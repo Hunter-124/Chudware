@@ -152,6 +152,8 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
     if (!linked) { err = "id_pass program link failed"; return false; }
 
     destroy();  // drop old per-body buffers (keep prog_ + targets)
+    ++docGen_;                 // new geometry: invalidate the frame cache (task 01)
+    haveCachedFrame_ = false;
 
     // Bind pos (location 0, float3) + id (location 1, uint) attribute buffers into a fresh VAO and
     // optionally an element buffer. Returns the BodyDraw (count set by caller). Integer ids MUST go
@@ -244,6 +246,26 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
 
 void IdPass::render(const Renderer::CameraXform& cam) {
     if (!built_) return;
+
+    // Frame cache (task 01: selection lag). Fingerprint everything the draws depend on; if it
+    // matches the last rendered frame, the offscreen id buffer is still valid and we skip the
+    // O(bodies) redraw entirely. This is what keeps hover/pick instant in large assemblies — a
+    // static camera no longer re-renders every body's faces/edges/verts each frame.
+    IdPassFrameKey key;
+    std::memcpy(key.mvp, cam.mvp.m, sizeof(key.mvp));
+    key.w = cam.ssWidth;
+    key.h = cam.ssHeight;
+    key.clipCount = clipCount_;
+    for (int i = 0; i < clipCount_; ++i) {
+        key.clipN[i * 3 + 0] = clipNormals_[i][0];
+        key.clipN[i * 3 + 1] = clipNormals_[i][1];
+        key.clipN[i * 3 + 2] = clipNormals_[i][2];
+        key.clipOff[i] = clipOffsets_[i];
+    }
+    key.hiddenHash = idPassHiddenHash(hidden_);
+    key.docGen = docGen_;
+    if (haveCachedFrame_ && key == lastKey_) return;  // cached id buffer still valid — skip redraw
+
     allocTargets(cam.ssWidth, cam.ssHeight);
 
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
@@ -308,6 +330,10 @@ void IdPass::render(const Renderer::CameraXform& cam) {
     glDepthRange(0.0, 1.0);
     glBindVertexArray(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // The id buffer now reflects `key`; reuse it until one of these inputs changes (task 01).
+    lastKey_ = key;
+    haveCachedFrame_ = true;
 }
 
 PickHit IdPass::pickFinal(int px, int py, int finalW, int finalH) {

@@ -47,6 +47,53 @@ inline PickHit decodeId(uint32_t v) {
     return h;
 }
 
+// ---- id-pass frame caching (task 01: selection lag) ----
+// The id buffer is an offscreen FBO that nothing else draws into, so its contents stay valid across
+// frames as long as the inputs that produced them are unchanged. render() fingerprints those inputs
+// into an IdPassFrameKey and skips the per-body draw work when the key matches the last rendered
+// frame — turning a static-camera hover from O(bodies) draw calls every frame into a no-op. This is
+// the dominant per-frame pick cost in large assemblies. Kept pure/inline so it unit-tests w/o GL.
+
+// FNV-1a fold of the hidden-body ids. std::set iterates ascending, so the result is deterministic
+// and independent of insertion order — toggling a body's visibility changes the digest, nothing
+// else does.
+inline uint64_t idPassHiddenHash(const std::set<uint32_t>& hidden) {
+    uint64_t h = 1469598103934665603ull;  // FNV-1a offset basis
+    for (uint32_t id : hidden) {
+        h ^= (uint64_t)id;
+        h *= 1099511628211ull;  // FNV-1a prime
+    }
+    return h;
+}
+
+// Fingerprint of everything render() consults to produce the id buffer. Exact float compare is
+// intentional: the camera matrix is recomputed deterministically from the same yaw/pitch/zoom/pan,
+// so a static camera yields bit-identical mvp (→ skip), and any motion or tween changes it (→
+// redraw, so picks stay fresh during movement). Only the active clip planes participate.
+struct IdPassFrameKey {
+    float mvp[16] = {0};
+    int w = 0, h = 0;
+    int clipCount = 0;
+    float clipN[9] = {0};
+    float clipOff[3] = {0};
+    uint64_t hiddenHash = 0;
+    uint64_t docGen = 0;  // bumped on every setDoc() so a rebuilt doc always re-renders
+
+    bool operator==(const IdPassFrameKey& o) const {
+        if (w != o.w || h != o.h || clipCount != o.clipCount || hiddenHash != o.hiddenHash ||
+            docGen != o.docGen)
+            return false;
+        for (int i = 0; i < 16; ++i)
+            if (mvp[i] != o.mvp[i]) return false;
+        for (int i = 0; i < clipCount * 3; ++i)
+            if (clipN[i] != o.clipN[i]) return false;
+        for (int i = 0; i < clipCount; ++i)
+            if (clipOff[i] != o.clipOff[i]) return false;
+        return true;
+    }
+    bool operator!=(const IdPassFrameKey& o) const { return !(*this == o); }
+};
+
 class IdPass {
 public:
     ~IdPass();
@@ -122,6 +169,11 @@ private:
     int clipCount_ = 0;
     float clipNormals_[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
     float clipOffsets_[3] = {0,0,0};
+
+    // Frame cache (task 01): the last rendered id buffer is reused when its inputs are unchanged.
+    IdPassFrameKey lastKey_;
+    bool haveCachedFrame_ = false;  // false until the first render() at the current buffer state
+    uint64_t docGen_ = 0;           // monotonically bumped by setDoc() to invalidate the cache
 };
 
 }  // namespace render

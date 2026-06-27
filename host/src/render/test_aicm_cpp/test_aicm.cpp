@@ -77,6 +77,50 @@ int main(int argc, char** argv) {
     CHECK(hi.body_id == 44 && hi.kind == PickKind::Face && hi.topo_id == 1,
           "body_id truncates to 8 bits (300 -> 44)");
 
+    // ---- id-pass frame cache key (task 01: selection lag) ----
+    // The whole point of the cache is: identical inputs => render() is skipped; ANY change to the
+    // camera, viewport size, clip planes, hidden set, or doc generation => the key differs and the
+    // id buffer is re-rendered. Verify each axis flips equality so a stale buffer can't be reused.
+    {
+        using render::IdPassFrameKey;
+        IdPassFrameKey base;  // identity-ish; concrete values below
+        for (int i = 0; i < 16; ++i) base.mvp[i] = (float)i * 0.5f;
+        base.w = 1280; base.h = 720;
+        base.clipCount = 1;
+        base.clipN[0] = 0; base.clipN[1] = 0; base.clipN[2] = 1; base.clipOff[0] = 3.5f;
+        base.hiddenHash = render::idPassHiddenHash({2, 7});
+        base.docGen = 4;
+
+        IdPassFrameKey same = base;
+        CHECK(same == base, "frame key: identical inputs compare equal (render is skipped)");
+
+        IdPassFrameKey camMoved = base; camMoved.mvp[5] += 0.001f;
+        CHECK(camMoved != base, "frame key: a moved camera invalidates the cache");
+
+        IdPassFrameKey resized = base; resized.w = 1281;
+        CHECK(resized != base, "frame key: a viewport resize invalidates the cache");
+
+        IdPassFrameKey clipOffMoved = base; clipOffMoved.clipOff[0] = 4.0f;
+        CHECK(clipOffMoved != base, "frame key: a moved section plane invalidates the cache");
+
+        IdPassFrameKey clipAdded = base; clipAdded.clipCount = 0;
+        CHECK(clipAdded != base, "frame key: enabling/disabling section clip invalidates the cache");
+
+        IdPassFrameKey docBumped = base; docBumped.docGen = 5;
+        CHECK(docBumped != base, "frame key: a rebuilt doc (docGen++) invalidates the cache");
+
+        IdPassFrameKey hid = base; hid.hiddenHash = render::idPassHiddenHash({2});
+        CHECK(hid != base, "frame key: toggling body visibility invalidates the cache");
+
+        // The hidden-set digest is order-independent (std::set is sorted) but content-sensitive.
+        CHECK(render::idPassHiddenHash({2, 7}) == render::idPassHiddenHash({7, 2}),
+              "hidden hash: order-independent over the same set");
+        CHECK(render::idPassHiddenHash({}) != render::idPassHiddenHash({1}),
+              "hidden hash: empty vs non-empty differ");
+        CHECK(render::idPassHiddenHash({1, 2}) != render::idPassHiddenHash({1, 3}),
+              "hidden hash: differing members differ");
+    }
+
     if (g_fail) { std::printf("\n%d check(s) FAILED\n", g_fail); return 1; }
     std::printf("\nall checks passed\n");
     return 0;

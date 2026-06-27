@@ -7,7 +7,8 @@ __pycache__/
 host/build*/
 
 # C++ core build tree (CMake FetchContent deps + binaries; regenerate with cmake)
-core/build/
+# build*/ covers build-linux, build-occt, build-occt-linux, etc.
+core/build*/
 
 # Test caches
 .pytest_cache/

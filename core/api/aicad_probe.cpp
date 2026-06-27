@@ -19,6 +19,9 @@
 #if defined(_WIN32)
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#else
+#  include <dlfcn.h>
+#  include <unistd.h>
 #endif
 
 using nlohmann::json;
@@ -105,10 +108,7 @@ int call(const std::string& method, const json& params, json& out, int& rc) {
 }  // namespace
 
 int main() {
-#if !defined(_WIN32)
-    std::fprintf(stderr, "[probe] only implemented for Windows LoadLibrary\n");
-    return 0;  // skip on non-Windows
-#else
+#if defined(_WIN32)
     HMODULE dll = LoadLibraryW(L"libaicad.dll");
     if (!dll) {
         std::fprintf(stderr, "[probe] LoadLibrary(libaicad.dll) failed: %lu\n", GetLastError());
@@ -117,7 +117,32 @@ int main() {
     g_call = reinterpret_cast<aicad_call_fn>(GetProcAddress(dll, "aicad_call"));
     g_free = reinterpret_cast<aicad_free_fn>(GetProcAddress(dll, "aicad_free"));
     g_abi = reinterpret_cast<aicad_abi_fn>(GetProcAddress(dll, "aicad_abi_version"));
-    if (!g_call || !g_free || !g_abi) return fail("GetProcAddress for an export failed");
+#else
+    // POSIX: dlopen libaicad.so. Prefer AI_CAD_LIBAICAD, else the copy next to this exe
+    // (probe + lib are co-located in bin/), else the loader's default search.
+    std::string libpath = "libaicad.so";
+    if (const char* env = std::getenv("AI_CAD_LIBAICAD"); env && env[0]) {
+        libpath = env;
+    } else {
+        char buf[4096];
+        ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            std::string p(buf);
+            size_t slash = p.find_last_of('/');
+            if (slash != std::string::npos) libpath = p.substr(0, slash) + "/libaicad.so";
+        }
+    }
+    void* dll = dlopen(libpath.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!dll) {
+        std::fprintf(stderr, "[probe] dlopen(%s) failed: %s\n", libpath.c_str(), dlerror());
+        return 2;
+    }
+    g_call = reinterpret_cast<aicad_call_fn>(dlsym(dll, "aicad_call"));
+    g_free = reinterpret_cast<aicad_free_fn>(dlsym(dll, "aicad_free"));
+    g_abi = reinterpret_cast<aicad_abi_fn>(dlsym(dll, "aicad_abi_version"));
+#endif
+    if (!g_call || !g_free || !g_abi) return fail("symbol lookup for an export failed");
 
     std::printf("[probe] libaicad ABI version: %s\n", g_abi());
 
@@ -169,7 +194,21 @@ int main() {
         std::printf("[probe] unknown-method fallback signal ok (rc=%d)\n", rc);
     }
 
+    // 4. ecad_new -> the C++ ECAD core mints a board doc. Validates the ECAD seam that the
+    //    Linux host now routes to by default (cppEcadFlag() default-on off-Windows).
+    {
+        json out;
+        int rc = 0;
+        if (call("ecad_new", json{{"name", "probe_board"}}, out, rc) != 0) return 1;
+        if (rc != 0) {
+            std::fprintf(stderr, "[probe] ecad_new rc=%d out=%s\n", rc, out.dump().c_str());
+            return fail("ecad_new returned nonzero");
+        }
+        std::string did = out.value("doc_id", out.value("id", std::string()));
+        if (did.empty()) return fail("ecad_new returned no doc_id");
+        std::printf("[probe] ecad_new ok: doc_id=%s\n", did.c_str());
+    }
+
     std::printf("[probe] ALL CHECKS PASSED\n");
     return 0;
-#endif
 }

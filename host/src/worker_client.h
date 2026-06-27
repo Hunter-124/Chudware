@@ -45,9 +45,15 @@ public:
 private:
     bool readLine(std::string& line, int timeoutMs);
 
+#ifdef _WIN32
     void* childStdinWr_ = nullptr;   // HANDLE
     void* childStdoutRd_ = nullptr;  // HANDLE
     void* process_ = nullptr;        // HANDLE
+#else
+    int childStdinWr_ = -1;          // write fd -> child stdin
+    int childStdoutRd_ = -1;         // read fd  <- child stdout
+    int process_ = -1;               // child pid
+#endif
     std::string readBuf_;
     int nextId_ = 1;
     bool running_ = false;

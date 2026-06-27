@@ -410,7 +410,7 @@ static ImFont* addFont(ImGuiIO& io,
 
 Fonts loadFonts(const std::string& assetsDir, float pxScale) {
     ImGuiIO& io = ImGui::GetIO();
-    const std::string fd  = assetsDir + "\\fonts\\";
+    const std::string fd  = assetsDir + "/fonts/";  // '/' works on Windows + POSIX for file I/O
     const std::string cad = fd + "CADSymbols.ttf";
     Fonts f;
     ImFont* def = io.Fonts->AddFontDefault();

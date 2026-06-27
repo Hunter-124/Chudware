@@ -19,6 +19,7 @@
 #include "app_state.h"
 
 #include "../bootstrap.h"
+#include "cpp_core.h"  // in-process C++ core (libaicad) — the backend when no Python runtime
 #include "../mesh.h"
 #include "../renderer.h"
 
@@ -39,10 +40,18 @@ const char* kStarterCode =
 
 // ---------------- settings (AI provider) ----------------
 std::string appdataDir() {
+#ifdef _WIN32
     const char* a = std::getenv("APPDATA");
     return std::string(a ? a : ".");
+#else
+    // Parent of the AI-CAD data dir (callers append "/AI-CAD/..."): XDG data home, else
+    // ~/.local/share — matching bootstrap.cpp's appdataRoot() (~/.local/share/AI-CAD).
+    if (const char* x = std::getenv("XDG_DATA_HOME")) { if (*x) return std::string(x); }
+    if (const char* h = std::getenv("HOME")) { if (*h) return std::string(h) + "/.local/share"; }
+    return ".";
+#endif
 }
-std::string configPath() { return appdataDir() + "\\AI-CAD\\config.json"; }
+std::string configPath() { return appdataDir() + "/AI-CAD/config.json"; }
 const char* kDefaultLlamaModelPath = "%APPDATA%\\AI-CAD\\models\\model.gguf";
 
 // User-provided Gemini key, seeded as the out-of-box default so the copilot works on first
@@ -236,7 +245,7 @@ void saveSettings(const Settings& s) {
         j["experimental"] = exp;
     }
     try {
-        std::filesystem::create_directories(appdataDir() + "\\AI-CAD");
+        std::filesystem::create_directories(appdataDir() + "/AI-CAD");
         std::ofstream(configPath()) << j.dump(2);
     } catch (...) {
     }
@@ -491,6 +500,26 @@ void AppState::tryStartWorker() {
         return;
     }
     addLog("[err] worker: " + werr);
+#ifndef _WIN32
+    // No managed Python runtime on this platform — the in-process C++ core (libaicad) is the
+    // backend (doc/agent/sim ops route through cpp_core). If it loads, the app is ready; do NOT
+    // dead-end into Python provisioning. On Windows the Python worker stays the production path.
+    {
+        std::string lerr;
+        if (core::cpp_core().ensureLoaded(lerr)) {
+            // Treat the in-process C++ core as the live backend: the ~50 `workerStarted` gates
+            // across the UI (FeatureManager toolbar / doc ops / panels) must pass, since RPCs
+            // route to libaicad via worker_client. (worker_client's own `running_` stays false,
+            // so methods libaicad can't serve still fail cleanly rather than hit a dead pipe.)
+            workerStarted = true;
+            status = "Ready (C++ core).";
+            statusKind = 0;
+            addLog("[ok] in-process C++ core (libaicad) ready; Python worker not required");
+            return;
+        }
+        addLog("[..] libaicad not loaded: " + lerr);
+    }
+#endif
     if (!autoSetupTried && !setupRunning.load()) {
         autoSetupTried = true;
         addLog("[..] attempting automatic runtime setup...");

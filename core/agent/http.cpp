@@ -1,11 +1,20 @@
-// core/agent/http.cpp — WinHTTP implementation of http_post (see http.h).
+// core/agent/http.cpp — blocking HTTPS POST/GET (see http.h).
+//
+// Two backends behind one interface so the agent/LLM layer is cross-platform:
+//   * Windows: native WinHTTP (no libcurl/OpenSSL dependency on the dev platform).
+//   * Other (Linux/macOS): libcurl, which uses the system TLS + CA store.
+// Both map onto the same HttpResponse contract: a transport-level failure (DNS,
+// TLS, refused) yields status==0 with a human-readable `error`; an HTTP-level
+// response yields the numeric status + full body.
 #include "agent/http.h"
-
-#include <windows.h>
-#include <winhttp.h>
 
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+
+#include <windows.h>
+#include <winhttp.h>
 
 namespace aicad {
 namespace agent {
@@ -259,3 +268,104 @@ HttpResponse http_get(const std::string& url,
 
 }  // namespace agent
 }  // namespace aicad
+
+#else  // ---------------------------------------------------------------------
+       // POSIX (Linux/macOS): libcurl backend.
+
+#include <curl/curl.h>
+
+namespace aicad {
+namespace agent {
+
+namespace {
+
+// Process-wide one-time curl_global_init. libcurl will lazy-init on the first
+// easy handle, but doing it explicitly once (and never curl_global_cleanup, since
+// these handles are created ad hoc across the process lifetime) is the documented,
+// thread-safe pattern.
+struct CurlGlobal {
+    CurlGlobal() { curl_global_init(CURL_GLOBAL_DEFAULT); }
+};
+const CurlGlobal& curl_global() {
+    static CurlGlobal g;
+    return g;
+}
+
+size_t write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* buf = static_cast<std::string*>(userdata);
+    const size_t n = size * nmemb;
+    buf->append(ptr, n);
+    return n;
+}
+
+// Shared request path for POST (body != nullptr) and GET (body == nullptr).
+HttpResponse curl_request(const std::string& url,
+                          const std::vector<std::pair<std::string, std::string>>& headers,
+                          const std::string* body, int timeout_ms) {
+    HttpResponse out;
+    (void)curl_global();  // ensure curl_global_init ran before curl_easy_init.
+
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        out.error = "curl_easy_init failed";
+        return out;
+    }
+
+    struct curl_slist* hdrs = nullptr;
+    for (const auto& h : headers) {
+        const std::string line = h.first + ": " + h.second;
+        hdrs = curl_slist_append(hdrs, line.c_str());
+    }
+    // Suppress libcurl's automatic "Expect: 100-continue" on large POSTs (WinHTTP
+    // does not send it; some endpoints stall waiting on it).
+    hdrs = curl_slist_append(hdrs, "Expect:");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    if (hdrs) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "aicad-agent/1.0");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out.body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_ms));
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(timeout_ms));
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);  // mirror WinHTTP's default redirect follow.
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);        // thread-safe DNS timeouts (no SIGALRM).
+    if (body) {
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body->data());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body->size()));
+    }
+
+    const CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        // Transport-level failure: status stays 0, body may be partial — clear it.
+        out.body.clear();
+        out.error = std::string("curl_easy_perform failed: ") + curl_easy_strerror(res);
+    } else {
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        out.status = status;
+    }
+
+    if (hdrs) curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    return out;
+}
+
+}  // namespace
+
+HttpResponse http_post(const std::string& url,
+                       const std::vector<std::pair<std::string, std::string>>& headers,
+                       const std::string& body, int timeout_ms) {
+    return curl_request(url, headers, &body, timeout_ms);
+}
+
+HttpResponse http_get(const std::string& url,
+                      const std::vector<std::pair<std::string, std::string>>& headers,
+                      int timeout_ms) {
+    return curl_request(url, headers, nullptr, timeout_ms);
+}
+
+}  // namespace agent
+}  // namespace aicad
+
+#endif  // _WIN32

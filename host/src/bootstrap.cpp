@@ -1,5 +1,7 @@
 #include "bootstrap.h"
 
+#ifdef _WIN32
+
 #include <windows.h>
 #include <bcrypt.h>
 
@@ -275,3 +277,193 @@ bool ensureRuntime(std::string& log) {
 }
 
 bool repairRuntime(std::string& log) { return provisionRuntime(true, log); }
+
+#else  // ---------------------------------------------------------------------
+       // POSIX (Linux/macOS): XDG data dir, /proc/self/exe, python3.11 + venv/bin.
+
+#include <unistd.h>
+
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+std::string env_or(const char* k, const std::string& fb) {
+    const char* v = std::getenv(k);
+    return (v && *v) ? std::string(v) : fb;
+}
+bool fileExists(const std::string& p) {
+    std::error_code ec;
+    return fs::is_regular_file(p, ec);
+}
+bool dirExists(const std::string& p) {
+    std::error_code ec;
+    return fs::is_directory(p, ec);
+}
+// Single-quote an argument for the shell (escaping embedded single quotes).
+std::string shq(const std::string& s) {
+    std::string o = "'";
+    for (char c : s) o += (c == '\'') ? std::string("'\\''") : std::string(1, c);
+    o += "'";
+    return o;
+}
+// XDG data root for the managed runtime/cache (mirrors %APPDATA%\AI-CAD on Windows).
+std::string appdataRoot() {
+    std::string xdg = env_or("XDG_DATA_HOME", "");
+    if (!xdg.empty()) return (fs::path(xdg) / "AI-CAD").string();
+    std::string home = env_or("HOME", "");
+    if (!home.empty()) return (fs::path(home) / ".local" / "share" / "AI-CAD").string();
+    return "AI-CAD";
+}
+std::string runCapture(const std::string& cmd) {
+    std::string out;
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return "";
+    char buf[256];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), p)) > 0) out.append(buf, n);
+    pclose(p);
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    return out;
+}
+// Resolve a base Python 3.11 to build the venv from (the Linux equivalent of `py -3.11`).
+std::string resolveBasePython() {
+    for (const char* probe : {"python3.11", "python3", "python"}) {
+        std::string r = runCapture(std::string(probe) +
+                                   " -c 'import sys;print(sys.executable)' 2>/dev/null");
+        if (fileExists(r)) return r;
+    }
+    return "";
+}
+int runWait(const std::string& cmd, const std::string& cwd) {
+    std::string full = cwd.empty() ? cmd : ("cd " + shq(cwd) + " && " + cmd);
+    int rc = std::system(full.c_str());
+    if (rc == -1) return -1;
+    return (rc >> 8) & 0xFF;  // WEXITSTATUS
+}
+
+struct Payload {
+    std::string srcDir;
+    std::string wheelhouse;
+};
+bool hasSource(const std::string& d) {
+    return fileExists((fs::path(d) / "installer" / "provision.py").string()) &&
+           fileExists((fs::path(d) / "requirements.txt").string());
+}
+bool findPayload(Payload& p) {
+    const std::string dir = exeDir();
+    if (hasSource((fs::path(dir) / "app").string())) {
+        p.srcDir = (fs::path(dir) / "app").string();
+        if (dirExists((fs::path(dir) / "wheelhouse").string()))
+            p.wheelhouse = (fs::path(dir) / "wheelhouse").string();
+        return true;
+    }
+    std::string repo = env_or("AI_CAD_REPO", "");
+    if (!repo.empty() && hasSource(repo)) {
+        p.srcDir = repo;
+        if (dirExists((fs::path(repo) / "wheelhouse").string()))
+            p.wheelhouse = (fs::path(repo) / "wheelhouse").string();
+        return true;
+    }
+    fs::path d = dir;
+    for (int i = 0; i < 6; ++i) {
+        if (hasSource(d.string())) {
+            p.srcDir = d.string();
+            if (dirExists((d / "wheelhouse").string())) p.wheelhouse = (d / "wheelhouse").string();
+            return true;
+        }
+        if (!d.has_parent_path() || d.parent_path() == d) break;
+        d = d.parent_path();
+    }
+    return false;
+}
+
+bool provisionRuntime(bool force, std::string& log) {
+    if (!force && runtimeReady()) {
+        log = "runtime already present";
+        return true;
+    }
+    Payload pl;
+    if (!findPayload(pl)) {
+        log = "runtime payload not found - run from a source checkout or set AI_CAD_REPO.";
+        return false;
+    }
+    std::string base = resolveBasePython();
+    if (base.empty()) {
+        log = "no base Python 3.11 found - install python3.11 to build the runtime.";
+        return false;
+    }
+    std::string cmd = shq(base) + " -m installer.provision --base-python " + shq(base) +
+                      " --with-app-code";
+    if (force) cmd += " --force";
+    if (!pl.wheelhouse.empty()) cmd += " --wheelhouse " + shq(pl.wheelhouse);
+    int rc = runWait(cmd, pl.srcDir);
+    log = std::string(force ? "repaired runtime" : "provisioned runtime") +
+          " (rc=" + std::to_string(rc) + ", base=" + base + ")";
+    return rc == 0 && runtimeReady();
+}
+
+}  // namespace
+
+std::string exeDir() {
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        return fs::path(buf).parent_path().string();
+    }
+    return ".";
+}
+
+std::string runtimePython() {
+    std::string envp = env_or("AI_CAD_PYTHON", "");
+    if (!envp.empty() && fileExists(envp)) return envp;
+    std::string installed = (fs::path(appdataRoot()) / "runtime" / "venv" / "bin" / "python").string();
+    if (fileExists(installed)) return installed;
+    std::string portable = (fs::path(exeDir()) / "runtime" / "venv" / "bin" / "python").string();
+    if (fileExists(portable)) return portable;
+    return installed;  // canonical default for messaging when nothing is installed yet
+}
+
+std::string appDir() {
+    std::string repo = env_or("AI_CAD_REPO", "");
+    if (!repo.empty() && dirExists((fs::path(repo) / "engine").string())) return repo;
+    std::string portable = (fs::path(exeDir()) / "app").string();
+    if (dirExists((fs::path(portable) / "engine").string()) &&
+        dirExists((fs::path(portable) / "agent").string()))
+        return portable;
+    fs::path d = exeDir();
+    for (int i = 0; i < 6; ++i) {
+        if (dirExists((d / "engine").string()) && dirExists((d / "agent").string()) &&
+            fileExists((d / "requirements.txt").string()))
+            return d.string();
+        if (!d.has_parent_path() || d.parent_path() == d) break;
+        d = d.parent_path();
+    }
+    return (fs::path(appdataRoot()) / "app").string();
+}
+
+bool runtimeReady() {
+    // On POSIX we don't apply the venv-freshness hash gate (the Windows path uses it to catch a
+    // stale %APPDATA% venv); presence of the interpreter is enough — see bootstrap.h.
+    return fileExists(runtimePython());
+}
+
+void ensurePromptsDir() {
+    if (!env_or("AI_CAD_PROMPTS_DIR", "").empty()) return;  // respect an explicit override
+    std::string p = (fs::path(appDir()) / "agent" / "prompts").string();
+    if (!dirExists(p)) return;
+    setenv("AI_CAD_PROMPTS_DIR", p.c_str(), 1);
+}
+
+bool ensureRuntime(std::string& log) {
+    ensurePromptsDir();
+    return provisionRuntime(false, log);
+}
+
+bool repairRuntime(std::string& log) { return provisionRuntime(true, log); }
+
+#endif  // _WIN32

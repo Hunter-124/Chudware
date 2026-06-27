@@ -20,4 +20,10 @@ struct HitLayout {
 // WndProc sits on top of ImGui's. `layout` must outlive the window (read on the UI thread).
 void install(GLFWwindow* win, HitLayout* layout);
 
+// Per-frame chrome update. No-op on Windows (the WndProc hit-test drives drag/resize at the
+// OS level); on Linux/macOS it polls the mouse and implements drag / edge-resize / double-
+// click-maximize for the borderless window, using the same `layout` spans. Call once per
+// frame after glfwPollEvents().
+void tick(GLFWwindow* win, HitLayout* layout);
+
 }  // namespace chrome

@@ -60,7 +60,7 @@ void ScenarioRunner::tick(AppState& st) {
             m1DirReady = true;
             const char* repo = std::getenv("AI_CAD_REPO");
             std::string base = repo ? std::string(repo) : std::string(".");
-            m1SavePath = base + "\\scratch\\m1_shots";
+            m1SavePath = base + "/scratch/m1_shots";
             // W1-B (item 12): create the output dir robustly. The old code left a dead `mk`
             // variable and never actually created the dir, so captures silently failed when it
             // was missing; an earlier ad-hoc string join also produced the malformed stray dir
@@ -122,7 +122,7 @@ void ScenarioRunner::tick(AppState& st) {
                                     st.docMirror.docId().c_str(), st.docMirror.revision());
                     } else std::printf("m1: new_part FAILED: %s\n", err.c_str());
                     std::fflush(stdout);
-                    m1Capture = m1SavePath + "\\m1_01_newpart.png"; m1Settle = kSettle;
+                    m1Capture = m1SavePath + "/m1_01_newpart.png"; m1Settle = kSettle;
                     break;
                 }
                 case 1: {  // Box 60x40x10
@@ -166,7 +166,7 @@ void ScenarioRunner::tick(AppState& st) {
                         }
                     }
                     st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
-                    m1Capture = m1SavePath + "\\m1_02_box.png"; m1Settle = kSettle;
+                    m1Capture = m1SavePath + "/m1_02_box.png"; m1Settle = kSettle;
                     break;
                 }
                 case 2: {  // Fillet r=4 on two picked vertical edges
@@ -186,7 +186,7 @@ void ScenarioRunner::tick(AppState& st) {
                                 (int)r.ok, r.revision, m1FilletId.c_str(),
                                 statusMs(r, m1FilletId));
                     std::fflush(stdout);
-                    m1Capture = m1SavePath + "\\m1_03_fillet.png"; m1Settle = kSettle;
+                    m1Capture = m1SavePath + "/m1_03_fillet.png"; m1Settle = kSettle;
                     break;
                 }
                 case 3: {  // Shell t=2 remove top face
@@ -207,7 +207,7 @@ void ScenarioRunner::tick(AppState& st) {
                     m1FilletMsBeforeEdit = statusMs(r, m1FilletId);
                     m1BoxMsBeforeEdit = statusMs(r, "f1");
                     std::fflush(stdout);
-                    m1Capture = m1SavePath + "\\m1_04_shell.png"; m1Settle = kSettle;
+                    m1Capture = m1SavePath + "/m1_04_shell.png"; m1Settle = kSettle;
                     break;
                 }
                 case 4: {  // Edit Fillet r=8 — cached rebuild: box (f1) cached, fillet+shell recompile
@@ -231,12 +231,12 @@ void ScenarioRunner::tick(AppState& st) {
                     // Open the PM on the fillet so the screenshot shows the populated edit form.
                     st.propertyManager->openForEdit(st, m1FilletId);
                     std::fflush(stdout);
-                    m1Capture = m1SavePath + "\\m1_05_edit.png"; m1Settle = kSettle;
+                    m1Capture = m1SavePath + "/m1_05_edit.png"; m1Settle = kSettle;
                     break;
                 }
                 case 5: {  // Save .step+ then reopen; assert tree intact (3 features)
                     st.propertyManager->closeIfActive();  // tree returns for the reopen screenshot
-                    std::string sp = m1SavePath + "\\part.step";
+                    std::string sp = m1SavePath + "/part.step";
                     std::string serr;
                     bool saved = st.docMirror.save(st.worker, sp, serr);
                     std::printf("m1: save ok=%d path=%s err=%s\n", (int)saved, sp.c_str(),
@@ -251,7 +251,7 @@ void ScenarioRunner::tick(AppState& st) {
                                 nfeat == 3 ? "(tree intact)" : "(TREE MISMATCH)");
                     std::fflush(stdout);
                     // Reopen doesn't return an aicm; force a rebuild to refresh the viewport.
-                    m1Capture = m1SavePath + "\\m1_06_reopen.png"; m1Settle = kSettle;
+                    m1Capture = m1SavePath + "/m1_06_reopen.png"; m1Settle = kSettle;
                     break;
                 }
                 default:
@@ -277,7 +277,7 @@ void ScenarioRunner::tick(AppState& st) {
             skDirReady = true;
             const char* repo = std::getenv("AI_CAD_REPO");
             std::string base = repo ? std::string(repo) : std::string(".");
-            skSavePath = base + "\\scratch\\sketch_shots";
+            skSavePath = base + "/scratch/sketch_shots";
             std::error_code ec; std::filesystem::create_directories(skSavePath, ec);  // W1-B (item 12)
         }
         auto applyOne = [&](const nlohmann::json& op) -> core::OpsResponse {
@@ -340,7 +340,7 @@ void ScenarioRunner::tick(AppState& st) {
                     std::printf("sketch: new sketch %s rect built (width_cid=%s) entered; status=%s\n",
                                 skFid.c_str(), skWidthCid.c_str(), sk ? sk->statusLine().c_str() : "?");
                     std::fflush(stdout);
-                    sketchCapture = skSavePath + "\\sketch_01_enter.png"; skSettle = kSettle;
+                    sketchCapture = skSavePath + "/sketch_01_enter.png"; skSettle = kSettle;
                     break;
                 }
                 case 1: {  // drag a corner + commit, then set width 80 -> 100
@@ -362,7 +362,7 @@ void ScenarioRunner::tick(AppState& st) {
                     std::printf("sketch: drag+commit, width 80->100, re-solved; status=%s dof=%d\n",
                                 sk ? sk->statusLine().c_str() : "?", sres.value("dof",-1));
                     std::fflush(stdout);
-                    sketchCapture = skSavePath + "\\sketch_02_dim.png"; skSettle = kSettle;
+                    sketchCapture = skSavePath + "/sketch_02_dim.png"; skSettle = kSettle;
                     break;
                 }
                 case 2: {  // exit + extrude region depth 10
@@ -381,7 +381,7 @@ void ScenarioRunner::tick(AppState& st) {
                     st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
                     std::printf("sketch: exit + extrude region depth 10 ok=%d\n", (int)exok);
                     std::fflush(stdout);
-                    sketchCapture = skSavePath + "\\sketch_03_solid.png"; skSettle = kSettle;
+                    sketchCapture = skSavePath + "/sketch_03_solid.png"; skSettle = kSettle;
                     break;
                 }
                 default:
@@ -406,9 +406,9 @@ void ScenarioRunner::tick(AppState& st) {
             asmDirReady = true;
             const char* repo = std::getenv("AI_CAD_REPO");
             std::string base = repo ? std::string(repo) : std::string(".");
-            asmSavePath = base + "\\scratch\\asm_shots";
-            asmBasePath = asmSavePath + "\\base.step+";
-            asmPegPath  = asmSavePath + "\\peg.step+";
+            asmSavePath = base + "/scratch/asm_shots";
+            asmBasePath = asmSavePath + "/base.step+";
+            asmPegPath  = asmSavePath + "/peg.step+";
             std::error_code ec; std::filesystem::create_directories(asmSavePath, ec);  // W1-B (item 12)
         }
         // Helper: author a part via raw worker calls (doc_new part -> apply_ops -> save -> close).
@@ -550,7 +550,7 @@ void ScenarioRunner::tick(AppState& st) {
                 else
                     std::printf("asm: FAIL z=%.3f not within 0.5 of 15\n", asmSolvedZ);
                 std::fflush(stdout);
-                asmCapture = asmSavePath + "\\asm_01_seated.png"; asmSettle = kSettle; ++asmStep; break;
+                asmCapture = asmSavePath + "/asm_01_seated.png"; asmSettle = kSettle; ++asmStep; break;
             }
             case 3: {  // explode factor 1.0
                 ap->closeMateForm();
@@ -566,14 +566,14 @@ void ScenarioRunner::tick(AppState& st) {
                 ap->handleCommand(st, "asm_explode");  // opens the Exploded View slider window
                 ap->setExplode(st, true, 1.0f);
                 std::printf("asm: explode factor=1.0 (peg +40mm)\n"); std::fflush(stdout);
-                asmCapture = asmSavePath + "\\asm_02_explode.png"; asmSettle = kSettle; ++asmStep; break;
+                asmCapture = asmSavePath + "/asm_02_explode.png"; asmSettle = kSettle; ++asmStep; break;
             }
             case 4: {  // interference window
                 ap->setExplode(st, false, 0.0f);  // collapse before checking real fit
                 ap->closeExplode();               // dismiss the explode window so it isn't on top
                 ap->openInterference(st);
                 std::printf("asm: interference window open\n"); std::fflush(stdout);
-                asmCapture = asmSavePath + "\\asm_03_interference.png"; asmSettle = kSettle; ++asmStep; break;
+                asmCapture = asmSavePath + "/asm_03_interference.png"; asmSettle = kSettle; ++asmStep; break;
             }
             default:
                 st.asmShotDone = true;
@@ -767,7 +767,7 @@ void ScenarioRunner::tick(AppState& st) {
             actDirReady = true;
             const char* repo = std::getenv("AI_CAD_REPO");
             std::string base = repo ? std::string(repo) : std::string(".");
-            actSavePath = base + "\\scratch\\activity_shots";
+            actSavePath = base + "/scratch/activity_shots";
             std::error_code ec; std::filesystem::create_directories(actSavePath, ec);  // W1-B (item 12)
         }
         const int kSettle = 4;
@@ -807,7 +807,7 @@ void ScenarioRunner::tick(AppState& st) {
                 }
                 case 3: {  // Screenshot 1: Activity panel with run tree
                     std::printf("activity: shot1 activity panel\n"); std::fflush(stdout);
-                    actCapture = actSavePath + "\\activity_01_run.png";
+                    actCapture = actSavePath + "/activity_01_run.png";
                     actSettle = kSettle; ++actStep; break;
                 }
                 case 4: {  // Open Settings > Agents tab
@@ -817,7 +817,7 @@ void ScenarioRunner::tick(AppState& st) {
                 }
                 case 5: {  // Screenshot 2: Settings Agents tab
                     std::printf("activity: shot2 agents settings tab\n"); std::fflush(stdout);
-                    actCapture = actSavePath + "\\activity_02_agents.png";
+                    actCapture = actSavePath + "/activity_02_agents.png";
                     actSettle = kSettle; ++actStep; break;
                 }
                 default:
@@ -853,7 +853,7 @@ void ScenarioRunner::runMultidoc(AppState& st) {
         mdDirReady = true;
         const char* repo = std::getenv("AI_CAD_REPO");
         std::string base = repo ? std::string(repo) : std::string(".");
-        mdSavePath = base + "\\scratch\\multidoc_shots";
+        mdSavePath = base + "/scratch/multidoc_shots";
         std::error_code ec; std::filesystem::create_directories(mdSavePath, ec);
     }
     auto loadMesh = [&](const core::OpsResponse& r) {
@@ -933,7 +933,7 @@ void ScenarioRunner::runMultidoc(AppState& st) {
                         (int)st.propertyManager->active(), st.selection.size(),
                         (int)(!st.bodyVisible.empty() && st.bodyVisible[0] == 0));
             std::fflush(stdout);
-            mdCapture = mdSavePath + "\\multidoc_01_A_editing.png"; ++mdStep; mdSettle = kSettle;
+            mdCapture = mdSavePath + "/multidoc_01_A_editing.png"; ++mdStep; mdSettle = kSettle;
             break;
         }
         case 2: {  // Part B: new part (parks A's session) -> assert B's PM is fresh -> box -> measure
@@ -957,7 +957,7 @@ void ScenarioRunner::runMultidoc(AppState& st) {
             std::printf("multidoc: B built doc=%s tab=%d measure_window='%s'\n",
                         mdDocB.c_str(), mdIdxB, st.evaluateDialogs->openWindowKind().c_str());
             std::fflush(stdout);
-            mdCapture = mdSavePath + "\\multidoc_02_B.png"; ++mdStep; mdSettle = kSettle;
+            mdCapture = mdSavePath + "/multidoc_02_B.png"; ++mdStep; mdSettle = kSettle;
             break;
         }
         case 3: {  // Switch back to A -> assert PM form + selection + hidden-body mask all preserved
@@ -976,7 +976,7 @@ void ScenarioRunner::runMultidoc(AppState& st) {
             std::printf("multidoc: back-to-A selection=%zu -> %s\n",
                         st.selection.size(), mdPassSel ? "PASS" : "FAIL");
             std::fflush(stdout);
-            mdCapture = mdSavePath + "\\multidoc_03_A_restored.png"; ++mdStep; mdSettle = kSettle;
+            mdCapture = mdSavePath + "/multidoc_03_A_restored.png"; ++mdStep; mdSettle = kSettle;
             break;
         }
         case 4: {  // Switch to B -> assert B's PM independent (inactive) + B's measure window intact
@@ -992,7 +992,7 @@ void ScenarioRunner::runMultidoc(AppState& st) {
                         bMeasureNow ? "PASS" : "FAIL");
             std::fflush(stdout);
             mdPassBMeasure = mdPassBMeasure && bMeasureNow;
-            mdCapture = mdSavePath + "\\multidoc_04_B_independent.png"; ++mdStep; mdSettle = kSettle;
+            mdCapture = mdSavePath + "/multidoc_04_B_independent.png"; ++mdStep; mdSettle = kSettle;
             break;
         }
         case 5: {  // Part C: new part (scales the DocSession to a third doc) + box + a DIFFERENT mid-edit
@@ -1019,7 +1019,7 @@ void ScenarioRunner::runMultidoc(AppState& st) {
                         mdDocC.c_str(), mdIdxC, (int)st.propertyManager->active(),
                         st.propertyManager->activeFormType().c_str(), st.selection.size());
             std::fflush(stdout);
-            mdCapture = mdSavePath + "\\multidoc_05_C_editing.png"; ++mdStep; mdSettle = kSettle;
+            mdCapture = mdSavePath + "/multidoc_05_C_editing.png"; ++mdStep; mdSettle = kSettle;
             break;
         }
         case 6: {  // A<->C hop 1: switch to A — A's FILLET form + selection + hidden mask still intact
@@ -1036,7 +1036,7 @@ void ScenarioRunner::runMultidoc(AppState& st) {
                         (int)mask, st.selection.size(), st.docMirror.revision(),
                         mdPassChop[0] ? "PASS" : "FAIL");
             std::fflush(stdout);
-            mdCapture = mdSavePath + "\\multidoc_07_A_after_C.png"; ++mdStep; mdSettle = kSettle;
+            mdCapture = mdSavePath + "/multidoc_07_A_after_C.png"; ++mdStep; mdSettle = kSettle;
             break;
         }
         case 7: {  // A<->C hop 2: switch to C — C's CHAMFER form + C's empty selection (distinct from A)
@@ -1052,7 +1052,7 @@ void ScenarioRunner::runMultidoc(AppState& st) {
                         st.selection.size(), st.docMirror.revision(),
                         mdPassChop[1] ? "PASS" : "FAIL");
             std::fflush(stdout);
-            mdCapture = mdSavePath + "\\multidoc_06_C_restored.png"; ++mdStep; mdSettle = kSettle;
+            mdCapture = mdSavePath + "/multidoc_06_C_restored.png"; ++mdStep; mdSettle = kSettle;
             break;
         }
         case 8: {  // A<->C hop 3: switch back to A — fillet/selection/mask still intact (cached path)
@@ -1126,7 +1126,7 @@ void ScenarioRunner::runDrawing(AppState& st) {
         dwgDirReady = true;
         const char* repo = std::getenv("AI_CAD_REPO");
         std::string base = repo ? std::string(repo) : std::string(".");
-        dwgSavePath = base + "\\scratch\\drawing_shots";
+        dwgSavePath = base + "/scratch/drawing_shots";
         std::error_code ec; std::filesystem::create_directories(dwgSavePath, ec);
     }
     auto vid_of = [](const nlohmann::json& v) -> std::string {
@@ -1281,7 +1281,7 @@ void ScenarioRunner::runDrawing(AppState& st) {
                             made ? "PASS" : "CHECK");
                 std::fflush(stdout);
             }
-            dwgCapture = dwgSavePath + "\\drawing_01_detailed.png"; dwgSettle = kSettle; ++dwgStep;
+            dwgCapture = dwgSavePath + "/drawing_01_detailed.png"; dwgSettle = kSettle; ++dwgStep;
             break;
         }
         default:

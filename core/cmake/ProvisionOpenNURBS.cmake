@@ -74,6 +74,10 @@ endif()
 # add_definitions/add_compile_options are scoped to this added subdirectory, so
 # they do NOT leak into the rest of aicad_core.
 if(NOT TARGET opennurbsStatic)
+  # opennurbs (and its android_uuid subdir) carry cmake_minimum_required values below CMake
+  # 3.5's floor, which CMake 4.x rejects outright. Relax the minimum for this subtree — set as
+  # a normal variable before add_subdirectory so it propagates into the added scope only.
+  set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
   # opennurbs builds with /W4; do NOT let a parent -DWERROR turn its warnings fatal.
   add_subdirectory("${_on_dir}" "${CMAKE_BINARY_DIR}/opennurbs-build" EXCLUDE_FROM_ALL)
 endif()

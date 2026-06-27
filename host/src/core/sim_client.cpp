@@ -6,6 +6,7 @@
 #include <thread>
 
 #include "app_state.h"  // jstr/jint/jnum/jbool safe JSON accessors
+#include "cpp_core.h"   // in-process C++ core (libaicad) — the sim backend when no Python worker
 
 namespace core {
 
@@ -17,8 +18,22 @@ bool SimClient::ensureStarted(std::string& consoleNote) {
         consoleNote = "[sim] simulation worker started";
         return true;
     }
+#ifndef _WIN32
+    // No managed Python runtime on this platform — the FEA sim RPCs (sim_mesh / sim_run_static /
+    // sim_run_modal / sim_run_fatigue) route in-process to libaicad (routeSimToCpp defaults on),
+    // so treat the backend as ready if the core loads. (sim_run_flow / sim_caps / sim_cancel have
+    // no C++ port yet and degrade gracefully.)
+    std::string lerr;
+    if (core::cpp_core().ensureLoaded(lerr)) {
+        consoleNote = "[sim] using in-process C++ core (libaicad) for simulation";
+        return true;
+    }
+    consoleNote = "[sim] could not start simulation worker and libaicad unavailable: " + lerr;
+    return false;
+#else
     consoleNote = "[sim] could not start simulation worker: " + err;
     return false;
+#endif
 }
 
 void SimClient::cancel() {

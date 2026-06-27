@@ -138,8 +138,13 @@ void ensureWorkspaceDir(AppState& st) {
         if (!st.settings.workspaceDir.empty()) {
             st.workspaceDir = st.settings.workspaceDir;
         } else {
+#ifdef _WIN32
             const char* up = std::getenv("USERPROFILE");
             fs::path base = up && *up ? fs::path(up) / "Documents" : fs::path(appdataDir());
+#else
+            const char* home = std::getenv("HOME");
+            fs::path base = home && *home ? fs::path(home) / "Documents" : fs::path(appdataDir());
+#endif
             st.workspaceDir = (base / "AI-CAD").string();
         }
     }

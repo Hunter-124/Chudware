@@ -1,5 +1,7 @@
 #include "win_chrome.h"
 
+#ifdef _WIN32
+
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #define GLFW_EXPOSE_NATIVE_WIN32
@@ -99,4 +101,138 @@ void install(GLFWwindow* win, HitLayout* layout) {
                  SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+// Windows drives drag/resize through the WndProc hit-test, so the per-frame tick is a no-op.
+void tick(GLFWwindow*, HitLayout*) {}
+
 }  // namespace chrome
+
+#else  // ---------------------------------------------------------------------
+       // Non-Windows (X11/XWayland): borderless window whose own ImGui title bar is the
+       // only chrome. The OS frame is removed (GLFW_DECORATED=false, set at create time);
+       // this code reimplements what the Windows WndProc gets for free — caption drag,
+       // edge/corner resize, and double-click-to-maximize — by polling the mouse each
+       // frame and moving/sizing the window via GLFW. Needs a backend that lets a client
+       // position itself: app.cpp forces GLFW_PLATFORM_X11 (Wayland forbids self-move).
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+
+namespace chrome {
+namespace {
+
+enum Edge { kLeft = 1, kRight = 2, kTop = 4, kBottom = 8 };
+enum class Mode { None, Drag, Resize };
+
+Mode g_mode = Mode::None;
+int g_edge = 0;
+double g_startSx = 0, g_startSy = 0;  // cursor screen pos at grab
+int g_startX = 0, g_startY = 0, g_startW = 0, g_startH = 0;
+bool g_prevDown = false;
+double g_lastCaptionClick = -1.0;
+
+bool maximized(GLFWwindow* w) { return glfwGetWindowAttrib(w, GLFW_MAXIMIZED) != 0; }
+
+// Cursor position in SCREEN space = window position + window-relative cursor. Stable to use
+// across moves: as the window moves under a held-still cursor, the relative term compensates.
+void cursorScreen(GLFWwindow* w, double& sx, double& sy) {
+    double cx, cy;
+    glfwGetCursorPos(w, &cx, &cy);
+    int wx, wy;
+    glfwGetWindowPos(w, &wx, &wy);
+    sx = wx + cx;
+    sy = wy + cy;
+}
+
+}  // namespace
+
+void install(GLFWwindow* win, HitLayout* layout) {
+    (void)layout;
+    // Belt-and-suspenders: app.cpp sets the GLFW_DECORATED=false hint before window creation
+    // (the reliable path); assert it here too in case a WM ignored the hint.
+    glfwSetWindowAttrib(win, GLFW_DECORATED, GLFW_FALSE);
+}
+
+void tick(GLFWwindow* win, HitLayout* layout) {
+    if (!win || !layout) return;
+    const bool down = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    double cx, cy;
+    glfwGetCursorPos(win, &cx, &cy);
+    int ww, wh;
+    glfwGetWindowSize(win, &ww, &wh);
+    const int H = layout->titleBarHeight;
+    const int B = layout->resizeBorder > 0 ? layout->resizeBorder : 6;
+    const bool maxed = maximized(win);
+
+    // Press transition: decide what this drag is (resize edge / caption drag / nothing).
+    if (down && !g_prevDown && g_mode == Mode::None) {
+        const bool inMenu =
+            (cx >= layout->menuLeft && cx < layout->menuRight) ||
+            (cx >= layout->controlsLeft && cx < layout->controlsRight);
+        int edge = 0;
+        if (!maxed) {
+            if (cx < B) edge |= kLeft;
+            if (cx >= ww - B) edge |= kRight;
+            if (cy < B) edge |= kTop;
+            if (cy >= wh - B) edge |= kBottom;
+        }
+        if (edge) {
+            g_mode = Mode::Resize;
+            g_edge = edge;
+            cursorScreen(win, g_startSx, g_startSy);
+            glfwGetWindowPos(win, &g_startX, &g_startY);
+            g_startW = ww;
+            g_startH = wh;
+        } else if (cy < H && !inMenu) {
+            // Draggable caption. A second click within 400ms toggles maximize.
+            const double now = glfwGetTime();
+            if (g_lastCaptionClick >= 0 && now - g_lastCaptionClick < 0.4) {
+                if (maxed)
+                    glfwRestoreWindow(win);
+                else
+                    glfwMaximizeWindow(win);
+                g_lastCaptionClick = -1.0;
+            } else {
+                g_lastCaptionClick = now;
+                if (!maxed) {
+                    g_mode = Mode::Drag;
+                    cursorScreen(win, g_startSx, g_startSy);
+                    glfwGetWindowPos(win, &g_startX, &g_startY);
+                }
+            }
+        }
+    }
+
+    if (down && g_mode != Mode::None) {
+        double sx, sy;
+        cursorScreen(win, sx, sy);
+        const int dx = (int)(sx - g_startSx), dy = (int)(sy - g_startSy);
+        if (g_mode == Mode::Drag) {
+            glfwSetWindowPos(win, g_startX + dx, g_startY + dy);
+        } else {  // Resize
+            const int MINW = 640, MINH = 420;
+            int nx = g_startX, ny = g_startY, nw = g_startW, nh = g_startH;
+            if (g_edge & kRight) nw = g_startW + dx;
+            if (g_edge & kBottom) nh = g_startH + dy;
+            if (g_edge & kLeft) {
+                nw = g_startW - dx;
+                if (nw < MINW) nw = MINW;
+                nx = g_startX + g_startW - nw;  // keep the right edge fixed
+            }
+            if (g_edge & kTop) {
+                nh = g_startH - dy;
+                if (nh < MINH) nh = MINH;
+                ny = g_startY + g_startH - nh;  // keep the bottom edge fixed
+            }
+            if (nw < MINW) nw = MINW;
+            if (nh < MINH) nh = MINH;
+            glfwSetWindowPos(win, nx, ny);
+            glfwSetWindowSize(win, nw, nh);
+        }
+    }
+
+    if (!down) g_mode = Mode::None;
+    g_prevDown = down;
+}
+
+}  // namespace chrome
+
+#endif  // _WIN32

@@ -14,14 +14,9 @@
 #include "metrics.h"
 #include "../core/app_state.h"
 
-// --- platform includes for run directory listing ---
-#ifndef WIN32_LEAN_AND_MEAN
-#  define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#  define NOMINMAX
-#endif
-#include <windows.h>
+// --- run-directory listing + timing (portable) ---
+#include <chrono>
+#include <filesystem>
 
 namespace ui {
 
@@ -30,12 +25,9 @@ namespace ui {
 // =========================================================================
 
 static long long nowMs() {
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    ULARGE_INTEGER u;
-    u.LowPart = ft.dwLowDateTime;
-    u.HighPart = ft.dwHighDateTime;
-    return (long long)(u.QuadPart / 10000LL);
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 // =========================================================================
@@ -151,36 +143,29 @@ void ActivityPanel::refreshReplayList() {
 
     replayList_.clear();
 
-    std::string runsDir = appdataDir() + "\\AI-CAD\\cache\\runs";
-    WIN32_FIND_DATAA fd;
-    std::string pat = runsDir + "\\*";
-    HANDLE h = FindFirstFileA(pat.c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path runsDir = fs::path(appdataDir()) / "AI-CAD" / "cache" / "runs";
+    if (!fs::is_directory(runsDir, ec)) return;
 
-    struct Entry { std::string id; std::string jsonlPath; FILETIME ft; };
+    struct Entry { std::string id; std::string jsonlPath; fs::file_time_type ft; };
     std::vector<Entry> entries;
-    do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
-        std::string runId = fd.cFileName;
-        std::string jp = runsDir + "\\" + runId + "\\events.jsonl";
-        // Only include if events.jsonl exists
-        DWORD attr = GetFileAttributesA(jp.c_str());
-        if (attr == INVALID_FILE_ATTRIBUTES) continue;
+    for (fs::directory_iterator it(runsDir, ec), end; it != end; it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_directory(ec)) continue;
+        std::string runId = it->path().filename().string();
+        fs::path jp = it->path() / "events.jsonl";
+        if (!fs::exists(jp, ec)) continue;  // only runs that actually logged events
         Entry e;
         e.id = runId;
-        e.jsonlPath = jp;
-        e.ft = fd.ftLastWriteTime;
+        e.jsonlPath = jp.string();
+        e.ft = fs::last_write_time(it->path(), ec);
         entries.push_back(std::move(e));
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+    }
 
     // Sort newest first
-    std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
-        if (a.ft.dwHighDateTime != b.ft.dwHighDateTime)
-            return a.ft.dwHighDateTime > b.ft.dwHighDateTime;
-        return a.ft.dwLowDateTime > b.ft.dwLowDateTime;
-    });
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry& a, const Entry& b) { return a.ft > b.ft; });
 
     for (auto& e : entries) {
         ReplayEntry re;

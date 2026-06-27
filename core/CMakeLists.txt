@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
-project(aicad_core LANGUAGES CXX)
+project(aicad_core LANGUAGES C CXX)  # C enabled for aicad_miniz (miniz.c); the VS generator
+                                     # tolerates an implicit C, but Ninja/Make + GCC/Clang need it explicit.
 
 # The new pure-C++ engine (libaicad). Wave 1 = the constraint solver core; later
 # waves add doc/geom (OCCT) and sim (CUDA). Built standalone here so the solver is
@@ -8,6 +9,10 @@ project(aicad_core LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Build all static libs position-independent so they can be linked into the libaicad
+# SHARED library on ELF platforms (Linux/macOS): GCC/Clang reject non-PIC .o in a .so
+# ("recompile with -fPIC"). No-op on MSVC (DLLs are inherently relocatable).
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(MSVC)
   add_compile_options(/utf-8 /MP)
 endif()
@@ -296,6 +301,10 @@ target_include_directories(aicad_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_agent PUBLIC nlohmann_json::nlohmann_json)
 if(WIN32)
   target_link_libraries(aicad_agent PUBLIC winhttp bcrypt)
+else()
+  # POSIX HTTP backend (agent/http.cpp #else branch): libcurl over the system TLS/CA store.
+  find_package(CURL REQUIRED)
+  target_link_libraries(aicad_agent PUBLIC CURL::libcurl)
 endif()
 set_property(TARGET aicad_agent PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
@@ -306,7 +315,9 @@ target_include_directories(test_agent PRIVATE ${doctest_SOURCE_DIR})
 target_link_libraries(test_agent PRIVATE aicad_agent)
 set_target_properties(test_agent PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME agent COMMAND test_agent)
+# test_agent loads role prompts from the repo-relative agent/prompts/ — run it from
+# the repo root (core/..) so the lookup resolves regardless of where ctest is invoked.
+add_test(NAME agent COMMAND test_agent WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 # err_sig identical-failure detector (agent/machine.cpp). OCCT-free, links aicad_agent.
 add_executable(test_machine
@@ -355,13 +366,40 @@ add_test(NAME parts COMMAND test_parts)
 if(AICAD_WITH_OCCT)
   include(ProvisionOCCT)
 
+  # --- Heavy from-source third-party sub-deps (opt-in per platform) -----------
+  # On Windows each of these auto-provisions (builds from source / fetches a wheel-
+  # matched binary). No Linux/macOS provisioning path exists yet (Fedora has no
+  # nglib-capable Netgen, no rhino3dm, and only an older lib3mf), so they DEFAULT
+  # OFF off-Windows and the dependent code is compiled out (doc/formats.cpp already
+  # #ifdef-guards AICAD_WITH_LIB3MF / AICAD_WITH_OPENNURBS; the Netgen mesher path
+  # is gated below). The OCCT geometry/document kernel itself needs none of them.
+  # Flip any ON once a system package or Linux provisioning is wired up.
+  if(WIN32)
+    set(_aicad_subdep_default ON)
+  else()
+    set(_aicad_subdep_default OFF)
+  endif()
+  option(AICAD_WITH_NETGEN    "Netgen/nglib FEA tet mesher (sim/mesher.cpp, fea_run)" ${_aicad_subdep_default})
+  option(AICAD_WITH_LIB3MF    "lib3mf 3MF reader/writer (doc/formats.cpp)"            ${_aicad_subdep_default})
+  option(AICAD_WITH_OPENNURBS "openNURBS Rhino .3dm reader/writer (doc/formats.cpp)"  ${_aicad_subdep_default})
+
   # --- P50: Netgen / nglib tet mesher (LGPL-2.1 — commercial-safe) -----------
   # BUILD Netgen from source against OUR OCCT (no prebuilt SDK exists); see
   # ProvisionNetgen.cmake. nglib.h lives ONLY in mesher.cpp (mesher.h is backend-
   # free); aicad_mesh links nglib's import lib and nglib.dll + ngcore.dll are staged
   # next to libaicad.dll. This replaced gmsh (GPL-2+, no linking exception) — the #1
   # commercialization blocker. MUST come AFTER ProvisionOCCT (shares its OCCT + zlib).
-  include(ProvisionNetgen)
+  if(AICAD_WITH_NETGEN)
+    include(ProvisionNetgen)
+    # ELF runtime-path: nglib lives in the Netgen install lib dir (out of the loader's default
+    # search). Bake that dir into the BUILD_RPATH of every target defined below (libaicad + the
+    # FEA-mesh tests) so they resolve libnglib.so; libnglib itself has $ORIGIN rpath so it then
+    # finds its sibling libngcore.so. No-op on Windows (DLLs are co-located/staged instead).
+    if(NOT WIN32)
+      get_filename_component(_ng_libdir "${NETGEN_IMPORT_LIB}" DIRECTORY)
+      list(APPEND CMAKE_BUILD_RPATH "$ORIGIN" "${_ng_libdir}")
+    endif()
+  endif()
 
   # --- P55r: lib3mf 3MF reader/writer (BSD — clean to link/distribute) -------
   # Provision the SAME lib3mf 2.5.0 the Python oracle (engine/doc/formats.py)
@@ -370,7 +408,9 @@ if(AICAD_WITH_OCCT)
   # ONLY in doc/formats.cpp and dlopens lib3mf.dll at runtime (no import lib on
   # the link line); aicad_doc compiles with AICAD_WITH_LIB3MF + the binding's
   # include dir, and lib3mf.dll is staged next to libaicad.dll below.
-  include(ProvisionLib3mf)
+  if(AICAD_WITH_LIB3MF)
+    include(ProvisionLib3mf)
+  endif()
 
   # --- P55s: openNURBS (Rhino .3dm read/write) — MIT-ish, built FROM SOURCE ---
   # Provision + build opennurbsStatic from the SAME rhino3dm v8.17.0 the Python
@@ -378,21 +418,26 @@ if(AICAD_WITH_OCCT)
   # .3dm mesh extraction (ON_Mesh m_V float32 + m_F quad/tri) is bit-identical.
   # opennurbs.h lives ONLY in doc/formats.cpp; aicad_doc compiles with
   # AICAD_WITH_OPENNURBS + the include dir and links opennurbsStatic below.
-  include(ProvisionOpenNURBS)
+  if(AICAD_WITH_OPENNURBS)
+    include(ProvisionOpenNURBS)
+  endif()
 
   # P50b: sim/fea_run.cpp (the combined mesh+resolve+solve glue) joins the mesher
   # target — it is the only sim source that needs the mesher, and adding it here
   # keeps the mesher-backend confinement intact (fea_run.h itself is nglib-free).
   # aicad_mesh gains a PUBLIC dep on aicad_sim so fea_run.cpp can call the FEA solvers.
-  add_library(aicad_mesh STATIC sim/mesher.cpp sim/hex_mesher.cpp sim/fea_run.cpp sim/fea_fatigue.cpp)
-  target_include_directories(aicad_mesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-  target_include_directories(aicad_mesh PRIVATE ${NETGEN_INCLUDE_DIRS})
-  # nglib's import lib is PUBLIC so it propagates onto the final link line of the
-  # `aicad` DLL that consumes this static lib (a STATIC lib's link deps aren't pulled
-  # in transitively otherwise). nglib.h decorates its prototypes dllimport on WIN32.
-  target_link_libraries(aicad_mesh PUBLIC ${NETGEN_IMPORT_LIB} aicad_sim nlohmann_json::nlohmann_json)
-  set_property(TARGET aicad_mesh PROPERTY
-    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+  # Gated on AICAD_WITH_NETGEN: the mesher (mesher.cpp) is the only nglib consumer.
+  if(AICAD_WITH_NETGEN)
+    add_library(aicad_mesh STATIC sim/mesher.cpp sim/hex_mesher.cpp sim/fea_run.cpp sim/fea_fatigue.cpp)
+    target_include_directories(aicad_mesh PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(aicad_mesh PRIVATE ${NETGEN_INCLUDE_DIRS})
+    # nglib's import lib is PUBLIC so it propagates onto the final link line of the
+    # `aicad` DLL that consumes this static lib (a STATIC lib's link deps aren't pulled
+    # in transitively otherwise). nglib.h decorates its prototypes dllimport on WIN32.
+    target_link_libraries(aicad_mesh PUBLIC ${NETGEN_IMPORT_LIB} aicad_sim nlohmann_json::nlohmann_json)
+    set_property(TARGET aicad_mesh PROPERTY
+      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+  endif()
   # Smoke test: box -> volume (BRepGProp) -> tessellation (BRepMesh). Proves the
   # auto-provisioned kernel is found, linked, and runnable end to end.
   add_executable(occt_smoke geom/occt_smoke.cpp)
@@ -475,6 +520,8 @@ if(AICAD_WITH_OCCT)
     # whole OCCT bin dir).
     TKRWMesh TKDEOBJ TKDEGLTF TKXCAF TKLCAF TKCDF TKBin TKBinL TKBinXCAF)
 
+  # --- Netgen-mesher-dependent wiring + tests (gated on AICAD_WITH_NETGEN) ----
+  if(AICAD_WITH_NETGEN)
   # sim/fea_fatigue.cpp (in aicad_mesh, defined above) calls fatigue_overlay from
   # sim/overlay.cpp (in aicad_geom_occt). Wire that dep here — AFTER aicad_geom_occt
   # exists — so the fatigue solver can package its display overlay. PRIVATE: only
@@ -515,6 +562,7 @@ if(AICAD_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME netgen_mesh COMMAND test_netgen_mesh)
   set_tests_properties(netgen_mesh PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
+  endif()  # AICAD_WITH_NETGEN
 
   # FEA boundary-surface extractor: fea_surface_body (the result-plot display surface,
   # so a bent beam renders curved). No STEP/mesher — builds structured tet meshes in
@@ -677,22 +725,38 @@ if(AICAD_WITH_OCCT)
     ${OpenCASCADE_INCLUDE_DIR})
   # 3MF (doc/formats.cpp): the lib3mf CppDynamic binding header + the enabling
   # define, PRIVATE so the binding stays confined to formats.cpp's TU and does
-  # not leak onto aicad_doc's public include interface.
-  target_include_directories(aicad_doc PRIVATE ${LIB3MF_INCLUDE_DIR})
-  target_compile_definitions(aicad_doc PRIVATE AICAD_WITH_LIB3MF)
+  # not leak onto aicad_doc's public include interface. (gated: AICAD_WITH_LIB3MF —
+  # formats.cpp compiles out its 3MF path when the define is absent.)
+  if(AICAD_WITH_LIB3MF)
+    target_include_directories(aicad_doc PRIVATE ${LIB3MF_INCLUDE_DIR})
+    target_compile_definitions(aicad_doc PRIVATE AICAD_WITH_LIB3MF)
+  endif()
   # openNURBS (.3dm): the opennurbs include dir + the enabling define, PRIVATE so
   # opennurbs.h stays confined to formats.cpp's TU; opennurbsStatic is linked
   # PUBLIC so it propagates onto the final libaicad DLL link line. UNICODE/_UNICODE
   # are required by opennurbs.h (its ON_wString APIs assume the wide CRT) — set
-  # PRIVATE on aicad_doc so only this lib's TUs see them.
-  target_include_directories(aicad_doc PRIVATE ${OPENNURBS_INCLUDE_DIR})
-  target_compile_definitions(aicad_doc PRIVATE AICAD_WITH_OPENNURBS UNICODE _UNICODE)
+  # PRIVATE on aicad_doc so only this lib's TUs see them. (gated: AICAD_WITH_OPENNURBS —
+  # formats.cpp compiles out its .3dm path when the define is absent.)
+  if(AICAD_WITH_OPENNURBS)
+    target_include_directories(aicad_doc PRIVATE ${OPENNURBS_INCLUDE_DIR})
+    target_compile_definitions(aicad_doc PRIVATE AICAD_WITH_OPENNURBS UNICODE _UNICODE)
+  endif()
   target_link_libraries(aicad_doc PUBLIC
     aicad_geom_occt aicad_sketch aicad_geom aicad_util
     aicad_mate
     aicad_miniz
-    opennurbsStatic
     nlohmann_json::nlohmann_json)
+  if(AICAD_WITH_OPENNURBS)
+    if(WIN32)
+      target_link_libraries(aicad_doc PUBLIC opennurbsStatic)
+    else()
+      # opennurbsStatic (MY_ZCALLOC -> it provides zcalloc/zcfree) and its bundled `zlib`
+      # archive (which CALLS zcfree but, built with MY_ZCALLOC, doesn't define it) form a
+      # circular static-lib dependency. MSVC's linker rescans automatically; GNU ld needs
+      # both archives inside one --start-group/--end-group, which $<LINK_GROUP:RESCAN> emits.
+      target_link_libraries(aicad_doc PUBLIC "$<LINK_GROUP:RESCAN,opennurbsStatic,zlib>")
+    endif()
+  endif()
 
   # Verification: compile a document -> write_aicm -> HOST render::parseAicm, with
   # the parametric-rebuild case (same doc, two envs -> two solids). Same wiring as
@@ -907,53 +971,55 @@ if(AICAD_WITH_OCCT)
   set_tests_properties(picks PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- libaicad: the C ABI SHARED library (the host-integration seam) ---------
-  # api/libaicad.{h,cpp} exposes a flat C ABI (aicad_call/aicad_free/
-  # aicad_abi_version) over aicad::doc::compile_document so the host can LoadLibrary
-  # this DLL at runtime and route ported methods to the in-process C++ core (the
-  # strangler seam; see docs/CPP_MIGRATION.md). Built as a SEPARATE libaicad.dll
-  # (user's choice) so OCCT stays OUT of the host exe and the link is reversible.
-  # aicad_doc (STATIC) drags in the whole OCCT geom kernel transitively, so the DLL
-  # imports the TK* toolkit DLLs — staged next to it by aicad_occt_copy_dlls.
+  # api/libaicad.{h,cpp} exposes a flat C ABI (aicad_call/aicad_free/aicad_abi_version)
+  # over aicad::doc::compile_document so the host can load this lib at runtime
+  # (LoadLibrary on Windows / dlopen on Linux) and route ported methods to the in-process
+  # C++ core (the strangler seam; see docs/CPP_MIGRATION.md). aicad_doc (STATIC) drags in
+  # the whole OCCT geom kernel transitively. The Netgen FEA-mesh RPCs in libaicad.cpp are
+  # compiled out unless AICAD_WITH_NETGEN, so the lib builds without the mesher (geometry,
+  # sketch, features, STEP/IGES/STL still work — those need only OCCT).
   add_library(aicad SHARED
     api/libaicad.cpp)
   target_include_directories(aicad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
-  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_mesh aicad_agent aicad_parts aicad_prof)
+  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_agent aicad_parts aicad_prof)
+  if(AICAD_WITH_NETGEN)
+    target_link_libraries(aicad PRIVATE aicad_mesh)
+    target_compile_definitions(aicad PRIVATE AICAD_WITH_NETGEN)  # enable the mesh RPCs in libaicad.cpp
+  endif()
   # Ship a usable PDB next to libaicad.dll WITHOUT dropping optimization, so the sampling
   # profiler resolves OUR frames to real names (OCCT stays module-level — no OCCT PDBs).
-  # /Zi adds full debug info to the optimized objects; /DEBUG emits the PDB; /OPT:REF,ICF
-  # undo /DEBUG's default of disabling these (keep the Release code size/speed).
   if(MSVC)
     target_compile_options(aicad PRIVATE /Zi)
     target_link_options(aicad PRIVATE /DEBUG /OPT:REF /OPT:ICF)
   endif()
   set_target_properties(aicad PROPERTIES
-    OUTPUT_NAME libaicad   # -> libaicad.dll + libaicad.lib (the host loads by this name)
+    OUTPUT_NAME libaicad   # Windows: libaicad.dll. With PREFIX "" below, Linux: libaicad.so
+    PREFIX ""              # don't prepend the usual lib -> the host loads it as "libaicad.{dll,so}"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-  # Stage the OCCT toolkit + 3rdparty (jemalloc/tbb) DLLs next to libaicad.dll so
-  # its imports resolve when it is loaded from the same directory.
+  # Stage the OCCT toolkit + 3rdparty DLLs next to libaicad (no-op on non-Windows: the
+  # system loader resolves the .so dependencies).
   aicad_occt_copy_dlls(aicad)
-  # Stage Netgen's nglib.dll + ngcore.dll + zlib.dll too (aicad_mesh's runtime deps,
-  # imported by libaicad.dll).
-  aicad_netgen_copy_dlls(aicad)
-  # Stage lib3mf.dll next to libaicad.dll so the CppDynamic binding in
-  # doc/formats.cpp can loadLibrary it at runtime (3MF read/write).
-  aicad_lib3mf_copy_dll(aicad)
+  if(AICAD_WITH_NETGEN)
+    aicad_netgen_copy_dlls(aicad)  # nglib.dll + ngcore.dll + zlib.dll (aicad_mesh runtime deps)
+  endif()
+  if(AICAD_WITH_LIB3MF)
+    aicad_lib3mf_copy_dll(aicad)   # lib3mf.dll for the CppDynamic 3MF binding
+  endif()
 
-  # --- aicad_probe: load libaicad.dll the way the HOST will (LoadLibrary) ------
-  # Links NEITHER the core static libs NOR OCCT — only nlohmann_json. It dlopens
-  # libaicad.dll, exercises ping + doc_compile_cpp + the unknown-method fallback
-  # signal, and asserts a real box compile produced AICM bytes. This isolates and
-  # validates the entire runtime-load + OCCT-DLL-discovery story before any host
-  # code changes.
+  # --- aicad_probe: load libaicad the way the HOST will (dlopen / LoadLibrary) -
+  # Links NEITHER the core static libs NOR OCCT — only nlohmann_json. It loads
+  # libaicad, exercises ping + doc_compile_cpp + the unknown-method fallback signal,
+  # and asserts a real box compile produced AICM bytes — validating the entire
+  # runtime-load + dependency-discovery story before any host code changes.
   add_executable(aicad_probe api/aicad_probe.cpp)
   target_include_directories(aicad_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(aicad_probe PRIVATE nlohmann_json::nlohmann_json)
   set_target_properties(aicad_probe PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-  add_dependencies(aicad_probe aicad)  # DLL built + OCCT DLLs staged before the probe runs
+  add_dependencies(aicad_probe aicad)  # lib built (+ OCCT DLLs staged) before the probe runs
   add_test(NAME probe COMMAND aicad_probe)
   # Same OCCT DLL PATH prepend as the other OCCT tests, as a backup to the staged DLLs.
   set_tests_properties(probe PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")

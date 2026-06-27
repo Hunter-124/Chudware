@@ -321,7 +321,7 @@ int main(int argc, char** argv) {
         // smoke-test invocation `AI-CAD --ui-screenshot`), default to a PNG next to the exe so
         // `shot` is still enabled and the capture-then-exit path runs (otherwise we'd fall
         // through to interactive GUI mode and hang headlessly, never writing a PNG).
-        static std::string defShot = exeDir() + "\\ui_screenshot.png";
+        static std::string defShot = exeDir() + "/ui_screenshot.png";
         return run_gui(argc >= 3 ? argv[2] : defShot.c_str());
     }
     // "Open with" / file association (task 05): a bare path argument — the verb the OS invokes when

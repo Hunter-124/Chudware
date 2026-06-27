@@ -97,6 +97,68 @@ def test_render_part_returns_image():
     assert item.data, "empty image payload"
 
 
+def _find_image(x):
+    if getattr(x, "type", "") == "image":
+        return x
+    if isinstance(x, (list, tuple)):
+        for e in x:
+            found = _find_image(e)
+            if found is not None:
+                return found
+    return None
+
+
+def test_render_part_custom_angle_returns_image():
+    # Task 03: render_part now takes an on-request view (named or {azimuth,elevation}). Each yields
+    # a real PNG, and the core echoes the resolved camera, proving the angle actually applied.
+    doc = _new_plate_with_hole()
+    from mcp_server import server
+
+    for view in ("right", {"azimuth": 30, "elevation": 20}):
+        result = asyncio.run(
+            server.mcp.call_tool("render_part", {"doc_id": doc, "view": view}))
+        item = _find_image(result)
+        assert item is not None, f"no ImageContent for view={view!r} in {result!r}"
+        assert getattr(item, "mimeType", "").startswith("image/"), item
+        assert item.data, "empty image payload"
+
+    # azimuth 90 / elevation 0 resolves to the same camera as the named "right" view.
+    import os
+    png = _tmp_png()
+    r = cb.call("doc_render_view",
+                {"doc_id": doc, "out_path": png, "view": {"azimuth": 90, "elevation": 0}})
+    assert r.get("ok"), r
+    assert os.path.exists(png)
+    assert abs(r["dir"][0] - 1.0) < 1e-6 and abs(r["dir"][1]) < 1e-6, r  # looks down +X
+
+
+def test_contact_sheet_returns_image():
+    # Task 03: contact_sheet tiles several labelled views into one PNG.
+    doc = _new_plate_with_hole()
+    from mcp_server import server
+
+    result = asyncio.run(server.mcp.call_tool("contact_sheet", {"doc_id": doc}))
+    item = _find_image(result)
+    assert item is not None, f"no ImageContent in {result!r}"
+    assert getattr(item, "mimeType", "").startswith("image/"), item
+    assert item.data, "empty image payload"
+
+    # Explicit view list is honoured; the core reports the tiled view names.
+    import os
+    png = _tmp_png()
+    r = cb.call("doc_render_contact_sheet",
+                {"doc_id": doc, "out_path": png, "views": ["front", "top"]})
+    assert r.get("ok") and os.path.exists(png), r
+    assert [v.upper() for v in r["views"]] == ["FRONT", "TOP"], r
+
+
+def _tmp_png():
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    return path
+
+
 def test_measure_part():
     doc = _new_plate_with_hole()
     r, _ = _call("measure_part", {"doc_id": doc})

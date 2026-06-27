@@ -734,6 +734,29 @@ json config_effective_features(const json& features, const json* config) {
     return out;
 }
 
+void apply_doc_appearance(const json& doc, uint32_t body_num,
+                          float color[3], float& metallic, float& roughness) {
+    if (!doc.contains("appearances") || !doc["appearances"].is_object()) return;
+    const json& ap = doc["appearances"];
+    const std::string key = "b" + std::to_string(body_num);
+    if (!ap.contains(key)) return;
+    const json& v = ap.at(key);
+    auto c01 = [](double x) { return (float)(x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x)); };
+    auto read_rgb = [&](const json& a) {
+        if (a.is_array() && a.size() >= 3 && a[0].is_number())
+            for (int i = 0; i < 3; ++i) color[i] = c01(a[i].get<double>());
+    };
+    if (v.is_array()) {
+        read_rgb(v);  // bare [r,g,b]
+    } else if (v.is_object()) {
+        if (v.contains("color")) read_rgb(v.at("color"));
+        if (v.contains("metallic") && v.at("metallic").is_number())
+            metallic = c01(v.at("metallic").get<double>());
+        if (v.contains("roughness") && v.at("roughness").is_number())
+            roughness = c01(v.at("roughness").get<double>());
+    }
+}
+
 CompileResult compile_document(const json& doc, const json& env_json) {
     CompileResult result;
     const EnvMap env = parse_env(env_json);
@@ -6249,6 +6272,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     std::vector<aicm::AicmBody> bodies;
     const float color[3] = {0.71f, 0.76f, 0.82f};  // default dielectric grey
     uint32_t body_num = 1;
+    const bool has_appearances = doc.contains("appearances") && doc["appearances"].is_object();
     // Per-TShape stats cache: volume/area/face-count/edge-count are geometry-only (location-
     // invariant), so instanced bodies that SHARE a TShape (e.g. the 4 wheels) compute the
     // mass props ONCE. Keyed by (TShape*, is_surface) so a surface vs solid use of the same
@@ -6260,7 +6284,14 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         const TopoDS_Shape& shape = std::get<SolidResult>(results.at(sid)).shape;
         if (shape.IsNull()) continue;
         try {
-            bodies.push_back(::geom::tessellate_body(shape, body_num, sid, color));
+            // Per-body appearance (C26 colour + C32-A material) baked into the AICM so the host
+            // render + doc_render_png reflect a set_appearance op. Default dielectric grey unless
+            // doc["appearances"]["b<body_num>"] overrides.
+            float bcolor[3] = {color[0], color[1], color[2]};
+            float bmetal = 0.0f, brough = 0.5f;
+            if (has_appearances) apply_doc_appearance(doc, body_num, bcolor, bmetal, brough);
+            bodies.push_back(::geom::tessellate_body(shape, body_num, sid, bcolor,
+                                                     0.05, 0.35, bmetal, brough));
             result.shapes.push_back(shape);  // AICM order: shapes[i] <-> body ordinal i+1
             ++body_num;
             // Per-body stats: SURFACE bodies report meaningful AREA + face/edge counts

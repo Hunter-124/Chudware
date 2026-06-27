@@ -2248,6 +2248,49 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
     } else if (k == "set_material") {
         doc["material"] = op.contains("key") && !op["key"].is_null()
                               ? json{{"key", op["key"]}} : json(nullptr);
+    } else if (k == "set_appearance") {
+        // C26 body colour + C32-A RealView material (doc_ops.md). `id` is a body key ("b<ordinal>"
+        // for a part body, component id for assembly). A null/absent `color` clears the body back to
+        // the default; a colour with metallic/roughness stores the {color,metallic,roughness} form,
+        // colour alone stores a bare [r,g,b]. The batch bumps the revision, so the AICM re-bakes.
+        const std::string id = op.value("id", std::string());
+        if (id.empty()) throw OpError("invalid_op", "set_appearance: missing body id");
+        if (!doc.contains("appearances") || !doc["appearances"].is_object())
+            doc["appearances"] = json::object();
+        json& ap = doc["appearances"];
+        const bool color_null = op.contains("color") && op["color"].is_null();
+        const bool has_color = op.contains("color") && op["color"].is_array() &&
+                               op["color"].size() >= 3;
+        auto c01 = [](double x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); };
+        if (color_null) {
+            ap.erase(id);  // clear to default
+        } else if (has_color) {
+            json col = json::array();
+            for (int i = 0; i < 3; ++i) col.push_back(c01(op["color"][i].get<double>()));
+            const bool m = op.contains("metallic") && op["metallic"].is_number();
+            const bool r = op.contains("roughness") && op["roughness"].is_number();
+            if (m || r) {
+                json val = json{{"color", col}};
+                if (m) val["metallic"] = c01(op["metallic"].get<double>());
+                if (r) val["roughness"] = c01(op["roughness"].get<double>());
+                ap[id] = val;
+            } else {
+                ap[id] = col;  // bare [r,g,b]
+            }
+        } else if (op.contains("metallic") || op.contains("roughness")) {
+            // Finish-only tweak on an existing entry: keep its colour, update the material.
+            json val = ap.contains(id) && ap[id].is_object()
+                           ? ap[id]
+                           : json{{"color", ap.contains(id) && ap[id].is_array()
+                                                ? ap[id]
+                                                : json::array({0.71, 0.76, 0.82})}};
+            if (op.contains("metallic") && op["metallic"].is_number())
+                val["metallic"] = c01(op["metallic"].get<double>());
+            if (op.contains("roughness") && op["roughness"].is_number())
+                val["roughness"] = c01(op["roughness"].get<double>());
+            ap[id] = val;
+        }
+        if (ap.empty()) doc.erase("appearances");
     } else if (k == "set_rollback") {
         if (op.contains("after") && !op["after"].is_null()) doc["rollback_after"] = op["after"];
         else doc.erase("rollback_after");
@@ -2396,8 +2439,14 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
         json bodies = json::array();
         for (int i = 0; i < r.body_count; ++i) {
             const std::string key = "b" + std::to_string(i + 1);
-            bodies.push_back({{"body_id", i + 1}, {"name", key}, {"color", {0.71, 0.76, 0.82}},
-                              {"owner_key", key}, {"metallic", 0.0}, {"roughness", 0.5},
+            // Report the per-body appearance (set_appearance) so the host's body list / swatch agree
+            // with the baked AICM, instead of always showing the default grey dielectric.
+            float bcolor[3] = {0.71f, 0.76f, 0.82f};
+            float bmetal = 0.0f, brough = 0.5f;
+            apply_doc_appearance(s.doc, (uint32_t)(i + 1), bcolor, bmetal, brough);
+            bodies.push_back({{"body_id", i + 1}, {"name", key},
+                              {"color", {bcolor[0], bcolor[1], bcolor[2]}},
+                              {"owner_key", key}, {"metallic", bmetal}, {"roughness", brough},
                               {"kind", "solid"}});
         }
         resp["tess"] = {{"aicm_path", aicm_path}, {"bodies", bodies}};
@@ -4436,7 +4485,13 @@ static std::vector<aicm::AicmBody> tessellate_session_bodies(Session& s) {
     const float color[3] = {0.62f, 0.70f, 0.82f};
     for (const auto& shp : r.shapes) {
         try {
-            bodies.push_back(::geom::tessellate_body(shp, id, "b" + std::to_string(id), color));
+            // Apply any set_appearance colour/material so the render path (doc_render_png /
+            // doc_render_view / CFD preview) matches the host's baked AICM. Default grey otherwise.
+            float bcolor[3] = {color[0], color[1], color[2]};
+            float bmetal = 0.0f, brough = 0.5f;
+            apply_doc_appearance(s.doc, id, bcolor, bmetal, brough);
+            bodies.push_back(::geom::tessellate_body(shp, id, "b" + std::to_string(id), bcolor,
+                                                     0.05, 0.35, bmetal, brough));
             ++id;
         } catch (...) {
         }

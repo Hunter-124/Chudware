@@ -512,6 +512,55 @@ def _resolve_material(material: Union[str, dict, None]) -> dict:
     return mat
 
 
+# Visual material presets (APPEARANCE only — distinct from the FEA mechanical `_MATERIALS` table
+# above). Each maps a friendly name to the set_appearance fields: an [r,g,b] tint (0..1) + a RealView
+# finish (metallic, roughness). Mirrors the host's appearance_common.cpp preset table so a material
+# named in chat looks the same as one picked in the PropertyManager.
+_APPEARANCE_PRESETS = {
+    "plastic":   {"color": [0.71, 0.76, 0.82], "metallic": 0.0,  "roughness": 0.50},
+    "abs":       {"color": [0.20, 0.21, 0.23], "metallic": 0.0,  "roughness": 0.60},
+    "aluminum":  {"color": [0.83, 0.85, 0.88], "metallic": 0.90, "roughness": 0.35},
+    "steel":     {"color": [0.56, 0.58, 0.62], "metallic": 0.85, "roughness": 0.25},
+    "stainless": {"color": [0.69, 0.71, 0.74], "metallic": 0.88, "roughness": 0.30},
+    "brass":     {"color": [0.80, 0.62, 0.28], "metallic": 0.95, "roughness": 0.30},
+    "copper":    {"color": [0.85, 0.54, 0.40], "metallic": 0.95, "roughness": 0.30},
+    "gold":      {"color": [0.90, 0.74, 0.36], "metallic": 0.97, "roughness": 0.28},
+    "black":     {"color": [0.09, 0.10, 0.12], "metallic": 0.0,  "roughness": 0.50},
+}
+_APPEARANCE_ALIASES = {
+    "aluminium": "aluminum", "al": "aluminum", "ss": "stainless",
+    "stainless steel": "stainless", "pla": "plastic", "abs plastic": "abs",
+    "dark metal": "black",
+}
+
+
+def _resolve_appearance(material: Union[str, dict, list, tuple]) -> dict:
+    """Resolve a visual-material name / dict / [r,g,b] to set_appearance fields {color[,metallic,
+    roughness]}. Raises ValueError on an unknown name or a dict missing a colour."""
+    if isinstance(material, dict):
+        ap: dict = {}
+        col = material.get("color", material.get("rgb"))
+        if col is not None:
+            ap["color"] = [float(c) for c in col][:3]
+        if material.get("metallic") is not None:
+            ap["metallic"] = float(material["metallic"])
+        if material.get("roughness") is not None:
+            ap["roughness"] = float(material["roughness"])
+        if "color" not in ap:
+            raise ValueError("appearance dict needs a 'color': [r,g,b] (0..1)")
+        return ap
+    if isinstance(material, (list, tuple)):
+        return {"color": [float(c) for c in material][:3]}
+    key = str(material).strip().lower()
+    key = _APPEARANCE_ALIASES.get(key, key)
+    if key not in _APPEARANCE_PRESETS:
+        raise ValueError(
+            f"Unknown appearance material {material!r}. Known: {sorted(_APPEARANCE_PRESETS)} "
+            f"(or pass {{'color':[r,g,b], 'metallic':0..1, 'roughness':0..1}})."
+        )
+    return dict(_APPEARANCE_PRESETS[key])
+
+
 def _as_face_query(q: Union[str, dict]) -> dict:
     """Accept a full geometry query dict OR a bare side word ("top", "+z") -> a face query."""
     if isinstance(q, dict):
@@ -719,6 +768,8 @@ WORKFLOW
                                             tinted + labelled TOP/FRONT/RIGHT...). Self-review
                                             against the request; iterate add_features to fix.
   4. measure_part() / query_geometry(q)     check mass/bbox, or explore faces/edges.
+     set_material("aluminum" | {color,...})  give a body its appearance (colour + finish); it
+                                            persists in the .step+ and shows in render_part.
   5. run_fea_static(...) / run_cfd_flow(...) prove it (see cad_guide("simulation")).
   6. save_part()                            save the NATIVE .step+ — the editable feature tree
                                             PLUS its simulation studies + any drawings, in one
@@ -1053,6 +1104,41 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 return Image(path=png)
             raise ValueError(f"Render failed: {r.get('reason', 'no bodies to render')}")
         return Image(path=png)
+
+    @mcp.tool()
+    def set_material(material: Union[str, dict, list],
+                     body: Optional[Union[str, int]] = None,
+                     doc_id: Optional[str] = None) -> str:
+        """Set a body's MATERIAL APPEARANCE — colour + finish — so it renders like the real material.
+
+        material: a preset name (aluminum, steel, stainless, brass, copper, gold, plastic, abs,
+        black) OR an explicit dict {"color": [r,g,b] 0..1, "metallic"?: 0..1, "roughness"?: 0..1},
+        OR a bare [r,g,b] list for a plain colour.
+        body: which body — "b1", "b2", ... (1-based) or an int ordinal. Default: ALL bodies.
+
+        Persists on the document (round-trips through the native .step+) and is picked up by
+        render_part. NOTE: this is the VISUAL material; to set the material for SIMULATION
+        (density/stiffness) pass `material=` to run_fea_static / run_cfd_flow instead.
+        """
+        try:
+            d = _doc(doc_id)
+            ap = _resolve_appearance(material)
+            # Resolve target body keys. None -> all bodies (an empty op batch returns the tess
+            # body list without mutating the doc); int -> "b<n>"; str -> the key as given.
+            if body is None:
+                info = cb.call("doc_apply_ops", {"doc_id": d, "ops": []})
+                n = len(info.get("tess", {}).get("bodies", [])) or 1
+                targets = [f"b{i + 1}" for i in range(n)]
+            elif isinstance(body, int):
+                targets = [f"b{body}"]
+            else:
+                targets = [str(body)]
+            ops = [{"op": "set_appearance", "id": k, **ap} for k in targets]
+            r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
+            return _dumps({"ok": True, "doc_id": d, "bodies": targets,
+                           "appearance": ap, "revision": r.get("revision")})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
 
     @mcp.tool()
     def measure_part(doc_id: Optional[str] = None, density_g_cm3: float = 7.85) -> str:

@@ -190,6 +190,44 @@ static bool newDocTile(const char* id, const char* title, const char* desc,
     return clicked;
 }
 
+// Task 02: non-intrusive "AI editing" badge painted over the 3D view while the in-app copilot
+// (agent_run_v2) is driving the document, so the user SEES that the AI — not they — is making the
+// edits that land live in the viewport. Driven off the same run lifecycle (agentV2Running /
+// agentV2Status) that feeds the Activity panel, so panel and viewport tell one story. Uses the
+// shared viewport-pill palette so it reads like the other 3D-view overlays. Top-center, gentle
+// pulse, single short line — the Activity panel carries the full per-stage detail.
+static void drawAiActivityBadge(ImVec2 vr0, ImVec2 vr1, const std::string& status) {
+    const auto& pal = ui::palette;
+    const float S = ui::uiScale;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // Pulse reads as "live/working" without flashing (0.55..1.0).
+    float pulse = 0.55f + 0.45f * (0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 3.0f));
+
+    std::string label = "AI editing";
+    if (!status.empty()) {
+        std::string s = status;
+        const size_t kMax = 40;
+        if (s.size() > kMax) s = s.substr(0, kMax - 1) + "\xE2\x80\xA6";  // ellipsis
+        label += "  \xC2\xB7  " + s;  // middle dot
+    }
+
+    ImVec2 ts = ImGui::CalcTextSize(label.c_str());
+    const float padX = 12.0f * S, padY = 6.0f * S, dotR = 4.0f * S, gap = 8.0f * S;
+    float w = padX + dotR * 2.0f + gap + ts.x + padX;
+    float h = ts.y + padY * 2.0f;
+    float cx = (vr0.x + vr1.x) * 0.5f;
+    ImVec2 p0(cx - w * 0.5f, vr0.y + 10.0f * S);
+    ImVec2 p1(p0.x + w, p0.y + h);
+
+    dl->AddRectFilled(p0, p1, withAlpha(pal.overlayBg, 0.90f), h * 0.5f);
+    dl->AddRect(p0, p1, withAlpha(pal.accent, 0.35f + 0.45f * pulse), h * 0.5f, 0, 1.5f * S);
+    ImVec2 dotc(p0.x + padX + dotR, (p0.y + p1.y) * 0.5f);
+    dl->AddCircleFilled(dotc, dotR, withAlpha(pal.accent, pulse));
+    dl->AddText(ImVec2(dotc.x + dotR + gap, p0.y + padY), withAlpha(pal.overlayText, 1.0f),
+                label.c_str());
+}
+
 // drawNewDocChooser is declared in viewport_panel.h (public — hosted at app scope).
 
 // The open documents live as browser/SolidWorks tabs in the central dock node's tab-bar ROW (where
@@ -1615,6 +1653,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                      ImVec2((float)vw, (float)vh),
                      ImVec2(0, 1), ImVec2(1, 0));
         ImVec2 vr0 = ImGui::GetItemRectMin(), vr1 = ImGui::GetItemRectMax();
+        // Task 02: while the in-app copilot is driving the doc, paint an "AI editing" badge over the
+        // view so the live edits are clearly attributed to the AI (not the user). Same run-lifecycle
+        // signal as the Activity panel; non-intrusive top-center pill.
+        if (st.agentV2Running) drawAiActivityBadge(vr0, vr1, st.agentV2Status);
         // Drop TARGET (Wave 3A item 5): dropping an in-app Explorer file row onto the viewport opens
         // it. The payload is the dragged file's absolute path (NUL-terminated); we hand it to the
         // GL-thread request pump via st.requestOpenPath, which routes CAD vs ECAD by extension — the

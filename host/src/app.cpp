@@ -770,11 +770,27 @@ static bool saveAllDirtyForQuit(AppState& st) {
 
 int run_gui(const char* screenshotPath) {
     const bool shot = screenshotPath != nullptr;
+#ifndef _WIN32
+    // The borderless custom chrome (chrome::tick drag/resize) needs a backend where a client
+    // can position itself; Wayland forbids that, so prefer X11 (XWayland). Fall back to the
+    // default platform if X11 isn't available (the window stays borderless but can't self-move).
+    glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11);
+    if (!glfwInit()) {
+        glfwInitHint(GLFW_PLATFORM, GLFW_ANY_PLATFORM);
+        if (!glfwInit()) return 1;
+    }
+#else
     if (!glfwInit()) return 1;
+#endif
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     if (!shot) glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
+#ifndef _WIN32
+    // Borderless: the app draws its own title bar; chrome::tick handles move/resize. (Windows
+    // creates a normal window and strips the frame later via the WndProc in chrome::install.)
+    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+#endif
     GLFWwindow* win = glfwCreateWindow(shot ? 1340 : 1440, shot ? 838 : 900, "AI-CAD", nullptr, nullptr);
     if (!win) { glfwTerminate(); return 1; }
     glfwMakeContextCurrent(win);
@@ -1645,6 +1661,10 @@ int run_gui(const char* screenshotPath) {
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
+
+        // Borderless-window chrome: drag / edge-resize / double-click-maximize off the same
+        // title-bar HitLayout the GUI publishes. No-op on Windows (the WndProc handles it).
+        chrome::tick(win, &hitLayout);
 
         // Unsaved-changes guard on exit. A close request (title-bar X / Alt+F4 / File > Quit all set
         // glfwSetWindowShouldClose) is intercepted here: if any document has unsaved edits and the

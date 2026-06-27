@@ -865,11 +865,10 @@ json parse_netlist(const std::string& text) {
 // ---------------------------------------------------------------------------
 // PUBLIC: netlist_to_spice_circuit  (== spice.netlist_to_spice_circuit)
 //
-// Maps a schematic netlist dict -> (Circuit, warnings). Mirrors the Python oracle
-// exactly for components carrying an inline "sim" mapping; the SYMBOLS-library
-// fallback (resolve sim by libid) is intentionally NOT reproduced (the C++ core
-// does not port the starter SYMBOL library) — such components are skipped with a
-// "no sim model — skipped" warning, EXACTLY as the oracle does for an unknown libid.
+// Maps a schematic netlist dict -> (Circuit, warnings). Mirrors the Python oracle:
+// inline comp["sim"] takes precedence; otherwise libid resolves against
+// symbol_sim_table() (starter SYMBOLS[].sim + pin name maps). Unknown libids get
+// the oracle's exact "no sim model — skipped" warning.
 // ---------------------------------------------------------------------------
 namespace {
 

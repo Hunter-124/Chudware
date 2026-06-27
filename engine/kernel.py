@@ -22,7 +22,7 @@ import re
 import subprocess
 import sys
 import traceback
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Optional
 
@@ -616,6 +616,12 @@ def run_code_multi(code: str, out_dir: Path, name: str = "model") -> AssemblyRes
         parts=parts_out, fit=fit, warnings=warnings)
 
 
+def _model_result_from_payload(data: dict) -> ModelResult:
+    """Build a :class:`ModelResult` from subprocess JSON, dropping assembly-only keys."""
+    names = {f.name for f in fields(ModelResult)}
+    return ModelResult(**{k: v for k, v in data.items() if k in names})
+
+
 def run_code_isolated(code: str, out_dir: Path, name: str = "model",
                       timeout: float = 60.0) -> ModelResult:
     """Run ``code`` in a fresh subprocess; isolates OCCT crashes/hangs."""
@@ -635,12 +641,13 @@ def run_code_isolated(code: str, out_dir: Path, name: str = "model",
         data = json.loads(proc.stdout.strip().splitlines()[-1])
     except Exception:  # noqa: BLE001
         return ModelResult(ok=False, error=f"Bad worker output:\n{proc.stdout}\n{proc.stderr}")
-    return ModelResult(**data)
+    return _model_result_from_payload(data)
 
 
 def _main_exec() -> None:
     req = json.loads(sys.stdin.read())
-    res = run_code(req["code"], Path(req["out_dir"]), req.get("name", "model"))
+    # Match the worker path: multi-part scripts export per-part + assembly meshes.
+    res = run_code_multi(req["code"], Path(req["out_dir"]), req.get("name", "model"))
     sys.stdout.write(res.to_json().replace("\n", " "))
     sys.stdout.write("\n")
 

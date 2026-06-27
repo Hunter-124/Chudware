@@ -99,10 +99,17 @@ char* dup_cstr(const std::string& s) {
     return p;
 }
 
-// Emit `j` into *out_json (heap) and return `rc`. Always leaves *out_json valid.
+// Emit `j` into *out_json (heap) and return `rc`. On allocation failure returns 1
+// with an {"error":"out of memory"} payload (or nullptr if even that fails).
 int emit(json&& j, char** out_json, int rc) {
-    if (out_json) *out_json = dup_cstr(j.dump());
-    return rc;
+    if (!out_json) return rc;
+    char* p = dup_cstr(j.dump());
+    if (p) {
+        *out_json = p;
+        return rc;
+    }
+    *out_json = dup_cstr(R"({"error":"out of memory"})");
+    return 1;
 }
 
 int emit_error(const std::string& msg, char** out_json) {
@@ -473,6 +480,10 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
     try {
         if (params_json && params_json[0] != '\0') {
             params = json::parse(params_json);
+            if (params.is_null())
+                params = json::object();
+            else if (!params.is_object())
+                return emit_error("params must be a JSON object", out_json);
         }
     } catch (const std::exception& e) {
         return emit_error(std::string("invalid params JSON: ") + e.what(), out_json);
@@ -2175,6 +2186,20 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 return emit(aicad::doc::doc_query(
                                 params.value("doc_id", std::string()),
                                 params.contains("query") ? params["query"] : params),
+                            out_json, 0);
+            if (m == "doc_adjacency")
+                return emit(aicad::doc::doc_adjacency(params.value("doc_id", std::string())),
+                            out_json, 0);
+            if (m == "doc_set_meta")
+                return emit(aicad::doc::doc_set_meta(
+                                params.value("doc_id", std::string()),
+                                params.value("key", std::string()),
+                                params.contains("value") ? params["value"] : json(nullptr)),
+                            out_json, 0);
+            if (m == "doc_get_meta")
+                return emit(aicad::doc::doc_get_meta(
+                                params.value("doc_id", std::string()),
+                                params.value("key", std::string())),
                             out_json, 0);
             // --- C18 interactive sketch mode (engine/doc/session.py sketch_*) ---
             // The worker passes the sketch feature id under "sketch".

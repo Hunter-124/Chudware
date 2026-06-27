@@ -5,9 +5,9 @@ non-zero if any fail. One command for pre-commit / CI.
     python scripts/check.py
 
 Gates (all stdlib-only — they parse source/docs, so they need NO engine/OCCT deps and run fast):
-  - gui_lint --rule all   : icon names exist in the atlas; no applyTheme(.,1.0f) HiDPI-collapse bug;
-                            chrome pixel literals are * uiScale. World-space draw-list art is
-                            reported as the non-gating "scale-ws" rule (informational only).
+  - gui_lint icons+theme  : icon names exist in the atlas; no applyTheme(.,1.0f) HiDPI-collapse bug.
+                            (The heuristic `scale` rule ratchets separately via a baseline — see
+                            docs/TESTING_STANDARDS.md — and is NOT part of this gate.)
   - feature_surface_audit : every visible ribbon command routes to a real handler (no dead buttons).
   - parity_audit          : every machine-checkable SW_PARITY_SPEC done/beyond claim resolves to real
                             code (no spec<->code drift).
@@ -25,7 +25,8 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 GATES = [
-    ("gui_lint (icons / theme / scale)", ["scripts/gui_lint.py", "--rule", "all"]),
+    ("gui_lint (icons)", ["scripts/gui_lint.py", "--rule", "icons"]),
+    ("gui_lint (theme)", ["scripts/gui_lint.py", "--rule", "theme"]),
     ("feature_surface_audit (ribbon -> handlers)", ["scripts/feature_surface_audit.py"]),
     ("parity_audit (spec <-> code drift)", ["scripts/parity_audit.py"]),
 ]

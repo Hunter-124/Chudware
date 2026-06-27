@@ -246,6 +246,16 @@ TEST_CASE("openai message text-join branch") {
     CHECK(m["content"] == "a\n\nb");
 }
 
+TEST_CASE("message parts tolerate null text field") {
+    // Resolved provider descriptors may carry text:null; value() would throw type_error.302.
+    json null_text = json{{"type", "text"}, {"text", nullptr}};
+    CHECK(anthropic_block(null_text)["text"] == "");
+    CHECK(openai_content(null_text)["text"] == "");
+    CHECK(gemini_part(null_text)["text"] == "");
+    json parts = json::array({null_text, text_part("ok")});
+    CHECK(openai_message("user", parts)["content"] == "\n\nok");
+}
+
 TEST_CASE("anthropic parse concat") {
     json resp = {{"content", json::array({
                                  {{"type", "thinking"}, {"thinking", "reasoning"}},

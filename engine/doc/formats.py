@@ -26,15 +26,9 @@ registers these via ``_METHODS.update(formats.WORKER_METHODS)``.  The handlers f
 worker_rpc.md calling convention: ``handler(params, emit) -> result_dict``  where *emit* is a
 callable for streaming events.
 
-    ``import_file {path, into?: doc_id}``
-        Opens the file with :func:`import_path`, constructs one ``import`` feature per body,
-        applies them through the session (``doc_apply_ops``), and returns an ops-response.
-        When ``into`` is supplied the features are appended to that document; otherwise a new
-        part session is created.
-
-    ``export_file {doc_id, path, format}``
-        Compiles the current document (uses the cached last_result) and exports all bodies to
-        the requested format.  Returns ``{path}``.
+    ``doc_formats {}``
+        Returns the import/export format matrix (``list_formats()``) so the host can build
+        Open/Import/Export filters.  ``import_file`` / ``export_file`` moved to the C++ core.
 """
 
 from __future__ import annotations

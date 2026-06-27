@@ -570,6 +570,18 @@ static Mesh meshFromBody(const render::BodyMesh& b) {
     return m;
 }
 
+// Drop id-pass / overlay GPU buffers when the viewport has no document mesh (empty doc, tab
+// close, or a rebuild that produced zero bodies). Requires a current GL context.
+static void clearPickBuffers(render::IdPass* idPass, render::Overlays* overlays) {
+    render::DocMesh empty;
+    std::string discard;
+    if (idPass) {
+        idPass->setDoc(empty, discard);
+        idPass->setHiddenBodies({});
+    }
+    if (overlays) overlays->setDoc(empty, discard);
+}
+
 bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool renderOnly) {
     if (!renderer || !idPass || !overlays) { err = "render objects not initialized"; return false; }
     render::DocMesh doc;
@@ -601,6 +613,7 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool r
         // tracks the document; before, the stale previous mesh kept rendering and the
         // rollback bar looked like it did nothing.
         if (renderer) renderer->setMeshes(std::vector<Renderer::PartMesh>{});
+        clearPickBuffers(idPass, overlays);
         bodyVisible.clear();
         docBodyIds.clear();
         applyBodyVisibility();
@@ -798,6 +811,7 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool r
 
 void AppState::clearViewportForNewDoc() {
     if (renderer) renderer->setMeshes(std::vector<Renderer::PartMesh>{});
+    clearPickBuffers(idPass, overlays);
     hasDocMesh = false;
     // Solid Bodies visibility: a fresh doc starts with no bodies and nothing hidden (stale hides
     // must never leak into the next document).

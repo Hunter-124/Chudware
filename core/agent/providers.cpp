@@ -91,7 +91,7 @@ std::string pstr(const json& part, const char* key) {
 // --------------------------------------------------------------------------- anthropic
 json anthropic_block(const json& part) {
     if (pstr(part, "type") == "text") {
-        return json{{"type", "text"}, {"text", part.value("text", std::string())}};
+        return json{{"type", "text"}, {"text", pstr(part, "text")}};
     }
     std::string data = base64_encode(read_file_bytes(pstr(part, "path")));
     return json{
@@ -187,7 +187,7 @@ std::string openai_normalize_base_url(const std::string& base_url) {
 
 json openai_content(const json& part) {
     if (pstr(part, "type") == "text") {
-        return json{{"type", "text"}, {"text", part.value("text", std::string())}};
+        return json{{"type", "text"}, {"text", pstr(part, "text")}};
     }
     std::string data = base64_encode(read_file_bytes(pstr(part, "path")));
     return json{{"type", "image_url"},
@@ -207,7 +207,7 @@ json openai_message(const std::string& role, const json& parts) {
         bool first = true;
         for (const auto& p : parts) {
             if (!first) joined += "\n\n";
-            joined += p.value("text", std::string());
+            joined += pstr(p, "text");
             first = false;
         }
         return json{{"role", role}, {"content", joined}};
@@ -275,7 +275,7 @@ const char* kGeminiDefaultModel = "gemini-2.5-flash";
 // One content part -> a Gemini part: text -> {text}; image -> {inline_data:{mime_type,data}}.
 json gemini_part(const json& part) {
     if (pstr(part, "type") == "text") {
-        return json{{"text", part.value("text", std::string())}};
+        return json{{"text", pstr(part, "text")}};
     }
     std::string data = base64_encode(read_file_bytes(pstr(part, "path")));
     return json{{"inline_data", {{"mime_type", "image/png"}, {"data", data}}}};

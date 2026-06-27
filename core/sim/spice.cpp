@@ -7,8 +7,8 @@
 // probe evaluation mirror engine/sim/circuit.py + engine/sim/devices.py. The dense
 // PartialPivLU solve matches numpy's linalg.solve for the small systems these circuits
 // produce. Nonlinear devices ported: Diode (D), BJT (Q, Ebers-Moll), MOSFET (M, level-1).
-// Mutual inductance (K), behavioral (B), subckt expansion, and the netlist parser remain
-// deferred to follow-ups.
+// Mutual inductance (K) and behavioral (B) are implemented here; deck parsing and
+// subckt expansion live in sim/netlist.cpp.
 
 #include "sim/spice.h"
 

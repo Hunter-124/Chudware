@@ -766,6 +766,25 @@ def test_draft_analysis_sphere_is_moldable():
     assert d["min_draft_deg"] < -45.0 and d["max_draft_deg"] > 45.0, d  # full orientation span
 
 
+def test_new_part_seeds_volume_baseline_for_write_diff():
+    """new_part seeds _LAST_VOLUME so the FIRST add_features reports a real volume delta
+    (volume 0.0 -> X) instead of degrading to the no-baseline 'volume now X' branch."""
+    from mcp_server import cad_tools
+    r, _ = _call("new_part", {"name": "vbase"})
+    doc = r["doc_id"]
+    # the empty part's volume baseline is seeded (zero) so the write-diff has a before-value
+    assert doc in cad_tools._LAST_VOLUME, "new_part must seed _LAST_VOLUME for the write-diff"
+    assert cad_tools._LAST_VOLUME[doc] == 0.0, cad_tools._LAST_VOLUME[doc]
+    r2, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(30), "width": cb.dim(20), "height": cb.dim(10)})]})
+    assert r2["ok"], r2
+    ch = r2.get("changes") or {}
+    # a baseline was available -> the delta is reported as a number (not the no-baseline branch)
+    assert "volume_delta_mm3" in ch, ch
+    assert ch["volume_delta_mm3"] > 0.0, ch  # material added from an empty part
+    assert cad_tools._LAST_VOLUME[doc] == r2["volume_mm3"], "baseline updated to the new volume"
+
+
 if __name__ == "__main__":
     import sys
 

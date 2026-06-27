@@ -18,7 +18,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
+#include <string>
 #include <tuple>
 
 #include <Bnd_Box.hxx>
@@ -165,6 +167,7 @@ std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
         std::optional<Eigen::Vector3d> axis;
         std::optional<Eigen::Vector3d> plane_axis;  // I3: signed outward plane normal
         std::optional<Eigen::Vector3d> axis_loc;    // I3: a point ON the cyl/cone axis
+        std::optional<double> radius;               // GSL Stage 0: round-geometry size (mm)
         try {
             if (st == GeomAbs_Plane) {
                 gp_Dir plane_normal = adaptor.Plane().Axis().Direction();
@@ -178,16 +181,21 @@ std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
                 axis = unit_axis(ax.Direction());
                 axis_loc = Eigen::Vector3d(ax.Location().X(), ax.Location().Y(),
                                            ax.Location().Z());
+                radius = adaptor.Cylinder().Radius();
             } else if (st == GeomAbs_Cone) {
                 gp_Ax1 ax = adaptor.Cone().Axis();
                 axis = unit_axis(ax.Direction());
                 axis_loc = Eigen::Vector3d(ax.Location().X(), ax.Location().Y(),
                                            ax.Location().Z());
+                radius = adaptor.Cone().RefRadius();
+            } else if (st == GeomAbs_Sphere) {
+                radius = adaptor.Sphere().Radius();
             }
         } catch (const Standard_Failure&) {
             axis = std::nullopt;
             plane_axis = std::nullopt;
             axis_loc = std::nullopt;
+            radius = std::nullopt;
         }
 
         // I3 — representative outward direction for EVERY face (plane normal / cyl-cone
@@ -215,6 +223,7 @@ std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
         info.owner = owner;
         info.hint_index = idx;
         info.rep_dir = rep_dir;
+        info.radius = radius;  // GSL Stage 0 (concavity is set on the picks/QCand read-back path)
         result.push_back(std::move(info));
     }
     return result;
@@ -239,14 +248,17 @@ TopoInfo edge_info(const TopoDS_Edge& edge, int idx) {
     // Axis — line direction, circle axis only (matches the Python oracle; an
     // ellipse edge carries surf=="ellipse" but no axis).
     std::optional<Eigen::Vector3d> axis;
+    std::optional<double> radius;  // GSL Stage 0: circle-edge radius (mm) for the read-back
     try {
         if (ct == GeomAbs_Line) {
             axis = unit_axis(adaptor.Line().Direction());
         } else if (ct == GeomAbs_Circle) {
             axis = unit_axis(adaptor.Circle().Axis().Direction());
+            radius = adaptor.Circle().Radius();
         }
     } catch (const Standard_Failure&) {
         axis = std::nullopt;
+        radius = std::nullopt;
     }
 
     TopoInfo info;
@@ -257,6 +269,7 @@ TopoInfo edge_info(const TopoDS_Edge& edge, int idx) {
     info.axis = axis;
     info.measure = length;
     info.hint_index = idx;
+    info.radius = radius;
     return info;
 }
 
@@ -304,21 +317,89 @@ std::vector<TopoInfo> describe_vertices(const TopoDS_Shape& shape,
 
 // --------------------------------------------------------------------------- make_selector
 
+namespace {
+
+// GSL Stage 0 — kill the float noise the LLM read-back used to carry (599.9999999999999,
+// e-16 centroid dust): snap sub-nano magnitudes to 0, round the rest to 1e-6. This is far
+// below the resolve() accept tolerance (best < 0.35 of bbox_diag), so it cannot change a
+// resolution outcome — it only de-noises the persisted/serialised value.
+double round_clean(double x) {
+    if (!std::isfinite(x)) return x;
+    if (std::abs(x) < 1e-9) return 0.0;
+    return std::round(x * 1e6) / 1e6;
+}
+
+nlohmann::json round_vec(const Eigen::Vector3d& v) {
+    return nlohmann::json::array({round_clean(v.x()), round_clean(v.y()), round_clean(v.z())});
+}
+
+// Map a signed outward direction to the nearest principal SIDE word (Z-up convention, mirrors
+// picks.cpp parse_side: +Z top, -Z bottom, +X right, -X left, -Y front, +Y back). Returns
+// nullopt for an oblique face where no axis clearly dominates, so an angled wall does not
+// falsely claim a side. This is the plain-word label the LLM addresses geometry by, finally
+// echoed back on the OUTPUT side (the docstring used to promise it and never delivered).
+std::optional<std::string> side_word(const std::optional<Eigen::Vector3d>& dir) {
+    if (!dir) return std::nullopt;
+    Eigen::Vector3d v = *dir;
+    const double n = v.norm();
+    if (n < 1e-9) return std::nullopt;
+    v /= n;
+    const double ax = std::abs(v.x()), ay = std::abs(v.y()), az = std::abs(v.z());
+    const double m = std::max({ax, ay, az});
+    // Match orient_tint (0.92): only label faces strongly aligned to a principal axis.
+    if (m < 0.92) return std::nullopt;
+    if (az >= ax && az >= ay) return v.z() > 0 ? "top" : "bottom";
+    if (ax >= ay && ax >= az) return v.x() > 0 ? "right" : "left";
+    return v.y() > 0 ? "back" : "front";
+}
+
+// GSL Stage 1c (pragmatic W1) — a stable geometry-fingerprint id so the LLM can name a face/edge
+// once and refer back to it. It hashes the rounded shape + position (0.1 mm grid) + role, so two
+// IDENTICAL faces at different places get DIFFERENT ids (no collision), and the same face is the
+// same id across a rebuild that does not move it. (A downstream edit that MOVES the face yields a
+// new id — honest: a moved face is a new handle. The owner-scoped version is future work.)
+std::string stable_sid(const TopoInfo& info) {
+    auto q = [](double x) -> long long { return std::llround(x * 10.0); };  // 0.1 mm grid
+    std::string k = info.kind + "|" + (info.surf ? *info.surf : std::string("null")) + "|" +
+                    std::to_string(q(info.centroid.x())) + "," +
+                    std::to_string(q(info.centroid.y())) + "," +
+                    std::to_string(q(info.centroid.z()));
+    if (info.radius) k += "|r" + std::to_string(q(*info.radius));
+    if (info.concave) k += *info.concave ? "|bore" : "|boss";
+    unsigned v = static_cast<unsigned>(std::hash<std::string>{}(k) & 0xFFFFFFu);
+    const char* hexd = "0123456789abcdef";
+    std::string out(7, '0');
+    out[0] = info.kind == "edge" ? 'E' : (info.kind == "vertex" ? 'V' : 'F');
+    for (int i = 6; i >= 1; --i) { out[i] = hexd[v & 0xF]; v >>= 4; }
+    return out;
+}
+
+}  // namespace
+
 nlohmann::json make_selector(const TopoInfo& info) {
     nlohmann::json sel;
     sel["kind"] = info.kind;
     sel["surf"] = info.surf ? nlohmann::json(*info.surf) : nlohmann::json(nullptr);
-    sel["centroid"] = nlohmann::json::array(
-        {info.centroid.x(), info.centroid.y(), info.centroid.z()});
-    if (info.axis) {
-        sel["axis"] = nlohmann::json::array(
-            {info.axis->x(), info.axis->y(), info.axis->z()});
-    } else {
-        sel["axis"] = nullptr;
-    }
-    sel["area_or_len"] = info.measure ? nlohmann::json(*info.measure) : nlohmann::json(nullptr);
+    // Existing scored-fingerprint fields (resolve() reads these) — now rounded clean.
+    sel["centroid"] = round_vec(info.centroid);
+    sel["axis"] = info.axis ? round_vec(*info.axis) : nlohmann::json(nullptr);
+    sel["area_or_len"] =
+        info.measure ? nlohmann::json(round_clean(*info.measure)) : nlohmann::json(nullptr);
     sel["owner_feature"] = info.owner ? nlohmann::json(*info.owner) : nlohmann::json(nullptr);
-    sel["hint_index"] = info.hint_index;
+    sel["hint_index"] = info.hint_index;  // load-bearing: resolve() tiebreak (contract §3)
+    // GSL Stage 0 — self-describing semantics the kernel already computes (resolve() IGNORES
+    // these; the scored fingerprint above is unchanged). `normal` is the SIGNED outward
+    // direction (unlike unsigned `axis`, which collides on opposite faces); `side` is its
+    // plain-word label; `concavity` separates a bore/hole from a boss/fillet; `radius` sizes
+    // round geometry. nulls where N/A (e.g. an oblique or non-round face).
+    sel["normal"] = info.rep_dir ? round_vec(*info.rep_dir) : nlohmann::json(nullptr);
+    const auto sw = side_word(info.rep_dir);
+    sel["side"] = sw ? nlohmann::json(*sw) : nlohmann::json(nullptr);
+    sel["concavity"] = info.concave ? nlohmann::json(*info.concave ? "bore" : "boss")
+                                    : nlohmann::json(nullptr);
+    sel["radius"] =
+        info.radius ? nlohmann::json(round_clean(*info.radius)) : nlohmann::json(nullptr);
+    sel["sid"] = stable_sid(info);  // GSL W1 — a stable handle the LLM can refer back to
     return sel;
 }
 

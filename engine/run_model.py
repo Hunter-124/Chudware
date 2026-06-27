@@ -3,7 +3,7 @@
     python -m engine.run_model engine/samples/mounting_plate.py
     python -m engine.run_model mounting_plate          # bundled sample by name
 
-Writes STEP/STL + multi-view PNGs + a 2x2 contact sheet into
+Writes STEP/STL + multi-view PNGs + a 2x3 contact sheet into
 ``%APPDATA%\\AI-CAD\\cache\\<name>`` and prints a JSON summary.
 """
 from __future__ import annotations

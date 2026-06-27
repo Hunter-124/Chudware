@@ -183,6 +183,8 @@ bool DocMirror::newPart(WorkerClient& w, std::string& err) {
     revision_ = jint(res, "revision");
     tree_ = {};
     featureStatus_ = {};
+    refDatums_ = nlohmann::json::array();
+    storeOwnerMap(nlohmann::json());
     notify();
     return true;
 }
@@ -198,6 +200,8 @@ bool DocMirror::newAssembly(WorkerClient& w, std::string& err) {
     if (res.contains("tree") && res["tree"].is_object()) tree_ = res["tree"];
     else tree_ = {};
     featureStatus_ = {};
+    refDatums_ = nlohmann::json::array();
+    storeOwnerMap(nlohmann::json());
     notify();
     return true;
 }
@@ -465,6 +469,8 @@ bool DocMirror::open(WorkerClient& w, const std::string& path, std::string& err,
     revision_ = jint(res, "revision");
     if (res.contains("tree") && res["tree"].is_object()) tree_ = res["tree"];
     featureStatus_ = {};
+    refDatums_ = nlohmann::json::array();
+    storeOwnerMap(nlohmann::json());
     // W12+ — stash any restored drawings so the open caller can re-create their Drawing tabs.
     if (res.contains("drawings") && res["drawings"].is_array())
         lastOpenedDrawings_ = res["drawings"];
@@ -499,6 +505,10 @@ bool DocMirror::activate(WorkerClient& w, const std::string& docId, std::string&
         storeOwnerMap(res["owner_map"]);
     else
         storeOwnerMap(nlohmann::json());  // clear stale owner map from the previous doc
+    if (res.contains("datums") && res["datums"].is_array())
+        refDatums_ = res["datums"];
+    else
+        refDatums_ = nlohmann::json::array();
     if (res.contains("tess") && res["tess"].is_object())
         aicmPath = jstr(res["tess"], "aicm_path");
     // Strangler diagnostic (no-op unless $AI_CAD_CPP_PARITY): compile the same tree
@@ -541,6 +551,13 @@ bool DocMirror::activateCached(WorkerClient& w, const std::string& docId, int ca
         storeOwnerMap(res["rebuild"]["owner_map"]);
     else
         storeOwnerMap(nlohmann::json());
+    if (res.contains("datums") && res["datums"].is_array())
+        refDatums_ = res["datums"];
+    else if (res.contains("rebuild") && res["rebuild"].is_object() &&
+             res["rebuild"].contains("datums") && res["rebuild"]["datums"].is_array())
+        refDatums_ = res["rebuild"]["datums"];
+    else
+        refDatums_ = nlohmann::json::array();
     aicmPath = cachedAicm;
     usedCache = true;
     notify();

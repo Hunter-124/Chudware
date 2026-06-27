@@ -11,10 +11,11 @@
 //   ambiguity) fires with margin == 0. dress.py works around this with a two-stage
 //   resolution we port verbatim:
 //     STAGE 1 — resolve_with_hint_fallback: when resolve() dangles with a "margin"
-//       reason AND the best score < 0.01, the reference is clearly correct (only
-//       identical duplicates co-rank), so re-score the same-kind (owner-filtered,
-//       fallback-to-all) candidates, sort by (score, hint_index), and accept the best
-//       (preferring a hint_index match) provided its score < 0.01.
+//       reason AND the best score < 0.35 (resolve()'s acceptance bound), the reference
+//       is geometrically close (often just duplicate explorer occurrences of the same
+//       edge), so re-score the same-kind (owner-filtered, fallback-to-all) candidates,
+//       sort by (score, hint_index), and accept the best (preferring a hint_index match)
+//       provided its score < 0.35.
 //     STAGE 2 — map the resolved describe-space descriptor's centroid to the NEAREST
 //       UNIQUE edge of the body (TopExp::MapShapes de-dup + BRepGProp linear centroid)
 //       within tol = max(bbox_diag, 1.0) * 1e-3. The describe-space index lives in the

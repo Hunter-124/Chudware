@@ -72,6 +72,10 @@ int main(int argc, char** argv) {
     CHECK(hv.body_id == 3 && hv.kind == PickKind::Vertex && hv.topo_id == 0x3FFFFF,
           "encode/decode round-trips max 22-bit topo id");
     CHECK(!render::decodeId(0).valid(), "id 0 decodes to invalid (background)");
+    // body_id is 8-bit in the packed id — values above 255 truncate (documented contract limit).
+    render::PickHit hi = render::decodeId(render::encodeId(300, PickKind::Face, 1));
+    CHECK(hi.body_id == 44 && hi.kind == PickKind::Face && hi.topo_id == 1,
+          "body_id truncates to 8 bits (300 -> 44)");
 
     if (g_fail) { std::printf("\n%d check(s) FAILED\n", g_fail); return 1; }
     std::printf("\nall checks passed\n");

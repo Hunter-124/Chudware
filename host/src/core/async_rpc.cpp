@@ -71,6 +71,7 @@ void AsyncRpc::shutdown() {
     // Unblock a round-trip the dispatch thread may be parked in (readLine poll loop).
     worker_.abortPending();
     if (thread_.joinable()) thread_.join();
+    pending_.store(0);
 }
 
 }  // namespace core

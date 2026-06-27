@@ -176,7 +176,7 @@ void AppState::addEcadTab(const std::string& kind, const std::string& ecadDocId_
     // An ECAD tab does not use the CAD subsystems — point st.propertyManager / sketchMode /
     // evaluateDialogs back at the fallback singletons so nothing acts on the parked part behind it.
     reseatActiveSubsystems(nullptr);
-    addLog("[tabs] new ECAD " + kind + " tab '" + t.title + "' (" + ecadDocId_ + ")");
+    addLog("[tabs] new ECAD " + kind + " tab '" + docTabs[activeTab].title + "' (" + ecadDocId_ + ")");
 }
 
 void AppState::switchToTab(int idx) {

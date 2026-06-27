@@ -222,6 +222,23 @@ nlohmann::json doc_face_points(const std::string& doc_id, const nlohmann::json& 
 // sub-shape's surf/centroid/axis/area_or_len (ready to paste into a fillet/hole/etc.).
 nlohmann::json doc_query(const std::string& doc_id, const nlohmann::json& query);
 
+// doc_adjacency (GSL W3): the face-adjacency graph the read-back never exposed. For the LAST
+// body, returns {"faces":[{ord, surf, side, concavity, neighbors:[ord,...]}], "edges":[{between:
+// [fa,fb], convex:bool, surf, length}]}. `ord` is the describe_faces enumeration index (== the
+// query-match position), so "the edge between the top and front face" and "the faces this pocket
+// cut" become first-class. Convexity is the signed dihedral between the two incident faces'
+// outward normals at the shared edge (convex = a real corner, concave = an inside/pocket edge).
+nlohmann::json doc_adjacency(const std::string& doc_id);
+
+// doc_set_meta / doc_get_meta: generic, opaque, top-level document metadata persisted INSIDE the
+// .step+ exactly like `studies` (the C++ never interprets it). The intake subsystem stores its
+// MeasuredPartProfile / ProcessProfile / CriticalDimensionLedger / FitReport / IntakeState under
+// keys here so an MCP-built part reopens in-app with its references intact. set returns {ok,key};
+// get returns {ok, key, value|null}. Keys live under doc["meta"][<key>].
+nlohmann::json doc_set_meta(const std::string& doc_id, const std::string& key,
+                            const nlohmann::json& value);
+nlohmann::json doc_get_meta(const std::string& doc_id, const std::string& key);
+
 // Weldment cut list — group every weld_member structural member into a SolidWorks
 // "Weldment Cut List" (port of engine/doc/cutlist.py::cut_list_for_session). Forces a
 // FRESH compile so the weld_member compiler repopulates the CompileResult.weld_members

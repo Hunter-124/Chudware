@@ -75,6 +75,73 @@ def test_query_geometry_top_face():
     assert any(m.get("kind") == "face" for m in r["matches"])
 
 
+# ---- task 06: sketch relations + check_sketch -----------------------------------------------
+# Sketch entity/constraint shape mirrors the proven C++ DSL (core/tests/test_document.cpp::
+# rect_entities): 4 lines closed by coincident + h/v relations + a fixed corner + 2 driving
+# distance dims == a FULLY DEFINED rectangle (dof 0). Drop the dims -> under-defined.
+def _line(eid, x1, y1, x2, y2):
+    return {"id": eid, "type": "line", "construction": False, "p1": [x1, y1], "p2": [x2, y2]}
+
+
+def _rel(cid, ctype, refs):
+    return {"id": cid, "type": ctype, "refs": refs}
+
+
+def _dim(cid, ctype, refs, value):
+    return {"id": cid, "type": ctype, "refs": refs, "value": {"value": value, "expr": None},
+            "driven": False}
+
+
+def _rect_sketch(fid, w, h, with_dims=True):
+    cons = [
+        _rel("c1", "coincident", ["e1.p2", "e2.p1"]),
+        _rel("c2", "coincident", ["e2.p2", "e3.p1"]),
+        _rel("c3", "coincident", ["e3.p2", "e4.p1"]),
+        _rel("c4", "coincident", ["e4.p2", "e1.p1"]),
+        _rel("c5", "horizontal", ["e1"]),
+        _rel("c6", "horizontal", ["e3"]),
+        _rel("c7", "vertical", ["e2"]),
+        _rel("c8", "vertical", ["e4"]),
+        _rel("c9", "fix", ["e1.p1"]),
+    ]
+    if with_dims:
+        cons += [
+            _dim("c10", "distance", ["e1.p1", "e1.p2"], w),
+            _dim("c11", "distance", ["e2.p1", "e2.p2"], h),
+        ]
+    return {"op": "add_feature", "feature": {
+        "id": fid, "type": "sketch", "plane": "top",
+        "entities": [
+            _line("e1", 0, 0, w, 0), _line("e2", w, 0, w, h),
+            _line("e3", w, h, 0, h), _line("e4", 0, h, 0, 0),
+        ],
+        "constraints": cons,
+    }}
+
+
+def test_check_sketch_fully_defined():
+    r, _ = _call("new_part", {"name": "sk"})
+    doc = r["doc_id"]
+    _call("add_features", {"ops": [_rect_sketch("s1", 40, 24, with_dims=True)], "doc_id": doc})
+    r, _ = _call("check_sketch", {"sketch": "s1", "doc_id": doc})
+    assert r["ok"], r
+    assert r["status"] == "full" and r["dof"] == 0, r
+    assert r["fully_defined"] is True, r
+    assert not r["conflicting"], r
+    assert "Fully defined" in r["summary"], r
+
+
+def test_check_sketch_under_defined():
+    r, _ = _call("new_part", {"name": "sk2"})
+    doc = r["doc_id"]
+    _call("add_features", {"ops": [_rect_sketch("s1", 40, 24, with_dims=False)], "doc_id": doc})
+    r, _ = _call("check_sketch", {"sketch": "s1", "doc_id": doc})
+    assert r["ok"], r
+    assert r["status"] == "under" and r["dof"] >= 1, r
+    assert r["fully_defined"] is False, r
+    assert "Under-defined" in r["summary"], r
+
+
 def test_render_part_returns_image():
     doc = _new_plate_with_hole()
     from mcp_server import server

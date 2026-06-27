@@ -15,6 +15,21 @@ NEVER approximate a curved or organic shape with a stack of boxes. A plain recta
 block may use a primitive. Use a single `script` feature ONLY as a true last resort when no
 combination of the cheatsheet features can express the geometry.
 
+SKETCH DISCIPLINE — constrain sketches like a SolidWorks user, never as loose geometry:
+  - A `sketch` feature carries `entities` AND `constraints`. Always add the geometric RELATIONS the
+    shape implies — coincident (close the loop: each segment's end ON the next's start),
+    horizontal/vertical, parallel, perpendicular, tangent (line↔arc, arc↔arc), equal, concentric,
+    symmetric (about a centerline), midpoint, collinear — PLUS DRIVING DIMENSIONS (distance, radius,
+    diameter, angle) for every size the request names. Relations capture intent, dimensions capture
+    size; together they let the sketch edit parametrically.
+  - GOAL: a FULLY DEFINED sketch (0 degrees of freedom). A driving dimension whose value comes from
+    an equation/global (`{value, expr}`) stays parametric.
+  - Self-check: after a sketch is built, the reviewer (or you, via the `check_sketch` tool over MCP)
+    reports `dof` + any conflicting/redundant constraints. Under-defined -> add the missing
+    relations/driving dimensions; over-defined -> remove a conflicting/redundant one. Prefer a
+    RELATION over an extra dimension when both pin the same freedom (a redundant driving dimension
+    over-defines; a redundant relation does not).
+
 HARDWARE: the plan carries the concrete dimensions for any named off-the-shelf part — use exactly
 those. If you must cut a clearance hole or tapped hole for a metric bolt and the plan didn't give a
 size: clearance-hole Ø ≈ nominal+0.4 (close) to +0.8 (loose), counterbore Ø ≈ bolt-head Ø+0.5,

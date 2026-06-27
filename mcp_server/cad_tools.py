@@ -715,6 +715,10 @@ WORKFLOW
   2. add_features([ ...ops... ])            build with standard features (vocabulary below).
                                             Returns per-feature status + body count + volume
                                             so you can see a dropped cut or a stray body.
+                                            A `sketch` feature should carry geometric RELATIONS
+                                            (coincident/horizontal/parallel/tangent/...) + DRIVING
+                                            DIMENSIONS, not loose geometry; check_sketch("s1")
+                                            reports dof + conflicts so you can reach fully-defined.
   3. render_part()                          SEE it — an annotated, colour-coded image (faces
                                             tinted + labelled TOP/FRONT/RIGHT...). Self-review
                                             against the request; iterate add_features to fix.
@@ -1026,6 +1030,52 @@ def register_cad_tools(mcp: FastMCP) -> None:
         try:
             q = query if isinstance(query, dict) else _as_face_query(query)
             return _dumps(cb.call("doc_query", {"doc_id": _doc(doc_id), "query": q}))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def check_sketch(sketch: str, doc_id: Optional[str] = None) -> str:
+        """Check whether a sketch is well-constrained (fully defined) and report what's missing.
+
+        Solves the named sketch feature and returns its constraint health so you can author
+        SolidWorks-quality sketches — explicit geometric RELATIONS (coincident, horizontal/vertical,
+        parallel, perpendicular, tangent, equal, concentric, symmetric, midpoint, collinear) plus
+        DRIVING DIMENSIONS — instead of loose geometry that only looks right.
+
+        sketch: the sketch feature id (e.g. "s1") whose constraints to evaluate.
+
+        Returns:
+          status       "full" (fully defined — the goal), "under" (under-defined), or "over"
+          dof          remaining degrees of freedom (0 = fully defined)
+          conflicting  constraint ids that contradict each other (an over-defined sketch) — remove one
+          redundant    constraint ids implied by the others (harmless, but a redundant DRIVING
+                       dimension over-defines — prefer a relation or delete the duplicate)
+          summary      one-line plain-English verdict + what to add/remove to reach dof 0
+
+        Workflow: after authoring a sketch, call this; if `under`, add the missing relations/driving
+        dimensions and re-check; if `over`, drop a conflicting/redundant constraint. Aim for dof 0 so
+        editing a driving dimension re-solves the geometry parametrically.
+        """
+        try:
+            d = _doc(doc_id)
+            r = cb.call("doc_sketch_solve", {"doc_id": d, "sketch_fid": sketch})
+            status = r.get("status", "")
+            dof = r.get("dof", 0)
+            conflicting = r.get("conflicting", []) or []
+            redundant = r.get("redundant", []) or []
+            if conflicting:
+                summary = (f"Over-defined: {len(conflicting)} conflicting constraint(s) "
+                           f"{conflicting} — remove one to resolve the contradiction.")
+            elif status == "full" or dof == 0:
+                summary = "Fully defined (dof 0) — every entity is pinned by relations + dimensions."
+            else:
+                summary = (f"Under-defined: {dof} degree(s) of freedom remain — add geometric "
+                           f"relations and/or driving dimensions until dof reaches 0.")
+                if redundant:
+                    summary += f" (Also {len(redundant)} redundant: {redundant}.)"
+            return _dumps({"ok": True, "doc_id": d, "sketch": sketch, "status": status,
+                           "dof": dof, "fully_defined": (status == "full" or dof == 0),
+                           "conflicting": conflicting, "redundant": redundant, "summary": summary})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

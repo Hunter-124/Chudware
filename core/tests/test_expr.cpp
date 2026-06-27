@@ -63,6 +63,12 @@ TEST_CASE("trig is in degrees, matching Python within 1e-9") {
     CHECK(evaluate("atan(1)", {}) == doctest::Approx(45.0).epsilon(1e-9));
 }
 
+TEST_CASE("scientific notation literals") {
+    CHECK(evaluate("1.5e2", {}) == doctest::Approx(150.0));
+    CHECK(evaluate("2E-1", {}) == doctest::Approx(0.2));
+    CHECK(evaluate("1e3+2", {}) == doctest::Approx(1002.0));
+}
+
 TEST_CASE("error cases throw ExprError") {
     CHECK_THROWS_AS(evaluate("NOPE", {}), ExprError);        // unknown name
     CHECK_THROWS_AS(evaluate("bogus(1)", {}), ExprError);    // unknown function

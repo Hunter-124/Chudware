@@ -140,6 +140,13 @@ void drawInspector(AppState& s) {
         labelCol("Height");   ImGui::DragFloat("##pkh",&pkH,0.1f,0.01f,1e5f,"%.2f");
     } else if (s.activeTool == "extrude_boss") {
         const char* ops[] = {"New Body","Add","Cut","Intersect"};
+        if (!s.toolExtrudeOp.empty()) {
+            if (s.toolExtrudeOp == "Cut") exOpi = 2;
+            else if (s.toolExtrudeOp == "Add") exOpi = 1;
+            else if (s.toolExtrudeOp == "Intersect") exOpi = 3;
+            else exOpi = 0;
+            s.toolExtrudeOp.clear();
+        }
         labelCol("Operation"); ImGui::Combo("##op", &exOpi, ops, 4);
         const char* profs[] = {"Rectangle","Circle"};
         labelCol("Profile"); ImGui::Combo("##prof", &exProfi, profs, 2);

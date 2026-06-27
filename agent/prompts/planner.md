@@ -17,7 +17,9 @@ Work out three things (plus, for multi-part designs, an assembly LAYOUT):
 2. DIMENSIONS - commit to CONCRETE values for every key dimension. Honor every number in the spec;
    derive the rest from function and proportion, preferring round, manufacturable values. Anchors:
    wall thickness 2-3 for small enclosures (1.5 min); fillet/chamfer smaller than the thinnest wall
-   it touches; standoffs 4-6 tall; slip fit 0.1-0.3 radial clearance, press fit ~0.05 interference.
+   it touches; standoffs 4-6 tall; FDM-default diametral clearances (mm) to ADD to the
+   receptacle: slip 0.40, location 0.20, press 0.10, free 0.50 (use the bound PROCESS BLOCK
+   when the manufacturing process is not FDM).
    When the request names OFF-THE-SHELF hardware (bolts, servos, bearings, extrusion, motors...),
    use the real published dimensions from the STANDARD HARDWARE CATALOG appended below this prompt,
    and write them into the feature notes so the modeler cuts pockets/holes/counterbores that fit.

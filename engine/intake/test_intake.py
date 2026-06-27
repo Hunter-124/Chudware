@@ -355,6 +355,15 @@ def test_gate_strict_fit_blocks_unmeasured_bore() -> None:
           repr(strict["must_block_reasons"]))
 
 
+def test_package_reexports_public_api() -> None:
+    """``from engine.intake import classify`` works at package level (not only submodule)."""
+    from engine.intake import classify as pkg_classify, worst_tier
+    check("package-level classify matches submodule",
+          pkg_classify("output shaft") == ik.classify("output shaft"), repr(pkg_classify))
+    check("worst_tier picks the weakest tier",
+          worst_tier(["high", "low", "medium"]) == "low")
+
+
 def test_imports_shared_process_math() -> None:
     # parity: the fit numbers come from the SAME process_profiles the planner uses
     m = pp.modeled_dim(3.00, "slip", "fdm", is_hole=True)
@@ -385,6 +394,7 @@ def main() -> int:
     test_gate_never_hard_blocks_by_default()
     test_gate_must_block_metal_on_fdm()
     test_gate_strict_fit_blocks_unmeasured_bore()
+    test_package_reexports_public_api()
     test_imports_shared_process_math()
 
     total = _PASSES + len(_FAILS)

@@ -4,7 +4,7 @@ The live MCP server is bypassed (it was deadlocked on the old DLL); this loads t
 staged dist/AI-CAD/libaicad.dll directly through mcp_server.core_bridge. Run from the repo
 root (PYTHONPATH=. or run a script that imports `tools.aicad_drive`), ideally with the
 runtime venv python:
-  C:\\Users\\nigga\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Roaming\\AI-CAD\\runtime\\venv\\Scripts\\python.exe
+  %APPDATA%\\AI-CAD\\runtime\\venv\\Scripts\\python.exe
 
 Quick use:
   import tools.aicad_drive as eng

@@ -102,6 +102,7 @@ void ScenarioRunner::tick(AppState& st) {
                 if (s.empty()) break;
                 try {
                     nlohmann::json o = nlohmann::json::parse(s);
+                    if (!o.contains("centroid")) continue;
                     double z = o["centroid"][2].get<double>();
                     if (z > bestZ) { bestZ = z; best = o; }
                 } catch (...) {}

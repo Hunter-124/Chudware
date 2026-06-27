@@ -289,8 +289,9 @@ when pieces must separate, move, or were explicitly requested as separate (e.g. 
 user gave; derive the rest from function and proportion, preferring round, manufacturable \
 values. Sanity anchors: M2/M3/M4 clearance holes r=1.1/1.7/2.2; M3 heat-set boss outer \
 r~3; wall thickness 2-3 for small enclosures (1.5 minimum); fillet/chamfer smaller than the \
-thinnest wall it touches; PCB standoffs 4-6 tall; slip fit = 0.1-0.3 radial clearance, \
-press fit = ~0.05 interference.
+thinnest wall it touches; PCB standoffs 4-6 tall; FDM-default diametral clearances (mm) \
+to ADD to the receptacle: slip 0.40, location 0.20, press 0.10, free 0.50 (see process \
+block when bound to another process).
 3. FEATURES - per part, the features (holes, pockets, bosses, fillets, vents, lips, slots) \
 with count, size and position, each with a short implementation route.
 
@@ -303,7 +304,8 @@ bosses/standoffs inside the cavity; openings = Box/Cylinder cutters through a wa
 - standoff/spacer/bushing: Cylinder (or extruded hex RegularPolygon) minus a bore Cylinder.
 - bracket: two plates at 90 degrees (two Boxes), optional triangular gusset; holes per leg.
 - lid: thin Box (or plate with a lip rim) sized to the opening minus clearance.
-- peg/pin in a hole: peg radius = hole radius - 0.1..0.3 for slip, + ~0.05 for press.
+- peg/pin in a hole: size the bore with the process slip/press clearance (FDM slip +0.40 mm
+  diametral on the bore for a shaft passthrough).
 - repeated features: explicit (x, y) coordinate list or GridLocations.
 
 Reply with exactly ONE ```json block, no code, shaped like:

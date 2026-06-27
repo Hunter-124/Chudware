@@ -44,7 +44,10 @@ void drawCommandPalette(AppState& s) {
     // search field
     icons::inlineIcon("search", 18*S, TCOL(txt2)); ImGui::SameLine(0,8*S);
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+    if (ImGui::IsWindowAppearing()) {
+        s.paletteQuery[0] = '\0'; s.paletteSel = 0;
+        ImGui::SetKeyboardFocusHere();
+    }
     ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0,0,0,0));
     ImGui::InputTextWithHint("##q", "Search every command...", s.paletteQuery, sizeof(s.paletteQuery));
     ImGui::PopStyleColor();

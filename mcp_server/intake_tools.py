@@ -196,7 +196,7 @@ def register_intake_tools(mcp: FastMCP) -> None:
             features = []
             for fkey, fv in by_feat.items():
                 arch = ik.classify(fkey) or "prism_pocket"
-                worst = min(fv["tiers"], key=ik._tier_index) if fv["tiers"] else "low"
+                worst = ik.worst_tier(fv["tiers"]) if fv["tiers"] else "low"
                 features.append(ik.new_measured_feature(fkey, arch, dims=fv["dims"],
                                                         confidence=worst))
             mp = ik.new_measured_part("mp_1", label, source="photo")

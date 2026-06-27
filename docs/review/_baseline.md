@@ -1,7 +1,7 @@
 # Phase 0 Baseline — Parallel Full Codebase Review
 
 Captured: 2026-06-27  
-Branch: `feat/gui-rewrite` (up to date with `origin/feat/gui-rewrite`)
+Branch at capture: `feat/gui-rewrite` (up to date with `origin/feat/gui-rewrite`)
 
 ## Git snapshot (pre-review)
 
@@ -26,19 +26,20 @@ Branch: `feat/gui-rewrite` (up to date with `origin/feat/gui-rewrite`)
 
 ### Diff stat (10 files, +393 / -16)
 ```
- core/api/libaicad.cpp         target/core/doc/picks.cpp
- core/doc/selectors.cpp
- core/doc/selectors.h
- core/doc/session.cpp
- core/doc/session.h
- core/tests/test_selectors.cpp
- docs/contracts/selectors.md
- mcp_server/cad_tools.py
- mcp_server/server.py
- 10 files changed, 393 insertions(+), 16 deletions(-)
+ core/api/libaicad.cpp
+ core/doc/picks.cpp
+ core/doc/selectors.cpp
+ core/doc/selectors.h
+ core/doc/session.cpp
+ core/doc/session.h
+ core/tests/test_selectors.cpp
+ docs/contracts/selectors.md
+ mcp_server/cad_tools.py
+ mcp_server/server.py
+ 10 files changed, 393 insertions(+), 16 deletions(-)
 ```
 
-## Python tests
+## Python tests (Phase 0 modules)
 
 Venv: `%APPDATA%\AI-CAD\runtime\venv\Scripts\python.exe` (present)  
 Note: `pytest` module not installed; ran via `python -m <module>`.
@@ -78,3 +79,18 @@ Tests: sim, modal, tet10, nsolve, prof, sketch, drag, plane, expr, agent, aicm, 
 1. All three `scripts/check.py` gates fail (gui scale lint, ribbon handlers, parity drift).
 2. `pytest` not in managed venv (tests run via `python -m` instead).
 3. Pre-existing uncommitted WIP on selectors/session/picks, MCP cad_tools, new engine/dfm and engine/intake dirs.
+
+---
+
+## Verification re-run (2026-06-27 — plan already complete)
+
+Branch: `master` (up to date with `origin/master`) · HEAD: `f5ef4b0d`  
+Review artifacts committed in `65fb8cee` (merged via `f5ef4b0d`). Working tree clean except this baseline update.
+
+| Suite | Phase 0 baseline | Re-run now | Delta |
+|-------|------------------|------------|-------|
+| Python (5 Phase 0 modules) | 5/5 PASS | **5/5 PASS** | 0 regressions |
+| `scripts/check.py` | 3/3 gates FAIL | **2 of 4 gates FAIL** (`gui_lint` icons+theme pass; `feature_surface_audit` + `parity_audit` fail) | +1 gate passing vs baseline |
+| `ctest` (Release) | 33/33 PASS | **36/36 PASS** | +3 tests (`spice_netlist`, `machine`, `mate_corpus`) |
+
+Re-run commands: managed venv `python -m <module>`, `python scripts/check.py`, `ctest --test-dir core/build-occt -C Release --output-on-failure`.

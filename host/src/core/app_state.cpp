@@ -809,6 +809,19 @@ bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool r
     return true;
 }
 
+void AppState::unloadDocMesh() {
+    if (renderer) renderer->setMeshes(std::vector<Renderer::PartMesh>{});
+    clearPickBuffers(idPass, overlays);
+    faceNormalCache.clear();
+    edgeCentroidCache.clear();
+    bodyBBoxCache.clear();
+    faceBBoxCache.clear();
+    docMeshHasScalar = false;
+    docMeshHasDisp = false;
+    hasDocMesh = false;
+    applyBodyVisibility();
+}
+
 void AppState::clearViewportForNewDoc() {
     if (renderer) renderer->setMeshes(std::vector<Renderer::PartMesh>{});
     clearPickBuffers(idPass, overlays);

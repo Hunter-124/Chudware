@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 
 namespace render {
 
@@ -197,25 +199,26 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
 }
 
 bool loadAicmFile(const std::string& path, DocMesh& out, std::string& err) {
-    FILE* f = std::fopen(path.c_str(), "rb");
+    // u8path so non-ASCII paths work on Windows (fopen/active code page would fail).
+    std::ifstream f(std::filesystem::u8path(path), std::ios::binary);
     if (!f) {
         err = "cannot open " + path;
         return false;
     }
-    std::fseek(f, 0, SEEK_END);
-    long n = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
+    f.seekg(0, std::ios::end);
+    std::streamoff n = f.tellg();
     if (n < 0) {
         err = "cannot size " + path;
-        std::fclose(f);
         return false;
     }
+    f.seekg(0, std::ios::beg);
     std::vector<uint8_t> buf((size_t)n);
-    size_t got = n ? std::fread(buf.data(), 1, (size_t)n, f) : 0;
-    std::fclose(f);
-    if (got != (size_t)n) {
-        err = "short read on " + path;
-        return false;
+    if (n > 0) {
+        f.read(reinterpret_cast<char*>(buf.data()), n);
+        if (!f) {
+            err = "short read on " + path;
+            return false;
+        }
     }
     return parseAicm(buf.data(), buf.size(), out, err);
 }

@@ -48,10 +48,22 @@ TIER_UNCERT_MM: dict[str, float] = {
 }
 
 
-def _tier_index(tier: str) -> int:
+def tier_index(tier: str) -> int:
     """Index of ``tier`` in :data:`TIER_ORDER`; unknown tiers sort as the weakest (-1)."""
     t = str(tier or "").strip().lower()
     return TIER_ORDER.index(t) if t in TIER_ORDER else -1
+
+
+def worst_tier(tiers: list[str]) -> str:
+    """Return the weakest confidence tier from a list (for aggregating per-view scores)."""
+    if not tiers:
+        return "low"
+    return min(tiers, key=tier_index)
+
+
+def _tier_index(tier: str) -> int:
+    """Backward-compatible alias for :func:`tier_index`."""
+    return tier_index(tier)
 
 
 # ===========================================================================================

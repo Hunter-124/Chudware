@@ -424,17 +424,14 @@ def _strong_tie(scores: dict[str, float]) -> Optional[tuple[str, str]]:
     sum slightly. So we compare at strong-cue granularity, returning the two highest-scored
     strong candidates (CNC preferred as the leader when tied on score).
     """
-    strong = sorted(((p, s) for p, s in scores.items() if s >= _STRONG_CUE),
-                    key=lambda kv: (kv[1], kv[0] != "cnc_mill"), reverse=False)
-    strong.sort(key=lambda kv: kv[1], reverse=True)
+    # Highest score wins; on a tie prefer cnc_mill as the conventional metal default.
+    strong = sorted(
+        ((p, s) for p, s in scores.items() if s >= _STRONG_CUE),
+        key=lambda kv: (-kv[1], 0 if kv[0] == "cnc_mill" else 1),
+    )
     if len(strong) < 2:
         return None
-    # leader = highest score; on a score tie prefer cnc_mill as the conventional metal default
-    top = strong[0]
-    second = strong[1]
-    if abs(top[1] - second[1]) < 1e-9 and second[0] == "cnc_mill":
-        top, second = second, top
-    return top[0], second[0]
+    return strong[0][0], strong[1][0]
 
 
 def _quantity_from(text: str, quantity: Optional[int]) -> Optional[int]:

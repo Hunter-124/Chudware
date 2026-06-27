@@ -2,9 +2,10 @@
 //
 // Structural validation only (envelopes, types, id prefixes, enum membership,
 // cross-refs) for the two ECAD document kinds: aicad.sch/1 (schematic) and
-// aicad.pcb/1 (board). Connectivity / ERC / DRC are separate passes (DEFERRED to
-// later waves). Coordinates are [x, y] in mm; angles in degrees CCW. Mirrors the
-// pattern of core/doc/validate.{h,cpp}.
+// aicad.pcb/1 (board). Connectivity passes (netlist, ERC, DRC, ratsnest, zonefill)
+// live in sibling modules and are invoked from session.cpp::compile_field. Coordinates
+// are [x, y] in mm; angles in degrees CCW. Mirrors the pattern of
+// core/doc/validate.{h,cpp}.
 #pragma once
 
 #include <set>

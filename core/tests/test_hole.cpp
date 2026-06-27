@@ -35,6 +35,7 @@
 #include "doc/document.h"
 #include "doc/selectors.h"
 #include "geom/features.h"
+#include "geom/hole.h"
 #include "aicm_loader.h"  // host loader (host/src/render on the include path)
 
 using json = nlohmann::json;
@@ -368,4 +369,19 @@ TEST_CASE("hole multi-position simple: four disjoint bores, material removed") {
     CHECK((hi[2] - lo[2]) == doctest::Approx(20.0).epsilon(1e-4));
     CHECK(vol < 32000.0);  // material was removed
     CHECK(vol == doctest::Approx(expected).epsilon(0.03));
+}
+
+TEST_CASE("make_hole_tool rejects non-positive shaft dims") {
+    geom::HoleDims dims;
+    dims.diameter = 0.0;
+    dims.depth = 10.0;
+    TopoDS_Shape tool = geom::make_hole_tool(Eigen::Vector3d::Zero(), Eigen::Vector3d::UnitZ(),
+                                             geom::HoleStyle::Simple, dims);
+    CHECK(tool.IsNull());
+
+    dims.diameter = 8.0;
+    dims.depth = 0.0;
+    tool = geom::make_hole_tool(Eigen::Vector3d::Zero(), Eigen::Vector3d::UnitZ(),
+                                geom::HoleStyle::Simple, dims);
+    CHECK(tool.IsNull());
 }

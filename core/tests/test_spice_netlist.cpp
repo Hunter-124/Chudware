@@ -57,6 +57,15 @@ TEST_CASE("netlist_to_spice_circuit: Device:R libid symbol fallback") {
     CHECK(out["warnings"].empty());
 }
 
+TEST_CASE("parse_netlist: X OPAMP subckt expands with Dclamp model") {
+    const std::string deck = "XU1 inp inn outp OPAMP\n";
+    json c = parse_netlist(deck);
+    REQUIRE(c.contains("devices"));
+    CHECK(c["devices"].size() >= 1);
+    REQUIRE(c.contains("models"));
+    CHECK(c["models"].contains("Dclamp"));
+}
+
 TEST_CASE("netlist_to_spice_circuit: unknown libid warns and skips") {
     json netlist = {{"components",
                      json::array({json{{"ref", "U1"},

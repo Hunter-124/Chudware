@@ -2116,7 +2116,7 @@ void PropertyManager::draw(AppState& st) {
 
 // Wave 1D: the form's inner content (no Begin/End). Caller owns the surrounding window/child.
 void PropertyManager::drawBody(AppState& st) {
-    if (!active_) return;
+    if (!active_ || !form_) return;
 
     // Keep a VISIBLE selector well active at all times. A method combo can HIDE the currently-
     // active well (ref_axis/ref_plane use duplicate-key, method-gated wells: switching

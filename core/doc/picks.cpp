@@ -806,10 +806,10 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
     // 3b) pick: keep the extreme set. largest/smallest face by area, longest/shortest
     //     edge by length — a model with no spatial sense can say "the largest face"
     //     instead of computing areas. inner/outer (also innermost/outermost/bore) classify
-    //     by CONCAVITY for cylindrical faces (C5 fix: bore = concave = TopAbs_REVERSED
-    //     orientation; boss/fillet = convex = TopAbs_FORWARD). When all candidates lack
-    //     orientation data (edges, or a body with only one cylinder), fall back to ranking
-    //     by radius so "inner" still means the smaller circle. Near-equal radius values
+    //     by CONCAVITY for cylindrical faces (C5: geometry-based cylinder_face_concave —
+    //     bore = concave, boss/fillet = convex; not raw TopAbs orientation). When all
+    //     candidates lack concavity data (edges, or a body with only one cylinder), fall
+    //     back to ranking by radius so "inner" still means the smaller circle. Near-equal
     //     co-rank (a relative tolerance) so a symmetric body keeps the opposite pair;
     //     combine with `side` or add count:1 to force a single result.
     if (q.contains("pick") && q["pick"].is_string()) {

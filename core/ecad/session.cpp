@@ -791,7 +791,8 @@ json ecad_simulate(const std::string& doc_id, const json& study_in, const json& 
     if (wants_ac && circuit.contains("devices")) {
         bool has_ac = false;
         for (const json& d : circuit["devices"])
-            if (d.contains("params") && d["params"].is_object() && d["params"].contains("ac"))
+            if (d.contains("params") && d["params"].is_object() && d["params"].contains("ac") &&
+                !d["params"]["ac"].is_null())
                 has_ac = true;
         if (!has_ac) {
             for (json& d : circuit["devices"]) {

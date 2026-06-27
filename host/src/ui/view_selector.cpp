@@ -322,7 +322,7 @@ void ViewSelector::update(AppState& st, Renderer& renderer, bool imgHovered, boo
 
 // ---- draw ----------------------------------------------------------------------
 void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
-    if (!m_active) return;
+    if (!m_active || !st.renderer) return;
     Renderer& renderer = *st.renderer;
 
     std::vector<Zone> zones;

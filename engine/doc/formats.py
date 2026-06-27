@@ -28,7 +28,11 @@ callable for streaming events.
 
     ``doc_formats {}``
         Returns the import/export format matrix (``list_formats()``) so the host can build
-        Open/Import/Export filters.  ``import_file`` / ``export_file`` moved to the C++ core.
+        Open/Import/Export filters.
+
+``import_file`` / ``export_file`` were removed from Python when the doc engine moved to the
+C++ core (host routes them via the doc-cpp / minting rule).  The pure helpers
+``import_path()`` / ``export_document()`` above remain for ECAD and other Python callers.
 """
 
 from __future__ import annotations

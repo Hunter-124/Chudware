@@ -6,6 +6,7 @@ shipped (non-sandboxed) binary and this dev environment converge on the same lay
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 
@@ -31,6 +32,16 @@ def parts_library_dir() -> Path:
 
 
 def model_dir(name: str) -> Path:
-    d = CACHE / name
+    """Return (and create) the per-model output directory under :data:`CACHE`.
+
+    Sanitizes ``name`` so a hostile ``run_model`` / worker caller cannot escape the cache
+    root via ``..`` path segments.
+    """
+    safe = re.sub(r"[^\w.-]+", "_", str(name)).strip("._") or "model"
+    d = (CACHE / safe).resolve()
+    root = CACHE.resolve()
+    if d != root and root not in d.parents:
+        safe = "model"
+        d = root / safe
     d.mkdir(parents=True, exist_ok=True)
     return d

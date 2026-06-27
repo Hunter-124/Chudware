@@ -1219,6 +1219,12 @@ struct AppState {
     // session holds (suppressed). So the user sees the round form but every edge pick is exact.
     bool loadDocMesh(const std::string& aicmPath, std::string& err, bool renderOnly = false);
 
+    // Drop shaded mesh + pick GPU buffers when the active doc has no tessellation (empty model /
+    // sketch-only). Does NOT clear selection, body visibility, or other per-doc fields — used on
+    // tab switch when activateCached returns an empty aicm_path so the leaving tab's mesh cannot
+    // linger on screen.
+    void unloadDocMesh();
+
     // C34: reset the viewport to the fresh-document state — drops the legacy/demo mesh and any
     // previous doc's parts so the empty-doc datum-planes view shows. Called by every path that
     // creates a new document (tree toolbar New Part/Assembly, sketch auto-create).

@@ -1285,6 +1285,7 @@ static bool dimHandleGeometry(AppState& st, const Renderer& renderer, const ImVe
 // owns the live preview and the single OK/Cancel commit, so there is no separate doc op to manage.)
 
 void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
+    if (!st.renderer) return;
     Renderer& renderer = *st.renderer;
     auto viewportTitle = [&]() {
         if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {

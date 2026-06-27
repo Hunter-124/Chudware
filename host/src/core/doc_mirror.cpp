@@ -163,6 +163,13 @@ bool DocMirror::resyncTree(WorkerClient& w) {
     else if (res.contains("rebuild") && res["rebuild"].is_object() &&
              res["rebuild"].contains("owner_map") && res["rebuild"]["owner_map"].is_object())
         storeOwnerMap(res["rebuild"]["owner_map"]);
+    // Refresh datum overlays when doc_tree carries them; leave the last value when absent (a cheap
+    // tree pull may omit datums that are still valid from the prior full rebuild).
+    if (res.contains("datums") && res["datums"].is_array())
+        refDatums_ = res["datums"];
+    else if (res.contains("rebuild") && res["rebuild"].is_object() &&
+             res["rebuild"].contains("datums") && res["rebuild"]["datums"].is_array())
+        refDatums_ = res["rebuild"]["datums"];
     return true;
 }
 

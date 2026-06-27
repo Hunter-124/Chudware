@@ -49,9 +49,10 @@ def test_mcmaster_enabled_with_creds_hits_stub() -> None:
         _point_config_at(Path(td), {"parts_providers": {"mcmaster": {
             "enabled": True, "api_url": "https://api.mcmaster.com",
             "username": "u", "password": "p", "client_cert": "c.pfx"}}})
-        # Credentials present -> reaches the intentional API stub.
-        with pytest.raises(NotImplementedError):
+        # Credentials present -> reaches the intentional API stub (not wired yet).
+        with pytest.raises(ProviderError) as ei:
             parts_providers.McMasterProvider().fetch("91251A542")
+        assert "not wired" in ei.value.message.lower()
 
 
 def test_other_providers_not_configured() -> None:

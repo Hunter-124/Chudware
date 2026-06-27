@@ -98,8 +98,11 @@ def _call_mcmaster_api(cfg: dict[str, Any], part_number: str) -> dict:
     ``vendor_parts.register_local_cad(supplier="McMaster-Carr", part_number=..., cad_path=...,
     source="api")``, returning that record.
     """
-    raise NotImplementedError(
-        "wire to approved McMaster API once credentials validated"
+    raise ProviderError(
+        "McMaster-Carr API adapter is not wired yet. Credentials are configured, but the "
+        "approved Product Information API call must be implemented before automated fetch "
+        "can run. Download the CAD manually and register it with "
+        "vendor_part_register_local_cad, or wait for the API adapter."
     )
 
 

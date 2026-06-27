@@ -22,7 +22,7 @@ result against the request and iterate.
                 │                                                            │
   user prompt → │  ┌─────────────┐   ┌──────────────┐   ┌────────────────┐  │
                 │  │ Chat / Agent │──▶│ 3D Viewport  │   │  MCP server    │◀─┼── external agent
-                │  │ panel (loop) │   │ (GLFW+ImGui+ │   │ (HTTP/SSE)     │  │   (Claude Code, …)
+                │  │ panel (loop) │   │ (GLFW+ImGui+ │   │ (stdio JSON-RPC)│  │   (Claude Code, …)
                 │  └──────┬───────┘   │  OpenGL)     │   └───────┬────────┘  │
                 │         │           └──────▲───────┘           │           │
                 │         │   JSON-RPC over stdio / local socket │           │

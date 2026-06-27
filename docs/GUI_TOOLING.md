@@ -107,8 +107,9 @@ one-file edit, not a 25-file hunt.
 
 ## 3. Recommended wiring (future)
 
-- **Pre-commit / CI:** run `python scripts/gui_lint.py --rule icons --rule theme` as a hard gate
-  (deterministic, zero false positives), and `--rule scale --baseline …` as a ratchet.
+- **Pre-commit / CI:** run `python scripts/check.py` as the hard gate (icons + theme +
+  feature_surface + parity; deterministic, zero false positives), and
+  `python scripts/gui_lint.py --rule scale --baseline scripts/gui_lint_baseline.json` as a ratchet.
 - **Feature-surface gate:** run `python scripts/feature_surface_audit.py`; any non-stretch ribbon
   command that would fall through to the generic "no PM form yet" log is a release blocker.
 - **Startup assert (debug):** a `validateIconNames()` that checks the static icon tables against the

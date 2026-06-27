@@ -157,6 +157,8 @@ target_include_directories(aicad_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # pure-JSON and does NOT depend on aicad_ecad, so this introduces no cycle.
 target_link_libraries(aicad_ecad PUBLIC nlohmann_json::nlohmann_json aicad_miniz aicad_sim)
 
+enable_testing()
+
 add_executable(test_sim tests/test_sim.cpp)
 target_include_directories(test_sim PRIVATE ${doctest_SOURCE_DIR})
 target_link_libraries(test_sim PRIVATE aicad_sim)
@@ -207,7 +209,6 @@ set_target_properties(sketch_cli PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # --- tests -------------------------------------------------------------------
-enable_testing()
 add_executable(test_nsolve
   tests/test_nsolve.cpp)
 target_include_directories(test_nsolve PRIVATE ${doctest_SOURCE_DIR})

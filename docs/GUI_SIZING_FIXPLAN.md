@@ -164,4 +164,4 @@ the baseline).
 3. ribbon structural (Step 2) — separate commit, **visual verify** (the double-scale fix changes
    button widths at HiDPI).
 4. 🌍 chrome exceptions (Step 8) + the exclude-list (Step 9, linter).
-5. Generate the committed baseline from whatever remains; wire `--rule icons --rule theme` into CI.
+5. Generate the committed baseline from whatever remains; wire `python scripts/check.py` into CI.

@@ -91,6 +91,12 @@ if(WIN32)
   target_link_libraries(AI-CAD2 PRIVATE opengl32 dwmapi comdlg32)
 endif()
 
+# Registry smoke tests (no GL/engine dependency).
+add_executable(test_command_registry
+  test/test_command_registry.cpp
+  src/ui/command_registry.cpp)
+target_include_directories(test_command_registry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # Stage the resources next to the exe so the app finds fonts/icons at runtime.
 add_custom_command(TARGET AI-CAD2 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory

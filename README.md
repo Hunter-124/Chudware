@@ -77,7 +77,8 @@ installer/       runtime provisioning + Claude MCP self-registration + release p
 mcp_setup.bat    portable multi-client MCP installer (Claude Code / Cursor / VS Code / opencode /
                  Antigravity) -> installer/setup_mcp_clients.py
 docs/            PLAN.md, ARCHITECTURE, CPP_MIGRATION, ECAD_*, FORMATS_*, PARTS_LIBRARY, contracts/
-tools/           dev/diagnostic scripts (cpp_parity.py, cpp_session_parity.py, mission_*_verify, ...)
+tools/           dev/diagnostic scripts (profile_modeling.py, flamegraph.py, aicad_drive.py,
+                 verify_*, probe_*, mission_*_verify, ecad_*_audit, …)
 build.bat        one-shot host build + dist sync (see below)
 ```
 
@@ -119,9 +120,9 @@ cmake -S core -B core/build-occt -DAICAD_WITH_OCCT=ON
 cmake --build core/build-occt --config Release
 ctest --test-dir core/build-occt -C Release --output-on-failure   # incl. the libaicad load probe
 
-$py = "$env:APPDATA\AI-CAD\runtime\venv\Scripts\python.exe"
-& $py tools\cpp_parity.py            # stateless feature parity dashboard (exact BRep volume gate)
-& $py tools\cpp_session_parity.py    # stateful session (doc_new/apply_ops/undo/redo/resolve_pick)
+ctest --test-dir core/build-occt -C Release --output-on-failure   # C++ core doctest suite (parity proof)
+# Legacy Python-vs-C++ differential harnesses (cpp_parity.py, cpp_session_parity.py) are documented
+# in docs/CPP_MIGRATION.md but not present in this tree — use ctest + core/tests/ until restored.
 ```
 
 ## Engine dev & tests

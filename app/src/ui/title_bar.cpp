@@ -107,7 +107,12 @@ void drawTitleBar(AppState& s, float height) {
         ImVec2 ts = ImGui::CalcTextSize(lbl.c_str());
         float tw = ts.x + 26*S;
         ImGui::SetCursorPosY((height - (height-12*S))*0.5f);
-        if (ImGui::InvisibleButton("tab", ImVec2(tw, height-12*S))) s.activeDoc = i;
+        if (ImGui::InvisibleButton("tab", ImVec2(tw, height-12*S))) {
+            s.activeDoc = i;
+            s.inSketch = false;
+            auto wss = cmd::workspacesFor(s.docs[i].type);
+            if (!wss.empty()) s.workspace = wss[0];
+        }
         bool th = ImGui::IsItemHovered();
         ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
         dl->AddRectFilled(a, b, act ? TCOL(bg2) : (th?TCOL(hover):0u), 7*S);

@@ -28,6 +28,13 @@ namespace {
 
 using ojson = nlohmann::ordered_json;
 
+template<typename JsonT>
+std::string jstr(const JsonT& j, const char* key, const std::string& d = std::string()) {
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_string()) return d;
+    return it->get<std::string>();
+}
+
 // How many parse/validate failures before the modeler escape hatch (raw build123d script)
 // fires. Kept deliberately high so the agent keeps trying REAL parametric ops — each retry is
 // re-prompted with the concrete validation error (state.last_errors flows into build_context),
@@ -899,8 +906,13 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
         std::string child;
         try {
             json nd = doc::doc_new("part", name);
-            child = nd.value("doc_id", std::string());
+            child = jstr(nd, "doc_id");
+        } catch (const std::exception& e) {
+            events.emit("part_skipped",
+                        json{{"index", idx}, {"name", name}, {"reason", e.what()}});
         } catch (...) {
+            events.emit("part_skipped",
+                        json{{"index", idx}, {"name", name}, {"reason", "doc_new failed"}});
         }
         if (child.empty()) { ++idx; continue; }
 
@@ -917,7 +929,12 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
             sp.pos[0] = pos[0]; sp.pos[1] = pos[1]; sp.pos[2] = pos[2];
             sp.rot[0] = rot[0]; sp.rot[1] = rot[1]; sp.rot[2] = rot[2];
             saved.push_back(sp);
+        } catch (const std::exception& e) {
+            events.emit("part_skipped",
+                        json{{"index", idx}, {"name", name}, {"reason", e.what()}});
         } catch (...) {
+            events.emit("part_skipped",
+                        json{{"index", idx}, {"name", name}, {"reason", "doc_save failed"}});
         }
         ++idx;
     }
@@ -935,8 +952,11 @@ json run_assembly_design(const std::string& request, const std::string& doc_id,
     std::string asm_id;
     try {
         json nd = doc::doc_new("assembly", asm_name);
-        asm_id = nd.value("doc_id", std::string());
+        asm_id = jstr(nd, "doc_id");
+    } catch (const std::exception& e) {
+        events.emit("assembly_failed", json{{"reason", e.what()}});
     } catch (...) {
+        events.emit("assembly_failed", json{{"reason", "doc_new failed"}});
     }
     if (asm_id.empty()) {
         events.emit("run_finished", json{{"status", "failed"},

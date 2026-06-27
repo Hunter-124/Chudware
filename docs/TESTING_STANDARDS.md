@@ -9,7 +9,7 @@
 
 | tier | what | how to run | gate |
 |---|---|---|---|
-| **0 — Static checkers** (deterministic) | machine-verified invariants of the source | `python scripts/gui_lint.py --rule icons --rule theme` · `python scripts/feature_surface_audit.py` · `python scripts/parity_audit.py` | **hard CI gate** — must be 0/clean |
+| **0 — Static checkers** (deterministic) | machine-verified invariants of the source | `python scripts/check.py` (runs icons + theme + feature_surface + parity) | **hard CI gate** — must be 0/clean |
 | **0b — Heuristic checker** (ratcheting) | GUI sizing scale rule | `python scripts/gui_lint.py --rule scale --baseline scripts/gui_lint_baseline.json` | no NEW findings vs baseline |
 | **1 — Engine tests** | pure-Python engine correctness | `<venv> -m pytest engine/doc -X utf8` · ECAD script runners `<venv> -m engine.ecad.test_*` · `engine/sim` | all green, 0 failures |
 | **2 — Headless host scenarios** | the C++ app launches, renders, runs a scripted flow, exits 0 | `AI_CAD_SHOT=<scenario> dist\AI-CAD\AI-CAD.exe --ui-screenshot` (knobs: `AI_CAD_THEME` dark/light, `AI_CAD_SCALE`, `AI_CAD_AICM`, `AI_CAD_ECAD_KIND`) | exit 0; the captured shot looks right |
@@ -36,8 +36,9 @@ saveopen/…). A scenario passing = the worker + host wiring for that flow is in
 
 A feature claims *done* in the parity spec only when **all applicable** gates hold:
 
-1. **Engine compiler** registered (`engine/features/__init__.py` + `engine/features/<f>.py`) or doc op
-   (`engine/doc/ops.py`) — the geometry/behavior actually computes.
+1. **Engine compiler** registered — C++ feature dispatch in `core/doc/document.cpp` (+ validation in
+   `core/doc/validate.cpp`) with a matching `core/tests/` doctest, or (legacy) doc op in
+   `engine/doc/ops.py` — the geometry/behavior actually computes.
 2. **Engine test** covering the happy path + at least one edge/degenerate case (`engine/doc/test_*.py`).
 3. **Worker RPC** exposed where the host needs it (`engine/worker.py` `_METHODS`), JSON-clean
    (no raw bytes — base64 binary; the worker serializes results).
@@ -68,7 +69,10 @@ exceeding SolidWorks (e.g. native ECAD + SPICE) is **beyond**.
 ## Recommended CI wiring (the "first time right" enforcement)
 ```
 # hard gates (deterministic, zero false positives)
-python scripts/gui_lint.py --rule icons --rule theme
+python scripts/check.py
+# or run individually (note: --rule accepts one value; do not pass --rule twice):
+python scripts/gui_lint.py --rule icons
+python scripts/gui_lint.py --rule theme
 python scripts/feature_surface_audit.py
 python scripts/parity_audit.py
 <venv> -m pytest engine/doc -X utf8

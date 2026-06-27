@@ -71,35 +71,52 @@ void loadIcons(const std::string& assetsDir) {
     long sz = std::ftell(f);
     std::rewind(f);
     std::string buf(sz, 0);
-    std::fread(&buf[0], 1, sz, f);
+    const size_t nread = std::fread(&buf[0], 1, sz, f);
     std::fclose(f);
+    if (nread != static_cast<size_t>(sz)) {
+        std::fprintf(stderr, "[icons] atlas.json read error\n");
+        return;
+    }
 
     nlohmann::json jroot;
     try {
         jroot = nlohmann::json::parse(buf);
+        if (!jroot.contains("atlas_px") || !jroot["atlas_px"].is_array() ||
+            jroot["atlas_px"].size() < 2 || !jroot.contains("cell") ||
+            !jroot["cell"].is_object()) {
+            std::fprintf(stderr, "[icons] atlas.json schema error\n");
+            return;
+        }
+        auto atlasArr = jroot["atlas_px"];
+        int aw = atlasArr[0].get<int>();
+        int ah = atlasArr[1].get<int>();
+        if (aw <= 0 || ah <= 0) {
+            std::fprintf(stderr, "[icons] atlas.json invalid atlas_px\n");
+            return;
+        }
+        gAtlas.atlasW = aw;
+        gAtlas.atlasH = ah;
+
+        const auto& cells = jroot["cell"];
+        for (auto it = cells.begin(); it != cells.end(); ++it) {
+            const auto& cell = it.value();
+            if (!cell.is_object() || !cell.contains("x") || !cell.contains("y") ||
+                !cell.contains("w") || !cell.contains("h"))
+                continue;
+            int x = cell["x"].get<int>();
+            int y = cell["y"].get<int>();
+            int w = cell["w"].get<int>();
+            int h = cell["h"].get<int>();
+            Cell c;
+            c.u0 = (float)x / aw;
+            c.v0 = (float)y / ah;
+            c.u1 = (float)(x + w) / aw;
+            c.v1 = (float)(y + h) / ah;
+            gAtlas.cells[it.key()] = c;
+        }
     } catch (...) {
         std::fprintf(stderr, "[icons] atlas.json parse error\n");
         return;
-    }
-
-    auto atlasArr = jroot["atlas_px"];
-    int aw = atlasArr[0].get<int>();
-    int ah = atlasArr[1].get<int>();
-    gAtlas.atlasW = aw;
-    gAtlas.atlasH = ah;
-
-    const auto& cells = jroot["cell"];
-    for (auto it = cells.begin(); it != cells.end(); ++it) {
-        int x = it.value()["x"].get<int>();
-        int y = it.value()["y"].get<int>();
-        int w = it.value()["w"].get<int>();
-        int h = it.value()["h"].get<int>();
-        Cell c;
-        c.u0 = (float)x / aw;
-        c.v0 = (float)y / ah;
-        c.u1 = (float)(x + w) / aw;
-        c.v1 = (float)(y + h) / ah;
-        gAtlas.cells[it.key()] = c;
     }
 
     // --- load dark atlas ---

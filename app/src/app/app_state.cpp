@@ -61,9 +61,14 @@ void AppState::dispatch(const char* cmdId) {
         status = "AI Design"; return;
     }
 
-    if (opensInspector(cmdId)) {
-        activeTool = cmdId;
-        if (cmdId == std::string("extrude_boss") && toolExtrudeOp.empty()) toolExtrudeOp = "New Body";
+    // Variants (Extrude Cut, etc.) open the parent tool's inspector with the op pre-selected.
+    const char* toolId = cmdId;
+    if (c && c->kind == cmd::Kind::Variant && c->parent) toolId = c->parent;
+
+    if (opensInspector(toolId)) {
+        activeTool = toolId;
+        if (c && c->kind == cmd::Kind::Variant) toolExtrudeOp = label;
+        else if (std::strcmp(toolId, "extrude_boss") == 0 && toolExtrudeOp.empty()) toolExtrudeOp = "New Body";
         status = std::string("Editing ") + label;
         return;
     }
@@ -98,6 +103,7 @@ static std::string featureIcon(const std::string& type) {
 }
 
 void AppState::buildTreeFromDoc() {
+    if (engineReady) viewMeshRev = -1;   // force viewport to reload tess when revision/path changes
     tree = TreeNode{};
     tree.name = docs.empty() ? "Part" : doc().name;
     tree.icon = "file_part"; tree.isFolder = true; tree.open = true;
@@ -137,8 +143,9 @@ void AppState::doNewPart() {
     if (!engineReady) { status = "Engine offline"; return; }
     if (engine.newPart("Part")) {
         savePath.clear();
+        inSketch = false;
         if (!docs.empty()) docs[activeDoc].name = "Part";
-        buildTreeFromDoc(); viewMeshRev = -1; activeTool.clear();
+        buildTreeFromDoc(); activeTool.clear();
         status = "New part";
     } else status = std::string("New failed: ") + engine.lastError();
 }
@@ -162,9 +169,10 @@ void AppState::doOpen() {
     if (path.empty()) return;  // cancelled
     if (engine.open(path)) {
         savePath = path;
+        inSketch = false;
         if (!docs.empty()) { docs[activeDoc].name = stemOf(path); docs[activeDoc].type = cmd::DocType::Part; }
         workspace = cmd::Workspace::Model;
-        buildTreeFromDoc(); viewMeshRev = -1; activeTool.clear();
+        buildTreeFromDoc(); activeTool.clear();
         status = "Opened " + path;
     } else status = std::string("Open failed: ") + engine.lastError();
 }

@@ -314,6 +314,10 @@ void AppState::switchToTab(int idx) {
         std::string lerr;
         if (!loadDocMesh(aicmPath, lerr) && !lerr.empty())
             addLog("[tabs] loadDocMesh on switch: " + lerr);
+    } else {
+        // Empty model (sketch-only / all solids suppressed): no tess file — drop the leaving tab's
+        // mesh + pick buffers without disturbing the session state we just restored.
+        unloadDocMesh();
     }
     // Refresh this session's fast-switch cache to the just-loaded mesh + revision, so the NEXT
     // switch-in can skip the rebuild while the doc stays unedited (activateCached above).

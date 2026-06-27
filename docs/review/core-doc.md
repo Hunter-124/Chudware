@@ -16,11 +16,13 @@
 
 4. **Stale hint-fallback documentation** (`picks.h`) — Header still described the dress.py `0.01` gate; implementation correctly uses `0.35` (resolve acceptance bound). Comment updated.
 
-5. **Stale concavity comment** (`picks.cpp`) — QCand comment still referenced `TopAbs_REVERSED`; code uses geometry-based `cylinder_face_concave()`. Comment updated.
+5. **Stale concavity comments** (`picks.cpp`) — QCand block and geom-query `pick` inner/outer comment still referenced `TopAbs_REVERSED` orientation; code uses geometry-based `cylinder_face_concave()`. Comments updated.
 
-**Note:** `doc_adjacency`, `doc_set_meta`, and `doc_get_meta` were already implemented in `session.cpp` (not missing). No stub removal needed.
+6. **`orient_tint` axis tie-break** (`session.cpp`) — Render tint used `az == m` float equality for principal-axis selection, diverging from `side_word` on XY ties (e.g. a diagonal-in-XY face could tint as Y while `side` labels X). Aligned tie-break order with `side_word` (Z, then X, then Y).
 
-**Render tint:** Reviewed per-face averaged-normal tint path (`render_iso_png`). Logic is correct for the stated goal (planar FaceRec only; curved faces neutral; mesh fallback). No code change — see Flagged for edge cases.
+**Note:** `doc_adjacency`, `doc_set_meta`, and `doc_get_meta` are implemented in `session.cpp` (not stubs). `doc_set_meta` writes `doc["meta"][key]`, sets `dirty`; `doc_get_meta` returns `{ok, key, value|null}`.
+
+**Render tint:** Per-face averaged-normal path in `render_iso_png` is correct for the stated goal (planar `FaceRec` only; curved faces neutral; mesh fallback per-triangle). Fix #6 aligns tint hue with selector `side` labels on axis-aligned faces.
 
 ---
 
@@ -47,7 +49,7 @@
 
 Existing torture coverage retained: A1–A8 (pure resolve), B7–B10 (describers + end-to-end), extensive geom-query suite in `test_picks.cpp`. Phase 2 should run `test_selectors` + `test_picks` binaries.
 
-**Suggested Phase 2 additions (not implemented):** session-level `doc_adjacency` / `doc_set_meta` round-trip; render PNG tint regression on curved vs planar body.
+**Suggested Phase 2 additions (not implemented):** session-level `doc_adjacency` / `doc_set_meta` round-trip; render PNG tint regression on curved vs planar body; `orient_tint` / `side_word` consistency on XY-tie normals.
 
 ---
 
@@ -57,12 +59,12 @@ Existing torture coverage retained: A1–A8 (pure resolve), B7–B10 (describers
 |------|--------|
 | `core/doc/selectors.cpp` | Fix `side_word` threshold / tie-break |
 | `core/doc/picks.h` | Fix stale hint-fallback comment |
-| `core/doc/picks.cpp` | Fix stale concavity comment (prior diff: GSL Stage 0 query read-back fields) |
-| `core/doc/session.cpp` | Fix `doc_adjacency` indexing + payload; render tint + meta/adjacency already present in branch |
+| `core/doc/picks.cpp` | Fix stale concavity comments (QCand + geom-query pick) |
+| `core/doc/session.cpp` | Fix `doc_adjacency` indexing + payload; align `orient_tint` tie-break with `side_word` |
 | `core/tests/test_selectors.cpp` | Add B11; prior diff: A8, B10 GSL assertions |
 | `docs/review/core-doc.md` | This report |
 
-**Read-only reviewed (no edits):** `selectors.h`, `picks.h` (API), `session.h`, `docs/contracts/selectors.md`, `test_picks.cpp`, `test_document.cpp`, other `core/doc/*` sources.
+**Read-only reviewed (no edits):** `selectors.h`, `session.h`, `document.{h,cpp}`, `validate.cpp`, `docs/contracts/selectors.md`, `test_picks.cpp`, `test_document.cpp`, other `core/doc/*` sources.
 
 ---
 
@@ -70,7 +72,7 @@ Existing torture coverage retained: A1–A8 (pure resolve), B7–B10 (describers
 
 | Metric | Count |
 |--------|------:|
-| **Fixes** | 5 |
+| **Fixes** | 6 |
 | **Flags** | 8 |
 | **Tests added** | 1 (B11) |
 | **Files touched** | 6 |

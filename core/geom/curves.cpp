@@ -36,6 +36,9 @@ inline double rad(double deg) { return deg * kPi / 180.0; }
 
 TopoDS_Wire make_helix(double pitch, double height, double radius, double cone_angle_deg,
                        double start_angle_deg, bool lefthand) {
+    if (!(height > 0.0) || !(radius > 0.0) || std::abs(pitch) < 1e-12) return TopoDS_Wire();
+    if (cone_angle_deg != 0.0 && std::abs(std::cos(rad(cone_angle_deg))) < 1e-12)
+        return TopoDS_Wire();
     try {
         const gp_Ax3 ax3(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
         Handle(Geom_Surface) surf;

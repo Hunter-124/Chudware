@@ -1,61 +1,96 @@
 # Phase 1 Review — host-core-render
 
 **Track:** `host-core-render`  
-**Branch:** `feat/gui-rewrite`  
+**Branch:** `feat/gui-rewrite` (review run on workspace `master`, 2026-06-27)  
 **Scope:** `host/src/core/**`, `host/src/render/**`, `host/src/main.cpp`, `host/src/app.cpp`, `host/src/worker_client.cpp`, `host/CMakeLists.txt`
 
-## Fixed
+## Architecture (reviewed)
 
-1. **`addEcadTab` use-after-move** — log line referenced `t.title` after `std::move(t)` into `docTabs`; now uses `docTabs[activeTab].title`.
-2. **`DocMirror::reset()` incomplete** — `reset()` now clears `ownerMap_` / reverse indices, `refDatums_`, and `lastOpenedDrawings_` so closing the last tab cannot leave stale topology ownership or datum overlays on the next document.
-3. **Stale owner map on mint** — `newPart`, `newAssembly`, and `open` call `storeOwnerMap({})` and clear `refDatums_` so a freshly minted/opened doc never inherits the previous doc's feature→topology map.
-4. **Stale datum overlays on tab switch** — `activate` and `activateCached` now refresh or clear `refDatums_` from the worker response (matching the `owner_map` discipline already used on switch).
-5. **Stale ID-pass / overlay buffers on empty viewport** — `clearViewportForNewDoc` and the zero-body branch of `loadDocMesh` call a shared `clearPickBuffers()` helper so pick/highlight GPU state cannot outlive `hasDocMesh == false`.
-6. **`IdPass` / `Overlays` GPU leaks** — destructors now delete FBO/texture/RBO/program and scratch VAO/VBO resources left alive after `destroy()` (which only drops per-body draws for reload).
-7. **`AsyncRpc::shutdown` pending counter** — `pending_` is zeroed after join so `busy()` cannot stay true after teardown (relevant for headless shot gating and session restart).
-8. **Stale `cpp_core.h` comment** — header comment updated to reflect that `CppCore` is the production routing seam, not diagnostics-only.
+| Layer | Role |
+|-------|------|
+| **AppState** | Single aggregate for GLFW/Renderer, per-doc viewport fields, `DocMirror`, `Selection`, `WorkerClient`, `AsyncRpc`, multi-doc `DocSession` parking |
+| **DocMirror** | Synchronous `doc_*` / `config_*` / export RPC facade; parses ops-responses; owner-map reverse index; tab `activate` / `activateCached` |
+| **WorkerClient** | NDJSON-RPC to Python worker **or** in-process `libaicad.dll` via routing seams (`routeDocToCpp`, `routeAgentToCpp`, `routeSimToCpp`, `routeEcadToCpp`) |
+| **loadDocMesh** | AICM → shaded `Renderer` + `IdPass` + `Overlays`; builds pick/BBox/normal caches; `renderOnly` for blend live preview |
+| **IdPass** | R32UI (or `AI_CAD_IDBUF=rgba8`) offscreen pass; face→edge→vertex priority; hidden-body skip; section clip |
+| **Selection** | Header-only pick set with observer; `doc_resolve_pick` filled in `app.cpp` on change |
 
-## Flagged
+### Python vs C++ routing seam (`worker_client.cpp`)
+
+- **Docs engine default ON** (`AI_CAD_CPP_DOCS` unset → C++; `=0` forces Python fallback).
+- **Per-doc commit:** `doc-cpp…` / `dwg-cpp…` ids bind all subsequent RPCs to C++ for that document’s lifetime (no mid-doc fallback).
+- **Minting** (`doc_new`, `doc_open`, `import_file` without `into`): tries C++ first; structured `unsupported` falls back to Python.
+- **Agent** coupled to doc engine (`cppAgentFlag()` follows `cppDocsFlag()`); v2 agent RPCs are C++-only when routed (Python worker deleted those methods).
+- **Sim FEA** default ON (`AI_CAD_CPP_SIM`); **ECAD** opt-in (`AI_CAD_CPP_ECAD=1`) with documented unported methods.
+- **Parity probe** (`AI_CAD_CPP_PARITY`) in `doc_mirror.cpp` is diagnostic-only; never affects production results.
+
+## Fixed (this review pass)
+
+| # | Issue | Fix |
+|---|--------|-----|
+| 9 | **Tab switch stale mesh** — `switchToTab` skipped `loadDocMesh` when `aicmPath` was empty (sketch-only / zero-body doc) but left `hasDocMesh` and the **leaving tab’s** GPU buffers active | Added `AppState::unloadDocMesh()`; `switchToTab` calls it when `aicmPath` is empty after a successful `activateCached` |
+| 10 | **`DocMirror::resyncTree` datum lag** — `doc_tree` resync refreshed owner map but never `refDatums_` when the response carried `datums` | Refresh `refDatums_` from top-level or `rebuild.datums` when present (leave last value when absent) |
+| 11 | **`loadAicmFile` path encoding** — `fopen(path)` fails on non-ASCII Windows paths | Read via `std::ifstream(std::filesystem::u8path(path))` |
+
+## Fixed (prior pass, verified in tree)
+
+1. **`addEcadTab` use-after-move** — log uses `docTabs[activeTab].title` after `std::move(t)`.
+2. **`DocMirror::reset()` incomplete** — clears owner maps, `refDatums_`, `lastOpenedDrawings_`.
+3. **Stale owner map on mint** — `newPart` / `newAssembly` / `open` call `storeOwnerMap({})` and clear `refDatums_`.
+4. **Stale datum overlays on tab switch** — `activate` / `activateCached` refresh or clear `refDatums_`.
+5. **Stale ID-pass on empty viewport** — `clearPickBuffers()` shared helper; used from `clearViewportForNewDoc` and zero-body `loadDocMesh`.
+6. **`IdPass` / `Overlays` GPU leaks** — destructors delete FBO/RBO/program and scratch VAO/VBO after `destroy()`.
+7. **`AsyncRpc::shutdown` pending counter** — `pending_.store(0)` after join.
+8. **Stale `cpp_core.h` comment** — documents production routing seam.
+
+## Flagged (no change)
 
 | Area | Severity | Notes |
 |------|----------|-------|
-| ID-buffer `body_id` encoding | Design limit | Packed pick id uses **8 bits** for `body_id` (`encodeId` masks `0xFF`). Assemblies with >255 bodies or body ids >255 will collide in picking/hidden-body skip. Documented with a new `test_aicm` assertion; needs contract bump to fix properly. |
-| `loadAicmFile` path encoding | Portability | Uses `fopen(path)` — non-ASCII paths on Windows may fail; `_wfopen` / `std::filesystem::path` native open would be safer. |
-| `kSeededGeminiKey` in source | Security | Default API key is compiled into `app_state.cpp` and written to `%APPDATA%`. Product/security decision — rotate, env-gate, or remove. |
-| Python vs C++ routing seam | Architecture | `worker_client.cpp` defaults `AI_CAD_CPP_DOCS=1`, `AI_CAD_CPP_SIM=1`, agent coupled to doc engine. Large surface area; unported methods on `doc-cpp` / `ecadcpp` docs fail loud (by design). ECAD still opt-in with documented gaps (`ecad_simulate`, `ecad_design`, doc-id `ecad_autoroute`, etc.). |
-| `DocMirror::resyncTree` | Minor stale risk | `doc_tree` resync refreshes owner map but not `refDatums_`; datum overlays may lag until the next full ops-response. Low impact (datums change on rebuild). |
-| `AppState` size | Design smell | 1200+ line aggregate header; intentional for GUI rework but hard to test and reason about. No change in Phase 1. |
-| Feature-tree file statics | Cross-panel | `doc_tabs.cpp` still calls `ui::featureTreeResetTransient()` on tab switch because rename/save-path statics are not per-doc. Flag for **host-ui** track. |
-| `core/doc/picks.cpp` / selectors | Cross-track | Git shows selector/pick changes outside this track's ownership — verify parity with host `doc_resolve_pick` wire format in Phase 2. |
+| ID-buffer `body_id` encoding | Design limit | `encodeId` masks `body_id` to **8 bits** (`0xFF`). Bodies with id >255 collide in picking and hidden-body skip. Asserted in `test_aicm`; needs AICM contract bump to widen. |
+| `kSeededGeminiKey` in source | Security | Default API key compiled into `app_state.cpp` and seeded to `%APPDATA%`. Product decision — rotate, env-gate, or remove. |
+| Python vs C++ routing surface | Architecture | Large opt-in/default matrix; unported methods on committed `doc-cpp` / `ecadcpp` docs fail loud by design. ECAD gaps: `ecad_simulate`, `ecad_design`, doc-id `ecad_autoroute`, etc. |
+| `AppState` size | Design smell | 1200+ line header; intentional for GUI rework. |
+| Feature-tree file statics | Cross-panel (**host-ui**) | `featureTreeResetTransient()` on tab switch; rename/save-path not per-doc. |
+| `switchToTab` failure path | Minor | On `activateCached` failure, viewport may not refresh; mirror re-syncs `activeTab` index only. |
+| Agent drain empty mesh | Minor (**app.cpp**) | Post–v2-run `doc_rebuild` path skips mesh refresh when `aicm_path` empty; same class as #9 — consider `unloadDocMesh()` there in a follow-up. |
+| `core/doc/picks.cpp` selectors | Cross-track | Verify parity with host `doc_resolve_pick` wire format in Phase 2. |
 
-## Tests added
+## Reviewed, no edits
 
-| Test | Location | CMake |
-|------|----------|-------|
-| `body_id` 8-bit truncation round-trip (`300 → 44`) | `host/src/render/test_aicm_cpp/test_aicm.cpp` | Already wired as `test_aicm` target — **no CMake edit** |
+- `host/src/main.cpp` — crash handler, offscreen render modes, `ensurePromptsDir()` on all launch paths; sound.
+- `host/src/app.cpp` — `DocMirror` listener, selection observer (`resolvePick` / assembly branch / owner-map → tree highlight), stale-resync toast, job drain; routing stays in `worker_client.cpp`.
+- `host/src/worker_client.cpp` — four routing seams + `doc_list` merge; agent hard-fail vs Python fallback documented inline.
+- `host/CMakeLists.txt` — `test_aicm` target wired; glad vendored; Release `/Zi` on Windows.
+- `host/src/core/selection.*` — header-only model; observer single-slot is sufficient.
+- `host/src/core/jobs.*`, `host/src/core/sim_client.*` — out of core/render focus; no lane bugs found.
+- `host/src/render/id_pass.h`, `host/src/render/overlays.h` — contracts clear; section clip + prefer-edge pick API documented.
 
-**Phase 2 suggestion:** run `test_aicm docs/contracts/fixtures/box.aicm` and a GUI pick smoke (`AI_CAD_SHOT=pick`) after full build.
+## Tests
 
-## Files touched
+| Test | Result |
+|------|--------|
+| `test_aicm docs/contracts/fixtures/box.aicm` | **PASS** (20 checks incl. 8-bit `body_id` truncation) |
 
-- `host/src/core/doc_tabs.cpp`
-- `host/src/core/doc_mirror.h`
-- `host/src/core/doc_mirror.cpp`
-- `host/src/core/app_state.cpp`
-- `host/src/core/async_rpc.cpp`
-- `host/src/core/cpp_core.h`
-- `host/src/render/id_pass.cpp`
-- `host/src/render/overlays.cpp`
-- `host/src/render/test_aicm_cpp/test_aicm.cpp`
+**Phase 2:** GUI pick smoke (`AI_CAD_SHOT=pick`), multi-doc mid-edit (`AI_CAD_SHOT=multidoc`), tab switch to empty sketch-only doc after a meshed part.
+
+## Files touched (this pass)
+
+- `host/src/core/app_state.h` — `unloadDocMesh()` declaration
+- `host/src/core/app_state.cpp` — `unloadDocMesh()` implementation
+- `host/src/core/doc_tabs.cpp` — empty-`aicmPath` branch on tab switch
+- `host/src/core/doc_mirror.cpp` — `resyncTree` datum refresh
+- `host/src/render/aicm_loader.cpp` — UTF-8 path open
 - `docs/review/host-core-render.md` (this file)
-
-**Reviewed, no edits:** `host/src/main.cpp`, `host/src/app.cpp`, `host/src/worker_client.cpp`, `host/CMakeLists.txt`, `host/src/core/selection.*`, `host/src/core/jobs.*`, `host/src/core/sim_client.*`, `host/src/render/aicm_loader.*`, `host/src/render/id_pass.h`, `host/src/render/overlays.h`, `host/src/render/aicm_loader.h`
 
 ## Summary
 
 | Metric | Count |
 |--------|------:|
-| Fixes | 8 |
+| Fixes (this pass) | 3 |
+| Fixes (verified prior) | 8 |
 | Flagged items | 8 |
-| Tests added | 1 |
-| Files touched | 10 |
+| Tests run | 1 (pass) |
+| Files touched (this pass) | 6 |
+
+**Lane health:** Core state, doc mirror, mesh load, ID-pass picking, and WorkerClient routing are coherent. The main correctness risks are contract limits (8-bit `body_id`), routing coverage gaps on opt-in ECAD, and the intentional monolithic `AppState`. Tab switching to tessellation-less documents no longer shows the previous tab’s mesh.

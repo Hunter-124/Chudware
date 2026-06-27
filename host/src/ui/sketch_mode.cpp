@@ -4597,7 +4597,7 @@ bool SketchMode::drawCurvePathPicker(AppState& st, ImGuiIO& io, const ImVec2& im
 
 bool SketchMode::drawDatumSelect(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
                                  const ImVec2& imgMax, int vw, int vh, bool imgHovered) {
-    if (active_ || !imgHovered) return false;
+    if (!st.renderer || active_ || !imgHovered) return false;
     auto* pm = st.propertyManager;
     // A PM picker (axis/plane well) owns datum picks while open — don't also general-select.
     if (pm && pm->active() && (pm->activeWellWantsAxis() || pm->activeWellWantsPlane())) return false;

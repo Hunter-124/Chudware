@@ -45,8 +45,10 @@ void Application::frame() {
     s.tickDemoAgent(io.DeltaTime);
 
     // keyboard: ⌘K / Ctrl+K palette
-    if ((io.KeyCtrl || io.KeySuper) && ImGui::IsKeyPressed(ImGuiKey_K, false))
+    if ((io.KeyCtrl || io.KeySuper) && ImGui::IsKeyPressed(ImGuiKey_K, false)) {
         s.paletteOpen = !s.paletteOpen;
+        if (s.paletteOpen) { s.paletteQuery[0] = '\0'; s.paletteSel = 0; }
+    }
 
     // undo / redo (engine), unless typing in a field or mid-tool / mid-agent
     if ((io.KeyCtrl || io.KeySuper) && !io.WantTextInput && s.engineReady && s.engine.hasDoc()

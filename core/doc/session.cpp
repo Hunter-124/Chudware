@@ -4200,12 +4200,17 @@ bool orient_tint(double nx, double ny, double nz, unsigned char out[3]) {
     double ax = std::abs(nx), ay = std::abs(ny), az = std::abs(nz);
     double m = std::max({ax, ay, az});
     if (m < 0.92) return false;  // not flat-on a principal axis -> leave neutral
-    if (az == m) { if (nz > 0) { out[0]=90; out[1]=140; out[2]=225; }   // top +Z blue
-                   else        { out[0]=70; out[1]=175; out[2]=185; } } // bottom -Z teal
-    else if (ay == m) { if (ny > 0) { out[0]=95; out[1]=185; out[2]=95; }   // back +Y green
-                        else        { out[0]=215; out[1]=200; out[2]=70; } } // front -Y yellow
-    else { if (nx > 0) { out[0]=220; out[1]=80; out[2]=80; }   // right +X red
-           else        { out[0]=225; out[1]=140; out[2]=70; } } // left -X orange
+    // Tie-break matches selectors.cpp side_word (Z, then X, then Y) — not float equality on m.
+    if (az >= ax && az >= ay) {
+        if (nz > 0) { out[0]=90; out[1]=140; out[2]=225; }   // top +Z blue
+        else        { out[0]=70; out[1]=175; out[2]=185; }   // bottom -Z teal
+    } else if (ax >= ay && ax >= az) {
+        if (nx > 0) { out[0]=220; out[1]=80; out[2]=80; }    // right +X red
+        else        { out[0]=225; out[1]=140; out[2]=70; }   // left -X orange
+    } else {
+        if (ny > 0) { out[0]=95; out[1]=185; out[2]=95; }    // back +Y green
+        else        { out[0]=215; out[1]=200; out[2]=70; }  // front -Y yellow
+    }
     return true;
 }
 

@@ -99,6 +99,14 @@ char* dup_cstr(const std::string& s) {
     return p;
 }
 
+// Read a string field tolerating absent or null (nlohmann value() throws on null).
+template<typename JsonT>
+std::string jstr(const JsonT& j, const char* key, const std::string& d = std::string()) {
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_string()) return d;
+    return it->get<std::string>();
+}
+
 // Emit `j` into *out_json (heap) and return `rc`. On allocation failure returns 1
 // with an {"error":"out of memory"} payload (or nullptr if even that fails).
 int emit(json&& j, char** out_json, int rc) {
@@ -507,7 +515,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         if (params.is_object() && !params.contains("params")) {
             json wrapped = json::object();
             wrapped["params"] = params;
-            wrapped["doc_id"] = params.value("doc_id", std::string());
+            wrapped["doc_id"] = jstr(params, "doc_id");
             params = std::move(wrapped);
         }
         m = "agent_pm_assist";
@@ -646,7 +654,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             aicad::agent::CompleteResult cr =
                 aicad::agent::complete(provider, cfg, system, messages, max_tokens);
             return emit(json{{"text", cr.text}, {"thinking", cr.thinking}, {"error", cr.error}},
-                        out_json, cr.error.empty() ? 0 : 0);
+                        out_json, 0);
         }
         if (m == "agent_role_of") {
             // {system} -> {role}. RoleScriptedProvider role sniffer probe.
@@ -1093,8 +1101,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             //      run_micro_design vs run_design.
             // Returns the RunResult + events:[...], OR {ok:false, error} on a provider
             // refusal/resolution failure (no run started).
-            std::string request = params.value("request", std::string());
-            std::string doc_id = params.value("doc_id", std::string());
+            std::string request = jstr(params, "request");
+            std::string doc_id = jstr(params, "doc_id");
             json options = params.contains("options") ? params["options"] : json::object();
 
             // ---- W17 drawing-intent fast-path ----
@@ -1161,7 +1169,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 json resolved = aicad::agent::resolve_provider(std::nullopt, cfg, json::object());
                 if (resolved.is_object() && resolved.contains("error")) {
                     return emit(json{{"ok", false},
-                                     {"error", resolved.value("error", std::string("provider resolution failed"))}},
+                                     {"error", jstr(resolved, "error", "provider resolution failed")}},
                                 out_json, 0);
                 }
                 // Attach the experimental knobs (separate vision review provider + cad-sequence
@@ -1200,8 +1208,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // it's good") instead of the old one-capability-per-message routing. Provider is
             // resolved exactly like agent_run; the flow-sim capability is wired to run_flow_sim
             // (the same path agent_simulate_v1 uses), so design->CFD chains in one run.
-            std::string request = params.value("request", std::string());
-            std::string doc_id = params.value("doc_id", std::string());
+            std::string request = jstr(params, "request");
+            std::string doc_id = jstr(params, "doc_id");
             json options = params.contains("options") ? params["options"] : json::object();
 
             json provider;
@@ -1215,8 +1223,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 json resolved = aicad::agent::resolve_provider(std::nullopt, cfg, json::object());
                 if (resolved.is_object() && resolved.contains("error"))
                     return emit(json{{"ok", false},
-                                     {"error", resolved.value(
-                                                   "error", std::string("provider resolution failed"))}},
+                                     {"error", jstr(resolved, "error", "provider resolution failed")}},
                                 out_json, 0);
                 provider = aicad::agent::apply_experimental(resolved, cfg, json::object());
             }
@@ -1237,8 +1244,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // {run_id, status, stop_reason, revision, doc_id, events:[...]}. The
             // provider descriptor is the resolved {name,model,api_key,...} OR the
             // role-scripted mock {name:"mock", replies:{by_role}} for the gate.
-            std::string request = params.value("request", std::string());
-            std::string doc_id = params.value("doc_id", std::string());
+            std::string request = jstr(params, "request");
+            std::string doc_id = jstr(params, "doc_id");
             json provider = params.contains("provider") ? params["provider"] : json::object();
             json options = params.contains("options") ? params["options"] : json::object();
             // Capture every emitted event (like agent_run_machine returns `events`).
@@ -1252,8 +1259,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // MICRO-ORCHESTRATION run: {request, doc_id, provider:{...}, options?} ->
             // {run_id, status, stop_reason, revision, doc_id, events:[...]}. Parallels
             // agent_run_design (P54a).
-            std::string request = params.value("request", std::string());
-            std::string doc_id = params.value("doc_id", std::string());
+            std::string request = jstr(params, "request");
+            std::string doc_id = jstr(params, "doc_id");
             json provider = params.contains("provider") ? params["provider"] : json::object();
             json options = params.contains("options") ? params["options"] : json::object();
             auto captured = std::make_shared<json>(json::array());
@@ -1352,8 +1359,8 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         if (m == "agent_answer_question") {
             using ojson = nlohmann::ordered_json;
             ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
-            std::string question = op.value("question", std::string());
-            std::string doc_id = op.value("doc_id", std::string("?"));
+            std::string question = jstr(op, "question");
+            std::string doc_id = jstr(op, "doc_id", "?");
             // P54b host-ergonomics: hydrate doc/revision/feature_status from the live
             // C++ session when not passed explicitly (host sends just {question, doc_id}).
             hydrate_assist_from_session(op, doc_id);
@@ -1367,7 +1374,7 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             json prov = resolve_assist_provider(params);
             if (prov.is_object() && prov.contains("error")) {
                 return emit(json{{"answer", std::string("I can't answer that right now: ") +
-                                                prov.value("error", std::string("provider unavailable"))}},
+                                                jstr(prov, "error", "provider unavailable")}},
                             out_json, 0);
             }
             auto provider = aicad::agent::make_assist_provider(prov);
@@ -1386,9 +1393,9 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             using ojson = nlohmann::ordered_json;
             ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
             // Accept both {request} (Design submit) and {question} (defensive alias).
-            std::string request = op.value("request", std::string());
-            if (request.empty()) request = op.value("question", std::string());
-            std::string doc_id = op.value("doc_id", std::string("?"));
+            std::string request = jstr(op, "request");
+            if (request.empty()) request = jstr(op, "question");
+            std::string doc_id = jstr(op, "doc_id", "?");
             // Hydrate doc/revision/feature_status from the live C++ session when present
             // (Edit mode); for Design-new no doc exists yet and `doc` stays null.
             hydrate_assist_from_session(op, doc_id);

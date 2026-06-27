@@ -162,3 +162,11 @@ TEST_CASE("swept solid has strictly positive principal moments of inertia") {
     CHECK(i2 > 0.0);
     CHECK(i3 > 0.0);
 }
+
+TEST_CASE("make_helix rejects degenerate parameters") {
+    CHECK(geom::make_helix(0.0, 10.0, 5.0, 0.0, 0.0, false).IsNull());
+    CHECK(geom::make_helix(2.0, 0.0, 5.0, 0.0, 0.0, false).IsNull());
+    CHECK(geom::make_helix(2.0, 10.0, 0.0, 0.0, 0.0, false).IsNull());
+    // 90° cone angle makes cos(cone_angle)==0 in the arc-length formula.
+    CHECK(geom::make_helix(2.0, 10.0, 5.0, 90.0, 0.0, false).IsNull());
+}

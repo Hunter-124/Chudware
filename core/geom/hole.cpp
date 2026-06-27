@@ -29,6 +29,7 @@ inline double radians(double deg) { return deg * kPi / 180.0; }
 TopoDS_Shape make_hole_tool(const Eigen::Vector3d& origin,
                             const Eigen::Vector3d& drill_dir,
                             HoleStyle style, const HoleDims& dims) {
+    if (!(dims.diameter > 0.0) || !(dims.depth > 0.0)) return TopoDS_Shape();
     // Coaxial frame: cylinder/cone build along +axis from `origin` toward the
     // material (drill_dir). gp_Dir normalises drill_dir (it need not be unit-length).
     gp_Ax2 ax(gp_Pnt(origin.x(), origin.y(), origin.z()),

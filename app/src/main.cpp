@@ -9,6 +9,7 @@
 
 #include "app/application.h"
 #include "app/app_state.h"
+#include "viewport/scene.h"
 #include "theme/theme.h"
 
 #include <cstdio>
@@ -46,7 +47,7 @@ static void capturePNG(GLFWwindow* win, const char* path) {
 int main(int argc, char** argv) {
     // headless screenshot mode: --shot <path> [--frames N]
     const char* shotPath = nullptr; int shotFrames = 12; bool demo = false;
-    const char* doCmd = nullptr; bool openPalette = false; bool sketch = false; bool selftest = false;
+    const char* doCmd = nullptr; bool openPalette = false; bool sketch = false; bool selftest = false; bool picktest = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--shot") && i+1 < argc) shotPath = argv[++i];
         else if (!std::strcmp(argv[i], "--frames") && i+1 < argc) shotFrames = atoi(argv[++i]);
@@ -55,6 +56,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--palette")) openPalette = true;
         else if (!std::strcmp(argv[i], "--sketch")) sketch = true;
         else if (!std::strcmp(argv[i], "--selftest")) selftest = true;
+        else if (!std::strcmp(argv[i], "--picktest")) picktest = true;
     }
 
     // If the core DLL location isn't set and isn't next to the exe, point at the dev build path.
@@ -128,6 +130,26 @@ int main(int argc, char** argv) {
             bool ok = sv && op && nf > 0;
             std::fprintf(stderr, "[selftest] save=%d open=%d features=%d rev=%d -> %s\n",
                          sv, op, nf, st.engine.revision(), ok ? "OK" : "FAIL");
+            rc = ok ? 0 : 2;
+        }
+        application.shutdown();
+        glfwDestroyWindow(win); glfwTerminate();
+        return rc;
+    }
+
+    if (picktest) {
+        auto& st = application.state();
+        int rc = 2;
+        if (!st.engineReady || !st.scene) std::fprintf(stderr, "[picktest] FAIL: no engine/scene\n");
+        else {
+            st.scene->resize(800, 600);
+            bool loaded = st.scene->loadAicm(st.engine.aicmPath());
+            st.scene->render();
+            viewport::Scene::PickRef pr;
+            bool hit = st.scene->pickAt(400, 300, pr);
+            bool ok = loaded && hit && pr.topo_id > 0;
+            std::fprintf(stderr, "[picktest] loaded=%d hit=%d body=%u face=%u -> %s\n",
+                         loaded, hit, pr.body_id, pr.topo_id, ok ? "OK" : "FAIL");
             rc = ok ? 0 : 2;
         }
         application.shutdown();

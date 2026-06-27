@@ -75,8 +75,8 @@ const char* kEdgeVS = R"(#version 330 core
 layout(location=0) in vec3 aPos; uniform mat4 uMVP;
 void main(){ gl_Position=uMVP*vec4(aPos,1.0); })";
 const char* kEdgeFS = R"(#version 330 core
-out vec4 frag; uniform vec3 uColor;
-void main(){ frag=vec4(uColor,1.0); })";
+out vec4 frag; uniform vec3 uColor; uniform float uA;
+void main(){ frag=vec4(uColor,uA); })";
 
 const char* kBgVS = R"(#version 330 core
 out vec2 vUv; const vec2 P[3]=vec2[3](vec2(-1,-1),vec2(3,-1),vec2(-1,3));
@@ -90,6 +90,7 @@ void main(){ frag=vec4(mix(uBot,uTop,vUv.y),1.0); })";
 bool Scene::init() {
     prog_   = link(kMeshVS,kMeshFS,"mesh");
     edgeProg_= link(kEdgeVS,kEdgeFS,"edge");
+    idProg_ = link(kEdgeVS,kEdgeFS,"id");   // flat color = exact pick id (no AA/blend)
     bgProg_ = link(kBgVS,kBgFS,"bg");
     glGenVertexArrays(1,&bgVao_);
     buildFbo();
@@ -98,13 +99,15 @@ bool Scene::init() {
 
 void Scene::shutdown(){ releaseBodies(); releaseFbo();
     if(prog_) glDeleteProgram(prog_); if(edgeProg_) glDeleteProgram(edgeProg_);
+    if(idProg_) glDeleteProgram(idProg_);
     if(bgProg_) glDeleteProgram(bgProg_); if(bgVao_) glDeleteVertexArrays(1,&bgVao_); }
 
 void Scene::releaseFbo(){
     if(msColor_) glDeleteRenderbuffers(1,&msColor_); if(msDepth_) glDeleteRenderbuffers(1,&msDepth_);
     if(msFbo_) glDeleteFramebuffers(1,&msFbo_);
     if(resolveTex_) glDeleteTextures(1,&resolveTex_); if(resolveFbo_) glDeleteFramebuffers(1,&resolveFbo_);
-    msColor_=msDepth_=msFbo_=resolveTex_=resolveFbo_=0;
+    if(idTex_) glDeleteTextures(1,&idTex_); if(idDepth_) glDeleteRenderbuffers(1,&idDepth_); if(idFbo_) glDeleteFramebuffers(1,&idFbo_);
+    msColor_=msDepth_=msFbo_=resolveTex_=resolveFbo_=idTex_=idDepth_=idFbo_=0;
 }
 
 void Scene::buildFbo(){
@@ -129,6 +132,18 @@ void Scene::buildFbo(){
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
     glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,resolveTex_,0);
+
+    // id-pass FBO (single-sample, exact colors for picking)
+    glGenFramebuffers(1,&idFbo_); glBindFramebuffer(GL_FRAMEBUFFER,idFbo_);
+    glGenTextures(1,&idTex_); glBindTexture(GL_TEXTURE_2D,idTex_);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,w_,h_,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,idTex_,0);
+    glGenRenderbuffers(1,&idDepth_); glBindRenderbuffer(GL_RENDERBUFFER,idDepth_);
+    glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH_COMPONENT24,w_,h_);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,idDepth_);
+
     glBindFramebuffer(GL_FRAMEBUFFER,0);
 }
 
@@ -151,6 +166,7 @@ bool Scene::loadAicm(const std::string& path){
     render::DocMesh dm; std::string err;
     if(!render::loadAicmFile(path,dm,err)){ lastError=err; return false; }
     releaseBodies();
+    pickMap_.clear(); selected_.clear(); hasHover_=false;
     float lo[3]={1e30f,1e30f,1e30f}, hi[3]={-1e30f,-1e30f,-1e30f};
     for(const auto& bm: dm.bodies){
         if(bm.n_tris==0) continue;
@@ -173,6 +189,12 @@ bool Scene::loadAicm(const std::string& path){
         glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)0);
         glEnableVertexAttribArray(1); glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)(3*sizeof(float)));
         g.nIdx=(int)bm.idx.size();
+        // picking metadata: one pick id per face range (render order == pickMap_ order)
+        g.body_id = bm.body_id;
+        for(const auto& fr : bm.faces){
+            g.faces.push_back(FacePart{fr.face_id, fr.first_tri, fr.tri_count});
+            pickMap_.push_back(PickRef{bm.body_id, fr.face_id, 0});
+        }
         // edges: expand each segment polyline into GL_LINES pairs
         std::vector<float> el;
         for(const auto& seg: bm.edges){
@@ -267,12 +289,35 @@ void Scene::render(){
             glUseProgram(edgeProg_);
             glUniformMatrix4fv(glGetUniformLocation(edgeProg_,"uMVP"),1,GL_FALSE,mvp.m);
             glUniform3f(glGetUniformLocation(edgeProg_,"uColor"),0.06f,0.08f,0.11f);
+            glUniform1f(glGetUniformLocation(edgeProg_,"uA"),1.0f);
             glLineWidth(1.2f);
             glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL);
             for(const auto&b:bodies_) if(b.evao && (style_==1)){
                 glBindVertexArray(b.evao); glDrawArrays(GL_LINES,0,b.nEdgeVerts);
             }
             glDepthFunc(GL_LESS);
+        }
+
+        // selection + hover face highlight (translucent overlay)
+        if(!selected_.empty() || hasHover_){
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+            glEnable(GL_POLYGON_OFFSET_FILL); glPolygonOffset(-1.f,-1.f);
+            glDepthFunc(GL_LEQUAL);
+            glUseProgram(edgeProg_);
+            glUniformMatrix4fv(glGetUniformLocation(edgeProg_,"uMVP"),1,GL_FALSE,mvp.m);
+            auto drawFace=[&](const PickRef& pr,float cr,float cg,float cb,float ca){
+                for(const auto&b:bodies_){ if(b.body_id!=pr.body_id) continue;
+                    for(const auto&f:b.faces){ if(f.face_id!=pr.topo_id) continue;
+                        glUniform3f(glGetUniformLocation(edgeProg_,"uColor"),cr,cg,cb);
+                        glUniform1f(glGetUniformLocation(edgeProg_,"uA"),ca);
+                        glBindVertexArray(b.vao);
+                        glDrawElements(GL_TRIANGLES,f.tri_count*3,GL_UNSIGNED_INT,
+                                       (void*)(size_t)(f.first_tri*3*sizeof(unsigned int)));
+                    } }
+            };
+            for(const auto& sref:selected_) drawFace(sref,0.30f,0.55f,1.0f,0.42f);
+            if(hasHover_) drawFace(hovered_,0.50f,0.72f,1.0f,0.26f);
+            glDisable(GL_POLYGON_OFFSET_FILL); glDisable(GL_BLEND); glDepthFunc(GL_LESS);
         }
     }
     glBindVertexArray(0);
@@ -282,6 +327,62 @@ void Scene::render(){
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER,resolveFbo_);
     glBlitFramebuffer(0,0,w_,h_,0,0,w_,h_,GL_COLOR_BUFFER_BIT,GL_NEAREST);
     glBindFramebuffer(GL_FRAMEBUFFER,0);
+}
+
+void Scene::renderIdPass(){
+    if(idFbo_==0 || bodies_.empty()) return;
+    glBindFramebuffer(GL_FRAMEBUFFER,idFbo_);
+    glViewport(0,0,w_,h_);
+    glDisable(GL_BLEND);
+    glClearColor(0,0,0,1); glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LESS);
+
+    float dir[3]={std::cos(el_)*std::cos(az_),std::cos(el_)*std::sin(az_),std::sin(el_)};
+    float eye[3]={target_[0]+dir[0]*dist_,target_[1]+dir[1]*dist_,target_[2]+dir[2]*dist_};
+    float up[3]={0,0,1};
+    float aspect=(float)w_/(float)(h_>0?h_:1);
+    M4 mvp=mul(perspective(fov_,aspect,radius_*0.02f+0.01f,dist_+radius_*8.f), lookAt(eye,target_,up));
+
+    glUseProgram(idProg_);
+    glUniformMatrix4fv(glGetUniformLocation(idProg_,"uMVP"),1,GL_FALSE,mvp.m);
+    glUniform1f(glGetUniformLocation(idProg_,"uA"),1.0f);
+    glEnable(GL_CULL_FACE); glCullFace(GL_BACK);
+    uint32_t idx=0;
+    for(const auto& b:bodies_){
+        glBindVertexArray(b.vao);
+        for(const auto& f:b.faces){
+            ++idx;  // 1-based pick id
+            glUniform3f(glGetUniformLocation(idProg_,"uColor"),
+                        (idx&0xFF)/255.f, ((idx>>8)&0xFF)/255.f, ((idx>>16)&0xFF)/255.f);
+            glDrawElements(GL_TRIANGLES,f.tri_count*3,GL_UNSIGNED_INT,
+                           (void*)(size_t)(f.first_tri*3*sizeof(unsigned int)));
+        }
+    }
+    glDisable(GL_CULL_FACE);
+    glBindVertexArray(0);
+    glBindFramebuffer(GL_FRAMEBUFFER,0);
+}
+
+bool Scene::pickAt(int px,int py,PickRef& out){
+    if(px<0||py<0||px>=w_||py>=h_||bodies_.empty()) return false;
+    renderIdPass();
+    glBindFramebuffer(GL_FRAMEBUFFER,idFbo_);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    unsigned char c[4]={0,0,0,0};
+    glPixelStorei(GL_PACK_ALIGNMENT,1);
+    glReadPixels(px, h_-1-py, 1,1, GL_RGBA, GL_UNSIGNED_BYTE, c);  // FBO is bottom-up
+    glBindFramebuffer(GL_FRAMEBUFFER,0);
+    uint32_t idx = (uint32_t)c[0] | ((uint32_t)c[1]<<8) | ((uint32_t)c[2]<<16);
+    if(idx==0 || idx>pickMap_.size()) return false;
+    out = pickMap_[idx-1];
+    return true;
+}
+
+void Scene::setHovered(const PickRef* r){ if(r){ hovered_=*r; hasHover_=true; } else hasHover_=false; }
+void Scene::clearSelection(){ selected_.clear(); }
+void Scene::toggleSelect(const PickRef& r){
+    for(size_t i=0;i<selected_.size();++i) if(selected_[i]==r){ selected_.erase(selected_.begin()+i); return; }
+    selected_.push_back(r);
 }
 
 } // namespace viewport

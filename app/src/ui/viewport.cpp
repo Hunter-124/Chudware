@@ -35,6 +35,8 @@ void drawViewport(AppState& s) {
         // navigation (middle = orbit, Ctrl+middle / right = pan, wheel = zoom)
         if (ImGui::IsItemHovered()) {
             ImGuiIO& io = ImGui::GetIO();
+            bool dragging = ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.f) ||
+                            ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.f);
             if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.f)) {
                 if (io.KeyCtrl) s.scene->pan(io.MouseDelta.x, io.MouseDelta.y);
                 else            s.scene->orbit(-io.MouseDelta.x*0.01f, io.MouseDelta.y*0.01f);
@@ -43,6 +45,20 @@ void drawViewport(AppState& s) {
             }
             if (io.MouseWheel != 0.f) s.scene->zoom(io.MouseWheel);
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Middle)) s.scene->homeView();
+
+            // face picking: hover-highlight + left-click select (Shift = add)
+            viewport::Scene::PickRef pr;
+            if (!dragging && s.scene->pickAt((int)(io.MousePos.x - a.x), (int)(io.MousePos.y - a.y), pr)) {
+                s.scene->setHovered(&pr);
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) s.scene->toggleSelect(pr);
+            } else {
+                s.scene->setHovered(nullptr);
+                if (!dragging && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !io.KeyShift)
+                    s.scene->clearSelection();
+            }
+            s.selCount = (int)s.scene->selection().size();
+        } else {
+            s.scene->setHovered(nullptr);
         }
     } else {
         dl->AddRectFilledMultiColor(a, b, TCOL(viewport0), TCOL(viewport0), TCOL(viewport1), TCOL(viewport1));

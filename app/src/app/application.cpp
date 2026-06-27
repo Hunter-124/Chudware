@@ -55,6 +55,11 @@ void Application::frame() {
         if (redo) { if (s.engine.redo().ok) { s.buildTreeFromDoc(); s.status = "Redo"; } }
         else if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) { if (s.engine.undo().ok) { s.buildTreeFromDoc(); s.status = "Undo"; } }
     }
+    // file shortcuts
+    if ((io.KeyCtrl || io.KeySuper) && !io.WantTextInput) {
+        if (ImGui::IsKeyPressed(ImGuiKey_S, false)) s.doSave(io.KeyShift);
+        else if (ImGui::IsKeyPressed(ImGuiKey_O, false)) s.doOpen();
+    }
 
     const float titleH = theme::ctx().m.titleBarH  * theme::S();
     const float wsH    = theme::ctx().m.workspaceH  * theme::S();

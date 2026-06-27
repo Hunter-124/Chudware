@@ -34,6 +34,8 @@ public:
     const std::string& aicmPath() const { return aicmPath_; }
 
     bool newPart(const std::string& name = "Part");
+    bool save(const std::string& path);        // doc_save -> .step+ (native editable format)
+    bool open(const std::string& path);        // doc_open -> adopt the opened doc (tree+mesh)
     OpsResult apply(const nlohmann::json& ops, bool coalesce = false);
     OpsResult addFeature(const nlohmann::json& feature);
     OpsResult refreshTree();

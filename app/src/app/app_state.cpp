@@ -1,7 +1,17 @@
 #include "app/app_state.h"
+#include "platform/file_dialog.h"
 #include <cstring>
+#include <string>
 
 namespace app {
+
+static std::string stemOf(const std::string& path) {
+    size_t s = path.find_last_of("/\\");
+    std::string f = (s == std::string::npos) ? path : path.substr(s+1);
+    size_t d = f.find_last_of('.');
+    if (d != std::string::npos && d > 0) f = f.substr(0, d);
+    return f.empty() ? "Part" : f;
+}
 
 static bool opensInspector(const char* id) {
     static const char* k[] = {
@@ -116,6 +126,42 @@ bool AppState::commitTool(const std::string& tool, double v1, double v2) {
     if (r.ok) { buildTreeFromDoc(); status = tool + " applied  (rev " + std::to_string(engine.revision()) + ")"; return true; }
     status = std::string("Engine error: ") + (r.errMsg.empty() ? engine.lastError() : r.errMsg);
     return false;
+}
+
+void AppState::doNewPart() {
+    if (!engineReady) { status = "Engine offline"; return; }
+    if (engine.newPart("Part")) {
+        savePath.clear();
+        if (!docs.empty()) docs[activeDoc].name = "Part";
+        buildTreeFromDoc(); viewMeshRev = -1; activeTool.clear();
+        status = "New part";
+    } else status = std::string("New failed: ") + engine.lastError();
+}
+
+void AppState::doSave(bool saveAs) {
+    if (!engineReady) { status = "Engine offline - nothing to save"; return; }
+    std::string path = (saveAs || savePath.empty())
+        ? platform::saveCadFile((docs.empty() ? std::string("Part1") : doc().name) + ".step+")
+        : savePath;
+    if (path.empty()) return;  // cancelled
+    if (engine.save(path)) {
+        savePath = path;
+        if (!docs.empty()) docs[activeDoc].name = stemOf(path);
+        status = "Saved " + path;
+    } else status = std::string("Save failed: ") + engine.lastError();
+}
+
+void AppState::doOpen() {
+    if (!engineReady) { status = "Engine offline"; return; }
+    std::string path = platform::openCadFile();
+    if (path.empty()) return;  // cancelled
+    if (engine.open(path)) {
+        savePath = path;
+        if (!docs.empty()) { docs[activeDoc].name = stemOf(path); docs[activeDoc].type = cmd::DocType::Part; }
+        workspace = cmd::Workspace::Model;
+        buildTreeFromDoc(); viewMeshRev = -1; activeTool.clear();
+        status = "Opened " + path;
+    } else status = std::string("Open failed: ") + engine.lastError();
 }
 
 void AppState::seedDemo() {

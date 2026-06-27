@@ -91,6 +91,9 @@ struct AppState {
     TreeNode tree;                      // demo model tree
     std::vector<std::string> bodies;
 
+    // document file lifecycle
+    std::string savePath;              // last saved/opened .step+ path ("" = untitled)
+
     // status
     std::string status = "Ready";
     std::string units = "mm";
@@ -116,6 +119,9 @@ struct AppState {
 
     void dispatch(const char* cmdId);   // central command handler (application.cpp)
     void seedDemo();                    // populate docs/tree/agent (real engine or demo fallback)
+    void doNewPart();                   // File > New Part
+    void doSave(bool saveAs);           // File > Save / Save As (native dialog)
+    void doOpen();                      // File > Open (native dialog)
     void buildTreeFromDoc();            // rebuild the UI tree from engine.tree()
     bool commitTool(const std::string& tool, double v1, double v2);  // apply a real op (Inspector OK)
     void startDemoAgent(const std::string& userText);

@@ -88,7 +88,7 @@ if(USE_BRIDGE)
     AICAD_DEFAULT_LIBAICAD="${REPO}/core/build-occt/bin/Release/libaicad.dll")
 endif()
 if(WIN32)
-  target_link_libraries(AI-CAD2 PRIVATE opengl32 dwmapi)
+  target_link_libraries(AI-CAD2 PRIVATE opengl32 dwmapi comdlg32)
 endif()
 
 # Stage the resources next to the exe so the app finds fonts/icons at runtime.

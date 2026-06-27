@@ -101,6 +101,36 @@ bool Engine::newPart(const std::string& name) {
 #endif
 }
 
+bool Engine::save(const std::string& path) {
+    if (docId_.empty()) { lastErr_ = "no document"; return false; }
+    OpsResult r = call("doc_save", json{{"doc_id", docId_}, {"path", path}});
+    if (!r.ok) lastErr_ = r.errMsg.empty() ? "save failed" : r.errMsg;
+    return r.ok;
+}
+
+bool Engine::open(const std::string& path) {
+#if defined(AICAD_HAVE_BRIDGE)
+    json result; std::string err;
+    bool ok = core::cpp_core().call("doc_open", json{{"path", path}}, result, err);
+    if (!ok && !(result.is_object() && result.contains("code"))) {
+        lastErr_ = err.empty() ? "open failed" : err; return false;
+    }
+    if (result.is_object() && result.contains("code")) {
+        lastErr_ = result.value("message", std::string("open error")); return false;
+    }
+    docId_ = result.value("doc_id", std::string());
+    if (docId_.empty()) { lastErr_ = "open returned no doc_id"; return false; }
+    revision_ = result.value("revision", 0);
+    if (result.contains("tree") && result["tree"].is_object()) tree_ = result["tree"];
+    if (result.contains("tess") && result["tess"].is_object()) aicmPath_ = result["tess"].value("aicm_path", std::string());
+    refreshTree();
+    rebuild();   // ensure a fresh tess.aicm_path for the viewport
+    return true;
+#else
+    (void)path; lastErr_ = "no bridge"; return false;
+#endif
+}
+
 OpsResult Engine::apply(const json& ops, bool coalesce) {
     if (docId_.empty()) { OpsResult r; r.errMsg = "no document"; return r; }
     OpsResult r = call("doc_apply_ops", json{

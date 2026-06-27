@@ -15,16 +15,16 @@ static void appMenu(AppState& s) {
     if (ImGui::BeginPopup("##appmenu")) {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::BeginMenu("New")) {
-                if (ImGui::MenuItem("Part"))      { s.docs.push_back({"Part"+std::to_string(s.docs.size()+1), cmd::DocType::Part}); s.activeDoc=(int)s.docs.size()-1; s.workspace=cmd::Workspace::Model; }
+                if (ImGui::MenuItem("Part"))      s.doNewPart();
                 if (ImGui::MenuItem("Assembly"))  { s.docs.push_back({"Assem"+std::to_string(s.docs.size()+1), cmd::DocType::Assembly}); s.activeDoc=(int)s.docs.size()-1; s.workspace=cmd::Workspace::Assemble; }
                 if (ImGui::MenuItem("Drawing"))   s.dispatch("make_drawing");
                 if (ImGui::MenuItem("Schematic")) s.dispatch("ecad_new_sch");
                 if (ImGui::MenuItem("PCB"))       s.dispatch("ecad_new_pcb");
                 ImGui::EndMenu();
             }
-            ImGui::MenuItem("Open...");
-            ImGui::MenuItem("Save");
-            ImGui::MenuItem("Save As...");
+            if (ImGui::MenuItem("Open...", "Ctrl+O"))        s.doOpen();
+            if (ImGui::MenuItem("Save", "Ctrl+S"))           s.doSave(false);
+            if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S")) s.doSave(true);
             ImGui::Separator();
             if (ImGui::MenuItem("Quit")) glfwSetWindowShouldClose(s.window, 1);
             ImGui::EndMenu();

@@ -46,7 +46,7 @@ static void capturePNG(GLFWwindow* win, const char* path) {
 int main(int argc, char** argv) {
     // headless screenshot mode: --shot <path> [--frames N]
     const char* shotPath = nullptr; int shotFrames = 12; bool demo = false;
-    const char* doCmd = nullptr; bool openPalette = false; bool sketch = false;
+    const char* doCmd = nullptr; bool openPalette = false; bool sketch = false; bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--shot") && i+1 < argc) shotPath = argv[++i];
         else if (!std::strcmp(argv[i], "--frames") && i+1 < argc) shotFrames = atoi(argv[++i]);
@@ -54,6 +54,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--do") && i+1 < argc) doCmd = argv[++i];
         else if (!std::strcmp(argv[i], "--palette")) openPalette = true;
         else if (!std::strcmp(argv[i], "--sketch")) sketch = true;
+        else if (!std::strcmp(argv[i], "--selftest")) selftest = true;
     }
 
     // If the core DLL location isn't set and isn't next to the exe, point at the dev build path.
@@ -113,6 +114,27 @@ int main(int argc, char** argv) {
 
     app::Application application;
     application.init(win, res, scale);
+    if (selftest) {
+        auto& st = application.state();
+        int rc = 2;
+        if (!st.engineReady) { std::fprintf(stderr, "[selftest] FAIL: engine not ready (%s)\n", st.engine.lastError().c_str()); }
+        else {
+            const char* tmp = std::getenv("TEMP");
+            std::string path = (tmp ? std::string(tmp) : std::string(".")) + "\\aicad2_selftest.step+";
+            bool sv = st.engine.save(path);
+            bool op = sv && st.engine.open(path);
+            int nf = 0; const auto& t = st.engine.tree();
+            if (t.contains("features") && t["features"].is_array()) nf = (int)t["features"].size();
+            bool ok = sv && op && nf > 0;
+            std::fprintf(stderr, "[selftest] save=%d open=%d features=%d rev=%d -> %s\n",
+                         sv, op, nf, st.engine.revision(), ok ? "OK" : "FAIL");
+            rc = ok ? 0 : 2;
+        }
+        application.shutdown();
+        glfwDestroyWindow(win); glfwTerminate();
+        return rc;
+    }
+
     if (demo) application.state().startDemoAgent("Design a 5V regulator board with a 3.3V output rail.");
     if (sketch) application.state().dispatch("sketch_new");
     if (doCmd)  application.state().dispatch(doCmd);

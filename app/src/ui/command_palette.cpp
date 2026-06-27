@@ -57,13 +57,16 @@ void drawCommandPalette(AppState& s) {
         int sc; if (matches(c, q, sc)) hits.push_back({sc, c});
     }
     std::stable_sort(hits.begin(), hits.end(), [](auto&a, auto&b){ return a.first > b.first; });
-    if (s.paletteSel < 0) s.paletteSel = 0;
-    if (s.paletteSel >= (int)hits.size()) s.paletteSel = (int)hits.size()-1;
-
-    // keyboard nav
-    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) s.paletteSel++;
-    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))   s.paletteSel--;
-    s.paletteSel = std::max(0, std::min(s.paletteSel, (int)hits.size()-1));
+    const int nHits = (int)hits.size();
+    if (nHits == 0) s.paletteSel = 0;
+    else {
+        if (s.paletteSel < 0) s.paletteSel = 0;
+        if (s.paletteSel >= nHits) s.paletteSel = nHits - 1;
+        // keyboard nav
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) s.paletteSel++;
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))   s.paletteSel--;
+        s.paletteSel = std::max(0, std::min(s.paletteSel, nHits - 1));
+    }
     bool runEnter = ImGui::IsKeyPressed(ImGuiKey_Enter);
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) s.paletteOpen = false;
 

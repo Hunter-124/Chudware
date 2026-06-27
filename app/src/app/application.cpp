@@ -49,7 +49,8 @@ void Application::frame() {
         s.paletteOpen = !s.paletteOpen;
 
     // undo / redo (engine), unless typing in a field or mid-tool / mid-agent
-    if ((io.KeyCtrl || io.KeySuper) && !io.WantTextInput && s.engineReady && !s.agent.running && s.activeTool.empty()) {
+    if ((io.KeyCtrl || io.KeySuper) && !io.WantTextInput && s.engineReady && s.engine.hasDoc()
+        && !s.agent.running && s.activeTool.empty()) {
         bool redo = (ImGui::IsKeyPressed(ImGuiKey_Y, false)) ||
                     (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false));
         if (redo) { if (s.engine.redo().ok) { s.buildTreeFromDoc(); s.status = "Redo"; } }

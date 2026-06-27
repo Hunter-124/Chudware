@@ -109,7 +109,11 @@ struct AppState {
     AgentThread agent;
 
     // ---- helpers ----
-    DocTabState& doc() { return docs[activeDoc < (int)docs.size() ? activeDoc : 0]; }
+    DocTabState& doc() {
+        static DocTabState fallback{"Part", cmd::DocType::Part};
+        if (docs.empty()) return fallback;
+        return docs[activeDoc < (int)docs.size() ? activeDoc : 0];
+    }
     cmd::DocType docType() { return docs.empty() ? cmd::DocType::Part : doc().type; }
 
     // effective workspace shown by the toolbar (sketch mode overrides).
@@ -117,7 +121,7 @@ struct AppState {
         return inSketch ? cmd::Workspace::Sketch : workspace;
     }
 
-    void dispatch(const char* cmdId);   // central command handler (application.cpp)
+    void dispatch(const char* cmdId);   // central command handler (app_state.cpp)
     void seedDemo();                    // populate docs/tree/agent (real engine or demo fallback)
     void doNewPart();                   // File > New Part
     void doSave(bool saveAs);           // File > Save / Save As (native dialog)

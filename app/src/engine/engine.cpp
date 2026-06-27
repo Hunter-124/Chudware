@@ -123,8 +123,16 @@ bool Engine::open(const std::string& path) {
     revision_ = result.value("revision", 0);
     if (result.contains("tree") && result["tree"].is_object()) tree_ = result["tree"];
     if (result.contains("tess") && result["tess"].is_object()) aicmPath_ = result["tess"].value("aicm_path", std::string());
-    refreshTree();
-    rebuild();   // ensure a fresh tess.aicm_path for the viewport
+    OpsResult rt = refreshTree();
+    if (!rt.ok) {
+        lastErr_ = rt.errMsg.empty() ? "refresh after open failed" : rt.errMsg;
+        return false;
+    }
+    OpsResult rb = rebuild();   // ensure a fresh tess.aicm_path for the viewport
+    if (!rb.ok) {
+        lastErr_ = rb.errMsg.empty() ? "rebuild after open failed" : rb.errMsg;
+        return false;
+    }
     return true;
 #else
     (void)path; lastErr_ = "no bridge"; return false;
@@ -156,8 +164,14 @@ OpsResult Engine::rebuild() {
     ingest(r);
     return r;
 }
-OpsResult Engine::undo() { OpsResult r = call("doc_undo", json{{"doc_id", docId_}}); ingest(r); return r; }
-OpsResult Engine::redo() { OpsResult r = call("doc_redo", json{{"doc_id", docId_}}); ingest(r); return r; }
+OpsResult Engine::undo() {
+    if (docId_.empty()) { OpsResult r; r.errMsg = "no document"; lastErr_ = r.errMsg; return r; }
+    OpsResult r = call("doc_undo", json{{"doc_id", docId_}}); ingest(r); return r;
+}
+OpsResult Engine::redo() {
+    if (docId_.empty()) { OpsResult r; r.errMsg = "no document"; lastErr_ = r.errMsg; return r; }
+    OpsResult r = call("doc_redo", json{{"doc_id", docId_}}); ingest(r); return r;
+}
 
 // ---- convenience builders ----
 OpsResult Engine::addBox(double l, double w, double h, const std::string& name) {
@@ -194,7 +208,7 @@ OpsResult Engine::addDraftSides(double angleDeg, const std::string& name) {
 }
 OpsResult Engine::addHoleCenter(double diameter, const std::string& name) {
     return addFeature(json{{"type","hole"},{"name",name},
-        {"params",{{"style","simple"},{"end","through_all"},{"diameter",diameter}}},
+        {"params",{{"style","simple"},{"standard","custom"},{"end","through_all"},{"diameter",dim(diameter)}}},
         {"refs",{{"face",{{"of","face"},{"side","top"}}}}}});
 }
 

@@ -48,7 +48,7 @@ int main(int argc, char** argv) {
     // headless screenshot mode: --shot <path> [--frames N]
     const char* shotPath = nullptr; int shotFrames = 12; bool demo = false;
     const char* doCmd = nullptr; bool openPalette = false; bool sketch = false;
-    bool selftest = false, picktest = false, shelltest = false;
+    bool selftest = false, picktest = false, shelltest = false, edgetest = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--shot") && i+1 < argc) shotPath = argv[++i];
         else if (!std::strcmp(argv[i], "--frames") && i+1 < argc) shotFrames = atoi(argv[++i]);
@@ -59,6 +59,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--selftest")) selftest = true;
         else if (!std::strcmp(argv[i], "--picktest")) picktest = true;
         else if (!std::strcmp(argv[i], "--shelltest")) shelltest = true;
+        else if (!std::strcmp(argv[i], "--edgetest")) edgetest = true;
     }
 
     // If the core DLL location isn't set and isn't next to the exe, point at the dev build path.
@@ -177,6 +178,34 @@ int main(int argc, char** argv) {
             bool ok = hit && !refs.empty() && r.ok && nf >= 2;
             std::fprintf(stderr, "[shelltest] hit=%d resolved=%d shellOk=%d features=%d -> %s\n",
                          hit, (int)!refs.empty(), (int)r.ok, nf, ok ? "OK" : "FAIL");
+            rc = ok ? 0 : 2;
+        }
+        application.shutdown();
+        glfwDestroyWindow(win); glfwTerminate();
+        return rc;
+    }
+
+    if (edgetest) {
+        auto& st = application.state();
+        int rc = 2;
+        if (!st.engineReady || !st.scene) std::fprintf(stderr, "[edgetest] FAIL: no engine/scene\n");
+        else {
+            st.engine.newPart("T"); st.engine.addBox(40, 30, 20, "Base"); st.engine.rebuild();
+            st.scene->resize(800, 600);
+            st.scene->loadAicm(st.engine.aicmPath());
+            st.scene->render();
+            st.scene->setPickKind(1);
+            viewport::Scene::PickRef pr; bool hit = false;
+            for (int yy = 120; yy <= 480 && !hit; yy += 30)
+                for (int xx = 120; xx <= 680 && !hit; xx += 30)
+                    if (st.scene->pickAt(xx, yy, pr)) hit = true;
+            nlohmann::json refs = nlohmann::json::array();
+            if (hit) { nlohmann::json sel = st.engine.resolvePick(pr.body_id, "edge", pr.topo_id); if (!sel.is_null()) refs.push_back(sel); }
+            eng::OpsResult r; if (!refs.empty()) r = st.engine.addFilletEdges(3.0, refs);
+            int nf = 0; const auto& t = st.engine.tree(); if (t.contains("features") && t["features"].is_array()) nf = (int)t["features"].size();
+            bool ok = hit && !refs.empty() && r.ok && nf >= 2;
+            std::fprintf(stderr, "[edgetest] hit=%d edge=%u resolved=%d filletOk=%d features=%d -> %s\n",
+                         hit, pr.topo_id, (int)!refs.empty(), (int)r.ok, nf, ok ? "OK" : "FAIL");
             rc = ok ? 0 : 2;
         }
         application.shutdown();

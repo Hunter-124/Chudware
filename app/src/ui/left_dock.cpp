@@ -191,6 +191,23 @@ void drawInspector(AppState& s) {
                             s.status = "Shell - removed " + std::to_string((int)refs.size()) + " selected face(s)"; }
                 else s.status = std::string("Engine error: ") + (r.errMsg.empty() ? s.engine.lastError() : r.errMsg);
             }
+        } else if ((tool == "fillet" || tool == "chamfer") && s.scene && !s.scene->selection().empty() && s.engineReady) {
+            // fillet/chamfer the edges selected in the viewport
+            nlohmann::json refs = nlohmann::json::array();
+            for (const auto& pr : s.scene->selection()) {
+                if (pr.kind != 1) continue;  // edges only
+                nlohmann::json sel = s.engine.resolvePick(pr.body_id, "edge", pr.topo_id);
+                if (!sel.is_null()) refs.push_back(sel);
+            }
+            if (refs.empty()) s.status = "Select edges in the viewport first";
+            else {
+                eng::OpsResult r = (tool == "fillet") ? s.engine.addFilletEdges(radius, refs)
+                                                      : s.engine.addChamferEdges(radius, refs);
+                if (r.ok) { s.scene->clearSelection(); s.selCount = 0; s.buildTreeFromDoc();
+                            s.status = std::string(tool == "fillet" ? "Fillet" : "Chamfer") + " - " +
+                                       std::to_string((int)refs.size()) + " edge(s)"; }
+                else s.status = std::string("Engine error: ") + (r.errMsg.empty() ? s.engine.lastError() : r.errMsg);
+            }
         } else {
             double v1 = radius;
             if (tool == "shell") v1 = thick;

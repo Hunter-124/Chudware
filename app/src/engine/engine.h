@@ -59,6 +59,8 @@ public:
     nlohmann::json resolvePick(uint32_t body_id, const std::string& kind, uint32_t topo_id);
     OpsResult addShellFaces(double thickness, const nlohmann::json& removeRefs);  // shell, removing picked faces
     OpsResult addDraftFaces(double angleDeg, const nlohmann::json& faceRefs);
+    OpsResult addFilletEdges(double radius, const nlohmann::json& edgeRefs);      // fillet picked edges
+    OpsResult addChamferEdges(double length, const nlohmann::json& edgeRefs);     // chamfer picked edges
 
 private:
     OpsResult call(const std::string& method, const nlohmann::json& params);

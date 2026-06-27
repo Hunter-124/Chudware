@@ -40,4 +40,14 @@ OpsResult Engine::addDraftFaces(double angleDeg, const json& faceRefs) {
         {"refs",{{"neutral",{{"of","face"},{"side","bottom"}}},{"faces",faceRefs}}}});
 }
 
+OpsResult Engine::addFilletEdges(double radius, const json& edgeRefs) {
+    return addFeature(json{{"type","fillet"},{"name","Fillet"},
+        {"params",{{"radius",dim(radius)}}},{"refs",{{"edges",edgeRefs}}}});
+}
+
+OpsResult Engine::addChamferEdges(double length, const json& edgeRefs) {
+    return addFeature(json{{"type","chamfer"},{"name","Chamfer"},
+        {"params",{{"length",dim(length)}}},{"refs",{{"edges",edgeRefs}}}});
+}
+
 } // namespace eng

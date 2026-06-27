@@ -34,7 +34,9 @@ public:
     // ---- selection / picking (faces) ----
     struct PickRef { uint32_t body_id=0; uint32_t topo_id=0; int kind=0;  // kind 0=face
         bool operator==(const PickRef& o) const { return body_id==o.body_id && topo_id==o.topo_id && kind==o.kind; } };
-    bool pickAt(int px, int py, PickRef& out);   // px,py = pixels from the image TOP-LEFT
+    bool pickAt(int px, int py, PickRef& out);   // px,py = pixels from the image TOP-LEFT; uses pickKind
+    void setPickKind(int k) { pickKind_ = k; }   // 0 = faces, 1 = edges
+    int  pickKind() const { return pickKind_; }
     void setHovered(const PickRef* r);           // null clears hover
     void toggleSelect(const PickRef& r);
     void clearSelection();
@@ -44,17 +46,20 @@ public:
 
 private:
     struct FacePart { uint32_t face_id=0, first_tri=0, tri_count=0; };
+    struct EdgePart { uint32_t edge_id=0; int vtxStart=0; int vtxCount=0; };
     struct GBody {
         unsigned int vao=0, vbo=0, ebo=0; int nIdx=0;
         unsigned int evao=0, evbo=0; int nEdgeVerts=0;
         float color[3]={0.7f,0.75f,0.82f}; float metallic=0, roughness=0.5f;
         uint32_t body_id=0;
         std::vector<FacePart> faces;
+        std::vector<EdgePart> edgeParts;
     };
     void buildFbo();
     void releaseFbo();
     void releaseBodies();
-    void renderIdPass();                          // faces colored by pick index into idFbo_
+    void renderIdPassFaces();                     // faces colored by pick index into idFbo_
+    void renderIdPassEdges();                     // edges colored by pick index into idFbo_
 
     int w_=16, h_=16, samples_=4;
     unsigned int msFbo_=0, msColor_=0, msDepth_=0;
@@ -63,9 +68,11 @@ private:
     unsigned int prog_=0, bgProg_=0, edgeProg_=0, idProg_=0, bgVao_=0;
     std::vector<GBody> bodies_;
 
-    std::vector<PickRef> pickMap_;                // index (1-based id color) -> ref
+    std::vector<PickRef> pickMap_;                // face index (1-based id color) -> ref
+    std::vector<PickRef> edgeMap_;                // edge index (1-based id color) -> ref
     std::vector<PickRef> selected_;
     PickRef hovered_; bool hasHover_=false;
+    int pickKind_=0;                              // 0 faces, 1 edges
 
     // bounds + camera
     float center_[3]={0,0,0}, radius_=50.f;

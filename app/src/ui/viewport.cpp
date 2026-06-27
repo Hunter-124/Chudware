@@ -46,7 +46,11 @@ void drawViewport(AppState& s) {
             if (io.MouseWheel != 0.f) s.scene->zoom(io.MouseWheel);
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Middle)) s.scene->homeView();
 
-            // face picking: hover-highlight + left-click select (Shift = add)
+            // pick faces by default; edges when a fillet/chamfer tool is active
+            int wantKind = (s.activeTool=="fillet" || s.activeTool=="chamfer") ? 1 : 0;
+            if (s.scene->pickKind() != wantKind) { s.scene->setPickKind(wantKind); s.scene->clearSelection(); s.selCount = 0; }
+
+            // picking: hover-highlight + left-click select (Shift = add)
             viewport::Scene::PickRef pr;
             if (!dragging && s.scene->pickAt((int)(io.MousePos.x - a.x), (int)(io.MousePos.y - a.y), pr)) {
                 s.scene->setHovered(&pr);

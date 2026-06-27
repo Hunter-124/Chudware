@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <vector>
 
 namespace viewport {
 namespace {
@@ -166,7 +168,7 @@ bool Scene::loadAicm(const std::string& path){
     render::DocMesh dm; std::string err;
     if(!render::loadAicmFile(path,dm,err)){ lastError=err; return false; }
     releaseBodies();
-    pickMap_.clear(); selected_.clear(); hasHover_=false;
+    pickMap_.clear(); edgeMap_.clear(); selected_.clear(); hasHover_=false;
     float lo[3]={1e30f,1e30f,1e30f}, hi[3]={-1e30f,-1e30f,-1e30f};
     for(const auto& bm: dm.bodies){
         if(bm.n_tris==0) continue;
@@ -195,14 +197,20 @@ bool Scene::loadAicm(const std::string& path){
             g.faces.push_back(FacePart{fr.face_id, fr.first_tri, fr.tri_count});
             pickMap_.push_back(PickRef{bm.body_id, fr.face_id, 0});
         }
-        // edges: expand each segment polyline into GL_LINES pairs
+        // edges: expand each segment polyline into GL_LINES pairs; record per-edge vertex ranges
         std::vector<float> el;
         for(const auto& seg: bm.edges){
+            int vtxStart=(int)(el.size()/3);
             for(uint32_t k=0;k+1<seg.pt_count;k++){
                 uint32_t a=seg.first_pt+k, b=seg.first_pt+k+1;
                 if((b)*3+2 >= bm.edge_pts.size()) break;
                 el.push_back(bm.edge_pts[a*3]);el.push_back(bm.edge_pts[a*3+1]);el.push_back(bm.edge_pts[a*3+2]);
                 el.push_back(bm.edge_pts[b*3]);el.push_back(bm.edge_pts[b*3+1]);el.push_back(bm.edge_pts[b*3+2]);
+            }
+            int vtxCount=(int)(el.size()/3)-vtxStart;
+            if(vtxCount>0){
+                g.edgeParts.push_back(EdgePart{seg.edge_id, vtxStart, vtxCount});
+                edgeMap_.push_back(PickRef{bm.body_id, seg.edge_id, 1});
             }
         }
         if(!el.empty()){
@@ -305,19 +313,29 @@ void Scene::render(){
             glDepthFunc(GL_LEQUAL);
             glUseProgram(edgeProg_);
             glUniformMatrix4fv(glGetUniformLocation(edgeProg_,"uMVP"),1,GL_FALSE,mvp.m);
-            auto drawFace=[&](const PickRef& pr,float cr,float cg,float cb,float ca){
+            int uCol=glGetUniformLocation(edgeProg_,"uColor"), uAl=glGetUniformLocation(edgeProg_,"uA");
+            auto drawRef=[&](const PickRef& pr,float cr,float cg,float cb,float ca){
+                glUniform3f(uCol,cr,cg,cb); glUniform1f(uAl,ca);
                 for(const auto&b:bodies_){ if(b.body_id!=pr.body_id) continue;
-                    for(const auto&f:b.faces){ if(f.face_id!=pr.topo_id) continue;
-                        glUniform3f(glGetUniformLocation(edgeProg_,"uColor"),cr,cg,cb);
-                        glUniform1f(glGetUniformLocation(edgeProg_,"uA"),ca);
-                        glBindVertexArray(b.vao);
-                        glDrawElements(GL_TRIANGLES,f.tri_count*3,GL_UNSIGNED_INT,
-                                       (void*)(size_t)(f.first_tri*3*sizeof(unsigned int)));
-                    } }
+                    if(pr.kind==0){
+                        for(const auto&f:b.faces){ if(f.face_id!=pr.topo_id) continue;
+                            glBindVertexArray(b.vao);
+                            glDrawElements(GL_TRIANGLES,f.tri_count*3,GL_UNSIGNED_INT,
+                                           (void*)(size_t)(f.first_tri*3*sizeof(unsigned int)));
+                        }
+                    } else if(b.evao){
+                        glLineWidth(3.5f);
+                        for(const auto&ep:b.edgeParts){ if(ep.edge_id!=pr.topo_id) continue;
+                            glBindVertexArray(b.evao); glDrawArrays(GL_LINES, ep.vtxStart, ep.vtxCount);
+                        }
+                    }
+                }
             };
-            for(const auto& sref:selected_) drawFace(sref,0.30f,0.55f,1.0f,0.42f);
-            if(hasHover_) drawFace(hovered_,0.50f,0.72f,1.0f,0.26f);
-            glDisable(GL_POLYGON_OFFSET_FILL); glDisable(GL_BLEND); glDepthFunc(GL_LESS);
+            for(const auto& sref:selected_)
+                drawRef(sref, sref.kind==1?0.25f:0.30f, sref.kind==1?0.62f:0.55f, 1.0f, sref.kind==1?0.95f:0.42f);
+            if(hasHover_)
+                drawRef(hovered_, 0.55f,0.80f,1.0f, hovered_.kind==1?0.85f:0.26f);
+            glDisable(GL_POLYGON_OFFSET_FILL); glDisable(GL_BLEND); glDepthFunc(GL_LESS); glLineWidth(1.0f);
         }
     }
     glBindVertexArray(0);
@@ -329,20 +347,22 @@ void Scene::render(){
     glBindFramebuffer(GL_FRAMEBUFFER,0);
 }
 
-void Scene::renderIdPass(){
+// shared camera mvp for the id passes
+static M4 idMvp(float az,float el,float dist,const float* tgt,float fov,float rad,int w,int h){
+    float dir[3]={std::cos(el)*std::cos(az),std::cos(el)*std::sin(az),std::sin(el)};
+    float eye[3]={tgt[0]+dir[0]*dist,tgt[1]+dir[1]*dist,tgt[2]+dir[2]*dist};
+    float up[3]={0,0,1};
+    float aspect=(float)w/(float)(h>0?h:1);
+    return mul(perspective(fov,aspect,rad*0.02f+0.01f,dist+rad*8.f), lookAt(eye,tgt,up));
+}
+
+void Scene::renderIdPassFaces(){
     if(idFbo_==0 || bodies_.empty()) return;
-    glBindFramebuffer(GL_FRAMEBUFFER,idFbo_);
-    glViewport(0,0,w_,h_);
+    glBindFramebuffer(GL_FRAMEBUFFER,idFbo_); glViewport(0,0,w_,h_);
     glDisable(GL_BLEND);
     glClearColor(0,0,0,1); glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
     glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LESS);
-
-    float dir[3]={std::cos(el_)*std::cos(az_),std::cos(el_)*std::sin(az_),std::sin(el_)};
-    float eye[3]={target_[0]+dir[0]*dist_,target_[1]+dir[1]*dist_,target_[2]+dir[2]*dist_};
-    float up[3]={0,0,1};
-    float aspect=(float)w_/(float)(h_>0?h_:1);
-    M4 mvp=mul(perspective(fov_,aspect,radius_*0.02f+0.01f,dist_+radius_*8.f), lookAt(eye,target_,up));
-
+    M4 mvp=idMvp(az_,el_,dist_,target_,fov_,radius_,w_,h_);
     glUseProgram(idProg_);
     glUniformMatrix4fv(glGetUniformLocation(idProg_,"uMVP"),1,GL_FALSE,mvp.m);
     glUniform1f(glGetUniformLocation(idProg_,"uA"),1.0f);
@@ -351,31 +371,81 @@ void Scene::renderIdPass(){
     for(const auto& b:bodies_){
         glBindVertexArray(b.vao);
         for(const auto& f:b.faces){
-            ++idx;  // 1-based pick id
+            ++idx;
             glUniform3f(glGetUniformLocation(idProg_,"uColor"),
                         (idx&0xFF)/255.f, ((idx>>8)&0xFF)/255.f, ((idx>>16)&0xFF)/255.f);
             glDrawElements(GL_TRIANGLES,f.tri_count*3,GL_UNSIGNED_INT,
                            (void*)(size_t)(f.first_tri*3*sizeof(unsigned int)));
         }
     }
+    glDisable(GL_CULL_FACE); glBindVertexArray(0); glBindFramebuffer(GL_FRAMEBUFFER,0);
+}
+
+void Scene::renderIdPassEdges(){
+    if(idFbo_==0 || bodies_.empty()) return;
+    glBindFramebuffer(GL_FRAMEBUFFER,idFbo_); glViewport(0,0,w_,h_);
+    glDisable(GL_BLEND);
+    glClearColor(0,0,0,1); glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    M4 mvp=idMvp(az_,el_,dist_,target_,fov_,radius_,w_,h_);
+    glUseProgram(idProg_);
+    glUniformMatrix4fv(glGetUniformLocation(idProg_,"uMVP"),1,GL_FALSE,mvp.m);
+    glUniform1f(glGetUniformLocation(idProg_,"uA"),1.0f);
+    // depth-only face prepass so only FRONT (visible) edges get picked
+    glDepthFunc(GL_LESS); glColorMask(GL_FALSE,GL_FALSE,GL_FALSE,GL_FALSE);
+    glEnable(GL_CULL_FACE); glCullFace(GL_BACK);
+    for(const auto& b:bodies_){ glBindVertexArray(b.vao); glDrawElements(GL_TRIANGLES,b.nIdx,GL_UNSIGNED_INT,0); }
     glDisable(GL_CULL_FACE);
-    glBindVertexArray(0);
-    glBindFramebuffer(GL_FRAMEBUFFER,0);
+    glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE); glDepthFunc(GL_LEQUAL);
+    glLineWidth(4.5f);
+    uint32_t idx=0;
+    for(const auto& b:bodies_){
+        if(!b.evao) { idx += (uint32_t)b.edgeParts.size(); continue; }
+        glBindVertexArray(b.evao);
+        for(const auto& ep:b.edgeParts){
+            ++idx;
+            glUniform3f(glGetUniformLocation(idProg_,"uColor"),
+                        (idx&0xFF)/255.f, ((idx>>8)&0xFF)/255.f, ((idx>>16)&0xFF)/255.f);
+            glDrawArrays(GL_LINES, ep.vtxStart, ep.vtxCount);
+        }
+    }
+    glDepthFunc(GL_LESS); glBindVertexArray(0); glBindFramebuffer(GL_FRAMEBUFFER,0);
 }
 
 bool Scene::pickAt(int px,int py,PickRef& out){
     if(px<0||py<0||px>=w_||py>=h_||bodies_.empty()) return false;
-    renderIdPass();
-    glBindFramebuffer(GL_FRAMEBUFFER,idFbo_);
-    glReadBuffer(GL_COLOR_ATTACHMENT0);
-    unsigned char c[4]={0,0,0,0};
     glPixelStorei(GL_PACK_ALIGNMENT,1);
-    glReadPixels(px, h_-1-py, 1,1, GL_RGBA, GL_UNSIGNED_BYTE, c);  // FBO is bottom-up
+    if(pickKind_==1){  // EDGES: search a small window for the nearest edge pixel
+        renderIdPassEdges();
+        glBindFramebuffer(GL_FRAMEBUFFER,idFbo_); glReadBuffer(GL_COLOR_ATTACHMENT0);
+        const int R=6;
+        int cxFbo=px, cyFbo=h_-1-py;
+        int x0=std::max(0,cxFbo-R), x1=std::min(w_-1,cxFbo+R);
+        int y0=std::max(0,cyFbo-R), y1=std::min(h_-1,cyFbo+R);
+        int rw=x1-x0+1, rh=y1-y0+1;
+        if(rw<=0||rh<=0){ glBindFramebuffer(GL_FRAMEBUFFER,0); return false; }
+        std::vector<unsigned char> buf((size_t)rw*rh*4, 0);
+        glReadPixels(x0,y0,rw,rh,GL_RGBA,GL_UNSIGNED_BYTE,buf.data());
+        glBindFramebuffer(GL_FRAMEBUFFER,0);
+        int ci=cxFbo-x0, cj=cyFbo-y0; uint32_t bestIdx=0; float bestD=1e18f;
+        for(int j=0;j<rh;j++) for(int i=0;i<rw;i++){
+            size_t o=((size_t)j*rw+i)*4; uint32_t idx=buf[o]|((uint32_t)buf[o+1]<<8)|((uint32_t)buf[o+2]<<16);
+            if(idx==0) continue;
+            float d=(float)((i-ci)*(i-ci)+(j-cj)*(j-cj));
+            if(d<bestD){ bestD=d; bestIdx=idx; }
+        }
+        if(bestIdx==0 || bestIdx>edgeMap_.size()) return false;
+        out=edgeMap_[bestIdx-1]; return true;
+    }
+    // FACES: exact center pixel
+    renderIdPassFaces();
+    glBindFramebuffer(GL_FRAMEBUFFER,idFbo_); glReadBuffer(GL_COLOR_ATTACHMENT0);
+    unsigned char c[4]={0,0,0,0};
+    glReadPixels(px, h_-1-py, 1,1, GL_RGBA, GL_UNSIGNED_BYTE, c);
     glBindFramebuffer(GL_FRAMEBUFFER,0);
-    uint32_t idx = (uint32_t)c[0] | ((uint32_t)c[1]<<8) | ((uint32_t)c[2]<<16);
+    uint32_t idx=(uint32_t)c[0]|((uint32_t)c[1]<<8)|((uint32_t)c[2]<<16);
     if(idx==0 || idx>pickMap_.size()) return false;
-    out = pickMap_[idx-1];
-    return true;
+    out=pickMap_[idx-1]; return true;
 }
 
 void Scene::setHovered(const PickRef* r){ if(r){ hovered_=*r; hasHover_=true; } else hasHover_=false; }

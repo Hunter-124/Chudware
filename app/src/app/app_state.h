@@ -7,6 +7,7 @@
 #include "engine/engine.h"
 
 struct GLFWwindow;
+namespace viewport { class Scene; }
 
 namespace app {
 
@@ -59,6 +60,11 @@ struct AppState {
     // engine (real libaicad C++ kernel; falls back to demo data if unavailable)
     eng::Engine engine;
     bool  engineReady = false;
+
+    // 3D viewport (owned by Application; null until GL is up)
+    viewport::Scene* scene = nullptr;
+    int   viewMeshRev = -1;             // engine revision currently uploaded to the scene
+    int   viewStyle = 1;               // 0 shaded, 1 shaded+edges, 2 wireframe
 
     // theme / window
     bool  dark = true;

@@ -56,19 +56,19 @@ target_include_directories(glad PUBLIC ${GLAD_DIR}/include)
 # --- new app sources ---------------------------------------------------------
 file(GLOB_RECURSE APP_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 
-# Reused engine-bridge source from host/ (UI-independent: no ImGui dependency). Just the
-# flat-ABI libaicad loader — doc ops route to the C++ core by default (no Python worker needed).
-# Quote-relative includes resolve from host/src, so NO need to put host/src on the include path
-# (which would shadow the system <math.h> with host/src/math.h and break <cmath>).
-set(BRIDGE_SRC
-  ${HOST}/src/core/cpp_core.cpp)
+# Reused, UI-independent host sources (no ImGui dependency). They use quote-relative includes
+# that resolve from host/src, so we include host headers via ${HOST} as "src/...". NOTE: we add
+# ${HOST} (the host/ dir) — NOT ${HOST}/src — because host/src/math.h shadows the system <math.h>
+# and breaks <cmath>; host/ has no such file.
+#  - render/aicm_loader.cpp: pure-CPU AICM mesh parser (always reused by the viewport).
+list(APPEND APP_SRC ${HOST}/src/render/aicm_loader.cpp)
+
+#  - core/cpp_core.cpp: the flat-ABI libaicad loader (real doc engine; no Python worker needed).
 set(USE_BRIDGE ON CACHE BOOL "Link the reused libaicad flat-ABI loader (real engine)")
 if(USE_BRIDGE)
-  foreach(f ${BRIDGE_SRC})
-    if(EXISTS "${f}")
-      list(APPEND APP_SRC "${f}")
-    endif()
-  endforeach()
+  if(EXISTS "${HOST}/src/core/cpp_core.cpp")
+    list(APPEND APP_SRC ${HOST}/src/core/cpp_core.cpp)
+  endif()
 endif()
 
 # NOTE: no WIN32 subsystem flag — we use int main() and keep a console for dev logs.
@@ -76,14 +76,9 @@ endif()
 add_executable(AI-CAD2 ${APP_SRC})
 target_include_directories(AI-CAD2 PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${HOST}                              # include host headers as "src/..." (NOT ${HOST}/src — math.h shadow)
   ${DEPS}/json-src/single_include
   ${DEPS}/stb-src)
-# NOTE: do NOT add ${HOST}/src to the include path — it contains a custom math.h that
-# shadows the system <math.h> and breaks <cmath>. When wiring the bridge, include host
-# headers via ${HOST} as "src/worker_client.h" (see USE_BRIDGE block) instead.
-if(USE_BRIDGE)
-  target_include_directories(AI-CAD2 PRIVATE ${HOST})
-endif()
 target_link_libraries(AI-CAD2 PRIVATE imgui glad glfw)
 if(USE_BRIDGE)
   target_compile_definitions(AI-CAD2 PRIVATE AICAD_HAVE_BRIDGE=1

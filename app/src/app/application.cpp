@@ -14,12 +14,14 @@ AppState& Application::state() { return g_state; }
 
 bool Application::init(GLFWwindow* window, const std::string& resourcesDir, float scale) {
     g_state.window = window;
+    scene_.init();               // compile shaders + FBO (GL context is current here)
+    g_state.scene = &scene_;
     g_state.seedDemo();
     (void)resourcesDir; (void)scale;
     return true;
 }
 
-void Application::shutdown() {}
+void Application::shutdown() { scene_.shutdown(); g_state.scene = nullptr; }
 
 void Application::buildDockLayout(ImGuiID dockId) {
     ImGui::DockBuilderRemoveNode(dockId);

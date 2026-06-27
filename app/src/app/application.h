@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include "viewport/scene.h"
 struct GLFWwindow;
 
 namespace app {
@@ -14,6 +15,7 @@ public:
 private:
     void buildDockLayout(unsigned int dockspaceId);
     bool layoutBuilt_ = false;
+    viewport::Scene scene_;
 };
 
 } // namespace app

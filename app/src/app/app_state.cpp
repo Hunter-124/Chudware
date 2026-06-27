@@ -15,6 +15,7 @@ static std::string stemOf(const std::string& path) {
 
 static bool opensInspector(const char* id) {
     static const char* k[] = {
+        "prim_box","prim_cylinder","prim_sphere","prim_cone",
         "extrude_boss","revolve_boss","sweep_boss","loft_boss","rib","hole_wizard","curve_helix",
         "fillet","chamfer","shell","draft","split","boolean_combine",
         "linear_pattern","circular_pattern","mirror_feature",
@@ -71,8 +72,12 @@ void AppState::dispatch(const char* cmdId) {
 
 // Map an engine feature type -> an IconId for the tree.
 static std::string featureIcon(const std::string& type) {
-    if (type == "box" || type == "extrude") return "extrude";
-    if (type == "cylinder" || type == "revolve") return "revolve";
+    if (type == "box") return "prim_box";
+    if (type == "cylinder") return "prim_cylinder";
+    if (type == "sphere") return "prim_sphere";
+    if (type == "cone") return "prim_cone";
+    if (type == "extrude") return "extrude";
+    if (type == "revolve") return "revolve";
     if (type == "sweep") return "sweep";
     if (type == "loft") return "loft";
     if (type == "fillet") return "fillet";

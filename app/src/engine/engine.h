@@ -46,6 +46,8 @@ public:
     // convenience feature builders (return the apply result)
     OpsResult addBox(double l, double w, double h, const std::string& name = "Box");
     OpsResult addCylinder(double r, double h, const std::string& name = "Cylinder");
+    OpsResult addSphere(double r, const std::string& name = "Sphere");
+    OpsResult addCone(double r1, double r2, double h, const std::string& name = "Cone");
     OpsResult addFilletAll(double radius, const std::string& name = "Fillet");
     OpsResult addChamferAll(double length, const std::string& name = "Chamfer");
     OpsResult addShell(double thickness, const std::string& name = "Shell");

@@ -19,6 +19,11 @@ static const Command T[] = {
 // ---- MODEL ----------------------------------------------------------------
 { "sketch_new",           "New Sketch",      "ws_sketch",      W::Model,    G::Sketch,    K::Top,      nullptr,           "draw 2d profile" },
 
+{ "prim_box",             "Box",             "prim_box",       W::Model,    G::Create,    K::Top,      nullptr,           "primitive block cube cuboid" },
+{ "prim_cylinder",        "Cylinder",        "prim_cylinder",  W::Model,    G::Create,    K::Flyout,   "prim_box",        "primitive rod disc" },
+{ "prim_sphere",          "Sphere",          "prim_sphere",    W::Model,    G::Create,    K::Flyout,   "prim_box",        "primitive ball" },
+{ "prim_cone",            "Cone",            "prim_cone",      W::Model,    G::Create,    K::Flyout,   "prim_box",        "primitive taper frustum" },
+
 { "extrude_boss",         "Extrude",         "extrude",        W::Model,    G::Create,    K::Top,      nullptr,           "boss pad protrusion" },
 { "extrude_cut",          "Extrude Cut",     "subtract",       W::Model,    G::Create,    K::Variant,  "extrude_boss",    "pocket remove" },
 { "revolve_boss",         "Revolve",         "revolve",        W::Model,    G::Create,    K::Top,      nullptr,           "lathe turn" },

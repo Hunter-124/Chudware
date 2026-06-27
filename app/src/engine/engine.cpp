@@ -168,6 +168,13 @@ OpsResult Engine::addCylinder(double r, double h, const std::string& name) {
     return addFeature(json{{"type","cylinder"},{"name",name},
         {"params",{{"radius",dim(r)},{"height",dim(h)}}}});
 }
+OpsResult Engine::addSphere(double r, const std::string& name) {
+    return addFeature(json{{"type","sphere"},{"name",name},{"params",{{"radius",dim(r)}}}});
+}
+OpsResult Engine::addCone(double r1, double r2, double h, const std::string& name) {
+    return addFeature(json{{"type","cone"},{"name",name},
+        {"params",{{"r1",dim(r1)},{"r2",dim(r2)},{"height",dim(h)}}}});
+}
 OpsResult Engine::addFilletAll(double radius, const std::string& name) {
     return addFeature(json{{"type","fillet"},{"name",name},
         {"params",{{"radius",dim(radius)}}},{"refs",{{"edges",{{"of","edge"}}}}}});

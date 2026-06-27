@@ -100,6 +100,30 @@ inline void draw(ImDrawList* dl, const char* name, ImVec2 c, float size, ImU32 c
     if (is("zoom_fit")) {
         dl->AddRect(P(-0.4f,-0.4f),P(0.4f,0.4f),col,2.f,0,th); return;
     }
+    // ---- primitives (isometric line glyphs) ----
+    if (is("prim_box")) {
+        ImVec2 A=P(-0.45f,-0.45f),B=P(0.2f,-0.45f),C=P(0.2f,0.3f),D=P(-0.45f,0.3f);
+        ImVec2 Bp=P(0.45f,-0.2f),Cp=P(0.45f,0.55f),Dp=P(-0.2f,0.55f);
+        dl->AddLine(A,B,col,th);dl->AddLine(B,C,col,th);dl->AddLine(C,D,col,th);dl->AddLine(D,A,col,th);
+        dl->AddLine(C,Cp,col,th);dl->AddLine(B,Bp,col,th);dl->AddLine(D,Dp,col,th);
+        dl->AddLine(Bp,Cp,col,th);dl->AddLine(Dp,Cp,col,th); return;
+    }
+    if (is("prim_cylinder")) {
+        dl->AddEllipse(P(0,0.34f),ImVec2(r*0.42f,r*0.15f),col,0,0,th);
+        dl->AddLine(P(-0.42f,0.34f),P(-0.42f,-0.34f),col,th);
+        dl->AddLine(P(0.42f,0.34f),P(0.42f,-0.34f),col,th);
+        // bottom front arc
+        dl->PathClear(); dl->PathEllipticalArcTo(P(0,-0.34f),ImVec2(r*0.42f,r*0.15f),0,0,3.14159f); dl->PathStroke(col,0,th); return;
+    }
+    if (is("prim_sphere")) {
+        dl->AddCircle(c,r*0.44f,col,0,th);
+        dl->AddEllipse(c,ImVec2(r*0.44f,r*0.16f),col,0,0,th); return;
+    }
+    if (is("prim_cone")) {
+        dl->AddLine(P(0,0.5f),P(-0.42f,-0.34f),col,th);
+        dl->AddLine(P(0,0.5f),P(0.42f,-0.34f),col,th);
+        dl->AddEllipse(P(0,-0.34f),ImVec2(r*0.42f,r*0.15f),col,0,0,th); return;
+    }
 
     // ---- fallback: monogram placeholder ----
     float r2 = size*0.5f;

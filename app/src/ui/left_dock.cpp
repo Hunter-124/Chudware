@@ -120,9 +120,23 @@ void drawInspector(AppState& s) {
     auto labelCol = [&](const char* t){ ImGui::TextColored(TVEC(txt1), "%s", t); ImGui::SameLine(96*S); ImGui::SetNextItemWidth(-FLT_MIN); };
 
     static float depth = 25.f, draft = 0.f, radius = 5.f, thick = 2.f, dia = 6.f;
+    static float pbL=40, pbW=30, pbH=15, pcR=15, pcH=30, psR=20, pkR1=15, pkR2=0, pkH=25;
     static bool reverse=false, merge=true;
 
-    if (s.activeTool == "extrude_boss") {
+    if (s.activeTool == "prim_box") {
+        labelCol("Length"); ImGui::DragFloat("##pbl",&pbL,0.1f,0.01f,1e5f,"%.2f");
+        labelCol("Width");  ImGui::DragFloat("##pbw",&pbW,0.1f,0.01f,1e5f,"%.2f");
+        labelCol("Height"); ImGui::DragFloat("##pbh",&pbH,0.1f,0.01f,1e5f,"%.2f");
+    } else if (s.activeTool == "prim_cylinder") {
+        labelCol("Radius"); ImGui::DragFloat("##pcr",&pcR,0.1f,0.01f,1e5f,"%.2f");
+        labelCol("Height"); ImGui::DragFloat("##pch",&pcH,0.1f,0.01f,1e5f,"%.2f");
+    } else if (s.activeTool == "prim_sphere") {
+        labelCol("Radius"); ImGui::DragFloat("##psr",&psR,0.1f,0.01f,1e5f,"%.2f");
+    } else if (s.activeTool == "prim_cone") {
+        labelCol("Bottom R"); ImGui::DragFloat("##pk1",&pkR1,0.1f,0.f,1e5f,"%.2f");
+        labelCol("Top R");    ImGui::DragFloat("##pk2",&pkR2,0.1f,0.f,1e5f,"%.2f");
+        labelCol("Height");   ImGui::DragFloat("##pkh",&pkH,0.1f,0.01f,1e5f,"%.2f");
+    } else if (s.activeTool == "extrude_boss") {
         const char* ops[] = {"New Body","Add","Cut","Intersect","Surface"};
         static int opi = 0;
         labelCol("Operation"); ImGui::Combo("##op", &opi, ops, 5); s.toolExtrudeOp = ops[opi];
@@ -151,10 +165,23 @@ void drawInspector(AppState& s) {
     ImGui::Separator();
     float bw = 70*S;
     if (ImGui::Button("OK", ImVec2(bw, 0))) {
-        double v1 = radius;                                   // default primary field
-        if (s.activeTool == "shell") v1 = thick;
-        else if (s.activeTool == "hole_wizard") v1 = dia;
-        s.commitTool(s.activeTool, v1, 0);
+        std::string tool = s.activeTool;
+        if (tool.rfind("prim_", 0) == 0) {
+            if (s.engineReady) {
+                eng::OpsResult r;
+                if (tool == "prim_box")           r = s.engine.addBox(pbL, pbW, pbH);
+                else if (tool == "prim_cylinder") r = s.engine.addCylinder(pcR, pcH);
+                else if (tool == "prim_sphere")   r = s.engine.addSphere(psR);
+                else                              r = s.engine.addCone(pkR1, pkR2, pkH);
+                if (r.ok) { s.buildTreeFromDoc(); s.status = label + " added (rev " + std::to_string(s.engine.revision()) + ")"; }
+                else s.status = std::string("Engine error: ") + (r.errMsg.empty() ? s.engine.lastError() : r.errMsg);
+            } else s.status = label + " added (demo)";
+        } else {
+            double v1 = radius;
+            if (tool == "shell") v1 = thick;
+            else if (tool == "hole_wizard") v1 = dia;
+            s.commitTool(tool, v1, 0);
+        }
         s.activeTool.clear();
     }
     ImGui::SameLine();

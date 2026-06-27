@@ -56,15 +56,13 @@ target_include_directories(glad PUBLIC ${GLAD_DIR}/include)
 # --- new app sources ---------------------------------------------------------
 file(GLOB_RECURSE APP_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 
-# Reused engine-bridge sources from host/ (UI-independent: no ImGui dependency).
-# Added incrementally as the slice wires the real engine; guarded so the shell
-# builds even before they are pulled in.
+# Reused engine-bridge source from host/ (UI-independent: no ImGui dependency). Just the
+# flat-ABI libaicad loader — doc ops route to the C++ core by default (no Python worker needed).
+# Quote-relative includes resolve from host/src, so NO need to put host/src on the include path
+# (which would shadow the system <math.h> with host/src/math.h and break <cmath>).
 set(BRIDGE_SRC
-  ${HOST}/src/worker_client.cpp
-  ${HOST}/src/core/cpp_core.cpp
-  ${HOST}/src/core/async_rpc.cpp
-  ${HOST}/src/core/doc_mirror.cpp)
-set(USE_BRIDGE ON CACHE BOOL "Link the reused host engine bridge")
+  ${HOST}/src/core/cpp_core.cpp)
+set(USE_BRIDGE ON CACHE BOOL "Link the reused libaicad flat-ABI loader (real engine)")
 if(USE_BRIDGE)
   foreach(f ${BRIDGE_SRC})
     if(EXISTS "${f}")
@@ -88,7 +86,11 @@ if(USE_BRIDGE)
 endif()
 target_link_libraries(AI-CAD2 PRIVATE imgui glad glfw)
 if(USE_BRIDGE)
-  target_compile_definitions(AI-CAD2 PRIVATE AICAD_HAVE_BRIDGE=1)
+  target_compile_definitions(AI-CAD2 PRIVATE AICAD_HAVE_BRIDGE=1
+    # Dev fallback: where the core DLL is built. Used only if AI_CAD_LIBAICAD is unset AND no
+    # libaicad.dll sits next to the exe. Harmless on machines without this path (cpp_core falls
+    # through to exe-dir / default search).
+    AICAD_DEFAULT_LIBAICAD="${REPO}/core/build-occt/bin/Release/libaicad.dll")
 endif()
 if(WIN32)
   target_link_libraries(AI-CAD2 PRIVATE opengl32 dwmapi)

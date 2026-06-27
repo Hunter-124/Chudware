@@ -56,6 +56,17 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--sketch")) sketch = true;
     }
 
+    // If the core DLL location isn't set and isn't next to the exe, point at the dev build path.
+    // cpp_core tries AI_CAD_LIBAICAD first, then exe-dir, then default search — a missing dev
+    // path simply falls through, so this is safe on any machine.
+#if defined(AICAD_DEFAULT_LIBAICAD) && defined(_WIN32)
+    if (!std::getenv("AI_CAD_LIBAICAD")) {
+        std::string side = exeDir() + "\\libaicad.dll";
+        if (GetFileAttributesA(side.c_str()) == INVALID_FILE_ATTRIBUTES)
+            _putenv_s("AI_CAD_LIBAICAD", AICAD_DEFAULT_LIBAICAD);
+    }
+#endif
+
     glfwSetErrorCallback(glfwErr);
     if (!glfwInit()) { std::fprintf(stderr, "glfwInit failed\n"); return 1; }
 

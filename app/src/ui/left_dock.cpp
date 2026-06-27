@@ -150,7 +150,13 @@ void drawInspector(AppState& s) {
     ImGui::Dummy(ImVec2(0, 4*S));
     ImGui::Separator();
     float bw = 70*S;
-    if (ImGui::Button("OK", ImVec2(bw, 0))) { s.status = label + " applied"; s.activeTool.clear(); }
+    if (ImGui::Button("OK", ImVec2(bw, 0))) {
+        double v1 = radius;                                   // default primary field
+        if (s.activeTool == "shell") v1 = thick;
+        else if (s.activeTool == "hole_wizard") v1 = dia;
+        s.commitTool(s.activeTool, v1, 0);
+        s.activeTool.clear();
+    }
     ImGui::SameLine();
     if (ImGui::Button("Cancel", ImVec2(bw, 0))) { s.status = "Ready"; s.activeTool.clear(); }
 

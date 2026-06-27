@@ -59,23 +59,69 @@ void AppState::dispatch(const char* cmdId) {
     status = std::string("Command: ") + label;
 }
 
+// Map an engine feature type -> an IconId for the tree.
+static std::string featureIcon(const std::string& type) {
+    if (type == "box" || type == "extrude") return "extrude";
+    if (type == "cylinder" || type == "revolve") return "revolve";
+    if (type == "sweep") return "sweep";
+    if (type == "loft") return "loft";
+    if (type == "fillet") return "fillet";
+    if (type == "chamfer") return "chamfer";
+    if (type == "shell") return "shell";
+    if (type == "draft") return "draft";
+    if (type == "rib") return "rib";
+    if (type == "hole" || type == "bolt_circle") return "hole";
+    if (type == "sketch") return "ws_sketch";
+    if (type == "helix") return "coil";
+    if (type == "split") return "split";
+    if (type == "boolean") return "combine";
+    if (type == "linear_pattern") return "pattern_linear";
+    if (type == "circular_pattern") return "pattern_circular";
+    if (type == "mirror") return "mirror";
+    if (type == "transform") return "move_component";
+    return "extrude";
+}
+
+void AppState::buildTreeFromDoc() {
+    tree = TreeNode{};
+    tree.name = docs.empty() ? "Part" : doc().name;
+    tree.icon = "file_part"; tree.isFolder = true; tree.open = true;
+    TreeNode planes{ "Planes", "ref_plane", true, false,
+        { {"Front", "ref_plane"}, {"Top", "ref_plane"}, {"Right", "ref_plane"} } };
+    TreeNode origin{ "Origin", "ref_csys", false, true, {} };
+    tree.children = { planes, origin };
+
+    const nlohmann::json& t = engine.tree();
+    if (t.is_object() && t.contains("features") && t["features"].is_array()) {
+        for (const auto& f : t["features"]) {
+            if (!f.is_object()) continue;
+            std::string type = f.value("type", std::string("feature"));
+            std::string name = f.value("name", type);
+            TreeNode n; n.name = name; n.icon = featureIcon(type); n.open = true;
+            tree.children.push_back(n);
+        }
+    }
+}
+
+bool AppState::commitTool(const std::string& tool, double v1, double v2) {
+    (void)v2;
+    if (!engineReady) { status = tool + " applied (demo)"; return true; }
+    eng::OpsResult r;
+    if (tool == "fillet")            r = engine.addFilletAll(v1);
+    else if (tool == "chamfer")      r = engine.addChamferAll(v1);
+    else if (tool == "shell")        r = engine.addShell(v1);
+    else if (tool == "draft")        r = engine.addDraftSides(v1);
+    else if (tool == "hole_wizard")  r = engine.addHoleCenter(v1);
+    else { status = "That tool needs a sketch (sketch wiring is next)."; return false; }
+    if (r.ok) { buildTreeFromDoc(); status = tool + " applied  (rev " + std::to_string(engine.revision()) + ")"; return true; }
+    status = std::string("Engine error: ") + (r.errMsg.empty() ? engine.lastError() : r.errMsg);
+    return false;
+}
+
 void AppState::seedDemo() {
-    docs = { {"Bracket", cmd::DocType::Part} };
+    docs = { {"Part1", cmd::DocType::Part} };
     activeDoc = 0;
     workspace = cmd::Workspace::Model;
-
-    tree.name = "Bracket"; tree.icon = "file_part"; tree.isFolder = true; tree.open = true;
-    TreeNode origin{ "Origin", "ref_csys", false, true, {} };
-    TreeNode planes{ "Planes", "ref_plane", true, false, {
-        {"Front", "ref_plane"}, {"Top", "ref_plane"}, {"Right", "ref_plane"} } };
-    TreeNode s1{ "Sketch1", "ws_sketch", false, true, {} };
-    TreeNode f1{ "Extrude1", "extrude", true, true, { {"Sketch1", "ws_sketch"} } };
-    TreeNode f2{ "Fillet1", "fillet", false, true, {} };
-    TreeNode f3{ "Shell1", "shell", false, true, {} };
-    TreeNode f4{ "LPattern1", "pattern_linear", false, true, {} };
-    tree.children = { planes, origin, f1, f2, f3, f4 };
-
-    bodies = { "Bracket<1>" };
 
     // welcome agent message
     agent.blocks.clear();
@@ -84,6 +130,31 @@ void AppState::seedDemo() {
     w.body  = "Hi - I'm your CAD copilot. Ask me to model something, run a simulation, or "
               "explain a feature. You'll see my thinking and every action I take, inline.";
     agent.blocks.push_back(w);
+
+    // --- Try the real C++ kernel (libaicad.dll): new part + a demo body. ---
+    engineReady = engine.available();
+    if (engineReady && engine.newPart("Part1")) {
+        auto r1 = engine.addBox(40, 30, 15, "Base");
+        if (r1.ok) { engine.addFilletAll(3, "Fillet"); engine.addShell(2, "Shell"); }
+        engine.rebuild();              // produce an initial tess.aicm_path for the viewport phase
+        buildTreeFromDoc();
+        bodies = { "Base" };
+        status = std::string("Engine live  (libaicad, rev ") + std::to_string(engine.revision()) + ")";
+        return;
+    }
+
+    // --- Fallback: demo data (engine/DLL unavailable). ---
+    engineReady = false;
+    status = std::string("Demo mode - ") + (engine.lastError().empty() ? "engine unavailable" : engine.lastError());
+    tree.name = "Part1"; tree.icon = "file_part"; tree.isFolder = true; tree.open = true;
+    TreeNode origin{ "Origin", "ref_csys", false, true, {} };
+    TreeNode planes{ "Planes", "ref_plane", true, false, {
+        {"Front", "ref_plane"}, {"Top", "ref_plane"}, {"Right", "ref_plane"} } };
+    TreeNode f1{ "Base", "extrude", false, true, {} };
+    TreeNode f2{ "Fillet", "fillet", false, true, {} };
+    TreeNode f3{ "Shell", "shell", false, true, {} };
+    tree.children = { planes, origin, f1, f2, f3 };
+    bodies = { "Part1<1>" };
 }
 
 // ---------------------------------------------------------------------------

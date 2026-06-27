@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include "ui/command_registry.h"
+#include "engine/engine.h"
 
 struct GLFWwindow;
 
@@ -55,6 +56,10 @@ struct DocTabState {
 struct AppState {
     GLFWwindow* window = nullptr;
 
+    // engine (real libaicad C++ kernel; falls back to demo data if unavailable)
+    eng::Engine engine;
+    bool  engineReady = false;
+
     // theme / window
     bool  dark = true;
     bool  maximized = false;
@@ -101,7 +106,9 @@ struct AppState {
     }
 
     void dispatch(const char* cmdId);   // central command handler (application.cpp)
-    void seedDemo();                    // populate demo docs/tree/agent
+    void seedDemo();                    // populate docs/tree/agent (real engine or demo fallback)
+    void buildTreeFromDoc();            // rebuild the UI tree from engine.tree()
+    bool commitTool(const std::string& tool, double v1, double v2);  // apply a real op (Inspector OK)
     void startDemoAgent(const std::string& userText);
     void tickDemoAgent(float dt);
 };

@@ -568,20 +568,35 @@ void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen
         return;
     }
 
-    // REGULAR POLYGON convenience entity: {type:"polygon"|"regular_polygon"|"hexagon", center:[x,y],
+    // REGULAR POLYGON convenience entity: {type:"polygon"|"regular_polygon"|"hexagon"|..., center:[x,y],
     // sides:N, and ONE size — across_flats (wrench/spanner size), circumradius/radius (centre->vertex),
     // or inradius/apothem} expands to N closed line segments. A small local model can't reliably draw
     // a closed hexagon as a spline (it emits an OPEN spline -> no region -> "extrude produced no
-    // solid"); this gives it a clean closed hex/nut/bolt-head profile in one entity. type:"hexagon"
-    // implies sides=6. Plain lines downstream, so the solver / region-detect / profile.cpp need no
-    // polygon awareness — same trick as the airfoil entity above.
+    // solid"); this gives it a clean closed hex/nut/bolt-head profile in one entity. A NAMED polygon
+    // type (triangle/pentagon/hexagon/heptagon/octagon/nonagon/decagon/dodecagon) implies its side
+    // count; an explicit "sides" still overrides it. Plain lines downstream, so the solver /
+    // region-detect / profile.cpp need no polygon awareness — same trick as the airfoil entity above.
     {
         const std::string et = ent.value("type", std::string());
-        if (et == "polygon" || et == "regular_polygon" || et == "ngon" || et == "hexagon") {
-            int n = et == "hexagon" ? 6 : 0;
+        // Named regular-polygon shorthands -> implied side count (0 = not a named ngon). Mirrors the
+        // "hexagon" convenience so a model can say {"type":"octagon",...} just like {"type":"hexagon"}.
+        auto named_sides = [](const std::string& t) -> int {
+            if (t == "triangle" || t == "equilateral_triangle" || t == "trigon") return 3;
+            if (t == "pentagon")                  return 5;
+            if (t == "hexagon"   || t == "hex")   return 6;
+            if (t == "heptagon"  || t == "septagon") return 7;
+            if (t == "octagon"   || t == "oct")   return 8;
+            if (t == "nonagon"   || t == "enneagon") return 9;
+            if (t == "decagon")                   return 10;
+            if (t == "hendecagon" || t == "undecagon") return 11;
+            if (t == "dodecagon")                 return 12;
+            return 0;
+        };
+        const int named = named_sides(et);
+        if (et == "polygon" || et == "regular_polygon" || et == "ngon" || named > 0) {
+            int n = named;  // named type implies a side count; generic types start at 0 (need "sides")
             for (const char* k : {"sides", "n", "num_sides", "count"})
                 if (ent.contains(k) && ent[k].is_number_integer()) { n = ent[k].get<int>(); break; }
-            if (n == 0 && et == "hexagon") n = 6;
             if (n < 3) throw OpError("invalid_op",
                                      "polygon: needs 'sides' >= 3 (e.g. {\"type\":\"polygon\","
                                      "\"sides\":6,\"across_flats\":12})");

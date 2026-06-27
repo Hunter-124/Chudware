@@ -1,16 +1,20 @@
-"""Thin ctypes bridge from the MCP server to the AI-CAD C++ core (``libaicad.dll``).
+"""Thin ctypes bridge from the MCP server to the AI-CAD C++ core (``libaicad``).
 
-This is the SAME engine the desktop app loads: the staged ``dist/AI-CAD/libaicad.dll``
+This is the SAME engine the desktop app loads: the native core library
+(``libaicad.dll`` on Windows, ``libaicad.so`` on Linux, ``libaicad.dylib`` on macOS)
 exposes every modeling / simulation / drawing capability as a string-in/string-out JSON
 RPC (``aicad_call(method, params_json, &out_json)``; see ``core/api/libaicad.cpp``). The
 in-app agent drives it through the host; here we drive it from Python so an MCP client
 (Claude) can do the same — write parametric feature ops, render, run FEA/CFD, export.
 
 Loading mirrors the proven probe loaders (``tools/vocab_battery.py``,
-``tools/mesh_quality_verify.py``): add the dist dir to the DLL search path (so the
-transitive OCCT / gmsh deps resolve), point ``AI_CAD_PROMPTS_DIR`` at the staged prompts
-(so plain-English geometry queries + cheatsheets behave exactly like the engine), then
-``CDLL`` the dll and bind the two C-ABI entry points.
+``tools/mesh_quality_verify.py``) and the host's own resolver (``cpp_core.cpp``): locate
+the library (``$AI_CAD_LIBAICAD`` explicit path → ``$AI_CAD_DIST`` dir → the platform's
+known build/stage dirs), put its directory on the native dep search path (so the
+transitive OCCT / Netgen / lib3mf deps resolve — on Linux the .so's ``$ORIGIN`` RUNPATH
+already handles its siblings), point ``AI_CAD_PROMPTS_DIR`` at the prompts (so
+plain-English geometry queries + cheatsheets behave exactly like the engine), then
+``CDLL`` the library and bind the two C-ABI entry points.
 
 Public surface:
     call(method, params) -> dict     one RPC; raises CoreError on a hard failure
@@ -23,6 +27,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -37,23 +42,80 @@ class CoreError(RuntimeError):
         self.detail = detail
 
 
-# ---------------------------------------------------------------- dist resolution
+# ---------------------------------------------------------------- library resolution
 
 def _repo_root() -> Path:
     # mcp_server/core_bridge.py -> repo root is two parents up.
     return Path(__file__).resolve().parents[1]
 
 
+def _lib_name() -> str:
+    """Platform filename of the core library."""
+    if sys.platform == "win32":
+        return "libaicad.dll"
+    if sys.platform == "darwin":
+        return "libaicad.dylib"
+    return "libaicad.so"
+
+
 def dist_dir() -> Path:
-    """The dist/AI-CAD directory holding libaicad.dll + its deps + staged prompts.
+    """The dist/AI-CAD directory holding the core library + its deps + staged prompts.
 
     Honours $AI_CAD_DIST (absolute path to the dist dir); else defaults to the repo's
-    ``dist/AI-CAD``. The directory is NOT required to exist until the DLL is first loaded.
+    ``dist/AI-CAD`` (the Windows ``build.bat`` stage target). The directory is NOT
+    required to exist until the library is first loaded; on Linux there is no ``dist``
+    stage and the library is found in a build dir instead (see ``_lib_candidates``).
     """
     env = os.environ.get("AI_CAD_DIST")
     if env:
         return Path(env)
     return _repo_root() / "dist" / "AI-CAD"
+
+
+def _lib_candidates() -> list[Path]:
+    """Ordered candidate paths to the core library, mirroring the host's resolver:
+    explicit ``$AI_CAD_LIBAICAD`` → the ``$AI_CAD_DIST`` / dist dir → the platform's
+    known build dirs. First existing one wins.
+    """
+    name = _lib_name()
+    out: list[Path] = []
+    env_lib = os.environ.get("AI_CAD_LIBAICAD")
+    if env_lib:
+        out.append(Path(env_lib))
+    out.append(dist_dir() / name)  # honours $AI_CAD_DIST; Windows stage default
+    if sys.platform != "win32":
+        # No dist stage off-Windows: the .so is produced in a build dir (and copied next
+        # to the host exe). Its $ORIGIN RUNPATH resolves the sibling Netgen/lib3mf deps.
+        root = _repo_root()
+        out.append(root / "core" / "build-occt-linux" / "bin" / name)
+        out.append(root / "host" / "build-linux" / "bin" / name)
+    return out
+
+
+def _resolve_lib() -> Path:
+    """First existing candidate library path, or raise CoreError listing what was tried."""
+    tried = _lib_candidates()
+    for p in tried:
+        if p.exists():
+            return p
+    name = _lib_name()
+    hint = (
+        "build.bat" if sys.platform == "win32"
+        else "cmake --build core/build-occt-linux (then set AI_CAD_LIBAICAD or AI_CAD_DIST)"
+    )
+    raise CoreError(
+        f"{name} not found. Tried: {', '.join(str(p) for p in tried)}. "
+        f"Build + stage the C++ core ({hint})."
+    )
+
+
+def _prompts_default() -> Path:
+    """Where the staged/source agent prompts live for $AI_CAD_PROMPTS_DIR. Prefers the
+    Windows dist stage when present, else the repo source (``agent/prompts``)."""
+    staged = dist_dir() / "app" / "agent" / "prompts"
+    if staged.is_dir():
+        return staged
+    return _repo_root() / "agent" / "prompts"
 
 
 # ---------------------------------------------------------------- DLL load (once)
@@ -69,27 +131,27 @@ def _load() -> ctypes.CDLL:
     with _lock:
         if _dll is not None:
             return _dll
-        dist = dist_dir()
-        dll_path = dist / "libaicad.dll"
-        if not dll_path.exists():
-            raise CoreError(
-                f"libaicad.dll not found at {dll_path}. Build + stage the C++ core with "
-                f"build.bat (or set AI_CAD_DIST to the dist/AI-CAD directory)."
-            )
-        # The dll's transitive deps (OCCT, gmsh, ...) live alongside it; put the dir on the
-        # native search path before loading. add_dll_directory is the Windows-correct way.
-        try:
-            os.add_dll_directory(str(dist))
-        except (AttributeError, OSError):
-            # Non-Windows / older Python: fall back to PATH (best effort).
-            os.environ["PATH"] = str(dist) + os.pathsep + os.environ.get("PATH", "")
+        lib_path = _resolve_lib()
+        lib_dir = lib_path.parent
+        # The library's transitive deps (OCCT, Netgen, lib3mf, ...) live alongside it; put
+        # the dir on the native search path before loading.
+        if sys.platform == "win32":
+            # add_dll_directory is the Windows-correct way (PATH is not consulted for deps
+            # of a DLL loaded by absolute path on modern Windows).
+            try:
+                os.add_dll_directory(str(lib_dir))
+            except (AttributeError, OSError):
+                os.environ["PATH"] = str(lib_dir) + os.pathsep + os.environ.get("PATH", "")
+        else:
+            # On Linux/macOS the .so/.dylib already carries an $ORIGIN RUNPATH that resolves
+            # its siblings; prepend the dir to LD_LIBRARY_PATH as a best-effort belt-and-braces.
+            ld = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+            os.environ[ld] = str(lib_dir) + os.pathsep + os.environ.get(ld, "")
         # Geometry queries + the agent cheatsheets resolve relative to the prompts dir; point
-        # it at the staged copy so the MCP behaves identically to the engine. Don't clobber an
-        # explicit override.
-        os.environ.setdefault(
-            "AI_CAD_PROMPTS_DIR", str(dist / "app" / "agent" / "prompts")
-        )
-        dll = ctypes.CDLL(str(dll_path))
+        # it at the staged/source copy so the MCP behaves identically to the engine. Don't
+        # clobber an explicit override.
+        os.environ.setdefault("AI_CAD_PROMPTS_DIR", str(_prompts_default()))
+        dll = ctypes.CDLL(str(lib_path))
         dll.aicad_call.restype = ctypes.c_int
         dll.aicad_call.argtypes = [
             ctypes.c_char_p,

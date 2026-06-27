@@ -507,6 +507,11 @@ void AppState::tryStartWorker() {
     {
         std::string lerr;
         if (core::cpp_core().ensureLoaded(lerr)) {
+            // Treat the in-process C++ core as the live backend: the ~50 `workerStarted` gates
+            // across the UI (FeatureManager toolbar / doc ops / panels) must pass, since RPCs
+            // route to libaicad via worker_client. (worker_client's own `running_` stays false,
+            // so methods libaicad can't serve still fail cleanly rather than hit a dead pipe.)
+            workerStarted = true;
             status = "Ready (C++ core).";
             statusKind = 0;
             addLog("[ok] in-process C++ core (libaicad) ready; Python worker not required");

@@ -122,6 +122,7 @@ void drawInspector(AppState& s) {
 
     static float depth = 25.f, draft = 0.f, radius = 5.f, thick = 2.f, dia = 6.f;
     static float pbL=40, pbW=30, pbH=15, pcR=15, pcH=30, psR=20, pkR1=15, pkR2=0, pkH=25;
+    static int   exProfi=0, exPlani=1, exOpi=0; static float exW=40, exH=30, exR=15;  // extrude
     static bool reverse=false, merge=true;
 
     if (s.activeTool == "prim_box") {
@@ -138,13 +139,17 @@ void drawInspector(AppState& s) {
         labelCol("Top R");    ImGui::DragFloat("##pk2",&pkR2,0.1f,0.f,1e5f,"%.2f");
         labelCol("Height");   ImGui::DragFloat("##pkh",&pkH,0.1f,0.01f,1e5f,"%.2f");
     } else if (s.activeTool == "extrude_boss") {
-        const char* ops[] = {"New Body","Add","Cut","Intersect","Surface"};
-        static int opi = 0;
-        labelCol("Operation"); ImGui::Combo("##op", &opi, ops, 5); s.toolExtrudeOp = ops[opi];
-        labelCol("End"); { static int endi=0; const char* ends[]={"Blind","Through All","Up To Next","Up To Surface"}; ImGui::Combo("##end", &endi, ends, 4); }
-        labelCol("Depth (mm)"); ImGui::DragFloat("##d", &depth, 0.1f, 0.f, 1000.f, "%.2f");
-        labelCol("Draft (deg)"); ImGui::DragFloat("##dr", &draft, 0.1f, -89.f, 89.f, "%.1f");
-        ImGui::Checkbox("Reverse direction", &reverse); ImGui::SameLine(); ImGui::Checkbox("Merge result", &merge);
+        const char* ops[] = {"New Body","Add","Cut","Intersect"};
+        labelCol("Operation"); ImGui::Combo("##op", &exOpi, ops, 4);
+        const char* profs[] = {"Rectangle","Circle"};
+        labelCol("Profile"); ImGui::Combo("##prof", &exProfi, profs, 2);
+        const char* planes[] = {"Front","Top","Right"};
+        labelCol("Plane"); ImGui::Combo("##pl", &exPlani, planes, 3);
+        if (exProfi == 0) { labelCol("Width");  ImGui::DragFloat("##exw",&exW,0.1f,0.01f,1e5f,"%.2f");
+                            labelCol("Height"); ImGui::DragFloat("##exh",&exH,0.1f,0.01f,1e5f,"%.2f"); }
+        else              { labelCol("Radius"); ImGui::DragFloat("##exr",&exR,0.1f,0.01f,1e5f,"%.2f"); }
+        labelCol("Depth (mm)"); ImGui::DragFloat("##d", &depth, 0.1f, 0.f, 1e5f, "%.2f");
+        ImGui::TextColored(TVEC(txt2), "Sketches the profile and extrudes it.");
     } else if (s.activeTool == "fillet") {
         labelCol("Radius (mm)"); ImGui::DragFloat("##r", &radius, 0.1f, 0.f, 1000.f, "%.2f");
         ImGui::TextColored(TVEC(txt2), "Select edges in the viewport...");
@@ -208,6 +213,13 @@ void drawInspector(AppState& s) {
                                        std::to_string((int)refs.size()) + " edge(s)"; }
                 else s.status = std::string("Engine error: ") + (r.errMsg.empty() ? s.engine.lastError() : r.errMsg);
             }
+        } else if (tool == "extrude_boss" && s.engineReady) {
+            std::string plane = exPlani == 0 ? "plane.front" : (exPlani == 1 ? "plane.top" : "plane.right");
+            std::string mode  = (exOpi == 2) ? "cut" : "boss";   // New Body/Add/Intersect -> boss; Cut -> cut
+            eng::OpsResult r = (exProfi == 0) ? s.engine.sketchRectExtrude(plane, exW, exH, depth, mode)
+                                              : s.engine.sketchCircleExtrude(plane, exR, depth, mode);
+            if (r.ok) { s.buildTreeFromDoc(); s.status = "Extrude added (rev " + std::to_string(s.engine.revision()) + ")"; }
+            else s.status = std::string("Engine error: ") + (r.errMsg.empty() ? s.engine.lastError() : r.errMsg);
         } else {
             double v1 = radius;
             if (tool == "shell") v1 = thick;

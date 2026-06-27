@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
     // headless screenshot mode: --shot <path> [--frames N]
     const char* shotPath = nullptr; int shotFrames = 12; bool demo = false;
     const char* doCmd = nullptr; bool openPalette = false; bool sketch = false;
-    bool selftest = false, picktest = false, shelltest = false, edgetest = false; bool light = false;
+    bool selftest = false, picktest = false, shelltest = false, edgetest = false, extrudetest = false; bool light = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--shot") && i+1 < argc) shotPath = argv[++i];
         else if (!std::strcmp(argv[i], "--frames") && i+1 < argc) shotFrames = atoi(argv[++i]);
@@ -61,6 +61,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--picktest")) picktest = true;
         else if (!std::strcmp(argv[i], "--shelltest")) shelltest = true;
         else if (!std::strcmp(argv[i], "--edgetest")) edgetest = true;
+        else if (!std::strcmp(argv[i], "--extrudetest")) extrudetest = true;
         else if (!std::strcmp(argv[i], "--light")) light = true;
     }
 
@@ -209,6 +210,23 @@ int main(int argc, char** argv) {
             bool ok = hit && !refs.empty() && r.ok && nf >= 2;
             std::fprintf(stderr, "[edgetest] hit=%d edge=%u resolved=%d filletOk=%d features=%d -> %s\n",
                          hit, pr.topo_id, (int)!refs.empty(), (int)r.ok, nf, ok ? "OK" : "FAIL");
+            rc = ok ? 0 : 2;
+        }
+        application.shutdown();
+        glfwDestroyWindow(win); glfwTerminate();
+        return rc;
+    }
+
+    if (extrudetest) {
+        auto& st = application.state();
+        int rc = 2;
+        if (!st.engineReady) std::fprintf(stderr, "[extrudetest] FAIL: no engine\n");
+        else {
+            st.engine.newPart("T");
+            eng::OpsResult r = st.engine.sketchRectExtrude("plane.top", 40, 30, 20, "boss");
+            int nf = 0; const auto& t = st.engine.tree(); if (t.contains("features") && t["features"].is_array()) nf = (int)t["features"].size();
+            bool ok = r.ok && nf >= 2;
+            std::fprintf(stderr, "[extrudetest] ok=%d features=%d rev=%d -> %s\n", (int)r.ok, nf, st.engine.revision(), ok ? "OK" : "FAIL");
             rc = ok ? 0 : 2;
         }
         application.shutdown();

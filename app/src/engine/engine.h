@@ -62,6 +62,10 @@ public:
     OpsResult addFilletEdges(double radius, const nlohmann::json& edgeRefs);      // fillet picked edges
     OpsResult addChamferEdges(double length, const nlohmann::json& edgeRefs);     // chamfer picked edges
 
+    // ---- parametric sketch + extrude (engine_sketch.cpp) ----
+    OpsResult sketchRectExtrude(const std::string& plane, double w, double h, double depth, const std::string& mode="boss");
+    OpsResult sketchCircleExtrude(const std::string& plane, double r, double depth, const std::string& mode="boss");
+
 private:
     OpsResult call(const std::string& method, const nlohmann::json& params);
     OpsResult parse(const nlohmann::json& res);

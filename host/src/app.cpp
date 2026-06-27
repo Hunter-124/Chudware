@@ -768,7 +768,7 @@ static bool saveAllDirtyForQuit(AppState& st) {
     return allSaved;
 }
 
-int run_gui(const char* screenshotPath) {
+int run_gui(const char* screenshotPath, const char* openPath) {
     const bool shot = screenshotPath != nullptr;
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -869,6 +869,14 @@ int run_gui(const char* screenshotPath) {
     st.win = win;
     st.shot = shot;
     st.scale = scale;
+    // "Open with" / file association (task 05): a document handed in on the command line is queued
+    // on the same deferred open pump the menu / OS file-drop use. The pump holds an open request
+    // pending until the worker is up (it only drops save/export when busy), so this opens cleanly
+    // even though the worker hasn't started yet at this point.
+    if (openPath && openPath[0]) {
+        st.requestOpenPath = openPath;
+        st.addLog(std::string("[open-with] launch arg -> ") + openPath);
+    }
     st.assets = assets;
     st.fonts = fonts;
     st.wordmark = wordmark;

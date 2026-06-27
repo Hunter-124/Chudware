@@ -15,9 +15,11 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "bootstrap.h"
@@ -31,7 +33,7 @@
 #include <ctime>
 #endif
 
-int run_gui(const char* screenshotPath);  // gui_app.cpp
+int run_gui(const char* screenshotPath, const char* openPath = nullptr);  // gui_app.cpp
 
 namespace {
 
@@ -321,6 +323,15 @@ int main(int argc, char** argv) {
         // through to interactive GUI mode and hang headlessly, never writing a PNG).
         static std::string defShot = exeDir() + "\\ui_screenshot.png";
         return run_gui(argc >= 3 ? argv[2] : defShot.c_str());
+    }
+    // "Open with" / file association (task 05): a bare path argument — the verb the OS invokes when
+    // a user double-clicks a .step+ (or any registered CAD/ECAD file) — launches the GUI and opens
+    // that document through the normal deferred open pump (NOT a headless mode). Anything starting
+    // with '-' is a flag handled above; a non-flag arg that names an existing file is the doc to open.
+    if (argc >= 2 && argv[1] && argv[1][0] != '-') {
+        std::error_code ec;
+        const char* openArg = std::filesystem::exists(argv[1], ec) ? argv[1] : nullptr;
+        return run_gui(nullptr, openArg);
     }
     // GUI opens immediately and provisions the runtime in-app (with progress) if needed.
     return run_gui(nullptr);

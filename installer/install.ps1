@@ -40,6 +40,10 @@ try {
     if (-not $NoRegister) {
         Write-Host "==> Registering AI-CAD MCP server with Claude ..."
         & $venvPy -m installer.register_mcp --python $venvPy --cwd $app
+        # File associations (.step+ default + Open-with for the formats AI-CAD loads). Per-user
+        # (HKCU), idempotent, reversed on uninstall. Stdlib-only, so the base python is fine too.
+        Write-Host "==> Registering AI-CAD file associations ..."
+        & $venvPy -m installer.setup_file_assoc --exe (Join-Path $InstallDir "AI-CAD.exe")
     }
 } finally {
     Pop-Location

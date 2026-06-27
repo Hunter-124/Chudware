@@ -194,6 +194,21 @@ int main() {
         std::printf("[probe] unknown-method fallback signal ok (rc=%d)\n", rc);
     }
 
+    // 4. ecad_new -> the C++ ECAD core mints a board doc. Validates the ECAD seam that the
+    //    Linux host now routes to by default (cppEcadFlag() default-on off-Windows).
+    {
+        json out;
+        int rc = 0;
+        if (call("ecad_new", json{{"name", "probe_board"}}, out, rc) != 0) return 1;
+        if (rc != 0) {
+            std::fprintf(stderr, "[probe] ecad_new rc=%d out=%s\n", rc, out.dump().c_str());
+            return fail("ecad_new returned nonzero");
+        }
+        std::string did = out.value("doc_id", out.value("id", std::string()));
+        if (did.empty()) return fail("ecad_new returned no doc_id");
+        std::printf("[probe] ecad_new ok: doc_id=%s\n", did.c_str());
+    }
+
     std::printf("[probe] ALL CHECKS PASSED\n");
     return 0;
 }

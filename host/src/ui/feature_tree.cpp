@@ -2520,7 +2520,7 @@ void pollAiCadHandoff(AppState& st) {
     if (!st.workerStarted) return;   // worker not up — nothing can open yet
     if (st.agentV2Running) return;   // an in-app agent run owns the doc; don't fight it
     namespace fs = std::filesystem;
-    static const std::string ctrl = appdataDir() + "\\AI-CAD\\handoff\\live.json";
+    static const std::string ctrl = appdataDir() + "/AI-CAD/handoff/live.json";
 
     static long long shownRev   = -1;   // the rev currently drawn in the mirror tab
     static long long pendingRev = -1;   // the latest rev the MCP published (may be deferred)

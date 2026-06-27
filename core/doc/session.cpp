@@ -7160,15 +7160,27 @@ json doc_vendor_part_insert(const std::string& into, const std::string& supplier
                             const std::string& part_number, const std::string& name) {
     DocLock lk;
     // %APPDATA%/AI-CAD/vendor_parts/index.json (mirror of engine/paths.py::appdata_root()).
+    // Resolve %APPDATA%/AI-CAD (Windows) or $XDG_DATA_HOME|~/.local/share /AI-CAD (POSIX) —
+    // mirrors agent/paths.cpp::appdata_root() so the core and host agree on the data dir.
+    std::filesystem::path aicad_root;
+#ifdef _WIN32
     const char* appdata = std::getenv("APPDATA");
-    std::filesystem::path root;
     if (appdata && appdata[0]) {
-        root = std::filesystem::path(appdata);
+        aicad_root = std::filesystem::path(appdata) / "AI-CAD";
     } else {
         const char* home = std::getenv("USERPROFILE");
-        root = std::filesystem::path(home && home[0] ? home : ".") / "AppData" / "Roaming";
+        aicad_root = std::filesystem::path(home && home[0] ? home : ".") / "AppData" / "Roaming" /
+                     "AI-CAD";
     }
-    const std::filesystem::path index = root / "AI-CAD" / "vendor_parts" / "index.json";
+#else
+    if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && xdg[0])
+        aicad_root = std::filesystem::path(xdg) / "AI-CAD";
+    else if (const char* home = std::getenv("HOME"); home && home[0])
+        aicad_root = std::filesystem::path(home) / ".local" / "share" / "AI-CAD";
+    else
+        aicad_root = std::filesystem::path(".") / "AI-CAD";
+#endif
+    const std::filesystem::path index = aicad_root / "vendor_parts" / "index.json";
     if (!std::filesystem::exists(index))
         throw OpError("invalid_op", "vendor_part_insert: no vendor parts registered",
                       {{"reason", "no vendor index"}, {"index", index.string()}});

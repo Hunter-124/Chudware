@@ -228,7 +228,12 @@ bool routeSimToCpp(const std::string& method, const json& /*params*/) {
 // (no Python doc to fall back to) — exactly the doc-cpp seam's behavior.
 bool cppEcadFlag() {
     const char* f = std::getenv("AI_CAD_CPP_ECAD");
-    return f && f[0] && f[0] != '0';  // explicit opt-in only (default OFF)
+    if (f && f[0]) return f[0] != '0';  // explicit override (1=on, 0=force Python)
+#ifdef _WIN32
+    return false;  // Windows: default to the mature Python ECAD worker
+#else
+    return true;   // Linux/macOS: no Python worker — the C++ core is the only ECAD backend
+#endif
 }
 
 bool routeEcadToCpp(const std::string& method, const json& params) {

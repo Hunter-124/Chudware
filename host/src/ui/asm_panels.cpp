@@ -186,8 +186,9 @@ namespace {
 // assembly's source.path stays valid across rebuilds. Sanitizes size designators
 // ("1/4-20" / "#6-32") into filename-safe tokens.
 std::string partsCacheDir() {
-    const char* a = std::getenv("APPDATA");
-    return std::string(a ? a : ".") + "\\AI-CAD\\cache\\parts_library";
+    // appdataDir() resolves %APPDATA% on Windows / XDG (~/.local/share) on POSIX; '/' is a
+    // valid separator on both, so the cache path is correct cross-platform.
+    return appdataDir() + "/AI-CAD/cache/parts_library";
 }
 std::string sanitizeToken(const std::string& s) {
     std::string out;

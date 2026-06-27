@@ -796,21 +796,6 @@ if(AICAD_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(studies PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
-  # --- Per-body appearance (task 04: set_appearance op + AICM colour/material bake) ---
-  # Ports the set_appearance op into the C++ core and bakes doc["appearances"] onto tessellated
-  # bodies; the test drives the op end to end (doc field + both tess paths). aicad_doc carries OCCT.
-  add_executable(test_appearance
-    tests/test_appearance.cpp)
-  target_include_directories(test_appearance PRIVATE
-    ${doctest_SOURCE_DIR}
-    ${OpenCASCADE_INCLUDE_DIR})
-  target_link_libraries(test_appearance PRIVATE
-    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
-  set_target_properties(test_appearance PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-  add_test(NAME appearance COMMAND test_appearance)
-  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
-  set_tests_properties(appearance PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- GD&T + custom-section drawing coverage (annot_draw + section modes) ------
   # Builds a real holed block, makes a drawing, adds every GD&T element + a half

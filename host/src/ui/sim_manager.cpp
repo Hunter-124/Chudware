@@ -69,6 +69,49 @@ static const char* studyTypeLabel(StudyType t) {
     }
 }
 
+// Study-type icon name for the atlas (study_* per the icon contract). Referencing by string is
+// compile-decoupled; callers guard on IconUV::valid so a missing atlas entry degrades to no icon.
+static const char* studyTypeIcon(StudyType t) {
+    switch (t) {
+        case StudyType::Modal:   return "study_modal";
+        case StudyType::Flow:    return "study_flow";
+        case StudyType::Fatigue: return "study_fatigue";
+        case StudyType::Thermal: return "study_thermal";
+        default:                 return "study_static";
+    }
+}
+
+// One-line study-type intent banner on a translucent glass card (type icon + description). Part of
+// the UI overhaul's glassmorphism pass (ui::glassBackground); falls back to plain text when the
+// icon atlas lacks the study_* name. Drawn at the top of the Study overview so each type announces
+// what it solves and which inputs apply.
+static void drawStudyTypeBanner(StudyType t, const char* desc) {
+    const float S = ui::uiScale;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 pad(9.0f * S, 7.0f * S);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    dl->ChannelsSplit(2);
+    dl->ChannelsSetCurrent(1);                 // content sits above the card
+    ImGui::Dummy(ImVec2(0, pad.y));
+    ImGui::Indent(pad.x);
+    IconUV iv = getIcon(studyTypeIcon(t), 20);
+    if (iv.valid) {
+        ImGui::Image(iv.texId, ImVec2(18.0f * S, 18.0f * S), iv.uv0, iv.uv1);
+        ImGui::SameLine(0, 7.0f * S);
+    }
+    ImGui::PushTextWrapPos(p0.x + w - pad.x);
+    ImGui::TextWrapped("%s", desc);
+    ImGui::PopTextWrapPos();
+    ImGui::Unindent(pad.x);
+    ImGui::Dummy(ImVec2(0, pad.y));
+    const ImVec2 p1(p0.x + w, ImGui::GetCursorScreenPos().y);
+    dl->ChannelsSetCurrent(0);                 // glass card behind the content
+    ui::glassBackground(dl, p0, p1, 8.0f);
+    dl->ChannelsMerge();
+    ImGui::Spacing();
+}
+
 // allowHex=false forces tetrahedral (e.g. modal studies have no hex8 mass matrix).
 static void addMeshParams(nlohmann::json& j, const Study& s, int meshOrder, bool allowHex = true) {
     j["fineness"] = s.meshFineness;     // primary control (0=coarse..1=fine)
@@ -572,7 +615,10 @@ void SimManager::newStudy(AppState& st, StudyType t) {
     Study s;
     s.type = t;
     s.name = std::string(studyTypeLabel(t)) + " " + std::to_string((int)studies_.size() + 1);
-    if (!materials().empty()) s.materialKey = materials()[0].key;
+    // Structural & frequency studies need a material (stiffness/density/yield). Flow/Thermal run the
+    // OpenFOAM pipeline and never read materialKey, so leave it unset for them — the tree hides the
+    // Material node and nothing in runFlow consumes the record.
+    if (!isFlowFamily(t) && !materials().empty()) s.materialKey = materials()[0].key;
     // A Thermal study IS the OpenFOAM heat-transfer pipeline — force the solver + thermal on so
     // the form opens straight into the thermal setup (no LBM, no aero-only fallback).
     if (t == StudyType::Thermal) { s.flowSolver = 1; s.flowThermal = true; }
@@ -643,6 +689,14 @@ bool SimManager::handleCommand(AppState& st, const std::string& cmdId) {
         return true;
     }
     Study& s = studies_[sel_];
+    // Frequency (modal) eigenvalue solves ignore loads entirely — a load added here would be silently
+    // discarded on run (runStaticOrModal never sends modal loads). Block the load commands with a
+    // teaching toast so the user learns to constrain rigid-body modes with fixtures instead.
+    if ((cmdId == "sim_load_force" || cmdId == "sim_load_pressure") && s.type == StudyType::Modal) {
+        st.toast(ui::ToastLevel::Warn,
+                 "Frequency studies don't use loads — add fixtures to constrain rigid-body modes.");
+        return true;
+    }
     // captureSelectionInto adopts any GENUINE pre-selection (faces the user picked before clicking the
     // command) into the new well, then we clear st.selection. The carryover bug came from sim face
     // picks LINGERING in st.selection (the pick observer never removes them) so the next capture
@@ -1770,6 +1824,13 @@ void SimManager::drawStudyRow(AppState& st, int i) {
                                ImGuiTreeNodeFlags_DefaultOpen;
     if (selStudy && node_ == SimNode::Study) flags |= ImGuiTreeNodeFlags_Selected;
 
+    // Study-type icon ahead of the node (study_* atlas; degrades to no icon when absent), matching
+    // the feature-tree's icon + SameLine + TreeNodeEx row convention.
+    IconUV tIcon = getIcon(studyTypeIcon(s.type), 20);
+    if (tIcon.valid) {
+        ImGui::Image(tIcon.texId, ImVec2(16.0f * ui::uiScale, 16.0f * ui::uiScale), tIcon.uv0, tIcon.uv1);
+        ImGui::SameLine(0, 4.0f * ui::uiScale);
+    }
     std::string title = s.name + "  (" + studyTypeLabel(s.type) + ")";
     bool open = ImGui::TreeNodeEx("##study", flags, "%s", title.c_str());
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
@@ -1806,8 +1867,17 @@ void SimManager::drawStudyRow(AppState& st, int i) {
             int mi = materialIndexByKey(s.materialKey);
             return mi >= 0 ? materials()[mi].name : std::string("(not set)");
         }();
-        child("material", "Material: " + matName, SimNode::Material, !s.materialKey.empty(),
-              s.materialKey.empty() ? "No material assigned — pick one before running." : "");
+        // Material drives stiffness/density/yield for structural & frequency studies. Flow/Thermal
+        // run the OpenFOAM pipeline (flowSolidKappa is set directly in the form) and never read
+        // materialKey, so the node is hidden for them — re-add here if a CHT material feature lands.
+        if (!isFlowFamily(s.type))
+            child("material", "Material: " + matName, SimNode::Material, !s.materialKey.empty(),
+                  s.materialKey.empty() ? "No material assigned — pick one before running." : "");
+        // Thermal has no Material/Fixtures/Loads/Mesh nodes; give the tree a meaningful entry point
+        // back to the thermal boundary-condition form (drawn by the Study overview / drawFlowForm).
+        if (s.type == StudyType::Thermal)
+            child("study_thermal", "Heat source / wall BC", SimNode::Study, true,
+                  "Configure the thermal boundary condition in the study form.");
 
         if (!isFlowFamily(s.type)) {
             bool hasFix = !s.fixtures.empty();
@@ -1815,14 +1885,18 @@ void SimManager::drawStudyRow(AppState& st, int i) {
                   hasFix ? "" : (s.type == StudyType::Modal
                       ? "No fixtures — frequency study will run free-free."
                       : "A static study needs at least one fixed face."));
-            // Loads (each its own row).
-            for (int li = 0; li < (int)s.loads.size(); ++li) {
-                const SimLoad& ld = s.loads[li];
-                std::string lbl = (ld.pressure ? "Pressure " : "Force ") + std::to_string(li + 1) +
-                                  " (" + ld.faces.label() + ")";
-                child(ld.pressure ? "load_pressure" : "load_force", lbl, SimNode::Load,
-                      !ld.faces.empty(),
-                      ld.faces.empty() ? "This load has no faces selected." : "", li);
+            // Loads (each its own row). Frequency (modal) eigenvalue solves ignore loads entirely —
+            // they never reach runStaticOrModal's load array — so the load nodes are hidden for
+            // modal studies. Fixtures + Mesh stay (fixtures constrain rigid-body modes).
+            if (s.type != StudyType::Modal) {
+                for (int li = 0; li < (int)s.loads.size(); ++li) {
+                    const SimLoad& ld = s.loads[li];
+                    std::string lbl = (ld.pressure ? "Pressure " : "Force ") + std::to_string(li + 1) +
+                                      " (" + ld.faces.label() + ")";
+                    child(ld.pressure ? "load_pressure" : "load_force", lbl, SimNode::Load,
+                          !ld.faces.empty(),
+                          ld.faces.empty() ? "This load has no faces selected." : "", li);
+                }
             }
             child("mesh", "Mesh", SimNode::Mesh, true, "Mesh density for the solve.");
         }
@@ -2040,6 +2114,10 @@ void SimManager::drawMeshForm(AppState& st, Study& s) {
 
     // --- Mesh type: tetrahedral (general) vs structured hexahedral (prismatic) ------
     const bool modal = (s.type == StudyType::Modal);
+    // Data hygiene: a modal study should carry no loads (the eigenvalue solve ignores them and the
+    // tree hides them). If a study accumulated loads before becoming modal — e.g. copied from a
+    // static template — drop them once so future JSON readers don't see inert load entries.
+    if (modal && !s.loads.empty()) { s.loads.clear(); persist(st, s); }
     ImGui::TextUnformatted("Mesh type");
     static const char* kType[2] = {"Tetrahedral (any shape)",
                                    "Hexahedral (box / prismatic only)"};
@@ -2099,7 +2177,9 @@ void SimManager::drawMeshForm(AppState& st, Study& s) {
     ImGui::TextUnformatted("Element order");
     static const char* kOrder[2] = {"Draft - linear (1st order, fast)",
                                     "High quality - quadratic (2nd order)"};
-    int oi = (s.meshOrder == 2) ? 1 : 0;
+    // Modal always runs 1st-order linear tets (runStaticOrModal forces order=1); show + lock Draft.
+    int oi = (!modal && s.meshOrder == 2) ? 1 : 0;
+    if (modal) ImGui::BeginDisabled();
     ImGui::SetNextItemWidth(-FLT_MIN);
     if (ImGui::BeginCombo("##meshorder", kOrder[oi])) {
         for (int i = 0; i < 2; ++i)
@@ -2108,19 +2188,24 @@ void SimManager::drawMeshForm(AppState& st, Study& s) {
             }
         ImGui::EndCombo();
     }
+    if (modal) ImGui::EndDisabled();
     simTip("2nd-order (quadratic) elements capture bending and curved geometry far more "
            "accurately. Linear elements are overly stiff (shear-locking) and make a bent "
            "part look almost straight. Use High quality for structural accuracy; Draft for a "
            "fast first look. (Frequency studies always use 1st-order.)");
+    if (modal) ImGui::TextDisabled("Frequency studies always use 1st-order elements.");
     ImGui::Spacing();
 
     // --- Optimize ------------------------------------------------------------------
+    if (modal) ImGui::BeginDisabled();
     if (ImGui::Checkbox("Optimize element quality (Netgen)", &s.meshOptimize)) {
         persist(st, s);
         clearMeshPreview();
     }
+    if (modal) ImGui::EndDisabled();
     simTip("Run Netgen's surface + volume optimizers after generation to improve poorly-shaped "
            "tetrahedra. Recommended; adds a little meshing time.");
+    if (modal) ImGui::TextDisabled("Mesh quality settings are fixed for frequency studies.");
     ImGui::Spacing();
 
     // --- Advanced (collapsed) ------------------------------------------------------
@@ -3111,39 +3196,62 @@ void SimManager::drawForm(AppState& st, Study& s) {
             break;
         case SimNode::Study:
         default:
-            // Study overview: material + (type-specific) key controls + Run.
+            // Study overview: a per-type intent banner (glass card) followed by the inputs that
+            // actually apply to this type, grouped under step-section headers. Flow/Thermal have no
+            // structural Material node — drawFlowForm carries every fluid / thermal input directly.
             if (isFlowFamily(s.type)) {
+                drawStudyTypeBanner(s.type, s.type == StudyType::Thermal
+                    ? "Steady-state heat transfer (OpenFOAM): convection with wall / heat-source "
+                      "boundary conditions. Structural material is not used."
+                    : "External flow / wind-tunnel (CFD): drag, lift and pressure from the velocity "
+                      "and fluid. Structural material is not used.");
                 drawFlowForm(st, s);
-            } else {
-                ImGui::TextUnformatted("Material"); drawMaterialCombo(st, s);
+            } else if (s.type == StudyType::Modal) {
+                drawStudyTypeBanner(s.type, "Natural frequencies and mode shapes. Loads are not "
+                    "applicable — fixtures (optional) constrain rigid-body modes.");
+                ImGui::SeparatorText("Material");
+                drawMaterialCombo(st, s);
                 ImGui::Spacing();
-                if (s.type == StudyType::Modal) {
-                    ImGui::TextUnformatted("Modes");
-                    ImGui::SetNextItemWidth(-FLT_MIN);
-                    if (ImGui::SliderInt("##modes", &s.nModes, 1, 12)) {}
-                    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
-                    simTip("How many natural frequencies / mode shapes to solve for.");
-                } else if (s.type == StudyType::Static) {
-                    // Failure theory driving the headline factor of safety + the FoS plot field.
-                    ImGui::TextUnformatted("Failure criterion");
-                    static const char* kCrit[3] = {"Max von Mises (distortion energy)",
-                                                   "Max shear stress (Tresca)",
-                                                   "Max normal stress (Rankine)"};
-                    int ci = (int)s.criterion; if (ci < 0 || ci > 2) ci = 0;
-                    ImGui::SetNextItemWidth(-FLT_MIN);
-                    if (ImGui::BeginCombo("##crit", kCrit[ci])) {
-                        for (int i = 0; i < 3; ++i)
-                            if (ImGui::Selectable(kCrit[i], ci == i)) {
-                                s.criterion = (FailureCriterion)i; persist(st, s);
-                            }
-                        ImGui::EndCombo();
-                    }
-                    simTip("Theory used for the headline factor of safety. Ductile metals: von Mises "
-                           "(distortion energy) or Tresca (max shear, more conservative). Brittle "
-                           "materials: max normal stress (Rankine).");
-                } else if (s.type == StudyType::Fatigue) {
-                    drawFatigueForm(st, s);
+                ImGui::SeparatorText("Modes");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::SliderInt("##modes", &s.nModes, 1, 12)) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                simTip("How many natural frequencies / mode shapes to solve for.");
+                ImGui::Spacing();
+                ImGui::TextDisabled("Select Fixtures / Mesh in the tree to edit them. "
+                                    "Frequency studies have no loads.");
+            } else if (s.type == StudyType::Static) {
+                drawStudyTypeBanner(s.type, "Linear static stress under applied loads. Set material, "
+                    "fixtures, loads and mesh, then run for stress, displacement and factor of safety.");
+                ImGui::SeparatorText("Material");
+                drawMaterialCombo(st, s);
+                ImGui::Spacing();
+                // Failure theory driving the headline factor of safety + the FoS plot field.
+                ImGui::SeparatorText("Failure criterion");
+                static const char* kCrit[3] = {"Max von Mises (distortion energy)",
+                                               "Max shear stress (Tresca)",
+                                               "Max normal stress (Rankine)"};
+                int ci = (int)s.criterion; if (ci < 0 || ci > 2) ci = 0;
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::BeginCombo("##crit", kCrit[ci])) {
+                    for (int i = 0; i < 3; ++i)
+                        if (ImGui::Selectable(kCrit[i], ci == i)) {
+                            s.criterion = (FailureCriterion)i; persist(st, s);
+                        }
+                    ImGui::EndCombo();
                 }
+                simTip("Theory used for the headline factor of safety. Ductile metals: von Mises "
+                       "(distortion energy) or Tresca (max shear, more conservative). Brittle "
+                       "materials: max normal stress (Rankine).");
+                ImGui::Spacing();
+                ImGui::TextDisabled("Select Fixtures / Loads / Mesh in the tree to edit them.");
+            } else {   // StudyType::Fatigue — drawFatigueForm adds its own step headers.
+                drawStudyTypeBanner(s.type, "Fatigue life under cyclic loading: the static stress "
+                    "state is scaled over the load cycle (Goodman / Gerber / Soderberg).");
+                ImGui::SeparatorText("Material");
+                drawMaterialCombo(st, s);
+                ImGui::Spacing();
+                drawFatigueForm(st, s);
                 ImGui::Spacing();
                 ImGui::TextDisabled("Select Fixtures / Loads / Mesh in the tree to edit them.");
             }

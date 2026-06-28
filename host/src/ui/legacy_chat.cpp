@@ -115,6 +115,9 @@ static bool rewrapInPlace(char* buf, int len, float wrapW) {
 }
 namespace {
 struct ChatInputCb { float wrapW = 0.0f; };
+// Panel-local transparency toggle: show/hide the AI's reasoning ("Thinking") blocks. Session-only
+// (DESIGN §5 "Show thinking" switch, default on); not persisted and deliberately NOT in AppState.
+bool gShowThinking = true;
 int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
     if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
         auto* cb = static_cast<ChatInputCb*>(data->UserData);
@@ -255,19 +258,81 @@ void drawFitReadout(const FitReport& fit, bool detailed) {
     }
 }
 
-// The build-plan card: an accent-edged panel listing each planned part with its purpose,
-// committed dimensions (mono) and feature bullets — the agent's blueprint, shown before
-// any code runs so the user can see (and steer) what is about to be built.
-void drawPlanCard(const PlanInfo& plan, const ui::Fonts& fonts) {
+// Draw a run-status glyph (spinning comet arc / check / cross / retry ring / pending hollow dot)
+// centered in a `box`-wide cell at the cursor, then advance past it. Shared by the plan checklist
+// and the action cards so every surface shows the same animated status art.
+static void drawStatusGlyph(const std::string& status, float box) {
+    const auto& pal = ui::palette;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 c(p0.x + box * 0.5f, p0.y + box * 0.5f);
+    const float r = box * 0.30f;
+    const bool running = status == "running";
+    const bool pass    = status == "pass" || status == "done";
+    const bool retry   = status == "retry";
+    const bool fail    = status == "fail";
+    ImU32 col = ui::Palette::toU32(running || pass ? pal.accent
+                                   : retry ? pal.statusWarn
+                                   : fail  ? pal.statusErr : pal.textDim);
+    const float th = ui::metrics::stroke(1.6f);
+    if (running) {                              // spinning comet arc
+        float t = (float)ImGui::GetTime();
+        const int seg = 14;
+        for (int s = 0; s < seg; ++s) {
+            float f = (float)s / seg, aa = t * 6.0f + f * 6.2831853f;
+            float al = 0.12f + 0.88f * f;
+            ImU32 cc = (col & 0x00FFFFFFu) | ((ImU32)(al * 255) << 24);
+            dl->AddCircleFilled(ImVec2(c.x + std::cos(aa) * r, c.y + std::sin(aa) * r), th, cc);
+        }
+    } else if (pass) {                          // check mark
+        dl->AddLine(ImVec2(c.x - r * 0.55f, c.y + r * 0.05f),
+                    ImVec2(c.x - r * 0.10f, c.y + r * 0.50f), col, th);
+        dl->AddLine(ImVec2(c.x - r * 0.10f, c.y + r * 0.50f),
+                    ImVec2(c.x + r * 0.60f, c.y - r * 0.50f), col, th);
+    } else if (fail) {                          // cross
+        dl->AddLine(ImVec2(c.x - r * 0.5f, c.y - r * 0.5f),
+                    ImVec2(c.x + r * 0.5f, c.y + r * 0.5f), col, th);
+        dl->AddLine(ImVec2(c.x - r * 0.5f, c.y + r * 0.5f),
+                    ImVec2(c.x + r * 0.5f, c.y - r * 0.5f), col, th);
+    } else if (retry) {
+        dl->AddCircle(c, r, col, 12, th);
+    } else {
+        dl->AddCircle(c, r * 0.8f, col, 12, th);  // pending hollow dot
+    }
+    ImGui::Dummy(ImVec2(box, box));
+}
+
+// The build-plan card: a glass panel listing each planned part with its purpose, committed
+// dimensions (mono) and feature bullets — plus a live status tick per part (spins while the
+// matching orchestrator stage runs, checks when it passes), so it doubles as the todo checklist.
+void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activity,
+                  const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const ImVec4 accent(pal.accent[0], pal.accent[1], pal.accent[2], 1);
+    auto lower = [](std::string s) {
+        for (char& c : s) c = (char)std::tolower((unsigned char)c);
+        return s;
+    };
+    // Match a part to an activity stage by name (substring of title or stage key) for its tick.
+    auto partStatus = [&](const std::string& name) -> std::string {
+        std::string ln = lower(name);
+        if (ln.empty()) return "";
+        for (const auto& a : activity)
+            if (lower(a.title).find(ln) != std::string::npos ||
+                lower(a.stage).find(ln) != std::string::npos)
+                return a.status;
+        return "";
+    };
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.planCardBg[0], pal.planCardBg[1], pal.planCardBg[2], pal.planCardBg[3]));
+        ImVec4(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], pal.glassBg[3]));
+    ImGui::PushStyleColor(ImGuiCol_Border,
+        ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2], pal.glassBorder[3]));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f * ui::uiScale);
     ImGui::BeginChild("##plancard", ImVec2(0, 0),
                       ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 w0 = ImGui::GetWindowPos();
-    // Accent bar: use the same accent color with alpha from planAccentBar role.
+    // Left accent bar: the accent color at the planAccentBar alpha.
     dl->AddRectFilled(w0, ImVec2(w0.x + 3.0f, w0.y + ImGui::GetWindowHeight()),
                       ui::Palette::toU32(pal.accent) & 0x00FFFFFFu |
                       ((uint32_t)(unsigned char)pal.planAccentBar << 24));
@@ -283,9 +348,7 @@ void drawPlanCard(const PlanInfo& plan, const ui::Fonts& fonts) {
         const PlanPart& p = plan.parts[i];
         ImGui::PushID((int)i);
         ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
-        ImGui::ColorButton("##pdot", partColor((int)i),
-                           ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop,
-                           ImVec2(10 * ui::uiScale, 10 * ui::uiScale));
+        drawStatusGlyph(partStatus(p.name), ImGui::GetTextLineHeight());
         ImGui::SameLine(0, 7 * ui::uiScale);
         ImGui::PushFont(fonts.medium);
         ImGui::TextUnformatted(p.name.c_str());
@@ -314,7 +377,8 @@ void drawPlanCard(const PlanInfo& plan, const ui::Fonts& fonts) {
         dimText(("Fit: " + plan.fit).c_str());
     }
     ImGui::EndChild();
-    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
 }
 
 // One line "Parts: a, b, c" with each name tinted its assembly color.
@@ -450,7 +514,10 @@ static void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
     ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.stepCardBg[0], pal.stepCardBg[1], pal.stepCardBg[2], pal.stepCardBg[3]));
+        ImVec4(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], pal.glassBg[3]));
+    ImGui::PushStyleColor(ImGuiCol_Border,
+        ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2], pal.glassBorder[3]));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f * ui::uiScale);
     ImGui::BeginChild("##stepcard", ImVec2(0, 0),
                       ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
     // Build issues are amber, not red: a failed pass is normal mid-loop — the error goes
@@ -530,7 +597,8 @@ static void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     if (s.showError && !s.error.empty())
         drawCodeBox("##err_v", s.error, fonts.mono, ui::metrics::px(200.0f));
     ImGui::EndChild();
-    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
 }
 
 // One assistant turn: name + plan card + summary + iteration cards. While running, an inline
@@ -723,126 +791,230 @@ static int effectiveContextWindow(const Settings& s) {
         default: return 8192;  // local / unknown
     }
 }
-// Which model handles a given stage, per the routing config: the vision/spatial model runs the
-// review+fix stages when enabled; the command model runs everything else.
-static std::string stageModel(const Settings& s, const std::string& stage) {
-    bool visionStage =
-        stage.find("review") != std::string::npos || stage.find("fix") != std::string::npos;
-    if (s.expVisionReview && visionStage && s.expVisionModel[0]) return s.expVisionModel;
-    return s.model;
+// ============================ typed-block agent timeline ============================
+// The orchestrator event stream (feedTurnActivity -> ChatMsg::activity) is rendered as the
+// DESIGN.md §5 typed blocks: dimmed, collapsible "thinking" blocks for reasoning-only stages and
+// glass "action cards" (icon + human label + animated status + folded result + expandable detail)
+// for tool / build stages. Engine RPCs + the event plumbing are unchanged — this is layout only.
+
+// Atlas icon for a stage key (string-keyed: a missing name just falls back to no glyph).
+static const char* stageIconName(const std::string& stage, bool missionHeader) {
+    if (missionHeader) return "list";
+    std::string s = stage;
+    size_t colon = s.find(':');           // strip the "<taskIdx>:" mission namespace prefix
+    if (colon != std::string::npos) s = s.substr(colon + 1);
+    if (s == "intake") return "search";
+    if (s == "plan")   return "list";
+    if (s == "model")  return "cpu";
+    if (s == "edit")   return "edit";
+    if (s == "review") return "eye";
+    if (s == "fix")    return "wrench";
+    if (s == "memory") return "bookmark";
+    return "cpu";
 }
 
-// The transparent activity timeline: one expandable row per thing the AI did/thought, with a
-// status glyph (drawn with the draw list — check/arrow glyphs are not in the body font), the
-// plain-language heading, optional verdict reason, and a click-to-expand body that reveals the
-// raw reasoning/output behind the step. This is the primary "what the AI is doing" surface and
-// replaces the old separate Activity panel + cramped embedded run tree. `cfg` drives the per-row
-// "which model ran this stage" label.
-static void drawActivityTimeline(ChatMsg& m, const ui::Fonts& fonts, const Settings& cfg) {
-    if (m.activity.empty()) return;
+// Classify a row: reasoning-only stages (no CAD ops, with captured detail) render as a thinking
+// block; build/tool stages (model/edit/review/fix/memory) and mission headers are action cards.
+static bool isThinkingItem(const ActivityItem& a) {
+    if (a.missionHeader) return false;
+    std::string s = a.stage;
+    size_t colon = s.find(':');
+    if (colon != std::string::npos) s = s.substr(colon + 1);
+    if (s == "model" || s == "edit" || s == "review" || s == "fix" || s == "memory") return false;
+    return a.opsCount == 0 && !a.detail.empty();
+}
+
+// A collapsible, dimmed reasoning block. While it is the frontier of work it stays open so the
+// thoughts stream; once a later stage reaches a verdict (`laterDone`) it auto-collapses unless the
+// user expanded it (a.expanded, set by clicking). `showThinking` off -> a single dim one-liner.
+static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool showThinking,
+                              bool laterDone) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     ImGui::Dummy(ImVec2(0, 2 * sc));
+
+    if (!showThinking) {
+        ImGui::PushFont(fonts.body);
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::TextUnformatted(a.title.empty() ? "Thinking" : a.title.c_str());
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
+        return;
+    }
+
+    const bool open = a.expanded || !laterDone;   // forced open while it is the active frontier
+    const bool hasDetail = !a.detail.empty();
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImVec4(pal.blockThinkBg[0], pal.blockThinkBg[1], pal.blockThinkBg[2], pal.blockThinkBg[3]));
+    ImGui::PushStyleColor(ImGuiCol_Border,
+        ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2], pal.glassBorder[3]));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f * sc);
+    ImGui::BeginChild("##thinkblk", ImVec2(0, 0), ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+
+    const ImVec4 dim(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1);
+    ImGui::PushFont(fonts.body);
+    ImGui::TextColored(dim, "%s", a.title.empty() ? "Thinking" : a.title.c_str());
+    ImGui::PopFont();
+    if (hasDetail) {
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked()) a.expanded = !open;
+        ImGui::SameLine(0, 6 * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::TextUnformatted(open ? "(hide)" : "(show thinking)");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked()) a.expanded = !open;
+    }
+    if (open && hasDetail)
+        drawProseBox("##thinkdetail", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+}
+
+// A glass action card for a tool call / orchestrator build stage: status glyph + tool icon + human
+// label + duration/ops meta, the verdict folded in as a result line, an expandable drawer (a
+// legacy AgentStep's thinking/code/diff/thumbnail when attached, else the raw detail), and a red
+// border when the stage failed. `step` is non-null only for v1 runs that carry an AgentStep.
+static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fonts, float logW) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const bool running = a.status == "running";
+    const bool fail    = a.status == "fail";
+
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImVec4(pal.blockActionBg[0], pal.blockActionBg[1], pal.blockActionBg[2], pal.blockActionBg[3]));
+    ImGui::PushStyleColor(ImGuiCol_Border,
+        ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2], pal.glassBorder[3]));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f * sc);
+    ImGui::BeginChild("##actcard", ImVec2(0, 0), ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+
+    // ---- header row: status glyph + tool icon + label + meta ----
+    drawStatusGlyph(a.status, ImGui::GetTextLineHeight());
+    ImGui::SameLine(0, 6 * sc);
+    ui::IconUV iv = ui::getIcon(stageIconName(a.stage, a.missionHeader), 20);
+    if (iv.valid) {
+        float gz = ImGui::GetTextLineHeight();
+        ImVec4 tint(pal.text[0], pal.text[1], pal.text[2], running ? 1.0f : 0.85f);
+        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, tint);
+        ImGui::SameLine(0, 6 * sc);
+    }
+    ImVec4 titleCol = running ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)
+                    : fail    ? ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1)
+                              : ImVec4(pal.text[0], pal.text[1], pal.text[2], 1);
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(titleCol, "%s", a.title.c_str());
+    ImGui::PopFont();
+
+    const bool hasDrawer = (step && (!step->thinking.empty() || !step->code.empty() ||
+                                     !step->diff.empty() || !step->contactSheet.empty())) ||
+                           !a.detail.empty();
+    if (hasDrawer) {
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
+        ImGui::SameLine(0, 6 * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::TextUnformatted(a.expanded ? "(hide)" : "(details)");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
+    }
+    if (a.durationMs > 0 || a.opsCount > 0) {
+        ImGui::SameLine(0, 8 * sc);
+        char meta[96];
+        if (a.opsCount > 0 && a.durationMs > 0)
+            std::snprintf(meta, sizeof(meta), "%d ops \xc2\xb7 %.1fs", a.opsCount, a.durationMs / 1000.0);
+        else if (a.durationMs > 0)
+            std::snprintf(meta, sizeof(meta), "%.1fs", a.durationMs / 1000.0);
+        else
+            std::snprintf(meta, sizeof(meta), "%d ops", a.opsCount);
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::TextUnformatted(meta);
+        ImGui::PopStyleColor();
+    }
+
+    // ---- result / notes line (folded into the card) ----
+    if (!a.reason.empty()) dimText(a.reason.c_str());
+    else if (step && !step->notes.empty()) dimText(step->notes.c_str());
+
+    // ---- expandable drawer ----
+    if (a.expanded && hasDrawer) {
+        if (step) {
+            if (!step->thinking.empty())
+                drawProseBox("##actthink", step->thinking, ui::metrics::copilotProseMaxH());
+            if (!step->code.empty())
+                drawCodeBox("##actcode", step->code, fonts.mono, ui::metrics::px(260.0f));
+            if (!step->diff.empty())
+                drawDiffBox("##actdiff", step->diff, fonts.mono, ui::metrics::copilotDiffMaxH());
+            if (!step->contactSheet.empty()) {
+                if (!step->triedThumb) { step->thumb = loadTexture(step->contactSheet); step->triedThumb = true; }
+                if (step->thumb.id) {
+                    float maxTw = ui::metrics::copilotThumbW();
+                    float tw = logW < maxTw ? logW : maxTw;
+                    float th = tw * (float)step->thumb.h / (float)step->thumb.w;
+                    ImGui::Image((ImTextureID)(intptr_t)step->thumb.id, ImVec2(tw, th));
+                }
+            }
+        } else if (!a.detail.empty()) {
+            drawProseBox("##actdetail", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
+        }
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+
+    // ---- error frame: a red border around the whole card ----
+    if (fail) {
+        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+        ImGui::GetWindowDrawList()->AddRect(mn, mx, ui::Palette::toU32(pal.statusErr),
+                                            8.0f * sc, 0, ui::metrics::stroke(1.5f));
+    }
+}
+
+// The agent timeline: dispatch each activity row to a thinking block or an action card, computing
+// the thinking auto-collapse (a thinking row collapses once a later stage reaches a verdict).
+static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bool showThinking) {
+    if (m.activity.empty()) return;
+    ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
     for (size_t i = 0; i < m.activity.size(); ++i) {
         ActivityItem& a = m.activity[i];
         ImGui::PushID((int)i);
-        const float lh = ImGui::GetTextLineHeight();
-        const float gw = lh;                       // status-glyph box width
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        const ImVec2 p0 = ImGui::GetCursorScreenPos();
-        const ImVec2 c(p0.x + gw * 0.5f, p0.y + lh * 0.5f);
-        const float r = lh * 0.30f;
-        const bool running = a.status == "running";
-        const bool pass    = a.status == "pass" || a.status == "done";
-        const bool retry   = a.status == "retry";
-        const bool fail    = a.status == "fail";
-        ImU32 col = ui::Palette::toU32(running || pass ? pal.accent
-                                       : retry ? pal.statusWarn
-                                       : fail  ? pal.statusErr : pal.textDim);
-        const float th = ui::metrics::stroke(1.6f);
-        if (running) {                              // spinning comet arc
-            float t = (float)ImGui::GetTime();
-            const int seg = 14;
-            for (int s = 0; s < seg; ++s) {
-                float f = (float)s / seg, aa = t * 6.0f + f * 6.2831853f;
-                float al = 0.12f + 0.88f * f;
-                ImU32 cc = (col & 0x00FFFFFFu) | ((ImU32)(al * 255) << 24);
-                dl->AddCircleFilled(ImVec2(c.x + std::cos(aa) * r, c.y + std::sin(aa) * r), th, cc);
+        if (isThinkingItem(a)) {
+            bool laterDone = false;
+            for (size_t j = i + 1; j < m.activity.size(); ++j) {
+                const std::string& s = m.activity[j].status;
+                if (s == "pass" || s == "done" || s == "fail" || s == "retry") { laterDone = true; break; }
             }
-        } else if (pass) {                          // check mark
-            dl->AddLine(ImVec2(c.x - r * 0.55f, c.y + r * 0.05f),
-                        ImVec2(c.x - r * 0.10f, c.y + r * 0.50f), col, th);
-            dl->AddLine(ImVec2(c.x - r * 0.10f, c.y + r * 0.50f),
-                        ImVec2(c.x + r * 0.60f, c.y - r * 0.50f), col, th);
-        } else if (fail) {                          // cross
-            dl->AddLine(ImVec2(c.x - r * 0.5f, c.y - r * 0.5f),
-                        ImVec2(c.x + r * 0.5f, c.y + r * 0.5f), col, th);
-            dl->AddLine(ImVec2(c.x - r * 0.5f, c.y + r * 0.5f),
-                        ImVec2(c.x + r * 0.5f, c.y - r * 0.5f), col, th);
-        } else if (retry) {
-            dl->AddCircle(c, r, col, 12, th);
+            drawThinkingBlock(a, fonts, showThinking, laterDone);
         } else {
-            dl->AddCircle(c, r * 0.8f, col, 12, th);  // pending hollow dot
+            drawActionCard(a, nullptr, fonts, logW);
         }
-        ImGui::Dummy(ImVec2(gw, lh));
-        ImGui::SameLine(0, 6 * sc);
-
-        const bool hasDetail = !a.detail.empty();
-        ImVec4 titleCol = running ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)
-                        : fail    ? ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1)
-                        : pass    ? ImVec4(pal.text[0], pal.text[1], pal.text[2], 1)
-                                  : ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1);
-        ImGui::PushFont(fonts.medium);
-        ImGui::TextColored(titleCol, "%s", a.title.c_str());
-        ImGui::PopFont();
-        if (hasDetail) {
-            if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-            if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
-            ImGui::SameLine(0, 6 * sc);
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-            ImGui::TextUnformatted(a.expanded ? "(hide)" : "(details)");
-            ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-            if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
-        }
-        if (a.durationMs > 0 || a.opsCount > 0) {
-            ImGui::SameLine(0, 8 * sc);
-            char meta[96];
-            if (a.opsCount > 0 && a.durationMs > 0)
-                std::snprintf(meta, sizeof(meta), "%d ops \xc2\xb7 %.1fs", a.opsCount, a.durationMs / 1000.0);
-            else if (a.durationMs > 0)
-                std::snprintf(meta, sizeof(meta), "%.1fs", a.durationMs / 1000.0);
-            else
-                std::snprintf(meta, sizeof(meta), "%d ops", a.opsCount);
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-            ImGui::TextUnformatted(meta);
-            ImGui::PopStyleColor();
-        }
-        // Which model ran (or is running) this stage — the transparency the user asked for.
-        if (!a.missionHeader) {
-            std::string mdl = shortModelName(stageModel(cfg, a.stage));
-            if (!mdl.empty()) {
-                ImGui::SameLine(0, 8 * sc);
-                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-                ImGui::Text("\xc2\xb7 %s", mdl.c_str());
-                ImGui::PopStyleColor();
-            }
-        }
-        if (!a.reason.empty()) {
-            ImGui::Indent(gw + 6 * sc);
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-            ImGui::TextWrapped("%s", a.reason.c_str());
-            ImGui::PopStyleColor();
-            ImGui::Unindent(gw + 6 * sc);
-        }
-        if (a.expanded && hasDetail) {
-            ImGui::Indent(gw + 6 * sc);
-            drawProseBox("##actdetail", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
-            ImGui::Unindent(gw + 6 * sc);
-        }
-        ImGui::Dummy(ImVec2(0, 3 * sc));
         ImGui::PopID();
     }
+}
+
+// One user turn: a right-aligned, markdown-stripped bubble (DESIGN.md §5 "User message" block).
+static void drawUserBlock(const ChatMsg& m, const ui::Fonts& fonts, float panelW) {
+    const auto& pal = ui::palette;
+    const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
+    // Right-align: indent ~22% of the panel so the bubble sits against the right edge.
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + panelW * 0.22f);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImVec4(pal.userBubbleBg[0], pal.userBubbleBg[1], pal.userBubbleBg[2], pal.userBubbleBg[3]));
+    ImGui::PushStyleColor(ImGuiCol_Border,
+        ImVec4(pal.userBubbleBorder[0], pal.userBubbleBorder[1],
+               pal.userBubbleBorder[2], pal.userBubbleBorder[3]));
+    ImGui::BeginChild("##umsg", ImVec2(0, 0), ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(accentCol, "You");
+    ImGui::PopFont();
+    ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
+    ImGui::EndChild();
+    ImGui::PopStyleColor(2);
+    ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
 }
 
 static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW) {
@@ -853,36 +1025,29 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     ImGui::TextColored(ImVec4(pal.assistantName[0], pal.assistantName[1],
                              pal.assistantName[2], 1), "Assistant");
     ImGui::PopFont();
-    if (m.plan.present) drawPlanCard(m.plan, fonts);
 
-    // Transparent activity timeline — what the AI is doing / thinking, inline + expandable.
-    drawActivityTimeline(m, fonts, st.settings);
+    // (1) Plan / todo block — a live checklist that ticks off as stages complete (DESIGN §5).
+    if (m.plan.present) drawPlanCard(m.plan, m.activity, fonts);
 
-    if (!m.text.empty()) {
-        if (m.errKind == ERR_SYSTEM)
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(pal.errSystem[0], pal.errSystem[1], pal.errSystem[2], 1));
-        else if (m.errKind == ERR_CAD)
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(pal.errCad[0], pal.errCad[1], pal.errCad[2], 1));
+    // (2) Agent timeline — typed blocks: collapsible thinking + glass action cards.
+    drawAgentTimeline(m, fonts, logW, gShowThinking);
+
+    // (3) Streaming assistant text — a normal markdown bubble (errors get their own card below).
+    if (!m.text.empty() && m.errKind == ERR_NONE)
         ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
-        if (m.errKind != ERR_NONE) ImGui::PopStyleColor();
-    }
 
-    // pre-flight clarify gate: the model's build-critical questions, awaiting the user.
+    // (4) Pre-flight clarify gate: the model's build-critical questions, awaiting the user.
     if (m.clarify.active) drawClarifyCard(st, m, fonts);
 
-    // iteration trace — one expandable card per pass of the agent loop
+    // (5) Legacy v1 AgentStep cards — kept for backward compat (glass-restyled in drawAgentStep).
     for (size_t si = 0; si < m.steps.size(); ++si) {
         ImGui::PushID((int)si);
         drawAgentStep(m.steps[si], fonts, logW);
         ImGui::PopID();
     }
 
+    // (6) Live spinner + model-transparency line + thin progress bar (while running).
     if (m.running) {
-        // Inline live status: a simple braille spinner + the current phase, then a thin
-        // accent progress bar so the pane reads as "working" at a glance. The transparent
-        // activity timeline above already shows the per-stage detail.
         ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
         static const char* kSpin[] = {"|", "/", "-", "\\"};
         int sp = (int)(ImGui::GetTime() * 8.0) & 3;
@@ -901,12 +1066,37 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             ImGui::TextWrapped("%s", line.c_str());
             ImGui::PopStyleColor();
         }
-        // thin animated accent progress bar
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ui::Palette::toU32(pal.accent));
         ImGui::PushStyleColor(ImGuiCol_FrameBg, ui::Palette::toU32(pal.accentSoft));
         float frac = 0.15f + 0.35f * (float)(0.5 + 0.5 * std::sin(ImGui::GetTime() * 2.2));
         ImGui::ProgressBar(frac, ImVec2(-1, 3.0f * ui::uiScale), "");
         ImGui::PopStyleColor(2);
+    } else {
+        // (7) Usage footer — tokens + wall-time for the finished turn, dim (DESIGN §5).
+        int tin = 0, tout = 0, tms = 0;
+        for (const auto& a : m.activity) { tin += a.tokensIn; tout += a.tokensOut; tms += a.durationMs; }
+        if (tin > 0) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+            ImGui::Text("%d tokens in / %d out \xc2\xb7 %.1f s", tin, tout, tms / 1000.0);
+            ImGui::PopStyleColor();
+        }
+    }
+
+    // (8) Error block — a distinct red-bordered card carrying the real reason (DESIGN §5).
+    if (m.errKind != ERR_NONE && !m.text.empty()) {
+        ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+            ImVec4(pal.blockActionBg[0], pal.blockActionBg[1], pal.blockActionBg[2], pal.blockActionBg[3]));
+        ImGui::BeginChild("##errcard", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY);
+        const float* ec = (m.errKind == ERR_SYSTEM) ? pal.errSystem : pal.errCad;
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ec[0], ec[1], ec[2], 1));
+        ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
+        ImGui::PopStyleColor();
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+        ImGui::GetWindowDrawList()->AddRect(mn, mx, ui::Palette::toU32(pal.statusErr),
+                                            8.0f * ui::uiScale, 0, ui::metrics::stroke(1.5f));
     }
 }
 
@@ -1795,8 +1985,8 @@ static void drawAISettingsBody(AppState& st, bool busy) {
     }
 }
 
-// The Settings dock tab — a sibling of the "AI" window (docked next to it). Hosts the same AI
-// settings body. SetNextWindowDockID pins it beside "AI" even on a saved layout; focusSettingsTab
+// The Settings dock tab — a sibling of the "Copilot" window (docked next to it). Hosts the same AI
+// settings body. SetNextWindowDockID pins it beside "Copilot" even on a saved layout; focusSettingsTab
 // (set by the composer gear / model-dropdown gear) brings it forward.
 void drawAISettingsTab(AppState& st, bool busy) {
     if (!st.showAIPanel) return;
@@ -2456,6 +2646,13 @@ static void drawComposerChips(AppState& st, bool busy) {
         ImGui::SetTooltip("Whether the AI plans and asks before modeling.");
     if (ImGui::BeginPopup("##runmode")) { drawRunModeMenu(st); ImGui::EndPopup(); }
 
+    // transparency chip — show/hide the AI's reasoning ("Thinking") blocks (DESIGN §5, default on).
+    ImGui::SameLine();
+    if (toggleChip(gShowThinking ? "Thoughts" : "Thoughts (off)", gShowThinking))
+        gShowThinking = !gShowThinking;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show or hide the AI's reasoning steps (like Claude Code verbose mode).");
+
     // Right edge of the left-hand chips on this row, in window-local cursor coords. The run-mode
     // chip wasn't followed by SameLine(), so the cursor has already wrapped to the next line —
     // GetCursorPosX() would report the left margin, not the chip edge. The chip width also varies
@@ -2726,10 +2923,8 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // throttled to ~5s and no-ops for a non-loopback (cloud) base_url, so this is cheap.
     refreshModelAvailability(st, false);
 
-    if (!ImGui::Begin("AI")) { ImGui::End(); return; }
+    if (!ImGui::Begin("Copilot")) { ImGui::End(); return; }
     ui::Fonts& fonts = st.fonts;
-    const auto& pal = ui::palette;
-    const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
 
     // Remember which dock node we live in so the sibling "Settings" tab can dock next to us.
     st.aiDockId = (unsigned int)ImGui::GetWindowDockID();
@@ -2759,22 +2954,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         ChatMsg& m = st.chat[mi];
         ImGui::PushID((int)mi);
         if (m.fromUser) {
-            // user turn: a soft accent-tinted bubble
-            ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                ImVec4(pal.userBubbleBg[0], pal.userBubbleBg[1],
-                       pal.userBubbleBg[2], pal.userBubbleBg[3]));
-            ImGui::PushStyleColor(ImGuiCol_Border,
-                ImVec4(pal.userBubbleBorder[0], pal.userBubbleBorder[1],
-                       pal.userBubbleBorder[2], pal.userBubbleBorder[3]));
-            ImGui::BeginChild("##umsg", ImVec2(0, 0),
-                              ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
-            ImGui::PushFont(fonts.medium);
-            ImGui::TextColored(accentCol, "You");
-            ImGui::PopFont();
-            ImGui::TextWrapped("%s", m.text.c_str());
-            ImGui::EndChild();
-            ImGui::PopStyleColor(2);
-            ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
+            drawUserBlock(m, fonts, logW);
             ImGui::PopID();
             continue;
         }
@@ -2782,7 +2962,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));
         ImGui::PopID();
     }
-    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 6) ImGui::SetScrollHereY(1.0f);
+    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12) ImGui::SetScrollHereY(1.0f);
     ImGui::EndChild();
     ImGui::PopStyleColor();
 

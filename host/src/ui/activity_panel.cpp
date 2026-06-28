@@ -382,7 +382,7 @@ void ActivityPanel::drawAttempt(AppState& st, AttemptNode& attempt, int idx) {
                 attempt.showRaw = !attempt.showRaw;
             if (attempt.showRaw) {
                 ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                    ImVec4(p.codeBg[0], p.codeBg[1], p.codeBg[2], p.codeBg[3]));
+                    ImVec4(p.blockActionBg[0], p.blockActionBg[1], p.blockActionBg[2], p.blockActionBg[3]));
                 float rawH = 140.0f;
                 ImGui::BeginChild(rawId, ImVec2(0, rawH), ImGuiChildFlags_Border,
                                   ImGuiWindowFlags_HorizontalScrollbar);
@@ -402,9 +402,10 @@ void ActivityPanel::drawStage(AppState& st, StageNode& stage, bool isActive, boo
     bool open = false;
     if (isActive && live) {
         // Pulsing chip on the active stage (accent color)
-        float alpha = 0.55f + 0.45f * std::sin(pulseT_ * 4.0f);
+        float pulse = 0.70f + 0.30f * std::sin(pulseT_ * 4.0f);
         ImGui::PushStyleColor(ImGuiCol_Header,
-            ImVec4(p.accent[0], p.accent[1], p.accent[2], alpha * 0.25f));
+            ImVec4(p.glassBg[0], p.glassBg[1], p.glassBg[2], p.glassBg[3] * pulse));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f * ui::uiScale);
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(p.accent[0], p.accent[1], p.accent[2], 1));
         char slbl[128];
@@ -413,6 +414,7 @@ void ActivityPanel::drawStage(AppState& st, StageNode& stage, bool isActive, boo
         open = ImGui::TreeNodeEx(slbl,
                    ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_DefaultOpen);
         ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar();
     } else {
         char slbl[128];
         std::snprintf(slbl, sizeof(slbl), "%s##st%p", stage.name.c_str(), (void*)&stage);

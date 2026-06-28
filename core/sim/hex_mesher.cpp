@@ -42,62 +42,69 @@ void fill_hex_quality(MeshOut& out, double dx, double dy, double dz) {
 
 }  // namespace
 
-MeshOut mesh_box_hex(const std::string& step_path, const MeshOptions& options) {
-    MeshOut out;
-    out.nodes_per_elem = 8;
+// See hex_mesher.h. Classifies a STEP solid as a mappable axis-aligned box and reports its
+// bbox dimensions. Used by mesh_box_hex (the gate before grid generation) and by the
+// Simple-mode auto-pick in mesher.cpp (to choose hex vs tet without duplicating OCCT reads).
+BoxGeomInfo detect_box_geometry(const std::string& step_path) {
+    BoxGeomInfo info;
 
-    // --- read the STEP -------------------------------------------------------------
     TopoDS_Shape shape;
     try {
         STEPControl_Reader reader;
         if (reader.ReadFile(step_path.c_str()) != IFSelect_RetDone) {
-            out.error = "hex: could not read STEP '" + step_path + "'";
-            return out;
+            info.error = "hex: could not read STEP '" + step_path + "'";
+            return info;
         }
         reader.TransferRoots();
         shape = reader.OneShape();
     } catch (const std::exception& e) {
-        out.error = std::string("hex: STEP read threw: ") + e.what();
-        return out;
+        info.error = std::string("hex: STEP read threw: ") + e.what();
+        return info;
     }
     if (shape.IsNull()) {
-        out.error = "hex: STEP produced no shape";
-        return out;
+        info.error = "hex: STEP produced no shape";
+        return info;
     }
 
-    // --- box detection: 6 faces, axis-aligned bbox from the vertices, volume match ---
+    // bbox from the vertices: exact for a true axis-aligned box (its 8 corners span the full
+    // extent). For a curved solid the vertex hull underestimates the extent, but such a solid
+    // is rejected by the face/volume checks below, so the dims are only trusted when is_box.
+    TopTools_IndexedMapOfShape verts;
+    TopExp::MapShapes(shape, TopAbs_VERTEX, verts);
+    if (verts.Extent() > 0) {
+        double xmin = std::numeric_limits<double>::infinity(), ymin = xmin, zmin = xmin;
+        double xmax = -xmin, ymax = -xmin, zmax = -xmin;
+        for (int i = 1; i <= verts.Extent(); ++i) {
+            const gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(verts(i)));
+            xmin = std::min(xmin, p.X()); xmax = std::max(xmax, p.X());
+            ymin = std::min(ymin, p.Y()); ymax = std::max(ymax, p.Y());
+            zmin = std::min(zmin, p.Z()); zmax = std::max(zmax, p.Z());
+        }
+        info.Lx = xmax - xmin;
+        info.Ly = ymax - ymin;
+        info.Lz = zmax - zmin;
+        info.diag = std::sqrt(info.Lx * info.Lx + info.Ly * info.Ly + info.Lz * info.Lz);
+    }
+
+    // box detection: exactly 6 faces, a real 3D extent, and an actual volume matching the
+    // axis-aligned bbox volume (a rotated/curved solid fills less than its bbox -> rejected).
     TopTools_IndexedMapOfShape faces;
     TopExp::MapShapes(shape, TopAbs_FACE, faces);
     if (faces.Extent() != 6) {
-        out.error =
+        info.error =
             "Hexahedral meshing needs a box/prismatic part (got " +
             std::to_string(faces.Extent()) + " faces); use Tetrahedral for this geometry.";
-        return out;
+        return info;
     }
-
-    TopTools_IndexedMapOfShape verts;
-    TopExp::MapShapes(shape, TopAbs_VERTEX, verts);
     if (verts.Extent() == 0) {
-        out.error = "Hexahedral meshing needs a box/prismatic part; use Tetrahedral.";
-        return out;
+        info.error = "Hexahedral meshing needs a box/prismatic part; use Tetrahedral.";
+        return info;
     }
-    double xmin = std::numeric_limits<double>::infinity(), ymin = xmin, zmin = xmin;
-    double xmax = -xmin, ymax = -xmin, zmax = -xmin;
-    for (int i = 1; i <= verts.Extent(); ++i) {
-        const gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(verts(i)));
-        xmin = std::min(xmin, p.X()); xmax = std::max(xmax, p.X());
-        ymin = std::min(ymin, p.Y()); ymax = std::max(ymax, p.Y());
-        zmin = std::min(zmin, p.Z()); zmax = std::max(zmax, p.Z());
-    }
-    const double Lx = xmax - xmin, Ly = ymax - ymin, Lz = zmax - zmin;
-    if (!(Lx > 1e-6 && Ly > 1e-6 && Lz > 1e-6)) {
-        out.error = "Hexahedral meshing needs a 3D box; this part is degenerate/planar.";
-        return out;
+    if (!(info.Lx > 1e-6 && info.Ly > 1e-6 && info.Lz > 1e-6)) {
+        info.error = "Hexahedral meshing needs a 3D box; this part is degenerate/planar.";
+        return info;
     }
 
-    // A rotated or non-prismatic solid fills less than its axis-aligned bbox: require the
-    // actual volume to match the bbox volume (so this is a true axis-aligned rectangular
-    // prism). A 45-degree-rotated box fails here and the caller falls back to tets.
     double vol = 0.0;
     try {
         GProp_GProps props;
@@ -106,12 +113,64 @@ MeshOut mesh_box_hex(const std::string& step_path, const MeshOptions& options) {
     } catch (...) {
         vol = 0.0;
     }
-    const double bbox_vol = Lx * Ly * Lz;
+    const double bbox_vol = info.Lx * info.Ly * info.Lz;
     if (vol <= 0.0 || std::abs(vol - bbox_vol) > 1e-3 * bbox_vol) {
-        out.error =
+        info.error =
             "Hexahedral meshing needs an axis-aligned box; this part isn't a rectangular "
             "prism (rotated/curved). Use Tetrahedral for this geometry.";
+        return info;
+    }
+
+    info.is_box = true;
+    return info;
+}
+
+MeshOut mesh_box_hex(const std::string& step_path, const MeshOptions& options) {
+    MeshOut out;
+    out.nodes_per_elem = 8;
+
+    // Classify first: detect_box_geometry runs the 6-face + volume/bbox check. If the part is
+    // not a mappable axis-aligned box, surface its error (the caller — mesh_step — falls back
+    // to tet meshing when options.fallback_to_tet is set).
+    const BoxGeomInfo info = detect_box_geometry(step_path);
+    if (!info.is_box) {
+        out.error = info.error;
         return out;
+    }
+    const double Lx = info.Lx, Ly = info.Ly, Lz = info.Lz;
+
+    // Recover the world-space bbox MIN corner for grid placement: the mesh must sit at the
+    // CAD part's actual position so FEA fixtures/loads resolve by node coordinate, and
+    // BoxGeomInfo carries only the dimensions. This STEP read is cheap and runs only on an
+    // explicit (or auto-picked) structured-hex request, never on the tet hot path.
+    double xmin = 0.0, ymin = 0.0, zmin = 0.0;
+    {
+        TopoDS_Shape shape;
+        try {
+            STEPControl_Reader reader;
+            if (reader.ReadFile(step_path.c_str()) != IFSelect_RetDone) {
+                out.error = "hex: could not read STEP '" + step_path + "'";
+                return out;
+            }
+            reader.TransferRoots();
+            shape = reader.OneShape();
+        } catch (const std::exception& e) {
+            out.error = std::string("hex: STEP read threw: ") + e.what();
+            return out;
+        }
+        if (shape.IsNull()) {
+            out.error = "hex: STEP produced no shape";
+            return out;
+        }
+        TopTools_IndexedMapOfShape verts;
+        TopExp::MapShapes(shape, TopAbs_VERTEX, verts);
+        xmin = ymin = zmin = std::numeric_limits<double>::infinity();
+        for (int i = 1; i <= verts.Extent(); ++i) {
+            const gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(verts(i)));
+            xmin = std::min(xmin, p.X());
+            ymin = std::min(ymin, p.Y());
+            zmin = std::min(zmin, p.Z());
+        }
     }
 
     // --- grid sizing (same fineness model as the tet mesher) -------------------------
@@ -170,6 +229,7 @@ MeshOut mesh_box_hex(const std::string& step_path, const MeshOptions& options) {
     out.n_nodes = static_cast<int>(out.points.size() / 3);
     out.n_elems = static_cast<int>(out.tets.size() / 8);
     fill_hex_quality(out, dx, dy, dz);
+    out.mesh_type_used = "hex8";
     out.ok = true;
     return out;
 }

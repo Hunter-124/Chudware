@@ -1662,9 +1662,13 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             // Curvature-adaptive tet mesher (wraps Netgen / nglib). Params:
             //   {"step_path", "fineness"(0..1)|"density"(legacy), "order"|"mesh_order",
             //    "curvature"(bool), "curv_elems_per_circle", "target_size_mm",
-            //    "min_size_mm", "max_size_mm", "optimize"(bool), "algorithm3d"}.
-            // Returns points[n*3], tets[m*K] (0-based), counts, and quality metrics
-            // (aspect min/avg/max, jacobian_min, pct_poor, aspect_hist) for the GUI.
+            //    "min_size_mm", "max_size_mm", "optimize"(bool), "algorithm3d",
+            //    "structured"|"mesh_type"=="hex", "auto_type"(bool, Simple-mode geometry
+            //    pick), "quad_surface"(bool, quad-dominated surface), "fallback_to_tet"(bool,
+            //    default true), "thin_wall_layers"(double)}.
+            // Returns points[n*3], tets[m*K] (0-based), counts, quality metrics (aspect
+            // min/avg/max, jacobian_min, pct_poor, aspect_hist), plus mesh_type_used + note
+            // (the element type actually produced and any auto-pick/fallback decision) for the GUI.
             std::string step_path = params.contains("step_path") && params["step_path"].is_string()
                                         ? params["step_path"].get<std::string>()
                                         : std::string();
@@ -1683,6 +1687,10 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             opts.algorithm3d = params.value("algorithm3d", 1);
             opts.structured = params.value(
                 "structured", params.value("mesh_type", std::string()) == "hex");
+            opts.auto_type = params.value("auto_type", false);
+            opts.quad_surface = params.value("quad_surface", false);
+            opts.fallback_to_tet = params.value("fallback_to_tet", true);
+            opts.thin_wall_layers = params.value("thin_wall_layers", 4.0);
             aicad::sim::MeshOut r = aicad::sim::mesh_step(step_path, opts);
             if (!r.ok) return emit(json{{"ok", false}, {"error", r.error}}, out_json, 0);
             return emit(json{{"ok", true},
@@ -1699,7 +1707,9 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                              {"aspect_max", r.aspect_max},
                              {"jacobian_min", r.jacobian_min},
                              {"pct_poor", r.pct_poor},
-                             {"aspect_hist", r.aspect_hist}},
+                             {"aspect_hist", r.aspect_hist},
+                             {"mesh_type_used", r.mesh_type_used},
+                             {"note", r.note}},
                         out_json, 0);
         }
         if (m == "sim_run_static") {
@@ -1739,6 +1749,10 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                         opts.algorithm3d = study.value("algorithm3d", 1);
                         opts.structured = study.value(
                             "structured", study.value("mesh_type", std::string()) == "hex");
+                        opts.auto_type = study.value("auto_type", false);
+                        opts.quad_surface = study.value("quad_surface", false);
+                        opts.fallback_to_tet = study.value("fallback_to_tet", true);
+                        opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
                         aicad::sim::MeshOut mo = aicad::sim::mesh_step(step_path, opts);
                         if (mo.ok) {
                             vol = mo.points;
@@ -1812,6 +1826,10 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                         opts.max_size_mm = study.value("max_size_mm", 0.0);
                         opts.optimize = study.value("optimize", true);
                         opts.algorithm3d = study.value("algorithm3d", 1);
+                        opts.auto_type = study.value("auto_type", false);
+                        opts.quad_surface = study.value("quad_surface", false);
+                        opts.fallback_to_tet = study.value("fallback_to_tet", true);
+                        opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
                         aicad::sim::MeshOut mo = aicad::sim::mesh_step(step_path, opts);
                         if (mo.ok) {
                             vol = mo.points;

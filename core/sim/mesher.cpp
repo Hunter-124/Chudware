@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <filesystem>
 #include <mutex>
 #include <limits>
@@ -261,21 +262,20 @@ std::string heal_step_for_mesh(const std::string& step_path) {
 
 }  // namespace
 
-// The Netgen meshing core (defined below); the public mesh_step wraps it with the heal-and-retry
-// fallback for fused-primitive geometry (Issue 6).
+// The Netgen meshing core (defined below); the public mesh_step wraps it with the
+// heal-and-retry fallback for fused-primitive geometry (Issue 6), the structured-hex ->
+// tet fallback, the quad-surface -> tet fallback, and the Simple-mode auto-pick.
 MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& options);
 
-MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
-    // Structured hexahedral request: delegate to the OCCT box-grid mesher (no Netgen).
-    if (options.structured) return mesh_box_hex(step_path, options);
+namespace {
 
+// Unstructured tet meshing with the heal-and-retry fallback (Issue 6): if the raw geometry
+// defeats the volume mesher (coincident coplanar faces / sliver edges on a fused-primitive
+// part), heal the STEP and retry ONCE before reporting failure. Clean geometry never pays
+// the cost — the heal only runs after a real miss.
+MeshOut mesh_tet_healed(const std::string& step_path, const MeshOptions& options) {
     MeshOut out = mesh_step_netgen(step_path, options);
     if (out.ok) return out;
-
-    // Robust-fallback meshing (Issue 6): the mesher failed on the raw geometry — almost always
-    // a fused-primitive part whose coincident coplanar faces / sliver edges defeat tet
-    // generation. Heal the shape and retry ONCE on the healed STEP before reporting failure.
-    // The common (clean-geometry) path never pays this cost: it only runs after a real miss.
     std::string healed = heal_step_for_mesh(step_path);
     if (!healed.empty() && healed != step_path) {
         MeshOut out2 = mesh_step_netgen(healed, options);
@@ -284,6 +284,151 @@ MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
         if (out2.ok) return out2;
     }
     return out;  // surface the original mesher error
+}
+
+// quad_surface is a SURFACE-meshing HINT (Netgen mp.quad_dominated): it asks for a
+// quad-dominated surface mesh while the VOLUME stays tetrahedral. On this Netgen build
+// (6.2.2504 / nglib) a quad-dominated surface can leave the volume mesher with "open quads"
+// and FAIL to close the volume — even on a trivial box. A surface hint must never break the
+// volume mesh, so when a quad_surface request yields no valid tet volume, retry ONCE without
+// quad-dominance and annotate the degradation. Non-quad requests take the first attempt
+// verbatim (no extra cost, identical behavior).
+MeshOut mesh_tet_quad_aware(const std::string& step_path, const MeshOptions& options) {
+    MeshOut out = mesh_tet_healed(step_path, options);
+    if (out.ok || !options.quad_surface) return out;
+
+    // The quad-dominated surface defeated the volume mesher; fall back to a plain tet volume.
+    MeshOptions tet_opts = options;
+    tet_opts.quad_surface = false;
+    MeshOut fb = mesh_tet_healed(step_path, tet_opts);
+    if (!fb.ok) return out;  // even plain tet failed -> surface the ORIGINAL quad error
+
+    // A valid tet volume was produced, but the requested quad surface was unavailable here.
+    fb.mesh_type_used = (options.order == 2) ? "tet10-quad-surface-fallback"
+                                             : "tet4-quad-surface-fallback";
+    const std::string fbnote =
+        "quad_surface requested but Netgen's volume mesher rejected the quad-dominated "
+        "surface (open quads); fell back to a tetrahedral volume mesh";
+    fb.note = fb.note.empty() ? fbnote : (fbnote + "; " + fb.note);
+    return fb;
+}
+
+// Simple-mode auto-pick: classify the geometry and choose the element type + sizing.
+//   • axis-aligned box     -> structured hex8.
+//   • thin-wall part       -> tet, sized for ~thin_wall_layers elements through the smallest
+//                             dimension (else a thin part gets one element through its
+//                             thickness, which is FEA-inaccurate).
+//   • general curved solid -> tet with curvature-adaptive refinement.
+// Returns the effective MeshOptions; `note` describes the decision (for MeshOut::note).
+MeshOptions pick_options_for_geometry(const std::string& step_path, const MeshOptions& base,
+                                      std::string& note) {
+    MeshOptions opts = base;
+    const BoxGeomInfo info = detect_box_geometry(step_path);
+    if (info.is_box) {
+        opts.structured = true;
+        note = "auto-pick: axis-aligned box -> hex8";
+        return opts;
+    }
+    // Non-box: tetrahedral. A box's vertex bbox is exact, but a curved solid needs a real
+    // Bnd_Box to bound it — read the actual bbox here to drive the thin-wall sizing decision.
+    opts.structured = false;
+    opts.curvature = true;
+    double dx = 0.0, dy = 0.0, dz = 0.0;
+    try {
+        STEPControl_Reader rd;
+        if (rd.ReadFile(step_path.c_str()) == IFSelect_RetDone) {
+            rd.TransferRoots();
+            TopoDS_Shape shape = rd.OneShape();
+            if (!shape.IsNull()) {
+                Bnd_Box bb;
+                BRepBndLib::Add(shape, bb);
+                if (!bb.IsVoid()) {
+                    double xmin, ymin, zmin, xmax, ymax, zmax;
+                    bb.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+                    dx = std::fabs(xmax - xmin);
+                    dy = std::fabs(ymax - ymin);
+                    dz = std::fabs(zmax - zmin);
+                }
+            }
+        }
+    } catch (...) {
+        dx = dy = dz = 0.0;
+    }
+    const double diag = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const double min_side = std::min({dx, dy, dz});
+    // Thin-wall heuristic: the smallest dimension is a small fraction of the diagonal (a
+    // plate / shell / thin disc). diag/6 is a tunable threshold.
+    constexpr double kThinWallRatio = 1.0 / 6.0;
+    if (diag > 0.0 && min_side > 0.0 && min_side < diag * kThinWallRatio) {
+        const double layers = (base.thin_wall_layers > 0.0) ? base.thin_wall_layers : 4.0;
+        // Size so ~`layers` tet layers span the smallest dimension. Set max == target so the
+        // through-thickness sizing isn't coarsened away (mesh_step_netgen maps max_size_mm
+        // onto Netgen's maxh); min allows a little local refinement.
+        opts.target_size_mm = min_side / layers;
+        opts.min_size_mm = min_side / (2.0 * layers);
+        opts.max_size_mm = min_side / layers;
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "auto-pick: thin-wall (min_side/diag=%.3f), sized for %d tet layers",
+                      min_side / diag, static_cast<int>(layers));
+        note = buf;
+        return opts;
+    }
+    note = "auto-pick: general solid -> tet";
+    return opts;
+}
+
+}  // namespace
+
+MeshOut mesh_step(const std::string& step_path, const MeshOptions& options) {
+    // (3) Auto-pick (Simple mode): classify the geometry and resolve concrete options before
+    // dispatching. Gated behind auto_type so existing callers are unaffected.
+    MeshOptions eff = options;
+    std::string auto_note;
+    const bool auto_picked = options.auto_type;
+    if (auto_picked) {
+        eff = pick_options_for_geometry(step_path, options, auto_note);
+        eff.auto_type = false;  // resolved to concrete options; never re-enter auto-pick
+    }
+
+    if (eff.structured) {
+        // Structured hexahedral: delegate to the OCCT box-grid mesher (no Netgen).
+        MeshOut hx = mesh_box_hex(step_path, eff);
+        if (hx.ok) {
+            if (auto_picked) {
+                hx.mesh_type_used = "hex8-autopick";
+                hx.note = auto_note;
+            }
+            return hx;
+        }
+        // (1) Structured hex failed — the part is not a mappable axis-aligned box. With
+        // fallback_to_tet (the default) fall back to tet meshing and annotate, instead of the
+        // post-gmsh hard failure. Set fallback_to_tet=false to require hex and surface the
+        // original box error unchanged.
+        if (eff.fallback_to_tet) {
+            MeshOptions tet_opts = eff;
+            tet_opts.structured = false;
+            MeshOut to = mesh_tet_quad_aware(step_path, tet_opts);
+            if (to.ok) {
+                to.mesh_type_used = (eff.order == 2) ? "tet10-fallback" : "tet4-fallback";
+                to.note = "structured hex not applicable, tet fallback used: " + hx.error;
+            }
+            return to;
+        }
+        return hx;  // fallback disabled: surface the original box error unchanged
+    }
+
+    // Unstructured tetrahedral path (with heal-and-retry).
+    MeshOut out = mesh_tet_quad_aware(step_path, eff);
+    if (auto_picked && out.ok) {
+        // mesh_step_netgen set mesh_type_used to tet4/tet10; relabel as the auto-pick variant
+        // (thin-wall sizing vs. a general-solid pick) and surface the decision note.
+        const bool thin = auto_note.find("thin-wall") != std::string::npos;
+        const std::string tet = (eff.order == 2) ? "tet10" : "tet4";
+        out.mesh_type_used = tet + (thin ? "-thinwall" : "-autopick");
+        out.note = out.note.empty() ? auto_note : (auto_note + "; " + out.note);
+    }
+    return out;
 }
 
 // RAII holder so the Netgen mesh + OCC geometry are freed on EVERY exit path (including the
@@ -425,6 +570,10 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
         mp.optsteps_2d = options.optimize ? 3 : 0;
         mp.optsteps_3d = options.optimize ? 3 : 0;
         mp.closeedgeenable = 0;
+        // Quad-dominated SURFACE mesh (exotic type): the VOLUME stays tetrahedral, but Netgen
+        // lays a quad/quad8 surface mesh. Off by default. The quad->tet transition can
+        // introduce pyramids, which the volume-element extraction below splits into tets.
+        mp.quad_dominated = options.quad_surface ? 1 : 0;
         // NOTE: options.algorithm3d (gmsh Mesh.Algorithm3D: Delaunay/HXT) has no Netgen
         // equivalent — Netgen uses its Delaunay + advancing-front mesher unconditionally —
         // so the field is accepted for API compatibility but intentionally not mapped.
@@ -478,7 +627,45 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
         }
     }
 
-    if (!any_tet) {
+    // Second pass — exotic volume elements: Netgen can emit PYRAMID (5-node) and PRISM
+    // (6-node) elements in boundary-layer / quad-dominated-surface / degenerate contexts.
+    // fea_static accepts only 4/10/8-node elements, so rather than silently dropping these
+    // (the prior behavior — a partly pyramid/prism mesh then failed with "no tet elements"),
+    // split each into tet4s and append. Only the tet4 path absorbs them: the split yields
+    // 4-node tets that share the stride of a tet4 array. (In a second-order mesh Netgen
+    // elevates these to quadratic forms its own Ng_GetVolumeElement reports as the default
+    // NG_TET, so they never surface here as NG_PYRAMID/NG_PRISM.)
+    bool any_split = false;
+    if (!order2) {
+        // Netgen local node order (libsrc/meshing/topology.cpp reference points):
+        //   pyramid: base quad {0,1,2,3} CCW, apex 4 -> 2 tets via the 0-2 base diagonal.
+        //   prism:   bottom tri {0,1,2}, top tri {3,4,5} (i+3 above i) -> 3 tets.
+        static const int kPyr[2][4] = {{0, 1, 2, 4}, {0, 2, 3, 4}};
+        static const int kPrism[3][4] = {{0, 1, 2, 3}, {1, 2, 3, 4}, {2, 3, 4, 5}};
+        auto append_split = [&](const int* loc, const int* t) {
+            const int a = loc[t[0]] - 1, b = loc[t[1]] - 1, c = loc[t[2]] - 1, d = loc[t[3]] - 1;
+            // Skip a degenerate split (sliver / mis-ordered source) rather than hand FEA an
+            // inverted or zero-volume tet; |6V| <= 0 flags it.
+            if (std::abs(tet_volume6(out.points, a, b, c, d)) <= 0.0) return;
+            out.tets.push_back(a);
+            out.tets.push_back(b);
+            out.tets.push_back(c);
+            out.tets.push_back(d);
+            any_split = true;
+        };
+        for (int e = 1; e <= ne; ++e) {
+            const auto et = nglib::Ng_GetVolumeElement(sess.mesh, e, pi);
+            if (et == nglib::NG_PYRAMID) {
+                for (const auto& t : kPyr) append_split(pi, t);
+            } else if (et == nglib::NG_PRISM) {
+                for (const auto& t : kPrism) append_split(pi, t);
+            }
+        }
+        if (any_split)
+            out.note = "split Netgen pyramid/prism volume elements into tets";
+    }
+
+    if (!any_tet && !any_split) {
         out.ok = false;
         out.error = std::string("netgen produced no ") + (order2 ? "tet10" : "tet4") +
                     " elements for '" + step_path +
@@ -489,6 +676,8 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
     out.char_len_mm = base;
     out.n_nodes = static_cast<int>(out.points.size() / 3);
     out.n_elems = static_cast<int>(out.tets.size() / npe);
+    out.mesh_type_used = order2 ? (options.quad_surface ? "tet10-quad-surface" : "tet10")
+                                : (options.quad_surface ? "tet4-quad-surface" : "tet4");
     fill_quality(out);
     out.ok = true;
     return out;

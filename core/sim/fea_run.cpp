@@ -83,8 +83,11 @@ bool faceset_normal(const json& fs, std::array<double, 3>& face_normal, double& 
 // from study["nodes_per_elem"] (default 4); for a STEP mesh it follows the chosen
 // mesh_order (study["mesh_order"], default 1).
 bool resolve_mesh(const json& study, std::vector<double>& points, std::vector<int>& tets,
-                  int& nodes_per_elem, std::string& err) {
+                  int& nodes_per_elem, std::string& mesh_type_used, std::string& note,
+                  std::string& err) {
     nodes_per_elem = 4;
+    mesh_type_used.clear();
+    note.clear();
     // A present step_path ALWAYS re-meshes with the current options. Inline points/tets
     // are only used as a fallback when there is no step_path, so a cached/stale inline
     // mesh can never silently override the GUI mesh controls.
@@ -117,6 +120,12 @@ bool resolve_mesh(const json& study, std::vector<double>& points, std::vector<in
         opts.optimize = study.value("optimize", true);
         opts.algorithm3d = study.value("algorithm3d", 1);
         opts.structured = study.value("structured", study.value("mesh_type", std::string()) == "hex");
+        // Exotic-type + auto-pick controls (Simple/Advanced mode). Defaults preserve existing
+        // behavior: auto_type off; structured-hex falls back to tet on a non-box part.
+        opts.auto_type = study.value("auto_type", false);
+        opts.quad_surface = study.value("quad_surface", false);
+        opts.fallback_to_tet = study.value("fallback_to_tet", true);
+        opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
         MeshOut m = mesh_step(step_path, opts);
         if (!m.ok) {
             err = "mesh failed: " + m.error;
@@ -125,6 +134,8 @@ bool resolve_mesh(const json& study, std::vector<double>& points, std::vector<in
         points = m.points;
         tets = m.tets;
         nodes_per_elem = m.nodes_per_elem;
+        mesh_type_used = m.mesh_type_used;
+        note = m.note;
         return true;
     }
     err = "study must have inline points/tets or a step_path";
@@ -321,8 +332,9 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     std::vector<double> points;
     std::vector<int> tets;
     int nodes_per_elem = 4;
+    std::string mesh_type_used, mesh_note;
     std::string err;
-    if (!resolve_mesh(study, points, tets, nodes_per_elem, err))
+    if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used, mesh_note, err))
         return json{{"ok", false}, {"error", err}};
 
     const int n_nodes = static_cast<int>(points.size() / 3);
@@ -334,6 +346,7 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
     const double yield_mpa = material.value("yield_mpa", 250.0);
 
     std::vector<std::string> notes;
+    if (!mesh_note.empty()) notes.push_back("mesh: " + mesh_note);
 
     // ── Force vector (replicate run_static's load loop EXACTLY) ──────────────
     std::vector<double> nodal_forces(static_cast<size_t>(n_dof), 0.0);
@@ -502,6 +515,7 @@ nlohmann::json fea_run_static(const nlohmann::json& study) {
                 {"n_dof", r.n_dof},
                 {"n_nodes", r.n_nodes},
                 {"n_elems", r.n_elems},
+                {"mesh_type_used", mesh_type_used},
                 {"summary",
                  {{"max_von_mises_mpa", round_nd(r.max_von_mises_mpa, 4)},
                   {"max_disp_mm", round_nd(r.max_disp_mm, 6)},
@@ -521,6 +535,7 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     std::vector<double> points;
     std::vector<int> tets;
     int nodes_per_elem = 4;
+    std::string mesh_type_used, mesh_note;
     std::string err;
     std::vector<std::string> notes;
     // Modal now solves with 2nd-order (tet10) elements by default — the quadratic stiffness
@@ -532,10 +547,11 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
     modal_study["mesh_order"] = want_order;
     if (modal_study.contains("nodes_per_elem"))
         modal_study["nodes_per_elem"] = (want_order == 2) ? 10 : 4;
-    if (!resolve_mesh(modal_study, points, tets, nodes_per_elem, err))
+    if (!resolve_mesh(modal_study, points, tets, nodes_per_elem, mesh_type_used, mesh_note, err))
         return json{{"ok", false}, {"error", err}};
     notes.push_back(nodes_per_elem == 10 ? "modal uses 2nd-order (tet10) elements"
                                          : "modal uses 1st-order (tet4) elements");
+    if (!mesh_note.empty()) notes.push_back("mesh: " + mesh_note);
 
     const json material = study.value("material", json::object());
     const double E_mpa = material.value("E_mpa", 0.0);
@@ -569,6 +585,7 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
                 {"n_modes", r.n_modes},
                 {"n_nodes", r.n_nodes},
                 {"n_dof", r.n_dof},
+                {"mesh_type_used", mesh_type_used},
                 {"solver_notes", notes}};
 }
 

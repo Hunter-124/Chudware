@@ -253,6 +253,14 @@ set_target_properties(test_drag PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME drag COMMAND test_drag)
 
+add_executable(test_freecad_parity
+  tests/test_freecad_parity.cpp)
+target_include_directories(test_freecad_parity PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_freecad_parity PRIVATE aicad_sketch)
+set_target_properties(test_freecad_parity PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME freecad_parity COMMAND test_freecad_parity)
+
 add_executable(test_plane
   tests/test_plane.cpp)
 target_include_directories(test_plane PRIVATE ${doctest_SOURCE_DIR})
@@ -562,6 +570,17 @@ if(AICAD_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME netgen_mesh COMMAND test_netgen_mesh)
   set_tests_properties(netgen_mesh PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
+
+  # Mesher auto-pick + exotic-type regression: structured-hex fallback to tet on non-box,
+  # auto_type hex/tet selection, thin-wall layering, quad_surface, detect_box_geometry.
+  add_executable(test_mesher_autopick tests/test_mesher_autopick.cpp)
+  target_include_directories(test_mesher_autopick PRIVATE
+    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_mesher_autopick PRIVATE aicad_mesh aicad_geom_occt)
+  set_target_properties(test_mesher_autopick PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME mesher_autopick COMMAND test_mesher_autopick)
+  set_tests_properties(mesher_autopick PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
   endif()  # AICAD_WITH_NETGEN
 
   # FEA boundary-surface extractor: fea_surface_body (the result-plot display surface,

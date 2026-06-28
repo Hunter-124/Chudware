@@ -15,6 +15,20 @@
 
 namespace aicad::sim {
 
+// Cheap geometry classification shared by the structured-hex path and the Simple-mode
+// auto-pick in mesher.cpp. Reads the STEP and reports whether the solid is a mappable
+// axis-aligned rectangular prism, plus its bbox dimensions. is_box is true only when the
+// part has exactly 6 faces AND its actual volume matches the axis-aligned bbox volume (so a
+// rotated or curved solid is rejected). Lx/Ly/Lz/diag are the vertex-bbox extents (exact for
+// a true box; for a non-box prefer a real Bnd_Box). error is set when is_box is false.
+// Never throws.
+struct BoxGeomInfo {
+    bool is_box = false;
+    double Lx = 0.0, Ly = 0.0, Lz = 0.0, diag = 0.0;
+    std::string error;
+};
+BoxGeomInfo detect_box_geometry(const std::string& step_path);
+
 // Mesh an axis-aligned box/rectangular-prism STEP into a regular grid of hex8 elements.
 // Sizing follows the same fineness model as the tet mesher (base from the bbox diagonal,
 // or an explicit target_size_mm). Returns MeshOut with nodes_per_elem==8 and the quality

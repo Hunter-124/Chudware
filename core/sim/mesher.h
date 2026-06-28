@@ -44,6 +44,18 @@ struct MeshOut {
     double pct_poor = 0.0;       // % of elements with aspect_ratio > kPoorAspect (10)
     std::vector<int> aspect_hist;  // 10 buckets over aspect in [1, kPoorAspect]+overflow
 
+    // --- Exotic-type + auto-pick annotations (filled on every successful path) ---
+    // The concrete element type actually produced, so a caller can tell hex from tet and
+    // surface an auto-pick / fallback decision. One of: 'tet4', 'tet10', 'hex8',
+    // 'tet4-autopick', 'hex8-autopick', 'tet4-thinwall', 'tet4-fallback', 'tet10-fallback',
+    // 'tet4-quad-surface', 'tet10-quad-surface', 'tet4-quad-surface-fallback',
+    // 'tet10-quad-surface-fallback'.
+    std::string mesh_type_used;
+    // Non-fatal informational note: empty unless a fallback or auto-pick decision was made,
+    // e.g. 'auto-pick: axis-aligned box -> hex8' or 'structured hex not applicable: ...,
+    // fell back to tet'. Surfaced by the simulation UI alongside the mesh.
+    std::string note;
+
     bool ok = false;
     std::string error;  // non-empty when ok==false
 };
@@ -76,6 +88,27 @@ struct MeshOptions {
     // which produces a regular nx*ny*nz grid of 8-node hexes for a box/rectangular-prism
     // part (nodes_per_elem==8). Non-mappable geometry returns ok=false with a message.
     bool structured = false;
+
+    // --- Simple-mode auto-pick + exotic surface meshing (geometry-adaptive) ---
+    // auto_type: classify the geometry (box / curved / thin-wall) and choose the element
+    // type + sizing automatically (Simple mode). When set, mesh_step resolves effective
+    // options via pick_options_for_geometry before dispatching.
+    bool auto_type = false;
+    // quad_surface: quad-dominated SURFACE mesh (Netgen mp.quad_dominated=1); the VOLUME
+    // stays tetrahedral. Surface elements are not consumed by the FEA solvers, so this only
+    // affects the surface topology (and the pyramids Netgen inserts at the quad->tet
+    // transition, which the mesher splits to tets).
+    // If the quad-dominated surface defeats Netgen's volume mesher (open quads on this build),
+    // the mesh automatically falls back to a plain tet volume (mesh_type_used
+    // '...-quad-surface-fallback', note set) — the surface hint never breaks the volume mesh.
+    bool quad_surface = false;
+    // fallback_to_tet: when structured==true fails on a non-box part, fall back to tet
+    // meshing and annotate (mesh_type_used='tet4-fallback', note set) instead of hard-failing
+    // as the post-gmsh path did. Set false to require hex and surface the original box error.
+    bool fallback_to_tet = true;
+    // thin_wall_layers: auto-pick target for the number of tet layers through the smallest
+    // bbox dimension of a thin-wall part (drives the element-size formula).
+    double thin_wall_layers = 4.0;
 };
 
 // Aspect-ratio threshold above which an element is counted "poor" (SolidWorks-style).

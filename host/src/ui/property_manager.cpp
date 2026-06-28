@@ -2105,8 +2105,15 @@ void PropertyManager::draw(AppState& st) {
                                  ImGuiCond_Appearing);
         ImGui::SetNextWindowPos(ImVec2(80.0f * ui::uiScale, 80.0f * ui::uiScale),
                                 ImGuiCond_Appearing);
-        if (!ImGui::Begin("##PMFloating", nullptr,
-                          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav)) {
+        // Frosted-glass fill so the floating PropertyManager fallback joins the app-wide glass
+        // family (the docked FeatureManager keeps its solid panel chrome).
+        ImGui::PushStyleColor(ImGuiCol_WindowBg,
+            ImVec4(ui::palette.glassBg[0], ui::palette.glassBg[1],
+                   ui::palette.glassBg[2], ui::palette.glassBg[3]));
+        const bool pmFloat = ImGui::Begin("##PMFloating", nullptr,
+                          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav);
+        ImGui::PopStyleColor();
+        if (!pmFloat) {
             ImGui::End(); return;
         }
     }
@@ -2332,10 +2339,13 @@ void PropertyManager::drawBody(AppState& st) {
                                     ImVec2(9.0f * ui::uiScale, 8.0f * ui::uiScale));
                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                                     ImVec2(7.0f * ui::uiScale, 7.0f * ui::uiScale));
+                // PM group cards adopt the frosted-glass roles so each form section reads as a
+                // floating glass card (translucent glassBg lets the panel bleed through subtly).
                 ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                    ImVec4(pal.panelBg[0], pal.panelBg[1], pal.panelBg[2], 1));
+                    ImVec4(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], pal.glassBg[3]));
                 ImGui::PushStyleColor(ImGuiCol_Border,
-                    ImVec4(pal.border[0], pal.border[1], pal.border[2], 0.85f));
+                    ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2],
+                           pal.glassBorder[3]));
                 ImGui::BeginChild("##pm_group_card", ImVec2(0, 0),
                                   ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY |
                                   ImGuiChildFlags_AlwaysUseWindowPadding);

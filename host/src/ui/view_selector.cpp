@@ -340,7 +340,6 @@ void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
     const ImU32 edgeDim    = ui::Palette::toU32(edgeDimF);
     const ImU32 hoverFill  = ui::Palette::toU32(pal.accentSoft);
     const ImU32 hoverLine  = ui::Palette::toU32(pal.accent);
-    const ImU32 overlayBg   = ui::Palette::toU32(pal.overlayBg);
     const ImU32 overlayBord = ui::Palette::toU32(pal.overlayBorder);
     const ImU32 overlayTxt  = ui::Palette::toU32(pal.overlayText);
 
@@ -381,8 +380,7 @@ void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
         ImVec2 cp(io.MousePos.x + 14.0f * s, io.MousePos.y + 14.0f * s);
         if (cp.x + ts.x + 12 * s > vr1.x) cp.x = vr1.x - ts.x - 12 * s;
         if (cp.y + ts.y + 8 * s  > vr1.y) cp.y = vr1.y - ts.y - 8 * s;
-        dl->AddRectFilled(cp, ImVec2(cp.x + ts.x + 12 * s, cp.y + ts.y + 8 * s), overlayBg, 4.0f * s);
-        dl->AddRect(cp, ImVec2(cp.x + ts.x + 12 * s, cp.y + ts.y + 8 * s), overlayBord, 4.0f * s);
+        ui::glassBackground(dl, cp, ImVec2(cp.x + ts.x + 12 * s, cp.y + ts.y + 8 * s), 4.0f);
         dl->AddText(ImVec2(cp.x + 6 * s, cp.y + 4 * s), overlayTxt, cap);
     }
 
@@ -410,8 +408,7 @@ void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
             ImVec2 p0(px0, py0), p1(px0 + panelW, py0 + panelH);
 
             // Panel chrome (theme overlay roles).
-            dl->AddRectFilled(p0, p1, overlayBg, 6.0f * s);
-            dl->AddRect(p0, p1, overlayBord, 6.0f * s);
+            ui::glassBackground(dl, p0, p1, 6.0f);
 
             // Thumbnail image. GL texture origin is bottom-left -> flip V (uv0.y=1, uv1.y=0).
             ImVec2 i0(p0.x + pad, p0.y + pad);
@@ -432,8 +429,7 @@ void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
         float w = ts.x + 22.0f * s, hh = ts.y + 12.0f * s;
         ImVec2 p0((vr0.x + vr1.x) * 0.5f - w * 0.5f, vr1.y - hh - 16.0f * s);
         ImVec2 p1(p0.x + w, p0.y + hh);
-        dl->AddRectFilled(p0, p1, overlayBg, hh * 0.5f);
-        dl->AddRect(p0, p1, overlayBord, hh * 0.5f);
+        ui::glassBackground(dl, p0, p1, hh * 0.5f / s);
         dl->AddText(ImVec2(p0.x + 11.0f * s, p0.y + 6.0f * s), overlayTxt, hint);
     }
 
@@ -441,10 +437,8 @@ void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
     {
         const int n = 7;
         PopupLayout L = popupLayout(vr0, vr1);
-        dl->AddRectFilled(ImVec2(L.x0, L.y0), ImVec2(L.x0 + L.w, L.y0 + L.h),
-                          overlayBg, L.h * 0.30f);
-        dl->AddRect(ImVec2(L.x0, L.y0), ImVec2(L.x0 + L.w, L.y0 + L.h),
-                    overlayBord, L.h * 0.30f);
+        ui::glassBackground(dl, ImVec2(L.x0, L.y0), ImVec2(L.x0 + L.w, L.y0 + L.h),
+                            L.h * 0.30f / s);
 
         ImGui::PushID("##viewsel_popup");
         for (int i = 0; i < n; ++i) {

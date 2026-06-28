@@ -159,6 +159,11 @@ void EvaluateDialogs::draw(AppState& st) {
     if (openWindow_.empty()) return;
     bool open = true;
     ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(340), 0), ImGuiCond_Appearing);
+    // Frosted-glass fill so evaluate result windows float as part of the app-wide glass family
+    // (translucent glassBg lets the viewport bleed through subtly; content stays legible).
+    const auto& gpal = ui::palette;
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,
+        ImVec4(gpal.glassBg[0], gpal.glassBg[1], gpal.glassBg[2], gpal.glassBg[3]));
     if (ImGui::Begin(title_.c_str(), &open)) {
         if (pending_) {
             // C39: the eval is in flight on the dispatch thread; the result fills in when
@@ -325,6 +330,7 @@ void EvaluateDialogs::draw(AppState& st) {
         }
     }
     ImGui::End();
+    ImGui::PopStyleColor();
     if (!open) {
         // Closing the window must also exit stripe mode so the user isn't stuck in zebra shading.
         if (openWindow_ == "zebra" && st.renderer) st.renderer->setZebra(false, gZebraFreq);

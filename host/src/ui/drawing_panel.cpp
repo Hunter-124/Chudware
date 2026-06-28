@@ -2070,7 +2070,7 @@ void drawDrawingSheet(AppState& st) {
         ImVec2 ts = ImGui::CalcTextSize(hud);
         ImVec2 p0(canvasMin.x + 8 * s, canvasMax.y - ts.y - 8 * s);
         ImVec2 p1(p0.x + ts.x + 12, p0.y + ts.y + 6);
-        dl->AddRectFilled(p0, p1, ui::Palette::toU32(pal.overlayBg), 4.0f);
+        ui::glassBackground(dl, p0, p1, 4.0f);
         dl->AddText(ImVec2(p0.x + 6, p0.y + 3), ui::Palette::toU32(pal.overlayText), hud);
     }
 

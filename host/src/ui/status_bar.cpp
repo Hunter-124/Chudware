@@ -56,9 +56,19 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     }
     if (busy && !st.livePhase.empty()) {
         ImGui::SameLine();
+        // Live-phase progress chip on a frosted-glass pill so the running-job readout matches the
+        // app-wide glass family (the dim text stays legible on glassBg in both themes).
+        std::string phase = std::string("|  ") + st.livePhase;
+        ImVec2 tsz = ImGui::CalcTextSize(phase.c_str());
+        ImVec2 cp  = ImGui::GetCursorScreenPos();
+        const float px = 8.0f * dpiS, py = 2.5f * dpiS;
+        ui::glassBackground(ImGui::GetWindowDrawList(),
+                            ImVec2(cp.x - px * 0.5f, cp.y - py),
+                            ImVec2(cp.x + tsz.x + px, cp.y + tsz.y + py),
+                            (tsz.y + py * 2.0f) * 0.5f / dpiS);
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
-        ImGui::Text("|  %s", st.livePhase.c_str());
+        ImGui::TextUnformatted(phase.c_str());
         ImGui::PopStyleColor();
     }
     // W5C: pick / selection label (e.g. "Face 12 of Body1") — shown when not editing a sketch

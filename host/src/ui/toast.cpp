@@ -88,9 +88,10 @@ void drawToasts(AppState& st) {
             return ui::Palette::toU32(v);
         };
 
-        // Panel bg (popup role), border, and a left accent bar in the level color.
-        dl->AddRectFilled(p0, p1, withA(pal.popupBg, 0.98f), 6.0f * scale);
-        dl->AddRect(p0, p1, withA(pal.border, 1.0f), 6.0f * scale, 0, 1.2f * scale);
+        // Panel bg + border use the glass roles so toasts match the app-wide frosted-glass family;
+        // the per-toast fade alpha (and left accent bar) are preserved.
+        dl->AddRectFilled(p0, p1, withA(pal.glassBg, 1.0f), 6.0f * scale);
+        dl->AddRect(p0, p1, withA(pal.glassBorder, 1.0f), 6.0f * scale, 0, 1.2f * scale);
         dl->AddRectFilled(p0, ImVec2(p0.x + 3.0f * scale, p1.y), withA(accent, 1.0f),
                           6.0f * scale, ImDrawFlags_RoundCornersLeft);
 

@@ -204,6 +204,12 @@ void ConfigPanel::drawBody(AppState& st) {
         return;
     }
 
+    // Frosted-glass card for the config list, matching the PropertyManager form cards so the glass
+    // look is consistent across docked panels (text stays legible on glassBg in both themes).
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImVec4(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], pal.glassBg[3]));
+    ImGui::PushStyleColor(ImGuiCol_Border,
+        ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2], pal.glassBorder[3]));
     ImGui::BeginChild("cfglist", ImVec2(0, 0), ImGuiChildFlags_Border);
     for (int i = 0; i < (int)names_.size(); ++i) {
         const std::string& name = names_[i];
@@ -263,6 +269,7 @@ void ConfigPanel::drawBody(AppState& st) {
         ImGui::PopID();
     }
     ImGui::EndChild();
+    ImGui::PopStyleColor(2);
 
 }
 

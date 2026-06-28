@@ -22,6 +22,17 @@
 
 namespace ui {
 
+// Frosted-glass window fill for the floating assembly tool windows (Insert / Parts Library / Mate /
+// Pattern / Explode / Interference / BOM) so they read as part of the app-wide glass family. Push
+// right before ImGui::Begin() (the window background is captured there) and pop right after; the
+// translucent glassBg lets content behind bleed through subtly while text stays legible.
+static void pushGlassWindow() {
+    const auto& p = ui::palette;
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,
+        ImVec4(p.glassBg[0], p.glassBg[1], p.glassBg[2], p.glassBg[3]));
+}
+static void popGlassWindow() { ImGui::PopStyleColor(); }
+
 // ---- small theme helpers (mirror feature_tree.cpp / property_manager.cpp) ----
 
 static void pushText(const float c[4]) {
@@ -141,7 +152,10 @@ void AsmPanels::drawInsert(AppState& st) {
     bool open = true;
     ImGui::SetNextWindowSize(ImVec2(380 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (insertFocus_) { ImGui::SetNextWindowFocus(); insertFocus_ = false; }
-    if (ImGui::Begin("Insert Component", &open)) {
+    pushGlassWindow();
+    const bool insWin = ImGui::Begin("Insert Component", &open);
+    popGlassWindow();
+    if (insWin) {
         asmIcon("insert_component", "[+]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Insert a part into the assembly");
         ImGui::Spacing();
@@ -238,7 +252,10 @@ void AsmPanels::drawPartsLibrary(AppState& st) {
     bool open = true;
     ImGui::SetNextWindowSize(ImVec2(560 * ui::uiScale, 420 * ui::uiScale), ImGuiCond_Appearing);
     if (partsLibFocus_) { ImGui::SetNextWindowFocus(); partsLibFocus_ = false; }
-    if (ImGui::Begin("Standard Parts Library", &open)) {
+    pushGlassWindow();
+    const bool partsLibWin = ImGui::Begin("Standard Parts Library", &open);
+    popGlassWindow();
+    if (partsLibWin) {
         asmIcon("insert_component", "[+]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Insert standard hardware (generated to spec)");
         ImGui::Spacing();
@@ -571,7 +588,10 @@ void AsmPanels::drawMateForm(AppState& st) {
     ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0),
                                         ImVec2(FLT_MAX, vp->WorkSize.y - 120 * ui::uiScale));
     if (mateFocus_) { ImGui::SetNextWindowFocus(); mateFocus_ = false; }
-    if (ImGui::Begin("Mate##asm", &open)) {
+    pushGlassWindow();
+    const bool mateWin = ImGui::Begin("Mate##asm", &open);
+    popGlassWindow();
+    if (mateWin) {
         // header: icon + title + Add / Cancel (PM style)
         asmIcon("mate", "[M]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         pushText(pal.text);
@@ -864,7 +884,10 @@ void AsmPanels::drawPatternForm(AppState& st) {
     bool open = true;
     ImGui::SetNextWindowSize(ImVec2(340 * ui::uiScale, 0), ImGuiCond_Appearing);
     if (patternFocus_) { ImGui::SetNextWindowFocus(); patternFocus_ = false; }
-    if (ImGui::Begin("Component Pattern##asm", &open)) {
+    pushGlassWindow();
+    const bool patternWin = ImGui::Begin("Component Pattern##asm", &open);
+    popGlassWindow();
+    if (patternWin) {
         asmIcon("pattern_component", "[#]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         pushText(pal.text);
         ImGui::TextUnformatted("Component Pattern");
@@ -1000,7 +1023,10 @@ void AsmPanels::drawExplode(AppState& st) {
     bool open = true;
     ImGui::SetNextWindowSize(ImVec2(300 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (explodeFocus_) { ImGui::SetNextWindowFocus(); explodeFocus_ = false; }
-    if (ImGui::Begin("Exploded View", &open)) {
+    pushGlassWindow();
+    const bool explodeWin = ImGui::Begin("Exploded View", &open);
+    popGlassWindow();
+    if (explodeWin) {
         asmIcon("exploded_view", "[X]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Explode factor");
         ImGui::Spacing();
@@ -1064,7 +1090,10 @@ void AsmPanels::drawInterference(AppState& st) {
     bool open = true;
     ImGui::SetNextWindowSize(ImVec2(420 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (interferenceFocus_) { ImGui::SetNextWindowFocus(); interferenceFocus_ = false; }
-    if (ImGui::Begin("Interference Detection", &open)) {
+    pushGlassWindow();
+    const bool interfWin = ImGui::Begin("Interference Detection", &open);
+    popGlassWindow();
+    if (interfWin) {
         asmIcon("interference", "[!]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Component interference + clearance");
         ImGui::SameLine(ImGui::GetWindowWidth() - 80);
@@ -1183,7 +1212,10 @@ void AsmPanels::drawBom(AppState& st) {
     bool open = true;
     ImGui::SetNextWindowSize(ImVec2(560 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (bomFocus_) { ImGui::SetNextWindowFocus(); bomFocus_ = false; }
-    if (ImGui::Begin("Bill of Materials", &open)) {
+    pushGlassWindow();
+    const bool bomWin = ImGui::Begin("Bill of Materials", &open);
+    popGlassWindow();
+    if (bomWin) {
         asmIcon("bom", "[B]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Components");
         ImGui::SameLine(ImGui::GetWindowWidth() - 80);

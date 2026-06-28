@@ -220,7 +220,7 @@ static void drawAiActivityBadge(ImVec2 vr0, ImVec2 vr1, const std::string& statu
     ImVec2 p0(cx - w * 0.5f, vr0.y + 10.0f * S);
     ImVec2 p1(p0.x + w, p0.y + h);
 
-    dl->AddRectFilled(p0, p1, withAlpha(pal.overlayBg, 0.90f), h * 0.5f);
+    ui::glassBackground(dl, p0, p1, h * 0.5f / S);
     dl->AddRect(p0, p1, withAlpha(pal.accent, 0.35f + 0.45f * pulse), h * 0.5f, 0, 1.5f * S);
     ImVec2 dotc(p0.x + padX + dotR, (p0.y + p1.y) * 0.5f);
     dl->AddCircleFilled(dotc, dotR, withAlpha(pal.accent, pulse));
@@ -2500,10 +2500,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             float byi  = by0 + padY;
 
             // Chip background.
-            hdl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx0 + barW, by0 + barH),
-                               ui::Palette::toU32(hpal.overlayBg), barH * 0.30f);
-            hdl->AddRect(ImVec2(bx0, by0), ImVec2(bx0 + barW, by0 + barH),
-                         ui::Palette::toU32(hpal.overlayBorder), barH * 0.30f);
+            ui::glassBackground(hdl, ImVec2(bx0, by0), ImVec2(bx0 + barW, by0 + barH),
+                                barH * 0.30f / s);
 
             // Helper: draw one toolbar icon button. Returns true on click.
             // active=true fills with accentSoft (toggle state).
@@ -2744,8 +2742,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             float maxW = (vr1.x - vr0.x) - 58.0f;
             ImVec2 p0(vr0.x + 12, vr0.y + 12);
             ImVec2 p1(p0.x + (ts.x > maxW ? maxW : ts.x) + 36.0f, p0.y + ts.y + 12.0f);
-            vdl->AddRectFilled(p0, p1, overlayBg, (p1.y - p0.y) * 0.5f);
-            vdl->AddRect(p0, p1, overlayBord, (p1.y - p0.y) * 0.5f);
+            ui::glassBackground(vdl, p0, p1, (p1.y - p0.y) * 0.5f / ui::uiScale);
             float pulse = 0.35f + 0.65f * (0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 5.0f));
             vdl->AddCircleFilled(ImVec2(p0.x + 14 * ui::uiScale, (p0.y + p1.y) * 0.5f), 4.0f * ui::uiScale,
                                  ImGui::ColorConvertFloat4ToU32(
@@ -2761,8 +2758,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             ImVec2 p1(vr1.x - 12, vr0.y + 12);
             ImVec2 p0(p1.x - ts.x - 20.0f, p1.y);
             ImVec2 p1b(p1.x, p1.y + ts.y + 10.0f);
-            vdl->AddRectFilled(p0, p1b, overlayBg, 6.0f * ui::uiScale);
-            vdl->AddRect(p0, p1b, overlayBord, 6.0f * ui::uiScale);
+            ui::glassBackground(vdl, p0, p1b, 6.0f);
             vdl->AddText(ImVec2(p0.x + 10 * ui::uiScale, p0.y + 5 * ui::uiScale), overlayTxt,
                          st.pickStatus.c_str());
         }
@@ -3052,7 +3048,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             ImVec2 ts = mf->CalcTextSizeA(fs, 1e30f, 0.0f, st.modelInfo.c_str());
             ImVec2 p0(vr0.x + 12, vr1.y - ts.y - 70.0f);
             ImVec2 p1(p0.x + ts.x + 20.0f, p0.y + ts.y + 10.0f);
-            vdl->AddRectFilled(p0, p1, overlayBg, 6.0f * ui::uiScale);
+            ui::glassBackground(vdl, p0, p1, 6.0f);
             vdl->AddText(mf, fs, ImVec2(p0.x + 10 * ui::uiScale, p0.y + 5 * ui::uiScale),
                          overlayTxt, st.modelInfo.c_str());
         }

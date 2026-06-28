@@ -227,35 +227,35 @@ static const RibbonCmd kCmds[] = {
     // =========================================================================
     // Tab: Sheet Metal — base + edge flange drive the engine sm_* features.
     // cmd_id == engine feature type (pmFormForCommand routes straight through).
-    // Icons reuse extrude_boss (base) and shell (edge); ribbon falls back gracefully.
+    // Icons: dedicated sm_* atlas glyphs (sm_base_flange / sm_edge_flange / sm_hem / sm_jog / sm_flat_pattern).
     // =========================================================================
 
     // --- Group: Create ---
-    { "sm_base_flange",      "Base Flange",     "extrude_boss",     "Sheet Metal", "Create",      true,  nullptr,          false },
-    { "sm_edge_flange",      "Edge Flange",     "shell",            "Sheet Metal", "Create",      true,  nullptr,          false },
+    { "sm_base_flange",      "Base Flange",     "sm_base_flange",    "Sheet Metal", "Create",      true,  nullptr,          false },
+    { "sm_edge_flange",      "Edge Flange",     "sm_edge_flange",    "Sheet Metal", "Create",      true,  nullptr,          false },
     // Hem (fold an edge back on itself) + Jog (two bends -> a parallel offset step). cmd_id ==
-    // engine feature type (pmFormForCommand routes straight through). Icons reuse shell/extrude_boss.
-    { "sm_hem",              "Hem",             "shell",            "Sheet Metal", "Create",      true,  nullptr,          false },
-    { "sm_jog",              "Jog",             "extrude_boss",     "Sheet Metal", "Create",      true,  nullptr,          false },
+    // engine feature type (pmFormForCommand routes straight through). Dedicated sm_hem / sm_jog glyphs.
+    { "sm_hem",              "Hem",             "sm_hem",           "Sheet Metal", "Create",      true,  nullptr,          false },
+    { "sm_jog",              "Jog",             "sm_jog",           "Sheet Metal", "Create",      true,  nullptr,          false },
     // W16: one-click Flatten — adds the param-less sm_flat_pattern feature (handled in app.cpp).
-    { "sm_flat_pattern",     "Flatten",         "shell",            "Sheet Metal", "Flat Pattern",true,  nullptr,          false },
+    { "sm_flat_pattern",     "Flatten",         "sm_flat_pattern",   "Sheet Metal", "Flat Pattern",true,  nullptr,          false },
     // W14: export the flat pattern (outline on layer OUTLINE + bend lines on layer BEND) to DXF.
     // One-click command (no PM form) — handled in app.cpp like Flatten, via export_flat_dxf.
-    { "sm_export_flat_dxf",  "Export Flat DXF", "section_props",    "Sheet Metal", "Flat Pattern",true,  nullptr,          false },
+    { "sm_export_flat_dxf",  "Export Flat DXF", "sm_flat_pattern",  "Sheet Metal", "Flat Pattern",true,  nullptr,          false },
 
     // =========================================================================
     // Tab: Weldments — sweeps a library profile along a path sketch's segments.
     // cmd_id == engine feature type weld_member (pmFormForCommand routes straight through).
-    // Reuses the sweep icon (a structural member is a profile swept along a path).
+    // Dedicated weld_member glyph (an I-beam / tube structural section).
     // =========================================================================
 
     // --- Group: Structural ---
-    { "weld_member",         "Structural Member","sweep",           "Weldments",   "Structural",  true,  nullptr,          false },
+    { "weld_member",         "Structural Member","weld_member",     "Weldments",   "Structural",  true,  nullptr,          false },
 
     // --- Group: Dress --- gusset (corner plate) + end cap (closes a tube end). cmd_id == engine
-    // feature type (pmFormForCommand routes straight through). Reuse shell/fillet icons.
-    { "weld_gusset",         "Gusset",          "shell",            "Weldments",   "Dress",       true,  nullptr,          false },
-    { "weld_end_cap",        "End Cap",         "fillet",           "Weldments",   "Dress",       true,  nullptr,          false },
+    // feature type (pmFormForCommand routes straight through). Dedicated weld_gusset / weld_end_cap glyphs.
+    { "weld_gusset",         "Gusset",          "weld_gusset",      "Weldments",   "Dress",       true,  nullptr,          false },
+    { "weld_end_cap",        "End Cap",         "weld_end_cap",     "Weldments",   "Dress",       true,  nullptr,          false },
 
     // =========================================================================
     // Tab: PCB  (Wave N — AI-ECAD electrical design: schematic capture, PCB layout, sim)
@@ -380,17 +380,17 @@ static const RibbonCmd kCmds[] = {
     // Tab: Appearance — per-body color, RealView material + display style.
     // Material presets apply a set_appearance op to the model (body "b1"); "Appearance"
     // opens the full color/material picker; Display sets st.displayStyle. All handled in
-    // app.cpp's dispatcher. Icons reuse existing atlas glyphs (material / refresh /
-    // display_*) so gui_lint --rule icons stays clean.
+    // app.cpp's dispatcher. Material buttons use dedicated color_picker / appr_* icons; the
+    // ribbon.cpp swatch overlay draws each preset's actual RGB. Display reuses the display_* glyphs.
     // =========================================================================
 
     // --- Group: Material ---
-    { "appr_color",          "Appearance",      "material",         "Appearance", "Material", true,  nullptr, false },
-    { "appr_mat_plastic",    "Plastic",         "material",         "Appearance", "Material", true,  nullptr, false },
-    { "appr_mat_aluminum",   "Aluminum",        "material",         "Appearance", "Material", true,  nullptr, false },
-    { "appr_mat_steel",      "Steel",           "material",         "Appearance", "Material", true,  nullptr, false },
-    { "appr_mat_brass",      "Brass",           "material",         "Appearance", "Material", true,  nullptr, false },
-    { "appr_mat_dark",       "Dark Metal",      "material",         "Appearance", "Material", true,  nullptr, false },
+    { "appr_color",          "Appearance",      "color_picker",     "Appearance", "Material", true,  nullptr, false },
+    { "appr_mat_plastic",    "Plastic",         "appr_plastic",     "Appearance", "Material", true,  nullptr, false },
+    { "appr_mat_aluminum",   "Aluminum",        "appr_metal",       "Appearance", "Material", true,  nullptr, false },
+    { "appr_mat_steel",      "Steel",           "appr_metal",       "Appearance", "Material", true,  nullptr, false },
+    { "appr_mat_brass",      "Brass",           "appr_metal",       "Appearance", "Material", true,  nullptr, false },
+    { "appr_mat_dark",       "Dark Metal",      "appr_metal",       "Appearance", "Material", true,  nullptr, false },
     { "appr_clear",          "Clear",           "refresh",          "Appearance", "Material", false, nullptr, false },
 
     // --- Group: Display --- (sets st.displayStyle; the viewport applies it each frame) ---

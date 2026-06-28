@@ -8,6 +8,12 @@
 // chosen color into outColor[3] and, when a preset was picked, the material into
 // outMetallic/outRoughness (a custom color leaves the material untouched so a previously-set metal
 // keeps its finish).
+//
+// The popup also exposes Metalness and Roughness sliders (shown when outMetallic && outRoughness are
+// non-null): they edit the live PBR finish for ANY color — including a custom RGB — so Apply captures
+// the chosen metalness/roughness without first clicking a named material. Sixteen quick color presets
+// (two rows of eight) sit above the full color wheel, and each material preset button shows its
+// characteristic color as a swatch beside the name.
 #pragma once
 
 namespace ui {
@@ -18,9 +24,12 @@ struct MaterialPreset {
     float metallic, roughness, rgb[3];
 };
 
-// The five presets shared by the feature tree and viewport appearance editors. Plastic restores the
+// Number of shared RealView material presets in kMaterials.
+constexpr int kMaterialsCount = 5;
+
+// The shared presets used by the feature tree and viewport appearance editors. Plastic restores the
 // dielectric default (the C30 look).
-extern const MaterialPreset kMaterials[5];
+extern const MaterialPreset kMaterials[kMaterialsCount];
 
 // The appearance editor popup. Returns true once on commit. See header note.
 bool appearanceColorPicker(const char* popupId, float outColor[3],

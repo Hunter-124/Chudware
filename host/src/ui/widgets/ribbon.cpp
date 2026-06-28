@@ -12,6 +12,7 @@
 #include "../../ui_theme.h"   // ui::palette, ui::Palette
 #include "../ribbon_def.h"    // RibbonCmd, getRibbonCmds
 #include "../metrics.h"       // ui::metrics::px/U/stroke/rounding + ribbon tokens
+#include "../appearance_common.h"  // ui::kMaterials (material swatch colors)
 
 #include <cmath>
 #include <cstdio>
@@ -43,6 +44,27 @@ static const char* kRibbonTabs[] = {"Features", "Sketch", "Evaluate", "Simulatio
                                     "View Layout", "Annotation", "Appearance"};
 static constexpr int kRibbonTabCount = 12;  // + W17 contextual "View Layout"/"Annotation" (drawings)
                                             //   + "Appearance" (3D color/material/display, index 11)
+
+// W-overhaul: per-workspace tab icon, parallel to kRibbonTabs[]. The eight true workspace tabs use
+// the dedicated ws_* atlas glyphs from the icon contract; the four tabs that have no ws_* glyph
+// (Simulation, PCB, and the two contextual drawing tabs) reuse the closest existing atlas icon as a
+// placeholder until dedicated glyphs ship.
+static const char* kTabIcons[] = {
+    "ws_features",    // Features
+    "ws_sketch",      // Sketch
+    "ws_evaluate",    // Evaluate
+    "study_static",   // Simulation (placeholder — no ws_simulation glyph in the contract)
+    "ws_assembly",    // Assembly
+    "ws_sheetmetal",  // Sheet Metal
+    "ws_weldments",   // Weldments
+    "ai_panel",       // PCB (placeholder — no ws_pcb glyph in the contract)
+    "ws_surfaces",    // Surfaces
+    "view_selector",  // View Layout (drawing — placeholder)
+    "smart_dim",      // Annotation (drawing — placeholder)
+    "ws_appearance",  // Appearance
+};
+static_assert(sizeof(kTabIcons) / sizeof(kTabIcons[0]) == kRibbonTabCount,
+              "kTabIcons must stay parallel to kRibbonTabs");
 
 // W17: in a Drawing doc the ribbon swaps to the two contextual drawing tabs ONLY (the
 // mechanical/sim/pcb tabs are 3D-doc context and would do nothing on a sheet). Outside a
@@ -403,32 +425,186 @@ static const char* ribbon_tipFor(const char* cmd_id) {
         {"asm_interference",  "Detect interference between components."},
         {"asm_bom",           "Generate a bill of materials."},
         {"asm_explode",       "Create an exploded view."},
+        // --- Sketch: corner fillet/chamfer + airfoil generator (flyout/tools) ---
+        {"sk_fillet",         "Round a sharp sketch corner between two lines."},
+        {"sk_chamfer",        "Bevel a sharp sketch corner between two lines."},
+        {"sk_airfoil",        "Generate a NACA airfoil section as chained splines."},
+        // --- Simulation: extended study types ---
+        {"sim_new_thermal",   "Create a steady-state or transient thermal study."},
+        {"sim_new_fatigue",   "Estimate fatigue life from a static stress result."},
+        // --- Assembly ---
+        {"asm_parts_library", "Insert a standard hardware part from the library."},
+        // --- Evaluate: drawing entry point + profiler ---
+        {"make_drawing",      "Create a drawing sheet with standard views of the part."},
+        {"prof_toggle",       "Start or stop the modeling performance profiler."},
+        // --- Sheet Metal ---
+        {"sm_base_flange",    "Create the first wall of a sheet-metal part."},
+        {"sm_edge_flange",    "Add a flange bent from an existing sheet edge."},
+        {"sm_hem",            "Fold an edge back on itself to stiffen or finish it."},
+        {"sm_jog",            "Add two bends to offset the sheet into a step."},
+        {"sm_flat_pattern",   "Unfold the sheet-metal part into its flat pattern."},
+        {"sm_export_flat_dxf","Export the flat-pattern outline and bend lines to DXF."},
+        // --- Weldments ---
+        {"weld_member",       "Sweep a structural profile along the path segments."},
+        {"weld_gusset",       "Add a triangular gusset plate to brace a corner."},
+        {"weld_end_cap",      "Close the open end of a structural tube."},
+        // --- PCB: schematic, board, analysis, outputs ---
+        {"ecad_ai_design",    "Generate a schematic and PCB layout from a text prompt."},
+        {"ecad_new_sch",      "Start a new schematic sheet."},
+        {"ecad_new_pcb",      "Start a new PCB layout."},
+        {"ecad_open",         "Open an existing schematic or board."},
+        {"ecad_save",         "Save the schematic and board."},
+        {"sch_add_symbol",    "Place a component symbol on the schematic."},
+        {"sch_add_wire",      "Draw a wire between schematic pins."},
+        {"sch_add_label",     "Add a net label to name a connection."},
+        {"sch_add_power",     "Place a power or ground port."},
+        {"sch_annotate",      "Assign reference designators to the symbols."},
+        {"ecad_run_erc",      "Run electrical rule checks on the schematic."},
+        {"pcb_update_from_sch","Push schematic changes onto the board."},
+        {"pcb_add_footprint", "Place a component footprint on the board."},
+        {"pcb_add_track",     "Route a copper track between pads."},
+        {"pcb_add_via",       "Place a via connecting copper layers."},
+        {"pcb_add_zone",      "Draw a copper pour zone."},
+        {"ecad_autoroute",    "Automatically route the board's connections."},
+        {"ecad_fill_zones",   "Recompute copper pours around tracks and pads."},
+        {"ecad_run_drc",      "Run design rule checks on the board."},
+        {"ecad_simulate",     "Run a SPICE simulation of the circuit."},
+        {"ecad_to_3d",        "Build a 3D model of the populated board."},
+        {"ecad_export_gerber","Export Gerber fabrication files."},
+        {"ecad_export_drill", "Export the NC drill file."},
+        {"ecad_export_bom",   "Export the board bill of materials."},
+        // --- Surfaces ---
+        {"surf_extrude",      "Create an open surface by extruding a profile."},
+        {"surf_revolve",      "Create a surface by revolving a profile about an axis."},
+        {"surf_sweep",        "Create a surface by sweeping a profile along a path."},
+        {"surf_loft",         "Create a surface blended between two or more profiles."},
+        {"surf_planar",       "Create a planar surface from a closed boundary."},
+        {"surf_offset",       "Offset faces or surfaces by a distance."},
+        {"surf_ruled",        "Create a ruled surface from an edge."},
+        {"surf_boundary",     "Create a boundary surface between edges."},
+        {"surf_fill",         "Fill a bounded region with a surface patch."},
+        {"surf_knit",         "Knit adjacent surfaces into a single surface."},
+        {"surf_thicken",      "Thicken a surface into a solid body."},
+        {"surf_trim",         "Trim a surface with a curve or another surface."},
+        {"surf_untrim",       "Remove trim boundaries to restore the full surface."},
+        {"surf_delete_face",  "Remove faces from a body or surface."},
+        {"surf_replace_face", "Replace faces with a target surface."},
+        // --- Drawing: View Layout ---
+        {"dwg_view_model",    "Place a model view on the sheet."},
+        {"dwg_view_proj",     "Project a new view from an existing view."},
+        {"dwg_view_std3",     "Place the standard three orthographic views."},
+        {"dwg_view_section",  "Create a section view through a cutting line."},
+        {"dwg_view_detail",   "Create an enlarged detail view of a region."},
+        {"dwg_sheet_props",   "Edit sheet size, scale, and properties."},
+        {"dwg_rebuild",       "Rebuild the views to match the model."},
+        {"dwg_fit",           "Fit the sheet to the window."},
+        {"dwg_export_dxf",    "Export the drawing sheet to DXF."},
+        {"dwg_export_pdf",    "Export the drawing sheet to PDF."},
+        {"dwg_section_half",  "Create a half-section view."},
+        {"dwg_section_reverse","Flip the section cut direction."},
+        {"dwg_scale_1_1",     "Set the selected view scale to 1:1."},
+        {"dwg_scale_1_2",     "Set the selected view scale to 1:2."},
+        {"dwg_scale_2_1",     "Set the selected view scale to 2:1."},
+        // --- Drawing: Annotation ---
+        {"dwg_smart_dim",     "Add a dimension to drawing entities."},
+        {"dwg_model_items",   "Import dimensions and annotations from the model."},
+        {"dwg_hole_callout",  "Add a hole callout to a hole."},
+        {"dwg_gdt",           "Add a geometric tolerance frame."},
+        {"dwg_datum",         "Place a datum feature symbol."},
+        {"dwg_datum_target",  "Place a datum target symbol."},
+        {"dwg_surface_finish","Add a surface finish symbol."},
+        {"dwg_weld",          "Add a welding symbol."},
+        {"dwg_center_mark",   "Add a center mark to a circle or arc."},
+        {"dwg_center_line",   "Add a center line between two edges."},
+        {"dwg_note",          "Add a text note, optionally with a leader."},
+        {"dwg_balloon",       "Add a BOM balloon to a component."},
+        {"dwg_auto_balloon",  "Auto-place balloons on every component."},
+        {"dwg_title_block",   "Edit the sheet's title block fields."},
+        {"dwg_bom_table",     "Insert a bill of materials table."},
+        // --- Appearance: material / clear + display styles ---
+        {"appr_color",        "Open the appearance editor for color and material."},
+        {"appr_mat_plastic",  "Apply a matte plastic appearance."},
+        {"appr_mat_aluminum", "Apply a brushed aluminum appearance."},
+        {"appr_mat_steel",    "Apply a polished steel appearance."},
+        {"appr_mat_brass",    "Apply a warm brass appearance."},
+        {"appr_mat_dark",     "Apply a dark metal appearance."},
+        {"appr_clear",        "Clear the appearance and restore the default look."},
+        {"display_shaded",      "Show the model shaded without edges."},
+        {"display_shaded_edges","Show the model shaded with edges."},
+        {"display_hlr",         "Show edges with hidden lines removed."},
+        {"display_hlv",         "Show edges with hidden lines shown dashed."},
+        {"display_wireframe",   "Show the model as a wireframe."},
     };
     for (const auto& t : tips)
         if (std::strcmp(t.id, cmd_id) == 0) return t.tip;
     return nullptr;
 }
 
+// Look up the atlas icon name registered for a cmd_id (mirrors the ribbon_def table) so the tooltip
+// can render the very glyph the button shows. Returns nullptr for an unknown command.
+static const char* ribbon_iconFor(const char* cmd_id) {
+    if (!cmd_id) return nullptr;
+    int n = 0;
+    const ui::RibbonCmd* cmds = ui::getRibbonCmds(n);
+    for (int i = 0; i < n; ++i)
+        if (std::strcmp(cmds[i].cmd_id, cmd_id) == 0) return cmds[i].icon;
+    return nullptr;
+}
+
 static void ribbon_tooltip(const char* title, const char* cmd_id, bool enabled) {
     auto col = [](const float f[4]) { return ImVec4(f[0], f[1], f[2], f[3]); };
-    ImGui::BeginTooltip();
-    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 20.0f);
-    ImGui::PushStyleColor(ImGuiCol_Text, col(ui::palette.text));
-    ImGui::TextUnformatted(title);
-    ImGui::PopStyleColor();
-    const char* d = ribbon_tipFor(cmd_id);
-    if (d) {
-        ImGui::PushStyleColor(ImGuiCol_Text, col(ui::palette.textDim));
-        ImGui::TextUnformatted(d);
+    ui::pushGlassTooltipStyle();
+    if (ImGui::BeginTooltip()) {
+        ImVec2 wp = ImGui::GetWindowPos();
+        ImVec2 ws = ImGui::GetWindowSize();
+        ui::glassBackground(ImGui::GetWindowDrawList(), wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
+        // Icon mini-preview: the same glyph the button shows, so the tooltip previews what the tool
+        // does. Tinted like the button — white when enabled, grey when disabled / "Coming soon".
+        const char* iconName = ribbon_iconFor(cmd_id);
+        const bool  hasIcon  = iconName && *iconName;
+        if (hasIcon) {
+            float isz = 36.0f * ui::uiScale;
+            ui::IconUV ic = ui::getIcon(iconName, 32);
+            ImVec4 tint = enabled ? ImVec4(1, 1, 1, 1) : ImVec4(0.5f, 0.5f, 0.5f, 0.63f);
+            ImGui::Image(ic.texId, ImVec2(isz, isz), ic.uv0, ic.uv1, tint);
+            ImGui::SameLine();
+            ImGui::BeginGroup();
+        }
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 20.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, col(ui::palette.text));
+        ImGui::TextUnformatted(title);
         ImGui::PopStyleColor();
+        const char* d = ribbon_tipFor(cmd_id);
+        if (d) {
+            ImGui::PushStyleColor(ImGuiCol_Text, col(ui::palette.textDim));
+            ImGui::TextUnformatted(d);
+            ImGui::PopStyleColor();
+        }
+        if (!enabled) {
+            ImGui::PushStyleColor(ImGuiCol_Text, col(ui::palette.textDisabled));
+            ImGui::TextUnformatted("Coming soon");
+            ImGui::PopStyleColor();
+        }
+        ImGui::PopTextWrapPos();
+        if (hasIcon) ImGui::EndGroup();
+        ImGui::EndTooltip();
     }
-    if (!enabled) {
-        ImGui::PushStyleColor(ImGuiCol_Text, col(ui::palette.textDisabled));
-        ImGui::TextUnformatted("Coming soon");
-        ImGui::PopStyleColor();
-    }
-    ImGui::PopTextWrapPos();
-    ImGui::EndTooltip();
+    ui::popGlassTooltipStyle();
+}
+
+// The Appearance "Material" buttons each apply one RealView preset color. ribbon_matSwatchColor maps
+// an appr_mat_* cmd_id to the RGB of the matching ui::kMaterials entry (single source of truth) so a
+// button can paint a swatch of the exact color it applies. Returns nullptr for any other command.
+static const float* ribbon_matSwatchColor(const char* cmd_id) {
+    if (!cmd_id) return nullptr;
+    struct MatBtn { const char* cmd_id; int idx; };
+    static const MatBtn kMatBtns[] = {
+        {"appr_mat_plastic",  0}, {"appr_mat_aluminum", 1}, {"appr_mat_steel", 2},
+        {"appr_mat_brass",    3}, {"appr_mat_dark",     4},
+    };
+    for (const auto& m : kMatBtns)
+        if (std::strcmp(m.cmd_id, cmd_id) == 0) return ui::kMaterials[m.idx].rgb;
+    return nullptr;
 }
 
 // Draw a SW big button. Returns true if main area clicked.
@@ -518,12 +694,28 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
                      ImVec2(snap(cx - iconSz * 0.5f) + iconSz, iy + iconSz),
                      ic.uv0, ic.uv1, tint);
 
+        // Material color swatch: a 20x4 bar under the icon previewing the exact color this button
+        // applies. The label below is nudged down (see ty) so the bar never overlaps the text.
+        const float* matRgb = ribbon_matSwatchColor(cmd_id);
+        if (matRgb) {
+            float swW = 20.0f * s, swH = 4.0f * s;
+            float sx0 = snap(cx - swW * 0.5f);
+            float sy0 = snap(iy + iconSz + 1.0f * s);
+            ImU32 swCol = IM_COL32((int)(matRgb[0] * 255.0f + 0.5f),
+                                   (int)(matRgb[1] * 255.0f + 0.5f),
+                                   (int)(matRgb[2] * 255.0f + 0.5f), enabled ? 255 : 160);
+            dl->AddRectFilled(ImVec2(sx0, sy0), ImVec2(sx0 + swW, sy0 + swH), swCol, 1.5f * s);
+            dl->AddRect(ImVec2(sx0, sy0), ImVec2(sx0 + swW, sy0 + swH),
+                        ui::Palette::toU32(ui::palette.border), 1.5f * s, 0,
+                        ui::metrics::stroke(1.0f));
+        }
+
         std::string l1, l2;
         ribbon_wrapLabel(visibleLabel, l1, l2);
         ImU32 tCol = enabled ? ui::Palette::toU32(ui::palette.text)
                              : ui::Palette::toU32(ui::palette.textDisabled);
         float lineH = ImGui::GetTextLineHeight();
-        float ty    = iy + iconSz + 2.0f * s;
+        float ty    = iy + iconSz + (matRgb ? 6.0f * s : 2.0f * s);
         dl->PushClipRect(ImVec2(p0.x, p0.y), ImVec2(p0.x + mainW, p0.y + bh), true);
         if (visibleLabel[0] != '\0') {
             ImVec2 t1 = ImGui::CalcTextSize(l1.c_str());
@@ -637,12 +829,26 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
 
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        float ix = snap(p0.x + 2.0f * s);
+        const float* matRgb = ribbon_matSwatchColor(cmd_id);
+        float ix = snap(p0.x + 2.0f * s + (matRgb ? 6.0f * s : 0.0f));
         float iy = snap(p0.y + (rowH - iconSz) * 0.5f);
         ui::IconUV ic = ui::getIcon(iconName, 20);
         ImU32 tint = enabled ? IM_COL32(255,255,255,255) : IM_COL32(128,128,128,160);
         dl->AddImage(ic.texId, ImVec2(ix, iy), ImVec2(ix + iconSz, iy + iconSz),
                      ic.uv0, ic.uv1, tint);
+        if (matRgb) {
+            // Vertical color swatch strip to the left of the icon (compact row layout).
+            float stW = 4.0f * s, stH = 14.0f * s;
+            float stx = snap(p0.x + 2.0f * s);
+            float sty = snap(p0.y + (rowH - stH) * 0.5f);
+            ImU32 swCol = IM_COL32((int)(matRgb[0] * 255.0f + 0.5f),
+                                   (int)(matRgb[1] * 255.0f + 0.5f),
+                                   (int)(matRgb[2] * 255.0f + 0.5f), enabled ? 255 : 160);
+            dl->AddRectFilled(ImVec2(stx, sty), ImVec2(stx + stW, sty + stH), swCol, 1.0f * s);
+            dl->AddRect(ImVec2(stx, sty), ImVec2(stx + stW, sty + stH),
+                        ui::Palette::toU32(ui::palette.border), 1.0f * s, 0,
+                        ui::metrics::stroke(1.0f));
+        }
         float tx  = snap(ix + iconSz + 4.0f * s);
         float ty  = snap(p0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f);
         ImU32 tCol = enabled ? ui::Palette::toU32(ui::palette.text)
@@ -821,13 +1027,27 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
     {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         float snappedIconSz = snap(iconSz);
-        float ix  = snap(p0.x);
+        const float* matRgb = ribbon_matSwatchColor(cmd_id);
+        float ix  = snap(p0.x + (matRgb ? 6.0f * s : 0.0f));
         float iy  = snap(p0.y + (rowH - snappedIconSz) * 0.5f);
         ui::IconUV ic = ui::getIcon(iconName, 20);
         ImU32 tint = enabled ? IM_COL32(255,255,255,255) : IM_COL32(128,128,128,160);
         dl->AddImage(ic.texId, ImVec2(ix, iy), ImVec2(ix + snappedIconSz, iy + snappedIconSz),
                      ic.uv0, ic.uv1, tint);
-        float tx  = snap(p0.x + snappedIconSz + 4.0f * s);
+        if (matRgb) {
+            // Vertical color swatch strip to the left of the icon.
+            float stW = 4.0f * s, stH = 14.0f * s;
+            float stx = snap(p0.x);
+            float sty = snap(p0.y + (rowH - stH) * 0.5f);
+            ImU32 swCol = IM_COL32((int)(matRgb[0] * 255.0f + 0.5f),
+                                   (int)(matRgb[1] * 255.0f + 0.5f),
+                                   (int)(matRgb[2] * 255.0f + 0.5f), enabled ? 255 : 160);
+            dl->AddRectFilled(ImVec2(stx, sty), ImVec2(stx + stW, sty + stH), swCol, 1.0f * s);
+            dl->AddRect(ImVec2(stx, sty), ImVec2(stx + stW, sty + stH),
+                        ui::Palette::toU32(ui::palette.border), 1.0f * s, 0,
+                        ui::metrics::stroke(1.0f));
+        }
+        float tx  = snap(ix + snappedIconSz + 4.0f * s);
         float ty  = snap(p0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f);
         ImU32 tCol = enabled ? ui::Palette::toU32(ui::palette.text)
                              : ui::Palette::toU32(ui::palette.textDisabled);
@@ -958,7 +1178,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         if (!ribbon_tabVisible(i, showSimulationTools, showPcbTools, showDrawingTools)) continue;
         const char* tabLabel = kRibbonTabs[i];
         ImVec2 tsize  = ImGui::CalcTextSize(tabLabel);
-        float  tw     = tsize.x + 22.0f * s;
+        float  tw     = tsize.x + 22.0f * s + 18.0f * s + 4.0f * s;  // + 14px icon + gap + pad
         bool   isAct  = (activeTab == i);
 
         ImVec2 tp0(tabX, tabY);
@@ -986,8 +1206,19 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
             ? ImVec4(palette.text[0],    palette.text[1],    palette.text[2],    palette.text[3])
             : ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], palette.textDim[3]);
         const float textY = snap(tp0.y + (tabBtnH - tsize.y) * 0.5f - 1.0f * s);
+        // Per-workspace tab icon: a 14x14 glyph snapped to the left of the centered label, tinted to
+        // match the label color (bright when active/hovered, dim otherwise).
+        const float tIconSz   = 14.0f * s;
+        const float tIconGap  = 4.0f * s;
+        const float tContentW = tIconSz + tIconGap + tsize.x;
+        const float tGroupX   = snap(tp0.x + (tw - tContentW) * 0.5f);
+        ui::IconUV  tic       = ui::getIcon(kTabIcons[i], 14);
+        const float tIconY    = snap(tp0.y + (tabBtnH - tIconSz) * 0.5f - 1.0f * s);
+        ImU32       tIconTint = ImGui::ColorConvertFloat4ToU32(lc);
+        dl->AddImage(tic.texId, ImVec2(tGroupX, tIconY),
+                     ImVec2(tGroupX + tIconSz, tIconY + tIconSz), tic.uv0, tic.uv1, tIconTint);
         dl->AddText(nullptr, 0.0f,
-                    ImVec2(snap(tp0.x + (tw - tsize.x) * 0.5f), textY),
+                    ImVec2(snap(tGroupX + tIconSz + tIconGap), textY),
                     ImGui::ColorConvertFloat4ToU32(lc), tabLabel);
 
         tabX += tw + 2.0f * s;

@@ -136,58 +136,104 @@ static void toggleFeatureEye(AppState& st, const std::string& fid,
 static void featureBadge(bool ok, bool hasError, const std::string& errText,
                          const std::vector<std::string>& danglingRefs,
                          bool rolledBack = false, const std::string& warnText = "") {
+    (void)hasError;
+    // Pick this row's health dot: color, filled-vs-hollow, and tooltip. Rendering the badge as a
+    // draw-list circle (not a •/!/?/◦ text glyph) makes it pixel-identical at any DPI and removes the
+    // per-font glyph-advance/size variance the old SameLine+TextUnformatted markers had.
+    const float S = ui::uiScale;
+    ImU32 col = 0;
+    bool  hollow = false;
+    bool  hasTip = false;
+    std::string tip;
     if (rolledBack) {
         // Muted hollow ring — "not currently built" (distinct from ok/error/dangling).
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                   ui::palette.textDim[2], 0.75f));
-        ImGui::TextUnformatted(u8"◦");  // hollow bullet = rolled back
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Rolled back (after the rollback bar — not built)");
-        return;
-    }
-    if (ok && danglingRefs.empty() && !warnText.empty()) {
-        // Built, but with a non-fatal note (e.g. fillet rounded a subset of edges) — amber "!".
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
-                   ui::palette.statusWarn[2], ui::palette.statusWarn[3]));
-        ImGui::TextUnformatted("!");
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", warnText.c_str());
+        col = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 0.75f));
+        hollow = true;
+        tip = "Rolled back (after the rollback bar — not built)"; hasTip = true;
+    } else if (ok && danglingRefs.empty() && !warnText.empty()) {
+        // Built, but with a non-fatal note (e.g. fillet rounded a subset of edges) — amber dot.
+        col = ui::Palette::toU32(ui::palette.statusWarn);
+        tip = warnText; hasTip = true;
     } else if (ok && danglingRefs.empty()) {
-        // Green check (just a color dot for compactness)
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(ui::palette.statusOk[0], ui::palette.statusOk[1],
-                   ui::palette.statusOk[2], ui::palette.statusOk[3]));
-        ImGui::TextUnformatted(u8"•");  // bullet
-        ImGui::PopStyleColor();
+        col = ui::Palette::toU32(ui::palette.statusOk);    // healthy — teal dot
     } else if (!ok) {
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(ui::palette.statusErr[0], ui::palette.statusErr[1],
-                   ui::palette.statusErr[2], ui::palette.statusErr[3]));
-        ImGui::TextUnformatted("!");
-        ImGui::PopStyleColor();
-        if (!errText.empty() && ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", errText.c_str());
+        col = ui::Palette::toU32(ui::palette.statusErr);   // error — red-orange dot
+        if (!errText.empty()) { tip = errText; hasTip = true; }
     } else if (!danglingRefs.empty()) {
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
-                   ui::palette.statusWarn[2], ui::palette.statusWarn[3]));
-        ImGui::TextUnformatted("?");
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) {
-            std::string tip = "Dangling refs:\n";
-            for (const auto& r : danglingRefs) { tip += "  "; tip += r; tip += '\n'; }
-            ImGui::SetTooltip("%s", tip.c_str());
-        }
+        col = ui::Palette::toU32(ui::palette.statusWarn);  // dangling refs — amber dot
+        tip = "Dangling refs:\n";
+        for (const auto& r : danglingRefs) { tip += "  "; tip += r; tip += '\n'; }
+        hasTip = true;
+    } else {
+        return;   // nothing to flag
     }
-    (void)hasError;
+
+    const float r = 3.5f * S;
+    const float w = 2.0f * r + 4.0f * S;   // dot diameter + breathing room
+    ImGui::SameLine();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float  lineH = ImGui::GetTextLineHeight();
+    ImVec2 center(p.x + r + 2.0f * S, p.y + lineH * 0.5f);
+    // A non-interactive Dummy advances the layout cursor by [w]; the tooltip uses a geometric
+    // IsMouseHoveringRect (same pattern as the per-row eye above) so the badge never captures hover
+    // or competes with the row's click / context-menu binding — tree behavior is unchanged.
+    ImGui::Dummy(ImVec2(w, lineH));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (hollow) dl->AddCircle(center, r, col, 0, std::max(1.0f, 1.5f * S));
+    else        dl->AddCircleFilled(center, r, col);
+    if (hasTip && ImGui::IsMouseHoveringRect(p, ImVec2(p.x + w, p.y + lineH)))
+        ImGui::SetTooltip("%s", tip.c_str());
+}
+
+// ---- glass popover styling (shared by every FeatureManager popup) ----
+// A slightly lighter, blue-tinted, mostly-opaque popup bg (glass depth illusion), a teal accent
+// border, rounded corners and roomier padding. Push BEFORE the BeginPopup*/picker call and pop
+// AFTER EndPopup/the call: the styles must stay live for the popup's whole deferred draw. The
+// push/pop is balanced every frame regardless of whether the popup is actually open.
+static void pushTreePopupGlass() {
+    const auto& pal = ui::palette;
+    ImGui::PushStyleColor(ImGuiCol_PopupBg,
+        ImVec4(pal.panelBg[0] * 1.08f, pal.panelBg[1] * 1.08f, pal.panelBg[2] * 1.20f, 0.92f));
+    ImGui::PushStyleColor(ImGuiCol_Border,
+        ImVec4(pal.accentMid[0], pal.accentMid[1], pal.accentMid[2], 0.60f));
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 8.0f * ui::uiScale);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+        ImVec2(10.0f * ui::uiScale, 7.0f * ui::uiScale));
+}
+static void popTreePopupGlass() {
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+}
+
+// ---- styled section rule with a centered label ----
+// Groups the tree into its three logical sections (document header / reference geometry / feature
+// history) far more clearly than a bare Separator(): a treeSection-colored centered label flanked by
+// two short draw-list hairlines, then a Dummy to re-sync the layout cursor below the drawn row.
+static void treeSectionDivider(const char* label) {
+    const auto& pal = ui::palette;
+    const float S = ui::uiScale;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float  w = ImGui::GetContentRegionAvail().x;
+    float  lineH = ImGui::GetTextLineHeight();
+    ImVec2 tsz = ImGui::CalcTextSize(label);
+    float  textX = p.x + (w - tsz.x) * 0.5f;
+    float  cy = p.y + lineH * 0.5f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 lineCol = ui::Palette::toU32(pal.border);
+    if (textX > p.x + 4.0f * S) {   // guard tiny panels (avoid zero/negative-length segments)
+        dl->AddLine(ImVec2(p.x + 4.0f * S, cy), ImVec2(textX - 6.0f * S, cy),
+                    lineCol, std::max(1.0f, 1.0f * S));
+        dl->AddLine(ImVec2(textX + tsz.x + 6.0f * S, cy), ImVec2(p.x + w - 4.0f * S, cy),
+                    lineCol, std::max(1.0f, 1.0f * S));
+    }
+    ImGui::SetCursorScreenPos(ImVec2(textX, p.y));
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(pal.treeSection[0], pal.treeSection[1], pal.treeSection[2], pal.treeSection[3]));
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y));
+    ImGui::Dummy(ImVec2(w, lineH + 4.0f * S));
 }
 
 // ---- shared op applier (DocMirror ops -> rebuild -> reload mesh) ----
@@ -671,9 +717,18 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     if (s_renamingId == fid) {
         ImGui::SetNextItemWidth(-1);
         if (!ImGui::IsAnyItemActive()) ImGui::SetKeyboardFocusHere();
+        ImGui::PushStyleColor(ImGuiCol_FrameBg,
+            ImVec4(ui::palette.accentSoft[0], ui::palette.accentSoft[1],
+                   ui::palette.accentSoft[2], 0.25f));
+        ImGui::PushStyleColor(ImGuiCol_Border,
+            ImVec4(ui::palette.accent[0], ui::palette.accent[1],
+                   ui::palette.accent[2], 0.70f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f * ui::uiScale);
         bool commit = ImGui::InputText(("##rn_" + fid).c_str(), s_renameBuf, sizeof(s_renameBuf),
                                        ImGuiInputTextFlags_EnterReturnsTrue |
                                        ImGuiInputTextFlags_AutoSelectAll);
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
         bool cancel = ImGui::IsKeyPressed(ImGuiKey_Escape);
         bool deact  = ImGui::IsItemDeactivated();
         if (commit || cancel || deact) {
@@ -726,11 +781,12 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
 
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
                         ImVec2(3.0f * ui::uiScale, 3.0f * ui::uiScale));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 2.0f * ui::uiScale));
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0, 0, 0, 0));
     ImGui::TreeNodeEx(label.c_str(), flags);
     ImGui::PopStyleColor(2);
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(2);
 
     if (dim) ImGui::PopStyleColor();
 
@@ -788,6 +844,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     // BeginPopupContextItem opens on right-click of the LAST item, and featureBadge() below
     // emits its own SameLine text item. With the old order the menu only opened when the user
     // right-clicked the tiny status dot, i.e. effectively never (C40 fix).
+    pushTreePopupGlass();
     if (ImGui::BeginPopupContextItem(("##ctx_" + fid).c_str())) {
         bool isSketch = c.iconName && std::strcmp(c.iconName, "sketch_node") == 0;
         bool multi    = s_multiSel.size() > 1 && s_multiSel.count(fid) > 0;
@@ -937,6 +994,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         if (!c.canDoc) ImGui::EndDisabled();
         ImGui::EndPopup();
     }
+    popTreePopupGlass();
 
     // ---- per-feature eye toggle (every row, right edge) ----
     // Hidden body-owning features hide their bodies; hidden sketches/datums drop out of the ghost
@@ -1135,6 +1193,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                 ImGui::TreeNodeEx((row + "##mate_" + mid).c_str(), mf);
                 if (msup) ImGui::PopStyleColor();
 
+                pushTreePopupGlass();
                 if (ImGui::BeginPopupContextItem(("##mctx_" + mid).c_str())) {
                     // C25: deferred via applyTreeOps — applying here would invalidate the
                     // tree json this loop iterates (same UAF as feature reorder).
@@ -1149,6 +1208,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                     }
                     ImGui::EndPopup();
                 }
+                popTreePopupGlass();
                 ++mi;
             }
             if (tree["mates"].empty()) {
@@ -1448,8 +1508,9 @@ static void nameAndGroupFeatures(AppState& st) {
 //
 // While dragging, the per-row hit-test in the feature walk records s_rbDropAfter (the feature the
 // bar would land after); the walk's release handler turns it into set_rollback. `enabled` (canDoc)
-// gates the mutating feature-row drop. `barAfterFid` is unused here but documents placement.
-static void drawRollbackBarLine(AppState& st, bool enabled, const std::string& /*barAfterFid*/) {
+// gates the mutating feature-row drop. `barAfterFid` (non-empty = the bar sits mid-history) also
+// drives the "rolled back" zone label drawn below the bar.
+static void drawRollbackBarLine(AppState& st, bool enabled, const std::string& barAfterFid) {
     const auto& pal = ui::palette;
     ImGui::Dummy(ImVec2(0, 2.0f * ui::uiScale));
     ImVec2 r0 = ImGui::GetCursorScreenPos();
@@ -1486,6 +1547,20 @@ static void drawRollbackBarLine(AppState& st, bool enabled, const std::string& /
                 {{{"op", "reorder_feature"}, {"id", dragged}}}), "reorder");
         }
         ImGui::EndDragDropTarget();
+    }
+    // Bar mid-history (features below are rolled back): a dim centered label makes the divider's
+    // meaning obvious — clearly not a plain separator. Skipped when the bar is at the end.
+    if (!barAfterFid.empty()) {
+        ImGui::Dummy(ImVec2(0, 3.0f * rsc));
+        const char* rbLbl = "↓ rolled back";
+        float rbW = ImGui::CalcTextSize(rbLbl).x;
+        float rbX0 = ImGui::GetCursorPosX();
+        ImGui::SetCursorPosX(rbX0 + std::max(0.0f, (w - rbW) * 0.5f));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.55f));
+        ImGui::TextUnformatted(rbLbl);
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, 2.0f * rsc));
     }
     ImGui::PopID();
 }
@@ -1619,6 +1694,7 @@ void drawFeatureTreeBody(AppState& st,
             static float s_rootMetallic = 0.0f, s_rootRoughness = 0.5f;  // C32-A material
             static bool  s_openRootPicker = false;
             if (!isAsmDoc && st.docMirror.hasDoc()) {
+                pushTreePopupGlass();
                 if (ImGui::BeginPopupContextItem("##root_ctx")) {
                     if (ImGui::MenuItem("Appearance...")) {
                         s_rootColor[0] = 0.71f; s_rootColor[1] = 0.76f; s_rootColor[2] = 0.82f;
@@ -1632,9 +1708,11 @@ void drawFeatureTreeBody(AppState& st,
                     }
                     ImGui::EndPopup();
                 }
+                popTreePopupGlass();
                 // Picker popup lives OUTSIDE the context menu (a sibling) to avoid nested-popup
                 // ordering pitfalls; it is opened by the menu item via s_openRootPicker.
                 if (s_openRootPicker) { ImGui::OpenPopup("##appearance_root"); s_openRootPicker = false; }
+                pushTreePopupGlass();
                 if (appearanceColorPicker("##appearance_root", s_rootColor,
                                           &s_rootMetallic, &s_rootRoughness)) {
                     applyTreeOps(st, nlohmann::json::array({
@@ -1643,6 +1721,7 @@ void drawFeatureTreeBody(AppState& st,
                          {"metallic", s_rootMetallic}, {"roughness", s_rootRoughness}}}),
                         "set_appearance");
                 }
+                popTreePopupGlass();
             }
         }
 
@@ -1748,6 +1827,7 @@ void drawFeatureTreeBody(AppState& st,
                             bool rowHovered = ImGui::IsItemHovered();
                             char ctxId[32];
                             std::snprintf(ctxId, sizeof(ctxId), "##body_ctx%d", bi);
+                            pushTreePopupGlass();
                             if (ImGui::BeginPopupContextItem(ctxId)) {
                                 if (ImGui::MenuItem(hidden ? "Show" : "Hide"))
                                     setBodyShown(st, bi, hidden);
@@ -1776,6 +1856,7 @@ void drawFeatureTreeBody(AppState& st,
                                 }
                                 ImGui::EndPopup();
                             }
+                            popTreePopupGlass();
                             if (rowClicked) setBodyShown(st, bi, hidden);
                             if (rowHovered)
                                 ImGui::SetTooltip(hidden ? "Show %s" : "Hide %s", bname);
@@ -1784,6 +1865,8 @@ void drawFeatureTreeBody(AppState& st,
                     }
                 }
             }
+            // Section rule: reference geometry (planes / origin) follows.
+            treeSectionDivider("Reference");
 
             // Reference planes — click to show/hide in the viewport; the clicked plane is
             // emphasized (brighter) and the others dim (focus-follows-selection).
@@ -1899,7 +1982,7 @@ void drawFeatureTreeBody(AppState& st,
                 ImGui::TreeNodeEx("Origin##origin", f);
             }
 
-            ImGui::Separator();
+            treeSectionDivider("Features");
 
             // ---- feature history ----
             const nlohmann::json& statusArr = st.docMirror.featureStatus();
@@ -2083,24 +2166,29 @@ void drawFeatureTreeBody(AppState& st,
                         ImVec2 rowMin = ImGui::GetCursorScreenPos();
                         float availW = ImGui::GetContentRegionAvail().x;
                         const float S = ui::uiScale;
-                        const float rowH = ImGui::GetTextLineHeight() + 8.0f * S;
+                        const float rowH = ImGui::GetTextLineHeight() + 10.0f * S;
                         ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
                         ImDrawList* rowDl = ImGui::GetWindowDrawList();
                         if (rowIdx % 2 == 0)
                             rowDl->AddRectFilled(rowMin, rowMax, Palette::toU32(pal.treeRowAlt));
+                        if (suppressed)
+                            rowDl->AddRectFilled(rowMin, rowMax,
+                                IM_COL32((int)(pal.statusWarn[0] * 255),
+                                         (int)(pal.statusWarn[1] * 255),
+                                         (int)(pal.statusWarn[2] * 255), 8));
                         if (sel) {
                             ImVec2 cardMin(rowMin.x + 2.0f * S, rowMin.y + 1.0f * S);
                             ImVec2 cardMax(rowMax.x - 3.0f * S, rowMax.y - 1.0f * S);
                             ImVec4 fill(pal.accentSoft[0], pal.accentSoft[1],
-                                        pal.accentSoft[2], 0.38f);
+                                        pal.accentSoft[2], 0.45f);
                             rowDl->AddRectFilled(cardMin, cardMax,
                                                  ImGui::ColorConvertFloat4ToU32(fill),
                                                  4.0f * S);
                             rowDl->AddRect(cardMin, cardMax,
-                                           Palette::toU32(pal.border), 4.0f * S, 0,
+                                           Palette::toU32(pal.accentMid), 4.0f * S, 0,
                                            std::max(1.0f, 1.0f * S));
                             rowDl->AddRectFilled(ImVec2(cardMin.x, cardMin.y + 3.0f * S),
-                                                 ImVec2(cardMin.x + 3.0f * S,
+                                                 ImVec2(cardMin.x + 4.0f * S,
                                                         cardMax.y - 3.0f * S),
                                                  Palette::toU32(pal.accent), 2.0f * S);
                             if (selectedFeatureId == fid && st.treeScrollToSelection) {
@@ -2175,6 +2263,8 @@ void drawFeatureTreeBody(AppState& st,
                             ImGui::GetWindowDrawList()->AddRect(
                                 hovMin, hovMax, ImGui::ColorConvertFloat4ToU32(hoverCol),
                                 4.0f * S, 0, std::max(1.0f, 1.0f * S));
+                            ImGui::GetWindowDrawList()->AddRectFilled(
+                                hovMin, hovMax, Palette::toU32(pal.treeHover), 4.0f * S);
                         }
 
                         // ---- rollback-bar drag hit-test (item 4) ----
@@ -2301,12 +2391,18 @@ void drawFeatureTreeBody(AppState& st,
                             if (folderOpen) { ImGui::TreePop(); folderOpen = false; }
                             openFolder = folder;
                             if (!folder.empty()) {
+                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                    ImVec4(pal.text[0], pal.text[1], pal.text[2], 1.0f));
+                                ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                                    ImVec2(0, 4.0f * ui::uiScale));
                                 treeIcon("body_folder", "[F]", 16.0f);   // #4.4: was "mates_folder"
                                 ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                                 folderOpen = ImGui::TreeNodeEx(
                                     (folder + "##fld_" + folder).c_str(),
                                     ImGuiTreeNodeFlags_DefaultOpen |
                                     ImGuiTreeNodeFlags_SpanFullWidth);
+                                ImGui::PopStyleVar();
+                                ImGui::PopStyleColor();
                             }
                         }
                         if (!openFolder.empty() && !folderOpen) continue;
@@ -2416,6 +2512,7 @@ void drawFeatureTreeBody(AppState& st,
     // node) and turn a commit into a set_appearance op on that body.
     if (s_apprOpen && !s_apprBody.empty()) { ImGui::OpenPopup("##appearance_feat"); s_apprOpen = false; }
     if (!s_apprBody.empty()) {
+        pushTreePopupGlass();
         if (appearanceColorPicker("##appearance_feat", s_apprColor,
                                   &s_apprMetallic, &s_apprRoughness)) {
             applyTreeOps(st, nlohmann::json::array({
@@ -2425,6 +2522,7 @@ void drawFeatureTreeBody(AppState& st,
                 "set_appearance");
             s_apprBody.clear();
         }
+        popTreePopupGlass();
     }
 
     // ---- C41: bottom file strip ----

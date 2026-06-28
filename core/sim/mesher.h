@@ -72,10 +72,13 @@ struct MeshOptions {
     int order = 1;                 // 1=tet4, 2=tet10
 
     // Curvature-adaptive refinement — THE feature that makes FEA capture stress
-    // concentrations: the mesher refines around holes/fillets to hit ~curv_elems_per_circle
-    // elements per full 2*pi of curvature. Off => uniform sizing.
+    // concentrations AND gives curved bodies (cylinders/fillets/holes) an even, smooth
+    // surface mesh: the mesher refines a curve of radius r so a full 2*pi turn gets
+    // ~curv_elems_per_circle elements. Off => uniform sizing.
     bool curvature = true;
-    double curv_elems_per_circle = 12.0;  // typical 8..20
+    // 20 (was 12 ~= Netgen's default ~12.6/circle, which left cylinders visibly faceted).
+    // 20 segments/circle reads smooth and even while staying bounded; typical 8..24.
+    double curv_elems_per_circle = 20.0;
 
     double target_size_mm = 0.0;   // >0 hard override of the derived base size
     double min_size_mm = 0.0;      // >0 overrides base*0.5 (the auto 2:1 size band floor)

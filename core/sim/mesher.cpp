@@ -551,24 +551,45 @@ MeshOut mesh_step_netgen(const std::string& step_path, const MeshOptions& option
         mp.maxh = max_len;
         mp.minh = min_len;
         mp.fineness = fineness;
-        mp.grading = 0.3;                  // smooth 2:1 gradation between min/max
+        // Grading controls how fast element size may change between neighbours (nglib doc:
+        // 0 => uniform mesh, 1 => aggressive local grading). 0.2 ("fine gradation") keeps the
+        // size field smooth so a curvature-refined wall blends GRADUALLY into the coarser
+        // interior instead of jumping a step — this, more than the min/max band, is what makes
+        // a cylinder mesh look EVEN (it was 0.3, Netgen's default, which let sizes step). The
+        // 2:1 min/max band above is kept deliberately tight (Bug F7); grading does the rest.
+        //
+        // This local size field (uselocalh) is BOUNDARY-ALIGNED: edge + curvature refinement is
+        // seeded on the geometry boundary and propagated inward, so elements are naturally finer
+        // near feature edges / curved faces and coarsen toward the bulk. Honest scope note:
+        // nglib's OCC pipeline meshes the VOLUME as TETRAHEDRA (NG_TET / NG_TET10). It does NOT
+        // expose true boundary-layer prism extrusion or mixed hex/prism/tet volume meshing; the
+        // only non-tet volume elements it ever emits are the stray pyramid/prism at a
+        // quad-dominated-surface transition, which we split back into tets below. So we grade
+        // tets toward the boundary — we do not (and must not claim to) build a hybrid volume.
+        mp.grading = 0.2;
         mp.elementsperedge = 2.0;
-        // Curvature-adaptive refinement around holes/fillets. Netgen's elementspercurve is
-        // "elements per curvature RADIUS"; a full circle (2*pi radians) therefore gets
-        // ~2*pi*elementspercurve elements, so divide curv_elems_per_circle (elements per full
-        // turn) by 2*pi. Off => a low value so sizing is uniform.
+        // Curvature-adaptive refinement around holes / fillets / cylinders — THE control that
+        // resolves a curved face evenly. Netgen's elementspercurve maps to curvaturesafety, and
+        // occ/occgenmesh.cpp::ComputeH restricts the local size on a curve of radius r to
+        // r/curvaturesafety (capped at maxh); a full 2*pi circle therefore gets
+        // ~2*pi*curvaturesafety elements. To request curv_elems_per_circle elements per full
+        // turn we set elementspercurve = curv_elems_per_circle / (2*pi). (Conversion VERIFIED
+        // against ComputeH.) Curvature off => a low value (1.0) so sizing stays uniform.
         constexpr double kTwoPi = 6.283185307179586;
         mp.elementspercurve =
             (options.curvature && options.curv_elems_per_circle > 0.0)
                 ? std::max(1.0, options.curv_elems_per_circle / kTwoPi)
                 : 1.0;
         mp.second_order = 0;  // elevate explicitly below (with CAD-surface projection)
-        // Quality optimization — Netgen's native passes (the same engine gmsh invoked via
-        // OptimizeNetgen). Disabled => 0 passes.
+        // Quality optimization — Netgen's native surface + volume passes (the same engine gmsh
+        // invoked via OptimizeNetgen): edge/face swaps, point-combine and smoothing that remove
+        // sliver tets, which is what RAISES jacobian_min and LOWERS aspect_max / pct_poor. Run
+        // 5 passes (was 3) so the worst elements get cleaned up; the optimizer is cheap next to
+        // generation, so the extra passes are well worth the quality. Disabled => 0 passes.
         mp.optsurfmeshenable = options.optimize ? 1 : 0;
         mp.optvolmeshenable = options.optimize ? 1 : 0;
-        mp.optsteps_2d = options.optimize ? 3 : 0;
-        mp.optsteps_3d = options.optimize ? 3 : 0;
+        mp.optsteps_2d = options.optimize ? 5 : 0;
+        mp.optsteps_3d = options.optimize ? 5 : 0;
         mp.closeedgeenable = 0;
         // Quad-dominated SURFACE mesh (exotic type): the VOLUME stays tetrahedral, but Netgen
         // lays a quad/quad8 surface mesh. Off by default. The quad->tet transition can

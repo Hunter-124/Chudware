@@ -581,6 +581,17 @@ if(AICAD_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME mesher_autopick COMMAND test_mesher_autopick)
   set_tests_properties(mesher_autopick PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
+
+  # Mesh-quality (evenness) regression: cylinder -> STEP -> mesh_step, assert an EVEN tet mesh
+  # (bounded aspect_max, jacobian_min>0, low pct_poor, healthy curvature resolution).
+  add_executable(test_mesh_quality tests/test_mesh_quality.cpp)
+  target_include_directories(test_mesh_quality PRIVATE
+    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_mesh_quality PRIVATE aicad_mesh aicad_geom_occt)
+  set_target_properties(test_mesh_quality PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME mesh_quality COMMAND test_mesh_quality)
+  set_tests_properties(mesh_quality PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
   endif()  # AICAD_WITH_NETGEN
 
   # FEA boundary-surface extractor: fea_surface_body (the result-plot display surface,

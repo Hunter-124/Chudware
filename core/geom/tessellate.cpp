@@ -1,5 +1,7 @@
 #include "geom/tessellate.h"
 
+#include <algorithm>
+
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepLib_ToolTriangulatedShape.hxx>
@@ -29,6 +31,14 @@
 namespace geom {
 
 namespace {
+
+// Display-quality ceiling on BRepMesh's angular deflection (max normal deviation between
+// adjacent facets, radians). The historical render default fed straight through was 0.35 rad
+// (~20deg), which leaves curved faces — cylinders especially — visibly faceted in the viewport.
+// Clamping the angular term to ~0.20 rad (~11.5deg) roughly +75% facets around a curve (smooth)
+// while staying BOUNDED: it is INERT on planar faces (no extra triangles there) and never lets
+// a coarse caller value coarsen the display. A FINER (smaller) request is always honoured.
+constexpr double kDisplayMaxAngularDeflection = 0.20;
 
 // Surface/curve GeomAbs enum -> AICM code (mesh_format.md §2). Anything else -> "other".
 uint8_t surf_code(GeomAbs_SurfaceType t) {
@@ -82,9 +92,18 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
     body.metallic = metallic;
     body.roughness = roughness;
 
+    // Smooth-render clamp (display path): never let a curved face facet worse than
+    // kDisplayMaxAngularDeflection. A coarse caller angular value (the 0.35 rad default) would
+    // otherwise render a faceted cylinder; a FINER request passes through unchanged. Linear
+    // deflection is left as the caller set it (0.05 mm by default is already smooth) — the
+    // angular term is the one that was binding on curved faces.
+    const double eff_ang = (ang_deflection > 0.0)
+                               ? std::min(ang_deflection, kDisplayMaxAngularDeflection)
+                               : kDisplayMaxAngularDeflection;
+
     // Mesh the shape (parallel, absolute deflection) — same call as tessellate.py.
     BRepMesh_IncrementalMesh mesher(shape, lin_deflection, Standard_False,
-                                    ang_deflection, Standard_True);
+                                    eff_ang, Standard_True);
     mesher.Perform();
 
     // Stable 1-based index maps.
@@ -195,7 +214,7 @@ aicm::AicmBody tessellate_body(const TopoDS_Shape& shape, uint32_t body_id,
         if (pts.empty()) {
             try {
                 BRepAdaptor_Curve crv(edge);
-                GCPnts_TangentialDeflection disc(crv, lin_deflection, ang_deflection);
+                GCPnts_TangentialDeflection disc(crv, lin_deflection, eff_ang);
                 for (int ni = 1; ni <= disc.NbPoints(); ++ni) {
                     gp_Pnt p = disc.Value(ni);
                     pts.push_back(static_cast<float>(p.X()));

@@ -9,6 +9,7 @@
 
 #include "../core/app_state.h"
 #include "sketch_mode.h"   // C18
+#include "../core/sim_client.h"
 
 namespace ui {
 
@@ -69,6 +70,46 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
         ImGui::TextUnformatted(phase.c_str());
+        ImGui::PopStyleColor();
+    }
+    // ---- Simulation progress chip (BOTTOM-LEFT, visible while a FEA/CFD solve runs) --------
+    // Shows: animated spinner | pretty stage label | last log line | elapsed seconds.
+    // Uses the same glass-background pill as the agent livePhase chip above so the two styles
+    // are consistent.  The text pulses slightly so it is obviously alive even when stage is
+    // stuck on "Solving" for a long static analysis.
+    if (st.simClient && st.simClient->busy()) {
+        static const char* kSpin[] = {"|", "/", "-", "\\"};
+        int si = static_cast<int>(ImGui::GetTime() * 8.0) & 3;
+        std::string stg = st.simClient->stage();
+        std::string lg  = st.simClient->recentLog();
+        float elapsed   = st.simClient->elapsedSeconds();
+        // Human-readable stage labels that match the worker's stage token vocabulary.
+        auto prettyStage = [](const std::string& s) -> std::string {
+            if (s == "voxelize") return "Voxelizing";
+            if (s == "mesh")     return "Meshing";
+            if (s == "assemble") return "Assembling";
+            if (s == "solve")    return "Solving";
+            if (s == "stream")   return "Streaming results";
+            if (s == "post")     return "Post-processing";
+            return s.empty() ? "Solving" : s;
+        };
+        std::string chip = std::string("Sim ") + kSpin[si] + "  " + prettyStage(stg);
+        if (!lg.empty()) chip += "  \xe2\x80\x94  " + lg;  // em-dash separator before detail
+        chip += "  (" + std::to_string(static_cast<int>(elapsed)) + "s)";
+        ImGui::SameLine();
+        ImVec2 tsz = ImGui::CalcTextSize(chip.c_str());
+        ImVec2 cp  = ImGui::GetCursorScreenPos();
+        const float px = 10.0f * dpiS, py = 2.5f * dpiS;
+        ui::glassBackground(ImGui::GetWindowDrawList(),
+                            ImVec2(cp.x - px * 0.5f, cp.y - py),
+                            ImVec2(cp.x + tsz.x + px, cp.y + tsz.y + py),
+                            (tsz.y + py * 2.0f) * 0.5f / dpiS);
+        // Pulse the text alpha slightly so it is visually "alive" even during a long quiet stage.
+        float pulse = 0.80f + 0.20f * std::sin(static_cast<float>(ImGui::GetTime()) * 3.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(pal.statusOk[0] * pulse, pal.statusOk[1] * pulse,
+                   pal.statusOk[2] * pulse, 1.0f));
+        ImGui::TextUnformatted(chip.c_str());
         ImGui::PopStyleColor();
     }
     // W5C: pick / selection label (e.g. "Face 12 of Body1") — shown when not editing a sketch

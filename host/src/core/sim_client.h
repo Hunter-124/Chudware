@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include <chrono>
+#include <cstdint>
 #include <nlohmann/json.hpp>
 
 #include "../worker_client.h"
@@ -60,6 +62,14 @@ public:
     // True while a study is in flight (one job at a time).
     bool busy() const { return job_.running.load(); }
 
+    // Thread-safe progress readouts consumed by the status bar while busy() == true.
+    // stage()       — current solver phase ("mesh", "assemble", "solve", "post", …)
+    // recentLog()   — most recent human-readable event text from the worker
+    // elapsedSeconds() — wall seconds since the job was launched (0 if idle)
+    std::string stage() const;
+    std::string recentLog() const;
+    float       elapsedSeconds() const;
+
     // Launch a sim_* method on a background thread. `params` is the full RPC params object
     // (e.g. {"study": {...}} or {"stl_path":..., "direction":..., ...}). The job streams
     // sim_progress into job().events and latches job().ready when done. No-op (returns false)
@@ -89,6 +99,13 @@ private:
     std::mutex capsMtx_;
     nlohmann::json capsCache_;
     std::atomic<bool> capsQueried_{false};
+
+    // Live progress readouts — written by the background solve thread, read from the main
+    // thread via the accessors above.  progMtx_ is mutable so the const accessors can lock it.
+    mutable std::mutex     progMtx_;
+    std::string            progStage_;        // current solver phase
+    std::string            progLog_;          // last human-readable event text
+    std::atomic<long long> launchNs_{0LL};   // steady_clock ns at launch; 0 when idle
 };
 
 }  // namespace core

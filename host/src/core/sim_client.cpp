@@ -68,6 +68,25 @@ nlohmann::json SimClient::caps() {
     return capsCache_;
 }
 
+std::string SimClient::stage() const {
+    std::lock_guard<std::mutex> lk(progMtx_);
+    return progStage_;
+}
+
+std::string SimClient::recentLog() const {
+    std::lock_guard<std::mutex> lk(progMtx_);
+    return progLog_;
+}
+
+float SimClient::elapsedSeconds() const {
+    long long launch = launchNs_.load();
+    if (launch == 0LL) return 0.0f;
+    long long nowNs = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    return static_cast<float>(static_cast<double>(nowNs - launch) * 1e-9);
+}
+
 bool SimClient::launch(const std::string& method, nlohmann::json params,
                        std::string& consoleNote, const std::string& ownerDocId) {
     if (job_.running.exchange(true)) {
@@ -92,6 +111,16 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
     { std::lock_guard<std::mutex> lk(job_.evMtx); job_.events.clear(); }
     job_.ready = false;
 
+    // Reset live progress for the incoming job so the status bar shows "Starting" immediately.
+    {
+        std::lock_guard<std::mutex> lk(progMtx_);
+        progStage_ = "Starting";
+        progLog_.clear();
+    }
+    launchNs_.store(static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()));
+
     // Stamp a job_id so sim_progress / sim_cancel correlate. Reuse the same id everywhere the
     // worker reads it (study.job_id for FEA, top-level job_id for flow/mesh).
     static int counter = 0;
@@ -112,6 +141,12 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
                 ev.hasTrace = true;
                 ev.traceStep = jint(*it, "step");
                 ev.traceDrag = jnum(*it, "drag");
+            }
+            // Update the live progress display (read before ev is moved into the queue).
+            {
+                std::lock_guard<std::mutex> lk(progMtx_);
+                if (!ev.stage.empty()) progStage_ = ev.stage;
+                if (!ev.text.empty())  progLog_   = ev.text;
             }
             std::lock_guard<std::mutex> lk(job_.evMtx);
             job_.events.push_back(std::move(ev));
@@ -139,6 +174,8 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
         }
         job_.ready = true;
         job_.running = false;
+        launchNs_.store(0LL);
+        { std::lock_guard<std::mutex> lk(progMtx_); progStage_.clear(); progLog_.clear(); }
     }).detach();
 
     consoleNote = "[sim] launched " + method;

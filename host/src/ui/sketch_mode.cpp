@@ -204,57 +204,10 @@ void drawDashedPolyline(ImDrawList* dl, const std::vector<ImVec2>& pts, ImU32 co
     }
 }
 
-// C51: fill a simple (possibly concave) screen-space polygon via ear clipping. ImGui's
-// AddConvexPolyFilled fans from vertex 0 and bleeds across concavities, so closed profiles like
-// L-brackets need real triangulation. Robust enough for the well-formed loops region detection
-// produces (no self-intersections); falls back to the convex fill for triangles/degenerate input.
-void fillPolygon(ImDrawList* dl, const std::vector<ImVec2>& poly, ImU32 c) {
-    int n = (int)poly.size();
-    if (n < 3) return;
-    if (n == 3) { dl->AddTriangleFilled(poly[0], poly[1], poly[2], c); return; }
-    auto cross = [](const ImVec2& a, const ImVec2& b, const ImVec2& cc) {
-        return (b.x - a.x) * (cc.y - a.y) - (b.y - a.y) * (cc.x - a.x);
-    };
-    // polygon winding (signed area)
-    float area = 0.0f;
-    for (int i = 0, j = n - 1; i < n; j = i++) area += poly[j].x * poly[i].y - poly[i].x * poly[j].y;
-    bool ccw = area > 0.0f;
-    std::vector<int> idx(n);
-    for (int i = 0; i < n; ++i) idx[i] = i;
-    auto inTri = [&](const ImVec2& a, const ImVec2& b, const ImVec2& cc, const ImVec2& p) {
-        float d1 = cross(a, b, p), d2 = cross(b, cc, p), d3 = cross(cc, a, p);
-        bool neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
-        bool pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
-        return !(neg && pos);
-    };
-    int guard = 0;
-    while ((int)idx.size() > 3 && guard++ < 4 * n) {
-        bool clipped = false;
-        int m = (int)idx.size();
-        for (int i = 0; i < m; ++i) {
-            const ImVec2& a = poly[idx[(i + m - 1) % m]];
-            const ImVec2& b = poly[idx[i]];
-            const ImVec2& cc = poly[idx[(i + 1) % m]];
-            float conv = cross(a, b, cc);
-            bool convex = ccw ? (conv > 0) : (conv < 0);
-            if (!convex) continue;
-            bool ear = true;
-            for (int k = 0; k < m; ++k) {
-                int vi = idx[k];
-                if (vi == idx[(i + m - 1) % m] || vi == idx[i] || vi == idx[(i + 1) % m]) continue;
-                if (inTri(a, b, cc, poly[vi])) { ear = false; break; }
-            }
-            if (!ear) continue;
-            dl->AddTriangleFilled(a, b, cc, c);
-            idx.erase(idx.begin() + i);
-            clipped = true;
-            break;
-        }
-        if (!clipped) break;   // non-simple polygon — bail rather than spin
-    }
-    if (idx.size() == 3)
-        dl->AddTriangleFilled(poly[idx[0]], poly[idx[1]], poly[idx[2]], c);
-}
+// arcSweepContains is defined later in this TU's anonymous namespace (with the trim helpers);
+// forward-declare it here so SketchMode::hitTestHandle below can gate an arc's draggable rim
+// handle to the drawn sweep.
+bool arcSweepContains(const SketchEntity& arc, float ang);
 
 }  // namespace
 
@@ -2072,6 +2025,41 @@ int SketchMode::hitTestHandle(const ImVec2& s, std::string& handleOut, float& uO
         } else if (e.type == "circle" || e.type == "arc" || e.type == "arc_slot" ||
                    e.type == "ellipse") {
             consider(e.id + ".center", e.center[0], e.center[1]);
+            // C-bug1: a draggable RIM handle (resize radius) for circles/arcs, plus arc endpoint
+            // angle handles. Computed in screen space then mapped back to (u,v) so the rim handle
+            // tracks the actual circle under the cursor regardless of zoom / anisotropic basis.
+            if (e.type == "circle" || e.type == "arc") {
+                ImVec2 cc = uvToScreen(e.center[0], e.center[1]);
+                ImVec2 rimRef = uvToScreen(e.center[0] + e.radius, e.center[1]);
+                float rpx = std::hypot(rimRef.x - cc.x, rimRef.y - cc.y);
+                if (rpx > 3.0f) {   // skip sub-pixel circles
+                    float dxS = s.x - cc.x, dyS = s.y - cc.y;
+                    float dS = std::hypot(dxS, dyS);
+                    if (dS > 1e-3f) {
+                        ImVec2 rimS(cc.x + dxS / dS * rpx, cc.y + dyS / dS * rpx);
+                        float rimU, rimV; screenToUV(rimS, rimU, rimV);
+                        if (e.type == "circle") {
+                            consider(e.id + ".rim", rimU, rimV);
+                        } else {
+                            // Arc: endpoint handles always; the rim handle only inside the sweep.
+                            // Registered center-first, endpoints-before-rim so endpoints win a tie.
+                            const float D2R = 3.14159265f / 180.0f;
+                            consider(e.id + ".start_angle",
+                                     e.center[0] + e.radius * std::cos(e.start * D2R),
+                                     e.center[1] + e.radius * std::sin(e.start * D2R));
+                            consider(e.id + ".end_angle",
+                                     e.center[0] + e.radius * std::cos(e.end * D2R),
+                                     e.center[1] + e.radius * std::sin(e.end * D2R));
+                            float rimAng = std::atan2(rimV - e.center[1],
+                                                      rimU - e.center[0])
+                                           * 180.0f / 3.14159265f;
+                            if (rimAng < 0) rimAng += 360.0f;
+                            if (arcSweepContains(e, rimAng))
+                                consider(e.id + ".rim", rimU, rimV);
+                        }
+                    }
+                }
+            }
         } else if (e.type == "point") {
             consider(e.id + ".p", e.p1[0], e.p1[1]);
         } else if (e.type == "spline" || e.type == "style_spline") {   // C42: draggable through-points / control poles p0..pN
@@ -4965,8 +4953,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // Loops detected from the live geometry are filled faintly so a closed profile reads as a
     // selectable face; the one the cursor has dwelled in (hotRegion_) brightens + gets an outline,
     // signalling that a click will grab its whole loop. Drawn BEFORE the entities so the boundary
-    // lines stay crisp on top. The fill is ear-clipped so concave profiles (L-brackets etc.) shade
-    // correctly rather than fanning across the notch.
+    // lines stay crisp on top. The fill uses ImGui's AddConcavePolyFilled so concave profiles
+    // (L-brackets etc.) shade as one clean solid translucent region with no triangle-seam streaks
+    // (rebuildRegions() only emits simple, non-self-intersecting loops, which it handles).
     rebuildRegions();
     if (hotRegion_ >= (int)regions_.size()) hotRegion_ = -1;
     {
@@ -4978,8 +4967,175 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             bool hot = (tool_ == SketchTool::None && (int)ri == hotRegion_);
             std::vector<ImVec2> sp; sp.reserve(rg.poly.size());
             for (const auto& p : rg.poly) sp.push_back(uvToScreen(p.x, p.y));
-            fillPolygon(dl, sp, hot ? hotFill : fillCol);
+            dl->AddConcavePolyFilled(sp.data(), (int)sp.size(), hot ? hotFill : fillCol);
             if (hot) dl->AddPolyline(sp.data(), (int)sp.size(), hotEdge, ImDrawFlags_Closed, 1.5f);
+        }
+    }
+
+    // ---- C-bug2: relation badges (geometric / non-dimensional constraints) ----
+    // Drawn HERE, BENEATH the entity lines, so geometry stays crisp on top (the user complaint was
+    // badges sitting on the lines). Three phases: (1) collect each badge's initial chip center plus
+    // the geometry point it annotates, (2) relax overlapping chips apart, (3) draw a hairline leader
+    // from the geometry to any displaced chip, then the chip. Dimension annotations still render
+    // AFTER the entity loop (they read better on top of geometry).
+    {
+        const float bs = 16.0f * ui::uiScale;                 // chip side
+        const ImU32 relBg        = col(pal.sketchRelBg);
+        const ImU32 relBorder    = col(pal.sketchRelBorder);
+        const ImU32 relInk       = col(pal.sketchInk);
+        const ImU32 relSelBg     = col(pal.accent, 0.85f);
+        const ImU32 relSelBorder = col(pal.accent);
+        const ImU32 relSelInk    = col(pal.statusBg);         // dark glyph reads on the accent fill
+        const ImU32 dimErrCol    = col(pal.statusErr);        // conflicting/redundant relations -> red
+        const ImU32 leaderCol    = col(pal.sketchRelBorder, 0.4f);
+        auto isConflict = [&](const std::string& cid) {
+            return std::find(conflicting_.begin(), conflicting_.end(), cid) != conflicting_.end()
+                || std::find(redundant_.begin(),  redundant_.end(),  cid) != redundant_.end();
+        };
+        auto baseId = [](const std::string& h) { return h.substr(0, h.find('.')); };
+        // Screen point a ref handle resolves to ("e3" entity, "e3.p2" point handle, or "origin").
+        auto refScreen = [&](const std::string& h, ImVec2& s) -> bool {
+            if (baseId(h) == "origin") { s = uvToScreen(0, 0); return true; }
+            const SketchEntity* e = entById(baseId(h));
+            if (!e) return false;
+            if (h.find(".p1") != std::string::npos)           s = uvToScreen(e->p1[0], e->p1[1]);
+            else if (h.find(".p2") != std::string::npos)      s = uvToScreen(e->p2[0], e->p2[1]);
+            else if (h.find(".center") != std::string::npos)  s = uvToScreen(e->center[0], e->center[1]);
+            else if (e->type == "line")  s = uvToScreen((e->p1[0]+e->p2[0])*0.5f, (e->p1[1]+e->p2[1])*0.5f);
+            else                         s = uvToScreen(e->center[0], e->center[1]);
+            return true;
+        };
+        // Geometry point a badge POINTS AT: entity midpoint / the point / arc rim mid-sweep.
+        auto refAttach = [&](const std::string& h, ImVec2& s) -> bool {
+            if (h.find('.') != std::string::npos || baseId(h) == "origin") return refScreen(h, s);
+            const SketchEntity* e = entById(baseId(h));
+            if (!e) return false;
+            if (e->type == "line" || e->type == "slot") {
+                ImVec2 a = uvToScreen(e->p1[0], e->p1[1]), b = uvToScreen(e->p2[0], e->p2[1]);
+                s = ImVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
+                return true;
+            }
+            if (e->type == "circle" || e->type == "arc" || e->type == "arc_slot") {
+                float aMid = 45.0f;
+                if (e->type != "circle") {
+                    float a0 = e->start, a1 = e->end; if (a1 < a0) a1 += 360.0f;
+                    aMid = (a0 + a1) * 0.5f;
+                }
+                float ar = aMid * 3.14159265f / 180.0f;
+                s = uvToScreen(e->center[0] + e->radius * std::cos(ar),
+                               e->center[1] + e->radius * std::sin(ar));
+                return true;
+            }
+            return refScreen(h, s);
+        };
+        // Initial chip center: the attachment point pushed clear of the geometry line.
+        auto badgeAnchor = [&](const std::string& h, ImVec2& out) -> bool {
+            const float off = 10.0f * ui::uiScale + bs * 0.5f;
+            if (h.find('.') != std::string::npos || baseId(h) == "origin") {
+                ImVec2 s; if (!refScreen(h, s)) return false;
+                out = ImVec2(s.x + off * 0.8f, s.y - off * 0.8f);
+                return true;
+            }
+            const SketchEntity* e = entById(baseId(h));
+            if (!e) return false;
+            if (e->type == "line" || e->type == "slot") {
+                ImVec2 a = uvToScreen(e->p1[0], e->p1[1]), b = uvToScreen(e->p2[0], e->p2[1]);
+                ImVec2 m((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
+                float dx = b.x - a.x, dy = b.y - a.y; float L = std::hypot(dx, dy);
+                float nx = L > 1e-3f ? -dy / L : 0.0f, ny = L > 1e-3f ? dx / L : -1.0f;
+                out = ImVec2(m.x + nx * off, m.y + ny * off);
+                return true;
+            }
+            if (e->type == "circle" || e->type == "arc" || e->type == "arc_slot") {
+                float aMid = 45.0f;
+                if (e->type != "circle") {
+                    float a0 = e->start, a1 = e->end; if (a1 < a0) a1 += 360.0f;
+                    aMid = (a0 + a1) * 0.5f;
+                }
+                float ar = aMid * 3.14159265f / 180.0f;
+                ImVec2 cc = uvToScreen(e->center[0], e->center[1]);
+                ImVec2 rim = uvToScreen(e->center[0] + e->radius * std::cos(ar),
+                                        e->center[1] + e->radius * std::sin(ar));
+                float dx = rim.x - cc.x, dy = rim.y - cc.y; float L = std::hypot(dx, dy);
+                if (L > 1e-3f) out = ImVec2(rim.x + dx / L * off, rim.y + dy / L * off);
+                else           out = ImVec2(cc.x + off, cc.y - off);
+                return true;
+            }
+            ImVec2 s; if (!refScreen(h, s)) return false;
+            out = ImVec2(s.x + off * 0.8f, s.y - off * 0.8f);
+            return true;
+        };
+        // (1) Collect every non-dimensional relation as a Badge.
+        struct Badge { std::string cid; const char* glyph; const char* name; bool conflict;
+                       ImVec2 pos, anchor; };
+        std::vector<Badge> badges;
+        auto pushBadge = [&](const std::string& cid, const std::string& h, const char* glyph,
+                             const char* name, bool conflict) {
+            ImVec2 pos, anchor;
+            if (!badgeAnchor(h, pos)) return;
+            if (!refAttach(h, anchor)) anchor = pos;
+            badges.push_back({cid, glyph, name, conflict, pos, anchor});
+        };
+        for (const auto& c : cons_) {
+            if (c.isDimensional() || c.refs.empty()) continue;
+            const char* g = c.type == "horizontal"    ? "-"
+                          : c.type == "vertical"      ? "|"
+                          : c.type == "parallel"      ? "//"
+                          : c.type == "perpendicular" ? "L"
+                          : c.type == "equal"         ? "="
+                          : c.type == "coincident"    ? "o"
+                          : c.type == "concentric"    ? "c"
+                          : c.type == "tangent"       ? "T"
+                          : c.type == "collinear"     ? "col"
+                          : c.type == "coradial"      ? "cr"
+                          : c.type == "midpoint"      ? "m"
+                          : c.type == "symmetric"     ? "s"
+                          : c.type == "fix"           ? "x" : nullptr;
+            if (!g) continue;
+            bool conflict = isConflict(c.id);
+            // Entity-pair relations get a badge on EACH ref (SolidWorks shows both sides);
+            // single-entity / point relations get one badge at the first ref.
+            bool pairRel = c.type == "parallel" || c.type == "perpendicular" ||
+                           c.type == "equal" || c.type == "tangent" || c.type == "concentric" ||
+                           c.type == "collinear" || c.type == "coradial" || c.type == "symmetric";
+            if (pairRel) { for (const auto& rh : c.refs) pushBadge(c.id, rh, g, c.type.c_str(), conflict); }
+            else         pushBadge(c.id, c.refs[0], g, c.type.c_str(), conflict);
+        }
+        // (2) Spread: 8 relaxation passes pushing any overlapping pair apart by half the overlap.
+        for (int it = 0; it < 8; ++it) {
+            for (size_t i = 0; i < badges.size(); ++i) {
+                for (size_t j = i + 1; j < badges.size(); ++j) {
+                    float dx = badges[j].pos.x - badges[i].pos.x;
+                    float dy = badges[j].pos.y - badges[i].pos.y;
+                    float d = std::hypot(dx, dy);
+                    const float minD = bs + 2.0f;
+                    if (d >= minD) continue;
+                    float ox, oy;
+                    if (d < 1e-3f) { ox = minD * 0.5f; oy = 0.0f; }   // coincident -> shove along +x
+                    else { float push = (minD - d) * 0.5f; ox = dx / d * push; oy = dy / d * push; }
+                    badges[i].pos.x -= ox; badges[i].pos.y -= oy;
+                    badges[j].pos.x += ox; badges[j].pos.y += oy;
+                }
+            }
+        }
+        // (3) Draw: hairline leader (only when the chip drifted off its anchor) + chip + hit-rect.
+        relHits_.clear();
+        for (const auto& b : badges) {
+            const ImVec2 gp = b.pos;
+            if (std::hypot(gp.x - b.anchor.x, gp.y - b.anchor.y) > bs)
+                dl->AddLine(b.anchor, gp, leaderCol, 0.8f);
+            ImVec2 c0(gp.x - bs * 0.5f, gp.y - bs * 0.5f), c1(gp.x + bs * 0.5f, gp.y + bs * 0.5f);
+            bool hot = isRelSelected(b.cid) || hoverRelCid_ == b.cid;
+            dl->AddRectFilled(c0, c1, hot ? relSelBg : relBg, 3.5f * ui::uiScale);
+            dl->AddRect(c0, c1, b.conflict ? dimErrCol : (hot ? relSelBorder : relBorder),
+                        3.5f * ui::uiScale, 0, (b.conflict || hot) ? 1.8f : 1.2f);
+            ImVec2 gs = ImGui::CalcTextSize(b.glyph);
+            dl->AddText(ImVec2(gp.x - gs.x * 0.5f, gp.y - gs.y * 0.5f),
+                        b.conflict ? dimErrCol : (hot ? relSelInk : relInk), b.glyph);
+            relHits_.push_back({b.cid, c0, c1});
+            if (imgHovered && io.MousePos.x >= c0.x && io.MousePos.x <= c1.x &&
+                io.MousePos.y >= c0.y && io.MousePos.y <= c1.y)
+                ImGui::SetTooltip("%s", b.name);
         }
     }
 
@@ -5161,11 +5317,22 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         else if (sub == "p2")     p = uvToScreen(e->p2[0], e->p2[1]);
         else if (sub == "center") p = uvToScreen(e->center[0], e->center[1]);
         else if (sub == "p")      p = uvToScreen(e->p1[0], e->p1[1]);
+        else if (sub == "start_angle") {
+            const float D2R = 3.14159265f / 180.0f;
+            p = uvToScreen(e->center[0] + e->radius * std::cos(e->start * D2R),
+                           e->center[1] + e->radius * std::sin(e->start * D2R));
+        }
+        else if (sub == "end_angle") {
+            const float D2R = 3.14159265f / 180.0f;
+            p = uvToScreen(e->center[0] + e->radius * std::cos(e->end * D2R),
+                           e->center[1] + e->radius * std::sin(e->end * D2R));
+        }
+        else if (sub == "rim") { continue; }   // floating cursor-dependent handle, not persisted
         else continue;
         dl->AddRectFilled(ImVec2(p.x - 4, p.y - 4), ImVec2(p.x + 4, p.y + 4), col(pal.accent), 1.5f);
     }
 
-    // ---- C37-D: dimension annotations + relation glyphs (always rendered) ----
+    // ---- C37-D: dimension annotations (always rendered, ON TOP of entity lines) ----
     {
         const ImU32 dimLineCol = col(pal.sketchDimLine, 0.85f);
         const ImU32 dimTextCol = col(pal.sketchInk);
@@ -5182,128 +5349,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             return std::find(conflicting_.begin(), conflicting_.end(), cid) != conflicting_.end()
                 || std::find(redundant_.begin(),  redundant_.end(),  cid) != redundant_.end();
         };
-        // 1) relation badges for geometric (non-dimensional) constraints.
-        auto baseId = [](const std::string& h) { return h.substr(0, h.find('.')); };
-        auto refScreen = [&](const std::string& h, ImVec2& s) -> bool {
-            if (baseId(h) == "origin") { s = uvToScreen(0, 0); return true; }
-            const SketchEntity* e = entById(baseId(h));
-            if (!e) return false;
-            if (h.find(".p1") != std::string::npos)      s = uvToScreen(e->p1[0], e->p1[1]);
-            else if (h.find(".p2") != std::string::npos) s = uvToScreen(e->p2[0], e->p2[1]);
-            else if (h.find(".center") != std::string::npos) s = uvToScreen(e->center[0], e->center[1]);
-            else if (e->type == "line")  s = uvToScreen((e->p1[0]+e->p2[0])*0.5f, (e->p1[1]+e->p2[1])*0.5f);
-            else                         s = uvToScreen(e->center[0], e->center[1]);
-            return true;
-        };
-        // C41 (T3): SolidWorks-like relation badges — ~16px (ui::uiScale-scaled) rounded chips
-        // with a light-green fill (palette.sketchRelBg), darker green border, and a DARK ASCII
-        // glyph (plain ASCII on purpose: no missing-glyph boxes). Entity-level relations sit at
-        // the entity midpoint pushed ~10px perpendicular; point-level ones at the point + a
-        // small diagonal offset. Badges whose refs can't be resolved are skipped. Multiple
-        // badges on the same ref stack horizontally.
-        const float bs = 16.0f * ui::uiScale;                 // chip side
-        const ImU32 relBg     = col(pal.sketchRelBg);
-        const ImU32 relBorder = col(pal.sketchRelBorder);
-        const ImU32 relInk    = col(pal.sketchInk);
-        std::unordered_map<std::string, int> badgeStack;      // per-anchor-cell stacking index
-        // Chip-center anchor for a ref handle (entity id "e3" or point handle "e3.p2").
-        auto badgeAnchor = [&](const std::string& h, ImVec2& out) -> bool {
-            const SketchEntity* e = entById(baseId(h));
-            if (!e) return false;
-            const float off = 10.0f * ui::uiScale + bs * 0.5f;   // clear the geometry line
-            if (h.find('.') != std::string::npos) {              // point-level: point + offset
-                ImVec2 s;
-                if (!refScreen(h, s)) return false;
-                out = ImVec2(s.x + off * 0.8f, s.y - off * 0.8f);
-                return true;
-            }
-            if (e->type == "line" || e->type == "slot") {        // midpoint + unit perpendicular
-                ImVec2 a = uvToScreen(e->p1[0], e->p1[1]), b = uvToScreen(e->p2[0], e->p2[1]);
-                ImVec2 m((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
-                float dx = b.x - a.x, dy = b.y - a.y; float L = std::hypot(dx, dy);
-                float nx = L > 1e-3f ? -dy / L : 0.0f, ny = L > 1e-3f ? dx / L : -1.0f;
-                out = ImVec2(m.x + nx * off, m.y + ny * off);
-                return true;
-            }
-            if (e->type == "circle" || e->type == "arc" || e->type == "arc_slot") {
-                // rim point (45° for circles, mid-sweep for arcs), pushed radially outward
-                float aMid = 45.0f;
-                if (e->type != "circle") {
-                    float a0 = e->start, a1 = e->end; if (a1 < a0) a1 += 360.0f;
-                    aMid = (a0 + a1) * 0.5f;
-                }
-                float ar = aMid * 3.14159265f / 180.0f;
-                ImVec2 cc = uvToScreen(e->center[0], e->center[1]);
-                ImVec2 rim = uvToScreen(e->center[0] + e->radius * std::cos(ar),
-                                        e->center[1] + e->radius * std::sin(ar));
-                float dx = rim.x - cc.x, dy = rim.y - cc.y; float L = std::hypot(dx, dy);
-                if (L > 1e-3f) out = ImVec2(rim.x + dx / L * off, rim.y + dy / L * off);
-                else           out = ImVec2(cc.x + off, cc.y - off);
-                return true;
-            }
-            ImVec2 s;                                            // point entity / fallback
-            if (!refScreen(h, s)) return false;
-            out = ImVec2(s.x + off * 0.8f, s.y - off * 0.8f);
-            return true;
-        };
-        // C50f: conflict flag flows in so a fighting relation's chip border + glyph go red.
-        // C51: accent tint for a selected/hovered relation badge (relations are click-selectable).
-        const ImU32 relSelBg     = col(pal.accent, 0.85f);
-        const ImU32 relSelBorder = col(pal.accent);
-        const ImU32 relSelInk    = col(pal.statusBg);   // dark glyph reads on the accent fill
-        auto drawBadge = [&](const std::string& cid, const std::string& h, const char* glyph,
-                             const char* name, bool conflict) {
-            ImVec2 gp;
-            if (!badgeAnchor(h, gp)) return;
-            // Stack badges landing in the same screen cell along +x (covers both multiple
-            // relations on one ref AND distinct refs whose anchors coincide, e.g. a fix and a
-            // coincident on the same corner point).
-            char cell[40];
-            std::snprintf(cell, sizeof(cell), "%d:%d",
-                          (int)std::floor(gp.x / bs), (int)std::floor(gp.y / bs));
-            gp.x += (float)badgeStack[cell]++ * (bs + 2.0f);
-            ImVec2 c0(gp.x - bs * 0.5f, gp.y - bs * 0.5f), c1(gp.x + bs * 0.5f, gp.y + bs * 0.5f);
-            bool hot = isRelSelected(cid) || hoverRelCid_ == cid;
-            dl->AddRectFilled(c0, c1, hot ? relSelBg : relBg, 3.5f * ui::uiScale);
-            dl->AddRect(c0, c1, conflict ? dimErrCol : (hot ? relSelBorder : relBorder),
-                        3.5f * ui::uiScale, 0, (conflict || hot) ? 1.8f : 1.2f);
-            ImVec2 gs = ImGui::CalcTextSize(glyph);
-            dl->AddText(ImVec2(gp.x - gs.x * 0.5f, gp.y - gs.y * 0.5f),
-                        conflict ? dimErrCol : (hot ? relSelInk : relInk), glyph);
-            // Record the badge rect (constraint id) for click hit-testing this frame.
-            relHits_.push_back({cid, c0, c1});
-            // Hover tooltip naming the relation type.
-            if (imgHovered && io.MousePos.x >= c0.x && io.MousePos.x <= c1.x &&
-                io.MousePos.y >= c0.y && io.MousePos.y <= c1.y)
-                ImGui::SetTooltip("%s", name);
-        };
-        relHits_.clear();
-        for (const auto& c : cons_) {
-            if (c.isDimensional() || c.refs.empty()) continue;
-            const char* g = c.type == "horizontal"    ? "-"
-                          : c.type == "vertical"      ? "|"
-                          : c.type == "parallel"      ? "//"
-                          : c.type == "perpendicular" ? "L"
-                          : c.type == "equal"         ? "="
-                          : c.type == "coincident"    ? "o"
-                          : c.type == "concentric"    ? "c"
-                          : c.type == "tangent"       ? "T"
-                          : c.type == "collinear"     ? "col"
-                          : c.type == "coradial"      ? "cr"
-                          : c.type == "midpoint"      ? "m"
-                          : c.type == "symmetric"     ? "s"
-                          : c.type == "fix"           ? "x" : nullptr;
-            if (!g) continue;
-            bool conflict = isConflict(c.id);
-            // Entity-pair relations get a badge on EACH ref (SolidWorks shows both sides);
-            // single-entity / point relations get one badge at the first ref.
-            bool pairRel = c.type == "parallel" || c.type == "perpendicular" ||
-                           c.type == "equal" || c.type == "tangent" || c.type == "concentric" ||
-                           c.type == "collinear" || c.type == "coradial" || c.type == "symmetric";
-            if (pairRel) { for (const auto& rh : c.refs) drawBadge(c.id, rh, g, c.type.c_str(), conflict); }
-            else         drawBadge(c.id, c.refs[0], g, c.type.c_str(), conflict);
-        }
-        // 2) dimension annotations. C50g: SolidWorks-style picking — a dim is hovered when the
+        // Dimension annotations. C50g: SolidWorks-style picking — a dim is hovered when the
         // mouse is inside its TEXT box (padded ~4px*uiScale) or within ~6px*uiScale of its
         // DIMENSION LINE (not the extension lines). We draw every dim non-hovered first while
         // collecting per-dim hit geometry, resolve the hover (text beats line, then nearest),
@@ -5601,8 +5647,33 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             if (frame != dragFrame_ && imgHovered) {
                 dragFrame_ = frame;
                 nlohmann::json res;
-                nlohmann::json extra = {{"handle", dragHandle_},
-                                        {"xy", nlohmann::json::array({mu, mv})}};
+                // Most handles target the cursor model point (u,v). The new scalar handles
+                // (.rim / .start_angle / .end_angle) instead target a single solver variable, so the
+                // scalar goes in xy[0]; xy[1] is ignored by the engine's 1-variable soft-target drag.
+                nlohmann::json extra;
+                auto hSuf = [](const std::string& h, const char* suf) {
+                    auto p = h.rfind('.');
+                    return p != std::string::npos && h.substr(p + 1) == suf;
+                };
+                std::string hEid = dragHandle_.substr(0, dragHandle_.find('.'));
+                const SketchEntity* hEnt = entById(hEid);
+                if (hSuf(dragHandle_, "rim") && hEnt) {
+                    double dr = std::hypot((double)mu - hEnt->center[0],
+                                           (double)mv - hEnt->center[1]);
+                    extra = {{"handle", dragHandle_},
+                             {"xy", nlohmann::json::array({dr, 0.0})}};
+                } else if ((hSuf(dragHandle_, "start_angle") ||
+                            hSuf(dragHandle_, "end_angle")) && hEnt) {
+                    double ang = std::atan2((double)mv - hEnt->center[1],
+                                            (double)mu - hEnt->center[0])
+                                 * 180.0 / 3.14159265358979;
+                    if (ang < 0) ang += 360.0;
+                    extra = {{"handle", dragHandle_},
+                             {"xy", nlohmann::json::array({ang, 0.0})}};
+                } else {
+                    extra = {{"handle", dragHandle_},
+                             {"xy", nlohmann::json::array({(double)mu, (double)mv})}};
+                }
                 if (callSketch(st, "sketch_drag", extra, res)) applyEnterResult(res);
             }
         }

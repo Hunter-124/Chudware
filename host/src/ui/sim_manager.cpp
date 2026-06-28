@@ -2786,8 +2786,10 @@ void SimManager::drawFlowForm(AppState& st, Study& s) {
     bool ofAvail = false; std::string ofVer;
     if (st.simClient) {
         nlohmann::json caps = st.simClient->caps();
-        ofAvail = caps.value("openfoam", false);
-        ofVer = caps.value("openfoam_version", std::string());
+        if (caps.is_object()) {
+            ofAvail = caps.value("openfoam", false);
+            ofVer = caps.value("openfoam_version", std::string());
+        }
     }
 
     if (!thermalStudy) {

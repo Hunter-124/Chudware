@@ -30,6 +30,9 @@
   arc_center, arc_tangent, polygon, slot, spline, ellipse, point_ent, text_ent, trim, extend,
   offset_ent, convert_ent, mirror_ent, pattern_lin_ent, pattern_circ_ent, move_ent,
   construction, relations, fix`
+- **Sketch flyouts** (variant tools, parented under their base tool): `rect_3pt_corner,
+  rect_3pt_center, parallelogram, circle_perimeter, slot_ctr_str, slot_arc_3pt, slot_arc_ctr,
+  spline_style, spline_surface, spline_equation, ellipse_partial, parabola, conic`
 - **Assembly tab**: `insert_component, mate, move_component, rotate_component,
   pattern_component, smart_fasteners, exploded_view, bom, interference`
 - **Evaluate tab**: `measure, mass_props, section_props, interference_eval, draft_analysis,
@@ -47,5 +50,20 @@
 - **Workspace tabs**: `ws_features, ws_sketch, ws_evaluate, ws_assembly, ws_sheetmetal,
   ws_weldments, ws_surfaces, ws_appearance`
 - **Appearance**: `color_picker, appr_metal, appr_plastic, appr_glass, appr_paint, appr_default`
+
+## Sketch-tool glyphs
+
+Sketch-tool icons depict the **result/action** of each tool, not a generic emblem: the produced
+geometry is the bold stroke shape and the defining interaction is an accent cue — endpoints &
+picks (line, rectangle corners, circle center+rim, arc 3-points), centerlines (center rectangle,
+slot, the construction dash-dot line), a dimension line with double arrows + value tag
+(`smart_dim`), scissors over a removed red-dashed segment (`trim`), a dashed reach-to-wall
+(`extend`), parallel offset curves (`offset_ent`), edge→sketch projection arrows (`convert_ent`),
+a mirror axis with a reflected asymmetric shape (`mirror_ent`), seed + copies along a direction or
+ring (`pattern_lin_ent` / `pattern_circ_ent`), and a source → dashed-ghost translation
+(`move_ent`). Curves (`spline`, `spline_style`, `parabola`, `conic`) are sampled smooth paths
+through their control points. All are tuned to read at **20 px and 32 px in both themes**. Glyph
+drawings may be revised freely; the **names and atlas layout (UVs) stay stable**, so a redraw
+never shifts any other icon's cell.
 
 Adding an icon = add a draw function + name here; atlas layout is computed, never hand-packed.

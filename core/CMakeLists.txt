@@ -797,6 +797,24 @@ if(AICAD_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(document PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- Sketch-on-face DISPLAY fix (doc/session.cpp resolve_sketch_plane) -------
+  # A sketch whose refs.plane is a kind=="face" selector must ENTER on that face:
+  # doc_sketch_enter's plane_frame origin at the face offset, not SketchPlane::top()
+  # (origin 0,0,0 — the reported display bug). Builds a box (rect sketch + extrude H)
+  # via doc_apply_ops, adds a second sketch on a face selector targeting the top face,
+  # and asserts the entered plane sits at z=H.
+  add_executable(test_sketch_on_face
+    tests/test_sketch_on_face.cpp)
+  target_include_directories(test_sketch_on_face PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_sketch_on_face PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_sketch_on_face PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME sketch_on_face COMMAND test_sketch_on_face)
+  set_tests_properties(sketch_on_face PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- Simulation-study persistence + mutate RPCs (doc_sim_study_*) -----------
   # Exercises the full study lifecycle (add/edit/list/save+open/delete) on a blank
   # part. doc_new/doc_open compile the empty document through OCCT, so this is gated

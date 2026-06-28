@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
     // headless screenshot mode: --shot <path> [--frames N]
     const char* shotPath = nullptr; int shotFrames = 12; bool demo = false;
     const char* doCmd = nullptr; bool openPalette = false; bool sketch = false;
-    bool selftest = false, picktest = false, shelltest = false, edgetest = false, extrudetest = false; bool light = false;
+    bool selftest = false, picktest = false, shelltest = false, edgetest = false, extrudetest = false, apptest = false; bool light = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--shot") && i+1 < argc) shotPath = argv[++i];
         else if (!std::strcmp(argv[i], "--frames") && i+1 < argc) shotFrames = atoi(argv[++i]);
@@ -71,6 +71,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--shelltest")) shelltest = true;
         else if (!std::strcmp(argv[i], "--edgetest")) edgetest = true;
         else if (!std::strcmp(argv[i], "--extrudetest")) extrudetest = true;
+        else if (!std::strcmp(argv[i], "--apptest")) apptest = true;
         else if (!std::strcmp(argv[i], "--light")) light = true;
     }
 
@@ -241,6 +242,35 @@ int main(int argc, char** argv) {
             int nf = 0; const auto& t = st.engine.tree(); if (t.contains("features") && t["features"].is_array()) nf = (int)t["features"].size();
             bool ok = r.ok && nf >= 2;
             std::fprintf(stderr, "[extrudetest] ok=%d features=%d rev=%d -> %s\n", (int)r.ok, nf, st.engine.revision(), ok ? "OK" : "FAIL");
+            rc = ok ? 0 : 2;
+        }
+        application.shutdown();
+        glfwDestroyWindow(win); glfwTerminate();
+        return rc;
+    }
+
+    if (apptest) {
+        // End-to-end appearance: set_appearance op -> re-baked AICM -> scene reads the new look back.
+        auto& st = application.state();
+        int rc = 2;
+        if (!st.engineReady || !st.scene) std::fprintf(stderr, "[apptest] FAIL: no engine/scene\n");
+        else {
+            st.engine.newPart("T"); st.engine.addBox(40, 30, 20, "Base"); st.engine.rebuild();
+            st.scene->resize(800, 600);
+            st.scene->loadAicm(st.engine.aicmPath());
+            uint32_t bid = st.scene->bodyIdAt(0);
+            nlohmann::json ops = nlohmann::json::array();
+            ops.push_back({ {"op","set_appearance"}, {"id", std::string("b") + std::to_string(bid)},
+                            {"color", {1.00, 0.78, 0.34}}, {"metallic", 1.0}, {"roughness", 0.25} });  // gold
+            eng::OpsResult r = st.engine.apply(ops);
+            bool reloaded = r.ok && !st.engine.aicmPath().empty() && st.scene->loadAicm(st.engine.aicmPath());
+            float c[3] = {0,0,0}; float m = -1, rough = -1;
+            bool got = reloaded && st.scene->getBodyAppearance(st.scene->bodyIdAt(0), c, m, rough);
+            bool colorOk = got && c[0] > 0.9f && c[1] > 0.65f && c[2] > 0.25f && c[2] < 0.45f
+                               && m > 0.9f && rough < 0.35f;
+            bool ok = r.ok && reloaded && colorOk;
+            std::fprintf(stderr, "[apptest] applyOk=%d reload=%d color=(%.2f,%.2f,%.2f) metal=%.2f rough=%.2f -> %s\n",
+                         (int)r.ok, (int)reloaded, c[0], c[1], c[2], m, rough, ok ? "OK" : "FAIL");
             rc = ok ? 0 : 2;
         }
         application.shutdown();

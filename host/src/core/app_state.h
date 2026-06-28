@@ -926,6 +926,9 @@ struct AppState {
     int  planeEmphasis = -1;
     // C25 W3-J: viewport display/visibility state.
     int  displayStyle  = 1;          // mirrors DisplayStyle enum; 0=Shaded 1=ShadedEdges(default) 2=HLR 3=HLV 4=Wire
+    // Appearance ribbon "Appearance..." button -> one-shot request the viewport's color/material
+    // picker for the whole model (body "b1"). Consumed (and cleared) by viewport_panel each frame.
+    bool requestAppearanceEditor = false;
     bool showTriad        = true;    // orientation triad, bottom-left of viewport
     bool showGroundShadow = true;    // soft contact-shadow blob
     bool showRealView     = true;    // C30-C: procedural environment reflections (RealView sheen)
@@ -971,6 +974,8 @@ struct AppState {
         // W17 drawing overhaul: contextual tabs shown ONLY while a Drawing doc is active
         // (they replace the mechanical tabs, SolidWorks-style). See ribbon_tabVisible().
         RT_ViewLayout = 9, RT_Annotation = 10,
+        // Appearance workspace — per-body color / RealView material / display style (3D docs).
+        RT_Appearance = 11,
     };
     bool showRibbon = true;        // View > Ribbon visibility toggle
     bool profilerRunning = false;  // Evaluate > Profiler: sampling profiler active (libaicad prof_*)

@@ -31,6 +31,14 @@ public:
     void setStyle(int s) { style_ = s; }       // 0 shaded, 1 shaded+edges, 2 wireframe
     int  style() const { return style_; }
 
+    // ---- per-body appearance (live viewport override; engine set_appearance persists) ----
+    int  bodyCount() const { return (int)bodies_.size(); }
+    uint32_t bodyIdAt(int i) const { return (i>=0 && i<(int)bodies_.size()) ? bodies_[i].body_id : 0; }
+    // Read a body's current color/metallic/roughness (false if body_id not found).
+    bool getBodyAppearance(uint32_t body_id, float color[3], float& metallic, float& roughness) const;
+    // Override a body's color/metallic/roughness in place (no re-tessellation). body_id 0 = all bodies.
+    void setBodyAppearance(uint32_t body_id, const float color[3], float metallic, float roughness);
+
     // ---- selection / picking (faces) ----
     struct PickRef { uint32_t body_id=0; uint32_t topo_id=0; int kind=0;  // kind 0=face
         bool operator==(const PickRef& o) const { return body_id==o.body_id && topo_id==o.topo_id && kind==o.kind; } };

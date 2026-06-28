@@ -1,5 +1,6 @@
 #include "app/app_state.h"
 #include "platform/file_dialog.h"
+#include "viewport/scene.h"
 #include <cstring>
 #include <string>
 
@@ -59,6 +60,27 @@ void AppState::dispatch(const char* cmdId) {
     if (std::strcmp(cmdId, "ecad_ai_design") == 0) {
         startDemoAgent("Design a 5V regulator schematic.");
         status = "AI Design"; return;
+    }
+
+    // ---- Appearance group: display style (live, no engine round-trip) ----
+    if (std::strcmp(cmdId, "view_style") == 0) {        // primary button cycles the style
+        viewStyle = (viewStyle + 1) % 3;
+        if (scene) scene->setStyle(viewStyle);
+        static const char* nm[3] = {"Shaded", "Shaded + Edges", "Wireframe"};
+        status = std::string("Display: ") + nm[viewStyle]; return;
+    }
+    if (std::strcmp(cmdId, "view_style_shaded") == 0) { viewStyle = 0; if (scene) scene->setStyle(0); status = "Display: Shaded"; return; }
+    if (std::strcmp(cmdId, "view_style_edges")  == 0) { viewStyle = 1; if (scene) scene->setStyle(1); status = "Display: Shaded + Edges"; return; }
+    if (std::strcmp(cmdId, "view_style_wire")   == 0) { viewStyle = 2; if (scene) scene->setStyle(2); status = "Display: Wireframe"; return; }
+
+    // ---- Appearance group: open the material/color/finish editor ----
+    if (std::strcmp(cmdId, "appearance_edit") == 0) {
+        activeTool = "appearance_edit";
+        railTab = 1;                          // surface the Bodies rail alongside the editor
+        apNeedsInit = true;
+        apBody = 0;                            // default: all bodies
+        if (scene && !scene->selection().empty()) apBody = scene->selection().front().body_id;
+        status = "Appearance"; return;
     }
 
     // Variants (Extrude Cut, etc.) open the parent tool's inspector with the op pre-selected.

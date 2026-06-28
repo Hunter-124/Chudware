@@ -18,7 +18,7 @@ enum class Workspace {
 
 enum class Group {
     // 3D verb groups
-    Sketch, Create, Modify, Pattern, Construct, Inspect, Output,
+    Sketch, Create, Modify, Pattern, Construct, Inspect, Output, Appearance,
     // sketch
     Draw, Dimension, Relations, Finish,
     // simulate

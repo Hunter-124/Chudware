@@ -376,6 +376,30 @@ static const RibbonCmd kCmds[] = {
     // docs/PROFILER.md. Click to start; model; click again to stop + save a report.
     { "prof_toggle",      "Profiler",      "results",       "Evaluate", "Performance",   true,  nullptr, false },
 
+    // =========================================================================
+    // Tab: Appearance — per-body color, RealView material + display style.
+    // Material presets apply a set_appearance op to the model (body "b1"); "Appearance"
+    // opens the full color/material picker; Display sets st.displayStyle. All handled in
+    // app.cpp's dispatcher. Icons reuse existing atlas glyphs (material / refresh /
+    // display_*) so gui_lint --rule icons stays clean.
+    // =========================================================================
+
+    // --- Group: Material ---
+    { "appr_color",          "Appearance",      "material",         "Appearance", "Material", true,  nullptr, false },
+    { "appr_mat_plastic",    "Plastic",         "material",         "Appearance", "Material", true,  nullptr, false },
+    { "appr_mat_aluminum",   "Aluminum",        "material",         "Appearance", "Material", true,  nullptr, false },
+    { "appr_mat_steel",      "Steel",           "material",         "Appearance", "Material", true,  nullptr, false },
+    { "appr_mat_brass",      "Brass",           "material",         "Appearance", "Material", true,  nullptr, false },
+    { "appr_mat_dark",       "Dark Metal",      "material",         "Appearance", "Material", true,  nullptr, false },
+    { "appr_clear",          "Clear",           "refresh",          "Appearance", "Material", false, nullptr, false },
+
+    // --- Group: Display --- (sets st.displayStyle; the viewport applies it each frame) ---
+    { "display_shaded",       "Shaded",          "display_shaded",       "Appearance", "Display", true,  nullptr, false },
+    { "display_shaded_edges", "Shaded Edges",    "display_shaded_edges", "Appearance", "Display", true,  nullptr, false },
+    { "display_hlr",          "Hidden Removed",  "display_hlr",          "Appearance", "Display", true,  nullptr, false },
+    { "display_hlv",          "Hidden Visible",  "display_hlv",          "Appearance", "Display", false, nullptr, false },
+    { "display_wireframe",    "Wireframe",       "display_wireframe",    "Appearance", "Display", true,  nullptr, false },
+
 };
 // clang-format on
 

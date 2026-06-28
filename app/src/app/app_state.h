@@ -85,6 +85,13 @@ struct AppState {
     std::string activeTool;             // open inspector tool (cmd id), empty = none
     std::string toolExtrudeOp;          // demo: op variant for the unified Extrude tool
 
+    // appearance editor (Appearance group): per-body color + RealView finish.
+    bool     apNeedsInit = false;          // pull the target body's appearance into the form on open
+    uint32_t apBody = 0;                    // target body ordinal (engine "b<n>"); 0 = all bodies
+    float    apColor[3] = {0.71f, 0.76f, 0.82f};
+    float    apMetal = 0.f;
+    float    apRough = 0.5f;
+
     // left dock
     int   railTab = 0;                  // 0 Tree, 1 Bodies, 2 Files, 3 Configs
     std::string selectedFeature;

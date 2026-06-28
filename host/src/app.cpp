@@ -57,6 +57,7 @@
 #include "ui/ecad/ecad_mirror.h"  // Wave N: complete type for EcadMirror::setDocId
 #include "ui/file_dialog.h"       // Wave Y: native Save As / Open dialogs for .ecad+
 #include "ui/icons.h"
+#include "ui/appearance_common.h"  // Appearance tab: MaterialPreset table (kMaterials) for presets
 #include "ui/widgets/ribbon.h"
 #include "ui/ribbon_def.h"
 #include "ui/property_manager.h"
@@ -91,6 +92,29 @@
 // geometry-placing ops (sch_add_symbol, pcb_add_track, ...) still need canvas-click placement.
 // =====================================================================================
 namespace {
+
+// Appearance ribbon: apply a set_appearance op to the whole model (body "b1") and reload the mesh
+// so the new color/material shows immediately. color==nullptr clears back to the default grey.
+// A direct apply is safe from the ribbon dispatcher (it runs before the FeatureManager tree walk
+// this frame, like edit_delete / Flatten). "b1" matches the feature-tree root convention; per-body
+// edits stay on the tree / viewport context menu.
+void applyModelAppearance(AppState& st, const float* color, float metallic, float roughness) {
+    if (!st.docMirror.hasDoc() || !st.workerStarted) {
+        st.toast(ui::ToastLevel::Info, "Open a part first to change its appearance");
+        return;
+    }
+    nlohmann::json op = {{"op", "set_appearance"}, {"id", "b1"}};
+    if (color) { op["color"] = {color[0], color[1], color[2]};
+                 op["metallic"] = metallic; op["roughness"] = roughness; }
+    else op["color"] = nullptr;
+    auto resp = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (resp.ok && !resp.aicm_path.empty()) {
+        std::string lerr; st.loadDocMesh(resp.aicm_path, lerr);
+        if (!lerr.empty()) st.addLog("[err] loadDocMesh: " + lerr);
+    } else if (!resp.ok) {
+        st.addLog("[err] set_appearance: " + resp.error_message);
+    }
+}
 
 // Feed a worker ECAD ops-response into the editor mirror; track doc id + revision.
 void ecadAdopt(AppState& st, const nlohmann::json& res) {
@@ -1050,6 +1074,32 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // W17 drawing overhaul: View Layout / Annotation ribbon commands route to the 2D panel.
         if (std::strncmp(cmd_id, "dwg_", 4) == 0 && ui::drawingHandleCommand(st, std::string(cmd_id)))
             return;
+        // ---- Appearance tab: Display group (cheap — viewport applies st.displayStyle each frame) ----
+        {
+            int ds = -1;
+            if      (std::strcmp(cmd_id, "display_shaded")       == 0) ds = 0;
+            else if (std::strcmp(cmd_id, "display_shaded_edges") == 0) ds = 1;
+            else if (std::strcmp(cmd_id, "display_hlr")          == 0) ds = 2;
+            else if (std::strcmp(cmd_id, "display_hlv")          == 0) ds = 3;
+            else if (std::strcmp(cmd_id, "display_wireframe")    == 0) ds = 4;
+            if (ds >= 0) { st.displayStyle = ds; return; }
+        }
+        // ---- Appearance tab: Material group (set_appearance on body "b1") ----
+        if (std::strcmp(cmd_id, "appr_color") == 0) { st.requestAppearanceEditor = true; return; }
+        if (std::strcmp(cmd_id, "appr_clear") == 0) { applyModelAppearance(st, nullptr, 0.0f, 0.5f); return; }
+        {
+            int mi = -1;
+            if      (std::strcmp(cmd_id, "appr_mat_plastic")  == 0) mi = 0;
+            else if (std::strcmp(cmd_id, "appr_mat_aluminum") == 0) mi = 1;
+            else if (std::strcmp(cmd_id, "appr_mat_steel")    == 0) mi = 2;
+            else if (std::strcmp(cmd_id, "appr_mat_brass")    == 0) mi = 3;
+            else if (std::strcmp(cmd_id, "appr_mat_dark")     == 0) mi = 4;
+            if (mi >= 0) {
+                const ui::MaterialPreset& m = ui::kMaterials[mi];
+                applyModelAppearance(st, m.rgb, m.metallic, m.roughness);
+                return;
+            }
+        }
         // C20b: Assembly tab + New Assembly route to the assembly panels first.
         {
             std::string cmd(cmd_id);
@@ -1443,7 +1493,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         st.showRibbon = true; st.ribbonTab = AppState::RT_Features;
         if (const char* tabEnv = std::getenv("AI_CAD_TAB")) {
             int t = std::atoi(tabEnv);
-            if (t >= 0 && t <= 8) st.ribbonTab = t;
+            if (t >= 0 && t <= AppState::RT_Appearance) st.ribbonTab = t;
         }
     }
     // pmform shot: open a PropertyManager form headlessly for visual verification of its field

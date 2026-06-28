@@ -40,8 +40,9 @@ static std::string s_flyoutOpenReq;
 
 static const char* kRibbonTabs[] = {"Features", "Sketch", "Evaluate", "Simulation", "Assembly",
                                     "Sheet Metal", "Weldments", "PCB", "Surfaces",
-                                    "View Layout", "Annotation"};
-static constexpr int kRibbonTabCount = 11;  // + W17 contextual "View Layout"/"Annotation" (drawings)
+                                    "View Layout", "Annotation", "Appearance"};
+static constexpr int kRibbonTabCount = 12;  // + W17 contextual "View Layout"/"Annotation" (drawings)
+                                            //   + "Appearance" (3D color/material/display, index 11)
 
 // W17: in a Drawing doc the ribbon swaps to the two contextual drawing tabs ONLY (the
 // mechanical/sim/pcb tabs are 3D-doc context and would do nothing on a sheet). Outside a

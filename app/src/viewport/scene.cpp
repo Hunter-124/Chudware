@@ -455,4 +455,19 @@ void Scene::toggleSelect(const PickRef& r){
     selected_.push_back(r);
 }
 
+bool Scene::getBodyAppearance(uint32_t body_id, float color[3], float& metallic, float& roughness) const {
+    for(const auto& b: bodies_) if(b.body_id==body_id){
+        color[0]=b.color[0]; color[1]=b.color[1]; color[2]=b.color[2];
+        metallic=b.metallic; roughness=b.roughness; return true;
+    }
+    return false;
+}
+
+void Scene::setBodyAppearance(uint32_t body_id, const float color[3], float metallic, float roughness){
+    for(auto& b: bodies_) if(body_id==0 || b.body_id==body_id){
+        b.color[0]=color[0]; b.color[1]=color[1]; b.color[2]=color[2];
+        b.metallic=metallic; b.roughness=roughness;
+    }
+}
+
 } // namespace viewport

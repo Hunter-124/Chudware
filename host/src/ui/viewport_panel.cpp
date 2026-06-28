@@ -2468,6 +2468,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
 
         // C26: appearance picker — a SIBLING popup of vp_ctx (opened from its menu item) to avoid
         // nested-popup ordering issues. Direct-applies on commit (safe outside tree iteration).
+        // Appearance ribbon "Appearance..." -> arm this picker for the whole model (body "b1").
+        if (st.requestAppearanceEditor) {
+            s_vpKey = "b1";
+            s_vpColor[0] = 0.71f; s_vpColor[1] = 0.76f; s_vpColor[2] = 0.82f;
+            s_vpMetallic = 0.0f; s_vpRoughness = 0.5f;
+            s_openVpPicker = true;
+            st.requestAppearanceEditor = false;
+        }
         if (s_openVpPicker) { ImGui::OpenPopup("##appearance_vp"); s_openVpPicker = false; }
         if (appearanceColorPicker("##appearance_vp", s_vpColor, &s_vpMetallic, &s_vpRoughness)
             && !s_vpKey.empty())

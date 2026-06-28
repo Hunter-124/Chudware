@@ -67,6 +67,12 @@ static const Command T[] = {
 { "eval_geometry",        "Geometry Anlys",  "check",          W::Model,    G::Inspect,   K::Flyout,   "eval_check",      nullptr },
 { "prof_toggle",          "Profiler",        "results",        W::Model,    G::Inspect,   K::Top,      nullptr,           "performance sampling" },
 
+{ "appearance_edit",      "Appearance",      "material",       W::Model,    G::Appearance, K::Top,    nullptr,           "color material finish texture realview render swatch" },
+{ "view_style",           "Display",         "section_props",  W::Model,    G::Appearance, K::Top,    nullptr,           "shaded wireframe edges display style hidden" },
+{ "view_style_shaded",    "Shaded",          "section_props",  W::Model,    G::Appearance, K::Flyout, "view_style",      nullptr },
+{ "view_style_edges",     "Shaded + Edges",  "section_props",  W::Model,    G::Appearance, K::Flyout, "view_style",      nullptr },
+{ "view_style_wire",      "Wireframe",       "section_props",  W::Model,    G::Appearance, K::Flyout, "view_style",      nullptr },
+
 { "make_drawing",         "Make Drawing",    "dwg_view",       W::Model,    G::Output,    K::Top,      nullptr,           "2d sheet draft" },
 
 // ---- SKETCH (contextual) --------------------------------------------------
@@ -125,11 +131,15 @@ static const Command T[] = {
 { "sm_jog",               "Jog",             "extrude",        W::SheetMetal,G::Create,   K::Top,      nullptr,           "offset step" },
 { "sm_flat_pattern",      "Flatten",         "shell",          W::SheetMetal,G::Modify,   K::Top,      nullptr,           "unfold flat pattern" },
 { "sm_export_flat_dxf",   "Export Flat DXF", "gerber",         W::SheetMetal,G::Output,   K::Top,      nullptr,           "laser cut" },
+{ "appearance_edit",      "Appearance",      "material",       W::SheetMetal,G::Appearance, K::Top,    nullptr,           "color material finish texture realview render swatch" },
+{ "view_style",           "Display",         "section_props",  W::SheetMetal,G::Appearance, K::Top,    nullptr,           "shaded wireframe edges display style hidden" },
 
 // ---- WELDMENT -------------------------------------------------------------
 { "weld_member",          "Structural Member","ws_weldment",   W::Weldment, G::Create,    K::Top,      nullptr,           "beam profile frame" },
 { "weld_gusset",          "Gusset",          "shell",          W::Weldment, G::Modify,    K::Top,      nullptr,           "corner plate" },
 { "weld_end_cap",         "End Cap",         "fillet",         W::Weldment, G::Modify,    K::Top,      nullptr,           "tube close" },
+{ "appearance_edit",      "Appearance",      "material",       W::Weldment, G::Appearance, K::Top,    nullptr,           "color material finish texture realview render swatch" },
+{ "view_style",           "Display",         "section_props",  W::Weldment, G::Appearance, K::Top,    nullptr,           "shaded wireframe edges display style hidden" },
 
 // ---- SURFACE --------------------------------------------------------------
 { "surf_extrude",         "Extrude",         "extrude",        W::Surface,  G::Create,    K::Top,      nullptr,           "surface" },
@@ -147,6 +157,8 @@ static const Command T[] = {
 { "surf_untrim",          "Untrim",          "sk_convert",     W::Surface,  G::Modify,    K::Flyout,   "surf_trim",       nullptr },
 { "surf_delete_face",     "Delete Face",     "subtract",       W::Surface,  G::Modify,    K::Top,      nullptr,           nullptr },
 { "surf_replace_face",    "Replace Face",    "draft",          W::Surface,  G::Modify,    K::Flyout,   "surf_delete_face",nullptr },
+{ "appearance_edit",      "Appearance",      "material",       W::Surface,  G::Appearance, K::Top,    nullptr,           "color material finish texture realview render swatch" },
+{ "view_style",           "Display",         "section_props",  W::Surface,  G::Appearance, K::Top,    nullptr,           "shaded wireframe edges display style hidden" },
 
 // ---- SIMULATE -------------------------------------------------------------
 { "sim_new_static",       "New Study",       "sim_static",     W::Simulate, G::Study,     K::Top,      nullptr,           "fea stress" },
@@ -265,7 +277,8 @@ const char* groupLabel(Group g) {
         case G::Sketch: return "Sketch";   case G::Create: return "Create";
         case G::Modify: return "Modify";   case G::Pattern: return "Pattern";
         case G::Construct: return "Construct"; case G::Inspect: return "Inspect";
-        case G::Output: return "Output";   case G::Draw: return "Draw";
+        case G::Output: return "Output";   case G::Appearance: return "Appearance";
+        case G::Draw: return "Draw";
         case G::Dimension: return "Dimension"; case G::Relations: return "Relations";
         case G::Finish: return "Finish";   case G::Study: return "Study";
         case G::Setup: return "Setup";     case G::Run: return "Run";

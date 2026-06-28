@@ -36,6 +36,15 @@ static void appMenu(AppState& s) {
         }
         if (ImGui::BeginMenu("View")) {
             if (ImGui::MenuItem(s.dark ? "Light theme" : "Dark theme")) { s.dark = !s.dark; theme::setDark(s.dark); icons::setAtlasTheme(s.dark); }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Appearance...")) s.dispatch("appearance_edit");
+            if (ImGui::BeginMenu("Display Style")) {
+                if (ImGui::MenuItem("Shaded", nullptr, s.viewStyle==0))         s.dispatch("view_style_shaded");
+                if (ImGui::MenuItem("Shaded + Edges", nullptr, s.viewStyle==1)) s.dispatch("view_style_edges");
+                if (ImGui::MenuItem("Wireframe", nullptr, s.viewStyle==2))      s.dispatch("view_style_wire");
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
             ImGui::MenuItem("Reset Layout");
             ImGui::EndMenu();
         }

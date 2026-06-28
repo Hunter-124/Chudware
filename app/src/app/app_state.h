@@ -107,6 +107,7 @@ struct AppState {
 
     // agent
     AgentThread agent;
+    bool agentIsReal = false;  // true when the current run uses the real engine (not the scripted demo)
 
     // ---- helpers ----
     DocTabState& doc() {

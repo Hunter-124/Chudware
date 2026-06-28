@@ -5,6 +5,7 @@
 #endif
 
 using nlohmann::json;
+using namespace std::chrono_literals;
 
 namespace eng {
 
@@ -210,6 +211,51 @@ OpsResult Engine::addHoleCenter(double diameter, const std::string& name) {
     return addFeature(json{{"type","hole"},{"name",name},
         {"params",{{"style","simple"},{"standard","custom"},{"end","through_all"},{"diameter",dim(diameter)}}},
         {"refs",{{"face",{{"of","face"},{"side","top"}}}}}});
+}
+
+void Engine::startAgent(const std::string& request) {
+    if (agentRunning_.load()) return;
+    if (docId_.empty()) return;
+    agentRunning_ = true;
+    agentDone_    = false;
+    {
+        std::lock_guard<std::mutex> lk(agentMtx_);
+        agentResult_ = json::object();
+    }
+
+    std::string req  = request;
+    std::string dId  = docId_;
+
+    if (agentThread_.joinable()) agentThread_.join();  // clean up previous
+    agentThread_ = std::thread([this, req, dId]() {
+#if defined(AICAD_HAVE_BRIDGE)
+        json result; std::string err;
+        bool ok = core::cpp_core().call("agent_run",
+            json{{"request", req}, {"doc_id", dId}}, result, err);
+        if (!ok) {
+            if (!result.is_object() || !result.contains("error"))
+                result = json{{"ok", false}, {"error", err.empty() ? "agent_run failed" : err}};
+        }
+        {
+            std::lock_guard<std::mutex> lk(agentMtx_);
+            agentResult_ = std::move(result);
+        }
+#else
+        std::lock_guard<std::mutex> lk(agentMtx_);
+        agentResult_ = json{{"ok", false}, {"error", "no bridge"}};
+#endif
+        agentRunning_ = false;
+        agentDone_    = true;
+    });
+    agentThread_.detach();
+}
+
+json Engine::takeAgentResult() {
+    std::lock_guard<std::mutex> lk(agentMtx_);
+    agentDone_ = false;
+    json r = std::move(agentResult_);
+    agentResult_ = json::object();
+    return r;
 }
 
 } // namespace eng

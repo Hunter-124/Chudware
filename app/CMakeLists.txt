@@ -18,7 +18,15 @@ endif()
 # Repo root = app/..  — deps + reused host sources resolve from here.
 get_filename_component(REPO "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 set(HOST     "${REPO}/host")
-set(DEPS     "${HOST}/build/_deps")          # reuse host's already-fetched FetchContent sources
+# Reuse host's already-fetched FetchContent sources. On Linux the build lives in
+# host/build-linux; on Windows in host/build. Fall back through candidates.
+if(EXISTS "${HOST}/build/_deps/glfw-src")
+  set(DEPS "${HOST}/build/_deps")
+elseif(EXISTS "${HOST}/build-linux/_deps/glfw-src")
+  set(DEPS "${HOST}/build-linux/_deps")
+else()
+  set(DEPS "${HOST}/build/_deps")   # will error below with a clear message
+endif()
 set(GLAD_DIR "${HOST}/extern/glad")
 
 # --- sanity: the reused dep sources must exist (host was built at least once) ---
@@ -81,14 +89,19 @@ target_include_directories(AI-CAD2 PRIVATE
   ${DEPS}/stb-src)
 target_link_libraries(AI-CAD2 PRIVATE imgui glad glfw)
 if(USE_BRIDGE)
-  target_compile_definitions(AI-CAD2 PRIVATE AICAD_HAVE_BRIDGE=1
-    # Dev fallback: where the core DLL is built. Used only if AI_CAD_LIBAICAD is unset AND no
-    # libaicad.dll sits next to the exe. Harmless on machines without this path (cpp_core falls
-    # through to exe-dir / default search).
-    AICAD_DEFAULT_LIBAICAD="${REPO}/core/build-occt/bin/Release/libaicad.dll")
+  if(WIN32)
+    target_compile_definitions(AI-CAD2 PRIVATE AICAD_HAVE_BRIDGE=1
+      AICAD_DEFAULT_LIBAICAD="${REPO}/core/build-occt/bin/Release/libaicad.dll")
+  else()
+    target_compile_definitions(AI-CAD2 PRIVATE AICAD_HAVE_BRIDGE=1
+      AICAD_DEFAULT_LIBAICAD="${REPO}/core/build-occt-linux/bin/libaicad.so")
+  endif()
 endif()
 if(WIN32)
   target_link_libraries(AI-CAD2 PRIVATE opengl32 dwmapi comdlg32)
+else()
+  # GLFW brings in X11/Wayland and OpenGL on Linux; add dl for dlopen + pthread for std::thread.
+  target_link_libraries(AI-CAD2 PRIVATE dl pthread)
 endif()
 
 # Registry smoke tests (no GL/engine dependency).

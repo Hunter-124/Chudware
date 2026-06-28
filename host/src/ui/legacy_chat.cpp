@@ -2384,7 +2384,11 @@ static void drawRuntimeBanner(AppState& st) {
     } else {
         ImGui::TextColored(ImVec4(pal.statusWarn[0], pal.statusWarn[1], pal.statusWarn[2], 1),
                            "Runtime not ready");
+#ifdef _WIN32
         dimText("Run the packaged build (dist) or install.ps1 so the engine can self-install.");
+#else
+        dimText("Place libaicad.so next to the AI-CAD executable, or set AI_CAD_LIBAICAD.");
+#endif
         if (ImGui::Button("Try setup now")) st.startSetup(false);
     }
     ImGui::EndChild();

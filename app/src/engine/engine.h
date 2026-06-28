@@ -5,6 +5,9 @@
 #pragma once
 #include <string>
 #include <cstdint>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <nlohmann/json.hpp>
 
 namespace eng {
@@ -66,6 +69,14 @@ public:
     OpsResult sketchRectExtrude(const std::string& plane, double w, double h, double depth, const std::string& mode="boss");
     OpsResult sketchCircleExtrude(const std::string& plane, double r, double depth, const std::string& mode="boss");
 
+    // ---- async agent run ----
+    // startAgent() fires agent_run in a background thread. Poll agentDone() each frame;
+    // when true call takeAgentResult() to get the events+status and clear the flag.
+    void startAgent(const std::string& request);
+    bool agentRunning() const { return agentRunning_.load(); }
+    bool agentDone() const { return agentDone_.load(); }
+    nlohmann::json takeAgentResult();   // clears agentDone_; call only when agentDone()
+
 private:
     OpsResult call(const std::string& method, const nlohmann::json& params);
     OpsResult parse(const nlohmann::json& res);
@@ -74,6 +85,13 @@ private:
     std::string docId_, aicmPath_, lastErr_;
     int revision_ = -1;
     nlohmann::json tree_, featureStatus_;
+
+    // agent run state
+    std::atomic<bool> agentRunning_{false};
+    std::atomic<bool> agentDone_{false};
+    nlohmann::json agentResult_;
+    mutable std::mutex agentMtx_;
+    std::thread agentThread_;
 };
 
 } // namespace eng

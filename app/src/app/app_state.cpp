@@ -216,16 +216,27 @@ void AppState::seedDemo() {
     bodies = { "Part1<1>" };
 }
 
-// ---------------------------------------------------------------------------
-//  Demo scripted agent — illustrates the transparent timeline (DESIGN.md §5).
-//  Replaced by the real agent_run_v2 / events.jsonl stream in a later phase.
-// ---------------------------------------------------------------------------
 void AppState::startDemoAgent(const std::string& userText) {
     AgentBlock u; u.kind = BlockKind::UserMsg; u.body = userText; u.anim = 0.f;
     agent.blocks.push_back(u);
     agent.running = true;
-    agent.demoStep = 0;
-    agent.demoTimer = 0.f;
+
+    if (engineReady && engine.hasDoc()) {
+        // Real agent: call agent_run via the C++ core.
+        agentIsReal = true;
+        agent.demoStep = -1;
+        engine.startAgent(userText);
+        AgentBlock spinner; spinner.kind = BlockKind::Action;
+        spinner.title = "Running copilot…";
+        spinner.status = ActionStatus::Running;
+        spinner.anim = 0.f;
+        agent.blocks.push_back(spinner);
+    } else {
+        // Demo / engine offline: scripted sequence.
+        agentIsReal = false;
+        agent.demoStep = 0;
+        agent.demoTimer = 0.f;
+    }
 }
 
 void AppState::tickDemoAgent(float dt) {
@@ -235,6 +246,67 @@ void AppState::tickDemoAgent(float dt) {
         if (b.anim > 1.f) b.anim = 1.f;
         if (b.kind == BlockKind::Action && b.status == ActionStatus::Running) b.spin += dt * 6.f;
     }
+
+    // ---------- real agent: drain result when the background thread finishes ----------
+    if (agent.running && agentIsReal && engine.agentDone()) {
+        nlohmann::json result = engine.takeAgentResult();
+        bool ok = !result.contains("ok") || result.value("ok", true);
+        std::string errMsg = result.value("error", std::string());
+        if (result.contains("status") && result.value("status", std::string()) == "failed")
+            ok = false;
+
+        // Resolve the running spinner block
+        for (auto it = agent.blocks.rbegin(); it != agent.blocks.rend(); ++it) {
+            if (it->kind == BlockKind::Action && it->status == ActionStatus::Running) {
+                it->status = ok ? ActionStatus::Ok : ActionStatus::Failed;
+                it->result = ok ? "Done" : (errMsg.empty() ? "Agent run failed" : errMsg);
+                break;
+            }
+        }
+
+        // Show any run_note events as thinking blocks
+        if (result.contains("events") && result["events"].is_array()) {
+            for (const auto& ev : result["events"]) {
+                std::string kind = ev.value("kind", std::string());
+                if (kind == "run_note") {
+                    AgentBlock t; t.kind = BlockKind::Thinking; t.title = "Thinking";
+                    t.body = ev.value("note", ev.dump(2)); t.anim = 0.f;
+                    agent.blocks.push_back(t);
+                }
+            }
+        }
+
+        // Final assistant message
+        AgentBlock m; m.kind = BlockKind::AssistantMsg; m.anim = 0.f;
+        if (ok) {
+            int rev = result.value("revision", -1);
+            m.body = "Done." + (rev >= 0 ? "  Model is at rev " + std::to_string(rev) + "." : "");
+        } else {
+            m.body = "The copilot run failed: " + (errMsg.empty() ? "unknown error" : errMsg);
+        }
+        agent.blocks.push_back(m);
+
+        // Usage line
+        std::string engaged = result.value("engaged", std::string("agent"));
+        int itok = result.value("input_tokens", 0);
+        int otok = result.value("output_tokens", 0);
+        AgentBlock us; us.kind = BlockKind::Usage; us.anim = 0.f;
+        us.body = engaged;
+        if (itok > 0 || otok > 0)
+            us.body += "  |  " + std::to_string(itok) + "→" + std::to_string(otok) + " tok";
+        agent.blocks.push_back(us);
+
+        // Refresh tree + viewport
+        if (ok) {
+            auto r = engine.refreshTree();
+            if (r.ok) { buildTreeFromDoc(); viewMeshRev = -1; }
+        }
+
+        agent.running = false;
+        agentIsReal = false;
+        return;
+    }
+
     if (!agent.running || agent.demoStep < 0) return;
     agent.demoTimer += dt;
 

@@ -29,7 +29,16 @@ static std::string exeDir() {
     return slash == std::string::npos ? "." : p.substr(0, slash);
 }
 #else
-static std::string exeDir() { return "."; }
+#  include <unistd.h>
+static std::string exeDir() {
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return ".";
+    buf[n] = '\0';
+    std::string p(buf, (size_t)n);
+    size_t slash = p.find_last_of('/');
+    return slash == std::string::npos ? "." : p.substr(0, slash);
+}
 #endif
 
 static void glfwErr(int code, const char* desc) { std::fprintf(stderr, "[glfw] %d: %s\n", code, desc); }
@@ -128,8 +137,13 @@ int main(int argc, char** argv) {
         int rc = 2;
         if (!st.engineReady) { std::fprintf(stderr, "[selftest] FAIL: engine not ready (%s)\n", st.engine.lastError().c_str()); }
         else {
+#ifdef _WIN32
             const char* tmp = std::getenv("TEMP");
             std::string path = (tmp ? std::string(tmp) : std::string(".")) + "\\aicad2_selftest.step+";
+#else
+            const char* tmp = std::getenv("TMPDIR");
+            std::string path = (tmp ? std::string(tmp) : std::string("/tmp")) + "/aicad2_selftest.step+";
+#endif
             bool sv = st.engine.save(path);
             bool op = sv && st.engine.open(path);
             int nf = 0; const auto& t = st.engine.tree();

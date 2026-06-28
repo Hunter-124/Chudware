@@ -40,5 +40,12 @@
   section_view, orientation`
 - **General**: `ok_check, cancel_x, settings, save, open, new_doc, undo, redo, theme_toggle,
   ai_panel, activity, prompt_edit`
+- **Simulation (extended)**: `study_thermal, study_fatigue`
+- **Mesh types**: `mesh_tet, mesh_hex, mesh_auto`
+- **Sheet Metal**: `sm_base_flange, sm_edge_flange, sm_hem, sm_jog, sm_flat_pattern`
+- **Weldments**: `weld_member, weld_gusset, weld_end_cap`
+- **Workspace tabs**: `ws_features, ws_sketch, ws_evaluate, ws_assembly, ws_sheetmetal,
+  ws_weldments, ws_surfaces, ws_appearance`
+- **Appearance**: `color_picker, appr_metal, appr_plastic, appr_glass, appr_paint, appr_default`
 
 Adding an icon = add a draw function + name here; atlas layout is computed, never hand-packed.

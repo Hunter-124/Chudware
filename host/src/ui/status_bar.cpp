@@ -77,12 +77,15 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     // Uses the same glass-background pill as the agent livePhase chip above so the two styles
     // are consistent.  The text pulses slightly so it is obviously alive even when stage is
     // stuck on "Solving" for a long static analysis.
-    if (st.simClient && st.simClient->busy()) {
+    const bool simForce = std::getenv("AI_CAD_SIMPROG") != nullptr;  // headless smoke: force the chip
+    if ((st.simClient && st.simClient->busy()) || simForce) {
         static const char* kSpin[] = {"|", "/", "-", "\\"};
         int si = static_cast<int>(ImGui::GetTime() * 8.0) & 3;
-        std::string stg = st.simClient->stage();
-        std::string lg  = st.simClient->recentLog();
-        float elapsed   = st.simClient->elapsedSeconds();
+        const bool live = st.simClient && st.simClient->busy();
+        std::string stg = live ? st.simClient->stage() : std::string("solve");
+        std::string lg  = live ? st.simClient->recentLog()
+                               : std::string("assembling stiffness matrix (12,480 nodes)");
+        float elapsed   = live ? st.simClient->elapsedSeconds() : 7.0f;
         // Human-readable stage labels that match the worker's stage token vocabulary.
         auto prettyStage = [](const std::string& s) -> std::string {
             if (s == "voxelize") return "Voxelizing";

@@ -2837,6 +2837,62 @@ aicad::geom::SketchPlane resolve_sketch_plane(Session& s, const json& feat) {
             }
         }
     }
+    // Face-selector ref (kind == "face"): the sketch lives ON a model face, not a datum.
+    // Mirror the modeling path (document.cpp plane_of -> face_plane(resolve_face_sel(...)))
+    // so the live overlay lands on the picked face: recompile, resolve the face off the
+    // last surviving body, and return its actual plane (area-centroid origin +
+    // orientation-aware normal). Without this branch a face-sketch falls to
+    // SketchPlane::top() (origin at the world origin) and draws on the parallel base plane
+    // through the origin — the reported bug. Any failure falls through to top() (below).
+    if (plane_ref.is_object() && plane_ref.value("kind", std::string()) == "face") {
+        try {
+            CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+            if (!r.shapes.empty()) {
+                const TopoDS_Shape& body = r.shapes.back();
+                TopoDS_Face face;
+                // Primary: re-express the resolved make_selector as a centroid-near query so
+                // its UNIQUE centroid singles out one face even among symmetric duplicates —
+                // the same strategy eval_resolve_ref uses for a resolved face/edge selector.
+                const json& c = plane_ref.contains("centroid") ? plane_ref.at("centroid") : json();
+                if (c.is_array() && c.size() == 3 && c[0].is_number() && c[1].is_number() &&
+                    c[2].is_number()) {
+                    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(
+                        body, json{{"of", std::string("face")}, {"near", c}, {"count", 1}});
+                    if (qp.error.empty() && !qp.faces.empty()) face = qp.faces.front();
+                }
+                // Fallback: describe_faces + resolve for a selector with no centroid
+                // (eval_resolve_ref's legacy path).
+                if (face.IsNull()) {
+                    std::vector<TopoInfo> infos = describe_faces(body);
+                    ResolveResult rr = resolve(plane_ref, infos, bbox_diag(body));
+                    if (rr.index.has_value()) {
+                        int idx = 0;
+                        for (TopExp_Explorer ex(body, TopAbs_FACE); ex.More(); ex.Next(), ++idx)
+                            if (idx == *rr.index) { face = TopoDS::Face(ex.Current()); break; }
+                    }
+                }
+                if (!face.IsNull()) {
+                    BRepAdaptor_Surface ad(face);
+                    if (ad.GetType() == GeomAbs_Plane) {
+                        // origin (area centroid) + orientation-aware normal — mirrors
+                        // face_plane() in document.cpp, using session.cpp's own REVERSED
+                        // normal idiom (cf. the faceset normal in doc_face_points).
+                        gp_Dir nd = ad.Plane().Axis().Direction();
+                        if (face.Orientation() == TopAbs_REVERSED) nd.Reverse();
+                        GProp_GProps props;
+                        BRepGProp::SurfaceProperties(face, props);
+                        gp_Pnt cm = props.CentreOfMass();
+                        return aicad::geom::SketchPlane::from(
+                            Eigen::Vector3d(cm.X(), cm.Y(), cm.Z()),
+                            Eigen::Vector3d(nd.X(), nd.Y(), nd.Z()));
+                    }
+                }
+            }
+        } catch (...) {
+            // Resolution failure (non-planar face, empty compile, stale selector) falls
+            // through to the existing SketchPlane::top() fallback — behaviour unchanged.
+        }
+    }
     return aicad::geom::SketchPlane::top();
 }
 

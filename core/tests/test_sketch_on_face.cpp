@@ -38,6 +38,7 @@ using json = nlohmann::json;
 using aicad::doc::doc_new;
 using aicad::doc::doc_apply_ops;
 using aicad::doc::doc_sketch_enter;
+using aicad::doc::doc_query;
 
 namespace {
 
@@ -165,4 +166,53 @@ TEST_CASE("sketch-on-face: face-selector plane_frame origin lands on the face (z
     // top()-fallback bug would also zero the x and y origin, not just z).
     CHECK(ox == doctest::Approx(W / 2.0).epsilon(1e-3));
     CHECK(oy == doctest::Approx(D / 2.0).epsilon(1e-3));
+}
+
+TEST_CASE("sketch-on-face: a REAL resolver (doc_query) face selector resolves onto the face") {
+    // Stronger than the synthetic-centroid case: build the box, then ask the engine's OWN
+    // resolver (doc_query) for the top-face selector — a selector with a resolver-computed
+    // centroid, like the host emits from a face pick — and sketch on THAT. Proves
+    // resolve_sketch_plane's centroid-near query matches a real resolver centroid, not a
+    // hand-fed one (the gap that hid this bug behind a green synthetic test).
+    const double W = 40.0, D = 30.0, H = 25.0;
+    json nr = doc_new("part", "SketchOnRealFace");
+    const std::string doc_id = nr.at("doc_id").get<std::string>();
+
+    json box = json::array({
+        json{{"op","add_feature"},{"feature",
+            json{{"type","sketch"},{"name","Base"},
+                 {"params",{{"entities",rect_entities(W,D)},{"constraints",rect_constraints(W,D)}}},
+                 {"refs",{{"plane","plane.top"}}}}}},
+        json{{"op","add_feature"},{"feature",
+            json{{"type","extrude"},{"name","Body"},
+                 {"params",{{"mode","boss"},{"end","blind"},{"depth",dimv(H)}}},
+                 {"refs",{{"profile",json::array({json{{"kind","region"},{"sketch","$0"},
+                    {"centroid",json::array({W/2.0,D/2.0})},{"hint_index",0}}})}}}}}},
+    });
+    json br = doc_apply_ops(doc_id, -1, box, false);
+    for (const auto& st : br.at("rebuild").at("feature_status")) REQUIRE(st.value("ok", false));
+
+    // The resolver's own top-face selector (computed centroid + kind).
+    json q = doc_query(doc_id, json{{"of","face"},{"side","top"}});
+    REQUIRE_MESSAGE(q.value("count", 0) >= 1, "doc_query found no top face: " << q.dump());
+    json face_sel = q.at("matches").at(0);
+    MESSAGE("real top-face selector = " << face_sel.dump());
+
+    json mk = json::array({
+        json{{"op","add_feature"},{"feature",
+            json{{"type","sketch"},{"name","OnRealFace"},
+                 {"params",{{"entities",json::array()},{"constraints",json::array()}}},
+                 {"refs",{{"plane", face_sel}}}}}},
+    });
+    json mr = doc_apply_ops(doc_id, -1, mk, false);
+    const std::string fid = mr.at("id_map").at("$0").get<std::string>();
+
+    json enter = doc_sketch_enter(doc_id, fid);
+    const std::vector<double> frame = enter.at("plane_frame").get<std::vector<double>>();
+    REQUIRE(frame.size() == 16);
+    const double oz = frame[11];
+    MESSAGE("real-selector plane_frame origin z = " << oz << " (expected " << H << ")");
+    REQUIRE_MESSAGE(oz == doctest::Approx(H).epsilon(1e-3),
+        "a real resolver face selector must enter on the face (z=H=" << H
+        << "), not the z=0 base-plane fallback; got " << oz);
 }

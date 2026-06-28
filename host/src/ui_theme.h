@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <string>
 
-struct ImFont;
+#include "imgui.h"
 
 namespace ui {
 
@@ -158,6 +158,28 @@ struct Palette {
     // ---- window chrome buttons ----
     float captionFg        = 0.922f;   // greyscale for caption glyphs
 
+    // ---- glass (floating widgets: tooltips, popovers, overlays) ----
+    // glassBg:        main translucent fill — semi-opaque so the content behind bleeds through subtly.
+    // glassBorder:    cooler/brighter border than the standard chrome border.
+    // glassHighlight: white-tinted top-shine gradient + specular line (top inner edge).
+    // glassShadow:    soft simulated drop-shadow beneath the panel.
+    float glassBg[4]        = {0.118f, 0.133f, 0.167f, 0.87f};
+    float glassBorder[4]    = {0.230f, 0.275f, 0.365f, 0.80f};
+    float glassHighlight[4] = {1.000f, 1.000f, 1.000f, 0.09f};
+    float glassShadow[4]    = {0.000f, 0.000f, 0.000f, 0.40f};
+
+    // ---- tree (feature-manager rows: hover wash + section header label) ----
+    // treeHover:   accent-tinted row hover wash (low alpha so text stays legible).
+    // treeSection: muted label color for collapsible section headers.
+    float treeHover[4]      = {0.176f, 0.831f, 0.749f, 0.10f};
+    float treeSection[4]    = {0.620f, 0.660f, 0.720f, 1.0f};
+
+    // ---- copilot blocks (chat thinking / action cards) ----
+    // blockThinkBg:  thinking-block background — semi-transparent, darker than the card.
+    // blockActionBg: action-card background — near-opaque so structured content reads clearly.
+    float blockThinkBg[4]   = {0.071f, 0.082f, 0.106f, 0.90f};
+    float blockActionBg[4]  = {0.094f, 0.110f, 0.141f, 0.96f};
+
     // Helper: convert float[4] to ImU32 (for draw-list calls).
     // Usage: palette.toU32(palette.accent)
     static inline uint32_t toU32(const float f[4]) {
@@ -179,6 +201,29 @@ struct Palette {
 void applyTheme(Theme t, float scale = 1.0f);
 
 Fonts loadFonts(const std::string& assetsDir, float pxScale = 1.0f);
+
+// Draw a glassmorphism panel background onto 'dl' covering [mn, mx].
+// Layers (back to front): drop-shadow, translucent base fill, vertical inner-shine gradient,
+// border, top specular line. 'rounding' is a logical dp value (multiplied by ui::uiScale
+// internally, so 8.0f matches the PopupRounding set by applyTheme at any DPI).
+void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 8.0f);
+
+// Push/pop ImGuiStyle overrides for the BeginTooltip() + glassBackground() pattern.
+// pushGlassTooltipStyle() sets PopupBg=transparent so ImGui's native rect fill does not
+// compete with the custom-drawn glass layers. popGlassTooltipStyle() restores all pushed state.
+// Callers of SetTooltip() do NOT need push/pop — ImGuiCol_PopupBg==glassBg globally.
+// Usage pattern:
+//   ui::pushGlassTooltipStyle();
+//   if (ImGui::BeginTooltip()) {
+//       ImVec2 p0 = ImGui::GetWindowPos();
+//       ImVec2 p1 = p0 + ImGui::GetWindowSize();
+//       ui::glassBackground(ImGui::GetWindowDrawList(), p0, p1);
+//       /* content */
+//       ImGui::EndTooltip();
+//   }
+//   ui::popGlassTooltipStyle();
+void pushGlassTooltipStyle();
+void popGlassTooltipStyle();
 
 // The active palette — read-only from panels.
 extern Palette palette;

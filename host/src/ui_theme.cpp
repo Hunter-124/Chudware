@@ -133,6 +133,17 @@ static void fillDark(Palette& p) {
     set4(p.planFeature, 0.600f,0.639f,0.700f,1);
     set4(p.partsDim,    0.620f,0.660f,0.720f,1);
     p.captionFg = 0.922f;
+    // glass (floating panels: tooltips, popovers, overlays)
+    set4(p.glassBg,        0.118f, 0.133f, 0.167f, 0.87f);  // translucent dark-blue-gray
+    set4(p.glassBorder,    0.230f, 0.275f, 0.365f, 0.80f);  // cool bright border
+    set4(p.glassHighlight, 1.000f, 1.000f, 1.000f, 0.09f);  // subtle white top shine
+    set4(p.glassShadow,    0.000f, 0.000f, 0.000f, 0.40f);  // drop shadow
+    // tree (feature-manager rows)
+    set4(p.treeHover,      0.176f, 0.831f, 0.749f, 0.10f);  // accent-tinted hover wash
+    set4(p.treeSection,    0.620f, 0.660f, 0.720f, 1.0f);   // muted section-header label
+    // copilot blocks (chat thinking / action cards)
+    set4(p.blockThinkBg,   0.071f, 0.082f, 0.106f, 0.90f);  // semi-transparent thinking block
+    set4(p.blockActionBg,  0.094f, 0.110f, 0.141f, 0.96f);  // near-opaque action card
 }
 
 // =========================================================================
@@ -251,6 +262,17 @@ static void fillLight(Palette& p) {
     set4(p.planFeature, 0.310f,0.353f,0.431f,1);
     set4(p.partsDim,    0.420f,0.447f,0.502f,1);
     p.captionFg = 0.118f;
+    // glass (light theme: frosted near-white surface)
+    set4(p.glassBg,        0.970f, 0.975f, 0.988f, 0.92f);  // frosted near-white, slight blue tint
+    set4(p.glassBorder,    0.620f, 0.650f, 0.730f, 0.72f);  // grey-blue border
+    set4(p.glassHighlight, 1.000f, 1.000f, 1.000f, 0.35f);  // pronounced shine (2.2x => 0.77 for specular line, not blinding)
+    set4(p.glassShadow,    0.000f, 0.000f, 0.000f, 0.18f);  // lighter shadow on light bg
+    // tree (feature-manager rows)
+    set4(p.treeHover,      0.000f, 0.471f, 0.843f, 0.08f);  // SW-blue hover wash (lower alpha)
+    set4(p.treeSection,    0.357f, 0.384f, 0.439f, 1.0f);   // darker grey section-header label
+    // copilot blocks (chat thinking / action cards)
+    set4(p.blockThinkBg,   0.880f, 0.900f, 0.930f, 0.92f);  // semi-transparent thinking block
+    set4(p.blockActionBg,  0.930f, 0.940f, 0.960f, 0.96f);  // near-opaque action card
 }
 
 // =========================================================================
@@ -312,7 +334,7 @@ void applyTheme(Theme t, float scale) {
     c[ImGuiCol_TextDisabled]        = fromRole(p.textDisabled);
     c[ImGuiCol_WindowBg]            = fromRole(p.windowBg);
     c[ImGuiCol_ChildBg]             = fromRole(p.panelBg);
-    c[ImGuiCol_PopupBg]             = fromRole(p.popupBg);
+    c[ImGuiCol_PopupBg]             = fromRole(p.glassBg);
     c[ImGuiCol_Border]              = fromRole(p.border);
     c[ImGuiCol_BorderShadow]        = rgba(0,0,0,0);
     c[ImGuiCol_FrameBg]             = fromRole(p.frameBg);
@@ -357,6 +379,70 @@ void applyTheme(Theme t, float scale) {
                                       : rgba(0.02f, 0.027f, 0.039f, 0.65f);
 
     if (scale != 1.0f) s.ScaleAllSizes(scale);
+}
+
+// =========================================================================
+// Glassmorphism helpers (consumed by feature-manager, copilot, ribbon, etc.)
+// =========================================================================
+void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding) {
+    const Palette& p = palette;
+    const float s = uiScale;
+    const float r = rounding * s;
+
+    // 1. Drop shadow: two stacked rects to fake a blurred shadow.
+    {
+        const float off  = 4.0f * s;
+        const float off2 = 2.5f * s;
+        float sa[4]; Palette::withAlpha(p.glassShadow, sa, 0.35f);
+        dl->AddRectFilled(
+            ImVec2(mn.x + off2 * 0.4f, mn.y + off2),
+            ImVec2(mx.x + off,         mx.y + off),
+            Palette::toU32(sa), r + off * 0.5f);
+        dl->AddRectFilled(
+            ImVec2(mn.x + 1.0f * s, mn.y + 2.0f * s),
+            ImVec2(mx.x + off2,     mx.y + off2),
+            Palette::toU32(p.glassShadow), r + 0.5f * s);
+    }
+
+    // 2. Base translucent fill.
+    dl->AddRectFilled(mn, mx, Palette::toU32(p.glassBg), r);
+
+    // 3. Inner vertical shine gradient — top 35% of height, glassHighlight -> transparent.
+    {
+        const float shineH = (mx.y - mn.y) * 0.35f;
+        const ImVec2 shineMx(mx.x, mn.y + shineH);
+        const uint32_t top = Palette::toU32(p.glassHighlight);
+        const uint32_t btm = top & 0x00FFFFFFu;   // same RGB, alpha=0 (toU32 is ABGR: bits 24-31 = A)
+        dl->AddRectFilledMultiColor(mn, shineMx, top, top, btm, btm);
+    }
+
+    // 4. Border.
+    dl->AddRect(mn, mx, Palette::toU32(p.glassBorder), r, 0, 1.5f * s);
+
+    // 5. Top specular line — 1.5 px inside the top border arc.
+    {
+        const float lineY = mn.y + 1.5f * s;
+        const float inset = r * 0.6f;   // stay clear of the rounded corners
+        float sha[4]; Palette::withAlpha(p.glassHighlight, sha, 2.2f);  // brighter than the gradient; toU32 clamps
+        dl->AddLine(
+            ImVec2(mn.x + inset, lineY),
+            ImVec2(mx.x - inset, lineY),
+            Palette::toU32(sha), 1.5f * s);
+    }
+}
+
+void pushGlassTooltipStyle() {
+    const float s = uiScale;
+    // Suppress ImGui's native PopupBg rect fill so glassBackground() layers are not double-filled.
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    // Compact padding and matching rounding for tooltip windows.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,  ImVec2(10.0f * s, 8.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding,  8.0f * s);
+}
+
+void popGlassTooltipStyle() {
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(1);
 }
 
 // =========================================================================

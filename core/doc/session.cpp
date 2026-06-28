@@ -7863,17 +7863,11 @@ json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
     json res = aicad::sketch::drag(*s.active_sketch->solve_state, handle, target_xy, sk, env,
                                    targets.is_null() ? json() : targets);
 
-    if (res.is_object() && res.contains("ok") && !res["ok"].get<bool>()) {
-        json err;
-        err["ok"] = false;
-        err["error"] = res.contains("error") && !res["error"].is_null()
-                           ? res["error"] : json("drag target did not resolve");
-        err["rejected_handles"] = res.contains("rejected_handles") ? res["rejected_handles"]
-                                                                    : json::array();
-        return err;
-    }
-
-    const json& res_entities = res["entities"];
+    // Build the entity-coord array from the drag result REGARDLESS of ok/fail. drag() always
+    // returns `entities` (live coords on success, frozen coords on a rejected/empty drag), so
+    // including them on EVERY return keeps the host overlay alive — a failed drag must never
+    // wipe the on-screen sketch (the "sketch disappears while dragging" bug).
+    const json res_entities = res.contains("entities") ? res["entities"] : json::object();
     auto construction_of = [&](const std::string& eid) -> bool {
         if (params.contains("entities") && params["entities"].is_array())
             for (const json& e : params["entities"])
@@ -7882,12 +7876,29 @@ json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
         return false;
     };
     json entities = json::array();
-    for (auto it = res_entities.begin(); it != res_entities.end(); ++it) {
-        json rec = it.value();
-        rec["id"] = it.key();
-        rec["construction"] = construction_of(it.key());
-        entities.push_back(std::move(rec));
+    if (res_entities.is_object())
+        for (auto it = res_entities.begin(); it != res_entities.end(); ++it) {
+            json rec = it.value();
+            rec["id"] = it.key();
+            rec["construction"] = construction_of(it.key());
+            entities.push_back(std::move(rec));
+        }
+
+    if (res.is_object() && res.contains("ok") && !res["ok"].get<bool>()) {
+        // Failed/empty drag: keep the frozen entities so the host overlay is preserved.
+        json err;
+        err["ok"] = false;
+        err["error"] = res.contains("error") && !res["error"].is_null()
+                           ? res["error"] : json("drag target did not resolve");
+        err["rejected_handles"] = res.contains("rejected_handles") ? res["rejected_handles"]
+                                                                    : json::array();
+        err["entities"] = entities;
+        err["statuses"] = res.contains("statuses") ? res["statuses"] : json::object();
+        err["solve_rejected"] = false;
+        err["constraints"] = sketch_constraints(feat, res_entities);
+        return err;
     }
+
     // Remember dragged coords so commit can persist them (transient; no warm churn).
     s.active_sketch->last_entities = res_entities;
     s.active_sketch->last_statuses = res.contains("statuses") ? res["statuses"] : json::object();

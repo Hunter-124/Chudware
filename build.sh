@@ -51,8 +51,23 @@ build_project() {
   fi
 }
 
-build_core() { build_project core "$CORE_SRC" "$CORE_BUILD"; }
-build_host() { build_project host "$HOST_SRC" "$HOST_BUILD" AI-CAD; }
+# Stage the freshly-built kernel next to the host exe. The host dlopen()s
+# "<exe_dir>/libaicad.so" (host/src/core/cpp_core.cpp), and nothing else refreshes it,
+# so a core rebuild MUST recopy it here or the running GUI keeps loading a stale kernel
+# (the cause of "C++ fixes pass tests but the product is unchanged"). Copy only when the
+# fresh lib differs, and only if the host bin dir exists.
+stage_lib() {
+  local hostbin="$HOST_BUILD/bin"
+  if [ -f "$LIBAICAD" ] && [ -d "$hostbin" ]; then
+    if ! cmp -s "$LIBAICAD" "$hostbin/libaicad.so" 2>/dev/null; then
+      cp -f "$LIBAICAD" "$hostbin/libaicad.so"
+      echo "[build] staged fresh libaicad.so -> $hostbin/"
+    fi
+  fi
+}
+
+build_core() { build_project core "$CORE_SRC" "$CORE_BUILD"; stage_lib; }
+build_host() { build_project host "$HOST_SRC" "$HOST_BUILD" AI-CAD; stage_lib; }
 build_app()  { build_project app  "$APP_SRC"  "$APP_BUILD" AI-CAD2 test_command_registry; }
 
 # Ensure the kernel the GUI dlopen()s exists; build it once if absent.

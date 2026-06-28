@@ -815,6 +815,22 @@ if(AICAD_WITH_OCCT)
   add_test(NAME sketch_on_face COMMAND test_sketch_on_face)
   set_tests_properties(sketch_on_face PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- Circle rim drag-resize through the doc_sketch_drag RPC path -------------
+  # The host drags a circle/arc rim via doc_sketch_enter -> doc_sketch_drag(".rim") ->
+  # doc_sketch_drag_commit. Proves the rim handle resizes the radius AND that a failed
+  # drag still returns entities (so the overlay is never wiped).
+  add_executable(test_sketch_drag_rpc
+    tests/test_sketch_drag_rpc.cpp)
+  target_include_directories(test_sketch_drag_rpc PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_sketch_drag_rpc PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_sketch_drag_rpc PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME sketch_drag_rpc COMMAND test_sketch_drag_rpc)
+  set_tests_properties(sketch_drag_rpc PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- Simulation-study persistence + mutate RPCs (doc_sim_study_*) -----------
   # Exercises the full study lifecycle (add/edit/list/save+open/delete) on a blank
   # part. doc_new/doc_open compile the empty document through OCCT, so this is gated

@@ -831,7 +831,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // GUI rework layout schema. The old imgui.ini can contain dock IDs/window placements from
     // pre-rework names, which restores the FeatureManager into the center and leaves Viewport as a
     // floating orphan. Use a versioned ini so stale dock layouts cannot override buildDefaultLayout.
-    static std::string iniPath = appdataDir() + "/AI-CAD/imgui_gui_v2.ini";
+    static std::string iniPath = appdataDir() + "/AI-CAD/imgui_gui_v3.ini";
     io.IniFilename = shot ? nullptr : iniPath.c_str();
 
     float xs = 1.0f, ys = 1.0f;
@@ -2678,7 +2678,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         ImGui::PopStyleVar(3);
         // Versioned dockspace ID pairs with imgui_gui_v2.ini. Changing this intentionally forces
         // one clean DockBuilder layout after major window/dock identity changes.
-        ImGuiID dockId = ImGui::GetID("AICADDockV2");
+        ImGuiID dockId = ImGui::GetID("AICADDockV3");
         if ((!st.layoutInit && ImGui::DockBuilderGetNode(dockId) == nullptr) || st.resetLayout) {
             buildDefaultLayout(dockId, ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
             st.layoutInit = true;

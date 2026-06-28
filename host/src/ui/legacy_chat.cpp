@@ -1998,6 +1998,12 @@ void drawAISettingsTab(AppState& st, bool busy) {
         ImVec4(pal.panelBg[0], pal.panelBg[1], pal.panelBg[2], 1));
     ImGui::BeginChild("##aisetbody", ImVec2(0, 0), ImGuiChildFlags_None);
     drawAISettingsBody(st, busy);
+    // Transparency toggle (moved here from the composer per request): show/hide the AI's
+    // reasoning ("Thoughts") blocks inline. File-static gShowThinking, default on (DESIGN §5).
+    ImGui::Separator();
+    ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show the AI's reasoning steps inline (like Claude Code verbose mode).");
     ImGui::EndChild();
     ImGui::PopStyleColor();
     ImGui::End();
@@ -2649,12 +2655,6 @@ static void drawComposerChips(AppState& st, bool busy) {
         ImGui::SetTooltip("Whether the AI plans and asks before modeling.");
     if (ImGui::BeginPopup("##runmode")) { drawRunModeMenu(st); ImGui::EndPopup(); }
 
-    // transparency chip — show/hide the AI's reasoning ("Thinking") blocks (DESIGN §5, default on).
-    ImGui::SameLine();
-    if (toggleChip(gShowThinking ? "Thoughts" : "Thoughts (off)", gShowThinking))
-        gShowThinking = !gShowThinking;
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Show or hide the AI's reasoning steps (like Claude Code verbose mode).");
 
     // Right edge of the left-hand chips on this row, in window-local cursor coords. The run-mode
     // chip wasn't followed by SameLine(), so the cursor has already wrapped to the next line —

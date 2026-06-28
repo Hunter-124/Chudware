@@ -860,7 +860,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
                 auto* sk = st.sketchMode;
                 if (sk) sk->enterForFeature(st, fid);
             }
-            if (ImGui::MenuItem("Edit Sketch Plane")) {
+            if (ImGui::MenuItem("Edit Sketch Plane/Face")) {
                 auto* sk = st.sketchMode;
                 if (sk) sk->beginPlaneEdit(st, fid);
             }

@@ -240,7 +240,6 @@ void drawLeftPane(AppState& st,
         { kLeftPaneFeatureManager,  "history",     "F", "Feature Manager" },
         { kLeftPanePropertyManager, "material",    "P", "Property Manager" },
         { kLeftPaneConfigurations,  "settings",    "C", "Configurations" },
-        { kLeftPaneSimulation,      "performance", "S", "Simulation studies" },
     };
 
     const float btn = 36.0f * S;
@@ -265,7 +264,8 @@ void drawLeftPane(AppState& st,
     const float btnX = (stripW - btn) * 0.5f;
     ImGui::SetCursorPosY(6.0f * S);
     for (const TabDef& t : kTabs) {
-        const bool selected = (st.leftPaneTab == t.id);
+        const bool selected = (st.leftPaneTab == t.id) ||
+                              (t.id == kLeftPaneFeatureManager && st.leftPaneTab == kLeftPaneSimulation);
         const bool attention = (t.id == kLeftPanePropertyManager && pmActive);
         char idBuf[16];
         std::snprintf(idBuf, sizeof(idBuf), "%d", t.id);
@@ -300,9 +300,6 @@ void drawLeftPane(AppState& st,
     } else if (st.leftPaneTab == kLeftPaneConfigurations) {
         title = "Configurations";
         titleIcon = "settings";
-    } else if (st.leftPaneTab == kLeftPaneSimulation) {
-        title = "Simulation";
-        titleIcon = "performance";
     }
 
     // Equal left/right margins via symmetric WindowPadding + a slim scrollbar. When the form
@@ -360,16 +357,25 @@ void drawLeftPane(AppState& st,
             else                drawConfigurationsBody(st);
             break;
 
-        case kLeftPaneSimulation:
-            // Simulation studies for the active part: a SolidWorks-style study tree + inline setup
-            // forms. SimManager is per-document (re-seated on tab switch); studies live in the doc and
-            // persist in the .step+. Falls back to the run_gui singleton at the empty start state.
-            if (st.simManager) st.simManager->drawTreeBody(st);
-            break;
-
+        case kLeftPaneSimulation:   // legacy programmatic target — render the same unified body
         case kLeftPaneFeatureManager:
         default:
             drawFeatureTreeBody(st, editCallback);
+            // Simulation studies now live IN the FeatureManager tree (no separate "Simulation
+            // Studies" tab). Show the study section when the part has studies or the Simulation
+            // workspace is active, so a Static/Modal/Flow study reads as an editable tree feature
+            // with Material/Fixtures/Loads/Mesh/Results subnodes + per-type setup forms.
+            if (st.simManager) {
+                const bool simWs = st.showSimulationTools || st.ribbonTab == AppState::RT_Simulation;
+                if (st.simManager->studyCount() > 0 || simWs) {
+                    ImGui::Dummy(ImVec2(0, 6.0f * S));
+                    ImGui::Separator();
+                    ImGui::PushFont(st.fonts.medium);
+                    ImGui::TextUnformatted("Simulation");
+                    ImGui::PopFont();
+                    st.simManager->drawTreeBody(st);
+                }
+            }
             break;
     }
     s_bodyScrolled = ImGui::GetScrollMaxY() > 0.0f;   // remembered for next frame's indent balance

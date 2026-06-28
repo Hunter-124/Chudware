@@ -2117,6 +2117,13 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                             (int)r1.ok, r1.revision, r1.aicm_path.c_str());
                 std::fflush(stdout);
                 if (r1.ok && !r1.aicm_path.empty()) { std::string le; st.loadDocMesh(r1.aicm_path, le); }
+                // Headless appearance smoke (AI_CAD_APPR): apply a vivid colour so a screenshot
+                // confirms the GL renderer reflects a set_appearance colour (not the default grey).
+                if (std::getenv("AI_CAD_APPR")) {
+                    float orange[3] = {0.95f, 0.45f, 0.10f};
+                    applyModelAppearance(st, orange, 0.6f, 0.35f);
+                    std::printf("appr: applied orange\n"); std::fflush(stdout);
+                }
                 std::string selStr, serr;
                 selStr = st.docMirror.resolvePick(st.worker, 1, "face", 1, serr);
                 std::printf("resolve_pick: selector=%s err=%s\n", selStr.c_str(), serr.c_str());

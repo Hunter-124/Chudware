@@ -42,6 +42,14 @@ public:
         uint32_t body_id = 0;             // AICM body id (matches the owner-map (body<<32)|face keys)
         std::vector<FaceSpan> faces;      // per-face triangle runs (empty = whole body opaque only)
         float color[3] = {0.62f, 0.70f, 0.80f};
+        // Per-body colour is shown VERBATIM: the AICM bakes a real colour for every body (the
+        // set_appearance colour, or the engine default grey when none is set), so a set_appearance
+        // change is reflected on screen. The literal above is just the inert init value — every
+        // doc/assembly caller overwrites color[] from the loaded body. A body with NO baked colour
+        // (the single-mesh setMesh() STL path) sets useDefaultColor=true to fall back to the theme
+        // palette.partDefault (setDefaultPartColor) instead — an explicit flag, never a sentinel
+        // colour value, so a legitimately-set colour is never mistaken for "unset".
+        bool useDefaultColor = false;
         // C32-A RealView material (0 metallic / 0.5 roughness == dielectric plastic, the C30 look).
         float metallic = 0.0f;
         float roughness = 0.5f;

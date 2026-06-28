@@ -581,6 +581,7 @@ void Renderer::setBodyVisible(size_t index, bool visible) {
 void Renderer::setMesh(const Mesh& m) {
     PartMesh p;
     p.mesh = m;
+    p.useDefaultColor = true;  // a single STL body carries no baked colour -> theme default part colour
     setMeshes({p});
 }
 
@@ -592,12 +593,15 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
         const Mesh& m = part.mesh;
         if (m.empty()) continue;
         Sub s;
-        // A body left at the PartMesh default color {0.62,0.70,0.80} is treated as "no explicit
-        // color" and falls back to the theme default part color (palette.partDefault).
-        bool unset = part.color[0] == 0.62f && part.color[1] == 0.70f && part.color[2] == 0.80f;
-        s.color[0] = unset ? defaultPart_[0] : part.color[0];
-        s.color[1] = unset ? defaultPart_[1] : part.color[1];
-        s.color[2] = unset ? defaultPart_[2] : part.color[2];
+        // Per-body color is authoritative: show the AICM-baked colour verbatim (the set_appearance
+        // colour, or the engine's default grey when none is set) so an appearance change is visible.
+        // Only a colour-less mesh (setMesh()) opts into the theme default part colour. Using an
+        // explicit flag — not a sentinel colour value — means a legitimately-set colour equal to the
+        // old struct default is no longer silently overridden ("set that grey-blue -> nothing").
+        const bool useDefault = part.useDefaultColor;
+        s.color[0] = useDefault ? defaultPart_[0] : part.color[0];
+        s.color[1] = useDefault ? defaultPart_[1] : part.color[1];
+        s.color[2] = useDefault ? defaultPart_[2] : part.color[2];
         s.metallic = part.metallic;     // C32-A RealView material
         s.roughness = part.roughness;
         // Per-feature preview isolation: keep the body id + face triangle-runs (sorted by first_tri

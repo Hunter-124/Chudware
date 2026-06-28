@@ -688,6 +688,24 @@ Handle derived_point(const std::vector<int>& idx, ValFn val, JacFn jac) {
     return h;
 }
 
+// A scalar drag handle: a SINGLE solver variable (a circle/arc radius, or an arc
+// endpoint angle in degrees). The host pre-computes the target scalar — radius =
+// |cursor - centre| in mm, or the endpoint angle in degrees — into the drag op's
+// xy[0] (see sketch_mode.cpp), so drag() soft-targets idx[0] toward that scalar and
+// only the one DOF moves: the centre and radius never drift. val/jac embed the scalar
+// as the x-component of a 1D point — valid for the Handle, unused by the scalar drag.
+Handle scalar_handle(const std::vector<int>& idx) {
+    Handle h;
+    h.idx = idx;
+    h.val = [](const VectorXd& xs) { return Vector2d(xs(0), 0.0); };
+    h.jac = [](const VectorXd&) {
+        MatrixXd j(2, 1);
+        j << 1.0, 0.0;
+        return j;
+    };
+    return h;
+}
+
 Handle resolve_handle(const std::string& handle, const EntMap& entities,
                       const VarMap& var_map) {
     std::string eid = handle, sub;
@@ -728,6 +746,9 @@ Handle resolve_handle(const std::string& handle, const EntMap& entities,
     }
     if (t == "circle") {
         if (sub.empty() || sub == "center") return ident_point(pick(vidx, {0, 1}));
+        // Rim drag handle: the host pre-computes the target RADIUS (mm) into xy[0], so
+        // this exposes ONLY the radius variable; the centre never drifts. "<id>.rim".
+        if (sub == "rim") return scalar_handle(pick(vidx, {2}));
     }
     if (t == "arc") {
         if (sub.empty() || sub == "center") return ident_point(pick(vidx, {0, 1}));
@@ -749,6 +770,13 @@ Handle resolve_handle(const std::string& handle, const EntMap& entities,
             };
             return h;
         }
+        // Rim drag handle: host pre-computes the target RADIUS (mm) into xy[0]. "<id>.rim".
+        if (sub == "rim") return scalar_handle(pick(vidx, {2}));
+        // Endpoint-ANGLE drag handles: the host pre-computes the target angle (deg) into
+        // xy[0], so these expose ONLY the angle variable (a0/a1); the centre and radius
+        // never move. Contract drag-handles "<id>.start_angle" / "<id>.end_angle".
+        if (sub == "start_angle") return scalar_handle(pick(vidx, {3}));
+        if (sub == "end_angle") return scalar_handle(pick(vidx, {4}));
     }
     if (t == "ellipse") {
         if (sub.empty() || sub == "center") return ident_point(pick(vidx, {0, 1}));
@@ -1124,6 +1152,8 @@ void add_point_on(System& sys, const std::string& cid, const std::string& point_
         return;
     }
     if (t == "circle" || t == "arc") {
+        // point_on places the point on the FULL circle (any arc a0/a1 trim is
+        // ignored), matching the Python oracle's _add_point_on convention.
         std::vector<int> cidx = pick(var_map.at(eid), {0, 1, 2});
         std::vector<int> combined = concat(p.idx, cidx);
         sys.add_residual(
@@ -1150,9 +1180,10 @@ void add_point_on(System& sys, const std::string& cid, const std::string& point_
             cid);
         return;
     }
-    if (t == "ellipse_arc") {
-        // Implicit rotated-ellipse residual; ignores a0/a1 trim (full ellipse),
-        // mirroring the arc/circle point_on convention. Port of _add_point_on.
+    if (t == "ellipse_arc" || t == "ellipse") {
+        // Implicit rotated-ellipse residual on (cx, cy, rx, ry, rot). For ellipse_arc
+        // the a0/a1 trim is ignored (places on the FULL ellipse), matching the
+        // arc/circle point_on convention; a plain ellipse has no trim. _add_point_on.
         std::vector<int> eidx = pick(var_map.at(eid), {0, 1, 2, 3, 4});
         std::vector<int> combined = concat(p.idx, eidx);
         constexpr int ke = 5;
@@ -2491,7 +2522,10 @@ json drag(const SolveState& state, const std::string& handle,
         target_pairs.emplace_back(handle, target_xy);
     }
 
-    // Soft-target each resolvable handle's first two (x, y) variables (weight 0.01).
+    // Soft-target each resolvable handle's variable(s) (weight 0.01). A point handle
+    // (idx = {px, py}) is pulled to the cursor (tx, ty); a scalar handle (rim/angle,
+    // idx = {one var}) is pulled to the single host-precomputed scalar in tx (xy[1]=0
+    // is unused -- the size>1 guard skips it).
     bool any_target = false;
     std::vector<std::string> rejected_handles;
     for (const auto& tp : target_pairs) {

@@ -312,7 +312,7 @@ Eigen::VectorXd System::lm(const Eigen::VectorXd& x_in, const BlockSet& bs,
         return best_x;
     }
 
-    double lam = 1e-4;  // LM damping; adapted multiplicatively
+    double lam = -1.0;  // LM damping; initialized from the JtJ scale on iter 1
     double nu = 2.0;    // damping growth factor on rejected steps
     int it = 0;
     Eigen::VectorXd step;
@@ -321,6 +321,12 @@ Eigen::VectorXd System::lm(const Eigen::VectorXd& x_in, const BlockSet& bs,
         Eigen::MatrixXd JtJ = J.transpose() * J;       // dense normal matrix
         Eigen::VectorXd g = J.transpose() * r;         // gradient = J^T r
         Eigen::VectorXd diag = JtJ.diagonal().cwiseMax(1e-12);  // scale-invariant basis
+        // FreeCAD-planegcs-style initial damping: normalize the opening step to the
+        // problem scale (tau * max(diag(JtJ)), tau = 1e-4). A fixed 1e-4 over-steps
+        // when numeric-Jacobian conic/tangent blocks make the normal matrix tiny
+        // (O(1e-8)); scaling by max(diag) keeps the first LM step consistently
+        // conditioned. Subsequent iterations keep the multiplicatively adapted lam.
+        if (lam < 0.0) lam = 1e-4 * std::max(JtJ.diagonal().maxCoeff(), 1.0);
 
         bool accepted = false;
         for (int t = 0; t < 12; ++t) {

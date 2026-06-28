@@ -1769,18 +1769,70 @@ void drawFeatureTreeBody(AppState& st,
                 treeIcon("material", "[M]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                 ImGui::TreeNodeEx("##mat_hdr", f | ImGuiTreeNodeFlags_NoTreePushOnOpen);
+                // W2 (material UX): right-click the Material node to assign a PHYSICAL material.
+                // Each choice (a) sets the part's material key (set_material) — read by FEA studies
+                // and shown on this row — and (b) recolours every body to the material's look via a
+                // derived set_appearance (the material->appearance map in appearance_common). An
+                // Appearance-tab edit applied later still wins (it is a later set_appearance). Ops are
+                // DEFERRED through applyTreeOps like every other tree-originated op (UAF-safe).
+                {
+                    bool matAsm = tree.is_object() && jfld(tree, "schema") == "aicad.asm/1";
+                    if (!matAsm && st.docMirror.hasDoc()) {
+                        pushTreePopupGlass();
+                        if (ImGui::BeginPopupContextItem("##mat_ctx")) {
+                            ImGui::TextDisabled("Assign Material");
+                            ImGui::Separator();
+                            // The set_appearance keys are AICM body ordinals ("b<n>"); recolour every
+                            // body so a multi-body part takes the material wholesale. Empty body list
+                            // (mesh not loaded yet) falls back to "b1", the common single-body case.
+                            std::vector<uint32_t> bodies = st.docBodyIds;
+                            if (bodies.empty()) bodies.push_back(1);
+                            for (int i = 0; i < kPhysicalMaterialsCount; ++i) {
+                                const auto& pm = kPhysicalMaterials[i];
+                                bool cur = (matKey == pm.key);
+                                if (ImGui::MenuItem(pm.name, nullptr, cur)) {
+                                    float col[3]; float mtl = 0.0f, rgh = 0.5f;
+                                    materialAppearance(pm.key, col, mtl, rgh);
+                                    nlohmann::json ops = nlohmann::json::array();
+                                    ops.push_back({{"op", "set_material"}, {"key", pm.key}});
+                                    for (uint32_t bid : bodies)
+                                        ops.push_back({{"op", "set_appearance"},
+                                                       {"id", "b" + std::to_string(bid)},
+                                                       {"color", {col[0], col[1], col[2]}},
+                                                       {"metallic", mtl}, {"roughness", rgh}});
+                                    applyTreeOps(st, ops, "set_material");
+                                }
+                            }
+                            if (!matKey.empty()) {
+                                ImGui::Separator();
+                                if (ImGui::MenuItem("Remove Material")) {
+                                    applyTreeOps(st, nlohmann::json::array({
+                                        {{"op", "set_material"}, {"key", nullptr}}}),
+                                        "set_material");
+                                }
+                            }
+                            ImGui::EndPopup();
+                        }
+                        popTreePopupGlass();
+                    }
+                }
                 ImGui::SameLine();
                 ImGui::TextUnformatted("Material");
+                // Show the friendly material name (kPhysicalMaterials) when the assigned key is one
+                // we know; fall back to the raw engine key for any other (custom / MCP-set) material.
+                const char* matLabel = matKey.c_str();
+                for (int i = 0; i < kPhysicalMaterialsCount; ++i)
+                    if (matKey == kPhysicalMaterials[i].key) { matLabel = kPhysicalMaterials[i].name; break; }
                 if (!matKey.empty()) {
                     ImGui::SameLine();
                     ImGui::PushStyleColor(ImGuiCol_Text,
                         ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1.0f));
-                    ImGui::TextUnformatted(matKey.c_str());
+                    ImGui::TextUnformatted(matLabel);
                     ImGui::PopStyleColor();
                 }
                 if (ImGui::IsItemHovered()) {
-                    if (matKey.empty()) ImGui::SetTooltip("No material assigned");
-                    else ImGui::SetTooltip("Material: %s", matKey.c_str());
+                    if (matKey.empty()) ImGui::SetTooltip("No material assigned — right-click to assign");
+                    else ImGui::SetTooltip("Material: %s", matLabel);
                 }
             }
 

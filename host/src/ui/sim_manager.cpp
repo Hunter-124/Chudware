@@ -618,7 +618,17 @@ void SimManager::newStudy(AppState& st, StudyType t) {
     // Structural & frequency studies need a material (stiffness/density/yield). Flow/Thermal run the
     // OpenFOAM pipeline and never read materialKey, so leave it unset for them — the tree hides the
     // Material node and nothing in runFlow consumes the record.
-    if (!isFlowFamily(t) && !materials().empty()) s.materialKey = materials()[0].key;
+    if (!isFlowFamily(t) && !materials().empty()) {
+        // Prefer the part's PHYSICAL material (set via the FeatureManager Material node -> set_material,
+        // stored as doc["material"]["key"]) so a study inherits what the user assigned; fall back to the
+        // first library material otherwise.
+        std::string partKey;
+        const nlohmann::json& tr = st.docMirror.tree();
+        if (tr.is_object() && tr.contains("material") && tr["material"].is_object())
+            partKey = tr["material"].value("key", std::string());
+        s.materialKey = (!partKey.empty() && materialIndexByKey(partKey) >= 0)
+                            ? partKey : materials()[0].key;
+    }
     // A Thermal study IS the OpenFOAM heat-transfer pipeline — force the solver + thermal on so
     // the form opens straight into the thermal setup (no LBM, no aero-only fallback).
     if (t == StudyType::Thermal) { s.flowSolver = 1; s.flowThermal = true; }

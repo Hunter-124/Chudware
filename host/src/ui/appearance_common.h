@@ -16,6 +16,8 @@
 // characteristic color as a swatch beside the name.
 #pragma once
 
+#include <string>
+
 namespace ui {
 
 // C32-A RealView material preset (metallic, roughness, [r,g,b] tint).
@@ -30,6 +32,28 @@ constexpr int kMaterialsCount = 5;
 // The shared presets used by the feature tree and viewport appearance editors. Plastic restores the
 // dielectric default (the C30 look).
 extern const MaterialPreset kMaterials[kMaterialsCount];
+
+// W2 (material UX): physical materials surfaced by the FeatureManager "Material" node's right-click
+// menu. Each pairs an engine sim material key (engine/sim/materials.json — what an FEA study reads)
+// with the display appearance the part takes when that material is assigned. Choosing one both feeds
+// the simulation (the doc's material key, via set_material) and recolours the part (a derived
+// set_appearance); an Appearance edit applied afterwards still wins, being a later set_appearance.
+struct PhysicalMaterial {
+    const char* key;    // engine/sim/materials.json key (the FEA study material)
+    const char* name;   // menu label
+    float metallic, roughness, rgb[3];   // derived display appearance
+};
+
+// Curated common engineering materials offered by the Material node's menu.
+constexpr int kPhysicalMaterialsCount = 9;
+extern const PhysicalMaterial kPhysicalMaterials[kPhysicalMaterialsCount];
+
+// Material -> appearance map: fills outColor/outMetallic/outRoughness with the display look for an
+// engine material key. A curated key (kPhysicalMaterials) maps exactly; any other key (a custom or
+// less-common engine material) is categorised by name onto a kMaterials preset so it still gets a
+// sensible finish. Always resolves a look (Plastic is the dielectric fall-through) and returns true.
+bool materialAppearance(const std::string& key, float outColor[3],
+                        float& outMetallic, float& outRoughness);
 
 // The appearance editor popup. Returns true once on commit. See header note.
 bool appearanceColorPicker(const char* popupId, float outColor[3],

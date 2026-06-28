@@ -22,6 +22,44 @@ const MaterialPreset kMaterials[kMaterialsCount] = {
     {"Dark Metal", 0.90f, 0.45f, {0.16f, 0.17f, 0.19f}},  // near-black
 };
 
+const PhysicalMaterial kPhysicalMaterials[kPhysicalMaterialsCount] = {
+    // engine key            menu label              metal  rough  display rgb
+    {"alu_6061",            "Aluminum 6061-T6",     0.90f, 0.35f, {0.83f, 0.85f, 0.88f}},
+    {"steel_1018",          "Steel 1018",           0.85f, 0.25f, {0.56f, 0.58f, 0.62f}},
+    {"steel_304_stainless", "Stainless Steel 304",  0.88f, 0.20f, {0.72f, 0.74f, 0.77f}},
+    {"ti_6al4v",            "Titanium Ti-6Al-4V",   0.80f, 0.45f, {0.42f, 0.43f, 0.46f}},
+    {"brass_c360",          "Brass C360",           0.95f, 0.30f, {0.80f, 0.62f, 0.28f}},
+    {"copper_c110",         "Copper C110",          0.95f, 0.32f, {0.72f, 0.43f, 0.27f}},
+    {"cast_iron_gray",      "Cast Iron (Gray)",     0.65f, 0.55f, {0.24f, 0.25f, 0.27f}},
+    {"abs",                 "ABS Plastic",          0.00f, 0.50f, {0.30f, 0.32f, 0.36f}},
+    {"pla",                 "PLA",                  0.00f, 0.55f, {0.88f, 0.87f, 0.83f}},
+};
+
+bool materialAppearance(const std::string& key, float outColor[3],
+                        float& outMetallic, float& outRoughness) {
+    auto emit = [&](float m, float r, const float rgb[3]) {
+        outColor[0] = rgb[0]; outColor[1] = rgb[1]; outColor[2] = rgb[2];
+        outMetallic = m; outRoughness = r;
+    };
+    // 1) Exact curated match — the menu's own choices land here.
+    for (int i = 0; i < kPhysicalMaterialsCount; ++i)
+        if (key == kPhysicalMaterials[i].key) {
+            emit(kPhysicalMaterials[i].metallic, kPhysicalMaterials[i].roughness,
+                 kPhysicalMaterials[i].rgb);
+            return true;
+        }
+    // 2) Category heuristic for any other engine/custom key -> a kMaterials preset (indices:
+    //    0 Plastic, 1 Aluminum, 2 Steel, 3 Brass, 4 Dark Metal). Keys are lowercase in materials.json.
+    auto has = [&](const char* s) { return key.find(s) != std::string::npos; };
+    int p = 0;  // Plastic (dielectric) default — also covers polymers/glass/concrete/carbon.
+    if (has("brass") || has("copper")) p = 3;
+    else if (has("alu")) p = 1;
+    else if (has("steel") || has("stainless") || has("iron") || has("inconel") || has("tungsten")) p = 2;
+    else if (has("ti_") || has("titanium") || has("magnesium") || has("lead")) p = 4;
+    emit(kMaterials[p].metallic, kMaterials[p].roughness, kMaterials[p].rgb);
+    return true;
+}
+
 bool appearanceColorPicker(const char* popupId, float outColor[3],
                            float* outMetallic, float* outRoughness) {
     // C38 (A1): per-popup-id seed state. Three callers share this function with distinct popup ids;

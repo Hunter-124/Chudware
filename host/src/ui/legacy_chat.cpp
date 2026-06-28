@@ -2359,7 +2359,10 @@ static void submitTurn(AppState& st, const std::string& text) {
                                   has("precise") || has("high-fidelity") || has("high fidelity") ||
                                   has("rans") || has("validated");
         bool ofAvail = false;
-        if (wantAccurate && st.simClient) ofAvail = st.simClient->caps().value("openfoam", false);
+        if (wantAccurate && st.simClient) {
+            nlohmann::json caps = st.simClient->caps();
+            if (caps.is_object()) ofAvail = caps.value("openfoam", false);
+        }
         if (wantAccurate && ofAvail) params["solver"] = "openfoam";
         if (wantAccurate && !ofAvail)
             st.addLog("[cfd] accurate requested but OpenFOAM not provisioned — using LBM estimate");
@@ -2923,7 +2926,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // throttled to ~5s and no-ops for a non-loopback (cloud) base_url, so this is cheap.
     refreshModelAvailability(st, false);
 
-    if (!ImGui::Begin("Copilot")) { ImGui::End(); return; }
+    if (!ImGui::Begin("Copilot###AI")) { ImGui::End(); return; }
     ui::Fonts& fonts = st.fonts;
 
     // Remember which dock node we live in so the sibling "Settings" tab can dock next to us.

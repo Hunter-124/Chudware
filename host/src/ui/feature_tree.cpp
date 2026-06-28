@@ -2255,10 +2255,8 @@ void drawFeatureTreeBody(AppState& st,
 
                         RowResult rr = featureRow(ctx, st);
                         if (rr.hovered && !sel && !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-                            ImVec2 imn = ImGui::GetItemRectMin();
-                            ImVec2 imx = ImGui::GetItemRectMax();
-                            ImVec2 hovMin(imn.x + 2.0f * S, imn.y + 1.0f * S);
-                            ImVec2 hovMax(imx.x - 3.0f * S, imx.y - 1.0f * S);
+                            ImVec2 hovMin(rowMin.x + 2.0f * S, rowMin.y + 1.0f * S);
+                            ImVec2 hovMax(rowMax.x - 3.0f * S, rowMax.y - 1.0f * S);
                             ImVec4 hoverCol(pal.accent[0], pal.accent[1], pal.accent[2], 0.45f);
                             ImGui::GetWindowDrawList()->AddRect(
                                 hovMin, hovMax, ImGui::ColorConvertFloat4ToU32(hoverCol),

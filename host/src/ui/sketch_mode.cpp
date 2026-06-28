@@ -5685,7 +5685,17 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             }
             else if (dragArmed_) {
                 // Released without dragging -> select the point handle (vertex/center pick).
-                toggleSel(pendingHandle_);
+                // The drag-only rim/arc-angle handles (.rim/.start_angle/.end_angle) are not real
+                // sub-entities: a click without a drag should select the OWNING entity instead, so
+                // toggle-construction / relations get a resolvable id (not "c1.rim").
+                std::string selH = pendingHandle_;
+                auto dot = selH.rfind('.');
+                if (dot != std::string::npos) {
+                    std::string suf = selH.substr(dot);
+                    if (suf == ".rim" || suf == ".start_angle" || suf == ".end_angle")
+                        selH = selH.substr(0, dot);
+                }
+                toggleSel(selH);
             }
             else if (groupDragArmed_) {
                 // C51: press without a drag -> plain click. Select the pressed entity, or the

@@ -454,7 +454,8 @@ void drawProseBox(const char* id, const std::string& text, float maxH);
 void drawFitReadout(const FitReport& fit, bool detailed);
 
 // The build-plan card: an accent-edged panel listing each planned part.
-void drawPlanCard(const PlanInfo& plan, const ui::Fonts& fonts);
+void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activity,
+                  const ui::Fonts& fonts);
 
 // One line "Parts: a, b, c" with each name tinted its assembly color.
 void drawPartsLine(const std::vector<PartInfo>& parts);

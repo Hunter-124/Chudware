@@ -74,7 +74,7 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     // Wave 1D: visible dock label stays familiar while the internal id is stable.
     ImGui::DockBuilderDockWindow("FeatureManager##LeftPane", left);
     // Right task pane: the AI Copilot pane + a sibling Settings tab next to it.
-    ImGui::DockBuilderDockWindow("AI", right);
+    ImGui::DockBuilderDockWindow("Copilot###AI", right);  // exact window name (matches Begin)
     ImGui::DockBuilderDockWindow("Settings###AISettings", right);
     // Wave N/O: ECAD shares the central node with the Viewport (tabbed). Dock ECAD FIRST so the
     // Viewport is the default-active tab (3D is the primary view); the ECAD tab pops forward on its

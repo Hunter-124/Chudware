@@ -1,0 +1,15 @@
+SETUP SHEET — SampleJob
+Post: Fanuc   Units: mm
+
+TOOLS
+  T#  Type            Dia    Fl  Name
+  1   endmill_flat    6.00   3   6mm flat
+  2   drill           5.00   2   5mm drill
+
+S1 — Generic 3-axis mill
+  #  Operation          Type          T#  CutLen   Time
+  1                     pocket2d      1   2686     1m33s
+  2                     contour2d     1   495      0m14s
+  3                     drill         2   68       0m18s
+
+Estimated total machining time: 2m 5s

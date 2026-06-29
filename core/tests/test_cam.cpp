@@ -882,3 +882,31 @@ TEST_CASE("session: inline generate + post (stateless)") {
     CHECK(post["ok"].get<bool>());
     CHECK(post["gcode"].get<std::string>().size() > 50);
 }
+
+TEST_CASE("session: cam_post dialect override beats the job default (whole-job post)") {
+    // job default = grbl; a per-call dialect=fanuc must produce FANUC output, not grbl.
+    json nw = cam_new(json{{"name", "DialJob"}, {"post", "grbl"}});
+    std::string doc = nw["doc_id"].get<std::string>();
+    json setup = json{{"name", "S1"}, {"machine", json{{"kind", "mill3"}}},
+                      {"stock", json{{"type", "box"}, {"min", {-10, -10, -5}}, {"max", {10, 10, 0}}, {"material", "aluminum"}}}};
+    json a = cam_apply_ops(doc, -1, json::array({
+        json{{"op", "add_tool"}, {"tool", json{{"number", 1}, {"type", "drill"}, {"diameter", 5}}}},
+        json{{"op", "add_setup"}, {"ref", "S"}, {"setup", setup}}}));
+    std::string sid = a["id_map"]["S"].get<std::string>();
+    json drill = json{{"type", "drill"}, {"tool_number", 1}, {"cycle", "peck"}, {"peck", 2},
+                      {"heights", json{{"top", 0}, {"bottom", -8}, {"retract", 2}}},
+                      {"geometry", json{{"points", json::array({json::array({0, 0, 0})})}}}};
+    cam_apply_ops(doc, a["revision"].get<long>(),
+                  json::array({json{{"op", "add_operation"}, {"setup_id", sid}, {"operation", drill}}}));
+    cam_generate(doc, json::object());
+    // whole-job post (no setup_id) with the override
+    json pf = cam_post(doc, json{{"dialect", "fanuc"}});
+    std::string gf = pf["gcode"].get<std::string>();
+    CHECK(gf.find("G83") != std::string::npos);   // fanuc canned peck cycle
+    CHECK(gf.front() == '%');                       // fanuc % wrap
+    CHECK(gf.find("GRBL") == std::string::npos);    // NOT the grbl header
+    // grbl override on the same job -> long-hand (no G83)
+    json pg = cam_post(doc, json{{"dialect", "grbl"}});
+    CHECK(pg["gcode"].get<std::string>().find("G83") == std::string::npos);
+    cam_close(doc);
+}

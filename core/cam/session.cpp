@@ -379,7 +379,11 @@ json cam_post(const std::string& doc_id, const json& params) {
     }
     std::vector<std::vector<Toolpath>> per;
     for (auto& su : s.job.setups) per.push_back(s.cache[su.id]);
-    PostResult r = post_job(s.job, per, po);
+    // post_job posts with job.post; honor the per-call `dialect` override by posting against
+    // a copy whose default dialect is the requested one.
+    Job jd = s.job;
+    jd.post = dialect;
+    PostResult r = post_job(jd, per, po);
     return r.to_json();
 }
 

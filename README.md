@@ -10,6 +10,9 @@ agent (the built-in chat, or any external agent such as Claude Code).
 > common feature set (extrude/revolve/sweep/loft/rib/shell/draft/fillet/chamfer/hole/pattern/
 > mirror), assemblies + mates, sheet metal, surfacing, weldments, drawings, FEA (static/modal)
 > + LBM flow + SPICE simulation, an **ECAD** module (schematic / PCB / native sim / Gerber), a
+> full **CAM** suite (toolpaths for milling / turning / laser-plasma-waterjet, feeds & speeds,
+> material-removal sim, G-code post for GRBL/LinuxCNC/Fanuc/Haas/Mach3/Marlin/Siemens/Centroid —
+> see [docs/CAM.md](docs/CAM.md)), a
 > **standard-parts library** (vendor hardware catalog — see [docs/PARTS_LIBRARY.md](docs/PARTS_LIBRARY.md)),
 > and multi-format import/export (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3dm + SolidWorks COM +
 > Parasolid) plus the native **`.step+`** document. The built-in **AI copilot** can run a whole

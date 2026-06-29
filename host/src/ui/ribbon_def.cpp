@@ -411,6 +411,43 @@ static const RibbonCmd kCmds[] = {
     { "sk_poly_oct",  "Octagon",  "poly_octagon",  "Sketch", "Draw", false, "sk_polygon", false },
     { "sk_poly_star", "Star",     "poly_star",     "Sketch", "Draw", false, "sk_polygon", false },
 
+    // =========================================================================
+    // Tab: Manufacture (CAM — toolpaths / post / material-removal sim)
+    // =========================================================================
+    // --- Group: Job ---
+    { "cam_new_job",       "New Job",     "new_part",        "Manufacture", "Job",       true,  nullptr, false },
+    { "cam_extract",       "From Part",   "hole_wizard",     "Manufacture", "Job",       true,  nullptr, false },
+    { "cam_add_setup",     "Setup",       "ref_csys",        "Manufacture", "Job",       false, nullptr, false },
+    { "cam_add_tool",      "Tool",        "drill",           "Manufacture", "Job",       false, nullptr, false },
+    // --- Group: 2.5D Milling ---
+    { "cam_op_face",       "Face",        "extrude_cut",     "Manufacture", "2.5D",      true,  nullptr, false },
+    { "cam_op_contour",    "Contour",     "fillet",          "Manufacture", "2.5D",      true,  nullptr, false },
+    { "cam_op_pocket",     "Pocket",      "shell",           "Manufacture", "2.5D",      true,  nullptr, false },
+    { "cam_op_adaptive",   "Adaptive",    "curve_helix",     "Manufacture", "2.5D",      false, nullptr, false },
+    { "cam_op_slot",       "Slot",        "slot",            "Manufacture", "2.5D",      false, nullptr, false },
+    { "cam_op_chamfer",    "Chamfer",     "chamfer",         "Manufacture", "2.5D",      false, nullptr, false },
+    { "cam_op_engrave",    "Engrave",     "split",           "Manufacture", "2.5D",      false, nullptr, false },
+    // --- Group: Holes ---
+    { "cam_op_drill",      "Drill",       "hole_wizard",     "Manufacture", "Holes",     true,  nullptr, false },
+    { "cam_op_thread",     "Thread Mill", "curve_helix",     "Manufacture", "Holes",     false, nullptr, false },
+    // --- Group: 3D Milling ---
+    { "cam_op_parallel3d", "Parallel",    "loft",            "Manufacture", "3D",        true,  nullptr, false },
+    { "cam_op_waterline3d","Waterline",   "revolve_boss",    "Manufacture", "3D",        true,  nullptr, false },
+    { "cam_op_scallop3d",  "Scallop",     "sweep",           "Manufacture", "3D",        false, nullptr, false },
+    { "cam_op_pocket3d",   "3D Pocket",   "shell",           "Manufacture", "3D",        false, nullptr, false },
+    // --- Group: Turning ---
+    { "cam_op_turn_rough", "Rough",       "revolve_cut",     "Manufacture", "Turning",   true,  nullptr, false },
+    { "cam_op_turn_finish","Finish",      "revolve_boss",    "Manufacture", "Turning",   false, nullptr, false },
+    { "cam_op_turn_face",  "Face",        "extrude_cut",     "Manufacture", "Turning",   false, nullptr, false },
+    { "cam_op_turn_part",  "Part Off",    "split",           "Manufacture", "Turning",   false, nullptr, false },
+    // --- Group: Cutting ---
+    { "cam_op_laser",      "Laser/Plasma","split",           "Manufacture", "Cutting",   true,  nullptr, false },
+    { "cam_op_probe",      "Probe",       "ref_point",       "Manufacture", "Cutting",   false, nullptr, false },
+    // --- Group: Output ---
+    { "cam_generate",      "Generate",    "ok_check",        "Manufacture", "Output",    true,  nullptr, false },
+    { "cam_simulate",      "Simulate",    "study_static",    "Manufacture", "Output",    true,  nullptr, false },
+    { "cam_post",          "Post G-code", "ai_panel",        "Manufacture", "Output",    true,  nullptr, false },
+
 };
 // clang-format on
 

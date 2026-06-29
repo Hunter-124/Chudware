@@ -55,6 +55,7 @@
 #include "ui/drawing_panel.h"     // W17: drawing ribbon command dispatch (drawingHandleCommand)
 #include "ui/ecad/ecad_panel.h"   // Wave N: AI-ECAD 2D editor
 #include "ui/ecad/ecad_mirror.h"  // Wave N: complete type for EcadMirror::setDocId
+#include "ui/cam/cam_panel.h"     // CAM: manufacturing workspace (toolpaths / post / sim)
 #include "ui/file_dialog.h"       // Wave Y: native Save As / Open dialogs for .ecad+
 #include "ui/icons.h"
 #include "ui/appearance_common.h"  // Appearance tab: MaterialPreset table (kMaterials) for presets
@@ -1057,6 +1058,11 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 st.showPcbTools = true;
                 ecadDispatch(st, ec); return;
             }
+        }
+        // CAM (Manufacture workspace): cam_* commands route to the CAM manager panel.
+        {
+            std::string cc(cmd_id);
+            if (cc.rfind("cam_", 0) == 0) { ui::camHandleCommand(st, cc); return; }
         }
         if (propertyManager.openForCommand(st, cmd_id)) return;  // form opened
         // C19: Simulation tab -> sim panel; Evaluate tab -> evaluate dialogs.
@@ -2611,7 +2617,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         float docTabsH = 0.0f;
 
         // ---------- dockspace host (between the title bar+ribbon and the status bar) ----------
-        const float statusH = ImGui::GetTextLineHeight() + 12.0f * scale;
+        const float statusH = ImGui::GetTextLineHeight() + 8.0f * scale;
         const float dockTopY = barH + ribbonH + docTabsH;
         ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + dockTopY));
         ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
@@ -2692,6 +2698,10 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         }
         if (st.showPcbTools || !st.ecadDocId.empty())
             ui::drawEcadEditor(st);   // Wave N: AI-ECAD 2D editor
+        // CAM Manufacture workspace: reveal when its ribbon tab is active; draw every frame
+        // (no-ops until opened). Self-contained dock window like the ECAD editor.
+        if (st.ribbonTab == AppState::RT_Manufacture) ui::camEnsureVisible();
+        ui::drawCamManager(st);
         if (st.ecadAiGo) { st.ecadAiGo = false; ecadAiDesign(st, st.ecadAiRequest); }  // Wave P
         if (st.ecadAiBoardGo) { st.ecadAiBoardGo = false; ecadAiBoard(st, st.ecadAiRequest); }  // Wave U
         if (st.ecadOpsGo) { st.ecadOpsGo = false; ecadApplyOps(st, st.ecadPendingOps); }  // Wave Q

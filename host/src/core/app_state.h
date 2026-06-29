@@ -977,6 +977,8 @@ struct AppState {
         RT_ViewLayout = 9, RT_Annotation = 10,
         // Appearance workspace — per-body color / RealView material / display style (3D docs).
         RT_Appearance = 11,
+        // Manufacture workspace — CAM toolpaths / post / material-removal sim (3D docs).
+        RT_Manufacture = 12,
     };
     bool showRibbon = true;        // View > Ribbon visibility toggle
     bool profilerRunning = false;  // Evaluate > Profiler: sampling profiler active (libaicad prof_*)

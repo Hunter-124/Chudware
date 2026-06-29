@@ -705,6 +705,21 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
         // DLL is unavailable) — continue to the Python worker so ECAD creation never
         // hard-breaks (it mints a Python doc id, which keeps the doc on Python).
     }
+    // CAM (computer-aided machining): every cam_* RPC lives ONLY in the C++ core
+    // (libaicad); there is no Python CAM engine. Route them all to cpp_core and report
+    // its result (an OpError surfaces as {code,message,detail}); never fall back to Python.
+    if (method.rfind("cam_", 0) == 0) {
+        std::string cerr;
+        if (core::cpp_core().call(method, params, result, cerr))
+            return true;  // handled (rc==0)
+        if (result.is_object() && result.contains("code")) {
+            err = result.value("message", std::string("cpp-cam error"));
+            return true;  // structured OpError round-tripped
+        }
+        err = "cpp-cam (" + method + "): " + cerr;
+        if (errorSink_) errorSink_(method, err);
+        return false;
+    }
     // P16: route C++-backed documents to the in-process core (libaicad) instead of the
     // Python worker. All-or-nothing per document (NO mid-doc Python fallback — Python
     // never created this doc), so an unported method surfaces a clear error rather than

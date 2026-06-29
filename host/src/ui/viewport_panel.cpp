@@ -20,6 +20,8 @@
 #include "camera_anim.h"     // C25 W2-D: eased camera tween (presets / Normal-To / zoom-to-fit)
 #include "view_selector.h"   // C25 W2-E: SolidWorks-style glass-box view selector (Space)
 #include "section_tool.h"    // C25 W3-J: section-view tool (another agent owns impl)
+#include "cam/cam_panel.h"   // CAM: viewport toolpath backplot overlay
+#include "cam/cam_mirror.h"  // CAM: CamBackplot type
 
 #include "../core/app_state.h"
 
@@ -1661,6 +1663,21 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     if (fb.segs && !fb.segs->empty())
                         st.overlays->drawSegments(renderer.camera(), *fb.segs, fb.color, 2.0f, true);
             }
+            // CAM toolpaths: draw the active job's classified backplot over the part — rapid
+            // (faint red), lead (green), plunge (cyan), cut (blue), arc (violet). The CAM panel
+            // owns the segment batches; nullptr when the panel is hidden or backplot is off.
+            if (const ui::CamBackplot* bp = ui::camActiveBackplot()) {
+                static const float kRapid[4]  = {0.78f, 0.24f, 0.20f, 0.55f};
+                static const float kLead[4]   = {0.31f, 0.78f, 0.47f, 0.95f};
+                static const float kPlunge[4] = {0.31f, 0.71f, 0.86f, 0.95f};
+                static const float kCut[4]    = {0.35f, 0.59f, 0.94f, 1.0f};
+                static const float kArc[4]    = {0.59f, 0.51f, 0.94f, 1.0f};
+                if (!bp->rapid.empty())  st.overlays->drawSegments(renderer.camera(), bp->rapid,  kRapid,  1.0f, false);
+                if (!bp->lead.empty())   st.overlays->drawSegments(renderer.camera(), bp->lead,   kLead,   1.6f, false);
+                if (!bp->plunge.empty()) st.overlays->drawSegments(renderer.camera(), bp->plunge, kPlunge, 1.6f, false);
+                if (!bp->cut.empty())    st.overlays->drawSegments(renderer.camera(), bp->cut,    kCut,    1.8f, false);
+                if (!bp->arc.empty())    st.overlays->drawSegments(renderer.camera(), bp->arc,    kArc,    1.8f, false);
+            }
             std::vector<render::PickHit> selHits;
             selHits.reserve(st.selection.size());
             for (const auto& it : st.selection.items()) selHits.push_back(it.hit);
@@ -1691,6 +1708,30 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         ImGui::GetBackgroundDrawList()->AddImage(
             (ImTextureID)(intptr_t)renderer.resolvedColorTexture(), vr0, vr1,
             ImVec2(0, 1), ImVec2(1, 0));
+        // W2b: the dock-tab band above the content rect (the central doc-tab strip's y-range, shared
+        // by the side panes' now-transparent title bars — ImGuiCol_TitleBg* are 0) has no 3D behind it,
+        // so without this it reads as a dark strip above the translucent FeatureManager/Copilot panes.
+        // Paint the 3D texture's TOP slice into that band (full width, on the background draw list, so
+        // it sits behind the doc tabs + tab labels) so the band blends into the same full-bleed 3D as
+        // the panes. Purely additive: vr0/vr1 (the pick-exact rect) are untouched.
+        if (ImGuiDockNode* vpNode = ImGui::GetWindowDockNode()) {
+            const float bandTop = vpNode->Pos.y;
+            const float bandH   = cr0.y - bandTop;
+            if (bandH > 0.5f && vh > 0) {
+                const float vFrac = bandH / (float)vh;
+                ImDrawList* bgDl = ImGui::GetBackgroundDrawList();
+                const ImVec2 bp0(mainVp->Pos.x, bandTop);
+                const ImVec2 bp1(mainVp->Pos.x + (float)vw, cr0.y);
+                bgDl->AddImage(
+                    (ImTextureID)(intptr_t)renderer.resolvedColorTexture(), bp0, bp1,
+                    ImVec2(0, 1.0f), ImVec2(1, 1.0f - (vFrac < 1.0f ? vFrac : 1.0f)));
+                // Same translucent glass fill the side panes paint (glassBg * 0.45), so the band
+                // reads as a continuation of the frosted FeatureManager/Copilot surface rather than a
+                // brighter un-glassed strip. The centre column's doc-tab strip paints over this.
+                float bandGlass[4]; ui::Palette::withAlpha(ui::palette.glassBg, bandGlass, 0.45f);
+                bgDl->AddRectFilled(bp0, bp1, ui::Palette::toU32(bandGlass));
+            }
+        }
         // Input surface: an invisible button over the visible 3D (the content rect). It carries the
         // hover/active state the navigation, picking, and drag-drop target all read (imgHovered),
         // exactly as the old ImGui::Image item did — minus the opaque quad that would hide the 3D.

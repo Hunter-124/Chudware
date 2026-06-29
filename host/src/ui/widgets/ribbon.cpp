@@ -41,9 +41,9 @@ static std::string s_flyoutOpenReq;
 
 static const char* kRibbonTabs[] = {"Features", "Sketch", "Evaluate", "Simulation", "Assembly",
                                     "Sheet Metal", "Weldments", "PCB", "Surfaces",
-                                    "View Layout", "Annotation", "Appearance"};
-static constexpr int kRibbonTabCount = 12;  // + W17 contextual "View Layout"/"Annotation" (drawings)
-                                            //   + "Appearance" (3D color/material/display, index 11)
+                                    "View Layout", "Annotation", "Appearance", "Manufacture"};
+static constexpr int kRibbonTabCount = 13;  // + W17 contextual "View Layout"/"Annotation" (drawings)
+                                            //   + "Appearance" (index 11) + "Manufacture" (CAM, 12)
 
 // W-overhaul: per-workspace tab icon, parallel to kRibbonTabs[]. The eight true workspace tabs use
 // the dedicated ws_* atlas glyphs from the icon contract; the four tabs that have no ws_* glyph
@@ -62,6 +62,7 @@ static const char* kTabIcons[] = {
     "view_selector",  // View Layout (drawing — placeholder)
     "smart_dim",      // Annotation (drawing — placeholder)
     "ws_appearance",  // Appearance
+    "hole_wizard",    // Manufacture (CAM — placeholder, machining glyph)
 };
 static_assert(sizeof(kTabIcons) / sizeof(kTabIcons[0]) == kRibbonTabCount,
               "kTabIcons must stay parallel to kRibbonTabs");

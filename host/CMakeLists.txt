@@ -120,6 +120,10 @@ add_executable(AI-CAD
   src/ui/ecad/ecad_canvas.cpp
   src/ui/ecad/ecad_panel.cpp
   # --- end Wave N ---
+  # --- CAM (computer-aided machining) workspace: toolpaths / post / sim ---
+  src/ui/cam/cam_mirror.cpp
+  src/ui/cam/cam_panel.cpp
+  # --- end CAM ---
   # --- C25: mouse gesture wheel + S shortcut bar ---
   src/ui/mouse_gestures.cpp
   src/ui/camera_anim.cpp   # C25 W2-D: eased camera tween (presets / Normal-To / zoom-to-fit)

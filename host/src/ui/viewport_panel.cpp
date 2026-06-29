@@ -1356,6 +1356,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     // ---------- Viewport ----------
     if (st.showViewport) {
     const std::string title = viewportTitle();
+    // W2 full-bleed viewport: the central Viewport window paints NO background so the full-window 3D
+    // (composited on the background draw list) shows through the central dock node. The doc-tab strip
+    // and assembly parts panel still paint their own backgrounds on top of the 3D. (Also requires the
+    // dockspace backdrop to be transparent — app.cpp pushes a transparent ImGuiCol_WindowBg around the
+    // DockSpace() call, since PassthruCentralNode only punches the hole when the central node is empty.)
+    ImGui::SetNextWindowBgAlpha(0.0f);
     if (ImGui::Begin(title.c_str()))
     {
         vpDockStripDraw(st);        // hide window tab + paint the doc tabs above the 3D view
@@ -1401,7 +1407,16 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         }
 
         ImVec2 avail = ImGui::GetContentRegionAvail();
-        int vw = (int)avail.x > 64 ? (int)avail.x : 64;
+        // W2 full-bleed viewport: the visible (un-occluded) 3D region is this docked window's
+        // content rect. cr0/cr1 anchor the HUD chrome and drive the lens-shift re-centering.
+        const ImVec2 cr0 = ImGui::GetCursorScreenPos();
+        const ImVec2 cr1 = ImVec2(cr0.x + avail.x, cr0.y + avail.y);
+        // The 3D renders full-WIDTH so it sits behind the translucent FeatureManager, but keeps the
+        // content-region HEIGHT so the part's framing/apparent size is byte-identical to before (a
+        // full-window-height FBO would frame the part larger). With no side panes the content rect
+        // already spans the full width, so this is a no-op (lens shift 0) — identical to before.
+        ImGuiViewport* mainVp = ImGui::GetMainViewport();
+        int vw = (int)mainVp->Size.x > 64 ? (int)mainVp->Size.x : 64;
         int vh = (int)avail.y > 64 ? (int)avail.y : 64;
         renderer.resize(vw, vh);
         // C18: lock the camera normal to the sketch plane while editing a sketch — UNTIL the user
@@ -1558,6 +1573,23 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         } else {
             renderer.clearPreviewIsolation();
         }
+        // W2 full-bleed viewport: re-center the part horizontally in the un-occluded region between
+        // the side panes via an asymmetric-frustum lens shift (NOT by moving pan_, so the published
+        // cam_.mvp — and thus the id-pass picks + every overlay — stays pixel-exact). The visible
+        // region IS the central dock node = this window's content rect [cr0,cr1]; deriving the shift
+        // from it makes a hidden / floating / tabbed pane fall out automatically (the node spans that
+        // edge), and the no-side-panes case computes offset 0 -> lens shift 0 (identical to before).
+        // cx = leftW + (fullW-leftW-rightW)/2 expressed via the content rect: the node's centre.
+        {
+            const float fullW = mainVp->Size.x;
+            if (fullW > 1.0f) {
+                const float cx = (cr0.x + cr1.x) * 0.5f - mainVp->Pos.x;   // visible centre, window-relative
+                const float offsetNDC = 2.0f * (cx - fullW * 0.5f) / fullW;
+                renderer.setLensShiftX(-offsetNDC);
+            } else {
+                renderer.setLensShiftX(0.0f);
+            }
+        }
         renderer.renderOrbit(st.yaw, st.pitch, st.zoom, st.pan);
 
         // ---- topology picking (C15): id pass + overlay highlights drawn over the shaded view ----
@@ -1649,14 +1681,26 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             renderer.endOverlay();
         }
 
-        ImGui::Image((ImTextureID)(intptr_t)renderer.resolvedColorTexture(),
-                     ImVec2((float)vw, (float)vh),
-                     ImVec2(0, 1), ImVec2(1, 0));
-        ImVec2 vr0 = ImGui::GetItemRectMin(), vr1 = ImGui::GetItemRectMax();
+        // W2 full-bleed viewport: the shaded 3D is composited on the BACKGROUND draw list so it sits
+        // BEHIND every panel — full window WIDTH (visible behind the translucent FeatureManager) at
+        // the content-region vertical band. vr0/vr1 is this image's exact screen rect; ppProject, the
+        // id-pick mouse->pixel mapping, and every projected overlay read it, so they stay pixel-exact
+        // with the model (the lens shift lives in cam_.mvp, the rect is just the NDC->screen map).
+        ImVec2 vr0(mainVp->Pos.x, cr0.y);
+        ImVec2 vr1(vr0.x + (float)vw, vr0.y + (float)vh);  // == vr0 + (vw,vh) so it matches ppProject + the FBO exactly
+        ImGui::GetBackgroundDrawList()->AddImage(
+            (ImTextureID)(intptr_t)renderer.resolvedColorTexture(), vr0, vr1,
+            ImVec2(0, 1), ImVec2(1, 0));
+        // Input surface: an invisible button over the visible 3D (the content rect). It carries the
+        // hover/active state the navigation, picking, and drag-drop target all read (imgHovered),
+        // exactly as the old ImGui::Image item did — minus the opaque quad that would hide the 3D.
+        ImGui::SetCursorScreenPos(cr0);
+        ImGui::InvisibleButton("##viewport3d",
+            ImVec2(avail.x > 1.0f ? avail.x : 1.0f, avail.y > 1.0f ? avail.y : 1.0f));
         // Task 02: while the in-app copilot is driving the doc, paint an "AI editing" badge over the
         // view so the live edits are clearly attributed to the AI (not the user). Same run-lifecycle
         // signal as the Activity panel; non-intrusive top-center pill.
-        if (st.agentV2Running) drawAiActivityBadge(vr0, vr1, st.agentV2Status);
+        if (st.agentV2Running) drawAiActivityBadge(cr0, cr1, st.agentV2Status);
         // Drop TARGET (Wave 3A item 5): dropping an in-app Explorer file row onto the viewport opens
         // it. The payload is the dragged file's absolute path (NUL-terminated); we hand it to the
         // GL-thread request pump via st.requestOpenPath, which routes CAD vs ECAD by extension — the
@@ -1746,7 +1790,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     float rw = rx1 - rx0, rh = ry1 - ry0;
                     if (rw > 4 && rh > 4) {
                         // Center of the rect in viewport-relative px (origin = viewport center).
-                        float vcx = (vr0.x + vr1.x) * 0.5f, vcy = (vr0.y + vr1.y) * 0.5f;
+                        float vcx = (cr0.x + cr1.x) * 0.5f, vcy = (cr0.y + cr1.y) * 0.5f;
                         float rcx = (rx0 + rx1) * 0.5f - vcx;
                         float rcy = (ry0 + ry1) * 0.5f - vcy;
                         // Pan shift: move target so rect center lands at view center.
@@ -2116,8 +2160,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10 ? 10 : st.zoom);
                 float newZoom = st.zoom;
                 if (newZoom != oldZoom) {
-                    float cxp = io.MousePos.x - (vr0.x + (vr1.x - vr0.x) * 0.5f);
-                    float cyp = io.MousePos.y - (vr0.y + (vr1.y - vr0.y) * 0.5f);
+                    float cxp = io.MousePos.x - (cr0.x + cr1.x) * 0.5f;
+                    float cyp = io.MousePos.y - (cr0.y + cr1.y) * 0.5f;
                     // worldPerPx is inversely proportional to zoom; the target must move so the
                     // cursor ray hits the same world point. delta = cursorOffset * (1/old - 1/new)
                     // in world units, projected onto the camera plane (R right, U up; y is down).
@@ -2310,8 +2354,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 !datumSelectHot && !blendDeselectHot && !s_pp.active && !s_dim.active) {
                 if (io.KeyCtrl) {
                     if (st.hover.valid()) st.selection.toggle(st.hover);
+                } else if (st.hover.valid()) {
+                    st.selection.selectOne(st.hover);
                 } else {
-                    st.selection.selectOne(st.hover);  // clears if hover invalid
+                    // W2: a left click on empty 3D space (no pick hit) deselects ALL selection kinds
+                    // (topology + feature-tree multi-select + sketch entities), not just topology —
+                    // so clicking the open viewport clears the model the way SolidWorks does.
+                    st.clearSelection();
                 }
             }
             // ESC: during a push-pull / dimension drag, cancel it (revert) and DON'T clear the
@@ -2342,11 +2391,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // ---- C25: mouse gesture wheel (right-drag) + 'S' shortcut bar ----
         // Gestures are suppressed while in sketch mode (camera is plane-locked; no view presets).
         if (!inSketch) {
-            s_gestures.update(st, imgHovered, vr0, vr1);
+            s_gestures.update(st, imgHovered, cr0, cr1);
             s_gestures.draw(ImGui::GetWindowDrawList());
         }
         // Shortcut bar is context-aware: shows sketch tools when inSketch, model tools otherwise.
-        s_shortcutBar.update(st, imgHovered, inSketch, vr0, vr1);
+        s_shortcutBar.update(st, imgHovered, inSketch, cr0, cr1);
         s_shortcutBar.draw(st, inSketch);
 
         // ---- C25 W3-J: viewport right-click context menu ----
@@ -2495,8 +2544,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const int nHU = 8;
             float barW = nHU * btn + (nHU - 1) * gap + padX * 2;
             float barH = btn + padY * 2;
-            float bx0  = vr0.x + ((vr1.x - vr0.x) - barW) * 0.5f;
-            float by0  = vr0.y + 8.0f * s;
+            float bx0  = cr0.x + ((cr1.x - cr0.x) - barW) * 0.5f;
+            float by0  = cr0.y + 8.0f * s;
             float byi  = by0 + padY;
 
             // Chip background.
@@ -2739,8 +2788,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // live progress pill: pulsing dot + the agent's current phase
             std::string lt = st.livePhase.empty() ? std::string("Working...") : st.livePhase;
             ImVec2 ts = ImGui::CalcTextSize(lt.c_str());
-            float maxW = (vr1.x - vr0.x) - 58.0f;
-            ImVec2 p0(vr0.x + 12, vr0.y + 12);
+            float maxW = (cr1.x - cr0.x) - 58.0f;
+            ImVec2 p0(cr0.x + 12, cr0.y + 12);
             ImVec2 p1(p0.x + (ts.x > maxW ? maxW : ts.x) + 36.0f, p0.y + ts.y + 12.0f);
             ui::glassBackground(vdl, p0, p1, (p1.y - p0.y) * 0.5f / ui::uiScale);
             float pulse = 0.35f + 0.65f * (0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 5.0f));
@@ -2755,7 +2804,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         if (st.hasDocMesh && !st.pickStatus.empty()) {
             // pick readout, top-right ("Face 12 of Body1")
             ImVec2 ts = ImGui::CalcTextSize(st.pickStatus.c_str());
-            ImVec2 p1(vr1.x - 12, vr0.y + 12);
+            ImVec2 p1(cr1.x - 12, cr0.y + 12);
             ImVec2 p0(p1.x - ts.x - 20.0f, p1.y);
             ImVec2 p1b(p1.x, p1.y + ts.y + 10.0f);
             ui::glassBackground(vdl, p0, p1b, 6.0f);
@@ -2818,8 +2867,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         ImVec2 q0(io.MousePos.x + 16.0f * sc, io.MousePos.y + 16.0f * sc);
                         ImVec2 q1(q0.x + ts2.x + padX * 2, q0.y + ts2.y + padY * 2);
                         // keep inside the viewport rect
-                        if (q1.x > vr1.x - 4) { float w = q1.x - q0.x; q1.x = vr1.x - 4; q0.x = q1.x - w; }
-                        if (q1.y > vr1.y - 4) { float h = q1.y - q0.y; q1.y = vr1.y - 4; q0.y = q1.y - h; }
+                        if (q1.x > cr1.x - 4) { float w = q1.x - q0.x; q1.x = cr1.x - 4; q0.x = q1.x - w; }
+                        if (q1.y > cr1.y - 4) { float h = q1.y - q0.y; q1.y = cr1.y - 4; q0.y = q1.y - h; }
                         vdl->AddRectFilled(q0, q1, overlayBg, 4.0f * sc);
                         ImU32 chipBord = s_pp.clamped
                             ? ImGui::ColorConvertFloat4ToU32(ImVec4(0.90f, 0.55f, 0.25f, 1.0f))
@@ -2911,10 +2960,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         : ImVec2(tipP.x + 8.0f * sc, tipP.y - (ts2.y + padY * 2) * 0.5f);
                     ImVec2 q1(q0.x + ts2.x + padX * 2, q0.y + ts2.y + padY * 2);
                     // keep inside the viewport rect
-                    if (q1.x > vr1.x - 4) { float w = q1.x - q0.x; q1.x = vr1.x - 4; q0.x = q1.x - w; }
-                    if (q0.x < vr0.x + 4) { float w = q1.x - q0.x; q0.x = vr0.x + 4; q1.x = q0.x + w; }
-                    if (q1.y > vr1.y - 4) { float h = q1.y - q0.y; q1.y = vr1.y - 4; q0.y = q1.y - h; }
-                    if (q0.y < vr0.y + 4) { float h = q1.y - q0.y; q0.y = vr0.y + 4; q1.y = q0.y + h; }
+                    if (q1.x > cr1.x - 4) { float w = q1.x - q0.x; q1.x = cr1.x - 4; q0.x = q1.x - w; }
+                    if (q0.x < cr0.x + 4) { float w = q1.x - q0.x; q0.x = cr0.x + 4; q1.x = q0.x + w; }
+                    if (q1.y > cr1.y - 4) { float h = q1.y - q0.y; q1.y = cr1.y - 4; q0.y = q1.y - h; }
+                    if (q0.y < cr0.y + 4) { float h = q1.y - q0.y; q0.y = cr0.y + 4; q1.y = q0.y + h; }
                     vdl->AddRectFilled(q0, q1, overlayBg, 4.0f * sc);
                     ImU32 chipBord = (isDragged && s_dim.clamped)
                         ? ImGui::ColorConvertFloat4ToU32(ImVec4(0.90f, 0.55f, 0.25f, 1.0f))
@@ -2956,7 +3005,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Hover: accentSoft circle behind the label. Tooltip: view name.
         if (st.showTriad) {
             const float ts = ui::uiScale;
-            float cx = vr0.x + 34.0f * ts, cy = vr1.y - 34.0f * ts;
+            float cx = cr0.x + 34.0f * ts, cy = cr1.y - 34.0f * ts;
             float L = 20.0f * ts;
             float yawR = st.yaw * 3.14159265f / 180.0f, pitR = st.pitch * 3.14159265f / 180.0f;
             float cyaw = std::cos(yawR), syaw = std::sin(yawR);
@@ -3046,7 +3095,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             ImFont* mf = st.fonts.mono ? st.fonts.mono : ImGui::GetFont();
             float fs = mf->FontSize * 0.92f;
             ImVec2 ts = mf->CalcTextSizeA(fs, 1e30f, 0.0f, st.modelInfo.c_str());
-            ImVec2 p0(vr0.x + 12, vr1.y - ts.y - 70.0f);
+            ImVec2 p0(cr0.x + 12, cr1.y - ts.y - 70.0f);
             ImVec2 p1(p0.x + ts.x + 20.0f, p0.y + ts.y + 10.0f);
             ui::glassBackground(vdl, p0, p1, 6.0f);
             vdl->AddText(mf, fs, ImVec2(p0.x + 10 * ui::uiScale, p0.y + 5 * ui::uiScale),
@@ -3078,10 +3127,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 ImVec2 ts = ImGui::CalcTextSize(nm);
                 // keep the chip inside the viewport rect
                 float x0 = sp.x, y0 = sp.y;
-                if (x0 + ts.x + 12 > vr1.x) x0 = vr1.x - ts.x - 12;
-                if (x0 < vr0.x + 2) x0 = vr0.x + 2;
-                if (y0 + ts.y + 6 > vr1.y) y0 = vr1.y - ts.y - 6;
-                if (y0 < vr0.y + 2) y0 = vr0.y + 2;
+                if (x0 + ts.x + 12 > cr1.x) x0 = cr1.x - ts.x - 12;
+                if (x0 < cr0.x + 2) x0 = cr0.x + 2;
+                if (y0 + ts.y + 6 > cr1.y) y0 = cr1.y - ts.y - 6;
+                if (y0 < cr0.y + 2) y0 = cr0.y + 2;
                 ImVec2 q0(x0, y0), q1(x0 + ts.x + 12, y0 + ts.y + 6);
                 // C43: during plane-pick the label chips are CLICK TARGETS (the quads overlap
                 // heavily near the origin; the labels are unambiguous). Outside a pick — and outside
@@ -3158,15 +3207,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             ++anchoredRow;
                         } else {
                             // No geometry: dock top-right, under the HUD pick readout.
-                            chipTL = ImVec2(vr1.x - cw - 12.0f * sc,
-                                            vr0.y + 44.0f * sc + dockRow * (ch + 6.0f * sc));
+                            chipTL = ImVec2(cr1.x - cw - 12.0f * sc,
+                                            cr0.y + 44.0f * sc + dockRow * (ch + 6.0f * sc));
                             ++dockRow;
                         }
                         // Clamp the chip inside the viewport rect.
-                        if (chipTL.x + cw > vr1.x - 4) chipTL.x = vr1.x - cw - 4;
-                        if (chipTL.x < vr0.x + 4)       chipTL.x = vr0.x + 4;
-                        if (chipTL.y + ch > vr1.y - 4) chipTL.y = vr1.y - ch - 4;
-                        if (chipTL.y < vr0.y + 4)       chipTL.y = vr0.y + 4;
+                        if (chipTL.x + cw > cr1.x - 4) chipTL.x = cr1.x - cw - 4;
+                        if (chipTL.x < cr0.x + 4)       chipTL.x = cr0.x + 4;
+                        if (chipTL.y + ch > cr1.y - 4) chipTL.y = cr1.y - ch - 4;
+                        if (chipTL.y < cr0.y + 4)       chipTL.y = cr0.y + 4;
                         ImVec2 chipBR(chipTL.x + cw, chipTL.y + ch);
 
                         if (drawLeader) {
@@ -3186,7 +3235,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         }
 
         // ---- C19: result colormap legend (bottom-right) ----
-        ui::drawLegend(st, vdl, vr0, vr1);
+        ui::drawLegend(st, vdl, cr0, cr1);
         }  // end overlay colors scope
     }
     ImGui::End();

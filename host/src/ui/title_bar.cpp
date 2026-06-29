@@ -360,6 +360,8 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
                 if (ImGui::BeginMenu("Tools"))  { drawToolsMenu();  ImGui::EndMenu(); }
                 if (ImGui::BeginMenu("Window")) { drawWindowMenu(); ImGui::EndMenu(); }
                 if (ImGui::BeginMenu("Help"))   { drawHelpMenu();   ImGui::EndMenu(); }
+                if (ImGui::MenuItem("Settings")) st.openSettings = true;
+                if (ImGui::MenuItem("Search"))   st.showCommandSearch = true;
                 ImGui::EndMenu();
             }
         } else {
@@ -370,6 +372,8 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             if (ImGui::BeginMenu("Tools"))  { drawToolsMenu();  ImGui::EndMenu(); }
             if (ImGui::BeginMenu("Window")) { drawWindowMenu(); ImGui::EndMenu(); }
             if (ImGui::BeginMenu("Help"))   { drawHelpMenu();   ImGui::EndMenu(); }
+            if (ImGui::MenuItem("Settings")) st.openSettings = true;
+            if (ImGui::MenuItem("Search"))   st.showCommandSearch = true;
         }
         hitLayout.menuRight = (int)ImGui::GetItemRectMax().x;
 

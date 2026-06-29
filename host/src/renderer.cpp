@@ -755,6 +755,10 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
                               std::cos(pitch)));
 
     Mat4 proj = perspective(fov, (float)sw_ / (float)sh_, dist * 0.01f, dist * 10.0f);
+    // W2 full-bleed viewport: bake the horizontal lens shift into the projection's unused m[8]
+    // slot BEFORE building mvp, so the asymmetric frustum re-centers the part in the un-occluded
+    // region and the shift travels through cam_.mvp to the id-pass + overlays (pixel-exact).
+    proj.m[8] = lensShiftX_;
     Mat4 view = lookAt(eye, target, up);
     Mat4 mvp = mul(proj, view);
 

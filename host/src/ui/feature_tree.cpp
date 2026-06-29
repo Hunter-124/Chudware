@@ -532,6 +532,9 @@ void featureTreeResetTransient() {
     s_clipReqFids.clear();              // (the clipboard payload itself survives a doc switch)
 }
 
+// Clear only the multi-select set — see feature_tree.h.
+void featureClearTreeMultiSel() { s_multiSel.clear(); }
+
 // ---- C26: appearance color-picker popup ----
 // W1-B (item 9): the MaterialPreset table + the appearance picker popup, formerly duplicated here
 // and in viewport_panel.cpp, now live in ui/appearance_common.{h,cpp}. Both call ui::appearance-
@@ -1071,6 +1074,35 @@ static const char* featureIcon(const std::string& type, const nlohmann::json* fe
     if (type == "point")            return "ref_point";
     if (type == "import")           return "open";
     if (type == "script")           return "history";
+    if (type == "helix")            return "curve_helix";
+    if (type == "csys")             return "ref_csys";
+    if (type == "boolean")          return "combine";
+    if (type == "split")            return "split";
+    // Sheet metal
+    if (type == "sm_base_flange")   return "sm_base_flange";
+    if (type == "sm_edge_flange")   return "sm_edge_flange";
+    if (type == "sm_hem")           return "sm_hem";
+    if (type == "sm_jog")           return "sm_jog";
+    // Weldments
+    if (type == "weld_member")      return "weld_member";
+    if (type == "weld_gusset")      return "weld_gusset";
+    if (type == "weld_end_cap")     return "weld_end_cap";
+    // Surfacing — reuse closest solid icon where no dedicated surface glyph exists
+    if (type == "surf_extrude")     return "extrude_boss";
+    if (type == "surf_revolve")     return "revolve_boss";
+    if (type == "surf_sweep")       return "sweep";
+    if (type == "surf_loft")        return "loft";
+    if (type == "surf_planar")      return "plane";
+    if (type == "surf_offset")      return "offset_ent";
+    if (type == "surf_boundary")    return "boundary";
+    if (type == "surf_fill")        return "boundary";
+    if (type == "surf_trim")        return "trim";
+    if (type == "surf_knit")        return "combine";
+    if (type == "surf_thicken")     return "extrude_boss";
+    if (type == "surf_ruled")       return "shell";
+    if (type == "surf_untrim")      return "convert_ent";
+    if (type == "surf_delete_face") return "subtract";
+    if (type == "surf_replace_face")return "wrap";
     // Primitives (box/cylinder/sphere/cone/torus) and anything else: the generic part glyph.
     if (type == "box")              return "box_feature";
     if (type == "cylinder")         return "cylinder_feature";
@@ -1080,11 +1112,102 @@ static const char* featureIcon(const std::string& type, const nlohmann::json* fe
     return "part";
 }
 static const char* featureFallback(const std::string& type) {
-    if (type == "sketch")   return "[S]";
-    if (type == "extrude")  return "[E]";
-    if (type == "fillet")   return "[F]";
-    if (type == "chamfer")  return "[C]";
+    // Sketch
+    if (type == "sketch")            return "[S]";
+    // Solid operations (boss)
+    if (type == "extrude")           return "[E]";
+    if (type == "revolve")           return "[Rv]";
+    if (type == "sweep")             return "[Sw]";
+    if (type == "loft")              return "[Lt]";
+    // Dress-up
+    if (type == "fillet")            return "[F]";
+    if (type == "chamfer")           return "[C]";
+    if (type == "shell")             return "[Sh]";
+    if (type == "draft")             return "[Dr]";
+    if (type == "rib")               return "[Rb]";
+    // Feature operations
+    if (type == "hole")              return "[H]";
+    if (type == "mirror")            return "[Mi]";
+    if (type == "linear_pattern")    return "[LP]";
+    if (type == "circular_pattern")  return "[CP]";
+    // Datum
+    if (type == "plane" || type == "datum_plane") return "[Pl]";
+    if (type == "axis")              return "[Ax]";
+    if (type == "point")             return "[Pt]";
+    if (type == "csys")              return "[CS]";
+    // Primitives
+    if (type == "box")               return "[Bx]";
+    if (type == "cylinder")          return "[Cy]";
+    if (type == "sphere")            return "[Sp]";
+    if (type == "cone")              return "[Co]";
+    if (type == "torus")             return "[To]";
+    // Curves
+    if (type == "helix")             return "[Hx]";
+    // Sheet metal
+    if (type == "sm_base_flange")    return "[BF]";
+    if (type == "sm_edge_flange")    return "[EF]";
+    if (type == "sm_hem")            return "[Hm]";
+    if (type == "sm_jog")            return "[Jg]";
+    // Weldments
+    if (type == "weld_member")       return "[WM]";
+    if (type == "weld_gusset")       return "[WG]";
+    if (type == "weld_end_cap")      return "[EC]";
+    // Multi-body boolean
+    if (type == "boolean")           return "[Bl]";
+    // Misc
+    if (type == "import")            return "[Im]";
+    if (type == "script")            return "[Sc]";
+    if (type == "split")             return "[Sl]";
+    // Surfaces
+    if (type == "surf_extrude")      return "[SE]";
+    if (type == "surf_revolve")      return "[SR]";
+    if (type == "surf_sweep")        return "[SS]";
+    if (type == "surf_loft")         return "[SL]";
+    if (type == "surf_planar")       return "[SP]";
+    if (type == "surf_offset")       return "[SO]";
+    if (type == "surf_ruled")        return "[SU]";
+    if (type == "surf_boundary")     return "[SB]";
+    if (type == "surf_fill")         return "[SF]";
+    if (type == "surf_knit")         return "[SK]";
+    if (type == "surf_thicken")      return "[ST]";
+    if (type == "surf_trim")         return "[Sm]";
+    if (type == "surf_untrim")       return "[Sn]";
+    if (type == "surf_delete_face")  return "[Sd]";
+    if (type == "surf_replace_face") return "[Sf]";
     return "[?]";
+}
+
+// Category color strip: thin left-edge accent by feature group.
+// Groups: sketch, solid-add, solid-cut, dress-up, pattern, datum, sheet-metal, weldment, surface.
+static ImU32 categoryColor(const std::string& type, bool isCut) {
+    if (type == "sketch")
+        return IM_COL32(86, 152, 245, 180);   // soft blue
+    if (isCut && (type == "extrude" || type == "revolve" ||
+                  type == "sweep"   || type == "loft"))
+        return IM_COL32(245, 120, 72, 190);   // orange-red (solid-cut)
+    if (type == "extrude" || type == "revolve" || type == "sweep" || type == "loft" ||
+        type == "box" || type == "cylinder" || type == "sphere" ||
+        type == "cone" || type == "torus"   || type == "hole")
+        return IM_COL32(45, 212, 191, 190);   // teal accent (solid-add)
+    if (type == "fillet" || type == "chamfer" || type == "shell" ||
+        type == "draft"  || type == "rib")
+        return IM_COL32(155, 120, 220, 190);  // purple (dress-up)
+    if (type == "linear_pattern" || type == "circular_pattern" || type == "mirror")
+        return IM_COL32(74, 173, 204, 190);   // cyan (pattern)
+    if (type == "plane" || type == "datum_plane" ||
+        type == "axis"  || type == "point" || type == "csys")
+        return IM_COL32(100, 140, 210, 190);  // slate-blue (datum)
+    if (type.size() >= 3 && type[0]=='s' && type[1]=='m' && type[2]=='_')
+        return IM_COL32(242, 182, 64, 190);   // amber (sheet-metal)
+    if (type.size() >= 5 && type[0]=='w' && type[1]=='e' && type[2]=='l' &&
+        type[3]=='d' && type[4]=='_')
+        return IM_COL32(220, 90, 80, 190);    // coral-red (weldment)
+    if (type.size() >= 5 && type[0]=='s' && type[1]=='u' && type[2]=='r' &&
+        type[3]=='f' && type[4]=='_')
+        return IM_COL32(90, 200, 110, 190);   // green (surface)
+    if (type == "boolean")
+        return IM_COL32(175, 120, 205, 190);  // soft purple (multi-body boolean)
+    return IM_COL32(120, 130, 148, 140);      // grey (unknown)
 }
 
 // ---- C20b: assembly tree (components + Mates folder) ----
@@ -1565,6 +1688,24 @@ static void drawRollbackBarLine(AppState& st, bool enabled, const std::string& b
     ImGui::PopID();
 }
 
+static char s_fmFilter[128] = {};
+
+static bool fm_icontains(const char* hay, const char* needle) {
+    if (!needle || !needle[0]) return true;
+    if (!hay) return false;
+    for (const char* h = hay; *h; ++h) {
+        const char* ph = h, *pn = needle;
+        while (*ph && *pn) {
+            char a = (*ph >= 'A' && *ph <= 'Z') ? (char)(*ph + 32) : *ph;
+            char b = (*pn >= 'A' && *pn <= 'Z') ? (char)(*pn + 32) : *pn;
+            if (a != b) break;
+            ++ph; ++pn;
+        }
+        if (!*pn) return true;
+    }
+    return false;
+}
+
 // ---- C24: FeatureManager top strip — a SolidWorks-style tab row (tree active; properties /
 // configurations tabs are visual stubs) plus a compact document toolbar (New Part / New Assembly /
 // Open / Save / Undo / Redo) that replaces the old wide text-button strip at the panel bottom.
@@ -1646,6 +1787,10 @@ static void drawFeatureManagerTopStrip(AppState& st) {
         if (!can) ImGui::EndDisabled();
     }
 
+    ImGui::Spacing();
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##fm_filter", "Filter features...", s_fmFilter, sizeof(s_fmFilter));
+
     ImGui::Separator();
 }
 
@@ -1662,9 +1807,8 @@ void drawFeatureTreeBody(AppState& st,
     // New Part / Undo / Redo text buttons that used to live at the panel bottom.
     drawFeatureManagerTopStrip(st);
 
-    // Panel background
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.panelBg[0], pal.panelBg[1], pal.panelBg[2], pal.panelBg[3]));
+        ImVec4(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], 0.22f));
 
     // ---- document title ----
     const nlohmann::json& tree = st.docMirror.tree();
@@ -2205,6 +2349,9 @@ void drawFeatureTreeBody(AppState& st,
                         std::string fname  = jfld(f, "name");
                         std::string ftype  = jfld(f, "type");
                         if (fname.empty()) fname = ftype + "·" + fid;  // C37-E: stable fid, not index
+                        if (s_fmFilter[0] && !fm_icontains(fname.c_str(), s_fmFilter) &&
+                            !fm_icontains(ftype.c_str(), s_fmFilter))
+                            return;
 
                         FStatus fs;
                         { auto it = statusMap.find(fid); if (it != statusMap.end()) fs = it->second; }
@@ -2221,8 +2368,33 @@ void drawFeatureTreeBody(AppState& st,
                         const float rowH = ImGui::GetTextLineHeight() + 10.0f * S;
                         ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
                         ImDrawList* rowDl = ImGui::GetWindowDrawList();
-                        if (rowIdx % 2 == 0)
-                            rowDl->AddRectFilled(rowMin, rowMax, Palette::toU32(pal.treeRowAlt));
+                        // Readable-surface pill: semi-opaque dark backing on every row so white
+                        // text/icons stay legible against whatever 3D content shows through the
+                        // transparent glass panel. Alternating rows get a faint white tint as a
+                        // stripe. The 2px inset gap lets the glass bleed through between rows.
+                        {
+                            const float pr = 3.5f * S;
+                            ImVec2 pillMin(rowMin.x + 2.0f * S, rowMin.y + 2.0f * S);
+                            ImVec2 pillMax(rowMax.x - 2.0f * S, rowMax.y - 2.0f * S);
+                            rowDl->AddRectFilled(pillMin, pillMax, IM_COL32(8, 12, 20, 160), pr);
+                            if (rowIdx % 2 == 0)
+                                rowDl->AddRectFilled(pillMin, pillMax, IM_COL32(255, 255, 255, 12), pr);
+                        }
+                        // Category color strip: ~3px vertical bar on the far-left edge.
+                        // Colored by feature group (sketch/solid-add/solid-cut/dress-up/pattern/
+                        // datum/sheet-metal/weldment/surface) so each family is instantly scannable.
+                        // The selected card's accent bar (drawn below) overlaps it on selected rows —
+                        // the strip's first ~2 dp still shows through, but the accent bar dominates.
+                        {
+                            const bool catIsCut = featureModeIsCut(&f);
+                            ImU32 catCol  = categoryColor(ftype, catIsCut);
+                            float catW    = 3.0f * S;
+                            float catInset = 2.0f * S;
+                            rowDl->AddRectFilled(
+                                ImVec2(rowMin.x,        rowMin.y + catInset),
+                                ImVec2(rowMin.x + catW, rowMax.y - catInset),
+                                catCol, 1.5f * S);
+                        }
                         if (suppressed)
                             rowDl->AddRectFilled(rowMin, rowMax,
                                 IM_COL32((int)(pal.statusWarn[0] * 255),
@@ -2232,7 +2404,7 @@ void drawFeatureTreeBody(AppState& st,
                             ImVec2 cardMin(rowMin.x + 2.0f * S, rowMin.y + 1.0f * S);
                             ImVec2 cardMax(rowMax.x - 3.0f * S, rowMax.y - 1.0f * S);
                             ImVec4 fill(pal.accentSoft[0], pal.accentSoft[1],
-                                        pal.accentSoft[2], 0.45f);
+                                        pal.accentSoft[2], 0.52f);
                             rowDl->AddRectFilled(cardMin, cardMax,
                                                  ImGui::ColorConvertFloat4ToU32(fill),
                                                  4.0f * S);

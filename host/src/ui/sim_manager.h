@@ -262,6 +262,7 @@ private:
     // tree + form
     void drawStudyRow(AppState& st, int i);
     void drawForm(AppState& st, Study& s);
+    void drawStudyChecklist(AppState& st, Study& s);  // stepwise setup overview (all structural nodes)
     void drawFixturesForm(AppState& st, Study& s);
     void drawLoadsForm(AppState& st, Study& s);
     void drawMaterialCombo(AppState& st, Study& s);

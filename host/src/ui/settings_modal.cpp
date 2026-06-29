@@ -125,6 +125,59 @@ static void applyThemeNow(AppState& st, bool light) {
 }
 }  // anonymous namespace
 
+// ---- kSettingsEntries: unified command search table (command_search.cpp) ----
+// Tab indices: 0=General  1=AI  2=Prompts  3=Advanced  4=Experimental
+// One entry per prominent field/section; labels mirror the modal's visible text.
+const SettingsEntry kSettingsEntries[] = {
+    // General (tab 0)
+    { "Units",                    "General",      0 },
+    { "MMGS units",               "General",      0 },
+    { "IPS units",                "General",      0 },
+    { "Light theme",              "General",      0 },
+    { "Dark theme",               "General",      0 },
+    { "Theme",                    "General",      0 },
+    { "Engine routing",           "General",      0 },
+    { "C++ core",                 "General",      0 },
+    { "Performance profiler",     "General",      0 },
+    { "Profiler",                 "General",      0 },
+    // AI (tab 1)
+    { "AI provider",              "AI",           1 },
+    { "Model",                    "AI",           1 },
+    { "API key",                  "AI",           1 },
+    { "Gemini key",               "AI",           1 },
+    { "Anthropic key",            "AI",           1 },
+    { "OpenAI key",               "AI",           1 },
+    { "Cloud API key",            "AI",           1 },
+    { "Vision",                   "AI",           1 },
+    { "Offline mode",             "AI",           1 },
+    { "Reasoning effort",         "AI",           1 },
+    { "Local endpoint",           "AI",           1 },
+    { "Manage models",            "AI",           1 },
+    { "Hidden models",            "AI",           1 },
+    // Prompts (tab 2)
+    { "Role prompts",             "Prompts",      2 },
+    { "Agent prompts",            "Prompts",      2 },
+    { "Prompt editor",            "Prompts",      2 },
+    // Advanced (tab 3)
+    { "Plan before building",     "Advanced",     3 },
+    { "Plan mode",                "Advanced",     3 },
+    { "Refine-pass cap",          "Advanced",     3 },
+    { "Max iters",                "Advanced",     3 },
+    { "Iteration budget",         "Advanced",     3 },
+    { "System prompt",            "Advanced",     3 },
+    { "System prompt override",   "Advanced",     3 },
+    // Experimental (tab 4)
+    { "Vision review model",      "Experimental", 4 },
+    { "Model routing",            "Experimental", 4 },
+    { "Seek-CAD split",           "Experimental", 4 },
+    { "Parametric sequence mode", "Experimental", 4 },
+    { "CAD sequence mode",        "Experimental", 4 },
+    { "Feature sequence",         "Experimental", 4 },
+};
+const int kSettingsEntryCount =
+    (int)(sizeof(kSettingsEntries) / sizeof(kSettingsEntries[0]));
+
+
 namespace ui {
 
 void drawSettingsModal(AppState& st, bool busy) {
@@ -136,6 +189,7 @@ void drawSettingsModal(AppState& st, bool busy) {
         s_settingsOpen = true;
         st.openSettings = false;
     }
+    if (st.openSettingsTab >= 0) s_settingsOpen = true;
     float sc = ui::uiScale;
     ImGuiViewport* vp = ImGui::GetMainViewport();
     const float margin = 28.0f * sc;
@@ -162,6 +216,12 @@ void drawSettingsModal(AppState& st, bool busy) {
             st.pendingPromptRole.clear();
             jumpToAgents = true;
         }
+        // openSettingsTab: jump to a specific tab requested by the command search widget.
+        int jumpToTab = -1;
+        if (st.openSettingsTab >= 0) {
+            jumpToTab          = st.openSettingsTab;
+            st.openSettingsTab = -1;
+        }
 
         // Tab content scrolls in its own region; Save/Cancel stay pinned at the bottom.
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
@@ -171,7 +231,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                                              ImGui::GetContentRegionAvail().y - footerH)));
         if (ImGui::BeginTabBar("##settabs")) {
             // ---- General tab: Document (units) + Display (theme) ----
-            if (ImGui::BeginTabItem("General")) {
+            if (ImGui::BeginTabItem("General", nullptr,
+                                    (jumpToTab == 0) ? ImGuiTabItemFlags_SetSelected
+                                                     : ImGuiTabItemFlags_None)) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
 
                 ImGui::SeparatorText("Document");
@@ -246,11 +308,19 @@ void drawSettingsModal(AppState& st, bool busy) {
                     dimText("C++ core: not loaded");
                 }
 
+                ImGui::Dummy(ImVec2(0, 8 * sc));
+                ImGui::SeparatorText("Performance");
+                dimText("Sampling profiler \xe2\x80\x94 see where modeling time goes (extrude / "
+                        "fillet / boolean, into the kernel) as a live flame graph.");
+                if (ImGui::Button("Open Profiler", ImVec2(160.0f * sc, 30.0f * sc)))
+                    st.showProfilerWindow = true;
                 ImGui::Dummy(ImVec2(0, 6 * sc));
                 dimText("All settings here are stored in %APPDATA%\\AI-CAD\\config.json.");
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("AI")) {
+            if (ImGui::BeginTabItem("AI", nullptr,
+                                    (jumpToTab == 1) ? ImGuiTabItemFlags_SetSelected
+                                                     : ImGuiTabItemFlags_None)) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 ImGui::SeparatorText("Provider & model");
                 dimText("Used by Design, Edit, and Help. Stored in "
@@ -263,8 +333,8 @@ void drawSettingsModal(AppState& st, bool busy) {
             }
             // --- C22b: Agents tab (role prompt editor) --- begin marked block ---
             if (ImGui::BeginTabItem("Prompts", nullptr,
-                                    jumpToAgents ? ImGuiTabItemFlags_SetSelected
-                                                 : ImGuiTabItemFlags_None)) {
+                                    (jumpToAgents || jumpToTab == 2) ? ImGuiTabItemFlags_SetSelected
+                                                                     : ImGuiTabItemFlags_None)) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 bool canFetch = st.workerStarted && !busy;
                 if (!s_promptsLoaded) {
@@ -350,8 +420,8 @@ void drawSettingsModal(AppState& st, bool busy) {
             // --- end C22b marked block ---
 
             if (ImGui::BeginTabItem("Advanced", nullptr,
-                                    st.wantSettings ? ImGuiTabItemFlags_SetSelected
-                                                    : ImGuiTabItemFlags_None)) {
+                                    (st.wantSettings || jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
+                                                                        : ImGuiTabItemFlags_None)) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 ImGui::SeparatorText("Run behavior");
                 ImGui::Checkbox("Plan before building (recommended)", &settings.planMode);
@@ -411,7 +481,9 @@ void drawSettingsModal(AppState& st, bool busy) {
             }
 
             // ---- Experimental tab: research-backed opt-in AI features ----
-            if (ImGui::BeginTabItem("Experimental")) {
+            if (ImGui::BeginTabItem("Experimental", nullptr,
+                                    (jumpToTab == 4) ? ImGuiTabItemFlags_SetSelected
+                                                     : ImGuiTabItemFlags_None)) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 dimText("Opt-in, default-off features from the model/provider research. All run "
                         "fully local (ITAR-safe) and are additive — off = the standard copilot.");

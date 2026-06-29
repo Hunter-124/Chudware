@@ -80,6 +80,8 @@
 #include "ui/asm_panels.h"
 // --- end C20b ---
 #include "ui/equations_dialog.h"  // Equations / Global Variables editor
+#include "ui/profiler_window.h"   // in-app sampling-profiler window (text report + flamegraph)
+#include "ui/command_search.h"    // unified settings + modeling-tools search popup
 #include "ui/scenarios.h"  // scripted screenshot/test scenarios (m1/sketch/asm/fea/evalmass/activity)
 
 #include <filesystem>      // Wave N: ecad export output dir + W14: flat-pattern DXF export
@@ -139,64 +141,6 @@ bool ecadCall(AppState& st, const char* method, const nlohmann::json& params, nl
     return true;
 }
 
-// Evaluate > Profiler: toggle the in-process sampling profiler in libaicad (prof_start /
-// prof_stop). Click once to start sampling, model normally, click again to stop — the
-// symbolized report (folded stacks + a speedscope profile) is written to
-// %APPDATA%\AI-CAD\prof and the top hotspots are toasted. Drives the C++ core directly
-// (cpp_core), since profiling is a global, non-document operation. See docs/PROFILER.md.
-void toggleProfiler(AppState& st) {
-    nlohmann::json res;
-    std::string err;
-    if (!st.profilerRunning) {
-        if (!core::cpp_core().call("prof_start",
-                                   {{"hz", 1000}, {"mode", "modeling"}}, res, err) ||
-            (res.is_object() && res.contains("error"))) {
-            const std::string why = !err.empty() ? err
-                : (res.is_object() ? res.value("error", std::string("unavailable"))
-                                   : std::string("unavailable"));
-            st.toast(ui::ToastLevel::Error,
-                     "Profiler couldn't start (" + why +
-                     "). Rebuild + restart so the engine exposes prof_*.");
-            return;
-        }
-        st.profilerRunning = true;
-        st.toast(ui::ToastLevel::Info,
-                 "Profiler ON — model now, then click Profiler again to stop & save.");
-        return;
-    }
-
-    // Stop + write the report.
-    st.profilerRunning = false;
-    const std::string dir = appdataDir() + "/AI-CAD/prof";
-    try { std::filesystem::create_directories(dir); } catch (...) {}
-    const std::string folded = dir + "/modeling.folded";
-    const std::string scope  = dir + "/modeling.speedscope.json";
-    if (!core::cpp_core().call("prof_stop",
-                               {{"top", 25}, {"write_folded", folded},
-                                {"write_speedscope", scope}}, res, err)) {
-        st.toast(ui::ToastLevel::Error, "Profiler stop failed: " + err);
-        return;
-    }
-    if (!res.value("ok", false)) {
-        st.toast(ui::ToastLevel::Warn,
-                 "Profiler: " + res.value("error", std::string("no samples captured")));
-        return;
-    }
-    const auto& summary = res["summary"];
-    long long samples = summary.value("samples", 0LL);
-    std::string hot;
-    if (res.contains("modules") && res["modules"].is_array() && !res["modules"].empty()) {
-        const auto& m0 = res["modules"][0];
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), " · hottest %s %.0f%%",
-                      m0.value("module", std::string("?")).c_str(), m0.value("pct", 0.0));
-        hot = buf;
-    }
-    st.toast(ui::ToastLevel::Info,
-             "Profiler: " + std::to_string(samples) + " samples" + hot +
-             " → " + dir + " (open modeling.speedscope.json at speedscope.app)");
-    st.addLog("[prof] report written to " + dir);
-}
 
 void ecadNewDoc(AppState& st, const char* kind) {
     nlohmann::json res;
@@ -822,7 +766,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     if (!gladLoadGL((GLADloadfunc)glfwGetProcAddress)) return 1;
 
     const std::string assets = exeDir() + "/assets";  // '/' is valid on Windows + POSIX
-    setWindowIcon(win, assets + "/logo_window.png");
+    setWindowIcon(win, assets + "/logo_icon.png");
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -999,7 +943,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         ui::EvaluateDialogs& evaluateDialogs = *st.evaluateDialogs;
         // Evaluate > Profiler: global, document-independent — handle before any lockout so it can be
         // toggled at any time (including mid-edit, which is exactly when you want to profile).
-        if (std::strcmp(cmd_id, "prof_toggle") == 0) { toggleProfiler(st); return; }
+        if (std::strcmp(cmd_id, "prof_toggle") == 0) { st.showProfilerWindow = true; return; }
         // Simulation lockout: while the Simulation workspace is active the model is frozen — a study's
         // fixtures/loads/results are tied to the current geometry, so changing the part's shape from
         // under them is disallowed (SolidWorks freezes the model inside a study the same way). We block
@@ -2459,6 +2403,11 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 ImGui::IsKeyPressed(ImGuiKey_N, false))
                 ui::createNewDoc(st, 0);
 
+            // Ctrl+P: open the unified command + settings search.
+            if (!textFocus && (io.KeyCtrl || io.KeySuper) && !io.KeyShift &&
+                ImGui::IsKeyPressed(ImGuiKey_P, false))
+                st.showCommandSearch = true;
+
             // ---- Wave 3: Ctrl+O / Ctrl+S / Ctrl+Shift+S file shortcuts ----
             // Set request flags consumed by the GL-thread file pump below (after the input block) so
             // the native dialog opens with the doc swap off the ImGui input path. Skip while a text
@@ -2674,11 +2623,11 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
             ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus |
             ImGuiWindowFlags_NoDocking;
-        ImGui::Begin("##DockHost", nullptr, hostFlags);
+        ImGui::Begin("##DockHost", nullptr, hostFlags | ImGuiWindowFlags_NoBackground);
         ImGui::PopStyleVar(3);
         // Versioned dockspace ID pairs with imgui_gui_v2.ini. Changing this intentionally forces
         // one clean DockBuilder layout after major window/dock identity changes.
-        ImGuiID dockId = ImGui::GetID("AICADDockV3");
+        ImGuiID dockId = ImGui::GetID("AICADDockV4");
         if ((!st.layoutInit && ImGui::DockBuilderGetNode(dockId) == nullptr) || st.resetLayout) {
             buildDefaultLayout(dockId, ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
             st.layoutInit = true;
@@ -2689,7 +2638,16 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             st.focusDesignTab = true;
             if (!st.wantEcad) st.wantFocusViewport = 6;
         }
-        ImGui::DockSpace(dockId, ImVec2(0, 0), ImGuiDockNodeFlags_None);
+        // W2 full-bleed: with PassthruCentralNode AND a window docked in the central node, ImGui
+        // paints an OPAQUE ImGuiCol_WindowBg rect over the WHOLE dockspace (imgui.cpp DockNodeUpdate:
+        // the transparent "central node hole" is punched only when the central node is EMPTY, but the
+        // Viewport window is docked there). That backdrop sits above the global background draw list
+        // and hides the full-bleed 3D image composited there. Push a transparent WindowBg just for
+        // the DockSpace() call so the dockspace backdrop is see-through and the 3D shows; every docked
+        // window still paints its own background (the glass FeatureManager stays translucent) on top.
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+        ImGui::DockSpace(dockId, ImVec2(0, 0), ImGuiDockNodeFlags_PassthruCentralNode);
+        ImGui::PopStyleColor();
         ImGui::End();
 
         // ---------- status bar ----------
@@ -2955,7 +2913,19 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // ---------- modals ----------
         ui::drawSettingsModal(st, busy);
 
-        // ---------- W1-B: toast notifications (top-right, over everything) ----------
+        // ---------- in-app profiler window + unified command/settings search ----------
+        ui::drawProfilerWindow(st);
+        ui::drawCommandSearch(st);
+
+        // ---------- click empty space (any panel whitespace) to deselect everything ----------
+        // The viewport's own full-window input surface handles empty-3D clicks; this covers the
+        // panels: a left click with nothing hovered/active and no open popup clears the selection.
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            !ImGui::IsAnyItemHovered() && !ImGui::IsAnyItemActive() &&
+            !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
+            st.clearSelection();
+
+        // ---------- splash notifications (top-left glass; click to copy + clear) ----------
         ui::drawToasts(st);
 
         // ---------- W1-B: consume this frame's cursor request (item 3) ----------

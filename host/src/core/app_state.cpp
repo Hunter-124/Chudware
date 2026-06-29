@@ -5,6 +5,7 @@
 #include <GLFW/glfw3.h>
 
 #include "stb_image.h"
+#include "stb_image_resize2.h"
 
 #include <algorithm>
 #include <cctype>
@@ -28,6 +29,7 @@
 #include "../render/overlays.h"
 
 #include "../ui/feature_tree.h"  // W1-B: ui::featureTreeResetTransient (clear tree statics on doc change)
+#include "../ui/sketch_mode.h"   // ui::SketchMode::clearEntitySelection (clearSelection)
 
 const char* kStarterCode =
     "# build123d is imported. Assign the final solid to `result`.\n"
@@ -269,11 +271,37 @@ Tex loadTexture(const std::string& path) {
 }
 void setWindowIcon(GLFWwindow* win, const std::string& path) {
     int w, h, n;
-    unsigned char* d = stbi_load(path.c_str(), &w, &h, &n, 4);
-    if (!d) return;
-    GLFWimage img{w, h, d};
-    glfwSetWindowIcon(win, 1, &img);
-    stbi_image_free(d);
+    unsigned char* src = stbi_load(path.c_str(), &w, &h, &n, 4);
+    if (!src) return;
+
+    static const int kSizes[] = {16, 32, 48, 128, 256};
+    static const int kCount   = (int)(sizeof(kSizes) / sizeof(kSizes[0]));
+
+    GLFWimage imgs[kCount];
+    unsigned char* bufs[kCount] = {};
+    int nImgs = 0;
+
+    for (int i = 0; i < kCount; ++i) {
+        int s = kSizes[i];
+        if (s > w || s > h) continue;   // don't upscale
+        unsigned char* buf = (unsigned char*)malloc(s * s * 4);
+        if (!buf) continue;
+        stbir_resize_uint8_srgb(src, w, h, 0, buf, s, s, 0, STBIR_RGBA);
+        imgs[nImgs]  = {s, s, buf};
+        bufs[nImgs] = buf;
+        ++nImgs;
+    }
+
+    // Always include the original size if we ended up with nothing
+    if (nImgs == 0) {
+        imgs[0]  = {w, h, src};
+        glfwSetWindowIcon(win, 1, imgs);
+    } else {
+        glfwSetWindowIcon(win, nImgs, imgs);
+        for (int i = 0; i < nImgs; ++i) free(bufs[i]);
+    }
+
+    stbi_image_free(src);
 }
 
 // The human-readable cause of a Python traceback.
@@ -512,7 +540,7 @@ void AppState::tryStartWorker() {
             // route to libaicad via worker_client. (worker_client's own `running_` stays false,
             // so methods libaicad can't serve still fail cleanly rather than hit a dead pipe.)
             workerStarted = true;
-            status = "Ready (C++ core).";
+            status = "Ready.";
             statusKind = 0;
             addLog("[ok] in-process C++ core (libaicad) ready; Python worker not required");
             return;
@@ -528,6 +556,21 @@ void AppState::tryStartWorker() {
         status = "Runtime needs setup";
         statusKind = 2;
     }
+}
+
+void AppState::clearSelection() {
+    // 1. Viewport topology picks + hover/status.
+    selection.clear();
+    hover = {};
+    pickStatus.clear();
+    // 2. FeatureManager primary selection + face tint + one-shot scroll.
+    selectedFeatureId.clear();
+    featureHighlightFaces.clear();
+    treeScrollToSelection = false;
+    // 3. FeatureManager multi-selection (file-static in feature_tree.cpp).
+    ui::featureClearTreeMultiSel();
+    // 4. In-sketch entity + relation selection (no-op when not in a sketch).
+    if (sketchMode && sketchMode->active()) sketchMode->clearEntitySelection();
 }
 
 void AppState::showPartMesh(int sel) {

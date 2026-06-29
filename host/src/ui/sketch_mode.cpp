@@ -1261,6 +1261,13 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     // C42: remaining draw tools.
     if (cmdId == "sk_arc_3pt")         { resetTool(); tool_ = SketchTool::Arc3pt;         return true; }
     if (cmdId == "sk_polygon")         { resetTool(); tool_ = SketchTool::Polygon;        return true; }
+    // Polygon flyout variants — set polySides_ then arm the Polygon tool.
+    if (cmdId == "sk_poly_tri")  { resetTool(); tool_ = SketchTool::Polygon; polySides_ = 3; return true; }
+    if (cmdId == "sk_poly_quad") { resetTool(); tool_ = SketchTool::Polygon; polySides_ = 4; return true; }
+    if (cmdId == "sk_poly_pent") { resetTool(); tool_ = SketchTool::Polygon; polySides_ = 5; return true; }
+    if (cmdId == "sk_poly_hex")  { resetTool(); tool_ = SketchTool::Polygon; polySides_ = 6; return true; }
+    if (cmdId == "sk_poly_oct")  { resetTool(); tool_ = SketchTool::Polygon; polySides_ = 8; return true; }
+    if (cmdId == "sk_poly_star") { resetTool(); tool_ = SketchTool::Star;                  return true; }
     if (cmdId == "sk_rect_center")     { resetTool(); tool_ = SketchTool::RectCenter;     return true; }
     if (cmdId == "sk_point")           { resetTool(); tool_ = SketchTool::Point;          return true; }
     if (cmdId == "sk_ellipse" || cmdId == "sk_ellipse_big") {
@@ -1374,6 +1381,7 @@ const char* SketchMode::activeToolCmd() const {
         case SketchTool::Text:            return "sk_text";
         case SketchTool::EqCurve:         return "sk_spline_equation";
         case SketchTool::Airfoil:         return "sk_airfoil";
+        case SketchTool::Star:            return "sk_polygon";  // keeps parent button highlighted
         default:                          return "";
     }
 }
@@ -1381,6 +1389,12 @@ const char* SketchMode::activeToolCmd() const {
 // ---------------------------------------------------------------------------
 // tool helpers
 // ---------------------------------------------------------------------------
+
+void SketchMode::clearEntitySelection() {
+    selIds_.clear();
+    selRelIds_.clear();
+    hoverRelCid_.clear();
+}
 
 void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSnaps_.clear();
                                conicRho_ = 0.5f; chainPrevId_.clear();
@@ -6676,6 +6690,24 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
                     }
                 }
+            } else if (tool_ == SketchTool::Star && n >= 1) {
+                ImVec2 ctr = toolUV_[0];
+                dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), 3.0f, uCol);
+                float vx = su - ctr.x, vy = sv - ctr.y;
+                float R = std::hypot(vx, vy);
+                if (R < 1e-4f) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, 1.6f); }
+                else {
+                    float a0 = std::atan2(vy, vx);
+                    float Ri = R * polyStarRatio_;
+                    int pts = polyStarPoints_;
+                    ImVec2 prev;
+                    for (int i = 0; i <= 2 * pts; ++i) {
+                        float a = a0 + (float)i * 3.14159265f / (float)pts;
+                        float r = (i & 1) ? Ri : R;
+                        ImVec2 q = uvToScreen(ctr.x + r * std::cos(a), ctr.y + r * std::sin(a));
+                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                    }
+                }
             } else if (tool_ == SketchTool::RectCenter && n >= 1) {
                 ImVec2 ctr = toolUV_[0];
                 dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), 3.0f, uCol);
@@ -7195,6 +7227,28 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     resolve(st);
                     resetTool();
                 }
+            } else if (tool_ == SketchTool::Star && toolUV_.size() == 2) {
+                // center + one tip vertex -> 2*polyStarPoints_ alternating outer/inner corners.
+                ImVec2 ctr = toolUV_[0], vtx = toolUV_[1];
+                float R = std::hypot(vtx.x - ctr.x, vtx.y - ctr.y);
+                if (R < 1e-4f) {
+                    st.addLog("[sketch] Star: vertex == center \xE2\x80\x94 pick a tip away from the center");
+                    toolUV_.pop_back(); toolSnaps_.pop_back();
+                } else {
+                    float a0 = std::atan2(vtx.y - ctr.y, vtx.x - ctr.x);
+                    float Ri = R * polyStarRatio_;
+                    int pts = polyStarPoints_;
+                    std::vector<ImVec2> corners;
+                    corners.reserve(2 * pts);
+                    for (int i = 0; i < 2 * pts; ++i) {
+                        float a = a0 + (float)i * 3.14159265f / (float)pts;
+                        float r = (i & 1) ? Ri : R;
+                        corners.push_back(ImVec2(ctr.x + r * std::cos(a), ctr.y + r * std::sin(a)));
+                    }
+                    addPolyLoop(st, corners, /*equalEdges=*/false);
+                    resolve(st);
+                    resetTool();
+                }
             } else if (tool_ == SketchTool::RectCenter && toolUV_.size() == 2) {
                 // center + corner -> axis-aligned rect (same per-edge h/v relations as RectCorner).
                 ImVec2 ctr = toolUV_[0], cor = toolUV_[1];
@@ -7289,6 +7343,17 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                           || ImGui::IsKeyPressed(ImGuiKey_LeftBracket);
             if (inc && polySides_ < 64) ++polySides_;
             if (dec && polySides_ > 3)  --polySides_;
+        }
+        // Star tip count: +/-/[/] adjust polyStarPoints_ (clamped 3..12).
+        if (tool_ == SketchTool::Star && !io.WantTextInput) {
+            const bool inc = ImGui::IsKeyPressed(ImGuiKey_Equal)
+                          || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd)
+                          || ImGui::IsKeyPressed(ImGuiKey_RightBracket);
+            const bool dec = ImGui::IsKeyPressed(ImGuiKey_Minus)
+                          || ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract)
+                          || ImGui::IsKeyPressed(ImGuiKey_LeftBracket);
+            if (inc && polyStarPoints_ < 12) ++polyStarPoints_;
+            if (dec && polyStarPoints_ > 3)  --polyStarPoints_;
         }
 
         // C42: Spline finishing — Enter / right-click / double-click commits (>= 2 points); a
@@ -7607,7 +7672,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          tool_ == SketchTool::Spline ? "Spline" :
                          tool_ == SketchTool::StyleSpline ? "Style Spline" :
                          tool_ == SketchTool::Text ? "Text" :
-                         tool_ == SketchTool::EqCurve ? "Equation Driven Curve" : "";
+                         tool_ == SketchTool::EqCurve ? "Equation Driven Curve" :
+                         tool_ == SketchTool::Star ? "Star" : "";
         // Per-stage step prompt (status-bar style) for the multi-click variants.
         const size_t n = toolUV_.size();
         const char* step = nullptr;
@@ -7716,12 +7782,20 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 step = "enter x(t) / y(t) and the t range, then OK"; break;
             case SketchTool::Airfoil:
                 step = "set the NACA code / .dat + chord, then OK"; break;
+            case SketchTool::Star:
+                step = n == 0 ? "click center" : "click a tip vertex"; break;
             default: break;
         }
         std::string hint = std::string(tn) + (step ? std::string(" \xE2\x80\x94 ") + step : std::string());
         if (tool_ == SketchTool::Polygon) {   // C42: live side count + how to change it
             char sb[80];
             std::snprintf(sb, sizeof(sb), "  [Sides: %d \xC2\xB7 keys 3-9 or +/- to adjust]", polySides_);
+            hint += sb;
+        }
+        if (tool_ == SketchTool::Star) {
+            char sb[80];
+            std::snprintf(sb, sizeof(sb), "  [Tips: %d \xC2\xB7 +/- to adjust, ratio %.2f]",
+                          polyStarPoints_, polyStarRatio_);
             hint += sb;
         }
         hint += "  (ESC to end)";

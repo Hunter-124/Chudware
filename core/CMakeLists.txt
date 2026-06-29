@@ -81,17 +81,25 @@ FetchContent_Declare(doctest
   SOURCE_SUBDIR doctest)
 FetchContent_MakeAvailable(doctest)
 
-# --- aicad_prof: in-process sampling profiler (Windows; no-op elsewhere) ------
-# Periodically suspends the registered modeling thread and walks its stack lock-free
-# (RtlVirtualUnwind), then symbolizes with DbgHelp at report time. OCCT-free + tiny, so
-# it links cleanly into libaicad.dll and the unit test. See core/prof/sampler.{h,cpp}
-# and docs/PROFILER.md.
+# --- aicad_prof: in-process sampling profiler (Windows + Linux; no-op elsewhere) ----
+# Windows: periodically suspends the registered modeling thread and walks its stack lock-free
+# (RtlVirtualUnwind), symbolizing with DbgHelp at report time. Linux: a sampler thread signals
+# the work thread, an async-signal-safe backtrace() feeds a ring, and dladdr/__cxa_demangle
+# symbolize at report time. OCCT-free + tiny, so it links cleanly into libaicad.{dll,so} and the
+# unit test. See core/prof/sampler.{h,cpp} and docs/PROFILER.md.
 add_library(aicad_prof STATIC
   prof/sampler.cpp)
 target_include_directories(aicad_prof PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_prof PUBLIC nlohmann_json::nlohmann_json)
 if(WIN32)
   target_link_libraries(aicad_prof PUBLIC dbghelp)
+else()
+  # Linux/Unix: dladdr (symbolization) is in libdl on older glibc (CMAKE_DL_LIBS -> "dl" or "");
+  # the sampler/drain run on a std::thread and the handler uses pthread_sigmask, so the POSIX
+  # threads lib is required too. PUBLIC so both land on every consumer's final link line
+  # (libaicad.so + test_prof).
+  find_package(Threads REQUIRED)
+  target_link_libraries(aicad_prof PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)
 endif()
 set_property(TARGET aicad_prof PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
@@ -223,8 +231,9 @@ set_target_properties(test_nsolve PROPERTIES
 add_test(NAME nsolve COMMAND test_nsolve)
 
 # --- sampling profiler unit test (OCCT-free) ---------------------------------
-# Ships a PDB (/Zi /DEBUG) so the hot function resolves by name, exercising both the
-# stack walk and DbgHelp symbolization.
+# Windows: ships a PDB (/Zi /DEBUG) so the hot function resolves by name. Linux: exports its
+# symbols (-rdynamic) so dladdr can name frames. Either way it exercises the stack walk +
+# symbolization end to end.
 add_executable(test_prof
   tests/test_prof.cpp)
 target_include_directories(test_prof PRIVATE ${doctest_SOURCE_DIR})
@@ -234,6 +243,10 @@ set_target_properties(test_prof PROPERTIES
 if(MSVC)
   target_compile_options(test_prof PRIVATE /Zi)
   target_link_options(test_prof PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  # Export the executable's symbols into the dynamic symbol table so dladdr() (Linux
+  # symbolization) can name our frames in the report.
+  target_link_options(test_prof PRIVATE -rdynamic)
 endif()
 add_test(NAME prof COMMAND test_prof)
 
@@ -1073,6 +1086,11 @@ if(AICAD_WITH_OCCT)
   if(MSVC)
     target_compile_options(aicad PRIVATE /Zi)
     target_link_options(aicad PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+  elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # Keep our symbols in the dynamic symbol table so the sampling profiler's dladdr() resolves
+    # OUR frames to real names (OCCT's exported symbols already resolve). GCC/Clang export shared-
+    # library symbols by default, but make it explicit + robust to any future -fvisibility=hidden.
+    target_link_options(aicad PRIVATE -Wl,--export-dynamic)
   endif()
   set_target_properties(aicad PROPERTIES
     OUTPUT_NAME libaicad   # Windows: libaicad.dll. With PREFIX "" below, Linux: libaicad.so

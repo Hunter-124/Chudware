@@ -25,8 +25,12 @@
 // "TKBO!0x1234" — which is exactly the attribution we want there ("70% of time in TKBO =
 // booleans dominate"). See docs/PROFILER.md.
 //
-// This header is cross-platform; the implementation is Windows-only. On other platforms
-// every entry point is a no-op and report() returns an "unsupported" envelope.
+// This header and the public API are cross-platform. There are two real capture backends:
+// Windows (SuspendThread + RtlVirtualUnwind + DbgHelp, above) and Linux (a periodic signal
+// delivered to the registered work thread, an async-signal-safe backtrace() into a lock-free
+// ring, and dladdr + __cxa_demangle symbolization in report()). Both feed ONE platform-neutral
+// aggregation + report core. On any OTHER platform every entry point is a no-op and report()
+// returns an "unsupported" envelope. See docs/PROFILER.md.
 #pragma once
 
 #include <string>
@@ -80,13 +84,13 @@ struct TargetScope {
 //     "min_samples": int }                drop frames below this self-sample count from flat
 // Returns:
 //   { "ok": true,
-//     "summary": {samples, unique_stacks, interval_us, mode, wall_seconds, unresolved},
+//     "summary": {samples, unique_stacks, interval_us, mode, wall_seconds, unresolved_frames},
 //     "modules": [{module, self, pct}],   self-time by DLL — the fastest hotspot read
 //     "flat_self":  [{frame, self, pct}], hottest leaf frames (where the CPU actually is)
 //     "flat_total": [{frame, total, pct}],frames most often ON the stack (callers included)
 //     "folded": "a;b;c 12\n...",          full folded text (also returned inline)
 //     "wrote": ["path", ...] }
-// On non-Windows or when there are no samples, returns {"ok":false,"error":...}.
+// On an unsupported platform, or when no samples were captured, returns {"ok":false,"error":...}.
 nlohmann::json report(const nlohmann::json& opts);
 
 }  // namespace prof

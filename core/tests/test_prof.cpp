@@ -2,9 +2,11 @@
 //
 // Validates the machinery WITHOUT OCCT: spin a known hot call chain on a worker thread,
 // register that thread as the sample target, sample it, then assert the report captured
-// multi-frame stacks. When the test binary ships a PDB (it does — see CMake /Zi /DEBUG) the
-// hot function also shows up by name in the flat self-time table, proving symbolization +
-// the stack walk line up.
+// multi-frame stacks. On Windows the test binary ships a PDB (CMake /Zi /DEBUG) so the hot
+// function also shows up by name in the flat tables, proving symbolization + the stack walk
+// line up. On Linux the hot functions live in an anonymous namespace (local symbols, absent
+// from the dynamic symbol table dladdr reads), so the by-name check is Windows-only — the
+// samples>0 + multi-frame (';') checks already prove the signal/backtrace path works.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -24,6 +26,8 @@ volatile double g_sink = 0.0;
 // to find (prof_hot_outer -> prof_hot_inner).
 #if defined(_MSC_VER)
 __declspec(noinline)
+#elif defined(__GNUC__)
+__attribute__((noinline))
 #endif
 double prof_hot_inner(int n) {
     double a = 0.0;
@@ -33,6 +37,8 @@ double prof_hot_inner(int n) {
 
 #if defined(_MSC_VER)
 __declspec(noinline)
+#elif defined(__GNUC__)
+__attribute__((noinline))
 #endif
 double prof_hot_outer(int reps) {
     double a = 0.0;
@@ -42,8 +48,8 @@ double prof_hot_outer(int reps) {
 }  // namespace
 
 TEST_CASE("sampling profiler captures multi-frame stacks") {
-#ifndef _WIN32
-    MESSAGE("sampling profiler is Windows-only; skipping");
+#if !defined(_WIN32) && !defined(__linux__)
+    MESSAGE("sampling profiler is unsupported on this platform; skipping");
 #else
     using namespace aicad;
     std::atomic<bool> go{false};
@@ -72,11 +78,14 @@ TEST_CASE("sampling profiler captures multi-frame stacks") {
     CHECK(r["summary"]["samples"].get<unsigned long long>() > 0);
     CHECK(r["modules"].size() > 0);
     // A ';' in the folded output means at least one captured stack had >1 frame — i.e. the
-    // RtlVirtualUnwind walk actually unwound past the leaf.
+    // stack walk (RtlVirtualUnwind / backtrace) actually unwound past the leaf.
     CHECK(r["folded"].get<std::string>().find(';') != std::string::npos);
 
+#if defined(_WIN32)
     // With the test binary's PDB present, the hot function should appear by name somewhere in
-    // the self- or total-time tables (DbgHelp undecorates it to "prof_hot_inner/outer").
+    // the self- or total-time tables (DbgHelp undecorates it to "prof_hot_inner/outer"). On
+    // Linux these are anonymous-namespace (local) symbols, so dladdr can't name them and they
+    // show as "test_prof!0x<rva>" — the checks above already prove the capture path.
     bool found = false;
     for (const char* key : {"flat_self", "flat_total"}) {
         for (const auto& f : r[key]) {
@@ -86,5 +95,6 @@ TEST_CASE("sampling profiler captures multi-frame stacks") {
         }
     }
     CHECK_MESSAGE(found, "expected prof_hot_* in the flat tables (needs the test PDB)");
+#endif
 #endif
 }

@@ -110,6 +110,8 @@ add_executable(AI-CAD
   # --- end C20b ---
   # --- Equations / Global Variables editor ---
   src/ui/equations_dialog.cpp
+  src/ui/profiler_window.cpp   # in-app sampling-profiler window (text report + flamegraph)
+  src/ui/command_search.cpp    # unified settings + modeling-tools search popup
   # --- C22b: Activity panel + prompt editor + orchestrator wiring ---
   src/ui/activity_panel.cpp
   # --- end C22b ---

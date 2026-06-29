@@ -183,6 +183,11 @@ public:
     // this to the sketch's geometric center so the view orbits/centres there instead. Cleared (on
     // == false) outside sketch, where center_ (the model bbox centre) is already correct.
     void setOrbitCenterOverride(bool on, const Vec3& c) { orbitOverride_ = on; orbitCenter_ = c; }
+    // W2 full-bleed viewport: a horizontal lens shift (in NDC units) baked into the projection's
+    // unused m[8] slot by drawCurrent(), so the modeled part stays centered in the un-occluded
+    // region between the side panes WITHOUT moving pan_ — picking/overlays read cam_.mvp and so
+    // follow automatically. 0 = symmetric (no shift); set per frame from the viewport panel.
+    void setLensShiftX(float x) { lensShiftX_ = x; }
 
     // ---- C28-C: SolidWorks-style Section View — up to 3 simultaneous clip planes ----
     // A fragment is visible only when it is inside ALL active half-spaces: dot(p,Ni) <= Oi.
@@ -331,6 +336,7 @@ private:
     std::vector<Sub> subs_;
     Vec3 center_;
     Vec3 pan_;  // W2-D: world-space orbit-target offset (set by renderOrbit; added to center_)
+    float lensShiftX_ = 0.0f;  // W2: horizontal NDC lens shift baked into proj.m[8] (see setLensShiftX)
     float radius_ = 1.0f;
     CameraXform cam_;  // updated each drawCurrent()
 

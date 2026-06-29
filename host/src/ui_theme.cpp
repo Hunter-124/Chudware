@@ -384,51 +384,57 @@ void applyTheme(Theme t, float scale) {
 // =========================================================================
 // Glassmorphism helpers (consumed by feature-manager, copilot, ribbon, etc.)
 // =========================================================================
-void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding) {
+void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, float alpha) {
     const Palette& p = palette;
     const float s = uiScale;
     const float r = rounding * s;
+    // Alpha-scaled role -> ImU32 (multiplies the role's own alpha by `alpha`, then by `mul`).
+    auto A = [&](const float c[4], float mul) -> uint32_t {
+        float t[4]; Palette::withAlpha(c, t, mul * alpha); return Palette::toU32(t);
+    };
 
     // 1. Drop shadow: two stacked rects to fake a blurred shadow.
     {
         const float off  = 4.0f * s;
         const float off2 = 2.5f * s;
-        float sa[4]; Palette::withAlpha(p.glassShadow, sa, 0.35f);
         dl->AddRectFilled(
             ImVec2(mn.x + off2 * 0.4f, mn.y + off2),
             ImVec2(mx.x + off,         mx.y + off),
-            Palette::toU32(sa), r + off * 0.5f);
+            A(p.glassShadow, 0.35f), r + off * 0.5f);
         dl->AddRectFilled(
             ImVec2(mn.x + 1.0f * s, mn.y + 2.0f * s),
             ImVec2(mx.x + off2,     mx.y + off2),
-            Palette::toU32(p.glassShadow), r + 0.5f * s);
+            A(p.glassShadow, 1.0f), r + 0.5f * s);
     }
 
     // 2. Base translucent fill.
-    dl->AddRectFilled(mn, mx, Palette::toU32(p.glassBg), r);
+    dl->AddRectFilled(mn, mx, A(p.glassBg, 1.0f), r);
 
     // 3. Inner vertical shine gradient — top 35% of height, glassHighlight -> transparent.
     {
         const float shineH = (mx.y - mn.y) * 0.35f;
         const ImVec2 shineMx(mx.x, mn.y + shineH);
-        const uint32_t top = Palette::toU32(p.glassHighlight);
+        const uint32_t top = A(p.glassHighlight, 1.0f);
         const uint32_t btm = top & 0x00FFFFFFu;   // same RGB, alpha=0 (toU32 is ABGR: bits 24-31 = A)
         dl->AddRectFilledMultiColor(mn, shineMx, top, top, btm, btm);
     }
 
     // 4. Border.
-    dl->AddRect(mn, mx, Palette::toU32(p.glassBorder), r, 0, 1.5f * s);
+    dl->AddRect(mn, mx, A(p.glassBorder, 1.0f), r, 0, 1.5f * s);
 
     // 5. Top specular line — 1.5 px inside the top border arc.
     {
         const float lineY = mn.y + 1.5f * s;
         const float inset = r * 0.6f;   // stay clear of the rounded corners
-        float sha[4]; Palette::withAlpha(p.glassHighlight, sha, 2.2f);  // brighter than the gradient; toU32 clamps
         dl->AddLine(
             ImVec2(mn.x + inset, lineY),
             ImVec2(mx.x - inset, lineY),
-            Palette::toU32(sha), 1.5f * s);
+            A(p.glassHighlight, 2.2f), 1.5f * s);
     }
+}
+
+void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding) {
+    glassBackground(dl, mn, mx, rounding, 1.0f);
 }
 
 void pushGlassTooltipStyle() {
@@ -443,6 +449,28 @@ void pushGlassTooltipStyle() {
 void popGlassTooltipStyle() {
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(1);
+}
+
+void pushGlassWindowStyle() {
+    const Palette& p = palette;
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,
+                          ImVec4(p.glassBg[0], p.glassBg[1], p.glassBg[2], p.glassBg[3]));
+}
+
+void popGlassWindowStyle() { ImGui::PopStyleColor(1); }
+
+void pushGlassChildStyle(float rounding) {
+    const Palette& p = palette;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                          ImVec4(p.glassBg[0], p.glassBg[1], p.glassBg[2], p.glassBg[3]));
+    ImGui::PushStyleColor(ImGuiCol_Border,
+                          ImVec4(p.glassBorder[0], p.glassBorder[1], p.glassBorder[2], p.glassBorder[3]));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, rounding * uiScale);
+}
+
+void popGlassChildStyle() {
+    ImGui::PopStyleVar(1);
+    ImGui::PopStyleColor(2);
 }
 
 // =========================================================================

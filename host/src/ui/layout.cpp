@@ -65,6 +65,8 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     ImGuiID main = root, left, right, rightBottom;
     // Left column = LeftPane task pane (full height).
     left  = ImGui::DockBuilderSplitNode(main, ImGuiDir_Left,  leftFrac,  nullptr, &main);
+    if (ImGuiDockNode* ln = ImGui::DockBuilderGetNode(left))
+        ln->LocalFlags |= ImGuiDockNodeFlags_NoUndocking;
     // Right column = Task Pane (the consolidated AI panel), full height like SolidWorks.
     right = ImGui::DockBuilderSplitNode(main, ImGuiDir_Right, rightFrac / (1.0f - leftFrac),
                                         nullptr, &main);
@@ -221,7 +223,22 @@ void drawLeftPane(AppState& st,
     }
     s_pmWasActive = pmActive;
 
-    if (!ImGui::Begin("FeatureManager##LeftPane")) { ImGui::End(); return; }
+    const bool lpOpen = ImGui::Begin("FeatureManager##LeftPane", nullptr,
+                                      ImGuiWindowFlags_NoBackground);
+    if (!lpOpen) { ImGui::End(); return; }
+
+    if (!ImGui::IsWindowDocked())
+        st.resetLayout = true;
+
+    // Full-panel liquid-glass chrome: shadow, translucent fill, shine gradient, border, specular.
+    // alpha=0.55 keeps the border/shadow/specular visible but light — the real opacity
+    // comes from each row's readable-surface pill (drawn in drawOneRow), not the panel fill.
+    {
+        ImVec2 p0 = ImGui::GetWindowPos();
+        ImVec2 sz = ImGui::GetWindowSize();
+        ui::glassBackground(ImGui::GetWindowDrawList(), p0,
+                            ImVec2(p0.x + sz.x, p0.y + sz.y), 0.0f, 0.55f);
+    }
 
     const auto& pal = ui::palette;
     const float S = ui::uiScale;
@@ -311,6 +328,8 @@ void drawLeftPane(AppState& st,
     static bool s_bodyScrolled = false;
     const float bodyPad = 12.0f * S;
     const float sbSize  = 8.0f * S;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImVec4(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], 0.22f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(bodyPad, ImGui::GetStyle().WindowPadding.y));
     ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, sbSize);
@@ -382,6 +401,7 @@ void drawLeftPane(AppState& st,
     if (bodyIndented) ImGui::Unindent(sbSize);
     ImGui::EndChild();
     ImGui::PopStyleVar(2);   // WindowPadding + ScrollbarSize pushed before the body child
+    ImGui::PopStyleColor();  // ChildBg = glassBg
 
     ImGui::End();
 }

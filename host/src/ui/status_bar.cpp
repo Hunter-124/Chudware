@@ -113,6 +113,14 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
             ImVec4(pal.statusOk[0] * pulse, pal.statusOk[1] * pulse,
                    pal.statusOk[2] * pulse, 1.0f));
         ImGui::TextUnformatted(chip.c_str());
+        // Clicking the progress chip navigates to the Simulation tab so the user can
+        // watch progress or cancel without hunting for the panel.
+        if (ImGui::IsItemClicked()) {
+            st.leftPaneTab = AppState::LP_Simulation;
+            st.ribbonTab   = AppState::RT_Simulation;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Click to focus the Simulation pane");
         ImGui::PopStyleColor();
     }
     // W5C: pick / selection label (e.g. "Face 12 of Body1") — shown when not editing a sketch

@@ -143,14 +143,14 @@ static const PMSelKinds K_FACEEDGEAXIS {true,  true, false, false, false, true};
 static const std::vector<PMFormDef>& forms() {
     static const std::vector<PMFormDef> kForms = {
         // --- box ---  length/width/height/centered ; refs at? (origin default)
-        { "box", "Box", "extrude_boss", {
+        { "box", "Box", "box_feature", {
             Dim   ("length",   "Length",   "Box",  20.0),
             Dim   ("width",    "Width",    "Box",  20.0),
             Dim   ("height",   "Height",   "Box",  20.0),
             Check ("centered", "Centered", "Box",  true),
         }},
         // --- cylinder ---  radius/height/centered
-        { "cylinder", "Cylinder", "extrude_boss", {
+        { "cylinder", "Cylinder", "cylinder_feature", {
             Dim   ("radius",   "Radius",   "Cylinder", 10.0),
             Dim   ("height",   "Height",   "Cylinder", 20.0),
             Check ("centered", "Centered", "Cylinder", true),
@@ -359,7 +359,7 @@ static const std::vector<PMFormDef>& forms() {
         // --- mirror ---  plane (datum/face) + features[] (seeded from selection)
         //   Engine (pattern.py compile_mirror): reflects each seed feature's tool body across the
         //   plane with the same boolean; empty features => whole-body mirror + union.
-        { "mirror", "Mirror", "mirror_feature", {
+        { "mirror", "Mirror", "mirror", {
             DatumRef ("plane",    "Mirror Face/Plane", "Mirror Plane",
                       "plane.right|plane.front|plane.top",
                       "Right plane|Front plane|Top plane"),
@@ -518,7 +518,7 @@ static const std::vector<PMFormDef>& forms() {
         //   a sketch region, resolved exactly like extrude's profile well (K_FACE, multi). thickness
         //   drives the wall; k_factor (0..1, unitless) sets the bend-allowance neutral axis;
         //   default_bend_radius seeds the inner radius (defaults to thickness engine-side).
-        { "sm_base_flange", "Base Flange", "extrude_boss", {
+        { "sm_base_flange", "Base Flange", "sm_base_flange", {
             Well ("profile",            "Profile",            "Profile",          K_FACE, true),
             Dim  ("thickness",          "Thickness",          "Sheet Metal Gauges", 2.0),
             DimU ("k_factor",           "K-Factor",           "Sheet Metal Gauges", 0.45),
@@ -529,7 +529,7 @@ static const std::vector<PMFormDef>& forms() {
         //   flange wall; radius is the inner bend radius (defaults to thickness). position picks how
         //   the flange aligns to the picked edge; flip mirrors the bend direction. k_factor is
         //   inherited from the base flange — intentionally NOT on this form.
-        { "sm_edge_flange", "Edge Flange", "shell", {
+        { "sm_edge_flange", "Edge Flange", "sm_edge_flange", {
             Well   ("edge",     "Bend Edge",      "Flange",   K_EDGE, false),
             Angle  ("angle",    "Angle",          "Flange",   90.0),
             Dim    ("length",   "Length",         "Flange",   20.0),
@@ -544,7 +544,7 @@ static const std::vector<PMFormDef>& forms() {
         //   real radius, visible standoff) / teardrop (curls past 180°). length is the hem return
         //   wall; radius is the inner bend radius (defaults engine-side: ~T/2 for closed, T else).
         //   flip mirrors the fold side. k_factor inherited from the base flange (not on this form).
-        { "sm_hem", "Hem", "shell", {
+        { "sm_hem", "Hem", "sm_hem", {
             Well   ("edge",   "Bend Edge",      "Hem",   K_EDGE, false),
             ComboL ("type",   "Hem Type",       "Hem",
                     "closed|open|teardrop", "Closed|Open|Teardrop"),
@@ -557,7 +557,7 @@ static const std::vector<PMFormDef>& forms() {
         //   (0..90]; offset is the step height; length is the flat end flange; radius is the inner
         //   bend radius (defaults to thickness). position aligns the first bend to the picked edge;
         //   flip mirrors the bend direction. k_factor inherited from the base flange.
-        { "sm_jog", "Jog", "extrude_boss", {
+        { "sm_jog", "Jog", "sm_jog", {
             Well   ("edge",     "Bend Edge",      "Jog",   K_EDGE, false),
             Angle  ("angle",    "Angle",          "Jog",   90.0),
             Dim    ("offset",   "Offset",         "Jog",   10.0),
@@ -576,7 +576,7 @@ static const std::vector<PMFormDef>& forms() {
         //   dims are emitted (the engine's per-profile defaults drive the rest). thickness applies to
         //   every profile. angle rotates the section; justify centres vs corner-aligns it to the path;
         //   trim_corners miters where members meet.
-        { "weld_member", "Structural Member", "sweep", {
+        { "weld_member", "Structural Member", "weld_member", {
             FeatWell1 ("sketch",  "Path Sketch",   "Selections"),
             ComboL    ("profile", "Profile",       "Profile",
                        "square_tube|rect_tube|round_tube|angle_L|flat_bar|c_channel",
@@ -597,7 +597,7 @@ static const std::vector<PMFormDef>& forms() {
         //   members' top faces); the engine recovers each member axis from the pick and builds the
         //   plate in the faces' shared plane. d1/d2 are the legs along each member; type picks the
         //   plate shape; location shifts the plate ±½·thickness off the shared plane.
-        { "weld_gusset", "Gusset", "shell", {
+        { "weld_gusset", "Gusset", "weld_gusset", {
             Well   ("faces",     "Supporting Faces", "Selections", K_FACE, true),
             Dim    ("thickness", "Thickness",        "Gusset",  5.0),
             Dim    ("d1",        "Leg 1 (d1)",       "Gusset",  30.0),
@@ -612,7 +612,7 @@ static const std::vector<PMFormDef>& forms() {
         //   closing the open END of a hollow member. The face well takes ONE planar member end face.
         //   type: outer mounts a plate covering the whole tube end + overhang on the end face; inner
         //   insets a plate matching the bore into the tube. offset shifts along the member axis.
-        { "weld_end_cap", "End Cap", "fillet", {
+        { "weld_end_cap", "End Cap", "weld_end_cap", {
             Well   ("face",      "End Face",         "Selections", K_FACE, false),
             Dim    ("thickness", "Thickness",        "End Cap", 5.0),
             ComboL ("type",      "Type",             "End Cap",

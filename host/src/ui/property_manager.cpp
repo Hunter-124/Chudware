@@ -2198,66 +2198,104 @@ void PropertyManager::drawBody(AppState& st) {
         }
     }
 
-    // ---- header: compact command bar --------------------------------------
+    // ---- header: polished glass command strip ----------------------------------
     {
-        const float S = ui::uiScale;
-        const ImGuiStyle& pmStyle = ImGui::GetStyle();
-        const float gap = 6.0f * S;
-        float btnW = 28.0f * S;
-        const float rowStartX = ImGui::GetCursorPosX();
-        const float rowAvail = std::max(1.0f, ImGui::GetContentRegionAvail().x);
-        if (btnW * 2.0f + gap > rowAvail)
-            btnW = std::max(20.0f * S, (rowAvail - gap) * 0.5f);
-        const float actionW = btnW * 2.0f + gap;
+        const float S         = ui::uiScale;
+        const float glyphSz   = 26.0f * S;
+        const float hdrPadV   = 7.0f * S;
+        const float hdrPadH   = 10.0f * S;
+        const float accentBarW = 4.0f * S;
+        const float rowAvail  = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+        float btnW            = 26.0f * S;
+        const float gap       = 6.0f * S;
+        if (btnW * 2.0f + gap > rowAvail - 50.0f * S)
+            btnW = std::max(16.0f * S, (rowAvail - 50.0f * S - gap) * 0.5f);
+        const float actionW   = btnW * 2.0f + gap;
+        const float hdrH      = glyphSz + hdrPadV * 2.0f;
 
-        auto drawHeaderAction = [&](const char* id, const char* iconName,
-                                    const char* fallback, bool positive,
-                                    const char* tooltip) -> bool {
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                positive ? ImVec4(pal.accentDim[0], pal.accentDim[1], pal.accentDim[2], 1)
-                         : ImVec4(pal.button[0], pal.button[1], pal.button[2], 1));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                positive ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)
-                         : ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 0.7f));
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * S, 4.0f * S));
-            IconUV actionIc = getIcon(iconName, 20);
-            bool pressed = false;
-            if (actionIc.valid) {
-                pressed = ImGui::ImageButton(id, actionIc.texId,
-                    ImVec2(btnW - 8.0f * S, btnW - 8.0f * S), actionIc.uv0, actionIc.uv1);
-            } else {
-                pressed = ImGui::Button(fallback, ImVec2(btnW, btnW));
+        // Mode-aware icon: use the cut variant for boss/cut operations when mode_ is "cut".
+        const char* hdrIcon = form_->icon;
+        {
+            const std::string& ft = form_->type;
+            if (mode_ == "cut") {
+                if      (ft == "extrude") hdrIcon = "extrude_cut";
+                else if (ft == "revolve") hdrIcon = "revolve_cut";
+                else if (ft == "sweep")   hdrIcon = "sweep_cut";
+                else if (ft == "loft")    hdrIcon = "loft_cut";
             }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
-            ImGui::PopStyleVar();
-            ImGui::PopStyleColor(2);
-            return pressed;
-        };
-
-        IconUV ic = getIcon(form_->icon, 20);
-        if (ic.valid) {
-            ImGui::Image(ic.texId, ImVec2(18.0f * S, 18.0f * S),
-                         ic.uv0, ic.uv1);
-            ImGui::SameLine(0, 6.0f * S);
         }
-        ImGui::AlignTextToFramePadding();
-        pushTextColor(pal.text);
+
+        // Draw glass background + left accent bar before advancing the cursor.
+        ImVec2 hdrMin = ImGui::GetCursorScreenPos();
+        ImVec2 hdrMax(hdrMin.x + rowAvail, hdrMin.y + hdrH);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ui::glassBackground(dl, hdrMin, hdrMax, 6.0f);
+        {
+            const float bi = 4.0f * S;
+            dl->AddRectFilled(ImVec2(hdrMin.x,             hdrMin.y + bi),
+                              ImVec2(hdrMin.x + accentBarW, hdrMax.y - bi),
+                              Palette::toU32(pal.accent), 2.0f * S);
+        }
+
+        // Feature glyph (26 dp; use @32 atlas cell for sharpness).
+        ImGui::SetCursorScreenPos(ImVec2(hdrMin.x + accentBarW + hdrPadH, hdrMin.y + hdrPadV));
+        float afterGlyphX = hdrMin.x + accentBarW + hdrPadH;
+        IconUV ic = getIcon(hdrIcon, 32);
+        if (ic.valid) {
+            ImGui::Image(ic.texId, ImVec2(glyphSz, glyphSz), ic.uv0, ic.uv1);
+            afterGlyphX += glyphSz + 8.0f * S;
+        }
+
+        // Title — vertically centred, in accent color.
+        float titleY = hdrMin.y + (hdrH - ImGui::GetTextLineHeight()) * 0.5f;
+        ImGui::SetCursorScreenPos(ImVec2(afterGlyphX, titleY));
+        pushTextColor(pal.accent);
         ImGui::TextUnformatted(title_.c_str());
         ImGui::PopStyleColor();
 
-        const bool inlineActions = rowAvail >= 150.0f * S;
-        if (inlineActions) {
-            ImGui::SameLine();
-            ImGui::SetCursorPosX(rowStartX + std::max(0.0f, rowAvail - actionW));
-        } else {
-            ImGui::Spacing();
-            ImGui::SetCursorPosX(rowStartX + std::max(0.0f, rowAvail - actionW));
-        }
-        ok = drawHeaderAction("##pm_ok", "ok_check", "OK##pm", true, "OK (Enter)");
-        ImGui::SameLine(0, gap);
-        cancel = cancel || drawHeaderAction("##pm_cancel", "cancel_x", "X##pm",
-                                            false, "Cancel (Esc)");
+        // OK / Cancel — right-aligned within the glass header row.
+        float okX = hdrMin.x + rowAvail - actionW - hdrPadH;
+        float okY = hdrMin.y + (hdrH - btnW) * 0.5f;
+        ImGui::SetCursorScreenPos(ImVec2(okX, okY));
 
+        ImGui::PushStyleColor(ImGuiCol_Button,     ImVec4(0.08f, 0.38f, 0.24f, 0.9f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.14f, 0.58f, 0.36f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * S, 4.0f * S));
+        {
+            IconUV okIc = getIcon("ok_badge", 20);
+            if (okIc.valid)
+                ok = ImGui::ImageButton("##pm_ok", okIc.texId,
+                         ImVec2(btnW - 8.0f * S, btnW - 8.0f * S), okIc.uv0, okIc.uv1);
+            else
+                ok = ImGui::Button("OK##pm", ImVec2(btnW, btnW));
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("OK (Enter)");
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+
+        ImGui::SameLine(0, gap);
+
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            ImVec4(pal.button[0], pal.button[1], pal.button[2], 0.9f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+            ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 0.7f));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * S, 4.0f * S));
+        {
+            IconUV cancelIc = getIcon("error_badge", 20);
+            if (cancelIc.valid)
+                cancel = cancel || ImGui::ImageButton("##pm_cancel", cancelIc.texId,
+                             ImVec2(btnW - 8.0f * S, btnW - 8.0f * S), cancelIc.uv0, cancelIc.uv1);
+            else
+                cancel = cancel || ImGui::Button("X##pm", ImVec2(btnW, btnW));
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cancel (Esc)");
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+
+        // Resume layout below the glass header strip.
+        ImGui::SetCursorScreenPos(ImVec2(hdrMin.x, hdrMax.y + 4.0f * S));
+
+        // Optional form description.
         const char* desc = formDescription(form_->type);
         if (desc && desc[0]) {
             pushTextColor(pal.textDim);

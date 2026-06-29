@@ -203,9 +203,9 @@ static const RibbonCmd kCmds[] = {
     { "sk_spline_style",     "Style Spline",    "spline_style",     "Sketch", "Draw", false, "sk_spline",      false },
     { "sk_spline_surface",   "Spline on Surf.", "spline_surface",   "Sketch", "Draw", false, "sk_spline",      true  },
     { "sk_spline_equation",  "Eq. Driven Crv.", "spline_equation",  "Sketch", "Draw", false, "sk_spline",      false },
-    // Airfoil calculator — generates a NACA/.dat section as chained splines (reuses the
-    // equation-curve glyph; both are parametric-curve generators).
-    { "sk_airfoil",          "Airfoil",         "spline_equation",  "Sketch", "Draw", false, "sk_spline",      false },
+    // Airfoil calculator — promoted to its own top-level Draw button (big=true, unique "airfoil"
+    // icon; removed from the spline flyout so users can reach it without opening a dropdown).
+    { "sk_airfoil",          "Airfoil",         "airfoil",          "Sketch", "Draw", true,  nullptr,          false },
 
     // --- Ellipse flyout (new big-button parent; original sk_ellipse small-btn kept for compat) ---
     // sk_ellipse_big is the split-button parent with sub-variants. W4-K: enabled (stretch=false) so
@@ -399,6 +399,17 @@ static const RibbonCmd kCmds[] = {
     { "display_hlr",          "Hidden Removed",  "display_hlr",          "Appearance", "Display", true,  nullptr, false },
     { "display_hlv",          "Hidden Visible",  "display_hlv",          "Appearance", "Display", false, nullptr, false },
     { "display_wireframe",    "Wireframe",       "display_wireframe",    "Appearance", "Display", true,  nullptr, false },
+
+    // =========================================================================
+    // Polygon flyout variants (parent: sk_polygon, big=false). Each arms the
+    // Polygon tool with the appropriate polySides_ value (or Star tool for star).
+    // =========================================================================
+    { "sk_poly_tri",  "Triangle", "poly_triangle", "Sketch", "Draw", false, "sk_polygon", false },
+    { "sk_poly_quad", "Square",   "poly_square",   "Sketch", "Draw", false, "sk_polygon", false },
+    { "sk_poly_pent", "Pentagon", "poly_pentagon", "Sketch", "Draw", false, "sk_polygon", false },
+    { "sk_poly_hex",  "Hexagon",  "polygon",       "Sketch", "Draw", false, "sk_polygon", false },
+    { "sk_poly_oct",  "Octagon",  "poly_octagon",  "Sketch", "Draw", false, "sk_polygon", false },
+    { "sk_poly_star", "Star",     "poly_star",     "Sketch", "Draw", false, "sk_polygon", false },
 
 };
 // clang-format on

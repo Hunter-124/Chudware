@@ -25,6 +25,11 @@ void drawFeatureTreeBody(AppState& st,
 // previous one. The selection itself now lives on AppState (selectedFeatureId), cleared separately.
 void featureTreeResetTransient();
 
+// Clear ONLY the FeatureManager multi-select set (Ctrl+click set). Narrower than
+// featureTreeResetTransient (which also drops the rename buffer + pending ops); safe to call during
+// normal interaction. Used by AppState::clearSelection.
+void featureClearTreeMultiSel();
+
 // C38 (T1): rebuild st.featureHighlightFaces from the CURRENT owner map for st.selectedFeatureId
 // (clearing it when the feature is absent or there's no selection). Face tags are retagged on every
 // applyOps/undo/redo/resync rebuild, so the cached highlight goes stale; call this after any such

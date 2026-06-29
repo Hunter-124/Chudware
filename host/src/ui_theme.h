@@ -207,6 +207,9 @@ Fonts loadFonts(const std::string& assetsDir, float pxScale = 1.0f);
 // border, top specular line. 'rounding' is a logical dp value (multiplied by ui::uiScale
 // internally, so 8.0f matches the PopupRounding set by applyTheme at any DPI).
 void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 8.0f);
+// Alpha-scaled variant for animated widgets (e.g. toasts): `alpha` (0..1) multiplies every glass
+// role's alpha before drawing, so a fading card dims all five layers coherently.
+void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, float alpha);
 
 // Push/pop ImGuiStyle overrides for the BeginTooltip() + glassBackground() pattern.
 // pushGlassTooltipStyle() sets PopupBg=transparent so ImGui's native rect fill does not
@@ -224,6 +227,16 @@ void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 8.0f
 //   ui::popGlassTooltipStyle();
 void pushGlassTooltipStyle();
 void popGlassTooltipStyle();
+
+// Push/pop WindowBg=glassBg around a floating ImGui::Begin() window (translucent glass panel).
+// Pair the calls immediately around Begin()/End().
+void pushGlassWindowStyle();
+void popGlassWindowStyle();
+
+// Push/pop ChildBg=glassBg + Border=glassBorder + ChildRounding around a BeginChild() card.
+// `rounding` is logical dp (scaled by uiScale internally). Pair around BeginChild()/EndChild().
+void pushGlassChildStyle(float rounding = 8.0f);
+void popGlassChildStyle();
 
 // The active palette — read-only from panels.
 extern Palette palette;

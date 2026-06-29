@@ -59,7 +59,9 @@ enum class SketchTool {
     // Airfoil calculator (no viewport pick; origin-relative like EqCurve): a popup collects a
     // NACA 4-/5-digit code or a .dat file + chord/angle-of-attack, then emits the upper/lower
     // surfaces as two through-point splines (chained into a closed, extrudable loop).
-    Airfoil
+    Airfoil,
+    // Polygon flyout: Star tool (2*polyStarPoints_ alternating outer/inner radii).
+    Star
 };
 
 // C37-D: One constraint record from a sketch_enter/solve/drag response (worker_rpc.md §"constraints").
@@ -206,6 +208,10 @@ public:
     // C40: ribbon cmd id of the armed tool ("" when none) — drives the ribbon's armed-tool
     // highlight (ui::setRibbonActiveCmd each frame from app.cpp).
     const char* activeToolCmd() const;
+
+    // Clear in-sketch entity + relation selection WITHOUT changing the active tool (unlike
+    // resetTool, which also exits the tool). Used by AppState::clearSelection for global deselect.
+    void clearEntitySelection();
 
     // The plane-normal camera angles (so the caller can hard-lock the orbit while active).
     bool cameraLock(float& yaw, float& pitch) const;
@@ -515,6 +521,9 @@ private:
                            const std::string& snap1 = "", const std::string& snap2 = "");
     // C42: Polygon tool side count (set with number keys 3-9 while the tool is armed).
     int polySides_ = 6;
+    // Star tool parameters (set while tool_ == SketchTool::Star).
+    int   polyStarPoints_ = 5;    // number of tips (clamped 3..12)
+    float polyStarRatio_  = 0.45f; // inner/outer radius ratio
 
     // C42: minimal "Add Relation" popup (ribbon sk_relations with 1-2 entities selected). The
     // selection is snapshotted into relIds_ when the popup opens (selIds_ may churn).

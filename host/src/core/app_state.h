@@ -980,6 +980,9 @@ struct AppState {
     };
     bool showRibbon = true;        // View > Ribbon visibility toggle
     bool profilerRunning = false;  // Evaluate > Profiler: sampling profiler active (libaicad prof_*)
+    bool showProfilerWindow = false;  // in-app profiler results window (text report + flamegraph)
+    bool showCommandSearch  = false;  // top-bar unified search popup (settings + modeling tools)
+    int  openSettingsTab    = -1;     // >=0: jump the Settings modal to this tab index (search result)
     int  ribbonTab  = RT_Features; // active ribbon tab (one of RibbonTab); contextual on the doc
     bool showSimulationTools = false; // View-gated advanced module; hidden from default ribbon
     bool showPcbTools = false;        // View-gated ECAD module; hidden until requested/used
@@ -1235,6 +1238,12 @@ struct AppState {
     // previous doc's parts so the empty-doc datum-planes view shows. Called by every path that
     // creates a new document (tree toolbar New Part/Assembly, sketch auto-create).
     void clearViewportForNewDoc();
+
+    // Clear ALL selection kinds in one call: viewport topology picks (+ hover/pickStatus), the
+    // FeatureManager primary + multi-select + face highlight, and any in-sketch entity/relation
+    // selection. Used by the global "click empty space to deselect" handler and ESC / Clear Selection.
+    // Does NOT touch body visibility, model readouts, or other per-doc fields.
+    void clearSelection();
 
     // Build the "Face 12 of Body1" status label for a pick (empty string for an invalid hit).
     std::string pickLabel(const render::PickHit& h) const;

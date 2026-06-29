@@ -43,14 +43,14 @@ void drawToasts(AppState& st) {
     const auto& pal = ui::palette;
     const float scale = ui::uiScale;
 
-    // Anchor top-right of the main viewport (the whole window — toasts float over everything,
-    // SolidWorks-style). A modest inset from the right edge and below the title/ribbon area.
+    // Anchor top-LEFT of the main viewport (toasts float over everything, SolidWorks-style).
+    // A modest inset from the left edge and below the title/ribbon area.
     ImGuiViewport* vp = ImGui::GetMainViewport();
     const float pad     = 12.0f * scale;
     const float toastW  = 320.0f * scale;
     const float rowGap  = 8.0f * scale;
     const float topInset = 64.0f * scale;  // clear the title bar + ribbon
-    float x = vp->Pos.x + vp->Size.x - toastW - pad;
+    float x = vp->Pos.x + pad;
     float y = vp->Pos.y + topInset;
 
     ImDrawList* dl = ImGui::GetForegroundDrawList();
@@ -88,10 +88,9 @@ void drawToasts(AppState& st) {
             return ui::Palette::toU32(v);
         };
 
-        // Panel bg + border use the glass roles so toasts match the app-wide frosted-glass family;
-        // the per-toast fade alpha (and left accent bar) are preserved.
-        dl->AddRectFilled(p0, p1, withA(pal.glassBg, 1.0f), 6.0f * scale);
-        dl->AddRect(p0, p1, withA(pal.glassBorder, 1.0f), 6.0f * scale, 0, 1.2f * scale);
+        // Full liquid-glass card: drop shadow + shine + specular layers, coherently dimmed by alpha.
+        ui::glassBackground(dl, p0, p1, 8.0f, alpha);
+        // Colored left accent bar drawn on top of glass; withA already folds in alpha.
         dl->AddRectFilled(p0, ImVec2(p0.x + 3.0f * scale, p1.y), withA(accent, 1.0f),
                           6.0f * scale, ImDrawFlags_RoundCornersLeft);
 
@@ -102,9 +101,11 @@ void drawToasts(AppState& st) {
         dl->AddText(font, font->FontSize, ImVec2(tx, ty + titleH),
                     withA(pal.text, 1.0f), t.msg.c_str(), nullptr, innerW);
 
-        // Click-to-dismiss anywhere on the card.
-        if (clicked && mouse.x >= p0.x && mouse.x <= p1.x && mouse.y >= p0.y && mouse.y <= p1.y)
+        // Click = copy message to OS clipboard + instant dismiss (no fade-out).
+        if (clicked && mouse.x >= p0.x && mouse.x <= p1.x && mouse.y >= p0.y && mouse.y <= p1.y) {
+            ImGui::SetClipboardText(t.msg.c_str());
             dismissIdx = i;
+        }
 
         y += cardH + rowGap;
     }

@@ -82,6 +82,9 @@ CONTRACT_NAMES: list[str] = [
     # Appearance
     "color_picker", "appr_metal", "appr_plastic", "appr_glass",
     "appr_paint", "appr_default",
+    # Sketch shape drop-ins (polygon dropdown variants + star) and airfoil
+    "poly_triangle", "poly_square", "poly_pentagon", "poly_octagon", "poly_star",
+    "airfoil",
 ]
 
 # ---------------------------------------------------------------------------
@@ -2852,6 +2855,78 @@ def draw_missing(d: ImageDraw.ImageDraw, cell: int, p: Palette):
     s = cell * SS
     lw = stroke_width(cell)
     diagonal_box(d, s*0.1, s*0.1, s*0.9, s*0.9, p.err, lw)
+
+
+def _ngon(d, cell, p, n, start_deg=-90):
+    """Regular n-gon by center + a vertex (radius), accent center+vertex dots."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, cy, r = s*0.5, s*0.5, s*0.36
+    pts = [(cx + r*math.cos(math.radians(start_deg + i*360/n)),
+            cy + r*math.sin(math.radians(start_deg + i*360/n))) for i in range(n)]
+    d.line(pts + [pts[0]], fill=p.stroke, width=lw)
+    d.line([(cx, cy), pts[0]], fill=_rgba(p.accent, 150), width=max(1, lw//2))
+    filled_circle(d, cx, cy, lw*0.9, p.accent)
+    filled_circle(d, pts[0][0], pts[0][1], lw*0.9, p.accent)
+
+
+@icon("poly_triangle")
+def draw_poly_triangle(d, cell, p):
+    """Equilateral triangle drop-in shape."""
+    _ngon(d, cell, p, 3)
+
+
+@icon("poly_square")
+def draw_poly_square(d, cell, p):
+    """Axis-aligned square drop-in shape."""
+    _ngon(d, cell, p, 4, start_deg=-45)
+
+
+@icon("poly_pentagon")
+def draw_poly_pentagon(d, cell, p):
+    """Regular pentagon drop-in shape."""
+    _ngon(d, cell, p, 5)
+
+
+@icon("poly_octagon")
+def draw_poly_octagon(d, cell, p):
+    """Regular octagon drop-in shape."""
+    _ngon(d, cell, p, 8, start_deg=-67.5)
+
+
+@icon("poly_star")
+def draw_poly_star(d, cell, p):
+    """Five-point star (alternating outer/inner radius)."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, cy = s*0.5, s*0.5
+    ro, ri, n = s*0.40, s*0.17, 5
+    pts = []
+    for i in range(n*2):
+        rr = ro if i % 2 == 0 else ri
+        ang = math.radians(-90 + i*180/n)
+        pts.append((cx + rr*math.cos(ang), cy + rr*math.sin(ang)))
+    d.polygon(pts, fill=_rgba(p.accent, 55))
+    d.line(pts + [pts[0]], fill=p.stroke, width=lw)
+    filled_circle(d, cx, cy, lw*0.85, p.accent)
+
+
+@icon("airfoil")
+def draw_airfoil(d, cell, p):
+    """Side-on cambered wing cross-section with chord line + leading-edge dot."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    le = (s*0.12, s*0.52)
+    te = (s*0.90, s*0.50)
+    upper = [le, (s*0.26, s*0.34), (s*0.50, s*0.30), (s*0.72, s*0.39), te]
+    lower = [le, (s*0.34, s*0.60), (s*0.60, s*0.585), (s*0.80, s*0.535), te]
+    up = _cr(upper)
+    lo = _cr(lower)
+    d.polygon(up + list(reversed(lo)), fill=_rgba(p.accent, 45))
+    polyline(d, up, p.stroke, lw)
+    polyline(d, lo, p.stroke, lw)
+    d.line([le, te], fill=_rgba(p.accent, 140), width=max(1, lw//2))
+    filled_circle(d, le[0], le[1], lw*0.95, p.accent)
 
 
 # ---------------------------------------------------------------------------

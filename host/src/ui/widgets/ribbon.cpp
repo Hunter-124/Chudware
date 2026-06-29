@@ -92,7 +92,8 @@ static const HiddenSmall kHiddenSmallByParent[] = {
 // fires it. sk_ellipse_big -> sk_ellipse so clicking the big Ellipse draws an ellipse immediately.
 struct ParentDefault { const char* parentId; const char* defaultCmd; const char* defaultLabel; const char* icon; };
 static const ParentDefault kParentDefaults[] = {
-    {"sk_ellipse_big", "sk_ellipse", "Ellipse", "ellipse"},
+    {"sk_ellipse_big", "sk_ellipse",  "Ellipse", "ellipse"},
+    {"sk_polygon",     "sk_poly_hex", "Hexagon", "polygon"},
 };
 
 static const ParentDefault* ribbon_parentDefault(const char* parentId) {
@@ -429,6 +430,13 @@ static const char* ribbon_tipFor(const char* cmd_id) {
         {"sk_fillet",         "Round a sharp sketch corner between two lines."},
         {"sk_chamfer",        "Bevel a sharp sketch corner between two lines."},
         {"sk_airfoil",        "Generate a NACA airfoil section as chained splines."},
+        // --- Sketch: polygon flyout variants ---
+        {"sk_poly_tri",  "Draw an equilateral triangle."},
+        {"sk_poly_quad", "Draw a square."},
+        {"sk_poly_pent", "Draw a regular pentagon."},
+        {"sk_poly_hex",  "Draw a regular hexagon."},
+        {"sk_poly_oct",  "Draw a regular octagon."},
+        {"sk_poly_star", "Draw a star polygon with alternating outer and inner radii."},
         // --- Simulation: extended study types ---
         {"sim_new_thermal",   "Create a steady-state or transient thermal study."},
         {"sim_new_fatigue",   "Estimate fatigue life from a static stress result."},

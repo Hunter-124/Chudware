@@ -1749,6 +1749,32 @@ void SimManager::tick(AppState& st) {
     }
 }
 
+// ---- pre-flight readiness gate -------------------------------------------------
+// Returns true when the study is ready to run; populates `blocker` with the first
+// unmet prerequisite when returning false. Flow / Thermal are always ready (no
+// material or fixtures required by the solver — the flow pipeline handles them).
+static bool studyReady(const Study& s, std::string& blocker) {
+    if (isFlowFamily(s.type)) return true;
+    if (s.materialKey.empty()) {
+        blocker = "Material required — pick a material before running.";
+        return false;
+    }
+    if (s.type != StudyType::Modal && s.fixtures.empty()) {
+        blocker = "At least one fixed face is required to constrain the part.";
+        return false;
+    }
+    if (s.type == StudyType::Fatigue) {
+        int mi = SimManager::materialIndexByKey(s.materialKey);
+        double matSut = (mi >= 0) ? SimManager::materials()[mi].ultimate_mpa : 0.0;
+        if (s.fatigueSut <= 0.0f && matSut <= 0.0) {
+            blocker = "Fatigue study needs ultimate strength (Sut) \xe2\x80\x94 set it in Fatigue parameters "
+                      "or choose a material with Sut data.";
+            return false;
+        }
+    }
+    return true;
+}
+
 // ============================================================ tree + form (drawTreeBody)
 
 static const char* kPresetLabels[4] = {
@@ -1775,26 +1801,45 @@ void SimManager::drawTreeBody(AppState& st) {
 
     const float S = ui::uiScale;
 
-    // ---- New-study buttons (2x2 grid so labels never clip in the narrow pane) ----
-    const float availW = ImGui::GetContentRegionAvail().x;
-    const float bw = (availW - 6.0f * S) / 2.0f;
-    if (ImGui::Button("Static##new", ImVec2(bw, 0))) newStudy(st, StudyType::Static);
-    simTip("Linear static structural study: apply fixtures + loads, solve for stress, displacement, "
-           "and factor of safety (von Mises / Tresca / max-normal).");
-    ImGui::SameLine();
-    if (ImGui::Button("Fatigue##new", ImVec2(bw, 0))) newStudy(st, StudyType::Fatigue);
-    simTip("Fatigue study: cyclic loading life + factor of safety using Goodman / Gerber / Soderberg "
-           "mean-stress theory, with a constant-life diagram and an S-N curve.");
-    if (ImGui::Button("Frequency##new", ImVec2(bw, 0))) newStudy(st, StudyType::Modal);
-    simTip("Modal (frequency) study: solve the natural frequencies and mode shapes. Fixtures optional.");
-    ImGui::SameLine();
-    if (ImGui::Button("Flow##new", ImVec2(bw, 0))) newStudy(st, StudyType::Flow);
-    simTip("External flow (wind tunnel): estimate drag/lift and streamlines for a flow direction.");
-    if (ImGui::Button("Thermal##new", ImVec2(bw, 0))) newStudy(st, StudyType::Thermal);
-    simTip("Heat transfer (OpenFOAM): a heated part cooled by airflow. Fluid mode gives surface "
-           "temperature + heat flow; Conjugate (CHT) conducts heat through the solid part itself — "
-           "the right model for electronics / heat-sink cooling.");
+    // ---- Single "+ New Study" entry point: opens a picker popup for the 5 study types.
+    // Ribbon sim_new_* commands remain as keyboard accelerators (ribbon_def.cpp, untouched).
+    if (ImGui::Button("+ New Study", ImVec2(-FLT_MIN, 0)))
+        ImGui::OpenPopup("##newStudyPicker");
+    simTip("Add a simulation study to this part. Static, Fatigue, Frequency, Flow, or Thermal.");
 
+    if (ImGui::BeginPopup("##newStudyPicker")) {
+        struct SEntry { StudyType type; const char* name; const char* desc; };
+        static const SEntry kEntries[] = {
+            { StudyType::Static,  "Static",    "Linear stress, displacement and factor of safety." },
+            { StudyType::Fatigue, "Fatigue",   "Cyclic loading life using Goodman/Gerber/Soderberg." },
+            { StudyType::Modal,   "Frequency", "Natural frequencies and mode shapes." },
+            { StudyType::Flow,    "Flow",      "External aerodynamics: drag, lift and streamlines." },
+            { StudyType::Thermal, "Thermal",   "Heat transfer via OpenFOAM convection / CHT." },
+        };
+        ImGui::TextDisabled("Select study type");
+        ImGui::Separator();
+        const float S2 = ui::uiScale;
+        const auto& pal2 = ui::palette;
+        for (const auto& e : kEntries) {
+            ImGui::PushID((int)e.type);
+            IconUV iv = getIcon(studyTypeIcon(e.type), 20);
+            if (iv.valid) {
+                ImGui::Image(iv.texId, ImVec2(16.0f * S2, 16.0f * S2), iv.uv0, iv.uv1);
+                ImGui::SameLine(0, 6.0f * S2);
+            }
+            ImGui::PushFont(st.fonts.medium);
+            bool hit = ImGui::Selectable(e.name, false, 0, ImVec2(80.0f * S2, 0));
+            ImGui::PopFont();
+            ImGui::SameLine(0, 8.0f * S2);
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(pal2.textDim[0], pal2.textDim[1], pal2.textDim[2], 1));
+            ImGui::TextUnformatted(e.desc);
+            ImGui::PopStyleColor();
+            if (hit) { newStudy(st, e.type); ImGui::CloseCurrentPopup(); }
+            ImGui::PopID();
+        }
+        ImGui::EndPopup();
+    }
     ImGui::Spacing();
 
     if (!st.docMirror.hasDoc()) {
@@ -2949,7 +2994,9 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
     char b[80];
 
     // Scroll so a long metric list never clips at the bottom of the narrow pane.
-    ImGui::BeginChild("##simresults", ImVec2(0, 0), false);
+    // Reserve ~50px for the Run button that drawForm places after the switch.
+    float rH = ImGui::GetContentRegionAvail().y - 50.0f * ui::uiScale;
+    ImGui::BeginChild("##simresults", ImVec2(0, std::max(rH, 80.0f * ui::uiScale)), false);
 
     ImGui::PushFont(st.fonts.medium);
     ImGui::TextUnformatted("Results");
@@ -3148,6 +3195,201 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
     ImGui::EndChild();
 }
 
+// ---- Stepwise setup checklist (all structural sub-nodes) -----------------------
+// Replaces the scattered Study-overview inputs with numbered, glass-carded sections.
+// Called for every structural SimNode (Study/Material/Fixtures/Load/Mesh); SetNextItemOpen
+// auto-expands the matching section when a tree leaf is selected. Flow/Thermal short-circuit
+// to the flow form (no material / fixture steps apply there).
+void SimManager::drawStudyChecklist(AppState& st, Study& s) {
+    const float S = ui::uiScale;
+    const auto& pal = ui::palette;
+
+    // ---------- Flow / Thermal: banner + flow form, no structural steps ----------
+    if (isFlowFamily(s.type)) {
+        drawStudyTypeBanner(s.type, s.type == StudyType::Thermal
+            ? "Steady-state heat transfer (OpenFOAM): convection with wall / heat-source "
+              "boundary conditions. Structural material is not used."
+            : "External flow / wind-tunnel (CFD): drag, lift and pressure from the velocity "
+              "and fluid. Structural material is not used.");
+        drawFlowForm(st, s);
+        return;
+    }
+
+    // Study-type intent banner
+    if (s.type == StudyType::Modal)
+        drawStudyTypeBanner(s.type,
+            "Natural frequencies and mode shapes. Loads are not applicable "
+            "\xe2\x80\x94 fixtures (optional) constrain rigid-body modes.");
+    else if (s.type == StudyType::Static)
+        drawStudyTypeBanner(s.type,
+            "Linear static stress under applied loads. Set material, "
+            "fixtures, loads and mesh, then run for stress, displacement "
+            "and factor of safety.");
+    else  // Fatigue
+        drawStudyTypeBanner(s.type,
+            "Fatigue life under cyclic loading: the static stress state is "
+            "scaled over the load cycle (Goodman / Gerber / Soderberg).");
+
+    // Helper: draw a small filled-circle badge to the right of the most-recently-drawn item.
+    // green=set, amber=required+missing, dim=optional.
+    auto drawBadge = [&](bool isSet, bool required) {
+        ImU32 col;
+        if (isSet) {
+            col = pal.toU32(pal.statusOk);
+        } else if (required) {
+            col = pal.toU32(pal.statusWarn);
+        } else {
+            float d[4]; Palette::withAlpha(pal.textDim, d, 0.55f); col = pal.toU32(d);
+        }
+        ImVec2 rmin = ImGui::GetItemRectMin();
+        ImVec2 rmax = ImGui::GetItemRectMax();
+        float cx = rmax.x - 14.0f * S;
+        float cy = (rmin.y + rmax.y) * 0.5f;
+        ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(cx, cy), 5.0f * S, col);
+    };
+
+    bool matSet  = !s.materialKey.empty();
+    bool fixSet  = !s.fixtures.empty();
+    bool matReq  = true;                          // material always required for structural
+    bool fixReq  = (s.type != StudyType::Modal);  // modal can run free-free
+
+    // ---- Step 1: Material ----
+    // Open when this leaf is selected in the tree, or on the Study overview root.
+    if (node_ == SimNode::Material || node_ == SimNode::Study)
+        ImGui::SetNextItemOpen(true, node_ == SimNode::Study ? ImGuiCond_Once : ImGuiCond_Always);
+    bool matOpen = ImGui::CollapsingHeader("1  Material");
+    drawBadge(matSet, matReq);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Material defines stiffness (E), Poisson ratio, density and yield strength\n"
+            "used in the stress solve and factor-of-safety result.\n"
+            "Required for all structural and fatigue studies.");
+    if (matOpen) {
+        ui::pushGlassChildStyle(6.0f);
+        if (ImGui::BeginChild("##ckmat", ImVec2(0.0f, 0.0f),
+                              ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding)) {
+            drawMaterialCombo(st, s);
+            // Static: failure criterion lives logically with the material choice
+            if (s.type == StudyType::Static) {
+                ImGui::Spacing();
+                ImGui::SeparatorText("Failure criterion");
+                static const char* kCrit[3] = {"Max von Mises (distortion energy)",
+                                               "Max shear stress (Tresca)",
+                                               "Max normal stress (Rankine)"};
+                int ci = (int)s.criterion; if (ci < 0 || ci > 2) ci = 0;
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::BeginCombo("##crit2", kCrit[ci])) {
+                    for (int i = 0; i < 3; ++i)
+                        if (ImGui::Selectable(kCrit[i], ci == i)) {
+                            s.criterion = (FailureCriterion)i; persist(st, s);
+                        }
+                    ImGui::EndCombo();
+                }
+                simTip("Theory for the headline factor of safety. Ductile metals: von Mises or "
+                       "Tresca (more conservative). Brittle: max normal stress.");
+            }
+            // Modal: mode count lives with material (drives the mass matrix order)
+            if (s.type == StudyType::Modal) {
+                ImGui::Spacing();
+                ImGui::SeparatorText("Modes");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::SliderInt("##modes2", &s.nModes, 1, 12)) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                simTip("How many natural frequencies / mode shapes to solve for.");
+            }
+        }
+        ImGui::EndChild();
+        ui::popGlassChildStyle();
+    }
+    ImGui::Spacing();
+
+    // ---- Step 2: Fixtures ----
+    if (node_ == SimNode::Fixtures) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+    bool fixOpen = ImGui::CollapsingHeader("2  Fixtures");
+    drawBadge(fixSet, fixReq);
+    if (ImGui::IsItemHovered()) {
+        if (s.type == StudyType::Modal)
+            ImGui::SetTooltip(
+                "Fixtures (optional for frequency studies): constrains rigid-body modes.\n"
+                "A free-free modal solve runs without fixtures.");
+        else
+            ImGui::SetTooltip(
+                "Fixtures constrain the part so it cannot translate or rotate as a rigid body.\n"
+                "Required for static and fatigue studies \xe2\x80\x94 at least one fixed face.");
+    }
+    if (fixOpen) {
+        ui::pushGlassChildStyle(6.0f);
+        if (ImGui::BeginChild("##ckfix", ImVec2(0.0f, 0.0f),
+                              ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding)) {
+            drawFixturesForm(st, s);
+        }
+        ImGui::EndChild();
+        ui::popGlassChildStyle();
+    }
+    ImGui::Spacing();
+
+    // ---- Step 3: Loads (hidden for modal) ----
+    if (s.type != StudyType::Modal) {
+        if (node_ == SimNode::Load) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+        bool loadOpen = ImGui::CollapsingHeader("3  Loads");
+        drawBadge(!s.loads.empty(), false);  // optional: neutral when empty
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Loads (optional): forces or pressures applied to model faces.\n"
+                "A study without loads produces zero stress \xe2\x80\x94 add at least one load\n"
+                "to get a meaningful structural result.");
+        if (loadOpen) {
+            ui::pushGlassChildStyle(6.0f);
+            if (ImGui::BeginChild("##ckloads", ImVec2(0.0f, 0.0f),
+                                  ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding)) {
+                drawLoadsForm(st, s);
+            }
+            ImGui::EndChild();
+            ui::popGlassChildStyle();
+        }
+        ImGui::Spacing();
+    }
+
+    // ---- Step 4: Mesh ----
+    if (node_ == SimNode::Mesh) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+    bool meshOpen = ImGui::CollapsingHeader("4  Mesh");
+    drawBadge(true, false);  // mesh always has sane defaults — neutral/green
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Mesh: controls element size and type.\n"
+            "Finer elements capture stress concentrations (holes, fillets) better\n"
+            "but increase solve time. The defaults are a good starting point.");
+    if (meshOpen) {
+        ui::pushGlassChildStyle(6.0f);
+        if (ImGui::BeginChild("##ckmesh", ImVec2(0.0f, 0.0f),
+                              ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding)) {
+            drawMeshForm(st, s);
+        }
+        ImGui::EndChild();
+        ui::popGlassChildStyle();
+    }
+
+    // ---- Step 5: Fatigue parameters (fatigue studies only) ----
+    if (s.type == StudyType::Fatigue) {
+        ImGui::Spacing();
+        bool fatigueOpen = ImGui::CollapsingHeader("5  Fatigue parameters");
+        drawBadge(true, false);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Cyclic loading definition, Marin endurance corrections,\n"
+                "and strength overrides (Sut / Se') for the fatigue solve.");
+        if (fatigueOpen) {
+            ui::pushGlassChildStyle(6.0f);
+            if (ImGui::BeginChild("##ckfatigue", ImVec2(0.0f, 0.0f),
+                                  ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding)) {
+                drawFatigueForm(st, s);
+            }
+            ImGui::EndChild();
+            ui::popGlassChildStyle();
+        }
+    }
+}
+
 void SimManager::drawForm(AppState& st, Study& s) {
     const float S = ui::uiScale;
 
@@ -3190,101 +3432,50 @@ void SimManager::drawForm(AppState& st, Study& s) {
     ImGui::Spacing();
 
     switch (node_) {
-        case SimNode::Material:
-            ImGui::TextUnformatted("Material"); simTip("");
-            drawMaterialCombo(st, s);
-            break;
-        case SimNode::Fixtures:
-            drawFixturesForm(st, s);
-            break;
-        case SimNode::Load:
-            drawLoadsForm(st, s);
-            break;
-        case SimNode::Mesh:
-            drawMeshForm(st, s);
-            break;
         case SimNode::Results:
             drawResultControls(st, s);
             break;
-        case SimNode::Study:
         default:
-            // Study overview: a per-type intent banner (glass card) followed by the inputs that
-            // actually apply to this type, grouped under step-section headers. Flow/Thermal have no
-            // structural Material node — drawFlowForm carries every fluid / thermal input directly.
-            if (isFlowFamily(s.type)) {
-                drawStudyTypeBanner(s.type, s.type == StudyType::Thermal
-                    ? "Steady-state heat transfer (OpenFOAM): convection with wall / heat-source "
-                      "boundary conditions. Structural material is not used."
-                    : "External flow / wind-tunnel (CFD): drag, lift and pressure from the velocity "
-                      "and fluid. Structural material is not used.");
-                drawFlowForm(st, s);
-            } else if (s.type == StudyType::Modal) {
-                drawStudyTypeBanner(s.type, "Natural frequencies and mode shapes. Loads are not "
-                    "applicable — fixtures (optional) constrain rigid-body modes.");
-                ImGui::SeparatorText("Material");
-                drawMaterialCombo(st, s);
-                ImGui::Spacing();
-                ImGui::SeparatorText("Modes");
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                if (ImGui::SliderInt("##modes", &s.nModes, 1, 12)) {}
-                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
-                simTip("How many natural frequencies / mode shapes to solve for.");
-                ImGui::Spacing();
-                ImGui::TextDisabled("Select Fixtures / Mesh in the tree to edit them. "
-                                    "Frequency studies have no loads.");
-            } else if (s.type == StudyType::Static) {
-                drawStudyTypeBanner(s.type, "Linear static stress under applied loads. Set material, "
-                    "fixtures, loads and mesh, then run for stress, displacement and factor of safety.");
-                ImGui::SeparatorText("Material");
-                drawMaterialCombo(st, s);
-                ImGui::Spacing();
-                // Failure theory driving the headline factor of safety + the FoS plot field.
-                ImGui::SeparatorText("Failure criterion");
-                static const char* kCrit[3] = {"Max von Mises (distortion energy)",
-                                               "Max shear stress (Tresca)",
-                                               "Max normal stress (Rankine)"};
-                int ci = (int)s.criterion; if (ci < 0 || ci > 2) ci = 0;
-                ImGui::SetNextItemWidth(-FLT_MIN);
-                if (ImGui::BeginCombo("##crit", kCrit[ci])) {
-                    for (int i = 0; i < 3; ++i)
-                        if (ImGui::Selectable(kCrit[i], ci == i)) {
-                            s.criterion = (FailureCriterion)i; persist(st, s);
-                        }
-                    ImGui::EndCombo();
-                }
-                simTip("Theory used for the headline factor of safety. Ductile metals: von Mises "
-                       "(distortion energy) or Tresca (max shear, more conservative). Brittle "
-                       "materials: max normal stress (Rankine).");
-                ImGui::Spacing();
-                ImGui::TextDisabled("Select Fixtures / Loads / Mesh in the tree to edit them.");
-            } else {   // StudyType::Fatigue — drawFatigueForm adds its own step headers.
-                drawStudyTypeBanner(s.type, "Fatigue life under cyclic loading: the static stress "
-                    "state is scaled over the load cycle (Goodman / Gerber / Soderberg).");
-                ImGui::SeparatorText("Material");
-                drawMaterialCombo(st, s);
-                ImGui::Spacing();
-                drawFatigueForm(st, s);
-                ImGui::Spacing();
-                ImGui::TextDisabled("Select Fixtures / Loads / Mesh in the tree to edit them.");
-            }
-
-            ImGui::Spacing();
-            ImGui::Separator();
-            bool busy = st.simClient && st.simClient->busy();
-            if (busy) ImGui::BeginDisabled();
-            if (ImGui::Button(busy ? "Running…" : "Run study", ImVec2(-FLT_MIN, 30.0f * S)))
-                run(st, s);
-            if (busy) ImGui::EndDisabled();
-            simTip("Mesh the part and solve. Results color the model and appear under the Results node.");
-            if (busy) {
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Cancel")) st.simClient->cancel();
-            }
-            if (!s.dragTrace.empty())
-                ImGui::PlotLines("##drag", s.dragTrace.data(), (int)s.dragTrace.size(), 0,
-                                 "Drag trace", FLT_MAX, FLT_MAX, ImVec2(-FLT_MIN, 50.0f * S));
-            if (s.hasResult) { ImGui::Spacing(); ImGui::TextWrapped("%s", s.summary.c_str()); }
+            // All structural nodes (Study / Material / Fixtures / Load / Mesh) go through
+            // the stepwise checklist. drawStudyChecklist uses SetNextItemOpen to auto-expand
+            // the section that matches the currently-selected tree leaf.
+            drawStudyChecklist(st, s);
             break;
+    }
+
+    // ---- Gated Run button (always at the bottom, visible on every sub-node) --------
+    // Disabled when a solve is running OR prerequisites are unmet (studyReady gate).
+    // A glass tooltip explains the first unmet prerequisite so the user knows what to fix.
+    {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        bool busy = st.simClient && st.simClient->busy();
+        std::string blocker;
+        bool ready = studyReady(s, blocker);
+        const bool canRun = ready && !busy;
+        if (!canRun) ImGui::BeginDisabled();
+        if (ImGui::Button(busy ? "Running\xe2\x80\xa6" : "Run",
+                          ImVec2(-FLT_MIN, 30.0f * S)))
+            run(st, s);
+        if (!canRun) ImGui::EndDisabled();
+        // Tooltip: blocker reason (when unmet) or generic hint (when ready).
+        if (!busy && !ready)
+            simTip(blocker.c_str());
+        else
+            simTip("Mesh the part and solve. Results color the model and appear under Results.");
+        if (busy && st.simClient) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Cancel")) st.simClient->cancel();
+        }
+        // Live drag-convergence sparkline and final result summary
+        if (!s.dragTrace.empty())
+            ImGui::PlotLines("##drag", s.dragTrace.data(), (int)s.dragTrace.size(), 0,
+                             "Drag trace", FLT_MAX, FLT_MAX, ImVec2(-FLT_MIN, 50.0f * S));
+        if (s.hasResult && node_ != SimNode::Results) {
+            ImGui::Spacing();
+            ImGui::TextWrapped("%s", s.summary.c_str());
+        }
     }
 }
 

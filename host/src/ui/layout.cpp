@@ -273,7 +273,7 @@ void drawLeftPane(AppState& st,
     // column share one origin — otherwise the default padding offsets the buttons from the rail bg.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::BeginChild("##lp_tabstrip", ImVec2(stripW, 0), ImGuiChildFlags_None,
-                      ImGuiWindowFlags_NoScrollbar);
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
     ImGui::PopStyleVar();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 rail0 = ImGui::GetWindowPos();

@@ -1,5 +1,0 @@
-# build output + generated screenshots
-build/
-build-linux/
-*.png
-!resources/**/*.png

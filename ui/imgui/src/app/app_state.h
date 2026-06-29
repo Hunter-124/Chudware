@@ -5,6 +5,8 @@
 #include <vector>
 #include "ui/command_registry.h"
 #include "engine/engine.h"
+#include "view_model.h"
+#include "action_bus.h"
 
 struct GLFWwindow;
 namespace viewport { class Scene; }
@@ -115,6 +117,10 @@ struct AppState {
     // agent
     AgentThread agent;
     bool agentIsReal = false;  // true when the current run uses the real engine (not the scripted demo)
+
+    // framework-agnostic presentation model + action routing (ui/abstract seam)
+    aicad::ui::DocViewModel viewModel;
+    aicad::ui::ActionBus actionBus;
 
     // ---- helpers ----
     DocTabState& doc() {

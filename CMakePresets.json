@@ -22,7 +22,8 @@
       "binaryDir": "${sourceDir}/build/linux-app",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "AICAD_BUILD_APP": "ON"
+        "AICAD_BUILD_APP": "ON",
+        "AICAD_BUILD_UI_ABSTRACT": "ON"
       }
     }
   ],

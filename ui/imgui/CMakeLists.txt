@@ -15,8 +15,8 @@ if(MSVC)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 endif()
 
-# Repo root = app/..  — deps + reused host sources resolve from here.
-get_filename_component(REPO "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+# Repo root = ui/imgui/../..  — deps + reused host sources resolve from here.
+get_filename_component(REPO "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 set(HOST     "${REPO}/host")
 # Reuse host's already-fetched FetchContent sources. On Linux the build lives in
 # host/build-linux; on Windows in host/build. Fall back through candidates.
@@ -87,7 +87,8 @@ endif()
 add_executable(AI-CAD2 ${APP_SRC})
 target_include_directories(AI-CAD2 PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${HOST}                              # include host headers as "src/..." (NOT ${HOST}/src — math.h shadow)
+  ${REPO}/ui/abstract
+  ${HOST}
   ${DEPS}/json-src/single_include
   ${DEPS}/stb-src)
 target_link_libraries(AI-CAD2 PRIVATE imgui glad glfw aicad_ui_abstract)

@@ -182,7 +182,8 @@ add_library(aicad_cam STATIC
   cam/heightfield.cpp
   cam/op_3d.cpp
   cam/op_cut.cpp
-  cam/op_turn.cpp)
+  cam/op_turn.cpp
+  cam/post.cpp)
 target_include_directories(aicad_cam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_cam PUBLIC
   aicad_clipper2 aicad_miniz nlohmann_json::nlohmann_json)

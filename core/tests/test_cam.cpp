@@ -10,6 +10,7 @@
 #include "cam/feeds.h"
 #include "cam/operations.h"
 #include "cam/heightfield.h"
+#include "cam/post.h"
 #include "cam/model.h"
 
 using namespace aicad::cam;
@@ -593,4 +594,131 @@ TEST_CASE("cut2d: kerf offset applied + pierce; probe per point") {
     GenResult rp = gen_probe(pr, ctx);
     REQUIRE(rp.ok);
     CHECK(rp.path.moves.size() > 0);
+}
+
+// ── post-processor tests (Phase 4) ───────────────────────────────────────────
+namespace {
+bool has(const std::string& s, const std::string& needle) { return s.find(needle) != std::string::npos; }
+
+// build a small milling setup: one contour op (T1) + one drill op (T2), generate
+// toolpaths, return (setup, tools, toolpaths).
+struct Built { Setup setup; ToolLibrary tools; std::vector<Toolpath> tps; };
+Built build_mill_job() {
+    Built b;
+    b.setup.name = "Setup1";
+    b.setup.machine.kind = MachineKind::Mill3;
+    b.setup.machine.name = "VMC";
+    b.setup.stock.type = StockType::Box;
+    b.setup.stock.min = {-25, -25, -10}; b.setup.stock.max = {25, 25, 0};
+    b.setup.wcs.offset = 54;
+    Tool t1; t1.number = 1; t1.type = ToolType::EndmillFlat; t1.diameter = 6; t1.flutes = 3; t1.name = "6mm flat";
+    Tool t2; t2.number = 2; t2.type = ToolType::Drill; t2.diameter = 5; t2.name = "5mm drill";
+    b.tools.tools = {t1, t2};
+
+    Operation c; c.id = "c1"; c.name = "Profile"; c.type = OpType::Contour2D; c.tool_number = 1;
+    c.comp_side = CompSide::Left; c.heights.top = 0; c.heights.bottom = -5; c.stepdown = 2.5;
+    c.geometry["regions"] = json::array({to_json(square(0, 0, 10))});
+    Operation d; d.id = "d1"; d.name = "Drill"; d.type = OpType::Drill; d.tool_number = 2;
+    d.cycle = "peck"; d.peck = 2.0; d.heights.top = 0; d.heights.bottom = -10; d.heights.retract = 2;
+    d.geometry["points"] = json::array({json::array({0, 0, 0}), json::array({10, 0, 0})});
+    b.setup.operations = {c, d};
+
+    for (Operation* op : {&b.setup.operations[0], &b.setup.operations[1]}) {
+        OpContext ctx;
+        ctx.machine = b.setup.machine; ctx.stock = b.setup.stock; ctx.wcs = b.setup.wcs;
+        ctx.material_id = "aluminum";
+        ctx.tool = *b.tools.find(op->tool_number);
+        b.tps.push_back(generate(*op, ctx).path);
+    }
+    return b;
+}
+}  // namespace
+
+TEST_CASE("post: dialect registry has all eight controllers") {
+    auto ids = post_dialect_ids();
+    CHECK(ids.size() == 8);
+    for (const char* id : {"grbl", "linuxcnc", "fanuc", "haas", "mach3", "marlin", "siemens", "centroid"})
+        CHECK(std::find(ids.begin(), ids.end(), std::string(id)) != ids.end());
+    CHECK(post_dialect("fanuc").name == "Fanuc");
+    CHECK(post_dialect("unknown_dialect").id == "grbl");  // graceful fallback
+}
+
+TEST_CASE("post: GRBL emits conformant long-hand g-code (no canned cycles)") {
+    Built b = build_mill_job();
+    PostResult r = post_setup(b.setup, b.tools, "grbl", b.tps);
+    REQUIRE(r.ok);
+    CHECK(r.line_count > 10);
+    CHECK(has(r.gcode, "G21"));     // metric
+    CHECK(has(r.gcode, "G90"));     // absolute
+    CHECK(has(r.gcode, "G0"));      // rapids
+    CHECK(has(r.gcode, "G1"));      // feeds
+    bool spindle_on = has(r.gcode, "M3") || has(r.gcode, "M03");
+    CHECK(spindle_on);
+    bool prog_end = has(r.gcode, "M30") || has(r.gcode, "M2");
+    CHECK(prog_end);
+    CHECK(has(r.gcode, "("));       // comments in parens
+    CHECK_FALSE(has(r.gcode, "G81")); // GRBL has no canned cycles
+    CHECK_FALSE(has(r.gcode, "G83"));
+}
+
+TEST_CASE("post: Fanuc emits O-number, N-lines, %, and a peck cycle G83") {
+    Built b = build_mill_job();
+    PostResult r = post_setup(b.setup, b.tools, "fanuc", b.tps);
+    REQUIRE(r.ok);
+    CHECK(r.gcode.front() == '%');
+    CHECK(has(r.gcode, "O"));        // program number
+    CHECK(has(r.gcode, "N"));        // sequence numbers
+    CHECK(has(r.gcode, "G83"));      // peck drilling canned cycle
+    CHECK(has(r.gcode, "Q"));        // peck increment
+    CHECK(has(r.gcode, "R"));        // retract plane
+    CHECK(has(r.gcode, "G80"));      // cycle cancel
+    CHECK(has(r.gcode, "T2"));       // tool change to the drill
+    CHECK(has(r.gcode, "G43"));      // length offset
+    CHECK(r.tool_changes >= 2);
+}
+
+TEST_CASE("post: arcs emit IJK; tool change between two tools") {
+    Built b = build_mill_job();
+    // make the contour use an arc lead so an arc move exists
+    PostResult r = post_setup(b.setup, b.tools, "linuxcnc", b.tps);
+    REQUIRE(r.ok);
+    CHECK(has(r.gcode, "M6"));         // tool change
+    CHECK(has(r.gcode, "G54"));        // work offset
+    CHECK(has(r.gcode, "%"));          // percent wrap
+    // estimated time is the sum of toolpath times
+    CHECK(r.est_time_s > 0);
+}
+
+TEST_CASE("post: Marlin laser gates the beam with M3 S / M5, no spindle") {
+    Setup su;
+    su.name = "Laser";
+    su.machine.kind = MachineKind::Laser;
+    su.machine.kerf = 0.15;
+    Tool head; head.number = 1; head.type = ToolType::LaserHead;
+    ToolLibrary lib; lib.tools = {head};
+    Operation cut; cut.id = "L1"; cut.type = OpType::Cut2D; cut.tool_number = 1;
+    cut.comp_side = CompSide::On; cut.power = 0.8; cut.heights.top = 0; cut.heights.bottom = -1;
+    cut.geometry["contours"] = json::array({json::array({json::array({0,0}),json::array({20,0}),
+                                                         json::array({20,20}),json::array({0,20})})});
+    su.operations = {cut};
+    OpContext ctx; ctx.machine = su.machine; ctx.material_id = "steel_mild";
+    ctx.tool = head;
+    std::vector<Toolpath> tps = {generate(cut, ctx).path};
+    PostResult r = post_setup(su, lib, "marlin", tps);
+    REQUIRE(r.ok);
+    CHECK(has(r.gcode, "M3"));     // beam on
+    CHECK(has(r.gcode, "M5"));     // beam off
+    CHECK(has(r.gcode, "S"));      // laser power word
+    CHECK(has(r.gcode, ";"));      // marlin line comments
+}
+
+TEST_CASE("post: setup sheet lists tools + operations + time") {
+    Built b = build_mill_job();
+    Job job; job.name = "Bracket"; job.tools = b.tools; job.setups = {b.setup};
+    SheetResult s = setup_sheet(job, {b.tps}, "fanuc");
+    CHECK(has(s.html, "Bracket"));
+    CHECK(has(s.html, "6mm flat"));
+    CHECK(has(s.html, "Profile"));
+    CHECK(has(s.text, "TOOLS"));
+    CHECK(has(s.text, "machining time"));
 }

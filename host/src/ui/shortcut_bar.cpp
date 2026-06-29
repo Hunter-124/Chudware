@@ -55,8 +55,8 @@ void ShortcutBar::update(AppState& st, bool imgHovered, bool inSketch,
 
         const float s     = ui::uiScale;
         const int   nCmds = inSketch ? kSketchCount : kModelCount;
-        const float btnSz = 36.0f * s;
-        const float pad   = 6.0f  * s;
+        const float btnSz = 30.0f * s;
+        const float pad   = 4.0f  * s;
         float barW = nCmds * btnSz + (nCmds - 1) * pad + pad * 2.0f;
         float barH = btnSz + pad * 2.0f;
 
@@ -109,8 +109,8 @@ void ShortcutBar::draw(AppState& st, bool inSketch) {
                               ui::Palette::toU32(pal.buttonHovered), 4.0f * s);
             ImGui::SetTooltip("%s", cmds[i].tip);
         }
-        IconUV iv = ui::getIcon(cmds[i].icon, 32);
-        float iz  = 26.0f * s;
+        IconUV iv = ui::getIcon(cmds[i].icon, 24);
+        float iz  = 22.0f * s;
         float off = (btnSz - iz) * 0.5f;
         dl->AddImage(iv.texId,
                      ImVec2(bx + off, by + off),

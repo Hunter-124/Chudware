@@ -215,7 +215,7 @@ static void drawAiActivityBadge(ImVec2 vr0, ImVec2 vr1, const std::string& statu
     }
 
     ImVec2 ts = ImGui::CalcTextSize(label.c_str());
-    const float padX = 12.0f * S, padY = 6.0f * S, dotR = 4.0f * S, gap = 8.0f * S;
+    const float padX = 10.0f * S, padY = 4.0f * S, dotR = 4.0f * S, gap = 6.0f * S;
     float w = padX + dotR * 2.0f + gap + ts.x + padX;
     float h = ts.y + padY * 2.0f;
     float cx = (vr0.x + vr1.x) * 0.5f;
@@ -1708,28 +1708,17 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         ImGui::GetBackgroundDrawList()->AddImage(
             (ImTextureID)(intptr_t)renderer.resolvedColorTexture(), vr0, vr1,
             ImVec2(0, 1), ImVec2(1, 0));
-        // W2b: the dock-tab band above the content rect (the central doc-tab strip's y-range, shared
-        // by the side panes' now-transparent title bars — ImGuiCol_TitleBg* are 0) has no 3D behind it,
-        // so without this it reads as a dark strip above the translucent FeatureManager/Copilot panes.
-        // Paint the 3D texture's TOP slice into that band (full width, on the background draw list, so
-        // it sits behind the doc tabs + tab labels) so the band blends into the same full-bleed 3D as
-        // the panes. Purely additive: vr0/vr1 (the pick-exact rect) are untouched.
+        // W2b: the dock-tab band above the content rect (the central doc-tab strip's y-range). Paint
+        // a solid windowBg fill so the tab row reads as a normal opaque header with no 3D bleed or
+        // frosted-glass transparency behind the open-file tab names.
         if (ImGuiDockNode* vpNode = ImGui::GetWindowDockNode()) {
             const float bandTop = vpNode->Pos.y;
             const float bandH   = cr0.y - bandTop;
-            if (bandH > 0.5f && vh > 0) {
-                const float vFrac = bandH / (float)vh;
+            if (bandH > 0.5f) {
                 ImDrawList* bgDl = ImGui::GetBackgroundDrawList();
                 const ImVec2 bp0(mainVp->Pos.x, bandTop);
                 const ImVec2 bp1(mainVp->Pos.x + (float)vw, cr0.y);
-                bgDl->AddImage(
-                    (ImTextureID)(intptr_t)renderer.resolvedColorTexture(), bp0, bp1,
-                    ImVec2(0, 1.0f), ImVec2(1, 1.0f - (vFrac < 1.0f ? vFrac : 1.0f)));
-                // Same translucent glass fill the side panes paint (glassBg * 0.45), so the band
-                // reads as a continuation of the frosted FeatureManager/Copilot surface rather than a
-                // brighter un-glassed strip. The centre column's doc-tab strip paints over this.
-                float bandGlass[4]; ui::Palette::withAlpha(ui::palette.glassBg, bandGlass, 0.45f);
-                bgDl->AddRectFilled(bp0, bp1, ui::Palette::toU32(bandGlass));
+                bgDl->AddRectFilled(bp0, bp1, ui::Palette::toU32(ui::palette.windowBg));
             }
         }
         // Input surface: an invisible button over the visible 3D (the content rect). It carries the
@@ -2579,7 +2568,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const auto& hpal = ui::palette;
             ImDrawList* hdl = ImGui::GetWindowDrawList();
             const float s   = ui::uiScale;
-            float btn = 26.0f * s, gap = 3.0f * s, padX = 8.0f * s, padY = 4.0f * s;
+            float btn = 26.0f * s, gap = 3.0f * s, padX = 5.0f * s, padY = 2.0f * s;
 
             // 9 buttons: zoom-fit, zoom-area, pan, rotate, view-orient▾, display-style▾, hide/show▾, section
             const int nHU = 8;
@@ -2830,26 +2819,27 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             std::string lt = st.livePhase.empty() ? std::string("Working...") : st.livePhase;
             ImVec2 ts = ImGui::CalcTextSize(lt.c_str());
             float maxW = (cr1.x - cr0.x) - 58.0f;
-            ImVec2 p0(cr0.x + 12, cr0.y + 12);
-            ImVec2 p1(p0.x + (ts.x > maxW ? maxW : ts.x) + 36.0f, p0.y + ts.y + 12.0f);
+            ImVec2 p0(cr0.x + 8 * ui::uiScale, cr0.y + 8 * ui::uiScale);
+            ImVec2 p1(p0.x + (ts.x > maxW ? maxW : ts.x) + 28.0f * ui::uiScale, p0.y + ts.y + 8.0f * ui::uiScale);
             ui::glassBackground(vdl, p0, p1, (p1.y - p0.y) * 0.5f / ui::uiScale);
             float pulse = 0.35f + 0.65f * (0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 5.0f));
-            vdl->AddCircleFilled(ImVec2(p0.x + 14 * ui::uiScale, (p0.y + p1.y) * 0.5f), 4.0f * ui::uiScale,
+            vdl->AddCircleFilled(ImVec2(p0.x + 11 * ui::uiScale, (p0.y + p1.y) * 0.5f), 4.0f * ui::uiScale,
                                  ImGui::ColorConvertFloat4ToU32(
                                      ImVec4(vpal.accent[0], vpal.accent[1],
                                             vpal.accent[2], pulse)));
-            vdl->PushClipRect(p0, ImVec2(p1.x - 8 * ui::uiScale, p1.y), true);
-            vdl->AddText(ImVec2(p0.x + 24 * ui::uiScale, p0.y + 6 * ui::uiScale), overlayTxt, lt.c_str());
+            vdl->PushClipRect(p0, ImVec2(p1.x - 6 * ui::uiScale, p1.y), true);
+            vdl->AddText(ImVec2(p0.x + 19 * ui::uiScale, p0.y + 4 * ui::uiScale), overlayTxt, lt.c_str());
             vdl->PopClipRect();
         }
         if (st.hasDocMesh && !st.pickStatus.empty()) {
             // pick readout, top-right ("Face 12 of Body1")
             ImVec2 ts = ImGui::CalcTextSize(st.pickStatus.c_str());
-            ImVec2 p1(cr1.x - 12, cr0.y + 12);
-            ImVec2 p0(p1.x - ts.x - 20.0f, p1.y);
-            ImVec2 p1b(p1.x, p1.y + ts.y + 10.0f);
-            ui::glassBackground(vdl, p0, p1b, 6.0f);
-            vdl->AddText(ImVec2(p0.x + 10 * ui::uiScale, p0.y + 5 * ui::uiScale), overlayTxt,
+            const float s2 = ui::uiScale;
+            ImVec2 p1(cr1.x - 8 * s2, cr0.y + 8 * s2);
+            ImVec2 p0(p1.x - ts.x - 14.0f * s2, p1.y);
+            ImVec2 p1b(p1.x, p1.y + ts.y + 8.0f * s2);
+            ui::glassBackground(vdl, p0, p1b, 5.0f);
+            vdl->AddText(ImVec2(p0.x + 7 * s2, p0.y + 4 * s2), overlayTxt,
                          st.pickStatus.c_str());
         }
 

@@ -220,15 +220,71 @@ inline bool modelSupportsVision(int provider, const std::string& id) {
     return provider != PROV_LLAMACPP;  // local default vision-on unless managed llama.cpp
 }
 
-// The reasoning-effort levels exposed in the UI, in config string form.
+// Per-model default context window when settings.contextWindow == 0 (auto).
+inline int defaultContextWindowForModel(int provider, const std::string& id) {
+    std::string m = id;
+    for (char& c : m) c = (char)std::tolower((unsigned char)c);
+    auto has = [&](const char* sub) -> bool {
+        if (sub == nullptr || !*sub) return false;
+        std::string s = sub;
+        for (char& c : s) c = (char)std::tolower((unsigned char)c);
+        return m.find(s) != std::string::npos;
+    };
+    if (has("1.5-pro")) return 2097152;
+    if (has("1.5-flash") || has("2.0") || has("2.5") || has("flash") || has("gemini"))
+        return 1048576;
+    if (has("claude") || has("opus") || has("sonnet")) return 200000;
+    if (has("gpt-4.1")) return 1047576;
+    if (has("o1") || has("o3") || has("o4") || has("reasoner") || has("r1")) return 200000;
+    if (has("gpt-4o") || has("gpt-4-turbo") || has("4o-mini")) return 128000;
+    if (has("gpt-3.5")) return 16385;
+    if (has("qwen3-max") || has("qwen3-vl")) return 131072;
+    if (has("qwen") || has("deepseek")) return 128000;
+    switch (provider) {
+        case PROV_GEMINI: return 1048576;
+        case PROV_ANTHROPIC: return 200000;
+        case PROV_OPENAI:
+        case PROV_CLOUDCOMPAT: return 128000;
+        default: return 8192;
+    }
+}
+
+// Reasoning-effort levels for the active model. Returns count; writes labels/values arrays.
+inline int reasoningEffortOptions(int provider, const std::string& id,
+                                  const char** outLabels, const char** outValues, int maxN) {
+    if (!modelSupportsReasoning(provider, id)) return 0;
+    struct Opt { const char* label; const char* value; };
+    static const Opt kGemini[] = {{"Off", "off"}, {"Low", "low"}, {"Medium", "medium"},
+                                  {"High", "high"}, {"Max", "max"}};
+    static const Opt kAnthropic[] = {{"Low", "low"}, {"Medium", "medium"}, {"High", "high"}};
+    static const Opt kGeneric[] = {{"Off", "off"}, {"Low", "low"}, {"Medium", "medium"},
+                                   {"High", "high"}};
+    std::string m = id;
+    for (char& c : m) c = (char)std::tolower((unsigned char)c);
+    const Opt* src = kGeneric;
+    int n = 4;
+    if (provider == PROV_GEMINI || m.find("gemini") != std::string::npos) {
+        src = kGemini; n = 5;
+    } else if (provider == PROV_ANTHROPIC || m.find("claude") != std::string::npos) {
+        src = kAnthropic; n = 3;
+    }
+    int out = n < maxN ? n : maxN;
+    for (int i = 0; i < out; ++i) {
+        outLabels[i] = src[i].label;
+        outValues[i] = src[i].value;
+    }
+    return out;
+}
+
+// Legacy flat list (Settings modal fallback).
 inline const char* const* reasoningEffortValues(int* n) {
-    static const char* kVals[] = {"off", "low", "medium", "high"};
-    if (n) *n = 4;
+    static const char* kVals[] = {"off", "low", "medium", "high", "max"};
+    if (n) *n = 5;
     return kVals;
 }
 inline const char* const* reasoningEffortLabels(int* n) {
-    static const char* kLabels[] = {"Off", "Low", "Medium", "High"};
-    if (n) *n = 4;
+    static const char* kLabels[] = {"Off", "Low", "Medium", "High", "Max"};
+    if (n) *n = 5;
     return kLabels;
 }
 inline int reasoningEffortToIndex(const std::string& v) {

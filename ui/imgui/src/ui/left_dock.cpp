@@ -48,6 +48,9 @@ static void drawNode(AppState& s, TreeNode& n, int depth) {
     float indent = 8*S + depth * 16*S;
     ImVec2 p = ImGui::GetCursorScreenPos();
     bool sel = (s.selectedFeature == n.name && depth > 0);
+    float availW = ImGui::GetContentRegionAvail().x;
+    ImVec2 rowMax(p.x + availW, p.y + rowH);
+    theme::glassRowBackground(ImGui::GetWindowDrawList(), p, rowMax, 3.5f*S, depth % 2 == 0, sel);
 
     if (ImGui::Selectable("##row", sel, ImGuiSelectableFlags_SpanAllColumns, ImVec2(0, rowH))) {
         float mx = ImGui::GetIO().MousePos.x - p.x;
@@ -73,6 +76,10 @@ static void drawNode(AppState& s, TreeNode& n, int depth) {
 
 void drawLeftDock(AppState& s) {
     const float S = theme::S();
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    float h = ImGui::GetContentRegionAvail().y;
+    theme::glassPanelBackground(ImGui::GetWindowDrawList(), p0,
+                                ImVec2(p0.x + ImGui::GetContentRegionAvail().x, p0.y + h));
     ImGui::PushFont(theme::font(theme::Font::H2));
     const char* titles[] = {"Model Tree", "Bodies", "Files", "Configurations"};
     ImGui::TextColored(TVEC(txt1), "%s", titles[s.railTab]);

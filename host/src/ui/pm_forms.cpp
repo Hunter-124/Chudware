@@ -682,7 +682,7 @@ static const std::vector<PMFormDef>& forms() {
         }},
         // --- surf_planar --- refs.profile[]; no params. A planar surface filling a
         //   closed sketch contour or bounded by closed edges.
-        { "surf_planar", "Planar Surface", "plane", {
+        { "surf_planar", "Planar Surface", "ref_plane", {
             Well ("profile", "Bounding Entities", "Planar Surface", K_FACE, true),
         }},
         // --- surf_offset --- refs.faces[]; params distance.

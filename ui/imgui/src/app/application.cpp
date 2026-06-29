@@ -110,9 +110,9 @@ void Application::frame() {
 
     ImGui::End();   // ##root
 
-    // --- docked panels ---
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, TVEC(bg1));
-    ImGuiWindowFlags pflags = ImGuiWindowFlags_NoCollapse;
+    // --- docked panels (translucent glass) ---
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0,0,0,0));
+    ImGuiWindowFlags pflags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground;
     if (ImGui::Begin("Browser###left", nullptr, pflags)) {
         if (!s.activeTool.empty()) ui::drawInspector(s);
         ui::drawLeftDock(s);

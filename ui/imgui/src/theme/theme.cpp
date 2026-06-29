@@ -132,4 +132,34 @@ void apply() {
     s.ScaleAllSizes(g.scale);   // exactly once (style guide §1)
 }
 
+void glassPanelBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float alpha) {
+    const float s = S();
+    const Palette& p = g.pal;
+    auto A = [&](unsigned int col, float mul) {
+        ImVec4 v = vec(col);
+        v.w *= mul * alpha;
+        return ImGui::ColorConvertFloat4ToU32(v);
+    };
+    dl->AddRectFilled(mn, mx, A(p.bg2, 0.55f), 0.f);
+    dl->AddRect(mn, mx, A(p.line, 0.35f), 0.f, 0, 1.f * s);
+}
+
+void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, bool stripe,
+                        bool selected) {
+    const float s = S();
+    const float inset = 2.f * s;
+    ImVec2 a(mn.x + inset, mn.y + inset), b(mx.x - inset, mx.y - inset);
+    ImVec4 wash = vec(pal().bg2); wash.w = 0.22f;
+    dl->AddRectFilled(a, b, ImGui::ColorConvertFloat4ToU32(wash), rounding * s);
+    if (stripe) {
+        ImVec4 st = ImVec4(1,1,1,0.04f);
+        dl->AddRectFilled(a, b, ImGui::ColorConvertFloat4ToU32(st), rounding * s);
+    }
+    if (selected) {
+        ImVec4 sel = vec(pal().accentDim); sel.w = 0.55f;
+        dl->AddRectFilled(a, b, ImGui::ColorConvertFloat4ToU32(sel), rounding * s);
+        dl->AddRect(a, b, TCOL(accent), rounding * s, 0, 1.f * s);
+    }
+}
+
 } // namespace theme

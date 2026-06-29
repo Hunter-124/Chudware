@@ -500,6 +500,8 @@ static void newConversation(AppState& st);
 static void switchConversation(AppState& st, int idx);
 static void closeConversation(AppState& st, int idx);
 static void submitTurn(AppState& st, const std::string& text);
+static bool aiTurnActive(AppState& st);
+static bool activeConversationRunning(AppState& st);
 
 // ============================ W3-H: unified AI Copilot pane ============================
 // One pane, top-down: header -> input -> mode pills -> conversation (with inline live run
@@ -784,40 +786,7 @@ static std::string fmtTokens(int n) {
 // The active model's total context window (mirrors core default_context_window for the meter).
 static int effectiveContextWindow(const Settings& s) {
     if (s.contextWindow > 0) return s.contextWindow;
-    // Model-aware: case-insensitive substring match on the wire model name.
-    auto hasSub = [&](const char* sub) -> bool {
-        const char* m = s.model;
-        if (!m || !*m || !sub || !*sub) return false;
-        const size_t mlen = std::strlen(m), slen = std::strlen(sub);
-        if (slen > mlen) return false;
-        for (size_t i = 0; i + slen <= mlen; ++i) {
-            bool ok = true;
-            for (size_t j = 0; j < slen; ++j)
-                if (std::tolower((unsigned char)m[i+j]) != std::tolower((unsigned char)sub[j]))
-                    { ok = false; break; }
-            if (ok) return true;
-        }
-        return false;
-    };
-    // Gemini (more-specific "1.5-pro" before generic "pro")
-    if (hasSub("1.5-pro"))                                              return 2097152;
-    if (hasSub("1.5-flash") || hasSub("2.0") || hasSub("2.5") ||
-        hasSub("flash")     || hasSub("pro"))                           return 1048576;
-    // Anthropic
-    if (hasSub("claude"))                                               return 200000;
-    // OpenAI
-    if (hasSub("gpt-4.1"))                                             return 1047576;
-    if (hasSub("o1") || hasSub("o3") || hasSub("o4"))                  return 200000;
-    if (hasSub("gpt-4o") || hasSub("gpt-4-turbo") || hasSub("4o-mini")) return 128000;
-    if (hasSub("gpt-3.5"))                                             return 16385;
-    // Fall back to per-provider default.
-    switch (s.provider) {
-        case ui::PROV_GEMINI:      return 1048576;
-        case ui::PROV_ANTHROPIC:   return 200000;
-        case ui::PROV_OPENAI:
-        case ui::PROV_CLOUDCOMPAT: return 128000;
-        default: return 8192;  // local / unknown
-    }
+    return ui::defaultContextWindowForModel(s.provider, s.model[0] ? s.model : "");
 }
 // ============================ typed-block agent timeline ============================
 // The orchestrator event stream (feedTurnActivity -> ChatMsg::activity) is rendered as the
@@ -1128,13 +1097,10 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     }
 }
 
-// ---- header: logo + "AI-CAD Copilot" + right cluster ([New chat] [Chats ▾] + status dot) ----
+// ---- header: logo + "AI-CAD Copilot" + Sessions + status dot ----
 static void drawCopilotHeader(AppState& st, bool busy) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
-    // NOTE: do NOT ensureConversations() here — drawAIPanel calls syncChatToDoc() first, which
-    // adopts the seeded/persisted chat. Forcing a conversation earlier flips that load into its
-    // "fresh chat" branch and wipes the active turn.
 
     if (st.logoIcon.id) {
         float h = ImGui::GetTextLineHeight();
@@ -1145,86 +1111,151 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     ImGui::TextUnformatted("AI-CAD Copilot");
     ImGui::PopFont();
 
-    // ---- right cluster ----
     const ImGuiStyle& style = ImGui::GetStyle();
     const float lh = ImGui::GetTextLineHeight();
-    float newW   = ImGui::CalcTextSize("New chat").x + style.FramePadding.x * 2.0f;
-    float chatsW = ImGui::CalcTextSize("Chats").x + style.FramePadding.x * 2.0f;
-    float cluster = newW + style.ItemSpacing.x + chatsW + style.ItemSpacing.x + lh;
+    float sessW = ImGui::CalcTextSize("Sessions").x + style.FramePadding.x * 2.0f;
+    float cluster = sessW + style.ItemSpacing.x + lh;
     ImGui::SameLine();
     float xRight = ImGui::GetContentRegionMax().x - cluster;
     if (xRight > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(xRight);
 
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::SmallButton("New chat")) { newConversation(st); st.prompt[0] = 0; }
+    if (ImGui::SmallButton("Sessions")) st.showSessionsPicker = !st.showSessionsPicker;
     if (busy) ImGui::EndDisabled();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a new conversation (past chats are kept).");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show or hide the session list — switch chats out of order.");
 
-    ImGui::SameLine();
-    bool openChats = ImGui::SmallButton("Chats");
-    // The "Chats" button sits near the panel's right edge, so a popup anchored there grows off the
-    // right of the window (hiding the trashcan column). Capture the button's bottom-right and pin
-    // the popup's top-RIGHT corner to it so it opens leftward, fully on-screen.
-    ImVec2 chatsAnchor = ImGui::GetItemRectMax();
-    if (openChats) ImGui::OpenPopup("##chatspopup");
-
-    // Render one chat row: a width-bounded Selectable (so long titles clip instead of overflowing)
-    // plus a right-aligned trashcan delete button. Returns true if the chat was deleted, in which
-    // case the caller must stop iterating (st.conversations changed).
-    auto chatRow = [&](int i) -> bool {
-        std::string title = st.conversations[i].title.empty()
-                                ? ("Chat " + std::to_string(i + 1)) : st.conversations[i].title;
-        ImGui::PushID(i);
-        float trashW = ImGui::GetFrameHeight();
-        float rowW = ImGui::GetContentRegionAvail().x;
-        if (ImGui::Selectable(title.c_str(), i == st.activeConv,
-                              ImGuiSelectableFlags_DontClosePopups,
-                              ImVec2(rowW - trashW - 4 * sc, 0)) &&
-            !busy)
-            switchConversation(st, i);
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - trashW);
-        IconUV trash = ui::getIcon("delete", 20);
-        bool del;
-        if (trash.valid) {
-            ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(0, 0, 0, 0));  // frameless icon
-            del = ImGui::ImageButton("##delconv", trash.texId,
-                                     ImVec2(trashW - 8 * sc, trashW - 8 * sc),
-                                     trash.uv0, trash.uv1);
-            ImGui::PopStyleColor();
-        } else {
-            del = ImGui::SmallButton("x");
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete this chat");
-        bool deleted = del && !busy;
-        if (deleted) closeConversation(st, i);
-        ImGui::PopID();
-        return deleted;
-    };
-
-    // Pin the popup width. BeginPopup forces ImGuiWindowFlags_AlwaysAutoResize, which IGNORES
-    // SetNextWindowSize — so the popup would auto-size to its "fill available" content and balloon
-    // to viewport width. SizeConstraints ARE honored under auto-resize: clamp the width (height
-    // auto). Anchoring the top-RIGHT to the button then keeps it on-screen, growing leftward.
-    ImGui::SetNextWindowPos(chatsAnchor, ImGuiCond_Appearing, ImVec2(1.0f, 0.0f));  // grow left
-    ImGui::SetNextWindowSizeConstraints(ImVec2(248 * sc, 0), ImVec2(248 * sc, FLT_MAX));
-    if (ImGui::BeginPopup("##chatspopup")) {
-        for (int i = 0; i < (int)st.conversations.size(); ++i) if (chatRow(i)) break;
-        ImGui::Separator();
-        if (ImGui::Selectable("+ New chat") && !busy) newConversation(st);
-        ImGui::EndPopup();
-    }
-
-    // status dot (drawn — the ● glyph is not in the body font), accent=running / red=error / dim=idle
     ImGui::SameLine();
     const float* dot = pal.accentMid;  const char* tip = "Idle";
     if (st.statusKind == 2) { dot = pal.statusErr; tip = "Error"; }
-    else if (busy || st.agentV2Running) { dot = pal.accent; tip = "Running"; }
+    else if (busy || st.agentV2Running || activeConversationRunning(st)) {
+        dot = pal.accent; tip = "Running";
+    }
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 cp = ImGui::GetCursorScreenPos();
     dl->AddCircleFilled(ImVec2(cp.x + lh * 0.5f, cp.y + lh * 0.5f), lh * 0.30f,
                         ImGui::ColorConvertFloat4ToU32(ImVec4(dot[0], dot[1], dot[2], dot[3])));
     ImGui::Dummy(ImVec2(lh, lh));
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+}
+
+// Sessions list — replaces the chat log while open so users can jump between sessions easily.
+static void drawSessionsPanel(AppState& st, bool busy) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    ensureConversations(st);
+
+    if (ImGui::Button("+ New session") && !busy) { newConversation(st); st.prompt[0] = 0; }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a fresh conversation.");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Back to chat")) st.showSessionsPicker = false;
+
+    ImGui::Separator();
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+    ImGui::TextUnformatted("Switch sessions — running ones keep working in the background.");
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 4 * sc));
+
+    for (int i = 0; i < (int)st.conversations.size(); ++i) {
+        Conversation& c = st.conversations[i];
+        std::string title = c.title.empty() ? ("Chat " + std::to_string(i + 1)) : c.title;
+        const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : c.msgs;
+        bool running = false;
+        for (auto it = msgs.rbegin(); it != msgs.rend(); ++it)
+            if (!it->fromUser && it->running) { running = true; break; }
+        if (i == st.activeConv && aiTurnActive(st)) running = true;
+        bool active = (i == st.activeConv);
+        ImGui::PushID(i);
+        float trashW = ImGui::GetFrameHeight();
+        float rowW = ImGui::GetContentRegionAvail().x;
+        std::string label = title;
+        if (running) label += "  \xe2\x80\xa2 running";
+        if (ImGui::Selectable(label.c_str(), active, 0,
+                              ImVec2(rowW - trashW - 4 * sc, 0)) && !busy)
+            switchConversation(st, i);
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - trashW);
+        IconUV trash = ui::getIcon("delete", 20);
+        bool del = trash.valid
+            ? ImGui::ImageButton("##delconv", trash.texId,
+                                 ImVec2(trashW - 8 * sc, trashW - 8 * sc), trash.uv0, trash.uv1)
+            : ImGui::SmallButton("x");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete this session");
+        if (del && !busy) { closeConversation(st, i); ImGui::PopID(); break; }
+        ImGui::PopID();
+    }
+}
+
+// Agent mode + permissions + thinking effort — above the chat log (context-meter row).
+static void drawCopilotTopBar(AppState& st, bool busy) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const bool hasDoc = st.docMirror.hasDoc();
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 3 * sc));
+    ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.button));
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+
+    const char* modes[] = {"Design", "Edit", "Ask"};
+    int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 2) ? st.aiInteraction : 0;
+    if (ImGui::SmallButton(modes[mode])) ImGui::OpenPopup("##topmode");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Agent mode — what the AI does with your message.");
+    if (ImGui::BeginPopup("##topmode")) {
+        if (ImGui::Selectable("Design  — model a new part from a description", mode == 0))
+            st.aiInteraction = 0;
+        if (!hasDoc) ImGui::BeginDisabled();
+        if (ImGui::Selectable("Edit  — change the open part", mode == 1)) st.aiInteraction = 1;
+        if (!hasDoc) ImGui::EndDisabled();
+        if (ImGui::Selectable("Ask  — questions about the part, no changes", mode == 2))
+            st.aiInteraction = 2;
+        ImGui::EndPopup();
+    }
+
+    ImGui::SameLine();
+    const char* permLabel = st.settings.offlineMode ? "Permissions: Offline" : "Permissions";
+    if (ImGui::SmallButton(permLabel)) ImGui::OpenPopup("##topperm");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Privacy and run permissions for the copilot.");
+    if (ImGui::BeginPopup("##topperm")) {
+        bool off = st.settings.offlineMode;
+        if (ImGui::Checkbox("Offline mode (local models only — ITAR-safe)", &off))
+            st.settings.offlineMode = off;
+        bool sup = st.settings.planMode;
+        if (ImGui::Checkbox("Supervised (plan + clarify before modeling)", &sup))
+            st.settings.planMode = sup;
+        ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
+        ImGui::EndPopup();
+    }
+
+    ImGui::SameLine();
+    Settings& s = st.settings;
+    const char* effLabels[8] = {};
+    const char* effValues[8] = {};
+    int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8);
+    if (nEff > 0) {
+        int effIdx = 0;
+        for (int i = 0; i < nEff; ++i)
+            if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
+        char effBtn[48];
+        std::snprintf(effBtn, sizeof(effBtn), "Thinking: %s", effLabels[effIdx]);
+        if (ImGui::SmallButton(effBtn)) ImGui::OpenPopup("##topeffort");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Thinking effort for the selected model.");
+        if (ImGui::BeginPopup("##topeffort")) {
+            for (int i = 0; i < nEff; ++i) {
+                if (ImGui::Selectable(effLabels[i], effIdx == i))
+                    std::strncpy(s.reasoningEffort, effValues[i], sizeof(s.reasoningEffort) - 1);
+            }
+            ImGui::EndPopup();
+        }
+    } else {
+        ImGui::BeginDisabled();
+        ImGui::SmallButton("Thinking: n/a");
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The selected model does not expose a thinking-effort control.");
+    }
+
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar();
 }
 
 // ============================ conversation tabs + persistence ============================
@@ -1355,12 +1386,17 @@ static void loadChatHistoryForKey(AppState& st, const std::string& key) {
         if (act < 0 || act >= (int)st.conversations.size()) act = 0;
         st.activeConv = act;
         st.chat = std::move(st.conversations[act].msgs);
+        st.lastContextTokens = st.conversations[act].lastContextTokens;
+        st.queuedPrompts = std::move(st.conversations[act].queuedPrompts);
         st.conversations[act].msgs.clear();
+        st.conversations[act].queuedPrompts.clear();
     } else if (st.conversations.empty() && st.activeConv < 0) {
         ensureConversations(st);  // first init: adopt current st.chat (welcome) as conversation 1
     } else {
         freeChatTextures(st.chat);  // switching to a different doc with no history: fresh chat
         st.chat.clear();
+        st.lastContextTokens = 0;
+        st.queuedPrompts.clear();
         st.conversations.clear();
         st.activeConv = -1;
         ensureConversations(st);
@@ -1376,46 +1412,91 @@ static void syncChatToDoc(AppState& st) {
     st.chatDocKey = key;
 }
 
+static void parkActiveConversation(AppState& st) {
+    if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return;
+    Conversation& c = st.conversations[st.activeConv];
+    c.msgs = std::move(st.chat);
+    c.lastContextTokens = st.lastContextTokens;
+    c.queuedPrompts = std::move(st.queuedPrompts);
+    st.chat.clear();
+    st.lastContextTokens = 0;
+    st.queuedPrompts.clear();
+}
+
+static void restoreActiveConversation(AppState& st) {
+    if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return;
+    Conversation& c = st.conversations[st.activeConv];
+    st.chat = std::move(c.msgs);
+    st.lastContextTokens = c.lastContextTokens;
+    st.queuedPrompts = std::move(c.queuedPrompts);
+    c.msgs.clear();
+    c.queuedPrompts.clear();
+}
+
+static bool conversationRunning(const Conversation& c) {
+    for (auto it = c.msgs.rbegin(); it != c.msgs.rend(); ++it)
+        if (!it->fromUser && it->running) return true;
+    return false;
+}
+
+static bool activeConversationRunning(AppState& st) {
+    if (aiTurnActive(st)) return true;
+    if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size())
+        return conversationRunning(st.conversations[st.activeConv]);
+    return false;
+}
+
 static void newConversation(AppState& st) {
     ensureConversations(st);
-    st.conversations[st.activeConv].msgs = std::move(st.chat);
-    st.chat.clear();
+    parkActiveConversation(st);
     Conversation c;
     c.id = newConvId(st);
     c.title = "Chat " + std::to_string((int)st.conversations.size() + 1);
     st.conversations.push_back(std::move(c));
     st.activeConv = (int)st.conversations.size() - 1;
+    st.showSessionsPicker = false;
     persistChatHistory(st);
 }
 
 static void switchConversation(AppState& st, int idx) {
     if (idx == st.activeConv || idx < 0 || idx >= (int)st.conversations.size()) return;
-    st.conversations[st.activeConv].msgs = std::move(st.chat);
-    st.chat = std::move(st.conversations[idx].msgs);
-    st.conversations[idx].msgs.clear();
+    parkActiveConversation(st);
     st.activeConv = idx;
+    restoreActiveConversation(st);
+    st.showSessionsPicker = false;
+    persistChatHistory(st);
 }
 
 static void closeConversation(AppState& st, int idx) {
     if (idx < 0 || idx >= (int)st.conversations.size()) return;
     bool closingActive = (idx == st.activeConv);
-    if (closingActive) { freeChatTextures(st.chat); st.chat.clear(); }
-    else { freeChatTextures(st.conversations[idx].msgs); }
+    if (closingActive) {
+        freeChatTextures(st.chat);
+        st.chat.clear();
+        st.lastContextTokens = 0;
+        st.queuedPrompts.clear();
+    } else {
+        freeChatTextures(st.conversations[idx].msgs);
+    }
     st.conversations.erase(st.conversations.begin() + idx);
-    if (st.conversations.empty()) { st.activeConv = -1; ensureConversations(st); persistChatHistory(st); return; }
+    if (st.conversations.empty()) {
+        st.activeConv = -1;
+        ensureConversations(st);
+        restoreActiveConversation(st);
+        persistChatHistory(st);
+        return;
+    }
     if (closingActive) {
         int na = std::min(idx, (int)st.conversations.size() - 1);
-        st.chat = std::move(st.conversations[na].msgs);
-        st.conversations[na].msgs.clear();
         st.activeConv = na;
+        restoreActiveConversation(st);
     } else if (idx < st.activeConv) {
         st.activeConv--;
     }
     persistChatHistory(st);
 }
 
-// (The horizontal conversation-tab strip was removed in the copilot overhaul — conversations are
-//  now switched from the header's "Chats" dropdown; New chat lives in the header + composer.)
+// (Conversations are switched from the Sessions picker in the Copilot header.)
 
 // Probe the local OpenAI-compatible endpoint for its loaded models + reachability, so the
 // picker can hide local models that are down. Throttled to ~5s; force bypasses the throttle.
@@ -1702,20 +1783,25 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
     }
 
     // ---- reasoning effort (only for reasoning-capable models) ----
-    if (ui::modelSupportsReasoning(s.provider, s.model)) {
-        ImGui::Dummy(ImVec2(0, 4 * S));
-        ImGui::TextUnformatted("Reasoning effort");
-        int nEff = 0; auto effVals = ui::reasoningEffortValues(&nEff);
-        auto effLabels = ui::reasoningEffortLabels(nullptr);
-        int eff = ui::reasoningEffortToIndex(s.reasoningEffort);
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::Combo("##effort", &eff, effLabels, nEff)) {
-            std::strncpy(s.reasoningEffort, effVals[eff], sizeof(s.reasoningEffort) - 1);
-            changed = true;
+    {
+        const char* effLabels[8] = {};
+        const char* effValues[8] = {};
+        int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8);
+        if (nEff > 0) {
+            ImGui::Dummy(ImVec2(0, 4 * S));
+            ImGui::TextUnformatted("Reasoning effort");
+            int effIdx = 0;
+            for (int i = 0; i < nEff; ++i)
+                if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::Combo("##effort", &effIdx, effLabels, nEff)) {
+                std::strncpy(s.reasoningEffort, effValues[effIdx], sizeof(s.reasoningEffort) - 1);
+                changed = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How much hidden reasoning the model spends before answering.\n"
+                                  "Higher = better planning on hard parts, slower + more tokens.");
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("How much hidden reasoning the model spends before answering.\n"
-                              "Higher = better planning on hard parts, slower + more tokens.");
     }
 
     // ---- max response tokens (per model call) ----
@@ -2032,7 +2118,7 @@ void drawAISettingsTab(AppState& st, bool busy) {
         ImVec2 sp1(sp0.x + ssz.x, sp0.y + ssz.y);
         ImDrawList* wdl = ImGui::GetWindowDrawList();
         wdl->AddRectFilled(sp0, sp1, ui::Palette::toU32(ui::palette.windowBg));
-        ui::glassBackground(wdl, sp0, sp1, 0.0f, 0.55f);
+        ui::glassBackground(wdl, sp0, sp1, 0.0f, 0.38f);
     }
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##aisetbody", ImVec2(0, 0), ImGuiChildFlags_None);
@@ -2643,64 +2729,9 @@ static void composerModelLabel(const Settings& s, char* out, size_t n) {
     std::snprintf(out, n, "%s \xc2\xb7 %s", prov, s.model[0] ? s.model : "default");
 }
 
-// ---- footer chips under the composer: provider · mode · autopilot (SolidWorks-clean pills) ----
+// ---- footer chips under the composer (removed — mode/permissions live in drawCopilotTopBar) ----
 static void drawComposerChips(AppState& st, bool busy) {
-    const auto& pal = ui::palette;
-    const float sc = ui::uiScale;
-    const bool hasDoc = st.docMirror.hasDoc();
-    ImGui::Dummy(ImVec2(0, 3 * sc));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 3 * sc));
-    ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.button));
-    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-
-    // provider / connection chip — opens the model picker
-    const char* provNames[] = {"Anthropic", "OpenAI", "Local", "llama.cpp", "Gemini", "Cloud API"};
-    int pv = (st.settings.provider >= 0 && st.settings.provider < ui::PROV_COUNT)
-                 ? st.settings.provider : ui::PROV_GEMINI;
-    bool isLocal = (pv == ui::PROV_LOCAL || pv == ui::PROV_LLAMACPP);
-    if (ImGui::SmallButton(isLocal ? "Local" : provNames[pv])) ImGui::OpenPopup("##chipmodel");
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(isLocal ? "Running on a local model — click to search/switch models."
-                                  : "Cloud provider — click to search/switch models.");
-    ImGui::SetNextWindowSizeConstraints(ImVec2(300 * sc, 0), ImVec2(300 * sc, FLT_MAX));
-    if (ImGui::BeginPopup("##chipmodel")) { drawModelDropdown(st, busy); ImGui::EndPopup(); }
-
-    // mode chip — Design / Edit / Ask
-    ImGui::SameLine();
-    const char* modes[] = {"Design", "Edit", "Ask"};
-    int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 2) ? st.aiInteraction : 0;
-    if (ImGui::SmallButton(modes[mode])) ImGui::OpenPopup("##chipmode");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("What the AI does with your message.");
-    if (ImGui::BeginPopup("##chipmode")) {
-        if (ImGui::Selectable("Design  — model a new part from a description", mode == 0))
-            st.aiInteraction = 0;
-        if (!hasDoc) ImGui::BeginDisabled();
-        if (ImGui::Selectable("Edit  — change the open part", mode == 1)) st.aiInteraction = 1;
-        if (!hasDoc) ImGui::EndDisabled();
-        if (!hasDoc) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDisabled));
-            ImGui::TextUnformatted("   (open a part to edit)");
-            ImGui::PopStyleColor();
-        }
-        if (ImGui::Selectable("Ask  — questions about the part, no changes", mode == 2))
-            st.aiInteraction = 2;
-        ImGui::EndPopup();
-    }
-
-    // run-mode chip — Supervised / Autopilot (our real plan/clarify behavior)
-    ImGui::SameLine();
-    if (ImGui::SmallButton(st.settings.planMode ? "Supervised" : "Autopilot"))
-        ImGui::OpenPopup("##runmode");
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Whether the AI plans and asks before modeling.");
-    if (ImGui::BeginPopup("##runmode")) { drawRunModeMenu(st); ImGui::EndPopup(); }
-
-    // (The context meter that used to right-align on this footer row was moved UP to its own line just
-    // above the composer box — see drawContextMeter() and its call in drawAIPanel. On this bottom row
-    // it sat on the pane's very bottom edge jammed against the status bar, the "too low" report.)
-
-    ImGui::PopStyleColor(2);
-    ImGui::PopStyleVar();
+    (void)st; (void)busy;
 }
 
 // Context-window meter for the composer toolbar row: a small fill-bar + "N/M" readout (compact
@@ -2860,16 +2891,12 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
                                      ui::metrics::copilotInputMaxLines());
     ImGui::PopStyleColor();
 
-    // ---- inline toolbar row ----
+    // inline toolbar row — model chip + settings + send (canonical model picker)
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 2 * sc);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * sc, 3 * sc));
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));   // ghost buttons
 
-    // + new chat
-    if (ImGui::Button("+")) { newConversation(st); st.prompt[0] = 0; }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("New chat");
-
-    // model chip
+    // model chip (single canonical picker)
     ImGui::SameLine();
     char modelLabel[160];
     composerModelLabel(st.settings, modelLabel, sizeof(modelLabel));
@@ -2990,7 +3017,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         ImVec2 gp1(gp0.x + gsz.x, gp0.y + gsz.y);
         ImDrawList* wdl = ImGui::GetWindowDrawList();
         wdl->AddRectFilled(gp0, gp1, ui::Palette::toU32(ui::palette.windowBg));
-        ui::glassBackground(wdl, gp0, gp1, 0.0f, 0.55f);
+        ui::glassBackground(wdl, gp0, gp1, 0.0f, 0.38f);
     }
 
     // Remember which dock node we live in so the sibling "Settings" tab can dock next to us.
@@ -3003,6 +3030,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
 
     drawCopilotHeader(st, busy);
     ImGui::Separator();
+    drawCopilotTopBar(st, busy);
     drawRuntimeBanner(st);
 
     // Reserve the composer's height (measured last frame) so the conversation log fills the rest.
@@ -3012,24 +3040,27 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     float chatH = ImGui::GetContentRegionAvail().y - reserve;
     if (chatH < ui::metrics::px(120.0f)) chatH = ui::metrics::px(120.0f);
 
-    // ---- conversation log (transparent — the cards carry their own backgrounds) ----
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_None);
-    const float logW = ImGui::GetContentRegionAvail().x;
-
-    for (size_t mi = 0; mi < st.chat.size(); ++mi) {
-        ChatMsg& m = st.chat[mi];
-        ImGui::PushID((int)mi);
-        if (m.fromUser) {
-            drawUserBlock(m, fonts, logW);
+    if (st.showSessionsPicker) {
+        drawSessionsPanel(st, busy);
+    } else {
+        const float logW = ImGui::GetContentRegionAvail().x;
+        for (size_t mi = 0; mi < st.chat.size(); ++mi) {
+            ChatMsg& m = st.chat[mi];
+            ImGui::PushID((int)mi);
+            if (m.fromUser) {
+                drawUserBlock(m, fonts, logW);
+                ImGui::PopID();
+                continue;
+            }
+            drawAssistantTurn(st, m, fonts, logW);
+            ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));
             ImGui::PopID();
-            continue;
         }
-        drawAssistantTurn(st, m, fonts, logW);
-        ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));
-        ImGui::PopID();
+        if (!st.showSessionsPicker && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12)
+            ImGui::SetScrollHereY(1.0f);
     }
-    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12) ImGui::SetScrollHereY(1.0f);
     ImGui::EndChild();
     ImGui::PopStyleColor();
 

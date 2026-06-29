@@ -384,14 +384,15 @@ def draw_csys(d, cell, p):
 
 @icon("origin")
 def draw_origin(d, cell, p):
-    """Small sphere at crossing of 3 axes."""
+    """Part origin: short RGB axis stubs meeting at a highlighted dot."""
     s = cell * SS
     lw = stroke_width(cell)
     cx, cy = s/2, s/2
-    # simplified: crosshair + circle
-    circle(d, cx, cy, s*0.12, outline=p.accent, lw=lw)
-    d.line([(s*0.12, cy), (s*0.88, cy)], fill=p.stroke, width=lw)
-    d.line([(cx, s*0.12), (cx, s*0.88)], fill=p.stroke, width=lw)
+    stub = s * 0.22
+    arrow(d, cx, cy, cx + stub, cy, p.err, lw)           # +X
+    arrow(d, cx, cy, cx, cy - stub, p.ok, lw)            # +Y
+    arrow(d, cx, cy, cx - stub * 0.7, cy + stub * 0.7, p.accent, lw)  # +Z
+    filled_circle(d, cx, cy, s * 0.07, p.accent)
 
 @icon("equations")
 def draw_equations(d, cell, p):
@@ -810,12 +811,14 @@ def draw_mirror(d, cell, p):
 
 @icon("ref_plane")
 def draw_ref_plane(d, cell, p):
-    """Translucent parallelogram (reference plane)."""
+    """Translucent datum plane (distinct from plane's normal-arrow glyph)."""
     s = cell * SS
     lw = stroke_width(cell)
     pts = [(s*0.1, s*0.60), (s*0.45, s*0.22), (s*0.9, s*0.36), (s*0.55, s*0.74)]
-    d.polygon(pts, fill=None, outline=p.accent)
+    d.polygon(pts, fill=_rgba(p.accent, 35), outline=p.accent)
     d.line([pts[0], pts[1], pts[2], pts[3], pts[0]], fill=p.accent, width=lw)
+    # corner origin tick — reads as a construction datum at small sizes
+    filled_circle(d, pts[0][0], pts[0][1], max(2, lw), p.stroke)
 
 @icon("ref_axis")
 def draw_ref_axis(d, cell, p):

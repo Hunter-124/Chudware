@@ -241,6 +241,12 @@ void popGlassWindowStyle();
 void pushGlassChildStyle(float rounding = 8.0f);
 void popGlassChildStyle();
 
+// Subtle frosted pill behind a single text/icon row (FeatureManager, Copilot blocks). Keeps the
+// panel itself maximally transparent while preserving row readability. `stripe` adds a faint
+// alternating tint; `selected` draws a restrained accent card.
+void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 4.0f,
+                        bool stripe = false, bool selected = false);
+
 // The active palette — read-only from panels.
 extern Palette palette;
 

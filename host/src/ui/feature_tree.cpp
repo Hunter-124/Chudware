@@ -31,6 +31,7 @@
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
+#include "../ui_theme.h"
 #include "../render/id_pass.h"
 #include "../renderer.h"   // C34: clearViewportForNewDoc resets meshes
 
@@ -1092,7 +1093,7 @@ static const char* featureIcon(const std::string& type, const nlohmann::json* fe
     if (type == "surf_revolve")     return "revolve_boss";
     if (type == "surf_sweep")       return "sweep";
     if (type == "surf_loft")        return "loft";
-    if (type == "surf_planar")      return "plane";
+    if (type == "surf_planar")      return "ref_plane";
     if (type == "surf_offset")      return "offset_ent";
     if (type == "surf_boundary")    return "boundary";
     if (type == "surf_fill")        return "boundary";
@@ -2058,121 +2059,105 @@ void drawFeatureTreeBody(AppState& st,
                     }
                 }
             }
-            // Section rule: reference geometry (planes / origin) follows.
+            // Section rule: reference geometry (Origin + planes) follows.
             treeSectionDivider("Reference");
 
-            // Reference planes — click to show/hide in the viewport; the clicked plane is
-            // emphasized (brighter) and the others dim (focus-follows-selection).
-            static const char* kPlanes[] = {"Front Plane", "Top Plane", "Right Plane"};
-            // A body-less part auto-shows all three planes until the user takes control of plane
-            // visibility (eye / row click). Taking control bakes that auto-shown state into showPlane
-            // so hiding ONE plane doesn't blank the other two. The eye/glyph track EFFECTIVE
-            // visibility (what the viewport shows), not raw showPlane.
-            bool planesAutoShow = !st.hasDocMesh && st.docMirror.hasDoc() && !st.planesUserToggled;
-            auto takePlaneControl = [&st, planesAutoShow]() {
-                if (st.planesUserToggled) return;
-                if (planesAutoShow)
-                    st.showPlane[0] = st.showPlane[1] = st.showPlane[2] = true;
-                st.planesUserToggled = true;
-            };
-            for (int pi = 0; pi < 3; ++pi) {
-                ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_Leaf |
-                                       ImGuiTreeNodeFlags_NoTreePushOnOpen |
-                                       ImGuiTreeNodeFlags_SpanFullWidth;
-                if (st.planeEmphasis == pi) f |= ImGuiTreeNodeFlags_Selected;
-                bool planeShownEff = st.showPlane[pi] || planesAutoShow;
-                bool hidden = !planeShownEff;
-                treeIcon("plane", "[P]", 16.0f);
-                ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
-                if (hidden)
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                        ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.55f));
-                ImGui::TreeNodeEx((std::string(kPlanes[pi]) + "##plane" + std::to_string(pi)).c_str(), f);
-                if (hidden) ImGui::PopStyleColor();
-                // Per-row eye (show/hide this origin plane), matching the feature rows. A click on the
-                // eye toggles visibility WITHOUT changing the selection; the rest of the row keeps its
-                // select / plane-pick behavior.
-                ImVec2 pNodeMin = ImGui::GetItemRectMin();
-                ImVec2 pNodeMax = ImGui::GetItemRectMax();
-                float  pEyeSz = 14.0f * ui::uiScale, pEyePad = 6.0f * ui::uiScale;
-                ImVec2 pEyeMin(pNodeMax.x - pEyeSz - pEyePad,
-                               pNodeMin.y + (pNodeMax.y - pNodeMin.y - pEyeSz) * 0.5f);
-                ImVec2 pEyeMax(pEyeMin.x + pEyeSz, pEyeMin.y + pEyeSz);
-                bool   pOverEye = ImGui::IsMouseHoveringRect(pEyeMin, pEyeMax);
-                {
-                    ImDrawList* pdl = ImGui::GetWindowDrawList();
-                    IconUV iv = getIcon("hide_show_eye", 20);
-                    float a = !hidden ? (pOverEye ? 1.0f : 0.70f) : (pOverEye ? 0.55f : 0.28f);
-                    ImU32 tint = IM_COL32(255, 255, 255, (int)(a * 255.0f + 0.5f));
-                    if (iv.valid) {
-                        pdl->AddImage(iv.texId, pEyeMin, pEyeMax, iv.uv0, iv.uv1, tint);
-                        if (hidden)
-                            pdl->AddLine(ImVec2(pEyeMin.x, pEyeMax.y), ImVec2(pEyeMax.x, pEyeMin.y),
-                                         ImGui::ColorConvertFloat4ToU32(ImVec4(pal.textDim[0],
-                                             pal.textDim[1], pal.textDim[2], 0.9f)),
-                                         std::max(1.0f, 1.5f * ui::uiScale));
-                    } else {
-                        pdl->AddText(pEyeMin, tint, hidden ? "-" : "o");
-                    }
-                    if (pOverEye) {
-                        ImGui::SetTooltip(hidden ? "Show %s" : "Hide %s", kPlanes[pi]);
-                        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                            static const char* kPlaneEyeId[] = {"plane.front","plane.top","plane.right"};
-                            takePlaneControl();          // bake auto-shown state, then toggle this one
-                            st.showPlane[pi] = hidden;   // was hidden -> turn on; was shown -> turn off
-                            if (!st.showPlane[pi]) {
-                                if (st.planeEmphasis == pi) st.planeEmphasis = -1;
-                                if (st.selectedFeatureId == kPlaneEyeId[pi]) st.selectedFeatureId.clear();
-                            }
-                        }
-                    }
-                }
-                if (!pOverEye && ImGui::IsItemClicked()) {
-                    if (st.sketchPlanePickActive && st.sketchMode) {
-                        // Plane-pick in progress: clicking a plane in the tree picks it (SolidWorks
-                        // behavior) instead of toggling visibility. consumePlanePick routes to a NEW
-                        // sketch or an Edit-Sketch-Plane reparent depending on the armed mode.
-                        static const char* kPlaneSel[] = {"plane.front", "plane.top", "plane.right"};
-                        st.sketchPlanePickActive = false;
-                        st.sketchMode->consumePlanePick(st, kPlaneSel[pi]);
-                    } else if (st.sketchMode && st.sketchMode->smartDimPicking()) {
-                        // Smart Dimension armed in a sketch: a tree plane click references that
-                        // datum plane (projected into the sketch) instead of toggling visibility.
-                        st.sketchMode->addPlaneDimRef(st, pi);
-                    } else {
-                        // Plain click selects the plane (SolidWorks: select a plane, then Sketch /
-                        // run a plane-well feature) and shows it. Re-clicking the already-selected
-                        // plane hides + deselects it, preserving the old show/hide toggle.
-                        static const char* kPlaneSelId[] = {"plane.front", "plane.top", "plane.right"};
-                        takePlaneControl();
-                        bool wasSel = (st.selectedFeatureId == kPlaneSelId[pi]);
-                        if (wasSel && planeShownEff) {
-                            st.showPlane[pi] = false;
-                            st.planeEmphasis = -1;
-                            st.selectedFeatureId.clear();
-                        } else {
-                            st.showPlane[pi] = true;
-                            st.planeEmphasis = pi;
-                            st.selection.clear();
-                            st.selectedFeatureId = kPlaneSelId[pi];
-                        }
-                    }
-                }
-                if (ImGui::IsItemHovered() && !pOverEye)
-                    ImGui::SetTooltip(st.sketchPlanePickActive ? "Sketch on %s"
-                                      : ((st.sketchMode && st.sketchMode->smartDimPicking())
-                                             ? "Dimension to %s"
-                                             : (hidden ? "Show %s" : "Hide %s")), kPlanes[pi]);
-            }
-
-            // Origin
+            // Origin — expandable; the three default planes nest underneath (no duplicate flat list).
             {
-                ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_Leaf |
-                                       ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_DefaultOpen |
                                        ImGuiTreeNodeFlags_SpanFullWidth;
                 treeIcon("origin", "[O]", 16.0f);
-                ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
-                ImGui::TreeNodeEx("Origin##origin", f);
+                ImGui::SameLine(0, 4 * ui::uiScale);
+                bool originOpen = ImGui::TreeNodeEx("Origin##origin", f);
+                if (originOpen) {
+                    static const char* kPlanes[] = {"Front Plane", "Top Plane", "Right Plane"};
+                    bool planesAutoShow = !st.hasDocMesh && st.docMirror.hasDoc() && !st.planesUserToggled;
+                    auto takePlaneControl = [&st, planesAutoShow]() {
+                        if (st.planesUserToggled) return;
+                        if (planesAutoShow)
+                            st.showPlane[0] = st.showPlane[1] = st.showPlane[2] = true;
+                        st.planesUserToggled = true;
+                    };
+                    for (int pi = 0; pi < 3; ++pi) {
+                        ImGuiTreeNodeFlags pf = ImGuiTreeNodeFlags_Leaf |
+                                                ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                                                ImGuiTreeNodeFlags_SpanFullWidth;
+                        if (st.planeEmphasis == pi) pf |= ImGuiTreeNodeFlags_Selected;
+                        bool planeShownEff = st.showPlane[pi] || planesAutoShow;
+                        bool hidden = !planeShownEff;
+                        treeIcon("ref_plane", "[P]", 16.0f, hidden ? 0.45f : 1.0f);
+                        ImGui::SameLine(0, 4 * ui::uiScale);
+                        if (hidden)
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.55f));
+                        ImGui::TreeNodeEx((std::string(kPlanes[pi]) + "##plane" + std::to_string(pi)).c_str(), pf);
+                        if (hidden) ImGui::PopStyleColor();
+                        ImVec2 pNodeMin = ImGui::GetItemRectMin();
+                        ImVec2 pNodeMax = ImGui::GetItemRectMax();
+                        float  pEyeSz = 14.0f * ui::uiScale, pEyePad = 6.0f * ui::uiScale;
+                        ImVec2 pEyeMin(pNodeMax.x - pEyeSz - pEyePad,
+                                       pNodeMin.y + (pNodeMax.y - pNodeMin.y - pEyeSz) * 0.5f);
+                        ImVec2 pEyeMax(pEyeMin.x + pEyeSz, pEyeMin.y + pEyeSz);
+                        bool   pOverEye = ImGui::IsMouseHoveringRect(pEyeMin, pEyeMax);
+                        {
+                            ImDrawList* pdl = ImGui::GetWindowDrawList();
+                            IconUV iv = getIcon("hide_show_eye", 20);
+                            float a = !hidden ? (pOverEye ? 1.0f : 0.70f) : (pOverEye ? 0.55f : 0.28f);
+                            ImU32 tint = IM_COL32(255, 255, 255, (int)(a * 255.0f + 0.5f));
+                            if (iv.valid) {
+                                pdl->AddImage(iv.texId, pEyeMin, pEyeMax, iv.uv0, iv.uv1, tint);
+                                if (hidden)
+                                    pdl->AddLine(ImVec2(pEyeMin.x, pEyeMax.y), ImVec2(pEyeMax.x, pEyeMin.y),
+                                                 ImGui::ColorConvertFloat4ToU32(ImVec4(pal.textDim[0],
+                                                     pal.textDim[1], pal.textDim[2], 0.9f)),
+                                                 std::max(1.0f, 1.5f * ui::uiScale));
+                            } else {
+                                pdl->AddText(pEyeMin, tint, hidden ? "-" : "o");
+                            }
+                            if (pOverEye) {
+                                ImGui::SetTooltip(hidden ? "Show %s" : "Hide %s", kPlanes[pi]);
+                                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                                    static const char* kPlaneEyeId[] = {"plane.front","plane.top","plane.right"};
+                                    takePlaneControl();
+                                    st.showPlane[pi] = hidden;
+                                    if (!st.showPlane[pi]) {
+                                        if (st.planeEmphasis == pi) st.planeEmphasis = -1;
+                                        if (st.selectedFeatureId == kPlaneEyeId[pi]) st.selectedFeatureId.clear();
+                                    }
+                                }
+                            }
+                        }
+                        if (!pOverEye && ImGui::IsItemClicked()) {
+                            if (st.sketchPlanePickActive && st.sketchMode) {
+                                static const char* kPlaneSel[] = {"plane.front", "plane.top", "plane.right"};
+                                st.sketchPlanePickActive = false;
+                                st.sketchMode->consumePlanePick(st, kPlaneSel[pi]);
+                            } else if (st.sketchMode && st.sketchMode->smartDimPicking()) {
+                                st.sketchMode->addPlaneDimRef(st, pi);
+                            } else {
+                                static const char* kPlaneSelId[] = {"plane.front", "plane.top", "plane.right"};
+                                takePlaneControl();
+                                bool wasSel = (st.selectedFeatureId == kPlaneSelId[pi]);
+                                if (wasSel && planeShownEff) {
+                                    st.showPlane[pi] = false;
+                                    st.planeEmphasis = -1;
+                                    st.selectedFeatureId.clear();
+                                } else {
+                                    st.showPlane[pi] = true;
+                                    st.planeEmphasis = pi;
+                                    st.selection.clear();
+                                    st.selectedFeatureId = kPlaneSelId[pi];
+                                }
+                            }
+                        }
+                        if (ImGui::IsItemHovered() && !pOverEye)
+                            ImGui::SetTooltip(st.sketchPlanePickActive ? "Sketch on %s"
+                                              : ((st.sketchMode && st.sketchMode->smartDimPicking())
+                                                     ? "Dimension to %s"
+                                                     : (hidden ? "Show %s" : "Hide %s")), kPlanes[pi]);
+                    }
+                    ImGui::TreePop();
+                }
             }
 
             treeSectionDivider("Features");
@@ -2365,18 +2350,8 @@ void drawFeatureTreeBody(AppState& st,
                         const float rowH = ImGui::GetTextLineHeight() + 10.0f * S;
                         ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
                         ImDrawList* rowDl = ImGui::GetWindowDrawList();
-                        // Readable-surface pill: semi-opaque dark backing on every row so white
-                        // text/icons stay legible against whatever 3D content shows through the
-                        // transparent glass panel. Alternating rows get a faint white tint as a
-                        // stripe. The 2px inset gap lets the glass bleed through between rows.
-                        {
-                            const float pr = 3.5f * S;
-                            ImVec2 pillMin(rowMin.x + 2.0f * S, rowMin.y + 2.0f * S);
-                            ImVec2 pillMax(rowMax.x - 2.0f * S, rowMax.y - 2.0f * S);
-                            rowDl->AddRectFilled(pillMin, pillMax, IM_COL32(8, 12, 20, 110), pr);
-                            if (rowIdx % 2 == 0)
-                                rowDl->AddRectFilled(pillMin, pillMax, IM_COL32(255, 255, 255, 12), pr);
-                        }
+                        // Readable row pill via shared glass helper (panel stays transparent).
+                        ui::glassRowBackground(rowDl, rowMin, rowMax, 3.5f, rowIdx % 2 == 0, sel);
                         // Category color strip: ~3px vertical bar on the far-left edge.
                         // Colored by feature group (sketch/solid-add/solid-cut/dress-up/pattern/
                         // datum/sheet-metal/weldment/surface) so each family is instantly scannable.
@@ -2398,20 +2373,7 @@ void drawFeatureTreeBody(AppState& st,
                                          (int)(pal.statusWarn[1] * 255),
                                          (int)(pal.statusWarn[2] * 255), 8));
                         if (sel) {
-                            ImVec2 cardMin(rowMin.x + 2.0f * S, rowMin.y + 1.0f * S);
-                            ImVec2 cardMax(rowMax.x - 3.0f * S, rowMax.y - 1.0f * S);
-                            ImVec4 fill(pal.accentSoft[0], pal.accentSoft[1],
-                                        pal.accentSoft[2], 0.52f);
-                            rowDl->AddRectFilled(cardMin, cardMax,
-                                                 ImGui::ColorConvertFloat4ToU32(fill),
-                                                 4.0f * S);
-                            rowDl->AddRect(cardMin, cardMax,
-                                           Palette::toU32(pal.accentMid), 4.0f * S, 0,
-                                           std::max(1.0f, 1.0f * S));
-                            rowDl->AddRectFilled(ImVec2(cardMin.x, cardMin.y + 3.0f * S),
-                                                 ImVec2(cardMin.x + 4.0f * S,
-                                                        cardMax.y - 3.0f * S),
-                                                 Palette::toU32(pal.accent), 2.0f * S);
+                            // selection card drawn by glassRowBackground(selected=true)
                             if (selectedFeatureId == fid && st.treeScrollToSelection) {
                                 ImGui::SetScrollHereY(0.5f);
                                 st.treeScrollToSelection = false;

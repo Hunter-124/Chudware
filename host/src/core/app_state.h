@@ -422,6 +422,8 @@ struct Conversation {
     std::string id;
     std::string title;             // shown on the tab; defaults to "Chat N", renamed to 1st prompt
     std::vector<ChatMsg> msgs;      // populated only while INACTIVE (active lives in AppState::chat)
+    int lastContextTokens = 0;     // per-session context meter (input tokens from last model call)
+    std::vector<std::string> queuedPrompts;  // queued while this session's turn was active
 };
 
 // A progress event streamed from the worker (parsed off the worker thread, applied on the
@@ -949,6 +951,7 @@ struct AppState {
     bool focusSettingsTab = false; // one-shot: focus the AI pane's Settings tab
     // Consolidated AI panel (Design / Activity / Console as internal tabs). One dock window "AI".
     bool showAIPanel = true;
+    bool showSessionsPicker = false;  // Copilot: hide chat log, show the Sessions list/dropdown
     unsigned int aiDockId = 0;   // dock node the "AI" window lives in — so the sibling "Settings"
                                  // tab can dock next to it even on a saved layout (ImGuiID).
     // Design Table panel (SolidWorks Design Table). Dockable "Design Table" window in the right

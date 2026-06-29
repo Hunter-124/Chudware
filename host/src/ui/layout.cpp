@@ -247,7 +247,7 @@ void drawLeftPane(AppState& st,
         ImVec2 p1(p0.x + sz.x, p0.y + sz.y);
         ImDrawList* wdl = ImGui::GetWindowDrawList();
         wdl->AddRectFilled(p0, p1, ui::Palette::toU32(ui::palette.windowBg));
-        ui::glassBackground(wdl, p0, p1, 0.0f, 0.55f);
+        ui::glassBackground(wdl, p0, p1, 0.0f, 0.38f);
     }
 
     const auto& pal = ui::palette;

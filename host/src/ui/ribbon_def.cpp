@@ -308,7 +308,7 @@ static const RibbonCmd kCmds[] = {
     { "surf_revolve",       "Revolved Surf.", "revolve_boss",    "Surfaces", "Create", true,  nullptr, false },
     { "surf_sweep",         "Swept Surf.",    "sweep",           "Surfaces", "Create", true,  nullptr, false },
     { "surf_loft",          "Lofted Surf.",   "loft",            "Surfaces", "Create", true,  nullptr, false },
-    { "surf_planar",        "Planar Surf.",   "plane",           "Surfaces", "Create", true,  nullptr, false },
+    { "surf_planar",        "Planar Surf.",   "ref_plane",       "Surfaces", "Create", true,  nullptr, false },
 
     // --- Group: Curves & Patches --- derived surfaces from faces / edges / curves.
     { "surf_offset",        "Offset Surf.",   "offset_ent",      "Surfaces", "Curves & Patches", true,  nullptr, false },

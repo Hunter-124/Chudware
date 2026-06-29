@@ -473,6 +473,34 @@ void popGlassChildStyle() {
     ImGui::PopStyleColor(2);
 }
 
+void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, bool stripe,
+                        bool selected) {
+    const Palette& p = palette;
+    const float s = uiScale;
+    const float r = rounding * s;
+    auto A = [&](const float c[4], float mul) -> uint32_t {
+        float t[4]; Palette::withAlpha(c, t, mul); return Palette::toU32(t);
+    };
+    const float inset = 2.0f * s;
+    ImVec2 pillMin(mn.x + inset, mn.y + inset);
+    ImVec2 pillMax(mx.x - inset, mx.y - inset);
+    // Very light row wash — much more transparent than a full glass panel.
+    float wash[4]; Palette::withAlpha(p.glassBg, wash, 0.22f);
+    dl->AddRectFilled(pillMin, pillMax, Palette::toU32(wash), r);
+    if (stripe) {
+        float stripeCol[4]; Palette::withAlpha(p.glassHighlight, stripeCol, 0.35f);
+        dl->AddRectFilled(pillMin, pillMax, Palette::toU32(stripeCol), r);
+    }
+    if (selected) {
+        ImVec4 fill(p.accentSoft[0], p.accentSoft[1], p.accentSoft[2], 0.48f);
+        dl->AddRectFilled(pillMin, pillMax, ImGui::ColorConvertFloat4ToU32(fill), r);
+        dl->AddRect(pillMin, pillMax, Palette::toU32(p.accentMid), r, 0, std::max(1.0f, 1.0f * s));
+        dl->AddRectFilled(ImVec2(pillMin.x, pillMin.y + 3.0f * s),
+                          ImVec2(pillMin.x + 4.0f * s, pillMax.y - 3.0f * s),
+                          Palette::toU32(p.accent), 2.0f * s);
+    }
+}
+
 // =========================================================================
 // Font loading (unchanged)
 // =========================================================================

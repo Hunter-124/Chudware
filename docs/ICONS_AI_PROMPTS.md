@@ -2,6 +2,8 @@
 
 Ready-to-use image-generation prompts for **all 189** AI-CAD icons, so you can regenerate the full icon set with Gemini / Imagen. AI-CAD is a professional **parametric CAD program** (OpenCASCADE B-rep kernel, desktop engineering app); every prompt is written with that context so the model renders recognizable CAD geometry.
 
+> **Production path today:** `python host/assets/make_icons.py` draws all 189 icons procedurally (Pillow) into `atlas_dark.png` / `atlas_light.png` / `atlas.json`. The prompts below are for optional AI PNG replacement via `host/assets/pack_icons.py` once `host/assets/icons/src/<name>.png` sources exist. Until then, tweak draw functions in `make_icons.py` and re-run it.
+
 ## How to generate
 
 1. **Model:** `gemini-3.1-flash-image` (the current Gemini Flash image model) or `imagen-4.0-generate-001`. The free-tier key shipped in the repo has **no image quota** (Gemini image -> HTTP 429; Imagen -> "paid plans only"), so use a key with image generation enabled.

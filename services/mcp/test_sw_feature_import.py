@@ -97,7 +97,7 @@ def _T(p):
 # Authored fixtures (engine.doc.sw_fixture_author writes them) — one per feature concept. Each is
 # validated by comparing the engine's reconstructed volume AND center-of-mass to SolidWorks' own.
 _FIXTURE_DIR = os.environ.get(
-    "AI_CAD_SW_FIXTURES", r"C:\Users\nigga\Desktop\AI-opencad\test_fixtures_sw")
+    "AI_CAD_SW_FIXTURES", os.path.join(os.path.dirname(__file__), "..", "..", "corpora", "sw_fixtures"))
 _FIXTURES = [
     "asym_top.SLDPRT", "asym_front.SLDPRT", "asym_right.SLDPRT", "extrude_front_40x30x20.SLDPRT",
     "revolve_ring.SLDPRT", "fillet_box.SLDPRT", "chamfer_box.SLDPRT", "shell_box.SLDPRT",

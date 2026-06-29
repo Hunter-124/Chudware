@@ -25,18 +25,20 @@ physically lives today. "→ moves" marks dirs slated to move per the plan.
 | `core/` | Pure C++/CUDA kernel → `libaicad` (the zero-Python engine target): geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. | Stays `core/`. |
 | `host/` | Legacy C++ ImGui desktop host: `src/ui/*` (panels/editors), `src/render/*` (GL viewport), `src/core/*` (app_state/doc_mirror/worker_client). **End-of-life** — migrated into `app/` + `ui/` + `services/worker/`, then deleted (N4b). | → `app/` + `ui/` + `services/worker/`; deleted N4b. |
 | `app/` | New ImGui desktop GUI rewrite (`src/ui/*`, `src/platform/*`). The first concrete backend over the future `ui/abstract` view-model seam. | → `ui/imgui/` (+ `platform/`). |
-| `engine/` | Legacy Python engine — the parity oracle, kept frozen while `core/` catches up subsystem-by-subsystem. Deleted LAST (N6b). | → `engine-oracle/`; deleted N6b. |
-| `agent/` | Built-in agent loop (Python now → C++ later) driving the Copilot panel. | → `services/agent/`. |
-| `mcp_server/` | MCP server exposing CAD tools to external agents. | → `services/mcp/`. |
-| `installer/` | Provisioning, MCP registration, packaging. | → `services/installer/`. |
-| `docs/` | Design docs, status notes, parity specs, contracts (contracts move out in N0c). | Stays `docs/` (contracts promoted out). |
-| `contracts/` | Frozen interface contracts — THE seams (promoted from `docs/contracts/` in N0c). Append-only, integrator-owned. | New in N0c. |
+| `engine_oracle/` | Python parity oracle (frozen while `core/` catches up). Root `engine` symlink preserves imports. Deleted LAST (N6b). | Deleted N6b. |
+| `services/agent/` | Built-in agent loop (Python now → C++ later). Root `agent` symlink. | C++ at N5e. |
+| `services/mcp/` | MCP server for external agents. Root `mcp_server` symlink. | C++ at N5e. |
+| `services/installer/` | Provisioning, MCP registration, packaging. Root `installer` symlink. | Stays until N6. |
+| `services/worker/` | Engine routing seam (scaffold; lands N4a from `host/src/core/*`). | N4a. |
+| `ui/abstract/` | Framework-agnostic UI seam (view-model, commands, panel specs). **No ImGui.** | P2. |
+| `ui/imgui/` | ImGui concrete backend (scaffold; `app/` lands here P3). | P3. |
+| `ui/viewport/` | Shared OpenGL viewport pipeline (scaffold; `host/src/render/*` lands N2c). | N2c/P3. |
+| `platform/` | Cross-OS shims (scaffold; `app/src/platform/*` lands P3). | P3. |
+| `corpora/` | Consolidated test fixtures (`sketch/`, `render/`, `sw_parity/`, `sw_fixtures/`). Root symlinks preserve legacy paths. | Done (N1d). |
+| `docs/` | Design docs, status notes, parity specs. | Stays `docs/`. |
+| `contracts/` | Frozen interface contracts — THE seams. Append-only, integrator-owned. | Done (N0c). |
 | `tools/` | One-off dev/analysis tools. | Stays. |
-| `scripts/` | Repo gates + audits: `check.py` (stdlib gate), `gui_lint.py`, `feature_surface_audit.py`, `parity_audit.py`, `gate.sh` (Linux gate, N0d). | Stays. |
-| `corpus/` | Canonical input corpus for parity/screenshot tests. | → `corpora/`. |
-| `corpus_render/` | Render-output corpus (headless screenshots). | → `corpora/`. |
-| `corpus_sw_parity/` | Software-parity corpus (SW vs engine vs libaicad). | → `corpora/`. |
-| `test_fixtures_sw/` | SW test fixtures. | → `corpora/`. |
+| `scripts/` | Repo gates + audits: `check.py`, `gate.sh`, etc. | Stays. |
 | `third_party/` | Vendored third-party deps. | Stays. |
 | `scratch/` | Throwaway scratch area. | Stays (non-blocking). |
 

@@ -29,6 +29,7 @@
 #include <regex>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -479,6 +480,285 @@ extern "C" {
 AICAD_API const char* aicad_abi_version(void) { return "1"; }
 
 AICAD_API void aicad_free(char* s) { std::free(s); }
+
+// ---- CAM program recipe (deterministic, request-aware, no LLM) ------------------
+// Build a complete CAM machining JOB from the CURRENT PART and post it to G-code,
+// reusing the exact cam_* engine the GUI and MCP drive. This is the offline "make me a
+// CNC program" path for the in-app copilot — the manufacturing analogue of the W17
+// drawing fast-path. It mines the free-text request for the machining STRATEGY (which
+// operations, which post dialect, which material) and tailors the op set + tooling to
+// it, falling back to a sensible face+contour+drill recipe when nothing specific is
+// asked. It does NOT invent CAM logic; it orchestrates the existing RPCs. Returns a
+// {ok, ...} envelope with the job tree, op summary, sim, and gcode. Never throws.
+static json cam_program_from_part(const std::string& part_doc_id, const json& options) {
+    if (part_doc_id.empty()) return json{{"ok", false}, {"error", "no active part"}};
+
+    // --- mine the request ----------------------------------------------------------
+    std::string req = jstr(options, "request");
+    std::string lc; lc.reserve(req.size());
+    for (char c : req) lc += (char)std::tolower((unsigned char)c);
+    auto has = [&](const char* w) { return lc.find(w) != std::string::npos; };
+
+    std::string dialect = jstr(options, "post");
+    if (dialect.empty()) {
+        for (const char* d : {"linuxcnc", "fanuc", "haas", "mach3", "marlin", "siemens",
+                              "centroid", "grbl"})
+            if (has(d)) { dialect = d; break; }
+    }
+    if (dialect.empty() && has("tormach")) dialect = "centroid";
+    if (dialect.empty()) dialect = "grbl";
+
+    std::string material = jstr(options, "material");
+    if (material.empty()) {
+        for (const char* mt : {"aluminium", "aluminum", "stainless", "steel", "brass",
+                               "titanium", "copper", "acrylic", "abs", "mdf", "wood"})
+            if (has(mt)) { material = mt; break; }
+    }
+    if (material == "aluminium") material = "aluminum";
+    if (material.empty()) material = "aluminum";
+
+    // --- strategy + which operations the request asks for --------------------------
+    const bool turning = has("lathe") || has("turning") || has("turn down") || has("turn it") ||
+                         has(" turn ") || has("turned") || has("part off") || has("parting");
+    bool wFace    = has("face") || has("facing") || has("skim") || has("flatten");
+    bool wContour = has("contour") || has("profile") || has("outline") || has("perimeter") ||
+                    has("cut out") || has("cutout") || has("cut it out");
+    bool wPocket  = has("pocket") || has("cavity") || has("hollow");
+    bool wAdaptive= has("adaptive") || has("rough") || has("hsm") || has("clear out") ||
+                    has("clearing") || has("bulk");
+    bool wSlot    = has("slot");
+    bool wEngrave = has("engrave") || has("etch") || has("mark ") || has("engraving");
+    bool wChamfer = has("chamfer") || has("deburr") || has("break edge") || has("bevel");
+    bool wDrill   = has("drill") || has("bore") || has("hole") || has("peck") || has("tap ");
+    bool w3d      = has("3d") || has("3-d") || has("parallel") || has("scallop") ||
+                    has("waterline") || has("surface finish") || has("finish pass") ||
+                    has("contour finish") || has("ball");
+    // No specific verb anywhere -> the default general-purpose recipe.
+    const bool anyReq = turning || wFace || wContour || wPocket || wAdaptive || wSlot ||
+                        wEngrave || wChamfer || wDrill || w3d;
+    if (!anyReq) { wFace = true; wContour = true; wDrill = true; }
+
+    // --- export the part to a temp STEP, then extract what the chosen ops need ------
+    std::error_code ec;
+    std::filesystem::path step =
+        std::filesystem::temp_directory_path(ec) / ("aicad_cam_" + part_doc_id + ".step");
+    try {
+        aicad::doc::doc_export_step(part_doc_id, step.string());
+    } catch (const std::exception& e) {
+        return json{{"ok", false}, {"error", std::string("export failed: ") + e.what()}};
+    }
+    auto extract = [&](const char* kind, double z, bool useZ) -> json {
+        json p = {{"path", step.string()}, {"kind", kind}, {"deflection", 0.1}};
+        if (useZ) p["z"] = z;
+        try { return aicad::cam::cam_extract(p); } catch (...) { return json::object(); }
+    };
+
+    json ex = extract("all", 0, false);
+    if (ex.is_null() || ex.empty())
+        return json{{"ok", false}, {"error", "extract failed (OCCT geometry unavailable)"}};
+    json boxSrc;
+    if (ex.contains("stock") && ex["stock"].contains("box")) boxSrc = ex["stock"]["box"];
+    else if (ex.contains("bbox")) boxSrc = ex["bbox"];
+    if (!boxSrc.is_object() || !boxSrc.contains("min") || !boxSrc.contains("max") ||
+        !boxSrc["min"].is_array() || boxSrc["min"].size() < 3)
+        return json{{"ok", false}, {"error", "could not determine stock from part"}};
+    json stockBox = json{{"type", "box"}, {"min", boxSrc["min"]}, {"max", boxSrc["max"]}};
+    const double zmin = boxSrc["min"][2].get<double>(), zmax = boxSrc["max"][2].get<double>();
+    const double xspan = boxSrc["max"][0].get<double>() - boxSrc["min"][0].get<double>();
+    const double yspan = boxSrc["max"][1].get<double>() - boxSrc["min"][1].get<double>();
+    const double clearance = zmax + 15.0, retract = zmax + 5.0;
+
+    // planar section regions (2.5D ops), drill points, mesh (3D), turning profile — lazily.
+    json regions, holePoints = json::array(), mesh, profile;
+    auto needRegions = [&]() -> bool {
+        if (regions.is_null()) { json s = extract("section", 0.5 * (zmin + zmax), true);
+            regions = s.contains("regions") ? s["regions"] : json::array(); }
+        return regions.is_array() && !regions.empty();
+    };
+    if (wDrill) { json h = extract("holes", 0, false);
+        if (h.contains("points") && h["points"].is_array()) holePoints = h["points"]; }
+    const bool hasHoles = !holePoints.empty();
+    if (w3d) { json m = extract("mesh", 0, false); if (m.contains("mesh")) mesh = m["mesh"]; }
+    if (turning) { json pr = extract("profile", 0, false);
+        if (pr.contains("profile")) profile = pr["profile"]; }
+
+    // --- create the job ------------------------------------------------------------
+    std::string partName;
+    try {
+        json t = aicad::doc::doc_tree(part_doc_id);
+        if (t.contains("tree")) partName = t["tree"].value("name", std::string());
+    } catch (...) {}
+    if (partName.empty()) partName = "Part";
+    std::string cam_id;
+    try {
+        json nj = aicad::cam::cam_new(json{{"name", partName + " CAM"}, {"post", dialect}});
+        cam_id = nj.value("doc_id", std::string());
+    } catch (const std::exception& e) {
+        return json{{"ok", false}, {"error", std::string("cam_new: ") + e.what()}};
+    }
+    if (cam_id.empty()) return json{{"ok", false}, {"error", "cam_new returned no doc_id"}};
+
+    // --- tool registry: add a tool of each kind on demand, sized to the part --------
+    const double minspan = (xspan > 0 && yspan > 0) ? std::min(xspan, yspan) : 60.0;
+    const double flatDia = minspan >= 60 ? 10.0 : (minspan < 20 ? 3.0 : 6.0);
+    const double ballDia = minspan >= 60 ? 6.0 : 3.0;
+    int nextTool = 1;
+    json toolBatch = json::array();
+    std::map<std::string, int> toolNo;
+    auto tool = [&](const std::string& type, double dia) -> int {
+        auto it = toolNo.find(type);
+        if (it != toolNo.end()) return it->second;
+        int n = nextTool++;
+        json t = {{"number", n}, {"type", type}, {"diameter", dia}, {"flutes", 3}};
+        std::string nm = std::to_string((int)dia) + "mm " + type;
+        if (type == "endmill_flat") nm = std::to_string((int)dia) + "mm flat endmill";
+        else if (type == "endmill_ball") { nm = std::to_string((int)dia) + "mm ball endmill"; t["flutes"] = 2; }
+        else if (type == "drill") { nm = std::to_string((int)dia) + "mm drill"; t["flutes"] = 2; }
+        else if (type == "chamfer_mill") { nm = "chamfer mill"; t["tip_angle"] = 90.0; }
+        else if (type == "vbit") { nm = "60deg V-bit"; t["tip_angle"] = 60.0; t["flutes"] = 1; }
+        else if (type == "turning_general") nm = "turning tool";
+        else if (type == "parting_tool") nm = "parting tool";
+        t["name"] = nm;
+        toolBatch.push_back(json{{"op", "add_tool"}, {"tool", t}});
+        toolNo[type] = n;
+        return n;
+    };
+
+    // --- plan the operations FIRST (machining order: rough -> 2.5D -> finish -> holes). Each op's
+    //     tool() call registers into toolBatch on demand; ops carry a "$S" setup placeholder that is
+    //     patched to the real id after the setup is created. Planning before the setup-apply is what
+    //     guarantees every tool the ops reference is actually in the job's tool library. -----------
+    json opBatch = json::array();
+    std::vector<std::string> summary;
+    auto addOp = [&](const std::string& type, int toolN, const json& geom,
+                     double top, double bottom, const json& params) {
+        json op = {{"type", type}, {"tool_number", toolN},
+                   {"heights", {{"top", top}, {"bottom", bottom},
+                                {"clearance", clearance}, {"retract", retract}}}};
+        if (geom.is_object() && !geom.empty()) op["geometry"] = geom;
+        if (params.is_object() && !params.empty()) op["params"] = params;
+        opBatch.push_back(json{{"op", "add_operation"}, {"setup_id", "$S"}, {"operation", op}});
+        summary.push_back(type);
+    };
+
+    const char* machineKind = turning ? "lathe" : "mill3";
+
+    if (turning) {
+        // Lathe job: face the end, rough + finish the turned profile, optional part-off. Heights are
+        // not meaningful for radial turning; the engine works from the profile.
+        int tg = tool("turning_general", 12.0);
+        json geom = profile.is_null() ? json::object() : json{{"profile", profile}};
+        addOp("turn_face", tg, geom, zmax, zmin, json::object());
+        addOp("turn_rough", tg, geom, zmax, zmin, json::object());
+        addOp("turn_finish", tg, geom, zmax, zmin, json::object());
+        if (has("part off") || has("parting") || has("cut off"))
+            addOp("turn_part", tool("parting_tool", 3.0), geom, zmax, zmin, json::object());
+    } else {
+        if (wFace)
+            addOp("face", tool("endmill_flat", flatDia), json::object(), zmax, zmax - 1.0, json::object());
+        if (wAdaptive && needRegions())
+            addOp("adaptive2d", tool("endmill_flat", flatDia), json{{"regions", regions}}, zmax, zmin,
+                  json{{"stepover", flatDia * 0.4}, {"stepdown", flatDia}});
+        if (wPocket && needRegions())
+            addOp("pocket2d", tool("endmill_flat", flatDia), json{{"regions", regions}}, zmax, zmin, json::object());
+        if (wSlot && needRegions())
+            addOp("slot", tool("endmill_flat", flatDia), json{{"regions", regions}}, zmax, zmin, json::object());
+        if (wContour && needRegions())
+            addOp("contour2d", tool("endmill_flat", flatDia), json{{"regions", regions}}, zmax, zmin, json::object());
+        if (w3d && mesh.is_object() && !mesh.empty()) {
+            std::string t3 = has("scallop") ? "scallop3d" : has("waterline") ? "contour3d" : "parallel3d";
+            addOp(t3, tool("endmill_ball", ballDia), json{{"mesh", mesh}}, zmax, zmin,
+                  json{{"stepover", ballDia * 0.25}});
+        }
+        if (wChamfer && needRegions())
+            addOp("chamfer2d", tool("chamfer_mill", 6.0), json{{"regions", regions}}, zmax, zmax - 1.0, json::object());
+        if (wEngrave && needRegions())
+            addOp("engrave", tool("vbit", 6.0), json{{"regions", regions}}, zmax, zmax - 0.5, json::object());
+        if (wDrill && hasHoles)
+            addOp("drill", tool("drill", 5.0), json{{"points", holePoints}}, zmax, zmin, json{{"cycle", "peck"}});
+    }
+
+    if (opBatch.empty())
+        return json{{"ok", false},
+                    {"error", "the requested operations need geometry this part doesn't expose "
+                              "(e.g. drilling but no holes, or a profile/section that came back empty)"}};
+
+    // --- apply tools + setup (toolBatch is now fully populated by planning), resolve the setup id --
+    json setupStock = stockBox;
+    setupStock["material"] = material;
+    json setupBatch = toolBatch;
+    setupBatch.push_back(json{{"op", "add_setup"},
+                              {"setup", {{"name", "Setup1"}, {"machine", {{"kind", machineKind}}},
+                                         {"stock", setupStock}}}});
+    json applied;
+    try {
+        applied = aicad::cam::cam_apply_ops(cam_id, -1, setupBatch);
+    } catch (const std::exception& e) {
+        return json{{"ok", false}, {"error", std::string("setup/tools: ") + e.what()}};
+    }
+    std::string setupId;
+    if (applied.contains("tree") && applied["tree"].contains("setups") &&
+        applied["tree"]["setups"].is_array() && !applied["tree"]["setups"].empty())
+        setupId = applied["tree"]["setups"][0].value("id", std::string());
+    if (setupId.empty() && applied.contains("id_map"))
+        setupId = applied["id_map"].value("_s", std::string());
+    if (setupId.empty()) return json{{"ok", false}, {"error", "setup id not found"}};
+
+    for (auto& o : opBatch) o["setup_id"] = setupId;  // patch the "$S" placeholder
+    try {
+        aicad::cam::cam_apply_ops(cam_id, -1, opBatch);
+    } catch (const std::exception& e) {
+        return json{{"ok", false}, {"error", std::string("operations: ") + e.what()}};
+    }
+
+    // --- generate, simulate, post --------------------------------------------------
+    json gen, sim, post;
+    try {
+        gen = aicad::cam::cam_generate(cam_id, json::object());
+    } catch (const std::exception& e) {
+        return json{{"ok", false}, {"error", std::string("generate: ") + e.what()}};
+    }
+    try { sim = aicad::cam::cam_simulate(cam_id, json::object()); } catch (...) {}
+    try {
+        post = aicad::cam::cam_post(cam_id, json{{"dialect", dialect}, {"program_name", "AICAD"}});
+    } catch (const std::exception& e) {
+        return json{{"ok", false}, {"error", std::string("post: ") + e.what()}};
+    }
+
+    const std::string gcode = post.value("gcode", std::string());
+    std::string ncPath;
+    try {
+        std::filesystem::path nc = std::filesystem::temp_directory_path(ec) /
+                                   ("aicad_cam_" + part_doc_id + "." + dialect + ".nc");
+        std::ofstream f(nc);
+        if (f) { f << gcode; ncPath = nc.string(); }
+    } catch (...) {}
+
+    json tree = aicad::cam::cam_tree(cam_id);
+    int opCount = 0;
+    if (tree.contains("tree") && tree["tree"].contains("setups"))
+        for (auto& s : tree["tree"]["setups"])
+            if (s.contains("operations")) opCount += (int)s["operations"].size();
+    std::string opsCsv;
+    for (size_t i = 0; i < summary.size(); ++i) opsCsv += (i ? ", " : "") + summary[i];
+
+    json out = {{"ok", true},
+                {"cam_doc_id", cam_id},
+                {"part_doc_id", part_doc_id},
+                {"dialect", dialect},
+                {"material", material},
+                {"strategy", turning ? "turning" : "milling"},
+                {"op_count", opCount},
+                {"ops_summary", opsCsv},
+                {"hole_count", (int)holePoints.size()},
+                {"tree", tree.contains("tree") ? tree["tree"] : json::object()},
+                {"gcode", gcode},
+                {"gcode_path", ncPath},
+                {"line_count", post.value("line_count", 0)},
+                {"warnings", gen.contains("warnings") ? gen["warnings"] : json::array()}};
+    if (sim.is_object() && sim.contains("results")) out["sim"] = sim["results"];
+    return out;
+}
 
 // Real dispatch body. Extracted from aicad_call so the public entry can wrap it in a
 // Windows structured-exception (SEH) guard WITHOUT this function — which is full of
@@ -1159,6 +1439,83 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                                              : part_name + " - Drawing"},
                                         {"source_doc_id", doc_id}, {"events", events},
                                         {"engaged", "drawing"}},
+                                    out_json, 0);
+                    }
+                }
+            }
+
+            // ---- CAM-intent fast-path ----
+            // "generate toolpaths / post G-code / make a CNC program for this part" builds a
+            // complete machining job from the current part deterministically (no provider) —
+            // the manufacturing analogue of the drawing fast-path. Fires when the request is
+            // clearly CAM-oriented (tight keyword set so it never grabs a modeling request),
+            // or when the host set options.cam from the Manufacture workspace, AND the active
+            // doc already has geometry. Otherwise falls through to normal modeling (so "model a
+            // CNC fixture" on an empty doc still builds a part).
+            {
+                bool wants_cam = options.value("cam", false) ||
+                                 options.value("workspace", std::string()) == "cam";
+                std::string lc;
+                lc.reserve(request.size());
+                for (char c : request) lc += (char)std::tolower((unsigned char)c);
+                auto has = [&](const char* w) { return lc.find(w) != std::string::npos; };
+                const bool cam_words =
+                    has("toolpath") || has("g-code") || has("gcode") || has("g code") ||
+                    has("cnc") || has("post-process") || has("post process") ||
+                    has("nc program") || has("machining program") || has("cam program") ||
+                    has("cam job") || (has("machine") && has("part") && has("this"));
+                // options.cam (Manufacture workspace) lowers the bar — but still requires a
+                // manufacturing NOUN, so a modeling request typed there (e.g. "generate a
+                // fillet") falls through to the modeler instead of being read as a CAM build.
+                const bool cam_noun =
+                    has("program") || has("toolpath") || has("g-code") || has("gcode") ||
+                    has("g code") || has("cnc") || has("post") || has("machining") ||
+                    has("mill") || has("router") || has("lathe") || has("nc ");
+                if ((cam_words || (wants_cam && cam_noun)) && !doc_id.empty()) {
+                    json t = aicad::doc::doc_tree(doc_id);
+                    bool has_geom = t.is_object() && t.contains("tree") && t["tree"].is_object() &&
+                                    t["tree"].contains("features") &&
+                                    t["tree"]["features"].is_array() &&
+                                    !t["tree"]["features"].empty();
+                    if (has_geom) {
+                        json copts = options;
+                        copts["request"] = request;
+                        json prog = cam_program_from_part(doc_id, copts);
+                        json events = json::array();
+                        events.push_back(json{{"kind", "run_started"}, {"request", request},
+                                              {"doc_id", doc_id}});
+                        if (prog.value("ok", false)) {
+                            const int opc = prog.value("op_count", 0);
+                            const int lc2 = prog.value("line_count", 0);
+                            const std::string dlt = prog.value("dialect", std::string("grbl"));
+                            const std::string opsCsv = prog.value("ops_summary", std::string());
+                            std::string note =
+                                "Built a CAM job from the part: " + std::to_string(opc) +
+                                " operation(s)" + (opsCsv.empty() ? "" : " (" + opsCsv + ")") +
+                                ", posted " + std::to_string(lc2) + " lines of " + dlt +
+                                " G-code to " + prog.value("gcode_path", std::string()) +
+                                ". Open the Manufacture workspace to refine tools, setups, and operations.";
+                            events.push_back(json{{"kind", "run_note"}, {"text", note}});
+                            events.push_back(json{{"kind", "run_finished"},
+                                                  {"status", "done"}, {"stop_reason", "cam"}});
+                            json res = {{"status", "done"}, {"stop_reason", "cam"},
+                                        {"run_id", options.value("run_id", std::string("cam"))},
+                                        {"doc_id", doc_id}, {"created_cam", true},
+                                        {"cam_doc_id", prog.value("cam_doc_id", std::string())},
+                                        {"op_count", opc}, {"line_count", lc2}, {"dialect", dlt},
+                                        {"gcode", prog.value("gcode", std::string())},
+                                        {"gcode_path", prog.value("gcode_path", std::string())},
+                                        {"summary", note}, {"events", events}, {"engaged", "cam"}};
+                            if (prog.contains("sim")) res["sim"] = prog["sim"];
+                            if (prog.contains("warnings")) res["warnings"] = prog["warnings"];
+                            return emit(std::move(res), out_json, 0);
+                        }
+                        const std::string err = prog.value("error", std::string("CAM build failed"));
+                        events.push_back(json{{"kind", "run_finished"},
+                                              {"status", "error"}, {"stop_reason", "cam"}});
+                        return emit(json{{"status", "error"}, {"stop_reason", "cam"},
+                                         {"error", err}, {"doc_id", doc_id},
+                                         {"events", events}, {"engaged", "cam"}},
                                     out_json, 0);
                     }
                 }
@@ -2829,6 +3186,10 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             if (m == "cam_open") return emit(aicad::cam::cam_open(params.value("path", std::string())), out_json, 0);
             // OCCT extraction adapter: live B-rep part -> CAM geometry inputs.
             if (m == "cam_extract") return emit(aicad::cam::cam_extract(params), out_json, 0);
+            // One-shot: build a complete machining job + G-code from the current part
+            // (deterministic recipe; the in-app copilot's CAM fast-path calls the same fn).
+            if (m == "cam_program")
+                return emit(cam_program_from_part(jstr(params, "doc_id"), params), out_json, 0);
         } catch (const aicad::cam::OpError& oe) {
             return emit(oe.envelope(), out_json, 3);
         }

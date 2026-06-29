@@ -21,6 +21,7 @@
 #include "../core/app_state.h"
 #include "../core/jobs.h"  // launchAgentRunV2 (C22b activity scenario)
 #include "activity_panel.h"
+#include "cam/cam_panel.h"  // camLoadJob (CAM copilot fast-path scenario)
 #include "asm_panels.h"
 #include "evaluate_dialogs.h"
 #include "property_manager.h"
@@ -669,6 +670,56 @@ void ScenarioRunner::tick(AppState& st) {
                 break;
         }
         (void)sim;
+    }
+
+    // ---------- CAM copilot fast-path scenario (AI_CAD_SHOT=cam) ----------
+    // new part -> box 80x60x15 + 4 corner through-holes -> run the copilot CAM fast-path
+    // (agent_run options.cam) -> adopt the built job into the Manufacture panel (exactly as the
+    // app.cpp drain does) -> capture the populated CAM workspace (Setup1 -> face/contour/drill,
+    // tools T1/T2). Proves the end-to-end "copilot builds a CAM program that lands in the GUI".
+    if (st.wantCam && st.workerStarted && !st.camShotDone && st.frame >= 5) {
+        std::string err;
+        st.docMirror.newPart(st.worker, err);
+        nlohmann::json ops = nlohmann::json::array();
+        ops.push_back({{"op","add_feature"},{"feature",{
+            {"type","box"},{"name","Plate"},{"params",{
+                {"length",{{"value",80.0},{"expr",nullptr}}},
+                {"width", {{"value",60.0},{"expr",nullptr}}},
+                {"height",{{"value",15.0},{"expr",nullptr}}}}},{"centered",true}}}});
+        nlohmann::json hole;
+        hole["op"] = "add_feature";
+        hole["feature"]["type"] = "hole";
+        hole["feature"]["name"] = "Bores";
+        hole["feature"]["params"]["style"] = "simple";
+        hole["feature"]["params"]["standard"] = "custom";
+        hole["feature"]["params"]["diameter"] = {{"value", 5.0}, {"expr", nullptr}};
+        hole["feature"]["params"]["end"] = "through_all";
+        hole["feature"]["params"]["positions"] = {{-30, -20}, {30, -20}, {30, 20}, {-30, 20}};
+        hole["feature"]["refs"]["face"] = {{"of", "face"}, {"side", "top"}};
+        ops.push_back(hole);
+        auto r = st.docMirror.applyOps(st.worker, ops);
+        std::printf("cam-shot: part ok=%d rev=%d aicm=%d\n", (int)r.ok, r.revision,
+                    (int)!r.aicm_path.empty());
+        std::fflush(stdout);
+        if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        // Drive the same core recipe the copilot CAM fast-path calls (cam_program_from_part);
+        // cam_* routes straight to the C++ core, so no agent provider is needed.
+        nlohmann::json res; std::string e2;
+        bool ok = st.worker.call("cam_program",
+                       {{"doc_id", st.docMirror.docId()}, {"post", "fanuc"}}, res, e2);
+        std::string camId = (ok && res.is_object()) ? res.value("cam_doc_id", std::string()) : std::string();
+        std::printf("cam-shot: ok=%d err=%s engaged=%s cam_doc=%s ops=%d lines=%d\n",
+                    (int)ok, e2.c_str(),
+                    (res.is_object() ? res.value("engaged", std::string()) : std::string("?")).c_str(),
+                    camId.c_str(),
+                    (res.is_object() ? (int)res.value("op_count", 0) : -1),
+                    (res.is_object() ? (int)res.value("line_count", 0) : -1));
+        std::fflush(stdout);
+        ui::camLoadJob(st, camId);                 // adopt like the GL-thread drain
+        ui::camFloatForShot();                     // float so the headless capture shows the tree
+        st.showRibbon = true; st.ribbonTab = AppState::RT_Manufacture;
+        st.wantFocusViewport = 0;                  // let the CAM tab stay forward
+        st.camShotDone = true;
     }
 
     // ---------- external-flow scenario (AI_CAD_SHOT=flow) ----------

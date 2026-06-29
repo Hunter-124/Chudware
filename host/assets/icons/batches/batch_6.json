@@ -1,0 +1,149 @@
+[
+  {
+    "name": "rib",
+    "file": "rib.png",
+    "category": "features",
+    "kind": "render",
+    "prompt": "A thin vertical structural rib wall spanning the inner corner between a horizontal base and an upright wall, forming a triangular gusset web of constant thickness reinforcing the L-shaped junction. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "rollback",
+    "file": "rollback.png",
+    "category": "app_tree",
+    "kind": "icon",
+    "prompt": "A sleek UI icon of a rollback bar \u2014 a horizontal feature timeline with a draggable handle and a rewind/back arrow pulling the bar leftward. Sleek modern UI icon for a professional parametric-CAD application; single centered glyph with subtle 3D depth and a soft gradient; restrained palette with a teal (#2DD4BF) accent; FULLY TRANSPARENT background (PNG alpha) \u2014 no text labels, no card, no frame; bold, high-contrast, consistent stroke weight, legible at 20-32 px."
+  },
+  {
+    "name": "rotate_component",
+    "file": "rotate_component.png",
+    "category": "assembly",
+    "kind": "render",
+    "prompt": "A CAD component encircled by three curved rotation arrows on the orthogonal axis rings of a rotation gizmo, with a faint arc trail showing it spinning about its center. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "rotate_view",
+    "file": "rotate_view.png",
+    "category": "hud",
+    "kind": "icon",
+    "prompt": "Two curved arrows forming a circular orbit around a small 3D cube, indicating free rotation of the view. Sleek modern UI icon for a professional parametric-CAD application; single centered glyph with subtle 3D depth and a soft gradient; restrained palette with a teal (#2DD4BF) accent; FULLY TRANSPARENT background (PNG alpha) \u2014 no text labels, no card, no frame; bold, high-contrast, consistent stroke weight, legible at 20-32 px."
+  },
+  {
+    "name": "run_study",
+    "file": "run_study.png",
+    "category": "simulation",
+    "kind": "icon",
+    "prompt": "A sleek solver run icon: a triangular play button combined with a small gear or pulse motif indicating launch and compute of a simulation. Sleek modern UI icon for a professional parametric-CAD application; single centered glyph with subtle 3D depth and a soft gradient; restrained palette with a teal (#2DD4BF) accent; FULLY TRANSPARENT background (PNG alpha) \u2014 no text labels, no card, no frame; bold, high-contrast, consistent stroke weight, legible at 20-32 px."
+  },
+  {
+    "name": "save",
+    "file": "save.png",
+    "category": "general",
+    "kind": "icon",
+    "prompt": "A classic floppy-disk save glyph showing the square body, notched top-right corner, write-protect shutter and a small label rectangle. Sleek modern UI icon for a professional parametric-CAD application; single centered glyph with subtle 3D depth and a soft gradient; restrained palette with a teal (#2DD4BF) accent; FULLY TRANSPARENT background (PNG alpha) \u2014 no text labels, no card, no frame; bold, high-contrast, consistent stroke weight, legible at 20-32 px."
+  },
+  {
+    "name": "section_props",
+    "file": "section_props.png",
+    "category": "evaluate",
+    "kind": "render",
+    "prompt": "A part cut by a slicing plane to expose a flat hatched cross-section face, with the centroid marked by crossing principal axes and the enclosed area tinted to show its computed section area. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "section_view",
+    "file": "section_view.png",
+    "category": "hud",
+    "kind": "render",
+    "prompt": "A solid rectangular block sliced by a section plane with its near half removed, revealing a hatched cross-sectional interior and crisp cut edges. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "settings",
+    "file": "settings.png",
+    "category": "general",
+    "kind": "icon",
+    "prompt": "A single mechanical cog wheel with evenly spaced teeth and a circular hub bore at its center, evoking machined gear configuration. Sleek modern UI icon for a professional parametric-CAD application; single centered glyph with subtle 3D depth and a soft gradient; restrained palette with a teal (#2DD4BF) accent; FULLY TRANSPARENT background (PNG alpha) \u2014 no text labels, no card, no frame; bold, high-contrast, consistent stroke weight, legible at 20-32 px."
+  },
+  {
+    "name": "shell",
+    "file": "shell.png",
+    "category": "features",
+    "kind": "render",
+    "prompt": "A rectangular box hollowed into a thin-walled open container, the top face removed to reveal uniform thin walls and an interior cavity, a cutaway showing the constant wall thickness of the shelled-out solid. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "sketch",
+    "file": "sketch.png",
+    "category": "sketch",
+    "kind": "render",
+    "prompt": "A flat sketch plane shown in light perspective with a faint blue square grid, on which a single closed 2D profile\u2014a rounded rectangle traced in a crisp sketch-blue line with small square endpoint nodes\u2014is drawn. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "sketch_node",
+    "file": "sketch_node.png",
+    "category": "app_tree",
+    "kind": "render",
+    "prompt": "A flat reference plane carrying a 2D sketch drawn in bright sketch-blue lines \u2014 a rectangle with a centered circle \u2014 annotated with a couple of dimension arrows and a coincident constraint marker. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "slot",
+    "file": "slot.png",
+    "category": "sketch",
+    "kind": "render",
+    "prompt": "A straight slot profile in sketch-blue\u2014two parallel horizontal lines joined at each end by a semicircular cap\u2014with a dash-dot centerline running through its length. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "slot_arc_3pt",
+    "file": "slot_arc_3pt.png",
+    "category": "sketch_flyouts",
+    "kind": "render",
+    "prompt": "A curved banana-shaped arc slot following a circular path with rounded semicircular caps at both ends, three glowing points strung along the arc centerline that define the curved sweep. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "slot_arc_ctr",
+    "file": "slot_arc_ctr.png",
+    "category": "sketch_flyouts",
+    "kind": "render",
+    "prompt": "A curved arc slot bending around a marked arc-center dot, two radius construction lines running from the center to the slot's curved centerline, rounded end caps, and a width dimension across the band. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "slot_ctr_str",
+    "file": "slot_ctr_str.png",
+    "category": "sketch_flyouts",
+    "kind": "render",
+    "prompt": "A straight obround slot (parallel sides capped by two semicircular ends) on a sketch grid, a dashed centerline joining the two end-arc centers and a perpendicular width dimension spanning across the slot. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "sm_base_flange",
+    "file": "sm_base_flange.png",
+    "category": "sheet_metal",
+    "kind": "render",
+    "prompt": "A single thin brushed-steel sheet of uniform thickness folded once into a clean L-profile, with a smooth constant-radius bend at the corner and crisp straight edges, sitting as the first solid body of a sheet-metal part. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "sm_edge_flange",
+    "file": "sm_edge_flange.png",
+    "category": "sheet_metal",
+    "kind": "render",
+    "prompt": "A flat rectangular metal sheet with one narrow wall bent upward 90 degrees along a single straight edge, showing the rounded bend zone where the new flange meets the parent face and a small corner relief notch at the bend ends. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "sm_flat_pattern",
+    "file": "sm_flat_pattern.png",
+    "category": "sheet_metal",
+    "kind": "render",
+    "prompt": "A single sheet-metal blank laid out completely unfolded and flat, its outline and cut openings visible, overlaid with dashed bend lines and shaded bend-allowance zones marking where each fold would occur. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "sm_hem",
+    "file": "sm_hem.png",
+    "category": "sheet_metal",
+    "kind": "render",
+    "prompt": "The edge of a metal sheet folded back 180 degrees onto itself into a tight doubled-over rounded lip, the returned material running parallel just beneath the main face to form a smooth reinforced hemmed edge. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "sm_jog",
+    "file": "sm_jog.png",
+    "category": "sheet_metal",
+    "kind": "render",
+    "prompt": "A flat metal strip interrupted by two closely spaced parallel bends that step one half of the sheet up to a parallel offset plane, forming a shallow Z-shaped jog with two matching bend radii in cross-section. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  }
+]

@@ -1,0 +1,149 @@
+[
+  {
+    "name": "interference",
+    "file": "interference.png",
+    "category": "assembly",
+    "kind": "render",
+    "prompt": "Two solid parts overlapping where a peg pushes into a block, the overlapping clash volume rendered as a bright solid-red lens shape glowing at the intersection of the two grey bodies. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "interference_eval",
+    "file": "interference_eval.png",
+    "category": "evaluate",
+    "kind": "render",
+    "prompt": "Two mating metal components pushed together so a shaft overlaps its bore, the intersecting overlap volume rendered as a glowing solid red lens while the rest of the parts stay neutral gray. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "intersect",
+    "file": "intersect.png",
+    "category": "features",
+    "kind": "render",
+    "prompt": "Two overlapping bodies (a cube and a sphere) reduced to only their shared overlapping intersection volume, a single lens-rounded chunk where both originally coincided, the non-overlapping portions shown faint or removed. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "line",
+    "file": "line.png",
+    "category": "sketch",
+    "kind": "render",
+    "prompt": "A single straight sketch-blue line segment crossing a faint grid, terminated at each end by a small solid endpoint dot. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "linear_pattern",
+    "file": "linear_pattern.png",
+    "category": "features",
+    "kind": "render",
+    "prompt": "A single cylindrical boss feature on a plate copied into a straight evenly-spaced row of four identical instances, faint spacing-dimension arrows between them and the original seed feature subtly distinguished from the patterned copies. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "load_force",
+    "file": "load_force.png",
+    "category": "simulation",
+    "kind": "render",
+    "prompt": "A solid part with one bold red force arrow pushing perpendicularly into a flat face, the single thick directional arrowhead indicating a concentrated point or face load. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "load_pressure",
+    "file": "load_pressure.png",
+    "category": "simulation",
+    "kind": "render",
+    "prompt": "A solid part with a flat face covered by a dense uniform grid of many small identical arrows all pressing inward on that face, representing distributed pressure. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "loft",
+    "file": "loft.png",
+    "category": "features",
+    "kind": "render",
+    "prompt": "A smoothly blended solid transitioning from a square cross-section at the bottom to a round circular cross-section at the top, the two end profiles highlighted as crisp wireframe outlines connected by flowing twisted surfaces that morph between the shapes. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "loft_cut",
+    "file": "loft_cut.png",
+    "category": "features",
+    "kind": "render",
+    "prompt": "A solid block with a tapering cavity lofted through it, the opening transitioning from a square mouth on the top face to a smaller circular hole on the bottom face, the two profile outlines highlighted and the blended inner walls shown as a recessed funnel-like pocket. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "mass_props",
+    "file": "mass_props.png",
+    "category": "evaluate",
+    "kind": "render",
+    "prompt": "A solid steel bracket resting on the platform of a sleek digital weighing scale, a small balanced center-of-mass marker (three intersecting axes with a sphere) glowing inside the part and a weight value on the scale display. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "mate",
+    "file": "mate.png",
+    "category": "assembly",
+    "kind": "render",
+    "prompt": "Two metal parts brought together so a flat planar face of one sits flush against the flat face of the other, a small coincident-mate symbol and a thin highlight line glowing along the shared contact face. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "material",
+    "file": "material.png",
+    "category": "app_tree",
+    "kind": "render",
+    "prompt": "A rendered glossy material swatch sphere with a smooth reflective brushed-metal finish and a soft specular highlight, sitting on a tiny flat chip base. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "mates_folder",
+    "file": "mates_folder.png",
+    "category": "app_tree",
+    "kind": "icon",
+    "prompt": "A sleek UI folder icon with a small assembly-mate glyph on it \u2014 two facing alignment arrows meeting at a coincident constraint marker. Sleek modern UI icon for a professional parametric-CAD application; single centered glyph with subtle 3D depth and a soft gradient; restrained palette with a teal (#2DD4BF) accent; FULLY TRANSPARENT background (PNG alpha) \u2014 no text labels, no card, no frame; bold, high-contrast, consistent stroke weight, legible at 20-32 px."
+  },
+  {
+    "name": "measure",
+    "file": "measure.png",
+    "category": "evaluate",
+    "kind": "render",
+    "prompt": "A digital vernier caliper clamped across the width of a machined aluminum block, its jaws spanning the part with an extension dimension line and a crisp numeric distance readout floating beside it. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "mesh",
+    "file": "mesh.png",
+    "category": "simulation",
+    "kind": "render",
+    "prompt": "A 3D part fully wrapped in a fine finite-element mesh of small triangular and tetrahedral surface elements, the thin mesh wireframe conforming tightly over its curved and flat faces. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "mesh_auto",
+    "file": "mesh_auto.png",
+    "category": "mesh_types",
+    "kind": "render",
+    "prompt": "A plate-with-hole part under automatic adaptive meshing, showing a graded element field: very fine, dense cells clustered around the hole rim and fillet stress concentrations transitioning smoothly to large coarse cells across the flat regions, conveying curvature- and error-driven refinement. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "mesh_hex",
+    "file": "mesh_hex.png",
+    "category": "mesh_types",
+    "kind": "render",
+    "prompt": "The same compact mechanical block meshed with a structured hexahedral (brick) finite-element grid, clean orthogonal rows and columns of six-faced cube-like cells with crisp quadrilateral surface faces, the regular wireframe lattice wrapping the solid and a sliced edge revealing aligned interior bricks. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "mesh_tet",
+    "file": "mesh_tet.png",
+    "category": "mesh_types",
+    "kind": "render",
+    "prompt": "A small machined bracket solid discretized into an unstructured tetrahedral finite-element mesh, its surface tiled with thousands of small triangular facets and a corner cutaway exposing the interior four-sided tetrahedral cells, mesh edges drawn as thin contrasting wireframe lines over a soft pale solid. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "mirror",
+    "file": "mirror.png",
+    "category": "features",
+    "kind": "render",
+    "prompt": "An asymmetric bracket feature reflected across a vertical mirror plane into an identical mirrored copy on the opposite side, the translucent mirror plane standing between the original and its symmetric reflection with a double-headed symmetry arrow. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "mirror_ent",
+    "file": "mirror_ent.png",
+    "category": "sketch",
+    "kind": "render",
+    "prompt": "An L-shaped sketch profile and its mirrored duplicate reflected across a vertical dash-dot centerline axis standing between them. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "move_component",
+    "file": "move_component.png",
+    "category": "assembly",
+    "kind": "render",
+    "prompt": "A single blue CAD component lifted away from its assembly with a triad of straight translation arrows along X, Y and Z, a ghosted outline marking its original position. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  }
+]

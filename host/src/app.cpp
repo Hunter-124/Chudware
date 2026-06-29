@@ -1403,6 +1403,8 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     st.wantSketch = shot && shotMode && std::strcmp(shotMode, "sketch") == 0;  // C18 sketch flow
     if (st.wantSketch) { st.showRibbon = true; st.ribbonTab = AppState::RT_Sketch; }  // Sketch tab forward
     st.wantFea = shot && shotMode && std::strcmp(shotMode, "fea") == 0;       // C19 static study
+    st.wantCam = shot && shotMode && std::strcmp(shotMode, "cam") == 0;       // CAM copilot fast-path
+    if (st.wantCam) { st.showRibbon = true; st.ribbonTab = AppState::RT_Manufacture; }
     st.wantFlow = shot && shotMode && std::strcmp(shotMode, "flow") == 0;     // external-flow study
     // W17: engineering-drawing scenario — part w/ a hole -> Make Drawing -> Model Items + hole
     // callout + a critical toleranced dim + title block, with the contextual drawing ribbon shown.
@@ -1436,14 +1438,14 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 if (*mt) asmPanels.presetMateTypeForShot(mt);
         }
     }
-    // ribbon shot: show Features tab by default; AI_CAD_TAB=<0..8> selects which tab to capture
+    // ribbon shot: show Features tab by default; AI_CAD_TAB=<0..12> selects which tab to capture
     // (0=Features 1=Sketch 2=Evaluate 3=Simulation 4=Assembly 5=Sheet Metal 6=Weldments 7=PCB
-    // 8=Surfaces) for headless per-tab verification. Upper bound tracks kRibbonTabCount-1.
+    // 8=Surfaces .. 11=Appearance 12=Manufacture) for headless per-tab verification.
     if (st.wantRibbon) {
         st.showRibbon = true; st.ribbonTab = AppState::RT_Features;
         if (const char* tabEnv = std::getenv("AI_CAD_TAB")) {
             int t = std::atoi(tabEnv);
-            if (t >= 0 && t <= AppState::RT_Appearance) st.ribbonTab = t;
+            if (t >= 0 && t <= AppState::RT_Manufacture) st.ribbonTab = t;
         }
     }
     // pmform shot: open a PropertyManager form headlessly for visual verification of its field
@@ -1856,9 +1858,21 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 st.addLog("[v2] drawing built -> opened drawing tab " + st.job.drawingDocId);
                 st.job.drawingDocId.clear();
             }
+            // CAM fast-path: the run built a machining job from the current part. Load it into the
+            // Manufacture workspace panel and switch to it (the active part doc was NOT mutated, so
+            // the doc_rebuild below is skipped — same as drawing).
+            const bool madeCam = wasV2 && !st.job.camDocId.empty() && st.job.error.empty();
+            if (madeCam) {
+                ui::camLoadJob(st, st.job.camDocId);
+                st.showRibbon = true;
+                st.ribbonTab = AppState::RT_Manufacture;
+                st.addLog("[v2] CAM job built -> opened Manufacture workspace " + st.job.camDocId);
+                st.job.camDocId.clear();
+            }
             if (st.agentV2Running) {
                 st.agentV2Running = false;
-                if (!openedNewDoc && !madeDrawing && st.docMirror.hasDoc() && st.job.error.empty()) {
+                if (!openedNewDoc && !madeDrawing && !madeCam && st.docMirror.hasDoc() &&
+                    st.job.error.empty()) {
                     // C39: doc_rebuild can take tens of seconds on a heavy doc — the old sync
                     // call froze the window right after the agent finished. Queue it async;
                     // the callback (a later frame's drain, GL thread) resyncs and reloads.
@@ -2633,7 +2647,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         ImGui::PopStyleVar(3);
         // Versioned dockspace ID pairs with imgui_gui_v2.ini. Changing this intentionally forces
         // one clean DockBuilder layout after major window/dock identity changes.
-        ImGuiID dockId = ImGui::GetID("AICADDockV4");
+        ImGuiID dockId = ImGui::GetID("AICADDockV5");  // V5: CAM workspace docked into the central node
         if ((!st.layoutInit && ImGui::DockBuilderGetNode(dockId) == nullptr) || st.resetLayout) {
             buildDefaultLayout(dockId, ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
             st.layoutInit = true;
@@ -2642,7 +2656,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             // SolidWorks's task pane defaulting to the first tab. Deferred one frame via a flag so
             // the docked windows exist before we focus.
             st.focusDesignTab = true;
-            if (!st.wantEcad) st.wantFocusViewport = 6;
+            // Don't yank focus to the Viewport when the app opens straight into a non-3D workspace
+            // (ECAD board editor or the CAM Manufacture tab) — let that workspace's docked tab show.
+            if (!st.wantEcad && st.ribbonTab != AppState::RT_Manufacture) st.wantFocusViewport = 6;
         }
         // W2 full-bleed: with PassthruCentralNode AND a window docked in the central node, ImGui
         // paints an OPAQUE ImGuiCol_WindowBg rect over the WHOLE dockspace (imgui.cpp DockNodeUpdate:
@@ -2974,6 +2990,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             else if (st.wantFocusViewport > 0 || st.wantFocusEcad > 0)  shotFrame = 99999; // let focus settle
             else                                                        shotFrame = 10;    // then capture
         }
+        // cam shot: wait for the worker + the build/load scenario, then give the CAM tab a few
+        // frames to come forward (camLoadJob re-requests focus for ~10 frames) before capturing.
+        if (st.wantCam) shotFrame = st.camShotDone ? 60 : 99999;
         if (shot && ++st.frame >= shotFrame) {
             std::vector<unsigned char> px(dw * dh * 4);
             glReadBuffer(GL_BACK);

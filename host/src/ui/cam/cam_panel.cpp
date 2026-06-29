@@ -8,12 +8,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
 
 #include "../../core/app_state.h"
+#include "../../ui_theme.h"  // ui::palette (opaque title-bar / border override for this window)
 
 namespace ui {
 
@@ -23,6 +25,8 @@ struct CamUI {
     CamMirror mirror;
     std::string docId;                 // cam job doc id ("" = no job)
     bool show = false;
+    int  focusFrames = 0;              // >0: keep popping the CAM tab forward (set by camLoadJob)
+    bool floatForShot = false;         // shot-only: float the panel so a headless capture sees it
     bool backplot = true;              // draw toolpaths in the 3D viewport
     int selSetup = 0;
     int selOp = -1;
@@ -330,12 +334,65 @@ const CamBackplot* camActiveBackplot() {
 
 void camEnsureVisible() { g.show = true; }
 
+// Shot-only hook: make the CAM panel float (undock + centre) so a headless screenshot of the
+// AI_CAD_SHOT=cam scenario can actually show the populated workspace. Never called in normal use.
+void camFloatForShot() { g.floatForShot = true; }
+
+// Adopt an existing CAM job doc (built core-side by the copilot's CAM fast-path) into the
+// panel so it shows up populated instead of empty. Loads the job tree (setups/ops/tools).
+void camLoadJob(AppState& st, const std::string& docId) {
+    if (docId.empty()) return;
+    g.docId = docId;
+    g.selSetup = 0;
+    g.selOp = -1;
+    g.loadedOpFor = -1;
+    nlohmann::json r;
+    if (camCall(st, "cam_tree", {{"doc_id", docId}}, r)) {
+        loadTree(r);
+        g.status = "loaded CAM job from copilot";
+    }
+    // Also pull the generated toolpaths so the backplot / "Show in 3D" works immediately (the
+    // job was already generated core-side by cam_program; cam_generate returns the cached paths).
+    nlohmann::json gp;
+    if (camCall(st, "cam_generate", {{"doc_id", docId}}, gp)) g.mirror.loadToolpaths(gp);
+    g.show = true;
+    g.focusFrames = 10;  // surface the CAM tab for a few frames even if the panel was already
+                         // open in the background (out-competes a one-off viewport focus grab)
+}
+
 // ---- the panel ----
 void drawCamManager(AppState& st) {
     if (!g.show) return;
     refreshDialects(st);
+    // Pop the CAM tab forward the frame the workspace first becomes visible (the user switched to
+    // the Manufacture ribbon), so the docked CAM editor surfaces instead of staying behind the
+    // Viewport tab. Mirrors the ECAD panel. Docked into the central node by buildDefaultLayout.
+    // Shot-only (set via camFloatForShot() from the AI_CAD_SHOT=cam scenario): float the panel
+    // (undock + centre) so a headless capture sees the populated workspace — a central-node-docked
+    // tab won't surface over the full-bleed 3D in an offscreen render. No-op in normal use.
+    if (g.floatForShot) {
+        ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(330, 210), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(660, 470), ImGuiCond_Always);
+    }
+    static bool prevShown = false;
+    if (g.focusFrames > 0 || (g.show && !prevShown)) ImGui::SetNextWindowFocus();  // applies to the Begin below
+    prevShown = g.show;
+    if (g.focusFrames > 0) g.focusFrames--;
     ImGui::SetNextWindowSize(ImVec2(720, 480), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("CAM", &g.show)) { ImGui::End(); return; }
+    // The global theme makes window title bars fully transparent (a clean look for docked panels),
+    // but a FLOATING CAM window then reads as see-through at the top. Give this window an opaque
+    // title bar and a solid (fully opaque) border so it stands on its own whether floating or
+    // docked. Pushed before Begin (window decoration colours are read there) and popped right after.
+    const ui::Palette& pal = ui::palette;
+    const ImVec4 titleOpaque(pal.headerBg[0], pal.headerBg[1], pal.headerBg[2], 1.0f);
+    float camBorder[4]; ui::Palette::withAlpha(pal.border, camBorder, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_TitleBg,       titleOpaque);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleOpaque);
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(camBorder[0], camBorder[1], camBorder[2], camBorder[3]));
+    const bool camOpen = ImGui::Begin("CAM", &g.show);
+    ImGui::PopStyleColor(3);
+    if (!camOpen) { ImGui::End(); return; }
 
     // toolbar
     if (ImGui::Button("New Job")) camHandleCommand(st, "cam_new_job");

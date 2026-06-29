@@ -415,10 +415,10 @@ static const RibbonCmd kCmds[] = {
     // Tab: Manufacture (CAM — toolpaths / post / material-removal sim)
     // =========================================================================
     // --- Group: Job ---
-    { "cam_new_job",       "New Job",     "new_part",        "Manufacture", "Job",       true,  nullptr, false },
+    { "cam_new_job",       "New Job",     "new_doc",         "Manufacture", "Job",       true,  nullptr, false },
     { "cam_extract",       "From Part",   "hole_wizard",     "Manufacture", "Job",       true,  nullptr, false },
     { "cam_add_setup",     "Setup",       "ref_csys",        "Manufacture", "Job",       false, nullptr, false },
-    { "cam_add_tool",      "Tool",        "drill",           "Manufacture", "Job",       false, nullptr, false },
+    { "cam_add_tool",      "Tool",        "curve_helix",     "Manufacture", "Job",       false, nullptr, false },
     // --- Group: 2.5D Milling ---
     { "cam_op_face",       "Face",        "extrude_cut",     "Manufacture", "2.5D",      true,  nullptr, false },
     { "cam_op_contour",    "Contour",     "fillet",          "Manufacture", "2.5D",      true,  nullptr, false },

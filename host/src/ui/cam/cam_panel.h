@@ -23,6 +23,12 @@ void drawCamManager(AppState& st);
 
 // Reveal the CAM panel (called when the Manufacture ribbon workspace is activated).
 void camEnsureVisible();
+// Shot-only: float the panel so a headless AI_CAD_SHOT=cam capture can show the populated tree.
+void camFloatForShot();
+// Adopt an EXISTING CAM job doc (e.g. one the copilot's CAM fast-path just built) into the
+// panel: point the panel at docId, load its tree, and reveal it. Lets a core-side cam_* run
+// surface in the GUI instead of leaving the Manufacture panel empty.
+void camLoadJob(AppState& st, const std::string& docId);
 // Handle a CAM ribbon command (cmd ids prefixed "cam_"). Opens the panel and performs the
 // action (new job / extract / add operation / generate / simulate / post / ...).
 void camHandleCommand(AppState& st, const std::string& cmd);

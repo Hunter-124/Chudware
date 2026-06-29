@@ -1,0 +1,149 @@
+[
+  {
+    "name": "smart_dim",
+    "file": "smart_dim.png",
+    "category": "sketch",
+    "kind": "icon",
+    "prompt": "A horizontal dimension line capped with thin arrowheads, spanning between two short extension witness lines, with a small rounded value tag reading '25.0' floating at its midpoint. Sleek modern UI icon for a professional parametric-CAD application; single centered glyph with subtle 3D depth and a soft gradient; restrained palette with a teal (#2DD4BF) accent; FULLY TRANSPARENT background (PNG alpha) \u2014 no text labels, no card, no frame; bold, high-contrast, consistent stroke weight, legible at 20-32 px."
+  },
+  {
+    "name": "smart_fasteners",
+    "file": "smart_fasteners.png",
+    "category": "assembly",
+    "kind": "render",
+    "prompt": "A chrome hex-head bolt with a threaded shank passing through a clamped plate and engaging a hex nut on the far side, threads and chamfered hex flats clearly rendered. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "sphere_feature",
+    "file": "sphere_feature.png",
+    "category": "primitives",
+    "kind": "render",
+    "prompt": "A single smooth solid sphere with a soft graded specular highlight and a faint silhouette edge, a perfectly round ball primitive sitting alone. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "spline",
+    "file": "spline.png",
+    "category": "sketch",
+    "kind": "render",
+    "prompt": "A smooth flowing spline curve in sketch-blue undulating through four or five small square control points linked by a faint control-polygon. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "spline_equation",
+    "file": "spline_equation.png",
+    "category": "sketch_flyouts",
+    "kind": "render",
+    "prompt": "An equation-driven curve plotted on a sketch plane: a smooth parametric wave-like spline with a small floating formula label such as y=f(x) and faint x-y axes signaling it is mathematically defined. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "spline_style",
+    "file": "spline_style.png",
+    "category": "sketch_flyouts",
+    "kind": "render",
+    "prompt": "A single smooth flowing class-A style spline sweeping elegantly across a sketch plane in sketch-blue, a few control points linked by a faint control polygon, emphasizing fair continuous curvature. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "spline_surface",
+    "file": "spline_surface.png",
+    "category": "sketch_flyouts",
+    "kind": "render",
+    "prompt": "A doubly-curved 3D surface patch with a smooth spline curve lying directly on it, the curve hugging and following the surface contours with small control points raised on the face. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "split",
+    "file": "split.png",
+    "category": "features",
+    "kind": "render",
+    "prompt": "A single solid body sliced into two separate pieces by a flat cutting plane, the two halves pulled slightly apart to reveal the freshly cut planar faces, the translucent cutting plane shown edge-on between them. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "study_fatigue",
+    "file": "study_fatigue.png",
+    "category": "simulation",
+    "kind": "render",
+    "prompt": "A machine part marked with a fatigue-life color map and a small cyclic sine-wave load symbol, showing a red low-cycle danger zone at a stress-concentrating notch or hole transitioning to green high-life regions. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "study_flow",
+    "file": "study_flow.png",
+    "category": "simulation",
+    "kind": "render",
+    "prompt": "A streamlined solid part such as an airfoil or rounded block with smooth curved CFD streamlines flowing past it left to right, the lines wrapping around the body and trailing into a wake, colored by velocity from blue to red. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "study_modal",
+    "file": "study_modal.png",
+    "category": "simulation",
+    "kind": "render",
+    "prompt": "A slender cantilever beam or plate rendered mid-vibration, visibly flexed into a smooth bending mode shape with a faint ghosted outline of its original undeformed position, surface tinted by a blue-to-red modal displacement gradient. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "study_static",
+    "file": "study_static.png",
+    "category": "simulation",
+    "kind": "render",
+    "prompt": "A small 3D-rendered metal bracket under load, its surface shaded with a smooth von Mises stress rainbow color map sweeping from deep blue at the cool low-stress regions to red-orange hot spots concentrated at a fillet and bolt hole. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "study_thermal",
+    "file": "study_thermal.png",
+    "category": "simulation",
+    "kind": "render",
+    "prompt": "A 3D part such as a finned heatsink rendered with a thermal temperature color map, glowing red-hot at a heat-source face and fading through orange and yellow to cool blue at the fin tips. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "subtract",
+    "file": "subtract.png",
+    "category": "features",
+    "kind": "render",
+    "prompt": "A solid cube with a spherical body subtracted from it by boolean cut, leaving a clean spherical concave cavity scooped out of one corner, the removed tool-body shown as a faint ghost outline. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "suppressed",
+    "file": "suppressed.png",
+    "category": "app_tree",
+    "kind": "icon",
+    "prompt": "A sleek UI icon of a dimmed, greyed-out feature node drawn with a dashed inactive outline and a small pause indicator, signifying a suppressed feature. Sleek modern UI icon for a professional parametric-CAD application; single centered glyph with subtle 3D depth and a soft gradient; restrained palette with a teal (#2DD4BF) accent; FULLY TRANSPARENT background (PNG alpha) \u2014 no text labels, no card, no frame; bold, high-contrast, consistent stroke weight, legible at 20-32 px."
+  },
+  {
+    "name": "sweep",
+    "file": "sweep.png",
+    "category": "features",
+    "kind": "render",
+    "prompt": "A circular cross-section profile swept along a smoothly curving 3D guide path to form a bent solid tube, the spline path drawn as a thin curve through the pipe's center and the small start-profile circle visible at the tube's open end. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "sweep_cut",
+    "file": "sweep_cut.png",
+    "category": "features",
+    "kind": "render",
+    "prompt": "A flat plate with a U-shaped profile swept along a curved guide path across its top surface, carving a smooth recessed channel that follows the curve, the path shown as a thin centerline and the removed groove shaded as a sunken trough. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "symmetry_check",
+    "file": "symmetry_check.png",
+    "category": "evaluate",
+    "kind": "render",
+    "prompt": "A part bisected by a translucent vertical mirror plane with its two halves overlaid for comparison, matching geometry shown in green and a small mismatched region flagged in red. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "text_ent",
+    "file": "text_ent.png",
+    "category": "sketch",
+    "kind": "icon",
+    "prompt": "The letters 'Aa' rendered as clean bold sketch lettering, sharp and legible. Sleek modern UI icon for a professional parametric-CAD application; single centered glyph with subtle 3D depth and a soft gradient; restrained palette with a teal (#2DD4BF) accent; FULLY TRANSPARENT background (PNG alpha) \u2014 no text labels, no card, no frame; bold, high-contrast, consistent stroke weight, legible at 20-32 px."
+  },
+  {
+    "name": "theme_toggle",
+    "file": "theme_toggle.png",
+    "category": "general",
+    "kind": "icon",
+    "prompt": "A split sun-and-moon emblem, a radiating sun on one side fading into a crescent moon on the other, indicating a light/dark theme switch. Sleek modern UI icon for a professional parametric-CAD application; single centered glyph with subtle 3D depth and a soft gradient; restrained palette with a teal (#2DD4BF) accent; FULLY TRANSPARENT background (PNG alpha) \u2014 no text labels, no card, no frame; bold, high-contrast, consistent stroke weight, legible at 20-32 px."
+  },
+  {
+    "name": "thickness",
+    "file": "thickness.png",
+    "category": "evaluate",
+    "kind": "render",
+    "prompt": "A hollow shelled enclosure rendered semi-cutaway with its wall thickness color-mapped, thick regions in blue grading through green to red where the wall thins dangerously. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  }
+]

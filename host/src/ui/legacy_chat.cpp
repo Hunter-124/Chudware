@@ -659,7 +659,8 @@ static void launchDesignRun(AppState& st, const std::string& request) {
     st.agentV2 = true;
     if (st.activityPanel)
         st.activityPanel->clearLive();
-    launchAgentRunV2(st.worker, st.job, request, st.docMirror.docId());
+    launchAgentRunV2(st.worker, st.job, request, st.docMirror.docId(),
+                     st.ribbonTab == AppState::RT_Manufacture);
 }
 
 // Launch the MISSION orchestrator for a multi-capability request (e.g. "model X, then run CFD and
@@ -783,9 +784,36 @@ static std::string fmtTokens(int n) {
 // The active model's total context window (mirrors core default_context_window for the meter).
 static int effectiveContextWindow(const Settings& s) {
     if (s.contextWindow > 0) return s.contextWindow;
+    // Model-aware: case-insensitive substring match on the wire model name.
+    auto hasSub = [&](const char* sub) -> bool {
+        const char* m = s.model;
+        if (!m || !*m || !sub || !*sub) return false;
+        const size_t mlen = std::strlen(m), slen = std::strlen(sub);
+        if (slen > mlen) return false;
+        for (size_t i = 0; i + slen <= mlen; ++i) {
+            bool ok = true;
+            for (size_t j = 0; j < slen; ++j)
+                if (std::tolower((unsigned char)m[i+j]) != std::tolower((unsigned char)sub[j]))
+                    { ok = false; break; }
+            if (ok) return true;
+        }
+        return false;
+    };
+    // Gemini (more-specific "1.5-pro" before generic "pro")
+    if (hasSub("1.5-pro"))                                              return 2097152;
+    if (hasSub("1.5-flash") || hasSub("2.0") || hasSub("2.5") ||
+        hasSub("flash")     || hasSub("pro"))                           return 1048576;
+    // Anthropic
+    if (hasSub("claude"))                                               return 200000;
+    // OpenAI
+    if (hasSub("gpt-4.1"))                                             return 1047576;
+    if (hasSub("o1") || hasSub("o3") || hasSub("o4"))                  return 200000;
+    if (hasSub("gpt-4o") || hasSub("gpt-4-turbo") || hasSub("4o-mini")) return 128000;
+    if (hasSub("gpt-3.5"))                                             return 16385;
+    // Fall back to per-provider default.
     switch (s.provider) {
-        case ui::PROV_GEMINI: return 1048576;
-        case ui::PROV_ANTHROPIC: return 200000;
+        case ui::PROV_GEMINI:      return 1048576;
+        case ui::PROV_ANTHROPIC:   return 200000;
         case ui::PROV_OPENAI:
         case ui::PROV_CLOUDCOMPAT: return 128000;
         default: return 8192;  // local / unknown
@@ -2434,7 +2462,8 @@ static void submitTurn(AppState& st, const std::string& text) {
         st.agentV2 = true;
         if (st.activityPanel)
             st.activityPanel->clearLive();
-        launchAgentRunV2(st.worker, st.job, text, st.docMirror.docId());
+        launchAgentRunV2(st.worker, st.job, text, st.docMirror.docId(),
+                         st.ribbonTab == AppState::RT_Manufacture);
     } else if (askMode) {
         // Ask -> Wave D: question answering about the open part via agent_ask_v2. The worker
         // answers from the doc tree without mutating anything (an empty doc_id is handled
@@ -2675,10 +2704,9 @@ static void drawComposerChips(AppState& st, bool busy) {
         float tw = ImGui::CalcTextSize(txt.c_str()).x;
         float total = barW + gap + tw;
         float x = ImGui::GetContentRegionMax().x - total;
-        // Only draw when the meter clears the chips with a visible gap. Because `total` already
-        // accounts for the live text width, this stays correct as the token count grows wider.
-        if (x > chipsEndX + 10 * sc) {  // only if it fits on the row clear of the chips
-            ImGui::SameLine(x);
+        // Always draw: on the chips row when it fits, else right-aligned on its own line.
+        if (x > chipsEndX + 10 * sc) ImGui::SameLine(x);
+        else ImGui::SetCursorPosX(std::max(0.0f, x));
             ImVec2 p = ImGui::GetCursorScreenPos();
             float h = ImGui::GetTextLineHeight();
             float by0 = p.y + h * 0.32f, by1 = p.y + h * 0.68f;
@@ -2701,7 +2729,6 @@ static void drawComposerChips(AppState& st, bool busy) {
                 ImGui::SetTooltip("Context window usage — the last model call's input tokens vs the "
                                   "active model's window (%d / %d).\nSet the window in AI settings if "
                                   "your local model differs.", used, win);
-        }
     }
 
     ImGui::PopStyleColor(2);
@@ -2811,11 +2838,12 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
     ImGui::PopStyleColor();
 
     // ---- inline toolbar row ----
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 2 * sc);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * sc, 3 * sc));
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));   // ghost buttons
 
     // + new chat
-    if (ImGui::SmallButton("+")) { newConversation(st); st.prompt[0] = 0; }
+    if (ImGui::Button("+")) { newConversation(st); st.prompt[0] = 0; }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("New chat");
 
     // model chip
@@ -2823,7 +2851,7 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
     char modelLabel[160];
     composerModelLabel(st.settings, modelLabel, sizeof(modelLabel));
     ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-    if (ImGui::SmallButton(modelLabel)) ImGui::OpenPopup("##modeldropdown");
+    if (ImGui::Button(modelLabel)) ImGui::OpenPopup("##modeldropdown");
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Model — click to search and switch.");
 

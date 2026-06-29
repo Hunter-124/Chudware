@@ -1,0 +1,149 @@
+[
+  {
+    "name": "circle",
+    "file": "circle.png",
+    "category": "sketch",
+    "kind": "render",
+    "prompt": "A clean circle outlined in sketch-blue on a faint grid, with a small center point dot and a thin radius line reaching out to a node on the circumference. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "circle_perimeter",
+    "file": "circle_perimeter.png",
+    "category": "sketch_flyouts",
+    "kind": "render",
+    "prompt": "A circle on a sketch plane passing exactly through three highlighted perimeter points spaced around its rim, the three dots glowing on the circle outline with thin construction lines suggesting the fit through them. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "circular_pattern",
+    "file": "circular_pattern.png",
+    "category": "features",
+    "kind": "render",
+    "prompt": "A single hole feature copied evenly around a circular bolt-ring on a round flange, six identical instances spaced at equal angles about the center axis, a faint dashed pitch circle and a curved angular arrow showing the rotational repeat. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "color_picker",
+    "file": "color_picker.png",
+    "category": "appearance",
+    "kind": "icon",
+    "prompt": "A circular HSV color wheel with a smooth continuous rainbow-hue ring and a brightness gradient toward the center, overlaid by an angled eyedropper tool that holds a single sampled paint droplet at its tip. Sleek modern UI icon for a professional parametric-CAD application; single centered glyph with subtle 3D depth and a soft gradient; restrained palette with a teal (#2DD4BF) accent; FULLY TRANSPARENT background (PNG alpha) \u2014 no text labels, no card, no frame; bold, high-contrast, consistent stroke weight, legible at 20-32 px."
+  },
+  {
+    "name": "combine",
+    "file": "combine.png",
+    "category": "features",
+    "kind": "render",
+    "prompt": "Two overlapping solid bodies (a cube and a sphere) merged by boolean union into one seamless joined solid, the internal seam between them dissolved into a single continuous outer surface. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "cone_feature",
+    "file": "cone_feature.png",
+    "category": "primitives",
+    "kind": "render",
+    "prompt": "A solid right circular cone tapering from a broad flat circular base up to a sharp apex point, the conical surface smoothly shaded with a clean curved base rim. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "conic",
+    "file": "conic.png",
+    "category": "sketch_flyouts",
+    "kind": "render",
+    "prompt": "A tensioned conic arc spanning two endpoints with a control triangle showing its apex point and shoulder (rho) point, the smooth curve bowing in a form between an ellipse and a hyperbola, drawn in sketch-blue. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "construction",
+    "file": "construction.png",
+    "category": "sketch",
+    "kind": "icon",
+    "prompt": "A grey dash-dot construction reference line drawn diagonally. Sleek modern UI icon for a professional parametric-CAD application; single centered glyph with subtle 3D depth and a soft gradient; restrained palette with a teal (#2DD4BF) accent; FULLY TRANSPARENT background (PNG alpha) \u2014 no text labels, no card, no frame; bold, high-contrast, consistent stroke weight, legible at 20-32 px."
+  },
+  {
+    "name": "convert_ent",
+    "file": "convert_ent.png",
+    "category": "sketch",
+    "kind": "render",
+    "prompt": "A 3D model edge above projecting straight downward onto a sketch plane via two parallel downward arrows, creating a matching sketch-blue curve on the plane. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "copy",
+    "file": "copy.png",
+    "category": "general",
+    "kind": "icon",
+    "prompt": "Two identical document pages overlapping with a slight offset, the front sheet duplicating the one behind it to indicate copy. Sleek modern UI icon for a professional parametric-CAD application; single centered glyph with subtle 3D depth and a soft gradient; restrained palette with a teal (#2DD4BF) accent; FULLY TRANSPARENT background (PNG alpha) \u2014 no text labels, no card, no frame; bold, high-contrast, consistent stroke weight, legible at 20-32 px."
+  },
+  {
+    "name": "csys",
+    "file": "csys.png",
+    "category": "app_tree",
+    "kind": "render",
+    "prompt": "A user coordinate system shown as three bold arrows from a common origin \u2014 red X, green Y, blue Z \u2014 each tipped with a cone arrowhead and tiny axis labels. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "curvature",
+    "file": "curvature.png",
+    "category": "evaluate",
+    "kind": "render",
+    "prompt": "A smooth freeform spline curve with a curvature comb of evenly spaced perpendicular hairlines spiking outward, their tips connected by an envelope line that bulges at high-curvature zones. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "curve_helix",
+    "file": "curve_helix.png",
+    "category": "features",
+    "kind": "render",
+    "prompt": "A 3D helical spiral curve coiling evenly around an implied vertical cylinder axis, a thin smooth spring-like wire with constant pitch and radius spiraling upward, the dashed center axis visible through the coils. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "cylinder_feature",
+    "file": "cylinder_feature.png",
+    "category": "primitives",
+    "kind": "render",
+    "prompt": "An upright solid cylinder standing on its flat circular base, the curved side wall smoothly shaded and the top showing a clean circular rim, rendered as a simple machined metal primitive. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "delete",
+    "file": "delete.png",
+    "category": "general",
+    "kind": "icon",
+    "prompt": "A trash can with a lifted lid, a handle on top and vertical ribs down the bin, indicating delete. Sleek modern UI icon for a professional parametric-CAD application; single centered glyph with subtle 3D depth and a soft gradient; restrained palette with a teal (#2DD4BF) accent; FULLY TRANSPARENT background (PNG alpha) \u2014 no text labels, no card, no frame; bold, high-contrast, consistent stroke weight, legible at 20-32 px."
+  },
+  {
+    "name": "display_edges",
+    "file": "display_edges.png",
+    "category": "hud",
+    "kind": "render",
+    "prompt": "A solid part with blank unshaded surfaces showing only its sharp model edges highlighted as crisp bold dark outline curves. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "display_hlr",
+    "file": "display_hlr.png",
+    "category": "hud",
+    "kind": "render",
+    "prompt": "A stepped rectangular block drawn purely as clean dark outline edges with every hidden back edge removed, reading as a crisp visible-only line drawing. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "display_hlv",
+    "file": "display_hlv.png",
+    "category": "hud",
+    "kind": "render",
+    "prompt": "The same stepped rectangular block drawn as dark outline edges with its hidden back edges shown as faint grey dashed lines. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "display_shaded",
+    "file": "display_shaded.png",
+    "category": "hud",
+    "kind": "render",
+    "prompt": "A perfectly smooth solid sphere in even matte surface shading with a soft specular highlight and a gentle gradient, showing absolutely no edge lines. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "display_shaded_edges",
+    "file": "display_shaded_edges.png",
+    "category": "hud",
+    "kind": "render",
+    "prompt": "A solid shaded sphere of the same matte material overlaid with thin dark isoparametric edge lines tracing its silhouette and surface curvature. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  },
+  {
+    "name": "display_wire",
+    "file": "display_wire.png",
+    "category": "hud",
+    "kind": "render",
+    "prompt": "A turned cylindrical part shown as a fine wireframe of isoparametric U-V curves wrapping its rounded surfaces and circular ends. Modern glossy 3D product render styled as a professional CAD app icon; single bold centered subject in a clean three-quarter isometric view; neutral bright studio lighting with a subtle teal (#2DD4BF) rim-light accent; precision-engineering / brushed-metal materials; soft contact shadow; FULLY TRANSPARENT background (PNG alpha) \u2014 no card, no text, no labels, no UI frame; high contrast, generous padding, must read clearly at 20-32 px."
+  }
+]

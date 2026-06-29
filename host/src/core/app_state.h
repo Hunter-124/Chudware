@@ -278,6 +278,9 @@ struct JobState {
     std::string drawingDocId;         // non-empty => adopt this drawing as a new tab on success
     std::string drawingName;          // display name for the drawing tab
     std::string drawingSourceId;      // the source part doc the drawing projects from
+    // CAM: the run built a machining job (its own cam doc id) from the current part. The drain
+    // loads it into the Manufacture workspace panel; the active part doc was NOT mutated.
+    std::string camDocId;             // non-empty => load this CAM job into the panel on success
     // Mission orchestrator: a multi-capability run (design -> CFD -> verdict). isMission marks the
     // job so the drain uses missionVerdict (the report stage's prose) as the final chat bubble
     // instead of the generic design summary; createdDocPath still carries any assembly tab to open.
@@ -1038,6 +1041,8 @@ struct AppState {
     int simUnits = 0;
     bool wantFea = false;       // C19: AI_CAD_SHOT=fea scripted static-study scenario
     bool feaShotDone = false;   // guard so the fea scenario runs exactly once
+    bool wantCam = false;       // AI_CAD_SHOT=cam: build a part, run the copilot CAM fast-path,
+    bool camShotDone = false;   //   adopt the job into the Manufacture panel — runs exactly once
     bool wantFlow = false;      // AI_CAD_SHOT=flow scripted external-flow (wind-tunnel) study scenario
     bool flowShotDone = false;  // guard so the flow scenario runs exactly once
     bool wantDrawing = false;   // W17: AI_CAD_SHOT=drawing scripted engineering-drawing scenario

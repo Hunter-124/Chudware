@@ -82,6 +82,10 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     // Viewport is the default-active tab (3D is the primary view); the ECAD tab pops forward on its
     // own (SetNextWindowFocus) when an ECAD document is loaded.
     ImGui::DockBuilderDockWindow("ECAD", main);
+    // CAM (Manufacture workspace) shares the central node too, tabbed with the Viewport. Docked
+    // before the Viewport so 3D stays the default-active tab; the CAM tab pops forward on its own
+    // (SetNextWindowFocus in drawCamManager) when the user enters the Manufacture workspace.
+    ImGui::DockBuilderDockWindow("CAM", main);
     ImGui::DockBuilderDockWindow("Viewport", main);
     ImGui::DockBuilderDockWindow("Viewport###Viewport", main);
     // Command dialogs dock into the lower-right slot so they surface as tabs instead of floating
@@ -273,10 +277,12 @@ void drawLeftPane(AppState& st,
     ImGui::PopStyleVar();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 rail0 = ImGui::GetWindowPos();
-    ImVec2 rail1(rail0.x + stripW, rail0.y + ImGui::GetWindowHeight());
+    const int   nTabs = (int)(sizeof(kTabs)/sizeof(kTabs[0]));
+    const float railH = 6.0f*S + nTabs*btn + (nTabs-1)*gap + 6.0f*S;
+    ImVec2 rail1(rail0.x + stripW, rail0.y + std::min(railH, ImGui::GetWindowHeight()));
     // Translucent glass rail: a faint wash (not the opaque headerBg) so the panel's liquid-glass
     // fill bleeds through; a hairline on the right edge separates the rail from the body.
-    float railWash[4]; ui::Palette::withAlpha(pal.headerBg, railWash, 0.30f);
+    float railWash[4]; ui::Palette::withAlpha(pal.headerBg, railWash, 0.14f);
     dl->AddRectFilled(rail0, rail1, ui::Palette::toU32(railWash));
     dl->AddLine(ImVec2(rail1.x - 0.5f, rail0.y), ImVec2(rail1.x - 0.5f, rail1.y),
                 ui::Palette::toU32(pal.glassBorder), 1.0f * S);

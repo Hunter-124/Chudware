@@ -340,9 +340,9 @@ void applyTheme(Theme t, float scale) {
     c[ImGuiCol_FrameBg]             = fromRole(p.frameBg);
     c[ImGuiCol_FrameBgHovered]      = fromRole(p.frameBgHovered);
     c[ImGuiCol_FrameBgActive]       = fromRole(p.frameBgActive);
-    c[ImGuiCol_TitleBg]             = fromRole(p.headerBg);
-    c[ImGuiCol_TitleBgActive]       = fromRole(p.headerBg);
-    c[ImGuiCol_TitleBgCollapsed]    = fromRole(p.windowBg);
+    c[ImGuiCol_TitleBg]             = rgba(0,0,0,0);
+    c[ImGuiCol_TitleBgActive]       = rgba(0,0,0,0);
+    c[ImGuiCol_TitleBgCollapsed]    = rgba(0,0,0,0);
     c[ImGuiCol_MenuBarBg]           = fromRole(p.headerBg);
     c[ImGuiCol_ScrollbarBg]         = rgba(0,0,0,0);
     c[ImGuiCol_ScrollbarGrab]       = fromRole(p.button);

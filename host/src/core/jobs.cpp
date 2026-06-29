@@ -116,7 +116,7 @@ void launchJob(WorkerClient& w, JobState& job, int kind, std::string payload, bo
 // job.events with an "orch_" prefix (kind field) so the main thread drain can distinguish
 // them from legacy iteration events and route them to the ActivityPanel.
 void launchAgentRunV2(WorkerClient& w, JobState& job,
-                      const std::string& request, const std::string& docId) {
+                      const std::string& request, const std::string& docId, bool cam) {
     if (job.running.exchange(true)) return;
     job.ready = false;
     job.kind = JOB_DESIGN;
@@ -129,7 +129,7 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
 
-    std::thread([&w, &job, request, docId]() {
+    std::thread([&w, &job, request, docId, cam]() {
         nlohmann::json result;
         std::string err;
 
@@ -155,8 +155,11 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
             job.events.push_back(std::move(e));
         };
 
+        // options.cam (true when launched from the Manufacture workspace) lets the core's
+        // CAM fast-path treat a generic "make a program" as a CAM request on the current part.
         bool ok = w.call("agent_run_v2",
-                         {{"request", request}, {"doc_id", docId}},
+                         {{"request", request}, {"doc_id", docId},
+                          {"options", {{"cam", cam}}}},
                          result, err, 900000, onEvent);
         std::lock_guard<std::mutex> lk(job.mtx);
         if (!ok) {
@@ -182,6 +185,10 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
                 job.drawingName = result.value("drawing_name", std::string());
                 job.drawingSourceId = result.value("source_doc_id", std::string());
             }
+            // CAM fast-path: the run built a machining job from the current part (its own cam
+            // doc id). The drain loads it into the Manufacture workspace; the part was untouched.
+            if (result.value("created_cam", false) && result.value("status", "") == "done")
+                job.camDocId = result.value("cam_doc_id", std::string());
         }
         job.ready = true;
         job.running = false;

@@ -1,0 +1,85 @@
+# AGENTS.md — AI-CAD repo navigation + ownership
+
+This is the canonical agent-navigation and ownership doc for the whole AI-CAD
+codebase. Read this first before any refactor work.
+
+## Project
+
+AI-CAD is a parametric CAD application. The core geometry/document/solver/CAM
+engine is a C++ library `libaicad` (under `core/`) that is strangling out a
+legacy Python `engine/` oracle — the two are kept in lockstep by a per-subsystem
+parity corpus until each Python module is flipped off and deleted. The desktop
+GUI is an ImGui shell (under `app/`, with the older `host/` tree being migrated
+into `app/` and then deleted). The active refactor plan lives at
+`/home/hunter/.cursor/plans/cad_modular_refactor_+_gui_abstraction_6371dd9f.plan.md`
+and is the source of truth for the target layered layout and the per-phase DAG.
+
+## Repo map (current on-disk reality)
+
+The target layout (see the plan's "Target layered layout" section) re-homes most
+of these dirs; until a move node lands, the dirs below are where the code
+physically lives today. "→ moves" marks dirs slated to move per the plan.
+
+| Dir | Purpose (current) | Plan target |
+|-----|-------------------|-------------|
+| `core/` | Pure C++/CUDA kernel → `libaicad` (the zero-Python engine target): geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. | Stays `core/`. |
+| `host/` | Legacy C++ ImGui desktop host: `src/ui/*` (panels/editors), `src/render/*` (GL viewport), `src/core/*` (app_state/doc_mirror/worker_client). **End-of-life** — migrated into `app/` + `ui/` + `services/worker/`, then deleted (N4b). | → `app/` + `ui/` + `services/worker/`; deleted N4b. |
+| `app/` | New ImGui desktop GUI rewrite (`src/ui/*`, `src/platform/*`). The first concrete backend over the future `ui/abstract` view-model seam. | → `ui/imgui/` (+ `platform/`). |
+| `engine/` | Legacy Python engine — the parity oracle, kept frozen while `core/` catches up subsystem-by-subsystem. Deleted LAST (N6b). | → `engine-oracle/`; deleted N6b. |
+| `agent/` | Built-in agent loop (Python now → C++ later) driving the Copilot panel. | → `services/agent/`. |
+| `mcp_server/` | MCP server exposing CAD tools to external agents. | → `services/mcp/`. |
+| `installer/` | Provisioning, MCP registration, packaging. | → `services/installer/`. |
+| `docs/` | Design docs, status notes, parity specs, contracts (contracts move out in N0c). | Stays `docs/` (contracts promoted out). |
+| `contracts/` | Frozen interface contracts — THE seams (promoted from `docs/contracts/` in N0c). Append-only, integrator-owned. | New in N0c. |
+| `tools/` | One-off dev/analysis tools. | Stays. |
+| `scripts/` | Repo gates + audits: `check.py` (stdlib gate), `gui_lint.py`, `feature_surface_audit.py`, `parity_audit.py`, `gate.sh` (Linux gate, N0d). | Stays. |
+| `corpus/` | Canonical input corpus for parity/screenshot tests. | → `corpora/`. |
+| `corpus_render/` | Render-output corpus (headless screenshots). | → `corpora/`. |
+| `corpus_sw_parity/` | Software-parity corpus (SW vs engine vs libaicad). | → `corpora/`. |
+| `test_fixtures_sw/` | SW test fixtures. | → `corpora/`. |
+| `third_party/` | Vendored third-party deps. | Stays. |
+| `scratch/` | Throwaway scratch area. | Stays (non-blocking). |
+
+## Swarm operating rules
+
+Generalized from `docs/gui_rework_handoff.md` — these are binding for every
+agent working in this repo during the refactor.
+
+- **No worktree isolation.** Worktrees in this repo branch from a stale base and
+  silently revert `master`. Run all subagents non-isolated in the main tree.
+- **One integrator agent** owns all shared / append-only files (top-level
+  CMake, `contracts/`, `AGENTS.md`, `scripts/gate.sh`, `core/api/libaicad.h`,
+  `ui/abstract/command_registry.*`, `worker_rpc.md`) and does **all git
+  commits**. Leaf subagents never run git.
+- **Leaf subagents never touch files outside their assigned scope** and never
+  run git. Each node lists its owned write-set.
+- **Disjoint write-sets** for any parallel pair of nodes.
+- **Append-only shared files** (`contracts/*`, `core/api/libaicad.h`,
+  `ui/abstract/command_registry.*`, top-level CMake, `worker_rpc.md`) get
+  exactly one owner per round; the integrator merges.
+- **A node is done when `scripts/gate.sh` is green.** The integrator rebuilds
+  once per wave; leaf nodes do **not** self-build if a parallel node shares the
+  build graph.
+- **Each node writes a one-paragraph handoff** to `docs/REFACTOR_LOG.md`
+  (files touched, deferred, gotchas).
+
+## Build / test cadence
+
+- The Linux gate is `scripts/gate.sh` (created in N0d). It runs the stdlib
+  `scripts/check.py` (always), then the C++ core CMake/Ninja build + ctest
+  (skipped with a clear reason if OCCT is not installed), then the engine+agent
+  pytest suites (skipped with a clear reason if the runtime venv / pytest is not
+  provisioned). Every DAG node must leave `scripts/gate.sh` green.
+- The engine + agent pytest suites (`<venv>/python -X utf8 -m pytest engine/doc agent -q`)
+  need the runtime venv, which may be **absent on this Linux box** — that is a
+  SKIP, not a failure.
+- `scripts/check.py` is the stdlib-only fast gate (gui_lint icons/theme,
+  feature_surface_audit, parity_audit) and always runs.
+
+## Pointers
+
+- Plan: `/home/hunter/.cursor/plans/cad_modular_refactor_+_gui_abstraction_6371dd9f.plan.md`
+- Frozen contracts: `contracts/` (see `contracts/README.md`)
+- Architecture: `ARCHITECTURE.md`
+- C++ strangler status: `docs/CPP_MIGRATION.md`
+- Refactor handoff log: `docs/REFACTOR_LOG.md`

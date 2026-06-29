@@ -82,6 +82,8 @@ struct Stock {
     double off_axial = 0;   // CylinderOffset (per end)
     // FromSolid: the stock body as a mesh (e.g. a near-net casting).
     TriMesh solid;
+    // material being machined (cutting-data DB id; drives feeds & speeds).
+    std::string material = "aluminum";
 
     json to_json() const;
     static Stock from_json(const json&);

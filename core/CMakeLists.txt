@@ -184,7 +184,8 @@ add_library(aicad_cam STATIC
   cam/op_cut.cpp
   cam/op_turn.cpp
   cam/post.cpp
-  cam/stock_sim.cpp)
+  cam/stock_sim.cpp
+  cam/session.cpp)
 target_include_directories(aicad_cam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_cam PUBLIC
   aicad_clipper2 aicad_miniz nlohmann_json::nlohmann_json)

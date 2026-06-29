@@ -205,7 +205,7 @@ json Stock::to_json() const {
     json j{{"type", cam::to_string(type)}, {"min", cam::to_json(min)}, {"max", cam::to_json(max)},
            {"off_xy", off_xy}, {"off_ztop", off_ztop}, {"off_zbot", off_zbot},
            {"base", cam::to_json(base)}, {"radius", radius}, {"height", height},
-           {"off_radial", off_radial}, {"off_axial", off_axial}};
+           {"off_radial", off_radial}, {"off_axial", off_axial}, {"material", material}};
     if (!solid.verts.empty()) j["solid"] = cam::to_json(solid);
     return j;
 }
@@ -223,6 +223,7 @@ Stock Stock::from_json(const json& j) {
     s.off_radial = num(j.value("off_radial", json(0.0)));
     s.off_axial = num(j.value("off_axial", json(0.0)));
     if (j.contains("solid")) s.solid = trimesh_from_json(j["solid"]);
+    s.material = j.value("material", std::string("aluminum"));
     return s;
 }
 

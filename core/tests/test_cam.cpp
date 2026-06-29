@@ -12,6 +12,7 @@
 #include "cam/heightfield.h"
 #include "cam/post.h"
 #include "cam/stock_sim.h"
+#include "cam/session.h"
 #include "cam/model.h"
 
 using namespace aicad::cam;
@@ -790,4 +791,94 @@ TEST_CASE("sim: rapid through stock is flagged") {
     SimResult r = simulate_setup(su, lib, {tp}, TriMesh{}, so);
     REQUIRE(r.ok);
     CHECK(r.rapid_collisions > 0);
+}
+
+// ── session + RPC tests (Phase 6) ────────────────────────────────────────────
+TEST_CASE("session: new / apply_ops / generate / post / undo / save+open") {
+    json nw = cam_new(json{{"name", "JobA"}, {"post", "fanuc"}});
+    std::string doc = nw["doc_id"].get<std::string>();
+    CHECK(nw["tree"]["name"] == "JobA");
+
+    // build a setup + tool + contour op via ops
+    json ops = json::array();
+    ops.push_back(json{{"op", "add_tool"}, {"tool", json{{"number", 1}, {"type", "endmill_flat"}, {"diameter", 6}, {"flutes", 3}}}});
+    json setup = json{{"name", "S1"}, {"machine", json{{"kind", "mill3"}}},
+                      {"stock", json{{"type", "box"}, {"min", {-25,-25,-10}}, {"max", {25,25,0}}, {"material", "aluminum"}}}};
+    ops.push_back(json{{"op", "add_setup"}, {"setup", setup}, {"ref", "S"}});
+    json apply1 = cam_apply_ops(doc, -1, ops);
+    std::string sid = apply1["id_map"]["S"].get<std::string>();
+    CHECK(apply1["revision"].get<long>() == 2);
+
+    json contour = json{{"type", "contour2d"}, {"tool_number", 1}, {"comp_side", "left"},
+                        {"heights", json{{"top", 0}, {"bottom", -4}}}, {"stepdown", 2},
+                        {"geometry", json{{"regions", json::array({to_json(square(0,0,10))})}}}};
+    json apply2 = cam_apply_ops(doc, 2, json::array({json{{"op", "add_operation"}, {"setup_id", sid}, {"operation", contour}, {"ref", "O"}}}));
+    CHECK(apply2["revision"].get<long>() == 3);
+
+    // generate
+    json gen = cam_generate(doc, json::object());
+    CHECK(gen["toolpaths"].size() == 1);
+    CHECK(gen["stats"]["count"].get<int>() == 1);
+
+    // post
+    json post = cam_post(doc, json{{"dialect", "grbl"}});
+    CHECK(post["ok"].get<bool>());
+    CHECK(post["gcode"].get<std::string>().find("G21") != std::string::npos);
+
+    // tree + stats
+    json tr = cam_tree(doc);
+    CHECK(tr["stats"]["operations"].get<int>() == 1);
+    CHECK(tr["stats"]["tools"].get<int>() == 1);
+
+    // undo removes the operation
+    json un = cam_undo(doc);
+    CHECK(cam_tree(doc)["stats"]["operations"].get<int>() == 0);
+    json re = cam_redo(doc);
+    CHECK(cam_tree(doc)["stats"]["operations"].get<int>() == 1);
+
+    // save + open round-trip
+    std::string path = "/tmp/aicad_test.cam+";
+    json sv = cam_save(doc, path);
+    CHECK(sv["path"] == path);
+    json op2 = cam_open(path);
+    std::string doc2 = op2["doc_id"].get<std::string>();
+    CHECK(cam_tree(doc2)["stats"]["operations"].get<int>() == 1);
+
+    // stale revision guard
+    bool threw = false;
+    try { cam_apply_ops(doc, 99, json::array()); } catch (const OpError& e) { threw = (e.code == "stale_revision"); }
+    CHECK(threw);
+
+    CHECK(cam_close(doc));
+    CHECK(cam_close(doc2));
+}
+
+TEST_CASE("session: stale-doc + reference data RPCs") {
+    bool threw = false;
+    try { cam_tree("nonexistent_doc"); } catch (const OpError& e) { threw = (e.code == "unknown_doc"); }
+    CHECK(threw);
+    CHECK(cam_post_dialects()["dialects"].size() == 8);
+    CHECK(cam_materials()["materials"].size() >= 20);
+    CHECK(cam_tool_types()["tool_types"].size() > 10);
+    CHECK(cam_op_types()["op_types"].size() == 28);
+}
+
+TEST_CASE("session: inline generate + post (stateless)") {
+    Job job;
+    job.post = "linuxcnc";
+    Tool t; t.number = 1; t.type = ToolType::EndmillFlat; t.diameter = 6; t.flutes = 3;
+    job.tools.tools = {t};
+    Setup su; su.id = "s1"; su.machine.kind = MachineKind::Mill3;
+    su.stock.type = StockType::Box; su.stock.min = {-20,-20,-5}; su.stock.max = {20,20,0};
+    su.stock.material = "aluminum";
+    Operation op; op.id = "o1"; op.type = OpType::Pocket2D; op.tool_number = 1;
+    op.heights.top = 0; op.heights.bottom = -3; op.stepover = 3;
+    op.geometry["regions"] = json::array({to_json(square(0,0,15))});
+    su.operations = {op};
+    job.setups = {su};
+    json gen = cam_generate_inline(json{{"job", job.to_json()}, {"setup_index", 0}});
+    REQUIRE(gen["toolpaths"].size() == 1);
+    json post = cam_post_inline(json{{"job", job.to_json()}, {"toolpaths", gen["toolpaths"]}, {"dialect", "linuxcnc"}});
+    CHECK(post["ok"].get<bool>());
+    CHECK(post["gcode"].get<std::string>().size() > 50);
 }

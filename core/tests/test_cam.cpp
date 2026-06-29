@@ -8,6 +8,7 @@
 
 #include "cam/geometry.h"
 #include "cam/feeds.h"
+#include "cam/operations.h"
 #include "cam/model.h"
 
 using namespace aicad::cam;
@@ -268,4 +269,174 @@ TEST_CASE("feeds: cutting DB has the expected materials + merge works") {
     // override existing
     custom.merge(json{{"materials", json::array({json{{"id", "aluminum"}, {"sfm_mill", 1234}}})}});
     CHECK(custom.find("aluminum")->sfm_mill == doctest::Approx(1234));
+}
+
+// ── operation generator tests ───────────────────────────────────────────────
+namespace {
+OpContext mill_ctx(double tool_dia = 6.0, ToolType tt = ToolType::EndmillFlat) {
+    OpContext c;
+    c.machine.kind = MachineKind::Mill3;
+    c.material_id = "aluminum";
+    c.tool.number = 1;
+    c.tool.type = tt;
+    c.tool.diameter = tool_dia;
+    c.tool.flutes = 3;
+    c.stock.type = StockType::Box;
+    c.stock.min = {-25, -25, -10};
+    c.stock.max = {25, 25, 0};
+    return c;
+}
+void path_xy_bounds(const Toolpath& tp, Vec2& lo, Vec2& hi) {
+    lo = {1e300, 1e300}; hi = {-1e300, -1e300};
+    for (auto& m : tp.moves) {
+        lo.x = std::min(lo.x, m.to.x); lo.y = std::min(lo.y, m.to.y);
+        hi.x = std::max(hi.x, m.to.x); hi.y = std::max(hi.y, m.to.y);
+    }
+}
+int count_kind(const Toolpath& tp, MoveKind k) {
+    int n = 0; for (auto& m : tp.moves) if (m.kind == k) ++n; return n;
+}
+}  // namespace
+
+TEST_CASE("op: contour offsets outside by tool radius") {
+    OpContext ctx = mill_ctx(6.0);
+    Operation op;
+    op.id = "c1";
+    op.type = OpType::Contour2D;
+    op.comp_side = CompSide::Left;          // tool outside the boundary
+    op.heights.top = 0; op.heights.bottom = -5; op.stepdown = 2.5;
+    op.geometry["regions"] = json::array({to_json(square(0, 0, 10))});  // 20x20
+    GenResult r = gen_contour2d(op, ctx);
+    REQUIRE(r.ok);
+    CHECK(r.path.cut_length > 0);
+    CHECK(count_kind(r.path, MoveKind::Cut) > 0);
+    Vec2 lo, hi; path_xy_bounds(r.path, lo, hi);
+    // outside offset by r=3 -> ~26x26 envelope
+    CHECK(hi.x == doctest::Approx(13.0).epsilon(0.05));
+    CHECK(lo.x == doctest::Approx(-13.0).epsilon(0.05));
+    // multi-depth: 5mm / 2.5 stepdown -> 2 levels, so loop cut twice
+    CHECK(count_kind(r.path, MoveKind::Plunge) >= 2);
+}
+
+TEST_CASE("op: contour feeds resolved from material when unset") {
+    OpContext ctx = mill_ctx(6.0);
+    Operation op;
+    op.type = OpType::Contour2D;
+    op.heights.top = 0; op.heights.bottom = -2;
+    op.geometry["regions"] = json::array({to_json(square(0, 0, 10))});
+    GenResult r = gen_contour2d(op, ctx);
+    REQUIRE(r.ok);
+    // a cut move must carry a nonzero feed (resolved)
+    bool any_feed = false;
+    for (auto& m : r.path.moves) if (m.kind == MoveKind::Cut && m.feed > 0) any_feed = true;
+    CHECK(any_feed);
+    CHECK(r.path.cycle_time_s > 0);
+}
+
+TEST_CASE("op: pocket clears inside the region and stays in bounds") {
+    OpContext ctx = mill_ctx(6.0);
+    Operation op;
+    op.id = "p1";
+    op.type = OpType::Pocket2D;
+    op.heights.top = 0; op.heights.bottom = -4; op.stepdown = 2.0;
+    op.stepover = 3.0;
+    op.geometry["regions"] = json::array({to_json(square(0, 0, 20))});  // 40x40
+    GenResult r = gen_pocket2d(op, ctx);
+    REQUIRE(r.ok);
+    CHECK(r.path.cut_length > 0);
+    // every CUT move stays inside the machinable area (region inset by r): |xy|<=17
+    for (auto& m : r.path.moves)
+        if (m.kind == MoveKind::Cut) {
+            CHECK(std::fabs(m.to.x) <= 17.001);
+            CHECK(std::fabs(m.to.y) <= 17.001);
+        }
+}
+
+TEST_CASE("op: pocket respects an island hole") {
+    OpContext ctx = mill_ctx(6.0);
+    Region reg = square(0, 0, 20);
+    reg.holes.push_back(square(0, 0, 6).outer);  // 12x12 island
+    Operation op;
+    op.type = OpType::Pocket2D;
+    op.heights.top = 0; op.heights.bottom = -3; op.stepover = 3.0;
+    op.geometry["regions"] = json::array({to_json(reg)});
+    GenResult r = gen_pocket2d(op, ctx);
+    REQUIRE(r.ok);
+    // no cut move should land deep inside the island (island grown by tool r=3 -> |xy|<3)
+    for (auto& m : r.path.moves)
+        if (m.kind == MoveKind::Cut) {
+            bool deep_in_island = (std::fabs(m.to.x) < 2.5) && (std::fabs(m.to.y) < 2.5);
+            CHECK_FALSE(deep_in_island);
+        }
+}
+
+TEST_CASE("op: facing rasters across the stock") {
+    OpContext ctx = mill_ctx(10.0, ToolType::FaceMill);
+    Operation op;
+    op.type = OpType::Face;
+    op.heights.top = 0; op.heights.bottom = -0.5;
+    op.stepover = 6.0;
+    GenResult r = gen_face(op, ctx);
+    REQUIRE(r.ok);
+    CHECK(r.path.cut_length > 0);
+    CHECK(count_kind(r.path, MoveKind::Cut) >= 6);
+}
+
+TEST_CASE("op: drilling cycles produce moves per hole; peck pecks") {
+    OpContext ctx = mill_ctx(5.0, ToolType::Drill);
+    json pts = json::array({json::array({0, 0, 0}), json::array({10, 0, 0}), json::array({20, 0, 0})});
+    Operation simple;
+    simple.type = OpType::Drill; simple.cycle = "drill";
+    simple.heights.top = 0; simple.heights.bottom = -10; simple.heights.retract = 2;
+    simple.geometry["points"] = pts;
+    GenResult rs = gen_drill(simple, ctx);
+    REQUIRE(rs.ok);
+    CHECK(count_kind(rs.path, MoveKind::Plunge) == 3);   // one plunge per hole
+
+    Operation peck = simple;
+    peck.cycle = "peck"; peck.peck = 2.0;                 // 10mm / 2mm -> 5 pecks/hole
+    GenResult rp = gen_drill(peck, ctx);
+    REQUIRE(rp.ok);
+    CHECK(count_kind(rp.path, MoveKind::Plunge) > count_kind(rs.path, MoveKind::Plunge));
+}
+
+TEST_CASE("op: engrave follows a V-bit groove at width-derived depth") {
+    OpContext ctx = mill_ctx(6.0, ToolType::VBit);
+    ctx.tool.tip_angle = 60;
+    Operation op;
+    op.type = OpType::Engrave;
+    op.heights.top = 0; op.heights.bottom = -5;
+    op.extra["width"] = 1.0;             // 1mm groove -> depth = 0.5/tan(30) ~= 0.866
+    op.geometry["contours"] = json::array({json::array({json::array({-10, 0}), json::array({10, 0})})});
+    GenResult r = gen_engrave(op, ctx);
+    REQUIRE(r.ok);
+    double minz = 1e9;
+    for (auto& m : r.path.moves) if (m.kind == MoveKind::Cut) minz = std::min(minz, m.to.z);
+    CHECK(minz == doctest::Approx(-0.866).epsilon(0.05));
+}
+
+TEST_CASE("op: adaptive uses small engagement, helical entry, deep cut") {
+    OpContext ctx = mill_ctx(6.0);
+    Operation op;
+    op.type = OpType::Adaptive2D;
+    op.heights.top = 0; op.heights.bottom = -12;   // deep
+    op.geometry["regions"] = json::array({to_json(square(0, 0, 20))});
+    GenResult r = gen_adaptive2d(op, ctx);
+    REQUIRE(r.ok);
+    CHECK(r.path.cut_length > 0);
+    // helical entry => many cut moves changing Z before reaching depth
+    CHECK(count_kind(r.path, MoveKind::Cut) > 20);
+}
+
+TEST_CASE("op: generate() dispatch + suppressed + not-yet-wired") {
+    OpContext ctx = mill_ctx(6.0);
+    Operation op;
+    op.type = OpType::Contour2D;
+    op.heights.bottom = -2;
+    op.geometry["regions"] = json::array({to_json(square(0, 0, 10))});
+    CHECK(generate(op, ctx).ok);
+    Operation sup = op; sup.suppressed = true;
+    CHECK(generate(sup, ctx).ok);            // suppressed -> ok, no path
+    Operation turn; turn.type = OpType::TurnRough;
+    CHECK_FALSE(generate(turn, ctx).ok);     // turning wave not wired yet
 }

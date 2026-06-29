@@ -10,6 +10,9 @@ host/build*/
 # build*/ covers build-linux, build-occt, build-occt-linux, etc.
 core/build*/
 
+# Root-level CMake preset build dirs (CMakePresets linux-core / linux-app → build/linux-*)
+/build/
+
 # Test caches
 .pytest_cache/
 

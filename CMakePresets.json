@@ -1,0 +1,41 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "linux-core",
+      "displayName": "Linux core (libaicad, Ninja, OCCT)",
+      "description": "Configure the pure-C++ core libaicad with the OCCT geometry kernel (core/).",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-core",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "AICAD_BUILD_CORE": "ON",
+        "AICAD_WITH_OCCT": "ON"
+      }
+    },
+    {
+      "name": "linux-app",
+      "displayName": "Linux app (ImGui GUI, Ninja)",
+      "description": "Configure the new ImGui desktop GUI under app/.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-app",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "AICAD_BUILD_APP": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "linux-core",
+      "configurePreset": "linux-core",
+      "configuration": "Release"
+    },
+    {
+      "name": "linux-app",
+      "configurePreset": "linux-app",
+      "configuration": "Release"
+    }
+  ]
+}

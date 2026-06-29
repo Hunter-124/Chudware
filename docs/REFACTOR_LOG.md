@@ -51,3 +51,20 @@ by the gate, and those trees move/reorganize in later phases; the path fixups
 land with the per-subsystem moves. `AGENTS.md`'s "promoted from `docs/contracts/`"
 line was preserved as historical prose. `scripts/parity_audit.py` references
 `docs/SW_PARITY_SPEC.md` (not `docs/contracts`), so no script change was needed.
+
+### N0d — Linux gate + CMake presets
+Added `scripts/gate.sh` (executable, `set -euo pipefail`): runs `scripts/check.py`
+(recorded; pre-existing red is non-fatal via `CHECK_PY_FATAL=0` until the
+ribbon/parity gaps close), then the core CMake/Ninja build with
+`-DAICAD_WITH_OCCT=ON` + `ctest` (SKIP if system OCCT cmake config not found),
+then engine+agent pytest (SKIP if no venv/pytest). Prints a PASS/SKIP summary
+and exits 0 on environment SKIPs. Added `CMakePresets.json` (`linux-core`,
+`linux-app`, Ninja) plus a minimal root `CMakeLists.txt` dispatcher so the
+presets can wrap the existing `core/` and `app/` builds (the real layered
+top-level CMake lands in N1a; the gate does NOT use presets — it drives
+`cmake -S core` directly). Added `/build/` to `.gitignore` for preset build dirs.
+
+**Gate result on this box:** `bash scripts/gate.sh` exits 0 — `check.py`
+FAIL-RECORDED (pre-existing), core build PASS (system OCCT 7.9.1 at
+`/usr/lib64/cmake/opencascade`), ctest PASS (41/41), pytest SKIP (no runtime
+venv / pytest installed).

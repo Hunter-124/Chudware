@@ -64,6 +64,10 @@ register_intake_tools(mcp)
 from mcp_server.ecad_tools import register_ecad_tools
 register_ecad_tools(mcp)
 
+# CAM (computer-aided machining): toolpaths, feeds & speeds, material-removal sim, G-code post.
+from mcp_server.cam_tools import register_cam_tools
+register_cam_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

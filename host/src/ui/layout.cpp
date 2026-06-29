@@ -237,7 +237,7 @@ void drawLeftPane(AppState& st,
         ImVec2 p0 = ImGui::GetWindowPos();
         ImVec2 sz = ImGui::GetWindowSize();
         ui::glassBackground(ImGui::GetWindowDrawList(), p0,
-                            ImVec2(p0.x + sz.x, p0.y + sz.y), 0.0f, 0.55f);
+                            ImVec2(p0.x + sz.x, p0.y + sz.y), 0.0f, 0.45f);
     }
 
     const auto& pal = ui::palette;
@@ -274,7 +274,12 @@ void drawLeftPane(AppState& st,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 rail0 = ImGui::GetWindowPos();
     ImVec2 rail1(rail0.x + stripW, rail0.y + ImGui::GetWindowHeight());
-    dl->AddRectFilled(rail0, rail1, ui::Palette::toU32(pal.headerBg));
+    // Translucent glass rail: a faint wash (not the opaque headerBg) so the panel's liquid-glass
+    // fill bleeds through; a hairline on the right edge separates the rail from the body.
+    float railWash[4]; ui::Palette::withAlpha(pal.headerBg, railWash, 0.30f);
+    dl->AddRectFilled(rail0, rail1, ui::Palette::toU32(railWash));
+    dl->AddLine(ImVec2(rail1.x - 0.5f, rail0.y), ImVec2(rail1.x - 0.5f, rail1.y),
+                ui::Palette::toU32(pal.glassBorder), 1.0f * S);
     // Center the square button in the rail. SetCursorPosX must be set PER button: ImGui resets X to
     // the line start after each Dummy, so a single SetCursorPos before the loop would only offset the
     // first icon (the others would snap to x=0), producing the off-center / zig-zag look.
@@ -329,7 +334,7 @@ void drawLeftPane(AppState& st,
     const float bodyPad = 12.0f * S;
     const float sbSize  = 8.0f * S;
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], 0.22f));
+        ImVec4(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], 0.16f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(bodyPad, ImGui::GetStyle().WindowPadding.y));
     ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, sbSize);

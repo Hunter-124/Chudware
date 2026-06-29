@@ -2376,7 +2376,7 @@ void drawFeatureTreeBody(AppState& st,
                             const float pr = 3.5f * S;
                             ImVec2 pillMin(rowMin.x + 2.0f * S, rowMin.y + 2.0f * S);
                             ImVec2 pillMax(rowMax.x - 2.0f * S, rowMax.y - 2.0f * S);
-                            rowDl->AddRectFilled(pillMin, pillMax, IM_COL32(8, 12, 20, 160), pr);
+                            rowDl->AddRectFilled(pillMin, pillMax, IM_COL32(8, 12, 20, 110), pr);
                             if (rowIdx % 2 == 0)
                                 rowDl->AddRectFilled(pillMin, pillMax, IM_COL32(255, 255, 255, 12), pr);
                         }

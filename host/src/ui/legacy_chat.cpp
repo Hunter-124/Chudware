@@ -2926,8 +2926,16 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // throttled to ~5s and no-ops for a non-loopback (cloud) base_url, so this is cheap.
     refreshModelAvailability(st, false);
 
-    if (!ImGui::Begin("Copilot###AI")) { ImGui::End(); return; }
+    if (!ImGui::Begin("Copilot###AI", nullptr, ImGuiWindowFlags_NoBackground)) { ImGui::End(); return; }
     ui::Fonts& fonts = st.fonts;
+    // Full-panel liquid-glass chrome — match the FeatureManager (translucent fill + shadow + shine
+    // + specular) so the Copilot pane reads as the same frosted-glass surface.
+    {
+        ImVec2 gp0 = ImGui::GetWindowPos();
+        ImVec2 gsz = ImGui::GetWindowSize();
+        ui::glassBackground(ImGui::GetWindowDrawList(), gp0,
+                            ImVec2(gp0.x + gsz.x, gp0.y + gsz.y), 0.0f, 0.45f);
+    }
 
     // Remember which dock node we live in so the sibling "Settings" tab can dock next to us.
     st.aiDockId = (unsigned int)ImGui::GetWindowDockID();

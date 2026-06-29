@@ -1,4 +1,4 @@
-#include "ui/command_registry.h"
+#include "command_registry.h"
 #include <cstring>
 #include <unordered_set>
 #include <string>

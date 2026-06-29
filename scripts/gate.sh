@@ -105,9 +105,29 @@ stage_core_build() {
     CORE_BUILD_OK=1
 }
 
-# ---- Stage 3: ctest ---------------------------------------------------------
+# ---- Stage 2b: ui/abstract build + test -------------------------------------
+stage_ui_abstract() {
+    echo "=== [2b/5] ui/abstract build + ctest ==="
+    if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
+        record "ui/abstract         SKIP    cmake or ninja not on PATH"
+        echo "  SKIP: cmake/ninja missing"
+        return 0
+    fi
+    if cmake -S . -B build/linux-ui-abstract -DAICAD_BUILD_CORE=OFF -DAICAD_BUILD_UI_ABSTRACT=ON -G Ninja > /tmp/gate_uiabs_cfg.out 2>&1 \
+       && cmake --build build/linux-ui-abstract --config Release > /tmp/gate_uiabs_build.out 2>&1 \
+       && ctest --test-dir build/linux-ui-abstract -C Release --output-on-failure > /tmp/gate_uiabs_ctest.out 2>&1; then
+        record "ui/abstract         PASS    command_registry test green"
+        echo "  PASS"
+    else
+        record "ui/abstract         FAIL    build or ctest (see /tmp/gate_uiabs_*.out)"
+        echo "  FAIL: ui/abstract"; tail -n 10 /tmp/gate_uiabs_build.out 2>/dev/null | sed 's/^/    /'
+        fail_fatal=1
+    fi
+}
+
+# ---- Stage 3: ctest (core) -------------------------------------------------
 stage_ctest() {
-    echo "=== [3/4] ctest (core) ==="
+    echo "=== [3/5] ctest (core) ==="
     if [ "${CORE_BUILD_OK:-0}" -ne 1 ]; then
         record "ctest               SKIP    core build did not succeed"
         echo "  SKIP: no core build"
@@ -132,7 +152,7 @@ stage_ctest() {
 
 # ---- Stage 4: engine + agent pytest -----------------------------------------
 stage_pytest() {
-    echo "=== [4/4] engine + agent pytest ==="
+    echo "=== [4/5] engine + agent pytest ==="
     local venv_py=""
     for cand in runtime/venv/bin/python .venv/bin/python venv/bin/python; do
         [ -x "$cand" ] && { venv_py="$cand"; break; }
@@ -163,6 +183,7 @@ stage_pytest() {
 CORE_BUILD_OK=0
 stage_check
 stage_core_build
+stage_ui_abstract
 stage_ctest
 stage_pytest
 

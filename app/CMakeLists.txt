@@ -61,6 +61,9 @@ target_link_libraries(imgui PUBLIC glfw)
 add_library(glad STATIC ${GLAD_DIR}/src/gl.c)
 target_include_directories(glad PUBLIC ${GLAD_DIR}/include)
 
+# --- ui/abstract (framework-neutral command registry + view-model seam) ----
+add_subdirectory("${REPO}/ui/abstract" "${CMAKE_BINARY_DIR}/ui_abstract" EXCLUDE_FROM_ALL)
+
 # --- new app sources ---------------------------------------------------------
 file(GLOB_RECURSE APP_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 
@@ -87,7 +90,7 @@ target_include_directories(AI-CAD2 PRIVATE
   ${HOST}                              # include host headers as "src/..." (NOT ${HOST}/src — math.h shadow)
   ${DEPS}/json-src/single_include
   ${DEPS}/stb-src)
-target_link_libraries(AI-CAD2 PRIVATE imgui glad glfw)
+target_link_libraries(AI-CAD2 PRIVATE imgui glad glfw aicad_ui_abstract)
 if(USE_BRIDGE)
   if(WIN32)
     target_compile_definitions(AI-CAD2 PRIVATE AICAD_HAVE_BRIDGE=1
@@ -104,11 +107,9 @@ else()
   target_link_libraries(AI-CAD2 PRIVATE dl pthread)
 endif()
 
-# Registry smoke tests (no GL/engine dependency).
-add_executable(test_command_registry
-  test/test_command_registry.cpp
-  src/ui/command_registry.cpp)
-target_include_directories(test_command_registry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# Registry smoke tests (no GL/engine dependency) — lives in ui/abstract/.
+add_executable(test_command_registry_app test/test_command_registry.cpp)
+target_link_libraries(test_command_registry_app PRIVATE aicad_ui_abstract)
 
 # Stage the resources next to the exe so the app finds fonts/icons at runtime.
 add_custom_command(TARGET AI-CAD2 POST_BUILD

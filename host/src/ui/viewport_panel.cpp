@@ -1716,9 +1716,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const float bandH   = cr0.y - bandTop;
             if (bandH > 0.5f) {
                 ImDrawList* bgDl = ImGui::GetBackgroundDrawList();
-                const ImVec2 bp0(mainVp->Pos.x, bandTop);
-                const ImVec2 bp1(mainVp->Pos.x + (float)vw, cr0.y);
-                bgDl->AddRectFilled(bp0, bp1, ui::Palette::toU32(ui::palette.windowBg));
+                // Restrict to the viewport dock node's horizontal extent so the band does
+                // not bleed over the FeatureManager or Copilot panels.
+                const ImVec2 bp0(vpNode->Pos.x, bandTop);
+                const ImVec2 bp1(vpNode->Pos.x + vpNode->Size.x, cr0.y);
+                float bandFill[4]; ui::Palette::withAlpha(ui::palette.glassBg, bandFill, 0.70f);
+                bgDl->AddRectFilled(bp0, bp1, ui::Palette::toU32(bandFill));
             }
         }
         // Input surface: an invisible button over the visible 3D (the content rect). It carries the

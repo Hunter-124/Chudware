@@ -267,25 +267,25 @@ void drawLeftPane(AppState& st,
     const float glyph = 20.0f * S;
     const float gap = 4.0f * S;
     const ImGuiStyle& style = ImGui::GetStyle();
-    const float stripW = btn + 8.0f * S;
+    const float stripW     = btn + 8.0f * S;
+    const int   nTabs      = (int)(sizeof(kTabs)/sizeof(kTabs[0]));
+    const float railH      = 6.0f*S + nTabs*btn + (nTabs-1)*gap + 6.0f*S;
+    const float paneAvailH = ImGui::GetContentRegionAvail().y;
 
     // Zero the child's WindowPadding so the rail background (drawn from GetWindowPos) and the button
     // column share one origin — otherwise the default padding offsets the buttons from the rail bg.
+    // Fixed height = railH so all icon buttons are always within the clip rect regardless of the
+    // parent's available height (height=0 could clip the last button when the pane is short).
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    ImGui::BeginChild("##lp_tabstrip", ImVec2(stripW, 0), ImGuiChildFlags_None,
+    ImGui::BeginChild("##lp_tabstrip", ImVec2(stripW, railH), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
     ImGui::PopStyleVar();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 rail0 = ImGui::GetWindowPos();
-    const int   nTabs = (int)(sizeof(kTabs)/sizeof(kTabs[0]));
-    const float railH = 6.0f*S + nTabs*btn + (nTabs-1)*gap + 6.0f*S;
-    ImVec2 rail1(rail0.x + stripW, rail0.y + std::min(railH, ImGui::GetWindowHeight()));
-    // Translucent glass rail: a faint wash (not the opaque headerBg) so the panel's liquid-glass
-    // fill bleeds through; a hairline on the right edge separates the rail from the body.
+    ImVec2 rail1(rail0.x + stripW, rail0.y + railH);
+    // Translucent glass rail: a faint wash so the panel's liquid-glass fill bleeds through.
     float railWash[4]; ui::Palette::withAlpha(pal.headerBg, railWash, 0.14f);
     dl->AddRectFilled(rail0, rail1, ui::Palette::toU32(railWash));
-    dl->AddLine(ImVec2(rail1.x - 0.5f, rail0.y), ImVec2(rail1.x - 0.5f, rail1.y),
-                ui::Palette::toU32(pal.glassBorder), 1.0f * S);
     // Center the square button in the rail. SetCursorPosX must be set PER button: ImGui resets X to
     // the line start after each Dummy, so a single SetCursorPos before the loop would only offset the
     // first icon (the others would snap to x=0), producing the off-center / zig-zag look.
@@ -310,6 +310,16 @@ void drawLeftPane(AppState& st,
         ImGui::Dummy(ImVec2(0, gap));
     }
     ImGui::EndChild();
+
+    // Full-height separator between icon strip and body, drawn on the pane draw list so it
+    // spans the entire panel height regardless of the strip child's railH.
+    {
+        ImDrawList* pdl = ImGui::GetWindowDrawList();
+        const float sepX = paneOrigin.x + stripW - 0.5f;
+        pdl->AddLine(ImVec2(sepX, paneOrigin.y),
+                     ImVec2(sepX, paneOrigin.y + paneAvailH),
+                     ui::Palette::toU32(pal.glassBorder), 1.0f * S);
+    }
 
     // Body sits flush against the rail; the symmetric WindowPadding pushed below supplies EQUAL
     // breathing room on both sides (gap from the rail == gap from the panel's right edge) so every

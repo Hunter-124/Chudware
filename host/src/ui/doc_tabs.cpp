@@ -275,8 +275,9 @@ float drawDocTabs(AppState& st, float availW) {
     ImVec2 origin = ImGui::GetCursorScreenPos();
     {
         ImDrawList* bdl = ImGui::GetWindowDrawList();
+        float tabBg[4]; ui::Palette::withAlpha(pal.glassBg, tabBg, 0.75f);
         bdl->AddRectFilled(origin, ImVec2(origin.x + availW, origin.y + barH),
-                           ui::Palette::toU32(pal.windowBg));
+                           ui::Palette::toU32(tabBg));
         bdl->AddLine(ImVec2(origin.x, origin.y + barH - 0.5f),
                      ImVec2(origin.x + availW, origin.y + barH - 0.5f),
                      ui::Palette::toU32(pal.border), 1.0f);

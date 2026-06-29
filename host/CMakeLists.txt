@@ -66,7 +66,8 @@ add_executable(AI-CAD
   # --- end C15 ---
   # --- C16: feature tree + doc mirror ---
   src/core/doc_mirror.cpp
-  src/core/cpp_core.cpp    # strangler seam: runtime-load libaicad.dll (the C++ core)
+  ../services/worker/cpp_core.cpp
+  ../services/worker/worker_router.cpp
   src/ui/feature_tree.cpp
   src/ui/file_dialog.cpp   # C41: native Win32 Save/Open dialogs
   src/ui/file_explorer.cpp # Wave 3: File Explorer panel (workspace browser + recent)
@@ -131,7 +132,7 @@ add_executable(AI-CAD
   src/ui/view_selector.cpp
   src/ui/section_tool.cpp   # C25 W3-I: SolidWorks-style Section View (clip plane + cap)
   # --- end C25 ---
-  src/worker_client.cpp
+  ../services/worker/worker_client.cpp
   src/bootstrap.cpp
   src/ui_theme.cpp
   src/win_chrome.cpp
@@ -157,6 +158,8 @@ if(WIN32)
 endif()
 
 target_include_directories(AI-CAD PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker
   ${stb_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/extern/glad/include
   ${imgui_SOURCE_DIR}

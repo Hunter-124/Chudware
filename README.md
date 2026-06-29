@@ -50,39 +50,28 @@ writes build123d code) still works — that script becomes a `script` feature in
                       runtime + cache live in %APPDATA%\AI-CAD
 ```
 
-## Layout
+## Layout (post-refactor — see [AGENTS.md](AGENTS.md))
 ```
-engine/          Python CAD engine (runs in the managed runtime)
-  doc/             the parametric document: feature compiler, sketch constraint solver
-                   (nsolve), session/ops/undo, selectors, tessellate, formats, drawing,
-                   stepplus (.step+ I/O), 110+ test_*.py suites
-  ecad/            KiCad-class EDA: schematic, PCB, netlist, native MNA circuit sim, fab out
-  sim/             simulation: FEA (static/modal), LBM CFD, SPICE
-  parts_library.py standard-parts library + parts_providers.py (vendor hardware catalog)
-  kernel.py        v1: run build123d code -> ModelResult (subprocess-isolated)
-  worker.py        JSON-RPC worker the C++ host spawns; render.py headless PNGs
-core/            C++/CUDA core rewrite (the Python-replacement, in progress)
-  geom/ doc/ sketch/ solver/   geometry kernel, document compiler, SW sketch solver
-  agent/           C++ agent loop: roles, providers, state, mission orchestrator (mission.h)
-  parts/           C++ standard-parts catalog + generators
-  api/             libaicad.{h,cpp} flat C ABI (aicad_call) + DLL load probe
-  tests/           doctest suites (ctest); built with Eigen + OCCT 7.9.3
-host/            native C++ desktop app (GLFW + Dear ImGui + OpenGL)
-  src/ui/          ribbon, FeatureManager tree, PropertyManager, sketcher, drawing, ECAD,
-                   settings, viewport panel, status bar (~79 units)
-  src/core/        app/doc state, DocMirror, worker client, cpp_core (loads libaicad)
-  src/render/      offscreen GL renderer, id-pass picking, overlays
-  CMakeLists.txt   MSVC build (fetches GLFW/ImGui/json)
-mcp_server/      MCP server exposing the engine as tools (run_model, doc ops, screenshots)
-agent/           built-in agent loop: prompt -> ops/code -> render -> visual self-check;
-                 prompts/ roles incl. mission_planner + reporter, shared cheatsheets (hardware)
-installer/       runtime provisioning + Claude MCP self-registration + release packaging
-mcp_setup.bat    portable multi-client MCP installer (Claude Code / Cursor / VS Code / opencode /
-                 Antigravity) -> installer/setup_mcp_clients.py
-docs/            PLAN.md, ARCHITECTURE, CPP_MIGRATION, ECAD_*, FORMATS_*, PARTS_LIBRARY, contracts/
-tools/           dev/diagnostic scripts (profile_modeling.py, flamegraph.py, aicad_drive.py,
-                 verify_*, probe_*, mission_*_verify, ecad_*_audit, …)
-build.bat        one-shot host build + dist sync (see below)
+contracts/       frozen interface seams (worker RPC, doc schema, selectors, mesh, …)
+core/            pure C++/CUDA kernel → libaicad (zero-Python target)
+engine_oracle/   Python parity oracle (frozen; deleted last) — root `engine` symlink
+services/
+  worker/        JSON-RPC client + libaicad loader + routing policy
+  agent/         built-in agent loop — root `agent` symlink
+  mcp/           MCP server — root `mcp_server` symlink
+  installer/     provisioning + packaging — root `installer` symlink
+ui/
+  abstract/      framework-agnostic UI seam (view-model, commands, panel specs)
+  imgui/         ImGui desktop GUI rewrite — root `app` symlink
+  viewport/      shared OpenGL pipeline (scaffold)
+host/            legacy SW-clone host (**deprecated** — see host/DEPRECATED.md)
+corpora/         test fixtures (sketch, render, sw_parity, sw_fixtures)
+docs/ tools/ scripts/ third_party/
+```
+
+## Linux gate
+```bash
+bash scripts/gate.sh    # check.py + core build/ctest + ui/abstract test
 ```
 
 ## Build & run the desktop app

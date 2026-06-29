@@ -78,7 +78,7 @@ list(APPEND APP_SRC ${HOST}/src/render/aicm_loader.cpp)
 set(USE_BRIDGE ON CACHE BOOL "Link the reused libaicad flat-ABI loader (real engine)")
 if(USE_BRIDGE)
   if(EXISTS "${HOST}/src/core/cpp_core.cpp")
-    list(APPEND APP_SRC ${HOST}/src/core/cpp_core.cpp)
+    list(APPEND APP_SRC ${HOST}/../services/worker/cpp_core.cpp)
   endif()
 endif()
 

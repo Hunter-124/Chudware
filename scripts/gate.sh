@@ -88,13 +88,13 @@ stage_core_build() {
     fi
     echo "  OCCT config: $occt_cfg"
     local build_dir="core/build-linux"
-    if ! cmake -S core -B "$build_dir" -DAICAD_WITH_OCCT=ON -G Ninja > /tmp/gate_cfg.out 2>&1; then
+    if ! CCACHE_DISABLE=1 cmake -S core -B "$build_dir" -DAICAD_WITH_OCCT=ON -G Ninja > /tmp/gate_cfg.out 2>&1; then
         record "core build          FAIL    cmake configure failed (see /tmp/gate_cfg.out)"
         echo "  FAIL: configure"; tail -n 15 /tmp/gate_cfg.out | sed 's/^/    /'
         fail_fatal=1
         return 0
     fi
-    if ! cmake --build "$build_dir" --config Release > /tmp/gate_build.out 2>&1; then
+    if ! CCACHE_DISABLE=1 cmake --build "$build_dir" --config Release > /tmp/gate_build.out 2>&1; then
         record "core build          FAIL    cmake build failed (see /tmp/gate_build.out)"
         echo "  FAIL: build"; tail -n 15 /tmp/gate_build.out | sed 's/^/    /'
         fail_fatal=1
@@ -113,8 +113,8 @@ stage_ui_abstract() {
         echo "  SKIP: cmake/ninja missing"
         return 0
     fi
-    if cmake -S . -B build/linux-ui-abstract -DAICAD_BUILD_CORE=OFF -DAICAD_BUILD_UI_ABSTRACT=ON -G Ninja > /tmp/gate_uiabs_cfg.out 2>&1 \
-       && cmake --build build/linux-ui-abstract --config Release > /tmp/gate_uiabs_build.out 2>&1 \
+    if CCACHE_DISABLE=1 cmake -S . -B build/linux-ui-abstract -DAICAD_BUILD_CORE=OFF -DAICAD_BUILD_UI_ABSTRACT=ON -G Ninja > /tmp/gate_uiabs_cfg.out 2>&1 \
+       && CCACHE_DISABLE=1 cmake --build build/linux-ui-abstract --config Release > /tmp/gate_uiabs_build.out 2>&1 \
        && ctest --test-dir build/linux-ui-abstract -C Release --output-on-failure > /tmp/gate_uiabs_ctest.out 2>&1; then
         record "ui/abstract         PASS    command_registry test green"
         echo "  PASS"

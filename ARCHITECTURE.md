@@ -47,7 +47,14 @@ result against the request and iterate.
 
 ## Components
 
-### 1. Python CAD kernel (`engine/`) — built first, testable now
+> **2026-06 refactor:** the codebase is reorganizing into layered modules — see
+> [AGENTS.md](AGENTS.md), [docs/PYTHON_CUTOVER_STATUS.md](docs/PYTHON_CUTOVER_STATUS.md),
+> and [docs/REFACTOR_LOG.md](docs/REFACTOR_LOG.md). Frozen contracts live in
+> [`contracts/`](contracts/). The new GUI is [`ui/imgui/`](ui/imgui/) over the
+> framework-agnostic seam [`ui/abstract/`](ui/abstract/). The legacy host is
+> deprecated ([`host/DEPRECATED.md`](host/DEPRECATED.md)).
+
+### 1. Python CAD kernel (`engine_oracle/`, symlink `engine/`) — parity oracle, deleted last
 The brain of the modeling. Pure Python, runs inside the managed runtime.
 - `kernel.py` — execute AI-generated build123d code in a controlled namespace; locate the
   resulting solid; compute mass properties (volume, area, bbox, center); export **STEP**
@@ -61,7 +68,7 @@ The brain of the modeling. Pure Python, runs inside the managed runtime.
   spawns and talks to.
 - `samples/` — feature-rich reference models used as smoke tests.
 
-### 2. MCP server (`mcp_server/`)
+### 2. MCP server (`services/mcp/`, symlink `mcp_server/`)
 stdio MCP server (run as `python -m mcp_server.server`) so an external agent drives the
 same engine as the desktop app. Tools:
 `run_model(code)`, `get_screenshot(views)`, `get_model_info()`, `export(format)`,
@@ -69,18 +76,18 @@ same engine as the desktop app. Tools:
 `get_assembly_screenshot()`, `export_part(name, fmt)` for multi-part assemblies. Registered
 into Claude config on first launch.
 
-### 3. Built-in agent loop (`agent/`)
+### 3. Built-in agent loop (`services/agent/`, symlink `agent/`)
 `generate → run_model → screenshot → vision self-check vs. request → iterate`.
 Provider-adapter layer (`providers/`: anthropic, openai, openai-compatible/local) so
 "any API provider" works; default Anthropic (vision + codegen). Keys stored in
 `%APPDATA%\AI-CAD\config.json`.
 
-### 4. Native host (`host/`) — C++
+### 4. Native host (`host/`) — **deprecated**; production GUI migrating to `ui/imgui/`
 GLFW window, Dear ImGui docking UI (chat, viewport, code, log, settings), OpenGL mesh
 renderer with orbit camera, framebuffer capture → PNG. Spawns + supervises the Python
 worker. Hosts the MCP server. Embeds the runtime payload and runs first-launch bootstrap.
 
-### 5. Installer / bootstrap (`installer/`, `scripts/`)
+### 5. Installer / bootstrap (`services/installer/`, symlink `installer/`, `scripts/`)
 Embed-and-extract of the runtime payload; version-stamped provisioning into
 `%APPDATA%\AI-CAD`; Claude MCP self-registration; Windows installer script.
 

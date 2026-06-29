@@ -171,7 +171,8 @@ target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_jso
 # feeds live-part geometry into operations for the product. See docs/CAM_PLAN.md.
 add_library(aicad_cam STATIC
   cam/model.cpp
-  cam/geometry.cpp)
+  cam/geometry.cpp
+  cam/feeds.cpp)
 target_include_directories(aicad_cam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_cam PUBLIC
   aicad_clipper2 aicad_miniz nlohmann_json::nlohmann_json)

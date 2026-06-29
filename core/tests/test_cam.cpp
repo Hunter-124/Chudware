@@ -7,6 +7,7 @@
 #include <cmath>
 
 #include "cam/geometry.h"
+#include "cam/feeds.h"
 #include "cam/model.h"
 
 using namespace aicad::cam;
@@ -179,4 +180,92 @@ TEST_CASE("geo: open offset makes a kerf ribbon") {
     REQUIRE(ribbons.size() == 1);
     // a 20mm line offset by 1mm both sides + round caps ~ area 2*20 + pi*1^2
     CHECK(geo::area(ribbons[0]) == doctest::Approx(40.0 + M_PI).epsilon(0.1));
+}
+
+TEST_CASE("feeds: aluminum endmill gives sane rpm/feed") {
+    Machine m;  // 24000 rpm, 10000 mm/min default
+    Tool t;
+    t.type = ToolType::EndmillFlat;
+    t.diameter = 6;
+    t.flutes = 3;
+    t.tool_material = "carbide";
+    Operation op;
+    op.type = OpType::Contour2D;
+    Feeds f = compute_feeds(m, t, op, "aluminum");
+    // 900 SFM, 6mm -> ~14500 rpm (clamped to 24000) ; 3 flutes * ~0.06 fz
+    CHECK(f.rpm > 10000.0);
+    CHECK(f.rpm <= 24000.0);
+    CHECK(f.feed > 1000.0);
+    CHECK(f.feed <= 10000.0);   // machine feed clamp
+    CHECK(f.plunge > 0.0);
+    CHECK(f.plunge < f.feed);
+    CHECK(f.stepover == doctest::Approx(0.45 * 6.0));
+    CHECK(f.stepdown == doctest::Approx(1.0 * 6.0));
+}
+
+TEST_CASE("feeds: steel runs slower than aluminum") {
+    Machine m;
+    Tool t; t.diameter = 6; t.flutes = 3;
+    Operation op; op.type = OpType::Pocket2D;
+    Feeds al = compute_feeds(m, t, op, "aluminum");
+    Feeds st = compute_feeds(m, t, op, "steel_mild");
+    CHECK(st.rpm < al.rpm);
+    CHECK(st.sfm < al.sfm);
+}
+
+TEST_CASE("feeds: HSS tool is slower than carbide") {
+    Machine m;
+    Tool carbide; carbide.diameter = 6; carbide.flutes = 2; carbide.tool_material = "carbide";
+    Tool hss = carbide; hss.tool_material = "hss";
+    Operation op; op.type = OpType::Contour2D;
+    Feeds c = compute_feeds(m, carbide, op, "steel_mild");
+    Feeds h = compute_feeds(m, hss, op, "steel_mild");
+    CHECK(h.rpm < c.rpm);
+}
+
+TEST_CASE("feeds: rigid tap feed equals rpm times pitch") {
+    Machine m;
+    Tool tap; tap.type = ToolType::Tap; tap.diameter = 5; tap.thread_pitch = 0.8;
+    Operation op; op.type = OpType::Drill; op.cycle = "rigidtap";
+    Feeds f = compute_feeds(m, tap, op, "aluminum");
+    CHECK(f.feed == doctest::Approx(f.rpm * 0.8).epsilon(0.001));
+}
+
+TEST_CASE("feeds: laser cut feed scales down with thickness, no spindle") {
+    Machine m; m.kind = MachineKind::Laser;
+    Tool head; head.type = ToolType::LaserHead;
+    Operation thin; thin.type = OpType::Cut2D; thin.heights.top = 0; thin.heights.bottom = -1;
+    Operation thick; thick.type = OpType::Cut2D; thick.heights.top = 0; thick.heights.bottom = -10;
+    Feeds ft = compute_feeds(m, head, thin, "steel_mild");
+    Feeds fk = compute_feeds(m, head, thick, "steel_mild");
+    CHECK(ft.rpm == 0.0);
+    CHECK(fk.feed < ft.feed);   // 10mm cuts slower than 1mm
+}
+
+TEST_CASE("feeds: user override on op is preserved by apply_feeds") {
+    Machine m;
+    Tool t; t.diameter = 6; t.flutes = 3;
+    Operation op; op.type = OpType::Contour2D;
+    op.rpm = 12000;          // user pinned rpm
+    op.feed = 0;             // let it resolve
+    Feeds f = compute_feeds(m, t, op, "aluminum");
+    apply_feeds(op, f);
+    CHECK(op.rpm == 12000);          // preserved
+    CHECK(op.feed == doctest::Approx(f.feed));  // filled
+}
+
+TEST_CASE("feeds: cutting DB has the expected materials + merge works") {
+    const CuttingDB& db = CuttingDB::builtin();
+    CHECK(db.find("aluminum") != nullptr);
+    CHECK(db.find("titanium") != nullptr);
+    CHECK(db.find("stainless_304") != nullptr);
+    CHECK(db.find("nonexistent") == nullptr);
+    CHECK(db.material_ids().size() >= 20);
+    CuttingDB custom;
+    custom.merge(json{{"materials", json::array({json{{"id", "unobtanium"}, {"sfm_mill", 50}}})}});
+    REQUIRE(custom.find("unobtanium") != nullptr);
+    CHECK(custom.find("unobtanium")->sfm_mill == doctest::Approx(50));
+    // override existing
+    custom.merge(json{{"materials", json::array({json{{"id", "aluminum"}, {"sfm_mill", 1234}}})}});
+    CHECK(custom.find("aluminum")->sfm_mill == doctest::Approx(1234));
 }

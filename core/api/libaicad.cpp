@@ -72,6 +72,8 @@
 #include "ecad/recipes.h"
 #include "ecad/schema.h"
 #include "ecad/session.h"
+#include "cam/session.h"
+#include "cam/extract.h"
 #include "geom/aicm.h"
 #include "geom/ecad_3d.h"
 #ifdef AICAD_WITH_NETGEN
@@ -2789,6 +2791,47 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
         } catch (const aicad::ecad::OpError& oe) {
             return emit(oe.envelope(), out_json, 3);
         }
+
+        // --- CAM (computer-aided machining) document session RPCs --------------
+        // Same OpError-envelope contract as the ecad block. The CAM job/ops/post/
+        // sim layer is pure JSON (no OCCT); the OCCT extraction adapter (cam_extract)
+        // lives in geom/ and is dispatched below when AICAD_WITH_OCCT.
+        try {
+            auto cam_base_rev = [&](void) -> long {
+                return (params.contains("base_revision") && params["base_revision"].is_number())
+                           ? params["base_revision"].get<long>() : -1;
+            };
+            if (m == "cam_new") return emit(aicad::cam::cam_new(params), out_json, 0);
+            if (m == "cam_apply_ops")
+                return emit(aicad::cam::cam_apply_ops(params.value("doc_id", std::string()),
+                                                      cam_base_rev(),
+                                                      params.contains("ops") ? params["ops"] : json::array()),
+                            out_json, 0);
+            if (m == "cam_undo") return emit(aicad::cam::cam_undo(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "cam_redo") return emit(aicad::cam::cam_redo(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "cam_tree") return emit(aicad::cam::cam_tree(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "cam_close")
+                return emit(json{{"closed", aicad::cam::cam_close(params.value("doc_id", std::string()))}}, out_json, 0);
+            if (m == "cam_describe") return emit(aicad::cam::cam_describe(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "cam_generate") return emit(aicad::cam::cam_generate(params.value("doc_id", std::string()), params), out_json, 0);
+            if (m == "cam_simulate") return emit(aicad::cam::cam_simulate(params.value("doc_id", std::string()), params), out_json, 0);
+            if (m == "cam_post") return emit(aicad::cam::cam_post(params.value("doc_id", std::string()), params), out_json, 0);
+            if (m == "cam_setup_sheet") return emit(aicad::cam::cam_setup_sheet(params.value("doc_id", std::string()), params), out_json, 0);
+            if (m == "cam_generate_inline") return emit(aicad::cam::cam_generate_inline(params), out_json, 0);
+            if (m == "cam_post_inline") return emit(aicad::cam::cam_post_inline(params), out_json, 0);
+            if (m == "cam_post_dialects") return emit(aicad::cam::cam_post_dialects(), out_json, 0);
+            if (m == "cam_materials") return emit(aicad::cam::cam_materials(), out_json, 0);
+            if (m == "cam_tool_types") return emit(aicad::cam::cam_tool_types(), out_json, 0);
+            if (m == "cam_op_types") return emit(aicad::cam::cam_op_types(), out_json, 0);
+            if (m == "cam_save")
+                return emit(aicad::cam::cam_save(params.value("doc_id", std::string()),
+                                                 params.value("path", std::string())), out_json, 0);
+            if (m == "cam_open") return emit(aicad::cam::cam_open(params.value("path", std::string())), out_json, 0);
+            // OCCT extraction adapter: live B-rep part -> CAM geometry inputs.
+            if (m == "cam_extract") return emit(aicad::cam::cam_extract(params), out_json, 0);
+        } catch (const aicad::cam::OpError& oe) {
+            return emit(oe.envelope(), out_json, 3);
+        }
         // Unknown to the C++ core -> nonzero so the host falls back to Python.
         return emit(json{{"error", "unknown method: " + m}}, out_json, 2);
     } catch (const std::exception& e) {
@@ -2851,6 +2894,7 @@ AICAD_API int aicad_call(const char* method, const char* params_json, char** out
         aicad::doc::force_release_doc_lock();
         aicad::doc::force_release_drawing_lock();
         aicad::ecad::force_release_ecad_lock();
+        aicad::cam::force_release_cam_lock();
         if (out_json) *out_json = dup_seh_error("{\"error\":\"internal error: access violation (the engine hit a hardware fault and recovered; the document is unchanged)\"}");
         return 1;
     }

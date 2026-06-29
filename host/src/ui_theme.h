@@ -118,6 +118,9 @@ struct Palette {
     // ---- code / diff ----
     float chipBg[4]        = {0.176f,0.831f,0.749f, 0.30f};
     float codeBg[4]        = {0.055f,0.065f,0.085f, 1};
+    // NOTE: proseBg/stepCardBg are ≈ the Copilot pane's dark base (windowBg ~0.082) since the panes
+    // went opaque-dark, so these cards now read by their BORDER, not fill contrast. If chat content
+    // ever looks flat, lighten these ~0.03 above windowBg so the cards regain a visible surface.
     float proseBg[4]       = {0.085f,0.100f,0.130f, 1};
     float proseText[4]     = {0.700f,0.740f,0.800f, 1};
     float stepCardBg[4]    = {0.082f,0.094f,0.118f, 1};

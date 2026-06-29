@@ -235,13 +235,19 @@ void drawLeftPane(AppState& st,
         st.resetLayout = true;
 
     // Full-panel liquid-glass chrome: shadow, translucent fill, shine gradient, border, specular.
-    // alpha=0.55 keeps the border/shadow/specular visible but light — the real opacity
-    // comes from each row's readable-surface pill (drawn in drawOneRow), not the panel fill.
+    // OPAQUE dark base FIRST, then the glass on top: the W2 full-bleed 3D is composited at full window
+    // width on the background draw list, so without a base it washed straight through this NoBackground
+    // pane's translucent glass and read as a muddy light-gray (~98,101,108). Painting windowBg solid
+    // first means the glass shine/border/specular now layer over a deep dark surface that matches the
+    // chrome band + dock tabs (windowBg) — clean frosted panel, no 3D bleed. The body child below paints
+    // NO fill of its own (transparent ChildBg). alpha must match the Copilot pane so the two read alike.
     {
         ImVec2 p0 = ImGui::GetWindowPos();
         ImVec2 sz = ImGui::GetWindowSize();
-        ui::glassBackground(ImGui::GetWindowDrawList(), p0,
-                            ImVec2(p0.x + sz.x, p0.y + sz.y), 0.0f, 0.45f);
+        ImVec2 p1(p0.x + sz.x, p0.y + sz.y);
+        ImDrawList* wdl = ImGui::GetWindowDrawList();
+        wdl->AddRectFilled(p0, p1, ui::Palette::toU32(ui::palette.windowBg));
+        ui::glassBackground(wdl, p0, p1, 0.0f, 0.55f);
     }
 
     const auto& pal = ui::palette;
@@ -349,8 +355,9 @@ void drawLeftPane(AppState& st,
     static bool s_bodyScrolled = false;
     const float bodyPad = 12.0f * S;
     const float sbSize  = 8.0f * S;
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], 0.16f));
+    // Transparent body — the pane's single glass fill (above) is the only background, so the body
+    // does NOT stack a second translucent layer on top of it (that double-fill was the muddy look).
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(bodyPad, ImGui::GetStyle().WindowPadding.y));
     ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, sbSize);

@@ -1708,22 +1708,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         ImGui::GetBackgroundDrawList()->AddImage(
             (ImTextureID)(intptr_t)renderer.resolvedColorTexture(), vr0, vr1,
             ImVec2(0, 1), ImVec2(1, 0));
-        // W2b: the dock-tab band above the content rect (the central doc-tab strip's y-range). Paint
-        // a solid windowBg fill so the tab row reads as a normal opaque header with no 3D bleed or
-        // frosted-glass transparency behind the open-file tab names.
-        if (ImGuiDockNode* vpNode = ImGui::GetWindowDockNode()) {
-            const float bandTop = vpNode->Pos.y;
-            const float bandH   = cr0.y - bandTop;
-            if (bandH > 0.5f) {
-                ImDrawList* bgDl = ImGui::GetBackgroundDrawList();
-                // Restrict to the viewport dock node's horizontal extent so the band does
-                // not bleed over the FeatureManager or Copilot panels.
-                const ImVec2 bp0(vpNode->Pos.x, bandTop);
-                const ImVec2 bp1(vpNode->Pos.x + vpNode->Size.x, cr0.y);
-                float bandFill[4]; ui::Palette::withAlpha(ui::palette.glassBg, bandFill, 0.70f);
-                bgDl->AddRectFilled(bp0, bp1, ui::Palette::toU32(bandFill));
-            }
-        }
+        // (The dock-tab band that used to paint here was removed: drawDocTabs() now paints a single
+        // opaque band for the whole tab row — covering both the strip and the window-padding gap above
+        // it — so there is no longer a second translucent fill to stack against it. The 3D image below
+        // starts at cr0 (under the strip), so nothing bleeds through the row.)
         // Input surface: an invisible button over the visible 3D (the content rect). It carries the
         // hover/active state the navigation, picking, and drag-drop target all read (imgHovered),
         // exactly as the old ImGui::Image item did — minus the opaque quad that would hide the 3D.

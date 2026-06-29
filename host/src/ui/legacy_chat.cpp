@@ -2020,10 +2020,21 @@ void drawAISettingsTab(AppState& st, bool busy) {
     if (!st.showAIPanel) return;
     if (st.aiDockId) ImGui::SetNextWindowDockID((ImGuiID)st.aiDockId, ImGuiCond_FirstUseEver);
     if (st.focusSettingsTab) { ImGui::SetNextWindowFocus(); st.focusSettingsTab = false; }
-    if (!ImGui::Begin("Settings###AISettings")) { ImGui::End(); return; }
+    if (!ImGui::Begin("Settings###AISettings", nullptr, ImGuiWindowFlags_NoBackground)) {
+        ImGui::End(); return;
+    }
     const auto& pal = ui::palette;
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.panelBg[0], pal.panelBg[1], pal.panelBg[2], 1));
+    // Same opaque-base + glass chrome as the Copilot pane (its sibling dock tab) so switching tabs
+    // doesn't swap between a frosted-glass surface and a flat panelBg one.
+    {
+        ImVec2 sp0 = ImGui::GetWindowPos();
+        ImVec2 ssz = ImGui::GetWindowSize();
+        ImVec2 sp1(sp0.x + ssz.x, sp0.y + ssz.y);
+        ImDrawList* wdl = ImGui::GetWindowDrawList();
+        wdl->AddRectFilled(sp0, sp1, ui::Palette::toU32(ui::palette.windowBg));
+        ui::glassBackground(wdl, sp0, sp1, 0.0f, 0.55f);
+    }
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##aisetbody", ImVec2(0, 0), ImGuiChildFlags_None);
     drawAISettingsBody(st, busy);
     // Transparency toggle (moved here from the composer per request): show/hide the AI's
@@ -2684,55 +2695,67 @@ static void drawComposerChips(AppState& st, bool busy) {
         ImGui::SetTooltip("Whether the AI plans and asks before modeling.");
     if (ImGui::BeginPopup("##runmode")) { drawRunModeMenu(st); ImGui::EndPopup(); }
 
-
-    // Right edge of the left-hand chips on this row, in window-local cursor coords. The run-mode
-    // chip wasn't followed by SameLine(), so the cursor has already wrapped to the next line —
-    // GetCursorPosX() would report the left margin, not the chip edge. The chip width also varies
-    // ("Supervised" is wider than "Autopilot"), so measure the actual item rect instead.
-    const float chipsEndX =
-        ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + ImGui::GetScrollX();
-
-    // ---- context meter (right-aligned) — like Claude Code / Codex / VS Code ----
-    // How full the model's context window was on the last call (input-token estimate), so the user
-    // can see headroom before a small local window overruns mid-chain.
-    {
-        int win = effectiveContextWindow(st.settings);
-        int used = st.lastContextTokens;
-        float frac = win > 0 ? std::min(1.0f, (float)used / (float)win) : 0.0f;
-        std::string txt = "ctx " + fmtTokens(used) + "/" + fmtTokens(win);
-        const float barW = 44 * sc, gap = 6 * sc;
-        float tw = ImGui::CalcTextSize(txt.c_str()).x;
-        float total = barW + gap + tw;
-        float x = ImGui::GetContentRegionMax().x - total;
-        // Always draw: on the chips row when it fits, else right-aligned on its own line.
-        if (x > chipsEndX + 10 * sc) ImGui::SameLine(x);
-        else ImGui::SetCursorPosX(std::max(0.0f, x));
-            ImVec2 p = ImGui::GetCursorScreenPos();
-            float h = ImGui::GetTextLineHeight();
-            float by0 = p.y + h * 0.32f, by1 = p.y + h * 0.68f;
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            ImU32 fg = frac < 0.5f ? IM_COL32(120, 200, 120, 255)
-                     : frac < 0.85f ? IM_COL32(220, 170, 90, 255)
-                                    : IM_COL32(220, 110, 100, 255);
-            dl->AddRectFilled(ImVec2(p.x, by0), ImVec2(p.x + barW, by1),
-                              ui::Palette::toU32(pal.accentSoft), 2 * sc);
-            if (frac > 0)
-                dl->AddRectFilled(ImVec2(p.x, by0), ImVec2(p.x + barW * frac, by1), fg, 2 * sc);
-            dl->AddRect(ImVec2(p.x, by0), ImVec2(p.x + barW, by1),
-                        ui::Palette::toU32(pal.textDim), 2 * sc);
-            ImGui::Dummy(ImVec2(barW, h));
-            ImGui::SameLine(0, gap);
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-            ImGui::TextUnformatted(txt.c_str());
-            ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Context window usage — the last model call's input tokens vs the "
-                                  "active model's window (%d / %d).\nSet the window in AI settings if "
-                                  "your local model differs.", used, win);
-    }
+    // (The context meter that used to right-align on this footer row was moved UP to its own line just
+    // above the composer box — see drawContextMeter() and its call in drawAIPanel. On this bottom row
+    // it sat on the pane's very bottom edge jammed against the status bar, the "too low" report.)
 
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar();
+}
+
+// Context-window meter for the composer toolbar row: a small fill-bar + "N/M" readout (compact
+// "ctx N/M" with no bar when the pane is too narrow). Drawn at the current cursor; advances it.
+// Moved here from the footer chips, where it was pinned to the pane bottom against the status bar.
+static void drawContextMeter(AppState& st, float roomForMeter) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const int   win  = effectiveContextWindow(st.settings);
+    const int   used = st.lastContextTokens;
+    const float frac = win > 0 ? std::min(1.0f, (float)used / (float)win) : 0.0f;
+    const float barW = 40 * sc, gap = 5 * sc;
+    const std::string full = fmtTokens(used) + "/" + fmtTokens(win);
+    const std::string lean = "ctx " + full;       // standalone (no bar) keeps a "ctx" tag so it reads
+    const float fh = ImGui::GetFrameHeight();
+    // Bar + readout only when there is room for both; uses the SAME roomForMeter the caller passed to
+    // measureContextMeter() so the width it reserved and the layout drawn here agree exactly.
+    const float fullTw = ImGui::CalcTextSize(full.c_str()).x;
+    const bool  showBar = roomForMeter >= barW + gap + fullTw;
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+    if (showBar) {
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        float by0 = p.y + fh * 0.5f - 3 * sc, by1 = p.y + fh * 0.5f + 3 * sc;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImU32 fg = frac < 0.5f ? IM_COL32(120, 200, 120, 255)
+                 : frac < 0.85f ? IM_COL32(220, 170, 90, 255)
+                                : IM_COL32(220, 110, 100, 255);
+        dl->AddRectFilled(ImVec2(p.x, by0), ImVec2(p.x + barW, by1),
+                          ui::Palette::toU32(pal.accentSoft), 2 * sc);
+        if (frac > 0)
+            dl->AddRectFilled(ImVec2(p.x, by0), ImVec2(p.x + barW * frac, by1), fg, 2 * sc);
+        dl->AddRect(ImVec2(p.x, by0), ImVec2(p.x + barW, by1),
+                    ui::Palette::toU32(pal.textDim), 2 * sc);
+        ImGui::Dummy(ImVec2(barW, fh));
+        ImGui::SameLine(0, gap);
+    }
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(showBar ? full.c_str() : lean.c_str());
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Context window usage — the last model call's input tokens vs the "
+                          "active model's window (%d / %d).\nSet the window in AI settings if "
+                          "your local model differs.", used, win);
+}
+
+// Width drawContextMeter() will occupy, so the caller can right-align it on its line above the
+// composer. Mirrors the showBar decision in drawContextMeter() so reserved width == drawn width.
+static float measureContextMeter(AppState& st, float roomForMeter) {
+    const float sc = ui::uiScale;
+    const float barW = 40 * sc, gap = 5 * sc;
+    const std::string full = fmtTokens(st.lastContextTokens) + "/" +
+                             fmtTokens(effectiveContextWindow(st.settings));
+    const float fullTw = ImGui::CalcTextSize(full.c_str()).x;
+    if (roomForMeter >= barW + gap + fullTw) return barW + gap + fullTw;
+    return ImGui::CalcTextSize(("ctx " + full).c_str()).x;
 }
 
 // Is the assistant currently working a turn? Covers every run path: job-based design/edit, the
@@ -2956,13 +2979,18 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
 
     if (!ImGui::Begin("Copilot###AI", nullptr, ImGuiWindowFlags_NoBackground)) { ImGui::End(); return; }
     ui::Fonts& fonts = st.fonts;
-    // Full-panel liquid-glass chrome — match the FeatureManager (translucent fill + shadow + shine
-    // + specular) so the Copilot pane reads as the same frosted-glass surface.
+    // Full-panel liquid-glass chrome — OPAQUE dark base FIRST, then the glass on top (see the matching
+    // comment in layout.cpp drawLeftPane): the full-bleed 3D on the background draw list would otherwise
+    // wash through this NoBackground pane and read muddy. windowBg solid base => the glass layers over a
+    // deep dark surface matching the chrome band + dock tabs. Alpha matches the FeatureManager pane
+    // exactly so the two side panes read as the same frosted surface.
     {
         ImVec2 gp0 = ImGui::GetWindowPos();
         ImVec2 gsz = ImGui::GetWindowSize();
-        ui::glassBackground(ImGui::GetWindowDrawList(), gp0,
-                            ImVec2(gp0.x + gsz.x, gp0.y + gsz.y), 0.0f, 0.45f);
+        ImVec2 gp1(gp0.x + gsz.x, gp0.y + gsz.y);
+        ImDrawList* wdl = ImGui::GetWindowDrawList();
+        wdl->AddRectFilled(gp0, gp1, ui::Palette::toU32(ui::palette.windowBg));
+        ui::glassBackground(wdl, gp0, gp1, 0.0f, 0.55f);
     }
 
     // Remember which dock node we live in so the sibling "Settings" tab can dock next to us.
@@ -3008,6 +3036,18 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // ---- composer (measure its height for next frame's reserve) ----
     ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
     ImGui::BeginGroup();
+    // Context-window meter — a thin right-aligned line at the TOP of the composer block. Moved up here
+    // off the footer chips row, where it pinned to the pane's bottom-right corner against the status
+    // bar (the "too low" report). On its own full-width line the fill-bar + "N/M" readout always fit,
+    // and being above the input it reads as an input-context hint (Claude Code / Cursor style). Inside
+    // the group so its height folds into s_composerH and the conversation log reserves for it.
+    {
+        const float room = ImGui::GetContentRegionAvail().x;
+        const float w    = measureContextMeter(st, room);
+        const float x    = ImGui::GetContentRegionMax().x - w;
+        if (x > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(x);
+        drawContextMeter(st, room);
+    }
     drawComposer(st, busy, canRun);
     ImGui::EndGroup();
     s_composerH = ImGui::GetItemRectSize().y + ui::metrics::U(1);

@@ -7,6 +7,7 @@
 #include <string>
 
 #include "imgui.h"
+#include "imgui_internal.h"   // ImGuiDockNode + GetWindowDockNode — the doc-tab band spans the node
 
 #include "doc_tabs.h"
 #include "feature_tree.h"   // featureTreeSaveDoc — save-then-close from the unsaved-changes prompt
@@ -270,16 +271,33 @@ float drawDocTabs(AppState& st, float availW) {
     s_saveCloseIdx = -1;
     s_newDoc = NewDocKind::None;
 
-    // Background band spanning the content width so the row reads as a cohesive tab bar over the
-    // dark 3D view. Tabs/“+” paint on top of it via the host window's draw list.
+    // ONE opaque windowBg bar for the ENTIRE tab row — full dockspace WIDTH, behind all three dock
+    // nodes (FeatureManager tabs | doc tabs | Copilot/Settings tabs). Spanning the whole width (not just
+    // this central node) guarantees the row reads as one continuous dark bar: it backfills the dock
+    // splitter gaps and any translucent tab-bar region on the side nodes with the same windowBg the
+    // dock tabs (ImGuiCol_Tab) and the side panes' opaque base already use — so nothing two-tone shows
+    // between the ribbon and the content. Drawn on the background draw list (behind every window): the
+    // tabs paint on top via their window draw lists; the side panes' opaque base paints on top in their
+    // x-range; the full-bleed 3D is composited lower (from cr0, below this bar). The bar reaches DOWN
+    // past the tab height to the viewport content top so its bottom divider sits flush above the 3D
+    // instead of floating in a dark strip. Replaces the old glassBg@0.75 strip + the W2b band.
     ImVec2 origin = ImGui::GetCursorScreenPos();
     {
-        ImDrawList* bdl = ImGui::GetWindowDrawList();
-        float tabBg[4]; ui::Palette::withAlpha(pal.glassBg, tabBg, 0.75f);
-        bdl->AddRectFilled(origin, ImVec2(origin.x + availW, origin.y + barH),
-                           ui::Palette::toU32(tabBg));
-        bdl->AddLine(ImVec2(origin.x, origin.y + barH - 0.5f),
-                     ImVec2(origin.x + availW, origin.y + barH - 0.5f),
+        const ImGuiStyle& style = ImGui::GetStyle();
+        float bandT = origin.y, bandL = origin.x, bandR = origin.x + availW;
+        if (ImGuiDockNode* node = ImGui::GetWindowDockNode()) bandT = node->Pos.y;
+        // Full dockspace width = the whole main viewport row, not just the central node.
+        if (ImGuiViewport* mv = ImGui::GetMainViewport()) {
+            bandL = mv->Pos.x;
+            bandR = mv->Pos.x + mv->Size.x;
+        }
+        // Bottom = where the viewport 3D content begins (the strip + the window-padding/spacing gap
+        // that the caller leaves before cr0), so the divider hugs the viewport top.
+        const float bandB = origin.y + barH + style.ItemSpacing.y;
+        ImDrawList* bdl = ImGui::GetBackgroundDrawList();
+        bdl->AddRectFilled(ImVec2(bandL, bandT), ImVec2(bandR, bandB),
+                           ui::Palette::toU32(pal.windowBg));
+        bdl->AddLine(ImVec2(bandL, bandB - 0.5f), ImVec2(bandR, bandB - 0.5f),
                      ui::Palette::toU32(pal.border), 1.0f);
     }
 

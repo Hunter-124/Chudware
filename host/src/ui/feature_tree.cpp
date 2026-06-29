@@ -1807,9 +1807,6 @@ void drawFeatureTreeBody(AppState& st,
     // New Part / Undo / Redo text buttons that used to live at the panel bottom.
     drawFeatureManagerTopStrip(st);
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], 0.22f));
-
     // ---- document title ----
     const nlohmann::json& tree = st.docMirror.tree();
     std::string docName = "Part1";
@@ -2726,8 +2723,6 @@ void drawFeatureTreeBody(AppState& st,
             clearTreeFeatureSelection(st);
         }
     }
-
-    ImGui::PopStyleColor();  // ChildBg
 
     // C37-E (item 3): per-row "Appearance..." picker. The row's context menu stashed the target body
     // key + a one-shot open flag; render the picker as a sibling popup (same pattern as the root

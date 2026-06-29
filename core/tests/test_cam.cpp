@@ -11,6 +11,7 @@
 #include "cam/operations.h"
 #include "cam/heightfield.h"
 #include "cam/post.h"
+#include "cam/stock_sim.h"
 #include "cam/model.h"
 
 using namespace aicad::cam;
@@ -721,4 +722,72 @@ TEST_CASE("post: setup sheet lists tools + operations + time") {
     CHECK(has(s.html, "Profile"));
     CHECK(has(s.text, "TOOLS"));
     CHECK(has(s.text, "machining time"));
+}
+
+// ── material-removal sim + backplot + time (Phase 5) ─────────────────────────
+TEST_CASE("sim: facing a box removes the expected slab volume") {
+    Setup su;
+    su.machine.kind = MachineKind::Mill3;
+    su.stock.type = StockType::Box;
+    su.stock.min = {-25, -25, -10};
+    su.stock.max = {25, 25, 0};        // 50x50x10 = 25000 mm^3
+    Tool t; t.number = 1; t.type = ToolType::FaceMill; t.diameter = 12;
+    ToolLibrary lib; lib.tools = {t};
+    Operation op; op.id = "f"; op.type = OpType::Face; op.tool_number = 1;
+    op.heights.top = 0; op.heights.bottom = -2;   // remove a 2mm slab over 50x50 = 5000 mm^3
+    op.stepover = 8;
+    op.geometry["regions"] = json::array({to_json(square(0, 0, 25))});
+    su.operations = {op};
+    OpContext ctx; ctx.machine = su.machine; ctx.stock = su.stock; ctx.tool = t; ctx.material_id = "aluminum";
+    std::vector<Toolpath> tps = {generate(op, ctx).path};
+    SimResult r = simulate_setup(su, lib, tps, TriMesh{}, SimOptions{});
+    REQUIRE(r.ok);
+    CHECK(r.stock_volume_mm3 == doctest::Approx(50.0 * 50.0 * 10.0).epsilon(0.05));
+    CHECK(r.removed_volume_mm3 > 3000.0);     // ~5000, allow for tool coverage/edges
+    CHECK(r.removed_volume_mm3 < 7000.0);
+    CHECK(r.cycle_time_s > 0);
+    CHECK(r.remaining_volume_mm3 < r.stock_volume_mm3);
+}
+
+TEST_CASE("sim: estimate_time scales with feed") {
+    Toolpath tp;
+    tp.moves.push_back({MoveKind::Rapid, {0, 0, 0}, false, {0,0,0}, 0, 0, 0});   // start position
+    tp.moves.push_back({MoveKind::Cut, {100, 0, 0}, false, {0,0,0}, 600, 0, 0});
+    Machine m;
+    double t_slow = estimate_time(tp, m);
+    tp.moves[1].feed = 1200;
+    double t_fast = estimate_time(tp, m);
+    CHECK(t_fast < t_slow);
+    // 100mm at 600 mm/min ~= 10s (feed-limited, no accel)
+    tp.moves[1].feed = 600;
+    CHECK(estimate_time(tp, m) == doctest::Approx(10.0).epsilon(0.05));
+}
+
+TEST_CASE("sim: backplot classifies moves into colored polylines") {
+    OpContext ctx = mill_ctx(6.0);
+    Operation op; op.type = OpType::Contour2D; op.heights.bottom = -3;
+    op.geometry["regions"] = json::array({to_json(square(0, 0, 10))});
+    Toolpath tp = gen_contour2d(op, ctx).path;
+    json bp = backplot(tp);
+    CHECK(bp.contains("rapid"));
+    CHECK(bp.contains("cut"));
+    CHECK(bp["cut"].size() > 0);
+    CHECK(bp["cut"].size() % 3 == 0);   // flat xyz triples (pairs of points)
+}
+
+TEST_CASE("sim: rapid through stock is flagged") {
+    Setup su;
+    su.stock.type = StockType::Box;
+    su.stock.min = {-10, -10, -5}; su.stock.max = {10, 10, 0};
+    Tool t; t.number = 1; t.diameter = 6; ToolLibrary lib; lib.tools = {t};
+    Operation op; op.id = "x"; op.tool_number = 1;
+    su.operations = {op};
+    // hand-build a toolpath: a rapid that plows through the stock at z=-3
+    Toolpath tp; tp.op_id = "x"; tp.tool_number = 1;
+    tp.moves.push_back({MoveKind::Rapid, {-8, 0, -3}, false, {0,0,0}, 0, 0, 0});
+    tp.moves.push_back({MoveKind::Rapid, {8, 0, -3}, false, {0,0,0}, 0, 0, 0});
+    SimOptions so; so.check_rapid = true;
+    SimResult r = simulate_setup(su, lib, {tp}, TriMesh{}, so);
+    REQUIRE(r.ok);
+    CHECK(r.rapid_collisions > 0);
 }

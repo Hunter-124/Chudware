@@ -118,7 +118,7 @@ live session. Each op is a dict with an `"op"` key.
 | `pcb_delete_zone` | `id` | Delete a zone |
 | `pcb_set_net` | `name`, `class` | Register / update a net |
 
-Full contracts: `docs/contracts/ecad/ecad_ops.md`.
+Full contracts: `contracts/ecad/ecad_ops.md`.
 
 ---
 

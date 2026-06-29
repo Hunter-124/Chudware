@@ -8,8 +8,8 @@ Model: **sonnet** · Wave 1 · Depends: C02 (scalar_chunk writer) · Follow
 properties, check, symmetry, draft/thickness/curvature per-vertex fields emitted as AICM SCLR.
 
 ## Read first
-1. `docs/contracts/worker_rpc.md` §2 Evaluate (result shapes per method)
-2. `docs/contracts/mesh_format.md` SCLR chunk; `engine/doc/tessellate.py` (C02 helpers)
+1. `contracts/worker_rpc.md` §2 Evaluate (result shapes per method)
+2. `contracts/mesh_format.md` SCLR chunk; `engine/doc/tessellate.py` (C02 helpers)
 3. `docs/PLAN.md` §5-M5 (analytic verification fixtures)
 4. `engine/kernel.py` `_fit_report` (interference port), `_face_census`
 

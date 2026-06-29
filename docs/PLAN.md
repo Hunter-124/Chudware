@@ -1,7 +1,7 @@
 # AI-CAD Overhaul — Master Plan
 
 > Status: **APPROVED 2026-06-10** · M0 in progress · This file is the canonical execution reference.
-> Contracts live in `docs/contracts/` and change only via explicit version bump.
+> Contracts live in `contracts/` and change only via explicit version bump.
 
 ## 1. Context
 
@@ -109,7 +109,7 @@ matplotlib (colormap LUTs), trimesh voxelizer, scipy are already in the 94-wheel
   (run/stage/attempt with prompts, inputs, raw output, parsed result, durations) streamed to an
   Activity panel and persisted to `cache/runs/<id>/events.jsonl` for replay.
 
-## 4. Contracts (`docs/contracts/`, frozen at M0)
+## 4. Contracts (`contracts/`, frozen at M0)
 
 | Contract | Contents |
 |---|---|
@@ -143,7 +143,7 @@ M0 contracts
 `AI_CAD_SHOT` screenshot gallery rendered in BOTH themes; legacy agent loop + MCP server intact.
 
 ### M0 — Contracts & scaffolding (~1 wk) — single-threaded, no parallelism
-All `docs/contracts/*`, fixtures (`part_bracket.json`, `asm_clamp.json`, golden `box.aicm` +
+All `contracts/*`, fixtures (`part_bracket.json`, `asm_clamp.json`, golden `box.aicm` +
 generator), `engine/doc/` schema validator + equations evaluator + tests, wheel-availability spike
 (gmsh/scikit-fem/meshio/pyamg/python-solvespace), git repo init + baseline.
 **Verify:** fixture validation suite green; golden AICM regenerates byte-identical; legacy suites green.
@@ -165,7 +165,7 @@ generator), `engine/doc/` schema validator + equations evaluator + tests, wheel-
   (dark + SW-light, runtime switch), FeatureManager tree (status icons, context menus, rollback
   bar visual), PropertyManager host (OK/Cancel, collapsible groups, dim fields with expr,
   selector wells bound to selection), viewport HUD, doc tabs, status bar (units, defined-state).
-  Builds against `docs/contracts/fixtures/` until WS-1A lands.
+  Builds against `contracts/fixtures/` until WS-1A lands.
 **Integration:** New Part → Box via PM → pick edges → Fillet → pick face → Shell → tree shows the
 history → edit fillet radius → cached rebuild → save/open `.step+` → legacy chat designs into a
 `script` feature in the same document.

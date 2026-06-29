@@ -29,3 +29,25 @@ this is pre-existing drift, not introduced by the refactor. Per the plan,
 `scripts/gate.sh` (N0d) records this as a non-fatal `check.py` finding and
 still exits 0 so the swarm can proceed; the underlying ribbon/parity gaps are
 real engine work for later phases, not P0 foundation.
+
+### N0c — promote contracts
+`git mv docs/contracts contracts` (history preserved). Updated `docs/contracts`
+path references → `contracts/` in `docs/**/*.md`, the moved `contracts/**/*.md`
+internal cross-refs, and root config (`README.md`, `ARCHITECTURE.md`,
+`requirements.txt`). Added `contracts/README.md` listing the frozen seams
+(`worker_rpc.md`, `doc_ops.md`, `doc_schema.md`, `selectors.md`,
+`mesh_format.md`, `stepplus.md`, `events.md`, `feature_params.md`) plus the
+`ecad/`, `fixtures/`, `icons.md`, `licenses.md` subdirs, with the append-only /
+integrator-sign-off policy.
+
+**Deferred (per P0 hard constraint — no source edits under
+`core/`/`host/`/`app/`/`engine/`/`agent/`/`mcp_server/`):** the `docs/contracts`
+path references that remain in code comments / one string literal inside those
+trees (e.g. `host/src/ui/viewport_panel.cpp`, `host/src/render/test_aicm_cpp/test_aicm.cpp`
+default `"docs/contracts/fixtures/box.aicm"`, `core/CMakeLists.txt`,
+`core/doc/*.h`, `engine/**/*.py`, `host/assets/make_icons.py`) were intentionally
+left stale. They are non-functional comments or a test fallback default not run
+by the gate, and those trees move/reorganize in later phases; the path fixups
+land with the per-subsystem moves. `AGENTS.md`'s "promoted from `docs/contracts/`"
+line was preserved as historical prose. `scripts/parity_audit.py` references
+`docs/SW_PARITY_SPEC.md` (not `docs/contracts`), so no script change was needed.

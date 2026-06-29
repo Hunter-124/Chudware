@@ -151,7 +151,7 @@ CAD `cmd_id`s start with `sch_`/`pcb_`/`ecad_`).
 
 ## (e) Worker-RPC call pattern — `ecad_apply_ops` / `ecad_tree` → the mirror
 
-The ECAD RPC surface (`docs/contracts/ecad/ecad_rpc.md`, registered from `engine/ecad/rpc.py`) is the
+The ECAD RPC surface (`contracts/ecad/ecad_rpc.md`, registered from `engine/ecad/rpc.py`) is the
 exact analogue of the CAD `doc_*` methods that `core/doc_mirror.cpp` already drives via
 `WorkerClient::call(...)`. The scaffold's panel keeps its mirror behind `ui::ecadEditorMirror()` and a
 `ui::ecadEditorLoadResponse(const nlohmann::json&)` feeder; you call the worker and hand the response
@@ -195,7 +195,7 @@ static void ecadNewDoc(AppState& st, const char* kind) {
     st.addLog("[ecad] new " + std::string(kind) + " doc " + st.ecadDocId);
 }
 
-// Apply an op batch (the same closed vocabulary as docs/contracts/ecad/ecad_ops.md). On success the
+// Apply an op batch (the same closed vocabulary as contracts/ecad/ecad_ops.md). On success the
 // response's {revision,kind,tree,compile} flow straight into the mirror; on stale_revision we resync
 // via ecad_tree (same discipline as core::DocMirror::applyOps).
 static void ecadApplyOps(AppState& st, const nlohmann::json& ops) {

@@ -2,7 +2,7 @@
 
 Branch: `feat/gui-rewrite` · Captured: 2026-06-27  
 Track ownership: `scripts/**`, `installer/**`, `tools/**`, `build.bat`, `mcp_setup.bat`,
-`config.example.json`, `.mcp.json`, `README.md`, `ARCHITECTURE.md`, `docs/**` (excl. `docs/review/**`, `docs/contracts/**`).
+`config.example.json`, `.mcp.json`, `README.md`, `ARCHITECTURE.md`, `docs/**` (excl. `docs/review/**`, `contracts/**`).
 
 ## Fixed
 

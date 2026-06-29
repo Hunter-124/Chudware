@@ -8,12 +8,12 @@ The viewport learns topology: load AICM tessellations with per-face/edge identit
 R32UI ID buffer, and turn the mouse into face/edge/vertex picks with hover/selection highlight.
 
 ## Read first
-1. `docs/contracts/mesh_format.md` (you implement the C++ reader; golden:
-   `docs/contracts/fixtures/box.aicm`)
+1. `contracts/mesh_format.md` (you implement the C++ reader; golden:
+   `contracts/fixtures/box.aicm`)
 2. `host/src/renderer.{h,cpp}`, `host/src/mesh.{h,cpp}` (current pipeline you extend),
    `host/src/ui/viewport_panel.cpp` (post-split)
 3. `docs/PLAN.md` §3.1 (ID encoding: 8-bit body | 2-bit kind | 22-bit topo id; RGBA8 fallback)
-4. `docs/contracts/worker_rpc.md` `doc_resolve_pick` (what a pick becomes — wiring to the
+4. `contracts/worker_rpc.md` `doc_resolve_pick` (what a pick becomes — wiring to the
    worker is C16's job; you expose the pick result struct)
 
 ## Owned paths
@@ -42,7 +42,7 @@ surgical extensions to `host/src/renderer.{h,cpp}` · `host/src/ui/viewport_pane
    selectors — leave a `pending_resolve` slot.
 5. Viewport wiring: hover on mouse move (throttle to once per frame), click selection,
    ESC clears; status-bar text hook "Face 12 of Body1" via a callback.
-6. `AI_CAD_SHOT=pick` headless mode: load `docs/contracts/fixtures/box.aicm`, render, simulate
+6. `AI_CAD_SHOT=pick` headless mode: load `contracts/fixtures/box.aicm`, render, simulate
    a center-screen pick, draw the highlight, save shot; ALSO print to stdout the PickHit for
    the center pixel ("pick: body=1 kind=face id=N") so verification is scriptable.
 

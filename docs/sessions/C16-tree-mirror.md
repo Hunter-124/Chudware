@@ -8,7 +8,7 @@ The GUI becomes document-aware: a worker-backed document mirror, the left Featur
 and picks that resolve to selectors through the worker.
 
 ## Read first
-1. `docs/contracts/doc_ops.md` (ops-response you consume), `docs/contracts/worker_rpc.md` §2
+1. `contracts/doc_ops.md` (ops-response you consume), `contracts/worker_rpc.md` §2
 2. `host/src/core/jobs.cpp` + `host/src/worker_client.{h,cpp}` (how the GUI calls the worker)
 3. `host/src/render/aicm_loader.h` + `host/src/core/selection.h` (C15's API)
 4. SolidWorks tree look: doc name root; Equations, Material, Front/Top/Right planes, Origin
@@ -44,7 +44,7 @@ AICM reload on rebuild) · `host/CMakeLists.txt` (append)
    worker; reuse the existing shot plumbing that already launches it for chat demos (read how
    AI_CAD_SHOT=chat works post-split). If a live worker in shot mode is infeasible tonight,
    drive the same flow in a `--doc-smoke` CLI mode printing JSON results, and screenshot a
-   mirror loaded from `docs/contracts/fixtures/part_bracket.json` instead — note the choice.
+   mirror loaded from `contracts/fixtures/part_bracket.json` instead — note the choice.
 
 ## Verification
 Build green (host/build2); the scripted flow produces: tree showing Box + Fillet with ok

@@ -7,8 +7,8 @@ Model: **sonnet** · Wave 0 · Depends: none · Follow `docs/sessions/README.md`
 against rebuilt topology by scored best-match — the contract's exact algorithm.
 
 ## Read first
-1. `docs/contracts/selectors.md` — normative algorithm (weights, thresholds, margin, tiebreak)
-2. `docs/contracts/doc_schema.md` §0/§5 (selector-or-datum, reserved datums)
+1. `contracts/selectors.md` — normative algorithm (weights, thresholds, margin, tiebreak)
+2. `contracts/doc_schema.md` §0/§5 (selector-or-datum, reserved datums)
 3. `engine/doc/schema.py` (`validate_selector` — your outputs must pass it)
 
 ## Owned paths

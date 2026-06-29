@@ -2,7 +2,7 @@
 
 > Status: **DRAFTED autonomously 2026-06-13** (user away; decisions made with rationale and flagged
 > for review — see §2). Sibling of `docs/PLAN.md`. Canonical execution reference for the EDA module.
-> Contracts live in `docs/contracts/ecad/` and change only via explicit version bump.
+> Contracts live in `contracts/ecad/` and change only via explicit version bump.
 
 ## 0. One-paragraph thesis
 
@@ -45,7 +45,7 @@ AI-CAD is a SolidWorks-class parametric CAD app (see `docs/PLAN.md`). The archit
 ## 2. Locked decisions (made autonomously; **flagged for user review** ⚑)
 
 1. **Clean-room, GPL-clean.** ⚑ *(highest-stakes — confirm on return.)* KiCad is **GPLv3**.
-   `docs/contracts/licenses.md` already mandates a "GPL-clean except where isolated" posture. We
+   `contracts/licenses.md` already mandates a "GPL-clean except where isolated" posture. We
    therefore **copy no KiCad source**. We learn its architecture, reimplement original code, and
    **parse its file formats** (reading a documented S-expression format is interop, not derivation).
    Users import **their own installed** KiCad symbol/footprint/3D libraries; we ship a small
@@ -111,7 +111,7 @@ mcp_server/
   ecad_tools.py       @mcp.tool() EDA tools with rich context helpers (imported by server.py)
 host/src/ui/ecad/     C++ editor (Wave D): sch_canvas, pcb_canvas, layers_panel, erc_drc_panel,
                       sim_panel, ecad_forms (PM forms), ecad_ribbon
-docs/contracts/ecad/  frozen contracts (M0)
+contracts/ecad/  frozen contracts (M0)
 tests/ecad/           headless pytest suites + fixtures
 ```
 
@@ -165,7 +165,7 @@ single `import` feature references it — so it opens in the existing CAD viewpo
 The user then models a housing around it and uses the **existing interference/fit report** to check
 clearance. This is the seam that makes "design PCB → design its enclosure" one continuous flow.
 
-## 4. Contracts (frozen at M0, `docs/contracts/ecad/`)
+## 4. Contracts (frozen at M0, `contracts/ecad/`)
 
 | Contract | Contents |
 |---|---|
@@ -178,7 +178,7 @@ clearance. This is the seam that makes "design PCB → design its enclosure" one
 | `fab_outputs.md` | Gerber/Excellon/BOM/CPL formats, layer mapping, the STEP 3D-bridge contract |
 | `library.md` | Native symbol/footprint/3D library format + KiCad import field mapping + starter inventory |
 
-Plus one appended row block in `docs/contracts/licenses.md` (ECAD posture: KiCad clean-room,
+Plus one appended row block in `contracts/licenses.md` (ECAD posture: KiCad clean-room,
 ngspice isolation, library-content terms).
 
 ## 5. Waves & model assignment
@@ -190,7 +190,7 @@ scaffolding/boilerplate/format writers with a worked example.
 
 | Wave | Tasks (owner dir) | Model | Verify gate |
 |---|---|---|---|
-| **M0** | Plan + all `docs/contracts/ecad/*` + fixtures | Opus (me) | contracts internally consistent; fixtures validate |
+| **M0** | Plan + all `contracts/ecad/*` + fixtures | Opus (me) | contracts internally consistent; fixtures validate |
 | **A1** | `schema.py` (sch+pcb validators) + schema tests | Sonnet | fixture docs validate; round-trip JSON stable |
 | **A2** | `ops.py` + `session.py` (revision/undo/transactionality) | Opus | transactional-ops tests; undo/redo; placeholder resolution |
 | **A3** | `netlist.py` + `erc.py` | Opus | golden netlist for fixture sch; ERC catches seeded faults |
@@ -214,7 +214,7 @@ Wave D is best-effort scaffolding handed off for integration.
 The CAD agent is actively editing `engine/doc/` and `host/src/`. We stay out of its way:
 
 - **New code in new dirs** (`engine/ecad/`, `engine/sim/circuit.py|devices.py|spice.py`,
-  `mcp_server/ecad_tools.py`, `host/src/ui/ecad/`, `tests/ecad/`, `docs/contracts/ecad/`).
+  `mcp_server/ecad_tools.py`, `host/src/ui/ecad/`, `tests/ecad/`, `contracts/ecad/`).
   Zero edits to existing `engine/doc/*` or `engine/sim/{fea,lbm}*`.
 - **Shared "merge-by-append" files** (the plan already names these as single-owner append targets):
   `engine/worker.py` `_METHODS` registry, `host/CMakeLists.txt` source list,

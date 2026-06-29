@@ -167,7 +167,7 @@ waves (F0–F3, F5) and the host wave (F4) parallelize once the F0 RPC/registry 
 - Owner deliverable: a short "make me these test parts" list to drive reverse-engineering.
 
 ### F6 — Polish / QA / docs
-- `docs/FORMATS_STATUS.md` final matrix; `docs/contracts/formats.md` contract for the registry +
+- `docs/FORMATS_STATUS.md` final matrix; `contracts/formats.md` contract for the registry +
   `doc_formats` RPC. Optional **"Convert mesh to solid"** op (D1 stretch).
 - Full manual SW-vocabulary checklist; engine test sweep stays green.
 
@@ -184,7 +184,7 @@ waves (F0–F3, F5) and the host wave (F4) parallelize once the F0 RPC/registry 
 | pywin32 | PSF/BSD | F5 | optional SolidWorks COM automation (Windows-only, feature-detected) |
 
 No commercial/GPL deps. ODA MCAD SDK and the Parasolid kernel are explicitly **out of scope**
-(paid, closed). Each new dep gets a row in `docs/contracts/licenses.md` in the same wave.
+(paid, closed). Each new dep gets a row in `contracts/licenses.md` in the same wave.
 
 ---
 

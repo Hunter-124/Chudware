@@ -1,7 +1,7 @@
 # Contract: Document Schema — `aicad.part/1` · `aicad.asm/1` · `aicad.drawing/1`
 
 > Version 1. Changes require a schema-string bump and a migration note here.
-> Machine-checked by `engine/doc/schema.py`; fixtures in `docs/contracts/fixtures/`.
+> Machine-checked by `engine/doc/schema.py`; fixtures in `contracts/fixtures/`.
 >
 > **W12 minor version bump (additive).** A NEW top-level document kind `aicad.drawing/1`
 > (`DrawingDocument`, §8) is added — a 2D detailing document that projects a source part/assembly

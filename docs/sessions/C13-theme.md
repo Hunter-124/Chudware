@@ -10,7 +10,7 @@ alongside the existing dark/teal one, runtime-switchable.
 ## Read first
 1. `host/src/ui_theme.{h,cpp}` (current theme), every file under `host/src/ui/` (the split
    panels — find their hardcoded ImVec4/ImU32 colors)
-2. `docs/PLAN.md` §2.1 + §3.1 (theme toggle decision), `docs/contracts/icons.md` (palette refs)
+2. `docs/PLAN.md` §2.1 + §3.1 (theme toggle decision), `contracts/icons.md` (palette refs)
 
 ## Owned paths
 `host/src/ui_theme.{h,cpp}` · color-only edits inside `host/src/ui/*.cpp` and

@@ -54,7 +54,7 @@
   prompt_file (click -> opens Agents editor), context size, duration, verdict chips, raw output.
   Settings "Agents" tab: per-role editor, Save->override_path, Reset, char-count diff badge.
   Design panel "Use orchestrator (v2)" checkbox (agent_v2 setting; needs an open doc); after a
-  v2 run, doc_rebuild refreshes tree+mesh. Fixture docs/contracts/fixtures/mock_replies_v2.json.
+  v2 run, doc_rebuild refreshes tree+mesh. Fixture contracts/fixtures/mock_replies_v2.json.
 - AI_CAD_SHOT now also: asm (asserts |peg z-15|<0.5), activity. ALWAYS run shots with
   AI_CAD_PROVIDER=mock.
 - C24 DEBTS (from both agents): dock the floating asm dialogs (dockspace NoBringToFrontOnFocus

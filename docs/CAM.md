@@ -48,7 +48,7 @@ so it builds in the standalone config and is unit-tested headless. Geometry to m
 as plain data (regions / section profiles / drill points / a triangle mesh); the OCCT
 `cam_extract` adapter pulls that data out of a live document for the product. 2D polygon offset/
 boolean uses **Clipper2** (Boost license — vendored via FetchContent; see
-`docs/contracts/licenses.md`). No GPL CAM source (FreeCAD Path / libarea / opencamlib) or vendor
+`contracts/licenses.md`). No GPL CAM source (FreeCAD Path / libarea / opencamlib) or vendor
 post is copied — dialect tables + algorithms are clean-room from public G-code references.
 
 ## Platforms & operations

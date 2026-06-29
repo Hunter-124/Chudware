@@ -7,9 +7,9 @@ Model: **sonnet** · Wave 1 · Depends: C06 (nsolve) · Follow `docs/sessions/RE
 as nsolve residuals with analytic Jacobians, and report SolidWorks-style statuses.
 
 ## Read first
-1. `docs/contracts/doc_schema.md` §3 (entities, handles, constraints — the full table)
+1. `contracts/doc_schema.md` §3 (entities, handles, constraints — the full table)
 2. `engine/doc/nsolve.py` (C06's API — read its module docstring and tests)
-3. `docs/contracts/worker_rpc.md` sketch methods (what callers need back)
+3. `contracts/worker_rpc.md` sketch methods (what callers need back)
 
 ## Owned paths
 `engine/doc/sketch_solver.py` · `engine/doc/test_sketch_solver.py`

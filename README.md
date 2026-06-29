@@ -156,5 +156,5 @@ mcp_setup.bat            # portable wrapper around installer/setup_mcp_clients.p
 Scripts run with the full `build123d` namespace in scope and assign the final shape to
 **`result`** (a `Part`/`Solid`/`Compound`, or a `BuildPart`/`BuildSketch` context — the kernel
 unwraps it). Anything printed is captured and returned. See
-[docs/contracts/](docs/contracts) for the frozen interface contracts (doc schema, ops, RPC,
+[contracts/](contracts) for the frozen interface contracts (doc schema, ops, RPC,
 selectors, mesh/`.step+` formats).

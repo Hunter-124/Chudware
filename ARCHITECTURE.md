@@ -5,7 +5,7 @@
 > FEA (static/modal) + LBM flow simulation, Evaluate tools, STEP/IGES/BREP/STL/3MF + native
 > `.step+`, and a deterministic AI orchestrator with editable role prompts and a transparent
 > Activity panel. **Canonical references:** [docs/PLAN.md](docs/PLAN.md) (design + milestones),
-> [docs/contracts/](docs/contracts) (frozen interface contracts),
+> [contracts/](contracts) (frozen interface contracts),
 > [docs/sessions/reports.md](docs/sessions/reports.md) (per-component integration notes).
 > The description below covers the original v1 pipeline, which still works unchanged
 > (a script becomes a `script` feature in the document tree).

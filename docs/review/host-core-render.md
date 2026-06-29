@@ -70,7 +70,7 @@
 
 | Test | Result |
 |------|--------|
-| `test_aicm docs/contracts/fixtures/box.aicm` | **PASS** (20 checks incl. 8-bit `body_id` truncation) |
+| `test_aicm contracts/fixtures/box.aicm` | **PASS** (20 checks incl. 8-bit `body_id` truncation) |
 
 **Phase 2:** GUI pick smoke (`AI_CAD_SHOT=pick`), multi-doc mid-edit (`AI_CAD_SHOT=multidoc`), tab switch to empty sketch-only doc after a meshed part.
 

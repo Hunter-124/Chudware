@@ -1,7 +1,7 @@
 # Session Cards — build-out work orders
 
 Each card is a self-contained prompt for one agent session (Sonnet/Opus) or one human-driven
-Claude Code session. Cards reference the frozen contracts in `docs/contracts/` — read them, never
+Claude Code session. Cards reference the frozen contracts in `contracts/` — read them, never
 edit them. The orchestrator dispatches cards in waves and owns integration + commits.
 
 ## Conventions (every card inherits these)
@@ -17,7 +17,7 @@ edit them. The orchestrator dispatches cards in waves and owns integration + com
   file (`engine/worker.py`, `engine/doc/__init__.py`, `host/CMakeLists.txt`,
   `host/src/ui/ribbon_def.cpp`), DO NOT edit it — list the exact change in your final report.
 - **No git**: never commit/stage; leave changes in the working tree. The orchestrator commits.
-- **No contract edits**: `docs/contracts/*` and `docs/PLAN.md` are read-only. If a contract is
+- **No contract edits**: `contracts/*` and `docs/PLAN.md` are read-only. If a contract is
   wrong or blocks you, STOP that part and report the conflict instead of improvising around it.
 - **Units**: canonical mm/degrees/grams everywhere (doc_schema.md §0). Equations trig = degrees.
 - **Code style**: match the surrounding code. Python: type hints, no heavy deps beyond the venv.

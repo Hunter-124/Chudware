@@ -8,8 +8,8 @@ runtime. Returns numpy results (npz); AICM/GUI packaging is a later card — kee
 
 ## Read first
 1. `docs/PLAN.md` §3.1 CFD bullet and §5-M7 (guards, presets, outputs, verification bands)
-2. `docs/contracts/worker_rpc.md` §3 `sim_run_flow` (the result fields you must produce)
-3. `docs/contracts/events.md` `sim_progress` (your `on_progress` callback payloads)
+2. `contracts/worker_rpc.md` §3 `sim_run_flow` (the result fields you must produce)
+3. `contracts/events.md` `sim_progress` (your `on_progress` callback payloads)
 
 ## Owned paths
 `engine/sim/lbm.py` · `engine/sim/test_lbm.py`

@@ -8,9 +8,9 @@ vocabulary, tessellation on rebuild, pick resolution, and minimal `.step+` save/
 card, the C++ side has a complete backend for M1.
 
 ## Read first
-1. `docs/contracts/doc_ops.md` (op vocabulary, envelope, transactionality, placeholders, errors)
-2. `docs/contracts/worker_rpc.md` §2 (every doc_* method + protocol 2)
-3. `docs/contracts/stepplus.md` (§1 required entries, §2 load order, §3 atomic save)
+1. `contracts/doc_ops.md` (op vocabulary, envelope, transactionality, placeholders, errors)
+2. `contracts/worker_rpc.md` §2 (every doc_* method + protocol 2)
+3. `contracts/stepplus.md` (§1 required entries, §2 load order, §3 atomic save)
 4. `engine/worker.py` (serve loop you extend), `engine/doc/compiler.py` (C01),
    `engine/doc/tessellate.py` (C02), `engine/doc/selectors.py` (C03), C09's features
 5. `engine/test_worker_stream.py` (the wire-test style you extend)

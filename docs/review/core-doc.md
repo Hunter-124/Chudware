@@ -2,7 +2,7 @@
 
 **Branch:** feat/gui-rewrite  
 **Ownership:** `core/doc/**`, `core/tests/test_selectors.cpp`, `core/tests/test_picks.cpp`, `core/tests/test_document*`  
-**Focus:** selectors / picks / session active changes, render tint, `doc_adjacency` / `doc_set_meta` / `doc_get_meta`, contract alignment (read-only `docs/contracts/selectors.md`).
+**Focus:** selectors / picks / session active changes, render tint, `doc_adjacency` / `doc_set_meta` / `doc_get_meta`, contract alignment (read-only `contracts/selectors.md`).
 
 ---
 
@@ -30,7 +30,7 @@
 
 | Item | Location | Notes |
 |------|----------|-------|
-| **`sid` field not in contract** | `selectors.cpp` `make_selector` | Emits `sid` (GSL W1 stable handle). Not in `docs/contracts/selectors.md` §1. Informational only; resolve ignores it. |
+| **`sid` field not in contract** | `selectors.cpp` `make_selector` | Emits `sid` (GSL W1 stable handle). Not in `contracts/selectors.md` §1. Informational only; resolve ignores it. |
 | **resolve() extensions beyond §3** | `selectors.cpp` `resolve()` | Signed-normal tie-break (F5) and coaxial area tie-break go beyond normative contract algorithm. Intentional pragmatic fixes; contract / torture suite unchanged for axis-less cases. |
 | **Line-edge scoring extension** | `selectors.cpp` `score_candidate` | Perpendicular-distance scoring for line-vs-line not specified in contract §3. Matches fillet-preview trimming behavior. |
 | **`doc_adjacency` concavity often null** | `session.cpp` | `describe_faces` does not set `TopoInfo::concave`; only geom-query path sets it via `cylinder_face_concave`. Adjacency `concavity` field present but usually `null` until describers enrich cylinders. |
@@ -64,7 +64,7 @@ Existing torture coverage retained: A1–A8 (pure resolve), B7–B10 (describers
 | `core/tests/test_selectors.cpp` | Add B11; prior diff: A8, B10 GSL assertions |
 | `docs/review/core-doc.md` | This report |
 
-**Read-only reviewed (no edits):** `selectors.h`, `session.h`, `document.{h,cpp}`, `validate.cpp`, `docs/contracts/selectors.md`, `test_picks.cpp`, `test_document.cpp`, other `core/doc/*` sources.
+**Read-only reviewed (no edits):** `selectors.h`, `session.h`, `document.{h,cpp}`, `validate.cpp`, `contracts/selectors.md`, `test_picks.cpp`, `test_document.cpp`, other `core/doc/*` sources.
 
 ---
 

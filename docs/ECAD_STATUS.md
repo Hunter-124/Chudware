@@ -49,7 +49,7 @@ Run the demo to see the whole pipeline:
 ## Key decisions made autonomously (⚑ = please confirm)
 
 1. ⚑ **Clean-room, GPL-clean.** No KiCad source copied (KiCad is GPLv3); we parse its file formats
-   and import the user's own libraries. Locked in `docs/contracts/licenses.md`.
+   and import the user's own libraries. Locked in `contracts/licenses.md`.
 2. ⚑ **Native MNA simulator instead of ngspice** — satisfies "improve the simulations" and stays
    GPL-clean. ngspice remains a documented, subprocess-isolated *optional* backend (not built).
 3. **Mirrors `engine/doc` architecture** exactly (schema/ops/session/compile/RPC/tools/PM-forms).

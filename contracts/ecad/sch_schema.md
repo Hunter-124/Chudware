@@ -1,7 +1,7 @@
 # Contract: Schematic Document Schema — v1
 
 > `SchematicDocument` (`schema: "aicad.sch/1"`). JSON-serializable, the **authority for
-> connectivity**. Mirrors the conventions of `docs/contracts/doc_schema.md`: canonical units are
+> connectivity**. Mirrors the conventions of `contracts/doc_schema.md`: canonical units are
 > **mm internally** (display/grid in C++ only), ids are assigned and never reused, unknown keys are
 > preserved on resave. Changes require a version bump.
 

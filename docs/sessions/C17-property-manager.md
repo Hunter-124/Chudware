@@ -9,8 +9,8 @@ wells fed by viewport picks, dimension fields with units + expressions, live pre
 full M1 integration scenario passing.
 
 ## Read first
-1. `docs/contracts/feature_params.md` — field order IS the form; PM conventions at the bottom
-2. `docs/contracts/doc_ops.md` (add_feature/edit_feature you emit)
+1. `contracts/feature_params.md` — field order IS the form; PM conventions at the bottom
+2. `contracts/doc_ops.md` (add_feature/edit_feature you emit)
 3. C14's ribbon callback registration, C16's doc_mirror + selection APIs, C15's PickHit flow
 4. `docs/PLAN.md` §5-M1 "Integration"
 

@@ -36,7 +36,7 @@ exercise, all SolidWorks-equivalent flows.
 
 ## Decisions locked (no test, FYI)
 - **Clean-room / GPL-clean: confirmed** — KiCad source is never copied; features are reimplemented
-  clean-room. (Owner sign-off in `docs/contracts/licenses.md`.)
+  clean-room. (Owner sign-off in `contracts/licenses.md`.)
 - **ngspice** — fine as an optional, unmodified, subprocess-only backend; native MNA stays primary.
 - **AI cloud opt-in** — already works: set `offline_mode` false in Settings to allow cloud models;
   true keeps everything local (your current setting).

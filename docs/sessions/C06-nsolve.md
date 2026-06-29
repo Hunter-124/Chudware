@@ -10,7 +10,7 @@ make-or-break component for SolidWorks feel — diagnostics quality matters as m
 
 ## Read first
 1. `docs/PLAN.md` §3.1 (one numeric solver core; budgets: warm drag <10 ms @ ~200 unknowns)
-2. `docs/contracts/doc_schema.md` §3.3–3.4 (what constraint diagnostics must support)
+2. `contracts/doc_schema.md` §3.3–3.4 (what constraint diagnostics must support)
 
 ## Owned paths
 `engine/doc/nsolve.py` · `engine/doc/test_nsolve.py`

@@ -7,7 +7,7 @@ Model: **sonnet** · Wave 0 · Depends: none · Follow `docs/sessions/README.md`
 per the icons contract. Pure generation, no C++ in this card.
 
 ## Read first
-1. `docs/contracts/icons.md` — inventory (~95 names), sizes, style, atlas JSON shape
+1. `contracts/icons.md` — inventory (~95 names), sizes, style, atlas JSON shape
 2. `host/assets/make_logo.py` — the house pattern (PIL, supersampling)
 
 ## Owned paths
@@ -33,7 +33,7 @@ per the icons contract. Pure generation, no C++ in this card.
    regeneration is byte-identical (determinism).
 
 ## Constraints
-- venv python has Pillow. Parse the inventory FROM `docs/contracts/icons.md` (the backticked
+- venv python has Pillow. Parse the inventory FROM `contracts/icons.md` (the backticked
   name lists) so contract and atlas can't drift — if parsing is brittle, mirror the list in
   one Python constant and assert it matches the contract's names.
 

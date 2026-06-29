@@ -7,8 +7,8 @@ Write `engine/doc/tessellate.py`: OCCT shapes → AICM v1 binary (the viewport/p
 plus a pure-Python parser used by tests and later by tooling.
 
 ## Read first
-1. `docs/contracts/mesh_format.md` — the byte-level spec, normative
-2. `docs/contracts/fixtures/make_box_aicm.py` + `fixtures/box.aicm` — golden encoding example
+1. `contracts/mesh_format.md` — the byte-level spec, normative
+2. `contracts/fixtures/make_box_aicm.py` + `fixtures/box.aicm` — golden encoding example
 3. `docs/PLAN.md` §3 "Architecture (validated)" — the EXACT verified OCP call paths (edge
    polylines via `PolygonOnTriangulation_s`, NOT `Polygon3D_s`; normals via
    `BRepLib_ToolTriangulatedShape.ComputeNormals_s`; orientation flip for REVERSED faces)

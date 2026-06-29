@@ -9,8 +9,8 @@ selector-picked topology, plus the non-solving sketch compiler (stored coordinat
 and extrude/revolve over those regions.
 
 ## Read first
-1. `docs/contracts/feature_params.md` (fillet, chamfer, shell, sketch, extrude, revolve)
-2. `docs/contracts/selectors.md` §4 (region resolution)
+1. `contracts/feature_params.md` (fillet, chamfer, shell, sketch, extrude, revolve)
+2. `contracts/selectors.md` §4 (region resolution)
 3. `engine/doc/compiler.py` + `engine/doc/features/base.py` (C01's registry — build on it,
    read its report notes in your dispatch prompt if provided)
 4. `engine/doc/selectors.py` (C03's describers + resolve API)
@@ -38,7 +38,7 @@ and extrude/revolve over those regions.
    DEFERRED (note it) — do not block on BRepOffsetAPI_DraftAngle tonight. Revolve validates
    the axis doesn't cross the profile interior (clean error).
 4. `test_features1.py`:
-   - bracket fixture compiles: load `docs/contracts/fixtures/part_bracket.json`, compile —
+   - bracket fixture compiles: load `contracts/fixtures/part_bracket.json`, compile —
      EVERY feature ok; final volume ≈ plate volume − 4 pattern holes... pattern (f6) is NOT
      yours: if `linear_pattern` is unimplemented in C01's registry, assert features f1–f5 ok
      and f6 reports a clean "unknown feature type" error instead of crashing; note it.

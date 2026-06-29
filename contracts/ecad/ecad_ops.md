@@ -1,7 +1,7 @@
 # Contract: ECAD Document Ops — v1
 
 > The closed vocabulary of ECAD document mutations. The GUI submits these; **the AI ECAD tools emit
-> exactly these**. Mirrors `docs/contracts/doc_ops.md` (envelope, transactionality, id placeholders).
+> exactly these**. Mirrors `contracts/doc_ops.md` (envelope, transactionality, id placeholders).
 > Design once, freeze here; changes require a version bump.
 
 ## 1. Envelope

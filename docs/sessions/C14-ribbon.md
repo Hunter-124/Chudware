@@ -11,7 +11,7 @@ wires PropertyManager flows).
 ## Read first
 1. The user's target layout is SolidWorks 2025: tabs (Part: Features | Sketch | Evaluate |
    Simulation), groups of large icon-over-label buttons with dropdown splits, group separators.
-   See `docs/PLAN.md` §2.1/§3.1 and `docs/contracts/icons.md` for command names.
+   See `docs/PLAN.md` §2.1/§3.1 and `contracts/icons.md` for command names.
 2. `host/src/app.cpp` + `host/src/ui/` (post-split structure), `host/src/ui_theme.h` (C13 roles)
 3. `host/assets/icons/atlas.json` (C05 output format)
 
@@ -29,7 +29,7 @@ wires PropertyManager flows).
    label, SW-style hover frame), `RibbonSmall` rows, dropdown-split buttons (arrow zone opens
    an ImGui popup of sub-commands), disabled state, horizontal overflow scroll.
 3. `ribbon_def.cpp`: ONE static table `{cmd_id, label, icon, tab, group, big, sub_of}` covering
-   the v1 commands of all four Part tabs per `docs/contracts/feature_params.md` and PLAN §6
+   the v1 commands of all four Part tabs per `contracts/feature_params.md` and PLAN §6
    tiers (stretch commands present but disabled). Dispatch via a registered
    `std::function<void(const char* cmd_id)>` callback; default logs "[ribbon] <cmd>".
 4. Integration: ribbon spans the window under the title bar; dockspace shifts down; View menu

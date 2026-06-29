@@ -13,7 +13,7 @@ Branch at capture: `feat/gui-rewrite` (up to date with `origin/feat/gui-rewrite`
 - `core/doc/session.cpp`
 - `core/doc/session.h`
 - `core/tests/test_selectors.cpp`
-- `docs/contracts/selectors.md`
+- `contracts/selectors.md`
 - `mcp_server/cad_tools.py`
 - `mcp_server/server.py`
 
@@ -33,7 +33,7 @@ Branch at capture: `feat/gui-rewrite` (up to date with `origin/feat/gui-rewrite`
  core/doc/session.cpp
  core/doc/session.h
  core/tests/test_selectors.cpp
- docs/contracts/selectors.md
+ contracts/selectors.md
  mcp_server/cad_tools.py
  mcp_server/server.py
  10 files changed, 393 insertions(+), 16 deletions(-)

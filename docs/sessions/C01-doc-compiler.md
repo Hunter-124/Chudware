@@ -7,8 +7,8 @@ The heart of M1-WS-1A: compile an `aicad.part/1` document dict into OCCT solids,
 with per-feature caching, timing, error containment, and topology owner-tagging.
 
 ## Read first
-1. `docs/contracts/doc_schema.md`, `docs/contracts/feature_params.md` (params/refs per type)
-2. `docs/contracts/selectors.md` §1–2 (what owner tags feed)
+1. `contracts/doc_schema.md`, `contracts/feature_params.md` (params/refs per type)
+2. `contracts/selectors.md` §1–2 (what owner tags feed)
 3. `engine/doc/schema.py` (validators you call before compiling), `engine/doc/equations.py`
 4. `engine/kernel.py` — the forgiving namespace + `_exec_model`-style execution you will REUSE
    for the `script` feature (do not duplicate that logic; import and call it)

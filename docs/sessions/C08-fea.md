@@ -9,8 +9,8 @@ Linear-static + modal FEA over gmsh tet meshes, plus the separate sim-worker pro
 all simulation methods (crash isolation from the doc worker).
 
 ## Read first
-1. `docs/contracts/worker_rpc.md` §3 (sim worker methods + result shapes) and §1 (wire format)
-2. `docs/contracts/events.md` (`sim_progress`)
+1. `contracts/worker_rpc.md` §3 (sim worker methods + result shapes) and §1 (wire format)
+2. `contracts/events.md` (`sim_progress`)
 3. `engine/worker.py` — copy its stdio JSON-RPC serve loop pattern (methods dict, emit_event)
 4. `docs/PLAN.md` §5-M6
 

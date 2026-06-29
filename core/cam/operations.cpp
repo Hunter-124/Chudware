@@ -9,14 +9,6 @@
 namespace aicad {
 namespace cam {
 
-static GenResult not_wired(const Operation& op, const char* phase) {
-    GenResult r;
-    r.ok = false;
-    r.error = std::string("operation '") + to_string(op.type) + "' lands in the " + phase + " wave";
-    r.path.op_id = op.id;
-    return r;
-}
-
 GenResult generate(const Operation& op, const OpContext& ctx) {
     if (op.suppressed) {
         GenResult r;
@@ -38,26 +30,26 @@ GenResult generate(const Operation& op, const OpContext& ctx) {
         case OpType::Trace:      return gen_engrave(op, ctx);
         case OpType::Drill:      return gen_drill(op, ctx);
         case OpType::ThreadMill: return gen_threadmill(op, ctx);
-        // ── 3D milling (3d wave) ──
-        case OpType::AdaptiveClear3D:
-        case OpType::Pocket3D:
-        case OpType::Parallel3D:
-        case OpType::Contour3D:
-        case OpType::Scallop3D:
-        case OpType::Pencil3D:
-        case OpType::Radial3D:
-        case OpType::SpiralFinish3D: return not_wired(op, "3D");
-        // ── turning (turn wave) ──
-        case OpType::TurnFace:
-        case OpType::TurnRough:
-        case OpType::TurnFinish:
-        case OpType::TurnGroove:
-        case OpType::TurnThread:
-        case OpType::TurnPart:
-        case OpType::TurnDrill: return not_wired(op, "turning");
-        // ── 2D cutting + metrology (cut wave) ──
-        case OpType::Cut2D:
-        case OpType::Probe:     return not_wired(op, "cutting/probe");
+        // ── 3D milling ──
+        case OpType::AdaptiveClear3D: return gen_adaptive_clear3d(op, ctx);
+        case OpType::Pocket3D:        return gen_pocket3d(op, ctx);
+        case OpType::Parallel3D:      return gen_parallel3d(op, ctx);
+        case OpType::Contour3D:       return gen_contour3d(op, ctx);
+        case OpType::Scallop3D:       return gen_scallop3d(op, ctx);
+        case OpType::Pencil3D:        return gen_pencil3d(op, ctx);
+        case OpType::Radial3D:        return gen_radial3d(op, ctx);
+        case OpType::SpiralFinish3D:  return gen_spiral_finish3d(op, ctx);
+        // ── turning ──
+        case OpType::TurnFace:   return gen_turn_face(op, ctx);
+        case OpType::TurnRough:  return gen_turn_rough(op, ctx);
+        case OpType::TurnFinish: return gen_turn_finish(op, ctx);
+        case OpType::TurnGroove: return gen_turn_groove(op, ctx);
+        case OpType::TurnThread: return gen_turn_thread(op, ctx);
+        case OpType::TurnPart:   return gen_turn_part(op, ctx);
+        case OpType::TurnDrill:  return gen_turn_drill(op, ctx);
+        // ── 2D cutting + metrology ──
+        case OpType::Cut2D:  return gen_cut2d(op, ctx);
+        case OpType::Probe:  return gen_probe(op, ctx);
     }
     GenResult r;
     r.ok = false;

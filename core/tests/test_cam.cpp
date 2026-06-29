@@ -9,6 +9,7 @@
 #include "cam/geometry.h"
 #include "cam/feeds.h"
 #include "cam/operations.h"
+#include "cam/heightfield.h"
 #include "cam/model.h"
 
 using namespace aicad::cam;
@@ -437,6 +438,159 @@ TEST_CASE("op: generate() dispatch + suppressed + not-yet-wired") {
     CHECK(generate(op, ctx).ok);
     Operation sup = op; sup.suppressed = true;
     CHECK(generate(sup, ctx).ok);            // suppressed -> ok, no path
-    Operation turn; turn.type = OpType::TurnRough;
-    CHECK_FALSE(generate(turn, ctx).ok);     // turning wave not wired yet
+    Operation turn; turn.type = OpType::TurnRough;   // wired, but no profile geometry
+    CHECK_FALSE(generate(turn, ctx).ok);             // -> fails cleanly (no profile)
+}
+
+// ── 3D / turning / cutting generator tests (Phase 3) ─────────────────────────
+namespace {
+// A flat plane at z=h over [-s,s]^2 (two triangles).
+TriMesh plane_mesh(double h, double s) {
+    TriMesh m;
+    m.verts = {{-s, -s, h}, {s, -s, h}, {s, s, h}, {-s, s, h}};
+    m.tris = {{0, 1, 2}, {0, 2, 3}};
+    return m;
+}
+// A square pyramid: apex (0,0,ap), base [-s,s]^2 at z=0 (4 side triangles).
+TriMesh pyramid_mesh(double s, double ap) {
+    TriMesh m;
+    m.verts = {{-s, -s, 0}, {s, -s, 0}, {s, s, 0}, {-s, s, 0}, {0, 0, ap}};
+    m.tris = {{0, 1, 4}, {1, 2, 4}, {2, 3, 4}, {3, 0, 4}};
+    return m;
+}
+double min_cut_z(const Toolpath& tp) {
+    double z = 1e9;
+    for (auto& m : tp.moves) if (m.kind == MoveKind::Cut || m.kind == MoveKind::Plunge) z = std::min(z, m.to.z);
+    return z;
+}
+}  // namespace
+
+TEST_CASE("heightfield: flat plane samples + flat-tool drop") {
+    HeightField hf = HeightField::from_mesh(plane_mesh(3.0, 10.0), 0.5, 0.0, -10.0);
+    CHECK(hf.nx() > 0);
+    CHECK(hf.height_at(0, 0) == doctest::Approx(3.0).epsilon(0.01));
+    CHECK(hf.drop_tool(0, 0, 3.0, 0.0, 0.5) == doctest::Approx(3.0).epsilon(0.02));
+}
+
+TEST_CASE("heightfield: pyramid drop never gouges + center highest") {
+    TriMesh py = pyramid_mesh(10.0, 8.0);
+    HeightField hf = HeightField::from_mesh(py, 0.5, 0.0, 0.0);
+    double zc = hf.drop_tool(0, 0, 0.0, 0.0, 0.5);   // tiny tool at apex
+    double ze = hf.drop_tool(8, 0, 0.0, 0.0, 0.5);   // near edge
+    CHECK(zc > ze);
+    CHECK(zc == doctest::Approx(8.0).epsilon(0.1));
+    // a ball tool centered at apex must ride ABOVE the surface height there (no gouge)
+    double zball = hf.drop_tool(0, 0, 3.0, 3.0, 0.5);
+    CHECK(zball >= hf.height_at(0, 0) - 0.05);
+}
+
+TEST_CASE("heightfield: waterline sections of a pyramid shrink with height") {
+    TriMesh py = pyramid_mesh(10.0, 8.0);
+    auto secs = waterline_sections(py, {2.0, 6.0}, 0.05);
+    REQUIRE(secs.size() == 2);
+    REQUIRE(!secs[0].empty());
+    REQUIRE(!secs[1].empty());
+    // section at z=6 is smaller than at z=2
+    CHECK(geo::area(secs[1][0]) < geo::area(secs[0][0]));
+}
+
+TEST_CASE("op3d: parallel finish follows the surface without gouging") {
+    OpContext ctx = mill_ctx(4.0, ToolType::EndmillBall);
+    ctx.tool.corner_radius = 2.0;
+    Operation op;
+    op.type = OpType::Parallel3D;
+    op.heights.top = 8; op.heights.bottom = 0; op.stepover = 1.0;
+    op.geometry["mesh"] = to_json(pyramid_mesh(10.0, 8.0));
+    GenResult r = gen_parallel3d(op, ctx);
+    REQUIRE(r.ok);
+    CHECK(r.path.cut_length > 0);
+    CHECK(count_kind(r.path, MoveKind::Cut) > 20);
+    CHECK(min_cut_z(r.path) >= -0.1);   // never below the base
+}
+
+TEST_CASE("op3d: waterline + roughing + scallop + spiral produce paths") {
+    OpContext ctx = mill_ctx(4.0, ToolType::EndmillBall);
+    ctx.tool.corner_radius = 2.0;
+    auto mk = [&](OpType t) {
+        Operation op;
+        op.type = t;
+        op.heights.top = 8; op.heights.bottom = 0; op.stepover = 1.5; op.stepdown = 2.0;
+        op.geometry["mesh"] = to_json(pyramid_mesh(10.0, 8.0));
+        return generate(op, ctx);
+    };
+    for (OpType t : {OpType::Contour3D, OpType::Pocket3D, OpType::Scallop3D,
+                     OpType::SpiralFinish3D, OpType::Radial3D, OpType::AdaptiveClear3D}) {
+        GenResult r = mk(t);
+        CHECK(r.ok);
+        CHECK(r.path.cut_length > 0);
+    }
+}
+
+TEST_CASE("turn: finish follows the profile radii") {
+    OpContext ctx;
+    ctx.machine.kind = MachineKind::Lathe;
+    ctx.material_id = "steel_mild";
+    ctx.tool.type = ToolType::TurningGeneral;
+    ctx.tool.number = 1;
+    // stepped shaft: (z,x) radius profile
+    json prof = json::array({json::array({0, 10}), json::array({10, 10}),
+                             json::array({10, 5}), json::array({25, 5})});
+    Operation op;
+    op.type = OpType::TurnFinish;
+    op.heights.top = 0; op.heights.bottom = 0;
+    op.geometry["profile"] = prof;
+    GenResult r = gen_turn_finish(op, ctx);
+    REQUIRE(r.ok);
+    CHECK(r.path.cut_length > 0);
+    // every cut radius (x) stays within the profile envelope [0,10]
+    for (auto& m : r.path.moves)
+        if (m.kind == MoveKind::Cut) { CHECK(m.to.x <= 10.5); CHECK(m.to.x >= -0.01); }
+}
+
+TEST_CASE("turn: roughing + facing + threading produce passes") {
+    OpContext ctx;
+    ctx.machine.kind = MachineKind::Lathe;
+    ctx.material_id = "steel_mild";
+    ctx.tool.type = ToolType::TurningGeneral;
+    json prof = json::array({json::array({0, 12}), json::array({30, 12})});
+    auto mk = [&](OpType t, double pitch = 0) {
+        Operation op;
+        op.type = t;
+        op.geometry["profile"] = prof;
+        op.stepdown = 1.5; op.stock_to_leave = 0.3;
+        op.thread_pitch = pitch; op.thread_depth = pitch * 0.6; op.infeed = 0.2;
+        return generate(op, ctx);
+    };
+    CHECK(mk(OpType::TurnRough).ok);
+    CHECK(mk(OpType::TurnFace).path.moves.size() > 0);
+    GenResult thr = mk(OpType::TurnThread, 1.5);
+    CHECK(thr.ok);
+    CHECK(thr.path.cut_length > 0);
+}
+
+TEST_CASE("cut2d: kerf offset applied + pierce; probe per point") {
+    OpContext ctx;
+    ctx.machine.kind = MachineKind::Laser;
+    ctx.machine.kerf = 0.2;
+    ctx.material_id = "steel_mild";
+    ctx.tool.type = ToolType::LaserHead;
+    Operation op;
+    op.type = OpType::Cut2D;
+    op.comp_side = CompSide::Left;        // outside cut -> grow by kerf/2
+    op.heights.top = 0; op.heights.bottom = -2;
+    op.pierce_delay = 0.5;
+    op.geometry["contours"] = json::array({json::array({json::array({-10, -10}), json::array({10, -10}),
+                                                        json::array({10, 10}), json::array({-10, 10})})});
+    GenResult r = gen_cut2d(op, ctx);
+    REQUIRE(r.ok);
+    CHECK(r.path.cut_length > 0);
+    CHECK(count_kind(r.path, MoveKind::Dwell) >= 1);   // pierce dwell
+
+    Operation pr;
+    pr.type = OpType::Probe;
+    pr.heights.top = 5; pr.heights.bottom = -2; pr.heights.clearance = 15;
+    pr.geometry["points"] = json::array({json::array({0, 0, 0}), json::array({5, 5, 0})});
+    GenResult rp = gen_probe(pr, ctx);
+    REQUIRE(rp.ok);
+    CHECK(rp.path.moves.size() > 0);
 }

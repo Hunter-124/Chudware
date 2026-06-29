@@ -81,6 +81,26 @@ FetchContent_Declare(doctest
   SOURCE_SUBDIR doctest)
 FetchContent_MakeAvailable(doctest)
 
+# --- Clipper2 (polygon offset / boolean for the CAM toolpath engine) ----------
+# Boost Software License 1.0 (GPL-clean, commercial-safe). The amalgamated lib
+# ships its own CMakeLists under CPP/, but we POPULATE-only and compile the three
+# engine .cpp ourselves into a tiny static lib (mirrors the miniz approach) to
+# skip Clipper2's tests/benchmarks/USINGZ options. See docs/contracts/licenses.md.
+FetchContent_Declare(clipper2
+  GIT_REPOSITORY https://github.com/AngusJohnson/Clipper2.git
+  GIT_TAG Clipper2_1.5.4
+  GIT_SHALLOW TRUE
+  SOURCE_SUBDIR _no_cmake_)
+FetchContent_MakeAvailable(clipper2)
+add_library(aicad_clipper2 STATIC
+  ${clipper2_SOURCE_DIR}/CPP/Clipper2Lib/src/clipper.engine.cpp
+  ${clipper2_SOURCE_DIR}/CPP/Clipper2Lib/src/clipper.offset.cpp
+  ${clipper2_SOURCE_DIR}/CPP/Clipper2Lib/src/clipper.rectclip.cpp)
+target_include_directories(aicad_clipper2 PUBLIC
+  ${clipper2_SOURCE_DIR}/CPP/Clipper2Lib/include)
+set_property(TARGET aicad_clipper2 PROPERTY
+  MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+
 # --- aicad_prof: in-process sampling profiler (Windows + Linux; no-op elsewhere) ----
 # Windows: periodically suspends the registered modeling thread and walks its stack lock-free
 # (RtlVirtualUnwind), symbolizing with DbgHelp at report time. Linux: a sampler thread signals
@@ -140,6 +160,23 @@ add_library(aicad_sim STATIC
 target_include_directories(aicad_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(aicad_sim PRIVATE ${spectra_SOURCE_DIR}/include)
 target_link_libraries(aicad_sim PUBLIC Eigen3::Eigen nlohmann_json::nlohmann_json)
+
+# --- libaicad cam (computer-aided machining: toolpaths + post + sim) ----------
+# The CAM suite: stock/tool/machine/op model, Clipper2-backed 2D geometry, the
+# 2.5D/3D/turning/cutting toolpath generators, feeds & speeds, the data-driven
+# post-processor (GRBL/LinuxCNC/Fanuc/Haas/Mach3/Marlin/Siemens/Centroid), the
+# material-removal sim, and the stateful job session. OCCT-FREE — pure numerics +
+# JSON like aicad_sim/aicad_ecad, so it builds in the standalone config and is
+# unit-tested headless (test_cam). A separate OCCT extraction adapter (geom layer)
+# feeds live-part geometry into operations for the product. See docs/CAM_PLAN.md.
+add_library(aicad_cam STATIC
+  cam/model.cpp
+  cam/geometry.cpp)
+target_include_directories(aicad_cam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(aicad_cam PUBLIC
+  aicad_clipper2 aicad_miniz nlohmann_json::nlohmann_json)
+set_property(TARGET aicad_cam PROPERTY
+  MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 # --- libaicad ecad (ECAD document model: schema + ops + session) -------------
 # C++ port of engine/ecad (schema.py + ops.py + session.py). OCCT-free — the
@@ -205,6 +242,18 @@ target_link_libraries(test_spice_netlist PRIVATE aicad_sim)
 set_target_properties(test_spice_netlist PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME spice_netlist COMMAND test_spice_netlist)
+
+# CAM suite tests: model serialization round-trips, Clipper2 geometry (offset /
+# boolean / pocket clearing / raster), feeds & speeds, the toolpath generators,
+# the post-processor dialects, and the material-removal sim. OCCT-free; links
+# aicad_cam (which pulls in Clipper2 + miniz). Grows with each CAM wave.
+add_executable(test_cam
+  tests/test_cam.cpp)
+target_include_directories(test_cam PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_cam PRIVATE aicad_cam)
+set_target_properties(test_cam PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME cam COMMAND test_cam)
 
 # --- libaicad sketch (parameterization + constraints over the solver core) ---
 add_library(aicad_sketch STATIC
@@ -1076,7 +1125,7 @@ if(AICAD_WITH_OCCT)
     api/libaicad.cpp)
   target_include_directories(aicad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_definitions(aicad PRIVATE AICAD_BUILD_DLL)
-  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_agent aicad_parts aicad_prof)
+  target_link_libraries(aicad PRIVATE aicad_doc aicad_sim aicad_ecad aicad_cam aicad_agent aicad_parts aicad_prof)
   if(AICAD_WITH_NETGEN)
     target_link_libraries(aicad PRIVATE aicad_mesh)
     target_compile_definitions(aicad PRIVATE AICAD_WITH_NETGEN)  # enable the mesh RPCs in libaicad.cpp

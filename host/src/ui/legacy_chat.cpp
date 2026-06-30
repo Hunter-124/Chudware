@@ -1029,9 +1029,15 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     // (2) Agent timeline — typed blocks: collapsible thinking + glass action cards.
     drawAgentTimeline(m, fonts, logW, gShowThinking);
 
-    // (3) Streaming assistant text — a normal markdown bubble (errors get their own card below).
-    if (!m.text.empty() && m.errKind == ERR_NONE)
+    // (3) Streaming assistant text — frosted row pill keeps body copy legible over viewport bleed.
+    if (!m.text.empty() && m.errKind == ERR_NONE) {
+        ui::glassRowAtCursor(4.0f, false, false, 5.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(pal.text[0], pal.text[1], pal.text[2], 1.0f));
         ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
+    }
 
     // (4) Pre-flight clarify gate: the model's build-critical questions, awaiting the user.
     if (m.clarify.active) drawClarifyCard(st, m, fonts);

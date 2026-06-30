@@ -42,7 +42,7 @@ static void fillDark(Palette& p) {
     set4(p.ribbonTabActive,0.094f,0.106f,0.129f,1);
     // text
     set4(p.text,          0.898f,0.918f,0.945f, 1);
-    set4(p.textDim,       0.520f,0.560f,0.620f, 1);
+    set4(p.textDim,       0.620f,0.660f,0.720f, 1);   // brighter on glass rows over viewport bleed
     set4(p.textDisabled,  0.471f,0.502f,0.549f, 1);
     // accent  #2DD4BF
     set4(p.accent,        0.176f,0.831f,0.749f, 1);
@@ -106,7 +106,7 @@ static void fillDark(Palette& p) {
     set4(p.chipBg,     0.176f,0.831f,0.749f, 0.30f);
     set4(p.codeBg,     0.055f,0.065f,0.085f, 1);
     set4(p.proseBg,    0.085f,0.100f,0.130f, 1);
-    set4(p.proseText,  0.700f,0.740f,0.800f, 1);
+    set4(p.proseText,  0.780f,0.820f,0.880f, 1);
     set4(p.stepCardBg, 0.082f,0.094f,0.118f, 1);
     set4(p.planCardBg, 0.071f,0.102f,0.110f, 1);
     set4(p.setupWarnBg,0.200f,0.130f,0.100f, 1);
@@ -124,7 +124,7 @@ static void fillDark(Palette& p) {
     // chat
     set4(p.userBubbleBg,    0.176f,0.831f,0.749f,0.07f);
     set4(p.userBubbleBorder,0.176f,0.831f,0.749f,0.22f);
-    set4(p.assistantName,   0.780f,0.820f,0.900f,1);
+    set4(p.assistantName,   0.820f,0.860f,0.920f,1);
     set4(p.errSystem,       0.961f,0.600f,0.502f,1);
     set4(p.errCad,          0.929f,0.800f,0.561f,1);
     // misc
@@ -474,7 +474,7 @@ void popGlassChildStyle() {
 }
 
 void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, bool stripe,
-                        bool selected) {
+                        bool selected, float washAlpha) {
     const Palette& p = palette;
     const float s = uiScale;
     const float r = rounding * s;
@@ -484,9 +484,14 @@ void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, bo
     const float inset = 2.0f * s;
     ImVec2 pillMin(mn.x + inset, mn.y + inset);
     ImVec2 pillMax(mx.x - inset, mx.y - inset);
-    // Light row wash — tuned for readability over the bright viewport bleed-through.
-    float wash[4]; Palette::withAlpha(p.glassBg, wash, 0.28f);
+    // Frosted row wash — strong enough for legible text over bright viewport bleed-through.
+    float wash[4]; Palette::withAlpha(p.glassBg, wash, washAlpha);
     dl->AddRectFilled(pillMin, pillMax, Palette::toU32(wash), r);
+    // Faint border helps row pills read on a light canvas without a full panel wash.
+    if (washAlpha > 0.08f) {
+        float edge[4]; Palette::withAlpha(p.glassBorder, edge, washAlpha * 0.55f);
+        dl->AddRect(pillMin, pillMax, Palette::toU32(edge), r, 0, std::max(0.5f, 0.75f * s));
+    }
     if (stripe) {
         float stripeCol[4]; Palette::withAlpha(p.glassHighlight, stripeCol, 0.35f);
         dl->AddRectFilled(pillMin, pillMax, Palette::toU32(stripeCol), r);

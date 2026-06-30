@@ -133,12 +133,17 @@ void apply() {
 }
 
 void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, bool stripe,
-                        bool selected) {
+                        bool selected, float washAlpha) {
     const float s = S();
     const float inset = 2.f * s;
     ImVec2 a(mn.x + inset, mn.y + inset), b(mx.x - inset, mx.y - inset);
-    ImVec4 wash = vec(pal().bg2); wash.w = 0.28f;
+    ImVec4 wash = vec(pal().bg2); wash.w = washAlpha;
     dl->AddRectFilled(a, b, ImGui::ColorConvertFloat4ToU32(wash), rounding * s);
+    if (washAlpha > 0.08f) {
+        ImVec4 edge = vec(pal().line); edge.w = washAlpha * 0.55f;
+        dl->AddRect(a, b, ImGui::ColorConvertFloat4ToU32(edge), rounding * s, 0,
+                    std::max(0.5f, 0.75f * s));
+    }
     if (stripe) {
         ImVec4 st = ImVec4(1,1,1,0.04f);
         dl->AddRectFilled(a, b, ImGui::ColorConvertFloat4ToU32(st), rounding * s);

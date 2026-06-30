@@ -44,6 +44,7 @@ static MouseGestures s_gestures;
 static ShortcutBar   s_shortcutBar;
 static ViewSelector  s_viewSelector;   // C25 W2-E: glass-box view selector (Space)
 static SectionTool   s_sectionTool;    // C25 W3-J: section-view (impl owned by section_tool agent)
+static float         s_huFade = 0.25f; // heads-up toolbar idle opacity (ramps on hover)
 
 enum class NewDocStage { Root, Drawing, Simulation };
 
@@ -2552,54 +2553,70 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             applyAppearanceFromViewport(st, s_vpKey, s_vpColor, s_vpMetallic, s_vpRoughness);
 
         // ---- C25 W3-J: heads-up view toolbar (SolidWorks-style, fully functional) ----
-        // Centered pill at the viewport top; hidden while editing a sketch.
+        // Top-right row-only glass pills; fades when idle so the central workspace stays clear.
         // Groups: [zoom-fit | zoom-area | pan | rotate] [view-orientation ▾] [display-style ▾]
         //         [hide/show ▾] [section]
         if (!inSketch) {
             const auto& hpal = ui::palette;
             ImDrawList* hdl = ImGui::GetWindowDrawList();
             const float s   = ui::uiScale;
-            float btn = 26.0f * s, gap = 3.0f * s, padX = 5.0f * s, padY = 2.0f * s;
+            float btn = 22.0f * s, gap = 2.0f * s, padX = 3.0f * s, padY = 2.0f * s;
 
-            // 9 buttons: zoom-fit, zoom-area, pan, rotate, view-orient▾, display-style▾, hide/show▾, section
             const int nHU = 8;
             float barW = nHU * btn + (nHU - 1) * gap + padX * 2;
             float barH = btn + padY * 2;
-            float bx0  = cr0.x + ((cr1.x - cr0.x) - barW) * 0.5f;
-            float by0  = cr0.y + 8.0f * s;
+            float bx0  = cr1.x - barW - 10.0f * s;
+            float by0  = cr0.y + 6.0f * s;
             float byi  = by0 + padY;
 
-            // Chip background.
-            ui::glassBackground(hdl, ImVec2(bx0, by0), ImVec2(bx0 + barW, by0 + barH),
-                                barH * 0.30f / s);
+            ImVec2 mp = io.MousePos;
+            ImRect hudZone(ImVec2(bx0 - 14.0f * s, by0 - 10.0f * s),
+                           ImVec2(bx0 + barW + 10.0f * s, by0 + barH + 10.0f * s));
+            const bool hudHot = hudZone.Contains(mp) || s_zoomAreaArmed ||
+                ImGui::IsPopupOpen("##hu_vieworient") || ImGui::IsPopupOpen("##hu_dispstyle") ||
+                ImGui::IsPopupOpen("##hu_hideshow");
+            const float targetFade = hudHot ? 1.0f : 0.20f;
+            s_huFade += (targetFade - s_huFade) * std::min(1.0f, io.DeltaTime * 10.0f);
+            const float pillA = 0.38f * s_huFade;
+            const int iconA = (int)(220.0f * s_huFade + 20.0f);
+
+            auto huPill = [&](float bxi, float by, bool selected) {
+                if (pillA <= 0.04f) return;
+                ui::glassRowBackground(hdl, ImVec2(bxi, by), ImVec2(bxi + btn, by + btn),
+                                       4.0f, false, selected && s_huFade > 0.55f, pillA);
+            };
 
             // Helper: draw one toolbar icon button. Returns true on click.
-            // active=true fills with accentSoft (toggle state).
             auto huBtn = [&](int idx, const char* iconName, const char* tip, bool active) -> bool {
                 float bxi = bx0 + padX + (float)idx * (btn + gap);
+                huPill(bxi, byi, active);
                 ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
                 ImGui::PushID(idx);
                 bool clicked = ImGui::InvisibleButton("##hb", ImVec2(btn, btn));
                 bool hov = ImGui::IsItemHovered();
-                ImU32 fill = active  ? ui::Palette::toU32(hpal.accentSoft) :
-                             hov     ? ui::Palette::toU32(hpal.buttonHovered) : 0;
-                if (fill)
-                    hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn), fill, 3.0f * s);
+                if (hov && !active && pillA > 0.04f) {
+                    float hovCol[4]; Palette::withAlpha(hpal.buttonHovered, hovCol, pillA * 0.65f);
+                    hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
+                                       Palette::toU32(hovCol), 3.0f * s);
+                }
                 IconUV iv = ui::getIcon(iconName, 20);
-                float iz = 18.0f * s, off = (btn - iz) * 0.5f;
+                float iz = 16.0f * s, off = (btn - iz) * 0.5f;
                 hdl->AddImage(iv.texId, ImVec2(bxi + off, byi + off),
                               ImVec2(bxi + off + iz, byi + off + iz), iv.uv0, iv.uv1,
-                              IM_COL32(255, 255, 255, 235));
+                              IM_COL32(255, 255, 255, iconA));
                 if (hov) ImGui::SetTooltip("%s", tip);
                 ImGui::PopID();
                 return clicked;
             };
             // Separator tick between groups.
             auto huSep = [&](int afterIdx) {
+                if (s_huFade < 0.12f) return;
                 float bxi = bx0 + padX + (float)afterIdx * (btn + gap);
+                float sepA = s_huFade * 0.55f;
+                float scol[4]; Palette::withAlpha(hpal.border, scol, sepA);
                 hdl->AddLine(ImVec2(bxi + btn + gap * 0.5f, byi + 3 * s),
                              ImVec2(bxi + btn + gap * 0.5f, byi + btn - 3 * s),
-                             ui::Palette::toU32(hpal.border), 1.0f);
+                             Palette::toU32(scol), 1.0f);
             };
 
             ImGui::PushID("##headsup");
@@ -2627,17 +2644,21 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // [4] View orientation dropdown ▾
             {
                 float bxi = bx0 + padX + 4.0f * (btn + gap);
+                huPill(bxi, byi, false);
                 ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
                 ImGui::PushID(4);
                 bool clicked = ImGui::InvisibleButton("##hb", ImVec2(btn, btn));
                 bool hov = ImGui::IsItemHovered();
-                if (hov) hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
-                                             ui::Palette::toU32(hpal.buttonHovered), 3.0f);
+                if (hov && pillA > 0.04f) {
+                    float hovCol[4]; Palette::withAlpha(hpal.buttonHovered, hovCol, pillA * 0.65f);
+                    hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
+                                       Palette::toU32(hovCol), 3.0f);
+                }
                 IconUV iv = ui::getIcon("view_selector", 20);
-                float iz = 18.0f * s, off = (btn - iz) * 0.5f;
+                float iz = 16.0f * s, off = (btn - iz) * 0.5f;
                 hdl->AddImage(iv.texId, ImVec2(bxi + off, byi + off),
                               ImVec2(bxi + off + iz, byi + off + iz), iv.uv0, iv.uv1,
-                              IM_COL32(255, 255, 255, 235));
+                              IM_COL32(255, 255, 255, iconA));
                 if (hov) ImGui::SetTooltip("View Orientation");
                 if (clicked) ImGui::OpenPopup("##hu_vieworient");
                 ImGui::SetNextWindowPos(ImVec2(bxi, byi + btn + 4.0f * s), ImGuiCond_Always);
@@ -2687,17 +2708,21 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 };
                 const char* curIcon = kDsIcons[st.displayStyle < 5 ? st.displayStyle : 1];
                 float bxi = bx0 + padX + 5.0f * (btn + gap);
+                huPill(bxi, byi, false);
                 ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
                 ImGui::PushID(5);
                 bool clicked = ImGui::InvisibleButton("##hb", ImVec2(btn, btn));
                 bool hov = ImGui::IsItemHovered();
-                if (hov) hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
-                                             ui::Palette::toU32(hpal.buttonHovered), 3.0f);
+                if (hov && pillA > 0.04f) {
+                    float hovCol[4]; Palette::withAlpha(hpal.buttonHovered, hovCol, pillA * 0.65f);
+                    hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
+                                       Palette::toU32(hovCol), 3.0f);
+                }
                 IconUV iv = ui::getIcon(curIcon, 20);
-                float iz = 18.0f * s, off = (btn - iz) * 0.5f;
+                float iz = 16.0f * s, off = (btn - iz) * 0.5f;
                 hdl->AddImage(iv.texId, ImVec2(bxi + off, byi + off),
                               ImVec2(bxi + off + iz, byi + off + iz), iv.uv0, iv.uv1,
-                              IM_COL32(255, 255, 255, 235));
+                              IM_COL32(255, 255, 255, iconA));
                 if (hov) ImGui::SetTooltip("Display Style");
                 if (clicked) ImGui::OpenPopup("##hu_dispstyle");
                 ImGui::SetNextWindowPos(ImVec2(bxi, byi + btn + 4.0f * s), ImGuiCond_Always);
@@ -2730,17 +2755,21 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // [6] Hide/Show items dropdown ▾
             {
                 float bxi = bx0 + padX + 6.0f * (btn + gap);
+                huPill(bxi, byi, false);
                 ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
                 ImGui::PushID(6);
                 bool clicked = ImGui::InvisibleButton("##hb", ImVec2(btn, btn));
                 bool hov = ImGui::IsItemHovered();
-                if (hov) hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
-                                             ui::Palette::toU32(hpal.buttonHovered), 3.0f);
+                if (hov && pillA > 0.04f) {
+                    float hovCol[4]; Palette::withAlpha(hpal.buttonHovered, hovCol, pillA * 0.65f);
+                    hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
+                                       Palette::toU32(hovCol), 3.0f);
+                }
                 IconUV iv = ui::getIcon("hide_show_eye", 20);   // C25b: proper visibility glyph
-                float iz = 18.0f * s, off = (btn - iz) * 0.5f;
+                float iz = 16.0f * s, off = (btn - iz) * 0.5f;
                 hdl->AddImage(iv.texId, ImVec2(bxi + off, byi + off),
                               ImVec2(bxi + off + iz, byi + off + iz), iv.uv0, iv.uv1,
-                              IM_COL32(255, 255, 255, 235));
+                              IM_COL32(255, 255, 255, iconA));
                 if (hov) ImGui::SetTooltip("Hide / Show Items");
                 if (clicked) ImGui::OpenPopup("##hu_hideshow");
                 ImGui::SetNextWindowPos(ImVec2(bxi, byi + btn + 4.0f * s), ImGuiCond_Always);

@@ -38,7 +38,7 @@ struct Palette {
 
     // ---- text ----
     float text[4]          = {0.898f,0.918f,0.945f, 1};   // primary text
-    float textDim[4]       = {0.520f,0.560f,0.620f, 1};   // secondary / dim text
+    float textDim[4]       = {0.620f,0.660f,0.720f, 1};   // secondary / dim text (glass rows)
     float textDisabled[4]  = {0.471f,0.502f,0.549f, 1};
 
     // ---- accent ----
@@ -122,7 +122,7 @@ struct Palette {
     // went opaque-dark, so these cards now read by their BORDER, not fill contrast. If chat content
     // ever looks flat, lighten these ~0.03 above windowBg so the cards regain a visible surface.
     float proseBg[4]       = {0.085f,0.100f,0.130f, 1};
-    float proseText[4]     = {0.700f,0.740f,0.800f, 1};
+    float proseText[4]     = {0.780f,0.820f,0.880f, 1};
     float stepCardBg[4]    = {0.082f,0.094f,0.118f, 1};
     float planCardBg[4]    = {0.071f,0.102f,0.110f, 1};
     float setupWarnBg[4]   = {0.200f,0.130f,0.100f, 1};
@@ -144,7 +144,7 @@ struct Palette {
     // ---- chat ----
     float userBubbleBg[4]  = {0.176f,0.831f,0.749f, 0.07f};
     float userBubbleBorder[4]= {0.176f,0.831f,0.749f, 0.22f};
-    float assistantName[4] = {0.780f,0.820f,0.900f, 1};
+    float assistantName[4] = {0.820f,0.860f,0.920f, 1};
     float errSystem[4]     = {0.961f,0.600f,0.502f, 1};
     float errCad[4]        = {0.929f,0.800f,0.561f, 1};
 
@@ -245,7 +245,7 @@ void popGlassChildStyle();
 // panel itself maximally transparent while preserving row readability. `stripe` adds a faint
 // alternating tint; `selected` draws a restrained accent card.
 void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 4.0f,
-                        bool stripe = false, bool selected = false);
+                        bool stripe = false, bool selected = false, float washAlpha = 0.42f);
 
 // Paint a row pill at the current cursor (full content width). Call immediately BEFORE the row's
 // widgets so the pill sits behind text/icons.

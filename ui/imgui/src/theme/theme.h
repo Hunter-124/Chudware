@@ -36,7 +36,7 @@ void setDark(bool dark);
 
 // Glass helpers — match host/ui_theme glassRowBackground; panels stay transparent.
 void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 4.f,
-                        bool stripe = false, bool selected = false);
+                        bool stripe = false, bool selected = false, float washAlpha = 0.42f);
 void glassRowAtCursor(float rounding = 4.f, bool stripe = false, bool selected = false,
                       float rowPadV = 5.f);
 void glassRowAtCursor(float rounding = 4.f, bool stripe = false, bool selected = false,

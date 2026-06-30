@@ -1185,78 +1185,6 @@ static void drawSessionsPanel(AppState& st, bool busy) {
     }
 }
 
-// Agent mode + permissions + thinking effort — above the chat log (context-meter row).
-static void drawCopilotTopBar(AppState& st, bool busy) {
-    const auto& pal = ui::palette;
-    const float sc = ui::uiScale;
-    const bool hasDoc = st.docMirror.hasDoc();
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 3 * sc));
-    ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.button));
-    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-
-    const char* modes[] = {"Design", "Edit", "Ask"};
-    int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 2) ? st.aiInteraction : 0;
-    if (ImGui::SmallButton(modes[mode])) ImGui::OpenPopup("##topmode");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Agent mode — what the AI does with your message.");
-    if (ImGui::BeginPopup("##topmode")) {
-        if (ImGui::Selectable("Design  — model a new part from a description", mode == 0))
-            st.aiInteraction = 0;
-        if (!hasDoc) ImGui::BeginDisabled();
-        if (ImGui::Selectable("Edit  — change the open part", mode == 1)) st.aiInteraction = 1;
-        if (!hasDoc) ImGui::EndDisabled();
-        if (ImGui::Selectable("Ask  — questions about the part, no changes", mode == 2))
-            st.aiInteraction = 2;
-        ImGui::EndPopup();
-    }
-
-    ImGui::SameLine();
-    const char* permLabel = st.settings.offlineMode ? "Permissions: Offline" : "Permissions";
-    if (ImGui::SmallButton(permLabel)) ImGui::OpenPopup("##topperm");
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Privacy and run permissions for the copilot.");
-    if (ImGui::BeginPopup("##topperm")) {
-        bool off = st.settings.offlineMode;
-        if (ImGui::Checkbox("Offline mode (local models only — ITAR-safe)", &off))
-            st.settings.offlineMode = off;
-        bool sup = st.settings.planMode;
-        if (ImGui::Checkbox("Supervised (plan + clarify before modeling)", &sup))
-            st.settings.planMode = sup;
-        ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
-        ImGui::EndPopup();
-    }
-
-    ImGui::SameLine();
-    Settings& s = st.settings;
-    const char* effLabels[8] = {};
-    const char* effValues[8] = {};
-    int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8);
-    if (nEff > 0) {
-        int effIdx = 0;
-        for (int i = 0; i < nEff; ++i)
-            if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
-        char effBtn[48];
-        std::snprintf(effBtn, sizeof(effBtn), "Thinking: %s", effLabels[effIdx]);
-        if (ImGui::SmallButton(effBtn)) ImGui::OpenPopup("##topeffort");
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Thinking effort for the selected model.");
-        if (ImGui::BeginPopup("##topeffort")) {
-            for (int i = 0; i < nEff; ++i) {
-                if (ImGui::Selectable(effLabels[i], effIdx == i))
-                    std::strncpy(s.reasoningEffort, effValues[i], sizeof(s.reasoningEffort) - 1);
-            }
-            ImGui::EndPopup();
-        }
-    } else {
-        ImGui::BeginDisabled();
-        ImGui::SmallButton("Thinking: n/a");
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("The selected model does not expose a thinking-effort control.");
-    }
-
-    ImGui::PopStyleColor(2);
-    ImGui::PopStyleVar();
-}
 
 // ============================ conversation tabs + persistence ============================
 // Each conversation is its own tab. The ACTIVE conversation's messages live in st.chat; the
@@ -2729,12 +2657,7 @@ static void composerModelLabel(const Settings& s, char* out, size_t n) {
     std::snprintf(out, n, "%s \xc2\xb7 %s", prov, s.model[0] ? s.model : "default");
 }
 
-// ---- footer chips under the composer (removed — mode/permissions live in drawCopilotTopBar) ----
-static void drawComposerChips(AppState& st, bool busy) {
-    (void)st; (void)busy;
-}
-
-// Context-window meter for the composer toolbar row: a small fill-bar + "N/M" readout (compact
+// Context-window meter for the composer prelude row: a small fill-bar + "N/M" readout (compact
 // "ctx N/M" with no bar when the pane is too narrow). Drawn at the current cursor; advances it.
 // Moved here from the footer chips, where it was pinned to the pane bottom against the status bar.
 static void drawContextMeter(AppState& st, float roomForMeter) {
@@ -2787,6 +2710,182 @@ static float measureContextMeter(AppState& st, float roomForMeter) {
     const float fullTw = ImGui::CalcTextSize(full.c_str()).x;
     if (roomForMeter >= barW + gap + fullTw) return barW + gap + fullTw;
     return ImGui::CalcTextSize(("ctx " + full).c_str()).x;
+}
+
+// Prelude row above the prompt: Design + Permissions on the left, context meter on the right.
+static void drawComposerPrelude(AppState& st, bool /*busy*/) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const bool hasDoc = st.docMirror.hasDoc();
+
+    ImVec2 rowMin = ImGui::GetCursorScreenPos();
+    const float rowH = ImGui::GetFrameHeight() + 4 * sc;
+    const float availW = ImGui::GetContentRegionAvail().x;
+    ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
+    ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, 4.0f * sc, false, false);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 3 * sc));
+    ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.button));
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+
+    const char* modes[] = {"Design", "Edit", "Ask"};
+    int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 2) ? st.aiInteraction : 0;
+    if (ImGui::SmallButton(modes[mode])) ImGui::OpenPopup("##cmpmode");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Agent mode — what the AI does with your message.");
+    if (ImGui::BeginPopup("##cmpmode")) {
+        if (ImGui::Selectable("Design  — model a new part from a description", mode == 0))
+            st.aiInteraction = 0;
+        if (!hasDoc) ImGui::BeginDisabled();
+        if (ImGui::Selectable("Edit  — change the open part", mode == 1)) st.aiInteraction = 1;
+        if (!hasDoc) ImGui::EndDisabled();
+        if (ImGui::Selectable("Ask  — questions about the part, no changes", mode == 2))
+            st.aiInteraction = 2;
+        ImGui::EndPopup();
+    }
+
+    ImGui::SameLine();
+    const char* permLabel = st.settings.offlineMode ? "Permissions: Offline" : "Permissions";
+    if (ImGui::SmallButton(permLabel)) ImGui::OpenPopup("##cmpperm");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Privacy and run permissions for the copilot.");
+    if (ImGui::BeginPopup("##cmpperm")) {
+        bool off = st.settings.offlineMode;
+        if (ImGui::Checkbox("Offline mode (local models only — ITAR-safe)", &off))
+            st.settings.offlineMode = off;
+        bool sup = st.settings.planMode;
+        if (ImGui::Checkbox("Supervised (plan + clarify before modeling)", &sup))
+            st.settings.planMode = sup;
+        ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
+        ImGui::EndPopup();
+    }
+
+    const float room = ImGui::GetContentRegionAvail().x;
+    const float w    = measureContextMeter(st, room);
+    const float x    = ImGui::GetContentRegionMax().x - w;
+    if (x > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(x);
+    drawContextMeter(st, room);
+
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar();
+    ImGui::Dummy(ImVec2(0, 4 * sc));
+}
+
+// Toolbar row below the prompt: model picker + thinking effort ... gear + send/stop.
+static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool active,
+                                bool& submit, bool& stopReq) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+
+    ImVec2 rowMin = ImGui::GetCursorScreenPos();
+    const float rowH = ImGui::GetFrameHeight() + 4 * sc;
+    const float availW = ImGui::GetContentRegionAvail().x;
+    ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
+    ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, 4.0f * sc, false, false);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 4 * sc));
+    ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.button));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ui::Palette::toU32(pal.buttonHovered));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ui::Palette::toU32(pal.buttonActive));
+
+    char modelLabel[160];
+    composerModelLabel(st.settings, modelLabel, sizeof(modelLabel));
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.text));
+    if (ImGui::Button(modelLabel)) ImGui::OpenPopup("##modeldropdown");
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Model — click to search and switch.");
+
+    ImGui::SameLine();
+    Settings& s = st.settings;
+    const char* effLabels[8] = {};
+    const char* effValues[8] = {};
+    int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8);
+    if (nEff > 0) {
+        int effIdx = 0;
+        for (int i = 0; i < nEff; ++i)
+            if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
+        char effBtn[48];
+        std::snprintf(effBtn, sizeof(effBtn), "Thinking: %s", effLabels[effIdx]);
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        if (ImGui::Button(effBtn)) ImGui::OpenPopup("##cmpeffort");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Thinking effort for the selected model.");
+        if (ImGui::BeginPopup("##cmpeffort")) {
+            for (int i = 0; i < nEff; ++i) {
+                if (ImGui::Selectable(effLabels[i], effIdx == i))
+                    std::strncpy(s.reasoningEffort, effValues[i], sizeof(s.reasoningEffort) - 1);
+            }
+            ImGui::EndPopup();
+        }
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDisabled));
+        ImGui::BeginDisabled();
+        ImGui::Button("Thinking: n/a");
+        ImGui::EndDisabled();
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The selected model does not expose a thinking-effort control.");
+    }
+
+    const float sendSz = ImGui::GetFrameHeight();
+    const float gearSz = ImGui::GetFrameHeight();
+    ImGui::SameLine();
+    float rightX = ImGui::GetContentRegionMax().x - sendSz - 6 * sc - gearSz;
+    if (rightX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rightX);
+
+    IconUV gear = ui::getIcon("settings", 20);
+    bool openSettings = false;
+    if (gear.valid)
+        openSettings = ImGui::ImageButton("##aigear", gear.texId,
+                                          ImVec2(gearSz - 8 * sc, gearSz - 8 * sc),
+                                          gear.uv0, gear.uv1);
+    else
+        openSettings = ImGui::SmallButton("set");
+    if (openSettings) st.focusSettingsTab = true;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI settings");
+
+    ImGui::SameLine(0, 6 * sc);
+    if (active) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.statusErr));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(220, 100, 92, 255));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(190, 80, 74, 255));
+        if (ImGui::Button("##stop", ImVec2(sendSz, sendSz))) stopReq = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(st.stopRequested ? "Stopping\xE2\x80\xA6 (finishing current step)"
+                                               : "Stop the current run");
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+        ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
+        float h = sendSz * 0.18f;
+        dl->AddRectFilled(ImVec2(c.x - h, c.y - h), ImVec2(c.x + h, c.y + h),
+                          IM_COL32(255, 255, 255, 235), 1.5f * sc);
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            canStart ? ui::Palette::toU32(pal.accent) : ui::Palette::toU32(pal.button));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+            canStart ? ui::Palette::toU32(pal.accentDim) : ui::Palette::toU32(pal.buttonHovered));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ui::Palette::toU32(pal.accentDim));
+        if (ImGui::Button("##send", ImVec2(sendSz, sendSz)) && canStart) submit = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(canStart ? "Send  (Enter)"
+                              : !canStart ? "Runtime/worker not ready yet." : "Type a message first.");
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+        ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
+        float t = sendSz * 0.22f;
+        ImU32 ac = canStart ? IM_COL32(8, 26, 26, 255) : ui::Palette::toU32(pal.textDim);
+        dl->AddTriangleFilled(ImVec2(c.x, c.y - t), ImVec2(c.x - t, c.y + t * 0.55f),
+                              ImVec2(c.x + t, c.y + t * 0.55f), ac);
+        dl->AddRectFilled(ImVec2(c.x - t * 0.30f, c.y - t * 0.1f),
+                          ImVec2(c.x + t * 0.30f, c.y + t * 0.9f), ac);
+    }
+    ImGui::PopStyleColor(3);
+
+    ImGui::PopStyleColor(3);   // button base / hovered / active
+    ImGui::PopStyleVar();
+
+    ImGui::SetNextWindowSizeConstraints(ImVec2(300 * sc, 0), ImVec2(300 * sc, FLT_MAX));
+    if (ImGui::BeginPopup("##modeldropdown")) { drawModelDropdown(st, busy); ImGui::EndPopup(); }
 }
 
 // Is the assistant currently working a turn? Covers every run path: job-based design/edit, the
@@ -2873,108 +2972,23 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
         ImGui::PopStyleColor();
     }
 
-    // ---- rounded composer box ----
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::Palette::toU32(pal.frameBg));
-    ImGui::PushStyleColor(ImGuiCol_Border, ui::Palette::toU32(pal.border));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui::metrics::rounding(10.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, ui::metrics::stroke(1.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 8 * sc));
-    ImGui::BeginChild("##composer", ImVec2(0, 0),
-                      ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+    // ---- composer: prelude row -> transparent input -> toolbar row ----
+    drawComposerPrelude(st, busy);
 
-    // input (transparent frame so it blends into the rounded box)
     const char* placeholder = st.aiInteraction == 2 ? "Ask about this part\xE2\x80\xA6"
                             : st.aiInteraction == 1 ? "Describe a change to this part\xE2\x80\xA6"
                                                     : "Describe what to build\xE2\x80\xA6";
     ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_Border, ui::Palette::toU32(pal.border));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, ui::metrics::stroke(1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(8.0f));
     bool submitInput = drawChatInput("##aiprompt", st.prompt, placeholder,
                                      ui::metrics::copilotInputMaxLines());
-    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
 
-    // inline toolbar row — model chip + settings + send (canonical model picker)
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 2 * sc);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * sc, 3 * sc));
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));   // ghost buttons
-
-    // model chip (single canonical picker)
-    ImGui::SameLine();
-    char modelLabel[160];
-    composerModelLabel(st.settings, modelLabel, sizeof(modelLabel));
-    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
-    if (ImGui::Button(modelLabel)) ImGui::OpenPopup("##modeldropdown");
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Model — click to search and switch.");
-
-    // right cluster: [settings] [send]
-    const float sendSz = ImGui::GetFrameHeight();
-    const float gearSz = ImGui::GetFrameHeight();
-    ImGui::SameLine();
-    float rightX = ImGui::GetContentRegionMax().x - sendSz - 6 * sc - gearSz;
-    if (rightX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rightX);
-
-    // settings (gear glyph from the icon atlas; text fallback)
-    IconUV gear = ui::getIcon("settings", 20);
-    bool openSettings = false;
-    if (gear.valid)
-        openSettings = ImGui::ImageButton("##aigear", gear.texId,
-                                          ImVec2(gearSz - 8 * sc, gearSz - 8 * sc),
-                                          gear.uv0, gear.uv1);
-    else
-        openSettings = ImGui::SmallButton("set");
-    if (openSettings) st.focusSettingsTab = true;   // bring the Settings dock tab forward
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI settings");
-
-    // right action: STOP while a turn is active (red square), else SEND (accent up-arrow).
-    // Arrow/square glyphs aren't in the body font, so both are drawn on the draw list.
-    ImGui::SameLine(0, 6 * sc);
-    if (active) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.statusErr));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(220, 100, 92, 255));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(190, 80, 74, 255));
-        if (ImGui::Button("##stop", ImVec2(sendSz, sendSz))) stopReq = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(st.stopRequested ? "Stopping\xE2\x80\xA6 (finishing current step)"
-                                               : "Stop the current run");
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-        ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
-        float h = sendSz * 0.18f;
-        dl->AddRectFilled(ImVec2(c.x - h, c.y - h), ImVec2(c.x + h, c.y + h),
-                          IM_COL32(255, 255, 255, 235), 1.5f * sc);
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Button,
-            canStart ? ui::Palette::toU32(pal.accent) : ui::Palette::toU32(pal.button));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-            canStart ? ui::Palette::toU32(pal.accentDim) : ui::Palette::toU32(pal.buttonHovered));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ui::Palette::toU32(pal.accentDim));
-        if (ImGui::Button("##send", ImVec2(sendSz, sendSz)) && canStart) submit = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(canStart ? "Send  (Enter)"
-                              : !canRun ? "Runtime/worker not ready yet." : "Type a message first.");
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-        ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
-        float t = sendSz * 0.22f;
-        ImU32 ac = canStart ? IM_COL32(8, 26, 26, 255) : ui::Palette::toU32(pal.textDim);
-        dl->AddTriangleFilled(ImVec2(c.x, c.y - t), ImVec2(c.x - t, c.y + t * 0.55f),
-                              ImVec2(c.x + t, c.y + t * 0.55f), ac);
-        dl->AddRectFilled(ImVec2(c.x - t * 0.30f, c.y - t * 0.1f),
-                          ImVec2(c.x + t * 0.30f, c.y + t * 0.9f), ac);
-    }
-    ImGui::PopStyleColor(3);
-    ImGui::PopStyleColor();   // ghost button base
-    ImGui::PopStyleVar();     // toolbar frame padding
-
-    // model dropdown popup (search + checkmarked list + gear)
-    ImGui::SetNextWindowSizeConstraints(ImVec2(300 * sc, 0), ImVec2(300 * sc, FLT_MAX));
-    if (ImGui::BeginPopup("##modeldropdown")) { drawModelDropdown(st, busy); ImGui::EndPopup(); }
-
-    ImGui::EndChild();
-    ImGui::PopStyleVar(3);   // child rounding / border / window padding
-    ImGui::PopStyleColor(2); // child bg / border
-
-    // ---- footer chips ----
-    drawComposerChips(st, busy);
+    ImGui::Dummy(ImVec2(0, 4 * sc));
+    drawComposerToolbar(st, busy, canStart, active, submit, stopReq);
 
     // ---- stop / submit / queue ----
     if (stopReq) requestStopRun(st);
@@ -3006,19 +3020,6 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
 
     if (!ImGui::Begin("Copilot###AI", nullptr, ImGuiWindowFlags_NoBackground)) { ImGui::End(); return; }
     ui::Fonts& fonts = st.fonts;
-    // Full-panel liquid-glass chrome — OPAQUE dark base FIRST, then the glass on top (see the matching
-    // comment in layout.cpp drawLeftPane): the full-bleed 3D on the background draw list would otherwise
-    // wash through this NoBackground pane and read muddy. windowBg solid base => the glass layers over a
-    // deep dark surface matching the chrome band + dock tabs. Alpha matches the FeatureManager pane
-    // exactly so the two side panes read as the same frosted surface.
-    {
-        ImVec2 gp0 = ImGui::GetWindowPos();
-        ImVec2 gsz = ImGui::GetWindowSize();
-        ImVec2 gp1(gp0.x + gsz.x, gp0.y + gsz.y);
-        ImDrawList* wdl = ImGui::GetWindowDrawList();
-        wdl->AddRectFilled(gp0, gp1, ui::Palette::toU32(ui::palette.windowBg));
-        ui::glassBackground(wdl, gp0, gp1, 0.0f, 0.38f);
-    }
 
     // Remember which dock node we live in so the sibling "Settings" tab can dock next to us.
     st.aiDockId = (unsigned int)ImGui::GetWindowDockID();
@@ -3030,7 +3031,6 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
 
     drawCopilotHeader(st, busy);
     ImGui::Separator();
-    drawCopilotTopBar(st, busy);
     drawRuntimeBanner(st);
 
     // Reserve the composer's height (measured last frame) so the conversation log fills the rest.
@@ -3067,18 +3067,6 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // ---- composer (measure its height for next frame's reserve) ----
     ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
     ImGui::BeginGroup();
-    // Context-window meter — a thin right-aligned line at the TOP of the composer block. Moved up here
-    // off the footer chips row, where it pinned to the pane's bottom-right corner against the status
-    // bar (the "too low" report). On its own full-width line the fill-bar + "N/M" readout always fit,
-    // and being above the input it reads as an input-context hint (Claude Code / Cursor style). Inside
-    // the group so its height folds into s_composerH and the conversation log reserves for it.
-    {
-        const float room = ImGui::GetContentRegionAvail().x;
-        const float w    = measureContextMeter(st, room);
-        const float x    = ImGui::GetContentRegionMax().x - w;
-        if (x > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(x);
-        drawContextMeter(st, room);
-    }
     drawComposer(st, busy, canRun);
     ImGui::EndGroup();
     s_composerH = ImGui::GetItemRectSize().y + ui::metrics::U(1);

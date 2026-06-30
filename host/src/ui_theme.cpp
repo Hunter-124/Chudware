@@ -484,8 +484,8 @@ void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, bo
     const float inset = 2.0f * s;
     ImVec2 pillMin(mn.x + inset, mn.y + inset);
     ImVec2 pillMax(mx.x - inset, mx.y - inset);
-    // Very light row wash — much more transparent than a full glass panel.
-    float wash[4]; Palette::withAlpha(p.glassBg, wash, 0.22f);
+    // Light row wash — tuned for readability over the bright viewport bleed-through.
+    float wash[4]; Palette::withAlpha(p.glassBg, wash, 0.28f);
     dl->AddRectFilled(pillMin, pillMax, Palette::toU32(wash), r);
     if (stripe) {
         float stripeCol[4]; Palette::withAlpha(p.glassHighlight, stripeCol, 0.35f);
@@ -499,6 +499,15 @@ void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, bo
                           ImVec2(pillMin.x + 4.0f * s, pillMax.y - 3.0f * s),
                           Palette::toU32(p.accent), 2.0f * s);
     }
+}
+
+void glassRowAtCursor(float rounding, bool stripe, bool selected, float rowPadV) {
+    const float s = uiScale;
+    ImVec2 rowMin = ImGui::GetCursorScreenPos();
+    float availW = ImGui::GetContentRegionAvail().x;
+    const float rowH = ImGui::GetTextLineHeight() + rowPadV * s;
+    ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
+    glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, rounding, stripe, selected);
 }
 
 // =========================================================================

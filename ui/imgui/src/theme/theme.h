@@ -34,10 +34,13 @@ void apply();
 // Swap dark/light at runtime (re-applies colors; does NOT reload fonts).
 void setDark(bool dark);
 
-// Glass helpers — match host/ui_theme glassRowBackground + panel wash.
-void glassPanelBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float alpha = 0.38f);
+// Glass helpers — match host/ui_theme glassRowBackground; panels stay transparent.
 void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 4.f,
                         bool stripe = false, bool selected = false);
+void glassRowAtCursor(float rounding = 4.f, bool stripe = false, bool selected = false,
+                      float rowPadV = 5.f);
+void glassRowAtCursor(float rounding = 4.f, bool stripe = false, bool selected = false,
+                      float rowPadV = 5.f);
 
 } // namespace theme
 

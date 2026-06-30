@@ -69,6 +69,12 @@ static void treeIcon(const char* name, const char* fallback, float size = 16.0f,
     }
 }
 
+// Frosted row pill at the current cursor (full content width). Stripe index advances per call.
+static int s_fmStripeIdx = 0;
+static void fmRowPill(bool selected = false) {
+    ui::glassRowAtCursor(3.5f, (s_fmStripeIdx++ % 2) == 0, selected, 5.0f);
+}
+
 // ---- Solid Bodies visibility helper ----
 // Show/hide one renderer body slot. Host-side state only (AppState::bodyVisible) — no doc ops,
 // so it is applied immediately (no s_pendingTreeOps detour needed). Hiding also drops any
@@ -1071,8 +1077,8 @@ static const char* featureIcon(const std::string& type, const nlohmann::json* fe
     if (type == "circular_pattern") return "circular_pattern";
     if (type == "mirror")           return "mirror";
     if (type == "plane" || type == "datum_plane") return "ref_plane";
-    if (type == "axis")             return "ref_axis";
-    if (type == "point")            return "ref_point";
+    if (type == "axis" || type == "datum_axis")   return "ref_axis";
+    if (type == "point" || type == "datum_point") return "ref_point";
     if (type == "import")           return "open";
     if (type == "script")           return "history";
     if (type == "helix")            return "curve_helix";
@@ -1133,8 +1139,8 @@ static const char* featureFallback(const std::string& type) {
     if (type == "circular_pattern")  return "[CP]";
     // Datum
     if (type == "plane" || type == "datum_plane") return "[Pl]";
-    if (type == "axis")              return "[Ax]";
-    if (type == "point")             return "[Pt]";
+    if (type == "axis" || type == "datum_axis")   return "[Ax]";
+    if (type == "point" || type == "datum_point") return "[Pt]";
     if (type == "csys")              return "[CS]";
     // Primitives
     if (type == "box")               return "[Bx]";
@@ -1258,13 +1264,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             }
             FStatus fs = getFeatureStatus(statusArr, cid);
 
-            if (ci % 2 == 0) {
-                ImVec2 rowMin = ImGui::GetCursorScreenPos();
-                ImVec2 rowMax(rowMin.x + ImGui::GetContentRegionAvail().x,
-                              rowMin.y + ImGui::GetTextLineHeightWithSpacing());
-                ImGui::GetWindowDrawList()->AddRectFilled(rowMin, rowMax,
-                    Palette::toU32(pal.treeRowAlt));
-            }
+            fmRowPill();
             treeIcon(isAsm ? "assembly" : "part", isAsm ? "[A]" : "[P]", 16.0f);
             ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
             // SolidWorks marks fixed components with a "(f)" prefix.
@@ -1281,6 +1281,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
     ImGui::Separator();
 
     // ---- Mates folder ----
+    fmRowPill();
     treeIcon("mates_folder", "[M]", 16.0f);
     ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
     ImGuiTreeNodeFlags ff = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth;
@@ -1308,6 +1309,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                 std::string row = disp + pair;
                 if (msup) row += " [S]";
 
+                fmRowPill();
                 treeIcon("mate", "[m]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                 if (msup) ImGui::PushStyleColor(ImGuiCol_Text,
@@ -1358,8 +1360,7 @@ static bool toolbarIconBtn(const char* id, const char* iconName, const char* too
     bool hov = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (hov && enabled)
-        dl->AddRectFilled(p0, ImVec2(p0.x + btn, p0.y + btn),
-                          ui::Palette::toU32(pal.buttonHovered), 3.0f);
+        ui::glassRowBackground(dl, p0, ImVec2(p0.x + btn, p0.y + btn), 3.0f, false, false);
     IconUV iv = getIcon(iconName, 20);
     float iz = 18.0f * ui::uiScale, off = (btn - iz) * 0.5f;
     ImU32 tint = enabled ? IM_COL32(255,255,255,255) : IM_COL32(128,128,128,150);
@@ -1718,6 +1719,7 @@ static void drawFeatureManagerTopStrip(AppState& st) {
     // decoration that duplicated the real vertical tab strip in the LeftPane container (layout.cpp
     // drawLeftPane). This strip now hosts only the functional document toolbar + "Name & group".
     // --- centered document toolbar (first item on the line, so position it absolutely) ---
+    ui::glassRowAtCursor(3.5f, false, false, 8.0f);
     float nBtns = 6.0f, gap = 2.0f * ui::uiScale, bw = 24.0f * ui::uiScale;
     float toolW = nBtns * bw + (nBtns - 1) * gap;
     float startX = ImGui::GetCursorPosX();
@@ -1778,6 +1780,7 @@ static void drawFeatureManagerTopStrip(AppState& st) {
         ImGui::Spacing();
         bool can = canDoc;
         if (!can) ImGui::BeginDisabled();
+        ui::glassRowAtCursor(3.5f, true, false, 6.0f);
         ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.accentSoft));
         if (ImGui::Button("Name & group features", ImVec2(-1, 0)) && can)
             nameAndGroupFeatures(st);
@@ -1789,6 +1792,7 @@ static void drawFeatureManagerTopStrip(AppState& st) {
     }
 
     ImGui::Spacing();
+    ui::glassRowAtCursor(3.5f, false, false, 6.0f);
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputTextWithHint("##fm_filter", "Filter features...", s_fmFilter, sizeof(s_fmFilter));
 
@@ -1803,6 +1807,7 @@ static void drawFeatureManagerTopStrip(AppState& st) {
 void drawFeatureTreeBody(AppState& st,
                          const std::function<void(const std::string&)>& editCallback) {
     const auto& pal = ui::palette;
+    s_fmStripeIdx = 0;
 
     // C24: SolidWorks-style top strip (tab row + compact doc toolbar), replacing the old wide
     // New Part / Undo / Redo text buttons that used to live at the panel bottom.
@@ -1825,6 +1830,7 @@ void drawFeatureTreeBody(AppState& st,
         ImGuiTreeNodeFlags rootFlags =
             ImGuiTreeNodeFlags_DefaultOpen |
             ImGuiTreeNodeFlags_SpanFullWidth;
+        fmRowPill();
         bool rootOpen = ImGui::TreeNodeEx(docName.c_str(), rootFlags);
 
         // C26: root-row "Appearance…" — sets the primary body's color (the common single-body
@@ -1887,6 +1893,7 @@ void drawFeatureTreeBody(AppState& st,
                                        ImGuiTreeNodeFlags_SpanFullWidth;
                 char eqLabel[64];
                 std::snprintf(eqLabel, sizeof(eqLabel), "Equations (%d)##eqhdr", eqCount);
+                fmRowPill();
                 treeIcon("equations", "[=]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                 ImGui::TreeNodeEx(eqLabel, f);
@@ -1908,6 +1915,7 @@ void drawFeatureTreeBody(AppState& st,
                         if (!key.empty()) matKey = key;
                     }
                 }
+                fmRowPill();
                 treeIcon("material", "[M]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                 ImGui::TreeNodeEx("##mat_hdr", f | ImGuiTreeNodeFlags_NoTreePushOnOpen);
@@ -1990,6 +1998,7 @@ void drawFeatureTreeBody(AppState& st,
                 if (!isAsmDoc && st.hasDocMesh && nBodies >= 1) {
                     char hdr[64];
                     std::snprintf(hdr, sizeof(hdr), "Solid Bodies (%d)##solid_bodies", nBodies);
+                    fmRowPill();
                     treeIcon("body_folder", "[F]", 16.0f);   // #4.4: was borrowed "mates_folder"
                     ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                     bool open = ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_DefaultOpen |
@@ -2004,6 +2013,7 @@ void drawFeatureTreeBody(AppState& st,
                             ImGuiTreeNodeFlags bf = ImGuiTreeNodeFlags_Leaf |
                                                     ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                                     ImGuiTreeNodeFlags_SpanFullWidth;
+                            fmRowPill();
                             treeIcon("part", "[B]", 16.0f, hidden ? 0.45f : 1.0f);
                             ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                             if (hidden)
@@ -2066,6 +2076,7 @@ void drawFeatureTreeBody(AppState& st,
             {
                 ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_DefaultOpen |
                                        ImGuiTreeNodeFlags_SpanFullWidth;
+                fmRowPill();
                 treeIcon("origin", "[O]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);
                 bool originOpen = ImGui::TreeNodeEx("Origin##origin", f);
@@ -2090,6 +2101,7 @@ void drawFeatureTreeBody(AppState& st,
                         if (hidden)
                             ImGui::PushStyleColor(ImGuiCol_Text,
                                 ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.55f));
+                        fmRowPill(st.planeEmphasis == pi);
                         ImGui::TreeNodeEx((std::string(kPlanes[pi]) + "##plane" + std::to_string(pi)).c_str(), pf);
                         if (hidden) ImGui::PopStyleColor();
                         ImVec2 pNodeMin = ImGui::GetItemRectMin();
@@ -2576,6 +2588,7 @@ void drawFeatureTreeBody(AppState& st,
                                     ImVec4(pal.text[0], pal.text[1], pal.text[2], 1.0f));
                                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                                     ImVec2(0, 4.0f * ui::uiScale));
+                                fmRowPill();
                                 treeIcon("body_folder", "[F]", 16.0f);   // #4.4: was "mates_folder"
                                 ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                                 folderOpen = ImGui::TreeNodeEx(
@@ -2741,6 +2754,7 @@ void drawFeatureTreeBody(AppState& st,
         } else {
             // File name on its own dimmed line (a narrow panel must never push it — or the
             // buttons — past the edge); the full path shows on hover.
+            ui::glassRowAtCursor(3.5f, false, false, 5.0f);
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1.0f));
             std::string fileLabel = s_docPath.empty() ? "(unsaved)" : pathBaseName(s_docPath);
@@ -2754,11 +2768,13 @@ void drawFeatureTreeBody(AppState& st,
                 const ImGuiStyle& style = ImGui::GetStyle();
                 const float gap = style.ItemSpacing.x;
                 const float halfW = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
+                fmRowPill();
                 if (ImGui::Button("Save", ImVec2(halfW, 0))) doSaveDoc(st, /*forceDialog=*/false);
                 ImGui::SameLine(0, gap);
                 if (ImGui::Button("Save As...", ImVec2(halfW, 0))) doSaveDoc(st, /*forceDialog=*/true);
             }
             if (!canSave) ImGui::EndDisabled();
+            ui::glassRowAtCursor(3.5f, false, false, 6.0f);
             if (ImGui::Button("Open...", ImVec2(-1, 0))) doOpenDoc(st);
         }
     }

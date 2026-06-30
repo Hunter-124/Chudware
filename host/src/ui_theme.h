@@ -247,6 +247,11 @@ void popGlassChildStyle();
 void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 4.0f,
                         bool stripe = false, bool selected = false);
 
+// Paint a row pill at the current cursor (full content width). Call immediately BEFORE the row's
+// widgets so the pill sits behind text/icons.
+void glassRowAtCursor(float rounding = 4.0f, bool stripe = false, bool selected = false,
+                      float rowPadV = 5.0f);
+
 // The active palette — read-only from panels.
 extern Palette palette;
 

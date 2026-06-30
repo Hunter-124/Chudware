@@ -32,6 +32,11 @@ namespace fs = std::filesystem;
 namespace ui {
 
 // ---- module state (single Explorer instance) ----
+static int s_explorerStripe = 0;
+static void explorerRowPill(bool selected = false) {
+    ui::glassRowAtCursor(3.5f, (s_explorerStripe++ % 2) == 0, selected, 5.0f);
+}
+
 static std::string s_selectedPath;     // the currently-highlighted tree node (file or folder)
 static std::string s_currentFolder;    // folder that New Folder / Paste act inside (a dir, or a
                                        // file's parent); defaults to the workspace root
@@ -117,7 +122,7 @@ static bool toolbarIconButton(const char* id, const char* icon, const char* tip,
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (hovered && enabled)
-        dl->AddRectFilled(p0, p1, ui::Palette::toU32(pal.buttonHovered), 5.0f * S);
+        ui::glassRowBackground(dl, p0, p1, 5.0f, false, false);
     IconUV ic = getIcon(icon, 20);
     if (ic.valid) {
         float ix = p0.x + (btn - glyph) * 0.5f;
@@ -251,7 +256,9 @@ static void requestOpen(AppState& st, const fs::path& p) {
 static void drawFileRow(AppState& st, const fs::path& root, const fs::path& p, const std::string& ext) {
     const std::string pathStr = p.string();
     const bool isRenaming = (s_renameId == pathStr);
+    const bool selected = (s_selectedPath == pathStr);
     ImGui::PushID(pathStr.c_str());
+    explorerRowPill(selected);
     drawIcon(fileIconName(ext));
     if (isRenaming) {
         ImGui::SetNextItemWidth(-1);
@@ -261,7 +268,6 @@ static void drawFileRow(AppState& st, const fs::path& root, const fs::path& p, c
             commitRename(st, root);
         if (ImGui::IsItemDeactivated()) commitRename(st, root);   // click-away / Esc commits-or-cancels
     } else {
-        const bool selected = (s_selectedPath == pathStr);
         if (ImGui::Selectable(p.filename().string().c_str(), selected,
                               ImGuiSelectableFlags_AllowDoubleClick)) {
             s_selectedPath = pathStr;
@@ -312,6 +318,7 @@ static void drawDirNode(AppState& st, const fs::path& root, const fs::path& dir,
     // A non-root folder being inline-renamed shows an InputText in place of its tree node; its
     // children stay collapsed during the rename (kept simple — folder rename is a leaf interaction).
     if (!isRoot && s_renameId == dir.string()) {
+        explorerRowPill(s_selectedPath == dir.string());
         drawIcon("body_folder");
         ImGui::SetNextItemWidth(-1);
         if (s_renameFocus) { ImGui::SetKeyboardFocusHere(); s_renameFocus = false; }
@@ -323,6 +330,7 @@ static void drawDirNode(AppState& st, const fs::path& root, const fs::path& dir,
         return;
     }
 
+    explorerRowPill(s_selectedPath == dir.string());
     drawIcon("body_folder");
     bool open = ImGui::TreeNodeEx(label.c_str(), flags);
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
@@ -388,11 +396,13 @@ static void drawRecentSection(AppState& st) {
         for (const std::string& rp : st.recentFiles) {
             ImGui::PushID(idx++);
             fs::path p(rp);
+            explorerRowPill(false);
             drawIcon(fileIconName(lowerExt(p)));
             std::error_code ec;
             bool exists = fs::exists(p, ec);
             if (!exists) ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
+            explorerRowPill();
             if (ImGui::Selectable(p.filename().string().c_str(), false,
                                   ImGuiSelectableFlags_AllowDoubleClick) &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && exists)
@@ -451,6 +461,7 @@ static void drawDeleteModal(AppState& st, const fs::path& root) {
 
 // ---- body -----------------------------------------------------------------
 void drawFileExplorerBody(AppState& st) {
+    s_explorerStripe = 0;
     ensureWorkspaceDir(st);
     fs::path root(st.workspaceDir);
 
@@ -473,6 +484,7 @@ void drawFileExplorerBody(AppState& st) {
         fs::is_regular_file(fs::path(s_selectedPath), curEc) &&
         isKnownExt(lowerExt(fs::path(s_selectedPath)));
 
+    ui::glassRowAtCursor(3.5f, false, false, 8.0f);
     if (toolbarIconButton("open", "open", "Open selected file", selectedFile))
         requestOpen(st, fs::path(s_selectedPath));
     ImGui::SameLine(0, 3.0f * ui::uiScale);
@@ -485,6 +497,7 @@ void drawFileExplorerBody(AppState& st) {
     if (toolbarIconButton("refresh", "refresh", "Refresh"))
         st.toast(ui::ToastLevel::Info, "Explorer refreshed");
 
+    ui::glassRowAtCursor(3.5f, false, false, 5.0f);
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));

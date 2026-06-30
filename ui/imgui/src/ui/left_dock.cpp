@@ -29,8 +29,8 @@ void drawActivityRail(AppState& s, float width) {
         bool act = (s.railTab == i);
         if (ImGui::InvisibleButton("r", ImVec2(btn, btn))) s.railTab = i;
         bool hov = ImGui::IsItemHovered();
-        if (act) dl->AddRectFilled(p, ImVec2(p.x+btn, p.y+btn), TCOL(bg2), 8*S);
-        else if (hov) dl->AddRectFilled(p, ImVec2(p.x+btn, p.y+btn), TCOL(hover), 8*S);
+        if (act || hov)
+            theme::glassRowBackground(dl, p, ImVec2(p.x+btn, p.y+btn), 8*S, false, act);
         if (act) dl->AddRectFilled(ImVec2(p.x-6*S, p.y+btn*0.2f), ImVec2(p.x-6*S+3*S, p.y+btn*0.8f), TCOL(accent), 2*S);
         icons::draw(dl, rails[i].icon, ImVec2(p.x+btn*0.5f, p.y+btn*0.5f), btn*0.5f, act?TCOL(txt0):TCOL(txt1));
         if (hov) ImGui::SetTooltip("%s", rails[i].tip);
@@ -76,12 +76,9 @@ static void drawNode(AppState& s, TreeNode& n, int depth) {
 
 void drawLeftDock(AppState& s) {
     const float S = theme::S();
-    ImVec2 p0 = ImGui::GetCursorScreenPos();
-    float h = ImGui::GetContentRegionAvail().y;
-    theme::glassPanelBackground(ImGui::GetWindowDrawList(), p0,
-                                ImVec2(p0.x + ImGui::GetContentRegionAvail().x, p0.y + h));
-    ImGui::PushFont(theme::font(theme::Font::H2));
     const char* titles[] = {"Model Tree", "Bodies", "Files", "Configurations"};
+    theme::glassRowAtCursor(4.f, false, false, 6.f);
+    ImGui::PushFont(theme::font(theme::Font::H2));
     ImGui::TextColored(TVEC(txt1), "%s", titles[s.railTab]);
     ImGui::PopFont();
     ImGui::Separator();
@@ -92,6 +89,7 @@ void drawLeftDock(AppState& s) {
         ImGui::PopStyleVar();
     } else if (s.railTab == 1) {
         for (auto& b : s.bodies) {
+            theme::glassRowAtCursor(3.5f, false, false, 5.f);
             icons::inlineIcon("file_part", 15*S, TCOL(txt1)); ImGui::SameLine(0,6*S);
             ImGui::TextColored(TVEC(txt0), "%s", b.c_str());
         }
@@ -99,10 +97,12 @@ void drawLeftDock(AppState& s) {
         ImGui::TextColored(TVEC(txt2), "Workspace files");
         const char* demo[] = {"Bracket.step+", "Housing.step+", "Plate.dxf"};
         for (auto f : demo) {
+            theme::glassRowAtCursor(3.5f, false, false, 5.f);
             icons::inlineIcon("file_part", 15*S, TCOL(txt1)); ImGui::SameLine(0,6*S);
             ImGui::TextColored(TVEC(txt1), "%s", f);
         }
     } else {
+        theme::glassRowAtCursor(3.5f, false, false, 5.f);
         icons::inlineIcon("rail_configs", 15*S, TCOL(accent)); ImGui::SameLine(0,6*S);
         ImGui::TextColored(TVEC(txt0), "Default <active>");
     }

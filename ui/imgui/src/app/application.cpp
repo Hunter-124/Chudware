@@ -93,7 +93,7 @@ void Application::frame() {
     float midH = ImGui::GetContentRegionAvail().y - statusH;
     if (midH < 0) midH = 0;
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, TVEC(bg0));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##rail", ImVec2(railW, midH), false,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ui::drawActivityRail(s, railW);
@@ -102,15 +102,18 @@ void Application::frame() {
 
     ImGui::SameLine(0, 0);
 
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_DockingEmptyBg, ImVec4(0, 0, 0, 0));
     ImGuiID dockId = ImGui::GetID("##dockspace");
     ImGui::DockSpace(dockId, ImVec2(0, midH), ImGuiDockNodeFlags_PassthruCentralNode);
+    ImGui::PopStyleColor(2);
     if (!layoutBuilt_) buildDockLayout(dockId);
 
     ui::drawStatusBar(s, statusH);
 
     ImGui::End();   // ##root
 
-    // --- docked panels (translucent glass) ---
+    // --- docked panels (transparent; row pills only) ---
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0,0,0,0));
     ImGuiWindowFlags pflags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground;
     if (ImGui::Begin("Browser###left", nullptr, pflags)) {

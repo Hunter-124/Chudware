@@ -25,8 +25,11 @@ static int gActiveSession = 0;
 static bool gShowSessions = false;
 static int gAgentMode = 0;       // 0 Design, 1 Edit, 2 Ask
 static bool gOffline = false;
+static bool gSupervised = false;
 static int gThinking = 3;        // 0 off .. 3 high
+static int gModel = 0;           // 0 Claude, 1 Gemini, 2 Local
 static const char* kModes[] = {"Design", "Edit", "Ask"};
+static const char* kModels[] = {"Claude Sonnet", "Gemini Pro", "Local (llama.cpp)"};
 static const char* kThink[] = {"Off", "Low", "Medium", "High"};
 static const int kCtxWin = 128000;
 
@@ -64,6 +67,8 @@ static void newSession(AppState& s) {
     s.agent.running = false;
     gShowSessions = false;
 }
+
+static bool modelSupportsThinking(int model) { return model != 2; }  // local demo: no effort knob
 } // namespace
 
 static void spinner(ImDrawList* dl, ImVec2 c, float r, float t, ImU32 col) {
@@ -93,7 +98,6 @@ static void drawBlock(AppState& s, AgentBlock& b, int idx) {
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * (0.15f + 0.85f*b.anim));
     float dy = (1.f - b.anim) * 8*S;
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + dy);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
 
     switch (b.kind) {
     case BlockKind::UserMsg:
@@ -128,34 +132,6 @@ static void drawBlock(AppState& s, AgentBlock& b, int idx) {
     ImGui::PopID();
 }
 
-static void drawTopBar(AppState& s) {
-    const float S = theme::S();
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8*S, 3*S));
-    if (ImGui::SmallButton(kModes[gAgentMode])) ImGui::OpenPopup("##mode");
-    if (ImGui::BeginPopup("##mode")) {
-        for (int i = 0; i < 3; ++i)
-            if (ImGui::Selectable(kModes[i], gAgentMode == i)) gAgentMode = i;
-        ImGui::EndPopup();
-    }
-    ImGui::SameLine();
-    const char* pl = gOffline ? "Permissions: Offline" : "Permissions";
-    if (ImGui::SmallButton(pl)) ImGui::OpenPopup("##perm");
-    if (ImGui::BeginPopup("##perm")) {
-        ImGui::Checkbox("Offline mode (local only)", &gOffline);
-        ImGui::Checkbox("Show assistant thoughts", &s.agent.showThinking);
-        ImGui::EndPopup();
-    }
-    ImGui::SameLine();
-    char tb[48]; std::snprintf(tb, sizeof(tb), "Thinking: %s", kThink[gThinking]);
-    if (ImGui::SmallButton(tb)) ImGui::OpenPopup("##think");
-    if (ImGui::BeginPopup("##think")) {
-        for (int i = 0; i < 4; ++i)
-            if (ImGui::Selectable(kThink[i], gThinking == i)) gThinking = i;
-        ImGui::EndPopup();
-    }
-    ImGui::PopStyleVar();
-}
-
 static void drawSessionsList(AppState& s) {
     ensureSessions();
     if (ImGui::Button("+ New session")) newSession(s);
@@ -173,20 +149,137 @@ static void drawSessionsList(AppState& s) {
 static void drawContextMeter() {
     const float S = theme::S();
     int used = gSessions.empty() ? 0 : gSessions[gActiveSession].contextUsed;
-    char buf[32]; std::snprintf(buf, sizeof(buf), "%dk/%dk", (used+500)/1000, kCtxWin/1000);
-    float w = ImGui::CalcTextSize(buf).x;
-    ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - w);
-    ImGui::TextColored(TVEC(txt2), "%s", buf);
+    const float frac = kCtxWin > 0 ? std::min(1.f, (float)used / (float)kCtxWin) : 0.f;
+    const float barW = 40 * S, gap = 5 * S;
+    char full[32]; std::snprintf(full, sizeof(full), "%dk/%dk", (used+500)/1000, kCtxWin/1000);
+    char lean[40]; std::snprintf(lean, sizeof(lean), "ctx %s", full);
+    const float fullTw = ImGui::CalcTextSize(full).x;
+    const float room = ImGui::GetContentRegionAvail().x;
+    const bool showBar = room >= barW + gap + fullTw;
+    const float fh = ImGui::GetFrameHeight();
+    ImGui::PushStyleColor(ImGuiCol_Text, TVEC(txt2));
+    if (showBar) {
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        float by0 = p.y + fh * 0.5f - 3 * S, by1 = p.y + fh * 0.5f + 3 * S;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImU32 fg = frac < 0.5f ? IM_COL32(120, 200, 120, 255)
+                 : frac < 0.85f ? IM_COL32(220, 170, 90, 255)
+                                : IM_COL32(220, 110, 100, 255);
+        dl->AddRectFilled(ImVec2(p.x, by0), ImVec2(p.x + barW, by1), TCOL(accentDim), 2 * S);
+        if (frac > 0)
+            dl->AddRectFilled(ImVec2(p.x, by0), ImVec2(p.x + barW * frac, by1), fg, 2 * S);
+        dl->AddRect(ImVec2(p.x, by0), ImVec2(p.x + barW, by1), TCOL(txt2), 2 * S);
+        ImGui::Dummy(ImVec2(barW, fh));
+        ImGui::SameLine(0, gap);
+    }
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(showBar ? full : lean);
+    ImGui::PopStyleColor();
+}
+
+static void drawComposerPrelude(AppState& s) {
+    const float S = theme::S();
+    ImVec2 rowMin = ImGui::GetCursorScreenPos();
+    const float rowH = ImGui::GetFrameHeight() + 4 * S;
+    ImVec2 rowMax(rowMin.x + ImGui::GetContentRegionAvail().x, rowMin.y + rowH);
+    theme::glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, 4.f * S, false, false);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8*S, 3*S));
+    if (ImGui::SmallButton(kModes[gAgentMode])) ImGui::OpenPopup("##cmpmode");
+    if (ImGui::BeginPopup("##cmpmode")) {
+        for (int i = 0; i < 3; ++i)
+            if (ImGui::Selectable(kModes[i], gAgentMode == i)) gAgentMode = i;
+        ImGui::EndPopup();
+    }
+    ImGui::SameLine();
+    const char* pl = gOffline ? "Permissions: Offline" : "Permissions";
+    if (ImGui::SmallButton(pl)) ImGui::OpenPopup("##cmpperm");
+    if (ImGui::BeginPopup("##cmpperm")) {
+        ImGui::Checkbox("Offline mode (local only)", &gOffline);
+        ImGui::Checkbox("Supervised (plan + clarify before modeling)", &gSupervised);
+        ImGui::Checkbox("Show assistant thoughts", &s.agent.showThinking);
+        ImGui::EndPopup();
+    }
+    const float room = ImGui::GetContentRegionAvail().x;
+    char full[32];
+    int used = gSessions.empty() ? 0 : gSessions[gActiveSession].contextUsed;
+    std::snprintf(full, sizeof(full), "%dk/%dk", (used+500)/1000, kCtxWin/1000);
+    const float barW = 40 * S, gap = 5 * S;
+    const float w = (room >= barW + gap + ImGui::CalcTextSize(full).x)
+                        ? barW + gap + ImGui::CalcTextSize(full).x
+                        : ImGui::CalcTextSize(("ctx " + std::string(full)).c_str()).x;
+    const float x = ImGui::GetContentRegionMax().x - w;
+    if (x > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(x);
+    drawContextMeter();
+    ImGui::PopStyleVar();
+    ImGui::Dummy(ImVec2(0, 4*S));
+}
+
+static void drawComposerToolbar(AppState& s, bool canSend, bool& submit) {
+    const float S = theme::S();
+    AgentThread& a = s.agent;
+    ImVec2 rowMin = ImGui::GetCursorScreenPos();
+    const float rowH = ImGui::GetFrameHeight() + 4 * S;
+    ImVec2 rowMax(rowMin.x + ImGui::GetContentRegionAvail().x, rowMin.y + rowH);
+    theme::glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, 4.f * S, false, false);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8*S, 4*S));
+    ImGui::PushStyleColor(ImGuiCol_Button, TVEC(bg2));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, TVEC(bg3));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, TVEC(line));
+    if (ImGui::Button(kModels[gModel])) ImGui::OpenPopup("##modeldropdown");
+    if (ImGui::BeginPopup("##modeldropdown")) {
+        for (int i = 0; i < 3; ++i)
+            if (ImGui::Selectable(kModels[i], gModel == i)) { gModel = i; a.model = i; }
+        ImGui::EndPopup();
+    }
+    ImGui::SameLine();
+    if (modelSupportsThinking(gModel)) {
+        char tb[48]; std::snprintf(tb, sizeof(tb), "Thinking: %s", kThink[gThinking]);
+        ImGui::PushStyleColor(ImGuiCol_Text, TVEC(txt2));
+        if (ImGui::Button(tb)) ImGui::OpenPopup("##cmpeffort");
+        ImGui::PopStyleColor();
+        if (ImGui::BeginPopup("##cmpeffort")) {
+            for (int i = 0; i < 4; ++i)
+                if (ImGui::Selectable(kThink[i], gThinking == i)) gThinking = i;
+            ImGui::EndPopup();
+        }
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, TVEC(txt2));
+        ImGui::BeginDisabled();
+        ImGui::Button("Thinking: n/a");
+        ImGui::EndDisabled();
+        ImGui::PopStyleColor();
+    }
+    const float sendSz = ImGui::GetFrameHeight();
+    const float gearSz = sendSz;
+    ImGui::SameLine();
+    float rightX = ImGui::GetContentRegionMax().x - sendSz - 6*S - gearSz;
+    if (rightX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rightX);
+    if (ImGui::SmallButton("set")) { /* settings tab placeholder */ }
+    ImGui::SameLine(0, 6*S);
+    if (a.running) {
+        ImGui::PushStyleColor(ImGuiCol_Button, TVEC(bad));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, TVEC(bad));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, TVEC(bad));
+        if (ImGui::Button("Stop", ImVec2(sendSz, sendSz))) { a.running = false; a.demoStep = -1; }
+        ImGui::PopStyleColor(3);
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Button, canSend ? TVEC(accent) : TVEC(bg2));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, canSend ? TVEC(accentDim) : TVEC(bg3));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, TVEC(accentDim));
+        if (ImGui::Button("Send", ImVec2(sendSz, sendSz)) && canSend) submit = true;
+        ImGui::PopStyleColor(3);
+    }
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar();
 }
 
 void drawAgentPanel(AppState& s) {
     const float S = theme::S();
     AgentThread& a = s.agent;
     ensureSessions();
-
-    ImVec2 wp = ImGui::GetWindowPos();
-    ImVec2 ws = ImGui::GetWindowSize();
-    theme::glassPanelBackground(ImGui::GetWindowDrawList(), wp, ImVec2(wp.x+ws.x, wp.y+ws.y));
+    gModel = a.model;
 
     ImGui::PushFont(theme::font(theme::Font::H2));
     icons::inlineIcon("agent", 18*S, TCOL(accent)); ImGui::SameLine(0,8*S);
@@ -198,34 +291,37 @@ void drawAgentPanel(AppState& s) {
     if (ImGui::SmallButton("Sessions")) gShowSessions = !gShowSessions;
 
     ImGui::Separator();
-    drawTopBar(s);
 
-    float composerH = 92*S;
-    ImGui::BeginChild("##transcript", ImVec2(0, -composerH - 22*S), false);
+    static float sComposerH = 0.f;
+    float reserve = (sComposerH > 0 ? sComposerH : 110*S) + 8*S;
+    ImGui::BeginChild("##transcript", ImVec2(0, -reserve), false);
     if (gShowSessions) drawSessionsList(s);
     else for (int i = 0; i < (int)a.blocks.size(); ++i) drawBlock(s, a.blocks[i], i);
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40*S) ImGui::SetScrollHereY(1.f);
     ImGui::EndChild();
 
-    drawContextMeter();
-    ImGui::BeginChild("##composer", ImVec2(0, composerH), ImGuiChildFlags_Borders);
+    ImGui::BeginGroup();
     static char buf[4096] = {0};
-    ImGui::InputTextMultiline("##in", buf, sizeof(buf), ImVec2(-FLT_MIN, composerH-44*S));
-    const char* models[] = {"Claude", "Gemini", "Local"};
-    ImGui::TextColored(TVEC(txt2), "Enter to send");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(84*S);
-    ImGui::Combo("##model", &a.model, models, 3);
-    ImGui::SameLine();
-    float sendW = 64*S;
-    ImGui::SetCursorPosX(ImGui::GetContentRegionMax().x - sendW);
-    if (a.running) {
-        if (ImGui::Button("Stop", ImVec2(sendW, 0))) { a.running = false; a.demoStep = -1; }
-    } else if ((ImGui::Button("Send", ImVec2(sendW, 0)) || (ImGui::IsKeyPressed(ImGuiKey_Enter) && buf[0])) && buf[0]) {
+    drawComposerPrelude(s);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0,0,0,0));
+    ImGui::PushStyleColor(ImGuiCol_Border, TVEC(line));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8*S);
+    ImGui::InputTextMultiline("##in", buf, sizeof(buf), ImVec2(-FLT_MIN, 56*S));
+    bool enterSend = ImGui::IsKeyPressed(ImGuiKey_Enter) && !ImGui::GetIO().KeyShift && buf[0];
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+    ImGui::Dummy(ImVec2(0, 4*S));
+    bool submit = false;
+    bool canSend = buf[0] != 0 && !a.running;
+    drawComposerToolbar(s, canSend, submit);
+    if ((submit || enterSend) && canSend) {
         s.startDemoAgent(buf); buf[0] = 0;
         gSessions[gActiveSession].contextUsed = 1200 + (int)a.blocks.size() * 400;
     }
-    ImGui::EndChild();
+    ImGui::EndGroup();
+    sComposerH = ImGui::GetItemRectSize().y;
+
     syncBlocksToSession(s);
 }
 

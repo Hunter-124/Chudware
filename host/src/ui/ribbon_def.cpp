@@ -13,6 +13,8 @@ static const RibbonCmd kCmds[] = {
 
     // =========================================================================
     // Tab: Features
+    // Icon column audited against FM_REFRESH_MANIFEST in make_icons.py (68 glyphs).
+    // Every icon string below must exist in host/assets/icons/atlas.json.
     // =========================================================================
 
     // --- Group: Sketch (entry point for the features workflow) ---

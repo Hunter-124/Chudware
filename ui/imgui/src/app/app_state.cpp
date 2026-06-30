@@ -97,14 +97,11 @@ void AppState::dispatch(const char* cmdId) {
     status = std::string("Command: ") + label;
 }
 
-// Map an engine feature type -> an IconId for the tree.
+// Map an engine feature type -> an atlas icon id for the tree (mirrors host featureIcon).
 static std::string featureIcon(const std::string& type) {
-    if (type == "box") return "prim_box";
-    if (type == "cylinder") return "prim_cylinder";
-    if (type == "sphere") return "prim_sphere";
-    if (type == "cone") return "prim_cone";
-    if (type == "extrude") return "extrude";
-    if (type == "revolve") return "revolve";
+    if (type == "sketch") return "sketch_node";
+    if (type == "extrude") return "extrude_boss";
+    if (type == "revolve") return "revolve_boss";
     if (type == "sweep") return "sweep";
     if (type == "loft") return "loft";
     if (type == "fillet") return "fillet";
@@ -112,16 +109,22 @@ static std::string featureIcon(const std::string& type) {
     if (type == "shell") return "shell";
     if (type == "draft") return "draft";
     if (type == "rib") return "rib";
-    if (type == "hole" || type == "bolt_circle") return "hole";
-    if (type == "sketch") return "ws_sketch";
-    if (type == "helix") return "coil";
+    if (type == "hole" || type == "bolt_circle") return "hole_wizard";
+    if (type == "helix") return "curve_helix";
     if (type == "split") return "split";
     if (type == "boolean") return "combine";
-    if (type == "linear_pattern") return "pattern_linear";
-    if (type == "circular_pattern") return "pattern_circular";
+    if (type == "linear_pattern") return "linear_pattern";
+    if (type == "circular_pattern") return "circular_pattern";
     if (type == "mirror") return "mirror";
-    if (type == "transform") return "move_component";
-    return "extrude";
+    if (type == "box") return "box_feature";
+    if (type == "cylinder") return "cylinder_feature";
+    if (type == "sphere") return "sphere_feature";
+    if (type == "cone") return "cone_feature";
+    if (type == "plane" || type == "datum_plane") return "ref_plane";
+    if (type == "axis" || type == "datum_axis") return "ref_axis";
+    if (type == "point" || type == "datum_point") return "ref_point";
+    if (type == "csys") return "ref_csys";
+    return "part";
 }
 
 void AppState::buildTreeFromDoc() {
@@ -129,10 +132,9 @@ void AppState::buildTreeFromDoc() {
     tree = TreeNode{};
     tree.name = docs.empty() ? "Part" : doc().name;
     tree.icon = "file_part"; tree.isFolder = true; tree.open = true;
-    TreeNode planes{ "Planes", "ref_plane", true, false,
-        { {"Front", "ref_plane"}, {"Top", "ref_plane"}, {"Right", "ref_plane"} } };
-    TreeNode origin{ "Origin", "ref_csys", false, true, {} };
-    tree.children = { planes, origin };
+    TreeNode origin{ "Origin", "origin", true, true, {
+        {"Front Plane", "ref_plane"}, {"Top Plane", "ref_plane"}, {"Right Plane", "ref_plane"} } };
+    tree.children = { origin };
 
     const nlohmann::json& t = engine.tree();
     if (t.is_object() && t.contains("features") && t["features"].is_array()) {
@@ -228,13 +230,12 @@ void AppState::seedDemo() {
     engineReady = false;
     status = std::string("Demo mode - ") + (engine.lastError().empty() ? "engine unavailable" : engine.lastError());
     tree.name = "Part1"; tree.icon = "file_part"; tree.isFolder = true; tree.open = true;
-    TreeNode origin{ "Origin", "ref_csys", false, true, {} };
-    TreeNode planes{ "Planes", "ref_plane", true, false, {
-        {"Front", "ref_plane"}, {"Top", "ref_plane"}, {"Right", "ref_plane"} } };
-    TreeNode f1{ "Base", "extrude", false, true, {} };
+    TreeNode origin{ "Origin", "origin", true, true, {
+        {"Front Plane", "ref_plane"}, {"Top Plane", "ref_plane"}, {"Right Plane", "ref_plane"} } };
+    TreeNode f1{ "Base", "extrude_boss", false, true, {} };
     TreeNode f2{ "Fillet", "fillet", false, true, {} };
     TreeNode f3{ "Shell", "shell", false, true, {} };
-    tree.children = { planes, origin, f1, f2, f3 };
+    tree.children = { origin, f1, f2, f3 };
     bodies = { "Part1<1>" };
 }
 

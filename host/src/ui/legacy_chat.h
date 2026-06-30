@@ -1,6 +1,6 @@
-// AI-CAD Copilot pane: slim header (logo + status + chat menu), conversation log with a per-turn
-// transparent activity timeline (what the AI is doing / thinking, expandable), and a bottom
-// composer (rounded input + inline model/settings/send toolbar + provider/mode/autopilot chips).
+// AI-CAD Copilot pane: slim header (logo + status + Sessions), conversation log with a per-turn
+// transparent activity timeline, and a bottom composer (prelude: Design/Permissions + context meter;
+// transparent prompt; toolbar: model picker + thinking + gear/send).
 #pragma once
 
 struct AppState;

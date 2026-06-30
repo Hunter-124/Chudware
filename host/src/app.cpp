@@ -2668,8 +2668,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // the DockSpace() call so the dockspace backdrop is see-through and the 3D shows; every docked
         // window still paints its own background (the glass FeatureManager stays translucent) on top.
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_DockingEmptyBg, ImVec4(0, 0, 0, 0));
         ImGui::DockSpace(dockId, ImVec2(0, 0), ImGuiDockNodeFlags_PassthruCentralNode);
-        ImGui::PopStyleColor();
+        ImGui::PopStyleColor(2);
         ImGui::End();
 
         // ---------- status bar ----------

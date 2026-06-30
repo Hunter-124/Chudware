@@ -87,6 +87,41 @@ CONTRACT_NAMES: list[str] = [
     "airfoil",
 ]
 
+# FM + ribbon-adjacent refresh scope (Agent 3 — fm_copilot_gui_rectify).
+# Every name here must exist in CONTRACT_NAMES; draw_* is tuned for tree/ribbon legibility.
+FM_REFRESH_MANIFEST: list[str] = [
+    # FM tree chrome
+    "origin", "ref_plane", "ref_axis", "ref_point", "ref_csys",
+    "part", "assembly", "sketch_node",
+    "equations", "material", "body_folder", "mates_folder", "mate",
+    "history", "rollback", "suppressed",
+    "error_badge", "warning_badge", "ok_badge",
+    "box_feature", "cylinder_feature", "sphere_feature", "cone_feature", "torus_feature",
+    # FM document toolbar
+    "new_doc", "open", "save", "undo", "redo",
+    # Ribbon Features tab (workflow adjacent to FM)
+    "sketch",
+    "extrude_boss", "extrude_cut", "revolve_boss", "revolve_cut",
+    "sweep", "sweep_cut", "loft", "loft_cut", "boundary",
+    "fillet", "chamfer", "shell", "draft", "rib", "hole_wizard",
+    "linear_pattern", "circular_pattern", "mirror",
+    "combine", "subtract", "intersect", "split", "wrap",
+    "curve_helix",
+    # Workspace rail (left pane tabs)
+    "ws_features", "ws_sketch", "ws_evaluate", "ws_assembly",
+    "ws_sheetmetal", "ws_weldments", "ws_surfaces", "ws_appearance",
+    # FM row visibility + assembly tree
+    "hide_show_eye", "insert_component", "move_component",
+    # Sheet-metal / weldment tree rows
+    "sm_base_flange", "sm_edge_flange", "weld_member",
+]
+
+
+def validate_fm_manifest() -> list[str]:
+    """Return FM manifest names missing from CONTRACT_NAMES."""
+    contract = set(CONTRACT_NAMES)
+    return [n for n in FM_REFRESH_MANIFEST if n not in contract]
+
 # ---------------------------------------------------------------------------
 # Palettes
 # ---------------------------------------------------------------------------
@@ -314,18 +349,14 @@ def draw_part(d, cell, p):
 
 @icon("assembly")
 def draw_assembly(d, cell, p):
-    """Three small parts connected — assembly."""
+    """Three small shaded parts mated together."""
     s = cell * SS
     lw = stroke_width(cell)
-    r = s * 0.14
-    cx, cy = s/2, s/2
-    # three small circles
-    for ox, oy in [(0, -0.3), (-0.28, 0.18), (0.28, 0.18)]:
-        xx, yy = cx + ox*s, cy + oy*s
-        circle(d, xx, yy, r, outline=p.stroke, lw=lw)
-    # connecting lines
-    for ox, oy in [(0, -0.3), (-0.28, 0.18), (0.28, 0.18)]:
-        d.line([(cx, cy), (cx + ox*s, cy + oy*s)], fill=p.accent, width=lw)
+    shaded_prism(d, s, s*0.38, s*0.18, s*0.22, s*0.18, s*0.07, s*0.05, p, accent=True)
+    shaded_prism(d, s, s*0.14, s*0.52, s*0.20, s*0.16, s*0.06, s*0.05, p)
+    shaded_prism(d, s, s*0.58, s*0.54, s*0.20, s*0.16, s*0.06, s*0.05, p)
+    d.line([(s*0.36, s*0.44), (s*0.46, s*0.44)], fill=p.accent, width=lw)
+    d.line([(s*0.56, s*0.54), (s*0.56, s*0.64)], fill=p.accent, width=lw)
 
 @icon("sketch_node")
 def draw_sketch_node(d, cell, p):
@@ -355,10 +386,15 @@ def draw_plane(d, cell, p):
 
 @icon("axis")
 def draw_axis(d, cell, p):
-    """Vertical dashed axis line."""
+    """Datum axis — dashed centerline with endpoint ticks."""
     s = cell * SS
     lw = stroke_width(cell)
-    arrow(d, s/2, s*0.85, s/2, s*0.1, p.accent, lw)
+    x0, y0, x1, y1 = s*0.50, s*0.82, s*0.50, s*0.14
+    _dash(d, x0, y0, x1, y1, p.accent, lw)
+    tick = s * 0.08
+    for y in (y0, y1):
+        d.line([(x0 - tick, y), (x0 + tick, y)], fill=p.stroke, width=lw)
+    arrow(d, x0, y1 + s*0.04, x0, y1, p.accent, lw)
 
 @icon("point")
 def draw_point(d, cell, p):
@@ -384,74 +420,92 @@ def draw_csys(d, cell, p):
 
 @icon("origin")
 def draw_origin(d, cell, p):
-    """Part origin: short RGB axis stubs meeting at a highlighted dot."""
+    """Part origin: RGB stubs + faint default-plane corner at 0,0,0."""
     s = cell * SS
     lw = stroke_width(cell)
     cx, cy = s/2, s/2
     stub = s * 0.22
+    # faint corner of three default planes (distinct from ref_plane / ref_csys)
+    corner = [(cx - s*0.14, cy + s*0.10), (cx + s*0.06, cy - s*0.16), (cx + s*0.18, cy + s*0.04)]
+    d.polygon(corner, fill=_rgba(p.stroke, 22))
+    d.line(corner + [corner[0]], fill=_rgba(p.stroke, 90), width=max(1, lw//2))
     arrow(d, cx, cy, cx + stub, cy, p.err, lw)           # +X
     arrow(d, cx, cy, cx, cy - stub, p.ok, lw)            # +Y
     arrow(d, cx, cy, cx - stub * 0.7, cy + stub * 0.7, p.accent, lw)  # +Z
-    filled_circle(d, cx, cy, s * 0.07, p.accent)
+    filled_circle(d, cx, cy, s * 0.08, p.accent)
+    filled_circle(d, cx, cy, s * 0.04, p.stroke)
 
 @icon("equations")
 def draw_equations(d, cell, p):
-    """'=' sign with small 'f(x)' letters implied — just two horizontal bars."""
+    """Parametric relation: Σ variable = expression."""
     s = cell * SS
-    lw = stroke_width(cell) * 2
-    y1, y2 = s*0.40, s*0.60
-    d.line([(s*0.2, y1), (s*0.8, y1)], fill=p.stroke, width=lw)
-    d.line([(s*0.2, y2), (s*0.8, y2)], fill=p.stroke, width=lw)
-    # small vertical on left = 'f'
-    d.line([(s*0.25, s*0.2), (s*0.25, s*0.8)], fill=p.accent, width=lw)
+    lw = stroke_width(cell)
+    # Sigma glyph (left)
+    d.arc([s*0.10, s*0.22, s*0.34, s*0.78], start=200, end=340, fill=p.accent, width=lw*2)
+    d.line([(s*0.14, s*0.50), (s*0.30, s*0.50)], fill=p.accent, width=lw)
+    # equals bars (center)
+    y1, y2 = s*0.44, s*0.56
+    d.line([(s*0.38, y1), (s*0.62, y1)], fill=p.stroke, width=lw*2)
+    d.line([(s*0.38, y2), (s*0.62, y2)], fill=p.stroke, width=lw*2)
+    # D1 / D2 dimension chips (right)
+    for i, y in enumerate([s*0.28, s*0.68]):
+        d.rounded_rectangle([s*0.66, y, s*0.88, y + s*0.14], radius=int(s*0.03),
+                             fill=_rgba(p.accent, 40 if i else 28), outline=p.accent,
+                             width=max(1, lw//2))
 
 @icon("material")
 def draw_material(d, cell, p):
-    """Layered stack = material swatch."""
+    """Glossy material swatch sphere on a flat chip."""
     s = cell * SS
     lw = stroke_width(cell)
-    for i, frac in enumerate([0.25, 0.45, 0.65]):
-        y = s * frac
-        col = p.accent if i == 1 else p.stroke
-        d.rectangle([s*0.2, y, s*0.8, y + s*0.15], outline=col, width=lw)
+    d.rounded_rectangle([s*0.14, s*0.62, s*0.86, s*0.86], radius=int(s*0.04),
+                         fill=_rgba(p.stroke, 28), outline=p.stroke, width=lw)
+    cx, cy, r = s*0.50, s*0.42, s*0.28
+    filled_circle(d, cx, cy, r, _rgba(p.accent, 100))
+    circle(d, cx, cy, r, outline=p.stroke, lw=lw)
+    filled_circle(d, cx - r*0.30, cy - r*0.32, r*0.18, _rgba((255, 255, 255), 140))
+    d.arc([cx - r, cy - r, cx + r, cy + r], start=25, end=145,
+          fill=_rgba(p.stroke, 110), width=max(1, lw//2))
 
 @icon("mates_folder")
 def draw_mates_folder(d, cell, p):
-    """Folder outline with link symbol."""
+    """Folder with coincident mate constraint glyph."""
     s = cell * SS
     lw = stroke_width(cell)
-    # folder
     d.rounded_rectangle([s*0.1, s*0.3, s*0.9, s*0.82], radius=int(s*0.05),
                          outline=p.stroke, width=lw)
     d.rectangle([s*0.1, s*0.25, s*0.45, s*0.35], outline=p.stroke, width=lw)
-    # link circles inside
-    circle(d, s*0.42, s*0.58, s*0.09, outline=p.accent, lw=lw)
-    circle(d, s*0.62, s*0.58, s*0.09, outline=p.accent, lw=lw)
-    d.line([(s*0.51, s*0.58), (s*0.53, s*0.58)], fill=p.accent, width=lw)
+    # two facing faces + alignment arrows
+    d.line([(s*0.30, s*0.50), (s*0.30, s*0.72)], fill=p.stroke, width=lw)
+    d.line([(s*0.70, s*0.50), (s*0.70, s*0.72)], fill=p.stroke, width=lw)
+    arrow(d, s*0.38, s*0.61, s*0.46, s*0.61, p.accent, lw)
+    arrow(d, s*0.62, s*0.61, s*0.54, s*0.61, p.accent, lw)
+    filled_circle(d, s*0.50, s*0.61, lw*0.9, p.accent)
 
 @icon("body_folder")
 def draw_body_folder(d, cell, p):
-    """Folder with small solid body inside."""
+    """Folder with iso solid body inside."""
     s = cell * SS
     lw = stroke_width(cell)
     d.rounded_rectangle([s*0.1, s*0.3, s*0.9, s*0.82], radius=int(s*0.05),
                          outline=p.stroke, width=lw)
     d.rectangle([s*0.1, s*0.25, s*0.45, s*0.35], outline=p.stroke, width=lw)
-    # small rect body
-    d.rounded_rectangle([s*0.35, s*0.46, s*0.68, s*0.70],
-                         radius=int(s*0.04), outline=p.accent, width=lw)
+    shaded_prism(d, s, s*0.32, s*0.46, s*0.30, s*0.22, s*0.08, s*0.06, p, accent=True)
 
 @icon("history")
 def draw_history(d, cell, p):
-    """Clock/history: circle + arrow going counter-clockwise."""
+    """Vertical feature timeline with nodes."""
     s = cell * SS
     lw = stroke_width(cell)
-    cx, cy = s/2, s/2
-    r = s * 0.32
-    circle(d, cx, cy, r, outline=p.stroke, lw=lw)
-    arc_segment(d, cx, cy, r, 0, 270, p.accent, lw*2)
-    # arrow tip
-    d.line([(cx + r*0.05, cy - r), (cx - r*0.22, cy - r*0.6)], fill=p.accent, width=lw)
+    x = s * 0.46
+    d.line([(x, s*0.14), (x, s*0.86)], fill=_rgba(p.stroke, 120), width=max(1, lw//2))
+    for i, yf in enumerate([0.22, 0.42, 0.62, 0.78]):
+        y = s * yf
+        r = s * (0.07 if i == 0 else 0.055)
+        col = p.accent if i == 0 else p.stroke
+        filled_circle(d, x, y, r, _rgba(col, 90 if i == 0 else 55))
+        circle(d, x, y, r, outline=col, lw=lw)
+    arc_segment(d, x, s*0.22, s*0.22, 270, 360, p.accent, lw)
 
 @icon("rollback")
 def draw_rollback(d, cell, p):
@@ -811,13 +865,16 @@ def draw_mirror(d, cell, p):
 
 @icon("ref_plane")
 def draw_ref_plane(d, cell, p):
-    """Translucent datum plane (distinct from plane's normal-arrow glyph)."""
+    """Translucent datum plane with construction hatch (distinct from plane glyph)."""
     s = cell * SS
     lw = stroke_width(cell)
     pts = [(s*0.1, s*0.60), (s*0.45, s*0.22), (s*0.9, s*0.36), (s*0.55, s*0.74)]
     d.polygon(pts, fill=_rgba(p.accent, 35), outline=p.accent)
     d.line([pts[0], pts[1], pts[2], pts[3], pts[0]], fill=p.accent, width=lw)
-    # corner origin tick — reads as a construction datum at small sizes
+    for t in (0.2, 0.4, 0.6, 0.8):
+        d.line([(pts[0][0] + (pts[2][0]-pts[0][0])*t, pts[0][1] + (pts[2][1]-pts[0][1])*t),
+                (pts[1][0] + (pts[3][0]-pts[1][0])*t, pts[1][1] + (pts[3][1]-pts[1][1])*t)],
+               fill=_rgba(p.stroke, 95), width=max(1, lw//2))
     filled_circle(d, pts[0][0], pts[0][1], max(2, lw), p.stroke)
 
 @icon("ref_axis")
@@ -2650,9 +2707,13 @@ def draw_weld_end_cap(d, cell, p):
 
 @icon("ws_features")
 def draw_ws_features(d, cell, p):
-    """Workspace tab: Features — an extruded boss solid."""
+    """Workspace tab: Features — extruded boss with direction arrow."""
     s = cell * SS
+    lw = stroke_width(cell)
     shaded_prism(d, s, s * 0.22, s * 0.40, s * 0.42, s * 0.34, s * 0.18, s * 0.14, p, accent=True)
+    d.rounded_rectangle([s*0.18, s*0.68, s*0.58, s*0.82], radius=int(s*0.03),
+                         outline=p.stroke, width=max(1, lw//2))
+    arrow(d, s*0.40, s*0.66, s*0.40, s*0.22, p.accent, lw)
 
 @icon("ws_sketch")
 def draw_ws_sketch(d, cell, p):
@@ -2999,6 +3060,9 @@ def build_atlas(palette: Palette) -> tuple[Image.Image, dict]:
 
 
 def main():
+    fm_bad = validate_fm_manifest()
+    if fm_bad:
+        print("ERROR: FM_REFRESH_MANIFEST names not in CONTRACT_NAMES:", fm_bad)
     missing = check_coverage()
     if missing:
         print("ERROR: no draw function for:", missing)
@@ -3025,8 +3089,11 @@ def main():
     print(f"Wrote atlas_dark.png, atlas_light.png, atlas.json to {OUT_DIR}")
     print(f"  {len(CONTRACT_NAMES)} icons × {len(CELL_SIZES)} sizes = "
           f"{len(CONTRACT_NAMES)*len(CELL_SIZES)} cells")
+    print(f"  FM refresh manifest: {len(FM_REFRESH_MANIFEST)} glyphs")
     print(f"  Atlas dimensions: {atlas_w} × {atlas_h} px")
 
+    if fm_bad:
+        raise RuntimeError(f"FM manifest invalid: {fm_bad}")
     if missing:
         raise RuntimeError(f"Missing draw functions: {missing}")
 

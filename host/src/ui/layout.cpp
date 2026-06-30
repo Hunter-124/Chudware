@@ -136,10 +136,8 @@ static bool drawManagerTabButton(const char* id,
     bool clicked = ImGui::InvisibleButton("##lp_tab", ImVec2(btn, btn));
     bool hovered = ImGui::IsItemHovered();
 
-    ImU32 fill = 0;
-    if (selected) fill = ui::Palette::toU32(pal.ribbonTabActive);
-    else if (hovered) fill = ui::Palette::toU32(pal.buttonHovered);
-    if (fill) dl->AddRectFilled(p0, p1, fill, 7.0f * S);
+    if (selected || hovered)
+        ui::glassRowBackground(dl, p0, p1, 7.0f, false, selected);
 
     if (selected) {
         dl->AddRectFilled(ImVec2(p0.x, p0.y + 6.0f * S),
@@ -234,22 +232,6 @@ void drawLeftPane(AppState& st,
     if (!ImGui::IsWindowDocked())
         st.resetLayout = true;
 
-    // Full-panel liquid-glass chrome: shadow, translucent fill, shine gradient, border, specular.
-    // OPAQUE dark base FIRST, then the glass on top: the W2 full-bleed 3D is composited at full window
-    // width on the background draw list, so without a base it washed straight through this NoBackground
-    // pane's translucent glass and read as a muddy light-gray (~98,101,108). Painting windowBg solid
-    // first means the glass shine/border/specular now layer over a deep dark surface that matches the
-    // chrome band + dock tabs (windowBg) — clean frosted panel, no 3D bleed. The body child below paints
-    // NO fill of its own (transparent ChildBg). alpha must match the Copilot pane so the two read alike.
-    {
-        ImVec2 p0 = ImGui::GetWindowPos();
-        ImVec2 sz = ImGui::GetWindowSize();
-        ImVec2 p1(p0.x + sz.x, p0.y + sz.y);
-        ImDrawList* wdl = ImGui::GetWindowDrawList();
-        wdl->AddRectFilled(p0, p1, ui::Palette::toU32(ui::palette.windowBg));
-        ui::glassBackground(wdl, p0, p1, 0.0f, 0.38f);
-    }
-
     const auto& pal = ui::palette;
     const float S = ui::uiScale;
 
@@ -287,11 +269,6 @@ void drawLeftPane(AppState& st,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
     ImGui::PopStyleVar();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 rail0 = ImGui::GetWindowPos();
-    ImVec2 rail1(rail0.x + stripW, rail0.y + railH);
-    // Translucent glass rail: a faint wash so the panel's liquid-glass fill bleeds through.
-    float railWash[4]; ui::Palette::withAlpha(pal.headerBg, railWash, 0.14f);
-    dl->AddRectFilled(rail0, rail1, ui::Palette::toU32(railWash));
     // Center the square button in the rail. SetCursorPosX must be set PER button: ImGui resets X to
     // the line start after each Dummy, so a single SetCursorPos before the loop would only offset the
     // first icon (the others would snap to x=0), producing the off-center / zig-zag look.
@@ -355,8 +332,7 @@ void drawLeftPane(AppState& st,
     static bool s_bodyScrolled = false;
     const float bodyPad = 12.0f * S;
     const float sbSize  = 8.0f * S;
-    // Transparent body — the pane's single glass fill (above) is the only background, so the body
-    // does NOT stack a second translucent layer on top of it (that double-fill was the muddy look).
+    // Transparent body — row-level glass pills only; viewport shows through gaps.
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(bodyPad, ImGui::GetStyle().WindowPadding.y));
@@ -374,6 +350,7 @@ void drawLeftPane(AppState& st,
     const float localCur = ImGui::GetCursorPosX();
     const float titleX = std::max(localCur,
         localCur + (paneCenterX - groupW * 0.5f - ImGui::GetCursorScreenPos().x));
+    ui::glassRowAtCursor(4.0f, false, false, 6.0f);
     ImGui::SetCursorPosX(titleX);
     if (headIcon.valid) {
         ImGui::Image(headIcon.texId, ImVec2(iconSz, iconSz), headIcon.uv0, headIcon.uv1);
@@ -429,7 +406,7 @@ void drawLeftPane(AppState& st,
     if (bodyIndented) ImGui::Unindent(sbSize);
     ImGui::EndChild();
     ImGui::PopStyleVar(2);   // WindowPadding + ScrollbarSize pushed before the body child
-    ImGui::PopStyleColor();  // ChildBg = glassBg
+    ImGui::PopStyleColor();  // ChildBg transparent
 
     ImGui::End();
 }

@@ -136,8 +136,9 @@ static bool drawManagerTabButton(const char* id,
     bool clicked = ImGui::InvisibleButton("##lp_tab", ImVec2(btn, btn));
     bool hovered = ImGui::IsItemHovered();
 
-    if (selected || hovered)
-        ui::glassRowBackground(dl, p0, p1, 7.0f, false, selected);
+    // Persistent subtle frosted pill on every rail tab; stronger when selected or hovered.
+    const float wash = selected ? 0.40f : (hovered ? 0.32f : 0.20f);
+    ui::glassRowBackground(dl, p0, p1, 7.0f, false, selected, wash);
 
     if (selected) {
         dl->AddRectFilled(ImVec2(p0.x, p0.y + 6.0f * S),

@@ -29,8 +29,8 @@ void drawActivityRail(AppState& s, float width) {
         bool act = (s.railTab == i);
         if (ImGui::InvisibleButton("r", ImVec2(btn, btn))) s.railTab = i;
         bool hov = ImGui::IsItemHovered();
-        if (act || hov)
-            theme::glassRowBackground(dl, p, ImVec2(p.x+btn, p.y+btn), 8*S, false, act);
+        const float wash = act ? 0.40f : (hov ? 0.32f : 0.20f);
+        theme::glassRowBackground(dl, p, ImVec2(p.x+btn, p.y+btn), 8*S, false, act, wash);
         if (act) dl->AddRectFilled(ImVec2(p.x-6*S, p.y+btn*0.2f), ImVec2(p.x-6*S+3*S, p.y+btn*0.8f), TCOL(accent), 2*S);
         icons::draw(dl, rails[i].icon, ImVec2(p.x+btn*0.5f, p.y+btn*0.5f), btn*0.5f, act?TCOL(txt0):TCOL(txt1));
         if (hov) ImGui::SetTooltip("%s", rails[i].tip);

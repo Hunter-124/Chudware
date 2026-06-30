@@ -72,7 +72,14 @@ static void treeIcon(const char* name, const char* fallback, float size = 16.0f,
 // Frosted row pill at the current cursor (full content width). Stripe index advances per call.
 static int s_fmStripeIdx = 0;
 static void fmRowPill(bool selected = false) {
-    ui::glassRowAtCursor(3.5f, (s_fmStripeIdx++ % 2) == 0, selected, 5.0f);
+    const float S = ui::uiScale;
+    const float rowH = ImGui::GetFrameHeightWithSpacing();
+    ImVec2 rowMin = ImGui::GetCursorScreenPos();
+    float availW = ImGui::GetContentRegionAvail().x;
+    ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
+    const float wash = selected ? 0.42f : 0.26f;
+    ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, 3.5f,
+                           (s_fmStripeIdx++ % 2) == 0, selected, wash);
 }
 
 // ---- Solid Bodies visibility helper ----
@@ -1356,11 +1363,13 @@ static bool toolbarIconBtn(const char* id, const char* iconName, const char* too
     float btn = 24.0f * ui::uiScale;
     ImGui::PushID(id);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    // Always-on subtle pill; stronger wash on hover (draw-only — must not affect hit-test).
+    ui::glassRowBackground(dl, p0, ImVec2(p0.x + btn, p0.y + btn), 3.0f, false, false, 0.22f);
     bool clicked = ImGui::InvisibleButton("##tb", ImVec2(btn, btn)) && enabled;
     bool hov = ImGui::IsItemHovered();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
     if (hov && enabled)
-        ui::glassRowBackground(dl, p0, ImVec2(p0.x + btn, p0.y + btn), 3.0f, false, false);
+        ui::glassRowBackground(dl, p0, ImVec2(p0.x + btn, p0.y + btn), 3.0f, false, false, 0.38f);
     IconUV iv = getIcon(iconName, 20);
     float iz = 18.0f * ui::uiScale, off = (btn - iz) * 0.5f;
     ImU32 tint = enabled ? IM_COL32(255,255,255,255) : IM_COL32(128,128,128,150);
@@ -1714,18 +1723,32 @@ static bool fm_icontains(const char* hay, const char* needle) {
 static void drawFeatureManagerTopStrip(AppState& st) {
     const auto& pal = ui::palette;
     bool canDoc = st.workerStarted && !st.job.running.load();
+    const float S = ui::uiScale;
 
     // W5C: the old tree/Properties/Configurations stub tabs were removed here — they were visual
     // decoration that duplicated the real vertical tab strip in the LeftPane container (layout.cpp
     // drawLeftPane). This strip now hosts only the functional document toolbar + "Name & group".
-    // --- centered document toolbar (first item on the line, so position it absolutely) ---
-    ui::glassRowAtCursor(3.5f, false, false, 8.0f);
-    float nBtns = 6.0f, gap = 2.0f * ui::uiScale, bw = 24.0f * ui::uiScale;
-    float toolW = nBtns * bw + (nBtns - 1) * gap;
-    float startX = ImGui::GetCursorPosX();
-    float availX = ImGui::GetContentRegionAvail().x;
-    ImGui::SetCursorPosX(startX + std::max(0.0f, (availX - toolW) * 0.5f));
-    if (toolbarIconBtn("fm_new", "new_doc", "New Part", canDoc) && canDoc) {
+    // --- centered document toolbar ---
+    // glassRowAtCursor is draw-only and does not advance the layout cursor. Without an explicit
+    // row reservation the full-width filter InputText below was placed at the same Y and stole
+    // clicks from undo/redo (and the rest of the toolbar).
+    const float bw = 24.0f * S, gap = 2.0f * S, nBtns = 6.0f;
+    const float toolW = nBtns * bw + (nBtns - 1) * gap;
+    ImVec2 toolRowMin = ImGui::GetCursorScreenPos();
+    const float availW = ImGui::GetContentRegionAvail().x;
+    ui::glassRowBackground(ImGui::GetWindowDrawList(), toolRowMin,
+                           ImVec2(toolRowMin.x + availW, toolRowMin.y + bw),
+                           3.5f, false, false, 0.24f);
+    float bx = toolRowMin.x + std::max(0.0f, (availW - toolW) * 0.5f);
+    const float by = toolRowMin.y;
+    auto toolBtn = [&](const char* id, const char* icon, const char* tip, bool en) -> bool {
+        ImGui::SetCursorScreenPos(ImVec2(bx, by));
+        bool hit = toolbarIconBtn(id, icon, tip, en);
+        bx += bw + gap;
+        return hit;
+    };
+    ImGui::PushID("fm_toolbar");
+    if (toolBtn("fm_new", "new_doc", "New Part", canDoc) && canDoc) {
         std::string err;
         // Multi-document: New Part opens a NEW tab (it does not replace the current doc). The
         // worker registry keeps the previous doc alive; addDocTab records this one and activates it.
@@ -1739,8 +1762,7 @@ static void drawFeatureManagerTopStrip(AppState& st) {
         }
         else st.addLog("[err] new part: " + err);
     }
-    ImGui::SameLine(0, gap);
-    if (toolbarIconBtn("fm_newasm", "assembly", "New Assembly", canDoc) && canDoc) {
+    if (toolBtn("fm_newasm", "assembly", "New Assembly", canDoc) && canDoc) {
         std::string err;
         st.suppressTabDirty = true;
         bool ok = st.docMirror.newAssembly(st.worker, err);
@@ -1752,19 +1774,18 @@ static void drawFeatureManagerTopStrip(AppState& st) {
             st.showRibbon = true; st.ribbonTab = AppState::RT_Assembly;
         } else st.addLog("[err] new assembly: " + err);
     }
-    ImGui::SameLine(0, gap);
-    if (toolbarIconBtn("fm_open", "open", "Open...", canDoc) && canDoc)
+    if (toolBtn("fm_open", "open", "Open...", canDoc) && canDoc)
         doOpenDoc(st);   // C41: native dialog -> DocMirror::open -> viewport refresh
-    ImGui::SameLine(0, gap);
     bool canSave = canDoc && st.docMirror.hasDoc();
-    if (toolbarIconBtn("fm_save", "save", "Save  (Shift-click: Save As...)", canSave) && canSave)
+    if (toolBtn("fm_save", "save", "Save  (Shift-click: Save As...)", canSave) && canSave)
         doSaveDoc(st, /*forceDialog=*/ImGui::GetIO().KeyShift);   // C41
-    ImGui::SameLine(0, gap);
     // W1-B (item 4): route through the shared AppState helper so the toolbar buttons and the global
     // Ctrl+Z / Ctrl+Y keys take the identical path (mesh refresh + owner map + confirmation toast).
-    if (toolbarIconBtn("fm_undo", "undo", "Undo", canDoc) && canDoc) st.docUndo();
-    ImGui::SameLine(0, gap);
-    if (toolbarIconBtn("fm_redo", "redo", "Redo", canDoc) && canDoc) st.docRedo();
+    if (toolBtn("fm_undo", "undo", "Undo", canDoc) && canDoc) st.docUndo();
+    if (toolBtn("fm_redo", "redo", "Redo", canDoc) && canDoc) st.docRedo();
+    ImGui::PopID();
+    ImGui::SetCursorScreenPos(ImVec2(toolRowMin.x, toolRowMin.y + bw));
+    ImGui::Dummy(ImVec2(availW, 0));
 
     // --- "Name & group" — auto-name features SolidWorks-style and sort into folders. ---
     // Shown only for a part doc that actually has features (not assemblies / empty docs).
@@ -1780,7 +1801,14 @@ static void drawFeatureManagerTopStrip(AppState& st) {
         ImGui::Spacing();
         bool can = canDoc;
         if (!can) ImGui::BeginDisabled();
-        ui::glassRowAtCursor(3.5f, true, false, 6.0f);
+        {
+            const float rowH = ImGui::GetFrameHeight();
+            ImVec2 rowMin = ImGui::GetCursorScreenPos();
+            float rowW = ImGui::GetContentRegionAvail().x;
+            ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin,
+                                   ImVec2(rowMin.x + rowW, rowMin.y + rowH),
+                                   3.5f, true, false, 0.28f);
+        }
         ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.accentSoft));
         if (ImGui::Button("Name & group features", ImVec2(-1, 0)) && can)
             nameAndGroupFeatures(st);
@@ -1792,9 +1820,19 @@ static void drawFeatureManagerTopStrip(AppState& st) {
     }
 
     ImGui::Spacing();
-    ui::glassRowAtCursor(3.5f, false, false, 6.0f);
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##fm_filter", "Filter features...", s_fmFilter, sizeof(s_fmFilter));
+    {
+        const float filterH = ImGui::GetFrameHeight();
+        ImVec2 fMin = ImGui::GetCursorScreenPos();
+        const float fW = ImGui::GetContentRegionAvail().x;
+        ui::glassRowBackground(ImGui::GetWindowDrawList(), fMin,
+                               ImVec2(fMin.x + fW, fMin.y + filterH),
+                               3.5f, false, false, 0.24f);
+        ImGui::SetCursorScreenPos(fMin);
+        ImGui::SetNextItemWidth(fW);
+        ImGui::InputTextWithHint("##fm_filter", "Filter features...", s_fmFilter, sizeof(s_fmFilter));
+        ImGui::SetCursorScreenPos(ImVec2(fMin.x, fMin.y + filterH));
+        ImGui::Dummy(ImVec2(0, 0));
+    }
 
     ImGui::Separator();
 }
@@ -2363,7 +2401,8 @@ void drawFeatureTreeBody(AppState& st,
                         ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
                         ImDrawList* rowDl = ImGui::GetWindowDrawList();
                         // Readable row pill via shared glass helper (panel stays transparent).
-                        ui::glassRowBackground(rowDl, rowMin, rowMax, 3.5f, rowIdx % 2 == 0, sel);
+                        ui::glassRowBackground(rowDl, rowMin, rowMax, 3.5f, rowIdx % 2 == 0, sel,
+                                               sel ? 0.42f : 0.26f);
                         // Category color strip: ~3px vertical bar on the far-left edge.
                         // Colored by feature group (sketch/solid-add/solid-cut/dress-up/pattern/
                         // datum/sheet-metal/weldment/surface) so each family is instantly scannable.

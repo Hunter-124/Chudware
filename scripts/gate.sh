@@ -37,7 +37,7 @@ record() { SUMMARY+=("$1"); }   # arg: "STAGE  RESULT  detail"
 
 # ---- Stage 1: stdlib gate ---------------------------------------------------
 stage_check() {
-    echo "=== [1/4] scripts/check.py (stdlib gate) ==="
+    echo "=== [1/6] scripts/check.py (stdlib gate) ==="
     if python3 scripts/check.py > /tmp/gate_check.out 2>&1; then
         record "check.py            PASS    all stdlib gates green"
         echo "  PASS"
@@ -70,7 +70,7 @@ find_occt_config() {
 
 # ---- Stage 2: core CMake/Ninja build ----------------------------------------
 stage_core_build() {
-    echo "=== [2/4] core CMake/Ninja build (libaicad, AICAD_WITH_OCCT=ON) ==="
+    echo "=== [2/6] core CMake/Ninja build (libaicad, AICAD_WITH_OCCT=ON) ==="
     if ! command -v cmake >/dev/null 2>&1; then
         record "core build          SKIP    cmake not on PATH"
         echo "  SKIP: cmake not installed"
@@ -107,7 +107,7 @@ stage_core_build() {
 
 # ---- Stage 2b: ui/abstract build + test -------------------------------------
 stage_ui_abstract() {
-    echo "=== [2b/5] ui/abstract build + ctest ==="
+    echo "=== [2b/6] ui/abstract build + ctest ==="
     if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
         record "ui/abstract         SKIP    cmake or ninja not on PATH"
         echo "  SKIP: cmake/ninja missing"
@@ -127,7 +127,7 @@ stage_ui_abstract() {
 
 # ---- Stage 3: ctest (core) -------------------------------------------------
 stage_ctest() {
-    echo "=== [3/5] ctest (core) ==="
+    echo "=== [3/6] ctest (core) ==="
     if [ "${CORE_BUILD_OK:-0}" -ne 1 ]; then
         record "ctest               SKIP    core build did not succeed"
         echo "  SKIP: no core build"
@@ -152,7 +152,7 @@ stage_ctest() {
 
 # ---- Stage 4: engine + agent pytest -----------------------------------------
 stage_pytest() {
-    echo "=== [4/5] engine + agent pytest ==="
+    echo "=== [4/6] engine + agent pytest ==="
     local venv_py=""
     for cand in runtime/venv/bin/python .venv/bin/python venv/bin/python; do
         [ -x "$cand" ] && { venv_py="$cand"; break; }
@@ -179,6 +179,63 @@ stage_pytest() {
     echo "  PASS"
 }
 
+# ---- Stage 5: ui/imgui (AI-CAD2) build + --shot smoke -----------------------
+stage_ui_imgui() {
+    echo "=== [5/6] ui/imgui build + AI-CAD2 --shot smoke ==="
+    if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
+        record "ui/imgui             SKIP    cmake or ninja not on PATH"
+        echo "  SKIP: cmake/ninja missing"
+        return 0
+    fi
+    local build_dir="build/linux-app"
+    if ! CCACHE_DISABLE=1 cmake --preset linux-app > /tmp/gate_app_cfg.out 2>&1; then
+        record "ui/imgui             FAIL    cmake configure (see /tmp/gate_app_cfg.out)"
+        echo "  FAIL: configure"; tail -n 15 /tmp/gate_app_cfg.out | sed 's/^/    /'
+        fail_fatal=1
+        return 0
+    fi
+    if ! CCACHE_DISABLE=1 cmake --build "$build_dir" --config Release > /tmp/gate_app_build.out 2>&1; then
+        record "ui/imgui             FAIL    cmake build (see /tmp/gate_app_build.out)"
+        echo "  FAIL: build"; tail -n 20 /tmp/gate_app_build.out | sed 's/^/    /'
+        fail_fatal=1
+        return 0
+    fi
+    local bin="$build_dir/bin/AI-CAD2"
+    if [ ! -x "$bin" ]; then
+        record "ui/imgui             FAIL    AI-CAD2 binary missing at $bin"
+        echo "  FAIL: missing $bin"
+        fail_fatal=1
+        return 0
+    fi
+    local shot="/tmp/aicad2-gate-shot.png"
+    local shot_cmd="AI_CAD_NO_FILE_DIALOGS=1 \"$bin\" --shot \"$shot\" --frames 12"
+    if [ -z "${DISPLAY:-}" ] && command -v xvfb-run >/dev/null 2>&1; then
+        shot_cmd="xvfb-run -a $shot_cmd"
+    fi
+    if ! eval "$shot_cmd" > /tmp/gate_app_shot.out 2>&1; then
+        record "ui/imgui             FAIL    --shot smoke (see /tmp/gate_app_shot.out)"
+        echo "  FAIL: --shot"; tail -n 15 /tmp/gate_app_shot.out | sed 's/^/    /'
+        fail_fatal=1
+        return 0
+    fi
+    if [ "${CORE_BUILD_OK:-0}" -eq 1 ] && [ -f "core/build-linux/bin/libaicad.so" ]; then
+        local self_cmd="AI_CAD_NO_FILE_DIALOGS=1 \"$bin\" --selftest"
+        if [ -z "${DISPLAY:-}" ] && command -v xvfb-run >/dev/null 2>&1; then
+            self_cmd="xvfb-run -a $self_cmd"
+        fi
+        if eval "$self_cmd" > /tmp/gate_app_selftest.out 2>&1; then
+            record "ui/imgui             PASS    build + --shot + --selftest"
+            echo "  PASS (build + shot + selftest)"
+        else
+            record "ui/imgui             PASS    build + --shot (--selftest FAIL, see /tmp/gate_app_selftest.out)"
+            echo "  PASS (build + shot; selftest failed — non-fatal)"
+        fi
+    else
+        record "ui/imgui             PASS    build + --shot smoke"
+        echo "  PASS (build + shot)"
+    fi
+}
+
 # ---- main -------------------------------------------------------------------
 CORE_BUILD_OK=0
 stage_check
@@ -186,6 +243,7 @@ stage_core_build
 stage_ui_abstract
 stage_ctest
 stage_pytest
+stage_ui_imgui
 
 echo
 echo "============================================================"

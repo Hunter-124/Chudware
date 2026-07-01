@@ -14,10 +14,7 @@
 #include <vector>
 
 #include "aicm_loader.h"
-// renderer.h has not been ported to ui/viewport/ yet (that's a separate migration item per
-// ui/viewport/AGENTS.md's "Owns: renderer.*, mesh.*"); reach back into host/src/ for
-// Renderer::CameraXform until it lands here. Update this include when renderer.h moves.
-#include "../../../host/src/renderer.h"
+#include "../renderer.h"
 
 namespace render {
 

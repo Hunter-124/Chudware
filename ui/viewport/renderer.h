@@ -11,6 +11,27 @@
 #include "vec_math.h"
 #include "mesh.h"
 
+// Framework-neutral screen helpers (no ImGui). Origin is top-left of the viewport image rect.
+struct ViewportScreen {
+    float originX = 0.f;
+    float originY = 0.f;
+};
+struct ScreenPt {
+    float x = 0.f;
+    float y = 0.f;
+};
+struct ViewportRect {
+    float x0 = 0.f, y0 = 0.f, x1 = 0.f, y1 = 0.f;
+};
+
+// Kawase-blurred backdrop for liquid-glass UI (GLASS_DESIGN_SPEC §5). UVs map the full viewport.
+struct ViewportBackdrop {
+    std::uintptr_t textureId = 0;
+    float uvMin[2] = {0.f, 0.f};
+    float uvMax[2] = {1.f, 1.f};
+    bool valid() const { return textureId != 0; }
+};
+
 // Display style for the shaded pass (SolidWorks "Display Style" toolbar).
 enum class DisplayStyle {
     Shaded,               // faces only, no feature edges
@@ -242,6 +263,12 @@ public:
         return index < subs_.size() && subs_[index].visible;
     }
 
+    // ---- F1: glass backdrop + adaptive contrast ----
+    // Kawase-blurred copy of the resolved color buffer (updated when resolveColorTexture runs).
+    ViewportBackdrop backdrop() const;
+    // Mean relative luminance (Rec.709) under rect in top-left viewport coordinates.
+    float averageLuminance(const ViewportRect& rect) const;
+
 private:
     // GPU buffers for one body.
     struct Sub {
@@ -273,14 +300,23 @@ private:
     void buildLut();              // C19: build the SW-style jet LUT texture (lazy)
     void uploadDeformed(Sub& s);  // C19: re-upload displaced positions for the current scale
     void resolveColorTexture() const;  // SS colorTex_ -> final-size resolvedTex_ by box filter
+    void updateBackdropBlur() const;   // resolvedTex_ -> quarter-res Kawase blur chain
 
     static constexpr int SS = 3;  // supersample factor for anti-aliasing (3x for crisp thin edges)
+    static constexpr int kBlurPasses = 4;  // 4-tap Kawase passes (GLASS_DESIGN_SPEC)
     int w_ = 0, h_ = 0;           // final size
     int sw_ = 0, sh_ = 0;         // supersampled size
     unsigned int fbo_ = 0, colorTex_ = 0, depthRbo_ = 0;
     mutable unsigned int resolveFbo_ = 0, resolvedTex_ = 0;
     unsigned int resolveProg_ = 0;
     mutable bool resolvedDirty_ = true;
+    // Kawase blur chain: downsample resolved color to ¼ res, then ping-pong blur passes.
+    mutable unsigned int blurDownFbo_ = 0, blurDownTex_ = 0;
+    mutable unsigned int blurPingFbo_[2] = {0, 0};
+    mutable unsigned int blurPingTex_[2] = {0, 0};
+    unsigned int downsampleProg_ = 0, kawaseProg_ = 0;
+    mutable int blurW_ = 0, blurH_ = 0;
+    mutable bool backdropDirty_ = true;
     // C27-D: dedicated small offscreen target for the View Selector preview thumbnail. Lazily
     // allocated on the first renderThumbnail() call; reallocated only when the requested px changes.
     unsigned int thumbFbo_ = 0, thumbTex_ = 0, thumbDepth_ = 0;
@@ -346,3 +382,10 @@ private:
     bool framingFrozen_ = false;   // when true, setMeshes() keeps center_/radius_ (no re-frame)
     unsigned int lutTex_ = 0;  // 256x1 RGB jet ramp
 };
+
+// Project world -> screen pixels inside [screen.origin, screen.origin+(vw,vh)]. Image is V-flipped.
+bool worldToScreen(const Renderer::CameraXform& cam, const ViewportScreen& screen, int vw, int vh,
+                   float wx, float wy, float wz, ScreenPt& out);
+// Unproject cursor to a world-space ray (near-plane origin + normalized direction).
+bool screenRay(const Renderer::CameraXform& cam, const ViewportScreen& screen, int vw, int vh,
+               ScreenPt mouse, Vec3& outOrig, Vec3& outDir);

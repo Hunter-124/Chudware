@@ -1,13 +1,11 @@
-// Design tokens — the single source of color/spacing/shape for the new GUI.
-// Dark-first with a light variant. See app/DESIGN.md §7.
+// Design tokens — single source of color/spacing/shape for the unified GUI shell.
+// Panels read tokens only; no literal ImVec4/IM_COL32 in ui/imgui/src/ui/**.
+// See docs/GLASS_DESIGN_SPEC.md.
 #pragma once
-// NOTE: MSVC 14.44's <cmath> no longer self-includes <math.h> and relies on the C math
-// functions (acosf/sinf/...) already being in the global namespace. Include <math.h> first
-// so every TU that funnels through this header gets a working <cmath>.
 #include <math.h>
 #include <cmath>
 #include "imgui.h"
-#include "imgui_internal.h"   // ImMax/ImMin/ImClamp/ImLerp/ImRect used across the UI
+#include "imgui_internal.h"
 
 namespace theme {
 
@@ -16,54 +14,125 @@ inline ImU32  rgba(unsigned int hex) { return IM_COL32((hex>>24)&0xFF,(hex>>16)&
 inline ImVec4 vec (unsigned int hex) {
     return ImVec4(((hex>>24)&0xFF)/255.f,((hex>>16)&0xFF)/255.f,((hex>>8)&0xFF)/255.f,(hex&0xFF)/255.f);
 }
+inline ImVec4 roleVec(unsigned int hex, float alphaMul = 1.f) {
+    ImVec4 v = vec(hex);
+    v.w *= alphaMul;
+    return v;
+}
+inline ImU32 roleU32(unsigned int hex, float alphaMul = 1.f) {
+    return ImGui::ColorConvertFloat4ToU32(roleVec(hex, alphaMul));
+}
+inline ImU32 roleU32A(unsigned int hex, float a) {
+    ImVec4 v = vec(hex);
+    v.w = a;
+    return ImGui::ColorConvertFloat4ToU32(v);
+}
 
-// The full palette. Swapping this struct swaps the whole theme — no widget ever
-// hardcodes a color; it reads a token here (the old code's per-widget-color bug is designed out).
+// iOS UIBlurEffect material semantics (docs/GLASS_DESIGN_SPEC.md §2).
+enum class MaterialLevel { UltraThin, Thin, Regular, Thick };
+
+struct MaterialToken {
+    float tintAlpha;   // translucent wash alpha over backdrop
+    int   blurPasses;  // Kawase passes (F1 viewport); unused when no backdrop
+};
+
+inline MaterialToken materialToken(MaterialLevel m) {
+    switch (m) {
+    case MaterialLevel::UltraThin: return {0.12f, 2};
+    case MaterialLevel::Thin:      return {0.22f, 3};
+    case MaterialLevel::Regular:   return {0.35f, 4};
+    case MaterialLevel::Thick:     return {0.52f, 5};
+    }
+    return {0.35f, 4};
+}
+
+// Named palette roles — swap the struct to swap the whole theme.
 struct Palette {
     // surfaces (deepest -> raised)
     unsigned int bg0, bg1, bg2, bg3, hover, active, line;
     // text
     unsigned int txt0, txt1, txt2;
     // semantic
-    unsigned int accent, accentDim, good, warn, bad;
+    unsigned int accent, accentDim, accentSoft, accentMid, good, warn, bad;
     // viewport clear
-    unsigned int viewport0, viewport1;   // gradient top/bottom
+    unsigned int viewport0, viewport1;
+    // glass (5-layer glassBackground + row pills)
+    unsigned int glassBg, glassBorder, glassHighlight, glassShadow;
+    // vibrancy text over glass (light-on-dark viewport vs dark-on-bright bleed)
+    unsigned int vibrancyLightPrimary, vibrancyLightSecondary, vibrancyLightTertiary;
+    unsigned int vibrancyDarkPrimary,  vibrancyDarkSecondary,  vibrancyDarkTertiary;
 };
 
 inline Palette darkPalette() {
     Palette p{};
-    p.bg0=0x0E1116FF; p.bg1=0x151A21FF; p.bg2=0x1C232CFF; p.bg3=0x232C37FF;
-    p.hover=0x2A333EFF; p.active=0x313C49FF; p.line=0x2C3744FF;
-    p.txt0=0xE6EAF0FF; p.txt1=0x9AA7B5FF; p.txt2=0x5E6B7AFF;
-    p.accent=0x4C8DFFFF; p.accentDim=0x2E4A78FF;
-    p.good=0x46C08DFF; p.warn=0xE2B33EFF; p.bad=0xE5604DFF;
-    p.viewport0=0x222A33FF; p.viewport1=0x141A20FF;
+    p.bg0=0x15171CFF; p.bg1=0x181C24FF; p.bg2=0x1E2430FF; p.bg3=0x252D3AFF;
+    p.hover=0x2E3848FF; p.active=0x364252FF; p.line=0x2A3444D9;
+    p.txt0=0xE5EAF0FF; p.txt1=0x9EA8B8FF; p.txt2=0x788596FF;
+    p.accent=0x2DD4BFFF; p.accentDim=0x1E8D7FFF; p.accentSoft=0x2DD4BF38; p.accentMid=0x2DD4BF66;
+    p.good=0x2DD4BFFF; p.warn=0xF3C26BFF; p.bad=0xF58C6BFF;
+    p.viewport0=0xF4F6F9FF; p.viewport1=0xEEF0F3FF;
+    // host dark glass roles (ui_theme.cpp fillDark)
+    p.glassBg=0x1E222BDE; p.glassBorder=0x3B465DCC; p.glassHighlight=0xFFFFFF17; p.glassShadow=0x00000066;
+    p.vibrancyLightPrimary=0xE5EAF0FF; p.vibrancyLightSecondary=0xB8C2D0FF; p.vibrancyLightTertiary=0x8A96A8FF;
+    p.vibrancyDarkPrimary=0x1E2332FF;  p.vibrancyDarkSecondary=0x3D4654FF;  p.vibrancyDarkTertiary=0x5C6678FF;
     return p;
 }
 
 inline Palette lightPalette() {
     Palette p{};
-    p.bg0=0xF4F6F9FF; p.bg1=0xFBFCFDFF; p.bg2=0xFFFFFFFF; p.bg3=0xEDF1F5FF;
-    p.hover=0xE6ECF2FF; p.active=0xDCE5EEFF; p.line=0xD7DEE6FF;
-    p.txt0=0x1B232CFF; p.txt1=0x5A6776FF; p.txt2=0x95A1AEFF;
-    p.accent=0x2F73E8FF; p.accentDim=0xBFD3F5FF;
-    p.good=0x1F9D6BFF; p.warn=0xC68A12FF; p.bad=0xCE4632FF;
-    p.viewport0=0xDDE4EBFF; p.viewport1=0xC3CDD7FF;
+    p.bg0=0xF5F5F5FF; p.bg1=0xFFFFFFFF; p.bg2=0xFAFAFAFF; p.bg3=0xE8E8E8FF;
+    p.hover=0xD4E4F7FF; p.active=0xBBD3F5FF; p.line=0xC7C7C7E6;
+    p.txt0=0x1E2332FF; p.txt1=0x5B626FFF; p.txt2=0x8F959EFF;
+    p.accent=0x0078D7FF; p.accentDim=0x005AA0FF; p.accentSoft=0x0078D72E; p.accentMid=0x0078D759;
+    p.good=0x0A9230FF; p.warn=0xC88C00FF; p.bad=0xD41E18FF;
+    p.viewport0=0xF4F6F9FF; p.viewport1=0xEEF0F3FF;
+    // host light glass roles
+    p.glassBg=0xF7F9FCEB; p.glassBorder=0x9EA6BAB8; p.glassHighlight=0xFFFFFF59; p.glassShadow=0x0000002E;
+    p.vibrancyLightPrimary=0xF5F7FAFF; p.vibrancyLightSecondary=0xD8DEE8FF; p.vibrancyLightTertiary=0xA8B0BCFF;
+    p.vibrancyDarkPrimary=0x1E2332FF;  p.vibrancyDarkSecondary=0x3D4654FF;  p.vibrancyDarkTertiary=0x5C6678FF;
     return p;
 }
+
+// 8pt spacing grid (logical px @1.0×; scale via theme::S() / theme::U()).
+struct Space {
+    float xs = 4.f;
+    float sm = 8.f;
+    float md = 16.f;
+    float lg = 24.f;
+    float xl = 32.f;
+};
+
+// SF-like type scale (logical px @1.0×).
+struct TypeScale {
+    float largeTitle = 22.f;
+    float title      = 17.f;
+    float headline   = 15.f;
+    float body       = 13.f;
+    float caption    = 11.f;
+    float mono       = 12.f;
+};
 
 // Geometry tokens (logical px @1.0×; scaled once at apply).
 struct Metrics {
     float titleBarH   = 38.f;
     float workspaceH  = 34.f;
-    float toolbarH    = 76.f;   // context toolbar (big tool buttons)
+    float toolbarH    = 76.f;
     float railW       = 48.f;
     float statusH     = 26.f;
-    float bigBtn      = 52.f;   // context toolbar button square
-    float rounding    = 6.f;
-    float roundingLg  = 10.f;
-    float grid        = 4.f;    // base spacing unit
+    float bigBtn      = 52.f;
+    float rounding    = 6.f;     // row pills
+    float roundingLg  = 10.f;    // panels
+    float grid        = 8.f;     // base spacing unit (was 4.f pre-F2)
+    Space   space;
+    TypeScale type;
 };
+
+// Row pill wash alphas (GLASS_DESIGN_SPEC §5 + host regression fix).
+namespace rowWash {
+    constexpr float idle     = 0.26f;
+    constexpr float hover    = 0.32f;
+    constexpr float selected = 0.42f;
+}
 
 // Motion tokens (seconds).
 namespace motion {
@@ -72,9 +141,7 @@ namespace motion {
     constexpr float entrance = 0.220f;
 }
 
-// easeOutCubic
 inline float easeOut(float t){ t=t<0?0:(t>1?1:t); float u=1-t; return 1-u*u*u; }
-// frame-rate independent exponential approach toward target (a = 1-exp(-dt/tau))
 inline float approach(float cur,float target,float dt,float tau=0.06f){
     float a = 1.f - std::exp(-dt/ (tau<1e-4f?1e-4f:tau));
     return cur + (target-cur)*a;

@@ -21,7 +21,7 @@
 #include <string>
 
 #include "bootstrap.h"
-#include "core/cpp_core.h"  // P16: route C++-backed documents in-process to libaicad
+#include "cpp_core.h"  // P16: route C++-backed documents in-process to libaicad
 
 using nlohmann::json;
 

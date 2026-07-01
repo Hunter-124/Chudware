@@ -1,4 +1,4 @@
-// AI-CAD (new GUI) entry point. GLFW + glad + Dear ImGui (docking) bootstrap.
+// AI-CAD2 entry point. GLFW + glad + Dear ImGui (docking) bootstrap.
 #define GLFW_INCLUDE_NONE
 #include <glad/gl.h>
 #include <GLFW/glfw3.h>
@@ -13,6 +13,11 @@
 #include "theme/theme.h"
 #include "theme/icons.h"
 
+#include <platform/dpi.h>
+#include <platform/paths.h>
+#include <platform/resources.h>
+#include <platform/window.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,23 +27,6 @@
 
 #ifdef _WIN32
 #  include <windows.h>
-static std::string exeDir() {
-    char buf[MAX_PATH]; DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    std::string p(buf, n);
-    size_t slash = p.find_last_of("\\/");
-    return slash == std::string::npos ? "." : p.substr(0, slash);
-}
-#else
-#  include <unistd.h>
-static std::string exeDir() {
-    char buf[4096];
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n <= 0) return ".";
-    buf[n] = '\0';
-    std::string p(buf, (size_t)n);
-    size_t slash = p.find_last_of('/');
-    return slash == std::string::npos ? "." : p.substr(0, slash);
-}
 #endif
 
 static void glfwErr(int code, const char* desc) { std::fprintf(stderr, "[glfw] %d: %s\n", code, desc); }
@@ -55,7 +43,6 @@ static void capturePNG(GLFWwindow* win, const char* path) {
 }
 
 int main(int argc, char** argv) {
-    // headless screenshot mode: --shot <path> [--frames N]
     const char* shotPath = nullptr; int shotFrames = 12; bool demo = false;
     const char* doCmd = nullptr; bool openPalette = false; bool sketch = false;
     bool selftest = false, picktest = false, shelltest = false, edgetest = false, extrudetest = false, apptest = false; bool light = false;
@@ -75,19 +62,16 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--light")) light = true;
     }
 
-    // If the core DLL location isn't set and isn't next to the exe, point at the dev build path.
-    // cpp_core tries AI_CAD_LIBAICAD first, then exe-dir, then default search — a missing dev
-    // path simply falls through, so this is safe on any machine.
 #if defined(AICAD_DEFAULT_LIBAICAD) && defined(_WIN32)
     if (!std::getenv("AI_CAD_LIBAICAD")) {
-        std::string side = exeDir() + "\\libaicad.dll";
+        std::string side = platform::joinPath(platform::exeDir(), "libaicad.dll");
         if (GetFileAttributesA(side.c_str()) == INVALID_FILE_ATTRIBUTES)
             _putenv_s("AI_CAD_LIBAICAD", AICAD_DEFAULT_LIBAICAD);
     }
 #endif
 
     glfwSetErrorCallback(glfwErr);
-    if (!glfwInit()) { std::fprintf(stderr, "glfwInit failed\n"); return 1; }
+    if (!platform::initGlfwPlatform()) { std::fprintf(stderr, "glfwInit failed\n"); return 1; }
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -95,10 +79,8 @@ int main(int argc, char** argv) {
 #ifdef __APPLE__
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
-    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);   // frameless: custom chrome (DESIGN.md §2)
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
-    if (shotPath) { glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE); glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_FALSE); }
-    else            glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
+    platform::applyBorderlessWindowHints(shotPath != nullptr);
 
     int winW = shotPath ? 1600 : 1480, winH = shotPath ? 1000 : 920;
     GLFWwindow* win = glfwCreateWindow(winW, winH, "AI-CAD", nullptr, nullptr);
@@ -110,26 +92,28 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "glad load failed\n"); return 1;
     }
 
-    // DPI scale
-    float xs = 1.f, ys = 1.f;
-    glfwGetWindowContentScale(win, &xs, &ys);
-    float scale = (xs > ys ? xs : ys);
-    if (const char* e = std::getenv("AI_CAD_SCALE")) { float v = (float)atof(e); if (v > 0.4f && v < 4.f) scale = v; }
-    if (scale < 0.5f) scale = 1.f;
+    const float scale = platform::contentScale(win, shotPath != nullptr);
+    const std::string res = platform::resourcesDir();
+    platform::setWindowIcon(win, platform::joinPath(res, "icons/logo_icon.png"));
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigWindowsMoveFromTitleBarOnly = true;
-    io.IniFilename = nullptr;   // we own the layout (DockBuilder)
+    static std::string iniPath = platform::imguiIniPath();
+    io.IniFilename = shotPath ? nullptr : iniPath.c_str();
 
-    const std::string res = exeDir() + "/resources";
     theme::init(res, scale, /*dark=*/!light);
     icons::initAtlas(res, /*dark=*/!light);
 
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 150");
+
+    static platform::WindowChromeLayout chromeLayout;
+    chromeLayout.titleBarHeight = (int)(theme::ctx().m.titleBarH * theme::S());
+    chromeLayout.resizeBorder = (int)(6.f * theme::S());
+    platform::installWindowChrome(win, &chromeLayout);
 
     app::Application application;
     application.init(win, res, scale);
@@ -138,13 +122,7 @@ int main(int argc, char** argv) {
         int rc = 2;
         if (!st.engineReady) { std::fprintf(stderr, "[selftest] FAIL: engine not ready (%s)\n", st.engine.lastError().c_str()); }
         else {
-#ifdef _WIN32
-            const char* tmp = std::getenv("TEMP");
-            std::string path = (tmp ? std::string(tmp) : std::string(".")) + "\\aicad2_selftest.step+";
-#else
-            const char* tmp = std::getenv("TMPDIR");
-            std::string path = (tmp ? std::string(tmp) : std::string("/tmp")) + "/aicad2_selftest.step+";
-#endif
+            std::string path = platform::joinPath(platform::tempDir(), "aicad2_selftest.step+");
             bool sv = st.engine.save(path);
             bool op = sv && st.engine.open(path);
             int nf = 0; const auto& t = st.engine.tree();
@@ -250,7 +228,6 @@ int main(int argc, char** argv) {
     }
 
     if (apptest) {
-        // End-to-end appearance: set_appearance op -> re-baked AICM -> scene reads the new look back.
         auto& st = application.state();
         int rc = 2;
         if (!st.engineReady || !st.scene) std::fprintf(stderr, "[apptest] FAIL: no engine/scene\n");
@@ -261,7 +238,7 @@ int main(int argc, char** argv) {
             uint32_t bid = st.scene->bodyIdAt(0);
             nlohmann::json ops = nlohmann::json::array();
             ops.push_back({ {"op","set_appearance"}, {"id", std::string("b") + std::to_string(bid)},
-                            {"color", {1.00, 0.78, 0.34}}, {"metallic", 1.0}, {"roughness", 0.25} });  // gold
+                            {"color", {1.00, 0.78, 0.34}}, {"metallic", 1.0}, {"roughness", 0.25} });
             eng::OpsResult r = st.engine.apply(ops);
             bool reloaded = r.ok && !st.engine.aicmPath().empty() && st.scene->loadAicm(st.engine.aicmPath());
             float c[3] = {0,0,0}; float m = -1, rough = -1;
@@ -286,11 +263,12 @@ int main(int argc, char** argv) {
     int frame = 0;
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
+        platform::tickWindowChrome(win, &chromeLayout);
         if (!shotPath && glfwGetWindowAttrib(win, GLFW_ICONIFIED)) { glfwWaitEventsTimeout(0.1); continue; }
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
-        ImGui::GetIO().DeltaTime = 1.f/60.f;   // deterministic stepping (esp. for --shot)
+        ImGui::GetIO().DeltaTime = 1.f/60.f;
         ImGui::NewFrame();
 
         application.frame();

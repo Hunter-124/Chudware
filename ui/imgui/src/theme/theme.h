@@ -1,6 +1,6 @@
-// Theme runtime: holds the active palette/metrics/scale + loaded fonts, maps the
-// palette onto ImGuiStyle, and rasterizes the Rubik/JetBrains fonts at DPI scale.
+// Theme runtime: palette/metrics/scale, ImGuiStyle mapping, liquid-glass draw helpers.
 #pragma once
+#include <cstdint>
 #include <string>
 #include "imgui.h"
 #include "theme/tokens.h"
@@ -11,7 +11,7 @@ enum class Font { Body, Label, H2, H1, Mono, Icon, _count };
 
 struct Ctx {
     Palette pal;
-    Metrics m;          // logical metrics (multiply by scale at use, like the old style guide §1)
+    Metrics m;
     float   scale = 1.f;
     bool    dark  = true;
     bool    reduceMotion = false;
@@ -20,30 +20,57 @@ struct Ctx {
 
 Ctx&      ctx();
 inline const Palette& pal() { return ctx().pal; }
-inline float S() { return ctx().scale; }                 // the one scale value
-inline float U(float n=1.f) { return n * ctx().m.grid * ctx().scale; }   // 4px grid unit
+inline float S() { return ctx().scale; }
+inline float U(float n = 1.f) { return n * ctx().m.grid * ctx().scale; }
 ImFont*   font(Font f);
 
-// Load fonts from <resourcesDir>/fonts at basePx*scale, then apply the theme. Call once after
-// ImGui context creation, before the first frame. resourcesDir is the staged resources/ folder.
 void init(const std::string& resourcesDir, float scale, bool dark);
-
-// Re-map the active palette onto ImGui::GetStyle() (colors) + ScaleAllSizes once. Call on theme/scale change.
 void apply();
-
-// Swap dark/light at runtime (re-applies colors; does NOT reload fonts).
 void setDark(bool dark);
 
-// Glass helpers — match host/ui_theme glassRowBackground; panels stay transparent.
+// ---- viewport backdrop (F1 Kawase blur; stub OK until wired) ----------------
+struct ViewportBackdrop {
+    std::uintptr_t textureId = 0;
+    ImVec2 uvMin{0.f, 0.f};
+    ImVec2 uvMax{1.f, 1.f};
+    bool valid() const { return textureId != 0; }
+};
+
+void setViewportBackdrop(const ViewportBackdrop& backdrop);
+const ViewportBackdrop& viewportBackdrop();
+
+// ---- adaptive contrast (GLASS_DESIGN_SPEC §5) ---------------------------------
+struct AdaptiveSurface {
+    ImVec4 tint;
+    ImVec4 textPrimary;
+    ImVec4 textSecondary;
+};
+
+AdaptiveSurface adaptiveSurface(float avgLuminance);
+
+// ---- liquid glass (ported from host/ui_theme.*) --------------------------------
+void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 8.f);
+void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, float alpha);
+
+void pushGlassTooltipStyle();
+void popGlassTooltipStyle();
+void pushGlassWindowStyle();
+void popGlassWindowStyle();
+void pushGlassChildStyle(float rounding = 8.f);
+void popGlassChildStyle();
+
 void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 4.f,
-                        bool stripe = false, bool selected = false, float washAlpha = 0.42f);
+                        bool stripe = false, bool selected = false,
+                        float washAlpha = rowWash::idle);
 void glassRowAtCursor(float rounding = 4.f, bool stripe = false, bool selected = false,
                       float rowPadV = 5.f);
-void glassRowAtCursor(float rounding = 4.f, bool stripe = false, bool selected = false,
-                      float rowPadV = 5.f);
+
+// Frosted panel over viewport (blur when backdrop valid) or layered fallback.
+// avgLuminance < 0 → skip adaptive tint (use palette defaults).
+void glassPanel(ImDrawList* dl, const ImRect& rect, MaterialLevel level,
+                float rounding = -1.f, float avgLuminance = -1.f, float alpha = 1.f);
 
 } // namespace theme
 
-// Shorthand: theme color as ImU32 / ImVec4 by palette field name.
 #define TCOL(field)  theme::rgba(theme::pal().field)
 #define TVEC(field)  theme::vec (theme::pal().field)

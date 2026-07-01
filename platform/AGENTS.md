@@ -1,16 +1,30 @@
 # platform — cross-OS shims
 
-**Owner:** P3 / N1a scaffold; grows as `host/` dies.
+**Owner:** F3 / G1 integrator. Portable replacements for OS-specific code in `host/`.
 
-Portable replacements for Windows-only code in `host/` (`win_chrome.cpp`,
-`%APPDATA%` paths, native file dialogs). The `app/src/platform/*` code lands
-here during the `app/` → `ui/imgui/` migration.
+## Public API (panels + shell include these — no `#ifdef _WIN32` outside this tree)
 
-## Write-set rules
-- No raw Win32 in new code — use GLFW + portable abstractions.
-- `userDataDir()` → `%APPDATA%` / `$XDG_CONFIG_HOME` / `~/Library/Application Support`.
-- File dialogs: nfd (Native File Dialog Extended).
+| Header | Purpose |
+|--------|---------|
+| `dialogs.h` | `saveFileDialog`, `openFileDialog`, `promptImportMeshAsSolid`, `fileDialogsDisabled` |
+| `window.h` | Borderless chrome: `installWindowChrome`, `tickWindowChrome`, GLFW init hints |
+| `paths.h` | `exeDir`, `appdataDir`, `appdataRoot`, `configPath`, `cacheDir`, `tempDir`, `resourcesDir` |
+| `resources.h` | `setWindowIcon` (PNG → GLFW icons) |
+| `dpi.h` | `readContentScale`, `applyScaleOverride` (AI_CAD_SCALE) |
+
+Implementations split by OS: `*_win32.cpp`, `*_linux.cpp`. Build via `platform/CMakeLists.txt` → static lib `aicad_platform`.
+
+## AI-CAD2 wrappers
+
+`ui/imgui/src/platform/file_dialog.*` — CAD-specific `openCadFile` / `saveCadFile` over `dialogs.h`.
+
+## Headless
+
+`AI_CAD_NO_FILE_DIALOGS=1` → all dialog calls return empty / -1 (CI / `--shot`).
 
 ## Migration source
-- `app/src/platform/file_dialog.*` (P3)
-- `host/src/win_chrome.cpp` logic → custom ImGui titlebar (P3/N4b)
+
+- `host/src/ui/file_dialog.*` → `dialogs_*`
+- `host/src/win_chrome.*` → `window_*`
+- `host/src/core/app_state.cpp` (`appdataDir`) + `host/src/bootstrap.cpp` (`exeDir`) → `paths_*`
+- `host/src/app.cpp` (GLFW scale + X11 hint) → `dpi.*` + `window.h`

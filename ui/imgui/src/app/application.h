@@ -3,6 +3,8 @@
 #include "viewport/scene.h"
 struct GLFWwindow;
 
+namespace aicad::viewport { class GlViewport; }
+
 namespace app {
 struct AppState;
 
@@ -14,8 +16,11 @@ public:
     AppState& state();
 private:
     void buildDockLayout(unsigned int dockspaceId);
+    void updateViewportBackdrop(AppState& s);
     bool layoutBuilt_ = false;
     viewport::Scene scene_;
+    aicad::viewport::GlViewport* glViewport_ = nullptr;
+    bool glViewportReady_ = false;
 };
 
 } // namespace app

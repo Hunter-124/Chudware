@@ -8,7 +8,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "math.h"
+#include "vec_math.h"
 #include "mesh.h"
 
 // Display style for the shaded pass (SolidWorks "Display Style" toolbar).

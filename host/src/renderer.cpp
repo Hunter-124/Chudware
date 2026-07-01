@@ -9,7 +9,7 @@
 #include <limits>
 #include <vector>
 
-#include "math.h"
+#include "vec_math.h"
 
 namespace {
 const char* kVert = R"(#version 330 core

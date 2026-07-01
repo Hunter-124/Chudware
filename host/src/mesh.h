@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include "math.h"
+#include "vec_math.h"
 
 struct Mesh {
     std::vector<float> positions;  // xyz per welded vertex

@@ -233,15 +233,8 @@ static void drawAiActivityBadge(ImVec2 vr0, ImVec2 vr1, const std::string& statu
 
 // drawNewDocChooser is declared in viewport_panel.h (public — hosted at app scope).
 
-// The open documents live as browser/SolidWorks tabs in the central dock node's tab-bar ROW (where
-// the "<doc> - Viewport" dock tab used to sit), NOT as a separate full-width band. We can't make
-// ImGui's docking tab bar host our per-document tabs (one window == one tab), so instead each
-// central panel that owns this node (Viewport 3D, Viewport-as-drawing-sheet, ECAD) hides the node's
-// own window tab (NoTabBar — so "Viewport"/"ECAD" don't show a redundant tab) and paints the doc
-// tabs INLINE as the first thing in its content. Inline (vs a floating overlay) keeps the tabs on
-// top of the dark 3D view — an overlay floated behind the focused window and was covered by its
-// background. Picking is unaffected: the 3D image rect is read from the image item itself, so the
-// strip reserving height at the top simply shifts the image down with it. Call right after Begin.
+// The document strip is drawn by the central view window itself. That keeps Part/Assembly tabs
+// contained in the view area while reserving height before the 3D canvas or drawing sheet.
 static void vpDockStripDraw(AppState& st) {
     ImGuiDockNode* node = ImGui::GetWindowDockNode();
     // Always hide the node's own window tab — the redundant "Viewport"/"ECAD" label should never
@@ -1344,7 +1337,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     if (st.showViewport && st.activeTabIsDrawing()) {
         const std::string title = viewportTitle();
         if (ImGui::Begin(title.c_str())) {
-            vpDockStripDraw(st);   // hide window tab + paint the doc tabs above the sheet
+            vpDockStripDraw(st);   // hide the redundant dock tab; app.cpp owns the filename strip
             ui::drawDrawingSheet(st);
         }
         ImGui::End();
@@ -1367,7 +1360,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     ImGui::SetNextWindowBgAlpha(0.0f);
     if (ImGui::Begin(title.c_str()))
     {
-        vpDockStripDraw(st);        // hide window tab + paint the doc tabs above the 3D view
+        vpDockStripDraw(st);        // hide the redundant dock tab; app.cpp owns the filename strip
         // (The "Create New" chooser modal is hosted at app scope — ui::drawNewDocChooser — so it
         //  works regardless of which central document is forward.)
 

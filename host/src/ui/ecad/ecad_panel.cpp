@@ -20,10 +20,8 @@
 
 namespace ui {
 
-// The document tab strip is shared across every window docked in the central node (Viewport 3D /
-// drawing sheet / this ECAD editor). When ECAD is the forward window the Viewport's Begin returns
-// false, so the ECAD editor hides the node's own tab bar and paints the doc tabs inline itself —
-// exactly like the Viewport panel does (see viewport_panel.cpp's vpDockStripDraw).
+// The document strip is drawn by whichever central view window is active. ECAD participates so
+// Part/Assembly/ECAD tabs stay contained in the shared view area.
 static void ecadDockStripDraw(AppState& st) {
     ImGuiDockNode* node = ImGui::GetWindowDockNode();
     if (node) node->LocalFlags |= ImGuiDockNodeFlags_NoTabBar;   // never show the redundant window tab
@@ -868,7 +866,7 @@ void drawEcadEditor(AppState& st) {
     prevHadDoc = hasDocNow;
 
     if (!ImGui::Begin("ECAD")) { ImGui::End(); return; }
-    ecadDockStripDraw(st);   // hide window tab + paint the doc tabs above the ECAD canvas
+    ecadDockStripDraw(st);   // hide the redundant dock tab; app.cpp owns the filename strip
 
     if (!es.mirror.hasDoc()) {
         // Launchpad: describe a circuit -> the AI designs a verified schematic. (Blank docs come

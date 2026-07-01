@@ -16,17 +16,15 @@ struct AppState;
 
 namespace ui {
 
-// Height the document-tab strip wants to occupy (0 when no document is open, so the empty start
-// state keeps the plain dock tab bar). Callers reserve this much space at the top of the central
-// dock node before drawing the strip overlay over it.
+// Height the document-tab strip wants to occupy inside the central view window. It remains visible
+// without fake tabs so the New Document button stays reachable.
 float docTabStripHeight(const AppState& state);
 
-// Draw the document tab strip INLINE at the current cursor inside the central dock window (Viewport
-// 3D view / drawing sheet / ECAD editor), spanning `availW` and reserving its own height below so
-// the view flows under it. One tab per open doc (active highlighted, * for unsaved, X to close,
-// middle-click closes) plus a trailing "+" New chooser. Clicking a tab switches the active document
-// (re-points DocMirror so viewport/tree/PM/selection all follow). Returns the strip height (0 when
-// no document is open). A pending close on a dirty tab raises a confirmation modal handled inside.
+// Draw the document tab strip at the current cursor inside the central view window, spanning
+// `availW` and reserving its own height. One tab per open doc (active highlighted, * for unsaved,
+// X to close, middle-click closes) plus a trailing "+" New chooser. Clicking a tab switches the
+// active document (re-points DocMirror so viewport/tree/PM/selection all follow). A pending close
+// on a dirty tab raises a confirmation modal handled inside.
 float drawDocTabs(AppState& state, float availW);
 
 // Wave 2 (GUI rework): request the "+" New-Document chooser popup open on the next strip draw. The

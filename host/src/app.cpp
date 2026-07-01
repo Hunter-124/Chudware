@@ -2623,16 +2623,14 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         ensureStarterDoc(st, shot);
 
         // ---------- active document reconciliation ----------
-        // The browser/SolidWorks-style document tabs are rendered INSIDE the central dock node's
-        // tab-bar row (see ui::drawDocTabs, invoked from the Viewport/ECAD panels which own that
-        // node's geometry) rather than as a separate full-width band here — so they sit exactly
-        // where the "<doc> - Viewport" dock tab used to, and span only the central column.
+        // The browser/SolidWorks-style document tabs are rendered by the central Viewport/ECAD
+        // window that owns the view area, so the strip stays contained in that view window.
         st.ensureActiveTab();
         float docTabsH = 0.0f;
 
         // ---------- dockspace host (between the title bar+ribbon and the status bar) ----------
         const float statusH = ImGui::GetTextLineHeight() + 8.0f * scale;
-        const float dockTopY = barH + ribbonH + docTabsH;
+        const float dockTopY = barH + ribbonH;
         ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + dockTopY));
         ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
         ImGui::SetNextWindowViewport(vp->ID);

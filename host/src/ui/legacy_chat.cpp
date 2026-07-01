@@ -999,18 +999,14 @@ static void drawUserBlock(const ChatMsg& m, const ui::Fonts& fonts, float panelW
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
     // Right-align: indent ~22% of the panel so the bubble sits against the right edge.
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + panelW * 0.22f);
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.userBubbleBg[0], pal.userBubbleBg[1], pal.userBubbleBg[2], pal.userBubbleBg[3]));
-    ImGui::PushStyleColor(ImGuiCol_Border,
-        ImVec4(pal.userBubbleBorder[0], pal.userBubbleBorder[1],
-               pal.userBubbleBorder[2], pal.userBubbleBorder[3]));
+    ui::pushGlassChildStyle(8.0f);
     ImGui::BeginChild("##umsg", ImVec2(0, 0), ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
     ImGui::PushFont(fonts.medium);
     ImGui::TextColored(accentCol, "You");
     ImGui::PopFont();
     ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
     ImGui::EndChild();
-    ImGui::PopStyleColor(2);
+    ui::popGlassChildStyle();
     ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
 }
 
@@ -1114,13 +1110,16 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
     }
     ImGui::PushFont(st.fonts.h2);
+    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(16, 20, 26, 255));
     ImGui::TextUnformatted("AI-CAD Copilot");
+    ImGui::PopStyleColor();
     ImGui::PopFont();
 
     const ImGuiStyle& style = ImGui::GetStyle();
     const float lh = ImGui::GetTextLineHeight();
     float sessW = ImGui::CalcTextSize("Sessions").x + style.FramePadding.x * 2.0f;
-    float cluster = sessW + style.ItemSpacing.x + lh;
+    float gearW = lh;
+    float cluster = sessW + style.ItemSpacing.x + gearW + style.ItemSpacing.x + lh;
     ImGui::SameLine();
     float xRight = ImGui::GetContentRegionMax().x - cluster;
     if (xRight > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(xRight);
@@ -1130,6 +1129,18 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Show or hide the session list — switch chats out of order.");
+
+    ImGui::SameLine();
+    IconUV gear = ui::getIcon("settings", 20);
+    bool openSettings = false;
+    if (gear.valid)
+        openSettings = ImGui::ImageButton("##aiheadergear", gear.texId,
+                                          ImVec2(gearW - 4 * sc, gearW - 4 * sc),
+                                          gear.uv0, gear.uv1);
+    else
+        openSettings = ImGui::SmallButton("set");
+    if (openSettings) st.focusSettingsTab = true;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI settings");
 
     ImGui::SameLine();
     const float* dot = pal.accentMid;  const char* tip = "Idle";
@@ -2044,16 +2055,6 @@ void drawAISettingsTab(AppState& st, bool busy) {
         ImGui::End(); return;
     }
     const auto& pal = ui::palette;
-    // Same opaque-base + glass chrome as the Copilot pane (its sibling dock tab) so switching tabs
-    // doesn't swap between a frosted-glass surface and a flat panelBg one.
-    {
-        ImVec2 sp0 = ImGui::GetWindowPos();
-        ImVec2 ssz = ImGui::GetWindowSize();
-        ImVec2 sp1(sp0.x + ssz.x, sp0.y + ssz.y);
-        ImDrawList* wdl = ImGui::GetWindowDrawList();
-        wdl->AddRectFilled(sp0, sp1, ui::Palette::toU32(ui::palette.windowBg));
-        ui::glassBackground(wdl, sp0, sp1, 0.0f, 0.38f);
-    }
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##aisetbody", ImVec2(0, 0), ImGuiChildFlags_None);
     drawAISettingsBody(st, busy);
@@ -2776,9 +2777,9 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     ImGui::Dummy(ImVec2(0, 4 * sc));
 }
 
-// Toolbar row below the prompt: model picker + thinking effort ... gear + send/stop.
+// Toolbar row below the prompt: model picker + thinking effort ... send/stop.
 static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool active,
-                                bool& submit, bool& stopReq) {
+                                bool& submit, bool& stopReq, bool embedded = false) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
 
@@ -2786,16 +2787,28 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
     const float rowH = ImGui::GetFrameHeight() + 4 * sc;
     const float availW = ImGui::GetContentRegionAvail().x;
     ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
-    ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, 4.0f * sc, false, false);
+    ImDrawList* bgDl = ImGui::GetWindowDrawList();
+    const ImU32 composerBg = IM_COL32(31, 37, 48, 255);
+    const ImU32 composerHover = IM_COL32(42, 50, 64, 255);
+    const ImU32 composerActive = IM_COL32(50, 60, 78, 255);
+    if (embedded) {
+        bgDl->AddLine(ImVec2(rowMin.x + 8.0f * sc, rowMin.y),
+                      ImVec2(rowMax.x - 8.0f * sc, rowMin.y),
+                      IM_COL32(71, 82, 102, 170), ui::metrics::stroke(1.0f));
+    } else {
+        bgDl->AddRectFilled(rowMin, rowMax, composerBg, 4.0f * sc);
+        bgDl->AddRect(rowMin, rowMax, IM_COL32(71, 82, 102, 220), 4.0f * sc, 0,
+                      ui::metrics::stroke(1.0f));
+    }
 
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 4 * sc));
-    ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.button));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ui::Palette::toU32(pal.buttonHovered));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ui::Palette::toU32(pal.buttonActive));
+    ImGui::PushStyleColor(ImGuiCol_Button, composerBg);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, composerHover);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, composerActive);
 
     char modelLabel[160];
     composerModelLabel(st.settings, modelLabel, sizeof(modelLabel));
-    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.text));
+    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(244, 247, 251, 255));
     if (ImGui::Button(modelLabel)) ImGui::OpenPopup("##modeldropdown");
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Model — click to search and switch.");
@@ -2811,7 +2824,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
             if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
         char effBtn[48];
         std::snprintf(effBtn, sizeof(effBtn), "Thinking: %s", effLabels[effIdx]);
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(203, 213, 225, 255));
         if (ImGui::Button(effBtn)) ImGui::OpenPopup("##cmpeffort");
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered())
@@ -2824,7 +2837,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
             ImGui::EndPopup();
         }
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDisabled));
+        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(148, 163, 184, 255));
         ImGui::BeginDisabled();
         ImGui::Button("Thinking: n/a");
         ImGui::EndDisabled();
@@ -2834,23 +2847,10 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
     }
 
     const float sendSz = ImGui::GetFrameHeight();
-    const float gearSz = ImGui::GetFrameHeight();
     ImGui::SameLine();
-    float rightX = ImGui::GetContentRegionMax().x - sendSz - 6 * sc - gearSz;
+    float rightX = ImGui::GetContentRegionMax().x - sendSz;
     if (rightX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rightX);
 
-    IconUV gear = ui::getIcon("settings", 20);
-    bool openSettings = false;
-    if (gear.valid)
-        openSettings = ImGui::ImageButton("##aigear", gear.texId,
-                                          ImVec2(gearSz - 8 * sc, gearSz - 8 * sc),
-                                          gear.uv0, gear.uv1);
-    else
-        openSettings = ImGui::SmallButton("set");
-    if (openSettings) st.focusSettingsTab = true;
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI settings");
-
-    ImGui::SameLine(0, 6 * sc);
     if (active) {
         ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.statusErr));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(220, 100, 92, 255));
@@ -2984,17 +2984,39 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
     const char* placeholder = st.aiInteraction == 2 ? "Ask about this part\xE2\x80\xA6"
                             : st.aiInteraction == 1 ? "Describe a change to this part\xE2\x80\xA6"
                                                     : "Describe what to build\xE2\x80\xA6";
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_Border, ui::Palette::toU32(pal.border));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, ui::metrics::stroke(1.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(8.0f));
+
+    ImDrawList* composerDl = ImGui::GetWindowDrawList();
+    ImDrawListSplitter composerSplit;
+    const ImVec2 composerMin = ImGui::GetCursorScreenPos();
+    const float composerW = ImGui::GetContentRegionAvail().x;
+    composerSplit.Split(composerDl, 2);
+    composerSplit.SetCurrentChannel(composerDl, 1);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, IM_COL32(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, IM_COL32(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(244, 247, 251, 255));
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled, IM_COL32(166, 176, 194, 255));
+    ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 0, 0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
     bool submitInput = drawChatInput("##aiprompt", st.prompt, placeholder,
                                      ui::metrics::copilotInputMaxLines());
     ImGui::PopStyleVar(2);
-    ImGui::PopStyleColor(2);
+    ImGui::PopStyleColor(6);
 
-    ImGui::Dummy(ImVec2(0, 4 * sc));
-    drawComposerToolbar(st, busy, canStart, active, submit, stopReq);
+    drawComposerToolbar(st, busy, canStart, active, submit, stopReq, true);
+    ImGui::PopStyleVar();
+
+    const ImVec2 composerMax(composerMin.x + composerW, ImGui::GetItemRectMax().y);
+    composerSplit.SetCurrentChannel(composerDl, 0);
+    composerDl->AddRectFilled(composerMin, composerMax, IM_COL32(31, 37, 48, 255),
+                              ui::metrics::rounding(8.0f));
+    composerDl->AddRect(composerMin, composerMax, IM_COL32(71, 82, 102, 255),
+                        ui::metrics::rounding(8.0f), 0, ui::metrics::stroke(1.0f));
+    composerSplit.Merge(composerDl);
 
     // ---- stop / submit / queue ----
     if (stopReq) requestStopRun(st);
@@ -3035,14 +3057,17 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // adopted rather than cleared.
     syncChatToDoc(st);
 
+    ImGui::Dummy(ImVec2(0, ui::metrics::U(1.5f)));
     drawCopilotHeader(st, busy);
     ImGui::Separator();
     drawRuntimeBanner(st);
 
     // Reserve the composer's height (measured last frame) so the conversation log fills the rest.
     static float s_composerH = 0.0f;
+    const float bottomClearance = ui::metrics::U(5);
     float reserve = (s_composerH > 0 ? s_composerH
-                                     : ImGui::GetFrameHeightWithSpacing() * 4.0f) + ui::metrics::U(2);
+                                     : ImGui::GetFrameHeightWithSpacing() * 4.0f) +
+                    ui::metrics::U(2) + bottomClearance;
     float chatH = ImGui::GetContentRegionAvail().y - reserve;
     if (chatH < ui::metrics::px(120.0f)) chatH = ui::metrics::px(120.0f);
 
@@ -3076,6 +3101,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     drawComposer(st, busy, canRun);
     ImGui::EndGroup();
     s_composerH = ImGui::GetItemRectSize().y + ui::metrics::U(1);
+    ImGui::Dummy(ImVec2(0, bottomClearance));
 
     ImGui::End();
 }

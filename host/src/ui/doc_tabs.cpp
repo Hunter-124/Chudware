@@ -156,8 +156,8 @@ float docTabStripHeight(const AppState& st) {
     // The strip persists even with no document open (empty start state / all tabs closed) so its
     // "+" New-Document button stays reachable — closing the last tab must not strand the user with
     // no way to start a new file. Only suppressed before the worker is up (nothing to host yet).
-    if (!st.docTabs.empty()) return 26.0f * ui::uiScale;
-    return st.workerStarted ? 26.0f * ui::uiScale : 0.0f;
+    (void)st;
+    return 26.0f * ui::uiScale;
 }
 
 // Index of the Part/Assembly tab that owns worker doc `docId`, or -1. Used to resolve a Drawing's
@@ -258,8 +258,6 @@ float drawDocTabs(AppState& st, float availW) {
     // The strip still draws with zero tabs (empty start state / all tabs closed) — just the band and
     // the "+" New-Document button, so the user can always start a new file. Suppressed only before
     // the worker is up (mirrors docTabStripHeight).
-    if (st.docTabs.empty() && !st.workerStarted) return 0.0f;
-
     const auto& pal = ui::palette;
     float s = ui::uiScale;
     float barH = 26.0f * s;
@@ -286,18 +284,15 @@ float drawDocTabs(AppState& st, float availW) {
         const ImGuiStyle& style = ImGui::GetStyle();
         float bandT = origin.y, bandL = origin.x, bandR = origin.x + availW;
         if (ImGuiDockNode* node = ImGui::GetWindowDockNode()) bandT = node->Pos.y;
-        // Full dockspace width = the whole main viewport row, not just the central node.
-        if (ImGuiViewport* mv = ImGui::GetMainViewport()) {
-            bandL = mv->Pos.x;
-            bandR = mv->Pos.x + mv->Size.x;
-        }
+        // The strip is drawn inside the central view window; keep the background clipped to that
+        // window instead of spanning the whole app chrome.
         // Bottom = where the viewport 3D content begins (the strip + the window-padding/spacing gap
         // that the caller leaves before cr0), so the divider hugs the viewport top.
         const float bandB = origin.y + barH + style.ItemSpacing.y;
-        ImDrawList* bdl = ImGui::GetBackgroundDrawList();
-        bdl->AddRectFilled(ImVec2(bandL, bandT), ImVec2(bandR, bandB),
-                           ui::Palette::toU32(pal.windowBg));
-        bdl->AddLine(ImVec2(bandL, bandB - 0.5f), ImVec2(bandR, bandB - 0.5f),
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(ImVec2(bandL, bandT), ImVec2(bandR, bandB),
+                          ui::Palette::toU32(pal.panelBg));
+        dl->AddLine(ImVec2(bandL, bandB - 0.5f), ImVec2(bandR, bandB - 0.5f),
                      ui::Palette::toU32(pal.border), 1.0f);
     }
 

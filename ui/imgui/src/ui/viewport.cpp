@@ -1,9 +1,16 @@
 #include "ui/panels.h"
+#include "ui/doc_tabs.h"
+#include "ui/shortcut_bar.h"
+#include "ui/sketch/sketch_mode.h"
+#include "ui/sketch/sketch_seam.h"
 #include "app/app_state.h"
 #include "viewport/scene.h"
 #include "theme/theme.h"
 #include "theme/icons.h"
+#include "renderer.h"
+#include "render/id_pass.h"
 #include "imgui.h"
+#include "imgui_internal.h"
 #include <cmath>
 #include <cstdio>
 
@@ -11,8 +18,23 @@ namespace ui {
 
 using namespace app;
 
+static Renderer* g_renderer = nullptr;
+static render::IdPass* g_idPass = nullptr;
+static ShortcutBar s_shortcutBar;
+static SketchMode s_sketch;
+
+void setViewportPipeline(Renderer* r, render::IdPass* idPass) {
+    g_renderer = r;
+    g_idPass = idPass;
+}
+
 void drawViewport(AppState& s) {
     const float S = theme::S();
+
+    ImGuiDockNode* node = ImGui::GetWindowDockNode();
+    if (node) node->LocalFlags |= ImGuiDockNodeFlags_NoTabBar;
+    if (docTabStripHeight(s) > 0.0f) drawDocTabs(s, ImGui::GetContentRegionAvail().x);
+
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImVec2 sz = ImGui::GetContentRegionAvail();
     if (sz.x < 8 || sz.y < 8) return;
@@ -25,6 +47,7 @@ void drawViewport(AppState& s) {
         s.viewMeshRev = s.engine.revision();
     }
     bool live = s.scene && s.scene->hasMesh();
+    bool imgHovered = false;
 
     if (live) {
         s.scene->setStyle(s.viewStyle);
@@ -32,8 +55,9 @@ void drawViewport(AppState& s) {
         s.scene->render();
         ImGui::SetNextItemAllowOverlap();
         ImGui::Image((ImTextureID)(intptr_t)s.scene->texture(), sz, ImVec2(0,1), ImVec2(1,0));
+        imgHovered = ImGui::IsItemHovered();
         // navigation (middle = orbit, Ctrl+middle / right = pan, wheel = zoom)
-        if (ImGui::IsItemHovered()) {
+        if (imgHovered) {
             ImGuiIO& io = ImGui::GetIO();
             bool dragging = ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.f) ||
                             ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.f);
@@ -73,7 +97,25 @@ void drawViewport(AppState& s) {
         ImVec2 ts = ImGui::CalcTextSize(hint);
         dl->AddText(ImVec2((a.x+b.x)*0.5f-ts.x*0.5f, b.y-28*S), TCOL(txt2), hint);
         ImGui::InvisibleButton("##vp", sz);
+        imgHovered = ImGui::IsItemHovered();
     }
+
+    const int vw = (int)sz.x, vh = (int)sz.y;
+    ImGuiIO& io = ImGui::GetIO();
+    if (g_renderer) {
+        auto host = sketch::makeHost(s, g_renderer);
+        host.sketchPlanePickActive = s.inSketch;
+        host.hasDocMesh = live;
+        host.idPass = g_idPass;
+        s_sketch.drawGhosts(host, a, b, vw, vh);
+        if (s.inSketch)
+            s_sketch.drawOverlay(host, io, a, b, vw, vh, imgHovered);
+        else if (host.sketchPlanePickActive)
+            s_sketch.drawOverlay(host, io, a, b, vw, vh, imgHovered);
+    }
+
+    s_shortcutBar.update(s, imgHovered, s.inSketch, a, b);
+    s_shortcutBar.draw(s, s.inSketch);
 
     // ---- in-canvas toolbar (top-left): Fit, Shaded, Shaded+Edges, Wireframe ----
     {

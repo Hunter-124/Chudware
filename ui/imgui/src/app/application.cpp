@@ -1,6 +1,11 @@
 #include "app/application.h"
 #include "app/app_state.h"
+#include "ui/layout.h"
 #include "ui/panels.h"
+#include "ui/cursors.h"
+#include "ui/command_search.h"
+#include "ui/file_explorer.h"
+#include "ui/settings_modal.h"
 #include "theme/theme.h"
 
 #include "viewport_impl.h"
@@ -26,6 +31,9 @@ bool Application::init(GLFWwindow* window, const std::string& resourcesDir, floa
     if (window) glfwGetFramebufferSize(window, &dw, &dh);
     glViewportReady_ = glViewport_->init(dw > 0 ? dw : 1280, dh > 0 ? dh : 800);
     g_state.seedDemo();
+    ui::initCursors(window);
+    if (glViewportReady_)
+        ui::setViewportPipeline(&glViewport_->renderer(), &glViewport_->idPass());
     (void)resourcesDir; (void)scale;
     return true;
 }
@@ -63,22 +71,6 @@ void Application::updateViewportBackdrop(AppState& s) {
     theme::setViewportBackdrop(tbd);
 }
 
-void Application::buildDockLayout(ImGuiID dockId) {
-    ImGui::DockBuilderRemoveNode(dockId);
-    ImGui::DockBuilderAddNode(dockId, ImGuiDockNodeFlags_DockSpace);
-    ImGui::DockBuilderSetNodeSize(dockId, ImGui::GetMainViewport()->WorkSize);
-
-    ImGuiID center = dockId, left, right;
-    left  = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left,  0.20f, nullptr, &center);
-    right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.30f, nullptr, &center);
-
-    ImGui::DockBuilderDockWindow("Browser###left", left);
-    ImGui::DockBuilderDockWindow("Viewport###viewport", center);
-    ImGui::DockBuilderDockWindow("Assistant###agent", right);
-    ImGui::DockBuilderFinish(dockId);
-    layoutBuilt_ = true;
-}
-
 void Application::frame() {
     AppState& s = g_state;
     ImGuiIO& io = ImGui::GetIO();
@@ -107,6 +99,22 @@ void Application::frame() {
     if ((io.KeyCtrl || io.KeySuper) && !io.WantTextInput) {
         if (ImGui::IsKeyPressed(ImGuiKey_S, false)) s.doSave(io.KeyShift);
         else if (ImGui::IsKeyPressed(ImGuiKey_O, false)) s.doOpen();
+        else if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_N, false)) ui::openNewDocChooser();
+    }
+
+    {
+        int settingsTab = -1;
+        if (ui::takeOpenSettingsRequest(&settingsTab)) {
+            ui::settingsUi().openSettings = true;
+            if (settingsTab >= 0) ui::settingsUi().openSettingsTab = settingsTab;
+        }
+        std::string openPath = ui::takeExplorerOpenRequest();
+        if (!openPath.empty() && s.engineReady) {
+            if (s.engine.open(openPath)) {
+                s.onDocMutation();
+                s.status = "Opened " + openPath;
+            }
+        }
     }
 
     const float titleH = theme::ctx().m.titleBarH  * theme::S();
@@ -147,10 +155,18 @@ void Application::frame() {
 
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_DockingEmptyBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_SeparatorActive, ImVec4(0, 0, 0, 0));
+    const float dockW = ImGui::GetContentRegionAvail().x;
     ImGuiID dockId = ImGui::GetID("##dockspace");
     ImGui::DockSpace(dockId, ImVec2(0, midH), ImGuiDockNodeFlags_PassthruCentralNode);
-    ImGui::PopStyleColor(2);
-    if (!layoutBuilt_) buildDockLayout(dockId);
+    if (!layoutBuilt_) {
+        buildDefaultLayout(dockId, ImVec2(dockW > 1.f ? dockW : 1440.f, midH));
+        layoutBuilt_ = true;
+    }
+    ui::drawDockSplitters(dockId);
+    ImGui::PopStyleColor(5);
 
     ui::drawStatusBar(s, statusH);
 
@@ -177,6 +193,12 @@ void Application::frame() {
     ImGui::PopStyleColor();
 
     if (s.paletteOpen) ui::drawCommandPalette(s);
+
+    ui::drawSettingsModal(s, false);
+    ui::drawProfilerWindow(s);
+    ui::drawCommandSearch(s);
+    ui::drawToasts(s);
+    ui::applyCursorRequest(s.window);
 }
 
 } // namespace app

@@ -1,5 +1,6 @@
 #include "ui/panels.h"
 #include "ui/command_registry.h"
+#include "ui/file_explorer.h"
 #include "app/app_state.h"
 #include "viewport/scene.h"
 #include "theme/theme.h"
@@ -93,14 +94,8 @@ void drawLeftDock(AppState& s) {
             icons::inlineIcon("file_part", 15*S, TCOL(txt1)); ImGui::SameLine(0,6*S);
             ImGui::TextColored(TVEC(txt0), "%s", b.c_str());
         }
-    } else if (s.railTab == 2) {
-        ImGui::TextColored(TVEC(txt2), "Workspace files");
-        const char* demo[] = {"Bracket.step+", "Housing.step+", "Plate.dxf"};
-        for (auto f : demo) {
-            theme::glassRowAtCursor(3.5f, false, false, 5.f);
-            icons::inlineIcon("file_part", 15*S, TCOL(txt1)); ImGui::SameLine(0,6*S);
-            ImGui::TextColored(TVEC(txt1), "%s", f);
-        }
+    } else if (s.railTab == kFilesRailTab) {
+        drawFileExplorerBody(s);
     } else {
         theme::glassRowAtCursor(3.5f, false, false, 5.f);
         icons::inlineIcon("rail_configs", 15*S, TCOL(accent)); ImGui::SameLine(0,6*S);

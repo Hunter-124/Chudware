@@ -1,5 +1,5 @@
-#include "ui/panels.h"
-#include "ui/command_registry.h"
+#include "ui/title_bar.h"
+#include "ui/doc_tabs.h"
 #include "app/app_state.h"
 #include "theme/theme.h"
 #include "theme/icons.h"
@@ -11,160 +11,184 @@ namespace ui {
 
 using app::AppState;
 
-static void appMenu(AppState& s) {
-    if (ImGui::BeginPopup("##appmenu")) {
-        if (ImGui::BeginMenu("File")) {
-            if (ImGui::BeginMenu("New")) {
-                if (ImGui::MenuItem("Part"))      s.doNewPart();
-                if (ImGui::MenuItem("Assembly"))  { s.docs.push_back({"Assem"+std::to_string(s.docs.size()+1), cmd::DocType::Assembly}); s.activeDoc=(int)s.docs.size()-1; s.workspace=cmd::Workspace::Assemble; }
-                if (ImGui::MenuItem("Drawing"))   s.dispatch("make_drawing");
-                if (ImGui::MenuItem("Schematic")) s.dispatch("ecad_new_sch");
-                if (ImGui::MenuItem("PCB"))       s.dispatch("ecad_new_pcb");
-                ImGui::EndMenu();
-            }
-            if (ImGui::MenuItem("Open...", "Ctrl+O"))        s.doOpen();
-            if (ImGui::MenuItem("Save", "Ctrl+S"))           s.doSave(false);
-            if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S")) s.doSave(true);
-            ImGui::Separator();
-            if (ImGui::MenuItem("Quit")) glfwSetWindowShouldClose(s.window, 1);
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("Edit")) {
-            ImGui::MenuItem("Undo"); ImGui::MenuItem("Redo"); ImGui::Separator();
-            ImGui::MenuItem("Cut"); ImGui::MenuItem("Copy"); ImGui::MenuItem("Paste");
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("View")) {
-            if (ImGui::MenuItem(s.dark ? "Light theme" : "Dark theme")) { s.dark = !s.dark; theme::setDark(s.dark); icons::setAtlasTheme(s.dark); }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Appearance...")) s.dispatch("appearance_edit");
-            if (ImGui::BeginMenu("Display Style")) {
-                if (ImGui::MenuItem("Shaded", nullptr, s.viewStyle==0))         s.dispatch("view_style_shaded");
-                if (ImGui::MenuItem("Shaded + Edges", nullptr, s.viewStyle==1)) s.dispatch("view_style_edges");
-                if (ImGui::MenuItem("Wireframe", nullptr, s.viewStyle==2))      s.dispatch("view_style_wire");
-                ImGui::EndMenu();
-            }
-            ImGui::Separator();
-            ImGui::MenuItem("Reset Layout");
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("Insert")) {
-            for (const cmd::Command* c : cmd::topCommands(cmd::Workspace::Model))
-                if (c->group == cmd::Group::Create || c->group == cmd::Group::Construct)
-                    if (ImGui::MenuItem(c->label)) s.dispatch(c->id);
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("Help")) { ImGui::MenuItem("Documentation"); ImGui::MenuItem("About AI-CAD"); ImGui::EndMenu(); }
-        ImGui::EndPopup();
+namespace {
+
+enum WinBtn { BTN_MIN, BTN_MAX, BTN_CLOSE };
+
+bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
+    const float S = theme::S();
+    const float btnW = h * (1.35f + 0.15f * (S - 1.f));
+    const ImVec2 size(btnW, h);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton(id, size);
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    if (hovered) {
+        const ImU32 bg = (kind == BTN_CLOSE) ? TCOL(bad) : TCOL(hover);
+        dl->AddRectFilled(p0, ImVec2(p0.x + size.x, p0.y + size.y), bg);
     }
+
+    const ImU32 fg = (hovered && kind == BTN_CLOSE) ? TCOL(txt0) : TCOL(txt1);
+    const ImVec2 c(p0.x + size.x * 0.5f, p0.y + size.y * 0.5f);
+    const float s = h * 0.16f;
+    const float th = 1.4f * S;
+
+    if (kind == BTN_MIN) {
+        dl->AddLine(ImVec2(c.x - s, c.y), ImVec2(c.x + s, c.y), fg, th);
+    } else if (kind == BTN_MAX) {
+        if (maximized) {
+            dl->AddRect(ImVec2(c.x - s + 2 * S, c.y - s), ImVec2(c.x + s, c.y + s - 2 * S), fg, 0, 0, th);
+            dl->AddRect(ImVec2(c.x - s, c.y - s + 2 * S), ImVec2(c.x + s - 2 * S, c.y + s), fg, 0, 0, th);
+        } else {
+            dl->AddRect(ImVec2(c.x - s, c.y - s), ImVec2(c.x + s, c.y + s), fg, 0, 0, th);
+        }
+    } else {
+        dl->AddLine(ImVec2(c.x - s, c.y - s), ImVec2(c.x + s, c.y + s), fg, th);
+        dl->AddLine(ImVec2(c.x - s, c.y + s), ImVec2(c.x + s, c.y - s), fg, th);
+    }
+    return clicked;
 }
 
-void drawTitleBar(AppState& s, float height) {
+}  // namespace
+
+void drawTitleBar(AppState& st, float height) {
     const float S = theme::S();
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, TVEC(bg0));
+    GLFWwindow* win = st.window;
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, TVEC(bg1));
     ImGui::BeginChild("##title", ImVec2(0, height), false,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 wp = ImGui::GetWindowPos(), wsz = ImGui::GetWindowSize();
+    const ImVec2 wp = ImGui::GetWindowPos();
+    const ImVec2 wsz = ImGui::GetWindowSize();
+    const bool maximized = win && glfwGetWindowAttrib(win, GLFW_MAXIMIZED) != 0;
 
-    float pad = 8.f * S;
-    float btnH = height - 10.f*S;
-    float capW = height * 1.2f;
-    bool maxed = glfwGetWindowAttrib(s.window, GLFW_MAXIMIZED) != 0;
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14.f * S, 12.f * S));
+    ImGui::PushStyleColor(ImGuiCol_MenuBarBg, TVEC(bg1));
 
-    // --- window drag zone: submit FIRST (full title minus the window buttons) so the
-    //     menu/tabs/search drawn after it win hover and stay clickable. ---
-    ImGui::SetCursorPos(ImVec2(0,0));
-    ImGui::SetNextItemAllowOverlap();
-    ImGui::InvisibleButton("##dragzone", ImVec2(wsz.x - capW*3, height));
-    if (ImGui::IsItemActive() && !maxed) {
-        ImGuiIO& io = ImGui::GetIO();
-        if (io.MouseDelta.x != 0 || io.MouseDelta.y != 0) {
-            int wx, wy; glfwGetWindowPos(s.window, &wx, &wy);
-            glfwSetWindowPos(s.window, wx + (int)io.MouseDelta.x, wy + (int)io.MouseDelta.y);
+    const float barH = ImGui::GetFrameHeight();
+    const float bw = barH * (1.35f + 0.15f * (S - 1.f));
+    const float captionZoneW = bw * 3.f;
+    const float winW = wsz.x;
+    const float menuZoneR = winW - captionZoneW - 4.f * S;
+
+    if (ImGui::BeginMenuBar()) {
+        ImGui::SetCursorPosX(12.f * S);
+
+        ImGui::PushFont(theme::font(theme::Font::H2));
+        if (ImGui::GetCursorPosX() + 120.f * S < menuZoneR - 80.f * S) {
+            ImGui::SetCursorPosY((barH - ImGui::GetFontSize()) * 0.5f);
+            ImGui::TextColored(TVEC(txt0), "AI-CAD");
+            ImGui::SameLine(0, 4.f * S);
+            ImGui::TextColored(TVEC(accent), "2");
         }
-    }
-    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
-        if (maxed) glfwRestoreWindow(s.window); else glfwMaximizeWindow(s.window);
-    }
+        ImGui::PopFont();
 
-    ImGui::SetCursorPos(ImVec2(pad, (height - btnH)*0.5f));
+        const float collapseThreshold = 700.f * S;
+        const bool hasDoc = st.activeTab >= 0 || !st.docs.empty();
 
-    // hamburger menu
-    if (ImGui::Button("###menu", ImVec2(btnH, btnH))) ImGui::OpenPopup("##appmenu");
-    { ImVec2 mp = ImGui::GetItemRectMin(); ImVec2 c(mp.x+btnH*0.5f, mp.y+btnH*0.5f);
-      icons::draw(dl, "menu", c, btnH*0.5f, TCOL(txt1)); }
-    appMenu(s);
+        auto drawFileMenu = [&]() {
+            if (ImGui::BeginMenu("New")) {
+                if (ImGui::MenuItem("Part", "Ctrl+N")) ui::createNewDoc(st, 0);
+                if (ImGui::MenuItem("Assembly")) ui::createNewDoc(st, 1);
+                if (ImGui::MenuItem("Drawing", nullptr, false, hasDoc)) ui::createNewDoc(st, 2);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Schematic")) ui::createNewDoc(st, 3);
+                if (ImGui::MenuItem("PCB")) ui::createNewDoc(st, 4);
+                ImGui::EndMenu();
+            }
+            if (ImGui::MenuItem("Open...", "Ctrl+O")) st.doOpen();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Save", "Ctrl+S", false, hasDoc)) st.doSave(false);
+            if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S", false, hasDoc)) st.doSave(true);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Quit", "Alt+F4")) glfwSetWindowShouldClose(win, 1);
+        };
 
-    // wordmark
-    ImGui::SameLine(0, 10*S);
-    ImGui::PushFont(theme::font(theme::Font::H2));
-    ImGui::SetCursorPosY((height - ImGui::GetFontSize())*0.5f);
-    ImGui::TextColored(TVEC(txt0), "AI-CAD");
-    ImGui::PopFont();
-    ImGui::SameLine(0, 6*S);
-    ImGui::SetCursorPosY((height - ImGui::GetTextLineHeight())*0.5f);
-    ImGui::TextColored(TVEC(accent), "2");
+        auto drawEditMenu = [&]() {
+            if (ImGui::MenuItem("Undo", "Ctrl+Z", false, hasDoc)) {
+                st.dispatch("edit_undo");
+                st.onDocMutation();
+            }
+            if (ImGui::MenuItem("Redo", "Ctrl+Y", false, hasDoc)) {
+                st.dispatch("edit_redo");
+                st.onDocMutation();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Cut", "Ctrl+X", false, hasDoc)) st.dispatch("edit_cut");
+            if (ImGui::MenuItem("Copy", "Ctrl+C", false, hasDoc)) st.dispatch("edit_copy");
+            if (ImGui::MenuItem("Paste", "Ctrl+V", false, hasDoc)) st.dispatch("edit_paste");
+        };
 
-    // doc tabs
-    ImGui::SameLine(0, 16*S);
-    for (int i = 0; i < (int)s.docs.size(); ++i) {
-        ImGui::PushID(i);
-        bool act = (i == s.activeDoc);
-        ImVec2 tp = ImGui::GetCursorScreenPos();
-        std::string lbl = s.docs[i].name;
-        ImVec2 ts = ImGui::CalcTextSize(lbl.c_str());
-        float tw = ts.x + 26*S;
-        ImGui::SetCursorPosY((height - (height-12*S))*0.5f);
-        if (ImGui::InvisibleButton("tab", ImVec2(tw, height-12*S))) {
-            s.activeDoc = i;
-            s.inSketch = false;
-            auto wss = cmd::workspacesFor(s.docs[i].type);
-            if (!wss.empty()) s.workspace = wss[0];
+        auto drawViewMenu = [&]() {
+            if (ImGui::MenuItem(st.dark ? "Light theme" : "Dark theme")) {
+                st.dark = !st.dark;
+                theme::setDark(st.dark);
+                icons::setAtlasTheme(st.dark);
+            }
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Display Style")) {
+                if (ImGui::MenuItem("Shaded", nullptr, st.viewStyle == 0)) st.dispatch("view_style_shaded");
+                if (ImGui::MenuItem("Shaded + Edges", nullptr, st.viewStyle == 1)) st.dispatch("view_style_edges");
+                if (ImGui::MenuItem("Wireframe", nullptr, st.viewStyle == 2)) st.dispatch("view_style_wire");
+                ImGui::EndMenu();
+            }
+        };
+
+        auto drawInsertMenu = [&]() {
+            if (ImGui::MenuItem("Sketch", nullptr, false, hasDoc)) st.dispatch("sketch_new");
+            if (ImGui::MenuItem("Extrude Boss/Base", nullptr, false, hasDoc)) st.dispatch("extrude_boss");
+            if (ImGui::MenuItem("Fillet", nullptr, false, hasDoc)) st.dispatch("fillet");
+        };
+
+        auto drawHelpMenu = [&]() {
+            ImGui::MenuItem("Documentation", nullptr, false, false);
+            ImGui::MenuItem("About AI-CAD", nullptr, false, false);
+        };
+
+        if (winW < collapseThreshold) {
+            if (ImGui::BeginMenu("Menu")) {
+                if (ImGui::BeginMenu("File")) { drawFileMenu(); ImGui::EndMenu(); }
+                if (ImGui::BeginMenu("Edit")) { drawEditMenu(); ImGui::EndMenu(); }
+                if (ImGui::BeginMenu("View")) { drawViewMenu(); ImGui::EndMenu(); }
+                if (ImGui::BeginMenu("Insert")) { drawInsertMenu(); ImGui::EndMenu(); }
+                if (ImGui::BeginMenu("Help")) { drawHelpMenu(); ImGui::EndMenu(); }
+                if (ImGui::MenuItem("Search")) st.paletteOpen = true;
+                ImGui::EndMenu();
+            }
+        } else {
+            if (ImGui::BeginMenu("File")) { drawFileMenu(); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Edit")) { drawEditMenu(); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("View")) { drawViewMenu(); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Insert")) { drawInsertMenu(); ImGui::EndMenu(); }
+            if (ImGui::BeginMenu("Help")) { drawHelpMenu(); ImGui::EndMenu(); }
+            if (ImGui::MenuItem("Search")) st.paletteOpen = true;
         }
-        bool th = ImGui::IsItemHovered();
-        ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
-        dl->AddRectFilled(a, b, act ? TCOL(bg2) : (th?TCOL(hover):0u), 7*S);
-        if (act) dl->AddRectFilled(ImVec2(a.x, b.y-2*S), b, TCOL(accent), 0);
-        dl->AddText(ImVec2(a.x+10*S, (a.y+b.y)*0.5f - ts.y*0.5f), act?TCOL(txt0):TCOL(txt1), lbl.c_str());
-        ImGui::PopID();
-        ImGui::SameLine(0, 4*S);
-    }
-    // new-doc +
-    if (ImGui::Button("+", ImVec2(height-14*S, height-14*S))) ImGui::OpenPopup("##appmenu");
 
-    // ----- right cluster: window buttons -----
-    float rightX = wsz.x - capW*3;
-    // search pill (left of window buttons)
-    float searchW = 220*S;
-    float searchX = rightX - searchW - 12*S;
-    if (searchX > ImGui::GetCursorPosX()) {
-        ImGui::SetCursorPos(ImVec2(searchX, (height-btnH)*0.5f));
-        if (ImGui::Button("##search", ImVec2(searchW, btnH))) s.paletteOpen = true;
-        ImVec2 sp = ImGui::GetItemRectMin();
-        icons::draw(dl, "search", ImVec2(sp.x+btnH*0.5f, sp.y+btnH*0.5f), btnH*0.42f, TCOL(txt2));
-        dl->AddText(ImVec2(sp.x+btnH, sp.y+btnH*0.5f-ImGui::GetTextLineHeight()*0.5f), TCOL(txt2), "Search commands");
-        dl->AddText(theme::font(theme::Font::Mono), 12*S, ImVec2(sp.x+searchW-36*S, sp.y+btnH*0.5f-7*S), TCOL(txt2), "Ctrl K");
+        const float bx = winW - captionZoneW;
+        ImGui::SetCursorPos(ImVec2(bx, 0.f));
+        if (windowButton("##min", BTN_MIN, barH, false)) glfwIconifyWindow(win);
+        ImGui::SetCursorPos(ImVec2(bx + bw, 0.f));
+        if (windowButton("##max", BTN_MAX, barH, maximized)) {
+            if (maximized) glfwRestoreWindow(win);
+            else glfwMaximizeWindow(win);
+        }
+        ImGui::SetCursorPos(ImVec2(bx + bw * 2.f, 0.f));
+        if (windowButton("##close", BTN_CLOSE, barH, false)) glfwSetWindowShouldClose(win, 1);
+
+        ImGui::EndMenuBar();
     }
 
-    // window controls
-    auto capBtn = [&](const char* id, const char* icon, ImU32 hoverCol)->bool {
-        bool clicked = ImGui::Button(id, ImVec2(capW, height));
-        ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
-        if (ImGui::IsItemHovered()) dl->AddRectFilled(a, b, hoverCol, 0);
-        icons::draw(dl, icon, ImVec2((a.x+b.x)*0.5f,(a.y+b.y)*0.5f), height*0.34f, TCOL(txt1));
-        return clicked;
-    };
-    ImGui::SetCursorPos(ImVec2(wsz.x - capW*3, 0));
-    if (capBtn("##min", "win_min", TCOL(hover)))  glfwIconifyWindow(s.window);
-    ImGui::SameLine(0,0);
-    if (capBtn("##max", maxed?"win_restore":"win_max", TCOL(hover))) { if (maxed) glfwRestoreWindow(s.window); else glfwMaximizeWindow(s.window); }
-    ImGui::SameLine(0,0);
-    if (capBtn("##close","win_close", TCOL(bad))) glfwSetWindowShouldClose(s.window, 1);
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
 
-    dl->AddLine(ImVec2(wp.x, wp.y+wsz.y-0.5f), ImVec2(wp.x+wsz.x, wp.y+wsz.y-0.5f), TCOL(line), 1.f);
+    dl->AddLine(ImVec2(wp.x, wp.y + wsz.y - 0.5f), ImVec2(wp.x + wsz.x, wp.y + wsz.y - 0.5f),
+                TCOL(line), 1.f);
+
     ImGui::EndChild();
     ImGui::PopStyleColor();
 }
 
-} // namespace ui
+}  // namespace ui

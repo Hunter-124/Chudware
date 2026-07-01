@@ -1,24 +1,40 @@
-// Icon rendering. Draws, in priority order:
-//   1. hand-drawn vector glyphs for chrome (menu/search/window buttons/check/x/sparkle/...),
-//   2. the reused pre-rendered CAD icon atlas (host/assets/icons, mapped by name),
-//   3. a clean monogram placeholder (never magenta).
-// Definitions live in icons.cpp so the atlas can own a GL texture. See app/resources/icons/ICONS.md.
+// AI-CAD icon loader (C14). Host-faithful atlas API (ui::) plus shell draw helpers (icons::).
+// Loads atlas_dark.png / atlas_light.png + atlas.json from <resourcesDir>/icons/.
 #pragma once
-#include <string>
+
 #include "imgui.h"
+#include <string>
+
+namespace ui {
+
+struct IconUV {
+    ImTextureID texId;
+    ImVec2      uv0;
+    ImVec2      uv1;
+    bool        valid;
+    IconUV() : texId((ImTextureID)0), uv0(0, 0), uv1(1, 1), valid(false) {}
+};
+
+// Load both atlases and parse atlas.json. Call once after GL context is live.
+void loadIcons(const std::string& assetsDir);
+void freeIcons();
+
+// Query an icon. size should be 32 or 20 (falls back to the other size).
+IconUV getIcon(const char* name, int size = 32);
+
+// Call after theme::setDark() — getIcon() reads theme::ctx().dark each call.
+void syncIconTheme();
+
+}  // namespace ui
 
 namespace icons {
 
-// Load the CAD icon atlas (atlas_<theme>.png + atlas.json) from <resourcesDir>/icons. GL context
-// must be current. Safe to call once after init; no-op if the files are absent (falls back to glyphs).
+// Shell convenience: loadIcons + optional theme hint (theme comes from theme::ctx() at query time).
 void initAtlas(const std::string& resourcesDir, bool dark);
-void setAtlasTheme(bool dark);   // swap dark/light atlas on theme change
+void setAtlasTheme(bool dark);
 
-// Draw an icon centered at `c`, fitting a `size`x`size` box, tinted `col` (atlas icons keep their
-// baked color; hand-drawn glyphs honor `col`).
+// Draw priority: hand-drawn chrome glyph → atlas (alias-resolved) → monogram placeholder.
 void draw(ImDrawList* dl, const char* name, ImVec2 c, float size, ImU32 col);
-
-// Inline icon at the current cursor (advances layout by size).
 void inlineIcon(const char* name, float size, ImU32 col);
 
-} // namespace icons
+}  // namespace icons

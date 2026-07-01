@@ -336,7 +336,7 @@ When the `AI-CAD` host target eventually links `libaicad_geom_occt`, attach the 
 
 Pick one of:
 - `C:\OCCT\opencascade-7.9.3\` — short, no spaces, survives reboots ✓
-- `C:\Users\nigga\Desktop\AI-opencad\third_party\occt\` — colocated with repo (do NOT commit 
+- `C:\Users\dev\Desktop\AI-opencad\third_party\occt\` — colocated with repo (do NOT commit 
   the binaries; add `third_party/occt/` to `.gitignore`)
 
 We recommend `C:\OCCT\` to avoid PATH-length issues on Windows.

@@ -3,7 +3,7 @@
 House style: plain ``main()`` + asserts (see engine/sim/test_circuit.py, agent/test_orchestrator.py).
 Run as::
 
-    & "C:/Users/nigga/AppData/Roaming/AI-CAD/runtime/venv/Scripts/python.exe" -m engine.ecad.test_orchestrator
+    & "$env:APPDATA\AI-CAD\runtime\venv\Scripts\python.exe" -m engine.ecad.test_orchestrator
 
 No pytest, no API key, no network -- a deterministic MockProvider returns canned structured plans, so
 the whole pipeline (PLAN -> BUILD -> ERC -> SIMULATE -> REPORT) runs offline in CI.

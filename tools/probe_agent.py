@@ -1,6 +1,6 @@
 import ctypes, json, os, sys
 
-dist = r"C:\Users\nigga\Desktop\AI-opencad\dist\AI-CAD"
+dist = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "AI-CAD")
 os.add_dll_directory(dist)
 os.environ.setdefault("AI_CAD_PROMPTS_DIR", os.path.join(dist, "app", "agent", "prompts"))
 

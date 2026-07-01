@@ -3,7 +3,7 @@ doc_apply_ops, to isolate whether the engine builds a face+solid from this
 spline+lines loop (revolve), independent of the agent."""
 import ctypes, json, os
 
-DIST = r"C:\Users\nigga\Desktop\AI-opencad\dist\AI-CAD"
+DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "AI-CAD")
 os.add_dll_directory(DIST)
 dll = ctypes.CDLL(os.path.join(DIST, "libaicad.dll"))
 dll.aicad_call.restype = ctypes.c_int

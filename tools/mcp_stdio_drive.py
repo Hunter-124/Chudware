@@ -2,11 +2,11 @@
 call tools, measuring latency and asserting replies actually arrive (the -32001 repro)."""
 import json, os, subprocess, sys, time, threading, queue
 
-VENV = r"C:\Users\nigga\AppData\Roaming\AI-CAD\runtime\venv\Scripts\python.exe"
-REPO = r"C:\Users\nigga\Desktop\AI-opencad"
+VENV = os.path.join(os.environ.get("APPDATA", ""), "AI-CAD", "runtime", "venv", "Scripts", "python.exe")
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 env = dict(os.environ, PYTHONPATH=REPO)
 
-p = subprocess.Popen([VENV, "-m", "mcp_server.server"], cwd="C:\\",
+p = subprocess.Popen([VENV, "-m", "mcp_server.server"], cwd=REPO,
                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                      stderr=subprocess.DEVNULL, env=env, bufsize=0)
 

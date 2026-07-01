@@ -9,7 +9,7 @@ asserts the produced assembly .step+ is a valid aicad.asm/1 container referencin
 """
 import ctypes, json, os, sys, tempfile, zipfile
 
-DIST = r"C:\Users\nigga\Desktop\AI-opencad\dist\AI-CAD"
+DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "AI-CAD")
 os.add_dll_directory(DIST)
 lib = ctypes.WinDLL(os.path.join(DIST, "libaicad.dll"))
 lib.aicad_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]

@@ -1,7 +1,7 @@
 # Parallel Full Codebase Review — Consolidated Summary
 
-Repo: `c:\Users\nigga\Desktop\AI-opencad` · Branch: `master` · Date: 2026-06-27  
-Plan: `c:\Users\nigga\.cursor\plans\parallel_full_codebase_review_8df1109c.plan.md`
+Repo: `c:\Users\dev\Desktop\AI-opencad` · Branch: `master` · Date: 2026-06-27  
+Plan: `c:\Users\dev\.cursor\plans\parallel_full_codebase_review_8df1109c.plan.md`
 
 ---
 

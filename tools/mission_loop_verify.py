@@ -9,8 +9,9 @@ the verdict stage end-to-end without any live model.
 """
 import ctypes, json, os
 
-CORE = r"C:\Users\nigga\Desktop\AI-opencad\core\build-occt\bin\Release"
-os.environ.setdefault("AI_CAD_PROMPTS_DIR", r"C:\Users\nigga\Desktop\AI-opencad\agent\prompts")
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CORE = os.path.join(_REPO_ROOT, "core", "build-occt", "bin", "Release")
+os.environ.setdefault("AI_CAD_PROMPTS_DIR", os.path.join(_REPO_ROOT, "agent", "prompts"))
 os.add_dll_directory(CORE)
 lib = ctypes.WinDLL(os.path.join(CORE, "libaicad.dll"))
 lib.aicad_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]

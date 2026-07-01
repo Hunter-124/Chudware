@@ -23,7 +23,7 @@ from engine.doc.sw_translate import resolve
 from mcp_server import core_bridge as cb
 
 _SAMPLES = os.environ.get(
-    "AI_CAD_SW_SAMPLES", r"C:\Users\nigga\Desktop\AI-opencad\sldprt reversing")
+    "AI_CAD_SW_SAMPLES", r"C:\Users\dev\Desktop\AI-opencad\sldprt reversing")
 
 # file name -> volume (mm^3) SolidWorks reports for it (ground truth, captured via COM).
 _PART_VOLUMES = {

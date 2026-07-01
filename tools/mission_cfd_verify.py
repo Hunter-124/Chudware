@@ -12,7 +12,7 @@ Uses the freshly-built core DLL directly (no dist staging required).
 """
 import ctypes, json, os, tempfile
 
-CORE = r"C:\Users\nigga\Desktop\AI-opencad\core\build-occt\bin\Release"
+CORE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "core", "build-occt", "bin", "Release")
 os.add_dll_directory(CORE)
 lib = ctypes.WinDLL(os.path.join(CORE, "libaicad.dll"))
 lib.aicad_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]

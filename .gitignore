@@ -6,6 +6,9 @@ __pycache__/
 # C++ host build output (parallel agent build dirs included)
 host/build*/
 
+# ui/imgui local CMake build tree (regenerate with cmake -S ui/imgui -B ui/imgui/build)
+ui/imgui/build/
+
 # C++ core build tree (CMake FetchContent deps + binaries; regenerate with cmake)
 # build*/ covers build-linux, build-occt, build-occt-linux, etc.
 core/build*/

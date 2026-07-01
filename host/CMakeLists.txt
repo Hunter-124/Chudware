@@ -171,6 +171,10 @@ if(WIN32)
   if(MSVC)
     target_compile_options(AI-CAD PRIVATE $<$<CONFIG:Release>:/Zi>)
     target_link_options(AI-CAD PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
+    # MSVC 14.51 (VS 2026): UCRT <cmath> is missing C99 float math declarations in the
+    # global namespace; force-include the shim on C++ TUs only (see extern/fix_math.h).
+    target_compile_options(AI-CAD PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>:/FI"${CMAKE_CURRENT_SOURCE_DIR}/extern/fix_math.h">)
   endif()
 endif()
 

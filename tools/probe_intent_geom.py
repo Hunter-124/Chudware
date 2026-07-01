@@ -3,7 +3,7 @@
 (bore-wall centroid at the face centre) — the bug class that 'material removed' hid."""
 import ctypes, json, os, math
 
-DIST = r"C:\Users\nigga\Desktop\AI-opencad\dist\AI-CAD"
+DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "AI-CAD")
 os.add_dll_directory(DIST)
 dll = ctypes.CDLL(os.path.join(DIST, "libaicad.dll"))
 dll.aicad_call.restype = ctypes.c_int

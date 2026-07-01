@@ -2,7 +2,7 @@
 
 House style: main() + asserts, same as test_rpc.py.
 Run:
-  & "C:\\Users\\nigga\\AppData\\Roaming\\AI-CAD\\runtime\\venv\\Scripts\\python.exe" -m engine.ecad.test_formats
+  & "$env:APPDATA\AI-CAD\runtime\venv\Scripts\python.exe" -m engine.ecad.test_formats
 """
 from __future__ import annotations
 

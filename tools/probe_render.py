@@ -2,7 +2,7 @@
 orientation gizmo, the direction-tinted faces, and the named-face callouts."""
 import ctypes, json, os
 
-DIST = r"C:\Users\nigga\Desktop\AI-opencad\dist\AI-CAD"
+DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "AI-CAD")
 os.add_dll_directory(DIST)
 dll = ctypes.CDLL(os.path.join(DIST, "libaicad.dll"))
 dll.aicad_call.restype = ctypes.c_int
@@ -33,5 +33,5 @@ call("doc_apply_ops", {"doc_id": d, "ops": [
     {"op": "add_feature", "feature": {"type": "fillet", "name": "Round",
         "params": {"radius": dimv(4)}, "refs": {"edges": {"of": "edge", "parallel": "z"}}}},
 ]})
-out = r"C:\Users\nigga\Desktop\AI-opencad\tools\_render_test.png"
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_render_test.png")
 print(call("doc_render_png", {"doc_id": d, "out_path": out}))

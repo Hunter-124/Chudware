@@ -1,7 +1,7 @@
 """ECAD → 3D bridge tests (fab_outputs.md §5). House style: main() + asserts.
 
 Run (from repo root):
-    & "C:/Users/nigga/AppData/Roaming/AI-CAD/runtime/venv/Scripts/python.exe" -m engine.ecad.test_threed
+    & "$env:APPDATA\AI-CAD\runtime\venv\Scripts\python.exe" -m engine.ecad.test_threed
 
 Uses OCP — a full run takes ~10-30s (STEP export/import + part-doc compile). That's expected.
 

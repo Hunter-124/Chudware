@@ -6,7 +6,7 @@ edit them. The orchestrator dispatches cards in waves and owns integration + com
 
 ## Conventions (every card inherits these)
 
-- **Repo root**: `C:\Users\nigga\Desktop\AI-opencad`. Work from there.
+- **Repo root**: `C:\Users\dev\Desktop\AI-opencad`. Work from there.
 - **Python**: `%APPDATA%\AI-CAD\runtime\venv\Scripts\python.exe` (py 3.11). Run tests as
   `& $py -m <package>.<test_module>` from repo root. Tests are **plain `main()` runners with
   asserts** (see `engine/test_kernel_aliases.py` for the house style) — NOT pytest.

@@ -18,7 +18,7 @@ Usage:
 """
 import ctypes, json, os, sys, time
 
-DIST = r"C:\Users\nigga\Desktop\AI-opencad\dist\AI-CAD"
+DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "AI-CAD")
 os.add_dll_directory(DIST)
 os.environ["AI_CAD_PROMPTS_DIR"] = os.path.join(DIST, "app", "agent", "prompts")
 

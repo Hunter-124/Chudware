@@ -80,7 +80,7 @@ section (lines 30–47) still shows `engine/doc feature compiler` as primary.
 Partial fixes applied (# Fixed); full rewrite crosses tracks → **flag.**
 
 ### 5. `.mcp.json` committed with machine-specific absolute paths
-**File:line:** `.mcp.json:4,8,9` — `C:\Users\nigga\...` paths.
+**File:line:** `.mcp.json:4,8,9` — `C:\Users\dev\...` paths.
 
 **Risk:** medium — regenerated per-machine by `installer/setup_mcp_clients.py`; other contributors
 get broken MCP wiring. Should be gitignored; `mcp_setup.bat` is the canonical entry point.

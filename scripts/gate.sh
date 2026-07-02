@@ -236,6 +236,33 @@ stage_ui_imgui() {
     fi
 }
 
+# ---- Stage 6: model-eval bench smoke (T-H8) ---------------------------------
+# Optional, env-gated SKIP like the OCCT stages: runs the product-task eval benches at
+# smoke size. Default is SKIP (stays green) so the gate does not depend on the flywheel;
+# set AICAD_RUN_BENCH=1 to opt in, and then a bench error DOES fail the gate. The bench
+# framework is stdlib-only, so it needs nothing but python3.
+stage_bench() {
+    echo "=== [6/6] model-eval bench smoke (T-H8) ==="
+    if [ "${AICAD_RUN_BENCH:-0}" != "1" ]; then
+        record "bench (T-H8)        SKIP    set AICAD_RUN_BENCH=1 to run smoke-size eval benches"
+        echo "  SKIP: AICAD_RUN_BENCH not set"
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        record "bench (T-H8)        SKIP    python3 not on PATH"
+        echo "  SKIP: python3 not installed"
+        return 0
+    fi
+    if ! python3 -m tools.flywheel.bench.runner --smoke --all --no-write > /tmp/gate_bench.out 2>&1; then
+        record "bench (T-H8)        FAIL    a smoke bench errored (see /tmp/gate_bench.out)"
+        echo "  FAIL: bench smoke"; tail -n 15 /tmp/gate_bench.out | sed 's/^/    /'
+        fail_fatal=1
+        return 0
+    fi
+    record "bench (T-H8)        PASS    smoke benches ran ($(rg -c 'baselines\[' /tmp/gate_bench.out 2>/dev/null || echo '?') reported)"
+    echo "  PASS"; tail -n 8 /tmp/gate_bench.out | sed 's/^/    /'
+}
+
 # ---- main -------------------------------------------------------------------
 CORE_BUILD_OK=0
 stage_check
@@ -244,6 +271,7 @@ stage_ui_abstract
 stage_ctest
 stage_pytest
 stage_ui_imgui
+stage_bench
 
 echo
 echo "============================================================"

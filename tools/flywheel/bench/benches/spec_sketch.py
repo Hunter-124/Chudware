@@ -294,13 +294,19 @@ def _dims_in_tol(spec_dims: dict, realized: dict, family: str, tol: float) -> tu
 # ---- op-wire conversion for the live-core path --------------------------------
 
 def _to_op_feature(sketch: dict) -> dict:
-    """Storage-shape sketch (params/refs) -> the flattened add_feature op wire shape that
-    `core_bridge.call('doc_apply_ops', ...)` expects (mirrors mcp_server/test_cad_tools.py's
-    proven `_rect_sketch` helper: entities/constraints top-level, plane as a bare keyword)."""
+    """Sketch feature in the shape `core_bridge.call('doc_apply_ops', {'op':'add_feature'})`
+    validates against. Verified empirically against the built core: the engine requires
+    `params.entities` and `params.constraints` (the storage shape) — a flattened
+    top-level entities/constraints fails validation ("required for sketch"). So the op
+    feature is the storage feature, with the sketch plane under `refs`."""
     return {
-        "id": sketch["id"], "type": "sketch", "plane": "top",
-        "entities": sketch["params"]["entities"],
-        "constraints": sketch["params"]["constraints"],
+        "id": sketch["id"], "type": "sketch", "name": sketch.get("name", sketch["id"]),
+        "suppressed": False,
+        "params": {
+            "entities": sketch["params"]["entities"],
+            "constraints": sketch["params"]["constraints"],
+        },
+        "refs": {"plane": "plane.top"},
     }
 
 
@@ -372,10 +378,18 @@ def score_example(spec: dict, *, doc_id_opener=None) -> ExampleScore:
             from services.verify.battery import verify  # noqa: local import, core-only path
             fid = op_feature["id"]
             battery = verify(doc_id, ["check_sketch"], sketch=fid)
-            solved = cb.call("doc_sketch_solve", {"doc_id": doc_id, "sketch_fid": fid})
-            status = solved.get("status", "under")
+            extra = {"battery_scores": battery.get("scores", {})}
+            try:
+                solved = cb.call("doc_sketch_solve", {"doc_id": doc_id, "sketch_fid": fid})
+                status = solved.get("status", "under")
+            except Exception as se:
+                # doc_sketch_solve isn't in every core build; keep the (real) through-battery
+                # check_sketch result and derive status from the DOF proxy, recording why.
+                status = solver_status_proxy(sketch)
+                extra["solver_status_source"] = "proxy (doc_sketch_solve unavailable)"
+                extra["solver_note"] = f"{type(se).__name__}: {se}"[:120]
             return score_sketch(spec, sketch, mode="live", solver_status=status,
-                                detail_extra={"battery_scores": battery.get("scores", {})})
+                                detail_extra=extra)
         except Exception as e:  # core error -> fall back to fixture scoring, record why
             return score_sketch(spec, sketch, mode="fixture",
                                 detail_extra={"live_error": f"{type(e).__name__}: {e}"[:160]})

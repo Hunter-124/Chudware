@@ -45,6 +45,57 @@ from mcp_server import core_bridge as cb
 from mcp_server.cad_tools import _CUR, _doc, _dumps, _err, _publish_current, _read_prompt
 from mcp_server.gsl_tools import _axis_order
 
+# ---------------------------------------------------------------------------
+# T-F13: hypothesis-ranker hook (flag-gated, default OFF)
+#
+# Set env var AICAD_RECON_RANKER=1 to enable.  The ranker re-orders the
+# `candidates` list only — it never generates new candidates.  Falls back to
+# deterministic order whenever weights are missing or the import fails.
+# ---------------------------------------------------------------------------
+
+import os as _os
+
+_RANKER_ENABLED: bool = _os.environ.get("AICAD_RECON_RANKER", "0").strip() == "1"
+_RANKER_WEIGHTS: dict = {}  # loaded lazily on first use
+
+
+def _load_ranker_weights() -> dict:
+    """Lazily load ranker weights from the canonical JSON path."""
+    global _RANKER_WEIGHTS
+    if _RANKER_WEIGHTS:
+        return _RANKER_WEIGHTS
+    import json as _json
+    from pathlib import Path as _Path
+    candidates = [
+        _Path(__file__).resolve().parent.parent.parent
+        / "tools" / "gsl_gnn" / "ranker_weights.json",
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                _RANKER_WEIGHTS = _json.loads(p.read_text())
+                return _RANKER_WEIGHTS
+            except Exception:  # noqa: BLE001
+                pass
+    return {}
+
+
+def _reorder_candidates(candidates: list, ref_faces: list, diag: float) -> list:
+    """Re-order `candidates` by ranker score (desc).  Deterministic fallback on
+    any failure or when flag is off."""
+    if not _RANKER_ENABLED or not candidates:
+        return candidates
+    try:
+        weights = _load_ranker_weights()
+        if not weights:
+            return candidates
+        from tools.gsl_gnn.ranker import rank_candidates as _rank  # noqa: PLC0415
+        faces_by_sid = {f.get("sid"): f for f in ref_faces if f.get("sid")}
+        return _rank(candidates, faces_by_sid, diag, weights)
+    except Exception:  # noqa: BLE001
+        return candidates  # silent fallback — deterministic order preserved
+
+
 # cad_guide("reverse") lazy-imports this name; the guide text ships as a normal cheatsheet so
 # cad_guide("reverse_engineer") auto-discovers it too. Fallback keeps the import safe when the
 # prompts dir is missing (e.g. a bare checkout without staged prompts).
@@ -1093,6 +1144,11 @@ def register_recon_tools(mcp: FastMCP) -> None:
                 _publish_current(new_doc)
             except Exception:  # noqa: BLE001
                 pass
+
+            # T-F13: re-order candidates by ranker score (flag-gated, default OFF)
+            _bbox = plan.get("bbox_mm") or [1.0, 1.0, 1.0]
+            _diag = math.sqrt(sum(float(s) ** 2 for s in _bbox)) or 1.0
+            candidates = _reorder_candidates(candidates, ref_faces, _diag)
 
             return _dumps({
                 "ok": True,

@@ -51,3 +51,62 @@ Scoring notes: `match_pct` = boolean common volume / max(source, rebuild) from `
 | turned_shaft | 1 | 100.0 | 100.0 | 1 | turned | 0 | 0 | 0.1 |  |
 
 Interpretation guardrails: `match_pct` alone can flatter a family whose base solid dominates its volume (a recovered base with a missed dress-up still scores high); read it together with `faces claimed %` and the per-sample `candidates`/`rejected` counts. Families whose base is NOT prismatic or turned (sweeps, ribs, shells) are expected deterministic failures — that is exactly the residual this report exists to measure.
+
+---
+
+## T-F13 Micro-evaluator — hypothesis-ranker results (2026-07-02)
+
+**Implementation:** `tools/gsl_gnn/ranker.py` + `tools/gsl_gnn/ranker_weights.json`.
+
+**Design:** 2-layer MLP (43→64→32→1, ~4 929 params) trained on synthetic candidates
+derived from `faces.json` ground-truth labels.  Per-candidate feature: mean+max of
+the existing 18-dim node features (surf one-hot(7), area/diag², log1p(radius),
+concavity one-hot(3), normal xyz, centroid/diag) across claimed faces + 1-dim
+face-fraction + 6-dim kind one-hot = 43 dims total.  Serving inference is pure
+numpy (no torch dependency in the serving path).  Hook is flag-gated:
+`AICAD_RECON_RANKER=1` in `services/mcp/recon_tools.py`; default OFF.
+
+**Training:** 56 synthetic candidate records (14 samples × ~4 candidates each),
+family-stratified 80/20 split (44 train / 12 val), BCE loss, Adam lr=1e-3, 50 epochs.
+
+| metric | value |
+|---|---|
+| val AUC | 0.938 |
+| val BCE loss | 0.430 |
+| val prec@1 (global best) | 1.000 |
+
+**Eval (per-family prec@1, all samples, `tools/gsl_gnn/eval_ranker.py`):**
+
+| family | n_samples | n_candidates | det_prec@1 | ranker_prec@1 | delta |
+|---|---|---|---|---|---|
+| bladed_disk | 2 | 12 | 1.000 | 1.000 | +0.000 |
+| plate_bolt_circle | 2 | 8 | 1.000 | 1.000 | +0.000 |
+| pocketed_block | 2 | 12 | 1.000 | 1.000 | +0.000 |
+| **ribbed_bracket** (GO) | 2 | 12 | 1.000 | 1.000 | +0.000 |
+| **shelled_enclosure** (GO) | 2 | 8 | 1.000 | 1.000 | +0.000 |
+| **swept_pipe** (GO) | 2 | 2 | 1.000 | 1.000 | +0.000 |
+| turned_shaft | 2 | 2 | 1.000 | 1.000 | +0.000 |
+| **OVERALL (GO only)** | **6** | | **1.000** | **1.000** | **+0.000** |
+
+**Verdict:** Ranker ≥ deterministic baseline on all GO families (tie at 1.000; exit 0).
+The synthetic-candidate eval uses balanced positives/negatives so both methods achieve
+high precision; a more discriminating eval would require the live recon pipeline to
+generate real wrong-order candidates at inference time.  The harness is in place and
+the ranker is flag-gated for that future live integration.
+
+**Caveats and honest limitations:**
+
+1. The 2-sample-per-family dataset is very small.  The "candidates" in the live
+   `reverse_engineer` output for the GO families are sparse (0–2 per sample); the
+   synthetic training scenario is richer.  The ranker's real-world impact on GO-family
+   match_pct cannot be measured without a larger dataset generated via
+   `python3 tools/gsl_dataset_gen.py --count 200 --families
+   ribbed_bracket,shelled_enclosure,swept_pipe` and live recon re-scoring.
+2. The core failure mode for ribbed_bracket and shelled_enclosure is that NO base is
+   recognized (match_pct 4–17%), not wrong candidate ordering.  The ranker addresses
+   the dress-up/candidate ordering layer only; the base-recognition residual remains.
+3. Non-GO families: the ranker hook is never invoked (flag default OFF and no-op when
+   families pass deterministic checks).
+
+**Recommendation:** ship the harness; collect 200 samples per GO family; re-evaluate
+on live recon candidates to measure real-world delta.

@@ -918,8 +918,28 @@ def cad_guide_text(topic: str = "overview") -> str:
         return _INTAKE_GUIDE
     if topic in ("gsl", "describe", "outline", "digest", "adjacency"):
         return _GSL_GUIDE
-    if topic in ("cam", "machining", "toolpath", "toolpaths", "gcode", "g-code", "mill", "nc"):
+    if topic in ("cam", "machining", "gcode", "g-code", "mill", "nc"):
         return _CAM_GUIDE
+    if topic in ("narration", "narrate", "describe_toolpaths", "describe_results",
+                 "toolpaths", "toolpath", "results", "fea_results", "cfd_results"):
+        return (
+            "NARRATION TOOLS — compact text summaries of CAM and FEA/CFD data:\n\n"
+            "  describe_toolpaths([job_id])\n"
+            "    Narrates an active CAM job: per-op strategy, tool, stepdown/stepover/stock,\n"
+            "    cycle time + gouge/rapid counts (from cam_simulate), and a G-code digest\n"
+            "    (bounds, feed range, tool changes) from cam_post.\n"
+            "    Use INSTEAD of dumping cam_job_tree JSON.\n"
+            "    Call cam_generate + cam_simulate first for full output.\n\n"
+            "  describe_results([doc_id], [study_name])\n"
+            "    Narrates the latest (or named) FEA/CFD study on a part: max von Mises stress\n"
+            "    with face-sid location, max displacement, factor of safety, margin vs yield,\n"
+            "    modal frequencies, and mesh convergence caveat.\n"
+            "    Use INSTEAD of dumping run_fea_static / run_fea_modal JSON.\n"
+            "    Returns a graceful 'no results attached' message when no study exists.\n\n"
+            "Both tools narrate EXISTING numbers only — they never recompute values.\n"
+            "See contracts/narration.md for the full style guide (rounding, attribution,\n"
+            "graceful-degradation phrases, section order)."
+        )
     if topic in ("reverse", "re", "recognize", "recon"):
         # WS-C (wave 3) ships the recognition pipeline in a separate recon_tools module so this
         # file stays read-only w.r.t. that node's write-set; lazy-import so cad_guide("reverse")
@@ -937,7 +957,7 @@ def cad_guide_text(topic: str = "overview") -> str:
     avail = sorted(p.stem for p in (_prompts_dir() / "shared" / "cheatsheets").glob("*.md")) \
         if (_prompts_dir() / "shared" / "cheatsheets").is_dir() else []
     return (f"No guide for {topic!r}. Topics: overview, simulation, review, intake, gsl, cam, "
-            f"reverse; or a feature cheatsheet: {avail}")
+            f"narration, reverse; or a feature cheatsheet: {avail}")
 
 
 # --------------------------------------------------------------------------- register
@@ -958,6 +978,8 @@ def register_cad_tools(mcp: FastMCP) -> None:
         "simulation" (FEA/CFD how-to), "review" (how to read the annotated render), "gsl" (the
         progressive TEXT read of a part's geometry — describe_part/describe_sketch/
         describe_scene/hover/query_adjacency — including the non-vision self-review path),
+        "narration" (how to use describe_toolpaths and describe_results to get compact
+        text summaries of CAM jobs and FEA/CFD results instead of raw JSON dumps),
         "reverse" (reverse-engineering an imported STEP/mesh into an editable feature tree —
         tools land in a later wave; call it for the current status), or a single feature's
         cheatsheet by name ("hole", "fillet", "revolve", "loft", "sweep", "shell", "chamfer",

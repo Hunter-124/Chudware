@@ -453,11 +453,36 @@ def _in_quotes_hash(line: str) -> bool:
 # Training execution
 # ---------------------------------------------------------------------------
 
+def _load_train_dataset(dataset_path: Path) -> Any:
+    """Load a JSONL training dataset from a DVC-pulled path (lazy import).
+
+    Accepts a single .jsonl file or a directory (globs ``**/*.jsonl``).
+    T-H5's exporter (tools/flywheel/export.py) produces JSONL shards, so
+    that is the one format the fleet runner consumes.
+    """
+    try:
+        from datasets import load_dataset  # type: ignore[import]
+    except ImportError as exc:
+        raise ImportError(
+            "Training requires the 'datasets' package to load JSONL shards. "
+            "Run: pip install datasets  (Apache-2.0)"
+        ) from exc
+
+    if dataset_path.is_dir():
+        files = sorted(str(p) for p in dataset_path.rglob("*.jsonl"))
+        if not files:
+            raise FileNotFoundError(f"No *.jsonl shards under {dataset_path}")
+    else:
+        files = [str(dataset_path)]
+    return load_dataset("json", data_files=files, split="train")
+
+
 def _run_training(
     job: dict,
     recipe: dict,
     adapter_out: Path,
     dry_run: bool = False,
+    dataset_path: Path | None = None,
     _train_fn: Any = None,
 ) -> dict:
     """Run training for a job, or delegate to _train_fn if provided.
@@ -467,6 +492,8 @@ def _run_training(
         recipe:     parsed recipe dict
         adapter_out: directory where the adapter should be written
         dry_run:    if True, write a placeholder and return without real training
+        dataset_path: DVC-pulled dataset location (file or shard directory);
+                    required for real training, ignored for dry_run/_train_fn
         _train_fn:  optional callable(job, recipe, adapter_out) -> metrics dict.
                     Injected by tests to avoid requiring the ML stack.
 
@@ -477,6 +504,16 @@ def _run_training(
 
     if _train_fn is not None:
         return _train_fn(job, recipe, adapter_out)
+
+    # SEAM(T-H9): GRPO needs a reward source; recipes ship reward_model: null
+    # until the verifier-battery reward is wired. Refuse loudly, per the
+    # grpo_lora.yaml contract, BEFORE any model download.
+    method_early = recipe.get("method", "sft").lower()
+    if method_early == "grpo" and recipe.get("grpo", {}).get("reward_model") is None:
+        raise ValueError(
+            "GRPO recipe has reward_model: null (SEAM T-H9) — the runner "
+            "refuses to execute GRPO until a reward source is configured."
+        )
 
     if dry_run:
         # Write a placeholder adapter config so provenance checks work
@@ -556,6 +593,13 @@ def _run_training(
 
     train_cfg = recipe.get("training", {})
 
+    if dataset_path is None:
+        raise ValueError(
+            "Real training requires dataset_path (the DVC-pulled dataset "
+            "location); only dry_run/_train_fn may omit it."
+        )
+    train_ds = _load_train_dataset(dataset_path)
+
     metrics: dict[str, float] = {}
 
     if method == "sft":
@@ -571,7 +615,8 @@ def _run_training(
             logging_steps=train_cfg.get("logging_steps", 10),
             save_strategy="no",
         )
-        trainer = SFTTrainer(model=model, tokenizer=tokenizer, args=trainer_args)
+        trainer = SFTTrainer(model=model, tokenizer=tokenizer, args=trainer_args,
+                             train_dataset=train_ds)
         result = trainer.train()
         metrics["train_loss"] = getattr(result, "training_loss", 0.0)
 
@@ -591,7 +636,8 @@ def _run_training(
             beta=float(dpo_cfg.get("beta", 0.1)),
             loss_type=dpo_cfg.get("loss_type", "sigmoid"),
         )
-        trainer = DPOTrainer(model=model, tokenizer=tokenizer, args=trainer_args)
+        trainer = DPOTrainer(model=model, tokenizer=tokenizer, args=trainer_args,
+                             train_dataset=train_ds)
         result = trainer.train()
         metrics["train_loss"] = getattr(result, "training_loss", 0.0)
 
@@ -608,7 +654,8 @@ def _run_training(
             logging_steps=train_cfg.get("logging_steps", 10),
             save_strategy="no",
         )
-        trainer = GRPOTrainer(model=model, tokenizer=tokenizer, args=trainer_args)
+        trainer = GRPOTrainer(model=model, tokenizer=tokenizer, args=trainer_args,
+                              train_dataset=train_ds)
         result = trainer.train()
         metrics["train_loss"] = getattr(result, "training_loss", 0.0)
 
@@ -793,9 +840,11 @@ def run_job(
     adapter_out.mkdir(parents=True, exist_ok=True)
 
     # Run training
+    dataset_path = (training_root / dataset_hash) if dataset_hash else None
     metrics = _run_training(
         job, recipe, adapter_out,
         dry_run=dry_run,
+        dataset_path=dataset_path,
         _train_fn=_train_fn,
     )
 
@@ -805,8 +854,30 @@ def run_job(
     # Provenance record
     provenance = _build_provenance(job, recipe, adapter_out, mlflow_run_id)
 
-    # Mark job as review
+    # Push adapter artifacts to the DVC remote (skipped when training_root is
+    # not a DVC repo — e.g. unit tests / dry smoke without dvc init).
+    adapter_pushed = False
+    if (training_root / ".dvc").exists():
+        try:
+            from tools.flywheel.dvc_init import add_to_dvc, dvc_push
+            add_to_dvc(training_root, adapter_out)
+            dvc_push(training_root)
+            adapter_pushed = True
+        except Exception as exc:
+            warnings.warn(
+                f"runner: DVC adapter push failed ({exc}) — adapter remains "
+                "local-only; push manually with tools/flywheel/dvc_init.py",
+                stacklevel=2,
+            )
+
+    # Mark job as review + append a fleet-visible completion note (work.py idiom)
     _set_job_field(path, status="review")
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    note = (f"\n- {stamp} [{owner}] completed: adapter={adapter_out} "
+            f"mlflow_run={mlflow_run_id} pushed={adapter_pushed} "
+            f"metrics={json.dumps(metrics, default=str)}\n")
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(note)
 
     # Git commit status update (best-effort)
     repo_root = _find_git_root(jobs_dir)
@@ -832,6 +903,7 @@ def run_job(
     return {
         "job_id": job.get("id", ""),
         "adapter_out": str(adapter_out),
+        "adapter_pushed": adapter_pushed,
         "mlflow_run_id": mlflow_run_id,
         "provenance_path": str(adapter_out / "provenance.json"),
         "metrics": metrics,

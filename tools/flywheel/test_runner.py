@@ -126,6 +126,28 @@ training:
     assert recipe["training"]["max_steps"] == 50
 
 
+def test_grpo_null_reward_model_refused(tmp_path):
+    """GRPO with reward_model: null (SEAM T-H9) must be refused before training."""
+    from tools.flywheel.runner import _run_training
+
+    recipe = {"method": "grpo", "grpo": {"reward_model": None}}
+    with pytest.raises(ValueError, match="reward_model"):
+        _run_training({"id": "j1"}, recipe, tmp_path / "adapter")
+
+
+def test_run_training_real_path_requires_dataset(tmp_path):
+    """Real (non-dry) training without dataset_path must fail fast, not mid-download."""
+    from tools.flywheel.runner import _run_training
+
+    recipe = {"method": "sft", "unsloth": {"enabled": False}}
+    with pytest.raises((ValueError, ImportError)):
+        # Either the dataset_path guard fires (ValueError) or, if transformers
+        # is genuinely absent, the lazy-import guard fires first (ImportError).
+        # Both are fail-fast; neither may silently construct a trainer.
+        _run_training({"id": "j1", "base_model": ""}, recipe,
+                      tmp_path / "adapter", dataset_path=None)
+
+
 def test_parse_flat_yaml_fallback_matches_recipes():
     """The PyYAML-free fallback parser must correctly parse every shipped recipe."""
     from tools.flywheel.runner import _parse_flat_yaml

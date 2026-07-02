@@ -154,6 +154,7 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 Fable STUCK-AUDIT: fleet healthy — F1/F3/F5/F9/F14/E1/C1/D1 all status:review at branch tips (board shows doing until merge); fable-arc ACTIVE on T-F16 (commit 35s ago at audit). ONE casualty: opus-finch/T-E4 dead at claim (2h, nothing pushed — session-limit pattern); claim RELEASED, redispatching sonnet-pax chained off T-E2 per the recorded merge order (E1→E2→{E3,E4})
 - 2026-07-02 sonnet-pax CLAIMED T-E4 (redispatch from opus-finch; worktree at /home/hunter/Repositories/CAD-T-E4 on branch task/T-E4-cfd-handoff based on origin/task/T-E2-network-solve)
 - 2026-07-02 sonnet-pax REVIEW T-E4 branch=task/T-E4-cfd-handoff (merge order: E1 → E2 → {E3, E4} — E3 and E4 are independent siblings)
+- 2026-07-02T18:30Z sonnet-lux CLAIMED T-E5 (chained off task/T-E3-gas-heat-props; merge order E1 → E2 → E3 → E5)
 5. **You own your children's lifecycle.** If you fan out background subagents, stopping
    them is part of YOUR closeout: when your deliverable is done, TaskStop every child
    you spawned and confirm before exiting. An orphaned researcher burning usage for

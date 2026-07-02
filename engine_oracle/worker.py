@@ -197,6 +197,21 @@ except Exception as _deliv_import_err:  # noqa: BLE001
         _deliv_import_err)
 # === end Deliverables ===
 
+# === Parts library seam (T-U2, Pillar 17) — part_search / part_get / part_place ===
+# Reaches the unified parts hub (engine_oracle/parts_hub/) over the same worker seam so the
+# C++/ImGui parts browser panel (ui/imgui/src/ui/parts_panel.cpp) fetches results
+# asynchronously via AsyncRpc with no bespoke transport.  Degrades gracefully when the hub
+# or its backing data is unavailable (returns empty results, never a traceback).
+try:
+    from engine_oracle.parts_hub.worker_rpc import WORKER_METHODS as _PARTS_METHODS  # noqa: E402
+    _METHODS.update(_PARTS_METHODS)
+except Exception as _parts_import_err:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger("ai-cad.worker").warning(
+        "engine_oracle.parts_hub.worker_rpc unavailable — part_search/get/place not registered: %s",
+        _parts_import_err)
+# === end Parts library ===
+
 
 def _emit(obj: dict) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")

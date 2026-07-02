@@ -467,28 +467,14 @@ def _solve_sync_or_handoff(kind: str, fn, progress: Optional[dict] = None,
 
 # A small material library so FEA tools take a friendly name. Fields are exactly what the
 # host's study expects (host/src/ui/sim_manager.cpp): E in MPa, density g/cm^3, strengths MPa.
-_MATERIALS: dict = {
-    "steel": {"name": "Mild steel (A36)", "E_mpa": 200000, "nu": 0.29, "density_g_cm3": 7.85,
-              "yield_mpa": 250, "ultimate_mpa": 400, "endurance_mpa": 200},
-    "stainless": {"name": "Stainless 304", "E_mpa": 193000, "nu": 0.29, "density_g_cm3": 8.0,
-                  "yield_mpa": 215, "ultimate_mpa": 505, "endurance_mpa": 240},
-    "aluminum": {"name": "Aluminium 6061-T6", "E_mpa": 69000, "nu": 0.33, "density_g_cm3": 2.70,
-                 "yield_mpa": 276, "ultimate_mpa": 310, "endurance_mpa": 96},
-    "titanium": {"name": "Titanium Ti-6Al-4V", "E_mpa": 113800, "nu": 0.342, "density_g_cm3": 4.43,
-                 "yield_mpa": 880, "ultimate_mpa": 950, "endurance_mpa": 510},
-    "brass": {"name": "Brass C360", "E_mpa": 97000, "nu": 0.34, "density_g_cm3": 8.5,
-              "yield_mpa": 124, "ultimate_mpa": 338, "endurance_mpa": 120},
-    "abs": {"name": "ABS plastic", "E_mpa": 2300, "nu": 0.35, "density_g_cm3": 1.04,
-            "yield_mpa": 40, "ultimate_mpa": 44, "endurance_mpa": 15},
-    "pla": {"name": "PLA plastic", "E_mpa": 3500, "nu": 0.36, "density_g_cm3": 1.24,
-            "yield_mpa": 50, "ultimate_mpa": 50, "endurance_mpa": 18},
-}
-_MATERIAL_ALIASES: dict = {
-    "mild steel": "steel", "carbon steel": "steel", "a36": "steel",
-    "ss": "stainless", "304": "stainless", "stainless steel": "stainless",
-    "aluminium": "aluminum", "al": "aluminum", "6061": "aluminum", "alu": "aluminum",
-    "ti": "titanium", "ti-6al-4v": "titanium",
-}
+# T-F2: these are now sourced from the unified `engine.materials` registry — the single
+# provenance-stamped first-party table — instead of a literal here, so the FEA path, DfM
+# and the `material_lookup` research helper can never drift apart. `fea_table()` reproduces
+# exactly the legacy 7-entry library + `fea_aliases()` the alias map (values unchanged).
+from engine import materials as _materials_registry  # noqa: E402
+
+_MATERIALS: dict = _materials_registry.fea_table()
+_MATERIAL_ALIASES: dict = _materials_registry.fea_aliases()
 
 
 def _resolve_material(material: Union[str, dict, None]) -> dict:

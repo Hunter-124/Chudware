@@ -21,7 +21,8 @@ Five public entry points:
 * :func:`modeled_dim` — the stacked, build-ready dimension for a mating feature.
 * :func:`process_block_text` — the human-readable PROCESS BLOCK appended to the planner prompt.
 
-Stdlib-only; no engine/OCP imports so it is safe to use from any layer.
+Stdlib plus a lazy read of the stdlib-only ``engine.materials`` registry (default
+densities, T-F2); no OCP/heavy imports, so it stays safe to use from any layer.
 """
 from __future__ import annotations
 
@@ -81,14 +82,28 @@ class ProcessProfile:
         }
 
 
+def _reg_density(name: str, fallback: float) -> float:
+    """Density (g/cm^3) from the unified ``engine.materials`` registry (T-F2: the single
+    provenance-stamped material table) so the DfM default density is not maintained
+    independently of sim / ``material_lookup``. Falls back to the literal if the material
+    ever drops out of the registry. Lazy import keeps this module dependency-light."""
+    try:
+        from engine import materials as _mat
+        d = _mat.density(name)
+        return float(d) if d is not None else fallback
+    except Exception:  # noqa: BLE001 - registry optional; never break profile construction
+        return fallback
+
+
 # The load-bearing numbers from the plan's section-5 table. FDM is the default; its values are
 # the printable ones the rest of the pipeline trusts. A ``None`` clearance means the fit class is
 # not meaningful for that process (e.g. sheet/laser do not get a diametral shaft-in-bore class).
+# T-F2: material_default densities now read from the unified engine.materials registry.
 PROFILES: dict[str, ProcessProfile] = {
     # ---- DEFAULT -----------------------------------------------------------------
     "fdm": ProcessProfile(
         process="fdm",
-        material_default={"name": "PLA", "density_g_cm3": 1.24},
+        material_default={"name": "PLA", "density_g_cm3": _reg_density("pla", 1.24)},
         min_wall_mm=1.0,
         min_feature_mm=0.8,
         hole_comp_mm=0.20,                # printed holes shrink; oversize the bore by this
@@ -102,7 +117,7 @@ PROFILES: dict[str, ProcessProfile] = {
     # ---- subtractive -------------------------------------------------------------
     "cnc_mill": ProcessProfile(
         process="cnc_mill",
-        material_default={"name": "Aluminium 6061-T6", "density_g_cm3": 2.70},
+        material_default={"name": "Aluminium 6061-T6", "density_g_cm3": _reg_density("6061", 2.70)},
         min_wall_mm=0.5,
         min_feature_mm=0.5,
         hole_comp_mm=0.0,                 # drilled/reamed to size — no print compensation
@@ -114,7 +129,7 @@ PROFILES: dict[str, ProcessProfile] = {
     ),
     "lathe": ProcessProfile(
         process="lathe",
-        material_default={"name": "Aluminium 6061-T6", "density_g_cm3": 2.70},
+        material_default={"name": "Aluminium 6061-T6", "density_g_cm3": _reg_density("6061", 2.70)},
         min_wall_mm=0.5,
         min_feature_mm=0.5,
         hole_comp_mm=0.0,
@@ -127,7 +142,7 @@ PROFILES: dict[str, ProcessProfile] = {
     # ---- formed / cut sheet ------------------------------------------------------
     "sheet_metal": ProcessProfile(
         process="sheet_metal",
-        material_default={"name": "Steel (mild)", "density_g_cm3": 7.85},
+        material_default={"name": "Steel (mild)", "density_g_cm3": _reg_density("steel", 7.85)},
         min_wall_mm=1.0,                  # "gauge" — the sheet thickness is the wall
         min_feature_mm=1.0,
         hole_comp_mm=0.0,
@@ -140,7 +155,7 @@ PROFILES: dict[str, ProcessProfile] = {
     ),
     "laser": ProcessProfile(
         process="laser",
-        material_default={"name": "Acrylic", "density_g_cm3": 1.18},
+        material_default={"name": "Acrylic", "density_g_cm3": _reg_density("acrylic", 1.18)},
         min_wall_mm=1.0,
         min_feature_mm=0.5,
         hole_comp_mm=0.0,                 # 2D cut; kerf is the comp, handled per-job
@@ -153,7 +168,7 @@ PROFILES: dict[str, ProcessProfile] = {
     # ---- molded ------------------------------------------------------------------
     "injection": ProcessProfile(
         process="injection",
-        material_default={"name": "ABS", "density_g_cm3": 1.04},
+        material_default={"name": "ABS", "density_g_cm3": _reg_density("abs", 1.04)},
         min_wall_mm=1.0,
         min_feature_mm=0.5,
         hole_comp_mm=0.0,                 # cavity shrink is modeled as a global shrink %, not a bore add

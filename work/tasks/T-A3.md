@@ -44,3 +44,20 @@ Gate nodes implement human approval checkpoints via LangGraph `interrupt()`. Whe
 - `graphify query "interrupt resume LangGraph checkpoint"` — check if any prior usage in repo
 - Relevant files: `core/agent/machine.h`, `services/dag/executor.py`
 - LangGraph interrupt pattern: `from langgraph.types import interrupt` — call inside the node function; the graph raises `GraphInterrupt`; resume via `graph.invoke(None, config={"configurable": {"thread_id": run_id}})`
+
+## Driver notes (Fable, 2026-07-02 — WS-A opened to agents; chain off A2)
+
+- Branch FROM T-A2's branch when it exists (merge order A1 → A2 → A3).
+- machine.h VERDICT_PAUSE is a C++ change: rebuild core AND RESTAGE libaicad.so — the
+  staged .so is stale (predates sim_run_static; open board note says "next C++ task
+  refreshes it" — that is YOU; record the restage in your check-in so Python suites
+  stop skipping).
+- Gate question payloads MUST be shaped as T-F3 interaction-contract ask_user calls
+  (kind=approval, ledger-backed) so T-F4's migration is a thin adapter, not a rewrite —
+  contracts/interaction.md is on master by then (or origin/task/T-F3-interaction-contract).
+- autonomy levels are FROZEN in aicad.dag/1 (auto/approve/manual, per-run default +
+  per-node override) — implement exactly; resume(run_id, decision) re-opens A1's
+  SqliteSaver checkpoint.
+- interrupt() persistence must survive app restart (the DoD's suspend-across-restart is
+  the hard bit — test it by re-instantiating the executor against the same checkpoint
+  DB, not by mocking).

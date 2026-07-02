@@ -44,3 +44,19 @@ Each DAG node is executed by wrapping the existing agent: the node receives a **
 - `graphify explain "describe_part GSL"` — understand GSL describe_part output format
 - Relevant files: `services/agent/loop.py`, `engine_oracle/kernel.py`, `services/mcp/server.py`
 - Retry budget: store as `node_state["retry_remaining"]`; node_runner decrements on each `retry` verdict; when 0 → `escalate` (triggers gate node)
+
+## Driver notes (Fable, 2026-07-02 — WS-A opened to agents; chain off A1)
+
+- Branch FROM origin/task/T-A1-dag-schema (merge order A1 → A2). aicad.dag/1 is FROZEN
+  there — build against it; gaps → work/questions/T-A2.md, never silent amendments.
+- A1 already landed executor.py (run() + SqliteSaver + the 8-event table) and
+  graph_loader.py (validate_graph/build_state_graph) with reserved seams — node_runner
+  plugs into executor per those seams; read services/dag/test_executor.py (17 tests)
+  for the executor's expected behavior before wiring.
+- Context packs: use the T-F7/T-F8 describers (describe_part / describe_project GSL
+  output) — NEVER raw doc JSON. Allowed-tools list comes from the node def; the wrapping
+  surface is services/agent/loop.py (read-only; wrap, don't modify).
+- Event emission MUST go through A1's event table via a callback/hook (T-F17 will tap
+  this stream for mission-control) — no hardwired prints/logging as the event channel.
+- dag_planner.md: ≤20 nodes, every cycle back-edge carries retry_budget ≤3, include the
+  soil-moisture-sensor worked example. langgraph deps already licensed by A1.

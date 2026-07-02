@@ -43,3 +43,16 @@ Verify nodes run deterministic checks as end conditions: `check_interference` (m
 - `graphify query "check_interference ecad DRC ERC"` — locate existing tool implementations
 - Relevant files: `services/mcp/server.py`, `engine_oracle/ecad/`, `engine_oracle/sim/`
 - End-condition predicate is stored as a string in the graph JSON; evaluate with `eval(predicate, {"result": tool_result})` inside a try/except — or use a safe predicate DSL
+
+## Driver notes (Fable, 2026-07-02 — WS-A opened to agents; chain off A3)
+
+- Branch FROM T-A3's branch (merge order A1 → A2 → A3 → A4).
+- Keep verify.py's check-type→tool dispatch a REUSABLE function/table — T-F12's
+  design_review() battery reuses it verbatim (recorded in T-F12 driver notes).
+- Tool availability caveat: budget→bom_price lives on the WS-B chain, firmware→fw_sim_run
+  on WS-C — by dispatch time these should be merged; if one is missing on your base,
+  mock it in tests and note [~], don't block.
+- The five dag_* MCP tools: services/mcp/server.py registrations APPEND-ONLY; follow
+  the existing registration pattern (hydraulic_tools.py / cost_tools.py are recent
+  exemplars). dag_approve resumes T-A3 gates — it is the MCP twin of resume(run_id,
+  decision); keep one implementation.

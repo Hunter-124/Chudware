@@ -40,3 +40,21 @@ v1 — the claim-file pattern is already trusted fleet-wide. Stack: Unsloth + TR
 - [ ] Job with `os: linux` is never claimed by a native-Windows runner (test)
 - [ ] Every artifact traceable: adapter → job → dataset hash → provenance
 - [ ] `graphify update .`; gate green
+
+## Driver notes (Fable, 2026-07-02 — pre-paid pointers + Erik's ratified calls)
+
+- ERIK RATIFIED: MLflow self-hosted via docker on THIS PC — EXTEND the T-H5 compose
+  setup in tools/flywheel/ (docker-compose.argilla.yml + .env pattern); add an MLflow
+  service (or sibling compose file), do NOT create a second stack or ask again.
+- DVC remote = local file:// default (ratified). tools/flywheel/dvc_init.py already has
+  the helpers INCLUDING the _dvc_cmd() shutil.which fix (DVC lives at ~/.local/bin/dvc,
+  not in mcp-venv) — reuse, don't re-implement.
+- Claim queue: mirror work/tools/work.py's atomic claim idiom exactly (stdlib, proven
+  fleet-wide). Jobs = files in training/jobs/ with owner field, git-synced. No
+  Prefect/Dagster (locked decision).
+- requires{os,vram_gb,cuda}: capability check in runner.py; test that os:linux jobs are
+  never claimed by a native-Windows runner via monkeypatched platform — no real Windows
+  box needed for the unit test; the two-machine smoke DoD is a HUMAN/fleet step, mark it
+  [~] with run instructions if you can't execute it.
+- Licenses: Unsloth/TRL/PEFT rows (Apache-2.0) in contracts/licenses.md. Recipes are
+  config files — they must not execute training in CI (capture-now-train-later stands).

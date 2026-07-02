@@ -2,8 +2,8 @@
 id: T-G2
 title: Restore doc-tab input, shrink Copilot header, PM button contrast
 workstream: G
-owner: unassigned
-status: todo
+owner: sonnet-mira
+status: doing
 branch: task/T-G2-doc-tab-input-fix
 day: 1
 depends_on: [T-G1]

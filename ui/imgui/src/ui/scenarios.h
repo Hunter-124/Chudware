@@ -37,6 +37,8 @@ struct ShotConfig {
     bool equationsShotDone = false;
     bool wantEcad = false;
     bool ecadShotDone = false;
+    bool wantBom = false;
+    bool bomShotDone = false;
 
     // Long-running scenario modes (ScenarioRunner step machines)
     bool wantM1 = false;

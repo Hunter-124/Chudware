@@ -217,3 +217,27 @@ gate.sh ui/imgui selMulti failure is PRE-EXISTING, never chase; commit+push ever
   the card inline in the Copilot bubble stream is deferred to the T-G7 copilot-panels wave rather
   than risk the hot-spot — see work/questions/T-F16.md. Standalone pane fully satisfies card
   (thumbnail/open-externally/regenerate) + file-explorer preview + async DoD bullets.
+
+### 2026-07-02 — OPUS-ARC TAKEOVER (Fable usage exhausted mid-arc)
+
+- **Fable ran dry during T-F16.** The T-F16 driver hit the Fable 5 account limit on its
+  final DoD-closeout call; Erik switched the session to Opus 4.8 and said "continue".
+  Per the continuation plan at the top of this log, this session is now **OPUS-ARC,
+  acting arc driver** (same mandate, orchestrator-only, budget now Opus-only).
+- **T-F16 state at takeover (GOOD — checkpointing worked):** implementation fully
+  landed + pushed in 5 commits (claim d7ae743, worker-RPC bridge 77b3d78, ui/abstract
+  view-model ef3f785, arc-log/questions 820f6e6, ui/imgui standalone pane+cards
+  b20aa43). **agent_panel.cpp UNTOUCHED** — hot-spot respected exactly; the pane +
+  artifact cards are standalone (preview_pane.*, artifact_cards.*, texture_cache.*,
+  open_external.*, ui/abstract/artifact_view.h + worker_rpc bridge). 21 files, +924.
+  MISSING: DoD closeout only — gate run, graphify update, status→review, FOREMAN
+  REVIEW line, and this log's demo-script finale.
+- **T-F16 questions ANSWERED (OPUS-ARC):** Q1 ACCEPT standalone-only surface; inline-
+  in-bubble card deferred to T-G7 (reuses drawArtifactCard + ArtifactCard unchanged;
+  clean BlockKind::Artifact append once T-F3/T-H1 merge) — matches the hot-spot rule.
+  Q2 ACCEPT Regenerate = refresh preview (evict textures + re-render_document); spec-
+  driven file rebuild stays agent-driven (would be a new deliverables tool / contract
+  change). Both sound.
+- Next: dispatch an Opus driver to finish ONLY T-F16's DoD closeout (verify the new
+  standalone UI compiles despite the pre-existing selMulti break, gate, graphify,
+  status→review, FOREMAN check-in, write the demo script here). Then arc = complete.

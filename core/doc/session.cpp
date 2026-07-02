@@ -94,6 +94,7 @@
 
 #include "doc/assembly.h"
 #include "doc/document.h"
+#include "doc/recon.h"    // C1/C2 WS-C reverse-engineering kernel primitives
 #include "doc/formats.h"
 #include "doc/picks.h"
 #include "doc/selectors.h"
@@ -102,6 +103,7 @@
 #include "doc/stepplus.h"
 #include "doc/validate.h"
 #include "geom/aicm.h"
+#include "geom/booleans.h"  // fuse_many — doc_eval_compare's default whole-doc shape
 #include "geom/plane.h"
 #include "geom/profile.h"
 #include "geom/tessellate.h"
@@ -6833,6 +6835,100 @@ json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
         {"pairs", pairs},
         {"dead_features", dead_features},
     };
+}
+
+// C1 (WS-C) — resolve one side of eval_compare: compile `doc_id` fresh, then pick either the
+// named body ("b1".."bN", the same naming doc_eval_interference's members use, 1-based AICM
+// order) or, by default, the fuse of every surviving solid body (mirrors doc_eval_interference's
+// part-doc member collection). Caller already holds the DocLock.
+TopoDS_Shape eval_compare_pick_shape(const std::string& doc_id, const json& params,
+                                     const char* body_key) {
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    if (r.shapes.empty())
+        throw OpError("invalid_op", "eval_compare: document '" + doc_id + "' has no bodies",
+                      {{"doc_id", doc_id}});
+    if (params.contains(body_key) && params[body_key].is_string()) {
+        const std::string name = params[body_key].get<std::string>();
+        if (name.size() > 1 && name.front() == 'b') {
+            try {
+                std::size_t consumed = 0;
+                const long idx = std::stol(name.substr(1), &consumed);
+                if (consumed == name.size() - 1 && idx >= 1 &&
+                    static_cast<std::size_t>(idx) <= r.shapes.size())
+                    return r.shapes[static_cast<std::size_t>(idx) - 1];
+            } catch (const std::exception&) {
+            }
+        }
+        throw OpError("invalid_op",
+                      "eval_compare: unknown body '" + name + "' in document '" + doc_id + "'",
+                      {{"doc_id", doc_id}, {"body", name}});
+    }
+    if (r.shapes.size() == 1) return r.shapes.front();
+    return ::geom::fuse_many(
+        r.shapes.front(), std::vector<TopoDS_Shape>(r.shapes.begin() + 1, r.shapes.end()));
+}
+
+// C1 (WS-C reverse-engineering) — general shape-vs-shape comparison; see session.h /
+// recon.h::compare_shapes for the full contract. Both docs compile fresh so a compare always
+// reflects the latest edit on either side (no ensure_compiled cache reuse).
+json doc_eval_compare(const json& params) {
+    DocLock lk;
+    const std::string doc_a_id = params.value("doc_a", std::string());
+    const std::string doc_b_id = params.value("doc_b", std::string());
+    if (doc_a_id.empty() || doc_b_id.empty())
+        throw OpError("invalid_op", "eval_compare requires doc_a and doc_b",
+                      {{"reason", "missing doc id"}});
+    TopoDS_Shape shape_a = eval_compare_pick_shape(doc_a_id, params, "body_a");
+    TopoDS_Shape shape_b = eval_compare_pick_shape(doc_b_id, params, "body_b");
+    return aicad::doc::compare_shapes(shape_a, shape_b);
+}
+
+// C2 (WS-C) — resolve params.face into a live TopoDS_Face on `body`: either a stable "sid"
+// handle (matched against make_selector's sid over the body's CURRENT faces — the handle
+// GSL's doc_query/describe_part hand back) or a selector/geom-query object (eval_resolve_ref's
+// own predicate-aware path — the same one doc_eval_measure's refs use).
+TopoDS_Face doc_face_wires_resolve(const TopoDS_Shape& body, const json& face_ref) {
+    if (!face_ref.is_object())
+        throw OpError("invalid_op", "doc_face_wires: params.face must be an object",
+                      {{"reason", "bad face ref"}});
+    if (face_ref.contains("sid") && face_ref["sid"].is_string() && !face_ref.contains("kind") &&
+        !aicad::doc::is_geom_query(face_ref)) {
+        const std::string want = face_ref["sid"].get<std::string>();
+        for (const TopoInfo& info : describe_faces(body)) {
+            if (make_selector(info).value("sid", std::string()) != want) continue;
+            aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(
+                body, json{{"of", std::string("face")},
+                          {"near", {info.centroid.x(), info.centroid.y(), info.centroid.z()}},
+                          {"count", 1}});
+            if (qp.error.empty() && !qp.faces.empty()) return qp.faces.front();
+        }
+        throw OpError("invalid_op", "doc_face_wires: no face matches sid '" + want + "'",
+                      {{"sid", want}});
+    }
+    const double diag = sim_bbox_diag(body);
+    const TopoDS_Shape sub = eval_resolve_ref(face_ref, body, diag);
+    if (sub.ShapeType() != TopAbs_FACE)
+        throw OpError("invalid_op", "doc_face_wires: ref did not resolve to a face",
+                      {{"reason", "not a face"}});
+    return TopoDS::Face(sub);
+}
+
+// C2 (WS-C reverse-engineering) — convert-entities primitive; see session.h / recon.h::
+// face_wires for the full contract.
+json doc_face_wires(const std::string& doc_id, const json& params) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+    if (r.shapes.empty())
+        throw OpError("invalid_op", "doc_face_wires: document '" + doc_id + "' has no bodies",
+                      {{"doc_id", doc_id}});
+    const json face_ref = params.contains("face") ? params["face"] : json();
+    if (face_ref.is_null())
+        throw OpError("invalid_op", "doc_face_wires requires params.face",
+                      {{"reason", "missing face"}});
+    TopoDS_Face face = doc_face_wires_resolve(r.shapes.back(), face_ref);
+    return aicad::doc::face_wires(face);
 }
 
 

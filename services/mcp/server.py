@@ -42,6 +42,11 @@ mcp = FastMCP(
         "'the largest round face' — never face numbers or raw coordinates. Build with the "
         "feature a person would use (sketch+revolve for round bodies, loft for blended shapes), "
         "not stacks of boxes. The OpenCASCADE B-rep kernel gives precise solids.\n"
+        "NO VISION? Use describe_part()/describe_sketch()/describe_scene() (cad_guide('gsl')) "
+        "for a text-only read of the geometry instead of render_part's image. Before calling a "
+        "design done, run check_feature_overlap() (one part's own features colliding — a boss "
+        "swallowed by a later cut, redundant cuts) and, for multi-body/assembly docs, "
+        "check_interference() (clash/clearance between bodies or components).\n"
         "ECAD (schematic/PCB) tools are also available (ecad_*)."
     ),
 )

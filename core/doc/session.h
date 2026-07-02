@@ -330,6 +330,24 @@ nlohmann::json doc_eval_interference(const std::string& doc_id,
 nlohmann::json doc_eval_feature_overlap(const std::string& doc_id,
                                         const nlohmann::json& params = nlohmann::json::object());
 
+// C1 (WS-C reverse-engineering) — general shape-vs-shape comparison; see recon.h::
+// compare_shapes for the full field/degraded-mode contract. `params`: `doc_a`, `doc_b`
+// (required doc ids); `body_a`/`body_b` (optional — a "bN" name as doc_eval_interference's
+// members use, 1-based AICM order; default = geom::fuse_many of every surviving solid body,
+// matching doc_eval_interference's part-doc member collection). Both docs are compiled fresh
+// (not the ensure_compiled cache) so a just-edited doc always compares its latest geometry.
+// Throws OpError on an unknown doc_id, an unknown body name, or a doc with no bodies.
+nlohmann::json doc_eval_compare(const nlohmann::json& params);
+
+// C2 (WS-C reverse-engineering) — convert-entities primitive; see recon.h::face_wires for
+// the full per-edge classification + return-shape contract. `params.face` resolves against
+// the LAST surviving body of `doc_id`, either as a selector/geom-query object (the same
+// predicate-aware path doc_eval_measure's refs use) or as `{"sid": "<stable face handle>"}`
+// (matched against make_selector's sid over the body's current faces — the handle GSL's
+// doc_query/describe_part hand back). Throws OpError on no bodies, a missing/unresolved
+// params.face, or a resolved-but-non-planar face.
+nlohmann::json doc_face_wires(const std::string& doc_id, const nlohmann::json& params);
+
 // Evaluate — measure 1-2 resolved refs against the LAST body (port of evaluate.py::measure
 // via worker.py::_eval_measure). Each ref is a face/edge/vertex selector. 1 ref ->
 // single-entity measure (length/radius/area/point/volume); 2 refs -> pair measure

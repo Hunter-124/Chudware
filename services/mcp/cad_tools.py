@@ -160,6 +160,21 @@ def _tmp(suffix: str) -> str:
     return path
 
 
+def _captioned_render(png: str, doc_id: str, views: list) -> Union[Image, list]:
+    """A2/render-caption wiring: pair a render PNG with a one-paragraph deterministic text
+    caption (services.mcp.gsl_tools._scene_caption) so a non-vision model reading the tool
+    transcript gets SOME signal from a render it cannot see. `mcp` 1.28.1 flattens a list
+    return into [ImageContent, TextContent] (func_metadata._convert_to_content), so a vision
+    model still gets the image plus the caption is free extra context either way. Best-effort:
+    any failure (missing gsl_tools, a bad doc_id) degrades to the bare Image exactly as before."""
+    try:
+        from mcp_server.gsl_tools import _scene_caption
+        caption = _scene_caption(doc_id, views)
+        return [Image(path=png), caption]
+    except Exception:  # noqa: BLE001
+        return Image(path=png)
+
+
 def _sanitize_output_path(path: str) -> str:
     """K3: Normalize an output path so callers see (and the engine writes to) the real,
     resolved absolute path.
@@ -797,14 +812,25 @@ vocabulary, with worked examples, follows.
 
 
 _GSL_GUIDE = """\
-GEOMETRY-SEMANTICS LAYER — read a part WITHOUT drowning in a flat face dump.
+GEOMETRY-SEMANTICS LAYER — read a part WITHOUT drowning in a flat face dump, and get a
+usable read on geometry EVEN WITHOUT VISION (no image, just text).
 
 On a complex/imported part, do NOT page through query_geometry's whole face list. Instead:
-  describe_part()        a compact NAMED outline: bbox, the feature groups, any detected
+  describe_part()        a compact NAMED outline: bbox, the feature groups WITH a placement
+                         narrative (which face each feature sits on / touches), any detected
                          symmetry/instanced PATTERN (e.g. "6-fold rotational about +Z" with the
                          6 blade faces collapsed to one line), the bores/holes and flat faces by
                          side, and a stable `sid` for every addressable face/edge. Token cost
                          scales with the number of DISTINCT roles, not the raw face count.
+  describe_sketch(id)    a sketch's plane placement, entity roster (line/circle/arc + dims),
+                         constraint roster with driving-dimension values, closed-region count/
+                         area, and the DOF (fully/under/over-defined) verdict — the sketch
+                         equivalent of describe_part, for reviewing layout before you extrude it.
+  describe_scene(views)  the TEXT equivalent of render_part/contact_sheet for a model with no
+                         vision: per requested view (default front/right/top/iso), which faces
+                         face the camera (by sid/surf/side/dims) plus the part bbox — computed
+                         from B-rep normals with NO occlusion modeling (says so inline). This is
+                         the non-vision self-review step; do it instead of skipping the review.
   hover(sid)             expand ONE face/edge by the sid describe_part / query_geometry gave —
                          its full card (surf, side, signed normal, concavity bore/boss, radius).
   query_adjacency()      the face-adjacency graph: which faces touch, and whether each shared
@@ -814,7 +840,9 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
 Every query_geometry/describe_part match now also carries: `side` (top/bottom/left/right/front/
 back), `normal` (SIGNED outward dir — unlike the unsigned `axis`), `concavity` (bore vs boss),
 `radius`, and a stable `sid`. add_features returns a `changes` write-diff ("added 1 cylinder; 1
-new bore; volume -3927") so you can confirm an op did what you meant instead of guessing.
+new bore; volume -3927") so you can confirm an op did what you meant instead of guessing — and,
+best-effort, `overlap_warnings` when the batch introduced a boss/cut overlap (see
+check_feature_overlap for the dedicated tool).
 """
 
 _INTAKE_GUIDE = """\
@@ -892,14 +920,24 @@ def cad_guide_text(topic: str = "overview") -> str:
         return _GSL_GUIDE
     if topic in ("cam", "machining", "toolpath", "toolpaths", "gcode", "g-code", "mill", "nc"):
         return _CAM_GUIDE
+    if topic in ("reverse", "re", "recognize", "recon"):
+        # WS-C (wave 3) ships the recognition pipeline in a separate recon_tools module so this
+        # file stays read-only w.r.t. that node's write-set; lazy-import so cad_guide("reverse")
+        # works TODAY (degrades to a pointer) and picks up the real guide the moment it lands.
+        try:
+            from mcp_server.recon_tools import _RE_GUIDE  # noqa: PLC0415
+            return _RE_GUIDE
+        except ImportError:
+            return ("Reverse-engineering guide ships with the recon tools (wave 3); use "
+                    "import_part + describe_part + compare workflow meanwhile.")
     # Otherwise treat the topic as a per-feature cheatsheet name (hole, fillet, revolve, ...).
     sheet = _read_prompt(f"shared/cheatsheets/{topic}.md")
     if sheet:
         return sheet
     avail = sorted(p.stem for p in (_prompts_dir() / "shared" / "cheatsheets").glob("*.md")) \
         if (_prompts_dir() / "shared" / "cheatsheets").is_dir() else []
-    return (f"No guide for {topic!r}. Topics: overview, simulation, review; or a feature "
-            f"cheatsheet: {avail}")
+    return (f"No guide for {topic!r}. Topics: overview, simulation, review, intake, gsl, cam, "
+            f"reverse; or a feature cheatsheet: {avail}")
 
 
 # --------------------------------------------------------------------------- register
@@ -917,9 +955,13 @@ def register_cad_tools(mcp: FastMCP) -> None:
         taught. topic="overview" (default) gives the workflow + full op cheatsheet (primitives,
         sketch+extrude/revolve/loft/sweep, fillet/chamfer/shell/draft, holes, bolt_circle,
         patterns/mirror, edits) and the plain-English geometry-query predicates. Other topics:
-        "simulation" (FEA/CFD how-to), "review" (how to read the annotated render), or a single
-        feature's cheatsheet by name ("hole", "fillet", "revolve", "loft", "sweep", "shell",
-        "chamfer", "pattern", "mirror", "sketch", "airfoil", "drawing", "hardware", ...).
+        "simulation" (FEA/CFD how-to), "review" (how to read the annotated render), "gsl" (the
+        progressive TEXT read of a part's geometry — describe_part/describe_sketch/
+        describe_scene/hover/query_adjacency — including the non-vision self-review path),
+        "reverse" (reverse-engineering an imported STEP/mesh into an editable feature tree —
+        tools land in a later wave; call it for the current status), or a single feature's
+        cheatsheet by name ("hole", "fillet", "revolve", "loft", "sweep", "shell", "chamfer",
+        "pattern", "mirror", "sketch", "airfoil", "drawing", "hardware", ...).
         """
         return cad_guide_text(topic)
 
@@ -1038,6 +1080,25 @@ def register_cad_tools(mcp: FastMCP) -> None:
                         }
                     if isinstance(vol_after, (int, float)):
                         _LAST_VOLUME[d] = vol_after
+                    # B3 — best-effort AUTO-WARNING: if this batch added feature(s), check the
+                    # new batch against the rest of the tree for boss/cut overlap or a swallowed
+                    # boss (features filter keeps this bounded to new-batch x existing pairs, not
+                    # a full-tree scan). Never fails the batch — degrades to no warning.
+                    added_ids = [fid for i, op in enumerate(ops)
+                                 if isinstance(op, dict) and op.get("op") == "add_feature"
+                                 for fid in [(r.get("id_map") or {}).get(f"${i}")] if fid]
+                    if added_ids:
+                        try:
+                            ov = cb.call("eval_feature_overlap",
+                                         {"doc_id": d, "features": added_ids})
+                            if ov.get("pairs") or ov.get("dead_features"):
+                                out["overlap_warnings"] = {
+                                    "summary": ov.get("summary"),
+                                    "pairs": ov.get("pairs", []),
+                                    "dead_features": ov.get("dead_features", []),
+                                }
+                        except Exception:  # noqa: BLE001
+                            pass
                 # Push the updated part to the desktop app's viewport (if it's open) so the user
                 # watches it build. Best-effort; only when something actually got built.
                 if ok and bodies:
@@ -1172,7 +1233,7 @@ def register_cad_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def render_part(doc_id: Optional[str] = None,
-                    view: Optional[Union[str, dict]] = None) -> Image:
+                    view: Optional[Union[str, dict]] = None) -> list:
         """Render the current part to an ANNOTATED image and return it so you can SEE the result.
 
         The render is colour-coded and labelled exactly like the in-app vision reviewer: an XYZ
@@ -1187,15 +1248,21 @@ def register_cad_tools(mcp: FastMCP) -> None:
         {"dir": [x, y, z]}  (an explicit scene->camera direction). The image is headed with the
         resolved view name + bounding-box dimensions. Omit `view` for the labelled iso self-review.
         Use contact_sheet(...) to get several angles tiled in one image.
+
+        Returns [image, caption]: the PNG followed by a one-paragraph TEXT caption (resolved
+        view, bbox, the principal visible labelled faces) so a non-vision model reading the
+        tool transcript — or a vision model wanting a quick text digest — has something besides
+        a bare image blob.
         """
         d = _doc(doc_id)
         png = _tmp(".png")
+        view_name = view if isinstance(view, str) else "iso"
         if view is not None:
             r = cb.call("doc_render_view", {"doc_id": d, "out_path": png, "view": view})
             if not r.get("ok") or not os.path.exists(png):
                 raise ValueError(
                     f"Render failed: {r.get('reason', r.get('error', 'no bodies to render'))}")
-            return Image(path=png)
+            return _captioned_render(png, d, [view_name])
         r = cb.call("doc_render_png", {"doc_id": d, "out_path": png})
         if (not r.get("ok") or not os.path.exists(png)):
             # A 2D DRAWING doc has no 3D bodies — rasterize its views instead so the AI
@@ -1205,13 +1272,13 @@ def register_cad_tools(mcp: FastMCP) -> None:
             except Exception:  # noqa: BLE001
                 rd = {"ok": False}
             if rd.get("ok") and os.path.exists(png):
-                return Image(path=png)
+                return _captioned_render(png, d, [view_name])
             raise ValueError(f"Render failed: {r.get('reason', 'no bodies to render')}")
-        return Image(path=png)
+        return _captioned_render(png, d, [view_name])
 
     @mcp.tool()
     def contact_sheet(doc_id: Optional[str] = None,
-                      views: Optional[list] = None) -> Image:
+                      views: Optional[list] = None) -> list:
         """Render SEVERAL labelled views tiled into ONE image — the fastest multi-angle self-check.
 
         Each tile is colour-coded + headed with its view name and the part's bounding-box
@@ -1221,15 +1288,20 @@ def register_cad_tools(mcp: FastMCP) -> None:
         views: a list of view specs, each either a named view ("front"/"back"/"top"/"bottom"/
         "left"/"right"/"iso") or a custom-camera dict ({"azimuth","elevation"} or {"dir":[x,y,z]} —
         see render_part). Omit for the standard set: front + right + top + iso.
+
+        Returns [image, caption]: the tiled PNG followed by a one-paragraph TEXT caption
+        (resolved views, bbox, principal visible labelled faces per view) for non-vision models
+        or a quick text digest alongside the picture.
         """
         d = _doc(doc_id)
         png = _tmp(".png")
+        view_list = views or ["front", "right", "top", "iso"]
         r = cb.call("doc_render_contact_sheet",
                     {"doc_id": d, "out_path": png, "views": views or []})
         if not r.get("ok") or not os.path.exists(png):
             raise ValueError(
                 f"Contact sheet failed: {r.get('reason', r.get('error', 'no bodies to render'))}")
-        return Image(path=png)
+        return _captioned_render(png, d, view_list)
 
     @mcp.tool()
     def set_material(material: Union[str, dict, list],
@@ -1348,23 +1420,73 @@ def register_cad_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def check_interference(doc_id: Optional[str] = None) -> str:
+    def check_interference(doc_id: Optional[str] = None, include_coincident: bool = False,
+                           min_clearance_mm: float = 0.0) -> str:
         """Clash/clearance check — do the bodies OVERLAP, and if not, how tight is the gap?
 
         Runs a pairwise interference analysis over every body in the document (for an assembly
         doc, over the world-placed component bodies). For each pair it reports either an
         INTERFERENCE (overlap volume in mm^3 — a real collision the design must not have) or a
         CLEARANCE (minimum gap in mm). Use it to validate that mating/instanced parts fit without
-        clashing, or to find the tightest gap in an assembly.
+        clashing, or to find the tightest gap in an assembly. For overlap WITHIN a single part's
+        own features (two bosses merged, a cut swallowing a boss) use check_feature_overlap
+        instead — this tool only sees whole bodies/components.
+
+        include_coincident: also classify near-zero-clearance face-touching pairs (distance
+        <= 1e-6 mm) as `contacts` entries instead of clearances — the "coincident faces" case
+        SolidWorks flags separately (two parts touching exactly, not overlapping or gapped).
+        min_clearance_mm: tag any clearance pair tighter than this with a "below min clearance"
+        warning (e.g. flag a press-fit gap that's actually too tight to assemble by hand).
 
         Returns {ok, summary, parts:[{name,bbox,volume}], interferences:[{a,b,volume}],
-        clearances:[{a,b,distance}]}. ok is True only when NOTHING interferes. A single-body part
-        trivially reports no interference (build a multi-body part with the `transform` copy
-        feature, or open an assembly, to get meaningful pairs).
+        clearances:[{a,b,distance}], contacts:[{a,b,distance}]}. ok is True only when NOTHING
+        interferes. A single-body part trivially reports no interference (build a multi-body
+        part with the `transform` copy feature, or open an assembly, to get meaningful pairs).
         """
         try:
             d = _doc(doc_id)
-            res = cb.call("eval_interference", {"doc_id": d})
+            res = cb.call("eval_interference", {"doc_id": d, "include_coincident": include_coincident,
+                                                "min_clearance_mm": min_clearance_mm})
+            return _dumps({"ok": res.get("ok", True), "doc_id": d, **res})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def check_feature_overlap(doc_id: Optional[str] = None, features: Optional[list] = None) -> str:
+        """Intra-PART feature-vs-feature overlap — do two of THIS part's own features collide?
+
+        Tests each feature's own pre-boolean tool solid (the shape it added/removed BEFORE it
+        got fused/cut into the body) against every other feature's tool, so it catches things a
+        single compiled solid can't show you: two bosses that silently merged (add+add), a
+        redundant cut carved twice over the same region (cut+cut), or — the dangerous one — a
+        later cut that erased an EARLIER boss entirely (add+cut where the common volume ≈ the
+        boss's whole volume). Use this for one part's feature tree; use check_interference for
+        separate BODIES or assembly components.
+
+        features (optional): restrict the scan to pairs involving these feature ids (e.g. the
+        ids you just added) instead of the whole tree — add_features already runs this
+        automatically on each new batch and surfaces it as `overlap_warnings` in its return, so
+        you rarely need to call this yourself right after building; call it explicitly to
+        re-check the whole part or a specific subset.
+
+        Returns {ok, summary, pairs:[{a, b, a_name, b_name, kind, volume_mm3}], dead_features}.
+          kind "boss_overlap"   — two ADDITIVE features share volume (often intentional — a
+                                  boss deliberately overlapping a rib — but flagged as a warning).
+          kind "cut_overlap"    — two cuts remove overlapping material (a redundant cut, usually
+                                  a modeling mistake worth cleaning up).
+          kind "cut_into_boss"  — a cut removes PART of an earlier additive feature.
+          kind "boss_swallowed" — a cut removes essentially the WHOLE earlier boss (>=99% of its
+                                  volume) — almost certainly an error; this is the ONLY kind that
+                                  sets ok:false.
+        dead_features: feature ids that built successfully but own NO surviving faces (fully
+        consumed by a later op) — a feature silently doing nothing right now.
+        """
+        try:
+            d = _doc(doc_id)
+            params: dict = {"doc_id": d}
+            if features is not None:
+                params["features"] = features
+            res = cb.call("eval_feature_overlap", params)
             return _dumps({"ok": res.get("ok", True), "doc_id": d, **res})
         except Exception as e:  # noqa: BLE001
             return _err(e)

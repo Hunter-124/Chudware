@@ -1,0 +1,60 @@
+// Reverse-engineering kernel primitives (WS-C / C1+C2) — pure OCCT geometry, no Session
+// dependency. The doc-resolving glue (require_session, body/face selector resolution) lives
+// in session.cpp's doc_eval_compare / doc_face_wires wrappers, which call straight through to
+// the functions declared here. Keeping this file Session-free mirrors the geom/doc.h split:
+// independently testable, no knowledge of the document/feature-tree contract.
+#pragma once
+
+#include <nlohmann/json.hpp>
+#include <TopoDS_Face.hxx>
+#include <TopoDS_Shape.hxx>
+
+namespace aicad::doc {
+
+// C1 — eval_compare. Shape-vs-shape comparison, the geometric ground truth the WS-C
+// reverse-engineering loop scores its rebuild against (precedent: doc_eval_symmetry's
+// mirror + BRepAlgoAPI_Common deviation, session.cpp ~L6514).
+//
+// FRAME ASSUMPTION: `a` and `b` are compared AS-IS in whatever world coordinates their
+// callers hand over — there is no registration/ICP step. The intended RE workflow rebuilds
+// directly in the reference solid's own coordinate frame for exactly this reason (datum-plane
+// sketches use the source face's own plane_frame); a caller comparing two independently
+// positioned solids must align them itself first.
+//
+// Normal return (both booleans converged):
+//   {ok:true, degraded:false, volume_a_mm3, volume_b_mm3, common_mm3, missing_mm3, extra_mm3,
+//    match_pct, residual_regions:[{side:"missing"|"extra", volume_mm3, center:[x,y,z],
+//    size:[dx,dy,dz]}, ...] (volume desc, capped at 10, < 1e-3 mm^3 dropped), summary}
+// match_pct = 100 * common_mm3 / max(volume_a_mm3, volume_b_mm3) (100 when both volumes are
+// ~0 — two empty/degenerate shapes are trivially "identical").
+//
+// Degraded return (a boolean threw or failed to converge — OCCT booleans are weakest on
+// near-identical/coincident geometry, exactly the case this RPC exists to handle):
+//   {ok:true, degraded:true, match_pct:null, volume_a_mm3, volume_b_mm3, volume_ratio,
+//    bbox_a, bbox_b, centroid_dist_mm, summary}
+// Never throws: a totally unusable pair of shapes (null) degrades rather than raising, so the
+// RE loop always gets a signal (even if "no signal").
+nlohmann::json compare_shapes(const TopoDS_Shape& a, const TopoDS_Shape& b);
+
+// C2 — convert-entities primitive. Converts one PLANAR face's boundary wires into doc-schema
+// §3.1 sketch entities expressed in the face's own 2D plane frame (origin = area centroid,
+// axes/normal built via aicad::geom::SketchPlane::from(origin, normal) — the SAME convention
+// resolve_sketch_plane's face-sketch branch uses, so a sketch authored from this output lands
+// exactly where "sketch on this face" would).
+//
+// Per edge: GeomAbs_Line -> "line"; GeomAbs_Circle, full loop -> "circle", trimmed -> "arc"
+// (center/radius/start/end in DEGREES measured in the face's own plane frame + an explicit
+// `ccw` sweep-direction flag, resolved from an actual traversal-midpoint sample so it is
+// correct regardless of how the underlying curve's own axis relates to the face normal);
+// GeomAbs_Ellipse, full loop -> "ellipse" (center/rx/ry/rot), trimmed -> "ellipse_arc"
+// (adds a0/a1 — the curve's OWN un-rotated-frame trim parameters in degrees, per doc_schema.md
+// §3.1: these are always stored increasing/CCW in the ellipse's local frame, so no separate
+// ccw flag is needed there). Anything else (BSpline/Bezier/offset/etc.) is sampled into a
+// 24-segment "line" polyline and the top-level `approx` flag is set.
+//
+// Returns {ok:true, plane_frame (16-float row-major, same layout as doc_sketch_overview's
+// plane_frame), entities:[...], wires:[{outer:bool, entity_ids:[...]}], approx:bool}.
+// Throws OpError("invalid_op", ...) if `face` is not planar.
+nlohmann::json face_wires(const TopoDS_Face& face);
+
+}  // namespace aicad::doc

@@ -374,3 +374,97 @@ from -Y edge"; `describe_scene` iso view lists the 3 faces whose normals actuall
 with both regions (outer 40x20 material, inner void) and their areas/bboxes correctly split.
 Unknown-sketch id returns the plan's exact `_err`-style hint. No changes needed to
 `_digest`/`_outline_text` call sites elsewhere — `server.py` only imports `register_gsl_tools`.
+
+### MCP-SURFACE — check_feature_overlap + auto-warnings + render captions + guide topics (AI-experience wave, WS-B B3 / WS-A A2/A4)
+Write-set: `services/mcp/cad_tools.py`, `services/mcp/server.py` (instructions string only).
+Depends on CORE-OVERLAP's `eval_feature_overlap`/`eval_interference` RPCs and GSL-TEXT's
+`describe_sketch`/`describe_scene`/`_scene_caption`, both confirmed present. Added
+`check_feature_overlap(doc_id, features)` right after `check_interference`, following its exact
+`cb.call` + `_dumps({"ok": res.get("ok", True), "doc_id": d, **res})` pattern; docstring explains
+boss_overlap/cut_overlap/boss_swallowed/dead_features and when to reach for it vs
+check_interference. `add_features`'s success path now derives the batch's own new feature ids
+from `r["id_map"]["$<op-index>"]` (only for `add_feature` ops), best-effort calls
+`eval_feature_overlap({"doc_id","features":added_ids})`, and attaches `overlap_warnings`
+{summary, pairs, dead_features} when non-empty — never fails the batch, and is skipped
+entirely when the batch added no features. `check_interference` gained `include_coincident`/
+`min_clearance_mm` params threaded straight through to `eval_interference`, documented alongside
+the new `contacts` array and the "below min clearance" warning. `render_part`/`contact_sheet`
+now return `-> list`: a new `_captioned_render(png, doc_id, views)` helper lazy-imports
+`mcp_server.gsl_tools._scene_caption` inside a try/except and returns `[Image(path=png),
+caption]`, degrading to the bare `Image` on any failure (missing gsl_tools, bad doc_id); every
+existing return point in both tools was routed through it. Guide discoverability: `_GSL_GUIDE`
+now documents `describe_sketch`/`describe_scene` alongside `describe_part`/`hover`/
+`query_adjacency`; `cad_guide_text` gained a `("reverse","re","recognize","recon")` branch that
+lazy-imports `mcp_server.recon_tools._RE_GUIDE` and falls back to a one-line pointer via
+`except ImportError` (recon_tools.py doesn't exist yet — this future-proofs the wave-3 node
+with zero coupling); the no-match fallback string and the `cad_guide` tool docstring both now
+list gsl/reverse alongside overview/simulation/review/intake/cam. `server.py`'s FastMCP
+instructions string gained one sentence pointing at the non-vision describe_* path and at
+check_feature_overlap (intra-part) vs check_interference (assemblies) — the ECAD closing
+sentence was preserved. **Verify:** `python3 -m py_compile services/mcp/cad_tools.py
+services/mcp/server.py` clean. Live smoke against a freshly built `libaicad.so`
+(`core/build-linux/bin`, staged via `AI_CAD_LIBAICAD` since `core_bridge`'s default Linux
+candidate `core/build-occt-linux/bin` was stale and lacked the new RPC — a real repo issue for
+whoever restages the default candidate list, not touched here since `core_bridge.py` is outside
+this node's write-set): built a 40³ box + a d10h10 top boss (deliberately half-embedded, so
+`add_features` also surfaced a `boss_overlap` warning on that batch) + a 20³ cut engulfing the
+boss — the boss-adding batch's own `overlap_warnings` and the cut batch's `overlap_warnings`
+both appeared automatically, the latter naming the exact `boss_swallowed` pair (Boss<->
+SwallowCut, ~785 mm³) plus `dead_features:["f2"]`; a direct `check_feature_overlap` call on the
+full tree returned `ok:false` with all three pairs (boss_overlap, cut_into_boss, boss_swallowed)
+sorted by volume descending, matching the core's own ordering. `check_interference` with
+`include_coincident=True` on two flush-stacked duplicate boxes returned a `contacts` entry
+`{a:"b1",b:"b2",distance:0.0}`; with `min_clearance_mm=5.0` on two boxes with a 1 mm gap it
+tagged the clearance `"warning":"below min clearance"`. `await mcp.call_tool("render_part", {})`
+returned exactly `[ImageContent, TextContent]` with a real one-paragraph caption (and likewise
+for `contact_sheet`, four-view caption). `cad_guide("gsl")` mentions both `describe_sketch` and
+`describe_scene`; `cad_guide("reverse")` returns the exact wave-3 fallback pointer string. No
+other files touched; `gsl_tools.py` was read-only (imported, never edited).
+
+### CORE-RECON — eval_compare + doc_face_wires (AI-experience wave, WS-C C1+C2)
+Write-set: new `core/doc/recon.h`/`core/doc/recon.cpp`; appended wrappers in
+`core/doc/session.h`/`core/doc/session.cpp`; appended dispatch lines in
+`core/api/libaicad.cpp` beside `eval_feature_overlap`; `core/CMakeLists.txt` (added
+`doc/recon.cpp` to the `aicad_doc` source list only). `recon.{h,cpp}` are Session-free — pure
+OCCT geometry (`compare_shapes(TopoDS_Shape,TopoDS_Shape)`, `face_wires(TopoDS_Face)`) — so the
+doc-resolving glue (require_session, body/face selector resolution) stays in session.cpp's
+`doc_eval_compare`/`doc_face_wires` wrappers, dispatched as RPC methods `eval_compare` and
+`doc_face_wires`. `eval_compare`: `{doc_a,doc_b,body_a?,body_b?}`, default body = `geom::fuse_many`
+of every surviving solid (mirrors `doc_eval_interference`'s member collection); named body_x uses
+the same `"b1".."bN"` convention. Returns volume_a/b, common/missing/extra_mm3, match_pct, up to
+10 residual regions (side/volume/center/size, exploded via `TopExp_Explorer(TopAbs_SOLID)`,
+sorted desc, <1e-3 mm³ dropped), and a one-line summary; every boolean uses `SetFuzzyValue(1e-4)`
+and a null/failed boolean degrades to `{degraded:true, match_pct:null, volume_ratio, bbox_a/b,
+centroid_dist_mm}` instead of throwing. `doc_face_wires`: `{doc_id,{face:<selector-or-geom-query
+or {"sid":...}>}}` resolves against the last body's faces (sid matched via `make_selector`'s sid,
+else the same `eval_resolve_ref` predicate path `doc_eval_measure` uses), converts a planar
+face's wires into doc-schema §3.1 entities in the face's own plane frame (built via
+`aicad::geom::SketchPlane::from(origin,normal)` — byte-identical convention to
+`resolve_sketch_plane`'s face-sketch branch): line/circle/arc (ccw resolved from an actual
+traversal-midpoint sample)/ellipse/ellipse_arc, anything else sampled to a 24-segment polyline
+with `approx:true`. Non-planar face throws `OpError("invalid_op", "convert entities requires a
+planar face")`. **Verify:** `cmake --build core/build-linux -j12` clean. Live ctypes smoke
+(`AI_CAD_LIBAICAD` pointed at the fresh `core/build-linux/bin/libaicad.so` — same stale-default
+candidate-list gotcha MCP-SURFACE already flagged): two independently-built 40×30×20 box docs ->
+`eval_compare` match_pct 100.0 (0 residual regions); a third box translated +10mm in X ->
+match_pct 75.0 with exactly one 6000 mm³ `missing` region at `[-15,0,0]` and one 6000 mm³
+`extra` region at `[25,0,0]` (both against a 24000 mm³ box — arithmetically exact). `body_a`/
+`body_b` `"b1"` naming round-trips; an unknown body name (`"b2"` on a single-body doc) raises
+`eval_compare: unknown body 'b2' in document '<id>'`. `doc_face_wires` on a bare box's top face
+returned exactly 4 `line` entities in one `outer:true` wire; the same face on a box with an
+8mm-diameter through hole returned the same 4-line outer wire plus a `radius:4.0` `circle` in a
+second `outer:false` wire — both by the `{"of":"face","side":"top"}` geom-query form and by
+`{"sid":<doc_query's sid>}`. The `ok:false`-vs-`degraded` split is intentional: an EMPTY doc (no
+bodies at all) raises `OpError("invalid_op", "...has no bodies")` from the wrapper before ever
+reaching `compare_shapes` — a clearer error than a soft "degraded" match — so the degraded branch
+is unreachable from the RPC with an empty-vs-box pair as literally worded in the ask; verified the
+branch itself directly instead with a standalone harness (recon.cpp + geom/plane.cpp linked
+against system OCCT 7.9.1 in `/tmp`, no repo files touched) calling `compare_shapes` with a
+genuine null `TopoDS_Shape`: returned `{degraded:true, match_pct:null, volume_ratio:0.0,
+bbox_a:null, bbox_b:{...}, centroid_dist_mm:-1.0}` as designed, and `compare_shapes(box,box)` from
+the same binary still returned the normal 100%-match shape — confirming both branches compile and
+run correctly. **Tool-issue note:** the `edit` tool repeatedly rejected a `SWAP` on
+`core/CMakeLists.txt` claiming a stale hash while `read`/`grep` on the same file consistently
+returned the tag the edit claimed was current-invalid, with disk content verified byte-identical
+via `sed`/`md5sum`; worked around by patching the file directly through the `eval` `write()`
+helper (see the `report_tool_issue` call this session). No other files touched.

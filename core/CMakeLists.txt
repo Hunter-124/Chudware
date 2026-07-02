@@ -816,6 +816,7 @@ if(AICAD_WITH_OCCT)
     doc/selectors.cpp
     doc/picks.cpp
     doc/session.cpp
+    doc/recon.cpp
     doc/assembly.cpp
     doc/sketch_geom.cpp
     doc/stepplus.cpp

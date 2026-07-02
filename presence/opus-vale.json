@@ -1,7 +1,7 @@
 {
  "agent": "opus-vale",
  "host": "hunter-pc",
- "activity": "set_status",
+ "activity": "work_ready",
  "task": "",
- "ts": "2026-07-02T17:15:04Z"
+ "ts": "2026-07-02T17:15:13Z"
 }

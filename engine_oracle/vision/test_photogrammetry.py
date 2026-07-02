@@ -334,6 +334,143 @@ class TestTokenRequired:
                 stop_session(session)
 
 
+class TestPhotoUpload:
+    """Cover the _parse_multipart_photo / upload POST path — the most recently rewritten piece
+    (cgi -> email-parser in d6e3b8d).  No real phone or image library needed: we POST raw
+    multipart bytes to the live local server and assert the files land correctly."""
+
+    @staticmethod
+    def _build_multipart(field_name: str, filename: str, data: bytes,
+                         content_type: str = "image/jpeg") -> tuple:
+        """Return (body_bytes, content_type_header) for a minimal multipart/form-data body."""
+        boundary = "----TestBoundary1234567890"
+        lines = []
+        lines.append(f"--{boundary}".encode())
+        lines.append(
+            f'Content-Disposition: form-data; name="{field_name}"; '
+            f'filename="{filename}"'.encode()
+        )
+        lines.append(f"Content-Type: {content_type}".encode())
+        lines.append(b"")
+        lines.append(data)
+        lines.append(f"--{boundary}--".encode())
+        body = b"\r\n".join(lines) + b"\r\n"
+        ctype = f"multipart/form-data; boundary={boundary}"
+        return body, ctype
+
+    def test_post_photo_lands_in_work_dir(self):
+        """POST a fake JPEG to the upload endpoint — asserts 200, file saved, received grows."""
+        port = _free_port()
+        session = None
+        try:
+            session = start_session(port=port)
+            time.sleep(0.1)
+
+            fake_jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 16  # minimal JPEG magic bytes
+            body, ctype = self._build_multipart("photo", "test_photo.jpg", fake_jpeg)
+
+            url = f"http://127.0.0.1:{port}/upload?token={session.token}"
+            req = urllib.request.Request(
+                url, data=body, method="POST",
+                headers={"Content-Type": ctype, "Content-Length": str(len(body))},
+            )
+            resp = urllib.request.urlopen(req, timeout=3)
+            assert resp.status == 200
+
+            # File must be in work_dir with index + shot-name
+            assert len(session.received) == 1
+            from pathlib import Path as _Path
+            saved = _Path(session.received[0])
+            assert saved.exists()
+            assert saved.read_bytes() == fake_jpeg
+            assert saved.name.startswith("000_top")
+            assert saved.suffix == ".jpg"
+        finally:
+            if session is not None:
+                stop_session(session)
+
+    def test_post_two_photos_advance_index_and_shot_name(self):
+        """Two sequential POSTs produce 000_top.jpg and 001_front.jpg in order."""
+        port = _free_port()
+        session = None
+        try:
+            session = start_session(port=port)
+            time.sleep(0.1)
+
+            for i, (fname, expected_stem_prefix) in enumerate([
+                ("photo1.jpg", "000_top"),
+                ("photo2.jpg", "001_front"),
+            ]):
+                fake_data = b"\xff\xd8\xff\xe0" + bytes([i]) * 16
+                body, ctype = self._build_multipart("photo", fname, fake_data)
+                url = f"http://127.0.0.1:{port}/upload?token={session.token}"
+                req = urllib.request.Request(
+                    url, data=body, method="POST",
+                    headers={"Content-Type": ctype, "Content-Length": str(len(body))},
+                )
+                resp = urllib.request.urlopen(req, timeout=3)
+                assert resp.status == 200
+
+            assert len(session.received) == 2
+            from pathlib import Path as _Path
+            names = [_Path(p).name for p in session.received]
+            assert names[0].startswith("000_top")
+            assert names[1].startswith("001_front")
+        finally:
+            if session is not None:
+                stop_session(session)
+
+    def test_post_without_token_returns_401(self):
+        """POST to /upload without a token returns 401 and does not save anything."""
+        port = _free_port()
+        session = None
+        try:
+            session = start_session(port=port)
+            time.sleep(0.1)
+
+            body, ctype = self._build_multipart("photo", "x.jpg", b"\xff\xd8\xff\xe0")
+            url = f"http://127.0.0.1:{port}/upload"  # no token
+            req = urllib.request.Request(
+                url, data=body, method="POST",
+                headers={"Content-Type": ctype, "Content-Length": str(len(body))},
+            )
+            try:
+                urllib.request.urlopen(req, timeout=3)
+                pytest.fail("Expected 401 but got 200")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 401
+            assert len(session.received) == 0
+        finally:
+            if session is not None:
+                stop_session(session)
+
+    def test_post_png_extension_preserved(self):
+        """PNG filename extension is kept (not forced to .jpg)."""
+        port = _free_port()
+        session = None
+        try:
+            session = start_session(port=port)
+            time.sleep(0.1)
+
+            fake_png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+            body, ctype = self._build_multipart("photo", "snap.png", fake_png,
+                                                content_type="image/png")
+            url = f"http://127.0.0.1:{port}/upload?token={session.token}"
+            req = urllib.request.Request(
+                url, data=body, method="POST",
+                headers={"Content-Type": ctype, "Content-Length": str(len(body))},
+            )
+            resp = urllib.request.urlopen(req, timeout=3)
+            assert resp.status == 200
+
+            from pathlib import Path as _Path
+            saved = _Path(session.received[0])
+            assert saved.suffix == ".png"
+        finally:
+            if session is not None:
+                stop_session(session)
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------

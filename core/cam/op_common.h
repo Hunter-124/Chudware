@@ -3,6 +3,7 @@
 // Header-only so each op_*.cpp (compiled independently / in parallel) can include it.
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -108,6 +109,64 @@ inline Vec2 region_inside_point(const Region& reg) {
     }
     (void)y;
     return best;
+}
+
+// ── ring-to-ring linking for concentric area clearing ────────────────────────
+// Plain concentric-offset clearing (gen_pocket2d-style pocketing, and the plain
+// "waterline" flavor of clear_waterline_region) links consecutive offset rings
+// with a direct feed_to at whatever vertex each ring happens to start at. That's
+// fine for round/simple pockets, but on corner-heavy geometry the two rings'
+// start vertices can end up far apart, so the "link" move re-engages a long
+// stretch of fresh wall in one feed — a tool-engagement spike defeating the
+// point of adaptive/HSM clearing.
+//
+// "Adaptive" arc-blend linking fixes this in two steps: (1) rotate the next
+// ring so it starts at the vertex nearest the current tool position (this is
+// the main fix — it minimizes the transition distance to roughly the radial
+// stepover, even at corners), then (2) bridge the (now short) gap with a
+// tangent semicircular arc — radius = gap/2 — instead of a straight line, so
+// the tool sweeps into the next ring rather than plunging straight at it.
+// The arc is built to bulge toward `toward` (the pocket interior, already
+// cleared), never toward uncut material.
+//
+// Distinguishing the two by name/flag (Operation::arc_blend_linking) keeps
+// "adaptive" honest: without this, ring linking is plain concentric-offset
+// clearing wearing an adaptive label.
+
+// Rotate a closed loop so index 0 is the vertex nearest `from` (does not
+// change orientation/winding, only the start index).
+inline Path2 rotate_ring_to_nearest(const Path2& loop, const Vec2& from) {
+    if (loop.size() < 2) return loop;
+    size_t best = 0;
+    double bestd2 = 1e300;
+    for (size_t i = 0; i < loop.size(); ++i) {
+        double dx = loop[i].x - from.x, dy = loop[i].y - from.y;
+        double d2 = dx * dx + dy * dy;
+        if (d2 < bestd2) { bestd2 = d2; best = i; }
+    }
+    Path2 out;
+    out.reserve(loop.size());
+    for (size_t i = 0; i < loop.size(); ++i) out.push_back(loop[(best + i) % loop.size()]);
+    return out;
+}
+
+// Emit the link move from `from` to `to` at depth z: a direct feed (arc_blend
+// false — plain concentric-offset behavior) or a tangent semicircular arc
+// (radius = |to-from|/2) bulging toward `toward` (arc_blend true — "adaptive"
+// behavior). Returns the XY link distance, for the caller's engagement check.
+inline double link_ring(PathBuilder& pb, const Vec2& from, const Vec2& to, double z,
+                        bool arc_blend, const Vec2& toward) {
+    double vx = to.x - from.x, vy = to.y - from.y;
+    double dist = std::hypot(vx, vy);
+    if (!arc_blend || dist < 1e-6) {
+        pb.feed_to(to, z);
+        return dist;
+    }
+    Vec2 mid{(from.x + to.x) * 0.5, (from.y + to.y) * 0.5};
+    double dxc = toward.x - mid.x, dyc = toward.y - mid.y;
+    bool ccw = (dxc * vy - dyc * vx) > 0;  // bulge the semicircle toward `toward`
+    pb.arc_to(to, mid, ccw, z);
+    return dist;
 }
 
 }  // namespace cam

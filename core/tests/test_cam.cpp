@@ -962,3 +962,64 @@ TEST_CASE("session: cam_post dialect override beats the job default (whole-job p
     CHECK(pg["gcode"].get<std::string>().find("G83") == std::string::npos);
     cam_close(doc);
 }
+
+// ── T-M2: adaptive ring-to-ring arc-blend linking ────────────────────────────
+namespace {
+// A corner-heavy "star/gear" pocket: an irregular star with sharp acute-angle
+// spikes and reflex notches (no right angles anywhere, unlike a rectangular
+// pocket, whose corners cap the naive same-vertex ring-to-ring gap at a
+// modest sqrt(2)*stepover -- comfortably under the 1.5x-stepover threshold).
+// Concentric offsetting of a sharp, irregular polygon like this shifts the
+// offset loop's canonical start vertex a lot between adjacent levels, so a
+// naive direct feed_to link between rings can jump much further than the
+// radial stepover, unlike a smooth/convex pocket where corresponding start
+// vertices stay close together across levels.
+Region star_notch_pocket() {
+    Region r;
+    Path2& p = r.outer;
+    const int n = 9;
+    const double r_out[9] = {18, 15, 19, 14, 20, 13, 17, 16, 19.5};
+    const double r_in[9]  = {5, 7, 4.5, 6.5, 4, 7.5, 5.5, 6, 4.8};
+    for (int i = 0; i < n; ++i) {
+        double a_out = 2.0 * M_PI * (i + 0.15) / n;
+        double a_in  = 2.0 * M_PI * (i + 0.55) / n;
+        p.push_back({r_out[i] * std::cos(a_out), r_out[i] * std::sin(a_out)});
+        p.push_back({r_in[i] * std::cos(a_in), r_in[i] * std::sin(a_in)});
+    }
+    return r;
+}
+bool has_warning_containing(const std::vector<std::string>& warnings, const std::string& needle) {
+    for (auto& w : warnings) if (w.find(needle) != std::string::npos) return true;
+    return false;
+}
+}  // namespace
+
+TEST_CASE("op: adaptive arc-blend linking bounds ring-transition engagement on a corner-heavy pocket") {
+    OpContext ctx = mill_ctx(2.0);   // small tool so the comb's narrow channels stay resolvable
+    Operation op;
+    op.type = OpType::Adaptive2D;
+    op.heights.top = 0; op.heights.bottom = -2;   // shallow: one Z level, isolates ring linking
+    op.stepover = 0.6;
+    op.geometry["regions"] = json::array({to_json(star_notch_pocket())});
+
+    // Arc-blend ON (default): nearest-vertex rotation + tangent-arc link keeps
+    // every ring transition close to the radial stepover -> no warning.
+    op.arc_blend_linking = true;
+    GenResult on = gen_adaptive2d(op, ctx);
+    REQUIRE(on.ok);
+    CHECK(on.path.cut_length > 0);
+    CHECK_FALSE(has_warning_containing(on.warnings, "ring-transition engagement exceeds"));
+
+    // Arc-blend OFF: plain concentric-offset linking (direct feed_to at whatever
+    // vertex each ring's offset loop starts at) -> the comb's uneven topology
+    // produces at least one over-engagement ring transition -> warning present.
+    op.arc_blend_linking = false;
+    GenResult off = gen_adaptive2d(op, ctx);
+    REQUIRE(off.ok);
+    CHECK(off.path.cut_length > 0);
+    CHECK(has_warning_containing(off.warnings, "ring-transition engagement exceeds"));
+
+    // Confirm ring transitions are actually arc moves with arc-blend ON (not
+    // just a smaller straight-line gap) -- the headline deliverable.
+    CHECK(count_kind(on.path, MoveKind::Arc) > count_kind(off.path, MoveKind::Arc));
+}

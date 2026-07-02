@@ -115,29 +115,51 @@ void pocket_entry(PathBuilder& pb, const Operation& op, const Region& reg,
 }
 
 // ── waterline pocket clearing for one region at one Z level ──────────────────
-void clear_waterline_region(PathBuilder& pb, const Operation& op,
-                            const Path2& loop, double tool_r,
-                            double stepover, double z) {
-    if (loop.size() < 3) return;
+// Cuts inner->outer concentric offset rings. Shared by gen_pocket3d (plain
+// waterline roughing) and gen_adaptive_clear3d (engagement-limited adaptive
+// clearing). With op.arc_blend_linking (default true), ring-to-ring transitions
+// use the same tangent arc-blend link as gen_adaptive2d (rotate the next ring
+// to start nearest the tool, then a semicircular arc) instead of a direct
+// feed_to, bounding tool engagement at corners; with it off, linking is plain
+// concentric-offset (direct feed_to). Returns the largest ring-transition XY
+// link distance seen (0 if there were <=1 rings), so an adaptive caller can run
+// the same engagement-exceeded check as gen_adaptive2d.
+double clear_waterline_region(PathBuilder& pb, const Operation& op,
+                              const Path2& loop, double tool_r,
+                              double stepover, double z) {
+    if (loop.size() < 3) return 0.0;
     Region reg;
     reg.outer = geo::ensure_ccw(loop);
     auto pocket_lv = geo::pocket_offsets(reg, tool_r, stepover, op.stock_to_leave);
-    if (pocket_lv.empty()) return;
+    if (pocket_lv.empty()) return 0.0;
 
     pocket_entry(pb, op, reg, tool_r, stepover, z);
+    Vec2 centroid = region_inside_point(reg);
 
     bool climb = op.direction == CutDirection::Climb;
+    double max_link = 0.0;
+    bool have_prev = false;
+    Vec2 prev{0, 0};
     // Cut from innermost to outermost (climb from inside out).
     for (auto it = pocket_lv.rbegin(); it != pocket_lv.rend(); ++it) {
         for (const Path2& lp : *it) {
             if (lp.size() < 3) continue;
             Path2 oriented = climb ? geo::ensure_ccw(lp) : geo::ensure_cw(lp);
-            pb.feed_to(oriented.front(), z);
+            if (have_prev && op.arc_blend_linking) oriented = rotate_ring_to_nearest(oriented, prev);
+            if (have_prev) {
+                double link_dist = link_ring(pb, prev, oriented.front(), z, op.arc_blend_linking, centroid);
+                max_link = std::max(max_link, link_dist);
+            } else {
+                pb.feed_to(oriented.front(), z);
+            }
             for (size_t k = 1; k <= oriented.size(); ++k)
                 pb.feed_to(oriented[k % oriented.size()], z);
+            prev = oriented.front();
+            have_prev = true;
         }
     }
     pb.rapid_to_clearance();
+    return max_link;
 }
 
 }  // namespace
@@ -309,11 +331,22 @@ GenResult gen_adaptive_clear3d(const Operation& opIn, const OpContext& ctx) {
     Operation op_helix = op;
     op_helix.ramp.type = RampType::Helix;
 
+    // Largest ring-to-ring link distance seen across the whole op (see
+    // clear_waterline_region / op_common.h link_ring); mirrors gen_adaptive2d's
+    // engagement-exceeded check since this is the true "adaptive" 3D path (as
+    // opposed to gen_pocket3d's plain waterline roughing, which shares the same
+    // clearing routine but is not held to the adaptive engagement bound).
+    double max_link_dist = 0.0;
     for (size_t li = 0; li < levels.size(); ++li) {
         double z = levels[li];
         for (const Path2& loop : sections[li]) {
-            clear_waterline_region(pb, op_helix, loop, tool_r, stepover, z);
+            max_link_dist = std::max(max_link_dist,
+                                     clear_waterline_region(pb, op_helix, loop, tool_r, stepover, z));
         }
+    }
+    if (max_link_dist > stepover * 1.5) {
+        res.warnings.push_back("adaptive_clear3d: ring-transition engagement exceeds 1.5x stepover — "
+                               "arc-blend linking recommended");
     }
 
     res.path = pb.take(ctx.tool.number, ctx.machine);

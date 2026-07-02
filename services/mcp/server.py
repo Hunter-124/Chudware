@@ -86,6 +86,9 @@ register_doc_diff_tools(mcp)
 # Schema: contracts/requirements.md  Brain: engine_oracle/requirements/requirements.py
 from mcp_server.req_tools import register_req_tools
 register_req_tools(mcp)
+# Verify battery (T-H4) — deterministic check dispatcher for RL reward + CI gate.
+from mcp_server.verify_tools import register_verify_tools
+register_verify_tools(mcp)
 
 
 def _install_clean_stdout():

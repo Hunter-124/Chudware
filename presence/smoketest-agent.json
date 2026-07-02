@@ -1,7 +1,7 @@
 {
  "agent": "smoketest-agent",
  "host": "hunter-pc",
- "activity": "whoami",
+ "activity": "section_context",
  "task": "",
  "ts": "2026-07-02T11:32:23Z"
 }

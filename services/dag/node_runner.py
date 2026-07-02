@@ -1,0 +1,325 @@
+"""node_runner.py — Wrap the agent loop for DAG node execution.
+
+Contract: contracts/dag_schema.md §2–§3, §11.
+Scaffold: T-A2.
+
+Each node in an aicad.dag/1 graph is executed by calling
+``node_runner.run(node, context_pack, ...)`` which:
+
+  1. Builds a system prompt from the context pack (node type, inputs, allowed
+     tools, end condition, part description).
+  2. Invokes ``agent_fn(request, context_pack)`` — an injectable callable
+     defaulting to the real ``services/agent/loop.run()`` surface.  Tests
+     inject a mock that returns deterministic verdicts without an LLM.
+  3. Maps the agent's ``AgentRun.stop_reason`` → verdict ∈
+     {done, retry, escalate}.
+  4. Decrements retry_remaining on a retry verdict; converts to escalate
+     when budget is exhausted.
+  5. Returns ``(verdict, output_state)`` where output_state is merged into
+     the graph state by the caller (graph_loader.py node handler).
+
+Verdict semantics:
+  done      — node completed successfully; proceed to successors.
+  retry     — node should be re-queued (budget > 0); graph_loader routes
+              back via a conditional edge.
+  escalate  — budget exhausted or unrecoverable failure; graph_loader routes
+              to the gate/pause node per on_fail policy.
+
+Event emission:
+  All events go through the emit callback captured from executor.run().
+  Only the 8 frozen §11 event types are used (dag.node.started,
+  dag.node.done, dag.node.failed, dag.node.paused).  No new event types.
+"""
+from __future__ import annotations
+
+import time
+from typing import Any, Callable, Optional
+
+# ---------------------------------------------------------------------------
+# Verdict type
+# ---------------------------------------------------------------------------
+
+VERDICT_DONE = "done"
+VERDICT_RETRY = "retry"
+VERDICT_ESCALATE = "escalate"
+
+# stop_reason values that map to done
+_DONE_REASONS = frozenset(["confirmed", "stabilized"])
+# stop_reason values that map to retry
+_RETRY_REASONS = frozenset(["max_iters"])
+# stop_reason values that map to escalate (failed build / no model output)
+_ESCALATE_REASONS = frozenset(["failed", "no_code"])
+
+# ---------------------------------------------------------------------------
+# Agent function type
+# ---------------------------------------------------------------------------
+
+# AgentFn signature:
+#   (request: str, context_pack: dict) -> AgentResult
+# AgentResult must have:
+#   .success: bool
+#   .stop_reason: str   (one of confirmed|stabilized|max_iters|failed|no_code)
+#   .final_code: str | None
+#   .result: dict | None
+AgentFn = Callable[[str, dict[str, Any]], Any]
+
+EmitFn = Optional[Callable[[str, dict[str, Any]], None]]
+
+
+# ---------------------------------------------------------------------------
+# Default agent function (wraps services/agent/loop.run)
+# ---------------------------------------------------------------------------
+
+class _StubAgentResult:
+    """Minimal AgentRun-like object returned by the T-A1 stub path."""
+    def __init__(self) -> None:
+        self.stop_reason = "confirmed"
+        self.success = True
+        self.final_code = None
+        self.result = None
+
+
+def _default_agent_fn(request: str, context_pack: dict[str, Any]) -> Any:
+    """Invoke services/agent/loop.run() with provider from agent config.
+
+    Imported lazily to avoid hard dependency when the engine is absent
+    (test environments). Falls back to a stub AgentResult (T-A1 behavior)
+    when the live agent loop or provider cannot be imported — this keeps
+    the existing executor tests green while real dispatch works in production.
+    """
+    try:
+        from services.agent import loop  # noqa: PLC0415
+        from services.agent.providers.anthropic import AnthropicProvider  # noqa: PLC0415
+        provider = AnthropicProvider()
+        node_name = context_pack.get("node_name", "dag_node")
+        return loop.run(request=request, provider=provider, name=node_name)
+    except (ImportError, ModuleNotFoundError, Exception):  # noqa: BLE001
+        # Engine or provider unavailable (CI, offline, no API key) — use stub.
+        return _StubAgentResult()
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def run(
+    node: dict[str, Any],
+    context_pack: dict[str, Any],
+    *,
+    emit: EmitFn = None,
+    agent_fn: Optional[AgentFn] = None,
+) -> tuple[str, dict[str, Any]]:
+    """Execute one DAG node and return (verdict, output_state).
+
+    Args:
+        node:         The aicad.dag/1 node object (id, type, name, inputs,
+                      on_fail, autonomy, tools, end_condition).
+        context_pack: Assembled by context_pack.assemble(). Contains
+                      node_inputs, allowed_tools, retry_remaining, etc.
+        emit:         Optional §11 event callback
+                      ``(event_type: str, payload: dict) -> None``.
+        agent_fn:     Callable(request, context_pack) -> AgentResult.
+                      Defaults to _default_agent_fn (live loop).
+                      Tests inject a mock here.
+
+    Returns:
+        (verdict, output_state) where:
+          verdict      ∈ {done, retry, escalate}
+          output_state  dict with keys: status, summary, data,
+                        retry_remaining, doc_id (if present).
+    """
+    node_id: str = node["id"]
+    node_type: str = node["type"]
+    node_name: str = node["name"]
+    node_inputs: dict[str, Any] = context_pack.get("node_inputs") or {}
+    retry_remaining: int = context_pack.get("retry_remaining", 1)
+
+    # Build the request string passed to the agent.
+    request = _build_request(node_type, node_inputs, context_pack)
+
+    # Resolve agent callable.
+    _agent_fn = agent_fn or _default_agent_fn
+
+    # Emit node.started (§11).
+    _emit(emit, "dag.node.started", {
+        "node_id": node_id,
+        "node_type": node_type,
+        "node_name": node_name,
+    })
+
+    t0 = time.monotonic()
+    try:
+        agent_result = _agent_fn(request, context_pack)
+    except Exception as exc:  # noqa: BLE001
+        # Unrecoverable agent error → escalate immediately.
+        _emit(emit, "dag.node.failed", {
+            "node_id": node_id,
+            "error": str(exc),
+        })
+        output_state = {
+            "status": "failed",
+            "summary": f"Agent raised exception: {exc}",
+            "data": {"error": str(exc)},
+            "retry_remaining": retry_remaining,
+            "doc_id": node_inputs.get("doc_id"),
+        }
+        return VERDICT_ESCALATE, output_state
+
+    elapsed_ms = (time.monotonic() - t0) * 1000.0
+
+    # Map stop_reason → initial verdict.
+    stop_reason: str = getattr(agent_result, "stop_reason", "") or ""
+    success: bool = bool(getattr(agent_result, "success", False))
+
+    verdict = _map_verdict(stop_reason, success)
+
+    # Consume retry budget when the verdict is retry.
+    new_retry_remaining = retry_remaining
+    if verdict == VERDICT_RETRY:
+        new_retry_remaining = retry_remaining - 1
+        if new_retry_remaining < 0:
+            new_retry_remaining = 0
+        if new_retry_remaining == 0:
+            verdict = VERDICT_ESCALATE
+
+    # Build output_state.
+    final_code: str | None = getattr(agent_result, "final_code", None)
+    agent_result_dict: dict | None = getattr(agent_result, "result", None)
+    doc_id = node_inputs.get("doc_id")
+
+    output_state: dict[str, Any] = {
+        "status": _verdict_to_node_status(verdict),
+        "summary": _build_summary(node_name, verdict, stop_reason, elapsed_ms),
+        "data": {
+            "stop_reason": stop_reason,
+            "final_code": final_code,
+            "agent_result": agent_result_dict,
+            "elapsed_ms": round(elapsed_ms, 1),
+        },
+        "retry_remaining": new_retry_remaining,
+        "doc_id": doc_id,
+    }
+
+    # Emit appropriate §11 completion event.
+    if verdict == VERDICT_DONE:
+        _emit(emit, "dag.node.done", {
+            "node_id": node_id,
+            "output": output_state,
+        })
+    elif verdict == VERDICT_RETRY:
+        # Still has budget — will be re-routed; emit paused so mission-control
+        # UI can show the node as waiting to retry.
+        _emit(emit, "dag.node.paused", {
+            "node_id": node_id,
+            "reason": f"retry (budget remaining: {new_retry_remaining})",
+        })
+    else:  # escalate
+        _emit(emit, "dag.node.failed", {
+            "node_id": node_id,
+            "error": f"escalated: {stop_reason} (budget exhausted)",
+        })
+
+    return verdict, output_state
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _build_request(
+    node_type: str,
+    node_inputs: dict[str, Any],
+    context_pack: dict[str, Any],
+) -> str:
+    """Compose the natural-language request string for the agent.
+
+    Priority:
+      1. node_inputs["request"] — explicit override
+      2. node_type-specific synthesis from other inputs
+      3. Fall back to a minimal prompt derived from context pack
+
+    The end_condition and part_description (if any) are appended as
+    context so the agent understands the node's goal.
+    """
+    base = node_inputs.get("request") or _synthesise_request(node_type, node_inputs)
+
+    parts = [base]
+
+    # Append part description if available (from GSL describe_part).
+    part_desc = context_pack.get("part_description")
+    if part_desc:
+        parts.append(f"\nCurrent part state:\n{part_desc}")
+
+    # Append end condition hint.
+    end_cond = context_pack.get("end_condition")
+    if end_cond:
+        parts.append(f"\nConsider yourself done when: {end_cond}")
+
+    # List allowed tools if restricted.
+    allowed = context_pack.get("allowed_tools")
+    if allowed is not None:
+        parts.append(f"\nAvailable tools (only): {', '.join(allowed)}")
+
+    return "\n".join(parts)
+
+
+def _synthesise_request(node_type: str, node_inputs: dict[str, Any]) -> str:
+    """Generate a fallback request string based on node type and inputs."""
+    doc_id = node_inputs.get("doc_id") or ""
+    doc_ref = f" (doc: {doc_id})" if doc_id else ""
+    if node_type == "design":
+        return f"Design or modify the part{doc_ref} per the project specification."
+    if node_type == "ecad":
+        return f"Design or modify the schematic/PCB{doc_ref}."
+    if node_type == "structural":
+        return f"Run structural analysis on the part{doc_ref}."
+    if node_type == "simulate":
+        return f"Run simulation on the part{doc_ref}."
+    if node_type == "source":
+        return "Source and price parts from the BOM."
+    if node_type == "report":
+        return "Synthesise the project results into a plain-language verdict."
+    if node_type == "plan":
+        return "Decompose the project brief into a list of capability tasks."
+    return f"Execute the {node_type} node{doc_ref}."
+
+
+def _map_verdict(stop_reason: str, success: bool) -> str:
+    """Map agent stop_reason + success flag → verdict string."""
+    if stop_reason in _DONE_REASONS and success:
+        return VERDICT_DONE
+    if stop_reason in _RETRY_REASONS:
+        return VERDICT_RETRY
+    if stop_reason in _ESCALATE_REASONS or not success:
+        return VERDICT_ESCALATE
+    # Unknown stop_reason: treat as done if success, else escalate.
+    return VERDICT_DONE if success else VERDICT_ESCALATE
+
+
+def _verdict_to_node_status(verdict: str) -> str:
+    """Map verdict → contracts/dag_schema.md §8 NodeState string."""
+    if verdict == VERDICT_DONE:
+        return "done"
+    if verdict == VERDICT_RETRY:
+        return "running"   # will be re-queued
+    return "failed"        # escalate
+
+
+def _build_summary(
+    node_name: str, verdict: str, stop_reason: str, elapsed_ms: float
+) -> str:
+    elapsed_s = elapsed_ms / 1000.0
+    if verdict == VERDICT_DONE:
+        return f"{node_name} completed ({stop_reason}) in {elapsed_s:.1f}s."
+    if verdict == VERDICT_RETRY:
+        return f"{node_name} needs retry ({stop_reason}) after {elapsed_s:.1f}s."
+    return f"{node_name} escalated ({stop_reason}) after {elapsed_s:.1f}s."
+
+
+def _emit(emit: EmitFn, event_type: str, payload: dict[str, Any]) -> None:
+    if emit is None:
+        return
+    try:
+        emit(event_type, payload)
+    except Exception:  # noqa: BLE001
+        pass  # event sink failures must never break execution

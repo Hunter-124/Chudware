@@ -51,6 +51,7 @@ def run(
     run_id: Optional[str] = None,
     runs_dir: Optional[Path] = None,
     emit: EmitFn = None,
+    agent_fn: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Execute an aicad.dag/1 graph and persist checkpoints to SQLite.
 
@@ -62,6 +63,9 @@ def run(
                        Defaults to default_runs_dir(). Pass a tmp dir for hermetic tests.
         emit:          Optional event callback ``(event_type: str, payload: dict) -> None``.
                        Receives dag.run.* and dag.node.* events per §11 of the contract.
+        agent_fn:      Optional agent callable injected into node handlers.
+                       Signature: ``(request: str, context_pack: dict) -> AgentRun``.
+                       Defaults to the live agent loop.  Tests inject a mock here.
 
     Returns:
         dict with keys:
@@ -89,7 +93,7 @@ def run(
 
     # Build the uncompiled StateGraph, then compile with checkpointer inside the CM
     # so the SqliteSaver connection is alive for the full invocation.
-    uncompiled = build_state_graph(graph_json, emit=emit)
+    uncompiled = build_state_graph(graph_json, emit=emit, agent_fn=agent_fn)
 
     # NOTE: emit is passed via closure into node handlers by build_state_graph(),
     # NOT carried in state — the LangGraph checkpointer cannot serialise callables.

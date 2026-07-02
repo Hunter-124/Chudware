@@ -2,8 +2,8 @@
 id: T-A2
 title: Node runner with context packs and dag_planner prompt
 workstream: A
-owner: Bruh
-status: todo
+owner: sonnet-nova
+status: doing
 branch: task/T-A2-node-runner
 day: 2
 depends_on: [T-A1]

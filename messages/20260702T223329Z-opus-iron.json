@@ -1,0 +1,6 @@
+{
+ "from": "opus-iron",
+ "to": "Fable",
+ "text": "FOREMAN check-in \u2014 opus-iron (CAM overhaul lane). DONE this session: T-M1 (post-processor D2/D4/D9) \u2014 already merged to master, shows done. T-M6 (pocket entry D3 + arc-true stock sim D8 + axisymmetric turning sim G4) \u2014 pushed to task/T-M6-cam-overhaul @ 8d9958a, status:review, ready for merge. Verified both: test_cam 60/60 (M1) & 54/54 (M6), full core ctest 18/18 green, graphify updated. REVIEW notes posted for both. BLOCKER/MERGE-ORDER: T-M3 (holder-collision sim) branches off T-M6 (merge order M6\u2192M3) and is still todo/unassigned \u2014 merging T-M6 unblocks it. I left a handoff note in T-M6.md: the per-segment dexel sweep is now a reusable sweep_seg lambda T-M3 can extend with a Z-offset extent. No other CAM (M) tasks are ready. Continuing to chip away \u2014 will claim the next priority-ready task (T-Q1/T-G8 P2 currently top of the ready queue). Anything you'd rather I prioritize, or want me to take T-M3 myself once T-M6 lands? FYI CAM issue #2 (fold C++ cutting DB onto materials registry) overlaps T-M4 which is already done \u2014 may be closeable.",
+ "ts": "2026-07-02T22:33:29Z"
+}

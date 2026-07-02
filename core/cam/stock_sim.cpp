@@ -158,6 +158,61 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
         res.ok = false; res.error = "stock has zero extent"; return res;
     }
 
+    // ── turning: axisymmetric radial-profile sim ──────────────────────────────
+    // A top-down Z-dexel can't represent diameter reduction (removal is radial, the
+    // dexel's height axis is the spindle axis). For a lathe + cylindrical stock, model
+    // the stock as a radius profile R(z) and lower it as each turning pass cuts; removed
+    // volume integrates π(R0²−R(z)²)dz along the axis (audit G4).
+    if (setup.machine.kind == MachineKind::Lathe && cylinder) {
+        int nz = std::max(2, (int)std::ceil((top - bottom) / res_mm));
+        double dz = (top - bottom) / nz;
+        std::vector<double> rad(nz, cyl_r);   // outer radius per axial slice
+        for (const Toolpath& tp : toolpaths) {
+            Vec3 prev{0, 0, 0};
+            bool have = false;
+            for (const Move& m : tp.moves) {
+                if (m.kind == MoveKind::Dwell || m.kind == MoveKind::ToolChange) continue;
+                Vec3 to = m.to;
+                if (!have) { prev = to; have = true; continue; }
+                bool cutting = (m.kind == MoveKind::Cut || m.kind == MoveKind::Plunge ||
+                                m.kind == MoveKind::Lead || m.kind == MoveKind::Arc);
+                if (cutting) {
+                    double z0 = std::min(prev.z, to.z), z1 = std::max(prev.z, to.z);
+                    bool radial = std::fabs(to.z - prev.z) < 1e-9;  // pure infeed at one Z
+                    for (int k = 0; k < nz; ++k) {
+                        double zc = bottom + (k + 0.5) * dz;
+                        if (zc < z0 - dz || zc > z1 + dz) continue;
+                        double xr;
+                        if (radial) {
+                            xr = std::min(std::fabs(prev.x), std::fabs(to.x));
+                        } else {
+                            double f = (zc - prev.z) / (to.z - prev.z);
+                            f = std::max(0.0, std::min(1.0, f));
+                            xr = std::fabs(prev.x + (to.x - prev.x) * f);
+                        }
+                        if (xr < rad[k]) rad[k] = xr;   // tool leaves the smallest radius it reached
+                    }
+                }
+                prev = to;
+            }
+        }
+        double remaining = 0;
+        for (int k = 0; k < nz; ++k) remaining += M_PI * rad[k] * rad[k] * dz;
+        double removed = std::max(0.0, stock_vol - remaining);
+        res.stock_volume_mm3 = stock_vol;
+        res.removed_volume_mm3 = removed;
+        res.remaining_volume_mm3 = std::max(0.0, remaining);
+        res.machined_fraction = removed / std::max(1e-9, stock_vol);
+        double total = 0;
+        int last_tool = -999;
+        for (const Toolpath& tp : toolpaths) {
+            if (tp.tool_number != last_tool) { total += setup.machine.tool_change_s; last_tool = tp.tool_number; }
+            total += estimate_time(tp, setup.machine);
+        }
+        res.cycle_time_s = total;
+        return res;
+    }
+
     // seed the dexel field at the stock top
     HeightField field = HeightField::from_mesh(flat_plane(lo, hi, top, res_mm), res_mm, 0, bottom);
     int nx = field.nx(), ny = field.ny();
@@ -202,16 +257,11 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
         double r = tl ? tl->effective_radius() : 1.0;
         Vec3 prev{0, 0, 1e9};
         bool have = false;
-        for (const Move& m : tp.moves) {
-            if (m.kind == MoveKind::Dwell || m.kind == MoveKind::ToolChange) continue;
-            // arcs: approximate as a chord for removal (fine at sim resolution)
-            Vec3 to = m.to;
-            if (!have) { prev = to; have = true; continue; }
-            bool cutting = (m.kind == MoveKind::Cut || m.kind == MoveKind::Plunge ||
-                            m.kind == MoveKind::Lead || m.kind == MoveKind::Arc);
-            bool rapid = (m.kind == MoveKind::Rapid || m.kind == MoveKind::Retract);
-            double minx = std::min(prev.x, to.x) - r, maxx = std::max(prev.x, to.x) + r;
-            double miny = std::min(prev.y, to.y) - r, maxy = std::max(prev.y, to.y) + r;
+        // lower the dexel field under the tool disc along one straight sub-segment a→b
+        // (cutting), or flag a rapid that passes through remaining stock.
+        auto sweep_seg = [&](const Vec3& a, const Vec3& b, bool cutting, bool rapid) {
+            double minx = std::min(a.x, b.x) - r, maxx = std::max(a.x, b.x) + r;
+            double miny = std::min(a.y, b.y) - r, maxy = std::max(a.y, b.y) + r;
             int i0 = std::max(0, (int)std::floor((minx - flo.x) / res_mm));
             int i1 = std::min(nx - 1, (int)std::ceil((maxx - flo.x) / res_mm));
             int j0 = std::max(0, (int)std::floor((miny - flo.y) / res_mm));
@@ -220,15 +270,51 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
                 for (int i = i0; i <= i1; ++i) {
                     double x = flo.x + i * res_mm, y = flo.y + j * res_mm;
                     double t;
-                    double d = dist_point_seg(x, y, prev.x, prev.y, to.x, to.y, t);
+                    double d = dist_point_seg(x, y, a.x, a.y, b.x, b.y, t);
                     if (d > r) continue;
-                    double zt = prev.z + (to.z - prev.z) * t;  // tool tip Z at nearest pass
+                    double zt = a.z + (b.z - a.z) * t;  // tool tip Z at nearest pass
                     if (cutting) {
                         if (zt < field.raw(i, j)) field.set_raw(i, j, zt);
                     } else if (rapid && opt.check_rapid) {
                         if (field.raw(i, j) > zt + 0.01) { ++rapid_hits; }
                     }
                 }
+        };
+        for (const Move& m : tp.moves) {
+            if (m.kind == MoveKind::Dwell || m.kind == MoveKind::ToolChange) continue;
+            Vec3 to = m.to;
+            if (!have) { prev = to; have = true; continue; }
+            bool cutting = (m.kind == MoveKind::Cut || m.kind == MoveKind::Plunge ||
+                            m.kind == MoveKind::Lead || m.kind == MoveKind::Arc);
+            bool rapid = (m.kind == MoveKind::Rapid || m.kind == MoveKind::Retract);
+            if (m.kind == MoveKind::Arc) {
+                // sweep the TRUE arc (center+radius carried on the Move), not the chord:
+                // a chord bows inside a convex arc and under-removes near the midpoint,
+                // which false-negatives the gouge check on curved passes (audit D8).
+                double cx = m.center.x, cy = m.center.y;
+                double rad = std::hypot(prev.x - cx, prev.y - cy);
+                double a0 = std::atan2(prev.y - cy, prev.x - cx);
+                double a1 = std::atan2(to.y - cy, to.x - cx);
+                double da = a1 - a0;
+                if (m.ccw) { if (da <= 1e-9) da += 2 * M_PI; }
+                else       { if (da >= -1e-9) da -= 2 * M_PI; }
+                double arclen = std::fabs(da) * rad;
+                // sample ~2 points per grid cell so the arc's mid-bulge is captured
+                int segs = std::max(2, (int)std::ceil(arclen / std::max(1e-6, res_mm * 0.5)));
+                segs = std::min(segs, 1440);
+                Vec3 a = prev;
+                for (int k = 1; k <= segs; ++k) {
+                    double f = (double)k / segs;
+                    Vec3 b = (k == segs) ? to
+                             : Vec3{cx + rad * std::cos(a0 + da * f),
+                                    cy + rad * std::sin(a0 + da * f),
+                                    prev.z + (to.z - prev.z) * f};
+                    sweep_seg(a, b, cutting, rapid);
+                    a = b;
+                }
+            } else {
+                sweep_seg(prev, to, cutting, rapid);
+            }
             prev = to;
         }
     }

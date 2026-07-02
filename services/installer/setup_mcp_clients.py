@@ -22,6 +22,12 @@ engine's heavy dependencies installed.
 
     python installer/setup_mcp_clients.py [--python <exe>] [--repo <dir>]
                                           [--unregister] [--dry-run]
+                                          [--detect] [--wizard]
+
+First-run "connect your client" wizard groundwork: ``--detect`` reports which MCP clients
+this machine appears to have (and whether ai-cad is already wired); ``--wizard`` connects
+just the detected-but-unconnected ones (reusing the same idempotent writer). This is the
+seam a GUI first-run flow drives -- see contracts/providers.md (Pillar 12 MCP-first).
 """
 from __future__ import annotations
 
@@ -146,6 +152,44 @@ def _apply_one(t: dict, unregister: bool, dry_run: bool) -> dict:
     return {"client": t["client"], "path": str(path), "status": status}
 
 
+# ------------------------------------------------------ first-run wizard groundwork
+
+def _status_of(t: dict) -> dict:
+    """Detection record for one client target: is the client present, and are we wired to it?
+
+    ``present`` = the client has left a footprint on this machine (its config file or the
+    directory that holds it already exists) -- a good-enough, stdlib-only heuristic for a
+    first-run "we found these clients" prompt. ``connected`` = ai-cad is already registered.
+    """
+    path: Path = t["path"]
+    cfg = _load(path) if path.exists() else {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    connected = SERVER_NAME in (cfg.get(t["key"]) or {})
+    present = path.exists() or path.parent.exists()
+    return {"client": t["client"], "path": str(path), "present": present,
+            "connected": connected}
+
+
+def detect(py: str, repo: str) -> list[dict]:
+    """Report every known MCP client target with presence + connection status."""
+    return [_status_of(t) for t in _targets(py, repo)]
+
+
+def _run_wizard(py: str, repo: str, dry_run: bool) -> list[dict]:
+    """Connect just the clients that are present but not yet wired to ai-cad."""
+    results = []
+    for t in _targets(py, repo):
+        st = _status_of(t)
+        if st["connected"] or not st["present"]:
+            results.append({"client": t["client"], "path": st["path"],
+                            "status": "already connected" if st["connected"]
+                            else "skipped (client not detected)"})
+            continue
+        results.append(_apply_one(t, unregister=False, dry_run=dry_run))
+    return results
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -155,18 +199,36 @@ def main(argv: list[str]) -> int:
                     help="Repository root (default: this script's parent)")
     ap.add_argument("--unregister", action="store_true", help="Remove the ai-cad entries")
     ap.add_argument("--dry-run", action="store_true", help="Show what would change")
+    ap.add_argument("--detect", action="store_true",
+                    help="Report which MCP clients are present / already connected, then exit")
+    ap.add_argument("--wizard", action="store_true",
+                    help="Connect only the clients detected on this machine (first-run flow)")
     args = ap.parse_args(argv)
 
     py = str(Path(args.python).resolve())
     repo = str(Path(args.repo).resolve())
 
+    if args.detect:
+        rows = detect(py, repo)
+        width = max(len(r["client"]) for r in rows)
+        print("Detected MCP clients (present = footprint on this machine):\n")
+        for r in rows:
+            mark = "connected" if r["connected"] else ("present" if r["present"] else "-")
+            print(f"  {r['client']:<{width}}  {mark:<10}  {r['path']}")
+        return 0
+
     action = "Unregistering" if args.unregister else "Registering"
+    if args.wizard:
+        action = "Connecting detected"
     print(f"{action} '{SERVER_NAME}' MCP server")
     print(f"  python : {py}")
     print(f"  repo   : {repo}")
     print()
 
-    results = [_apply_one(t, args.unregister, args.dry_run) for t in _targets(py, repo)]
+    if args.wizard:
+        results = _run_wizard(py, repo, args.dry_run)
+    else:
+        results = [_apply_one(t, args.unregister, args.dry_run) for t in _targets(py, repo)]
     width = max(len(r["client"]) for r in results)
     for r in results:
         print(f"  {r['client']:<{width}}  {r['status']:<22}  {r['path']}")

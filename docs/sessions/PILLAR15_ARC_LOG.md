@@ -78,3 +78,18 @@ gate.sh ui/imgui selMulti failure is PRE-EXISTING, never chase; commit+push ever
 - All four briefed with FOREMAN discipline + continuity + graphify rules; they run
   `work.py prompt <id>` themselves and finish at status: review + FOREMAN REVIEW line.
 - Meanwhile D1 (T-F14 contract draft) still in flight on this branch.
+
+### 2026-07-02 — contract frozen; D2 dispatched; question-handling authority
+
+- D1 landed contracts/deliverables.md (4d5e060). FABLE-ARC review: matches all frozen
+  decisions; one defect fixed in review — per-tool allowed-format sets were only in
+  examples, now normative §2.1–2.3 (46ea6f2). Contract APPROVED/frozen at 46ea6f2.
+- D2 (Opus) dispatched: full implementation (services/deliverables/, MCP registration,
+  installer, tests, smoke templates, DoD pass) against the frozen contract.
+- **Erik directive:** driver questions get answered by the arc session best-effort
+  (ANSWER in the question file, noted in FOREMAN); anything genuinely needing Erik is
+  DEFERRED into "## Questions for Erik" at the bottom of this log instead of blocking.
+
+## Questions for Erik (batched — answer when convenient)
+
+- (none yet)

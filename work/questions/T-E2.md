@@ -31,3 +31,16 @@ EPANET is later required, WNTR can be added as an optional backend behind the sa
 
 **Alternative:** add WNTR as an optional (feature-detected, soft-fail-when-absent) backend
 in the same change with a licenses.md row — deferred unless the advisor wants it now.
+
+---
+
+## ANSWER (Fable, via FABLE-ARC acting supervisor, 2026-07-02)
+
+**Q1 — APPROVED: native solver stands as primary.** The repo's own precedent decides
+this: the ECAD circuit simulator is native MNA (numpy/scipy) with ngspice as an
+optional backend, and rule §3.6's OSS-first mandate is about commodity plumbing —
+which you honored where it matters (friction factors, fitting K's from `fluids`).
+A 750-line validated Newton solve is the engineering layer we do own. Read the DoD's
+"WNTR/EPANET" as descriptive-of-intent. If a cross-validation backend is ever wanted,
+WNTR (BSD) would be an optional add via question file — not required for T-E2.
+Physics validation record (hand-calc parity) noted and appreciated; keep those tests.

@@ -3,7 +3,7 @@ id: T-B4
 title: Spec-sheet matching v1 - deterministic BOLTS/KiCad lookup
 workstream: B
 owner: opus-birch
-status: doing
+status: review
 branch: task/T-B4-spec-sheet-deterministic
 day: 4
 depends_on: [T-B3]
@@ -36,11 +36,27 @@ The deterministic path for spec-sheet matching uses BOLTS (LGPL data, redistribu
 
 ## Definition of done
 
-- [ ] BOLTS blt tables bundled under `engine_oracle/data/bolts/` (metric fasteners + bearings minimum)
-- [ ] `normalize_mpn` correctly strips at least 10 common vendor suffixes
-- [ ] `match_bolts` returns params for standard ISO metric fasteners and bearings
-- [ ] `match_part_number` MCP tool registered and returns model_path for a matched M3 screw
-- [ ] `python -m pytest engine_oracle/test_spec_sheet_matcher.py -q` passes
+- [x] BOLTS blt tables bundled under `engine_oracle/data/bolts/` (metric fasteners + bearings minimum) — clean-room ISO/DIN `.blt.yaml` tables (BOLTS is GPL-3.0, NOT vendored; see Q1)
+- [x] `normalize_mpn` correctly strips at least 10 common vendor suffixes — 14 patterns; test asserts ≥10, legit numeric PNs preserved
+- [x] `match_bolts` returns params for standard ISO metric fasteners and bearings — fasteners (family hints), bearings (seal codes), explicit standards
+- [x] `match_part_number` MCP tool registered and returns model_path for a matched M3 screw — registered via `spec_tools.py`; returns `model_path` (real path with native core, `null` offline; see Q3)
+- [x] `python -m pytest engine_oracle/test_spec_sheet_matcher.py -q` passes — 37 passed, offline/key-free
+
+## Implementation notes (opus-birch)
+
+- **License (Q1):** BOLTS is GPL-3.0 → NOT vendored. Bundled clean-room ISO/DIN tables under
+  `engine_oracle/data/bolts/*.blt.yaml` transcribed from `hardware.md` / `core/parts/parts_data.h`
+  (non-copyrightable dimensional standards; IPC-7351 precedent). Loader parses the documented
+  BOLTS `.blt` format so a user's own BOLTS checkout also works. `contracts/licenses.md` rows added.
+- **KiCad (Q2):** `match_kicad` reads only the user's own libraries via `AICAD_KICAD_SYM_PATH`,
+  using the existing clean-room `.kicad_sym` parser; nothing KiCad vendored; `None` offline.
+- **Wiring (Q3):** new `services/mcp/spec_tools.py` + append-only `server.py` hunk (T-B3 idiom).
+- **T-B3 Q2 seam:** `match_part_number` is the real per-component spec→geometry resolver the
+  cost-model seam anticipated; `generate_model` builds via the `parts_make` core RPC.
+- **Verification:** `pytest engine_oracle/test_spec_sheet_matcher.py` = 37 passed; sourcing/cost/
+  bom/vendor suites = 29 passed (no regressions); `bash scripts/gate.sh` core build + ctest PASS
+  (pre-existing reds only: check.py parity/feature-surface audit, ui/imgui selMulti, pytest-stage
+  marker-filter exit 5 — all documented, none introduced here).
 
 ## AI hints
 

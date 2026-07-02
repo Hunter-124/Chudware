@@ -10,6 +10,7 @@
 #include "ui/settings_modal.h"
 #include "ui/preview_pane.h"
 #include "ui/scaffold_demo_panel.h"
+#include "ui/parts_panel.h"
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -199,6 +200,21 @@ void Application::frame() {
         ImGui::SetNextWindowSize(ImVec2(420.f * theme::S(), 420.f * theme::S()), ImGuiCond_Appearing);
         if (ImGui::Begin("Scaffold Demo###scaffold_demo", ui::scaffoldDemoPanelOpen(), pflags))
             ui::drawScaffoldDemoPanel(s);
+        ImGui::End();
+    }
+
+    // T-U2 Parts Browser: closable panel built on panel_scaffold.h (T-U1 kit).
+    // Federated search across all part domains; detail card + insert via part_place (Pillar 17).
+    // Screenshot-verifiable via AI_CAD_SHOT=parts_browser (worker one-shot).
+    // Zero footprint while closed — same convention as drawScaffoldDemoPanel / drawPreviewPane.
+    if (*ui::partsPanelOpen()) {
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
+                                        vp->WorkPos.y + vp->WorkSize.y * 0.5f),
+                                 ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(520.f * theme::S(), 680.f * theme::S()), ImGuiCond_Appearing);
+        if (ImGui::Begin("Parts Browser###parts_browser", ui::partsPanelOpen(), pflags))
+            ui::drawPartsPanel(s);
         ImGui::End();
     }
     ImGui::PopStyleColor();

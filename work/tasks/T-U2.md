@@ -3,7 +3,7 @@ id: T-U2
 title: Parts browser panel — federated search, detail card, insert
 workstream: U
 owner: sonnet-page
-status: doing
+status: review
 branch: task/T-U2-ui
 day: 2
 priority: 2
@@ -24,13 +24,14 @@ everything (fasteners→ECAD→sections→fittings→hydraulics→vendor), inspe
 
 ## Definition of done
 
-- [ ] Search-as-you-type w/ domain filter chips; results show domain badge + standard +
+- [x] Search-as-you-type w/ domain filter chips; results show domain badge + standard +
       source (local/live); live vendor rows marked and price-annotated when present
-- [ ] Detail card: params table, sourcing links, provenance/license line, Insert button
-- [ ] Insert calls part_place and the result is an editable doc artifact (R1) — assert
-      in a scenario test; headless screenshot of populated panel
-- [ ] Empty/offline/key-less states use the pattern-library placeholder vocabulary
-- [ ] ui_style_check green; flock'd build; gate; graphify update .
+- [x] Detail card: params table, sourcing links, provenance/license line, Insert button
+- [x] Insert calls part_place and the result is an editable doc artifact (R1) — assert
+      in a scenario test (test_parts_worker_rpc.py::TestPartPlace::test_place_r1_editable);
+      headless screenshot of populated panel (AI_CAD_SHOT=parts_browser, 6 results visible)
+- [x] Empty/offline/key-less states use the pattern-library placeholder vocabulary
+- [x] ui_style_check green; flock'd build; gate PASS; graphify update .
 
 ## Driver notes (Fable)
 

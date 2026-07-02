@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "imgui.h"
+#include "imgui_internal.h"  // ImRect (ui::adaptivePanel rect argument)
 
 #include "file_explorer.h"
 #include "dragdrop.h"       // kFileDragPayload (Explorer drag source -> viewport drop target)
@@ -35,6 +36,24 @@ namespace ui {
 static int s_explorerStripe = 0;
 static void explorerRowPill(bool selected = false) {
     ui::glassRowAtCursor(3.5f, (s_explorerStripe++ % 2) == 0, selected, 5.0f);
+}
+
+// Liquid glass v2 (host contract §H4): fetch (never paint) the left pane's ONE glass surface —
+// layout.cpp's drawLeftPane already painted it this frame under "host_left_glass"; adaptivePanel
+// is idempotent per frame (A2), so this is a cheap cached lookup regardless of the rect passed
+// (window pos/size here is this child's rect, not the whole pane — irrelevant after the first
+// same-frame call).
+static const ui::AdaptiveSurface& explorerSurf() {
+    ImVec2 wp_ = ImGui::GetWindowPos(); ImVec2 ws_ = ImGui::GetWindowSize();
+    ImRect r(wp_, ImVec2(wp_.x + ws_.x, wp_.y + ws_.y));
+    return ui::adaptivePanel(ui::panelId("host_left_glass"), r);
+}
+// Contrast halo for drawIconGlass: surf.tint is already the opposite-tone neutral (see
+// ui_theme.cpp adaptiveSurface) at ~0x50 alpha; 0 alpha (no live backdrop) => drawIconGlass
+// draws plain (icons.h contract).
+static ImU32 explorerHalo(const ui::AdaptiveSurface& surf) {
+    if (!ui::viewportBackdrop().valid()) return 0;
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0x50 / 255.f));
 }
 
 static std::string s_selectedPath;     // the currently-highlighted tree node (file or folder)
@@ -96,12 +115,18 @@ static const char* fileIconName(const std::string& ext) {
     return "new_doc";
 }
 
-// Draw a 16px icon inline (or nothing if the atlas lacks it) and advance the cursor.
+// Draw a 16px icon inline (or nothing if the atlas lacks it) and advance the cursor. Tint tracks
+// the pane's adaptive surface (max contrast over the frosted backdrop); drawIconGlass adds the
+// opposite-tone contrast halo (host contract §H4).
 static void drawIcon(const char* name) {
     const float sz = 16.0f * ui::uiScale;
     IconUV ic = getIcon(name, 20);
     if (ic.valid) {
-        ImGui::Image(ic.texId, ImVec2(sz, sz), ic.uv0, ic.uv1);
+        const ui::AdaptiveSurface& surf = explorerSurf();
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImGui::Dummy(ImVec2(sz, sz));
+        drawIconGlass(ImGui::GetWindowDrawList(), name, ImVec2(p0.x + sz * 0.5f, p0.y + sz * 0.5f),
+                     sz, ImGui::ColorConvertFloat4ToU32(surf.textSecondary), explorerHalo(surf));
         ImGui::SameLine(0, 4.0f * ui::uiScale);
     }
 }
@@ -110,7 +135,6 @@ static bool toolbarIconButton(const char* id, const char* icon, const char* tip,
     const float S = ui::uiScale;
     const float btn = 28.0f * S;
     const float glyph = 18.0f * S;
-    const auto& pal = ui::palette;
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImVec2 p1(p0.x + btn, p0.y + btn);
 
@@ -125,11 +149,12 @@ static bool toolbarIconButton(const char* id, const char* icon, const char* tip,
         ui::glassRowBackground(dl, p0, p1, 5.0f, false, false);
     IconUV ic = getIcon(icon, 20);
     if (ic.valid) {
-        float ix = p0.x + (btn - glyph) * 0.5f;
-        float iy = p0.y + (btn - glyph) * 0.5f;
-        ImVec4 tint(pal.text[0], pal.text[1], pal.text[2], enabled ? 1.0f : 0.35f);
-        dl->AddImage(ic.texId, ImVec2(ix, iy), ImVec2(ix + glyph, iy + glyph),
-                     ic.uv0, ic.uv1, ImGui::ColorConvertFloat4ToU32(tint));
+        const ui::AdaptiveSurface& surf = explorerSurf();
+        ImVec4 tintV = enabled ? surf.textPrimary
+                               : ImVec4(surf.textTertiary.x, surf.textTertiary.y,
+                                        surf.textTertiary.z, surf.textTertiary.w * 0.35f);
+        drawIconGlass(dl, icon, ImVec2(p0.x + btn * 0.5f, p0.y + btn * 0.5f), glyph,
+                     ImGui::ColorConvertFloat4ToU32(tintV), explorerHalo(surf));
     }
     if (hovered) ImGui::SetTooltip("%s", tip);
     ImGui::PopID();
@@ -400,8 +425,7 @@ static void drawRecentSection(AppState& st) {
             drawIcon(fileIconName(lowerExt(p)));
             std::error_code ec;
             bool exists = fs::exists(p, ec);
-            if (!exists) ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
+            if (!exists) ImGui::PushStyleColor(ImGuiCol_Text, explorerSurf().textSecondary);
             explorerRowPill();
             if (ImGui::Selectable(p.filename().string().c_str(), false,
                                   ImGuiSelectableFlags_AllowDoubleClick) &&
@@ -499,8 +523,7 @@ void drawFileExplorerBody(AppState& st) {
 
     ui::glassRowAtCursor(3.5f, false, false, 5.0f);
     ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], 1));
+    ImGui::PushStyleColor(ImGuiCol_Text, explorerSurf().textSecondary);
     std::string folderName = current.filename().string();
     if (folderName.empty()) folderName = current.string();
     ImGui::TextUnformatted(folderName.c_str());

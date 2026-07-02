@@ -46,6 +46,56 @@ static ViewSelector  s_viewSelector;   // C25 W2-E: glass-box view selector (Spa
 static SectionTool   s_sectionTool;    // C25 W3-J: section-view (impl owned by section_tool agent)
 static float         s_huFade = 0.25f; // heads-up toolbar idle opacity (ramps on hover)
 
+// ---- Liquid-glass v2 host port (H6a: local://glass_host.md) ----
+// Published viewport image rect (screen coords) + the live Renderer, kept for the registered
+// ui::LuminanceSampler (a captureless lambda can only read file-static state) and for
+// invalidateViewportBackdrop(). Mirrors ui/imgui/src/ui/viewport.cpp's s_bdMin/s_bdMax/s_bdLive
+// + g_glVp pattern; refreshed every frame from drawViewportPanel (st.renderer is a stable single
+// instance for the app's lifetime -- see AppState::renderer / run_gui).
+static Renderer* s_bdRenderer = nullptr;
+static ImVec2    s_bdMin  = {0, 0};
+static ImVec2    s_bdMax  = {0, 0};
+static bool      s_bdLive = false;
+
+// Registers the screen->viewport-local luminance sampler exactly once. Ported from
+// ui/imgui/src/ui/viewport.cpp setViewportPipeline's inset-band clamp (A7): a rect fully outside
+// the viewport degenerates to an edge column/row, so such rects grow ~15% (min 24px) INTO the
+// viewport, letting side panels adapt to real scene content instead of the 1px border line.
+static void registerViewportLuminanceSamplerOnce() {
+    static bool s_registered = false;
+    if (s_registered) return;
+    s_registered = true;
+    ui::setLuminanceSampler(+[](ImVec2 mn, ImVec2 mx) -> float {
+        if (!s_bdLive || !s_bdRenderer) return -1.f;
+        ImVec2 cmn(std::min(std::max(mn.x, s_bdMin.x), s_bdMax.x),
+                  std::min(std::max(mn.y, s_bdMin.y), s_bdMax.y));
+        ImVec2 cmx(std::min(std::max(mx.x, s_bdMin.x), s_bdMax.x),
+                  std::min(std::max(mx.y, s_bdMin.y), s_bdMax.y));
+        const float kInset = std::max(24.f, (s_bdMax.x - s_bdMin.x) * 0.15f);
+        if (cmx.x - cmn.x < 4.f) {
+            if (cmn.x <= s_bdMin.x + 1.f) cmx.x = std::min(s_bdMin.x + kInset, s_bdMax.x);
+            else                          cmn.x = std::max(s_bdMax.x - kInset, s_bdMin.x);
+        }
+        if (cmx.y - cmn.y < 4.f) {
+            if (cmn.y <= s_bdMin.y + 1.f) cmx.y = std::min(s_bdMin.y + kInset, s_bdMax.y);
+            else                          cmn.y = std::max(s_bdMax.y - kInset, s_bdMin.y);
+        }
+        return s_bdRenderer->averageLuminance(cmn.x - s_bdMin.x, cmn.y - s_bdMin.y,
+                                              cmx.x - s_bdMin.x, cmx.y - s_bdMin.y);
+    });
+}
+
+// A6 (host): invalidate the published backdrop + stop the renderer's blur/luminance work outright
+// whenever the Viewport window's content does not draw this frame (hidden dock tab -- ECAD/CAM
+// Manufacture forward -- a Drawing tab, or the viewport hidden outright). Panels then take the
+// palette-fallback surface automatically (adaptivePanel's l<0 path).
+static void invalidateViewportBackdrop() {
+    ui::setViewportBackdrop(ui::ViewportBackdropInfo{});
+    s_bdLive = false;
+    if (s_bdRenderer) s_bdRenderer->setBackdropEnabled(false);
+}
+
+
 enum class NewDocStage { Root, Drawing, Simulation };
 
 static bool        s_newDocLauncherOpen = false;
@@ -223,12 +273,17 @@ static void drawAiActivityBadge(ImVec2 vr0, ImVec2 vr1, const std::string& statu
     ImVec2 p0(cx - w * 0.5f, vr0.y + 10.0f * S);
     ImVec2 p1(p0.x + w, p0.y + h);
 
-    ui::glassBackground(dl, p0, p1, h * 0.5f / S);
+    // Liquid-glass v2 (H6a): adaptive UltraThin surface instead of the fixed glassBackground fill
+    // so the badge's contrast tracks the live scene under it. Accent pulse border/dot stay
+    // palette (a semantic "live" cue, not surface text).
+    const ui::AdaptiveSurface& surf =
+        ui::adaptivePanel(ui::panelId("vp_ai_badge"), ImRect(p0, p1));
+    ui::glassPanel(dl, ImRect(p0, p1), ui::GlassLevel::UltraThin, h * 0.5f / S, surf);
     dl->AddRect(p0, p1, withAlpha(pal.accent, 0.35f + 0.45f * pulse), h * 0.5f, 0, 1.5f * S);
     ImVec2 dotc(p0.x + padX + dotR, (p0.y + p1.y) * 0.5f);
     dl->AddCircleFilled(dotc, dotR, withAlpha(pal.accent, pulse));
-    dl->AddText(ImVec2(dotc.x + dotR + gap, p0.y + padY), withAlpha(pal.overlayText, 1.0f),
-                label.c_str());
+    ui::glassText(dl, nullptr, ImGui::GetFontSize(),
+                 ImVec2(dotc.x + dotR + gap, p0.y + padY), surf, label.c_str());
 }
 
 // drawNewDocChooser is declared in viewport_panel.h (public — hosted at app scope).
@@ -1321,6 +1376,11 @@ static bool dimHandleGeometry(AppState& st, const Renderer& renderer, const ImVe
 void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     if (!st.renderer) return;
     Renderer& renderer = *st.renderer;
+    // Liquid-glass v2 (H6a): st.renderer is a stable singleton for the app's lifetime (set once
+    // in run_gui), so refreshing this pointer + registering the sampler here covers every branch
+    // below (live 3D, Drawing tab, hidden dock tab) with one call.
+    s_bdRenderer = &renderer;
+    registerViewportLuminanceSamplerOnce();
     auto viewportTitle = [&]() {
         if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
             const auto& tab = st.docTabs[st.activeTab];
@@ -1341,6 +1401,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             ui::drawDrawingSheet(st);
         }
         ImGui::End();
+        invalidateViewportBackdrop();
         return;
     }
 
@@ -1702,6 +1763,25 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         ImGui::GetBackgroundDrawList()->AddImage(
             (ImTextureID)(intptr_t)renderer.resolvedColorTexture(), vr0, vr1,
             ImVec2(0, 1), ImVec2(1, 0));
+        // ---- Liquid-glass v2 (H6a): publish the Kawase-blurred backdrop with THIS image's
+        // screen rect so ui::glassPanel can project any panel rect into backdrop UVs. uv0=(0,1),
+        // uv1=(1,0) above (GL bottom-left texture) is the same orientation ViewportBackdropInfo's
+        // flipV=true assumes, so flipV=true here matches the AddImage call verbatim.
+        renderer.setBackdropEnabled(true);   // frost from the studio bg even with no mesh
+        {
+            const auto bd = renderer.backdrop();
+            ui::ViewportBackdropInfo bdInfo;
+            bdInfo.textureId = bd.textureId;
+            bdInfo.uvMin = ImVec2(bd.uvMin[0], bd.uvMin[1]);
+            bdInfo.uvMax = ImVec2(bd.uvMax[0], bd.uvMax[1]);
+            bdInfo.screenMin = vr0;
+            bdInfo.screenMax = vr1;
+            bdInfo.flipV = true;
+            ui::setViewportBackdrop(bdInfo);
+            s_bdMin = vr0;
+            s_bdMax = vr1;
+            s_bdLive = bdInfo.valid();
+        }
         // (The dock-tab band that used to paint here was removed: drawDocTabs() now paints a single
         // opaque band for the whole tab row — covering both the strip and the window-padding gap above
         // it — so there is no longer a second translucent fill to stack against it. The 3D image below
@@ -2573,16 +2653,26 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const float pillA = 0.38f * s_huFade;
             const int iconA = (int)(220.0f * s_huFade + 20.0f);
 
-            auto huPill = [&](float bxi, float by, bool selected) {
-                if (pillA <= 0.04f) return;
-                ui::glassRowBackground(hdl, ImVec2(bxi, by), ImVec2(bxi + btn, by + btn),
-                                       4.0f, false, selected && s_huFade > 0.55f, pillA);
+            // Liquid-glass v2 (H6a): per-pill AdaptiveSurface (id = panelId(iconName), window-
+            // independent) drives both the frosted UltraThin glassPanel AND the icon/halo tone, so
+            // the toolbar's contrast tracks the live viewport content instead of a fixed palette
+            // tint. Returns the surface so callers can tint their own icon draw to match.
+            auto huPill = [&](float bxi, float by, bool selected,
+                              const char* iconName) -> const ui::AdaptiveSurface& {
+                ImVec2 mn(bxi, by), mx(bxi + btn, by + btn);
+                const ui::AdaptiveSurface& surf =
+                    ui::adaptivePanel(ui::panelId(iconName), ImRect(mn, mx));
+                ui::glassPanel(hdl, ImRect(mn, mx), ui::GlassLevel::UltraThin, 4.0f, surf,
+                              s_huFade * (selected ? 1.0f : 0.85f));
+                if (selected && s_huFade > 0.55f)
+                    ui::glassRowBackground(hdl, mn, mx, 4.0f, false, true, 0.42f * s_huFade);
+                return surf;
             };
 
             // Helper: draw one toolbar icon button. Returns true on click.
             auto huBtn = [&](int idx, const char* iconName, const char* tip, bool active) -> bool {
                 float bxi = bx0 + padX + (float)idx * (btn + gap);
-                huPill(bxi, byi, active);
+                const ui::AdaptiveSurface& surf = huPill(bxi, byi, active, iconName);
                 ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
                 ImGui::PushID(idx);
                 bool clicked = ImGui::InvisibleButton("##hb", ImVec2(btn, btn));
@@ -2592,11 +2682,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
                                        Palette::toU32(hovCol), 3.0f * s);
                 }
-                IconUV iv = ui::getIcon(iconName, 20);
-                float iz = 16.0f * s, off = (btn - iz) * 0.5f;
-                hdl->AddImage(iv.texId, ImVec2(bxi + off, byi + off),
-                              ImVec2(bxi + off + iz, byi + off + iz), iv.uv0, iv.uv1,
-                              IM_COL32(255, 255, 255, iconA));
+                float iz = 16.0f * s;
+                ImVec4 iconCol = surf.textPrimary; iconCol.w *= (iconA / 255.0f);
+                ui::drawIconGlass(hdl, iconName, ImVec2(bxi + btn * 0.5f, byi + btn * 0.5f), iz,
+                                  ImGui::ColorConvertFloat4ToU32(iconCol),
+                                  ui::glassIconHalo(surf, s_huFade));
                 if (hov) ImGui::SetTooltip("%s", tip);
                 ImGui::PopID();
                 return clicked;
@@ -2637,7 +2727,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // [4] View orientation dropdown ▾
             {
                 float bxi = bx0 + padX + 4.0f * (btn + gap);
-                huPill(bxi, byi, false);
+                const ui::AdaptiveSurface& surf = huPill(bxi, byi, false, "view_selector");
                 ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
                 ImGui::PushID(4);
                 bool clicked = ImGui::InvisibleButton("##hb", ImVec2(btn, btn));
@@ -2647,11 +2737,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
                                        Palette::toU32(hovCol), 3.0f);
                 }
-                IconUV iv = ui::getIcon("view_selector", 20);
-                float iz = 16.0f * s, off = (btn - iz) * 0.5f;
-                hdl->AddImage(iv.texId, ImVec2(bxi + off, byi + off),
-                              ImVec2(bxi + off + iz, byi + off + iz), iv.uv0, iv.uv1,
-                              IM_COL32(255, 255, 255, iconA));
+                {
+                    float iz = 16.0f * s;
+                    ImVec4 iconCol = surf.textPrimary; iconCol.w *= (iconA / 255.0f);
+                    ui::drawIconGlass(hdl, "view_selector",
+                                      ImVec2(bxi + btn * 0.5f, byi + btn * 0.5f), iz,
+                                      ImGui::ColorConvertFloat4ToU32(iconCol),
+                                      ui::glassIconHalo(surf, s_huFade));
+                }
                 if (hov) ImGui::SetTooltip("View Orientation");
                 if (clicked) ImGui::OpenPopup("##hu_vieworient");
                 ImGui::SetNextWindowPos(ImVec2(bxi, byi + btn + 4.0f * s), ImGuiCond_Always);
@@ -2701,7 +2794,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 };
                 const char* curIcon = kDsIcons[st.displayStyle < 5 ? st.displayStyle : 1];
                 float bxi = bx0 + padX + 5.0f * (btn + gap);
-                huPill(bxi, byi, false);
+                const ui::AdaptiveSurface& surf = huPill(bxi, byi, false, curIcon);
                 ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
                 ImGui::PushID(5);
                 bool clicked = ImGui::InvisibleButton("##hb", ImVec2(btn, btn));
@@ -2711,11 +2804,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
                                        Palette::toU32(hovCol), 3.0f);
                 }
-                IconUV iv = ui::getIcon(curIcon, 20);
-                float iz = 16.0f * s, off = (btn - iz) * 0.5f;
-                hdl->AddImage(iv.texId, ImVec2(bxi + off, byi + off),
-                              ImVec2(bxi + off + iz, byi + off + iz), iv.uv0, iv.uv1,
-                              IM_COL32(255, 255, 255, iconA));
+                {
+                    float iz = 16.0f * s;
+                    ImVec4 iconCol = surf.textPrimary; iconCol.w *= (iconA / 255.0f);
+                    ui::drawIconGlass(hdl, curIcon, ImVec2(bxi + btn * 0.5f, byi + btn * 0.5f), iz,
+                                      ImGui::ColorConvertFloat4ToU32(iconCol),
+                                      ui::glassIconHalo(surf, s_huFade));
+                }
                 if (hov) ImGui::SetTooltip("Display Style");
                 if (clicked) ImGui::OpenPopup("##hu_dispstyle");
                 ImGui::SetNextWindowPos(ImVec2(bxi, byi + btn + 4.0f * s), ImGuiCond_Always);
@@ -2748,7 +2843,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // [6] Hide/Show items dropdown ▾
             {
                 float bxi = bx0 + padX + 6.0f * (btn + gap);
-                huPill(bxi, byi, false);
+                const ui::AdaptiveSurface& surf = huPill(bxi, byi, false, "hide_show_eye");
                 ImGui::SetCursorScreenPos(ImVec2(bxi, byi));
                 ImGui::PushID(6);
                 bool clicked = ImGui::InvisibleButton("##hb", ImVec2(btn, btn));
@@ -2758,11 +2853,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     hdl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + btn, byi + btn),
                                        Palette::toU32(hovCol), 3.0f);
                 }
-                IconUV iv = ui::getIcon("hide_show_eye", 20);   // C25b: proper visibility glyph
-                float iz = 16.0f * s, off = (btn - iz) * 0.5f;
-                hdl->AddImage(iv.texId, ImVec2(bxi + off, byi + off),
-                              ImVec2(bxi + off + iz, byi + off + iz), iv.uv0, iv.uv1,
-                              IM_COL32(255, 255, 255, iconA));
+                {
+                    float iz = 16.0f * s;
+                    ImVec4 iconCol = surf.textPrimary; iconCol.w *= (iconA / 255.0f);
+                    ui::drawIconGlass(hdl, "hide_show_eye",
+                                      ImVec2(bxi + btn * 0.5f, byi + btn * 0.5f), iz,
+                                      ImGui::ColorConvertFloat4ToU32(iconCol),
+                                      ui::glassIconHalo(surf, s_huFade));
+                }
                 if (hov) ImGui::SetTooltip("Hide / Show Items");
                 if (clicked) ImGui::OpenPopup("##hu_hideshow");
                 ImGui::SetNextWindowPos(ImVec2(bxi, byi + btn + 4.0f * s), ImGuiCond_Always);
@@ -2834,14 +2932,18 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             float maxW = (cr1.x - cr0.x) - 58.0f;
             ImVec2 p0(cr0.x + 8 * ui::uiScale, cr0.y + 8 * ui::uiScale);
             ImVec2 p1(p0.x + (ts.x > maxW ? maxW : ts.x) + 28.0f * ui::uiScale, p0.y + ts.y + 8.0f * ui::uiScale);
-            ui::glassBackground(vdl, p0, p1, (p1.y - p0.y) * 0.5f / ui::uiScale);
+            const ui::AdaptiveSurface& busySurf =
+                ui::adaptivePanel(ui::panelId("vp_busy"), ImRect(p0, p1));
+            ui::glassPanel(vdl, ImRect(p0, p1), ui::GlassLevel::UltraThin,
+                          (p1.y - p0.y) * 0.5f / ui::uiScale, busySurf);
             float pulse = 0.35f + 0.65f * (0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 5.0f));
             vdl->AddCircleFilled(ImVec2(p0.x + 11 * ui::uiScale, (p0.y + p1.y) * 0.5f), 4.0f * ui::uiScale,
                                  ImGui::ColorConvertFloat4ToU32(
                                      ImVec4(vpal.accent[0], vpal.accent[1],
                                             vpal.accent[2], pulse)));
             vdl->PushClipRect(p0, ImVec2(p1.x - 6 * ui::uiScale, p1.y), true);
-            vdl->AddText(ImVec2(p0.x + 19 * ui::uiScale, p0.y + 4 * ui::uiScale), overlayTxt, lt.c_str());
+            ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
+                         ImVec2(p0.x + 19 * ui::uiScale, p0.y + 4 * ui::uiScale), busySurf, lt.c_str());
             vdl->PopClipRect();
         }
         if (st.hasDocMesh && !st.pickStatus.empty()) {
@@ -2851,9 +2953,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             ImVec2 p1(cr1.x - 8 * s2, cr0.y + 8 * s2);
             ImVec2 p0(p1.x - ts.x - 14.0f * s2, p1.y);
             ImVec2 p1b(p1.x, p1.y + ts.y + 8.0f * s2);
-            ui::glassBackground(vdl, p0, p1b, 5.0f);
-            vdl->AddText(ImVec2(p0.x + 7 * s2, p0.y + 4 * s2), overlayTxt,
-                         st.pickStatus.c_str());
+            const ui::AdaptiveSurface& pickSurf =
+                ui::adaptivePanel(ui::panelId("vp_pick_status"), ImRect(p0, p1b));
+            ui::glassPanel(vdl, ImRect(p0, p1b), ui::GlassLevel::UltraThin, 5.0f, pickSurf);
+            ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
+                         ImVec2(p0.x + 7 * s2, p0.y + 4 * s2), pickSurf, st.pickStatus.c_str());
         }
 
         // ---- Instant3D push-pull handle + live readout ----
@@ -2913,12 +3017,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         // keep inside the viewport rect
                         if (q1.x > cr1.x - 4) { float w = q1.x - q0.x; q1.x = cr1.x - 4; q0.x = q1.x - w; }
                         if (q1.y > cr1.y - 4) { float h = q1.y - q0.y; q1.y = cr1.y - 4; q0.y = q1.y - h; }
-                        vdl->AddRectFilled(q0, q1, overlayBg, 4.0f * sc);
+                        const ui::AdaptiveSurface& ppSurf =
+                            ui::adaptivePanel(ui::panelId("vp_pp_readout"), ImRect(q0, q1));
+                        ui::glassPanel(vdl, ImRect(q0, q1), ui::GlassLevel::UltraThin, 4.0f, ppSurf);
                         ImU32 chipBord = s_pp.clamped
                             ? ImGui::ColorConvertFloat4ToU32(ImVec4(0.90f, 0.55f, 0.25f, 1.0f))
                             : acc;
                         vdl->AddRect(q0, q1, chipBord, 4.0f * sc);
-                        vdl->AddText(ImVec2(q0.x + padX, q0.y + padY), overlayTxt, txt.c_str());
+                        ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
+                                     ImVec2(q0.x + padX, q0.y + padY), ppSurf, txt.c_str());
                     } else if (!dragging) {
                         // Hint tooltip when hovering the handle (not dragging).
                         ImVec2 mp = io.MousePos;
@@ -3008,12 +3115,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     if (q0.x < cr0.x + 4) { float w = q1.x - q0.x; q0.x = cr0.x + 4; q1.x = q0.x + w; }
                     if (q1.y > cr1.y - 4) { float h = q1.y - q0.y; q1.y = cr1.y - 4; q0.y = q1.y - h; }
                     if (q0.y < cr0.y + 4) { float h = q1.y - q0.y; q0.y = cr0.y + 4; q1.y = q0.y + h; }
-                    vdl->AddRectFilled(q0, q1, overlayBg, 4.0f * sc);
+                    const ui::AdaptiveSurface& dimSurf =
+                        ui::adaptivePanel(ui::panelId(c.param.c_str()), ImRect(q0, q1));
+                    ui::glassPanel(vdl, ImRect(q0, q1), ui::GlassLevel::UltraThin, 4.0f, dimSurf);
                     ImU32 chipBord = (isDragged && s_dim.clamped)
                         ? ImGui::ColorConvertFloat4ToU32(ImVec4(0.90f, 0.55f, 0.25f, 1.0f))
                         : acc;
                     vdl->AddRect(q0, q1, chipBord, 4.0f * sc);
-                    vdl->AddText(ImVec2(q0.x + padX, q0.y + padY), overlayTxt, txt.c_str());
+                    ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
+                                 ImVec2(q0.x + padX, q0.y + padY), dimSurf, txt.c_str());
 
                     // Hover hint when not dragging and the cursor is over the handle.
                     if (!s_dim.active) {
@@ -3141,9 +3251,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             ImVec2 ts = mf->CalcTextSizeA(fs, 1e30f, 0.0f, st.modelInfo.c_str());
             ImVec2 p0(cr0.x + 12, cr1.y - ts.y - 70.0f);
             ImVec2 p1(p0.x + ts.x + 20.0f, p0.y + ts.y + 10.0f);
-            ui::glassBackground(vdl, p0, p1, 6.0f);
-            vdl->AddText(mf, fs, ImVec2(p0.x + 10 * ui::uiScale, p0.y + 5 * ui::uiScale),
-                         overlayTxt, st.modelInfo.c_str());
+            const ui::AdaptiveSurface& infoSurf =
+                ui::adaptivePanel(ui::panelId("vp_model_info"), ImRect(p0, p1));
+            ui::glassPanel(vdl, ImRect(p0, p1), ui::GlassLevel::UltraThin, 6.0f, infoSurf);
+            ui::glassText(vdl, mf, fs, ImVec2(p0.x + 10 * ui::uiScale, p0.y + 5 * ui::uiScale),
+                         infoSurf, st.modelInfo.c_str());
         }
         // ---- reference-plane name chips (projected to screen) ----
         // C25: gate on effPlane (same effective visibility as the quads) so labels never
@@ -3187,12 +3299,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 static const char* kPlaneSel[3] = {"plane.front", "plane.top", "plane.right"};
                 bool chipSelected = !st.sketchPlanePickActive &&
                                     st.selectedFeatureId == kPlaneSel[p];
-                vdl->AddRectFilled(q0, q1, overlayBg, 4.0f * ui::uiScale);
+                const ui::AdaptiveSurface& planeSurf =
+                    ui::adaptivePanel(ui::panelId(nm), ImRect(q0, q1));
+                ui::glassPanel(vdl, ImRect(q0, q1), ui::GlassLevel::UltraThin, 4.0f, planeSurf);
                 vdl->AddRect(q0, q1, (chipHovered || chipSelected)
                                          ? ui::Palette::toU32(vpal.accent)
                                          : planeChipBord, 4.0f * ui::uiScale, 0,
                              (chipHovered || chipSelected) ? 2.0f : 1.0f);
-                vdl->AddText(ImVec2(x0 + 6 * ui::uiScale, y0 + 3 * ui::uiScale), overlayTxt, nm);
+                ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
+                              ImVec2(x0 + 6 * ui::uiScale, y0 + 3 * ui::uiScale), planeSurf, nm);
                 if (chipHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                     if (st.sketchPlanePickActive && st.sketchMode) {
                         st.sketchPlanePickActive = false;
@@ -3268,10 +3383,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             vdl->AddLine(anchorSp, leaderEnd, leaderCol, 1.5f * sc);
                             vdl->AddCircleFilled(anchorSp, 2.6f * sc, leaderCol);
                         }
-                        vdl->AddRectFilled(chipTL, chipBR, overlayBg, 4.0f * sc);
+                        const ui::AdaptiveSurface& pmSurf =
+                            ui::adaptivePanel(ui::panelId(ci.label.c_str()), ImRect(chipTL, chipBR));
+                        ui::glassPanel(vdl, ImRect(chipTL, chipBR), ui::GlassLevel::UltraThin, 4.0f,
+                                      pmSurf);
                         vdl->AddRect(chipTL, chipBR, chipBord, 4.0f * sc);
-                        vdl->AddText(ImVec2(chipTL.x + padX, chipTL.y + padY), overlayTxt,
-                                     txt.c_str());
+                        ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
+                                     ImVec2(chipTL.x + padX, chipTL.y + padY), pmSurf, txt.c_str());
                         ++shown;
                     }
                 }
@@ -3281,8 +3399,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // ---- C19: result colormap legend (bottom-right) ----
         ui::drawLegend(st, vdl, cr0, cr1);
         }  // end overlay colors scope
+    } else {
+        invalidateViewportBackdrop();
     }
     ImGui::End();
+    } else {
+        invalidateViewportBackdrop();
     }
 }
 

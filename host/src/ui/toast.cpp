@@ -1,10 +1,16 @@
 // Toast notification renderer (W1-B). See toast.h.
+// Liquid Glass v2 port (host, H6b write-set): each toast card is a Regular glass surface fed by
+// its own per-slot adaptivePanel (id keyed on the visible slot index so it stays stable while
+// toasts scroll through the stack); message text reads surf.textPrimary for max contrast against
+// the live viewport backdrop. Ported from ui/imgui/src/ui/toast.cpp's drawToasts. Accent bars +
+// title tag stay palette-driven (semantic level color, not adaptive — contract: local://glass_host.md).
 #include "toast.h"
 
 #include <cfloat>
 #include <string>
 
 #include "imgui.h"
+#include "imgui_internal.h"   // ImRect — ui::glassPanel/ui::adaptivePanel take a const ImRect&
 
 #include "../core/app_state.h"
 #include "../ui_theme.h"
@@ -40,7 +46,6 @@ void drawToasts(AppState& st) {
     }
     if (st.toasts.empty()) return;
 
-    const auto& pal = ui::palette;
     const float scale = ui::uiScale;
 
     // Anchor top-LEFT of the main viewport (toasts float over everything, SolidWorks-style).
@@ -88,8 +93,13 @@ void drawToasts(AppState& st) {
             return ui::Palette::toU32(v);
         };
 
-        // Full liquid-glass card: drop shadow + shine + specular layers, coherently dimmed by alpha.
-        ui::glassBackground(dl, p0, p1, 8.0f, alpha);
+        // Per-toast glass card: adaptivePanel samples the backdrop under THIS card's rect (cards
+        // shift position frame to frame as older toasts expire, so the id must key on slot, not
+        // identity); glassPanel handles the backdrop-UV projection + edge effects, dimmed by alpha.
+        const std::string slotId = "host_toast_glass_" + std::to_string(shown);
+        const ui::AdaptiveSurface& surf =
+            ui::adaptivePanel(ui::panelId(slotId.c_str()), ImRect(p0, p1));
+        ui::glassPanel(dl, ImRect(p0, p1), ui::GlassLevel::Regular, 8.0f * scale, surf, alpha);
         // Colored left accent bar drawn on top of glass; withA already folds in alpha.
         dl->AddRectFilled(p0, ImVec2(p0.x + 3.0f * scale, p1.y), withA(accent, 1.0f),
                           6.0f * scale, ImDrawFlags_RoundCornersLeft);
@@ -98,8 +108,10 @@ void drawToasts(AppState& st) {
         float tx = p0.x + 12.0f * scale;
         float ty = p0.y + 8.0f * scale;
         dl->AddText(font, font->FontSize, ImVec2(tx, ty), withA(accent, 1.0f), tag);
+        ImVec4 msgCol = surf.textPrimary;
+        msgCol.w *= alpha;
         dl->AddText(font, font->FontSize, ImVec2(tx, ty + titleH),
-                    withA(pal.text, 1.0f), t.msg.c_str(), nullptr, innerW);
+                    ImGui::ColorConvertFloat4ToU32(msgCol), t.msg.c_str(), nullptr, innerW);
 
         // Click = copy message to OS clipboard + instant dismiss (no fade-out).
         if (clicked && mouse.x >= p0.x && mouse.x <= p1.x && mouse.y >= p0.y && mouse.y <= p1.y) {

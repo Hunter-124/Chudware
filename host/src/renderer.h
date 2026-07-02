@@ -20,6 +20,23 @@ enum class DisplayStyle {
     Wireframe,            // edges only over the background
 };
 
+// Kawase-blurred backdrop for liquid-glass UI (Liquid Glass v2, ported from
+// ui/viewport/renderer.h). UVs map the full viewport image.
+struct ViewportBackdrop {
+    std::uintptr_t textureId = 0;
+    float uvMin[2] = {0.f, 0.f};
+    float uvMax[2] = {1.f, 1.f};
+    bool valid() const { return textureId != 0; }
+};
+
+// GPU pass timings (ms), each backed by a double-buffered GL_TIME_ELAPSED query pair so a
+// result is polled without ever blocking the GL pipeline (see Renderer::glassTimings()).
+// valid=false until every phase (scene/blur/luma) has produced at least one polled result.
+struct GlassTimings {
+    float sceneMs = 0.f, blurMs = 0.f, lumaMs = 0.f;
+    bool valid = false;
+};
+
 class Renderer {
 public:
     // One body of the displayed model: geometry + its display color (RGB 0..1).
@@ -242,6 +259,20 @@ public:
         return index < subs_.size() && subs_[index].visible;
     }
 
+    // ---- F1: glass backdrop + adaptive contrast (Liquid Glass v2) ----
+    // Kawase-blurred copy of the resolved color buffer (updated when resolveColorTexture runs).
+    ViewportBackdrop backdrop() const;
+    // Mean relative luminance (Rec.709) under the rect, top-left viewport-local px coords.
+    float averageLuminance(float x0, float y0, float x1, float y1) const;
+
+    // GPU timings for the last polled scene-draw / blur-chain / luma-readback phases.
+    GlassTimings glassTimings() const;
+    // Master switch: when false, updateBackdropBlur() and the async luminance readback are
+    // skipped entirely each frame (averageLuminance() keeps returning the last-known grid
+    // value, or 0.5f if none was ever read back). Default true.
+    void setBackdropEnabled(bool on);
+    bool backdropEnabled() const { return backdropEnabled_; }
+
 private:
     // GPU buffers for one body.
     struct Sub {
@@ -273,14 +304,58 @@ private:
     void buildLut();              // C19: build the SW-style jet LUT texture (lazy)
     void uploadDeformed(Sub& s);  // C19: re-upload displaced positions for the current scale
     void resolveColorTexture() const;  // SS colorTex_ -> final-size resolvedTex_ by box filter
+    void updateBackdropBlur() const;   // resolvedTex_ -> quarter-res Kawase blur chain
+
+    // ---- F1 async luminance pipeline (ported from ui/viewport/renderer.cpp) ----
+    void issueLumaReadback() const;   // one glReadPixels/frame -> PBO ring + fence, or fallback
+    void issueLumaPboRead(unsigned int srcFbo, int srcW, int srcH) const;  // handles resize
+    void pollLumaPbos() const;           // non-blocking glClientWaitSync poll of the ring
+    void reduceLumaPbo(int slot) const;  // map -> Rec.709 reduce -> staging -> published swap
 
     static constexpr int SS = 3;  // supersample factor for anti-aliasing (3x for crisp thin edges)
+    static constexpr int kBlurPasses = 4;  // 4-tap Kawase passes (GLASS_DESIGN_SPEC)
     int w_ = 0, h_ = 0;           // final size
     int sw_ = 0, sh_ = 0;         // supersampled size
     unsigned int fbo_ = 0, colorTex_ = 0, depthRbo_ = 0;
     mutable unsigned int resolveFbo_ = 0, resolvedTex_ = 0;
     unsigned int resolveProg_ = 0;
     mutable bool resolvedDirty_ = true;
+    // Kawase blur chain: downsample resolved color to ¼ res, then ping-pong blur passes.
+    mutable unsigned int blurDownFbo_ = 0, blurDownTex_ = 0;
+    mutable unsigned int blurPingFbo_[2] = {0, 0};
+    mutable unsigned int blurPingTex_[2] = {0, 0};
+    unsigned int downsampleProg_ = 0, kawaseProg_ = 0;
+    mutable int blurW_ = 0, blurH_ = 0;
+    mutable bool backdropDirty_ = true;
+
+    // ---- F1 async luminance pipeline: 3-slot PBO ring + fence, GPU-async, never blocks ----
+    static constexpr int kLumaPboCount = 3;
+    static constexpr int kLumaGridMaxW = 64, kLumaGridMaxH = 40;
+    mutable unsigned int lumaPbo_[kLumaPboCount] = {0, 0, 0};
+    mutable void* lumaFence_[kLumaPboCount] = {nullptr, nullptr, nullptr};  // GLsync, opaque
+    mutable bool lumaPboPending_[kLumaPboCount] = {false, false, false};
+    mutable int lumaPboW_[kLumaPboCount] = {0, 0, 0};  // (w,h) generation each slot issued at
+    mutable int lumaPboH_[kLumaPboCount] = {0, 0, 0};  // (detects a mid-flight blur resize)
+    mutable int lumaPboNext_ = 0;              // next ring slot to issue into
+    mutable int lumaSrcW_ = 0, lumaSrcH_ = 0;  // readback source size as of the last (re)spec
+    mutable unsigned int lumaFallbackCounter_ = 0;  // every-8th-frame direct-read fallback cadence
+    mutable std::vector<float> lumaGrid_;     // published grid, top-left row order, lumaW_*lumaH_
+    mutable std::vector<float> lumaStaging_;  // built off to the side, then swapped in (no tearing)
+    mutable int lumaW_ = 0, lumaH_ = 0;
+    mutable bool lumaEverRead_ = false;  // averageLuminance() returns 0.5f until this is true
+    bool backdropEnabled_ = true;
+
+    // ---- F1 GPU pass timing: 2 queries per phase, ping-ponged so a result never blocks ----
+    struct GpuTimerRing {
+        unsigned int id[2] = {0, 0};
+        bool pending[2] = {false, false};
+        int cur = 0;
+    };
+    static void beginGpuTimer(GpuTimerRing& t);
+    static void endGpuTimer(GpuTimerRing& t, float& outMs, bool& outValid);
+    mutable GpuTimerRing sceneTimer_, blurTimer_, lumaTimer_;
+    mutable float sceneMs_ = 0.f, blurMs_ = 0.f, lumaMs_ = 0.f;
+    mutable bool sceneTimingValid_ = false, blurTimingValid_ = false, lumaTimingValid_ = false;
     // C27-D: dedicated small offscreen target for the View Selector preview thumbnail. Lazily
     // allocated on the first renderThumbnail() call; reallocated only when the requested px changes.
     unsigned int thumbFbo_ = 0, thumbTex_ = 0, thumbDepth_ = 0;

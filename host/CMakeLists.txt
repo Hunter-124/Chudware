@@ -139,6 +139,7 @@ add_executable(AI-CAD
   src/stb_impl.cpp
   # --- C14: ribbon widgets + command table + icon loader ---
   src/ui/icons.cpp
+  src/ui/icons_sdf.cpp  # liquid-glass v2: runtime SDF glyphs + halo (drawIconGlass)
   src/ui/widgets/ribbon.cpp
   src/ui/ribbon_def.cpp
   # --- end C14 ---

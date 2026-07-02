@@ -4,6 +4,9 @@
 // per-turn transparent activity timeline (what the AI is doing / thinking, expandable), and a
 // bottom composer (rounded input + inline model/settings/send toolbar + provider/mode/autopilot
 // chips). Settings live in a popup off the composer; there is no separate Activity panel anymore.
+// Bubbles/cards (user prompt, prose, thinking, action, plan, error) and the composer are painted
+// as translucent Liquid-Glass bubbles over the live viewport backdrop (host contract H5; see
+// chatSurf()/GlassBubble below) instead of the old near-opaque pushGlassChildStyle cards.
 //
 // Also home to the shared small-UI helpers (primaryButton/sectionHeader/dimText/toggleChip and
 // the code/diff/prose/fit/plan/parts draw helpers) declared in core/app_state.h — they live here
@@ -24,6 +27,7 @@
 #include <nlohmann/json.hpp>
 
 #include "imgui.h"
+#include "imgui_internal.h"   // ImRect — Liquid Glass v2 host port (contract H5: glass bubbles)
 
 #include "legacy_chat.h"
 #include "model_registry.h"  // ui::ModelInfo / capability flags / provider mapping
@@ -302,6 +306,51 @@ static void drawStatusGlyph(const std::string& status, float box) {
     ImGui::Dummy(ImVec2(box, box));
 }
 
+// ---- Liquid Glass v2 host port (contract H5): glass surface + bubble helpers ----------------
+// ONE adaptivePanel id shared by the whole Copilot pane — header, composer, and every card below
+// fetch this SAME cached surface via ui::panelId("host_agent_glass"); ui::adaptivePanel is
+// idempotent per frame (it re-samples only on the first call each frame, from the full pane rect
+// painted in drawAIPanel), so every later fetch below is free regardless of which window/child is
+// current when it's called.
+static const ui::AdaptiveSurface& chatSurf() {
+    ImVec2 mn = ImGui::GetWindowPos();
+    ImVec2 mx(mn.x + ImGui::GetWindowSize().x, mn.y + ImGui::GetWindowSize().y);
+    return ui::adaptivePanel(ui::panelId("host_agent_glass"), ImRect(mn, mx));
+}
+
+// A "bubble" = an auto-height child painted over an explicit glassPanel fill, ported from
+// ui/imgui/src/ui/agent_panel.cpp's GlassBubble. The child's true height is only known after
+// EndChild(), so the PARENT draw list is channel-split: content goes to channel 1, and
+// endGlassBubble() paints the correctly-sized fill into channel 0 (behind) once the real rect is
+// known — measure-then-fill, no frame lag. Child-window content lives in the child's own draw
+// list and is unaffected by the parent split.
+struct GlassBubble {
+    ImVec2         origin;
+    float          width;
+    ui::GlassLevel level;
+    float          rounding;
+};
+
+static GlassBubble beginGlassBubble(float width, ui::GlassLevel level, float rounding) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->ChannelsSplit(2);
+    dl->ChannelsSetCurrent(1);
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+    return GlassBubble{p0, width, level, rounding};
+}
+
+static ImRect endGlassBubble(const GlassBubble& b) {
+    ImGui::PopStyleColor();
+    ImVec2 p1 = ImGui::GetItemRectMax();
+    if (p1.x < b.origin.x + b.width) p1.x = b.origin.x + b.width;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->ChannelsSetCurrent(0);
+    ui::glassPanel(dl, ImRect(b.origin, p1), b.level, b.rounding, chatSurf());
+    dl->ChannelsMerge();
+    return ImRect(b.origin, p1);
+}
+
 // The build-plan card: a glass panel listing each planned part with its purpose, committed
 // dimensions (mono) and feature bullets — plus a live status tick per part (spins while the
 // matching orchestrator stage runs, checks when it passes), so it doubles as the todo checklist.
@@ -323,13 +372,11 @@ void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activit
                 return a.status;
         return "";
     };
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], pal.glassBg[3]));
-    ImGui::PushStyleColor(ImGuiCol_Border,
-        ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2], pal.glassBorder[3]));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f * ui::uiScale);
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
+                                      8.0f * ui::uiScale);
     ImGui::BeginChild("##plancard", ImVec2(0, 0),
-                      ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 w0 = ImGui::GetWindowPos();
     // Left accent bar: the accent color at the planAccentBar alpha.
@@ -376,9 +423,9 @@ void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activit
         ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
         dimText(("Fit: " + plan.fit).c_str());
     }
+    ImGui::PopStyleColor();
     ImGui::EndChild();
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor(2);
+    endGlassBubble(gb);
 }
 
 // One line "Parts: a, b, c" with each name tinted its assembly color.
@@ -515,13 +562,11 @@ static void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     const auto& pal = ui::palette;
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
     ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], pal.glassBg[3]));
-    ImGui::PushStyleColor(ImGuiCol_Border,
-        ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2], pal.glassBorder[3]));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f * ui::uiScale);
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
+                                      8.0f * ui::uiScale);
     ImGui::BeginChild("##stepcard", ImVec2(0, 0),
-                      ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
     // Build issues are amber, not red: a failed pass is normal mid-loop — the error goes
     // straight back to the model, which usually fixes it.
     ImVec4 badge = s.ok ? (s.done ? accentCol
@@ -598,9 +643,9 @@ static void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
         drawDiffBox("##diff_v", s.diff, fonts.mono, ui::metrics::copilotDiffMaxH());
     if (s.showError && !s.error.empty())
         drawCodeBox("##err_v", s.error, fonts.mono, ui::metrics::px(200.0f));
+    ImGui::PopStyleColor();
     ImGui::EndChild();
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor(2);
+    endGlassBubble(gb);
 }
 
 // One assistant turn: name + plan card + summary + iteration cards. While running, an inline
@@ -714,10 +759,11 @@ static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
     ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.stepCardBg[0], pal.stepCardBg[1], pal.stepCardBg[2], pal.stepCardBg[3]));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
+                                      8.0f * ui::uiScale);
     ImGui::BeginChild("##clarify", ImVec2(0, 0),
-                      ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
     ImGui::PushFont(fonts.medium);
     ImGui::TextColored(accentCol, "A few details to get this right");
     ImGui::PopFont();
@@ -734,7 +780,7 @@ static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     }
     if (!m.clarify.assumptions.empty()) {
         ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
         ImGui::TextUnformatted("Assuming:");
         ImGui::PopStyleColor();
         for (const auto& a : m.clarify.assumptions) {
@@ -746,8 +792,9 @@ static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
     bool build = primaryButton("Build it", ImVec2(-1, ui::metrics::copilotBtnH()));
     bool skip = ImGui::Button("Skip - use defaults", ImVec2(-1, 0));
-    ImGui::EndChild();
     ImGui::PopStyleColor();
+    ImGui::EndChild();
+    endGlassBubble(gb);
     if (build || skip) {
         // Fold each answer (or its suggested default on Skip) into the request so the
         // orchestrator builds with concrete numbers.
@@ -826,13 +873,12 @@ static bool isThinkingItem(const ActivityItem& a) {
 // user expanded it (a.expanded, set by clicking). `showThinking` off -> a single dim one-liner.
 static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool showThinking,
                               bool laterDone) {
-    const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     ImGui::Dummy(ImVec2(0, 2 * sc));
 
     if (!showThinking) {
         ImGui::PushFont(fonts.body);
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
         ImGui::TextUnformatted(a.title.empty() ? "Thinking" : a.title.c_str());
         ImGui::PopStyleColor();
         ImGui::PopFont();
@@ -841,22 +887,19 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
 
     const bool open = a.expanded || !laterDone;   // forced open while it is the active frontier
     const bool hasDetail = !a.detail.empty();
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.blockThinkBg[0], pal.blockThinkBg[1], pal.blockThinkBg[2], pal.blockThinkBg[3]));
-    ImGui::PushStyleColor(ImGuiCol_Border,
-        ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2], pal.glassBorder[3]));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f * sc);
-    ImGui::BeginChild("##thinkblk", ImVec2(0, 0), ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f * sc);
+    ImGui::BeginChild("##thinkblk", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
-    const ImVec4 dim(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1);
+    const ui::AdaptiveSurface& surf = chatSurf();
     ImGui::PushFont(fonts.body);
-    ImGui::TextColored(dim, "%s", a.title.empty() ? "Thinking" : a.title.c_str());
+    ImGui::TextColored(surf.textSecondary, "%s", a.title.empty() ? "Thinking" : a.title.c_str());
     ImGui::PopFont();
     if (hasDetail) {
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsItemClicked()) a.expanded = !open;
         ImGui::SameLine(0, 6 * sc);
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
         ImGui::TextUnformatted(open ? "(hide)" : "(show thinking)");
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -866,8 +909,7 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
         drawProseBox("##thinkdetail", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
 
     ImGui::EndChild();
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor(2);
+    endGlassBubble(gb);
 }
 
 // A glass action card for a tool call / orchestrator build stage: status glyph + tool icon + human
@@ -881,12 +923,10 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
     const bool fail    = a.status == "fail";
 
     ImGui::Dummy(ImVec2(0, 2 * sc));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-        ImVec4(pal.blockActionBg[0], pal.blockActionBg[1], pal.blockActionBg[2], pal.blockActionBg[3]));
-    ImGui::PushStyleColor(ImGuiCol_Border,
-        ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2], pal.glassBorder[3]));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f * sc);
-    ImGui::BeginChild("##actcard", ImVec2(0, 0), ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f * sc);
+    ImGui::BeginChild("##actcard", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    const ui::AdaptiveSurface& surf = chatSurf();
 
     // ---- header row: status glyph + tool icon + label + meta ----
     drawStatusGlyph(a.status, ImGui::GetTextLineHeight());
@@ -894,13 +934,14 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
     ui::IconUV iv = ui::getIcon(stageIconName(a.stage, a.missionHeader), 20);
     if (iv.valid) {
         float gz = ImGui::GetTextLineHeight();
-        ImVec4 tint(pal.text[0], pal.text[1], pal.text[2], running ? 1.0f : 0.85f);
+        ImVec4 tint(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z,
+                   running ? 1.0f : 0.85f);
         ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, tint);
         ImGui::SameLine(0, 6 * sc);
     }
     ImVec4 titleCol = running ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)
                     : fail    ? ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1)
-                              : ImVec4(pal.text[0], pal.text[1], pal.text[2], 1);
+                              : surf.textPrimary;
     ImGui::PushFont(fonts.medium);
     ImGui::TextColored(titleCol, "%s", a.title.c_str());
     ImGui::PopFont();
@@ -912,7 +953,7 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
         if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
         ImGui::SameLine(0, 6 * sc);
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
         ImGui::TextUnformatted(a.expanded ? "(hide)" : "(details)");
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -927,7 +968,7 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
             std::snprintf(meta, sizeof(meta), "%.1fs", a.durationMs / 1000.0);
         else
             std::snprintf(meta, sizeof(meta), "%d ops", a.opsCount);
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
         ImGui::TextUnformatted(meta);
         ImGui::PopStyleColor();
     }
@@ -960,13 +1001,11 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
     }
 
     ImGui::EndChild();
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor(2);
+    ImRect cardRect = endGlassBubble(gb);
 
     // ---- error frame: a red border around the whole card ----
     if (fail) {
-        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-        ImGui::GetWindowDrawList()->AddRect(mn, mx, ui::Palette::toU32(pal.statusErr),
+        ImGui::GetWindowDrawList()->AddRect(cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusErr),
                                             8.0f * sc, 0, ui::metrics::stroke(1.5f));
     }
 }
@@ -999,14 +1038,21 @@ static void drawUserBlock(const ChatMsg& m, const ui::Fonts& fonts, float panelW
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
     // Right-align: indent ~22% of the panel so the bubble sits against the right edge.
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + panelW * 0.22f);
-    ui::pushGlassChildStyle(8.0f);
-    ImGui::BeginChild("##umsg", ImVec2(0, 0), ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY);
+    const float bw = ImGui::GetContentRegionAvail().x;
+    GlassBubble gb = beginGlassBubble(bw, ui::GlassLevel::Regular, 8.0f * ui::uiScale);
+    ImGui::BeginChild("##umsg", ImVec2(bw, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushFont(fonts.medium);
     ImGui::TextColored(accentCol, "You");
     ImGui::PopFont();
+    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
     ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
+    ImGui::PopStyleColor();
     ImGui::EndChild();
-    ui::popGlassChildStyle();
+    ImRect bubble = endGlassBubble(gb);
+    ImGui::GetWindowDrawList()->AddRect(bubble.Min, bubble.Max,
+        ImGui::ColorConvertFloat4ToU32(ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.55f)),
+        8.0f * ui::uiScale, 0, ui::metrics::stroke(1.0f));
     ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
 }
 
@@ -1025,13 +1071,18 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     // (2) Agent timeline — typed blocks: collapsible thinking + glass action cards.
     drawAgentTimeline(m, fonts, logW, gShowThinking);
 
-    // (3) Streaming assistant text — frosted row pill keeps body copy legible over viewport bleed.
+    // (3) Streaming assistant text — a Thin glass "prose" card (Liquid Glass v2 §6, host
+    // contract H5) keeps body copy legible over the live viewport blur.
     if (!m.text.empty() && m.errKind == ERR_NONE) {
-        ui::glassRowAtCursor(4.0f, false, false, 5.0f);
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(pal.text[0], pal.text[1], pal.text[2], 1.0f));
+        GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
+                                          4.0f * ui::uiScale);
+        ImGui::BeginChild("##prose", ImVec2(0, 0),
+                          ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+        ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
         ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
         ImGui::PopStyleColor();
+        ImGui::EndChild();
+        endGlassBubble(gb);
         ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
     }
 
@@ -1052,8 +1103,8 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         int sp = (int)(ImGui::GetTime() * 8.0) & 3;
         ImGui::TextColored(accentCol, "%s", kSpin[sp]);
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
+        const ui::AdaptiveSurface& surf = chatSurf();
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
         ImGui::TextWrapped("%s", m.liveStatus.empty() ? "working..." : m.liveStatus.c_str());
         ImGui::PopStyleColor();
         // Which model(s) are driving this turn — transparency about what's actually running.
@@ -1061,7 +1112,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
             std::string line = "Command model: " + shortModelName(st.settings.model);
             if (st.settings.expVisionReview && st.settings.expVisionModel[0])
                 line += "   \xc2\xb7   Vision: " + shortModelName(st.settings.expVisionModel);
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
             ImGui::TextWrapped("%s", line.c_str());
             ImGui::PopStyleColor();
         }
@@ -1075,26 +1126,26 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
         int tin = 0, tout = 0, tms = 0;
         for (const auto& a : m.activity) { tin += a.tokensIn; tout += a.tokensOut; tms += a.durationMs; }
         if (tin > 0) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+            ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textTertiary);
             ImGui::Text("%d tokens in / %d out \xc2\xb7 %.1f s", tin, tout, tms / 1000.0);
             ImGui::PopStyleColor();
         }
     }
 
-    // (8) Error block — a distinct red-bordered card carrying the real reason (DESIGN §5).
+    // (8) Error block — a distinct red-bordered glass card carrying the real reason (DESIGN §5).
     if (m.errKind != ERR_NONE && !m.text.empty()) {
         ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
-        ImGui::PushStyleColor(ImGuiCol_ChildBg,
-            ImVec4(pal.blockActionBg[0], pal.blockActionBg[1], pal.blockActionBg[2], pal.blockActionBg[3]));
-        ImGui::BeginChild("##errcard", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY);
+        GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
+                                          8.0f * ui::uiScale);
+        ImGui::BeginChild("##errcard", ImVec2(0, 0),
+                          ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
         const float* ec = (m.errKind == ERR_SYSTEM) ? pal.errSystem : pal.errCad;
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ec[0], ec[1], ec[2], 1));
         ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
         ImGui::PopStyleColor();
         ImGui::EndChild();
-        ImGui::PopStyleColor();
-        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-        ImGui::GetWindowDrawList()->AddRect(mn, mx, ui::Palette::toU32(pal.statusErr),
+        ImRect cardRect = endGlassBubble(gb);
+        ImGui::GetWindowDrawList()->AddRect(cardRect.Min, cardRect.Max, ui::Palette::toU32(pal.statusErr),
                                             8.0f * ui::uiScale, 0, ui::metrics::stroke(1.5f));
     }
 }
@@ -1110,7 +1161,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
     }
     ImGui::PushFont(st.fonts.h2);
-    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(16, 20, 26, 255));
+    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
     ImGui::TextUnformatted("AI-CAD Copilot");
     ImGui::PopStyleColor();
     ImGui::PopFont();
@@ -1803,8 +1854,8 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
         if (ImGui::InputText("##provkey", key, 256, ImGuiInputTextFlags_Password)) changed = true;
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
         bool haveKey = key[0] != '\0';
-        ImGui::PushStyleColor(ImGuiCol_Text, haveKey ? IM_COL32(120, 200, 120, 255)
-                                                     : IM_COL32(220, 170, 90, 255));
+        ImGui::PushStyleColor(ImGuiCol_Text, haveKey ? ui::Palette::toU32(ui::palette.statusOk)
+                                                     : ui::Palette::toU32(ui::palette.statusWarn));
         ImGui::TextUnformatted(haveKey ? "key set — cloud API available (blocked in Offline mode)"
                                        : "no API key — add your DashScope / DeepSeek key");
         ImGui::PopStyleColor();
@@ -1814,8 +1865,8 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
         ImGui::SetNextItemWidth(-1);
         if (ImGui::InputText("##provkey", key, 256, ImGuiInputTextFlags_Password)) changed = true;
         bool haveKey = key[0] != '\0';
-        ImGui::PushStyleColor(ImGuiCol_Text, haveKey ? IM_COL32(120, 200, 120, 255)
-                                                     : IM_COL32(220, 170, 90, 255));
+        ImGui::PushStyleColor(ImGuiCol_Text, haveKey ? ui::Palette::toU32(ui::palette.statusOk)
+                                                     : ui::Palette::toU32(ui::palette.statusWarn));
         ImGui::TextUnformatted(haveKey ? "key set — model available"
                                        : "no API key — add one to use this provider");
         ImGui::PopStyleColor();
@@ -1838,8 +1889,8 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
                                                           ? ui::PROV_LLAMACPP : ui::PROV_LOCAL];
         const char* msg; ImU32 col;
         if (!pm.checked) { msg = "checking endpoint…"; col = IM_COL32(180, 180, 180, 255); }
-        else if (pm.ok) { msg = "endpoint reachable"; col = IM_COL32(120, 200, 120, 255); }
-        else { msg = "endpoint unreachable — start your local model server"; col = IM_COL32(220, 120, 110, 255); }
+        else if (pm.ok) { msg = "endpoint reachable"; col = ui::Palette::toU32(ui::palette.statusOk); }
+        else { msg = "endpoint unreachable — start your local model server"; col = ui::Palette::toU32(ui::palette.statusErr); }
         ImGui::PushStyleColor(ImGuiCol_Text, col);
         ImGui::TextUnformatted(msg);
         ImGui::PopStyleColor();
@@ -1874,9 +1925,9 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
             }
             ImGui::PopID();
         };
-        const ImU32 okCol = IM_COL32(120, 200, 120, 255);
+        const ImU32 okCol = ui::Palette::toU32(pal2.statusOk);
         const ImU32 dimCol = ui::Palette::toU32(pal2.textDim);
-        const ImU32 warnCol = IM_COL32(220, 170, 90, 255);
+        const ImU32 warnCol = ui::Palette::toU32(pal2.statusWarn);
         dimText("Each provider is a category: the checkbox bulk-toggles the whole provider on/off; "
                 "expand it to hide individual models. Off = hidden from the composer's model picker.");
         ImGui::Dummy(ImVec2(0, 2 * S));
@@ -2670,6 +2721,7 @@ static void composerModelLabel(const Settings& s, char* out, size_t n) {
 static void drawContextMeter(AppState& st, float roomForMeter) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
     const int   win  = effectiveContextWindow(st.settings);
     const int   used = st.lastContextTokens;
     const float frac = win > 0 ? std::min(1.0f, (float)used / (float)win) : 0.0f;
@@ -2681,20 +2733,20 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
     // measureContextMeter() so the width it reserved and the layout drawn here agree exactly.
     const float fullTw = ImGui::CalcTextSize(full.c_str()).x;
     const bool  showBar = roomForMeter >= barW + gap + fullTw;
-    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     if (showBar) {
         ImVec2 p = ImGui::GetCursorScreenPos();
         float by0 = p.y + fh * 0.5f - 3 * sc, by1 = p.y + fh * 0.5f + 3 * sc;
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        ImU32 fg = frac < 0.5f ? IM_COL32(120, 200, 120, 255)
-                 : frac < 0.85f ? IM_COL32(220, 170, 90, 255)
-                                : IM_COL32(220, 110, 100, 255);
+        ImU32 fg = frac < 0.5f ? ui::Palette::toU32(pal.statusOk)
+                 : frac < 0.85f ? ui::Palette::toU32(pal.statusWarn)
+                                : ui::Palette::toU32(pal.statusErr);
         dl->AddRectFilled(ImVec2(p.x, by0), ImVec2(p.x + barW, by1),
                           ui::Palette::toU32(pal.accentSoft), 2 * sc);
         if (frac > 0)
             dl->AddRectFilled(ImVec2(p.x, by0), ImVec2(p.x + barW * frac, by1), fg, 2 * sc);
         dl->AddRect(ImVec2(p.x, by0), ImVec2(p.x + barW, by1),
-                    ui::Palette::toU32(pal.textDim), 2 * sc);
+                    ImGui::ColorConvertFloat4ToU32(surf.textSecondary), 2 * sc);
         ImGui::Dummy(ImVec2(barW, fh));
         ImGui::SameLine(0, gap);
     }
@@ -2724,6 +2776,7 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const bool hasDoc = st.docMirror.hasDoc();
+    const ui::AdaptiveSurface& surf = chatSurf();
 
     ImVec2 rowMin = ImGui::GetCursorScreenPos();
     const float rowH = ImGui::GetFrameHeight() + 4 * sc;
@@ -2732,8 +2785,13 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, 4.0f * sc, false, false);
 
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 3 * sc));
-    ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.button));
-    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+    // Translucent chips over the glass composer (opaque fills fought the adaptive text).
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+        ImVec4(pal.buttonHovered[0], pal.buttonHovered[1], pal.buttonHovered[2], 0.55f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+        ImVec4(pal.buttonActive[0], pal.buttonActive[1], pal.buttonActive[2], 0.60f));
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
     const char* modes[] = {"Design", "Edit", "Ask"};
     int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 2) ? st.aiInteraction : 0;
@@ -2772,7 +2830,7 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     if (x > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(x);
     drawContextMeter(st, room);
 
-    ImGui::PopStyleColor(2);
+    ImGui::PopStyleColor(4);
     ImGui::PopStyleVar();
     ImGui::Dummy(ImVec2(0, 4 * sc));
 }
@@ -2782,33 +2840,32 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
                                 bool& submit, bool& stopReq, bool embedded = false) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
 
     ImVec2 rowMin = ImGui::GetCursorScreenPos();
     const float rowH = ImGui::GetFrameHeight() + 4 * sc;
     const float availW = ImGui::GetContentRegionAvail().x;
     ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
     ImDrawList* bgDl = ImGui::GetWindowDrawList();
-    const ImU32 composerBg = IM_COL32(31, 37, 48, 255);
-    const ImU32 composerHover = IM_COL32(42, 50, 64, 255);
-    const ImU32 composerActive = IM_COL32(50, 60, 78, 255);
     if (embedded) {
         bgDl->AddLine(ImVec2(rowMin.x + 8.0f * sc, rowMin.y),
                       ImVec2(rowMax.x - 8.0f * sc, rowMin.y),
                       IM_COL32(71, 82, 102, 170), ui::metrics::stroke(1.0f));
     } else {
-        bgDl->AddRectFilled(rowMin, rowMax, composerBg, 4.0f * sc);
-        bgDl->AddRect(rowMin, rowMax, IM_COL32(71, 82, 102, 220), 4.0f * sc, 0,
-                      ui::metrics::stroke(1.0f));
+        ui::glassPanel(bgDl, ImRect(rowMin, rowMax), ui::GlassLevel::Thin, 4.0f * sc, surf);
     }
 
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 4 * sc));
-    ImGui::PushStyleColor(ImGuiCol_Button, composerBg);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, composerHover);
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, composerActive);
+    // Translucent chips over the glass composer (opaque fills fought the adaptive text).
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+        ImVec4(pal.buttonHovered[0], pal.buttonHovered[1], pal.buttonHovered[2], 0.55f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+        ImVec4(pal.buttonActive[0], pal.buttonActive[1], pal.buttonActive[2], 0.60f));
 
     char modelLabel[160];
     composerModelLabel(st.settings, modelLabel, sizeof(modelLabel));
-    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(244, 247, 251, 255));
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
     if (ImGui::Button(modelLabel)) ImGui::OpenPopup("##modeldropdown");
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Model — click to search and switch.");
@@ -2824,7 +2881,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
             if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
         char effBtn[48];
         std::snprintf(effBtn, sizeof(effBtn), "Thinking: %s", effLabels[effIdx]);
-        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(203, 213, 225, 255));
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
         if (ImGui::Button(effBtn)) ImGui::OpenPopup("##cmpeffort");
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered())
@@ -2837,7 +2894,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
             ImGui::EndPopup();
         }
     } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(148, 163, 184, 255));
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
         ImGui::BeginDisabled();
         ImGui::Button("Thinking: n/a");
         ImGui::EndDisabled();
@@ -2936,7 +2993,6 @@ static void requestStopRun(AppState& st) {
 // ---- the composer: a rounded input box + inline toolbar (+, model chip, settings, send) ----
 // Submits on Enter or the send button. Returns nothing; runs the turn directly.
 static void drawComposer(AppState& st, bool busy, bool canRun) {
-    const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const bool hasDoc = st.docMirror.hasDoc();
 
@@ -2959,7 +3015,7 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
 
     // ---- queued messages (shown above the composer, each removable) ----
     if (!st.queuedPrompts.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+        ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
         for (size_t qi = 0; qi < st.queuedPrompts.size(); ++qi) {
             ImGui::PushID((int)qi + 9000);
             float xBtn = ImGui::GetFrameHeight();
@@ -2992,13 +3048,14 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
     composerSplit.Split(composerDl, 2);
     composerSplit.SetCurrentChannel(composerDl, 1);
 
+    const ui::AdaptiveSurface& surf = chatSurf();
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                         ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
     ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, IM_COL32(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_FrameBgActive, IM_COL32(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(244, 247, 251, 255));
-    ImGui::PushStyleColor(ImGuiCol_TextDisabled, IM_COL32(166, 176, 194, 255));
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled, surf.textTertiary);
     ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(0, 0, 0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
@@ -3012,10 +3069,8 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
 
     const ImVec2 composerMax(composerMin.x + composerW, ImGui::GetItemRectMax().y);
     composerSplit.SetCurrentChannel(composerDl, 0);
-    composerDl->AddRectFilled(composerMin, composerMax, IM_COL32(31, 37, 48, 255),
-                              ui::metrics::rounding(8.0f));
-    composerDl->AddRect(composerMin, composerMax, IM_COL32(71, 82, 102, 255),
-                        ui::metrics::rounding(8.0f), 0, ui::metrics::stroke(1.0f));
+    ui::glassPanel(composerDl, ImRect(composerMin, composerMax), ui::GlassLevel::Thin,
+                  ui::metrics::rounding(8.0f), surf);
     composerSplit.Merge(composerDl);
 
     // ---- stop / submit / queue ----
@@ -3048,6 +3103,18 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
 
     if (!ImGui::Begin("Copilot###AI", nullptr, ImGuiWindowFlags_NoBackground)) { ImGui::End(); return; }
     ui::Fonts& fonts = st.fonts;
+
+    // Liquid-Glass v2 host port (contract H5): ONE UltraThin glass surface for the whole Copilot
+    // pane, painted once here at panel top (id "host_agent_glass" via ui::panelId — window-
+    // independent, so chatSurf() below returns the SAME cached surface for the header, composer,
+    // and every card this frame; ui::adaptivePanel is idempotent per frame). Falls back to the
+    // palette's glassBackground when no viewport backdrop has been published yet.
+    {
+        ImVec2 wmin = ImGui::GetWindowPos();
+        ImVec2 wmax(wmin.x + ImGui::GetWindowSize().x, wmin.y + ImGui::GetWindowSize().y);
+        ui::glassPanel(ImGui::GetWindowDrawList(), ImRect(wmin, wmax), ui::GlassLevel::UltraThin,
+                      -1.0f, chatSurf());
+    }
 
     // Remember which dock node we live in so the sibling "Settings" tab can dock next to us.
     st.aiDockId = (unsigned int)ImGui::GetWindowDockID();

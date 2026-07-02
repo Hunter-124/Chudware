@@ -3,6 +3,12 @@
 // mutations to AppState::docTabs are DEFERRED until after the strip is fully drawn (we iterate the
 // vector while drawing), mirroring the feature tree's s_pendingTreeOps discipline so a switch/close
 // never invalidates the loop it fires from.
+
+// Liquid Glass v2 port (host, H6b write-set): tab pills + the whole band read the live
+// viewport-backdrop glass surface projected via ui::glassPanel/ui::adaptivePanel (contract:
+// local://glass_host.md). Ported from ui/imgui/src/ui/doc_tabs.cpp (drawOneTab / drawDocTabs) —
+// see that file for the landed v2 reference. The opaque panelBg fill the band used to paint
+// unconditionally is now drawn ONLY as the backdrop-invalid fallback.
 #include <cstdio>
 #include <string>
 
@@ -56,10 +62,12 @@ static const char* docIconName(const AppState::DocTab& t) {
     }
 }
 
+
 // A single tab, placed explicitly at screen position (x, y0). Returns the tab WIDTH so the caller
 // can advance to the next tab. Records a deferred switch/close into the file statics. Layout:
 // [ title (dirty *) × ]. The whole pill switches; the × hot-zone (submitted on top) closes.
-static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
+static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
+                        const ui::AdaptiveSurface& surf) {
     const auto& pal = ui::palette;
     AppState::DocTab& t = st.docTabs[idx];
     const bool active = (idx == st.activeTab);
@@ -81,6 +89,7 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
 
     ImVec2 p0(x, y0);
     ImVec2 p1(p0.x + tabW, p0.y + tabH);
+    const ImRect tabRect(p0, p1);
 
     // Whole-pill click target (switch). The × button sits on top and consumes its own clicks — but
     // ImGui occludes a later item by an earlier overlapping one unless the underlying item opts in,
@@ -91,11 +100,11 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
     bool hovered = ImGui::IsItemHovered();
     bool middleClose = hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Middle);
 
-    // Pill background: active = panel bg with an accent top edge; inactive = darker, hover lifts it.
-    ImU32 bg = active ? ui::Palette::toU32(pal.panelBg)
-                      : (hovered ? ui::Palette::toU32(pal.buttonHovered)
-                                 : ui::Palette::toU32(pal.headerBg));
-    dl->AddRectFilled(p0, p1, bg, 4.0f * s, ImDrawFlags_RoundCornersTop);
+    // Glass pill: active = Regular material, inactive = UltraThin, hover lifts an inactive tab to
+    // Thin (per-rect UV-projected live backdrop; glassBackground fallback when no backdrop is live).
+    ui::GlassLevel level = active ? ui::GlassLevel::Regular : ui::GlassLevel::UltraThin;
+    if (hovered && !active) level = ui::GlassLevel::Thin;
+    ui::glassPanel(dl, tabRect, level, 4.0f * s, surf);
     if (active)
         dl->AddLine(ImVec2(p0.x + ui::metrics::px(2), p0.y + ui::metrics::px(1)),
                     ImVec2(p1.x - ui::metrics::px(2), p0.y + ui::metrics::px(1)),
@@ -104,20 +113,14 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
         dl->AddLine(ImVec2(p1.x - 0.5f, p0.y + 4 * s), ImVec2(p1.x - 0.5f, p1.y - 4 * s),
                     ui::Palette::toU32(pal.border), 1.0f);
 
-    // Title text.
-    const float* textCol = active ? pal.text : pal.textDim;
-    IconUV ic = getIcon(docIconName(t), 20);
-    if (ic.valid) {
-        ImVec4 tint(textCol[0], textCol[1], textCol[2], active ? 1.0f : 0.78f);
-        float iy = p0.y + (tabH - iconSz) * 0.5f;
-        dl->AddImage(ic.texId, ImVec2(p0.x + padX, iy),
-                     ImVec2(p0.x + padX + iconSz, iy + iconSz),
-                     ic.uv0, ic.uv1, ImGui::ColorConvertFloat4ToU32(tint));
-    }
+    // Title text + kind icon — max-contrast glass surface tones (theme-independent vibrancy ramp).
+    const ImU32 textCol = ImGui::ColorConvertFloat4ToU32(active ? surf.textPrimary : surf.textSecondary);
+    const float iy = p0.y + (tabH - iconSz) * 0.5f;
+    ui::drawIconGlass(dl, docIconName(t), ImVec2(p0.x + padX + iconSz * 0.5f, iy + iconSz * 0.5f),
+                      iconSz * 0.5f, textCol, ui::glassIconHalo(surf));
     dl->AddText(ImVec2(p0.x + padX + iconSz + iconGap,
                        p0.y + (tabH - ImGui::GetFontSize()) * 0.5f),
-                ImGui::ColorConvertFloat4ToU32(ImVec4(textCol[0], textCol[1], textCol[2], 1)),
-                label.c_str());
+                textCol, label.c_str());
 
     if (hovered && !t.path.empty())
         ImGui::SetTooltip("%s%s", t.path.c_str(), t.dirty ? "  (unsaved changes)" : "");
@@ -132,11 +135,9 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
     bool xHover = ImGui::IsItemHovered();
     ImVec2 xc(cx + closeW * 0.5f, p0.y + tabH * 0.5f);
     if (xHover)
-        dl->AddCircleFilled(xc, closeW * 0.5f, IM_COL32(232, 17, 35, 200));
+        dl->AddCircleFilled(xc, closeW * 0.5f, IM_COL32(232, 17, 35, 200));  // semantic red — kept literal
     float g = closeW * 0.22f;
-    ImU32 xCol = xHover ? IM_COL32(255, 255, 255, 255)
-                        : ImGui::ColorConvertFloat4ToU32(
-                              ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
+    const ImU32 xCol = ImGui::ColorConvertFloat4ToU32(xHover ? surf.textPrimary : surf.textTertiary);
     dl->AddLine(ImVec2(xc.x - g, xc.y - g), ImVec2(xc.x + g, xc.y + g), xCol, 1.6f * s);
     dl->AddLine(ImVec2(xc.x - g, xc.y + g), ImVec2(xc.x + g, xc.y - g), xCol, 1.6f * s);
 
@@ -269,32 +270,29 @@ float drawDocTabs(AppState& st, float availW) {
     s_saveCloseIdx = -1;
     s_newDoc = NewDocKind::None;
 
-    // ONE opaque windowBg bar for the ENTIRE tab row — full dockspace WIDTH, behind all three dock
-    // nodes (FeatureManager tabs | doc tabs | Copilot/Settings tabs). Spanning the whole width (not just
-    // this central node) guarantees the row reads as one continuous dark bar: it backfills the dock
-    // splitter gaps and any translucent tab-bar region on the side nodes with the same windowBg the
-    // dock tabs (ImGuiCol_Tab) and the side panes' opaque base already use — so nothing two-tone shows
-    // between the ribbon and the content. Drawn on the background draw list (behind every window): the
-    // tabs paint on top via their window draw lists; the side panes' opaque base paints on top in their
-    // x-range; the full-bleed 3D is composited lower (from cr0, below this bar). The bar reaches DOWN
-    // past the tab height to the viewport content top so its bottom divider sits flush above the 3D
-    // instead of floating in a dark strip. Replaces the old glassBg@0.75 strip + the W2b band.
+    // Liquid Glass v2 port (ported from ui/imgui/src/ui/doc_tabs.cpp's drawDocTabs): the tab band
+    // is now ONE Thin glass surface whose backdrop is the live blurred viewport, per-rect UV
+    // projected across the FULL dockspace width (ui::glassPanel handles the projection + clamped
+    // edge bleed) — still backfilling the FeatureManager | doc-tab | Copilot dock-node splitter
+    // gaps like the old opaque bar did. The OPAQUE panelBg fill from the pre-glass design is kept,
+    // but now drawn ONLY when no viewport backdrop is currently live (ECAD/CAM tab active, or
+    // before the first frame publishes one): that opaque fill was the original two-tone-banding
+    // workaround, and with a live backdrop the new per-rect UV projection samples one continuous
+    // texture so that banding cannot recur (host facts, see local://glass_host.md).
     ImVec2 origin = ImGui::GetCursorScreenPos();
-    {
-        const ImGuiStyle& style = ImGui::GetStyle();
-        float bandT = origin.y, bandL = origin.x, bandR = origin.x + availW;
-        if (ImGuiDockNode* node = ImGui::GetWindowDockNode()) bandT = node->Pos.y;
-        // The strip is drawn inside the central view window; keep the background clipped to that
-        // window instead of spanning the whole app chrome.
-        // Bottom = where the viewport 3D content begins (the strip + the window-padding/spacing gap
-        // that the caller leaves before cr0), so the divider hugs the viewport top.
-        const float bandB = origin.y + barH + style.ItemSpacing.y;
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->AddRectFilled(ImVec2(bandL, bandT), ImVec2(bandR, bandB),
-                          ui::Palette::toU32(pal.panelBg));
-        dl->AddLine(ImVec2(bandL, bandB - 0.5f), ImVec2(bandR, bandB - 0.5f),
-                     ui::Palette::toU32(pal.border), 1.0f);
-    }
+    const ImGuiStyle& style = ImGui::GetStyle();
+    float bandT = origin.y, bandL = origin.x, bandR = origin.x + availW;
+    if (ImGuiDockNode* node = ImGui::GetWindowDockNode()) bandT = node->Pos.y;
+    const float bandB = origin.y + barH + style.ItemSpacing.y;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImRect bandRect(ImVec2(bandL, bandT), ImVec2(bandR, bandB));
+    if (!ui::viewportBackdrop().valid())
+        dl->AddRectFilled(bandRect.Min, bandRect.Max, ui::Palette::toU32(pal.panelBg));
+    const ui::AdaptiveSurface& surf =
+        ui::adaptivePanel(ui::panelId("host_doctabs_glass"), bandRect);
+    ui::glassPanel(dl, bandRect, ui::GlassLevel::Thin, 8.0f * s, surf);
+    dl->AddLine(ImVec2(bandL, bandB - 0.5f), ImVec2(bandR, bandB - 0.5f),
+                ui::Palette::toU32(pal.border), 1.0f);
 
     // Explicit x-cursor placement (no SameLine/Dummy bookkeeping): each tab is drawn at the running
     // x and returns its width. The strip never wraps; very many tabs just clip at the content edge.
@@ -302,37 +300,24 @@ float drawDocTabs(AppState& st, float availW) {
     float y0 = origin.y;
     float gap = 2.0f * s;
     for (int i = 0; i < (int)st.docTabs.size(); ++i) {
-        runX += drawOneTab(st, i, runX, y0, barH) + gap;
+        runX += drawOneTab(st, i, runX, y0, barH, surf) + gap;
     }
 
     // "+" New-Document button at the end of the strip — opens a chooser popup (Wave 2). Clicking it
     // (or Ctrl+N via openNewDocChooser()) opens "##newdocmenu"; each item records a deferred
     // NewDocKind applied after the strip is drawn (so docTabs isn't mutated mid-iteration).
     {
-        float btn = barH;
-        ImVec2 p0(runX, y0);
+        const float btn = barH;
+        const ImVec2 p0(runX, y0);
         ImGui::SetCursorScreenPos(p0);
-        bool clicked = ImGui::InvisibleButton("##newtab", ImVec2(btn, btn));
-        bool hov = ImGui::IsItemHovered();
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        if (hov)
-            dl->AddRectFilled(p0, ImVec2(p0.x + btn, p0.y + btn),
-                              ui::Palette::toU32(pal.buttonHovered), 4.0f * s);
-        ImVec2 c(p0.x + btn * 0.5f, p0.y + btn * 0.5f);
-        IconUV plus = getIcon("new_doc", 20);
-        if (plus.valid) {
-            float iz = 18.0f * s;
-            ImVec4 tint(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1);
-            dl->AddImage(plus.texId, ImVec2(c.x - iz * 0.5f, c.y - iz * 0.5f),
-                         ImVec2(c.x + iz * 0.5f, c.y + iz * 0.5f),
-                         plus.uv0, plus.uv1, ImGui::ColorConvertFloat4ToU32(tint));
-        } else {
-            float g = btn * 0.2f;
-            ImU32 col = ImGui::ColorConvertFloat4ToU32(
-                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
-            dl->AddLine(ImVec2(c.x - g, c.y), ImVec2(c.x + g, c.y), col, 1.6f * s);
-            dl->AddLine(ImVec2(c.x, c.y - g), ImVec2(c.x, c.y + g), col, 1.6f * s);
+        const bool clicked = ImGui::InvisibleButton("##newtab", ImVec2(btn, btn));
+        const bool hov = ImGui::IsItemHovered();
+        if (hov) {
+            const ImRect pill(p0, ImVec2(p0.x + btn, p0.y + btn));
+            ui::glassPanel(dl, pill, ui::GlassLevel::UltraThin, 4.0f * s, surf);
         }
+        ui::drawIconGlass(dl, "new_doc", ImVec2(p0.x + btn * 0.5f, p0.y + btn * 0.5f), 9.f * s,
+                          ImGui::ColorConvertFloat4ToU32(surf.textSecondary), ui::glassIconHalo(surf));
         if (hov) ImGui::SetTooltip("New document");
         // Open the tiled "Create New" chooser (Part / Assembly / Drawing / Simulation / PCB / Open
         // existing — with previews), hosted at app scope (ui::drawNewDocChooser). Ctrl+N raises it

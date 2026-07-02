@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "imgui.h"
+#include "imgui_internal.h"  // ImRect (ui::adaptivePanel rect argument)
 
 #include "feature_tree.h"
 #include "file_dialog.h"   // C41: native Win32 Save/Open dialogs
@@ -52,6 +53,62 @@ static inline double jftnum(const nlohmann::json& o, const char* k, double def =
 
 namespace ui {
 
+// ---- Liquid glass v2: adaptive-surface palette shim (host contract §H4) ----------------------
+// Over-viewport panels get maximum-contrast, theme-independent text driven by the sampled
+// viewport luminance (ui_theme.h AdaptiveSurface / adaptivePanel). fmSurf()/fmHalo() are cheap,
+// idempotent-per-frame fetches (adaptivePanel caches by id — see design doc amendment A2) of the
+// ONE glass surface layout.cpp's drawLeftPane paints for the whole pane ("host_left_glass");
+// every tree/row/icon site below reads through them instead of painting its own background.
+// FmPalette mirrors the ui/imgui/src/ui/feature_tree.cpp v2 port: the handful of `pal.<role>`
+// call sites throughout this file keep compiling unchanged once their local `pal` alias is
+// rebound to fmPalette() below — only text/dim/border roles switch to adaptive contrast when a
+// backdrop is live; semantic roles (accent/status/hover/panelBg) always stay palette.
+static const ui::AdaptiveSurface& fmSurf() {
+    ImVec2 wp_ = ImGui::GetWindowPos(); ImVec2 ws_ = ImGui::GetWindowSize();
+    ImRect r(wp_, ImVec2(wp_.x + ws_.x, wp_.y + ws_.y));
+    return ui::adaptivePanel(ui::panelId("host_left_glass"), r);
+}
+// Contrast halo for drawIconGlass: surf.tint is already the opposite-tone neutral (see
+// ui_theme.cpp adaptiveSurface) at ~0x50 alpha; 0 alpha (no live backdrop) => drawIconGlass
+// draws plain (icons.h contract).
+static ImU32 fmHalo(const ui::AdaptiveSurface& surf) {
+    if (!ui::viewportBackdrop().valid()) return 0;
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0x50 / 255.f));
+}
+
+struct FmPalette {
+    float text[4], textDim[4], accent[4], accentSoft[4], accentMid[4];
+    float statusWarn[4];
+    float treeHover[4], treeSection[4];
+    float border[4], panelBg[4];
+};
+static FmPalette g_fmPal;
+
+static void fmPaletteRefresh(const ui::AdaptiveSurface* live) {
+    const auto& p = ui::palette;
+    auto c4 = [](const float src[4], float* o) { o[0]=src[0]; o[1]=src[1]; o[2]=src[2]; o[3]=src[3]; };
+    auto v4 = [](const ImVec4& v, float* o) { o[0]=v.x; o[1]=v.y; o[2]=v.z; o[3]=v.w; };
+    c4(p.text, g_fmPal.text);
+    c4(p.textDim, g_fmPal.textDim);
+    c4(p.accent, g_fmPal.accent);
+    c4(p.accentSoft, g_fmPal.accentSoft);
+    c4(p.accentMid, g_fmPal.accentMid);
+    c4(p.statusWarn, g_fmPal.statusWarn);
+    c4(p.treeHover, g_fmPal.treeHover);
+    c4(p.treeSection, g_fmPal.treeSection);
+    c4(p.border, g_fmPal.border);
+    c4(p.panelBg, g_fmPal.panelBg);
+    // Over a LIVE viewport backdrop, adaptive contrast wins for the text/dim/border roles (max
+    // legibility over frosted glass); semantic roles (accent/status/hover/panelBg) stay palette.
+    if (live) {
+        v4(live->textPrimary,   g_fmPal.text);
+        v4(live->textSecondary, g_fmPal.textDim);
+        v4(live->textSecondary, g_fmPal.treeSection);
+        v4(live->textTertiary,  g_fmPal.border);
+    }
+}
+static const FmPalette& fmPalette() { return g_fmPal; }
+
 // ---- icon helper ----
 // Attempt to draw a named atlas icon; fall back to a text glyph if the atlas is absent.
 // C37-E: `alpha` dims the icon (suppressed / rolled-back rows get a faded icon, item 6).
@@ -63,7 +120,8 @@ static void treeIcon(const char* name, const char* fallback, float size = 16.0f,
         ImGui::Image(iv.texId, ImVec2(px, px), iv.uv0, iv.uv1, ImVec4(1, 1, 1, alpha));
     } else {
         if (alpha < 1.0f) ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1], ui::palette.textDim[2], alpha));
+            ImVec4(fmSurf().textSecondary.x, fmSurf().textSecondary.y,
+                   fmSurf().textSecondary.z, alpha));
         ImGui::TextUnformatted(fallback);
         if (alpha < 1.0f) ImGui::PopStyleColor();
     }
@@ -206,7 +264,7 @@ static void featureBadge(bool ok, bool hasError, const std::string& errText,
 // AFTER EndPopup/the call: the styles must stay live for the popup's whole deferred draw. The
 // push/pop is balanced every frame regardless of whether the popup is actually open.
 static void pushTreePopupGlass() {
-    const auto& pal = ui::palette;
+    const auto& pal = fmPalette();
     ImGui::PushStyleColor(ImGuiCol_PopupBg,
         ImVec4(pal.panelBg[0] * 1.08f, pal.panelBg[1] * 1.08f, pal.panelBg[2] * 1.20f, 0.92f));
     ImGui::PushStyleColor(ImGuiCol_Border,
@@ -225,7 +283,7 @@ static void popTreePopupGlass() {
 // history) far more clearly than a bare Separator(): a treeSection-colored centered label flanked by
 // two short draw-list hairlines, then a Dummy to re-sync the layout cursor below the drawn row.
 static void treeSectionDivider(const char* label) {
-    const auto& pal = ui::palette;
+    const auto& pal = fmPalette();
     const float S = ui::uiScale;
     ImVec2 p = ImGui::GetCursorScreenPos();
     float  w = ImGui::GetContentRegionAvail().x;
@@ -787,8 +845,8 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     if (dim) {
         float a = c.suppressed ? 0.5f : 0.62f;
         ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                   ui::palette.textDim[2], a));
+            ImVec4(fmSurf().textSecondary.x, fmSurf().textSecondary.y,
+                   fmSurf().textSecondary.z, a));
     }
 
     // Label: dimmed-icon suppressed cue handled via the tree icon; keep a compact [S] too.
@@ -1021,14 +1079,16 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         ImDrawList* eyeDl = ImGui::GetWindowDrawList();
         IconUV iv = getIcon("hide_show_eye", 20);
         float a = shown ? (overEye ? 1.0f : 0.70f) : (overEye ? 0.55f : 0.28f);
-        ImU32 tint = IM_COL32(255, 255, 255, (int)(a * 255.0f + 0.5f));
+        const ui::AdaptiveSurface& eyeSurf = fmSurf();
+        ImU32 tint = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(eyeSurf.textPrimary.x, eyeSurf.textPrimary.y, eyeSurf.textPrimary.z, a));
         if (iv.valid) {
-            eyeDl->AddImage(iv.texId, eyeMin, eyeMax, iv.uv0, iv.uv1, tint);
+            drawIconGlass(eyeDl, "hide_show_eye",
+                         ImVec2((eyeMin.x + eyeMax.x) * 0.5f, (eyeMin.y + eyeMax.y) * 0.5f),
+                         eyeMax.x - eyeMin.x, tint, fmHalo(eyeSurf));
             if (!shown)
                 eyeDl->AddLine(ImVec2(eyeMin.x, eyeMax.y), ImVec2(eyeMax.x, eyeMin.y),
-                               ImGui::ColorConvertFloat4ToU32(
-                                   ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                                          ui::palette.textDim[2], 0.9f)),
+                               ImGui::ColorConvertFloat4ToU32(eyeSurf.textSecondary),
                                std::max(1.0f, 1.5f * ui::uiScale));
         } else {
             eyeDl->AddText(eyeMin, tint, shown ? "o" : "-");
@@ -1230,7 +1290,7 @@ static ImU32 categoryColor(const std::string& type, bool isCut) {
 // menu (asm_edit_mate / asm_delete_mate). Returns nothing; mutates the doc via DocMirror.
 static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                              const nlohmann::json& statusArr) {
-    const auto& pal = ui::palette;
+    const auto& pal = fmPalette();
 
     // Map component id -> display name (for the mate captions).
     auto compName = [&](const std::string& cid) -> std::string {
@@ -1359,7 +1419,6 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
 // Returns true on click. Disabled buttons render dimmed and don't fire.
 static bool toolbarIconBtn(const char* id, const char* iconName, const char* tooltip,
                            bool enabled) {
-    const auto& pal = ui::palette;
     float btn = 24.0f * ui::uiScale;
     ImGui::PushID(id);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -1370,11 +1429,13 @@ static bool toolbarIconBtn(const char* id, const char* iconName, const char* too
     bool hov = ImGui::IsItemHovered();
     if (hov && enabled)
         ui::glassRowBackground(dl, p0, ImVec2(p0.x + btn, p0.y + btn), 3.0f, false, false, 0.38f);
-    IconUV iv = getIcon(iconName, 20);
-    float iz = 18.0f * ui::uiScale, off = (btn - iz) * 0.5f;
-    ImU32 tint = enabled ? IM_COL32(255,255,255,255) : IM_COL32(128,128,128,150);
-    dl->AddImage(iv.texId, ImVec2(p0.x + off, p0.y + off),
-                 ImVec2(p0.x + off + iz, p0.y + off + iz), iv.uv0, iv.uv1, tint);
+    float iz = 18.0f * ui::uiScale;
+    const ui::AdaptiveSurface& surf = fmSurf();
+    ImVec4 tintV = enabled ? surf.textPrimary
+                           : ImVec4(surf.textTertiary.x, surf.textTertiary.y,
+                                    surf.textTertiary.z, surf.textTertiary.w * (150.0f / 255.0f));
+    drawIconGlass(dl, iconName, ImVec2(p0.x + btn * 0.5f, p0.y + btn * 0.5f), iz,
+                 ImGui::ColorConvertFloat4ToU32(tintV), fmHalo(surf));
     if (hov && tooltip) ImGui::SetTooltip("%s", tooltip);
     ImGui::PopID();
     return clicked;
@@ -1645,7 +1706,7 @@ static void nameAndGroupFeatures(AppState& st) {
 // gates the mutating feature-row drop. `barAfterFid` (non-empty = the bar sits mid-history) also
 // drives the "rolled back" zone label drawn below the bar.
 static void drawRollbackBarLine(AppState& st, bool enabled, const std::string& barAfterFid) {
-    const auto& pal = ui::palette;
+    const auto& pal = fmPalette();
     ImGui::Dummy(ImVec2(0, 2.0f * ui::uiScale));
     ImVec2 r0 = ImGui::GetCursorScreenPos();
     float  w  = ImGui::GetContentRegionAvail().x;
@@ -1721,7 +1782,7 @@ static bool fm_icontains(const char* hay, const char* needle) {
 // configurations tabs are visual stubs) plus a compact document toolbar (New Part / New Assembly /
 // Open / Save / Undo / Redo) that replaces the old wide text-button strip at the panel bottom.
 static void drawFeatureManagerTopStrip(AppState& st) {
-    const auto& pal = ui::palette;
+    const auto& pal = fmPalette();
     bool canDoc = st.workerStarted && !st.job.running.load();
     const float S = ui::uiScale;
 
@@ -1844,7 +1905,9 @@ static void drawFeatureManagerTopStrip(AppState& st) {
 // the former drawFeatureTree(); the only change is the removed Begin/End at the top and bottom.
 void drawFeatureTreeBody(AppState& st,
                          const std::function<void(const std::string&)>& editCallback) {
-    const auto& pal = ui::palette;
+    const ui::AdaptiveSurface& lpSurf = fmSurf();
+    fmPaletteRefresh(ui::viewportBackdrop().valid() ? &lpSurf : nullptr);
+    const auto& pal = fmPalette();
     s_fmStripeIdx = 0;
 
     // C24: SolidWorks-style top strip (tab row + compact doc toolbar), replacing the old wide
@@ -2153,9 +2216,15 @@ void drawFeatureTreeBody(AppState& st,
                             ImDrawList* pdl = ImGui::GetWindowDrawList();
                             IconUV iv = getIcon("hide_show_eye", 20);
                             float a = !hidden ? (pOverEye ? 1.0f : 0.70f) : (pOverEye ? 0.55f : 0.28f);
-                            ImU32 tint = IM_COL32(255, 255, 255, (int)(a * 255.0f + 0.5f));
+                            const ui::AdaptiveSurface& peSurf = fmSurf();
+                            ImU32 tint = ImGui::ColorConvertFloat4ToU32(
+                                ImVec4(peSurf.textPrimary.x, peSurf.textPrimary.y,
+                                       peSurf.textPrimary.z, a));
                             if (iv.valid) {
-                                pdl->AddImage(iv.texId, pEyeMin, pEyeMax, iv.uv0, iv.uv1, tint);
+                                drawIconGlass(pdl, "hide_show_eye",
+                                             ImVec2((pEyeMin.x + pEyeMax.x) * 0.5f,
+                                                    (pEyeMin.y + pEyeMax.y) * 0.5f),
+                                             pEyeMax.x - pEyeMin.x, tint, fmHalo(peSurf));
                                 if (hidden)
                                     pdl->AddLine(ImVec2(pEyeMin.x, pEyeMax.y), ImVec2(pEyeMax.x, pEyeMin.y),
                                                  ImGui::ColorConvertFloat4ToU32(ImVec4(pal.textDim[0],

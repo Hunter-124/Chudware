@@ -1,6 +1,8 @@
 // AI-CAD Copilot pane: slim header (logo + status + Sessions), conversation log with a per-turn
-// transparent activity timeline, and a bottom composer (prelude: Design/Permissions + context meter;
-// transparent prompt; toolbar: model picker + thinking + gear/send).
+// transparent activity timeline (what the AI is doing / thinking, expandable) whose cards are now
+// translucent Liquid-Glass bubbles over the live viewport backdrop (host contract H5), and a
+// bottom composer (prelude: Design/Permissions + context meter; transparent prompt; toolbar:
+// model picker + thinking + gear/send) painted over the same glass surface.
 #pragma once
 
 struct AppState;

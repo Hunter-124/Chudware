@@ -174,3 +174,74 @@ module-level (`-rdynamic` would fix); worker tessellation on this box returns no
 — scenario docs build but don't display without the fixture path).
 **Gates** — build/linux-app green; gui_lint icons/theme clean; feature_surface_audit +
 parity_audit failures are pre-existing and untouched.
+
+### PROMPTS — non-vision review path (AI-experience wave, WS-A/A4)
+Write-set: `services/agent/prompts/reviewer.md`, `services/agent/loop.py`. In
+`reviewer.md`, replaced the one-line "(or, if no image is available, the mass properties
+and feature tree)" fallback with an explicit "NO IMAGE AVAILABLE (non-vision model)"
+paragraph directing the reviewer through `describe_part()` (named outline: bbox, feature
+groups, symmetry, placement), `describe_scene()` (per-view visible-face text, occlusion
+disclaimed), `check_feature_overlap()` (intra-part boss/cut overlap + swallowed-boss),
+`check_interference()` (assembly clearance/clash), and `measure_part()`, plus an explicit
+instruction to confirm every requested feature's placement against the outline before
+approving; the rest of the file (render-reading cues, concrete checklist, JSON reply
+contract) is untouched. In `loop.py`, added `_no_vision_note(res)` (new helper, right
+after `_feedback_ok`) and wired it into the non-vision branch of `run_turn`'s per-iteration
+feedback (~L987) so a non-vision provider gets 3–4 extra sentences pointing it at the
+face histogram, bbox/fill %, and (for assemblies) the FIT REPORT already present in
+`_feedback_ok`'s digest — no new engine/MCP calls, since `ModelResult.faces` only carries
+`{total,planar,cylindrical}` (no per-face or per-body breakdown) so a "largest faces per
+body" summary was not available from data the loop already holds and was correctly
+omitted rather than faked. The vision branch (`_feedback_ok(res)` + image + prompt_text)
+is untouched — verified byte-identical by inspection since only the `else` branch changed.
+**Verify:** `python3 -m py_compile services/agent/loop.py` — clean.
+
+### KNOWLEDGE — scraped-knowledge cheatsheets + scraper script (AI-experience wave, WS-D/D4)
+Write-set: `tools/scrape_knowledge.py` (new), `services/agent/prompts/shared/cheatsheets/{fits,threads,bearings,materials}.md`
+(new). Added a stdlib-only draft generator (`tools/scrape_knowledge.py`): built-in
+`TOPIC_URLS` dict (fits/threads/bearings/materials → public reference URLs), fetches each
+via the Firecrawl REST v1 `/scrape` endpoint (`Bearer $FIRECRAWL_API_KEY`,
+`formats:["markdown"]`) when the env var is set, else `urllib.request` with a browser
+User-Agent + a crude tag-strip fallback (verified live against Wikipedia in this session —
+112 KB draft produced for the `materials` topic with no `FIRECRAWL_API_KEY` set); writes
+`<topic>.md` drafts under `--out` (default `/tmp/knowledge_drafts`), one `## <url>` /
+`Source: <url> (retrieved YYYY-MM-DD)` section per page. The script refuses to write into
+`services/agent/prompts/shared/cheatsheets/` (explicit path-equality guard) so it can never
+clobber a committed cheatsheet — it only ever produces scratch drafts for a human curator.
+Wrote the four committed cheatsheets by hand (table-first, phrased for the modeling agent,
+each ≤60 lines, well under the 120-line cap): `fits.md` (ISO 286 H7/g6·H7/k6·H7/p6·H11/c11
+clearance/interference ranges for 3–50 mm plus FDM-clearance guidance — press fits routed to
+heat-set inserts/fasteners rather than interference, matching
+`docs/INTAKE_MEASUREMENT_DFM_PLAN.md`'s process-profile table), `threads.md` (ISO metric
+coarse M2–M12 pitch/tap-drill/minor-Ø/clearance + UNC #4–3/8" equivalents + a "model ≥ M6 or
+use an insert" printed-thread rule), `bearings.md` (608/6000-series/625/688 bore×OD×width +
+rotating-vs-stationary-ring shaft-k6/housing-H7 fit table + a printed-housing section warning
+against relying on plastic interference to retain a bearing), `materials.md` (density/E/yield
+for mild steel, 6061-T6, 304 SS, brass, ABS, PLA, PETG, nylon, one selection line each, noting
+the FEA-material-entry and Z-axis-anisotropy caveats for printed polymers). No dispatch code
+was touched: `cad_guide_text()` in `services/mcp/cad_tools.py` already resolves an unknown
+topic via `_read_prompt(f"shared/cheatsheets/{topic}.md")` (confirmed by reading the existing
+source), so `cad_guide("fits")` etc. auto-discover the new files by filename alone, sitting
+beside `fillet.md`/`hardware.md`/etc. **Verify:** `python3 -m py_compile
+tools/scrape_knowledge.py` — clean; all four cheatsheets end with a `Sources:` line citing
+public references (ISO 286-2, ISO 261/262, ANSI/ASME B1.1, SKF bearing/fit tables, MatWeb
+typical values) and are 39–60 lines each.
+## Liquid-glass v2 → HOST port (production binary) — 2026-07-01
+
+Follow-up to the AI-CAD2 restyle: the user launches `./build.sh` → host/build-linux/bin/AI-CAD
+(host/DEPRECATED.md: "host/ remains the production binary"), so the full glass system was ported
+to host/src via a second 7-node wave against local://glass_host.md (H1 renderer backdrop/Kawase/
+async PBO luminance grid/GL timers; H2 ui_theme AdaptiveSurface/adaptivePanel/panelId/GlassLevel/
+glassPanel-UV/glassText/glassIconHalo with the SAME theme-independent vibrancy constants as
+ui/imgui; H3 icons_sdf port + ui::drawIconGlass; H4 left pane one UltraThin surface
+("host_left_glass") + adaptive text; H5 legacy_chat translucent glass bubbles — deliberately
+REVERSES the old opaque-dark card decision per the restyle brief — measure-then-fill channel
+split; H6a viewport_panel backdrop publish + sampler (15% inset band) + adaptive HUD pills;
+H6b doc-tab band adaptive Thin glass with the opaque panelBg fill kept as backdrop-invalid
+fallback + adaptive toasts). Integrator: host/CMakeLists.txt gained src/ui/icons_sdf.cpp;
+glassIconHalo hoisted into ui_theme (was duplicated in doc_tabs/viewport_panel).
+AI-CAD2 extra: empty scenes now render the GL studio backdrop (viewport.cpp renderViewport no
+longer early-outs without a doc), so the glass look is live from first launch in both apps —
+previously an empty scene fell back to a flat draw-list gradient and the restyle was invisible
+until a mesh loaded (the "I don't see any changes" report). gui_lint icons/theme clean; scale
+findings unchanged (pre-existing); host tree/chat scenario shots verified visually.

@@ -33,4 +33,19 @@ IconUV getIcon(const char* name, int size = 32);
 // calls use the new atlas.  UVs stay constant.
 void syncIconTheme();
 
+// Liquid Glass v2 host port (H3 contract): SDF icon path derived at load time from the
+// already-decoded atlas alpha of monochrome-safe line-art glyphs (see icons_sdf.cpp). Renders
+// crisp at any pixel size via a CPU re-raster cache; falls back to the raster atlas for
+// multi-color glyphs that did not qualify.
+
+// True when `name` renders via the SDF path instead of the raster atlas.
+bool hasIconSdf(const char* name);
+
+// SDF-crisp draw with an optional contrast halo (soft dilated backing tinted `haloCol`, drawn
+// beneath the glyph) — for icons painted directly over the frosted viewport backdrop. haloCol
+// alpha 0 => no halo. Falls back to a plain getIcon()+AddImage draw (no halo) when `name` has no
+// SDF glyph (multi-color raster icons keep their raster path).
+void drawIconGlass(ImDrawList* dl, const char* name, ImVec2 center, float sizePx, ImU32 col,
+                    ImU32 haloCol);
+
 }  // namespace ui

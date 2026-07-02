@@ -6,6 +6,7 @@
 #include <string>
 
 #include "imgui.h"
+#include "imgui_internal.h"   // ImRect (adaptivePanel/glassPanel rects), ImHashStr (panelId)
 
 namespace ui {
 
@@ -263,5 +264,75 @@ extern Theme activeTheme;
 // the pre-scaled font atlas. Prefer this over ImGui::GetIO().FontGlobalScale, which the app
 // leaves at 1.0 (fonts are scaled at load time, not via FontGlobalScale).
 extern float uiScale;
+
+// =========================================================================
+// Liquid Glass v2 — adaptive contrast + backdrop-projected glass panels
+// Ported from ui/imgui/src/theme/theme.{h,cpp} (see local://glass_host.md for the host
+// contract). Over-viewport surfaces (left dock, Copilot, viewport HUD, doc-tab band, toasts)
+// use these instead of the theme-dependent glass* helpers above, so text contrast tracks the
+// LIVE viewport content identically in dark and light theme.
+// =========================================================================
+
+// iOS UIBlurEffect-style material levels — tint alphas 0.12 / 0.22 / 0.35 / 0.52.
+enum class GlassLevel { UltraThin, Thin, Regular, Thick };
+
+// Precomputed contrast surface for one panel/rect — see adaptivePanel() / adaptiveSurface().
+struct AdaptiveSurface {
+    ImVec4 tint;                             // scrim color+alpha to draw over the blurred backdrop
+    ImVec4 textPrimary, textSecondary, textTertiary;
+    bool   darkText = false;                 // true => dark-on-bright text
+    float  scrim = 0.f;                      // extra contrast alpha already folded into tint.w
+};
+
+// Published once per frame by the viewport (after its render) so glassPanel()/adaptivePanel()
+// can project any panel rect into backdrop UVs. screenMin/Max = the viewport IMAGE rect in
+// absolute screen coords.
+struct ViewportBackdropInfo {
+    std::uintptr_t textureId = 0;
+    ImVec2 uvMin{0, 0}, uvMax{1, 1};
+    ImVec2 screenMin{0, 0}, screenMax{0, 0};
+    bool   flipV = true;   // GL bottom-left texture: v runs bottom-up
+    bool valid() const {
+        return textureId != 0 && screenMax.x > screenMin.x && screenMax.y > screenMin.y;
+    }
+};
+void                        setViewportBackdrop(const ViewportBackdropInfo& b);
+const ViewportBackdropInfo& viewportBackdrop();
+
+// Luminance bridge: the viewport registers a sampler; theme code consumes it. Screen coords in,
+// 0..1 luminance out; negative => no live backdrop under that rect.
+using LuminanceSampler = float (*)(ImVec2 mn, ImVec2 mx);
+void  setLuminanceSampler(LuminanceSampler fn);
+float sampleLuminance(ImVec2 mn, ImVec2 mx);   // -1 when unavailable
+
+// Stable, window-independent panel-surface id (ImHashStr) — the same id resolves to the same
+// AdaptiveSurface no matter which window/TU looks it up (e.g. a pane vs. its own rows).
+ImGuiID panelId(const char* label);
+
+// Stateless surface builder. avgLuminance >= 0: theme-INDEPENDENT vibrancy tokens (identical
+// constants in dark+light theme) — tone comes solely from the sampled luminance. avgLuminance
+// < 0: palette fallback (chrome, no live backdrop); darkText = (activeTheme == Theme::Light).
+AdaptiveSurface adaptiveSurface(float avgLuminance);
+
+// Hysteretic (.42/.58) + temporally smoothed (tau 0.24s) per-panel adapter. Samples luminance
+// under `rect` via the registered sampler. `id` = any stable ImGuiID (use panelId()). Safe to
+// call every frame; idempotent within a frame; GUI thread only.
+const AdaptiveSurface& adaptivePanel(ImGuiID id, const ImRect& rect);
+
+// Frosted panel: projects `rect` into the live backdrop's UV space (clamped => frosted
+// edge-bleed for rects that spill past the viewport image) and tints with `surf`; falls back to
+// the layered glassBackground() above when no backdrop is live. `rounding` < 0 uses the default
+// panel rounding.
+void glassPanel(ImDrawList* dl, const ImRect& rect, GlassLevel level, float rounding,
+                const AdaptiveSurface& surf, float alpha = 1.f);
+
+// Draw text with a contrast halo (1px offset soft shadow in the opposite tone) — for text
+// painted directly on the viewport (legend, HUD labels, doc-name overlay).
+void glassText(ImDrawList* dl, ImFont* font, float size, ImVec2 pos,
+              const AdaptiveSurface& s, const char* text, const char* textEnd = nullptr);
+
+// Contrast halo color for an icon/glyph drawn over a frosted adaptive surface: the vibrancy
+// tone OPPOSITE the surface's text tone at ~0x50 alpha. alphaMul scales the alpha (HUD fades).
+ImU32 glassIconHalo(const AdaptiveSurface& surf, float alphaMul = 1.0f);
 
 }  // namespace ui

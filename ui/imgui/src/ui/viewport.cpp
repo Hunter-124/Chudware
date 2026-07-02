@@ -138,7 +138,7 @@ bool ensureDocLoaded(AppState& s) {
 
 void renderViewport(AppState& s, int w, int h) {
     if (!g_glVp || w < 8 || h < 8) return;
-    if (!ensureDocLoaded(s)) return;
+    ensureDocLoaded(s);  // best-effort: an EMPTY scene still renders the GL studio backdrop
 
     Renderer& r = g_glVp->renderer();
     g_glVp->resize(w, h);
@@ -495,15 +495,16 @@ void drawViewport(AppState& s) {
     bool imgHovered = false;
 
     Renderer* r = renderer();
-    // An externally-injected mesh (pick/glassperf harness via viewportLoadAicm) renders even
-    // before the engine reports ready — the empty-grid branch is only for a truly empty scene.
-    if (g_glVp && (s.engineReady || g_glVp->renderer().hasMesh())) {
+    // GL path whenever the pipeline exists: with no mesh the renderer still draws the studio
+    // background, which feeds the liquid-glass backdrop + luminance from FIRST LAUNCH (before,
+    // an empty scene fell back to a flat draw-list gradient and every panel lost its frost).
+    if (g_glVp) {
         if (!s.inSketch) tickCameraAnimation(s);
         else cancelCameraAnimation();
 
         renderViewport(s, vw, vh);
         live = r && r->hasMesh();
-        g_glVp->setBackdropEnabled(live);
+        g_glVp->setBackdropEnabled(true);  // frost from the studio bg even with no mesh
         publishBackdrop(a, b);
 
         if (live) {
@@ -571,16 +572,17 @@ void drawViewport(AppState& s) {
                 }
             }
         } else {
-            dl->AddRectFilledMultiColor(a, b, TCOL(viewport0), TCOL(viewport0), TCOL(viewport1), TCOL(viewport1));
-            float gs = 36.f * S;
-            ImU32 grid = theme::roleU32(theme::pal().line, 0.13f);
-            for (float x = a.x; x < b.x; x += gs) dl->AddLine(ImVec2(x, a.y), ImVec2(x, b.y), grid, 1.f);
-            for (float y = a.y; y < b.y; y += gs) dl->AddLine(ImVec2(a.x, y), ImVec2(b.x, y), grid, 1.f);
+            // Empty scene: the GL studio backdrop just rendered above — show it (glass panels
+            // frost over it) instead of the old flat draw-list gradient.
+            ImGui::Image((ImTextureID)(intptr_t)g_glVp->colorTextureId(), sz, ImVec2(0, 1), ImVec2(1, 0));
+            imgHovered = ImGui::IsItemHovered();
             const char* hint = s.engineReady ? "Building preview..." : "3D viewport  -  engine offline (demo mode)";
             ImVec2 ts = ImGui::CalcTextSize(hint);
-            dl->AddText(ImVec2((a.x + b.x) * 0.5f - ts.x * 0.5f, b.y - 28.f * S), TCOL(txt2), hint);
-            ImGui::InvisibleButton("##vp", sz);
-            imgHovered = ImGui::IsItemHovered();
+            const theme::AdaptiveSurface& hs =
+                theme::adaptivePanel(theme::panelId("vp_hint"),
+                                     ImRect(ImVec2(a.x, b.y - 40.f * S), b));
+            theme::glassText(dl, nullptr, ImGui::GetFontSize(),
+                             ImVec2((a.x + b.x) * 0.5f - ts.x * 0.5f, b.y - 28.f * S), hs, hint);
         }
     } else {
         dl->AddRectFilledMultiColor(a, b, TCOL(viewport0), TCOL(viewport0), TCOL(viewport1), TCOL(viewport1));

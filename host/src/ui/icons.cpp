@@ -2,6 +2,7 @@
 // Uses stb_image (already vendored via stb_impl.cpp).  nlohmann/json for atlas.json.
 // GOTCHA: never add host/src to the include path; use relative includes.
 #include "icons.h"
+#include "icons_sdf.h"
 
 #include <glad/gl.h>
 #include "imgui.h"
@@ -22,9 +23,9 @@ namespace ui {
 
 // --- internal types --------------------------------------------------------
 
-struct Cell {
-    float u0, v0, u1, v1;  // UV coords, 0..1
-};
+// UV rect within a raster atlas texture — shared layout with icons_sdf::CellUV (icons_sdf.cpp
+// samples pixel data from the same atlas.json cells to derive SDF glyphs).
+using Cell = icons_sdf::CellUV;
 
 struct AtlasState {
     GLuint texDark  = 0;
@@ -127,6 +128,9 @@ void loadIcons(const std::string& assetsDir) {
         unsigned char* px = stbi_load(path.c_str(), &w, &h, &ch, 4);
         if (px) {
             gAtlas.texDark = uploadTexture(px, w, h);
+            // SDF derivation reads the still-live pixel buffer (shape is theme-independent, so
+            // deriving once from the dark atlas covers both themes) — freed right after.
+            icons_sdf::build(px, w, h, gAtlas.cells);
             stbi_image_free(px);
         } else {
             std::fprintf(stderr, "[icons] failed to load atlas_dark.png: %s\n", stbi_failure_reason());
@@ -156,6 +160,7 @@ void loadIcons(const std::string& assetsDir) {
 }
 
 void freeIcons() {
+    icons_sdf::shutdown();
     if (gAtlas.texDark)        { glDeleteTextures(1, &gAtlas.texDark);        gAtlas.texDark = 0; }
     if (gAtlas.texLight)       { glDeleteTextures(1, &gAtlas.texLight);       gAtlas.texLight = 0; }
     if (gAtlas.texPlaceholder) { glDeleteTextures(1, &gAtlas.texPlaceholder); gAtlas.texPlaceholder = 0; }
@@ -212,6 +217,23 @@ IconUV getIcon(const char* name, int size) {
 void syncIconTheme() {
     // Nothing to precompute — getIcon() reads activeTheme each call.
     // This hook exists so callers can force a cache invalidation if needed in the future.
+}
+
+bool hasIconSdf(const char* name) {
+    return icons_sdf::has(name);
+}
+
+void drawIconGlass(ImDrawList* dl, const char* name, ImVec2 center, float sizePx, ImU32 col,
+                    ImU32 haloCol) {
+    if (icons_sdf::draw(dl, name, center, sizePx, col, haloCol)) return;
+
+    // Fallback: no SDF glyph (multi-color raster icon) — plain atlas draw, no halo. Cell-size
+    // pick mirrors the v2 icons::pickCellSize convention (ui/imgui/src/theme/icons.cpp).
+    const int cellSize = (sizePx >= 24.f) ? 32 : 20;
+    const IconUV ic = getIcon(name, cellSize);
+    const float r = sizePx * 0.5f;
+    dl->AddImage(ic.texId, ImVec2(center.x - r, center.y - r), ImVec2(center.x + r, center.y + r),
+                 ic.uv0, ic.uv1, col);
 }
 
 }  // namespace ui

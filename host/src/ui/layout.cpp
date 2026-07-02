@@ -124,6 +124,8 @@ static bool drawManagerTabButton(const char* id,
                                  const char* tip,
                                  bool selected,
                                  bool pmAttention,
+                                 const ui::AdaptiveSurface& surf,
+                                 ImU32 halo,
                                  float btn,
                                  float glyph) {
     const auto& pal = ui::palette;
@@ -148,19 +150,19 @@ static bool drawManagerTabButton(const char* id,
                     std::max(1.0f, 1.0f * S));
     }
 
+    // Liquid glass v2: rail-tab glyph tint tracks the pane's adaptive surface (max contrast
+    // over the frosted backdrop) instead of the raw palette; PM-attention keeps the semantic
+    // accent color. drawIconGlass adds the opposite-tone contrast halo (host contract §H4).
+    ImVec4 tint = selected ? surf.textPrimary : surf.textSecondary;
+    if (pmAttention && !selected) tint = roleColor(pal.accent);
     IconUV ic = getIcon(icon, 20);
     if (ic.valid) {
-        float ix = p0.x + (btn - glyph) * 0.5f;
-        float iy = p0.y + (btn - glyph) * 0.5f;
-        ImVec4 tint = selected ? roleColor(pal.text) : roleColor(pal.textDim);
-        if (pmAttention && !selected) tint = roleColor(pal.accent);
-        dl->AddImage(ic.texId, ImVec2(ix, iy), ImVec2(ix + glyph, iy + glyph),
-                     ic.uv0, ic.uv1, ImGui::ColorConvertFloat4ToU32(tint));
+        drawIconGlass(dl, icon, ImVec2(p0.x + btn * 0.5f, p0.y + btn * 0.5f), glyph,
+                     ImGui::ColorConvertFloat4ToU32(tint), halo);
     } else {
         ImVec2 ts = ImGui::CalcTextSize(fallback);
-        ImU32 tc = selected ? ui::Palette::toU32(pal.text) : ui::Palette::toU32(pal.textDim);
         dl->AddText(ImVec2(p0.x + (btn - ts.x) * 0.5f, p0.y + (btn - ts.y) * 0.5f),
-                    tc, fallback);
+                    ImGui::ColorConvertFloat4ToU32(tint), fallback);
     }
 
     if (pmAttention) {
@@ -182,7 +184,15 @@ static bool drawManagerTabButton(const char* id,
 void drawConfigurationsBody(AppState& st) {
     const auto& pal = ui::palette;
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
-    const ImVec4 dimCol(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1);
+    // Liquid glass v2: dim text over this over-viewport pane tracks the adaptive surface
+    // (host contract §H4); the surface is a cached idempotent-per-frame lookup (A2) of the SAME
+    // "host_left_glass" id drawLeftPane already painted this frame — no signature change needed
+    // since this function is a fixed layout.h entry point.
+    const ImVec2 cfgWp = ImGui::GetWindowPos(), cfgWs = ImGui::GetWindowSize();
+    const ImRect cfgRect(cfgWp, ImVec2(cfgWp.x + cfgWs.x, cfgWp.y + cfgWs.y));
+    const ui::AdaptiveSurface& cfgSurf =
+        ui::adaptivePanel(ui::panelId("host_left_glass"), cfgRect);
+    const ImVec4& dimCol = cfgSurf.textSecondary;
 
     ImGui::PushFont(st.fonts.medium);
     ImGui::TextColored(accentCol, "Configurations");
@@ -236,6 +246,23 @@ void drawLeftPane(AppState& st,
     const auto& pal = ui::palette;
     const float S = ui::uiScale;
 
+    // Liquid glass v2 (host contract §H4): paint the ONE UltraThin glass surface for the WHOLE
+    // pane (icon rail + body) right after Begin, before any content. feature_tree.cpp /
+    // file_explorer.cpp fetch this SAME surface via the SAME panelId ("host_left_glass") instead
+    // of painting their own background (idempotent per frame — A2). Adaptive max-contrast text
+    // for the whole pane body; popped before End().
+    const ImVec2 lpWp = ImGui::GetWindowPos();
+    const ImVec2 lpWs = ImGui::GetWindowSize();
+    const ImRect lpPaneRect(lpWp, ImVec2(lpWp.x + lpWs.x, lpWp.y + lpWs.y));
+    const ui::AdaptiveSurface& surf =
+        ui::adaptivePanel(ui::panelId("host_left_glass"), lpPaneRect);
+    ui::glassPanel(ImGui::GetWindowDrawList(), lpPaneRect, ui::GlassLevel::UltraThin, -1.f, surf);
+    const bool lpLive = ui::viewportBackdrop().valid();
+    const ImU32 lpHalo = lpLive
+        ? ImGui::ColorConvertFloat4ToU32(ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0x50 / 255.f))
+        : 0;
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+
     // True horizontal center of the WHOLE pane (icon rail + body), captured BEFORE the rail child so
     // the FeatureManager header can be centered across the full panel. Centering only within the body
     // (right of the rail) left the header sitting slightly left of the panel's true center.
@@ -282,7 +309,8 @@ void drawLeftPane(AppState& st,
         char idBuf[16];
         std::snprintf(idBuf, sizeof(idBuf), "%d", t.id);
         ImGui::SetCursorPosX(btnX);
-        if (drawManagerTabButton(idBuf, t.icon, t.fallback, t.tip, selected, attention, btn, glyph)) {
+        if (drawManagerTabButton(idBuf, t.icon, t.fallback, t.tip, selected, attention,
+                                 surf, lpHalo, btn, glyph)) {
             st.leftPaneTab = t.id;
             // Opening the Simulation manager reveals + fronts the Simulation ribbon toolbar so the
             // study tools are at hand the moment the user is in the simulation workspace.
@@ -354,7 +382,11 @@ void drawLeftPane(AppState& st,
     ui::glassRowAtCursor(4.0f, false, false, 6.0f);
     ImGui::SetCursorPosX(titleX);
     if (headIcon.valid) {
-        ImGui::Image(headIcon.texId, ImVec2(iconSz, iconSz), headIcon.uv0, headIcon.uv1);
+        ImVec2 hp0 = ImGui::GetCursorScreenPos();
+        ImGui::Dummy(ImVec2(iconSz, iconSz));
+        drawIconGlass(ImGui::GetWindowDrawList(), titleIcon,
+                     ImVec2(hp0.x + iconSz * 0.5f, hp0.y + iconSz * 0.5f), iconSz,
+                     ImGui::ColorConvertFloat4ToU32(surf.textPrimary), lpHalo);
         ImGui::SameLine(0, iconGap);
     }
     ImGui::PushFont(st.fonts.medium);
@@ -409,6 +441,7 @@ void drawLeftPane(AppState& st,
     ImGui::PopStyleVar(2);   // WindowPadding + ScrollbarSize pushed before the body child
     ImGui::PopStyleColor();  // ChildBg transparent
 
+    ImGui::PopStyleColor();  // surf.textPrimary pushed after Begin (liquid glass v2)
     ImGui::End();
 }
 

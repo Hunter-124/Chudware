@@ -55,6 +55,14 @@
 | Pillow (T-F5 direct dep) | MIT-CMU | photo ingestion downscale pipeline (engine.vision.ingest) | ok |
 | **pdfminer.six** (optional, T-F2 Pillar 8) | **MIT** | `engine/research/datasheet_fetch` PDF->markdown extraction | ok (**in-process, permissive**). **Optional + feature-detected** — NOT a hard dependency (not in `requirements.txt`); absence degrades to `{ok:false, reason:"no_pdf_tool"}`, CI stays green with no new dep. |
 | ~~PyMuPDF / pymupdf4llm~~ | ~~AGPL-3~~ | ~~PDF->markdown~~ | **EXCLUDED (T-F2)** — AGPL, never imported in-process. `datasheet_fetch` uses only the MIT extractor above. |
+| python-pptx (T-F14) | MIT | .pptx deliverables | ok |
+| python-docx (T-F14) | MIT | .docx deliverables | ok |
+| openpyxl (T-F14) | MIT | .xlsx deliverables (live formulas) | ok |
+| reportlab (T-F14) | BSD-3 | PDF reports + preview rendering | ok |
+| pypdfium2 (T-F14) | BSD-3 / Apache-2.0 | PDF → PNG preview raster | ok |
+| cairosvg (T-F14, optional) | LGPL-3.0 | best-effort SVG preview | ok (**import-only**, feature-detected, never bundled or required — LGPL dynamic posture per the Netgen precedent) |
+| pandoc (T-F14, optional) | GPL-2+ | markup conversion | **subprocess-only**, PATH-discovered, never bundled (mere aggregation — same isolation policy as ngspice) |
+| LibreOffice headless (T-F14, optional) | MPL-2.0 | office → PDF for `render_document` previews | **subprocess-only**, PATH-discovered, never bundled |
 
 Rules:
 - Adding any dependency requires a row here in the same change.

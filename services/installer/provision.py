@@ -41,9 +41,34 @@ def _req_hash() -> str:
 def _imports_ok(py: Path) -> bool:
     if not py.exists():
         return False
-    probe = "import build123d, pyvista, mcp, anthropic, openai"
+    # Includes the deliverables/1 in-process engines (contract §7): they are required deps, so a
+    # runtime missing python-pptx/docx/openpyxl/matplotlib/reportlab/pypdfium2 is NOT ready.
+    probe = ("import build123d, pyvista, mcp, anthropic, openai; "
+             "import pptx, docx, openpyxl, matplotlib, reportlab, pypdfium2")
     r = subprocess.run([str(py), "-c", probe], capture_output=True, text=True)
     return r.returncode == 0
+
+
+def converters_status() -> dict:
+    """Discover the OPTIONAL subprocess-only converters on PATH (contract §7) — never installs.
+
+    pandoc (GPL) and LibreOffice headless (MPL) are subprocess-only: discovered on PATH, never
+    bundled. Their absence is not an error — the deliverables tools degrade to a contract-shaped
+    ``{ok:false, reason:"converter_missing", hint:...}`` and CI passes without them. This helper
+    reports availability for the installer/host; it raises nothing.
+    """
+    lo = shutil.which("soffice") or shutil.which("libreoffice")
+    pandoc = shutil.which("pandoc")
+    return {
+        "libreoffice": {
+            "installed": bool(lo), "path": lo,
+            "hint": None if lo else "install libreoffice (office->PDF previews in render_document)",
+        },
+        "pandoc": {
+            "installed": bool(pandoc), "path": pandoc,
+            "hint": None if pandoc else "install pandoc (optional markup conversion)",
+        },
+    }
 
 
 def is_ready() -> bool:
@@ -145,7 +170,8 @@ def main(argv: list[str]) -> int:
     if args.check:
         print(json.dumps({"ready": is_ready(), "python": str(_venv_python()),
                           "exists": _venv_python().exists(),
-                          "imports_ok": _imports_ok(_venv_python())}, indent=2))
+                          "imports_ok": _imports_ok(_venv_python()),
+                          "converters": converters_status()}, indent=2))
         return 0
 
     res = ensure_runtime(args.base_python, args.wheelhouse, args.force)

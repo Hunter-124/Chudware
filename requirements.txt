@@ -33,3 +33,13 @@ httpx==0.28.1
 scikit-fem==12.0.2
 meshio==5.3.5
 pyamg==5.3.0
+# deliverables pack (contract deliverables/1) — spec-driven office artifacts. ALL in-process and
+# permissive per contracts/licenses.md §7; we wrap these and write no format parser. Subprocess-
+# only converters (pandoc GPL, LibreOffice headless MPL) are NOT pip deps — they are discovered on
+# PATH at runtime and degrade to {reason:"converter_missing"} when absent. NEVER PyMuPDF (AGPL).
+python-pptx==1.0.2          # MIT — .pptx decks
+python-docx==1.2.0          # MIT — .docx reports
+openpyxl==3.1.5             # MIT — .xlsx workbooks (live formulas)
+matplotlib==3.11.0          # PSF — charts/figures + csv/md preview rasterization
+reportlab==5.0.0            # BSD — direct PDF reports (in-process, no subprocess)
+pypdfium2==5.11.0           # BSD (pdfium) — PDF -> PNG page rasterization for previews

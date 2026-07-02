@@ -46,3 +46,16 @@ files don't even collect in mcp-venv), engine.paths.DATA AttributeError
 - [ ] Sweep-pollution top offenders identified with root causes
 - [ ] Proposed-task table for anything DEAD
 - [ ] `graphify update .` run
+
+## Progress log
+- 2026-07-02 22:50 UTC [sonnet-vega] REVIEW — branch task/T-V2-mcp-runtime-audit pushed.
+
+Deliverables: scripts/mcp_runtime_audit.py + work/audits/MCP_RUNTIME_AUDIT.md
+
+Key findings:
+- 182 tools registered, 0 DEAD (PyNite pattern does not currently exist — PyNiteFEA 1.0.1 and fluids 1.3.1 are installed)
+- 96 WORKS / 10 DEGRADED (graceful) / 69 INCONCLUSIVE (arg-fixture mismatch, tools are alive) / 7 SKIPPED (side-effect)
+- 21 of 29 requirements.txt packages absent from mcp-venv (build123d, OCP, anthropic, openai, pyvista, scikit-fem, python-pptx/docx, reportlab, etc.) — this is the real gap
+- 4 undeclared-but-installed deps: anyio, langgraph, pydantic, qrcode (all MIT)
+- 7 true pollution regressions (not ~29): primary cause is test_h7_shadow.py injecting sys.modules["services.agent.config"] stub at collection time; 2 secondary causes (module-load-time HAVE_FLUIDS/HAVE_KERNEL flags)
+- Proposed T-V3..T-V8 follow-up tasks in the audit doc

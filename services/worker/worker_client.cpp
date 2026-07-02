@@ -83,7 +83,12 @@ bool routeDocToCpp(const std::string& method, const json& params) {
         // doc) binds the call to a C++-backed document. A part/assembly carries a "doc-cpp"
         // id; a 2D DRAWING session (drawing_new / drawing_add_* / drawing_get / drawing_bom /
         // export_drawing) carries a "dwg-cpp" id — both route to the C++ core.
-        for (const char* key : {"doc_id", "into"}) {
+        // eval_compare (WS-C reverse-engineering: params {doc_a, doc_b, ...}, no "doc_id") is
+        // the one eval_* RPC that does NOT carry a plain "doc_id" -- without doc_a/doc_b here
+        // it would silently miss this C++-only RPC and fall through to the (nonexistent, in
+        // this RPC's case) Python doc path. eval_interference/eval_feature_overlap/
+        // doc_face_wires all use "doc_id" and are already covered by the generic sniff below.
+        for (const char* key : {"doc_id", "into", "doc_a", "doc_b"}) {
             auto it = params.find(key);
             if (it != params.end() && it->is_string()) {
                 const std::string v = it->get<std::string>();

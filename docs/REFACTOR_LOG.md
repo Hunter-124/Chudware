@@ -468,3 +468,73 @@ run correctly. **Tool-issue note:** the `edit` tool repeatedly rejected a `SWAP`
 returned the tag the edit claimed was current-invalid, with disk content verified byte-identical
 via `sed`/`md5sum`; worked around by patching the file directly through the `eval` `write()`
 helper (see the `report_tool_issue` call this session). No other files touched.
+
+### GNN-SCAFFOLD — gated GNN adapter scaffold, no training run (AI-experience wave, WS-D D3)
+Write-set: new `tools/gsl_gnn/{dataset.py,model.py,train.py,README.md,requirements.txt}` only.
+`dataset.py` walks `corpora/gsl_dataset/<family>/<seed>/{faces.json,adjacency.json,meta.json}`
+(layout confirmed against the already-generated corpus: `faces.json["matches"][i]` and
+`adjacency.json["faces"][i]` share the same `describe_faces()` enumeration order, so `edges[*]
+.between` indices join directly, no re-keying needed) and builds one PyTorch-Geometric `Data`
+per sample: 18-dim node features (`surf` one-hot over
+plane/cylinder/cone/sphere/torus/bspline/other, `area_or_len/diag²`, `log1p(radius or 0)`,
+`concavity` one-hot bore/boss/none, unit normal xyz, `centroid/diag` xyz; `diag` = bbox
+diagonal from `meta.json.bbox.size`), edges inserted both directions with `edge_attr =
+[convex, length/diag]`, and `y` from a deterministic sorted label vocab built across every
+`faces.json` under the root (`build_label_vocab`) — verified against the live corpus: 9
+classes (`bolt_circle, box, circular_pattern, cylinder, extrude, revolve, rib, shell, sweep`).
+`model.py` exposes `build_model(in_channels, num_classes, hidden_channels=128, dropout=0.2)`:
+3-layer GraphSAGE + ReLU + dropout + linear per-node head. `train.py` is a CLI
+(`--data/--epochs/--lr/--device/--out/--hidden/--dropout/--batch-size/--val-frac/--seed`)
+doing a family-stratified 80/20 split, cross-entropy, per-epoch train/val loss+accuracy
+printed to stdout, and writes `best.pt` (state_dict + label vocab + hyperparams) plus
+`confusion_matrix.{json,txt}` (no plotting dependency) under `--out`. Both `dataset.py` and
+`model.py` import `torch`/`torch_geometric` lazily inside functions (never at module scope),
+so all three modules `py_compile` clean and are importable with neither package installed;
+calling into any torch-requiring function without the deps raises a clear `ImportError`
+pointing at `requirements.txt` — verified live in this session (no torch/torch_geometric
+installed on this box): module import, `build_label_vocab`, and the pure-Python
+`_node_features`/`_bbox_diag` helpers all ran correctly against the real corpus (18-dim
+feature vectors, correct 9-class vocab), `train.py --help` printed normally, and both
+`load_samples(...)` and `build_model(...)` raised the intended `ImportError` instead of a
+bare `ModuleNotFoundError`. `requirements.txt` pins `torch>=2.2`/`torch-geometric>=2.5` with a
+comment noting CUDA wheel choice is user-side. README.md states the hard gate verbatim-in-
+spirit (train only for classes `docs/RECOGNITION_RESIDUAL.md` flags as median match_pct <
+90% or faces-claimed < 70%; output feeds a templated caption head only, never free-form
+numbers; never suppresses/replaces the raw face list; no soft-token/vision adapter per
+`GEOMETRY_LLM_REPRESENTATION_REVIEW.md` §3.6; engine-inference wiring is a separate later
+decision), plus setup/run commands and the `tools/gsl_dataset_gen.py --count 50` corpus
+regeneration pointer. No training run performed, no packages installed, no other files
+touched, git untouched.
+
+### TESTS-CORE — ctest coverage for eval_feature_overlap/eval_compare/interference params (AI-experience wave, WS-B B5-core)
+Write-set: new `core/tests/test_interference.cpp`; appended one test-target block to
+`core/CMakeLists.txt` (after `test_mirror`, inside the existing `if(AICAD_WITH_OCCT)` region,
+registering `add_test(NAME interference ...)`). Unlike `test_document.cpp`/`test_mirror.cpp`
+this file never touches the host AICM loader — every case calls `doc_new`/`doc_apply_ops`/
+`doc_eval_interference`/`doc_eval_feature_overlap`/`doc_eval_compare` (`core/doc/session.h`)
+directly and asserts on the returned JSON, so the target links only `aicad_doc`/
+`aicad_geom_occt`/`aicad_sketch`/`aicad_geom` with no OCCT include dir or render sources.
+Geometry is built entirely from primitive `box`/`cylinder` features placed via
+`params.at`+`params.centered:false` (corner/base-center convention, confirmed by reading
+`document.cpp`'s primitive branch) so every expected volume is closed-form exact, not a
+tolerance guess. 8 `TEST_CASE`s / 47 assertions, all real (verified with `--success`, no
+vacuous empty-loop checks): (1) a `copy:true` transform of a box gives two disjoint-body
+overlap of exactly 4000 mm³, asserted at 1e-6 relative tolerance via `eval_interference`;
+(2) base+boss+engulfing-cut → `eval_feature_overlap` reports `ok:false` with a
+`boss_swallowed(boss,cut)` pair and the boss id in `dead_features` (also incidentally
+surfaces a `boss_overlap(base,boss)` and `cut_into_boss(base,cut)` pair — expected, not
+asserted against); (3) two overlapping cylinder cuts into one plate → a `cut_overlap` pair
+with positive volume; (4) two 100mm-apart boxes (`merge:false`) → zero pairs, `ok:true`;
+(5) `eval_compare` on identical geometry in two independently-built docs → match_pct ≥
+99.5% (actual 100.0), empty `residual_regions`; a 10mm-translated copy of the same box →
+match_pct 66.67% (< 90), with ≥1 `missing` and ≥1 `extra` residual region, both positive
+volume; (6) two flush-stacked boxes (`merge:false`, zero gap) show no `contacts` entry by
+default but one at distance ~0 with `include_coincident:true`, and separately a 0.05mm gap
+is tagged `"warning":"below min clearance"` under `min_clearance_mm:0.1`. Feature ids used
+in assertions are read back from `doc_apply_ops`'s `rebuild.feature_status[i].id` (never
+assumed/hardcoded — `add_feature` ids are engine-assigned `f1,f2,...` regardless of any
+client-supplied `id`). Verified: `cmake --build core/build-linux -j12` clean (incremental
+no-op on the second run, zero errors), `ctest --test-dir core/build-linux -R interference
+--output-on-failure` → `1/1 Test #36: interference ... Passed` (100% tests passed). Full
+suite (`ctest` unfiltered) intentionally NOT run per the assignment's scope. No files
+outside the stated write-set touched; no git commands run.

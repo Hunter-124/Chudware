@@ -1056,6 +1056,25 @@ if(AICAD_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(mirror PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- B5: ctest coverage for eval_interference's B4 params (include_coincident /
+  # min_clearance_mm), doc_eval_feature_overlap (B2 intra-part tool-solid overlap: boss_
+  # swallowed/cut_overlap/dead_features), and doc_eval_compare (C1 shape-vs-shape match_pct
+  # + residual_regions). Calls doc_new/doc_apply_ops/doc_eval_* directly on primitive box/
+  # cylinder features and asserts on the returned JSON -- no host AICM loader needed (no
+  # mesh parsing here, unlike test_document/test_mirror/test_hole), so this target skips
+  # the render include path and the aicm_loader.cpp source.
+  add_executable(test_interference
+    tests/test_interference.cpp)
+  target_include_directories(test_interference PRIVATE
+    ${doctest_SOURCE_DIR})
+  target_link_libraries(test_interference PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_interference PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME interference COMMAND test_interference)
+  # Same OCCT DLL PATH prepend so the test can load TKernel et al.
+  set_tests_properties(interference PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- A5: hole feature compiler — drill simple/cbore/csink bores into a body ---
   # core/doc/document.cpp's hole branch drills hole(s) at position(s) on a FACE-
   # SELECTOR-resolved planar face, building a cylinder/cbore/csink tool per position

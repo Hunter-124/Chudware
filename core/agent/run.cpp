@@ -1121,39 +1121,49 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     const int ctx_cap = cb.input_cap;
     RunEvents events(run_id, emit);
 
-    // 1) Decompose the request into an ordered task list (one mission_planner call). On any
-    //    parse failure / offline provider this degrades to a single design task, so a plain
-    //    "make a bracket" still builds exactly as before.
-    DesignState mstate;
-    mstate.request = request;
-    mstate.doc_id = doc_id;
-    AgentCall ma =
-        agent_call(provider, mstate, "mission_planner", prompts_dir, budget, false, ctx_cap);
-    ojson plan = extract_json_obj(ma.reply);
-
+    // 1) Decompose the request into an ordered task list. Normally this costs one
+    //    mission_planner call; on any parse failure / offline provider it degrades to a
+    //    single design task, so a plain "make a bracket" still builds exactly as before.
+    //    E4 (AI-experience plan): an explicit options.capability lets a caller (the in-app
+    //    Copilot "Reverse-engineer import" chip) route straight to one capability without
+    //    depending on the mission_planner prompt recognizing wording it was never taught
+    //    about (that prompt template is outside this node's write-set) -- deterministic
+    //    instead of hoping an LLM infers "reverse_engineer" from prose.
     struct Task {
         std::string capability, title, req, target;
     };
-    static const std::set<std::string> kCaps = {"design",       "assembly", "simulate_flow",
-                                                "simulate_fea", "drawing",  "evaluate",
-                                                "report"};
+    static const std::set<std::string> kCaps = {
+        "design",  "assembly", "simulate_flow", "simulate_fea",
+        "drawing", "evaluate", "report",        "reverse_engineer"};
     std::vector<Task> tasks;
-    if (!plan.is_null() && plan.is_object() && plan.contains("tasks") && plan["tasks"].is_array()) {
-        for (const auto& t : plan["tasks"]) {
-            if (!t.is_object()) continue;
-            Task tk;
-            tk.capability = t.value("capability", std::string());
-            tk.title = t.value("title", std::string());
-            tk.req = t.value("request", std::string());
-            tk.target = t.value("target", std::string("previous"));
-            if (tk.capability.empty()) continue;
-            if (tk.req.empty()) tk.req = request;  // defensive: hand the modeler something
-            tasks.push_back(std::move(tk));
-            if (tasks.size() >= 8) break;  // hard cap (planner is asked for <=6)
+    const std::string capability_override = options.value("capability", std::string());
+    if (!capability_override.empty() && kCaps.count(capability_override)) {
+        tasks.push_back(Task{capability_override, "Reverse-engineer import", request, "active"});
+    } else {
+        DesignState mstate;
+        mstate.request = request;
+        mstate.doc_id = doc_id;
+        AgentCall ma =
+            agent_call(provider, mstate, "mission_planner", prompts_dir, budget, false, ctx_cap);
+        ojson plan = extract_json_obj(ma.reply);
+        if (!plan.is_null() && plan.is_object() && plan.contains("tasks") &&
+            plan["tasks"].is_array()) {
+            for (const auto& t : plan["tasks"]) {
+                if (!t.is_object()) continue;
+                Task tk;
+                tk.capability = t.value("capability", std::string());
+                tk.title = t.value("title", std::string());
+                tk.req = t.value("request", std::string());
+                tk.target = t.value("target", std::string("previous"));
+                if (tk.capability.empty()) continue;
+                if (tk.req.empty()) tk.req = request;  // defensive: hand the modeler something
+                tasks.push_back(std::move(tk));
+                if (tasks.size() >= 8) break;  // hard cap (planner is asked for <=6)
+            }
         }
+        if (tasks.empty())
+            tasks.push_back(Task{"design", "Build the model", request, "active"});
     }
-    if (tasks.empty())
-        tasks.push_back(Task{"design", "Build the model", request, "active"});
 
     json task_list = json::array();
     for (const auto& tk : tasks)
@@ -1175,6 +1185,7 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
     ojson sim_results = ojson::array();
     std::string design_summary;
     std::string verdict;
+    json re_report = json::object();  // populated by the "reverse_engineer" capability
     json task_results = json::array();
 
     for (size_t i = 0; i < tasks.size(); ++i) {
@@ -1228,6 +1239,76 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
             reported = true;
             status = "done";
             summary = verdict;
+        } else if (tk.capability == "reverse_engineer") {
+            // WS-E E4 (AI-experience plan): keep the import doc (target_doc) as a READ-ONLY
+            // reference, build the reconstruction into a fresh doc, then verify with the real
+            // doc_eval_compare geometric comparison and surface match_pct in both the task
+            // summary and a dedicated event.
+            //
+            // FALLBACK TAKEN (pre-decided in the plan): full per-stage plumbing would mean
+            // threading compare feedback into the reviewer/fixer BuiltContext at EVERY
+            // modeler/review/fix iteration inside run_design's ~500-line stage loop -- a loop
+            // shared with "design"/"assembly", and whose prompt templates (reviewer.md/
+            // fixer.md, under services/agent/prompts/) would need to learn to read an injected
+            // compare block. Both are outside this node's write-set and out of proportion for
+            // one capability branch. Instead: run the normal design loop once into a new doc
+            // (a real, not per-stage, verification pass), compare with the reference via the
+            // actual eval_compare RPC (never a canned number), and hand back one explicit
+            // follow-up instruction so a second copilot turn can close any residual gap via its
+            // normal add_features / eval_compare op path.
+            const std::string ref_doc = target_doc;
+            std::string new_doc_id;
+            try {
+                json nd = doc::doc_new("part", "Reverse-Engineered");
+                new_doc_id = nd.value("doc_id", std::string());
+            } catch (const std::exception& e) {
+                summary = std::string("could not create reconstruction doc: ") + e.what();
+            } catch (...) {
+                summary = "could not create reconstruction doc";
+            }
+            if (!new_doc_id.empty()) {
+                const std::string augmented =
+                    tk.req +
+                    "\n\nDocument " + ref_doc + " holds the ORIGINAL imported body — it is a "
+                    "READ-ONLY reference; never edit it. You are building INTO this new, empty "
+                    "document instead. Reproduce the reference geometry as a normal parametric "
+                    "feature tree (sketches, extrudes, holes, fillets, patterns, ...), not a "
+                    "single dumb import.";
+                json sub_opts = options;
+                sub_opts["run_id"] = run_id + "-t" + std::to_string(i);
+                json rr = run_assembly_design(augmented, new_doc_id, provider_cfg, emit, sub_opts);
+                status = rr.value("status", std::string("done"));
+                summary = rr.value("stop_reason", std::string());
+                current_doc = rr.value("doc_id", new_doc_id);
+                final_doc = current_doc;
+                revision = rr.value("revision", revision);
+                if (status == "done") {
+                    any_built = true;
+                    design_summary = doc_design_summary(current_doc);
+                }
+                try {
+                    json cmp = doc::doc_eval_compare(json{{"doc_a", current_doc}, {"doc_b", ref_doc}});
+                    re_report = json{{"new_doc_id", current_doc}, {"ref_doc_id", ref_doc},
+                                     {"compare", cmp}};
+                    events.emit("reverse_engineer_compare", re_report);
+                    if (cmp.value("degraded", false)) {
+                        summary += " | compare degraded (near-identical geometry defeated the "
+                                   "boolean); volume_ratio=" +
+                                   std::to_string(cmp.value("volume_ratio", 0.0));
+                    } else {
+                        const double pct = cmp.value("match_pct", 0.0);
+                        summary += " | match_pct=" + std::to_string(pct);
+                        if (pct < 99.0)
+                            summary += " — residual remains; iterate with add_features on " +
+                                       current_doc + " and re-check via eval_compare(" +
+                                       current_doc + ", " + ref_doc + ").";
+                    }
+                } catch (const std::exception& e) {
+                    summary += std::string(" | compare failed: ") + e.what();
+                } catch (...) {
+                    summary += " | compare failed";
+                }
+            }
         } else {
             // simulate_fea / drawing / evaluate — recognized but not yet executed here.
             summary = "capability '" + tk.capability + "' is not yet wired into missions";
@@ -1270,6 +1351,7 @@ json run_mission(const std::string& request, const std::string& doc_id, const js
         if (!asm_path.empty()) result["asm_path"] = asm_path;
         result["components"] = components;
     }
+    if (!re_report.empty()) result["reverse_engineer"] = re_report;
     return result;
 }
 

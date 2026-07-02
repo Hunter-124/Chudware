@@ -2,8 +2,8 @@
 id: T-E5
 title: Oil-hydraulic circuit design (ISO 1219)
 workstream: E
-owner: unassigned
-status: todo
+owner: sonnet-lux
+status: doing
 branch: task/T-E5-hydraulic-power
 day: 9
 depends_on: [T-E3]

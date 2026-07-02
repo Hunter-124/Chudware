@@ -3,7 +3,7 @@ id: T-G5
 title: GUI migration wave 1 - foundation libs (F1-F4 + G1 gate)
 workstream: G
 owner: opus-vale
-status: doing
+status: review
 branch: task/T-G5-migration-wave1
 day: 6
 depends_on: [T-G1]

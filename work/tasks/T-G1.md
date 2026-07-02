@@ -3,11 +3,13 @@ id: T-G1
 title: Land the uncommitted GUI working tree in scoped commits
 workstream: G
 owner: main-checkout
-status: todo
+status: done
 branch: task/T-G1-land-gui-tree
 day: 1
 depends_on: []
 ---
+
+> **Landed 2026-07-02 by direct user approval (session): commits ac45df9 + 7a61230; m1 reopen TREE MISMATCH filed separately.**
 
 ## Context
 

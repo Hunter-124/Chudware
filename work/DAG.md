@@ -66,7 +66,7 @@ graph TD
     T_F9["T-F9: Providers contract, tool registry/allow-listing, session-auth spike"]:::todo
   end
   subgraph WS_G["workstream G"]
-    T_G1["T-G1: Land the uncommitted GUI working tree in scoped commits"]:::todo
+    T_G1["T-G1: Land the uncommitted GUI working tree in scoped commits"]:::done
     T_G10["T-G10: ShopCraft rename tiers 2+3 - build targets, env vars, MCP id, appdata"]:::todo
     T_G11["T-G11: Windows build verify, then delete host/ and all deprecated GUI code"]:::todo
     T_G12["T-G12: Human UI walkthrough - element-by-element feedback checklist"]:::todo
@@ -100,7 +100,7 @@ graph TD
   end
   subgraph WS_setup["workstream setup"]
     T_S1["T-S1: Apply for vendor API keys"]:::todo
-    T_S2["T-S2: Land the AI-experience lane (recon/GSL) uncommitted files"]:::todo
+    T_S2["T-S2: Land the AI-experience lane (recon/GSL) uncommitted files"]:::done
   end
   T_S1 --> T_A1
   T_A1 --> T_A2

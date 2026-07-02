@@ -3,7 +3,7 @@ id: T-F5
 title: Image ingestion v1 - real files, provider image slots, fiducial metrology
 workstream: F
 owner: opus-sage
-status: doing
+status: review
 branch: task/T-F5-image-ingestion
 day: 7
 depends_on: []

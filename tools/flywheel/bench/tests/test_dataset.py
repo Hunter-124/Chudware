@@ -40,6 +40,15 @@ def test_freeze_verify_roundtrip(tmp_path):
     assert loaded.verify()
 
 
+def test_hash_is_eol_invariant_for_text(tmp_path):
+    # The cross-OS DoD: a CRLF checkout (Windows autocrlf) must hash identically to LF.
+    root = _mk(tmp_path, {"document.json": '{"a": 1}\n{"b": 2}\n'})
+    h_lf = content_hash(root)
+    (tmp_path / "document.json").write_bytes(b'{"a": 1}\r\n{"b": 2}\r\n')
+    h_crlf = content_hash(root)
+    assert h_lf == h_crlf
+
+
 def test_verify_detects_tampering(tmp_path):
     root = _mk(tmp_path, {"a.json": "1"})
     spec = DatasetSpec.freeze("t", root)

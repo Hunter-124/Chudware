@@ -38,12 +38,28 @@ def _iter_files(root: str, ignore: frozenset[str]) -> list[str]:
     return out
 
 
+# Text member extensions get their line endings normalized to LF before hashing, so a
+# git checkout that applies CRLF conversion on Windows (autocrlf) yields the SAME hash as
+# a Linux checkout — the exact property the "reproducible on a second OS" DoD tests.
+# Binary members (renders, STEP, glTF) are hashed raw. `.gitattributes` in the corpus
+# dirs is the belt to this suspenders (forces `-text` so git stores bytes verbatim).
+_TEXT_EXTS = frozenset({".json", ".jsonl", ".txt", ".md", ".csv", ".req", ".yaml", ".yml"})
+
+
+def _member_digest_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        data = f.read()
+    if os.path.splitext(path)[1].lower() in _TEXT_EXTS:
+        data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return data
+
+
 def content_hash(root: str, *, algo: str = "sha256",
                  ignore: frozenset[str] = frozenset({MANIFEST_NAME})) -> str:
-    """Deterministic hash of a directory tree: relative-path + bytes of each file.
+    """Deterministic hash of a directory tree: relative-path + normalized bytes of each file.
 
-    Path separators are normalized to '/' so the hash is OS-independent. Files named in
-    `ignore` (the frozen manifest by default) are skipped.
+    Path separators are normalized to '/' and text-member line endings to LF so the hash
+    is OS-independent. Files named in `ignore` (the frozen manifest by default) are skipped.
     """
     h = hashlib.new(algo)
     root = os.path.abspath(root)
@@ -51,9 +67,7 @@ def content_hash(root: str, *, algo: str = "sha256",
         rel = os.path.relpath(path, root).replace(os.sep, "/")
         h.update(rel.encode("utf-8"))
         h.update(b"\0")
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
+        h.update(_member_digest_bytes(path))
         h.update(b"\0")
     return f"{algo}:{h.hexdigest()}"
 

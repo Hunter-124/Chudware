@@ -15,6 +15,11 @@ see who holds what.
    - Output `NOTHING-TO-CLAIM` → run `python3 work/tools/work.py board`, report to the
      user what is in flight and by whom, which tasks are blocked on unmerged review
      branches, and any open files in work/questions/ — then STOP.
+   - PRIORITY POLICY (Erik, 2026-07-02): humans are the bottleneck. In EVERY summary
+     (claim, stop, or nothing-to-claim), list the human-blocked queue first: tasks
+     owned `main-checkout`, human-owned todo roots (e.g. T-S1), and review branches
+     awaiting merge. Day-numbers already encode "platform sprint before workstream F"
+     — never claim out of day order to work on something more interesting.
 2. `python3 work/tools/work.py prompt T-XX` — read the emitted work order and follow
    it exactly (worktree on the printed branch, driver rules, escalation protocol,
    DoD). Skip its claim step — you already claimed. Claiming happened on master, so

@@ -5,7 +5,7 @@ workstream: F
 owner: unassigned
 status: todo
 branch: task/T-F6-photogrammetry
-day: 6
+day: 10
 depends_on: [T-F5]
 ---
 

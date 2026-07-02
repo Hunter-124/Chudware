@@ -5,7 +5,7 @@ workstream: F
 owner: unassigned
 status: todo
 branch: task/T-F3-interaction-contract
-day: 3
+day: 7
 depends_on: []
 ---
 

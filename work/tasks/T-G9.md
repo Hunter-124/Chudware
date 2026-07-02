@@ -34,6 +34,10 @@ is the production GUI on Linux; `host/` survives only until T-G11's Windows chec
    the "final human-eye screenshot pass" debt from `HANDOFF_GUI_OVERHAUL.md` §5.3 — plus
    the ~10-minute manual interactive pass: resize hit-zones, PM slider ctrl-click, chip
    firing).
+3b. ELEMENT-BY-ELEMENT HUMAN WALKTHROUGH (Erik, mandatory before cutover): re-run the
+   T-G12 inventory checklist against the NEW binary — every ribbon button, PM form,
+   settings option, panel, and dialog gets a human keep/fix verdict. Unresolved
+   must-fix rows block G5.
 4. G5: retarget the audits, flip gate.sh to build+smoke AI-CAD2 as primary, note host
    EOL in AGENTS.md and host/DEPRECATED.md (criteria 1-4 there must all be green).
 
@@ -41,6 +45,7 @@ is the production GUI on Linux; `host/` survives only until T-G11's Windows chec
 
 - [ ] gui_lint theme clean; no over-viewport surface off the adaptive-glass API
 - [ ] 21/21 scenario pairs signed off; interactive manual pass done
+- [ ] T-G12 checklist re-run on the new binary by a human; zero unresolved must-fix rows
 - [ ] host/DEPRECATED.md deletion criteria 1-4 all green
 - [ ] `bash scripts/gate.sh` green scanning the new tree; `graphify update .` run
 

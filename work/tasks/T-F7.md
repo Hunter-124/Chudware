@@ -5,7 +5,7 @@ workstream: F
 owner: unassigned
 status: todo
 branch: task/T-F7-narration-core
-day: 2
+day: 6
 depends_on: []
 ---
 

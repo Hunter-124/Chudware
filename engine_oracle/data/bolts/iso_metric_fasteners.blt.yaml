@@ -1,0 +1,102 @@
+# Clean-room ISO/DIN metric fastener nominal dimensions (mm).
+# Source: agent/prompts/shared/cheatsheets/hardware.md + core/parts/parts_data.h
+# (published dimensional standards; NOT copied from BOLTS GPL data). See README.md.
+collection: iso_metric_fasteners
+
+standards:
+  - id: "ISO 4762"
+    name: "Socket Head Cap Screw"
+    family: shcs
+    kind: fastener
+    needs_length: true
+    aliases: ["DIN 912", "SHCS"]
+    sizes:
+      "M1.6": {d: 1.6, pitch: 0.35, head_d: 3.0,  head_h: 1.6,  hex_key: 1.5}
+      "M2":   {d: 2.0, pitch: 0.40, head_d: 3.8,  head_h: 2.0,  hex_key: 1.5}
+      "M2.5": {d: 2.5, pitch: 0.45, head_d: 4.5,  head_h: 2.5,  hex_key: 2.0}
+      "M3":   {d: 3.0, pitch: 0.50, head_d: 5.5,  head_h: 3.0,  hex_key: 2.5}
+      "M4":   {d: 4.0, pitch: 0.70, head_d: 7.0,  head_h: 4.0,  hex_key: 3.0}
+      "M5":   {d: 5.0, pitch: 0.80, head_d: 8.5,  head_h: 5.0,  hex_key: 4.0}
+      "M6":   {d: 6.0, pitch: 1.00, head_d: 10.0, head_h: 6.0,  hex_key: 5.0}
+      "M8":   {d: 8.0, pitch: 1.25, head_d: 13.0, head_h: 8.0,  hex_key: 6.0}
+      "M10":  {d: 10.0, pitch: 1.50, head_d: 16.0, head_h: 10.0, hex_key: 8.0}
+      "M12":  {d: 12.0, pitch: 1.75, head_d: 18.0, head_h: 12.0, hex_key: 10.0}
+
+  - id: "ISO 7380"
+    name: "Button Head Cap Screw"
+    family: bhcs
+    kind: fastener
+    needs_length: true
+    aliases: ["BHCS"]
+    sizes:
+      "M2":   {d: 2.0, pitch: 0.40, head_d: 3.8,  head_h: 1.3}
+      "M2.5": {d: 2.5, pitch: 0.45, head_d: 4.7,  head_h: 1.5}
+      "M3":   {d: 3.0, pitch: 0.50, head_d: 5.7,  head_h: 1.65}
+      "M4":   {d: 4.0, pitch: 0.70, head_d: 7.6,  head_h: 2.2}
+      "M5":   {d: 5.0, pitch: 0.80, head_d: 9.5,  head_h: 2.75}
+      "M6":   {d: 6.0, pitch: 1.00, head_d: 10.5, head_h: 3.3}
+      "M8":   {d: 8.0, pitch: 1.25, head_d: 14.0, head_h: 4.4}
+      "M10":  {d: 10.0, pitch: 1.50, head_d: 17.5, head_h: 5.5}
+
+  - id: "ISO 10642"
+    name: "Flat Head Cap Screw"
+    family: fhcs
+    kind: fastener
+    needs_length: true
+    aliases: ["DIN 7991", "FHCS"]
+    sizes:
+      "M2.5": {d: 2.5, pitch: 0.45, head_d: 5.5}
+      "M3":   {d: 3.0, pitch: 0.50, head_d: 6.3}
+      "M4":   {d: 4.0, pitch: 0.70, head_d: 8.4}
+      "M5":   {d: 5.0, pitch: 0.80, head_d: 10.4}
+      "M6":   {d: 6.0, pitch: 1.00, head_d: 12.6}
+      "M8":   {d: 8.0, pitch: 1.25, head_d: 17.3}
+
+  - id: "ISO 4017"
+    name: "Hex Head Bolt"
+    family: hex_bolt
+    kind: fastener
+    needs_length: true
+    aliases: ["ISO 4014", "HHCS"]
+    sizes:
+      "M3":  {d: 3.0, pitch: 0.50, af: 5.5}
+      "M4":  {d: 4.0, pitch: 0.70, af: 7.0}
+      "M5":  {d: 5.0, pitch: 0.80, af: 8.0}
+      "M6":  {d: 6.0, pitch: 1.00, af: 10.0}
+      "M8":  {d: 8.0, pitch: 1.25, af: 13.0}
+      "M10": {d: 10.0, pitch: 1.50, af: 16.0}
+      "M12": {d: 12.0, pitch: 1.75, af: 18.0}
+
+  - id: "ISO 4032"
+    name: "Hex Nut"
+    family: hex_nut
+    kind: fastener
+    needs_length: false
+    aliases: ["DIN 934"]
+    sizes:
+      "M2":   {d: 2.0, pitch: 0.40, af: 4.0,  thickness: 1.6}
+      "M2.5": {d: 2.5, pitch: 0.45, af: 5.0,  thickness: 2.0}
+      "M3":   {d: 3.0, pitch: 0.50, af: 5.5,  thickness: 2.4}
+      "M4":   {d: 4.0, pitch: 0.70, af: 7.0,  thickness: 3.2}
+      "M5":   {d: 5.0, pitch: 0.80, af: 8.0,  thickness: 4.0}
+      "M6":   {d: 6.0, pitch: 1.00, af: 10.0, thickness: 5.0}
+      "M8":   {d: 8.0, pitch: 1.25, af: 13.0, thickness: 6.5}
+      "M10":  {d: 10.0, pitch: 1.50, af: 16.0, thickness: 8.0}
+      "M12":  {d: 12.0, pitch: 1.75, af: 18.0, thickness: 10.0}
+
+  - id: "ISO 7089"
+    name: "Flat Washer"
+    family: washer_flat
+    kind: fastener
+    needs_length: false
+    aliases: ["DIN 125"]
+    sizes:
+      "M2":   {inner_d: 2.2,  outer_d: 5.5,  thickness: 0.3}
+      "M2.5": {inner_d: 2.7,  outer_d: 6.0,  thickness: 0.5}
+      "M3":   {inner_d: 3.2,  outer_d: 7.0,  thickness: 0.5}
+      "M4":   {inner_d: 4.3,  outer_d: 9.0,  thickness: 0.8}
+      "M5":   {inner_d: 5.3,  outer_d: 10.0, thickness: 1.0}
+      "M6":   {inner_d: 6.4,  outer_d: 12.0, thickness: 1.6}
+      "M8":   {inner_d: 8.4,  outer_d: 16.0, thickness: 1.6}
+      "M10":  {inner_d: 10.5, outer_d: 20.0, thickness: 2.0}
+      "M12":  {inner_d: 13.0, outer_d: 24.0, thickness: 2.5}

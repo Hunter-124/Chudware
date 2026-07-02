@@ -1,0 +1,28 @@
+# Clean-room deep-groove ball bearing envelopes (bore x OD x width, mm).
+# Source: agent/prompts/shared/cheatsheets/hardware.md + core/parts/parts_data.h
+# (ISO 15 dimensional standard; NOT copied from BOLTS GPL data). See README.md.
+collection: bearings
+
+standards:
+  - id: "ISO 15"
+    name: "Deep-Groove Ball Bearing"
+    family: bearing
+    kind: bearing
+    needs_length: false
+    aliases: ["deep groove", "ball bearing"]
+    sizes:
+      "623":  {bore: 3.0,  outer_d: 10.0, width: 4.0}
+      "624":  {bore: 4.0,  outer_d: 13.0, width: 5.0}
+      "625":  {bore: 5.0,  outer_d: 16.0, width: 5.0}
+      "626":  {bore: 6.0,  outer_d: 19.0, width: 6.0}
+      "608":  {bore: 8.0,  outer_d: 22.0, width: 7.0}
+      "6000": {bore: 10.0, outer_d: 26.0, width: 8.0}
+      "6001": {bore: 12.0, outer_d: 28.0, width: 8.0}
+      "6002": {bore: 15.0, outer_d: 32.0, width: 9.0}
+      "6003": {bore: 17.0, outer_d: 35.0, width: 10.0}
+      "6004": {bore: 20.0, outer_d: 42.0, width: 12.0}
+      "6800": {bore: 10.0, outer_d: 19.0, width: 5.0}
+      "6801": {bore: 12.0, outer_d: 21.0, width: 5.0}
+      "6802": {bore: 15.0, outer_d: 24.0, width: 5.0}
+      "6900": {bore: 10.0, outer_d: 22.0, width: 6.0}
+      "6901": {bore: 12.0, outer_d: 24.0, width: 6.0}

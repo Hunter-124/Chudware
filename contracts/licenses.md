@@ -51,6 +51,8 @@
 | pyamg (M6, optional) | MIT | AMG preconditioner | ok |
 | **python-solvespace** (optional backend) | **GPL-3** | sketch solver alternative | **NOT bundled by default**; in-house `nsolve` is primary. If a user enables it, it installs into their runtime venv on demand with a license notice |
 | numba (optional, M7 perf) | BSD-2 | LBM JIT | ok if added |
+| **BOLTS** (boltsparts) | **GPL-3.0** | standard-part spec reference | **NEVER vendored or linked** (T-B4). Same clean-room posture as KiCad: we learn the `.blt` *format* (documented → interop) and reimplement; no BOLTS data or code enters the tree. A user may point our loader at their own BOLTS checkout (their license, their choice). |
+| clean-room ISO/DIN part tables (`engine_oracle/data/bolts/*.blt.yaml`) | project (dimensional data) | deterministic spec-sheet lookup (T-B4) | ok — published ISO/DIN **nominal dimensions are not copyrightable** (same posture as the IPC-7351 row below); transcribed from our own `agent/prompts/shared/cheatsheets/hardware.md` + `core/parts/parts_data.h`, NOT from BOLTS. GPL-clean. |
 
 Rules:
 - Adding any dependency requires a row here in the same change.

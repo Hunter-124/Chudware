@@ -43,3 +43,6 @@ workaround every agent types by hand:
 - [ ] core_bridge finds core/build-linux/bin/libaicad.so without the env var
 - [ ] Issue #6 closed with the root-cause writeup
 - [ ] `graphify update .` run
+
+## Progress log
+- 2026-07-02 22:38 UTC [sonnet-orin] Gate stage 4 fixed and verified. bash scripts/gate.sh → RESULT: PASS. 1636 collected/1581 passed. Branch task/T-INF1-gate-pytest pushed. GH issue #6 closed with root-cause writeup. Ready for merge.

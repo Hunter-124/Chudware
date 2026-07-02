@@ -10,6 +10,7 @@
 #include "ui/scaffold_demo_panel.h"
 #include "ui/parts_panel.h"
 #include "ui/cam_panel.h"            // T-U3 CAM workspace (AI_CAD_SHOT=cam_workspace)
+#include "ui/bom_panel.h"
 #include "artifact_view.h"
 #include "app/app_state.h"
 #include "viewport/scene.h"
@@ -223,6 +224,7 @@ int ShotConfig::captureFrameBudget() const {
     if (wantFea && !feaShotDone) return 999999;
     if (wantCam && !camShotDone) return 999999;
     if (wantEcad && !ecadShotDone) return 150;
+    if (wantBom && !bomShotDone) return 150;
     if (wantTree) return treeShotDone ? 10 : 30;
     if (wantEquations) return equationsShotDone ? 10 : 30;
     if (wantPartsBrowser) return partsBrowserShotDone ? 10 : 30;
@@ -269,6 +271,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantPreview = eq("preview");
     cfg.wantScaffoldDemo  = eq("scaffold_demo");
     cfg.wantPartsBrowser  = eq("parts_browser");
+    cfg.wantBom          = eq("bom");
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
@@ -315,6 +318,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantPartsBrowser)  ui::openPartsPanel();
     cfg.wantCamWorkspace = eq("cam_workspace");
     if (cfg.wantCamWorkspace) ui::openCamWorkspacePanel();
+    if (cfg.wantBom)          ui::openBomPanel();
     if (cfg.wantPick) setupPickShot(st);
     if (cfg.wantGlassperf) setupPickShot(st);
 
@@ -450,6 +454,45 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
             std::fflush(stdout);
             ui::openCamWorkspacePanel();
         }
+    // T-U4: BOM & sourcing panel one-shot.
+    // Seeds two bought lines (M3 screw + 608ZZ bearing) with MPNs so the panel renders
+    // a realistic table even without a real assembly doc — prices will be BOM_UNPRICED
+    // unless a sourcing provider is configured, which is the correct unpriced state.
+    if (cfg.wantBom && !cfg.bomShotDone) {
+        cfg.bomShotDone = true;
+        // Try the live bom_price RPC first; if the engine.bom module is not provisioned
+        // the call fails and we fall back to seeding deterministic fixture rows.
+        nlohmann::json res;
+        std::string err;
+        bool liveOk = st.worker.call("bom_price", {{"doc_path", ""}}, res, err, 15000);
+        if (liveOk && res.value("ok", false) && res.contains("bom") && res["bom"].is_array()
+                && !res["bom"].empty()) {
+            std::string resStr = res.dump();
+            ui::seedBomPanelFromJson(resStr);
+            std::printf("bom: live rollup ok (%d lines)\n", (int)res["bom"].size());
+        } else {
+            // Fixture: two bought lines with MPNs, null prices (correct unpriced state).
+            const std::string fixture = R"({
+                "ok": true,
+                "bom": [
+                    {"line_id":"fix_1","kind":"bought","quantity":4,"unit":"ea",
+                     "description":"M3x10 Socket Head Cap Screw","mpn":"ISO4762-M3x10-A2",
+                     "vendor_part":{"supplier":"McMaster-Carr"},
+                     "unit_cost":null,"ext_cost":null},
+                    {"line_id":"fix_2","kind":"bought","quantity":2,"unit":"ea",
+                     "description":"608ZZ Deep Groove Bearing","mpn":"608ZZ",
+                     "vendor_part":{"supplier":""},
+                     "unit_cost":null,"ext_cost":null},
+                    {"line_id":"fix_3","kind":"made","quantity":1,"unit":"ea",
+                     "description":"6061-T6 Aluminum Plate 12mm","mpn":"",
+                     "vendor_part":null,
+                     "unit_cost":null,"ext_cost":null}
+                ]
+            })";
+            ui::seedBomPanelFromJson(fixture);
+            std::printf("bom: fixture seeded (live unavailable: %s)\n", err.c_str());
+        }
+        std::fflush(stdout);
     }
 }
 

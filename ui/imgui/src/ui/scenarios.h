@@ -41,6 +41,8 @@ struct ShotConfig {
     bool ecadShotDone = false;
     bool wantPartsBrowser = false;
     bool partsBrowserShotDone = false;
+    bool wantBom = false;
+    bool bomShotDone = false;
 
     // Long-running scenario modes (ScenarioRunner step machines)
     bool wantM1 = false;

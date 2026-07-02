@@ -13,6 +13,7 @@
 #include "ui/parts_panel.h"
 #include "ui/cam_panel.h"          // T-U3 CAM workspace
 #include "ui/first_run.h"
+#include "ui/bom_panel.h"
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -235,6 +236,21 @@ void Application::frame() {
             ui::drawPartsPanel(s);
         ImGui::End();
     }
+    // T-U4 BOM & sourcing panel — closable, screenshot-verifiable via AI_CAD_SHOT=bom.
+    // Floats centered (same positioning as scaffold_demo) so it doesn't overlap ribbon/tree chrome.
+    // Zero footprint while closed.
+    if (*ui::bomPanelOpen()) {
+        const ImGuiViewport* vp2 = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp2->WorkPos.x + vp2->WorkSize.x * 0.5f,
+                                       vp2->WorkPos.y + vp2->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(680.f * theme::S(), 480.f * theme::S()),
+                                 ImGuiCond_Appearing);
+        if (ImGui::Begin("BOM & Sourcing###bom", ui::bomPanelOpen(), pflags))
+            ui::drawBomPanel(s);
+        ImGui::End();
+    }
+
     ImGui::PopStyleColor();
 
     if (s.paletteOpen) ui::drawCommandPalette(s);

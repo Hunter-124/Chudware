@@ -317,19 +317,23 @@ def score_example(corpus_dir: str, label: dict, *, opener=None, compare_fn=None,
 
 
 def run(corpus_dir: str, dataset_hash: str, *, split: str = "all", limit: Optional[int] = None,
-        opener=None, compare_fn=None, frontier: Optional[Baseline] = None) -> BenchResult:
+        opener=None, compare_fn=None, frontier: Optional[Baseline] = None,
+        live: bool = False) -> BenchResult:
     labels = load_labels(corpus_dir)
     if limit is not None:
         labels = labels[:limit]
-
-    # Auto-detect the live-core binary verifier unless the caller supplied one (offline -> None).
-    if opener is None and compare_fn is None:
-        opener, compare_fn = _make_live_verifier()
 
     frontier = frontier or pending_frontier()
     # A frontier row is 'measured' ONLY when a real, available frontier strategy runs. With no
     # credentials it stays pending (baseline.py contract) — never a fabricated number.
     frontier_fn = frontier.apply if frontier.available else None
+
+    # The live binary verifier is OPT-IN (explicit opener, live=True, or a real frontier
+    # candidate that needs a geometry compare) — never silently toggled by ambient env, so an
+    # offline deterministic run stays reproducibly in fixture mode. Degrades to fixture with a
+    # recorded reason when the core can't be located.
+    if opener is None and compare_fn is None and (live or frontier.available):
+        opener, compare_fn = _make_live_verifier()
 
     examples = [score_example(corpus_dir, lab, opener=opener, compare_fn=compare_fn,
                               frontier_fn=frontier_fn) for lab in labels]

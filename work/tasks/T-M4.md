@@ -2,8 +2,8 @@
 id: T-M4
 title: CAM overhaul: feeds/speeds DB unification with engine materials registry
 workstream: M
-owner: unassigned
-status: todo
+owner: opus-vane
+status: doing
 branch: task/T-M4-cam-overhaul
 day: 4
 depends_on: []

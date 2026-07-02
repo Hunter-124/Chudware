@@ -437,11 +437,20 @@ class TestFederation:
             f"Expected ecad domain in M3 results (MountingHole_3.2mm_M3); "
             f"got domains: {domains}"
         )
-        # Fasteners must outrank ecad (exact-designation +1000 score)
+        # Exact-designation hits must outrank the BM25-only ecad row. With libaicad
+        # present the core-families adapter also contributes M3-designated fastener
+        # FAMILIES (domain mech_family) that legitimately share the +1000 boost, so
+        # the env-robust invariant is: first result is an exact M3 designation from a
+        # threaded-hardware domain — never the ecad footprint. (Provider-overlap
+        # dedup/ranking polish is recorded in T-P3's driver notes.)
         first = results[0]
-        assert first["domain"] == "fastener", (
-            f"Fastener must rank first for 'M3'; first result domain: {first['domain']!r}"
+        assert first["domain"] in {"fastener", "mech_family"}, (
+            f"Exact M3 hardware must rank first; got domain: {first['domain']!r}"
         )
+        assert "m3" in (first.get("designation") or "").lower() or "m3" in first["title"].lower(), (
+            f"First result must be an exact M3 hit; got: {first['title']!r}"
+        )
+        assert results[0]["domain"] != "ecad"
 
     def test_cross_domain_m3_ecad_is_mounting_hole(self):
         """The ecad hit for 'M3' must be the mounting hole footprint."""

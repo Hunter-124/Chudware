@@ -43,3 +43,11 @@ across every doc type, always R1-editable.
   route to it. If one genuinely lacks a path (hydraulic?), stub the seam + question file.
 - The demo is the acceptance test for Erik's directive: "design literally anything from
   standard parts" — make it read like that.
+
+> Driver-note addendum (Fable, 2026-07-03): the federation exposes provider OVERLAP —
+> core/parts fastener families (mech_family) and the bolts catalog (fastener) both match
+> threaded-hardware queries. Small ranking polish in scope for T-P3: dedupe/relate
+> same-designation records across providers (e.g. a `related_ids` field or a
+> domain-priority tiebreak fastener > mech_family for standard hardware), so part_search
+> presents ONE canonical row with the family as its instantiation recipe. Contract-additive
+> only; question file if it needs more than that.

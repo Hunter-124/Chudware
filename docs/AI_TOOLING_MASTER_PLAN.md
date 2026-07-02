@@ -505,7 +505,11 @@ Asked 2026-07-02; user AFK, so these are recorded as recommendations, not decisi
 2. **First drivers:** recommended Pillar 8 (research tools — unblocks accurate answers
    for limited models and feeds T-B5/T-D4) and Pillar 11 (narration — biggest GSL gap
    and prerequisite for translator training data) in parallel.
+   **ADOPTED 2026-07-02:** T-F1 + T-F7 are day-2 tasks (first claimed); T-F3/T-F5
+   follow at day 3.
 3. **Phone-handoff local listener (v2 capture):** recommended default-off; enabling
    shows port + per-session token in the QR so only QR holders can upload.
+   **ADOPTED 2026-07-02** — written into T-F6's DoD.
 4. **Translator training data:** synthetic-only; revisit opt-in real-design telemetry
-   at the T-F11 ship gate.
+   at the T-F11 ship gate. **ADOPTED 2026-07-02** — T-F10's dataset factory is
+   synthetic by construction; telemetry decision deferred to the T-F11 gate.

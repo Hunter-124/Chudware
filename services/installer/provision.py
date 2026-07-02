@@ -23,14 +23,19 @@ from pathlib import Path
 
 from engine import paths
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent
 REQUIREMENTS = REPO / "requirements.txt"
 APP_PACKAGES = ("engine", "mcp_server", "agent", "installer")
 STAMP = paths.RUNTIME / ".ready.json"
 
 
 def _venv_python() -> Path:
-    return paths.RUNTIME / "venv" / "Scripts" / "python.exe"
+    # Mirrors bootstrap.cpp's runtimePython() layout exactly (both must agree on where the
+    # managed venv's interpreter lives, or the C++ readiness check and this provisioner
+    # disagree on Linux): Scripts/python.exe on Windows, bin/python everywhere else.
+    if sys.platform == "win32":
+        return paths.RUNTIME / "venv" / "Scripts" / "python.exe"
+    return paths.RUNTIME / "venv" / "bin" / "python"
 
 
 def _req_hash() -> str:

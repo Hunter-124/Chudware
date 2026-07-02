@@ -151,6 +151,12 @@ register_firmware_tools(mcp)
 from mcp_server.structural_tools import register_structural_tools
 register_structural_tools(mcp)
 
+# Regen diagnosis (T-H11 / IP-18): on a rebuild failure, diagnose + propose editable fix-ops as
+# an accept/edit/reject card, logged as an IP-18 correction trace. Callable backend seam; the
+# copilot binding is T-F17.
+from mcp_server.regen_tools import register_regen_tools
+register_regen_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

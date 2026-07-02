@@ -353,10 +353,17 @@ def run(corpus_dir: str, dataset_hash: str, *, split: str = "all", limit: Option
         d["fixed"] += int(e.passed)
 
     verifier_mode = examples[0].detail.get("mode", "fixture") if examples else "fixture"
+    # An intended-live run where the core errored on any example silently fell back to fixture
+    # scoring for those (verify_fix records `live_error`). Surface it so an all-erroring "live"
+    # run can't masquerade as clean — the all-skip trap one layer down.
+    live_error_count = sum(1 for e in examples if e.detail.get("live_error"))
+    if verifier_mode == "live" and live_error_count:
+        verifier_mode = "degraded"
     agg = {
         "pct_fixed": det_pass, "deterministic_mean": det_mean,
         "roc_auc_det_fixable": auc, "intent_drift_count": intent_drift,
         "per_class": per_class, "verifier_mode": verifier_mode,
+        "live_error_count": live_error_count,
         "success_bar": {"pct_fixed>=0.70": det_pass >= 0.70, "intent_drift==0": intent_drift == 0},
     }
 

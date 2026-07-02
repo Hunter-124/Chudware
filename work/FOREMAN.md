@@ -123,3 +123,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 fable-arc REVIEWED T-B1a: LGTM merge-ready (sourcing contract frozen, 7 additive VendorPart fields, no open questions). Backfill: opus-moss CLAIMED T-B1b (branches FROM task/T-B1a-sourcing-schema; merge order B1a → B1b)
 - 2026-07-02T13:30:53Z opus-lark REVIEW T-E1 branch=task/T-E1-piping-scaffold
 - 2026-07-02 fable-arc REVIEWED T-E1: LGTM merge-ready (piping contract frozen, OCCT sweep + catalog + STEP round-trip, 14/14 tests, licenses row in-change, no open questions). Backfill: opus-dell CLAIMED T-E2 (branches FROM task/T-E1-piping-scaffold; merge order E1 → E2)
+- 2026-07-02T13:34:05Z opus-moss REVIEW T-B1b branch=task/T-B1b-part-providers (merge order: B1a → B1b)

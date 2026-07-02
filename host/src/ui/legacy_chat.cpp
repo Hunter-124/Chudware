@@ -1265,7 +1265,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     }
     ImGui::PushFont(st.fonts.medium);
     ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-    ImGui::TextUnformatted("AI-CAD Copilot");
+    ImGui::TextUnformatted("ShopCraft Copilot");
     ImGui::PopStyleColor();
     ImGui::PopFont();
 
@@ -3264,7 +3264,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
                     pdl->AddLine(ImVec2(cc.x + ox - ca * 0.5f, cc.y),
                                  ImVec2(cc.x + ox + ca * 0.5f, cc.y + ca), gc, 1.8f * S);
                 }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI-CAD Copilot");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("ShopCraft Copilot");
                 if (clicked) s_cpCollapsed = false;
             }
             ImGui::End();

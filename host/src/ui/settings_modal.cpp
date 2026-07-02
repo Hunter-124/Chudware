@@ -865,18 +865,18 @@ void drawSettingsModal(AppState& st, bool busy) {
 
     // ---------- About modal ----------
     if (st.showAbout) {
-        ImGui::OpenPopup("About AI-CAD");
+        ImGui::OpenPopup("About ShopCraft");
         st.showAbout = false;
     }
     ImGui::SetNextWindowSize(ImVec2(380.0f * sc, 0), ImGuiCond_Appearing);
-    if (ImGui::BeginPopupModal("About AI-CAD", nullptr, ImGuiWindowFlags_NoResize)) {
+    if (ImGui::BeginPopupModal("About ShopCraft", nullptr, ImGuiWindowFlags_NoResize)) {
         const Tex& wm = (ui::activeTheme == ui::Theme::Light && st.wordmarkDark.id)
                             ? st.wordmarkDark : st.wordmark;
         if (wm.id) {
             ImGui::Image((ImTextureID)(intptr_t)wm.id,
                          ImVec2(190.0f * sc, 190.0f * sc * (float)wm.h / wm.w));
         } else {
-            sectionHeader(st.fonts.h1, "AI-CAD");
+            sectionHeader(st.fonts.h1, "ShopCraft");
         }
         dimText("Parametric CAD, driven by AI.");
         ImGui::Dummy(ImVec2(0, 4 * sc));

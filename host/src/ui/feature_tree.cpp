@@ -3040,7 +3040,7 @@ void pollAiCadHandoff(AppState& st) {
         }
         shownRev = pendingRev;
         if (firstReveal)
-            st.toast(ui::ToastLevel::Info, "AI-CAD: live view of the AI's part — it updates as it builds");
+            st.toast(ui::ToastLevel::Info, "ShopCraft: live view of the AI's part — it updates as it builds");
     }
 }
 

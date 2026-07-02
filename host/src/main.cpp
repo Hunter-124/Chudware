@@ -161,7 +161,7 @@ GLFWwindow* makeContext(int w, int h, bool visible) {
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
     glfwWindowHint(GLFW_VISIBLE, visible ? GLFW_TRUE : GLFW_FALSE);
-    GLFWwindow* win = glfwCreateWindow(w, h, "AI-CAD", nullptr, nullptr);
+    GLFWwindow* win = glfwCreateWindow(w, h, "ShopCraft", nullptr, nullptr);
     if (!win) {
         std::fprintf(stderr, "window/context creation failed\n");
         glfwTerminate();

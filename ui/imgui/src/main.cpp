@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
     platform::applyBorderlessWindowHints(shotPath != nullptr);
 
     int winW = shotPath ? 1600 : 1480, winH = shotPath ? 1000 : 920;
-    GLFWwindow* win = glfwCreateWindow(winW, winH, "AI-CAD", nullptr, nullptr);
+    GLFWwindow* win = glfwCreateWindow(winW, winH, "ShopCraft", nullptr, nullptr);
     if (!win) { std::fprintf(stderr, "window create failed\n"); glfwTerminate(); return 1; }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);

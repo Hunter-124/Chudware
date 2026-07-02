@@ -80,7 +80,7 @@ void drawTitleBar(AppState& st, float height) {
         ImGui::PushFont(theme::font(theme::Font::H2));
         if (ImGui::GetCursorPosX() + 120.f * S < menuZoneR - 80.f * S) {
             ImGui::SetCursorPosY((barH - ImGui::GetFontSize()) * 0.5f);
-            ImGui::TextColored(TVEC(txt0), "AI-CAD");
+            ImGui::TextColored(TVEC(txt0), "ShopCraft");
             ImGui::SameLine(0, 4.f * S);
             ImGui::TextColored(TVEC(accent), "2");
         }
@@ -145,7 +145,7 @@ void drawTitleBar(AppState& st, float height) {
 
         auto drawHelpMenu = [&]() {
             ImGui::MenuItem("Documentation", nullptr, false, false);
-            ImGui::MenuItem("About AI-CAD", nullptr, false, false);
+            ImGui::MenuItem("About ShopCraft", nullptr, false, false);
         };
 
         if (winW < collapseThreshold) {

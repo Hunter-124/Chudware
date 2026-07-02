@@ -151,6 +151,12 @@ register_firmware_tools(mcp)
 from mcp_server.structural_tools import register_structural_tools
 register_structural_tools(mcp)
 
+# Adapter serving (T-H9): per-insertion-point LoRA routing table — status ("which brain
+# answered"), canary dial, always-safe rollback, and the Erik-ratified gated promotion
+# (evidence + human sign-off; no auto-promote). Pure-Python, no core dependency.
+from mcp_server.serving_tools import register_serving_tools
+register_serving_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

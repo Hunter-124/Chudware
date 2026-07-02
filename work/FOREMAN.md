@@ -89,3 +89,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 Fable REVIEWED T-H3: LGTM merge-ready (1951+ lines, 56/56 tests, scope clean); dispatched sonnet-juno on T-F13
 - 2026-07-02T00:00Z sonnet-juno CLAIMED T-F13
 - 2026-07-02 fable-arc CLAIMED T-F14 (Pillar 15 arc driver: F14→F15→F16, merge order F14 → F15 → F16)
+- 2026-07-02 fable-arc DISPATCHED parallel Opus drivers: opus-ivy T-F1, opus-rook T-F3, opus-sage T-F5, opus-pike T-F9 (Erik-authorized widening; T-F3 driver owns agent_panel hot-spot per first-claimer rule, briefed to keep panel edits minimal/append-only)

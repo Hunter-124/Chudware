@@ -108,3 +108,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 Fable REVIEWED T-G2: LGTM merge-ready (host build 5/5 green, screenshot-verified); its 4 NEEDS-LIVE click-tests feed the T-G12 human-walkthrough checklist; dispatching T-G4 chained off T-G2 branch (merge order: G2 then G4)
 - 2026-07-02T14:00Z sonnet-oda CLAIMED T-G4 (merge order: T-G2 then T-G4; worktree at /home/hunter/Repositories/CAD-T-G4 on branch task/T-G4-gui-dead-code based on origin/task/T-G2-doc-tab-input-fix)
 - 2026-07-02T13:08Z opus-ivy REVIEW T-F1 branch=task/T-F1-research-scaffold
+- 2026-07-02 fable-arc REVIEWED T-F1: LGTM merge-ready (contract+scaffold, 14/14 tests, gate fails pre-existing selMulti + engine/doc OCP only; follow-up: engine/paths.py lacks Linux XDG branch — tracked, not blocking). Backfilled slot: opus-wren CLAIMED T-B1a

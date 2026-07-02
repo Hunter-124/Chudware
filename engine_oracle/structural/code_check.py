@@ -7,8 +7,10 @@ Two-layer approach
    clause citations; no copyrighted text is reproduced.  Three rules in v1:
 
    * :func:`check_deflection`  — L/360 live-load limit (IBC 1604.3 / AISC 360).
-   * :func:`check_post_span`   — simplified lumber post capacity (NDS ASD, public-domain
-     reference values — same source as ``checks.py`` Douglas Fir-Larch No.2 table).
+   * :func:`check_post_span`   — simplified lumber post capacity (NDS ASD; Fc is the
+     same public-domain Douglas Fir-Larch No.2 value as ``checks.py``; dressed section
+     areas come from the T-D3 lumber table via
+     :func:`engine.structural.sections.get_lumber_section`).
    * :func:`check_fastener_schedule` — our own encoded fastener schedule with IBC table
      citation; not a reproduction of IBC Table 2304.10.1.
 
@@ -42,6 +44,10 @@ from typing import Optional, Protocol, runtime_checkable
 
 # Import the byte-exact disclaimer from checks.py — not redefined here.
 from engine.structural.checks import DISCLAIMER
+
+# Dressed-lumber section properties come from the T-D3 section library
+# (engine_oracle/data/lumber_table.json — ANSI/AWC PS 20 dressed dims).
+from engine.structural.sections import get_lumber_section
 
 # --------------------------------------------------------------------------- RuleResult
 
@@ -146,32 +152,31 @@ def check_deflection(span_mm: float, deflection_mm: float) -> RuleResult:
     )
 
 
-# Post capacity table — simplified NDS ASD for Douglas Fir-Larch No.2 lumber posts.
-# Values are our own derived reference capacities (public-domain NDS Supplement Table 4D /
-# standard textbook derivations); not a reproduction of NDS Table text.
-# Area in mm², Fc = 9.307 MPa (same as checks.py), no Cp in v1.
-_POST_SECTIONS: dict[str, dict] = {
-    # "size_label": {"A_mm2": ..., "Fc_MPa": ...}
-    "4x4":   {"A_mm2": 11_290.0,  "Fc_MPa": 9.307},  # 89×89 mm actual
-    "4x6":   {"A_mm2": 17_419.0,  "Fc_MPa": 9.307},  # 89×140 mm actual
-    "6x6":   {"A_mm2": 23_226.0,  "Fc_MPa": 9.307},  # 140×140 mm actual
-    "6x8":   {"A_mm2": 31_129.0,  "Fc_MPa": 9.307},  # 140×191 mm actual — approx
-    "8x8":   {"A_mm2": 40_387.0,  "Fc_MPa": 9.307},  # 191×191 mm actual
-}
-_DEFAULT_POST = "6x6"
+# Post compression material constant — Douglas Fir-Larch No.2, Fc = 9.307 MPa
+# (same public-domain reference value as checks.py; no Cp in v1).
+# Section areas come from the T-D3 lumber table (get_lumber_section) — ANSI/AWC PS 20
+# dressed (S4S) dimensions — NOT a hardcoded table (a previous table here overstated
+# areas by 19–43%, which overstated post capacity).
+_FC_MPA = 9.307
+# Unknown sizes fall back to the SMALLEST listed post (conservative: understates
+# capacity, never overstates it) with an explicit note in the result detail.
+_FALLBACK_POST = "4x4"
 
 
 def check_post_span(post_size: str, load_kn: float) -> RuleResult:
     """Simplified NDS ASD compression check for a lumber post (no column stability Cp).
 
     Demand = load_kn (kN).  Capacity = Fc × A (NDS ASD; no load-duration/wet-service
-    factors in v1).  Citation: "NDS 3.6 column compression / NDS Supplement Table 4D."
+    factors in v1).  Section area A comes from the T-D3 dressed-lumber table
+    (:func:`engine.structural.sections.get_lumber_section`).
+    Citation: "NDS 3.6 column compression / NDS Supplement Table 4D."
 
     Parameters
     ----------
     post_size:
-        Nominal lumber size string: ``"4x4"``, ``"4x6"``, ``"6x6"``, ``"6x8"``, ``"8x8"``.
-        Case-insensitive; unknown sizes use the 6x6 default with a note.
+        Nominal lumber size string, e.g. ``"4x4"``, ``"4x6"``, ``"6x6"``, ``"6x8"``.
+        Case-insensitive.  Unknown sizes fall back to the smallest listed post
+        (``4x4`` — conservative) with an explicit note in the result detail.
     load_kn:
         Applied compressive load in kilo-Newtons (positive = compression).
 
@@ -180,29 +185,34 @@ def check_post_span(post_size: str, load_kn: float) -> RuleResult:
     :class:`RuleResult` with ``rule_id="post_compression_NDS_ASD"``.
     """
     key = (post_size or "").strip().lower().replace(" ", "")
-    if key not in _POST_SECTIONS:
-        # Unknown size: use conservative 6x6 default
-        props = _POST_SECTIONS[_DEFAULT_POST]
-        size_note = f" (unknown size {post_size!r}; used {_DEFAULT_POST} as conservative default)"
-    else:
-        props = _POST_SECTIONS[key]
+    try:
+        section = get_lumber_section(key)
+        size_used = key
         size_note = ""
+    except KeyError:
+        # Unknown size: fall back to the SMALLEST listed post — this understates
+        # capacity (safe direction) rather than overstating it.
+        section = get_lumber_section(_FALLBACK_POST)
+        size_used = _FALLBACK_POST
+        size_note = (
+            f" (unknown post size {post_size!r}; fell back to smallest listed post "
+            f"{_FALLBACK_POST} — conservative, capacity understated)"
+        )
 
-    A_mm2 = props["A_mm2"]
-    Fc_MPa = props["Fc_MPa"]  # N/mm²
-    capacity_kn = Fc_MPa * A_mm2 / 1000.0  # → kN
+    A_mm2 = section["A"]  # dressed area, mm² (ANSI/AWC PS 20)
+    capacity_kn = _FC_MPA * A_mm2 / 1000.0  # N → kN
     demand = abs(load_kn)
     passed = demand < capacity_kn
 
     if passed:
         detail = (
             f"Post load {demand:.2f} kN < NDS capacity {capacity_kn:.2f} kN "
-            f"(size={key or _DEFAULT_POST}{size_note}) — PASS."
+            f"(size={size_used}{size_note}) — PASS."
         )
     else:
         detail = (
             f"Post load {demand:.2f} kN ≥ NDS capacity {capacity_kn:.2f} kN "
-            f"(size={key or _DEFAULT_POST}{size_note}) — FAIL."
+            f"(size={size_used}{size_note}) — FAIL."
         )
 
     return RuleResult(

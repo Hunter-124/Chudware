@@ -1,7 +1,8 @@
 """Building-code compliance MCP tools (T-D4).
 
 Registers:
-  code_check(doc_path, jurisdiction, load_combo) -> dict
+  code_check(doc_path, jurisdiction, load_combo, rag_query,
+             post_size, post_load_kn, connection_type) -> dict
     Deterministic rule checks (deflection L/360, post compression, fastener schedule) +
     agentic RAG citations from the user's local code corpus.  Never scrapes copyrighted
     public code viewers — see ``work/questions/T-D4.md`` for the copyright fence ruling.
@@ -27,6 +28,9 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
         jurisdiction: str = "CA",
         load_combo: str = "DEAD_LIVE",
         rag_query: str = "",
+        post_size: str = "",
+        post_load_kn: float = 0.0,
+        connection_type: str = "",
     ) -> str:
         """Run building-code compliance checks on a structural document.
 
@@ -36,7 +40,8 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
         * **deflection_L360** — checks live-load deflection < L/360 (IBC 1604.3 /
           AISC 360).  Requires ``doc_path`` to be an ``aicad.structure/1`` JSON document.
         * **post_compression_NDS_ASD** — simplified NDS ASD compression check for lumber
-          posts (no Cp in v1).  Uses Douglas Fir-Larch No.2 Fc = 9.31 MPa.
+          posts (no Cp in v1).  Uses Douglas Fir-Larch No.2 Fc = 9.31 MPa with dressed
+          section areas from the T-D3 lumber table.  Runs when ``post_size`` is given.
         * **fastener_schedule** — looks up the connection type in the encoded fastener
           schedule with IBC/NDS clause citations.
 
@@ -47,14 +52,21 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
 
         Args:
             doc_path: Path to a JSON ``aicad.structure/1`` document.  When empty or
-                absent, structural analysis is skipped and only standalone rules can run
-                (via direct kwargs — currently post/fastener, not deflection).
+                absent, structural analysis is skipped and only the standalone rules
+                (``post_size``/``post_load_kn`` and ``connection_type``) can run.
             jurisdiction: Two-letter US state code (e.g. ``"CA"``, ``"TX"``).  Used to
                 scope jurisdiction metadata and RAG retrieval.  Defaults to ``"CA"``.
             load_combo: ASCE 7 load combination for deflection analysis — ``"DEAD_ONLY"``,
                 ``"DEAD_LIVE"`` (default), or ``"DEAD_LIVE_WIND"``.
             rag_query: Optional natural-language query for agentic RAG retrieval.  When
                 empty, no citations are fetched.
+            post_size: Optional nominal lumber post size (e.g. ``"4x4"``, ``"6x6"``).
+                When non-empty, runs the post compression check with ``post_load_kn``.
+                Unknown sizes fall back to the smallest listed post (4x4, conservative).
+            post_load_kn: Applied compressive post load in kN (used with ``post_size``).
+            connection_type: Optional connection key for the fastener-schedule check
+                (e.g. ``"post_base"``, ``"ledger_to_band_joist"``).  When non-empty,
+                runs the fastener-schedule lookup.
 
         Returns:
             JSON ``{ok, jurisdiction, rule_results: [...], citations: [...], disclaimer}``.
@@ -70,7 +82,6 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
         try:
             from engine.structural.checks import DISCLAIMER
             from engine.structural.code_check import (
-                MockRAGProvider,
                 UserCorpusProvider,
                 agentic_rag,
                 check_deflection,
@@ -134,8 +145,22 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
                         "disclaimer": DISCLAIMER,
                     })
                 except ImportError:
-                    # PyNite/scipy unavailable — skip deflection, still run standalone rules
-                    pass
+                    # PyNite/scipy unavailable — record an advisory row instead of
+                    # silently returning ok:true with no deflection result.
+                    rule_results.append({
+                        "rule_id": "deflection_L360",
+                        "passed": False,
+                        "skipped": True,
+                        "value": 0.0,
+                        "limit": 0.0,
+                        "unit": "mm",
+                        "citation": "IBC 1604.3",
+                        "detail": (
+                            "deflection check skipped: PyNite unavailable — install "
+                            "PyNiteFEA to enable structural deflection analysis."
+                        ),
+                        "disclaimer": DISCLAIMER,
+                    })
                 except Exception as exc:  # noqa: BLE001
                     rule_results.append({
                         "rule_id": "deflection_L360",
@@ -147,6 +172,18 @@ def register_code_compliance_tools(mcp: FastMCP) -> None:
                         "detail": f"Analysis error: {exc}",
                         "disclaimer": DISCLAIMER,
                     })
+
+            # Post compression check — standalone kwargs
+            if post_size and post_size.strip():
+                rule_results.append(
+                    check_post_span(post_size.strip(), post_load_kn).to_dict()
+                )
+
+            # Fastener schedule check — standalone kwarg
+            if connection_type and connection_type.strip():
+                rule_results.append(
+                    check_fastener_schedule(connection_type.strip()).to_dict()
+                )
 
             # RAG citations
             citations: list[dict] = []

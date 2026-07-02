@@ -7,11 +7,14 @@ Hand-calc validation
   - 8 mm deflection  → 8 < 8.333 → passed=True
   - 10 mm deflection → 10 ≥ 8.333 → passed=False
 
-**Post compression (NDS ASD, 6x6 DF-L No.2):**
-  A = 23 226 mm², Fc = 9.307 MPa
-  Capacity = 9.307 × 23 226 / 1000 = 216.17 kN
-  - 100 kN → 100 < 216.17 → passed=True
-  - 300 kN → 300 ≥ 216.17 → passed=False
+**Post compression (NDS ASD, DF-L No.2, Fc = 9.307 MPa, ANSI/AWC PS 20 dressed dims):**
+  6x6 dressed = 140 × 140 mm → A = 19 600 mm²
+  Capacity = 9.307 N/mm² × 19 600 mm² = 182 417.2 N = 182.4172 kN
+  - 100 kN → 100 < 182.42 → passed=True
+  - 300 kN → 300 ≥ 182.42 → passed=False
+  4x4 dressed = 89 × 89 mm → A = 7 921 mm²
+  Capacity = 9.307 × 7 921 = 73 720.7 N = 73.7207 kN
+  Unknown sizes fall back to the smallest listed post (4x4) — conservative.
 
 Run::
 
@@ -132,26 +135,43 @@ class TestCheckDeflection:
 # ============================================================================ check_post_span
 
 class TestCheckPostSpan:
-    # Hand-calc: 6x6 DF-L No.2: A=23226 mm², Fc=9.307 MPa, capacity=216.17 kN
-    _6X6_CAPACITY = 9.307 * 23_226 / 1000.0  # ≈ 216.17 kN
+    # Independent hand-calc from ANSI/AWC PS 20 dressed dims (NOT recomputed from
+    # module constants):
+    #   6x6 dressed 140×140 mm → A = 19 600 mm²
+    #   capacity = 9.307 N/mm² × 19 600 mm² = 182 417.2 N = 182.4172 kN
+    _6X6_CAPACITY_KN = 182.4172
+    #   4x4 dressed 89×89 mm → A = 7 921 mm²
+    #   capacity = 9.307 N/mm² × 7 921 mm² = 73 720.7 N = 73.7207 kN
+    _4X4_CAPACITY_KN = 73.7207
 
     def test_6x6_100kn_passes(self):
-        """100 kN < 6x6 capacity (≈216 kN) → passed=True."""
+        """100 kN < 6x6 capacity (182.42 kN) → passed=True."""
         r = check_post_span("6x6", 100.0)
         assert r.passed is True
 
     def test_6x6_300kn_fails(self):
-        """300 kN > 6x6 capacity → passed=False."""
+        """300 kN > 6x6 capacity (182.42 kN) → passed=False."""
         r = check_post_span("6x6", 300.0)
         assert r.passed is False
 
-    def test_capacity_approx(self):
-        """6x6 capacity within ±1% of hand-calc 216.17 kN."""
+    def test_6x6_200kn_fails(self):
+        """200 kN ≥ 6x6 capacity 182.42 kN → FAIL.  The old hardcoded table overstated
+        6x6 area (23 226 vs actual 19 600 mm²) and would wrongly PASS this load."""
+        r = check_post_span("6x6", 200.0)
+        assert r.passed is False
+
+    def test_capacity_absolute(self):
+        """6x6 capacity equals independent hand-calc 182.4172 kN (140×140 dressed)."""
         r = check_post_span("6x6", 0.0)  # zero load → passes; limit gives capacity
-        assert r.limit == pytest.approx(self._6X6_CAPACITY, rel=0.01)
+        assert r.limit == pytest.approx(self._6X6_CAPACITY_KN, abs=0.01)
+
+    def test_4x4_capacity_absolute(self):
+        """4x4 capacity equals independent hand-calc 73.7207 kN (89×89 dressed)."""
+        r = check_post_span("4x4", 0.0)
+        assert r.limit == pytest.approx(self._4X4_CAPACITY_KN, abs=0.01)
 
     def test_4x4_smaller_capacity(self):
-        """4x4 post (A=11290 mm²) should have lower capacity than 6x6."""
+        """4x4 post (A=7921 mm²) should have lower capacity than 6x6 (A=19600 mm²)."""
         r_4x4 = check_post_span("4x4", 0.0)
         r_6x6 = check_post_span("6x6", 0.0)
         assert r_4x4.limit < r_6x6.limit
@@ -162,11 +182,20 @@ class TestCheckPostSpan:
         assert r_lower.passed == r_upper.passed
         assert r_lower.limit == r_upper.limit
 
-    def test_unknown_size_uses_default(self):
-        """Unknown post size should not raise; uses conservative 6x6 default."""
+    def test_unknown_size_falls_back_to_smallest(self):
+        """Unknown post size should not raise; falls back to the SMALLEST listed post
+        (4x4 — conservative) with an explicit note, never a larger 'default'."""
+        r = check_post_span("99x99", 50.0)
+        assert r.passed is True  # 50 kN < 4x4 capacity 73.72 kN
+        assert r.limit == pytest.approx(self._4X4_CAPACITY_KN, abs=0.01)
+        assert "unknown post size" in r.detail.lower()
+        assert "conservative" in r.detail.lower()
+
+    def test_unknown_size_is_actually_conservative(self):
+        """100 kN on an unknown size must FAIL (4x4 fallback capacity 73.72 kN) —
+        the old 6x6 'conservative' fallback wrongly passed this."""
         r = check_post_span("99x99", 100.0)
-        assert r.passed is True  # 100 kN < 6x6 capacity
-        assert "unknown size" in r.detail.lower() or "conservative" in r.detail.lower()
+        assert r.passed is False
 
     def test_citation_contains_nds(self):
         r = check_post_span("6x6", 50.0)

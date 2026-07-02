@@ -115,6 +115,10 @@ register_research_tools(mcp)
 from deliverables import register_deliverables_tools
 register_deliverables_tools(mcp)
 
+# Sourcing — unified BOM roll-up (made/bought) + approved-provider price resolution (workstream B).
+from mcp_server.sourcing_tools import register_sourcing_tools
+register_sourcing_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

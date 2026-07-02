@@ -34,10 +34,28 @@ Walk the assembly tree and ECAD BOM CSV to produce a unified BOM that classifies
 
 ## Definition of done
 
-- [ ] `bom_rollup` MCP tool returns a unified BOM with made/bought classification for the demo assembly
-- [ ] `bom_price` MCP tool resolves bought-line prices via ProviderChain
-- [ ] ECAD BOM CSV merged when a linked board doc is present
-- [ ] `python -m pytest engine_oracle/test_bom.py -q` passes
+- [x] `bom_rollup` MCP tool returns a unified BOM with made/bought classification for the demo assembly
+- [x] `bom_price` MCP tool resolves bought-line prices via ProviderChain
+- [x] ECAD BOM CSV merged when a linked board doc is present
+- [x] `python -m pytest engine_oracle/test_bom.py -q` passes
+
+## Implementation notes (T-B2, opus-vale)
+
+- `BomLine` follows the FROZEN `aicad.sourcing/1` §3 shape field-for-field (superseding this
+  task file's older sketch). Two additive-OPTIONAL fields (`mpn`, `description`) added per
+  contract §0 (no version bump) — see `work/questions/T-B2.md` Q1.
+- `engine_oracle/bom.py`: `rollup(doc_path)` walks the `aicad.asm/1` component tree (injectable
+  loaders → C++ core `doc_tree` by default), classifies made/bought, aggregates repeated
+  instances, and expands linked ECAD board components through the real `write_bom` CSV.
+  `resolve_prices()` folds `ProviderChain` pricing into bought lines (declined fetch → price
+  stays `None`, never fabricated — §0). Provider seam raises `ProviderError`; chain/resolver
+  returns `None` (per `work/questions/T-B1b.md` ruling).
+- MCP tools `bom_rollup` / `bom_price` in `services/mcp/sourcing_tools.py`; append-only
+  registration in `services/mcp/server.py`.
+- No new pip deps (stdlib + engine modules only) → no `contracts/licenses.md` row.
+- Upstream `write_bom` drops the MPN column; worked around by recovering MPN from board
+  footprints (Q2). Out of scope to fix that shared exporter here.
+- Merge order (binding): B1a → B1b → B2. Branch based on `task/T-B1b-part-providers`.
 
 ## AI hints
 

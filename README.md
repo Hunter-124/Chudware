@@ -83,6 +83,48 @@ docs/ tools/ scripts/ third_party/
 work/            git-tracked task system (see work/README.md)
 ```
 
+## Contributor setup: graphify + the team-coordination tools
+
+Two pieces of **internal dev tooling** (not part of the shipped product) make working on
+this codebase in parallel with a team, human or AI, much cheaper:
+
+**graphify** — a persistent knowledge graph of this codebase (god nodes, community
+structure, cross-file relationships) that Claude Code queries instead of repeated raw
+grep/read loops. `.claude/settings.json` wires a repo-wide hook that *requires* Claude to
+run `graphify query`/`explain`/`path` before grepping or reading source once the graph
+exists, so build it once per clone:
+
+```
+graphify .                 # one-time: build graphify-out/graph.json for this checkout
+graphify hook install      # optional: auto-rebuild graph.json after every git commit
+```
+
+`graphify-out/` is a local, per-machine build artifact (gitignored — it bakes in absolute
+paths and is fully regenerable) — every contributor builds their own, it is never pushed.
+The `graphify claude install` CLAUDE.md wiring is already done project-wide; you only need
+the one-time build above. See [.claude/skills/graphify/SKILL.md](.claude/skills/graphify/SKILL.md)
+for the full command set.
+
+**Team coordination (`work/`)** — file-based task tracking plus a live sync layer for
+multiple contributors (human or AI) working the [work/](work) task board at once, in
+parallel Claude Code CLI / Claude Desktop sessions, without overlapping fixes:
+
+```
+python3 work/tools/setup_team_tools.py   # one-time: registers the aicad-team MCP server
+                                          # with Claude Code CLI + Claude Desktop
+work/workd.sh <your-name>                # (or work\workd.bat) — presence/sync daemon,
+                                          # leave running while you work
+work/report.sh                           # (or work\report.bat) — AI-guided issue reporter
+                                          # GUI: draft a bug/idea -> linked GitHub issue +
+                                          # work/backlog task in one step
+```
+
+Once registered, `/work-board`, `/work-pick`, `/work-sync`, `/work-issues`, `/work-msg`,
+`/work-report`, and thirteen per-section `/ctx-*` commands (pre-mapped source maps —
+`work/context/*.md` — so agents don't burn tokens re-exploring a subsystem) are available
+in every Claude Code session in this repo. Full protocol: [work/README.md](work/README.md)
+and [work/prompts/autopilot.md](work/prompts/autopilot.md).
+
 ## Where this is going
 
 AI-CAD is expanding into an **idea-to-production platform** — one prompt carries a project from

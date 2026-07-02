@@ -94,6 +94,7 @@ graph TD
     T_BL12["T-BL12: TraceParts + Werk24 paid tiers"]:::backlog
     T_BL13["T-BL13: Per-document glass accent + luminance-variance scrim boost"]:::backlog
     T_BL14["T-BL14: GNN adapter training for GO families + sw_fixtures STEP export"]:::backlog
+    T_BL15["T-BL15: PROPOSAL — in-app document version control (needs human refinement first)"]:::backlog
   end
   subgraph WS_integration["workstream integration"]
     T_INT["T-INT: Day-5 integration demo - soil-moisture sensor end-to-end"]:::todo

@@ -273,6 +273,104 @@ def cmd_claim(tasks, errors, args):
         lock.unlink(missing_ok=True)
 
 
+def _commit_task_change(t, msg):
+    """Commit + push a single task-file change to master under the claim lock."""
+    main = _main_worktree()
+    rel = t["_path"].resolve().relative_to(main.resolve())
+    _git(["add", str(rel)], main, check=True)
+    _git(["commit", "-m", msg], main, check=True)
+    if _git(["remote"], main).stdout.strip():
+        if _git(["push"], main).returncode != 0:
+            _git(["pull", "--rebase"], main)
+            _git(["push"], main, check=True)
+
+
+def _owned_task(tasks, tid, owner):
+    if tid not in tasks:
+        raise RuntimeError(f"unknown task {tid}")
+    t = tasks[tid]
+    if t.get("owner", "").lower() != owner.lower():
+        raise RuntimeError(f"{tid} is owned by {t.get('owner')!r}, not {owner!r}")
+    return t
+
+
+def cmd_note(tasks, errors, args):
+    """Append a timestamped progress note to your claimed task + push to master."""
+    lock = _lock()
+    try:
+        main = _main_worktree()
+        if _git(["remote"], main).stdout.strip():
+            _git(["pull", "--rebase", "--autostash"], main)
+        tasks, _ = load_tasks()
+        t = _owned_task(tasks, args.task_id, args.owner)
+        stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+        text = t["_path"].read_text(encoding="utf-8")
+        if "## Progress log" not in text:
+            text = text.rstrip() + "\n\n## Progress log\n"
+        text = text.rstrip() + f"\n- {stamp} [{args.owner}] {args.text}\n"
+        t["_path"].write_text(text, encoding="utf-8")
+        _commit_task_change(t, f"note {args.task_id} ({args.owner})")
+        print(f"NOTED: {args.task_id}")
+        return 0
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+ALLOWED_TRANSITIONS = {
+    ("doing", "review"), ("doing", "blocked"),
+    ("blocked", "doing"), ("review", "doing"),
+}
+
+
+def cmd_status(tasks, errors, args):
+    """Set your claimed task's status (guarded transitions; never -> done)."""
+    lock = _lock()
+    try:
+        main = _main_worktree()
+        if _git(["remote"], main).stdout.strip():
+            _git(["pull", "--rebase", "--autostash"], main)
+        tasks, _ = load_tasks()
+        t = _owned_task(tasks, args.task_id, args.owner)
+        cur, new = t.get("status"), args.status
+        if new == "done":
+            raise RuntimeError("flipping to done is a HUMAN merge-time action")
+        if (cur, new) not in ALLOWED_TRANSITIONS:
+            raise RuntimeError(f"transition {cur} -> {new} not allowed "
+                               f"(allowed: {sorted(ALLOWED_TRANSITIONS)})")
+        _set_front_matter(t["_path"], status=new)
+        _commit_task_change(t, f"status {args.task_id}: {cur} -> {new} ({args.owner})")
+        print(f"STATUS: {args.task_id} {cur} -> {new}")
+        return 0
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def cmd_release(tasks, errors, args):
+    """Give a claimed task back to the pool (owner -> unassigned, status -> todo)."""
+    lock = _lock()
+    try:
+        main = _main_worktree()
+        if _git(["remote"], main).stdout.strip():
+            _git(["pull", "--rebase", "--autostash"], main)
+        tasks, _ = load_tasks()
+        t = _owned_task(tasks, args.task_id, args.owner)
+        _set_front_matter(t["_path"], owner="unassigned", status="todo")
+        _commit_task_change(t, f"release {args.task_id} ({args.owner})")
+        print(f"RELEASED: {args.task_id}")
+        return 0
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    finally:
+        lock.unlink(missing_ok=True)
+
+
 def cmd_prompt(tasks, errors, args):
     tid = args.task_id
     if tid not in tasks:
@@ -305,11 +403,23 @@ def main():
     p_claim = sub.add_parser("claim")
     p_claim.add_argument("--owner", required=True)
     p_claim.add_argument("--task")
+    p_note = sub.add_parser("note")
+    p_note.add_argument("task_id")
+    p_note.add_argument("--owner", required=True)
+    p_note.add_argument("--text", required=True)
+    p_status = sub.add_parser("status")
+    p_status.add_argument("task_id")
+    p_status.add_argument("--owner", required=True)
+    p_status.add_argument("--status", required=True, choices=sorted(STATUSES))
+    p_rel = sub.add_parser("release")
+    p_rel.add_argument("task_id")
+    p_rel.add_argument("--owner", required=True)
     args = ap.parse_args()
     tasks, errors = load_tasks()
     fn = {"validate": cmd_validate, "ready": cmd_ready,
           "board": cmd_board, "dag": cmd_dag, "prompt": cmd_prompt,
-          "claim": cmd_claim}[args.cmd]
+          "claim": cmd_claim, "note": cmd_note, "status": cmd_status,
+          "release": cmd_release}[args.cmd]
     sys.exit(fn(tasks, errors, args))
 
 

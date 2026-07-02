@@ -3,7 +3,7 @@ id: T-D1
 title: structural_schema.md contract and engine/structural/ scaffold
 workstream: D
 owner: opus-vex
-status: doing
+status: review
 branch: task/T-D1-structural-schema-scaffold
 day: 1
 depends_on: []
@@ -32,11 +32,48 @@ Day 1 establishes the structural pillar following the ECAD precedent: a frozen c
 
 ## Definition of done
 
-- [ ] `contracts/structural_schema.md` frozen, all element types and result schemas documented
-- [ ] `engine_oracle/structural/` package importable
-- [ ] `element_to_brep()` returns a valid OCCT shape for each element type
-- [ ] `aicad.structure/1` doc kind registered in doc-meta
-- [ ] `python -m pytest engine_oracle/structural/test_elements.py -q` passes
+- [x] `contracts/structural_schema.md` frozen, all element types and result schemas documented
+- [x] `engine_oracle/structural/` package importable
+- [x] `element_to_brep()` returns a valid OCCT shape for each element type (verified: all 6 types non-null, positive volume; I-section < bounding box)
+- [x] `aicad.structure/1` doc kind registered in doc-meta (self-declared schema + `is_structure`/`doc_kind` helpers — see note below / questions Q2)
+- [x] `python -m pytest engine_oracle/structural/test_elements.py -q` passes (10 passed, with OCP present)
+
+## Implementation notes (opus-vex)
+
+- **`engine` is a symlink → `engine_oracle`** (git-tracked). Code imports via `from engine.structural…`
+  to match the ECAD precedent; files live under `engine_oracle/`.
+- **doc-kind "registration":** no central Python doc-kind registry exists (the parametric doc
+  engine moved to the C++ core; Python `engine.doc` is closure-free helpers). A doc self-declares
+  its kind via its `schema` field — same as `aicad.sch/1` / `aicad.pcb/1`. Implemented as
+  `SCHEMA="aicad.structure/1"` + `is_structure`/`doc_kind`/`new_structure`. See questions Q2.
+- **Geometry:** raw OCP (cadquery-ocp) per the hints — `section_profile(name)->TopoDS_Wire`
+  (rect / RHS-outer / I-shape + a small AISC `W` table) faced + extruded +Z with
+  `BRepPrimAPI_MakePrism`, then a 4×4 rigid `gp_Trsf` placement. OCP is lazily imported so
+  `elements.py` stays OCCT-free. RHS is modelled as its outer rectangle for v1 (questions Q3).
+- **`element_type` is a `ClassVar`** (not an init field) so the subclass dataclasses stay valid
+  (a defaulted `element_type` field would otherwise precede the base's non-default fields).
+- **Verification:** `pytest engine_oracle/structural/test_elements.py -q` → 10 passed in a venv
+  with OCP installed. Standalone smoke: 100×100×2400 cedar post → exact 24 000 000 mm³ solid;
+  every element type yields a valid non-null solid.
+- **Did NOT edit** `services/mcp/server.py` (day-3 registration) — out of scope.
+
+## ⚠️ Gate status — pre-existing blocker (see work/questions/T-D1.md Q1)
+
+`bash scripts/gate.sh` PASSES every stage EXCEPT `ui/imgui`, which fails to **compile** on the same
+**pre-existing master break** flagged from T-C1: `property_manager.cpp` references
+`PanelField::selMulti` (10×) but the struct in `ui/abstract/panel_spec.h` has no such member
+(present at `f6e156c`, before this claim). T-D1 adds zero C++, so it neither causes nor can fix it.
+
+```
+check.py     FAIL-RECORDED  (pre-existing, non-fatal)
+core build   PASS  (libaicad, OCCT ON)
+ui/abstract  PASS
+ctest        PASS  (100%)
+pytest       SKIP  (no provisioned venv; structural suite verified separately — 10 passed)
+ui/imgui     FAIL  (pre-existing selMulti compile break — NOT from T-D1)
+```
+
+The structural slice is merge-ready on its own; the GUI break needs a separate GUI-workstream fix.
 
 ## AI hints
 

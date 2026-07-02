@@ -40,11 +40,33 @@ write-sets the DAG assigns and let the integrator gate own shared files.
 
 ## Definition of done
 
-- [ ] `aicad_ui_viewport` compiles standalone, zero `#include` into `host/`
-- [ ] Theme helpers compile; no literal colors outside `tokens.h`/`theme.*`
-- [ ] Zero OS `#ifdef` outside `platform/`
-- [ ] AI-CAD2 routes doc ops through `WorkerClient`
-- [ ] `bash scripts/gate.sh` green (known pre-existing failures excepted); `graphify update .` run
+- [x] `aicad_ui_viewport` compiles standalone, zero `#include` into `host/`
+- [x] Theme helpers compile; no literal colors outside `tokens.h`/`theme.*`
+- [x] Zero OS `#ifdef` outside `platform/`
+- [x] AI-CAD2 routes doc ops through `WorkerClient`
+- [~] `bash scripts/gate.sh` green — AI-CAD2 build/`--shot` proven green ONLY with the
+  staged `panel_spec` fix applied; clean master is BROKEN (see HANDOFF). `graphify update .` run.
+
+## HANDOFF (opus-vale, 2026-07-02) — VERIFIED, one human commit from green
+
+Wave 1 (F1–F4 + G1 CMake) — and in fact the whole migration through wave 3 per
+`docs/REFACTOR_LOG.md` — is **already landed on master**. T-G5 was a verify-and-close.
+All four verifiable DoD boxes pass (see the "G5 — Wave 1 verification" REFACTOR_LOG entry
+for exact commands + results).
+
+**The one blocker is not mine to fix:** clean master does not build AI-CAD2 because
+`ui/imgui/src/ui/property_manager.cpp` (committed, `0c20c37`) references
+`PanelField::selMulti`/`label`, but the matching `ui/abstract/panel_spec.{h,cpp}` rewrite is
+**uncommitted in the main checkout** (C2's write-set, not T-G5's). I proved the gate goes
+green the moment it lands — ephemerally applied it, AI-CAD2 built (exit 0) and `--shot`
+rendered the full shell, then reverted to keep this branch clean.
+
+**Action to close T-G5 (human):** commit the staged `panel_spec.{cpp,h}` — details +
+one-liner in `work/questions/T-G5.md`. After that commit, `bash scripts/gate.sh` stage 5
+(AI-CAD2 build + `--shot`) is green and every remaining DoD box is satisfied.
+
+This branch carries only docs (REFACTOR_LOG verification entry + this status + the question
+file) — no code changes, since none were needed.
 
 ## AI hints
 

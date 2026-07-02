@@ -828,3 +828,25 @@ exit 0); `AI_CAD_SHOT=m1` + `AI_CAD_SHOT=sketch` re-shot and eyeballed
 `rev=0 features=0 (TREE MISMATCH)` — save/reopen feature-tree restore, suspected
 pre-existing (kernel-worker side, untouched by this work); filed for investigation.
 Remaining NEEDS-LIVE click-tests are tracked as T-G2.
+
+### G5 — Wave 1 verification (opus-vale, 2026-07-02)
+Resumed T-G5 (claimed via `357860e`, no branch had been created). Established that Wave 1
+(F1 viewport, F2 theme, F3 platform, F4 worker seam) + the G1 CMake rewire are **already
+landed on master** (via `9d0d445` G1-integrate + `0c20c37` liquid-glass v2), so T-G5 is a
+verify-and-close, not a from-scratch port. **Verified DoD:** `aicad_ui_viewport` builds +
+links standalone (`cmake -S ui/viewport -B build/viewport && cmake --build build/viewport`,
+exit 0; `grep -r host/src ui/viewport` → only comments/AGENTS.md, no `#include`); F1 Kawase
+blur + `averageLuminance()` present (`renderer.h`/`viewport_impl.cpp`); zero OS `#ifdef` in
+`ui/imgui/src/ui`; F4 routes doc ops through `WorkerClient` (`doc_engine.cpp` ctor
+`Engine(WorkerClient&, DocMirror&)`, app_state "Engine live (WorkerClient)"). **G1 gate
+smoke — blocked on a half-landed C2 commit, then proven green once patched:** clean master
+does not build AI-CAD2 because `property_manager.cpp` (committed) references
+`PanelField::selMulti`/`label` but the matching `ui/abstract/panel_spec.{h,cpp}` rewrite is
+**uncommitted in the main checkout**. Ephemerally applying that staged panel_spec (reverted
+after, not this branch's write-set) → AI-CAD2 links clean (exit 0) and
+`AI_CAD_NO_FILE_DIALOGS=1 AI-CAD2 --shot scratch/smoke.png` renders the full shell (ribbon +
+Model Tree + liquid-glass + Copilot, 1600×1000). **Blocker filed:** `work/questions/T-G5.md`
+— recommend committing the staged `panel_spec.{cpp,h}` to unbreak every AI-CAD2 build
+(team-wide, not T-G5-specific). **Gotcha:** headless `--shot` works without xvfb on this box
+(offscreen GL); the "known selMulti gate break" is not a seam-file gap — it is C2's
+`property_manager.cpp` having shipped without its `panel_spec` counterpart.

@@ -319,6 +319,57 @@ def resolve_prices(
     return bom
 
 
+def resolve_costs(
+    bom: list[BomLine],
+    *,
+    cost_lookup: Optional[Callable[[BomLine], Optional[dict]]] = None,
+) -> list[BomLine]:
+    """Fill ``cost_model`` + ``unit_cost``/``ext_cost`` for the **made** lines of ``bom`` in place.
+
+    For each made line, ``cost_lookup(line)`` returns an ``aicad.sourcing/1`` §3 ``cost_model``
+    object (see :func:`engine.cost_model.estimate_made_cost`) or ``None``. On a result the line's
+    ``cost_model`` is populated; when that object carries a numeric ``unit_cost`` (``ok`` true) the
+    line's ``unit_cost``/``ext_cost`` are resolved from it, else they stay ``None`` (cost *unknown*,
+    per contract §0 — never a fabricated number). Bought lines are untouched (priced by
+    :func:`resolve_prices`).
+
+    ``cost_lookup`` is the injectable seam: the default (:func:`_default_cost_lookup`) is
+    core-backed (opens the source geometry, runs the CAM cycle-time sim, measures volume + material,
+    calls the cost model) and is therefore NOT exercised in CI; tests inject an in-memory estimator.
+    """
+    if cost_lookup is None:
+        cost_lookup = _default_cost_lookup
+    for line in bom:
+        if line.kind != "made":
+            continue
+        cm = cost_lookup(line)
+        if not cm:
+            continue
+        line.cost_model = cm
+        uc = cm.get("unit_cost")
+        if uc is None:
+            continue  # cost unknown — contract §0: keep unit_cost/ext_cost None, never guessed
+        line.unit_cost = float(uc)
+        line.ext_cost = float(uc) * int(line.quantity)
+        cur = cm.get("currency")
+        if cur:
+            line.currency = str(cur)
+    return bom
+
+
+def _default_cost_lookup(line: "BomLine") -> Optional[dict]:
+    """Core-backed made-line cost estimate (needs the DLL + geometry; not run in CI).
+
+    Made lines from :func:`rollup` do not yet carry a per-component source path, so per-line
+    core costing has no geometry to resolve here and this returns ``None`` (cost stays unknown).
+    SEAM(T-F2 merge / source plumbing): once the roll-up threads each made component's source doc
+    through the line, this resolves volume + material + CAM ``cycle_time_s`` and calls
+    ``engine.cost_model.estimate_made_cost``. The MCP ``cam_cost_estimate`` tool performs that
+    per-doc costing directly today.
+    """
+    return None
+
+
 def _unit_price_for_qty(rec: dict, quantity: int) -> Optional[float]:
     """Highest ``price_breaks`` tier whose ``qty <= quantity``, falling back to ``unit_price``."""
     breaks = sorted(

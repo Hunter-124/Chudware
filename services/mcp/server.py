@@ -119,6 +119,10 @@ register_deliverables_tools(mcp)
 from mcp_server.sourcing_tools import register_sourcing_tools
 register_sourcing_tools(mcp)
 
+# Cost-out — made-part cost model (material + machining) + approved quote-out APIs (workstream B).
+from mcp_server.cost_tools import register_cost_tools
+register_cost_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

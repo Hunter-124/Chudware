@@ -1,7 +1,7 @@
 {
  "agent": "sonnet-tarn",
  "host": "hunter-pc",
- "activity": "graphify_query",
+ "activity": "whoami",
  "task": "",
- "ts": "2026-07-02T18:52:53Z"
+ "ts": "2026-07-02T18:53:00Z"
 }

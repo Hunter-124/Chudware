@@ -538,3 +538,274 @@ no-op on the second run, zero errors), `ctest --test-dir core/build-linux -R int
 --output-on-failure` → `1/1 Test #36: interference ... Passed` (100% tests passed). Full
 suite (`ctest` unfiltered) intentionally NOT run per the assignment's scope. No files
 outside the stated write-set touched; no git commands run.
+
+### APP — in-app AI hooks: E2 worker routing, E4 reverse_engineer mission capability (AI-experience wave, WS-E)
+Assigned write-set: `app/src/app/doc_engine.{cpp,h}`, `app/src/ui/agent_panel.cpp`,
+`app/src/app/app_state.cpp`, `core/agent/run.cpp`, `services/worker/worker_client.cpp`.
+Delivered E2 + E4 in full; E3 (import-summary toast + Copilot chip) was descoped after
+discovering mid-task that `app/src/app/*` and `app/src/ui/agent_panel.*` are now SYMLINKS
+into `ui/imgui/src/...` (the G1 host->ImGui port landed after this plan was written) —
+editing them means editing the exact tree the concurrent GUI session owns exclusively.
+Flagged to the integrator over IRC; confirmed decision was to keep E2/E4, revert a
+trial `doc_engine.h` header change (two new method decls with no `.cpp` body would have
+broken the app link), and hand E3 to the GUI session via `docs/HANDOFF_AI_EXPERIENCE.md`.
+**E2**: traced `services/worker/worker_client.cpp`'s `routeDocToCpp` — it sniffs `params`
+for a `doc_id`/`into` key with a `doc-cpp`/`dwg-cpp` prefix to decide C++-core vs. Python
+routing, method-name-agnostic. `eval_interference`/`eval_feature_overlap`/`doc_face_wires`
+all key on `doc_id` and were already covered. `eval_compare` uniquely keys on `doc_a`/
+`doc_b` (two documents, no `doc_id` field at all) and was silently falling through to the
+(nonexistent, for this RPC) Python path — a real bug, not a hypothetical. Fixed by adding
+`doc_a`/`doc_b` to the sniffed-key list (7-line diff, `routeDocToCpp`, ~L86-92). **E4**: added
+a `reverse_engineer` capability branch to `run_mission` (`core/agent/run.cpp`) at the
+"recognized but not yet wired" stub. Also added a `options.capability` override that lets a
+caller route straight to one capability, bypassing the `mission_planner` LLM call entirely
+— necessary because the mission_planner prompt template (outside this node's write-set)
+has no idea "reverse_engineer" exists and would never emit it unprompted; this makes the
+future Copilot chip's canned request deterministic once wired, independent of any prompt
+update. The capability itself: creates a fresh doc via `doc::doc_new`, keeps the import doc
+as a read-only reference, runs the normal `run_assembly_design` build loop into the new doc
+with an appended instruction not to touch the reference, then calls the real
+`doc::doc_eval_compare(new, ref)` RPC (in-process, no WorkerClient hop) and folds
+`match_pct`/`degraded` into both the task summary text and a new `reverse_engineer_compare`
+event so the result surfaces in `agent_run_v2`'s event stream. Took the plan's PRE-DECIDED
+FALLBACK rather than the maximal path (threading compare feedback into the reviewer/fixer
+`BuiltContext` at every modeler/review/fix iteration): that would mean editing the ~500-line
+stage loop inside `run_design` that `design`/`assembly` also depend on, plus the
+reviewer/fixer prompt templates (`services/agent/prompts/`, not in this write-set) to teach
+them to read an injected compare block — disproportionate blast radius for one capability
+branch. The delivered version still does a REAL comparison (never a canned number), just
+once per mission rather than once per stage. Verified: `cmake --build core/build-linux -j12
+--target aicad_agent` clean (both incrementally and from the edit point forward). No
+`app/build*`/`build/linux-app` build attempted for E3 since no E3 code was written under
+this node — the app was left untouched. No git commands run by this node (the integrator
+owns commits per `AGENTS.md`).
+
+### AI-EXPERIENCE — final verification pass (§TODO-5), lane consolidated (2026-07-01)
+Verification node; no git run (orchestrator commits). **Gate**: `bash scripts/gate.sh` →
+RESULT: PASS — only `check.py` FAIL-RECORDED (`feature_surface_audit` + `parity_audit`),
+which is the documented PRE-EXISTING baseline; core build (OCCT ON), ui/abstract,
+core ctest (100%), ui/imgui build+shot+selftest all PASS; gate's engine/agent pytest
+step SKIPs (no runtime venv) as usual. **ctest**: `-R interference` 1/1 Passed.
+**MCP pytest** (`~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest`, mcp 1.27.2 +
+pytest 9.1.1): `test_gsl_tools.py + test_recon_tools.py` 13 passed;
+`test_cad_tools.py -k "overlap or coincident or caption"` 6 passed — run BOTH before and
+after restaging. **Restage**: `core/build-linux/bin/libaicad.so` (relinked 21:50 after the
+E4 `core/agent/run.cpp` capability work) was newer than `services/dist/AI-CAD/libaicad.so`
+(21:19) → recopied; all 19 lane tests re-green against the staged lib. No breakage found
+in this lane's new files, nothing fixed. **Lane consolidated — files landed across the
+TODO nodes**: `services/mcp/recon_tools.py` (`_recognize` 5-pass + `reverse_engineer` /
+`compare_parts` / `convert_face_to_sketch`), `services/mcp/server.py` (register after GSL
+block), `services/agent/prompts/shared/cheatsheets/reverse_engineer.md` (`_RE_GUIDE`,
+served by `cad_guide('reverse')`), `services/mcp/test_gsl_tools.py` (9 tests),
+`services/mcp/test_recon_tools.py` (4), append-only tests in
+`services/mcp/test_cad_tools.py` (5, before the `__main__` runner), `tools/gsl_eval.py`,
+`docs/RECOGNITION_RESIDUAL.md` (full 14-sample run), plus this node's doc touches
+(`docs/REFACTOR_LOG.md`, status note atop `docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md`,
+restaged `services/dist/AI-CAD/libaicad.so`). **Deferred/open**: E3 in-app hooks belong to
+the GUI session (HANDOFF §TODO-4); GNN adapter training remains gated — RECOGNITION_RESIDUAL
+says GO only for ribbed_bracket / shelled_enclosure / swept_pipe, NO-GO elsewhere;
+`corpora/sw_fixtures` has no `*.step` yet (eval path dormant until files appear);
+pre-existing (NOT this lane): `test_cad_tools.py::test_check_sketch_{fully,under}_defined`
+author the legacy flat sketch shape the staged schema validation rejects. **Gotchas worth
+keeping**: pytest under `services/mcp/` imports the dir as package `mcp`, shadowing the
+mcp SDK — each test file carries a no-op-when-unshadowed reload shim; recon hole placement
+uses a 2-position checkpointed probe because hole positions live in the face's `gp_Pln`
+parameter axes; fillet-candidate bound is 20% of MEDIAN bbox dim (documented deviation —
+the spec's own r3-on-8mm acceptance part violates the min-dim rule); ALWAYS restage
+`services/dist/AI-CAD/libaicad.so` after a core rebuild or new RPCs report
+"unknown method".
+---
+
+**Glass-v2 audit — drawing-sheet mode + Section View tool (host/src/ui/drawing_panel.cpp,
+section_tool.cpp).** Brought the two remaining raw-ImGui surfaces in this lane up to the
+liquid-glass v2 standard. `section_tool.cpp`: the `"Section View##panel"` floating window
+previously used `SetNextWindowBgAlpha(0.94f)` (flat opaque fill); now suppresses the native
+fill (`BgAlpha 0`), splits the window draw list (channel 1 = widgets, channel 0 = bg), and
+after the auto-resized rect is known paints a frosted `ui::adaptivePanel(panelId(
+"vp_section_panel"), rect, GlassGroup::Hud)` + `ui::glassPanel(Regular, WindowRounding/uiScale)`
+behind the content, then merges — matching the local convention already used by the collapsed
+`vp_section_chip` pill. Preset/Flip/OK/X/Add/Remove buttons were left as standard themed ImGui
+widgets (same choice settings_modal makes for real widgets inside a frosted window; their
+palette button roles already read correctly on glass). `drawing_panel.cpp`: added a local
+`GlassPopupScope`/`beginGlassPopup()` helper (anon file scope) and applied it to all three
+floating dialogs — Edit Dimension (`drw_dimedit_popup`), GD&T editor (`drw_gdtedit_popup`),
+Sheet Properties (`drw_sheetprops_popup`): each now `SetNextWindowBgAlpha(0)` before its
+`BeginPopup`, splits/merges the draw list, and frosts with `adaptivePanel`+`glassPanel`
+(Regular, `PopupRounding/uiScale`) so they join the app glass family instead of the flat
+legacy `PopupBg=glassBg` fill. The drawing CANVAS itself (the light "paper" sheet + view
+boxes + dimension/GD&T/title-block ink) was deliberately left untouched — it is a
+document/paper representation (like the 3D viewport), not chrome, and its dark-on-white ink
+must stay per the sketchInk contract. All `ImVec2` math done via explicit constructors (not
+`operator+`) to avoid the `IMGUI_DEFINE_MATH_OPERATORS` trap. **Verify:** both files compile
+cleanly under `flock /tmp/host-build-linux.lock` (section_tool + drawing_panel objects build
+with zero errors); full link + `AI_CAD_SHOT=drawing` screenshot are BLOCKED only by concurrent
+sibling agents' in-flight `ImVec2 operator+` errors in cutlist_panel.cpp / equations_dialog.cpp
+/ design_table_panel.cpp / evaluate_dialogs.cpp (all outside this write-set) — retry the link +
+shot once those land. **Touched:** host/src/ui/section_tool.cpp, host/src/ui/drawing_panel.cpp.
+
+**Liquid-glass v2 — PropertyManager forms (pm_forms.cpp / property_manager.cpp).** Brought the
+~44 feature-editing PM forms (extrude/revolve/fillet/chamfer/shell/hole-wizard/pattern/mirror/
+draft/sheet-metal/weldments/surfacing/…) up to the liquid-glass v2 standard. Key finding:
+`pm_forms.cpp` is a PURE DATA TABLE (form/field definitions) with ZERO render code — it needed no
+edits; ALL rendering lives in `property_manager.cpp`'s `drawBody()` + its helpers. The forms
+render EMBEDDED inside the pinned FeatureManager glass column (layout.cpp drawLeftPane -> drawBody,
+which pushes `ImGuiCol_Text = surf.textPrimary` around the call), so per the host contract they must
+REUSE that shared surface — not paint their own `glassPanel` (double-paint). Added an fmSurf-style
+local `pmSurf()` helper (verbatim pattern from feature_tree.cpp: same `panelId("host_left_glass")`
++ `GlassGroup::FeatureManager`, id-cached/idempotent) and switched every SECONDARY/dim text site
+from theme-static `pal.text`/`pal.textDim` to adaptive `surf.textPrimary`/`surf.textSecondary`
+(form description, section captions, selector-well labels + chip text, FeatureWell label, "="
+toggle glyph, idle segmented-pill text, live-preview status hint). Interactive rows now get
+translucent glass pills via `ui::glassRowBackground()` instead of opaque fills: `pmSectionHeader`
+(pill drawn behind the CollapsingHeader, transparent Header* colors), the selector-well fill
+(neutral frosted wash idle/hover, semantic accent selected-pill when active — accent/dangling
+BORDER semantics preserved). The "=" dim toggle and Boss/Cut-style segmented pills kept their
+ImGui::Button geometry but idle fills dropped to ~0.40 alpha so the column glass bleeds through.
+DELIBERATELY LEFT ON PALETTE (semantic, not chrome — per the feature_tree adaptive/semantic split):
+accent (title, active-well label, active-segment/toggle), statusOk (OK button), statusErr/statusWarn
+(errors/dangling/warnings), accentSoft/accentMid (selection/segment washes). LEFT AS-IS: the group
+`BeginChild` cards (`ChildBg=glassBg`, `Border=glassBorder`) — already translucent sub-region
+containers, not the "opaque plain ImGui widget" the report flagged; repainting them with glassPanel
+would be the double-paint the contract warns against. `PropertyManager::draw()` and its
+`##PMFloating` fallback (which paints its own `WindowBg=glassBg`) were left UNTOUCHED because that
+path is DEAD in the current liquid-glass layout (grep confirms only `drawBody()` is called, from
+layout.cpp:534 — `draw()` has no callers); if a future layout revives it, it needs the
+standalone-window treatment (own `adaptivePanel`+`glassPanel`, like settings_modal). All `ImVec2`
+math uses explicit constructors, never `operator+` (avoids the `IMGUI_DEFINE_MATH_OPERATORS` trap
+that broke sibling files). **Verify:** property_manager.cpp compiles cleanly under
+`flock /tmp/host-build-linux.lock`; full link succeeded after concurrent sibling `ImVec2 operator+`
+errors cleared, and I captured `scratch/gui-overhaul-shots/pmforms_extrude.png` (Extrude, with
+up_to_surface + thin revealed), `pmforms_fillet.png` (Fillet, variable-size), and `pmforms_m1.png`
+(m1 scenario, ran to completion, no crash/assertion). Screenshots confirm section-header glass
+pills, accent-washed active selector wells, segmented pills, and adaptive-contrast labels rendering
+over the live frosted column. **Input-frame widgets left opaque — DELIBERATE, matches app
+convention:** the Dim (Slider/Drag), Int (DragInt), Combo/DatumRef (BeginCombo), Check (Checkbox)
+and Text/`=`-mode (InputText) widgets keep the global opaque `ImGuiCol_FrameBg` (`pal.frameBg`
+alpha 1.0). Verified against the already-modernized panels: `settings_modal.cpp`, `sim_manager.cpp`,
+and `asm_panels.cpp` all render bare `ImGui::SliderFloat`/`Checkbox`/`BeginCombo`/`InputText` over
+their frosted glass with NO FrameBg override — opaque input frames are the established house style
+(they preserve value legibility; only chrome/rows/text/section-headers go glass). The only file that
+pushes a translucent FrameBg (feature_tree.cpp:848) is a special-case accent-tinted inline-rename
+editor, not a general convention. Making the PM input frames translucent would DEVIATE from the
+modernized panels, so they were intentionally left as themed opaque frames. **Touched:**
+host/src/ui/property_manager.cpp.
+
+**GUI visual-polish pass — 4 layout fixes (m1 blank-part fresh-screenshot audit, host/ only).**
+Closed the dead-gap / mislaid-chrome issues Erik flagged on the running app. **(1) Left icon rail
+→ horizontal.** `host/src/ui/layout.cpp` `drawLeftPane()`: the `##lp_tabstrip` child (Explorer/
+FeatureManager/PropertyManager/Configurations) was a VERTICAL strip down the column's left edge; it
+is now a HORIZONTAL icon row across the column's TOP (child sized `railW × railRowH`, buttons via
+`SameLine(0,gap)`, btn 30dp/glyph 18dp), with a horizontal separator under it and the tab body
+flowing BELOW at full pane width (the old full-height vertical separator + `SameLine(0,0)` beside
+the rail are gone) — kills the left gutter dead space (HANDOFF_GUI_OVERHAUL §5 item 1). **(2) Doc
+tab strip → floats over the viewport.** `host/src/ui/doc_tabs.cpp` `drawDocTabs()`: was drawn INLINE
+in the central document window and reserved its height with a trailing `Dummy(availW,barH)` (which
+pinned it above the FeatureManager column AND pushed the whole viewport down). It now opens its OWN
+pinned borderless floating window (same flag set as the FM/Copilot columns:
+`NoTitleBar|NoResize|NoMove|NoDocking|NoBackground|NoScrollbar|NoSavedSettings|NoBringToFront`),
+positioned at `x = (overlayColumnEdge(0)≥0 ? that : band.minX) + 12dp`, `y = band.minY + 12dp` (flush
+under the ribbon, just right of the FM column), and the height-reservation `Dummy` is removed. The
+window is sized to HUG its content (`winW = min(contentW+6, copilotLeftEdge - docX)`, the `contentW`
+tab-measure loop hoisted above the `Begin`) — a full-width window is `NoBackground` but still
+input-blocking, so its empty right half would eat clicks on the viewport toolbar + Copilot header
+that share the same top row to the right (they render clean but go dead — screenshots can't catch it;
+verified with a temporary `AddRectFilled` debug footprint that the rect stops after the "+" button in
+both m1 and multidoc). The
+band bottom is still published and `docTabStripHeight()` still returns 26 (truthiness gate at both
+call sites — viewport_panel.cpp:330 + the out-of-write-set ecad_panel.cpp:28 — preserved). Falls back
+to inline draw only on the pre-band-publish first frame. Corresponding `colY` in
+`layout.cpp` drawLeftPane (was `max(band.minY+docTabStripHeight, docTabBandBottom)+margin`) and
+`legacy_chat.cpp:~3192` (Copilot column) both collapsed to `band.minY + margin`, so both pinned
+columns start flush at the viewport top. **(3) Viewport toolbar + Copilot top flush.** The viewport
+zoom/pan toolbar (`viewport_panel.cpp` `by0 = cr0.y + 6`, `cr0 = GetCursorScreenPos()` after the
+strip) rose to band-top AUTOMATICALLY once the strip stopped reserving height — no edit needed there;
+the Copilot top was raised by the `colY` edit above. **(4) Collapse chevron.** `layout.cpp`
+`##lp_collapse` block: was hover-only background (read as a stray mark); now a persistent glass chip
+(`glassRowBackground` at 0.22 idle / 0.42 hover, 26dp square) parked at the column's top-right corner
+and reserved out of the horizontal rail's width (`chevRsv`) so it never collides with the relocated
+icon row. **Verify:** built green under `flock /tmp/host-build-linux.lock`; re-shot `AI_CAD_SHOT=
+m1|sketch|fea|appearance|multidoc` → `scratch/gui-overhaul-shots/fix4_*.png`, all clean (dead gap
+gone, doc tab + chevron coexist, icon row full-width bodies, FEA legend + Settings + multi-tab strip
+unregressed); `grep -rc panelsOverlay host/src/` still all-zero (docked layout stays deleted, locked
+decision §1). **Touched:** host/src/ui/layout.cpp, host/src/ui/doc_tabs.cpp,
+host/src/ui/legacy_chat.cpp (host/src/ui/viewport_panel.cpp needed NO edit — fix 3a was automatic;
+host/src/ui/layout.h unchanged).
+
+## Liquid-glass v2 — Evaluate / Equations / Design Table / Cut List dialogs
+
+Brought four standalone floating dialogs onto the v2 adaptive-glass standard; they had been left as
+plain opaque ImGui windows (or, more precisely, the older static `pushGlassWindowStyle()` fill, which
+is non-adaptive and near-opaque). **Files:** `host/src/ui/evaluate_dialogs.cpp`,
+`host/src/ui/equations_dialog.cpp`, `host/src/ui/design_table_panel.cpp`,
+`host/src/ui/cutlist_panel.cpp` (all `ImGui::Begin` floating windows over the viewport; no `.h`
+signature change needed). **Pattern (identical in all four):** dropped `push/popGlassWindowStyle`; push
+a transparent `ImGuiCol_WindowBg` so the adaptive `glassPanel` is the only fill (mirrors the tooltip
+"native rect must not compete with the custom glass" contract). Because the title bar renders DURING
+`Begin` (before any post-Begin draw — an `ImDrawListSplitter` can't reorder already-emitted commands,
+so full-rect glass filmed over the title text + close X; caught in the first `equations` shot), each
+window now scopes `ImGuiCol_TitleBg/Active/Collapsed = glassBg` around `Begin` (theme sets these
+transparent globally) and frosts only the CONTENT region: `winRect` starts at
+`GetCursorScreenPos().y - WindowPadding.y` (title-bar bottom), so the title strip stays crisp and the
+seam reads as a header divider. After Begin: `adaptivePanel(panelId("host_<dlg>_glass"), winRect,
+GlassGroup::Global)` → `glassPanel(dl, winRect, GlassLevel::Regular, 12.0f, surf)`; body text uses
+`surf.textPrimary` (default ink push) / `surf.textSecondary` (the old `pal.textDim` dim role) so
+contrast tracks the live backdrop, while semantic colors (statusErr/Warn/Ok, accent header) stay
+as-is. PopStyleColor accounting: 3 title colors popped right after Begin; WindowBg (+ default text ink
+on content paths) popped 1 (Begin-fail) / 2 (every content exit). **Deliberately left alone:** the
+read-only cutlist / design-table / equations grids use ImGui-default `TableRowBg` (~0 alpha), so the
+frost already shows through the grid body — row pills would add nothing and clash with the cell
+borders; only the design-table SELECTED config-name row got a cue: a translucent `selectionHighlight`
+wash via `TableSetBgColor(ImGuiTableBgTarget_RowBg0, ...)` (grid-honoring, not a rounded pill) with the
+`Selectable`'s own opaque highlight suppressed (passed `selected=false`). Standard `ImGui::Button`s
+left themed (consistent with settings_modal — only custom icon-buttons get pills). **Verify:** built
+green under `flock /tmp/host-build-linux.lock -c "cmake --build host/build-linux -j$(nproc)"`; re-shot
+`AI_CAD_SHOT=equations` and `AI_CAD_SHOT=evalmass` → `scratch/gui-overhaul-shots/dlg_equations.png` +
+`dlg_evalmass.png` (zoom crops confirm crisp title/X on the glass strip + legible frosted content).
+Design Table and Cut List have NO `AI_CAD_SHOT` scenario, so they are build-verified only (they share
+the identical, screenshot-proven pattern). **Touched:** host/src/ui/evaluate_dialogs.cpp,
+host/src/ui/equations_dialog.cpp, host/src/ui/design_table_panel.cpp, host/src/ui/cutlist_panel.cpp.
+
+---
+
+**Liquid-glass v2 for Simulation + Assembly panels (host/src/ui/sim_manager.{cpp,h}, asm_panels.cpp).**
+These two files still used only v1 theme-static glass (`glassBackground` / `palette.glassBg` fills +
+`maxContrastTextOn(glassBg)` text) — zero v2 adaptive API — so they read as flat dark panels over the
+light viewport instead of frosted backdrop-tracking glass. Split by nature:
+*sim_manager.cpp is EMBEDDED* in the FeatureManager column's tab body (layout.cpp `drawLeftPane` calls
+`SimManager::drawTreeBody`), so it must NOT repaint a pane background — it reuses the ONE surface
+layout already painted under `panelId("host_left_glass")` + `GlassGroup::FeatureManager`. Added
+`simSurf()` (mirror of feature_tree.cpp's `fmSurf`), a pane-level `PushStyleColor(ImGuiCol_Text,
+simSurf().textPrimary)` at the top of `drawTreeBody` (RAII pop; only over a live backdrop) so all pane
+text + the `pushDimText`-derived dims become adaptive, `simRowPill()` (`glassRowBackground` pill,
+mirror of `fmRowPill`) behind every study node + leaf row in `drawStudyRow` (accent card when
+selected), and a `beginCheckCard/endCheckCard` pair that replaced the 5 checklist cards' old
+`pushGlassChildStyle`+`pushCardText` (theme-static dark child fill) with a transparent auto-resize
+child fronted by a frosted `glassRowBackground` pill (no double-frost of the already-glass pane, no
+per-card text re-pair). `drawStudyTypeBanner` migrated `glassBackground`→`glassRowBackground`. NOTE:
+`glassCardText()`/`pushCardText()` are now used ONLY by the two floating popups (New Study picker +
+custom-material modal) which fill with the OPAQUE `glassBg` PopupBg regardless of backdrop, so
+`glassCardText` stays `maxContrastTextOn(glassBg)` (light ink) — substituting the pane's dark adaptive
+ink there would land dark-on-dark = invisible (contrast trap, caught in review before shipping).
+*asm_panels.cpp is 7 independent floating windows* (Insert / Parts Library / Mate / Pattern / Explode /
+Interference / BOM), so each paints its OWN frosted backdrop (evaluate_dialogs.cpp recipe): `pushGlassWindow`
+now pushes a transparent `ImGuiCol_WindowBg`; after each `Begin` succeeds, `paintGlassWindow("asm_<name>_glass")`
+does `adaptivePanel(unique panelId, winRect, GlassGroup::Global)` → `glassPanel(dl, winRect,
+GlassLevel::Regular, 12.0f, surf)` and pushes `surf.textPrimary`; `endGlassWindow()` pops it before each
+`End` (incl. the 2 early-return paths in Parts Library + Pattern). To make the file's ~40
+`pushText(pal.text)`/`pushText(pal.textDim)` call sites backdrop-adaptive with zero per-site edits,
+`pushText` now pointer-compares its arg against the `palette.text`/`palette.textDim` role arrays and
+remaps them to `surf.textPrimary`/`textSecondary` when a frosted window surface is active
+(`g_asmSurf`); semantic roles (accent/status*) pass through unchanged. (Full-rect frost incl. the title
+bar — title text bleeds through the translucent glass legibly, per the original evaluate_dialogs
+pattern; a sibling agent later refined dialogs to frost only the content region below the title, but
+the asm windows keep the simpler verified full-rect approach.) **Verify:** built green under
+`flock /tmp/host-build-linux.lock -c "cmake --build host/build-linux -j$(nproc)"`; `AI_CAD_SHOT=asm`
+→ `scratch/gui-overhaul-shots/asm_interference_after.png` (zoom crop confirms the Interference window
+is frosted with crisp dark-on-light content text over the light model); `AI_CAD_SHOT=fea` runs the sim
+path (`studyCount>0` forces `drawTreeBody`; `newStudy` sets `sel_>=0` so `drawForm`→`drawStudyChecklist`
+→`beginCheckCard` all execute) to clean completion with no ImGui stack assertion — the study tree +
+checklist render just below the headless left-pane fold, using the identical screenshot-proven
+`host_left_glass` surface + `glassRowBackground` mechanism the visible feature-tree rows already use.
+No `.h` signature change was needed (all new helpers are file-static in the .cpp; sim_manager.h's dirty
+diff in the tree is a PRE-EXISTING unrelated arrowhead-triangulation change, not this glass work).
+**Touched (this glass work):** host/src/ui/sim_manager.cpp, host/src/ui/asm_panels.cpp.

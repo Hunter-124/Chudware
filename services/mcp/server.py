@@ -51,25 +51,31 @@ mcp = FastMCP(
     ),
 )
 
+# Tool registry (contracts/providers.md §6): tag every tool with {family, risk} and enforce
+# a per-context allow-list at dispatch. `view(mcp, family)` stamps each register_*_tools()
+# call site with its family and wraps its tools in the single shared dispatch guard. Default
+# policy = everything allowed, so this is behavior-neutral until a DAG node / env sets a list.
+from mcp_server import tool_registry as _reg
+
 # Mechanical CAD + simulation (C++ feature engine via libaicad.dll).
 from mcp_server.cad_tools import register_cad_tools
-register_cad_tools(mcp)
+register_cad_tools(_reg.view(mcp, "cad"))
 
 # GSL — Geometry-Semantics Layer: compact named part outline (describe_part), face-adjacency
 # graph (query_adjacency), and stable-id hover. The progressive-pull view of the geometry.
 from mcp_server.gsl_tools import register_gsl_tools
-register_gsl_tools(mcp)
+register_gsl_tools(_reg.view(mcp, "gsl"))
 
 # Recon — reverse-engineering: import a STEP/mesh → deterministic feature recognition → an
 # EDITABLE parametric tree, verified against the source solid by boolean comparison
 # (reverse_engineer / compare_parts / convert_face_to_sketch; guide: cad_guide("reverse")).
 from mcp_server.recon_tools import register_recon_tools
-register_recon_tools(mcp)
+register_recon_tools(_reg.view(mcp, "recon"))
 
 # Intake — photo-measurement + manufacturing-clarification + first-try-fit. resolve/set process,
 # request/submit photos, confirm critical dims, dfm_check, fit_report, make_fit_coupon.
 from mcp_server.intake_tools import register_intake_tools
-register_intake_tools(mcp)
+register_intake_tools(_reg.view(mcp, "intake"))
 
 # Interaction — the ONE ask_user seam (Pillar 9, contracts/interaction.md): typed questions
 # with suggested defaults surface as MCP elicitations; answers persist + replay via the shared
@@ -80,11 +86,11 @@ register_interaction_tools(mcp)
 
 # ECAD (schematic / PCB / native circuit sim).
 from mcp_server.ecad_tools import register_ecad_tools
-register_ecad_tools(mcp)
+register_ecad_tools(_reg.view(mcp, "ecad"))
 
 # CAM (computer-aided machining): toolpaths, feeds & speeds, material-removal sim, G-code post.
 from mcp_server.cam_tools import register_cam_tools
-register_cam_tools(mcp)
+register_cam_tools(_reg.view(mcp, "cam"))
 
 # Doc diff — semantic feature-level diff between two document revisions (T-H2).
 from mcp_server.doc_diff_tools import register_doc_diff_tools

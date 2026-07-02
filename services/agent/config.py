@@ -98,7 +98,7 @@ def provider_offline_safe(provider: Provider) -> bool:
     name = getattr(provider, "name", "")
     if name in ("mock", "mock-roles", "base"):
         return True
-    if name in ("anthropic", "gemini"):
+    if name in ("anthropic", "gemini", "openrouter"):
         return False  # always cloud
     base_url = getattr(provider, "base_url", None)
     if name == "openai":
@@ -147,6 +147,10 @@ def _resolve_provider(name: str | None, cfg: dict) -> Provider:
     if offline and name == "gemini":
         raise OfflineModeError(
             f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the Google Gemini "
+            f"cloud provider is refused. Use a local (loopback) model server instead.")
+    if offline and name == "openrouter":
+        raise OfflineModeError(
+            f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the OpenRouter "
             f"cloud provider is refused. Use a local (loopback) model server instead.")
     if offline and name in ("anthropic", "openai") and name != "":
         if name == "anthropic":
@@ -228,6 +232,17 @@ def _resolve_provider(name: str | None, cfg: dict) -> Provider:
                               base_url=oai.get("base_url"),
                               supports_vision=oai.get("vision", True),
                               timeout=float(oai.get("timeout", 120.0)))
+
+    if name == "openrouter":
+        # OpenAI-compatible endpoint pinned to OpenRouter. Key is BYO (OPENROUTER_API_KEY)
+        # or minted by the blessed PKCE login and stored as api_key (contract §4.1).
+        from .providers.openrouter_provider import OpenRouterProvider, DEFAULT_MODEL
+
+        key = cfg.get("api_key") or os.environ.get("OPENROUTER_API_KEY")
+        oc = cfg.get("openrouter", {}) or {}
+        return OpenRouterProvider(api_key=key, model=cfg.get("model", DEFAULT_MODEL),
+                                  supports_vision=oc.get("vision", True),
+                                  timeout=float(oc.get("timeout", 120.0)))
 
     if name in ("llamacpp", "llama.cpp", "llama-cpp"):
         from .providers.llamacpp_provider import LlamaCppProvider, DEFAULT_MODEL

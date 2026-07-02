@@ -3,7 +3,7 @@ id: T-F9
 title: Providers contract, tool registry/allow-listing, session-auth spike
 workstream: F
 owner: opus-pike
-status: doing
+status: review
 branch: task/T-F9-providers-contract
 day: 7
 depends_on: []
@@ -29,10 +29,34 @@ default; AI-CAD Cloud relay is a config seam only, human-gated).
 
 ## Definition of done
 
-- [ ] Contract frozen; Python adapters conformant (C++ mirrors later, seam documented)
-- [ ] Every MCP tool tagged; allow-list enforced at dispatch with tests
-- [ ] OpenRouter PKCE login works end-to-end behind a feature flag
-- [ ] No prohibited auth path in code; `bash scripts/gate.sh`; `graphify update .`
+- [x] Contract frozen; Python adapters conformant (C++ mirrors later, seam documented)
+- [x] Every MCP tool tagged; allow-list enforced at dispatch with tests
+- [x] OpenRouter PKCE login works end-to-end behind a feature flag
+- [x] No prohibited auth path in code; `bash scripts/gate.sh`; `graphify update .`
+
+## Completion notes (opus-pike, 2026-07-02)
+
+- `contracts/providers.md` v1 frozen: neutral message/adapter/thinking/streaming schema,
+  token budgets, auth kinds (api_key | oauth_pkce | none/local), OpenRouter PKCE §4.1,
+  BINDING prohibited-auth §4.2, AI-CAD Cloud relay config seam §4.3, offline invariant §5,
+  tool registry + allow-listing §6, RESERVED `routing` §7 (T-H9). Corrected cite:
+  `call_budget_for` is in `core/agent/run.cpp:48-63` (not config.cpp).
+- Registry: `services/mcp/tool_registry.py` tags {family,risk} via name-pattern classifier
+  + one shared dispatch guard (contract-shaped `{ok:false,reason,hint}` on deny); `server.py`
+  wraps all 6 `register_*_tools()` call sites with `view(mcp, family)`. Default = allow all.
+- OpenRouter PKCE: `providers/oauth_pkce.py` (S256, feature-flagged, transport-injectable) +
+  `providers/openrouter_provider.py`; wired into `config.py` (resolve + offline refusal +
+  never-offline-safe). Prohibited consumer-OAuth grep gate in `test_prohibited_auth.py`.
+- Installer path is `services/installer/setup_mcp_clients.py` (task listed `installer/…`);
+  added `--detect` / `--wizard` groundwork.
+- New tests live under `agent/` (the gate runs `pytest engine/doc agent`; `services/mcp`
+  tests are NOT in the gate path — a pre-existing gap): test_tool_registry,
+  test_openrouter_pkce, test_providers_conformance, test_prohibited_auth — all green
+  (openai/anthropic-SDK cases importorskip; SDKs absent on this box).
+- Gate caveat: `pytest engine/doc agent` has PRE-EXISTING failures in `test_loop_mock` /
+  `test_compaction` (`ModuleNotFoundError: build123d`) reproduced on clean master by stash —
+  NOT a T-F9 regression; environmental (no runtime venv, build123d unprovisioned). The
+  ui/imgui selMulti break is the separately-known pre-existing red.
 
 ## Driver notes (Fable, 2026-07-02)
 

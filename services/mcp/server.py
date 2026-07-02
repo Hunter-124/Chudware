@@ -79,6 +79,10 @@ register_ecad_tools(mcp)
 from mcp_server.cam_tools import register_cam_tools
 register_cam_tools(mcp)
 
+# Doc diff — semantic feature-level diff between two document revisions (T-H2).
+from mcp_server.doc_diff_tools import register_doc_diff_tools
+register_doc_diff_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

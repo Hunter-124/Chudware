@@ -11,6 +11,7 @@
 #include "doc/stepplus.h"
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -116,6 +117,44 @@ std::string iso_utc_now() {
     throw OpError("io_error", msg, json{{"reason", msg}});
 }
 
+// ------------------------------------------------------------------ canonical JSON
+//
+// Policy (T-H2 / contracts/doc_schema.md §Canonical dump):
+//   - Floats are rounded at serialize time ONLY (in-memory precision unchanged):
+//       * mm-valued quantities: 6 decimal places (µm resolution)
+//       * degree-valued quantities: 3 decimal places (1e-3 deg resolution)
+//   - Both length and angle fields are stored as the same float in JSON, so we
+//     apply a single rounding pass at 6 dp (µm covers both: 1e-3 deg ≫ needed).
+//   - nlohmann::json uses std::map → keys are already sorted alphabetically.
+//   - The resulting string is deterministic for the same document tree.
+//
+// Recursively round every JSON float to `decimals` decimal places.
+json round_floats(const json& v, int decimals = 6) {
+    const double factor = std::pow(10.0, decimals);
+    if (v.is_number_float()) {
+        double d = v.get<double>();
+        return json(std::round(d * factor) / factor);
+    }
+    if (v.is_array()) {
+        json out = json::array();
+        for (const auto& elem : v) out.push_back(round_floats(elem, decimals));
+        return out;
+    }
+    if (v.is_object()) {
+        json out = json::object();
+        for (auto& [k, val] : v.items()) out[k] = round_floats(val, decimals);
+        return out;
+    }
+    return v;  // bool, int, null, string — unchanged
+}
+
+// Return the canonical document.json serialization:
+//   round_floats(doc, 6) then dump(2).  Keys are sorted because nlohmann::json
+//   (std::map) always iterates in lexicographic order.
+std::string canonical_doc_json(const json& doc) {
+    return round_floats(doc).dump(2);
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------------- save
@@ -140,8 +179,9 @@ std::string stepplus_save(const json& doc, const std::string& path,
         {"name", doc.value("name", std::string("Untitled"))},
     };
 
-    const std::string document = doc.dump(2);
-    const std::string meta_json = meta.dump(2);
+    // Canonical dump: sorted keys (std::map) + float rounding (6 dp = µm grade).
+    const std::string document = canonical_doc_json(doc);
+    const std::string meta_json = meta.dump(2);  // meta.json timestamps exempt from stability DoD
 
     // thumbnail: reuse a carried one if present, else the flat-grey placeholder.
     std::string thumb;

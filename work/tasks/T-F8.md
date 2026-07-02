@@ -30,3 +30,14 @@ ECAD (promote the bespoke `ecad_status` into the GSL layer), and the DAG run its
 - [ ] Three describers on the narration contract, cad_guide topics added
 - [ ] `_format_fit` has one home; build loop calls the shared one
 - [ ] Tests green; `bash scripts/gate.sh`; `graphify update .`
+
+## Follow-ups inherited from T-F7 (Fable, 2026-07-02)
+
+- Extend `_persist_study` to store the max-von-Mises node/face location so
+  `describe_results` can say WHERE the max stress is (T-F7 Q2; currently narrated as
+  explicitly-unavailable per the contract's honesty rule).
+- Expose per-op stepdown/stepover through a read RPC (cam_extract or cam_tree) so
+  `describe_toolpaths` can render those lines unconditionally (T-F7 Q3).
+- `contracts/narration.md` now codifies the REAL RPC shapes (verified against C++
+  sources by T-F7) — trust it over older notes; cam_simulate emits
+  `results[].{machined_fraction, gouges, rapid_collisions, cycle_time_s}`.

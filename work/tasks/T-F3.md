@@ -2,8 +2,8 @@
 id: T-F3
 title: Freeze interaction contract - ask_user core, in-app dialog, MCP elicitation
 workstream: F
-owner: unassigned
-status: todo
+owner: opus-rook
+status: doing
 branch: task/T-F3-interaction-contract
 day: 7
 depends_on: []

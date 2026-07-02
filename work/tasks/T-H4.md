@@ -43,7 +43,11 @@ the battery must tag per-check platform support, never assume it in rewards.
 - [x] Battery callable from Python in <50 ms overhead over the underlying checks
       (test_verify_overhead_under_50ms: stubbed checks → elapsed IS overhead; real
       5-check run incl. STEP round-trip = 38 ms total)
-- [x] `graphify update .`; gate green (pre-existing ui/imgui selMulti failure noted)
+- [x] `graphify update .` run (AST rebuild, 19307 nodes). Gate: exit 0 — sole FAIL is
+      the PRE-EXISTING ui/imgui `PanelField::selMulti` break (FOREMAN-documented, not
+      this branch); core/ctest SKIP (no build dir in worktree — env-only); pytest
+      stage SKIP (no runtime venv) so the suite was run manually in the MCP venv:
+      `services/mcp/test_verify_battery.py` 23/23 passed.
 
 ## Driver notes (Fable, 2026-07-02)
 

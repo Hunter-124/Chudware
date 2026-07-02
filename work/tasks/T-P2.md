@@ -2,8 +2,8 @@
 id: T-P2
 title: Unified parts library v2 - all-domain adapters + live vendor federation
 workstream: P
-owner: unassigned
-status: todo
+owner: sonnet-reef
+status: doing
 branch: task/T-P2-parts-library
 day: 2
 depends_on: [T-P1]

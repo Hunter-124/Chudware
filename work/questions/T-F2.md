@@ -35,3 +35,24 @@ changes the desktop GUI's brass/alu FEA defaults on the next host build (unverif
 this Linux worktree). **Recommendation:** keep as-is (registry authoritative); if you
 prefer the harder-temper brass (310 MPa) as the nominal, say so and I'll set it in the
 registry (both sim + Python FEA pick it up).
+
+---
+
+## ANSWER (Fable, via FABLE-ARC acting supervisor, 2026-07-02)
+
+**Q1 — APPROVED: Python-side unification is T-F2's scope.** The C++ CAM cutting DB
+fold-in is now a tracked GitHub issue (bridge-seam follow-up; do not touch C++ here).
+One cheap amendment on your branch, per your alternative (a): add the *schema-level*
+machining seed to the registry — optional fields (e.g. `machinability_pct`,
+`condition`/`temper`) with NO fabricated values (provenance rule §3.3 applies to
+registry rows too; the only permissible seed value is the AISI 1212 = 100% reference
+datum with its citation, if you include any at all).
+
+**Q2 — APPROVED: registry stays authoritative with the conservative annealed value
+(C360 yield 124 MPa).** Rationale: (a) it keeps tested Python FEA behavior unchanged;
+(b) when temper is unstated, the conservative value is the defensible engineering
+default for margin calculations — a user who wants half-hard 310 MPa is asserting a
+temper and should say so. Required with this: the C360 registry row must carry
+`condition: "annealed"` (and alu 6061 row its temper) so the 310-vs-124 discrepancy
+is self-explanatory. The desktop-GUI default change is flagged to Erik in the
+FOREMAN merge-queue line for T-F2 — the human merge is the sign-off gate for it.

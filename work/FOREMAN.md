@@ -103,3 +103,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 Fable REVIEWED T-F13: LGTM merge-ready as flag-gated-OFF code (8/8 tests, honest tie vs baseline on synthetic eval; real GO/NO-GO needs --count 200 regen — follow-up noted, kill-switch discipline holds)
 - 2026-07-02T12:56Z sonnet-nell REVIEW T-F7 branch=task/T-F7-narration-core
 - 2026-07-02 Fable REVIEWED T-F7: LGTM merge-ready (contract + both describers, 14/14 tests vs real engine, baseline-verified pre-existing failures); answered Q2-Q4 on-branch; follow-ups seeded into T-F8; NOTE: staged .so is stale (predates sim_run_static) — next C++ task refreshes it
+- 2026-07-02T13:00Z opus-rook QUESTION T-F3 (3 arch decisions logged, non-blocking; proceeding)

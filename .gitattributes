@@ -1,0 +1,2 @@
+services/mcp/server.py merge=union
+contracts/licenses.md merge=union

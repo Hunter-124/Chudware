@@ -384,6 +384,8 @@ class Diagnosis:
     n_applied: int
     failures: list[dict]
     raw_reply: str = ""
+    artifact_id: Optional[str] = None   # the IP-18 ai_artifact this fix belongs to (for action
+    run_id: Optional[str] = None        # events to correlate against; from the logged emit)
 
 
 def _parse_reply(reply: str) -> tuple[str, list[dict]]:
@@ -417,12 +419,23 @@ def diagnose(document: dict, provider: Provider, *,
     failures = detect_failures(document)
     prompt = build_diagnosis_prompt(document, failures, engine_error=engine_error)
 
+    # Capture the logged IP-18 ai_artifact's id/run_id so a downstream accept/reject action
+    # (regen_card.emit_action) can correlate against it in the exporter (T-H5).
+    captured: dict = {"artifact_id": None, "run_id": run_id}
+
+    def _sink(ev: dict) -> None:
+        if ev.get("kind") == "ai_artifact" and captured["artifact_id"] is None:
+            captured["artifact_id"] = ev.get("artifact_id")
+            captured["run_id"] = ev.get("run_id")
+        if on_event is not None:
+            on_event(ev)
+
     call_provider = provider
     if wrap_logging:
         try:
             from .providers.logging_provider import LoggingProvider
             call_provider = LoggingProvider(
-                provider, on_event=on_event, insertion_point=insertion_point,
+                provider, on_event=_sink, insertion_point=insertion_point,
                 suppress_emit=False, consent_fn=consent_fn, run_id=run_id,
                 sidecar_dir=_sidecar_dir(),
             )
@@ -435,4 +448,5 @@ def diagnose(document: dict, provider: Provider, *,
     return Diagnosis(
         diagnosis=diagnosis_text, fix_ops=fix_ops, fixed_document=fixed_doc,
         n_applied=n_applied, failures=[f.to_dict() for f in failures], raw_reply=reply,
+        artifact_id=captured["artifact_id"], run_id=captured["run_id"],
     )

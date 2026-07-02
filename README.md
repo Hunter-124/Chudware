@@ -117,10 +117,13 @@ work/workd.sh <your-name>                # (or work\workd.bat) — presence/sync
 work/report.sh                           # (or work\report.bat) — AI-guided issue reporter
                                           # GUI: draft a bug/idea -> linked GitHub issue +
                                           # work/backlog task in one step
+work/run_version_control.sh              # (or work\run_version_control.bat) — team-progress
+                                          # dashboard: Human Roadblocks / DAG / Graphify
+                                          # Preview / Verify tabs
 ```
 
 Once registered, `/work-board`, `/work-pick`, `/work-sync`, `/work-issues`, `/work-msg`,
-`/work-report`, and thirteen per-section `/ctx-*` commands (pre-mapped source maps —
+`/work-report`, `/work-dashboard`, and thirteen per-section `/ctx-*` commands (pre-mapped source maps —
 `work/context/*.md` — so agents don't burn tokens re-exploring a subsystem) are available
 in every Claude Code session in this repo. This is entirely per-machine setup (each
 contributor runs it locally on Windows/macOS/Linux — nothing here touches shared repo
@@ -140,31 +143,44 @@ Two things to expect on first run, either platform:
 has everything needed in the `aicad-team` MCP tools; no raw `git`/`gh` juggling required:
 
 ```
-work_board                              # situational awareness: full task board + who's
-                                         # online + open issues — call this first, always
-work_claim(owner="you")                 # atomically claim the next ready task (or a
-                                         # specific task_id) — the ONLY legitimate way in
+whoami(name="you")                      # once per machine — every owner/agent param below
+                                         # can then be omitted, resolved from this identity
+work_board(format="json")               # situational awareness: full task board (optional
+                                         # workstream/owner/status filters) + who's online +
+                                         # open issues — call this first, always
+claim(kind="task")                      # atomically claim the next ready task (kind="issue"
+                                         # + id=N claims a GitHub issue instead) — the ONLY
+                                         # legitimate way in, same double-claim protection
+                                         # for both kinds
 work_prompt(task_id="T-XX")             # emit the self-contained work order for it
   ...do the work, on the branch the work order names...
-work_note(task_id, owner, text)         # log progress so parallel sessions/humans stay
-                                         # current — use at real milestones
-work_status(task_id, owner,             # doing -> review when pushed and awaiting human
-            status="review")           # merge (status can never be set to "done" here —
+note(kind="task", id="T-XX", text=...)  # log progress so parallel sessions/humans stay
+                                         # current — use at real milestones (kind="issue"
+                                         # posts a GitHub comment instead)
+set_status(kind="task", id="T-XX",      # doing -> review when pushed and awaiting human
+           status="review")            # merge (status can never be set to "done" here —
                                          # that's a human merge-time action)
 
 issue_list()                            # before fixing any bug: check nobody else has it
-issue_claim(number)                     # claim it on GitHub so fixes never overlap
 graphify_query / graphify_explain /     # scoped subgraph answers instead of repeated
-  graphify_path                         # grep/read loops — use before raw file search
-section_context(section="core-cam")     # pre-mapped source map for a subsystem — see
-                                         # available sections with no args
-team_status / team_send                 # who else is active right now, and message them
+  graphify_path                         # grep/read loops — flags staleness automatically
+section_context(section="core-cam")     # pre-mapped source map for a subsystem — no-args
+                                         # listing now includes a one-line blurb per section
+team_status / team_send                 # who else is active right now, and message them —
+                                         # presence auto-updates as you call these tools,
+                                         # no daemon required
 ```
 
-Same rules either way (MCP tools or the `/work-*` slash commands are two doors to the
-same system): claim before starting, note progress, never flip anything to `done`
-yourself, and check `issue_list`/`work_board` before touching something someone else
-might already be on. Full protocol: [work/README.md](work/README.md)
+`claim`/`release`/`set_status`/`note` collapse what used to be two parallel systems
+(`work_claim`/`work_release`/`work_status`/`work_note` for tasks, `issue_claim`/
+`issue_comment` for GitHub issues) into one `kind`-tagged model — the legacy names still
+work and route to the same place, so nothing already scripted against them breaks. Same
+rules either way (MCP tools or the `/work-*` slash commands are two doors to the same
+system): claim before starting, note progress, never flip anything to `done` yourself,
+and check `issue_list`/`work_board` before touching something someone else might already
+be on. `/work-dashboard` gives the same picture visually (task DAG, human-roadblock
+queue, graphify preview, DoD/gate.sh verification) for anyone who'd rather look than call
+tools directly. Full protocol: [work/README.md](work/README.md)
 and [work/prompts/autopilot.md](work/prompts/autopilot.md).
 
 ## Where this is going

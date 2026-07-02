@@ -7,10 +7,12 @@ front matter (key: value, inline lists like [T-A1, T-B2]). Stdlib only.
 Usage:
   python3 work/tools/work.py validate
   python3 work/tools/work.py ready [--owner NAME]
-  python3 work/tools/work.py board
+  python3 work/tools/work.py board [--workstream X] [--owner Y] [--status Z] [--json]
   python3 work/tools/work.py dag        # regenerates work/DAG.md
+  python3 work/tools/work.py relink ID --owner NAME [--depends-on A,B] [--workstream X]
 """
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -130,9 +132,23 @@ def cmd_ready(tasks, errors, args):
     return 0
 
 
-def cmd_board(tasks, errors, _args):
+def cmd_board(tasks, errors, args):
+    rows = list(tasks.values())
+    if getattr(args, "workstream", None):
+        rows = [t for t in rows if t.get("workstream", "").lower() == args.workstream.lower()]
+    if getattr(args, "owner", None):
+        rows = [t for t in rows if t.get("owner", "").lower() == args.owner.lower()]
+    if getattr(args, "status", None):
+        rows = [t for t in rows if t.get("status", "").lower() == args.status.lower()]
+
+    if getattr(args, "json", False):
+        out = [{k: v for k, v in t.items() if not k.startswith("_")}
+               for t in sorted(rows, key=lambda x: x["id"])]
+        print(json.dumps(out))
+        return 0
+
     by_ws = {}
-    for t in tasks.values():
+    for t in rows:
         by_ws.setdefault(t.get("workstream", "?"), []).append(t)
     for ws in sorted(by_ws):
         print(f"\n== workstream {ws} ==")
@@ -371,6 +387,81 @@ def cmd_release(tasks, errors, args):
         lock.unlink(missing_ok=True)
 
 
+def cmd_relink(tasks, errors, args):
+    """Edit a task's depends_on / workstream — cycle-validated before writing. The
+    only place task topology gets rewritten; commits like note/status/release."""
+    lock = _lock()
+    try:
+        main = _main_worktree()
+        if _git(["remote"], main).stdout.strip():
+            _git(["pull", "--rebase", "--autostash"], main)
+        tasks, _ = load_tasks()
+        if args.task_id not in tasks:
+            raise RuntimeError(f"unknown task {args.task_id}")
+        t = tasks[args.task_id]
+
+        new_deps = t.get("depends_on", [])
+        if args.depends_on is not None:
+            new_deps = [d.strip() for d in args.depends_on.split(",") if d.strip()]
+        new_ws = args.workstream if args.workstream else t.get("workstream")
+
+        baseline = set(validate({tid: dict(tt) for tid, tt in tasks.items()}, []))
+        trial = {tid: dict(tt) for tid, tt in tasks.items()}
+        trial[args.task_id]["depends_on"] = new_deps
+        trial[args.task_id]["workstream"] = new_ws
+        new_errors = set(validate(trial, [])) - baseline
+        if new_errors:
+            raise RuntimeError("relink rejected — would break the DAG:\n  " +
+                               "\n  ".join(sorted(new_errors)))
+
+        updates = {"depends_on": "[" + ", ".join(new_deps) + "]"}
+        if args.workstream:
+            updates["workstream"] = new_ws
+        _set_front_matter(t["_path"], **updates)
+        _commit_task_change(t, f"relink {args.task_id} ({args.owner})")
+        print(f"RELINKED: {args.task_id} depends_on={new_deps} workstream={new_ws}")
+        return 0
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def cmd_checkdod(tasks, errors, args):
+    """Toggle one '## Definition of done' checklist item (0-based index) for a task."""
+    lock = _lock()
+    try:
+        main = _main_worktree()
+        if _git(["remote"], main).stdout.strip():
+            _git(["pull", "--rebase", "--autostash"], main)
+        tasks, _ = load_tasks()
+        if args.task_id not in tasks:
+            raise RuntimeError(f"unknown task {args.task_id}")
+        t = tasks[args.task_id]
+        text = t["_path"].read_text(encoding="utf-8")
+        lines = text.splitlines()
+        start = next((i for i, l in enumerate(lines) if l.strip() == "## Definition of done"), None)
+        if start is None:
+            raise RuntimeError(f"{args.task_id} has no '## Definition of done' section")
+        end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+        idxs = [i for i in range(start, end) if re.match(r"^\s*- \[[ xX]\]", lines[i])]
+        if not (0 <= args.index < len(idxs)):
+            raise RuntimeError(f"checklist index {args.index} out of range (0..{len(idxs) - 1})")
+        li = idxs[args.index]
+        checked = args.checked == "true"
+        lines[li] = re.sub(r"- \[[ xX]\]", f"- [{'x' if checked else ' '}]", lines[li], count=1)
+        t["_path"].write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _commit_task_change(t, f"checkdod {args.task_id}[{args.index}]={checked} ({args.owner})")
+        print(f"CHECKED: {args.task_id}[{args.index}] = {checked}")
+        return 0
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    finally:
+        lock.unlink(missing_ok=True)
+
+
 def cmd_prompt(tasks, errors, args):
     tid = args.task_id
     if tid not in tasks:
@@ -396,7 +487,11 @@ def main():
     sub.add_parser("validate")
     p_ready = sub.add_parser("ready")
     p_ready.add_argument("--owner")
-    sub.add_parser("board")
+    p_board = sub.add_parser("board")
+    p_board.add_argument("--workstream")
+    p_board.add_argument("--owner")
+    p_board.add_argument("--status")
+    p_board.add_argument("--json", action="store_true")
     sub.add_parser("dag")
     p_prompt = sub.add_parser("prompt")
     p_prompt.add_argument("task_id")
@@ -414,12 +509,23 @@ def main():
     p_rel = sub.add_parser("release")
     p_rel.add_argument("task_id")
     p_rel.add_argument("--owner", required=True)
+    p_relink = sub.add_parser("relink")
+    p_relink.add_argument("task_id")
+    p_relink.add_argument("--owner", required=True)
+    p_relink.add_argument("--depends-on", dest="depends_on", default=None)
+    p_relink.add_argument("--workstream", default=None)
+    p_checkdod = sub.add_parser("checkdod")
+    p_checkdod.add_argument("task_id")
+    p_checkdod.add_argument("--owner", required=True)
+    p_checkdod.add_argument("--index", type=int, required=True)
+    p_checkdod.add_argument("--checked", required=True, choices=["true", "false"])
     args = ap.parse_args()
     tasks, errors = load_tasks()
     fn = {"validate": cmd_validate, "ready": cmd_ready,
           "board": cmd_board, "dag": cmd_dag, "prompt": cmd_prompt,
           "claim": cmd_claim, "note": cmd_note, "status": cmd_status,
-          "release": cmd_release}[args.cmd]
+          "release": cmd_release, "relink": cmd_relink,
+          "checkdod": cmd_checkdod}[args.cmd]
     sys.exit(fn(tasks, errors, args))
 
 

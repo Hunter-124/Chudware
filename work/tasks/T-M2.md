@@ -2,8 +2,8 @@
 id: T-M2
 title: CAM overhaul: true adaptive clearing (trochoidal arc-blend linking)
 workstream: M
-owner: unassigned
-status: todo
+owner: opus-flux
+status: doing
 branch: task/T-M2-cam-overhaul
 day: 2
 depends_on: []

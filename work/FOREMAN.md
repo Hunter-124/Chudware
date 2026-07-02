@@ -93,6 +93,7 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 fable-arc DISPATCHED parallel Opus drivers: opus-ivy T-F1, opus-rook T-F3, opus-sage T-F5, opus-pike T-F9 (Erik-authorized widening; T-F3 driver owns agent_panel hot-spot per first-claimer rule, briefed to keep panel edits minimal/append-only)
 - 2026-07-02 sonnet-tomo REVIEW T-H4 branch=task/T-H4-verifier-battery
 - 2026-07-02 sonnet-tomo QUESTION T-H4 (coordination notes only, non-blocking: T-F10 groundedness ownership, T-H3 req_join stub — work/questions/T-H4.md on the branch)
+- 2026-07-02 sonnet-mira CLAIMED T-G2
 
 ## For Erik (batched by Fable — answered-where-possible, only true human calls land here)
 

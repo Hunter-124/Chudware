@@ -140,6 +140,11 @@ register_hydraulic_tools(mcp)
 from mcp_server.recon_tools import register_photo_recon_tools
 register_photo_recon_tools(mcp)
 
+# Firmware (embedded compile loop): fw_new_project / fw_build / fw_sources — auto-selects the MCU
+# target and generates a pinmap.h header from the linked ECAD board's netlist (T-C2).
+from mcp_server.firmware_tools import register_firmware_tools
+register_firmware_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

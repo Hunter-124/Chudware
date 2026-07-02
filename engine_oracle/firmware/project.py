@@ -171,16 +171,33 @@ def _synth_compile_commands(project: FirmwareProject) -> Path:
 # --------------------------------------------------------------------------- create
 
 
-def new_project(board_doc_ref: Optional[str], mcu: str, toolchain: str = "cmake",
-                *, name: Optional[str] = None, root: Optional[Path] = None) -> FirmwareProject:
+def new_project(board_doc_ref: Optional[str], mcu: Optional[str] = None, toolchain: str = "cmake",
+                *, name: Optional[str] = None, root: Optional[Path] = None,
+                board_doc: Optional[dict] = None) -> FirmwareProject:
     """Create a new firmware project directory seeded from the toolchain template.
 
     Creates ``<firmware_root>/<project_id>/`` (or ``root`` if given), copies the CMake template,
     records ``src_paths`` from the template, writes a synthetic ``compile_commands.json`` (so the
     contract guarantee in §6 holds without a cross-toolchain installed), and persists ``project.json``.
+
+    ``mcu`` (the firmware ``mcu_family``) is **optional** (T-C2): when omitted, the family is
+    auto-selected from the linked ECAD BOM — the first MCU component of ``board_doc`` (or the doc
+    that ``board_doc_ref`` resolves to). If no family can be given or derived, raises ``ValueError``
+    rather than guessing an MCU. Passing ``mcu`` explicitly keeps the original behaviour unchanged.
     """
     if toolchain not in _VALID_TOOLCHAINS:
         raise ValueError(f"toolchain must be one of {_VALID_TOOLCHAINS}, got {toolchain!r}")
+
+    if not mcu:
+        from engine.firmware import mcu_pinouts
+        doc = board_doc if board_doc is not None else mcu_pinouts.resolve_board_doc(board_doc_ref)
+        if doc is not None:
+            mcu = mcu_pinouts.select_mcu_family(doc)
+        if not mcu:
+            raise ValueError(
+                "new_project: no `mcu` given and none derivable from the ECAD BOM "
+                "(need an STM32*/ESP32*/ATmega* MCU component in board_doc_ref, or pass mcu "
+                "explicitly)")
 
     project_id = uuid.uuid4().hex[:12]
     proj_root = Path(root) if root is not None else (firmware_root() / project_id)

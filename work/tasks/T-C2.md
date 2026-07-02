@@ -3,8 +3,8 @@ id: T-C2
 title: Compile loop and pin-map header from ECAD netlist
 workstream: C
 owner: opus-crag
-status: doing
-branch: task/T-C2-compile-loop-pinmap
+status: review
+branch: task/T-C2-compile-loop
 day: 2
 depends_on: [T-C1]
 ---
@@ -35,11 +35,39 @@ Day 2's killer feature: the MCU selected in the ECAD schematic BOM seeds the fir
 
 ## Definition of done
 
-- [ ] `generate_pinmap()` produces a valid C header from ECAD net names
-- [ ] `new_project()` auto-selects MCU family from ECAD BOM when `mcu` param not specified
-- [ ] `fw_new_project`, `fw_build`, `fw_sources` MCP tools registered and functional
-- [ ] `fw_build` returns `{success, elf_path, stderr, warnings}` dict
-- [ ] `python -m pytest engine_oracle/firmware/test_pinmap.py engine_oracle/firmware/test_mcp_tools.py -q` passes
+- [x] `generate_pinmap()` produces a valid C header from ECAD net names — `pinmap.py`; board
+  `nets` list or schematic `build_netlist`; power/ground rails skipped; positional names (`PA5`→5,
+  `GPIO4`→4, `D13`→13) decode via `mcu_pinouts.resolve_pin`, named nets get logical indices (≥1000);
+  guarded `#ifndef AICAD_PINMAP_H` header.
+- [x] `new_project()` auto-selects MCU family from ECAD BOM when `mcu` param not specified —
+  `project.new_project` (`mcu` now optional) + `mcu_pinouts.select_mcu_family`/`resolve_board_doc`
+  (resolves an open doc_id or a `.ecad+`/`.json` path). STM32*→cortex-m4, ESP32*→xtensa-lx6,
+  ATmega*→avr. Errors (never guesses) when neither `mcu` nor a derivable BOM MCU is present.
+- [x] `fw_new_project`, `fw_build`, `fw_sources` MCP tools registered and functional —
+  framework-free handlers in `engine/firmware/mcp_tools.py`; FastMCP wrappers in
+  `services/mcp/firmware_tools.py`; registered append-only in `services/mcp/server.py` (stub-register
+  verified: exactly the 3 tools). `fw_new_project` also seeds `build/include/pinmap.h`.
+- [x] `fw_build` returns `{success, elf_path, stderr, warnings}` dict — returns the full
+  `BuildResult` dict (§3); tool-absent path is graceful (`success=False`, `returncode=-1`), not an
+  error envelope — see Q2 in `work/questions/T-C2.md` (DoD-over-§5 interpretation, non-blocking).
+- [x] `python -m pytest engine_oracle/firmware/test_pinmap.py engine_oracle/firmware/test_mcp_tools.py -q`
+  passes — **40 passed** (mcp-venv); full `engine/firmware/` suite **50/50** (incl. C1's 10).
+
+## Gate & closeout notes (opus-crag)
+
+`bash scripts/gate.sh` → **FAIL**, but every failing stage is pre-existing / out-of-lane; none is mine:
+- `ui/imgui` build fails on `PanelField::selMulti` — the KNOWN break fixed on master at `b569020`.
+  This branch is chained off `task/T-C1-firmware-scaffold`, which predates that fix; I touched **zero**
+  C++/ui files (`git diff --stat …-- '*.cpp' '*.h'` is empty). Rebases away once C1→C2 land post-b569020.
+- gate `pytest` FAILs because it runs system `python3 -m pytest` (deselects all 25 — the known
+  venv-skip trap). Under `~/.local/share/AI-CAD/mcp-venv` my paths are green (above). The wider
+  `engine/ecad` suite has pre-existing failures/errors under py3.14 (`test_impedance` import,
+  `test_sync`) in files I never touched.
+- `check.py` (feature_surface_audit + parity_audit) = FAIL-RECORDED non-fatal (pre-existing, per the
+  gate summary). `core build` / `ui/abstract` / `ctest` all PASS.
+
+Open questions (both non-blocking, recommended answers implemented): `work/questions/T-C2.md`.
+`branch:` corrected to the actual worktree branch `task/T-C2-compile-loop`.
 
 ## AI hints
 

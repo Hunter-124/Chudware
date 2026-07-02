@@ -139,6 +139,20 @@ def scan_library_folder(folder: str | None = None) -> dict:
     return {"scanned": scanned, "added": added, "updated": updated, "parts": touched}
 
 
+def resolve_priced_part(mpn: str) -> dict | None:
+    """Resolve a manufacturer part number to a priced VendorPart record, or ``None``.
+
+    This is the default catalog-lookup resolver: it dispatches through the priced-provider
+    :class:`~engine.parts_providers.ProviderChain` (Nexar → Digi-Key → Mouser). Returns the
+    first provider's §1 record dict (contracts/sourcing_schema.md), or ``None`` when every
+    provider declines (no credentials / no results) — a graceful "no price feed" state, never a
+    raised traceback or a network call without configured keys. The provider chain is
+    constructed lazily so importing this scanner never pulls in the HTTP/provider surface.
+    """
+    from engine import parts_providers
+    return parts_providers.default_pricing_chain().fetch(str(mpn or ""))
+
+
 EmitFn = Callable[[dict], None]
 
 

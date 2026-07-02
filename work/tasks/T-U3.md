@@ -1,0 +1,41 @@
+---
+id: T-U3
+title: CAM workspace UI — job tree, tool table, sim results, post/setup-sheet
+workstream: U
+owner: unassigned
+status: todo
+branch: task/T-U3-ui
+day: 3
+depends_on: [T-U1]
+---
+
+## Context
+
+The CAM backend (28 op types, 8 post dialects, dexel sim, T-M overhaul in flight) has
+no coherent workspace UI. This is the Manufacture tab's real panel set.
+
+## Files / areas touched
+
+- ui/abstract/cam_view.h + ui/imgui/src/ui/cam_panel.* (scaffolded): job/setup/op tree,
+  tool table editor, op parameter forms (REUSE panel_spec forms — the 44-form table
+  already includes CAM ops; extend there, not bespoke), sim results strip (removed
+  volume, gouges, rapid hits, holder collisions when T-M3 lands), post dialect picker +
+  setup-sheet/export actions
+- Worker-RPC to the existing cam_* surfaces (append-only registration)
+
+## Definition of done
+
+- [ ] Job tree reflects cam_job_tree live; op add/edit through panel_spec forms
+- [ ] Tool table CRUD persisted via cam_add_tool/update paths
+- [ ] Simulate button renders SimResult summary w/ warnings (incl. holder_collisions
+      field — degrade gracefully if T-M3 unmerged)
+- [ ] Post + setup-sheet actions produce files; dialect picker lists cam_post_dialects
+- [ ] Headless screenshots: empty state + populated job; ui_style_check green; gate;
+      graphify update .
+
+## Driver notes (Fable)
+
+- Coordinate with the T-M wave via the board — backend contracts are stable MCP tools;
+  UI must not block on M2-M5. panel_spec.cpp is shared infrastructure: additions
+  append-only (44-form precedent, b569020).
+- describe_toolpaths (T-F7) gives you the narration string for the sim strip — reuse.

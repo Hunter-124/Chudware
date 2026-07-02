@@ -555,3 +555,16 @@ R1-editable insertion in every domain; standard-before-custom bias in the agent 
 Execution: workstream P (T-P1 contract+search core → T-P2 all-domain adapters+vendor
 federation → T-P3 insertion parity+agent wiring+demo). Paid catalogs (TraceParts/Werk24,
 backlog T-BL12) join as providers behind the same seam when volume justifies spend.
+
+## Pillar 18 — Feature-UI coherence & productization (added 2026-07-03, project-lead pass)
+
+Every Pillar 8–17 backend earns a UI through workstream U, ALL of it built on the T-U1
+style-conformance kit (pattern library + panel scaffold + automated style checks) so
+parallel agents produce ONE coherent liquid-glass app, enforced by the recursive T-G12
+walkthrough loop. Panels: parts browser (U2), CAM workspace (U3), BOM/sourcing (U4),
+requirements+verification (U5), sim studies (U6), new-doc-kind viewers (U7), model &
+telemetry transparency (U8). Productization is workstream Q: installers+first-run (Q1,
+consent default OFF), autosave/crash recovery + consent-tied diagnostics (Q2), sample
+gallery + tours (Q3, Pillar-17 dogfood), auto-generated living manual (Q4, the reserved
+make_manual template). UI edit-parity for the U7 doc kinds is deliberately deferred to
+walkthrough-driven prioritization.

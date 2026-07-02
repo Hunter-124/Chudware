@@ -75,7 +75,7 @@ graph TD
     T_G4["T-G4: GUI dead-code and cleanliness pass on host/"]:::done
     T_G5["T-G5: GUI migration wave 1 - foundation libs (F1-F4 + G1 gate)"]:::done
     T_G6["T-G6: GUI migration wave 2 - shell chrome (S1-S6, H5 start, G2 gate)"]:::doing
-    T_G7["T-G7: GUI migration wave 3 - core panels (C1-C6, G3 gate)"]:::todo
+    T_G7["T-G7: GUI migration wave 3 - core panels (C1-C6, G3 gate)"]:::doing
     T_G8["T-G8: GUI migration wave 4 - hard subsystems (H1-H5, G4 gate)"]:::todo
     T_G9["T-G9: GUI migration wave 5 - polish, parity battery, cutover (P1, P2, G5)"]:::todo
   end
@@ -96,14 +96,30 @@ graph TD
     T_M1["T-M1: CAM overhaul: fix critical post-processor correctness (C++)"]:::doing
     T_M2["T-M2: CAM overhaul: true adaptive clearing (trochoidal arc-blend linking)"]:::todo
     T_M3["T-M3: CAM overhaul: holder/shank collision simulation"]:::todo
-    T_M4["T-M4: CAM overhaul: feeds/speeds DB unification with engine materials registry"]:::todo
+    T_M4["T-M4: CAM overhaul: feeds/speeds DB unification with engine materials registry"]:::doing
     T_M5["T-M5: CAM overhaul: OCCT hole-extraction completeness (counterbore/countersink/tilt)"]:::todo
     T_M6["T-M6: CAM overhaul: pocket entry fix + arc-true stock simulation"]:::doing
   end
   subgraph WS_P["workstream P"]
-    T_P1["T-P1: Unified parts library v1 - parts/1 contract, federated search core, first two adapters"]:::todo
+    T_P1["T-P1: Unified parts library v1 - parts/1 contract, federated search core, first two adapters"]:::doing
     T_P2["T-P2: Unified parts library v2 - all-domain adapters + live vendor federation"]:::todo
     T_P3["T-P3: Unified parts library v3 - part_place insertion parity + agent wiring + demo"]:::todo
+  end
+  subgraph WS_Q["workstream Q"]
+    T_Q1["T-Q1: Packaging & first-run — Linux+Windows installers, dependency bundling"]:::todo
+    T_Q2["T-Q2: Autosave, crash recovery & consent-tied diagnostics"]:::todo
+    T_Q3["T-Q3: Sample project gallery + guided tours"]:::todo
+    T_Q4["T-Q4: User manual auto-generation — cad_guide + inventory → living docs"]:::todo
+  end
+  subgraph WS_U["workstream U"]
+    T_U1["T-U1: UI kit: style-conformance scaffold + pattern library for all new feature panels"]:::todo
+    T_U2["T-U2: Parts browser panel — federated search, detail card, insert"]:::todo
+    T_U3["T-U3: CAM workspace UI — job tree, tool table, sim results, post/setup-sheet"]:::todo
+    T_U4["T-U4: BOM & sourcing panel — rollup, prices, quote-out"]:::todo
+    T_U5["T-U5: Requirements & verification panel — req status, battery results"]:::todo
+    T_U6["T-U6: Simulation studies manager — study list, results, convergence caveats"]:::todo
+    T_U7["T-U7: New-doc-kind viewers v1 — piping, hydraulic, structural"]:::todo
+    T_U8["T-U8: Model & telemetry transparency UI — consent, which-brain, canary opt-in"]:::todo
   end
   subgraph WS_backlog["workstream backlog"]
     T_BL01["T-BL01: V&V benchmark harness"]:::backlog
@@ -201,4 +217,14 @@ graph TD
   T_M6 --> T_M3
   T_P1 --> T_P2
   T_P2 --> T_P3
+  T_G6 --> T_U1
+  T_U1 --> T_U2
+  T_P2 --> T_U2
+  T_U1 --> T_U3
+  T_U1 --> T_U4
+  T_U1 --> T_U5
+  T_U1 --> T_U6
+  T_U1 --> T_U7
+  T_U1 --> T_U8
+  T_H9 --> T_U8
 ```

@@ -3,7 +3,7 @@ id: T-D5
 title: Cost takeoff and struct_estimate MCP tool with integration demo
 workstream: D
 owner: sonnet-birch
-status: doing
+status: review
 branch: task/T-D5-cost-takeoff-demo
 day: 5
 priority: 3
@@ -35,11 +35,26 @@ Day 5 delivers cost takeoff from the structure doc: board-feet for lumber, steel
 
 ## Definition of done
 
-- [ ] `board_feet()` returns correct BF for 4x4 post × 8ft = 10.67 BF
-- [ ] `struct_estimate` MCP tool returns a line-item estimate with totals
-- [ ] `struct_estimate` for the demo cedar post returns a total cost in the $50–200 range
-- [ ] `bom_bridge.py` produces BomLine-compatible output consumable by `bom_rollup`
-- [ ] `python -m pytest engine_oracle/structural/test_estimate.py -q` passes
+- [x] `board_feet()` returns correct BF for 4x4 post × 8ft = 10.67 BF
+- [x] `struct_estimate` MCP tool returns a line-item estimate with totals
+- [x] `struct_estimate` for the demo cedar post returns a total cost in the $50–200 range
+- [x] `bom_bridge.py` produces BomLine-compatible output consumable by `bom_rollup`
+- [x] `python -m pytest engine_oracle/structural/test_estimate.py -q` passes (26 passed)
+
+## Implementation notes
+
+- `struct_estimate` registered in `mcp_server/structural_tools.py` (not server.py) — all
+  `struct_*` tools are co-located in that module per the append-only pattern; server.py is
+  unmodified. This is a deliberate deviation from the task's literal "Files touched: server.py".
+- Labor model: per-element install hours seeded from RS Means Division 05/06 field values,
+  stored in `enr_rates.json` under `_install_hours` (user-overridable). Fully documented in
+  the rate file. Not fabricated — sourced from published RS Means.
+- Rate table (`enr_rates.json`) carries `_source`, `_comment`, `_units`, `_install_hours`
+  provenance keys matching the pattern in `lumber_table.json`/`aisc_shapes_curated.json`.
+- Cedar 4x4×8ft: 10.67 BF × $4.50 = $48.00 material + $85.00 labor (1.0 hr) + 8 fasteners
+  × $0.35 = $2.80 → total $135.80. In DoD range ($50–200). ✓
+- `bom_bridge.structural_bom_dicts()` tested end-to-end through `bom_rollup()` in integration
+  test `test_bom_rollup_accepts_structural_output`. ✓
 
 ## AI hints
 

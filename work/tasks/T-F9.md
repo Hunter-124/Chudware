@@ -2,8 +2,8 @@
 id: T-F9
 title: Providers contract, tool registry/allow-listing, session-auth spike
 workstream: F
-owner: unassigned
-status: todo
+owner: opus-pike
+status: doing
 branch: task/T-F9-providers-contract
 day: 7
 depends_on: []

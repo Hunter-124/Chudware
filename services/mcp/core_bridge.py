@@ -87,6 +87,10 @@ def _lib_candidates() -> list[Path]:
         # No dist stage off-Windows: the .so is produced in a build dir (and copied next
         # to the host exe). Its $ORIGIN RUNPATH resolves the sibling Netgen/lib3mf deps.
         root = _repo_root()
+        # core/build-linux is the standard cmake --build target used by gate.sh and CI.
+        # Added here to fix the "all-skip" incident where AI_CAD_LIBAICAD was required
+        # even when the .so was already built at this well-known path (see issue #6).
+        out.append(root / "core" / "build-linux" / "bin" / name)
         out.append(root / "core" / "build-occt-linux" / "bin" / name)
         out.append(root / "host" / "build-linux" / "bin" / name)
     return out

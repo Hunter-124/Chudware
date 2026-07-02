@@ -1031,6 +1031,23 @@ def _make_footprints() -> dict:
         description="Diode SMB",
     )
 
+    # ── MountingHole_3.2mm_M3 (clean-room; IPC-7251 annular ring 0.5 mm) ─────
+    # M3 screw clears a 3.2 mm hole; NPTH (no copper — mechanical only).
+    # Courtyard 4.0 mm radius; silkscreen circle 3.4 mm radius.
+    fps["MountingHole:MountingHole_3.2mm_M3"] = _fp(
+        "MountingHole:MountingHole_3.2mm_M3",
+        pads=[
+            _tht_pad("p1", "1", 0.0, 0.0, 3.2, 3.2, 3.2),
+        ],
+        graphics=[
+            {"type": "circle", "layer": "F.SilkS", "center": [0.0, 0.0], "radius": 3.4,
+             "width": 0.12},
+            {"type": "circle", "layer": "F.CrtYd", "center": [0.0, 0.0], "radius": 4.0,
+             "width": 0.05},
+        ],
+        description="Mounting hole 3.2 mm for M3 screw (NPTH, no copper)",
+    )
+
     # Final pass: clip every footprint's silk off its pads so no generated footprint
     # ships silk over copper (DFM silk_over_pad) — generic, covers all sizes + future parts.
     for fp in fps.values():

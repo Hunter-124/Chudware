@@ -13,7 +13,7 @@ graph TD
   subgraph WS_A["workstream A"]
     T_A1["T-A1: Freeze dag_schema.md and scaffold services/dag/"]:::done
     T_A2["T-A2: Node runner with context packs and dag_planner prompt"]:::done
-    T_A3["T-A3: Human-in-the-loop gate nodes and autonomy dial"]:::todo
+    T_A3["T-A3: Human-in-the-loop gate nodes and autonomy dial"]:::doing
     T_A4["T-A4: Verify nodes and DAG MCP tools"]:::todo
     T_A5["T-A5: Integration day - run demo mission end-to-end"]:::todo
   end
@@ -28,7 +28,7 @@ graph TD
   subgraph WS_C["workstream C"]
     T_C1["T-C1: firmware_rpc.md contract and engine/firmware/ scaffold"]:::done
     T_C2["T-C2: Compile loop and pin-map header from ECAD netlist"]:::done
-    T_C3["T-C3: Emulation loop via Renode with fw_sim_run MCP tool"]:::doing
+    T_C3["T-C3: Emulation loop via Renode with fw_sim_run MCP tool"]:::done
     T_C4["T-C4: Hardware path - probe-rs flash/debug and clangd LSP tools"]:::todo
     T_C5["T-C5: firmware.md agent prompt and demo firmware in Renode"]:::todo
   end

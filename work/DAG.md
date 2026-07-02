@@ -94,7 +94,7 @@ graph TD
   end
   subgraph WS_M["workstream M"]
     T_M1["T-M1: CAM overhaul: fix critical post-processor correctness (C++)"]:::doing
-    T_M2["T-M2: CAM overhaul: true adaptive clearing (trochoidal arc-blend linking)"]:::todo
+    T_M2["T-M2: CAM overhaul: true adaptive clearing (trochoidal arc-blend linking)"]:::doing
     T_M3["T-M3: CAM overhaul: holder/shank collision simulation"]:::todo
     T_M4["T-M4: CAM overhaul: feeds/speeds DB unification with engine materials registry"]:::doing
     T_M5["T-M5: CAM overhaul: OCCT hole-extraction completeness (counterbore/countersink/tilt)"]:::doing
@@ -102,7 +102,7 @@ graph TD
   end
   subgraph WS_P["workstream P"]
     T_P1["T-P1: Unified parts library v1 - parts/1 contract, federated search core, first two adapters"]:::done
-    T_P2["T-P2: Unified parts library v2 - all-domain adapters + live vendor federation"]:::todo
+    T_P2["T-P2: Unified parts library v2 - all-domain adapters + live vendor federation"]:::done
     T_P3["T-P3: Unified parts library v3 - part_place insertion parity + agent wiring + demo"]:::todo
   end
   subgraph WS_Q["workstream Q"]

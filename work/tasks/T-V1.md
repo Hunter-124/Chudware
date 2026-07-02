@@ -2,8 +2,8 @@
 id: T-V1
 title: Simulation-backend correctness audit - real/validated/stub/broken verdict per solver
 workstream: V
-owner: unassigned
-status: todo
+owner: sonnet-lyra
+status: doing
 branch: task/T-V1-sim-backend-audit
 day: 2
 priority: 2

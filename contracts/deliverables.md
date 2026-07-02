@@ -338,6 +338,7 @@ a row here and in `contracts/licenses.md`.**
 | matplotlib | PSF | **in-process** | charts/figures embedded in artifacts |
 | WeasyPrint / reportlab | BSD | **in-process** | HTML/CSS → PDF and direct PDF reports |
 | pypdfium2 (pdfium) | BSD | **in-process** | PDF → PNG page rasterization for previews |
+| cairosvg | LGPL-3.0 | **optional in-process** | best-effort SVG → PNG previews; import-only, feature-detected, never bundled or required; absent → LibreOffice path → `converter_missing` |
 | pandoc | GPL | **subprocess only** | optional markup conversion; discovered on PATH |
 | LibreOffice headless | MPL-2.0 | **subprocess only** | office → PDF for `render_document`; discovered on PATH |
 | ~~PyMuPDF / pymupdf4llm~~ | ~~AGPL~~ | **NEVER** | forbidden — AGPL; use pypdfium2 instead |
@@ -346,6 +347,10 @@ Rules:
 
 - In-process engines are permissive (MIT/BSD/PSF) and always available — the `make_*` tools and
   the native-format paths of `render_document` never need a subprocess.
+- **Optional in-process** engines (currently only cairosvg, LGPL) are import-only and
+  feature-detected: used when present in the user's environment, never bundled, never a hard
+  dependency, never in `requirements.txt`/installer deps (the CONTRIBUTING LGPL dynamic-link
+  posture, same as Netgen). Every path they serve degrades per §6 when they are absent.
 - Subprocess-only engines (GPL pandoc, MPL LibreOffice) are **mere aggregation**: invoked as
   external processes discovered on PATH, never linked, never bundled into our code. The installer
   offers to install them; the source offer obligation is the installer's.

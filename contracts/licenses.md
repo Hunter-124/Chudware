@@ -51,6 +51,14 @@
 | pyamg (M6, optional) | MIT | AMG preconditioner | ok |
 | **python-solvespace** (optional backend) | **GPL-3** | sketch solver alternative | **NOT bundled by default**; in-house `nsolve` is primary. If a user enables it, it installs into their runtime venv on demand with a license notice |
 | numba (optional, M7 perf) | BSD-2 | LBM JIT | ok if added |
+| python-pptx (T-F14) | MIT | .pptx deliverables | ok |
+| python-docx (T-F14) | MIT | .docx deliverables | ok |
+| openpyxl (T-F14) | MIT | .xlsx deliverables (live formulas) | ok |
+| reportlab (T-F14) | BSD-3 | PDF reports + preview rendering | ok |
+| pypdfium2 (T-F14) | BSD-3 / Apache-2.0 | PDF → PNG preview raster | ok |
+| cairosvg (T-F14, optional) | LGPL-3.0 | best-effort SVG preview | ok (**import-only**, feature-detected, never bundled or required — LGPL dynamic posture per the Netgen precedent) |
+| pandoc (T-F14, optional) | GPL-2+ | markup conversion | **subprocess-only**, PATH-discovered, never bundled (mere aggregation — same isolation policy as ngspice) |
+| LibreOffice headless (T-F14, optional) | MPL-2.0 | office → PDF for `render_document` previews | **subprocess-only**, PATH-discovered, never bundled |
 
 Rules:
 - Adding any dependency requires a row here in the same change.

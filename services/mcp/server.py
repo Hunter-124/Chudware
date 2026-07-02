@@ -232,10 +232,19 @@ def _warm_core() -> None:
         # Recover any docs auto-saved before a previous restart so a client-timeout kill doesn't
         # permanently drop the user's open parts (they reload with fresh ids; list_parts shows them).
         try:
-            from mcp_server.cad_tools import recover_autosaved
+            from mcp_server.cad_tools import recover_autosaved, start_periodic_autosave
             recover_autosaved()
+            # Arm the periodic autosave timer AFTER recovery (so we don't re-save stale files).
+            start_periodic_autosave()
         except Exception:
             pass
+    except Exception:
+        pass
+    # Install crash-bundle handler AFTER recovery so a crash on first load still
+    # writes a useful bundle with the autosave references from this session.
+    try:
+        from mcp_server import crash_bundle
+        crash_bundle.install()
     except Exception:
         pass
 

@@ -8,6 +8,8 @@
 #include "ui/file_explorer.h"
 #include "ui/preview_pane.h"
 #include "ui/scaffold_demo_panel.h"
+#include "ui/parts_panel.h"
+#include "ui/cam_panel.h"            // T-U3 CAM workspace (AI_CAD_SHOT=cam_workspace)
 #include "artifact_view.h"
 #include "app/app_state.h"
 #include "viewport/scene.h"
@@ -223,6 +225,7 @@ int ShotConfig::captureFrameBudget() const {
     if (wantEcad && !ecadShotDone) return 150;
     if (wantTree) return treeShotDone ? 10 : 30;
     if (wantEquations) return equationsShotDone ? 10 : 30;
+    if (wantPartsBrowser) return partsBrowserShotDone ? 10 : 30;
     if (isScenarioMode()) return 999999;
     if (wantGlassperf) return glassperfShotDone ? 10 : 400;
     return 6;
@@ -264,7 +267,8 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantAsm = eq("asm");
     cfg.wantPmform = eq("pmform");
     cfg.wantPreview = eq("preview");
-    cfg.wantScaffoldDemo = eq("scaffold_demo");
+    cfg.wantScaffoldDemo  = eq("scaffold_demo");
+    cfg.wantPartsBrowser  = eq("parts_browser");
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
@@ -307,7 +311,10 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantPlan) seedPlanShot(st);
     if (cfg.wantAssembly) seedAssemblyShot(st);
     if (cfg.wantPreview) seedPreviewShot(st);
-    if (cfg.wantScaffoldDemo) ui::openScaffoldDemoPanel();
+    if (cfg.wantScaffoldDemo)  ui::openScaffoldDemoPanel();
+    if (cfg.wantPartsBrowser)  ui::openPartsPanel();
+    cfg.wantCamWorkspace = eq("cam_workspace");
+    if (cfg.wantCamWorkspace) ui::openCamWorkspacePanel();
     if (cfg.wantPick) setupPickShot(st);
     if (cfg.wantGlassperf) setupPickShot(st);
 
@@ -375,6 +382,26 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
         std::fflush(stdout);
     }
 
+    // Parts browser: seed the panel model from a synchronous part_search call so the
+    // screenshot shows populated results without needing an async RPC round-trip.
+    // Follows the same worker-one-shot settle pattern as wantEquations / wantTree.
+    // No step machine — avoids the T-G13/issue-#7 offscreen deadlock.
+    if (cfg.wantPartsBrowser && !cfg.partsBrowserShotDone) {
+        cfg.partsBrowserShotDone = true;
+        nlohmann::json res;
+        std::string err;
+        if (st.worker.call("part_search", {{"query", "M8"}, {"limit", 20}}, res, err, 5000)) {
+            // Directly seed the panel's file-static model so render shows real rows.
+            ui::seedPartsPanelFromJson(res.dump(), "M8");
+            std::printf("parts_browser: seed search ok (count=%d)\n",
+                        res.value("count", 0));
+        } else {
+            std::printf("parts_browser: seed search failed (worker not ready): %s\n",
+                        err.c_str());
+        }
+        std::fflush(stdout);
+    }
+
     if (cfg.wantEcad && !cfg.ecadShotDone) {
         cfg.ecadShotDone = true;
         nlohmann::json res;
@@ -391,6 +418,38 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
         else
             std::printf("ecad: orchestrate skipped (%s)\n", err.c_str());
         std::fflush(stdout);
+    }
+
+    // T-U3: CAM workspace panel screenshot — build a plate + run cam_program, then adopt
+    // the job into the new ui/imgui cam_panel (camWorkspaceLoadJob). One-shot like wantTree.
+    if (cfg.wantCamWorkspace && !cfg.camWorkspaceShotDone) {
+        cfg.camWorkspaceShotDone = true;
+        std::string err;
+        if (st.docMirror.newPart(st.worker, err)) {
+            st.addDocTab(false);
+            auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                {{"op","add_feature"},{"feature",{
+                    {"type","box"},{"name","Plate"},
+                    {"params",{{"length",dim(80)},{"width",dim(60)},{"height",dim(15)}}}}}}}));
+            loadMesh(st, r.aicm_path);
+            nlohmann::json camRes;
+            std::string e2;
+            bool camOk = st.worker.call("cam_program",
+                {{"doc_id", st.docMirror.docId()}, {"post", "grbl"}}, camRes, e2, 30000);
+            std::string camDocId = (camOk && camRes.is_object())
+                                   ? camRes.value("cam_doc_id", std::string()) : std::string();
+            std::printf("cam_workspace-shot: ok=%d cam_doc=%s\n",
+                        (int)camOk, camDocId.c_str());
+            std::fflush(stdout);
+            if (!camDocId.empty())
+                ui::camWorkspaceLoadJob(st, camDocId);
+            else
+                ui::openCamWorkspacePanel();  // show empty panel if program failed
+        } else {
+            std::printf("cam_workspace-shot: doc_new failed: %s\n", err.c_str());
+            std::fflush(stdout);
+            ui::openCamWorkspacePanel();
+        }
     }
 }
 

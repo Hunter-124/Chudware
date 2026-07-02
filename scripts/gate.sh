@@ -257,7 +257,7 @@ stage_pytest() {
     # --- per-directory sweep ---
     # One invocation per top-level dir avoids cross-suite import-order pollution
     # (combined run has ~29 extra failures; T-V2 owns the cleanup).
-    local dirs=("services" "engine_oracle" "tools" "training")
+    local dirs=("mcp_server" "services" "engine_oracle" "tools" "training")
     local total_collected=0
     local total_passed=0
     local any_hard_fail=0
@@ -277,6 +277,10 @@ stage_pytest() {
         [ -f "engine_oracle/sim/test_foam_case.py" ]  && ignore_args+=(--ignore=engine_oracle/sim/test_foam_case.py)
         [ -f "engine_oracle/sim/test_lbm.py" ]        && ignore_args+=(--ignore=engine_oracle/sim/test_lbm.py)
         [ -f "services/agent/test_loop_mock.py" ]     && ignore_args+=(--ignore=services/agent/test_loop_mock.py)
+        # T-Q2: test_autosave_recovery must be collected via mcp_server/ (not services/)
+        # because it imports mcp_server.cad_tools; from services/ the 'mcp' name resolves
+        # to the services/mcp/ package and shadows mcp.server.fastmcp (collection crash).
+        [ -f "services/mcp/test_autosave_recovery.py" ] && ignore_args+=(--ignore=services/mcp/test_autosave_recovery.py)
 
         echo -n "  $dir ... "
         local rc=0

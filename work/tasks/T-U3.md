@@ -3,7 +3,7 @@ id: T-U3
 title: CAM workspace UI — job tree, tool table, sim results, post/setup-sheet
 workstream: U
 owner: sonnet-quinn
-status: doing
+status: done
 branch: task/T-U3-ui
 day: 3
 priority: 2
@@ -40,3 +40,6 @@ no coherent workspace UI. This is the Manufacture tab's real panel set.
   UI must not block on M2-M5. panel_spec.cpp is shared infrastructure: additions
   append-only (44-form precedent, b569020).
 - describe_toolpaths (T-F7) gives you the narration string for the sim strip — reuse.
+
+## Progress log
+- 2026-07-02 23:18 UTC [sonnet-quinn] REVIEW: branch task/T-U3-ui pushed (7f45a3f). Gate PASS. ui_style_check 0 findings. Headless AI_CAD_SHOT=cam_workspace wrote 1600x1000 PNG — empty-state panel renders (3 tabs, op-add row, Generate/Simulate buttons, "Press 'New Job' to start" empty state). AI_CAD_SHOT=cam (existing ScenarioRunner) also PASS. Files: ui/abstract/cam_view.h (pure view-model), ui/imgui/src/ui/cam_panel.{h,cpp} (350+ lines: job tree + glass rows + arc_blend_linking badges + engagement E/W warnings + tool table + sim results strip with gouge/collision semantics + post/setup-sheet + dialect picker), ui/abstract/panel_spec.cpp (+210 lines: 20 CAM op PanelSpecs), scenarios.h/cpp + application.cpp wired. holder_collisions degrades to "not checked" when T-M3 unmerged.

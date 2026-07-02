@@ -45,4 +45,8 @@ const PanelSpec* findPanelSpec(const char* featureType);
 const PanelSpec* panelFormForCommand(const std::string& cmdId, std::string& mode);
 const std::vector<PanelSpec>& allPanelSpecs();
 
+// T-U3: look up a CAM operation parameter spec by its type string
+// (e.g. "face", "pocket2d", "drill", "turn_rough"). Returns nullptr if not found.
+const PanelSpec* findCamOpSpec(const char* opType);
+
 } // namespace aicad::ui

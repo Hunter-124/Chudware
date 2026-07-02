@@ -240,8 +240,27 @@ _AUTOSAVE_MAX_AGE_DAYS = float(os.environ.get("AI_CAD_AUTOSAVE_MAX_AGE_DAYS", "7
 
 
 def _autosave_dir() -> Path:
-    base = os.environ.get("APPDATA") or tempfile.gettempdir()
-    d = Path(base) / "AI-CAD" / "mcp_autosave"
+    """Return (and create) the autosave directory.
+
+    Resolution order:
+      1. AI_CAD_AUTOSAVE_DIR env var (tests use this for hermeticity).
+      2. engine.paths.appdata_root() / "mcp_autosave"  — XDG-aware on Linux,
+         %APPDATA%\\AI-CAD on Windows.  Matches the C++ convention in paths.cpp.
+      3. tempfile.gettempdir() / "AI-CAD" / "mcp_autosave" (last-resort fallback).
+
+    NOTE: The prior implementation fell back to os.environ.get("APPDATA") which
+    silently resolved to /tmp on Linux (APPDATA unset), scattering autosave files
+    outside the AI-CAD data tree.  Fixed to use appdata_root() (XDG-aware).
+    """
+    override = os.environ.get("AI_CAD_AUTOSAVE_DIR")
+    if override:
+        d = Path(override)
+    else:
+        try:
+            from engine import paths as _paths  # noqa: PLC0415
+            d = _paths.appdata_root() / "mcp_autosave"
+        except Exception:  # noqa: BLE001
+            d = Path(tempfile.gettempdir()) / "AI-CAD" / "mcp_autosave"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -283,6 +302,89 @@ def _autosave_all_open() -> None:
         did = d.get("doc_id") if isinstance(d, dict) else None
         if did:
             _autosave(did, d.get("name") if isinstance(d, dict) else None)
+
+
+# ---------------------------------------------------------------------------
+# Periodic autosave timer
+# ---------------------------------------------------------------------------
+# Cadence: AI_CAD_AUTOSAVE_INTERVAL_S (seconds, float, default 60).  Set to 0
+# to disable.  The timer is a daemon thread so it never prevents process exit.
+# Overhead is measured per sweep; a warning is logged when p95 > 50 ms.
+
+_AUTOSAVE_INTERVAL_S: float = float(os.environ.get("AI_CAD_AUTOSAVE_INTERVAL_S", "60") or 60)
+_PERIODIC_TIMER: list = [None]  # [Timer | None]  — list so it's mutable from inner scope
+_AUTOSAVE_LATENCIES: list = []  # float seconds — rolling window of sweep durations
+_LATENCY_WINDOW = 100
+
+
+def _tick_autosave() -> None:
+    """Single timer tick: autosave all open docs, record latency, reschedule."""
+    import threading as _t  # local to avoid circular at module level
+
+    t0 = time.perf_counter()
+    _autosave_all_open()
+    dt = time.perf_counter() - t0
+
+    _AUTOSAVE_LATENCIES.append(dt)
+    if len(_AUTOSAVE_LATENCIES) > _LATENCY_WINDOW:
+        _AUTOSAVE_LATENCIES.pop(0)
+
+    # Warn when recent p95 > 50 ms (DoD overhead gate).
+    if len(_AUTOSAVE_LATENCIES) >= 20:
+        sorted_lat = sorted(_AUTOSAVE_LATENCIES)
+        p95 = sorted_lat[int(len(sorted_lat) * 0.95)]
+        if p95 > 0.050:
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "autosave p95 %.1f ms exceeds 50 ms target — consider longer interval "
+                "or reducing open doc count", p95 * 1000)
+
+    # Reschedule only if interval > 0 and not stopped.
+    interval = _AUTOSAVE_INTERVAL_S
+    if interval > 0:
+        timer = _t.Timer(interval, _tick_autosave)
+        timer.daemon = True
+        timer.name = "aicad-autosave"
+        _PERIODIC_TIMER[0] = timer
+        timer.start()
+
+
+def start_periodic_autosave(interval_s: float | None = None) -> None:
+    """Arm the periodic autosave timer.  Call once from server startup.
+
+    interval_s: cadence override (seconds); None → read AI_CAD_AUTOSAVE_INTERVAL_S
+    (default 60 s).  Passing 0 disables the timer.  Idempotent: if already running
+    the old timer is cancelled and a new one started with the new interval.
+    """
+    import threading as _t
+
+    global _AUTOSAVE_INTERVAL_S
+    if interval_s is not None:
+        _AUTOSAVE_INTERVAL_S = float(interval_s)
+    stop_periodic_autosave()  # cancel any previous timer
+    if _AUTOSAVE_INTERVAL_S <= 0:
+        return
+    timer = _t.Timer(_AUTOSAVE_INTERVAL_S, _tick_autosave)
+    timer.daemon = True
+    timer.name = "aicad-autosave"
+    _PERIODIC_TIMER[0] = timer
+    timer.start()
+
+
+def stop_periodic_autosave() -> None:
+    """Cancel the periodic autosave timer (if running)."""
+    t = _PERIODIC_TIMER[0]
+    if t is not None:
+        t.cancel()
+        _PERIODIC_TIMER[0] = None
+
+
+def autosave_p95_ms() -> float | None:
+    """Return current p95 autosave latency in milliseconds, or None if < 2 samples."""
+    if len(_AUTOSAVE_LATENCIES) < 2:
+        return None
+    s = sorted(_AUTOSAVE_LATENCIES)
+    return s[int(len(s) * 0.95)] * 1000.0
 
 
 def _prune_autosaves(max_age_days: float = _AUTOSAVE_MAX_AGE_DAYS) -> int:

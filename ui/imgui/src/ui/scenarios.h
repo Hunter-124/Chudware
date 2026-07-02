@@ -29,6 +29,8 @@ struct ShotConfig {
     bool wantPmform = false;
     bool wantPreview = false;
     bool wantScaffoldDemo = false;
+    bool wantCamWorkspace = false;            // T-U3: populate + screenshot the CAM workspace panel
+    bool camWorkspaceShotDone = false;
 
     // Worker one-shot shots (fire once when workerStarted)
     bool wantTree = false;
@@ -37,6 +39,8 @@ struct ShotConfig {
     bool equationsShotDone = false;
     bool wantEcad = false;
     bool ecadShotDone = false;
+    bool wantPartsBrowser = false;
+    bool partsBrowserShotDone = false;
 
     // Long-running scenario modes (ScenarioRunner step machines)
     bool wantM1 = false;

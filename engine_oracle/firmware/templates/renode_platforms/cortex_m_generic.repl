@@ -1,0 +1,13 @@
+// Generic Cortex-M platform description for Renode (MIT)
+// Minimal: flash + SRAM + CPU only; no peripheral mapping.
+// License: MIT — see templates/renode_platforms/LICENSE
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4"
+    nvicPrioBits: 4
+
+flash: Memory.MappedMemory @ sysbus 0x08000000
+    size: 0x100000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x20000

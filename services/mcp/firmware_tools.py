@@ -66,3 +66,26 @@ def register_firmware_tools(mcp) -> None:
         if remove:
             params["remove"] = remove
         return _dumps(_fw.fw_sources(params))
+
+    @mcp.tool()
+    def fw_sim_run(project_id: str, elf_path: str = "", scenario: str = "",
+                   assertions: Optional[list[str]] = None) -> str:
+        """Run the firmware emulation loop via Renode or QEMU and return SimResult.
+
+        SimResult fields: ``{passed, uart_log, gpio_states, assertion_results, ms}``.
+        ``passed`` is True iff every assertion matched. Assertions:
+        - ``"uart:<text>"`` — UART/semihosting output contains ``<text>``.
+        - ``"gpio:<PIN>=<level>"`` — GPIO pin is at the given logic level at end of run.
+        - plain string — treated as uart match.
+
+        Falls back gracefully when neither Renode nor QEMU is installed (``passed=False``,
+        ``uart_log`` explains what's missing). Run ``fw_build`` first to produce the ELF.
+        """
+        p: dict = {"project_id": project_id}
+        if elf_path:
+            p["elf_path"] = elf_path
+        if scenario:
+            p["scenario"] = scenario
+        if assertions:
+            p["assertions"] = assertions
+        return _dumps(_fw.fw_sim_run(p))

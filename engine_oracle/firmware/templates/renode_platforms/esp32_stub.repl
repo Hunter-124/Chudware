@@ -1,0 +1,12 @@
+// ESP32 stub platform description for Renode (MIT)
+// Minimal stub — ESP32 support in Renode is experimental.
+// License: MIT — see templates/renode_platforms/LICENSE
+
+cpu0: CPU.Xtensa @ sysbus
+    cpuType: "esp32"
+
+flash: Memory.MappedMemory @ sysbus 0x3F400000
+    size: 0x400000
+
+sram: Memory.MappedMemory @ sysbus 0x3FFB0000
+    size: 0x50000

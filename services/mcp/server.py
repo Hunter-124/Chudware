@@ -140,8 +140,9 @@ register_hydraulic_tools(mcp)
 from mcp_server.recon_tools import register_photo_recon_tools
 register_photo_recon_tools(mcp)
 
-# Firmware (embedded compile loop): fw_new_project / fw_build / fw_sources — auto-selects the MCU
-# target and generates a pinmap.h header from the linked ECAD board's netlist (T-C2).
+# Firmware (embedded compile loop): fw_new_project / fw_build / fw_sources / fw_sim_run — auto-selects
+# the MCU target, generates a pinmap.h header from the linked ECAD board's netlist (T-C2), and runs
+# the ELF through Renode or QEMU with assertion checks (T-C3).
 from mcp_server.firmware_tools import register_firmware_tools
 register_firmware_tools(mcp)
 

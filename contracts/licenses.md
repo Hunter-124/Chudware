@@ -74,6 +74,8 @@
 | **langgraph** (1.2.7) | MIT | DAG orchestrator state machine (services/dag/) — T-A1 | ok |
 | **langgraph-checkpoint-sqlite** (3.1.0) | MIT | SQLite persistence for DAG run checkpoints (services/dag/) — T-A1 | ok |
 | **aiosqlite** (0.22.1, transitive) | MIT | async SQLite backend for langgraph-checkpoint-sqlite | ok |
+| **Renode** (optional, T-C3) | **MIT** | firmware emulation: ELF boot + UART capture + GPIO state on Renode platform descriptions (`renode --disable-xwt`, subprocess-only) | ok. **Subprocess-only**, PATH-discovered, never vendored or linked. Bundled `.repl` platform description files (in `engine_oracle/firmware/templates/renode_platforms/`) are adapted from Renode's open-source platform infrastructure (MIT) with attribution in the bundled `LICENSE` file. |
+| **QEMU** (optional fallback, T-C3) | **GPL-2.0+** | firmware emulation fallback: generic Cortex-M via `qemu-system-arm -M mps2-an385`, semihosting stdout capture | ok. **Subprocess-only**, PATH-discovered, never bundled or linked (same aggregation isolation as ngspice). |
 | **langchain-core** (1.4.8, transitive) | MIT | langgraph dependency | ok |
 | **langsmith** (0.9.6, transitive) | MIT | langgraph tracing dep (no API key required) | ok |
 | qrcode (T-F6, optional) | MIT | QR code generation for phone handoff URL | ok |

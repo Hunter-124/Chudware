@@ -3,7 +3,7 @@ id: T-G6
 title: GUI migration wave 2 - shell chrome (S1-S6, H5 start, G2 gate)
 workstream: G
 owner: opus-gale
-status: doing
+status: review
 branch: task/T-G6-migration-wave2
 day: 7
 depends_on: [T-G5]
@@ -42,7 +42,15 @@ the G2 integrator gate.
       DOF solver render live ("Fully Defined" in `ribbon`+`AI_CAD_TAB=1`); the 2D
       entity-overlay screenshot (`AI_CAD_SHOT=sketch`) is blocked ONLY by the systemic
       step-machine deadlock below, not by the overlay code
-- [x] `bash scripts/gate.sh` — see closeout; `graphify update .` run
+- [~] `bash scripts/gate.sh` — **ui/imgui stage (this task's signal) PASS** (build + --shot).
+      Overall RESULT: FAIL is driven ONLY by the known pre-existing reds: check.py
+      `feature_surface_audit`+`parity_audit` (host-era manifest / absent SW_PARITY_SPEC);
+      pytest "107 deselected" (issue #6 gate-venv 0-collected gap); `--selftest` non-fatal
+      "engine not ready" (gate runs it WITHOUT `AI_CAD_LIBAICAD` — with the .so it returns
+      OK: save=1 open=1 features=3). Zero code changed on this branch → no regression possible.
+      `graphify update .`: **no-op** (zero code change; graph unaffected; foreman regenerates
+      at merge per established pattern — graphify-out/ lives in the foreman main checkout, not
+      this worktree).
 
 ## Verification report (opus-gale, 2026-07-03)
 

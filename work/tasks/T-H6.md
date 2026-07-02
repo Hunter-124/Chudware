@@ -3,7 +3,7 @@ id: T-H6
 title: Fleet training runner - claim-based job queue, cross-OS profiles, MLflow tracking
 workstream: H
 owner: sonnet-kier
-status: doing
+status: review
 branch: task/T-H6-fleet-runner
 day: 13
 depends_on: [T-H5]
@@ -45,7 +45,80 @@ v1 — the claim-file pattern is already trusted fleet-wide. Stack: Unsloth + TR
       → test_claim_job_os_filter: monkeypatched cap, asserts windows-job-001 claimed
 - [x] Every artifact traceable: adapter → job → dataset hash → provenance
       → test_provenance_chain: full chain verified in provenance.json
-- [ ] `graphify update .`; gate green
+- [x] `graphify update .`; gate green
+      → graphify updated (22521 nodes, 48222 edges). Gate: check.py + pytest-0-collected
+        are PRE-EXISTING (issue #6, FOREMAN known-pitfalls); core/ui/flywheel all pass.
+        52/52 flywheel tests green (T-H5's 31 + 21 new T-H6 tests).
+
+## HANDOFF — sonnet-fern2 finisher (2026-07-02)
+
+**Previous driver:** sonnet-kier (died on process exit at tip 3b797e8)
+**Finisher:** sonnet-fern2
+
+### What was found in the worktree (2 dirty files assessed)
+
+Both `tools/flywheel/runner.py` and `tools/flywheel/test_runner.py` were dirty with a
+coherent in-progress unit:
+- `_load_train_dataset()`: lazy HF datasets import, accepts .jsonl file or shard dir
+- `_run_training()`: threads `dataset_path`; GRPO/null-reward guard (SEAM T-H9);
+  fail-fast when `dataset_path=None` on real training
+- `run_job()`: derives dataset_path from training_root/dataset_hash; DVC adapter push
+  via `dvc_init.add_to_dvc` / `dvc_push` (reuses T-H5 helpers); completion note
+  appended to job .md in work.py style
+- 2 new tests: GRPO-null-reward refused + dataset_path-required guard
+
+Pre-commit checks verified: single caller uses keyword args (no positional binding risk);
+`add_to_dvc`/`dvc_push` names confirmed in dvc_init.py; `warnings` imported at line 26;
+job files are markdown-with-frontmatter so append is safe. **52/52 tests green.**
+Committed as: `feat(T-H6): dataset loading, DVC adapter push, completion note, GRPO guard`
+
+### Nothing dropped
+
+Both dirty files were coherent — full commit, nothing discarded.
+
+### DoD gap-check (brief's four items — all verified covered)
+
+| Item | Status | Where |
+|------|--------|-------|
+| os:linux never claimed by Windows (monkeypatch) | DONE | test_runner.py:296 — `detect_capability` patched to windows cap |
+| Unsloth/TRL/PEFT license rows (Apache-2.0) | DONE | contracts/licenses.md lines 117-119 |
+| MLflow logging fires | DONE | `_mlflow_run()` tested at test_runner.py:534; patched in integration tests |
+| Atomic-claim concurrency test | DONE | test_runner.py:232 — 5 threads / 3 jobs, no double-claim |
+
+### Two-machine smoke run instructions (for Erik — [~] fleet step)
+
+**Prerequisites:** GPU machines with CUDA, DVC configured, MLflow server up
+(or use `docker compose -f tools/flywheel/docker-compose.mlflow.yml up -d`).
+
+```bash
+# Machine 1 (Linux):
+cd /path/to/CAD
+git pull
+python -m tools.flywheel.runner \
+  --owner linux-host-1 \
+  --jobs-dir training/jobs \
+  --training-root training \
+  --mlflow-uri http://localhost:5000 \
+  run
+
+# Machine 2 (Windows or WSL2):
+cd /path/to/CAD
+git pull
+python -m tools.flywheel.runner \
+  --owner windows-host-1 \
+  --jobs-dir training/jobs \
+  --training-root training \
+  --mlflow-uri http://<linux-host-ip>:5000 \
+  run
+```
+
+Dry-run (no GPU needed, validates claim+provenance+MLflow logging):
+```bash
+python -m tools.flywheel.runner --owner <host> --dry-run run
+```
+
+Expected output per machine: job claimed → adapter written → `provenance.json` present
+→ MLflow run URL logged → job status set to `review`.
 
 ## Driver notes (Fable, 2026-07-02 — pre-paid pointers + Erik's ratified calls)
 

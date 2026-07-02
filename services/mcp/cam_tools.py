@@ -25,6 +25,41 @@ from .cad_tools import _CUR  # the "current part" doc_id (shared with the modeli
 _CAM: dict = {"doc_id": None}
 
 
+def _wire_materials_registry() -> None:
+    """Point the C++ core at the bundled engine materials registry so the CuttingDB folds its
+    ``cam`` sub-sections in (T-M4 / Issue #2). ``setdefault`` never overrides an explicit
+    AICAD_MATERIALS_REGISTRY (a user/installer path wins). Best-effort: a missing registry module
+    leaves the core on its in-code fallback table."""
+    try:
+        from engine.materials import registry as _reg
+        os.environ.setdefault("AICAD_MATERIALS_REGISTRY", str(_reg.registry_path()))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _resolve_cam_material(material: str) -> tuple[str, Optional[str]]:
+    """Map a material id/alias to the CuttingDB group id the feeds calculator resolves.
+
+    Accepts any registry material ID (DoD): a registry id/alias that carries a ``cam`` fold-in is
+    translated to its cutting-group id; a bare CuttingDB group id (or an unknown id) passes through
+    unchanged. Returns (resolved_id, note) — ``note`` is a non-fatal advisory when the material has
+    no cam correspondence (feeds will use the calculator's defaults)."""
+    m = str(material or "").strip() or "aluminum"
+    try:
+        from engine.materials import registry as _reg
+        gid = _reg.cam_material_id(m)
+        if gid:
+            return gid, None
+        # Not a cam-annotated registry material. If it is a known registry material at all, keep the
+        # user's id but flag that it has no dedicated feeds row; else pass through (may be a raw
+        # CuttingDB group id the core knows).
+        if _reg.resolve_key(m) is not None:
+            return m, f"material '{m}' has no CAM feeds data in the registry; using calculator defaults"
+    except Exception:  # noqa: BLE001
+        pass
+    return m, None
+
+
 def _dumps(obj: Any) -> str:
     return json.dumps(obj, indent=2)
 
@@ -48,6 +83,10 @@ def _apply(ops: list) -> dict:
 
 def register_cam_tools(mcp: FastMCP) -> None:
     """Attach the CAM toolpath/post/sim tools to the FastMCP server."""
+
+    # Point the core's CuttingDB at the bundled materials registry (T-M4) before any cam RPC
+    # triggers the lazy CuttingDB::builtin() singleton, so cam_materials reflects the registry.
+    _wire_materials_registry()
 
     # ------------------------------------------------------------------ job lifecycle
     @mcp.tool()
@@ -109,17 +148,23 @@ def register_cam_tools(mcp: FastMCP) -> None:
     def cam_add_setup(name: str = "Setup1", machine: str = "mill3", material: str = "aluminum",
                       stock: Optional[dict] = None, wcs: Optional[dict] = None) -> str:
         """Add a machining setup (a stock + WCS + machine/platform). machine: mill3|mill4|mill5|
-        router|lathe|millturn|laser|plasma|waterjet. `stock` is a stock dict (e.g. from
-        cam_extract(kind="stock")["stock"]["box"] -> {"type":"box","min":[...],"max":[...]}),
-        defaulting to a box-offset of the model bbox. Returns the new setup_id."""
+        router|lathe|millturn|laser|plasma|waterjet. `material` accepts any engine materials
+        registry ID/alias (e.g. "aluminum_6061_t6", "6061") or a CuttingDB group id ("aluminum",
+        "steel_mild") — a registry id is translated to the group whose feeds/speeds the calculator
+        uses (T-M4). `stock` is a stock dict (e.g. from cam_extract(kind="stock")["stock"]["box"]
+        -> {"type":"box","min":[...],"max":[...]}), defaulting to a box-offset of the model bbox.
+        Returns the new setup_id (+ a material_note when the id has no dedicated feeds row)."""
         try:
+            resolved, note = _resolve_cam_material(material)
             st = dict(stock or {"type": "box_offset", "off_ztop": 1.0})
-            st["material"] = material
+            st["material"] = resolved
             setup = {"name": name, "machine": {"kind": machine}, "stock": st}
             if wcs:
                 setup["wcs"] = wcs
             r = _apply([{"op": "add_setup", "setup": setup, "ref": "_s"}])
             r["setup_id"] = r.get("id_map", {}).get("_s")
+            if note:
+                r["material_note"] = note
             return _dumps(r)
         except Exception as e:  # noqa: BLE001
             return _err(e)

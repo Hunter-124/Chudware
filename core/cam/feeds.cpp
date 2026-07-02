@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 
 namespace aicad {
 namespace cam {
@@ -99,6 +102,33 @@ void CuttingDB::merge(const json& overrides) {
         if (!replaced) mats_.push_back(m);
     }
 }
+void CuttingDB::merge_cam(const json& registry) {
+    if (!registry.is_object() || !registry.contains("materials")) return;
+    const json& mats = registry["materials"];
+    if (!mats.is_object()) return;
+    for (auto it = mats.begin(); it != mats.end(); ++it) {
+        const json& rec = it.value();
+        if (!rec.is_object() || !rec.contains("cam")) continue;
+        const json& cam = rec["cam"];
+        if (!cam.is_object()) continue;
+        std::string gid = cam.value("id", std::string());
+        if (gid.empty()) continue;
+        MaterialData* m = nullptr;
+        for (auto& e : mats_) if (e.id == gid) { m = &e; break; }
+        if (!m) continue;  // registry names a cutting group absent from the in-code base -> skip
+        // Overwrite ONLY the feeds fields present in the cam section; identity is preserved.
+        if (cam.contains("sfm_mill"))      m->sfm_mill      = num(cam["sfm_mill"], m->sfm_mill);
+        if (cam.contains("sfm_drill"))     m->sfm_drill     = num(cam["sfm_drill"], m->sfm_drill);
+        if (cam.contains("sfm_turn"))      m->sfm_turn      = num(cam["sfm_turn"], m->sfm_turn);
+        if (cam.contains("hss_factor"))    m->hss_factor    = num(cam["hss_factor"], m->hss_factor);
+        if (cam.contains("fz_ref"))        m->fz_ref        = num(cam["fz_ref"], m->fz_ref);
+        if (cam.contains("fz_ref_dia"))    m->fz_ref_dia    = num(cam["fz_ref_dia"], m->fz_ref_dia);
+        if (cam.contains("stepover_frac")) m->stepover_frac = num(cam["stepover_frac"], m->stepover_frac);
+        if (cam.contains("stepdown_frac")) m->stepdown_frac = num(cam["stepdown_frac"], m->stepdown_frac);
+        if (cam.contains("plunge_frac"))   m->plunge_frac   = num(cam["plunge_frac"], m->plunge_frac);
+        if (cam.contains("cut_feed_ref"))  m->cut_feed_ref  = num(cam["cut_feed_ref"], m->cut_feed_ref);
+    }
+}
 const MaterialData* CuttingDB::find(const std::string& id) const {
     for (auto& m : mats_) if (m.id == id) return &m;
     return nullptr;
@@ -113,8 +143,49 @@ json CuttingDB::to_json() const {
     for (auto& m : mats_) a.push_back(m.to_json());
     return json{{"materials", a}};
 }
+// Resolve the engine materials registry.json location: env override first (tests + explicit
+// installs point at it), then the %APPDATA%/AI-CAD (XDG on *nix) data root — mirrors
+// core/agent/paths.cpp without linking aicad_agent (cam stays dependency-light). Empty path when
+// no root is discoverable -> the in-code table stands.
+namespace {
+std::filesystem::path resolve_registry_path() {
+    namespace fs = std::filesystem;
+    if (const char* env = std::getenv("AICAD_MATERIALS_REGISTRY"); env && env[0])
+        return fs::path(env);
+    fs::path root;
+#ifdef _WIN32
+    if (const char* base = std::getenv("APPDATA"); base && base[0]) root = fs::path(base) / "AI-CAD";
+#else
+    if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && xdg[0])
+        root = fs::path(xdg) / "AI-CAD";
+    else if (const char* home = std::getenv("HOME"); home && home[0])
+        root = fs::path(home) / ".local" / "share" / "AI-CAD";
+#endif
+    if (root.empty()) return {};
+    return root / "materials" / "registry.json";
+}
+}  // namespace
+
 const CuttingDB& CuttingDB::builtin() {
-    static CuttingDB db;
+    // Seed the in-code table (the byte-identical fallback), then fold the registry's cam
+    // sections on top when the registry is reachable. Absent/unparseable registry -> the
+    // in-code table stands, so headless/offline builds are unaffected (T-M4 / Issue #2).
+    static CuttingDB db = [] {
+        CuttingDB d;
+        try {
+            std::filesystem::path p = resolve_registry_path();
+            if (!p.empty()) {
+                std::ifstream fh(p, std::ios::binary);
+                if (fh) {
+                    json doc = json::parse(fh, nullptr, /*allow_exceptions=*/false);
+                    if (!doc.is_discarded()) d.merge_cam(doc);
+                }
+            }
+        } catch (...) {
+            // Registry unreadable/malformed -> keep the in-code table (never throw from builtin()).
+        }
+        return d;
+    }();
     return db;
 }
 

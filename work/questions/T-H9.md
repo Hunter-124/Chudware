@@ -41,6 +41,23 @@ into the existing `_emit_ai_artifact` `model` block. *Alternative:* T-H9 edits l
 rejected: loop.py has no insertion-point routing scaffold yet and it overlaps T-F17's agent
 bridge; adding it here would be a speculative edit to a hot file ahead of its consumer.
 
+## Q3 — Is a model-suppliable `approver`/`report_ref` a strong-enough sign-off? (foreman ruling)
+
+**Context.** `serving_promote` takes `approver` + `report_ref` as plain MCP tool args and
+enforces: report file must EXIST, evidence must be eligible, sign-off must be non-empty. It does
+NOT verify the report's content or that Erik personally signed it — and a model can call this
+tool. So the "human trigger, no auto-promote" guarantee is only as strong as *who invokes the
+tool*. This is consistent with the other human-gated tools here (ask_user, quote-out) and is a
+reasonable v1 seam, but promotion is the Erik-RATIFIED safety centerpiece.
+
+**Recommended answer (needs foreman/Erik ruling): acceptable for v1 as-is, with a hardening
+follow-up.** Options if you want it stronger: (a) route the sign-off through the `ask_user` /
+interaction seam (T-F4) so the human is prompted in-app rather than a model passing a string;
+and/or (b) require `report_ref` to contain a signed token (e.g. an HMAC / a line Erik writes) that
+`promote` validates, not just `os.path.exists`. Both are additive to the current gate. I left the
+existing behavior (existence + eligibility + non-empty sign-off) and flag this for your call —
+non-blocking, no auto-promote path exists either way.
+
 ## Batched for Erik (human-only)
 
 - **Live-gated DoD** (needs a real GPU + vLLM; cannot run in CI): two adapters served from one

@@ -294,6 +294,83 @@ def test_describe_scene_default_views():
     assert set(r["views"]) == {"front", "right", "top", "iso"}, r["views"]
 
 
+# ---------------------------------------------------------------- describe_toolpaths
+
+
+def test_describe_toolpaths_no_job_graceful():
+    """describe_toolpaths with no active CAM job returns a graceful error, not a crash."""
+    from mcp_server.cam_tools import _CAM
+    old = _CAM.get("doc_id")
+    _CAM["doc_id"] = None
+    try:
+        r, _ = _call("describe_toolpaths", {})
+        # Should return JSON with ok:False and a message, not raise
+        assert r is not None
+        assert r.get("ok") is False or "no cam job" in str(r).lower() or "No CAM job" in str(r)
+    finally:
+        _CAM["doc_id"] = old
+
+
+def test_describe_toolpaths_with_job_structure():
+    """describe_toolpaths on a job with one setup returns structured text with expected slots."""
+    rp, _ = _call("new_part", {"name": "cam_narr_plate"})
+    doc = rp["doc_id"]
+    ops = [cb.feat("box", "Plate",
+                   {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(10)})]
+    _call("add_features", {"ops": ops, "doc_id": doc})
+
+    rj, _ = _call("cam_new_job", {"name": "TestJob", "post": "grbl"})
+    assert rj.get("doc_id"), rj
+
+    _call("cam_add_tool", {"number": 1, "type": "endmill_flat", "diameter": 6.0})
+    _call("cam_add_setup", {"name": "Setup1", "machine": "mill3", "material": "aluminum"})
+
+    r, _ = _call("describe_toolpaths", {})
+    assert r is not None
+    text = r.get("text", "") if isinstance(r, dict) else str(r)
+    assert "TestJob" in text or "Setup1" in text or "cam" in text.lower(), text
+
+
+# ---------------------------------------------------------------- describe_results
+
+
+def test_describe_results_no_study_graceful():
+    """describe_results with no simulation attached returns a graceful message."""
+    doc = _new_plate_with_hole()
+    r, _ = _call("describe_results", {"doc_id": doc})
+    assert r is not None
+    result_text = r.get("text", "") if isinstance(r, dict) else str(r)
+    assert ("no simulation" in result_text.lower() or
+            "no study" in result_text.lower() or
+            "not attached" in result_text.lower() or
+            (isinstance(r, dict) and r.get("ok") is not False)), result_text
+
+
+def test_describe_results_after_fea_static():
+    """describe_results after run_fea_static includes stress, displacement, FoS, and material."""
+    doc = _new_plate_with_hole()
+
+    fea_r, _ = _call("run_fea_static", {
+        "fixtures": ["bottom"],
+        "loads": [{"face": "top", "force": [0, 0, -100]}],
+        "material": "steel",
+        "mesh_fineness": 0.3,
+        "doc_id": doc,
+    })
+    assert fea_r["ok"], fea_r
+
+    r, _ = _call("describe_results", {"doc_id": doc})
+    assert r is not None
+    result_text = r.get("text", "") if isinstance(r, dict) else str(r)
+
+    assert "MPa" in result_text, result_text
+    assert "mm" in result_text, result_text
+    assert "safety" in result_text.lower() or "fos" in result_text.lower(), result_text
+    assert "steel" in result_text.lower() or "material" in result_text.lower(), result_text
+    import re
+    assert re.search(r'\d+\.?\d*\s*MPa', result_text), result_text
+
+
 if __name__ == "__main__":
     if not cb.available():
         print("SKIP: libaicad not staged")

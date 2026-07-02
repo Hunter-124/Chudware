@@ -124,6 +124,7 @@ Rule: the ECAD default distribution stays **GPL-clean**, identical to the CAD po
 | **peft** | **Apache-2.0** | HuggingFace PEFT — LoRA adapter training | ok — in-process, dev/internal only; lazy import. Never shipped in the desktop installer. |
 | **Unsloth** | **Apache-2.0** | Fast LoRA training via custom CUDA kernels | ok — in-process, dev/internal only; lazy import with fallback to plain TRL. Never shipped in the desktop installer. |
 | **PyYAML** | **MIT** | YAML recipe file parsing | ok — in-process; already a common transitive dep. Never shipped in the desktop installer. |
+| **vLLM (server)** (T-H9) | **Apache-2.0** | per-task LoRA serving runtime — external OpenAI-compatible inference server launched with `--enable-lora` (`docs/serving_runbook.md`); AI-CAD talks to it over HTTP via the `vllm` provider (`services/agent/providers/vllm_provider.py`), NEVER imports it | ok — external server, same posture as the llama.cpp managed runtime / LM Studio: subprocess/HTTP isolation, Apache-2.0 permissive, GPU/dev-internal only, never bundled in the desktop installer. No `requirements.txt` line (never imported in-process — an HTTP client, not a Python dependency). |
 ## Structural section data (T-D3)
 
 | item | license | role | posture |

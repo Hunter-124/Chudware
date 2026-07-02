@@ -77,6 +77,29 @@ stage_manual_gen() {
     fi
 }
 
+# ---- Stage 1.6: UI style conformance (advisory, T-U1) ------------------------
+# scripts/ui_style_check.py enforces the panel_scaffold.h kit rules from
+# docs/UI_PATTERN_LIBRARY.md (no literal colors outside theme::/tokens.h, no OS #ifdef outside
+# ui/imgui/src/platform/, a ui/abstract/ view-model header per scaffold-built panel). Advisory
+# like manual regen — pre-existing findings are absorbed into scripts/ui_style_check_baseline.json
+# so this gates only NEW drift on top of the pre-T-U1 host/ history, not a wholesale rewrite.
+stage_ui_style_check() {
+    echo "=== ui_style_check.py (advisory) ==="
+    if ! command -v python3 >/dev/null 2>&1; then
+        record "ui_style_check.py   SKIP    python3 not on PATH"
+        echo "  SKIP: python3 not installed"
+        return 0
+    fi
+    if python3 scripts/ui_style_check.py > /tmp/gate_ui_style.out 2>&1; then
+        record "ui_style_check.py   PASS    no new panel-conformance drift"
+        echo "  PASS"
+    else
+        record "ui_style_check.py   FAIL-RECORDED  new drift (non-fatal — see /tmp/gate_ui_style.out)"
+        echo "  FAIL (non-fatal) — /tmp/gate_ui_style.out:"
+        tail -n 8 /tmp/gate_ui_style.out | sed 's/^/    /'
+    fi
+}
+
 # ---- OCCT detection ---------------------------------------------------------
 find_occt_config() {
     # Look for the OpenCASCADE CMake config in the standard install locations.
@@ -290,6 +313,7 @@ stage_bench() {
 CORE_BUILD_OK=0
 stage_check
 stage_manual_gen
+stage_ui_style_check
 stage_core_build
 stage_ui_abstract
 stage_ctest

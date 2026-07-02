@@ -194,6 +194,57 @@ def parse_panel_spec(repo: Path) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# 3b. T-U1 scaffold-built panels  (any ui/imgui/src/ui/*.cpp instantiating
+#     PanelScaffoldSpec) — auto-discovered, no manual registration table needed.
+#     New T-U2..T-U8 panels show up here the moment they use panel_scaffold.h.
+# ---------------------------------------------------------------------------
+
+def parse_panel_scaffold_panels(repo: Path) -> list[dict]:
+    """
+    Scan ui/imgui/src/ui/*.cpp for PanelScaffoldSpec instances and pull out their
+    {id, title, file, line}. Supports both field-assignment style:
+        PanelScaffoldSpec spec;
+        spec.id = "parts_browser";
+        spec.title = "Parts Browser";
+    and aggregate-init style:
+        PanelScaffoldSpec spec{"parts_browser", "Parts Browser", ...};
+    """
+    src_dir = repo / "ui" / "imgui" / "src" / "ui"
+    if not src_dir.exists():
+        print(f"[WARN] {src_dir} not found", file=sys.stderr)
+        return []
+
+    decl_re = re.compile(r'\bPanelScaffoldSpec\s+(\w+)\s*(;|\{)')
+    aggregate_re = re.compile(r'\bPanelScaffoldSpec\s+\w+\s*\{\s*"([^"]+)"\s*,\s*"([^"]+)"')
+
+    panels: list[dict] = []
+    for cpp in sorted(src_dir.glob("*.cpp")):
+        text = cpp.read_text(encoding="utf-8")
+        for m in decl_re.finditer(text):
+            var = m.group(1)
+            line_no = text.count("\n", 0, m.start()) + 1
+
+            if m.group(2) == "{":
+                agg = aggregate_re.match(text, m.start())
+                if agg:
+                    panels.append({
+                        "id": agg.group(1), "title": agg.group(2),
+                        "file": cpp.relative_to(repo).as_posix(), "line": line_no,
+                    })
+                    continue
+
+            id_m = re.search(rf'\b{re.escape(var)}\.id\s*=\s*"([^"]+)"', text)
+            title_m = re.search(rf'\b{re.escape(var)}\.title\s*=\s*"([^"]+)"', text)
+            if id_m or title_m:
+                panels.append({
+                    "id": id_m.group(1) if id_m else var,
+                    "title": title_m.group(1) if title_m else (id_m.group(1) if id_m else var),
+                    "file": cpp.relative_to(repo).as_posix(), "line": line_no,
+                })
+    return panels
+
+
+# ---------------------------------------------------------------------------
 # 4. Settings tabs + options  (settings_modal.cpp)
 # ---------------------------------------------------------------------------
 
@@ -361,6 +412,7 @@ def emit_inventory(
     ribbon_cmds = parse_ribbon_def(repo)
     palette_cmds = parse_command_registry(repo)
     panel_forms = parse_panel_spec(repo)
+    scaffold_panels = parse_panel_scaffold_panels(repo)
     settings_entries = parse_settings(repo)
 
     counts = {
@@ -368,6 +420,7 @@ def emit_inventory(
         "palette_rows": 0,
         "pm_forms": len(panel_forms),
         "pm_fields": sum(f["field_count"] for f in panel_forms),
+        "scaffold_panels": len(scaffold_panels),
         "settings_rows": 0,
         "needs_live_rows": len(NEEDS_LIVE_ROWS),
         "new_rows": 0,
@@ -542,6 +595,27 @@ def emit_inventory(
         counts["pm_fields"] += 0  # already counted above
 
     # -----------------------------------------------------------------------
+    # T-U1 scaffold-built panels (auto-discovered — no manual table to update)
+    # -----------------------------------------------------------------------
+    write()
+    write("---")
+    write()
+    write("## Scaffold-built Panels (T-U1 kit)")
+    write()
+    write(f"Total: {len(scaffold_panels)}. Auto-discovered from `PanelScaffoldSpec` instances under "
+          "`ui/imgui/src/ui/*.cpp` — a new T-U2..T-U8 panel appears here automatically the moment "
+          "it's built on `panel_scaffold.h` (docs/UI_PATTERN_LIBRARY.md §0), no manual registration.")
+    write()
+    write("| id | area | location | launch | keep/fix/kill | notes |")
+    write("|----|------|----------|--------|---------------|-------|")
+    for panel in scaffold_panels:
+        elem_id = f"scaffold/{panel['id']}"
+        tag = row_tag(elem_id)
+        location = f"{panel['file']}:{panel['line']} — \"{panel['title']}\""
+        write(make_row(elem_id, "Scaffold Panel", location, "Live app / AI_CAD_SHOT", tag))
+        seen_ids.add(elem_id)
+
+    # -----------------------------------------------------------------------
     # Settings tabs + options
     # -----------------------------------------------------------------------
     write()
@@ -640,6 +714,7 @@ def emit_inventory(
     write(f"| Palette commands (deduplicated) | {counts['palette_rows']} |")
     write(f"| PM forms | {len(panel_forms)} |")
     write(f"| PM fields (total across all forms) | {sum(f['field_count'] for f in panel_forms)} |")
+    write(f"| Scaffold-built panels (T-U1 kit) | {counts['scaffold_panels']} |")
     write(f"| Settings options | {counts['settings_rows']} |")
     write(f"| App chrome / viewport elements | {len(chrome_items)} |")
     write(f"| T-G2 NEEDS-LIVE seed items | {len(NEEDS_LIVE_ROWS)} |")

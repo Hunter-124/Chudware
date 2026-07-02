@@ -3,7 +3,7 @@ id: T-U1
 title: UI kit: style-conformance scaffold + pattern library for all new feature panels
 workstream: U
 owner: sonnet-reed
-status: doing
+status: review
 branch: task/T-U1-ui
 day: 1
 priority: 1
@@ -36,11 +36,11 @@ DELETED — ratified, do not re-litigate).
 
 ## Definition of done
 
-- [ ] Pattern library doc w/ at least 5 reusable patterns, each with a code pointer
-- [ ] panel_scaffold compiles + one demo panel built on it (screenshot, headless)
-- [ ] ui_style_check.py green on the existing shell; catches a seeded violation in test
-- [ ] T-G12 inventory script picks up scaffold-built panels automatically
-- [ ] flock'd build + gate + graphify update .
+- [x] Pattern library doc w/ at least 5 reusable patterns, each with a code pointer
+- [x] panel_scaffold compiles + one demo panel built on it (screenshot, headless)
+- [x] ui_style_check.py green on the existing shell; catches a seeded violation in test
+- [x] T-G12 inventory script picks up scaffold-built panels automatically
+- [x] flock'd build + gate + graphify update .
 
 ## Driver notes (Fable)
 
@@ -49,3 +49,56 @@ DELETED — ratified, do not re-litigate).
 - The kit is the coherence contract for T-U2..T-U8: write it for a mid-tier agent
   audience (explicit, example-heavy, zero taste-required decisions left open).
 - NO VISIBLE WINDOWS (headless shots only). host/ is deprecated — imgui only.
+
+## Driver report (sonnet-reed)
+
+Kit landed exactly as scoped, derived from the existing T-F16 exemplar (`artifact_view.h` +
+`preview_pane.cpp`) rather than inventing new conventions:
+
+- `docs/UI_PATTERN_LIBRARY.md` — 7 patterns (glass column anatomy / view-model-first / row
+  pills / cards / typed empty-state / tables / iconography) + a do/don't gallery, each with a
+  real code pointer. Explicitly calls out the T-G13/issue #7 step-machine deadlock and directs
+  new panels to the one-shot scenario style instead.
+- `ui/imgui/src/ui/panel_scaffold.{h,cpp}` — header + optional search row + scrollable content
+  + optional status footer, built entirely from existing `theme::` glass APIs (no new theme
+  surface). `drawPanelEmptyState()` generalizes the `previewStateFromReason`/`previewStateLabel`
+  placeholder precedent for scaffold panels.
+- `ui/abstract/scaffold_demo_view.h` + `ui/imgui/src/ui/scaffold_demo_panel.{h,cpp}` — the demo
+  panel proving the kit end-to-end (view-model-first, search filter, row pills, empty state,
+  status footer). Wired as a one-shot scenario (`AI_CAD_SHOT=scaffold_demo`, added to
+  `ShotConfig`/`configureShot`), not a `ScenarioRunner` step machine, so it's unaffected by the
+  T-G13 offscreen-deadlock issue. Floats centered (`ImGuiCond_Appearing`, `equations_dialog.cpp`
+  pattern) rather than dock-registered — it's a kit demo, not a shipped feature.
+- `scripts/ui_style_check.py` + `scripts/ui_style_check_baseline.json` — three rules (literal
+  colors / OS ifdefs / view-model header), baseline-absorbs the 18 genuine pre-existing findings
+  (17 literal colors in `evaluate_dialogs.cpp`/`feature_tree.cpp`/`property_manager.cpp`/
+  `settings_modal.cpp`, 1 `#ifdef _WIN32` in `preview_pane.cpp`) so it gates only new drift, same
+  pattern as `scripts/gui_lint.py`'s baseline. `--selftest` seeds one violation per rule in a
+  tempdir plus a conformant control panel and asserts all three fire / zero false positives —
+  ran green.
+- `scripts/ui_inventory.py` — new `parse_panel_scaffold_panels()` regex-scans every
+  `ui/imgui/src/ui/*.cpp` for `PanelScaffoldSpec` instances (field-assignment or aggregate-init
+  style) and emits a "Scaffold-built Panels" section — verified it auto-picked up
+  `scaffold_demo` with zero manual registration.
+- `scripts/gate.sh` — new advisory `stage_ui_style_check` (same non-fatal pattern as the T-Q4
+  manual-regen stage), wired into the stage sequence before `stage_core_build`.
+
+**Verified:** `flock /tmp/host-build-linux.lock` build of `build/linux-app` (AI-CAD2) clean;
+headless `xvfb-run ... --shot AI_CAD_SHOT=scaffold_demo` screenshot confirms the scaffold header,
+search row, three row-pill rows, and status footer all render correctly (glass row-pill z-order
+verified — background drawn before content, per the pitfall documented in the pattern library).
+Fixed one runtime bug found via the screenshot: an em-dash in the demo's status string rendered
+as `?` (font glyph-range gap) — replaced with a plain hyphen; UI-drawn strings should avoid
+non-ASCII punctuation until the font atlas is audited for it (worth a follow-up note for T-U2+
+authors, not filing a separate task for one string).
+
+**Gate (`scripts/gate.sh`):** check.py FAIL-RECORDED (pre-existing, unrelated — ribbon/parity
+audits), `ui_style_check.py` PASS, core build + ctest 100% PASS, ui/abstract PASS, ui/imgui build
++ `--shot` PASS (`--selftest` FAIL — pre-existing, no runtime venv provisioned on this box, same
+env gap as `pytest` below), `pytest` FAIL — pre-existing gate-venv gap (141 deselected, "Python
+runtime not installed"), the same issue #6 / T-INF1 gap other drivers have recorded repeatedly
+this session; T-U1 touches no engine/Python code. `graphify update .` run (25493 nodes / 53181
+edges / 1190 communities).
+
+No advisor questions — this task was fully spec'd (derive-don't-invent from an existing
+exemplar), no architectural ambiguity hit.

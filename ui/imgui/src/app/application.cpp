@@ -9,6 +9,7 @@
 #include "ui/file_explorer.h"
 #include "ui/settings_modal.h"
 #include "ui/preview_pane.h"
+#include "ui/scaffold_demo_panel.h"
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -183,6 +184,21 @@ void Application::frame() {
         if (ui::previewTakeFocusRequest()) ImGui::SetNextWindowFocus();
         if (ImGui::Begin("Preview###preview", ui::previewPaneOpen(), pflags))
             ui::drawPreviewPane(s);
+        ImGui::End();
+    }
+
+    // T-U1 kit demo: closable, proves panel_scaffold.h compiles/renders/screenshots
+    // (AI_CAD_SHOT=scaffold_demo). Zero footprint while closed. Not dock-registered (it is a
+    // kit demo, not a shipped feature) — floats centered so it doesn't overlap ribbon/tree chrome
+    // (equations_dialog.cpp's ImGuiCond_Appearing pattern).
+    if (*ui::scaffoldDemoPanelOpen()) {
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
+                                        vp->WorkPos.y + vp->WorkSize.y * 0.5f),
+                                 ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(420.f * theme::S(), 420.f * theme::S()), ImGuiCond_Appearing);
+        if (ImGui::Begin("Scaffold Demo###scaffold_demo", ui::scaffoldDemoPanelOpen(), pflags))
+            ui::drawScaffoldDemoPanel(s);
         ImGui::End();
     }
     ImGui::PopStyleColor();

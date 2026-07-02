@@ -13,6 +13,7 @@
 #include "imgui.h"
 
 #include "icons.h"
+#include "layout.h"           // setNextCommandDialogPlacement (floating dialog anchor)
 #include "metrics.h"
 #include "property_manager.h"   // pmParseDim / pmFormatDim (DimField parsing)
 
@@ -22,20 +23,56 @@
 
 namespace ui {
 
-// Frosted-glass window fill for the floating assembly tool windows (Insert / Parts Library / Mate /
-// Pattern / Explode / Interference / BOM) so they read as part of the app-wide glass family. Push
-// right before ImGui::Begin() (the window background is captured there) and pop right after; the
-// translucent glassBg lets content behind bleed through subtly while text stays legible.
+// Liquid-glass v2 for the floating assembly tool windows (Insert / Parts Library / Mate / Pattern /
+// Explode / Interference / BOM). These are independent top-level ImGui::Begin() windows (NOT embedded
+// in a pinned column), so each paints its OWN frosted backdrop — the layout.cpp drawLeftPane recipe:
+//   pushGlassWindow()  -> WindowBg transparent (so the native fill doesn't sit over our glassPanel)
+//   Begin(...)
+//   popGlassWindow()
+//   if (win) { paintGlassWindow(id) -> adaptivePanel(rect) + glassPanel + push surf.textPrimary; }
+//   ... content ...
+//   if (win) endGlassWindow();       // pop the content text color
+//   End();
+// The scrim tracks the LIVE viewport behind the window, so text contrast holds in dark + light theme.
 static void pushGlassWindow() {
-    const auto& p = ui::palette;
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,
-        ImVec4(p.glassBg[0], p.glassBg[1], p.glassBg[2], p.glassBg[3]));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));  // v2: transparent — glassPanel fills
 }
 static void popGlassWindow() { ImGui::PopStyleColor(); }
+
+// Paint the frosted backdrop over the just-Begun window and push its adaptive content text color.
+// `id` MUST be unique + stable per window (independent rects; a shared id thrashes the adaptivePanel
+// cache). Call once right after a successful Begin(); pair with endGlassWindow() before End(). Mirrors
+// evaluate_dialogs.cpp's proven floating-window recipe (glassPanel straight onto the window draw list;
+// the frost is translucent so the native title-bar text bleeds through legibly).
+// The active window's adaptive surface (set by paintGlassWindow while a live viewport backdrop is
+// under the window; cleared by endGlassWindow). pushText() consults it so the file's many
+// pushText(pal.text)/pushText(pal.textDim) call sites become backdrop-adaptive with ZERO edits:
+// over the frosted light glass, theme near-white ink would vanish, so we remap the primary/secondary
+// text ROLES to the surface's contrast-matched tones. Semantic roles (accent/status*) pass through
+// unchanged — they must keep their meaning.
+static const ui::AdaptiveSurface* g_asmSurf = nullptr;
+
+static void paintGlassWindow(const char* id) {
+    ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+    ImRect r(wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
+    const ui::AdaptiveSurface& surf =
+        ui::adaptivePanel(ui::panelId(id), r, ui::GlassGroup::Global);
+    ui::glassPanel(ImGui::GetWindowDrawList(), r, ui::GlassLevel::Regular, 12.0f, surf);
+    g_asmSurf = ui::viewportBackdrop().valid() ? &surf : nullptr;
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);  // adaptive content ink (default)
+}
+static void endGlassWindow() { ImGui::PopStyleColor(); g_asmSurf = nullptr; }
 
 // ---- small theme helpers (mirror feature_tree.cpp / property_manager.cpp) ----
 
 static void pushText(const float c[4]) {
+    // Remap the primary / secondary text ROLES to adaptive tones when a frosted surface is active
+    // (pointer-identity compare against the palette role arrays — cheap + exact). All other colors
+    // (accent, statusWarn/statusErr, custom) pass through so semantic meaning is preserved.
+    if (g_asmSurf) {
+        if (c == ui::palette.text)    { ImGui::PushStyleColor(ImGuiCol_Text, g_asmSurf->textPrimary);   return; }
+        if (c == ui::palette.textDim) { ImGui::PushStyleColor(ImGuiCol_Text, g_asmSurf->textSecondary); return; }
+    }
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], c[3]));
 }
 static void asmIcon(const char* name, const char* fallback, float size = 18.0f) {
@@ -150,12 +187,14 @@ bool AsmPanels::insertComponent(AppState& st, const std::string& path,
 void AsmPanels::drawInsert(AppState& st) {
     if (!insertOpen_) return;
     bool open = true;
+    ui::setNextCommandDialogPlacement();   // first-open anchor over the full-width viewport
     ImGui::SetNextWindowSize(ImVec2(380 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (insertFocus_) { ImGui::SetNextWindowFocus(); insertFocus_ = false; }
     pushGlassWindow();
     const bool insWin = ImGui::Begin("Insert Component", &open);
     popGlassWindow();
     if (insWin) {
+        paintGlassWindow("asm_insert_glass");
         asmIcon("insert_component", "[+]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Insert a part into the assembly");
         ImGui::Spacing();
@@ -186,6 +225,7 @@ void AsmPanels::drawInsert(AppState& st) {
             ImGui::SameLine();
             if (ImGui::Button("Close", ImVec2(ui::metrics::asmBtnW(), 0))) insertOpen_ = false;
         }
+        endGlassWindow();
     }
     ImGui::End();
     if (!open) insertOpen_ = false;
@@ -250,12 +290,14 @@ bool AsmPanels::insertCatalogPart(AppState& st, const std::string& family,
 void AsmPanels::drawPartsLibrary(AppState& st) {
     if (!partsLibOpen_) return;
     bool open = true;
+    ui::setNextCommandDialogPlacement();   // first-open anchor over the full-width viewport
     ImGui::SetNextWindowSize(ImVec2(560 * ui::uiScale, 420 * ui::uiScale), ImGuiCond_Appearing);
     if (partsLibFocus_) { ImGui::SetNextWindowFocus(); partsLibFocus_ = false; }
     pushGlassWindow();
     const bool partsLibWin = ImGui::Begin("Standard Parts Library", &open);
     popGlassWindow();
     if (partsLibWin) {
+        paintGlassWindow("asm_partslib_glass");
         asmIcon("insert_component", "[+]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Insert standard hardware (generated to spec)");
         ImGui::Spacing();
@@ -279,6 +321,7 @@ void AsmPanels::drawPartsLibrary(AppState& st) {
             ImGui::TextWrapped("Could not load the parts catalog: %s", partsCatalogError_.c_str());
             ImGui::PopStyleColor();
             if (ImGui::Button("Retry")) partsCatalogFetched_ = false;
+            endGlassWindow();
             ImGui::End();
             if (!open) partsLibOpen_ = false;
             return;
@@ -411,6 +454,7 @@ void AsmPanels::drawPartsLibrary(AppState& st) {
             ImGui::PopStyleColor();
         }
         ImGui::EndChild();
+        endGlassWindow();
     }
     ImGui::End();
     if (!open) partsLibOpen_ = false;
@@ -592,6 +636,7 @@ void AsmPanels::drawMateForm(AppState& st) {
     const bool mateWin = ImGui::Begin("Mate##asm", &open);
     popGlassWindow();
     if (mateWin) {
+        paintGlassWindow("asm_mate_glass");
         // header: icon + title + Add / Cancel (PM style)
         asmIcon("mate", "[M]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         pushText(pal.text);
@@ -783,6 +828,7 @@ void AsmPanels::drawMateForm(AppState& st) {
         if (!ready) ImGui::EndDisabled();
         ImGui::SameLine();
         if (ImGui::Button("Close##asm_mate", ImVec2(ui::metrics::asmBtnW(), 0))) closeMateForm();
+        endGlassWindow();
     }
     ImGui::End();
     if (!open) closeMateForm();
@@ -882,12 +928,14 @@ void AsmPanels::drawPatternForm(AppState& st) {
     if (!patternOpen_) return;
     const auto& pal = ui::palette;
     bool open = true;
+    ui::setNextCommandDialogPlacement();   // first-open anchor over the full-width viewport
     ImGui::SetNextWindowSize(ImVec2(340 * ui::uiScale, 0), ImGuiCond_Appearing);
     if (patternFocus_) { ImGui::SetNextWindowFocus(); patternFocus_ = false; }
     pushGlassWindow();
     const bool patternWin = ImGui::Begin("Component Pattern##asm", &open);
     popGlassWindow();
     if (patternWin) {
+        paintGlassWindow("asm_pattern_glass");
         asmIcon("pattern_component", "[#]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         pushText(pal.text);
         ImGui::TextUnformatted("Component Pattern");
@@ -898,6 +946,7 @@ void AsmPanels::drawPatternForm(AppState& st) {
             pushText(pal.statusWarn);
             ImGui::TextWrapped("No assembly open.");
             ImGui::PopStyleColor();
+            endGlassWindow();
             ImGui::End();
             if (!open) patternOpen_ = false;
             return;
@@ -988,6 +1037,7 @@ void AsmPanels::drawPatternForm(AppState& st) {
         if (!ready) ImGui::EndDisabled();
         ImGui::SameLine();
         if (ImGui::Button("Close##asm_pat", ImVec2(ui::metrics::asmBtnW(), 0))) patternOpen_ = false;
+        endGlassWindow();
     }
     ImGui::End();
     if (!open) patternOpen_ = false;
@@ -1021,12 +1071,14 @@ bool AsmPanels::setExplode(AppState& st, bool active, float factor) {
 void AsmPanels::drawExplode(AppState& st) {
     if (!explodeOpen_) return;
     bool open = true;
+    ui::setNextCommandDialogPlacement();   // first-open anchor over the full-width viewport
     ImGui::SetNextWindowSize(ImVec2(300 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (explodeFocus_) { ImGui::SetNextWindowFocus(); explodeFocus_ = false; }
     pushGlassWindow();
     const bool explodeWin = ImGui::Begin("Exploded View", &open);
     popGlassWindow();
     if (explodeWin) {
+        paintGlassWindow("asm_explode_glass");
         asmIcon("exploded_view", "[X]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Explode factor");
         ImGui::Spacing();
@@ -1041,6 +1093,7 @@ void AsmPanels::drawExplode(AppState& st) {
         if (ImGui::Button("Collapse", ImVec2(ui::metrics::asmBtnW(), 0))) { explodeFactor_ = 0.0f; setExplode(st, false, 0.0f); }
         ImGui::SameLine();
         if (ImGui::Button("Exploded", ImVec2(ui::metrics::asmBtnW(), 0))) { explodeFactor_ = 1.0f; setExplode(st, true, 1.0f); }
+        endGlassWindow();
     }
     ImGui::End();
     if (!open) explodeOpen_ = false;
@@ -1088,12 +1141,14 @@ void AsmPanels::drawInterference(AppState& st) {
     if (!interferenceOpen_) return;
     const auto& pal = ui::palette;
     bool open = true;
+    ui::setNextCommandDialogPlacement();   // first-open anchor over the full-width viewport
     ImGui::SetNextWindowSize(ImVec2(420 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (interferenceFocus_) { ImGui::SetNextWindowFocus(); interferenceFocus_ = false; }
     pushGlassWindow();
     const bool interfWin = ImGui::Begin("Interference Detection", &open);
     popGlassWindow();
     if (interfWin) {
+        paintGlassWindow("asm_interference_glass");
         asmIcon("interference", "[!]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Component interference + clearance");
         ImGui::SameLine(ImGui::GetWindowWidth() - 80);
@@ -1149,6 +1204,7 @@ void AsmPanels::drawInterference(AppState& st) {
                 ImGui::PopStyleColor();
             }
         }
+        endGlassWindow();
     }
     ImGui::End();
     if (!open) interferenceOpen_ = false;
@@ -1210,12 +1266,14 @@ void AsmPanels::refreshBom(AppState& st) {
 void AsmPanels::drawBom(AppState& st) {
     if (!bomOpen_) return;
     bool open = true;
+    ui::setNextCommandDialogPlacement();   // first-open anchor over the full-width viewport
     ImGui::SetNextWindowSize(ImVec2(560 * ui::uiScale, 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (bomFocus_) { ImGui::SetNextWindowFocus(); bomFocus_ = false; }
     pushGlassWindow();
     const bool bomWin = ImGui::Begin("Bill of Materials", &open);
     popGlassWindow();
     if (bomWin) {
+        paintGlassWindow("asm_bom_glass");
         asmIcon("bom", "[B]"); ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
         ImGui::TextUnformatted("Components");
         ImGui::SameLine(ImGui::GetWindowWidth() - 80);
@@ -1279,6 +1337,7 @@ void AsmPanels::drawBom(AppState& st) {
                 bomNote_ = "Could not open CSV path for writing.";
             }
         }
+        endGlassWindow();
     }
     ImGui::End();
     if (!open) bomOpen_ = false;

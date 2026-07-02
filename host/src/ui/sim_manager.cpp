@@ -35,6 +35,93 @@ static void simTip(const char* tip) {
         ImGui::SetTooltip("%s", tip);
 }
 
+// ---- liquid-glass v2: shared FeatureManager-column surface (host contract §H4) ----------------
+// The Simulation tree body is drawn EMBEDDED inside drawLeftPane's tab child (layout.cpp), which
+// already painted ONE glass surface for the whole pane under panelId("host_left_glass"). Mirror
+// feature_tree.cpp's fmSurf(): fetch that SAME surface (same id + group, every frame — the
+// adaptivePanel cache contract) for adaptive, backdrop-tracking text + row pills. The rect passed
+// here is moot (layout.cpp paints the id first this frame) but supplied for the cache signature.
+static const ui::AdaptiveSurface& simSurf() {
+    ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+    ImRect r(wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
+    return ui::adaptivePanel(ui::panelId("host_left_glass"), r, ui::GlassGroup::FeatureManager);
+}
+// Frosted pill behind one embedded row/card at the current cursor (full content width), mirroring
+// feature_tree.cpp's fmRowPill. Call immediately BEFORE the row's widgets. `rows` extends the pill
+// over multiple frame-heights (a small card block); `selected` draws the restrained accent card.
+static void simRowPill(bool selected = false, float rows = 1.0f, float rounding = 3.5f) {
+    const float rowH = ImGui::GetFrameHeight() * rows;
+    ImVec2 rowMin = ImGui::GetCursorScreenPos();
+    float availW = ImGui::GetContentRegionAvail().x;
+    ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
+    ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, rounding,
+                           false, selected, selected ? 0.42f : 0.26f);
+}
+
+// v2 checklist-card frame: replaces the old pushGlassChildStyle (theme-static dark glassBg fill,
+// which forced a text re-pair) with a transparent auto-resizing child fronted by a frosted glass
+// PILL painted behind it — one coherent glass family with the pane, no double-frost, and the
+// pane's adaptive ink stays correct (no per-card text push). Split the draw list so the pill lands
+// behind the child's content; the caller draws content between begin/end and reads the returned
+// visibility exactly like BeginChild. Pair begin/end unconditionally.
+static ImDrawList* s_ckDL = nullptr;
+static ImVec2      s_ckP0;
+static bool beginCheckCard(const char* id) {
+    const float S = ui::uiScale;
+    s_ckDL = ImGui::GetWindowDrawList();
+    s_ckP0 = ImGui::GetCursorScreenPos();
+    s_ckDL->ChannelsSplit(2);
+    s_ckDL->ChannelsSetCurrent(1);                  // content above the pill
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));  // transparent — pill is the fill
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f * S, 6.0f * S));
+    return ImGui::BeginChild(id, ImVec2(0.0f, 0.0f),
+                             ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+}
+static void endCheckCard() {
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+    const float w = ImGui::GetItemRectSize().x;
+    const ImVec2 p1(s_ckP0.x + w, ImGui::GetItemRectMax().y);
+    s_ckDL->ChannelsSetCurrent(0);                  // pill behind the content
+    ui::glassRowBackground(s_ckDL, s_ckP0, p1, 6.0f, false, false, 0.30f);
+    s_ckDL->ChannelsMerge();
+}
+
+// ---- card-surface text pairing --------------------------------------------------------------
+// v2: the banner / checklist cards now fill with the ADAPTIVE frosted surface (glassRowBackground
+// pills over the pane's live-backdrop glass — see simRowPill), so their text is the pane's own
+// adaptive ink (simSurf().textPrimary, dark-on-light over the light viewport). Only the scopes
+// still on the THEME glass surface (BeginPopup / the custom-material modal — floating popups do
+// not inherit the pane's frosted backdrop) pair against palette.glassBg via glassCardText().
+// So: pushCardText() below is used ONLY in those popup scopes now.
+static ImVec4 glassCardText() {
+    // The popup/modal consumers fill with the OPAQUE theme glassBg (ImGuiCol_PopupBg, ~0.87a dark)
+    // regardless of the viewport backdrop — they are NOT the frosted column — so text must always be
+    // contrasted against glassBg (a light ink). Do NOT substitute the pane's adaptive (dark) ink here
+    // or the popup text goes dark-on-dark = invisible over a light model.
+    const float* g = ui::palette.glassBg;
+    return ui::maxContrastTextOn(ImVec4(g[0], g[1], g[2], 1.0f));
+}
+static void pushCardText() {
+    ImVec4 t = glassCardText();
+    ImGui::PushStyleColor(ImGuiCol_Text, t);
+    t.w = 0.62f;
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled, t);
+}
+static void popCardText() { ImGui::PopStyleColor(2); }
+// Dim/secondary text for the CURRENT scope: derives from whatever Text color is active (adaptive
+// pane ink outside the cards, card ink inside), instead of palette.textDim — which only pairs
+// with theme surfaces and washes out on the frosted adaptive pane.
+static void pushDimText() {
+    ImVec4 t = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    t.w *= 0.62f;
+    ImGui::PushStyleColor(ImGuiCol_Text, t);
+}
+static void popDimText() { ImGui::PopStyleColor(1); }
+// Semantic status colors as ImVec4 (palette roles carry float[4]).
+static ImVec4 simRole(const float c[4]) { return ImVec4(c[0], c[1], c[2], c[3]); }
+
 // Compose the incoming-flow unit vector from a study's base axis + AoA + sideslip (defined below; used
 // by both the setup form readout and the viewport setup preview).
 static void flowIncomingDir(const Study& s, float out[3]);
@@ -93,6 +180,8 @@ static void drawStudyTypeBanner(StudyType t, const char* desc) {
     const float w = ImGui::GetContentRegionAvail().x;
     dl->ChannelsSplit(2);
     dl->ChannelsSetCurrent(1);                 // content sits above the card
+    // v2: no local text re-pair — the banner sits on a frosted glass PILL (drawn below) over the
+    // pane's adaptive backdrop, so drawTreeBody/drawForm's pane-level adaptive ink is already right.
     ImGui::Dummy(ImVec2(0, pad.y));
     ImGui::Indent(pad.x);
     IconUV iv = getIcon(studyTypeIcon(t), 20);
@@ -107,7 +196,7 @@ static void drawStudyTypeBanner(StudyType t, const char* desc) {
     ImGui::Dummy(ImVec2(0, pad.y));
     const ImVec2 p1(p0.x + w, ImGui::GetCursorScreenPos().y);
     dl->ChannelsSetCurrent(0);                 // glass card behind the content
-    ui::glassBackground(dl, p0, p1, 8.0f);
+    ui::glassRowBackground(dl, p0, p1, 8.0f, false, false, 0.30f);  // frosted pill (v2)
     dl->ChannelsMerge();
     ImGui::Spacing();
 }
@@ -1026,26 +1115,65 @@ void perp3(const float d[3], float p[3]) {
 void pushSeg3(std::vector<float>& s, const float a[3], const float b[3]) {
     s.insert(s.end(), {a[0], a[1], a[2], b[0], b[1], b[2]});
 }
-// Arrow: shaft tail->tip (tip = tail + dir*len) + a 4-line conical head at the tip.
-void pushArrow3(std::vector<float>& s, const float tail[3], const float dir[3], float len) {
+void cross3(const float a[3], const float b[3], float out[3]) {
+    out[0] = a[1] * b[2] - a[2] * b[1];
+    out[1] = a[2] * b[0] - a[0] * b[2];
+    out[2] = a[0] * b[1] - a[1] * b[0];
+}
+void pushTri3(std::vector<float>& t, const float a[3], const float b[3], const float c[3]) {
+    t.insert(t.end(), {a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]});
+}
+// Solid 12-segment cone: apex at `tip`, axis pointing tip->base, height h, base radius r.
+// Side fan + base cap so the head reads from every angle; the SS resolve anti-aliases it.
+void pushCone3(std::vector<float>& t, const float tip[3], const float axis[3], float h, float r) {
+    float d[3] = {axis[0], axis[1], axis[2]};
+    vecNorm3(d);
+    float bc[3] = {tip[0] + d[0] * h, tip[1] + d[1] * h, tip[2] + d[2] * h};
+    float p1[3], p2[3];
+    perp3(d, p1);
+    cross3(d, p1, p2);
+    const int kSegs = 12;
+    float prev[3] = {bc[0] + p1[0] * r, bc[1] + p1[1] * r, bc[2] + p1[2] * r};
+    for (int i = 1; i <= kSegs; ++i) {
+        const float a = (float)i / (float)kSegs * 6.2831853f;
+        const float ca = std::cos(a), sa = std::sin(a);
+        float q[3] = {bc[0] + (p1[0] * ca + p2[0] * sa) * r,
+                      bc[1] + (p1[1] * ca + p2[1] * sa) * r,
+                      bc[2] + (p1[2] * ca + p2[2] * sa) * r};
+        pushTri3(t, tip, prev, q);   // side
+        pushTri3(t, bc, q, prev);    // base cap
+        prev[0] = q[0]; prev[1] = q[1]; prev[2] = q[2];
+    }
+}
+// Arrow: shaft tail->tip (tip = tail + dir*len) + a head at the tip. With `tris` the head is a
+// SOLID triangulated cone (shaft stops at the cone base so it never pokes through the point) and
+// `headLen` can cap the head size; without it the legacy 4-line wireframe head is emitted so old
+// segments-only callers render unchanged.
+void pushArrow3(std::vector<float>& s, const float tail[3], const float dir[3], float len,
+                std::vector<float>* tris = nullptr, float headLen = -1.0f) {
     float d[3] = {dir[0], dir[1], dir[2]};
     vecNorm3(d);
     float tip[3] = {tail[0] + d[0] * len, tail[1] + d[1] * len, tail[2] + d[2] * len};
+    const float hl = headLen > 0.0f ? headLen : len * 0.28f;
+    const float hw = hl * 0.46f;  // same head aspect as the old wireframe (0.13/0.28 of len)
+    float bk[3] = {tip[0] - d[0] * hl, tip[1] - d[1] * hl, tip[2] - d[2] * hl};
+    if (tris) {
+        pushSeg3(s, tail, bk);
+        float back[3] = {-d[0], -d[1], -d[2]};
+        pushCone3(*tris, tip, back, hl, hw);
+        return;
+    }
     pushSeg3(s, tail, tip);
     float p1[3], p2[3];
     perp3(d, p1);
-    p2[0] = d[1] * p1[2] - d[2] * p1[1];
-    p2[1] = d[2] * p1[0] - d[0] * p1[2];
-    p2[2] = d[0] * p1[1] - d[1] * p1[0];
-    const float hl = len * 0.28f, hw = len * 0.13f;
-    float bk[3] = {tip[0] - d[0] * hl, tip[1] - d[1] * hl, tip[2] - d[2] * hl};
+    cross3(d, p1, p2);
     float c1[3] = {bk[0] + p1[0] * hw, bk[1] + p1[1] * hw, bk[2] + p1[2] * hw};
     float c2[3] = {bk[0] - p1[0] * hw, bk[1] - p1[1] * hw, bk[2] - p1[2] * hw};
     float c3[3] = {bk[0] + p2[0] * hw, bk[1] + p2[1] * hw, bk[2] + p2[2] * hw};
     float c4[3] = {bk[0] - p2[0] * hw, bk[1] - p2[1] * hw, bk[2] - p2[2] * hw};
     pushSeg3(s, tip, c1); pushSeg3(s, tip, c2); pushSeg3(s, tip, c3); pushSeg3(s, tip, c4);
 }
-// 3-axis cross glyph (fixture "ground/clamp" marker) of half-length r at c.
+// 3-axis cross glyph (legacy fixture "ground/clamp" marker) of half-length r at c.
 void pushCross3(std::vector<float>& s, const float c[3], float r) {
     for (int axis = 0; axis < 3; ++axis) {
         float a[3] = {c[0], c[1], c[2]}, b[3] = {c[0], c[1], c[2]};
@@ -1053,10 +1181,38 @@ void pushCross3(std::vector<float>& s, const float c[3], float r) {
         pushSeg3(s, a, b);
     }
 }
+// Fixture "fixed geometry" glyph at a face: a solid cone pinned tip-first to the face centroid
+// along the outward normal + a ground bar with hatch ticks laid in the face plane (SW-style
+// anchor). Falls back to the legacy 3-axis cross when no triangle batch is supplied.
+void pushFixture3(std::vector<float>& s, std::vector<float>* tris, const float c[3],
+                  const float n[3], float r) {
+    if (!tris) { pushCross3(s, c, r); return; }
+    float d[3] = {n[0], n[1], n[2]};
+    vecNorm3(d);
+    pushCone3(*tris, c, d, 1.1f * r, 0.5f * r);  // tip on the face, base lifted along +n
+    // Ground hatching around the anchor: a bar through the centroid + 4 diagonal ticks, all in the
+    // face plane (drawSegments' depth bias keeps them over the surface).
+    float p1[3], p2[3];
+    perp3(d, p1);
+    cross3(d, p1, p2);
+    float b0[3], b1[3];
+    for (int k = 0; k < 3; ++k) { b0[k] = c[k] - p1[k] * 0.9f * r; b1[k] = c[k] + p1[k] * 0.9f * r; }
+    pushSeg3(s, b0, b1);
+    for (int i = -2; i <= 1; ++i) {
+        float t0[3], t1[3];
+        for (int k = 0; k < 3; ++k) {
+            t0[k] = c[k] + p1[k] * (0.45f * r * i + 0.2f * r);
+            t1[k] = t0[k] - (p1[k] + p2[k]) * 0.32f * r;
+        }
+        pushSeg3(s, t0, t1);
+    }
+}
 }  // namespace
 
 void SimManager::collectIndicatorSegments(AppState& st, std::vector<float>& loadSegs,
-                                          std::vector<float>& fixtureSegs) const {
+                                          std::vector<float>& fixtureSegs,
+                                          std::vector<float>* loadTris,
+                                          std::vector<float>* fixtureTris) const {
     if (sel_ < 0 || sel_ >= (int)studies_.size()) return;
     const Study& s = studies_[sel_];
     // Model scale from the face-centroid extent (faceNormalCache holds {n,c} per face).
@@ -1085,7 +1241,8 @@ void SimManager::collectIndicatorSegments(AppState& st, std::vector<float>& load
     for (const auto& p : s.fixtures.picks) {
         if (!p.pickBody || !p.pickTopo) continue;
         float c[3], n[3];
-        if (faceCN(p.pickBody, p.pickTopo, c, n)) pushCross3(fixtureSegs, c, L * 0.35f);
+        if (faceCN(p.pickBody, p.pickTopo, c, n))
+            pushFixture3(fixtureSegs, fixtureTris, c, n, L * 0.35f);
     }
     // Fatigue with fully-reversed loading swings +/- the load — draw a second, opposite arrow so the
     // alternating nature reads on the model (a double-headed indicator).
@@ -1099,20 +1256,21 @@ void SimManager::collectIndicatorSegments(AppState& st, std::vector<float>& load
                 // Pressure pushes INTO the face along -normal; arrow tip lands on the surface.
                 float dir[3] = {-n[0], -n[1], -n[2]};
                 float tail[3] = {c[0] - dir[0] * L, c[1] - dir[1] * L, c[2] - dir[2] * L};
-                pushArrow3(loadSegs, tail, dir, L);
+                pushArrow3(loadSegs, tail, dir, L, loadTris);
                 if (reversed) {  // opposite (suction) half-cycle
                     float rd[3] = {n[0], n[1], n[2]};
                     float rt[3] = {c[0] - rd[0] * L, c[1] - rd[1] * L, c[2] - rd[2] * L};
-                    pushArrow3(loadSegs, rt, rd, L);
+                    pushArrow3(loadSegs, rt, rd, L, loadTris);
                 }
             } else {
                 float dir[3] = {ld.vec[0], ld.vec[1], ld.vec[2]};
                 float mag = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
                 if (mag < 1e-6f) continue;
-                pushArrow3(loadSegs, c, dir, L);  // force arrow emanates from the face along the vector
+                // force arrow emanates from the face along the vector
+                pushArrow3(loadSegs, c, dir, L, loadTris);
                 if (reversed) {
                     float rd[3] = {-dir[0], -dir[1], -dir[2]};
-                    pushArrow3(loadSegs, c, rd, L);
+                    pushArrow3(loadSegs, c, rd, L, loadTris);
                 }
             }
         }
@@ -1161,7 +1319,8 @@ bool SimManager::flowSetupActive(AppState& st) const {
 }
 
 void SimManager::collectFlowSetup(AppState& st, std::vector<float>& arrowSegs,
-                                  std::vector<float>& domainSegs, std::vector<float>& inletSegs) const {
+                                  std::vector<float>& domainSegs, std::vector<float>& inletSegs,
+                                  std::vector<float>* arrowTris) const {
     if (sel_ < 0 || sel_ >= (int)studies_.size()) return;
     const Study& s = studies_[sel_];
     // Model bbox / centre / scale from the face-centroid cache (same source as the FEA indicators).
@@ -1206,14 +1365,18 @@ void SimManager::collectFlowSetup(AppState& st, std::vector<float>& arrowSegs,
     pushSeg3(inletSegs, a3, a4); pushSeg3(inletSegs, a4, a1);
     pushSeg3(inletSegs, a1, a3); pushSeg3(inletSegs, a2, a4);
 
-    // Flow arrows: a 3x3 grid across the inlet, each pointing downstream along f, length ~1.2r.
-    const float aLen = 1.2f * r;
+    // Flow arrows: a 3x3 grid announcing the incoming stream, kept fully UPSTREAM of the inlet
+    // face (tips just short of it) and much shorter than the old 1.2r spears that pierced the
+    // model. Heads are capped so the glyphs never shout over the part being analysed.
+    const float aLen = 0.5f * r;
+    const float headLen = std::min(0.28f * aLen, 0.08f * r);
     for (int iu = -1; iu <= 1; ++iu)
         for (int iv = -1; iv <= 1; ++iv) {
             float tail[3];
             for (int k = 0; k < 3; ++k)
-                tail[k] = inC[k] + rgt[k]*(0.7f*halfCross*iu) + upv[k]*(0.7f*halfCross*iv);
-            pushArrow3(arrowSegs, tail, f, aLen);
+                tail[k] = inC[k] - f[k] * 0.6f * r +
+                          rgt[k] * (0.7f * halfCross * iu) + upv[k] * (0.7f * halfCross * iv);
+            pushArrow3(arrowSegs, tail, f, aLen, arrowTris, headLen);
         }
 }
 
@@ -1801,6 +1964,15 @@ void SimManager::drawTreeBody(AppState& st) {
 
     const float S = ui::uiScale;
 
+    // v2: the Simulation tree body is embedded in the FeatureManager column, whose glass surface
+    // layout.cpp already painted; push its ADAPTIVE text as the pane-level ink for the whole body
+    // (mirrors feature_tree.cpp) so pane text + row pills + banner/checklist cards all track the
+    // live viewport. Popups (BeginPopup / modal) are floating — they re-pair via pushCardText().
+    // Only pushed over a live backdrop; on chrome the theme Text role already reads on glassBg.
+    const bool paneInk = ui::viewportBackdrop().valid();
+    if (paneInk) ImGui::PushStyleColor(ImGuiCol_Text, simSurf().textPrimary);
+    struct PaneInkPop { bool on; ~PaneInkPop() { if (on) ImGui::PopStyleColor(); } } paneInkPop{paneInk};
+
     // ---- Single "+ New Study" entry point: opens a picker popup for the 5 study types.
     // Ribbon sim_new_* commands remain as keyboard accelerators (ribbon_def.cpp, untouched).
     if (ImGui::Button("+ New Study", ImVec2(-FLT_MIN, 0)))
@@ -1816,10 +1988,10 @@ void SimManager::drawTreeBody(AppState& st) {
             { StudyType::Flow,    "Flow",      "External aerodynamics: drag, lift and streamlines." },
             { StudyType::Thermal, "Thermal",   "Heat transfer via OpenFOAM convection / CHT." },
         };
+        pushCardText();  // popup fills with theme glassBg — re-pair the pane's adaptive text
         ImGui::TextDisabled("Select study type");
         ImGui::Separator();
         const float S2 = ui::uiScale;
-        const auto& pal2 = ui::palette;
         for (const auto& e : kEntries) {
             ImGui::PushID((int)e.type);
             IconUV iv = getIcon(studyTypeIcon(e.type), 20);
@@ -1831,13 +2003,13 @@ void SimManager::drawTreeBody(AppState& st) {
             bool hit = ImGui::Selectable(e.name, false, 0, ImVec2(80.0f * S2, 0));
             ImGui::PopFont();
             ImGui::SameLine(0, 8.0f * S2);
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(pal2.textDim[0], pal2.textDim[1], pal2.textDim[2], 1));
+            pushDimText();
             ImGui::TextUnformatted(e.desc);
-            ImGui::PopStyleColor();
+            popDimText();
             if (hit) { newStudy(st, e.type); ImGui::CloseCurrentPopup(); }
             ImGui::PopID();
         }
+        popCardText();
         ImGui::EndPopup();
     }
     ImGui::Spacing();
@@ -1848,11 +2020,10 @@ void SimManager::drawTreeBody(AppState& st) {
     }
     if (studies_.empty()) {
         ImGui::Separator();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                                                    ui::palette.textDim[2], 1));
+        pushDimText();  // pane surface — dim the ADAPTIVE ink, not the theme textDim role
         ImGui::TextWrapped("No studies yet. Create a study above to add fixtures, loads, and run an "
                            "analysis. Studies are saved inside this part file.");
-        ImGui::PopStyleColor();
+        popDimText();
         return;
     }
 
@@ -1879,6 +2050,9 @@ void SimManager::drawStudyRow(AppState& st, int i) {
                                ImGuiTreeNodeFlags_DefaultOpen;
     if (selStudy && node_ == SimNode::Study) flags |= ImGuiTreeNodeFlags_Selected;
 
+    // v2: frosted row pill behind the study node (mirrors feature_tree's fmRowPill), painted at the
+    // cursor BEFORE the icon so it sits behind the whole icon + label row; accent card when selected.
+    simRowPill(selStudy && node_ == SimNode::Study);
     // Study-type icon ahead of the node (study_* atlas; degrades to no icon when absent), matching
     // the feature-tree's icon + SameLine + TreeNodeEx row convention.
     IconUV tIcon = getIcon(studyTypeIcon(s.type), 20);
@@ -1903,12 +2077,13 @@ void SimManager::drawStudyRow(AppState& st, int i) {
         // One leaf row: a 16px atlas icon (feature-manager vocabulary) + a clickable label + badge.
         auto child = [&](const char* icon, const std::string& label, SimNode n, bool ok,
                          const char* tip, int loadI = -1) {
+            const bool selected = selStudy && node_ == n && (n != SimNode::Load || loadIdx_ == loadI);
+            simRowPill(selected);  // v2 frosted leaf-row pill behind icon + label
             IconUV iv = getIcon(icon, 20);
             if (iv.valid) {
                 ImGui::Image(iv.texId, ImVec2(15.0f * S, 15.0f * S), iv.uv0, iv.uv1);
                 ImGui::SameLine(0, 5.0f * S);
             }
-            const bool selected = selStudy && node_ == n && (n != SimNode::Load || loadIdx_ == loadI);
             if (ImGui::Selectable(label.c_str(), selected)) {
                 sel_ = i; node_ = n; loadIdx_ = loadI;
                 int newArm = (n == SimNode::Fixtures) ? 0 : (n == SimNode::Load ? loadI + 1 : -1);
@@ -1965,27 +2140,46 @@ void SimManager::drawStudyRow(AppState& st, int i) {
 
 void SimManager::drawCustomMaterialPopup(AppState& st, Study& s) {
     if (ImGui::BeginPopupModal("New material", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const float S = ui::uiScale;
+        pushCardText();  // modal fills with theme glassBg — re-pair the inherited adaptive text
         ImGui::TextUnformatted("Define a custom material");
         ImGui::TextDisabled("Saved to your library; available in every study.");
         ImGui::Separator();
-        ImGui::InputText("Name", cmName_, sizeof(cmName_));
-        ImGui::InputFloat("Young's modulus E (MPa)", &cmE_, 0, 0, "%.1f");
+        // Label-above + fixed-width fields (the file's form convention); bounded physical
+        // quantities are drags/sliders so out-of-range values are unreachable, not just flagged.
+        auto label = [](const char* l) { ImGui::TextUnformatted(l); };
+        label("Name");
+        ImGui::SetNextItemWidth(240.0f * S);
+        ImGui::InputText("##cmname", cmName_, sizeof(cmName_));
+        label("Young's modulus E (MPa)");
+        ImGui::SetNextItemWidth(240.0f * S);
+        ImGui::DragFloat("##cme", &cmE_, 100.0f, 1.0f, 1.0e6f, "%.0f MPa");
         simTip("Elastic stiffness. Steel ~200000 MPa, aluminum ~69000 MPa, most plastics 1500-3500 MPa.");
-        ImGui::InputFloat("Poisson ratio", &cmNu_, 0, 0, "%.3f");
+        label("Poisson ratio");
+        ImGui::SetNextItemWidth(240.0f * S);
+        ImGui::SliderFloat("##cmnu", &cmNu_, 0.0f, 0.499f, "%.3f");
         simTip("Lateral contraction ratio, 0-0.5. Metals ~0.3, rubber approaches 0.5.");
-        ImGui::InputFloat("Density (g/cm^3)", &cmDensity_, 0, 0, "%.3f");
+        label("Density (g/cm^3)");
+        ImGui::SetNextItemWidth(240.0f * S);
+        ImGui::DragFloat("##cmrho", &cmDensity_, 0.01f, 0.0f, 25.0f, "%.3f g/cm3");
         simTip("Mass density — used by frequency (modal) studies.");
-        ImGui::InputFloat("Yield strength (MPa)", &cmYield_, 0, 0, "%.1f");
+        label("Yield strength (MPa)");
+        ImGui::SetNextItemWidth(240.0f * S);
+        ImGui::DragFloat("##cmyield", &cmYield_, 1.0f, 0.0f, 1.0e5f, "%.0f MPa");
         simTip("Stress at which the material yields — drives the factor-of-safety result.");
-        ImGui::InputFloat("Ultimate strength Sut (MPa)", &cmUlt_, 0, 0, "%.1f");
+        label("Ultimate strength Sut (MPa)");
+        ImGui::SetNextItemWidth(240.0f * S);
+        ImGui::DragFloat("##cmult", &cmUlt_, 1.0f, 0.0f, 1.0e5f, "%.0f MPa");
         simTip("Ultimate tensile strength — used by fatigue (Goodman / Gerber).");
-        ImGui::InputFloat("Endurance limit Se (MPa)", &cmEnd_, 0, 0, "%.1f");
+        label("Endurance limit Se (MPa)");
+        ImGui::SetNextItemWidth(240.0f * S);
+        ImGui::DragFloat("##cmend", &cmEnd_, 1.0f, 0.0f, 1.0e5f, "%.0f MPa");
         simTip("Fully-corrected fatigue / endurance limit. ~0.5x Sut for steels; lower for "
                "aluminum/non-ferrous. Leave as a fraction of Sut if unsure.");
         ImGui::Separator();
         const bool ok = cmName_[0] != '\0' && cmE_ > 0.0f && cmNu_ > 0.0f && cmNu_ < 0.5f;
         if (!ok) ImGui::BeginDisabled();
-        if (ImGui::Button("Add", ImVec2(120, 0))) {
+        if (ImGui::Button("Add", ImVec2(120.0f * S, 0))) {
             Material m;
             m.name = cmName_; m.E_mpa = cmE_; m.nu = cmNu_;
             m.density_g_cm3 = cmDensity_; m.yield_mpa = cmYield_;
@@ -1996,7 +2190,8 @@ void SimManager::drawCustomMaterialPopup(AppState& st, Study& s) {
         }
         if (!ok) ImGui::EndDisabled();
         ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+        if (ImGui::Button("Cancel", ImVec2(120.0f * S, 0))) ImGui::CloseCurrentPopup();
+        popCardText();
         ImGui::EndPopup();
     }
 }
@@ -2040,11 +2235,10 @@ void SimManager::drawMaterialCombo(AppState& st, Study& s) {
     // Transparency: show the resolved properties of the selected material inline.
     if (mi >= 0) {
         const auto& m = mats[mi];
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                                                    ui::palette.textDim[2], 1));
+        pushDimText();
         ImGui::TextWrapped("E %.0f MPa  -  nu %.2f  -  yield %.0f MPa  -  rho %.2f g/cm3",
                            m.E_mpa, m.nu, m.yield_mpa, m.density_g_cm3);
-        ImGui::PopStyleColor();
+        popDimText();
     }
 }
 
@@ -2174,18 +2368,15 @@ void SimManager::drawMeshForm(AppState& st, Study& s) {
     // static template — drop them once so future JSON readers don't see inert load entries.
     if (modal && !s.loads.empty()) { s.loads.clear(); persist(st, s); }
     ImGui::TextUnformatted("Mesh type");
+    // Binary choice — radio rows read instantly and skip the combo popup in the narrow pane.
     static const char* kType[2] = {"Tetrahedral (any shape)",
                                    "Hexahedral (box / prismatic only)"};
     if (modal) ImGui::BeginDisabled();  // modal has no hex8 mass matrix
     int ti = (s.meshHex && !modal) ? 1 : 0;
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::BeginCombo("##meshtype", kType[ti])) {
-        for (int i = 0; i < 2; ++i)
-            if (ImGui::Selectable(kType[i], ti == i)) {
-                s.meshHex = (i == 1); persist(st, s); clearMeshPreview();
-            }
-        ImGui::EndCombo();
-    }
+    for (int i = 0; i < 2; ++i)
+        if (ImGui::RadioButton(kType[i], ti == i) && ti != i) {
+            s.meshHex = (i == 1); persist(st, s); clearMeshPreview();
+        }
     if (modal) ImGui::EndDisabled();
     simTip("Tetrahedral fills any geometry but its element pattern is irregular (normal for "
            "unstructured meshing). Hexahedral lays down a perfectly regular, symmetric grid — "
@@ -2235,14 +2426,10 @@ void SimManager::drawMeshForm(AppState& st, Study& s) {
     // Modal always runs 1st-order linear tets (runStaticOrModal forces order=1); show + lock Draft.
     int oi = (!modal && s.meshOrder == 2) ? 1 : 0;
     if (modal) ImGui::BeginDisabled();
-    ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::BeginCombo("##meshorder", kOrder[oi])) {
-        for (int i = 0; i < 2; ++i)
-            if (ImGui::Selectable(kOrder[i], oi == i)) {
-                s.meshOrder = i ? 2 : 1; persist(st, s); clearMeshPreview();
-            }
-        ImGui::EndCombo();
-    }
+    for (int i = 0; i < 2; ++i)
+        if (ImGui::RadioButton(kOrder[i], oi == i) && oi != i) {
+            s.meshOrder = i ? 2 : 1; persist(st, s); clearMeshPreview();
+        }
     if (modal) ImGui::EndDisabled();
     simTip("2nd-order (quadratic) elements capture bending and curved geometry far more "
            "accurately. Linear elements are overly stiff (shear-locking) and make a bent "
@@ -2338,9 +2525,9 @@ void SimManager::drawMeshForm(AppState& st, Study& s) {
         ImGui::Text("Min Jacobian: %.3f", s.meshJacobianMin);
         simTip("Worst scaled Jacobian (1.0 = ideal, <= 0 = inverted/invalid element).");
         // Color the poor-element percentage like SW: green clean, amber some, red many.
-        ImVec4 poorCol = s.meshPctPoor < 1.0f   ? ImVec4(0.45f, 0.80f, 0.45f, 1.0f)
-                         : s.meshPctPoor < 5.0f ? ImVec4(0.90f, 0.75f, 0.30f, 1.0f)
-                                                : ImVec4(0.90f, 0.40f, 0.40f, 1.0f);
+        ImVec4 poorCol = s.meshPctPoor < 1.0f   ? simRole(ui::palette.statusOk)
+                         : s.meshPctPoor < 5.0f ? simRole(ui::palette.statusWarn)
+                                                : simRole(ui::palette.statusErr);
         ImGui::TextColored(poorCol, "Poor elements: %.1f%%", s.meshPctPoor);
         if (s.meshAspectHist.size() == 10) {
             ImGui::PlotHistogram("##aspecthist", s.meshAspectHist.data(), 10, 0, "aspect 1 -> 10",
@@ -2381,12 +2568,13 @@ void SimManager::drawFatigueForm(AppState& st, Study& s) {
         ImGui::TextUnformatted("Min / max load factor (x applied)");
         float mm[2] = {s.fatigueLmin, s.fatigueLmax};
         ImGui::SetNextItemWidth(-FLT_MIN);
-        if (ImGui::InputFloat2("##fmm", mm, "%.2f")) {}
+        if (ImGui::DragFloat2("##fmm", mm, 0.01f, 0.0f, 0.0f, "%.2f x")) {}
         if (ImGui::IsItemDeactivatedAfterEdit()) {
             s.fatigueLmin = std::min(mm[0], mm[1]); s.fatigueLmax = std::max(mm[0], mm[1]);
             persist(st, s);
         }
-        simTip("The cycle runs between (min factor) and (max factor) times the applied load.");
+        simTip("The cycle runs between (min factor) and (max factor) times the applied load. "
+               "Values are sorted min/max on commit.");
     }
     // Readout + a tiny cycle sketch so the amplitude/mean are obvious.
     float lmin, lmax; fatigueLoadFactors(s, lmin, lmax);
@@ -2402,9 +2590,16 @@ void SimManager::drawFatigueForm(AppState& st, Study& s) {
         const float midY = p0.y + h * 0.5f, x0 = p0.x + 24 * S, x1 = p0.x + w - 6 * S;
         const float span = std::max(1.0f, std::max(std::fabs(lmax), std::fabs(lmin)));
         auto Y = [&](float v) { return midY - (v / span) * (h * 0.42f); };
-        dl->AddLine(ImVec2(x0, Y(0)), ImVec2(x1, Y(0)), IM_COL32(120, 120, 130, 160), 1.0f);  // zero
-        dl->AddLine(ImVec2(x0, Y(mean)), ImVec2(x1, Y(mean)), IM_COL32(230, 180, 70, 180), 1.0f);  // mean
-        ImU32 col = IM_COL32(90, 170, 250, 255);
+        // Chart ink derives from the scope's paired text color (card ink here) so the sketch stays
+        // readable on the light theme's near-white card too — no dark-theme-only literals.
+        const ImVec4 inkV = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+        auto ink = [&](float a) {
+            return ImGui::ColorConvertFloat4ToU32(ImVec4(inkV.x, inkV.y, inkV.z, inkV.w * a));
+        };
+        float warnA[4]; Palette::withAlpha(ui::palette.statusWarn, warnA, 0.75f);
+        dl->AddLine(ImVec2(x0, Y(0)), ImVec2(x1, Y(0)), ink(0.45f), 1.0f);                  // zero
+        dl->AddLine(ImVec2(x0, Y(mean)), ImVec2(x1, Y(mean)), Palette::toU32(warnA), 1.0f); // mean
+        ImU32 col = IM_COL32(90, 170, 250, 255);  // waveform trace hue (same family as the graphs)
         ImVec2 prev(x0, Y(mean));
         for (int i = 1; i <= 60; ++i) {
             float t = (float)i / 60.0f;
@@ -2412,8 +2607,8 @@ void SimManager::drawFatigueForm(AppState& st, Study& s) {
             ImVec2 cur(x0 + t * (x1 - x0), Y(v));
             dl->AddLine(prev, cur, col, 2.0f); prev = cur;
         }
-        dl->AddText(ImVec2(p0.x, Y(lmax) - 6 * S), IM_COL32(200, 200, 210, 255), "max");
-        dl->AddText(ImVec2(p0.x, Y(lmin) - 6 * S), IM_COL32(200, 200, 210, 255), "min");
+        dl->AddText(ImVec2(p0.x, Y(lmax) - 6 * S), ink(1.0f), "max");
+        dl->AddText(ImVec2(p0.x, Y(lmin) - 6 * S), ink(1.0f), "min");
     }
 
     // ---- Strength: Sut + Se' (overrides; default from the material) ----
@@ -2422,7 +2617,7 @@ void SimManager::drawFatigueForm(AppState& st, Study& s) {
         ImGui::TextDisabled("Material: Sut %.0f %s | Se' %.0f %s",
                             matSut * u.stressFromMpa, u.stress, matSe * u.stressFromMpa, u.stress);
     else {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.70f, 0.20f, 1));
+        ImGui::PushStyleColor(ImGuiCol_Text, simRole(ui::palette.statusWarn));
         ImGui::TextWrapped("This material has no ultimate strength — set Sut (and Se') below, or pick a "
                            "material that carries fatigue data.");
         ImGui::PopStyleColor();
@@ -2460,14 +2655,16 @@ void SimManager::drawFatigueForm(AppState& st, Study& s) {
     combo("Surface finish", "##fsurf", kSurf, 4, s.fatigueSurface, "Surface factor ka.");
     combo("Loading type", "##fcase", kCase, 3, s.fatigueLoadCase,
           "Load factor kc + size factor kb (axial has no size effect).");
+    // Bounded drags: the kb size correlation is valid ~2..250 mm, kd roughly -50..500 C — soft
+    // ranges make the correlation limits discoverable instead of silently extrapolating.
     ImGui::TextUnformatted("Section size");
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::InputFloat("##fsize", &s.fatigueSizeMm, 0, 0, "%.1f mm")) {}
+    if (ImGui::DragFloat("##fsize", &s.fatigueSizeMm, 0.5f, 1.0f, 250.0f, "%.1f mm")) {}
     if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
     simTip("Effective diameter for the size factor kb (use the section thickness/diameter).");
     ImGui::TextUnformatted("Temperature");
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::InputFloat("##ftemp", &s.fatigueTempC, 0, 0, "%.0f C")) {}
+    if (ImGui::DragFloat("##ftemp", &s.fatigueTempC, 1.0f, -50.0f, 500.0f, "%.0f C")) {}
     if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
     simTip("Operating temperature for the temperature factor kd.");
     ImGui::TextUnformatted("Design reliability (%)");
@@ -2485,10 +2682,9 @@ void SimManager::drawFatigueForm(AppState& st, Study& s) {
                      kc = marin_kc(s.fatigueLoadCase), kd = marin_kd(s.fatigueTempC);
         const double SeC = ka * kb * kc * kd * Seb;
         ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                                                    ui::palette.textDim[2], 1));
+        pushDimText();
         ImGui::TextWrapped("ka %.2f  kb %.2f  kc %.2f  kd %.2f", ka, kb, kc, kd);
-        ImGui::PopStyleColor();
+        popDimText();
         ImGui::Text("Corrected Se = %.0f %s", SeC * u.stressFromMpa, u.stress);
         simTip("Se = ka.kb.kc.kd . Se'. This is the endurance limit used for life + factor of safety "
                "(reliability is applied on top, in Results).");
@@ -2551,7 +2747,7 @@ void SimManager::drawFatigueGraphs(AppState& st, Study& s) {
             ImGui::TableNextColumn(); std::snprintf(c, sizeof(c), "%.3g", se * u.stressFromMpa);
             ImGui::TextUnformatted(c);
             ImGui::TableNextColumn();
-            if (fos < 1.0) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.30f, 0.25f, 1));
+            if (fos < 1.0) ImGui::PushStyleColor(ImGuiCol_Text, simRole(ui::palette.statusErr));
             std::snprintf(c, sizeof(c), "%.2f", fos); ImGui::TextUnformatted(c);
             if (fos < 1.0) ImGui::PopStyleColor();
             ImGui::TableNextColumn();
@@ -2569,9 +2765,17 @@ void SimManager::drawFatigueGraphs(AppState& st, Study& s) {
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImU32 axisCol = IM_COL32(150, 150, 160, 255), txtCol = IM_COL32(200, 200, 210, 255);
-    const ImU32 gridCol = IM_COL32(80, 80, 92, 130), ptCol = IM_COL32(240, 80, 70, 255);
-    const ImU32 yieldCol = IM_COL32(230, 180, 70, 200), bandCol = IM_COL32(90, 170, 250, 55);
+    // Axis / label / grid ink from the scope's paired text color (pane adaptive ink here) and the
+    // semantic accents from palette roles — the old dark-theme IM_COL32 light-greys were unreadable
+    // on the light theme. The 5 theory trace hues stay as named constants (a fixed series ramp).
+    const ImVec4 inkV = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    auto ink = [&](float a) {
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(inkV.x, inkV.y, inkV.z, inkV.w * a));
+    };
+    const ImU32 axisCol = ink(0.62f), txtCol = ink(1.0f), gridCol = ink(0.26f);
+    float warnA[4]; Palette::withAlpha(ui::palette.statusWarn, warnA, 0.8f);
+    const ImU32 ptCol = Palette::toU32(ui::palette.statusErr);
+    const ImU32 yieldCol = Palette::toU32(warnA), bandCol = IM_COL32(90, 170, 250, 55);
     const ImU32 tcol[5] = {IM_COL32(90, 170, 250, 255), IM_COL32(120, 210, 120, 255),
                            IM_COL32(240, 140, 60, 255), IM_COL32(200, 120, 230, 255),
                            IM_COL32(230, 90, 90, 255)};
@@ -2601,11 +2805,10 @@ void SimManager::drawFatigueGraphs(AppState& st, Study& s) {
             double se = saEq(t);
             double lHi = sn_life(se, SeOpt, Sut), lMed = sn_life(se, SeD, Sut), lLo = sn_life(se, SeLo, Sut);
             float y = p0.y + t * rowH + rowH * 0.5f;
-            dl->AddText(ImVec2(p0.x, y - 6 * S), (t == m) ? txtCol : IM_COL32(150, 150, 160, 255),
-                        kTheoryNames[t]);
+            dl->AddText(ImVec2(p0.x, y - 6 * S), (t == m) ? txtCol : axisCol, kTheoryNames[t]);
             float xLo = X(lg(lLo)), xHi = X(lg(lHi)), xMed = X(lg(lMed));
             dl->AddLine(ImVec2(xLo, y), ImVec2(xHi, y), (t == m) ? tcol[t] : tdim[t], 3.0f * S);
-            dl->AddCircleFilled(ImVec2(xMed, y), 3.5f * S, IM_COL32(255, 255, 255, 230));
+            dl->AddCircleFilled(ImVec2(xMed, y), 3.5f * S, ink(0.95f));  // median (design) dot
             if (lHi >= 1e6) dl->AddText(ImVec2(xHi + 3 * S, y - 6 * S), txtCol, "inf");
         }
         dl->PopClipRect();
@@ -2652,7 +2855,7 @@ void SimManager::drawFatigueGraphs(AppState& st, Study& s) {
         }
         if (Sy > 0) dl->AddLine(ImVec2(X(0), Y(Sy)), ImVec2(X(Sy), Y(0)), yieldCol, 1.0f);  // Langer
         const ImVec2 op(clampX(X(smean)), clampY(Y(sa)));
-        dl->AddLine(ImVec2(X(0), Y(0)), op, IM_COL32(120, 120, 130, 160), 1.0f);
+        dl->AddLine(ImVec2(X(0), Y(0)), op, ink(0.5f), 1.0f);
         dl->AddCircleFilled(op, 4.0f * S, ptCol);
         char lab[48];
         dl->AddText(ImVec2(p0.x + 2 * S, p0.y + 2 * S), txtCol, "Sa");
@@ -2697,7 +2900,8 @@ void SimManager::drawFatigueGraphs(AppState& st, Study& s) {
                           ImVec2(X(3), Y(s1k)), bandCol);
         dl->AddLine(ImVec2(X(3), Y(s1k)), ImVec2(X(6), Y(SeD)), tcol[m], 2.0f);  // design line
         dl->AddLine(ImVec2(X(6), Y(SeD)), ImVec2(X(7), Y(SeD)), tcol[m], 2.0f);
-        dl->AddLine(ImVec2(a0.x, Y(SeD)), ImVec2(a1.x, Y(SeD)), IM_COL32(120, 200, 120, 110), 1.0f);
+        float okA[4]; Palette::withAlpha(ui::palette.statusOk, okA, 0.45f);
+        dl->AddLine(ImVec2(a0.x, Y(SeD)), ImVec2(a1.x, Y(SeD)), Palette::toU32(okA), 1.0f);
         const ImVec2 op(clampX(X(logM)), clampY(Y(std::min(seM, yMax))));
         dl->AddCircleFilled(op, 4.0f * S, ptCol);
         char lab[48];
@@ -2881,7 +3085,7 @@ void SimManager::drawFlowForm(AppState& st, Study& s) {
         s.flowSolver = 1; s.flowThermal = true;
         if (!ofAvail) {
             ImGui::Spacing();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.55f, 0.25f, 1));
+            ImGui::PushStyleColor(ImGuiCol_Text, simRole(ui::palette.statusWarn));
             ImGui::TextWrapped("Thermal studies need OpenFOAM, which isn't detected. Provision it with "
                                "`python -m tools.provision_openfoam --install`.");
             ImGui::PopStyleColor();
@@ -2967,8 +3171,7 @@ void SimManager::drawFlowForm(AppState& st, Study& s) {
     ImGui::Spacing();
     float dir[3]; flowIncomingDir(s, dir);
     float density, visc; flowFluidProps(s, density, visc);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                                                ui::palette.textDim[2], 1));
+    pushDimText();
     ImGui::Text("Incoming flow: (%.2f, %.2f, %.2f)", dir[0], dir[1], dir[2]);
     // Reynolds estimate off the model's bounding diagonal (a stand-in for the characteristic length).
     float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f}; bool any = false;
@@ -2981,7 +3184,7 @@ void SimManager::drawFlowForm(AppState& st, Study& s) {
         double Re = (double)s.flowSpeed * Lc / visc;
         ImGui::Text("Re ~ %.0f  |  rho %.3g kg/m3", Re, density);
     }
-    ImGui::PopStyleColor();
+    popDimText();
     (void)S;
 }
 
@@ -3054,7 +3257,7 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
         ImGui::TableNextRow();
         ImGui::TableNextColumn(); ImGui::TextUnformatted(k);
         ImGui::TableNextColumn();
-        if (warn) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.30f, 0.25f, 1));
+        if (warn) ImGui::PushStyleColor(ImGuiCol_Text, simRole(ui::palette.statusErr));
         ImGui::TextUnformatted(v.c_str());
         if (warn) ImGui::PopStyleColor();
     };
@@ -3120,14 +3323,14 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
     // Yield warning for static/modal (fatigue shows per-theory FoS in its own table).
     if (s.type == StudyType::Static || s.type == StudyType::Modal) {
         if (s.resultSummary.value("min_fos", 99.0) < 1.0) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.30f, 0.25f, 1));
+            ImGui::PushStyleColor(ImGuiCol_Text, simRole(ui::palette.statusErr));
             ImGui::TextWrapped("Factor of safety below 1 — the material yields under this load.");
             ImGui::PopStyleColor();
         }
     }
     if (s.type == StudyType::Fatigue) drawFatigueGraphs(st, s);
     if (!s.banner.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.70f, 0.20f, 1));
+        ImGui::PushStyleColor(ImGuiCol_Text, simRole(ui::palette.statusWarn));
         ImGui::TextWrapped("Qualitative result: %s", s.banner.c_str());
         ImGui::PopStyleColor();
     }
@@ -3265,9 +3468,7 @@ void SimManager::drawStudyChecklist(AppState& st, Study& s) {
             "used in the stress solve and factor-of-safety result.\n"
             "Required for all structural and fatigue studies.");
     if (matOpen) {
-        ui::pushGlassChildStyle(6.0f);
-        if (ImGui::BeginChild("##ckmat", ImVec2(0.0f, 0.0f),
-                              ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding)) {
+        if (beginCheckCard("##ckmat")) {  // v2 frosted card (pane ink; no theme re-pair)
             drawMaterialCombo(st, s);
             // Static: failure criterion lives logically with the material choice
             if (s.type == StudyType::Static) {
@@ -3298,8 +3499,7 @@ void SimManager::drawStudyChecklist(AppState& st, Study& s) {
                 simTip("How many natural frequencies / mode shapes to solve for.");
             }
         }
-        ImGui::EndChild();
-        ui::popGlassChildStyle();
+        endCheckCard();
     }
     ImGui::Spacing();
 
@@ -3318,13 +3518,10 @@ void SimManager::drawStudyChecklist(AppState& st, Study& s) {
                 "Required for static and fatigue studies \xe2\x80\x94 at least one fixed face.");
     }
     if (fixOpen) {
-        ui::pushGlassChildStyle(6.0f);
-        if (ImGui::BeginChild("##ckfix", ImVec2(0.0f, 0.0f),
-                              ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding)) {
+        if (beginCheckCard("##ckfix")) {
             drawFixturesForm(st, s);
         }
-        ImGui::EndChild();
-        ui::popGlassChildStyle();
+        endCheckCard();
     }
     ImGui::Spacing();
 
@@ -3339,13 +3536,10 @@ void SimManager::drawStudyChecklist(AppState& st, Study& s) {
                 "A study without loads produces zero stress \xe2\x80\x94 add at least one load\n"
                 "to get a meaningful structural result.");
         if (loadOpen) {
-            ui::pushGlassChildStyle(6.0f);
-            if (ImGui::BeginChild("##ckloads", ImVec2(0.0f, 0.0f),
-                                  ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding)) {
+            if (beginCheckCard("##ckloads")) {
                 drawLoadsForm(st, s);
             }
-            ImGui::EndChild();
-            ui::popGlassChildStyle();
+            endCheckCard();
         }
         ImGui::Spacing();
     }
@@ -3360,13 +3554,10 @@ void SimManager::drawStudyChecklist(AppState& st, Study& s) {
             "Finer elements capture stress concentrations (holes, fillets) better\n"
             "but increase solve time. The defaults are a good starting point.");
     if (meshOpen) {
-        ui::pushGlassChildStyle(6.0f);
-        if (ImGui::BeginChild("##ckmesh", ImVec2(0.0f, 0.0f),
-                              ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding)) {
+        if (beginCheckCard("##ckmesh")) {
             drawMeshForm(st, s);
         }
-        ImGui::EndChild();
-        ui::popGlassChildStyle();
+        endCheckCard();
     }
 
     // ---- Step 5: Fatigue parameters (fatigue studies only) ----
@@ -3379,13 +3570,10 @@ void SimManager::drawStudyChecklist(AppState& st, Study& s) {
                 "Cyclic loading definition, Marin endurance corrections,\n"
                 "and strength overrides (Sut / Se') for the fatigue solve.");
         if (fatigueOpen) {
-            ui::pushGlassChildStyle(6.0f);
-            if (ImGui::BeginChild("##ckfatigue", ImVec2(0.0f, 0.0f),
-                                  ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding)) {
+            if (beginCheckCard("##ckfatigue")) {
                 drawFatigueForm(st, s);
             }
-            ImGui::EndChild();
-            ui::popGlassChildStyle();
+            endCheckCard();
         }
     }
 }

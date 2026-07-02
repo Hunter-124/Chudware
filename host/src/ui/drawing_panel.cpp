@@ -968,6 +968,37 @@ static void renderTitleBlock(ImDrawList* dl, const nlohmann::json& sheet,
 
 // The dimension/annotation editor popup: double-click a dim to open it. Edits tolerance, prefix/
 // suffix, precision, "Critical", and a verbatim text override -> drawing_set_annotation.
+// Glass-v2 popup frosting. Call once immediately after a BeginPopup()/BeginPopupModal() succeeds:
+// it splits the window draw list (content lands on channel 1) and returns a handle to finish().
+// finish() paints the frosted adaptivePanel/glassPanel behind the content on channel 0 and merges,
+// so drawing-mode dialogs float as part of the app-wide glass family (matching section_tool + the
+// evaluate/equations dialogs) instead of the flat legacy PopupBg fill.
+struct GlassPopupScope {
+    ImDrawList* dl = nullptr;
+    const char* id = nullptr;
+    void finish() {
+        const float s = ui::uiScale;
+        ImVec2 p0 = ImGui::GetWindowPos();
+        ImVec2 p1(p0.x + ImGui::GetWindowSize().x, p0.y + ImGui::GetWindowSize().y);
+        dl->ChannelsSetCurrent(0);
+        const ui::AdaptiveSurface& surf =
+            ui::adaptivePanel(ui::panelId(id), ImRect(p0, p1), ui::GlassGroup::Hud);
+        ui::glassPanel(dl, ImRect(p0, p1), ui::GlassLevel::Regular,
+                       ImGui::GetStyle().PopupRounding / s, surf);
+        dl->ChannelsMerge();
+    }
+};
+// Call AFTER BeginPopup() returns true. (Pair with ImGui::SetNextWindowBgAlpha(0.0f) BEFORE the
+// BeginPopup so the flat legacy PopupBg fill is suppressed and the glass replaces it.)
+static GlassPopupScope beginGlassPopup(const char* panelId) {
+    GlassPopupScope sc;
+    sc.dl = ImGui::GetWindowDrawList();
+    sc.id = panelId;
+    sc.dl->ChannelsSplit(2);
+    sc.dl->ChannelsSetCurrent(1);
+    return sc;
+}
+
 static void renderDimEditorPopup(AppState& st, AppState::DocTab& tab, const nlohmann::json& sheet) {
     static int  etTol = 0;              // 0 none,1 symmetric,2 deviation,3 limit,4 basic
     static double etUp = 0.0, etLo = 0.0;
@@ -1000,7 +1031,9 @@ static void renderDimEditorPopup(AppState& st, AppState::DocTab& tab, const nloh
     }
 
     ImGui::SetNextWindowSize(ImVec2(320 * ui::uiScale, 0), ImGuiCond_Appearing);
+    ImGui::SetNextWindowBgAlpha(0.0f);
     if (ImGui::BeginPopup("Edit Dimension##dimedit")) {
+        GlassPopupScope glass = beginGlassPopup("drw_dimedit_popup");
         std::string kind = ann ? djstr(*ann, "kind") : std::string();
         std::string type = ann ? djstr(*ann, "type") : std::string();
         bool numeric = kind == "linear_dim" || kind == "aligned_dim" || kind == "radial_dim" ||
@@ -1012,22 +1045,34 @@ static void renderDimEditorPopup(AppState& st, AppState::DocTab& tab, const nloh
                                 val);
         }
         ImGui::Separator();
+        // Shared field-column width so Tolerance/Upper/Lower/Precision/Prefix/Suffix align in one
+        // column (labels form a clean right-edge column beside them).
+        const float etFieldW = 150.0f * ui::uiScale;
         if (numeric) {
             const char* tols[] = {"None", "Symmetric  \xC2\xB1", "Deviation  +/-", "Limit",
                                   "Basic  [ ]"};
-            ImGui::SetNextItemWidth(-1);
-            ImGui::Combo("##tol", &etTol, tols, IM_ARRAYSIZE(tols));
+            ImGui::SetNextItemWidth(etFieldW);
+            ImGui::Combo("Tol type", &etTol, tols, IM_ARRAYSIZE(tols));
+            // Typical tolerances are +/-0.001..0.5 — the 0.01/0.1 steppers make keyboard-free
+            // tweaks practical.
             if (etTol == 1) {
-                ImGui::InputDouble("Tolerance \xC2\xB1", &etUp, 0.0, 0.0, "%.4f");
+                ImGui::SetNextItemWidth(etFieldW);
+                ImGui::InputDouble("Tolerance \xC2\xB1", &etUp, 0.01, 0.1, "%.4f");
             } else if (etTol == 2 || etTol == 3) {
-                ImGui::InputDouble("Upper", &etUp, 0.0, 0.0, "%.4f");
-                ImGui::InputDouble("Lower", &etLo, 0.0, 0.0, "%.4f");
+                ImGui::SetNextItemWidth(etFieldW);
+                ImGui::InputDouble("Upper", &etUp, 0.01, 0.1, "%.4f");
+                ImGui::SetNextItemWidth(etFieldW);
+                ImGui::InputDouble("Lower", &etLo, 0.01, 0.1, "%.4f");
             }
+            ImGui::SetNextItemWidth(etFieldW);
             ImGui::SliderInt("Precision", &etPrec, 0, 4);
+            ImGui::SetNextItemWidth(etFieldW);
             ImGui::InputText("Prefix", etPrefix, sizeof(etPrefix));
+            ImGui::SetNextItemWidth(etFieldW);
             ImGui::InputText("Suffix", etSuffix, sizeof(etSuffix));
             ImGui::Checkbox("Critical dimension", &etCrit);
         }
+        ImGui::SetNextItemWidth(etFieldW);
         ImGui::InputText(numeric ? "Override text" : "Note text", etText, sizeof(etText));
         ImGui::Separator();
         if (ImGui::Button("Apply", ImVec2(120 * ui::uiScale, 0))) {
@@ -1053,6 +1098,7 @@ static void renderDimEditorPopup(AppState& st, AppState::DocTab& tab, const nloh
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel", ImVec2(90 * ui::uiScale, 0))) ImGui::CloseCurrentPopup();
+        glass.finish();
         ImGui::EndPopup();
     } else {
         s_annEditLoaded = false;
@@ -1088,26 +1134,37 @@ static void renderGdtEditorPopup(AppState& st, AppState::DocTab& tab) {
         tab.gdtEditorOpen = false;
     }
     ImGui::SetNextWindowSize(ImVec2(340 * ui::uiScale, 0), ImGuiCond_Appearing);
+    ImGui::SetNextWindowBgAlpha(0.0f);
     if (!ImGui::BeginPopup("GD&T##gdtedit")) return;
+    GlassPopupScope glass = beginGlassPopup("drw_gdtedit_popup");
 
     const std::string& k = tab.gdtKind;
     bool commit = false;
     nlohmann::json spec = tab.gdtSpec.is_object() ? tab.gdtSpec : nlohmann::json::object();
 
+    // One shared field-column width for every combo/input so labels form a clean right-edge
+    // column; only the datum A/B/C trio stays narrow, on a single shared row.
+    const float gdtFieldW = 160.0f * ui::uiScale;
+
     if (k == "gdt_frame") {
         ImGui::TextUnformatted("Feature Control Frame");
-        ImGui::SetNextItemWidth(180 * ui::uiScale);
+        ImGui::SetNextItemWidth(gdtFieldW);
         ImGui::Combo("Characteristic", &symIdx, kSyms, IM_ARRAYSIZE(kSyms));
-        ImGui::Checkbox("Diameter zone", &dia);
-        ImGui::SetNextItemWidth(120 * ui::uiScale);
+        ImGui::SetNextItemWidth(gdtFieldW);
         ImGui::InputText("Tolerance", tolBuf, sizeof(tolBuf));
-        ImGui::SetNextItemWidth(120 * ui::uiScale);
+        ImGui::SetNextItemWidth(gdtFieldW);
         ImGui::Combo("Modifier", &modIdx, kMods, IM_ARRAYSIZE(kMods));
+        ImGui::Checkbox("Diameter zone", &dia);
         ImGui::Separator();
-        ImGui::TextUnformatted("Datum references");
-        ImGui::SetNextItemWidth(60 * ui::uiScale); ImGui::InputText("Primary", datA, sizeof(datA));
-        ImGui::SetNextItemWidth(60 * ui::uiScale); ImGui::InputText("Secondary", datB, sizeof(datB));
-        ImGui::SetNextItemWidth(60 * ui::uiScale); ImGui::InputText("Tertiary", datC, sizeof(datC));
+        // Datum trio on one row (primary / secondary / tertiary).
+        const float datW = 46.0f * ui::uiScale;
+        ImGui::SetNextItemWidth(datW); ImGui::InputText("##datA", datA, sizeof(datA));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(datW); ImGui::InputText("##datB", datB, sizeof(datB));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(datW); ImGui::InputText("##datC", datC, sizeof(datC));
+        ImGui::SameLine();
+        ImGui::TextUnformatted("Datums (1st / 2nd / 3rd)");
         if (ImGui::Button("Place", ImVec2(120 * ui::uiScale, 0))) {
             spec["symbol"] = kSyms[symIdx];
             spec["tol_value"] = std::string(tolBuf);
@@ -1122,8 +1179,8 @@ static void renderGdtEditorPopup(AppState& st, AppState::DocTab& tab) {
     } else if (k == "surface_finish") {
         static const char* kMach[] = {"any", "required", "prohibited"};
         ImGui::TextUnformatted("Surface Finish");
-        ImGui::SetNextItemWidth(100 * ui::uiScale); ImGui::InputText("Ra", sfRa, sizeof(sfRa));
-        ImGui::SetNextItemWidth(140 * ui::uiScale);
+        ImGui::SetNextItemWidth(gdtFieldW); ImGui::InputText("Ra", sfRa, sizeof(sfRa));
+        ImGui::SetNextItemWidth(gdtFieldW);
         ImGui::Combo("Machining", &sfMach, kMach, IM_ARRAYSIZE(kMach));
         ImGui::Checkbox("All around", &sfAll);
         if (ImGui::Button("Place", ImVec2(120 * ui::uiScale, 0))) {
@@ -1135,9 +1192,9 @@ static void renderGdtEditorPopup(AppState& st, AppState::DocTab& tab) {
     } else if (k == "weld_symbol") {
         static const char* kWeld[] = {"fillet", "square", "vee", "bevel", "plug"};
         ImGui::TextUnformatted("Weld Symbol");
-        ImGui::SetNextItemWidth(140 * ui::uiScale);
+        ImGui::SetNextItemWidth(gdtFieldW);
         ImGui::Combo("Type", &weldType, kWeld, IM_ARRAYSIZE(kWeld));
-        ImGui::SetNextItemWidth(100 * ui::uiScale); ImGui::InputText("Size", weldSize, sizeof(weldSize));
+        ImGui::SetNextItemWidth(gdtFieldW); ImGui::InputText("Size", weldSize, sizeof(weldSize));
         ImGui::Checkbox("Other side", &weldOther);
         ImGui::SameLine();
         ImGui::Checkbox("All around", &weldAll);
@@ -1151,10 +1208,10 @@ static void renderGdtEditorPopup(AppState& st, AppState::DocTab& tab) {
     } else if (k == "datum_target") {
         static const char* kT[] = {"point", "line", "area"};
         ImGui::TextUnformatted("Datum Target");
-        ImGui::SetNextItemWidth(80 * ui::uiScale); ImGui::InputText("Label", dtLabel, sizeof(dtLabel));
-        ImGui::SetNextItemWidth(120 * ui::uiScale);
+        ImGui::SetNextItemWidth(gdtFieldW); ImGui::InputText("Label", dtLabel, sizeof(dtLabel));
+        ImGui::SetNextItemWidth(gdtFieldW);
         ImGui::Combo("Type", &dtType, kT, IM_ARRAYSIZE(kT));
-        ImGui::SetNextItemWidth(100 * ui::uiScale); ImGui::InputText("Size", dtSize, sizeof(dtSize));
+        ImGui::SetNextItemWidth(gdtFieldW); ImGui::InputText("Size", dtSize, sizeof(dtSize));
         if (ImGui::Button("Place", ImVec2(120 * ui::uiScale, 0))) {
             spec["label"] = std::string(dtLabel);
             spec["target_type"] = kT[dtType];
@@ -1172,6 +1229,7 @@ static void renderGdtEditorPopup(AppState& st, AppState::DocTab& tab) {
         tab.gdtSpec = nlohmann::json::object();
         ImGui::CloseCurrentPopup();
     }
+    glass.finish();
     ImGui::EndPopup();
 }
 
@@ -1213,19 +1271,39 @@ static void renderTitleBlockPopup(AppState& st, AppState::DocTab& tab, const nlo
     }
 
     ImGui::SetNextWindowSize(ImVec2(360 * ui::uiScale, 0), ImGuiCond_Appearing);
+    ImGui::SetNextWindowBgAlpha(0.0f);
     if (ImGui::BeginPopup("Sheet Properties##sheetprops")) {
+        GlassPopupScope glass = beginGlassPopup("drw_sheetprops_popup");
         ImGui::SetNextItemWidth(120 * ui::uiScale);
         ImGui::Combo("Sheet size", &tbSizeIdx, kSizes, IM_ARRAYSIZE(kSizes));
         ImGui::Separator();
-        ImGui::InputText("Title", tbTitle, sizeof(tbTitle));
+        // Short fields share rows (kills the dead vertical space of nine full-width inputs in a
+        // 360px popup); Title/Company stay full width.
+        const float tbHalfW = 110.0f * ui::uiScale;
+        const float tbThirdW = 60.0f * ui::uiScale;
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##tb_title", "Title", tbTitle, sizeof(tbTitle));
+        const float tbCol2X = 190.0f * ui::uiScale;   // fixed 2nd column so rows align vertically
+        ImGui::SetNextItemWidth(tbHalfW);
         ImGui::InputText("Drawn by", tbDrawn, sizeof(tbDrawn));
+        ImGui::SameLine(tbCol2X);
+        ImGui::SetNextItemWidth(tbHalfW);
         ImGui::InputText("Date", tbDate, sizeof(tbDate));
+        ImGui::SetNextItemWidth(tbHalfW);
         ImGui::InputText("Material", tbMatl, sizeof(tbMatl));
+        ImGui::SameLine(tbCol2X);
+        ImGui::SetNextItemWidth(tbHalfW);
         ImGui::InputText("Finish", tbFinish, sizeof(tbFinish));
+        ImGui::SetNextItemWidth(tbThirdW);
         ImGui::InputText("Scale", tbScale, sizeof(tbScale));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(tbThirdW);
         ImGui::InputText("Rev", tbRev, sizeof(tbRev));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(tbThirdW);
         ImGui::InputText("Sheet", tbSheetNo, sizeof(tbSheetNo));
-        ImGui::InputText("Company", tbCompany, sizeof(tbCompany));
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputTextWithHint("##tb_company", "Company", tbCompany, sizeof(tbCompany));
         ImGui::Separator();
         if (ImGui::Button("Apply", ImVec2(120 * ui::uiScale, 0))) {
             std::string sheetId = djstr(sheet, "id");
@@ -1253,6 +1331,7 @@ static void renderTitleBlockPopup(AppState& st, AppState::DocTab& tab, const nlo
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel", ImVec2(90 * ui::uiScale, 0))) ImGui::CloseCurrentPopup();
+        glass.finish();
         ImGui::EndPopup();
     } else {
         tbLoaded = false;
@@ -1295,7 +1374,9 @@ void drawDrawingSheet(AppState& st) {
         else if (tab.balloonActive)     stageMsg = "Balloon: click to drop an item bubble";
 
         if (stageMsg) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.62f, 0.18f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(pal.statusWarn[0], pal.statusWarn[1],
+                                         pal.statusWarn[2], pal.statusWarn[3]));
             ImGui::TextUnformatted(stageMsg);
             ImGui::PopStyleColor();
             ImGui::SameLine();

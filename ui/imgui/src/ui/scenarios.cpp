@@ -723,22 +723,40 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
     }
 
     // ---------- cam ----------
+    // T-G13 (issue #7): cam used to do all its work in one tick and set camShotDone immediately,
+    // but it has no wantCam branch in endFrame() and captureFrameBudget() is 999999 for every
+    // isScenarioMode() scenario — so the generic budget path never fired and cam could NEVER
+    // write a PNG (it printed cam-shot: ok=1 and then spun to the outer timeout, even worker-
+    // present). Make it a tiny settle-based one-shot like sketch: build + loadMesh the plate,
+    // settle a few frames so the mesh renders, THEN set camShotDone. endFrame's new wantCam
+    // branch captures on camShotDone.
     if (cfg.wantCam && st.workerStarted && !cfg.camShotDone && cfg.frame >= 5) {
-        std::string err;
-        st.docMirror.newPart(st.worker, err);
-        st.addDocTab(false);
-        st.docMirror.applyOps(st.worker, nlohmann::json::array({
-            {{"op","add_feature"},{"feature",{
-                {"type","box"},{"name","Plate"},
-                {"params",{{"length",dim(80)},{"width",dim(60)},{"height",dim(15)}},
-                           {"centered",true}}}}}}));
-        nlohmann::json res; std::string e2;
-        st.worker.call("cam_program",
-            {{"doc_id", st.docMirror.docId()}, {"post", "fanuc"}}, res, e2);
-        st.workspace = cmd::Workspace::Model;
-        cfg.camShotDone = true;
-        std::printf("cam-shot: ok=%d\n", (int)!res.contains("code"));
-        std::fflush(stdout);
+        if (camSettle > 0) { --camSettle; return; }
+        switch (camStep) {
+            case 0: {
+                std::string err;
+                st.docMirror.newPart(st.worker, err);
+                st.addDocTab(false);
+                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op","add_feature"},{"feature",{
+                        {"type","box"},{"name","Plate"},
+                        {"params",{{"length",dim(80)},{"width",dim(60)},{"height",dim(15)}},
+                                   {"centered",true}}}}}}));
+                loadMesh(st, r.aicm_path);
+                nlohmann::json res; std::string e2;
+                st.worker.call("cam_program",
+                    {{"doc_id", st.docMirror.docId()}, {"post", "fanuc"}}, res, e2);
+                st.workspace = cmd::Workspace::Model;
+                std::printf("cam-shot: ok=%d\n", (int)!res.contains("code"));
+                std::fflush(stdout);
+                camSettle = 4; ++camStep; break;
+            }
+            default:
+                cfg.camShotDone = true;
+                std::printf("cam: scenario complete\n");
+                std::fflush(stdout);
+                break;
+        }
     }
 
     // ---------- evalmass ----------
@@ -996,6 +1014,24 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppSt
         std::fflush(stdout);
     };
 
+    // T-G13 (issue #7): worker-absent backstop. Every step-machine (isScenarioMode) scenario
+    // gates its body on st.workerStarted and only Breaks once its xShotDone is set; with no
+    // Python worker provisioned that never happens, so endFrame would return Continue forever
+    // (captureFrameBudget() is 999999 for these) and the --shot loop spins until the outer
+    // timeout kills it with no PNG — the exact deadlock in issue #7. When the worker never
+    // started, capture the (chrome-only) frame once ImGui has laid out and Break so the shot
+    // always terminates. Inert when the worker is up (workerStarted true): the real step machine
+    // runs and captures normally, so this can NEVER pre-empt the long-running fea/flow sims
+    // (which only reach their wait loops worker-present).
+    if (cfg.isScenarioMode() && !st.workerStarted && cfg.frame >= 12) {
+        writeBackbufferPng(screenshotPath, dw, dh);
+        if (win) glfwSwapBuffers(win);
+        std::printf("%s: worker absent — captured chrome-only shot (no part)\n",
+                    cfg.name ? cfg.name : "scenario");
+        std::fflush(stdout);
+        return FrameAction::Break;
+    }
+
     if (cfg.wantM1) {
         if (!m1Capture.empty()) { mirrorLast(m1Capture, "m1_06_reopen"); m1Capture.clear(); }
         if (win) glfwSwapBuffers(win);
@@ -1058,6 +1094,17 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppSt
         if (!mdCapture.empty() && !st.rpc.busy()) { mirrorLast(mdCapture, "multidoc_04_B"); mdCapture.clear(); }
         if (win) glfwSwapBuffers(win);
         return cfg.multidocShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+    // T-G13 (issue #7): cam had no capture branch — add one so it captures on camShotDone
+    // (mirrors fea/flow) instead of falling through to the 999999 generic budget and hanging.
+    if (cfg.wantCam) {
+        if (cfg.camShotDone) {
+            writeBackbufferPng(screenshotPath, dw, dh);
+            if (win) glfwSwapBuffers(win);
+            return FrameAction::Break;
+        }
+        if (win) glfwSwapBuffers(win);
+        return FrameAction::Continue;
     }
 
     return FrameAction::None;

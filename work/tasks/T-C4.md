@@ -2,8 +2,8 @@
 id: T-C4
 title: Hardware path - probe-rs flash/debug and clangd LSP tools
 workstream: C
-owner: unassigned
-status: todo
+owner: sonnet-orin
+status: doing
 branch: task/T-C4-hardware-path
 day: 4
 depends_on: [T-C3]

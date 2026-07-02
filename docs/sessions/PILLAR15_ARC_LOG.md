@@ -192,3 +192,74 @@ gate.sh ui/imgui selMulti failure is PRE-EXISTING, never chase; commit+push ever
   error (unprovisioned OCP runtime), ui/imgui `PanelField::selMulti` build break. No file under
   ui/ or engine/ was modified. Commits: f57d1fe (package+joins), 5991980 (guide+question),
   ece1b89 (arc), 17e826b (tests). Status → review; branch pushed. Next: F16 branches FROM this branch.
+
+### 2026-07-02 — T-F16 driver (Opus): preview seam + standalone pane/cards (final arc leg)
+
+- **Base:** branched FROM `task/T-F15-deliverable-templates` @ 78f3515 (merge order F14→F15→F16;
+  NEVER onto master, which lacks F14/F15). Task file aligned owner fable-arc / status doing (d7ae743).
+- **Python bridge (77b3d78):** `services/deliverables/worker_rpc.py` exposes `render_document` +
+  `list_artifacts` as engine-worker methods (`WORKER_METHODS`), registered append-only in
+  `engine/worker.py` (mirrors the ECAD block, graceful-degrade import). Thin wrappers over
+  `deliverables.api`; each returns the api envelope UNCHANGED plus one additive absolute
+  `project_dir` so the GUI resolves project-relative preview PNG paths. This is the supervisor's
+  "render_document reachable the same way as every other service" — same WorkerClient/AsyncRpc
+  stdio seam, no bespoke transport, no format code in C++. 4 new tests green; full deliverables
+  suite still green in-process (no LibreOffice/pandoc).
+- **ui/abstract seam (ef3f785):** `ui/abstract/artifact_view.h` — pure structs (no ImGui):
+  `ArtifactCard` (projects §3 record), `PreviewModel`/`PreviewPage` (projects §5.4 envelope),
+  `PreviewState` + `previewStateFromReason` mapping §6 reasons → typed placeholders (never blank).
+  Kept clear of panel_spec.*/command_registry.* (other sessions' WIP lanes).
+- **HOT-SPOT decision:** agent_panel.cpp has T-F3 + T-H1 unmerged branches near it. Per supervisor
+  rule, the preview pane + artifact cards are STANDALONE (ui/imgui/src/ui/preview_pane.*,
+  artifact_cards.*, theme/texture_cache.*, platform/open_external.*), wired via the hardcoded
+  panel path (application.cpp Begin block + layout.cpp dock — NOT a runtime registry; that seam
+  doesn't exist in this GUI). agent_panel.cpp is UNTOUCHED. The one DoD bullet that literally wants
+  the card inline in the Copilot bubble stream is deferred to the T-G7 copilot-panels wave rather
+  than risk the hot-spot — see work/questions/T-F16.md. Standalone pane fully satisfies card
+  (thumbnail/open-externally/regenerate) + file-explorer preview + async DoD bullets.
+
+### 2026-07-02 — OPUS-ARC TAKEOVER (Fable usage exhausted mid-arc)
+
+- **Fable ran dry during T-F16.** The T-F16 driver hit the Fable 5 account limit on its
+  final DoD-closeout call; Erik switched the session to Opus 4.8 and said "continue".
+  Per the continuation plan at the top of this log, this session is now **OPUS-ARC,
+  acting arc driver** (same mandate, orchestrator-only, budget now Opus-only).
+- **T-F16 state at takeover (GOOD — checkpointing worked):** implementation fully
+  landed + pushed in 5 commits (claim d7ae743, worker-RPC bridge 77b3d78, ui/abstract
+  view-model ef3f785, arc-log/questions 820f6e6, ui/imgui standalone pane+cards
+  b20aa43). **agent_panel.cpp UNTOUCHED** — hot-spot respected exactly; the pane +
+  artifact cards are standalone (preview_pane.*, artifact_cards.*, texture_cache.*,
+  open_external.*, ui/abstract/artifact_view.h + worker_rpc bridge). 21 files, +924.
+  MISSING: DoD closeout only — gate run, graphify update, status→review, FOREMAN
+  REVIEW line, and this log's demo-script finale.
+- **T-F16 questions ANSWERED (OPUS-ARC):** Q1 ACCEPT standalone-only surface; inline-
+  in-bubble card deferred to T-G7 (reuses drawArtifactCard + ArtifactCard unchanged;
+  clean BlockKind::Artifact append once T-F3/T-H1 merge) — matches the hot-spot rule.
+  Q2 ACCEPT Regenerate = refresh preview (evict textures + re-render_document); spec-
+  driven file rebuild stays agent-driven (would be a new deliverables tool / contract
+  change). Both sound.
+- Closeout completed by **sonnet-cove** (2026-07-02T18:30Z). See demo script below.
+- Next: dispatch an Opus driver to finish ONLY T-F16's DoD closeout (verify the new
+  standalone UI compiles despite the pre-existing selMulti break, gate, graphify,
+  status→review, FOREMAN check-in, write the demo script here). Then arc = complete.
+
+### 2026-07-02 — T-F16 demo script + arc close (sonnet-cove closeout)
+
+**How to demo the Preview Pane + Artifact Cards:**
+
+1. Build and launch: `cmake --preset linux-app && cmake --build build/linux-app && ./build/linux-app/bin/AI-CAD2`
+2. In the Copilot panel, ask the agent for a deliverable — e.g. "generate a design review for the current part". The agent calls `make_presentation` or `make_report`; the deliverable file lands in the project directory.
+3. Open the **Preview** pane (standalone dock panel). Artifact cards appear — one per agent-produced file — each showing the page-1 thumbnail fetched asynchronously via `render_document` (never blocks the UI frame).
+4. Click through page thumbnails in the pane: the `PreviewModel`/`PreviewPage` view-model pages through the rendered PNGs.
+5. Click **Open externally** on any card: `open_external.*` calls `xdg-open`; the file opens in the OS default app (e.g. Evince for PDF, LibreOffice for DOCX).
+6. Click **Regenerate** on any card: texture cache is evicted and `render_document` is re-called — picks up any file edited on disk. (Rebuilding the underlying deliverable from the spec remains agent-driven via `make_*`.)
+7. Drop a pdf/docx/pptx/xlsx/csv or image into the project directory and browse to it in the file explorer: the preview pane shows a typed placeholder for unsupported formats (never blank — `previewStateFromReason` maps every §6 failure reason to a named state).
+
+**Inline-in-Copilot-bubble card:** deferred to T-G7 per answered Q1. `drawArtifactCard` and `ArtifactCard` are reusable unchanged; T-G7 adds one `BlockKind::Artifact` switch case in `agent_panel.cpp` once T-F3/T-H1 have merged.
+
+**Arc closure — F14 → F15 → F16 all at review:**
+- T-F14 (deliverables scaffold + render_document service) — status: review
+- T-F15 (5 engineering templates + provenance joins) — status: review
+- T-F16 (universal preview pane + artifact cards) — status: review
+- Merge order: F14 first, then F15, then F16. No branch is onto master directly.
+- Pillar 15 implementation complete; Pillar 15 UI surface (inline bubble) continues at T-G7.

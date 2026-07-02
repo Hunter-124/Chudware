@@ -8,7 +8,9 @@
 #include "ui/command_search.h"
 #include "ui/file_explorer.h"
 #include "ui/settings_modal.h"
+#include "ui/preview_pane.h"
 #include "theme/theme.h"
+#include "theme/texture_cache.h"
 
 #include "viewport_impl.h"
 
@@ -43,6 +45,7 @@ void Application::shutdown() {
     g_state.rpc.shutdown();
     g_state.simClient.stop();
     g_state.worker.stop();
+    ui::clearPreviewTextures();
     scene_.shutdown();
     g_state.scene = nullptr;
     glViewportReady_ = false;
@@ -172,6 +175,16 @@ void Application::frame() {
     if (ImGui::Begin("Assistant###agent", nullptr, pflags))
         ui::drawAgentPanel(s);
     ImGui::End();
+
+    // T-F16 preview pane: closable, docked in the lower-right task-pane slot (layout.cpp).
+    // Focus is requested BEFORE Begin (a hidden dock tab's Begin returns false, so an in-window
+    // SetWindowFocus would never run). Zero footprint while closed.
+    if (*ui::previewPaneOpen()) {
+        if (ui::previewTakeFocusRequest()) ImGui::SetNextWindowFocus();
+        if (ImGui::Begin("Preview###preview", ui::previewPaneOpen(), pflags))
+            ui::drawPreviewPane(s);
+        ImGui::End();
+    }
     ImGui::PopStyleColor();
 
     if (s.paletteOpen) ui::drawCommandPalette(s);

@@ -12,6 +12,7 @@
 #include "imgui.h"
 
 #include "app/app_state.h"
+#include "ui/preview_pane.h"
 #include "ui/settings_modal.h"
 #include "theme/icons.h"
 #include "theme/theme.h"
@@ -230,8 +231,12 @@ static void drawFileRow(app::AppState& st, const fs::path& root, const fs::path&
     } else {
         if (ImGui::Selectable(p.filename().string().c_str(), selected,
                               ImGuiSelectableFlags_AllowDoubleClick)) {
+            const bool changed = !selected;
             s_selectedPath = pathStr;
             s_currentFolder = p.parent_path().string();
+            // T-F16: selecting a file feeds the docked Preview pane (async render_document —
+            // never blocks the frame; unsupported formats become a typed placeholder there).
+            if (changed) { requestArtifactPreview(st, pathStr); openPreviewPane(); }
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) requestOpen(st, p);
         }
         if (isKnownExt(ext) && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
@@ -243,6 +248,10 @@ static void drawFileRow(app::AppState& st, const fs::path& root, const fs::path&
             s_selectedPath = pathStr;
             s_currentFolder = p.parent_path().string();
             if (ImGui::MenuItem("Open"))   requestOpen(st, p);
+            if (ImGui::MenuItem("Preview")) {  // T-F16: render in the docked Preview pane
+                requestArtifactPreview(st, pathStr);
+                openPreviewPane();
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Rename", "F2")) {
                 s_renameId = pathStr;

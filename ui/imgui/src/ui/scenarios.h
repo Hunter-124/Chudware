@@ -27,6 +27,7 @@ struct ShotConfig {
     bool wantRibbon = false;
     bool wantExplorer = false;
     bool wantPmform = false;
+    bool wantPreview = false;
 
     // Worker one-shot shots (fire once when workerStarted)
     bool wantTree = false;

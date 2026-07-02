@@ -6,9 +6,13 @@
 #include "ui/ribbon.h"
 #include "ui/settings_modal.h"
 #include "ui/file_explorer.h"
+#include "ui/preview_pane.h"
+#include "artifact_view.h"
 #include "app/app_state.h"
 #include "viewport/scene.h"
 #include "jobs.h"
+
+#include <platform/paths.h>
 
 #include <glad/gl.h>
 #define GLFW_INCLUDE_NONE
@@ -115,6 +119,45 @@ static void seedAssemblyShot(app::AppState& st) {
     st.workspace = cmd::Workspace::Assemble;
 }
 
+// Seeds the T-F16 preview pane deterministically (no worker round-trip): a few representative
+// artifact cards + a Ready PreviewModel pointing at a PNG that's guaranteed to exist on disk
+// (the icon atlas already bundled under resourcesDir/icons/) so the shot renders a real texture.
+static void seedPreviewShot(app::AppState& /*st*/) {
+    using aicad::ui::ArtifactCard;
+    using aicad::ui::PreviewModel;
+    using aicad::ui::PreviewPage;
+    using aicad::ui::PreviewState;
+
+    std::vector<ArtifactCard> cards;
+    ArtifactCard report;
+    report.artifactId = "art_report"; report.kind = "report"; report.path = "out/report.docx";
+    report.title = "Design Review Report"; report.createdTs = "2026-07-02T00:00:00Z"; report.runId = "run_1";
+    cards.push_back(report);
+
+    ArtifactCard deck;
+    deck.artifactId = "art_deck"; deck.kind = "presentation"; deck.path = "out/deck.pptx";
+    deck.title = "Customer Deck"; deck.createdTs = "2026-07-02T00:05:00Z"; deck.runId = "run_1";
+    cards.push_back(deck);
+
+    ArtifactCard bom;
+    bom.artifactId = "art_bom"; bom.kind = "workbook"; bom.path = "out/bom.xlsx";
+    bom.title = "Bill of Materials"; bom.createdTs = "2026-07-02T00:10:00Z"; bom.runId = "run_1";
+    cards.push_back(bom);
+
+    PreviewModel model;
+    model.path = report.path;
+    model.kind = "docx";
+    model.state = PreviewState::Ready;
+    model.resourceLink = "file://" + platform::joinPath(platform::resourcesDir(), "icons/atlas_dark.png");
+    PreviewPage page;
+    page.index = 1;
+    page.imagePath = platform::joinPath(platform::resourcesDir(), "icons/atlas_dark.png");
+    model.pages = {page};
+    model.activePage = 0;
+
+    ui::previewPaneSeedForShot(cards, model);
+}
+
 static bool findBoxAicm(std::string& out) {
     if (const char* env = std::getenv("AI_CAD_AICM")) { out = env; return !out.empty(); }
     const char* candidates[] = {
@@ -219,6 +262,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantActivity = eq("activity");
     cfg.wantAsm = eq("asm");
     cfg.wantPmform = eq("pmform");
+    cfg.wantPreview = eq("preview");
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
@@ -256,6 +300,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantChat) seedChatShot(st);
     if (cfg.wantPlan) seedPlanShot(st);
     if (cfg.wantAssembly) seedAssemblyShot(st);
+    if (cfg.wantPreview) seedPreviewShot(st);
     if (cfg.wantPick) setupPickShot(st);
     if (cfg.wantGlassperf) setupPickShot(st);
 
@@ -416,6 +461,12 @@ void ScenarioRunner::tickGlassperf(ShotConfig& cfg, app::AppState& st) {
 
 void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
     tickSimpleShots(cfg, st);
+
+    // ---------- preview (T-F16) ----------
+    // Re-arm the Preview dock-tab focus every frame: the window is created on frame 1 and only
+    // docked (behind the viewport tab) on frame 2, so a single-shot request would be consumed
+    // before the tab exists. SetNextWindowFocus each frame guarantees the capture frame shows it.
+    if (cfg.wantPreview) ui::openPreviewPane();
 
     // ---------- glassperf (frame-driven perf harness; no worker needed) ----------
     if (cfg.wantGlassperf && !cfg.glassperfShotDone) tickGlassperf(cfg, st);

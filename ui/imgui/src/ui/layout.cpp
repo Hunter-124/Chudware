@@ -63,6 +63,10 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     for (const char* d : kTaskPaneDialogs)
         ImGui::DockBuilderDockWindow(d, rightBottom);
 
+    // T-F16 preview pane — same lower-right task-pane slot (the central node hides its tab bar
+    // via drawViewport's NoTabBar, so anything docked there would be unreachable).
+    ImGui::DockBuilderDockWindow("Preview###preview", rightBottom);
+
     ImGui::DockBuilderFinish(root);
 }
 

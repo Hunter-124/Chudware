@@ -2,8 +2,8 @@
 id: T-C2
 title: Compile loop and pin-map header from ECAD netlist
 workstream: C
-owner: unassigned
-status: todo
+owner: opus-crag
+status: doing
 branch: task/T-C2-compile-loop-pinmap
 day: 2
 depends_on: [T-C1]

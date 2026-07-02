@@ -8,13 +8,19 @@ they honestly read `pending-provision` with exact commands (never a fabricated s
 
     python -m tools.flywheel.vlm.residual_report                      # offline: pending rows
     python -m tools.flywheel.vlm.residual_report --base-url http://127.0.0.1:1234/v1  # live
+
+`--only key[,key]` restricts the LIVE measurement to the candidates actually loaded behind
+the endpoint. llama-server serves ONE model; without this fence every candidate row would
+probe the same `/models` endpoint, come back `available`, and be scored against whatever
+model happens to be loaded — fabricating MEASURED rows for weights that were never run.
+Candidates outside `--only` keep their honest `pending-provision` row.
 """
 from __future__ import annotations
 
 import argparse
 import os
 
-from .candidate_eval import run_residual
+from .candidate_eval import LlamaCppVisionCandidate, run_residual
 from .candidates import CANDIDATES
 
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -28,8 +34,25 @@ def _fmt(v):
     return "—" if v is None else v
 
 
-def build_section(base_url: str) -> str:
-    rep = run_residual(CORPUS, base_url=base_url)
+class _NotServed:
+    """Stand-in for a candidate that is NOT the model loaded behind the endpoint: always
+    unavailable, so `evaluate_candidate` short-circuits to the pending-provision row instead
+    of scoring the wrong weights."""
+    available = False
+
+    def __init__(self, spec):
+        self.name = spec.key
+
+    def propose_claims(self, image_path, prompt=None):  # pragma: no cover - never called
+        return []
+
+
+def build_section(base_url: str, only: set[str] | None = None) -> str:
+    factory = None
+    if only:
+        factory = (lambda spec: LlamaCppVisionCandidate(spec, base_url=base_url)
+                   if spec.key in only else _NotServed(spec))
+    rep = run_residual(CORPUS, base_url=base_url, candidate_factory=factory)
     ceil = rep["deterministic_ceiling"]
     lines = [
         BEGIN, "",
@@ -84,8 +107,8 @@ def build_section(base_url: str) -> str:
     return "\n".join(lines)
 
 
-def write(base_url: str, doc_path: str = DOC) -> str:
-    section = build_section(base_url)
+def write(base_url: str, doc_path: str = DOC, only: set[str] | None = None) -> str:
+    section = build_section(base_url, only=only)
     with open(doc_path, encoding="utf-8") as f:
         content = f.read()
     if BEGIN in content and END in content:
@@ -102,12 +125,19 @@ def write(base_url: str, doc_path: str = DOC) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Emit the T-H10 VLM residual section.")
     ap.add_argument("--base-url", default="http://127.0.0.1:1234/v1")
+    ap.add_argument("--only", default=None,
+                    help="comma-separated candidate keys actually loaded behind the endpoint;"
+                         " others keep pending-provision rows (llama-server serves ONE model)")
     ap.add_argument("--print", action="store_true", help="print to stdout, do not write")
     args = ap.parse_args(argv)
+    only = set(args.only.split(",")) if args.only else None
+    if only and not only <= set(CANDIDATES):
+        ap.error(f"unknown candidate key(s) {sorted(only - set(CANDIDATES))}; "
+                 f"known: {sorted(CANDIDATES)}")
     if args.print:
-        print(build_section(args.base_url))
+        print(build_section(args.base_url, only=only))
     else:
-        print("wrote", write(args.base_url))
+        print("wrote", write(args.base_url, only=only))
     return 0
 
 

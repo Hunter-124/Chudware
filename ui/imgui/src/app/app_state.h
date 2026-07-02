@@ -131,6 +131,11 @@ struct AppState {
     aicad::ui::DocViewModel viewModel;
     aicad::ui::ActionBus actionBus;
 
+    // Interaction contract §3/§8: in-app-dialog transport pending state (ui/ask_dialog.h).
+    std::string pendingAskBatchJson;  // set to raise an ask_user batch (empty = none pending)
+    std::string askAnswersJson;       // set by ui::drawAskDialog on Submit (§4 answers envelope)
+    bool askDialogOpen = false;
+
     DocTabState& doc() {
         static DocTabState fallback{"Part", cmd::DocType::Part};
         if (docs.empty()) return fallback;

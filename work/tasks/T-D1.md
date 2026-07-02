@@ -3,7 +3,7 @@ id: T-D1
 title: structural_schema.md contract and engine/structural/ scaffold
 workstream: D
 owner: opus-vex
-status: doing
+status: review
 branch: task/T-D1-structural-schema-scaffold
 day: 1
 depends_on: []

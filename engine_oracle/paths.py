@@ -11,7 +11,20 @@ from pathlib import Path
 
 
 def appdata_root() -> Path:
-    base = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
+    """Per-user data root, matching the C++ convention (core/agent/paths.cpp):
+    APPDATA on Windows, $XDG_DATA_HOME (default ~/.local/share) elsewhere.
+
+    An explicit APPDATA env var always wins (tests use it to redirect). The old
+    unconditional ``expanduser(r"~\\AppData\\Roaming")`` fallback silently created a
+    literal ``~\\AppData\\Roaming/`` directory in CWD on Linux (backslashes are not
+    path separators there, so expanduser is a no-op).
+    """
+    base = os.environ.get("APPDATA")
+    if not base:
+        if os.name == "nt":
+            base = os.path.expanduser(r"~\AppData\Roaming")
+        else:
+            base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
     return Path(base) / "AI-CAD"
 
 

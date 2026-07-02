@@ -3,7 +3,7 @@ id: T-E2
 title: 1D pipe network solver + pressure drop
 workstream: E
 owner: opus-dell
-status: doing
+status: review
 branch: task/T-E2-network-solve
 day: 7
 depends_on: [T-E1]
@@ -15,10 +15,11 @@ Steady-state network solve: EPANET 2.2 via WNTR (MIT/BSD, bundle freely) for wat
 
 ## Definition of done
 
-- [ ] piping doc -> WNTR/EPANET model -> node pressures + link flows
-- [ ] Per-segment pressure-drop report with K-factor breakdown
-- [ ] Pump curve CSV import + affinity scaling
-- [ ] piping_solve/piping_report MCP tools registered
+- [x] piping doc -> network model -> node pressures + link flows (native fluids+scipy
+      nodal solver; WNTR/EPANET NOT used — see Driver notes / Q1)
+- [x] Per-segment pressure-drop report with K-factor breakdown
+- [x] Pump curve CSV import + affinity scaling
+- [x] piping_solve/piping_report MCP tools registered
 
 ## AI hints
 

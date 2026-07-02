@@ -25,6 +25,7 @@ from mcp.server.fastmcp import FastMCP
 
 from mcp_server import core_bridge as cb
 from mcp_server.cad_tools import _doc, _dumps, _err
+from mcp_server.fit_narration import _format_fit  # single home (T-F8); loop.py shares it
 
 
 def _axis_order(faces: list) -> Optional[dict]:
@@ -513,34 +514,6 @@ def _scene_caption(doc_id: str, views: list) -> str:
     return " ".join(parts)
 
 
-# ================================================================ shared fit/clearance formatter (T-F8)
-
-
-def _format_fit(fit: dict | None) -> str:
-    """Render the kernel's fit/interference report as narration text (contracts/narration.md).
-
-    Shared single home for both the agent build loop (services/agent/loop.py imports this)
-    and the GSL narration layer (describe_assembly). Input shape:
-      {summary, interferences:[{a,b,volume}], clearances:[{a,b,distance}]}.
-    Returns "" when fit is None or empty.
-    """
-    if not fit:
-        return ""
-    lines = [f"FIT REPORT: {fit.get('summary', '')}"]
-    for it in fit.get("interferences", []):
-        lines.append(f"  INTERFERENCE  {it['a']} <-> {it['b']}: {it['volume']:.2f} mm^3 overlap")
-    for cl in fit.get("clearances", []):
-        lines.append(f"  clearance     {cl['a']} <-> {cl['b']}: {cl['distance']:.2f} mm gap")
-    if fit.get("interferences"):
-        lines.append("  -> If that overlap is NOT an intended press-fit, fix it: REPOSITION one "
-                     "part (change its Pos along the axis where the bodies overlap) or CUT a "
-                     "matching opening/pocket in the other part so the inserted part has room. "
-                     "A part placed AT a wall coordinate overlaps that wall - offset it by at "
-                     "least half its own thickness plus the wall thickness to sit flush outside, "
-                     "or place it in an actual gap/opening.")
-    return "\n".join(lines)
-
-
 # ================================================================ narration helpers (T-F7)
 
 
@@ -993,7 +966,7 @@ def _describe_board_text(doc_id: str) -> str:
     3. engine.ecad.erc.run_erc → ERC/DRC violation summary
     """
     try:
-        from engine.ecad import ecad_session  # noqa: PLC0415
+        from engine.ecad import session as ecad_session  # noqa: PLC0415
     except ImportError:
         return _dumps({"ok": False,
                        "error": "ECAD engine not available — "

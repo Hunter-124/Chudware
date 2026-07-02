@@ -23,8 +23,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from engine import paths, render
-from mcp_server.gsl_tools import _format_fit  # single home for fit/clearance formatting (T-F8)
 from engine.kernel import AssemblyResult, ModelResult, run_code_multi
+from mcp_server.fit_narration import _format_fit  # single home for fit/clearance text (T-F8)
 
 from . import config as agent_config
 from .providers.base import Provider, assistant, image_part, text_part, user
@@ -524,9 +524,9 @@ def _fill_ratio(res: ModelResult) -> float | None:
     return res.volume / box
 
 
-# _format_fit moved to services/mcp/gsl_tools.py (T-F8) — imported at module top.
-# The shared implementation in gsl_tools._format_fit is identical: same input shape
-# {summary, interferences:[{a,b,volume}], clearances:[{a,b,distance}]}, same output.
+# _format_fit moved to services/mcp/fit_narration.py (T-F8) — imported at module top.
+# Same input shape {summary, interferences:[{a,b,volume}], clearances:[{a,b,distance}]},
+# same output; gsl_tools (describe_assembly) shares the identical implementation.
 
 
 def _feedback_ok(res: "ModelResult | AssemblyResult") -> str:

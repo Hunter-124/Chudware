@@ -92,6 +92,14 @@ graph TD
     T_H8["T-H8: Product-task eval benchmark suite (elicitation, spec->sketch, regen-fix, CAM, VLM)"]:::done
     T_H9["T-H9: Adapter serving - vLLM per-task LoRA routing, canary rollout, rollback story"]:::todo
   end
+  subgraph WS_M["workstream M"]
+    T_M1["T-M1: CAM overhaul: fix critical post-processor correctness (C++)"]:::todo
+    T_M2["T-M2: CAM overhaul: true adaptive clearing (trochoidal arc-blend linking)"]:::todo
+    T_M3["T-M3: CAM overhaul: holder/shank collision simulation"]:::todo
+    T_M4["T-M4: CAM overhaul: feeds/speeds DB unification with engine materials registry"]:::todo
+    T_M5["T-M5: CAM overhaul: OCCT hole-extraction completeness (counterbore/countersink/tilt)"]:::todo
+    T_M6["T-M6: CAM overhaul: pocket entry fix + arc-true stock simulation"]:::todo
+  end
   subgraph WS_backlog["workstream backlog"]
     T_BL01["T-BL01: V&V benchmark harness"]:::backlog
     T_BL02["T-BL02: Format interop track (reverse-engineering intake)"]:::backlog
@@ -185,4 +193,5 @@ graph TD
   T_B4 --> T_INT
   T_C4 --> T_INT
   T_D4 --> T_INT
+  T_M6 --> T_M3
 ```

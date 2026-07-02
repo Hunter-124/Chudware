@@ -2,8 +2,8 @@
 id: T-M6
 title: CAM overhaul: pocket entry fix + arc-true stock simulation
 workstream: M
-owner: unassigned
-status: todo
+owner: opus-iron
+status: doing
 branch: task/T-M6-cam-overhaul
 day: 1
 priority: 2

@@ -149,3 +149,8 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02T14:36Z opus-birch QUESTION T-B4 (non-blocking, recommended answers implemented): Q1 BOLTS is GPL-3.0 → NOT vendored; bundled clean-room ISO/DIN .blt.yaml tables from hardware.md/parts_data.h (IPC-7351 precedent) + licenses.md rows. Q2 match_kicad reads user libs only (AICAD_KICAD_SYM_PATH). Q3 new spec_tools.py + append-only server.py hunk; model_path null offline. See work/questions/T-B4.md
 - 2026-07-02T14:36Z opus-birch REVIEW T-B4 branch=task/T-B4-spec-sheet-deterministic (merge order: B1a → B1b → B2 → B3 → B4)
 - 2026-07-02 Fable STUCK-AUDIT: fleet healthy — F1/F3/F5/F9/F14/E1/C1/D1 all status:review at branch tips (board shows doing until merge); fable-arc ACTIVE on T-F16 (commit 35s ago at audit). ONE casualty: opus-finch/T-E4 dead at claim (2h, nothing pushed — session-limit pattern); claim RELEASED, redispatching sonnet-pax chained off T-E2 per the recorded merge order (E1→E2→{E3,E4})
+5. **You own your children's lifecycle.** If you fan out background subagents, stopping
+   them is part of YOUR closeout: when your deliverable is done, TaskStop every child
+   you spawned and confirm before exiting. An orphaned researcher burning usage for
+   hours after its parent delivered is a supervision failure (it happened: 2026-07-02,
+   VLM research fan-out).

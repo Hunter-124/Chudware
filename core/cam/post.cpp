@@ -54,6 +54,7 @@ PostConfig PostConfig::from_json(const json& j) {
     B("work_offset", c.work_offset); B("comp_supported", c.comp_supported);
     B("laser_mode", c.laser_mode); B("lathe", c.lathe); B("diameter_mode", c.diameter_mode);
     S("program_stop", c.program_stop); S("tool_change", c.tool_change);
+    S("css_on", c.css_on); S("css_off", c.css_off); S("css_clamp", c.css_clamp);
     S("spindle_cw", c.spindle_cw); S("spindle_ccw", c.spindle_ccw); S("spindle_off", c.spindle_off);
     S("coolant_flood", c.coolant_flood); S("coolant_mist", c.coolant_mist); S("coolant_off", c.coolant_off);
     S("comment_open", c.comment_open); S("comment_close", c.comment_close);
@@ -305,6 +306,21 @@ std::string drill_cycle_code(const PostConfig& c, const std::string& cyc) {
     if (cyc == "spot") return "G82";
     return c.cycle_drill;
 }
+
+// Express a world-frame point in a work-coordinate-system's local (program) frame:
+// p_local = Rᵀ·(p − origin), where R = [x_dir | y_dir | z_dir] is the WCS orientation
+// and y_dir = z_dir × x_dir. For an identity WCS (origin 0, axes aligned) this is the
+// identity, so unshifted/unrotated offsets pass through unchanged. Used to place canned
+// drill points correctly under a per-op work offset (D2).
+Vec3 to_wcs_local(const WCS& w, const Vec3& p) {
+    const Vec3& x = w.x_dir;
+    const Vec3& z = w.z_dir;
+    Vec3 y{z.y * x.z - z.z * x.y, z.z * x.x - z.x * x.z, z.x * x.y - z.y * x.x};
+    Vec3 d{p.x - w.origin.x, p.y - w.origin.y, p.z - w.origin.z};
+    return Vec3{x.x * d.x + x.y * d.y + x.z * d.z,
+                y.x * d.x + y.y * d.y + y.z * d.z,
+                z.x * d.x + z.y * d.y + z.z * d.z};
+}
 }  // namespace
 
 // ──────────────────────────────────────────────────────────── post_setup ──
@@ -319,6 +335,9 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
         if (opt.overrides.contains("canned_drill")) c.canned_drill = ov.canned_drill;
         if (opt.overrides.contains("sequence_numbers")) c.sequence_numbers = ov.sequence_numbers;
         if (opt.overrides.contains("r_for_arcs")) { c.r_for_arcs = ov.r_for_arcs; c.arcs_ijk = !ov.r_for_arcs; }
+        if (opt.overrides.contains("lathe")) c.lathe = ov.lathe;
+        if (opt.overrides.contains("diameter_mode")) c.diameter_mode = ov.diameter_mode;
+        if (opt.overrides.contains("css_clamp")) c.css_clamp = ov.css_clamp;
     }
     NcGen g(c, opt);
     bool metric = opt.metric;
@@ -371,13 +390,21 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
         // work offset + spindle + coolant at op start
         if (op) {
             if (c.work_offset) {
-                int wo = op->wcs ? op->wcs->offset : setup.wcs.offset;
-                g.blk("G" + std::to_string(wo));
+                const WCS& w = op->wcs ? *op->wcs : setup.wcs;
+                if (w.offset_sub > 0)  // extended work offset: G54.1 P<n> (D4)
+                    g.blk("G" + std::to_string(w.offset) + ".1 P" + std::to_string(w.offset_sub));
+                else
+                    g.blk("G" + std::to_string(w.offset));
             }
         }
         bool head = (setup.machine.kind == MachineKind::Laser || setup.machine.kind == MachineKind::Plasma ||
                      setup.machine.kind == MachineKind::Waterjet);
         if (g.lathe && op && op->surface_speed_mode == "css") {
+            // clamp max spindle rpm BEFORE engaging constant-surface-speed, or the
+            // spindle overspeeds as the turned diameter approaches zero (D9). Fanuc/Haas
+            // require G50 S<max> immediately ahead of G96.
+            if (!c.css_clamp.empty() && op->max_turn_rpm > 0)
+                g.blk(c.css_clamp + " S" + fmt_num(op->max_turn_rpm, g.c.rpm));
             g.blk(c.css_on + " S" + fmt_num(op->css > 0 ? op->css : rpm, g.c.rpm));
         }
         if (!head && rpm > 0 && rpm != g.last_rpm) g.spindle(rpm, op ? op->spindle_dir : 1);
@@ -394,6 +421,9 @@ PostResult post_setup(const Setup& setup, const ToolLibrary& tools, const std::s
             bool first = true;
             for (auto& pj : op->geometry["points"]) {
                 Vec3 p = vec3_from_json(pj);
+                // a per-op work offset shifts/rotates the program origin; express the
+                // hole in that frame so the canned-cycle XY land on the real hole (D2).
+                if (op->wcs) p = to_wcs_local(*op->wcs, p);
                 std::ostringstream b;
                 if (first) {
                     b << code << " X" << fmt_num(p.x, c.xyz) << " Y" << fmt_num(p.y, c.xyz)

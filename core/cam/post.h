@@ -118,6 +118,7 @@ struct PostConfig {
     bool diameter_mode = true;          // X = diameter (true) vs radius
     std::string css_on = "G96";
     std::string css_off = "G97";
+    std::string css_clamp = "G50";      // spindle max-rpm clamp emitted before G96 (Fanuc/Haas: G50 S<max>)
     std::string feed_per_rev = "G99";   // turning feed mode
     std::string feed_per_min = "G98";
 

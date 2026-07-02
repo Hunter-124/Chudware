@@ -777,6 +777,153 @@ TEST_CASE("post: setup sheet lists tools + operations + time") {
     CHECK(has(s.text, "machining time"));
 }
 
+// ── T-M1: machine-safety post-processor correctness (audit D2, D4, D9) ────────
+
+// D4: extended work offsets (G54.1 P<n>) must be emitted, not silently collapsed to G54.
+TEST_CASE("post: extended work offset emits G54.1 P<n> (T-M1 D4)") {
+    Built b = build_mill_job();
+    // put the drill op on an extended offset G55.1 P3; leave origin/axes identity so
+    // only the register word changes (no coordinate shift).
+    WCS w; w.offset = 55; w.offset_sub = 3;
+    b.setup.operations[1].wcs = w;
+    PostResult r = post_setup(b.setup, b.tools, "fanuc", b.tps);
+    REQUIRE(r.ok);
+    CHECK(has(r.gcode, "G55.1 P3"));       // extended offset emitted
+    CHECK(has(r.gcode, "G54"));            // contour op still on the setup's plain G54
+    // the plain-register path must not masquerade the extended offset as bare "G55"
+    // (would silently target the wrong fixture). It only appears as "G55.1".
+    CHECK_FALSE(has(r.gcode, "G55\n"));
+}
+
+// D2: canned-cycle drill points must be transformed into a per-op work frame, else the
+// holes land at the wrong XY when the op overrides the setup WCS origin.
+TEST_CASE("post: canned drill points transform through per-op WCS (T-M1 D2)") {
+    Built b = build_mill_job();
+    // holes authored in world space at (0,0) and (10,0); shift the op's program origin
+    // by +10 in X so they become (-10,0) and (0,0) in the work frame.
+    WCS w; w.offset = 54; w.origin = {10, 0, 0};
+    b.setup.operations[1].wcs = w;
+    PostResult r = post_setup(b.setup, b.tools, "fanuc", b.tps);
+    REQUIRE(r.ok);
+    CHECK(has(r.gcode, "X-10.000"));         // first hole shifted into the work frame
+    CHECK(has(r.gcode, "X0.000 Y0.000"));    // second hole now sits on the work origin
+    CHECK_FALSE(has(r.gcode, "X10.000 Y0.000"));  // raw (untransformed) coord is gone
+}
+
+// D2 corollary: with no per-op WCS override the points pass through unchanged (guards
+// against a transform accidentally applying to the common single-fixture case).
+TEST_CASE("post: drill points unchanged without a per-op WCS (T-M1 D2 no-op)") {
+    Built b = build_mill_job();
+    PostResult r = post_setup(b.setup, b.tools, "fanuc", b.tps);
+    REQUIRE(r.ok);
+    CHECK(has(r.gcode, "X0.000 Y0.000"));    // first hole raw at origin
+    CHECK(has(r.gcode, "X10.000 Y0.000"));   // second hole raw at (10,0)
+}
+
+// build a minimal lathe setup: one CSS turning op + a hand-built single-cut toolpath,
+// driven through the post via a lathe override (no dedicated lathe dialect preset).
+static Built build_lathe_job() {
+    Built b;
+    b.setup.name = "LatheOp";
+    b.setup.machine.kind = MachineKind::Lathe;
+    b.setup.machine.name = "Slant-bed lathe";
+    b.setup.stock.type = StockType::Cylinder;
+    b.setup.wcs.offset = 54;
+    Tool t1; t1.number = 1; t1.type = ToolType::TurningGeneral; t1.name = "CNMG turn";
+    b.tools.tools = {t1};
+    Operation o; o.id = "t1"; o.name = "Rough turn"; o.type = OpType::TurnRough; o.tool_number = 1;
+    o.surface_speed_mode = "css"; o.css = 200; o.max_turn_rpm = 3000;
+    o.heights.top = 0; o.heights.bottom = -30;
+    b.setup.operations = {o};
+    Toolpath tp; tp.op_id = "t1"; tp.tool_number = 1;
+    Move m; m.kind = MoveKind::Cut; m.to = {5, 0, -30}; m.feed = 120;
+    tp.moves = {m};
+    tp.cycle_time_s = 1.0;
+    b.tps = {tp};
+    return b;
+}
+
+// D9: G50 S<max> must clamp the spindle BEFORE G96 CSS engages, or the spindle
+// overspeeds as the diameter approaches zero on a facing/parting pass.
+TEST_CASE("post: lathe CSS clamps spindle with G50 before G96 (T-M1 D9)") {
+    Built b = build_lathe_job();
+    PostOptions opt; opt.overrides = json{{"lathe", true}};
+    PostResult r = post_setup(b.setup, b.tools, "fanuc", b.tps, opt);
+    REQUIRE(r.ok);
+    CHECK(has(r.gcode, "G50 S3000"));   // max-rpm clamp with the op's max_turn_rpm
+    CHECK(has(r.gcode, "G96 S200"));    // constant surface speed at css=200
+    // ordering: the clamp must precede CSS engagement.
+    auto pg50 = r.gcode.find("G50");
+    auto pg96 = r.gcode.find("G96");
+    REQUIRE(pg50 != std::string::npos);
+    REQUIRE(pg96 != std::string::npos);
+    CHECK(pg50 < pg96);
+}
+
+// D9 corollary: dialects may name a different clamp word (Siemens LIMS); an empty
+// clamp word suppresses the line entirely without dropping the G96.
+TEST_CASE("post: lathe CSS clamp word is dialect-configurable (T-M1 D9)") {
+    Built b = build_lathe_job();
+    PostOptions opt; opt.overrides = json{{"lathe", true}, {"css_clamp", "G92"}};
+    PostResult r = post_setup(b.setup, b.tools, "fanuc", b.tps, opt);
+    REQUIRE(r.ok);
+    CHECK(has(r.gcode, "G92 S3000"));   // clamp emitted with the overridden word
+    CHECK(has(r.gcode, "G96 S200"));
+    CHECK_FALSE(has(r.gcode, "G50"));   // default clamp word not used
+}
+
+// T-M1: the four thinly-tested dialects (Haas, Mach3, Siemens, Centroid) get real
+// content assertions, not just enumeration coverage.
+TEST_CASE("post: Haas emits program-begin safety block + canned cycle (T-M1)") {
+    Built b = build_mill_job();
+    PostResult r = post_setup(b.setup, b.tools, "haas", b.tps);
+    REQUIRE(r.ok);
+    CHECK(r.gcode.front() == '%');       // percent-wrapped
+    CHECK(has(r.gcode, "O"));            // O-number program
+    CHECK(has(r.gcode, "G49"));          // safety-restart block G0 G17 G40 G49 G80 G90
+    CHECK(has(r.gcode, "G83"));          // peck canned cycle
+    CHECK(has(r.gcode, "G43"));          // length offset
+    CHECK(has(r.gcode, "G54"));          // work offset
+    CHECK(has(r.gcode, "M30"));          // program end
+}
+
+TEST_CASE("post: Mach3 emits canned cycles with no percent wrap (T-M1)") {
+    Built b = build_mill_job();
+    PostResult r = post_setup(b.setup, b.tools, "mach3", b.tps);
+    REQUIRE(r.ok);
+    CHECK(r.gcode.front() != '%');       // Mach3 has no % wrap
+    CHECK(has(r.gcode, "G83"));          // canned cycle supported
+    CHECK(has(r.gcode, "M6"));           // tool change
+    CHECK(has(r.gcode, "G43"));          // length offset
+    CHECK(has(r.gcode, "G54"));          // work offset
+    CHECK(has(r.gcode, "G80"));          // cycle cancel
+}
+
+TEST_CASE("post: Siemens emits N-lines, semicolon comments, canned cycle (T-M1)") {
+    Built b = build_mill_job();
+    PostResult r = post_setup(b.setup, b.tools, "siemens", b.tps);
+    REQUIRE(r.ok);
+    CHECK(has(r.gcode, "%"));            // ISO % wrap
+    CHECK(has(r.gcode, "N"));            // sequence numbers
+    CHECK(has(r.gcode, ";"));            // Siemens line comments
+    CHECK(has(r.gcode, "G83"));          // canned cycle
+    CHECK(has(r.gcode, "M6"));           // tool change
+    CHECK(has(r.gcode, "T2"));           // tool word (before M6)
+    CHECK(has(r.gcode, "G43"));          // length offset
+}
+
+TEST_CASE("post: Centroid/Tormach emits %, canned cycle, work offset (T-M1)") {
+    Built b = build_mill_job();
+    PostResult r = post_setup(b.setup, b.tools, "centroid", b.tps);
+    REQUIRE(r.ok);
+    CHECK(has(r.gcode, "%"));            // percent wrap
+    CHECK(has(r.gcode, "G83"));          // canned cycle
+    CHECK(has(r.gcode, "M6"));           // tool change
+    CHECK(has(r.gcode, "G54"));          // work offset
+    CHECK(has(r.gcode, "G43"));          // length offset
+    CHECK(has(r.gcode, "G80"));          // cycle cancel
+}
+
 // ── material-removal sim + backplot + time (Phase 5) ─────────────────────────
 TEST_CASE("sim: facing a box removes the expected slab volume") {
     Setup su;

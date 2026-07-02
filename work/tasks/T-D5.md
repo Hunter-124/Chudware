@@ -48,3 +48,22 @@ Day 5 delivers cost takeoff from the structure doc: board-feet for lumber, steel
 - Relevant files: `engine_oracle/structural/elements.py`, `engine_oracle/structural/sections.py`, `engine_oracle/bom.py`, `services/mcp/server.py`
 - Board feet formula: (thickness_in × width_in × length_ft) / 12 — using nominal dimensions, not actual
 - ENR Building Cost Index and Materials Cost Index are published monthly; seed from the most recent public issue available at ENR.com/economics
+
+## Progress log
+- 2026-07-02 23:35 UTC [sonnet-birch] REVIEW: branch task/T-D5-cost-takeoff-demo pushed. 26/26 tests pass.
+
+Files added:
+- engine_oracle/data/enr_rates.json — ENR Q4-2025 rate table w/ RS Means install hours, full provenance
+- engine_oracle/structural/estimate.py — board_feet(), steel_weight_lbs(), fastener_count(), takeoff(), estimate()
+- engine_oracle/structural/bom_bridge.py — structural_bom_lines()/structural_bom_dicts() → BomLine output for bom_rollup
+- engine_oracle/structural/test_estimate.py — 26 tests, all pass offline (no DLL/network)
+- mcp_server/structural_tools.py — struct_estimate MCP tool added inside register_structural_tools()
+
+DoD gates:
+✓ board_feet(4x4×8ft) = 10.67 BF
+✓ struct_estimate returns line_items + totals
+✓ Cedar post total = $135.80 (in $50–200: $48.00 lumber + $85.00 labor + $2.80 fasteners)
+✓ bom_bridge output passes through bom_rollup integration test
+✓ pytest engine_oracle/structural/test_estimate.py -q → 26 passed
+
+Design note: struct_estimate registered in structural_tools.py (not server.py) — co-located with struct_analyze/struct_check per existing append-only pattern. server.py unmodified.

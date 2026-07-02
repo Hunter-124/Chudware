@@ -293,8 +293,12 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
 
     if (cfg.wantPmform) {
         st.railTab = 0;
+        // pmform is a *form* screenshot: open the command's data-driven PropertyManager
+        // form (drawInspector renders when activeTool is set), NOT dispatch() which routes
+        // to actionBus and *executes* the command (leaving activeTool empty → no form).
+        // pmApplyShotEnv() (drawInspector) then applies any AI_CAD_PMSET field presets.
         if (const char* cmd = std::getenv("AI_CAD_PMCMD"))
-            if (*cmd) st.dispatch(cmd);
+            if (*cmd) st.activeTool = cmd;
     }
 
     if (cfg.wantChat) seedChatShot(st);

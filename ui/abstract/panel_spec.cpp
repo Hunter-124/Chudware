@@ -817,6 +817,11 @@ const PanelSpec* panelFormForCommand(const std::string& cmdId, std::string& mode
     // via the M1 scenario / future "Insert > Primitive" entries).
     if (cmdId == "box")           return findPanelSpec("box");
     if (cmdId == "cylinder")      return findPanelSpec("cylinder");
+    // Fallback: accept a bare panel-spec NAME as a command id (explicit ribbon-command
+    // mappings above always win). Lets tooling/scenarios/DoD examples address a form by its
+    // spec name directly — e.g. AI_CAD_PMCMD=extrude resolves to the extrude form the same
+    // way extrude_boss does (mode stays default). Only ever returns an already-registered spec.
+    if (const PanelSpec* byName = findPanelSpec(cmdId.c_str())) return byName;
     return nullptr;
 }
 

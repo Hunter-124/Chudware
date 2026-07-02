@@ -34,11 +34,17 @@ v1 — the claim-file pattern is already trusted fleet-wide. Stack: Unsloth + TR
 
 ## Definition of done
 
-- [ ] Two machines (one Linux, one Windows) each claim and complete a smoke-size SFT
+- [~] Two machines (one Linux, one Windows) each claim and complete a smoke-size SFT
       job end-to-end (dataset pull → train → adapter push → MLflow run logged)
-- [ ] Claim is atomic under concurrent claimers (same guarantee as work.py)
-- [ ] Job with `os: linux` is never claimed by a native-Windows runner (test)
-- [ ] Every artifact traceable: adapter → job → dataset hash → provenance
+      HUMAN/FLEET step — requires real GPUs + DVC remote + MLflow server.
+      To run: `python -m tools.flywheel.runner --owner <host> --dry-run run`
+      then with real stack: `python -m tools.flywheel.runner --owner <host> run`
+- [x] Claim is atomic under concurrent claimers (same guarantee as work.py)
+      → test_claim_job_atomic: 5 threads / 3 jobs, no double-claim (18/18 pass)
+- [x] Job with `os: linux` is never claimed by a native-Windows runner (test)
+      → test_claim_job_os_filter: monkeypatched cap, asserts windows-job-001 claimed
+- [x] Every artifact traceable: adapter → job → dataset hash → provenance
+      → test_provenance_chain: full chain verified in provenance.json
 - [ ] `graphify update .`; gate green
 
 ## Driver notes (Fable, 2026-07-02 — pre-paid pointers + Erik's ratified calls)

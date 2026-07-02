@@ -79,6 +79,11 @@ register_ecad_tools(mcp)
 from mcp_server.cam_tools import register_cam_tools
 register_cam_tools(mcp)
 
+# Research (Pillar 8): look-it-up-instead-of-recall. web_search + fetch_page return the
+# provenance-stamped answer envelope; per-user local cache; offline-safe degradation.
+from mcp_server.research_tools import register_research_tools
+register_research_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

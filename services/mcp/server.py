@@ -79,6 +79,10 @@ register_ecad_tools(mcp)
 from mcp_server.cam_tools import register_cam_tools
 register_cam_tools(mcp)
 
+# Piping (routed pipe networks): steady-state 1-D hydraulic solve + pressure-drop report.
+from mcp_server.piping_tools import register_piping_tools
+register_piping_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

@@ -184,3 +184,29 @@ AI_CAD_LIBAICAD=/home/hunter/Repositories/CAD/core/build-linux/bin/libaicad.so \
 ```
 
 Expected: 8 executed, 3 BROKEN (all provisioning gaps), 0 wrong-physics failures.
+
+---
+
+## Post-provisioning update (foreman, 2026-07-03)
+
+Acted on the gap table the same night. `fluids==1.3.1` + `build123d==0.10.0`
+installed into mcp-venv (both were already declared in requirements.txt +
+licenses.md — the PyNite pattern again: declared, never provisioned); `ngspice`
+installed via dnf (GPL2, subprocess-only per the standing policy).
+
+Also fixed four bugs in THIS audit script that the live runs exposed
+(wrong-case `PyNite` imports ×2 — PyNiteFEA installs module `Pynite`; hardcoded
+instead of probed build123d verdicts; Pynite local-axis mix-up in the cantilever
+hand-calc; wrong link-flow key + malformed boundary format in the piping check).
+The PyNite-in-mcp-venv "not installed" rows in the original table were the
+audit's own probe bug — the package was present.
+
+Re-run verdict: **PASS — all executed checks green.**
+- `piping_solve` now VALIDATED LIVE: Q=17.05 m³/h vs 17.69 Darcy-Weisbach rough
+  estimate (dH=10 m, L=100 m, DN50).
+- `struct_analyze` now VALIDATED LIVE: cantilever δ=6.7500 mm vs Euler-Bernoulli
+  6.7500 mm (0.00%).
+- `piping_internal_volume` / `piping_cfd_handoff` / `piping_verify_cfd`:
+  BROKEN → REAL (build123d/OCP imports clean).
+- `ecad_simulate [ngspice]`: subprocess path now present.
+- Remaining SKIP: OpenFOAM (`run_cfd_accurate`) — heavyweight install, deferred.

@@ -233,6 +233,8 @@ def register_piping_tools(mcp) -> None:
         """
         from engine.piping import properties as piping_props
         return _dumps(piping_props.fluid_properties(name, T=float(T), P=float(P)))
+
+    @mcp.tool()
     def piping_internal_volume(doc: Union[str, dict],
                                out_path: Optional[str] = None,
                                run_id: Optional[str] = None) -> str:

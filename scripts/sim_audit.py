@@ -193,7 +193,12 @@ def audit_piping() -> None:
                 name="main",
             )
             doc["runs"].append(run)
-            boundary = {"r0:0": {"head_m": 10.0}, "r0:1": {"head_m": 0.0}}
+            # solve() takes a LIST of BC dicts ({'run','end','head'} — see
+            # _apply_boundary), not a node-id->head mapping.
+            boundary = [
+                {"run": "r0", "end": "start", "head": 10.0},
+                {"run": "r0", "end": "end", "head": 0.0},
+            ]
             result = pip_solve.solve(doc, boundary=boundary)
 
             if not result.get("ok"):
@@ -206,8 +211,7 @@ def audit_piping() -> None:
                 # (order-of-magnitude; exact f depends on Reynolds iteration)
                 links = result.get("links", [])
                 if links:
-                    Q_m3s = links[0].get("flow_m3s", 0.0)
-                    Q_m3h = Q_m3s * 3600.0
+                    Q_m3h = links[0].get("flow_m3h", 0.0)  # solver reports m3/h directly
                     # Rough expected: dH=10m, f=0.02, L=100m, D=0.0525m (2" sched40)
                     D = 0.0525
                     f_approx = 0.02
@@ -235,16 +239,19 @@ def audit_piping() -> None:
         _record("piping_report", "REAL",
                 "engine/piping/solve.py:pressure_drop_report — K-factor breakdown per segment",
                 executed=False)
-        _record("piping_internal_volume", "BROKEN",
-                "requires build123d/OCP kernel (not installed in mcp-venv) — "
-                "import of piping_cfd_mod.internal_volume fails",
-                executed=False)
-        _record("piping_cfd_handoff", "BROKEN",
-                "requires build123d/OCP kernel (not installed) for bore extraction",
-                executed=False)
-        _record("piping_verify_cfd", "BROKEN",
-                "requires build123d/OCP kernel (not installed)",
-                executed=False)
+        # Probe (not hardcode) the build123d/OCP kernel these three tools need.
+        try:
+            import build123d  # noqa: F401
+            from engine.piping import cfd_handoff as _cfd  # noqa: F401
+            _b3d_note = "build123d/OCP import OK; engine.piping.cfd_handoff imports clean"
+            _b3d_verdict = "REAL"
+        except Exception as _e:  # noqa: BLE001
+            _b3d_note = f"requires build123d/OCP kernel: {type(_e).__name__}: {_e}"
+            _b3d_verdict = "BROKEN"
+        _record("piping_internal_volume", _b3d_verdict, _b3d_note, executed=False)
+        _record("piping_cfd_handoff", _b3d_verdict,
+                _b3d_note + " (bore extraction path)", executed=False)
+        _record("piping_verify_cfd", _b3d_verdict, _b3d_note, executed=False)
         _record("piping_fluid", "REAL",
                 "engine/piping/properties.py: CoolProp/thermo if available, else built-in table; "
                 "graceful degradation confirmed",
@@ -632,7 +639,7 @@ def audit_cfd() -> None:
 def audit_structural() -> None:
     print("\n--- FAMILY: structural (engine.structural, PyNite) ---")
     try:
-        import PyNite
+        import Pynite as PyNite  # PyNiteFEA installs module 'Pynite'
         pynite_ok = True
     except ImportError:
         pynite_ok = False
@@ -664,7 +671,7 @@ def audit_structural() -> None:
 
     try:
         import numpy as np
-        from PyNite import FEModel3D
+        from Pynite import FEModel3D  # PyNiteFEA installs module "Pynite"
 
         # Simple hand-built PyNite cantilever (bypasses StructureDoc to test PyNite directly)
         model = FEModel3D()
@@ -673,22 +680,28 @@ def audit_structural() -> None:
         # Use 50x200 rect for simpler independent check
         b_r = 50.0; h_r = 200.0
         A_r = b_r * h_r
-        Iy_r = h_r * b_r ** 3 / 12.0
-        Iz_r = b_r * h_r ** 3 / 12.0
+        # Pynite local axes for a member along global X: a global FZ (vertical) load
+        # bends the member ABOUT local y — so Iy must carry the b*h^3/12 (stiff) value
+        # for a section h tall in Z. (Verified empirically: swapping these gives exactly
+        # (h/b)^2 = 16x the deflection.)
+        Iy_r = b_r * h_r ** 3 / 12.0
+        Iz_r = h_r * b_r ** 3 / 12.0
         J_r = 0.141 * b_r * h_r ** 3 / (b_r / h_r)  # approx torsion constant
         L_r = 3000.0
 
         model.add_node("A", 0, 0, 0)
         model.add_node("B", L_r, 0, 0)
-        model.add_member("m1", "A", "B", "steel",
-                         Iy=Iy_r, Iz=Iz_r, J=J_r, A=A_r)
+        # Pynite >=1.0 API: sections are named objects (same call shape as
+        # engine/structural/analysis.py uses in production).
+        model.add_section("rect50x200", A_r, Iy_r, Iz_r, J_r)
+        model.add_member("m1", "A", "B", "steel", "rect50x200")
         model.def_support("A", True, True, True, True, True, True)
         model.add_node_load("B", "FZ", -5000.0)
         model.analyze(check_statics=False)
-        delta_got = abs(model.nodes["B"].dZ["Combo 1"])
+        delta_got = abs(model.nodes["B"].DZ["Combo 1"])  # Pynite 1.x: displacement dicts are DX/DY/DZ
 
         E_r = 200000.0
-        I_r = Iz_r  # bending about Z for FZ load
+        I_r = Iy_r  # FZ load bends about local y (see axis note above)
         delta_expected = 5000.0 * L_r ** 3 / (3.0 * E_r * I_r)
 
         err = _pct_err(delta_got, delta_expected)

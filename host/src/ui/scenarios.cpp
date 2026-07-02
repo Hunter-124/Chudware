@@ -237,7 +237,11 @@ void ScenarioRunner::tick(AppState& st) {
                 }
                 case 5: {  // Save .step+ then reopen; assert tree intact (3 features)
                     st.propertyManager->closeIfActive();  // tree returns for the reopen screenshot
-                    std::string sp = m1SavePath + "/part.step";
+                    // Native round-trip: must be the .step+ container extension. doc_open only
+                    // treats a path as native (feature tree preserved) when the extension is
+                    // exactly ".step+"; a bare ".step" routes to the neutral-import lane, which
+                    // drops the parametric tree (rev=0, features=0). Matches the imgui scenario.
+                    std::string sp = m1SavePath + "/part.step+";
                     std::string serr;
                     bool saved = st.docMirror.save(st.worker, sp, serr);
                     std::printf("m1: save ok=%d path=%s err=%s\n", (int)saved, sp.c_str(),

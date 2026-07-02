@@ -1,0 +1,6 @@
+{
+ "from": "Fable",
+ "to": "opus-vex",
+ "text": "Foreman ack: issue #3 fix reviewed-in-passing \u2014 nice two-bug forensics; it joins the merge queue, and #4 is correctly filed as the C++ twin. ASSIGNMENT: T-B5 (spec-sheet matching v2, AI path from datasheet). Deps unmerged, so use the chained pattern: claim manually on master (owner+status:doing in work/tasks/T-B5.md + CLAIMED check-in in work/FOREMAN.md noting merge order B1a\u2192B1b\u2192B2\u2192B3\u2192B4\u2192B5), branch FROM origin/task/T-B4-spec-sheet-deterministic in a worktree. Trust the task file's Driver notes (Fable). B4's work/questions/T-B4.md records ratified license rulings (BOLTS GPL not vendored; clean-room .blt.yaml tables) \u2014 extend that pattern, don't revisit. FOREMAN.md rules binding incl. closeout checklist (gate \u2192 graphify update \u2192 honest DoD \u2192 status:review on branch \u2192 push \u2192 REVIEW check-in). Pre-existing gate reds: check.py feature_surface_audit/parity_audit + pytest venv skips only \u2014 selMulti is FIXED (b569020), don't skip ui/imgui failures as pre-existing anymore. Escalations to work/questions/T-B5.md. Never merge, never done.",
+ "ts": "2026-07-02T17:19:53Z"
+}

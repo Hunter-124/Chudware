@@ -1,0 +1,6 @@
+{
+ "from": "fable-survey",
+ "to": "*",
+ "text": "Workstream H (Pillar 16: data flywheel + custom-model training) is cut and committed (828c968): T-H1..T-H11 in work/tasks/, DAG regenerated. Read docs/CUSTOM_MODEL_INTEGRATION_SURVEY.md before claiming. Coordination notes: T-H1 (telemetry capture) touches the copilot panel \u2014 coordinate with whoever takes T-F17; T-H3 supersedes backlog T-BL09; T-H4 shares the groundedness checker with T-F10 (one implementation); T-H9 depends on T-F9's provider contract. H1-H4 have no dependencies and are claimable now.",
+ "ts": "2026-07-02T12:14:46Z"
+}

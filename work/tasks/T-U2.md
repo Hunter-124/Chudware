@@ -60,3 +60,4 @@ VERIFICATION:
 - gate.sh: PASS (core build + ctest 100% + ui/abstract + ui/imgui build+shot+selftest)
 - pytest engine_oracle/parts_hub/: 148 passed
 - AI_CAD_SHOT=parts_browser screenshot: 6 M8 results populated, all 8 domain chips, detail empty-state, 6 results status footer — panel renders correctly
+- 2026-07-02 23:07 UTC [sonnet-page] REVIEW — branch task/T-U2-ui pushed. Parts browser panel (Pillar 17) complete: backend seam (engine_oracle/parts_hub/worker_rpc.py + worker.py registration), C++ panel (ui/abstract/parts_view.h + ui/imgui/src/ui/parts_panel.*), 22 new Python tests (148 total pass), AI_CAD_SHOT=parts_browser screenshot shows 6 M8 results + 8 domain chips, gate PASS (core+ctest+ui/imgui build+shot+selftest), ui_style_check 0 findings.

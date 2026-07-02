@@ -123,6 +123,9 @@ private:
     // evalmass
     int evalStep = 0, evalSettle = 0;
 
+    // cam
+    int camStep = 0, camSettle = 0;
+
     // activity
     int actStep = 0, actSettle = 0, actWaitFrames = 0;
     std::string actCapture, actSavePath;

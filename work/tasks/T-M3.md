@@ -2,8 +2,8 @@
 id: T-M3
 title: CAM overhaul: holder/shank collision simulation
 workstream: M
-owner: unassigned
-status: todo
+owner: opus-iron
+status: doing
 branch: task/T-M3-cam-overhaul
 day: 3
 priority: 3

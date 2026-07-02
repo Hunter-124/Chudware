@@ -76,15 +76,27 @@ light text on dark model).
 3. Draw 1px specular top edge (`glassHighlight` at 0.09–0.14 alpha).
 4. Continuous-corner rounding (`roundingLg` = 10px for panels, `rounding` = 6px for rows).
 
-### `adaptiveSurface(float avgLuminance)`
+### `adaptiveSurface(float avgLuminance)` / `adaptivePanel(ImGuiID, ImRect)`
 
-Returns `{ tint[4], textPrimary[4], textSecondary[4] }`:
+`AdaptiveSurface { tint, textPrimary, textSecondary, textTertiary, darkText, scrim }` is
+THEME-INDEPENDENT for `avgLuminance >= 0`: text tone derives only from the backdrop (vibrancy
+tokens are byte-identical in both palettes), so over-viewport text reads the same in light and
+dark mode. There is deliberately NO mid-range palette fallback — text tone is decisive (hysteretic
+dark/light switch at 0.58/0.42 with temporal smoothing, `motion::adaptive` tau), while a continuous
+contrast scrim (max at mid luminance, total tint alpha ≤ 0.62) compensates busy backdrops.
+`avgLuminance < 0` = chrome fallback (palette txt roles, `darkText = !ctx().dark`).
 
-- `luminance < 0.35` → light vibrancy text (HUD over dark model)
-- `luminance > 0.65` → dark vibrancy text (chat over bright viewport floor)
-- Mid-range → default palette `txt0`/`txt1`
+Panels use `theme::adaptivePanel(theme::panelId("<pane>_glass"), rect)` — window-independent ids,
+idempotent per frame, backed by `theme::sampleLuminance` (a sampler the viewport registers).
+Luminance queries are pure CPU reads of an async grid: the renderer downsamples the blurred
+backdrop and reads it back through a 3-slot PBO ring + fence polling (1–2 frame latency, ≤64×40
+cells, zero GL calls at query time — the old per-rect `glReadPixels` stalls are gone).
 
-Call `averageLuminance(rect)` on the viewport FBO each frame before drawing floating UI.
+### `glassPanel(dl, rect, level, rounding, surf)` — per-rect projection
+
+The backdrop publishes its screen rect (`ViewportBackdrop::screenMin/screenMax`, flipV); glassPanel
+projects each panel rect into backdrop UV space (clamped). Rects outside the viewport clamp to an
+inset edge band — the frosted "bleed" under side panels. Backdrop invalid → layered fallback.
 
 ### `glassRowBackground(dl, mn, mx, rounding, stripe, selected)`
 
@@ -106,7 +118,9 @@ Expose texture ID + UV transform on `IViewport::backdrop()`.
 
 ### Feature Manager (C1)
 
-- **No** full-panel `windowBg` + `glassBackground` wash on the docked FM pane.
+- ONE UltraThin true-glass surface per over-viewport pane (`browser_glass`, painted once by
+  left_dock; `agent_glass`, `doctabs_glass` likewise) — row pills on top. (The old "no full-panel
+  wash" rule predates the working per-rect backdrop projection; a full opaque wash is still wrong.)
 - Toolbar: explicit row reservation + `glassRowBackground` per icon button (undo/redo hit-test fix).
 - Tree rows: `fmRowPill()` → `glassRowBackground` with `GetFrameHeightWithSpacing()`.
 - Origin → nested planes hierarchy; datum icons use `ref_plane`.
@@ -161,14 +175,14 @@ Expose texture ID + UV transform on `IViewport::backdrop()`.
 
 Carried from `docs/REFACTOR_LOG.md` — must be cleared before G5:
 
-| ID | Issue | Fix |
-|----|-------|-----|
-| G1 | Row pills vs full-panel washes inconsistent (some panels still use `glassBackground` on whole window) | Remove full washes; pills only on interactive rows |
-| G2 | HUD idle fade too aggressive / not smooth on all themes | Tune `approach()` tau; verify on bright viewport |
-| G3 | Chat contrast poor on bright viewport bleed | `adaptiveSurface()` + darker `vibrancy.secondary` under 0.55 lum |
-| G4 | Dock splitter lines invisible | 1px `line` draw in `layout.cpp` on split hit areas |
-| G5 | Doc-tab band too opaque or too transparent | `mat.thin` 0.22 tint + blur when over viewport |
-| G6 | Empty dock pane shows wrong transparency | `DockingEmptyBg` + empty child bg = transparent |
+| ID | Issue | Status (liquid-glass v2, 2026-07) |
+|----|-------|-----------------------------------|
+| G1 | Row pills vs full-panel washes inconsistent | RESOLVED — one UltraThin adaptive surface per pane + rowWash-constant pills |
+| G2 | HUD idle fade too aggressive | RESOLVED — floor 0.25, ~120 ms hover ramp (viewport.cpp) |
+| G3 | Chat contrast poor on bright bleed | RESOLVED — hysteretic adaptive vibrancy + contrast scrim |
+| G4 | Dock splitter lines invisible | VERIFIED — 1px `line` hairlines in layout.cpp unchanged |
+| G5 | Doc-tab band opacity | RESOLVED — adaptive thin glass band + tabs (doc_tabs.cpp) |
+| G6 | Empty dock transparency | VERIFIED — DockingEmptyBg transparent (application.cpp) |
 
 ---
 

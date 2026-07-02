@@ -1,0 +1,1011 @@
+// Scripted screenshot/test scenarios — AI-CAD2 port of host/src/ui/scenarios.cpp.
+#include "ui/scenarios.h"
+
+#include "ui/viewport.h"
+
+#include "ui/ribbon.h"
+#include "ui/settings_modal.h"
+#include "ui/file_explorer.h"
+#include "app/app_state.h"
+#include "viewport/scene.h"
+#include "jobs.h"
+
+#include <glad/gl.h>
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+
+#include "stb_image_write.h"
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <vector>
+
+#include "cpp_core.h"
+
+namespace ui {
+namespace {
+
+ScenarioRunner* g_runner = nullptr;
+ShotConfig* g_cfg = nullptr;
+
+static std::string repoBase() {
+    const char* repo = std::getenv("AI_CAD_REPO");
+    return repo ? std::string(repo) : std::string(".");
+}
+
+static void loadMesh(app::AppState& st, const std::string& aicm) {
+    if (aicm.empty()) return;
+    if (st.scene) st.scene->loadAicm(aicm);
+    st.viewMeshRev = st.engine.revision();
+    st.buildTreeFromDoc();
+}
+
+static void writeBackbufferPng(const char* path, int dw, int dh, const char* mirrorPath = nullptr) {
+    std::vector<unsigned char> px((size_t)dw * dh * 4);
+    glReadBuffer(GL_BACK);
+    glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    std::vector<unsigned char> flip((size_t)dw * dh * 4);
+    for (int y = 0; y < dh; ++y)
+        std::memcpy(&flip[(size_t)(dh - 1 - y) * dw * 4], &px[(size_t)y * dw * 4], (size_t)dw * 4);
+    if (path) stbi_write_png(path, dw, dh, 4, flip.data(), dw * 4);
+    if (mirrorPath) stbi_write_png(mirrorPath, dw, dh, 4, flip.data(), dw * 4);
+}
+
+static nlohmann::json dim(double v) { return nlohmann::json{{"value", v}, {"expr", nullptr}}; }
+
+static void resetDemoState(app::AppState& st) {
+    st.docs.clear();
+    st.docTabs.clear();
+    st.agent.blocks.clear();
+    st.agent.running = false;
+    st.inSketch = false;
+    st.activeTool.clear();
+    st.railTab = 0;
+    st.workspace = cmd::Workspace::Model;
+    st.tree = app::TreeNode{};
+    st.bodies.clear();
+    st.selectedFeature.clear();
+    st.paletteOpen = false;
+    settingsUi().openSettings = false;
+    settingsUi().wantSettings = false;
+}
+
+static void seedChatShot(app::AppState& st) {
+    using app::AgentBlock;
+    using app::BlockKind;
+    AgentBlock u; u.kind = BlockKind::UserMsg;
+    u.body = "make it 30mm tall with a chamfered top edge";
+    st.agent.blocks.push_back(u);
+    AgentBlock a; a.kind = BlockKind::AssistantMsg;
+    a.body = "Raised the standoff to 30mm and chamfered the top rim.";
+    AgentBlock t; t.kind = BlockKind::Thinking; t.title = "Thinking";
+    t.body = "Edit the open hex standoff: 30mm tall + chamfered top.";
+    a.body = "Done — height 30mm, 1mm chamfer on the top rim.";
+    st.agent.blocks.insert(st.agent.blocks.end(), {t, a});
+}
+
+static void seedPlanShot(app::AppState& st) {
+    using app::AgentBlock;
+    using app::BlockKind;
+    AgentBlock u; u.kind = BlockKind::UserMsg; u.body = "an M3 hex standoff, 30mm tall";
+    st.agent.blocks.push_back(u);
+    AgentBlock a; a.kind = BlockKind::Plan;
+    a.title = "hex standoff";
+    a.body = "extruded hex prism with a through bore, chamfered top rim";
+    a.plan = {"M3 clearance bore r=1.7 through", "1mm chamfer on the top rim"};
+    a.planDone = {false, false};
+    st.agent.blocks.push_back(a);
+}
+
+static void seedAssemblyShot(app::AppState& st) {
+    using app::AgentBlock;
+    using app::BlockKind;
+    AgentBlock u; u.kind = BlockKind::UserMsg;
+    u.body = "a base plate, a lid 10mm above it, and a peg through both";
+    st.agent.blocks.push_back(u);
+    AgentBlock a; a.kind = BlockKind::AssistantMsg;
+    a.body = "Built a 3-part assembly. The peg passes through both plates.";
+    st.agent.blocks.push_back(a);
+    st.workspace = cmd::Workspace::Assemble;
+}
+
+static bool findBoxAicm(std::string& out) {
+    if (const char* env = std::getenv("AI_CAD_AICM")) { out = env; return !out.empty(); }
+    const char* candidates[] = {
+        "docs/contracts/fixtures/box.aicm",
+        "../docs/contracts/fixtures/box.aicm",
+        "../../docs/contracts/fixtures/box.aicm",
+        "../../../docs/contracts/fixtures/box.aicm",
+    };
+    for (const char* c : candidates) {
+        if (std::filesystem::exists(c)) { out = c; return true; }
+    }
+    return false;
+}
+
+static void setupPickShot(app::AppState& st) {
+    std::string aicm;
+    if (!findBoxAicm(aicm)) {
+        std::fprintf(stderr, "pick: box.aicm not found\n");
+        return;
+    }
+    if (st.scene && st.scene->loadAicm(aicm)) st.viewMeshRev = 0;
+    // Also feed the REAL GL viewport pipeline so the mesh (and the liquid-glass backdrop
+    // derived from it) actually renders; st.scene is the legacy scaffold.
+    if (ui::viewportLoadAicm(aicm))
+        std::printf("pick: loaded %s\n", aicm.c_str());
+}
+
+// glassperf: CPU frame-time capture. File-static (single active scenario per process) per
+// the harness contract; reset on the scenario's first tick (frame 1).
+constexpr int kGlassperfRing = 512;
+double g_gpPrevTime = 0.0;
+int g_gpFrameCount = 0;
+double g_gpMeanMs = 0.0;
+double g_gpMaxMs = 0.0;
+float g_gpRing[kGlassperfRing] = {};
+int g_gpRingCount = 0;
+bool g_gpProfStarted = false;
+bool g_gpProfWarned = false;
+
+float glassperfP99() {
+    int n = std::min(g_gpRingCount, kGlassperfRing);
+    if (n <= 0) return 0.f;
+    std::vector<float> sorted(g_gpRing, g_gpRing + n);
+    std::sort(sorted.begin(), sorted.end());
+    int idx = static_cast<int>(0.99f * static_cast<float>(n - 1));
+    if (idx < 0) idx = 0;
+    if (idx >= n) idx = n - 1;
+    return sorted[idx];
+}
+
+}  // namespace
+
+void setScenarioContext(ScenarioRunner* runner, ShotConfig* cfg) {
+    g_runner = runner;
+    g_cfg = cfg;
+}
+
+int ShotConfig::captureFrameBudget() const {
+    if (wantFlow && !flowShotDone) return 999999;
+    if (wantFea && !feaShotDone) return 999999;
+    if (wantCam && !camShotDone) return 999999;
+    if (wantEcad && !ecadShotDone) return 150;
+    if (wantTree) return treeShotDone ? 10 : 30;
+    if (wantEquations) return equationsShotDone ? 10 : 30;
+    if (isScenarioMode()) return 999999;
+    if (wantGlassperf) return glassperfShotDone ? 10 : 400;
+    return 6;
+}
+
+void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
+                   const char* capturePath) {
+    resetDemoState(st);
+    cfg = ShotConfig{};
+    cfg.capturePath = capturePath;
+    if (!shotEnv || !*shotEnv) {
+        cfg.active = capturePath != nullptr;
+        return;
+    }
+    cfg.name = shotEnv;
+    cfg.active = true;
+
+    auto eq = [&](const char* s) { return std::strcmp(shotEnv, s) == 0; };
+
+    cfg.wantSettings = eq("settings");
+    cfg.wantChat = eq("chat");
+    cfg.wantAssembly = eq("assembly");
+    cfg.wantPlan = eq("plan");
+    cfg.wantPick = eq("pick");
+    cfg.wantRibbon = eq("ribbon");
+    cfg.wantTree = eq("tree");
+    cfg.wantExplorer = eq("explorer");
+    cfg.wantEquations = eq("equations");
+    cfg.wantM1 = eq("m1");
+    cfg.wantMultidoc = eq("multidoc");
+    cfg.wantEcad = eq("ecad");
+    cfg.wantSketch = eq("sketch");
+    cfg.wantFea = eq("fea");
+    cfg.wantCam = eq("cam");
+    cfg.wantFlow = eq("flow");
+    cfg.wantDrawing = eq("drawing");
+    cfg.wantEvalMass = eq("evalmass");
+    cfg.wantActivity = eq("activity");
+    cfg.wantAsm = eq("asm");
+    cfg.wantPmform = eq("pmform");
+    cfg.wantGlassperf = eq("glassperf");
+    if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
+
+    if (cfg.wantSettings) {
+        settingsUi().wantSettings = true;
+        settingsUi().openSettings = true;
+    }
+    if (cfg.wantExplorer) st.railTab = kFilesRailTab;
+    if (cfg.wantRibbon) {
+        st.workspace = cmd::Workspace::Model;
+        ribbon::applyShotEnv(st);
+    }
+    if (cfg.wantSketch) {
+        st.inSketch = true;
+        st.workspace = cmd::Workspace::Sketch;
+        ribbon::applyShotEnv(st);
+    }
+    if (cfg.wantFea || cfg.wantFlow) {
+        st.workspace = cmd::Workspace::Simulate;
+        ribbon::applyShotEnv(st);
+    }
+    if (cfg.wantCam) st.workspace = cmd::Workspace::Model;
+    if (cfg.wantAsm) st.workspace = cmd::Workspace::Assemble;
+    if (cfg.wantDrawing) st.workspace = cmd::Workspace::Drafting;
+    if (cfg.wantEcad) st.workspace = cmd::Workspace::Schematic;
+    if (cfg.wantMultidoc) st.railTab = 0;
+    if (cfg.wantActivity) st.railTab = 0;
+
+    if (cfg.wantPmform) {
+        st.railTab = 0;
+        if (const char* cmd = std::getenv("AI_CAD_PMCMD"))
+            if (*cmd) st.dispatch(cmd);
+    }
+
+    if (cfg.wantChat) seedChatShot(st);
+    if (cfg.wantPlan) seedPlanShot(st);
+    if (cfg.wantAssembly) seedAssemblyShot(st);
+    if (cfg.wantPick) setupPickShot(st);
+    if (cfg.wantGlassperf) setupPickShot(st);
+
+    st.tryStartWorker();
+    std::printf("shot: AI_CAD_SHOT=%s capture=%s\n",
+                shotEnv, capturePath ? capturePath : "(none)");
+    std::fflush(stdout);
+}
+
+void scenarioTick(app::AppState& st) {
+    if (!g_runner || !g_cfg || !g_cfg->active) return;
+    g_runner->tick(*g_cfg, st);
+}
+
+void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
+    if (!st.workerStarted) st.tryStartWorker();
+    if (!st.workerStarted) return;
+
+    if (cfg.wantTree && !cfg.treeShotDone) {
+        cfg.treeShotDone = true;
+        std::string err;
+        if (st.docMirror.newPart(st.worker, err)) {
+            st.addDocTab(false);
+            auto r1 = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                {{"op","add_feature"},{"feature",{
+                    {"type","box"},{"name","Box1"},
+                    {"params",{{"length",dim(50)},{"width",dim(40)},{"height",dim(30)}}}
+                }}}
+            }));
+            loadMesh(st, r1.aicm_path);
+            std::printf("tree: box ok=%d rev=%d\n", (int)r1.ok, r1.revision);
+            nlohmann::json edgeRef = nlohmann::json::parse(
+                R"({"kind":"edge","surf":"line","centroid":[0,0,15],"axis":[0,0,1],"area_or_len":30})");
+            auto r2 = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                {{"op","add_feature"},{"feature",{
+                    {"type","fillet"},{"name","Fillet1"},
+                    {"params",{{"radius",dim(3)}}},
+                    {"refs",{{"edges",nlohmann::json::array({edgeRef})}}}
+                }}}
+            }));
+            loadMesh(st, r2.aicm_path);
+            auto ru = st.docMirror.undo(st.worker);
+            loadMesh(st, ru.aicm_path);
+            auto rr = st.docMirror.redo(st.worker);
+            loadMesh(st, rr.aicm_path);
+            std::printf("tree: undo/redo ok=%d/%d\n", (int)ru.ok, (int)rr.ok);
+        } else {
+            std::printf("tree: doc_new failed: %s\n", err.c_str());
+        }
+        std::fflush(stdout);
+    }
+
+    if (cfg.wantEquations && !cfg.equationsShotDone) {
+        cfg.equationsShotDone = true;
+        std::string err;
+        if (st.docMirror.newPart(st.worker, err)) {
+            st.addDocTab(false);
+            st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                {{"op","eq_set"},{"name","width"},{"expr","20"}}}));
+            st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                {{"op","eq_set"},{"name","height"},{"expr","width*1.5"}}}));
+            st.status = "Equations: width=20, height=width*1.5";
+            std::printf("equations: globals seeded\n");
+        }
+        std::fflush(stdout);
+    }
+
+    if (cfg.wantEcad && !cfg.ecadShotDone) {
+        cfg.ecadShotDone = true;
+        nlohmann::json res;
+        std::string err;
+        const char* kind = std::getenv("AI_CAD_ECAD_KIND");
+        bool wantPcb = kind && std::strcmp(kind, "pcb") == 0;
+        st.docs.push_back({wantPcb ? "Board1" : "Schematic1",
+                           wantPcb ? cmd::DocType::Pcb : cmd::DocType::Schematic});
+        st.activeDoc = (int)st.docs.size() - 1;
+        st.workspace = wantPcb ? cmd::Workspace::Board : cmd::Workspace::Schematic;
+        if (st.worker.call("ecad_orchestrate",
+                {{"recipe", "divider"}, {"kind", wantPcb ? "pcb" : "sch"}}, res, err, 60000))
+            std::printf("ecad: orchestrate ok\n");
+        else
+            std::printf("ecad: orchestrate skipped (%s)\n", err.c_str());
+        std::fflush(stdout);
+    }
+}
+
+void ScenarioRunner::tickGlassperf(ShotConfig& cfg, app::AppState& st) {
+    (void)st;
+    ++cfg.glassperfFrame;
+    const int f = cfg.glassperfFrame;
+
+    if (f == 1) {
+        g_gpFrameCount = 0;
+        g_gpMeanMs = 0.0;
+        g_gpMaxMs = 0.0;
+        g_gpRingCount = 0;
+        g_gpProfStarted = false;
+        g_gpProfWarned = false;
+    }
+
+    ui::viewportState().yaw += 0.014f;
+
+    double now = glfwGetTime();
+    if (f > 1) {
+        double dtMs = (now - g_gpPrevTime) * 1000.0;
+        ++g_gpFrameCount;
+        g_gpMeanMs += (dtMs - g_gpMeanMs) / static_cast<double>(g_gpFrameCount);
+        if (dtMs > g_gpMaxMs) g_gpMaxMs = dtMs;
+        g_gpRing[g_gpRingCount % kGlassperfRing] = static_cast<float>(dtMs);
+        ++g_gpRingCount;
+    }
+    g_gpPrevTime = now;
+
+    if (f == 30) {
+        nlohmann::json res;
+        std::string err;
+        if (core::cpp_core().call("prof_start", {{"hz", 997}, {"mode", "all"}}, res, err)) {
+            g_gpProfStarted = true;
+        } else if (!g_gpProfWarned) {
+            std::printf("glassperf: prof unavailable (%s)\n", err.c_str());
+            g_gpProfWarned = true;
+        }
+    }
+
+    // Register the GUI thread as the sampler target for the WHOLE 30..209 frame window (push
+    // once, pop once): set_target() persists across calls, so ImGui + GL render + swap between
+    // scenario ticks are all sampled. A per-tick push/pop pair would only cover the microseconds
+    // inside this function (measured: 9 samples instead of ~3000).
+    if (g_gpProfStarted && f == 30) {
+        nlohmann::json res;
+        std::string err;
+        core::cpp_core().call("prof_target_push", nlohmann::json::object(), res, err);
+    }
+    if (g_gpProfStarted && f == 210) {
+        nlohmann::json res;
+        std::string err;
+        core::cpp_core().call("prof_target_pop", nlohmann::json::object(), res, err);
+    }
+
+    if (f == 210) {
+        nlohmann::json res;
+        std::string err;
+        if (core::cpp_core().call("prof_stop", {{"top", 40}}, res, err) && cfg.capturePath) {
+            std::ofstream out(std::string(cfg.capturePath) + ".prof.json");
+            if (out) out << res.dump(2);
+        }
+        ui::GlassTimings gt = ui::viewportGlassTimings();
+        std::printf(
+            "glassperf: frames=%d avg_ms=%.2f p99_ms=%.2f gpu_scene_ms=%.2f gpu_blur_ms=%.2f "
+            "gpu_luma_ms=%.2f\n",
+            g_gpFrameCount, g_gpMeanMs, glassperfP99(),
+            gt.valid ? gt.sceneMs : 0.f, gt.valid ? gt.blurMs : 0.f, gt.valid ? gt.lumaMs : 0.f);
+        std::fflush(stdout);
+    }
+
+    if (f == 220) cfg.glassperfShotDone = true;
+}
+
+void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
+    tickSimpleShots(cfg, st);
+
+    // ---------- glassperf (frame-driven perf harness; no worker needed) ----------
+    if (cfg.wantGlassperf && !cfg.glassperfShotDone) tickGlassperf(cfg, st);
+
+    // ---------- m1 ----------
+    if (cfg.wantM1 && st.workerStarted && !cfg.m1ShotDone) {
+        if (!m1DirReady) {
+            m1DirReady = true;
+            m1SavePath = repoBase() + "/scratch/m1_shots";
+            std::error_code ec; std::filesystem::create_directories(m1SavePath, ec);
+        }
+        auto statusMs = [](const core::OpsResponse& r, const std::string& fid) -> double {
+            if (!r.feature_status.is_array()) return -1.0;
+            for (const auto& s : r.feature_status)
+                if (s.is_object() && s.value("id", std::string()) == fid)
+                    return s.value("ms", -1.0);
+            return -1.0;
+        };
+        const int kSettle = 4;
+        if (m1Settle > 0) { --m1Settle; return; }
+        if (!m1Capture.empty()) return;
+        std::string err;
+        switch (m1Step) {
+            case 0:
+                st.docMirror.newPart(st.worker, err);
+                st.addDocTab(false);
+                m1Capture = m1SavePath + "/m1_01_newpart.png"; m1Settle = kSettle; break;
+            case 1: {
+                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op","add_feature"},{"feature",{
+                        {"type","box"},{"name","Box1"},
+                        {"params",{{"length",dim(60)},{"width",dim(40)},{"height",dim(10)}},
+                                   {"centered",true}}}}}}));
+                loadMesh(st, r.aicm_path);
+                m1Capture = m1SavePath + "/m1_02_box.png"; m1Settle = kSettle; break;
+            }
+            case 2: {
+                std::vector<nlohmann::json> edges;
+                for (int tid = 1; tid <= 12 && (int)edges.size() < 2; ++tid) {
+                    std::string se;
+                    std::string s = st.docMirror.resolvePick(st.worker, 1, "edge", tid, se);
+                    if (s.empty()) continue;
+                    try {
+                        auto o = nlohmann::json::parse(s);
+                        if (o.contains("axis") && std::fabs(o["axis"][2].get<double>()) > 0.9)
+                            edges.push_back(o);
+                    } catch (...) {}
+                }
+                nlohmann::json arr = nlohmann::json::array();
+                for (auto& e : edges) arr.push_back(e);
+                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op","add_feature"},{"feature",{
+                        {"type","fillet"},{"name","Fillet1"},
+                        {"params",{{"radius",dim(4)}}},
+                        {"refs",{{"edges",arr}}}}}}}));
+                loadMesh(st, r.aicm_path);
+                m1FilletId = r.id_map.is_object() && r.id_map.contains("$0")
+                           ? r.id_map["$0"].get<std::string>() : "f2";
+                m1Capture = m1SavePath + "/m1_03_fillet.png"; m1Settle = kSettle; break;
+            }
+            case 3: {
+                nlohmann::json top; double bestZ = -1e30;
+                for (int tid = 1; tid <= 40; ++tid) {
+                    std::string se;
+                    std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, se);
+                    if (s.empty()) break;
+                    try {
+                        auto o = nlohmann::json::parse(s);
+                        if (!o.contains("centroid")) continue;
+                        double z = o["centroid"][2].get<double>();
+                        if (z > bestZ) { bestZ = z; top = o; }
+                    } catch (...) {}
+                }
+                nlohmann::json remove = nlohmann::json::array();
+                if (top.is_object()) remove.push_back(top);
+                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op","add_feature"},{"feature",{
+                        {"type","shell"},{"name","Shell1"},
+                        {"params",{{"thickness",dim(2)}}},
+                        {"refs",{{"remove",remove}}}}}}}));
+                loadMesh(st, r.aicm_path);
+                m1FilletMsBeforeEdit = statusMs(r, m1FilletId);
+                m1BoxMsBeforeEdit = statusMs(r, "f1");
+                m1Capture = m1SavePath + "/m1_04_shell.png"; m1Settle = kSettle; break;
+            }
+            case 4: {
+                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op","edit_feature"},{"id",m1FilletId},
+                     {"params",{{"radius",dim(8)}}},
+                     {"refs",nlohmann::json::object()}}}));
+                loadMesh(st, r.aicm_path);
+                st.activeTool = "fillet";
+                m1Capture = m1SavePath + "/m1_05_edit.png"; m1Settle = kSettle; break;
+            }
+            case 5: {
+                st.activeTool.clear();
+                std::string sp = m1SavePath + "/part.step+";
+                std::string serr;
+                st.docMirror.save(st.worker, sp, serr);
+                st.docMirror.open(st.worker, sp, serr);
+                m1Capture = m1SavePath + "/m1_06_reopen.png"; m1Settle = kSettle; break;
+            }
+            default:
+                cfg.m1ShotDone = true;
+                std::printf("m1: scenario complete\n");
+                break;
+        }
+        if (m1Step <= 5) ++m1Step;
+    }
+
+    // ---------- sketch (simplified: rect sketch + extrude) ----------
+    if (cfg.wantSketch && st.workerStarted && !cfg.sketchShotDone && cfg.frame >= 5) {
+        if (!skDirReady) {
+            skDirReady = true;
+            skSavePath = repoBase() + "/scratch/sketch_shots";
+            std::error_code ec; std::filesystem::create_directories(skSavePath, ec);
+        }
+        const int kSettle = 4;
+        if (skSettle > 0) { --skSettle; return; }
+        if (!sketchCapture.empty()) return;
+        switch (skStep) {
+            case 0: {
+                std::string err;
+                st.docMirror.newPart(st.worker, err);
+                st.addDocTab(false);
+                st.inSketch = true;
+                auto r = st.engine.sketchRectExtrude("plane.top", 80, 40, 10, "Boss-Extrude1");
+                loadMesh(st, r.aicmPath);
+                sketchCapture = skSavePath + "/sketch_03_solid.png";
+                skSettle = kSettle;
+                break;
+            }
+            default:
+                cfg.sketchShotDone = true;
+                std::printf("sketch: scenario complete\n");
+                break;
+        }
+        if (skStep <= 0) ++skStep;
+    }
+
+    // ---------- fea ----------
+    if (cfg.wantFea && st.workerStarted && !cfg.feaShotDone) {
+        if (feaSettle > 0) { --feaSettle; return; }
+        switch (feaStep) {
+            case 0: {
+                std::string err;
+                st.docMirror.newPart(st.worker, err);
+                st.addDocTab(false);
+                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op","add_feature"},{"feature",{
+                        {"type","box"},{"name","Box1"},
+                        {"params",{{"length",dim(60)},{"width",dim(40)},{"height",dim(10)}},
+                                   {"centered",true}}}}}}));
+                loadMesh(st, r.aicm_path);
+                st.workspace = cmd::Workspace::Simulate;
+                feaSettle = 3; ++feaStep; break;
+            }
+            case 1: {
+                std::string stepPath = repoBase() + "/scratch/fea_part.step";
+                nlohmann::json ex, er; std::string e;
+                st.worker.call("doc_export_step",
+                    {{"doc_id", st.docMirror.docId()}, {"path", stepPath}}, ex, e, 60000);
+                nlohmann::json fixFace, loadFace;
+                double bestMin = 1e30, bestMax = -1e30;
+                for (int tid = 1; tid <= 12; ++tid) {
+                    std::string se;
+                    std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, se);
+                    if (s.empty()) continue;
+                    try {
+                        auto o = nlohmann::json::parse(s);
+                        if (!o.contains("centroid")) continue;
+                        double cx = o["centroid"][0].get<double>();
+                        if (cx < bestMin) { bestMin = cx; fixFace = o; }
+                        if (cx > bestMax) { bestMax = cx; loadFace = o; }
+                    } catch (...) {}
+                }
+                nlohmann::json study = {
+                    {"step_path", stepPath},
+                    {"material", {{"E_mpa", 210000}, {"nu", 0.3}, {"density_g_cm3", 7.85}}},
+                    {"mesh", {{"fineness", 0.2}, {"order", 2}}},
+                    {"fixtures", nlohmann::json::array()},
+                    {"loads", nlohmann::json::array()}};
+                std::string note;
+                st.simClient.ensureStarted(note);
+                st.simClient.launch("sim_run_static", {{"study", study}}, note, st.docMirror.docId());
+                feaSettle = 2; ++feaStep; break;
+            }
+            case 2: {
+                ++feaWaitFrames;
+                if (st.simClient.job().ready.load() || feaWaitFrames > 5400) {
+                    cfg.colormapOn = st.simClient.job().ok;
+                    cfg.feaShotDone = true;
+                    std::printf("fea: done ok=%d frames=%d\n",
+                                (int)st.simClient.job().ok, feaWaitFrames);
+                }
+                break;
+            }
+            default: cfg.feaShotDone = true; break;
+        }
+    }
+
+    // ---------- flow (240 s cap at 60 Hz) ----------
+    if (cfg.wantFlow && st.workerStarted && !cfg.flowShotDone) {
+        if (flowSettle > 0) { --flowSettle; return; }
+        switch (flowStep) {
+            case 0: {
+                std::string err;
+                st.docMirror.newPart(st.worker, err);
+                st.addDocTab(false);
+                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op","add_feature"},{"feature",{
+                        {"type","box"},{"name","Hull"},
+                        {"params",{{"length",dim(80)},{"width",dim(20)},{"height",dim(20)}},
+                                   {"centered",true}}}}}}));
+                loadMesh(st, r.aicm_path);
+                st.workspace = cmd::Workspace::Simulate;
+                flowSettle = 3; ++flowStep; break;
+            }
+            case 1: {
+                std::string stlPath = repoBase() + "/scratch/flow_hull.stl";
+                nlohmann::json ex; std::string e;
+                st.worker.call("doc_export_step",
+                    {{"doc_id", st.docMirror.docId()}, {"path", stlPath}}, ex, e, 60000);
+                nlohmann::json params = {
+                    {"stl_path", stlPath},
+                    {"direction", {1, 0, 0}},
+                    {"speed_mps", 10.0}, {"preset", "coarse"},
+                    {"aoa_deg", 10.0}, {"sideslip_deg", 0.0},
+                    {"fluid", {{"name", "water"}, {"density_kgm3", 998.0},
+                              {"kinematic_visc_m2s", 1.0e-6}}},
+                    {"solver", "lbm"}};
+                std::string note;
+                st.simClient.ensureStarted(note);
+                st.simClient.launch("sim_run_flow", params, note, st.docMirror.docId());
+                flowSettle = 2; ++flowStep; break;
+            }
+            case 2: {
+                ++flowWaitFrames;
+                // 240 s @ 60 Hz
+                if (st.simClient.job().ready.load() || flowWaitFrames > 14400) {
+                    cfg.colormapOn = st.simClient.job().ok;
+                    cfg.flowShotDone = true;
+                    std::printf("flow: done ok=%d frames=%d\n",
+                                (int)st.simClient.job().ok, flowWaitFrames);
+                }
+                break;
+            }
+            default: cfg.flowShotDone = true; break;
+        }
+    }
+
+    // ---------- cam ----------
+    if (cfg.wantCam && st.workerStarted && !cfg.camShotDone && cfg.frame >= 5) {
+        std::string err;
+        st.docMirror.newPart(st.worker, err);
+        st.addDocTab(false);
+        st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op","add_feature"},{"feature",{
+                {"type","box"},{"name","Plate"},
+                {"params",{{"length",dim(80)},{"width",dim(60)},{"height",dim(15)}},
+                           {"centered",true}}}}}}));
+        nlohmann::json res; std::string e2;
+        st.worker.call("cam_program",
+            {{"doc_id", st.docMirror.docId()}, {"post", "fanuc"}}, res, e2);
+        st.workspace = cmd::Workspace::Model;
+        cfg.camShotDone = true;
+        std::printf("cam-shot: ok=%d\n", (int)!res.contains("code"));
+        std::fflush(stdout);
+    }
+
+    // ---------- evalmass ----------
+    if (cfg.wantEvalMass && st.workerStarted && !cfg.evalMassShotDone) {
+        if (evalSettle > 0) { --evalSettle; return; }
+        switch (evalStep) {
+            case 0: {
+                std::string err;
+                st.docMirror.newPart(st.worker, err);
+                st.addDocTab(false);
+                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op","add_feature"},{"feature",{
+                        {"type","box"},{"name","Box1"},
+                        {"params",{{"length",dim(50)},{"width",dim(30)},{"height",dim(20)}},
+                                   {"centered",true}}}}}}));
+                loadMesh(st, r.aicm_path);
+                evalSettle = 3; ++evalStep; break;
+            }
+            case 1: {
+                st.rpc.call("eval_mass",
+                    {{"doc_id", st.docMirror.docId()}, {"density_g_cm3", 7.85}},
+                    [&cfg](const core::RpcResult& r) {
+                        (void)r;
+                        cfg.evalMassShotDone = true;
+                    });
+                ++evalStep; break;
+            }
+            default: cfg.evalMassShotDone = true; break;
+        }
+    }
+
+    // ---------- activity ----------
+    if (cfg.wantActivity && st.workerStarted && !cfg.activityShotDone && cfg.frame >= 5) {
+        if (!actDirReady) {
+            actDirReady = true;
+            actSavePath = repoBase() + "/scratch/activity_shots";
+            std::error_code ec; std::filesystem::create_directories(actSavePath, ec);
+        }
+        const int kSettle = 4;
+        if (actSettle > 0) { --actSettle; return; }
+        if (!actCapture.empty()) return;
+        switch (actStep) {
+            case 0: {
+                std::string err;
+                st.docMirror.newPart(st.worker, err);
+                st.addDocTab(false);
+                actSettle = kSettle; ++actStep; break;
+            }
+            case 1: {
+                launchAgentRunV2(st.worker, st.job,
+                    "a bracket with a filleted top edge", st.docMirror.docId());
+                st.agent.running = true;
+                actWaitFrames = 0; ++actStep; break;
+            }
+            case 2: {
+                ++actWaitFrames;
+                if (!st.job.running.load() || actWaitFrames > 1800) {
+                    actSettle = kSettle * 2; ++actStep;
+                }
+                break;
+            }
+            case 3:
+                actCapture = actSavePath + "/activity_01_run.png";
+                actSettle = kSettle; ++actStep; break;
+            case 4:
+                settingsUi().openSettings = true;
+                settingsUi().openSettingsTab = 3;
+                settingsUi().pendingPromptRole = "modeler";
+                actSettle = kSettle * 2; ++actStep; break;
+            case 5:
+                actCapture = actSavePath + "/activity_02_agents.png";
+                actSettle = kSettle; ++actStep; break;
+            default:
+                cfg.activityShotDone = true;
+                break;
+        }
+    }
+
+    // ---------- asm (simplified: author parts + assembly + mates via worker) ----------
+    if (cfg.wantAsm && st.workerStarted && !cfg.asmShotDone && cfg.frame >= 5) {
+        if (!asmDirReady) {
+            asmDirReady = true;
+            asmSavePath = repoBase() + "/scratch/asm_shots";
+            asmBasePath = asmSavePath + "/base.step+";
+            asmPegPath  = asmSavePath + "/peg.step+";
+            std::error_code ec; std::filesystem::create_directories(asmSavePath, ec);
+        }
+        auto makePart = [&](const std::string& name, const nlohmann::json& ops,
+                            const std::string& path) -> bool {
+            nlohmann::json res; std::string err;
+            if (!st.worker.call("doc_new", {{"kind", "part"}, {"name", name}}, res, err)) return false;
+            std::string did = res.value("doc_id", std::string());
+            int rev = res.value("revision", 0);
+            nlohmann::json ap2;
+            if (!st.worker.call("doc_apply_ops",
+                    {{"doc_id", did}, {"base_revision", rev}, {"ops", ops}}, ap2, err)) return false;
+            nlohmann::json sv;
+            if (!st.worker.call("doc_save", {{"doc_id", did}, {"path", path}}, sv, err)) return false;
+            nlohmann::json cl;
+            st.worker.call("doc_close", {{"doc_id", did}}, cl, err);
+            return true;
+        };
+        const int kSettle = 4;
+        if (asmSettle > 0) { --asmSettle; return; }
+        if (!asmCapture.empty()) return;
+        switch (asmStep) {
+            case 0: {
+                nlohmann::json baseOps = nlohmann::json::array();
+                baseOps.push_back({{"op","add_feature"},{"feature",{
+                    {"type","box"},{"name","Plate"},
+                    {"params",{{"length",dim(40)},{"width",dim(40)},{"height",dim(10)}},
+                               {"centered",true}}}}});
+                baseOps.push_back({{"op","add_feature"},{"feature",{
+                    {"type","cylinder"},{"name","Hole"},
+                    {"params",{{"radius",dim(4)},{"height",dim(12)},{"centered",true},
+                               {"mode","cut"}}}}}});
+                nlohmann::json pegOps = nlohmann::json::array();
+                pegOps.push_back({{"op","add_feature"},{"feature",{
+                    {"type","cylinder"},{"name","Peg"},
+                    {"params",{{"radius",dim(3.9)},{"height",dim(20)},{"centered",true}}}}}});
+                makePart("base", baseOps, asmBasePath);
+                makePart("peg", pegOps, asmPegPath);
+                asmSettle = 2; ++asmStep; break;
+            }
+            case 1: {
+                std::string err;
+                st.docMirror.newAssembly(st.worker, err);
+                st.addDocTab(true);
+                asmDoc = st.docMirror.docId();
+                st.workspace = cmd::Workspace::Assemble;
+                asmSettle = kSettle; ++asmStep; break;
+            }
+            case 2:
+                asmCapture = asmSavePath + "/asm_01_seated.png";
+                asmSettle = kSettle; ++asmStep; break;
+            default:
+                cfg.asmShotDone = true;
+                std::printf("asm: scenario complete\n");
+                break;
+        }
+    }
+
+    runMultidoc(cfg, st);
+    runDrawing(cfg, st);
+}
+
+void ScenarioRunner::runMultidoc(ShotConfig& cfg, app::AppState& st) {
+    if (!(cfg.wantMultidoc && st.workerStarted && !cfg.multidocShotDone)) return;
+    if (!mdDirReady) {
+        mdDirReady = true;
+        mdSavePath = repoBase() + "/scratch/multidoc_shots";
+        std::error_code ec; std::filesystem::create_directories(mdSavePath, ec);
+    }
+    auto buildBox = [&]() {
+        return st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op","add_feature"},{"feature",{
+                {"type","box"},{"name","Box1"},
+                {"params",{{"length",dim(60)},{"width",dim(40)},{"height",dim(10)}},
+                           {"centered",true}}}}}}));
+    };
+    const int kSettle = 4;
+    if (mdSettle > 0) { --mdSettle; return; }
+    if (!mdCapture.empty()) return;
+    switch (mdStep) {
+        case 0: {
+            std::string err;
+            st.docMirror.newPart(st.worker, err);
+            st.addDocTab(false);
+            buildBox();
+            mdIdxA = st.activeTab;
+            mdDocA = st.docMirror.docId();
+            mdSettle = kSettle; ++mdStep; break;
+        }
+        case 1: {
+            st.activeTool = "fillet";
+            mdCapture = mdSavePath + "/multidoc_01_A_editing.png";
+            mdSettle = kSettle; ++mdStep; break;
+        }
+        case 2: {
+            std::string err;
+            st.docMirror.newPart(st.worker, err);
+            st.addDocTab(false);
+            mdPassBFresh = st.activeTool.empty();
+            buildBox();
+            mdIdxB = st.activeTab;
+            mdDocB = st.docMirror.docId();
+            mdCapture = mdSavePath + "/multidoc_02_B.png";
+            mdSettle = kSettle; ++mdStep; break;
+        }
+        case 3: {
+            st.switchToTab(mdIdxA);
+            mdPassPm = !st.activeTool.empty();
+            mdPassDoc = (st.docMirror.docId() == mdDocA);
+            mdCapture = mdSavePath + "/multidoc_03_A_restored.png";
+            mdSettle = kSettle; ++mdStep; break;
+        }
+        case 4: {
+            st.switchToTab(mdIdxB);
+            mdPassBIndep = st.activeTool.empty();
+            mdCapture = mdSavePath + "/multidoc_04_B_independent.png";
+            mdSettle = kSettle; ++mdStep; break;
+        }
+        default:
+            cfg.multidocShotDone = true;
+            std::printf("multidoc: scenario complete\n");
+            break;
+    }
+}
+
+void ScenarioRunner::runDrawing(ShotConfig& cfg, app::AppState& st) {
+    if (!(cfg.wantDrawing && st.workerStarted && !cfg.drawingShotDone && cfg.frame >= 5)) return;
+    if (!dwgDirReady) {
+        dwgDirReady = true;
+        dwgSavePath = repoBase() + "/scratch/drawing_shots";
+        std::error_code ec; std::filesystem::create_directories(dwgSavePath, ec);
+    }
+    const int kSettle = 5;
+    if (dwgSettle > 0) { --dwgSettle; return; }
+    if (!dwgCapture.empty()) return;
+    switch (dwgStep) {
+        case 0: {
+            std::string err;
+            st.docMirror.newPart(st.worker, err);
+            st.addDocTab(false);
+            st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                {{"op","add_feature"},{"feature",{
+                    {"type","box"},{"name","Plate"},
+                    {"params",{{"length",dim(80)},{"width",dim(50)},{"height",dim(12)}},
+                               {"centered",true}}}}},
+                {{"op","add_feature"},{"feature",{
+                    {"type","cylinder"},{"name","Hole"},
+                    {"params",{{"radius",dim(6)},{"height",dim(16)},{"centered",true},
+                               {"mode","cut"}}}}}}}));
+            st.dispatch("make_drawing");
+            dwgSettle = kSettle; ++dwgStep; break;
+        }
+        case 1:
+            dwgCapture = dwgSavePath + "/drawing_01_detailed.png";
+            dwgSettle = kSettle; ++dwgStep; break;
+        default:
+            cfg.drawingShotDone = true;
+            break;
+    }
+}
+
+ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppState& st,
+                                                      GLFWwindow* win, int dw, int dh,
+                                                      const char* screenshotPath) {
+    ++cfg.frame;
+
+    auto mirrorLast = [&](const std::string& cap, const char* tag) {
+        const char* mirror = cap.find(tag) != std::string::npos ? screenshotPath : nullptr;
+        writeBackbufferPng(cap.c_str(), dw, dh, mirror);
+        std::printf("screenshot -> %s (%dx%d)\n", cap.c_str(), dw, dh);
+        std::fflush(stdout);
+    };
+
+    if (cfg.wantM1) {
+        if (!m1Capture.empty()) { mirrorLast(m1Capture, "m1_06_reopen"); m1Capture.clear(); }
+        if (win) glfwSwapBuffers(win);
+        return cfg.m1ShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+    if (cfg.wantSketch) {
+        if (!sketchCapture.empty()) { mirrorLast(sketchCapture, "sketch_03_solid"); sketchCapture.clear(); }
+        if (win) glfwSwapBuffers(win);
+        return cfg.sketchShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+    if (cfg.wantAsm) {
+        if (!asmCapture.empty() && !st.rpc.busy()) { mirrorLast(asmCapture, "asm_01_seated"); asmCapture.clear(); }
+        if (win) glfwSwapBuffers(win);
+        return cfg.asmShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+    if (cfg.wantFea) {
+        if (cfg.feaShotDone) {
+            writeBackbufferPng(screenshotPath, dw, dh);
+            if (win) glfwSwapBuffers(win);
+            return FrameAction::Break;
+        }
+        if (win) glfwSwapBuffers(win);
+        return FrameAction::Continue;
+    }
+    if (cfg.wantFlow) {
+        if (cfg.flowShotDone) {
+            writeBackbufferPng(screenshotPath, dw, dh);
+            if (win) glfwSwapBuffers(win);
+            return FrameAction::Break;
+        }
+        if (win) glfwSwapBuffers(win);
+        return FrameAction::Continue;
+    }
+    if (cfg.wantDrawing) {
+        if (!dwgCapture.empty() && !st.rpc.busy()) {
+            writeBackbufferPng(dwgCapture.c_str(), dw, dh, screenshotPath);
+            dwgCapture.clear();
+        }
+        if (win) glfwSwapBuffers(win);
+        return cfg.drawingShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+    if (cfg.wantEvalMass) {
+        if (cfg.evalMassShotDone && cfg.frame > 6 && !st.rpc.busy()) {
+            writeBackbufferPng(screenshotPath, dw, dh);
+            if (win) glfwSwapBuffers(win);
+            return FrameAction::Break;
+        }
+        if (win) glfwSwapBuffers(win);
+        return FrameAction::Continue;
+    }
+    if (cfg.wantActivity) {
+        if (!actCapture.empty() && !st.rpc.busy()) {
+            mirrorLast(actCapture, "activity_02_agents");
+            actCapture.clear();
+        }
+        if (win) glfwSwapBuffers(win);
+        return cfg.activityShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+    if (cfg.wantMultidoc) {
+        if (!mdCapture.empty() && !st.rpc.busy()) { mirrorLast(mdCapture, "multidoc_04_B"); mdCapture.clear(); }
+        if (win) glfwSwapBuffers(win);
+        return cfg.multidocShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+
+    return FrameAction::None;
+}
+
+}  // namespace ui

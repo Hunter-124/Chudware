@@ -13,6 +13,8 @@
 #include "async_rpc.h"
 #include "render/id_pass.h"
 
+namespace ui { class PropertyManager; }
+
 namespace ui::sketch {
 
 enum class ToastLevel { Info, Warn, Error };
@@ -28,18 +30,20 @@ struct SketchClipboard {
 
 struct SketchHost;
 
-// Property-manager hooks the full port expects; nullptr until C2/C3 panels land.
+// Property-manager hooks — delegates to ui::PropertyManager when wired (C2).
 struct SketchPmSeam {
-    bool active() const { return false; }
-    bool activeWellWantsPlane() const { return false; }
-    bool activeWellWantsAxis() const { return false; }
-    bool activeWellWantsPathFeature() const { return false; }
-    std::string previewFeatureId() const { return {}; }
-    std::vector<std::string> pathHighlightFeatureIds() const { return {}; }
+    ui::PropertyManager* pm = nullptr;
+
+    bool active() const;
+    bool activeWellWantsPlane() const;
+    bool activeWellWantsAxis() const;
+    bool activeWellWantsPathFeature() const;
+    std::string previewFeatureId() const;
+    std::vector<std::string> pathHighlightFeatureIds() const;
     std::vector<std::string> regionCandidateSketches(SketchHost& st) const;
-    bool wantsRegionPicker() const { return false; }
-    bool sectionsAreOrdered() const { return false; }
-    std::vector<nlohmann::json> profilePicks() const { return {}; }
+    bool wantsRegionPicker() const;
+    bool sectionsAreOrdered() const;
+    std::vector<nlohmann::json> profilePicks() const;
     void setProfilePicks(SketchHost& st, const std::vector<nlohmann::json>& sels) const;
     bool routeDatumPlane(const std::string& datumId, const std::string& label = "") const;
     bool routeDatumAxis(const std::string& fid, const std::string& name) const;
@@ -81,7 +85,7 @@ struct SketchHost {
     core::AsyncRpc& rpc() { return app.rpc; }
     const core::AsyncRpc& rpc() const { return app.rpc; }
 
-    bool ips() const { return false; }  // MMGS until units land on AppState
+    bool ips() const { return app.units == "in"; }
 
     void toast(ToastLevel lvl, const std::string& msg);
     void addLog(const std::string& msg);

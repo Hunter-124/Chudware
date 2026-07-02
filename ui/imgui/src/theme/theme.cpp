@@ -1,6 +1,8 @@
 #include "theme/theme.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <unordered_map>
 
 namespace theme {
 
@@ -12,6 +14,17 @@ ImFont* font(Font f) { return g.fonts[(int)f]; }
 
 void setViewportBackdrop(const ViewportBackdrop& backdrop) { gBackdrop = backdrop; }
 const ViewportBackdrop& viewportBackdrop() { return gBackdrop; }
+
+// ---- luminance bridge (viewport registers, theme consumes; contract §2/A7) ---------------------
+static LuminanceSampler gLuminanceSampler = nullptr;
+
+void setLuminanceSampler(LuminanceSampler fn) { gLuminanceSampler = fn; }
+float sampleLuminance(ImVec2 mn, ImVec2 mx) {
+    return gLuminanceSampler ? gLuminanceSampler(mn, mx) : -1.f;
+}
+
+// Stable, window-independent panel-surface id (A1).
+ImGuiID panelId(const char* label) { return ImHashStr(label); }
 
 static ImFont* loadFont(const std::string& dir, const char* file, float px,
                         const ImWchar* ranges = nullptr) {
@@ -149,26 +162,89 @@ void apply() {
     s.ScaleAllSizes(g.scale);
 }
 
-// ---- adaptive contrast --------------------------------------------------------
+// ---- adaptive contrast (contract §2; theme-independent vibrancy tokens) -------
 AdaptiveSurface adaptiveSurface(float avgLuminance) {
     const Palette& p = g.pal;
     AdaptiveSurface out{};
-    out.tint = vec(p.glassBg);
 
-    if (avgLuminance < 0.35f) {
-        out.textPrimary   = vec(p.vibrancyLightPrimary);
-        out.textSecondary = vec(p.vibrancyLightSecondary);
-        out.tint.w *= 1.05f;
-    } else if (avgLuminance > 0.65f) {
-        out.textPrimary   = vec(p.vibrancyDarkPrimary);
-        out.textSecondary = vec(p.vibrancyDarkSecondary);
-        if (avgLuminance > 0.55f)
-            out.textSecondary.w = std::min(out.textSecondary.w, 0.85f);
-    } else {
+    if (avgLuminance < 0.f) {
+        // No live backdrop: theme-dependent palette fallback (chrome). darkText per A13 — dark
+        // theme's txt0 is LIGHT text (darkText=false), light theme's txt0 is dark (darkText=true).
+        out.tint          = vec(p.glassBg);
         out.textPrimary   = vec(p.txt0);
         out.textSecondary = vec(p.txt1);
+        out.textTertiary  = vec(p.txt2);
+        out.darkText      = !g.dark;
+        out.scrim         = 0.f;
+        return out;
     }
+
+    // Live backdrop: theme-independent — tone comes solely from sampled luminance.
+    const float l = avgLuminance;
+    out.darkText      = l > 0.50f;
+    out.textPrimary   = out.darkText ? vec(p.vibrancyDarkPrimary)   : vec(p.vibrancyLightPrimary);
+    out.textSecondary = out.darkText ? vec(p.vibrancyDarkSecondary) : vec(p.vibrancyLightSecondary);
+    out.textTertiary  = out.darkText ? vec(p.vibrancyDarkTertiary)  : vec(p.vibrancyLightTertiary);
+
+    // Contrast scrim: strongest at mid-luminance (ambiguous backdrop), tapering at the extremes.
+    const float scrim = 0.10f + 0.26f * (1.f - fabsf(l - 0.5f) * 2.f);
+    out.scrim = scrim;
+    out.tint  = out.darkText ? ImVec4(0.97f, 0.98f, 1.00f, scrim)
+                              : ImVec4(0.055f, 0.075f, 0.10f, scrim);
     return out;
+}
+
+// ---- adaptive panel (hysteretic + temporally smoothed, A1/A2) -----------------
+const AdaptiveSurface& adaptivePanel(ImGuiID id, const ImRect& rect) {
+    struct State {
+        int             lastFrame = -1;
+        float           lum = -1.f;
+        bool            dark = false;
+        AdaptiveSurface cur;
+    };
+    static std::unordered_map<ImGuiID, State> states;
+    static AdaptiveSurface stateless;
+
+    const float sampled = sampleLuminance(rect.Min, rect.Max);
+    if (sampled < 0.f) {
+        // Stateless palette fallback — no persistent id lookup, recomputed fresh (cheap).
+        stateless = adaptiveSurface(-1.f);
+        return stateless;
+    }
+
+    State& st = states[id];
+    const int frame = ImGui::GetFrameCount();
+    if (st.lastFrame == frame) return st.cur;   // A2: idempotent per frame
+    st.lastFrame = frame;
+
+    if (g.reduceMotion || st.lum < 0.f) {
+        st.lum = sampled;   // snap: reduced motion, or first sample for this id
+    } else {
+        st.lum = approach(st.lum, sampled, ImGui::GetIO().DeltaTime, motion::adaptive);
+    }
+
+    // Hysteresis: only flip tone once the smoothed luminance clears the far threshold.
+    st.dark = st.lum > 0.58f ? true : (st.lum < 0.42f ? false : st.dark);
+
+    // Decisive VIRTUAL luminance for text tone (never mid-gray); REAL smoothed lum drives scrim.
+    const float virt = st.dark ? std::max(st.lum, 0.66f) : std::min(st.lum, 0.34f);
+    AdaptiveSurface surf = adaptiveSurface(virt);
+    const float realScrim = 0.10f + 0.26f * (1.f - fabsf(st.lum - 0.5f) * 2.f);
+    surf.scrim  = realScrim;
+    surf.tint.w = realScrim;
+
+    st.cur = surf;
+    return st.cur;
+}
+
+// ---- glass text (contrast halo, A8: raw white/black permitted in theme.cpp) ---
+void glassText(ImDrawList* dl, ImFont* font, float size, ImVec2 pos,
+              const AdaptiveSurface& s, const char* text, const char* textEnd) {
+    const ImU32 haloCol = s.darkText
+        ? ImGui::ColorConvertFloat4ToU32(ImVec4(1.f, 1.f, 1.f, 0.30f))
+        : ImGui::ColorConvertFloat4ToU32(ImVec4(0.f, 0.f, 0.f, 0.38f));
+    dl->AddText(font, size, ImVec2(pos.x, pos.y + 1.f * S()), haloCol, text, textEnd);
+    dl->AddText(font, size, pos, ImGui::ColorConvertFloat4ToU32(s.textPrimary), text, textEnd);
 }
 
 // ---- glassBackground (5-layer, host/ui_theme.cpp) -----------------------------
@@ -289,39 +365,86 @@ void glassRowAtCursor(float rounding, bool stripe, bool selected, float rowPadV)
     glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, rounding, stripe, selected, wash);
 }
 
-void glassPanel(ImDrawList* dl, const ImRect& rect, MaterialLevel level,
-                float rounding, float avgLuminance, float alpha) {
+// Core renderer shared by both glassPanel overloads (contract §2).
+static void glassPanelCore(ImDrawList* dl, const ImRect& rect, MaterialLevel level,
+                           float rounding, const AdaptiveSurface& surf, float alpha) {
     const MaterialToken mat = materialToken(level);
     const Metrics& m = g.m;
-    const float r = (rounding < 0.f ? m.roundingLg : rounding) * S();
+    const float s = S();
+    const float r = (rounding < 0.f ? m.roundingLg : rounding) * s;
     const ImVec2 mn = rect.Min;
     const ImVec2 mx = rect.Max;
 
-    AdaptiveSurface surf = avgLuminance >= 0.f ? adaptiveSurface(avgLuminance)
-                                             : AdaptiveSurface{vec(g.pal.glassBg), vec(g.pal.txt0), vec(g.pal.txt1)};
-
     const ViewportBackdrop& bd = viewportBackdrop();
     if (bd.valid()) {
-        ImU32 imgCol = IM_COL32(255, 255, 255, (int)(255.f * alpha));
-        dl->AddImageRounded((ImTextureID)(intptr_t)bd.textureId, mn, mx,
-                            bd.uvMin, bd.uvMax, imgCol, r);
+        // Project the panel rect into backdrop UV space (per-rect, not whole-texture — DEFECT 2
+        // fix): clamped 0..1 so a rect that spills past the viewport image clamps into the edge
+        // texel band (intended frosted edge-bleed for docked side panels).
+        const float invW = 1.f / (bd.screenMax.x - bd.screenMin.x);
+        const float invH = 1.f / (bd.screenMax.y - bd.screenMin.y);
+        auto projectUV = [&](const ImVec2& p) -> ImVec2 {
+            float u = (p.x - bd.screenMin.x) * invW;
+            float v = (p.y - bd.screenMin.y) * invH;
+            u = std::min(1.f, std::max(0.f, u));
+            v = std::min(1.f, std::max(0.f, v));
+            if (bd.flipV) v = 1.f - v;
+            return ImVec2(bd.uvMin.x + (bd.uvMax.x - bd.uvMin.x) * u,
+                          bd.uvMin.y + (bd.uvMax.y - bd.uvMin.y) * v);
+        };
+        const ImVec2 uv0 = projectUV(mn);
+        const ImVec2 uv1 = projectUV(mx);
+        const ImU32 imgCol = IM_COL32(255, 255, 255, (int)(255.f * alpha));
+        dl->AddImageRounded((ImTextureID)(intptr_t)bd.textureId, mn, mx, uv0, uv1, imgCol, r);
+
+        // Material wash + the surface's own contrast scrim, capped — the blur already carries
+        // most legibility so this stays a light finishing tint.
+        float tintA = mat.tintAlpha * 0.55f + surf.scrim;
+        tintA = std::min(tintA, 0.62f);
         ImVec4 tint = surf.tint;
-        tint.w = mat.tintAlpha * alpha;
+        tint.w = tintA * alpha;
         dl->AddRectFilled(mn, mx, ImGui::ColorConvertFloat4ToU32(tint), r);
     } else {
-        glassBackground(dl, mn, mx, r / S(), alpha);
+        // Layered fallback when no live backdrop (first frame / hidden viewport, A6).
+        glassBackground(dl, mn, mx, r / s, alpha);
         ImVec4 tint = surf.tint;
         tint.w = mat.tintAlpha * 0.5f * alpha;
         if (tint.w > 0.001f)
             dl->AddRectFilled(mn, mx, ImGui::ColorConvertFloat4ToU32(tint), r);
     }
 
+    // Edge effects (both paths): (1) top specular (2) inner rim (3) bottom shadow (4) outer
+    // border — all widths *S().
+    const float hairline = 1.f * s;
+    const float strokeW  = 1.5f * s;
+    const float inset    = r * 0.6f;
+
     const float hiA = g.dark ? 0.11f : 0.14f;
-    const float lineY = mn.y + 1.5f * S();
-    const float inset = r * 0.6f;
+    const float lineY = mn.y + strokeW;
     dl->AddLine(ImVec2(mn.x + inset, lineY), ImVec2(mx.x - inset, lineY),
-                roleU32A(g.pal.glassHighlight, hiA * alpha), 1.5f * S());
-    dl->AddRect(mn, mx, roleU32(g.pal.glassBorder, alpha), r, 0, 1.5f * S());
+                roleU32A(g.pal.glassHighlight, hiA * alpha), strokeW);
+
+    const float rimA = (g.dark ? 0.06f : 0.10f) * alpha;
+    const ImVec2 rimMn(mn.x + hairline, mn.y + hairline);
+    const ImVec2 rimMx(mx.x - hairline, mx.y - hairline);
+    const float rimR = std::max(0.f, r - hairline);
+    dl->AddRect(rimMn, rimMx, roleU32A(g.pal.glassHighlight, rimA), rimR, 0, hairline);
+
+    const float shY = mx.y - hairline * 0.5f;
+    dl->AddLine(ImVec2(mn.x + inset, shY), ImVec2(mx.x - inset, shY),
+                roleU32A(g.pal.glassShadow, 0.22f * alpha), hairline);
+
+    dl->AddRect(mn, mx, roleU32(g.pal.glassBorder, 0.75f * alpha), r, 0, strokeW);
+}
+
+void glassPanel(ImDrawList* dl, const ImRect& rect, MaterialLevel level,
+                float rounding, float avgLuminance, float alpha) {
+    AdaptiveSurface surf = avgLuminance >= 0.f ? adaptiveSurface(avgLuminance) : adaptiveSurface(-1.f);
+    glassPanelCore(dl, rect, level, rounding, surf, alpha);
+}
+
+void glassPanel(ImDrawList* dl, const ImRect& rect, MaterialLevel level, float rounding,
+                const AdaptiveSurface& surf, float alpha) {
+    glassPanelCore(dl, rect, level, rounding, surf, alpha);
 }
 
 } // namespace theme

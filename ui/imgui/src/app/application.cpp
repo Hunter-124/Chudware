@@ -2,6 +2,8 @@
 #include "app/app_state.h"
 #include "ui/layout.h"
 #include "ui/panels.h"
+#include "ui/viewport.h"
+#include "ui/scenarios.h"
 #include "ui/cursors.h"
 #include "ui/command_search.h"
 #include "ui/file_explorer.h"
@@ -9,7 +11,6 @@
 #include "theme/theme.h"
 
 #include "viewport_impl.h"
-#include "render/aicm_loader.h"
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -33,7 +34,7 @@ bool Application::init(GLFWwindow* window, const std::string& resourcesDir, floa
     g_state.seedDemo();
     ui::initCursors(window);
     if (glViewportReady_)
-        ui::setViewportPipeline(&glViewport_->renderer(), &glViewport_->idPass());
+        ui::setViewportPipeline(glViewport_);
     (void)resourcesDir; (void)scale;
     return true;
 }
@@ -48,36 +49,13 @@ void Application::shutdown() {
     glViewport_ = nullptr;
 }
 
-void Application::updateViewportBackdrop(AppState& s) {
-    if (!glViewportReady_ || !glViewport_ || !s.scene) return;
-    if (!s.engineReady || s.engine.aicmPath().empty()) return;
-    const int w = s.scene->width(), h = s.scene->height();
-    if (w < 8 || h < 8) return;
-
-    render::DocMesh doc;
-    std::string err;
-    if (!render::loadAicmFile(s.engine.aicmPath(), doc, err)) return;
-
-    glViewport_->resize(w, h);
-    if (!glViewport_->setDoc(doc, err)) return;
-    glViewport_->setSceneRevision(s.engine.revision());
-    glViewport_->render();
-
-    const auto bd = glViewport_->backdrop();
-    theme::ViewportBackdrop tbd;
-    tbd.textureId = bd.textureId;
-    tbd.uvMin = ImVec2(bd.uvMin[0], bd.uvMin[1]);
-    tbd.uvMax = ImVec2(bd.uvMax[0], bd.uvMax[1]);
-    theme::setViewportBackdrop(tbd);
-}
-
 void Application::frame() {
     AppState& s = g_state;
     ImGuiIO& io = ImGui::GetIO();
 
     s.rpc.drain();
+    ui::scenarioTick(s);
     s.tickDemoAgent(io.DeltaTime);
-    updateViewportBackdrop(s);
 
     if ((io.KeyCtrl || io.KeySuper) && ImGui::IsKeyPressed(ImGuiKey_K, false)) {
         s.paletteOpen = !s.paletteOpen;
@@ -182,8 +160,12 @@ void Application::frame() {
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     if (ImGui::Begin("Viewport###viewport", nullptr, pflags | ImGuiWindowFlags_NoScrollbar |
-                     ImGuiWindowFlags_NoScrollWithMouse))
+                     ImGuiWindowFlags_NoScrollWithMouse)) {
+        ui::setViewportBackdropActive(true);
         ui::drawViewport(s);
+    } else {
+        ui::setViewportBackdropActive(false);
+    }
     ImGui::End();
     ImGui::PopStyleVar();
 

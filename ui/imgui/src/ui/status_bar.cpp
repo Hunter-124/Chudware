@@ -68,6 +68,8 @@ void drawStatusBar(AppState& s, float height) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 wp = ImGui::GetWindowPos(), wsz = ImGui::GetWindowSize();
     dl->AddLine(wp, ImVec2(wp.x + wsz.x, wp.y), TCOL(line), 1.f);
+    dl->AddLine(ImVec2(wp.x, wp.y + wsz.y - 0.5f), ImVec2(wp.x + wsz.x, wp.y + wsz.y - 0.5f),
+                theme::roleU32A(theme::pal().line, 0.35f), 1.f);
 
     unsigned int dotRole = kind == 2 ? theme::pal().bad
                          : kind == 1 ? theme::pal().warn

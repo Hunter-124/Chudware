@@ -5,6 +5,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 #include "stb_image.h"
+#include "theme/icons_sdf.h"
 #include "theme/theme.h"
 
 #include <nlohmann/json.hpp>
@@ -18,9 +19,9 @@
 
 namespace ui {
 
-struct Cell {
-    float u0, v0, u1, v1;
-};
+// UV rect within a raster atlas texture — shared layout with icons_sdf::CellUV (icons_sdf.cpp
+// samples pixel data from the same atlas.json cells to derive SDF glyphs).
+using Cell = icons_sdf::CellUV;
 
 struct AtlasState {
     GLuint texDark  = 0;
@@ -115,6 +116,9 @@ void loadIcons(const std::string& assetsDir) {
         unsigned char* px = stbi_load(path.c_str(), &w, &h, &ch, 4);
         if (px) {
             gAtlas.texDark = uploadTexture(px, w, h);
+            // SDF derivation reads the still-live pixel buffer (shape is theme-independent, so
+            // deriving once from the dark atlas covers both themes) — freed right after.
+            icons_sdf::build(px, w, h, gAtlas.cells);
             stbi_image_free(px);
         } else {
             std::fprintf(stderr, "[icons] failed to load atlas_dark.png: %s\n", stbi_failure_reason());
@@ -142,6 +146,7 @@ void loadIcons(const std::string& assetsDir) {
 }
 
 void freeIcons() {
+    icons_sdf::shutdown();
     if (gAtlas.texDark)        { glDeleteTextures(1, &gAtlas.texDark);        gAtlas.texDark = 0; }
     if (gAtlas.texLight)       { glDeleteTextures(1, &gAtlas.texLight);       gAtlas.texLight = 0; }
     if (gAtlas.texPlaceholder) { glDeleteTextures(1, &gAtlas.texPlaceholder); gAtlas.texPlaceholder = 0; }
@@ -338,6 +343,8 @@ void draw(ImDrawList* dl, const char* name, ImVec2 c, float size, ImU32 col) {
     if (drawGlyph(dl, name, c, size, col)) return;
 
     const char* atlasName = resolveAtlasName(name);
+    if (icons_sdf::draw(dl, atlasName, c, size, col, 0)) return;
+
     const ui::IconUV icon = ui::getIcon(atlasName, pickCellSize(size));
     if (icon.valid) {
         const float r = size * 0.5f;
@@ -355,6 +362,17 @@ void draw(ImDrawList* dl, const char* name, ImVec2 c, float size, ImU32 col) {
     const float fs = size * 0.46f;
     const ImVec2 ts = f->CalcTextSizeA(fs, FLT_MAX, 0, mg);
     dl->AddText(f, fs, ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), col, mg);
+}
+
+// SDF path with a contrast halo; plain draw() (no halo) for glyphs with no SDF (raster atlas).
+void drawGlass(ImDrawList* dl, const char* name, ImVec2 c, float size, ImU32 col, ImU32 haloCol) {
+    const char* atlasName = resolveAtlasName(name);
+    if (icons_sdf::draw(dl, atlasName, c, size, col, haloCol)) return;
+    draw(dl, name, c, size, col);
+}
+
+bool hasSdf(const char* name) {
+    return icons_sdf::has(resolveAtlasName(name));
 }
 
 void inlineIcon(const char* name, float size, ImU32 col) {

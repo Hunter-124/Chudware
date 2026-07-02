@@ -41,6 +41,16 @@ enum class DisplayStyle {
     Wireframe,            // edges only over the background
 };
 
+namespace aicad::viewport {
+// GPU pass timings (ms), each backed by a double-buffered GL_TIME_ELAPSED query pair so a result
+// is polled without ever blocking the GL pipeline (see Renderer::glassTimings()). valid=false
+// until every phase (scene/blur/luma) has produced at least one polled result.
+struct GlassTimings {
+    float sceneMs = 0.f, blurMs = 0.f, lumaMs = 0.f;
+    bool valid = false;
+};
+}  // namespace aicad::viewport
+
 class Renderer {
 public:
     // One body of the displayed model: geometry + its display color (RGB 0..1).
@@ -269,6 +279,14 @@ public:
     // Mean relative luminance (Rec.709) under rect in top-left viewport coordinates.
     float averageLuminance(const ViewportRect& rect) const;
 
+    // GPU timings for the last polled scene-draw / blur-chain / luma-readback phases.
+    aicad::viewport::GlassTimings glassTimings() const;
+    // Master switch: when false, updateBackdropBlur() and the async luminance readback are
+    // skipped entirely each frame (averageLuminance() keeps returning the last-known grid value,
+    // or 0.5f if none was ever read back). Default true.
+    void setBackdropEnabled(bool on);
+    bool backdropEnabled() const { return backdropEnabled_; }
+
 private:
     // GPU buffers for one body.
     struct Sub {
@@ -302,6 +320,12 @@ private:
     void resolveColorTexture() const;  // SS colorTex_ -> final-size resolvedTex_ by box filter
     void updateBackdropBlur() const;   // resolvedTex_ -> quarter-res Kawase blur chain
 
+    // ---- F1 async luminance pipeline (contract N1 / A9 / A11 / A12) ----
+    void issueLumaReadback() const;   // one glReadPixels/frame -> PBO ring + fence, or A9 fallback
+    void issueLumaPboRead(unsigned int srcFbo, int srcW, int srcH) const;  // handles A11 resize
+    void pollLumaPbos() const;           // non-blocking glClientWaitSync poll of the ring
+    void reduceLumaPbo(int slot) const;  // map -> Rec.709 reduce -> staging -> published swap
+
     static constexpr int SS = 3;  // supersample factor for anti-aliasing (3x for crisp thin edges)
     static constexpr int kBlurPasses = 4;  // 4-tap Kawase passes (GLASS_DESIGN_SPEC)
     int w_ = 0, h_ = 0;           // final size
@@ -317,6 +341,35 @@ private:
     unsigned int downsampleProg_ = 0, kawaseProg_ = 0;
     mutable int blurW_ = 0, blurH_ = 0;
     mutable bool backdropDirty_ = true;
+
+    // ---- F1 async luminance pipeline: 3-slot PBO ring + fence, GPU-async, never blocks ----
+    static constexpr int kLumaPboCount = 3;
+    static constexpr int kLumaGridMaxW = 64, kLumaGridMaxH = 40;
+    mutable unsigned int lumaPbo_[kLumaPboCount] = {0, 0, 0};
+    mutable void* lumaFence_[kLumaPboCount] = {nullptr, nullptr, nullptr};  // GLsync, stored opaque
+    mutable bool lumaPboPending_[kLumaPboCount] = {false, false, false};
+    mutable int lumaPboW_[kLumaPboCount] = {0, 0, 0};  // (w,h) generation each slot was issued at
+    mutable int lumaPboH_[kLumaPboCount] = {0, 0, 0};  // (A11: detects a mid-flight blur resize)
+    mutable int lumaPboNext_ = 0;              // next ring slot to issue into
+    mutable int lumaSrcW_ = 0, lumaSrcH_ = 0;  // readback source size as of the last (re)spec
+    mutable unsigned int lumaFallbackCounter_ = 0;  // A9: every-8th-frame direct-read cadence
+    mutable std::vector<float> lumaGrid_;     // published grid, top-left row order, lumaW_*lumaH_
+    mutable std::vector<float> lumaStaging_;  // built off to the side, then swapped in (no tearing)
+    mutable int lumaW_ = 0, lumaH_ = 0;
+    mutable bool lumaEverRead_ = false;  // averageLuminance() returns 0.5f until this is true
+    bool backdropEnabled_ = true;
+
+    // ---- F1 GPU pass timing: 2 queries per phase, ping-ponged so a result never blocks ----
+    struct GpuTimerRing {
+        unsigned int id[2] = {0, 0};
+        bool pending[2] = {false, false};
+        int cur = 0;
+    };
+    static void beginGpuTimer(GpuTimerRing& t);
+    static void endGpuTimer(GpuTimerRing& t, float& outMs, bool& outValid);
+    mutable GpuTimerRing sceneTimer_, blurTimer_, lumaTimer_;
+    mutable float sceneMs_ = 0.f, blurMs_ = 0.f, lumaMs_ = 0.f;
+    mutable bool sceneTimingValid_ = false, blurTimingValid_ = false, lumaTimingValid_ = false;
     // C27-D: dedicated small offscreen target for the View Selector preview thumbnail. Lazily
     // allocated on the first renderThumbnail() call; reallocated only when the requested px changes.
     unsigned int thumbFbo_ = 0, thumbTex_ = 0, thumbDepth_ = 0;

@@ -3,6 +3,7 @@
 #include "sketch_internal.h"
 #include "sketch_palette.h"
 #include "ui/cursors.h"
+#include "ui/property_manager.h"
 #include "viewport/scene.h"
 #include "theme/theme.h"
 #include "ui/command_registry.h"
@@ -10,14 +11,26 @@
 
 namespace ui::sketch {
 
-static SketchPmSeam kNullPm;
+static SketchPmSeam kPmSeam;
+
+bool SketchPmSeam::active() const { return pm && pm->active(); }
+bool SketchPmSeam::activeWellWantsPlane() const { return pm && pm->activeWellWantsPlane(); }
+bool SketchPmSeam::activeWellWantsAxis() const { return pm && pm->activeWellWantsAxis(); }
+bool SketchPmSeam::activeWellWantsPathFeature() const { return pm && pm->activeWellWantsPathFeature(); }
+std::string SketchPmSeam::previewFeatureId() const { return pm ? pm->previewFeatureId() : std::string(); }
+std::vector<std::string> SketchPmSeam::pathHighlightFeatureIds() const {
+    return pm ? pm->pathHighlightFeatureIds() : std::vector<std::string>{};
+}
+bool SketchPmSeam::wantsRegionPicker() const { return pm && pm->wantsRegionPicker(); }
+bool SketchPmSeam::sectionsAreOrdered() const { return pm && pm->sectionsAreOrdered(); }
+std::vector<nlohmann::json> SketchPmSeam::profilePicks() const {
+    return pm ? pm->profilePicks() : std::vector<nlohmann::json>{};
+}
 
 SketchHost makeHost(app::AppState& app, Renderer* renderer) {
-    SketchHost h{app, renderer, &kNullPm};
+    kPmSeam.pm = &ui::propertyManager();
+    SketchHost h{app, renderer, &kPmSeam};
     sketchPalette().scale = theme::S();
-    if (app.scene) {
-        // Scene owns orbit state; sketch enter/exit will read/write via scene when wired in G2.
-    }
     h.sketchPlanePickActive = app.inSketch;
     return h;
 }
@@ -84,27 +97,23 @@ std::vector<SketchHost::SelItem> SketchHost::selectionItems() const {
 }
 
 std::vector<std::string> SketchPmSeam::regionCandidateSketches(SketchHost& st) const {
-    (void)st;
-    return {};
+    return pm ? pm->regionCandidateSketches(st.app) : std::vector<std::string>{};
 }
 
 void SketchPmSeam::setProfilePicks(SketchHost& st, const std::vector<nlohmann::json>& sels) const {
-    (void)st; (void)sels;
+    if (pm) pm->setProfilePicks(st.app, sels);
 }
 
 bool SketchPmSeam::routeDatumPlane(const std::string& datumId, const std::string& label) const {
-    (void)datumId; (void)label;
-    return false;
+    return pm && pm->routeDatumPlane(datumId, label);
 }
 
 bool SketchPmSeam::routeDatumAxis(const std::string& fid, const std::string& name) const {
-    (void)fid; (void)name;
-    return false;
+    return pm && pm->routeDatumAxis(fid, name);
 }
 
 bool SketchPmSeam::routePathFeature(const std::string& fid, const std::string& name, bool isCurve) const {
-    (void)fid; (void)name; (void)isCurve;
-    return false;
+    return pm && pm->routePathFeature(fid, name, isCurve);
 }
 
 }  // namespace ui::sketch

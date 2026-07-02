@@ -389,6 +389,16 @@ Renderer::~Renderer() {
     if (capVbo_) glDeleteBuffers(1, &capVbo_);
     if (capVao_) glDeleteVertexArrays(1, &capVao_);
     if (lutTex_) glDeleteTextures(1, &lutTex_);
+    // F1 async luminance pipeline: PBO ring + any outstanding fences.
+    for (int i = 0; i < kLumaPboCount; ++i) {
+        if (lumaFence_[i]) glDeleteSync(static_cast<GLsync>(lumaFence_[i]));
+        if (lumaPbo_[i]) glDeleteBuffers(1, &lumaPbo_[i]);
+    }
+    // F1 GPU pass timing: double-buffered GL_TIME_ELAPSED query pairs.
+    auto deleteGpuTimer = [](GpuTimerRing& t) { if (t.id[0]) glDeleteQueries(2, t.id); };
+    deleteGpuTimer(sceneTimer_);
+    deleteGpuTimer(blurTimer_);
+    deleteGpuTimer(lumaTimer_);
 }
 
 // SolidWorks-style "jet/rainbow" result ramp: blue -> cyan -> green -> yellow -> red. Built once
@@ -755,6 +765,7 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
 static constexpr float kEmptySceneRadius = Renderer::kEmptySceneRadius;
 
 void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
+    beginGpuTimer(sceneTimer_);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
     glViewport(0, 0, sw_, sh_);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -999,6 +1010,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     // Feature datum geometry (created axes / planes / points / csys) — same blended overlay pass.
     drawRefDatums(mvp);
 
+    endGpuTimer(sceneTimer_, sceneMs_, sceneTimingValid_);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     resolvedDirty_ = true;
     backdropDirty_ = true;
@@ -1723,9 +1735,17 @@ void Renderer::updateBackdropBlur() const {
 
 ViewportBackdrop Renderer::backdrop() const {
     resolveColorTexture();
-    updateBackdropBlur();
+    if (backdropEnabled_) {
+        beginGpuTimer(blurTimer_);
+        updateBackdropBlur();
+        endGpuTimer(blurTimer_, blurMs_, blurTimingValid_);
+
+        beginGpuTimer(lumaTimer_);
+        issueLumaReadback();
+        endGpuTimer(lumaTimer_, lumaMs_, lumaTimingValid_);
+    }
     ViewportBackdrop bd;
-    if (blurW_ <= 0 || blurH_ <= 0) return bd;
+    if (!backdropEnabled_ || blurW_ <= 0 || blurH_ <= 0) return bd;
     // Final blur texture is whichever ping-pong buffer holds the last pass output.
     unsigned int tex = blurPingTex_[(kBlurPasses - 1) & 1];
     if (!tex) tex = blurDownTex_;
@@ -1737,49 +1757,206 @@ ViewportBackdrop Renderer::backdrop() const {
     return bd;
 }
 
+// F1: pure CPU box-average of the cached async luminance grid (see reduceLumaPbo()). ZERO GL
+// calls — `rect` is viewport-local top-left px coords, matching the grid's row convention.
 float Renderer::averageLuminance(const ViewportRect& rect) const {
-    resolveColorTexture();
-    if (w_ <= 0 || h_ <= 0 || !resolveFbo_) return 0.5f;
+    if (!lumaEverRead_ || lumaGrid_.empty() || lumaW_ <= 0 || lumaH_ <= 0 || w_ <= 0 || h_ <= 0)
+        return 0.5f;
 
     float x0 = rect.x0, y0 = rect.y0, x1 = rect.x1, y1 = rect.y1;
     if (x1 < x0) std::swap(x0, x1);
     if (y1 < y0) std::swap(y0, y1);
-    int px0 = (int)std::floor(x0);
-    int py0 = (int)std::floor(y0);
-    int px1 = (int)std::ceil(x1);
-    int py1 = (int)std::ceil(y1);
-    if (px0 < 0) px0 = 0;
-    if (py0 < 0) py0 = 0;
-    if (px1 > w_) px1 = w_;
-    if (py1 > h_) py1 = h_;
-    const int rw = px1 - px0;
-    const int rh = py1 - py0;
-    if (rw <= 0 || rh <= 0) return 0.5f;
+    x0 = std::max(0.0f, std::min(x0, (float)w_));
+    x1 = std::max(0.0f, std::min(x1, (float)w_));
+    y0 = std::max(0.0f, std::min(y0, (float)h_));
+    y1 = std::max(0.0f, std::min(y1, (float)h_));
 
-    // Cap readback size for perf (adaptive contrast only needs a coarse sample).
-    const int maxDim = 32;
-    int stepX = std::max(1, rw / maxDim);
-    int stepY = std::max(1, rh / maxDim);
+    const float sx = (float)lumaW_ / (float)w_;
+    const float sy = (float)lumaH_ / (float)h_;
+    int gx0 = std::max(0, std::min(lumaW_ - 1, (int)std::floor(x0 * sx)));
+    int gy0 = std::max(0, std::min(lumaH_ - 1, (int)std::floor(y0 * sy)));
+    int gx1 = std::max(gx0 + 1, std::min(lumaW_, (int)std::ceil(x1 * sx)));
+    int gy1 = std::max(gy0 + 1, std::min(lumaH_, (int)std::ceil(y1 * sy)));
 
-    std::vector<unsigned char> row((size_t)rw * 4);
     double sum = 0.0;
     int count = 0;
-    glBindFramebuffer(GL_FRAMEBUFFER, resolveFbo_);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    for (int y = py0; y < py1; y += stepY) {
-        const int glY = h_ - 1 - y;  // top-left rect -> GL bottom-left origin
-        glReadPixels(px0, glY, rw, 1, GL_RGBA, GL_UNSIGNED_BYTE, row.data());
-        for (int x = 0; x < rw; x += stepX) {
-            const unsigned char* p = &row[(size_t)x * 4];
-            const float r = p[0] / 255.0f;
-            const float g = p[1] / 255.0f;
-            const float b = p[2] / 255.0f;
-            sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            ++count;
-        }
+    for (int gy = gy0; gy < gy1; ++gy) {
+        const float* row = &lumaGrid_[(size_t)gy * (size_t)lumaW_];
+        for (int gx = gx0; gx < gx1; ++gx) { sum += row[gx]; ++count; }
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     return count > 0 ? (float)(sum / count) : 0.5f;
+}
+
+// ---- F1 GPU pass timing: 2 queries per phase, ping-ponged so a result never blocks ----
+void Renderer::beginGpuTimer(GpuTimerRing& t) {
+    if (!t.id[0]) glGenQueries(2, t.id);
+    glBeginQuery(GL_TIME_ELAPSED, t.id[t.cur]);
+}
+
+void Renderer::endGpuTimer(GpuTimerRing& t, float& outMs, bool& outValid) {
+    glEndQuery(GL_TIME_ELAPSED);
+    t.pending[t.cur] = true;
+    const int other = t.cur ^ 1;
+    t.cur = other;
+    if (t.pending[other]) {
+        GLuint avail = 0;
+        glGetQueryObjectuiv(t.id[other], GL_QUERY_RESULT_AVAILABLE, &avail);
+        if (avail) {
+            GLuint64 ns = 0;
+            glGetQueryObjectui64v(t.id[other], GL_QUERY_RESULT, &ns);
+            outMs = (float)((double)ns / 1e6);
+            outValid = true;
+            t.pending[other] = false;
+        }
+        // Not yet available: never block — keep reporting the previous outMs this frame.
+    }
+}
+
+aicad::viewport::GlassTimings Renderer::glassTimings() const {
+    aicad::viewport::GlassTimings t;
+    t.sceneMs = sceneMs_;
+    t.blurMs = blurMs_;
+    t.lumaMs = lumaMs_;
+    t.valid = sceneTimingValid_ && blurTimingValid_ && lumaTimingValid_;
+    return t;
+}
+
+void Renderer::setBackdropEnabled(bool on) {
+    backdropEnabled_ = on;
+}
+
+// A9/A12: source selection + cadence for the async luminance readback. Called once per
+// backdrop() frame while enabled; backdrop() brackets this with the luma GPU timer.
+void Renderer::issueLumaReadback() const {
+    if (!backdropEnabled_) return;  // A12: disabled means no readback at all.
+
+    // Always drain the ring first so slots free up even on a frame that skips issuing below.
+    pollLumaPbos();
+
+    const bool blurAvailable = blurW_ > 0 && blurH_ > 0 && downsampleProg_ && kawaseProg_;
+    unsigned int srcFbo = 0;
+    int srcW = 0, srcH = 0;
+    if (blurAvailable) {
+        srcFbo = blurPingFbo_[(kBlurPasses - 1) & 1];
+        srcW = blurW_;
+        srcH = blurH_;
+    } else {
+        // A9: blur chain permanently unavailable (link failure / never sized) -> fall back to a
+        // direct small read of the full resolved color buffer, throttled to every 8th frame so it
+        // never becomes a per-frame full-res stall source; still async via the same PBO ring.
+        if (!resolveFbo_ || w_ <= 0 || h_ <= 0) return;
+        ++lumaFallbackCounter_;
+        if ((lumaFallbackCounter_ % 8) != 0) return;
+        srcFbo = resolveFbo_;
+        srcW = w_;
+        srcH = h_;
+    }
+    if (!srcFbo || srcW <= 0 || srcH <= 0) return;
+    issueLumaPboRead(srcFbo, srcW, srcH);
+}
+
+// A11: issues one glReadPixels into the next PBO ring slot + a fence. Detects a source-size
+// change (blur resize, or a switch between the blur/fallback sources) and re-specs every slot's
+// storage before issuing, dropping any outstanding fences from the old generation WITHOUT mapping
+// them first (their data no longer matches the new dimensions).
+void Renderer::issueLumaPboRead(unsigned int srcFbo, int srcW, int srcH) const {
+    if (srcW != lumaSrcW_ || srcH != lumaSrcH_) {
+        for (int i = 0; i < kLumaPboCount; ++i) {
+            if (lumaFence_[i]) {
+                glDeleteSync(static_cast<GLsync>(lumaFence_[i]));
+                lumaFence_[i] = nullptr;
+            }
+            lumaPboPending_[i] = false;
+            if (!lumaPbo_[i]) glGenBuffers(1, &lumaPbo_[i]);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, lumaPbo_[i]);
+            glBufferData(GL_PIXEL_PACK_BUFFER, (size_t)srcW * (size_t)srcH * 4, nullptr,
+                         GL_STREAM_READ);
+            lumaPboW_[i] = srcW;
+            lumaPboH_[i] = srcH;
+        }
+        lumaSrcW_ = srcW;
+        lumaSrcH_ = srcH;
+    }
+
+    const int slot = lumaPboNext_;
+    lumaPboNext_ = (lumaPboNext_ + 1) % kLumaPboCount;
+    if (lumaFence_[slot]) {
+        // Slot still had an unread result (a slow GPU catching up) — drop it rather than block.
+        glDeleteSync(static_cast<GLsync>(lumaFence_[slot]));
+        lumaFence_[slot] = nullptr;
+        lumaPboPending_[slot] = false;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, srcFbo);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, lumaPbo_[slot]);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, srcW, srcH, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);  // lands in the bound PBO
+    lumaPboW_[slot] = srcW;
+    lumaPboH_[slot] = srcH;
+    lumaFence_[slot] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    lumaPboPending_[slot] = true;
+
+    // A5: never leave the PACK buffer or FBO bound past this call.
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// Non-blocking poll of every ring slot; a signaled slot is mapped, reduced, and freed.
+void Renderer::pollLumaPbos() const {
+    for (int i = 0; i < kLumaPboCount; ++i) {
+        if (!lumaPboPending_[i] || !lumaFence_[i]) continue;
+        const GLenum res = glClientWaitSync(static_cast<GLsync>(lumaFence_[i]), 0, /*timeout=*/0);
+        if (res == GL_ALREADY_SIGNALED || res == GL_CONDITION_SATISFIED) {
+            glDeleteSync(static_cast<GLsync>(lumaFence_[i]));
+            lumaFence_[i] = nullptr;
+            lumaPboPending_[i] = false;
+            reduceLumaPbo(i);
+        } else if (res == GL_WAIT_FAILED) {
+            glDeleteSync(static_cast<GLsync>(lumaFence_[i]));
+            lumaFence_[i] = nullptr;
+            lumaPboPending_[i] = false;
+        }
+        // GL_TIMEOUT_EXPIRED: still in flight — leave pending, poll again next frame.
+    }
+}
+
+// Maps slot `slot`, downsamples by a fixed step to a <=64x40 Rec.709 grid (grid row 0 = the TOP
+// of the viewport, matching averageLuminance()'s top-left rect convention — the source PBO rows
+// are GL bottom-left-origin, so the vertical index is flipped here), then publishes it with a
+// single vector swap (never a partial in-place mutation, per the no-tearing contract rule).
+void Renderer::reduceLumaPbo(int slot) const {
+    const int sw = lumaPboW_[slot];
+    const int sh = lumaPboH_[slot];
+    if (sw <= 0 || sh <= 0) return;
+
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, lumaPbo_[slot]);
+    const void* mapped =
+        glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (size_t)sw * (size_t)sh * 4, GL_MAP_READ_BIT);
+    if (mapped) {
+        const unsigned char* px = static_cast<const unsigned char*>(mapped);
+        const int stepX = std::max(1, (sw + kLumaGridMaxW - 1) / kLumaGridMaxW);
+        const int stepY = std::max(1, (sh + kLumaGridMaxH - 1) / kLumaGridMaxH);
+        const int gw = std::min(kLumaGridMaxW, (sw + stepX - 1) / stepX);
+        const int gh = std::min(kLumaGridMaxH, (sh + stepY - 1) / stepY);
+        lumaStaging_.assign((size_t)gw * (size_t)gh, 0.5f);
+        for (int gy = 0; gy < gh; ++gy) {
+            const int sy = std::max(0, sh - 1 - gy * stepY);  // flip: grid row 0 = viewport top
+            for (int gx = 0; gx < gw; ++gx) {
+                const int sx = std::min(sw - 1, gx * stepX);
+                const unsigned char* p = px + ((size_t)sy * (size_t)sw + (size_t)sx) * 4;
+                const float r = p[0] / 255.0f, g = p[1] / 255.0f, b = p[2] / 255.0f;
+                lumaStaging_[(size_t)gy * (size_t)gw + (size_t)gx] =
+                    0.2126f * r + 0.7152f * g + 0.0722f * b;
+            }
+        }
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        lumaGrid_.swap(lumaStaging_);  // one swap; a future reader never sees a torn grid
+        lumaW_ = gw;
+        lumaH_ = gh;
+        lumaEverRead_ = true;
+    }
+    // A5: never leave the PACK buffer bound past this call.
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 }
 
 namespace {

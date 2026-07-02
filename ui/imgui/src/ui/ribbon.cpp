@@ -109,7 +109,7 @@ static void resolveFace(const char* parentId, const cmd::Command* cmd, bool drop
     if (ch) { outIcon = ch->icon; outLabel = ch->label; }
 }
 
-static void flyoutPopup(const char* parentId, AppState& s) {
+static void flyoutPopup(const char* parentId, AppState& s, const theme::AdaptiveSurface& surf) {
     const float S = theme::S();
     std::string popId = std::string(parentId) + "_drop";
 
@@ -124,7 +124,7 @@ static void flyoutPopup(const char* parentId, AppState& s) {
     ImDrawList* pdl = ImGui::GetWindowDrawList();
     ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
     theme::glassPanel(pdl, ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)),
-                      theme::MaterialLevel::Regular, theme::ctx().m.roundingLg * S);
+                      theme::MaterialLevel::Regular, theme::ctx().m.roundingLg * S, surf);
 
     float rowH = 28.f * S;
     float iconSz = 20.f * S;
@@ -178,7 +178,7 @@ static void flyoutPopup(const char* parentId, AppState& s) {
 }
 
 static bool bigBtn(AppState& s, const char* cmdId, const char* icon, const char* label,
-                   float btnH, bool hasDrop) {
+                   float btnH, bool hasDrop, const theme::AdaptiveSurface& surf) {
     const float S = theme::S();
     float bw = bigBtnW(cmdId, label, hasDrop, btnH, S);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -232,14 +232,16 @@ static bool bigBtn(AppState& s, const char* cmdId, const char* icon, const char*
         float cx = p0.x + mainW * 0.5f;
         float iy = p0.y + (vis[0] == '\0' ? (btnH - iconSz) * 0.5f : btnH * 0.08f);
         icons::draw(dl, icon, ImVec2(cx, iy + iconSz * 0.5f), iconSz,
-                    (mainHov || isActive(s, cmdId)) ? TCOL(txt0) : TCOL(txt1));
+                    ImGui::ColorConvertFloat4ToU32((mainHov || isActive(s, cmdId)) ? surf.textPrimary
+                                                                                    : surf.textSecondary));
 
         if (vis[0] != '\0') {
             std::string l1, l2;
             wrapLabel(vis, l1, l2);
             ImFont* f = theme::font(theme::Font::Body);
             float fs = theme::ctx().m.type.caption * S;
-            ImU32 tc = (mainHov || isActive(s, cmdId)) ? TCOL(txt0) : TCOL(txt1);
+            ImU32 tc = ImGui::ColorConvertFloat4ToU32((mainHov || isActive(s, cmdId)) ? surf.textPrimary
+                                                                                       : surf.textSecondary);
             float ty = iy + iconSz + btnH * 0.04f;
             ImVec2 t1s = f->CalcTextSizeA(fs, FLT_MAX, 0, l1.c_str());
             dl->AddText(f, fs, ImVec2(cx - t1s.x * 0.5f, ty), tc, l1.c_str());
@@ -358,8 +360,10 @@ void drawBody(AppState& s, float height) {
     ImDrawList* wdl = ImGui::GetWindowDrawList();
     ImVec2 wp = ImGui::GetWindowPos();
     ImVec2 wsz = ImGui::GetWindowSize();
+    const theme::AdaptiveSurface& surf =
+        theme::adaptivePanel(theme::panelId("ribbon_glass"), ImRect(wp, ImVec2(wp.x + wsz.x, wp.y + wsz.y)));
     theme::glassPanel(wdl, ImRect(wp, ImVec2(wp.x + wsz.x, wp.y + wsz.y)),
-                      theme::MaterialLevel::Thin, theme::ctx().m.roundingLg * S);
+                      theme::MaterialLevel::Thin, theme::ctx().m.roundingLg * S, surf);
 
     cmd::Workspace ws = s.effectiveWorkspace();
     auto groups = buildGroups(ws, s);
@@ -407,8 +411,8 @@ void drawBody(AppState& s, float height) {
             const char* showIcon = c->icon;
             const char* showLabel = c->label;
             resolveFace(c->id, c, drop, showIcon, showLabel);
-            bigBtn(s, c->id, showIcon, showLabel, btnH, drop);
-            if (drop) flyoutPopup(c->id, s);
+            bigBtn(s, c->id, showIcon, showLabel, btnH, drop, surf);
+            if (drop) flyoutPopup(c->id, s, surf);
         }
         ImGui::EndGroup();
 

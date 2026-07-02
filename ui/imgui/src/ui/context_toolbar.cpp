@@ -28,6 +28,8 @@ bool toolButton(AppState& s, const char* cmdId, float cellH, bool* outArrow) {
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 p = ImGui::GetCursorScreenPos();
+    const theme::AdaptiveSurface& surf =
+        theme::adaptivePanel(theme::panelId(cmdId), ImRect(p, ImVec2(p.x + w, p.y + cellH)));
 
     ImGui::PushID(cmdId);
     ImGui::SetNextItemAllowOverlap();
@@ -46,10 +48,13 @@ bool toolButton(AppState& s, const char* cmdId, float cellH, bool* outArrow) {
                     theme::ctx().m.rounding * S, 0, ImMax(1.f, 1.5f * S));
 
     float iconSz = cellH * 0.42f;
-    ImU32 ic = (hovered || isActive) ? TCOL(txt0) : TCOL(txt1);
-    icons::draw(dl, c->icon, ImVec2(p.x + w * 0.5f, p.y + cellH * 0.34f), iconSz, ic);
-    dl->AddText(f, fs, ImVec2(p.x + (w - ts.x) * 0.5f, p.y + cellH * 0.62f),
-                (hovered || isActive) ? TCOL(txt0) : TCOL(txt1), c->label);
+    const ImU32 ic = ImGui::ColorConvertFloat4ToU32((hovered || isActive) ? surf.textPrimary
+                                                                          : surf.textSecondary);
+    const ImU32 halo = theme::roleU32A(surf.darkText ? theme::pal().vibrancyLightPrimary
+                                                      : theme::pal().vibrancyDarkPrimary,
+                                       0x50 / 255.f);
+    icons::drawGlass(dl, c->icon, ImVec2(p.x + w * 0.5f, p.y + cellH * 0.34f), iconSz, ic, halo);
+    dl->AddText(f, fs, ImVec2(p.x + (w - ts.x) * 0.5f, p.y + cellH * 0.62f), ic, c->label);
 
     bool arrowClicked = false;
     if (hasFly) {
@@ -59,7 +64,9 @@ bool toolButton(AppState& s, const char* cmdId, float cellH, bool* outArrow) {
         ImVec2 cc(ap0.x + as * 0.5f, ap0.y + as * 0.55f);
         float t = as * 0.16f;
         dl->AddTriangleFilled(ImVec2(cc.x - t, cc.y - t * 0.5f), ImVec2(cc.x + t, cc.y - t * 0.5f),
-                              ImVec2(cc.x, cc.y + t * 0.7f), (ah && hovered) ? TCOL(txt0) : TCOL(txt2));
+                              ImVec2(cc.x, cc.y + t * 0.7f),
+                              ImGui::ColorConvertFloat4ToU32((ah && hovered) ? surf.textPrimary
+                                                                             : surf.textTertiary));
         if (clicked && ah) { arrowClicked = true; clicked = false; if (outArrow) *outArrow = true; }
     }
 

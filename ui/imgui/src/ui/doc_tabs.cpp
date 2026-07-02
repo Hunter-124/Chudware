@@ -55,7 +55,8 @@ static void closeDocTabAt(AppState& st, int idx) {
     }
 }
 
-static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
+static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
+                        const theme::AdaptiveSurface& surf) {
     const float S = theme::S();
     DocTab& t = st.docTabs[idx];
     const bool active = (idx == st.activeTab);
@@ -86,7 +87,7 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
 
     theme::MaterialLevel level = active ? theme::MaterialLevel::Regular : theme::MaterialLevel::UltraThin;
     if (hovered && !active) level = theme::MaterialLevel::Thin;
-    theme::glassPanel(dl, tabRect, level, theme::ctx().m.rounding, -1.f);
+    theme::glassPanel(dl, tabRect, level, theme::ctx().m.rounding, surf);
     if (active) {
         dl->AddLine(ImVec2(p0.x + theme::U(0.25f), p0.y + theme::U(0.125f)),
                     ImVec2(p1.x - theme::U(0.25f), p0.y + theme::U(0.125f)),
@@ -96,10 +97,12 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
                     TCOL(line), 1.f);
     }
 
-    const ImU32 textCol = active ? TCOL(txt0) : TCOL(txt1);
+    const ImU32 textCol = ImGui::ColorConvertFloat4ToU32(active ? surf.textPrimary : surf.textSecondary);
     const float iy = p0.y + (tabH - iconSz) * 0.5f;
-    icons::draw(dl, docIconName(t), ImVec2(p0.x + padX + iconSz * 0.5f, iy + iconSz * 0.5f),
-                iconSz * 0.5f, active ? TCOL(txt0) : TCOL(txt1));
+    icons::drawGlass(dl, docIconName(t), ImVec2(p0.x + padX + iconSz * 0.5f, iy + iconSz * 0.5f),
+                     iconSz * 0.5f, textCol,
+                     theme::roleU32A(surf.darkText ? theme::pal().vibrancyLightPrimary
+                                                   : theme::pal().vibrancyDarkPrimary, 0.31f));
     dl->AddText(ImVec2(p0.x + padX + iconSz + iconGap,
                        p0.y + (tabH - ImGui::GetFontSize()) * 0.5f),
                 textCol, label.c_str());
@@ -117,7 +120,7 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH) {
     if (xHover)
         dl->AddCircleFilled(xc, closeW * 0.5f, TCOL(bad));
     const float g = closeW * 0.22f;
-    const ImU32 xCol = xHover ? TCOL(txt0) : TCOL(txt2);
+    const ImU32 xCol = ImGui::ColorConvertFloat4ToU32(xHover ? surf.textPrimary : surf.textTertiary);
     dl->AddLine(ImVec2(xc.x - g, xc.y - g), ImVec2(xc.x + g, xc.y + g), xCol, 1.6f * S);
     dl->AddLine(ImVec2(xc.x - g, xc.y + g), ImVec2(xc.x + g, xc.y - g), xCol, 1.6f * S);
 
@@ -179,14 +182,16 @@ float drawDocTabs(AppState& st, float availW) {
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImRect bandRect(ImVec2(bandL, bandT), ImVec2(bandR, bandB));
-    theme::glassPanel(dl, bandRect, theme::MaterialLevel::Thin, theme::ctx().m.roundingLg, -1.f);
+    const theme::AdaptiveSurface& surf =
+        theme::adaptivePanel(theme::panelId("doctabs_glass"), bandRect);
+    theme::glassPanel(dl, bandRect, theme::MaterialLevel::Thin, theme::ctx().m.roundingLg, surf);
     dl->AddLine(ImVec2(bandL, bandB - 0.5f), ImVec2(bandR, bandB - 0.5f), TCOL(line), 1.f);
 
     float runX = origin.x;
     const float y0 = origin.y;
     const float gap = 2.f * S;
     for (int i = 0; i < (int)st.docTabs.size(); ++i)
-        runX += drawOneTab(st, i, runX, y0, barH) + gap;
+        runX += drawOneTab(st, i, runX, y0, barH, surf) + gap;
 
     {
         const float btn = barH;
@@ -196,9 +201,12 @@ float drawDocTabs(AppState& st, float availW) {
         const bool hov = ImGui::IsItemHovered();
         if (hov) {
             const ImRect pill(p0, ImVec2(p0.x + btn, p0.y + btn));
-            theme::glassPanel(dl, pill, theme::MaterialLevel::UltraThin, theme::ctx().m.rounding, -1.f);
+            theme::glassPanel(dl, pill, theme::MaterialLevel::UltraThin, theme::ctx().m.rounding, surf);
         }
-        icons::draw(dl, "new_doc", ImVec2(p0.x + btn * 0.5f, p0.y + btn * 0.5f), 9.f * S, TCOL(txt1));
+        icons::drawGlass(dl, "new_doc", ImVec2(p0.x + btn * 0.5f, p0.y + btn * 0.5f), 9.f * S,
+                         ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
+                         theme::roleU32A(surf.darkText ? theme::pal().vibrancyLightPrimary
+                                                       : theme::pal().vibrancyDarkPrimary, 0.31f));
         if (hov) ImGui::SetTooltip("New document");
         if (clicked || s_openChooser) {
             ImGui::OpenPopup("##newdocmenu");

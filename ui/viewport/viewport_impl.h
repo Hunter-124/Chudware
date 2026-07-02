@@ -34,6 +34,11 @@ public:
     ViewportBackdrop backdrop() const;
     float averageLuminance(const ViewportRect& rect) const;
 
+    // GPU pass timings + master switch for the blur/luminance pipeline (see Renderer).
+    GlassTimings glassTimings() const;
+    void setBackdropEnabled(bool on);
+    bool backdropEnabled() const;
+
     Renderer& renderer() { return renderer_; }
     const Renderer& renderer() const { return renderer_; }
     render::IdPass& idPass() { return idPass_; }

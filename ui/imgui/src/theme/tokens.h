@@ -54,6 +54,7 @@ struct Palette {
     unsigned int txt0, txt1, txt2;
     // semantic
     unsigned int accent, accentDim, accentSoft, accentMid, good, warn, bad;
+    unsigned int onAccent;  // text/icons painted on accent fills (A3)
     // viewport clear
     unsigned int viewport0, viewport1;
     // glass (5-layer glassBackground + row pills)
@@ -70,11 +71,12 @@ inline Palette darkPalette() {
     p.txt0=0xE5EAF0FF; p.txt1=0x9EA8B8FF; p.txt2=0x788596FF;
     p.accent=0x2DD4BFFF; p.accentDim=0x1E8D7FFF; p.accentSoft=0x2DD4BF38; p.accentMid=0x2DD4BF66;
     p.good=0x2DD4BFFF; p.warn=0xF3C26BFF; p.bad=0xF58C6BFF;
+    p.onAccent=0xFFFFFFFF;
     p.viewport0=0xF4F6F9FF; p.viewport1=0xEEF0F3FF;
     // host dark glass roles (ui_theme.cpp fillDark)
     p.glassBg=0x1E222BDE; p.glassBorder=0x3B465DCC; p.glassHighlight=0xFFFFFF17; p.glassShadow=0x00000066;
-    p.vibrancyLightPrimary=0xE5EAF0FF; p.vibrancyLightSecondary=0xB8C2D0FF; p.vibrancyLightTertiary=0x8A96A8FF;
-    p.vibrancyDarkPrimary=0x1E2332FF;  p.vibrancyDarkSecondary=0x3D4654FF;  p.vibrancyDarkTertiary=0x5C6678FF;
+    p.vibrancyLightPrimary=0xF5F7FAFF; p.vibrancyLightSecondary=0xD8DEE8E6; p.vibrancyLightTertiary=0xA8B0BCCC;
+    p.vibrancyDarkPrimary=0x14181FFF;  p.vibrancyDarkSecondary=0x39424EE6;  p.vibrancyDarkTertiary=0x5C6678CC;
     return p;
 }
 
@@ -85,11 +87,12 @@ inline Palette lightPalette() {
     p.txt0=0x1E2332FF; p.txt1=0x5B626FFF; p.txt2=0x8F959EFF;
     p.accent=0x0078D7FF; p.accentDim=0x005AA0FF; p.accentSoft=0x0078D72E; p.accentMid=0x0078D759;
     p.good=0x0A9230FF; p.warn=0xC88C00FF; p.bad=0xD41E18FF;
+    p.onAccent=0xFFFFFFFF;
     p.viewport0=0xF4F6F9FF; p.viewport1=0xEEF0F3FF;
     // host light glass roles
     p.glassBg=0xF7F9FCEB; p.glassBorder=0x9EA6BAB8; p.glassHighlight=0xFFFFFF59; p.glassShadow=0x0000002E;
-    p.vibrancyLightPrimary=0xF5F7FAFF; p.vibrancyLightSecondary=0xD8DEE8FF; p.vibrancyLightTertiary=0xA8B0BCFF;
-    p.vibrancyDarkPrimary=0x1E2332FF;  p.vibrancyDarkSecondary=0x3D4654FF;  p.vibrancyDarkTertiary=0x5C6678FF;
+    p.vibrancyLightPrimary=0xF5F7FAFF; p.vibrancyLightSecondary=0xD8DEE8E6; p.vibrancyLightTertiary=0xA8B0BCCC;
+    p.vibrancyDarkPrimary=0x14181FFF;  p.vibrancyDarkSecondary=0x39424EE6;  p.vibrancyDarkTertiary=0x5C6678CC;
     return p;
 }
 
@@ -139,6 +142,7 @@ namespace motion {
     constexpr float micro    = 0.090f;
     constexpr float standard = 0.160f;
     constexpr float entrance = 0.220f;
+    constexpr float adaptive = 0.24f;  // luminance smoothing tau (s), A2/A13
 }
 
 inline float easeOut(float t){ t=t<0?0:(t>1?1:t); float u=1-t; return 1-u*u*u; }

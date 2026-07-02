@@ -29,6 +29,21 @@ static void explorerRowPill(bool selected = false) {
     theme::glassRowAtCursor(3.5f, (s_explorerStripe++ % 2) == 0, selected, 5.f);
 }
 
+// A1/A2: fetch (never paint) the Browser pane's ONE glass surface — left_dock.cpp already painted
+// it this frame under the same panelId; adaptivePanel is idempotent per frame, so this is a cheap
+// cached lookup no matter how many rows call it.
+static const theme::AdaptiveSurface& explorerSurf() {
+    ImVec2 wp_ = ImGui::GetWindowPos(); ImVec2 ws_ = ImGui::GetWindowSize();
+    ImRect r(wp_, ImVec2(wp_.x + ws_.x, wp_.y + ws_.y));
+    return theme::adaptivePanel(theme::panelId("browser_glass"), r);
+}
+// Contrast halo for icons::drawGlass: surf.tint is already the opposite-tone neutral (see
+// theme.cpp adaptiveSurface) at ~0x50 alpha; 0 alpha (no live backdrop) => drawGlass draws plain.
+static ImU32 explorerHalo(const theme::AdaptiveSurface& surf) {
+    if (!theme::viewportBackdrop().valid()) return 0;
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0x50 / 255.f));
+}
+
 static std::string s_selectedPath;
 static std::string s_currentFolder;
 static std::string s_renameId;
@@ -81,7 +96,11 @@ static const char* fileIconName(const std::string& ext) {
 
 static void drawIcon(const char* name) {
     const float sz = 16.f * theme::S();
-    icons::inlineIcon(name, sz, TCOL(txt1));
+    const theme::AdaptiveSurface& surf = explorerSurf();
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(sz, sz));
+    icons::drawGlass(ImGui::GetWindowDrawList(), name, ImVec2(p0.x + sz * 0.5f, p0.y + sz * 0.5f),
+                     sz * 0.5f, ImGui::ColorConvertFloat4ToU32(surf.textSecondary), explorerHalo(surf));
     ImGui::SameLine(0, 4.f * theme::S());
 }
 
@@ -100,8 +119,12 @@ static bool toolbarIconButton(const char* id, const char* icon, const char* tip,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (hovered && enabled)
         theme::glassRowBackground(dl, p0, p1, 5.f * S, false, false);
-    ImU32 col = enabled ? TCOL(txt0) : theme::roleU32(theme::pal().txt2, 0.35f);
-    icons::draw(dl, icon, ImVec2(p0.x + btn * 0.5f, p0.y + btn * 0.5f), btn * 0.32f, col);
+    const theme::AdaptiveSurface& surf = explorerSurf();
+    ImU32 col = enabled
+        ? ImGui::ColorConvertFloat4ToU32(surf.textPrimary)
+        : ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textTertiary.x, surf.textTertiary.y,
+                                                 surf.textTertiary.z, surf.textTertiary.w * 0.35f));
+    icons::drawGlass(dl, icon, ImVec2(p0.x + btn * 0.5f, p0.y + btn * 0.5f), btn * 0.32f, col, explorerHalo(surf));
     if (hovered) ImGui::SetTooltip("%s", tip);
     ImGui::PopID();
     return clicked && enabled;
@@ -325,7 +348,7 @@ static void drawRecentSection(app::AppState& st) {
             drawIcon(fileIconName(lowerExt(p)));
             std::error_code ec;
             bool exists = fs::exists(p, ec);
-            if (!exists) ImGui::PushStyleColor(ImGuiCol_Text, TVEC(txt2));
+            if (!exists) ImGui::PushStyleColor(ImGuiCol_Text, explorerSurf().textSecondary);
             if (ImGui::Selectable(p.filename().string().c_str(), false,
                                   ImGuiSelectableFlags_AllowDoubleClick) &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && exists)
@@ -418,6 +441,9 @@ void drawFileExplorerBody(app::AppState& st) {
         fs::is_regular_file(fs::path(s_selectedPath), curEc) &&
         isKnownExt(lowerExt(fs::path(s_selectedPath)));
 
+    const theme::AdaptiveSurface& fxSurf = explorerSurf();
+    ImGui::PushStyleColor(ImGuiCol_Text, fxSurf.textPrimary);
+
     theme::glassRowAtCursor(3.5f, false, false, 8.f);
     if (toolbarIconButton("open", "open", "Open selected file", selectedFile))
         requestOpen(st, fs::path(s_selectedPath));
@@ -433,7 +459,7 @@ void drawFileExplorerBody(app::AppState& st) {
 
     theme::glassRowAtCursor(3.5f, false, false, 5.f);
     ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, TVEC(txt2));
+    ImGui::PushStyleColor(ImGuiCol_Text, fxSurf.textSecondary);
     std::string folderName = current.filename().string();
     if (folderName.empty()) folderName = current.string();
     ImGui::TextUnformatted(folderName.c_str());
@@ -463,6 +489,7 @@ void drawFileExplorerBody(app::AppState& st) {
         ImGui::TextDisabled("Workspace folder missing");
     ImGui::EndChild();
 
+    ImGui::PopStyleColor();
     drawDeleteModal(st, root);
 }
 

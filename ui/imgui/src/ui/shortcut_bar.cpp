@@ -2,6 +2,7 @@
 #include "app/app_state.h"
 #include "theme/theme.h"
 #include "theme/icons.h"
+#include "ui/viewport.h"
 #include "imgui.h"
 
 namespace ui {
@@ -86,7 +87,9 @@ void ShortcutBar::draw(AppState& st, bool inSketch) {
 
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     float rounding = barH * 0.45f;
-    theme::glassPanel(dl, ImRect(p0, p1), theme::MaterialLevel::Regular, rounding);
+    const theme::AdaptiveSurface& surf =
+        theme::adaptivePanel(theme::panelId("shortcut_bar"), ImRect(p0, p1));
+    theme::glassPanel(dl, ImRect(p0, p1), theme::MaterialLevel::Regular, rounding, surf);
 
     ImGui::PushID("##sbar");
     for (int i = 0; i < nCmds; ++i) {
@@ -104,9 +107,9 @@ void ShortcutBar::draw(AppState& st, bool inSketch) {
         }
         float iz  = theme::U(2.75f);
         float off = (btnSz - iz) * 0.5f;
-        icons::draw(dl, cmds[i].icon,
+        icons::drawGlass(dl, cmds[i].icon,
                     ImVec2(bx + off + iz * 0.5f, by + off + iz * 0.5f),
-                    iz, theme::roleU32(theme::pal().txt0, 0.9f));
+                    iz, ImGui::ColorConvertFloat4ToU32(surf.textPrimary), glassIconHalo(surf));
         if (clicked) {
             st.dispatch(cmds[i].id);
             dismiss();

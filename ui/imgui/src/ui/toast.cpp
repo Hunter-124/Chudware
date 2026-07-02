@@ -90,17 +90,21 @@ void drawToasts(app::AppState& st) {
             return theme::roleU32(role, mul * alpha);
         };
 
+        const std::string slotId = "toast_glass_" + std::to_string(shown);
+        const theme::AdaptiveSurface& surf =
+            theme::adaptivePanel(theme::panelId(slotId.c_str()), ImRect(p0, p1));
         theme::glassPanel(dl, ImRect(p0, p1), theme::MaterialLevel::Regular,
-                          theme::ctx().m.roundingLg, -1.f, alpha);
+                          theme::ctx().m.roundingLg, surf, alpha);
         dl->AddRectFilled(p0, ImVec2(p0.x + 3.f * S, p1.y), withA(accentRole, 1.f),
                           theme::ctx().m.rounding * S, ImDrawFlags_RoundCornersLeft);
 
         float tx = p0.x + theme::U(1.5f);
         float ty = p0.y + theme::U(1.f);
         dl->AddText(font, font->FontSize, ImVec2(tx, ty), withA(accentRole, 1.f), tag);
+        ImVec4 msgCol = surf.textPrimary;
+        msgCol.w *= alpha;
         dl->AddText(font, font->FontSize, ImVec2(tx, ty + titleH),
-                    withA(p.txt0, 1.f), t.msg.c_str(), nullptr, innerW);
-
+                    ImGui::ColorConvertFloat4ToU32(msgCol), t.msg.c_str(), nullptr, innerW);
         if (clicked && mouse.x >= p0.x && mouse.x <= p1.x &&
             mouse.y >= p0.y && mouse.y <= p1.y) {
             ImGui::SetClipboardText(t.msg.c_str());

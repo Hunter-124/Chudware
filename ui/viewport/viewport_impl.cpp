@@ -78,6 +78,18 @@ float GlViewport::averageLuminance(const ViewportRect& rect) const {
     return renderer_.averageLuminance(rect);
 }
 
+GlassTimings GlViewport::glassTimings() const {
+    return renderer_.glassTimings();
+}
+
+void GlViewport::setBackdropEnabled(bool on) {
+    renderer_.setBackdropEnabled(on);
+}
+
+bool GlViewport::backdropEnabled() const {
+    return renderer_.backdropEnabled();
+}
+
 ui::PickResult GlViewport::pick(const ui::PickRequest& req) {
     ui::PickResult out;
     if (!hasDoc_ || width_ <= 0 || height_ <= 0) return out;

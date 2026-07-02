@@ -98,6 +98,7 @@ struct AppState {
 
     cmd::Workspace workspace = cmd::Workspace::Model;
     bool  inSketch = false;
+    bool  sketchPlanePickActive = false;
 
     std::string activeTool;
     std::string toolExtrudeOp;

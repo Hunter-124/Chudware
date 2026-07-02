@@ -185,7 +185,7 @@ void drawTitleBar(AppState& st, float height) {
     ImGui::PopStyleVar();
 
     dl->AddLine(ImVec2(wp.x, wp.y + wsz.y - 0.5f), ImVec2(wp.x + wsz.x, wp.y + wsz.y - 0.5f),
-                TCOL(line), 1.f);
+                theme::roleU32A(theme::pal().line, 0.35f), 1.f);
 
     ImGui::EndChild();
     ImGui::PopStyleColor();

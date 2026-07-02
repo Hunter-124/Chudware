@@ -15,7 +15,6 @@ public:
     void shutdown();
     AppState& state();
 private:
-    void updateViewportBackdrop(AppState& s);
     bool layoutBuilt_ = false;
     viewport::Scene scene_;
     aicad::viewport::GlViewport* glViewport_ = nullptr;

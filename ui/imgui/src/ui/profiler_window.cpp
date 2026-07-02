@@ -14,6 +14,7 @@
 
 #include "app/app_state.h"
 #include "ui/settings_modal.h"
+#include "ui/viewport.h"
 #include "theme/icons.h"
 #include "theme/theme.h"
 #include "cpp_core.h"
@@ -356,6 +357,16 @@ void drawProfilerWindow(app::AppState& st) {
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Symbolize samples so far without stopping.");
+
+        GlassTimings glassT = viewportGlassTimings();
+        if (glassT.valid) {
+            ImGui::SeparatorText("GUI / Glass (GPU)");
+            pushText(theme::pal().txt2);
+            ImGui::Text("scene %.2f ms", glassT.sceneMs);
+            ImGui::Text("blur %.2f ms", glassT.blurMs);
+            ImGui::Text("luma %.2f ms", glassT.lumaMs);
+            ImGui::PopStyleColor();
+        }
 
         ImGui::Spacing();
 

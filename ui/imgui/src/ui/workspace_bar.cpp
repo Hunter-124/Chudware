@@ -22,7 +22,7 @@ static bool chip(const char* id, const char* icon, const char* label, bool activ
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImU32 bg = active ? TCOL(accent) : hov ? TCOL(hover) : 0u;
     if (bg) dl->AddRectFilled(p, ImVec2(p.x+w, p.y+h), bg, h*0.5f);
-    ImU32 fg = active ? IM_COL32(255,255,255,255) : primary ? TCOL(txt0) : TCOL(txt1);
+    ImU32 fg = active ? TCOL(onAccent) : primary ? TCOL(txt0) : TCOL(txt1);
     icons::draw(dl, icon, ImVec2(p.x+10*S+icSz*0.5f, p.y+h*0.5f), icSz, fg);
     dl->AddText(f, f->FontSize, ImVec2(p.x+10*S+icSz+6*S, p.y+h*0.5f-ts.y*0.5f), fg, label);
     ImGui::PopID();
@@ -59,7 +59,8 @@ void drawWorkspaceBar(AppState& s, float height) {
     }
 
     ImVec2 wp = ImGui::GetWindowPos(), wsz = ImGui::GetWindowSize();
-    dl->AddLine(ImVec2(wp.x, wp.y+wsz.y-0.5f), ImVec2(wp.x+wsz.x, wp.y+wsz.y-0.5f), TCOL(line), 1.f);
+    dl->AddLine(ImVec2(wp.x, wp.y+wsz.y-0.5f), ImVec2(wp.x+wsz.x, wp.y+wsz.y-0.5f),
+                theme::roleU32A(theme::pal().line, 0.35f), 1.f);
     ImGui::EndChild();
     ImGui::PopStyleColor();
 }

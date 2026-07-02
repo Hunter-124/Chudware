@@ -862,6 +862,19 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                              {"mode", aicad::prof::mode()}},
                         out_json, 0);
         }
+        // prof_target_push / prof_target_pop {} -> persistently (un)register the CALLING
+        // thread as the sampler's stack-walk target beyond this call (ref-counted, see
+        // prof::set_target). Lets a GUI host sample its render thread: push at frame start,
+        // pop at frame end (the AI_CAD_SHOT=glassperf harness does exactly that). Harmless
+        // when the sampler is idle; pop without a matching push is a no-op at depth 0.
+        if (m == "prof_target_push") {
+            aicad::prof::set_target();
+            return emit(json{{"ok", true}}, out_json, 0);
+        }
+        if (m == "prof_target_pop") {
+            aicad::prof::clear_target();
+            return emit(json{{"ok", true}}, out_json, 0);
+        }
         if (m == "doc_compile_cpp") {
             return handle_compile(params, out_json);
         }

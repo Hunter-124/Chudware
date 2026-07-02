@@ -9,6 +9,7 @@
 
 #include "app/application.h"
 #include "app/app_state.h"
+#include "ui/scenarios.h"
 #include "viewport/scene.h"
 #include "theme/theme.h"
 #include "theme/icons.h"
@@ -117,6 +118,16 @@ int main(int argc, char** argv) {
 
     app::Application application;
     application.init(win, res, scale);
+
+    const char* shotEnv = std::getenv("AI_CAD_SHOT");
+    const bool shotMode = (shotPath != nullptr) || (shotEnv && *shotEnv);
+    ui::ScenarioRunner scenarioRunner;
+    ui::ShotConfig shotCfg;
+    if (shotMode) {
+        ui::configureShot(application.state(), shotCfg, shotEnv, shotPath);
+        ui::setScenarioContext(&scenarioRunner, &shotCfg);
+    }
+
     if (selftest) {
         auto& st = application.state();
         int rc = 2;
@@ -281,7 +292,18 @@ int main(int argc, char** argv) {
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-        if (shotPath && frame >= shotFrames - 1) { capturePNG(win, shotPath); break; }
+        if (shotPath) {
+            ui::ScenarioRunner::FrameAction act =
+                scenarioRunner.endFrame(shotCfg, application.state(), win, dw, dh, shotPath);
+            if (act == ui::ScenarioRunner::FrameAction::Break) break;
+            if (act == ui::ScenarioRunner::FrameAction::Continue) continue;
+
+            const int budget = shotCfg.active ? shotCfg.captureFrameBudget() : shotFrames;
+            if (frame >= budget - 1) {
+                capturePNG(win, shotPath);
+                break;
+            }
+        }
         glfwSwapBuffers(win);
         ++frame;
     }

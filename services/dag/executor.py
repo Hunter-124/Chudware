@@ -6,9 +6,12 @@ Scaffold: T-A1. Real capability dispatch in T-A2; interrupt() in T-A3; verify in
 Usage:
     from services.dag import executor
     result = executor.run(graph_json, initial_state={})
+    # After a gate pause:
+    result = executor.resume(run_id, graph_json, decision="approve", runs_dir=...)
 """
 from __future__ import annotations
 
+import json
 import os
 import platform
 import uuid
@@ -16,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import Command
 
 from .graph_loader import DagState, EmitFn, build_state_graph, validate_graph
 
@@ -52,20 +56,24 @@ def run(
     runs_dir: Optional[Path] = None,
     emit: EmitFn = None,
     agent_fn: Optional[Any] = None,
+    autonomy_default: str = "auto",
 ) -> dict[str, Any]:
     """Execute an aicad.dag/1 graph and persist checkpoints to SQLite.
 
     Args:
-        graph_json:    Validated aicad.dag/1 graph document.
-        initial_state: Extra keys merged into the initial DAG state (optional).
-        run_id:        UUID4 string. Generated if not supplied.
-        runs_dir:      Directory for checkpoint .db files.
-                       Defaults to default_runs_dir(). Pass a tmp dir for hermetic tests.
-        emit:          Optional event callback ``(event_type: str, payload: dict) -> None``.
-                       Receives dag.run.* and dag.node.* events per §11 of the contract.
-        agent_fn:      Optional agent callable injected into node handlers.
-                       Signature: ``(request: str, context_pack: dict) -> AgentRun``.
-                       Defaults to the live agent loop.  Tests inject a mock here.
+        graph_json:        Validated aicad.dag/1 graph document.
+        initial_state:     Extra keys merged into the initial DAG state (optional).
+        run_id:            UUID4 string. Generated if not supplied.
+        runs_dir:          Directory for checkpoint .db files.
+                           Defaults to default_runs_dir(). Pass a tmp dir for hermetic tests.
+        emit:              Optional event callback ``(event_type: str, payload: dict) -> None``.
+                           Receives dag.run.* and dag.node.* events per §11 of the contract.
+        agent_fn:          Optional agent callable injected into node handlers.
+                           Signature: ``(request: str, context_pack: dict) -> AgentRun``.
+                           Defaults to the live agent loop.  Tests inject a mock here.
+        autonomy_default:  Run-level autonomy floor — "auto" | "approve" | "manual".
+                           Can only RAISE a node's declared autonomy level, never lower it.
+                           When "approve", every "auto" node is promoted to gate-before-exec.
 
     Returns:
         dict with keys:
@@ -73,6 +81,10 @@ def run(
           status        : RunState string — "done" | "failed" | "paused" | "running"
           nodes         : {node_id: {"status": NodeState, "output": dict}}
           checkpoint_db : str (absolute path to the SQLite checkpoint file)
+
+        When a gate fires the run suspends: status="paused", and the dict includes
+          interrupted     : list of interrupt payload dicts (aicad.interaction/1 shape)
+        The caller (or UI) persists graph_json beside the .db for resume().
     """
     validate_graph(graph_json)
 
@@ -84,6 +96,12 @@ def run(
     base_dir.mkdir(parents=True, exist_ok=True)
     db_path = base_dir / f"{run_id}.db"
 
+    # Persist graph_json beside the .db so resume() can reconstruct the topology
+    # across an app restart without the caller re-supplying it.
+    graph_json_path = base_dir / f"{run_id}.graph.json"
+    if not graph_json_path.exists():
+        graph_json_path.write_text(json.dumps(graph_json), encoding="utf-8")
+
     if emit:
         emit("dag.run.started", {
             "run_id": run_id,
@@ -93,7 +111,10 @@ def run(
 
     # Build the uncompiled StateGraph, then compile with checkpointer inside the CM
     # so the SqliteSaver connection is alive for the full invocation.
-    uncompiled = build_state_graph(graph_json, emit=emit, agent_fn=agent_fn)
+    uncompiled = build_state_graph(
+        graph_json, emit=emit, agent_fn=agent_fn,
+        autonomy_default=autonomy_default,
+    )
 
     # NOTE: emit is passed via closure into node handlers by build_state_graph(),
     # NOT carried in state — the LangGraph checkpointer cannot serialise callables.
@@ -109,6 +130,22 @@ def run(
     with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         compiled = uncompiled.compile(checkpointer=checkpointer)
         final_state: DagState = compiled.invoke(initial, config=config)
+
+    # Detect a gate-pause: LangGraph returns {"__interrupt__": [...]} in the state.
+    interrupted = final_state.get("__interrupt__", [])
+    if interrupted:
+        interrupt_payloads = [
+            i.value if hasattr(i, "value") else i for i in interrupted
+        ]
+        return {
+            "run_id":       run_id,
+            "name":         graph_json.get("name", ""),
+            "status":       "paused",
+            "nodes":        final_state.get("node_states", {}),
+            "open_questions": final_state.get("open_questions", []),
+            "checkpoint_db": str(db_path),
+            "interrupted":  interrupt_payloads,
+        }
 
     # Resolve final run_status from node outcomes
     node_states: dict[str, Any] = final_state.get("node_states", {})
@@ -132,6 +169,118 @@ def run(
         "nodes": node_states,
         "open_questions": final_state.get("open_questions", []),  # §14: escalation log
         "checkpoint_db": str(db_path),
+    }
+
+
+def resume(
+    run_id: str,
+    graph_json: Optional[dict[str, Any]] = None,
+    *,
+    decision: Any = "approve",
+    runs_dir: Optional[Path] = None,
+    emit: EmitFn = None,
+    agent_fn: Optional[Any] = None,
+    autonomy_default: str = "auto",
+) -> dict[str, Any]:
+    """Resume a gate-paused run with a human decision.
+
+    Reconstructs the graph topology from the persisted .graph.json (or from
+    graph_json if supplied), re-opens the SqliteSaver checkpoint DB, and invokes
+    the compiled graph with Command(resume=decision).
+
+    This is the app-restart-safe resume path: the SqliteSaver connection from the
+    original run() call is fully closed and dropped; a brand-new connection is
+    opened against the same file.  The test for DoD "interrupt() persistence
+    survives app restart" is: call run() → drop all references → call resume()
+    with a fresh executor (new process / new import) → verify completion.
+
+    Args:
+        run_id:            UUID4 of the paused run.
+        graph_json:        The original aicad.dag/1 graph document.  If None, the
+                           executor loads it from the <run_id>.graph.json sidecar
+                           written by run() at start time.
+        decision:          Human decision fed back to interrupt():
+                             "approve"  — proceed (default)
+                             "reject"   — mark gate failed
+                             {"action": "modify", "output": {...}}  — override output
+                           Passed verbatim as Command(resume=decision).
+        runs_dir:          Must match the runs_dir used in the original run() call.
+        emit:              Optional event callback (same signature as run()).
+        agent_fn:          Optional agent callable (same as run()).
+        autonomy_default:  Must match the autonomy_default used in the original run().
+
+    Returns:
+        Same shape as run() — {run_id, status, nodes, checkpoint_db, …}.
+        May be "paused" again if another gate fires downstream.
+    """
+    base_dir: Path = runs_dir if runs_dir is not None else default_runs_dir()
+    db_path = base_dir / f"{run_id}.db"
+
+    if not db_path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint DB not found: {db_path}. "
+            "Pass the same runs_dir used in executor.run()."
+        )
+
+    # Load graph_json from sidecar if not supplied (app-restart path).
+    if graph_json is None:
+        graph_json_path = base_dir / f"{run_id}.graph.json"
+        if not graph_json_path.exists():
+            raise FileNotFoundError(
+                f"Graph sidecar not found: {graph_json_path}. "
+                "Supply graph_json explicitly or ensure run() wrote the sidecar."
+            )
+        graph_json = json.loads(graph_json_path.read_text(encoding="utf-8"))
+
+    validate_graph(graph_json)
+
+    # Reconstruct the identical StateGraph topology and compile with the existing DB.
+    # LangGraph persists STATE, not structure — the graph must be rebuilt identically.
+    uncompiled = build_state_graph(
+        graph_json, emit=emit, agent_fn=agent_fn,
+        autonomy_default=autonomy_default,
+    )
+
+    config = {"configurable": {"thread_id": run_id}}
+
+    with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
+        compiled = uncompiled.compile(checkpointer=checkpointer)
+        # Command(resume=decision) feeds the decision back into interrupt().
+        final_state: DagState = compiled.invoke(Command(resume=decision), config=config)
+
+    # Another gate may have fired downstream.
+    interrupted = final_state.get("__interrupt__", [])
+    if interrupted:
+        interrupt_payloads = [
+            i.value if hasattr(i, "value") else i for i in interrupted
+        ]
+        return {
+            "run_id":        run_id,
+            "name":          graph_json.get("name", ""),
+            "status":        "paused",
+            "nodes":         final_state.get("node_states", {}),
+            "open_questions": final_state.get("open_questions", []),
+            "checkpoint_db": str(db_path),
+            "interrupted":   interrupt_payloads,
+        }
+
+    node_states: dict[str, Any] = final_state.get("node_states", {})
+    run_status = _resolve_run_status(node_states, final_state.get("run_status", "running"))
+
+    if emit:
+        emit("dag.run.done", {
+            "run_id":      run_id,
+            "status":      run_status,
+            "node_states": node_states,
+        })
+
+    return {
+        "run_id":          run_id,
+        "name":            graph_json.get("name", ""),
+        "status":          run_status,
+        "nodes":           node_states,
+        "open_questions":  final_state.get("open_questions", []),
+        "checkpoint_db":   str(db_path),
     }
 
 

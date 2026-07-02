@@ -29,6 +29,8 @@ struct ShotConfig {
     bool wantPmform = false;
     bool wantPreview = false;
     bool wantScaffoldDemo = false;
+    bool wantCamWorkspace = false;            // T-U3: populate + screenshot the CAM workspace panel
+    bool camWorkspaceShotDone = false;
 
     // Worker one-shot shots (fire once when workerStarted)
     bool wantTree = false;

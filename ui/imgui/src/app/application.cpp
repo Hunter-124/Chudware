@@ -10,6 +10,7 @@
 #include "ui/settings_modal.h"
 #include "ui/preview_pane.h"
 #include "ui/scaffold_demo_panel.h"
+#include "ui/cam_panel.h"          // T-U3 CAM workspace
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -184,6 +185,22 @@ void Application::frame() {
         if (ui::previewTakeFocusRequest()) ImGui::SetNextWindowFocus();
         if (ImGui::Begin("Preview###preview", ui::previewPaneOpen(), pflags))
             ui::drawPreviewPane(s);
+        ImGui::End();
+    }
+
+    // T-U3 CAM workspace panel: closable, reveals when a cam_* ribbon command fires or
+    // camWorkspaceLoadJob() is called (e.g. from the copilot fast-path). Floats centered on
+    // first open (ImGuiCond_Appearing) so it surfaces over the viewport; zero footprint when closed.
+    // AI_CAD_SHOT=cam_workspace exercises the populated job / sim / post state.
+    if (*ui::camWorkspacePanelOpen()) {
+        const ImGuiViewport* camVp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(camVp->WorkPos.x + camVp->WorkSize.x * 0.5f,
+                                      camVp->WorkPos.y + camVp->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(820.f * theme::S(), 560.f * theme::S()),
+                                 ImGuiCond_Appearing);
+        if (ImGui::Begin("CAM Workspace###cam_workspace", ui::camWorkspacePanelOpen(), pflags))
+            ui::drawCamWorkspacePanel(s);
         ImGui::End();
     }
 

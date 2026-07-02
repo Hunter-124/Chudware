@@ -53,3 +53,6 @@ write-sets the DAG assigns and let the integrator gate own shared files.
 - The gate has a known pre-existing `PanelField::selMulti` break in ui/imgui (see agent
   memory gate-selmulti-blocker) — not your regression, but wave 1 may be the right
   moment to actually fix it since you own the seam files now.
+
+## Progress log
+- 2026-07-02 17:08 UTC [opus-vale] T-G5 -> review. Wave 1 (F1-F4 + G1 CMake) verified complete & already on master; all 4 verifiable DoD boxes pass (viewport lib builds standalone, Kawase blur+averageLuminance present, no OS ifdef leaks, F4 routes via WorkerClient). BLOCKER (team-wide, not T-G5-specific): clean master does NOT build AI-CAD2 — property_manager.cpp (committed 0c20c37) references PanelField::selMulti but panel_spec.{h,cpp} rewrite is UNCOMMITTED in the main checkout. Proven: applying that staged panel_spec makes AI-CAD2 link + --shot render the full shell. To close: commit the staged panel_spec.{cpp,h} (one-liner in work/questions/T-G5.md). Branch task/T-G5-migration-wave1 pushed (docs only, no code changes needed).

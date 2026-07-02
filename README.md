@@ -136,7 +136,35 @@ Two things to expect on first run, either platform:
   Settings → Connectors (or MCP Servers): Command `python3` (or `py -3` on Windows),
   Args `work/tools/team_mcp.py`'s full path.
 
-Full protocol: [work/README.md](work/README.md)
+**The desired path to contributing** — once registered, an agent (or human driving one)
+has everything needed in the `aicad-team` MCP tools; no raw `git`/`gh` juggling required:
+
+```
+work_board                              # situational awareness: full task board + who's
+                                         # online + open issues — call this first, always
+work_claim(owner="you")                 # atomically claim the next ready task (or a
+                                         # specific task_id) — the ONLY legitimate way in
+work_prompt(task_id="T-XX")             # emit the self-contained work order for it
+  ...do the work, on the branch the work order names...
+work_note(task_id, owner, text)         # log progress so parallel sessions/humans stay
+                                         # current — use at real milestones
+work_status(task_id, owner,             # doing -> review when pushed and awaiting human
+            status="review")           # merge (status can never be set to "done" here —
+                                         # that's a human merge-time action)
+
+issue_list()                            # before fixing any bug: check nobody else has it
+issue_claim(number)                     # claim it on GitHub so fixes never overlap
+graphify_query / graphify_explain /     # scoped subgraph answers instead of repeated
+  graphify_path                         # grep/read loops — use before raw file search
+section_context(section="core-cam")     # pre-mapped source map for a subsystem — see
+                                         # available sections with no args
+team_status / team_send                 # who else is active right now, and message them
+```
+
+Same rules either way (MCP tools or the `/work-*` slash commands are two doors to the
+same system): claim before starting, note progress, never flip anything to `done`
+yourself, and check `issue_list`/`work_board` before touching something someone else
+might already be on. Full protocol: [work/README.md](work/README.md)
 and [work/prompts/autopilot.md](work/prompts/autopilot.md).
 
 ## Where this is going

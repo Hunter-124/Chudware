@@ -8,6 +8,7 @@
 #include "ui/view_selector.h"
 #include "ui/section_tool.h"
 #include "ui/legend.h"
+#include "ui/drawing_panel.h"
 #include "app/app_state.h"
 #include "theme/theme.h"
 #include "theme/icons.h"
@@ -481,6 +482,16 @@ void drawViewport(AppState& s) {
     ImGuiDockNode* node = ImGui::GetWindowDockNode();
     if (node) node->LocalFlags |= ImGuiDockNodeFlags_NoTabBar;
     if (docTabStripHeight(s) > 0.f) drawDocTabs(s, ImGui::GetContentRegionAvail().x);
+
+    // H3: the Drafting workspace hosts the 2D drawing sheet INSIDE this same central Viewport
+    // window instead of the 3D render — mirroring host, which swaps the central area's content by
+    // active-tab kind rather than docking Drawing as a separate tab (unlike CAM/ECAD, which share
+    // this dock node as their own windows). "make_drawing" (app/app_state.cpp dispatch) flips
+    // workspace to Drafting; drawDrawingSheet self-creates the drawing on first render.
+    if (s.workspace == cmd::Workspace::Drafting) {
+        ui::drawDrawingSheet(s);
+        return;
+    }
 
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImVec2 sz = ImGui::GetContentRegionAvail();

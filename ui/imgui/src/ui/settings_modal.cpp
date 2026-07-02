@@ -659,13 +659,13 @@ void drawSettingsModal(app::AppState& st, bool busy) {
     }
 
     if (s_ui.showAbout) {
-        ImGui::OpenPopup("About AI-CAD");
+        ImGui::OpenPopup("About ShopCraft");
         s_ui.showAbout = false;
     }
     ImGui::SetNextWindowSize(ImVec2(380.f * sc, 0), ImGuiCond_Appearing);
-    if (ImGui::BeginPopupModal("About AI-CAD", nullptr, ImGuiWindowFlags_NoResize)) {
+    if (ImGui::BeginPopupModal("About ShopCraft", nullptr, ImGuiWindowFlags_NoResize)) {
         ImGui::PushFont(theme::font(theme::Font::H1));
-        ImGui::TextColored(TVEC(txt0), "AI-CAD");
+        ImGui::TextColored(TVEC(txt0), "ShopCraft");
         ImGui::PopFont();
         dimText("Parametric CAD, driven by AI.");
         ImGui::Dummy(ImVec2(0, 4 * sc));

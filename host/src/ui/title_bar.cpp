@@ -366,7 +366,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
                 st.showAIPanel = true;
                 st.aiInteraction = 2;  // Ask
             }
-            if (ImGui::MenuItem("About AI-CAD")) st.showAbout = true;
+            if (ImGui::MenuItem("About ShopCraft")) st.showAbout = true;
             // Documentation / Keyboard Shortcuts have no backing yet — greyed placeholders.
             ImGui::MenuItem("Documentation", nullptr, false, false);
             ImGui::MenuItem("Keyboard Shortcuts", nullptr, false, false);

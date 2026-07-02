@@ -760,7 +760,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // creates a normal window and strips the frame later via the WndProc in chrome::install.)
     glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
 #endif
-    GLFWwindow* win = glfwCreateWindow(shot ? 1340 : 1440, shot ? 838 : 900, "AI-CAD", nullptr, nullptr);
+    GLFWwindow* win = glfwCreateWindow(shot ? 1340 : 1440, shot ? 838 : 900, "ShopCraft", nullptr, nullptr);
     if (!win) { glfwTerminate(); return 1; }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
@@ -1964,7 +1964,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                                      st.job.error.find("No module named") != std::string::npos;
                 if (missingModule && !st.importRepairTried && !st.setupRunning.load()) {
                     st.importRepairTried = true;
-                    st.addLog("[..] runtime module missing — auto-repairing (use AI-CAD > Repair runtime if this persists)...");
+                    st.addLog("[..] runtime module missing — auto-repairing (use ShopCraft > Repair runtime if this persists)...");
                     st.startSetup(true);
                     assistant = "A required module is missing from the runtime — repairing now (may take a minute). Try again once the console shows setup complete.";
                 } else {
@@ -2781,12 +2781,12 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         {
             static bool s_quitModalOpen = false;
             if (st.wantQuitConfirm) { st.wantQuitConfirm = false; s_quitModalOpen = true; }
-            if (s_quitModalOpen) ImGui::OpenPopup("Quit AI-CAD?##appquit");
+            if (s_quitModalOpen) ImGui::OpenPopup("Quit ShopCraft?##appquit");
             ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f,
                                            vp->Pos.y + vp->Size.y * 0.5f),
                                     ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
             bool open = true;
-            if (ImGui::BeginPopupModal("Quit AI-CAD?##appquit", &open,
+            if (ImGui::BeginPopupModal("Quit ShopCraft?##appquit", &open,
                                        ImGuiWindowFlags_AlwaysAutoResize |
                                            ImGuiWindowFlags_NoSavedSettings)) {
                 int n = 0;

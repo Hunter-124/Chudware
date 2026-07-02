@@ -429,7 +429,7 @@ static void drawCopilotHeader(AppState& s, bool busy) {
     ImGui::PushFont(theme::font(theme::Font::H2));
     inlineIconGlass("agent", 18.f * S, ImGui::ColorConvertFloat4ToU32(surf.textPrimary));
     ImGui::SameLine(0, 8.f * S);
-    ImGui::TextColored(surf.textPrimary, "AI-CAD Copilot");
+    ImGui::TextColored(surf.textPrimary, "ShopCraft Copilot");
     ImGui::PopFont();
 
     const ImGuiStyle& style = ImGui::GetStyle();

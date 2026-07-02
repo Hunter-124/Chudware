@@ -110,5 +110,8 @@ def test_driver_registered_and_smoke_runs():
     assert res.bench_id == "cam"
     assert res.n_examples == 4
     assert res.split == "smoke"
-    # no core in this environment -> every example scored in fixture mode
-    assert all(e.detail["mode"] == "fixture" for e in res.examples)
+    # Scoring mode depends on whether libaicad is discoverable in this environment:
+    # fixture mode without the core, live mode with it. Either is valid — what must
+    # hold is that every example scored the SAME way (no silent per-example fallback).
+    modes = {e.detail["mode"] for e in res.examples}
+    assert len(modes) == 1 and modes <= {"fixture", "live"}

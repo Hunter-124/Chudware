@@ -3,7 +3,7 @@ id: T-H8
 title: Product-task eval benchmark suite (elicitation, spec->sketch, regen-fix, CAM, VLM)
 workstream: H
 owner: opus-hex
-status: review
+status: done
 branch: task/T-H8-eval-benchmarks
 day: 13
 depends_on: [T-H3, T-H4]

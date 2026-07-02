@@ -89,7 +89,7 @@ graph TD
     T_H5["T-H5: Training data store - consent-filtered exporter, DVC versioning, Argilla audit gate"]:::done
     T_H6["T-H6: Fleet training runner - claim-based job queue, cross-OS profiles, MLflow tracking"]:::done
     T_H7["T-H7: Frontier-API logging middleware + shadow-mode comparison harness"]:::done
-    T_H8["T-H8: Product-task eval benchmark suite (elicitation, spec->sketch, regen-fix, CAM, VLM)"]:::doing
+    T_H8["T-H8: Product-task eval benchmark suite (elicitation, spec->sketch, regen-fix, CAM, VLM)"]:::done
     T_H9["T-H9: Adapter serving - vLLM per-task LoRA routing, canary rollout, rollback story"]:::todo
   end
   subgraph WS_backlog["workstream backlog"]

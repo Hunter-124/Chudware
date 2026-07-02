@@ -28,6 +28,7 @@ struct ShotConfig {
     bool wantExplorer = false;
     bool wantPmform = false;
     bool wantPreview = false;
+    bool wantScaffoldDemo = false;
 
     // Worker one-shot shots (fire once when workerStarted)
     bool wantTree = false;

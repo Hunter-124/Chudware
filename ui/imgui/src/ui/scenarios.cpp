@@ -7,6 +7,7 @@
 #include "ui/settings_modal.h"
 #include "ui/file_explorer.h"
 #include "ui/preview_pane.h"
+#include "ui/scaffold_demo_panel.h"
 #include "artifact_view.h"
 #include "app/app_state.h"
 #include "viewport/scene.h"
@@ -263,6 +264,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantAsm = eq("asm");
     cfg.wantPmform = eq("pmform");
     cfg.wantPreview = eq("preview");
+    cfg.wantScaffoldDemo = eq("scaffold_demo");
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
@@ -305,6 +307,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantPlan) seedPlanShot(st);
     if (cfg.wantAssembly) seedAssemblyShot(st);
     if (cfg.wantPreview) seedPreviewShot(st);
+    if (cfg.wantScaffoldDemo) ui::openScaffoldDemoPanel();
     if (cfg.wantPick) setupPickShot(st);
     if (cfg.wantGlassperf) setupPickShot(st);
 

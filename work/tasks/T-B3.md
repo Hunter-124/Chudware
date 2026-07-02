@@ -2,8 +2,8 @@
 id: T-B3
 title: Cost model (material + machining) and quote-out tools
 workstream: B
-owner: unassigned
-status: todo
+owner: opus-hale
+status: doing
 branch: task/T-B3-cost-model
 day: 3
 depends_on: [T-B2]

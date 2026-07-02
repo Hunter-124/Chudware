@@ -27,6 +27,10 @@ GenResult gen_adaptive2d(const Operation& opIn, const OpContext& ctx) {
     pb.set_spindle((int)std::lround(op.rpm));
     auto levels = depth_levels(op.heights.top, op.heights.bottom, stepdown, op.stock_to_leave_axial);
 
+    // Largest ring-to-ring link distance seen across the whole op, for the
+    // engagement-exceeded check below (see op_common.h link_ring/rotate_ring_to_nearest).
+    double max_link_dist = 0.0;
+
     for (const Region& reg : regs) {
         auto offs = geo::pocket_offsets(reg, r, engage, op.stock_to_leave);
         if (offs.empty()) { res.warnings.push_back("adaptive: tool too large"); continue; }
@@ -36,19 +40,40 @@ GenResult gen_adaptive2d(const Operation& opIn, const OpContext& ctx) {
             // trochoidal helical entry to full depth (no straight plunge)
             double pitch = std::max(0.2, helix_r * std::tan(std::max(1.5, op.ramp.angle) * M_PI / 180.0) * 2);
             pb.helix_entry(entry, helix_r, op.heights.top, z, op.ramp_feed, pitch);
-            // clear inner -> outer with the engagement-limited loops, linked at depth
+            // Clear inner -> outer. This is concentric-offset ring clearing; with
+            // arc_blend_linking (the default) each ring-to-ring transition is a
+            // tangent arc-blend link (rotate the next ring to start nearest the
+            // tool, then a semicircular arc) instead of a direct feed_to, which is
+            // what keeps this "adaptive" (bounded engagement) rather than plain
+            // concentric-offset clearing. The very first ring of a level is entered
+            // from the helix bore, not from another ring, so it is not tracked as a
+            // ring-transition.
+            bool have_prev = false;
+            Vec2 prev{0, 0};
             for (auto it = offs.rbegin(); it != offs.rend(); ++it) {
                 for (Path2& loop : *it) {
                     if (loop.size() < 3) continue;
                     bool ccw = geo::is_ccw(loop);
                     bool want = (op.direction == CutDirection::Climb);
                     Path2 cl = (ccw == want) ? loop : Path2(loop.rbegin(), loop.rend());
-                    pb.feed_to(cl.front(), z);
+                    if (have_prev && op.arc_blend_linking) cl = rotate_ring_to_nearest(cl, prev);
+                    if (have_prev) {
+                        double link_dist = link_ring(pb, prev, cl.front(), z, op.arc_blend_linking, entry);
+                        max_link_dist = std::max(max_link_dist, link_dist);
+                    } else {
+                        pb.feed_to(cl.front(), z);
+                    }
                     for (size_t i = 1; i <= cl.size(); ++i) pb.feed_to(cl[i % cl.size()], z);
+                    prev = cl.front();
+                    have_prev = true;
                 }
             }
             pb.rapid_to_clearance();
         }
+    }
+    if (max_link_dist > op.stepover * 1.5) {
+        res.warnings.push_back("adaptive: ring-transition engagement exceeds 1.5x stepover — "
+                               "arc-blend linking recommended");
     }
     res.path = pb.take(ctx.tool.number, ctx.machine);
     res.path.op_id = op.id;

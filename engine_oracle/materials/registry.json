@@ -1,0 +1,197 @@
+{
+  "version": "v1",
+  "provenance_note": "First-party engineering fact table: public handbook nominal values (ASM Metals Reference, MMPDS/MIL-HDBK-5 nominal, manufacturer public datasheets). Nominal engineering priors for first-pass sizing, not certified allowables. No MatWeb/MakeItFrom/Matmatch content.",
+  "materials": {
+    "steel_a36": {
+      "name": "Mild steel (A36)",
+      "category": "metal",
+      "aliases": ["steel", "mild steel", "carbon steel", "a36"],
+      "mechanical": {"E_mpa": 200000, "nu": 0.29, "density_g_cm3": 7.85, "yield_mpa": 250, "ultimate_mpa": 400, "endurance_mpa": 200},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "stainless_304": {
+      "name": "Stainless 304",
+      "category": "metal",
+      "aliases": ["stainless", "ss", "304", "stainless steel"],
+      "mechanical": {"E_mpa": 193000, "nu": 0.29, "density_g_cm3": 8.0, "yield_mpa": 215, "ultimate_mpa": 505, "endurance_mpa": 240},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "aluminum_6061_t6": {
+      "name": "Aluminium 6061-T6",
+      "category": "metal",
+      "aliases": ["aluminum", "aluminium", "al", "6061", "alu", "6061-t6"],
+      "mechanical": {"E_mpa": 69000, "nu": 0.33, "density_g_cm3": 2.70, "yield_mpa": 276, "ultimate_mpa": 310, "endurance_mpa": 96},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "titanium_ti6al4v": {
+      "name": "Titanium Ti-6Al-4V",
+      "category": "metal",
+      "aliases": ["titanium", "ti", "ti-6al-4v"],
+      "mechanical": {"E_mpa": 113800, "nu": 0.342, "density_g_cm3": 4.43, "yield_mpa": 880, "ultimate_mpa": 950, "endurance_mpa": 510},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "brass_c360": {
+      "name": "Brass C360",
+      "category": "metal",
+      "aliases": ["brass", "c360", "free-cutting brass"],
+      "mechanical": {"E_mpa": 97000, "nu": 0.34, "density_g_cm3": 8.5, "yield_mpa": 124, "ultimate_mpa": 338, "endurance_mpa": 120},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "abs": {
+      "name": "ABS plastic",
+      "category": "plastic",
+      "aliases": ["abs plastic"],
+      "mechanical": {"E_mpa": 2300, "nu": 0.35, "density_g_cm3": 1.04, "yield_mpa": 40, "ultimate_mpa": 44, "endurance_mpa": 15},
+      "provenance": {"source": "Manufacturer public datasheet nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "pla": {
+      "name": "PLA plastic",
+      "category": "plastic",
+      "aliases": ["pla plastic"],
+      "mechanical": {"E_mpa": 3500, "nu": 0.36, "density_g_cm3": 1.24, "yield_mpa": 50, "ultimate_mpa": 50, "endurance_mpa": 18},
+      "provenance": {"source": "Manufacturer public datasheet nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "steel_1018": {
+      "name": "Steel AISI 1018",
+      "category": "metal",
+      "aliases": ["1018", "aisi 1018", "low carbon steel"],
+      "mechanical": {"E_mpa": 200000, "nu": 0.29, "density_g_cm3": 7.87, "yield_mpa": 370, "ultimate_mpa": 440, "endurance_mpa": 220},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "steel_1045": {
+      "name": "Steel AISI 1045",
+      "category": "metal",
+      "aliases": ["1045", "aisi 1045", "medium carbon steel"],
+      "mechanical": {"E_mpa": 200000, "nu": 0.29, "density_g_cm3": 7.85, "yield_mpa": 450, "ultimate_mpa": 585, "endurance_mpa": 290},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "cast_iron_gray": {
+      "name": "Cast Iron (Gray)",
+      "category": "metal",
+      "aliases": ["cast iron", "gray iron", "grey iron"],
+      "mechanical": {"E_mpa": 110000, "nu": 0.26, "density_g_cm3": 7.20, "yield_mpa": 130, "ultimate_mpa": 240, "endurance_mpa": 100},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "aluminum_7075_t6": {
+      "name": "Aluminium 7075-T6",
+      "category": "metal",
+      "aliases": ["7075", "7075-t6", "al 7075"],
+      "mechanical": {"E_mpa": 71700, "nu": 0.33, "density_g_cm3": 2.81, "yield_mpa": 503, "ultimate_mpa": 572, "endurance_mpa": 159},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "aluminum_2024_t3": {
+      "name": "Aluminium 2024-T3",
+      "category": "metal",
+      "aliases": ["2024", "2024-t3", "al 2024"],
+      "mechanical": {"E_mpa": 73100, "nu": 0.33, "density_g_cm3": 2.78, "yield_mpa": 345, "ultimate_mpa": 483, "endurance_mpa": 138},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "copper_c110": {
+      "name": "Copper C110",
+      "category": "metal",
+      "aliases": ["copper", "c110", "electrolytic copper"],
+      "mechanical": {"E_mpa": 117000, "nu": 0.34, "density_g_cm3": 8.94, "yield_mpa": 70, "ultimate_mpa": 220, "endurance_mpa": 76},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "magnesium_az31b": {
+      "name": "Magnesium AZ31B",
+      "category": "metal",
+      "aliases": ["magnesium", "az31b", "az31"],
+      "mechanical": {"E_mpa": 45000, "nu": 0.35, "density_g_cm3": 1.77, "yield_mpa": 200, "ultimate_mpa": 260, "endurance_mpa": 90},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "titanium_grade_2": {
+      "name": "Titanium Grade 2 (CP)",
+      "category": "metal",
+      "aliases": ["ti grade 2", "cp titanium", "grade 2 titanium"],
+      "mechanical": {"E_mpa": 105000, "nu": 0.37, "density_g_cm3": 4.51, "yield_mpa": 275, "ultimate_mpa": 345, "endurance_mpa": 190},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "inconel_718": {
+      "name": "Inconel 718",
+      "category": "metal",
+      "aliases": ["inconel", "inconel 718", "alloy 718"],
+      "mechanical": {"E_mpa": 200000, "nu": 0.29, "density_g_cm3": 8.19, "yield_mpa": 1100, "ultimate_mpa": 1375, "endurance_mpa": 620},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "tungsten": {
+      "name": "Tungsten",
+      "category": "metal",
+      "aliases": ["w"],
+      "mechanical": {"E_mpa": 411000, "nu": 0.28, "density_g_cm3": 19.25, "yield_mpa": 750, "ultimate_mpa": 980, "endurance_mpa": 430},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "lead": {
+      "name": "Lead",
+      "category": "metal",
+      "aliases": ["pb"],
+      "mechanical": {"E_mpa": 16000, "nu": 0.44, "density_g_cm3": 11.34, "yield_mpa": 12, "ultimate_mpa": 18, "endurance_mpa": 5},
+      "provenance": {"source": "ASM Metals Reference / MMPDS nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "petg": {
+      "name": "PETG",
+      "category": "plastic",
+      "aliases": [],
+      "mechanical": {"E_mpa": 2100, "nu": 0.37, "density_g_cm3": 1.27, "yield_mpa": 50, "ultimate_mpa": 53, "endurance_mpa": 16},
+      "provenance": {"source": "Manufacturer public datasheet nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "nylon_pa12": {
+      "name": "Nylon PA-12",
+      "category": "plastic",
+      "aliases": ["pa12", "pa-12", "nylon 12"],
+      "mechanical": {"E_mpa": 1600, "nu": 0.39, "density_g_cm3": 1.01, "yield_mpa": 45, "ultimate_mpa": 48, "endurance_mpa": 15},
+      "provenance": {"source": "Manufacturer public datasheet nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "nylon_66": {
+      "name": "Nylon 6/6",
+      "category": "plastic",
+      "aliases": ["nylon", "pa66", "nylon 66"],
+      "mechanical": {"E_mpa": 2900, "nu": 0.39, "density_g_cm3": 1.14, "yield_mpa": 82, "ultimate_mpa": 85, "endurance_mpa": 26},
+      "provenance": {"source": "Manufacturer public datasheet nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "polycarbonate": {
+      "name": "Polycarbonate",
+      "category": "plastic",
+      "aliases": ["pc", "lexan"],
+      "mechanical": {"E_mpa": 2300, "nu": 0.37, "density_g_cm3": 1.20, "yield_mpa": 62, "ultimate_mpa": 66, "endurance_mpa": 20},
+      "provenance": {"source": "Manufacturer public datasheet nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "peek": {
+      "name": "PEEK",
+      "category": "plastic",
+      "aliases": [],
+      "mechanical": {"E_mpa": 3600, "nu": 0.38, "density_g_cm3": 1.32, "yield_mpa": 97, "ultimate_mpa": 100, "endurance_mpa": 32},
+      "provenance": {"source": "Manufacturer public datasheet nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "acrylic_pmma": {
+      "name": "Acrylic (PMMA)",
+      "category": "plastic",
+      "aliases": ["acrylic", "pmma", "plexiglass"],
+      "mechanical": {"E_mpa": 3200, "nu": 0.37, "density_g_cm3": 1.18, "yield_mpa": 70, "ultimate_mpa": 72, "endurance_mpa": 22},
+      "provenance": {"source": "Manufacturer public datasheet nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "carbon_fiber_ud": {
+      "name": "Carbon Fiber (UD, iso-equivalent)",
+      "category": "composite",
+      "aliases": ["carbon fiber", "cfrp", "carbon"],
+      "mechanical": {"E_mpa": 135000, "nu": 0.30, "density_g_cm3": 1.60, "yield_mpa": 1500, "ultimate_mpa": 1600, "endurance_mpa": 640},
+      "provenance": {"source": "Engineering handbook nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "concrete": {
+      "name": "Concrete",
+      "category": "ceramic",
+      "aliases": [],
+      "mechanical": {"E_mpa": 30000, "nu": 0.20, "density_g_cm3": 2.40, "yield_mpa": 30, "ultimate_mpa": 40, "endurance_mpa": 18},
+      "provenance": {"source": "Engineering handbook nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    },
+    "glass_soda_lime": {
+      "name": "Glass (Soda-Lime)",
+      "category": "ceramic",
+      "aliases": ["glass", "soda-lime glass"],
+      "mechanical": {"E_mpa": 70000, "nu": 0.22, "density_g_cm3": 2.52, "yield_mpa": 50, "ultimate_mpa": 50, "endurance_mpa": 22},
+      "provenance": {"source": "Engineering handbook nominal (first-party compilation)", "source_type": "first_party", "license": "first-party compilation", "url": null}
+    }
+  },
+  "fea_canonical": {"steel":"steel_a36","stainless":"stainless_304","aluminum":"aluminum_6061_t6","titanium":"titanium_ti6al4v","brass":"brass_c360","abs":"abs","pla":"pla"},
+  "fea_aliases": {"mild steel":"steel","carbon steel":"steel","a36":"steel","ss":"stainless","304":"stainless","stainless steel":"stainless","aluminium":"aluminum","al":"aluminum","6061":"aluminum","alu":"aluminum","ti":"titanium","ti-6al-4v":"titanium"}
+}

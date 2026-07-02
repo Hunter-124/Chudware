@@ -3,7 +3,7 @@ id: T-D3
 title: Section libraries, D/C ratio checks, and struct_check MCP tool
 workstream: D
 owner: sonnet-mave
-status: review
+status: done
 branch: task/T-D3-section-libraries-checks
 day: 3
 depends_on: [T-D2]

@@ -29,13 +29,13 @@ graph TD
     T_C1["T-C1: firmware_rpc.md contract and engine/firmware/ scaffold"]:::done
     T_C2["T-C2: Compile loop and pin-map header from ECAD netlist"]:::done
     T_C3["T-C3: Emulation loop via Renode with fw_sim_run MCP tool"]:::done
-    T_C4["T-C4: Hardware path - probe-rs flash/debug and clangd LSP tools"]:::todo
+    T_C4["T-C4: Hardware path - probe-rs flash/debug and clangd LSP tools"]:::doing
     T_C5["T-C5: firmware.md agent prompt and demo firmware in Renode"]:::todo
   end
   subgraph WS_D["workstream D"]
     T_D1["T-D1: structural_schema.md contract and engine/structural/ scaffold"]:::done
     T_D2["T-D2: PyNite integration - member forces and deflections"]:::done
-    T_D3["T-D3: Section libraries, D/C ratio checks, and struct_check MCP tool"]:::doing
+    T_D3["T-D3: Section libraries, D/C ratio checks, and struct_check MCP tool"]:::done
     T_D4["T-D4: Code compliance - agentic RAG and deterministic rule engine"]:::todo
     T_D5["T-D5: Cost takeoff and struct_estimate MCP tool with integration demo"]:::todo
   end

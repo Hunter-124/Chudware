@@ -399,3 +399,66 @@ Implemented + machine-checked by `engine/doc/schema.py::_validate_configurations
 `engine/doc/compiler.py` (`resolve_active_config` / `apply_configuration_to_doc` /
 `_config_effective_features`), and `engine/doc/test_configurations.py`. The `config_*` worker RPCs
 that drive configurations live in [worker_rpc.md §Configurations](worker_rpc.md).
+
+## Appendix A — Canonical `document.json` dump policy (T-H2)
+
+**Goal:** saving the same document twice, or rebuilding geometry that did not change, must yield
+byte-identical `document.json` so that PDM-lite (T-BL10), correction-trace diffing (T-H1), and
+`doc_diff` (below) produce zero false-positive deltas.
+
+### Rules (normative for every `document.json` producer)
+
+| Rule | Detail |
+|---|---|
+| **Sorted keys** | Object keys MUST be emitted in lexicographic (ASCII) order. |
+| **Float rounding** | Every float MUST be rounded to **6 decimal places** before serialization (µm-grade for mm lengths; covers 1e-3 deg for angles). Rounding is applied at serialize time only — in-memory doubles are never mutated. |
+| **No timestamps** | `document.json` MUST NOT contain wall-clock timestamps or build counters. Timestamps belong in `meta.json` only (exempt from the byte-stability requirement). |
+| **indent=2** | Two-space indentation, no trailing whitespace. |
+| **UTF-8, no BOM** | The file is UTF-8 encoded with no byte-order mark. |
+
+### Noise sources eliminated (from §3.2 checklist)
+
+| Source | Fix |
+|---|---|
+| Float dust (`599.9999…`, `1e-16` centroid residuals) | Round to 6 dp at serialize time |
+| Non-canonical key order in some emitters | Sort keys |
+| Timestamps inside `document.json` | Moved to `meta.json` exclusively |
+
+### Implementations
+
+- **C++** (`.step+` save path): `core/doc/stepplus.cpp::canonical_doc_json()` — calls
+  `round_floats(doc, 6).dump(2)`. `nlohmann::json` uses `std::map` → keys are already sorted.
+- **Python** (utility + ECAD already canonical): `engine/doc/canonical.py::canonical_dump()` —
+  calls `json.dumps(round_floats_doc(doc), indent=2, sort_keys=True)`.
+- ECAD `.ecad+` save (`engine/ecad/formats.py:107`) already uses `sort_keys=True`; the float
+  rounding rule applies there too via `engine/doc/canonical.py` if ECAD floats ever carry dust.
+
+### `doc_diff` — semantic document diff
+
+`doc_diff(rev_a, rev_b)` computes a feature-level delta between two canonical `document.json`
+dicts. Both inputs MUST be already-canonical (use `canonical_dump` before persisting; call on
+the parsed dict for in-memory diffs). The diff is keyed on stable ids (`f*`, `e*`, `c*`,
+`k*`, `m*`) and returns:
+
+```json
+{
+  "features_added":   ["f4", "f5"],
+  "features_removed": ["f2"],
+  "features_changed": ["f3"],
+  "params_changed": [
+    {"feature": "f3", "param": "depth", "old": {"value": 10.0, "expr": null},
+                                         "new": {"value": 15.0, "expr": null}}
+  ],
+  "sketch_deltas": [
+    {"feature": "f1", "entities_added": [], "entities_removed": ["e7"],
+     "constraints_added": [], "constraints_removed": []}
+  ],
+  "mate_deltas": [],
+  "suppression_flips": [{"id": "f2", "old": false, "new": true}]
+}
+```
+
+`refs` churn is ignored when the resolved target is unchanged (ref id re-numbering after
+paste/undo must not produce false positives).
+
+Implemented in `services/mcp/doc_diff_tools.py`, registered as MCP tool `doc_diff`.

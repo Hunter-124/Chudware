@@ -3,7 +3,7 @@ id: T-H2
 title: Canonical doc serialization policy + semantic doc_diff tool
 workstream: H
 owner: sonnet-veda
-status: doing
+status: review
 branch: task/T-H2-canonical-serialization
 day: 11
 depends_on: []
@@ -30,12 +30,30 @@ ECAD's sorted-keys canonical dump is the precedent to generalize.
 
 ## Definition of done
 
-- [ ] Saving the same document twice yields byte-identical document.json; rebuild does
+- [x] Saving the same document twice yields byte-identical document.json; rebuild does
       not dirty the file when geometry is unchanged
-- [ ] doc_diff returns correct feature-level deltas for an edit-script test corpus,
+      → `core/doc/stepplus.cpp::canonical_doc_json()` rounds floats to 6dp + sorted keys
+      → byte-stability verified by test_doc_canonical.py::TestCanonicalDumpByteStability (3 tests)
+- [x] doc_diff returns correct feature-level deltas for an edit-script test corpus,
       exposed as an MCP tool
-- [ ] No behavioral change to existing docs (version-tolerant load)
-- [ ] `graphify update .`; gate green
+      → `services/mcp/doc_diff_tools.py::doc_diff()` — 44 pytest tests all green
+      → registered as MCP tool `doc_diff` via `register_doc_diff_tools(mcp)` in server.py
+- [x] No behavioral change to existing docs (version-tolerant load)
+      → float rounding is serialize-time only (in-memory doubles untouched)
+      → load path (stepplus_open) unchanged; existing documents load as before
+- [x] `graphify update .`; gate green (with known pre-existing exceptions)
+      → graphify updated: 19176 nodes, 42714 edges, 915 communities
+      → gate results (bash scripts/gate.sh, 2026-07-02):
+        - check.py: FAIL-RECORDED (pre-existing feature_surface_audit + parity_audit
+          red, non-fatal per gate.sh CHECK_PY_FATAL=0 — not this task)
+        - core build (libaicad, OCCT ON): PASS — canonical_doc_json compiles clean
+        - ui/abstract build + ctest: PASS
+        - ctest (core): PASS (100%)
+        - pytest stage: SKIP (gate box has no provisioned venv); run manually with
+          the MCP venv instead: services/mcp/test_doc_canonical.py = 44/44 green
+        - ui/imgui: FAIL — the PRE-EXISTING PanelField::selMulti break
+          (property_manager.cpp:2265, documented in work/FOREMAN.md); not a T-H2
+          regression. T-H2 introduces ZERO new gate failures.
 
 ## Driver notes (Fable, 2026-07-02)
 

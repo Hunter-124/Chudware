@@ -6,7 +6,7 @@ owner: unassigned
 status: todo
 branch: task/T-G9-migration-cutover
 day: 10
-depends_on: [T-G8, T-G4]
+depends_on: [T-G8, T-G4, T-G12]
 ---
 
 ## Context
@@ -45,7 +45,7 @@ is the production GUI on Linux; `host/` survives only until T-G11's Windows chec
 
 - [ ] gui_lint theme clean; no over-viewport surface off the adaptive-glass API
 - [ ] 21/21 scenario pairs signed off; interactive manual pass done
-- [ ] T-G12 checklist re-run on the new binary by a human; zero unresolved must-fix rows
+- [ ] T-G12 loop CONVERGED on the new binary: a full human walkthrough round with zero new must-fix findings (recursive protocol in T-G12 — rounds repeat until this holds)
 - [ ] host/DEPRECATED.md deletion criteria 1-4 all green
 - [ ] `bash scripts/gate.sh` green scanning the new tree; `graphify update .` run
 

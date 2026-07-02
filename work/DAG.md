@@ -69,7 +69,7 @@ graph TD
     T_G1["T-G1: Land the uncommitted GUI working tree in scoped commits"]:::done
     T_G10["T-G10: ShopCraft rename tiers 2+3 - build targets, env vars, MCP id, appdata"]:::todo
     T_G11["T-G11: Windows build verify, then delete host/ and all deprecated GUI code"]:::todo
-    T_G12["T-G12: Human UI walkthrough - element-by-element feedback checklist"]:::todo
+    T_G12["T-G12: Human UI walkthrough - recursive element-by-element feedback loop until converged"]:::todo
     T_G2["T-G2: Restore doc-tab input, shrink Copilot header, PM button contrast"]:::doing
     T_G3["T-G3: ShopCraft rename tier 1 - user-visible branding strings"]:::todo
     T_G4["T-G4: GUI dead-code and cleanliness pass on host/"]:::doing
@@ -169,6 +169,7 @@ graph TD
   T_G7 --> T_G8
   T_G8 --> T_G9
   T_G4 --> T_G9
+  T_G12 --> T_G9
   T_F5 --> T_H10
   T_H8 --> T_H10
   T_H7 --> T_H11

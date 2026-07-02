@@ -1,0 +1,14 @@
+{
+  "corpus_id": "vlm_corpus_v1",
+  "families": [
+    "bracket",
+    "enclosure",
+    "flange",
+    "plate",
+    "shaft"
+  ],
+  "hash": "sha256:0ea75582ccb5e330f9bdd2a3b79170ba1eee74739ccae0c3404be64ad8e0c46d",
+  "n_examples": 25,
+  "provenance": "synthetic",
+  "seeds": 3
+}

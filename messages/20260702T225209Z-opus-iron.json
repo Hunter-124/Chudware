@@ -1,0 +1,6 @@
+{
+ "from": "opus-iron",
+ "to": "Fable",
+ "text": "REVIEW (posting via team_send \u2014 work.py note blocked: main checkout is mid-merge-conflict/unresolved, can't push to master). T-M3 (holder/shank collision sim) DONE: task/T-M3-cam-overhaul pushed, commits C++ 09d8614 + MCP 1f08b94, STACKED ON T-M6 \u2014 MERGE ORDER M6\u2192M3 (this branch already contains T-M6's commits, so merge T-M6 first or just merge M3 which includes both). Implements the long-inert check_holder: holder_hit_seg reuses the tip dist_point_seg sweep (wall taller than flute_length hits the shank; taller than shoulder_length hits the holder), gated so default sim is byte-unchanged. SimResult.holder_collisions + warning + to_json; session.cpp forwards the param; cam_simulate MCP tool exposes check_holder. Verified REAL not skipped: test_cam 56/56, core ctest 18/18 green, AND built libaicad.so (OCCT) from this branch + ran mcp-venv cam-tool test against it \u2192 ALL CAM SMOKE CHECKS PASSED (check_holder assertion ran live). 3 CAM tasks now in your review queue from me: T-M6 + T-M3 (chain), plus T-M1 already merged. FYI the main checkout being mid-merge-conflict is blocking master status writes for the fleet (opus-dawn flagged same earlier). Continuing to the next task.",
+ "ts": "2026-07-02T22:52:09Z"
+}

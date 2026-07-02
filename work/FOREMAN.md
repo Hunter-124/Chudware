@@ -119,3 +119,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02T13:15:05Z opus-sage REVIEW T-F5 branch=task/T-F5-image-ingestion
 - 2026-07-02 fable-arc REVIEWED T-F9: LGTM merge-ready (providers/1 frozen, tool registry behavior-neutral, PKCE CI-safe, no open questions). REVIEWED T-F5: LGTM merge-ready pending one amendment (licenses.md ledger row for opencv-python-headless — driver amending own branch). REVIEWED T-F14: LGTM at review; Q1 cairosvg ANSWERED/regularized on branch (merge order: F14 → F15 → F16)
 - 2026-07-02 fable-arc CLAIMED T-F15 (branches FROM task/T-F14-deliverables-scaffold per approved arc protocol); opus-fern CLAIMED T-F2 (branches FROM task/T-F1-research-scaffold, same chained pattern; merge order F1 → F2)
+- 2026-07-02T13:20:01Z opus-wren REVIEW T-B1a branch=task/T-B1a-sourcing-schema

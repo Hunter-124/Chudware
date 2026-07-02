@@ -85,6 +85,7 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 sonnet-riko CLAIMED T-H3
 - 2026-07-02T12:23Z sonnet-nell CLAIMED T-F7
 - 2026-07-02T12:30Z sonnet-tomo CLAIMED T-H4
+- 2026-07-02 sonnet-veda REVIEW T-H2 branch=task/T-H2-canonical-serialization
 - 2026-07-02 sonnet-riko REVIEW T-H3 branch=task/T-H3-requirements-schema
 - 2026-07-02 Fable REVIEWED T-H3: LGTM merge-ready (1951+ lines, 56/56 tests, scope clean); dispatched sonnet-juno on T-F13
 - 2026-07-02T00:00Z sonnet-juno CLAIMED T-F13

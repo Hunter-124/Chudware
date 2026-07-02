@@ -17,6 +17,15 @@ first-pass sizing, not a certified allowables database.
 Stdlib-only (``json`` + ``pathlib``); no engine/OCP imports so any layer can read it.
 The JSON seed (~two dozen common alloys/plastics) is intentionally extensible — append
 rows to ``registry.json`` following the same schema; nothing here is hard-coded.
+
+Optional per-row schema fields (supervisor sign-off, T-F2 Q1/Q2):
+
+* ``condition`` — temper/state string (``"T6"``, ``"T3"``, ``"annealed"``) making the
+  basis of the mechanical values self-explanatory (e.g. brass C360 yield 124 MPa is the
+  *annealed* value; a harder temper is ~310 MPa and must be asserted explicitly).
+* ``machinability_pct`` — machinability rating, **AISI 1212 = 100 reference datum**
+  (see ``machinability_reference`` in the JSON). Unseeded in v1: populate only with
+  cited first-party data — never fabricated — when the CAM cutting DB folds in.
 """
 from __future__ import annotations
 

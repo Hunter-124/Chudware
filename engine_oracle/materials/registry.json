@@ -76,7 +76,8 @@
         "source_type": "first_party",
         "license": "first-party compilation",
         "url": null
-      }
+      },
+      "condition": "T6"
     },
     "titanium_ti6al4v": {
       "name": "Titanium Ti-6Al-4V",
@@ -123,7 +124,8 @@
         "source_type": "first_party",
         "license": "first-party compilation",
         "url": null
-      }
+      },
+      "condition": "annealed"
     },
     "abs": {
       "name": "ABS plastic",
@@ -258,7 +260,8 @@
         "source_type": "first_party",
         "license": "first-party compilation",
         "url": null
-      }
+      },
+      "condition": "T6"
     },
     "aluminum_2024_t3": {
       "name": "Aluminium 2024-T3",
@@ -282,7 +285,8 @@
         "source_type": "first_party",
         "license": "first-party compilation",
         "url": null
-      }
+      },
+      "condition": "T3"
     },
     "copper_c110": {
       "name": "Copper C110",
@@ -635,5 +639,11 @@
     "alu": "aluminum",
     "ti": "titanium",
     "ti-6al-4v": "titanium"
+  },
+  "machinability_reference": {
+    "field": "machinability_pct",
+    "basis": "AISI 1212 free-machining steel = 100 (the standard machinability reference datum)",
+    "citation": "ASM Metals Handbook machinability rating system (AISI 1212 = 100%)",
+    "note": "Optional per-row field; unseeded in v1 — populate only with cited first-party data (CAM cutting-DB follow-up)."
   }
 }

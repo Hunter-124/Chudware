@@ -4,6 +4,7 @@
 // active selector well, debounces live previews through doc_apply_ops (add or edit_feature), and
 // commits (OK) / rolls back (Cancel via worker undo of each preview batch).
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -12,10 +13,12 @@
 #include <vector>
 
 #include "imgui.h"
+#include "imgui_internal.h"   // ImRect (ui::adaptivePanel rect argument)
 
 #include "property_manager.h"
 #include "icons.h"
 #include "sketch_mode.h"   // C38 (P1f): SketchMode::active() — sketch owns Esc while editing
+#include "../ui_theme.h"   // liquid glass v2: adaptivePanel / glassRowBackground / AdaptiveSurface
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
@@ -107,6 +110,7 @@ static const char* aiKindName(PMFieldKind k) {
         case PMFieldKind::Int: return "int";
         case PMFieldKind::DatumRef: return "datum_ref";
         case PMFieldKind::FeatureWell: return "feature_well";
+        case PMFieldKind::Text: return "text";
     }
     return "unknown";
 }
@@ -375,6 +379,7 @@ static void initField(PMField& f, const PMFieldDef& d, bool ips) {
         case PMFieldKind::Dim: {
             f.dimValue = d.dimDefault;
             f.dimExpr.clear();
+            f.dimTextEntry = false;
             std::string disp = pmFieldValueText(&d, d.dimDefault, ips);
             std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
             break;
@@ -707,7 +712,7 @@ bool PropertyManager::dragSetDim(const std::string& key, double value) {
         std::string disp = pmFieldValueText(f.def, f.dimValue, ips_);
         std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
         dirty_ = true;
-        lastEditTime_ = ImGui::GetTime() - kDebounceSec;  // preview immediately (like the steppers)
+        lastEditTime_ = ImGui::GetTime() - kDebounceSec;  // preview immediately (like a drag release)
         return true;
     }
     return false;
@@ -1678,7 +1683,8 @@ void PropertyManager::applyAiAssistResult(AppState& st, const nlohmann::json& re
                     break;
                 case PMFieldKind::Int:
                     if (val.is_number_integer() && f->intValue != val.get<int>()) {
-                        f->intValue = std::max(1, val.get<int>());
+                        f->intValue = std::min(std::max(val.get<int>(), f->def->intMin),
+                                               f->def->intMax);
                         changed = true;
                     }
                     break;
@@ -2032,6 +2038,25 @@ bool PropertyManager::cancelEdits(AppState& st) {
 
 // ---- drawing --------------------------------------------------------------
 
+// Liquid glass v2 (host contract §H4): the PropertyManager form renders EMBEDDED inside the pinned
+// FeatureManager glass column (layout.cpp drawLeftPane -> drawBody), which already painted ONE glass
+// surface for the WHOLE pane via ui::adaptivePanel(panelId("host_left_glass"), …). We must NOT paint
+// our own glassPanel (that would double-paint / fight the column background). Instead we fetch that
+// SAME surface (same id + group => same cached AdaptiveSurface, idempotent per frame — design doc
+// A2) so labels/values read against the LIVE glass tint (surf.textPrimary/textSecondary track the
+// backdrop luminance in both themes) instead of the theme-static pal.text/pal.textDim. Mirrors
+// feature_tree.cpp's fmSurf(). Semantic roles (accent/status/selection) stay on palette.
+static const ui::AdaptiveSurface& pmSurf() {
+    ImVec2 wp = ImGui::GetWindowPos();
+    ImVec2 ws = ImGui::GetWindowSize();
+    ImRect r(wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
+    // Group tag MUST match layout.cpp's paint site (adaptivePanel contract: same group every frame
+    // for a given id) so the FeatureManager per-group glass knobs ride through unchanged.
+    return ui::adaptivePanel(ui::panelId("host_left_glass"), r, ui::GlassGroup::FeatureManager);
+}
+// Push a text color from an adaptive ImVec4 (surf.textPrimary/textSecondary).
+static void pushTextColorV(const ImVec4& c) { ImGui::PushStyleColor(ImGuiCol_Text, c); }
+
 static void pushTextColor(const float c[4]) {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], c[3]));
 }
@@ -2051,13 +2076,17 @@ static const char* formDescription(const char* type) {
 
 static bool pmCompactLabel(const char* label, const char* suffix,
                            const Palette& pal, bool enabled) {
+    (void)pal;
     const float S = ui::uiScale;
     const float avail = ImGui::GetContentRegionAvail().x;
     const bool inlineRow = avail >= 220.0f * S;
     float labelW = avail * 0.40f;
     labelW = std::max(112.0f * S, std::min(labelW, 138.0f * S));
 
-    pushTextColor(enabled ? pal.text : pal.textDim);
+    // Liquid glass v2: labels read against the LIVE column glass tint (adaptive max-contrast text)
+    // instead of theme-static pal.text/pal.textDim. Enabled -> primary, disabled -> dimmer secondary.
+    const ui::AdaptiveSurface& surf = pmSurf();
+    pushTextColorV(enabled ? surf.textPrimary : surf.textSecondary);
     if (inlineRow) {
         ImGui::AlignTextToFramePadding();
         ImGui::Text("%s%s", label, suffix ? suffix : "");
@@ -2076,15 +2105,36 @@ static bool pmSectionHeader(const char* label, const Palette& pal) {
     if (!label || !label[0]) return true;
     const float S = ui::uiScale;
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(9.0f * S, 4.0f * S));
-    ImGui::PushStyleColor(ImGuiCol_Header,
-        ImVec4(pal.frameBg[0], pal.frameBg[1], pal.frameBg[2], 1));
-    ImGui::PushStyleColor(ImGuiCol_HeaderHovered,
-        ImVec4(pal.buttonHovered[0], pal.buttonHovered[1], pal.buttonHovered[2], 1));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f * S);
+
+    // Liquid glass v2: the section header is a hoverable row, so give it a translucent glass PILL
+    // (glassRowBackground) consistent with the rest of the app (FeatureManager rows / the collapse
+    // chevron in layout.cpp) instead of the theme-static glassBg Header fill. ImGui paints the
+    // Header* fills UNDER our pill draw, so make them transparent and let the pill be the surface.
+    // Section captions read against the live glass tint (adaptive secondary text). Active state keeps
+    // the semantic accent wash so an open/pressed header still flashes accent (unchanged intent).
+    const ui::AdaptiveSurface& surf = pmSurf();
+    ImGui::PushStyleColor(ImGuiCol_Header,        ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,
         ImVec4(pal.accentSoft[0], pal.accentSoft[1], pal.accentSoft[2], pal.accentSoft[3]));
-    bool open = ImGui::CollapsingHeader(label, ImGuiTreeNodeFlags_DefaultOpen);
-    ImGui::PopStyleColor(3);
-    ImGui::PopStyleVar();
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+
+    // Draw the frosted pill FIRST (behind the header text/arrow) at the row rect. Hover reads last
+    // frame's state via IsItemHovered() after submit would paint over the label, so use the mouse
+    // rect test up-front for the brighter hover wash. The pill sits on the window draw list before
+    // CollapsingHeader submits its glyphs, so text/arrow render on top.
+    const ImVec2 rowMin = ImGui::GetCursorScreenPos();
+    const float  rowW   = ImGui::GetContentRegionAvail().x;
+    const float  rowH   = ImGui::GetFrameHeight();
+    const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + rowH);
+    const bool hov = ImGui::IsMouseHoveringRect(rowMin, rowMax);
+    ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, 6.0f * S,
+                           /*stripe=*/false, /*selected=*/false, hov ? 0.42f : 0.30f);
+    const bool open = ImGui::CollapsingHeader(label, ImGuiTreeNodeFlags_DefaultOpen);
+
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(2);
     return open;
 }
 
@@ -2164,6 +2214,10 @@ void PropertyManager::drawBody(AppState& st) {
     if (st.ips() != ips_) { ips_ = st.ips(); reformatDimDisplays(); }
 
     const auto& pal = ui::palette;
+    // Liquid glass v2: the ONE shared column surface (same id layout.cpp painted this frame). Used
+    // for adaptive max-contrast SECONDARY/dim text throughout the form so it reads against the live
+    // glass tint; semantic roles (accent/status) stay on `pal`. Idempotent per frame (id-cached).
+    const ui::AdaptiveSurface& surf = pmSurf();
 
     // ---- C37-F: Keyboard policy -------------------------------------------
     // Gather focus/hover state for this PM window BEFORE processing buttons.
@@ -2258,8 +2312,11 @@ void PropertyManager::drawBody(AppState& st) {
         float okY = hdrMin.y + (hdrH - btnW) * 0.5f;
         ImGui::SetCursorScreenPos(ImVec2(okX, okY));
 
-        ImGui::PushStyleColor(ImGuiCol_Button,     ImVec4(0.08f, 0.38f, 0.24f, 0.9f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.14f, 0.58f, 0.36f, 1.0f));
+        // Palette-role confirm button (statusOk adapts to the light theme; no baked greens).
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 0.85f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+            ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 1.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * S, 4.0f * S));
         {
             IconUV okIc = getIcon("ok_badge", 20);
@@ -2278,7 +2335,7 @@ void PropertyManager::drawBody(AppState& st) {
         ImGui::PushStyleColor(ImGuiCol_Button,
             ImVec4(pal.button[0], pal.button[1], pal.button[2], 0.9f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-            ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 0.7f));
+            ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], pal.statusErr[3]));
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * S, 4.0f * S));
         {
             IconUV cancelIc = getIcon("error_badge", 20);
@@ -2298,7 +2355,7 @@ void PropertyManager::drawBody(AppState& st) {
         // Optional form description.
         const char* desc = formDescription(form_->type);
         if (desc && desc[0]) {
-            pushTextColor(pal.textDim);
+            pushTextColorV(surf.textSecondary);
             float wrapW = ImGui::GetContentRegionAvail().x;
             ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
             ImGui::TextUnformatted(desc);
@@ -2359,7 +2416,7 @@ void PropertyManager::drawBody(AppState& st) {
         ImGui::PopStyleColor(2);
         ImGui::PopStyleVar(2);
         ImGui::PopID();
-        ImGui::Dummy(ImVec2(0, 6.0f * ui::uiScale));
+        ImGui::Dummy(ImVec2(0, 4.0f * ui::uiScale));
         groupCardOpen = false;
     };
 
@@ -2374,9 +2431,9 @@ void PropertyManager::drawBody(AppState& st) {
             if (groupOpen) {
                 ImGui::PushID(curGroup);
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                                    ImVec2(9.0f * ui::uiScale, 8.0f * ui::uiScale));
+                                    ImVec2(9.0f * ui::uiScale, 7.0f * ui::uiScale));
                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                                    ImVec2(7.0f * ui::uiScale, 7.0f * ui::uiScale));
+                                    ImVec2(7.0f * ui::uiScale, 5.0f * ui::uiScale));
                 // PM group cards adopt the frosted-glass roles so each form section reads as a
                 // floating glass card (translucent glassBg lets the panel bleed through subtly).
                 ImGui::PushStyleColor(ImGuiCol_ChildBg,
@@ -2404,6 +2461,8 @@ void PropertyManager::drawBody(AppState& st) {
         }
         switch (f.def->kind) {
             case PMFieldKind::Dim: {
+                const bool isAngle  = pmFieldIsAngle(f.def);
+                const bool unitless = pmFieldUnitless(f.def);
                 // C37-F: unit suffix in label ("Radius [mm]"). A field may override it (angle =
                 // "[deg]"; an empty override = no suffix).
                 const char* unitSuffix = f.def->unitLabel ? f.def->unitLabel
@@ -2411,16 +2470,42 @@ void PropertyManager::drawBody(AppState& st) {
                 pmCompactLabel(f.def->label, unitSuffix, pal, enabled);
                 if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip("Not yet supported by engine");
-                // Reserve room for the - / + step buttons so the InputText doesn't shove them past
-                // the pane's right edge (was SetNextItemWidth(-1), which let the steppers overflow
-                // / clip — the most visible "misplaced element" on the Extrude form).
-                {
-                    const ImGuiStyle& dimStl = ImGui::GetStyle();
-                    float stepBtnW = ImGui::CalcTextSize("+").x + dimStl.FramePadding.x * 2.0f;
-                    ImGui::SetNextItemWidth(-(stepBtnW * 2.0f + 9.0f * ui::uiScale));
-                }
 
-                // C37-F: SetKeyboardFocusHere on the very first editable Dim field when opening.
+                // Widgets audit: bounded dims (angles, draft, k-factor) are sliders; open-ended
+                // ones (depth, radii, spacing) are drags — both show the unit in the value text and
+                // CTRL+click types an exact number. Unit-math / "=expr" entry lives behind the "="
+                // toggle so the SolidWorks expression path is never lost. All conversion happens at
+                // the widget edge: dimValue stays canonical mm/deg.
+                const double toDisp  = (!isAngle && !unitless && useIps) ? (1.0 / 25.4) : 1.0;
+                const bool   bounded = f.def->dimMax > f.def->dimMin;
+                // Per-kind step (canonical units): metadata, else 1 mm lengths (1/16 in in IPS),
+                // 1 deg angles, 0.05 unit-less ratios. Drives the CTRL+wheel step + drag speed.
+                double step = f.def->dimStep;
+                if (step <= 0.0)
+                    step = isAngle ? 1.0 : (unitless ? 0.05 : (useIps ? 25.4 / 16.0 : 1.0));
+                const char* valFmt = isAngle ? "%.4g deg"
+                                             : (unitless ? "%.4g" : (useIps ? "%.4g in" : "%.4g mm"));
+
+                // Commit a canonical value coming from the slider/drag/wheel: clamp to the field
+                // range, clear any expr/error, and resync the text buffer (the "=" path reads it).
+                auto commitDim = [&](double v, bool immediate) {
+                    v = std::max(v, f.def->dimMin);
+                    if (bounded) v = std::min(v, f.def->dimMax);
+                    f.dimValue = v; f.dimExpr.clear(); f.dimError.clear();
+                    std::string disp = pmFieldValueText(f.def, f.dimValue, useIps);
+                    std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
+                    dirty_ = true;
+                    lastEditTime_ = immediate ? ImGui::GetTime() - kDebounceSec  // fire now
+                                              : ImGui::GetTime();               // debounced
+                };
+
+                // Reserve room for the "=" toggle so the widget never shoves it past the pane edge.
+                const float eqBtnW = ImGui::GetFrameHeight();
+                ImGui::SetNextItemWidth(-(eqBtnW + 4.0f * ui::uiScale));
+
+                // C37-F: SetKeyboardFocusHere on the very first editable Dim field when opening
+                // (on a drag/slider this opens ImGui's CTRL+click text input, so typing works
+                // immediately, same as the old InputText).
                 if (wantFocusFirstField_ && enabled && !f.def->comingSoon && !firstEditableDimSeen) {
                     ImGui::SetKeyboardFocusHere(0);
                     firstEditableDimSeen = true;
@@ -2428,84 +2513,105 @@ void PropertyManager::drawBody(AppState& st) {
                     // focus request is processed.
                 }
 
-                bool changed = ImGui::InputText("##dim", f.dimBuf.data(), f.dimBuf.size(),
-                                                ImGuiInputTextFlags_EnterReturnsTrue |
-                                                ImGuiInputTextFlags_AutoSelectAll);
-                bool deact = ImGui::IsItemDeactivatedAfterEdit();
-
-                // C37-F: Step buttons (- / +) trigger immediate preview (no debounce).
-                ImGui::SameLine(0, 3 * ui::uiScale);
-                ImGui::PushStyleColor(ImGuiCol_Button,
-                    ImVec4(pal.button[0], pal.button[1], pal.button[2], 1));
-                if (ImGui::SmallButton("-##step")) {
-                    if (enabled && !f.def->comingSoon) {
-                        f.dimValue = std::max(0.0, f.dimValue - 1.0);
-                        std::string disp = pmFieldValueText(f.def, f.dimValue, useIps);
-                        std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
-                        f.dimError.clear();
-                        dirty_ = true;
-                        lastEditTime_ = ImGui::GetTime() - kDebounceSec;  // fire immediately
-                    }
-                }
-                ImGui::SameLine(0, 2 * ui::uiScale);
-                if (ImGui::SmallButton("+##step")) {
-                    if (enabled && !f.def->comingSoon) {
-                        f.dimValue += 1.0;
-                        std::string disp = pmFieldValueText(f.def, f.dimValue, useIps);
-                        std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
-                        f.dimError.clear();
-                        dirty_ = true;
-                        lastEditTime_ = ImGui::GetTime() - kDebounceSec;  // fire immediately
-                    }
-                }
-                ImGui::PopStyleColor();
-
-                // C37-F: mouse-wheel on hovered field triggers immediate preview.
-                if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
-                    float wheel = io.MouseWheel;
-                    if (wheel != 0.0f && enabled && !f.def->comingSoon) {
-                        f.dimValue = std::max(0.0, f.dimValue + (double)wheel);
-                        std::string disp = pmFieldValueText(f.def, f.dimValue, useIps);
-                        std::strncpy(f.dimBuf.data(), disp.c_str(), f.dimBuf.size() - 1);
-                        f.dimError.clear();
-                        dirty_ = true;
-                        lastEditTime_ = ImGui::GetTime() - kDebounceSec;  // fire immediately
-                    }
-                }
-
-                if (enabled && (changed || deact)) {
-                    // `changed` is true ONLY when Enter is pressed (EnterReturnsTrue) — an explicit
-                    // "apply now" gesture, so we backdate lastEditTime_ past the debounce window to
-                    // fire the preview this frame. A plain blur (`deact` without `changed`) keeps the
-                    // normal debounce.
-                    const double applyTime = changed ? (ImGui::GetTime() - kDebounceSec)
-                                                     : ImGui::GetTime();
-                    std::string txt = f.dimBuf.data();
-                    // trim
-                    while (!txt.empty() && std::isspace((unsigned char)txt.front())) txt.erase(txt.begin());
-                    while (!txt.empty() && std::isspace((unsigned char)txt.back())) txt.pop_back();
-                    if (!txt.empty() && txt[0] == '=') {
-                        f.dimExpr = txt.substr(1);
-                        f.dimError.clear();
-                        dirty_ = true; lastEditTime_ = applyTime;
+                const bool textMode = !f.dimExpr.empty() || f.dimTextEntry;
+                if (!textMode) {
+                    float v = (float)(f.dimValue * toDisp);
+                    bool widgetEdited;
+                    if (bounded) {
+                        widgetEdited = ImGui::SliderFloat("##dim", &v,
+                                           (float)(f.def->dimMin * toDisp),
+                                           (float)(f.def->dimMax * toDisp),
+                                           valFmt, ImGuiSliderFlags_AlwaysClamp);
                     } else {
-                        double mm;
-                        std::string err;
-                        // A bare (unit-less) number follows the document length unit: mm in MMGS,
-                        // inch in IPS. Angle fields ([deg]) stay degrees in both systems (bare =
-                        // degrees) and parse with angle=true so the "deg" suffix they now display
-                        // round-trips and a stray length unit is rejected on them.
-                        const bool isAngle = pmFieldIsAngle(f.def);
-                        // angle + unit-less (ratio/k-factor/turns) values are never IPS-scaled.
-                        const bool unscaled = isAngle || pmFieldUnitless(f.def);
-                        const double bareScale = (useIps && !unscaled) ? 25.4 : 1.0;
-                        if (pmParseDim(txt, mm, err, /*angle=*/isAngle, bareScale)) {
-                            f.dimValue = mm; f.dimExpr.clear(); f.dimError.clear();
+                        widgetEdited = ImGui::DragFloat("##dim", &v,
+                                           (float)(step * toDisp) * 0.25f,
+                                           (float)(f.def->dimMin * toDisp), FLT_MAX,
+                                           valFmt, ImGuiSliderFlags_AlwaysClamp);
+                    }
+                    if (widgetEdited && enabled && !f.def->comingSoon)
+                        commitDim((double)v / toDisp, /*immediate=*/false);
+                    if (ImGui::IsItemDeactivatedAfterEdit() && dirty_)
+                        lastEditTime_ = ImGui::GetTime() - kDebounceSec;  // fire on release/commit
+                    // CTRL+wheel (or wheel mid-drag) steps by the field step. A bare hover-wheel
+                    // scrolls the pane instead of silently mutating the value (widgets audit).
+                    if (enabled && !f.def->comingSoon && io.MouseWheel != 0.0f &&
+                        (ImGui::IsItemActive() || (ImGui::IsItemHovered() && io.KeyCtrl)))
+                        commitDim(f.dimValue + step * (double)io.MouseWheel, /*immediate=*/true);
+                } else {
+                    bool changed = ImGui::InputText("##dim", f.dimBuf.data(), f.dimBuf.size(),
+                                                    ImGuiInputTextFlags_EnterReturnsTrue |
+                                                    ImGuiInputTextFlags_AutoSelectAll);
+                    bool deact = ImGui::IsItemDeactivatedAfterEdit();
+                    if (enabled && (changed || deact)) {
+                        // `changed` is true ONLY when Enter is pressed (EnterReturnsTrue) — an
+                        // explicit "apply now" gesture, so we backdate lastEditTime_ past the
+                        // debounce window to fire the preview this frame. A plain blur (`deact`
+                        // without `changed`) keeps the normal debounce.
+                        const double applyTime = changed ? (ImGui::GetTime() - kDebounceSec)
+                                                         : ImGui::GetTime();
+                        std::string txt = f.dimBuf.data();
+                        // trim
+                        while (!txt.empty() && std::isspace((unsigned char)txt.front())) txt.erase(txt.begin());
+                        while (!txt.empty() && std::isspace((unsigned char)txt.back())) txt.pop_back();
+                        if (!txt.empty() && txt[0] == '=') {
+                            f.dimExpr = txt.substr(1);
+                            f.dimError.clear();
                             dirty_ = true; lastEditTime_ = applyTime;
                         } else {
-                            f.dimError = err;
+                            double mm;
+                            std::string err;
+                            // A bare (unit-less) number follows the document length unit: mm in
+                            // MMGS, inch in IPS. Angle fields ([deg]) stay degrees in both systems
+                            // (bare = degrees) and parse with angle=true so the "deg" suffix they
+                            // display round-trips and a stray length unit is rejected on them.
+                            // angle + unit-less (ratio/k-factor/turns) values are never IPS-scaled.
+                            const bool unscaled = isAngle || unitless;
+                            const double bareScale = (useIps && !unscaled) ? 25.4 : 1.0;
+                            if (pmParseDim(txt, mm, err, /*angle=*/isAngle, bareScale)) {
+                                f.dimValue = mm; f.dimExpr.clear(); f.dimError.clear();
+                                dirty_ = true; lastEditTime_ = applyTime;
+                                if (deact) f.dimTextEntry = false;  // plain number -> back to widget
+                            } else {
+                                f.dimError = err;
+                            }
                         }
                     }
+                }
+
+                // "=" toggle: switch the row to free text entry (unit math / equations). While an
+                // expr is bound the row stays in text mode; the toggle then UNBINDS it (keeping
+                // the last resolved value) and returns to the widget.
+                ImGui::SameLine(0, 4.0f * ui::uiScale);
+                {
+                    const bool exprBound = !f.dimExpr.empty();
+                    // Liquid glass v2: active "=" (text/expr mode) keeps the semantic accent wash;
+                    // idle uses a translucent button fill so the column glass bleeds through (not the
+                    // opaque theme button), and its glyph reads via adaptive secondary text.
+                    ImGui::PushStyleColor(ImGuiCol_Button, textMode
+                        ? ImVec4(pal.accentSoft[0], pal.accentSoft[1], pal.accentSoft[2],
+                                 pal.accentSoft[3])
+                        : ImVec4(pal.button[0], pal.button[1], pal.button[2], 0.40f));
+                    ImGui::PushStyleColor(ImGuiCol_Text, textMode
+                        ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)
+                        : surf.textSecondary);
+                    if (ImGui::Button("=##dim_txt", ImVec2(eqBtnW, 0)) &&
+                        enabled && !f.def->comingSoon) {
+                        if (exprBound) {
+                            f.dimExpr.clear(); f.dimTextEntry = false;
+                            commitDim(f.dimValue, /*immediate=*/true);   // unbind, keep value
+                        } else if (textMode) {
+                            f.dimTextEntry = false;
+                        } else {
+                            f.dimTextEntry = true;
+                        }
+                    }
+                    ImGui::PopStyleColor(2);
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip(exprBound
+                            ? "Unbind the equation (keep the current value)"
+                            : (textMode
+                                ? "Back to slider entry"
+                                : "Type units or an equation (25mm, 3/8in, =width/2)"));
                 }
                 // expr resolved-value + tooltip
                 if (enabled && !f.dimExpr.empty()) {
@@ -2525,8 +2631,11 @@ void PropertyManager::drawBody(AppState& st) {
                 break;
             }
             case PMFieldKind::SelectorWell: {
-                // Label + activate toggle.
-                pushTextColor(f.wellActive ? pal.accent : pal.textDim);
+                const ui::AdaptiveSurface& wsurf = pmSurf();
+                // Label + activate toggle. Active -> semantic accent (unchanged intent); inactive ->
+                // adaptive secondary text so the label reads against the live column glass tint.
+                if (f.wellActive) pushTextColor(pal.accent);
+                else              pushTextColorV(wsurf.textSecondary);
                 ImGui::TextUnformatted(f.def->label);
                 ImGui::PopStyleColor();
 
@@ -2565,19 +2674,24 @@ void PropertyManager::drawBody(AppState& st) {
                 }
                 const bool wellHovered = ImGui::IsItemHovered();
                 ImDrawList* dl = ImGui::GetWindowDrawList();
-                ImVec4 fill = f.wellActive
-                    ? ImVec4(pal.accentSoft[0], pal.accentSoft[1], pal.accentSoft[2], pal.accentSoft[3])
-                    : (wellHovered
-                        ? ImVec4(pal.frameBgHovered[0], pal.frameBgHovered[1],
-                                 pal.frameBgHovered[2], pal.frameBgHovered[3])
-                        : ImVec4(pal.frameBg[0], pal.frameBg[1], pal.frameBg[2], 1));
-                dl->AddRectFilled(wp0, wp1, ImGui::ColorConvertFloat4ToU32(fill),
-                                  6.0f * S);
+                // Liquid glass v2: the well fill is a translucent glass pill (glassRowBackground)
+                // consistent with FeatureManager rows — instead of the opaque frameBg/frameBgHovered
+                // rects. An ACTIVE well keeps the semantic accent wash (selected pill) so the
+                // receiving pick target still flashes accent; idle/hover use the neutral frosted wash.
+                if (f.wellActive) {
+                    ui::glassRowBackground(dl, wp0, wp1, 6.0f * S, /*stripe=*/false,
+                                           /*selected=*/true, 0.42f);
+                } else {
+                    ui::glassRowBackground(dl, wp0, wp1, 6.0f * S, /*stripe=*/false,
+                                           /*selected=*/false, wellHovered ? 0.42f : 0.28f);
+                }
                 dl->AddRect(wp0, wp1, ImGui::ColorConvertFloat4ToU32(border), 6.0f * S, 0,
                             f.wellActive ? std::max(1.0f, 2.0f * S)
                                           : std::max(1.0f, 1.0f * S));
-                ImU32 chipCol = f.picks.empty() ? ui::Palette::toU32(pal.textDim)
-                                                : ui::Palette::toU32(pal.text);
+                // Chip text: adaptive contrast over the frosted pill (empty -> dimmer secondary).
+                ImU32 chipCol = f.picks.empty()
+                    ? ImGui::ColorConvertFloat4ToU32(wsurf.textSecondary)
+                    : ImGui::ColorConvertFloat4ToU32(wsurf.textPrimary);
                 dl->AddText(nullptr, 0.0f, ImVec2(wp0.x + textPadX, wp0.y + textPadY),
                             chipCol, chip.c_str(), nullptr, wrapW);
 
@@ -2625,73 +2739,108 @@ void PropertyManager::drawBody(AppState& st) {
                     }
                 }
                 std::string preview = (f.comboIndex < (int)labels.size()) ? labels[f.comboIndex] : "";
-                ImGui::SetNextItemWidth(-1);
-                if (ImGui::BeginCombo("##combo", preview.c_str())) {
-                    for (int n = 0; n < (int)labels.size(); ++n) {
-                        bool sel = (f.comboIndex == n);
-                        if (ImGui::Selectable(labels[n].c_str(), sel)) {
-                            if (enabled) {
-                                f.comboIndex = n; dirty_ = true; lastEditTime_ = ImGui::GetTime();
-                                // SolidWorks: choosing an end/start condition that reveals a
-                                // reference selection box auto-activates that box, so the next
-                                // viewport click picks the plane/face/vertex (without this the
-                                // active well stays on `profile` and the plane picker never arms).
-                                // Re-home the active well onto the first now-visible, empty
-                                // selector well gated by THIS combo.
-                                const char* ckey = f.def->key;
-                                PMField* reveal = nullptr;
-                                for (auto& w : fields_) {
-                                    if (w.def->kind != PMFieldKind::SelectorWell) continue;
-                                    if (!w.def->enableKey ||
-                                        std::strcmp(w.def->enableKey, ckey) != 0) continue;
-                                    if (!w.picks.empty() || !fieldVisible(*w.def, fields_)) continue;
-                                    reveal = &w; break;
-                                }
-                                if (reveal) {
-                                    for (auto& o : fields_)
-                                        if (o.def->kind == PMFieldKind::SelectorWell ||
-                                            o.def->kind == PMFieldKind::FeatureWell)
-                                            o.wellActive = false;
-                                    reveal->wellActive = true;
-                                }
-                            }
-                        }
-                        if (sel) ImGui::SetItemDefaultFocus();
+                // Shared select handler for both render styles.
+                auto selectOption = [&](int n) {
+                    if (!enabled) return;
+                    f.comboIndex = n; dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                    // SolidWorks: choosing an end/start condition that reveals a
+                    // reference selection box auto-activates that box, so the next
+                    // viewport click picks the plane/face/vertex (without this the
+                    // active well stays on `profile` and the plane picker never arms).
+                    // Re-home the active well onto the first now-visible, empty
+                    // selector well gated by THIS combo.
+                    const char* ckey = f.def->key;
+                    PMField* reveal = nullptr;
+                    for (auto& w : fields_) {
+                        if (w.def->kind != PMFieldKind::SelectorWell) continue;
+                        if (!w.def->enableKey ||
+                            std::strcmp(w.def->enableKey, ckey) != 0) continue;
+                        if (!w.picks.empty() || !fieldVisible(*w.def, fields_)) continue;
+                        reveal = &w; break;
                     }
-                    ImGui::EndCombo();
+                    if (reveal) {
+                        for (auto& o : fields_)
+                            if (o.def->kind == PMFieldKind::SelectorWell ||
+                                o.def->kind == PMFieldKind::FeatureWell)
+                                o.wellActive = false;
+                        reveal->wellActive = true;
+                    }
+                };
+                if (f.def->segmented && labels.size() == 2) {
+                    // Widgets audit: a combo-of-two (Boss|Cut, Both|One Side) renders as a
+                    // segmented pill pair — one click to flip, no dropdown popup.
+                    const float S = ui::uiScale;
+                    const float gap  = 4.0f * S;
+                    const float segW = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
+                    for (int n = 0; n < 2; ++n) {
+                        if (n) ImGui::SameLine(0, gap);
+                        const bool selSeg = (f.comboIndex == n);
+                        ImGui::PushID(n);
+                        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f * S);
+                        // Liquid glass v2: selected segment keeps the semantic accent wash; the idle
+                        // segment uses a translucent frame fill so the frosted column bleeds through
+                        // (not the opaque theme frameBg), with adaptive secondary text on top.
+                        ImGui::PushStyleColor(ImGuiCol_Button, selSeg
+                            ? ImVec4(pal.accentSoft[0], pal.accentSoft[1], pal.accentSoft[2],
+                                     pal.accentSoft[3])
+                            : ImVec4(pal.frameBg[0], pal.frameBg[1], pal.frameBg[2], 0.40f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, selSeg
+                            ? ImVec4(pal.accentMid[0], pal.accentMid[1], pal.accentMid[2],
+                                     pal.accentMid[3])
+                            : ImVec4(pal.frameBgHovered[0], pal.frameBgHovered[1],
+                                     pal.frameBgHovered[2], 0.60f));
+                        ImGui::PushStyleColor(ImGuiCol_Text, selSeg
+                            ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)
+                            : surf.textSecondary);
+                        if (ImGui::Button(labels[n].c_str(), ImVec2(segW, 0)) && !selSeg)
+                            selectOption(n);
+                        ImGui::PopStyleColor(3);
+                        ImGui::PopStyleVar();
+                        ImGui::PopID();
+                    }
+                } else {
+                    ImGui::SetNextItemWidth(-1);
+                    if (ImGui::BeginCombo("##combo", preview.c_str())) {
+                        for (int n = 0; n < (int)labels.size(); ++n) {
+                            bool sel = (f.comboIndex == n);
+                            if (ImGui::Selectable(labels[n].c_str(), sel)) selectOption(n);
+                            if (sel) ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
                 }
                 break;
             }
             case PMFieldKind::Check: {
+                // Widgets audit: Check rows join the same label-column grid as Dim/Combo rows —
+                // label in the left column (full text in its hover tooltip when clipped), box at
+                // the field column — so forms read as two clean columns instead of ragged rows.
+                pmCompactLabel(f.def->label, "", pal, enabled);
                 bool val = f.checkValue;
-                // Render the box with no inline label, then place the label on the
-                // same row with wrapping enabled. ImGui's built-in Checkbox label
-                // never wraps and gets clipped on a narrow dock (e.g. the long
-                // "Tangent propagation (coming soon)" rows) — wrap it ourselves.
                 if (ImGui::Checkbox("##chk", &val)) {
                     if (enabled) { f.checkValue = val; dirty_ = true; lastEditTime_ = ImGui::GetTime(); }
                 }
-                bool boxHov = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
-                ImGui::SameLine(0, ImGui::GetStyle().ItemInnerSpacing.x);
-                float wrapX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
-                ImGui::PushTextWrapPos(wrapX);
-                ImGui::TextUnformatted(f.def->label);
-                ImGui::PopTextWrapPos();
-                if (f.def->comingSoon &&
-                    (boxHov || ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)))
+                if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                     ImGui::SetTooltip("Not yet supported by engine");
                 break;
             }
             case PMFieldKind::Int: {
                 pmCompactLabel(f.def->label, "", pal, enabled);
                 ImGui::SetNextItemWidth(-1);
+                // DragInt bounded to the field's intMin..intMax (AlwaysClamp covers CTRL+click
+                // typed entry too) — a stray "100000 instances" can't reach the engine preview.
                 int v = f.intValue;
-                if (ImGui::InputInt("##int", &v)) {
+                if (ImGui::DragInt("##int", &v, 0.1f, f.def->intMin, f.def->intMax, "%d",
+                                   ImGuiSliderFlags_AlwaysClamp)) {
                     if (enabled) {
-                        if (v < 1) v = 1;
-                        f.intValue = v; dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                        v = std::min(std::max(v, f.def->intMin), f.def->intMax);
+                        if (v != f.intValue) {
+                            f.intValue = v; dirty_ = true; lastEditTime_ = ImGui::GetTime();
+                        }
                     }
                 }
+                if (ImGui::IsItemDeactivatedAfterEdit() && dirty_)
+                    lastEditTime_ = ImGui::GetTime() - kDebounceSec;  // fire on release/commit
                 break;
             }
             case PMFieldKind::Text: {
@@ -2728,7 +2877,7 @@ void PropertyManager::drawBody(AppState& st) {
                 break;
             }
             case PMFieldKind::FeatureWell: {
-                pushTextColor(pal.textDim);
+                pushTextColorV(surf.textSecondary);
                 ImGui::TextUnformatted(f.def->label);
                 ImGui::PopStyleColor();
                 const bool single = !f.def->selMulti;   // FeatWell1: holds exactly one feature id
@@ -2814,7 +2963,7 @@ void PropertyManager::drawBody(AppState& st) {
 
     // ---- live-preview status hint -----------------------------------------
     ImGui::Separator();
-    pushTextColor(pal.textDim);
+    pushTextColorV(surf.textSecondary);
     if (dirty_)            ImGui::TextUnformatted("editing\xe2\x80\xa6 (live preview)");
     else if (firstPreviewDone_ && !targetId_.empty())
         ImGui::Text("preview: %s", targetId_.c_str());

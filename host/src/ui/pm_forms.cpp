@@ -91,6 +91,15 @@ static PMFieldDef AngleIf(const char* key, const char* label, const char* group,
     PMFieldDef f = Angle(key, label, group, def);
     f.enableKey = enableKey; f.enableVals = enableVals; f.omitWhenDisabled = omit; return f;
 }
+// Attach a bounded range (canonical mm/deg) to a Dim/Angle/DimU — the PM renders it as a slider
+// with the unit in the value text (CTRL+click still types an exact number). step 0 = kind default.
+static PMFieldDef Range(PMFieldDef f, double mn, double mx, double step = 0.0) {
+    f.dimMin = mn; f.dimMax = mx; f.dimStep = step; return f;
+}
+// Allow negative values on a drag Dim (offsets that reverse direction). Default drags clamp at 0.
+static PMFieldDef Signed(PMFieldDef f) { f.dimMin = -1.0e9; return f; }
+// Render a 2-option combo as a segmented pill pair (one click to flip) instead of a dropdown.
+static PMFieldDef Seg(PMFieldDef f) { f.segmented = true; return f; }
 // A datum-reference combo whose chosen value is emitted as a refs string ("axis.x"/"plane.right").
 // For _SEL_OR_DATUM slots (pattern direction, mirror plane, draft neutral plane).
 static PMFieldDef DatumRef(const char* key, const char* label, const char* group,
@@ -167,10 +176,10 @@ static const std::vector<PMFormDef>& forms() {
                        "Sketch Plane|Offset|From Ref.|Offset Ref."),
             WellIf    ("start_ref","Start Reference", "From",        K_FACEPLANE, false,
                        "start", "from_reference|offset_from_reference"),
-            DimIf     ("start_offset", "Start Offset","From",        0.0,
-                       "start", "offset|offset_from_reference", true),
-            ComboL    ("mode",     "Type",            "Direction 1", "boss|cut",
-                                                                     "Boss|Cut"),
+            Signed    (DimIf ("start_offset", "Start Offset","From", 0.0,
+                       "start", "offset|offset_from_reference", true)),
+            Seg       (ComboL("mode",     "Type",            "Direction 1", "boss|cut",
+                                                                     "Boss|Cut")),
             ComboL    ("end",      "End Condition",   "Direction 1",
                        "blind|mid_plane|through_all|up_to_next|up_to_surface|offset_from_surface|up_to_body|up_to_vertex|up_to_reference|offset_from_reference",
                        "Blind|Mid Plane|Through All|Up To Next|Up To Plane/Surface|Offset Plane/Surf.|Up To Body|Up To Vertex|Up To Ref.|Offset Ref."),
@@ -178,15 +187,15 @@ static const std::vector<PMFormDef>& forms() {
                        "end", "blind|mid_plane", true),
             WellIf    ("up_to",    "Up To Reference", "Direction 1", K_FACEVERTPLANE, false,
                        "end", "up_to_surface|offset_from_surface|up_to_body|up_to_vertex"),
-            DimIf     ("offset",   "Offset",          "Direction 1", 0.0,
-                       "end", "offset_from_surface", true),
+            Signed    (DimIf ("offset",   "Offset",          "Direction 1", 0.0,
+                       "end", "offset_from_surface", true)),
             WellIf    ("end_ref",  "End Reference",   "Direction 1", K_FACEPLANE, false,
                        "end", "up_to_reference|offset_from_reference"),
-            DimIf     ("end_offset","End Offset",      "Direction 1", 0.0,
-                       "end", "offset_from_reference", true),
+            Signed    (DimIf ("end_offset","End Offset",      "Direction 1", 0.0,
+                       "end", "offset_from_reference", true)),
             Check     ("flip",     "Reverse direction","Direction 1", false),
-            AngleIf   ("draft",    "Draft angle",     "Direction 1", 0.0,
-                       "end", "blind|mid_plane", true),
+            Range     (AngleIf("draft",    "Draft angle",     "Direction 1", 0.0,
+                       "end", "blind|mid_plane", true), 0.0, 89.0),
             CheckIf   ("draft_outward", "Draft outward","Direction 1", false,
                        "end", "blind|mid_plane"),
             ComboL    ("end2",     "End Condition",   "Direction 2",
@@ -194,12 +203,12 @@ static const std::vector<PMFormDef>& forms() {
                        "None|Blind|Through All|Up To Next|Up To Plane/Surface|Offset Plane/Surf.|Up To Body|Up To Vertex|Up To Ref.|Offset Ref."),
             WellIf    ("up_to2",   "Up To Reference", "Direction 2", K_FACEVERTPLANE, false,
                        "end2", "up_to_surface|offset_from_surface|up_to_body|up_to_vertex"),
-            DimIf     ("offset2",  "Offset",          "Direction 2", 0.0,
-                       "end2", "offset_from_surface", true),
+            Signed    (DimIf ("offset2",  "Offset",          "Direction 2", 0.0,
+                       "end2", "offset_from_surface", true)),
             WellIf    ("end2_ref", "End Reference",   "Direction 2", K_FACEPLANE, false,
                        "end2", "up_to_reference|offset_from_reference"),
-            DimIf     ("end2_offset","End Offset",     "Direction 2", 0.0,
-                       "end2", "offset_from_reference", true),
+            Signed    (DimIf ("end2_offset","End Offset",     "Direction 2", 0.0,
+                       "end2", "offset_from_reference", true)),
             DimIf     ("depth2",   "Depth",           "Direction 2", 10.0,
                        "end2", "blind", true),
             Check     ("thin",         "Thin Feature",  "Thin Feature", false),
@@ -217,16 +226,16 @@ static const std::vector<PMFormDef>& forms() {
         { "revolve", "Revolve", "revolve_boss", {
             Well   ("profile",  "Profile",        "From",        K_FACE, true),
             Well   ("axis",     "Axis",           "From",        K_EDGEAXIS, false),
-            ComboL ("mode",     "Type",           "Direction 1", "boss|cut", "Boss|Cut"),
+            Seg    (ComboL("mode",     "Type",           "Direction 1", "boss|cut", "Boss|Cut")),
             ComboL ("end",      "End Condition",  "Direction 1",
                     "one_direction|mid_plane|up_to_surface",
                     "One Direction|Mid Plane|Up To Surface"),
-            AngleIf("angle",    "Angle",          "Direction 1", 360.0,
-                    "end", "one_direction|mid_plane"),
+            Range  (AngleIf("angle",    "Angle",          "Direction 1", 360.0,
+                    "end", "one_direction|mid_plane"), 0.0, 360.0),
             Check  ("flip",     "Reverse direction", "Direction 1", false),
             Check  ("dir2",     "Direction 2",    "Direction 2", false),
-            AngleIf("angle2",   "Angle",          "Direction 2", 360.0,
-                    "dir2", "true", /*omit=*/true),
+            Range  (AngleIf("angle2",   "Angle",          "Direction 2", 360.0,
+                    "dir2", "true", /*omit=*/true), 0.0, 360.0),
             Check  ("thin",         "Thin Feature",  "Thin Feature", false),
             DimIf  ("thin_thickness","Wall thickness","Thin Feature", 2.0,
                     "thin", "true"),
@@ -246,9 +255,9 @@ static const std::vector<PMFormDef>& forms() {
             ComboL    ("orientation", "Profile Orientation", "Options",
                        "follow_path|frenet|keep_normal",
                        "Follow Path|Frenet|Keep Normal"),
-            DimU      ("twist_turns",   "Twist (turns)",   "Options", 0.0),
-            Angle     ("twist_degrees", "Twist (degrees)", "Options", 0.0),
-            ComboL    ("mode",    "Type",         "Options", "boss|cut", "Boss|Cut"),
+            Signed    (DimU ("twist_turns",   "Twist (turns)",   "Options", 0.0)),
+            Signed    (Angle("twist_degrees", "Twist (degrees)", "Options", 0.0)),
+            Seg       (ComboL("mode",    "Type",         "Options", "boss|cut", "Boss|Cut")),
             Check     ("merge",   "Merge result", "Options", true),
         }},
         // --- loft ---  mode/ruled/merge ; sections[] (>=2 ordered region selectors)
@@ -263,7 +272,7 @@ static const std::vector<PMFormDef>& forms() {
             ComboL    ("tangency_end",   "End Constraint",   "Tangency",
                        "none|normal|tangent|curvature",
                        "None|Normal To Profile|Tangent To Section|Curvature"),
-            ComboL    ("mode",    "Type",         "Options", "boss|cut", "Boss|Cut"),
+            Seg       (ComboL("mode",    "Type",         "Options", "boss|cut", "Boss|Cut")),
             Check     ("ruled",   "Ruled (straight transitions)", "Options", false),
             Check     ("merge",   "Merge result", "Options", true),
         }},
@@ -314,8 +323,8 @@ static const std::vector<PMFormDef>& forms() {
             Dim     ("length",   "Distance",         "Chamfer Parameters", 1.0),
             DimIf   ("length2",  "Distance 2",       "Chamfer Parameters", 1.0,
                      "type", "asymmetric", /*omit=*/true),
-            AngleIf ("angle",    "Angle",            "Chamfer Parameters", 45.0,
-                     "type", "distance_angle", /*omit=*/true),
+            Range   (AngleIf("angle",    "Angle",            "Chamfer Parameters", 45.0,
+                     "type", "distance_angle", /*omit=*/true), 1.0, 89.0),
             WellIf  ("reference_face","Reference Face","Chamfer Parameters", K_FACE, false,
                      "type", "distance_angle"),
         }},
@@ -346,7 +355,8 @@ static const std::vector<PMFormDef>& forms() {
                      "#4-40 UNC|#6-32 UNC|#8-32 UNC|#10-24 UNC|#10-32 UNF|1/4-20 UNC|1/4-28 UNF|"
                      "5/16-18 UNC|3/8-16 UNC|1/2-13 UNC|NPT 1/8|NPT 1/4|NPT 1/2|Custom"),
             DimIf   ("diameter", "Diameter",         "Hole Type", 6.6, "standard", "custom", true),
-            AngleIf ("csink_angle", "C'Sink Angle",  "Hole Type", 90.0, "style", "csink"),
+            Range   (AngleIf("csink_angle", "C'Sink Angle",  "Hole Type", 90.0,
+                     "style", "csink"), 60.0, 150.0),
             ComboL  ("end",      "End Condition",    "End Condition",
                      "through_all|blind", "Through All|Blind"),
             DimIf   ("depth",    "Depth",            "End Condition", 10.0, "end", "blind"),
@@ -403,7 +413,7 @@ static const std::vector<PMFormDef>& forms() {
                       "axis.z|axis.x|axis.y", "Z axis|X axis|Y axis"),
             Well     ("axis",     "…or pick edge/cyl face/datum axis", "Parameters", K_FACEEDGEAXIS, false),
             Int      ("count",    "Instances",    "Parameters", 4),
-            Angle    ("angle",    "Angle",        "Parameters", 360.0),
+            Range    (Angle("angle",    "Angle",        "Parameters", 360.0), 0.0, 360.0),
             Check    ("equal_spacing", "Equal spacing", "Parameters", true),
             FeatWell ("features", "Features to Pattern", "Features to Pattern"),
             Text     ("skip",     "Instances to skip", "Instances to Skip",
@@ -418,7 +428,7 @@ static const std::vector<PMFormDef>& forms() {
             ComboL   ("mode",    "Draft Type",    "Draft",
                       "neutral_plane|parting_line|step",
                       "Neutral Plane|Parting Line|Step"),
-            Angle    ("angle",   "Draft Angle",   "Draft", 3.0),
+            Range    (Angle("angle",   "Draft Angle",   "Draft", 3.0), 0.0, 89.0),
             DatumRef ("neutral", "Neutral Plane", "Draft",
                       "plane.top|plane.front|plane.right",
                       "Top plane|Front plane|Right plane"),
@@ -443,8 +453,8 @@ static const std::vector<PMFormDef>& forms() {
             Dim      ("radius", "Radius",           "Helix", 10.0),
             Dim      ("pitch",  "Pitch",            "Helix", 5.0),
             Dim      ("height", "Height",           "Helix", 20.0),
-            Angle    ("taper",  "Taper Angle",      "Helix", 0.0),
-            Angle    ("start_angle", "Start Angle", "Helix", 0.0),
+            Range    (Angle("taper",  "Taper Angle",      "Helix", 0.0), -89.0, 89.0),
+            Range    (Angle("start_angle", "Start Angle", "Helix", 0.0), 0.0, 360.0),
             Check    ("ccw",    "Counterclockwise", "Helix", true),
         }},
         // --- ref_plane (datum) --- engine datum.py compile_plane. method gates which refs apply:
@@ -459,8 +469,9 @@ static const std::vector<PMFormDef>& forms() {
                       "Offset|At Angle|Three Points|Mid Plane"),
             WellIf   ("base",   "Reference",       "First Reference", K_PLANE, false,
                       "method", "offset|angle|midplane"),
-            DimIf    ("offset", "Offset Distance", "Parameters", 10.0, "method", "offset"),
-            AngleIf  ("angle",  "Angle",           "Parameters", 45.0, "method", "angle"),
+            Signed   (DimIf("offset", "Offset Distance", "Parameters", 10.0, "method", "offset")),
+            Range    (AngleIf("angle",  "Angle",           "Parameters", 45.0,
+                      "method", "angle"), -90.0, 90.0),
             WellIf   ("second", "Hinge (edge/axis)","Second Reference", K_FACEEDGE, false,
                       "method", "angle"),
             WellIf   ("second", "Second Plane",     "Second Reference", K_PLANE, false,
@@ -521,7 +532,8 @@ static const std::vector<PMFormDef>& forms() {
         { "sm_base_flange", "Base Flange", "sm_base_flange", {
             Well ("profile",            "Profile",            "Profile",          K_FACE, true),
             Dim  ("thickness",          "Thickness",          "Sheet Metal Gauges", 2.0),
-            DimU ("k_factor",           "K-Factor",           "Sheet Metal Gauges", 0.45),
+            Range(DimU("k_factor",      "K-Factor",           "Sheet Metal Gauges", 0.45),
+                  0.0, 1.0, 0.05),
             Dim  ("default_bend_radius","Bend Radius",        "Sheet Metal Gauges", 2.0),
         }},
         // --- sm_edge_flange (Sheet Metal) --- engine features/sheet_metal sm_edge_flange. The bend
@@ -531,7 +543,7 @@ static const std::vector<PMFormDef>& forms() {
         //   inherited from the base flange — intentionally NOT on this form.
         { "sm_edge_flange", "Edge Flange", "sm_edge_flange", {
             Well   ("edge",     "Bend Edge",      "Flange",   K_EDGE, false),
-            Angle  ("angle",    "Angle",          "Flange",   90.0),
+            Range  (Angle("angle",    "Angle",          "Flange",   90.0), 0.0, 180.0),
             Dim    ("length",   "Length",         "Flange",   20.0),
             Dim    ("radius",   "Bend Radius",    "Flange",   2.0),
             ComboL ("position", "Flange Position","Flange",
@@ -559,7 +571,7 @@ static const std::vector<PMFormDef>& forms() {
         //   flip mirrors the bend direction. k_factor inherited from the base flange.
         { "sm_jog", "Jog", "sm_jog", {
             Well   ("edge",     "Bend Edge",      "Jog",   K_EDGE, false),
-            Angle  ("angle",    "Angle",          "Jog",   90.0),
+            Range  (Angle("angle",    "Angle",          "Jog",   90.0), 0.0, 90.0),
             Dim    ("offset",   "Offset",         "Jog",   10.0),
             Dim    ("length",   "Length",         "Jog",   20.0),
             Dim    ("radius",   "Bend Radius",    "Jog",   2.0),
@@ -587,8 +599,9 @@ static const std::vector<PMFormDef>& forms() {
             DimIf     ("od",      "Outer Dia.",    "Profile", 25.0, "profile", "round_tube",           true),
             DimIf     ("leg",     "Leg",           "Profile", 25.0, "profile", "angle_L",              true),
             Dim       ("thickness","Thickness",    "Profile", 2.0),
-            Angle     ("angle",   "Rotation",      "Settings", 0.0),
-            ComboL    ("justify", "Justify",       "Settings", "center|corner", "Center|Corner"),
+            Range     (Angle("angle",   "Rotation",      "Settings", 0.0), 0.0, 360.0),
+            Seg       (ComboL("justify", "Justify",       "Settings", "center|corner",
+                       "Center|Corner")),
             Check     ("trim_corners", "Trim corners", "Settings", true),
         }},
         // --- weld_gusset (Weldments / Gusset) --- engine features/weldment weld_gusset. A triangular
@@ -606,7 +619,7 @@ static const std::vector<PMFormDef>& forms() {
                     "triangular|polygonal", "Triangular|Polygonal"),
             ComboL ("location",  "Location",         "Settings",
                     "centered|inner|outer", "Centered|Inner|Outer"),
-            Dim    ("offset",    "Offset",           "Settings", 0.0),
+            Signed (Dim("offset",    "Offset",           "Settings", 0.0)),
         }},
         // --- weld_end_cap (Weldments / End Cap) --- engine features/weldment weld_end_cap. A plate
         //   closing the open END of a hollow member. The face well takes ONE planar member end face.
@@ -615,10 +628,10 @@ static const std::vector<PMFormDef>& forms() {
         { "weld_end_cap", "End Cap", "weld_end_cap", {
             Well   ("face",      "End Face",         "Selections", K_FACE, false),
             Dim    ("thickness", "Thickness",        "End Cap", 5.0),
-            ComboL ("type",      "Type",             "End Cap",
-                    "outer|inner", "Outer (on end)|Inner (inset)"),
+            Seg    (ComboL("type",      "Type",             "End Cap",
+                    "outer|inner", "Outer (on end)|Inner (inset)")),
             DimU   ("overhang",  "Overhang",         "End Cap", 0.0),
-            Dim    ("offset",    "Offset",           "End Cap", 0.0),
+            Signed (Dim("offset",    "Offset",           "End Cap", 0.0)),
         }},
         // --- rib (Dress-up / Stretch) --- engine features/rib.py. A thin support wall grown from an
         //   OPEN sketch contour (a line/chain bridging the gap). The profile well is a region well
@@ -628,9 +641,9 @@ static const std::vector<PMFormDef>& forms() {
         { "rib", "Rib", "rib", {
             Well   ("profile",   "Profile (open contour)", "Profile", K_FACE, true),
             Dim    ("thickness", "Thickness",              "Rib",     3.0),
-            ComboL ("side",      "Thickness Side",         "Rib",
-                    "both|one", "Both (centered)|One Side"),
-            Angle  ("draft",     "Draft Angle",            "Rib",     0.0),
+            Seg    (ComboL("side",      "Thickness Side",         "Rib",
+                    "both|one", "Both (centered)|One Side")),
+            Range  (Angle("draft",     "Draft Angle",            "Rib",     0.0), 0.0, 89.0),
             Check  ("flip",      "Reverse direction",      "Rib",     false),
         }},
         // --- split (Curves / Stretch) --- engine features/split.py. Divide the running body(ies) by a
@@ -666,7 +679,7 @@ static const std::vector<PMFormDef>& forms() {
         { "surf_revolve", "Revolved Surface", "revolve_boss", {
             Well  ("profile", "Profile", "Revolve", K_FACE, true),
             Well  ("axis",    "Axis",    "Revolve", K_EDGE, false),
-            Angle ("angle",   "Angle",   "Revolve", 360.0),
+            Range (Angle("angle",   "Angle",   "Revolve", 360.0), 0.0, 360.0),
         }},
         // --- surf_sweep --- refs.profile[]/path/guides[]; no params.
         { "surf_sweep", "Swept Surface", "sweep", {
@@ -688,7 +701,7 @@ static const std::vector<PMFormDef>& forms() {
         // --- surf_offset --- refs.faces[]; params distance.
         { "surf_offset", "Offset Surface", "offset_ent", {
             Well ("faces",    "Faces to Offset", "Offset Parameters", K_FACE, true),
-            Dim  ("distance", "Offset Distance", "Offset Parameters", 10.0),
+            Signed(Dim("distance", "Offset Distance", "Offset Parameters", 10.0)),
         }},
         // --- surf_ruled --- refs.edge_a/edge_b (each one edge/curve); no params.
         { "surf_ruled", "Ruled Surface", "shell", {
@@ -721,8 +734,8 @@ static const std::vector<PMFormDef>& forms() {
         { "surf_trim", "Trim Surface", "trim", {
             Well   ("surface", "Surface to Trim", "Trim", K_FACE, false),
             Well   ("tool",    "Trim Tool",       "Trim", K_FACE, false),
-            ComboL ("keep",    "Keep Selection",  "Trim",
-                    "inside|outside", "Keep Inside|Keep Outside"),
+            Seg    (ComboL("keep",    "Keep Selection",  "Trim",
+                    "inside|outside", "Keep Inside|Keep Outside")),
         }},
         // --- surf_untrim --- refs.faces[]; no params. Restore a face's natural
         //   (untrimmed) underlying surface.

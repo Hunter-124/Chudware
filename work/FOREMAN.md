@@ -156,3 +156,4 @@ You are expected to spawn your own subagents, and to spend context like money:
    you spawned and confirm before exiting. An orphaned researcher burning usage for
    hours after its parent delivered is a supervision failure (it happened: 2026-07-02,
    VLM research fan-out).
+- 2026-07-02 Fable REVIEWED T-E4: LGTM merge-ready (bore-sweep internal volume + 1D->3D BC handoff + dP verify node w/ erosion advisory; 29 passed/16 skipped piping suite, no regressions; PipingCFDError contract-shaped degradation). Merge order E1 -> E2 -> {E3, E4}. WS-E COMPLETE at review — casualty T-E4 recovered same-day by redispatch

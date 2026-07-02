@@ -2,8 +2,8 @@
 id: T-G8
 title: GUI migration wave 4 - hard subsystems (H1-H5, G4 gate)
 workstream: G
-owner: unassigned
-status: todo
+owner: opus-sky
+status: doing
 branch: task/T-G8-migration-wave4
 day: 9
 priority: 2

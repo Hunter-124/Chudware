@@ -37,7 +37,8 @@ from engine.bolts_loader import Standard
 # off cleanly. The bare quantity qualifier (``-\d+``) is ONLY stripped when it is glued to a
 # distributor token (``-6-ND``) — never standalone — so legitimate ``PART-100`` PNs survive.
 _SUFFIX_PATTERNS: tuple[str, ...] = (
-    r"-\d{1,4}-ND",   # DigiKey quantity + distributor:  -1-ND, -6-ND, -100-ND
+    r"-\d{1,2}-ND",   # DigiKey quantity + distributor:  -1-ND, -6-ND, -25-ND
+                      # (1-2 digits only, so a PN like "ABC-123-ND" keeps its "-123")
     r"-DKR-ND",       # DigiReel + distributor
     r"-CT-ND",        # cut-tape + distributor
     r"-TR-ND",        # tape&reel + distributor
@@ -285,8 +286,8 @@ def match_kicad(mpn: str) -> dict[str, Any] | None:
                     "source": "kicad",
                     "library": path,
                     "libid": sdef.get("libid", libid),
-                    "footprint": sdef.get("footprint", ""),
-                    "description": sdef.get("description", ""),
+                    "footprint": sdef.get("footprint") or "",
+                    "description": sdef.get("description") or "",
                     "params": dict(sdef.get("fields") or {}),
                     "catalog_id": f"kicad:{sdef.get('libid', libid)}",  # provenance
                     "designation": norm,

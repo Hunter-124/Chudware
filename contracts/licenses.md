@@ -53,6 +53,10 @@
 | numba (optional, M7 perf) | BSD-2 | LBM JIT | ok if added |
 | opencv-python-headless (T-F5) | Apache-2.0 | ChArUco/ArUco fiducial detection + px→mm homography | ok |
 | Pillow (T-F5 direct dep) | MIT-CMU | photo ingestion downscale pipeline (engine.vision.ingest) | ok |
+| qrcode (T-F6, optional) | MIT | QR code generation for phone handoff URL | ok |
+| open3d (T-F6, optional) | MIT | mesh cleanup + scale normalization post-photogrammetry | ok |
+| Meshroom/AliceVision (T-F6, subprocess only) | MPL-2.0 | photogrammetry reconstruction — NEVER imported, subprocess via MESHROOM_BIN | ok (subprocess) |
+| COLMAP (T-F6, subprocess alternate) | BSD-3 | photogrammetry alternate — NEVER imported, subprocess via COLMAP_BIN | ok (subprocess) |
 
 Rules:
 - Adding any dependency requires a row here in the same change.

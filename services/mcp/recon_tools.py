@@ -1208,3 +1208,169 @@ def register_recon_tools(mcp: FastMCP) -> None:
                                    "revolve the sketch's regions to build on this face"})
         except Exception as e:  # noqa: BLE001
             return _err(e)
+
+
+# ---------------------------------------------------------------- photo-capture + photogrammetry entry path (T-F6)
+
+_SESSIONS: dict = {}  # port -> CaptureSession; module-level, no global state leaks
+
+
+def register_photo_recon_tools(mcp: FastMCP) -> None:
+    """Photo capture session + photogrammetry entry path for reverse_engineer.
+
+    DEFAULT OFF — the local HTTP listener only starts when start_capture_session is called
+    with explicit params. Offline mode (reverse_engineer on a file) is completely unaffected.
+    """
+
+    @mcp.tool()
+    def start_capture_session(
+        port: int = 8742,
+        scale_marker_mm: Optional[float] = None,
+    ) -> str:
+        """Start a local photo-capture server. Returns QR code URL + upload instructions.
+
+        The phone scans the QR code and opens a guided upload page. Photos go into a
+        temporary directory. Call stop_capture_session() when done to get the paths and
+        optionally trigger reconstruction.
+
+        scale_marker_mm: if you placed a known-size fiducial marker in the scene,
+        specify its size in mm for automatic scale normalization.
+        """
+        try:
+            # Lazy import so a missing qrcode/open3d can't break server startup
+            from engine.vision.capture_server import start_session
+
+            if port in _SESSIONS:
+                existing = _SESSIONS[port]
+                return _dumps({
+                    "ok": False,
+                    "reason": f"a capture session is already running on port {port}",
+                    "hint": "call stop_capture_session first, or use a different port",
+                    "upload_url": existing.upload_url,
+                    "photo_count": len(existing.received),
+                })
+
+            session = start_session(port=port)
+            # Store scale_marker_mm alongside the session
+            session._scale_marker_mm = scale_marker_mm  # type: ignore[attr-defined]
+            _SESSIONS[port] = session
+
+            return _dumps({
+                "ok": True,
+                "port": port,
+                "upload_url": session.upload_url,
+                "qr": session.qr,
+                "shot_names": session.shot_names,
+                "scale_marker_mm": scale_marker_mm,
+                "instructions": (
+                    "Scan the QR code with your phone (or open the upload_url in a mobile browser). "
+                    f"Upload one photo per guided angle ({len(session.shot_names)} angles). "
+                    "When done, call stop_capture_session(port=" + str(port) + ") to "
+                    "run reconstruction and get the mesh path for reverse_engineer()."
+                ),
+            })
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def stop_capture_session(
+        port: int = 8742,
+        run_reconstruction: bool = True,
+    ) -> str:
+        """Stop the capture session and optionally run photogrammetry reconstruction.
+
+        Returns {ok, photo_count, reconstruction, mesh_path, next_steps}.
+        Pass the returned mesh_path to reverse_engineer(source=<mesh_path>) to complete
+        the round-trip from photos to an editable parametric feature tree.
+        """
+        try:
+            from engine.vision.capture_server import stop_session
+            from engine.vision import photogrammetry as _pg
+            from engine.vision import mesh_cleanup as _mc
+            import os as _os
+            import tempfile
+
+            session = _SESSIONS.pop(port, None)
+            if session is None:
+                return _dumps({
+                    "ok": False,
+                    "reason": f"no capture session is running on port {port}",
+                    "hint": "call start_capture_session first",
+                })
+
+            photo_count = len(session.received)
+            work_dir = session.work_dir
+            stop_session(session)
+
+            result: dict = {
+                "ok": True,
+                "photo_count": photo_count,
+                "photos": session.received,
+            }
+
+            if not run_reconstruction or photo_count == 0:
+                result["reconstruction"] = None
+                result["mesh_path"] = None
+                result["next_steps"] = (
+                    ["capture more photos and try again"] if photo_count == 0
+                    else ["pass the photo paths to your preferred photogrammetry tool "
+                          "and then call reverse_engineer(source=<mesh_path>)"]
+                )
+                # Clean up work_dir only if we're not handing it off
+                if work_dir is not None and photo_count == 0:
+                    try:
+                        work_dir.cleanup()
+                    except Exception:  # noqa: BLE001
+                        pass
+                return _dumps(result)
+
+            # Run photogrammetry reconstruction
+            recon_dir = tempfile.mkdtemp(prefix="aicad_recon_")
+            scale_mm = getattr(session, "_scale_marker_mm", None)
+            recon = _pg.reconstruct(
+                image_dir=work_dir.name,
+                out_dir=recon_dir,
+                scale_mm=scale_mm,
+            )
+            result["reconstruction"] = recon
+
+            mesh_path = None
+            if recon.get("ok") and recon.get("mesh_path"):
+                raw_mesh = recon["mesh_path"]
+                cleaned_path = _os.path.join(recon_dir, "cleaned_mesh.obj")
+                cleanup = _mc.cleanup_mesh(raw_mesh, cleaned_path, scale_mm=scale_mm)
+                result["cleanup"] = cleanup
+                if cleanup.get("ok"):
+                    mesh_path = cleanup["mesh_path"]
+                    if cleanup.get("notes"):
+                        result["warnings"] = cleanup["notes"]
+                else:
+                    # Fallback to raw mesh if cleanup fails (e.g. open3d not installed)
+                    mesh_path = raw_mesh
+                    result["cleanup_skipped"] = cleanup.get("reason")
+
+            result["mesh_path"] = mesh_path
+
+            steps = []
+            if mesh_path:
+                steps.append(
+                    f"call reverse_engineer(source={mesh_path!r}) to convert the mesh "
+                    "into an editable parametric feature tree"
+                )
+            else:
+                steps.append(
+                    "photogrammetry did not produce a mesh — check reconstruction.reason; "
+                    "ensure MESHROOM_BIN or COLMAP_BIN is set"
+                )
+            result["next_steps"] = steps
+
+            # Clean up photo work_dir now that mesh is written to recon_dir
+            if work_dir is not None:
+                try:
+                    work_dir.cleanup()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            return _dumps(result)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)

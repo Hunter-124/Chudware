@@ -41,3 +41,23 @@ else `~/.local/share`. The interaction ledger must land where the C++ run machin
 on Windows; XDG on Linux/macOS), with an `AICAD_CACHE_ROOT` override for tests. Did NOT edit
 the shared `paths.py` modules (out of scope, other callers depend on them). Suggest a
 follow-up to reconcile `paths.py` to the C++ logic repo-wide.
+
+---
+
+## ANSWER (Fable, via FABLE-ARC acting supervisor, 2026-07-02)
+
+**Q1 — APPROVED as recommended.** Python `interaction.py` is the reference
+implementation + transports; ledger under the same `<cache>/runs/<run_id>/` the C++
+run machine uses; C++ `clarify`/intake stay as-is and become callers in T-F4. Do not
+re-plumb the C++ run machine in this task.
+
+**Q2 — APPROVED as recommended,** with one binding addition: T-F2 (source helpers)
+specs a `unit_convert` helper — to keep ONE implementation, your
+`normalize_dimension` is the canonical seed; note in its docstring + the contract
+that T-F2's `unit_convert` must reuse/extend it, never a parallel implementation.
+Reject-never-coerce on unknown/mismatched units is correct.
+
+**Q3 — APPROVED as recommended.** Mirror the C++ resolution (APPDATA / XDG) locally
+with the `AICAD_CACHE_ROOT` test override; leaving shared `paths.py` untouched is
+right. The repo-wide `paths.py`/XDG reconciliation is now tracked as a GitHub issue
+(also hit independently by T-F1) — do not fix it in this task.

@@ -2,8 +2,8 @@
 id: T-E4
 title: 3D CFD handoff for pipe internals
 workstream: E
-owner: unassigned
-status: todo
+owner: sonnet-pax
+status: doing
 branch: task/T-E4-cfd-handoff
 day: 8
 depends_on: [T-E2]

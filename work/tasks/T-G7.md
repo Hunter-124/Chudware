@@ -2,8 +2,8 @@
 id: T-G7
 title: GUI migration wave 3 - core panels (C1-C6, G3 gate)
 workstream: G
-owner: unassigned
-status: todo
+owner: opus-gale
+status: review
 branch: task/T-G7-migration-wave3
 day: 8
 depends_on: [T-G6]
@@ -45,8 +45,12 @@ harness — closed by the G3 integrator gate (full panel screenshot battery).
       evalmass) blocked by **issue #7** (mid-loop `DocMirror::newPart(worker)` offscreen
       deadlock, F4/C6 worker-seam scope — out of the ui/imgui G-lane). See work/questions/T-G7.md
       Q1 (G3-gate re-scope decision pending foreman).
-- [~] `bash scripts/gate.sh` — pending (chained on T-G6; ui/imgui build+shot expected PASS;
-      same known pre-existing reds as T-G6). `graphify update .`: foreman regenerates at merge.
+- [~] `bash scripts/gate.sh` — **ui/abstract PASS** (my panel_spec.cpp change passes the
+      command_registry test) and **ui/imgui build + --shot PASS** (my scenarios.cpp change
+      compiles + shots clean). RESULT: FAIL is ONLY the known pre-existing reds (identical to
+      T-G6): check.py audits; pytest "107 deselected" (issue #6); `--selftest` non-fatal env-gap
+      (no `AI_CAD_LIBAICAD` in gate). My two hunks are gate-clean. `graphify update .`: touches
+      2 code files — foreman regenerates at merge (graphify-out/ is in the foreman main checkout).
 
 ## Verification (opus-gale, 2026-07-03) — chained off T-G6 (merge order T-G6 → T-G7)
 

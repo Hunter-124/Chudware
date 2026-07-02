@@ -44,6 +44,16 @@ class VendorPart:
     # Optional: mtime of the on-disk source file when last registered. Used by the watched
     # parts-library scanner to skip unchanged files (idempotent re-scan). C++ core ignores it.
     source_mtime: float = 0.0
+    # --- Sourcing/pricing fields (T-B1a, additive; see contracts/sourcing_schema.md). ---
+    # All optional so records registered without a price feed remain valid and unchanged. A
+    # provider that returns pricing populates these; consumers must treat None as "unknown".
+    unit_price: float | None = None          # price for a single unit at qty 1, in `currency`
+    currency: str = "USD"                    # ISO-4217 code the prices are quoted in
+    price_breaks: list[dict] = field(default_factory=list)  # [{"qty": int, "unit_price": float}]
+    stock: int | None = None                 # units available now; None = unknown, 0 = out of stock
+    lead_time_days: int | None = None        # business days to ship if not in stock
+    moq: int | None = None                   # minimum order quantity
+    fetched_ts: float | None = None          # epoch seconds when pricing/stock was last fetched
 
     @property
     def key(self) -> str:

@@ -3,7 +3,7 @@ id: T-B1a
 title: Freeze sourcing_schema.md and extend VendorPart schema
 workstream: B
 owner: opus-wren
-status: doing
+status: review
 branch: task/T-B1a-sourcing-schema
 day: 1
 depends_on: [T-S1]
@@ -30,9 +30,9 @@ The morning deliverable for day 1 in workstream B is the contract freeze. `contr
 
 ## Definition of done
 
-- [ ] `contracts/sourcing_schema.md` exists and covers VendorPart, PartProvider interface, BomLine, QuoteRequest/Result
-- [ ] VendorPart in `vendor_parts.py` has all seven new fields with sensible defaults
-- [ ] `python -m pytest engine_oracle/test_vendor_parts.py -q` passes without modification to existing tests
+- [x] `contracts/sourcing_schema.md` exists and covers VendorPart, PartProvider interface, BomLine, QuoteRequest/Result
+- [x] VendorPart in `vendor_parts.py` has all seven new fields with sensible defaults
+- [x] `python -m pytest engine_oracle/test_vendor_parts.py -q` passes without modification to existing tests
 
 ## AI hints
 

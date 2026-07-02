@@ -90,6 +90,39 @@ gate.sh ui/imgui selMulti failure is PRE-EXISTING, never chase; commit+push ever
   (ANSWER in the question file, noted in FOREMAN); anything genuinely needing Erik is
   DEFERRED into "## Questions for Erik" at the bottom of this log instead of blocking.
 
+### 2026-07-02 — D2 landed (services/deliverables + MCP + installer + tests)
+
+- **D2 (Opus) implemented the full scaffold** on `task/T-F14-deliverables-scaffold` (rebased
+  onto origin/master bf1f718; server.py hot-spot had no divergence — clean append).
+  Commits: module `7181b20`, MCP registration `20c8844`, installer `82d6c24`, tests `7eb6ba5`
+  (bookkeeping commit follows).
+  - `services/deliverables/` (7 impl modules + guide + mcp_tools + tests; repo-root symlink
+    `deliverables/`): spec validator + provenance slot/cell resolution, engine wrappers
+    (python-pptx/docx/openpyxl/reportlab in-process; pypdfium2 PDF→PNG; matplotlib csv/md;
+    LibreOffice/pandoc PATH-discovered subprocess-only), generic template registry + three smoke
+    templates (deck/report/workbook with a live `=B2*C2` formula), artifact registry (§3 records
+    under `<project>/artifacts/registry.json`, spec persisted as `spec_ref`).
+  - `server.py` append-only `register_deliverables_tools(mcp)`; `cad_guide('deliverables')` topic.
+  - `requirements.txt` + `provision.py` engine pins + `converters_status()` PATH discovery.
+- **Tests:** 20 passed (`pytest services/deliverables -q`), incl. §5.1 4B-spec per format
+  (pptx/docx/pdf/xlsx), provenance_violation (literal in load-bearing slot/column), slot_unresolved
+  ×3, render_document mocked-converter + converter_missing degradation (artifact untouched), native
+  pdf/csv, registry round-trip + run_id filter. Green with neither pandoc nor LibreOffice installed
+  (verified under `env -i`, empty PATH).
+- **Gate:** `graphify update .` OK (AST-only, 19251 nodes). `scripts/gate.sh` — core build + ctest
+  PASS; ui/imgui `PanelField::selMulti` failure is PRE-EXISTING (not chased). Stage-4 pytest
+  (`engine/doc agent`) errors on `ModuleNotFoundError: No module named 'OCP'` — an unprovisioned
+  system-python3.14 runtime (no build123d/OCP venv), NOT a D2 regression (D2 touches no engine/doc
+  file; error even collects from a sibling worktree path). Deliverables suite is separate and green.
+- **Repair-warning DoD check:** LibreOffice IS on PATH locally — `soffice --headless --convert-to
+  pdf` succeeds for the docx/xlsx smoke artifacts (returncode 0, no repair prompt); pdf is native
+  (reportlab). pptx builds valid (2 slides) via python-pptx.
+- **Open question:** `work/questions/T-F14.md` Q1 — no permissive in-process SVG rasterizer in the
+  §7 engine set; svg preview is best-effort (optional cairosvg → office fallback → converter_missing).
+  Recommended answer: accept for `deliverables/1` (svg is not a make_* output format); add resvg/
+  cairosvg §7 row later if native svg preview is wanted. Non-blocking.
+- Next: F14 ready for human merge (order F14→F15→F16); T-F15 branches FROM this branch.
+
 ## Questions for Erik (batched — answer when convenient)
 
 - (none yet)

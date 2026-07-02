@@ -28,14 +28,14 @@ graph TD
   subgraph WS_C["workstream C"]
     T_C1["T-C1: firmware_rpc.md contract and engine/firmware/ scaffold"]:::done
     T_C2["T-C2: Compile loop and pin-map header from ECAD netlist"]:::done
-    T_C3["T-C3: Emulation loop via Renode with fw_sim_run MCP tool"]:::todo
+    T_C3["T-C3: Emulation loop via Renode with fw_sim_run MCP tool"]:::doing
     T_C4["T-C4: Hardware path - probe-rs flash/debug and clangd LSP tools"]:::todo
     T_C5["T-C5: firmware.md agent prompt and demo firmware in Renode"]:::todo
   end
   subgraph WS_D["workstream D"]
     T_D1["T-D1: structural_schema.md contract and engine/structural/ scaffold"]:::done
     T_D2["T-D2: PyNite integration - member forces and deflections"]:::done
-    T_D3["T-D3: Section libraries, D/C ratio checks, and struct_check MCP tool"]:::todo
+    T_D3["T-D3: Section libraries, D/C ratio checks, and struct_check MCP tool"]:::doing
     T_D4["T-D4: Code compliance - agentic RAG and deterministic rule engine"]:::todo
     T_D5["T-D5: Cost takeoff and struct_estimate MCP tool with integration demo"]:::todo
   end
@@ -87,7 +87,7 @@ graph TD
     T_H3["T-H3: Requirements layer - freeze aicad.req/1 schema + requirements doc CRUD"]:::done
     T_H4["T-H4: Verifier battery API + gap verifiers (groundedness, manifold, unit sanity, dim coverage)"]:::done
     T_H5["T-H5: Training data store - consent-filtered exporter, DVC versioning, Argilla audit gate"]:::done
-    T_H6["T-H6: Fleet training runner - claim-based job queue, cross-OS profiles, MLflow tracking"]:::doing
+    T_H6["T-H6: Fleet training runner - claim-based job queue, cross-OS profiles, MLflow tracking"]:::done
     T_H7["T-H7: Frontier-API logging middleware + shadow-mode comparison harness"]:::done
     T_H8["T-H8: Product-task eval benchmark suite (elicitation, spec->sketch, regen-fix, CAM, VLM)"]:::doing
     T_H9["T-H9: Adapter serving - vLLM per-task LoRA routing, canary rollout, rollback story"]:::todo

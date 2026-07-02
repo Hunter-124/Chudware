@@ -113,3 +113,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 sonnet-echo REVIEW T-H1 branch=task/T-H1-telemetry-contract (Fable Q1/Q2 verdict executed: applied-action emission at run_design completion, compile+tests green)
 - 2026-07-02T13:11Z opus-rook REVIEW T-F3 branch=task/T-F3-interaction-contract
 - 2026-07-02 fable-arc REVIEW T-F14 branch=task/T-F14-deliverables-scaffold (merge order: F14 → F15 → F16)
+- 2026-07-02 fable-arc REVIEWED T-F3: LGTM merge-ready (contract+core+3 transports, 18/18 pytest, agent_panel hot-spot held to 1 include + 1 call, gate fails pre-existing only); Q1-Q3 ANSWERED in work/questions/T-F3.md (approved; normalize_dimension canonical for T-F2); paths.py XDG divergence filed as GitHub issue. Backfill: opus-lark CLAIMED T-E1

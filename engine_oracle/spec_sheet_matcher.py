@@ -26,6 +26,7 @@ import re
 from typing import Any
 
 from engine import bolts_loader
+from engine import paths
 from engine.bolts_loader import Standard
 
 # --------------------------------------------------------------------------------------
@@ -385,3 +386,439 @@ def match_part_number(mpn: str, *, generate: bool = True) -> dict[str, Any]:
         if key in match:
             out[key] = match[key]
     return out
+
+
+# ======================================================================================
+# 6. AI path (T-B5): datasheet text -> dimension dict -> parametric template -> VendorPart
+# ======================================================================================
+#
+# The deterministic lane above resolves a *known* standard part (a screw, a bearing) from its
+# designation. This lane handles the long tail: a purchased part whose datasheet or listing gives
+# real dimensions but no catalog match. An LLM reads the datasheet text and returns a dimension
+# dict keyed to a small **parametric template** (a capacitor can, a generic box/cylinder); we fill
+# the template, build editable geometry, render a GSL text preview for the user to confirm, and
+# register the result as a ``VendorPart`` with ``source="spec_sheet"``.
+#
+# Provenance is still never fabricated: the LLM may only populate keys the template defines; a
+# missing REQUIRED dimension is surfaced (``missing_required``), never guessed, and
+# :func:`register_from_spec_sheet` refuses to build until every required dim is present. Every LLM
+# call goes through the T-F9 ``Provider`` contract wrapped in the T-H7 ``LoggingProvider`` so it is
+# flywheel-logged (insertion point IP-16, "standards/parts lookup" per the model-integration survey).
+
+import json as _json
+
+_SPEC_INSERTION_POINT = "IP-16"  # survey IP-16: standards/parts lookup & substitution
+
+
+class SpecTemplate:
+    """A parametric template: the dims an LLM must extract + how to build editable geometry.
+
+    ``required`` dims gate the build (never defaulted — a missing one is reported, not guessed);
+    ``optional`` dims are recorded on the part's specs and may inform geometry. ``build_ops`` maps a
+    validated dim dict to a list of ``doc_apply_ops`` feature ops (box/cylinder primitives) — the
+    editable geometry the ``script``-feature path produces.
+    """
+
+    def __init__(self, name: str, required: tuple[str, ...], optional: tuple[str, ...],
+                 build_ops: Callable[[dict[str, float]], list[dict[str, Any]]],
+                 *, description: str = "") -> None:
+        self.name = name
+        self.required = required
+        self.optional = optional
+        self._build_ops = build_ops
+        self.description = description
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        return tuple(self.required) + tuple(self.optional)
+
+    def build_ops(self, dims: dict[str, float]) -> list[dict[str, Any]]:
+        return self._build_ops(dims)
+
+
+def _p(value: float) -> dict[str, Any]:
+    """A parametric-value param cell (``{"value": v, "expr": null}``) per the doc-ops schema."""
+    return {"value": float(value), "expr": None}
+
+
+def _cylinder_ops(radius_mm: float, height_mm: float, name: str = "Body") -> list[dict[str, Any]]:
+    return [{"op": "add_feature", "feature": {
+        "type": "cylinder", "name": name,
+        "params": {"radius": _p(radius_mm), "height": _p(height_mm)}}}]
+
+
+def _box_ops(length_mm: float, width_mm: float, height_mm: float,
+             name: str = "Body") -> list[dict[str, Any]]:
+    return [{"op": "add_feature", "feature": {
+        "type": "box", "name": name,
+        "params": {"length": _p(length_mm), "width": _p(width_mm), "height": _p(height_mm)}}}]
+
+
+def _cap_radial_ops(dims: dict[str, float]) -> list[dict[str, Any]]:
+    # Radial (can) electrolytic: an upright cylinder can. Diameter -> radius, length -> height.
+    return _cylinder_ops(float(dims["body_diameter_mm"]) / 2.0,
+                         float(dims["body_length_mm"]), name="CapBody")
+
+
+def _cap_axial_ops(dims: dict[str, float]) -> list[dict[str, Any]]:
+    # Axial cap: a cylinder body (leads exit each end; recorded in specs, not modeled here).
+    return _cylinder_ops(float(dims["body_diameter_mm"]) / 2.0,
+                         float(dims["body_length_mm"]), name="CapBody")
+
+
+def _generic_cylinder_ops(dims: dict[str, float]) -> list[dict[str, Any]]:
+    return _cylinder_ops(float(dims["diameter_mm"]) / 2.0, float(dims["height_mm"]))
+
+
+def _generic_box_ops(dims: dict[str, float]) -> list[dict[str, Any]]:
+    return _box_ops(float(dims["length_mm"]), float(dims["width_mm"]), float(dims["height_mm"]))
+
+
+# Registry of supported parametric templates. Small by design — this is the fallback lane, not a
+# catalog. New templates are additive: name -> SpecTemplate.
+TEMPLATES: dict[str, SpecTemplate] = {
+    "capacitor_radial": SpecTemplate(
+        "capacitor_radial",
+        required=("body_diameter_mm", "body_length_mm"),
+        optional=("lead_spacing_mm", "lead_diameter_mm", "capacitance_uf",
+                  "voltage_v", "tolerance_pct"),
+        build_ops=_cap_radial_ops,
+        description="Radial (can) electrolytic capacitor body"),
+    "capacitor_axial": SpecTemplate(
+        "capacitor_axial",
+        required=("body_diameter_mm", "body_length_mm"),
+        optional=("lead_diameter_mm", "capacitance_uf", "voltage_v", "tolerance_pct"),
+        build_ops=_cap_axial_ops,
+        description="Axial-lead capacitor body"),
+    "cylinder": SpecTemplate(
+        "cylinder", required=("diameter_mm", "height_mm"), optional=(),
+        build_ops=_generic_cylinder_ops, description="Generic cylindrical body"),
+    "box": SpecTemplate(
+        "box", required=("length_mm", "width_mm", "height_mm"), optional=(),
+        build_ops=_generic_box_ops, description="Generic rectangular body"),
+}
+
+# Dimension keys are always numeric (mm / SI); non-dimension metadata keys the LLM may also fill.
+_META_KEYS = ("capacitance_uf", "voltage_v", "tolerance_pct")
+
+
+def list_templates() -> list[dict[str, Any]]:
+    """The supported parametric templates + their required/optional dimension keys."""
+    return [{"name": t.name, "required": list(t.required), "optional": list(t.optional),
+             "description": t.description} for t in TEMPLATES.values()]
+
+
+def _resolve_text(text_or_url: str, *,
+                  fetch: Callable[[str], dict] | None = None) -> str:
+    """Return datasheet text: pass-through for pasted text, or fetch a listing URL to markdown.
+
+    A ``http(s)://`` argument is fetched through the research fetch_page helper (offline/cache
+    aware, no scraping of blocked hosts); anything else is treated as already-pasted text. A fetch
+    that fails degrades to an empty string (the extractor then simply finds no dims).
+    """
+    s = str(text_or_url or "").strip()
+    if not re.match(r"^https?://", s, re.IGNORECASE):
+        return s
+    try:
+        fetch = fetch or _default_fetch
+        res = fetch(s)
+    except Exception:  # noqa: BLE001 — network/offline failure -> no text, never a traceback
+        return ""
+    if isinstance(res, dict) and res.get("ok") and res.get("markdown"):
+        return str(res["markdown"])
+    return ""
+
+
+def _default_fetch(url: str) -> dict:
+    from engine.research.fetch_page import fetch_page  # lazy: keep HTTP surface off import
+    return fetch_page(url)
+
+
+def _coerce_num(value: Any) -> float | None:
+    """Coerce an LLM-returned scalar to a float, tolerating ``"6.3 mm"`` / ``"470uF"`` strings."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        m = re.search(r"[-+]?\d*\.?\d+", value)
+        if m:
+            try:
+                return float(m.group(0))
+            except ValueError:
+                return None
+    return None
+
+
+def _extract_json_object(reply: str) -> dict[str, Any]:
+    """Pull the first balanced ``{...}`` JSON object out of an LLM reply (tolerates code fences)."""
+    if not reply:
+        return {}
+    start = reply.find("{")
+    if start < 0:
+        return {}
+    depth = 0
+    for i in range(start, len(reply)):
+        c = reply[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = _json.loads(reply[start:i + 1])
+                    return obj if isinstance(obj, dict) else {}
+                except Exception:  # noqa: BLE001
+                    return {}
+    return {}
+
+
+def _spec_prompt(template: SpecTemplate) -> str:
+    keys = ", ".join(template.keys)
+    return (
+        "You extract mechanical dimensions from an electronic-component datasheet or product "
+        "listing. Read the text and return ONLY a JSON object. Use these keys where the datasheet "
+        f"gives the value (omit any you cannot find — NEVER guess): {keys}. All *_mm keys are "
+        "millimetres, *_uf microfarads, *_v volts. Also include 'mpn' (manufacturer part number) "
+        "and 'description' if present. Output JSON only, no prose."
+    )
+
+
+def _make_journal_sink() -> Callable[[dict], None]:
+    """Durable default event sink: append each ai_artifact event to the telemetry journal.
+
+    Keeps the "every LLM call is flywheel-logged" guarantee real when no caller-supplied sink is
+    passed (e.g. the MCP tool path). Failures are swallowed — telemetry must never break a call.
+    """
+    def _sink(event: dict) -> None:
+        try:
+            out = paths.CACHE / "telemetry" / "events.jsonl"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with out.open("a", encoding="utf-8") as fh:
+                fh.write(_json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+    return _sink
+
+
+def _default_provider(on_event: Callable[[dict], None] | None):
+    """The configured T-F9 provider wrapped in the T-H7 LoggingProvider (flywheel-logged, IP-16)."""
+    from services.agent.config import get_provider
+    from services.agent.providers import logging_provider
+    base = get_provider()
+    # Pass sidecar_dir explicitly: LoggingProvider's default resolves engine.paths.DATA, which is
+    # absent on the Linux paths module (only %APPDATA%-style constants exist) — see the T-B5 note.
+    return logging_provider.wrap(
+        base, on_event=on_event or _make_journal_sink(),
+        sidecar_dir=paths.CACHE / "telemetry" / "sidecars",
+        insertion_point=_SPEC_INSERTION_POINT, suppress_emit=False)
+
+
+def ai_extract_dims(text_or_url: str, template: str, *,
+                    provider: Any = None,
+                    on_event: Callable[[dict], None] | None = None,
+                    fetch: Callable[[str], dict] | None = None) -> dict[str, Any]:
+    """Extract a template-keyed dimension dict from datasheet text (or a listing URL) via the LLM.
+
+    Prompts the model (through the T-F9 ``Provider`` contract, wrapped in the T-H7
+    ``LoggingProvider`` so the call is flywheel-logged at IP-16) with the datasheet text and the
+    template's dimension keys, then parses + validates the JSON reply. Only keys the template
+    defines are kept; numeric dims are coerced to floats (tolerating ``"6.3 mm"``); anything the
+    model could not find is simply absent — never fabricated.
+
+    Returns ``{"template", "dims", "missing_required", "mpn", "description", "raw"}``. ``dims`` holds
+    the validated numeric dimensions; ``missing_required`` lists required keys the datasheet did not
+    yield (empty ⇒ ready to build). ``provider`` is injectable (a mock in tests); the default
+    resolves the configured provider — never constructed in CI.
+    """
+    tmpl = TEMPLATES.get(template)
+    if tmpl is None:
+        raise ValueError(f"unknown template {template!r}; known: {sorted(TEMPLATES)}")
+
+    text = _resolve_text(text_or_url, fetch=fetch)
+    prov = provider if provider is not None else _default_provider(on_event)
+
+    from services.agent.providers.base import text_part, user
+    system = _spec_prompt(tmpl)
+    reply = prov.complete(system, [user([text_part(text)])], max_tokens=1024)
+
+    obj = _extract_json_object(reply)
+    dims: dict[str, Any] = {}
+    for key in tmpl.keys:
+        if key in obj and obj[key] is not None:
+            num = _coerce_num(obj[key])
+            if num is not None:
+                dims[key] = num
+    missing = [k for k in tmpl.required if k not in dims]
+    return {
+        "template": tmpl.name,
+        "dims": dims,
+        "missing_required": missing,
+        "mpn": str(obj.get("mpn") or "").strip() or None,
+        "description": str(obj.get("description") or "").strip(),
+        "raw": reply,
+    }
+
+
+def gsl_preview(dims: dict[str, Any], template: str, *, mpn: str = "") -> str:
+    """A deterministic GSL-style text render of the parametric part, for user confirmation.
+
+    Offline-safe (no core, no vision): summarizes the template and its filled dimensions so the
+    user can confirm the extracted spec before it is registered. When the native core is present
+    the caller may additionally attach a rendered preview, but this text always exists.
+    """
+    tmpl = TEMPLATES.get(template)
+    head = f"{template}" + (f"  [{mpn}]" if mpn else "")
+    lines = [f"spec-sheet part: {head}",
+             f"template: {tmpl.description if tmpl else template}"]
+    for key in (tmpl.keys if tmpl else sorted(dims)):
+        if key in dims:
+            unit = "mm" if key.endswith("_mm") else ""
+            lines.append(f"  {key} = {dims[key]:g} {unit}".rstrip())
+    return "\n".join(lines)
+
+
+def _default_build_model(template: str, dims: dict[str, float]) -> str | None:
+    """Build editable geometry for a filled template via the core and save a STEP; ``None`` offline.
+
+    Runs the ``script``-feature build path: ``doc_new`` → ``doc_apply_ops`` (the template's
+    box/cylinder ops) → ``doc_export_step``. Returns the saved model path, or ``None`` when the
+    native core is unavailable (CI/offline) or the build fails — the contract "no model" state,
+    never a traceback. Injectable via :func:`register_from_spec_sheet`'s ``build_model`` seam.
+    """
+    tmpl = TEMPLATES.get(template)
+    if tmpl is None:
+        return None
+    try:
+        ops = tmpl.build_ops(dims)
+    except Exception:  # noqa: BLE001 — a missing dim reaches here as KeyError; treat as no-build
+        return None
+    try:
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        repo = Path(__file__).resolve().parent.parent
+        svc = repo / "services" / "mcp"
+        if str(svc) not in sys.path:
+            sys.path.insert(0, str(svc))
+        import core_bridge as cb  # type: ignore
+
+        r = cb.call("doc_new", {"name": f"spec_{template}"})
+        doc_id = r.get("doc_id") if isinstance(r, dict) else None
+        if not doc_id:
+            return None
+        cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": ops})
+        stem = re.sub(r"[^A-Za-z0-9]+", "_", template).strip("_") or "spec_part"
+        out = Path(tempfile.gettempdir()) / "aicad_spec_models" / f"{stem}_{doc_id}.step"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        cb.call("doc_export_step", {"doc_id": doc_id, "path": str(out)})
+        return str(out) if out.exists() else None
+    except Exception:  # noqa: BLE001 — core absent / build failure -> contract "no model"
+        return None
+
+
+def register_from_spec_sheet(dims: dict[str, Any], template: str, mpn: str, *,
+                             supplier: str = "spec_sheet",
+                             description: str = "",
+                             build_model: Callable[[str, dict], str | None] | None = None,
+                             ) -> dict[str, Any]:
+    """Build a filled template's geometry and register it as a ``source="spec_sheet"`` VendorPart.
+
+    Validates that every REQUIRED dim for ``template`` is present (raises ``ValueError`` otherwise —
+    a part is never built from incomplete dims). Builds editable geometry (``build_model`` seam;
+    the default is core-backed and returns ``None`` offline), renders a GSL text preview, and — when
+    a model was produced — registers a ``VendorPart`` whose ``cad_path`` links the saved doc,
+    ``source="spec_sheet"``, and ``specs`` carries the extracted dims + template.
+
+    Returns ``{"registered", "source", "mpn", "template", "params", "model_path", "preview",
+    "vendor_part"}``. With no core (CI/offline) ``registered`` is ``False`` and ``model_path`` is
+    ``None`` — the spec + preview are still returned, but no hollow record is written.
+    """
+    tmpl = TEMPLATES.get(template)
+    if tmpl is None:
+        raise ValueError(f"unknown template {template!r}; known: {sorted(TEMPLATES)}")
+    if not str(mpn or "").strip():
+        raise ValueError("mpn is required to register a spec-sheet part")
+    missing = [k for k in tmpl.required if k not in dims]
+    if missing:
+        raise ValueError(
+            f"cannot build {template!r}: missing required dims {missing} "
+            f"(spec-sheet parts are never built from guessed dimensions)")
+
+    numeric = {k: float(v) for k, v in dims.items()
+               if k in tmpl.keys and _coerce_num(v) is not None}
+    preview = gsl_preview(numeric, template, mpn=mpn)
+
+    build = build_model or _default_build_model
+    model_path = build(template, numeric)
+
+    out: dict[str, Any] = {
+        "registered": False,
+        "source": "spec_sheet",
+        "mpn": str(mpn).strip(),
+        "template": template,
+        "params": numeric,
+        "model_path": model_path,
+        "preview": preview,
+        "vendor_part": None,
+    }
+    if not model_path:
+        out["reason"] = "no editable model produced (native core unavailable offline)"
+        return out
+
+    from engine import vendor_parts
+    specs = {**numeric, "template": template}
+    rec = vendor_parts.register_local_cad(
+        supplier=supplier, part_number=str(mpn).strip(),
+        cad_path=model_path, description=description or preview.splitlines()[0],
+        specs=specs, source="spec_sheet")
+    out["registered"] = True
+    out["vendor_part"] = rec
+    return out
+
+
+def spec_sheet_match(text_or_url: str, mpn: str, template: str, *,
+                     provider: Any = None,
+                     on_event: Callable[[dict], None] | None = None,
+                     build_model: Callable[[str, dict], str | None] | None = None,
+                     ) -> dict[str, Any]:
+    """Full AI path: datasheet -> LLM dims -> parametric build -> GSL preview -> VendorPart.
+
+    Orchestrates :func:`ai_extract_dims` then :func:`register_from_spec_sheet`. Returns a
+    contract-shaped dict: ``{matched, source, mpn, template, params, missing_required, model_path,
+    preview, registered, vendor_part}``. When the datasheet does not yield every required dim,
+    ``matched`` is ``False`` and ``missing_required`` names the gaps (nothing is built or
+    registered) — never a fabricated part. ``provider``/``build_model`` are injectable seams
+    (mocked in tests); defaults use the configured LLM + native core.
+    """
+    extracted = ai_extract_dims(text_or_url, template, provider=provider, on_event=on_event)
+    resolved_mpn = str(mpn or "").strip() or extracted.get("mpn") or ""
+    base: dict[str, Any] = {
+        "matched": False,
+        "source": "spec_sheet",
+        "mpn": resolved_mpn or None,
+        "template": extracted["template"],
+        "params": extracted["dims"],
+        "missing_required": extracted["missing_required"],
+        "model_path": None,
+        "preview": gsl_preview(extracted["dims"], template, mpn=resolved_mpn),
+        "registered": False,
+        "vendor_part": None,
+    }
+    if extracted["missing_required"] or not resolved_mpn:
+        if not resolved_mpn:
+            base["reason"] = "no manufacturer part number supplied or extracted"
+        return base
+
+    reg = register_from_spec_sheet(
+        extracted["dims"], template, resolved_mpn,
+        description=extracted["description"], build_model=build_model)
+    base.update({
+        "matched": True,
+        "model_path": reg["model_path"],
+        "preview": reg["preview"],
+        "registered": reg["registered"],
+        "vendor_part": reg["vendor_part"],
+    })
+    if reg.get("reason"):
+        base["reason"] = reg["reason"]
+    return base

@@ -246,3 +246,4 @@ All branches at status:review. Trivial `services/mcp/server.py` append conflicts
 - 2026-07-02T19:03Z opus-flux CLAIMED T-H11
 - 2026-07-02T19:07Z opus-flint CLAIMED T-H10
 - 2026-07-02T19:07Z opus-flint QUESTION T-H10 (Q1 spend/scope: real vs mock-proven candidate residual — no llama.cpp/weights on box, network up; recommended answer + provisioning cmds in work/questions/T-H10.md on branch; proceeding on unblocked corpus/harness/recipes/serving)
+- 2026-07-02T19:16Z opus-vane CLAIMED T-B5

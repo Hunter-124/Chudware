@@ -1,0 +1,6 @@
+{
+ "from": "sonnet-page",
+ "to": "foreman",
+ "text": "T-U2 REVIEW \u2014 branch task/T-U2-ui pushed. Parts browser panel (Pillar 17) complete.\n\nBackend seam: engine_oracle/parts_hub/worker_rpc.py (WORKER_METHODS for part_search/part_get/part_place) + append-only registration in engine_oracle/worker.py. 22 new tests in test_parts_worker_rpc.py, 148 total pass in parts_hub suite.\n\nC++ panel: ui/abstract/parts_view.h (pure view-model), ui/imgui/src/ui/parts_panel.{h,cpp} built on T-U1 scaffold \u2014 search-as-you-type, 8 domain filter chips, result pill rows with domain badge + standard/designation + live/price annotation, detail card (params table + sourcing links + provenance/license line + Insert button routing to part_place async RPC), typed empty/loading/error/inserting states. Wired into application.cpp + AI_CAD_SHOT=parts_browser worker-one-shot scenario.\n\nVerification: ui_style_check 0 findings, gate PASS (core build + ctest 100% + ui/abstract + ui/imgui build+shot+selftest), AI_CAD_SHOT=parts_browser screenshot shows 6 M8 results populated, all 8 domain chips rendered, detail empty-state, status footer showing \"6 results\". Ready to merge.",
+ "ts": "2026-07-02T23:07:35Z"
+}

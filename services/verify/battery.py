@@ -20,6 +20,21 @@ import time
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
+# Canonical aicad.req/1 status constants (T-H3, engine_oracle/requirements).
+# Imported here so _gap_req_join doesn't carry its own stub copies.
+# ---------------------------------------------------------------------------
+from engine_oracle.requirements.requirements import VALID_STATUSES as _REQ_VALID_STATUSES
+
+# "waived" is the one aicad.req/1 status that exempts a requirement from scoring.
+# Derived from the canonical set so any schema rename propagates automatically.
+_WAIVED_STATUS: str = next(s for s in _REQ_VALID_STATUSES if s == "waived")
+
+# The "met" set: "verified" is the canonical passing status (from aicad.req/1);
+# "pass" and "ok" are legacy aliases accepted by this battery for interoperability.
+# They are NOT in VALID_STATUSES — do not replace the full tuple with it.
+_REQ_MET_STATUSES: tuple[str, ...] = ("pass", "verified", "ok")
+
+# ---------------------------------------------------------------------------
 # Check registry
 # Tuple: (module_key, fn_name, cost, platform, reward_shape)
 # ---------------------------------------------------------------------------
@@ -267,15 +282,14 @@ def _gap_dim_coverage(doc_id: str = None, source_doc_id: str = None, **_) -> str
 def _gap_req_join(doc_id: str = None, requirements: list = None, **_) -> str:
     """aicad.req/1 join — does each requirement's STATUS agree with its verifier EVIDENCE?
 
-    Statuses follow docs/CUSTOM_MODEL_INTEGRATION_SURVEY.md §3.5 (T-H3, in flight):
-    proposed | user_confirmed | verified | failed | waived (plus generic pass/ok).
+    Status ladder from aicad.req/1 (T-H3, engine_oracle/requirements):
+    proposed | user_confirmed | verified | failed | waived (plus legacy aliases pass/ok).
     A "verified"/"pass" claim with an explicitly EMPTY trace.evidence list is
     INCONSISTENT — the exact failure this join exists to catch. "waived" is exempt
     (excluded from the denominator). score = met / non-waived total.
     """
     if not requirements:
         return json.dumps({"ok": True, "score": 1.0, "note": "no requirements provided"})
-    met_statuses = ("pass", "verified", "ok")
     met = 0
     unmet: list = []
     inconsistent: list = []
@@ -283,10 +297,10 @@ def _gap_req_join(doc_id: str = None, requirements: list = None, **_) -> str:
     for i, r in enumerate(requirements):
         rid = r.get("id", i)
         status = r.get("status")
-        if status == "waived":
+        if status == _WAIVED_STATUS:
             continue
         n_scored += 1
-        if status not in met_statuses:
+        if status not in _REQ_MET_STATUSES:
             unmet.append(rid)
             continue
         trace = r.get("trace")

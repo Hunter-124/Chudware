@@ -41,3 +41,36 @@ the battery must tag per-check platform support, never assume it in rewards.
 - [ ] Battery callable from Python in <50 ms overhead over the underlying checks
       (reward-loop viable)
 - [ ] `graphify update .`; gate green
+
+## Driver notes (Fable, 2026-07-02)
+
+- **The battery is a DISPATCHER — zero reimplementation.** Wrap existing callables:
+  `services/mcp/cad_tools.py` — check_sketch :1189, measure_part :1342,
+  query_geometry :1174, measure_between :1368, check_interference :1423,
+  check_feature_overlap :1455, check_symmetry :1495, wall_thickness :1550,
+  draft_analysis :1583, run_fea_static :1901, run_fea_modal :2005, run_cfd_flow
+  :2068, run_cfd_accurate :2142 (LINUX/MAC ONLY — tag it), solve_mates :2393,
+  review_drawing :2540; `recon_tools.py` compare_parts :1119; `ecad_tools.py` erc
+  :888, sim :933, drc :1108, dfm :1149, impedance :1916/:2050; `cam_tools.py`
+  cam_simulate :227; `eval_check` (BRepCheck + free/tiny-edge census) at
+  `core/doc/session.cpp:6140` — currently only reachable via measure_part; expose
+  it directly.
+- **Call the underlying functions, not MCP-over-wire** — the <50 ms overhead budget
+  means direct Python calls sharing the session context (the pattern gsl_eval.py
+  uses: instantiate the tool registry in-process, `tools/gsl_eval.py:65-81`).
+- **Per-check metadata table** `{name, cost: subsecond|seconds|minutes, platform:
+  any|posix, reward_shape: binary|scalar|findings}` — drives which checks an RL
+  loop may request; deterministic ordering of the findings list.
+- **Groundedness checker:** ONE implementation under `tools/translator/`, shared
+  with the T-F10 eval harness (parse numerals+units from text → slot-match vs a
+  state serialization; unit-normalized compare). If T-F10 is `doing`, coordinate
+  via work/questions/T-H4.md — whoever lands first owns the module, the other
+  consumes.
+- **Round-trip verifier:** export STEP (`export_part`) → re-import (`import_part`)
+  → `compare_parts` match_pct ≥ threshold + eval_check clean. Manifold = eval_check
+  free_edges==0 wrapper with an explicit name.
+- **Unit-sanity:** range table per quantity kind (length mm 1e-3..1e5, stress MPa
+  0.01..5000, density…) — catches the ksi/MPa 6.9× class; table lives in the
+  contract-adjacent constants, cited by T-H3's quantity validation too.
+- **T-F12 relationship:** T-F12 (design_review verify battery for DAG nodes) will
+  NARRATE what this returns. You own scoring; do not add narration here.

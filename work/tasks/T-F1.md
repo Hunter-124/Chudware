@@ -43,3 +43,23 @@ per-user local caches only).
 - [ ] `web_search`/`fetch_page` work with a mock provider + DDG fallback
 - [ ] Cache + offline mode tested; `python -m pytest engine/research/ -q` green
 - [ ] MCP registration + cad_guide topic; `bash scripts/gate.sh` passes; `graphify update .`
+
+## Driver notes (Fable, 2026-07-02)
+
+- **Offline gate to reuse, not reinvent:** `services/agent/config.py:40-109` has
+  `assert_offline_safe`/`provider_offline_safe` (loopback-only enforcement). Your
+  helpers must consult the same config flag; in offline mode serve cache + bundled
+  data only, with `cached: true` and a clear "offline" confidence note.
+- **Cache root:** resolve per-user appdata via the same convention as
+  `core/agent/paths.cpp:31-54` / `engine/paths.py` (Windows `%APPDATA%/AI-CAD`, Linux
+  `~/.local/share/AI-CAD`) → `knowledge/` subdir. Key = URL + content hash; store
+  `fetched_ts`; tiered TTLs as specced. Never sync this cache anywhere (legal rule).
+- **Provider pattern to copy:** `services/agent/providers/` — small classes behind one
+  interface, mock provider for tests (`mock_provider.py`). Mirror that shape for
+  search providers; tests must not hit the network (gate runs offline).
+- **MCP registration precedent:** any `register_*_tools()` module in `services/mcp/`
+  (e.g. `intake_tools.py`) — one function, tools closed over a context object.
+- **Scope fence:** do NOT build material_lookup/datasheet/standards helpers here —
+  that's T-F2. Ship exactly web_search + fetch_page + cache + contract.
+- **DDG fallback:** HTML endpoint, low volume, exponential backoff, `confidence:
+  "limited"` label per the master plan. No API key in code; Tavily key via config/env.

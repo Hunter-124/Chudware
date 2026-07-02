@@ -45,3 +45,26 @@ either stalling or guessing.
 
 - `graphify query "clarify ask gate intake ledger"` — find all three existing mechanisms
   before writing the contract; they become callers later (T-F4), don't break them now.
+
+## Driver notes (Fable, 2026-07-02)
+
+- **The three mechanisms you're unifying (read, don't touch):** C++ `clarify()` at
+  `core/agent/clarify.cpp:112` (prompt at :102, JSON `{question, options,
+  allowed_values}`, extract at :77-89); `ask()` at `core/agent/ask.cpp:180`; MCP
+  intake ledger `services/mcp/intake_tools.py:68-82` (`resolve_process` emits a
+  blocking `clarification`) and `:228-248` (`confirm_dimensions`). The ≤4-questions
+  batch cap comes from clarify — keep it.
+- **Answer persistence precedent:** intake's ledger round-trips as JSON into the
+  `.step+` doc (`engine_oracle/intake/intake.py`, `to_dict/from_dict`). Persist
+  ask_user answers the same way for doc-scoped questions, and to the run record
+  (`<appdata>/AI-CAD/cache/runs/<run_id>/`) for run-scoped ones. Emit an event per
+  Q and per A through the existing `RunEvents`/events.jsonl layer
+  (`core/agent/events.cpp:41-60`, persist-then-callback order is a contract).
+- **In-app dialog:** put the form logic in `ui/abstract/` panel-spec level if
+  feasible, thin ImGui shim — host/ is scheduled for deletion (T-G11); anything you
+  build only in `host/src/ui/` dies. Coordinate via work/questions/T-F3.md if unclear.
+- **MCP elicitation:** use the mcp python-sdk elicitation API (mcp 1.27.2 is pinned in
+  requirements.txt — it supports the stable spec). Do NOT build on MCP sampling
+  (deprecated in draft spec; unimplemented by clients).
+- **Answer schema must be typed:** dimension answers carry `{value, unit}` and route
+  through the same unit normalization intake uses — never bare floats.

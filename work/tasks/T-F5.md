@@ -40,3 +40,25 @@ agents with resource_link to full-res; all deps Apache/BSD, no GPU).
 - [ ] Known-artifact test: printed sheet + synthetic photo measures within tolerance
 - [ ] Dimensions land in the intake ledger, never directly in geometry
 - [ ] Tests green; `bash scripts/gate.sh`; `graphify update .`
+
+## Driver notes (Fable, 2026-07-02)
+
+- **Extend, don't replace:** `submit_part_photos` at
+  `services/mcp/intake_tools.py:174-225` already scores claims and builds
+  MeasuredPartProfile (`engine_oracle/intake/intake.py` — MeasuredFeature has
+  confidence tiers low/medium/high/measured, TIER_UNCERT_MM table). Your photo IDs
+  attach real files to that existing flow; `measure_from_photo` results enter as
+  claims with `provenance.method: "photo_fiducial"` and tier by marker pixel area.
+- **Provider image slots (Python) already exist:** the neutral message format is
+  `[{role, content: [{type: text|image, text/path}]}]` — `anthropic_provider.py:39-59`
+  consumes image content (the build loop sends contact sheets today). So the Python
+  side needs only the downscale + registry; the C++ provider image slot
+  (`core/agent/providers.cpp`) is a SEAM to document, not build (note it for T-F9).
+  For synthetic test photos, render a known part (`render_part`) and composite a
+  generated ArUco marker at known scale — no camera needed in CI.
+- **OpenCV dep:** `cv2.aruco` lives in core OpenCV `objdetect` (Apache-2.0) —
+  `opencv-python-headless` in requirements; no GUI extras, no contrib needed for
+  ArUco (ChArUco boards are also in objdetect since 4.7).
+- **Size caps are a hard contract:** agent-facing images ≤1024 px and <1 MB (Claude
+  Desktop tool-result cap), `resource_link` to full-res — master plan Pillar 10.
+- **Scope fence:** no phone/QR upload page, no photogrammetry — that's T-F6.

@@ -3,7 +3,7 @@ id: T-F7
 title: Freeze narration contract + describe_toolpaths + describe_results
 workstream: F
 owner: sonnet-nell
-status: review
+status: done
 branch: task/T-F7-narration-core
 day: 6
 depends_on: []

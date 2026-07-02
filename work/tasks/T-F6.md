@@ -3,7 +3,7 @@ id: T-F6
 title: Guided multi-photo capture, phone handoff, photogrammetry to reverse_engineer
 workstream: F
 owner: sonnet-pim
-status: review
+status: done
 branch: task/T-F6-photo-capture
 day: 10
 depends_on: [T-F5]

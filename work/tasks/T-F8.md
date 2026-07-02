@@ -3,7 +3,7 @@ id: T-F8
 title: describe_assembly, describe_board (GSL promotion), describe_project
 workstream: F
 owner: sonnet-rune
-status: review
+status: done
 branch: task/T-F8-narration-completion
 day: 8
 depends_on: [T-F7]

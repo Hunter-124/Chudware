@@ -3,7 +3,7 @@ id: T-A1
 title: Freeze dag_schema.md and scaffold services/dag/
 workstream: A
 owner: sonnet-ash
-status: review
+status: done
 branch: task/T-A1-dag-schema
 day: 1
 depends_on: [T-S1]

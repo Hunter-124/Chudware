@@ -3,7 +3,7 @@ id: T-F1
 title: Freeze research_tools contract, scaffold engine/research with web_search + fetch_page
 workstream: F
 owner: opus-ivy
-status: review
+status: done
 branch: task/T-F1-research-scaffold
 day: 6
 depends_on: []

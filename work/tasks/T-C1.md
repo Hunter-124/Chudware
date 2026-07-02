@@ -3,7 +3,7 @@ id: T-C1
 title: firmware_rpc.md contract and engine/firmware/ scaffold
 workstream: C
 owner: opus-vex
-status: review
+status: done
 branch: task/T-C1-firmware-scaffold
 day: 1
 depends_on: []

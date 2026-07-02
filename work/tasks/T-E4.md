@@ -3,7 +3,7 @@ id: T-E4
 title: 3D CFD handoff for pipe internals
 workstream: E
 owner: sonnet-pax
-status: review
+status: done
 branch: task/T-E4-cfd-handoff
 day: 8
 depends_on: [T-E2]

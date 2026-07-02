@@ -3,7 +3,7 @@ id: T-F2
 title: Research source helpers v1 + unified material registry seed
 workstream: F
 owner: opus-fern
-status: review
+status: done
 branch: task/T-F2-source-helpers
 day: 8
 depends_on: [T-F1]

@@ -3,7 +3,7 @@ id: T-E3
 title: Gas/heat networks + fluid properties
 workstream: E
 owner: opus-reed
-status: review
+status: done
 branch: task/T-E3-gas-heat-props
 day: 8
 depends_on: [T-E2]

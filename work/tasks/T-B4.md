@@ -3,7 +3,7 @@ id: T-B4
 title: Spec-sheet matching v1 - deterministic BOLTS/KiCad lookup
 workstream: B
 owner: opus-birch
-status: review
+status: done
 branch: task/T-B4-spec-sheet-deterministic
 day: 4
 depends_on: [T-B3]

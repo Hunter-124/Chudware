@@ -3,7 +3,7 @@ id: T-E5
 title: Oil-hydraulic circuit design (ISO 1219)
 workstream: E
 owner: sonnet-oak
-status: review
+status: done
 branch: task/T-E5-oil-hydraulics
 day: 9
 depends_on: [T-E3]

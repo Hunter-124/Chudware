@@ -3,7 +3,7 @@ id: T-H7
 title: Frontier-API logging middleware + shadow-mode comparison harness
 workstream: H
 owner: sonnet-jet
-status: review
+status: done
 branch: task/T-H7-frontier-logging
 day: 12
 depends_on: [T-H1]

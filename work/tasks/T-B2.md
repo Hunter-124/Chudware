@@ -3,7 +3,7 @@ id: T-B2
 title: BOM rollup with bom_rollup and bom_price MCP tools
 workstream: B
 owner: opus-vale
-status: review
+status: done
 branch: task/T-B2-bom-rollup
 day: 2
 depends_on: [T-B1b]

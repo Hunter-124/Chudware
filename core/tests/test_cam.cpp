@@ -992,6 +992,87 @@ TEST_CASE("sim: rapid through stock is flagged") {
     CHECK(r.rapid_collisions > 0);
 }
 
+// ── T-M6: pocket entry + arc-true stock sim + turning sim (audit D3, D8, G4) ──
+
+// D3: a straight-plunge pocket entry must rapid over the entry XY before plunging,
+// else the tool plunges from wherever the previous loop/level ended (air-cut or dive
+// into a wall). Every Plunge must be immediately preceded by a Rapid at its own XY.
+TEST_CASE("op: pocket non-helix entry rapids over the hole before plunging (T-M6 D3)") {
+    OpContext ctx = mill_ctx(6.0);
+    Operation op;
+    op.id = "pd3"; op.type = OpType::Pocket2D; op.tool_number = 1;
+    op.heights.top = 0; op.heights.bottom = -4; op.stepdown = 2.0; op.stepover = 3.0;
+    // default ramp (non-helix) -> the straight-plunge entry branch
+    op.geometry["regions"] = json::array({to_json(square(0, 0, 20))});
+    GenResult r = gen_pocket2d(op, ctx);
+    REQUIRE(r.ok);
+    const auto& mv = r.path.moves;
+    int plunges = 0;
+    for (size_t i = 0; i < mv.size(); ++i) {
+        if (mv[i].kind != MoveKind::Plunge) continue;
+        ++plunges;
+        REQUIRE(i > 0);
+        CHECK(mv[i - 1].kind == MoveKind::Rapid);                     // positioned first
+        CHECK(mv[i - 1].to.x == doctest::Approx(mv[i].to.x));         // over the entry XY
+        CHECK(mv[i - 1].to.y == doctest::Approx(mv[i].to.y));
+        CHECK(mv[i - 1].to.z >= mv[i].to.z - 1e-9);                   // came down from above
+    }
+    CHECK(plunges > 0);
+}
+
+// D8: an Arc move must be swept along the true arc, not the chord. A chord bows inside
+// a convex arc; cells near the arc's mid-bulge (>tool-radius from the chord) go
+// un-removed under the old approximation, false-negativing the gouge check.
+TEST_CASE("sim: arc removal follows the true arc, not the chord (T-M6 D8)") {
+    Setup su;
+    su.machine.kind = MachineKind::Mill3;
+    su.stock.type = StockType::Box;
+    su.stock.min = {-2, -2, -5}; su.stock.max = {12, 12, 0};
+    Tool t; t.number = 1; t.type = ToolType::EndmillFlat; t.diameter = 2;  // r=1
+    ToolLibrary lib; lib.tools = {t};
+    Operation op; op.id = "a"; op.tool_number = 1; su.operations = {op};
+    // quarter arc (10,0) -> (0,10) about the origin, CCW at depth -2. Chord is x+y=10;
+    // the arc's 45° midpoint (7.07,7.07) sits 2.93mm off the chord — beyond the 1mm tool.
+    Toolpath tp; tp.op_id = "a"; tp.tool_number = 1;
+    Move start; start.kind = MoveKind::Rapid; start.to = {10, 0, -2};
+    Move arc; arc.kind = MoveKind::Arc; arc.to = {0, 10, -2}; arc.center = {0, 0, -2};
+    arc.ccw = true; arc.feed = 200;
+    tp.moves = {start, arc};
+    SimResult r = simulate_setup(su, lib, {tp}, TriMesh{}, SimOptions{});
+    REQUIRE(r.ok);
+    // the arc mid-bulge is cut to depth; a chord sweep would leave it at the stock top (0)
+    double mid = 7.0710678;
+    CHECK(r.remaining.height_at(mid, mid) < -1.0);
+    // a point just outside the arc (larger radius) is untouched -> stays at the top
+    CHECK(r.remaining.height_at(9.0, 9.0) > -0.5);
+    CHECK(r.removed_volume_mm3 > 0);
+}
+
+// G4: turning-sim coverage. A lathe roughing pass on cylindrical stock must register
+// real radial removal (the top-down dexel can't; the axisymmetric branch does).
+TEST_CASE("sim: turning roughing removes stock volume (T-M6 G4)") {
+    Setup su;
+    su.machine.kind = MachineKind::Lathe;
+    su.stock.type = StockType::Cylinder;
+    su.stock.base = {0, 0, 0}; su.stock.radius = 12; su.stock.height = 30;  // Ø24 x 30 bar
+    Tool t; t.number = 1; t.type = ToolType::TurningGeneral;
+    ToolLibrary lib; lib.tools = {t};
+    Operation op; op.id = "tr"; op.type = OpType::TurnRough; op.tool_number = 1;
+    op.stepdown = 1.5; op.stock_to_leave = 0.3;
+    // rough the Ø24 bar down toward radius 6 (Ø12) over its full length
+    op.geometry["profile"] = json::array({json::array({0, 6}), json::array({30, 6})});
+    su.operations = {op};
+    OpContext ctx; ctx.machine = su.machine; ctx.stock = su.stock; ctx.tool = t;
+    ctx.material_id = "steel_mild";
+    GenResult g = generate(op, ctx);
+    REQUIRE(g.ok);
+    SimResult r = simulate_setup(su, lib, {g.path}, TriMesh{}, SimOptions{});
+    REQUIRE(r.ok);
+    CHECK(r.removed_volume_mm3 > 0);
+    CHECK(r.machined_fraction > 0.3);         // ~0.72: π6.3²·30 remains of π12²·30
+    CHECK(r.remaining_volume_mm3 < r.stock_volume_mm3);
+}
+
 // ── session + RPC tests (Phase 6) ────────────────────────────────────────────
 TEST_CASE("session: new / apply_ops / generate / post / undo / save+open") {
     json nw = cam_new(json{{"name", "JobA"}, {"post", "fanuc"}});

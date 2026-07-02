@@ -149,8 +149,14 @@ GenResult gen_pocket2d(const Operation& opIn, const OpContext& ctx) {
             double helix_r = std::max(0.5, std::min(r * 0.9, stepover));
             if (op.ramp.type == RampType::Helix)
                 pb.helix_entry(entry, helix_r, op.heights.top, z, op.ramp_feed, std::max(0.2, helix_r * std::tan(op.ramp.angle * M_PI / 180.0) * 2));
-            else
-                pb.plunge_to(z);  // (after a rapid_xy below)
+            else {
+                // straight-plunge entry: rapid over the entry point at clearance FIRST,
+                // then plunge — else the tool plunges from wherever the previous loop/level
+                // ended, air-cutting or diving into a wall (audit D3). rapid_xy retracts to
+                // the clearance plane internally before the XY traverse.
+                pb.rapid_xy(entry);
+                pb.plunge_to(z);
+            }
             // cut concentric loops inner->outer (climb-friendly) at this Z
             for (auto it = pocket_levels.rbegin(); it != pocket_levels.rend(); ++it) {
                 for (Path2& loop : *it) {

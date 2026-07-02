@@ -2,8 +2,8 @@
 id: T-INF1
 title: Fix gate pytest stage (issue 6) - wire mcp-venv + AI_CAD_LIBAICAD into scripts/gate.sh
 workstream: V
-owner: unassigned
-status: todo
+owner: sonnet-orin
+status: doing
 branch: task/T-INF1-gate-pytest
 day: 3
 priority: 2

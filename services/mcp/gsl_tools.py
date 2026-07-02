@@ -786,9 +786,11 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
 
     lines = [f'FEA results — "{sname}" ({stype})']
 
+    mat_src = {"fea_static": "run_fea_static", "fea_modal": "run_fea_modal",
+               "cfd_flow": "run_cfd_flow"}.get(stype, "the study record")
     if yield_mpa is not None:
         lines.append(f'Material: {mat_name} (yield {yield_mpa:.1f} MPa, '
-                     f'source: run_fea_static material record)')
+                     f'source: {mat_src} material record)')
     elif mat_name != "unknown":
         lines.append(f'Material: {mat_name} (yield not specified)')
 

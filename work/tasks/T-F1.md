@@ -3,7 +3,7 @@ id: T-F1
 title: Freeze research_tools contract, scaffold engine/research with web_search + fetch_page
 workstream: F
 owner: opus-ivy
-status: doing
+status: review
 branch: task/T-F1-research-scaffold
 day: 6
 depends_on: []
@@ -39,10 +39,32 @@ per-user local caches only).
 
 ## Definition of done
 
-- [ ] Contract frozen; answer schema documented with examples
-- [ ] `web_search`/`fetch_page` work with a mock provider + DDG fallback
-- [ ] Cache + offline mode tested; `python -m pytest engine/research/ -q` green
-- [ ] MCP registration + cad_guide topic; `bash scripts/gate.sh` passes; `graphify update .`
+- [x] Contract frozen; answer schema documented with examples
+- [x] `web_search`/`fetch_page` work with a mock provider + DDG fallback
+- [x] Cache + offline mode tested; `python -m pytest engine/research/ -q` green (14/14)
+- [x] MCP registration + cad_guide topic; `graphify update .` run; `bash scripts/gate.sh`
+  green except the two documented PRE-EXISTING failures (unrelated to this diff):
+  (a) `ui/imgui` `PanelField::selMulti` build break, and (b) `pytest engine/doc` collection
+  error — `engine/doc/test_aicm.py` imports `OCP` (OpenCASCADE bindings not provisioned on
+  this box); reproduces identically on a clean tree. The gate's pytest stage runs only
+  `engine/doc` + `agent`, not `engine/research`; this diff touches neither.
+
+## Review notes (opus-ivy, 2026-07-02)
+
+- **Design decisions:** (1) shared helpers in `engine/research/common.py` (envelope +
+  offline gate + ts) to avoid an engine↔agent import cycle — offline gate lazily imports
+  `agent.config.offline_enabled` (mirrors `ecad_tools`), with a `config.json` fallback.
+  (2) Cache root = `AI_CAD_KNOWLEDGE_DIR` env override → else `engine.paths.appdata_root()
+  /knowledge` (reuses the named reference; env override makes tests hermetic). Note:
+  `engine/paths.py` is Windows-flavored (no Linux XDG branch); when a cross-platform
+  paths.py lands, `knowledge/` moves with it — contract §4 documents this.
+  (3) `cad_guide('research')` shipped as `shared/cheatsheets/research.md` — the existing
+  fallback auto-serves + auto-lists it, so **no edit to the frozen `cad_tools.py`**.
+  (4) MCP registration is a new `services/mcp/research_tools.py` (mirrors `intake_tools.py`)
+  + a 2-line append to `server.py` (hot-spot kept minimal).
+- **Scope:** exactly web_search + fetch_page + cache + contract; no material/datasheet/
+  standards helpers (those are T-F2). Contract §8 forward-declares them on the same envelope.
+- **No new deps:** stdlib readability→markdown; `httpx` (already a dep) for network.
 
 ## Driver notes (Fable, 2026-07-02)
 

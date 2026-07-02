@@ -85,3 +85,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 sonnet-riko CLAIMED T-H3
 - 2026-07-02T12:23Z sonnet-nell CLAIMED T-F7
 - 2026-07-02T12:30Z sonnet-tomo CLAIMED T-H4
+- 2026-07-02 sonnet-riko REVIEW T-H3 branch=task/T-H3-requirements-schema

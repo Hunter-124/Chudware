@@ -22,10 +22,13 @@ Ground truth model: each example (fixture) carries
     attribute, e.g. miscounted holes).
 
 Claim matching (`_matches`): a claim matches a fact iff same `kind` and every attribute
-the claim asserts is compatible with the fact's value — numeric attributes (bbox dims,
-diameters, counts, depths) within tolerance (`_numeric_close`: max(1.0mm abs, 5% rel)),
-everything else by exact equality. A claim need not restate every fact attribute (coarse
-claims are fine), but every attribute it DOES assert must be grounded.
+the claim asserts is compatible with the fact's value — CONTINUOUS numeric attributes
+(bbox dims, diameters, depths — `_TOLERANT_NUMERIC_KEYS`) within tolerance
+(`_numeric_close`: max(1.0mm abs, 5% rel)), everything else — including discrete counts —
+by exact equality. A claim need not restate every fact attribute (coarse claims are fine),
+but every attribute it DOES assert must be grounded. Counts are deliberately NOT
+tolerance-matched: an off-by-one hole count is a wrong claim, not a "close enough" one,
+and a miscounted claim must sink precision like any other hallucination.
 
 Score = F1(precision, recall) per example, where
   precision = correct_claims / total_claims   (0 hallucinations -> precision 1.0)
@@ -102,6 +105,15 @@ def load_fixtures(scenes_dir: str) -> list[dict]:
 
 # ---- claim <-> fact matching ---------------------------------------------------
 
+# Attributes that are genuinely continuous measurements (bbox dims, diameters, depths) get
+# the numeric tolerance below. Everything else numeric (`count`, and any future discrete
+# attribute) must match EXACTLY -- a miscounted hole is a wrong claim, not a "close enough"
+# one, and letting tolerance leak onto counts would quietly defeat the "precision is king"
+# rule the whole bench exists to enforce (an off-by-one count is the single most common way
+# a reviewer hallucinates).
+_TOLERANT_NUMERIC_KEYS = frozenset({"x", "y", "z", "diameter", "depth"})
+
+
 def _numeric_close(a: float, b: float) -> bool:
     tol = max(_BBOX_TOL_ABS, _BBOX_TOL_REL * max(abs(a), abs(b)))
     return abs(a - b) <= tol
@@ -109,7 +121,8 @@ def _numeric_close(a: float, b: float) -> bool:
 
 def _matches(claim: dict, fact: dict) -> bool:
     """True iff `claim` is grounded by `fact`: same `kind`, and every attribute the claim
-    asserts is compatible with the fact (numeric within tolerance, else exact equality).
+    asserts is compatible with the fact -- continuous measurements (`_TOLERANT_NUMERIC_KEYS`)
+    within tolerance, everything else (including discrete counts) by exact equality.
     `visible` is fact-side-only metadata (drives the deterministic baseline), never
     compared. A claim omitting an attribute the fact carries is still a match — a coarse
     claim need not restate everything, but nothing it DOES say may be wrong."""
@@ -123,7 +136,7 @@ def _matches(claim: dict, fact: dict) -> bool:
         fv = fact[k]
         is_num = isinstance(v, (int, float)) and not isinstance(v, bool)
         fv_num = isinstance(fv, (int, float)) and not isinstance(fv, bool)
-        if is_num and fv_num:
+        if is_num and fv_num and k in _TOLERANT_NUMERIC_KEYS:
             if not _numeric_close(float(v), float(fv)):
                 return False
         elif v != fv:

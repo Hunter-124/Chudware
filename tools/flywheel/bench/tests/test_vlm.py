@@ -68,6 +68,17 @@ def test_wrong_attribute_claim_counts_as_hallucination_not_a_match():
     assert score.passed is False
 
 
+def test_count_is_exact_not_tolerant():
+    # Continuous attributes (bbox/diameter/depth) get a tolerance window; discrete counts
+    # must not -- an off-by-one hole count is a wrong claim, not "close enough". Before the
+    # fix this passed spuriously because the bbox tolerance formula (max(1mm, 5%)) leaked
+    # onto every numeric key, including count.
+    assert V._matches({"kind": "hole", "count": 5}, {"kind": "hole", "count": 4}) is False
+    assert V._matches({"kind": "hole", "count": 4}, {"kind": "hole", "count": 4}) is True
+    # continuous attributes still get their tolerance window
+    assert V._matches({"kind": "hole", "diameter": 6.2}, {"kind": "hole", "diameter": 6.0}) is True
+
+
 def test_deterministic_baseline_scores_near_perfect_precision():
     for fx in V.load_fixtures(V.SCENES_DIR):
         det_claims = V.deterministic_claims(fx["known_geometry"])

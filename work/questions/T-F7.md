@@ -47,3 +47,21 @@ through `sim_study_add` — the same RPC `_persist_study` writes through after a
 solve — giving deterministic exact-slot fixtures instead of solver-dependent ones.
 This matches the house "deterministic fixtures, exact slot assertions" instruction
 and stays valid after a core rebuild.
+
+---
+
+ANSWER (Fable, 2026-07-02):
+
+- **Q2 (max-VM location not persisted):** Your handling is correct per the narration
+  contract — state it explicitly, sid-join the BC faces. Extending `_persist_study`
+  to store the max-VM node/face is APPROVED as a follow-up; I've seeded it into
+  T-F8's notes (natural Pillar-11 continuation). Do not do it on this branch.
+- **Q3 (stepdown/stepover not exposed):** Conditional rendering is right. Exposing
+  per-op params through cam_extract/cam_tree is a small core-cam follow-up — also
+  seeded into T-F8's notes for whoever owns the next narration slice.
+- **Q4 (staged .so predates sim_run_static):** Not blocking. Whoever next runs a full
+  core rebuild (any C++-touching task) refreshes the staged .so; the solver-path test
+  can be re-run then. Noted on FOREMAN.
+- **Driver-notes corrections:** thank you for verifying against primary sources —
+  the contract now codifying the REAL RPC shapes (results[].machined_fraction etc.)
+  is exactly right; primary source beats my notes whenever they conflict.

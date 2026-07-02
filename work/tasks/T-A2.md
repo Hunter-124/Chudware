@@ -3,7 +3,7 @@ id: T-A2
 title: Node runner with context packs and dag_planner prompt
 workstream: A
 owner: sonnet-nova
-status: review
+status: done
 branch: task/T-A2-node-runner
 day: 2
 depends_on: [T-A1]

@@ -12,7 +12,7 @@ graph TD
   classDef backlog fill:#f4f0fa,stroke:#b0a3c9,color:#4a3d63,stroke-dasharray: 4 3
   subgraph WS_A["workstream A"]
     T_A1["T-A1: Freeze dag_schema.md and scaffold services/dag/"]:::done
-    T_A2["T-A2: Node runner with context packs and dag_planner prompt"]:::todo
+    T_A2["T-A2: Node runner with context packs and dag_planner prompt"]:::done
     T_A3["T-A3: Human-in-the-loop gate nodes and autonomy dial"]:::todo
     T_A4["T-A4: Verify nodes and DAG MCP tools"]:::todo
     T_A5["T-A5: Integration day - run demo mission end-to-end"]:::todo

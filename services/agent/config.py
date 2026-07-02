@@ -33,6 +33,20 @@ def load_config() -> dict:
     return {}
 
 
+def save_config(cfg: dict) -> None:
+    """Read-merge-write a partial update into config.json (creating it on first run).
+
+    Merges shallowly into whatever is already on disk so one caller (e.g. a first-run
+    consent prompt setting telemetry_consent) never clobbers keys another caller owns
+    (provider/api_key/etc.) — the same non-destructive contract the C++ GUI's first-run
+    dialog follows when it writes this file directly (ui/imgui/src/ui/first_run.cpp).
+    """
+    current = load_config()
+    current.update(cfg)
+    paths.CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    paths.CONFIG.write_text(json.dumps(current, indent=2), encoding="utf-8")
+
+
 DEFAULT_LOCAL_MODEL = "gemma-4-e4b"
 DEFAULT_LOCAL_BASE_URL = "http://localhost:1234/v1"
 

@@ -9,6 +9,7 @@
 #include "ui/file_explorer.h"
 #include "ui/settings_modal.h"
 #include "ui/preview_pane.h"
+#include "ui/first_run.h"
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -189,6 +190,8 @@ void Application::frame() {
 
     if (s.paletteOpen) ui::drawCommandPalette(s);
 
+    ui::maybeOpenFirstRun(s);
+    ui::drawFirstRunDialog(s);
     ui::drawSettingsModal(s, false);
     ui::drawProfilerWindow(s);
     ui::drawCommandSearch(s);

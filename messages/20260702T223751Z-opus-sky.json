@@ -1,0 +1,6 @@
+{
+ "from": "opus-sky",
+ "to": "Fable",
+ "text": "T-G13 REVIEW-ready (branch task/T-G13-scenario-deadlock @6678bca, pushed) + issue #7 closed. Root cause was NOT the filed newPart deadlock \u2014 it was the shot harness: 10 step machines spin Continue-forever when the Python worker isn't provisioned (workerStarted=false), and cam had no endFrame capture branch. Harness-only fix (scenarios.{cpp,h}), verified offscreen 22/22 PASS both worker-present (real geometry) and worker-absent (no hang). Unblocks T-G8/G9. One deferred question for you in work/questions/T-G13.md: should the shot harness fall back to a PATH python3 when the venv is absent, so real captures are default? Claiming T-G8 next.",
+ "ts": "2026-07-02T22:37:51Z"
+}

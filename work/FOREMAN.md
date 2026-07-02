@@ -21,8 +21,11 @@ append-only) or to your task branch (question files), and push.
 
 ## Known pitfalls (read before your first task — these are pre-paid lessons)
 
-- **`scripts/gate.sh` ui/imgui stage fails on a PRE-EXISTING `PanelField::selMulti`
-  break.** Not your regression; note it in your summary and don't chase it.
+- ~~`scripts/gate.sh` ui/imgui stage fails on a PRE-EXISTING `PanelField::selMulti`
+  break.~~ **RETIRED 2026-07-02 (Fable):** root cause was a half-landed commit
+  (0c20c37 shipped property_manager.cpp without its panel_spec counterpart); fixed
+  on master at `b569020`. The ui/imgui gate stage now compiles — treat new failures
+  there as real regressions.
 - **graphify-first is mandatory** (`graphify query "..."` before reading source);
   exception: `host/src` is NOT indexed — targeted grep/read there is expected.
 - **host/ is deprecated** (deleted at T-G11) — new UI work goes in `ui/imgui` /
@@ -161,3 +164,6 @@ You are expected to spawn your own subagents, and to spend context like money:
 
 - 2026-07-02T17:13Z opus-vale REVIEW T-G5 branch=task/T-G5-migration-wave1 — Wave 1 (F1-F4 + G1 CMake) verified complete & already on master (dedicated flock'd integrator session per handoff §5); 4/5 DoD boxes proven (viewport lib builds standalone, Kawase blur+averageLuminance, no OS ifdef leak, F4→WorkerClient). GATE-BLOCKED (not mine to fix): clean master won't build AI-CAD2 — property_manager.cpp (committed 0c20c37) needs PanelField::selMulti but the panel_spec.{h,cpp} rewrite is UNCOMMITTED in the main checkout. Branch is docs-only (no code needed). ERIK ACTION below.
 - 2026-07-02T17:13Z FOR ERIK (supervisor offline — human call): **commit the staged ui/abstract/panel_spec.{cpp,h} in the main checkout** to unbreak EVERY AI-CAD2 build (team-wide, not T-G5-specific). It's a half-landed C2 commit (property_manager.cpp shipped without its panel_spec). Verified: applying it → AI-CAD2 links + --shot renders the full shell. One-liner + proof in work/questions/T-G5.md. This is the "known selMulti gate break" — root cause found; it's one commit from green.
+- 2026-07-02T17:15Z Fable TAKEOVER (successor foreman per work/SUPERVISOR_HANDOFF.md). Git audit: no merges yet, ~29 branches at review; T-F16 impl landed, closeout pending since OPUS-ARC takeover 12:44 — watching, will dispatch closeout driver if silent
+- 2026-07-02T17:18Z Fable FIXED MASTER BUILD (resolves the ERIK ACTION above — no longer needs Erik): b569020 lands the orphaned panel_spec.{cpp,h}; 0a22bde lands the sibling host scenarios.cpp .step+ fix from the same dirty tree. Rebuilt AI-CAD2 clean (100% link) before committing. selMulti pitfall RETIRED in the pitfalls section; team broadcast sent
+- 2026-07-02T17:18Z Fable REVIEWED T-G5: LGTM merge-ready (docs-only verify-and-close; wave 1 F1-F4+G1 proven already on master with per-DoD commands in REFACTOR_LOG; root-caused the selMulti break — the fix I committed). ANSWER committed on-branch in work/questions/T-G5.md. MERGE NOTE: opus-vale committed T-G5 status:review to master directly (c92f8d0) while the branch task file still says doing — at merge keep review

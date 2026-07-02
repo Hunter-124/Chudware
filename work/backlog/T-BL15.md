@@ -43,7 +43,7 @@ settle before this is schedulable:
 
 ## Definition of done
 
-- [x] Human (Erik) has reviewed and either refined this into a scoped proposal (with
+- [ ] Human (Erik) has reviewed and either refined this into a scoped proposal (with
       the open questions above answered) or explicitly declined it
 - [ ] If refined: a follow-up task/doc section is written with an actual design, and
       *this* task is closed/superseded, not implemented as-is

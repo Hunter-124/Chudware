@@ -238,6 +238,28 @@ gate.sh ui/imgui selMulti failure is PRE-EXISTING, never chase; commit+push ever
   Q2 ACCEPT Regenerate = refresh preview (evict textures + re-render_document); spec-
   driven file rebuild stays agent-driven (would be a new deliverables tool / contract
   change). Both sound.
+- Closeout completed by **sonnet-cove** (2026-07-02T18:30Z). See demo script below.
 - Next: dispatch an Opus driver to finish ONLY T-F16's DoD closeout (verify the new
   standalone UI compiles despite the pre-existing selMulti break, gate, graphify,
   status→review, FOREMAN check-in, write the demo script here). Then arc = complete.
+
+### 2026-07-02 — T-F16 demo script + arc close (sonnet-cove closeout)
+
+**How to demo the Preview Pane + Artifact Cards:**
+
+1. Build and launch: `cmake --preset linux-app && cmake --build build/linux-app && ./build/linux-app/bin/AI-CAD2`
+2. In the Copilot panel, ask the agent for a deliverable — e.g. "generate a design review for the current part". The agent calls `make_presentation` or `make_report`; the deliverable file lands in the project directory.
+3. Open the **Preview** pane (standalone dock panel). Artifact cards appear — one per agent-produced file — each showing the page-1 thumbnail fetched asynchronously via `render_document` (never blocks the UI frame).
+4. Click through page thumbnails in the pane: the `PreviewModel`/`PreviewPage` view-model pages through the rendered PNGs.
+5. Click **Open externally** on any card: `open_external.*` calls `xdg-open`; the file opens in the OS default app (e.g. Evince for PDF, LibreOffice for DOCX).
+6. Click **Regenerate** on any card: texture cache is evicted and `render_document` is re-called — picks up any file edited on disk. (Rebuilding the underlying deliverable from the spec remains agent-driven via `make_*`.)
+7. Drop a pdf/docx/pptx/xlsx/csv or image into the project directory and browse to it in the file explorer: the preview pane shows a typed placeholder for unsupported formats (never blank — `previewStateFromReason` maps every §6 failure reason to a named state).
+
+**Inline-in-Copilot-bubble card:** deferred to T-G7 per answered Q1. `drawArtifactCard` and `ArtifactCard` are reusable unchanged; T-G7 adds one `BlockKind::Artifact` switch case in `agent_panel.cpp` once T-F3/T-H1 have merged.
+
+**Arc closure — F14 → F15 → F16 all at review:**
+- T-F14 (deliverables scaffold + render_document service) — status: review
+- T-F15 (5 engineering templates + provenance joins) — status: review
+- T-F16 (universal preview pane + artifact cards) — status: review
+- Merge order: F14 first, then F15, then F16. No branch is onto master directly.
+- Pillar 15 implementation complete; Pillar 15 UI surface (inline bubble) continues at T-G7.

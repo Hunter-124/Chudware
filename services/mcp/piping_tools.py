@@ -80,7 +80,8 @@ def register_piping_tools(mcp) -> None:
     @mcp.tool()
     def piping_solve(doc: Union[str, dict], boundary: Union[str, list],
                      fluid: Union[str, dict, None] = None,
-                     pumps: Union[str, list, None] = None) -> str:
+                     pumps: Union[str, list, None] = None,
+                     network_type: str = "liquid") -> str:
         """Solve an ``aicad.piping/1`` pipe network for node pressures/heads and link flows.
 
         ``doc`` is the piping document (a dict, a JSON string, or a path to a ``.json`` file) as
@@ -88,9 +89,19 @@ def register_piping_tools(mcp) -> None:
         list of per-node conditions — each entry names a node (``{"node":"n0"}`` /
         ``{"at":[x,y,z]}`` / ``{"run":"r1","end":"start"|"end"}``) plus ONE of: ``pressure`` (kPa
         gauge) or ``head`` (m) to fix it, or ``demand`` (m³/h, + leaves / − enters) /
-        ``demand_lps``. At least one fixed pressure/head node is required. ``fluid`` overrides the
-        default (water @20 °C) with ``{"rho":kg/m³,"mu":Pa·s}``. ``pumps`` is a list of
+        ``demand_lps``. At least one fixed pressure/head node is required.
+
+        ``fluid`` selects the working fluid: ``null`` (water @20 °C), an explicit
+        ``{"rho":kg/m³,"mu":Pa·s}`` override, or a **sourced lookup**
+        ``{"name":"water"|"air"|"methane"|"natural_gas"|"nitrogen"|"carbon_dioxide","T":K,"P":Pa}``
+        (properties come from CoolProp/thermo if installed, else a cited built-in model — see
+        ``piping_fluid``). ``pumps`` is a list of
         ``{"run":"r1","curve":<CSV text/path>,"speed_ratio":1.0,"direction":"a_to_b"}``.
+
+        ``network_type`` = ``"liquid"`` (incompressible, default) or ``"gas"``
+        (isothermal-compressible mass-balance solve; needs a named gas ``fluid``, boundary
+        pressures are kPa gauge, demands are ``mass_demand`` kg/h or ``std_demand`` Nm³/h, and
+        links report ``mass_flow_kgh`` / ``std_flow_nm3h`` / ``dp_kpa``).
 
         Node ids are derived by snapping coincident run endpoints; the result lists every node
         with its coordinates so you can address boundary conditions. Returns node
@@ -116,7 +127,8 @@ def register_piping_tools(mcp) -> None:
             return _dumps(_err("boundary conditions are required",
                                hint='e.g. [{"node":"n0","pressure":300},{"node":"n1","demand":50}]'))
 
-        res = piping_solve_mod.solve(d, boundary=bc, fluid=fl, pumps=pp)
+        res = piping_solve_mod.solve(d, boundary=bc, fluid=fl, pumps=pp,
+                                     network_type=network_type)
         if not res.get("ok"):
             res.setdefault("next_actions", [
                 "check every run endpoint meets another run or a boundary node",
@@ -165,3 +177,54 @@ def register_piping_tools(mcp) -> None:
                                hint='pass boundary, e.g. [{"node":"n0","pressure":300}, ...]'))
         rep = piping_solve_mod.pressure_drop_report(d, boundary=bc, fluid=fl, pumps=pp)
         return _dumps(rep)
+
+    @mcp.tool()
+    def piping_operating_point(pump_curve: str,
+                               system: Union[str, dict, None] = None,
+                               doc: Union[str, dict, None] = None,
+                               boundary: Union[str, list, None] = None,
+                               fluid: Union[str, dict, None] = None,
+                               suction: Union[str, dict, None] = None,
+                               npshr_curve: Union[str, None] = None,
+                               q_ref_m3h: Union[float, None] = None,
+                               speed_ratio: float = 1.0) -> str:
+        """Pump duty (operating) point + NPSH margin: intersect the pump curve with the system curve.
+
+        ``pump_curve`` — a pump-curve CSV (``flow`` m³/h, ``head`` m) as text or a file path.
+        ``system`` — ``{"static_head_m":h0,"k":k}`` giving H_sys = h0 + k·Q² (Q in m³/h); if
+        omitted, the system curve is **derived** from ``doc`` + ``boundary`` (one fixed
+        pressure/head node + one demand node whose value is the operating flow, or pass
+        ``q_ref_m3h``). ``fluid`` as in ``piping_solve`` (used for density + vapour pressure).
+        ``suction`` — NPSHa inputs ``{"pressure_kpa":gauge,"elevation_m":z,"friction_m":loss,
+        "atm_kpa":101.325,"pvap_kpa":<override>}``. ``npshr_curve`` — a ``flow,npshr`` (m) CSV;
+        NPSHr is interpolated at the duty flow to give the NPSH margin (NPSHa − NPSHr).
+
+        Returns ``{"duty_point":{flow_m3h,head_m}, "npsh":{npsha_m,npshr_m,margin_m}, ...}`` or a
+        contract-shaped failure (e.g. system head exceeds pump shutoff head → no operating point).
+        """
+        try:
+            sysd = _as_obj(system)
+            d = _load_doc(doc)
+            bc = _as_obj(boundary)
+            fl = _as_obj(fluid)
+            suc = _as_obj(suction)
+        except (ValueError, TypeError, OSError) as exc:
+            return _dumps(_err(f"could not parse inputs: {exc}"))
+        op = piping_solve_mod.operating_point(
+            pump_curve, system=sysd, doc=d, boundary=bc, fluid=fl,
+            suction=suc, npshr_curve=npshr_curve, q_ref_m3h=q_ref_m3h,
+            speed_ratio=speed_ratio)
+        return _dumps(op)
+
+    @mcp.tool()
+    def piping_fluid(name: str, T: float = 293.15, P: float = 101325.0) -> str:
+        """Sourced thermophysical properties for a named fluid at ``T`` (K), ``P`` (Pa absolute).
+
+        Supported: ``water, air, methane, natural_gas, nitrogen, carbon_dioxide``. Returns density
+        (kg/m³), dynamic viscosity (Pa·s), saturation/vapour pressure (Pa; liquids), the backend
+        used (CoolProp / thermo / built-in) and a ``source`` citation — the same values the solver
+        pulls for ``fluid={"name":...}``. Never fabricates: an unknown fluid or out-of-range
+        condition returns ``{"ok": false, "reason", "hint"}``.
+        """
+        from engine.piping import properties as piping_props
+        return _dumps(piping_props.fluid_properties(name, T=float(T), P=float(P)))

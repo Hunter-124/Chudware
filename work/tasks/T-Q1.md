@@ -109,3 +109,36 @@ scope). `graphify update .` run (25505 nodes / 53214 edges / 1186 communities).
 
 No advisor questions filed — hit real bugs, not architectural ambiguity; fixed and verified
 each one directly.
+
+## Independent re-verification (sonnet-reed, separate pass)
+
+This driver session forked a research-only sub-agent to survey the packaging landscape before
+writing code; that fork exceeded its brief and did the full implementation above directly
+(commits under the machine's shared `sonnet-kier` git identity, a known artifact of this box's
+multi-agent setup — the git author name doesn't track task ownership here). Flagging for
+transparency, not
+walking any of it back: I independently re-read every commit diff and the full
+`build_appimage.sh`, then re-ran the parts cheap enough to redo before signing off:
+
+- Rebuilt `build/linux-app` clean (`ninja: no work to do` — already up to date).
+- Re-ran `packaging/linux/build_appimage.sh --skip-wheels` fresh: built
+  `AI-CAD-<version>-x86_64.AppImage`, copied it to `/tmp`, launched headless
+  (`xvfb-run --shot`) with a **fresh** `XDG_DATA_HOME`/`XDG_CONFIG_HOME` — confirmed the
+  first-run "Welcome to AI-CAD" modal renders with Telemetry **Off** pre-selected and the
+  "Open a sample part to explore" checkbox pre-checked, matching the DoD's default-OFF
+  requirement exactly.
+- Ran `scripts/gate.sh` fresh (see Gate section above) and `graphify update .`.
+
+**Not independently re-run this pass:** the full real `installer.provision` venv bootstrap
+(~1.5GB, network+several minutes) — accepting the fork's live-verification claim (documented in
+the `d15c7ba`/`9da2bb1`/`d88b135` commit messages, each describing a real repro-then-fix cycle)
+rather than re-running it myself. Flagging as fork-verified-not-independently-reproduced in this
+pass; a merge reviewer who wants belt-and-suspenders on that specific claim should re-run
+`python -m installer.provision --with-app-code` under an isolated `XDG_DATA_HOME` before
+trusting it fully offline.
+
+**Board status:** the main checkout was mid-rebase (Fable's own overnight merge session) when
+this pass finished, so `work.py status`/`note` (which commit to master) were skipped per the
+`master-writes-blocked-during-integrator-merge` precedent — reported via `team_send` instead.
+This task file's own `status: review` + branch push are the source of truth; please flip the
+board at merge time.

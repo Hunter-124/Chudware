@@ -1,7 +1,7 @@
 {
  "agent": "smoketest-agent",
  "host": "hunter-pc",
- "activity": "graphify_query",
+ "activity": "work_ready",
  "task": "",
- "ts": "2026-07-02T11:32:23Z"
+ "ts": "2026-07-02T11:32:24Z"
 }

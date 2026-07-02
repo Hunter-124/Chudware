@@ -146,6 +146,17 @@ bool offline_enabled(const json& cfg) {
     return false;
 }
 
+std::string consent_tier(const json& cfg) {
+    // Hard override: offline/ITAR mode always forces consent off.
+    if (offline_enabled(cfg)) return "off";
+    if (!cfg.is_object() || !cfg.contains("telemetry_consent")) return "off";
+    const json& v = cfg["telemetry_consent"];
+    if (!v.is_string()) return "off";
+    const std::string s = v.get<std::string>();
+    if (s == "meta" || s == "full") return s;
+    return "off";  // unknown / explicit "off" / anything else
+}
+
 bool host_is_loopback(const std::string& base_url) {
     if (base_url.empty()) return false;
     return in_loopback(urlparse_hostname(base_url));

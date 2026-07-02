@@ -210,6 +210,7 @@ class CriticalDimension:
     blocks_features: list[str] = field(default_factory=list)
     why_it_matters: str = ""
     suggested: Optional[float] = None
+    audit: dict[str, Any] = field(default_factory=dict)  # {who, ts, superseded_value, reason}
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -227,6 +228,7 @@ class CriticalDimension:
             "blocks_features": list(self.blocks_features),
             "why_it_matters": self.why_it_matters,
             "suggested": self.suggested,
+            "audit": copy.deepcopy(self.audit),
         }
 
     @classmethod
@@ -246,6 +248,7 @@ class CriticalDimension:
             blocks_features=list(d.get("blocks_features") or []),
             why_it_matters=d.get("why_it_matters", ""),
             suggested=d.get("suggested"),
+            audit=copy.deepcopy(d.get("audit") or {}),
         )
 
 
@@ -588,7 +591,11 @@ def unresolved_critical(ledger: CriticalDimensionLedger) -> list[CriticalDimensi
 
 def apply_confirmation(ledger: CriticalDimensionLedger, key: str, value: Any, *,
                        resolved_by: Optional[str] = None,
-                       status: Optional[str] = None) -> CriticalDimension:
+                       status: Optional[str] = None,
+                       who: Optional[str] = None,
+                       ts: Optional[str] = None,
+                       superseded_value: Optional[Any] = None,
+                       reason: Optional[str] = None) -> CriticalDimension:
     """Resolve a ledger row from a user-supplied value (the demand-closing path).
 
     Sets ``nominal_mm = value`` and marks it resolved. ``status`` defaults to ``"given"`` (a typed
@@ -603,6 +610,17 @@ def apply_confirmation(ledger: CriticalDimensionLedger, key: str, value: Any, *,
     row.suggested = row.nominal_mm if row.suggested is None else row.suggested
     row.status = status or "given"
     row.resolved_by = resolved_by or "user_confirmed"
+    # Audit trail — stamp who/when/why changed a value. Absent fields default on old docs.
+    audit: dict[str, Any] = {}
+    if who is not None:
+        audit["who"] = who
+    if ts is not None:
+        audit["ts"] = ts
+    if superseded_value is not None:
+        audit["superseded_value"] = superseded_value
+    if reason is not None:
+        audit["reason"] = reason
+    row.audit = audit
     return row
 
 

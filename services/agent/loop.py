@@ -16,8 +16,10 @@ Provider-agnostic: any `Provider` (Anthropic by default, OpenAI, mock) plugs in.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -725,6 +727,63 @@ def _emit(on_event: EventFn | None, **data) -> None:
             pass  # a flaky UI sink must never break the design loop
 
 
+def _emit_ai_artifact(
+    on_event: EventFn | None,
+    run_id: str,
+    iteration_index: int,
+    insertion_point: str,
+    model_info: dict,
+    prompt_hash: str,
+    latency_ms: float,
+    consent: str,
+    verifier_scores: dict | None = None,
+    input_ref: str = "",
+    output_ref: str = "",
+    base_revision: int = 0,
+) -> None:
+    """Emit an ``ai_artifact`` telemetry event alongside the existing iteration event.
+
+    The artifact_id is the first 8 hex characters of SHA-256(run_id + str(iteration_index)),
+    giving a short, deterministic, collision-resistant id that ties back to the run.
+
+    Fields:
+      run_id           — opaque session/run identifier (e.g. session.name)
+      iteration_index  — 0-based pass counter within this turn
+      insertion_point  — "IP-1" for the design loop
+      model_info       — {"provider": str, "model": str, "adapter": None}
+      prompt_hash      — first 16 hex chars of SHA-256 of the prompt string
+      latency_ms       — wall-clock ms for this iteration's generate+build cycle
+      consent          — tier from config.consent_tier() ("off" | "meta" | "full")
+      verifier_scores  — dict populated by caller if a verifier ran, else {}
+      input_ref        — sidecar path to serialised prompt if stored, else ""
+      output_ref       — sidecar path to serialised output if stored, else ""
+      base_revision    — model revision number before this output (0 = first pass)
+
+    The event is written to the existing event sink (on_event / events.jsonl).
+    The exporter (T-H5) is responsible for filtering by consent tier; the emitter
+    always writes locally regardless of tier.
+    """
+    artifact_id = hashlib.sha256(
+        (run_id + str(iteration_index)).encode()
+    ).hexdigest()[:8]
+
+    _emit(
+        on_event,
+        kind="ai_artifact",
+        artifact_id=artifact_id,
+        run_id=run_id,
+        insertion_point=insertion_point,
+        model=model_info,
+        prompt_hash=prompt_hash,
+        input_ref=input_ref,
+        output_ref=output_ref,
+        base_revision=base_revision,
+        verifier_scores=verifier_scores if verifier_scores is not None else {},
+        latency_ms=latency_ms,
+        consent=consent,
+    )
+
+
 def _cap(s: str | None, n: int) -> str | None:
     if not s:
         return s
@@ -882,6 +941,7 @@ def run_turn(session: Session, request: str, provider: Provider,
     stop_reason = "max_iters"
 
     for i in range(max_iters):
+        _iter_t0 = time.monotonic()
         _emit(on_event, kind="status", index=i, turn=turn, phase="thinking",
               text=f"Iteration {i + 1}: generating build123d...")
         reply, thinking = _generate(session, provider, on_event, i, turn)
@@ -948,6 +1008,41 @@ def run_turn(session: Session, request: str, provider: Provider,
         log.append(entry)
         prev_built_code = new_code
         _emit(on_event, kind="iteration", turn=turn, **asdict(entry))
+
+        # Emit an ai_artifact telemetry event for every successful build.
+        # The exporter (T-H5) filters by consent tier; we always write locally.
+        if res.ok and new_code is not None:
+            _iter_latency_ms = (time.monotonic() - _iter_t0) * 1000.0
+            try:
+                _cfg = agent_config.load_config()
+                _consent = agent_config.consent_tier(_cfg)
+                _provider_name = getattr(provider, "name", "unknown")
+                _model_name = getattr(provider, "model", "unknown")
+            except Exception:  # noqa: BLE001
+                _consent = "off"
+                _provider_name = "unknown"
+                _model_name = "unknown"
+            # Prompt hash: sha256 of the last user message's text content (first 16 hex chars).
+            try:
+                _last_user = session.messages[-2] if len(session.messages) >= 2 else None
+                _prompt_text = ""
+                if _last_user:
+                    for _part in (_last_user.get("content") or []):
+                        if _part.get("type") == "text":
+                            _prompt_text += _part.get("text", "")
+                _prompt_hash = hashlib.sha256(_prompt_text.encode()).hexdigest()[:16]
+            except Exception:  # noqa: BLE001
+                _prompt_hash = ""
+            _emit_ai_artifact(
+                on_event=on_event,
+                run_id=session.name,
+                iteration_index=i,
+                insertion_point="IP-1",
+                model_info={"provider": _provider_name, "model": _model_name, "adapter": None},
+                prompt_hash=_prompt_hash,
+                latency_ms=_iter_latency_ms,
+                consent=_consent,
+            )
 
         if res.ok and res.stl_path:
             fail_streak = 0

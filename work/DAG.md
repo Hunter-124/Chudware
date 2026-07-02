@@ -36,7 +36,7 @@ graph TD
     T_D1["T-D1: structural_schema.md contract and engine/structural/ scaffold"]:::done
     T_D2["T-D2: PyNite integration - member forces and deflections"]:::done
     T_D3["T-D3: Section libraries, D/C ratio checks, and struct_check MCP tool"]:::done
-    T_D4["T-D4: Code compliance - agentic RAG and deterministic rule engine"]:::todo
+    T_D4["T-D4: Code compliance - agentic RAG and deterministic rule engine"]:::doing
     T_D5["T-D5: Cost takeoff and struct_estimate MCP tool with integration demo"]:::todo
   end
   subgraph WS_E["workstream E"]
@@ -71,7 +71,7 @@ graph TD
     T_G11["T-G11: Windows build verify, then delete host/ and all deprecated GUI code"]:::todo
     T_G12["T-G12: Human UI walkthrough - recursive element-by-element feedback loop until converged"]:::doing
     T_G2["T-G2: Restore doc-tab input, shrink Copilot header, PM button contrast"]:::done
-    T_G3["T-G3: ShopCraft rename tier 1 - user-visible branding strings"]:::doing
+    T_G3["T-G3: ShopCraft rename tier 1 - user-visible branding strings"]:::done
     T_G4["T-G4: GUI dead-code and cleanliness pass on host/"]:::done
     T_G5["T-G5: GUI migration wave 1 - foundation libs (F1-F4 + G1 gate)"]:::done
     T_G6["T-G6: GUI migration wave 2 - shell chrome (S1-S6, H5 start, G2 gate)"]:::todo

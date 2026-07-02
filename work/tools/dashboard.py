@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""dashboard.py — team-progress dashboard for AI-CAD contributors.
+"""dashboard.py — read-only team-progress viewer for AI-CAD contributors.
 
-Tkinter (stdlib only). Four tabs:
+Tkinter (stdlib only). Three tabs, all display-only — nothing here claims,
+edits, or writes anything:
   1. Human Roadblocks — everything blocked on a human right now (top priority).
-  2. DAG — the master task graph, color-coded, locked/greyed where blocked or
-     awaiting human review; click a node for safe actions (claim/note/status/
-     release) plus full depends_on/workstream editing (cycle-validated by
-     work.py relink — never writes task files directly).
+  2. DAG — the master task graph, color-coded, greyed where blocked on unmet
+     deps or awaiting human review. Click a node to see its details (read-only).
   3. Graphify Preview — live query/explain with a staleness banner.
-  4. Verify — a task's Definition-of-done checklist + scripts/gate.sh runner +
-     progress log. Purely deterministic, no AI call from this tab.
 
-This is internal dev-team tooling for BUILDING AI-CAD — separate from the
-product's own MCP server (services/mcp/) and agent loop. All task-file writes
-go through work/tools/work.py's guarded commands (claim/note/status/release/
-relink/checkdod), never direct file edits, so this GUI can't corrupt the DAG
-or race with other contributors.
+To actually change the plan (claim a task, add a note, edit dependencies,
+change status), talk to an AI driver in Claude Code — it has the same data
+this dashboard shows via the aicad-team MCP tools (work_board, claim, note,
+set_status, work_relink, ...), or let autopilot (work/prompts/autopilot.md)
+decide on its own. Keeping this GUI to pure display avoids a large surface of
+interactive-widget bugs for a window whose only job is "let me see the plan."
+
+Auto-refreshes every 30s; manual "Refresh now" also available.
 
 Run:  python3 work/tools/dashboard.py   (or work/run_version_control.sh/.bat)
 """
@@ -30,7 +30,7 @@ from pathlib import Path
 
 try:
     import tkinter as tk
-    from tkinter import messagebox, scrolledtext, simpledialog, ttk
+    from tkinter import messagebox, scrolledtext, ttk
 except ImportError:
     print("tkinter is not available in this Python install.\n"
           "  Debian/Ubuntu/Fedora: install the 'python3-tk' package, then re-run.\n"
@@ -54,14 +54,7 @@ STATUS_COLORS = {
     "backlog": ("#f4f0fa", "#b0a3c9"),
 }
 LOCKED_COLOR = ("#d9d9d9", "#888888")
-
-# Mirrors work.py's ALLOWED_TRANSITIONS (work.py:322) — kept in sync by hand;
-# work.py itself is still the enforcement point, this only drives the dropdown.
-ALLOWED_TRANSITIONS = {
-    "doing": ["review", "blocked"],
-    "blocked": ["doing"],
-    "review": ["doing"],
-}
+AUTO_REFRESH_MS = 30_000
 
 
 # ==================================================================== data helpers
@@ -78,24 +71,23 @@ def load_task_text(task_id):
     for sub in ("tasks", "backlog"):
         p = WORK / sub / f"{task_id}.md"
         if p.exists():
-            return p, p.read_text(encoding="utf-8")
-    return None, ""
+            return p.read_text(encoding="utf-8")
+    return ""
 
 
 def parse_dod(text):
-    """Return [(index, checked, label), ...] for '## Definition of done' checkboxes."""
+    """Return [(checked, label), ...] for '## Definition of done' checkboxes."""
     lines = text.splitlines()
     try:
         start = next(i for i, l in enumerate(lines) if l.strip() == "## Definition of done")
     except StopIteration:
         return []
     end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
-    items, idx = [], 0
+    items = []
     for i in range(start, end):
         m = re.match(r"^\s*- \[([ xX])\]\s*(.*)", lines[i])
         if m:
-            items.append((idx, m.group(1).lower() == "x", m.group(2)))
-            idx += 1
+            items.append((m.group(1).lower() == "x", m.group(2)))
     return items
 
 
@@ -129,8 +121,8 @@ def unanswered_questions():
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("AI-CAD — Team Progress Dashboard")
-        self.geometry("1250x820")
+        self.title("AI-CAD — Team Progress (read-only)")
+        self.geometry("1200x780")
         self.q = queue.Queue()
         self.tasks = []
         self.tasks_by_id = {}
@@ -138,17 +130,16 @@ class App(tk.Tk):
         self._build_ui()
         self.after(150, self._poll_queue)
         self.refresh_all()
+        self.after(AUTO_REFRESH_MS, self._auto_refresh)
 
     # ---------------------------------------------------------------- shell
 
     def _build_ui(self):
         bar = ttk.Frame(self)
         bar.pack(fill="x", padx=8, pady=4)
-        ttk.Label(bar, text="Identity:").pack(side="left")
-        self.identity_var = tk.StringVar(value=_teamlib.get_identity() or "(not set)")
-        ttk.Label(bar, textvariable=self.identity_var, foreground="#0a6").pack(side="left", padx=(2, 10))
-        ttk.Button(bar, text="Set identity…", command=self._on_set_identity).pack(side="left")
-        ttk.Button(bar, text="Refresh all", command=self.refresh_all).pack(side="right")
+        ttk.Label(bar, text="Display-only — to change the plan, ask an AI driver in Claude "
+                            "Code or let autopilot decide.", foreground="#666").pack(side="left")
+        ttk.Button(bar, text="Refresh now", command=self.refresh_all).pack(side="right")
         self.status_var = tk.StringVar(value="Loading…")
         ttk.Label(bar, textvariable=self.status_var, foreground="#555").pack(side="right", padx=10)
 
@@ -158,58 +149,29 @@ class App(tk.Tk):
         self.roadblocks_frame = ttk.Frame(self.nb)
         self.dag_frame = ttk.Frame(self.nb)
         self.graphify_frame = ttk.Frame(self.nb)
-        self.verify_frame = ttk.Frame(self.nb)
         self.nb.add(self.roadblocks_frame, text="Human Roadblocks")
         self.nb.add(self.dag_frame, text="DAG")
         self.nb.add(self.graphify_frame, text="Graphify Preview")
-        self.nb.add(self.verify_frame, text="Verify")
 
         self._build_roadblocks_tab()
         self._build_dag_tab()
         self._build_graphify_tab()
-        self._build_verify_tab()
-
-    def _on_set_identity(self):
-        cur = _teamlib.get_identity() or ""
-        name = simpledialog.askstring("Set identity", "Your name (used to attribute claims/notes):",
-                                      initialvalue=cur, parent=self)
-        if name and name.strip():
-            _teamlib.set_identity(name.strip())
-            self.identity_var.set(name.strip())
-
-    def _require_identity(self):
-        ident = _teamlib.get_identity()
-        if not ident:
-            messagebox.showwarning("No identity", "Set your identity first (top-left) so actions "
-                                                   "can be attributed to you.")
-            return None
-        return ident
 
     # ---------------------------------------------------------------- refresh / threading
 
     def refresh_all(self):
-        self.identity_var.set(_teamlib.get_identity() or "(not set)")
         self.status_var.set("Loading…")
         threading.Thread(target=self._load_board_worker, daemon=True).start()
+
+    def _auto_refresh(self):
+        self.refresh_all()
+        self.after(AUTO_REFRESH_MS, self._auto_refresh)
 
     def _load_board_worker(self):
         try:
             self.q.put(("board_loaded", (load_board(), None)))
         except Exception as e:
             self.q.put(("board_loaded", ([], str(e))))
-
-    def _run_threaded(self, args, on_done):
-        self.status_var.set("Working…")
-        threading.Thread(target=self._threaded_worker, args=(args, on_done), daemon=True).start()
-
-    def _threaded_worker(self, args, on_done):
-        try:
-            r = subprocess.run(args, cwd=str(REPO), capture_output=True, text=True, timeout=60)
-            out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr.strip() else "")
-            ok = r.returncode == 0
-        except Exception as e:
-            out, ok = str(e), False
-        self.q.put(("action_done", (on_done, out.strip(), ok)))
 
     def _poll_queue(self):
         try:
@@ -224,18 +186,10 @@ class App(tk.Tk):
                         self.tasks_by_id = {t["id"]: t for t in tasks}
                         self.render_dag()
                         self.render_roadblocks()
-                        self._populate_verify_selector()
                         self.refresh_graphify_freshness()
                         self.status_var.set(f"loaded {len(tasks)} tasks")
-                elif kind == "action_done":
-                    on_done, out, ok = payload
-                    on_done(out, ok)
                 elif kind == "graphify_result":
                     self._show_graphify_result(payload)
-                elif kind == "gate_output":
-                    self._append_gate_output(payload)
-                elif kind == "gate_done":
-                    self._append_gate_output(f"\n--- gate.sh exited {payload} ---\n")
         except queue.Empty:
             pass
         self.after(150, self._poll_queue)
@@ -286,7 +240,7 @@ class App(tk.Tk):
     def _build_dag_tab(self):
         f = self.dag_frame
         ttk.Label(f, text="Legend: grey = locked (unmet deps, or awaiting human review). "
-                          "Click a node for actions.").pack(anchor="w", padx=4, pady=2)
+                          "Click a node for details.").pack(anchor="w", padx=4, pady=2)
 
         body = ttk.Frame(f)
         body.pack(fill="both", expand=True)
@@ -302,17 +256,19 @@ class App(tk.Tk):
         canvas_frame.rowconfigure(0, weight=1)
         canvas_frame.columnconfigure(0, weight=1)
 
-        self.dag_side = ttk.Frame(body, width=340)
-        self.dag_side.pack(side="right", fill="y")
-        self.dag_side.pack_propagate(False)
-        self.node_boxes = {}
-        self._dag_side_empty()
+        side = ttk.Frame(body, width=320)
+        side.pack(side="right", fill="y")
+        side.pack_propagate(False)
+        ttk.Label(side, text="Task details", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", padx=8, pady=(8, 2))
+        self.dag_detail = scrolledtext.ScrolledText(side, wrap="word", state="disabled", height=30)
+        self.dag_detail.pack(fill="both", expand=True, padx=8, pady=4)
+        self._set_dag_detail("Click a task node to see its details.")
 
-    def _dag_side_empty(self):
-        for w in self.dag_side.winfo_children():
-            w.destroy()
-        ttk.Label(self.dag_side, text="Click a task node to see actions.",
-                  wraplength=320).pack(padx=8, pady=8)
+    def _set_dag_detail(self, text):
+        self.dag_detail.config(state="normal")
+        self.dag_detail.delete("1.0", "end")
+        self.dag_detail.insert("1.0", text)
+        self.dag_detail.config(state="disabled")
 
     def _node_color(self, t):
         status = t.get("status", "todo")
@@ -355,14 +311,12 @@ class App(tk.Tk):
         for cx, ws in col_headers:
             c.create_text(cx, 14, text=f"workstream {ws}", font=("TkDefaultFont", 10, "bold"))
 
-        self.node_boxes = {}
         for tid, (x0, y0, x1, y1, t) in positions.items():
             fill, outline = self._node_color(t)
             rect = c.create_rectangle(x0, y0, x1, y1, fill=fill, outline=outline, width=2)
             label = f"{t['id']}  {t.get('status', '?')}\n[{t.get('owner', '?')}]\n{t['title'][:32]}"
             txt = c.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=label,
                                 width=NODE_W - 10, font=("TkDefaultFont", 8))
-            self.node_boxes[tid] = (x0, y0, x1, y1)
             c.tag_bind(rect, "<Button-1>", lambda e, tid=tid: self.on_select_node(tid))
             c.tag_bind(txt, "<Button-1>", lambda e, tid=tid: self.on_select_node(tid))
 
@@ -371,131 +325,31 @@ class App(tk.Tk):
         c.configure(scrollregion=(0, 0, max(width, 400), max(height, 300)))
 
         if self.selected_task and self.selected_task in self.tasks_by_id:
-            self._render_dag_side_panel(self.selected_task)
-        else:
-            self._dag_side_empty()
+            self.on_select_node(self.selected_task)
 
     def on_select_node(self, task_id):
         self.selected_task = task_id
-        self._render_dag_side_panel(task_id)
-
-    def _render_dag_side_panel(self, task_id):
-        for w in self.dag_side.winfo_children():
-            w.destroy()
         t = self.tasks_by_id.get(task_id)
         if not t:
             return
-        pad = {"padx": 6, "pady": 3}
-        side = self.dag_side
-        ttk.Label(side, text=t["id"], font=("TkDefaultFont", 12, "bold")).pack(anchor="w", **pad)
-        ttk.Label(side, text=t["title"], wraplength=320).pack(anchor="w", **pad)
-        ttk.Label(side, text=f"status: {t.get('status')}   owner: {t.get('owner')}").pack(anchor="w", **pad)
-        ttk.Label(side, text=f"workstream: {t.get('workstream')}   day: {t.get('day', '-')}").pack(anchor="w", **pad)
-
         deps = t.get("depends_on", [])
         deps_done = all(self.tasks_by_id.get(d, {}).get("status") == "done" for d in deps)
         locked = (t.get("status") == "todo" and not deps_done) or t.get("status") == "review"
+        lines = [
+            t["id"], t["title"], "",
+            f"status:      {t.get('status')}",
+            f"owner:       {t.get('owner')}",
+            f"workstream:  {t.get('workstream')}",
+            f"day:         {t.get('day', '-')}",
+            f"branch:      {t.get('branch', '-')}",
+            f"depends_on:  {', '.join(deps) or '(none)'}",
+        ]
         if locked:
             reason = "awaiting human merge" if t.get("status") == "review" else \
                      "blocked on: " + ", ".join(d for d in deps
                                                 if self.tasks_by_id.get(d, {}).get("status") != "done")
-            ttk.Label(side, text=f"locked — {reason}", foreground="#a55", wraplength=320).pack(anchor="w", **pad)
-
-        ttk.Separator(side).pack(fill="x", pady=6)
-        ttk.Label(side, text="Safe actions", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", **pad)
-
-        actions = ttk.Frame(side)
-        actions.pack(fill="x", **pad)
-        can_claim = (t.get("status") == "todo" and deps_done
-                    and t.get("owner", "unassigned") in ("unassigned", "", "none"))
-        claim_btn = ttk.Button(actions, text="Claim", command=lambda: self._act_claim(task_id))
-        claim_btn.pack(side="left", padx=2)
-        if not can_claim:
-            claim_btn.state(["disabled"])
-
-        is_mine = t.get("owner") == (_teamlib.get_identity() or "")
-        release_btn = ttk.Button(actions, text="Release", command=lambda: self._act_release(task_id))
-        release_btn.pack(side="left", padx=2)
-        if not is_mine:
-            release_btn.state(["disabled"])
-
-        ttk.Label(side, text="Note:").pack(anchor="w", **pad)
-        note_entry = tk.Text(side, height=3, width=36)
-        note_entry.pack(padx=6)
-        ttk.Button(side, text="Add note",
-                  command=lambda: self._act_note(task_id, note_entry.get("1.0", "end").strip())
-                  ).pack(anchor="w", **pad)
-
-        allowed = ALLOWED_TRANSITIONS.get(t.get("status"), [])
-        if allowed:
-            ttk.Label(side, text="Set status:").pack(anchor="w", **pad)
-            status_var = tk.StringVar(value=allowed[0])
-            ttk.OptionMenu(side, status_var, allowed[0], *allowed).pack(anchor="w", padx=6)
-            ttk.Button(side, text="Apply status",
-                      command=lambda: self._act_status(task_id, status_var.get())).pack(anchor="w", **pad)
-
-        ttk.Separator(side).pack(fill="x", pady=6)
-        ttk.Label(side, text="Edit topology (relink)", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", **pad)
-        ttk.Label(side, text="depends_on (ctrl/shift-click to multi-select):").pack(anchor="w", **pad)
-        lb = tk.Listbox(side, selectmode="extended", height=8, exportselection=False)
-        all_ids = sorted(self.tasks_by_id)
-        for i, tid2 in enumerate(all_ids):
-            lb.insert("end", tid2)
-            if tid2 in deps:
-                lb.selection_set(i)
-        lb.pack(padx=6, fill="x")
-        ttk.Label(side, text="workstream:").pack(anchor="w", **pad)
-        ws_var = tk.StringVar(value=t.get("workstream", ""))
-        ws_options = sorted({tt.get("workstream", "") for tt in self.tasks})
-        ttk.Combobox(side, textvariable=ws_var, values=ws_options, width=20).pack(anchor="w", padx=6)
-        ttk.Button(side, text="Save relink",
-                  command=lambda: self._act_relink(task_id, [all_ids[i] for i in lb.curselection()],
-                                                   ws_var.get())).pack(anchor="w", **pad)
-
-    def _act_claim(self, task_id):
-        ident = self._require_identity()
-        if not ident:
-            return
-        self._run_threaded([PY, str(TOOLS_DIR / "work.py"), "claim", "--owner", ident, "--task", task_id],
-                           self._after_mutation)
-
-    def _act_release(self, task_id):
-        ident = self._require_identity()
-        if not ident:
-            return
-        self._run_threaded([PY, str(TOOLS_DIR / "work.py"), "release", task_id, "--owner", ident],
-                           self._after_mutation)
-
-    def _act_note(self, task_id, text):
-        ident = self._require_identity()
-        if not ident or not text:
-            return
-        self._run_threaded([PY, str(TOOLS_DIR / "work.py"), "note", task_id, "--owner", ident, "--text", text],
-                           self._after_mutation)
-
-    def _act_status(self, task_id, status):
-        ident = self._require_identity()
-        if not ident:
-            return
-        self._run_threaded([PY, str(TOOLS_DIR / "work.py"), "status", task_id, "--owner", ident,
-                            "--status", status], self._after_mutation)
-
-    def _act_relink(self, task_id, deps, workstream):
-        ident = self._require_identity()
-        if not ident:
-            return
-        args = [PY, str(TOOLS_DIR / "work.py"), "relink", task_id, "--owner", ident,
-               "--depends-on", ",".join(deps)]
-        if workstream:
-            args += ["--workstream", workstream]
-        self._run_threaded(args, self._after_mutation)
-
-    def _after_mutation(self, out, ok):
-        if not ok:
-            messagebox.showerror("Action failed", out or "(no output)")
-        else:
-            messagebox.showinfo("Done", out or "(no output)")
-        self.refresh_all()
+            lines += ["", f"LOCKED — {reason}"]
+        self._set_dag_detail("\n".join(lines))
 
     # ---------------------------------------------------------------- tab 3: Graphify Preview
 
@@ -550,113 +404,6 @@ class App(tk.Tk):
         self.graphify_out.delete("1.0", "end")
         self.graphify_out.insert("1.0", text)
         self.graphify_out.config(state="disabled")
-
-    # ---------------------------------------------------------------- tab 4: Verify
-
-    def _build_verify_tab(self):
-        f = self.verify_frame
-        row = ttk.Frame(f)
-        row.pack(fill="x", padx=8, pady=6)
-        ttk.Label(row, text="Task:").pack(side="left")
-        self.verify_task_var = tk.StringVar()
-        self.verify_combo = ttk.Combobox(row, textvariable=self.verify_task_var, state="readonly", width=50)
-        self.verify_combo.pack(side="left", padx=4)
-        self.verify_combo.bind("<<ComboboxSelected>>", lambda e: self._load_verify_task())
-        ttk.Button(row, text="Run scripts/gate.sh", command=self._on_run_gate).pack(side="right", padx=4)
-
-        body = ttk.PanedWindow(f, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=8, pady=4)
-
-        left = ttk.Frame(body)
-        ttk.Label(left, text="Definition of done", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
-        self.dod_frame = ttk.Frame(left)
-        self.dod_frame.pack(fill="x", pady=4)
-        ttk.Label(left, text="Progress log", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(10, 0))
-        self.progress_text = scrolledtext.ScrolledText(left, wrap="word", height=10, state="disabled")
-        self.progress_text.pack(fill="both", expand=True, pady=4)
-        body.add(left, weight=1)
-
-        right = ttk.Frame(body)
-        ttk.Label(right, text="gate.sh output", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
-        self.gate_out = scrolledtext.ScrolledText(right, wrap="word", state="disabled")
-        self.gate_out.pack(fill="both", expand=True, pady=4)
-        body.add(right, weight=1)
-
-    def _populate_verify_selector(self):
-        ids = sorted(self.tasks_by_id)
-        self.verify_combo["values"] = ids
-        if ids and (not self.verify_task_var.get() or self.verify_task_var.get() not in self.tasks_by_id):
-            self.verify_task_var.set(ids[0])
-        if self.verify_task_var.get():
-            self._load_verify_task()
-
-    def _load_verify_task(self):
-        tid = self.verify_task_var.get()
-        if not tid:
-            return
-        _, text = load_task_text(tid)
-        for w in self.dod_frame.winfo_children():
-            w.destroy()
-        items = parse_dod(text)
-        if not items:
-            ttk.Label(self.dod_frame, text="(no Definition of done checklist found)").pack(anchor="w")
-        for idx, checked, label in items:
-            var = tk.BooleanVar(value=checked)
-            ttk.Checkbutton(self.dod_frame, text=label, variable=var,
-                            command=lambda i=idx, v=var, t=tid: self._on_toggle_dod(t, i, v.get())
-                            ).pack(anchor="w")
-
-        log = parse_progress_log(text)
-        self.progress_text.config(state="normal")
-        self.progress_text.delete("1.0", "end")
-        self.progress_text.insert("1.0", "\n".join(log) if log else "(no progress log entries)")
-        self.progress_text.config(state="disabled")
-
-    def _on_toggle_dod(self, task_id, index, checked):
-        ident = self._require_identity()
-        if not ident:
-            self._load_verify_task()  # revert the checkbox visual since we're not proceeding
-            return
-        args = [PY, str(TOOLS_DIR / "work.py"), "checkdod", task_id, "--owner", ident,
-               "--index", str(index), "--checked", "true" if checked else "false"]
-
-        def done(out, ok):
-            if not ok:
-                messagebox.showerror("checkdod failed", out or "(no output)")
-            self._load_verify_task()
-            self.refresh_all()
-
-        self._run_threaded(args, done)
-
-    def _on_run_gate(self):
-        if not messagebox.askyesno(
-                "Run scripts/gate.sh?",
-                "This runs the full build/test gate (core build, ctest, pytest, ui/imgui "
-                "smoke) — can take several minutes and real CPU. Continue?"):
-            return
-        self.gate_out.config(state="normal")
-        self.gate_out.delete("1.0", "end")
-        self.gate_out.insert("1.0", "running scripts/gate.sh …\n")
-        self.gate_out.config(state="disabled")
-        threading.Thread(target=self._gate_worker, daemon=True).start()
-
-    def _gate_worker(self):
-        try:
-            p = subprocess.Popen(["bash", "scripts/gate.sh"], cwd=str(REPO), stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
-            for line in p.stdout:
-                self.q.put(("gate_output", line))
-            p.wait()
-            self.q.put(("gate_done", p.returncode))
-        except Exception as e:
-            self.q.put(("gate_output", f"error: {e}\n"))
-            self.q.put(("gate_done", 1))
-
-    def _append_gate_output(self, line):
-        self.gate_out.config(state="normal")
-        self.gate_out.insert("end", line)
-        self.gate_out.see("end")
-        self.gate_out.config(state="disabled")
 
 
 def main():

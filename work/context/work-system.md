@@ -17,7 +17,7 @@ Contracts: None — this is developer-team infrastructure for coordinating 4 peo
 - work/tools/work.py `cmd_board` also takes `--workstream/--owner/--status` filters and `--json` for structured output
 - work/tools/_teamlib.py — shared helpers: per-machine `whoami` identity (work/sync/.identity) and graphify staleness check (manifest.json mtime diff)
 - work/tools/team_mcp.py — unified `claim`/`release`/`set_status`/`note` tools take a `kind: "task"|"issue"` param (collapses the old task-claim/issue-claim duplication); legacy `work_claim`/`work_note`/`work_status`/`work_release`/`issue_claim`/`issue_comment` still work as thin aliases. Presence now auto-heartbeats on every tool call (no daemon required).
-- work/tools/dashboard.py — team-progress GUI (Human Roadblocks / DAG / Graphify Preview / Verify tabs), launched via work/run_version_control.sh|.bat
+- work/tools/dashboard.py — read-only team-progress GUI (Human Roadblocks / DAG / Graphify Preview; display-only, no claim/edit actions — use the MCP tools or autopilot for that), launched via work/run_version_control.sh|.bat
 - work/tools/teamsync.py:1-50 — sync daemon (presence heartbeats, inter-worker messages, GitHub issue cache on work-sync branch)
 - work/tools/team_mcp.py:1-50 — MCP stdio server exposing work/, presence, messaging, context packs, GitHub issues
 - work/tools/setup_team_tools.py — registers team_mcp.py with Claude Code + Claude Desktop

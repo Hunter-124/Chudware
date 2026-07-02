@@ -117,9 +117,9 @@ work/workd.sh <your-name>                # (or work\workd.bat) — presence/sync
 work/report.sh                           # (or work\report.bat) — AI-guided issue reporter
                                           # GUI: draft a bug/idea -> linked GitHub issue +
                                           # work/backlog task in one step
-work/run_version_control.sh              # (or work\run_version_control.bat) — team-progress
-                                          # dashboard: Human Roadblocks / DAG / Graphify
-                                          # Preview / Verify tabs
+work/run_version_control.sh              # (or work\run_version_control.bat) — read-only
+                                          # team-progress dashboard: Human Roadblocks / DAG /
+                                          # Graphify Preview (display only — see below)
 ```
 
 Once registered, `/work-board`, `/work-pick`, `/work-sync`, `/work-issues`, `/work-msg`,
@@ -178,9 +178,10 @@ work and route to the same place, so nothing already scripted against them break
 rules either way (MCP tools or the `/work-*` slash commands are two doors to the same
 system): claim before starting, note progress, never flip anything to `done` yourself,
 and check `issue_list`/`work_board` before touching something someone else might already
-be on. `/work-dashboard` gives the same picture visually (task DAG, human-roadblock
-queue, graphify preview, DoD/gate.sh verification) for anyone who'd rather look than call
-tools directly. Full protocol: [work/README.md](work/README.md)
+be on. `/work-dashboard` gives the same picture visually and read-only (task DAG,
+human-roadblock queue, graphify preview) for anyone who'd rather look than call tools
+directly — it never claims/edits/writes anything itself; do that here in chat (or let
+autopilot decide) instead. Full protocol: [work/README.md](work/README.md)
 and [work/prompts/autopilot.md](work/prompts/autopilot.md).
 
 ## Where this is going

@@ -2,8 +2,8 @@
 id: T-G3
 title: ShopCraft rename tier 1 - user-visible branding strings
 workstream: G
-owner: unassigned
-status: todo
+owner: sonnet-brio
+status: doing
 branch: task/T-G3-shopcraft-branding
 day: 2
 depends_on: [T-G2]

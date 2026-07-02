@@ -1,3 +1,4 @@
 services/mcp/server.py merge=union
 contracts/licenses.md merge=union
 requirements.txt merge=union
+work/FOREMAN.md merge=union

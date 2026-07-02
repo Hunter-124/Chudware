@@ -797,6 +797,19 @@ CompileResult compile_document(const json& doc, const json& env_json) {
     std::map<std::string, TopoDS_Shape> tool_body_of;
     std::map<std::string, std::string> feature_op_of;  // "add" | "cut"
 
+    // B1 — feature-overlap detection: record each feature's actual pre-boolean tool
+    // solid + its add/cut role into result.tool_recs (see ToolRec in document.h).
+    // Deliberately independent of tool_body_of/feature_op_of above: those are tuned
+    // for pattern/mirror REPLAY (an additive pattern's tool_body_of is its whole
+    // grown body, so an outer pattern can re-fuse it), whereas doc_eval_feature_
+    // overlap needs the real incremental geometry a feature added or removed so a
+    // pairwise BRepAlgoAPI_Common between two records measures genuine overlap.
+    // A null shape is never recorded (defensive; every callsite already guards
+    // IsNull before this point).
+    auto record_tool = [&](const std::string& fid, const char* role, const TopoDS_Shape& shp) {
+        if (!shp.IsNull()) result.tool_recs.push_back(ToolRec{fid, role, shp});
+    };
+
     // Feature DISPLAY names seen so far (Bug K9): a duplicate name in one doc is
     // confusing (the tree shows two "Boss-Extrude1"). We don't hard-error (it would
     // break existing flows) — instead the SECOND+ occurrence carries a status.warning.
@@ -2173,6 +2186,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // failed with "feature has no patternable geometry").
                 tool_body_of[id] = solid;
                 feature_op_of[id] = "add";
+                record_tool(id, "add", solid);
                 solid_order.push_back(id);
                 st.ok = true;
 
@@ -2320,6 +2334,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     if (pmode == "cut")
                         throw std::runtime_error(type + ": cut mode requires an existing body");
                     results[id] = SolidResult{solid};
+                    record_tool(id, "add", solid);
                 } else {
                     const TopoDS_Shape& target = require_solid(results, ptgt, "target");
                     TopoDS_Shape out = (pmode == "cut") ? ::geom::cut(target, solid)
@@ -2347,6 +2362,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                                 "place it on the surface, e.g. at:{\"of\":\"face\",\"side\":"
                                 "\"top\"}, or set centered:false)");
                     }
+                    record_tool(id, pmode == "cut" ? "cut" : "add", solid);
                     consumed.insert(ptgt);
                     source_of[id] = ptgt;  // owner-map: result derives from the target body
                     results[id] = SolidResult{out};
@@ -2906,6 +2922,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     // so a later pattern/mirror re-subtracts it per instance (N holes).
                     tool_body_of[id] = solid;
                     feature_op_of[id] = "cut";
+                    record_tool(id, "cut", solid);
                 } else {
                     // Boss: with a running body AND merge (default true), FUSE into it
                     // (SolidWorks "Merge result"); the merged solid replaces the body
@@ -2961,6 +2978,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     // running body (matches the oracle's tool_body for a merged boss).
                     tool_body_of[id] = solid;
                     feature_op_of[id] = "add";
+                    record_tool(id, "add", solid);
                 }
                 solid_order.push_back(id);
                 st.ok = true;
@@ -3120,6 +3138,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // Patternable tool: the revolved solid (instance-0 pose); op follows mode.
                 tool_body_of[id] = tool;
                 feature_op_of[id] = (rmode == "cut") ? "cut" : "add";
+                record_tool(id, (rmode == "cut") ? "cut" : "add", tool);
                 solid_order.push_back(id);
                 st.ok = true;
 
@@ -3310,6 +3329,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // loft/sweep boss can be a pattern seed (Bug J3).
                 tool_body_of[id] = solid;
                 feature_op_of[id] = (smode == "cut") ? "cut" : "add";
+                record_tool(id, (smode == "cut") ? "cut" : "add", solid);
                 solid_order.push_back(id);
                 st.ok = true;
 
@@ -3371,6 +3391,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 BRepGProp::VolumeProperties(out, ga);
                 if (ga.Mass() - gb.Mass() <= 1e-6)
                     throw std::runtime_error("rib added no material (contour must bridge the body)");
+                record_tool(id, "add", trimmed);
 
                 consumed.insert(body_id);
                 source_of[id] = body_id;  // owner-map: derives from the input body
@@ -3422,6 +3443,8 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                             std::string("boolean: ") + (op == "cut" ? "subtract" : "intersect") +
                             " produced an empty body");
                 }
+                if (op == "fuse") record_tool(id, "add", b);
+                else if (op == "cut") record_tool(id, "cut", b);
 
                 // a and b were merged/subtracted — they no longer survive standalone.
                 consumed.insert(a_id);
@@ -3806,6 +3829,19 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     tool_body_of[id] = res;
                     feature_op_of[id] = "add";
                 }
+                {
+                    // Additive pattern: tool_body_of/res above intentionally holds the
+                    // whole GROWN body (so an outer pattern can re-fuse it wholesale);
+                    // for overlap detection we want only the material THIS feature
+                    // added, so build the seed+copies union the same way the cut branch
+                    // already does for pattern_tool.
+                    TopoDS_Shape overlap_tool = pattern_tool;
+                    if (seed_op != "cut") {
+                        TopoDS_Shape pu = ::geom::fuse_many(seed_tool, copies);
+                        if (!pu.IsNull()) overlap_tool = pu;
+                    }
+                    record_tool(id, seed_op == "cut" ? "cut" : "add", overlap_tool);
+                }
 
                 results[id] = SolidResult{res};
                 solid_order.push_back(id);
@@ -3893,6 +3929,14 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     tool_body_of[id] = res;
                     feature_op_of[id] = "add";
                 }
+                {
+                    TopoDS_Shape overlap_tool = pattern_tool;
+                    if (seed_op != "cut") {
+                        TopoDS_Shape pu = ::geom::fuse_many(seed_tool, copies);
+                        if (!pu.IsNull()) overlap_tool = pu;
+                    }
+                    record_tool(id, seed_op == "cut" ? "cut" : "add", overlap_tool);
+                }
 
                 results[id] = SolidResult{res};
                 solid_order.push_back(id);
@@ -3968,6 +4012,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     source_of[id] = body_id;
                     tool_body_of[id] = out;
                     feature_op_of[id] = "add";
+                    record_tool(id, so.second == "cut" ? "cut" : "add", rtool);
                     results[id] = SolidResult{out};
                     solid_order.push_back(id);
                     st.ok = true;
@@ -3988,10 +4033,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                             throw std::runtime_error("mirror union (fuse) produced an empty shape");
                         consumed.insert(body_id);
                         results[id] = SolidResult{out};
+                        record_tool(id, "add", reflected);
                     } else {
                         // The reflection is a NEW standalone body; the original body is
                         // NOT consumed, so BOTH survive.
                         results[id] = SolidResult{reflected};
+                        record_tool(id, "add", reflected);
                     }
                     solid_order.push_back(id);
                     st.ok = true;
@@ -4332,6 +4379,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // op "cut" — a later pattern/mirror re-drills it per instance.
                 tool_body_of[id] = tool_union;
                 feature_op_of[id] = "cut";
+                record_tool(id, "cut", tool_union);
                 solid_order.push_back(id);
                 st.ok = true;
 
@@ -4473,6 +4521,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 results[id] = SolidResult{out};
                 tool_body_of[id] = tool_union;
                 feature_op_of[id] = "cut";
+                record_tool(id, "cut", tool_union);
                 solid_order.push_back(id);
                 st.ok = true;
 

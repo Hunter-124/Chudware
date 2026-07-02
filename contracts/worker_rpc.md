@@ -398,6 +398,19 @@ the app data vendor cache for local AI workflows.
 | `vendor_part_context` | `{limit?, query?}` → `{count, parts, llm_context, capabilities}` compact enough to inject into local-model prompts. |
 | `vendor_part_insert` | `{supplier, part_number, doc_id?/into?, base_revision?, name?}` → normal doc ops response after adding an `import` feature with vendor metadata preserved in feature params. |
 
+### Recognition & overlap (AI-experience wave — appended; see docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md)
+
+| method | params → result |
+|---|---|
+| `eval_feature_overlap` | `{doc_id, features?: [feature-id,…], min_volume_mm3?: 1e-3}` → `{ok, summary, pairs:[{a, b, a_name?, b_name?, kind: "boss_overlap"\|"cut_overlap"\|"cut_into_boss"\|"boss_swallowed", volume_mm3}], dead_features:[feature-id,…]}`. Pairwise common volume of the per-feature TOOL solids captured at compile; `features` restricts to pairs touching those ids (add_features checks only its new batch). `ok:false` only for `boss_swallowed` (a cut removed an ENTIRE earlier boss); every other kind is a warning. `dead_features` = ok features owning zero surviving faces. |
+| `eval_compare` | `{doc_a, doc_b, body_a?, body_b?}` → `{ok, match_pct, volume_a_mm3, volume_b_mm3, common_mm3, missing_mm3, extra_mm3, residual_regions:[{side: "missing"\|"extra", volume_mm3, center:[3], size:[3]}], summary}` or degraded `{ok, match_pct: null, degraded: true, volume/bbox/centroid agreement fields, summary}` when the boolean fails. Shapes compared in their own world frames (no registration). Default body = fuse of all solid bodies per doc. |
+| `doc_face_wires` | `{doc_id, face: Selector\|sid}` → `{ok, plane_frame, entities:[sketch-entity JSON, doc_schema §3.1], wires:[{outer: bool, entity_ids:[…]}], approx: bool}`. Convert-entities primitive: a PLANAR face's boundary wires as sketch entities in the face's 2D plane frame (lines/circles/arcs/ellipses exact; other curves sampled as polylines with `approx:true`). Non-planar face → `invalid_op`. |
+
+`eval_interference` accepts two appended optional params: `include_coincident?: bool = false`
+(adds `contacts:[{a, b, distance}]` for touching, non-overlapping pairs) and
+`min_clearance_mm?: number = 0` (clearance entries below the threshold carry
+`warning: "below min clearance"`). Return shape otherwise unchanged.
+
 ## 3. Sim worker (`engine/sim/worker.py`, separate process, spawned on demand)
 
 Same wire protocol. One job in flight; `job_id` correlates events.

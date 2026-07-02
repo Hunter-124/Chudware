@@ -245,3 +245,132 @@ longer early-outs without a doc), so the glass look is live from first launch in
 previously an empty scene fell back to a flat draw-list gradient and the restyle was invisible
 until a mesh loaded (the "I don't see any changes" report). gui_lint icons/theme clean; scale
 findings unchanged (pre-existing); host tree/chat scenario shots verified visually.
+
+### RELAY → GUI session (from AI-experience DAG integrator, 2026-07-02)
+User request for the GUI-polish lane (not handled by the AI-experience DAG; deferred per user):
+(1) every text/icon overlay drawn over the 3D viewport needs a proper glass background pill
+(`glassRowBackground`/`glassRowAtCursor` pattern); (2) PM feature forms should get SLIDERS for
+bounded numeric params (angles, draft, fillet radius within edge limits, pattern count) alongside
+the text fields; (3) viewport indicators need a cleanup pass — simulation-setup glyphs (fixtures/
+loads), feature preview rendering, and the drag arrows/handles for hand-tuning features should be
+visually consistent (consistent palette, occlusion-aware sizing, pill-backed labels). User: "a lot
+of it's messy, and it's up to you to clear it up."
+
+
+### DATASET — synthetic GSL dataset factory (AI-experience wave, WS-D/D1)
+Write-set: `tools/gsl_dataset_gen.py` (new), `corpora/gsl_dataset/README.md` (new). Added a
+stdlib-only generator (`json`, `argparse`, `random`, `pathlib`, `sys` only) with seven family
+templates (`plate_bolt_circle`, `pocketed_block`, `turned_shaft`, `ribbed_bracket` — 50/50
+rib-gusset-or-second-boss, `shelled_enclosure`, `bladed_disk`, `swept_pipe`), each grounded
+directly against `services/agent/prompts/shared/ops_cheatsheet.md` +
+`services/agent/prompts/shared/cheatsheets/sweep.md` and built with `core_bridge.dim`/`feat`.
+Every op batch was smoke-tested live against the engine (`core/build-linux/bin/libaicad.so`)
+before being committed to the script; **all 7 families built 100% of samples on this engine
+build — zero failures** across a 2-sample acceptance run and a 50-sample-per-family stress run
+(350/350). No family needed the "report and continue" degraded path, so there is nothing to
+list as broken; the per-sample try/except (logs `[family] sample seed=N FAILED: <error>` and
+continues) and the `--families` filter remain in place for when a future engine change
+regresses one. Per sample: `document.json` (`doc_tree`), `faces.json` (`doc_query` face matches
+labelled with the owning feature's TYPE, resolved by joining `doc_tree`'s `owner_map`
+`(body_id, face_id)` pairs against each match's `hint_index + 1` — `doc_query`'s own
+`owner_feature` field is always null since that RPC never threads the owner map through, a gap
+discovered and worked around here rather than filed), `adjacency.json` (`doc_adjacency`),
+`outline.txt` (best-effort `mcp_server.gsl_tools._outline_text(_digest(doc_id))`, imported
+lazily per-sample and caught so a concurrent edit to `gsl_tools.py` degrades to a placeholder
+string instead of crashing the run), and `meta.json` (bbox, `eval_mass` volume, ops count,
+generator version). `doc_close` is called after every sample (confirmed live as a real RPC,
+same as `cad_tools.py`'s usage) so a large `--count` run doesn't accumulate open doc sessions.
+**Gitignore gap (flagged, not fixed — outside this task's write-set):** neither the top-level
+`.gitignore` nor a `corpora/.gitignore` excludes `corpora/gsl_dataset/*` sample output; README
+documents this explicitly and asks the integrator to add one before samples get generated at
+scale. **Verify:** `python3 tools/gsl_dataset_gen.py --count 2` from repo root → 14/14 samples,
+7/7 families, all five files present per sample (tree listing + a sample `meta.json`/`faces.json`
+inspected and confirmed correctly labelled, e.g. `plate_bolt_circle` faces split `box`(4) vs
+`bolt_circle`(7) with the bore faces correctly attributed to the hole feature, not the plate).
+
+### CORE-OVERLAP — intra-part feature-overlap detection (AI-experience wave, WS-B/B1+B2+B4)
+Write-set: `core/doc/document.h`, `core/doc/document.cpp`, `core/doc/session.h`,
+`core/doc/session.cpp`, `core/api/libaicad.cpp`. **B1** — added `ToolRec{feature_id, role,
+tool}` + `CompileResult::tool_recs` (`document.h`) and captured the actual pre-boolean tool
+solid (+ "add"/"cut" role) at every boolean callsite in `compile_document`: both primitive
+boolean branches, extrude (cut and boss/base), revolve, sweep, rib, the explicit `boolean`
+feature (fuse/cut only — `common` is skipped, it fits neither role), linear/circular pattern,
+both mirror paths (feature-mirror and whole-body), hole, and bolt_circle — 16 capture sites via
+one `record_tool` lambda. Deliberately kept **independent** of the pre-existing
+`tool_body_of`/`feature_op_of` maps: those store NESTING-oriented shapes for pattern/mirror
+REPLAY (e.g. an additive pattern's `tool_body_of` is its whole grown body, so an outer pattern
+can re-fuse it wholesale), whereas a `ToolRec` always holds the real incremental geometry a
+feature added or removed, which is what a pairwise `BRepAlgoAPI_Common` needs to measure
+genuine overlap. For additive linear/circular patterns this meant building a fresh
+seed+copies union (mirroring the cut branch's existing `pattern_tool` logic) rather than reusing
+`res` (the whole grown body). Purely additive — no existing behavior/return shape changed.
+**B2** — new `doc_eval_feature_overlap(doc_id, params)` (`session.h`/`.cpp`) pairs every
+unordered combination of `tool_recs` (via `ensure_compiled`'s cache, unlike
+`doc_eval_interference` which always recompiles), classifies `boss_overlap`/`cut_overlap`/
+`cut_into_boss`/`boss_swallowed` (add+cut where common volume >= 99% of the additive tool's
+volume), and reports `dead_features` (ok, non-suppressed features that made a tool but own no
+surviving face/edge per the owner map — fully consumed downstream). `ok` is false only for a
+`boss_swallowed` pair. `params.features` restricts pairing to combinations touching at least one
+listed id (bounds add_features' future latency); `params.min_volume_mm3` floors reportable
+overlap (default 1e-3, mirrors `INTERFERENCE_EPS`). Dispatched as `eval_feature_overlap` in
+`libaicad.cpp` beside `eval_interference`. **B4** — `interference_report`/`doc_eval_interference`
+gained `include_coincident` (near-zero-clearance pairs, distance <= 1e-6, go to a new `contacts`
+array instead of `clearances`) and `min_clearance_mm` (tags a `clearances` entry below it with
+`"warning":"below min clearance"`); `contacts` is always present (empty by default) so the
+return shape is stable either way. `doc_eval_interference` took a `params` json param (default
+`{}`, backward compatible) threaded from the `eval_interference` dispatch. **Deferred/out of
+scope** (per the assignment's write-set): MCP surface (`check_feature_overlap`,
+`check_interference` params, `add_features` auto-warning — WS-B/B3, a different node's
+write-set) and core tests (`core/tests/test_interference.cpp` — WS-B/B5, also a different
+node). **Verify:** `cmake --build core/build-linux -j12` — clean, no new warnings in touched
+files (pre-existing `ctest` flakiness on `appearance`/`drawing_gdt`/`hole` under the parallel
+harness is unrelated — all three pass 100% run standalone). Live smoke via
+`core/build-linux/bin/libaicad.so` + Python `ctypes`: a 40mm cube + a d10h10 boss fused on top +
+a 20mm cube cut centered on the boss → `eval_feature_overlap` returns exactly the two expected
+pairs (`Base`<->`SwallowCut` = `cut_into_boss` 2000 mm³, `Boss`<->`SwallowCut` = `boss_swallowed`
+785.4 mm³, `ok:false`, `dead_features:["f2"]` since the boss's geometry is fully swallowed); a
+cube + a disjoint far-away boss (`merge:false`) → `pairs:[]`, `ok:true`. Also spot-checked the
+`features`/`min_volume_mm3` filters, an assembly doc (degrades gracefully to an empty report —
+`compile_document` tolerates the missing `features` key), and B4's `include_coincident`/
+`min_clearance_mm` on a flush two-box part (touching pair correctly moves from `clearances` to
+`contacts`) and a far-apart pair (correctly tagged `"warning":"below min clearance"`).
+
+### GSL-TEXT — non-vision geometry/sketch text channel (AI-experience wave, WS-A/A1+A2+A3)
+Write-set: `services/mcp/gsl_tools.py` only. **A3** extends `_digest`/`_outline_text`
+(signatures unchanged) with a per-feature placement narrative: mean centroid + dominant
+principal side + offsets from the part bbox on the two perpendicular axes + `touches` (other
+feature ids bridged by an adjacency edge). Ownership join required a workaround discovered at
+runtime: `doc_query`'s per-face `owner_feature` field is **always null**
+(`core/doc/picks.cpp::resolve_geom_query` hardcodes `ti.owner = std::nullopt`), so ownership is
+instead joined from `doc_tree`'s `owner_map` `[body_id, topo_id]` pairs against `doc_query`'s
+0-based match order (`topo_id == index + 1`, verified empirically on a box+hole: owner_map's
+4/3 face split for the box/hole features lined up exactly with doc_query's face order). A feature
+owning zero faces prints `"feature <id> owns no surviving faces (consumed by later ops)"`
+(verified live: a boss fully swallowed by a later cut correctly falls into this branch — doubles
+as WS-B's dead-feature signal on the read path). **A1** adds `describe_sketch(sketch, doc_id)`
+composing `doc_sketch_overview` + `doc_sketch_regions` + the authored sketch feature from
+`doc_tree` into plane/entity-roster/constraint-roster/regions/DOF-verdict text. Two RPC param
+gotchas found only by running them: both `doc_sketch_overview` and `doc_sketch_regions` take the
+sketch feature id under the JSON key **`sketch`**, not `sketch_fid` (that's only the C++
+parameter name; `libaicad.cpp`'s dispatch reads `params.value("sketch", ...)`) — the plan's RPC
+shorthand was misleading here. `doc_sketch_overview` carries no `constraints`/`measured` field
+(only `entities`/`statuses`/`dof`/`plane_frame`/`status`/`skipped_constraints`), so driving-
+dimension values are read from the authored params as the plan's fallback anticipated, and the
+DOF verdict's "conflicting" detail degrades to listing entity ids with `status:"over"` (no
+`conflicting` constraint-id list is available from this RPC). **A2** adds `describe_scene(views,
+doc_id)` (per-view visible-face listing from signed `normal` dot camera-dir > 0.15, explicit
+occlusion disclaimer, part-level bbox + A3 placement narrative up top) and the standalone,
+dependency-free `_scene_caption(doc_id, views)` helper (one paragraph; exported for the Wave-2
+`cad_tools` node's `render_part`/`contact_sheet` caption). View directions match render_part's
+documented convention exactly (front=-Y, back=+Y, right=+X, left=-X, top=+Z, bottom=-Z,
+iso=normalize(1,1,0.8)) — cross-checked against `core/doc/session.cpp::resolve_view_spec`.
+**Verify:** `python3 -m py_compile services/mcp/gsl_tools.py` clean; live smoke against
+`libaicad.so` (box 40x30x20 + a d8 through-hole): `describe_part` outline correctly reports
+"f1 Base [box] (4 face(s)): on right face of f2, centered 15 mm from -Y edge / 10 mm from -Z
+edge" and "f2 Bore [hole] (3 face(s)): on bottom face of f1, centered 20 mm from -X edge / 15 mm
+from -Y edge"; `describe_scene` iso view lists the 3 faces whose normals actually face
+`(0.62,0.62,0.49)`; a rect+circle sketch with coincident/H/V relations + 2 driving dimensions +
+1 radius dim reports "Under-defined: 2 degree(s) of freedom remain" (circle center unconstrained)
+with both regions (outer 40x20 material, inner void) and their areas/bboxes correctly split.
+Unknown-sketch id returns the plan's exact `_err`-style hint. No changes needed to
+`_digest`/`_outline_text` call sites elsewhere — `server.py` only imports `register_gsl_tools`.

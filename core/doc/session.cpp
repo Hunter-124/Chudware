@@ -6549,9 +6549,16 @@ json doc_eval_symmetry(const std::string& doc_id, int body_id, const json& plane
 // of engine/doc/evaluate.py::interference (kernel.py::_fit_report). Pairwise overlap
 // (BRepAlgoAPI_Common volume) + clearance (BRepExtrema min distance), per-part bbox.
 // ok iff nothing interferes.
-json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>& members) {
+// `include_coincident` (B4, default false) additionally classifies a near-zero-clearance
+// pair (common volume < eps AND DistShapeShape distance <= 1e-6) as a `contacts` entry
+// instead of a `clearances` one (SW-parity "coincident faces" gap, docs/SW_PARITY_GAPS.md).
+// `min_clearance_mm` (B4, default 0) tags a `clearances` entry below it with
+// `"warning":"below min clearance"`.
+json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>& members,
+                         bool include_coincident = false, double min_clearance_mm = 0.0) {
     const std::size_t n = members.size();
     constexpr double INTERFERENCE_EPS = 1e-3;
+    constexpr double kCoincidentTol = 1e-6;
 
     // Per-part bbox + volume (kernel.py::_bbox_dict uses build123d bounding_box() ->
     // BRepBndLib::AddOptimal, the precise box, after BRepTools::Clean).
@@ -6580,6 +6587,7 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
 
     json interferences = json::array();
     json clearances = json::array();
+    json contacts = json::array();
     for (std::size_t i = 0; i < n; ++i) {
         const std::string& name_i = members[i].first;
         for (std::size_t j = i + 1; j < n; ++j) {
@@ -6602,9 +6610,17 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
             } else {
                 try {
                     BRepExtrema_DistShapeShape dss(members[i].second, members[j].second);
-                    if (dss.IsDone())
-                        clearances.push_back(
-                            json{{"a", name_i}, {"b", name_j}, {"distance", dss.Value()}});
+                    if (dss.IsDone()) {
+                        const double dist = dss.Value();
+                        if (include_coincident && dist <= kCoincidentTol) {
+                            contacts.push_back(json{{"a", name_i}, {"b", name_j}, {"distance", dist}});
+                        } else {
+                            json c = {{"a", name_i}, {"b", name_j}, {"distance", dist}};
+                            if (min_clearance_mm > 0.0 && dist < min_clearance_mm)
+                                c["warning"] = "below min clearance";
+                            clearances.push_back(std::move(c));
+                        }
+                    }
                 } catch (const Standard_Failure&) {
                 }
             }
@@ -6644,6 +6660,7 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
         {"parts", parts},
         {"interferences", interferences},
         {"clearances", clearances},
+        {"contacts", contacts},
     };
 }
 
@@ -6653,7 +6670,8 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
 //                    session.py::asm_world_bodies, explode=False). This mirrors the oracle's
 //                    s.is_assembly branch — without it an assembly always reported "no interference"
 //                    because compile_document(asm).shapes is empty.
-json doc_eval_interference(const std::string& doc_id) {
+// `params` (B4): see the interference_report doc comment for include_coincident/min_clearance_mm.
+json doc_eval_interference(const std::string& doc_id, const json& params) {
     DocLock lk;
     Session& s = require_session(doc_id);
 
@@ -6672,8 +6690,151 @@ json doc_eval_interference(const std::string& doc_id) {
         for (std::size_t i = 0; i < r.shapes.size(); ++i)
             members.emplace_back("b" + std::to_string(i + 1), r.shapes[i]);
     }
-    return interference_report(members);
+    const bool include_coincident = params.contains("include_coincident") &&
+                                    params["include_coincident"].is_boolean() &&
+                                    params["include_coincident"].get<bool>();
+    const double min_clearance_mm = params.contains("min_clearance_mm") &&
+                                            params["min_clearance_mm"].is_number()
+                                        ? params["min_clearance_mm"].get<double>() : 0.0;
+    return interference_report(members, include_coincident, min_clearance_mm);
 }
+
+// B2 — intra-part FEATURE-overlap detection (see session.h doc_eval_feature_overlap for the
+// full contract). No Python analogue: assembly interference tests whole bodies across parts;
+// this tests each feature's own pre-boolean TOOL SOLID (CompileResult::tool_recs, populated in
+// document.cpp at every boolean callsite) against every OTHER feature's tool in the SAME part —
+// catching a boss silently fused into another boss, a cut that swallows an earlier boss whole,
+// or two cut tools that overlap (redundant material removal). Reuses the compile cache
+// (ensure_compiled) the same way interactive read paths (resolve_pick, face_edges, doc_status)
+// do, instead of unconditionally recompiling like doc_eval_interference above.
+json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    const CompileResult& r = ensure_compiled(s);
+
+    bool has_filter = false;
+    std::set<std::string> filter;
+    if (params.contains("features") && params["features"].is_array()) {
+        has_filter = true;
+        for (const json& v : params["features"])
+            if (v.is_string()) filter.insert(v.get<std::string>());
+    }
+    const double min_volume_mm3 = params.contains("min_volume_mm3") &&
+                                          params["min_volume_mm3"].is_number()
+                                      ? params["min_volume_mm3"].get<double>() : 1e-3;
+
+    auto feature_name = [&](const std::string& fid) -> std::string {
+        const json* f = find_feature_c(s.doc, fid);
+        return (f && f->contains("name") && (*f)["name"].is_string())
+                   ? (*f)["name"].get<std::string>() : fid;
+    };
+
+    std::vector<json> pair_vec;
+    const std::size_t n = r.tool_recs.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        const ToolRec& a = r.tool_recs[i];
+        for (std::size_t j = i + 1; j < n; ++j) {
+            const ToolRec& b = r.tool_recs[j];
+            if (a.feature_id == b.feature_id) continue;  // same feature's own tool records
+            if (has_filter && !filter.count(a.feature_id) && !filter.count(b.feature_id)) continue;
+
+            bool ov_ok = false;
+            double vol = 0.0;
+            try {
+                BRepAlgoAPI_Common common(a.tool, b.tool);
+                common.Build();
+                if (common.IsDone()) {
+                    vol = eval_vol_or_zero(common.Shape());
+                    ov_ok = true;
+                }
+            } catch (const Standard_Failure&) {
+            }
+            if (!ov_ok || vol < min_volume_mm3) continue;
+
+            std::string kind;
+            if (a.role == "add" && b.role == "add") {
+                kind = "boss_overlap";
+            } else if (a.role == "cut" && b.role == "cut") {
+                kind = "cut_overlap";
+            } else {
+                const ToolRec& add_rec = (a.role == "add") ? a : b;
+                const double add_vol = eval_vol_or_zero(add_rec.tool);
+                kind = (add_vol > 1e-12 && vol >= 0.99 * add_vol) ? "boss_swallowed"
+                                                                  : "cut_into_boss";
+            }
+            pair_vec.push_back(json{
+                {"a", a.feature_id},
+                {"b", b.feature_id},
+                {"a_name", feature_name(a.feature_id)},
+                {"b_name", feature_name(b.feature_id)},
+                {"kind", kind},
+                {"volume_mm3", vol},
+            });
+        }
+    }
+    std::sort(pair_vec.begin(), pair_vec.end(), [](const json& x, const json& y) {
+        return x["volume_mm3"].get<double>() > y["volume_mm3"].get<double>();
+    });
+
+    // dead_features: any feature that contributed a tool_rec but owns no surviving
+    // face/edge (fully consumed downstream) and did not itself error.
+    std::set<std::string> toolmakers;
+    for (const ToolRec& tr : r.tool_recs) toolmakers.insert(tr.feature_id);
+    json dead_features = json::array();
+    for (const std::string& fid : toolmakers) {
+        bool feature_ok = false;
+        for (const FeatureStatus& st : r.statuses)
+            if (st.id == fid) { feature_ok = st.ok; break; }
+        if (!feature_ok) continue;
+        const bool has_faces = r.owner_map.is_object() && r.owner_map.contains(fid) &&
+                               r.owner_map[fid].contains("faces") &&
+                               r.owner_map[fid]["faces"].is_array() &&
+                               !r.owner_map[fid]["faces"].empty();
+        if (!has_faces) dead_features.push_back(fid);
+    }
+
+    std::size_t n_swallowed = 0, n_boss = 0, n_cut = 0, n_into = 0;
+    for (const json& p : pair_vec) {
+        const std::string& k = p["kind"].get_ref<const std::string&>();
+        if (k == "boss_swallowed") ++n_swallowed;
+        else if (k == "boss_overlap") ++n_boss;
+        else if (k == "cut_overlap") ++n_cut;
+        else if (k == "cut_into_boss") ++n_into;
+    }
+
+    std::string summary;
+    if (pair_vec.empty() && dead_features.empty()) {
+        summary = "No feature overlap detected.";
+    } else {
+        char buf[224];
+        std::snprintf(buf, sizeof(buf),
+            "%zu overlapping pair(s) (%zu boss_swallowed, %zu boss_overlap, %zu cut_overlap, "
+            "%zu cut_into_boss); %zu dead feature(s)",
+            pair_vec.size(), n_swallowed, n_boss, n_cut, n_into, dead_features.size());
+        summary = buf;
+        if (!pair_vec.empty()) {
+            const json& big = pair_vec.front();  // sorted volume desc
+            char vbuf[192];
+            std::snprintf(vbuf, sizeof(vbuf), "; largest %s<->%s (%s) = %.1f mm^3",
+                          big["a_name"].get<std::string>().c_str(),
+                          big["b_name"].get<std::string>().c_str(),
+                          big["kind"].get<std::string>().c_str(),
+                          big["volume_mm3"].get<double>());
+            summary += vbuf;
+        }
+    }
+
+    json pairs = json::array();
+    for (json& p : pair_vec) pairs.push_back(std::move(p));
+
+    return json{
+        {"ok", n_swallowed == 0},
+        {"summary", summary},
+        {"pairs", pairs},
+        {"dead_features", dead_features},
+    };
+}
+
 
 // engine/doc/evaluate.py::measure via worker.py::_eval_measure. Resolve 1-2 refs against
 // the LAST body, then single-entity or pair measure. Refs resolve in the SAME enumeration

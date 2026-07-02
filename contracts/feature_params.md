@@ -417,6 +417,12 @@ A plate closing the open END of a hollow member (a tube). SEPARATE weldment body
 ### `import`
 - params: `source_path: str` · `format: "step"|"iges"|"brep"|"stl"` · `original_name: str?`
 - refs: — · bodies are frozen (no upstream params).
+- appended (code-level reality, `core/doc/session.cpp doc_import_file` / `core/doc/document.cpp`
+  import compiler): `embedded_brep: str?` — base64 BRep blob of the imported solids, written at
+  import time and PREFERRED over `source_path` at compile; each contained `TopoDS_SOLID`
+  becomes its own body `<feature-id>#k`. Observed `format` values also include the mesh/foreign
+  families (`3mf`, `obj`, `ply`, `gltf`/`glb`, `3dm`, `x_t`/`x_b`); mesh formats are sewn to a
+  shell/solid at import (`formats.cpp mesh_to_shape`).
 
 ## Stretch: `rib`, `split` (implemented)
 

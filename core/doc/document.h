@@ -64,6 +64,25 @@ struct BodyInfo {
     int n_edges = 0;
 };
 
+// One feature's pre-boolean TOOL SOLID (the prism/tool/tool_union/pattern union it
+// applied to the running body, or the whole created solid for a base/standalone
+// feature) + the boolean role it played. Populated additively at every boolean
+// callsite in compile_document (extrude/revolve/sweep/rib/boolean/patterns/mirror/
+// hole/bolt_circle/primitive) — the seam WS-B's doc_eval_feature_overlap needs to
+// test feature-vs-feature overlap WITHIN one part (two bosses sharing volume, a
+// cut that swallows an earlier boss, redundant overlapping cuts). Independent of
+// tool_body_of/feature_op_of below (those store NESTING-oriented shapes tuned for
+// pattern/mirror replay — e.g. an additive pattern's tool_body_of is its whole grown
+// body — whereas a ToolRec always holds the actual incremental geometry added or
+// removed, so a pairwise BRepAlgoAPI_Common between two ToolRecs measures real
+// overlap, not "the whole body overlaps itself"). A suppressed or failed feature
+// records nothing (the per-feature try/catch never reaches the capture call).
+struct ToolRec {
+    std::string feature_id;
+    std::string role;   // "add" | "cut"
+    TopoDS_Shape tool;  // the pre-boolean tool solid (refcounted handle, cheap to copy)
+};
+
 // The result of compiling a whole document.
 struct CompileResult {
     std::vector<FeatureStatus> statuses;  // one per feature, in tree order
@@ -79,6 +98,9 @@ struct CompileResult {
     // The surviving solid shapes in AICM body order (shapes[i] <-> body ordinal i+1).
     // Lets a caller describe a picked body's topology (doc_resolve_pick).
     std::vector<TopoDS_Shape> shapes;
+    // Per-feature pre-boolean tool solids + add/cut role (see ToolRec). Empty for a
+    // doc with no boolean-producing features, or when every feature errored.
+    std::vector<ToolRec> tool_recs;
     // Per-weld_member-feature cut-list side-channel: {fid: {profile, dims,
     // members:[{segment_id, profile, length, start[3], end[3], area, volume}]}}.
     // Surfaced from the weld_member compiler so the weldment cut list groups its

@@ -2706,7 +2706,11 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                             out_json, 0);
             if (m == "eval_interference")
                 return emit(aicad::doc::doc_eval_interference(
-                                params.value("doc_id", std::string())),
+                                params.value("doc_id", std::string()), params),
+                            out_json, 0);
+            if (m == "eval_feature_overlap")
+                return emit(aicad::doc::doc_eval_feature_overlap(
+                                params.value("doc_id", std::string()), params),
                             out_json, 0);
             if (m == "eval_measure")
                 return emit(aicad::doc::doc_eval_measure(

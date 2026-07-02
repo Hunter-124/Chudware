@@ -300,9 +300,35 @@ nlohmann::json doc_eval_symmetry(const std::string& doc_id, int body_id,
 // Evaluate — pairwise interference + clearance across ALL surviving bodies (port of
 // evaluate.py::interference via worker.py::_eval_interference, part-doc branch). Returns
 // {ok, summary, parts:[{name,volume,bbox}], interferences:[{a,b,volume}], clearances:
-// [{a,b,distance}]}. Body names are "b1".."bN" in AICM order (matching the oracle's
-// body_id). A single-body part yields an empty interference/clearance report.
-nlohmann::json doc_eval_interference(const std::string& doc_id);
+// [{a,b,distance}], contacts:[{a,b,distance}]}. Body names are "b1".."bN" in AICM order
+// (matching the oracle's body_id). A single-body part yields an empty interference/
+// clearance report. `params` (B4, all optional): `include_coincident` (bool, default
+// false) additionally classifies a near-zero-clearance pair (distance <= 1e-6) as a
+// `contacts` entry instead of a `clearances` one (SW-parity "coincident faces" gap);
+// `min_clearance_mm` (default 0) tags any clearance entry below it with
+// `"warning":"below min clearance"`.
+nlohmann::json doc_eval_interference(const std::string& doc_id,
+                                     const nlohmann::json& params = nlohmann::json::object());
+
+// Evaluate — pairwise FEATURE-tool overlap WITHIN one part (port of the new WS-B
+// intra-part check; no Python analogue). Pairs every unordered combination of
+// CompileResult::tool_recs (the pre-boolean tool solid each boss/cut/hole/pattern/
+// mirror feature contributed — see ToolRec in document.h) and runs BRepAlgoAPI_Common
+// to measure shared volume. `params` (all optional): `features` (array of feature-id
+// strings) restricts pairing to combinations touching at least one listed id (bounds
+// add_features' latency to new-batch x existing-tree); `min_volume_mm3` (default
+// 1e-3, mirrors interference's INTERFERENCE_EPS) floors a reportable overlap. Kind is
+// "boss_overlap" (add+add — two additive features share volume, often intentional),
+// "cut_overlap" (cut+cut — redundant removal), "cut_into_boss" (add+cut, partial), or
+// "boss_swallowed" (add+cut where the common volume is >= 99% of the additive tool's
+// volume — the cut removed the ENTIRE earlier boss, almost certainly an error).
+// Also reports `dead_features`: ok, non-suppressed features that contributed a tool
+// but own no surviving face/edge (fully consumed downstream). Returns {ok, summary,
+// pairs:[{a,b,a_name,b_name,kind,volume_mm3}] (volume desc), dead_features:[id,...]}.
+// `ok` is false ONLY when a boss_swallowed pair exists — every other kind is a
+// warning (overlapping bosses/cuts are common, intentional design).
+nlohmann::json doc_eval_feature_overlap(const std::string& doc_id,
+                                        const nlohmann::json& params = nlohmann::json::object());
 
 // Evaluate — measure 1-2 resolved refs against the LAST body (port of evaluate.py::measure
 // via worker.py::_eval_measure). Each ref is a face/edge/vertex selector. 1 ref ->

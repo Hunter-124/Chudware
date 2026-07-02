@@ -1,16 +1,23 @@
 """GSL (Geometry-Semantics Layer) MCP tools — a compact, NAMED, progressive-pull view of a part's
 geometry that replaces the flat 68-face dump.
 
-  describe_part(doc_id)      -> the part OUTLINE: bbox, feature groups, detected symmetry/instances,
-                                addressable handles (bores/caps/round faces) with their stable ids.
-  query_adjacency(doc_id)    -> the face-adjacency graph (W3): which faces touch, convex vs concave.
-  hover(sid, doc_id)         -> expand ONE face/edge by the stable id describe_part/query_geometry gave.
+  describe_part(doc_id)         -> the part OUTLINE: bbox, feature groups WITH a placement
+                                   narrative (which face each feature sits on, offsets from the
+                                   part bbox, what it touches), detected symmetry/instances,
+                                   addressable handles (bores/caps/round faces) with stable ids.
+  query_adjacency(doc_id)       -> the face-adjacency graph (W3): which faces touch, convex/concave.
+  hover(sid, doc_id)            -> expand ONE face/edge by the stable id describe_part gave.
+  describe_sketch(sketch, ...)  -> a sketch's plane, entity roster, constraints, regions and DOF
+                                   verdict as text — the non-vision equivalent of looking at it.
+  describe_scene(views, ...)    -> deterministic "what the render would show" per view, from
+                                   B-rep face normals — the non-vision fallback for render_part.
 
 These let the model pull a small, named view and address geometry by a STABLE handle instead of
 re-reading the whole B-rep after every edit.
 """
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from typing import Optional
 
@@ -49,6 +56,69 @@ def _axis_order(faces: list) -> Optional[dict]:
     return None
 
 
+# ---------------------------------------------------------------- A3: placement narrative
+# A feature type that never owns solid faces (references/sketches) — never gets a placement
+# line or a "consumed" line, since it was never expected to own B-rep faces to begin with.
+_NON_BODY_FEATURE_TYPES = {"sketch", "plane", "axis", "point", "csys"}
+
+_SIDE_AXIS = {"top": "z", "bottom": "z", "right": "x", "left": "x", "front": "y", "back": "y"}
+_AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
+
+
+def _feature_placement(owned: list, bbox: dict) -> Optional[dict]:
+    """Where a feature's SURVIVING faces sit: mean centroid, the dominant principal side among
+    them (top/bottom/right/left/front/back), and offsets from the part bbox on the two axes
+    PERPENDICULAR to that side (e.g. a boss on the top face is placed by its X/Y offset from the
+    bbox corner). Falls back to axis "z" (offsets on X/Y) when no owned face has a clear
+    principal-axis side — e.g. a through-hole's cylindrical bore wall, whose normal is radial."""
+    if not owned:
+        return None
+    n = len(owned)
+    cx = sum((f.get("centroid") or [0, 0, 0])[0] for f in owned) / n
+    cy = sum((f.get("centroid") or [0, 0, 0])[1] for f in owned) / n
+    cz = sum((f.get("centroid") or [0, 0, 0])[2] for f in owned) / n
+    centroid = [cx, cy, cz]
+    sides = [f.get("side") for f in owned if f.get("side")]
+    dominant = max(set(sides), key=sides.count) if sides else None
+    axis = _SIDE_AXIS.get(dominant, "z")
+    perp = [a for a in ("x", "y", "z") if a != axis]
+    bmin, bmax = bbox.get("min"), bbox.get("max")
+    offsets = None
+    if (isinstance(bmin, list) and isinstance(bmax, list) and
+            len(bmin) == 3 and len(bmax) == 3):
+        offsets = {}
+        for a in perp:
+            i = _AXIS_INDEX[a]
+            offsets[a] = {"from_min_mm": round(centroid[i] - bmin[i], 2),
+                          "from_max_mm": round(bmax[i] - centroid[i], 2)}
+    return {"centroid": [round(c, 2) for c in centroid], "side": dominant,
+           "offsets": offsets, "n_faces": n}
+
+
+def _feature_group_line(fg: dict) -> str:
+    """One-line placement sentence for a single feature_groups entry (token discipline: one
+    line per feature, no matter how many faces it owns)."""
+    if fg.get("consumed"):
+        return f'feature {fg["id"]} owns no surviving faces (consumed by later ops)'
+    label = f'{fg["id"]} {fg.get("name") or ""} [{fg.get("type")}]'.replace("  ", " ").strip()
+    pl = fg.get("placement")
+    if not pl:
+        return f'{label}: {fg["faces"]} face(s)'
+    touches = pl.get("touches") or []
+    touch_txt = f' of {", ".join(touches)}' if touches else ""
+    side = pl.get("side")
+    if side:
+        where = f'on {side} face{touch_txt}'
+    else:
+        where = f'no clear reference face{touch_txt} (curved/through feature)'
+    off = pl.get("offsets")
+    if off:
+        off_txt = " / ".join(
+            f'{off[a]["from_min_mm"]:.0f} mm from -{a.upper()} edge' for a in sorted(off))
+        return f'{label} ({fg["faces"]} face(s)): {where}, centered {off_txt}'
+    return f'{label} ({fg["faces"]} face(s)): {where}'
+
+
 def _digest(doc_id: str) -> dict:
     faces = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}}).get("matches", [])
     edges = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "edge"}}).get("matches", [])
@@ -61,8 +131,7 @@ def _digest(doc_id: str) -> dict:
     except Exception:  # noqa: BLE001
         bbox = {}
     feats = ((tree.get("tree") or {}).get("features")) or []
-    fmap = {f.get("id"): f for f in feats if isinstance(f, dict)}
-    owner_map = tree.get("owner_map") or {}
+    owner_map = tree.get("owner_map") or {}  # kept for callers that want the raw map
 
     # Instance/symmetry clustering: faces with the same shape+size are likely pattern copies.
     groups: dict = defaultdict(list)
@@ -86,14 +155,68 @@ def _digest(doc_id: str) -> dict:
     caps = [{"sid": f.get("sid"), "side": f.get("side"), "area": f.get("area_or_len")}
             for f in faces if f.get("surf") == "plane" and f.get("side")]
 
-    feat_summary = []
+    # A3 — group owned faces by feature. doc_query's per-face `owner_feature` field is ALWAYS
+    # null (core/doc/picks.cpp resolve_geom_query hardcodes ti.owner = nullopt — verified at
+    # runtime), so ownership must be joined from doc_tree's owner_map instead: it keys each
+    # feature's owned faces as [body_id, topo_id] pairs (1-based TopExp topo index). doc_query
+    # enumerates the SAME body's faces in the SAME order (both walk face topology in first-
+    # encounter order for a single-solid body — verified: owner_map's (body,topo) pairs line up
+    # 1:1 with doc_query's 0-based match order via topo_id == index+1), and doc_query always
+    # queries the LAST body, so we join against the highest body_id owner_map mentions.
+    last_body = 0
+    for om in owner_map.values():
+        for pair in om.get("faces", []) or []:
+            if isinstance(pair, list) and len(pair) == 2:
+                last_body = max(last_body, pair[0])
+    owner_by_topo: dict = {}
     for fid, om in owner_map.items():
-        nf = len(om.get("faces", []))
-        if not nf:
+        for pair in om.get("faces", []) or []:
+            if isinstance(pair, list) and len(pair) == 2 and pair[0] == last_body:
+                owner_by_topo[pair[1]] = fid
+    faces_by_owner: dict = defaultdict(list)
+    ord_owner = [owner_by_topo.get(i + 1) for i in range(len(faces))]
+    for i, f in enumerate(faces):
+        fo = ord_owner[i]
+        if fo:
+            faces_by_owner[fo].append(f)
+
+    # "touches": bridge adjacency edges across owner sets. doc_query's face-match order IS
+    # doc_adjacency's `ord` numbering (both walk the same TopExp_Explorer order), so index i
+    # in `faces` is face `ord` i.
+    touches: dict = defaultdict(set)
+    try:
+        adj = cb.call("doc_adjacency", {"doc_id": doc_id})
+        for e in adj.get("edges", []):
+            between = e.get("between") or []
+            if len(between) != 2:
+                continue
+            ia, ib = between
+            if not (0 <= ia < len(ord_owner)) or not (0 <= ib < len(ord_owner)):
+                continue
+            oa, ob = ord_owner[ia], ord_owner[ib]
+            if oa and ob and oa != ob:
+                touches[oa].add(ob)
+                touches[ob].add(oa)
+    except Exception:  # noqa: BLE001
+        pass
+
+    feat_summary = []
+    for ft in feats:
+        if not isinstance(ft, dict):
             continue
-        ft = fmap.get(fid, {})
-        feat_summary.append({"id": fid, "name": ft.get("name"), "type": ft.get("type"),
-                             "faces": nf})
+        fid = ft.get("id")
+        if not fid or ft.get("type") in _NON_BODY_FEATURE_TYPES:
+            continue
+        owned = faces_by_owner.get(fid, [])
+        entry = {"id": fid, "name": ft.get("name"), "type": ft.get("type"), "faces": len(owned)}
+        if owned:
+            placement = _feature_placement(owned, bbox)
+            if placement is not None:
+                placement["touches"] = sorted(touches.get(fid, []))
+                entry["placement"] = placement
+        else:
+            entry["consumed"] = True
+        feat_summary.append(entry)
 
     return {
         "part": (tree.get("tree") or {}).get("name"),
@@ -118,10 +241,9 @@ def _outline_text(d: dict) -> str:
         s = d["symmetry"]
         lines.append(f'Symmetry: {s["order"]}-fold {s["type"]} about +{s["axis"].upper()}')
     if d.get("feature_groups"):
-        lines.append("Features (each owns these many faces):")
+        lines.append("Features (placement narrative, one line each):")
         for fg in d["feature_groups"]:
-            lines.append(f'  - {fg["id"]} {fg.get("name") or ""} [{fg.get("type")}]: '
-                         f'{fg["faces"]} face(s)')
+            lines.append(f'  - {_feature_group_line(fg)}')
     if d.get("instances"):
         lines.append("Repeated/instanced groups (likely patterns - address as a set):")
         for g in d["instances"]:
@@ -142,15 +264,267 @@ def _outline_text(d: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- A1: describe_sketch
+_DIM_CONSTRAINT_TYPES = {"distance", "angle", "radius", "diameter"}
+
+
+def _sketch_authored_params(feat: Optional[dict]) -> dict:
+    """The sketch feature's authored {entities, constraints} — canonical `params` shape, or the
+    flat fallback some older docs store (mirrors the core's `sketch_params`)."""
+    if not feat:
+        return {"entities": [], "constraints": []}
+    params = feat.get("params")
+    if isinstance(params, dict) and ("entities" in params or "constraints" in params):
+        return params
+    return {"entities": feat.get("entities") or [], "constraints": feat.get("constraints") or []}
+
+
+def _fmt_xy(v) -> str:
+    return f'({v[0]:.3g},{v[1]:.3g})' if isinstance(v, list) and len(v) >= 2 else "?"
+
+
+def _entity_geom_str(etype: str, rec: dict) -> str:
+    """A short 'coords/dims' description for one sketch entity, from its solved (or authored,
+    if unsolved) coordinate record."""
+    if etype == "line":
+        p1, p2 = rec.get("p1"), rec.get("p2")
+        length = (math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                  if isinstance(p1, list) and isinstance(p2, list) else None)
+        return f'{_fmt_xy(p1)}\u2192{_fmt_xy(p2)}' + (f' len {length:.3g}' if length else "")
+    if etype == "circle":
+        return f'ctr{_fmt_xy(rec.get("center"))} r{rec.get("radius")}'
+    if etype == "arc":
+        return (f'ctr{_fmt_xy(rec.get("center"))} r{rec.get("radius")} '
+               f'{rec.get("start")}\u00b0\u2192{rec.get("end")}\u00b0')
+    if etype == "point":
+        return _fmt_xy(rec.get("p"))
+    if etype in ("ellipse", "ellipse_arc"):
+        return f'ctr{_fmt_xy(rec.get("center"))} rx{rec.get("rx")} ry{rec.get("ry")}'
+    if etype == "slot":
+        return f'{_fmt_xy(rec.get("p1"))}\u2192{_fmt_xy(rec.get("p2"))} w{rec.get("width")}'
+    if etype == "arc_slot":
+        return f'ctr{_fmt_xy(rec.get("center"))} r{rec.get("radius")} w{rec.get("width")}'
+    if etype in ("spline", "eq_curve"):
+        pts = rec.get("points") or []
+        return f'{len(pts)} pt(s)' if pts else "parametric curve"
+    keys = [k for k in rec if k not in ("id", "type", "construction")
+            and not isinstance(rec[k], (list, dict))]
+    return ", ".join(f'{k}={rec[k]}' for k in keys[:4]) or "?"
+
+
+def _sketch_digest(sketch: str, overview: dict, regions_resp: dict,
+                   feat: Optional[dict]) -> dict:
+    authored = _sketch_authored_params(feat)
+    live_by_id = {e.get("id"): e for e in (overview.get("entities") or [])
+                 if isinstance(e, dict) and e.get("id")}
+    statuses = overview.get("statuses") or {}
+
+    entities = []
+    for e in authored.get("entities") or []:
+        if not isinstance(e, dict):
+            continue
+        eid = e.get("id")
+        etype = e.get("type", "?")
+        live = live_by_id.get(eid, e)
+        entities.append({"id": eid, "type": etype, "geom": _entity_geom_str(etype, live),
+                         "status": statuses.get(eid, "?"),
+                         "construction": bool(e.get("construction"))})
+
+    by_kind: dict = defaultdict(list)
+    dims = []
+    for c in authored.get("constraints") or []:
+        if not isinstance(c, dict):
+            continue
+        ctype = c.get("type", "?")
+        by_kind[ctype].append(c.get("id"))
+        if ctype in _DIM_CONSTRAINT_TYPES:
+            val = c.get("value") or {}
+            dims.append({"id": c.get("id"), "type": ctype, "value": val.get("value"),
+                        "expr": val.get("expr"), "driven": bool(c.get("driven"))})
+    relation_counts = {k: len(v) for k, v in by_kind.items() if k not in _DIM_CONSTRAINT_TYPES}
+
+    regions = []
+    for r in regions_resp.get("regions") or []:
+        if not isinstance(r, dict):
+            continue
+        outer = r.get("outer") or []
+        us = [pt[0] for pt in outer if isinstance(pt, list) and len(pt) >= 2]
+        vs = [pt[1] for pt in outer if isinstance(pt, list) and len(pt) >= 2]
+        bbox = (None if not (us and vs) else
+               {"w": round(max(us) - min(us), 3), "h": round(max(vs) - min(vs), 3),
+                "at": [round(min(us), 3), round(min(vs), 3)]})
+        regions.append({"index": r.get("index"), "area": r.get("area"),
+                        "is_material": r.get("is_material", True), "bbox": bbox})
+
+    status = overview.get("status", "")
+    dof = overview.get("dof", 0)
+    over_ids = [k for k, v in statuses.items() if v == "over"]
+    skipped = overview.get("skipped_constraints") or []
+    if status == "over" or over_ids:
+        verdict = "Over-defined" + (f': conflicting entities {over_ids} — remove one constraint.'
+                                    if over_ids else ' — remove a conflicting constraint.')
+        fully_defined = False
+    elif status == "full" or dof == 0:
+        verdict = "Fully defined (dof 0) — every entity is pinned by relations + dimensions."
+        fully_defined = True
+    else:
+        verdict = (f'Under-defined: {dof} degree(s) of freedom remain — add geometric relations '
+                  'and/or driving dimensions.')
+        fully_defined = False
+    if skipped:
+        verdict += f' {len(skipped)} constraint(s) skipped by the solver: {skipped}.'
+
+    frame = overview.get("plane_frame") or []
+    plane = None
+    if isinstance(frame, list) and len(frame) >= 16:
+        plane = {"origin": [round(frame[3], 3), round(frame[7], 3), round(frame[11], 3)],
+                "u_axis": [round(frame[0], 3), round(frame[4], 3), round(frame[8], 3)],
+                "v_axis": [round(frame[1], 3), round(frame[5], 3), round(frame[9], 3)],
+                "normal": [round(frame[2], 3), round(frame[6], 3), round(frame[10], 3)]}
+    plane_ref = (feat.get("refs") or {}).get("plane") if feat else None
+    plane_name = (plane_ref if isinstance(plane_ref, str)
+                 else plane_ref.get("kind") if isinstance(plane_ref, dict) else None)
+
+    return {"sketch": sketch, "plane": plane, "plane_ref": plane_name,
+           "entities": entities, "relation_counts": relation_counts, "dimensions": dims,
+           "regions": regions, "status": status, "dof": dof,
+           "fully_defined": fully_defined, "skipped_constraints": skipped, "verdict": verdict}
+
+
+def _sketch_text(d: dict) -> str:
+    lines = []
+    p = d.get("plane")
+    if p:
+        named = f' on {d["plane_ref"]}' if d.get("plane_ref") else ""
+        lines.append(f'Plane{named}: origin {p["origin"]}, u-axis {p["u_axis"]}, '
+                     f'normal {p["normal"]}')
+    else:
+        lines.append("Plane: unknown (no plane_frame reported)")
+
+    ents = d.get("entities") or []
+    lines.append(f'Entities ({len(ents)}):')
+    if ents:
+        for e in ents:
+            cons = " [construction]" if e.get("construction") else ""
+            lines.append(f'  {e["id"]} {e["type"]} {e["geom"]} [{e["status"]}]{cons}')
+    else:
+        lines.append("  (none)")
+
+    rel = d.get("relation_counts") or {}
+    dims = d.get("dimensions") or []
+    lines.append("Constraints:")
+    if rel:
+        lines.append("  relations: " + "; ".join(f'{k} x{v}' for k, v in sorted(rel.items())))
+    if dims:
+        dim_txt = []
+        for c in dims:
+            v = c.get("value")
+            vt = "?" if v is None else (f'{v} ({c["expr"]})' if c.get("expr") else f'{v}')
+            dim_txt.append(f'{c["id"]} {c["type"]}={vt}' + (' [ref]' if c.get("driven") else ""))
+        lines.append("  driving dims: " + "; ".join(dim_txt))
+    if not rel and not dims:
+        lines.append("  (none)")
+
+    regs = d.get("regions") or []
+    if regs:
+        parts = []
+        for r in regs:
+            kind = "region" if r.get("is_material", True) else "void"
+            area = f'{r["area"]:.3g} mm\u00b2' if r.get("area") is not None else "?"
+            bx = r.get("bbox")
+            bt = f' {bx["w"]:.3g}\u00d7{bx["h"]:.3g} mm at {bx["at"]}' if bx else ""
+            parts.append(f'R{r.get("index")} {kind} area {area}{bt}')
+        lines.append(f'Regions: {len(regs)} closed loop(s) - ' + "; ".join(parts))
+    else:
+        lines.append("Regions: 0 closed loops")
+
+    lines.append(d.get("verdict", ""))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- A2: describe_scene
+def _iso_dir() -> tuple:
+    vx, vy, vz = 1.0, 1.0, 0.8
+    n = math.sqrt(vx * vx + vy * vy + vz * vz)
+    return (vx / n, vy / n, vz / n)
+
+
+# Scene->camera direction per named view — matches render_part's documented convention
+# (front looks at the -Y face, right at +X, top at +Z; iso is the legacy corner shot).
+_VIEW_DIRS = {
+    "front": (0.0, -1.0, 0.0), "back": (0.0, 1.0, 0.0),
+    "right": (1.0, 0.0, 0.0), "left": (-1.0, 0.0, 0.0),
+    "top": (0.0, 0.0, 1.0), "bottom": (0.0, 0.0, -1.0),
+    "iso": _iso_dir(),
+}
+
+
+def _view_dir(name: str) -> tuple:
+    return _VIEW_DIRS.get(name, _VIEW_DIRS["iso"])
+
+
+def _visible_faces(faces: list, direction: tuple) -> list:
+    """Faces whose signed normal points toward the camera (dot > 0.15) — a face-normal
+    approximation of visibility. OCCLUSION IS NOT MODELED: a face behind another survives this
+    filter if it faces the camera, exactly like a wireframe/normals-only render would show."""
+    dx, dy, dz = direction
+    scored = []
+    for f in faces:
+        n = f.get("normal")
+        if not isinstance(n, list) or len(n) != 3:
+            continue
+        dot = n[0] * dx + n[1] * dy + n[2] * dz
+        if dot > 0.15:
+            scored.append((dot, f))
+    scored.sort(key=lambda t: -t[0])
+    return [f for _, f in scored]
+
+
+def _bbox_str(size) -> str:
+    return (f'{size[0]:.0f}x{size[1]:.0f}x{size[2]:.0f} mm'
+           if isinstance(size, list) and len(size) == 3 else "unknown size")
+
+
+def _scene_caption(doc_id: str, views: list) -> str:
+    """ONE-PARAGRAPH deterministic caption for a render: the view name(s), the part bbox, and
+    the principal visible labelled faces per view — computed from B-rep face normals with NO
+    occlusion modeling. Dependency-free (doc_id + views only) so render_part/contact_sheet can
+    import this straight for their non-vision caption without pulling in the rest of GSL."""
+    try:
+        faces = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}}).get("matches", [])
+    except Exception:  # noqa: BLE001
+        faces = []
+    try:
+        bbox = cb.call("doc_bbox", {"doc_id": doc_id})
+    except Exception:  # noqa: BLE001
+        bbox = {}
+    bbs = _bbox_str(bbox.get("size"))
+    view_names = views or ["iso"]
+    parts = [f'{"/".join(view_names)} view of a {bbs} part.']
+    for name in view_names:
+        vis = _visible_faces(faces, _view_dir(name))
+        labelled = [f'{f.get("sid")}({f.get("side") or f.get("surf")})' for f in vis[:6]]
+        if labelled:
+            more = f' +{len(vis) - 6} more' if len(vis) > 6 else ""
+            parts.append(f'{name}: {", ".join(labelled)}{more}.')
+        else:
+            parts.append(f'{name}: no faces facing the camera.')
+    parts.append("Computed from B-rep normals; occlusion not modeled.")
+    return " ".join(parts)
+
+
 def register_gsl_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def describe_part(doc_id: Optional[str] = None) -> str:
         """Compact, NAMED outline of the part — use INSTEAD of dumping every face on a complex part.
 
-        Returns the bounding box, the feature groups, any detected symmetry/instanced patterns
-        (e.g. "6-fold rotational about +Z" with the blade faces collapsed to one line), the
-        bores/holes and flat faces by side, and a stable `sid` for every addressable face/edge.
+        Returns the bounding box, the feature groups WITH a placement narrative (which face each
+        feature sits on, its offset from the part bbox on the two perpendicular axes, and which
+        other features it touches via adjacency), any detected symmetry/instanced patterns (e.g.
+        "6-fold rotational about +Z" with the blade faces collapsed to one line), the bores/holes
+        and flat faces by side, and a stable `sid` for every addressable face/edge. A feature that
+        owns no surviving faces (fully consumed by a later boolean) is called out explicitly.
         Token cost scales with the number of DISTINCT feature roles, not the raw face count — a
         68-face impeller describes in a few hundred tokens. Drill into one entity with hover(sid).
         """
@@ -191,5 +565,99 @@ def register_gsl_tools(mcp: FastMCP) -> None:
                         return _dumps({"ok": True, "match": m})
             return _dumps({"ok": False, "error": f"no face/edge with sid {sid!r} "
                            "(it may have changed — call describe_part for current sids)"})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def describe_sketch(sketch: str, doc_id: Optional[str] = None) -> str:
+        """Compose a sketch's PLANE, ENTITY roster, CONSTRAINT roster, closed REGIONS and DOF
+        verdict into text — the non-vision equivalent of looking at the sketch overlay.
+
+        sketch: the sketch feature id (e.g. "s1"). Returns {ok, sketch, text, digest} where text
+        has 5 sections: (1) the plane's 3D origin/axes (and which face/datum it's on, if named),
+        (2) one line per entity — id, type, solved coords/dims, [full]/[under]/[over] status,
+        construction flag, (3) constraints grouped by kind with counts, plus driving dimensions
+        listed individually with their authored value, (4) region count with area + bbox per
+        closed loop, (5) a DOF verdict phrased like check_sketch's (fully/under/over-defined).
+
+        Use this instead of render_part when you cannot see images — pair with check_sketch for
+        the same DOF numbers in a smaller payload once you already know the sketch's shape.
+        """
+        try:
+            d = _doc(doc_id)
+            try:
+                overview = cb.call("doc_sketch_overview", {"doc_id": d, "sketch": sketch})
+            except Exception as e:  # noqa: BLE001
+                detail = getattr(e, "detail", None)
+                if isinstance(detail, dict) and detail.get("reason") == "unknown sketch":
+                    return _dumps({"ok": False,
+                                   "error": f"no sketch {sketch!r} "
+                                            "(call get_part for current ids)"})
+                raise
+            try:
+                regions_resp = cb.call("doc_sketch_regions", {"doc_id": d, "sketch": sketch})
+            except Exception:  # noqa: BLE001
+                regions_resp = {}
+            feat = None
+            try:
+                tree = cb.call("doc_tree", {"doc_id": d})
+                for f in ((tree.get("tree") or {}).get("features")) or []:
+                    if isinstance(f, dict) and f.get("id") == sketch:
+                        feat = f
+                        break
+            except Exception:  # noqa: BLE001
+                feat = None
+            digest = _sketch_digest(sketch, overview, regions_resp, feat)
+            return _dumps({"ok": True, "sketch": sketch, "text": _sketch_text(digest),
+                           "digest": digest})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def describe_scene(views: Optional[list] = None, doc_id: Optional[str] = None) -> str:
+        """Deterministic "what the render would show" per view, from B-rep face normals — the
+        non-vision fallback for render_part/contact_sheet.
+
+        views: named views to describe, default ["front", "right", "top", "iso"] (same names
+        render_part accepts). For each view: the camera direction, then every face whose signed
+        normal points toward the camera (dot > 0.15) as "sid surf side r<radius>/area" (capped at
+        20/view). Also includes the part-level narrative once at the top (bbox + the A3 feature
+        placement lines from describe_part). OCCLUSION IS NOT MODELED — a face behind another
+        still lists if it faces the camera; this is stated explicitly in the returned text.
+
+        Returns {ok, text, views:{<name>: {dir, visible:[sids]}}}.
+        """
+        try:
+            d = _doc(doc_id)
+            view_names = views or ["front", "right", "top", "iso"]
+            faces = cb.call("doc_query", {"doc_id": d, "query": {"of": "face"}}).get(
+                "matches", [])
+            digest = _digest(d)
+            bbs = _bbox_str(digest.get("bbox_mm"))
+
+            lines = [f'Part "{digest.get("part") or "part"}" — bbox {bbs}, '
+                    f'{digest["faces"]} face(s), {len(digest.get("feature_groups") or [])} '
+                    'feature(s)']
+            if digest.get("feature_groups"):
+                lines.append("Feature placement:")
+                for fg in digest["feature_groups"]:
+                    lines.append(f'  - {_feature_group_line(fg)}')
+
+            views_out = {}
+            for name in view_names:
+                direction = _view_dir(name)
+                vis = _visible_faces(faces, direction)
+                lines.append(f'{name} view — part {bbs} '
+                             f'(camera dir [{direction[0]:.2f}, {direction[1]:.2f}, '
+                             f'{direction[2]:.2f}]):')
+                for f in vis[:20]:
+                    dims = f'r{f["radius"]}' if f.get("radius") else f'{f.get("area_or_len")}mm\u00b2'
+                    lines.append(f'  {f.get("sid")} {f.get("surf")} {f.get("side") or "-"} {dims}')
+                if len(vis) > 20:
+                    lines.append(f'  +{len(vis) - 20} more')
+                views_out[name] = {"dir": list(direction), "visible": [f.get("sid") for f in vis]}
+
+            lines.append("Computed from B-rep normals; occlusion not modeled.")
+            return _dumps({"ok": True, "text": "\n".join(lines), "views": views_out})
         except Exception as e:  # noqa: BLE001
             return _err(e)

@@ -65,7 +65,11 @@ static const Command T[] = {
 { "eval_check",           "Check",           "check",          W::Model,    G::Inspect,   K::Top,      nullptr,           "geometry validity" },
 { "eval_interference",    "Interference",    "interference",   W::Model,    G::Inspect,   K::Flyout,   "eval_check",      "clash" },
 { "eval_geometry",        "Geometry Anlys",  "check",          W::Model,    G::Inspect,   K::Flyout,   "eval_check",      nullptr },
+{ "eval_feature_overlap",  "Feature Overlap", "interference",   W::Model,    G::Inspect,   K::Flyout,   "eval_check",      "feature overlap boss cut swallowed clash" },
 { "prof_toggle",          "Profiler",        "results",        W::Model,    G::Inspect,   K::Top,      nullptr,           "performance sampling" },
+
+{ "ai_reverse_engineer",  "Reverse Engineer","ai_design",      W::Model,    G::AI,        K::Top,      nullptr,           "reverse engineer import parametric rebuild editable" },
+{ "ai_explain_part",      "Explain Part",    "ai_design",      W::Model,    G::AI,        K::Top,      nullptr,           "describe explain geometry text" },
 
 { "appearance_edit",      "Appearance",      "material",       W::Model,    G::Appearance, K::Top,    nullptr,           "color material finish texture realview render swatch" },
 { "view_style",           "Display",         "section_props",  W::Model,    G::Appearance, K::Top,    nullptr,           "shaded wireframe edges display style hidden" },

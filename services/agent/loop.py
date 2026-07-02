@@ -573,6 +573,24 @@ def _feedback_ok(res: "ModelResult | AssemblyResult") -> str:
     return head + (f"\nstdout:\n{out}" if out else "") + tail
 
 
+def _no_vision_note(res: "ModelResult | AssemblyResult") -> str:
+    """Guidance appended ONLY for non-vision providers in place of the render: no image
+    is coming this turn, so point the model at the numeric substitutes already present
+    in `_feedback_ok`'s digest instead of letting it guess from a picture it can't see."""
+    msg = ("\n(No image available - this model does not receive renders, so judge the "
+           "build from the numbers above, not a picture. The face histogram (planar vs. "
+           "cylindrical count) is your only evidence for round features like holes or "
+           "bosses; the bounding box and fill % are your only evidence for proportions "
+           "and hollowness.")
+    if getattr(res, "is_assembly", False):
+        msg += (" For an assembly, the FIT REPORT above is your only evidence of "
+                "interference or clearance between parts - treat any listed overlap as "
+                "real unless it is an intended press-fit.")
+    msg += (" Confirm every feature the request named has a matching entry in these "
+            "numbers before declaring done.)")
+    return msg
+
+
 def _feedback_err(res: ModelResult, can_revert: bool = False) -> str:
     msg = (
         "Build FAILED. Fix the script and return a corrected ```python block.\n"
@@ -967,8 +985,8 @@ def run_turn(session: Session, request: str, provider: Provider,
                 feedback = [text_part(_feedback_ok(res)), image_part(sheet_i),
                             text_part(prompt_text)]
             else:
-                feedback = [text_part(_feedback_ok(res) + "\n(No image available - judge from "
-                                      "the dimensions and your own reasoning.)\n" + prompt_text)]
+                feedback = [text_part(_feedback_ok(res) + _no_vision_note(res) +
+                                      "\n" + prompt_text)]
             session.messages.append(user(feedback))
         else:
             fail_streak += 1

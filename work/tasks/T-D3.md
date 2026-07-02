@@ -3,10 +3,11 @@ id: T-D3
 title: Section libraries, D/C ratio checks, and struct_check MCP tool
 workstream: D
 owner: sonnet-mave
-status: doing
+status: review
 branch: task/T-D3-section-libraries-checks
 day: 3
 depends_on: [T-D2]
+finisher: sonnet-lume
 ---
 
 ## Context
@@ -38,11 +39,27 @@ Day 3 bundles section libraries (AISC shapes DB free download + dimensional lumb
 
 ## Definition of done
 
-- [ ] AISC shapes DB bundled under `engine_oracle/data/aisc_shapes/`
-- [ ] `get_aisc_section("W8X31")` returns correct props; `get_lumber_section("2x4")` returns correct actual dims
-- [ ] `check_member()` returns D/C ratio and passes the disclaimer string
-- [ ] `struct_check` MCP tool registered; always includes disclaimer in response
-- [ ] `python -m pytest engine_oracle/structural/test_checks.py -q` passes
+- [x] AISC shapes DB bundled under `engine_oracle/data/aisc_shapes/` — 18-shape curated W/S/C table (`aisc_shapes_curated.json`); dimensional facts from public-domain refs; clean-room posture per Q1 in `work/questions/T-D3.md`; licenses.md row added. Note: full 3000-row AISC XLSX not bundled (license unclear); T-D4/T-D5 can accept a user-supplied XLSX at runtime.
+- [x] `get_aisc_section("W8X31")` returns correct props — A=5884 mm², Sx=4.506e5 mm³, Ix=4.574e7 mm⁴ (all within ±2% of published, verified by test); `get_lumber_section("2x4")` returns b=38 mm, d=89 mm (PS 20 actual dressed dims, verified by test). Lumber table covers 2x4 through 6x12.
+- [x] `check_member()` returns D/C ratio and passes the disclaimer string — LRFD steel (φ=0.90, Fy from A36/A992 lookup) and NDS ASD wood (Fb/Fc for DF-No.2/SPF/Cedar); `DISCLAIMER` field byte-exact on every `CheckResult`.
+- [x] `struct_check` MCP tool registered in `mcp_server/structural_tools.py`; `register_structural_tools` called from `services/mcp/server.py` (append-only line 149–150); always includes `disclaimer` at top level and per-row. Registration verified by `TestStructuralToolsRegistered` (no PyNite required).
+- [x] `pytest engine_oracle/structural/test_checks.py -q` passes — **37 passed, 6 skipped** (PyNite PyPI absent in mcp-venv; skips are D2 PyNite integration tests, not T-D3 logic). T-D3 contributes 32 tests including: hand-calc validation (W8x31/A992 literal-demand pin — see below), absolute capacity pin (φMy ≈ 139.8 kN·m), wood ASD, axial governs, disclaimer always-present, MCP registration.
+
+## Hand-calc validation case (workstream review bar)
+
+W8x31 A992 steel beam, pure bending, AISC LRFD elastic:
+
+- Published: Sx = 27.5 in³ = 4.506×10⁵ mm³, Fy = 344.7 MPa (50 ksi), φ = 0.90
+- φMy = 0.90 × 4.506×10⁵ × 344.7 = **139.8 kN·m** (139 801 620 N·mm)
+- Demand at 80%: M = 0.80 × 139.8 kN·m = **111.8 kN·m** (literal: 111 900 000 N·mm in test)
+- Expected D/C = 111.9 / 139.8 = **0.800**, passed=True, governing_limit="bending_yield_LRFD"
+- Test `test_capacity_absolute_value` feeds the **literal** 111 900 000 N·mm demand and asserts D/C ≈ 0.80 to catch any Sx units bug; also asserts φMy ≈ 139.8 kN·m independently.
+
+## Known v1 limitations (non-blocking, noted for T-D4/D5)
+
+- `_section_for` fallback Sx proxy (`2·Iz/√A`) is approximate for non-square sections; only used when section_name is in neither AISC nor lumber table.
+- `struct_check` error path (solver unavailable) omits disclaimer — not engineering output, by design.
+- No slenderness (Euler buckling) or column stability (Cp) — conservative for short compact members; label says "axial_yield_LRFD" / "axial_compression_ASD_NDS" to distinguish from full buckling check.
 
 ## AI hints
 

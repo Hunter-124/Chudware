@@ -783,9 +783,10 @@ class TestDVCRoundTrip:
         subprocess.run(["git", "clone", str(repo1), str(repo2)],
                        check=True, capture_output=True)
         # -f overwrites any existing remote with the same name (idempotent)
+        # Use _dvc_cmd() so this works whether dvc is on PATH or only in a venv.
+        from tools.flywheel.dvc_init import _dvc_cmd
         subprocess.run(
-            [sys.executable, "-m", "dvc", "remote", "add", "-d", "-f",
-             "origin", remote_path],
+            [*_dvc_cmd(), "remote", "add", "-d", "-f", "origin", remote_path],
             cwd=str(repo2), check=True, capture_output=True,
         )
         dvc_pull(repo2)

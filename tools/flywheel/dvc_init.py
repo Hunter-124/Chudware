@@ -26,6 +26,7 @@ Usage (CLI):
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -46,9 +47,21 @@ def _run(cmd: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedP
     )
 
 
+def _dvc_cmd() -> list[str]:
+    """Return the DVC invocation prefix.
+
+    Prefers the ``dvc`` binary on PATH (works even when DVC is not installed in
+    the active venv, e.g. the mcp-venv).  Falls back to ``sys.executable -m dvc``
+    so the function degrades gracefully when only the Python package is present.
+    """
+    if shutil.which("dvc"):
+        return ["dvc"]
+    return [sys.executable, "-m", "dvc"]
+
+
 def _dvc(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
     """Invoke DVC CLI via subprocess (GPL-clean subprocess isolation)."""
-    return _run([sys.executable, "-m", "dvc", *args], cwd=cwd, check=check)
+    return _run([*_dvc_cmd(), *args], cwd=cwd, check=check)
 
 
 def _git(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess:

@@ -3,7 +3,7 @@ id: T-D2
 title: PyNite integration - member forces and deflections
 workstream: D
 owner: opus-dawn
-status: doing
+status: review
 branch: task/T-D2-pynite-integration
 day: 2
 depends_on: [T-D1]

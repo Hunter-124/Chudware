@@ -6,9 +6,13 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <utility>
 #include <mutex>
 #include <unordered_map>
+
+namespace fs = std::filesystem;
 
 #include "cam/feeds.h"
 #include "cam/model.h"
@@ -50,10 +54,28 @@ CamSession& must(const std::string& doc_id) {
     return it->second;
 }
 
+// Flush the bounded undo stack to a per-doc telemetry journal next to the .step+ file.
+// Called after snapshot() on every mutating op so the ops journal survives restart.
+// Journal path: <doc_path>.cam_journal.jsonl (next to the .step+, NOT inside it).
+// Format: one JSON per line, each entry is a revision snapshot.
+// Best-effort: ignore all IO errors (mirrors the events.cpp pattern).
+static void flush_cam_journal(const CamSession& s) {
+    if (s.path.empty()) return;  // unsaved doc — nothing to persist yet
+    try {
+        fs::path journal = fs::path(s.path).replace_extension("").string() + ".cam_journal.jsonl";
+        std::ofstream fh(journal, std::ios::binary | std::ios::trunc);
+        if (!fh) return;
+        for (const auto& snap : s.undo) {
+            fh << snap.dump() << "\n";
+        }
+    } catch (...) {}  // best-effort
+}
+
 void snapshot(CamSession& s) {
     s.undo.push_back(s.job.to_json());
     if (s.undo.size() > 50) s.undo.erase(s.undo.begin());
     s.redo.clear();
+    flush_cam_journal(s);
 }
 
 // compact tree view for the GUI / agent

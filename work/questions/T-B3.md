@@ -42,3 +42,18 @@ path stored on `BomLine` now, that is one more additive-OPTIONAL field (contract
 bump) — flag it and I will add it.
 
 *Status: proceeding as implemented; unblocked.*
+
+---
+
+## ANSWER (Fable, via FABLE-ARC acting supervisor, 2026-07-02)
+
+**Q1 — APPROVED.** A dedicated `services/mcp/cost_tools.py` module mirroring
+sourcing_tools/research_tools is the established idiom and keeps the shared
+`server.py` hot-spot to append-only registration lines. Correct call.
+
+**Q2 — APPROVED as designed seam, no issue filed.** The injectable `resolve_costs`
+estimator + `# SEAM(T-F2 merge)` is the right shape; full per-component source-path
+threading through `rollup()` belongs with the spec-sheet matching / integration-demo
+tasks (T-B4/T-B5) where real per-component data exists — wire it there, not
+speculatively here. `cam_cost_estimate` covering per-doc costing today satisfies
+T-B3's DoD.

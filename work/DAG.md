@@ -11,84 +11,84 @@ graph TD
   classDef blocked fill:#f5c6c6,stroke:#c0504d,color:#5e1f1d
   classDef backlog fill:#f4f0fa,stroke:#b0a3c9,color:#4a3d63,stroke-dasharray: 4 3
   subgraph WS_A["workstream A"]
-    T_A1["T-A1: Freeze dag_schema.md and scaffold services/dag/"]:::todo
+    T_A1["T-A1: Freeze dag_schema.md and scaffold services/dag/"]:::doing
     T_A2["T-A2: Node runner with context packs and dag_planner prompt"]:::todo
     T_A3["T-A3: Human-in-the-loop gate nodes and autonomy dial"]:::todo
     T_A4["T-A4: Verify nodes and DAG MCP tools"]:::todo
     T_A5["T-A5: Integration day - run demo mission end-to-end"]:::todo
   end
   subgraph WS_B["workstream B"]
-    T_B1a["T-B1a: Freeze sourcing_schema.md and extend VendorPart schema"]:::todo
-    T_B1b["T-B1b: Nexar, Digi-Key, and Mouser provider implementations"]:::todo
-    T_B2["T-B2: BOM rollup with bom_rollup and bom_price MCP tools"]:::todo
-    T_B3["T-B3: Cost model (material + machining) and quote-out tools"]:::todo
-    T_B4["T-B4: Spec-sheet matching v1 - deterministic BOLTS/KiCad lookup"]:::todo
+    T_B1a["T-B1a: Freeze sourcing_schema.md and extend VendorPart schema"]:::doing
+    T_B1b["T-B1b: Nexar, Digi-Key, and Mouser provider implementations"]:::doing
+    T_B2["T-B2: BOM rollup with bom_rollup and bom_price MCP tools"]:::review
+    T_B3["T-B3: Cost model (material + machining) and quote-out tools"]:::doing
+    T_B4["T-B4: Spec-sheet matching v1 - deterministic BOLTS/KiCad lookup"]:::doing
     T_B5["T-B5: Spec-sheet matching v2 - AI path from datasheet and integration demo"]:::todo
   end
   subgraph WS_C["workstream C"]
-    T_C1["T-C1: firmware_rpc.md contract and engine/firmware/ scaffold"]:::doing
+    T_C1["T-C1: firmware_rpc.md contract and engine/firmware/ scaffold"]:::review
     T_C2["T-C2: Compile loop and pin-map header from ECAD netlist"]:::todo
     T_C3["T-C3: Emulation loop via Renode with fw_sim_run MCP tool"]:::todo
     T_C4["T-C4: Hardware path - probe-rs flash/debug and clangd LSP tools"]:::todo
     T_C5["T-C5: firmware.md agent prompt and demo firmware in Renode"]:::todo
   end
   subgraph WS_D["workstream D"]
-    T_D1["T-D1: structural_schema.md contract and engine/structural/ scaffold"]:::doing
+    T_D1["T-D1: structural_schema.md contract and engine/structural/ scaffold"]:::review
     T_D2["T-D2: PyNite integration - member forces and deflections"]:::todo
     T_D3["T-D3: Section libraries, D/C ratio checks, and struct_check MCP tool"]:::todo
     T_D4["T-D4: Code compliance - agentic RAG and deterministic rule engine"]:::todo
     T_D5["T-D5: Cost takeoff and struct_estimate MCP tool with integration demo"]:::todo
   end
   subgraph WS_E["workstream E"]
-    T_E1["T-E1: Piping module scaffold + fitting catalog"]:::todo
-    T_E2["T-E2: 1D pipe network solver + pressure drop"]:::todo
-    T_E3["T-E3: Gas/heat networks + fluid properties"]:::todo
-    T_E4["T-E4: 3D CFD handoff for pipe internals"]:::todo
-    T_E5["T-E5: Oil-hydraulic circuit design (ISO 1219)"]:::todo
+    T_E1["T-E1: Piping module scaffold + fitting catalog"]:::doing
+    T_E2["T-E2: 1D pipe network solver + pressure drop"]:::doing
+    T_E3["T-E3: Gas/heat networks + fluid properties"]:::doing
+    T_E4["T-E4: 3D CFD handoff for pipe internals"]:::doing
+    T_E5["T-E5: Oil-hydraulic circuit design (ISO 1219)"]:::doing
   end
   subgraph WS_F["workstream F"]
-    T_F1["T-F1: Freeze research_tools contract, scaffold engine/research with web_search + fetch_page"]:::todo
-    T_F10["T-F10: gsl-ser/v1 serialization freeze + slot-fidelity eval harness + dataset factory"]:::todo
+    T_F1["T-F1: Freeze research_tools contract, scaffold engine/research with web_search + fetch_page"]:::doing
+    T_F10["T-F10: gsl-ser/v1 serialization freeze + slot-fidelity eval harness + dataset factory"]:::doing
     T_F11["T-F11: Translator SFT v0 + GRPO groundedness polish + local serving"]:::todo
     T_F12["T-F12: dag_replan, workflow templates, and the design_review verify battery"]:::todo
-    T_F13["T-F13: Micro-evaluator 1 - feature-recognition hypothesis ranker"]:::todo
-    T_F14["T-F14: Deliverables contract + services/deliverables scaffold with OSS engines"]:::todo
-    T_F15["T-F15: Engineering deliverable templates v1 with provenance joins"]:::todo
-    T_F16["T-F16: Universal in-app preview pane + Copilot artifact cards"]:::todo
+    T_F13["T-F13: Micro-evaluator 1 - feature-recognition hypothesis ranker"]:::doing
+    T_F14["T-F14: Deliverables contract + services/deliverables scaffold with OSS engines"]:::doing
+    T_F15["T-F15: Engineering deliverable templates v1 with provenance joins"]:::doing
+    T_F16["T-F16: Universal in-app preview pane + Copilot artifact cards"]:::doing
     T_F17["T-F17: Mission-control UX - live plan/action stream, steer-anytime, design-brief flow"]:::todo
-    T_F2["T-F2: Research source helpers v1 + unified material registry seed"]:::todo
-    T_F3["T-F3: Freeze interaction contract - ask_user core, in-app dialog, MCP elicitation"]:::todo
+    T_F2["T-F2: Research source helpers v1 + unified material registry seed"]:::doing
+    T_F3["T-F3: Freeze interaction contract - ask_user core, in-app dialog, MCP elicitation"]:::doing
     T_F4["T-F4: Migrate intake, clarify, and DAG gates onto the interaction contract"]:::todo
-    T_F5["T-F5: Image ingestion v1 - real files, provider image slots, fiducial metrology"]:::todo
-    T_F6["T-F6: Guided multi-photo capture, phone handoff, photogrammetry to reverse_engineer"]:::todo
-    T_F7["T-F7: Freeze narration contract + describe_toolpaths + describe_results"]:::todo
-    T_F8["T-F8: describe_assembly, describe_board (GSL promotion), describe_project"]:::todo
-    T_F9["T-F9: Providers contract, tool registry/allow-listing, session-auth spike"]:::todo
+    T_F5["T-F5: Image ingestion v1 - real files, provider image slots, fiducial metrology"]:::doing
+    T_F6["T-F6: Guided multi-photo capture, phone handoff, photogrammetry to reverse_engineer"]:::doing
+    T_F7["T-F7: Freeze narration contract + describe_toolpaths + describe_results"]:::review
+    T_F8["T-F8: describe_assembly, describe_board (GSL promotion), describe_project"]:::doing
+    T_F9["T-F9: Providers contract, tool registry/allow-listing, session-auth spike"]:::doing
   end
   subgraph WS_G["workstream G"]
     T_G1["T-G1: Land the uncommitted GUI working tree in scoped commits"]:::done
     T_G10["T-G10: ShopCraft rename tiers 2+3 - build targets, env vars, MCP id, appdata"]:::todo
     T_G11["T-G11: Windows build verify, then delete host/ and all deprecated GUI code"]:::todo
     T_G12["T-G12: Human UI walkthrough - element-by-element feedback checklist"]:::todo
-    T_G2["T-G2: Restore doc-tab input, shrink Copilot header, PM button contrast"]:::todo
+    T_G2["T-G2: Restore doc-tab input, shrink Copilot header, PM button contrast"]:::doing
     T_G3["T-G3: ShopCraft rename tier 1 - user-visible branding strings"]:::todo
-    T_G4["T-G4: GUI dead-code and cleanliness pass on host/"]:::todo
-    T_G5["T-G5: GUI migration wave 1 - foundation libs (F1-F4 + G1 gate)"]:::todo
+    T_G4["T-G4: GUI dead-code and cleanliness pass on host/"]:::doing
+    T_G5["T-G5: GUI migration wave 1 - foundation libs (F1-F4 + G1 gate)"]:::review
     T_G6["T-G6: GUI migration wave 2 - shell chrome (S1-S6, H5 start, G2 gate)"]:::todo
     T_G7["T-G7: GUI migration wave 3 - core panels (C1-C6, G3 gate)"]:::todo
     T_G8["T-G8: GUI migration wave 4 - hard subsystems (H1-H5, G4 gate)"]:::todo
     T_G9["T-G9: GUI migration wave 5 - polish, parity battery, cutover (P1, P2, G5)"]:::todo
   end
   subgraph WS_H["workstream H"]
-    T_H1["T-H1: Telemetry contract - AI-artifact envelope, accept/edit/reject capture, consent tiers"]:::todo
+    T_H1["T-H1: Telemetry contract - AI-artifact envelope, accept/edit/reject capture, consent tiers"]:::review
     T_H10["T-H10: Offline VLM track v0 - base pick eval, synthetic render corpus, render-grounded RL"]:::todo
     T_H11["T-H11: Regen-error diagnosis (IP-18) - frontier ship with logging, corruption corpus, migration gate"]:::todo
-    T_H2["T-H2: Canonical doc serialization policy + semantic doc_diff tool"]:::todo
-    T_H3["T-H3: Requirements layer - freeze aicad.req/1 schema + requirements doc CRUD"]:::todo
-    T_H4["T-H4: Verifier battery API + gap verifiers (groundedness, manifold, unit sanity, dim coverage)"]:::todo
-    T_H5["T-H5: Training data store - consent-filtered exporter, DVC versioning, Argilla audit gate"]:::todo
+    T_H2["T-H2: Canonical doc serialization policy + semantic doc_diff tool"]:::doing
+    T_H3["T-H3: Requirements layer - freeze aicad.req/1 schema + requirements doc CRUD"]:::doing
+    T_H4["T-H4: Verifier battery API + gap verifiers (groundedness, manifold, unit sanity, dim coverage)"]:::doing
+    T_H5["T-H5: Training data store - consent-filtered exporter, DVC versioning, Argilla audit gate"]:::doing
     T_H6["T-H6: Fleet training runner - claim-based job queue, cross-OS profiles, MLflow tracking"]:::todo
-    T_H7["T-H7: Frontier-API logging middleware + shadow-mode comparison harness"]:::todo
+    T_H7["T-H7: Frontier-API logging middleware + shadow-mode comparison harness"]:::doing
     T_H8["T-H8: Product-task eval benchmark suite (elicitation, spec->sketch, regen-fix, CAM, VLM)"]:::todo
     T_H9["T-H9: Adapter serving - vLLM per-task LoRA routing, canary rollout, rollback story"]:::todo
   end

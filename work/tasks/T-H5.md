@@ -2,8 +2,8 @@
 id: T-H5
 title: Training data store - consent-filtered exporter, DVC versioning, Argilla audit gate
 workstream: H
-owner: unassigned
-status: todo
+owner: sonnet-bree
+status: doing
 branch: task/T-H5-training-data-store
 day: 12
 depends_on: [T-H1]

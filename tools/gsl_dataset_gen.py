@@ -382,7 +382,6 @@ def _sample_domain(rng: random.Random) -> str:
 def make_pair(domain: str, rng: random.Random, paraphraser) -> Optional[dict]:
     """One (serialization, caption) training pair for `domain`, paraphrased + re-verified.
     Returns None (dropped) if the re-check fails — never emit an unverified pair."""
-    import re as _re  # noqa: PLC0415,F401 (paraphraser uses module-level re)
     from tools.translator import gsl_ser as _g  # noqa: PLC0415
 
     if domain in _STATE_GENS:
@@ -447,8 +446,10 @@ def _set_by_path(state: dict, path: str, value) -> None:
     elif segs[0] == "feat":
         for fg in state.get("feature_groups", []):
             if fg.get("name") == segs[1] or fg.get("id") == segs[1]:
-                (fg.setdefault("params", {}))[segs[2]] = value if segs[2] != "faces" \
-                    else fg.__setitem__("faces", value)
+                if segs[2] == "faces":
+                    fg["faces"] = value
+                else:
+                    fg.setdefault("params", {})[segs[2]] = value
     elif segs[0] == "cam" and len(segs) >= 4:
         for op in state.get("cam", {}).get("ops", []):
             if op.get("name") == segs[2] or op.get("id") == segs[2]:

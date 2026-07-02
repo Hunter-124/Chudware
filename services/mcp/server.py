@@ -82,6 +82,10 @@ register_cam_tools(mcp)
 # Doc diff — semantic feature-level diff between two document revisions (T-H2).
 from mcp_server.doc_diff_tools import register_doc_diff_tools
 register_doc_diff_tools(mcp)
+# Requirements (aicad.req/1): CRUD + markdown projection for design briefs.
+# Schema: contracts/requirements.md  Brain: engine_oracle/requirements/requirements.py
+from mcp_server.req_tools import register_req_tools
+register_req_tools(mcp)
 
 
 def _install_clean_stdout():

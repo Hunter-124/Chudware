@@ -6,6 +6,7 @@ owner: unassigned
 status: backlog
 branch: task/T-BL09-requirements
 depends_on: []
+superseded_by: T-H3
 ---
 
 ## Context

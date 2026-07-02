@@ -850,3 +850,29 @@ Model Tree + liquid-glass + Copilot, 1600×1000). **Blocker filed:** `work/quest
 (team-wide, not T-G5-specific). **Gotcha:** headless `--shot` works without xvfb on this box
 (offscreen GL); the "known selMulti gate break" is not a seam-file gap — it is C2's
 `property_manager.cpp` having shipped without its `panel_spec` counterpart.
+
+### T-G6 — wave 2 shell chrome verify-and-close (G2 gate) — 2026-07-03 (opus-gale)
+Verify-and-close of the Wave-2 shell chrome (S1–S6 + H5 milestone + G2 gate). The prior
+overhaul workflow had already ported all of S1–S6/H5/G2 to master (paragraphs above); this
+task changed **zero code** (branch = `origin/master` + claim commit) and instead built
+AI-CAD2 from master and eyeball-verified each DAG verify scenario against the AI hints.
+**Build:** `cmake --preset linux-app` → `bin/AI-CAD2` links clean; `--selftest` OK.
+**Renders (scratch/tg6-shots/, gitignored):** `ribbon` (full Model ribbon, all cmds+glyphs,
+group labels), `ribbon`+`AI_CAD_TAB=1` (sketch-context ribbon Line/Rect/…/Exit Sketch,
+"Sketch1"/"Fully Defined"), `explorer` (Files tab: Recent/Workspace tree), `settings`
+(Settings modal General/AI/Prompts/Advanced/Experimental), `tree` (real worker-built
+Base/Fillet/Shell FM tree). All show glass transparent columns w/ per-element pills,
+doc-tab band inside viewport, ShopCraft branding, "Engine live (WorkerClient, rev 3)".
+**S1** dock+rail (Model Tree↔Files switch) ✓; **S2** doc-tab band ✓ (multi-tab population
+blocked by deadlock below); **S3** ribbon + `AI_CAD_TAB` ✓✓; **S4** status bar + toast +
+palette + settings search seam ✓; **S5** atlas glyphs render (real, no fallback boxes) ✓;
+**S6** explorer + settings ✓; **H5** compiles ✓ + sketch chrome/DOF solver live ✓ (2D
+entity-overlay shot blocked by deadlock). **Systemic pre-existing finding:** ScenarioRunner
+*step-machine* scenarios (`sketch`/`multidoc`/`m1`/`fea`/`cam`/`flow`/`drawing`/`asm`/
+`activity`/`evalmass`) deadlock offscreen on a mid-loop `DocMirror::newPart(worker)`; the
+shot loop ignores `--frames` for these and waits for scenario completion → `timeout` exit 124,
+no PNG. Worker **one-shots** (`tree`/`equations`/`ecad`) capture fine. F4/C6 worker-seam
+scope, filed in `work/questions/T-G6.md`; does not block wave-2 shell chrome. **Gate:** core/
+ui-abstract/ctest/ui-imgui pass; check.py `feature_surface_audit`+`parity_audit` FAIL are the
+known pre-existing reds (host-era ribbon manifest / absent SW_PARITY_SPEC). **Touched:** none
+(code); docs/task/question files only.

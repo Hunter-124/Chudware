@@ -270,13 +270,15 @@ def register_cam_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def cam_simulate(setup_id: Optional[str] = None, resolution: float = 0.5,
-                     check_gouge: bool = True, check_rapid: bool = True) -> str:
-        """Material-removal simulation: removed/remaining volume, machined fraction, gouge and
-        rapid-through-stock checks, and estimated cycle time per setup."""
+                     check_gouge: bool = True, check_rapid: bool = True,
+                     check_holder: bool = False) -> str:
+        """Material-removal simulation: removed/remaining volume, machined fraction, gouge,
+        rapid-through-stock, and holder/shank collision checks, and estimated cycle time per
+        setup. check_holder is off by default (needs tool shank/holder geometry to flag)."""
         try:
             params: dict = {"doc_id": _job(),
                             "options": {"resolution": resolution, "check_gouge": check_gouge,
-                                        "check_rapid": check_rapid}}
+                                        "check_rapid": check_rapid, "check_holder": check_holder}}
             if setup_id:
                 params["setup_id"] = setup_id
             return _dumps(cb.call("cam_simulate", params))

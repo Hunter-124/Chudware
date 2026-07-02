@@ -3,7 +3,7 @@ id: T-M1
 title: CAM overhaul: fix critical post-processor correctness (C++)
 workstream: M
 owner: opus-iron
-status: doing
+status: review
 branch: task/T-M1-cam-overhaul
 day: 1
 priority: 1
@@ -24,12 +24,41 @@ lathe posts.
 
 ## Definition of done
 
-- [ ] Canned-cycle drill points transformed through op WCS (audit D2 repro fixed)
-- [ ] `G54.1 P<n>` emitted when wcs.offset_sub > 0 (D4)
-- [ ] `G50 S<max_turn_rpm>` before `G96` on lathe dialects (D9)
-- [ ] Post tests with actual content assertions for all 8 dialects (Haas, Mach3,
+- [x] Canned-cycle drill points transformed through op WCS (audit D2 repro fixed)
+- [x] `G54.1 P<n>` emitted when wcs.offset_sub > 0 (D4)
+- [x] `G50 S<max_turn_rpm>` before `G96` on lathe dialects (D9)
+- [x] Post tests with actual content assertions for all 8 dialects (Haas, Mach3,
       Siemens, Centroid at minimum get new asserts)
-- [ ] core build + ctest green; `graphify update .`
+- [x] core build + ctest green; `graphify update .`
+
+## DONE (opus-iron, 2026-07-02)
+
+Commit `0270230` on `task/T-M1-cam-overhaul`. Scope held to post.cpp + post.h + test_cam.cpp.
+
+**D2 (per-op WCS transform).** Added `to_wcs_local(WCS,Vec3) = Rᵀ·(p−origin)` and apply it
+to each canned-cycle drill point when the op has a WCS override. Identity when no override
+(single-fixture jobs byte-unchanged) — guarded by a dedicated no-op regression test.
+
+**D4 (extended offsets).** Work-offset emit now reads the resolved WCS (`op->wcs` else
+`setup.wcs`) and emits `G<reg>.1 P<sub>` when `offset_sub>0`, else the plain register.
+
+**D9 (lathe CSS clamp).** Emit `css_clamp S<max_turn_rpm>` before `css_on S<css>`. Added
+`PostConfig.css_clamp` (default `G50`) so a dialect can name a different clamp word (e.g.
+Siemens `LIMS`); empty word suppresses the line without dropping G96. Also wired
+`lathe`/`diameter_mode`/`css_clamp`/`css_on`/`css_off` through the post override JSON
+(`from_json` + the selective apply in `post_setup`) since all 8 presets are mills — this is
+how a lathe post is driven and tested.
+
+**Tests (append-only, +8 cases / ~147 lines).** D2 transform + D2 no-op, D4 extended offset,
+D9 clamp-before-G96 (with ordering assert) + configurable clamp word, and content assertions
+for Haas / Mach3 / Siemens / Centroid (GRBL/Fanuc/LinuxCNC/Marlin already had content tests →
+all 8 dialects now content-asserted).
+
+**Verified.** `test_cam` 60/60 (3528 assertions); full core ctest 18/18 green (no-OCCT build).
+`graphify update .` run. Note: `scripts/gate.sh` also run (OCCT build) — see final summary.
+
+Not in scope (other M-tasks / audit §3.2+): trochoidal adaptive (T-M2), holder sim (T-M3),
+feeds-registry fold (T-M4), extract hole kinds (T-M5), pocket entry + arc sim (T-M6).
 
 ## Driver notes (Fable)
 

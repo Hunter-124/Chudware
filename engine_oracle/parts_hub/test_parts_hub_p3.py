@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-_REPO = Path(__file__).resolve().parent.parent.parent.parent
+_REPO = Path(__file__).resolve().parent.parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
@@ -99,8 +99,9 @@ class TestPlaceCoreFamily:
         assert r["doc_id"] is not None
 
     @needs_core
-    def test_place_bearing_6205(self):
-        r = _place("bearing:ISO 15:6205")
+    def test_place_bearing_608(self):
+        """Place a deep-groove ball bearing (608) into a new mech doc via parts_make."""
+        r = _place("bearing:ISO 15:608")
         assert r["ok"] is True, f"part_place failed: {r.get('reason')}"
         assert r["editable"] is True
 
@@ -287,7 +288,7 @@ class TestDedupeRelatedIds:
     def test_no_overlap_passthrough(self):
         from engine_oracle.parts_hub.hub import _dedupe_related
         recs = self._make_records([
-            ("fastener", "M8", "fastener:ISO4762:M8"),
+            ("fastener", "M8", "fastener:ISO 4762:M8"),
             ("bearing",  "6205", "bearing:ISO 15:6205"),
         ])
         result = _dedupe_related(list(recs))
@@ -296,7 +297,7 @@ class TestDedupeRelatedIds:
     def test_overlap_injects_related_ids(self):
         from engine_oracle.parts_hub.hub import _dedupe_related
         recs = self._make_records([
-            ("fastener",   "M8", "fastener:ISO4762:M8"),
+            ("fastener",   "M8", "fastener:ISO 4762:M8"),
             ("mech_family","M8", "mech_family:shcs:M8"),
         ])
         result = _dedupe_related(list(recs))
@@ -314,7 +315,7 @@ class TestDedupeRelatedIds:
         # mech_family first in input — fastener must be promoted.
         recs = self._make_records([
             ("mech_family", "M8", "mech_family:shcs:M8"),
-            ("fastener",    "M8", "fastener:ISO4762:M8"),
+            ("fastener",    "M8", "fastener:ISO 4762:M8"),
         ])
         result = _dedupe_related(list(recs))
         assert result[0]["domain"] == "fastener", \
@@ -334,7 +335,7 @@ class TestDedupeRelatedIds:
         """related_ids must not appear on records without a sibling."""
         from engine_oracle.parts_hub.hub import _dedupe_related
         recs = self._make_records([
-            ("fastener", "M8",  "fastener:ISO4762:M8"),
+            ("fastener", "M8",  "fastener:ISO 4762:M8"),
             ("fastener", "M10", "fastener:ISO4762:M10"),
         ])
         result = _dedupe_related(list(recs))
@@ -375,20 +376,20 @@ class TestMcpPartPlaceTool:
         assert result["ok"] is False
 
     def test_part_place_bad_doc_json_returns_error(self):
-        raw = self.tools["part_place"]("fastener:ISO4762:M8", doc="{not valid json")
+        raw = self.tools["part_place"]("fastener:ISO 4762:M8", doc="{not valid json")
         result = json.loads(raw)
         assert result["ok"] is False
         assert "JSON" in (result.get("reason") or "") or "JSON" in (result.get("hint") or "")
 
     def test_part_place_bad_params_json_returns_error(self):
-        raw = self.tools["part_place"]("fastener:ISO4762:M8", params="{not valid json")
+        raw = self.tools["part_place"]("fastener:ISO 4762:M8", params="{not valid json")
         result = json.loads(raw)
         assert result["ok"] is False
 
     @needs_core
     def test_part_place_tool_mech_end_to_end(self):
         """part_place via MCP tool for a fastener creates editable doc_id."""
-        raw = self.tools["part_place"]("fastener:ISO4762:M8")
+        raw = self.tools["part_place"]("fastener:ISO 4762:M8")
         result = json.loads(raw)
         assert result["ok"] is True, f"MCP part_place failed: {result.get('reason')}"
         assert result["editable"] is True

@@ -265,19 +265,44 @@ def _gap_dim_coverage(doc_id: str = None, source_doc_id: str = None, **_) -> str
 
 
 def _gap_req_join(doc_id: str = None, requirements: list = None, **_) -> str:
-    """Join requirement statuses vs verifier evidence: what fraction have passing evidence?"""
+    """aicad.req/1 join — does each requirement's STATUS agree with its verifier EVIDENCE?
+
+    Statuses follow docs/CUSTOM_MODEL_INTEGRATION_SURVEY.md §3.5 (T-H3, in flight):
+    proposed | user_confirmed | verified | failed | waived (plus generic pass/ok).
+    A "verified"/"pass" claim with an explicitly EMPTY trace.evidence list is
+    INCONSISTENT — the exact failure this join exists to catch. "waived" is exempt
+    (excluded from the denominator). score = met / non-waived total.
+    """
     if not requirements:
         return json.dumps({"ok": True, "score": 1.0, "note": "no requirements provided"})
-    passed = sum(1 for r in requirements if r.get("status") in ("pass", "verified", "ok"))
-    total = len(requirements)
-    score = passed / total
+    met_statuses = ("pass", "verified", "ok")
+    met = 0
+    unmet: list = []
+    inconsistent: list = []
+    n_scored = 0
+    for i, r in enumerate(requirements):
+        rid = r.get("id", i)
+        status = r.get("status")
+        if status == "waived":
+            continue
+        n_scored += 1
+        if status not in met_statuses:
+            unmet.append(rid)
+            continue
+        trace = r.get("trace")
+        if isinstance(trace, dict) and trace.get("evidence") == []:
+            inconsistent.append(rid)   # claims verified, carries no evidence
+            unmet.append(rid)
+            continue
+        met += 1
+    score = met / n_scored if n_scored else 1.0
     return json.dumps({
         "ok": score >= 1.0,
         "score": score,
-        "passed": passed,
-        "total": total,
-        "unmet": [r.get("id", i) for i, r in enumerate(requirements)
-                  if r.get("status") not in ("pass", "verified", "ok")],
+        "passed": met,
+        "total": n_scored,
+        "unmet": unmet,
+        "inconsistent": inconsistent,
     })
 
 

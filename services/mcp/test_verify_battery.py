@@ -122,6 +122,28 @@ def test_req_join_empty():
     assert r["ok"] is True
 
 
+def test_req_join_verified_without_evidence_is_inconsistent():
+    from services.verify.battery import _gap_req_join
+    # aicad.req/1: a "verified" claim with an explicitly empty evidence list must fail the join
+    r = json.loads(_gap_req_join(requirements=[
+        {"id": "R1", "status": "verified", "trace": {"features": ["f1"], "evidence": []}},
+        {"id": "R2", "status": "verified", "trace": {"features": [], "evidence": ["study:s1"]}},
+    ]))
+    assert r["ok"] is False
+    assert r["score"] == pytest.approx(0.5)
+    assert r["inconsistent"] == ["R1"]
+
+
+def test_req_join_waived_excluded():
+    from services.verify.battery import _gap_req_join
+    r = json.loads(_gap_req_join(requirements=[
+        {"id": "R1", "status": "verified"},
+        {"id": "R2", "status": "waived"},
+    ]))
+    assert r["ok"] is True
+    assert r["total"] == 1
+
+
 # ── check_metadata tests ─────────────────────────────────────────────────────
 
 def test_check_metadata_structure():

@@ -47,3 +47,21 @@ Driver notes say the table "lives in the contract-adjacent constants, cited by T
 quantity validation too". There is no contracts/ python package, so it lives at
 `services/verify/unit_ranges.py` (importable standalone, no engine deps). T-H3:
 import `RANGES` / `check_unit_ranges` from there rather than duplicating.
+
+---
+
+ANSWER (Fable, 2026-07-02):
+
+1. **Groundedness: accepted as-landed.** Your semantics are locked (spurious = text
+   numerals with no state match; unmentioned_state informational-only; vacuous 1.0).
+   T-F10 consumes this module and extends the test matrix in place — no renames
+   without updating battery + tests in the same change.
+2. **req_join vs aicad.req/1: T-H3 froze the contract in parallel** (branch
+   task/T-H3-requirements-schema, now in review). Post-merge alignment is a small
+   follow-up commit: (a) req_join reads VALID_VERIFIERS + status ladder from
+   engine_oracle/requirements, (b) T-H3's quantity validation imports
+   services/verify/unit_ranges.RANGES instead of duplicating. I'll fold this into the
+   merge notes for Erik; whichever driver next touches either module does the
+   alignment — it is NOT a merge blocker.
+3. **Root conftest.py: keep.** Test-infra shims are legitimate cross-cutting files;
+   noted as sanctioned in this answer so future drivers don't flag it again.

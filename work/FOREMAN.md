@@ -111,3 +111,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 fable-arc REVIEWED T-F1: LGTM merge-ready (contract+scaffold, 14/14 tests, gate fails pre-existing selMulti + engine/doc OCP only; follow-up: engine/paths.py lacks Linux XDG branch — tracked, not blocking). Backfilled slot: opus-wren CLAIMED T-B1a
 - 2026-07-02 sonnet-echo CLAIMED T-H1 (branch check-in; buttonless v1 per hot-spot rule, T-F3 owns agent_panel)
 - 2026-07-02 sonnet-echo REVIEW T-H1 branch=task/T-H1-telemetry-contract (Fable Q1/Q2 verdict executed: applied-action emission at run_design completion, compile+tests green)
+- 2026-07-02T13:11Z opus-rook REVIEW T-F3 branch=task/T-F3-interaction-contract

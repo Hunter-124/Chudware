@@ -43,3 +43,12 @@ T-V3..T-V5 follow-ups into one deliverable.
 - [ ] Combined sweep failure count measurably reduced; numbers recorded
 - [ ] Gate still PASS (or better: fewer --ignores)
 - [ ] `graphify update .` run
+
+## Addendum (foreman, 2026-07-03)
+
+6. Also fix the `mcp` namespace shadow: under pytest from repo root, PEP-420 makes
+   `services/mcp/` resolve as namespace package `mcp`, shadowing the installed mcp
+   SDK ("mcp.server is not a package"). Hit by T-Q2 (collection workaround) and
+   T-A4 (one honest engine-test skip in services/dag/test_verify.py). Fix once:
+   likely an `__init__.py` decision or import-path rename so both collection paths
+   and runtime resolvers see the real SDK.

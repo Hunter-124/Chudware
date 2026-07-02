@@ -1,0 +1,18 @@
+---
+id: T-BL12
+title: TraceParts + Werk24 paid tiers
+workstream: backlog
+owner: unassigned
+status: backlog
+branch: task/T-BL12-paid-apis
+depends_on: []
+---
+
+## Context
+
+Adopt TraceParts API for supplier-catalog CAD and Werk24 for drawing/GD&T extraction once spec-sheet matching volume justifies the spend.
+
+## Definition of done
+
+- [ ] Cost/volume analysis documented
+- [ ] Provider implementations behind the existing PartProvider seam

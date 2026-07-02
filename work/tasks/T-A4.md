@@ -1,0 +1,45 @@
+---
+id: T-A4
+title: Verify nodes and DAG MCP tools
+workstream: A
+owner: Bruh
+status: todo
+branch: task/T-A4-verify-nodes-mcp
+day: 4
+depends_on: [T-A3]
+---
+
+## Context
+
+Verify nodes run deterministic checks as end conditions: `check_interference` (mechanical), `ecad_run_erc/drc` (ECAD), firmware test pass (Renode assert), D/C ratio < 1.0 (structural), budget ≤ target (cost). Each verify node calls an existing MCP tool and checks its output against the node's `end_condition` predicate. Day 4 also wires the five DAG MCP tools (`dag_plan`, `dag_run`, `dag_status`, `dag_approve`, `dag_abort`) into `services/mcp/server.py`.
+
+## Files / areas touched
+
+- `services/dag/verify.py` — new: verify node implementation; dispatches to MCP tools by check type
+- `services/mcp/server.py` — register dag_plan, dag_run, dag_status, dag_approve, dag_abort
+- `services/dag/mcp_tools.py` — new: MCP tool handlers for the five DAG tools
+- `engine_oracle/ecad/` — ecad_run_erc/drc tools (existing, verify node calls these)
+- `engine_oracle/sim/` — check_interference (existing)
+
+## Steps
+
+1. Run `graphify query "check_interference ecad_run_erc MCP tools"` to find existing tool names and signatures.
+2. Implement `verify.py`: a node runner variant that, instead of calling the LLM, calls a named MCP tool and evaluates the boolean end_condition predicate against the result. Map verify types to tool names: `interference → check_interference`, `erc → ecad_run_erc`, `drc → ecad_run_drc`, `firmware → fw_sim_run`, `dc_ratio → struct_check`, `budget → bom_price`.
+3. Implement `mcp_tools.py` with handlers for: `dag_plan` (run dag_planner, return graph JSON), `dag_run` (start/resume a run), `dag_status` (return run state + current node), `dag_approve` (resume a gate with approve), `dag_abort` (cancel a run).
+4. Register the five tools in `services/mcp/server.py` following the existing registration pattern.
+5. Test: create a graph with a verify node (interference check); mock the tool result; assert node passes when no interference, fails → retry when interference found.
+
+## Definition of done
+
+- [ ] `verify.py` dispatches all five check types to existing MCP tools without calling the LLM
+- [ ] Five DAG MCP tools registered in `services/mcp/server.py` and reachable via the MCP server
+- [ ] `dag_status` returns current node ID, run state, and gate-pending flag
+- [ ] `dag_approve` resumes a paused gate from outside (e.g., from CLI or UI panel)
+- [ ] `python -m pytest services/dag/test_verify.py services/dag/test_mcp_tools.py -q` passes
+
+## AI hints
+
+- `graphify query "MCP server tool registration pattern"` — find how tools are registered (function name, docstring, schema pattern)
+- `graphify query "check_interference ecad DRC ERC"` — locate existing tool implementations
+- Relevant files: `services/mcp/server.py`, `engine_oracle/ecad/`, `engine_oracle/sim/`
+- End-condition predicate is stored as a string in the graph JSON; evaluate with `eval(predicate, {"result": tool_result})` inside a try/except — or use a safe predicate DSL

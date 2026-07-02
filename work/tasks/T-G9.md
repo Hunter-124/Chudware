@@ -1,0 +1,50 @@
+---
+id: T-G9
+title: GUI migration wave 5 - polish, parity battery, cutover (P1, P2, G5)
+workstream: G
+owner: unassigned
+status: todo
+branch: task/T-G9-migration-cutover
+day: 10
+depends_on: [T-G8, T-G4]
+---
+
+## Context
+
+Final Linux wave of `docs/GUI_MIGRATION_DAG.md`: P1 adaptive-glass sweep (every
+over-viewport surface on `glassPanel()`/`adaptiveSurface()`, shortcomings list in
+`docs/GLASS_DESIGN_SPEC.md` cleared), P2 full 21-scenario screenshot battery on both
+binaries with sign-off per pair, then the G5 cutover: retarget `scripts/check.py`,
+`scripts/feature_surface_audit.py`, `scripts/parity_audit.py` to `ui/imgui` +
+`ui/abstract`, and mark host EOL in `AGENTS.md`. After this task, AI-CAD2 (ShopCraft)
+is the production GUI on Linux; `host/` survives only until T-G11's Windows check.
+
+## Files / areas touched
+
+- `ui/imgui/src/theme/**` + flagged panel files (P1)
+- `scripts/check.py`, `scripts/feature_surface_audit.py`, `scripts/parity_audit.py`,
+  `AGENTS.md` (G5)
+- `scratch/gui_baseline2/` (output only, gitignored)
+
+## Steps
+
+1. Read `docs/GUI_MIGRATION_DAG.md` P1/P2/G5 and `docs/GLASS_DESIGN_SPEC.md` shortcomings.
+2. P1 sweep; verify with `python3 scripts/check.py gui_lint theme`.
+3. P2 battery: all 21 scenarios on both binaries, human-eye sign-off per pair (this is
+   the "final human-eye screenshot pass" debt from `HANDOFF_GUI_OVERHAUL.md` §5.3 — plus
+   the ~10-minute manual interactive pass: resize hit-zones, PM slider ctrl-click, chip
+   firing).
+4. G5: retarget the audits, flip gate.sh to build+smoke AI-CAD2 as primary, note host
+   EOL in AGENTS.md and host/DEPRECATED.md (criteria 1-4 there must all be green).
+
+## Definition of done
+
+- [ ] gui_lint theme clean; no over-viewport surface off the adaptive-glass API
+- [ ] 21/21 scenario pairs signed off; interactive manual pass done
+- [ ] host/DEPRECATED.md deletion criteria 1-4 all green
+- [ ] `bash scripts/gate.sh` green scanning the new tree; `graphify update .` run
+
+## AI hints
+
+- The `feature_surface_audit`/`parity_audit` failures were PRE-EXISTING against host —
+  after retargeting they must actually pass, that's the point of the gate.

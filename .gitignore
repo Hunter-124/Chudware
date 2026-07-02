@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-mcp/
+.pip-cache/
 
 # C++ host build output (parallel agent build dirs included)
 host/build*/
@@ -78,3 +80,4 @@ core/build-occt/
 
 # Scratch render output from dev tools (leading-underscore convention, like _shot_*.png)
 tools/_*.png
+work/.claim.lock

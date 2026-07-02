@@ -35,6 +35,7 @@
 | olefile | BSD-2 | OLE2 probe for legacy SolidWorks .sldprt preview (experimental) | ok |
 | pywin32 | PSF-2.0 | optional SolidWorks COM automation (Windows-only, feature-detected) | ok |
 | numpy / scipy | BSD-3 | math, solvers | ok |
+| PyNiteFEA | MIT | structural FEM: member forces + deflections (T-D2 `engine.structural.analysis`) | ok (in-process; MIT permissive, GPL-clean, commercial-safe) |
 | matplotlib | PSF-based | colormap LUTs only | ok |
 | lib3mf | BSD-2 | 3MF import + export | ok |
 | anthropic / openai / mcp / httpx | MIT/Apache | providers | ok |

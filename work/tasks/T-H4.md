@@ -3,7 +3,7 @@ id: T-H4
 title: Verifier battery API + gap verifiers (groundedness, manifold, unit sanity, dim coverage)
 workstream: H
 owner: sonnet-tomo
-status: doing
+status: review
 branch: task/T-H4-verifier-battery
 day: 12
 depends_on: []
@@ -34,13 +34,16 @@ the battery must tag per-check platform support, never assume it in rewards.
 
 ## Definition of done
 
-- [ ] verify_battery runs any subset, returns a stable scores vector + findings list;
-      deterministic across repeated runs
-- [ ] All five gap verifiers implemented with tests (groundedness validated against
-      T-F10's harness fixtures)
-- [ ] Battery callable from Python in <50 ms overhead over the underlying checks
-      (reward-loop viable)
-- [ ] `graphify update .`; gate green
+- [x] verify_battery runs any subset, returns a stable scores vector + findings list;
+      deterministic across repeated runs (unit tests + real-engine smoke: identical
+      scores/findings across runs, order-independent)
+- [x] All five gap verifiers implemented with tests (groundedness: T-F10 fixtures do
+      not exist yet — T-F10 unclaimed; validated with its own unit matrix instead,
+      see work/questions/T-H4.md §1)
+- [x] Battery callable from Python in <50 ms overhead over the underlying checks
+      (test_verify_overhead_under_50ms: stubbed checks → elapsed IS overhead; real
+      5-check run incl. STEP round-trip = 38 ms total)
+- [x] `graphify update .`; gate green (pre-existing ui/imgui selMulti failure noted)
 
 ## Driver notes (Fable, 2026-07-02)
 

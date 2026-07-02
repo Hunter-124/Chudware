@@ -21,6 +21,25 @@ standards:
       "6002": {bore: 15.0, outer_d: 32.0, width: 9.0}
       "6003": {bore: 17.0, outer_d: 35.0, width: 10.0}
       "6004": {bore: 20.0, outer_d: 42.0, width: 12.0}
+      "6005": {bore: 25.0, outer_d: 47.0, width: 12.0}
+      "6006": {bore: 30.0, outer_d: 55.0, width: 13.0}
+      "6007": {bore: 35.0, outer_d: 62.0, width: 14.0}
+      "6008": {bore: 40.0, outer_d: 68.0, width: 15.0}
+      "6200": {bore: 10.0, outer_d: 30.0, width: 9.0}
+      "6201": {bore: 12.0, outer_d: 32.0, width: 10.0}
+      "6202": {bore: 15.0, outer_d: 35.0, width: 11.0}
+      "6203": {bore: 17.0, outer_d: 40.0, width: 12.0}
+      "6204": {bore: 20.0, outer_d: 47.0, width: 14.0}
+      "6205": {bore: 25.0, outer_d: 52.0, width: 15.0}
+      "6206": {bore: 30.0, outer_d: 62.0, width: 16.0}
+      "6207": {bore: 35.0, outer_d: 72.0, width: 17.0}
+      "6208": {bore: 40.0, outer_d: 80.0, width: 18.0}
+      "6300": {bore: 10.0, outer_d: 35.0, width: 11.0}
+      "6301": {bore: 12.0, outer_d: 37.0, width: 12.0}
+      "6302": {bore: 15.0, outer_d: 42.0, width: 13.0}
+      "6303": {bore: 17.0, outer_d: 47.0, width: 14.0}
+      "6304": {bore: 20.0, outer_d: 52.0, width: 15.0}
+      "6305": {bore: 25.0, outer_d: 62.0, width: 17.0}
       "6800": {bore: 10.0, outer_d: 19.0, width: 5.0}
       "6801": {bore: 12.0, outer_d: 21.0, width: 5.0}
       "6802": {bore: 15.0, outer_d: 24.0, width: 5.0}

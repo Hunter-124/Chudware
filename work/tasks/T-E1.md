@@ -2,8 +2,8 @@
 id: T-E1
 title: Piping module scaffold + fitting catalog
 workstream: E
-owner: unassigned
-status: todo
+owner: opus-lark
+status: doing
 branch: task/T-E1-piping-scaffold
 day: 6
 depends_on: [T-INT]

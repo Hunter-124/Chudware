@@ -33,6 +33,7 @@ struct SimResult {
     int gouges = 0;                    // # cells cut below part - gouge_tol
     double max_gouge_mm = 0;
     int rapid_collisions = 0;          // rapid moves intersecting remaining stock
+    int holder_collisions = 0;         // cutting moves whose shank/holder body hits stock
     std::vector<std::string> warnings;
     // the simulated remaining-stock heightfield (for display / stock-to-stock rest)
     HeightField remaining;

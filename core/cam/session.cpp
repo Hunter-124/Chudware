@@ -350,6 +350,7 @@ json cam_simulate(const std::string& doc_id, const json& params) {
         so.resolution = o.value("resolution", so.resolution);
         so.check_gouge = o.value("check_gouge", so.check_gouge);
         so.check_rapid = o.value("check_rapid", so.check_rapid);
+        so.check_holder = o.value("check_holder", so.check_holder);
         so.gouge_tol = o.value("gouge_tol", so.gouge_tol);
     }
     bool include_field = params.value("include_field", false);

@@ -14,6 +14,7 @@ from . import context_pack as cp
 from . import node_runner as nr
 from . import autonomy as av
 from . import gate as gt
+from . import verify as vr
 
 # ---------------------------------------------------------------------------
 # Schema constants
@@ -240,13 +241,26 @@ def _make_node_handler(
                                 node_id: node_entry},
             }
 
-        # --- verify node stub (T-A4 owns real logic) -------------------------
-        if node_type == "verify":
-            warnings.warn(
-                f"Verify node {node_id!r}: T-A4 verifier logic not implemented; "
-                "stub returns status='done' with empty output.",
-                stacklevel=2,
-            )
+        # --- verify node (T-A4: deterministic dispatch via verify.run) --------
+        # Only intercept verify nodes that declare a check_type in inputs.
+        # Without check_type the node falls through to node_runner (agent path)
+        # for backward compatibility with agent-driven verify nodes.
+        if node_type == "verify" and node.get("inputs", {}).get("check_type"):
+            current_node_state_v = state.get("node_states", {}).get(node_id, {})
+            if "retry_remaining" not in current_node_state_v:
+                current_node_state_v = {**current_node_state_v,
+                                         "retry_remaining": initial_retry_budget}
+            pack_v = cp.assemble(node, current_node_state_v)
+            verdict_v, output_v = vr.run(node, pack_v, emit=_emit)
+            node_entry_v: dict[str, Any] = {
+                "status": output_v.get("status", "done"),
+                "output": output_v,
+                "verdict": verdict_v,
+            }
+            return {
+                "node_states": {**state.get("node_states", {}),
+                                node_id: node_entry_v},
+            }
 
         # --- gate node (requires approve/manual — already handled above) -----
         if node_type == "gate" and eff_autonomy == "auto":

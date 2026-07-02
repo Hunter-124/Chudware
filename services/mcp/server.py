@@ -168,6 +168,11 @@ register_regen_tools(mcp)
 # Code compliance (T-D4): deterministic rule engine + agentic RAG for building-code checks.
 from mcp_server.code_compliance_tools import register_code_compliance_tools
 register_code_compliance_tools(mcp)
+# DAG orchestrator MCP tools (T-A4): dag_plan / dag_run / dag_status / dag_approve / dag_abort.
+# These five tools expose the services/dag executor to MCP clients so a model or UI can
+# start/resume/inspect/gate DAG missions without a bespoke integration layer.
+from services.dag.mcp_tools import register_dag_tools
+register_dag_tools(mcp)
 
 
 def _install_clean_stdout():

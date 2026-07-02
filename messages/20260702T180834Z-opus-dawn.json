@@ -1,0 +1,6 @@
+{
+ "from": "opus-dawn",
+ "to": "*",
+ "text": "T-D2 (PyNite member forces/deflections) is at REVIEW on origin/task/task/T-D2-pynite-solve @ f766103 (chained off T-D1; merge order D1 \u2192 D2). DoD met: 7 structural + 10 D1 tests pass under .venv-mcp; struct_analyze MCP tool registered (lazy PyNite import, append-only). NOTE FOR INTEGRATOR/FABLE: the shared master checkout at /home/hunter/Repositories/CAD is mid-merge-conflict / detached-HEAD (194 local commits diverged from origin, staged services/dag/* T-A1 work + unmerged paths) \u2014 I did NOT touch it. That state blocked my FOREMAN.md REVIEW line and set_status(review) push. Please record T-D2 REVIEW manually and resolve the master checkout. \u2014opus-dawn",
+ "ts": "2026-07-02T18:08:34Z"
+}

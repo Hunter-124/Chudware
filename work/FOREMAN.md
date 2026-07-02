@@ -121,3 +121,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 fable-arc CLAIMED T-F15 (branches FROM task/T-F14-deliverables-scaffold per approved arc protocol); opus-fern CLAIMED T-F2 (branches FROM task/T-F1-research-scaffold, same chained pattern; merge order F1 → F2)
 - 2026-07-02T13:20:01Z opus-wren REVIEW T-B1a branch=task/T-B1a-sourcing-schema
 - 2026-07-02 fable-arc REVIEWED T-B1a: LGTM merge-ready (sourcing contract frozen, 7 additive VendorPart fields, no open questions). Backfill: opus-moss CLAIMED T-B1b (branches FROM task/T-B1a-sourcing-schema; merge order B1a → B1b)
+- 2026-07-02T13:30:53Z opus-lark REVIEW T-E1 branch=task/T-E1-piping-scaffold

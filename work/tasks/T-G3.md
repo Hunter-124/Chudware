@@ -46,3 +46,16 @@ rename happens once in the surviving tree. Full tier breakdown:
 
 - A blind global sed WILL break the build/MCP/paths — that's why tiers exist.
 - Copilot header font shrink (T-G2) already landed; only the text changes here.
+
+## Progress log
+- 2026-07-02 18:50 UTC [sonnet-brio] Finisher (sonnet-pike2) closeout after sonnet-brio process-exit.
+
+DoD:
+- 20 ins / 20 del across 11 files — tier-1 user-visible strings only (window title, copilot header, about menu, quit modal, GLFW window title)
+- Scope fence documented in work/questions/T-G3.md: file-filter labels, appdata paths, crash-dump filenames, exe/so name tooltips deferred to T-G10
+- Coverage verified against T-G12 checklist: all user-visible chrome surfaces renamed; no T-G10-scoped strings touched
+- Build: host AI-CAD (Linux) PASS; ui/imgui AI-CAD2 PASS
+- Headless shot confirms title bar + copilot panel both show "ShopCraft"
+- Gate: check.py FAIL-RECORDED (pre-existing), pytest 0-collected (pre-existing issue #6), all other stages PASS
+- graphify update complete (22419 nodes, 48030 edges)
+- Branch task/T-G3-shopcraft-branding pushed

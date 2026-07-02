@@ -1,34 +1,48 @@
 #pragma once
 #include "variant.h"
-#include <functional>
+#include <cstring>
 #include <string>
 #include <vector>
 
 namespace aicad::ui {
 
 enum class FieldKind {
-    Dim, Combo, Check, Int, DatumRef, Selector, Text, Separator
+    Dim, Combo, Check, Int, DatumRef, SelectorWell, FeatureWell, Text
+};
+
+// Topology kinds a selector well accepts (mirrors feature_params sel(kinds…)).
+struct SelectorKinds {
+    bool face = false, edge = false, vertex = false, body = false, plane = false, axis = false;
 };
 
 struct PanelField {
-    std::string id;
-    std::string label;
+    const char* key = "";
+    const char* label = "";
+    const char* group = "";
     FieldKind kind = FieldKind::Dim;
-    std::string defaultJson;
-    std::vector<std::string> comboOptions;
-    bool visibleWhenExpr;  // reserved: expression gating (future)
-    std::string visibleWhen; // e.g. "end:blind" — simple key match for now
+    double dimDefault = 0.0;
+    const char* unitLabel = nullptr;  // nullptr = length [mm]/[in]; "[deg]" = angle; "" = unitless
+    SelectorKinds selKinds{};
+    bool selMulti = true;
+    const char* comboOptions = nullptr;
+    const char* comboLabels = nullptr;
+    const char* placeholder = nullptr;
+    bool checkDefault = false;
+    const char* enableKey = nullptr;
+    const char* enableVals = nullptr;
+    bool omitWhenDisabled = false;
+    bool comingSoon = false;
 };
 
 struct PanelSpec {
-    std::string featureType;  // engine feature type / tool id
-    std::string title;
+    const char* featureType = "";
+    const char* title = "";
+    const char* icon = "";
     std::vector<PanelField> fields;
 };
 
-// Lookup a panel spec by feature/tool type. Data-driven Inspector (replaces
-// hardcoded PM forms in host/src/ui/property_manager.cpp over time).
 const PanelSpec* findPanelSpec(const char* featureType);
+const PanelSpec* panelFormForCommand(const std::string& cmdId, std::string& mode);
 const std::vector<PanelSpec>& allPanelSpecs();
 
 } // namespace aicad::ui

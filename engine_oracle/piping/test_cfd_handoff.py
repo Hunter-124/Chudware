@@ -29,18 +29,27 @@ from engine.piping import cfd_handoff as ch
 # ── skip markers ──────────────────────────────────────────────────────────────
 
 def _have_kernel() -> bool:
+    """Evaluate lazily each time — not at module load.
+
+    RC#3 from T-V2 audit: module-load-time HAVE_KERNEL=False (build123d absent at
+    collection) but call-time _have_kernel() returns True (build123d appears in
+    sys.modules from a prior import in the combined run), causing
+    test_internal_volume_no_kernel_raises_piping_cfd_error to run but not raise.
+    Using importlib.util.find_spec avoids sys.modules state entirely.
+    """
     if not catalog.have_fluids():
         return False
-    try:
-        import build123d  # noqa: F401
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+    import importlib.util
+    return importlib.util.find_spec("build123d") is not None
 
 
-HAVE_KERNEL = _have_kernel()
+# _needs_kernel decorator evaluates _have_kernel() at decoration time (module load).
+# This is acceptable for skip decorators: if the kernel becomes available between
+# collection and execution in CI the test will simply run rather than skip — safe.
+# The key fix (RC#3) is that test_internal_volume_no_kernel_raises_piping_cfd_error
+# now calls _have_kernel() lazily inside the test body below.
 _needs_kernel = (
-    pytest.mark.skipif(not HAVE_KERNEL, reason="build123d/fluids kernel not installed")
+    pytest.mark.skipif(not _have_kernel(), reason="build123d/fluids kernel not installed")
     if pytest else (lambda f: f)
 )
 
@@ -150,8 +159,12 @@ def test_internal_volume_no_kernel_raises_piping_cfd_error():
 
     This test only runs when build123d is absent; if the kernel IS present it is skipped
     (we can't uninstall build123d in a live session).
+
+    RC#3 fix (T-V2 audit): call _have_kernel() lazily here (not the module-level
+    constant) so combined-run sys.modules state doesn't cause a mismatch between
+    the skip decision and what internal_volume() actually does at call time.
     """
-    if HAVE_KERNEL:
+    if _have_kernel():
         if pytest:
             pytest.skip("kernel present — cannot test absent-kernel path")
         return
@@ -393,7 +406,7 @@ def main():
     test_mcp_piping_verify_cfd_with_results()
     print("  group 4 (MCP smoke): 4/4 OK")
 
-    if HAVE_KERNEL:
+    if _have_kernel():
         print("  group 1 (internal_volume kernel): running...")
         test_internal_volume_produces_step()
         test_internal_volume_single_run_filter()

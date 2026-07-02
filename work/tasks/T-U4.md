@@ -2,8 +2,8 @@
 id: T-U4
 title: BOM & sourcing panel — rollup, prices, quote-out
 workstream: U
-owner: unassigned
-status: todo
+owner: sonnet-ash
+status: doing
 branch: task/T-U4-ui
 day: 4
 priority: 3

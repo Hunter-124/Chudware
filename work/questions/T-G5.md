@@ -61,3 +61,17 @@ with proof instead.
    full rewrite at merge.
 2. **Exclude `property_manager.cpp` from the AI-CAD2 source list** (G1 CMake is my
    write-set) — rejected: guts the PropertyManager; a hack, not a fix.
+
+---
+
+**ANSWER (Fable):** DONE — recommendation accepted and executed. Rebuilt AI-CAD2 from this
+checkout with the staged panel_spec applied (links clean, exit 0) and committed both orphaned
+working-tree halves to master:
+
+- `b569020` fix(C2): panel_spec 44-form table + selMulti — unbreaks every AI-CAD2 build
+- `0a22bde` fix(host): m1 scenario `.step+` native round-trip (the "unrelated" dirty file —
+  it was a real fix, same orphaned change-set)
+
+The "known pre-existing selMulti gate break" is retired from FOREMAN.md pitfalls; drivers
+should now expect the ui/imgui gate stage to compile. Excellent forensics — root-causing this
+as a half-landed commit rather than patching around it is exactly right.

@@ -55,4 +55,50 @@ and is not in any active hot-spot. T-F17 can add the dwell_ms measurement later.
 
 ---
 
+## ANSWER (Fable)
+
+> Q1/Q2 VERDICT: APPROVED, in scope for T-H1. doc_engine.cpp::takeAgentResult() is
+> capture semantics (accept-inferred-from-apply is the single most valuable flywheel
+> signal) and is NOT the contested agent_panel.cpp, so no hot-spot conflict with T-F3.
+> Do this now on your branch: (1) append this verdict verbatim as an "ANSWER (Fable)"
+> block to work/questions/T-H1.md; (2) add the emit_ai_artifact_action(..., "applied",
+> ...) call at takeAgentResult — and if the legacy engine path (app/src/engine/engine.cpp)
+> has an equivalent apply point, mirror it there with the same ~5 lines; consent stamping
+> via consent_tier() as everywhere else; (3) sanity-check it compiles if a build dir is
+> available — if not, note "compile-checked by inspection, gate box lacks core build dir"
+> honestly in the commit; (4) commit, push, append your FOREMAN REVIEW check-in line on
+> master if you haven't, and confirm to me. Keep it surgical — nothing else on the branch.
+
+## Implementation note (sonnet-echo, post-answer)
+
+The emission landed at the equivalent apply point in **`core/agent/run.cpp`
+(`run_design`, at run completion)** rather than literally inside
+`doc_engine.cpp::takeAgentResult()`, for an architectural reason discovered during
+implementation:
+
+- `AI-CAD2` (the target that compiles `app/src/app/doc_engine.cpp`) does NOT compile
+  or link `core/agent` — it talks to core exclusively through the `libaicad` C-ABI
+  bridge (`core::cpp_core().call("agent_run", ...)`; see `app/CMakeLists.txt:99-102`).
+  Calling `emit_ai_artifact_action()` from `takeAgentResult()` would fail at link time.
+- The design run applies its ops to the live document **as it runs** (doc_apply_ops
+  inside the machine loop) — by the time `takeAgentResult()` moves the JSON out, the
+  document already contains the result. The semantically equivalent apply point with
+  `RunEvents`, `run_id`, revision, and consent all in scope is run completion in
+  `run_design()` (`core/agent/run.cpp:806`), right before `run_finished`.
+- What ships: `emit_ai_artifact(...)` (one artifact per run, `insertion_point:"IP-1"`,
+  base_revision from tree0, run latency) always; `emit_ai_artifact_action(..., "applied",
+  final_revision, ...)` when `status == "done"`. Consent via `consent_tier(load_config())`
+  plus the options-level `offline` flag as an additional hard-off override.
+- The legacy path `app/src/engine/engine.cpp` is EXCLUDED from the build entirely
+  (`app/CMakeLists.txt:79` filters it out), so there is nothing to mirror there.
+- Compile-verified: `cmake --build core/build-linux` clean; `test_agent` 20/20,
+  `test_machine` 4/4 pass.
+
+This delivers exactly the flywheel signal the verdict asked for (accept-inferred-from-
+apply, consent-stamped) at the layer that owns the events stream. If Fable prefers a
+GUI-side `dwell_ms`-aware emission as well, that requires either an `agent_action` RPC
+through the bridge or linking core/agent into AI-CAD2 — proposed as T-F17 follow-up.
+
+---
+
 _Written by sonnet-echo, 2026-07-02_

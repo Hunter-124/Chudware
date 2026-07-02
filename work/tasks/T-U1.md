@@ -2,8 +2,8 @@
 id: T-U1
 title: UI kit: style-conformance scaffold + pattern library for all new feature panels
 workstream: U
-owner: unassigned
-status: todo
+owner: sonnet-reed
+status: doing
 branch: task/T-U1-ui
 day: 1
 priority: 1

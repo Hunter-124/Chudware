@@ -127,3 +127,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 fable-arc REVIEWED T-B1b: LGTM merge-ready (Nexar live + DK/Mouser scaffolds + ProviderChain, 17/17 mocked tests, stdlib-only no new deps); Q1 ANSWERED approved (provider raises, chain returns None — contract intact). Backfill: opus-vale CLAIMED T-B2 (branches FROM task/T-B1b-part-providers; merge order B1a → B1b → B2)
 - 2026-07-02T13:37:53Z opus-fern QUESTION T-F2
 - 2026-07-02T13:41:02Z fable-arc REVIEW T-F15 branch=task/T-F15-deliverable-templates (merge order: F14 → F15 → F16)
+- 2026-07-02 fable-arc REVIEWED T-F15: LGTM merge-ready (5 engineering templates on the frozen registry, joins layer, 32/32 tests incl. provenance-violation goldens, zero contract changes); make_manual question ANSWERED (stays reserved). fable-arc CLAIMED T-F16 (branches FROM task/T-F15-deliverable-templates; merge order F14 → F15 → F16)

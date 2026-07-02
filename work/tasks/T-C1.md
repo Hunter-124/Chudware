@@ -3,7 +3,7 @@ id: T-C1
 title: firmware_rpc.md contract and engine/firmware/ scaffold
 workstream: C
 owner: opus-vex
-status: doing
+status: review
 branch: task/T-C1-firmware-scaffold
 day: 1
 depends_on: []
@@ -32,11 +32,50 @@ Workstream C day 1 establishes the firmware pillar's contract and scaffold. `con
 
 ## Definition of done
 
-- [ ] `contracts/firmware_rpc.md` exists, all tool signatures documented
-- [ ] `engine_oracle/firmware/` package importable
-- [ ] `new_project()` creates a project dir with CMake template and `compile_commands.json`
-- [ ] `CMakeToolchain.build()` subprocess call is wired (actual compile may fail in CI without toolchain installed — that is acceptable; test with a mock)
-- [ ] `python -m pytest engine_oracle/firmware/test_project.py -q` passes
+- [x] `contracts/firmware_rpc.md` exists, all tool signatures documented
+- [x] `engine_oracle/firmware/` package importable
+- [x] `new_project()` creates a project dir with CMake template and `compile_commands.json`
+- [x] `CMakeToolchain.build()` subprocess call is wired (actual compile may fail in CI without toolchain installed — that is acceptable; test with a mock)
+- [x] `python -m pytest engine_oracle/firmware/test_project.py -q` passes (10 passed)
+
+## Implementation notes (opus-vex)
+
+- **`engine` is a symlink → `engine_oracle`** (the git-tracked dir). Code imports via
+  `from engine.firmware...` to match the ECAD precedent; files live under `engine_oracle/`.
+- **doc-meta linking:** the Python doc engine was rewritten into the C++ core and deleted,
+  so there is no heavy Python "doc-meta" subsystem. Board linking is a loose id/path string
+  reference (`board_doc_ref`) — the same mechanism `ecad_update_from_sch` uses to pair a board
+  and schematic. Persistence is a `project.json` sidecar written with the atomic tmp+`os.replace`
+  idiom from `engine.ecad.autosave`. Workspace dir: `AI_CAD_FIRMWARE_DIR` override → else
+  `%APPDATA%/AI-CAD/firmware` (temp fallback).
+- **`compile_commands.json` guarantee** (contract §6): `new_project` writes a synthetic
+  `compile_commands.json` enumerating template sources so the artifact always exists without a
+  cross-toolchain; a real `CMakeToolchain.build()` configure regenerates the accurate one.
+- **Verification:** 10 pytest tests green (create / roundtrip / compile_commands / mocked build
+  success + artifact discovery / graceful tool-absent for all three backends). Real `tc.build()`
+  smoke with cmake+ninja present but no `arm-none-eabi-gcc` returns a graceful
+  `BuildResult(success=False, returncode=1)` in ~95 ms (no hang) — the documented acceptable case.
+- **Did NOT edit** `services/mcp/server.py` (day-2 registration) or `contracts/licenses.md`
+  (out of scope; see `work/questions/T-C1.md` Q2).
+
+## ⚠️ Gate status — pre-existing blocker (see work/questions/T-C1.md Q1)
+
+`bash scripts/gate.sh` PASSES every stage EXCEPT `ui/imgui`, which fails to **compile** on a
+**pre-existing master break** unrelated to T-C1: `property_manager.cpp` references
+`PanelField::selMulti` (10×) but the struct in `ui/abstract/panel_spec.h` has no such member.
+Verified present at `f6e156c` (tip before this task's claim). T-C1 adds zero C++, so it neither
+causes nor can fix this within its allowed files. Gate summary at review time:
+
+```
+check.py     FAIL-RECORDED  (pre-existing, non-fatal)
+core build   PASS  (libaicad, OCCT ON)
+ui/abstract  PASS
+ctest        PASS  (100%)
+pytest       SKIP  (no provisioned venv; firmware suite verified separately — 10 passed)
+ui/imgui     FAIL  (pre-existing selMulti compile break — NOT from T-C1)
+```
+
+The firmware slice is merge-ready on its own; the GUI break needs a separate GUI-workstream fix.
 
 ## AI hints
 

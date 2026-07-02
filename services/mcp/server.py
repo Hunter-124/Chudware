@@ -83,6 +83,10 @@ register_cam_tools(mcp)
 from mcp_server.piping_tools import register_piping_tools
 register_piping_tools(mcp)
 
+# Hydraulic (ISO 1219 circuit design + component sizing).
+from mcp_server.hydraulic_tools import register_hydraulic_tools
+register_hydraulic_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

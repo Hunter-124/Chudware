@@ -2,8 +2,8 @@
 id: T-C3
 title: Emulation loop via Renode with fw_sim_run MCP tool
 workstream: C
-owner: unassigned
-status: todo
+owner: sonnet-rill
+status: doing
 branch: task/T-C3-renode-emulation
 day: 3
 depends_on: [T-C2]

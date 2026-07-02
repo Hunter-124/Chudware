@@ -49,6 +49,25 @@
         "source_type": "first_party",
         "license": "first-party compilation",
         "url": null
+      },
+      "cam": {
+        "id": "stainless_304",
+        "sfm_mill": 250.0,
+        "sfm_drill": 60.0,
+        "sfm_turn": 300.0,
+        "hss_factor": 0.4,
+        "fz_ref": 0.035,
+        "fz_ref_dia": 6.0,
+        "stepover_frac": 0.3,
+        "stepdown_frac": 0.5,
+        "plunge_frac": 0.3,
+        "cut_feed_ref": 0.0,
+        "provenance": {
+          "source": "AI-CAD CuttingDB builtin — clean-room from public machining-handbook ranges (Machinery's Handbook / tool-maker speed & feed charts; dimensional facts)",
+          "source_type": "first_party",
+          "license": "first-party compilation",
+          "url": null
+        }
       }
     },
     "aluminum_6061_t6": {
@@ -77,7 +96,26 @@
         "license": "first-party compilation",
         "url": null
       },
-      "condition": "T6"
+      "condition": "T6",
+      "cam": {
+        "id": "aluminum",
+        "sfm_mill": 900.0,
+        "sfm_drill": 300.0,
+        "sfm_turn": 800.0,
+        "hss_factor": 0.45,
+        "fz_ref": 0.06,
+        "fz_ref_dia": 6.0,
+        "stepover_frac": 0.45,
+        "stepdown_frac": 1.0,
+        "plunge_frac": 0.3,
+        "cut_feed_ref": 0.0,
+        "provenance": {
+          "source": "AI-CAD CuttingDB builtin — clean-room from public machining-handbook ranges (Machinery's Handbook / tool-maker speed & feed charts; dimensional facts)",
+          "source_type": "first_party",
+          "license": "first-party compilation",
+          "url": null
+        }
+      }
     },
     "titanium_ti6al4v": {
       "name": "Titanium Ti-6Al-4V",
@@ -101,6 +139,25 @@
         "source_type": "first_party",
         "license": "first-party compilation",
         "url": null
+      },
+      "cam": {
+        "id": "titanium",
+        "sfm_mill": 150.0,
+        "sfm_drill": 40.0,
+        "sfm_turn": 150.0,
+        "hss_factor": 0.3,
+        "fz_ref": 0.03,
+        "fz_ref_dia": 6.0,
+        "stepover_frac": 0.2,
+        "stepdown_frac": 0.3,
+        "plunge_frac": 0.3,
+        "cut_feed_ref": 0.0,
+        "provenance": {
+          "source": "AI-CAD CuttingDB builtin — clean-room from public machining-handbook ranges (Machinery's Handbook / tool-maker speed & feed charts; dimensional facts)",
+          "source_type": "first_party",
+          "license": "first-party compilation",
+          "url": null
+        }
       }
     },
     "brass_c360": {
@@ -125,7 +182,26 @@
         "license": "first-party compilation",
         "url": null
       },
-      "condition": "annealed"
+      "condition": "annealed",
+      "cam": {
+        "id": "brass",
+        "sfm_mill": 600.0,
+        "sfm_drill": 250.0,
+        "sfm_turn": 650.0,
+        "hss_factor": 0.5,
+        "fz_ref": 0.05,
+        "fz_ref_dia": 6.0,
+        "stepover_frac": 0.45,
+        "stepdown_frac": 1.0,
+        "plunge_frac": 0.3,
+        "cut_feed_ref": 0.0,
+        "provenance": {
+          "source": "AI-CAD CuttingDB builtin — clean-room from public machining-handbook ranges (Machinery's Handbook / tool-maker speed & feed charts; dimensional facts)",
+          "source_type": "first_party",
+          "license": "first-party compilation",
+          "url": null
+        }
+      }
     },
     "abs": {
       "name": "ABS plastic",
@@ -146,6 +222,25 @@
         "source_type": "first_party",
         "license": "first-party compilation",
         "url": null
+      },
+      "cam": {
+        "id": "plastic",
+        "sfm_mill": 1000.0,
+        "sfm_drill": 400.0,
+        "sfm_turn": 1000.0,
+        "hss_factor": 0.5,
+        "fz_ref": 0.08,
+        "fz_ref_dia": 6.0,
+        "stepover_frac": 0.6,
+        "stepdown_frac": 1.0,
+        "plunge_frac": 0.3,
+        "cut_feed_ref": 0.0,
+        "provenance": {
+          "source": "AI-CAD CuttingDB builtin — clean-room from public machining-handbook ranges (Machinery's Handbook / tool-maker speed & feed charts; dimensional facts)",
+          "source_type": "first_party",
+          "license": "first-party compilation",
+          "url": null
+        }
       }
     },
     "pla": {
@@ -190,6 +285,25 @@
         "source_type": "first_party",
         "license": "first-party compilation",
         "url": null
+      },
+      "cam": {
+        "id": "steel_mild",
+        "sfm_mill": 380.0,
+        "sfm_drill": 90.0,
+        "sfm_turn": 400.0,
+        "hss_factor": 0.4,
+        "fz_ref": 0.04,
+        "fz_ref_dia": 6.0,
+        "stepover_frac": 0.35,
+        "stepdown_frac": 0.8,
+        "plunge_frac": 0.3,
+        "cut_feed_ref": 0.0,
+        "provenance": {
+          "source": "AI-CAD CuttingDB builtin — clean-room from public machining-handbook ranges (Machinery's Handbook / tool-maker speed & feed charts; dimensional facts)",
+          "source_type": "first_party",
+          "license": "first-party compilation",
+          "url": null
+        }
       }
     },
     "steel_1045": {
@@ -236,6 +350,25 @@
         "source_type": "first_party",
         "license": "first-party compilation",
         "url": null
+      },
+      "cam": {
+        "id": "cast_iron",
+        "sfm_mill": 300.0,
+        "sfm_drill": 90.0,
+        "sfm_turn": 350.0,
+        "hss_factor": 0.45,
+        "fz_ref": 0.045,
+        "fz_ref_dia": 6.0,
+        "stepover_frac": 0.4,
+        "stepdown_frac": 0.6,
+        "plunge_frac": 0.3,
+        "cut_feed_ref": 0.0,
+        "provenance": {
+          "source": "AI-CAD CuttingDB builtin — clean-room from public machining-handbook ranges (Machinery's Handbook / tool-maker speed & feed charts; dimensional facts)",
+          "source_type": "first_party",
+          "license": "first-party compilation",
+          "url": null
+        }
       }
     },
     "aluminum_7075_t6": {
@@ -309,6 +442,25 @@
         "source_type": "first_party",
         "license": "first-party compilation",
         "url": null
+      },
+      "cam": {
+        "id": "copper",
+        "sfm_mill": 400.0,
+        "sfm_drill": 200.0,
+        "sfm_turn": 450.0,
+        "hss_factor": 0.45,
+        "fz_ref": 0.05,
+        "fz_ref_dia": 6.0,
+        "stepover_frac": 0.4,
+        "stepdown_frac": 1.0,
+        "plunge_frac": 0.3,
+        "cut_feed_ref": 0.0,
+        "provenance": {
+          "source": "AI-CAD CuttingDB builtin — clean-room from public machining-handbook ranges (Machinery's Handbook / tool-maker speed & feed charts; dimensional facts)",
+          "source_type": "first_party",
+          "license": "first-party compilation",
+          "url": null
+        }
       }
     },
     "magnesium_az31b": {
@@ -332,6 +484,25 @@
         "source_type": "first_party",
         "license": "first-party compilation",
         "url": null
+      },
+      "cam": {
+        "id": "magnesium",
+        "sfm_mill": 1200.0,
+        "sfm_drill": 400.0,
+        "sfm_turn": 1000.0,
+        "hss_factor": 0.5,
+        "fz_ref": 0.08,
+        "fz_ref_dia": 6.0,
+        "stepover_frac": 0.5,
+        "stepdown_frac": 1.0,
+        "plunge_frac": 0.3,
+        "cut_feed_ref": 0.0,
+        "provenance": {
+          "source": "AI-CAD CuttingDB builtin — clean-room from public machining-handbook ranges (Machinery's Handbook / tool-maker speed & feed charts; dimensional facts)",
+          "source_type": "first_party",
+          "license": "first-party compilation",
+          "url": null
+        }
       }
     },
     "titanium_grade_2": {
@@ -379,6 +550,25 @@
         "source_type": "first_party",
         "license": "first-party compilation",
         "url": null
+      },
+      "cam": {
+        "id": "inconel",
+        "sfm_mill": 90.0,
+        "sfm_drill": 25.0,
+        "sfm_turn": 100.0,
+        "hss_factor": 0.3,
+        "fz_ref": 0.025,
+        "fz_ref_dia": 6.0,
+        "stepover_frac": 0.15,
+        "stepdown_frac": 0.2,
+        "plunge_frac": 0.3,
+        "cut_feed_ref": 0.0,
+        "provenance": {
+          "source": "AI-CAD CuttingDB builtin — clean-room from public machining-handbook ranges (Machinery's Handbook / tool-maker speed & feed charts; dimensional facts)",
+          "source_type": "first_party",
+          "license": "first-party compilation",
+          "url": null
+        }
       }
     },
     "tungsten": {
@@ -550,6 +740,25 @@
         "source_type": "first_party",
         "license": "first-party compilation",
         "url": null
+      },
+      "cam": {
+        "id": "acrylic",
+        "sfm_mill": 800.0,
+        "sfm_drill": 300.0,
+        "sfm_turn": 800.0,
+        "hss_factor": 0.5,
+        "fz_ref": 0.06,
+        "fz_ref_dia": 6.0,
+        "stepover_frac": 0.5,
+        "stepdown_frac": 1.0,
+        "plunge_frac": 0.3,
+        "cut_feed_ref": 0.0,
+        "provenance": {
+          "source": "AI-CAD CuttingDB builtin — clean-room from public machining-handbook ranges (Machinery's Handbook / tool-maker speed & feed charts; dimensional facts)",
+          "source_type": "first_party",
+          "license": "first-party compilation",
+          "url": null
+        }
       }
     },
     "carbon_fiber_ud": {
@@ -573,6 +782,25 @@
         "source_type": "first_party",
         "license": "first-party compilation",
         "url": null
+      },
+      "cam": {
+        "id": "carbon_fiber",
+        "sfm_mill": 300.0,
+        "sfm_drill": 120.0,
+        "sfm_turn": 300.0,
+        "hss_factor": 0.35,
+        "fz_ref": 0.03,
+        "fz_ref_dia": 6.0,
+        "stepover_frac": 0.3,
+        "stepdown_frac": 0.4,
+        "plunge_frac": 0.3,
+        "cut_feed_ref": 0.0,
+        "provenance": {
+          "source": "AI-CAD CuttingDB builtin — clean-room from public machining-handbook ranges (Machinery's Handbook / tool-maker speed & feed charts; dimensional facts)",
+          "source_type": "first_party",
+          "license": "first-party compilation",
+          "url": null
+        }
       }
     },
     "concrete": {

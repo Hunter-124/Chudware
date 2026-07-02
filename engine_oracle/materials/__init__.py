@@ -7,7 +7,11 @@ that used to drift. See ``registry.py`` for the loader API and the legal posture
 from __future__ import annotations
 
 from .registry import (
+    CAM_FIELDS,
     all_materials,
+    cam_data,
+    cam_material_id,
+    cam_materials,
     density,
     fea_aliases,
     fea_table,
@@ -24,4 +28,8 @@ __all__ = [
     "fea_table",
     "fea_aliases",
     "registry_path",
+    "cam_data",
+    "cam_material_id",
+    "cam_materials",
+    "CAM_FIELDS",
 ]

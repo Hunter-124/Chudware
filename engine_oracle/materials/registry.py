@@ -117,3 +117,43 @@ def fea_table() -> dict:
 def fea_aliases() -> dict:
     """The legacy ``_MATERIAL_ALIASES`` map (alias -> friendly FEA key)."""
     return dict(_doc()["fea_aliases"])
+
+
+# --------------------------------------------------------------------------- CAM seam
+# The C++ CuttingDB (core/cam/feeds.cpp) folds onto this registry (T-M4, Issue #2). Each
+# registry material that corresponds to a machining group carries an additive ``cam``
+# sub-section: the 10 feeds/speeds fields the CuttingDB consumes, plus an ``id`` linking to
+# the CuttingDB's coarse group id ("aluminum", "steel_mild", ...) and per-row ``provenance``.
+# The C++ core reads this at startup and merges the cam fields onto its in-code table (which is
+# the byte-identical fallback when the registry is absent). These helpers expose the same data
+# to Python (cam_tools) so material-id validation reflects the registry's live list.
+
+# The 10 feeds/speeds fields the CuttingDB consumes (order matches core/cam/feeds.h).
+CAM_FIELDS = ("sfm_mill", "sfm_drill", "sfm_turn", "hss_factor", "fz_ref", "fz_ref_dia",
+              "stepover_frac", "stepdown_frac", "plunge_frac", "cut_feed_ref")
+
+
+def cam_data(name: str) -> Optional[dict]:
+    """The ``cam`` sub-section (feeds/speeds + linked group ``id`` + provenance) for a material
+    name/alias, or ``None`` when the material is unknown or carries no cam data."""
+    rec = get(name)
+    if rec is None:
+        return None
+    cam = rec.get("cam")
+    return copy.deepcopy(cam) if isinstance(cam, dict) else None
+
+
+def cam_material_id(name: str) -> Optional[str]:
+    """The CuttingDB group id ("aluminum", "steel_mild", ...) a registry material maps to, or
+    ``None`` if the material has no cam correspondence. Lets ``cam_add_setup`` accept a registry
+    id/alias and translate it to the id the C++ feeds calculator resolves."""
+    cam = cam_data(name)
+    return str(cam["id"]) if cam and cam.get("id") else None
+
+
+def cam_materials() -> dict:
+    """All registry materials that carry cam data, keyed by canonical registry id -> ``cam`` dict.
+    The registry side of the CAM material list (the C++ core adds its cam-only groups on top)."""
+    return {key: copy.deepcopy(rec["cam"])
+            for key, rec in _doc()["materials"].items()
+            if isinstance(rec.get("cam"), dict)}

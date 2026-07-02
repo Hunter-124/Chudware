@@ -36,6 +36,7 @@
 #include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
 #include "drawing_panel.h"  // DRAWINGS: 2D sheet renderer for a Drawing tab
 #include "doc_tabs.h"
+#include "layout.h"        // ui::overlayColumnEdge — HUD dodges the pinned glass columns
 
 namespace ui {
 
@@ -82,6 +83,37 @@ static void registerViewportLuminanceSamplerOnce() {
         }
         return s_bdRenderer->averageLuminance(cmn.x - s_bdMin.x, cmn.y - s_bdMin.y,
                                               cmx.x - s_bdMin.x, cmx.y - s_bdMin.y);
+    });
+    // Dynamic-color bridge (contract §6): mean-RGB/luminance/variance stats for the same rect,
+    // with the IDENTICAL clamp + inset-band fixup as the luminance lambda above. Returning false
+    // (no live backdrop / no readback yet) makes consumers behave as if dynamicColor were off.
+    ui::setBackdropStatsSampler(+[](ImVec2 mn, ImVec2 mx, ui::BackdropStats& out) -> bool {
+        if (!s_bdLive || !s_bdRenderer) return false;
+        ImVec2 cmn(std::min(std::max(mn.x, s_bdMin.x), s_bdMax.x),
+                  std::min(std::max(mn.y, s_bdMin.y), s_bdMax.y));
+        ImVec2 cmx(std::min(std::max(mx.x, s_bdMin.x), s_bdMax.x),
+                  std::min(std::max(mx.y, s_bdMin.y), s_bdMax.y));
+        const float kInset = std::max(24.f, (s_bdMax.x - s_bdMin.x) * 0.15f);
+        if (cmx.x - cmn.x < 4.f) {
+            if (cmn.x <= s_bdMin.x + 1.f) cmx.x = std::min(s_bdMin.x + kInset, s_bdMax.x);
+            else                          cmn.x = std::max(s_bdMax.x - kInset, s_bdMin.x);
+        }
+        if (cmx.y - cmn.y < 4.f) {
+            if (cmn.y <= s_bdMin.y + 1.f) cmx.y = std::min(s_bdMin.y + kInset, s_bdMax.y);
+            else                          cmn.y = std::max(s_bdMax.y - kInset, s_bdMin.y);
+        }
+        float rgb[3], lum, var;
+        if (!s_bdRenderer->averageBackdropStats(cmn.x - s_bdMin.x, cmn.y - s_bdMin.y,
+                                                cmx.x - s_bdMin.x, cmx.y - s_bdMin.y,
+                                                rgb, lum, var))
+            return false;
+        float h, sv, v;
+        ImGui::ColorConvertRGBtoHSV(rgb[0], rgb[1], rgb[2], h, sv, v);
+        out.lum = lum;
+        out.variance = var;
+        out.hue = h * 360.f;
+        out.sat = sv;
+        return true;
     });
 }
 
@@ -277,7 +309,7 @@ static void drawAiActivityBadge(ImVec2 vr0, ImVec2 vr1, const std::string& statu
     // so the badge's contrast tracks the live scene under it. Accent pulse border/dot stay
     // palette (a semantic "live" cue, not surface text).
     const ui::AdaptiveSurface& surf =
-        ui::adaptivePanel(ui::panelId("vp_ai_badge"), ImRect(p0, p1));
+        ui::adaptivePanel(ui::panelId("vp_ai_badge"), ImRect(p0, p1), ui::GlassGroup::Hud);
     ui::glassPanel(dl, ImRect(p0, p1), ui::GlassLevel::UltraThin, h * 0.5f / S, surf);
     dl->AddRect(p0, p1, withAlpha(pal.accent, 0.35f + 0.45f * pulse), h * 0.5f, 0, 1.5f * S);
     ImVec2 dotc(p0.x + padX + dotR, (p0.y + p1.y) * 0.5f);
@@ -496,6 +528,11 @@ struct DimDrag {
     std::string param;                // the param key being driven ("depth"/"radius"/"angle"/…)
     bool        angle    = false;     // true => value is degrees (drag maps px->deg)
     bool        allowZero = false;    // 0 is a valid value (draft/twist/offset) => drag floor is 0
+    // PMFieldDef range metadata (canonical mm/deg). rangeMax > rangeMin => BOUNDED field (revolve
+    // angle 0..360, draft 0..89, k-factor 0..1) — the drag clamps to [rangeMin, rangeMax] and the
+    // allowZero/size-floor heuristic is bypassed. Signed offsets carry rangeMin = -1e9.
+    double      rangeMin = 0.0;
+    double      rangeMax = 0.0;
     std::string label;                // PM label ("Depth"/"Radius"/"Angle"/…)
     std::string checkpoint;           // doc_checkpoint id taken on press (for revert/cancel)
     nlohmann::json baseParams;        // the feature's params at press (full; one field changes)
@@ -543,6 +580,8 @@ struct DimCandidate {
     std::string label;
     bool        angle = false;
     bool        allowZero = false;  // 0 is a valid value (draft/twist/offset) -> drag floor is 0
+    double      rangeMin = 0.0;     // PMFieldDef::dimMin (canonical mm/deg)
+    double      rangeMax = 0.0;     // PMFieldDef::dimMax; > rangeMin => bounded field
     double      value = 0.0;        // current stored value (mm or deg)
     float       anchor[3] = {0, 0, 0};
     Vec3        dirW;               // unit world direction the dim is measured along (length dims)
@@ -701,6 +740,10 @@ static std::vector<DimCandidate> dimCandidates(AppState& st, const std::string& 
         // is a legitimate value — so dragging it must be able to reach 0 rather than clamping to the
         // size floor (0.1mm / 1deg) that protects genuine size dims (depth/radius/revolve angle).
         c.allowZero = (fd.dimDefault == 0.0);
+        // Carry the form's range metadata: a bounded field's drag clamps to [dimMin, dimMax]
+        // (replacing the allowZero heuristic); unbounded signed fields lower the floor to dimMin.
+        c.rangeMin = fd.dimMin;
+        c.rangeMax = fd.dimMax;
         c.dirW = dimWorldDir(fd.key);
         if (hasAnchor) {
             // Spread the handles around the anchor so chips/arrows don't stack: nudge each one a
@@ -1030,13 +1073,64 @@ static void ppDashedLine(ImDrawList* dl, const ImVec2& a, const ImVec2& b, ImU32
                          float dash, float gap) {
     float dx = b.x - a.x, dy = b.y - a.y;
     float len = std::sqrt(dx * dx + dy * dy);
-    if (len < 1e-3f) { dl->AddCircle(a, 4.0f, col, 12, thick); return; }
+    if (len < 1e-3f) { dl->AddCircle(a, 4.0f * ui::uiScale, col, 0, thick); return; }
     float ux = dx / len, uy = dy / len;
     for (float t = 0.0f; t < len; t += dash + gap) {
         float e = std::min(t + dash, len);
         dl->AddLine(ImVec2(a.x + ux * t, a.y + uy * t),
                     ImVec2(a.x + ux * e, a.y + uy * e), col, thick);
     }
+}
+
+// One shared Instant3D manipulator arrow (push-pull face handle + dimension handles — the two
+// previously-diverging arrowHead lambdas; contrast audit P1). A bidirectional accent arrow with:
+// a soft accentSoft glow while hovered/dragged, a thin dark canvas-ink rim under shaft + heads so
+// the handle stays legible over faces of any color, solid AA heads, and a hub disc + soft ring.
+// (dx,dy) is the unit screen direction toward tipP; headLen/headW/shaftW are logical px
+// (pre-uiScale) so each call site keeps its authored sizes.
+static void drawManipArrow(ImDrawList* dl, const ImVec2& c, const ImVec2& tipP, const ImVec2& tipN,
+                           float dx, float dy, float headLen, float headW, float shaftW,
+                           bool hot, bool dragging) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const ImU32 acc  = ui::Palette::toU32(pal.accent);
+    const ImU32 accS = ui::Palette::toU32(pal.accentSoft);
+    float rimF[4]; ui::Palette::withAlpha(pal.viewportEdge, rimF, 0.80f);
+    const ImU32 rim = ui::Palette::toU32(rimF);
+    const float lw = (dragging ? 3.0f : (hot ? shaftW + 0.6f : shaftW)) * sc;
+    const float hl = headLen * sc, hw = headW * sc;
+    // Arrowhead corners for one tip; `grow` inflates the triangle for the rim under-pass.
+    auto headPts = [&](const ImVec2& tip, float hdx, float hdy, float grow,
+                       ImVec2& tp, ImVec2& l, ImVec2& r) {
+        tp = ImVec2(tip.x + hdx * grow, tip.y + hdy * grow);
+        ImVec2 base(tip.x - hdx * hl, tip.y - hdy * hl);
+        l = ImVec2(base.x + hdy * (hw + grow), base.y - hdx * (hw + grow));
+        r = ImVec2(base.x - hdy * (hw + grow), base.y + hdx * (hw + grow));
+    };
+    // Hover/drag glow: wide accentSoft under-stroke (soft halo that reads on light AND dark faces).
+    if (hot || dragging) {
+        dl->AddLine(c, tipP, accS, lw + 5.0f * sc);
+        dl->AddLine(c, tipN, accS, lw + 5.0f * sc);
+    }
+    // Contrast rim, then accent strokes on top.
+    dl->AddLine(c, tipP, rim, lw + 2.0f * sc);
+    dl->AddLine(c, tipN, rim, lw + 2.0f * sc);
+    dl->AddLine(c, tipP, acc, lw);
+    dl->AddLine(c, tipN, acc, lw);
+    for (int e = 0; e < 2; ++e) {
+        const ImVec2& tip = e ? tipN : tipP;
+        float hdx = e ? -dx : dx, hdy = e ? -dy : dy;
+        ImVec2 tp, l, r;
+        headPts(tip, hdx, hdy, 1.2f * sc, tp, l, r);
+        dl->AddTriangleFilled(tp, l, r, rim);   // inflated rim head underneath
+        headPts(tip, hdx, hdy, 0.0f, tp, l, r);
+        dl->AddTriangleFilled(tp, l, r, acc);   // solid AA accent head
+    }
+    // Hub: rim disc under an accent disc + soft ring.
+    const float hubR = (dragging ? 4.0f : (hot ? 3.5f : 3.0f)) * sc;
+    dl->AddCircleFilled(c, hubR + 1.0f * sc, rim);
+    dl->AddCircleFilled(c, hubR, acc);
+    dl->AddCircle(c, (dragging ? 7.0f : 5.0f) * sc, accS, 0, 1.5f * sc);
 }
 
 // SolidWorks-style fillet/chamfer edit overlay: the live body shows the ROUND, while each selected
@@ -1053,8 +1147,12 @@ static bool drawBlendEdgeOverlay(AppState& st, const Renderer& renderer, ImGuiIO
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float S = ui::uiScale;
-    const ImU32 colSel = IM_COL32(255, 178, 44, 230);   // amber dashed = selected original edge
-    const ImU32 colHot = IM_COL32(255, 232, 130, 255);  // brighter = hovered deselect target
+    // Palette roles (contrast audit P2): statusWarn is the semantic "original-edge ghost" amber in
+    // both themes; the hovered deselect target switches to accent so the hover state gains chroma
+    // contrast instead of a paler wash that vanished over light faces.
+    float selF[4]; ui::Palette::withAlpha(ui::palette.statusWarn, selF, 0.90f);
+    const ImU32 colSel = ui::Palette::toU32(selF);
+    const ImU32 colHot = ui::Palette::toU32(ui::palette.accent);
     const float tol = 8.0f * S;
 
     // Project each edge polyline to screen. A point fails to project when it's behind the camera; we
@@ -1468,13 +1566,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // content rect. cr0/cr1 anchor the HUD chrome and drive the lens-shift re-centering.
         const ImVec2 cr0 = ImGui::GetCursorScreenPos();
         const ImVec2 cr1 = ImVec2(cr0.x + avail.x, cr0.y + avail.y);
-        // The 3D renders full-WIDTH so it sits behind the translucent FeatureManager, but keeps the
-        // content-region HEIGHT so the part's framing/apparent size is byte-identical to before (a
-        // full-window-height FBO would frame the part larger). With no side panes the content rect
-        // already spans the full width, so this is a no-op (lens shift 0) — identical to before.
+        // Overlay layout: the 3D band renders full-WIDTH (behind the translucent pinned columns)
+        // AND full-HEIGHT of this window — from the window top (under the floating doc-tab strip)
+        // down to the content bottom — so the studio surface truly spans ribbon-to-status-bar and
+        // the doc tabs float over live 3D. With the splitless central node the content rect already
+        // spans the window width, so the lens shift below self-neutralizes (shift 0).
         ImGuiViewport* mainVp = ImGui::GetMainViewport();
+        const float winTopY = ImGui::GetWindowPos().y;   // == dockspace top (central node fills it)
         int vw = (int)mainVp->Size.x > 64 ? (int)mainVp->Size.x : 64;
-        int vh = (int)avail.y > 64 ? (int)avail.y : 64;
+        int vh = (int)(cr1.y - winTopY) > 64 ? (int)(cr1.y - winTopY) : 64;
         renderer.resize(vw, vh);
         // C18: lock the camera normal to the sketch plane while editing a sketch — UNTIL the user
         // middle-drags to rotate (SolidWorks lets you orbit a sketch). s_sketchRotated latches that
@@ -1657,6 +1757,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             int clipCount = renderer.sectionClip(clipN, clipOff);
             st.idPass->setSectionClip(clipCount, clipN, clipOff);
             st.overlays->setSectionClip(clipCount, clipN, clipOff);
+            // HiDPI: overlay line/point widths are authored in logical px; the overlays draw into
+            // the supersampled FBO, so fold BOTH the supersample factor and the UI scale in.
+            st.overlays->setWidthScale((float)renderer.supersample() * ui::uiScale);
             // Render the R32UI id buffer for this exact camera frame so picks are pixel-accurate.
             st.idPass->render(renderer.camera());
             st.pickReady = true;
@@ -1676,38 +1779,37 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 std::vector<uint64_t> fix, load;
                 st.simManager->collectFixtureFaces(fix);
                 st.simManager->collectLoadFaces(load);
-                static const float kFixCol[4]  = {0.18f, 0.80f, 0.36f, 0.45f};  // green
-                static const float kLoadCol[4] = {0.95f, 0.27f, 0.20f, 0.45f};  // red
-                if (!fix.empty())  st.overlays->drawFaceWash(renderer.camera(), fix, kFixCol);
-                if (!load.empty()) st.overlays->drawFaceWash(renderer.camera(), load, kLoadCol);
+                const auto& vpal = ui::palette;   // sim/flow/CAM overlay roles (theme-tunable)
+                if (!fix.empty())  st.overlays->drawFaceWash(renderer.camera(), fix, vpal.simFixture);
+                if (!load.empty()) st.overlays->drawFaceWash(renderer.camera(), load, vpal.simLoad);
                 // 3D indicators on top of the washes: red arrows for loads (force along the vector,
                 // pressure into the face) and green ground glyphs at fixtures — so direction + which
-                // faces are constrained/loaded read at a glance, not just a flat tint.
-                std::vector<float> loadSegs, fixSegs;
-                st.simManager->collectIndicatorSegments(st, loadSegs, fixSegs);
-                static const float kArrowCol[4] = {0.95f, 0.27f, 0.20f, 1.0f};
-                static const float kGlyphCol[4] = {0.10f, 0.66f, 0.30f, 1.0f};
-                if (!loadSegs.empty()) st.overlays->drawSegments(renderer.camera(), loadSegs, kArrowCol, 2.5f);
-                if (!fixSegs.empty())  st.overlays->drawSegments(renderer.camera(), fixSegs,  kGlyphCol, 2.5f);
+                // faces are constrained/loaded read at a glance, not just a flat tint. The optional
+                // triangle batches carry the SOLID cone heads / anchor glyphs (sim_manager emits
+                // legacy wireframe heads when the out-params are omitted).
+                std::vector<float> loadSegs, fixSegs, loadTris, fixTris;
+                st.simManager->collectIndicatorSegments(st, loadSegs, fixSegs, &loadTris, &fixTris);
+                if (!loadSegs.empty()) st.overlays->drawSegments(renderer.camera(), loadSegs, vpal.simArrow, 2.5f);
+                if (!fixSegs.empty())  st.overlays->drawSegments(renderer.camera(), fixSegs,  vpal.simGlyph, 2.5f);
+                if (!loadTris.empty()) st.overlays->drawTriangles(renderer.camera(), loadTris, vpal.simArrow);
+                if (!fixTris.empty())  st.overlays->drawTriangles(renderer.camera(), fixTris,  vpal.simGlyph);
                 // Mesh-preview wireframe (surface element edges) while setting the study up.
                 if (st.simManager->hasMeshPreview(st)) {
-                    static const float kMeshCol[4] = {0.55f, 0.74f, 0.95f, 0.55f};
                     st.overlays->drawSegments(renderer.camera(),
-                                              st.simManager->meshPreviewSegments(), kMeshCol, 1.0f);
+                                              st.simManager->meshPreviewSegments(), vpal.simMesh, 1.0f);
                 }
             }
             // Flow-study setup preview: incoming-flow arrows + the wind-tunnel domain box + inlet plane,
             // sized to the model and oriented by the base axis / AoA / sideslip, so the user sees how the
             // analysis is framed before committing minutes to a solve.
             if (st.simManager && st.simManager->flowSetupActive(st)) {
-                std::vector<float> arrowSegs, domainSegs, inletSegs;
-                st.simManager->collectFlowSetup(st, arrowSegs, domainSegs, inletSegs);
-                static const float kFlowArrow[4]  = {0.28f, 0.70f, 0.98f, 1.0f};  // bright blue stream
-                static const float kFlowDomain[4] = {0.45f, 0.55f, 0.68f, 0.55f}; // grey tunnel box
-                static const float kFlowInlet[4]  = {0.30f, 0.80f, 0.85f, 0.75f}; // teal inlet
-                if (!domainSegs.empty()) st.overlays->drawSegments(renderer.camera(), domainSegs, kFlowDomain, 1.2f);
-                if (!inletSegs.empty())  st.overlays->drawSegments(renderer.camera(), inletSegs, kFlowInlet, 1.5f);
-                if (!arrowSegs.empty())  st.overlays->drawSegments(renderer.camera(), arrowSegs, kFlowArrow, 2.5f);
+                std::vector<float> arrowSegs, domainSegs, inletSegs, arrowTris;
+                st.simManager->collectFlowSetup(st, arrowSegs, domainSegs, inletSegs, &arrowTris);
+                const auto& vpal = ui::palette;
+                if (!domainSegs.empty()) st.overlays->drawSegments(renderer.camera(), domainSegs, vpal.flowDomain, 1.2f);
+                if (!inletSegs.empty())  st.overlays->drawSegments(renderer.camera(), inletSegs, vpal.flowInlet, 1.5f);
+                if (!arrowSegs.empty())  st.overlays->drawSegments(renderer.camera(), arrowSegs, vpal.flowArrow, 2.5f);
+                if (!arrowTris.empty())  st.overlays->drawTriangles(renderer.camera(), arrowTris, vpal.flowArrow);
             }
             // Flow-study result: speed-colored streamlines + velocity slices drawn OVER the (still
             // visible, Cp-colored) model. Each batch is one speed band drawn in its ramp colour.
@@ -1722,16 +1824,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // (faint red), lead (green), plunge (cyan), cut (blue), arc (violet). The CAM panel
             // owns the segment batches; nullptr when the panel is hidden or backplot is off.
             if (const ui::CamBackplot* bp = ui::camActiveBackplot()) {
-                static const float kRapid[4]  = {0.78f, 0.24f, 0.20f, 0.55f};
-                static const float kLead[4]   = {0.31f, 0.78f, 0.47f, 0.95f};
-                static const float kPlunge[4] = {0.31f, 0.71f, 0.86f, 0.95f};
-                static const float kCut[4]    = {0.35f, 0.59f, 0.94f, 1.0f};
-                static const float kArc[4]    = {0.59f, 0.51f, 0.94f, 1.0f};
-                if (!bp->rapid.empty())  st.overlays->drawSegments(renderer.camera(), bp->rapid,  kRapid,  1.0f, false);
-                if (!bp->lead.empty())   st.overlays->drawSegments(renderer.camera(), bp->lead,   kLead,   1.6f, false);
-                if (!bp->plunge.empty()) st.overlays->drawSegments(renderer.camera(), bp->plunge, kPlunge, 1.6f, false);
-                if (!bp->cut.empty())    st.overlays->drawSegments(renderer.camera(), bp->cut,    kCut,    1.8f, false);
-                if (!bp->arc.empty())    st.overlays->drawSegments(renderer.camera(), bp->arc,    kArc,    1.8f, false);
+                const auto& vpal = ui::palette;
+                if (!bp->rapid.empty())  st.overlays->drawSegments(renderer.camera(), bp->rapid,  vpal.camRapid,  1.0f, false);
+                if (!bp->lead.empty())   st.overlays->drawSegments(renderer.camera(), bp->lead,   vpal.camLead,   1.6f, false);
+                if (!bp->plunge.empty()) st.overlays->drawSegments(renderer.camera(), bp->plunge, vpal.camPlunge, 1.6f, false);
+                if (!bp->cut.empty())    st.overlays->drawSegments(renderer.camera(), bp->cut,    vpal.camCut,    1.8f, false);
+                if (!bp->arc.empty())    st.overlays->drawSegments(renderer.camera(), bp->arc,    vpal.camArc,    1.8f, false);
             }
             std::vector<render::PickHit> selHits;
             selHits.reserve(st.selection.size());
@@ -1754,11 +1852,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         }
 
         // W2 full-bleed viewport: the shaded 3D is composited on the BACKGROUND draw list so it sits
-        // BEHIND every panel — full window WIDTH (visible behind the translucent FeatureManager) at
-        // the content-region vertical band. vr0/vr1 is this image's exact screen rect; ppProject, the
-        // id-pick mouse->pixel mapping, and every projected overlay read it, so they stay pixel-exact
-        // with the model (the lens shift lives in cam_.mvp, the rect is just the NDC->screen map).
-        ImVec2 vr0(mainVp->Pos.x, cr0.y);
+        // BEHIND every panel — full window WIDTH (visible behind the translucent FeatureManager) and
+        // full window HEIGHT (the doc-tab strip floats over live 3D). vr0/vr1 is this image's exact
+        // screen rect; ppProject, the id-pick mouse->pixel mapping, and every projected overlay read
+        // it, so they stay pixel-exact (the lens shift lives in cam_.mvp; the rect is the NDC map).
+        ImVec2 vr0(mainVp->Pos.x, winTopY);   // window top: the 3D runs under the doc-tab strip
         ImVec2 vr1(vr0.x + (float)vw, vr0.y + (float)vh);  // == vr0 + (vw,vh) so it matches ppProject + the FBO exactly
         ImGui::GetBackgroundDrawList()->AddImage(
             (ImTextureID)(intptr_t)renderer.resolvedColorTexture(), vr0, vr1,
@@ -1782,10 +1880,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             s_bdMax = vr1;
             s_bdLive = bdInfo.valid();
         }
-        // (The dock-tab band that used to paint here was removed: drawDocTabs() now paints a single
-        // opaque band for the whole tab row — covering both the strip and the window-padding gap above
-        // it — so there is no longer a second translucent fill to stack against it. The 3D image below
-        // starts at cr0 (under the strip), so nothing bleeds through the row.)
+        // (The dock-tab band that used to paint here was removed: drawDocTabs() paints one glass
+        // band for the whole tab row; the 3D image now starts at the window TOP, so the strip's
+        // glass projects live 3D instead of a dead panel fill.)
         // Input surface: an invisible button over the visible 3D (the content rect). It carries the
         // hover/active state the navigation, picking, and drag-drop target all read (imgHovered),
         // exactly as the old ImGui::Image item did — minus the opaque quad that would hide the 3D.
@@ -2146,6 +2243,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         s_dim.param       = c.param;
                         s_dim.angle       = c.angle;
                         s_dim.allowZero   = c.allowZero;
+                        s_dim.rangeMin    = c.rangeMin;
+                        s_dim.rangeMax    = c.rangeMax;
                         s_dim.label       = c.label;
                         s_dim.oldValue    = c.value;
                         s_dim.curValue    = c.value;
@@ -2171,17 +2270,23 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         newVal = s_dim.oldValue + (double)px * (double)s_dim.degPerPx;
                     else
                         newVal = s_dim.oldValue + (double)px * (double)s_dim.worldPerPx;
-                    // Clamp to a sane minimum (mirror the engine push-pull floor of 0.1mm; angles to
-                    // 1..360 deg). Flag clamped so the readout shows the limit. Dims where 0 is a
-                    // valid value (draft angle, sweep twist, offsets) floor at 0 instead — otherwise
-                    // a draft set by dragging could never be dragged back to 0 (no taper).
+                    // Clamp per the form's range metadata: a BOUNDED field (revolve angle 0..360,
+                    // draft 0..89, k-factor 0..1) clamps to [dimMin, dimMax]; unbounded fields keep
+                    // the sane-minimum heuristic (engine push-pull floor 0.1mm / 1deg; dims where 0
+                    // is valid floor at 0; signed offsets carry rangeMin = -1e9 and go negative).
+                    // Flag clamped so the readout shows the limit.
                     s_dim.clamped = false;
-                    if (s_dim.angle) {
-                        double lo = s_dim.allowZero ? 0.0 : 1.0;
+                    if (s_dim.rangeMax > s_dim.rangeMin) {
+                        if (newVal < s_dim.rangeMin) { newVal = s_dim.rangeMin; s_dim.clamped = true; }
+                        if (newVal > s_dim.rangeMax) { newVal = s_dim.rangeMax; s_dim.clamped = true; }
+                    } else if (s_dim.angle) {
+                        double lo = s_dim.rangeMin < 0.0 ? s_dim.rangeMin
+                                                         : (s_dim.allowZero ? 0.0 : 1.0);
                         if (newVal < lo)    { newVal = lo;    s_dim.clamped = true; }
                         if (newVal > 360.0) { newVal = 360.0; s_dim.clamped = true; }
                     } else {
-                        double lo = s_dim.allowZero ? 0.0 : 0.1;
+                        double lo = s_dim.rangeMin < 0.0 ? s_dim.rangeMin
+                                                         : (s_dim.allowZero ? 0.0 : 0.1);
                         if (newVal < lo)    { newVal = lo;    s_dim.clamped = true; }
                     }
                     s_dim.curValue = newVal;
@@ -2638,7 +2743,20 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const int nHU = 8;
             float barW = nHU * btn + (nHU - 1) * gap + padX * 2;
             float barH = btn + padY * 2;
-            float bx0  = cr1.x - barW - 10.0f * s;
+            // Anchor LEFT of the pinned Copilot column — the raw cr1-relative anchor put the
+            // toolbar underneath the floating glass column, unreachable (visual-review fix).
+            float hudRight = cr1.x;
+            {
+                const float e = ui::overlayColumnEdge(1);
+                if (e > cr0.x + barW + 40.0f * s && e < cr1.x) hudRight = e;
+            }
+            float bx0  = hudRight - barW - 10.0f * s;
+            // Never let the toolbar slide under the FeatureManager column either (left clamp), so its
+            // icons can't overlap the pinned columns' text on any window width / panel size.
+            {
+                const float fe = ui::overlayColumnEdge(0);
+                if (fe > cr0.x && bx0 < fe + 10.0f * s) bx0 = fe + 10.0f * s;
+            }
             float by0  = cr0.y + 6.0f * s;
             float byi  = by0 + padY;
 
@@ -2648,10 +2766,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const bool hudHot = hudZone.Contains(mp) || s_zoomAreaArmed ||
                 ImGui::IsPopupOpen("##hu_vieworient") || ImGui::IsPopupOpen("##hu_dispstyle") ||
                 ImGui::IsPopupOpen("##hu_hideshow");
-            const float targetFade = hudHot ? 1.0f : 0.20f;
+            // Idle floor raised 0.20 -> 0.38 (contrast audit P1): at 0.20 the idle icons landed at
+            // ~25% alpha and vanished over busy/contrasty models. The icon floor and a fixed halo
+            // minimum below keep the resting toolbar findable over ANY backdrop.
+            const float targetFade = hudHot ? 1.0f : 0.38f;
             s_huFade += (targetFade - s_huFade) * std::min(1.0f, io.DeltaTime * 10.0f);
             const float pillA = 0.38f * s_huFade;
-            const int iconA = (int)(220.0f * s_huFade + 20.0f);
+            const int iconA = (int)(200.0f * s_huFade + 55.0f);
+            // Halo never fades below half strength — it's the rescue exactly when idle.
+            const float haloA = std::max(s_huFade, 0.5f);
 
             // Liquid-glass v2 (H6a): per-pill AdaptiveSurface (id = panelId(iconName), window-
             // independent) drives both the frosted UltraThin glassPanel AND the icon/halo tone, so
@@ -2661,7 +2784,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                               const char* iconName) -> const ui::AdaptiveSurface& {
                 ImVec2 mn(bxi, by), mx(bxi + btn, by + btn);
                 const ui::AdaptiveSurface& surf =
-                    ui::adaptivePanel(ui::panelId(iconName), ImRect(mn, mx));
+                    ui::adaptivePanel(ui::panelId(iconName), ImRect(mn, mx), ui::GlassGroup::Hud);
                 ui::glassPanel(hdl, ImRect(mn, mx), ui::GlassLevel::UltraThin, 4.0f, surf,
                               s_huFade * (selected ? 1.0f : 0.85f));
                 if (selected && s_huFade > 0.55f)
@@ -2686,7 +2809,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 ImVec4 iconCol = surf.textPrimary; iconCol.w *= (iconA / 255.0f);
                 ui::drawIconGlass(hdl, iconName, ImVec2(bxi + btn * 0.5f, byi + btn * 0.5f), iz,
                                   ImGui::ColorConvertFloat4ToU32(iconCol),
-                                  ui::glassIconHalo(surf, s_huFade));
+                                  ui::glassIconHalo(surf, haloA));
                 if (hov) ImGui::SetTooltip("%s", tip);
                 ImGui::PopID();
                 return clicked;
@@ -2743,7 +2866,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     ui::drawIconGlass(hdl, "view_selector",
                                       ImVec2(bxi + btn * 0.5f, byi + btn * 0.5f), iz,
                                       ImGui::ColorConvertFloat4ToU32(iconCol),
-                                      ui::glassIconHalo(surf, s_huFade));
+                                      ui::glassIconHalo(surf, haloA));
                 }
                 if (hov) ImGui::SetTooltip("View Orientation");
                 if (clicked) ImGui::OpenPopup("##hu_vieworient");
@@ -2809,7 +2932,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     ImVec4 iconCol = surf.textPrimary; iconCol.w *= (iconA / 255.0f);
                     ui::drawIconGlass(hdl, curIcon, ImVec2(bxi + btn * 0.5f, byi + btn * 0.5f), iz,
                                       ImGui::ColorConvertFloat4ToU32(iconCol),
-                                      ui::glassIconHalo(surf, s_huFade));
+                                      ui::glassIconHalo(surf, haloA));
                 }
                 if (hov) ImGui::SetTooltip("Display Style");
                 if (clicked) ImGui::OpenPopup("##hu_dispstyle");
@@ -2859,7 +2982,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     ui::drawIconGlass(hdl, "hide_show_eye",
                                       ImVec2(bxi + btn * 0.5f, byi + btn * 0.5f), iz,
                                       ImGui::ColorConvertFloat4ToU32(iconCol),
-                                      ui::glassIconHalo(surf, s_huFade));
+                                      ui::glassIconHalo(surf, haloA));
                 }
                 if (hov) ImGui::SetTooltip("Hide / Show Items");
                 if (clicked) ImGui::OpenPopup("##hu_hideshow");
@@ -2919,11 +3042,9 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // ---- overlays on the 3D view ----
         ImDrawList* vdl = ImGui::GetWindowDrawList();
         {
-            // Cache overlay colors as ImU32 from the palette for this frame.
+            // Palette handle for this frame's overlays (all pills are glass-v2 adaptive now; the
+            // legacy overlayBg/overlayText ImU32 cache is gone with its last consumers).
             const auto& vpal = ui::palette;
-            const ImU32 overlayBg   = ui::Palette::toU32(vpal.overlayBg);
-            const ImU32 overlayBord = ui::Palette::toU32(vpal.overlayBorder);
-            const ImU32 overlayTxt  = ui::Palette::toU32(vpal.overlayText);
 
         if (busy) {
             // live progress pill: pulsing dot + the agent's current phase
@@ -2933,7 +3054,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             ImVec2 p0(cr0.x + 8 * ui::uiScale, cr0.y + 8 * ui::uiScale);
             ImVec2 p1(p0.x + (ts.x > maxW ? maxW : ts.x) + 28.0f * ui::uiScale, p0.y + ts.y + 8.0f * ui::uiScale);
             const ui::AdaptiveSurface& busySurf =
-                ui::adaptivePanel(ui::panelId("vp_busy"), ImRect(p0, p1));
+                ui::adaptivePanel(ui::panelId("vp_busy"), ImRect(p0, p1), ui::GlassGroup::Hud);
             ui::glassPanel(vdl, ImRect(p0, p1), ui::GlassLevel::UltraThin,
                           (p1.y - p0.y) * 0.5f / ui::uiScale, busySurf);
             float pulse = 0.35f + 0.65f * (0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 5.0f));
@@ -2947,14 +3068,23 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             vdl->PopClipRect();
         }
         if (st.hasDocMesh && !st.pickStatus.empty()) {
-            // pick readout, top-right ("Face 12 of Body1")
+            // pick readout, top-right ("Face 12 of Body1") — anchored LEFT of the pinned Copilot
+            // column, like the heads-up toolbar, so the text never ghosts under the glass column.
             ImVec2 ts = ImGui::CalcTextSize(st.pickStatus.c_str());
             const float s2 = ui::uiScale;
-            ImVec2 p1(cr1.x - 8 * s2, cr0.y + 8 * s2);
+            float pickRight = cr1.x;
+            {
+                const float e = ui::overlayColumnEdge(1);
+                if (e > cr0.x + ts.x + 60.0f * s2 && e < cr1.x) pickRight = e;
+            }
+            // Below the heads-up toolbar row (btn 22 + pad 2*2 + inset 6) when that row is drawn,
+            // else at the top inset — the two used to stack on the same corner and the readout
+            // ghosted the toolbar icons.
+            ImVec2 p1(pickRight - 8 * s2, cr0.y + (inSketch ? 8.0f : 40.0f) * s2);
             ImVec2 p0(p1.x - ts.x - 14.0f * s2, p1.y);
             ImVec2 p1b(p1.x, p1.y + ts.y + 8.0f * s2);
             const ui::AdaptiveSurface& pickSurf =
-                ui::adaptivePanel(ui::panelId("vp_pick_status"), ImRect(p0, p1b));
+                ui::adaptivePanel(ui::panelId("vp_pick_status"), ImRect(p0, p1b), ui::GlassGroup::Hud);
             ui::glassPanel(vdl, ImRect(p0, p1b), ui::GlassLevel::UltraThin, 5.0f, pickSurf);
             ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
                          ImVec2(p0.x + 7 * s2, p0.y + 4 * s2), pickSurf, st.pickStatus.c_str());
@@ -2980,27 +3110,21 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     ppHandleVisible = true;
                     const auto& vpal2 = ui::palette;
                     const ImU32 acc  = ui::Palette::toU32(vpal2.accent);
-                    const ImU32 accS = ui::Palette::toU32(vpal2.accentSoft);
                     float sc = ui::uiScale;
                     bool dragging = s_pp.active;
-                    float lw = (dragging ? 3.0f : 2.2f) * sc;
-                    // Shaft (centroid -> +normal tip, and centroid -> -normal tip).
-                    vdl->AddLine(cSp, tipP, acc, lw);
-                    vdl->AddLine(cSp, tipN, acc, lw);
-                    // Arrowheads at both tips.
-                    auto arrowHead = [&](const ImVec2& tip, float dx, float dy) {
-                        float hl = 9.0f * sc, hw = 5.0f * sc;
-                        // back along the shaft from the tip, then +/- perpendicular.
-                        ImVec2 base(tip.x - dx * hl, tip.y - dy * hl);
-                        ImVec2 l(base.x - (-dy) * hw, base.y - (dx) * hw);
-                        ImVec2 r(base.x + (-dy) * hw, base.y + (dx) * hw);
-                        vdl->AddTriangleFilled(tip, l, r, acc);
-                    };
-                    arrowHead(tipP,  nsx,  nsy);
-                    arrowHead(tipN, -nsx, -nsy);
-                    // Hub at the centroid.
-                    vdl->AddCircleFilled(cSp, (dragging ? 4.0f : 3.0f) * sc, acc);
-                    vdl->AddCircle(cSp, (dragging ? 7.0f : 5.0f) * sc, accS, 0, 1.5f * sc);
+                    // Capsule hover test (same perp/along band the tooltip used) BEFORE drawing,
+                    // so the handle itself brightens + gains a soft halo under the cursor.
+                    bool hovArrow = false;
+                    if (!dragging) {
+                        ImVec2 mp = io.MousePos;
+                        float dxh = mp.x - cSp.x, dyh = mp.y - cSp.y;
+                        float perp  = std::fabs(dxh * (-nsy) + dyh * nsx);
+                        float along = std::fabs(dxh * nsx + dyh * nsy);
+                        float armLenPx = 46.0f * sc;
+                        hovArrow = perp <= 10.0f * sc && along <= armLenPx + 10.0f * sc;
+                    }
+                    drawManipArrow(vdl, cSp, tipP, tipN, nsx, nsy, 9.0f, 5.0f, 2.2f,
+                                   hovArrow, dragging);
 
                     // Live readout chip near the cursor while dragging.
                     if (dragging && s_pp.haveReadout) {
@@ -3018,23 +3142,19 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         if (q1.x > cr1.x - 4) { float w = q1.x - q0.x; q1.x = cr1.x - 4; q0.x = q1.x - w; }
                         if (q1.y > cr1.y - 4) { float h = q1.y - q0.y; q1.y = cr1.y - 4; q0.y = q1.y - h; }
                         const ui::AdaptiveSurface& ppSurf =
-                            ui::adaptivePanel(ui::panelId("vp_pp_readout"), ImRect(q0, q1));
+                            ui::adaptivePanel(ui::panelId("vp_pp_readout"), ImRect(q0, q1),
+                                              ui::GlassGroup::Hud);
                         ui::glassPanel(vdl, ImRect(q0, q1), ui::GlassLevel::UltraThin, 4.0f, ppSurf);
+                        // statusWarn = the semantic "limit" amber in both themes (was a literal).
                         ImU32 chipBord = s_pp.clamped
-                            ? ImGui::ColorConvertFloat4ToU32(ImVec4(0.90f, 0.55f, 0.25f, 1.0f))
+                            ? ui::Palette::toU32(vpal2.statusWarn)
                             : acc;
                         vdl->AddRect(q0, q1, chipBord, 4.0f * sc);
                         ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
                                      ImVec2(q0.x + padX, q0.y + padY), ppSurf, txt.c_str());
-                    } else if (!dragging) {
+                    } else if (!dragging && hovArrow) {
                         // Hint tooltip when hovering the handle (not dragging).
-                        ImVec2 mp = io.MousePos;
-                        float dxh = mp.x - cSp.x, dyh = mp.y - cSp.y;
-                        float perp  = std::fabs(dxh * (-nsy) + dyh * nsx);
-                        float along = std::fabs(dxh * nsx + dyh * nsy);
-                        float armLenPx = 46.0f * ui::uiScale;
-                        if (perp <= 10.0f * sc && along <= armLenPx + 10.0f * sc)
-                            ImGui::SetTooltip("Drag to push/pull this face");
+                        ImGui::SetTooltip("Drag to push/pull this face");
                     }
                 }
             }
@@ -3059,7 +3179,6 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 auto cands = dimCandidates(st, dimRenderFid);
                 const auto& vpal2 = ui::palette;
                 const ImU32 acc  = ui::Palette::toU32(vpal2.accent);
-                const ImU32 accS = ui::Palette::toU32(vpal2.accentSoft);
                 float sc = ui::uiScale;
                 ImVec2 mp = io.MousePos;
                 for (const auto& c : cands) {
@@ -3073,71 +3192,123 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     // the view stays clean; the dragged dim keeps its handle + a live readout.
                     if (s_dim.active && !isDragged) continue;
 
-                    float lw = (isDragged ? 3.0f : 2.0f) * sc;
-                    vdl->AddLine(aSp, tipP, acc, lw);
-                    vdl->AddLine(aSp, tipN, acc, lw);
-                    auto arrowHead = [&](const ImVec2& tip, float dx, float dy) {
-                        float hl = 8.0f * sc, hw = 4.5f * sc;
-                        ImVec2 base(tip.x - dx * hl, tip.y - dy * hl);
-                        ImVec2 l(base.x - (-dy) * hw, base.y - (dx) * hw);
-                        ImVec2 r(base.x + (-dy) * hw, base.y + (dx) * hw);
-                        vdl->AddTriangleFilled(tip, l, r, acc);
-                    };
-                    arrowHead(tipP,  dsx,  dsy);
-                    arrowHead(tipN, -dsx, -dsy);
-                    vdl->AddCircleFilled(aSp, (isDragged ? 4.0f : 3.0f) * sc, acc);
-                    vdl->AddCircle(aSp, (isDragged ? 7.0f : 5.0f) * sc, accS, 0, 1.5f * sc);
-
-                    // Label/value chip. Static = "Depth: 25mm"; dragged = "Depth 25.0 -> 31.5 mm".
-                    std::string label = c.label.empty() ? c.param : c.label;
-                    std::string txt;
-                    if (isDragged && s_dim.haveReadout) {
-                        std::string oldS = c.angle ? (std::to_string((int)std::lround(s_dim.oldValue)) + "°")
-                                                   : ui::pmFormatDim(s_dim.oldValue, st.ips());
-                        std::string newS = c.angle ? (std::to_string((int)std::lround(s_dim.curValue)) + "°")
-                                                   : ui::pmFormatDim(s_dim.curValue, st.ips());
-                        txt = label + " " + oldS + " -> " + newS;
-                        if (s_dim.clamped) txt += (c.angle ? "  (limit)" : "  (min)");
-                    } else {
-                        std::string vS = c.angle ? (std::to_string((int)std::lround(c.value)) + "°")
-                                                 : ui::pmFormatDim(c.value, st.ips());
-                        txt = label + ": " + vS;
-                    }
-                    ImVec2 ts2 = ImGui::CalcTextSize(txt.c_str());
-                    float padX = 7.0f * sc, padY = 3.5f * sc;
-                    // Static chip floats just past the +tip; the dragged chip follows the cursor.
-                    ImVec2 q0 = isDragged
-                        ? ImVec2(mp.x + 16.0f * sc, mp.y + 16.0f * sc)
-                        : ImVec2(tipP.x + 8.0f * sc, tipP.y - (ts2.y + padY * 2) * 0.5f);
-                    ImVec2 q1(q0.x + ts2.x + padX * 2, q0.y + ts2.y + padY * 2);
-                    // keep inside the viewport rect
-                    if (q1.x > cr1.x - 4) { float w = q1.x - q0.x; q1.x = cr1.x - 4; q0.x = q1.x - w; }
-                    if (q0.x < cr0.x + 4) { float w = q1.x - q0.x; q0.x = cr0.x + 4; q1.x = q0.x + w; }
-                    if (q1.y > cr1.y - 4) { float h = q1.y - q0.y; q1.y = cr1.y - 4; q0.y = q1.y - h; }
-                    if (q0.y < cr0.y + 4) { float h = q1.y - q0.y; q0.y = cr0.y + 4; q1.y = q0.y + h; }
-                    const ui::AdaptiveSurface& dimSurf =
-                        ui::adaptivePanel(ui::panelId(c.param.c_str()), ImRect(q0, q1));
-                    ui::glassPanel(vdl, ImRect(q0, q1), ui::GlassLevel::UltraThin, 4.0f, dimSurf);
-                    ImU32 chipBord = (isDragged && s_dim.clamped)
-                        ? ImGui::ColorConvertFloat4ToU32(ImVec4(0.90f, 0.55f, 0.25f, 1.0f))
-                        : acc;
-                    vdl->AddRect(q0, q1, chipBord, 4.0f * sc);
-                    ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
-                                 ImVec2(q0.x + padX, q0.y + padY), dimSurf, txt.c_str());
-
-                    // Hover hint when not dragging and the cursor is over the handle.
+                    // Capsule hover test BEFORE drawing so the handle gains a hover state (shared
+                    // drawManipArrow soft halo + brighter shaft), not just a tooltip.
+                    bool hovArrow = false;
                     if (!s_dim.active) {
                         float dxh = mp.x - aSp.x, dyh = mp.y - aSp.y;
                         float perp  = std::fabs(dxh * (-dsy) + dyh * dsx);
                         float along = std::fabs(dxh * dsx + dyh * dsy);
-                        float armLenPx = 42.0f * ui::uiScale;
-                        if (perp <= 9.0f * sc && along <= armLenPx + 9.0f * sc)
-                            ImGui::SetTooltip(c.angle ? "Drag to change this angle"
-                                                      : "Drag to change this dimension");
+                        float armLenPx = 42.0f * sc;
+                        hovArrow = perp <= 9.0f * sc && along <= armLenPx + 9.0f * sc;
+                    }
+                    drawManipArrow(vdl, aSp, tipP, tipN, dsx, dsy, 8.0f, 4.5f, 2.0f,
+                                   hovArrow, isDragged);
+
+                    // Value chip drawn ONLY while THIS dim is being dragged (the live
+                    // "Depth 25.0 -> 31.5 mm" readout follows the cursor). The resting per-dim values
+                    // no longer float over the geometry — they live in the fixed active-feature status
+                    // panel pinned top-right (left of the Copilot column); see below.
+                    if (isDragged && s_dim.haveReadout) {
+                        std::string label = c.label.empty() ? c.param : c.label;
+                        std::string oldS = c.angle ? (std::to_string((int)std::lround(s_dim.oldValue)) + "°")
+                                                   : ui::pmFormatDim(s_dim.oldValue, st.ips());
+                        std::string newS = c.angle ? (std::to_string((int)std::lround(s_dim.curValue)) + "°")
+                                                   : ui::pmFormatDim(s_dim.curValue, st.ips());
+                        std::string txt = label + " " + oldS + " -> " + newS;
+                        if (s_dim.clamped) txt += (c.angle ? "  (limit)" : "  (min)");
+                        ImVec2 ts2 = ImGui::CalcTextSize(txt.c_str());
+                        float padX = 7.0f * sc, padY = 3.5f * sc;
+                        ImVec2 q0(mp.x + 16.0f * sc, mp.y + 16.0f * sc);
+                        ImVec2 q1(q0.x + ts2.x + padX * 2, q0.y + ts2.y + padY * 2);
+                        // keep inside the viewport rect
+                        if (q1.x > cr1.x - 4) { float w = q1.x - q0.x; q1.x = cr1.x - 4; q0.x = q1.x - w; }
+                        if (q0.x < cr0.x + 4) { float w = q1.x - q0.x; q0.x = cr0.x + 4; q1.x = q0.x + w; }
+                        if (q1.y > cr1.y - 4) { float h = q1.y - q0.y; q1.y = cr1.y - 4; q0.y = q1.y - h; }
+                        if (q0.y < cr0.y + 4) { float h = q1.y - q0.y; q0.y = cr0.y + 4; q1.y = q0.y + h; }
+                        const ui::AdaptiveSurface& dimSurf =
+                            ui::adaptivePanel(ui::panelId(c.param.c_str()), ImRect(q0, q1),
+                                              ui::GlassGroup::Hud);
+                        ui::glassPanel(vdl, ImRect(q0, q1), ui::GlassLevel::UltraThin, 4.0f, dimSurf);
+                        // statusWarn = the semantic "limit" amber in both themes (was a literal).
+                        ImU32 chipBord = s_dim.clamped ? ui::Palette::toU32(vpal2.statusWarn) : acc;
+                        vdl->AddRect(q0, q1, chipBord, 4.0f * sc);
+                        ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
+                                     ImVec2(q0.x + padX, q0.y + padY), dimSurf, txt.c_str());
+                    }
+
+                    // Hover hint when not dragging and the cursor is over the handle.
+                    if (hovArrow)
+                        ImGui::SetTooltip(c.angle ? "Drag to change this angle"
+                                                  : "Drag to change this dimension");
+                }
+            }
+        }
+        // ---- Fixed active-feature readout panel (top-right, left of the Copilot column) ----
+        // While a feature's PropertyManager is creating/editing, its dimensions (Depth, Draft angle,
+        // …) are mirrored into a compact read-only glass panel pinned to the top-right of the
+        // viewport — just left of the Copilot column — instead of floating over the geometry. Editing
+        // still happens in the PM form / by dragging the handles; this is a status readout.
+        {
+            const std::string activeFid =
+                (st.propertyManager && st.propertyManager->hasPreviewTarget())
+                    ? st.propertyManager->targetId() : std::string();
+            if (!inSketch && !activeFid.empty() && st.docMirror.hasDoc()) {
+                std::vector<DimCandidate> cands = dimCandidates(st, activeFid);
+                if (!cands.empty()) {
+                    const float sc = ui::uiScale;
+                    std::string title = "Active Feature";
+                    if (const nlohmann::json* feat = findFeature(st.docMirror.tree(), activeFid)) {
+                        std::string nm = feat->value("name", std::string());
+                        if (nm.empty()) nm = feat->value("type", std::string());
+                        if (!nm.empty()) title = nm;
+                    }
+                    struct Row { std::string k, v; };
+                    std::vector<Row> rows;
+                    rows.reserve(cands.size());
+                    for (const auto& c : cands) {
+                        std::string vS = c.angle
+                            ? (std::to_string((int)std::lround(c.value)) + "°")
+                            : ui::pmFormatDim(c.value, st.ips());
+                        rows.push_back({ c.label.empty() ? c.param : c.label, vS });
+                    }
+                    const float padX = 10.0f * sc, padY = 8.0f * sc;
+                    const float rowH = ImGui::GetTextLineHeight() + 4.0f * sc;
+                    const float headerH = ImGui::GetTextLineHeight() + 8.0f * sc;
+                    float contentW = ImGui::CalcTextSize(title.c_str()).x;
+                    for (const auto& r : rows) {
+                        float w = ImGui::CalcTextSize(r.k.c_str()).x + 20.0f * sc +
+                                  ImGui::CalcTextSize(r.v.c_str()).x;
+                        contentW = std::max(contentW, w);
+                    }
+                    const float panelW = contentW + padX * 2;
+                    const float panelH = padY * 2 + headerH + (float)rows.size() * rowH;
+                    const float cpEdge = ui::overlayColumnEdge(1);
+                    const float x1 = (cpEdge >= 0.0f ? cpEdge : cr1.x) - 12.0f * sc;
+                    const float x0 = x1 - panelW;
+                    const float y0 = cr0.y + 44.0f * sc;   // below the viewport toolbar row
+                    ImRect pr(ImVec2(x0, y0), ImVec2(x1, y0 + panelH));
+                    const ui::AdaptiveSurface& afSurf =
+                        ui::adaptivePanel(ui::panelId("vp_active_feature"), pr, ui::GlassGroup::Hud);
+                    ui::glassPanel(vdl, pr, ui::GlassLevel::Thin, 7.0f, afSurf);
+                    vdl->AddRect(pr.Min, pr.Max, ui::Palette::toU32(ui::palette.accentSoft),
+                                 7.0f * sc, 0, 1.0f * sc);
+                    float ty = y0 + padY;
+                    ui::glassText(vdl, nullptr, ImGui::GetFontSize(), ImVec2(x0 + padX, ty),
+                                  afSurf, title.c_str());
+                    ty += headerH;
+                    for (const auto& r : rows) {
+                        ui::glassText(vdl, nullptr, ImGui::GetFontSize(), ImVec2(x0 + padX, ty),
+                                      afSurf, r.k.c_str());
+                        ImVec2 vsz = ImGui::CalcTextSize(r.v.c_str());
+                        ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
+                                      ImVec2(x1 - padX - vsz.x, ty), afSurf, r.v.c_str());
+                        ty += rowH;
                     }
                 }
             }
         }
+
         // C25 W3-J: apply ground-shadow visibility (last call wins; app.cpp may set it per-frame
         // before viewport_panel runs — the ordering means this value wins for the rendered frame,
         // which is the desired result since viewport_panel calls renderOrbit immediately before).
@@ -3159,16 +3330,26 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Hover: accentSoft circle behind the label. Tooltip: view name.
         if (st.showTriad) {
             const float ts = ui::uiScale;
-            float cx = cr0.x + 34.0f * ts, cy = cr1.y - 34.0f * ts;
-            float L = 20.0f * ts;
+            // Anchor RIGHT of the pinned FeatureManager column — the old cr0-relative anchor put
+            // the triad underneath the floating glass column (visual-review fix).
+            float hudLeft = cr0.x;
+            {
+                const float e = ui::overlayColumnEdge(0);
+                if (e > cr0.x && e < cr1.x - 140.0f * ts) hudLeft = e;
+            }
+            float cx = hudLeft + 52.0f * ts, cy = cr1.y - 52.0f * ts;
+            float L = 30.0f * ts;
             float yawR = st.yaw * 3.14159265f / 180.0f, pitR = st.pitch * 3.14159265f / 180.0f;
             float cyaw = std::cos(yawR), syaw = std::sin(yawR);
             float cpit = std::cos(pitR), spit = std::sin(pitR);
-            auto proj = [&](float wx, float wy, float wz, float& sx, float& sy) {
+            // toCam: +1 when the axis points straight at the camera, -1 straight away — drives the
+            // depth cue (rear axes dim + shorten) so orientation stays readable near edge-on.
+            auto proj = [&](float wx, float wy, float wz, float& sx, float& sy, float& toCam) {
                 float rx = wx * cyaw + wy * syaw;
                 float ry = -wx * syaw + wy * cyaw;
                 sx = rx;
                 sy = -(wz * cpit - ry * spit);
+                toCam = ry * cpit + wz * spit;
             };
             struct Ax {
                 float x, y, z;
@@ -3184,26 +3365,66 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 {0, 1, 0, "Y", ui::palette.axisY, ViewPreset::Front,  "Front",   0.0f,  0.0f},
                 {0, 0, 1, "Z", ui::palette.axisZ, ViewPreset::Top,    "Top",     0.0f, 89.5f},
             };
-            // Draw lines and label chips first (under buttons).
-            for (const auto& a : axes) {
-                float sx, sy; proj(a.x, a.y, a.z, sx, sy);
-                ImVec2 tip(cx + sx * L, cy + sy * L);
-                ImU32 col = ImGui::ColorConvertFloat4ToU32(
-                    ImVec4(a.col[0], a.col[1], a.col[2], 0.95f));
-                vdl->AddLine(ImVec2(cx, cy), tip, col, 1.8f);
+            // Project all three axes, then draw rear-pointing ones first, dimmed and slightly
+            // shortened (contrast audit P1: no depth cue made near-edge-on orientation ambiguous).
+            // Each stroke gets a 1px-ish light halo under-pass so the RGB ink also reads over a
+            // dark part face, matching the glassText halo convention.
+            float toCam[3]; ImVec2 tips[3];
+            for (int ai = 0; ai < 3; ++ai) {
+                float sx, sy; proj(axes[ai].x, axes[ai].y, axes[ai].z, sx, sy, toCam[ai]);
+                float lenMul = 0.85f + 0.15f * (0.5f + 0.5f * toCam[ai]);
+                tips[ai] = ImVec2(cx + sx * L * lenMul, cy + sy * L * lenMul);
             }
-            vdl->AddCircleFilled(ImVec2(cx, cy), 2.4f * ts, overlayTxt);
+            int order[3] = {0, 1, 2};
+            std::sort(order, order + 3, [&](int a, int b) { return toCam[a] < toCam[b]; });
+            float haloF[4]; ui::Palette::withAlpha(ui::palette.viewportTop, haloF, 0.55f);
+            const ImU32 axHalo = ui::Palette::toU32(haloF);
+            for (int oi = 0; oi < 3; ++oi) {
+                const auto& a = axes[order[oi]];
+                float fade = 0.45f + 0.50f * (0.5f + 0.5f * toCam[order[oi]]);  // rear .45 -> front .95
+                ImU32 col = ImGui::ColorConvertFloat4ToU32(
+                    ImVec4(a.col[0], a.col[1], a.col[2], fade));
+                const ImVec2 tip = tips[order[oi]];
+                vdl->AddLine(ImVec2(cx, cy), tip, axHalo, 4.4f * ts);
+                vdl->AddLine(ImVec2(cx, cy), tip, col, 2.2f * ts);
+                // Arrowhead at the tip so each stroke reads as a proper axis VECTOR (the bare
+                // stubs were nearly invisible — visual-review fix). Skip near-degenerate
+                // projections (axis pointing at the camera).
+                float adx = tip.x - cx, ady = tip.y - cy;
+                float alen = std::sqrt(adx * adx + ady * ady);
+                if (alen > 4.0f * ts) {
+                    adx /= alen; ady /= alen;
+                    const float ah = 5.0f * ts, aw = 3.0f * ts;
+                    ImVec2 back(tip.x - adx * ah, tip.y - ady * ah);
+                    ImVec2 p1(back.x - ady * aw, back.y + adx * aw);
+                    ImVec2 p2(back.x + ady * aw, back.y - adx * aw);
+                    vdl->AddTriangleFilled(tip, p1, p2, col);
+                }
+            }
+            // Hub: canvas-stable dark ink over a light halo disc (was overlayText — near-white in
+            // the dark theme, washed out on the light canvas).
+            vdl->AddCircleFilled(ImVec2(cx, cy), 3.2f * ts, axHalo);
+            vdl->AddCircleFilled(ImVec2(cx, cy), 2.4f * ts,
+                                 ui::Palette::toU32(ui::palette.viewportEdge));
 
             // Draw buttons + labels on top.
             ImGui::PushID("##triad");
             const float hitR = 8.0f * ts;  // invisible button half-size
             for (int ai = 0; ai < 3; ++ai) {
                 const auto& a = axes[ai];
-                float sx, sy; proj(a.x, a.y, a.z, sx, sy);
-                ImVec2 tip(cx + sx * L, cy + sy * L);
+                ImVec2 tip = tips[ai];
 
-                // Invisible button centered on the axis tip.
-                ImGui::SetCursorScreenPos(ImVec2(tip.x - hitR, tip.y - hitR));
+                // Label chip center sits BEYOND the arrow tip along the axis direction, so the
+                // three letter badges never pile up on the stubs or on each other
+                // (visual-review fix). Near-degenerate projections fall back up-right.
+                float ldx = tip.x - cx, ldy = tip.y - cy;
+                float llen = std::sqrt(ldx * ldx + ldy * ldy);
+                if (llen > 1e-3f) { ldx /= llen; ldy /= llen; }
+                else              { ldx = 0.7071f; ldy = -0.7071f; }
+                const ImVec2 chipC(tip.x + ldx * 12.0f * ts, tip.y + ldy * 12.0f * ts);
+
+                // Invisible button centered on the label chip (the visible click target).
+                ImGui::SetCursorScreenPos(ImVec2(chipC.x - hitR, chipC.y - hitR));
                 ImGui::PushID(ai);
                 bool clicked = ImGui::InvisibleButton("##tb", ImVec2(hitR * 2, hitR * 2));
                 bool hov = ImGui::IsItemHovered();
@@ -3211,7 +3432,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
 
                 if (hov) {
                     // Hover: accentSoft circle highlight.
-                    vdl->AddCircleFilled(tip, hitR,
+                    vdl->AddCircleFilled(chipC, hitR,
                         ui::Palette::toU32(ui::palette.accentSoft));
                     ImGui::SetTooltip("%s view", a.viewName);
                 }
@@ -3230,14 +3451,21 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     }
                 }
 
-                // Label chip.
+                // Label chip: adaptive glass pill (the fixed overlayBg rect was off-family with
+                // every other HUD chip) with an axis-colored border keeping the color coding and
+                // glassText for guaranteed letter contrast; offsets now uiScale'd.
                 ImU32 col = ImGui::ColorConvertFloat4ToU32(
                     ImVec4(a.col[0], a.col[1], a.col[2], 0.95f));
-                ImVec2 lp(tip.x - 3, tip.y - 7);
                 ImVec2 lts = ImGui::CalcTextSize(a.l);
-                vdl->AddRectFilled(ImVec2(lp.x - 2 * ts, lp.y - 1 * ts),
-                                   ImVec2(lp.x + lts.x + 2 * ts, lp.y + lts.y + 1 * ts), overlayBg, 2.0f * ts);
-                vdl->AddText(lp, col, a.l);
+                ImVec2 lp(chipC.x - lts.x * 0.5f, chipC.y - lts.y * 0.5f);
+                ImVec2 c0(lp.x - 3.0f * ts, lp.y - 1.5f * ts);
+                ImVec2 c1(lp.x + lts.x + 3.0f * ts, lp.y + lts.y + 1.5f * ts);
+                static const char* kTriadChipId[3] = {"vp_triad_x", "vp_triad_y", "vp_triad_z"};
+                const ui::AdaptiveSurface& axSurf = ui::adaptivePanel(
+                    ui::panelId(kTriadChipId[ai]), ImRect(c0, c1), ui::GlassGroup::Hud);
+                ui::glassPanel(vdl, ImRect(c0, c1), ui::GlassLevel::UltraThin, 3.0f, axSurf);
+                vdl->AddRect(c0, c1, col, 3.0f * ts, 0, 1.0f * ts);
+                ui::glassText(vdl, nullptr, ImGui::GetFontSize(), lp, axSurf, a.l);
             }
             ImGui::PopID();
         }
@@ -3249,10 +3477,16 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             ImFont* mf = st.fonts.mono ? st.fonts.mono : ImGui::GetFont();
             float fs = mf->FontSize * 0.92f;
             ImVec2 ts = mf->CalcTextSizeA(fs, 1e30f, 0.0f, st.modelInfo.c_str());
-            ImVec2 p0(cr0.x + 12, cr1.y - ts.y - 70.0f);
+            // Dodge the pinned FeatureManager column and clear the (taller) triad below.
+            float infoLeft = cr0.x;
+            {
+                const float e = ui::overlayColumnEdge(0);
+                if (e > cr0.x && e < cr1.x - 140.0f * ui::uiScale) infoLeft = e;
+            }
+            ImVec2 p0(infoLeft + 12, cr1.y - ts.y - 112.0f * ui::uiScale);
             ImVec2 p1(p0.x + ts.x + 20.0f, p0.y + ts.y + 10.0f);
             const ui::AdaptiveSurface& infoSurf =
-                ui::adaptivePanel(ui::panelId("vp_model_info"), ImRect(p0, p1));
+                ui::adaptivePanel(ui::panelId("vp_model_info"), ImRect(p0, p1), ui::GlassGroup::Hud);
             ui::glassPanel(vdl, ImRect(p0, p1), ui::GlassLevel::UltraThin, 6.0f, infoSurf);
             ui::glassText(vdl, mf, fs, ImVec2(p0.x + 10 * ui::uiScale, p0.y + 5 * ui::uiScale),
                          infoSurf, st.modelInfo.c_str());
@@ -3300,7 +3534,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 bool chipSelected = !st.sketchPlanePickActive &&
                                     st.selectedFeatureId == kPlaneSel[p];
                 const ui::AdaptiveSurface& planeSurf =
-                    ui::adaptivePanel(ui::panelId(nm), ImRect(q0, q1));
+                    ui::adaptivePanel(ui::panelId(nm), ImRect(q0, q1), ui::GlassGroup::Hud);
                 ui::glassPanel(vdl, ImRect(q0, q1), ui::GlassLevel::UltraThin, 4.0f, planeSurf);
                 vdl->AddRect(q0, q1, (chipHovered || chipSelected)
                                          ? ui::Palette::toU32(vpal.accent)
@@ -3384,7 +3618,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             vdl->AddCircleFilled(anchorSp, 2.6f * sc, leaderCol);
                         }
                         const ui::AdaptiveSurface& pmSurf =
-                            ui::adaptivePanel(ui::panelId(ci.label.c_str()), ImRect(chipTL, chipBR));
+                            ui::adaptivePanel(ui::panelId(ci.label.c_str()), ImRect(chipTL, chipBR),
+                                              ui::GlassGroup::Hud);
                         ui::glassPanel(vdl, ImRect(chipTL, chipBR), ui::GlassLevel::UltraThin, 4.0f,
                                       pmSurf);
                         vdl->AddRect(chipTL, chipBR, chipBord, 4.0f * sc);

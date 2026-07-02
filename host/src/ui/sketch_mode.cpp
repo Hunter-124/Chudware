@@ -14,6 +14,9 @@
 #include "../renderer.h"
 #include "../worker_client.h"
 #include "../ui_theme.h"
+#include "icons.h"              // drawIconGlass (per-tool cursor badge)
+#include "layout.h"             // ui::overlayColumnEdge (sketch overlay dodges the pinned columns)
+#include "ribbon_def.h"         // getRibbonCmds (armed-tool cmd id -> icon name)
 #include "property_manager.h"   // pmParseDim (Smart Dimension value parsing)
 #include "airfoil.h"            // NACA 4-/5-digit + .dat profile generator (SketchTool::Airfoil)
 #include "file_dialog.h"        // openFileDialog (.dat import)
@@ -144,6 +147,98 @@ bool screenRay(const Renderer::CameraXform& cam, const ImVec2& imgMin, int vw, i
 ImU32 col(const float role[4], float a = 1.0f) {
     float c[4] = {role[0], role[1], role[2], role[3] * a};
     return ui::Palette::toU32(c);
+}
+
+// Canvas-safe accent ink for strokes/glyphs painted DIRECTLY on the (always light) viewport.
+// The dark theme's accent teal is itself light (Rec.709 lum ~0.69), so hover/selection ink
+// drawn with it reads WORSE than the resting dark ink; darken it toward the on-canvas ink
+// family while keeping the hue. The light theme accent is already dark — passes through.
+ImU32 canvasAccent(float a = 1.0f) {
+    const float* r = ui::palette.accent;
+    float lum = 0.2126f * r[0] + 0.7152f * r[1] + 0.0722f * r[2];
+    float k = lum > 0.5f ? 0.55f : 1.0f;
+    float c[4] = {r[0] * k, r[1] * k, r[2] * k, r[3] * a};
+    return ui::Palette::toU32(c);
+}
+
+// Light backing chip behind on-canvas annotation text (dimension labels). Near-invisible over
+// the light canvas (it IS the canvas tone) but keeps the dark ink readable when a label crosses
+// a dark model face — the same rescue the relation badges get from their green chip fill.
+void labelChip(ImDrawList* dl, ImVec2 mn, ImVec2 mx) {
+    const float s = ui::uiScale;
+    dl->AddRectFilled(ImVec2(mn.x - 3.0f * s, mn.y - 1.5f * s),
+                      ImVec2(mx.x + 3.0f * s, mx.y + 1.5f * s),
+                      col(ui::palette.viewportTop, 0.78f), 3.0f * s);
+}
+
+// Adaptive tessellation for (u,v)-sampled circles/arcs: segment count from the projected
+// radius so zoomed-in circles stay round and small ones stay cheap.
+inline int circleSegs(float radiusPx) {
+    int n = (int)(radiusPx * 0.7f);
+    return n < 24 ? 24 : (n > 256 ? 256 : n);
+}
+
+// C-bug2 follow-up: vector mini-glyphs for the relation badges (and the live inference chips).
+// The old ASCII tokens ("//", "col", "cr", "L"...) read as cramped letters, not constraint
+// icons; these are real AA primitives scaled to the chip. `c` = chip center, `bs` = chip side.
+void drawRelationGlyph(ImDrawList* dl, ImVec2 c, float bs, const char* type, ImU32 ink) {
+    const float h = bs * 0.30f;                              // glyph half-extent
+    const float w = std::max(1.2f, 1.4f * ui::uiScale);      // stroke width
+    auto L = [&](float x0, float y0, float x1, float y1) {
+        dl->AddLine(ImVec2(c.x + x0 * h, c.y + y0 * h),
+                    ImVec2(c.x + x1 * h, c.y + y1 * h), ink, w);
+    };
+    if      (!std::strcmp(type, "horizontal"))    { L(-1, 0, 1, 0); }
+    else if (!std::strcmp(type, "vertical"))      { L(0, -1, 0, 1); }
+    else if (!std::strcmp(type, "parallel"))      { L(-0.85f, 1, 0.15f, -1); L(-0.15f, 1, 0.85f, -1); }
+    else if (!std::strcmp(type, "perpendicular")) { L(-1, 1, 1, 1); L(0, 1, 0, -1); }
+    else if (!std::strcmp(type, "equal"))         { L(-1, -0.45f, 1, -0.45f); L(-1, 0.45f, 1, 0.45f); }
+    else if (!std::strcmp(type, "coincident"))    { dl->AddCircleFilled(c, h * 0.45f, ink);
+                                                    dl->AddCircle(c, h, ink, 0, w); }
+    else if (!std::strcmp(type, "concentric"))    { dl->AddCircle(c, h * 0.5f, ink, 0, w);
+                                                    dl->AddCircle(c, h, ink, 0, w); }
+    else if (!std::strcmp(type, "tangent"))       { dl->AddCircle(ImVec2(c.x, c.y + h * 0.3f),
+                                                                  h * 0.65f, ink, 0, w);
+                                                    L(-1, -0.35f, 1, -0.35f); }
+    else if (!std::strcmp(type, "collinear"))     { L(-1, 0, -0.15f, 0); L(0.15f, 0, 1, 0); }
+    else if (!std::strcmp(type, "coradial"))      { dl->PathArcTo(c, h, 0.5f, 5.8f);
+                                                    dl->PathStroke(ink, 0, w);
+                                                    dl->PathArcTo(c, h * 0.55f, 0.5f, 5.8f);
+                                                    dl->PathStroke(ink, 0, w); }
+    else if (!std::strcmp(type, "midpoint"))      { L(-1, 0.4f, 1, 0.4f);
+        ImVec2 d[4] = {ImVec2(c.x, c.y - h), ImVec2(c.x + h * 0.6f, c.y - h * 0.2f),
+                       ImVec2(c.x, c.y + h * 0.6f), ImVec2(c.x - h * 0.6f, c.y - h * 0.2f)};
+        dl->AddQuadFilled(d[0], d[1], d[2], d[3], ink); }
+    else if (!std::strcmp(type, "symmetric"))     { L(0, -1, 0, 1);
+        L(-1, 0, -0.3f, 0);  L(-0.3f, 0, -0.65f, -0.35f); L(-0.3f, 0, -0.65f, 0.35f);
+        L(1, 0, 0.3f, 0);    L(0.3f, 0, 0.65f, -0.35f);   L(0.3f, 0, 0.65f, 0.35f); }
+    else if (!std::strcmp(type, "fix"))           { L(0, -1, 0, 0.55f); L(-1, 0.55f, 1, 0.55f);
+        L(-0.85f, 1, -0.45f, 0.55f); L(-0.2f, 1, 0.2f, 0.55f); L(0.45f, 1, 0.85f, 0.55f); }
+    else { dl->AddCircleFilled(c, h * 0.4f, ink); }          // unknown relation: neutral dot
+}
+
+// Glass v2 HUD pill for sketch banners/hints — adaptivePanel + glassPanel + glassText (the
+// viewport_panel "vp_pick_status" reference pattern), replacing the legacy fixed
+// overlayBg/overlayText rects so the pill tracks the LIVE backdrop in both themes.
+// `borderCol` != 0 draws a semantic ring (sketch status / error states).
+void glassHudPill(ImDrawList* dl, const char* id, ImVec2 p0, const char* text,
+                  ImU32 borderCol = 0) {
+    const float s = ui::uiScale;
+    ImVec2 ts = ImGui::CalcTextSize(text);
+    ImVec2 p1(p0.x + ts.x + 24.0f * s, p0.y + ts.y + 10.0f * s);
+    ImRect r(p0, p1);
+    const ui::AdaptiveSurface& surf = ui::adaptivePanel(ui::panelId(id), r, ui::GlassGroup::Hud);
+    ui::glassPanel(dl, r, ui::GlassLevel::UltraThin, 6.0f, surf);
+    if (borderCol) dl->AddRect(p0, p1, borderCol, 6.0f * s, 0, 1.5f * s);
+    ui::glassText(dl, nullptr, ImGui::GetFontSize(),
+                  ImVec2(p0.x + 12.0f * s, p0.y + 5.0f * s), surf, text);
+}
+// Centered variant (top-center banners: plane pick, PM pickers, paste placement, tool hint).
+void glassHudBanner(ImDrawList* dl, const char* id, const ImVec2& imgMin, const ImVec2& imgMax,
+                    float y, const char* text, ImU32 borderCol = 0) {
+    ImVec2 ts = ImGui::CalcTextSize(text);
+    float cx = (imgMin.x + imgMax.x) * 0.5f;
+    glassHudPill(dl, id, ImVec2(cx - ts.x * 0.5f - 12.0f * ui::uiScale, y), text, borderCol);
 }
 
 // Circumcircle of three (u,v) points. Returns false when (near-)collinear.
@@ -1220,6 +1315,7 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sketch_new") { enterNewOnSelection(st); return true; }
     if (!active_) return false;  // the rest of the sketch tools require an active sketch
     if (cmdId == "sketch_exit") { exitSketch(st, /*keep=*/true); return true; }
+    if (cmdId == "sketch_cancel") { cancelSketch(st); return true; }  // ribbon commit cluster ✗
     if (cmdId == "sk_line")        { resetTool(); tool_ = SketchTool::Line;       return true; }
     if (cmdId == "sk_rect_corner") { resetTool(); tool_ = SketchTool::RectCorner; return true; }
     if (cmdId == "sk_circle")      { resetTool(); tool_ = SketchTool::Circle;     return true; }
@@ -1448,8 +1544,9 @@ void SketchMode::drawTextPopup(AppState& st, bool& escHandled) {
         bool enter = ImGui::InputText("##textstr", textBuf_, sizeof(textBuf_),
                                       ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::SetNextItemWidth(120);
-        ImGui::InputFloat("Height (mm)", &textHeight_, 1.0f, 5.0f, "%.3f");
-        if (textHeight_ < 0.001f) textHeight_ = 0.001f;   // engine requires height > 0
+        // Bounded value -> drag entry (Ctrl+click still types an exact number).
+        ImGui::DragFloat("Height (mm)", &textHeight_, 0.25f, 0.001f, 1000.0f, "%.3f",
+                         ImGuiSliderFlags_AlwaysClamp);
         ImGui::Separator();
         const bool empty = (textBuf_[0] == '\0');
         ImGui::BeginDisabled(empty);
@@ -1596,10 +1693,12 @@ void SketchMode::drawAirfoilPopup(AppState& st, bool& escHandled) {
         }
 
         ImGui::SetNextItemWidth(120);
-        ImGui::InputFloat("Chord (mm)", &afChord_, 1.0f, 10.0f, "%.2f");
-        if (afChord_ < 0.001f) afChord_ = 0.001f;
+        // Bounded values -> drag entry (Ctrl+click types an exact number).
+        ImGui::DragFloat("Chord (mm)", &afChord_, 1.0f, 0.001f, 100000.0f, "%.2f",
+                         ImGuiSliderFlags_AlwaysClamp);
         ImGui::SetNextItemWidth(120);
-        ImGui::InputFloat("Angle of attack", &afAoA_, 0.5f, 5.0f, "%.2f\xC2\xB0");
+        ImGui::DragFloat("Angle of attack", &afAoA_, 0.25f, -45.0f, 45.0f, "%.2f\xC2\xB0",
+                         ImGuiSliderFlags_AlwaysClamp);
 
         // Generate the profile from the current parameters (cheap; recomputed each frame so the
         // preview tracks edits live).
@@ -1610,12 +1709,14 @@ void SketchMode::drawAirfoilPopup(AppState& st, bool& escHandled) {
         else                     prof = airfoil::fromDatFile(afDatPath_, afChord_, afAoA_);
 
         // ---- live preview ----
+        // Mini canvas: light viewport tone + the sketcher's under-defined blue stroke, so the
+        // preview matches what lands on the real (always light) canvas in both themes.
         ImGui::Separator();
-        const float pw = 240.0f, ph = 90.0f;
+        const float pw = 240.0f * ui::uiScale, ph = 90.0f * ui::uiScale;
         ImVec2 org = ImGui::GetCursorScreenPos();
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->AddRectFilled(org, ImVec2(org.x + pw, org.y + ph), col(pal.overlayBg), 4.0f);
-        dl->AddRect(org, ImVec2(org.x + pw, org.y + ph), col(pal.overlayBorder), 4.0f);
+        dl->AddRectFilled(org, ImVec2(org.x + pw, org.y + ph), col(pal.viewportTop), 4.0f);
+        dl->AddRect(org, ImVec2(org.x + pw, org.y + ph), col(pal.sketchDimLine, 0.5f), 4.0f);
         if (prof.ok()) {
             // Fit the profile bbox into the preview rect (uniform scale, Y up).
             double xmn = 1e30, xmx = -1e30, ymn = 1e30, ymx = -1e30;
@@ -1632,13 +1733,15 @@ void SketchMode::drawAirfoilPopup(AppState& st, bool& escHandled) {
                 return ImVec2(float(org.x + pw * 0.5 + (q[0] - cx) * s),
                               float(org.y + ph * 0.5 - (q[1] - cy) * s));   // flip Y
             };
+            const ImU32 strokeCol = col(pal.sketchUnder);
+            const float strokeW = 1.5f * ui::uiScale;
             auto stroke = [&](const std::vector<std::array<double, 2>>& sv) {
                 for (size_t i = 1; i < sv.size(); ++i)
-                    dl->AddLine(map(sv[i - 1]), map(sv[i]), col(pal.accent), 1.5f);
+                    dl->AddLine(map(sv[i - 1]), map(sv[i]), strokeCol, strokeW);
             };
             stroke(prof.upper); stroke(prof.lower);
             // close the TE visually
-            dl->AddLine(map(prof.upper.back()), map(prof.lower.back()), col(pal.accent), 1.5f);
+            dl->AddLine(map(prof.upper.back()), map(prof.lower.back()), strokeCol, strokeW);
         } else {
             dl->AddText(ImVec2(org.x + 8, org.y + ph * 0.5f - 7), col(pal.statusErr),
                         prof.error.c_str());
@@ -1939,6 +2042,7 @@ bool SketchMode::tangentArcThrough(const ImVec2& start, const ImVec2& tdir, cons
 
 void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfer* infer) const {
     snapHandle.clear();
+    const float snapPx = kSnapPx * ui::uiScale;   // snap reach tracks DPI
     const ImVec2 cur = uvToScreen(u, v);   // raw cursor (snap distances measure from here)
     // Visit every snappable POINT (handle, u, v) — point snap + alignment share this set.
     auto forEachPoint = [&](const std::function<void(const std::string&, float, float)>& fn) {
@@ -1958,8 +2062,8 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
             }
         }
     };
-    // 1) Endpoint/center/point coincident snap within kSnapPx (screen space) — highest priority.
-    float best = kSnapPx * kSnapPx;
+    // 1) Endpoint/center/point coincident snap within snapPx (screen space) — highest priority.
+    float best = snapPx * snapPx;
     forEachPoint([&](const std::string& handle, float eu, float ev) {
         ImVec2 s = uvToScreen(eu, ev);
         float dx = s.x - cur.x, dy = s.y - cur.y;
@@ -1969,7 +2073,7 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
     if (!inferenceOn_) return;   // master toggle: everything below is C49 inference
     // 2) Line-midpoint snap ("mid:<id>") — only when no point snap fired.
     if (snapHandle.empty()) {
-        best = kSnapPx * kSnapPx;
+        best = snapPx * snapPx;
         for (const auto& e : ents_) {
             if (e.type != "line") continue;
             float mu2 = (e.p1[0] + e.p2[0]) * 0.5f, mv2 = (e.p1[1] + e.p2[1]) * 0.5f;
@@ -1979,17 +2083,17 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
             if (d2 < best) { best = d2; snapHandle = "mid:" + e.id; u = mu2; v = mv2; }
         }
     }
-    // 3) Circle/arc RIM snap ("rim:<id>"): within kSnapPx of the rim (full-circle metric, like
+    // 3) Circle/arc RIM snap ("rim:<id>"): within snapPx of the rim (full-circle metric, like
     //    hitTestEntity), pulled to the exact rim along the center->cursor ray. Tiny circles
-    //    (rim within 2*kSnapPx of the center) are skipped — the center snap owns those.
+    //    (rim within 2*snapPx of the center) are skipped — the center snap owns those.
     if (snapHandle.empty()) {
-        best = kSnapPx;          // compare |dist - r| in px (1D)
+        best = snapPx;          // compare |dist - r| in px (1D)
         for (const auto& e : ents_) {
             if (e.type != "circle" && e.type != "arc") continue;
             ImVec2 cc = uvToScreen(e.center[0], e.center[1]);
             ImVec2 rimRef = uvToScreen(e.center[0] + e.radius, e.center[1]);
             float rpx = std::hypot(rimRef.x - cc.x, rimRef.y - cc.y);
-            if (rpx < 2.0f * kSnapPx) continue;
+            if (rpx < 2.0f * snapPx) continue;
             float dm = std::hypot(cur.x - cc.x, cur.y - cc.y);
             float d = std::fabs(dm - rpx);
             if (d < best) {
@@ -2001,16 +2105,16 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
         }
     }
     // 4) Alignment inference (positional only — SolidWorks-style dashed lines, no constraint):
-    //    cursor u (or v) within kSnapPx of a source point's u (or v), the point itself clearly
+    //    cursor u (or v) within snapPx of a source point's u (or v), the point itself clearly
     //    OUTSIDE the coincident radius (else the dashed line degenerates / fights the point snap).
     if (infer && snapHandle.empty()) {
         const float pxPerU = std::hypot(uAxisS_.x, uAxisS_.y);
         const float pxPerV = std::hypot(vAxisS_.x, vAxisS_.y);
-        float bestU = kSnapPx, bestV = kSnapPx;   // screen-px distance along each axis
+        float bestU = snapPx, bestV = snapPx;   // screen-px distance along each axis
         forEachPoint([&](const std::string& handle, float eu, float ev) {
             ImVec2 s = uvToScreen(eu, ev);
             float d2 = (s.x - cur.x) * (s.x - cur.x) + (s.y - cur.y) * (s.y - cur.y);
-            if (d2 < (2.0f * kSnapPx) * (2.0f * kSnapPx)) return;  // too close to the point itself
+            if (d2 < (2.0f * snapPx) * (2.0f * snapPx)) return;  // too close to the point itself
             float dU = std::fabs(eu - u) * pxPerU;
             float dV = std::fabs(ev - v) * pxPerV;
             if (dU < bestU) { bestU = dU; infer->alignU = true; infer->srcU = ImVec2(eu, ev);
@@ -2024,7 +2128,7 @@ void SketchMode::snapPoint(float& u, float& v, std::string& snapHandle, SnapInfe
 }
 
 int SketchMode::hitTestHandle(const ImVec2& s, std::string& handleOut, float& uOut, float& vOut) const {
-    float best = kHandlePx * kHandlePx;
+    float best = (kHandlePx * ui::uiScale) * (kHandlePx * ui::uiScale);
     int hit = -1;
     auto consider = [&](const std::string& handle, float eu, float ev) {
         ImVec2 p = uvToScreen(eu, ev);
@@ -2096,6 +2200,7 @@ int SketchMode::hitTestHandle(const ImVec2& s, std::string& handleOut, float& uO
 // (no angular clamp) for arcs — a deliberately simple approximation matching the Smart-Dimension
 // picker. Returns the ents_ index or -1 when nothing is within maxPx.
 int SketchMode::hitTestEntity(const ImVec2& s, float maxPx) const {
+    maxPx *= ui::uiScale;   // pick reach tracks DPI (callers pass logical px)
     float best = maxPx * maxPx;
     int hit = -1;
     for (size_t i = 0; i < ents_.size(); ++i) {
@@ -2402,7 +2507,7 @@ int SketchMode::regionContaining(const std::string& entId) const {
 void SketchMode::strokeEntityOutline(ImDrawList* dl, const SketchEntity& e, ImU32 c, float th) const {
     std::vector<ImVec2> uv; bool closed; entityBoundaryUV(e, uv, closed);
     if (uv.empty()) return;
-    if (uv.size() == 1) { dl->AddCircle(uvToScreen(uv[0].x, uv[0].y), 5.0f, c, 12, th); return; }
+    if (uv.size() == 1) { dl->AddCircle(uvToScreen(uv[0].x, uv[0].y), 5.0f * ui::uiScale, c, 0, th); return; }
     std::vector<ImVec2> sp; sp.reserve(uv.size());
     for (const auto& p : uv) sp.push_back(uvToScreen(p.x, p.y));
     for (size_t i = 1; i < sp.size(); ++i) dl->AddLine(sp[i - 1], sp[i], c, th);
@@ -2756,13 +2861,19 @@ std::string fmtAng(double deg) {
     if (s.find('.') != std::string::npos) { while (s.back() == '0') s.pop_back(); if (s.back() == '.') s.pop_back(); }
     return s + "\xC2\xB0";   // degree sign
 }
-// Filled triangle arrowhead at tip, pointing along (dirx,diry) (unit), size px.
+// Filled triangle arrowhead at tip, pointing along (dirx,diry) (unit), size px (caller scales
+// by ui::uiScale). 0.45 aspect — the old 0.35 darts aliased into slivers at small sizes.
 void arrowHead(ImDrawList* dl, ImVec2 tip, float dx, float dy, float sz, ImU32 c) {
     float px = -dy, py = dx;   // perpendicular
-    ImVec2 a(tip.x - dx * sz + px * sz * 0.35f, tip.y - dy * sz + py * sz * 0.35f);
-    ImVec2 b(tip.x - dx * sz - px * sz * 0.35f, tip.y - dy * sz - py * sz * 0.35f);
+    ImVec2 a(tip.x - dx * sz + px * sz * 0.45f, tip.y - dy * sz + py * sz * 0.45f);
+    ImVec2 b(tip.x - dx * sz - px * sz * 0.45f, tip.y - dy * sz - py * sz * 0.45f);
     dl->AddTriangleFilled(tip, a, b, c);
 }
+// Shared annotation metrics (one block so every dimension part scales consistently on HiDPI).
+inline float dimArrowSz() { return 8.0f * ui::uiScale; }   // arrowhead length
+inline float dimGapPx()   { return 4.0f * ui::uiScale; }   // ext-line gap from geometry
+inline float dimExtPx()   { return 6.0f * ui::uiScale; }   // ext-line overshoot past dim line
+inline float dimThick(bool hovered) { return (hovered ? 2.2f : 1.4f) * ui::uiScale; }
 }  // namespace
 
 // Label text for a constraint (driven dims are parenthesized, SolidWorks-style).
@@ -2861,7 +2972,8 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
     ImVec2 place = uvToScreen(pu, pv);
     std::string lbl = dimLabel(c);
     ImVec2 ts = ImGui::CalcTextSize(lbl.c_str());
-    float th = hovered ? 2.2f : 1.4f;
+    const float th = dimThick(hovered);
+    const float asz = dimArrowSz();
 
     // C51: a slot WIDTH dim (diameter/radius constraint on a slot) renders as a LINEAR dimension
     // across the slot at its spine midpoint — not a circle leader — with a plain (un-⌀'d) value.
@@ -2880,7 +2992,7 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
             float nx = -uy, ny = ux;
             float off = (place.x - A.x) * nx + (place.y - A.y) * ny;
             ImVec2 dA(A.x + nx * off, A.y + ny * off), dB(B.x + nx * off, B.y + ny * off);
-            const float gap = 4.0f, ext = 6.0f;
+            const float gap = dimGapPx(), ext = dimExtPx();
             auto extLine = [&](ImVec2 from, ImVec2 to) {
                 float ex = to.x - from.x, ey = to.y - from.y; float el = std::hypot(ex, ey);
                 if (el < 1e-3f) return; float gx = ex / el, gy = ey / el;
@@ -2889,14 +3001,15 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
             };
             extLine(A, dA); extLine(B, dB);
             dl->AddLine(dA, dB, lineCol, th);
-            arrowHead(dl, dA, -ux, -uy, 8.0f, lineCol);
-            arrowHead(dl, dB, ux, uy, 8.0f, lineCol);
+            arrowHead(dl, dA, -ux, -uy, asz, lineCol);
+            arrowHead(dl, dB, ux, uy, asz, lineCol);
             recSeg(dA, dB);
             double v = c.hasMeasured ? c.measured : (c.hasValue ? c.value : (double)se->width);
             std::string wl = fmtLen(c.type == "radius" ? v : v);
             if (c.driven) wl = "(" + wl + ")";
             ImVec2 wts = ImGui::CalcTextSize(wl.c_str());
-            ImVec2 tp(place.x + 4, place.y - wts.y * 0.5f);
+            ImVec2 tp(place.x + 4.0f * ui::uiScale, place.y - wts.y * 0.5f);
+            labelChip(dl, tp, ImVec2(tp.x + wts.x, tp.y + wts.y));
             dl->AddText(tp, textCol, wl.c_str());
             recText(tp, wts);
             return;
@@ -2916,16 +3029,17 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
         if (c.type == "diameter") {
             ImVec2 rim2(cc.x - rimDir.x * rpx, cc.y - rimDir.y * rpx);
             dl->AddLine(rim2, place, lineCol, th);
-            arrowHead(dl, rim2, -rimDir.x, -rimDir.y, 8.0f, lineCol);
+            arrowHead(dl, rim2, -rimDir.x, -rimDir.y, asz, lineCol);
             recSeg(rim2, place);
         } else {
             dl->AddLine(cc, place, lineCol, th);
             recSeg(cc, place);
         }
         dl->AddLine(rim, place, lineCol, th);
-        arrowHead(dl, rim, rimDir.x, rimDir.y, 8.0f, lineCol);
+        arrowHead(dl, rim, rimDir.x, rimDir.y, asz, lineCol);
         recSeg(rim, place);
-        ImVec2 tp(place.x + 4, place.y - ts.y * 0.5f);
+        ImVec2 tp(place.x + 4.0f * ui::uiScale, place.y - ts.y * 0.5f);
+        labelChip(dl, tp, ImVec2(tp.x + ts.x, tp.y + ts.y));
         dl->AddText(tp, textCol, lbl.c_str());
         recText(tp, ts);
         return;
@@ -2949,9 +3063,10 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
         float ang0 = std::atan2(a2.y - a1.y, a2.x - a1.x);
         float ang1 = std::atan2(b2.y - b1.y, b2.x - b1.x);
         // small arc between the two line directions through the placement side
-        dl->PathArcTo(vtx, r, ang0, ang1, 32);
+        dl->PathArcTo(vtx, r, ang0, ang1, circleSegs(r) / 2);
         dl->PathStroke(lineCol, 0, th);
-        ImVec2 tp(place.x + 4, place.y - ts.y * 0.5f);
+        ImVec2 tp(place.x + 4.0f * ui::uiScale, place.y - ts.y * 0.5f);
+        labelChip(dl, tp, ImVec2(tp.x + ts.x, tp.y + ts.y));
         dl->AddText(tp, textCol, lbl.c_str());
         recText(tp, ts);
         // Approximate the arc's pickable span by its chord (start->end rim points).
@@ -3032,7 +3147,7 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
     float off = (place.x - A.x) * nx + (place.y - A.y) * ny;
     ImVec2 dA(A.x + nx * off, A.y + ny * off);
     ImVec2 dB(B.x + nx * off, B.y + ny * off);
-    const float gap = 4.0f, ext = 6.0f;   // extension-line gap from geometry, overshoot past dimline
+    const float gap = dimGapPx(), ext = dimExtPx();   // ext-line gap from geometry / overshoot
     auto extLine = [&](ImVec2 from, ImVec2 to) {
         // shorten near the geometry end by gap, extend past the dim line by ext
         float ex = to.x - from.x, ey = to.y - from.y; float el = std::hypot(ex, ey);
@@ -3044,12 +3159,14 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
     extLine(A, dA);
     extLine(B, dB);
     dl->AddLine(dA, dB, lineCol, th);
-    arrowHead(dl, dA, -ux, -uy, 8.0f, lineCol);
-    arrowHead(dl, dB, ux, uy, 8.0f, lineCol);
+    arrowHead(dl, dA, -ux, -uy, asz, lineCol);
+    arrowHead(dl, dB, ux, uy, asz, lineCol);
     recSeg(dA, dB);
     // text centered on the dim line, nudged to the placement side
     ImVec2 mid((dA.x + dB.x) * 0.5f, (dA.y + dB.y) * 0.5f);
-    ImVec2 tp(mid.x - ts.x * 0.5f + nx * 8, mid.y - ts.y * 0.5f + ny * 8);
+    ImVec2 tp(mid.x - ts.x * 0.5f + nx * 8.0f * ui::uiScale,
+              mid.y - ts.y * 0.5f + ny * 8.0f * ui::uiScale);
+    labelChip(dl, tp, ImVec2(tp.x + ts.x, tp.y + ts.y));
     dl->AddText(tp, textCol, lbl.c_str());
     recText(tp, ts);
 }
@@ -3057,7 +3174,8 @@ void SketchMode::drawDimension(ImDrawList* dl, const SketchConstraint& c, ImU32 
 // Smart Dimension pick: points (endpoints/centers) by priority within ~8px, then whole entities.
 bool SketchMode::dimHitTest(const ImVec2& s, DimPick& out) const {
     // 1) points
-    float best = 8.0f * 8.0f; bool got = false;
+    const float pr = 8.0f * ui::uiScale;   // pick radius tracks DPI
+    float best = pr * pr; bool got = false;
     auto consider = [&](const std::string& h, float u, float v) {
         ImVec2 p = uvToScreen(u, v);
         float d2 = (p.x - s.x) * (p.x - s.x) + (p.y - s.y) * (p.y - s.y);
@@ -3086,7 +3204,7 @@ bool SketchMode::dimHitTest(const ImVec2& s, DimPick& out) const {
         if (e.type == "line") {
             float mu = (e.p1[0] + e.p2[0]) * 0.5f, mv = (e.p1[1] + e.p2[1]) * 0.5f;
             ImVec2 mp = uvToScreen(mu, mv);
-            if (std::hypot(mp.x - s.x, mp.y - s.y) < 11.0f) {
+            if (std::hypot(mp.x - s.x, mp.y - s.y) < 11.0f * ui::uiScale) {
                 out.handle = e.id + ".mid"; out.isPoint = true; out.entIdx = -1;
                 out.entId.clear(); out.u = mu; out.v = mv; return true;
             }
@@ -3677,7 +3795,8 @@ void SketchMode::drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& im
                 ImVec2 p;
                 if (!uv2s(u, v, p)) { havePrev = false; continue; }
                 if (havePrev)
-                    dl->AddLine(prev, p, col(pal.sketchInk, g.fid == fid_ ? 0.9f : 0.55f), 1.5f);
+                    dl->AddLine(prev, p, col(pal.sketchInk, g.fid == fid_ ? 0.9f : 0.55f),
+                                1.5f * ui::uiScale);
                 prev = p; havePrev = true;
             }
         };
@@ -3761,15 +3880,16 @@ void SketchMode::drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& im
                 for (size_t i = 1; i < gp.size(); ++i) {
                     ImVec2 a, b;
                     if (uv2s(gp[i - 1].x, gp[i - 1].y, a) && uv2s(gp[i].x, gp[i].y, b))
-                        dl->AddLine(a, b, col(pal.sketchInk, 0.55f), 1.5f);
+                        dl->AddLine(a, b, col(pal.sketchInk, 0.55f), 1.5f * ui::uiScale);
                 }
             } else if (e.type == "point") {
                 // C42: small ghost cross.
                 ImVec2 p;
                 if (uv2s(e.p1[0], e.p1[1], p)) {
                     const ImU32 gc = col(pal.sketchInk, 0.55f);
-                    dl->AddLine(ImVec2(p.x - 4, p.y), ImVec2(p.x + 4, p.y), gc, 1.5f);
-                    dl->AddLine(ImVec2(p.x, p.y - 4), ImVec2(p.x, p.y + 4), gc, 1.5f);
+                    const float gx = 4.0f * ui::uiScale, gw = 1.5f * ui::uiScale;
+                    dl->AddLine(ImVec2(p.x - gx, p.y), ImVec2(p.x + gx, p.y), gc, gw);
+                    dl->AddLine(ImVec2(p.x, p.y - gx), ImVec2(p.x, p.y + gx), gc, gw);
                 }
             }
             // conic-family ghosts: not yet sampled (rare as standalone profiles).
@@ -3800,7 +3920,7 @@ void SketchMode::drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& im
                         float u, v; pointAt(i / (float)seg, u, v);
                         ImVec2 p;
                         if (!uv2s(u, v, p)) { have = false; continue; }
-                        if (have) dl->AddLine(prev, p, hc, 2.75f);
+                        if (have) dl->AddLine(prev, p, hc, 2.75f * ui::uiScale);
                         prev = p; have = true;
                     }
                 };
@@ -3834,7 +3954,7 @@ void SketchMode::drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& im
                         for (size_t i = 1; i < e.pts.size(); ++i) {
                             ImVec2 a, b;
                             if (uv2s(e.pts[i - 1].x, e.pts[i - 1].y, a) && uv2s(e.pts[i].x, e.pts[i].y, b))
-                                dl->AddLine(a, b, hc, 2.75f);
+                                dl->AddLine(a, b, hc, 2.75f * ui::uiScale);
                         }
                     }
                 }
@@ -3853,7 +3973,7 @@ void SketchMode::drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& im
                             worldToScreen(cam, imgMin, vw, vh, (float)p[0].get<double>(),
                                           (float)p[1].get<double>(), (float)p[2].get<double>(), s);
                         if (!ok) { have = false; continue; }
-                        if (have) dl->AddLine(prev, s, hc, 2.75f);
+                        if (have) dl->AddLine(prev, s, hc, 2.75f * ui::uiScale);
                         prev = s; have = true;
                     }
                 }
@@ -4071,7 +4191,7 @@ bool SketchMode::drawRegionPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMi
             // Outline: outer + holes. Selected = accent bold, else faint dim line.
             ImU32 lc = sel ? col(pal.accent, 0.95f)
                            : (hov ? col(pal.accent, 0.6f) : col(pal.sketchDimLine, 0.5f));
-            float th = sel ? 2.2f : (hov ? 1.8f : 1.2f);
+            float th = (sel ? 2.2f : (hov ? 1.8f : 1.2f)) * ui::uiScale;
             projectPoly(rs.frame, pr.outer, outerS);
             if (outerS.size() >= 2) dl->AddPolyline(outerS.data(), (int)outerS.size(), lc, ImDrawFlags_Closed, th);
             for (const auto& h : pr.holes) {
@@ -4332,22 +4452,16 @@ bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
     // emphasis brightening; viewport_panel feeds pmPlaneHover() as the emphasis index).
     if (datumWins) {
         wdl->AddQuadFilled(datumQuad[0], datumQuad[1], datumQuad[2], datumQuad[3], col(pal.accent, 0.16f));
-        wdl->AddQuad(datumQuad[0], datumQuad[1], datumQuad[2], datumQuad[3], col(pal.accent, 0.90f), 2.0f);
+        wdl->AddQuad(datumQuad[0], datumQuad[1], datumQuad[2], datumQuad[3], col(pal.accent, 0.90f), 2.0f * ui::uiScale);
     } else if (hovered >= 0 && quadVis[hovered]) {
         wdl->AddQuadFilled(quadS[hovered][0], quadS[hovered][1], quadS[hovered][2],
                            quadS[hovered][3], col(pal.accent, 0.16f));
         wdl->AddQuad(quadS[hovered][0], quadS[hovered][1], quadS[hovered][2],
-                     quadS[hovered][3], col(pal.accent, 0.90f), 2.0f);
+                     quadS[hovered][3], col(pal.accent, 0.90f), 2.0f * ui::uiScale);
     }
     // Compact hint pill (below the heads-up view toolbar, same slot as the new-sketch banner).
-    const char* banner = "Click a reference plane (incl. your datum planes) \xE2\x80\x94 or a planar face";
-    ImVec2 bts = ImGui::CalcTextSize(banner);
-    float bcx = (imgMin.x + imgMax.x) * 0.5f;
-    ImVec2 b0(bcx - bts.x * 0.5f - 14, imgMin.y + 52.0f * ui::uiScale);
-    ImVec2 b1(bcx + bts.x * 0.5f + 14, b0.y + bts.y + 12);
-    wdl->AddRectFilled(b0, b1, col(pal.overlayBg), 6.0f);
-    wdl->AddRect(b0, b1, col(pal.overlayBorder), 6.0f);
-    wdl->AddText(ImVec2(b0.x + 14, b0.y + 6), col(pal.overlayText), banner);
+    glassHudBanner(wdl, "sk_pm_plane_banner", imgMin, imgMax, imgMin.y + 52.0f * ui::uiScale,
+                   "Click a reference plane (incl. your datum planes) \xE2\x80\x94 or a planar face");
     wdl->PopClipRect();
 
     // Click a plane -> route its datum ref into the active well (a created datum plane routes its
@@ -4426,15 +4540,9 @@ bool SketchMode::drawAxisPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
     const auto& pal = ui::palette;
     ImDrawList* wdl = ImGui::GetWindowDrawList();
     wdl->PushClipRect(imgMin, imgMax, true);
-    wdl->AddLine(a, b, col(pal.accent, 0.95f), 4.0f);
-    const char* banner = "Click the reference axis";
-    ImVec2 bts = ImGui::CalcTextSize(banner);
-    float bcx = (imgMin.x + imgMax.x) * 0.5f;
-    ImVec2 b0(bcx - bts.x * 0.5f - 14, imgMin.y + 52.0f * ui::uiScale);
-    ImVec2 b1(bcx + bts.x * 0.5f + 14, b0.y + bts.y + 12);
-    wdl->AddRectFilled(b0, b1, col(pal.overlayBg), 6.0f);
-    wdl->AddRect(b0, b1, col(pal.overlayBorder), 6.0f);
-    wdl->AddText(ImVec2(b0.x + 14, b0.y + 6), col(pal.overlayText), banner);
+    wdl->AddLine(a, b, col(pal.accent, 0.95f), 4.0f * ui::uiScale);
+    glassHudBanner(wdl, "sk_pm_axis_banner", imgMin, imgMax, imgMin.y + 52.0f * ui::uiScale,
+                   "Click the reference axis");
     wdl->PopClipRect();
 
     st.requestCursor(ui::CursorKind::Hand);
@@ -4580,15 +4688,9 @@ bool SketchMode::drawCurvePathPicker(AppState& st, ImGuiIO& io, const ImVec2& im
     ImDrawList* wdl = ImGui::GetWindowDrawList();
     wdl->PushClipRect(imgMin, imgMax, true);
     for (const auto& s : bestSegs)
-        wdl->AddLine(s.first, s.second, col(pal.accent, 0.95f), 4.0f);
-    const char* banner = "Click to set this as the sweep path";
-    ImVec2 bts = ImGui::CalcTextSize(banner);
-    float bcx = (imgMin.x + imgMax.x) * 0.5f;
-    ImVec2 b0(bcx - bts.x * 0.5f - 14, imgMin.y + 52.0f * ui::uiScale);
-    ImVec2 b1(bcx + bts.x * 0.5f + 14, b0.y + bts.y + 12);
-    wdl->AddRectFilled(b0, b1, col(pal.overlayBg), 6.0f);
-    wdl->AddRect(b0, b1, col(pal.overlayBorder), 6.0f);
-    wdl->AddText(ImVec2(b0.x + 14, b0.y + 6), col(pal.overlayText), banner);
+        wdl->AddLine(s.first, s.second, col(pal.accent, 0.95f), 4.0f * ui::uiScale);
+    glassHudBanner(wdl, "sk_pm_path_banner", imgMin, imgMax, imgMin.y + 52.0f * ui::uiScale,
+                   "Click to set this as the sweep path");
     wdl->PopClipRect();
 
     st.requestCursor(ui::CursorKind::Hand);
@@ -4614,7 +4716,7 @@ bool SketchMode::drawDatumSelect(AppState& st, ImGuiIO& io, const ImVec2& imgMin
     bool axisHit = hitTestDatumAxis(st, io.MousePos, imgMin, vw, vh, a, b, fid, name);
     if (axisHit) {
         wdl->PushClipRect(imgMin, imgMax, true);
-        wdl->AddLine(a, b, col(ui::palette.accent, 0.90f), 4.0f);
+        wdl->AddLine(a, b, col(ui::palette.accent, 0.90f), 4.0f * ui::uiScale);
         wdl->PopClipRect();
     } else {
         // Pick the frontmost plane under the cursor across BOTH created datum planes and the (shown)
@@ -4642,11 +4744,11 @@ bool SketchMode::drawDatumSelect(AppState& st, ImGuiIO& io, const ImVec2& imgMin
                                       oCorners[i].z, s[i]);
             for (int i = 0; i < 4; ++i) {
                 int j = (i + 1) & 3;
-                if (ok[i] && ok[j]) wdl->AddLine(s[i], s[j], col(ui::palette.accent, 0.90f), 2.5f);
+                if (ok[i] && ok[j]) wdl->AddLine(s[i], s[j], col(ui::palette.accent, 0.90f), 2.5f * ui::uiScale);
             }
         } else {
             for (int i = 0; i < 4; ++i)
-                wdl->AddLine(cQuad[i], cQuad[(i + 1) & 3], col(ui::palette.accent, 0.90f), 2.5f);
+                wdl->AddLine(cQuad[i], cQuad[(i + 1) & 3], col(ui::palette.accent, 0.90f), 2.5f * ui::uiScale);
         }
         wdl->PopClipRect();
     }
@@ -4704,6 +4806,16 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     g_skIps = st.ips();
     const auto& pal = ui::palette;
 
+    // Sketch-overlay safe area: clip all on-canvas drawing (geometry, relations, dimensions, plane
+    // labels…) to the region BETWEEN the pinned FeatureManager / Copilot columns, so nothing draws
+    // under those columns and clashes with their text. imgMin/imgMax stay the TRUE image bounds for
+    // coordinate projection + hit-testing — only the DRAW clip is inset. Column edges are published
+    // per frame (overlayColumnEdge, valid even when collapsed to a pill); fall back to the image.
+    const float skFmEdge = ui::overlayColumnEdge(0);   // FeatureManager right edge
+    const float skCpEdge = ui::overlayColumnEdge(1);   // Copilot left edge
+    const ImVec2 skClipMin(skFmEdge > imgMin.x ? skFmEdge : imgMin.x, imgMin.y);
+    const ImVec2 skClipMax((skCpEdge > 0.0f && skCpEdge < imgMax.x) ? skCpEdge : imgMax.x, imgMax.y);
+
     // ---- C37-D: SolidWorks plane-pick step (runs while !active_, before a sketch exists) ----
     // The viewport keeps calling drawOverlay (and force-shows the origin planes) while
     // st.sketchPlanePickActive is set; we ray-hit-test the three origin-plane quads + planar faces.
@@ -4712,7 +4824,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         const Renderer& r = *st.renderer;
         const auto& cam = r.camera();
         ImDrawList* wdl = ImGui::GetWindowDrawList();
-        wdl->PushClipRect(imgMin, imgMax, true);
+        wdl->PushClipRect(skClipMin, skClipMax, true);   // dodge the pinned columns
 
         // Project each origin-plane quad (front=0/top=1/right=2). The corners come straight from
         // Renderer::planeQuad — the SAME geometry drawReferencePlanes renders — so the hit-test
@@ -4784,12 +4896,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // plane under the cursor.
         if (sDatumWins) {
             wdl->AddQuadFilled(sDatumQuad[0], sDatumQuad[1], sDatumQuad[2], sDatumQuad[3], col(pal.accent, 0.16f));
-            wdl->AddQuad(sDatumQuad[0], sDatumQuad[1], sDatumQuad[2], sDatumQuad[3], col(pal.accent, 0.90f), 2.0f);
+            wdl->AddQuad(sDatumQuad[0], sDatumQuad[1], sDatumQuad[2], sDatumQuad[3], col(pal.accent, 0.90f), 2.0f * ui::uiScale);
         } else if (hovered >= 0 && quadVis[hovered]) {
             wdl->AddQuadFilled(quadS[hovered][0], quadS[hovered][1], quadS[hovered][2],
                                quadS[hovered][3], col(pal.accent, 0.16f));
             wdl->AddQuad(quadS[hovered][0], quadS[hovered][1], quadS[hovered][2],
-                         quadS[hovered][3], col(pal.accent, 0.90f), 2.0f);
+                         quadS[hovered][3], col(pal.accent, 0.90f), 2.0f * ui::uiScale);
         }
         // Click: a datum plane wins if frontmost; else an origin plane; else the hovered planar face.
         if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -4819,19 +4931,13 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 }
             }
         }
-        // Top-center banner.
+        // Top-center banner. Sits BELOW the heads-up view toolbar (centered pill at imgMin.y+8,
+        // ~34px tall) so the two don't overlap (the HUD stays visible during plane-pick).
         const char* banner = planeEditFid_.empty()
             ? "Select a plane or a planar face for the sketch \xE2\x80\x94 Esc to cancel"
             : "Select the new sketch plane or a planar face \xE2\x80\x94 Esc to cancel";
-        ImVec2 bts = ImGui::CalcTextSize(banner);
-        float bcx = (imgMin.x + imgMax.x) * 0.5f;
-        // Sit BELOW the heads-up view toolbar (centered pill at imgMin.y+8, ~34px tall) so the
-        // two don't overlap (the HUD stays visible during plane-pick).
-        ImVec2 b0(bcx - bts.x * 0.5f - 14, imgMin.y + 52.0f * ui::uiScale);
-        ImVec2 b1(bcx + bts.x * 0.5f + 14, b0.y + bts.y + 12);
-        wdl->AddRectFilled(b0, b1, col(pal.overlayBg), 6.0f);
-        wdl->AddRect(b0, b1, col(pal.overlayBorder), 6.0f);
-        wdl->AddText(ImVec2(b0.x + 14, b0.y + 6), col(pal.overlayText), banner);
+        glassHudBanner(wdl, "sk_plane_pick_banner", imgMin, imgMax,
+                       imgMin.y + 52.0f * ui::uiScale, banner);
         wdl->PopClipRect();
         // Esc cancels the whole thing (new-sketch pick OR an Edit-Sketch-Plane reparent).
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
@@ -4848,22 +4954,13 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     if (!basisOk_) return;
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->PushClipRect(imgMin, imgMax, true);
+    dl->PushClipRect(skClipMin, skClipMax, true);   // dodge the pinned FeatureManager / Copilot columns
 
     // C37-D: crosshair cursor whenever a drawing tool or Smart Dimension is active.
     if (tool_ != SketchTool::None) st.requestCursor(ui::CursorKind::Crosshair);
 
-    // C37-D: the confirmation corner (top-right) sits over the viewport image, so its rects steal
-    // hover from the tools. Compute them here and treat clicks there as NOT hovering the canvas, so a
-    // tool/dim click on ✓/✗ doesn't also place a point. (Geometry mirrors the corner block below.)
-    {
-        const float sz = 30.0f, pad = 12.0f;
-        ImVec2 okMin(imgMax.x - pad - sz, imgMin.y + pad), okMax(okMin.x + sz, okMin.y + sz);
-        ImVec2 cxMin(okMin.x, okMax.y + 6), cxMax(cxMin.x + sz, cxMin.y + sz);
-        if (imgHovered && (ImGui::IsMouseHoveringRect(okMin, okMax) ||
-                           ImGui::IsMouseHoveringRect(cxMin, cxMax)))
-            imgHovered = false;
-    }
+    // C37-D: the in-viewport ✓/✗ confirmation corner was relocated to the Sketch-tab ribbon, so the
+    // viewport's top-right no longer needs a hover-exclusion carve-out (the whole image is live).
 
     // C37-D / C50: in-sketch undo + redo (the global app handler skips both while a sketch is
     // active). Ctrl+Z undoes (mid-stroke pops the last point); Ctrl+Y or Ctrl+Shift+Z redoes.
@@ -4922,17 +5019,18 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             vmin = std::fmin(vmin, v); vmax = std::fmax(vmax, v);
         }
         // Clamp the line count so a zoomed-out view doesn't draw thousands of lines.
+        const float gthA = 1.4f * ui::uiScale, gth = 1.0f * ui::uiScale;
         int count = 0;
         float gu0 = std::floor(umin / kGridStep) * kGridStep;
         for (float u = gu0; u <= umax && count < 400; u += kGridStep, ++count) {
             ImVec2 a = uvToScreen(u, vmin), b = uvToScreen(u, vmax);
-            dl->AddLine(a, b, std::fabs(u) < 1e-3f ? axisCol : gridCol, std::fabs(u) < 1e-3f ? 1.4f : 1.0f);
+            dl->AddLine(a, b, std::fabs(u) < 1e-3f ? axisCol : gridCol, std::fabs(u) < 1e-3f ? gthA : gth);
         }
         count = 0;
         float gv0 = std::floor(vmin / kGridStep) * kGridStep;
         for (float v = gv0; v <= vmax && count < 400; v += kGridStep, ++count) {
             ImVec2 a = uvToScreen(umin, v), b = uvToScreen(umax, v);
-            dl->AddLine(a, b, std::fabs(v) < 1e-3f ? axisCol : gridCol, std::fabs(v) < 1e-3f ? 1.4f : 1.0f);
+            dl->AddLine(a, b, std::fabs(v) < 1e-3f ? axisCol : gridCol, std::fabs(v) < 1e-3f ? gthA : gth);
         }
     }
 
@@ -4943,8 +5041,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // color with a filled selection ring (matching selected entities), red otherwise.
     {
         const bool oSel = isSelected("origin");
-        const ImU32 oc = oSel ? col(pal.accent) : col(pal.statusErr, 0.95f);
-        const float th = oSel ? 2.6f : 1.8f;
+        const ImU32 oc = oSel ? canvasAccent() : col(pal.statusErr, 0.95f);
+        const float th = (oSel ? 2.6f : 1.8f) * ui::uiScale;
         ImVec2 o = uvToScreen(0, 0);
         // unit u/v directions in screen space (normalized axis deltas)
         auto unit = [](ImVec2 d) {
@@ -4955,12 +5053,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         const float len = 22.0f * ui::uiScale;
         ImVec2 tu(o.x + du.x * len, o.y + du.y * len);
         ImVec2 tv(o.x + dv.x * len, o.y + dv.y * len);
-        if (oSel) dl->AddCircleFilled(o, 5.5f * ui::uiScale, col(pal.accent, 0.30f), 16);
+        if (oSel) dl->AddCircleFilled(o, 5.5f * ui::uiScale, col(pal.accent, 0.30f), 0);
         dl->AddLine(o, tu, oc, th);
         dl->AddLine(o, tv, oc, th);
-        arrowHead(dl, tu, du.x, du.y, 7.0f, oc);
-        arrowHead(dl, tv, dv.x, dv.y, 7.0f, oc);
-        dl->AddCircle(o, 3.5f, oc, 12, th);
+        arrowHead(dl, tu, du.x, du.y, 7.0f * ui::uiScale, oc);
+        arrowHead(dl, tv, dv.x, dv.y, 7.0f * ui::uiScale, oc);
+        dl->AddCircle(o, 3.5f * ui::uiScale, oc, 0, th);
     }
 
     // ---- C51: closed-profile region shading (under the entities) ----
@@ -4982,7 +5080,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             std::vector<ImVec2> sp; sp.reserve(rg.poly.size());
             for (const auto& p : rg.poly) sp.push_back(uvToScreen(p.x, p.y));
             dl->AddConcavePolyFilled(sp.data(), (int)sp.size(), hot ? hotFill : fillCol);
-            if (hot) dl->AddPolyline(sp.data(), (int)sp.size(), hotEdge, ImDrawFlags_Closed, 1.5f);
+            if (hot) dl->AddPolyline(sp.data(), (int)sp.size(), hotEdge, ImDrawFlags_Closed,
+                                     1.5f * ui::uiScale);
         }
     }
 
@@ -5079,50 +5178,45 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             out = ImVec2(s.x + off * 0.8f, s.y - off * 0.8f);
             return true;
         };
-        // (1) Collect every non-dimensional relation as a Badge.
-        struct Badge { std::string cid; const char* glyph; const char* name; bool conflict;
+        // (1) Collect every non-dimensional relation as a Badge. The chip glyph is a real
+        // vector mini-icon (drawRelationGlyph) keyed on the relation type — the old ASCII
+        // tokens ("//","col","cr") read as cramped letters, not constraint icons.
+        struct Badge { std::string cid; const char* type; const char* name; bool conflict;
                        ImVec2 pos, anchor; };
         std::vector<Badge> badges;
-        auto pushBadge = [&](const std::string& cid, const std::string& h, const char* glyph,
-                             const char* name, bool conflict) {
+        auto pushBadge = [&](const std::string& cid, const std::string& h, const char* type,
+                             bool conflict) {
             ImVec2 pos, anchor;
             if (!badgeAnchor(h, pos)) return;
             if (!refAttach(h, anchor)) anchor = pos;
-            badges.push_back({cid, glyph, name, conflict, pos, anchor});
+            badges.push_back({cid, type, type, conflict, pos, anchor});
+        };
+        auto knownRel = [](const std::string& t) {
+            return t == "horizontal" || t == "vertical" || t == "parallel" ||
+                   t == "perpendicular" || t == "equal" || t == "coincident" ||
+                   t == "concentric" || t == "tangent" || t == "collinear" ||
+                   t == "coradial" || t == "midpoint" || t == "symmetric" || t == "fix";
         };
         for (const auto& c : cons_) {
             if (c.isDimensional() || c.refs.empty()) continue;
-            const char* g = c.type == "horizontal"    ? "-"
-                          : c.type == "vertical"      ? "|"
-                          : c.type == "parallel"      ? "//"
-                          : c.type == "perpendicular" ? "L"
-                          : c.type == "equal"         ? "="
-                          : c.type == "coincident"    ? "o"
-                          : c.type == "concentric"    ? "c"
-                          : c.type == "tangent"       ? "T"
-                          : c.type == "collinear"     ? "col"
-                          : c.type == "coradial"      ? "cr"
-                          : c.type == "midpoint"      ? "m"
-                          : c.type == "symmetric"     ? "s"
-                          : c.type == "fix"           ? "x" : nullptr;
-            if (!g) continue;
+            if (!knownRel(c.type)) continue;
             bool conflict = isConflict(c.id);
             // Entity-pair relations get a badge on EACH ref (SolidWorks shows both sides);
             // single-entity / point relations get one badge at the first ref.
             bool pairRel = c.type == "parallel" || c.type == "perpendicular" ||
                            c.type == "equal" || c.type == "tangent" || c.type == "concentric" ||
                            c.type == "collinear" || c.type == "coradial" || c.type == "symmetric";
-            if (pairRel) { for (const auto& rh : c.refs) pushBadge(c.id, rh, g, c.type.c_str(), conflict); }
-            else         pushBadge(c.id, c.refs[0], g, c.type.c_str(), conflict);
+            if (pairRel) { for (const auto& rh : c.refs) pushBadge(c.id, rh, c.type.c_str(), conflict); }
+            else         pushBadge(c.id, c.refs[0], c.type.c_str(), conflict);
         }
         // (2) Spread: 8 relaxation passes pushing any overlapping pair apart by half the overlap.
+        const float minD = bs + 2.0f * ui::uiScale;   // chip side + DPI-scaled breathing margin
         for (int it = 0; it < 8; ++it) {
             for (size_t i = 0; i < badges.size(); ++i) {
                 for (size_t j = i + 1; j < badges.size(); ++j) {
                     float dx = badges[j].pos.x - badges[i].pos.x;
                     float dy = badges[j].pos.y - badges[i].pos.y;
                     float d = std::hypot(dx, dy);
-                    const float minD = bs + 2.0f;
                     if (d >= minD) continue;
                     float ox, oy;
                     if (d < 1e-3f) { ox = minD * 0.5f; oy = 0.0f; }   // coincident -> shove along +x
@@ -5137,15 +5231,14 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         for (const auto& b : badges) {
             const ImVec2 gp = b.pos;
             if (std::hypot(gp.x - b.anchor.x, gp.y - b.anchor.y) > bs)
-                dl->AddLine(b.anchor, gp, leaderCol, 0.8f);
+                dl->AddLine(b.anchor, gp, leaderCol, 0.8f * ui::uiScale);
             ImVec2 c0(gp.x - bs * 0.5f, gp.y - bs * 0.5f), c1(gp.x + bs * 0.5f, gp.y + bs * 0.5f);
             bool hot = isRelSelected(b.cid) || hoverRelCid_ == b.cid;
             dl->AddRectFilled(c0, c1, hot ? relSelBg : relBg, 3.5f * ui::uiScale);
             dl->AddRect(c0, c1, b.conflict ? dimErrCol : (hot ? relSelBorder : relBorder),
-                        3.5f * ui::uiScale, 0, (b.conflict || hot) ? 1.8f : 1.2f);
-            ImVec2 gs = ImGui::CalcTextSize(b.glyph);
-            dl->AddText(ImVec2(gp.x - gs.x * 0.5f, gp.y - gs.y * 0.5f),
-                        b.conflict ? dimErrCol : (hot ? relSelInk : relInk), b.glyph);
+                        3.5f * ui::uiScale, 0, ((b.conflict || hot) ? 1.8f : 1.2f) * ui::uiScale);
+            drawRelationGlyph(dl, gp, bs, b.type,
+                              b.conflict ? dimErrCol : (hot ? relSelInk : relInk));
             relHits_.push_back({b.cid, c0, c1});
             if (imgHovered && io.MousePos.x >= c0.x && io.MousePos.x <= c1.x &&
                 io.MousePos.y >= c0.y && io.MousePos.y <= c1.y)
@@ -5164,11 +5257,13 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     const float kConGap  = 4.0f * ui::uiScale;
     // Stroke one segment — solid for normal geometry, dashed for construction.
     // addSeg accumulates points into a local vector so the polyline dash phase is continuous.
+    // DPI-scaled marker sizes shared by the entity loop (endpoint/center dots, point crosses).
+    const float dotR = 3.0f * ui::uiScale, ctrR = 2.5f * ui::uiScale;
     for (const auto& e : ents_) {
-        // C41 (T2): selected entities render in the accent color, slightly thicker.
+        // C41 (T2): selected entities render in the (canvas-darkened) accent, slightly thicker.
         bool sel = !selIds_.empty() && isSelected(e.id);
-        ImU32 cc = sel ? col(pal.accent) : statusCol(e);
-        float th = (e.construction ? 1.0f : 2.0f) + (sel ? 1.0f : 0.0f);
+        ImU32 cc = sel ? canvasAccent() : statusCol(e);
+        float th = ((e.construction ? 1.0f : 2.0f) + (sel ? 1.0f : 0.0f)) * ui::uiScale;
         // Helper: stroke a polyline; uses dashed rendering for construction entities.
         auto strokePoly = [&](const std::vector<ImVec2>& pts) {
             if (e.construction) {
@@ -5185,11 +5280,14 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             } else {
                 dl->AddLine(a, b, cc, th);
             }
-            dl->AddCircleFilled(a, 3.0f, cc);
-            dl->AddCircleFilled(b, 3.0f, cc);
+            dl->AddCircleFilled(a, dotR, cc);
+            dl->AddCircleFilled(b, dotR, cc);
         } else if (e.type == "circle") {
-            // Sample the circle in (u,v) so it follows the plane mapping exactly.
-            int seg = 64;
+            // Sample the circle in (u,v) so it follows the plane mapping exactly; segment count
+            // tracks the projected radius so zoomed-in circles never show facets.
+            ImVec2 sc0 = uvToScreen(e.center[0], e.center[1]);
+            ImVec2 sr0 = uvToScreen(e.center[0] + e.radius, e.center[1]);
+            int seg = circleSegs(std::hypot(sr0.x - sc0.x, sr0.y - sc0.y));
             std::vector<ImVec2> pts; pts.reserve(seg + 1);
             for (int i = 0; i <= seg; ++i) {
                 float a = i / (float)seg * 6.2831853f;
@@ -5197,12 +5295,16 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                                          e.center[1] + e.radius * std::sin(a)));
             }
             strokePoly(pts);
-            dl->AddCircleFilled(uvToScreen(e.center[0], e.center[1]), 2.5f, cc);
+            dl->AddCircleFilled(sc0, ctrR, cc);
         } else if (e.type == "arc") {
             float a0 = e.start, a1 = e.end;
             if (!e.ccw) { float t = a0; a0 = a1; a1 = t; }
             if (a1 < a0) a1 += 360.0f;
-            int seg = 48;
+            ImVec2 sc0 = uvToScreen(e.center[0], e.center[1]);
+            ImVec2 sr0 = uvToScreen(e.center[0] + e.radius, e.center[1]);
+            float sweepFrac = (a1 - a0) / 360.0f;
+            int seg = std::max(12, (int)(circleSegs(std::hypot(sr0.x - sc0.x, sr0.y - sc0.y)) *
+                                         sweepFrac));
             std::vector<ImVec2> pts; pts.reserve(seg + 1);
             for (int i = 0; i <= seg; ++i) {
                 float a = (a0 + (a1 - a0) * (i / (float)seg)) * 3.14159265f / 180.0f;
@@ -5247,10 +5349,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 strokePoly(halfArc(e.p2, axis2));
                 // construction: centerline spine + the trimmed-away inner half of each end circle
                 const ImU32 conCol = sel ? cc : col(pal.sketchUnder, 0.85f);
-                drawDashedLine(dl, a, b, conCol, 1.0f, kConDash, kConGap);
-                drawDashedPolyline(dl, halfArc(e.p1, axis1 + 3.14159265f), conCol, 1.0f,
+                const float conTh = 1.0f * ui::uiScale;
+                drawDashedLine(dl, a, b, conCol, conTh, kConDash, kConGap);
+                drawDashedPolyline(dl, halfArc(e.p1, axis1 + 3.14159265f), conCol, conTh,
                                    kConDash, kConGap);
-                drawDashedPolyline(dl, halfArc(e.p2, axis2 + 3.14159265f), conCol, 1.0f,
+                drawDashedPolyline(dl, halfArc(e.p2, axis2 + 3.14159265f), conCol, conTh,
                                    kConDash, kConGap);
             }
         } else if (e.type == "arc_slot") {
@@ -5287,9 +5390,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         } else if (e.type == "point") {
             // C42: dot + small cross so a lone point reads as geometry, not a stray handle.
             ImVec2 p = uvToScreen(e.p1[0], e.p1[1]);
-            dl->AddCircleFilled(p, 3.0f, cc);
-            dl->AddLine(ImVec2(p.x - 6, p.y), ImVec2(p.x + 6, p.y), cc, 1.2f);
-            dl->AddLine(ImVec2(p.x, p.y - 6), ImVec2(p.x, p.y + 6), cc, 1.2f);
+            const float cx6 = 6.0f * ui::uiScale, cw = 1.2f * ui::uiScale;
+            dl->AddCircleFilled(p, dotR, cc);
+            dl->AddLine(ImVec2(p.x - cx6, p.y), ImVec2(p.x + cx6, p.y), cc, cw);
+            dl->AddLine(ImVec2(p.x, p.y - cx6), ImVec2(p.x, p.y + cx6), cc, cw);
         } else if (e.type == "ellipse") {
             // C42: parametric sample with the rotation applied (rot stored in degrees).
             const float D2R = 3.14159265f / 180.0f;
@@ -5303,7 +5407,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                                          e.center[1] + lx * sa + ly * ca));
             }
             strokePoly(pts);
-            dl->AddCircleFilled(uvToScreen(e.center[0], e.center[1]), 2.5f, cc);
+            dl->AddCircleFilled(uvToScreen(e.center[0], e.center[1]), ctrR, cc);
         } else if (e.type == "spline" || e.type == "style_spline") {
             // C42/M-1: an interpolating "spline" draws the SMOOTH curve through its points
             // (Catmull-Rom), so the viewport matches the geometry the engine sweeps/revolves.
@@ -5314,7 +5418,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             std::vector<ImVec2> pts; pts.reserve(src.size());
             for (const auto& q : src) pts.push_back(uvToScreen(q.x, q.y));
             strokePoly(pts);
-            for (const auto& q : e.pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), 2.5f, cc);
+            for (const auto& q : e.pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), ctrR, cc);
         }
     }
 
@@ -5343,15 +5447,19 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
         else if (sub == "rim") { continue; }   // floating cursor-dependent handle, not persisted
         else continue;
-        dl->AddRectFilled(ImVec2(p.x - 4, p.y - 4), ImVec2(p.x + 4, p.y + 4), col(pal.accent), 1.5f);
+        const float hs = 4.0f * ui::uiScale;
+        dl->AddRectFilled(ImVec2(p.x - hs, p.y - hs), ImVec2(p.x + hs, p.y + hs),
+                          canvasAccent(), 1.5f * ui::uiScale);
     }
 
     // ---- C37-D: dimension annotations (always rendered, ON TOP of entity lines) ----
     {
         const ImU32 dimLineCol = col(pal.sketchDimLine, 0.85f);
         const ImU32 dimTextCol = col(pal.sketchInk);
-        const ImU32 dimDrivenCol = col(pal.consoleDim);     // dimmer for driven (reference) dims
-        const ImU32 dimHoverCol = col(pal.accent);
+        // Driven (reference) dims: dimmed CANVAS ink — consoleDim is a panel role and is light
+        // grey in the dark theme, which washed out on the always-light canvas.
+        const ImU32 dimDrivenCol = col(pal.sketchInk, 0.55f);
+        const ImU32 dimHoverCol = canvasAccent();           // dark enough on the light canvas
         const ImU32 dimErrCol = col(pal.statusErr);         // C50f: conflicting dims/badges in red
         // C50f: is this constraint id one the solver flagged as conflicting? Conflicting dims/badges
         // render in the error color (SolidWorks paints fighting relations red), matching the entity
@@ -5575,17 +5683,19 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         int effRegion = hovRegion >= 0 ? hovRegion : entityLoopRegion_;
 
         // ---- C51: pre-highlight — outline exactly what a click will select, drawn on top. ----
-        const ImU32 hiCol = col(pal.accent);
+        const ImU32 hiCol = canvasAccent();
+        const float hiTh = 2.6f * ui::uiScale;
         if (!hovHandle.empty()) {
-            dl->AddCircle(uvToScreen(hovHu, hovHv), 6.0f, col(pal.hoverHighlight), 16, 2.0f);
+            dl->AddCircle(uvToScreen(hovHu, hovHv), 6.0f * ui::uiScale, col(pal.hoverHighlight),
+                          0, 2.0f * ui::uiScale);
             st.requestCursor(ui::CursorKind::Hand);
         } else if (effRegion >= 0) {
             for (const auto& id : regions_[effRegion].ids)
-                if (const SketchEntity* e = entById(id)) strokeEntityOutline(dl, *e, hiCol, 2.6f);
+                if (const SketchEntity* e = entById(id)) strokeEntityOutline(dl, *e, hiCol, hiTh);
             hotRegion_ = effRegion;          // brighten the region fill (next frame)
             st.requestCursor(ui::CursorKind::Hand);
         } else if (!hovEnt.empty()) {
-            if (const SketchEntity* e = entById(hovEnt)) strokeEntityOutline(dl, *e, hiCol, 2.6f);
+            if (const SketchEntity* e = entById(hovEnt)) strokeEntityOutline(dl, *e, hiCol, hiTh);
             hotRegion_ = -1;
             st.requestCursor(ui::CursorKind::Hand);
         } else {
@@ -5742,13 +5852,15 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             ImVec2 hi(std::fmax(boxStart_.x, io.MousePos.x), std::fmax(boxStart_.y, io.MousePos.y));
             ImU32 edge = crossing ? col(pal.sketchInfer) : col(pal.accent, 0.9f);
             dl->AddRectFilled(lo, hi, crossing ? col(pal.sketchInfer, 0.10f) : col(pal.accent, 0.10f));
+            const float bw = 1.4f * ui::uiScale;
+            const float bd = 6.0f * ui::uiScale, bg = 4.0f * ui::uiScale;
             if (crossing) {
-                drawDashedLine(dl, lo, ImVec2(hi.x, lo.y), edge, 1.4f, 6.0f, 4.0f);
-                drawDashedLine(dl, ImVec2(hi.x, lo.y), hi, edge, 1.4f, 6.0f, 4.0f);
-                drawDashedLine(dl, hi, ImVec2(lo.x, hi.y), edge, 1.4f, 6.0f, 4.0f);
-                drawDashedLine(dl, ImVec2(lo.x, hi.y), lo, edge, 1.4f, 6.0f, 4.0f);
+                drawDashedLine(dl, lo, ImVec2(hi.x, lo.y), edge, bw, bd, bg);
+                drawDashedLine(dl, ImVec2(hi.x, lo.y), hi, edge, bw, bd, bg);
+                drawDashedLine(dl, hi, ImVec2(lo.x, hi.y), edge, bw, bd, bg);
+                drawDashedLine(dl, ImVec2(lo.x, hi.y), lo, edge, bw, bd, bg);
             } else {
-                dl->AddRect(lo, hi, edge, 0.0f, 0, 1.4f);
+                dl->AddRect(lo, hi, edge, 0.0f, 0, bw);
             }
         }
         // (Handle/entity/loop/relation hover highlight is drawn by the C51 pre-highlight above.)
@@ -5807,7 +5919,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         const SketchEntity& e = ents_[hovered];
                         if (e.type == "line") {
                             dl->AddLine(uvToScreen(e.p1[0], e.p1[1]),
-                                        uvToScreen(e.p2[0], e.p2[1]), rc, 3.5f);
+                                        uvToScreen(e.p2[0], e.p2[1]), rc, 3.5f * ui::uiScale);
                         } else {
                             float a0 = 0, a1 = 6.2831853f;
                             if (e.type == "arc") {
@@ -5820,13 +5932,13 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                                 float a = a0 + (a1 - a0) * (i / (float)seg);
                                 ImVec2 p = uvToScreen(e.center[0] + e.radius * std::cos(a),
                                                       e.center[1] + e.radius * std::sin(a));
-                                if (i) dl->AddLine(prev, p, rc, 3.5f); prev = p;
+                                if (i) dl->AddLine(prev, p, rc, 3.5f * ui::uiScale); prev = p;
                             }
                         }
                     } else {
                         for (size_t i = 1; i < span.size(); ++i)
                             dl->AddLine(uvToScreen(span[i - 1].x, span[i - 1].y),
-                                        uvToScreen(span[i].x, span[i].y), rc, 3.5f);
+                                        uvToScreen(span[i].x, span[i].y), rc, 3.5f * ui::uiScale);
                     }
                 }
             }
@@ -5875,7 +5987,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 // Faint accent over the whole entity, bright dot on the nearer pickable end.
                 if (e.type == "line") {
                     ImVec2 a = uvToScreen(e.p1[0], e.p1[1]), b = uvToScreen(e.p2[0], e.p2[1]);
-                    dl->AddLine(a, b, ac, 2.5f);
+                    dl->AddLine(a, b, ac, 2.5f * ui::uiScale);
                     float da = std::hypot(a.x - io.MousePos.x, a.y - io.MousePos.y);
                     float db = std::hypot(b.x - io.MousePos.x, b.y - io.MousePos.y);
                     whichEnd = da < db ? "start" : "end"; endPx = da < db ? a : b;
@@ -5920,7 +6032,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 if (!inChain(e.id)) continue;
                 const ImU32 ac = col(pal.accent, 0.95f);
                 if (e.type == "line" || e.type == "slot") {
-                    dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), ac, 3.5f);
+                    dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), ac, 3.5f * ui::uiScale);
                 } else if (e.type == "circle" || e.type == "arc") {
                     float a0 = 0, a1 = 6.2831853f;
                     if (e.type == "arc") {
@@ -5933,7 +6045,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         float a = a0 + (a1 - a0) * (i / (float)seg);
                         ImVec2 p = uvToScreen(e.center[0] + e.radius * std::cos(a),
                                               e.center[1] + e.radius * std::sin(a));
-                        if (i) dl->AddLine(prev, p, ac, 3.5f); prev = p;
+                        if (i) dl->AddLine(prev, p, ac, 3.5f * ui::uiScale); prev = p;
                     }
                 }
             }
@@ -6006,7 +6118,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             const SketchEntity* first = corner1Id_.empty() ? nullptr : entById(corner1Id_);
             if (first && first->type == "line")
                 dl->AddLine(uvToScreen(first->p1[0], first->p1[1]),
-                            uvToScreen(first->p2[0], first->p2[1]), ac, 3.5f);
+                            uvToScreen(first->p2[0], first->p2[1]), ac, 3.5f * ui::uiScale);
             // Hover preview (faint) over the would-be-picked line (skip the already-picked one).
             if (hovered >= 0 && ents_[hovered].type == "line" && ents_[hovered].id != corner1Id_) {
                 const SketchEntity& e = ents_[hovered];
@@ -6067,7 +6179,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 }
             };
             // Tint the current selection.
-            for (const auto& e : ents_) if (inSel(e.id)) strokeEnt(e, ac, 3.5f);
+            for (const auto& e : ents_) if (inSel(e.id)) strokeEnt(e, ac, 3.5f * ui::uiScale);
 
             if (mpStage_ == 0) {
                 if (hovered >= 0 && !inSel(ents_[hovered].id)) strokeEnt(ents_[hovered], hc, 3.0f);
@@ -6145,7 +6257,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     }
                 }
             };
-            for (const auto& e : ents_) if (inSel(e.id)) strokeEnt(e, ac, 3.5f);
+            for (const auto& e : ents_) if (inSel(e.id)) strokeEnt(e, ac, 3.5f * ui::uiScale);
 
             if (mpStage_ == 0) {
                 if (hovered >= 0 && !inSel(ents_[hovered].id)) strokeEnt(ents_[hovered], hc, 3.0f);
@@ -6333,6 +6445,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
         ImVec2 sCur = uvToScreen(su, sv);
         const ImU32 prevCol = col(pal.accent, 0.9f);
+        const float pth = 1.6f * ui::uiScale;          // rubber-band / variant preview width
+        const float toolDotR = 3.0f * ui::uiScale;     // placed-point preview dots
 
         // Rubber band from the last placed point.
         if (!toolUV_.empty()) {
@@ -6342,19 +6456,19 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             // owns the drawing — otherwise this would draw a stray line to the cursor.
             if (tool_ == SketchTool::Line ||
                 (tool_ == SketchTool::Slot && toolUV_.size() == 1)) {
-                dl->AddLine(a, sCur, prevCol, 1.6f);
+                dl->AddLine(a, sCur, prevCol, pth);
             } else if (tool_ == SketchTool::RectCorner) {
                 ImVec2 p0 = a, p1 = sCur;
                 ImVec2 c1 = uvToScreen(su, toolUV_.back().y);
                 ImVec2 c2 = uvToScreen(toolUV_.back().x, sv);
-                dl->AddLine(p0, c1, prevCol, 1.6f); dl->AddLine(c1, p1, prevCol, 1.6f);
-                dl->AddLine(p1, c2, prevCol, 1.6f); dl->AddLine(c2, p0, prevCol, 1.6f);
+                dl->AddLine(p0, c1, prevCol, pth); dl->AddLine(c1, p1, prevCol, pth);
+                dl->AddLine(p1, c2, prevCol, pth); dl->AddLine(c2, p0, prevCol, pth);
             } else if (tool_ == SketchTool::Circle) {
                 float rpx = std::hypot(sCur.x - a.x, sCur.y - a.y);
-                dl->AddCircle(a, rpx, prevCol, 48, 1.6f);
+                dl->AddCircle(a, rpx, prevCol, 0, pth);
             } else if (tool_ == SketchTool::ArcCenter) {
                 float rpx = std::hypot(sCur.x - a.x, sCur.y - a.y);
-                dl->AddCircle(a, rpx, prevCol, 48, 1.2f);
+                dl->AddCircle(a, rpx, prevCol, 0, 1.2f * ui::uiScale);
             }
         }
 
@@ -6366,7 +6480,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             auto pl = [&](const std::vector<ImVec2>& uv) {  // draw a (u,v) polyline
                 for (size_t i = 1; i < uv.size(); ++i)
                     dl->AddLine(uvToScreen(uv[i - 1].x, uv[i - 1].y),
-                                uvToScreen(uv[i].x, uv[i].y), uCol, 1.6f);
+                                uvToScreen(uv[i].x, uv[i].y), uCol, pth);
             };
             // Arc-slot capsule preview: outer/inner arcs (r+/-hw, a0..a1 deg CCW) + two end caps.
             auto drawCapsule = [&](float cu, float cv, float rad, float a0d, float a1d, float hw) {
@@ -6377,7 +6491,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     for (int i = 0; i <= 64; ++i) {
                         float a = (a0d + (a1d - a0d) * (i / 64.0f)) * D2R;
                         ImVec2 q = uvToScreen(cu + rr * std::cos(a), cv + rr * std::sin(a));
-                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                        if (i) dl->AddLine(prev, q, uCol, pth); prev = q;
                     }
                 };
                 arcPoly(rad + hw); arcPoly(rad - hw);
@@ -6387,7 +6501,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     for (int i = 0; i <= 24; ++i) {
                         float t = (aDeg - 90.0f + 180.0f * (i / 24.0f)) * D2R;
                         ImVec2 q = uvToScreen(sx + hw * std::cos(t), sy + hw * std::sin(t));
-                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                        if (i) dl->AddLine(prev, q, uCol, pth); prev = q;
                     }
                 };
                 cap(a0d); cap(a1d);
@@ -6399,15 +6513,15 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 if (L < 1e-6f) return;
                 float nx = -dy / L, ny = dx / L;          // unit perpendicular to the spine
                 dl->AddLine(uvToScreen(p1.x + nx * hw, p1.y + ny * hw),
-                            uvToScreen(p2.x + nx * hw, p2.y + ny * hw), uCol, 1.6f);
+                            uvToScreen(p2.x + nx * hw, p2.y + ny * hw), uCol, pth);
                 dl->AddLine(uvToScreen(p1.x - nx * hw, p1.y - ny * hw),
-                            uvToScreen(p2.x - nx * hw, p2.y - ny * hw), uCol, 1.6f);
+                            uvToScreen(p2.x - nx * hw, p2.y - ny * hw), uCol, pth);
                 auto cap = [&](ImVec2 c, float axis) {       // outward-facing 180-deg arc
                     ImVec2 prev;
                     for (int i = 0; i <= 24; ++i) {
                         float a = axis - 1.5707963f + 3.14159265f * (i / 24.0f);
                         ImVec2 q = uvToScreen(c.x + hw * std::cos(a), c.y + hw * std::sin(a));
-                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                        if (i) dl->AddLine(prev, q, uCol, pth); prev = q;
                     }
                 };
                 cap(p1, std::atan2(p1.y - p2.y, p1.x - p2.x));
@@ -6420,7 +6534,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             if (tool_ == SketchTool::Rect3ptCorner && n >= 1) {
                 ImVec2 A = toolUV_[0];
                 ImVec2 B = (n >= 2) ? toolUV_[1] : ImVec2(su, sv);
-                if (n < 2) { dl->AddLine(uvToScreen(A.x, A.y), sCur, uCol, 1.6f); }
+                if (n < 2) { dl->AddLine(uvToScreen(A.x, A.y), sCur, uCol, pth); }
                 else {
                     // edge A-B fixed; third click sets width (perp offset of cursor from A-B).
                     float ex = B.x - A.x, ey = B.y - A.y; float L = std::hypot(ex, ey);
@@ -6432,7 +6546,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             } else if (tool_ == SketchTool::Rect3ptCenter && n >= 1) {
                 ImVec2 ctr = toolUV_[0];
                 ImVec2 mid = (n >= 2) ? toolUV_[1] : ImVec2(su, sv);
-                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, 1.6f); }
+                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, pth); }
                 else {
                     // ctr->mid is a half-edge direction (half-height); cursor sets half-width.
                     float hx = mid.x - ctr.x, hy = mid.y - ctr.y; float L = std::hypot(hx, hy);
@@ -6448,7 +6562,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             } else if (tool_ == SketchTool::Parallelogram && n >= 1) {
                 ImVec2 A = toolUV_[0];
                 ImVec2 B = (n >= 2) ? toolUV_[1] : ImVec2(su, sv);
-                if (n < 2) { dl->AddLine(uvToScreen(A.x, A.y), sCur, uCol, 1.6f); }
+                if (n < 2) { dl->AddLine(uvToScreen(A.x, A.y), sCur, uCol, pth); }
                 else {
                     ImVec2 C(su, sv);                 // third corner sets the shear
                     ImVec2 D(A.x + (C.x - B.x), A.y + (C.y - B.y));
@@ -6458,7 +6572,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 std::vector<ImVec2> pts;
                 for (size_t i = 0; i < n && i < 3; ++i) pts.push_back(toolUV_[i]);
                 if (pts.size() < 3) pts.push_back(ImVec2(su, sv));
-                for (auto& q : pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), 3.0f, uCol);
+                for (auto& q : pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), toolDotR, uCol);
                 if (pts.size() == 3) {
                     float cu, cv, rad;
                     if (circumcircle(pts[0], pts[1], pts[2], cu, cv, rad)) {
@@ -6466,7 +6580,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         for (int i = 0; i <= 48; ++i) {
                             float a = i / 48.0f * 6.2831853f;
                             ImVec2 q = uvToScreen(cu + rad * std::cos(a), cv + rad * std::sin(a));
-                            if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                            if (i) dl->AddLine(prev, q, uCol, pth); prev = q;
                         }
                     }
                 }
@@ -6480,7 +6594,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             } else if (tool_ == SketchTool::SlotCtrStr && n >= 1) {
                 ImVec2 ctr = toolUV_[0];
                 ImVec2 end = (n >= 2) ? toolUV_[1] : ImVec2(su, sv);
-                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, 1.6f); }
+                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, pth); }
                 else {
                     // centerpoint slot: spine endpoints are ctr +/- (end-ctr); cursor sets width.
                     ImVec2 e1(ctr.x + (end.x - ctr.x), ctr.y + (end.y - ctr.y));
@@ -6495,8 +6609,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 // 4 = width. Live preview at each stage with the snapped cursor.
                 const float R2D = 57.29577951f;
                 ImVec2 ctr = toolUV_[0];
-                dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), 3.0f, uCol);
-                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, 1.6f); }
+                dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), toolDotR, uCol);
+                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, pth); }
                 else {
                     ImVec2 s0 = toolUV_[1];
                     float rad = std::hypot(s0.x - ctr.x, s0.y - ctr.y);
@@ -6516,7 +6630,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 std::vector<ImVec2> pts;
                 for (size_t i = 0; i < n && i < 3; ++i) pts.push_back(toolUV_[i]);
                 if (pts.size() < 3) pts.push_back(ImVec2(su, sv));
-                for (auto& q : pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), 3.0f, uCol);
+                for (auto& q : pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), toolDotR, uCol);
                 float cu, cv, rad;
                 if (circumcircle(pts[0], pts[1], pts[2], cu, cv, rad)) {
                     float a0 = std::atan2(pts[0].y - cv, pts[0].x - cu) * R2D;
@@ -6536,7 +6650,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 float rot = std::atan2(rxp.y - ctr.y, rxp.x - ctr.x);
                 float rx = std::hypot(rxp.x - ctr.x, rxp.y - ctr.y);
                 float ca = std::cos(rot), sa = std::sin(rot);
-                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, 1.6f); }
+                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, pth); }
                 else {
                     // ry from the third pick's perpendicular distance; live cursor while n==2.
                     ImVec2 ryp = (n >= 3) ? toolUV_[2] : ImVec2(su, sv);
@@ -6556,14 +6670,14 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         float t = a0 + (a1 - a0) * (i / 64.0f);
                         float lx = rx * std::cos(t), ly = ry * std::sin(t);
                         ImVec2 q = uvToScreen(ctr.x + lx * ca - ly * sa, ctr.y + lx * sa + ly * ca);
-                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                        if (i) dl->AddLine(prev, q, uCol, pth); prev = q;
                     }
                 }
             } else if (tool_ == SketchTool::Parabola && n >= 1) {
                 ImVec2 focus = toolUV_[0];
                 ImVec2 vertex = (n >= 2) ? toolUV_[1] : ImVec2(su, sv);
-                dl->AddCircleFilled(uvToScreen(focus.x, focus.y), 3.0f, uCol);
-                if (n < 2) { dl->AddLine(uvToScreen(focus.x, focus.y), sCur, uCol, 1.6f); }
+                dl->AddCircleFilled(uvToScreen(focus.x, focus.y), toolDotR, uCol);
+                if (n < 2) { dl->AddLine(uvToScreen(focus.x, focus.y), sCur, uCol, pth); }
                 else {
                     // axis = vertex->focus; f = |vertex-focus|. Sample y = x^2/(4f) in axis frame
                     // over the [start..end] parametric range set by the 3rd/4th (or live) picks.
@@ -6579,14 +6693,14 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         float t = t0 + (t1 - t0) * (i / 48.0f);
                         float d = t * t / (4.0f * f);    // distance along axis from vertex
                         ImVec2 q = uvToScreen(vertex.x + ux * d + px * t, vertex.y + uy * d + py * t);
-                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                        if (i) dl->AddLine(prev, q, uCol, pth); prev = q;
                     }
                 }
             } else if (tool_ == SketchTool::Conic && n >= 1) {
                 ImVec2 P0 = toolUV_[0];
                 ImVec2 P1 = (n >= 2) ? toolUV_[1] : ImVec2(su, sv);
-                dl->AddCircleFilled(uvToScreen(P0.x, P0.y), 3.0f, uCol);
-                if (n < 2) { dl->AddLine(uvToScreen(P0.x, P0.y), sCur, uCol, 1.6f); }
+                dl->AddCircleFilled(uvToScreen(P0.x, P0.y), toolDotR, uCol);
+                if (n < 2) { dl->AddLine(uvToScreen(P0.x, P0.y), sCur, uCol, pth); }
                 else {
                     ImVec2 apex = (n >= 3) ? toolUV_[2] : ImVec2(su, sv);
                     // rho: 0..1 weight of the apex (shoulder). Live-pick while n==3 (cursor sets it),
@@ -6609,7 +6723,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         float qx = (b0 * P0.x + b1 * apex.x + b2 * P1.x) / den;
                         float qy = (b0 * P0.y + b1 * apex.y + b2 * P1.y) / den;
                         ImVec2 q = uvToScreen(qx, qy);
-                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                        if (i) dl->AddLine(prev, q, uCol, pth); prev = q;
                     }
                     dl->AddCircle(uvToScreen(apex.x, apex.y), 4.0f, uCol, 12, 1.2f);
                 }
@@ -6620,8 +6734,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 std::vector<ImVec2> pts;
                 for (size_t i = 0; i < n && i < 3; ++i) pts.push_back(toolUV_[i]);
                 if (pts.size() < 3) pts.push_back(ImVec2(su, sv));
-                for (auto& q : pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), 3.0f, uCol);
-                if (n == 1) { dl->AddLine(uvToScreen(pts[0].x, pts[0].y), sCur, uCol, 1.6f); }
+                for (auto& q : pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), toolDotR, uCol);
+                if (n == 1) { dl->AddLine(uvToScreen(pts[0].x, pts[0].y), sCur, uCol, pth); }
                 else {
                     float cu, cv, rad;
                     if (circumcircle(pts[0], pts[1], pts[2], cu, cv, rad)) {
@@ -6638,7 +6752,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         for (int i = 0; i <= 48; ++i) {
                             float a = (a0 + (a1 - a0) * (i / 48.0f)) * D2R;
                             ImVec2 q = uvToScreen(cu + rad * std::cos(a), cv + rad * std::sin(a));
-                            if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                            if (i) dl->AddLine(prev, q, uCol, pth); prev = q;
                         }
                     }
                 }
@@ -6665,37 +6779,37 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         for (int i = 0; i <= 48; ++i) {
                             float a = (lo + (hi - lo) * (i / 48.0f)) * D2R;
                             ImVec2 q = uvToScreen(cu + rad * std::cos(a), cv + rad * std::sin(a));
-                            if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                            if (i) dl->AddLine(prev, q, uCol, pth); prev = q;
                         }
                     } else {
                         // Degenerate (cursor on the tangent line): preview a straight chord.
-                        dl->AddLine(sS, sCur, uCol, 1.6f);
+                        dl->AddLine(sS, sCur, uCol, pth);
                     }
                 } else {
                     // No source -> behave like a 3-pt arc's first leg (rubber chord from cursor).
-                    dl->AddCircleFilled(sCur, 3.0f, uCol);
+                    dl->AddCircleFilled(sCur, toolDotR, uCol);
                 }
             } else if (tool_ == SketchTool::Polygon && n >= 1) {
                 ImVec2 ctr = toolUV_[0];
-                dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), 3.0f, uCol);
+                dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), toolDotR, uCol);
                 float vx = su - ctr.x, vy = sv - ctr.y;
                 float R = std::hypot(vx, vy);
-                if (R < 1e-4f) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, 1.6f); }
+                if (R < 1e-4f) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, pth); }
                 else {
                     float a0 = std::atan2(vy, vx);
                     ImVec2 prev;
                     for (int i = 0; i <= polySides_; ++i) {
                         float a = a0 + 6.2831853f * i / (float)polySides_;
                         ImVec2 q = uvToScreen(ctr.x + R * std::cos(a), ctr.y + R * std::sin(a));
-                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                        if (i) dl->AddLine(prev, q, uCol, pth); prev = q;
                     }
                 }
             } else if (tool_ == SketchTool::Star && n >= 1) {
                 ImVec2 ctr = toolUV_[0];
-                dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), 3.0f, uCol);
+                dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), toolDotR, uCol);
                 float vx = su - ctr.x, vy = sv - ctr.y;
                 float R = std::hypot(vx, vy);
-                if (R < 1e-4f) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, 1.6f); }
+                if (R < 1e-4f) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, pth); }
                 else {
                     float a0 = std::atan2(vy, vx);
                     float Ri = R * polyStarRatio_;
@@ -6705,12 +6819,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         float a = a0 + (float)i * 3.14159265f / (float)pts;
                         float r = (i & 1) ? Ri : R;
                         ImVec2 q = uvToScreen(ctr.x + r * std::cos(a), ctr.y + r * std::sin(a));
-                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                        if (i) dl->AddLine(prev, q, uCol, pth); prev = q;
                     }
                 }
             } else if (tool_ == SketchTool::RectCenter && n >= 1) {
                 ImVec2 ctr = toolUV_[0];
-                dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), 3.0f, uCol);
+                dl->AddCircleFilled(uvToScreen(ctr.x, ctr.y), toolDotR, uCol);
                 float dx = std::fabs(su - ctr.x), dy = std::fabs(sv - ctr.y);
                 ImVec2 A(ctr.x - dx, ctr.y - dy), B(ctr.x + dx, ctr.y - dy);
                 ImVec2 C(ctr.x + dx, ctr.y + dy), D(ctr.x - dx, ctr.y + dy);
@@ -6721,7 +6835,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 float rot = std::atan2(rxp.y - ctr.y, rxp.x - ctr.x);
                 float rx = std::hypot(rxp.x - ctr.x, rxp.y - ctr.y);
                 float ca = std::cos(rot), sa = std::sin(rot);
-                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, 1.6f); }
+                if (n < 2) { dl->AddLine(uvToScreen(ctr.x, ctr.y), sCur, uCol, pth); }
                 else {
                     float ry = std::fabs(-(su - ctr.x) * sa + (sv - ctr.y) * ca);
                     if (ry < 1e-4f) ry = rx * 0.5f;
@@ -6730,19 +6844,22 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         float a = i / 64.0f * 6.2831853f;
                         float lx = rx * std::cos(a), ly = ry * std::sin(a);
                         ImVec2 q = uvToScreen(ctr.x + lx * ca - ly * sa, ctr.y + lx * sa + ly * ca);
-                        if (i) dl->AddLine(prev, q, uCol, 1.6f); prev = q;
+                        if (i) dl->AddLine(prev, q, uCol, pth); prev = q;
                     }
                 }
             } else if ((tool_ == SketchTool::Spline || tool_ == SketchTool::StyleSpline) && n >= 1) {
                 std::vector<ImVec2> pts(toolUV_.begin(), toolUV_.end());
                 pts.push_back(ImVec2(su, sv));
                 pl(pts);
-                for (auto& q : pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), 3.0f, uCol);
+                for (auto& q : pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), toolDotR, uCol);
             }
         }
 
         // ---- C49: inference feedback (dashed alignment lines, snap markers, relation chips) ----
         const ImU32 inferCol = col(pal.sketchInfer);
+        // Soft light backing under a snap marker so the amber ink stays legible over dense
+        // geometry / dark faces (glassIconHalo-style, canvas-toned).
+        const ImU32 markerHalo = col(pal.viewportTop, 0.65f);
         if (infer.alignU || infer.alignV) {
             // Dashed line from the alignment source point to the cursor (positional only).
             auto dashed = [&](ImVec2 a, ImVec2 b) {
@@ -6753,48 +6870,51 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 for (float t = 0; t < L; t += dash + gap) {
                     float e = std::fmin(t + dash, L);
                     dl->AddLine(ImVec2(a.x + dx * (t / L), a.y + dy * (t / L)),
-                                ImVec2(a.x + dx * (e / L), a.y + dy * (e / L)), inferCol, 1.2f);
+                                ImVec2(a.x + dx * (e / L), a.y + dy * (e / L)), inferCol,
+                                1.2f * ui::uiScale);
                 }
             };
             if (infer.alignU) dashed(uvToScreen(infer.srcU.x, infer.srcU.y), sCur);
             if (infer.alignV) dashed(uvToScreen(infer.srcV.x, infer.srcV.y), sCur);
         }
         // Cursor marker.
-        dl->AddCircle(sCur, 4.0f * ui::uiScale, prevCol, 12, 1.5f);
+        dl->AddCircle(sCur, 4.0f * ui::uiScale, prevCol, 0, 1.5f * ui::uiScale);
         // Snap markers (unified, ui::uiScale-scaled): yellow-ish dot = endpoint/point snap,
         // concentric rings = center snap, diamond = midpoint snap, plain ring = rim contact.
         if (!snapH.empty()) {
             const float ms = 5.0f * ui::uiScale;
+            const float w16 = 1.6f * ui::uiScale, w12 = 1.2f * ui::uiScale;
+            dl->AddCircleFilled(sCur, ms * 2.4f, markerHalo, 0);
             if (snapHasPrefix(snapH, "mid:")) {
                 ImVec2 d[4] = {ImVec2(sCur.x, sCur.y - ms * 1.5f), ImVec2(sCur.x + ms * 1.5f, sCur.y),
                                ImVec2(sCur.x, sCur.y + ms * 1.5f), ImVec2(sCur.x - ms * 1.5f, sCur.y)};
-                dl->AddQuad(d[0], d[1], d[2], d[3], inferCol, 1.6f);
+                dl->AddQuad(d[0], d[1], d[2], d[3], inferCol, w16);
             } else if (snapHasPrefix(snapH, "rim:") || snapHasPrefix(snapH, "tan:")) {
-                dl->AddCircle(sCur, ms * 1.4f, inferCol, 16, 1.6f);
+                dl->AddCircle(sCur, ms * 1.4f, inferCol, 0, w16);
             } else if (snapH.find(".center") != std::string::npos) {
-                dl->AddCircle(sCur, ms, inferCol, 16, 1.6f);
-                dl->AddCircle(sCur, ms * 1.9f, inferCol, 16, 1.2f);
+                dl->AddCircle(sCur, ms, inferCol, 0, w16);
+                dl->AddCircle(sCur, ms * 1.9f, inferCol, 0, w12);
             } else {  // endpoint / point / spline through-point
                 dl->AddCircleFilled(sCur, ms * 0.7f, inferCol);
-                dl->AddCircle(sCur, ms * 1.4f, inferCol, 16, 1.2f);
+                dl->AddCircle(sCur, ms * 1.4f, inferCol, 0, w12);
             }
         }
-        // Live relation chips near the cursor (same style as the C41 relation badges).
+        // Live relation chips near the cursor (same style + vector glyphs as the C41 badges).
         if (hvH || hvV || tanSnap) {
             const float bs2 = 16.0f * ui::uiScale;
             float chipX = sCur.x + bs2;                       // below-right of the cursor
-            auto chip = [&](const char* glyph) {
+            auto chip = [&](const char* relType) {
                 ImVec2 gp(chipX, sCur.y + bs2);
                 ImVec2 c0(gp.x - bs2 * 0.5f, gp.y - bs2 * 0.5f), c1(gp.x + bs2 * 0.5f, gp.y + bs2 * 0.5f);
                 dl->AddRectFilled(c0, c1, col(pal.sketchRelBg), 3.5f * ui::uiScale);
-                dl->AddRect(c0, c1, col(pal.sketchRelBorder), 3.5f * ui::uiScale, 0, 1.2f);
-                ImVec2 gs = ImGui::CalcTextSize(glyph);
-                dl->AddText(ImVec2(gp.x - gs.x * 0.5f, gp.y - gs.y * 0.5f), col(pal.sketchInk), glyph);
-                chipX += bs2 + 2.0f;
+                dl->AddRect(c0, c1, col(pal.sketchRelBorder), 3.5f * ui::uiScale, 0,
+                            1.2f * ui::uiScale);
+                drawRelationGlyph(dl, gp, bs2, relType, col(pal.sketchInk));
+                chipX += bs2 + 2.0f * ui::uiScale;
             };
-            if (hvH) chip("-");
-            if (hvV) chip("|");
-            if (tanSnap) chip("T");
+            if (hvH) chip("horizontal");
+            if (hvV) chip("vertical");
+            if (tanSnap) chip("tangent");
         }
 
         // Click placement. EqCurve takes no viewport pick (origin-relative; its popup opens on the
@@ -7404,21 +7524,24 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // ---- C37-D: SolidWorks-grade Smart Dimension state machine ----
     if (tool_ == SketchTool::SmartDim) {
         st.requestCursor(ui::CursorKind::Crosshair);
-        const ImU32 hiCol = col(pal.accent);
-        const ImU32 pickCol = col(pal.accent, 0.95f);
+        const float sdS = ui::uiScale;
+        const ImU32 hiCol = canvasAccent();          // dark-on-canvas hover/pick emphasis
+        const ImU32 pickCol = canvasAccent(0.95f);
         // Highlight already-picked targets. C38 (S1): resolve the picked entity by id (ents_ may have
         // been refilled since the pick) — skip the highlight when it's gone.
         for (const auto& p : dimPicks_) {
-            if (p.isPoint) { dl->AddCircle(uvToScreen(p.u, p.v), 6.0f, pickCol, 12, 2.0f); continue; }
+            if (p.isPoint) { dl->AddCircle(uvToScreen(p.u, p.v), 6.0f * sdS, pickCol, 0, 2.0f * sdS); continue; }
             const SketchEntity* ep = entById(p.entId);
             if (ep) {
                 const SketchEntity& e = *ep;
                 if (e.type == "line")
-                    dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), pickCol, 3.0f);
+                    dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), pickCol,
+                                3.0f * sdS);
                 else if (e.type == "circle" || e.type == "arc")
                     dl->AddCircle(uvToScreen(e.center[0], e.center[1]),
                                   std::hypot(uvToScreen(e.center[0] + e.radius, e.center[1]).x -
-                                             uvToScreen(e.center[0], e.center[1]).x, 0.0f), pickCol, 48, 3.0f);
+                                             uvToScreen(e.center[0], e.center[1]).x, 0.0f), pickCol,
+                                  0, 3.0f * sdS);
             }
         }
         // A pick can still be chained while fewer than 2 targets are collected — even when a
@@ -7434,24 +7557,27 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             bool isMid = hoverPick.isPoint && hoverPick.handle.size() > 4 &&
                          hoverPick.handle.compare(hoverPick.handle.size() - 4, 4, ".mid") == 0;
             if (isMid) {
-                ImVec2 m = uvToScreen(hoverPick.u, hoverPick.v); float r = 5.0f;
+                ImVec2 m = uvToScreen(hoverPick.u, hoverPick.v); float r = 5.0f * sdS;
                 dl->AddQuadFilled(ImVec2(m.x, m.y - r), ImVec2(m.x + r, m.y),
                                   ImVec2(m.x, m.y + r), ImVec2(m.x - r, m.y), hiCol);
             } else if (hoverPick.isPoint) {
-                dl->AddCircle(uvToScreen(hoverPick.u, hoverPick.v), 6.0f, hiCol, 12, 2.0f);
+                dl->AddCircle(uvToScreen(hoverPick.u, hoverPick.v), 6.0f * sdS, hiCol, 0, 2.0f * sdS);
             } else if (hoverPick.entIdx >= 0) {
                 const SketchEntity& e = ents_[hoverPick.entIdx];
                 if (e.type == "line") {
-                    dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), hiCol, 2.5f);
+                    dl->AddLine(uvToScreen(e.p1[0], e.p1[1]), uvToScreen(e.p2[0], e.p2[1]), hiCol,
+                                2.5f * sdS);
                     // SolidWorks shows the midpoint marker whenever a line is hovered, so the user
                     // knows they can snap to it — a hollow diamond at the center.
-                    ImVec2 m = uvToScreen((e.p1[0]+e.p2[0])*0.5f, (e.p1[1]+e.p2[1])*0.5f); float r = 5.0f;
+                    ImVec2 m = uvToScreen((e.p1[0]+e.p2[0])*0.5f, (e.p1[1]+e.p2[1])*0.5f);
+                    float r = 5.0f * sdS;
                     dl->AddQuad(ImVec2(m.x, m.y - r), ImVec2(m.x + r, m.y),
-                                ImVec2(m.x, m.y + r), ImVec2(m.x - r, m.y), hiCol, 1.6f);
+                                ImVec2(m.x, m.y + r), ImVec2(m.x - r, m.y), hiCol, 1.6f * sdS);
                 } else if (e.type == "circle" || e.type == "arc")
                     dl->AddCircle(uvToScreen(e.center[0], e.center[1]),
                                   std::hypot(uvToScreen(e.center[0] + e.radius, e.center[1]).x -
-                                             uvToScreen(e.center[0], e.center[1]).x, 0.0f), hiCol, 48, 2.5f);
+                                             uvToScreen(e.center[0], e.center[1]).x, 0.0f), hiCol,
+                                  0, 2.5f * sdS);
             }
         }
 
@@ -7565,24 +7691,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     if (pastePlacing_) {
         st.requestCursor(ui::CursorKind::Crosshair);
         drawPastePreview(st, dl, io.MousePos);
-        const char* banner = "Click to place \xE2\x80\x94 Esc to cancel";
-        ImVec2 bts = ImGui::CalcTextSize(banner);
-        float bcx = (imgMin.x + imgMax.x) * 0.5f;
-        ImVec2 b0(bcx - bts.x * 0.5f - 14, imgMin.y + 52.0f * ui::uiScale);
-        ImVec2 b1(bcx + bts.x * 0.5f + 14, b0.y + bts.y + 12);
-        dl->AddRectFilled(b0, b1, col(pal.overlayBg), 6.0f);
-        dl->AddRect(b0, b1, col(pal.overlayBorder), 6.0f);
-        dl->AddText(ImVec2(b0.x + 14, b0.y + 6), col(pal.overlayText), banner);
+        glassHudBanner(dl, "sk_paste_banner", imgMin, imgMax, imgMin.y + 52.0f * ui::uiScale,
+                       "Click to place \xE2\x80\x94 Esc to cancel");
         bool overCanvas = ImGui::IsMouseHoveringRect(imgMin, imgMax);
-        // Exclude the ✓/✗ confirmation corner (top-right) so a click there doesn't also commit the
-        // paste — same geometry the top-of-function corner block uses to steal hover from tools.
-        {
-            const float sz = 30.0f, pad = 12.0f;
-            ImVec2 okMin(imgMax.x - pad - sz, imgMin.y + pad), okMax(okMin.x + sz, okMin.y + sz);
-            ImVec2 cxMin(okMin.x, okMax.y + 6), cxMax(cxMin.x + sz, cxMin.y + sz);
-            if (ImGui::IsMouseHoveringRect(okMin, okMax) || ImGui::IsMouseHoveringRect(cxMin, cxMax))
-                overCanvas = false;
-        }
+        // (The ✓/✗ confirmation corner moved to the Sketch-tab ribbon; no in-viewport carve-out.)
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
             pastePlacing_ = false; pasteBundle_ = nlohmann::json();
             st.toast(ui::ToastLevel::Info, "Paste cancelled");
@@ -7592,48 +7704,33 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
     }
 
+    // ---- per-tool cursor badge ----
+    // The armed tool's ribbon icon rides below-right of the OS crosshair (the SolidWorks
+    // pencil-glyph affordance) so the active tool is always visible at the cursor. SDF draw
+    // with a light canvas-toned halo keeps it AA, uiScale-crisp and readable over geometry.
+    // Drawn last (still clipped to the image) so no sketch ink paints over it.
+    if (tool_ != SketchTool::None && imgHovered && !pastePlacing_) {
+        const char* cmd = activeToolCmd();
+        if (cmd && *cmd) {
+            int cmdCount = 0;
+            const RibbonCmd* cmds = getRibbonCmds(cmdCount);
+            const char* icon = nullptr;
+            for (int i = 0; i < cmdCount; ++i)
+                if (std::strcmp(cmds[i].cmd_id, cmd) == 0) { icon = cmds[i].icon; break; }
+            if (icon) {
+                const float s = ui::uiScale;
+                ui::drawIconGlass(dl, icon, ImVec2(io.MousePos.x + 16.0f * s,
+                                                   io.MousePos.y + 18.0f * s),
+                                  15.0f * s, col(pal.sketchInk), col(pal.viewportTop, 0.85f));
+            }
+        }
+    }
+
     dl->PopClipRect();
 
-    // ---- C37-D: SolidWorks confirmation corner (top-right): ✓ exit & keep, ✗ cancel & revert ----
-    {
-        ImDrawList* wdl = ImGui::GetWindowDrawList();
-        const float sz = 30.0f, pad = 12.0f;
-        // Two stacked square buttons in the very top-right corner.
-        ImVec2 okMin(imgMax.x - pad - sz, imgMin.y + pad);
-        ImVec2 okMax(okMin.x + sz, okMin.y + sz);
-        ImVec2 cxMin(okMin.x, okMax.y + 6);
-        ImVec2 cxMax(cxMin.x + sz, cxMin.y + sz);
-        bool okOver = ImGui::IsMouseHoveringRect(okMin, okMax);
-        bool cxOver = ImGui::IsMouseHoveringRect(cxMin, cxMax);
-        // ✓ keep
-        wdl->AddRectFilled(okMin, okMax, col(pal.statusOk, okOver ? 0.95f : 0.80f), 5.0f);
-        {
-            ImVec2 c(okMin.x + sz * 0.5f, okMin.y + sz * 0.5f);
-            wdl->AddLine(ImVec2(c.x - 7, c.y + 0), ImVec2(c.x - 2, c.y + 6), col(pal.windowBg), 2.6f);
-            wdl->AddLine(ImVec2(c.x - 2, c.y + 6), ImVec2(c.x + 8, c.y - 6), col(pal.windowBg), 2.6f);
-        }
-        // ✗ cancel
-        wdl->AddRectFilled(cxMin, cxMax, col(pal.statusErr, cxOver ? 0.95f : 0.80f), 5.0f);
-        {
-            ImVec2 c(cxMin.x + sz * 0.5f, cxMin.y + sz * 0.5f);
-            wdl->AddLine(ImVec2(c.x - 6, c.y - 6), ImVec2(c.x + 6, c.y + 6), col(pal.windowBg), 2.6f);
-            wdl->AddLine(ImVec2(c.x - 6, c.y + 6), ImVec2(c.x + 6, c.y - 6), col(pal.windowBg), 2.6f);
-        }
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && (okOver || cxOver)) {
-            // C38 (S8): if the Smart Dimension Modify box is open when ✓/✗ is clicked, the pending
-            // dimension is INTENTIONALLY DISCARDED (the user chose to leave the sketch instead of
-            // finishing the dim). Close the box and clear the pick buffer explicitly FIRST so
-            // resetTool/exit teardown can't leave half-state behind, then run exit/cancel.
-            if (dimPopupOpen_) {
-                dimPopupOpen_ = false; dimError_.clear(); dimEditCid_.clear();
-                dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
-                dimAxis_.clear(); dimPopupDriven_ = false;
-            }
-            if (okOver)      exitSketch(st, /*keep=*/true);
-            else if (cxOver) cancelSketch(st);
-        }
-        if (!active_) return;   // confirmation corner closed the sketch this frame (clip already popped)
-    }
+    // C37-D: the ✓ keep / ✗ cancel confirmation corner that used to float in the viewport's
+    // top-right was relocated to the Sketch-tab ribbon as a right-aligned Finish/Cancel commit
+    // cluster (ribbon.cpp, shown only while s_sketchActive; fires sketch_exit / sketch_cancel).
 
     // ---- tool hint chip (top-center) ----
     if (tool_ != SketchTool::None) {
@@ -7799,46 +7896,39 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             hint += sb;
         }
         hint += "  (ESC to end)";
-        ImVec2 ts = ImGui::CalcTextSize(hint.c_str());
-        float cx = (imgMin.x + imgMax.x) * 0.5f;
-        ImVec2 p0(cx - ts.x * 0.5f - 12, imgMin.y + 12);
-        ImVec2 p1(cx + ts.x * 0.5f + 12, p0.y + ts.y + 10);
-        ImDrawList* wdl = ImGui::GetWindowDrawList();
-        wdl->AddRectFilled(p0, p1, col(pal.overlayBg), 6.0f);
-        wdl->AddRect(p0, p1, col(pal.overlayBorder), 6.0f);
-        wdl->AddText(ImVec2(p0.x + 12, p0.y + 5), col(pal.overlayText), hint.c_str());
+        // Stacks BELOW the top-center status/DOF island (y+52); centered on the inter-column safe
+        // area so it never slides under the pinned columns.
+        glassHudBanner(ImGui::GetWindowDrawList(), "sk_tool_hint", skClipMin, skClipMax,
+                       imgMin.y + 52.0f * ui::uiScale, hint.c_str());
     }
 
-    // ---- status chip (top-LEFT now; confirmation corner owns the top-right) ----
+    // ---- status/DOF chip (top-CENTER "dynamic island") ----
+    // Glass v2 pill: the frost + glassText body track the live backdrop; the solver state stays
+    // color-coded via the semantic ring (the raw status colors as TEXT washed out over the light
+    // frost in the dark theme — same failure mode as the toast level tags). Floats top-center like
+    // an iPhone dynamic island; the active-tool hint (below) stacks under it at y+52.
     {
+        const float s = ui::uiScale;
         std::string sl = statusLine();
         // C41 (T4): neutral pill while the sketch is empty (statusLine shows the draw hint).
-        ImU32 sc = ents_.empty()  ? col(pal.overlayText, 0.9f)
+        ImU32 sc = ents_.empty()  ? 0
                  : status_ == "over" ? col(pal.statusErr)
                  : status_ == "full" ? col(pal.statusOk) : col(pal.sketchUnder);
-        ImVec2 ts = ImGui::CalcTextSize(sl.c_str());
-        ImVec2 p0(imgMin.x + 12, imgMin.y + 12);
-        ImVec2 p1b(p0.x + ts.x + 20, p0.y + ts.y + 10);
         ImDrawList* wdl = ImGui::GetWindowDrawList();
-        wdl->AddRectFilled(p0, p1b, col(pal.overlayBg), 6.0f);
-        wdl->AddRect(p0, p1b, sc, 6.0f, 0, 1.5f);
-        wdl->AddText(ImVec2(p0.x + 10, p0.y + 5), sc, sl.c_str());
+        const float statusY = imgMin.y + 12.0f * s;
+        glassHudBanner(wdl, "sk_status_chip", skClipMin, skClipMax, statusY, sl.c_str(), sc);
+        float pillBot = statusY + ImGui::CalcTextSize(sl.c_str()).y + 10.0f * s;
 
         // C50f: conflict-freeze warning bar. When the last solve came back solve_rejected:true the
         // engine froze geometry at the last valid coordinates (no least-squares mangling); tell the
         // user the sketch couldn't be solved and point at the red (conflicting) relations to edit.
-        // Sits just below the status pill, error-tinted. Cleared automatically when a later solve
+        // Sits just below the status pill, error-ringed. Cleared automatically when a later solve
         // succeeds (applyEnterResult sets solveRejected_ = false).
         if (solveRejected_) {
             const char* warn = "Sketch could not be solved \xE2\x80\x94 geometry frozen at last valid "
                                "state. Delete or edit a conflicting (red) relation.";
-            ImVec2 wts = ImGui::CalcTextSize(warn);
-            ImVec2 w0(imgMin.x + 12, p1b.y + 8);
-            ImVec2 w1(w0.x + wts.x + 20, w0.y + wts.y + 10);
-            ImU32 ec = col(pal.statusErr);
-            wdl->AddRectFilled(w0, w1, col(pal.overlayBg), 6.0f);
-            wdl->AddRect(w0, w1, ec, 6.0f, 0, 1.5f);
-            wdl->AddText(ImVec2(w0.x + 10, w0.y + 5), ec, warn);
+            glassHudBanner(wdl, "sk_solve_warn", skClipMin, skClipMax, pillBot + 8.0f * s, warn,
+                           col(pal.statusErr));
         }
     }
 
@@ -7985,10 +8075,14 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
                          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
             ImGui::TextUnformatted("Offset distance (mm)");
-            ImGui::SetNextItemWidth(120);
+            ImGui::SetNextItemWidth(120 * ui::uiScale);
             if (offsetFocusInput_) { ImGui::SetKeyboardFocusHere(); offsetFocusInput_ = false; }
-            bool enter = ImGui::InputFloat("##offdist", &offsetDist_, 0.0f, 0.0f, "%.3f",
-                                           ImGuiInputTextFlags_EnterReturnsTrue);
+            // Bounded value -> drag entry (Ctrl+click types; Enter still advances the stage).
+            ImGui::DragFloat("##offdist", &offsetDist_, 0.25f, 0.001f, 100000.0f, "%.3f",
+                             ImGuiSliderFlags_AlwaysClamp);
+            bool enter = ImGui::IsItemDeactivatedAfterEdit() &&
+                         (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+                          ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
             bool ok = ImGui::Button("Next") || enter;
             ImGui::SameLine();
             bool cancel = ImGui::Button("Cancel");
@@ -8011,10 +8105,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
                          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
             ImGui::TextUnformatted(fillet ? "Fillet radius (mm)" : "Chamfer distance (mm)");
-            ImGui::SetNextItemWidth(120);
+            ImGui::SetNextItemWidth(120 * ui::uiScale);
             float* val = fillet ? &skFilletRadius_ : &skChamferDist_;
-            ImGui::InputFloat(fillet ? "##skfilletr" : "##skchamferd", val, 1.0f, 5.0f, "%.3f");
-            if (*val < 0.001f) *val = 0.001f;   // engine requires a strictly positive value
+            // Bounded value -> drag entry; the clamp keeps the engine's strictly-positive rule.
+            ImGui::DragFloat(fillet ? "##skfilletr" : "##skchamferd", val, 0.25f, 0.001f,
+                             100000.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
         }
         ImGui::End();
     }
@@ -8034,18 +8129,21 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             ImGui::Text(linPanel ? "Linear Pattern (%d entities)" : "Circular Pattern (%d entities)",
                         (int)mpSel_.size());
             ImGui::Separator();
-            ImGui::SetNextItemWidth(120);
-            ImGui::InputInt("Count", &patternCount_);
-            if (patternCount_ < 2) patternCount_ = 2;   // engine requires count >= 2
+            // Bounded values -> drag entry (Ctrl+click types an exact number).
+            ImGui::SetNextItemWidth(120 * ui::uiScale);
+            ImGui::DragInt("Count", &patternCount_, 0.1f, 2, 999, "%d",
+                           ImGuiSliderFlags_AlwaysClamp);   // engine requires count >= 2
             if (linPanel) {
-                ImGui::SetNextItemWidth(120);
-                ImGui::InputFloat("Spacing (mm)", &patternSpacing_, 1.0f, 10.0f, "%.3f");
-                ImGui::SetNextItemWidth(180);
+                ImGui::SetNextItemWidth(120 * ui::uiScale);
+                ImGui::DragFloat("Spacing (mm)", &patternSpacing_, 0.5f, 0.001f, 100000.0f,
+                                 "%.3f", ImGuiSliderFlags_AlwaysClamp);
+                ImGui::SetNextItemWidth(180 * ui::uiScale);
                 ImGui::InputFloat2("Direction (u,v)", &patternDirU_, "%.2f");
             } else {
-                ImGui::SetNextItemWidth(120);
-                ImGui::InputFloat(patternEqualSpacing_ ? "Total angle (deg)" : "Step angle (deg)",
-                                  &patternAngle_, 1.0f, 15.0f, "%.2f");
+                ImGui::SetNextItemWidth(120 * ui::uiScale);
+                ImGui::DragFloat(patternEqualSpacing_ ? "Total angle (deg)" : "Step angle (deg)",
+                                 &patternAngle_, 0.5f, 0.01f, 360.0f, "%.2f",
+                                 ImGuiSliderFlags_AlwaysClamp);
                 ImGui::Checkbox("Equal spacing (full span)", &patternEqualSpacing_);
             }
             ImGui::Separator();

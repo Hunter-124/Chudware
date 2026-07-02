@@ -225,19 +225,15 @@ void drawLeftPane(AppState& st,
     // "Reset layout" clears it via takeOverlayColumnReset below.
     static bool s_collapsed = false;
 
-    // Auto-switch policy (Wave 1D): track the PM's active state across frames.
-    //   open-edge  (inactive -> active): jump to the PropertyManager tab so the form is visible
-    //   (and pop the collapsed pill open — an invisible active command is worse than a yank).
-    //   close-edge (active -> inactive): return to FeatureManager, but ONLY if the user is still on
-    //   the PropertyManager tab — never yank a manual mid-edit tab change the user made themselves.
+    // Auto-switch policy: the PropertyManager form is hosted INSIDE the FeatureManager tab now (the
+    // separate "Property Manager" tab was a duplicate and was removed). When a command goes active
+    // (inactive -> active) jump to the FeatureManager tab and pop the collapsed pill open so the
+    // form is visible — an invisible active command is worse than a yank.
     static bool s_pmWasActive = false;
     const bool pmActive = pm && pm->active();
     if (pmActive && !s_pmWasActive) {
-        st.leftPaneTab = kLeftPanePropertyManager;
+        st.leftPaneTab = kLeftPaneFeatureManager;
         s_collapsed = false;
-    } else if (!pmActive && s_pmWasActive) {
-        if (st.leftPaneTab == kLeftPanePropertyManager)
-            st.leftPaneTab = kLeftPaneFeatureManager;
     }
     s_pmWasActive = pmActive;
 
@@ -257,12 +253,15 @@ void drawLeftPane(AppState& st,
         band.maxY = mvp->WorkPos.y + mvp->WorkSize.y;
     }
     const float margin = 12.0f * S;
+    // Columns hug closer to the ribbon than the side/bottom margins (moved up per design). The
+    // Copilot column + doc-tab strip use the same topMargin so all three share their top edge.
+    const float topMargin = 4.0f * S;
     const float colX = band.minX + margin;
     // The doc-tab strip no longer sits ABOVE this column — it floats over the viewport, starting to
     // the RIGHT of the column's right edge (fix 2). So the FeatureManager column can start flush at
     // the top of the viewport band; the horizontal icon rail (fix 1) fills the space the doc tabs
     // used to occupy above it.
-    const float colY = band.minY + margin;
+    const float colY = band.minY + topMargin;
     const float colH = std::max(120.0f * S, band.maxY - margin - colY);
 
     // ONE bubble radius shared by the invisible window (clip/interaction shape) and the drawn
@@ -279,13 +278,19 @@ void drawLeftPane(AppState& st,
         const float pill = 40.0f * S;
         ImGui::SetNextWindowPos(ImVec2(colX, colY), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(pill, pill), ImGuiCond_Always);
+        // Publish the pill's right edge like the expanded column does, so the doc-tab strip starts
+        // to its RIGHT instead of falling back to the band's left edge and drawing over the pill
+        // (which both hid it and let the strip steal its expand click).
+        publishOverlayColumnEdge(0, colX + pill);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, pill * 0.5f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        // No NoBringToFrontOnFocus here (unlike the pre-fix expanded column): the pill must stay
+        // clickable above the later-drawn doc-tab overlay so it can always be re-expanded.
         const ImGuiWindowFlags pillFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking |
             ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
+            ImGuiWindowFlags_NoSavedSettings;
         if (ImGui::Begin("##LeftPanePill", nullptr, pillFlags)) {
             const ImVec2 pp = ImGui::GetWindowPos();
             const ImRect pr(pp, ImVec2(pp.x + pill, pp.y + pill));
@@ -334,22 +339,25 @@ void drawLeftPane(AppState& st,
     ImGui::PushStyleColor(ImGuiCol_ResizeGripActive, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_SeparatorActive, ImVec4(0, 0, 0, 0));
-    // NoBringToFrontOnFocus: the column is pinned chrome — clicking it must never raise it above
-    // a transient floating command dialog (floating windows already z-sort above the docked
-    // central Viewport, so the column always reads over the 3D regardless).
+    // Input-regression fix: this column previously carried only NoBackground and was reliably
+    // clickable; commit 043e752 added NoBringToFrontOnFocus (to keep it below transient command
+    // dialogs) and the whole pane stopped responding to the mouse. FM (left edge) and the floating
+    // dialogs (top-right) don't overlap, so dropping the flag restores click routing without
+    // re-introducing any layering issue.
     const ImGuiWindowFlags lpFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoBackground |
-        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBringToFrontOnFocus;
+        ImGuiWindowFlags_NoScrollbar;
     const bool lpOpen = ImGui::Begin("FeatureManager##LeftPane", nullptr, lpFlags);
     ImGui::PopStyleColor(5);
     ImGui::PopStyleVar(2);
     if (!lpOpen) { ImGui::End(); return; }
 
-    // Liquid glass v2 (host contract §H4): paint the ONE UltraThin glass surface for the WHOLE
-    // column (icon rail + body) right after Begin, before any content. feature_tree.cpp /
-    // file_explorer.cpp fetch this SAME surface via the SAME panelId ("host_left_glass") + group
-    // instead of painting their own background (idempotent per frame — A2). Adaptive max-contrast
-    // text for the whole pane body; popped before End().
+    // Liquid glass v2 (host contract §H4): the WHOLE-column glass slab is intentionally NOT painted
+    // anymore — the column bounding box is hidden (fully transparent) so the 3D viewport shows
+    // straight through, and only the individual rows/tabs/text/icons carry their own glass pills
+    // (glassRowBackground / glassRowAtCursor / drawIconGlass). We still resolve the adaptive surface
+    // (idempotent per frame — A2) so every embedded body (feature_tree.cpp / file_explorer.cpp / the
+    // PM forms) fetches the SAME contrast-matched text color via panelId("host_left_glass").
     const ImVec2 lpWp = ImGui::GetWindowPos();
     const ImVec2 lpWs = ImGui::GetWindowSize();
     const ImRect lpPaneRect(lpWp, ImVec2(lpWp.x + lpWs.x, lpWp.y + lpWs.y));
@@ -357,7 +365,6 @@ void drawLeftPane(AppState& st,
     publishOverlayColumnEdge(0, lpPaneRect.Max.x);
     const ui::AdaptiveSurface& surf =
         ui::adaptivePanel(ui::panelId("host_left_glass"), lpPaneRect, ui::GlassGroup::FeatureManager);
-    ui::glassPanel(ImGui::GetWindowDrawList(), lpPaneRect, ui::GlassLevel::UltraThin, bubbleDp, surf);
     const bool lpLive = ui::viewportBackdrop().valid();
     const ImU32 lpHalo = lpLive
         ? ImGui::ColorConvertFloat4ToU32(ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0x50 / 255.f))
@@ -413,7 +420,6 @@ void drawLeftPane(AppState& st,
     static const TabDef kTabs[] = {
         { kLeftPaneExplorer,        "body_folder", "E", "Explorer" },
         { kLeftPaneFeatureManager,  "history",     "F", "Feature Manager" },
-        { kLeftPanePropertyManager, "material",    "P", "Property Manager" },
         { kLeftPaneConfigurations,  "settings",    "C", "Configurations" },
     };
 
@@ -437,7 +443,8 @@ void drawLeftPane(AppState& st,
         const TabDef& t = kTabs[i];
         const bool selected = (st.leftPaneTab == t.id) ||
                               (t.id == kLeftPaneFeatureManager && st.leftPaneTab == kLeftPaneSimulation);
-        const bool attention = (t.id == kLeftPanePropertyManager && pmActive);
+        // PM form now lives in the FeatureManager tab, so the attention dot rides that tab.
+        const bool attention = (t.id == kLeftPaneFeatureManager && pmActive);
         char idBuf[16];
         std::snprintf(idBuf, sizeof(idBuf), "%d", t.id);
         if (i == 0) ImGui::SetCursorPosX(0.0f);
@@ -470,12 +477,13 @@ void drawLeftPane(AppState& st,
     if (st.leftPaneTab == kLeftPaneExplorer) {
         title = "Explorer";
         titleIcon = "body_folder";
-    } else if (st.leftPaneTab == kLeftPanePropertyManager && pmActive) {
-        title = "Property Manager";
-        titleIcon = "material";
     } else if (st.leftPaneTab == kLeftPaneConfigurations) {
         title = "Configurations";
         titleIcon = "settings";
+    } else if (pmActive) {
+        // A live command form takes over the FeatureManager tab body -> label it as such.
+        title = "Property Manager";
+        titleIcon = "material";
     }
 
     // Equal left/right margins via symmetric WindowPadding + a slim scrollbar. When the form
@@ -527,13 +535,6 @@ void drawLeftPane(AppState& st,
             drawFileExplorerBody(st);
             break;
 
-        case kLeftPanePropertyManager:
-            // PM active -> show the live form body; otherwise the slot must never be blank, so fall
-            // back to the feature tree body (matches SolidWorks: the PM tab shows the tree at rest).
-            if (pmActive) pm->drawBody(st);
-            else          drawFeatureTreeBody(st, editCallback);
-            break;
-
         case kLeftPaneConfigurations:
             // User chose the live ConfigurationManager (config_* RPCs) for this tab. ConfigPanel is
             // owned by run_gui and borrowed via st.configPanel; drawEmbedded renders its contents
@@ -545,20 +546,26 @@ void drawLeftPane(AppState& st,
         case kLeftPaneSimulation:   // legacy programmatic target — render the same unified body
         case kLeftPaneFeatureManager:
         default:
-            drawFeatureTreeBody(st, editCallback);
-            // Simulation studies now live IN the FeatureManager tree (no separate "Simulation
-            // Studies" tab). Show the study section when the part has studies or the Simulation
-            // workspace is active, so a Static/Modal/Flow study reads as an editable tree feature
-            // with Material/Fixtures/Loads/Mesh/Results subnodes + per-type setup forms.
-            if (st.simManager) {
-                const bool simWs = st.showSimulationTools || st.ribbonTab == AppState::RT_Simulation;
-                if (st.simManager->studyCount() > 0 || simWs) {
-                    ImGui::Dummy(ImVec2(0, 6.0f * S));
-                    ImGui::Separator();
-                    ImGui::PushFont(st.fonts.medium);
-                    ImGui::TextUnformatted("Simulation");
-                    ImGui::PopFont();
-                    st.simManager->drawTreeBody(st);
+            // A live command form owns the tab body (the former standalone PropertyManager tab was
+            // merged in here as a duplicate). At rest, the feature tree + inline simulation section.
+            if (pmActive) {
+                pm->drawBody(st);
+            } else {
+                drawFeatureTreeBody(st, editCallback);
+                // Simulation studies now live IN the FeatureManager tree (no separate "Simulation
+                // Studies" tab). Show the study section when the part has studies or the Simulation
+                // workspace is active, so a Static/Modal/Flow study reads as an editable tree feature
+                // with Material/Fixtures/Loads/Mesh/Results subnodes + per-type setup forms.
+                if (st.simManager) {
+                    const bool simWs = st.showSimulationTools || st.ribbonTab == AppState::RT_Simulation;
+                    if (st.simManager->studyCount() > 0 || simWs) {
+                        ImGui::Dummy(ImVec2(0, 6.0f * S));
+                        ImGui::Separator();
+                        ImGui::PushFont(st.fonts.medium);
+                        ImGui::TextUnformatted("Simulation");
+                        ImGui::PopFont();
+                        st.simManager->drawTreeBody(st);
+                    }
                 }
             }
             break;

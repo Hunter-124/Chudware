@@ -2219,6 +2219,19 @@ void PropertyManager::drawBody(AppState& st) {
     // glass tint; semantic roles (accent/status) stay on `pal`. Idempotent per frame (id-cached).
     const ui::AdaptiveSurface& surf = pmSurf();
 
+    // Fix black-on-black: SliderFloat/DragFloat/InputText/BeginCombo draw an OPAQUE dark FrameBg
+    // by default. Over the fully-transparent FeatureManager column the adaptive `surf.textPrimary`
+    // is dark (contrasts the light viewport), so dark ink on dark frame = invisible text.
+    // Push a translucent glass-tinted frame fill so the viewport shows through the field boxes and
+    // the adaptive ink stays legible over both light and dark viewport backdrops. Must be popped on
+    // EVERY exit path of this function (balanced below at each return and at function end).
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,
+        ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.16f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
+        ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.26f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
+        ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.30f));
+
     // ---- C37-F: Keyboard policy -------------------------------------------
     // Gather focus/hover state for this PM window BEFORE processing buttons.
     bool pmWindowFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
@@ -2397,8 +2410,8 @@ void PropertyManager::drawBody(AppState& st) {
 
         // Wave 1D: drawBody() does NOT own the window — early-out is a plain return; the caller
         // (draw() or the LeftPane container) closes its own Begin/child.
-        if (ok)     { commit(st);      return; }
-        if (cancel) { cancelEdits(st); return; }
+        if (ok)     { ImGui::PopStyleColor(3); commit(st);      return; }
+        if (cancel) { ImGui::PopStyleColor(3); cancelEdits(st); return; }
     }
 
     // ---- field rows grouped by `group`, collapsible ------------------------
@@ -2801,11 +2814,17 @@ void PropertyManager::drawBody(AppState& st) {
                 } else {
                     ImGui::SetNextItemWidth(-1);
                     if (ImGui::BeginCombo("##combo", preview.c_str())) {
+                        // The dropdown popup has its own opaque dark PopupBg — the adaptive (dark)
+                        // ink pushed for the transparent column would be black-on-black here, so use
+                        // the theme's normal light text for the popup items.
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImVec4(pal.text[0], pal.text[1], pal.text[2], 1.0f));
                         for (int n = 0; n < (int)labels.size(); ++n) {
                             bool sel = (f.comboIndex == n);
                             if (ImGui::Selectable(labels[n].c_str(), sel)) selectOption(n);
                             if (sel) ImGui::SetItemDefaultFocus();
                         }
+                        ImGui::PopStyleColor();
                         ImGui::EndCombo();
                     }
                 }
@@ -2866,12 +2885,16 @@ void PropertyManager::drawBody(AppState& st) {
                 std::string preview = (f.comboIndex < (int)labels.size()) ? labels[f.comboIndex] : "";
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::BeginCombo("##datum", preview.c_str())) {
+                    // Light text on the opaque dark popup (see the ##combo note above).
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(pal.text[0], pal.text[1], pal.text[2], 1.0f));
                     for (int n = 0; n < (int)labels.size(); ++n) {
                         bool sel = (f.comboIndex == n);
                         if (ImGui::Selectable(labels[n].c_str(), sel))
                             if (enabled) { f.comboIndex = n; dirty_ = true; lastEditTime_ = ImGui::GetTime(); }
                         if (sel) ImGui::SetItemDefaultFocus();
                     }
+                    ImGui::PopStyleColor();
                     ImGui::EndCombo();
                 }
                 break;
@@ -2976,6 +2999,9 @@ void PropertyManager::drawBody(AppState& st) {
     // window-focus is PM-scoped — an active item in another window won't set this.
     pmWidgetActivePrevFrame_ = ImGui::IsAnyItemActive() &&
         ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+
+    // Balanced pop for the 3 FrameBg colors pushed after surf was resolved (above).
+    ImGui::PopStyleColor(3);
 }
 
 }  // namespace ui

@@ -1226,9 +1226,37 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 }
 
 // ---- header: logo + "AI-CAD Copilot" + Sessions + status dot ----
+// Copilot collapse-to-pill state (file scope so the header's collapse chevron and drawAIPanel's
+// pill/expand logic share it). Mirrors the FeatureManager collapse.
+static bool s_cpCollapsed = false;
+
 static void drawCopilotHeader(AppState& st, bool busy) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
+
+    // Collapse-to-pill chevron LEADS the header row (in-flow, so it never overlaps the logo). "»"
+    // tucks the column away to the right into a small pill (re-expanded from the pill in drawAIPanel).
+    {
+        const float cb = ImGui::GetTextLineHeight();
+        const ImVec2 c0 = ImGui::GetCursorScreenPos();
+        const bool clk = ImGui::InvisibleButton("##cp_collapse", ImVec2(cb, cb));
+        const bool hov = ImGui::IsItemHovered();
+        ImDrawList* wdl = ImGui::GetWindowDrawList();
+        ui::glassRowBackground(wdl, c0, ImVec2(c0.x + cb, c0.y + cb), 6.0f, false, false,
+                               hov ? 0.42f : 0.20f);
+        const ImU32 cc = ImGui::ColorConvertFloat4ToU32(hov ? chatSurf().textPrimary
+                                                             : chatSurf().textSecondary);
+        const ImVec2 m(c0.x + cb * 0.5f, c0.y + cb * 0.5f);
+        const float a = 3.0f * sc;
+        for (int i = 0; i < 2; ++i) {   // "»"
+            const float ox = (i == 0 ? -2.2f : 2.2f) * sc;
+            wdl->AddLine(ImVec2(m.x + ox - a * 0.5f, m.y - a), ImVec2(m.x + ox + a * 0.5f, m.y), cc, 1.6f * sc);
+            wdl->AddLine(ImVec2(m.x + ox + a * 0.5f, m.y), ImVec2(m.x + ox - a * 0.5f, m.y + a), cc, 1.6f * sc);
+        }
+        if (hov) ImGui::SetTooltip("Collapse");
+        if (clk) s_cpCollapsed = true;
+        ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
+    }
 
     if (st.logoIcon.id) {
         float h = ImGui::GetTextLineHeight();
@@ -3166,6 +3194,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     refreshModelAvailability(st, false);
 
     static float s_paneW = 0.0f;                    // column width (px), session-persistent
+    // s_cpCollapsed is file-scoped (shared with drawCopilotHeader's collapse chevron).
     // Anchor to the overlay band app.cpp publishes each frame (ribbon bottom -> status-bar top),
     // inset by the doc-tab strip on top — the SAME geometry source as the FeatureManager column in
     // layout.cpp drawLeftPane, so the two pinned columns always share top/bottom edges. Falls back
@@ -3190,14 +3219,59 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         // The doc-tab strip now floats over the viewport (fix 2), not above these columns, so the
         // Copilot column starts flush at the top of the viewport band — same rule as drawLeftPane,
         // keeping the two pinned columns sharing their top edge.
-        const float colY = band.minY + margin;
+        const float colY = band.minY + 4.0f * ui::uiScale;   // hug the ribbon (moved up per design)
         const float colH = std::max(120.0f * ui::uiScale, band.maxY - margin - colY);
-        // "Reset layout" (slot 1 = Copilot column) restores the default width.
-        if (ui::takeOverlayColumnReset(1)) s_paneW = 0.0f;
+        // "Reset layout" (slot 1 = Copilot column) restores the default width + expands it.
+        if (ui::takeOverlayColumnReset(1)) { s_paneW = 0.0f; s_cpCollapsed = false; }
         if (s_paneW <= 0.0f) s_paneW = ui::metrics::dockRightTarget();
         const float maxW = std::max((band.maxX - band.minX) * 0.5f,
                                     ui::metrics::dockRightMin());
         s_paneW = std::min(std::max(s_paneW, ui::metrics::dockRightMin()), maxW);
+
+        // Collapse-to-pill (mirrors the FeatureManager): draw a small glass pill at the column's
+        // top-right anchor that re-expands on click, and publish that pill's LEFT edge so the
+        // viewport HUD + doc-tab strip dodge it just like the full column.
+        if (s_cpCollapsed) {
+            const float S = ui::uiScale;
+            const float pill = 40.0f * S;
+            const float px = band.maxX - margin - pill;
+            ui::publishOverlayColumnEdge(1, px);
+            ImGui::SetNextWindowPos(ImVec2(px, colY), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(pill, pill), ImGuiCond_Always);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, pill * 0.5f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+            const ImGuiWindowFlags pf = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking |
+                ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+                ImGuiWindowFlags_NoSavedSettings;
+            if (ImGui::Begin("##CopilotPill", nullptr, pf)) {
+                const ImVec2 pp = ImGui::GetWindowPos();
+                const ImRect prr(pp, ImVec2(pp.x + pill, pp.y + pill));
+                const ui::AdaptiveSurface& ps = ui::adaptivePanel(
+                    ui::panelId("host_agent_glass_pill"), prr, ui::GlassGroup::Copilot);
+                ImDrawList* pdl = ImGui::GetWindowDrawList();
+                ui::glassPanel(pdl, prr, ui::GlassLevel::UltraThin, pill * 0.5f / S, ps);
+                const bool clicked = ImGui::InvisibleButton("##cp_expand", ImVec2(pill, pill));
+                // "«" — expand the column back out toward the viewport.
+                const ImU32 gc = ImGui::ColorConvertFloat4ToU32(ps.textPrimary);
+                const ImVec2 cc(pp.x + pill * 0.5f, pp.y + pill * 0.5f);
+                const float ca = 4.0f * S;
+                for (int i = 0; i < 2; ++i) {
+                    const float ox = (i == 0 ? -2.5f : 2.5f) * S;
+                    pdl->AddLine(ImVec2(cc.x + ox + ca * 0.5f, cc.y - ca),
+                                 ImVec2(cc.x + ox - ca * 0.5f, cc.y), gc, 1.8f * S);
+                    pdl->AddLine(ImVec2(cc.x + ox - ca * 0.5f, cc.y),
+                                 ImVec2(cc.x + ox + ca * 0.5f, cc.y + ca), gc, 1.8f * S);
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI-CAD Copilot");
+                if (clicked) s_cpCollapsed = false;
+            }
+            ImGui::End();
+            ImGui::PopStyleVar(3);
+            return;
+        }
+
         ImGui::SetNextWindowPos(ImVec2(band.maxX - margin - s_paneW, colY), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(s_paneW, colH), ImGuiCond_Always);
         flags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -3220,12 +3294,17 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // viewport backdrop has been published yet.
     {
         ImVec2 wmin = ImGui::GetWindowPos();
-        ImVec2 wmax(wmin.x + ImGui::GetWindowSize().x, wmin.y + ImGui::GetWindowSize().y);
-        ui::glassPanel(ImGui::GetWindowDrawList(), ImRect(wmin, wmax), ui::GlassLevel::UltraThin,
-                      bubbleDp /*same radius as the window clip, logical dp*/, chatSurf());
+        // The WHOLE-column glass slab is intentionally NOT painted anymore: the Copilot bounding box
+        // is hidden (fully transparent) so the 3D viewport shows straight through with no misaligned
+        // frosted refraction. Only the individual chat cards / header / composer / text carry their
+        // own glass pills. chatSurf() is still resolved (idempotent per frame) so those elements
+        // fetch the SAME contrast-matched text color as before.
         // Let the viewport HUD (result legend) dodge the pinned column (layout.h, slot 1).
         if (overlay) ui::publishOverlayColumnEdge(1, wmin.x);
     }
+
+    // (Collapse chevron now leads the Copilot header row — see drawCopilotHeader — so it can't
+    // overlap the logo the way a top-left corner chip did.)
 
     // Invisible left-edge resize hit-zone (design rule: no visible splitter bars). Dragging the
     // strip left widens the column; clamped at the top of the next frame.

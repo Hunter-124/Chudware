@@ -304,7 +304,7 @@ float drawDocTabs(AppState& st, float availW) {
         const float margin = 12.0f * s;
         const float fmEdge = ui::overlayColumnEdge(0);
         const float docX = (fmEdge >= 0.0f ? fmEdge : band.minX) + margin;
-        const float docY = band.minY + margin;
+        const float docY = band.minY + 4.0f * s;   // hug the ribbon; matches the pinned columns' top
         // Hug content, clamped to the Copilot column's LEFT edge (never run tabs under it). The
         // viewport toolbar lives to the LEFT of that edge, so hugging content is what actually frees
         // it — clamping alone would not.

@@ -84,6 +84,10 @@ register_cam_tools(mcp)
 from mcp_server.req_tools import register_req_tools
 register_req_tools(mcp)
 
+# Verify battery (T-H4) — deterministic check dispatcher for RL reward + CI gate.
+from mcp_server.verify_tools import register_verify_tools
+register_verify_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

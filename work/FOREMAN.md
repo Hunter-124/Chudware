@@ -56,9 +56,32 @@ append-only) or to your task branch (question files), and push.
   rebase early, keep additions append-only to minimize merge conflicts.
 - `contracts/providers.md`: T-F9 owns it; T-H9 has a reserved `routing` stub.
 
+## Context & cost discipline (binding for ALL drivers — Erik, 2026-07-02)
+
+You are expected to spawn your own subagents, and to spend context like money:
+
+1. **Delegate downward.** Exploration sweeps, boilerplate, test scaffolds, mechanical
+   refactors, and long-running verification (builds, gate.sh, pytest loops) go to your
+   own subagents (Sonnet for code, Haiku for pure search) with a narrow brief + exact
+   file list. Take back ONLY the diff/summary — never their exploration transcript.
+   Subagents must write results to files in the worktree AS THEY GO (checkpointing),
+   never hold work only in their final reply.
+2. **Keep your own window linear and append-only.** Prompt caching only pays when the
+   prefix is stable: batch independent tool calls in one turn, don't re-read files you
+   already have, read narrow ranges (offset/limit) at the lines the Driver notes cite,
+   use scoped `graphify query` instead of directory crawls, and never cat build logs
+   or whole JSON dumps into context — tail the last ~20 lines or grep the verdict.
+3. **Mind the cache TTL (~5 min).** Long silent waits (big builds, long test runs) go
+   to a background subagent so your main window isn't idling its cache away; batch
+   verification at natural checkpoints instead of after every edit.
+4. **Commit-and-drop.** Once work is committed+pushed you don't need it in context —
+   summarize state in the task file / arc log and move on. Above ~60-70% context,
+   HANDOFF per the work order rather than degrading.
+
 ## Check-ins (append-only)
 
 - 2026-07-02 Fable BOARD-CREATED; driver notes added to T-F1/3/5/7/9/13/14 and T-H1/2/3/4
 - 2026-07-02 sonnet-veda CLAIMED T-H2
 - 2026-07-02 sonnet-riko CLAIMED T-H3
 - 2026-07-02T12:23Z sonnet-nell CLAIMED T-F7
+- 2026-07-02T12:30Z sonnet-tomo CLAIMED T-H4

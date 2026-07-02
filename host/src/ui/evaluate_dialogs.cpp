@@ -4,7 +4,9 @@
 #include <cstdio>
 
 #include "imgui.h"
+#include "imgui_internal.h"     // ImRect (ui::adaptivePanel / ui::glassPanel rect argument)
 
+#include "layout.h"    // setNextCommandDialogPlacement (floating dialog anchor)
 #include "metrics.h"
 #include "../core/app_state.h"
 #include "../renderer.h"
@@ -158,23 +160,45 @@ bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
 void EvaluateDialogs::draw(AppState& st) {
     if (openWindow_.empty()) return;
     bool open = true;
+    ui::setNextCommandDialogPlacement();   // floats over the full-width viewport, top-right
     ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(340), 0), ImGuiCond_Appearing);
-    // Frosted-glass fill so evaluate result windows float as part of the app-wide glass family
-    // (translucent glassBg lets the viewport bleed through subtly; content stays legible).
+    // Liquid-glass v2: transparent native WindowBg so the adaptive glassPanel (painted below,
+    // once Begin succeeds) is the only fill — ImGui's dark rect must not compete with the frost.
+    // The title bar renders DURING Begin (before our glass paint), so give it its own opaque-ish
+    // glassBg backing via a scoped TitleBg push (the theme sets it transparent globally); we then
+    // frost only the CONTENT region so the title/X stay crisp instead of filmed over.
     const auto& gpal = ui::palette;
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,
-        ImVec4(gpal.glassBg[0], gpal.glassBg[1], gpal.glassBg[2], gpal.glassBg[3]));
-    if (ImGui::Begin(title_.c_str(), &open)) {
+    const ImVec4 titleTint(gpal.glassBg[0], gpal.glassBg[1], gpal.glassBg[2], gpal.glassBg[3]);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
+    const bool evVis = ImGui::Begin(title_.c_str(), &open);
+    ImGui::PopStyleColor(3);  // title bar already rendered; WindowBg stays for the frame
+    if (evVis) {
+        // Paint the result window's own frosted-glass background over the content region.
+        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+        const float contentTopY =
+            ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y;
+        const ImRect winRect(ImVec2(wp.x, contentTopY), ImVec2(wp.x + ws.x, wp.y + ws.y));
+        const ui::AdaptiveSurface& surf = ui::adaptivePanel(
+            ui::panelId("host_evaluate_glass"), winRect, ui::GlassGroup::Global);
+        ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
+        // Default ink for the plain readouts below tracks the frost's contrast tone; the branches
+        // that need semantic color (status err/ok, dim) push their own on top of this.
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+
         if (pending_) {
             // C39: the eval is in flight on the dispatch thread; the result fills in when
             // it drains. A spinner-ish pulse keeps it obviously alive.
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1));
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
             ImGui::TextUnformatted("Computing");
             ImGui::SameLine(0, 0);
             ImGui::TextUnformatted(&"..."[2 - ((int)(ImGui::GetTime() * 3.0) % 3)]);
             ImGui::PopStyleColor();
         } else if (!errorText_.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.35f, 0.30f, 1));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(gpal.statusErr[0], gpal.statusErr[1], gpal.statusErr[2], gpal.statusErr[3]));
             ImGui::TextWrapped("%s", errorText_.c_str());
             ImGui::PopStyleColor();
         } else if (openWindow_ == "mass") {
@@ -191,13 +215,14 @@ void EvaluateDialogs::draw(AppState& st) {
                 if (massMaterial_ != kCustom) massDensity_ = kMaterials[massMaterial_].d;
                 runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}});
             }
+            // Bounded drag (real materials span ~0.9..22.6 g/cm3); CTRL+click still types an exact
+            // value, AlwaysClamp keeps typed entries inside the range too.
             ImGui::SetNextItemWidth(140 * ui::uiScale);
-            if (ImGui::InputFloat("Density (g/cm3)", &massDensity_, 0.0f, 0.0f, "%.3f"))
+            if (ImGui::DragFloat("Density", &massDensity_, 0.01f, 0.0f, 25.0f, "%.3f g/cm3",
+                                 ImGuiSliderFlags_AlwaysClamp))
                 massMaterial_ = kCustom;
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                if (massDensity_ < 0.0f) massDensity_ = 0.0f;
+            if (ImGui::IsItemDeactivatedAfterEdit())
                 runEval(st, "eval_mass", {{"density_g_cm3", (double)massDensity_}});
-            }
             ImGui::Separator();
             ImGui::Text("Volume:  %.3f mm3", result_.value("volume_mm3", 0.0));
             ImGui::Text("Mass:    %.3f g", result_.value("mass_g", 0.0));
@@ -292,7 +317,8 @@ void EvaluateDialogs::draw(AppState& st) {
             if (result_.contains("issues") && result_["issues"].is_array()) {
                 const auto& issues = result_["issues"];
                 if (issues.empty()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.80f, 0.45f, 1));
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(gpal.statusOk[0], gpal.statusOk[1], gpal.statusOk[2], gpal.statusOk[3]));
                     ImGui::TextWrapped("No geometry issues found.");
                     ImGui::PopStyleColor();
                 } else {
@@ -328,9 +354,10 @@ void EvaluateDialogs::draw(AppState& st) {
                 openWindow_.clear();
             }
         }
+        ImGui::PopStyleColor();  // default text ink
     }
     ImGui::End();
-    ImGui::PopStyleColor();
+    ImGui::PopStyleColor();  // ImGuiCol_WindowBg
     if (!open) {
         // Closing the window must also exit stripe mode so the user isn't stuck in zebra shading.
         if (openWindow_ == "zebra" && st.renderer) st.renderer->setZebra(false, gZebraFreq);

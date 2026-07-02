@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "imgui.h"
+#include "imgui_internal.h"     // ImRect (ui::adaptivePanel / ui::glassPanel rect argument)
 
 #include "icons.h"
 #include "metrics.h"
@@ -94,11 +95,35 @@ void drawEquationsDialog(AppState& st) {
     ImGui::SetNextWindowSize(ImVec2(420 * ui::uiScale, 320 * ui::uiScale), ImGuiCond_Appearing);
 
     bool open = st.showEquations;
-    if (ImGui::Begin("Equations", &open)) {
+    // Liquid-glass v2: transparent native WindowBg so the adaptive glassPanel (painted below,
+    // once Begin succeeds) is the only fill — ImGui's dark rect must not compete with the frost.
+    // The title bar renders DURING Begin (before our glass paint), so give it its own opaque-ish
+    // glassBg backing via a scoped TitleBg push (the theme sets it transparent globally); we then
+    // frost only the CONTENT region so the title/X stay crisp instead of filmed over.
+    const ImVec4 titleTint(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], pal.glassBg[3]);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
+    const bool eqVis = ImGui::Begin("Equations", &open);
+    ImGui::PopStyleColor(3);  // title bar already rendered; WindowBg stays for the frame
+    if (eqVis) {
+        // Paint the editor's own frosted-glass background over the content region (below title).
+        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+        const float contentTopY =
+            ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y;
+        const ImRect winRect(ImVec2(wp.x, contentTopY), ImVec2(wp.x + ws.x, wp.y + ws.y));
+        const ui::AdaptiveSurface& surf = ui::adaptivePanel(
+            ui::panelId("host_equations_glass"), winRect, ui::GlassGroup::Global);
+        ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
+        // Default ink for the plain readouts tracks the frost's contrast tone; branches that need
+        // semantic color (status warn/err) push their own on top of this.
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+
         // ---- header: icon + title ----
         eqIcon("equations", "[=]", ui::metrics::iconHeader());
         ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
-        pushText(pal.text);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
         ImGui::TextUnformatted("Global Variables");
         ImGui::PopStyleColor();
         ImGui::Separator();
@@ -127,7 +152,7 @@ void drawEquationsDialog(AppState& st) {
         } else {
             // ---- table of current globals ----
             if (globals.empty()) {
-                pushText(pal.textDim);
+                ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
                 ImGui::TextWrapped("No global variables. Add one below.");
                 ImGui::PopStyleColor();
             } else {
@@ -170,7 +195,7 @@ void drawEquationsDialog(AppState& st) {
 
                         // col 0: name (with the SolidWorks "name" quoting for readability)
                         ImGui::TableSetColumnIndex(0);
-                        pushText(pal.text);
+                        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
                         ImGui::TextUnformatted(("\"" + name + "\"").c_str());
                         ImGui::PopStyleColor();
 
@@ -243,8 +268,10 @@ void drawEquationsDialog(AppState& st) {
                 ImGui::PopStyleColor();
             }
         }
+        ImGui::PopStyleColor();  // default text ink
     }
     ImGui::End();
+    ImGui::PopStyleColor();  // ImGuiCol_WindowBg
     st.showEquations = open;  // close box drives the AppState flag
 }
 

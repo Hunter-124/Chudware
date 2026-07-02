@@ -14,9 +14,12 @@
 #include <string>
 
 #include "imgui.h"
+#include "imgui_internal.h"     // ImRect (ui::adaptivePanel / ui::glassPanel rect argument)
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
+#include "../ui_theme.h"        // ui::palette / ui::uiScale / adaptivePanel / glassPanel
+#include "layout.h"             // setNextCommandDialogPlacement (floating dialog anchor)
 #include "property_manager.h"   // pmFindForm / PMFieldKind / pmFormatDim / pmParseDim
 
 namespace ui {
@@ -268,11 +271,42 @@ void DesignTablePanel::buildCandidates(AppState& st, std::vector<Candidate>& out
 
 void DesignTablePanel::draw(AppState& st) {
     if (!st.showDesignTablePanel) return;
-    if (!ImGui::Begin("Design Table", &st.showDesignTablePanel)) { ImGui::End(); return; }
+    // Frosted-glass fill so the floating panel joins the app-wide glass family.
+    ui::setNextCommandDialogPlacement();   // sane first-open anchor over the full-width viewport
+    ImGui::SetNextWindowSize(ImVec2(640 * ui::uiScale, 400 * ui::uiScale), ImGuiCond_FirstUseEver);
+    // Liquid-glass v2: transparent native WindowBg so the adaptive glassPanel (painted below,
+    // once Begin succeeds) is the only fill — ImGui's dark rect must not compete with the frost.
+    // The title bar renders DURING Begin (before our glass paint), so give it its own opaque-ish
+    // glassBg backing via a scoped TitleBg push (the theme sets it transparent globally); we then
+    // frost only the CONTENT region so the title/X stay crisp instead of filmed over.
+    const ImVec4 titleTint(ui::palette.glassBg[0], ui::palette.glassBg[1],
+                           ui::palette.glassBg[2], ui::palette.glassBg[3]);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
+    const bool dtVis = ImGui::Begin("Design Table", &st.showDesignTablePanel);
+    ImGui::PopStyleColor(3);  // title bar already rendered; WindowBg stays for the frame
+    if (!dtVis) {
+        ImGui::End();
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    // Paint the panel's own frosted-glass background over the content region (below title).
+    const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+    const float contentTopY = ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y;
+    const ImRect winRect(ImVec2(wp.x, contentTopY), ImVec2(wp.x + ws.x, wp.y + ws.y));
+    const ui::AdaptiveSurface& surf = ui::adaptivePanel(
+        ui::panelId("host_design_table_glass"), winRect, ui::GlassGroup::Global);
+    ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
+    // Default ink for the plain grid/header readouts tracks the frost's contrast tone.
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
     const auto& pal = ui::palette;
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
-    const ImVec4 dimCol(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1);
+    // Contrast-matched text over the frosted backdrop (dim = secondary tone).
+    const ImVec4 dimCol = surf.textSecondary;
 
     // Gate: only part/asm docs have configurations. Drawing tabs / no-doc show a hint.
     if (!dtApplicable(st)) {
@@ -280,6 +314,7 @@ void DesignTablePanel::draw(AppState& st) {
         cacheValid_ = false;
         addCfgOpen_ = false;
         ImGui::End();
+        ImGui::PopStyleColor(2);  // text ink + WindowBg
         return;
     }
 
@@ -389,6 +424,7 @@ void DesignTablePanel::draw(AppState& st) {
     if (names_.empty()) {
         ImGui::TextColored(dimCol, "No configurations.");
         ImGui::End();
+        ImGui::PopStyleColor(2);  // text ink + WindowBg
         return;
     }
     if (columns_.empty()) {
@@ -419,13 +455,25 @@ void DesignTablePanel::draw(AppState& st) {
             ImGui::PushID(row);
             ImGui::TableNextRow();
 
+            // Selected-row backing: a translucent accent wash via the table's own row-bg target so
+            // it reads over the frost without ImGui's opaque Selectable highlight fighting the glass
+            // (rounded pills would clash with the bordered cells; TableSetBgColor honors the grid).
+            if (selectedRow_ == row) {
+                const ImVec4 sw(pal.selectionHighlight[0], pal.selectionHighlight[1],
+                                pal.selectionHighlight[2], pal.selectionHighlight[3]);
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                       ImGui::ColorConvertFloat4ToU32(sw));
+            }
+
             // --- config-name cell: selectable; double-click activates; active row highlighted ---
             ImGui::TableSetColumnIndex(0);
             std::string nameLabel = (isActive ? std::string("\xe2\x97\x8f  ")
                                               : std::string("    ")) + name;
             if (isActive) ImGui::PushStyleColor(ImGuiCol_Text, accentCol);
+            // selected=false: the row backing above (TableSetBgColor) is the selection cue, so the
+            // Selectable's own opaque highlight is suppressed to keep the frosted look coherent.
             const bool clicked = ImGui::Selectable(
-                nameLabel.c_str(), selectedRow_ == row,
+                nameLabel.c_str(), false,
                 ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick);
             if (isActive) ImGui::PopStyleColor();
             if (clicked) {
@@ -535,6 +583,7 @@ void DesignTablePanel::draw(AppState& st) {
     }
 
     ImGui::End();
+    ImGui::PopStyleColor(2);  // text ink + WindowBg
 }
 
 }  // namespace ui

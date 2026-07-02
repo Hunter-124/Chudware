@@ -9,10 +9,12 @@
 #include <string>
 
 #include "imgui.h"
+#include "imgui_internal.h"     // ImRect (ui::adaptivePanel / ui::glassPanel rect argument)
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
 #include "../ui_theme.h"        // ui::palette / ui::uiScale
+#include "layout.h"             // setNextCommandDialogPlacement (floating dialog anchor)
 #include "property_manager.h"   // pmFormatDim — match the rest of the UI's dim formatting
 
 namespace ui {
@@ -66,17 +68,49 @@ void CutListPanel::refresh(AppState& st) {
 
 void CutListPanel::draw(AppState& st) {
     if (!st.showCutListPanel) return;
-    if (!ImGui::Begin("Cut List", &st.showCutListPanel)) { ImGui::End(); return; }
+    // Frosted-glass fill so the floating panel joins the app-wide glass family.
+    ui::setNextCommandDialogPlacement();   // sane first-open anchor over the full-width viewport
+    ImGui::SetNextWindowSize(ImVec2(560 * ui::uiScale, 380 * ui::uiScale), ImGuiCond_FirstUseEver);
+    // Liquid-glass v2: transparent native WindowBg so the adaptive glassPanel (painted below,
+    // once Begin succeeds) is the only fill — ImGui's dark rect must not compete with the frost.
+    // The title bar renders DURING Begin (before our glass paint), so give it its own opaque-ish
+    // glassBg backing via a scoped TitleBg push (the theme sets it transparent globally); we then
+    // frost only the CONTENT region so the title/X stay crisp instead of filmed over.
+    const ImVec4 titleTint(ui::palette.glassBg[0], ui::palette.glassBg[1],
+                           ui::palette.glassBg[2], ui::palette.glassBg[3]);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
+    const bool clVis = ImGui::Begin("Cut List", &st.showCutListPanel);
+    ImGui::PopStyleColor(3);  // title bar already rendered; WindowBg stays for the frame
+    if (!clVis) {
+        ImGui::End();
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    // Paint the panel's own frosted-glass background over the content region (below title).
+    const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+    const float contentTopY = ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y;
+    const ImRect winRect(ImVec2(wp.x, contentTopY), ImVec2(wp.x + ws.x, wp.y + ws.y));
+    const ui::AdaptiveSurface& surf =
+        ui::adaptivePanel(ui::panelId("host_cutlist_glass"), winRect, ui::GlassGroup::Global);
+    ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
+    // Default ink for the plain table readouts tracks the frost's contrast tone.
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
     const auto& pal = ui::palette;
     const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
-    const ImVec4 dimCol(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1);
+    // Contrast-matched text over the frosted backdrop (dim = secondary tone).
+    const ImVec4 dimCol = surf.textSecondary;
 
     // Gate: only part docs have a weldment cut list. Drawing tabs / no-doc show a hint.
     if (!cutListApplicable(st)) {
         ImGui::TextColored(dimCol, "Open a part to see its weldment cut list.");
         cacheValid_ = false;
         ImGui::End();
+        ImGui::PopStyleColor(2);  // text ink + WindowBg
         return;
     }
 
@@ -103,6 +137,7 @@ void CutListPanel::draw(AppState& st) {
         ImGui::TextColored(dimCol, "No weldment members.");
         ImGui::TextColored(dimCol, "Add a Structural Member (Weldments tab) to populate the cut list.");
         ImGui::End();
+        ImGui::PopStyleColor(2);  // text ink + WindowBg
         return;
     }
 
@@ -156,6 +191,7 @@ void CutListPanel::draw(AppState& st) {
                        pmFormatDim(totalLengthMm_, st.ips()).c_str());
 
     ImGui::End();
+    ImGui::PopStyleColor(2);  // text ink + WindowBg
 }
 
 }  // namespace ui

@@ -59,3 +59,4 @@ append-only) or to your task branch (question files), and push.
 ## Check-ins (append-only)
 
 - 2026-07-02 Fable BOARD-CREATED; driver notes added to T-F1/3/5/7/9/13/14 and T-H1/2/3/4
+- 2026-07-02 sonnet-veda CLAIMED T-H2

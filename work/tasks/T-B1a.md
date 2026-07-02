@@ -2,8 +2,8 @@
 id: T-B1a
 title: Freeze sourcing_schema.md and extend VendorPart schema
 workstream: B
-owner: unassigned
-status: todo
+owner: opus-wren
+status: doing
 branch: task/T-B1a-sourcing-schema
 day: 1
 depends_on: [T-S1]

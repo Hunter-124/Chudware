@@ -73,6 +73,10 @@ register_ecad_tools(mcp)
 from mcp_server.cam_tools import register_cam_tools
 register_cam_tools(mcp)
 
+# Structural (T-D2): PyNite member forces & deflections for aicad.structure/1 docs.
+from mcp_server.structural_tools import register_structural_tools
+register_structural_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

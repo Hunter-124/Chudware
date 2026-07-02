@@ -146,3 +146,40 @@ gate.sh ui/imgui selMulti failure is PRE-EXISTING, never chase; commit+push ever
   T-F9, T-B1a, T-E1.
 - Note: a separate supervisor instance is running workstream G (T-G2 reviewed,
   T-G4 sonnet-oda) — WS-G is off-limits to this arc's backfills.
+
+### 2026-07-02 — T-F15 driver (Opus): five engineering templates landed on the F14 branch
+
+- **Base:** branched FROM `task/T-F14-deliverables-scaffold` @ 27e2433 (merge order F14→F15→F16;
+  never onto master, which lacks F14). Task file aligned owner fable-arc / status doing (cf9f007).
+- **Contract-compat decision (no `deliverables/2` needed):** all five templates register against
+  the frozen generic registry (contract §8) and are driven by the THREE existing make_* tools —
+  `make_manual` stays reserved and unimplemented. Recorded recommendation + rationale in
+  `work/questions/T-F15.md` (accept manuals as a make_report template; "md→pdf" rendered directly
+  via in-process docx/reportlab, no pandoc/markdown intermediate). Non-blocking.
+- **Package split:** flat `templates.py` → `templates/` package (matches the task-file layout).
+  Registry core + shared helpers in `templates/__init__.py`; smoke templates moved verbatim to
+  `templates/smoke.py`. Shared `templates/_doc.py` Doc-ops model renders the 3 report templates to
+  BOTH docx and pdf from one description (no per-format duplication). Commit f57d1fe.
+- **Templates (all provenance-enforced, every load-bearing number from an attached tool result):**
+  - `design_review` (make_presentation/pptx): title | views (embedded renders, missing→caption) |
+    massprops | fea_margins | risks.
+  - `calc_package` (make_report/docx|pdf): assumptions | material (props + Pillar-8 source+fetched_ts
+    citation) | equation (ALL slots load-bearing) | results_table.
+  - `bom_workbook` (make_workbook/xlsx): one sheet per assembly level; fixed cols
+    Item|Qty|UnitCost|ExtCost|Source; Qty+UnitCost load-bearing; live `=B*C` + `=SUM` rollup.
+  - `verification_report` (make_report/docx|pdf): requirements→evidence matrix; measured/limit/margin
+    load-bearing.
+  - `assembly_manual` (make_report/docx|pdf): section (manual prose) | step (render + torque/
+    fastener callouts load-bearing).
+- **joins.py:** provenance join layer — attach()/ref() + describe_part/FEA/material/CAM/drawing
+  normalizers + `bom_rollup()` (emits qty/unit_cost as attached results + live formulas; graceful
+  without WS-B sourcing). Pure data-shaping, no engine imports.
+- **spec.py (backward-compat internal):** preserve model-authored template-defined block fields
+  through validation (images/expr/verdict/req_id survive); support all-slots-load-bearing block
+  types (equation). Existing T-F14 suite still 20/20 green.
+- **guide.py:** cad_guide('deliverables') now catalogs each of the 5 spec schemas + a worked
+  example (DoD). Commit 5991980.
+- **Verification so far:** Opus smoke of all 5 templates end-to-end via joins PASS (resolved refs
+  6/6/5/4/2; numerals present in files; negative provenance_violation per load-bearing slot).
+  Golden-file pytest suite (test_templates.py) delegated to a Sonnet subagent; gate + graphify to
+  follow. NO new dependencies (all engines already in contract §7 / licenses.md).

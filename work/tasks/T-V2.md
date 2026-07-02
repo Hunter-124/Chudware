@@ -2,8 +2,8 @@
 id: T-V2
 title: MCP runtime reality audit - dead tools, undeclared deps, missing binaries
 workstream: V
-owner: unassigned
-status: todo
+owner: sonnet-vega
+status: doing
 branch: task/T-V2-mcp-runtime-audit
 day: 2
 priority: 2

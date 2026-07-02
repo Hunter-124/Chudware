@@ -3,7 +3,7 @@ id: T-Q2
 title: Autosave, crash recovery & consent-tied diagnostics
 workstream: Q
 owner: sonnet-moss
-status: review
+status: done
 branch: task/T-Q2-prod
 day: 2
 priority: 3

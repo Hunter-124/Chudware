@@ -1,4 +1,6 @@
 """Firmware compile-loop handlers (T-C2): ``fw_new_project`` / ``fw_build`` / ``fw_sources``.
+Hardware path handlers (T-C4): ``fw_flash`` / ``fw_debug_start`` / ``fw_debug_halt`` /
+``fw_debug_read_mem``.
 
 Framework-free, plain ``dict`` in → ``dict`` out — the MCP wrapper
 (``services/mcp/firmware_tools.py``) and the JSON-RPC worker call these directly, mirroring
@@ -8,6 +10,10 @@ Framework-free, plain ``dict`` in → ``dict`` out — the MCP wrapper
 The compile loop is: ``fw_new_project`` (seeds the project + a pin-map header from the linked ECAD
 board) → write/edit sources → ``fw_build`` (BuildResult with parsed warnings) → read errors → fix →
 ``fw_sources`` to add/remove files → repeat.
+
+Hardware path: ``fw_flash`` → flash ELF/bin to target → ``fw_debug_start`` → halt core →
+``fw_debug_read_mem`` → read registers/memory → ``fw_debug_halt`` → halt/reset.
+All hardware ops degrade gracefully when probe-rs / esptool.py is absent (``success=False``).
 """
 
 from __future__ import annotations
@@ -160,3 +166,132 @@ def fw_sim_run(params: dict) -> dict:
         timeout_s=float(params.get("timeout_s", 30)),
     )
     return result.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Hardware path (T-C4): probe-rs flash/debug
+# ---------------------------------------------------------------------------
+
+def fw_flash(params: dict) -> dict:
+    """``{elf_path, chip, port?, baud?}`` → ``FlashResult`` dict.
+
+    Flashes *elf_path* to the target board using probe-rs (when ``port`` is absent or the
+    path is an ``.elf``) or esptool.py (when ``port`` is provided and the path is a
+    ``.bin``). Missing binary → ``success=False`` with ``output`` explaining what's needed;
+    never an error envelope (graceful degradation, same posture as ``fw_build``).
+
+    ``chip`` identifies the target MCU for probe-rs (e.g. ``"STM32F407VGTx"``).
+    For ESP32 targets, pass the serial port as ``port`` and a ``.bin`` image.
+
+    [~] Live flash (Erik): requires a DAP probe (probe-rs) or USB serial (esptool.py)
+        connected to the target board. See hardware.py docstrings for exact CLI invocations.
+    """
+    from engine.firmware.hardware import ProbeRsFlasher, EsptoolFlasher
+
+    elf_path = params.get("elf_path") or params.get("bin_path") or ""
+    if not elf_path:
+        return _err("invalid_request", "fw_flash requires 'elf_path'")
+
+    chip = params.get("chip") or ""
+    port = params.get("port") or ""
+
+    # Route: esptool for explicit serial port + .bin; probe-rs otherwise.
+    if port and elf_path.endswith(".bin"):
+        baud = int(params.get("baud", 460800))
+        flash_offset = params.get("flash_offset", "0x0")
+        result = EsptoolFlasher().flash(elf_path, port, baud=baud,
+                                        flash_offset=flash_offset,
+                                        timeout_s=float(params.get("timeout_s", 60)))
+    else:
+        if not chip:
+            return _err("invalid_request", "fw_flash requires 'chip' for probe-rs flashing")
+        result = ProbeRsFlasher().flash(elf_path, chip,
+                                        timeout_s=float(params.get("timeout_s", 60)))
+    return result.to_dict()
+
+
+def fw_debug_start(params: dict) -> dict:
+    """``{chip}`` → ``FlashResult`` dict (reset + run).
+
+    Resets the target and starts execution via probe-rs. Use this to bring the board out of
+    halt or a failed state before reading memory.
+
+    [~] Live run (Erik): ``probe-rs reset --chip <chip>``
+        Requires a DAP probe connected.
+    """
+    from engine.firmware.hardware import ProbeRsDebugger
+
+    chip = params.get("chip") or ""
+    if not chip:
+        return _err("invalid_request", "fw_debug_start requires 'chip'")
+
+    result = ProbeRsDebugger().reset(chip, timeout_s=float(params.get("timeout_s", 30)))
+    return result.to_dict()
+
+
+def fw_debug_halt(params: dict) -> dict:
+    """``{chip}`` → ``FlashResult`` dict (reset into halt).
+
+    Resets the target and holds it in halt so registers/memory can be inspected.
+
+    [~] Live run (Erik): ``probe-rs reset --chip <chip> --halt``
+        Requires a DAP probe connected.
+    """
+    from engine.firmware.hardware import ProbeRsDebugger
+
+    chip = params.get("chip") or ""
+    if not chip:
+        return _err("invalid_request", "fw_debug_halt requires 'chip'")
+
+    result = ProbeRsDebugger().halt(chip, timeout_s=float(params.get("timeout_s", 30)))
+    return result.to_dict()
+
+
+def fw_debug_read_mem(params: dict) -> dict:
+    """``{chip, address, length}`` → ``{success, data_hex, address, length, ms}``.
+
+    Reads *length* bytes from *address* on the halted target via probe-rs. Returns the raw
+    bytes hex-encoded in ``data_hex``. When probe-rs is absent or the read fails,
+    ``success=False`` with ``reason`` explaining the failure.
+
+    [~] Live run (Erik): ``probe-rs read --chip <chip> <address_hex> <length>``
+        Target must be halted first (use fw_debug_halt). Requires a DAP probe connected.
+    """
+    import time as _time
+    from engine.firmware.hardware import ProbeRsDebugger
+
+    chip = params.get("chip") or ""
+    if not chip:
+        return _err("invalid_request", "fw_debug_read_mem requires 'chip'")
+
+    address_raw = params.get("address")
+    length_raw = params.get("length")
+    if address_raw is None or length_raw is None:
+        return _err("invalid_request", "fw_debug_read_mem requires 'address' and 'length'")
+
+    try:
+        address = int(str(address_raw), 0)  # accept "0x20000000" or decimal
+        length = int(str(length_raw), 0)
+    except ValueError as e:
+        return _err("invalid_request", f"invalid address or length: {e}")
+
+    t0 = _time.perf_counter()
+    try:
+        data = ProbeRsDebugger().read_memory(
+            address, length, chip, timeout_s=float(params.get("timeout_s", 30))
+        )
+        return {
+            "success": True,
+            "data_hex": data.hex(),
+            "address": hex(address),
+            "length": len(data),
+            "ms": round((_time.perf_counter() - t0) * 1000.0, 2),
+        }
+    except RuntimeError as e:
+        return {
+            "success": False,
+            "reason": str(e),
+            "address": hex(address),
+            "length": length,
+            "ms": round((_time.perf_counter() - t0) * 1000.0, 2),
+        }

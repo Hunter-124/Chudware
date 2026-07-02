@@ -2,8 +2,8 @@
 id: T-D4
 title: Code compliance - agentic RAG and deterministic rule engine
 workstream: D
-owner: unassigned
-status: todo
+owner: sonnet-wren2
+status: doing
 branch: task/T-D4-code-compliance
 day: 4
 depends_on: [T-D3]

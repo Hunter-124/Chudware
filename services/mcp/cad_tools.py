@@ -907,9 +907,10 @@ def cad_guide_text(topic: str = "overview") -> str:
     if topic in ("cam", "machining", "toolpath", "toolpaths", "gcode", "g-code", "mill", "nc"):
         return _CAM_GUIDE
     if topic in ("narration", "narrate", "describe_toolpaths", "describe_results",
-                 "results", "fea_results", "cfd_results"):
+                 "describe_assembly", "describe_board", "describe_project",
+                 "results", "fea_results", "cfd_results", "assembly", "board", "project"):
         return (
-            "NARRATION TOOLS — compact text summaries of CAM and FEA/CFD data:\n\n"
+            "NARRATION TOOLS — compact text summaries of every domain state:\n\n"
             "  describe_toolpaths([job_id])\n"
             "    Narrates an active CAM job: per-op strategy, tool, stepdown/stepover/stock,\n"
             "    cycle time + gouge/rapid counts (from cam_simulate), and a G-code digest\n"
@@ -922,7 +923,23 @@ def cad_guide_text(topic: str = "overview") -> str:
             "    named by sid, modal frequencies, and mesh convergence caveat.\n"
             "    Use INSTEAD of dumping run_fea_static / run_fea_modal JSON.\n"
             "    Returns a graceful 'no results attached' message when no study exists.\n\n"
-            "Both tools narrate EXISTING numbers only — they never recompute values.\n"
+            "  describe_assembly([doc_id])\n"
+            "    Narrates an assembly or multi-body part: per-component world-frame bounding\n"
+            "    boxes and origins (from asm_world_bodies), interference/clearance pairs\n"
+            "    (volumes + gap distances from eval_interference), and mate solve status.\n"
+            "    Use INSTEAD of dumping asm_world_bodies JSON.\n"
+            "    Call solve_mates first for the latest placement.\n\n"
+            "  describe_board([doc_id])\n"
+            "    Narrates an active schematic or PCB: component roster (ref/value/footprint),\n"
+            "    net list with members, ERC/DRC violation counts, and unconnected pins.\n"
+            "    Promotes ecad_status into the GSL narration layer.\n"
+            "    Open a design first with ecad_new_schematic or ecad_new_pcb.\n\n"
+            "  describe_project([run])\n"
+            "    Narrates a DAG project run: nodes done/doing/blocked/pending, budget usage,\n"
+            "    and open questions. Feeds WS-A dag_status and the T-F17 mission-control UI.\n"
+            "    Pass run=dag_status()['run'] from your WS-A driver.\n"
+            "    See contracts/dag_schema.md for the run dict shape.\n\n"
+            "All tools narrate EXISTING numbers only — they never recompute values.\n"
             "See contracts/narration.md for the full style guide (rounding, attribution,\n"
             "graceful-degradation phrases, section order)."
         )

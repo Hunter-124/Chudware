@@ -48,6 +48,7 @@ _unshadow_mcp_sdk()
 
 import asyncio  # noqa: E402
 import json  # noqa: E402
+import re  # noqa: E402
 
 import pytest  # noqa: E402
 
@@ -443,6 +444,145 @@ def test_describe_results_modal_study_and_named_lookup():
     # Unknown name: graceful error listing what IS attached.
     r3, _ = _call("describe_results", {"doc_id": doc, "study_name": "nope"})
     assert r3["ok"] is False and "No study named" in r3["error"], r3
+
+
+# ---------------------------------------------------------------- describe_assembly (T-F8)
+
+
+def test_describe_assembly_single_part_ok():
+    """describe_assembly on a plain single-body part narrates without crashing — either the
+    graceful no-bodies phrase or a placement narrative with real numerals and attribution."""
+    doc = _new_plate_with_hole()
+    r, _ = _call("describe_assembly", {"doc_id": doc})
+    assert r is not None and r.get("ok"), r
+    text = r.get("text", "")
+    if "No bodies found" in text:
+        # Graceful degradation phrase per contracts/narration.md.
+        assert "add components" in text, text
+    else:
+        # Placement narrative: bbox numerals + the per-line and trailing attributions.
+        assert "component(s) / bod" in text, text
+        assert "(source: asm_world_bodies)" in text, text
+        assert re.search(r"\d+(\.\d+)?", text), text
+        assert ("(Source: asm_world_bodies, eval_interference, doc_solve_mates — "
+                "numbers narrated, never recomputed)") in text, text
+
+
+def test_describe_assembly_multibody_fit_report():
+    """On a multi-body part (transform copy), describe_assembly names both bodies and reports
+    fit — either a FIT REPORT block (interference) or the no-interference clearance line."""
+    r, _ = _call("new_part", {"name": "gsl_asm"})
+    doc = r["doc_id"]
+    ops = [
+        cb.feat("box", "Base",
+                {"length": cb.dim(30), "width": cb.dim(20), "height": cb.dim(10)}),
+        cb.feat("transform", "Copy",
+                {"mode": "copy", "translate": [50.0, 0.0, 0.0]}),
+    ]
+    r2, _ = _call("add_features", {"ops": ops, "doc_id": doc})
+    if not (r2 and r2.get("ok")):
+        pytest.skip(f"transform copy not available: {r2}")
+    r3, _ = _call("describe_assembly", {"doc_id": doc})
+    assert r3 is not None and r3.get("ok"), r3
+    text = r3.get("text", "")
+    if "No bodies found" in text:
+        pytest.skip("asm_world_bodies reports no bodies for a transform-copy part")
+    assert "(source: asm_world_bodies)" in text, text
+    # Two world-placed bodies 50mm apart never overlap: expect a fit verdict either way.
+    assert ("FIT REPORT" in text or "no interference detected" in text
+            or "Fit/clearance: not available" in text), text
+    assert re.search(r"\d+(\.\d+)?", text), text
+
+
+# ---------------------------------------------------------------- describe_board (T-F8)
+
+
+def test_describe_board_no_ecad_doc_graceful():
+    """describe_board with no active ECAD document returns the contract's graceful error,
+    not a crash."""
+    r, _ = _call("describe_board", {"doc_id": "no-such-ecad-doc"})
+    assert r is not None, r
+    assert r.get("ok") is False, r
+    err = r.get("error", "")
+    assert ("No active ECAD document" in err or "ECAD engine not available" in err
+            or "not open" in err), r
+
+
+def test_describe_board_schematic_narration():
+    """describe_board on a live schematic renders the component/net roster with ERC counts
+    and the contract's attribution line."""
+    r_sch, _ = _call("ecad_new_schematic", {"name": "gsl_board_narr"})
+    if not (r_sch and r_sch.get("ok")):
+        pytest.skip(f"ecad_new_schematic not available: {r_sch}")
+    doc_id = r_sch.get("doc_id", "")
+    try:
+        _call("ecad_place_symbol", {"symbol": "Device:R", "ref": "R1", "value": "10k"})
+    except Exception:  # noqa: BLE001 — roster may stay empty; narration still must work
+        pass
+    r, _ = _call("describe_board", {"doc_id": doc_id})
+    assert r is not None and r.get("ok"), r
+    text = r.get("text", "")
+    assert "schematic" in text, text
+    assert "component(s)" in text and "net(s)" in text, text
+    assert "(source: engine.ecad.netlist)" in text, text
+    assert "(Source: engine.ecad.netlist, engine.ecad.erc" in text, text
+    assert re.search(r"\d+ component\(s\)", text), text
+
+
+# ---------------------------------------------------------------- describe_project (T-F8)
+
+
+def test_describe_project_no_run_graceful():
+    """describe_project with no run supplied returns the contract's graceful phrase pointing
+    at contracts/dag_schema.md."""
+    r, _ = _call("describe_project", {})
+    assert r is not None and r.get("ok"), r
+    assert "No DAG run data supplied" in r["text"], r
+    assert "dag_schema.md" in r["text"], r
+
+
+def test_describe_project_full_run():
+    """A full run dict narrates every section: counts, budget with percentage, per-status
+    node lines with owners/reasons, open questions, and the attribution line."""
+    run = {
+        "id": "run-test-001",
+        "name": "Test Sprint",
+        "nodes": [
+            {"id": "T-1", "title": "Do something", "status": "done"},
+            {"id": "T-2", "title": "Do another", "status": "doing", "owner": "opus-test"},
+            {"id": "T-3", "title": "Blocked task", "status": "blocked",
+             "blocked_reason": "waiting on T-1"},
+            {"id": "T-4", "title": "Pending task", "status": "todo"},
+        ],
+        "budget": {"spent": 12345, "cap": 100000},
+        "open_questions": [
+            {"id": "Q1", "task": "T-2", "question": "Should we use X or Y?"},
+        ],
+    }
+    r, _ = _call("describe_project", {"run": run})
+    assert r is not None and r.get("ok"), r
+    text = r["text"]
+    assert 'Project "Test Sprint"' in text and "run-test-001" in text, text
+    assert re.search(r"4 node\(s\) total", text), text
+    assert "1 done/review, 1 in-progress, 1 blocked, 1 pending" in text, text
+    # Budget: 12345/100000 -> 12.3% at 1 dp per the contract's percentage rounding.
+    assert "12,345" in text and "100,000" in text and "(12.3%)" in text, text
+    assert "(source: dag_run.budget)" in text, text
+    assert "[done] T-1: Do something" in text, text
+    assert "[doing] T-2: Do another  (owner: opus-test)" in text, text
+    assert "[blocked] T-3: Blocked task  reason: waiting on T-1" in text, text
+    assert "Q (Q1): Should we use X or Y?" in text, text
+    assert ("(Source: dag_run dict — numbers narrated from the DAG run record, "
+            "never recomputed)") in text, text
+
+
+def test_describe_project_empty_nodes():
+    """An empty-node run degrades gracefully: explicit no-nodes and no-questions phrases."""
+    run = {"id": "run-empty", "name": "Empty", "nodes": []}
+    r, _ = _call("describe_project", {"run": run})
+    assert r is not None and r.get("ok"), r
+    assert "No nodes in this run" in r["text"], r
+    assert "No open questions." in r["text"], r
 
 
 if __name__ == "__main__":

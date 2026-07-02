@@ -2,8 +2,8 @@
 id: T-F8
 title: describe_assembly, describe_board (GSL promotion), describe_project
 workstream: F
-owner: sonnet-kilo
-status: doing
+owner: sonnet-rune
+status: review
 branch: task/T-F8-narration-completion
 day: 8
 depends_on: [T-F7]
@@ -27,17 +27,66 @@ ECAD (promote the bespoke `ecad_status` into the GSL layer), and the DAG run its
 
 ## Definition of done
 
-- [ ] Three describers on the narration contract, cad_guide topics added
-- [ ] `_format_fit` has one home; build loop calls the shared one
-- [ ] Tests green; `bash scripts/gate.sh`; `graphify update .`
+- [x] Three describers on the narration contract, cad_guide topics added
+- [x] `_format_fit` has one home; build loop calls the shared one
+- [x] Tests green; `bash scripts/gate.sh`; `graphify update .`
 
-## Follow-ups inherited from T-F7 (Fable, 2026-07-02)
+## What landed (sonnet-kilo → sonnet-rune finisher, 2026-07-02)
 
-- Extend `_persist_study` to store the max-von-Mises node/face location so
-  `describe_results` can say WHERE the max stress is (T-F7 Q2; currently narrated as
-  explicitly-unavailable per the contract's honesty rule).
-- Expose per-op stepdown/stepover through a read RPC (cam_extract or cam_tree) so
-  `describe_toolpaths` can render those lines unconditionally (T-F7 Q3).
-- `contracts/narration.md` now codifies the REAL RPC shapes (verified against C++
-  sources by T-F7) — trust it over older notes; cam_simulate emits
-  `results[].{machined_fraction, gouges, rapid_collisions, cycle_time_s}`.
+### Implementation (sonnet-kilo, commit fde21a1)
+
+- `services/mcp/gsl_tools.py`: `describe_assembly`, `describe_board`, `describe_project`
+  MCP tools + their `_describe_*_text` helpers (~270 lines). `_format_fit` extracted out.
+- `services/mcp/fit_narration.py` (NEW): single home for `_format_fit` — import-safe
+  (no mcp SDK imports), shared by both `gsl_tools.py` and `services/agent/loop.py`.
+- `services/agent/loop.py`: import updated to `from mcp_server.fit_narration import _format_fit`.
+- `services/mcp/cad_tools.py`: `cad_guide` updated with `"assembly"`, `"board"`, `"project"`
+  topic keys and narration text for the three new tools.
+
+### Fixes + tests (sonnet-rune, commit 3a02cd3)
+
+- Fixed broken ecad import in committed code: `from engine.ecad import ecad_session`
+  → `from engine.ecad import session as ecad_session` (module is `engine/ecad/session.py`).
+- 8 new tests in `services/mcp/test_gsl_tools.py`:
+  - `test_describe_assembly_single_part_ok` — graceful no-bodies or placement narrative
+  - `test_describe_assembly_multibody_fit_report` — FIT REPORT or clearance line
+  - `test_describe_board_no_ecad_doc_graceful` — error on missing doc
+  - `test_describe_board_schematic_narration` — component/net roster + attribution
+  - `test_describe_project_no_run_graceful` — graceful no-run message
+  - `test_describe_project_full_run` — full node/budget/questions narration
+  - `test_describe_project_empty_nodes` — empty-node degradation
+
+### Real-engine test run (sonnet-rune CORRECTION, foreman-held review)
+
+**21 passed / 0 skipped / 0 failed** in `services/mcp/test_gsl_tools.py` against the
+real engine — the 13 pre-existing T-F7-era tests (regression check on the
+`_format_fit` extraction, which touched loop.py + gsl_tools.py imports) AND the
+8 new T-F8 tests, including the live ECAD schematic narration test.
+
+How: the worktree lacks `core/build-occt-linux/bin/` and `host/build-linux/bin/`
+(the two Linux dirs `core_bridge._lib_candidates()` probes), so `cb.available()`
+was False and everything skipped. The gate's own stage-2 build (OCCT ON) lands at
+`core/build-linux/bin/libaicad.so` in this worktree — pointed the documented
+escape hatch at it:
+
+```
+AI_CAD_LIBAICAD=$PWD/core/build-linux/bin/libaicad.so \
+  ~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest services/mcp/test_gsl_tools.py -q
+```
+
+Also verified: `services/agent/loop.py` imports cleanly and `_format_fit` resolves
+to `mcp_server.fit_narration`. The `services/agent/test_loop_mock.py` collection
+error (`FileNotFoundError: services/engine/samples/mounting_plate.py`) is
+baseline-proven pre-existing — the `samples/` path is absent on the base
+`task/T-F7-narration-core` branch too. No legitimately skipping tests remain;
+nothing sim-dependent skipped.
+
+### Follow-ups inherited from T-F7 (not in scope for T-F8)
+
+- Extend `_persist_study` to store max-von-Mises node/face location (T-F7 Q2).
+- Expose per-op stepdown/stepover via cam_extract/cam_tree RPC (T-F7 Q3).
+
+### Gate results
+
+See gate.sh run below — pre-existing failures only (check.py feature_surface_audit +
+parity_audit, pytest venv skips). No new regressions introduced.

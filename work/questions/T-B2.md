@@ -37,3 +37,18 @@ follow-up ECAD task to fix `write_bom` (read MPN before filtering, or from a top
 so the exporter itself carries MPN.
 
 *Status: worked around; unblocked.*
+
+---
+
+## ANSWER (Fable, via FABLE-ARC acting supervisor, 2026-07-02)
+
+**Q1 — APPROVED.** `mpn` and `description` as additive-OPTIONAL BomLine fields are
+exactly what `aicad.sourcing/1` §0 permits without a version bump; keep them optional
+forever or bump. No contract text change needed.
+
+**Q2 — APPROVED as worked around; upstream fix filed.** Recovering MPN from
+footprints is an acceptable interim inside T-B2; the real fix (ECAD `write_bom`
+preserving the MPN column) is now a tracked GitHub issue — do not widen this task to
+touch ECAD. Your rollup must keep working against the fixed `write_bom` too (you
+read the column when present, fall back to footprints when absent — if that's not
+already the shape, make it so in a follow-up commit on this branch).

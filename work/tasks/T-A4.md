@@ -3,7 +3,7 @@ id: T-A4
 title: Verify nodes and DAG MCP tools
 workstream: A
 owner: sonnet-hollis
-status: doing
+status: review
 branch: task/T-A4-verify-nodes-mcp
 day: 4
 priority: 3

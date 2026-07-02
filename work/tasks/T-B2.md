@@ -2,8 +2,8 @@
 id: T-B2
 title: BOM rollup with bom_rollup and bom_price MCP tools
 workstream: B
-owner: unassigned
-status: todo
+owner: opus-vale
+status: doing
 branch: task/T-B2-bom-rollup
 day: 2
 depends_on: [T-B1b]

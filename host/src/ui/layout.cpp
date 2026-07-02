@@ -1,118 +1,117 @@
-// AI-CAD dock layout + SolidWorks-faithful tabbed left pane — see layout.h.
+// AI-CAD overlay layout + the pinned FeatureManager glass column — see layout.h.
 //
-// 1C: buildDefaultLayout() moved here verbatim from title_bar.cpp (preserving the W4-K px-based
-//     dock clamp byte-for-byte); the only behavioral change is docking "LeftPane" — the new tabbed
-//     container window — into the left slot instead of "FeatureManager".
-// 1D: drawLeftPane() draws the vertical icon-tab strip + the active tab body, routing to the
-//     existing feature-tree / PropertyManager / configurations bodies.
+// Overlay redesign: buildDefaultLayout() builds ONE splitless central node (Viewport / ECAD / CAM
+// tabbed) so the 3D surface spans the full dockspace; drawLeftPane() renders the SolidWorks-style
+// tabbed manager as a pinned full-height rounded glass column over the viewport's left edge, with
+// an invisible right-edge resize and a collapse-to-pill affordance. Command dialogs float (they
+// z-sort above the docked central node).
 #include "layout.h"
 
 #include "imgui.h"
 #include "imgui_internal.h"
 
 #include "../core/app_state.h"
-#include "../ui_theme.h"   // ui::uiScale, ui::palette
+#include "../ui_theme.h"   // ui::uiScale, ui::palette, liquid glass v2
 
 #include "feature_tree.h"       // drawFeatureTreeBody
 #include "file_explorer.h"      // Wave 3: drawFileExplorerBody (Explorer tab)
 #include "property_manager.h"   // PropertyManager::drawBody
 #include "config_panel.h"       // ConfigPanel::drawEmbedded (live Configurations tab)
 #include "sim_manager.h"        // SimManager::drawTreeBody (live Simulation tab)
+#include "doc_tabs.h"           // docTabStripHeight (the column never overlaps the doc-tab band)
 #include "icons.h"              // getIcon / IconUV
+#include "metrics.h"            // dockRightTarget (command-dialog default anchor)
 
 #include <algorithm>
 #include <cstdio>
 
-// C24: SolidWorks 2025 default arrangement.
-//   LEFT   = LeftPane (the SW task pane: Explorer / FeatureManager / PropertyManager /
-//            Configurations as a vertical icon-tab strip), full height ribbon->status (~280px). The
-//            PropertyManager swaps INTO the FeatureManager slot OF this pane during a command.
-//   RIGHT  = Task Pane (~340px): Design (AI panel) + Agent Activity as tabs, like SW's task pane.
-//            The floating command dialogs (Insert/Mate/Exploded/Interference/BOM, Mass Properties
-//            & friends, Simulation) dock as tabs into the bottom of this pane on first open so they
-//            never hide behind the central viewport node (the C20b NoBringToFrontOnFocus debt).
-//   BOTTOM = Console, a thin strip below the viewport (collapsed-feeling; SW has no console but we
-//            keep ours unobtrusive).
-//   CENTER = Viewport, as large as possible.
-// "Reset layout" rebuilds exactly this.
+// Overlay layout: the dockspace hosts ONLY the central document windows, tabbed in one node, so
+// the viewport runs edge to edge between the ribbon and the status bar. The FeatureManager and
+// Copilot are pinned floating glass columns drawn OVER the viewport (drawLeftPane below /
+// drawAIPanel in legacy_chat.cpp) — no left/right dock splits, no splitter bars anywhere.
+// "Reset layout" rebuilds exactly this (plus resetOverlayColumns for the columns' geometry).
 void buildDefaultLayout(ImGuiID root, const ImVec2& size) {
     ImGui::DockBuilderRemoveNode(root);
     ImGui::DockBuilderAddNode(root, ImGuiDockNodeFlags_DockSpace);
     ImGui::DockBuilderSetNodeSize(root, size);
 
-    // Target pixel widths translated to fractions of the dockspace width.
-    const float w = size.x > 1.0f ? size.x : 1440.0f;
-    // W4-K / GUI audit #2.6: clamp the dock widths in PIXELS, not in fixed fraction bounds. The
-    // target px scale by uiScale so the docks track the pre-scaled fonts; clamping the *fraction*
-    // with a fixed ceiling (the old 0.34/0.36) silently ate that DPI growth at >=1.5x and clipped
-    // tree labels — the very thing W4-K was meant to fix. See docs/GUI_STYLE_GUIDE.md §6.
-    const float sc = ui::uiScale;
-    // Grow panes for readability at HiDPI, but dampen the growth so the viewport remains the
-    // first-read area instead of being squeezed by two linear-DPI sidebars.
-    const float panelSc = 1.0f + (sc - 1.0f) * 0.55f;
-    auto clampf = [](float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); };
-    const float minCenterPx = clampf(420.0f * panelSc, 320.0f, 0.52f * w);
-    float leftPx  = clampf(360.0f * panelSc, 250.0f * panelSc, 0.34f * w);
-    float rightPx = clampf(380.0f * panelSc, 270.0f * panelSc, 0.36f * w);
-    const float sideMax = w - minCenterPx;
-    if (leftPx + rightPx > sideMax && sideMax > 0.0f) {
-        const float k = sideMax / (leftPx + rightPx);
-        leftPx *= k;
-        rightPx *= k;
-    }
-    float leftFrac  = leftPx  / w;
-    float rightFrac = rightPx / w;
-    ImGuiID main = root, left, right, rightBottom;
-    // Left column = LeftPane task pane (full height).
-    left  = ImGui::DockBuilderSplitNode(main, ImGuiDir_Left,  leftFrac,  nullptr, &main);
-    if (ImGuiDockNode* ln = ImGui::DockBuilderGetNode(left))
-        ln->LocalFlags |= ImGuiDockNodeFlags_NoUndocking;
-    // Right column = Task Pane (the consolidated AI panel), full height like SolidWorks.
-    right = ImGui::DockBuilderSplitNode(main, ImGuiDir_Right, rightFrac / (1.0f - leftFrac),
-                                        nullptr, &main);
-    // Bottom slice of the right pane holds the command dialogs as docked tabs.
-    rightBottom = ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.42f, nullptr, &right);
-
-    // Wave 1D: visible dock label stays familiar while the internal id is stable.
-    ImGui::DockBuilderDockWindow("FeatureManager##LeftPane", left);
-    // Right task pane: the AI Copilot pane + a sibling Settings tab next to it.
-    ImGui::DockBuilderDockWindow("Copilot###AI", right);  // exact window name (matches Begin)
-    ImGui::DockBuilderDockWindow("Settings###AISettings", right);
     // Wave N/O: ECAD shares the central node with the Viewport (tabbed). Dock ECAD FIRST so the
     // Viewport is the default-active tab (3D is the primary view); the ECAD tab pops forward on its
     // own (SetNextWindowFocus) when an ECAD document is loaded.
-    ImGui::DockBuilderDockWindow("ECAD", main);
+    ImGui::DockBuilderDockWindow("ECAD", root);
     // CAM (Manufacture workspace) shares the central node too, tabbed with the Viewport. Docked
     // before the Viewport so 3D stays the default-active tab; the CAM tab pops forward on its own
     // (SetNextWindowFocus in drawCamManager) when the user enters the Manufacture workspace.
-    ImGui::DockBuilderDockWindow("CAM", main);
-    ImGui::DockBuilderDockWindow("Viewport", main);
-    ImGui::DockBuilderDockWindow("Viewport###Viewport", main);
-    // Command dialogs dock into the lower-right slot so they surface as tabs instead of floating
-    // behind the central node. They share one node (only one is typically open at a time).
-    const char* dialogs[] = {
-        // ("Simulation" used to dock here as a floating window; it now lives in the left-pane
-        // Simulation tab, so it is intentionally no longer pre-docked.)
-        "Insert Component", "Mate##asm", "Exploded View",
-        "Interference Detection", "Bill of Materials",
-        // Evaluate dialogs (titles set in evaluate_dialogs.cpp) — pre-registered so they land in
-        // the task pane the first time they open (DockBuilderDockWindow matches by name).
-        "Mass Properties", "Measure", "Section Properties", "Geometry Check", "Symmetry Check",
-        "Zebra Stripes", "Draft angle", "Wall thickness", "Mean curvature",
-        // Configurations (SolidWorks ConfigurationManager) — lands in the task pane the first time
-        // it's toggled on so it surfaces as a tab rather than floating over the viewport.
-        "Configurations",
-        // Design Table — same task-pane slot so the editable config grid surfaces as a tab.
-        "Design Table",
-        // Weldment Cut List — same task-pane slot so it surfaces as a tab when toggled on.
-        "Cut List",
-    };
-    for (const char* d : dialogs) ImGui::DockBuilderDockWindow(d, rightBottom);
+    ImGui::DockBuilderDockWindow("CAM", root);
+    ImGui::DockBuilderDockWindow("Viewport", root);
+    ImGui::DockBuilderDockWindow("Viewport###Viewport", root);
 
     ImGui::DockBuilderFinish(root);
 }
 
 namespace ui {
+
+// ---- overlay band + pinned-column reset plumbing (see layout.h) --------------------------------
+static OverlayBand g_overlayBand;
+static bool g_overlayColReset[2] = {false, false};
+
+void setOverlayBand(float minX, float minY, float maxX, float maxY) {
+    g_overlayBand.minX = minX;
+    g_overlayBand.minY = minY;
+    g_overlayBand.maxX = maxX;
+    g_overlayBand.maxY = maxY;
+    g_overlayBand.valid = (maxX > minX && maxY > minY);
+}
+const OverlayBand& overlayBand() { return g_overlayBand; }
+
+// Floating command dialogs (Evaluate / assembly / Cut List / Design Table…) lost their docked
+// rightBottom slot with the overlay layout; give them a sane first-open anchor: top-right inside
+// the overlay band, left of the Copilot column's default pin, 12dp margins. Pivot (1,0) anchors
+// the window's top-RIGHT corner so the placement works for any dialog width.
+void setNextCommandDialogPlacement() {
+    const OverlayBand& band = overlayBand();
+    if (!band.valid) return;  // pre-publish frame: keep ImGui's default cascade
+    const float margin = 12.0f * ui::uiScale;
+    const float x = band.maxX - margin - ui::metrics::dockRightTarget() - margin;
+    ImGui::SetNextWindowPos(ImVec2(x, band.minY + margin), ImGuiCond_FirstUseEver, ImVec2(1, 0));
+}
+
+void resetOverlayColumns() { g_overlayColReset[0] = g_overlayColReset[1] = true; }
+
+// ---- pinned-column occlusion edges (see layout.h) ----------------------------------------------
+// Frame-stamped so a column that stops drawing (hidden / collapsed) stops occluding one frame later.
+static float g_overlayColEdge[2]      = {-1.0f, -1.0f};
+static int   g_overlayColEdgeFrame[2] = {-1, -1};
+
+void publishOverlayColumnEdge(int slot, float edgeX) {
+    if (slot < 0 || slot > 1) return;
+    g_overlayColEdge[slot] = edgeX;
+    g_overlayColEdgeFrame[slot] = ImGui::GetFrameCount();
+}
+float overlayColumnEdge(int slot) {
+    if (slot < 0 || slot > 1) return -1.0f;
+    if (g_overlayColEdgeFrame[slot] < ImGui::GetFrameCount() - 1) return -1.0f;
+    return g_overlayColEdge[slot];
+}
+// ---- doc-tab band bottom edge (see layout.h) -----------------------------------------------------
+// Frame-stamped like the column edges: a strip that stops drawing stops insetting one frame later.
+static float g_docTabBandBottom      = -1.0f;
+static int   g_docTabBandBottomFrame = -1;
+
+void publishDocTabBandBottom(float y) {
+    g_docTabBandBottom = y;
+    g_docTabBandBottomFrame = ImGui::GetFrameCount();
+}
+float docTabBandBottom() {
+    if (g_docTabBandBottomFrame < ImGui::GetFrameCount() - 1) return -1.0f;
+    return g_docTabBandBottom;
+}
+
+bool takeOverlayColumnReset(int slot) {
+    if (slot < 0 || slot > 1 || !g_overlayColReset[slot]) return false;
+    g_overlayColReset[slot] = false;
+    return true;
+}
 
 static ImVec4 roleColor(const float role[4]) {
     return ImVec4(role[0], role[1], role[2], role[3]);
@@ -191,7 +190,7 @@ void drawConfigurationsBody(AppState& st) {
     const ImVec2 cfgWp = ImGui::GetWindowPos(), cfgWs = ImGui::GetWindowSize();
     const ImRect cfgRect(cfgWp, ImVec2(cfgWp.x + cfgWs.x, cfgWp.y + cfgWs.y));
     const ui::AdaptiveSurface& cfgSurf =
-        ui::adaptivePanel(ui::panelId("host_left_glass"), cfgRect);
+        ui::adaptivePanel(ui::panelId("host_left_glass"), cfgRect, ui::GlassGroup::FeatureManager);
     const ImVec4& dimCol = cfgSurf.textSecondary;
 
     ImGui::PushFont(st.fonts.medium);
@@ -222,46 +221,182 @@ void drawLeftPane(AppState& st,
                   const std::function<void(const std::string& featureId)>& editCallback) {
     PropertyManager* pm = st.propertyManager;
 
+    // Collapse-to-pill state. Not persisted by design (a fresh session always opens the manager);
+    // "Reset layout" clears it via takeOverlayColumnReset below.
+    static bool s_collapsed = false;
+
     // Auto-switch policy (Wave 1D): track the PM's active state across frames.
-    //   open-edge  (inactive -> active): jump to the PropertyManager tab so the form is visible.
+    //   open-edge  (inactive -> active): jump to the PropertyManager tab so the form is visible
+    //   (and pop the collapsed pill open — an invisible active command is worse than a yank).
     //   close-edge (active -> inactive): return to FeatureManager, but ONLY if the user is still on
     //   the PropertyManager tab — never yank a manual mid-edit tab change the user made themselves.
     static bool s_pmWasActive = false;
     const bool pmActive = pm && pm->active();
     if (pmActive && !s_pmWasActive) {
         st.leftPaneTab = kLeftPanePropertyManager;
+        s_collapsed = false;
     } else if (!pmActive && s_pmWasActive) {
         if (st.leftPaneTab == kLeftPanePropertyManager)
             st.leftPaneTab = kLeftPaneFeatureManager;
     }
     s_pmWasActive = pmActive;
 
-    const bool lpOpen = ImGui::Begin("FeatureManager##LeftPane", nullptr,
-                                      ImGuiWindowFlags_NoBackground);
-    if (!lpOpen) { ImGui::End(); return; }
-
-    if (!ImGui::IsWindowDocked())
-        st.resetLayout = true;
-
     const auto& pal = ui::palette;
     const float S = ui::uiScale;
 
+    // ---- pinned-column geometry --------------------------------------------------------------
+    // Anchored to the overlay band app.cpp publishes each frame (ribbon bottom -> status-bar top),
+    // inset by the doc-tab strip on top (the column must never overlap that band) and ~12dp
+    // margins. Falls back to the main viewport's work rect for the pre-publish first frame.
+    OverlayBand band = overlayBand();
+    if (!band.valid) {
+        const ImGuiViewport* mvp = ImGui::GetMainViewport();
+        band.minX = mvp->WorkPos.x;
+        band.minY = mvp->WorkPos.y;
+        band.maxX = mvp->WorkPos.x + mvp->WorkSize.x;
+        band.maxY = mvp->WorkPos.y + mvp->WorkSize.y;
+    }
+    const float margin = 12.0f * S;
+    const float colX = band.minX + margin;
+    // The doc-tab strip no longer sits ABOVE this column — it floats over the viewport, starting to
+    // the RIGHT of the column's right edge (fix 2). So the FeatureManager column can start flush at
+    // the top of the viewport band; the horizontal icon rail (fix 1) fills the space the doc tabs
+    // used to occupy above it.
+    const float colY = band.minY + margin;
+    const float colH = std::max(120.0f * S, band.maxY - margin - colY);
+
+    // ONE bubble radius shared by the invisible window (clip/interaction shape) and the drawn
+    // glass, so the user's per-group rounding knob can't desync the corners: the resolved
+    // FeatureManager rounding wins when set, else the 12dp bubble default.
+    const ui::GlassStyleResolved& rsFm = ui::glassStyleResolved(ui::GlassGroup::FeatureManager);
+    const float bubbleDp = (rsFm.rounding >= 0.f) ? rsFm.rounding : 12.0f;
+
+    const bool wantReset = takeOverlayColumnReset(0);
+    if (wantReset) s_collapsed = false;
+
+    // ---- collapsed: a small glass pill at the column anchor that re-expands -------------------
+    if (s_collapsed) {
+        const float pill = 40.0f * S;
+        ImGui::SetNextWindowPos(ImVec2(colX, colY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(pill, pill), ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, pill * 0.5f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        const ImGuiWindowFlags pillFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking |
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
+        if (ImGui::Begin("##LeftPanePill", nullptr, pillFlags)) {
+            const ImVec2 pp = ImGui::GetWindowPos();
+            const ImRect pr(pp, ImVec2(pp.x + pill, pp.y + pill));
+            // Distinct panel id (rect differs from the column's), same group => same user knobs.
+            const ui::AdaptiveSurface& psurf = ui::adaptivePanel(
+                ui::panelId("host_left_glass_pill"), pr, ui::GlassGroup::FeatureManager);
+            ui::glassPanel(ImGui::GetWindowDrawList(), pr, ui::GlassLevel::UltraThin,
+                           pill * 0.5f / S, psurf);
+            const bool pClicked = ImGui::InvisibleButton("##lp_expand", ImVec2(pill, pill));
+            const ImU32 pHalo = ui::viewportBackdrop().valid()
+                ? ImGui::ColorConvertFloat4ToU32(
+                      ImVec4(psurf.tint.x, psurf.tint.y, psurf.tint.z, 0x50 / 255.f))
+                : 0;
+            drawIconGlass(ImGui::GetWindowDrawList(), "history",
+                          ImVec2(pp.x + pill * 0.5f, pp.y + pill * 0.5f), 20.0f * S,
+                          ImGui::ColorConvertFloat4ToU32(psurf.textPrimary), pHalo);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Feature Manager");
+            if (pClicked) s_collapsed = false;
+        }
+        ImGui::End();
+        ImGui::PopStyleVar(3);
+        return;
+    }
+
+    // ---- expanded: the pinned full-height glass column -----------------------------------------
+    // Position + height are pinned every frame (min == max height in the constraint); WIDTH is the
+    // one free axis, resized via ImGui's invisible edge hit-zone (ConfigWindowsResizeFromEdges,
+    // EW mouse-cursor feedback, no drawn bars) and persisted in the imgui ini like any floating
+    // window. Default/min widths reuse the HiDPI-damped targets of the old dock split.
+    const float panelSc = 1.0f + (S - 1.0f) * 0.55f;
+    const float minW = 250.0f * panelSc;
+    const float defW = 360.0f * panelSc;
+    const float maxW = std::max(minW + 40.0f * S,
+                                std::min(560.0f * panelSc, (band.maxX - band.minX) * 0.42f));
+    ImGui::SetNextWindowPos(ImVec2(colX, colY), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(defW, colH),
+                             wantReset ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(minW, colH), ImVec2(maxW, colH));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, bubbleDp * S);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    // Kill every drawn resize affordance (corner grips + the edge hover/active flash) — the
+    // cursor change is the only feedback. Popped right after Begin (decorations render inside it);
+    // in-window Separator() uses ImGuiCol_Separator, which stays untouched.
+    ImGui::PushStyleColor(ImGuiCol_ResizeGrip, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ResizeGripHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ResizeGripActive, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_SeparatorActive, ImVec4(0, 0, 0, 0));
+    // NoBringToFrontOnFocus: the column is pinned chrome — clicking it must never raise it above
+    // a transient floating command dialog (floating windows already z-sort above the docked
+    // central Viewport, so the column always reads over the 3D regardless).
+    const ImGuiWindowFlags lpFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoBackground |
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBringToFrontOnFocus;
+    const bool lpOpen = ImGui::Begin("FeatureManager##LeftPane", nullptr, lpFlags);
+    ImGui::PopStyleColor(5);
+    ImGui::PopStyleVar(2);
+    if (!lpOpen) { ImGui::End(); return; }
+
     // Liquid glass v2 (host contract §H4): paint the ONE UltraThin glass surface for the WHOLE
-    // pane (icon rail + body) right after Begin, before any content. feature_tree.cpp /
-    // file_explorer.cpp fetch this SAME surface via the SAME panelId ("host_left_glass") instead
-    // of painting their own background (idempotent per frame — A2). Adaptive max-contrast text
-    // for the whole pane body; popped before End().
+    // column (icon rail + body) right after Begin, before any content. feature_tree.cpp /
+    // file_explorer.cpp fetch this SAME surface via the SAME panelId ("host_left_glass") + group
+    // instead of painting their own background (idempotent per frame — A2). Adaptive max-contrast
+    // text for the whole pane body; popped before End().
     const ImVec2 lpWp = ImGui::GetWindowPos();
     const ImVec2 lpWs = ImGui::GetWindowSize();
     const ImRect lpPaneRect(lpWp, ImVec2(lpWp.x + lpWs.x, lpWp.y + lpWs.y));
+    // Let the viewport HUD (triad / model-info pill) dodge the pinned column (layout.h).
+    publishOverlayColumnEdge(0, lpPaneRect.Max.x);
     const ui::AdaptiveSurface& surf =
-        ui::adaptivePanel(ui::panelId("host_left_glass"), lpPaneRect);
-    ui::glassPanel(ImGui::GetWindowDrawList(), lpPaneRect, ui::GlassLevel::UltraThin, -1.f, surf);
+        ui::adaptivePanel(ui::panelId("host_left_glass"), lpPaneRect, ui::GlassGroup::FeatureManager);
+    ui::glassPanel(ImGui::GetWindowDrawList(), lpPaneRect, ui::GlassLevel::UltraThin, bubbleDp, surf);
     const bool lpLive = ui::viewportBackdrop().valid();
     const ImU32 lpHalo = lpLive
         ? ImGui::ColorConvertFloat4ToU32(ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0x50 / 255.f))
         : 0;
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+
+    // Collapse-to-pill chevron — a persistent glass CHIP parked at the column's top-right corner, on
+    // the same top row as the horizontal icon rail (fix 1) but reserved out of its width (chevRsv
+    // below) so the two never overlap. A resting glass background (not hover-only) makes it read as an
+    // obvious button rather than a stray floating mark (fix 4). Drawn before the rail / body lay out;
+    // the cursor is restored so the flow below is unaffected.
+    const float chevSz  = 26.0f * S;                 // square chip, matches the rail icon-button height
+    const float chevRsv = chevSz + 8.0f * S;         // width the rail must leave clear at the right
+    {
+        const float cb = chevSz;
+        const ImVec2 c0(lpPaneRect.Max.x - cb - 8.0f * S, lpPaneRect.Min.y + 8.0f * S);
+        const ImVec2 savedCur = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(c0);
+        const bool cClicked = ImGui::InvisibleButton("##lp_collapse", ImVec2(cb, cb));
+        const bool cHover = ImGui::IsItemHovered();
+        ImDrawList* wdl = ImGui::GetWindowDrawList();
+        // Persistent subtle glass chip; brighter on hover.
+        ui::glassRowBackground(wdl, c0, ImVec2(c0.x + cb, c0.y + cb), 7.0f, false, false,
+                               cHover ? 0.42f : 0.22f);
+        const ImU32 cCol =
+            ImGui::ColorConvertFloat4ToU32(cHover ? surf.textPrimary : surf.textSecondary);
+        const ImVec2 cc(c0.x + cb * 0.5f, c0.y + cb * 0.5f);
+        const float ca = 3.5f * S;
+        for (int i = 0; i < 2; ++i) {   // "«" double chevron
+            const float ox = (i == 0 ? -2.5f : 2.5f) * S;
+            wdl->AddLine(ImVec2(cc.x + ox + ca * 0.5f, cc.y - ca),
+                         ImVec2(cc.x + ox - ca * 0.5f, cc.y), cCol, 1.6f * S);
+            wdl->AddLine(ImVec2(cc.x + ox - ca * 0.5f, cc.y),
+                         ImVec2(cc.x + ox + ca * 0.5f, cc.y + ca), cCol, 1.6f * S);
+        }
+        if (cHover) ImGui::SetTooltip("Collapse");
+        if (cClicked) s_collapsed = true;
+        ImGui::SetCursorScreenPos(savedCur);
+    }
 
     // True horizontal center of the WHOLE pane (icon rail + body), captured BEFORE the rail child so
     // the FeatureManager header can be centered across the full panel. Centering only within the body
@@ -270,7 +405,10 @@ void drawLeftPane(AppState& st,
     const float  paneInnerW  = ImGui::GetContentRegionAvail().x;
     const float  paneCenterX = paneOrigin.x + paneInnerW * 0.5f;
 
-    // ---- vertical icon-tab strip (SolidWorks style: small icons stacked on the left edge) ----
+    // ---- horizontal icon-tab row (fix 1: was a vertical strip down the left edge; now a row across
+    // the column's TOP edge, so the tab bodies below get the panel's FULL width — kills the old left
+    // gutter dead space). The collapse chevron (fix 4) shares this top row at the far right; the row
+    // reserves chevRsv on its right so the two never collide. ----
     struct TabDef { int id; const char* icon; const char* fallback; const char* tip; };
     static const TabDef kTabs[] = {
         { kLeftPaneExplorer,        "body_folder", "E", "Explorer" },
@@ -279,36 +417,31 @@ void drawLeftPane(AppState& st,
         { kLeftPaneConfigurations,  "settings",    "C", "Configurations" },
     };
 
-    const float btn = 36.0f * S;
-    const float glyph = 20.0f * S;
-    const float gap = 4.0f * S;
-    const ImGuiStyle& style = ImGui::GetStyle();
-    const float stripW     = btn + 8.0f * S;
+    const float btn = 30.0f * S;
+    const float glyph = 18.0f * S;
+    const float gap = 6.0f * S;
     const int   nTabs      = (int)(sizeof(kTabs)/sizeof(kTabs[0]));
-    const float railH      = 6.0f*S + nTabs*btn + (nTabs-1)*gap + 6.0f*S;
-    const float paneAvailH = ImGui::GetContentRegionAvail().y;
+    const float rowPad     = 6.0f * S;
+    const float railRowH   = rowPad + btn + rowPad;   // full top-row height (icons + top/bottom pad)
+    const float paneInnerWFull = ImGui::GetContentRegionAvail().x;
+    // The row spans the full pane width MINUS the chevron chip reserved at the right end.
+    const float railW = std::max(btn, paneInnerWFull - chevRsv);
 
-    // Zero the child's WindowPadding so the rail background (drawn from GetWindowPos) and the button
-    // column share one origin — otherwise the default padding offsets the buttons from the rail bg.
-    // Fixed height = railH so all icon buttons are always within the clip rect regardless of the
-    // parent's available height (height=0 could clip the last button when the pane is short).
+    // Zero the child's WindowPadding so the row background/origin and the buttons share one origin.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    ImGui::BeginChild("##lp_tabstrip", ImVec2(stripW, railH), ImGuiChildFlags_None,
+    ImGui::BeginChild("##lp_tabstrip", ImVec2(railW, railRowH), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
     ImGui::PopStyleVar();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    // Center the square button in the rail. SetCursorPosX must be set PER button: ImGui resets X to
-    // the line start after each Dummy, so a single SetCursorPos before the loop would only offset the
-    // first icon (the others would snap to x=0), producing the off-center / zig-zag look.
-    const float btnX = (stripW - btn) * 0.5f;
-    ImGui::SetCursorPosY(6.0f * S);
-    for (const TabDef& t : kTabs) {
+    ImGui::SetCursorPosY(rowPad);
+    for (int i = 0; i < nTabs; ++i) {
+        const TabDef& t = kTabs[i];
         const bool selected = (st.leftPaneTab == t.id) ||
                               (t.id == kLeftPaneFeatureManager && st.leftPaneTab == kLeftPaneSimulation);
         const bool attention = (t.id == kLeftPanePropertyManager && pmActive);
         char idBuf[16];
         std::snprintf(idBuf, sizeof(idBuf), "%d", t.id);
-        ImGui::SetCursorPosX(btnX);
+        if (i == 0) ImGui::SetCursorPosX(0.0f);
+        else        ImGui::SameLine(0, gap);
         if (drawManagerTabButton(idBuf, t.icon, t.fallback, t.tip, selected, attention,
                                  surf, lpHalo, btn, glyph)) {
             st.leftPaneTab = t.id;
@@ -319,24 +452,17 @@ void drawLeftPane(AppState& st,
                 st.ribbonTab = AppState::RT_Simulation;
             }
         }
-        ImGui::Dummy(ImVec2(0, gap));
     }
     ImGui::EndChild();
 
-    // Full-height separator between icon strip and body, drawn on the pane draw list so it
-    // spans the entire panel height regardless of the strip child's railH.
+    // Horizontal separator under the icon row, spanning the full pane width on the pane draw list.
     {
         ImDrawList* pdl = ImGui::GetWindowDrawList();
-        const float sepX = paneOrigin.x + stripW - 0.5f;
-        pdl->AddLine(ImVec2(sepX, paneOrigin.y),
-                     ImVec2(sepX, paneOrigin.y + paneAvailH),
+        const float sepY = paneOrigin.y + railRowH - 0.5f;
+        pdl->AddLine(ImVec2(paneOrigin.x, sepY),
+                     ImVec2(paneOrigin.x + paneInnerWFull, sepY),
                      ui::Palette::toU32(pal.glassBorder), 1.0f * S);
     }
-
-    // Body sits flush against the rail; the symmetric WindowPadding pushed below supplies EQUAL
-    // breathing room on both sides (gap from the rail == gap from the panel's right edge) so every
-    // manager tab is evenly spaced instead of crowding the rail or leaning toward the right edge.
-    ImGui::SameLine(0, 0);
 
     // ---- active tab body ----
     const char* title = "Feature Manager";
@@ -366,7 +492,9 @@ void drawLeftPane(AppState& st,
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(bodyPad, ImGui::GetStyle().WindowPadding.y));
     ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, sbSize);
-    ImGui::BeginChild("##lp_body", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
+    // Inset the scroll region above the bubble's rounded bottom edge so the last row (the file
+    // strip's "(unsaved)" line / buttons) is never clipped by the corner radius (visual-review fix).
+    ImGui::BeginChild("##lp_body", ImVec2(0, -8.0f * S), ImGuiChildFlags_AlwaysUseWindowPadding);
     const bool bodyIndented = s_bodyScrolled;
     if (bodyIndented) ImGui::Indent(sbSize);   // balance the right-side scrollbar gutter
     IconUV headIcon = getIcon(titleIcon, 20);

@@ -1,12 +1,16 @@
 // AI-CAD Copilot pane.
 //
-// One clean vertical pane: a slim header (logo + status + chat menu), the conversation log with a
-// per-turn transparent activity timeline (what the AI is doing / thinking, expandable), and a
-// bottom composer (rounded input + inline model/settings/send toolbar + provider/mode/autopilot
-// chips). Settings live in a popup off the composer; there is no separate Activity panel anymore.
+// A PINNED, full-height, rounded liquid-glass column overlaid on the viewport's right edge with
+// ~12dp margins (geometry from ui::viewportBackdrop(); invisible left-edge drag zone to resize;
+// the docked task-pane layout is gone — this is the only layout). Top-down: a slim header (logo
+// + status + Sessions), the conversation log with a per-turn transparent activity timeline (what
+// the AI is doing / thinking, expandable), and a bottom composer (segmented Design|Edit|Ask
+// toggle + Permissions + context meter; transparent prompt; model/thinking/send toolbar). The AI
+// settings render as an inline view inside the column (gShowSettingsView; opened by the gear).
 // Bubbles/cards (user prompt, prose, thinking, action, plan, error) and the composer are painted
-// as translucent Liquid-Glass bubbles over the live viewport backdrop (host contract H5; see
-// chatSurf()/GlassBubble below) instead of the old near-opaque pushGlassChildStyle cards.
+// as translucent adaptive Liquid-Glass bubbles over the live viewport backdrop (host contract
+// H5, GlassGroup::Copilot; see chatSurf()/GlassBubble/semanticOnGlass below) so every ink tone
+// stays readable over ANY model color.
 //
 // Also home to the shared small-UI helpers (primaryButton/sectionHeader/dimText/toggleChip and
 // the code/diff/prose/fit/plan/parts draw helpers) declared in core/app_state.h — they live here
@@ -30,6 +34,8 @@
 #include "imgui_internal.h"   // ImRect — Liquid Glass v2 host port (contract H5: glass bubbles)
 
 #include "legacy_chat.h"
+#include "layout.h"          // ui::overlayBand / takeOverlayColumnReset — pinned-column geometry
+#include "doc_tabs.h"        // ui::docTabStripHeight — top inset so the column clears the tab band
 #include "model_registry.h"  // ui::ModelInfo / capability flags / provider mapping
 #include "metrics.h"          // ui::metrics::px/U/asmHeaderIconGap
 #include "activity_panel.h"  // C22b: ActivityPanel still fed for the AI_CAD_SHOT=activity scenario
@@ -57,8 +63,10 @@ bool primaryButton(const char* label, const ImVec2& size) {
                p.accent[2]*1.08f > 1.f ? 1.f : p.accent[2]*1.08f, 1));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,
         ImVec4(p.accentDim[0], p.accentDim[1], p.accentDim[2], 1));
-    // Text on the accent button: dark for light-themed accent, dark for teal accent.
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.04f, 0.10f, 0.10f, 1));
+    // Text on the accent button: max-contrast ink for the accent fill (dark ink on the teal
+    // accent, light ink on the light theme's deeper blue) — no hardcoded tone.
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ui::maxContrastTextOn(ImVec4(p.accent[0], p.accent[1], p.accent[2], 1)));
     bool r = ImGui::Button(label, size);
     ImGui::PopStyleColor(4);
     return r;
@@ -70,19 +78,36 @@ void sectionHeader(ImFont* f, const char* text) {
     ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
 }
 void dimText(const char* t) {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ui::palette.textDim[0], ui::palette.textDim[1],
-                                                ui::palette.textDim[2], 1));
+    // Dim = the CURRENT text tone at reduced alpha, so the helper stays readable on ANY surface:
+    // theme text on opaque panels, adaptive glass ink when a bubble pushed surf.textPrimary
+    // (the old fixed palette.textDim was light grey over the light frost — washed out).
+    ImVec4 c = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    c.w *= 0.62f;
+    ImGui::PushStyleColor(ImGuiCol_Text, c);
     ImGui::TextWrapped("%s", t);
     ImGui::PopStyleColor();
 }
 
-// A small pill button that highlights when its section is expanded.
+// A small pill button that highlights when its section is expanded. All tones derive from the
+// CURRENT text color (+ the translucent chip accent when active) so the chip reads on opaque
+// panels AND on adaptive glass bubbles alike — the old theme-button fill under adaptive
+// near-black ink was black-on-black over the glass cards.
 bool toggleChip(const char* label, bool active) {
-    if (active) ImGui::PushStyleColor(ImGuiCol_Button,
-        ImVec4(ui::palette.chipBg[0], ui::palette.chipBg[1],
-               ui::palette.chipBg[2], ui::palette.chipBg[3]));
+    const auto& p = ui::palette;
+    const ImVec4 txt = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(6.0f));
+    ImGui::PushStyleColor(ImGuiCol_Button, active
+        ? ImVec4(p.chipBg[0], p.chipBg[1], p.chipBg[2], p.chipBg[3])
+        : ImVec4(txt.x, txt.y, txt.z, 0.06f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(txt.x, txt.y, txt.z, 0.14f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(txt.x, txt.y, txt.z, 0.22f));
     bool clicked = ImGui::SmallButton(label);
-    if (active) ImGui::PopStyleColor();
+    ImGui::GetWindowDrawList()->AddRect(
+        ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+        ImGui::ColorConvertFloat4ToU32(ImVec4(txt.x, txt.y, txt.z, active ? 0.45f : 0.25f)),
+        ui::metrics::rounding(6.0f), 0, ui::metrics::stroke(1.0f));
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar();
     return clicked;
 }
 
@@ -134,7 +159,6 @@ int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
 static bool drawChatInput(const char* id, std::vector<char>& buf, const char* placeholder,
                           int maxLines) {
     if (buf.empty()) return false;
-    const auto& pal = ui::palette;
     const ImGuiStyle& style = ImGui::GetStyle();
     const float lineH = ImGui::GetTextLineHeight();
     float wrapW = ImGui::GetContentRegionAvail().x - style.FramePadding.x * 2.0f -
@@ -166,24 +190,34 @@ static bool drawChatInput(const char* id, std::vector<char>& buf, const char* pl
                   ImGui::IsKeyPressed(ImGuiKey_Enter, false);
     if (buf[0] == 0 && placeholder && placeholder[0]) {
         ImVec2 mn = ImGui::GetItemRectMin();
+        // Honor a pushed TextDisabled (the glass composer pushes surf.textTertiary) so the hint
+        // adapts to the backdrop instead of always using the theme's disabled grey.
         ImGui::GetWindowDrawList()->AddText(
             ImVec2(mn.x + style.FramePadding.x * 2.0f, mn.y + style.FramePadding.y),
-            ui::Palette::toU32(pal.textDisabled), placeholder);
+            ImGui::GetColorU32(ImGuiCol_TextDisabled), placeholder);
     }
     return submit;
 }
 
-// Read-only, copyable monospace code view; height fits the content up to maxH.
+// Read-only, copyable monospace code view; height fits the content up to maxH. The ink is
+// paired with the box's OWN fill (codeBg) rather than inherited — a caller's adaptive glass
+// textPrimary (near-black over the light viewport) on the dark-theme codeBg was black-on-black.
 void drawCodeBox(const char* id, const std::string& code, ImFont* mono, float maxH) {
+    const auto& p = ui::palette;
     int lines = 1;
     for (char c : code) if (c == '\n') ++lines;
     if (mono) ImGui::PushFont(mono);
     float lh = ImGui::GetTextLineHeightWithSpacing();
-    float h = lh * (float)lines + 10.0f;
+    const float pad = 10.0f * ui::uiScale;
+    float h = lh * (float)lines + pad;
     if (h > maxH) h = maxH;
-    if (h < lh + 10.0f) h = lh + 10.0f;
+    if (h < lh + pad) h = lh + pad;
+    const ImVec4 bg(p.codeBg[0], p.codeBg[1], p.codeBg[2], p.codeBg[3]);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, bg);
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::maxContrastTextOn(bg));
     ImGui::InputTextMultiline(id, (char*)code.c_str(), code.size() + 1, ImVec2(-1, h),
                               ImGuiInputTextFlags_ReadOnly);
+    ImGui::PopStyleColor(2);
     if (mono) ImGui::PopFont();
 }
 
@@ -194,7 +228,7 @@ void drawDiffBox(const char* id, const std::string& diff, ImFont* mono, float ma
     for (char c : diff) if (c == '\n') ++lines;
     if (mono) ImGui::PushFont(mono);
     float lh = ImGui::GetTextLineHeightWithSpacing();
-    float h = lh * (float)lines + 10.0f;
+    float h = lh * (float)lines + 10.0f * ui::uiScale;
     if (h > maxH) h = maxH;
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
         ImVec4(p.codeBg[0], p.codeBg[1], p.codeBg[2], p.codeBg[3]));
@@ -236,14 +270,56 @@ void drawProseBox(const char* id, const std::string& text, float maxH) {
     ImGui::PopStyleColor();
 }
 
+// ---- Liquid Glass v2 host port (contract H5): glass surface + bubble helpers ----------------
+// ONE adaptivePanel id shared by the whole Copilot pane — header, composer, and every card below
+// fetch this SAME cached surface via ui::panelId("host_agent_glass"); ui::adaptivePanel is
+// idempotent per frame (it re-samples only on the first call each frame, from the full pane rect
+// painted in drawAIPanel), so every later fetch below is free regardless of which window/child is
+// current when it's called. Tagged GlassGroup::Copilot so the user's per-group appearance knobs
+// (tint / opacity / rounding / contrast boost) apply to every copilot surface.
+static const ui::AdaptiveSurface& chatSurf() {
+    ImVec2 mn = ImGui::GetWindowPos();
+    ImVec2 mx(mn.x + ImGui::GetWindowSize().x, mn.y + ImGui::GetWindowSize().y);
+    return ui::adaptivePanel(ui::panelId("host_agent_glass"), ImRect(mn, mx),
+                             ui::GlassGroup::Copilot);
+}
+
+// Semantic chroma (accent / status / badge roles) retuned for the surface it is drawn on. The
+// theme roles are picked for the theme's OWN panel background; on the frosted bubbles the tone
+// under them is whatever the model/viewport shows. Keep the hue but move the weight toward the
+// surface's text tone: bright roles darken over a bright frost, dark roles lighten over a dark
+// one — so status colors stay readable over ANY model (audit: washed-out teal/amber pattern).
+static ImVec4 semanticOnTone(const float role[4], bool brightSurface) {
+    ImVec4 c(role[0], role[1], role[2], 1.0f);
+    const float lum = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+    if (brightSurface && lum > 0.45f) {              // bright hue on a bright frost -> deepen
+        c.x *= 0.52f; c.y *= 0.52f; c.z *= 0.52f;
+    } else if (!brightSurface && lum < 0.35f) {      // dark hue on a dark frost -> lift
+        c.x += (1.0f - c.x) * 0.55f;
+        c.y += (1.0f - c.y) * 0.55f;
+        c.z += (1.0f - c.z) * 0.55f;
+    }
+    return c;
+}
+static ImVec4 semanticOnGlass(const float role[4], const ui::AdaptiveSurface& surf) {
+    return semanticOnTone(role, surf.darkText);
+}
+
 // Fit/interference readout: a green ("fits") or red ("clash") status line; when detailed,
 // the per-pair overlap volumes (red) and clearance gaps (dim) below it.
+// Tone-matches the CALLER's current ink rather than chatSurf() — this helper is shared with the
+// viewport's assembly readout (viewport_panel.cpp), which must not touch the copilot's cached
+// adaptive surface: dark ink in ImGuiCol_Text means a bright surface under us, and vice versa.
 void drawFitReadout(const FitReport& fit, bool detailed) {
     if (!fit.present) return;
     const auto& p = ui::palette;
-    const ImVec4 good(p.fitOk[0], p.fitOk[1], p.fitOk[2], 1);
-    const ImVec4 bad(p.fitBad[0], p.fitBad[1], p.fitBad[2], 1);
-    const ImVec4 dim(p.fitDim[0], p.fitDim[1], p.fitDim[2], 1);
+    const ImVec4 ink = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    const bool brightSurface =
+        (0.2126f * ink.x + 0.7152f * ink.y + 0.0722f * ink.z) < 0.5f;
+    const ImVec4 good = semanticOnTone(p.fitOk, brightSurface);
+    const ImVec4 bad  = semanticOnTone(p.fitBad, brightSurface);
+    ImVec4 dim = ink;
+    dim.w *= 0.70f;
     ImGui::TextColored(fit.ok ? good : bad, "%s  %s", fit.ok ? "[fits]" : "[clash]",
                        fit.summary.empty() ? (fit.ok ? "No interference" : "Interference")
                                            : fit.summary.c_str());
@@ -267,6 +343,7 @@ void drawFitReadout(const FitReport& fit, bool detailed) {
 // and the action cards so every surface shows the same animated status art.
 static void drawStatusGlyph(const std::string& status, float box) {
     const auto& pal = ui::palette;
+    const ui::AdaptiveSurface& surf = chatSurf();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
     const ImVec2 c(p0.x + box * 0.5f, p0.y + box * 0.5f);
@@ -275,9 +352,11 @@ static void drawStatusGlyph(const std::string& status, float box) {
     const bool pass    = status == "pass" || status == "done";
     const bool retry   = status == "retry";
     const bool fail    = status == "fail";
-    ImU32 col = ui::Palette::toU32(running || pass ? pal.accent
-                                   : retry ? pal.statusWarn
-                                   : fail  ? pal.statusErr : pal.textDim);
+    ImU32 col = ImGui::ColorConvertFloat4ToU32(
+        running || pass ? semanticOnGlass(pal.accent, surf)
+        : retry         ? semanticOnGlass(pal.statusWarn, surf)
+        : fail          ? semanticOnGlass(pal.statusErr, surf)
+                        : surf.textTertiary);
     const float th = ui::metrics::stroke(1.6f);
     if (running) {                              // spinning comet arc
         float t = (float)ImGui::GetTime();
@@ -306,18 +385,6 @@ static void drawStatusGlyph(const std::string& status, float box) {
     ImGui::Dummy(ImVec2(box, box));
 }
 
-// ---- Liquid Glass v2 host port (contract H5): glass surface + bubble helpers ----------------
-// ONE adaptivePanel id shared by the whole Copilot pane — header, composer, and every card below
-// fetch this SAME cached surface via ui::panelId("host_agent_glass"); ui::adaptivePanel is
-// idempotent per frame (it re-samples only on the first call each frame, from the full pane rect
-// painted in drawAIPanel), so every later fetch below is free regardless of which window/child is
-// current when it's called.
-static const ui::AdaptiveSurface& chatSurf() {
-    ImVec2 mn = ImGui::GetWindowPos();
-    ImVec2 mx(mn.x + ImGui::GetWindowSize().x, mn.y + ImGui::GetWindowSize().y);
-    return ui::adaptivePanel(ui::panelId("host_agent_glass"), ImRect(mn, mx));
-}
-
 // A "bubble" = an auto-height child painted over an explicit glassPanel fill, ported from
 // ui/imgui/src/ui/agent_panel.cpp's GlassBubble. The child's true height is only known after
 // EndChild(), so the PARENT draw list is channel-split: content goes to channel 1, and
@@ -328,7 +395,7 @@ struct GlassBubble {
     ImVec2         origin;
     float          width;
     ui::GlassLevel level;
-    float          rounding;
+    float          rounding;   // LOGICAL dp — ui::glassPanel scales by uiScale internally
 };
 
 static GlassBubble beginGlassBubble(float width, ui::GlassLevel level, float rounding) {
@@ -357,7 +424,7 @@ static ImRect endGlassBubble(const GlassBubble& b) {
 void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activity,
                   const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
-    const ImVec4 accent(pal.accent[0], pal.accent[1], pal.accent[2], 1);
+    const ImVec4 accent = semanticOnGlass(pal.accent, chatSurf());
     auto lower = [](std::string s) {
         for (char& c : s) c = (char)std::tolower((unsigned char)c);
         return s;
@@ -372,8 +439,7 @@ void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activit
                 return a.status;
         return "";
     };
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
-                                      8.0f * ui::uiScale);
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::BeginChild("##plancard", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
@@ -381,7 +447,7 @@ void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activit
     ImVec2 w0 = ImGui::GetWindowPos();
     // Left accent bar: the accent color at the planAccentBar alpha.
     dl->AddRectFilled(w0, ImVec2(w0.x + 3.0f, w0.y + ImGui::GetWindowHeight()),
-                      ui::Palette::toU32(pal.accent) & 0x00FFFFFFu |
+                      (ui::Palette::toU32(pal.accent) & 0x00FFFFFFu) |
                       ((uint32_t)(unsigned char)pal.planAccentBar << 24));
     ImGui::PushFont(fonts.medium);
     ImGui::TextColored(accent, "Build plan");
@@ -402,15 +468,15 @@ void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activit
         ImGui::PopFont();
         if (!p.purpose.empty()) dimText(p.purpose.c_str());
         if (!p.dims.empty()) {
+            // Adaptive secondary ink, not the theme's planDims grey — the theme tone is picked
+            // for the theme panel bg and washes out over the live frost.
             ImGui::PushFont(fonts.mono);
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(pal.planDims[0], pal.planDims[1], pal.planDims[2], 1));
+            ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
             ImGui::TextWrapped("%s  (mm)", p.dims.c_str());
             ImGui::PopStyleColor();
             ImGui::PopFont();
         }
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(pal.planFeature[0], pal.planFeature[1], pal.planFeature[2], 1));
+        ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
         for (const auto& f : p.features) {
             ImGui::Bullet();
             ImGui::SameLine();
@@ -431,9 +497,7 @@ void drawPlanCard(const PlanInfo& plan, const std::vector<ActivityItem>& activit
 // One line "Parts: a, b, c" with each name tinted its assembly color.
 void drawPartsLine(const std::vector<PartInfo>& parts) {
     if (parts.empty()) return;
-    const auto& p = ui::palette;
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(p.partsDim[0], p.partsDim[1], p.partsDim[2], 1));
+    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
     ImGui::TextUnformatted("Parts:");
     ImGui::PopStyleColor();
     for (size_t i = 0; i < parts.size(); ++i) {
@@ -560,18 +624,17 @@ static bool activeConversationRunning(AppState& st);
 // old conversation loop unchanged in behavior.
 static void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     const auto& pal = ui::palette;
-    const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
+    const ui::AdaptiveSurface& stepSurf = chatSurf();
+    const ImVec4 accentCol = semanticOnGlass(pal.accent, stepSurf);
     ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
-                                      8.0f * ui::uiScale);
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::BeginChild("##stepcard", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
     // Build issues are amber, not red: a failed pass is normal mid-loop — the error goes
     // straight back to the model, which usually fixes it.
-    ImVec4 badge = s.ok ? (s.done ? accentCol
-                               : ImVec4(pal.iterBuilt[0], pal.iterBuilt[1], pal.iterBuilt[2], 1))
-                        : ImVec4(pal.statusWarn[0], pal.statusWarn[1], pal.statusWarn[2], 1);
+    ImVec4 badge = s.ok ? (s.done ? accentCol : semanticOnGlass(pal.iterBuilt, stepSurf))
+                        : semanticOnGlass(pal.statusWarn, stepSurf);
     const char* word = s.ok ? (s.done ? "done" : "built") : "build issue";
     ImGui::PushFont(fonts.medium);
     ImGui::TextColored(badge, "Iteration %d - %s", s.index + 1, word);
@@ -579,8 +642,7 @@ static void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     if (!s.dims.empty()) {
         ImGui::SameLine();
         ImGui::PushFont(fonts.mono);
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1));
+        ImGui::PushStyleColor(ImGuiCol_Text, stepSurf.textSecondary);
         ImGui::Text("%s", s.dims.c_str());
         ImGui::PopStyleColor();
         ImGui::PopFont();
@@ -607,8 +669,7 @@ static void drawAgentStep(AgentStep& s, const ui::Fonts& fonts, float logW) {
     if (!s.ok && !s.error.empty()) {
         // Calm one-line cause; the raw traceback stays behind a toggle so a self-correcting
         // pass never reads like a crash.
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(pal.statusWarn[0], pal.statusWarn[1], pal.statusWarn[2], 1));
+        ImGui::PushStyleColor(ImGuiCol_Text, semanticOnGlass(pal.statusWarn, stepSurf));
         ImGui::TextWrapped("%s", errSummary(s.error).c_str());
         ImGui::PopStyleColor();
         dimText("The CAD code failed this pass; the error was fed back to the AI to correct.");
@@ -757,13 +818,22 @@ static void launchMissionRunChat(AppState& st, const std::string& request, bool 
 // and launches the run; "Skip" uses the suggested defaults. Shown inside an assistant turn.
 static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
-    const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
+    const ui::AdaptiveSurface& surf = chatSurf();
+    const ImVec4 accentCol = semanticOnGlass(pal.accent, surf);
     ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
-                                      8.0f * ui::uiScale);
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::BeginChild("##clarify", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
-    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    // Value fields on glass: a wash OPPOSITE the ink tone so typed answers stay readable over
+    // any model — the theme FrameBg under the adaptive near-black ink was black-on-black.
+    const ImVec4 fieldBg = surf.darkText ? ImVec4(1, 1, 1, 0.50f) : ImVec4(0, 0, 0, 0.38f);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, fieldBg);
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
+                          ImVec4(fieldBg.x, fieldBg.y, fieldBg.z, fieldBg.w + 0.10f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
+                          ImVec4(fieldBg.x, fieldBg.y, fieldBg.z, fieldBg.w + 0.16f));
+    ImGui::PushStyleColor(ImGuiCol_TextDisabled, surf.textTertiary);
     ImGui::PushFont(fonts.medium);
     ImGui::TextColored(accentCol, "A few details to get this right");
     ImGui::PopFont();
@@ -792,7 +862,7 @@ static void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     ImGui::Dummy(ImVec2(0, 4 * ui::uiScale));
     bool build = primaryButton("Build it", ImVec2(-1, ui::metrics::copilotBtnH()));
     bool skip = ImGui::Button("Skip - use defaults", ImVec2(-1, 0));
-    ImGui::PopStyleColor();
+    ImGui::PopStyleColor(5);   // Text + FrameBg/Hovered/Active + TextDisabled
     ImGui::EndChild();
     endGlassBubble(gb);
     if (build || skip) {
@@ -887,7 +957,7 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
 
     const bool open = a.expanded || !laterDone;   // forced open while it is the active frontier
     const bool hasDetail = !a.detail.empty();
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f * sc);
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::BeginChild("##thinkblk", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
@@ -923,10 +993,11 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
     const bool fail    = a.status == "fail";
 
     ImGui::Dummy(ImVec2(0, 2 * sc));
-    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f * sc);
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::BeginChild("##actcard", ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);   // base ink (dimText derives from it)
 
     // ---- header row: status glyph + tool icon + label + meta ----
     drawStatusGlyph(a.status, ImGui::GetTextLineHeight());
@@ -939,8 +1010,8 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
         ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, tint);
         ImGui::SameLine(0, 6 * sc);
     }
-    ImVec4 titleCol = running ? ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)
-                    : fail    ? ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1)
+    ImVec4 titleCol = running ? semanticOnGlass(pal.accent, surf)
+                    : fail    ? semanticOnGlass(pal.statusErr, surf)
                               : surf.textPrimary;
     ImGui::PushFont(fonts.medium);
     ImGui::TextColored(titleCol, "%s", a.title.c_str());
@@ -1000,6 +1071,7 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
         }
     }
 
+    ImGui::PopStyleColor();   // base ink
     ImGui::EndChild();
     ImRect cardRect = endGlassBubble(gb);
 
@@ -1035,11 +1107,11 @@ static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bo
 // One user turn: a right-aligned, markdown-stripped bubble (DESIGN.md §5 "User message" block).
 static void drawUserBlock(const ChatMsg& m, const ui::Fonts& fonts, float panelW) {
     const auto& pal = ui::palette;
-    const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
+    const ImVec4 accentCol = semanticOnGlass(pal.accent, chatSurf());
     // Right-align: indent ~22% of the panel so the bubble sits against the right edge.
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + panelW * 0.22f);
     const float bw = ImGui::GetContentRegionAvail().x;
-    GlassBubble gb = beginGlassBubble(bw, ui::GlassLevel::Regular, 8.0f * ui::uiScale);
+    GlassBubble gb = beginGlassBubble(bw, ui::GlassLevel::Regular, 8.0f);
     ImGui::BeginChild("##umsg", ImVec2(bw, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushFont(fonts.medium);
@@ -1051,18 +1123,20 @@ static void drawUserBlock(const ChatMsg& m, const ui::Fonts& fonts, float panelW
     ImGui::EndChild();
     ImRect bubble = endGlassBubble(gb);
     ImGui::GetWindowDrawList()->AddRect(bubble.Min, bubble.Max,
-        ImGui::ColorConvertFloat4ToU32(ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.55f)),
+        ImGui::ColorConvertFloat4ToU32(ImVec4(accentCol.x, accentCol.y, accentCol.z, 0.55f)),
         8.0f * ui::uiScale, 0, ui::metrics::stroke(1.0f));
     ImGui::Dummy(ImVec2(0, 6 * ui::uiScale));
 }
 
 static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, float logW) {
     const auto& pal = ui::palette;
-    const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
+    const ui::AdaptiveSurface& turnSurf = chatSurf();
+    const ImVec4 accentCol = semanticOnGlass(pal.accent, turnSurf);
 
+    // Adaptive ink for the turn name — the theme's assistantName tone (near-white in dark
+    // theme) washed out over the light frost.
     ImGui::PushFont(fonts.medium);
-    ImGui::TextColored(ImVec4(pal.assistantName[0], pal.assistantName[1],
-                             pal.assistantName[2], 1), "Assistant");
+    ImGui::TextColored(turnSurf.textSecondary, "Assistant");
     ImGui::PopFont();
 
     // (1) Plan / todo block — a live checklist that ticks off as stages complete (DESIGN §5).
@@ -1075,7 +1149,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     // contract H5) keeps body copy legible over the live viewport blur.
     if (!m.text.empty() && m.errKind == ERR_NONE) {
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
-                                          4.0f * ui::uiScale);
+                                          4.0f);
         ImGui::BeginChild("##prose", ImVec2(0, 0),
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
         ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
@@ -1136,11 +1210,12 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     if (m.errKind != ERR_NONE && !m.text.empty()) {
         ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
-                                          8.0f * ui::uiScale);
+                                          8.0f);
         ImGui::BeginChild("##errcard", ImVec2(0, 0),
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+        // Error tone retuned for the frost so the reason stays readable over any model.
         const float* ec = (m.errKind == ERR_SYSTEM) ? pal.errSystem : pal.errCad;
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(ec[0], ec[1], ec[2], 1));
+        ImGui::PushStyleColor(ImGuiCol_Text, semanticOnGlass(ec, chatSurf()));
         ImGui::TextWrapped("%s", stripMdMarks(m.text).c_str());
         ImGui::PopStyleColor();
         ImGui::EndChild();
@@ -1201,16 +1276,18 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     }
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 cp = ImGui::GetCursorScreenPos();
+    ImVec4 dotCol = semanticOnGlass(dot, chatSurf());
+    dotCol.w = dot[3];
     dl->AddCircleFilled(ImVec2(cp.x + lh * 0.5f, cp.y + lh * 0.5f), lh * 0.30f,
-                        ImGui::ColorConvertFloat4ToU32(ImVec4(dot[0], dot[1], dot[2], dot[3])));
+                        ImGui::ColorConvertFloat4ToU32(dotCol));
     ImGui::Dummy(ImVec2(lh, lh));
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
 }
 
 // Sessions list — replaces the chat log while open so users can jump between sessions easily.
 static void drawSessionsPanel(AppState& st, bool busy) {
-    const auto& pal = ui::palette;
     const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
     ensureConversations(st);
 
     if (ImGui::Button("+ New session") && !busy) { newConversation(st); st.prompt[0] = 0; }
@@ -1219,10 +1296,12 @@ static void drawSessionsPanel(AppState& st, bool busy) {
     if (ImGui::SmallButton("Back to chat")) st.showSessionsPicker = false;
 
     ImGui::Separator();
-    ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     ImGui::TextUnformatted("Switch sessions — running ones keep working in the background.");
     ImGui::PopStyleColor();
     ImGui::Dummy(ImVec2(0, 4 * sc));
+    // Session rows sit directly on the pane glass — adaptive ink, not theme text.
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
     for (int i = 0; i < (int)st.conversations.size(); ++i) {
         Conversation& c = st.conversations[i];
@@ -1251,6 +1330,7 @@ static void drawSessionsPanel(AppState& st, bool busy) {
         if (del && !busy) { closeConversation(st, i); ImGui::PopID(); break; }
         ImGui::PopID();
     }
+    ImGui::PopStyleColor();   // session-row ink
 }
 
 
@@ -1888,7 +1968,7 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
         const ProviderModels& pm = st.providerModels[s.provider == ui::PROV_LLAMACPP
                                                           ? ui::PROV_LLAMACPP : ui::PROV_LOCAL];
         const char* msg; ImU32 col;
-        if (!pm.checked) { msg = "checking endpoint…"; col = IM_COL32(180, 180, 180, 255); }
+        if (!pm.checked) { msg = "checking endpoint…"; col = ui::Palette::toU32(ui::palette.textDim); }
         else if (pm.ok) { msg = "endpoint reachable"; col = ui::Palette::toU32(ui::palette.statusOk); }
         else { msg = "endpoint unreachable — start your local model server"; col = ui::Palette::toU32(ui::palette.statusErr); }
         ImGui::PushStyleColor(ImGuiCol_Text, col);
@@ -2050,44 +2130,11 @@ static void drawAISettingsBody(AppState& st, bool busy) {
     ImGui::Separator();
 
     // Shared provider + availability-filtered model picker + reasoning effort (Settings modal
-    // uses the same widget, so the two never diverge).
-    ui::drawProviderModelPicker(st, busy);
+    // uses the same widget, so the two never diverge). Persist on change — this popover has no
+    // Save button; run mode, units, and theme live in their canonical Settings-modal tabs
+    // (Agent / General / Appearance) instead of duplicating here with divergent persistence.
+    if (ui::drawProviderModelPicker(st, busy)) saveSettings(settings);
 
-    ImGui::SeparatorText("Behavior");
-    {
-        const char* rmItems[] = {"Supervised (plan + clarify before modeling)",
-                                 "Autopilot (model straight from the prompt)"};
-        int rm = settings.planMode ? 0 : 1;
-        ImGui::TextUnformatted("Run mode");
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::Combo("##runmodecombo", &rm, rmItems, 2)) settings.planMode = (rm == 0);
-    }
-    int units = st.ips() ? 1 : 0;
-    if (ImGui::RadioButton("MMGS", &units, 0)) settings.units = Units::MMGS;
-    ImGui::SameLine();
-    if (ImGui::RadioButton("IPS", &units, 1)) settings.units = Units::IPS;
-
-    bool light = (ui::activeTheme == ui::Theme::Light);
-    if (ImGui::Checkbox("Light theme", &light)) {
-        ui::Theme next = light ? ui::Theme::Light : ui::Theme::Dark;
-        ui::applyTheme(next, st.scale);
-        settings.theme = light ? "light" : "dark";
-        if (st.renderer)
-            st.renderer->setBackground(
-                ui::palette.viewportTop[0], ui::palette.viewportTop[1],
-                ui::palette.viewportTop[2], ui::palette.viewportBottom[0],
-                ui::palette.viewportBottom[1], ui::palette.viewportBottom[2]);
-    }
-
-    if (busy) ImGui::BeginDisabled();
-    if (primaryButton("Save settings", ImVec2(-1, ui::metrics::copilotBtnH()))) {
-        settings.systemPrompt = st.spBuf.data();
-        saveSettings(settings);
-        st.settings.recentFiles = st.recentFiles;
-        st.addLog("[ok] saved settings");
-        st.toast(ui::ToastLevel::Info, "Settings saved");
-    }
-    if (busy) ImGui::EndDisabled();
     if (ImGui::Button("Advanced settings...", ImVec2(-1, 0))) st.openSettings = true;
     if (ImGui::Button("Repair / install runtime", ImVec2(-1, 0)) &&
         !st.setupRunning.load() && !st.job.running.load()) {
@@ -2095,29 +2142,33 @@ static void drawAISettingsBody(AppState& st, bool busy) {
     }
 }
 
-// The Settings dock tab — a sibling of the "Copilot" window (docked next to it). Hosts the same AI
-// settings body. SetNextWindowDockID pins it beside "Copilot" even on a saved layout; focusSettingsTab
-// (set by the composer gear / model-dropdown gear) brings it forward.
-void drawAISettingsTab(AppState& st, bool busy) {
-    if (!st.showAIPanel) return;
-    if (st.aiDockId) ImGui::SetNextWindowDockID((ImGuiID)st.aiDockId, ImGuiCond_FirstUseEver);
-    if (st.focusSettingsTab) { ImGui::SetNextWindowFocus(); st.focusSettingsTab = false; }
-    if (!ImGui::Begin("Settings###AISettings", nullptr, ImGuiWindowFlags_NoBackground)) {
-        ImGui::End(); return;
-    }
+// Session-only: the inline AI-settings view is open (replaces the conversation, like the
+// Sessions list). Set by st.focusSettingsTab (composer gear / model-dropdown gear).
+static bool gShowSettingsView = false;
+
+// Inline AI-settings view — hosted INSIDE the Copilot column. The old docked "Settings" sibling
+// tab went away with the docked layout (overlay glass columns are the only layout). The settings
+// body's widgets are theme-paired (combos / inputs / checkboxes with theme FrameBg), so the view
+// draws over a near-opaque theme wash instead of raw glass — mixing adaptive ink with theme
+// fills is the audit's black-on-black pattern.
+static void drawSettingsView(AppState& st, bool busy) {
     const auto& pal = ui::palette;
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##aisetbody", ImVec2(0, 0), ImGuiChildFlags_None);
+    if (ImGui::SmallButton("< Back to chat")) gShowSettingsView = false;
+    ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ui::metrics::rounding(8.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+        ImVec4(pal.windowBg[0], pal.windowBg[1], pal.windowBg[2], 0.92f));
+    ImGui::BeginChild("##aisetview", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
     drawAISettingsBody(st, busy);
-    // Transparency toggle (moved here from the composer per request): show/hide the AI's
-    // reasoning ("Thoughts") blocks inline. File-static gShowThinking, default on (DESIGN §5).
+    // Transparency toggle: show/hide the AI's reasoning ("Thoughts") blocks inline. File-static
+    // gShowThinking, default on (DESIGN §5).
     ImGui::Separator();
     ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Show the AI's reasoning steps inline (like Claude Code verbose mode).");
     ImGui::EndChild();
     ImGui::PopStyleColor();
-    ImGui::End();
+    ImGui::PopStyleVar();
 }
 
 // ============================ searchable model dropdown ============================
@@ -2360,37 +2411,6 @@ static void drawModelDropdown(AppState& st, bool busy) {
         // endpoint and 403'd. Saving here keeps config.json == what the picker shows before any run.
         saveSettings(st.settings);
         ImGui::CloseCurrentPopup();
-    }
-}
-
-// ============================ run-mode dropdown ============================
-// Our real run modes (driven by Settings::planMode): Supervised drafts a plan + asks the
-// build-critical clarify questions before modeling; Autopilot models straight from the prompt.
-static void drawRunModeMenu(AppState& st) {
-    const auto& pal = ui::palette;
-    const float sc = ui::uiScale;
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    struct Row { bool plan; const char* title; const char* desc; };
-    static const Row rows[] = {
-        {true,  "Supervised", "Drafts a plan and asks for key dimensions before modeling"},
-        {false, "Autopilot",  "Models straight from your prompt \xE2\x80\x94 no plan or questions"},
-    };
-    const float lh = ImGui::GetTextLineHeight();
-    for (const auto& r : rows) {
-        bool cur = st.settings.planMode == r.plan;
-        float h = lh * 2 + 8 * sc;
-        ImGui::PushID(r.title);
-        bool clicked = ImGui::Selectable("##rmrow", cur, 0, ImVec2(300 * sc, h));
-        ImVec2 mn = ImGui::GetItemRectMin();
-        float tx = mn.x + 8 * sc;
-        if (st.fonts.medium)
-            dl->AddText(st.fonts.medium, st.fonts.medium->FontSize, ImVec2(tx, mn.y + 4 * sc),
-                        ui::Palette::toU32(pal.text), r.title);
-        else
-            dl->AddText(ImVec2(tx, mn.y + 4 * sc), ui::Palette::toU32(pal.text), r.title);
-        dl->AddText(ImVec2(tx, mn.y + 4 * sc + lh), ui::Palette::toU32(pal.textDim), r.desc);
-        ImGui::PopID();
-        if (clicked) { st.settings.planMode = r.plan; saveSettings(st.settings); }
     }
 }
 
@@ -2778,12 +2798,9 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
     const bool hasDoc = st.docMirror.hasDoc();
     const ui::AdaptiveSurface& surf = chatSurf();
 
-    ImVec2 rowMin = ImGui::GetCursorScreenPos();
-    const float rowH = ImGui::GetFrameHeight() + 4 * sc;
-    const float availW = ImGui::GetContentRegionAvail().x;
-    ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
-    ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, 4.0f * sc, false, false);
-
+    // No backing strip here: the theme's glassBg wash didn't track the adaptive ink (dark text on
+    // a dark strip over a light model — visual-review fix). The chips carry their own fills; the
+    // pane's glass is the only background, so the adaptive text always reads.
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 3 * sc));
     // Translucent chips over the glass composer (opaque fills fought the adaptive text).
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
@@ -2793,20 +2810,36 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
         ImVec4(pal.buttonActive[0], pal.buttonActive[1], pal.buttonActive[2], 0.60f));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
+    // Mode chips: a PROPER segmented toggle (Design | Edit | Ask) — one click, visible state —
+    // instead of the old label-only popup. Active pill = translucent chip fill + accent outline;
+    // inactive pills stay transparent with secondary ink so the row reads on any backdrop.
     const char* modes[] = {"Design", "Edit", "Ask"};
+    const char* modeTips[] = {"Design — model a new part from a description.",
+                              "Edit — change the open part.",
+                              "Ask — questions about the part; nothing changes."};
     int mode = (st.aiInteraction >= 0 && st.aiInteraction <= 2) ? st.aiInteraction : 0;
-    if (ImGui::SmallButton(modes[mode])) ImGui::OpenPopup("##cmpmode");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Agent mode — what the AI does with your message.");
-    if (ImGui::BeginPopup("##cmpmode")) {
-        if (ImGui::Selectable("Design  — model a new part from a description", mode == 0))
-            st.aiInteraction = 0;
-        if (!hasDoc) ImGui::BeginDisabled();
-        if (ImGui::Selectable("Edit  — change the open part", mode == 1)) st.aiInteraction = 1;
-        if (!hasDoc) ImGui::EndDisabled();
-        if (ImGui::Selectable("Ask  — questions about the part, no changes", mode == 2))
-            st.aiInteraction = 2;
-        ImGui::EndPopup();
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(6.0f));
+    for (int i = 0; i < 3; ++i) {
+        if (i) ImGui::SameLine(0, 2 * sc);
+        const bool selMode = (mode == i);
+        const bool needDoc = (i == 1 && !hasDoc);   // Edit needs an open document
+        if (needDoc) ImGui::BeginDisabled();
+        ImGui::PushStyleColor(ImGuiCol_Button, selMode
+            ? ImVec4(pal.chipBg[0], pal.chipBg[1], pal.chipBg[2], pal.chipBg[3])
+            : ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_Text, selMode ? surf.textPrimary : surf.textSecondary);
+        if (ImGui::SmallButton(modes[i]) && !selMode) st.aiInteraction = i;
+        ImGui::PopStyleColor(2);
+        if (selMode)
+            ImGui::GetWindowDrawList()->AddRect(
+                ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                ImGui::ColorConvertFloat4ToU32(semanticOnGlass(pal.accent, surf)),
+                ui::metrics::rounding(6.0f), 0, ui::metrics::stroke(1.0f));
+        if (needDoc) ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", needDoc ? "Edit — open a part first." : modeTips[i]);
     }
+    ImGui::PopStyleVar();
 
     ImGui::SameLine();
     const char* permLabel = st.settings.offlineMode ? "Permissions: Offline" : "Permissions";
@@ -2815,11 +2848,15 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
         ImGui::SetTooltip("Privacy and run permissions for the copilot.");
     if (ImGui::BeginPopup("##cmpperm")) {
         bool off = st.settings.offlineMode;
-        if (ImGui::Checkbox("Offline mode (local models only — ITAR-safe)", &off))
+        if (ImGui::Checkbox("Offline mode (local models only — ITAR-safe)", &off)) {
             st.settings.offlineMode = off;
+            saveSettings(st.settings);   // the core reads config.json — persist immediately
+        }
         bool sup = st.settings.planMode;
-        if (ImGui::Checkbox("Supervised (plan + clarify before modeling)", &sup))
+        if (ImGui::Checkbox("Supervised (plan + clarify before modeling)", &sup)) {
             st.settings.planMode = sup;
+            saveSettings(st.settings);
+        }
         ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
         ImGui::EndPopup();
     }
@@ -2848,11 +2885,14 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
     ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
     ImDrawList* bgDl = ImGui::GetWindowDrawList();
     if (embedded) {
+        // Hairline divider from the surface's own ink so it reads on any backdrop.
         bgDl->AddLine(ImVec2(rowMin.x + 8.0f * sc, rowMin.y),
                       ImVec2(rowMax.x - 8.0f * sc, rowMin.y),
-                      IM_COL32(71, 82, 102, 170), ui::metrics::stroke(1.0f));
+                      ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textTertiary.x,
+                          surf.textTertiary.y, surf.textTertiary.z, 0.40f)),
+                      ui::metrics::stroke(1.0f));
     } else {
-        ui::glassPanel(bgDl, ImRect(rowMin, rowMax), ui::GlassLevel::Thin, 4.0f * sc, surf);
+        ui::glassPanel(bgDl, ImRect(rowMin, rowMax), ui::GlassLevel::Thin, 4.0f, surf);
     }
 
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 4 * sc));
@@ -2875,32 +2915,33 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
     const char* effLabels[8] = {};
     const char* effValues[8] = {};
     int nEff = ui::reasoningEffortOptions(s.provider, s.model, effLabels, effValues, 8);
+    // The chip renders ONLY when the model exposes an effort control AND the row has room for it
+    // before the send button — the old always-on "Thinking: n/a" placeholder overflowed the
+    // composer's rounded border and read as faint clipped junk (visual-review fix).
     if (nEff > 0) {
         int effIdx = 0;
         for (int i = 0; i < nEff; ++i)
             if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
         char effBtn[48];
         std::snprintf(effBtn, sizeof(effBtn), "Thinking: %s", effLabels[effIdx]);
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        if (ImGui::Button(effBtn)) ImGui::OpenPopup("##cmpeffort");
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Thinking effort for the selected model.");
+        const float chipW = ImGui::CalcTextSize(effBtn).x + 16 * sc;   // + FramePadding (8dp x2)
+        const float sendReserve = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x;
+        if (ImGui::GetCursorPosX() + chipW <= ImGui::GetContentRegionMax().x - sendReserve) {
+            ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+            if (ImGui::Button(effBtn)) ImGui::OpenPopup("##cmpeffort");
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Thinking effort for the selected model.");
+        }
         if (ImGui::BeginPopup("##cmpeffort")) {
             for (int i = 0; i < nEff; ++i) {
-                if (ImGui::Selectable(effLabels[i], effIdx == i))
+                if (ImGui::Selectable(effLabels[i], effIdx == i)) {
                     std::strncpy(s.reasoningEffort, effValues[i], sizeof(s.reasoningEffort) - 1);
+                    saveSettings(st.settings);   // the core reads config.json — persist immediately
+                }
             }
             ImGui::EndPopup();
         }
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
-        ImGui::BeginDisabled();
-        ImGui::Button("Thinking: n/a");
-        ImGui::EndDisabled();
-        ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("The selected model does not expose a thinking-effort control.");
     }
 
     const float sendSz = ImGui::GetFrameHeight();
@@ -2909,9 +2950,14 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
     if (rightX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rightX);
 
     if (active) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.statusErr));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(220, 100, 92, 255));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(190, 80, 74, 255));
+        // Stop button: statusErr fill with derived hover/active weights (no color literals).
+        const ImVec4 errC(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1);
+        ImGui::PushStyleColor(ImGuiCol_Button, errC);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+            ImVec4(std::min(errC.x * 1.12f, 1.0f), std::min(errC.y * 1.12f, 1.0f),
+                   std::min(errC.z * 1.12f, 1.0f), 1));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+            ImVec4(errC.x * 0.85f, errC.y * 0.85f, errC.z * 0.85f, 1));
         if (ImGui::Button("##stop", ImVec2(sendSz, sendSz))) stopReq = true;
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(st.stopRequested ? "Stopping\xE2\x80\xA6 (finishing current step)"
@@ -2920,8 +2966,10 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
         ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
         ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
         float h = sendSz * 0.18f;
+        ImVec4 stopInk = ui::maxContrastTextOn(errC);
+        stopInk.w = 0.92f;
         dl->AddRectFilled(ImVec2(c.x - h, c.y - h), ImVec2(c.x + h, c.y + h),
-                          IM_COL32(255, 255, 255, 235), 1.5f * sc);
+                          ImGui::ColorConvertFloat4ToU32(stopInk), 1.5f * sc);
     } else {
         ImGui::PushStyleColor(ImGuiCol_Button,
             canStart ? ui::Palette::toU32(pal.accent) : ui::Palette::toU32(pal.button));
@@ -2936,7 +2984,11 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
         ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
         ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
         float t = sendSz * 0.22f;
-        ImU32 ac = canStart ? IM_COL32(8, 26, 26, 255) : ui::Palette::toU32(pal.textDim);
+        // Glyph ink pairs with the button's own fill: max-contrast on accent when armed, the
+        // theme's dim ink on the theme button fill when idle.
+        ImU32 ac = canStart ? ImGui::ColorConvertFloat4ToU32(ui::maxContrastTextOn(
+                                  ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1)))
+                            : ui::Palette::toU32(pal.textDim);
         dl->AddTriangleFilled(ImVec2(c.x, c.y - t), ImVec2(c.x - t, c.y + t * 0.55f),
                               ImVec2(c.x + t, c.y + t * 0.55f), ac);
         dl->AddRectFilled(ImVec2(c.x - t * 0.30f, c.y - t * 0.1f),
@@ -2947,7 +2999,13 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
     ImGui::PopStyleColor(3);   // button base / hovered / active
     ImGui::PopStyleVar();
 
-    ImGui::SetNextWindowSizeConstraints(ImVec2(300 * sc, 0), ImVec2(300 * sc, FLT_MAX));
+    // Clamp the dropdown to the Copilot column's width (minus a small inset) so a narrow column
+    // never overhangs the pinned bubble; 300dp stays the cap for wide columns.
+    {
+        const float popW = std::max(180.0f * sc,
+                                    std::min(300.0f * sc, ImGui::GetWindowWidth() - 16.0f * sc));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(popW, 0), ImVec2(popW, FLT_MAX));
+    }
     if (ImGui::BeginPopup("##modeldropdown")) { drawModelDropdown(st, busy); ImGui::EndPopup(); }
 }
 
@@ -2993,7 +3051,6 @@ static void requestStopRun(AppState& st) {
 // ---- the composer: a rounded input box + inline toolbar (+, model chip, settings, send) ----
 // Submits on Enter or the send button. Returns nothing; runs the turn directly.
 static void drawComposer(AppState& st, bool busy, bool canRun) {
-    const float sc = ui::uiScale;
     const bool hasDoc = st.docMirror.hasDoc();
 
     // Keep the orchestrator flag synced to the mode (Edit == validated document ops on the doc).
@@ -3070,7 +3127,7 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
     const ImVec2 composerMax(composerMin.x + composerW, ImGui::GetItemRectMax().y);
     composerSplit.SetCurrentChannel(composerDl, 0);
     ui::glassPanel(composerDl, ImRect(composerMin, composerMax), ui::GlassLevel::Thin,
-                  ui::metrics::rounding(8.0f), surf);
+                  8.0f /*logical dp — glassPanel scales internally*/, surf);
     composerSplit.Merge(composerDl);
 
     // ---- stop / submit / queue ----
@@ -3091,33 +3148,105 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
 }
 
 // ---- unified AI Copilot pane: header -> conversation -> bottom composer ----
+// The pane is a PINNED, full-height, rounded glass column overlaid on the viewport's right edge
+// (~12dp margins inside the area between ribbon and status bar) — the ONLY layout; the docked
+// task-pane path is gone. Geometry comes from ui::overlayBand() (published per-frame by app.cpp;
+// same source as the FeatureManager column), so the column tracks ribbon/status-bar/window
+// resizes with no extra wiring. Width is user-resizable via an INVISIBLE hit-zone on the
+// column's left edge (no visible splitter). Until the first backdrop is published (early frames)
+// the window falls back to its default placement so nothing breaks headless.
 void drawAIPanel(AppState& st, bool busy, bool canRun) {
     if (!st.showAIPanel) return;
 
     // Keep the local-endpoint model list fresh whenever the copilot panel exists — BEFORE the
-    // visibility gate below, so discovery runs even when the AI tab is docked in the background
-    // (ImGui::Begin returns false for an inactive tab). Without this, a model loaded in LM Studio
-    // isn't discovered until the user opens the picker ("pokes around in settings"). The probe is
-    // throttled to ~5s and no-ops for a non-loopback (cloud) base_url, so this is cheap.
+    // visibility gate below, so discovery runs even when the pane is occluded. Without this, a
+    // model loaded in LM Studio isn't discovered until the user opens the picker ("pokes around
+    // in settings"). The probe is throttled to ~5s and no-ops for a non-loopback (cloud)
+    // base_url, so this is cheap.
     refreshModelAvailability(st, false);
 
-    if (!ImGui::Begin("Copilot###AI", nullptr, ImGuiWindowFlags_NoBackground)) { ImGui::End(); return; }
+    static float s_paneW = 0.0f;                    // column width (px), session-persistent
+    // Anchor to the overlay band app.cpp publishes each frame (ribbon bottom -> status-bar top),
+    // inset by the doc-tab strip on top — the SAME geometry source as the FeatureManager column in
+    // layout.cpp drawLeftPane, so the two pinned columns always share top/bottom edges. Falls back
+    // to the main viewport's work rect for the pre-publish first frame.
+    ui::OverlayBand band = ui::overlayBand();
+    if (!band.valid) {
+        const ImGuiViewport* mvp = ImGui::GetMainViewport();
+        band.minX = mvp->WorkPos.x;
+        band.minY = mvp->WorkPos.y;
+        band.maxX = mvp->WorkPos.x + mvp->WorkSize.x;
+        band.maxY = mvp->WorkPos.y + mvp->WorkSize.y;
+        band.valid = band.maxX > band.minX && band.maxY > band.minY;
+    }
+    const bool overlay = band.valid;
+    // ONE bubble radius shared by the window clip and the drawn glass (same rule as drawLeftPane):
+    // the resolved Copilot rounding knob wins when set, else the 12dp bubble default.
+    const ui::GlassStyleResolved& rsCp = ui::glassStyleResolved(ui::GlassGroup::Copilot);
+    const float bubbleDp = (rsCp.rounding >= 0.f) ? rsCp.rounding : 12.0f;
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoBackground;
+    if (overlay) {
+        const float margin = ui::metrics::px(12.0f);
+        // The doc-tab strip now floats over the viewport (fix 2), not above these columns, so the
+        // Copilot column starts flush at the top of the viewport band — same rule as drawLeftPane,
+        // keeping the two pinned columns sharing their top edge.
+        const float colY = band.minY + margin;
+        const float colH = std::max(120.0f * ui::uiScale, band.maxY - margin - colY);
+        // "Reset layout" (slot 1 = Copilot column) restores the default width.
+        if (ui::takeOverlayColumnReset(1)) s_paneW = 0.0f;
+        if (s_paneW <= 0.0f) s_paneW = ui::metrics::dockRightTarget();
+        const float maxW = std::max((band.maxX - band.minX) * 0.5f,
+                                    ui::metrics::dockRightMin());
+        s_paneW = std::min(std::max(s_paneW, ui::metrics::dockRightMin()), maxW);
+        ImGui::SetNextWindowPos(ImVec2(band.maxX - margin - s_paneW, colY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(s_paneW, colH), ImGuiCond_Always);
+        flags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                 ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoScrollbar |
+                 ImGuiWindowFlags_NoScrollWithMouse;
+    }
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, bubbleDp * ui::uiScale);
+    const bool cpOpen = ImGui::Begin("Copilot###AI", nullptr, flags);
+    ImGui::PopStyleVar();
+    if (!cpOpen) { ImGui::End(); return; }
     ui::Fonts& fonts = st.fonts;
 
-    // Liquid-Glass v2 host port (contract H5): ONE UltraThin glass surface for the whole Copilot
-    // pane, painted once here at panel top (id "host_agent_glass" via ui::panelId — window-
-    // independent, so chatSurf() below returns the SAME cached surface for the header, composer,
-    // and every card this frame; ui::adaptivePanel is idempotent per frame). Falls back to the
-    // palette's glassBackground when no viewport backdrop has been published yet.
+    // Liquid-Glass v2 host port (contract H5): ONE fully transparent glass surface for the whole
+    // Copilot column, painted once here at panel top (id "host_agent_glass" via ui::panelId —
+    // window-independent, so chatSurf() below returns the SAME cached surface for the header,
+    // composer, and every card this frame; ui::adaptivePanel is idempotent per frame). Tagged
+    // GlassGroup::Copilot in chatSurf(), so the user's Appearance knobs (tint/level/rounding/
+    // opacity) ride in automatically. Falls back to the palette's glassBackground when no
+    // viewport backdrop has been published yet.
     {
         ImVec2 wmin = ImGui::GetWindowPos();
         ImVec2 wmax(wmin.x + ImGui::GetWindowSize().x, wmin.y + ImGui::GetWindowSize().y);
         ui::glassPanel(ImGui::GetWindowDrawList(), ImRect(wmin, wmax), ui::GlassLevel::UltraThin,
-                      -1.0f, chatSurf());
+                      bubbleDp /*same radius as the window clip, logical dp*/, chatSurf());
+        // Let the viewport HUD (result legend) dodge the pinned column (layout.h, slot 1).
+        if (overlay) ui::publishOverlayColumnEdge(1, wmin.x);
     }
 
-    // Remember which dock node we live in so the sibling "Settings" tab can dock next to us.
-    st.aiDockId = (unsigned int)ImGui::GetWindowDockID();
+    // Invisible left-edge resize hit-zone (design rule: no visible splitter bars). Dragging the
+    // strip left widens the column; clamped at the top of the next frame.
+    if (overlay) {
+        const ImVec2 keep = ImGui::GetCursorPos();
+        ImGui::SetCursorScreenPos(ImGui::GetWindowPos());
+        ImGui::InvisibleButton("##copilot_resize",
+                               ImVec2(ui::metrics::px(6.0f), ImGui::GetWindowSize().y));
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        if (ImGui::IsItemActive()) s_paneW -= ImGui::GetIO().MouseDelta.x;
+        ImGui::SetCursorPos(keep);
+    }
+
+    // Route the composer/model-picker gear to the INLINE settings view (the docked sibling
+    // Settings tab is gone with the docked layout).
+    if (st.focusSettingsTab) {
+        gShowSettingsView = true;
+        st.showSessionsPicker = false;
+        st.focusSettingsTab = false;
+    }
 
     // Keep the conversation set bound to the active document (swaps history on doc change). Must
     // run BEFORE the header/composer touch st.conversations, so the seeded/persisted chat is
@@ -3140,7 +3269,9 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
 
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_None);
-    if (st.showSessionsPicker) {
+    if (gShowSettingsView) {
+        drawSettingsView(st, busy);
+    } else if (st.showSessionsPicker) {
         drawSessionsPanel(st, busy);
     } else {
         const float logW = ImGui::GetContentRegionAvail().x;
@@ -3159,7 +3290,34 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         if (!st.showSessionsPicker && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12)
             ImGui::SetScrollHereY(1.0f);
     }
+    const bool  logScrolled = ImGui::GetScrollY() > 0.5f;
+    const ImVec2 logP0 = ImGui::GetWindowPos();
+    const float  logVisW = ImGui::GetWindowSize().x;
     ImGui::EndChild();
+
+    // Top fade mask over the conversation scroll viewport: once the log is scrolled, the first
+    // visible line clips mid-glyph right under the header divider — wash those half glyphs out
+    // with a surface-tint gradient instead of showing them cut (visual-review fix). Drawn in its
+    // own input-transparent overlay CHILD submitted after the log, because the message cards are
+    // nested child windows that render after both the log's and this window's draw lists.
+    if (logScrolled) {
+        const ImVec2 keep = ImGui::GetCursorPos();
+        // One full text row tall, so a mid-glyph clipped line is washed out along its whole height.
+        const float fadeH = ImGui::GetTextLineHeight() + ui::metrics::px(6.0f);
+        ImGui::SetCursorScreenPos(logP0);
+        ImGui::BeginChild("##chatlog_fade", ImVec2(logVisW, fadeH), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoScrollbar |
+                          ImGuiWindowFlags_NoScrollWithMouse);
+        const ui::AdaptiveSurface& fsurf = chatSurf();
+        const ImU32 top = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(fsurf.tint.x, fsurf.tint.y, fsurf.tint.z, 0.92f));
+        const ImU32 clear = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(fsurf.tint.x, fsurf.tint.y, fsurf.tint.z, 0.0f));
+        ImGui::GetWindowDrawList()->AddRectFilledMultiColor(
+            logP0, ImVec2(logP0.x + logVisW, logP0.y + fadeH), top, top, clear, clear);
+        ImGui::EndChild();
+        ImGui::SetCursorPos(keep);
+    }
     ImGui::PopStyleColor();
 
     // ---- composer (measure its height for next frame's reserve) ----

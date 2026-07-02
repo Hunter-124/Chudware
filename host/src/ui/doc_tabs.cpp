@@ -16,6 +16,7 @@
 #include "imgui_internal.h"   // ImGuiDockNode + GetWindowDockNode — the doc-tab band spans the node
 
 #include "doc_tabs.h"
+#include "layout.h"         // publishDocTabBandBottom — pinned columns anchor below the real band
 #include "feature_tree.h"   // featureTreeSaveDoc — save-then-close from the unsaved-changes prompt
 #include "file_dialog.h"    // saveFileDialog — ECAD Save-As from the unsaved-changes prompt
 #include "icons.h"
@@ -104,7 +105,7 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     // Thin (per-rect UV-projected live backdrop; glassBackground fallback when no backdrop is live).
     ui::GlassLevel level = active ? ui::GlassLevel::Regular : ui::GlassLevel::UltraThin;
     if (hovered && !active) level = ui::GlassLevel::Thin;
-    ui::glassPanel(dl, tabRect, level, 4.0f * s, surf);
+    ui::glassPanel(dl, tabRect, level, 4.0f /*dp — glassPanel scales by uiScale*/, surf);
     if (active)
         dl->AddLine(ImVec2(p0.x + ui::metrics::px(2), p0.y + ui::metrics::px(1)),
                     ImVec2(p1.x - ui::metrics::px(2), p0.y + ui::metrics::px(1)),
@@ -270,6 +271,66 @@ float drawDocTabs(AppState& st, float availW) {
     s_saveCloseIdx = -1;
     s_newDoc = NewDocKind::None;
 
+    // ---- pinned floating overlay window (visual-overhaul fix 2) ------------------------------------
+    // The strip used to draw INLINE at the top of the central document window and reserve its own
+    // height, which pinned it above the FeatureManager column's top-left corner AND pushed the whole
+    // viewport (toolbar + 3D) down by barH — the dead gap under the ribbon. It now floats over the
+    // viewport in its OWN borderless window, starting just RIGHT of the FeatureManager column's right
+    // edge (overlayColumnEdge(0)) and flush under the ribbon (band.minY), so the FM column can start
+    // at the very top of the viewport band and the viewport chrome sits flush with the ribbon bottom.
+    // Same flag set as the FM / Copilot pinned columns (floating over the docked central node, input
+    // scoped to this window, glass samples the backdrop window-independently). Falls back to the
+    // band's left edge when the FM column hasn't published an edge yet (first frame / collapsed pill).
+    // Content width (tabs + the trailing "+" button) measured up front — no window context needed,
+    // just st.docTabs + CalcTextSize — so the floating overlay window can HUG it. Sizing the window
+    // full-width would leave a huge invisible (NoBackground but input-blocking) right half that eats
+    // clicks meant for the viewport toolbar + Copilot header, which sit on the SAME top row to the
+    // right (they render clean in a screenshot but become unclickable). Same per-tab formula
+    // drawOneTab uses so band, pills, and window all agree.
+    float contentW = barH;   // the trailing "+" button (btn == barH)
+    {
+        const float padX = 12.0f * s, closeW = 18.0f * s, iconSz = 16.0f * s, iconGap = 6.0f * s;
+        for (const auto& t : st.docTabs) {
+            std::string label = t.displayTitle();
+            if (t.dirty) label += " *";
+            contentW += padX + iconSz + iconGap + ImGui::CalcTextSize(label.c_str()).x +
+                        6.0f * s + closeW + padX * 0.5f + 2.0f * s /*gap*/;
+        }
+    }
+
+    ui::OverlayBand band = ui::overlayBand();
+    bool floatingWindow = false;
+    if (band.valid) {
+        const float margin = 12.0f * s;
+        const float fmEdge = ui::overlayColumnEdge(0);
+        const float docX = (fmEdge >= 0.0f ? fmEdge : band.minX) + margin;
+        const float docY = band.minY + margin;
+        // Hug content, clamped to the Copilot column's LEFT edge (never run tabs under it). The
+        // viewport toolbar lives to the LEFT of that edge, so hugging content is what actually frees
+        // it — clamping alone would not.
+        float rightBound = ui::overlayColumnEdge(1);   // Copilot left edge
+        if (rightBound < 0.0f) rightBound = band.maxX - margin;
+        const float winW = std::max(80.0f * s,
+                                    std::min(contentW + 6.0f * s, rightBound - docX));
+        // Height hugs the band + a hair of slack so the rounded pills are not clipped.
+        const float winH = barH + ImGui::GetStyle().ItemSpacing.y + 2.0f * s;
+        availW = winW;   // the strip lays out relative to this window's content width
+        ImGui::SetNextWindowPos(ImVec2(docX, docY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        const ImGuiWindowFlags dtFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking |
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoBringToFrontOnFocus;
+        const bool dtOpen = ImGui::Begin("##DocTabsOverlay", nullptr, dtFlags);
+        ImGui::PopStyleVar(3);
+        if (!dtOpen) { ImGui::End(); return barH; }
+        floatingWindow = true;
+    }
+
     // Liquid Glass v2 port (ported from ui/imgui/src/ui/doc_tabs.cpp's drawDocTabs): the tab band
     // is now ONE Thin glass surface whose backdrop is the live blurred viewport, per-rect UV
     // projected across the FULL dockspace width (ui::glassPanel handles the projection + clamped
@@ -281,18 +342,26 @@ float drawDocTabs(AppState& st, float availW) {
     // texture so that banding cannot recur (host facts, see local://glass_host.md).
     ImVec2 origin = ImGui::GetCursorScreenPos();
     const ImGuiStyle& style = ImGui::GetStyle();
-    float bandT = origin.y, bandL = origin.x, bandR = origin.x + availW;
-    if (ImGuiDockNode* node = ImGui::GetWindowDockNode()) bandT = node->Pos.y;
+    // In the floating overlay window origin is already the strip's top-left; there is no dock node to
+    // consult (the old inline strip pulled bandT from the central node top).
+    float bandT = origin.y, bandL = origin.x;
     const float bandB = origin.y + barH + style.ItemSpacing.y;
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    // The band hugs its CONTENT (contentW measured above the Begin) instead of spanning the full
+    // window — a full-width glass slab with zero/few tabs read as a large dead strip (visual-review
+    // fix); it now also matches the hugged window footprint.
+    const float bandR = std::min(origin.x + availW, bandL + contentW + 6.0f * s);
     const ImRect bandRect(ImVec2(bandL, bandT), ImVec2(bandR, bandB));
+    // Tell the pinned glass columns where the band REALLY ends (bandB sits below band.minY +
+    // docTabStripHeight because origin.y is the central window's content cursor, not the node top)
+    // so the band never overlaps their top corners (visual-review fix).
+    ui::publishDocTabBandBottom(bandB);
     if (!ui::viewportBackdrop().valid())
-        dl->AddRectFilled(bandRect.Min, bandRect.Max, ui::Palette::toU32(pal.panelBg));
+        dl->AddRectFilled(bandRect.Min, bandRect.Max, ui::Palette::toU32(pal.panelBg),
+                          8.0f * s);
     const ui::AdaptiveSurface& surf =
         ui::adaptivePanel(ui::panelId("host_doctabs_glass"), bandRect);
-    ui::glassPanel(dl, bandRect, ui::GlassLevel::Thin, 8.0f * s, surf);
-    dl->AddLine(ImVec2(bandL, bandB - 0.5f), ImVec2(bandR, bandB - 0.5f),
-                ui::Palette::toU32(pal.border), 1.0f);
+    ui::glassPanel(dl, bandRect, ui::GlassLevel::Thin, 8.0f /*dp — glassPanel scales by uiScale*/, surf);
 
     // Explicit x-cursor placement (no SameLine/Dummy bookkeeping): each tab is drawn at the running
     // x and returns its width. The strip never wraps; very many tabs just clip at the content edge.
@@ -314,7 +383,7 @@ float drawDocTabs(AppState& st, float availW) {
         const bool hov = ImGui::IsItemHovered();
         if (hov) {
             const ImRect pill(p0, ImVec2(p0.x + btn, p0.y + btn));
-            ui::glassPanel(dl, pill, ui::GlassLevel::UltraThin, 4.0f * s, surf);
+            ui::glassPanel(dl, pill, ui::GlassLevel::UltraThin, 4.0f /*dp*/, surf);
         }
         ui::drawIconGlass(dl, "new_doc", ImVec2(p0.x + btn * 0.5f, p0.y + btn * 0.5f), 9.f * s,
                           ImGui::ColorConvertFloat4ToU32(surf.textSecondary), ui::glassIconHalo(surf));
@@ -324,6 +393,10 @@ float drawDocTabs(AppState& st, float availW) {
         // the same way via openNewDocChooser().
         if (clicked || s_openChooser) { st.wantNewDocChooser = true; s_openChooser = false; }
     }
+
+    // Close the pinned floating overlay window (the band + tabs + "+" are all drawn now). The modal
+    // prompt + deferred mutations below run at the caller's (central window) scope.
+    if (floatingWindow) ImGui::End();
 
     // ---- unsaved-changes confirmation prompt ----
     if (s_confirmCloseIdx >= 0) {
@@ -361,10 +434,9 @@ float drawDocTabs(AppState& st, float availW) {
     }
     if (!open) s_confirmCloseIdx = -1;   // modal dismissed via the title-bar X
 
-    // Reserve the strip's height in the host window's layout so the 3D image / sheet flows BELOW it
-    // (the tabs above were placed absolutely; this is what actually advances the content cursor).
-    ImGui::SetCursorScreenPos(origin);
-    ImGui::Dummy(ImVec2(availW, barH));
+    // No height reservation any more — the strip is a pinned floating overlay (fix 2), so the central
+    // window's content cursor stays at the top and the viewport chrome (toolbar + 3D) sits flush under
+    // the ribbon. The old inline strip advanced the cursor by barH with a trailing Dummy here.
 
     // ---- apply deferred actions (after all tabs were drawn) ----
     // A close that targets the active tab leaves the mirror on a neighbor, so handle close before

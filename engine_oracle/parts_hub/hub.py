@@ -1,4 +1,4 @@
-"""PartsHub — the orchestrator for aicad.parts/1 (T-P1 + T-P2).
+"""PartsHub — the orchestrator for aicad.parts/1 (T-P1 + T-P2 + T-P3).
 
 Ties together the ProviderRegistry, the FTS index, and the provider lookup.
 Bootstrap auto-registers all adapters:
@@ -10,6 +10,15 @@ Live-vendor fallback (T-P2): when the local FTS index returns no results for a
 query, any registered live-only provider (iter_records raises NotImplementedError)
 is queried directly. Results from live providers carry source:"live" and are
 NEVER indexed.
+
+Provider-overlap deduplication (T-P3, contract-additive):
+  For standard threaded hardware (fasteners / bearings / nuts / washers), the
+  BoltsAdapter (domain="fastener") and CoreFamiliesAdapter (domain="mech_family")
+  both emit records for the same designation (e.g. "M8").  After ranking, the hub:
+  1. Groups records with the same normalised designation across these two domains.
+  2. Keeps both, but promotes fastener > mech_family (canonical row first).
+  3. Injects a ``related_ids`` additive field (list[str]) on each record pointing
+     to its sibling(s).  Contract-additive per contracts/parts.md §0.
 """
 from __future__ import annotations
 
@@ -112,7 +121,7 @@ class PartsHub:
         self._ensure_index()
         results = self._index.search(query, domain=domain, limit=limit)
         if results:
-            return results
+            return _dedupe_related(results)
         # Fallback to live providers when the index has no hits.
         live_results: list[dict] = []
         for provider in self._registry.providers():
@@ -147,6 +156,102 @@ class PartsHub:
                 except Exception:  # noqa: BLE001
                     pass
         return None
+
+
+# ── Provider-overlap deduplication (T-P3 — contract-additive) ────────────────
+
+# Domains that may emit the same physical hardware designation.
+_OVERLAP_DOMAINS = frozenset({"fastener", "bearing", "mech_family"})
+
+# Priority: lower number = preferred canonical row (shown first when designation collides).
+_DOMAIN_PRIORITY: dict[str, int] = {
+    "fastener":    0,   # BOLTS catalog — authoritative for standards-designated hardware
+    "bearing":     0,   # BOLTS bearing rows share the same priority tier as fastener
+    "mech_family": 1,   # Core parametric families — instantiation recipe, not catalog record
+}
+
+
+def _normalise_desig(desig: str | None) -> str:
+    """Canonical form for same-designation grouping (strip spaces, upper-case)."""
+    if not desig:
+        return ""
+    return desig.replace(" ", "").upper()
+
+
+def _dedupe_related(results: list[dict]) -> list[dict]:
+    """Inject ``related_ids`` on overlapping-designation records and re-rank within groups.
+
+    Only touches records whose domain is in ``_OVERLAP_DOMAINS``.  Non-hardware
+    domains (ecad, section, fitting, hydraulic) pass through unchanged.
+
+    Contract-additive: ``related_ids`` is a NEW optional list[str] field on PartRecord —
+    contracts/parts.md §0 permits new optional fields without a version bump.
+    """
+    # Build a map: normalised_designation → list of (index, record) for overlap-domain records.
+    from collections import defaultdict
+    desig_groups: dict[str, list[tuple[int, dict]]] = defaultdict(list)
+    for idx, rec in enumerate(results):
+        if rec.get("domain") in _OVERLAP_DOMAINS:
+            key = _normalise_desig(rec.get("designation"))
+            if key:
+                desig_groups[key].append((idx, rec))
+
+    # For each group with >1 record, wire related_ids (additive) and sort by priority.
+    # We build a reordered result list preserving non-overlap records in their original slots.
+    if not any(len(v) > 1 for v in desig_groups.values()):
+        return results  # Fast path: nothing to do.
+
+    # Collect indices that belong to a multi-record overlap group.
+    overlap_indices: set[int] = set()
+    group_clusters: list[list[tuple[int, dict]]] = []
+    for grp in desig_groups.values():
+        if len(grp) > 1:
+            overlap_indices.update(i for i, _ in grp)
+            group_clusters.append(grp)
+
+    # Annotate related_ids on all records in each cluster.
+    for grp in group_clusters:
+        all_ids = [rec["part_id"] for _, rec in grp]
+        for _, rec in grp:
+            siblings = [pid for pid in all_ids if pid != rec["part_id"]]
+            # Shallow-copy the record so we don't mutate the index cache.
+            rec_copy = dict(rec)
+            rec_copy["related_ids"] = siblings
+            # Replace in results list in-place (we'll rebuild below).
+            # Find the record's original position and update it.
+            for j, orig in enumerate(results):
+                if orig is rec:
+                    results[j] = rec_copy
+                    break
+
+    # Re-sort overlap groups by domain priority (stable — preserves FTS order within tier).
+    for grp in group_clusters:
+        grp.sort(key=lambda t: _DOMAIN_PRIORITY.get(t[1].get("domain", ""), 99))
+
+    # Build a set of all indices that belong to any cluster, and a map from the minimum
+    # index of each cluster to its sorted record list.
+    cluster_by_first: dict[int, list[dict]] = {}
+    for grp in group_clusters:
+        first_idx = min(i for i, _ in grp)
+        cluster_by_first[first_idx] = [results[i] for i, _ in grp]
+
+    out: list[dict] = []
+    emitted_indices: set[int] = set()
+    for idx in range(len(results)):
+        if idx in overlap_indices:
+            if idx in cluster_by_first and idx not in emitted_indices:
+                # Emit the full sorted cluster at the first-member's position.
+                out.extend(cluster_by_first[idx])
+                # Mark all members of this cluster as emitted.
+                for grp in group_clusters:
+                    if min(i for i, _ in grp) == idx:
+                        emitted_indices.update(i for i, _ in grp)
+                        break
+            # Non-first cluster members: skip (already emitted above).
+        else:
+            out.append(results[idx])
+
+    return out
 
 
 def _is_live_only(provider: object) -> bool:

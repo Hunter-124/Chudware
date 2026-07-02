@@ -956,6 +956,69 @@ def cad_guide_text(topic: str = "overview") -> str:
             return ("Deliverables (spec-driven .pptx/.docx/.pdf/.xlsx with a provenance rule) ship "
                     "with the deliverables package; make_report/make_presentation/make_workbook/"
                     "render_document/list_artifacts.")
+    if topic in ("parts", "standard_parts", "standard-parts", "library", "catalog",
+                 "part_search", "part_get", "part_place", "hardware", "bom_parts"):
+        return (
+            "STANDARD-PARTS LIBRARY — search → get → place (T-P3, aicad.parts/1)\n\n"
+            "BIAS: always prefer standard parts over custom geometry for hardware.\n"
+            "Standard parts are editable, sourced, and BOM-ready out of the box.\n\n"
+            "WORKFLOW:\n"
+            "  1. part_search(query, domain?, limit?)\n"
+            "       Search the federated catalog.  Returns ranked PartRecord list.\n"
+            "       Examples:\n"
+            "         part_search('M8 socket head')         → fastener records\n"
+            "         part_search('6205')                   → ISO 6205 bearing\n"
+            "         part_search('W8x31')                  → AISC W8×31 section\n"
+            "         part_search('resistor', domain='ecad')→ KiCad resistor symbols\n"
+            "         part_search('elbow NPS1')             → piping fitting\n"
+            "         part_search('pump', domain='hydraulic')→ ISO 1219 pump\n"
+            "       Domains: fastener | bearing | mech_family | section | fitting |\n"
+            "                hydraulic | ecad\n\n"
+            "  2. part_get(part_id)\n"
+            "       Fetch the full PartRecord for a stable part_id:\n"
+            "         part_get('fastener:ISO4762:M8')       → M8 SHCS record\n"
+            "         part_get('bearing:ISO 15:6205')       → 6205 bearing record\n"
+            "       Inspect params + geometry_ref to confirm dimensions before placing.\n\n"
+            "  3. part_place(part_id, doc?, params?)\n"
+            "       Insert the part — always editable, never an opaque solid.\n\n"
+            "       Mechanical (fastener / bearing / mech_family):\n"
+            "         part_place('fastener:ISO4762:M8')\n"
+            "         part_place('fastener:ISO4762:M8', params='{\"length_mm\": 25}')\n"
+            "         → Creates a new editable part doc_id.  Use make_standard_part\n"
+            "           equivalently if you already know family/size.\n\n"
+            "       ECAD (schematic symbol):\n"
+            "         part_place('ecad:Device:R',\n"
+            "                    doc=json.dumps(sch_doc),\n"
+            "                    params='{\"pos\":{\"x\":10,\"y\":20},\"value\":\"1k\"}')\n"
+            "         → Appends sch_add_symbol op; symbol appears in doc['symbols'].\n\n"
+            "       Structural section:\n"
+            "         part_place('section:AISC:W8x31',\n"
+            "                    doc=json.dumps(struct_doc),\n"
+            "                    params='{\"kind\":\"beam\",\"length_mm\":3000}')\n"
+            "         → Appends StructuralElement to doc['elements'].\n\n"
+            "       Piping fitting:\n"
+            "         part_place('fitting:elbow:NPS1',\n"
+            "                    doc=json.dumps(piping_doc),\n"
+            "                    params='{\"type\":\"elbow\",\"nps\":1.0}')\n"
+            "         → Appends fitting record to doc['fittings'].\n\n"
+            "       Hydraulic component:\n"
+            "         part_place('hydraulic:pump:gear-1cc',\n"
+            "                    doc=json.dumps(hyd_doc),\n"
+            "                    params='{\"type\":\"pump\",\"displacement_cc_rev\":1.0}')\n"
+            "         → Appends component record to doc['components'].\n\n"
+            "DEDUPLICATION NOTE:\n"
+            "  Threaded-hardware queries may surface both fastener: and mech_family: records\n"
+            "  for the same designation.  The search ranks fastener > mech_family for\n"
+            "  standard-hardware queries, and same-designation results carry a related_ids\n"
+            "  field pointing to the sibling.  Prefer the top-ranked result; both are\n"
+            "  placeable and editable.\n\n"
+            "EDITABILITY GUARANTEE:\n"
+            "  part_place always returns {'editable': true}.  A placed part that isn't\n"
+            "  editable is a bug — report it and use part_get to inspect geometry_ref.\n\n"
+            "SOURCING:\n"
+            "  Each PartRecord carries a sourcing[] list of VendorPart dicts (aicad.sourcing/1).\n"
+            "  Use bom_rollup after placing multiple parts to get a costed BOM.\n"
+        )
     if topic in ("reverse", "re", "recognize", "recon"):
         # WS-C (wave 3) ships the recognition pipeline in a separate recon_tools module so this
         # file stays read-only w.r.t. that node's write-set; lazy-import so cad_guide("reverse")
@@ -973,7 +1036,7 @@ def cad_guide_text(topic: str = "overview") -> str:
     avail = sorted(p.stem for p in (_prompts_dir() / "shared" / "cheatsheets").glob("*.md")) \
         if (_prompts_dir() / "shared" / "cheatsheets").is_dir() else []
     return (f"No guide for {topic!r}. Topics: overview, simulation, review, intake, gsl, cam, "
-            f"narration, reverse, deliverables; or a feature cheatsheet: {avail}")
+            f"narration, parts, reverse, deliverables; or a feature cheatsheet: {avail}")
 
 
 # --------------------------------------------------------------------------- register
@@ -996,7 +1059,9 @@ def register_cad_tools(mcp: FastMCP) -> None:
         describe_scene/hover/query_adjacency — including the non-vision self-review path),
         "narration" (how to use describe_toolpaths and describe_results to get compact
         text summaries of CAM jobs and FEA/CFD results instead of raw JSON dumps),
-        "reverse" (reverse-engineering an imported STEP/mesh into an editable feature tree —
+        "parts" (standard-parts library: search→get→place workflow, standard-before-custom
+        bias, domain routing, editability guarantee, sourcing), "reverse"
+        (reverse-engineering an imported STEP/mesh into an editable feature tree —
         tools land in a later wave; call it for the current status), or a single feature's
         cheatsheet by name ("hole", "fillet", "revolve", "loft", "sweep", "shell", "chamfer",
         "pattern", "mirror", "sketch", "airfoil", "drawing", "hardware", ...).

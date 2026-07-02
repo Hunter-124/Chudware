@@ -1,12 +1,17 @@
-"""Unified parts-library MCP tools — aicad.parts/1 (T-P1 + T-P2).
+"""Unified parts-library MCP tools — aicad.parts/1 (T-P1 + T-P2 + T-P3).
 
-Exposes two tools over the federated parts hub:
+Exposes three tools over the federated parts hub:
 
 - ``part_search(query, domain?, limit?)`` — FTS5-ranked search across all indexed providers.
   T-P2: domain filter extended to section | fitting | hydraulic | ecad.
   Live vendor results (ecad_vendor) carry source:"live" in each PartRecord and are
   returned as a fallback when the local index has no hits.
 - ``part_get(part_id)`` — retrieve a single PartRecord by its stable part_id.
+- ``part_place(part_id, doc?, params?)`` — T-P3: insert a standard part into a doc,
+  routing geometry_ref to the correct domain path.  Always returns editable doc-schema
+  ops (R1 parity).  Every domain: core_family/generate_model → new mech part doc;
+  symbol_footprint → sch_add_symbol; section_profile → structural element;
+  fitting_id → piping fitting; fmu_component → hydraulic component.
 
 The hub is lazy-initialized on the first call; subsequent calls reuse the in-memory FTS index.
 No network, no keys, no core dependency for the fastener/bearing adapter (they run on the
@@ -44,7 +49,7 @@ def _err(reason: str, hint: str = "") -> str:
 
 
 def register_parts_tools(mcp: FastMCP) -> None:
-    """Register part_search and part_get MCP tools (append-only)."""
+    """Register part_search, part_get, and part_place MCP tools (append-only)."""
 
     @mcp.tool()
     def part_search(query: str, domain: str = "", limit: int = 20) -> str:
@@ -111,3 +116,64 @@ def register_parts_tools(mcp: FastMCP) -> None:
         except Exception as exc:  # noqa: BLE001
             return _err(f"part_get failed: {exc}",
                         "Check that engine_oracle/parts_hub is importable.")
+
+    @mcp.tool()
+    def part_place(part_id: str, doc: str = "", params: str = "") -> str:
+        """Place a standard part into a document — universal insertion across all domains (T-P3).
+
+        Looks up the PartRecord for ``part_id``, reads its geometry_ref.kind, and routes
+        to the correct domain insertion path.  ALWAYS returns an editable document-schema
+        op — never an opaque solid body.  Standard-before-custom: prefer part_search +
+        part_place over add_features for standard hardware.
+
+        part_id : stable part id, e.g. "fastener:ISO4762:M8", "ecad:Device:R",
+                  "bearing:ISO 15:6205", "section:AISC:W8x31", "fitting:elbow:NPS1",
+                  "hydraulic:pump:gear-1cc"
+        doc     : JSON string of the open document that receives the placement, OR "" for
+                  mechanical parts (core_family / generate_model) which create a new doc.
+        params  : optional JSON dict with domain-specific placement overrides:
+                  - mech:        {"length_mm": 25}
+                  - ecad:        {"pos": {"x": 10, "y": 20}, "value": "1k", "ref": "R1"}
+                  - structural:  {"kind": "beam", "length_mm": 3000, "material": "steel"}
+                  - piping:      {"type": "elbow", "nps": 1.0}
+                  - hydraulic:   {"type": "pump", "displacement_cc_rev": 2.5}
+
+        Returns a PlacementResult dict:
+          {ok, domain, doc_id, entity_id, editable: true, detail: {...}}
+        or {"ok": false, "reason": ..., "hint": ...} on failure.
+
+        Workflow:
+          1. part_search("M8 socket head") → pick part_id "fastener:ISO4762:M8"
+          2. part_place("fastener:ISO4762:M8") → creates editable mech part doc_id
+          3. For ECAD: part_place("ecad:Device:R", doc=json.dumps(sch_doc), params='{"pos":...}')
+        """
+        import json as _json
+
+        try:
+            from engine_oracle.parts_hub.place import place as _place
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"part_place import failed: {exc}",
+                        "Check that engine_oracle/parts_hub/place.py is present.")
+
+        # Parse doc and params from JSON strings (MCP tools only accept scalars).
+        doc_dict: dict | None = None
+        params_dict: dict | None = None
+        if doc and doc.strip():
+            try:
+                doc_dict = _json.loads(doc)
+            except Exception:  # noqa: BLE001
+                return _err("doc argument is not valid JSON.",
+                            "Pass the document as a JSON string: json.dumps(my_doc).")
+        if params and params.strip():
+            try:
+                params_dict = _json.loads(params)
+            except Exception:  # noqa: BLE001
+                return _err("params argument is not valid JSON.",
+                            "Pass params as a JSON string: '{\"pos\": {\"x\": 0, \"y\": 0}}'.")
+
+        try:
+            result = _place(part_id, doc=doc_dict, params=params_dict)
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"part_place failed: {exc}",
+                        "Check part_id with part_get first.")

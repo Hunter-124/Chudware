@@ -100,3 +100,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 
 - (none yet) Fable answers driver questions in work/questions/ directly; only decisions requiring the human (spend, credentials, merge-order exceptions, scope changes) get queued here.
 - 2026-07-02 Fable REVIEWED T-H4: LGTM merge-ready (1164+ lines, 23/23 tests, 30-check battery); answered its 3 questions on-branch; post-merge alignment note: req_join<->aicad.req/1 + unit_ranges import (non-blocking)
+- 2026-07-02 Fable REVIEWED T-F13: LGTM merge-ready as flag-gated-OFF code (8/8 tests, honest tie vs baseline on synthetic eval; real GO/NO-GO needs --count 200 regen — follow-up noted, kill-switch discipline holds)

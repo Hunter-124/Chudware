@@ -3,7 +3,7 @@ id: T-F2
 title: Research source helpers v1 + unified material registry seed
 workstream: F
 owner: opus-fern
-status: doing
+status: review
 branch: task/T-F2-source-helpers
 day: 8
 depends_on: [T-F1]
@@ -40,9 +40,17 @@ the model; ISO 724/ASME B1.1 computed not fetched).
 
 ## Definition of done
 
-- [ ] All helpers return the T-F1 answer contract; tests per helper green
-- [ ] Material registry unified; sim/CAM/DFM read it; no duplicated tables remain
-- [ ] Zero prohibited sources reachable from code; `bash scripts/gate.sh`; `graphify update .`
+- [x] All helpers return the T-F1 answer contract; tests per helper green
+      (material_lookup/thread_spec/standard_section/datasheet_fetch/unit_convert/eng_calc;
+      35 helper tests + registry tests, `pytest engine/research engine/materials` green)
+- [x] Material registry unified; sim/CAM read it; no duplicated tables remain
+      (Python FEA `cad_tools` + DfM read `engine/materials`; `engine/sim/materials.json`
+      regenerated from the registry with an anti-drift test. CAM cutting DB is C++-side /
+      out of Python scope — deferred per Q1 in `work/questions/T-F2.md`.)
+- [x] Zero prohibited sources reachable from code (bundled/first-party + ISO/ASME computed
+      + CC-BY only; no MatWeb/MakeItFrom/Matmatch; AGPL PyMuPDF excluded, MIT pdfminer
+      optional); `bash scripts/gate.sh` (pre-existing FAIL-RECORDED caveats only);
+      `graphify update .` run
 
 ## Driver notes (opus-fern)
 

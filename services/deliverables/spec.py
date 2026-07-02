@@ -156,12 +156,14 @@ def validate_and_resolve(spec: Any, expected_kind: str, template, source_refs: l
             raise DeliverableError("invalid_spec", f"outline[{i}] missing 'type'")
 
         lb_slots = set(template.load_bearing_slots(btype))
+        all_lb = template.all_slots_load_bearing(btype)
         slots_out: dict = {}
         raw_slots = blk.get("slots") or {}
         if not isinstance(raw_slots, dict):
             raise DeliverableError("invalid_spec", f"outline[{i}] 'slots' must be an object")
         for sname, sval in raw_slots.items():
-            slots_out[sname] = _resolve_slot(sname, sval, sname in lb_slots, attached, source_refs)
+            load_bearing = all_lb or sname in lb_slots
+            slots_out[sname] = _resolve_slot(sname, sval, load_bearing, attached, source_refs)
 
         rows_out: list = []
         raw_rows = blk.get("rows")
@@ -181,7 +183,13 @@ def validate_and_resolve(spec: Any, expected_kind: str, template, source_refs: l
         body = blk.get("body") or []
         if isinstance(body, str):
             body = [body]
+        # Preserve any model-authored, template-defined block fields (contract §2.4: block types
+        # are template-defined) — e.g. `images`, `expr`, `verdict`, `req_id`. `slots`/`rows` are
+        # overwritten with their resolved forms; free-prose fields survive verbatim.
+        extra = {k: v for k, v in blk.items()
+                 if k not in ("type", "heading", "body", "slots", "rows")}
         blocks.append({
+            **extra,
             "type": btype,
             "heading": blk.get("heading", ""),
             "body": list(body),

@@ -2,8 +2,8 @@
 id: T-E2
 title: 1D pipe network solver + pressure drop
 workstream: E
-owner: unassigned
-status: todo
+owner: opus-dell
+status: doing
 branch: task/T-E2-network-solve
 day: 7
 depends_on: [T-E1]
@@ -24,3 +24,13 @@ Steady-state network solve: EPANET 2.2 via WNTR (MIT/BSD, bundle freely) for wat
 
 - WNTR: https://github.com/USEPA/WNTR
 - fluids fittings module for K-factors
+
+## Driver notes (opus-dell)
+
+- Backend decision: native `fluids`+numpy/scipy nodal solver (mirrors
+  `engine/sim/circuit.py` MNA precedent), **no WNTR/EPANET dep added** — per foreman
+  addenda. Rationale + advisor sign-off request logged in `work/questions/T-E2.md` (Q1).
+- Solver: `engine/piping/solve.py` (H-equation Newton, Darcy-Weisbach + Colebrook +
+  fitting K-factors). Pump-curve CSV import + affinity scaling and the per-segment
+  pressure-drop report live in the same module. MCP `piping_solve`/`piping_report` in
+  `services/mcp/piping_tools.py`, wired append-only into `services/mcp/server.py`.

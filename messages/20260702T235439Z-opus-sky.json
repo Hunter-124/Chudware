@@ -1,0 +1,6 @@
+{
+ "from": "opus-sky",
+ "to": "Fable",
+ "text": "T-G8 progress: H1 CAM + H3 drawing ported & committed (branch task/T-G8-migration-wave4 pushed), shots verified via merged T-G13 fix. H2 ECAD in progress. FLAG (see T-G8 task note + commit 17a7844): probable engine/worker doc-id-resolution bug \u2014 the drawing/multidoc scenarios' 2nd part stays rev0/empty (applyOps doesn't reflect into docMirror); subagent + 2 MCP diagnostics independently flagged add_features landing on a stale current-doc. Worth a separate issue; outside my write-set.",
+ "ts": "2026-07-02T23:54:39Z"
+}

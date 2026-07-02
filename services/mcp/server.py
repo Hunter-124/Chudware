@@ -165,6 +165,9 @@ register_serving_tools(mcp)
 # copilot binding is T-F17.
 from mcp_server.regen_tools import register_regen_tools
 register_regen_tools(mcp)
+# Code compliance (T-D4): deterministic rule engine + agentic RAG for building-code checks.
+from mcp_server.code_compliance_tools import register_code_compliance_tools
+register_code_compliance_tools(mcp)
 
 
 def _install_clean_stdout():

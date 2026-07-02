@@ -34,20 +34,6 @@ struct ModelInfo {
     bool reasoning = true; // exposes a reasoning-effort knob
 };
 
-// config.json "provider" string <-> Settings::provider index. Local + OpenAI cloud both
-// serialize as "openai" (local adds an openai.base_url); the index distinguishes them.
-inline const char* providerConfigName(int provider) {
-    switch (provider) {
-        case PROV_ANTHROPIC: return "anthropic";
-        case PROV_OPENAI: return "openai";
-        case PROV_LOCAL: return "openai";
-        case PROV_LLAMACPP: return "llamacpp";
-        case PROV_GEMINI: return "gemini";
-        case PROV_CLOUDCOMPAT: return "openai";  // cloud OpenAI-compatible via base_url
-        default: return "openai";
-    }
-}
-
 inline const char* providerLabel(int provider) {
     switch (provider) {
         case PROV_ANTHROPIC: return "Anthropic (Claude)";
@@ -64,10 +50,6 @@ inline bool providerIsCloud(int provider) {
     return provider == PROV_ANTHROPIC || provider == PROV_OPENAI || provider == PROV_GEMINI ||
            provider == PROV_CLOUDCOMPAT;
 }
-
-// True for the cloud OpenAI-compatible API slot — the one cloud provider that also needs a
-// user-editable base URL (Alibaba DashScope, DeepSeek, etc.). Refused under offline (ITAR) mode.
-inline bool providerIsCloudCompat(int provider) { return provider == PROV_CLOUDCOMPAT; }
 
 // ---- provider/service CATEGORY keys (for Manage-models categories + bulk on/off) ----
 // A stable string identity per provider category, used by Settings::disabledProviders and the
@@ -214,12 +196,6 @@ inline bool modelSupportsReasoning(int provider, const std::string& id) {
     return false;
 }
 
-inline bool modelSupportsVision(int provider, const std::string& id) {
-    for (const auto& m : builtinModels())
-        if (m.provider == provider && m.id == id) return m.vision;
-    return provider != PROV_LLAMACPP;  // local default vision-on unless managed llama.cpp
-}
-
 // Per-model default context window when settings.contextWindow == 0 (auto).
 inline int defaultContextWindowForModel(int provider, const std::string& id) {
     std::string m = id;
@@ -274,23 +250,6 @@ inline int reasoningEffortOptions(int provider, const std::string& id,
         outValues[i] = src[i].value;
     }
     return out;
-}
-
-// Legacy flat list (Settings modal fallback).
-inline const char* const* reasoningEffortValues(int* n) {
-    static const char* kVals[] = {"off", "low", "medium", "high", "max"};
-    if (n) *n = 5;
-    return kVals;
-}
-inline const char* const* reasoningEffortLabels(int* n) {
-    static const char* kLabels[] = {"Off", "Low", "Medium", "High", "Max"};
-    if (n) *n = 5;
-    return kLabels;
-}
-inline int reasoningEffortToIndex(const std::string& v) {
-    int n = 0; auto vals = reasoningEffortValues(&n);
-    for (int i = 0; i < n; ++i) if (v == vals[i]) return i;
-    return 3;  // default High
 }
 
 }  // namespace ui

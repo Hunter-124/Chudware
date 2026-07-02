@@ -1143,11 +1143,6 @@ void setRibbonCallback(std::function<void(const char* cmd_id)> cb) {
     s_RibbonCb = std::move(cb);
 }
 
-float ribbonHeight() {
-    float s = ui::uiScale;
-    return (kTabH + kBodyH + kBottomPad) * s;
-}
-
 void setRibbonActiveCmd(const char* cmd_id) {
     s_activeCmd = (cmd_id && *cmd_id) ? cmd_id : "";
 }

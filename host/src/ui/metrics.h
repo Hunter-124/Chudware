@@ -8,7 +8,7 @@
 // proper scaling. All accessors return DPI-scaled pixels (logical × ui::uiScale).
 //
 // Usage:
-//   ImGui::Indent(ui::metrics::treeIndent());
+//   ImGui::SetNextItemWidth(ui::metrics::pmLabelCol());
 //   ImGui::SameLine(0, ui::metrics::U(1));            // a 4px grid gap
 //   dl->AddLine(a, b, col, ui::metrics::stroke(2));   // hairline-safe, never < 1px
 //
@@ -34,32 +34,15 @@ inline float rounding(float logicalRadius) {                             // corn
 }
 
 // ---- icon display tiers (logical px) ----------------------------------------------------------
-inline float iconTree()    { return px(16.0f); }   // every tree/header/folder/feature row icon
-inline float iconToolbar() { return px(18.0f); }   // toolbar glyph inside a 24px button
 inline float iconHeader()  { return px(20.0f); }   // PM / panel header icon
-inline float iconRibbonBig() { return px(32.0f); } // ribbon big-button icon
-
-// ---- FeatureManager tree / left pane ----------------------------------------------------------
-inline float treeIndent()  { return px(14.0f); }   // nested-entity indent step
-inline float treeToolBtn() { return px(24.0f); }   // square toolbar icon button
 
 // ---- PropertyManager forms --------------------------------------------------------------------
 inline float pmLabelCol()  { return px(116.0f); }  // fixed label column width (two-column rows)
 inline float pmOkBtn()     { return px(28.0f); }   // OK / Cancel button size
 
-// ---- ribbon -----------------------------------------------------------------------------------
-inline float ribbonTabH()       { return px(28.0f); }
-inline float ribbonBigBtnW()    { return px(52.0f); }   // big-button min width
-inline float ribbonBigBtnMaxW() { return px(96.0f); }   // big-button max width
-inline float ribbonBodyH()      { return px(100.0f); }
-inline float ribbonSmRowH()     { return px(22.0f); }
-inline float ribbonChevron()    { return px(20.0f); }   // overflow chevron reserve
-
 // ---- bars -------------------------------------------------------------------------------------
 inline float titleFramePadX() { return px(14.0f); }
 inline float titleFramePadY() { return px(12.0f); }
-inline float statusBarPadX()  { return px(14.0f); }
-inline float statusBarPadY()  { return px(5.0f); }
 
 // ---- pinned Copilot column default/min width (PIXELS; consumed by legacy_chat drawAIPanel) -----
 inline float dockRightTarget() { return px(300.0f); }
@@ -68,9 +51,6 @@ inline float dockRightMin()    { return px(200.0f); }
 // ---- overlay pills / chips (viewport HUD, sketch overlays, legend, view_selector tooltips) ------
 // Recurring pattern: a rounded translucent rect with a text label. See docs/GUI_SIZING_FIXPLAN.md.
 inline float chipRound()   { return rounding(6.0f); }   // standard overlay pill corner
-inline float chipRoundSm() { return rounding(4.0f); }
-inline float chipPadX()    { return px(12.0f); }        // pill horizontal text inset
-inline float chipPadY()    { return px(5.0f); }         // pill vertical text inset
 
 // ---- assembly panel forms (asm_panels.cpp) ----------------------------------------------------
 inline float asmBtnW()         { return px(90.0f); }    // Add/Close/Insert/Collapse buttons
@@ -85,17 +65,9 @@ inline float ribbonSmSplitInset(){ return px(2.0f); }        // small-button + t
 // ---- AI Copilot pane (legacy_chat.cpp) --------------------------------------------------------
 inline float copilotBtnH()        { return px(32.0f); }   // primary send / build button height
 inline int   copilotInputMaxLines(){ return 6; }          // prompt box grows to N lines, then scrolls
-inline float copilotChipPadX()    { return px(8.0f); }    // mode-pill / chip horizontal padding
-inline float copilotChipPadY()    { return px(4.0f); }    // mode-pill / chip vertical padding
 inline float copilotThumbW()      { return px(220.0f); }  // iteration contact-sheet thumbnail width
-inline float copilotCodeH()       { return px(140.0f); }  // build123d code editor height
-inline float copilotConsoleH()    { return px(160.0f); }  // folded Console body height
 inline float copilotProseMaxH()   { return px(150.0f); }  // thoughts / prose scroll cap
 inline float copilotDiffMaxH()    { return px(220.0f); }  // diff / code view scroll cap
-
-// ---- sketch canvas glyphs (sketch_mode.cpp, screen-px draw-list art) --------------------------
-inline float sketchHandleR()    { return px(3.0f); }    // entity endpoint / handle dot radius
-inline float sketchHoverRingR() { return px(6.0f); }    // hover highlight ring radius
 
 }  // namespace metrics
 }  // namespace ui

@@ -22,9 +22,6 @@ float   uiScale     = 1.0f;
 static ImVec4 rgba(float r, float g, float b, float a = 1.0f) {
     return ImVec4(r, g, b, a);
 }
-static ImVec4 rgb8(int r, int g, int b, float a = 1.0f) {
-    return ImVec4(r / 255.0f, g / 255.0f, b / 255.0f, a);
-}
 static void set4(float dst[4], float r, float g, float b, float a = 1.0f) {
     dst[0]=r; dst[1]=g; dst[2]=b; dst[3]=a;
 }
@@ -61,10 +58,6 @@ static void fillDark(Palette& p) {
     set4(p.frameBg,       0.129f,0.149f,0.184f, 1);
     set4(p.frameBgHovered,0.165f,0.192f,0.235f, 1);
     set4(p.frameBgActive, 0.192f,0.224f,0.271f, 1);
-    // tree
-    set4(p.treeRow,       0,0,0, 0);
-    set4(p.treeRowAlt,    0,0,0, 0.04f);
-    set4(p.treeRowSelected,0.176f,0.831f,0.749f,0.18f);
     // viewport — C25: light studio gradient in BOTH themes (SolidWorks look)
     set4(p.viewportTop,   0.957f,0.965f,0.976f, 1);   // #F4F6F9
     set4(p.viewportMid,   0.851f,0.867f,0.894f, 1);   // #D9DDE4
@@ -125,8 +118,6 @@ static void fillDark(Palette& p) {
     set4(p.codeBg,     0.055f,0.065f,0.085f, 1);
     set4(p.proseBg,    0.085f,0.100f,0.130f, 1);
     set4(p.proseText,  0.780f,0.820f,0.880f, 1);
-    set4(p.stepCardBg, 0.082f,0.094f,0.118f, 1);
-    set4(p.planCardBg, 0.071f,0.102f,0.110f, 1);
     set4(p.setupWarnBg,0.200f,0.130f,0.100f, 1);
     set4(p.diffDefault,0.780f,0.820f,0.880f,1);
     set4(p.diffHdr,    0.600f,0.660f,0.740f,1);
@@ -140,8 +131,6 @@ static void fillDark(Palette& p) {
     // iteration badge
     set4(p.iterBuilt, 0.600f,0.780f,0.950f,1);
     // chat
-    set4(p.userBubbleBg,    0.176f,0.831f,0.749f,0.07f);
-    set4(p.userBubbleBorder,0.176f,0.831f,0.749f,0.22f);
     set4(p.assistantName,   0.820f,0.860f,0.920f,1);
     set4(p.errSystem,       0.961f,0.600f,0.502f,1);
     set4(p.errCad,          0.929f,0.800f,0.561f,1);
@@ -159,8 +148,7 @@ static void fillDark(Palette& p) {
     // tree (feature-manager rows)
     set4(p.treeHover,      0.176f, 0.831f, 0.749f, 0.10f);  // accent-tinted hover wash
     set4(p.treeSection,    0.620f, 0.660f, 0.720f, 1.0f);   // muted section-header label
-    // copilot blocks (chat thinking / action cards)
-    set4(p.blockThinkBg,   0.071f, 0.082f, 0.106f, 0.90f);  // semi-transparent thinking block
+    // copilot blocks (chat action cards)
     set4(p.blockActionBg,  0.094f, 0.110f, 0.141f, 0.96f);  // near-opaque action card
 }
 
@@ -204,10 +192,6 @@ static void fillLight(Palette& p) {
     set4(p.frameBg,       0.949f,0.949f,0.949f, 1);
     set4(p.frameBgHovered,0.878f,0.918f,0.980f, 1);
     set4(p.frameBgActive, 0.800f,0.867f,0.961f, 1);
-    // tree
-    set4(p.treeRow,       0,0,0, 0);
-    set4(p.treeRowAlt,    0,0,0, 0.025f);
-    set4(p.treeRowSelected,0.000f,0.471f,0.843f,0.18f);
     // viewport — C25: same light studio gradient as dark theme (SolidWorks look)
     set4(p.viewportTop,   0.957f,0.965f,0.976f, 1);   // #F4F6F9
     set4(p.viewportMid,   0.851f,0.867f,0.894f, 1);   // #D9DDE4
@@ -269,8 +253,6 @@ static void fillLight(Palette& p) {
     set4(p.codeBg,     0.933f,0.941f,0.957f, 1);    // #EEF0F4
     set4(p.proseBg,    0.949f,0.953f,0.965f, 1);
     set4(p.proseText,  0.235f,0.259f,0.318f, 1);
-    set4(p.stepCardBg, 0.957f,0.961f,0.969f, 1);
-    set4(p.planCardBg, 0.929f,0.953f,0.980f, 1);    // light blue tint for plan card
     set4(p.setupWarnBg,0.980f,0.949f,0.886f, 1);    // pale amber
     set4(p.diffDefault,0.118f,0.137f,0.196f,1);
     set4(p.diffHdr,    0.353f,0.400f,0.467f,1);
@@ -284,8 +266,6 @@ static void fillLight(Palette& p) {
     // iteration badge
     set4(p.iterBuilt, 0.100f,0.420f,0.780f,1);   // deeper blue on light bg
     // chat
-    set4(p.userBubbleBg,    0.000f,0.471f,0.843f,0.06f);
-    set4(p.userBubbleBorder,0.000f,0.471f,0.843f,0.25f);
     set4(p.assistantName,   0.118f,0.137f,0.196f,1);
     set4(p.errSystem,       0.706f,0.118f,0.118f,1);
     set4(p.errCad,          0.627f,0.412f,0.000f,1);
@@ -303,8 +283,7 @@ static void fillLight(Palette& p) {
     // tree (feature-manager rows)
     set4(p.treeHover,      0.000f, 0.471f, 0.843f, 0.08f);  // SW-blue hover wash (lower alpha)
     set4(p.treeSection,    0.357f, 0.384f, 0.439f, 1.0f);   // darker grey section-header label
-    // copilot blocks (chat thinking / action cards)
-    set4(p.blockThinkBg,   0.880f, 0.900f, 0.930f, 0.92f);  // semi-transparent thinking block
+    // copilot blocks (chat action cards)
     set4(p.blockActionBg,  0.930f, 0.940f, 0.960f, 0.96f);  // near-opaque action card
 }
 

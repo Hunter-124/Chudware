@@ -58,11 +58,6 @@ struct Palette {
     float frameBgHovered[4]= {0.165f,0.192f,0.235f, 1};
     float frameBgActive[4] = {0.192f,0.224f,0.271f, 1};
 
-    // ---- tree rows ----
-    float treeRow[4]       = {0.000f,0.000f,0.000f, 0.0f};  // transparent (use panelBg)
-    float treeRowAlt[4]    = {0.000f,0.000f,0.000f, 0.04f}; // very subtle stripe
-    float treeRowSelected[4]= {0.176f,0.831f,0.749f, 0.18f};
-
     // ---- viewport ----
     // C25: the 3D viewport is light in BOTH themes (SolidWorks studio look).
     float viewportTop[4]   = {0.957f,0.965f,0.976f, 1};   // bg gradient top    (#F4F6F9)
@@ -136,13 +131,11 @@ struct Palette {
     // ---- code / diff ----
     float chipBg[4]        = {0.176f,0.831f,0.749f, 0.30f};
     float codeBg[4]        = {0.055f,0.065f,0.085f, 1};
-    // NOTE: proseBg/stepCardBg are ≈ the Copilot pane's dark base (windowBg ~0.082) since the panes
-    // went opaque-dark, so these cards now read by their BORDER, not fill contrast. If chat content
-    // ever looks flat, lighten these ~0.03 above windowBg so the cards regain a visible surface.
+    // NOTE: proseBg is ≈ the Copilot pane's dark base (windowBg ~0.082) since the panes
+    // went opaque-dark, so prose cards now read by their BORDER, not fill contrast. If chat
+    // content ever looks flat, lighten ~0.03 above windowBg so the cards regain a surface.
     float proseBg[4]       = {0.085f,0.100f,0.130f, 1};
     float proseText[4]     = {0.780f,0.820f,0.880f, 1};
-    float stepCardBg[4]    = {0.082f,0.094f,0.118f, 1};
-    float planCardBg[4]    = {0.071f,0.102f,0.110f, 1};
     float setupWarnBg[4]   = {0.200f,0.130f,0.100f, 1};
 
     float diffDefault[4]   = {0.780f,0.820f,0.880f, 1};
@@ -160,8 +153,6 @@ struct Palette {
     float iterBuilt[4]     = {0.600f,0.780f,0.950f, 1};   // "built" in-progress badge
 
     // ---- chat ----
-    float userBubbleBg[4]  = {0.176f,0.831f,0.749f, 0.07f};
-    float userBubbleBorder[4]= {0.176f,0.831f,0.749f, 0.22f};
     float assistantName[4] = {0.820f,0.860f,0.920f, 1};
     float errSystem[4]     = {0.961f,0.600f,0.502f, 1};
     float errCad[4]        = {0.929f,0.800f,0.561f, 1};
@@ -195,10 +186,8 @@ struct Palette {
     float treeHover[4]      = {0.176f, 0.831f, 0.749f, 0.10f};
     float treeSection[4]    = {0.620f, 0.660f, 0.720f, 1.0f};
 
-    // ---- copilot blocks (chat thinking / action cards) ----
-    // blockThinkBg:  thinking-block background — semi-transparent, darker than the card.
+    // ---- copilot blocks (chat action cards) ----
     // blockActionBg: action-card background — near-opaque so structured content reads clearly.
-    float blockThinkBg[4]   = {0.071f, 0.082f, 0.106f, 0.90f};
     float blockActionBg[4]  = {0.094f, 0.110f, 0.141f, 0.96f};
 
     // Helper: convert float[4] to ImU32 (for draw-list calls).

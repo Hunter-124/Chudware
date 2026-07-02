@@ -15,6 +15,11 @@ pillow==12.2.0
 # headless rendering
 pyvista==0.48.4
 vtk==9.3.1
+# vision & capture (Pillar 10 v1) — image ingestion + ArUco/ChArUco fiducial metrology.
+# OpenCV CORE only (ArUco lives in objdetect since 4.7; NO opencv-contrib, NO GPU). Apache-2.0,
+# license-clean per contracts/licenses.md. Optional at runtime: engine.vision + the MCP vision
+# tools degrade to a contract-shaped {ok:false,reason,hint} when it is not provisioned.
+opencv-python-headless==4.11.0.86
 # interfaces
 mcp==1.27.2
 # built-in agent provider adapters

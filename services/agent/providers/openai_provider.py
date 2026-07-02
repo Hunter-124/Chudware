@@ -51,7 +51,8 @@ class OpenAIProvider(Provider):
         if part["type"] == "text":
             return {"type": "text", "text": part["text"]}
         data = base64.standard_b64encode(Path(part["path"]).read_bytes()).decode("utf-8")
-        return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}}
+        mime = part.get("mime", "image/png")
+        return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
 
     def _message(self, role: str, parts: list[dict]) -> dict:
         # Use plain-string content for text-only messages — the most broadly compatible

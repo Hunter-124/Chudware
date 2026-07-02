@@ -30,7 +30,7 @@ class AnthropicProvider(Provider):
         data = base64.standard_b64encode(Path(part["path"]).read_bytes()).decode("utf-8")
         return {
             "type": "image",
-            "source": {"type": "base64", "media_type": "image/png", "data": data},
+            "source": {"type": "base64", "media_type": part.get("mime", "image/png"), "data": data},
         }
 
     def complete(self, system: str, messages: list[dict], max_tokens: int = 8000) -> str:

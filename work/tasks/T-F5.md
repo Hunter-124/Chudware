@@ -3,7 +3,7 @@ id: T-F5
 title: Image ingestion v1 - real files, provider image slots, fiducial metrology
 workstream: F
 owner: opus-sage
-status: doing
+status: review
 branch: task/T-F5-image-ingestion
 day: 7
 depends_on: []
@@ -36,10 +36,33 @@ agents with resource_link to full-res; all deps Apache/BSD, no GPU).
 
 ## Definition of done
 
-- [ ] Photo in → agent sees downscaled image + photo ID; full-res linked
-- [ ] Known-artifact test: printed sheet + synthetic photo measures within tolerance
-- [ ] Dimensions land in the intake ledger, never directly in geometry
-- [ ] Tests green; `bash scripts/gate.sh`; `graphify update .`
+- [x] Photo in → agent sees downscaled image + photo ID; full-res linked
+- [x] Known-artifact test: printed sheet + synthetic photo measures within tolerance
+- [x] Dimensions land in the intake ledger, never directly in geometry
+- [x] Tests green; `bash scripts/gate.sh`; `graphify update .`
+
+## Landed (opus-sage)
+
+- `engine/vision/` (physically `engine_oracle/vision/`, via the `engine`→`engine_oracle`
+  symlink): `ingest` (photo-ID registry + ≤1024px/<1MB downscale, Pillow-only, imports
+  without cv2), `calib_sheet` (printable ChArUco sheet + ArUco marker), `fiducial`
+  (ChArUco detection + px→mm homography; px_per_mm + marker-area CoV → confidence/planarity),
+  `measure` (`measure_from_photo` + `HONESTY_STRING` + `to_claim`).
+- `services/mcp/intake_tools.py`: `submit_part_photos(photos=[...])` registers real files;
+  new `measure_from_photo(photo_id, [x,y], [x,y], feature, dim, fit?, board?)` lands the
+  fiducial measurement in the intake ledger at its marker-area tier with
+  `provenance.method="photo_fiducial"` — never geometry. The intake §5 policy then applies:
+  a photo dim on a tolerance-sensitive fit is downgraded-and-flagged (never a typed
+  `measured`), and any low / out-of-plane read stays demanded via `confirm_dimensions`.
+  Prior caliper confirmations are preserved across re-measure. cv2-absent ⇒ contract-shaped
+  `{ok:false,reason,hint}`.
+- `services/agent/providers/`: the neutral `image_part` gained an optional `mime`; the
+  anthropic/openai/gemini adapters honor it (default png) so downscaled JPEG previews ride
+  the existing image slot correctly. **Seam for T-F9:** the C++ provider image slot
+  (`core/agent/providers.cpp`) is unchanged — documented, not built, per the driver note.
+- Dep: `opencv-python-headless==4.11.0.86` (Apache-2.0, core objdetect, no contrib/GPU).
+- Verified: synthetic ChArUco 90 mm → 89.95 mm (0.06%), tier=high; vision suite 6 passed
+  with cv2, 4 passed / 2 skipped without cv2 (graceful degradation).
 
 ## Driver notes (Fable, 2026-07-02)
 

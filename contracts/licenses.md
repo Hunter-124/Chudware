@@ -51,6 +51,8 @@
 | pyamg (M6, optional) | MIT | AMG preconditioner | ok |
 | **python-solvespace** (optional backend) | **GPL-3** | sketch solver alternative | **NOT bundled by default**; in-house `nsolve` is primary. If a user enables it, it installs into their runtime venv on demand with a license notice |
 | numba (optional, M7 perf) | BSD-2 | LBM JIT | ok if added |
+| opencv-python-headless (T-F5) | Apache-2.0 | ChArUco/ArUco fiducial detection + px→mm homography | ok |
+| Pillow (T-F5 direct dep) | MIT-CMU | photo ingestion downscale pipeline (engine.vision.ingest) | ok |
 
 Rules:
 - Adding any dependency requires a row here in the same change.

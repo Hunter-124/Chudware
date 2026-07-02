@@ -32,7 +32,7 @@ Day 1 for the DAG orchestrator covers two separable deliverables: (AM) freezing 
 
 ## Definition of done
 
-- [ ] `contracts/dag_schema.md` exists, all required fields documented, workstream leads have confirmed no blockers
+- [x] `contracts/dag_schema.md` exists, all required fields documented, workstream leads have confirmed no blockers
 - [ ] `services/dag/` package importable with `from services.dag import executor`
 - [ ] `executor.run()` can execute a two-node test graph and write a checkpoint SQLite file
 - [ ] Smoke-test passes: `python -m pytest services/dag/test_executor.py -q`

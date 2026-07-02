@@ -755,6 +755,67 @@ def test_m5_placement_rows_excludes_header() -> None:
     print(f"  PASS: Placement CSV {n_newlines} newlines, {n_data} data rows; MCP rows={mcp_rows}")
 
 
+# ── Issue #3: MPN column must carry through to the BOM ───────────────────────
+
+def test_bom_mpn() -> None:
+    """Regression (issue #3): an MPN carried on a footprint must appear in the BOM,
+    and parts sharing value+footprint but differing in MPN must be distinct rows."""
+    print("--- BOM MPN tests ---")
+
+    def _fp(fid: str, ref: str, value: str, *, fields=None, mpn_top=None) -> dict:
+        fp = {
+            "id": fid, "fpid": "Resistor_SMD:R_0603_1608Metric",
+            "ref": ref, "value": value, "pos": [0.0, 0.0], "angle": 0.0,
+            "side": "top", "attr": "smd", "pads": [], "graphics": [],
+            "model_3d": None, "linked_symbol": None,
+        }
+        if fields is not None:
+            fp["fields"] = fields
+        if mpn_top is not None:
+            fp["mpn"] = mpn_top
+        return fp
+
+    board = new_board("MpnBoard")
+    board["nets"] = [{"name": "GND", "class": "default"}]
+    board["footprints"] = [
+        _fp("f1", "R1", "10k", fields={"MPN": "RC0603FR-0710KL"}),
+        _fp("f2", "R2", "10k", fields={"MPN": "RC0603FR-0710KL"}),  # same MPN -> groups with R1
+        _fp("f3", "R3", "10k", fields={"MPN": "AC0603FR-0710KL"}),  # diff MPN -> own row
+        _fp("f4", "R4", "1k", mpn_top="RC0603FR-071KL"),            # MPN as top-level key
+        _fp("f5", "R5", "1k"),                                       # no MPN -> stays empty
+    ]
+
+    reader = csv.DictReader(io.StringIO(write_bom(board, fmt="csv")))
+    rows = {tuple(sorted(r["Refs"].split(","))): r for r in reader}
+
+    # R1+R2 share value+MPN -> one grouped row that actually carries the MPN.
+    r12 = rows.get(("R1", "R2"))
+    assert r12 is not None, f"R1+R2 should group; got rows {list(rows)}"
+    assert r12["MPN"] == "RC0603FR-0710KL", f"grouped MPN dropped: {r12['MPN']!r}"
+
+    # R3 shares value+footprint with R1/R2 but has a different MPN -> its own row.
+    r3 = rows.get(("R3",))
+    assert r3 is not None, f"R3 (distinct MPN) should not fold into R1+R2; got {list(rows)}"
+    assert r3["MPN"] == "AC0603FR-0710KL", f"R3 MPN wrong: {r3['MPN']!r}"
+
+    # R4 carries MPN as a top-level footprint key.
+    r4 = rows.get(("R4",))
+    assert r4 is not None and r4["MPN"] == "RC0603FR-071KL", f"R4 top-level mpn not emitted: {r4}"
+
+    # R5 has no MPN -> empty (backward compatible with the footprint-fallback consumer).
+    r5 = rows.get(("R5",))
+    assert r5 is not None and r5["MPN"] == "", f"R5 should have empty MPN, got {r5['MPN']!r}"
+
+    # JSON output carries the same MPN values.
+    jrows = {r["Refs"]: r for r in json.loads(write_bom(board, fmt="json"))}
+    assert jrows["R1,R2"]["MPN"] == "RC0603FR-0710KL"
+    assert jrows["R4"]["MPN"] == "RC0603FR-071KL"
+
+    print("  PASS: MPN from fields dict reaches the BOM")
+    print("  PASS: distinct MPNs split into separate rows")
+    print("  PASS: top-level mpn key emitted; absent MPN stays empty; JSON parity")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -771,6 +832,8 @@ def main() -> None:
     test_m5_bom_rows_excludes_header()
     print()
     test_m5_placement_rows_excludes_header()
+    print()
+    test_bom_mpn()
     print("\n=== ALL PASS ===")
 
 

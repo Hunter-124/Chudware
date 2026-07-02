@@ -64,8 +64,18 @@ def _group_footprints(board: dict, exclude_dnp: bool = True) -> list[dict]:
         if exclude_dnp and dnp:
             continue
 
-        mpn = fields.pop("MPN", fields.pop("mpn", ""))
-        key = (value, fpid, frozenset(fields.items()))
+        # MPN is a standard column, so it was excluded from `fields` above; read it
+        # from the footprint's top-level `mpn` or the raw fields dict (case-insensitive)
+        # so an MPN carried on the source symbol actually reaches the BOM. Include it in
+        # the group key so parts sharing value+footprint but differing in MPN stay
+        # distinct rows (each MPN is a distinct purchasable part for pricing).
+        mpn = str(fp.get("mpn", "") or "")
+        if not mpn and isinstance(raw_fields, dict):
+            for _k, _v in raw_fields.items():
+                if _k.lower() == "mpn":
+                    mpn = str(_v)
+                    break
+        key = (value, fpid, mpn, frozenset(fields.items()))
 
         groups[key].append(ref)
         if key not in group_data:

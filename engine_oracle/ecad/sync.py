@@ -196,6 +196,10 @@ def _new_footprint(board: dict, comp: dict, fpdef: dict, place_xy: list[float],
         "graphics": copy.deepcopy(fpdef.get("graphics", []) or []),
         "attr": fpdef.get("attr", "smd"),
         "linked_symbol": comp.get("sym", ""),
+        # Carry the symbol's user fields (MPN, tolerance, etc.) onto the footprint so
+        # fab outputs (BOM) and downstream pricing can read them. The symbol is the
+        # source of truth for these; the update branch below refreshes them on re-sync.
+        "fields": dict(comp.get("fields", {}) or {}),
     }
 
 
@@ -283,6 +287,15 @@ def update_board_from_sch(board: dict, netlist: dict, *, library: Any = None,
             if sym_id and fp.get("linked_symbol") != sym_id:
                 fp["linked_symbol"] = sym_id
                 dirty = True
+            # Refresh symbol-derived user fields (MPN, tolerance, ...) — symbol wins.
+            # Merge (not replace) so any footprint-only field is preserved.
+            comp_fields = dict(comp.get("fields", {}) or {})
+            if comp_fields:
+                merged = dict(fp.get("fields", {}) or {})
+                merged.update(comp_fields)
+                if merged != (fp.get("fields") or {}):
+                    fp["fields"] = merged
+                    dirty = True
             changed, bound = _bind_pads(fp.get("pads", []), comp_pins, work)
             report["nets_bound"] += bound
             if changed or dirty:

@@ -323,8 +323,7 @@ float drawDocTabs(AppState& st, float availW) {
         const ImGuiWindowFlags dtFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking |
             ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings |
-            ImGuiWindowFlags_NoBringToFrontOnFocus;
+            ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings;
         const bool dtOpen = ImGui::Begin("##DocTabsOverlay", nullptr, dtFlags);
         ImGui::PopStyleVar(3);
         if (!dtOpen) { ImGui::End(); return barH; }

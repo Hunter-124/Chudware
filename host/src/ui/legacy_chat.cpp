@@ -1263,7 +1263,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(h, h));
         ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
     }
-    ImGui::PushFont(st.fonts.h2);
+    ImGui::PushFont(st.fonts.medium);
     ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
     ImGui::TextUnformatted("AI-CAD Copilot");
     ImGui::PopStyleColor();

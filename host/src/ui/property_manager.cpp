@@ -2378,9 +2378,17 @@ void PropertyManager::drawBody(AppState& st) {
 
         ImGui::Spacing();
         if (aiBusy_) ImGui::BeginDisabled();
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.20f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+            ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.35f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+            ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.50f));
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
         if (ImGui::Button(aiBusy_ ? "AI is selecting..." : "Select with AI", ImVec2(-1, 0))) {
             requestAiAssist(st);
         }
+        ImGui::PopStyleColor(4);
         if (aiBusy_) ImGui::EndDisabled();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Ask AI to fill safe visible fields or activate the next reference well");

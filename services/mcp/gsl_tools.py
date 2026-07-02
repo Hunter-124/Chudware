@@ -513,6 +513,34 @@ def _scene_caption(doc_id: str, views: list) -> str:
     return " ".join(parts)
 
 
+# ================================================================ shared fit/clearance formatter (T-F8)
+
+
+def _format_fit(fit: dict | None) -> str:
+    """Render the kernel's fit/interference report as narration text (contracts/narration.md).
+
+    Shared single home for both the agent build loop (services/agent/loop.py imports this)
+    and the GSL narration layer (describe_assembly). Input shape:
+      {summary, interferences:[{a,b,volume}], clearances:[{a,b,distance}]}.
+    Returns "" when fit is None or empty.
+    """
+    if not fit:
+        return ""
+    lines = [f"FIT REPORT: {fit.get('summary', '')}"]
+    for it in fit.get("interferences", []):
+        lines.append(f"  INTERFERENCE  {it['a']} <-> {it['b']}: {it['volume']:.2f} mm^3 overlap")
+    for cl in fit.get("clearances", []):
+        lines.append(f"  clearance     {cl['a']} <-> {cl['b']}: {cl['distance']:.2f} mm gap")
+    if fit.get("interferences"):
+        lines.append("  -> If that overlap is NOT an intended press-fit, fix it: REPOSITION one "
+                     "part (change its Pos along the axis where the bodies overlap) or CUT a "
+                     "matching opening/pocket in the other part so the inserted part has room. "
+                     "A part placed AT a wall coordinate overlaps that wall - offset it by at "
+                     "least half its own thickness plus the wall thickness to sit flush outside, "
+                     "or place it in an actual gap/opening.")
+    return "\n".join(lines)
+
+
 # ================================================================ narration helpers (T-F7)
 
 
@@ -866,6 +894,357 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
     return _dumps({"ok": True, "text": "\n".join(lines)})
 
 
+# ================================================================ narration helpers (T-F8)
+
+
+def _describe_assembly_text(doc_id: str) -> str:
+    """Narrate an assembly's world placement, fit/clearance, and mate summary.
+
+    Data sources (in call order):
+    1. asm_world_bodies  — body names, placements, bounding boxes
+    2. eval_interference — pairwise clash (volume) and gap (distance) data
+    3. doc_solve_mates   — top-level DOF/converged summary string (best-effort)
+
+    Numbers narrated verbatim from the tool payloads — never recomputed.
+    """
+    # 1. World-placed bodies
+    try:
+        wb_r = cb.call("asm_world_bodies", {"doc_id": doc_id, "explode": False})
+    except Exception as e:  # noqa: BLE001
+        return _dumps({"ok": False, "error": f"asm_world_bodies failed: {e}"})
+
+    bodies = wb_r.get("bodies", [])
+    is_multi = wb_r.get("multibody_part", False)
+    n = len(bodies)
+
+    if n == 0:
+        return _dumps({"ok": True, "text":
+                       "No bodies found in this document — "
+                       "add components (assembly) or features (part) first."})
+
+    doc_kind = "multi-body part" if is_multi else "assembly"
+    lines = [f'Assembly "{doc_id}" — {n} component(s) / bod(y/ies) [{doc_kind}]']
+
+    # 2. Per-body placement narrative
+    lines.append("\nComponent placement (world frame):")
+    for b in bodies:
+        name = b.get("name") or b.get("component") or "?"
+        bbox = b.get("bbox") or {}
+        bmin = bbox.get("min", [None, None, None])
+        bmax = bbox.get("max", [None, None, None])
+        bsize = bbox.get("size", [None, None, None])
+
+        def _coord(v):
+            return f"{v:.3g}" if isinstance(v, (int, float)) else "?"
+
+        if all(v is not None for v in bsize):
+            size_txt = (f"{_coord(bsize[0])} × {_coord(bsize[1])} × {_coord(bsize[2])} mm")
+        else:
+            size_txt = "?"
+        if all(v is not None for v in (bmin[0], bmin[1], bmin[2])):
+            origin_txt = (f"origin [{_coord(bmin[0])}, {_coord(bmin[1])}, {_coord(bmin[2])}]")
+        else:
+            origin_txt = "origin ?"
+        lines.append(f"  {name}: {size_txt}, {origin_txt}  (source: asm_world_bodies)")
+
+    # 3. Solve/DOF summary (best-effort — doc_solve_mates returns a status string)
+    try:
+        sm_r = cb.call("doc_solve_mates", {"doc_id": doc_id})
+        status = (sm_r.get("rebuild") or {}).get("doc_status") or sm_r.get("status") or ""
+        if status:
+            lines.append(f"\nMate solve: {status}  (source: doc_solve_mates)")
+        else:
+            lines.append("\nMate solve: solve completed (DOF detail not available via read RPC — "
+                         "call solve_mates for the live result)")
+    except Exception:  # noqa: BLE001
+        lines.append("\nMate solve: not available for this document type")
+
+    # 4. Interference / clearance (best-effort)
+    try:
+        if_r = cb.call("eval_interference", {"doc_id": doc_id,
+                                             "include_coincident": False,
+                                             "min_clearance_mm": 0.0})
+        fit_text = _format_fit(if_r)
+        if fit_text:
+            lines.append("")
+            lines.extend(fit_text.splitlines())
+        elif not if_r.get("interferences"):
+            n_pairs = len(if_r.get("clearances", []))
+            lines.append(f"\nFit: no interference detected ({n_pairs} clearance pair(s))  "
+                         "(source: eval_interference)")
+    except Exception:  # noqa: BLE001
+        lines.append("\nFit/clearance: not available for this document")
+
+    lines.append("\n(Source: asm_world_bodies, eval_interference, doc_solve_mates — "
+                 "numbers narrated, never recomputed)")
+    return _dumps({"ok": True, "text": "\n".join(lines)})
+
+
+def _describe_board_text(doc_id: str) -> str:
+    """Narrate a PCB or schematic board's status as GSL text.
+
+    Promotes ecad_status data into the narration contract layer. Reads directly from
+    the ecad Python modules (same sources ecad_status uses) and reformats as narration
+    text following contracts/narration.md section order.
+
+    Data sources:
+    1. ecad_session.get_session → kind (sch|pcb), component list, netlist
+    2. engine.ecad.netlist.build_netlist → components, nets
+    3. engine.ecad.erc.run_erc → ERC/DRC violation summary
+    """
+    try:
+        from engine.ecad import ecad_session  # noqa: PLC0415
+    except ImportError:
+        return _dumps({"ok": False,
+                       "error": "ECAD engine not available — "
+                                "open a schematic or PCB first (ecad_new_schematic / ecad_new_pcb)"})
+
+    try:
+        from engine.ecad import netlist as netlist_mod  # noqa: PLC0415
+    except ImportError:
+        netlist_mod = None  # type: ignore[assignment]
+
+    did = doc_id or ""
+    try:
+        session = ecad_session.get_session(did)
+    except Exception as e:  # noqa: BLE001
+        return _dumps({"ok": False,
+                       "error": f"No active ECAD document: {e} — "
+                                "open one with ecad_new_schematic or ecad_new_pcb first."})
+
+    doc = session.doc
+    kind = session.kind  # "sch" or "pcb"
+    doc_name = doc.get("name", "board")
+
+    if kind == "pcb":
+        fps = doc.get("footprints", [])
+        nets = doc.get("nets", [])
+        tracks = doc.get("tracks", [])
+        vias = doc.get("vias", [])
+        outline = doc.get("outline") or {}
+        has_outline = bool(outline.get("shapes"))
+        lines = [
+            f'Board "{doc_name}" — PCB layout',
+            f'  {len(fps)} footprint(s), {len(nets)} net(s), '
+            f'{len(tracks)} track(s), {len(vias)} via(s)  '
+            f'(source: ecad_session)',
+        ]
+        if has_outline:
+            lines.append("  Board outline: defined  (source: ecad_session)")
+        else:
+            lines.append("  Board outline: NOT defined — set one with a pcb_set_outline op")
+
+        # DRC summary (best-effort)
+        n_err = 0
+        try:
+            from engine.ecad import drc as drc_mod  # noqa: PLC0415
+            res = drc_mod.run_drc(doc)
+            viols = res if isinstance(res, list) else res.get("violations", [])
+            n_err = sum(1 for v in viols if v.get("severity") == "error")
+            n_warn = sum(1 for v in viols if v.get("severity") == "warning")
+            if n_err:
+                lines.append(f"\nDRC: {n_err} error(s), {n_warn} warning(s) — fix errors before "
+                              "fabrication  (source: engine.ecad.drc)")
+            else:
+                lines.append(f"\nDRC: clean — {n_warn} warning(s)  (source: engine.ecad.drc)")
+        except Exception:  # noqa: BLE001
+            lines.append("\nDRC: not available")
+
+        if not fps:
+            lines.append("\nNo footprints placed — use ecad_find_part then ecad_place_symbol.")
+        caveats = []
+        if not has_outline:
+            caveats.append("Board outline missing — required for fabrication (pcb_set_outline).")
+        if n_err:
+            caveats.append("DRC errors present — resolve before export.")
+        if caveats:
+            lines.append("\nCaveats:")
+            for c in caveats:
+                lines.append(f"  - {c}")
+        lines.append("\n(Source: ecad_session, engine.ecad.drc — numbers narrated, never recomputed)")
+        return _dumps({"ok": True, "text": "\n".join(lines)})
+
+    # ---- schematic ----
+    if netlist_mod is None:
+        return _dumps({"ok": False,
+                       "error": "engine.ecad.netlist not available — check your install."})
+
+    nl = netlist_mod.build_netlist(doc)
+    components = nl.get("components", [])
+    nets_dict = nl.get("nets", {})
+    net_list = sorted(nets_dict.items())
+
+    lines = [
+        f'Board "{doc_name}" — schematic',
+        f'  {len(components)} component(s), {len(net_list)} net(s)  '
+        f'(source: engine.ecad.netlist)',
+    ]
+
+    # Component roster
+    if components:
+        lines.append("\nComponents:")
+        for c in components:
+            ref = c.get("ref", "?")
+            val = c.get("value", "")
+            libid = c.get("libid", "")
+            fp = c.get("footprint") or ""
+            fp_note = f", fp={fp}" if fp else ", no footprint"
+            lines.append(f"  {ref}: {val} ({libid}{fp_note})")
+    else:
+        lines.append("\nNo components — add parts with ecad_find_part + ecad_place_symbol.")
+
+    # Net roster (cap at 20 to stay token-bounded)
+    if net_list:
+        lines.append("\nNets:")
+        for name, members in net_list[:20]:
+            pins = ", ".join(f"{m.get('ref')}.{m.get('pin')}" for m in members)
+            lines.append(f"  {name} ({len(members)} pin(s)): {pins}")
+        if len(net_list) > 20:
+            lines.append(f"  +{len(net_list) - 20} more nets")
+    else:
+        lines.append("\nNo nets — wire pins with ecad_wire.")
+
+    # ERC summary
+    n_erc_err = 0
+    try:
+        from engine.ecad import erc as erc_mod  # noqa: PLC0415
+        violations = erc_mod.run_erc(doc, nl)
+        n_erc_err = sum(1 for v in violations if v.get("severity") == "error")
+        n_erc_warn = sum(1 for v in violations if v.get("severity") == "warning")
+        if n_erc_err:
+            lines.append(f"\nERC: {n_erc_err} error(s), {n_erc_warn} warning(s)  "
+                         "(source: engine.ecad.erc)")
+        else:
+            lines.append(f"\nERC: clean — {n_erc_warn} warning(s)  (source: engine.ecad.erc)")
+    except Exception:  # noqa: BLE001
+        lines.append("\nERC: not available")
+
+    # Unconnected pins (pins with no net connection)
+    try:
+        all_pins = {(c.get("ref"), str(p))
+                    for c in components
+                    for p in (c.get("pins") or [])}
+        wired = {(m.get("ref"), str(m.get("pin")))
+                 for _, members in nets_dict.items()
+                 for m in members}
+        unconnected = sorted(f"{r}.{p}" for r, p in all_pins - wired)
+    except Exception:  # noqa: BLE001
+        unconnected = []
+
+    if unconnected:
+        sample = ", ".join(unconnected[:6])
+        more = f" (+{len(unconnected) - 6} more)" if len(unconnected) > 6 else ""
+        lines.append(f"\nUnconnected pins ({len(unconnected)}): {sample}{more} — "
+                     "wire with ecad_wire or mark no-connect.")
+    else:
+        lines.append("\nAll pins connected.")
+
+    caveats = []
+    if n_erc_err:
+        caveats.append("ERC errors present — fix before simulation or layout.")
+    if unconnected:
+        caveats.append(f"{len(unconnected)} unconnected pin(s) — wire or mark no-connect.")
+    if not components:
+        caveats.append("Empty schematic — add parts first.")
+    if caveats:
+        lines.append("\nCaveats:")
+        for c in caveats:
+            lines.append(f"  - {c}")
+
+    lines.append("\n(Source: engine.ecad.netlist, engine.ecad.erc — "
+                 "numbers narrated, never recomputed)")
+    return _dumps({"ok": True, "text": "\n".join(lines)})
+
+
+def _describe_project_text(run: dict | None = None) -> str:
+    """Narrate a DAG run's status: nodes done/blocked, budgets, open questions.
+
+    Feeds WS-A dag_status and the T-F17 mission-control UI. Accepts an optional
+    ``run`` dict matching contracts/dag_schema.md; degrades gracefully when no run
+    data is available (services/dag/ not yet landed as of T-F8).
+
+    Data sources: the caller-supplied run dict (no engine RPC — DAG is Python-side).
+    """
+    if run is None:
+        return _dumps({"ok": True, "text":
+                       "No DAG run data supplied — pass run=<dag_run_dict> from "
+                       "dag_status() once services/dag is available, or from your "
+                       "WS-A dag driver directly. See contracts/dag_schema.md "
+                       "for the expected shape."})
+
+    run_id = run.get("id") or run.get("run_id") or "?"
+    name = run.get("name") or run.get("project") or run_id
+    nodes = run.get("nodes") or []
+    budget = run.get("budget") or {}
+    questions = run.get("open_questions") or []
+
+    # Node status counts
+    done = [n for n in nodes if n.get("status") in ("done", "review")]
+    blocked = [n for n in nodes if n.get("status") == "blocked"]
+    doing = [n for n in nodes if n.get("status") == "doing"]
+    todo = [n for n in nodes if n.get("status") in ("todo", "ready", "pending")]
+
+    lines = [
+        f'Project "{name}" (DAG run {run_id})',
+        f'  {len(nodes)} node(s) total: {len(done)} done/review, {len(doing)} in-progress, '
+        f'{len(blocked)} blocked, {len(todo)} pending',
+    ]
+
+    # Budget
+    if budget:
+        spent = budget.get("spent") or budget.get("tokens_used")
+        cap = budget.get("cap") or budget.get("tokens_cap")
+        if spent is not None and cap is not None:
+            pct = spent / cap * 100.0 if cap else 0.0
+            lines.append(f"  Budget: {spent:,} / {cap:,} tokens used ({pct:.1f}%)  "
+                         "(source: dag_run.budget)")
+        elif spent is not None:
+            lines.append(f"  Budget: {spent:,} tokens used  (source: dag_run.budget)")
+
+    # Done/review nodes
+    if done:
+        lines.append("\nCompleted nodes:")
+        for n in done:
+            nid = n.get("id") or n.get("task") or "?"
+            title = n.get("title") or n.get("name") or nid
+            lines.append(f"  [done] {nid}: {title}")
+
+    # In-progress
+    if doing:
+        lines.append("\nIn progress:")
+        for n in doing:
+            nid = n.get("id") or n.get("task") or "?"
+            title = n.get("title") or n.get("name") or nid
+            owner = n.get("owner") or "unassigned"
+            lines.append(f"  [doing] {nid}: {title}  (owner: {owner})")
+
+    # Blocked nodes
+    if blocked:
+        lines.append("\nBlocked:")
+        for n in blocked:
+            nid = n.get("id") or n.get("task") or "?"
+            title = n.get("title") or n.get("name") or nid
+            reason = n.get("blocked_reason") or n.get("reason") or "unspecified"
+            lines.append(f"  [blocked] {nid}: {title}  reason: {reason}")
+
+    # Open questions
+    if questions:
+        lines.append(f"\nOpen questions ({len(questions)}):")
+        for q in questions:
+            qid = q.get("id") or q.get("task") or "?"
+            text = q.get("question") or q.get("text") or str(q)
+            lines.append(f"  Q ({qid}): {text}")
+    else:
+        lines.append("\nNo open questions.")
+
+    if not nodes:
+        lines.append("\nNo nodes in this run — the DAG may not have started yet.")
+
+    lines.append("\n(Source: dag_run dict — numbers narrated from the DAG run record, "
+                 "never recomputed)")
+    return _dumps({"ok": True, "text": "\n".join(lines)})
+
+
 def register_gsl_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
@@ -1040,5 +1419,56 @@ def register_gsl_tools(mcp: FastMCP) -> None:
         attached' message when no study exists."""
         try:
             return _describe_results_text(_doc(doc_id), study_name)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    # ---------------------------------------------------------------- narration (T-F8)
+
+    @mcp.tool()
+    def describe_assembly(doc_id: Optional[str] = None) -> str:
+        """Compact narrative of an assembly (or multi-body part) — world placement, fit/clearance,
+        and mate solve summary. Use INSTEAD of dumping asm_world_bodies JSON.
+
+        Returns per-component bounding boxes and world-frame origins, interference/clearance pairs
+        from check_interference (volumes and gap distances), and the top-level mate solve status.
+        Narrates existing numbers only — never recomputes. Works on assembly docs (components placed
+        by mates) and multi-body parts (transform-assembled bodies). Returns a graceful message when
+        no bodies are present. Call solve_mates first to update the assembly placement.
+        """
+        try:
+            return _describe_assembly_text(_doc(doc_id))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def describe_board(doc_id: str = "") -> str:
+        """Compact narrative of an ECAD schematic or PCB — component roster, net list, ERC/DRC
+        summary, and unconnected pins. Promotes ecad_status into the GSL narration layer.
+
+        Returns the component count and list (ref, value, footprint), net count and per-net
+        members (capped at 20 nets), ERC error/warning counts for schematics or DRC status for
+        PCBs, and a list of unconnected pins. Narrates existing numbers only — never recomputes.
+        Returns a graceful message when no ECAD document is active. Open a schematic first with
+        ecad_new_schematic or ecad_new_pcb.
+        """
+        try:
+            return _describe_board_text(doc_id)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def describe_project(run: Optional[dict] = None) -> str:
+        """Compact narrative of a DAG project run — nodes done/blocked, budgets, open questions.
+        Feeds WS-A dag_status and the T-F17 mission-control UI.
+
+        run: a dag_run dict matching contracts/dag_schema.md — pass dag_status()['run'] or your
+        WS-A driver's run record. When omitted, returns a graceful 'no run supplied' message.
+
+        Returns node status counts (done/doing/blocked/pending), per-node titles and owners,
+        budget usage (tokens spent vs cap), and open questions by task id. Narrates the dag_run
+        dict only — never queries the engine. See contracts/dag_schema.md for the run shape.
+        """
+        try:
+            return _describe_project_text(run)
         except Exception as e:  # noqa: BLE001
             return _err(e)

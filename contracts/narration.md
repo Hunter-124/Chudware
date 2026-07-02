@@ -181,6 +181,138 @@ Convergence note: tet10 (2nd-order) elements used; re-run with finer mesh
 
 ---
 
+### `describe_assembly` (assemblies / multi-body parts) — T-F8
+
+Data sources (in call order):
+
+1. `asm_world_bodies` → `{"bodies":[{name, component, bbox:{min,max,size}}], multibody_part}`
+   (`core/doc/assembly.h AsmBodyOut`): one entry per placed component / body.
+2. `doc_solve_mates` → `{"revision", "status": <rebuild.doc_status>}` — top-level summary
+   string; DOF per component is not exposed via a read RPC; output says so explicitly.
+3. `eval_interference` → `{summary, interferences:[{a,b,volume}], clearances:[{a,b,distance}]}`
+   (`check_interference` shape); volume in mm^3, distance in mm.
+
+Graceful degradation phrases for this tool:
+
+| Situation | Required output |
+|---|---|
+| No bodies | `No bodies found in this document — add components (assembly) or features (part) first.` |
+| DOF not readable | `DOF detail not available via read RPC — call solve_mates for the live result` |
+| Interference/clearance unavailable | `Fit/clearance: not available for this document` |
+
+Output skeleton:
+
+```
+Assembly "<doc_id>" — <N> component(s) / bod(y/ies) [<kind>]
+
+Component placement (world frame):
+  <name>: <W> × <H> × <D> mm, origin [<x>, <y>, <z>]  (source: asm_world_bodies)
+  ...
+
+Mate solve: <status string>  (source: doc_solve_mates)
+
+FIT REPORT: <summary>
+  INTERFERENCE  <a> <-> <b>: <vol> mm^3 overlap
+  clearance     <a> <-> <b>: <dist> mm gap
+  -> [actionable fix advice — only when interferences exist]
+
+(Source: asm_world_bodies, eval_interference, doc_solve_mates — numbers narrated, never recomputed)
+```
+
+### `describe_board` (ECAD schematic / PCB) — T-F8
+
+Promotes `ecad_status` into the GSL narration layer. Reads directly from the ECAD Python
+engine modules — no extra RPC round-trip.
+
+Data sources:
+
+1. `engine.ecad.ecad_session.get_session` → session kind (`sch`|`pcb`), doc dict
+2. `engine.ecad.netlist.build_netlist` → `{components:[{ref,libid,value,footprint,pins}], nets:{name:[members]}}`
+3. `engine.ecad.erc.run_erc` → list of violation dicts `{severity, rule, ...}` (schematic)
+4. `engine.ecad.drc.run_drc` → violation list or `{violations:[...]}` (PCB)
+
+Graceful degradation phrases:
+
+| Situation | Required output |
+|---|---|
+| No active ECAD document | `No active ECAD document: <error> — open one with ecad_new_schematic or ecad_new_pcb first.` |
+| ECAD engine not available | `ECAD engine not available — open a schematic or PCB first (ecad_new_schematic / ecad_new_pcb)` |
+| ERC/DRC not available | `ERC: not available` / `DRC: not available` |
+
+Output skeleton (schematic):
+
+```
+Board "<name>" — schematic
+  <N> component(s), <N> net(s)  (source: engine.ecad.netlist)
+
+Components:
+  <ref>: <value> (<libid>[, fp=<footprint>])
+  ...
+
+Nets:
+  <net_name> (<N> pin(s)): <ref>.<pin>, ...
+  ...
+
+ERC: <N> error(s), <N> warning(s)  (source: engine.ecad.erc)
+
+Unconnected pins (<N>): <list>  [only when unconnected exist]
+
+Caveats:
+  - <caveat>  [only when problems present]
+
+(Source: engine.ecad.netlist, engine.ecad.erc — numbers narrated, never recomputed)
+```
+
+### `describe_project` (DAG run) — T-F8
+
+Narrates a caller-supplied DAG run dict; no engine RPC. The run dict is passed in by the
+caller (WS-A driver or dag_status()) — this tool is a formatter, not a reader.
+
+Data sources: `run` parameter dict matching `contracts/dag_schema.md`.
+
+Fields read: `run.id`, `run.name`, `run.nodes[]{id,title,name,status,owner,blocked_reason}`,
+`run.budget{spent,cap,tokens_used,tokens_cap}`, `run.open_questions[]{id,task,question,text}`.
+
+Graceful degradation phrases:
+
+| Situation | Required output |
+|---|---|
+| No run supplied (run=None) | `No DAG run data supplied — pass run=<dag_run_dict> from dag_status() once services/dag is available...` |
+| Empty nodes list | `No nodes in this run — the DAG may not have started yet.` |
+| No open questions | `No open questions.` |
+
+Output skeleton:
+
+```
+Project "<name>" (DAG run <id>)
+  <N> node(s) total: <N> done/review, <N> in-progress, <N> blocked, <N> pending
+  Budget: <spent> / <cap> tokens used (<pct>%)  (source: dag_run.budget)
+
+Completed nodes:
+  [done] <id>: <title>
+
+In progress:
+  [doing] <id>: <title>  (owner: <owner>)
+
+Blocked:
+  [blocked] <id>: <title>  reason: <reason>
+
+Open questions (<N>):
+  Q (<task_id>): <question text>
+
+(Source: dag_run dict — numbers narrated from the DAG run record, never recomputed)
+```
+
+---
+
+## Shared fit/clearance formatter
+
+`_format_fit(fit)` lives in `services/mcp/gsl_tools.py` — the single canonical home.
+`services/agent/loop.py` imports it from there. The input shape is:
+`{summary, interferences:[{a,b,volume}], clearances:[{a,b,distance}]}`.
+
+---
+
 ## Adding a new narration tool
 
 1. Name it `describe_<domain>` (lowercase, underscore-separated).

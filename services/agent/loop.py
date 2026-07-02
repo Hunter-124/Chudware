@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from engine import paths, render
+from mcp_server.gsl_tools import _format_fit  # single home for fit/clearance formatting (T-F8)
 from engine.kernel import AssemblyResult, ModelResult, run_code_multi
 
 from . import config as agent_config
@@ -523,23 +524,9 @@ def _fill_ratio(res: ModelResult) -> float | None:
     return res.volume / box
 
 
-def _format_fit(fit: dict | None) -> str:
-    """Render the kernel's fit report as feedback text the model can act on."""
-    if not fit:
-        return ""
-    lines = [f"FIT REPORT: {fit.get('summary', '')}"]
-    for it in fit.get("interferences", []):
-        lines.append(f"  INTERFERENCE  {it['a']} <-> {it['b']}: {it['volume']:.2f} mm^3 overlap")
-    for cl in fit.get("clearances", []):
-        lines.append(f"  clearance     {cl['a']} <-> {cl['b']}: {cl['distance']:.2f} mm gap")
-    if fit.get("interferences"):
-        lines.append("  -> If that overlap is NOT an intended press-fit, fix it: REPOSITION one "
-                     "part (change its Pos along the axis where the bodies overlap) or CUT a "
-                     "matching opening/pocket in the other part so the inserted part has room. "
-                     "A part placed AT a wall coordinate overlaps that wall - offset it by at "
-                     "least half its own thickness plus the wall thickness to sit flush outside, "
-                     "or place it in an actual gap/opening.")
-    return "\n".join(lines)
+# _format_fit moved to services/mcp/gsl_tools.py (T-F8) — imported at module top.
+# The shared implementation in gsl_tools._format_fit is identical: same input shape
+# {summary, interferences:[{a,b,volume}], clearances:[{a,b,distance}]}, same output.
 
 
 def _feedback_ok(res: "ModelResult | AssemblyResult") -> str:

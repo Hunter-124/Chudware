@@ -124,6 +124,7 @@ Rule: the ECAD default distribution stays **GPL-clean**, identical to the CAD po
 | **peft** | **Apache-2.0** | HuggingFace PEFT — LoRA adapter training | ok — in-process, dev/internal only; lazy import. Never shipped in the desktop installer. |
 | **Unsloth** | **Apache-2.0** | Fast LoRA training via custom CUDA kernels | ok — in-process, dev/internal only; lazy import with fallback to plain TRL. Never shipped in the desktop installer. |
 | **PyYAML** | **MIT** | YAML recipe file parsing | ok — in-process; already a common transitive dep. Never shipped in the desktop installer. |
+| **Offline VLM weights** (T-H10): Qwen3-VL-4B-Instruct, granite-vision-4.1-4b, Gemma 4 E4B-it (+ their GGUF/mmproj) | **Apache-2.0** (all three) | `experimental.vision_review` render self-review / drawing reading; the offline vision track candidates | ok — **bundleable in a paid, ITAR-safe offline app** (all Apache-2.0). Served **subprocess-only** via the llama.cpp MIT runtime row above (`llama-server --mmproj`, loopback). NOT vendored in the repo — downloaded out-of-band (`tools/flywheel/vlm/candidates.py:provision_instructions`). RULED OUT: Qwen2.5-VL-3B (Qwen Research License — non-commercial) and Moondream 3 (BUSL-1.1). |
 ## Structural section data (T-D3)
 
 | item | license | role | posture |

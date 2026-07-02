@@ -209,3 +209,17 @@ def test_reward_strips_confidence():
     facts = [{"kind": "hole", "count": 4}]
     with_conf = [{"kind": "hole", "count": 4, "confidence": "high"}]
     assert reward.render_reward(with_conf, facts) == 1.0
+
+
+# ---- DVC round-trip (proves DVC-versioning end-to-end; skips if dvc binary absent) -------
+
+def _dvc_available() -> bool:
+    import shutil
+    return shutil.which("dvc") is not None
+
+@pytest.mark.skipif(not _dvc_available(), reason="dvc binary not on PATH")
+def test_dvc_corpus_roundtrip(tmp_path):
+    from tools.flywheel.vlm.dvc_track import roundtrip_demo
+    rep = roundtrip_demo(tmp_path / "repo", tmp_path / "remote")
+    assert rep["pointer_has_md5"] is True     # .dvc pointer pins the content
+    assert rep["bytes_match"] is True         # dvc pull restores identical bytes

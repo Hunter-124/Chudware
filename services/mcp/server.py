@@ -150,6 +150,10 @@ register_firmware_tools(mcp)
 from mcp_server.structural_tools import register_structural_tools
 register_structural_tools(mcp)
 
+# Code compliance (T-D4): deterministic rule engine + agentic RAG for building-code checks.
+from mcp_server.code_compliance_tools import register_code_compliance_tools
+register_code_compliance_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

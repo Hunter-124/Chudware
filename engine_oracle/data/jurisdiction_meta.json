@@ -1,0 +1,73 @@
+{
+  "_comment": "Jurisdiction adoption metadata — edition facts only, no code text. Sources: ICC/state legislative websites (public record). Update as states adopt new editions.",
+  "CA": {
+    "ibc_edition": "2022",
+    "asce7_edition": "22",
+    "nds_edition": "2018",
+    "residential_code": "CRC-2022",
+    "notes": "California Building Code (CBC) amends IBC; seismic zone varies by county"
+  },
+  "TX": {
+    "ibc_edition": "2021",
+    "asce7_edition": "16",
+    "nds_edition": "2018",
+    "residential_code": "IRC-2021",
+    "notes": "Adopted by local jurisdictions; some municipalities use older editions"
+  },
+  "NY": {
+    "ibc_edition": "2020",
+    "asce7_edition": "16",
+    "nds_edition": "2018",
+    "residential_code": "RCNYS-2020",
+    "notes": "New York City uses its own NYC Building Code (2014 base)"
+  },
+  "FL": {
+    "ibc_edition": "2020",
+    "asce7_edition": "16",
+    "nds_edition": "2018",
+    "residential_code": "FRC-2020",
+    "notes": "Florida Building Code; high-velocity hurricane zones (HVHZ) additional requirements"
+  },
+  "WA": {
+    "ibc_edition": "2021",
+    "asce7_edition": "16",
+    "nds_edition": "2018",
+    "residential_code": "IRC-2021",
+    "notes": "Washington State Building Code; seismic zone varies by county"
+  },
+  "OR": {
+    "ibc_edition": "2021",
+    "asce7_edition": "16",
+    "nds_edition": "2018",
+    "residential_code": "ORSC-2021",
+    "notes": "Oregon Residential Specialty Code; seismic zone D in Portland area"
+  },
+  "CO": {
+    "ibc_edition": "2021",
+    "asce7_edition": "16",
+    "nds_edition": "2018",
+    "residential_code": "IRC-2021",
+    "notes": "Local adoption varies; high-altitude and wildfire provisions apply"
+  },
+  "AZ": {
+    "ibc_edition": "2018",
+    "asce7_edition": "16",
+    "nds_edition": "2018",
+    "residential_code": "IRC-2018",
+    "notes": "Statewide minimum; local jurisdictions may adopt newer editions"
+  },
+  "GA": {
+    "ibc_edition": "2018",
+    "asce7_edition": "16",
+    "nds_edition": "2018",
+    "residential_code": "IRC-2018",
+    "notes": "Georgia State Minimum Standard Codes"
+  },
+  "IL": {
+    "ibc_edition": "2021",
+    "asce7_edition": "16",
+    "nds_edition": "2018",
+    "residential_code": "IRC-2021",
+    "notes": "Chicago uses its own Chicago Building Code; elsewhere IBC/IRC"
+  }
+}

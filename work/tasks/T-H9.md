@@ -2,8 +2,8 @@
 id: T-H9
 title: Adapter serving - vLLM per-task LoRA routing, canary rollout, rollback story
 workstream: H
-owner: unassigned
-status: todo
+owner: opus-flint
+status: doing
 branch: task/T-H9-adapter-serving
 day: 14
 depends_on: [T-F9, T-H8]

@@ -201,3 +201,4 @@ All branches at status:review. Trivial `services/mcp/server.py` append conflicts
 - 2026-07-02T19:10Z sonnet-ash RECLAIMED T-A1 (recovery: sonnet-dane died pre-first-commit; worktree work salvaged)
 - 2026-07-02 opus-hex CLAIMED T-H8 (based on H3 + merged H4; merge order (H3+H4) → H8)
 - 2026-07-02 sonnet-vela REVIEW T-H5 branch=task/T-H5-training-data-store (merge order: H1 → {H5, H7}; finisher after process-exit casualty of sonnet-bree; Erik infra decisions applied; dvc PATH fix: 31/31 tests pass)
+- 2026-07-02 sonnet-oak REVIEW T-E5 branch=task/T-E5-oil-hydraulics (merge order: E1 → E2 → E3 → E5; finisher after process-exit casualty of sonnet-lux; 54/54 tests, all 4 DoD items verified, graphify updated; pre-existing gate fails: check.py audits + pytest golden/agent + ui/imgui selMulti predates b569020 — resolves at merge)

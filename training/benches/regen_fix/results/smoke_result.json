@@ -29,7 +29,8 @@
     "success_bar": {
       "intent_drift==0": true,
       "pct_fixed>=0.70": false
-    }
+    },
+    "verifier_mode": "fixture"
   },
   "baselines": [
     {
@@ -50,7 +51,7 @@
     }
   ],
   "bench_id": "regen_fix",
-  "dataset_hash": "sha256:28993318613e1ec7cbc1bc1e8775cb99f042d3486466c2b99d2ba859cab5ae46",
+  "dataset_hash": "sha256:7a767339339935c617a0b7d92b851cb96b3c422131591dc0a7a507a5b8a3ae34",
   "dataset_id": "regen_fix_corpus",
   "examples": [
     {
@@ -482,7 +483,7 @@
   "n_examples": 25,
   "residual": {
     "baseline_mean": 0.4,
-    "note": "frontier candidate pending; residual measured when it lands",
+    "note": "frontier candidate pending credentials; residual measured when it lands",
     "status": "pending"
   },
   "schema_version": "aicad.bench/1",

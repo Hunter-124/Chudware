@@ -272,6 +272,12 @@ def build_corpus(out_dir: str, *, count: int = 500, seed: int = 1337,
         with open(os.path.join(ex_dir, "document.json"), "w", encoding="utf-8") as f:
             json.dump({"revision": 0, "tree": corrupted, "owner_map": {}}, f,
                       indent=2, sort_keys=True)
+        # The pre-mutation known-good doc — the reference the LIVE binary verifier compares
+        # a proposed fix against (rebuild passes AND compare_parts ≈100% vs this). JSON→JSON,
+        # still no core needed to BUILD it; the core is only used later to compare.
+        with open(os.path.join(ex_dir, "good.json"), "w", encoding="utf-8") as f:
+            json.dump({"revision": 0, "tree": variant, "owner_map": {}}, f,
+                      indent=2, sort_keys=True)
         labels.append(MutationLabel(
             example_id=ex_id, structure=variant["id"], mutation_class=mclass,
             target=target, det_fixable=DET_FIXABLE[mclass], fixable=True,
@@ -289,6 +295,16 @@ def build_corpus(out_dir: str, *, count: int = 500, seed: int = 1337,
                               structures=structures)
     spec.write(os.path.join(out_dir, "spec.json"))
     return spec
+
+
+def load_good(corpus_dir: str, example_id: str) -> Optional[dict]:
+    """The pre-mutation known-good doc for one example (the live verifier's reference), or
+    None for corpora built before good.json was emitted."""
+    path = os.path.join(corpus_dir, example_id, "good.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def load_labels(corpus_dir: str) -> list[dict]:

@@ -36,7 +36,9 @@ def _run_regen_fix(smoke: bool, workdir: str) -> BenchResult:
     count = 25 if smoke else 500
     corpus_dir = os.path.join(workdir, "regen_fix_corpus")
     spec = build_corpus(corpus_dir, count=count, seed=1337)
-    return regen_fix.run(corpus_dir, spec.hash, split="smoke" if smoke else "all")
+    # live=True -> use the authoritative rebuild+compare_parts verifier when the core is
+    # present; degrades to fixture with a recorded reason when it isn't.
+    return regen_fix.run(corpus_dir, spec.hash, split="smoke" if smoke else "all", live=True)
 
 
 REGISTRY: dict[str, BenchDriver] = {

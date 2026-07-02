@@ -160,6 +160,11 @@ register_parts_tools(mcp)
 # (evidence + human sign-off; no auto-promote). Pure-Python, no core dependency.
 from mcp_server.serving_tools import register_serving_tools
 register_serving_tools(mcp)
+# Regen diagnosis (T-H11 / IP-18): on a rebuild failure, diagnose + propose editable fix-ops as
+# an accept/edit/reject card, logged as an IP-18 correction trace. Callable backend seam; the
+# copilot binding is T-F17.
+from mcp_server.regen_tools import register_regen_tools
+register_regen_tools(mcp)
 
 
 def _install_clean_stdout():

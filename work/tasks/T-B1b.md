@@ -2,8 +2,8 @@
 id: T-B1b
 title: Nexar, Digi-Key, and Mouser provider implementations
 workstream: B
-owner: unassigned
-status: todo
+owner: opus-moss
+status: doing
 branch: task/T-B1b-part-providers
 day: 1
 depends_on: [T-B1a, T-S1]

@@ -62,3 +62,19 @@ gate.sh ui/imgui selMulti failure is PRE-EXISTING, never chase; commit+push ever
   wording → D2 (Opus) implements services/deliverables/ + MCP registration +
   installer/provision.py + tests + DoD pass, delegating sweeps/scaffolds to Sonnet.
 - Next dispatch: D1 contract draft (see brief in Task tool call, this session).
+
+### 2026-07-02 — front widened (Erik-authorized)
+
+- Erik authorized parallel work beyond the Pillar 15 arc for throughput/cache
+  efficiency. FABLE-ARC claimed and dispatched four additional autonomous Opus
+  drivers on zero-dependency tasks (claims atomic via work.py; FOREMAN check-in on
+  master @ db3d8a4):
+  - opus-ivy → T-F1 (research tools contract + engine/research), worktree ../CAD-T-F1
+  - opus-rook → T-F3 (interaction contract + ask_user + in-app dialog), ../CAD-T-F3;
+    owns agent_panel.cpp hot-spot as first claimer, briefed: dialog in its own
+    component files, minimal append-only panel wiring
+  - opus-sage → T-F5 (image ingestion v1), ../CAD-T-F5
+  - opus-pike → T-F9 (providers contract; T-H9 routing stub reserved), ../CAD-T-F9
+- All four briefed with FOREMAN discipline + continuity + graphify rules; they run
+  `work.py prompt <id>` themselves and finish at status: review + FOREMAN REVIEW line.
+- Meanwhile D1 (T-F14 contract draft) still in flight on this branch.

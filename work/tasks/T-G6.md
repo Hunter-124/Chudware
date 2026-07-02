@@ -2,8 +2,8 @@
 id: T-G6
 title: GUI migration wave 2 - shell chrome (S1-S6, H5 start, G2 gate)
 workstream: G
-owner: unassigned
-status: todo
+owner: opus-gale
+status: doing
 branch: task/T-G6-migration-wave2
 day: 7
 depends_on: [T-G5]

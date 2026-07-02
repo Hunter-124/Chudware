@@ -35,4 +35,20 @@ detectable by callers (`returncode == -1`) and matches the DoD's stated shape an
 scaffold's non-raising `Toolchain.build()`. If the supervisor wants the strict §5 error
 envelope for absent tools instead, it's a one-line branch in `mcp_tools.fw_build`.
 
-_Both non-blocking; proceeding on the recommended answers._
+## Q3 — New file `services/mcp/firmware_tools.py` (outside literal "Files / areas touched")
+
+**Context.** The task's "Files / areas touched" lists `engine_oracle/firmware/mcp_tools.py`
+(handlers) + `services/mcp/server.py` (register), but not a wrapper module. Every other tool family
+(`ecad_tools.py`, `cam_tools.py`, `cad_tools.py`, …) exposes its MCP surface through a dedicated
+`services/mcp/<family>_tools.py` with a `register_<family>_tools(mcp)` function; `server.py` is a
+thin registrar with **no** inline `@mcp.tool()` defs. Inlining the three firmware wrappers directly
+in `server.py` would break that pattern and couple the engine to FastMCP.
+
+**Recommended answer (implemented).** Keep the new `services/mcp/firmware_tools.py` (thin FastMCP
+wrappers mirroring `ecad_tools.py`) and register it append-only in `server.py`. This is the exact
+precedent set on-branch by `opus-hale` (new `cost_tools.py`, T-B3 Q1) and `opus-birch` (new
+`spec_tools.py`, T-B4 Q3). Engine handlers stay framework-free in `engine/firmware/mcp_tools.py`.
+Alternative (inline in `server.py`) rejected: breaks the thin-registrar convention and the engine's
+framework-independence.
+
+_All three non-blocking; proceeding on the recommended answers._

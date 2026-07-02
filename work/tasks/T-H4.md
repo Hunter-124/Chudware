@@ -2,8 +2,8 @@
 id: T-H4
 title: Verifier battery API + gap verifiers (groundedness, manifold, unit sanity, dim coverage)
 workstream: H
-owner: unassigned
-status: todo
+owner: sonnet-tomo
+status: doing
 branch: task/T-H4-verifier-battery
 day: 12
 depends_on: []

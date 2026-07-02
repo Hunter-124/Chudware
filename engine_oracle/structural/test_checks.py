@@ -213,6 +213,41 @@ class TestCheckMemberSteelW8x31:
         assert cr.dc_ratio > 1.0
         assert cr.passed is False
 
+    def test_capacity_absolute_value(self, section):
+        """Pin absolute φMy against the published hand-calc value (independent of production code).
+
+        Published W8x31 props: Sx = 27.5 in³ = 27.5 × 16387.1 = 450 645 mm³ ≈ 4.506e5 mm³
+        A992 Fy = 50 ksi = 344.7 MPa; φ = 0.90 (AISC LRFD §F2)
+        φMy = 0.90 × 4.506e5 × 344.7 = 139 801 620 N·mm ≈ 139.8 kN·m
+
+        This test feeds the literal 111 900 000 N·mm demand (= 80% × 139.875 kN·m, rounded from
+        the docstring) and asserts D/C ≈ 0.80 independently — so a units bug (e.g. Sx in in³)
+        would produce a wildly wrong ratio, not a tautological 0.80.
+        """
+        # Literal demand from the docstring hand-calc, not derived from section["Sx"] at runtime
+        _LITERAL_DEMAND_NMM = 111_900_000.0   # N·mm (≈ 80% × 139.875 kN·m)
+        _EXPECTED_CAPACITY_NMM = 139_800_000.0  # N·mm (published φMy rounded to 0.1 kN·m)
+
+        # Capacity pin: production code must give ≈ 139.8 kN·m for this section
+        computed_capacity = self._PHI * section["Sx"] * self._FY
+        assert computed_capacity == pytest.approx(_EXPECTED_CAPACITY_NMM, rel=0.01), (
+            f"φMy = {computed_capacity/1e6:.3f} kN·m, expected ≈ 139.8 kN·m. "
+            "Possible units bug in Sx (should be mm³, not in³)."
+        )
+
+        # D/C from literal demand
+        member_literal = {
+            "element_id": "b1", "combo": "DEAD_LIVE",
+            "axial_n": 0.0,
+            "moment_nmm": _LITERAL_DEMAND_NMM,
+            "shear_n": 0.0, "deflection_mm": 0.0,
+        }
+        cr = check_member(member_literal, section, "steel_a992")
+        assert cr.dc_ratio == pytest.approx(0.80, rel=0.01), (
+            f"D/C = {cr.dc_ratio:.4f} from literal demand {_LITERAL_DEMAND_NMM/1e6:.2f} kN·m; "
+            f"expected ≈ 0.80 (hand-calc φMy = {_EXPECTED_CAPACITY_NMM/1e6:.1f} kN·m)"
+        )
+
     def test_a36_lower_capacity_than_a992(self, section):
         """A36 (248 MPa) → smaller φMy → higher D/C for the same demand."""
         same_moment = {
@@ -303,3 +338,35 @@ class TestCheckMemberDisclaimerAlways:
         d = cr.to_dict()
         assert "disclaimer" in d
         assert d["disclaimer"] == DISCLAIMER
+
+
+# ============================================================================ MCP tool registration
+
+class TestStructuralToolsRegistered:
+    """struct_check and struct_analyze must both be registered on a FastMCP instance.
+
+    This does NOT call the tools (that would require PyNite + a real doc); it only verifies the
+    registration contract — i.e. that ``register_structural_tools`` installs both names on the
+    server object so ``struct_check`` is visible to MCP clients.
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def tool_names(cls):
+        from mcp.server.fastmcp import FastMCP
+        from mcp_server.structural_tools import register_structural_tools
+
+        app = FastMCP("test-structural")
+        register_structural_tools(app)
+        # _tool_manager.list_tools() is synchronous in this version of mcp
+        return {t.name for t in app._tool_manager.list_tools()}
+
+    def test_struct_check_registered(self, tool_names):
+        assert "struct_check" in tool_names, (
+            f"struct_check not registered. Found: {sorted(tool_names)}"
+        )
+
+    def test_struct_analyze_registered(self, tool_names):
+        assert "struct_analyze" in tool_names, (
+            f"struct_analyze not registered. Found: {sorted(tool_names)}"
+        )

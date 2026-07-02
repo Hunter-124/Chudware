@@ -262,6 +262,45 @@ def test_dnp_and_unresolved() -> None:
     print(f"  report={report}")
 
 
+def test_mpn_field_propagation() -> None:
+    """A symbol's user ``fields`` (MPN, etc.) survive onto the board footprint on ADD, and a changed
+    symbol field is merged onto the existing footprint on a later UPDATE (symbol wins)."""
+    print("\n--- mpn field propagation ------------------------------------------")
+    s = esess.new_session("sch", "mpn_sch")
+    s.doc["lib_cache"]["Device:R"] = copy.deepcopy(SYMBOLS["Device:R"])
+    esess.apply_ops(s, s.revision, [
+        {"op": "sch_add_symbol", "libid": "Device:R", "pos": [0.0, 0.0], "ref": "R1",
+         "footprint": "Resistor_SMD:R_0603", "fields": {"MPN": "RC0603FR-0710KL"}},
+    ])
+    nl = build_netlist(s.doc)
+    comps = {c["ref"]: c for c in nl["components"]}
+    _assert(comps["R1"]["fields"].get("MPN") == "RC0603FR-0710KL",
+            f"netlist carries R1 fields.MPN (got {comps['R1']['fields']})")
+
+    # ADD path: a fresh board's new footprint must carry the symbol's fields.
+    board = schema.new_board("mpn_board")
+    out = sync.update_board_from_sch(board, nl)
+    report = out["report"]
+    _assert(report["added"] == ["R1"], f"R1 added (got {report['added']})")
+    fp = {f["ref"]: f for f in out["mutated_board"]["footprints"]}["R1"]
+    _assert(fp.get("fields", {}).get("MPN") == "RC0603FR-0710KL",
+            f"ADD: new footprint carries fields.MPN (got {fp.get('fields')})")
+
+    # UPDATE path: bump the symbol's MPN and re-sync onto the already-populated board -> the
+    # footprint's fields must be MERGED with the symbol winning (not silently dropped/skipped).
+    esess.apply_ops(s, s.revision, [
+        {"op": "sch_edit_symbol", "id": "s1", "fields": {"MPN": "RC0603FR-0711KL"}},
+    ])
+    nl2 = build_netlist(s.doc)
+    out2 = sync.update_board_from_sch(out["mutated_board"], nl2)
+    report2 = out2["report"]
+    _assert(report2["updated"] == ["R1"], f"R1 updated (got {report2['updated']})")
+    fp2 = {f["ref"]: f for f in out2["mutated_board"]["footprints"]}["R1"]
+    _assert(fp2.get("fields", {}).get("MPN") == "RC0603FR-0711KL",
+            f"UPDATE: footprint fields.MPN reflects new symbol value (got {fp2.get('fields')})")
+    print(f"  ADD fields={fp.get('fields')}  UPDATE fields={fp2.get('fields')}")
+
+
 def main() -> None:
     print("=== AI-ECAD sync (back-annotation) tests ===")
     ctx = test_netlist_shape()
@@ -270,6 +309,7 @@ def main() -> None:
     test_ratsnest_reflects_population(ctx)
     test_rpc_update_from_sch()
     test_dnp_and_unresolved()
+    test_mpn_field_propagation()
     print("\n=== ALL SYNC ASSERTIONS PASSED ===")
 
 

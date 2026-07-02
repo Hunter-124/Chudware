@@ -134,3 +134,5 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 Fable REVIEWED T-G4: LGTM merge-ready AFTER T-G2 (chained; ~224 lines dead code, build green per commit, recovered+reverified a killed workflow's audit); backlog notes in task file for E3-hooks retarget decision
 - 2026-07-02T13:58:28Z opus-vale REVIEW T-B2 branch=task/T-B2-bom-rollup (merge order: B1a → B1b → B2)
 - 2026-07-02 fable-arc REVIEWED T-B2: LGTM merge-ready (rollup + pricing fold-in, 10/10 + 34 related green, contract-faithful never-fabricated prices); Q1/Q2 ANSWERED (additive fields ok; write_bom MPN drop filed as issue #3). Backfill: opus-hale CLAIMED T-B3 (branches FROM task/T-B2-bom-rollup; merge order B1a → B1b → B2 → B3)
+- 2026-07-02T14:04:27Z opus-dell QUESTION T-E2 — Q1 solver backend: native fluids+scipy nodal solver (no WNTR/EPANET dep added); recommended answer + rationale in work/questions/T-E2.md, proceeding unblocked
+- 2026-07-02T14:04:27Z opus-dell REVIEW T-E2 branch=task/T-E2-network-solve (merge order: E1 → E2)

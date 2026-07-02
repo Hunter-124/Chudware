@@ -571,28 +571,45 @@ def _gcode_digest(nc_text: str) -> dict:
     }
 
 
-def _stress_face_location(doc_id: str, results: dict) -> Optional[str]:
-    """Best-effort: find the face sid nearest the max-stress location using the overlay.
-    Falls back gracefully (returns None) if the overlay call fails."""
+def _face_label(f: dict) -> str:
+    """'face <sid> (<surf> on <side>)' — the same sid namespace describe_part hands out."""
+    sid = f.get("sid", "?")
+    surf = f.get("surf", "?")
+    side = f.get("side")
+    return f'face {sid} ({surf} on {side})' if side else f'face {sid} ({surf})'
+
+
+def _study_bc_faces(doc_id: str, study: dict) -> dict:
+    """Sid join for the study's boundary conditions: resolve the STORED fixture/load face
+    queries (persisted as the original plain-English queries by _persist_study) against the
+    CURRENT face layer — the same sid namespace describe_part uses. Returns
+    {"fixed": [labels], "loaded": [labels]}; each list empty when a query no longer resolves
+    (the caller degrades gracefully). The per-node stress field is NOT persisted in the study
+    record, so the max-stress node cannot be located from stored data — the loaded faces are
+    the traceable stand-in for where the load (and typically the stress path) enters the part."""
+    out: dict = {"fixed": [], "loaded": []}
     try:
-        faces = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}}).get("matches", [])
-        overlay = cb.call("doc_study_overlay", {"doc_id": doc_id})
-        face_stress = overlay.get("face_max_von_mises", [])
-        if face_stress and faces:
-            max_idx = max(range(len(face_stress)), key=lambda i: face_stress[i])
-            if max_idx < len(faces):
-                f = faces[max_idx]
-                sid = f.get("sid", "?")
-                surf = f.get("surf", "?")
-                side = f.get("side")
-                loc = f"face {sid} ({surf}"
-                if side:
-                    loc += f" on {side}"
-                loc += ")"
-                return loc
+        faces = cb.call("doc_query", {"doc_id": doc_id,
+                                      "query": {"of": "face"}}).get("matches", [])
+        by_side: dict = {}
+        for f in faces:
+            if f.get("side"):
+                by_side.setdefault(f["side"], []).append(f)
+
+        def _resolve(q) -> list:
+            # A stored query is either a plain side name ("bottom") or a structured
+            # {"of":"face","side":...} dict — match by side against the live face list.
+            side = q if isinstance(q, str) else (q.get("side") if isinstance(q, dict) else None)
+            return by_side.get(side, []) if side else []
+
+        for q in study.get("fixtures") or []:
+            out["fixed"].extend(_face_label(f) for f in _resolve(q))
+        for ld in study.get("loads") or []:
+            if isinstance(ld, dict) and "face" in ld:
+                out["loaded"].extend(_face_label(f) for f in _resolve(ld["face"]))
     except Exception:  # noqa: BLE001
         pass
-    return None
+    return out
 
 
 def _describe_toolpaths_text(job_id: Optional[str] = None) -> str:
@@ -603,12 +620,15 @@ def _describe_toolpaths_text(job_id: Optional[str] = None) -> str:
     if not jid:
         return _dumps({"ok": False, "error": "No CAM job. Call cam_new_job first."})
 
-    # 1. Job tree — authoritative source for ops, tools, setup hierarchy
+    # 1. Job tree — authoritative source for ops, tools, setup hierarchy.
+    # cam_tree returns {"revision", "tree": {id,name,units,post,tools,setups}, "stats"}
+    # (core/cam/session.cpp tree_of) — the job payload is nested under "tree".
     try:
-        tree = cb.call("cam_tree", {"doc_id": jid})
+        tree_r = cb.call("cam_tree", {"doc_id": jid})
     except Exception as e:  # noqa: BLE001
         return _dumps({"ok": False, "error": f"cam_tree failed: {e}"})
 
+    tree = tree_r.get("tree") or {}
     job_name = tree.get("name", "CAM Job")
     setups = tree.get("setups", [])
     tools_by_num = {t["number"]: t for t in tree.get("tools", [])}
@@ -616,7 +636,9 @@ def _describe_toolpaths_text(job_id: Optional[str] = None) -> str:
     total_ops = sum(len(s.get("operations", [])) for s in setups)
     lines = [f'CAM job "{job_name}" — {len(setups)} setup(s), {total_ops} operation(s) total']
 
-    # 2. Simulation results (best-effort)
+    # 2. Simulation results (best-effort). cam_simulate returns {"results": [SimResult...]}
+    # with per-setup keys machined_fraction (0..1), cycle_time_s, gouges, rapid_collisions
+    # (core/cam/stock_sim.cpp SimResult::to_json) — narrated verbatim, never recomputed.
     sim_by_setup: dict = {}
     sim_available = False
     try:
@@ -624,20 +646,22 @@ def _describe_toolpaths_text(job_id: Optional[str] = None) -> str:
                                          "options": {"resolution": 0.5,
                                                      "check_gouge": True,
                                                      "check_rapid": True}})
-        for s in sim_r.get("setups", []):
-            sid = s.get("setup_id") or s.get("id")
-            sim_by_setup[sid] = s
+        for s in sim_r.get("results", []):
+            sim_by_setup[s.get("setup_id")] = s
         sim_available = True
     except Exception:  # noqa: BLE001
         pass
 
-    # 3. G-code digest (best-effort)
+    # 3. G-code digest (best-effort). cam_post returns {ok, gcode, line_count, tool_changes,
+    # est_time_s, warnings} (core/cam/post.cpp PostResult::to_json) — line/tool-change counts
+    # come from the post itself; only bounds + feed range are parsed from the emitted text.
+    post_r = None
     gcode_text = None
     try:
         post_r = cb.call("cam_post", {"doc_id": jid,
                                       "options": {"program_name": "AICAD",
                                                   "program_number": 1000}})
-        gcode_text = post_r.get("nc_program") or post_r.get("program") or post_r.get("text")
+        gcode_text = post_r.get("gcode")
     except Exception:  # noqa: BLE001
         pass
 
@@ -678,39 +702,49 @@ def _describe_toolpaths_text(job_id: Optional[str] = None) -> str:
             if engage is not None:
                 lines.append(f'    Engage: {engage:.1f}%')
 
-        # Simulation for this setup
+        # Simulation for this setup — SimResult keys narrated verbatim; machined_fraction
+        # is a 0..1 fraction, formatted as a percentage (formatting, not recomputation).
         sim = sim_by_setup.get(setup_id)
         if sim:
-            pct = sim.get("machined_fraction_pct")
-            cycle = sim.get("cycle_time_s") or sim.get("time_s")
-            gouges = sim.get("gouge_count", 0)
-            rapids = sim.get("rapid_through_count", 0)
+            frac = sim.get("machined_fraction")
+            cycle = sim.get("cycle_time_s")
+            gouges = sim.get("gouges", 0)
+            rapids = sim.get("rapid_collisions", 0)
+            remaining = sim.get("remaining_volume_mm3")
             sim_parts = []
-            if pct is not None:
-                sim_parts.append(f"machined {pct:.1f}%")
+            if frac is not None:
+                sim_parts.append(f"machined {frac * 100.0:.1f}%")
+            if remaining is not None:
+                sim_parts.append(f"remaining stock {remaining:.0f} mm3")
             if cycle is not None:
                 sim_parts.append(f"cycle ~{cycle:.1f}s")
-            lines.append(f'  Simulation: {", ".join(sim_parts) if sim_parts else "no data"}')
-            lines.append(f'  Gouges: {gouges}; rapid-through-stock: {rapids}')
+            lines.append(f'  Simulation: {", ".join(sim_parts) if sim_parts else "no data"}'
+                         '  (source: cam_simulate)')
+            lines.append(f'  Gouges: {gouges}; rapid-through-stock collisions: {rapids}'
+                         '  (source: cam_simulate)')
         elif not sim_available:
             lines.append('  Simulation: not run — call cam_simulate for cycle time and gouge checks')
         else:
             lines.append('  Simulation: no data for this setup')
 
-        # G-code digest
-        if gcode_text:
-            digest = _gcode_digest(gcode_text)
-            b = digest["bounds"]
-            lines.append(
-                f'  G-code digest: {digest["lines"]} lines, '
-                f'bounds X[{b["x"][0]:.3g}..{b["x"][1]:.3g}] '
-                f'Y[{b["y"][0]:.3g}..{b["y"][1]:.3g}] '
-                f'Z[{b["z"][0]:.3g}..{b["z"][1]:.3g}] mm, '
-                f'feed {digest["feed_min"]:.0f}–{digest["feed_max"]:.0f} mm/min, '
-                f'{digest["tool_changes"]} tool change(s)'
-            )
-        else:
-            lines.append('  G-code: not available — run cam_post first')
+    # G-code digest — one per posted program (cam_post posts the whole job).
+    if gcode_text:
+        digest = _gcode_digest(gcode_text)
+        b = digest["bounds"]
+        n_lines = post_r.get("line_count", digest["lines"])
+        n_tc = post_r.get("tool_changes", digest["tool_changes"])
+        est = post_r.get("est_time_s")
+        est_txt = f', est. time {est:.1f}s' if isinstance(est, (int, float)) else ""
+        lines.append(
+            f'\nG-code digest (source: cam_post): {n_lines} lines, '
+            f'bounds X[{b["x"][0]:.3g}..{b["x"][1]:.3g}] '
+            f'Y[{b["y"][0]:.3g}..{b["y"][1]:.3g}] '
+            f'Z[{b["z"][0]:.3g}..{b["z"][1]:.3g}] mm, '
+            f'feed {digest["feed_min"]:.0f}–{digest["feed_max"]:.0f} mm/min, '
+            f'{n_tc} tool change(s){est_txt}'
+        )
+    else:
+        lines.append('\nG-code: not available — run cam_post first')
 
     if not setups:
         lines.append('No setups configured — call cam_add_setup to add one.')
@@ -720,10 +754,11 @@ def _describe_toolpaths_text(job_id: Optional[str] = None) -> str:
 
 
 def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str:
-    """Narrate FEA/CFD results — data from doc_studies only, never recomputed."""
+    """Narrate FEA/CFD results — data from the doc's persisted studies (sim_study_list, the
+    same records _persist_study writes after every solve) — never recomputed."""
     studies = []
     try:
-        studies_r = cb.call("doc_studies", {"doc_id": doc_id})
+        studies_r = cb.call("sim_study_list", {"doc_id": doc_id})
         studies = studies_r.get("studies", [])
     except Exception:  # noqa: BLE001
         pass
@@ -767,13 +802,17 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
         lines.append('\nStatic stress:')
         if vm is not None:
             lines.append(f'  Max von Mises stress: {vm:.1f} MPa  (source: run_fea_static)')
-            face_loc = _stress_face_location(doc_id, results)
-            if face_loc:
-                lines.append(f'  Stress location: {face_loc}')
-            else:
-                lines.append('  Stress location: not resolved — call hover(sid) after query_geometry()')
         else:
             lines.append('  Max von Mises stress: not available')
+        bc = _study_bc_faces(doc_id, study)
+        if bc["fixed"]:
+            lines.append(f'  Fixed at: {", ".join(bc["fixed"][:4])}  (sid join of the stored '
+                         'fixture queries)')
+        if bc["loaded"]:
+            lines.append(f'  Load applied on: {", ".join(bc["loaded"][:4])}  (sid join of the '
+                         'stored load queries)')
+        lines.append('  Max-stress node location: not stored in the study record — the study '
+                     'persists summary scalars only; re-run run_fea_static for the live field.')
 
         if disp is not None:
             lines.append(f'  Max displacement: {disp:.3f} mm  (source: run_fea_static)')
@@ -820,7 +859,8 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
             if isinstance(v, (int, float)):
                 lines.append(f'  {k}: {v}')
 
-    lines.append('\n(Source: doc_studies — numbers narrated from stored study, never recomputed)')
+    lines.append('\n(Source: sim_study_list — numbers narrated from the stored study, '
+                 'never recomputed)')
     return _dumps({"ok": True, "text": "\n".join(lines)})
 
 

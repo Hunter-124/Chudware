@@ -918,10 +918,10 @@ def cad_guide_text(topic: str = "overview") -> str:
         return _INTAKE_GUIDE
     if topic in ("gsl", "describe", "outline", "digest", "adjacency"):
         return _GSL_GUIDE
-    if topic in ("cam", "machining", "gcode", "g-code", "mill", "nc"):
+    if topic in ("cam", "machining", "toolpath", "toolpaths", "gcode", "g-code", "mill", "nc"):
         return _CAM_GUIDE
     if topic in ("narration", "narrate", "describe_toolpaths", "describe_results",
-                 "toolpaths", "toolpath", "results", "fea_results", "cfd_results"):
+                 "results", "fea_results", "cfd_results"):
         return (
             "NARRATION TOOLS — compact text summaries of CAM and FEA/CFD data:\n\n"
             "  describe_toolpaths([job_id])\n"

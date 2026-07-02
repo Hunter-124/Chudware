@@ -55,7 +55,31 @@ ECAD (promote the bespoke `ecad_status` into the GSL layer), and the DAG run its
   - `test_describe_project_no_run_graceful` — graceful no-run message
   - `test_describe_project_full_run` — full node/budget/questions narration
   - `test_describe_project_empty_nodes` — empty-node degradation
-  - (21 total tests in file; all skip cleanly when libaicad not staged — same baseline as T-F7)
+
+### Real-engine test run (sonnet-rune CORRECTION, foreman-held review)
+
+**21 passed / 0 skipped / 0 failed** in `services/mcp/test_gsl_tools.py` against the
+real engine — the 13 pre-existing T-F7-era tests (regression check on the
+`_format_fit` extraction, which touched loop.py + gsl_tools.py imports) AND the
+8 new T-F8 tests, including the live ECAD schematic narration test.
+
+How: the worktree lacks `core/build-occt-linux/bin/` and `host/build-linux/bin/`
+(the two Linux dirs `core_bridge._lib_candidates()` probes), so `cb.available()`
+was False and everything skipped. The gate's own stage-2 build (OCCT ON) lands at
+`core/build-linux/bin/libaicad.so` in this worktree — pointed the documented
+escape hatch at it:
+
+```
+AI_CAD_LIBAICAD=$PWD/core/build-linux/bin/libaicad.so \
+  ~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest services/mcp/test_gsl_tools.py -q
+```
+
+Also verified: `services/agent/loop.py` imports cleanly and `_format_fit` resolves
+to `mcp_server.fit_narration`. The `services/agent/test_loop_mock.py` collection
+error (`FileNotFoundError: services/engine/samples/mounting_plate.py`) is
+baseline-proven pre-existing — the `samples/` path is absent on the base
+`task/T-F7-narration-core` branch too. No legitimately skipping tests remain;
+nothing sim-dependent skipped.
 
 ### Follow-ups inherited from T-F7 (not in scope for T-F8)
 

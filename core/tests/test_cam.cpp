@@ -966,4 +966,8 @@ TEST_CASE("op: adaptive arc-blend linking bounds ring-transition engagement on a
     REQUIRE(off.ok);
     CHECK(off.path.cut_length > 0);
     CHECK(has_warning_containing(off.warnings, "ring-transition engagement exceeds"));
+
+    // Confirm ring transitions are actually arc moves with arc-blend ON (not
+    // just a smaller straight-line gap) -- the headline deliverable.
+    CHECK(count_kind(on.path, MoveKind::Arc) > count_kind(off.path, MoveKind::Arc));
 }

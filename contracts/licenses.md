@@ -70,6 +70,11 @@
 | **CoolProp** (optional backend) | **MIT** | piping module: thermophysical property backend (`engine/piping/properties.py`) — REFPROP-grade density/viscosity/vapour-pressure EOS | ok. **Optional, feature-detected, soft-fail** — `properties.fluid_properties` prefers CoolProp when importable and otherwise falls back to a cited built-in model (ideal-gas + Sutherland + tabulated IAPWS water). **NOT** added as a hard install dependency by T-E3; no CoolProp code is bundled. If a user installs it, it links in-process (MIT, GPL-clean). |
 | **thermo** (optional backend) | **MIT** | piping module: second thermophysical property backend (`engine/piping/properties.py`), Caleb Bell family (same author as `fluids`/`chemicals`/`ht`) | ok. **Optional, feature-detected, soft-fail** — used only when importable, after CoolProp, before the cited built-in fallback. Pure-Python (numpy/scipy/`fluids` already present). **NOT** a hard install dependency of T-E3; no code bundled. |
 | **fmpy** (optional backend) | **BSD-2-Clause** | hydraulic module: FMU execution backend (`engine/hydraulic/solve.fmu_simulate`) for OpenHydraulics Modelica circuits | ok. **Optional, feature-detected, soft-fail** — `fmu_simulate` returns `{"ok": False, "skipped": True}` when absent. NOT a hard install dependency; no FMU or Modelica source bundled. If a user installs it, it links in-process (BSD-2-Clause, GPL-clean). |
+| **langgraph** (1.2.7) | MIT | DAG orchestrator state machine (services/dag/) — T-A1 | ok |
+| **langgraph-checkpoint-sqlite** (3.1.0) | MIT | SQLite persistence for DAG run checkpoints (services/dag/) — T-A1 | ok |
+| **aiosqlite** (0.22.1, transitive) | MIT | async SQLite backend for langgraph-checkpoint-sqlite | ok |
+| **langchain-core** (1.4.8, transitive) | MIT | langgraph dependency | ok |
+| **langsmith** (0.9.6, transitive) | MIT | langgraph tracing dep (no API key required) | ok |
 
 Rules:
 - Adding any dependency requires a row here in the same change.

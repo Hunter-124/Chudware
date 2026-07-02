@@ -124,6 +124,7 @@ Rule: the ECAD default distribution stays **GPL-clean**, identical to the CAD po
 | **peft** | **Apache-2.0** | HuggingFace PEFT — LoRA adapter training | ok — in-process, dev/internal only; lazy import. Never shipped in the desktop installer. |
 | **Unsloth** | **Apache-2.0** | Fast LoRA training via custom CUDA kernels | ok — in-process, dev/internal only; lazy import with fallback to plain TRL. Never shipped in the desktop installer. |
 | **PyYAML** | **MIT** | YAML recipe file parsing | ok — in-process; already a common transitive dep. Never shipped in the desktop installer. |
+| **Translator base weights** (T-F11): Qwen3-4B-Instruct-2507; Gemma 3 4B-it (+ their Q4_K_M GGUF) | Qwen3 = **Apache-2.0**; Gemma 3 = **Gemma ToU** (commercial OK, restrictions) | Pillar-13 learned narration translator (state→text); served locally | ok — served **subprocess-only** via the llama.cpp MIT runtime row above (drop-in for the existing local-model default). NOT vendored — downloaded out-of-band (`tools/translator/candidates.py:provision_instructions`). Qwen3-4B is the license-clean PRIMARY; Gemma 3 4B is the parallel candidate (verify Gemma ToU restrictions before shipping it as default). RULED OUT: Qwen2.5-3B (non-commercial research license). |
 ## Structural section data (T-D3)
 
 | item | license | role | posture |

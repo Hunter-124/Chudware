@@ -3,7 +3,7 @@ id: T-V2
 title: MCP runtime reality audit - dead tools, undeclared deps, missing binaries
 workstream: V
 owner: sonnet-vega
-status: doing
+status: done
 branch: task/T-V2-mcp-runtime-audit
 day: 2
 priority: 2
@@ -41,11 +41,11 @@ files don't even collect in mcp-venv), engine.paths.DATA AttributeError
 
 ## Definition of done
 
-- [ ] Verdict table covers every registered tool (real call counts)
-- [ ] Undeclared-dep list with install/declare lines (licenses checked)
-- [ ] Sweep-pollution top offenders identified with root causes
-- [ ] Proposed-task table for anything DEAD
-- [ ] `graphify update .` run
+- [x] Verdict table covers every registered tool (real call counts) — 182 tools, 0 DEAD
+- [x] Undeclared-dep list with install/declare lines (licenses checked) — 4 undeclared, 21 unprovisioned
+- [x] Sweep-pollution top offenders identified with root causes — 7 true regressions, 3 root causes
+- [x] Proposed-task table for anything DEAD — T-V3..T-V8 (no DEAD tools; table covers gaps)
+- [x] `graphify update .` run
 
 ## Progress log
 - 2026-07-02 22:50 UTC [sonnet-vega] REVIEW — branch task/T-V2-mcp-runtime-audit pushed.

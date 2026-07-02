@@ -2,8 +2,8 @@
 id: T-H6
 title: Fleet training runner - claim-based job queue, cross-OS profiles, MLflow tracking
 workstream: H
-owner: unassigned
-status: todo
+owner: sonnet-kier
+status: doing
 branch: task/T-H6-fleet-runner
 day: 13
 depends_on: [T-H5]

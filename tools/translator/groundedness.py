@@ -92,7 +92,8 @@ def is_stub() -> bool:
     return isinstance(_CHECKER, _MembershipStub)
 
 
-__all__ = ["Verdict", "GroundednessChecker", "set_checker", "get_checker", "check", "is_stub"]
+__all__ = ["Verdict", "GroundednessChecker", "H4GroundednessAdapter",
+           "set_checker", "get_checker", "check", "is_stub"]
 
 
 # ===========================================================================
@@ -214,6 +215,97 @@ def _values_match(extracted: float, slot_val: float) -> bool:
     return rel <= 0.05
 
 
+def _verdicts_from_state(model_text: str, state_dict: dict) -> tuple[
+    list[tuple[float, str, float]],  # extracted: (raw_val, unit, norm_val)
+    list[tuple[str, float]],          # slot_norms: (name, val)
+    list[dict],                        # matched
+    list[dict],                        # spurious
+    set[str],                          # used_slots
+]:
+    """Core matching logic shared by check_groundedness() and H4GroundednessAdapter.
+
+    Returns the raw decomposed result so both callers can derive their surface
+    (dict for the battery, list[Verdict] for the GroundednessChecker protocol)
+    from one canonical implementation.
+    """
+    raw_pairs = _parse_numerals(model_text)
+    extracted: list[tuple[float, str, float]] = []
+    for raw_val, unit in raw_pairs:
+        norm_val = _normalize(raw_val, unit)
+        extracted.append((raw_val, unit, norm_val))
+
+    slot_norms = _flatten(state_dict)
+
+    matched: list[dict] = []
+    spurious: list[dict] = []
+    used_slots: set[str] = set()
+
+    for raw_val, unit, norm_val in extracted:
+        best_slot = None
+        for slot_name, slot_val in slot_norms:
+            if slot_name in used_slots:
+                continue
+            if _values_match(norm_val, slot_val) or _values_match(raw_val, slot_val):
+                best_slot = (slot_name, slot_val)
+                break
+        if best_slot:
+            used_slots.add(best_slot[0])
+            matched.append({
+                "extracted": raw_val,
+                "unit": unit,
+                "slot": best_slot[0],
+                "slot_value": best_slot[1],
+            })
+        else:
+            spurious.append({"extracted": raw_val, "unit": unit})
+
+    return extracted, slot_norms, matched, spurious, used_slots
+
+
+class H4GroundednessAdapter:
+    """GroundednessChecker implementation wrapping the T-H4 check_groundedness() logic.
+
+    Implements the GroundednessChecker Protocol (one Verdict per numeral in `text`)
+    by delegating to _verdicts_from_state(), the same core used by check_groundedness().
+    Install via set_checker(H4GroundednessAdapter()) to upgrade the module default from
+    the _MembershipStub floor to the full T-H4 verify-battery semantics.
+
+    NOTE (alignment TODO): test_groundedness_is_stub_by_default in the T-F10 suite
+    asserts is_stub() is True, pinning _MembershipStub as the process-start default.
+    Until that test is updated to accept the adapter as default, the module-level
+    default remains _MembershipStub. See work/questions/align-post-merge.md.
+    """
+
+    def check(self, text: str, state: dict) -> list[Verdict]:
+        """Return one Verdict per numeral in text, in extraction order."""
+        raw_pairs = _parse_numerals(text)
+        slot_norms = _flatten(state)
+        used_slots: set[str] = set()
+        verdicts: list[Verdict] = []
+
+        for raw_val, unit in raw_pairs:
+            norm_val = _normalize(raw_val, unit)
+            best_slot: tuple[str, float] | None = None
+            for slot_name, slot_val in slot_norms:
+                if slot_name in used_slots:
+                    continue
+                if _values_match(norm_val, slot_val) or _values_match(raw_val, slot_val):
+                    best_slot = (slot_name, slot_val)
+                    break
+            if best_slot:
+                used_slots.add(best_slot[0])
+                verdicts.append(Verdict(
+                    value=raw_val,
+                    unit=unit,
+                    grounded=True,
+                    matched_path=best_slot[0],
+                ))
+            else:
+                verdicts.append(Verdict(value=raw_val, unit=unit, grounded=False))
+
+        return verdicts
+
+
 def check_groundedness(model_text: str, state_dict: dict) -> dict:
     """Slot-match numerals extracted from model_text against state_dict numerics.
 
@@ -225,49 +317,14 @@ def check_groundedness(model_text: str, state_dict: dict) -> dict:
             "unmentioned_state": list of {slot, value},  # in state, never cited (informational)
         }
     """
-    # Extract and normalize numerals from text
-    raw_pairs = _parse_numerals(model_text)
-    extracted: list[tuple[float, str, float]] = []  # (raw_val, unit, norm_val)
-    for raw_val, unit in raw_pairs:
-        norm_val = _normalize(raw_val, unit)
-        extracted.append((raw_val, unit, norm_val))
-
-    # Flatten state dict to (slot_name, slot_value) pairs (numeric only)
-    slots = _flatten(state_dict)
-    # Also try normalizing slot values (they are assumed to be in SI already)
-    slot_norms = [(name, val) for name, val in slots]
+    extracted, slot_norms, matched, spurious, used_slots = _verdicts_from_state(
+        model_text, state_dict
+    )
 
     # Edge case: no numerals in the text → vacuously grounded (nothing to hallucinate)
     if not extracted:
         return {"score": 1.0, "matched": [], "spurious": [],
                 "unmentioned_state": [{"slot": n, "value": v} for n, v in slot_norms]}
-
-    matched: list[dict] = []
-    spurious: list[dict] = []
-    used_slots: set[str] = set()
-
-    for raw_val, unit, norm_val in extracted:
-        best_slot = None
-        # Try direct match with each unit family: the extracted norm_val may be in
-        # a different SI family than the slot value (e.g., both mm after conversion).
-        # We also try matching the raw value directly against slots.
-        for slot_name, slot_val in slot_norms:
-            if slot_name in used_slots:
-                continue
-            if _values_match(norm_val, slot_val) or _values_match(raw_val, slot_val):
-                best_slot = (slot_name, slot_val)
-                break
-
-        if best_slot:
-            used_slots.add(best_slot[0])
-            matched.append({
-                "extracted": raw_val,
-                "unit": unit,
-                "slot": best_slot[0],
-                "slot_value": best_slot[1],
-            })
-        else:
-            spurious.append({"extracted": raw_val, "unit": unit})
 
     unmentioned = [
         {"slot": name, "value": val}

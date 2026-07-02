@@ -5,6 +5,7 @@
 #include "ui/viewport.h"
 #include "ui/scenarios.h"
 #include "ui/cursors.h"
+#include "ui/cam/cam_panel.h"
 #include "ui/command_search.h"
 #include "ui/file_explorer.h"
 #include "ui/settings_modal.h"
@@ -171,6 +172,15 @@ void Application::frame() {
     }
     ImGui::End();
     ImGui::PopStyleVar();
+
+    // H1: CAM (Manufacture) workspace — shares the central dock node with Viewport/ECAD
+    // (layout.cpp pre-docks all three; the node hides its tab bar, so camTakeFocusRequest()
+    // drives which one is forward). Self-contained, no-op-safe: drawCamManager renders an
+    // empty-job toolbar/tree until a cam_* command or camLoadJob() populates it.
+    if (ui::camTakeFocusRequest()) ImGui::SetNextWindowFocus();
+    if (ImGui::Begin("CAM", nullptr, pflags))
+        ui::drawCamManager(s);
+    ImGui::End();
 
     if (ImGui::Begin("Assistant###agent", nullptr, pflags))
         ui::drawAgentPanel(s);

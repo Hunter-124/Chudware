@@ -8,6 +8,7 @@ loaded (e.g. the C++ core hasn't been built) so it never blocks a Python-only ru
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 import tempfile
@@ -33,6 +34,191 @@ def _build_part_step() -> str:
     path = os.path.join(tempfile.gettempdir(), "aicad_camtest.step")
     cb.call("export_file", {"doc_id": doc, "path": path, "format": "step"})
     return path
+
+
+def _check_hole_extraction(cb, check) -> None:  # noqa: ANN001 - cb module + check() closure
+    """T-M5 hole-extraction upgrade: real-geometry checks for counterbore/countersink/
+    tilted-hole records and the kind="sections"/"profile" extract modes.
+
+    All ops go through the doc C ABI (doc_new/add_feature/doc_apply_ops/export_file),
+    same as _build_part_step, then cam_extract reads the exported STEP.
+    """
+
+    def dim(v):
+        return {"value": v, "expr": None}
+
+    # --- counterbore / countersink / simple holes on an 80x80x20 box -----------------
+    doc = None
+    try:
+        nd = cb.call("doc_new", {"kind": "part", "name": "HoleExtractTest"})
+        doc = nd.get("doc_id") or nd.get("id")
+        ops = [
+            {"op": "add_feature", "feature": {"type": "box", "name": "B1",
+                "params": {"length": dim(80), "width": dim(80), "height": dim(20),
+                           "centered": True}}},
+            {"op": "add_feature", "feature": {"type": "hole", "name": "Hcb",
+                "params": {"face": {"of": "face", "side": "top"}, "style": "cbore",
+                           "diameter": 6, "cbore_d": 12, "cbore_depth": 5,
+                           "end": "through_all", "positions": [[-25, 0]]}}},
+            {"op": "add_feature", "feature": {"type": "hole", "name": "Hcs",
+                "params": {"face": {"of": "face", "side": "top"}, "style": "csink",
+                           "diameter": 6, "csink_d": 12, "csink_angle": 90,
+                           "end": "through_all", "positions": [[0, 0]]}}},
+            {"op": "add_feature", "feature": {"type": "hole", "name": "Hs",
+                "params": {"face": {"of": "face", "side": "top"}, "style": "simple",
+                           "diameter": 5, "end": "through_all", "positions": [[25, 0]]}}},
+        ]
+        r = cb.call("doc_apply_ops", {"doc_id": doc, "base_revision": -1, "ops": ops})
+        fs = r["rebuild"]["feature_status"]
+        check(all(s.get("ok") for s in fs),
+              "cbore/csink/simple hole features built ok "
+              f"({[s.get('error') for s in fs if not s.get('ok')]})")
+
+        path = os.path.join(tempfile.gettempdir(), "aicad_cam_holeextract.step")
+        cb.call("export_file", {"doc_id": doc, "path": path, "format": "step"})
+        ex = cb.call("cam_extract", {"path": path, "kind": "holes"})
+        holes = ex.get("holes", [])
+        check(len(holes) == 3, f"3 holes extracted from the cbore/csink/simple part (got {len(holes)})")
+
+        by_kind = {h.get("kind"): h for h in holes}
+
+        cbore = by_kind.get("counterbore")
+        check(cbore is not None, "a 'counterbore' record is present in holes[]")
+        if cbore:
+            check(abs(cbore.get("dia", 0) - 6) < 0.5, f"counterbore dia ~6 (got {cbore.get('dia')})")
+            check(abs(cbore.get("dia_major", 0) - 12) < 0.5,
+                  f"counterbore dia_major ~12 (got {cbore.get('dia_major')})")
+            check(abs(cbore.get("dia_minor", 0) - 6) < 0.5,
+                  f"counterbore dia_minor ~6 (got {cbore.get('dia_minor')})")
+            check(abs(cbore.get("depth_major", 0) - 5) < 1.0,
+                  f"counterbore depth_major ~5 (got {cbore.get('depth_major')})")
+            check(cbore.get("depth_minor", 0) > 10,
+                  f"counterbore depth_minor > 10 (got {cbore.get('depth_minor')})")
+            check(abs(cbore.get("tilt_deg", 99) - 0) < 0.5,
+                  f"counterbore tilt_deg ~0 (got {cbore.get('tilt_deg')})")
+
+        csink = by_kind.get("countersink")
+        check(csink is not None, "a 'countersink' record is present in holes[]")
+        if csink:
+            check(abs(csink.get("dia", 0) - 6) < 0.5, f"countersink dia ~6 (got {csink.get('dia')})")
+            check(abs(csink.get("csink_angle_deg", 0) - 90) < 2.0,
+                  f"countersink csink_angle_deg ~90 (got {csink.get('csink_angle_deg')})")
+            check(abs(csink.get("csink_outer_dia", 0) - 12) < 0.5,
+                  f"countersink csink_outer_dia ~12 (got {csink.get('csink_outer_dia')})")
+            check(abs(csink.get("tilt_deg", 99) - 0) < 0.5,
+                  f"countersink tilt_deg ~0 (got {csink.get('tilt_deg')})")
+
+        simple = by_kind.get("simple")
+        check(simple is not None, "a 'simple' hole record is present in holes[]")
+        if simple:
+            check(abs(simple.get("dia", 0) - 5) < 0.5, f"simple hole dia ~5 (got {simple.get('dia')})")
+            check(abs(simple.get("tilt_deg", 99) - 0) < 0.5,
+                  f"simple hole tilt_deg ~0 (got {simple.get('tilt_deg')})")
+
+        # --- kind="sections" -----------------------------------------------------
+        sec = cb.call("cam_extract", {"path": path, "kind": "sections", "z_levels": [-5, 0, 5]})
+        check("bbox" in sec and "levels" in sec, "sections extract returns bbox+levels")
+        levels = sec.get("levels", [])
+        check(len(levels) == 3, f"sections extract has 3 z-levels (got {len(levels)})")
+        check(all("regions" in lv for lv in levels), "every section level carries a 'regions' key")
+        check(all(len(lv.get("regions", [])) > 0 for lv in levels),
+              "every section level has at least one region")
+
+        # --- kind="profile" --------------------------------------------------------
+        prof = cb.call("cam_extract", {"path": path, "kind": "profile"})
+        check("bbox" in prof and "profile" in prof, "profile extract returns bbox+profile")
+        check(len(prof.get("profile", [])) > 0, "profile extract returns a non-empty [z,x] list")
+    except Exception as e:  # noqa: BLE001
+        check(False, f"counterbore/countersink/simple/sections/profile extraction: {e}")
+    finally:
+        if doc is not None:
+            try:
+                cb.call("cam_close", {"doc_id": doc})
+            except Exception:  # noqa: BLE001
+                pass
+
+    # --- tilted hole -------------------------------------------------------------
+    # T-M5 upgrade: the extractor now accepts holes with |axis.Z()| >= 0.95 (tilt up
+    # to ~18deg) instead of the old >= 0.99 threshold. Build a hole tilted ~10deg
+    # (cos(10deg) ~= 0.985 -- rejected by the OLD 0.99 threshold, accepted by the
+    # NEW 0.95 one) by drilling normal to a sloped face made from a box's top face
+    # via an asymmetric two-distance chamfer that consumes (almost) the whole face.
+    #
+    # Empirically determined (core/geom/dress.cpp chamfer_edges_two_distance, via
+    # BRepFilletAPI_MakeChamfer::Add(d1, d2, edge, face) where `face` is the edge's
+    # FIRST incident face per TopExp::MapShapesAndAncestors):
+    #   - params.distance (leg 1) lands on the box's FRONT face -> bounded by the
+    #     box HEIGHT (>= height fails "too large").
+    #   - params.length2  (leg 2) lands on the box's TOP face   -> bounded by the
+    #     box WIDTH (>= width fails "too large"; must stay strictly under it).
+    # A leg2 just under the box width turns (almost) the entire top face into one
+    # sloped plane, tilted by atan(leg1/leg2) from horizontal.
+    tilt_doc = None
+    try:
+        box_w = 60.0
+        top_leg = 59.99  # just under box_w -> consumes ~the whole top face
+        tilt_target_deg = 10.0
+        front_leg = top_leg * math.tan(math.radians(tilt_target_deg))
+
+        nd2 = cb.call("doc_new", {"kind": "part", "name": "TiltedHoleTest"})
+        tilt_doc = nd2.get("doc_id") or nd2.get("id")
+        ops2 = [
+            {"op": "add_feature", "feature": {"type": "box", "name": "B1",
+                "params": {"length": dim(box_w), "width": dim(box_w), "height": dim(20),
+                           "centered": True}}},
+            {"op": "add_feature", "feature": {"type": "chamfer", "name": "Ch1",
+                "params": {"distance": front_leg, "length2": top_leg},
+                "refs": {"edges": {"of": "edge", "near": [0, -box_w / 2, 10], "count": 1}}}},
+        ]
+        r1 = cb.call("doc_apply_ops", {"doc_id": tilt_doc, "base_revision": -1, "ops": ops2})
+        fs1 = r1["rebuild"]["feature_status"]
+        chamfer_ok = all(s.get("ok") for s in fs1)
+        if not chamfer_ok:
+            print("  skip: tilted-hole chamfer build failed: "
+                  f"{[s.get('error') for s in fs1 if not s.get('ok')]}")
+        else:
+            # Drill normal to the sloped face, targeting a point that sits ON that
+            # face (NOT the {"side":"top"} query, which would instead pick the thin
+            # sliver of ORIGINAL flat top face left over from top_leg < box_w).
+            zmid = 10 - front_leg * 0.5
+            ops3 = [
+                {"op": "add_feature", "feature": {"type": "hole", "name": "Ht",
+                    "params": {"face": {"of": "face", "near": [0, 0, zmid], "count": 1},
+                               "style": "simple", "diameter": 5, "end": "through_all",
+                               "positions": [[0, 0]]}}},
+            ]
+            r2 = cb.call("doc_apply_ops",
+                         {"doc_id": tilt_doc, "base_revision": r1["revision"], "ops": ops3})
+            fs2 = r2["rebuild"]["feature_status"]
+            hole_ok = all(s.get("ok") for s in fs2)
+            if not hole_ok:
+                print("  skip: tilted-hole drill failed: "
+                      f"{[s.get('error') for s in fs2 if not s.get('ok')]}")
+            else:
+                path2 = os.path.join(tempfile.gettempdir(), "aicad_cam_tilted.step")
+                cb.call("export_file", {"doc_id": tilt_doc, "path": path2, "format": "step"})
+                ext = cb.call("cam_extract", {"path": path2, "kind": "holes"})
+                tholes = ext.get("holes", [])
+                tilted = [h for h in tholes if h.get("tilt_deg", 0) > 5]
+                check(len(tilted) >= 1,
+                      "a tilted hole (tilt_deg > 5) appears in holes[] "
+                      f"(got tilt_deg values {[h.get('tilt_deg') for h in tholes]})")
+                if tilted:
+                    check(tilted[0]["tilt_deg"] < 18,
+                          "tilted hole's tilt_deg is within the new-threshold-accepted range "
+                          f"(<18deg, got {tilted[0]['tilt_deg']})")
+                    # Pin dia too, so the tilt>5 match is provably the Ø5 bore we drilled
+                    # (not some other artifact) -- both fields are exact/stable here.
+                    check(abs(tilted[0].get("dia", 0) - 5) < 0.5,
+                          f"tilted hole dia ~5 (got {tilted[0].get('dia')})")
+    except Exception as e:  # noqa: BLE001
+        check(False, f"tilted-hole extraction: {e}")
+    finally:
+        if tilt_doc is not None:
+            try:
+                cb.call("cam_close", {"doc_id": tilt_doc})
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def main() -> int:
@@ -111,6 +297,10 @@ def main() -> int:
         check(len(ex["mesh"]["tris"]) > 0, "extract produced a mesh")
     except Exception as e:  # noqa: BLE001
         check(False, f"cam_extract on a real STEP: {e}")
+
+    # T-M5: hole-extraction upgrade (counterbore/countersink/tilted holes) +
+    # kind="sections"/"profile" extract modes, on real geometry.
+    _check_hole_extraction(cb, check)
 
     cb.call("cam_close", {"doc_id": doc})
 

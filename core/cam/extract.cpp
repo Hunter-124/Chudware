@@ -255,16 +255,21 @@ json holes_json(const std::vector<TopoDS_Shape>& shapes) {
         const Cyl& major = cyls[g.back()];   // largest dia
         double ztop = -1e30, zbot = 1e30;
         for (int idx : g) { ztop = std::max(ztop, cyls[idx].ztop); zbot = std::min(zbot, cyls[idx].zbot); }
+        // Report AXIAL depth (bore length along the tool axis), not the Z-projection: for a
+        // tilted hole the drilled depth a driller needs is z_extent / cos(tilt). |axis.Z()| =
+        // cos(tilt); guarded so a (near-)horizontal axis can't divide by ~0. Vertical holes
+        // (tilt≈0, cos≈1) are unchanged, so counterbore depth_major/minor stay as before.
+        const double axz = std::max(1e-3, std::cos(minor.tilt * PI / 180.0));
 
         json rec{{"x", minor.x}, {"y", minor.y}, {"z", ztop}, {"dia", minor.r * 2},
-                 {"depth", ztop - zbot}, {"tilt_deg", minor.tilt}};
+                 {"depth", (ztop - zbot) / axz}, {"tilt_deg", minor.tilt}};
         std::string kind = "simple";
         if (g.size() >= 2 && std::fabs(major.r - minor.r) > 1e-3) {
             kind = "counterbore";
             rec["dia_major"] = major.r * 2;
             rec["dia_minor"] = minor.r * 2;
-            rec["depth_major"] = major.ztop - major.zbot;
-            rec["depth_minor"] = minor.ztop - minor.zbot;
+            rec["depth_major"] = (major.ztop - major.zbot) / axz;
+            rec["depth_minor"] = (minor.ztop - minor.zbot) / axz;
         }
         // Attach a coaxial cone -> countersink on this hole.
         for (auto& cn : cones)

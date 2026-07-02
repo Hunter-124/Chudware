@@ -426,6 +426,43 @@ class TestGateEvents:
         event_types = [e[0] for e in events]
         assert "dag.node.manual_required" in event_types
 
+    def test_gate_events_fire_exactly_once_across_resume(self):
+        """Pause events must not double-emit on resume.
+
+        On resume LangGraph re-executes the node handler from the top, so events
+        emitted inside the handler would fire twice.  The fix emits them from
+        executor.run()/resume() off the surfaced interrupt payloads — exactly
+        once per suspend.  A single-gate run + approve-resume must therefore
+        produce exactly ONE dag.node.paused and ONE dag.node.approval_required.
+        """
+        graph = _make_graph(node_autonomy="approve", node_type="gate")
+        events: list[tuple[str, dict]] = []
+        with tempfile.TemporaryDirectory() as td:
+            runs_dir = Path(td)
+            r1 = executor.run(
+                graph,
+                runs_dir=runs_dir,
+                agent_fn=_mock_agent,
+                emit=lambda t, p: events.append((t, p)),
+            )
+            assert r1["status"] == "paused"
+            r2 = executor.resume(
+                r1["run_id"],
+                graph_json=graph,
+                decision=DECISION_APPROVE,
+                runs_dir=runs_dir,
+                agent_fn=_mock_agent,
+                emit=lambda t, p: events.append((t, p)),
+            )
+        assert r2["status"] == "done"
+        gate_pauses = [
+            p for t, p in events
+            if t == "dag.node.paused" and p.get("reason") == "gate"
+        ]
+        approvals = [p for t, p in events if t == "dag.node.approval_required"]
+        assert len(gate_pauses) == 1, f"dag.node.paused double-emitted: {gate_pauses}"
+        assert len(approvals) == 1, f"approval_required double-emitted: {approvals}"
+
     def test_pause_event_carries_run_id(self):
         graph = _make_graph(node_autonomy="approve", node_type="gate")
         run_id = str(uuid.uuid4())
@@ -441,3 +478,121 @@ class TestGateEvents:
         pause_payloads = [p for t, p in events if t == "dag.node.paused"]
         assert pause_payloads, "dag.node.paused event must be emitted"
         assert pause_payloads[0].get("run_id") == run_id
+
+
+# ---------------------------------------------------------------------------
+# §6 — "modify" decision override + fail-closed unrecognised decisions
+# ---------------------------------------------------------------------------
+
+class TestModifyDecision:
+    """A 'modify' decision's user-supplied output must actually land in state."""
+
+    def test_modify_output_lands_in_node_state(self):
+        """resume(decision={'action': 'modify', ...}) completes the node with
+        the user-supplied output — the override reaches downstream state."""
+        graph = _make_graph(node_autonomy="manual", node_type="design")
+        user_output = {"answer": 42, "note": "human-edited"}
+        with tempfile.TemporaryDirectory() as td:
+            runs_dir = Path(td)
+            r1 = executor.run(graph, runs_dir=runs_dir, agent_fn=_mock_agent)
+            assert r1["status"] == "paused"
+            r2 = executor.resume(
+                r1["run_id"],
+                graph_json=graph,
+                decision={"action": "modify", "output": user_output},
+                runs_dir=runs_dir,
+                agent_fn=_mock_agent,
+            )
+        assert r2["status"] == "done", f"Expected done after modify, got: {r2['status']}"
+        entry = r2["nodes"]["n_gate"]
+        assert entry["status"] == "done"
+        assert entry["gate_decision"] == "modify"
+        assert entry["output"]["data"] == user_output, (
+            "user-supplied modify output must land in the node's output state"
+        )
+
+    def test_modify_skips_agent_dispatch(self):
+        """With a modify override, the agent must NOT be dispatched for the node."""
+        graph = _make_graph(node_autonomy="approve", node_type="design")
+        calls: list[str] = []
+
+        def counting_agent(request: str, context_pack: dict) -> Any:
+            calls.append(request)
+            return _mock_agent(request, context_pack)
+
+        with tempfile.TemporaryDirectory() as td:
+            runs_dir = Path(td)
+            r1 = executor.run(graph, runs_dir=runs_dir, agent_fn=counting_agent)
+            assert r1["status"] == "paused"
+            assert calls == [], "gated node must not run before the decision"
+            r2 = executor.resume(
+                r1["run_id"],
+                graph_json=graph,
+                decision={"action": "modify", "output": {"k": "v"}},
+                runs_dir=runs_dir,
+                agent_fn=counting_agent,
+            )
+        assert r2["status"] == "done"
+        assert calls == [], (
+            "modify supplies the output directly; the agent must not be dispatched"
+        )
+
+    def test_modify_emits_node_done_event(self):
+        graph = _make_graph(node_autonomy="manual", node_type="design")
+        events: list[tuple[str, dict]] = []
+        with tempfile.TemporaryDirectory() as td:
+            runs_dir = Path(td)
+            r1 = executor.run(graph, runs_dir=runs_dir, agent_fn=_mock_agent)
+            executor.resume(
+                r1["run_id"],
+                graph_json=graph,
+                decision={"action": "modify", "output": {"x": 1}},
+                runs_dir=runs_dir,
+                agent_fn=_mock_agent,
+                emit=lambda t, p: events.append((t, p)),
+            )
+        done_events = [p for t, p in events if t == "dag.node.done"]
+        assert done_events, "modify completion must emit dag.node.done"
+        assert done_events[0]["output"]["data"] == {"x": 1}
+
+
+class TestUnrecognisedDecisionFailsClosed:
+    """A human-approval gate must never fail open: unknown decisions reject."""
+
+    def test_unrecognised_decision_rejects(self):
+        graph = _make_graph(node_autonomy="approve", node_type="gate")
+        with tempfile.TemporaryDirectory() as td:
+            runs_dir = Path(td)
+            r1 = executor.run(graph, runs_dir=runs_dir, agent_fn=_mock_agent)
+            assert r1["status"] == "paused"
+            with pytest.warns(UserWarning, match="unrecognised decision"):
+                r2 = executor.resume(
+                    r1["run_id"],
+                    graph_json=graph,
+                    decision="bogus-decision-value",
+                    runs_dir=runs_dir,
+                    agent_fn=_mock_agent,
+                )
+        assert r2["status"] == "paused", (
+            f"Unrecognised decision must fail closed (paused), got: {r2['status']}"
+        )
+        entry = r2["nodes"]["n_gate"]
+        assert entry["status"] == "paused"
+        assert entry["gate_decision"] == DECISION_REJECT
+
+    def test_unrecognised_dict_decision_rejects(self):
+        """A dict without action='modify' is also unrecognised → reject."""
+        graph = _make_graph(node_autonomy="approve", node_type="gate")
+        with tempfile.TemporaryDirectory() as td:
+            runs_dir = Path(td)
+            r1 = executor.run(graph, runs_dir=runs_dir, agent_fn=_mock_agent)
+            with pytest.warns(UserWarning, match="fail-closed"):
+                r2 = executor.resume(
+                    r1["run_id"],
+                    graph_json=graph,
+                    decision={"action": "overwrite", "output": {"evil": True}},
+                    runs_dir=runs_dir,
+                    agent_fn=_mock_agent,
+                )
+        assert r2["status"] == "paused"
+        assert r2["nodes"]["n_gate"]["gate_decision"] == DECISION_REJECT

@@ -137,6 +137,7 @@ def run(
         interrupt_payloads = [
             i.value if hasattr(i, "value") else i for i in interrupted
         ]
+        _emit_gate_pause_events(emit, run_id, interrupt_payloads)
         return {
             "run_id":       run_id,
             "name":         graph_json.get("name", ""),
@@ -254,6 +255,7 @@ def resume(
         interrupt_payloads = [
             i.value if hasattr(i, "value") else i for i in interrupted
         ]
+        _emit_gate_pause_events(emit, run_id, interrupt_payloads)
         return {
             "run_id":        run_id,
             "name":          graph_json.get("name", ""),
@@ -287,6 +289,51 @@ def resume(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _emit_gate_pause_events(
+    emit: EmitFn,
+    run_id: str,
+    interrupt_payloads: list[Any],
+) -> None:
+    """Emit §11 gate pause events, exactly once per suspend.
+
+    These events CANNOT be emitted inside the node handler: on resume LangGraph
+    re-executes the handler from the top before interrupt() returns, so any emit
+    placed before the interrupt double-fires (see gate.run_gate()).  Emitting
+    here — from the surfaced '__interrupt__' payloads — fires exactly once per
+    suspend: run()/resume() only reach this path when a NEW interrupt surfaced.
+
+    The payloads carry top-level ``node_id`` and ``autonomy`` (effective level)
+    keys written by gate.make_gate_payload() for exactly this purpose.
+    """
+    if not emit:
+        return
+    for payload in interrupt_payloads:
+        if not isinstance(payload, dict):
+            continue
+        node_id = payload.get("node_id", "unknown")
+        autonomy = payload.get("autonomy", "approve")
+        if autonomy == "manual":
+            emit("dag.node.manual_required", {
+                "run_id":  run_id,
+                "node_id": node_id,
+            })
+            emit("dag.node.paused", {
+                "run_id":  run_id,
+                "node_id": node_id,
+                "reason":  "manual",
+            })
+        else:
+            emit("dag.node.paused", {
+                "run_id":  run_id,
+                "node_id": node_id,
+                "reason":  "gate",
+            })
+            emit("dag.node.approval_required", {
+                "run_id":  run_id,
+                "node_id": node_id,
+            })
+
 
 def _resolve_run_status(node_states: dict[str, Any], current: str) -> str:
     """Determine final run status from node outcomes.

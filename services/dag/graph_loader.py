@@ -174,26 +174,23 @@ def _make_node_handler(
         _emit: EmitFn = emit
 
         # --- autonomy gate (T-A3: real interrupt()) --------------------------
-        # Events are emitted HERE (before run_gate) so they fire exactly once,
-        # on the initial suspending call.  run_gate() calls interrupt() which
-        # does NOT return on first call (LangGraph suspends the graph); on resume
-        # interrupt() returns the decision without re-triggering the events.
-        _run_id = state.get("run_id", "unknown")
+        # NOTE on events: dag.node.paused / dag.node.approval_required /
+        # dag.node.manual_required are NOT emitted here.  On resume, LangGraph
+        # re-executes this handler from the top before interrupt() returns the
+        # decision, so any emit placed before run_gate() double-fires (once on
+        # the initial suspend, again on resume).  Instead executor.run()/resume()
+        # emit those events exactly once per suspend, from the surfaced
+        # '__interrupt__' payloads (which carry node_id + autonomy for this).
+        gate_decision: Optional[str] = None
+        gate_user_output: Optional[dict[str, Any]] = None
 
-        if eff_autonomy == "approve":
-            if _emit:
-                _emit("dag.node.paused", {
-                    "run_id":  _run_id,
-                    "node_id": node_id,
-                    "reason":  "gate",
-                })
-                _emit("dag.node.approval_required", {
-                    "run_id":  _run_id,
-                    "node_id": node_id,
-                })
-            decision, extra_patch = gt.run_gate(node, state, emit=_emit)
+        if eff_autonomy in ("approve", "manual"):
+            decision, extra_patch = gt.run_gate(
+                node, state, emit=_emit, autonomy=eff_autonomy
+            )
             if decision == gt.DECISION_REJECT:
-                # Rejected: mark paused without running the node.
+                # Rejected (or unrecognised decision, which fails closed to
+                # reject in run_gate): mark paused without running the node.
                 return {
                     "node_states": {**state.get("node_states", {}),
                                     node_id: {"status": "paused", "output": {},
@@ -201,30 +198,47 @@ def _make_node_handler(
                                               "gate_decision": decision}},
                     "run_status": "paused",
                 }
-            # "approve" or "modify" → fall through to execution below.
-            # For "modify", the user_output override is in extra_patch["user_output"].
+            gate_decision = decision
+            if decision == "modify":
+                # User-supplied output override; applied below instead of
+                # dispatching the agent.
+                gate_user_output = extra_patch.get("user_output", {})
+            # "approve" → fall through to agent execution below.
 
-        elif eff_autonomy == "manual":
+        # --- "modify" decision: user-supplied output override -----------------
+        # The user supplied the node's output directly (manual nodes advertise
+        # this in the gate proposal; approve nodes may also modify).  Record the
+        # node as done with that output — the agent is NOT dispatched, so the
+        # override actually takes effect in downstream state.
+        if gate_user_output is not None:
+            prev_ns = state.get("node_states", {}).get(node_id, {})
+            retry_rem = prev_ns.get("retry_remaining", initial_retry_budget)
+            output_state = {
+                "status": "done",
+                "summary": (
+                    f"Node '{node_name}': user-supplied output override "
+                    "(gate decision 'modify'); agent execution skipped."
+                ),
+                "data": gate_user_output,
+                "retry_remaining": retry_rem,
+                "doc_id": node.get("inputs", {}).get("doc_id"),
+            }
+            node_entry = {
+                "status": "done",
+                "output": output_state,
+                "verdict": nr.VERDICT_DONE,
+                "retry_remaining": retry_rem,
+                "gate_decision": "modify",
+            }
             if _emit:
-                _emit("dag.node.manual_required", {
-                    "run_id":  _run_id,
+                _emit("dag.node.done", {
                     "node_id": node_id,
+                    "output": output_state,
                 })
-                _emit("dag.node.paused", {
-                    "run_id":  _run_id,
-                    "node_id": node_id,
-                    "reason":  "manual",
-                })
-            decision, extra_patch = gt.run_gate(node, state, emit=_emit)
-            if decision == gt.DECISION_REJECT:
-                return {
-                    "node_states": {**state.get("node_states", {}),
-                                    node_id: {"status": "paused", "output": {},
-                                              "verdict": "escalate",
-                                              "gate_decision": decision}},
-                    "run_status": "paused",
-                }
-            # Approved or modified — continue to agent execution below.
+            return {
+                "node_states": {**state.get("node_states", {}),
+                                node_id: node_entry},
+            }
 
         # --- verify node stub (T-A4 owns real logic) -------------------------
         if node_type == "verify":
@@ -268,6 +282,8 @@ def _make_node_handler(
             "verdict": verdict,
             "retry_remaining": output_state.get("retry_remaining", 0),
         }
+        if gate_decision is not None:
+            node_entry["gate_decision"] = gate_decision
 
         new_node_states = {**state.get("node_states", {}), node_id: node_entry}
 

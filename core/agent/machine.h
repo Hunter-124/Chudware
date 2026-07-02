@@ -36,10 +36,13 @@ std::string err_sig(const std::string& err);
 // What an Action reports after one attempt of a stage.
 struct StageOutcome {
     std::string verdict;  // "pass" | "retry" | "fail" | "skip" | "pause"
-    // "pause" (VERDICT_PAUSE) — used by the DAG gate contract (contracts/dag_schema.md §6)
-    // to suspend execution at a human-approval checkpoint.  The LangGraph interrupt()
-    // mechanism in services/dag/gate.py owns the actual suspension; this value is the
-    // C++ sentinel that signals an in-progress stage machine should yield to human input.
+    // "pause" (VERDICT_PAUSE) — RESERVED for the DAG gate contract (contracts/dag_schema.md §6).
+    // NOT WIRED in C++: machine.cpp run_stage() treats only pass/fail/skip/cancelled as
+    // terminal, so an Action returning "pause" today would be retried until the stage
+    // budget is exhausted and land as "fail".  Human-approval suspension is Python-side
+    // only (LangGraph interrupt() in services/dag/gate.py).  C++ wiring is explicitly
+    // deferred — recorded in work/tasks/T-A3.md (Definition of done).  Do not return
+    // "pause" from a C++ Action until run_stage() handles it.
     std::string reason;
     bool has_error = false;  // Python error=None vs a string
     std::string error;

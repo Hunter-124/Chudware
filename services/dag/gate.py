@@ -7,8 +7,11 @@ Wired by: T-A3. Migration seam for T-F4 (thin adapter, not a rewrite).
 The gate node calls LangGraph interrupt() to suspend execution; the user resumes via
 executor.resume(run_id, decision).  The decision is one of:
   "approve"  — proceed with the node as planned
-  "reject"   — mark the node failed (on_fail disposition applies)
-  "modify"   — proceed with a user-supplied output override (carried in decision dict)
+  "reject"   — mark the node paused; the run stays paused (node is not executed)
+  "modify"   — complete the node with a user-supplied output override (carried in
+               the decision dict; the agent is not dispatched)
+Any other value FAILS CLOSED: it is treated as "reject" (with a warning) — an
+unrecognised decision must never be treated as consent on a safety gate.
 
 LangGraph 1.x behaviour (verified empirically, 2026-07-02):
   - interrupt() RETURNS the Command(resume=...) value when resumed; it does NOT raise.
@@ -37,6 +40,7 @@ def make_gate_payload(
     node: dict[str, Any],
     run_id: str,
     batch_id: Optional[str] = None,
+    autonomy: Optional[str] = None,
 ) -> dict[str, Any]:
     """Build the interrupt payload shaped as an aicad.interaction/1 approval batch.
 
@@ -47,15 +51,20 @@ def make_gate_payload(
         node:      The DAG node dict (id, name, type, inputs, autonomy, …).
         run_id:    Current run UUID (for the batch scope).
         batch_id:  Stable batch id (generated if not supplied).
+        autonomy:  EFFECTIVE autonomy level (node level raised by the run-level
+                   default). Falls back to the node's declared level if omitted.
 
     Returns:
-        A dict conforming to aicad.interaction/1 with a single approval question.
+        A dict conforming to aicad.interaction/1 with a single approval question,
+        plus top-level ``node_id`` and ``autonomy`` keys (extra keys are allowed
+        by the contract) so executor.run()/resume() can emit the §11 pause events
+        exactly once per suspend from the surfaced interrupt payload.
     """
     batch_id = batch_id or f"b_{uuid.uuid4().hex[:12]}"
     node_id   = node["id"]
     node_name = node.get("name", node_id)
     node_type = node.get("type", "unknown")
-    autonomy  = node.get("autonomy", "approve")
+    autonomy  = autonomy or node.get("autonomy", "approve")
 
     # Build the proposal text.  For "manual" nodes include a note that the user
     # can supply output directly.
@@ -75,6 +84,8 @@ def make_gate_payload(
         "batch_id":  batch_id,
         "scope":     "run",
         "run_id":    run_id,
+        "node_id":   node_id,     # for executor-level §11 event emission (dedupe)
+        "autonomy":  autonomy,    # effective level; picks paused-reason/manual events
         "blocking":  True,
         "questions": [
             {
@@ -96,6 +107,7 @@ def run_gate(
     node: dict[str, Any],
     state: DagState,
     emit: EmitFn = None,
+    autonomy: Optional[str] = None,
 ) -> tuple[str, dict[str, Any]]:
     """Execute a gate check-point inline inside a node handler.
 
@@ -110,9 +122,13 @@ def run_gate(
         Command(resume=decision).  The handler continues normally.
 
     Args:
-        node:  The node dict.
-        state: Current DagState (used for run_id and emit).
-        emit:  Optional event callback.
+        node:     The node dict.
+        state:    Current DagState (used for run_id and emit).
+        emit:     Optional event callback (currently unused here — see the
+                  emit-dedupe note below; kept for signature stability).
+        autonomy: EFFECTIVE autonomy level from graph_loader (node level raised
+                  by the run-level default). Carried in the interrupt payload so
+                  the executor can emit the right pause events.
 
     Returns:
         (decision_str, extra_state_patch) — decision_str is DECISION_APPROVE,
@@ -123,7 +139,7 @@ def run_gate(
     node_id = node["id"]
 
     # Build the interaction payload (aicad.interaction/1 shape for T-F4 compat).
-    payload = make_gate_payload(node, run_id)
+    payload = make_gate_payload(node, run_id, autonomy=autonomy)
 
     # --- LangGraph interrupt() -------------------------------------------
     # Empirically verified (LangGraph 1.2.7, 2026-07-02):
@@ -136,13 +152,17 @@ def run_gate(
     #     and execution continues normally from the line after interrupt().
     #
     # Consequence for emit: events emitted BEFORE interrupt() fire on BOTH
-    # the initial run (before suspending) and on resume (before the decision
-    # is returned).  Events emitted AFTER interrupt() only fire on resume.
+    # the initial run (before suspending) and on resume — LangGraph re-executes
+    # the node handler from the top on resume, so ANY emit placed above the
+    # interrupt() call double-fires.  Events emitted AFTER interrupt() only
+    # fire on resume.
     #
-    # The caller (graph_loader._make_node_handler) emits dag.node.paused and
-    # dag.node.approval_required BEFORE calling run_gate() so they fire exactly
-    # once, on the initial suspending call.  run_gate() itself does not re-emit
-    # them to avoid double-emission on resume.
+    # Dedupe strategy (empirically forced by the above): neither run_gate()
+    # nor graph_loader._make_node_handler() emits dag.node.paused /
+    # dag.node.approval_required / dag.node.manual_required.  Instead,
+    # executor.run()/resume() emit them exactly once per suspend, from the
+    # surfaced '__interrupt__' payloads — which carry top-level node_id and
+    # autonomy keys for that purpose (see make_gate_payload()).
     decision = interrupt(payload)
 
     # Normalise the decision.
@@ -153,10 +173,13 @@ def run_gate(
     if isinstance(decision, dict) and decision.get("action") == "modify":
         return "modify", {"user_output": decision.get("output", {})}
 
-    # Unknown value — treat as approve (safe default, logged).
+    # Unknown value — FAIL CLOSED.  This is a human-approval safety gate:
+    # an unrecognised decision must never be treated as consent.  Reject
+    # (the caller re-pauses the node) and keep the warning for diagnosis.
     import warnings
     warnings.warn(
-        f"Gate node {node_id!r}: unrecognised decision {decision!r}; treating as approve.",
+        f"Gate node {node_id!r}: unrecognised decision {decision!r}; "
+        "treating as reject (fail-closed).",
         stacklevel=2,
     )
-    return DECISION_APPROVE, {}
+    return DECISION_REJECT, {}

@@ -39,3 +39,20 @@ Recording the honest split (proceeding, not blocking):
 - **spec→sketch / CAM / VLM live scoring — runs when the C++ core is present** (gate stage
   6, env-gated like OCCT); offline they score committed fixtures with recorded expected
   outcomes. Tests skip-if-no-core.
+
+## Q3 — req_join ↔ contract-constants alignment (post-merge note, NOT actioned here)
+
+The T-H8 driver notes ask to align `req_join` with the T-H3 contract constants + the
+unit_ranges import "if nobody has yet". Findings after the H3+H4 merge:
+- **unit_ranges: already wired** — `battery.py` `_gap_unit_sanity` imports
+  `services.verify.unit_ranges.check_unit_ranges` directly. Nothing to do.
+- **req_join met-statuses: intentionally looser** — battery's `_gap_req_join` hardcodes
+  `met_statuses = ("pass","verified","ok")` rather than importing T-H3's
+  `VALID_STATUSES` ladder (`proposed|user_confirmed|verified|failed|waived`), per its own
+  docstring. Reconciling them means editing `services/verify/battery.py`, which is T-H4's
+  merged deliverable — **out of scope for T-H8** (hard rule: no edits outside my file
+  list; contracts/verifier semantics are the owner's call). **Recommended:** a T-H4
+  follow-up maps req_join's met-status set onto the contract ladder. The elicitation bench
+  here consumes `VALID_VERIFIERS/STATUSES/KINDS` from `engine_oracle/requirements` for its
+  schema-valid check, so the bench side is contract-aligned regardless.
+Non-blocking; recorded so the owner rules on it.

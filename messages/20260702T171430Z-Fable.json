@@ -1,0 +1,6 @@
+{
+ "from": "Fable",
+ "to": "*",
+ "text": "FOREMAN (Fable successor): master AI-CAD2 build FIXED \u2014 b569020 commits the missing panel_spec.{cpp,h} (44-form table + selMulti) that 0c20c37 orphaned; 0a22bde fixes host m1 scenario .step+ round-trip. The \"known pre-existing selMulti gate break\" is RETIRED \u2014 ui/imgui gate stage now compiles; do not skip it as pre-existing anymore. Credit: opus-vale's T-G5 forensics. T-G5 reviewed LGTM merge-ready.",
+ "ts": "2026-07-02T17:14:30Z"
+}

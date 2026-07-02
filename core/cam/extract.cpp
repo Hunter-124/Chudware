@@ -20,6 +20,7 @@
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 #include <gp_Ax3.hxx>
+#include <gp_Cone.hxx>
 #include <gp_Cylinder.hxx>
 #include <gp_Pln.hxx>
 
@@ -180,39 +181,114 @@ json mesh_json(const std::vector<TopoDS_Shape>& shapes, double defl) {
     return json{{"verts", verts}, {"tris", tris}};
 }
 
+// Hole extraction for auto-drill (T-M5, audit D7): recognizes plain holes, counterbores
+// (coaxial cylinders of different diameter), countersinks (cone faces), and tilted holes.
+// Tilt allowance is 0.95 (was 0.99 = Z-only); the tilt angle is emitted so the caller can
+// decide whether a 3-axis machine can program it.
 json holes_json(const std::vector<TopoDS_Shape>& shapes) {
-    json points = json::array(), holes = json::array();
-    struct H { double x, y, ztop, zbot, r; };
-    std::vector<H> found;
+    constexpr double PI = 3.14159265358979323846;
+    constexpr double AXIS_TOL = 0.95;  // |axis.Z()| >= this counts as a drillable (near-Z) hole
+    constexpr double XY_TOL = 1e-2;     // coaxial-grouping tolerance for axis XY (audit: "within tolerance")
+
+    struct Cyl { double x, y, ztop, zbot, r, tilt; };
+    struct Cone { double x, y, angle_deg, outer_dia; };
+    std::vector<Cyl> cyls;
+    std::vector<Cone> cones;
+
     for (auto& s : shapes) {
-        TopExp_Explorer ex(s, TopAbs_FACE);
-        for (; ex.More(); ex.Next()) {
+        for (TopExp_Explorer ex(s, TopAbs_FACE); ex.More(); ex.Next()) {
             TopoDS_Face f = TopoDS::Face(ex.Current());
             BRepAdaptor_Surface surf(f);
-            if (surf.GetType() != GeomAbs_Cylinder) continue;
-            gp_Cylinder cyl = surf.Cylinder();
-            gp_Dir ax = cyl.Axis().Direction();
-            if (std::fabs(ax.Z()) < 0.99) continue;  // only Z-axis holes for 3-axis drilling
-            gp_Pnt loc = cyl.Axis().Location();
+            GeomAbs_SurfaceType st = surf.GetType();
+            if (st != GeomAbs_Cylinder && st != GeomAbs_Cone) continue;
             Bnd_Box fb;
             BRepBndLib::Add(f, fb);
             double x0, y0, z0, x1, y1, z1;
             fb.Get(x0, y0, z0, x1, y1, z1);
-            H h{loc.X(), loc.Y(), z1, z0, cyl.Radius()};
-            // dedup by axis xy + radius
-            bool dup = false;
-            for (auto& e : found)
-                if (std::hypot(e.x - h.x, e.y - h.y) < 1e-3 && std::fabs(e.r - h.r) < 1e-3) {
-                    e.ztop = std::max(e.ztop, h.ztop); e.zbot = std::min(e.zbot, h.zbot); dup = true; break;
-                }
-            if (!dup) found.push_back(h);
+
+            if (st == GeomAbs_Cylinder) {
+                gp_Cylinder cyl = surf.Cylinder();
+                gp_Dir ax = cyl.Axis().Direction();
+                double az = std::fabs(ax.Z());
+                if (az < AXIS_TOL) continue;
+                gp_Pnt loc = cyl.Axis().Location();
+                double tilt = std::acos(std::min(1.0, az)) * 180.0 / PI;
+                Cyl h{loc.X(), loc.Y(), z1, z0, cyl.Radius(), tilt};
+                // merge coaxial faces of the SAME radius (a cylinder split into seam faces)
+                bool dup = false;
+                for (auto& e : cyls)
+                    if (std::hypot(e.x - h.x, e.y - h.y) < XY_TOL && std::fabs(e.r - h.r) < 1e-3) {
+                        e.ztop = std::max(e.ztop, h.ztop); e.zbot = std::min(e.zbot, h.zbot); dup = true; break;
+                    }
+                if (!dup) cyls.push_back(h);
+            } else {  // GeomAbs_Cone -> countersink candidate
+                gp_Cone cn = surf.Cone();
+                gp_Dir ax = cn.Axis().Direction();
+                if (std::fabs(ax.Z()) < AXIS_TOL) continue;  // only ~Z-axis countersinks are drillable
+                gp_Pnt loc = cn.Axis().Location();
+                double angle_deg = 2.0 * std::fabs(cn.SemiAngle()) * 180.0 / PI;  // included (tip) angle
+                double outer_dia = std::max(x1 - x0, y1 - y0);  // widest ring of the cone face
+                cones.push_back(Cone{loc.X(), loc.Y(), angle_deg, outer_dia});
+            }
         }
     }
-    for (auto& h : found) {
-        points.push_back(json::array({h.x, h.y, h.ztop}));
-        holes.push_back(json{{"x", h.x}, {"y", h.y}, {"z", h.ztop}, {"dia", h.r * 2},
-                             {"depth", h.ztop - h.zbot}});
+
+    // Group coaxial cylinders (same axis XY) — a group with >1 distinct radius is a counterbore.
+    std::vector<std::vector<int>> groups;
+    std::vector<bool> used(cyls.size(), false);
+    for (size_t i = 0; i < cyls.size(); ++i) {
+        if (used[i]) continue;
+        std::vector<int> g{static_cast<int>(i)};
+        used[i] = true;
+        for (size_t j = i + 1; j < cyls.size(); ++j)
+            if (!used[j] && std::hypot(cyls[i].x - cyls[j].x, cyls[i].y - cyls[j].y) < XY_TOL) {
+                g.push_back(static_cast<int>(j));
+                used[j] = true;
+            }
+        groups.push_back(std::move(g));
     }
+
+    json points = json::array(), holes = json::array();
+    for (auto& g : groups) {
+        std::sort(g.begin(), g.end(), [&](int a, int b) { return cyls[a].r < cyls[b].r; });
+        const Cyl& minor = cyls[g.front()];  // smallest dia = the drilled through-hole
+        const Cyl& major = cyls[g.back()];   // largest dia
+        double ztop = -1e30, zbot = 1e30;
+        for (int idx : g) { ztop = std::max(ztop, cyls[idx].ztop); zbot = std::min(zbot, cyls[idx].zbot); }
+
+        json rec{{"x", minor.x}, {"y", minor.y}, {"z", ztop}, {"dia", minor.r * 2},
+                 {"depth", ztop - zbot}, {"tilt_deg", minor.tilt}};
+        std::string kind = "simple";
+        if (g.size() >= 2 && std::fabs(major.r - minor.r) > 1e-3) {
+            kind = "counterbore";
+            rec["dia_major"] = major.r * 2;
+            rec["dia_minor"] = minor.r * 2;
+            rec["depth_major"] = major.ztop - major.zbot;
+            rec["depth_minor"] = minor.ztop - minor.zbot;
+        }
+        // Attach a coaxial cone -> countersink on this hole.
+        for (auto& cn : cones)
+            if (std::hypot(cn.x - minor.x, cn.y - minor.y) < XY_TOL) {
+                rec["csink_angle_deg"] = cn.angle_deg;
+                rec["csink_outer_dia"] = cn.outer_dia;
+                kind = (kind == "counterbore") ? "counterbore_countersink" : "countersink";
+                break;
+            }
+        rec["kind"] = kind;
+        points.push_back(json::array({minor.x, minor.y, ztop}));
+        holes.push_back(rec);
+    }
+
+    // Standalone countersinks (a cone with no coaxial cylinder) — rare, but record them.
+    for (auto& cn : cones) {
+        bool matched = false;
+        for (auto& g : groups)
+            if (std::hypot(cn.x - cyls[g.front()].x, cn.y - cyls[g.front()].y) < XY_TOL) { matched = true; break; }
+        if (matched) continue;
+        holes.push_back(json{{"x", cn.x}, {"y", cn.y}, {"kind", "countersink"},
+                             {"csink_angle_deg", cn.angle_deg}, {"csink_outer_dia", cn.outer_dia}});
+    }
+
     return json{{"points", points}, {"holes", holes}};
 }
 

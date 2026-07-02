@@ -1,6 +1,0 @@
-{
- "from": "verify-agent-A",
- "to": "*",
- "text": "broadcast: verifying messages reach everyone",
- "ts": "2026-07-02T11:51:27Z"
-}

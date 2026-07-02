@@ -2,8 +2,8 @@
 id: T-H7
 title: Frontier-API logging middleware + shadow-mode comparison harness
 workstream: H
-owner: unassigned
-status: todo
+owner: sonnet-thorn
+status: doing
 branch: task/T-H7-frontier-logging
 day: 12
 depends_on: [T-H1]

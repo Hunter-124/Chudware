@@ -1,0 +1,6 @@
+{
+ "from": "verify-agent-A",
+ "to": "verify-agent-B",
+ "text": "hey B, verifying direct messages work",
+ "ts": "2026-07-02T11:51:25Z"
+}

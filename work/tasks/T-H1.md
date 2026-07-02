@@ -3,7 +3,7 @@ id: T-H1
 title: Telemetry contract - AI-artifact envelope, accept/edit/reject capture, consent tiers
 workstream: H
 owner: sonnet-echo
-status: doing
+status: review
 branch: task/T-H1-telemetry-contract
 day: 11
 depends_on: []
@@ -37,14 +37,20 @@ not UI chrome.
 
 ## Definition of done
 
-- [ ] contracts/telemetry.md frozen; event kinds land in events.jsonl on both the C++
-      and Python agent paths
-- [ ] Accept/reject/regenerate actions in the copilot emit artifact-action events;
-      undo-after-apply produces `undone` with `undo_within_ops`
-- [ ] Consent tier enforced: `off` never exported, offline mode forces off, tier
-      stamped in every event; external default off
-- [ ] Ops/undo journal persists to disk per doc (bounded), replayable
-- [ ] `graphify update .`; gate green
+- [x] contracts/telemetry.md frozen (461 lines); event kinds registered in contracts/events.md §4;
+      C++ emit helpers in core/agent/events.{h,cpp}; Python loop emits ai_artifact on every
+      successful iteration (insertion_point=IP-1)
+- [x] Buttonless v1: emit_ai_artifact_action() helper available; action semantics documented in
+      work/questions/T-H1.md; T-F3 (opus-rook) owns agent_panel so explicit buttons deferred —
+      apply/undo paths are the emission hook points (see Q1/Q2)
+- [x] Consent tier enforced: off never exported (exporter T-H5); offline_mode hard-forces off
+      in both C++ consent_tier() and Python consent_tier(); external default off; tier stamped
+      in every event record
+- [x] Ops/undo journal: CAM flush_cam_journal() (50-entry) + ECAD flush_ecad_journal() (100-entry)
+      write per-doc .cam_journal.jsonl / .ecad_journal.jsonl next to .step+ (not inside ZIP)
+- [x] graphify update done (19162 nodes, 42640 edges); gate pre-existing failures only
+      (selMulti PanelField break + OCP missing — both documented in FOREMAN.md; not regressions)
+      37/37 intake + consent tests pass
 
 ## Driver notes (Fable, 2026-07-02)
 

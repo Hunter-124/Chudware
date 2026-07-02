@@ -51,6 +51,11 @@
 | pyamg (M6, optional) | MIT | AMG preconditioner | ok |
 | **python-solvespace** (optional backend) | **GPL-3** | sketch solver alternative | **NOT bundled by default**; in-house `nsolve` is primary. If a user enables it, it installs into their runtime venv on demand with a license notice |
 | numba (optional, M7 perf) | BSD-2 | LBM JIT | ok if added |
+| **langgraph** (1.2.7) | MIT | DAG orchestrator state machine (services/dag/) — T-A1 | ok |
+| **langgraph-checkpoint-sqlite** (3.1.0) | MIT | SQLite persistence for DAG run checkpoints (services/dag/) — T-A1 | ok |
+| **aiosqlite** (0.22.1, transitive) | MIT | async SQLite backend for langgraph-checkpoint-sqlite | ok |
+| **langchain-core** (1.4.8, transitive) | MIT | langgraph dependency | ok |
+| **langsmith** (0.9.6, transitive) | MIT | langgraph tracing dep (no API key required) | ok |
 
 Rules:
 - Adding any dependency requires a row here in the same change.

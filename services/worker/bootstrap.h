@@ -6,6 +6,11 @@
 
 std::string exeDir();
 
+// Per-user data root: %APPDATA%/AI-CAD on Windows, $XDG_DATA_HOME/AI-CAD (falling back to
+// ~/.local/share/AI-CAD) elsewhere — mirrors engine/paths.py's appdata_root(). config.json
+// (telemetry consent, provider settings) lives directly under this root.
+std::string appdataRoot();
+
 // Resolved python.exe the worker will launch: AI_CAD_PYTHON override, the installed
 // %APPDATA%/AI-CAD venv, or a portable runtime next to the exe — first that exists,
 // else the canonical %APPDATA% path (for messaging).

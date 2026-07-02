@@ -12,6 +12,7 @@
 #include "ui/scaffold_demo_panel.h"
 #include "ui/parts_panel.h"
 #include "ui/cam_panel.h"          // T-U3 CAM workspace
+#include "ui/first_run.h"
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -238,6 +239,8 @@ void Application::frame() {
 
     if (s.paletteOpen) ui::drawCommandPalette(s);
 
+    ui::maybeOpenFirstRun(s);
+    ui::drawFirstRunDialog(s);
     ui::drawSettingsModal(s, false);
     ui::drawProfilerWindow(s);
     ui::drawCommandSearch(s);

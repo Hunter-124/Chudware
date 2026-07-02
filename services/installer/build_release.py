@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent
 APP_PACKAGES = ("engine", "mcp_server", "agent", "installer")
 HOST_EXE = REPO / "host" / "build" / "bin" / "Release" / "AI-CAD.exe"
 _IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "build", "samples", "test_*", ".ready.json")

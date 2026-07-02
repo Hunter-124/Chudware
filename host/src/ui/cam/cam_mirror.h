@@ -63,7 +63,6 @@ public:
     const std::vector<CamSetupRow>& setups() const { return setups_; }
     const std::vector<CamToolRow>& tools() const { return tools_; }
     const CamBackplot& backplot() const { return bp_; }
-    bool hasJob() const { return !name_.empty() || !setups_.empty(); }
     void clear() { setups_.clear(); tools_.clear(); bp_.clear(); name_.clear(); revision_ = -1; }
 
 private:

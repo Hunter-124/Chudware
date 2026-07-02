@@ -37,7 +37,4 @@ void setRibbonSketchActive(bool active);
 float drawRibbon(int& activeTab, bool visible, bool showSimulationTools = true,
                  bool showPcbTools = true, float titleBarH = -1.0f, bool showDrawingTools = false);
 
-// Returns the ribbon height in pixels for layout math.
-float ribbonHeight();
-
 }  // namespace ui

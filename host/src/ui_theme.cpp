@@ -22,9 +22,6 @@ float   uiScale     = 1.0f;
 static ImVec4 rgba(float r, float g, float b, float a = 1.0f) {
     return ImVec4(r, g, b, a);
 }
-static ImVec4 rgb8(int r, int g, int b, float a = 1.0f) {
-    return ImVec4(r / 255.0f, g / 255.0f, b / 255.0f, a);
-}
 static void set4(float dst[4], float r, float g, float b, float a = 1.0f) {
     dst[0]=r; dst[1]=g; dst[2]=b; dst[3]=a;
 }

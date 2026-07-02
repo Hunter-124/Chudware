@@ -278,7 +278,6 @@ public:
     // skipped entirely each frame (averageLuminance() keeps returning the last-known grid
     // value, or 0.5f if none was ever read back). Default true.
     void setBackdropEnabled(bool on);
-    bool backdropEnabled() const { return backdropEnabled_; }
 
 private:
     // GPU buffers for one body.

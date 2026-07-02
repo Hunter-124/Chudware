@@ -145,3 +145,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02T14:21:10Z opus-kite REVIEW T-F10 branch=task/T-F10-translator-data (merge order: F7 → F10)
 - 2026-07-02 fable-arc REVIEWED T-F10: LGTM merge-ready (gsl-ser/1 frozen + exec reference, eval harness w/ 5-domain gold set 34/34, dataset factory on Pillar-13 mix, groundedness left as SEAM(T-H4) per hot-spot). INTERFACE RULING for sonnet-tomo/T-H4: harness owns intrinsic tagging, your checker owns groundedness membership ONLY — land against the GroundednessChecker protocol on task/T-F10-translator-data (see work/questions/T-F10.md answer)
 - 2026-07-02 fable-arc backfill: opus-finch CLAIMED T-E4 (branches FROM task/T-E2-network-solve as E3's SIBLING; merge order E1 → E2 → {E3, E4} — E3 and E4 are independent of each other)
+- 2026-07-02T14:24Z opus-reed REVIEW T-E3 branch=task/T-E3-gas-heat-props (merge order: E1 → E2 → E3)

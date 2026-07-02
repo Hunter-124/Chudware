@@ -13,7 +13,7 @@ graph TD
   subgraph WS_A["workstream A"]
     T_A1["T-A1: Freeze dag_schema.md and scaffold services/dag/"]:::done
     T_A2["T-A2: Node runner with context packs and dag_planner prompt"]:::done
-    T_A3["T-A3: Human-in-the-loop gate nodes and autonomy dial"]:::doing
+    T_A3["T-A3: Human-in-the-loop gate nodes and autonomy dial"]:::done
     T_A4["T-A4: Verify nodes and DAG MCP tools"]:::todo
     T_A5["T-A5: Integration day - run demo mission end-to-end"]:::todo
   end
@@ -23,7 +23,7 @@ graph TD
     T_B2["T-B2: BOM rollup with bom_rollup and bom_price MCP tools"]:::done
     T_B3["T-B3: Cost model (material + machining) and quote-out tools"]:::done
     T_B4["T-B4: Spec-sheet matching v1 - deterministic BOLTS/KiCad lookup"]:::done
-    T_B5["T-B5: Spec-sheet matching v2 - AI path from datasheet and integration demo"]:::doing
+    T_B5["T-B5: Spec-sheet matching v2 - AI path from datasheet and integration demo"]:::done
   end
   subgraph WS_C["workstream C"]
     T_C1["T-C1: firmware_rpc.md contract and engine/firmware/ scaffold"]:::done
@@ -36,7 +36,7 @@ graph TD
     T_D1["T-D1: structural_schema.md contract and engine/structural/ scaffold"]:::done
     T_D2["T-D2: PyNite integration - member forces and deflections"]:::done
     T_D3["T-D3: Section libraries, D/C ratio checks, and struct_check MCP tool"]:::done
-    T_D4["T-D4: Code compliance - agentic RAG and deterministic rule engine"]:::doing
+    T_D4["T-D4: Code compliance - agentic RAG and deterministic rule engine"]:::done
     T_D5["T-D5: Cost takeoff and struct_estimate MCP tool with integration demo"]:::todo
   end
   subgraph WS_E["workstream E"]
@@ -49,7 +49,7 @@ graph TD
   subgraph WS_F["workstream F"]
     T_F1["T-F1: Freeze research_tools contract, scaffold engine/research with web_search + fetch_page"]:::done
     T_F10["T-F10: gsl-ser/v1 serialization freeze + slot-fidelity eval harness + dataset factory"]:::done
-    T_F11["T-F11: Translator SFT v0 + GRPO groundedness polish + local serving"]:::doing
+    T_F11["T-F11: Translator SFT v0 + GRPO groundedness polish + local serving"]:::done
     T_F12["T-F12: dag_replan, workflow templates, and the design_review verify battery"]:::todo
     T_F13["T-F13: Micro-evaluator 1 - feature-recognition hypothesis ranker"]:::done
     T_F14["T-F14: Deliverables contract + services/deliverables scaffold with OSS engines"]:::done
@@ -70,19 +70,20 @@ graph TD
     T_G10["T-G10: ShopCraft rename tiers 2+3 - build targets, env vars, MCP id, appdata"]:::todo
     T_G11["T-G11: Windows build verify, then delete host/ and all deprecated GUI code"]:::todo
     T_G12["T-G12: Human UI walkthrough - recursive element-by-element feedback loop until converged"]:::doing
+    T_G13["T-G13: Fix issue 7 (scenario deadlock) - ScenarioRunner step-machine scenarios deadlock offscreen"]:::todo
     T_G2["T-G2: Restore doc-tab input, shrink Copilot header, PM button contrast"]:::done
     T_G3["T-G3: ShopCraft rename tier 1 - user-visible branding strings"]:::done
     T_G4["T-G4: GUI dead-code and cleanliness pass on host/"]:::done
     T_G5["T-G5: GUI migration wave 1 - foundation libs (F1-F4 + G1 gate)"]:::done
-    T_G6["T-G6: GUI migration wave 2 - shell chrome (S1-S6, H5 start, G2 gate)"]:::doing
-    T_G7["T-G7: GUI migration wave 3 - core panels (C1-C6, G3 gate)"]:::doing
+    T_G6["T-G6: GUI migration wave 2 - shell chrome (S1-S6, H5 start, G2 gate)"]:::done
+    T_G7["T-G7: GUI migration wave 3 - core panels (C1-C6, G3 gate)"]:::done
     T_G8["T-G8: GUI migration wave 4 - hard subsystems (H1-H5, G4 gate)"]:::todo
     T_G9["T-G9: GUI migration wave 5 - polish, parity battery, cutover (P1, P2, G5)"]:::todo
   end
   subgraph WS_H["workstream H"]
     T_H1["T-H1: Telemetry contract - AI-artifact envelope, accept/edit/reject capture, consent tiers"]:::done
-    T_H10["T-H10: Offline VLM track v0 - base pick eval, synthetic render corpus, render-grounded RL"]:::doing
-    T_H11["T-H11: Regen-error diagnosis (IP-18) - frontier ship with logging, corruption corpus, migration gate"]:::doing
+    T_H10["T-H10: Offline VLM track v0 - base pick eval, synthetic render corpus, render-grounded RL"]:::done
+    T_H11["T-H11: Regen-error diagnosis (IP-18) - frontier ship with logging, corruption corpus, migration gate"]:::done
     T_H2["T-H2: Canonical doc serialization policy + semantic doc_diff tool"]:::done
     T_H3["T-H3: Requirements layer - freeze aicad.req/1 schema + requirements doc CRUD"]:::done
     T_H4["T-H4: Verifier battery API + gap verifiers (groundedness, manifold, unit sanity, dim coverage)"]:::done
@@ -90,15 +91,15 @@ graph TD
     T_H6["T-H6: Fleet training runner - claim-based job queue, cross-OS profiles, MLflow tracking"]:::done
     T_H7["T-H7: Frontier-API logging middleware + shadow-mode comparison harness"]:::done
     T_H8["T-H8: Product-task eval benchmark suite (elicitation, spec->sketch, regen-fix, CAM, VLM)"]:::done
-    T_H9["T-H9: Adapter serving - vLLM per-task LoRA routing, canary rollout, rollback story"]:::doing
+    T_H9["T-H9: Adapter serving - vLLM per-task LoRA routing, canary rollout, rollback story"]:::done
   end
   subgraph WS_M["workstream M"]
-    T_M1["T-M1: CAM overhaul: fix critical post-processor correctness (C++)"]:::doing
-    T_M2["T-M2: CAM overhaul: true adaptive clearing (trochoidal arc-blend linking)"]:::doing
+    T_M1["T-M1: CAM overhaul: fix critical post-processor correctness (C++)"]:::todo
+    T_M2["T-M2: CAM overhaul: true adaptive clearing (trochoidal arc-blend linking)"]:::done
     T_M3["T-M3: CAM overhaul: holder/shank collision simulation"]:::todo
-    T_M4["T-M4: CAM overhaul: feeds/speeds DB unification with engine materials registry"]:::doing
-    T_M5["T-M5: CAM overhaul: OCCT hole-extraction completeness (counterbore/countersink/tilt)"]:::doing
-    T_M6["T-M6: CAM overhaul: pocket entry fix + arc-true stock simulation"]:::doing
+    T_M4["T-M4: CAM overhaul: feeds/speeds DB unification with engine materials registry"]:::done
+    T_M5["T-M5: CAM overhaul: OCCT hole-extraction completeness (counterbore/countersink/tilt)"]:::done
+    T_M6["T-M6: CAM overhaul: pocket entry fix + arc-true stock simulation"]:::todo
   end
   subgraph WS_P["workstream P"]
     T_P1["T-P1: Unified parts library v1 - parts/1 contract, federated search core, first two adapters"]:::done
@@ -109,7 +110,7 @@ graph TD
     T_Q1["T-Q1: Packaging & first-run — Linux+Windows installers, dependency bundling"]:::todo
     T_Q2["T-Q2: Autosave, crash recovery & consent-tied diagnostics"]:::todo
     T_Q3["T-Q3: Sample project gallery + guided tours"]:::todo
-    T_Q4["T-Q4: User manual auto-generation — cad_guide + inventory → living docs"]:::doing
+    T_Q4["T-Q4: User manual auto-generation — cad_guide + inventory → living docs"]:::done
   end
   subgraph WS_U["workstream U"]
     T_U1["T-U1: UI kit: style-conformance scaffold + pattern library for all new feature panels"]:::todo
@@ -120,6 +121,11 @@ graph TD
     T_U6["T-U6: Simulation studies manager — study list, results, convergence caveats"]:::todo
     T_U7["T-U7: New-doc-kind viewers v1 — piping, hydraulic, structural"]:::todo
     T_U8["T-U8: Model & telemetry transparency UI — consent, which-brain, canary opt-in"]:::todo
+  end
+  subgraph WS_V["workstream V"]
+    T_INF1["T-INF1: Fix gate pytest stage (issue 6) - wire mcp-venv + AI_CAD_LIBAICAD into scripts/gate.sh"]:::todo
+    T_V1["T-V1: Simulation-backend correctness audit - real/validated/stub/broken verdict per solver"]:::todo
+    T_V2["T-V2: MCP runtime reality audit - dead tools, undeclared deps, missing binaries"]:::todo
   end
   subgraph WS_backlog["workstream backlog"]
     T_BL01["T-BL01: V&V benchmark harness"]:::backlog
@@ -139,7 +145,7 @@ graph TD
     T_BL15["T-BL15: PROPOSAL — in-app document version control (needs human refinement first)"]:::backlog
   end
   subgraph WS_integration["workstream integration"]
-    T_INT["T-INT: Day-5 integration demo - soil-moisture sensor end-to-end"]:::todo
+    T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog
   end
   subgraph WS_setup["workstream setup"]
     T_S1["T-S1: Apply for vendor API keys"]:::todo
@@ -189,6 +195,7 @@ graph TD
   T_G3 --> T_G10
   T_G10 --> T_G11
   T_G2 --> T_G12
+  T_G7 --> T_G13
   T_G1 --> T_G2
   T_G2 --> T_G3
   T_G1 --> T_G4

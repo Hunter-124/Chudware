@@ -40,7 +40,7 @@ from typing import Optional
 
 DISCLAIMER = (
     "Preliminary cost estimate — not a contractor bid.  "
-    "Rates are ENR national averages; verify with local suppliers before procurement."
+    "Rates are approximate national-average estimates (see rate-file provenance); verify with local suppliers before procurement."
 )
 
 # --------------------------------------------------------------------------- rate table

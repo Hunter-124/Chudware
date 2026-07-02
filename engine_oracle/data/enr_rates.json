@@ -1,6 +1,6 @@
 {
   "_comment": "Construction material and labor unit rates for structural cost takeoff.",
-  "_source": "ENR (Engineering News-Record) Building Cost Index / Materials Cost Index — Q4 2025 national averages. Published at ENR.com/economics (public, subscription-free summary figures). User can override any rate by editing this file.",
+  "_source": "Approximate US national-average figures informed by published cost indices (e.g. ENR BCI/MCI class of sources). UNVERIFIED estimates seeded offline — not a copied database; confirm against current local pricing before any procurement decision. User can override any rate by editing this file.",
   "_units": {
     "cedar_lumber_per_bf": "USD per board-foot (BF). Board foot = nominal 1 in × 12 in × 1 ft.",
     "steel_per_lb":        "USD per pound of structural steel (AISC W/S/C sections, in place).",

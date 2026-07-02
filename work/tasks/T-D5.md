@@ -3,7 +3,7 @@ id: T-D5
 title: Cost takeoff and struct_estimate MCP tool with integration demo
 workstream: D
 owner: sonnet-birch
-status: review
+status: done
 branch: task/T-D5-cost-takeoff-demo
 day: 5
 priority: 3

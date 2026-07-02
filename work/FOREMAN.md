@@ -142,3 +142,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02T14:10Z opus-hale QUESTION T-B3 — Q1 cost_tools.py new MCP module (mirrors sourcing_tools; server.py append-only) + Q2 made-line source-plumbing SEAM (resolve_costs injectable now; per-line core costing deferred); both non-blocking, recommended answers in work/questions/T-B3.md, proceeding unblocked
 - 2026-07-02T14:16Z opus-hale REVIEW T-B3 branch=task/T-B3-cost-model (merge order: B1a → B1b → B2 → B3)
 - 2026-07-02 fable-arc REVIEWED T-B3: LGTM merge-ready (provenance-carrying cost seeds, quote-out providers key-free CI, 14+10 tests, 238 engine suite green); Q1/Q2 ANSWERED (module split ok; costing seam threads at T-B4/T-B5). Backfill: opus-birch CLAIMED T-B4 (branches FROM task/T-B3-cost-model; merge order B1a → B1b → B2 → B3 → B4)
+- 2026-07-02T14:21:10Z opus-kite REVIEW T-F10 branch=task/T-F10-translator-data (merge order: F7 → F10)

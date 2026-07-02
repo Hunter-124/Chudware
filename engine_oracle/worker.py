@@ -183,6 +183,20 @@ except Exception as _ecad_import_err:  # noqa: BLE001
         "engine.ecad.rpc unavailable — ecad_* methods not registered: %s", _ecad_import_err)
 # === end ECAD ===
 
+# === Deliverables preview seam (T-F16, Pillar 15) — render_document / list_artifacts ===
+# Reaches the deliverables service (contract deliverables/1 §5.4/§5.5) over the same worker seam
+# the ImGui GUI uses for every other service, so the preview pane + artifact cards fetch previews
+# asynchronously (AsyncRpc) with no bespoke transport and no format code in C++.
+try:
+    from deliverables.worker_rpc import WORKER_METHODS as _DELIV_METHODS  # noqa: E402
+    _METHODS.update(_DELIV_METHODS)
+except Exception as _deliv_import_err:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger("ai-cad.worker").warning(
+        "deliverables.worker_rpc unavailable — render_document/list_artifacts not registered: %s",
+        _deliv_import_err)
+# === end Deliverables ===
+
 
 def _emit(obj: dict) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")

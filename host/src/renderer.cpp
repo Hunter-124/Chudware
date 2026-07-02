@@ -1788,6 +1788,55 @@ float Renderer::averageLuminance(float x0, float y0, float x1, float y1) const {
     return count > 0 ? (float)(sum / count) : 0.5f;
 }
 
+// Dynamic-color stats (Liquid Glass v2.1): mean RGB + mean luminance + luminance variance under
+// the rect, same cached-grid box-average as averageLuminance (ZERO GL calls). false until the
+// async pipeline has published at least one grid — consumers then treat dynamic color as off.
+bool Renderer::averageBackdropStats(float x0, float y0, float x1, float y1,
+                                    float outRgb[3], float& outLum, float& outVariance) const {
+    if (!lumaEverRead_ || lumaGrid_.empty() || lumaW_ <= 0 || lumaH_ <= 0 || w_ <= 0 || h_ <= 0 ||
+        lumaRgbGrid_.size() != lumaGrid_.size() * 3)
+        return false;
+
+    if (x1 < x0) std::swap(x0, x1);
+    if (y1 < y0) std::swap(y0, y1);
+    x0 = std::max(0.0f, std::min(x0, (float)w_));
+    x1 = std::max(0.0f, std::min(x1, (float)w_));
+    y0 = std::max(0.0f, std::min(y0, (float)h_));
+    y1 = std::max(0.0f, std::min(y1, (float)h_));
+
+    const float sx = (float)lumaW_ / (float)w_;
+    const float sy = (float)lumaH_ / (float)h_;
+    int gx0 = std::max(0, std::min(lumaW_ - 1, (int)std::floor(x0 * sx)));
+    int gy0 = std::max(0, std::min(lumaH_ - 1, (int)std::floor(y0 * sy)));
+    int gx1 = std::max(gx0 + 1, std::min(lumaW_, (int)std::ceil(x1 * sx)));
+    int gy1 = std::max(gy0 + 1, std::min(lumaH_, (int)std::ceil(y1 * sy)));
+
+    double sumR = 0.0, sumG = 0.0, sumB = 0.0, sumL = 0.0, sumL2 = 0.0;
+    int count = 0;
+    for (int gy = gy0; gy < gy1; ++gy) {
+        const float* lrow = &lumaGrid_[(size_t)gy * (size_t)lumaW_];
+        const float* crow = &lumaRgbGrid_[(size_t)gy * (size_t)lumaW_ * 3];
+        for (int gx = gx0; gx < gx1; ++gx) {
+            const float l = lrow[gx];
+            sumL += l;
+            sumL2 += (double)l * (double)l;
+            sumR += crow[gx * 3 + 0];
+            sumG += crow[gx * 3 + 1];
+            sumB += crow[gx * 3 + 2];
+            ++count;
+        }
+    }
+    if (count <= 0) return false;
+    const double inv = 1.0 / count;
+    outRgb[0] = (float)(sumR * inv);
+    outRgb[1] = (float)(sumG * inv);
+    outRgb[2] = (float)(sumB * inv);
+    const double meanL = sumL * inv;
+    outLum = (float)meanL;
+    outVariance = (float)std::max(0.0, sumL2 * inv - meanL * meanL);
+    return true;
+}
+
 // ---- F1 GPU pass timing: 2 queries per phase, ping-ponged so a result never blocks ----
 void Renderer::beginGpuTimer(GpuTimerRing& t) {
     if (!t.id[0]) glGenQueries(2, t.id);
@@ -1940,18 +1989,23 @@ void Renderer::reduceLumaPbo(int slot) const {
         const int gw = std::min(kLumaGridMaxW, (sw + stepX - 1) / stepX);
         const int gh = std::min(kLumaGridMaxH, (sh + stepY - 1) / stepY);
         lumaStaging_.assign((size_t)gw * (size_t)gh, 0.5f);
+        lumaRgbStaging_.assign((size_t)gw * (size_t)gh * 3, 0.5f);  // mean-RGB twin (backdrop stats)
         for (int gy = 0; gy < gh; ++gy) {
             const int sy = std::max(0, sh - 1 - gy * stepY);  // flip: grid row 0 = viewport top
             for (int gx = 0; gx < gw; ++gx) {
                 const int sx = std::min(sw - 1, gx * stepX);
                 const unsigned char* p = px + ((size_t)sy * (size_t)sw + (size_t)sx) * 4;
                 const float r = p[0] / 255.0f, g = p[1] / 255.0f, b = p[2] / 255.0f;
-                lumaStaging_[(size_t)gy * (size_t)gw + (size_t)gx] =
-                    0.2126f * r + 0.7152f * g + 0.0722f * b;
+                const size_t cell = (size_t)gy * (size_t)gw + (size_t)gx;
+                lumaStaging_[cell] = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+                lumaRgbStaging_[cell * 3 + 0] = r;
+                lumaRgbStaging_[cell * 3 + 1] = g;
+                lumaRgbStaging_[cell * 3 + 2] = b;
             }
         }
         glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
         lumaGrid_.swap(lumaStaging_);  // one swap; a future reader never sees a torn grid
+        lumaRgbGrid_.swap(lumaRgbStaging_);  // swapped in lockstep — the two grids never diverge
         lumaW_ = gw;
         lumaH_ = gh;
         lumaEverRead_ = true;

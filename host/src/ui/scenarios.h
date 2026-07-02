@@ -1,7 +1,8 @@
 // Scripted screenshot/test scenarios (extracted from app.cpp's run_gui frame loop).
 //
 // ScenarioRunner hosts the frame-driven state machines keyed on AI_CAD_SHOT
-// (m1 / sketch / asm / fea / evalmass / activity / multidoc). tick() runs once per frame before
+// (m1 / sketch / asm / fea / evalmass / activity / multidoc / appearance). tick() runs once per
+// frame before
 // ImGui::NewFrame() and advances whichever scenario is active; endFrame() runs after
 // ImGui_ImplOpenGL3_RenderDrawData and handles the per-step backbuffer captures plus the
 // scenario-driven frame-loop control (swap+continue / swap+break). Behavior-preserving
@@ -90,6 +91,16 @@ private:
 
     // ---------- C19 evalmass scenario (AI_CAD_SHOT=evalmass) ----------
     int evalStep = 0, evalSettle = 0;
+
+    // ---------- appearance scenario (AI_CAD_SHOT=appearance) ----------
+    // Model a part, open the Settings modal on the Appearance tab (glass knobs + live glass
+    // preview over the viewport), capture. Self-contained: the runner reads AI_CAD_SHOT itself
+    // (no AppState want-flag), seeded once on the first tick (apInit).
+    void runAppearance(AppState& st);
+    bool apInit = false, apWant = false, apDone = false;
+    int apStep = 0, apSettle = 0;
+    std::string apSavePath, apCapture;
+    bool apDirReady = false;
 
     // ---------- C22b activity scenario (AI_CAD_SHOT=activity) ----------
     int actStep = 0, actSettle = 0, actWaitFrames = 0;

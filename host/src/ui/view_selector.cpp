@@ -107,6 +107,8 @@ struct Zone {
     ViewAngle view;
     bool      front = false;    // faces the camera (hoverable/clickable) vs. back-facing (dim only)
     bool      isFace = false;   // face (octagon) vs. corner triangle — controls fill weight
+    float     facing = 0.f;     // cos(normal, toEye): +1 dead-on .. 0 edge-on .. -1 away; grades
+                                // edge/caption alpha so edge-on geometry fades instead of popping
 };
 
 // Standard even-odd point-in-polygon test in screen space.
@@ -168,8 +170,11 @@ bool buildZones(Renderer& renderer, ImVec2 vr0, ImVec2 vr1,
         return v;
     };
 
-    auto facesCamera = [&](const Vec3& faceCenter, const Vec3& normal) -> bool {
-        return dot(normal, eye - faceCenter) > 0.0f;
+    // Signed cosine between the outward normal and the to-eye direction (facing grade).
+    auto facingCos = [&](const Vec3& faceCenter, const Vec3& normal) -> float {
+        Vec3 toEye = eye - faceCenter;
+        float len = std::sqrt(dot(toEye, toEye));
+        return len > 1e-6f ? dot(normal, toEye) / len : 0.0f;
     };
 
     // ---- 6 octagonal faces ----
@@ -182,11 +187,12 @@ bool buildZones(Renderer& renderer, ImVec2 vr0, ImVec2 vr1,
         int sFixed = (n.x + n.y + n.z) > 0 ? 1 : -1;
         int a = (fixed + 1) % 3, b = (fixed + 2) % 3;        // the two in-plane axes
         Vec3 faceCenter = C + n * h;
-        bool front = facesCamera(faceCenter, n);
+        float facing = facingCos(faceCenter, n);
 
         // 4 in-plane corner sign pairs, ordered around the face.
         const int quad[4][2] = {{+1,+1},{-1,+1},{-1,-1},{+1,-1}};
-        Zone z; z.isFace = true; z.front = front; z.view = kFaceView[f];
+        Zone z; z.isFace = true; z.front = facing > 0.0f; z.facing = facing;
+        z.view = kFaceView[f];
         bool ok = true;
         for (int q = 0; q < 4 && ok; ++q) {
             int sgn[3];
@@ -220,10 +226,11 @@ bool buildZones(Renderer& renderer, ImVec2 vr0, ImVec2 vr1,
         Vec3 v2 = cornerVert(sx, sy, sz, 2);
         Vec3 triCenter = (v0 + v1 + v2) * (1.0f / 3.0f);
         Vec3 cornerDir = normalize(Vec3((float)sx, (float)sy, (float)sz));
-        bool front = facesCamera(triCenter, cornerDir);
+        float facing = facingCos(triCenter, cornerDir);
         ImVec2 p0, p1, p2;
         if (!project(v0, p0) || !project(v1, p1) || !project(v2, p2)) continue;
-        Zone z; z.isFace = false; z.front = front; z.view = cornerView(sx, sy, sz);
+        Zone z; z.isFace = false; z.front = facing > 0.0f; z.facing = facing;
+        z.view = cornerView(sx, sy, sz);
         z.poly = {p0, p1, p2};
         zones.push_back(std::move(z));
     }
@@ -331,17 +338,16 @@ void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
     const auto& pal = ui::palette;
     const float s = ui::uiScale;
 
-    // Color roles (never hardcoded). Faces: subtle light translucent fill + dark edge.
+    // Color roles (never hardcoded). Faces: subtle light translucent fill + dark edge. Every
+    // viewportEdge stroke rides on a light halo under-stroke (glassText's two-pass idea) so the
+    // box edges read over BOTH the light canvas and a dark part appearance (contrast audit P1).
     float faceFillF[4];  ui::Palette::withAlpha(pal.viewportTop, faceFillF, 0.18f);
     const ImU32 faceFill   = ui::Palette::toU32(faceFillF);
     float edgeF[4];      ui::Palette::withAlpha(pal.viewportEdge, edgeF, 0.55f);
     const ImU32 edgeCol    = ui::Palette::toU32(edgeF);
-    float edgeDimF[4];   ui::Palette::withAlpha(pal.viewportEdge, edgeDimF, 0.18f);
-    const ImU32 edgeDim    = ui::Palette::toU32(edgeDimF);
     const ImU32 hoverFill  = ui::Palette::toU32(pal.accentSoft);
+    const ImU32 hoverGlow  = ui::Palette::toU32(pal.accentSoft);
     const ImU32 hoverLine  = ui::Palette::toU32(pal.accent);
-    const ImU32 overlayBord = ui::Palette::toU32(pal.overlayBorder);
-    const ImU32 overlayTxt  = ui::Palette::toU32(pal.overlayText);
 
     // Re-resolve the hovered zone here so fill/outline match the exact projected polys we draw.
     ImGuiIO& io = ImGui::GetIO();
@@ -354,34 +360,67 @@ void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
         }
     }
 
-    // Pass 1: back-facing zones — dim outline only (so the far edges of the glass box read through).
+    // Two-pass edge stroke: light halo underneath, dark ink on top.
+    auto strokeEdge = [&](const Zone& z, ImU32 ink, float w, float haloAlpha) {
+        float hf[4]; ui::Palette::withAlpha(pal.viewportTop, hf, haloAlpha);
+        dl->AddPolyline(z.poly.data(), (int)z.poly.size(), ui::Palette::toU32(hf),
+                        ImDrawFlags_Closed, w + 2.0f * s);
+        dl->AddPolyline(z.poly.data(), (int)z.poly.size(), ink, ImDrawFlags_Closed, w);
+    };
+
+    // Pass 1: back-facing zones — dim outline graded by facing angle (edge-on fades out) so the
+    // far edges of the glass box read through without a constant near-invisible 0.18 alpha.
     for (const auto& z : zones) {
         if (z.front || z.poly.size() < 3) continue;
-        dl->AddPolyline(z.poly.data(), (int)z.poly.size(), edgeDim, ImDrawFlags_Closed, 1.0f * s);
+        float away = -z.facing; if (away < 0.f) away = 0.f; if (away > 1.f) away = 1.f;
+        float a = 0.16f + 0.18f * away;   // 0.16 edge-on .. 0.34 fully turned away
+        float ef[4]; ui::Palette::withAlpha(pal.viewportEdge, ef, a);
+        strokeEdge(z, ui::Palette::toU32(ef), 1.0f * s, a * 1.2f);
     }
-    // Pass 2: front-facing faces — translucent fill + dark outline.
+    // Pass 2: front-facing faces — translucent fill + haloed dark outline + on-box caption.
     for (const auto& z : zones) {
         if (!z.front || !z.isFace || z.poly.size() < 3) continue;
         dl->AddConvexPolyFilled(z.poly.data(), (int)z.poly.size(), faceFill);
-        dl->AddPolyline(z.poly.data(), (int)z.poly.size(), edgeCol, ImDrawFlags_Closed, 1.2f * s);
+        strokeEdge(z, edgeCol, 1.2f * s, 0.60f);
+        // Face caption centered on the octagon, faded as the face turns edge-on — the box is no
+        // longer 6 anonymous octagons. Same two-pass halo treatment as the edges.
+        float capA = (z.facing - 0.20f) / 0.55f;    // invisible below ~0.2, full by ~0.75
+        if (capA > 0.0f) {
+            if (capA > 1.0f) capA = 1.0f;
+            ImVec2 ctr(0, 0);
+            for (const ImVec2& p : z.poly) { ctr.x += p.x; ctr.y += p.y; }
+            ctr.x /= (float)z.poly.size(); ctr.y /= (float)z.poly.size();
+            ImVec2 ts2 = ImGui::CalcTextSize(z.view.name);
+            ImVec2 tp(ctr.x - ts2.x * 0.5f, ctr.y - ts2.y * 0.5f);
+            float chf[4]; ui::Palette::withAlpha(pal.viewportTop, chf, 0.65f * capA);
+            float cif[4]; ui::Palette::withAlpha(pal.viewportEdge, cif, 0.90f * capA);
+            dl->AddText(ImVec2(tp.x, tp.y + 1.0f * s), ui::Palette::toU32(chf), z.view.name);
+            dl->AddText(tp, ui::Palette::toU32(cif), z.view.name);
+        }
     }
     // Pass 3: front-facing corner triangles — outline only (filled on hover below).
     for (const auto& z : zones) {
         if (!z.front || z.isFace || z.poly.size() < 3) continue;
-        dl->AddPolyline(z.poly.data(), (int)z.poly.size(), edgeCol, ImDrawFlags_Closed, 1.0f * s);
+        strokeEdge(z, edgeCol, 1.0f * s, 0.60f);
     }
-    // Pass 4: hovered zone — accent fill + thick accent outline + caption near the cursor.
+    // Pass 4: hovered zone — soft accent fill + inner glow (wide accentSoft under-stroke below the
+    // accent outline) instead of a hard fill pop, + caption pill near the cursor.
     if (hover >= 0) {
         const Zone& z = zones[hover];
         dl->AddConvexPolyFilled(z.poly.data(), (int)z.poly.size(), hoverFill);
+        dl->AddPolyline(z.poly.data(), (int)z.poly.size(), hoverGlow, ImDrawFlags_Closed, 4.5f * s);
         dl->AddPolyline(z.poly.data(), (int)z.poly.size(), hoverLine, ImDrawFlags_Closed, 2.0f * s);
         const char* cap = z.view.name;
         ImVec2 ts = ImGui::CalcTextSize(cap);
         ImVec2 cp(io.MousePos.x + 14.0f * s, io.MousePos.y + 14.0f * s);
         if (cp.x + ts.x + 12 * s > vr1.x) cp.x = vr1.x - ts.x - 12 * s;
         if (cp.y + ts.y + 8 * s  > vr1.y) cp.y = vr1.y - ts.y - 8 * s;
-        ui::glassBackground(dl, cp, ImVec2(cp.x + ts.x + 12 * s, cp.y + ts.y + 8 * s), 4.0f);
-        dl->AddText(ImVec2(cp.x + 6 * s, cp.y + 4 * s), overlayTxt, cap);
+        ImRect capR(cp, ImVec2(cp.x + ts.x + 12 * s, cp.y + ts.y + 8 * s));
+        const ui::AdaptiveSurface& capSurf =
+            ui::adaptivePanel(ui::panelId("viewsel_caption"), capR, ui::GlassGroup::Hud);
+        ui::glassPanel(dl, capR, ui::GlassLevel::UltraThin, 4.0f, capSurf);
+        ui::glassText(dl, nullptr, ImGui::GetFontSize(), ImVec2(cp.x + 6 * s, cp.y + 4 * s),
+                      capSurf, cap);
     }
 
     // ---- C27-D: hover-preview thumbnail panel, top-right ----
@@ -407,17 +446,22 @@ void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
             if (px0 < vr0.x + 6.0f * s) px0 = vr0.x + 6.0f * s;
             ImVec2 p0(px0, py0), p1(px0 + panelW, py0 + panelH);
 
-            // Panel chrome (theme overlay roles).
-            ui::glassBackground(dl, p0, p1, 6.0f);
+            // Panel chrome: adaptive glass v2 (was legacy glassBackground + fixed overlay roles).
+            const ui::AdaptiveSurface& pvSurf = ui::adaptivePanel(
+                ui::panelId("viewsel_preview"), ImRect(p0, p1), ui::GlassGroup::Hud);
+            ui::glassPanel(dl, ImRect(p0, p1), ui::GlassLevel::Thin, 6.0f, pvSurf);
 
             // Thumbnail image. GL texture origin is bottom-left -> flip V (uv0.y=1, uv1.y=0).
             ImVec2 i0(p0.x + pad, p0.y + pad);
             ImVec2 i1(i0.x + thumb, i0.y + thumb);
             dl->AddImage((ImTextureID)(intptr_t)tex, i0, i1, ImVec2(0, 1), ImVec2(1, 0));
-            dl->AddRect(i0, i1, overlayBord, 3.0f * s);  // subtle frame around the render
+            // subtle frame around the render, from the surface's tertiary tone
+            dl->AddRect(i0, i1, ImGui::ColorConvertFloat4ToU32(pvSurf.textTertiary), 3.0f * s);
 
-            // Caption below the image (wrapped to the panel width).
-            dl->AddText(nullptr, 0.0f, ImVec2(i0.x, i1.y + pad), overlayTxt, cap, nullptr,
+            // Caption below the image (wrapped to the panel width; the frosted Thin panel carries
+            // the contrast, so a plain surface-toned AddText with wrap is enough here).
+            dl->AddText(nullptr, 0.0f, ImVec2(i0.x, i1.y + pad),
+                        ImGui::ColorConvertFloat4ToU32(pvSurf.textSecondary), cap, nullptr,
                         panelW - pad * 2.0f);
         }
     }
@@ -429,16 +473,21 @@ void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
         float w = ts.x + 22.0f * s, hh = ts.y + 12.0f * s;
         ImVec2 p0((vr0.x + vr1.x) * 0.5f - w * 0.5f, vr1.y - hh - 16.0f * s);
         ImVec2 p1(p0.x + w, p0.y + hh);
-        ui::glassBackground(dl, p0, p1, hh * 0.5f / s);
-        dl->AddText(ImVec2(p0.x + 11.0f * s, p0.y + 6.0f * s), overlayTxt, hint);
+        const ui::AdaptiveSurface& hintSurf = ui::adaptivePanel(
+            ui::panelId("viewsel_hint"), ImRect(p0, p1), ui::GlassGroup::Hud);
+        ui::glassPanel(dl, ImRect(p0, p1), ui::GlassLevel::UltraThin, hh * 0.5f / s, hintSurf);
+        ui::glassText(dl, nullptr, ImGui::GetFontSize(),
+                      ImVec2(p0.x + 11.0f * s, p0.y + 6.0f * s), hintSurf, hint);
     }
 
     // ---- orientation popup, top-center (below the heads-up toolbar) ----
     {
         const int n = 7;
         PopupLayout L = popupLayout(vr0, vr1);
-        ui::glassBackground(dl, ImVec2(L.x0, L.y0), ImVec2(L.x0 + L.w, L.y0 + L.h),
-                            L.h * 0.30f / s);
+        ImRect barR(ImVec2(L.x0, L.y0), ImVec2(L.x0 + L.w, L.y0 + L.h));
+        const ui::AdaptiveSurface& barSurf =
+            ui::adaptivePanel(ui::panelId("viewsel_popup"), barR, ui::GlassGroup::Hud);
+        ui::glassPanel(dl, barR, ui::GlassLevel::Thin, L.h * 0.30f / s, barSurf);
 
         ImGui::PushID("##viewsel_popup");
         for (int i = 0; i < n; ++i) {
@@ -447,12 +496,15 @@ void ViewSelector::draw(AppState& st, ImDrawList* dl, ImVec2 vr0, ImVec2 vr1) {
             ImGui::PushID(i);
             bool clicked = ImGui::InvisibleButton("##vb", ImVec2(L.btnW[i], L.btnH));
             bool hov = ImGui::IsItemHovered();
+            // Hover wash from the adaptive surface (buttonHovered was nearly invisible on the
+            // frost in the dark theme); the caption keeps guaranteed contrast via glassText.
             if (hov)
-                dl->AddRectFilled(ImVec2(bxi, byi), ImVec2(bxi + L.btnW[i], byi + L.btnH),
-                                  ui::Palette::toU32(pal.buttonHovered), 3.0f);
+                ui::glassRowBackground(dl, ImVec2(bxi, byi),
+                                       ImVec2(bxi + L.btnW[i], byi + L.btnH), 3.0f, false, true);
             ImVec2 lts = ImGui::CalcTextSize(kPopup[i].name);
-            dl->AddText(ImVec2(bxi + (L.btnW[i] - lts.x) * 0.5f, byi + (L.btnH - lts.y) * 0.5f),
-                        hov ? hoverLine : overlayTxt, kPopup[i].name);
+            ui::glassText(dl, nullptr, ImGui::GetFontSize(),
+                          ImVec2(bxi + (L.btnW[i] - lts.x) * 0.5f, byi + (L.btnH - lts.y) * 0.5f),
+                          barSurf, kPopup[i].name);
             if (clicked) {
                 requestCameraAnimation(st, kPopup[i].yaw, kPopup[i].pitch);
                 close();

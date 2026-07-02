@@ -1,6 +1,7 @@
 // FeatureManager tree panel (C16).
-// Renders the left dock panel — fixed nodes (Equations, Material, planes, Origin) followed
-// by the feature history with status badges, context menu (Rename/Suppress/Delete/Edit).
+// Renders the tree body of the pinned left glass column (ui::drawLeftPane) — fixed nodes
+// (Equations, Material, planes, Origin) followed by the feature history with status badges,
+// context menu (Rename/Suppress/Delete/Edit).
 // Selecting a tree feature highlights its owned faces in the viewport via the selection set.
 // The panel calls back into C17's edit dispatcher via the optional EditCallback slot.
 #pragma once

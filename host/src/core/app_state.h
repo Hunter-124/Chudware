@@ -97,6 +97,11 @@ struct Settings {
     std::string systemPrompt;    // system prompt override; empty = built-in
     std::string theme = "dark";  // "dark" | "light" — persisted to config.json
     Units units = Units::MMGS;   // document display/input unit system — persisted to config.json
+    // v2.1 colored liquid glass: per-group tint/level/rounding/contrast knobs (+ dynamicColor,
+    // ON by default) — persisted to config.json under "appearance.glass"; absent keys stay at
+    // their GlassStyle sentinels (= inherit Global / built-in default). Mirrored into
+    // ui::setGlassConfig() at startup and whenever a knob changes (safe to push every frame).
+    ui::GlassConfig glassCfg;
     // Wave 3 (GUI rework): File Explorer workspace root + Recent files, persisted to config.json
     // ("workspace_dir" / "recent_files"). Mirrored onto AppState at startup; AppState is the live
     // copy the UI reads, Settings is what saveSettings serializes.
@@ -946,14 +951,11 @@ struct AppState {
     bool showViewport = true;
     // C24: the right task pane (Design + Agent Activity tabs, SolidWorks-style). View > Task Pane.
     bool showTaskPane = true;
-    bool focusDesignTab = false;  // one-shot: focus the Design tab after a (re)layout
     bool focusHelpTab = false;    // one-shot: focus the AI pane's Help tab
     bool focusSettingsTab = false; // one-shot: focus the AI pane's Settings tab
     // Consolidated AI panel (Design / Activity / Console as internal tabs). One dock window "AI".
     bool showAIPanel = true;
     bool showSessionsPicker = false;  // Copilot: hide chat log, show the Sessions list/dropdown
-    unsigned int aiDockId = 0;   // dock node the "AI" window lives in — so the sibling "Settings"
-                                 // tab can dock next to it even on a saved layout (ImGuiID).
     // Design Table panel (SolidWorks Design Table). Dockable "Design Table" window in the right
     // task pane; View > Design Table toggles it. An editable grid (rows=configs, columns=driven
     // params + per-feature suppression) over the same config_* RPCs the Configurations panel reads.

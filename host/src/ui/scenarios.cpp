@@ -885,6 +885,73 @@ void ScenarioRunner::tick(AppState& st) {
 
     // ---------- W17 engineering-drawing scenario (AI_CAD_SHOT=drawing) ----------
     runDrawing(st);
+
+    // ---------- appearance scenario (AI_CAD_SHOT=appearance) ----------
+    runAppearance(st);
+}
+
+// Appearance scenario (AI_CAD_SHOT=appearance). Same frame-driven step machine + kSettle
+// settling + per-step backbuffer capture (apCapture) as evalmass/m1. Flow: new part + box
+// (a modeled part so the Appearance tab's live glass preview frosts real geometry) -> open the
+// Settings modal jumped to the Appearance tab (index 0) -> settle -> capture. Unlike the older
+// scenarios this one has no AppState want-flag: the runner reads AI_CAD_SHOT itself (gated on
+// st.shot so a stray env var in an interactive run can't hijack the frame loop).
+void ScenarioRunner::runAppearance(AppState& st) {
+    if (!apInit) {
+        apInit = true;
+        const char* sm = std::getenv("AI_CAD_SHOT");
+        apWant = st.shot && sm && std::strcmp(sm, "appearance") == 0;
+    }
+    if (!(apWant && st.workerStarted && !apDone && st.frame >= 5)) return;
+    if (!apDirReady) {
+        apDirReady = true;
+        const char* repo = std::getenv("AI_CAD_REPO");
+        std::string base = repo ? std::string(repo) : std::string(".");
+        apSavePath = base + "/scratch/appearance_shots";
+        std::error_code ec; std::filesystem::create_directories(apSavePath, ec);
+    }
+    const int kSettle = 4;
+    if (apSettle > 0) { --apSettle; return; }
+    if (!apCapture.empty()) return;  // only advance when no capture is pending
+    std::string err;
+    switch (apStep) {
+        case 0: {  // modeled part: box 60x40x10 (mirrors evalmass's single-feature build)
+            if (!st.docMirror.newPart(st.worker, err)) {
+                std::printf("appearance: new_part FAILED: %s\n", err.c_str());
+                std::fflush(stdout);
+                apDone = true; break;
+            }
+            nlohmann::json ops = nlohmann::json::array();
+            ops.push_back({{"op","add_feature"},{"feature",{
+                {"type","box"},{"name","Box1"},{"params",{
+                    {"length",{{"value",60.0},{"expr",nullptr}}},
+                    {"width", {{"value",40.0},{"expr",nullptr}}},
+                    {"height",{{"value",10.0},{"expr",nullptr}}}},
+                },{"centered",true}}}});
+            auto r = st.docMirror.applyOps(st.worker, ops);
+            if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+            st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
+            std::printf("appearance: box ok=%d rev=%d\n", (int)r.ok, r.revision);
+            std::fflush(stdout);
+            apSettle = kSettle; ++apStep; break;
+        }
+        case 1: {  // open Settings jumped to the Appearance tab (first tab, index 0)
+            st.openSettings = true;
+            st.openSettingsTab = 0;
+            std::printf("appearance: settings modal opened on Appearance tab\n");
+            std::fflush(stdout);
+            apSettle = kSettle * 2; ++apStep; break;  // let the modal + glass preview settle
+        }
+        case 2: {  // capture the modal over the modeled part
+            apCapture = apSavePath + "/appearance_01_settings.png";
+            apSettle = kSettle; ++apStep; break;
+        }
+        default:
+            apDone = true;
+            std::printf("appearance: scenario complete\n");
+            std::fflush(stdout);
+            break;
+    }
 }
 
 // Multi-document mid-edit verification (AI_CAD_SHOT=multidoc). Same frame-driven step machine +
@@ -1475,6 +1542,21 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         return st.activityShotDone ? FrameAction::Break : FrameAction::Continue;
     }
     // --- end C22b activity shot capture ---
+
+    // appearance scenario: single capture (mirrored to the caller's --ui-screenshot target),
+    // waiting for any async worker call to drain so the modal + preview are settled.
+    if (apWant) {
+        ++st.frame;
+        if (!apCapture.empty() && !st.rpc.busy()) {
+            std::error_code ec; std::filesystem::create_directories(apSavePath, ec);
+            writeBackbufferPng(apCapture.c_str(), dw, dh, screenshotPath);
+            std::printf("appearance screenshot -> %s (%dx%d)\n", apCapture.c_str(), dw, dh);
+            std::fflush(stdout);
+            apCapture.clear();
+        }
+        glfwSwapBuffers(st.win);
+        return apDone ? FrameAction::Break : FrameAction::Continue;
+    }
 
     // multidoc scenario: identical per-step capture mechanism. Wait for any async worker call
     // (eval_measure on B) to drain so the captured frame shows the settled state.

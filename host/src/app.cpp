@@ -776,7 +776,10 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // GUI rework layout schema. The old imgui.ini can contain dock IDs/window placements from
     // pre-rework names, which restores the FeatureManager into the center and leaves Viewport as a
     // floating orphan. Use a versioned ini so stale dock layouts cannot override buildDefaultLayout.
-    static std::string iniPath = appdataDir() + "/AI-CAD/imgui_gui_v3.ini";
+    // v4: overlay layout — stale v3 entries carry docked flags/placements for the now-floating
+    // FeatureManager/Copilot columns. The ini is ALSO the columns' width persistence (ImGui saves
+    // floating windows' Pos/Size by name), so column width survives restarts with zero new code.
+    static std::string iniPath = appdataDir() + "/AI-CAD/imgui_gui_v4.ini";
     io.IniFilename = shot ? nullptr : iniPath.c_str();
 
     float xs = 1.0f, ys = 1.0f;
@@ -847,7 +850,13 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // them. They stay inert until a doc mesh (AICM) is loaded. Highlight colors track theme roles.
     render::IdPass idPass;
     render::Overlays overlays;
-    overlays.setColors(ui::palette.hoverHighlight, ui::palette.selectionHighlight);
+    {
+        // C37-C feature-highlight wash follows the theme (dimmer selection tint) instead of the
+        // baked default; re-pushed every frame below so theme switches track automatically.
+        float feat[4];
+        ui::Palette::withAlpha(ui::palette.selectionHighlight, feat, 0.30f);
+        overlays.setColors(ui::palette.hoverHighlight, ui::palette.selectionHighlight, feat);
+    }
 
     // ---------- application state (bundles what were run_gui locals) ----------
     AppState st;
@@ -1083,6 +1092,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     st.ribbonDispatch = dispatchCmd;
 
     loadSettings(st.settings);
+    // Liquid glass v2.1: install + resolve the persisted appearance config before the first frame
+    // (idempotent; re-pushed every frame in the loop below so runtime mutations self-heal).
+    ui::setGlassConfig(st.settings.glassCfg);
     // editor buffer for the system-prompt override (Settings > Agent)
     std::strncpy(st.spBuf.data(), st.settings.systemPrompt.c_str(), st.spBuf.size() - 1);
 
@@ -2387,6 +2399,20 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        // Liquid glass v2.1: per-frame Settings -> resolved-glass push. Idempotent (exact-match
+        // early-out in setGlassConfig => free), so any code path that mutates st.settings.glassCfg
+        // (the Appearance editor, MCP, tests) is live-applied without extra plumbing.
+        ui::setGlassConfig(st.settings.glassCfg);
+
+        // Viewport highlight colors track the live palette (theme switches included) — setColors
+        // just stores three float[4]s, so the per-frame push is free.
+        if (st.overlays) {
+            float featHl[4];
+            ui::Palette::withAlpha(ui::palette.selectionHighlight, featHl, 0.30f);
+            st.overlays->setColors(ui::palette.hoverHighlight, ui::palette.selectionHighlight,
+                                   featHl);
+        }
+
         // ---------- W1-B (item 4): global Undo / Redo keys ----------
         // Ctrl+Z = undo, Ctrl+Y / Ctrl+Shift+Z = redo. Routed through the SAME AppState helper the
         // FeatureManager toolbar buttons use (mesh refresh + owner map + confirmation toast).
@@ -2626,11 +2652,15 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // The browser/SolidWorks-style document tabs are rendered by the central Viewport/ECAD
         // window that owns the view area, so the strip stays contained in that view window.
         st.ensureActiveTab();
-        float docTabsH = 0.0f;
 
         // ---------- dockspace host (between the title bar+ribbon and the status bar) ----------
         const float statusH = ImGui::GetTextLineHeight() + 8.0f * scale;
         const float dockTopY = barH + ribbonH;
+        // Publish the overlay band (the full-width viewport region the pinned glass columns
+        // anchor to) BEFORE any panel draws — drawLeftPane (layout.cpp) and the Copilot column
+        // (legacy_chat.cpp) read it via ui::overlayBand().
+        ui::setOverlayBand(vp->Pos.x, vp->Pos.y + dockTopY,
+                           vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y - statusH);
         ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + dockTopY));
         ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
         ImGui::SetNextWindowViewport(vp->ID);
@@ -2643,17 +2673,16 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             ImGuiWindowFlags_NoDocking;
         ImGui::Begin("##DockHost", nullptr, hostFlags | ImGuiWindowFlags_NoBackground);
         ImGui::PopStyleVar(3);
-        // Versioned dockspace ID pairs with imgui_gui_v2.ini. Changing this intentionally forces
+        // Versioned dockspace ID pairs with the versioned ini. Changing this intentionally forces
         // one clean DockBuilder layout after major window/dock identity changes.
-        ImGuiID dockId = ImGui::GetID("AICADDockV5");  // V5: CAM workspace docked into the central node
+        ImGuiID dockId = ImGui::GetID("AICADDockV6");  // V6: overlay layout — splitless central node
         if ((!st.layoutInit && ImGui::DockBuilderGetNode(dockId) == nullptr) || st.resetLayout) {
             buildDefaultLayout(dockId, ImVec2(vp->Size.x, vp->Size.y - dockTopY - statusH));
             st.layoutInit = true;
             st.resetLayout = false;
-            // C24: make Design the active tab in the right task pane (not Agent Activity), matching
-            // SolidWorks's task pane defaulting to the first tab. Deferred one frame via a flag so
-            // the docked windows exist before we focus.
-            st.focusDesignTab = true;
+            // "Reset layout" also restores the pinned glass columns' default width/collapse state
+            // (one-shot flags consumed by drawLeftPane / the Copilot column on their next draw).
+            ui::resetOverlayColumns();
             // Don't yank focus to the Viewport when the app opens straight into a non-3D workspace
             // (ECAD board editor or the CAM Manufacture tab) — let that workspace's docked tab show.
             if (!st.wantEcad && st.ribbonTab != AppState::RT_Manufacture) st.wantFocusViewport = 6;
@@ -2667,8 +2696,16 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // window still paints its own background (the glass FeatureManager stays translucent) on top.
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
         ImGui::PushStyleColor(ImGuiCol_DockingEmptyBg, ImVec4(0, 0, 0, 0));
+        // Overlay layout: the default layout has NO dock splits, so ImGui draws no splitter bars.
+        // Belt-and-braces for user-created splits (a window dragged into a dockspace edge): make
+        // any splitter invisible around ONLY this DockSpace call (DockingSeparatorSize keeps its
+        // default so the invisible hit zone still resizes). ui_theme's Separator roles stay live
+        // for normal ImGui::Separator() everywhere else.
+        ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_SeparatorActive, ImVec4(0, 0, 0, 0));
         ImGui::DockSpace(dockId, ImVec2(0, 0), ImGuiDockNodeFlags_PassthruCentralNode);
-        ImGui::PopStyleColor(2);
+        ImGui::PopStyleColor(5);
         ImGui::End();
 
         // ---------- status bar ----------
@@ -2676,9 +2713,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
 
         bool canRun = st.workerStarted && !busy;
 
-        // ---------- panels ----------
-        // Wave 1D: the SolidWorks-faithful tabbed LEFT pane (Explorer / FeatureManager /
-        // PropertyManager / Configurations). drawLeftPane routes the active tab body and auto-
+        // ---------- panels (pinned glass columns + floating dialogs over the full-width 3D) ----
+        // The SolidWorks-faithful tabbed LEFT column (Explorer / FeatureManager / PropertyManager /
+        // Configurations). drawLeftPane routes the active tab body and auto-
         // switches to the PropertyManager tab while a command form is active. We still tick the PM
         // so the debounced live preview fires; the container draws the PM form body when active.
         // A live PropertyManager forces the left pane open so its form is visible, but the preview
@@ -2698,8 +2735,6 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // W3-H: unified AI Copilot pane (input-at-top + conversation; embeds the run tree
         // inline while a v2 run is active). st.activityPanel is still fed events via onEvent.
         ui::drawAIPanel(st, busy, canRun);
-        // Sibling "Settings" dock tab next to the AI pane.
-        ui::drawAISettingsTab(st, busy);
         // W3-H: standalone "Agent Activity" window (View > Activity / the pane's Activity
         // button / the activity shot). No-op unless st.showActivityPanel; was previously
         // unreachable because only the in-pane tab hosted drawBody.

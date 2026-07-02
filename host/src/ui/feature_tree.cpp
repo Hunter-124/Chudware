@@ -66,7 +66,9 @@ namespace ui {
 static const ui::AdaptiveSurface& fmSurf() {
     ImVec2 wp_ = ImGui::GetWindowPos(); ImVec2 ws_ = ImGui::GetWindowSize();
     ImRect r(wp_, ImVec2(wp_.x + ws_.x, wp_.y + ws_.y));
-    return ui::adaptivePanel(ui::panelId("host_left_glass"), r);
+    // Group tag MUST match layout.cpp's paint site (adaptivePanel contract: same group every
+    // frame for a given id) — v2.1 per-group knobs ride in through it.
+    return ui::adaptivePanel(ui::panelId("host_left_glass"), r, ui::GlassGroup::FeatureManager);
 }
 // Contrast halo for drawIconGlass: surf.tint is already the opposite-tone neutral (see
 // ui_theme.cpp adaptiveSurface) at ~0x50 alpha; 0 alpha (no live backdrop) => drawIconGlass
@@ -128,16 +130,70 @@ static void treeIcon(const char* name, const char* fallback, float size = 16.0f,
 }
 
 // Frosted row pill at the current cursor (full content width). Stripe index advances per call.
+// Height is the FRAME height only (font + FramePadding), never WithSpacing — a pill that also
+// covered the inter-row spacing bled into the next row / the section dividers and read as
+// stacked, overlapping slabs (visual-review fix).
 static int s_fmStripeIdx = 0;
 static void fmRowPill(bool selected = false) {
-    const float S = ui::uiScale;
-    const float rowH = ImGui::GetFrameHeightWithSpacing();
+    const float rowH = ImGui::GetFrameHeight();
     ImVec2 rowMin = ImGui::GetCursorScreenPos();
     float availW = ImGui::GetContentRegionAvail().x;
     ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
     const float wash = selected ? 0.42f : 0.26f;
     ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, 3.5f,
                            (s_fmStripeIdx++ % 2) == 0, selected, wash);
+}
+
+// Draw a row's type icon INSIDE the (empty) leaf-arrow slot of the TreeNodeEx that was just
+// submitted, given the cursor position captured BEFORE the node. Leaf tree nodes still reserve
+// the arrow column (FontSize + padding) ahead of their label; drawing the icon as a separate
+// item BEFORE the node doubled that gap and left the icon stranded far left of its label
+// (visual-review fix). The icon is clamped to the arrow slot so it never overlaps the label.
+static void treeIconInArrowSlot(ImVec2 rowPos, const char* name, const char* fallback,
+                                float alpha = 1.0f) {
+    const float rowH = ImGui::GetItemRectSize().y;
+    const float px = std::min(16.0f * ui::uiScale, ImGui::GetFontSize());
+    ImVec2 p(rowPos.x + ImGui::GetStyle().FramePadding.x * 0.5f,
+             rowPos.y + (rowH - px) * 0.5f);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    IconUV iv = getIcon(name, 20);
+    if (iv.valid) {
+        dl->AddImage(iv.texId, p, ImVec2(p.x + px, p.y + px), iv.uv0, iv.uv1,
+                     IM_COL32(255, 255, 255, (int)(alpha * 255.0f)));
+    } else {
+        const ui::AdaptiveSurface& surf = fmSurf();
+        dl->AddText(p, ImGui::ColorConvertFloat4ToU32(
+                            ImVec4(surf.textSecondary.x, surf.textSecondary.y,
+                                   surf.textSecondary.z, alpha)),
+                    fallback);
+    }
+}
+
+// ---- vector eye glyph (per-row visibility toggle) ----
+// The atlas "hide_show_eye" icon rendered faint/ambiguous at native scale (the hidden state read
+// as a bare diagonal slash — visual-review fix), so the eye is drawn as crisp vector geometry:
+// two lens arcs + a pupil, with a slash overlaid when hidden. Ink comes from the adaptive surface
+// so it holds contrast on any backdrop.
+static void drawEyeGlyph(ImDrawList* dl, ImVec2 mn, ImVec2 mx, bool shown, bool hovered,
+                         const ui::AdaptiveSurface& surf) {
+    const float S = ui::uiScale;
+    const ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
+    const float w = (mx.x - mn.x) * 0.5f;          // half-width of the eye
+    const float h = w * 0.62f;                     // lens half-height
+    const float a = shown ? (hovered ? 1.0f : 0.85f) : (hovered ? 0.85f : 0.60f);
+    const ImU32 ink = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, a));
+    const float th = std::max(1.0f, 1.3f * S);
+    // Lens: two mirrored quadratic arcs through the corners.
+    dl->PathLineTo(ImVec2(c.x - w, c.y));
+    dl->PathBezierQuadraticCurveTo(ImVec2(c.x, c.y - 2.0f * h), ImVec2(c.x + w, c.y), 8);
+    dl->PathStroke(ink, 0, th);
+    dl->PathLineTo(ImVec2(c.x - w, c.y));
+    dl->PathBezierQuadraticCurveTo(ImVec2(c.x, c.y + 2.0f * h), ImVec2(c.x + w, c.y), 8);
+    dl->PathStroke(ink, 0, th);
+    if (shown) dl->AddCircleFilled(c, std::max(1.5f, w * 0.30f), ink);
+    else       dl->AddLine(ImVec2(c.x - w, c.y + h + 1.0f * S),
+                           ImVec2(c.x + w, c.y - h - 1.0f * S), ink, th);
 }
 
 // ---- Solid Bodies visibility helper ----
@@ -779,14 +835,11 @@ struct RowResult {
 static RowResult featureRow(RowCtx& c, AppState& st) {
     RowResult res;
     const std::string& fid = c.fid;
-    // #4.2: feature rows now use the SAME logical 16px icon as headers/folders (was 20) so the icon
-    // column is uniform; treeIcon bakes in *uiScale.
-    float iconW = 16.0f;
     if (c.nested) ImGui::Indent(14.0f * ui::uiScale);   // #4.3: scaled sketch child indent
     // C37-E (item 6): suppressed/rolled-back rows get a faded icon (clearer than just the [S] tag).
+    // The icon is drawn INTO the leaf node's arrow slot after TreeNodeEx (treeIconInArrowSlot) so
+    // the label sits directly beside it instead of across a doubled icon+arrow gap.
     float iconAlpha = c.suppressed ? 0.45f : (c.rolledBack ? 0.6f : 1.0f);
-    treeIcon(c.iconName, c.iconFallback, iconW, iconAlpha);
-    ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5: scaled icon↔label gap
 
     // ---- inline rename editor (replaces the label while active) ----
     if (s_renamingId == fid) {
@@ -839,11 +892,12 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         ImGuiTreeNodeFlags_NoTreePushOnOpen |
         ImGuiTreeNodeFlags_SpanFullWidth;
 
-    // Suppressed → dim heavily. Rolled back → dim + italic-ish look (we cannot truly italicize a
+    // Suppressed → dim. Rolled back → dim + italic-ish look (we cannot truly italicize a
     // default font, so we use the lighter dim + the "(Rolled back)" cue in the badge/tooltip).
+    // Alphas stay high enough for a readable dimmed state (no-low-contrast-text goal).
     bool dim = c.suppressed || c.rolledBack;
     if (dim) {
-        float a = c.suppressed ? 0.5f : 0.62f;
+        float a = c.suppressed ? 0.75f : 0.85f;
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(fmSurf().textSecondary.x, fmSurf().textSecondary.y,
                    fmSurf().textSecondary.z, a));
@@ -859,7 +913,9 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 2.0f * ui::uiScale));
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0, 0, 0, 0));
+    ImVec2 rowPos = ImGui::GetCursorScreenPos();
     ImGui::TreeNodeEx(label.c_str(), flags);
+    treeIconInArrowSlot(rowPos, c.iconName, c.iconFallback, iconAlpha);
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar(2);
 
@@ -1077,22 +1133,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     {
         bool shown = featureEyeShown(st, fid, c.ownedBodies);
         ImDrawList* eyeDl = ImGui::GetWindowDrawList();
-        IconUV iv = getIcon("hide_show_eye", 20);
-        float a = shown ? (overEye ? 1.0f : 0.70f) : (overEye ? 0.55f : 0.28f);
-        const ui::AdaptiveSurface& eyeSurf = fmSurf();
-        ImU32 tint = ImGui::ColorConvertFloat4ToU32(
-            ImVec4(eyeSurf.textPrimary.x, eyeSurf.textPrimary.y, eyeSurf.textPrimary.z, a));
-        if (iv.valid) {
-            drawIconGlass(eyeDl, "hide_show_eye",
-                         ImVec2((eyeMin.x + eyeMax.x) * 0.5f, (eyeMin.y + eyeMax.y) * 0.5f),
-                         eyeMax.x - eyeMin.x, tint, fmHalo(eyeSurf));
-            if (!shown)
-                eyeDl->AddLine(ImVec2(eyeMin.x, eyeMax.y), ImVec2(eyeMax.x, eyeMin.y),
-                               ImGui::ColorConvertFloat4ToU32(eyeSurf.textSecondary),
-                               std::max(1.0f, 1.5f * ui::uiScale));
-        } else {
-            eyeDl->AddText(eyeMin, tint, shown ? "o" : "-");
-        }
+        drawEyeGlyph(eyeDl, eyeMin, eyeMax, shown, overEye, fmSurf());
         if (overEye) {
             ImGui::SetTooltip(shown ? "Hide" : "Show");
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -1332,14 +1373,14 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             FStatus fs = getFeatureStatus(statusArr, cid);
 
             fmRowPill();
-            treeIcon(isAsm ? "assembly" : "part", isAsm ? "[A]" : "[P]", 16.0f);
-            ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
             // SolidWorks marks fixed components with a "(f)" prefix.
             std::string label = (fixed ? "(f) " : "") + cname;
             if (suppressed) label += " [S]";
             ImGuiTreeNodeFlags lf = ImGuiTreeNodeFlags_Leaf |
                 ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanFullWidth;
+            ImVec2 compRowPos = ImGui::GetCursorScreenPos();
             ImGui::TreeNodeEx((label + "##comp_" + cid).c_str(), lf);
+            treeIconInArrowSlot(compRowPos, isAsm ? "assembly" : "part", isAsm ? "[A]" : "[P]");
             featureBadge(fs.ok, !fs.error.empty(), fs.error, fs.dangling, false, fs.warning);
             ++ci;
         }
@@ -1377,13 +1418,13 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                 if (msup) row += " [S]";
 
                 fmRowPill();
-                treeIcon("mate", "[m]", 16.0f);
-                ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                 if (msup) ImGui::PushStyleColor(ImGuiCol_Text,
-                    ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.5f));
+                    ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.75f));
                 ImGuiTreeNodeFlags mf = ImGuiTreeNodeFlags_Leaf |
                     ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanFullWidth;
+                ImVec2 mateRowPos = ImGui::GetCursorScreenPos();
                 ImGui::TreeNodeEx((row + "##mate_" + mid).c_str(), mf);
+                treeIconInArrowSlot(mateRowPos, "mate", "[m]", msup ? 0.6f : 1.0f);
                 if (msup) ImGui::PopStyleColor();
 
                 pushTreePopupGlass();
@@ -1995,9 +2036,9 @@ void drawFeatureTreeBody(AppState& st,
                 char eqLabel[64];
                 std::snprintf(eqLabel, sizeof(eqLabel), "Equations (%d)##eqhdr", eqCount);
                 fmRowPill();
-                treeIcon("equations", "[=]", 16.0f);
-                ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
+                ImVec2 eqRowPos = ImGui::GetCursorScreenPos();
                 ImGui::TreeNodeEx(eqLabel, f);
+                treeIconInArrowSlot(eqRowPos, "equations", "[=]");
                 // Double-click the node to open the Equations / Global Variables editor (SolidWorks).
                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                     st.showEquations = true;
@@ -2017,9 +2058,9 @@ void drawFeatureTreeBody(AppState& st,
                     }
                 }
                 fmRowPill();
-                treeIcon("material", "[M]", 16.0f);
-                ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
-                ImGui::TreeNodeEx("##mat_hdr", f | ImGuiTreeNodeFlags_NoTreePushOnOpen);
+                ImVec2 matRowPos = ImGui::GetCursorScreenPos();
+                ImGui::TreeNodeEx("Material##mat_hdr", f);
+                treeIconInArrowSlot(matRowPos, "material", "[M]");
                 // W2 (material UX): right-click the Material node to assign a PHYSICAL material.
                 // Each choice (a) sets the part's material key (set_material) — read by FEA studies
                 // and shown on this row — and (b) recolours every body to the material's look via a
@@ -2067,8 +2108,6 @@ void drawFeatureTreeBody(AppState& st,
                         popTreePopupGlass();
                     }
                 }
-                ImGui::SameLine();
-                ImGui::TextUnformatted("Material");
                 // Show the friendly material name (kPhysicalMaterials) when the assigned key is one
                 // we know; fall back to the raw engine key for any other (custom / MCP-set) material.
                 const char* matLabel = matKey.c_str();
@@ -2115,15 +2154,16 @@ void drawFeatureTreeBody(AppState& st,
                                                     ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                                     ImGuiTreeNodeFlags_SpanFullWidth;
                             fmRowPill();
-                            treeIcon("part", "[B]", 16.0f, hidden ? 0.45f : 1.0f);
-                            ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                             if (hidden)
                                 ImGui::PushStyleColor(ImGuiCol_Text,
                                     ImVec4(pal.textDim[0], pal.textDim[1],
-                                           pal.textDim[2], 0.55f));
+                                           pal.textDim[2], 0.85f));
                             char rowId[48];
                             std::snprintf(rowId, sizeof(rowId), "%s##body%d", bname, bi);
+                            ImVec2 bodyRowPos = ImGui::GetCursorScreenPos();
                             ImGui::TreeNodeEx(rowId, bf);
+                            treeIconInArrowSlot(bodyRowPos, "part", "[B]",
+                                                hidden ? 0.45f : 1.0f);
                             if (hidden) ImGui::PopStyleColor();
                             // Capture row interactions NOW; BeginPopupContextItem binds to the
                             // LAST item, so it must come right after TreeNodeEx, before any
@@ -2197,13 +2237,17 @@ void drawFeatureTreeBody(AppState& st,
                         if (st.planeEmphasis == pi) pf |= ImGuiTreeNodeFlags_Selected;
                         bool planeShownEff = st.showPlane[pi] || planesAutoShow;
                         bool hidden = !planeShownEff;
-                        treeIcon("ref_plane", "[P]", 16.0f, hidden ? 0.45f : 1.0f);
-                        ImGui::SameLine(0, 4 * ui::uiScale);
+                        // Pill FIRST (at the row's true left edge — drawing it after the icon left
+                        // a misaligned slab starting right of the indent), then the node, then the
+                        // icon into the leaf arrow slot. Hidden planes keep a readable dim state.
+                        fmRowPill(st.planeEmphasis == pi);
                         if (hidden)
                             ImGui::PushStyleColor(ImGuiCol_Text,
-                                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.55f));
-                        fmRowPill(st.planeEmphasis == pi);
+                                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
+                        ImVec2 planeRowPos = ImGui::GetCursorScreenPos();
                         ImGui::TreeNodeEx((std::string(kPlanes[pi]) + "##plane" + std::to_string(pi)).c_str(), pf);
+                        treeIconInArrowSlot(planeRowPos, "ref_plane", "[P]",
+                                            hidden ? 0.45f : 1.0f);
                         if (hidden) ImGui::PopStyleColor();
                         ImVec2 pNodeMin = ImGui::GetItemRectMin();
                         ImVec2 pNodeMax = ImGui::GetItemRectMax();
@@ -2214,25 +2258,7 @@ void drawFeatureTreeBody(AppState& st,
                         bool   pOverEye = ImGui::IsMouseHoveringRect(pEyeMin, pEyeMax);
                         {
                             ImDrawList* pdl = ImGui::GetWindowDrawList();
-                            IconUV iv = getIcon("hide_show_eye", 20);
-                            float a = !hidden ? (pOverEye ? 1.0f : 0.70f) : (pOverEye ? 0.55f : 0.28f);
-                            const ui::AdaptiveSurface& peSurf = fmSurf();
-                            ImU32 tint = ImGui::ColorConvertFloat4ToU32(
-                                ImVec4(peSurf.textPrimary.x, peSurf.textPrimary.y,
-                                       peSurf.textPrimary.z, a));
-                            if (iv.valid) {
-                                drawIconGlass(pdl, "hide_show_eye",
-                                             ImVec2((pEyeMin.x + pEyeMax.x) * 0.5f,
-                                                    (pEyeMin.y + pEyeMax.y) * 0.5f),
-                                             pEyeMax.x - pEyeMin.x, tint, fmHalo(peSurf));
-                                if (hidden)
-                                    pdl->AddLine(ImVec2(pEyeMin.x, pEyeMax.y), ImVec2(pEyeMax.x, pEyeMin.y),
-                                                 ImGui::ColorConvertFloat4ToU32(ImVec4(pal.textDim[0],
-                                                     pal.textDim[1], pal.textDim[2], 0.9f)),
-                                                 std::max(1.0f, 1.5f * ui::uiScale));
-                            } else {
-                                pdl->AddText(pEyeMin, tint, hidden ? "-" : "o");
-                            }
+                            drawEyeGlyph(pdl, pEyeMin, pEyeMax, !hidden, pOverEye, fmSurf());
                             if (pOverEye) {
                                 ImGui::SetTooltip(hidden ? "Show %s" : "Hide %s", kPlanes[pi]);
                                 if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -2466,7 +2492,9 @@ void drawFeatureTreeBody(AppState& st,
                         ImVec2 rowMin = ImGui::GetCursorScreenPos();
                         float availW = ImGui::GetContentRegionAvail().x;
                         const float S = ui::uiScale;
-                        const float rowH = ImGui::GetTextLineHeight() + 10.0f * S;
+                        // Must equal featureRow()'s node frame height (FramePadding 3dp pushed
+                        // there): a taller pill bled over the following row (visual-review fix).
+                        const float rowH = ImGui::GetTextLineHeight() + 6.0f * S;
                         ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
                         ImDrawList* rowDl = ImGui::GetWindowDrawList();
                         // Readable row pill via shared glass helper (panel stays transparent).
@@ -2871,19 +2899,35 @@ void drawFeatureTreeBody(AppState& st,
             if (!s_docPath.empty() && ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", s_docPath.c_str());
             bool canSave = st.docMirror.hasDoc();
+            // Adaptive glass chips: theme Button colors don't track the live backdrop, which left
+            // the labels near-invisible over the frosted column (visual-review fix). Fill + ink
+            // both come from the pane's adaptive surface so they always read; disabled rows keep
+            // ImGui's DisabledAlpha over the same high-contrast ink.
+            const ui::AdaptiveSurface& btnSurf = fmSurf();
+            const ImVec4& ink = btnSurf.textPrimary;
+            ImGui::PushStyleColor(ImGuiCol_Text, ink);
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(ink.x, ink.y, ink.z, 0.10f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(ink.x, ink.y, ink.z, 0.20f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(ink.x, ink.y, ink.z, 0.28f));
+            ImGui::PushStyleColor(ImGuiCol_Border,
+                ImVec4(btnSurf.textTertiary.x, btnSurf.textTertiary.y,
+                       btnSurf.textTertiary.z, 0.60f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, std::max(1.0f, 1.0f * ui::uiScale));
             if (!canSave) ImGui::BeginDisabled();
             {
                 const ImGuiStyle& style = ImGui::GetStyle();
                 const float gap = style.ItemSpacing.x;
                 const float halfW = (ImGui::GetContentRegionAvail().x - gap) * 0.5f;
-                fmRowPill();
                 if (ImGui::Button("Save", ImVec2(halfW, 0))) doSaveDoc(st, /*forceDialog=*/false);
                 ImGui::SameLine(0, gap);
                 if (ImGui::Button("Save As...", ImVec2(halfW, 0))) doSaveDoc(st, /*forceDialog=*/true);
             }
             if (!canSave) ImGui::EndDisabled();
-            ui::glassRowAtCursor(3.5f, false, false, 6.0f);
             if (ImGui::Button("Open...", ImVec2(-1, 0))) doOpenDoc(st);
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(5);
+            // Bottom breathing room so the last row never kisses the bubble's rounded edge.
+            ImGui::Dummy(ImVec2(0, 6.0f * ui::uiScale));
         }
     }
 

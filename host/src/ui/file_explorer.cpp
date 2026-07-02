@@ -46,7 +46,9 @@ static void explorerRowPill(bool selected = false) {
 static const ui::AdaptiveSurface& explorerSurf() {
     ImVec2 wp_ = ImGui::GetWindowPos(); ImVec2 ws_ = ImGui::GetWindowSize();
     ImRect r(wp_, ImVec2(wp_.x + ws_.x, wp_.y + ws_.y));
-    return ui::adaptivePanel(ui::panelId("host_left_glass"), r);
+    // Glass v2.1: the left pane is the FeatureManager group (per-group user overrides). All
+    // "host_left_glass" call sites (layout.cpp, feature_tree.cpp) must pass the same group.
+    return ui::adaptivePanel(ui::panelId("host_left_glass"), r, ui::GlassGroup::FeatureManager);
 }
 // Contrast halo for drawIconGlass: surf.tint is already the opposite-tone neutral (see
 // ui_theme.cpp adaptiveSurface) at ~0x50 alpha; 0 alpha (no live backdrop) => drawIconGlass
@@ -181,6 +183,14 @@ void ensureWorkspaceDir(AppState& st) {
     std::error_code ec;
     fs::create_directories(st.workspaceDir, ec);   // idempotent; ignore "already exists"
     if (s_currentFolder.empty()) s_currentFolder = st.workspaceDir;
+    // Root-change detection: Settings -> General's "Workspace folder" Apply resets st.workspaceDir
+    // (possibly to empty = re-resolve default, handled above) while the app is live. Re-root the
+    // browser to the new workspace — without this, s_currentFolder keeps showing the old tree.
+    static std::string s_lastRoot;
+    if (st.workspaceDir != s_lastRoot) {
+        s_lastRoot = st.workspaceDir;
+        s_currentFolder = st.workspaceDir;
+    }
 }
 
 // ---- inline rename commit -------------------------------------------------
@@ -426,7 +436,6 @@ static void drawRecentSection(AppState& st) {
             std::error_code ec;
             bool exists = fs::exists(p, ec);
             if (!exists) ImGui::PushStyleColor(ImGuiCol_Text, explorerSurf().textSecondary);
-            explorerRowPill();
             if (ImGui::Selectable(p.filename().string().c_str(), false,
                                   ImGuiSelectableFlags_AllowDoubleClick) &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && exists)

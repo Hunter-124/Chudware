@@ -35,6 +35,20 @@ static const SCmd kSketchCmds[] = {
 static constexpr int kModelCount  = (int)(sizeof(kModelCmds)  / sizeof(kModelCmds[0]));
 static constexpr int kSketchCount = (int)(sizeof(kSketchCmds) / sizeof(kSketchCmds[0]));
 
+// ---- geometry (logical px at 1x) ----------------------------------------------
+// SINGLE source for the bar's metrics: update() previously placed/clamped the bar with a
+// 30px-button/4px-pad footprint while draw() painted a 36/6 one, so the pill could hang past
+// the viewport edge and sat off-center under the mouse.
+static constexpr float kSBarBtn = 36.0f;   // square button hit size
+static constexpr float kSBarPad = 6.0f;    // pill inset + inter-button gap
+
+static void shortcutBarSize(int nCmds, float& barW, float& barH) {
+    const float s = ui::uiScale;
+    const float btnSz = kSBarBtn * s, pad = kSBarPad * s;
+    barW = (float)nCmds * btnSz + (float)(nCmds - 1) * pad + pad * 2.0f;
+    barH = btnSz + pad * 2.0f;
+}
+
 // ---- update ------------------------------------------------------------------
 void ShortcutBar::update(AppState& st, bool imgHovered, bool inSketch,
                          ImVec2 vr0, ImVec2 vr1) {
@@ -55,10 +69,8 @@ void ShortcutBar::update(AppState& st, bool imgHovered, bool inSketch,
 
         const float s     = ui::uiScale;
         const int   nCmds = inSketch ? kSketchCount : kModelCount;
-        const float btnSz = 30.0f * s;
-        const float pad   = 4.0f  * s;
-        float barW = nCmds * btnSz + (nCmds - 1) * pad + pad * 2.0f;
-        float barH = btnSz + pad * 2.0f;
+        float barW, barH;
+        shortcutBarSize(nCmds, barW, barH);
 
         // Place top-left at mouse; clamp so bar stays inside the viewport.
         float px = io.MousePos.x - barW * 0.5f;
@@ -80,20 +92,23 @@ void ShortcutBar::draw(AppState& st, bool inSketch) {
     const float s     = ui::uiScale;
     const auto& pal   = ui::palette;
 
-    const float btnSz = 36.0f * s;
-    const float pad   = 6.0f  * s;
-    float barW = (float)nCmds * btnSz + ((float)(nCmds - 1)) * pad + pad * 2.0f;
-    float barH = btnSz + pad * 2.0f;
+    const float btnSz = kSBarBtn * s;
+    const float pad   = kSBarPad * s;
+    float barW, barH;
+    shortcutBarSize(nCmds, barW, barH);
 
     ImVec2 p0 = m_pos;
     ImVec2 p1 = ImVec2(p0.x + barW, p0.y + barH);
 
     ImDrawList* dl = ImGui::GetForegroundDrawList();
 
-    // Pill background + border.
-    float rounding = barH * 0.45f;
-    dl->AddRectFilled(p0, p1, ui::Palette::toU32(pal.overlayBg), rounding);
-    dl->AddRect(p0, p1, ui::Palette::toU32(pal.overlayBorder), rounding, 0, 1.5f);
+    // Glass v2 pill over the live viewport (HUD group — per-group user overrides apply): the
+    // legacy overlayBg/overlayBorder pair ignored the backdrop, washing out over dark parts.
+    ImRect barRect(p0, p1);
+    const ui::AdaptiveSurface& surf =
+        ui::adaptivePanel(ui::panelId("host_shortcut_bar"), barRect, ui::GlassGroup::Hud);
+    ui::glassPanel(dl, barRect, ui::GlassLevel::Regular, (kSBarBtn + kSBarPad * 2.0f) * 0.45f,
+                   surf);
 
     // Buttons (InvisibleButton over draw-list art, same pattern as HUD toolbar).
     ImGui::PushID("##sbar");
@@ -105,18 +120,21 @@ void ShortcutBar::draw(AppState& st, bool inSketch) {
         bool clicked = ImGui::InvisibleButton("##sb", ImVec2(btnSz, btnSz));
         bool hov     = ImGui::IsItemHovered();
         if (hov) {
+            // Accent wash (not buttonHovered — near-invisible over the frosted pill).
             dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + btnSz, by + btnSz),
-                              ui::Palette::toU32(pal.buttonHovered), 4.0f * s);
+                              ui::Palette::toU32(pal.accentSoft), 4.0f * s);
             ImGui::SetTooltip("%s", cmds[i].tip);
         }
-        IconUV iv = ui::getIcon(cmds[i].icon, 24);
-        float iz  = 22.0f * s;
-        float off = (btnSz - iz) * 0.5f;
-        dl->AddImage(iv.texId,
-                     ImVec2(bx + off, by + off),
-                     ImVec2(bx + off + iz, by + off + iz),
-                     iv.uv0, iv.uv1,
-                     IM_COL32(255, 255, 255, 230));
+        // SDF glyphs pair with the adaptive surface ink + contrast halo; multi-color raster
+        // icons keep their pre-colored pixels (white tint = identity, no halo).
+        const float iz = 22.0f * s;
+        const ImVec2 ic(bx + btnSz * 0.5f, by + btnSz * 0.5f);
+        if (ui::hasIconSdf(cmds[i].icon))
+            ui::drawIconGlass(dl, cmds[i].icon, ic, iz,
+                              ImGui::ColorConvertFloat4ToU32(surf.textPrimary),
+                              ui::glassIconHalo(surf));
+        else
+            ui::drawIconGlass(dl, cmds[i].icon, ic, iz, IM_COL32(255, 255, 255, 230), 0);
         if (clicked) {
             if (st.ribbonDispatch) st.ribbonDispatch(cmds[i].id);
             dismiss();

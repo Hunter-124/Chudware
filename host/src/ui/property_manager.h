@@ -6,8 +6,10 @@
 // field order), so adding a feature later is a table edit, not new draw code.
 //
 // Field widgets:
-//   - Dim:           numeric input accepting 25 / 25mm / 1.5in / 3/8in (parsed to canonical mm)
-//                    and "=expr" to bind an equation. Inline red on parse/validation error.
+//   - Dim:           slider (bounded range) / drag (open-ended) with the unit in the value text;
+//                    CTRL+click types an exact number. The row's "=" toggle switches to free text
+//                    entry accepting 25 / 25mm / 1.5in / 3/8in (parsed to canonical mm) and
+//                    "=expr" to bind an equation. Inline red on parse/validation error.
 //   - SelectorWell:  labeled pick target; when active, viewport picks (filtered by allowed kinds)
 //                    route into it. Shows "Edge×3" chips; right-click clears; red tint on a
 //                    dangling ref reported in feature_status.
@@ -62,6 +64,20 @@ struct PMFieldDef {
     // Dim
     double dimDefault = 0.0;    // canonical mm default (also the Int default, truncated)
     const char* unitLabel = nullptr;   // override the "[mm]" suffix (e.g. "[deg]"; "" = none)
+    // Numeric range/step metadata (canonical mm/deg). dimMax > dimMin => BOUNDED field, rendered
+    // as a slider (angles, draft, k-factor); otherwise a drag clamped below at dimMin (default 0;
+    // offsets that may reverse direction lower it — see pm_forms Signed()). dimStep 0 picks a
+    // kind default (1 mm length — 1/16 in in IPS — 1 deg angle, 0.05 unit-less) used by the
+    // CTRL+mouse-wheel step. Ranges/clamps apply to widget edits only; the "=" text-entry path
+    // stays unclamped (engine validation is the backstop, same as before).
+    double dimMin  = 0.0;
+    double dimMax  = 0.0;       // <= dimMin => unbounded above
+    double dimStep = 0.0;       // 0 = kind default
+
+    // Int range (pattern/hole counts). Clamped on both drag and CTRL+click typed entry, so a
+    // stray "100000 instances" can never reach the engine preview.
+    int intMin = 1;
+    int intMax = 200;
 
     // SelectorWell
     PMSelKinds selKinds;        // allowed kinds
@@ -70,6 +86,7 @@ struct PMFieldDef {
     // Combo
     const char* comboOptions = nullptr;  // "boss|cut" — param values emitted to engine (first = default)
     const char* comboLabels  = nullptr;  // "Boss|Cut" — display labels; null = use comboOptions
+    bool segmented = false;              // render a 2-option combo as a segmented pill pair
 
     // Text (free-form string param, e.g. pattern instances-to-skip "2:1, 3:0")
     const char* placeholder = nullptr;   // greyed hint shown when the field is empty
@@ -127,6 +144,7 @@ struct PMField {
     double dimValue = 0.0;       // canonical mm (when not an expr)
     std::string dimExpr;         // non-empty => bound to this expression
     std::string dimError;        // inline validation error (empty = ok)
+    bool dimTextEntry = false;   // "=" toggle: unit-math / "=expr" text entry instead of the widget
 
     // SelectorWell
     std::vector<PMSelEntry> picks;

@@ -210,14 +210,27 @@ const CacheEntry& rasterize(int id, int sizePx, Variant variant) {
     const SdfGlyph& g = gGlyphs[(size_t)id];
     const int px = std::max(1, sizePx);
 
-    // Standard SDF antialiasing width (contract §3): shrinks as render size grows (sharper when
-    // upscaled, softer when downscaled). Clamped for sanity at extreme sizes — exact visual
-    // tuning needs a live build, which this pass does not run.
-    float aa = 0.7071f * kSpread / (float)px;
-    aa = ImClamp(aa, 0.015f, 0.35f);
+    // Resolution-correct SDF antialiasing (chrome-polish pass): one TARGET pixel spans
+    // (glyphPx / px) source pixels, and one source pixel is 1/(2*kSpread) in encoded-distance
+    // units, so a constant ~0.7 target px of edge smoothing is
+    //     aa = 0.7071 * (glyphPx / px) / (2 * kSpread).
+    // The previous kSpread/px form was off by the glyph/target ratio and over-blurred small
+    // sizes ~2x (a 20px icon got ~1.6 target px of half-width smear -> mushy strokes).
+    const float srcPerTarget = (float)std::max(std::max(g.w, g.h), 1) / (float)px;
+    float aa = 0.7071f * srcPerTarget / (2.0f * kSpread);
+    aa = ImClamp(aa, 0.02f, 0.25f);
+    // Optical-weight compensation: downscaled below ~22px the 1.5-2px source strokes drop under
+    // a target pixel and grey out, so small glyphs read lighter than their 32px parents. Dilate
+    // the coverage threshold by up to 0.35 target px (ramped in as px shrinks) to hold apparent
+    // stroke weight constant across sizes. In encoded units t target px = t*srcPerTarget/(2*spread).
+    float boldTargetPx = 0.0f;
+    if (variant == Variant::Glyph && px < 22)
+        boldTargetPx = ImMin(0.35f, (22.0f - (float)px) * 0.045f);
     // Halo = dilated backing: shift the coverage threshold outward (contract dilate d0 =
     // 0.5 - 2.5/spread) so the halo silhouette reads visibly larger/softer than the glyph on top.
-    const float center = (variant == Variant::Halo) ? (0.5f - 2.5f / kSpread) : 0.5f;
+    const float center = (variant == Variant::Halo)
+                             ? (0.5f - 2.5f / kSpread)
+                             : (0.5f - boldTargetPx * srcPerTarget / (2.0f * kSpread));
 
     std::vector<uint8_t> pixels((size_t)px * px * 4);
     for (int y = 0; y < px; ++y) {

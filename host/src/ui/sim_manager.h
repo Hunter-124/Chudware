@@ -195,9 +195,14 @@ public:
     // Build world-space indicator geometry for the selected study's setup, sized to the model: red
     // arrows for force/pressure loads (force along the vector, pressure into the face) and green
     // ground/clamp glyphs at fixed faces. Anchors/normals come from st.faceNormalCache. Flat
-    // [x0,y0,z0,x1,y1,z1,…] GL_LINES batches, ready to hand to Overlays::drawSegments.
+    // [x0,y0,z0,x1,y1,z1,…] GL_LINES batches, ready to hand to Overlays::drawSegments. When the
+    // optional triangle batches are supplied the arrowheads / fixture cones are emitted as SOLID
+    // triangulated glyphs (flat xyz triples for Overlays::drawTriangles) instead of the legacy
+    // 4-line wireframe heads — pass both so shafts and heads stay in sync.
     void collectIndicatorSegments(AppState& st, std::vector<float>& loadSegs,
-                                  std::vector<float>& fixtureSegs) const;
+                                  std::vector<float>& fixtureSegs,
+                                  std::vector<float>* loadTris = nullptr,
+                                  std::vector<float>* fixtureTris = nullptr) const;
 
     // Mesh-preview wireframe (surface element edges from the last "Preview mesh") for the selected
     // study, or an empty batch. Only valid while the Sim tab is active and the preview matches sel_.
@@ -208,10 +213,12 @@ public:
     // True when the selected study is a Flow study and no result colormap is up (so the wind-tunnel
     // setup overlay reads without muddying a result). Drawn from the viewport block.
     bool flowSetupActive(AppState& st) const;
-    // Build the wind-tunnel setup overlay sized to the model: the incoming-flow arrow (oriented by the
-    // base axis + AoA + sideslip), the flow-domain box, and the inlet plane. Flat GL_LINES batches.
+    // Build the wind-tunnel setup overlay sized to the model: the incoming-flow arrows (oriented by
+    // the base axis + AoA + sideslip), the flow-domain box, and the inlet plane. Flat GL_LINES
+    // batches; `arrowTris` (optional) receives solid triangulated arrowhead cones for the flow
+    // arrows (Overlays::drawTriangles) — without it the legacy wireframe heads are emitted.
     void collectFlowSetup(AppState& st, std::vector<float>& arrowSegs, std::vector<float>& domainSegs,
-                          std::vector<float>& inletSegs) const;
+                          std::vector<float>& inletSegs, std::vector<float>* arrowTris = nullptr) const;
 
     // ---- flow-result streamline / slice lines (drawn over the model while the Results node is up) ----
     // One speed-banded line batch: a pointer to the (manager-owned) flat GL_LINES xyz for that band +

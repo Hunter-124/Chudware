@@ -85,6 +85,20 @@ static void fillDark(Palette& p) {
     set4(p.axisX, 0.910f,0.380f,0.380f, 1);
     set4(p.axisY, 0.470f,0.820f,0.450f, 1);
     set4(p.axisZ, 0.420f,0.620f,0.960f, 1);
+    // in-viewport sim / flow / CAM overlay roles (values = the former viewport_panel literals)
+    set4(p.simFixture, 0.18f,0.80f,0.36f, 0.45f);
+    set4(p.simLoad,    0.95f,0.27f,0.20f, 0.45f);
+    set4(p.simArrow,   0.95f,0.27f,0.20f, 1);
+    set4(p.simGlyph,   0.10f,0.66f,0.30f, 1);
+    set4(p.simMesh,    0.55f,0.74f,0.95f, 0.55f);
+    set4(p.flowArrow,  0.28f,0.70f,0.98f, 1);
+    set4(p.flowDomain, 0.45f,0.55f,0.68f, 0.55f);
+    set4(p.flowInlet,  0.30f,0.80f,0.85f, 0.75f);
+    set4(p.camRapid,   0.78f,0.24f,0.20f, 0.55f);
+    set4(p.camLead,    0.31f,0.78f,0.47f, 0.95f);
+    set4(p.camPlunge,  0.31f,0.71f,0.86f, 0.95f);
+    set4(p.camCut,     0.35f,0.59f,0.94f, 1);
+    set4(p.camArc,     0.59f,0.51f,0.94f, 1);
     // C18 sketch mode
     set4(p.sketchUnder, 0.337f,0.612f,0.960f, 1);
     set4(p.sketchGrid,  0.520f,0.560f,0.620f, 0.18f);
@@ -210,6 +224,21 @@ static void fillLight(Palette& p) {
     // selection
     set4(p.selectionHighlight, 0.000f,0.471f,0.843f, 0.18f);
     set4(p.hoverHighlight,     0.000f,0.471f,0.843f, 0.35f);
+    // in-viewport sim / flow / CAM overlay roles — saturated strokes carry over; the translucent
+    // washes (mesh preview, domain box) darken slightly so they hold on the light canvas.
+    set4(p.simFixture, 0.14f,0.62f,0.28f, 0.45f);
+    set4(p.simLoad,    0.85f,0.20f,0.15f, 0.45f);
+    set4(p.simArrow,   0.85f,0.18f,0.13f, 1);
+    set4(p.simGlyph,   0.07f,0.52f,0.24f, 1);
+    set4(p.simMesh,    0.25f,0.45f,0.75f, 0.60f);
+    set4(p.flowArrow,  0.10f,0.48f,0.80f, 1);
+    set4(p.flowDomain, 0.35f,0.42f,0.55f, 0.60f);
+    set4(p.flowInlet,  0.10f,0.58f,0.64f, 0.80f);
+    set4(p.camRapid,   0.70f,0.18f,0.15f, 0.55f);
+    set4(p.camLead,    0.16f,0.60f,0.32f, 0.95f);
+    set4(p.camPlunge,  0.13f,0.53f,0.68f, 0.95f);
+    set4(p.camCut,     0.16f,0.40f,0.80f, 1);
+    set4(p.camArc,     0.44f,0.34f,0.82f, 1);
     // C24 orientation-triad axes (slightly deeper on the light studio bg for contrast)
     set4(p.axisX, 0.800f,0.180f,0.180f, 1);
     set4(p.axisY, 0.180f,0.580f,0.220f, 1);
@@ -601,6 +630,14 @@ constexpr unsigned int kVibrancyDarkTertiary   = 0x5C6678CC;
 constexpr float        kAdaptiveTau            = 0.24f;  // luminance smoothing tau (s)
 constexpr float        kDefaultPanelRounding   = 10.0f;  // used when glassPanel's rounding < 0
 
+// ---- Colored liquid glass (v2.1): dynamic-color tuning ------------------------------------
+constexpr float kDynHueOffsetDeg   = 180.f;  // tint = complement of the backdrop hue
+constexpr float kDynMinBackdropSat = 0.12f;  // below: backdrop is neutral, keep the user tint
+constexpr float kDynSatBase = 0.30f, kDynSatGain = 0.45f;   // tint sat follows backdrop chroma
+constexpr float kDynTintStrength   = 0.35f;  // floor tint mix while dynamic color is steering
+constexpr float kDynVarBoostGain = 2.2f, kDynVarBoostMax = 0.35f;  // busy backdrop => stronger scrim/halo
+constexpr float kDynHueTau = 0.60f;          // hue smoothing tau (s) — slower than kAdaptiveTau
+
 ImVec4 hexVec(unsigned int hex) {
     return ImVec4(((hex >> 24) & 0xFF) / 255.f, ((hex >> 16) & 0xFF) / 255.f,
                   ((hex >> 8) & 0xFF) / 255.f, (hex & 0xFF) / 255.f);
@@ -630,6 +667,23 @@ float approach(float cur, float target, float dt, float tau) {
 
 ViewportBackdropInfo gViewportBackdrop;
 LuminanceSampler     gLuminanceSampler = nullptr;
+BackdropStatsSampler gBackdropStatsSampler = nullptr;
+
+// v2.1 active glass config + eagerly-resolved per-group styles. Default-constructed
+// GlassStyleResolved == the default config's resolution, so every helper is safe to call
+// before the first setGlassConfig (first-frame order independence). GUI thread only.
+GlassConfig        gGlassConfig;
+GlassStyleResolved gGlassResolved[(size_t)GlassGroup::Count];
+
+bool sameGlassStyle(const GlassStyle& a, const GlassStyle& b) {
+    return a.tintHue == b.tintHue && a.tintSat == b.tintSat &&
+           a.tintStrength == b.tintStrength && a.glassLevel == b.glassLevel &&
+           a.opacityMul == b.opacityMul && a.rounding == b.rounding &&
+           a.textContrastBoost == b.textContrastBoost && a.dynamicColor == b.dynamicColor;
+}
+
+float clampF(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+float wrapHue(float h) { h = std::fmod(h, 360.f); return h < 0.f ? h + 360.f : h; }
 }  // namespace
 
 void setViewportBackdrop(const ViewportBackdropInfo& b) { gViewportBackdrop = b; }
@@ -640,10 +694,71 @@ float sampleLuminance(ImVec2 mn, ImVec2 mx) {
     return gLuminanceSampler ? gLuminanceSampler(mn, mx) : -1.f;
 }
 
+void setBackdropStatsSampler(BackdropStatsSampler fn) { gBackdropStatsSampler = fn; }
+bool sampleBackdropStats(ImVec2 mn, ImVec2 mx, BackdropStats& out) {
+    return gBackdropStatsSampler ? gBackdropStatsSampler(mn, mx, out) : false;
+}
+
+// ---- v2.1 colored glass config (see ui_theme.h GlassStyle for sentinel semantics) ----------
+void setGlassConfig(const GlassConfig& cfg) {
+    // Idempotent early-out so the frame loop can push Settings every frame for free.
+    bool same = true;
+    for (size_t gi = 0; gi < (size_t)GlassGroup::Count; ++gi)
+        if (!sameGlassStyle(cfg.group[gi], gGlassConfig.group[gi])) { same = false; break; }
+    static bool resolvedOnce = false;
+    if (same && resolvedOnce) return;
+    resolvedOnce = true;
+    gGlassConfig = cfg;
+
+    // Resolve Global first: sentinels -> built-in defaults (dynamic color ON out of the box).
+    {
+        const GlassStyle& s = cfg.group[(size_t)GlassGroup::Global];
+        GlassStyleResolved& r = gGlassResolved[(size_t)GlassGroup::Global];
+        r.tintHue           = s.tintHue      < 0.f ? 210.f : wrapHue(s.tintHue);
+        r.tintSat           = s.tintSat      < 0.f ? 0.f   : clampF(s.tintSat, 0.f, 1.f);
+        r.tintStrength      = s.tintStrength < 0.f ? 0.f   : clampF(s.tintStrength, 0.f, 1.f);
+        r.glassLevel        = (s.glassLevel >= 0 && s.glassLevel <= 3) ? s.glassLevel : -1;
+        r.opacityMul        = s.opacityMul < 0.f ? 1.f  : clampF(s.opacityMul, 0.25f, 2.f);
+        r.rounding          = s.rounding   < 0.f ? -1.f : clampF(s.rounding, 0.f, 24.f);
+        r.textContrastBoost = s.textContrastBoost < 0.f ? 0.f
+                                                        : clampF(s.textContrastBoost, 0.f, 1.f);
+        r.dynamicColor      = (s.dynamicColor < 0) ? true : (s.dynamicColor == 1);
+    }
+    // Other groups: any field still at its sentinel takes Global's RESOLVED value.
+    const GlassStyleResolved& g0 = gGlassResolved[(size_t)GlassGroup::Global];
+    for (size_t gi = 1; gi < (size_t)GlassGroup::Count; ++gi) {
+        const GlassStyle& s = cfg.group[gi];
+        GlassStyleResolved& r = gGlassResolved[gi];
+        r.tintHue           = s.tintHue      < 0.f ? g0.tintHue      : wrapHue(s.tintHue);
+        r.tintSat           = s.tintSat      < 0.f ? g0.tintSat      : clampF(s.tintSat, 0.f, 1.f);
+        r.tintStrength      = s.tintStrength < 0.f ? g0.tintStrength : clampF(s.tintStrength, 0.f, 1.f);
+        r.glassLevel        = (s.glassLevel >= 0 && s.glassLevel <= 3) ? s.glassLevel : g0.glassLevel;
+        r.opacityMul        = s.opacityMul < 0.f ? g0.opacityMul : clampF(s.opacityMul, 0.25f, 2.f);
+        r.rounding          = s.rounding   < 0.f ? g0.rounding   : clampF(s.rounding, 0.f, 24.f);
+        r.textContrastBoost = s.textContrastBoost < 0.f ? g0.textContrastBoost
+                                                        : clampF(s.textContrastBoost, 0.f, 1.f);
+        r.dynamicColor      = (s.dynamicColor < 0) ? g0.dynamicColor : (s.dynamicColor == 1);
+    }
+}
+
+const GlassConfig& glassConfig() { return gGlassConfig; }
+
+const GlassStyleResolved& glassStyleResolved(GlassGroup g) {
+    const size_t i = (size_t)g;
+    return gGlassResolved[i < (size_t)GlassGroup::Count ? i : (size_t)GlassGroup::Global];
+}
+
 ImGuiID panelId(const char* label) { return ImHashStr(label); }
 
-AdaptiveSurface adaptiveSurface(float avgLuminance) {
+// Shared core for adaptiveSurface()/adaptivePanel(): builds the surface for one luminance
+// sample under an EXPLICIT resolved style (adaptivePanel substitutes a dynamic-color style).
+// Luminance still picks the base tone + text; the style's hue/sat only colorize the scrim, and
+// its opacity/contrast knobs scale it — a default style is a provable no-op vs. the old code.
+static AdaptiveSurface adaptiveSurfaceStyled(float avgLuminance, GlassGroup group,
+                                             const GlassStyleResolved& rs) {
     AdaptiveSurface out{};
+    out.group = group;
+    out.contrastBoost = rs.textContrastBoost;
     if (avgLuminance < 0.f) {
         // No live backdrop: theme-dependent palette fallback (chrome). Dark theme's `text` role
         // is LIGHT (darkText=false); light theme's `text` role is dark (darkText=true) — keeps
@@ -654,6 +769,18 @@ AdaptiveSurface adaptiveSurface(float avgLuminance) {
         out.textTertiary  = fromRole(palette.textDisabled);
         out.darkText      = (activeTheme == Theme::Light);
         out.scrim         = 0.f;
+        // v2.1: user knobs also style chrome fallback surfaces — colorize toward the tint at
+        // the fallback tone (V = the glassBg value component), scale alpha by the opacity knob.
+        if (rs.tintStrength > 0.f && rs.tintSat > 0.f) {
+            const float v = std::max(out.tint.x, std::max(out.tint.y, out.tint.z));
+            float r, g, b;
+            ImGui::ColorConvertHSVtoRGB(rs.tintHue / 360.f, rs.tintSat, v, r, g, b);
+            const float k = rs.tintStrength;
+            out.tint.x += (r - out.tint.x) * k;
+            out.tint.y += (g - out.tint.y) * k;
+            out.tint.z += (b - out.tint.z) * k;
+        }
+        out.tint.w = std::min(1.f, out.tint.w * rs.opacityMul + 0.22f * out.contrastBoost);
         return out;
     }
 
@@ -664,20 +791,38 @@ AdaptiveSurface adaptiveSurface(float avgLuminance) {
     out.textSecondary = out.darkText ? hexVec(kVibrancyDarkSecondary) : hexVec(kVibrancyLightSecondary);
     out.textTertiary  = out.darkText ? hexVec(kVibrancyDarkTertiary)  : hexVec(kVibrancyLightTertiary);
 
-    // Contrast scrim: strongest at mid-luminance (ambiguous backdrop), tapering at the extremes.
-    const float scrim = 0.10f + 0.26f * (1.f - fabsf(l - 0.5f) * 2.f);
+    // Contrast scrim: strongest at mid-luminance (ambiguous backdrop), tapering at the extremes;
+    // then the opacity knob scales it and the contrast boost thickens it.
+    float scrim = 0.10f + 0.26f * (1.f - fabsf(l - 0.5f) * 2.f);
+    scrim = std::min(1.f, scrim * rs.opacityMul + 0.22f * out.contrastBoost);
     out.scrim = scrim;
-    out.tint  = out.darkText ? ImVec4(0.97f, 0.98f, 1.00f, scrim)
-                              : ImVec4(0.055f, 0.075f, 0.10f, scrim);
+    ImVec4 neutral = out.darkText ? ImVec4(0.97f, 0.98f, 1.00f, scrim)
+                                  : ImVec4(0.055f, 0.075f, 0.10f, scrim);
+    if (rs.tintStrength > 0.f && rs.tintSat > 0.f) {
+        float r, g, b;   // V follows the tone so tint never fights the luminance pick
+        ImGui::ColorConvertHSVtoRGB(rs.tintHue / 360.f, rs.tintSat,
+                                    out.darkText ? 0.97f : 0.10f, r, g, b);
+        const float k = rs.tintStrength;
+        neutral.x += (r - neutral.x) * k;
+        neutral.y += (g - neutral.y) * k;
+        neutral.z += (b - neutral.z) * k;
+    }
+    out.tint = neutral;
     return out;
 }
 
-const AdaptiveSurface& adaptivePanel(ImGuiID id, const ImRect& rect) {
+AdaptiveSurface adaptiveSurface(float avgLuminance, GlassGroup group) {
+    return adaptiveSurfaceStyled(avgLuminance, group, glassStyleResolved(group));
+}
+
+const AdaptiveSurface& adaptivePanel(ImGuiID id, const ImRect& rect, GlassGroup group) {
     struct State {
         int             lastFrame = -1;
         float           lum = -1.f;
         bool            dark = false;
         AdaptiveSurface cur;
+        // v2.1 dynamic-color memory (hue smoothed on the shortest arc, see below).
+        float           dynHue = -1.f, dynSat = 0.f, dynVar = 0.f;
     };
     static std::unordered_map<ImGuiID, State> states;
     static AdaptiveSurface stateless;
@@ -685,7 +830,8 @@ const AdaptiveSurface& adaptivePanel(ImGuiID id, const ImRect& rect) {
     const float sampled = sampleLuminance(rect.Min, rect.Max);
     if (sampled < 0.f) {
         // Stateless palette fallback — no persistent id lookup, recomputed fresh (cheap).
-        stateless = adaptiveSurface(-1.f);
+        // Pass the group through so fallback surfaces still get tint/opacity knobs.
+        stateless = adaptiveSurface(-1.f, group);
         return stateless;
     }
 
@@ -694,18 +840,53 @@ const AdaptiveSurface& adaptivePanel(ImGuiID id, const ImRect& rect) {
     if (st.lastFrame == frame) return st.cur;   // idempotent per frame
     st.lastFrame = frame;
 
+    const float dt = ImGui::GetIO().DeltaTime;
     if (st.lum < 0.f)
         st.lum = sampled;   // snap on first sample for this id
     else
-        st.lum = approach(st.lum, sampled, ImGui::GetIO().DeltaTime, kAdaptiveTau);
+        st.lum = approach(st.lum, sampled, dt, kAdaptiveTau);
 
     // Hysteresis: only flip tone once the smoothed luminance clears the far threshold.
     st.dark = st.lum > 0.58f ? true : (st.lum < 0.42f ? false : st.dark);
 
+    // v2.1 dynamic color: GUARD ORDER — check the group's knob BEFORE sampling stats so a
+    // config with dynamic color off everywhere never touches the stats bridge (zero cost).
+    // Text tone stays 100% luminance-driven (hysteresis above untouched) — dynamic mode only
+    // steers the tint hue/sat and boosts the scrim on busy backdrops.
+    const GlassStyleResolved& rs = glassStyleResolved(group);
+    GlassStyleResolved eff = rs;
+    BackdropStats stats;
+    if (rs.dynamicColor && sampleBackdropStats(rect.Min, rect.Max, stats)) {
+        // Shortest-arc hue smoothing toward the backdrop COMPLEMENT (max chroma contrast);
+        // slow tau so the tint never flickers or rainbow-spins.
+        const float target = std::fmod(stats.hue + kDynHueOffsetDeg, 360.f);
+        if (st.dynHue < 0.f) {
+            st.dynHue = target;
+        } else {
+            const float dh = std::fmod(target - st.dynHue + 540.f, 360.f) - 180.f;
+            st.dynHue = std::fmod(st.dynHue + dh * (1.f - std::exp(-dt / kDynHueTau)) + 360.f,
+                                  360.f);
+        }
+        st.dynSat = approach(st.dynSat, stats.sat, dt, kDynHueTau);
+        st.dynVar = approach(st.dynVar, stats.variance, dt, kAdaptiveTau);
+
+        eff.tintHue = st.dynHue;
+        if (st.dynSat >= kDynMinBackdropSat) {
+            // Chromatic backdrop: complement tint, saturation follows the backdrop's chroma.
+            // (Neutral backdrop keeps the user's own hue/sat/strength — grey stays grey.)
+            eff.tintSat      = std::min(1.f, kDynSatBase + kDynSatGain * st.dynSat);
+            eff.tintStrength = std::max(rs.tintStrength, kDynTintStrength);
+        }
+        // Busy backdrop => stronger scrim + text/icon halo.
+        eff.textContrastBoost = std::min(
+            1.f, rs.textContrastBoost + std::min(kDynVarBoostMax, st.dynVar * kDynVarBoostGain));
+    }
+
     // Decisive VIRTUAL luminance for text tone (never mid-gray); REAL smoothed lum drives scrim.
     const float virt = st.dark ? std::max(st.lum, 0.66f) : std::min(st.lum, 0.34f);
-    AdaptiveSurface surf = adaptiveSurface(virt);
-    const float realScrim = 0.10f + 0.26f * (1.f - fabsf(st.lum - 0.5f) * 2.f);
+    AdaptiveSurface surf = adaptiveSurfaceStyled(virt, group, eff);
+    float realScrim = 0.10f + 0.26f * (1.f - fabsf(st.lum - 0.5f) * 2.f);
+    realScrim   = std::min(1.f, realScrim * eff.opacityMul + 0.22f * surf.contrastBoost);
     surf.scrim  = realScrim;
     surf.tint.w = realScrim;
 
@@ -715,26 +896,44 @@ const AdaptiveSurface& adaptivePanel(ImGuiID id, const ImRect& rect) {
 
 ImU32 glassIconHalo(const AdaptiveSurface& surf, float alphaMul) {
     // Opposite vibrancy tone: light halo under dark text, dark halo under light text.
+    // v2.1: the contrast boost (user knob + dynamic busyness term) strengthens the halo.
     ImVec4 v = surf.darkText ? ImVec4(0.961f, 0.969f, 0.980f, 1.f)   // vibrancy light primary
                              : ImVec4(0.078f, 0.094f, 0.122f, 1.f);  // vibrancy dark primary
-    v.w = (0x50 / 255.f) * (alphaMul < 0.f ? 0.f : (alphaMul > 1.f ? 1.f : alphaMul));
+    v.w = std::min(0.55f, (0x50 / 255.f) * (1.f + surf.contrastBoost)) *
+          (alphaMul < 0.f ? 0.f : (alphaMul > 1.f ? 1.f : alphaMul));
     return ImGui::ColorConvertFloat4ToU32(v);
 }
 
 void glassText(ImDrawList* dl, ImFont* font, float size, ImVec2 pos,
               const AdaptiveSurface& s, const char* text, const char* textEnd) {
+    // v2.1: contrast boost thickens the halo (boost 0 == today's 0.30/0.38 alphas).
+    const float boost = 0.35f * s.contrastBoost;
     const ImU32 haloCol = s.darkText
-        ? ImGui::ColorConvertFloat4ToU32(ImVec4(1.f, 1.f, 1.f, 0.30f))
-        : ImGui::ColorConvertFloat4ToU32(ImVec4(0.f, 0.f, 0.f, 0.38f));
+        ? ImGui::ColorConvertFloat4ToU32(ImVec4(1.f, 1.f, 1.f, std::min(0.55f, 0.30f + boost)))
+        : ImGui::ColorConvertFloat4ToU32(ImVec4(0.f, 0.f, 0.f, std::min(0.65f, 0.38f + boost)));
     dl->AddText(font, size, ImVec2(pos.x, pos.y + 1.f * uiScale), haloCol, text, textEnd);
     dl->AddText(font, size, pos, ImGui::ColorConvertFloat4ToU32(s.textPrimary), text, textEnd);
 }
 
+ImVec4 maxContrastTextOn(const ImVec4& surface) {
+    // Rec.709 luminance split at 0.5 — same threshold adaptiveSurface() uses for its tone pick,
+    // same vibrancy primaries, so custom-tinted chips match adaptive panels exactly.
+    const float l = 0.2126f * surface.x + 0.7152f * surface.y + 0.0722f * surface.z;
+    return (l > 0.5f) ? hexVec(kVibrancyDarkPrimary) : hexVec(kVibrancyLightPrimary);
+}
+
 void glassPanel(ImDrawList* dl, const ImRect& rect, GlassLevel level, float rounding,
                const AdaptiveSurface& surf, float alpha) {
-    const float tintAlpha = glassLevelTintAlpha(level);
+    // v2.1: per-group user overrides ride in through surf.group (signature unchanged) — a
+    // forced material level, a rounding override, and the opacity multiplier. All-default
+    // resolved styles reproduce the pre-v2.1 output byte-for-byte.
+    const GlassStyleResolved& rs = glassStyleResolved(surf.group);
+    const GlassLevel lvl = (rs.glassLevel >= 0) ? (GlassLevel)rs.glassLevel : level;
+    const float tintAlpha = glassLevelTintAlpha(lvl);
     const float s = uiScale;
-    const float r = (rounding < 0.f ? kDefaultPanelRounding : rounding) * s;
+    const float rDp = (rs.rounding >= 0.f) ? rs.rounding
+                                           : (rounding < 0.f ? kDefaultPanelRounding : rounding);
+    const float r = rDp * s;
     const ImVec2 mn = rect.Min;
     const ImVec2 mx = rect.Max;
 
@@ -760,17 +959,18 @@ void glassPanel(ImDrawList* dl, const ImRect& rect, GlassLevel level, float roun
         dl->AddImageRounded((ImTextureID)(intptr_t)bd.textureId, mn, mx, uv0, uv1, imgCol, r);
 
         // Material wash + the surface's own contrast scrim, capped — the blur already carries
-        // most legibility so this stays a light finishing tint.
-        float tintA = tintAlpha * 0.55f + surf.scrim;
-        tintA = std::min(tintA, 0.62f);
+        // most legibility so this stays a light finishing tint. surf.scrim already carries the
+        // opacity knob + contrast boost from adaptiveSurface — only the wash is scaled here.
+        float tintA = tintAlpha * 0.55f * rs.opacityMul + surf.scrim;
+        tintA = std::min(tintA, 0.62f + 0.18f * surf.contrastBoost);
         ImVec4 tint = surf.tint;
         tint.w = tintA * alpha;
         dl->AddRectFilled(mn, mx, ImGui::ColorConvertFloat4ToU32(tint), r);
     } else {
         // Layered fallback when no live backdrop (first frame / hidden viewport).
-        glassBackground(dl, mn, mx, r / s, alpha);
+        glassBackground(dl, mn, mx, rDp, alpha * std::min(1.f, rs.opacityMul));
         ImVec4 tint = surf.tint;
-        tint.w = tintAlpha * 0.5f * alpha;
+        tint.w = tintAlpha * 0.5f * rs.opacityMul * alpha;
         if (tint.w > 0.001f)
             dl->AddRectFilled(mn, mx, ImGui::ColorConvertFloat4ToU32(tint), r);
     }

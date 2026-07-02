@@ -61,9 +61,7 @@ inline float titleFramePadY() { return px(12.0f); }
 inline float statusBarPadX()  { return px(14.0f); }
 inline float statusBarPadY()  { return px(5.0f); }
 
-// ---- dock default target widths (clamp in PIXELS, see buildDefaultLayout) ----------------------
-inline float dockLeftTarget()  { return px(360.0f); }
-inline float dockLeftMin()     { return px(250.0f); }
+// ---- pinned Copilot column default/min width (PIXELS; consumed by legacy_chat drawAIPanel) -----
 inline float dockRightTarget() { return px(300.0f); }
 inline float dockRightMin()    { return px(200.0f); }
 

@@ -62,6 +62,8 @@ Overlays::~Overlays() {
     if (vbo_) glDeleteBuffers(1, &vbo_);
     if (segVao_) glDeleteVertexArrays(1, &segVao_);
     if (segVbo_) glDeleteBuffers(1, &segVbo_);
+    if (triVao_) glDeleteVertexArrays(1, &triVao_);
+    if (triVbo_) glDeleteBuffers(1, &triVbo_);
 }
 
 void Overlays::destroy() {
@@ -82,10 +84,11 @@ void Overlays::destroy() {
     verts_.clear();
 }
 
-void Overlays::setColors(const float hover[4], const float selection[4]) {
+void Overlays::setColors(const float hover[4], const float selection[4], const float feature[4]) {
     for (int i = 0; i < 4; ++i) {
         hoverCol_[i] = hover[i];
         selCol_[i] = selection[i];
+        if (feature) featHlCol_[i] = feature[i];
     }
 }
 
@@ -100,7 +103,15 @@ void Overlays::setSectionClip(int count, const float normals[3][3], const float 
 }
 
 bool Overlays::setDoc(const DocMesh& doc, std::string& err) {
-    if (!prog_) prog_ = linkProgram(kVert, kFrag);
+    if (!prog_) {
+        prog_ = linkProgram(kVert, kFrag);
+        // Cache uniform locations once — every draw path used to re-query them by string.
+        uMVP_       = glGetUniformLocation(prog_, "uMVP");
+        uColor_     = glGetUniformLocation(prog_, "uColor");
+        uClipCount_ = glGetUniformLocation(prog_, "uClipCount");
+        uClipN_     = glGetUniformLocation(prog_, "uClipN");
+        uClipOff_   = glGetUniformLocation(prog_, "uClipOff");
+    }
     int linked = 0;
     glGetProgramiv(prog_, GL_LINK_STATUS, &linked);
     if (!linked) { err = "overlays program link failed"; return false; }
@@ -138,7 +149,7 @@ bool Overlays::setDoc(const DocMesh& doc, std::string& err) {
                          GL_STATIC_DRAW);
             glBindVertexArray(0);
             fb.idxCount = count;
-            faces_.push_back({Key{b.body_id, fr.face_id}, fb});
+            faces_[key(b.body_id, fr.face_id)] = fb;
         }
         for (const auto& es : b.edges) {
             if (es.pt_count < 2) continue;
@@ -160,37 +171,44 @@ bool Overlays::setDoc(const DocMesh& doc, std::string& err) {
             glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
             glBindVertexArray(0);
             eb.vertCount = (int)lines.size() / 3;
-            edges_.push_back({Key{b.body_id, es.edge_id}, eb});
+            edges_[key(b.body_id, es.edge_id)] = eb;
         }
         for (const auto& v : b.brep_verts) {
-            verts_.push_back({Key{b.body_id, v.vertex_id},
-                              std::array<float, 3>{v.xyz[0], v.xyz[1], v.xyz[2]}});
+            verts_[key(b.body_id, v.vertex_id)] =
+                std::array<float, 3>{v.xyz[0], v.xyz[1], v.xyz[2]};
         }
     }
     return true;
 }
 
 const Overlays::FaceBuf* Overlays::findFace(uint32_t body, uint32_t face_id) const {
-    for (const auto& kv : faces_)
-        if (kv.first.body == body && kv.first.topo == face_id) return &kv.second;
-    return nullptr;
+    auto it = faces_.find(key(body, face_id));
+    return it == faces_.end() ? nullptr : &it->second;
 }
 const Overlays::EdgeBuf* Overlays::findEdge(uint32_t body, uint32_t edge_id) const {
-    for (const auto& kv : edges_)
-        if (kv.first.body == body && kv.first.topo == edge_id) return &kv.second;
-    return nullptr;
+    auto it = edges_.find(key(body, edge_id));
+    return it == edges_.end() ? nullptr : &it->second;
 }
 bool Overlays::findVert(uint32_t body, uint32_t vert_id, float out[3]) const {
-    for (const auto& kv : verts_)
-        if (kv.first.body == body && kv.first.topo == vert_id) {
-            out[0] = kv.second[0]; out[1] = kv.second[1]; out[2] = kv.second[2];
-            return true;
-        }
-    return false;
+    auto it = verts_.find(key(body, vert_id));
+    if (it == verts_.end()) return false;
+    out[0] = it->second[0]; out[1] = it->second[1]; out[2] = it->second[2];
+    return true;
+}
+
+// Bind the flat-color program + the per-frame camera / section-clip uniforms shared by every
+// draw path (draw / drawFaceWash / drawSegments / drawTriangles).
+void Overlays::bindCommon(const Renderer::CameraXform& cam) {
+    glUseProgram(prog_);
+    glUniformMatrix4fv(uMVP_, 1, GL_FALSE, cam.mvp.m);
+    glUniform1i(uClipCount_, clipCount_);
+    if (clipCount_ > 0) {
+        glUniform3fv(uClipN_, clipCount_, clipNormals_[0]);
+        glUniform1fv(uClipOff_, clipCount_, clipOffsets_);
+    }
 }
 
 void Overlays::drawHit(const Renderer::CameraXform& cam, const PickHit& h, const float rgba[4]) {
-    int colLoc = glGetUniformLocation(prog_, "uColor");
     if (h.kind == PickKind::Face) {
         const FaceBuf* fb = findFace(h.body_id, h.topo_id);
         if (!fb) return;
@@ -199,7 +217,7 @@ void Overlays::drawHit(const Renderer::CameraXform& cam, const PickHit& h, const
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glEnable(GL_POLYGON_OFFSET_FILL);
         glPolygonOffset(-1.0f, -1.0f);
-        glUniform4fv(colLoc, 1, rgba);
+        glUniform4fv(uColor_, 1, rgba);
         glBindVertexArray(fb->vao);
         glDrawElements(GL_TRIANGLES, fb->idxCount, GL_UNSIGNED_INT, 0);
         glDisable(GL_POLYGON_OFFSET_FILL);
@@ -208,25 +226,31 @@ void Overlays::drawHit(const Renderer::CameraXform& cam, const PickHit& h, const
         const EdgeBuf* eb = findEdge(h.body_id, h.topo_id);
         if (!eb) return;
         float opaque[4] = {rgba[0], rgba[1], rgba[2], 1.0f};
-        glUniform4fv(colLoc, 1, opaque);
+        glUniform4fv(uColor_, 1, opaque);
         glDepthRange(0.0, 0.999);  // bias over the shaded surface
-        glLineWidth(3.5f);
+        glLineWidth(3.5f * widthScale_);
         glBindVertexArray(eb->vao);
         glDrawArrays(GL_LINES, 0, eb->vertCount);
         glDepthRange(0.0, 1.0);
     } else if (h.kind == PickKind::Vertex) {
         float xyz[3];
         if (!findVert(h.body_id, h.topo_id, xyz)) return;
-        float opaque[4] = {rgba[0], rgba[1], rgba[2], 1.0f};
-        glUniform4fv(colLoc, 1, opaque);
         glBindVertexArray(vao_);
         glBindBuffer(GL_ARRAY_BUFFER, vbo_);
         glBufferData(GL_ARRAY_BUFFER, 3 * sizeof(float), xyz, GL_DYNAMIC_DRAW);
         glEnableVertexAttribArray(0);
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
         glEnable(GL_PROGRAM_POINT_SIZE);
-        glPointSize(9.0f);
         glDepthRange(0.0, 0.997);
+        // Contrast rim first (a larger dark point behind), then the highlight dot on top — the
+        // bare 9px point downsampled to ~3px used to be the weakest highlight kind.
+        float rim[4] = {0.06f, 0.07f, 0.09f, 1.0f};
+        glUniform4fv(uColor_, 1, rim);
+        glPointSize(13.0f * widthScale_);
+        glDrawArrays(GL_POINTS, 0, 1);
+        float opaque[4] = {rgba[0], rgba[1], rgba[2], 1.0f};
+        glUniform4fv(uColor_, 1, opaque);
+        glPointSize(9.0f * widthScale_);
         glDrawArrays(GL_POINTS, 0, 1);
         glDepthRange(0.0, 1.0);
     }
@@ -242,25 +266,16 @@ void Overlays::drawFeatureHighlight(const Renderer::CameraXform& cam,
 void Overlays::drawFaceWash(const Renderer::CameraXform& cam,
                             const std::vector<uint64_t>& faceKeys, const float rgba[4]) {
     if (faceKeys.empty() || !prog_) return;
-    glUseProgram(prog_);
-    glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, cam.mvp.m);
-    glUniform1i(glGetUniformLocation(prog_, "uClipCount"), clipCount_);
-    if (clipCount_ > 0) {
-        glUniform3fv(glGetUniformLocation(prog_, "uClipN"), clipCount_, clipNormals_[0]);
-        glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), clipCount_, clipOffsets_);
-    }
+    bindCommon(cam);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(-1.0f, -1.0f);
-    int colLoc = glGetUniformLocation(prog_, "uColor");
-    glUniform4fv(colLoc, 1, rgba);
-    for (uint64_t key : faceKeys) {
-        uint32_t body_id  = (uint32_t)(key >> 32);
-        uint32_t face_id  = (uint32_t)(key & 0xFFFFFFFFu);
-        const FaceBuf* fb = findFace(body_id, face_id);
+    glUniform4fv(uColor_, 1, rgba);
+    for (uint64_t k : faceKeys) {
+        const FaceBuf* fb = findFace((uint32_t)(k >> 32), (uint32_t)(k & 0xFFFFFFFFu));
         if (!fb) continue;  // stale key after rebuild — skip silently
         glBindVertexArray(fb->vao);
         glDrawElements(GL_TRIANGLES, fb->idxCount, GL_UNSIGNED_INT, 0);
@@ -274,14 +289,8 @@ void Overlays::drawSegments(const Renderer::CameraXform& cam, const std::vector<
                             const float rgba[4], float lineWidth, bool overSurface) {
     if (xyz.size() < 6 || !prog_) return;
     if (!segVao_) { glGenVertexArrays(1, &segVao_); glGenBuffers(1, &segVbo_); }
-    glUseProgram(prog_);
-    glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, cam.mvp.m);
-    glUniform1i(glGetUniformLocation(prog_, "uClipCount"), clipCount_);
-    if (clipCount_ > 0) {
-        glUniform3fv(glGetUniformLocation(prog_, "uClipN"), clipCount_, clipNormals_[0]);
-        glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), clipCount_, clipOffsets_);
-    }
-    glUniform4fv(glGetUniformLocation(prog_, "uColor"), 1, rgba);
+    bindCommon(cam);
+    glUniform4fv(uColor_, 1, rgba);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     if (overSurface) glDepthRange(0.0, 0.999);  // bias over the shaded surface like edge highlights
@@ -290,22 +299,41 @@ void Overlays::drawSegments(const Renderer::CameraXform& cam, const std::vector<
     glBufferData(GL_ARRAY_BUFFER, xyz.size() * sizeof(float), xyz.data(), GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-    glLineWidth(lineWidth);
+    // Scale by supersample x uiScale so the requested width survives the SS downsample (the
+    // renderer's own feature edges do the same; unscaled widths landed at 1/3 the authored size).
+    glLineWidth(lineWidth * widthScale_);
     glDrawArrays(GL_LINES, 0, (int)(xyz.size() / 3));
     if (overSurface) glDepthRange(0.0, 1.0);
+    glBindVertexArray(0);
+}
+
+void Overlays::drawTriangles(const Renderer::CameraXform& cam, const std::vector<float>& xyz,
+                             const float rgba[4], bool overSurface) {
+    if (xyz.size() < 9 || !prog_) return;
+    if (!triVao_) { glGenVertexArrays(1, &triVao_); glGenBuffers(1, &triVbo_); }
+    bindCommon(cam);
+    glUniform4fv(uColor_, 1, rgba);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_CULL_FACE);  // glyph cones/quads are viewed from either side
+    if (overSurface) glDepthRange(0.0, 0.999);
+    glBindVertexArray(triVao_);
+    glBindBuffer(GL_ARRAY_BUFFER, triVbo_);
+    glBufferData(GL_ARRAY_BUFFER, xyz.size() * sizeof(float), xyz.data(), GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glDrawArrays(GL_TRIANGLES, 0, (int)(xyz.size() / 3));
+    if (overSurface) glDepthRange(0.0, 1.0);
+    glDisable(GL_BLEND);
     glBindVertexArray(0);
 }
 
 void Overlays::draw(const Renderer::CameraXform& cam, const PickHit& hover,
                     const std::vector<PickHit>& sel) {
     if (!prog_) return;
-    glUseProgram(prog_);
-    glUniformMatrix4fv(glGetUniformLocation(prog_, "uMVP"), 1, GL_FALSE, cam.mvp.m);
-    glUniform1i(glGetUniformLocation(prog_, "uClipCount"), clipCount_);
-    if (clipCount_ > 0) {
-        glUniform3fv(glGetUniformLocation(prog_, "uClipN"), clipCount_, clipNormals_[0]);
-        glUniform1fv(glGetUniformLocation(prog_, "uClipOff"), clipCount_, clipOffsets_);
-    }
+    bindCommon(cam);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
 

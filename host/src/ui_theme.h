@@ -88,6 +88,23 @@ struct Palette {
     float axisY[4]         = {0.470f,0.820f,0.450f, 1};   // green
     float axisZ[4]         = {0.420f,0.620f,0.960f, 1};   // blue
 
+    // ---- in-viewport simulation / flow / CAM overlay roles (viewport_panel.cpp) ----
+    // Promoted from viewport_panel file-statics so themes can tune them; the light theme darkens
+    // the translucent washes slightly so they hold on the light canvas.
+    float simFixture[4]    = {0.18f,0.80f,0.36f, 0.45f}; // fixture-face wash (green)
+    float simLoad[4]       = {0.95f,0.27f,0.20f, 0.45f}; // load-face wash (red)
+    float simArrow[4]      = {0.95f,0.27f,0.20f, 1};     // load arrows
+    float simGlyph[4]      = {0.10f,0.66f,0.30f, 1};     // fixture ground glyphs
+    float simMesh[4]       = {0.55f,0.74f,0.95f, 0.55f}; // mesh-preview wireframe
+    float flowArrow[4]     = {0.28f,0.70f,0.98f, 1};     // incoming-flow arrows (bright blue)
+    float flowDomain[4]    = {0.45f,0.55f,0.68f, 0.55f}; // wind-tunnel domain box
+    float flowInlet[4]     = {0.30f,0.80f,0.85f, 0.75f}; // inlet plane (teal)
+    float camRapid[4]      = {0.78f,0.24f,0.20f, 0.55f}; // CAM backplot: rapid (faint red)
+    float camLead[4]       = {0.31f,0.78f,0.47f, 0.95f}; //   lead in/out (green)
+    float camPlunge[4]     = {0.31f,0.71f,0.86f, 0.95f}; //   plunge (cyan)
+    float camCut[4]        = {0.35f,0.59f,0.94f, 1};     //   cut (blue)
+    float camArc[4]        = {0.59f,0.51f,0.94f, 1};     //   arc (violet)
+
     // ---- C18 sketch mode ----
     float sketchUnder[4]   = {0.337f,0.612f,0.960f, 1};   // under-defined entity (SW-style blue)
     float sketchGrid[4]    = {0.520f,0.560f,0.620f, 0.18f}; // faint sketch grid lines
@@ -276,12 +293,64 @@ extern float uiScale;
 // iOS UIBlurEffect-style material levels — tint alphas 0.12 / 0.22 / 0.35 / 0.52.
 enum class GlassLevel { UltraThin, Thin, Regular, Thick };
 
+// ---- Colored liquid glass (v2.1): per-group user styling -------------------
+// Panel groups that can be styled independently. Global is the base; the other groups inherit
+// any field they leave at its sentinel (see GlassStyle). Pass the group that OWNS a surface to
+// adaptivePanel()/adaptiveSurface(); untagged call sites default to Global.
+enum class GlassGroup : uint8_t { Global = 0, FeatureManager, Copilot, Hud, Count };
+
+// One group's user knobs. SENTINELS (-1) mean 'inherit from Global'; for Global itself they
+// resolve to the built-in default shown in the trailing comment. Default-constructed GlassStyle
+// == today's glass GEOMETRY/opacity with dynamic color ON (the out-of-box look).
+struct GlassStyle {
+    float tintHue           = -1.f;   // scrim hue, degrees 0..360; <0 inherit (Global: 210)
+    float tintSat           = -1.f;   // scrim saturation 0..1; <0 inherit (Global: 0 = neutral)
+    float tintStrength      = -1.f;   // 0..1 tint mix into the scrim; <0 inherit (Global: 0)
+    int   glassLevel        = -1;     // 0..3 forces UltraThin..Thick; -1 inherit (Global: call-site level)
+    float opacityMul        = -1.f;   // scrim-alpha multiplier 0.25..2; <0 inherit (Global: 1)
+    float rounding          = -1.f;   // logical dp override; <0 inherit (Global: call-site rounding)
+    float textContrastBoost = -1.f;   // 0..1 extra scrim + halo; <0 inherit (Global: 0)
+    int   dynamicColor      = -1;     // 1 on / 0 off / -1 inherit (Global: ON — auto max-contrast
+                                      // tint/text vs the live backdrop is the out-of-box default)
+};
+
+// Whole user config: one style per group (index by (size_t)GlassGroup). Settings owns the
+// persisted copy (config.json "appearance.glass"); ui_theme owns the active copy below.
+struct GlassConfig {
+    GlassStyle group[(size_t)GlassGroup::Count];
+};
+
+// Install the active config. Cheap + idempotent (early-outs when nothing changed), so the frame
+// loop may push Settings every frame: ui::setGlassConfig(st.settings.glassCfg). Call once after
+// loadSettings at startup and on every Appearance-tab edit. Independent of applyTheme() — theme
+// toggles never reset glass knobs. GUI thread only.
+void               setGlassConfig(const GlassConfig& cfg);
+const GlassConfig& glassConfig();
+
+// Fully-resolved (sentinel-free) style for a group, cached by setGlassConfig(). Safe to call
+// before the first setGlassConfig (static defaults == default config resolution).
+struct GlassStyleResolved {
+    float tintHue = 210.f, tintSat = 0.f, tintStrength = 0.f;
+    int   glassLevel = -1;          // -1 = keep the call-site GlassLevel
+    float opacityMul = 1.f;
+    float rounding = -1.f;          // -1 = keep the call-site rounding
+    float textContrastBoost = 0.f;
+    bool  dynamicColor = true;      // out-of-box: auto-tint from the live backdrop
+};
+const GlassStyleResolved& glassStyleResolved(GlassGroup g);
+
 // Precomputed contrast surface for one panel/rect — see adaptivePanel() / adaptiveSurface().
 struct AdaptiveSurface {
     ImVec4 tint;                             // scrim color+alpha to draw over the blurred backdrop
     ImVec4 textPrimary, textSecondary, textTertiary;
     bool   darkText = false;                 // true => dark-on-bright text
     float  scrim = 0.f;                      // extra contrast alpha already folded into tint.w
+    // v2.1: which group's GlassStyleResolved applies (set by adaptivePanel/adaptiveSurface);
+    // glassPanel reads level/rounding/opacity overrides through this.
+    GlassGroup group = GlassGroup::Global;
+    // v2.1: resolved textContrastBoost (+ the dynamic-color busyness term when active), consumed
+    // by glassText()/glassIconHalo() halo alpha. 0 = today's halo.
+    float contrastBoost = 0.f;
 };
 
 // Published once per frame by the viewport (after its render) so glassPanel()/adaptivePanel()
@@ -305,6 +374,24 @@ using LuminanceSampler = float (*)(ImVec2 mn, ImVec2 mx);
 void  setLuminanceSampler(LuminanceSampler fn);
 float sampleLuminance(ImVec2 mn, ImVec2 mx);   // -1 when unavailable
 
+// v2.1 dynamic color: aggregate backdrop statistics under a rect. hue/sat are the HSV of the
+// MEAN RGB (hue of the mean, not mean of hues — circular-safe and cheap); variance is the
+// luminance variance across the sampled grid cells (busyness proxy; the source grid is built
+// from the BLURRED quarter-res buffer, so treat it as a low-frequency measure). The scalar
+// LuminanceSampler above stays registered and untouched — this is a second, richer bridge the
+// viewport registers alongside it.
+struct BackdropStats {
+    float lum = -1.f;      // mean Rec.709 luminance; -1 = unavailable
+    float variance = 0.f;  // luminance variance across grid cells, 0..~0.25
+    float hue = 0.f;       // mean-color hue, degrees 0..360
+    float sat = 0.f;       // mean-color saturation 0..1
+};
+using BackdropStatsSampler = bool (*)(ImVec2 mn, ImVec2 mx, BackdropStats& out);
+void setBackdropStatsSampler(BackdropStatsSampler fn);
+// false => unavailable (no live backdrop / sampler unregistered); callers then behave exactly
+// as if dynamicColor were off.
+bool sampleBackdropStats(ImVec2 mn, ImVec2 mx, BackdropStats& out);
+
 // Stable, window-independent panel-surface id (ImHashStr) — the same id resolves to the same
 // AdaptiveSurface no matter which window/TU looks it up (e.g. a pane vs. its own rows).
 ImGuiID panelId(const char* label);
@@ -312,12 +399,15 @@ ImGuiID panelId(const char* label);
 // Stateless surface builder. avgLuminance >= 0: theme-INDEPENDENT vibrancy tokens (identical
 // constants in dark+light theme) — tone comes solely from the sampled luminance. avgLuminance
 // < 0: palette fallback (chrome, no live backdrop); darkText = (activeTheme == Theme::Light).
-AdaptiveSurface adaptiveSurface(float avgLuminance);
+// `group` selects the user GlassStyle (tint / opacity / contrast) applied to the scrim.
+AdaptiveSurface adaptiveSurface(float avgLuminance, GlassGroup group = GlassGroup::Global);
 
 // Hysteretic (.42/.58) + temporally smoothed (tau 0.24s) per-panel adapter. Samples luminance
 // under `rect` via the registered sampler. `id` = any stable ImGuiID (use panelId()). Safe to
-// call every frame; idempotent within a frame; GUI thread only.
-const AdaptiveSurface& adaptivePanel(ImGuiID id, const ImRect& rect);
+// call every frame; idempotent within a frame; GUI thread only. `group` selects the user
+// GlassStyle (tint / dynamic color / contrast); pass the SAME group every frame for a given id.
+const AdaptiveSurface& adaptivePanel(ImGuiID id, const ImRect& rect,
+                                     GlassGroup group = GlassGroup::Global);
 
 // Frosted panel: projects `rect` into the live backdrop's UV space (clamped => frosted
 // edge-bleed for rects that spill past the viewport image) and tints with `surf`; falls back to
@@ -334,5 +424,10 @@ void glassText(ImDrawList* dl, ImFont* font, float size, ImVec2 pos,
 // Contrast halo color for an icon/glyph drawn over a frosted adaptive surface: the vibrancy
 // tone OPPOSITE the surface's text tone at ~0x50 alpha. alphaMul scales the alpha (HUD fades).
 ImU32 glassIconHalo(const AdaptiveSurface& surf, float alphaMul = 1.0f);
+
+// v2.1: max-contrast text color over an ARBITRARY tinted surface color (Rec.709 luminance
+// split, same 0.5 threshold as adaptiveSurface's tone pick). Use for text painted on a custom
+// tint that did not come from adaptiveSurface/adaptivePanel — those already carry textPrimary.
+ImVec4 maxContrastTextOn(const ImVec4& surface);
 
 }  // namespace ui

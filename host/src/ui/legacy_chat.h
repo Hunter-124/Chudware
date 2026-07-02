@@ -1,8 +1,11 @@
-// AI-CAD Copilot pane: slim header (logo + status + Sessions), conversation log with a per-turn
-// transparent activity timeline (what the AI is doing / thinking, expandable) whose cards are now
-// translucent Liquid-Glass bubbles over the live viewport backdrop (host contract H5), and a
-// bottom composer (prelude: Design/Permissions + context meter; transparent prompt; toolbar:
-// model picker + thinking + gear/send) painted over the same glass surface.
+// AI-CAD Copilot pane: a PINNED, full-height, rounded liquid-glass column overlaid on the
+// viewport's right edge (~12dp margins; the only layout — no docked fallback). Slim header
+// (logo + status + Sessions), conversation log with a per-turn transparent activity timeline
+// (what the AI is doing / thinking, expandable) whose cards are translucent adaptive glass
+// bubbles over the live viewport backdrop (GlassGroup::Copilot, host contract H5), and a bottom
+// composer (prelude: Design|Edit|Ask segmented toggle + Permissions + context meter; transparent
+// prompt; toolbar: model picker + thinking + send) painted over the same glass surface. The AI
+// settings live in an inline view inside the column (opened by the composer gear).
 #pragma once
 
 struct AppState;
@@ -12,10 +15,6 @@ namespace ui {
 // Draw the AI Copilot pane (header + conversation + bottom composer). `busy` whether a job is
 // running, `canRun` whether new jobs can be launched.
 void drawAIPanel(AppState& state, bool busy, bool canRun);
-
-// Draw the "Settings" dock tab that sits next to the "AI" window (same dock node). Call right
-// after drawAIPanel each frame.
-void drawAISettingsTab(AppState& state, bool busy);
 
 // Shared provider + model picker (provider combo, availability-filtered model picker, per-
 // provider API key, reasoning-effort knob, local base URL/vision, offline toggle). Rendered

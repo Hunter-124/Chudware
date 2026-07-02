@@ -264,6 +264,13 @@ public:
     ViewportBackdrop backdrop() const;
     // Mean relative luminance (Rec.709) under the rect, top-left viewport-local px coords.
     float averageLuminance(float x0, float y0, float x1, float y1) const;
+    // Mean backdrop color stats under the rect (same coord convention): mean RGB, mean Rec.709
+    // luminance, and the luminance VARIANCE across the sampled grid cells (the dynamic-color
+    // busyness term). Pure CPU read of the same async grid as averageLuminance (reduceLumaPbo
+    // retains the mean-RGB cells alongside the luma ones). Returns false until the first
+    // readback has published a grid — callers then behave as if dynamic color were off.
+    bool averageBackdropStats(float x0, float y0, float x1, float y1,
+                              float outRgb[3], float& outLum, float& outVariance) const;
 
     // GPU timings for the last polled scene-draw / blur-chain / luma-readback phases.
     GlassTimings glassTimings() const;
@@ -341,6 +348,8 @@ private:
     mutable unsigned int lumaFallbackCounter_ = 0;  // every-8th-frame direct-read fallback cadence
     mutable std::vector<float> lumaGrid_;     // published grid, top-left row order, lumaW_*lumaH_
     mutable std::vector<float> lumaStaging_;  // built off to the side, then swapped in (no tearing)
+    mutable std::vector<float> lumaRgbGrid_;     // mean-RGB grid, 3 floats/cell, same order/dims
+    mutable std::vector<float> lumaRgbStaging_;  // staging twin, swapped in lockstep with lumaGrid_
     mutable int lumaW_ = 0, lumaH_ = 0;
     mutable bool lumaEverRead_ = false;  // averageLuminance() returns 0.5f until this is true
     bool backdropEnabled_ = true;

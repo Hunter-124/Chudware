@@ -2,8 +2,9 @@
 // Liquid Glass v2 port (host, H6b write-set): each toast card is a Regular glass surface fed by
 // its own per-slot adaptivePanel (id keyed on the visible slot index so it stays stable while
 // toasts scroll through the stack); message text reads surf.textPrimary for max contrast against
-// the live viewport backdrop. Ported from ui/imgui/src/ui/toast.cpp's drawToasts. Accent bars +
-// title tag stay palette-driven (semantic level color, not adaptive — contract: local://glass_host.md).
+// the live viewport backdrop. Ported from ui/imgui/src/ui/toast.cpp's drawToasts. Accent bars stay
+// raw palette (semantic level color); the title tag is the same role tone-matched to the frost
+// (contract: local://glass_host.md + viewport-text contrast audit).
 #include "toast.h"
 
 #include <cfloat>
@@ -99,15 +100,25 @@ void drawToasts(AppState& st) {
         const std::string slotId = "host_toast_glass_" + std::to_string(shown);
         const ui::AdaptiveSurface& surf =
             ui::adaptivePanel(ui::panelId(slotId.c_str()), ImRect(p0, p1));
-        ui::glassPanel(dl, ImRect(p0, p1), ui::GlassLevel::Regular, 8.0f * scale, surf, alpha);
+        ui::glassPanel(dl, ImRect(p0, p1), ui::GlassLevel::Regular, 8.0f /*logical dp — glassPanel scales*/, surf, alpha);
         // Colored left accent bar drawn on top of glass; withA already folds in alpha.
         dl->AddRectFilled(p0, ImVec2(p0.x + 3.0f * scale, p1.y), withA(accent, 1.0f),
                           6.0f * scale, ImDrawFlags_RoundCornersLeft);
 
-        // Title (level tag) + message body.
+        // Title (level tag) + message body. The tag ink is tone-matched to the card frost
+        // (contrast audit P1): the raw statusOk/Warn roles are bright in the dark theme and wash
+        // out on the light frost the viewport backdrop produces, so deepen the role toward black
+        // when the surface wants dark text and lift it toward white over a dark frost. The left
+        // accent bar keeps the raw semantic role.
         float tx = p0.x + 12.0f * scale;
         float ty = p0.y + 8.0f * scale;
-        dl->AddText(font, font->FontSize, ImVec2(tx, ty), withA(accent, 1.0f), tag);
+        float tagC[4];
+        if (surf.darkText)
+            for (int ch = 0; ch < 3; ++ch) tagC[ch] = accent[ch] * 0.55f;
+        else
+            for (int ch = 0; ch < 3; ++ch) tagC[ch] = accent[ch] + (1.0f - accent[ch]) * 0.45f;
+        tagC[3] = 1.0f;
+        dl->AddText(font, font->FontSize, ImVec2(tx, ty), withA(tagC, 1.0f), tag);
         ImVec4 msgCol = surf.textPrimary;
         msgCol.w *= alpha;
         dl->AddText(font, font->FontSize, ImVec2(tx, ty + titleH),

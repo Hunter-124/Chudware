@@ -1,4 +1,5 @@
-// AI-CAD Settings modal (AI provider + Agent + Agents-prompt-editor tabs) and the About modal.
+// AI-CAD Settings modal (Appearance / General / AI / Prompts / Agent / Experimental tabs) and
+// the About modal.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -117,6 +118,10 @@ static void applyThemeNow(AppState& st, bool light) {
     ui::Theme next = light ? ui::Theme::Light : ui::Theme::Dark;
     ui::applyTheme(next, st.scale);
     st.settings.theme = light ? "light" : "dark";
+    // Persist immediately: the checkbox is labeled "saved immediately" and the View-menu copy
+    // already saves on toggle — without this, toggle-then-Cancel applied the theme in memory
+    // but lost it on restart (audit P1).
+    saveSettings(st.settings);
     if (st.renderer)
         st.renderer->setBackground(
             ui::palette.viewportTop[0], ui::palette.viewportTop[1], ui::palette.viewportTop[2],
@@ -126,53 +131,65 @@ static void applyThemeNow(AppState& st, bool light) {
 }  // anonymous namespace
 
 // ---- kSettingsEntries: unified command search table (command_search.cpp) ----
-// Tab indices: 0=General  1=AI  2=Prompts  3=Advanced  4=Experimental
+// Tab indices: 0=Appearance  1=General  2=AI  3=Prompts  4=Agent  5=Experimental
 // One entry per prominent field/section; labels mirror the modal's visible text.
 const SettingsEntry kSettingsEntries[] = {
-    // General (tab 0)
-    { "Units",                    "General",      0 },
-    { "MMGS units",               "General",      0 },
-    { "IPS units",                "General",      0 },
-    { "Light theme",              "General",      0 },
-    { "Dark theme",               "General",      0 },
-    { "Theme",                    "General",      0 },
-    { "Engine routing",           "General",      0 },
-    { "C++ core",                 "General",      0 },
-    { "Performance profiler",     "General",      0 },
-    { "Profiler",                 "General",      0 },
-    // AI (tab 1)
-    { "AI provider",              "AI",           1 },
-    { "Model",                    "AI",           1 },
-    { "API key",                  "AI",           1 },
-    { "Gemini key",               "AI",           1 },
-    { "Anthropic key",            "AI",           1 },
-    { "OpenAI key",               "AI",           1 },
-    { "Cloud API key",            "AI",           1 },
-    { "Vision",                   "AI",           1 },
-    { "Offline mode",             "AI",           1 },
-    { "Reasoning effort",         "AI",           1 },
-    { "Local endpoint",           "AI",           1 },
-    { "Manage models",            "AI",           1 },
-    { "Hidden models",            "AI",           1 },
-    // Prompts (tab 2)
-    { "Role prompts",             "Prompts",      2 },
-    { "Agent prompts",            "Prompts",      2 },
-    { "Prompt editor",            "Prompts",      2 },
-    // Advanced (tab 3)
-    { "Plan before building",     "Advanced",     3 },
-    { "Plan mode",                "Advanced",     3 },
-    { "Refine-pass cap",          "Advanced",     3 },
-    { "Max iters",                "Advanced",     3 },
-    { "Iteration budget",         "Advanced",     3 },
-    { "System prompt",            "Advanced",     3 },
-    { "System prompt override",   "Advanced",     3 },
-    // Experimental (tab 4)
-    { "Vision review model",      "Experimental", 4 },
-    { "Model routing",            "Experimental", 4 },
-    { "Seek-CAD split",           "Experimental", 4 },
-    { "Parametric sequence mode", "Experimental", 4 },
-    { "CAD sequence mode",        "Experimental", 4 },
-    { "Feature sequence",         "Experimental", 4 },
+    // Appearance (tab 0)
+    { "Theme",                    "Appearance",   0 },
+    { "Light theme",              "Appearance",   0 },
+    { "Dark theme",               "Appearance",   0 },
+    { "Liquid glass",             "Appearance",   0 },
+    { "Glass tint",               "Appearance",   0 },
+    { "Tint strength",            "Appearance",   0 },
+    { "Glass level",              "Appearance",   0 },
+    { "Glass opacity",            "Appearance",   0 },
+    { "Corner rounding",          "Appearance",   0 },
+    { "Text contrast",            "Appearance",   0 },
+    { "Dynamic color",            "Appearance",   0 },
+    // General (tab 1)
+    { "Units",                    "General",      1 },
+    { "MMGS units",               "General",      1 },
+    { "IPS units",                "General",      1 },
+    { "Workspace folder",         "General",      1 },
+    { "Engine routing",           "General",      1 },
+    { "C++ core",                 "General",      1 },
+    { "Performance profiler",     "General",      1 },
+    { "Profiler",                 "General",      1 },
+    // AI (tab 2)
+    { "AI provider",              "AI",           2 },
+    { "Model",                    "AI",           2 },
+    { "API key",                  "AI",           2 },
+    { "Gemini key",               "AI",           2 },
+    { "Anthropic key",            "AI",           2 },
+    { "OpenAI key",               "AI",           2 },
+    { "Cloud API key",            "AI",           2 },
+    { "Vision",                   "AI",           2 },
+    { "Offline mode",             "AI",           2 },
+    { "Reasoning effort",         "AI",           2 },
+    { "Max response tokens",      "AI",           2 },
+    { "Model context window",     "AI",           2 },
+    { "Local endpoint",           "AI",           2 },
+    { "Manage models",            "AI",           2 },
+    { "Hidden models",            "AI",           2 },
+    // Prompts (tab 3) — role prompts + the system-prompt override (moved from Advanced)
+    { "Role prompts",             "Prompts",      3 },
+    { "Agent prompts",            "Prompts",      3 },
+    { "Prompt editor",            "Prompts",      3 },
+    { "System prompt",            "Prompts",      3 },
+    { "System prompt override",   "Prompts",      3 },
+    // Agent (tab 4) — run behavior (was the Advanced tab)
+    { "Plan before building",     "Agent",        4 },
+    { "Plan mode",                "Agent",        4 },
+    { "Refine-pass cap",          "Agent",        4 },
+    { "Max iters",                "Agent",        4 },
+    { "Iteration budget",         "Agent",        4 },
+    // Experimental (tab 5)
+    { "Vision review model",      "Experimental", 5 },
+    { "Model routing",            "Experimental", 5 },
+    { "Seek-CAD split",           "Experimental", 5 },
+    { "Parametric sequence mode", "Experimental", 5 },
+    { "CAD sequence mode",        "Experimental", 5 },
+    { "Feature sequence",         "Experimental", 5 },
 };
 const int kSettingsEntryCount =
     (int)(sizeof(kSettingsEntries) / sizeof(kSettingsEntries[0]));
@@ -185,11 +202,27 @@ void drawSettingsModal(AppState& st, bool busy) {
 
     // ---------- Settings window ----------
     static bool s_settingsOpen = false;
+    // On-open snapshot for Cancel: the AI-tab picker and the Agent/Experimental checkboxes edit
+    // st.settings live, so Cancel restores this copy (real revert semantics — audit P1). The
+    // immediate-persist preferences (units / theme / glass) are re-kept on Cancel below.
+    static Settings s_snapshot;
+    bool opening = false;
     if (st.openSettings) {
+        if (!s_settingsOpen) opening = true;
         s_settingsOpen = true;
         st.openSettings = false;
     }
-    if (st.openSettingsTab >= 0) s_settingsOpen = true;
+    if (st.openSettingsTab >= 0 && !s_settingsOpen) { opening = true; s_settingsOpen = true; }
+    // Workspace-folder edit buffer (General tab), reseeded from Settings on every open.
+    static std::vector<char> s_wsBuf(512, 0);
+    if (opening) {
+        s_snapshot = settings;
+        std::fill(s_wsBuf.begin(), s_wsBuf.end(), 0);
+        std::strncpy(s_wsBuf.data(), settings.workspaceDir.c_str(), s_wsBuf.size() - 1);
+        // Make sure the glass engine reflects the persisted config before the Appearance
+        // preview draws (idempotent — app startup wiring may already have pushed it).
+        ui::setGlassConfig(settings.glassCfg);
+    }
     float sc = ui::uiScale;
     ImGuiViewport* vp = ImGui::GetMainViewport();
     const float margin = 28.0f * sc;
@@ -202,8 +235,8 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
         if (ImGui::Begin("Settings", &s_settingsOpen,
                          ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking)) {
-        // C22b: if a pending prompt role was requested, load prompts and jump to Agents tab.
-        bool jumpToAgents = false;
+        // C22b: if a pending prompt role was requested, load prompts and jump to the Prompts tab.
+        bool jumpToPrompts = false;
         if (!st.pendingPromptRole.empty() && st.workerStarted) {
             if (!s_promptsLoaded) loadPrompts(st);
             // Select the matching role in the list
@@ -214,7 +247,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 }
             }
             st.pendingPromptRole.clear();
-            jumpToAgents = true;
+            jumpToPrompts = true;
         }
         // openSettingsTab: jump to a specific tab requested by the command search widget.
         int jumpToTab = -1;
@@ -223,16 +256,205 @@ void drawSettingsModal(AppState& st, bool busy) {
             st.openSettingsTab = -1;
         }
 
-        // Tab content scrolls in its own region; Save/Cancel stay pinned at the bottom.
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+        // Tab content scrolls in its own region (a subtle glass card); Save/Cancel stay pinned
+        // at the bottom.
         const float footerH = ImGui::GetFrameHeightWithSpacing() + 20.0f * sc;
+        pushGlassChildStyle(10.0f);
         ImGui::BeginChild("##settabsarea",
                           ImVec2(0, std::max(120.0f * sc,
                                              ImGui::GetContentRegionAvail().y - footerH)));
         if (ImGui::BeginTabBar("##settabs")) {
-            // ---- General tab: Document (units) + Display (theme) ----
-            if (ImGui::BeginTabItem("General", nullptr,
+            // ---- Appearance tab (FIRST): theme + colored liquid glass (v2.1) ----
+            // The canonical theme control lives here (moved from General; the View-menu item
+            // stays a synced shortcut). The glass knobs edit Settings::glassCfg per group and
+            // live-apply via ui::setGlassConfig + persist via saveSettings on every change —
+            // so the persisted "appearance.glass" block is no longer a dead round-trip.
+            if (ImGui::BeginTabItem("Appearance", nullptr,
                                     (jumpToTab == 0) ? ImGuiTabItemFlags_SetSelected
+                                                     : ImGuiTabItemFlags_None)) {
+                ImGui::Dummy(ImVec2(0, 2 * sc));
+                ImGui::SeparatorText("Theme");
+                bool isLight = (ui::activeTheme == ui::Theme::Light);
+                if (ImGui::Checkbox("Light theme (SolidWorks-style)", &isLight))
+                    applyThemeNow(st, isLight);
+                dimText("Switches the whole UI between the dark and light palettes. "
+                        "Saved immediately.");
+
+                ImGui::Dummy(ImVec2(0, 8 * sc));
+                ImGui::SeparatorText("Liquid Glass");
+                dimText("Per-surface styling for the glass panels floating over the viewport. "
+                        "Dynamic color auto-tints each panel for max contrast against the live "
+                        "model; pin a tint below to override it. Saved immediately.");
+                ImGui::Dummy(ImVec2(0, 4 * sc));
+
+                // Group selector — segmented pills. Global is the inheritance base: the other
+                // groups fall back to it for any knob left at its default ("Reset" state).
+                static int s_glassGroup = 0;
+                static const char* kGroupLabel[(size_t)ui::GlassGroup::Count] = {
+                    "Global", "Feature Manager", "Copilot", "Viewport HUD"};
+                for (int i = 0; i < (int)ui::GlassGroup::Count; ++i) {
+                    if (i) ImGui::SameLine(0.0f, 6.0f * sc);
+                    bool selGrp = (s_glassGroup == i);
+                    const float* bc = selGrp ? ui::palette.accentSoft : ui::palette.button;
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(bc[0], bc[1], bc[2], bc[3]));
+                    if (ImGui::Button(kGroupLabel[i])) s_glassGroup = i;
+                    ImGui::PopStyleColor();
+                }
+
+                const ui::GlassGroup grp = (ui::GlassGroup)s_glassGroup;
+                ui::GlassStyle& g = settings.glassCfg.group[(size_t)grp];
+                // Seed every widget from the group's EFFECTIVE (resolved) values so inherited
+                // knobs display what actually renders; an edit pins a concrete value.
+                const ui::GlassStyleResolved& res = ui::glassStyleResolved(grp);
+                bool glassChanged = false;
+
+                // Aligned label column (uiScale-correct).
+                const float labelW = 150.0f * sc;
+                const float fieldW = 230.0f * sc;
+                auto fieldRow = [&](const char* label) {
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted(label);
+                    ImGui::SameLine(labelW);
+                    ImGui::SetNextItemWidth(fieldW);
+                };
+
+                ImGui::Dummy(ImVec2(0, 6 * sc));
+                // Tint is hue+saturation only (brightness comes from the glass level/opacity),
+                // so edit it through an HSV swatch with the value channel pinned at 1.
+                fieldRow("Tint color");
+                {
+                    float rgb[3];
+                    ImGui::ColorConvertHSVtoRGB(res.tintHue / 360.0f, res.tintSat, 1.0f,
+                                                rgb[0], rgb[1], rgb[2]);
+                    if (ImGui::ColorEdit3("##glasstint", rgb, ImGuiColorEditFlags_NoInputs)) {
+                        float h, s2, v;
+                        ImGui::ColorConvertRGBtoHSV(rgb[0], rgb[1], rgb[2], h, s2, v);
+                        g.tintHue = h * 360.0f;
+                        g.tintSat = s2;
+                        glassChanged = true;
+                    }
+                    ImGui::SameLine();
+                    dimText("(hue + saturation; strength below mixes it in)");
+                }
+                // Slider VALUES render beside the track (not centered inside it) — the teal grab
+                // sat right on top of the in-track text and obscured it (visual-review fix).
+                auto sliderValueText = [&](const char* txt) {
+                    ImGui::SameLine(0.0f, 8.0f * sc);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted(txt);
+                };
+                fieldRow("Tint strength");
+                {
+                    float v = res.tintStrength;
+                    if (ImGui::SliderFloat("##glassstrength", &v, 0.0f, 1.0f, "")) {
+                        g.tintStrength = v;
+                        glassChanged = true;
+                    }
+                    char vb[32];
+                    std::snprintf(vb, sizeof(vb), "%.2f", v);
+                    sliderValueText(v <= 0.0f ? "off" : vb);
+                }
+                fieldRow("Glass level");
+                {
+                    static const char* kLevels[] = {"Automatic", "Ultra thin", "Thin",
+                                                    "Regular", "Thick"};
+                    int lv = res.glassLevel + 1;  // -1 (auto) .. 3 -> 0 .. 4
+                    if (lv < 0 || lv > 4) lv = 0;
+                    if (ImGui::Combo("##glasslevel", &lv, kLevels, 5)) {
+                        g.glassLevel = lv - 1;
+                        glassChanged = true;
+                    }
+                }
+                fieldRow("Opacity");
+                {
+                    float v = res.opacityMul;
+                    if (ImGui::SliderFloat("##glassopacity", &v, 0.25f, 2.0f, "")) {
+                        g.opacityMul = v;
+                        glassChanged = true;
+                    }
+                    char vb[32];
+                    std::snprintf(vb, sizeof(vb), "%.2fx", v);
+                    sliderValueText(vb);
+                }
+                fieldRow("Corner rounding");
+                {
+                    float v = res.rounding < 0.0f ? 12.0f : res.rounding;
+                    if (ImGui::SliderFloat("##glassround", &v, 0.0f, 24.0f, "")) {
+                        g.rounding = v;
+                        glassChanged = true;
+                    }
+                    char vb[32];
+                    std::snprintf(vb, sizeof(vb), "%.0f dp", v);
+                    sliderValueText(res.rounding < 0.0f ? "automatic" : vb);
+                }
+                fieldRow("Text contrast boost");
+                {
+                    float v = res.textContrastBoost;
+                    if (ImGui::SliderFloat("##glassboost", &v, 0.0f, 1.0f, "")) {
+                        g.textContrastBoost = v;
+                        glassChanged = true;
+                    }
+                    char vb[32];
+                    std::snprintf(vb, sizeof(vb), "%.2f", v);
+                    sliderValueText(v <= 0.0f ? "off" : vb);
+                }
+                ImGui::Dummy(ImVec2(0, 2 * sc));
+                bool dyn = res.dynamicColor;
+                if (ImGui::Checkbox("Dynamic color \xe2\x80\x94 auto max-contrast vs model",
+                                    &dyn)) {
+                    g.dynamicColor = dyn ? 1 : 0;
+                    glassChanged = true;
+                }
+                dimText("On (default): each panel samples the live viewport and steers its tint "
+                        "for legibility. Off: the pinned tint above is used as-is.");
+
+                ImGui::Dummy(ImVec2(0, 4 * sc));
+                if (ImGui::Button("Reset to defaults", ImVec2(150.0f * sc, 28.0f * sc))) {
+                    g = ui::GlassStyle();  // all sentinels -> inherit Global / built-in defaults
+                    glassChanged = true;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Restore this group to inherited (Global / built-in) values");
+
+                if (glassChanged) {
+                    ui::setGlassConfig(settings.glassCfg);  // live-apply (idempotent)
+                    saveSettings(settings);                 // glass knobs persist immediately
+                }
+
+                // Live preview through the ACTUAL glass pipeline (adaptivePanel + glassPanel):
+                // over the viewport it frosts the real backdrop with this group's resolved style;
+                // over chrome it falls back to the layered glass. One stable id per group (the
+                // adaptive cache requires the same group every frame for a given id).
+                ImGui::Dummy(ImVec2(0, 6 * sc));
+                ImGui::SeparatorText("Preview");
+                {
+                    static const char* kPreviewId[(size_t)ui::GlassGroup::Count] = {
+                        "settings_glass_preview_global", "settings_glass_preview_fm",
+                        "settings_glass_preview_copilot", "settings_glass_preview_hud"};
+                    ImVec2 mn = ImGui::GetCursorScreenPos();
+                    float pw = std::max(220.0f * sc, ImGui::GetContentRegionAvail().x);
+                    float ph = 64.0f * sc;
+                    ImRect pr(mn, ImVec2(mn.x + pw, mn.y + ph));
+                    const ui::AdaptiveSurface& surf =
+                        ui::adaptivePanel(ui::panelId(kPreviewId[s_glassGroup]), pr, grp);
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    ui::glassPanel(dl, pr, ui::GlassLevel::Regular, 12.0f, surf);
+                    ImFont* pf = st.fonts.medium ? st.fonts.medium : ImGui::GetFont();
+                    float fs = ImGui::GetFontSize();
+                    ui::glassText(dl, pf, fs, ImVec2(mn.x + 14.0f * sc, mn.y + 12.0f * sc),
+                                  surf, kGroupLabel[s_glassGroup]);
+                    dl->AddText(pf, fs * 0.88f,
+                                ImVec2(mn.x + 14.0f * sc, mn.y + 12.0f * sc + fs * 1.35f),
+                                ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
+                                "Adaptive text over this group's glass");
+                    ImGui::Dummy(ImVec2(pw, ph));
+                }
+                ImGui::EndTabItem();
+            }
+
+            // ---- General tab: Document (units) + System (engine readout, profiler) ----
+            if (ImGui::BeginTabItem("General", nullptr,
+                                    (jumpToTab == 1) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
 
@@ -256,18 +478,34 @@ void drawSettingsModal(AppState& st, bool busy) {
                 }
                 dimText("Changes how lengths display/parse everywhere (saved immediately).");
 
+                // Workspace folder (audit P1): workspace_dir was persisted but had NO UI —
+                // users had to hand-edit config.json to re-root the File Explorer.
                 ImGui::Dummy(ImVec2(0, 8 * sc));
-                ImGui::SeparatorText("Display");
-                bool isLight = (ui::activeTheme == ui::Theme::Light);
-                if (ImGui::Checkbox("Light theme (SolidWorks-style)", &isLight))
-                    applyThemeNow(st, isLight);
+                ImGui::SeparatorText("Workspace");
+                ImGui::TextUnformatted("Workspace folder");
+                helpMarker("The File Explorer's root folder and the default save location. "
+                           "Leave empty to use Documents/AI-CAD. Applied and saved with the "
+                           "Apply button.");
+                ImGui::SetNextItemWidth(-110.0f * sc);
+                ImGui::InputTextWithHint("##wsdir", "(default: Documents/AI-CAD)",
+                                         s_wsBuf.data(), s_wsBuf.size());
                 ImGui::SameLine();
-                dimText("(saved immediately)");
-                helpMarker("Switches the whole UI and viewport between the dark and light "
-                           "(SolidWorks-style) palettes. Persists across restarts.");
+                if (ImGui::Button("Apply", ImVec2(100.0f * sc, 0))) {
+                    settings.workspaceDir = s_wsBuf.data();
+                    saveSettings(settings);
+                    // Re-resolve the live root: empty falls back to Documents/AI-CAD inside
+                    // the Explorer's ensureWorkspaceDir.
+                    st.workspaceDir = settings.workspaceDir;
+                    st.addLog("[ok] workspace folder set: " +
+                              (settings.workspaceDir.empty() ? std::string("(default)")
+                                                             : settings.workspaceDir));
+                }
+                dimText("Root of the File Explorer and default save location (saved on Apply).");
 
+                // Theme moved to the Appearance tab (the canonical control); engine routing +
+                // profiler are status/launchers, folded under one System section (audit P2).
                 ImGui::Dummy(ImVec2(0, 8 * sc));
-                ImGui::SeparatorText("Engine");
+                ImGui::SeparatorText("System");
                 // Reflect the REAL strangler-seam state (see worker_client.cpp): once the C++
                 // core (libaicad.dll) loads, doc ops route to it by default (AI_CAD_CPP_DOCS,
                 // default ON); sim/agent/ecad are explicit opt-ins. These mirror the flag reads
@@ -309,180 +547,191 @@ void drawSettingsModal(AppState& st, bool busy) {
                 }
 
                 ImGui::Dummy(ImVec2(0, 8 * sc));
-                ImGui::SeparatorText("Performance");
                 dimText("Sampling profiler \xe2\x80\x94 see where modeling time goes (extrude / "
                         "fillet / boolean, into the kernel) as a live flame graph.");
                 if (ImGui::Button("Open Profiler", ImVec2(160.0f * sc, 30.0f * sc)))
                     st.showProfilerWindow = true;
                 ImGui::Dummy(ImVec2(0, 6 * sc));
-                dimText("All settings here are stored in %APPDATA%\\AI-CAD\\config.json.");
+                dimText(("All settings here are stored in " + configPath() + ".").c_str());
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("AI", nullptr,
-                                    (jumpToTab == 1) ? ImGuiTabItemFlags_SetSelected
+                                    (jumpToTab == 2) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 ImGui::SeparatorText("Provider & model");
-                dimText("Used by Design, Edit, and Help. Stored in "
-                        "%APPDATA%\\AI-CAD\\config.json.");
+                dimText(("Used by Design, Edit, and Help. Stored in " + configPath() + ".")
+                            .c_str());
                 ImGui::Dummy(ImVec2(0, 4 * sc));
                 // Shared provider + availability-filtered model picker + reasoning effort +
                 // privacy/offline. The inline AI Settings tab renders the SAME widget.
                 ui::drawProviderModelPicker(st, busy);
                 ImGui::EndTabItem();
             }
-            // --- C22b: Agents tab (role prompt editor) --- begin marked block ---
+            // --- C22b: Prompts tab (role prompt editor + system-prompt override) ---
             if (ImGui::BeginTabItem("Prompts", nullptr,
-                                    (jumpToAgents || jumpToTab == 2) ? ImGuiTabItemFlags_SetSelected
-                                                                     : ImGuiTabItemFlags_None)) {
+                                    (jumpToPrompts || jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
+                                                                      : ImGuiTabItemFlags_None)) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 bool canFetch = st.workerStarted && !busy;
-                if (!s_promptsLoaded) {
-                    if (canFetch) {
-                        loadPrompts(st);
-                    } else {
-                        dimText("Worker not ready — start the runtime first.");
-                    }
+                if (!s_promptsLoaded && canFetch) loadPrompts(st);
+                if (!s_promptsLoaded)
+                    dimText("Worker not ready \xe2\x80\x94 role prompts appear once the runtime "
+                            "starts.");
+                // Left column: role list + the system-prompt override pseudo-entry (moved here
+                // from the old Advanced tab — it IS a prompt; audit P1). sysIdx = one past the
+                // roles = the override editor.
+                const int sysIdx = (int)s_promptRecs.size();
+                float listW = 150.0f * sc;
+                float avail = ImGui::GetContentRegionAvail().y;
+                ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                    ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
+                           ui::palette.panelBg[2], 1));
+                ImGui::BeginChild("##rolelist", ImVec2(listW, avail - 38.0f * sc),
+                                  ImGuiChildFlags_Border);
+                for (int i = 0; i < (int)s_promptRecs.size(); ++i) {
+                    bool sel = (i == s_selectedRole);
+                    auto& pr = s_promptRecs[i];
+                    std::string lbl = pr.role;
+                    if (pr.overridden) lbl += " *";
+                    if (ImGui::Selectable(lbl.c_str(), sel))
+                        s_selectedRole = i;
+                    if (ImGui::IsItemHovered())  // long names truncate in the narrow list
+                        ImGui::SetTooltip("%s%s", pr.role.c_str(),
+                                          pr.overridden ? " (overridden)" : "");
                 }
-                if (s_promptsLoaded && !s_promptRecs.empty()) {
-                    // Left column: role list
-                    float listW = 100.0f * sc;
-                    float avail = ImGui::GetContentRegionAvail().y;
-                    ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                        ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
-                               ui::palette.panelBg[2], 1));
-                    ImGui::BeginChild("##rolelist", ImVec2(listW, avail - 38.0f * sc),
-                                      ImGuiChildFlags_Border);
-                    for (int i = 0; i < (int)s_promptRecs.size(); ++i) {
-                        bool sel = (i == s_selectedRole);
-                        auto& pr = s_promptRecs[i];
-                        std::string lbl = pr.role;
-                        if (pr.overridden) lbl += " *";
-                        if (ImGui::Selectable(lbl.c_str(), sel))
-                            s_selectedRole = i;
-                    }
-                    ImGui::EndChild();
-                    ImGui::PopStyleColor();
+                if (!s_promptRecs.empty()) ImGui::Separator();
+                {
+                    std::string syslbl = "system (override)";
+                    if (st.spBuf[0] != 0) syslbl += " *";
+                    if (ImGui::Selectable(syslbl.c_str(), s_selectedRole >= sysIdx))
+                        s_selectedRole = sysIdx;
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Override the agent's system prompt (advanced)");
+                }
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
 
+                ImGui::SameLine();
+
+                // Right column: editor + diff indicator
+                ImGui::BeginChild("##roleeditor", ImVec2(0, avail - 38.0f * sc),
+                                  ImGuiChildFlags_None);
+                if (s_selectedRole >= sysIdx) {
+                    // System prompt override (applied by the footer Save; empty = built-in).
+                    ImGui::PushFont(st.fonts.medium);
+                    ImGui::TextUnformatted("System prompt override");
+                    ImGui::PopFont();
+                    dimText("Leave empty to use the built-in prompt (recommended). A custom "
+                            "prompt fully replaces it - keep the `result`/`parts` contract "
+                            "and the python+json two-block reply format or the agent breaks. "
+                            "Applied by the Save button below.");
+                    ImGui::PushFont(st.fonts.mono);
+                    float edH = ImGui::GetContentRegionAvail().y - 38.0f * sc;
+                    if (edH < 100.0f * sc) edH = 100.0f * sc;
+                    ImGui::InputTextMultiline("##sysprompt", st.spBuf.data(), st.spBuf.size(),
+                                              ImVec2(-1, edH));
+                    ImGui::PopFont();
+                    if (!canFetch) ImGui::BeginDisabled();
+                    if (ImGui::Button("Load built-in prompt")) {
+                        nlohmann::json pr;
+                        std::string perr;
+                        if (st.worker.call("get_prompts", nlohmann::json::object(), pr, perr,
+                                           20000)) {
+                            std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
+                            std::strncpy(st.spBuf.data(), pr.value("system_prompt", "").c_str(),
+                                         st.spBuf.size() - 1);
+                        } else {
+                            st.addLog("[err] get_prompts: " + perr);
+                        }
+                    }
+                    if (!canFetch) ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Copy the built-in prompt into the editor as a "
+                                          "starting point");
                     ImGui::SameLine();
-
-                    // Right column: editor + diff indicator
-                    ImGui::BeginChild("##roleeditor", ImVec2(0, avail - 38.0f * sc), ImGuiChildFlags_None);
-                    if (s_selectedRole < (int)s_promptRecs.size()) {
-                        auto& pr = s_promptRecs[s_selectedRole];
-                        // Overridden badge
-                        if (pr.overridden) {
-                            ImGui::PushStyleColor(ImGuiCol_Text,
-                                ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
-                                       ui::palette.statusWarn[2], 1));
-                            ImGui::TextUnformatted("[overridden]");
-                            ImGui::PopStyleColor();
-                            ImGui::SameLine();
-                        }
-                        ImGui::PushFont(st.fonts.medium);
-                        ImGui::TextUnformatted(pr.role.c_str());
-                        ImGui::PopFont();
-                        // Diff indicator (just char count difference — not a full diff)
-                        int curLen = (int)std::strlen(pr.buf.data());
-                        int delta  = curLen - pr.builtinLen;
-                        if (delta != 0) {
-                            ImGui::SameLine();
-                            dimText(delta > 0 ? "(differs from built-in: longer)"
-                                              : "(differs from built-in: shorter)");
-                        }
-                        ImGui::PushFont(st.fonts.mono);
-                        float edH = ImGui::GetContentRegionAvail().y - 38.0f * sc;
-                        if (edH < 100.0f * sc) edH = 100.0f * sc;
-                        ImGui::InputTextMultiline("##prompted", pr.buf.data(), pr.buf.size(),
-                                                  ImVec2(-1, edH));
-                        ImGui::PopFont();
-                        // Save / Reset
-                        if (!canFetch) ImGui::BeginDisabled();
-                        if (primaryButton("Save", ImVec2(80.0f * sc, 28.0f * sc))) {
-                            savePromptOverride(pr);
-                            st.addLog("[ok] prompt saved: " + pr.role);
-                        }
-                        if (!canFetch) ImGui::EndDisabled();
+                    if (ImGui::Button("Clear (use built-in)"))
+                        std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
+                } else if (s_selectedRole < (int)s_promptRecs.size()) {
+                    auto& pr = s_promptRecs[s_selectedRole];
+                    // Overridden badge
+                    if (pr.overridden) {
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImVec4(ui::palette.statusWarn[0], ui::palette.statusWarn[1],
+                                   ui::palette.statusWarn[2], 1));
+                        ImGui::TextUnformatted("[overridden]");
+                        ImGui::PopStyleColor();
                         ImGui::SameLine();
-                        if (!canFetch) ImGui::BeginDisabled();
-                        if (ImGui::Button("Reset to built-in", ImVec2(140.0f * sc, 28.0f * sc))) {
-                            resetPromptOverride(pr, st);
-                            st.addLog("[ok] prompt reset: " + pr.role);
-                        }
-                        if (!canFetch) ImGui::EndDisabled();
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("Delete the override and restore the shipped prompt");
                     }
-                    ImGui::EndChild();
+                    ImGui::PushFont(st.fonts.medium);
+                    ImGui::TextUnformatted(pr.role.c_str());
+                    ImGui::PopFont();
+                    // Diff indicator (just char count difference — not a full diff)
+                    int curLen = (int)std::strlen(pr.buf.data());
+                    int delta  = curLen - pr.builtinLen;
+                    if (delta != 0) {
+                        ImGui::SameLine();
+                        dimText(delta > 0 ? "(differs from built-in: longer)"
+                                          : "(differs from built-in: shorter)");
+                    }
+                    ImGui::PushFont(st.fonts.mono);
+                    float edH = ImGui::GetContentRegionAvail().y - 38.0f * sc;
+                    if (edH < 100.0f * sc) edH = 100.0f * sc;
+                    ImGui::InputTextMultiline("##prompted", pr.buf.data(), pr.buf.size(),
+                                              ImVec2(-1, edH));
+                    ImGui::PopFont();
+                    // Save / Reset
+                    if (!canFetch) ImGui::BeginDisabled();
+                    if (primaryButton("Save", ImVec2(80.0f * sc, 28.0f * sc))) {
+                        savePromptOverride(pr);
+                        st.addLog("[ok] prompt saved: " + pr.role);
+                    }
+                    if (!canFetch) ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    if (!canFetch) ImGui::BeginDisabled();
+                    if (ImGui::Button("Reset to built-in", ImVec2(140.0f * sc, 28.0f * sc))) {
+                        resetPromptOverride(pr, st);
+                        st.addLog("[ok] prompt reset: " + pr.role);
+                    }
+                    if (!canFetch) ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Delete the override and restore the shipped prompt");
                 }
+                ImGui::EndChild();
                 ImGui::EndTabItem();
             }
             // --- end C22b marked block ---
 
-            if (ImGui::BeginTabItem("Advanced", nullptr,
-                                    (st.wantSettings || jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
+            // ---- Agent tab: run behavior + iteration budget (the old Advanced tab minus the
+            // system-prompt editor, which moved to Prompts where it belongs — audit P1) ----
+            // AI_CAD_SHOT=settings selects this tab ONE-SHOT: consuming st.wantSettings directly
+            // every frame kept the other tabs unclickable for the whole session (audit P2).
+            static bool s_wantSettingsTabDone = false;
+            bool wantSettingsSel = st.wantSettings && !s_wantSettingsTabDone;
+            if (wantSettingsSel) s_wantSettingsTabDone = true;
+            if (ImGui::BeginTabItem("Agent", nullptr,
+                                    (wantSettingsSel || jumpToTab == 4) ? ImGuiTabItemFlags_SetSelected
                                                                         : ImGuiTabItemFlags_None)) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 ImGui::SeparatorText("Run behavior");
                 ImGui::Checkbox("Plan before building (recommended)", &settings.planMode);
-                helpMarker("Plan mode: before writing any CAD code the agent drafts a build plan "
-                           "(the parts, their concrete dimensions and the feature list) and shows "
-                           "it in the conversation, then codes against that plan. Off = it goes "
-                           "straight to code.");
                 dimText("The agent first drafts a build plan - the parts, concrete "
                         "dimensions and features - shows it in the conversation, then "
                         "writes the CAD code against it.");
                 ImGui::Dummy(ImVec2(0, 4 * sc));
                 ImGui::SeparatorText("Iteration budget");
                 ImGui::TextUnformatted("Refine-pass cap per request");
-                helpMarker("Max iters: how many times the agent may re-build and refine a part in "
-                           "one request before it must stop. 0 = automatic — it keeps going until "
-                           "the render matches the request (or stabilizes), then stops on its own. "
-                           "A small cap (e.g. 3) bounds cost/time on hard parts.");
                 ImGui::SetNextItemWidth(140.0f * sc);
-                ImGui::InputInt("##miters", &settings.maxIters);
-                if (settings.maxIters < 0) settings.maxIters = 0;
-                if (settings.maxIters > 64) settings.maxIters = 64;
+                ImGui::SliderInt("##miters", &settings.maxIters, 0, 64,
+                                 settings.maxIters == 0 ? "automatic" : "%d passes");
                 ImGui::SameLine();
                 dimText("0 = automatic (stops once the render matches)");
-                ImGui::Dummy(ImVec2(0, 6 * sc));
-                ImGui::SeparatorText("Prompt override");
-                ImGui::Dummy(ImVec2(0, 2 * sc));
-                ImGui::TextUnformatted("System prompt override");
-                dimText("Leave empty to use the built-in prompt (recommended). A custom "
-                        "prompt fully replaces it - keep the `result`/`parts` contract "
-                        "and the python+json two-block reply format or the agent breaks.");
-                ImGui::PushFont(st.fonts.mono);
-                ImGui::InputTextMultiline("##sysprompt", st.spBuf.data(), st.spBuf.size(),
-                                          ImVec2(-1, ImGui::GetTextLineHeight() * 10));
-                ImGui::PopFont();
-                bool canFetch = st.workerStarted && !busy;
-                if (!canFetch) ImGui::BeginDisabled();
-                if (ImGui::Button("Load built-in prompt")) {
-                    nlohmann::json pr;
-                    std::string perr;
-                    if (st.worker.call("get_prompts", nlohmann::json::object(), pr, perr,
-                                    20000)) {
-                        std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
-                        std::strncpy(st.spBuf.data(), pr.value("system_prompt", "").c_str(),
-                                     st.spBuf.size() - 1);
-                    } else {
-                        st.addLog("[err] get_prompts: " + perr);
-                    }
-                }
-                if (!canFetch) ImGui::EndDisabled();
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Copy the built-in prompt into the editor as a "
-                                      "starting point");
-                ImGui::SameLine();
-                if (ImGui::Button("Clear (use built-in)"))
-                    std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
                 ImGui::EndTabItem();
             }
 
             // ---- Experimental tab: research-backed opt-in AI features ----
             if (ImGui::BeginTabItem("Experimental", nullptr,
-                                    (jumpToTab == 4) ? ImGuiTabItemFlags_SetSelected
+                                    (jumpToTab == 5) ? ImGuiTabItemFlags_SetSelected
                                                      : ImGuiTabItemFlags_None)) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 dimText("Opt-in, default-off features from the model/provider research. All run "
@@ -574,14 +823,15 @@ void drawSettingsModal(AppState& st, bool busy) {
                 dimText("Keeps generated parts editable as a real feature tree, not a dead solid.");
 
                 ImGui::Dummy(ImVec2(0, 8 * sc));
-                dimText("Saved to %APPDATA%\\AI-CAD\\config.json under \"experimental\". "
-                        "Open-weight model presets for your main provider live under AI → Local.");
+                dimText(("Saved to " + configPath() + " under \"experimental\". Open-weight "
+                         "model presets for your main provider live under AI → Local.")
+                            .c_str());
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
         }
         ImGui::EndChild();
-        ImGui::PopStyleColor();
+        popGlassChildStyle();
         if (primaryButton("Save", ImVec2(120.0f * sc, 34.0f * sc))) {
             settings.systemPrompt = st.spBuf.data();
             saveSettings(settings);
@@ -590,7 +840,22 @@ void drawSettingsModal(AppState& st, bool busy) {
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel", ImVec2(100.0f * sc, 34.0f * sc))) {
-            std::fill(st.spBuf.begin(), st.spBuf.end(), 0);  // discard edits
+            // Restore the on-open snapshot so live-edited (but unsaved) fields don't linger as
+            // a half-applied in-memory state (audit P1) — EXCEPT the immediate-persist
+            // preferences (units / theme / glass / recent files), which already saved to
+            // config.json when they changed and must keep their live values.
+            Units keepUnits = settings.units;
+            std::string keepTheme = settings.theme;
+            ui::GlassConfig keepGlass = settings.glassCfg;
+            std::string keepWs = settings.workspaceDir;   // persisted by its Apply button
+            std::vector<std::string> keepRecent = settings.recentFiles;
+            settings = s_snapshot;
+            settings.units = keepUnits;
+            settings.theme = keepTheme;
+            settings.glassCfg = keepGlass;
+            settings.workspaceDir = keepWs;
+            settings.recentFiles = keepRecent;
+            std::fill(st.spBuf.begin(), st.spBuf.end(), 0);  // discard prompt edits
             std::strncpy(st.spBuf.data(), settings.systemPrompt.c_str(), st.spBuf.size() - 1);
             s_settingsOpen = false;
         }

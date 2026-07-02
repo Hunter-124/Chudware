@@ -9,6 +9,7 @@
 #include "../core/app_state.h"
 #include "../renderer.h"
 #include "../ui_theme.h"   // ui::uiScale
+#include "metrics.h"       // ui::metrics::stroke / titleFramePad tokens
 #include "doc_tabs.h"      // ui::openNewDocChooser (File > New)
 #include "feature_tree.h"  // Wave 3: ui::featureTreeActivePath (Save vs. Save As gating)
 #include "property_manager.h"  // View > PropertyManager checkmark queries PropertyManager::active()
@@ -25,7 +26,11 @@ bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
     bool hovered = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (hovered) {
-        ImU32 bg = kind == BTN_CLOSE ? IM_COL32(232, 17, 35, 255) : IM_COL32(255, 255, 255, 26);
+        // Close keeps the Windows-standard caption red (intentional literal); min/max hover
+        // uses the palette role so the wash reads on the light theme too (a white wash on the
+        // near-white light headerBg was invisible).
+        ImU32 bg = kind == BTN_CLOSE ? IM_COL32(232, 17, 35, 255)
+                                     : ui::Palette::toU32(ui::palette.buttonHovered);
         dl->AddRectFilled(p0, ImVec2(p0.x + size.x, p0.y + size.y), bg);
     }
     // Caption glyph color from palette so it adapts to light/dark themes.
@@ -34,7 +39,7 @@ bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
                                                     : IM_COL32(fgv, fgv, fgv, 235);
     const ImVec2 c(p0.x + size.x * 0.5f, p0.y + size.y * 0.5f);
     const float s = h * 0.16f;  // glyph half-size
-    const float th = 1.4f;
+    const float th = ui::metrics::stroke(1.4f);  // was a raw 1.4f — hairline at 2x DPI
     if (kind == BTN_MIN) {
         dl->AddLine(ImVec2(c.x - s, c.y), ImVec2(c.x + s, c.y), fg, th);
     } else if (kind == BTN_MAX) {
@@ -58,26 +63,46 @@ bool windowButton(const char* id, WinBtn kind, float h, bool maximized) {
 
 namespace ui {
 
+// Glass v2.1: the title bar stays a SOLID chrome band (locked design) but subtly adopts the
+// Global glass group's user tint — mirror of ribbon_chromeTint in widgets/ribbon.cpp. Quiet by
+// design: 35% of the resolved tintStrength, value/alpha of the base role preserved; a no-op at
+// the out-of-box strength 0.
+static ImVec4 titleBar_chromeTint(const float base[4]) {
+    const ui::GlassStyleResolved& gs = ui::glassStyleResolved(ui::GlassGroup::Global);
+    ImVec4 c(base[0], base[1], base[2], base[3]);
+    if (gs.tintStrength <= 0.001f || gs.tintSat <= 0.001f) return c;
+    float h, sat, v;
+    ImGui::ColorConvertRGBtoHSV(c.x, c.y, c.z, h, sat, v);
+    float tr, tg, tb;
+    ImGui::ColorConvertHSVtoRGB(gs.tintHue / 360.0f, gs.tintSat, v, tr, tg, tb);
+    float m = gs.tintStrength * 0.35f;
+    if (m > 1.0f) m = 1.0f;
+    c.x += (tr - c.x) * m;
+    c.y += (tg - c.y) * m;
+    c.z += (tb - c.z) * m;
+    return c;
+}
+
 void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
     GLFWwindow* win = st.win;
     chrome::HitLayout& hitLayout = *st.hitLayout;
 
-    // C25-W3G: scale the frame padding so the title bar grows with DPI.
+    // C25-W3G: scale the frame padding so the title bar grows with DPI (metrics tokens).
     float s = ui::uiScale;
     // ---------- custom title bar (our own; the OS title bar is stripped) ----------
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14.0f * s, 12.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(ui::metrics::titleFramePadX(), ui::metrics::titleFramePadY()));
     const float barH = ImGui::GetFrameHeight();
     hitLayout.titleBarHeight = (int)barH;
-    ImGui::PushStyleColor(ImGuiCol_MenuBarBg,
-        ImVec4(ui::palette.headerBg[0], ui::palette.headerBg[1],
-               ui::palette.headerBg[2], ui::palette.headerBg[3]));
+    // Solid chrome band, subtly following the Global glass tint (no-op at default strength 0).
+    ImGui::PushStyleColor(ImGuiCol_MenuBarBg, titleBar_chromeTint(ui::palette.headerBg));
     if (ImGui::BeginMainMenuBar()) {
         // C25-W3G: compute caption button width early so we can clamp the brand/menu region.
         const float bw = barH * (1.35f + 0.15f * (s - 1.0f));
         const float captionZoneW = bw * 3.0f;
         const float winW = ImGui::GetWindowWidth();
         // Available horizontal space for brand + menus (leave caption buttons on the right).
-        const float menuZoneR = winW - captionZoneW - 4.0f;
+        const float menuZoneR = winW - captionZoneW - 4.0f * s;
 
         // Brand mark: the wordmark asset already includes the cube, so do not draw logoIcon beside
         // it or the app starts with a doubled-up logo.
@@ -87,15 +112,15 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
         if (wm.id) {
             const float wmH = barH * 0.40f;
             float wmW = wmH * (float)wm.w / wm.h;
-            // C25-W3G: only show wordmark if it fits in the available zone.
-            if (ImGui::GetCursorPosX() + wmW + 18.0f * s < menuZoneR - 120.0f) {
+            // C25-W3G: only show wordmark if it fits in the available zone (menu reserve scaled).
+            if (ImGui::GetCursorPosX() + wmW + 18.0f * s < menuZoneR - 120.0f * s) {
                 ImGui::SetCursorPosY((barH - wmH) * 0.5f);
                 ImGui::Image((ImTextureID)(intptr_t)wm.id, ImVec2(wmW, wmH));
                 ImGui::SameLine(0, 22.0f * s);
             }
         } else if (st.logoIcon.id) {
             const float iconH = barH * 0.52f;
-            if (ImGui::GetCursorPosX() + iconH + 18.0f * s < menuZoneR - 120.0f) {
+            if (ImGui::GetCursorPosX() + iconH + 18.0f * s < menuZoneR - 120.0f * s) {
                 ImGui::SetCursorPosY((barH - iconH) * 0.5f);
                 ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(iconH, iconH));
                 ImGui::SameLine(0, 22.0f * s);
@@ -215,27 +240,25 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
 
         auto drawViewMenu = [&]() {
             ImGui::MenuItem("Ribbon", nullptr, &st.showRibbon);
-            if (ImGui::MenuItem("FeatureManager", nullptr,
-                                st.showFeatureTree && st.leftPaneTab == AppState::LP_FeatureManager)) {
-                st.showFeatureTree = true;
-                st.leftPaneTab = AppState::LP_FeatureManager;
-            }
-            if (ImGui::MenuItem("PropertyManager", nullptr,
-                                st.showFeatureTree && st.leftPaneTab == AppState::LP_PropertyManager,
-                                st.propertyManager && st.propertyManager->active())) {
-                st.showFeatureTree = true;
-                st.leftPaneTab = AppState::LP_PropertyManager;
-            }
-            if (ImGui::MenuItem("ConfigurationManager", nullptr,
-                                st.showFeatureTree && st.leftPaneTab == AppState::LP_Configurations)) {
-                st.showFeatureTree = true;
-                st.leftPaneTab = AppState::LP_Configurations;
-            }
-            if (ImGui::MenuItem("Explorer", nullptr,
-                                st.showFeatureTree && st.leftPaneTab == AppState::LP_Explorer)) {
-                st.showFeatureTree = true;
-                st.leftPaneTab = AppState::LP_Explorer;
-            }
+            // Each left-pane entry activates its tab; clicking the already-active entry hides the
+            // pinned column outright (the collapse-to-pill chevron has no menu equivalent, so this
+            // is the only full-hide path — mirrors the AI Panel toggle below).
+            auto leftPaneEntry = [&](const char* label, int tab, bool enabled = true) {
+                const bool activeEntry = st.showFeatureTree && st.leftPaneTab == tab;
+                if (ImGui::MenuItem(label, nullptr, activeEntry, enabled)) {
+                    if (activeEntry) {
+                        st.showFeatureTree = false;
+                    } else {
+                        st.showFeatureTree = true;
+                        st.leftPaneTab = tab;
+                    }
+                }
+            };
+            leftPaneEntry("FeatureManager", AppState::LP_FeatureManager);
+            leftPaneEntry("PropertyManager", AppState::LP_PropertyManager,
+                          st.propertyManager && st.propertyManager->active());
+            leftPaneEntry("ConfigurationManager", AppState::LP_Configurations);
+            leftPaneEntry("Explorer", AppState::LP_Explorer);
             ImGui::MenuItem("Design Table", nullptr, &st.showDesignTablePanel);
             ImGui::MenuItem("Cut List", nullptr, &st.showCutListPanel);
             ImGui::MenuItem("Equations", nullptr, &st.showEquations);
@@ -341,7 +364,6 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             if (ImGui::MenuItem("AI Help")) {
                 // Help folded into Ask mode in the unified Copilot conversation.
                 st.showAIPanel = true;
-                st.focusDesignTab = true;
                 st.aiInteraction = 2;  // Ask
             }
             if (ImGui::MenuItem("About AI-CAD")) st.showAbout = true;

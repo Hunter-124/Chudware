@@ -66,6 +66,10 @@ static void copyStr(char* dst, size_t cap, const std::string& v) {
     dst[cap - 1] = '\0';
 }
 
+// Canonical config.json "appearance.glass" group keys — index == (size_t)ui::GlassGroup.
+// Shared by loadSettings/saveSettings so the schema can never diverge between the two.
+static const char* kGlassGroupKey[] = {"global", "feature_manager", "copilot", "hud"};
+
 void loadSettings(Settings& s) {
     // Seed the shipped Gemini key by default; an on-disk config overrides it below. Done
     // before the file check so a fresh install (no config.json yet) still has a working key.
@@ -134,6 +138,31 @@ void loadSettings(Settings& s) {
         s.systemPrompt = j.value("system_prompt", "");
         s.theme = j.value("theme", "dark");
         s.units = (j.value("units", std::string("mmgs")) == "ips") ? Units::IPS : Units::MMGS;
+        // v2.1 colored liquid glass ("appearance.glass"). Absent keys stay at their GlassStyle
+        // sentinels (= inherit Global / built-in default: dynamic color ON, geometry as today),
+        // so an old config.json with no "appearance" block loads to the out-of-box look.
+        s.glassCfg = ui::GlassConfig{};
+        {
+            auto app = j.value("appearance", nlohmann::json::object());
+            auto gl  = app.is_object() ? app.value("glass", nlohmann::json::object())
+                                       : nlohmann::json::object();
+            if (gl.is_object()) {
+                for (size_t gi = 0; gi < (size_t)ui::GlassGroup::Count; ++gi) {
+                    auto go = gl.value(kGlassGroupKey[gi], nlohmann::json::object());
+                    if (!go.is_object()) continue;
+                    ui::GlassStyle& g = s.glassCfg.group[gi];
+                    g.tintHue           = go.value("tint_hue", g.tintHue);
+                    g.tintSat           = go.value("tint_sat", g.tintSat);
+                    g.tintStrength      = go.value("tint_strength", g.tintStrength);
+                    g.glassLevel        = go.value("glass_level", g.glassLevel);
+                    g.opacityMul        = go.value("opacity", g.opacityMul);
+                    g.rounding          = go.value("rounding", g.rounding);
+                    g.textContrastBoost = go.value("text_contrast_boost", g.textContrastBoost);
+                    if (go.contains("dynamic_color") && go["dynamic_color"].is_boolean())
+                        g.dynamicColor = go["dynamic_color"].get<bool>() ? 1 : 0;
+                }
+            }
+        }
         // Wave 3: File Explorer workspace + Recent files.
         s.workspaceDir = j.value("workspace_dir", std::string());
         s.recentFiles.clear();
@@ -222,6 +251,26 @@ void saveSettings(const Settings& s) {
     if (!s.systemPrompt.empty()) j["system_prompt"] = s.systemPrompt;
     j["theme"] = s.theme;
     j["units"] = (s.units == Units::IPS) ? "ips" : "mmgs";
+    // v2.1 colored liquid glass. Emit only fields the user moved off their sentinel and only
+    // groups with at least one such field, so a default config carries no "appearance" block.
+    {
+        nlohmann::json glassJ = nlohmann::json::object();
+        const ui::GlassStyle def;   // sentinel defaults
+        for (size_t gi = 0; gi < (size_t)ui::GlassGroup::Count; ++gi) {
+            const ui::GlassStyle& g = s.glassCfg.group[gi];
+            nlohmann::json go = nlohmann::json::object();
+            if (g.tintHue           != def.tintHue)           go["tint_hue"] = g.tintHue;
+            if (g.tintSat           != def.tintSat)           go["tint_sat"] = g.tintSat;
+            if (g.tintStrength      != def.tintStrength)      go["tint_strength"] = g.tintStrength;
+            if (g.glassLevel        != def.glassLevel)        go["glass_level"] = g.glassLevel;
+            if (g.opacityMul        != def.opacityMul)        go["opacity"] = g.opacityMul;
+            if (g.rounding          != def.rounding)          go["rounding"] = g.rounding;
+            if (g.textContrastBoost != def.textContrastBoost) go["text_contrast_boost"] = g.textContrastBoost;
+            if (g.dynamicColor      != def.dynamicColor)      go["dynamic_color"] = (g.dynamicColor == 1);
+            if (!go.empty()) glassJ[kGlassGroupKey[gi]] = go;
+        }
+        if (!glassJ.empty()) j["appearance"] = {{"glass", glassJ}};
+    }
     // Wave 3: File Explorer workspace + Recent files.
     if (!s.workspaceDir.empty()) j["workspace_dir"] = s.workspaceDir;
     j["recent_files"] = s.recentFiles;

@@ -539,3 +539,19 @@ Asked 2026-07-02; user AFK, so these are recorded as recommendations, not decisi
 4. **Translator training data:** synthetic-only; revisit opt-in real-design telemetry
    at the T-F11 ship gate. **ADOPTED 2026-07-02** — T-F10's dataset factory is
    synthetic by construction; telemetry decision deferred to the T-F11 gate.
+
+---
+
+## Pillar 17 — Unified Standard Parts Library (added 2026-07-03, Erik directive)
+
+One of the product's most valuable features: the AI designs ANYTHING — electronics,
+assemblies, piping, structures — from standard parts through ONE surface. Six catalogs
+already exist (core/parts families, BOLTS-lineage fasteners/bearings, KiCad+vendor ECAD,
+AISC/lumber sections, piping fittings, ISO 1219 hydraulics); Pillar 17 federates them
+rather than rewriting them. Architecture (frozen at contracts/parts.md when T-P1 lands):
+PartRecord envelope + CatalogProvider protocol + adapter per catalog; SQLite-FTS local
+index + live vendor providers; part_search / part_get / part_place MCP tools;
+R1-editable insertion in every domain; standard-before-custom bias in the agent guide.
+Execution: workstream P (T-P1 contract+search core → T-P2 all-domain adapters+vendor
+federation → T-P3 insertion parity+agent wiring+demo). Paid catalogs (TraceParts/Werk24,
+backlog T-BL12) join as providers behind the same seam when volume justifies spend.

@@ -140,3 +140,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02T14:09Z opus-reed QUESTION T-E3
 - 2026-07-02T14:09:51Z opus-kite QUESTION T-F10 — Q1 groundedness seam interface (Verdict{value,unit,grounded,matched_path} + set_checker) for T-H4 to implement; stub in place, harness unblocked; recommended answer in work/questions/T-F10.md
 - 2026-07-02T14:10Z opus-hale QUESTION T-B3 — Q1 cost_tools.py new MCP module (mirrors sourcing_tools; server.py append-only) + Q2 made-line source-plumbing SEAM (resolve_costs injectable now; per-line core costing deferred); both non-blocking, recommended answers in work/questions/T-B3.md, proceeding unblocked
+- 2026-07-02T14:16Z opus-hale REVIEW T-B3 branch=task/T-B3-cost-model (merge order: B1a → B1b → B2 → B3)

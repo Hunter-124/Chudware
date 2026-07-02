@@ -809,3 +809,22 @@ checklist render just below the headless left-pane fold, using the identical scr
 No `.h` signature change was needed (all new helpers are file-static in the .cpp; sim_manager.h's dirty
 diff in the tree is a PRE-EXISTING unrelated arrowhead-triangulation change, not this glass work).
 **Touched (this glass work):** host/src/ui/sim_manager.cpp, host/src/ui/asm_panels.cpp.
+
+**2026-07-02 — GUI overhaul Commit A + glass-polish landing (T-G1).** Landed the two
+sessions of verified-but-uncommitted host GUI work from the master working tree in two
+scoped commits: (1) the overhaul core set — adaptive colored-glass API + AppearanceSettings
+(`ui_theme.*`, `core/app_state.*`), full-bleed overlay layout support files, contrast/widget
+modernization across `feature_tree.*`, `settings_modal.*`, `title_bar/toast/legend/
+view_selector/shortcut_bar/icons_sdf`, renderer/overlay support (`renderer.*`,
+`render/overlays.*`), scenario harness updates, plus pre-existing header diffs
+(`layout.h`, `legacy_chat.h`, `property_manager.h`, `sim_manager.h`, `metrics.h`); (2) the
+2026-07-02 polish set on the seven files from `docs/HANDOFF_SHOPCRAFT_GUI_POLISH.md` —
+FM input fix (NoBringToFrontOnFocus removal), fully transparent columns (pills only),
+columns hugging the ribbon, Copilot collapse-to-pill, PropertyManager-inside-FeatureManager,
+sketch top-center DOF island + ribbon accept/deny cluster, feature readout panel, overlay
+column-dodging, PM FrameBg translucency fix. **Verify:** build green (flock'd ninja,
+exit 0); `AI_CAD_SHOT=m1` + `AI_CAD_SHOT=sketch` re-shot and eyeballed
+(`scratch/land_verify/`). **Known open item:** the m1 scenario's reopen step reports
+`rev=0 features=0 (TREE MISMATCH)` — save/reopen feature-tree restore, suspected
+pre-existing (kernel-worker side, untouched by this work); filed for investigation.
+Remaining NEEDS-LIVE click-tests are tracked as T-G2.

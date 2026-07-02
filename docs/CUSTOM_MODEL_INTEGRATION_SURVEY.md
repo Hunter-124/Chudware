@@ -211,30 +211,26 @@ the synthetic factory. This single decision is what guarantees "users can change
 visually and numerically with automatic relations" for every model output, and it
 matches the field's convergence on executable-but-structured CAD representations.
 
-### 3.5 Requirements layer — `aicad.req/1` (didn't exist; defined here, cut as T-H3)
+### 3.5 Requirements layer — `aicad.req/1`
 
-Promotes backlog T-BL09; consumed by T-F17's design-brief sign-off; joined by verify
-nodes and P15 test reports.
+> **Normative definition moved to `contracts/requirements.md`** (T-H3, 2026-07-02).
+> This section is now a summary pointer only. For the canonical schema, field rules,
+> valid verifiers list, status ladder, persistence, and markdown projection spec —
+> see `contracts/requirements.md`.
 
-```json
-{"schema":"aicad.req/1", "id":"uuid4", "title":"…", "revision":3,
- "stakeholder_needs":[{"id":"N1","text":"…","source":"chat|doc|import"}],
- "requirements":[
-   {"id":"R1", "need":"N1", "kind":"dimensional|functional|material|interface|cost|standard|process",
-    "text":"Bore accepts a 608 bearing, press fit",
-    "quantity":{"param":"bore_dia","op":"==","value":22.0,"unit":"mm","tol":{"plus":0.0,"minus":0.013}},
-    "verify_by":[{"verifier":"measure_between","args":"…"},{"verifier":"fit_report"}],
-    "status":"proposed|user_confirmed|verified|failed|waived",
-    "trace":{"features":["f3"],"study":null,"evidence":[]}}],
- "interfaces":[], "assumptions":[], "open_questions":[],
- "audit":[{"who":"user|agent","ts":"…","change":"…"}]}
-```
+`aicad.req/1` is simultaneously the **elicitation target format (IP-12)**, the
+**T-F17 design-brief sign-off format**, the **verify-node contract (WS-A)**, and
+the **eval spec for spec→sketch/part benchmarks (T-H8)**.
 
-Rules: only `quantity` fields carry numbers; every requirement names its verifier(s);
-`user_confirmed` requires a Pillar-9 `ask_user` answer or explicit edit; markdown
-projection for reading/diffing. This is simultaneously the **elicitation target format
-(IP-12)**, the **verify-node contract**, and the **eval spec for spec→sketch/part
-benchmarks**.
+Key rules (normative in `contracts/requirements.md`):
+- Only `quantity` fields carry numbers; `text` is prose.
+- Every requirement names ≥1 deterministic verifier from `VALID_VERIFIERS`.
+- `user_confirmed` requires a Pillar-9 `ask_user` answer or explicit user edit.
+- `verified`/`failed` are set by automated verifiers; `waived` by the user only.
+- Markdown projection is a deterministic read-only view (never parsed back).
+
+MCP tools: `req_create`, `req_update`, `req_status`, `req_report`
+(`services/mcp/req_tools.py`).  Pure brain: `engine_oracle/requirements/requirements.py`.
 
 ---
 

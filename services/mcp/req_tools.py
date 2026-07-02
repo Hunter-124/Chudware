@@ -20,9 +20,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
-from mcp.server.fastmcp import FastMCP
+if TYPE_CHECKING:
+    from mcp.server.fastmcp import FastMCP
 
 from engine_oracle.requirements import RequirementsDoc
 
@@ -98,7 +99,7 @@ def _save_doc(
 # Tool registration
 # ---------------------------------------------------------------------------
 
-def register_req_tools(mcp: FastMCP) -> None:
+def register_req_tools(mcp: "FastMCP") -> None:
     """Register all requirements CRUD tools on the given FastMCP instance."""
 
     @mcp.tool()

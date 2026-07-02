@@ -10,10 +10,13 @@ import os
 import tempfile
 from pathlib import Path
 
+import importlib.util
+import sys
+
 import pytest
 
 # Patch the FastMCP registration so we can test tools directly.
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 
 def _make_mcp():
@@ -33,9 +36,19 @@ def _make_mcp():
 
 
 def _register():
-    from mcp_server.req_tools import register_req_tools  # noqa: PLC0415
+    # Import req_tools directly by file path to avoid triggering server.py's
+    # module-level FastMCP import, which shadows the mcp SDK when services/mcp/
+    # is on sys.path.
+    import os
+    _here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "req_tools_under_test",
+        os.path.join(_here, "req_tools.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
     mcp = _make_mcp()
-    register_req_tools(mcp)
+    mod.register_req_tools(mcp)
     return mcp._tools
 
 

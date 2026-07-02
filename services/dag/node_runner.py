@@ -93,7 +93,10 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any]) -> Any:
         provider = AnthropicProvider()
         node_name = context_pack.get("node_name", "dag_node")
         return loop.run(request=request, provider=provider, name=node_name)
-    except (ImportError, ModuleNotFoundError, Exception):  # noqa: BLE001
+        # NOTE: loop.run() has no allowed_tools parameter — tool filtering is
+        # expressed as advisory prose in the request string (see _build_request).
+        # Real injection is a T-A4/T-A5 seam; loop.py is read-only per Driver notes.
+    except (ImportError, ModuleNotFoundError):
         # Engine or provider unavailable (CI, offline, no API key) — use stub.
         return _StubAgentResult()
 

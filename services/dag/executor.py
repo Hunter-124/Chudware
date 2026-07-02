@@ -121,10 +121,16 @@ def run(
             "node_states": node_states,
         })
 
+    # §14 narration fields: describe_project(run=...) in gsl_tools.py reads
+    # "name"/"project", "open_questions", and "budget" via .get().  Populate the
+    # two we can reliably source; budget is omitted (loop.py carries no token
+    # usage surface — T-F17 may add it later; the contract degrades gracefully).
     return {
         "run_id": run_id,
+        "name": graph_json.get("name", ""),          # §14: project name for narration
         "status": run_status,
         "nodes": node_states,
+        "open_questions": final_state.get("open_questions", []),  # §14: escalation log
         "checkpoint_db": str(db_path),
     }
 

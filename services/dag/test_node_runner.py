@@ -482,3 +482,72 @@ class TestExecutorWiring:
         assert "dag.node.started" in events
         assert "dag.node.done" in events
         assert "dag.run.done" in events
+
+
+# ---------------------------------------------------------------------------
+# §14 narration fields in executor.run() return dict
+# ---------------------------------------------------------------------------
+
+class TestSection14NarrationFields:
+    """executor.run() must surface §14 fields so describe_project(run=...) works."""
+
+    def test_name_in_result(self, tmp_path: Path) -> None:
+        """executor.run() return dict includes 'name' from the graph document."""
+        graph = {
+            "schema": "aicad.dag/1",
+            "id": "narration-test",
+            "name": "soil-moisture-sensor",
+            "nodes": [
+                {"id": "n1", "type": "report", "name": "Report",
+                 "inputs": {}, "on_fail": "skip", "autonomy": "auto"},
+            ],
+            "edges": [],
+        }
+        result = executor.run(graph, runs_dir=tmp_path,
+                              agent_fn=_agent_always("confirmed", True))
+        assert result["name"] == "soil-moisture-sensor"
+
+    def test_open_questions_empty_on_clean_run(self, tmp_path: Path) -> None:
+        """A run with no escalations has an empty open_questions list."""
+        graph = {
+            "schema": "aicad.dag/1",
+            "id": "narration-clean",
+            "name": "clean",
+            "nodes": [
+                {"id": "n1", "type": "design", "name": "D",
+                 "inputs": {"request": "x"}, "on_fail": "pause", "autonomy": "auto"},
+            ],
+            "edges": [],
+        }
+        result = executor.run(graph, runs_dir=tmp_path,
+                              agent_fn=_agent_always("confirmed", True))
+        assert "open_questions" in result
+        assert result["open_questions"] == []
+
+    def test_open_questions_populated_on_escalation(self, tmp_path: Path) -> None:
+        """An escalation (budget exhausted) appends an entry to open_questions."""
+        graph = {
+            "schema": "aicad.dag/1",
+            "id": "narration-escalation",
+            "name": "escalation-test",
+            "nodes": [
+                {"id": "n1", "type": "design", "name": "Design",
+                 "inputs": {"request": "x"}, "on_fail": "pause", "autonomy": "auto"},
+                {"id": "n_gate", "type": "gate", "name": "Gate",
+                 "inputs": {}, "on_fail": "pause", "autonomy": "approve"},
+            ],
+            "edges": [{"from": "n1", "to": "n_gate"}],
+        }
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            result = executor.run(
+                graph, runs_dir=tmp_path,
+                # n1 always escalates (failed verdict, budget exhausted)
+                agent_fn=_agent_always("failed", False),
+            )
+        assert "open_questions" in result
+        # n1 should have escalated and added an entry
+        assert any(q.get("node") == "n1" for q in result["open_questions"]), (
+            f"Expected n1 escalation in open_questions, got: {result['open_questions']}"
+        )

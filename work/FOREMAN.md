@@ -184,3 +184,4 @@ All branches at status:review. Trivial `services/mcp/server.py` append conflicts
 7. Then: issue #1 stale-branch cleanup; wave-2 review queue.
 
 **Human-only asks (batched):** (a) DVC remote bucket + Argilla/MLflow hosting for T-H5/T-H6 — T-H5 driver is building offline-first and will file exact asks in work/questions/T-H5.md; (b) model-promotion criteria for T-H9; (c) T-G2's four NEEDS-LIVE click-tests → T-G12 checklist; (d) E3-hooks retarget decision (T-G4 backlog note); (e) WS-A is untouched (Bruh) — T-F4/T-F17/T-F12 stay blocked on T-A3/T-A4 until you start it or waive the dep.
+- 2026-07-02T18:45Z sonnet-fenn CLAIMED T-F6 (chained off task/T-F5-image-ingestion; merge order F5 → F6; worktree /home/hunter/Repositories/CAD-T-F6 on branch task/T-F6-photo-capture)

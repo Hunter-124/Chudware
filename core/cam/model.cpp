@@ -370,7 +370,7 @@ json Operation::to_json() const {
         {"stepover", stepover}, {"stepdown", stepdown}, {"stock_to_leave", stock_to_leave},
         {"stock_to_leave_axial", stock_to_leave_axial}, {"tolerance", tolerance},
         {"pattern", cam::to_string(pattern)}, {"direction", cam::to_string(direction)},
-        {"angle", angle}, {"multi_depth", multi_depth},
+        {"angle", angle}, {"multi_depth", multi_depth}, {"arc_blend_linking", arc_blend_linking},
         {"lead_in", lead_in.to_json()}, {"lead_out", lead_out.to_json()}, {"ramp", ramp.to_json()},
         {"rpm", rpm}, {"feed", feed}, {"plunge", plunge}, {"lead_feed", lead_feed},
         {"ramp_feed", ramp_feed}, {"spindle_dir", spindle_dir}, {"coolant", coolant},
@@ -408,6 +408,7 @@ Operation Operation::from_json(const json& j) {
     o.direction = cut_direction_from_string(j.value("direction", std::string("climb")));
     o.angle = num(j.value("angle", json(0.0)));
     o.multi_depth = j.value("multi_depth", true);
+    o.arc_blend_linking = j.value("arc_blend_linking", true);
     if (j.contains("lead_in")) o.lead_in = Lead::from_json(j["lead_in"]);
     if (j.contains("lead_out")) o.lead_out = Lead::from_json(j["lead_out"]);
     if (j.contains("ramp")) o.ramp = Ramp::from_json(j["ramp"]);

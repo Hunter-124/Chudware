@@ -265,6 +265,11 @@ struct Operation {
     CutDirection direction = CutDirection::Climb;
     double angle = 0;                // raster/zigzag angle (deg)
     bool multi_depth = true;         // step down in stepdown increments
+    // Area-clearing (adaptive2d / waterline / adaptive3d) ring-to-ring linking:
+    // true = "adaptive" arc-blend link (tangent semicircle, nearest-vertex start) —
+    // bounded engagement at corners; false = plain concentric-offset linking (a
+    // direct feed_to between rings), which can spike engagement at corners.
+    bool arc_blend_linking = true;
 
     Lead lead_in;
     Lead lead_out;

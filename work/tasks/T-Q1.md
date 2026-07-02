@@ -2,8 +2,8 @@
 id: T-Q1
 title: Packaging & first-run — Linux+Windows installers, dependency bundling
 workstream: Q
-owner: sonnet-reed
-status: doing
+owner: unassigned
+status: todo
 branch: task/T-Q1-prod
 day: 1
 priority: 2

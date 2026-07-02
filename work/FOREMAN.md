@@ -115,3 +115,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 fable-arc REVIEW T-F14 branch=task/T-F14-deliverables-scaffold (merge order: F14 → F15 → F16)
 - 2026-07-02 fable-arc REVIEWED T-F3: LGTM merge-ready (contract+core+3 transports, 18/18 pytest, agent_panel hot-spot held to 1 include + 1 call, gate fails pre-existing only); Q1-Q3 ANSWERED in work/questions/T-F3.md (approved; normalize_dimension canonical for T-F2); paths.py XDG divergence filed as GitHub issue. Backfill: opus-lark CLAIMED T-E1
 - 2026-07-02 Fable REVIEWED T-H1: LGTM merge-ready (telemetry contract + consent tiers + journals + C++/Py emission incl. applied-action at run_design completion; compile-verified, 20/20 agent tests). Follow-up for T-F17: GUI-side action emission with real dwell_ms needs an agent_action bridge RPC (see work/questions/T-H1.md)
+- 2026-07-02T13:12:40Z opus-pike REVIEW T-F9 branch=task/T-F9-providers-contract

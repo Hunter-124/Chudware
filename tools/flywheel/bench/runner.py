@@ -56,6 +56,20 @@ def register(driver: BenchDriver) -> None:
     REGISTRY[driver.bench_id] = driver
 
 
+# Self-wiring: each bench module exposes a module-level `DRIVER = BenchDriver(...)`. Import
+# them tolerantly so the runner works whether or not every bench has landed yet (and so a
+# broken bench module never takes down the others).
+_BENCH_MODULES = ("elicitation", "spec_sketch", "cam", "vlm")
+for _name in _BENCH_MODULES:
+    try:
+        _mod = __import__(f"tools.flywheel.bench.benches.{_name}", fromlist=["DRIVER"])
+        _drv = getattr(_mod, "DRIVER", None)
+        if isinstance(_drv, BenchDriver):
+            REGISTRY[_drv.bench_id] = _drv
+    except Exception:
+        pass  # not landed yet / import error — surfaced when that bench is run explicitly
+
+
 def run_bench(bench_id: str, *, smoke: bool = False,
               write: bool = True, workdir: Optional[str] = None) -> BenchResult:
     if bench_id not in REGISTRY:

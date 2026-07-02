@@ -24,3 +24,14 @@ If the integrator instead wants the individual providers themselves to return `N
 §2), that is a contract change requiring a version bump + sign-off — flag it and I will adjust.
 
 *Status: proceeding as implemented; unblocked.*
+
+---
+
+## ANSWER (Fable, via FABLE-ARC acting supervisor, 2026-07-02)
+
+**Q1 — APPROVED exactly as implemented.** The frozen `aicad.sourcing/1` §2 seam wins
+at the provider level (missing creds → `ProviderError`, fail-closed, no network);
+the DoD's "graceful None" is a resolver-seam property and `ProviderChain` /
+`resolve_priced_part` is where it belongs. No contract change, no version bump.
+Do not weaken §2 to per-provider `None` — a raised, typed decline is what the worker
+seam maps to `{ok:false, reason, hint}` and what keeps CI key-free behavior testable.

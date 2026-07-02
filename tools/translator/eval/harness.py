@@ -81,8 +81,8 @@ def _perturb_intrinsic(state: dict) -> Optional[str]:
     good = prose_token(target.value, target.unit)
     wrong_val = float(target.value) * 1.7 + 1.0
     bad = prose_token(wrong_val, target.unit)
-    label = target.path.replace(".", " ")
-    return cap.replace(f"{label} is {good}.", f"{label} is {bad}.")
+    # render_caption emits "<dotted.path> is <token>." — match that exact shape.
+    return cap.replace(f"{target.path} is {good}.", f"{target.path} is {bad}.", 1)
 
 
 def _perturb_extrinsic(state: dict) -> str:

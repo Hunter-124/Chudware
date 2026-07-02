@@ -54,9 +54,16 @@ _UNIT_FMT: dict[str, str] = {
     "mm/min": "{:.0f}",    # feed rates — integer
     "s": "{:.1f}",         # cycle/est times — 1 decimal
     "pct": "{:.1f}",       # percentages — 1 decimal
+    "ohm": "{:.1f}",       # trace impedance — 1 decimal
+    "ratio": "{:.2f}",     # dimensionless ratios (factor of safety) — 2 decimals
     "count": "{:.0f}",     # integer counts
     "none": "{}",          # categorical
 }
+
+# Dimensionless numeric units that appear BARE in prose (no unit token). A bare number
+# in a caption is an acceptable candidate for these; `count` compares as an integer,
+# `ratio` within tolerance.
+_BARE_UNITS = ("count", "ratio")
 
 # Aliases normalised on extraction of FREE text (captions/paraphrases). The strict
 # serialization only ever emits canonical units; the eval harness tolerates a model
@@ -72,7 +79,8 @@ _UNIT_ALIAS: dict[str, tuple[str, float]] = {
     "mm/min": ("mm/min", 1.0),
     "s": ("s", 1.0), "sec": ("s", 1.0), "seconds": ("s", 1.0),
     "%": ("pct", 1.0), "pct": ("pct", 1.0), "percent": ("pct", 1.0),
-    "count": ("count", 1.0),
+    "ohm": ("ohm", 1.0), "ohms": ("ohm", 1.0), "Ω": ("ohm", 1.0),
+    "count": ("count", 1.0), "ratio": ("ratio", 1.0),
 }
 
 
@@ -100,9 +108,10 @@ def prose_token(value: Any, unit: str) -> str:
     """Render a value for natural-language captions: counts and enums appear bare
     (`6`, `bolt_circle`), physical dims keep their unit (`6.5mm`). Distinct from the
     strict `fmt_value`, which suffixes `count` for exact machine round-trips."""
-    if unit in ("none", "count"):
-        return _UNIT_FMT.get(unit, "{}").format(float(value)) if unit == "count" \
-            else _enum_token(value)
+    if unit == "none":
+        return _enum_token(value)
+    if unit in _BARE_UNITS:
+        return _UNIT_FMT.get(unit, "{}").format(float(value))
     return fmt_value(value, unit)
 
 
@@ -133,12 +142,15 @@ class Slot:
         if not self.numeric:
             return _enum_token(self.value) == _enum_token(other_value)
         base_u, factor = _UNIT_ALIAS.get(other_unit, (other_unit, 1.0))
-        if self.kind == "count":
-            # Counts read as bare integers in prose ("6 holes"), so a unitless numeral
-            # is an acceptable candidate as well as an explicit `count` token.
+        if self.unit in _BARE_UNITS:
+            # Dimensionless: reads as a bare number in prose ("6 holes", "FOS 1.43"),
+            # so a unitless numeral is an acceptable candidate.
             if base_u not in (self.unit, "none"):
                 return False
-            return round(float(other_value) * factor) == round(float(self.value))
+            cand = float(other_value) * factor
+            if self.unit == "count":
+                return round(cand) == round(float(self.value))
+            return abs(cand - float(self.value)) <= max(abs_tol, rel_tol * abs(float(self.value)))
         if base_u != self.unit:
             return False
         cand = float(other_value) * factor
@@ -241,7 +253,7 @@ def _domain_slots(state: dict, out: list[Slot]) -> None:
         _num_slot("fea.yield", fea.get("yield_mpa"), "MPa", "tolerance", out)
         _num_slot("fea.max_von_mises", fea.get("max_von_mises_mpa"), "MPa", "dim", out)
         _num_slot("fea.max_disp", fea.get("max_disp_mm"), "mm", "dim", out)
-        _num_slot("fea.min_fos", fea.get("min_fos"), "count", "dim", out)
+        _num_slot("fea.min_fos", fea.get("min_fos"), "ratio", "dim", out)
         for i, f in enumerate(fea.get("freqs_hz") or []):
             _num_slot(f"fea.mode.{i + 1}", f, "Hz", "dim", out)
 
@@ -253,7 +265,7 @@ def _domain_slots(state: dict, out: list[Slot]) -> None:
             if isinstance(tr, dict) and tr.get("net"):
                 base = f"ecad.trace.{_enum_token(tr['net'])}"
                 _num_slot(f"{base}.width", tr.get("width_mm"), "mm", "dim", out)
-                _num_slot(f"{base}.impedance", tr.get("impedance_ohm"), "count", "tolerance", out)
+                _num_slot(f"{base}.impedance", tr.get("impedance_ohm"), "ohm", "tolerance", out)
 
 
 # --------------------------------------------------------------- state -> text (serialize)
@@ -347,8 +359,13 @@ def extract_slots(text: str) -> list[Slot]:
 # secondary channel the master plan flags as lossy — the slot harness treats a low
 # recall here as a real miss, never papers over it.
 _PROSE_NUM_RE = re.compile(
-    r"(?<![A-Za-z0-9])(?P<num>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*"
-    r"(?P<unit>mm/min|mm3|mm\^3|MPa|N/mm2|mm|cm|m|deg|degrees|°|Hz|s|sec|%|percent|count)?",
+    # A numeral must not be embedded in an identifier: reject a leading letter/digit/
+    # underscore/dot (so `pcb_7870`, `1018_steel`, `f7`, `v1.2` do NOT leak digits).
+    r"(?<![A-Za-z0-9_.])(?P<num>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+    # then EITHER a unit (which must end at a word boundary — else `s` eats the 's' of
+    # "setup", `m` the 'm' of "machined") OR a non-identifier boundary (bare number).
+    r"(?:\s*(?P<unit>mm/min|mm3|mm\^3|MPa|N/mm2|mm|cm|deg|degrees|°|Hz|sec|s|%|pct|percent|"
+    r"ohms|ohm|Ω|count|m)(?![A-Za-z])|(?![_A-Za-z0-9]))",
     re.IGNORECASE)
 
 
@@ -369,17 +386,22 @@ def extract_numerals(text: str) -> list[tuple[float, str]]:
 
 
 def slots_equal(a: Iterable[Slot], b: Iterable[Slot]) -> bool:
-    """Exact ordered equality of two canonical Slot lists (the DoD-1 round-trip check)."""
+    """Exact ordered equality of two canonical Slot lists over the SERIALIZED content —
+    (path, unit, value). `kind` is a semantic annotation (dim vs tolerance, material vs
+    enum) that is deliberately NOT written to the text and cannot be recovered from
+    "250MPa" or "6061_T6" alone, so it is not part of the round-trip guarantee; the
+    extractor infers a best-effort kind for downstream use only. This is the DoD-1
+    round-trip check and matches `roundtrip_diff` (which compares tokens)."""
     la, lb = list(a), list(b)
     if len(la) != len(lb):
         return False
     for x, y in zip(la, lb):
-        if x.path != y.path or x.unit != y.unit or x.kind != y.kind:
+        if x.path != y.path or x.unit != y.unit:
             return False
-        if x.numeric:
+        if x.numeric and y.numeric:
             if abs(float(x.value) - float(y.value)) > 1e-9:
                 return False
-        elif _enum_token(x.value) != _enum_token(y.value):
+        elif x.numeric != y.numeric or _enum_token(x.value) != _enum_token(y.value):
             return False
     return True
 
@@ -417,8 +439,10 @@ def render_caption(state: dict) -> str:
     dom = state.get("domain") or "brep"
     parts = [f"[{SER_VERSION} domain={dom}]"]
     for s in slots:
-        label = s.path.replace(".", " ")
-        parts.append(f"{label} is {prose_token(s.value, s.unit)}.")
+        # Keep the dotted path as the label: a numeric path index (e.g. `fea.mode.1`)
+        # stays attached to its dot, so the identifier-guard never mistakes the ordinal
+        # `1` for a slot VALUE. Word-separators inside a segment stay readable.
+        parts.append(f"{s.path} is {prose_token(s.value, s.unit)}.")
     return " ".join(parts)
 
 

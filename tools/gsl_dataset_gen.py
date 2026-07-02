@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import sys
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -237,6 +238,256 @@ FAMILIES: dict[str, Callable[[random.Random], list[dict]]] = {
 }
 
 
+# ==================================================== Pillar-13 translator-pair factory
+#
+# Stage-0 dataset extension (docs/AI_TOOLING_MASTER_PLAN.md §Pillar 13): the deterministic
+# describers are the FREE label source, so a translator training pair is
+# (gsl-ser/v1 serialization, grounded caption). This factory emits the §Pillar-13 DOMAIN
+# MIX, paraphrase-augments each caption, then RE-VERIFIES every pair through the
+# groundedness seam AND the round-trip re-extraction diff before it may enter the set —
+# never trust the paraphraser (the master plan's binding rule). It is engine-FREE: it
+# builds gsl-ser/v1 STATE dicts directly (the `_digest`/domain shape), so the mix runs in
+# CI with no libaicad. When the engine IS available, real B-rep digests can be substituted
+# for `synth_brep_state` without changing the pipeline.
+
+# §Pillar-13 data-mix table (fractions sum to 1.0). B-rep dominates; the "what changed"
+# contrastive + correction pairs are the 10% that teaches task-conditioned narration.
+DOMAIN_MIX: dict[str, float] = {
+    "brep": 0.40,
+    "sketch": 0.15,
+    "ecad": 0.15,
+    "cam": 0.15,
+    "fea": 0.05,
+    "contrastive": 0.05,
+    "correction": 0.05,
+}
+
+
+def _round(x: float, n: int = 1) -> float:
+    return round(x, n)
+
+
+def synth_brep_state(rng: random.Random) -> dict:
+    """An engine-free gsl-ser/v1 B-rep state (bolt-circle plate variant)."""
+    L, W, H = _round(rng.uniform(60, 150)), _round(rng.uniform(40, 100)), _round(rng.uniform(5, 15))
+    n = rng.randint(3, 8)
+    return {
+        "domain": "brep", "part": f"plate_{rng.randint(0, 9999)}",
+        "bbox_mm": [L, W, H], "faces": 6 + n, "edges": 12 + 2 * n,
+        "symmetry": {"order": n, "type": "rotational", "axis": "z"},
+        "feature_groups": [
+            {"id": "F1", "name": "Plate", "type": "box", "faces": 6},
+            {"id": "F2", "name": "Bolts", "type": "bolt_circle", "faces": n,
+             "params": {"count": n, "diameter": _round(rng.uniform(4, 10)),
+                        "pcd": _round(min(L, W) * rng.uniform(0.5, 0.75))}},
+        ],
+    }
+
+
+def synth_sketch_state(rng: random.Random) -> dict:
+    dims = [{"id": f"d{i}", "type": rng.choice(["distance", "radius"]),
+             "value": _round(rng.uniform(5, 90)), "driven": False} for i in range(rng.randint(2, 5))]
+    dims.append({"id": "da", "type": "angle", "value": _round(rng.choice([30, 45, 60, 90])),
+                 "driven": False})
+    return {"domain": "sketch", "part": f"sketch_{rng.randint(0, 9999)}",
+            "sketch": {"dof": 0, "dims": dims}}
+
+
+def synth_cam_state(rng: random.Random) -> dict:
+    op_types = ["adaptive_clearing", "contour", "pocket", "face"]
+    ops = []
+    for i, name in enumerate(["Rough", "Finish"][: rng.randint(1, 2)]):
+        ops.append({"id": f"op{i}", "name": name, "type": rng.choice(op_types),
+                    "tool_diameter": _round(rng.uniform(3, 12)),
+                    "machined_pct": _round(rng.uniform(60, 99.9)),
+                    "cycle_time_s": _round(rng.uniform(30, 600)),
+                    "feed_mm_min": float(rng.randint(400, 2000))})
+    return {"domain": "cam", "part": f"job_{rng.randint(0, 9999)}",
+            "cam": {"setups": 1, "operations": len(ops), "ops": ops}}
+
+
+def synth_fea_state(rng: random.Random) -> dict:
+    yield_mpa = _round(rng.choice([276.0, 250.0, 505.0, 215.0]))
+    vm = _round(yield_mpa * rng.uniform(0.4, 0.9), 1)
+    return {"domain": "fea", "part": f"study_{rng.randint(0, 9999)}",
+            "fea": {"material": rng.choice(["6061_T6", "1018_steel", "Ti_6Al_4V"]),
+                    "yield_mpa": yield_mpa, "max_von_mises_mpa": vm,
+                    "max_disp_mm": round(rng.uniform(0.005, 0.5), 3),
+                    "min_fos": round(yield_mpa / vm, 2),
+                    "freqs_hz": sorted(_round(rng.uniform(100, 1500), 1)
+                                       for _ in range(rng.randint(1, 3)))}}
+
+
+def synth_ecad_state(rng: random.Random) -> dict:
+    nets = ["SW", "VIN", "VOUT", "GND", "FB"]
+    traces = [{"net": nets[i], "width_mm": round(rng.uniform(0.2, 1.5), 2),
+               "impedance_ohm": _round(rng.choice([45.0, 50.0, 90.0, 100.0]), 1)}
+              for i in range(rng.randint(1, 3))]
+    return {"domain": "ecad", "part": f"pcb_{rng.randint(0, 9999)}",
+            "ecad": {"nets": rng.randint(8, 30), "components": rng.randint(10, 60),
+                     "traces": traces}}
+
+
+_STATE_GENS: dict[str, Callable[[random.Random], dict]] = {
+    "brep": synth_brep_state, "sketch": synth_sketch_state, "cam": synth_cam_state,
+    "fea": synth_fea_state, "ecad": synth_ecad_state,
+}
+
+
+def paraphrase_default(caption: str, rng: random.Random) -> str:
+    """Deterministic OFFLINE stand-in for the large-LLM paraphraser (the real step runs
+    a big model out of band). Reorders sentences + swaps a few surface words WITHOUT
+    touching numerals — the groundedness re-check must still pass. The point of the
+    pipeline is that even a *misbehaving* paraphraser cannot inject an ungrounded number:
+    the re-check drops it. Pass your own callable to substitute the real paraphraser."""
+    swaps = [("is", "="), ("bbox", "bounding box"), ("feat", "feature"),
+             ("op", "operation"), ("pct", "%")]
+    sents = [s.strip() for s in caption.split(". ") if s.strip()]
+    if len(sents) > 2:
+        head, tail = sents[0], sents[1:]
+        rng.shuffle(tail)
+        sents = [head] + tail
+    text = ". ".join(sents)
+    for a, b in swaps:
+        if rng.random() < 0.5:
+            text = re.sub(rf"\b{re.escape(a)}\b", b, text)
+    return text
+
+
+def verify_pair(state: dict, caption: str) -> tuple[bool, list[str]]:
+    """A pair is admissible iff (1) the state round-trips exactly through gsl-ser/v1 and
+    (2) the caption has NO ungrounded numeral (groundedness seam). Returns (ok, reasons)."""
+    from tools.translator import gsl_ser as _g  # noqa: PLC0415
+    from tools.translator import groundedness as _gnd  # noqa: PLC0415
+    reasons: list[str] = []
+    rt = _g.roundtrip_diff(state)
+    if rt:
+        reasons.append(f"roundtrip:{rt[:2]}")
+    ungrounded = [(v.value, v.unit) for v in _gnd.check(caption, state) if not v.grounded]
+    if ungrounded:
+        reasons.append(f"ungrounded:{ungrounded[:3]}")
+    return (not reasons, reasons)
+
+
+def _sample_domain(rng: random.Random) -> str:
+    r = rng.random()
+    acc = 0.0
+    for dom, w in DOMAIN_MIX.items():
+        acc += w
+        if r <= acc:
+            return dom
+    return "brep"
+
+
+def make_pair(domain: str, rng: random.Random, paraphraser) -> Optional[dict]:
+    """One (serialization, caption) training pair for `domain`, paraphrased + re-verified.
+    Returns None (dropped) if the re-check fails — never emit an unverified pair."""
+    import re as _re  # noqa: PLC0415,F401 (paraphraser uses module-level re)
+    from tools.translator import gsl_ser as _g  # noqa: PLC0415
+
+    if domain in _STATE_GENS:
+        state = _STATE_GENS[domain](rng)
+        caption = _g.render_caption(state)
+        ok, reasons = verify_pair(state, caption)
+        if not ok:
+            return {"_dropped": reasons}
+        para = paraphraser(caption, rng)
+        ok, reasons = verify_pair(state, para)
+        if not ok:                      # paraphraser injected/dropped a number -> discard
+            return {"_dropped": reasons}
+        return {"domain": domain, "serialization": _g.serialize(state),
+                "caption": para, "template_caption": caption,
+                "task": "narrate", "state": state}
+
+    if domain == "contrastive":         # "what changed" — before/after, delta-only caption
+        base = _STATE_GENS[rng.choice(["brep", "cam", "fea"])](rng)
+        after = json.loads(json.dumps(base))
+        slots = [s for s in _g.enumerate_slots(base) if s.kind in ("dim", "count")]
+        if not slots:
+            return None
+        tgt = slots[rng.randrange(len(slots))]
+        new_val = _g.canon(float(tgt.value) * 1.5 + 1.0, tgt.unit)
+        _set_by_path(after, tgt.path, new_val)
+        caption = (f"[gsl-ser/v1 what_changed] {tgt.path} changed from "
+                   f"{tgt.token()} to {_g.fmt_value(new_val, tgt.unit)}.")
+        # A delta caption legitimately names BOTH the before- and after-value, so it must
+        # ground against before ∪ after (not `after` alone); the state must round-trip.
+        from tools.translator import groundedness as _gnd  # noqa: PLC0415
+        allslots = [s for s in _g.enumerate_slots(base) + _g.enumerate_slots(after)
+                    if s.numeric]
+        ungrounded = [(v, u) for v, u in _g.extract_numerals(caption)
+                      if not any(s.matches(v, u) for s in allslots)]
+        if _g.roundtrip_diff(after) or ungrounded:
+            return {"_dropped": [f"contrastive:{ungrounded[:2] or _g.roundtrip_diff(after)[:1]}"]}
+        return {"domain": domain, "serialization": _g.serialize(after),
+                "before": _g.serialize(base), "caption": caption, "task": "what_changed",
+                "state": after}
+
+    if domain == "correction":          # wrong caption -> corrected (deterministic) caption
+        state = _STATE_GENS[rng.choice(list(_STATE_GENS))](rng)
+        good = _g.render_caption(state)
+        slots = [s for s in _g.enumerate_slots(state) if s.numeric]
+        if not slots:
+            return None
+        tgt = slots[len(slots) // 2]
+        bad = good.replace(f"is {_g.prose_token(tgt.value, tgt.unit)}.",
+                           f"is {_g.prose_token(float(tgt.value) * 2 + 3, tgt.unit)}.", 1)
+        return {"domain": domain, "serialization": _g.serialize(state),
+                "wrong_caption": bad, "caption": good, "task": "correct", "state": state}
+    return None
+
+
+def _set_by_path(state: dict, path: str, value) -> None:
+    """Mutate the state slot at `path` (mirrors enumerate_slots' path scheme) in place."""
+    segs = path.split(".")
+    if segs[:2] == ["part", "bbox"]:
+        state["bbox_mm"][{"x": 0, "y": 1, "z": 2}[segs[2]]] = value
+    elif path in ("part.faces", "part.edges"):
+        state[segs[1]] = value
+    elif segs[0] == "feat":
+        for fg in state.get("feature_groups", []):
+            if fg.get("name") == segs[1] or fg.get("id") == segs[1]:
+                (fg.setdefault("params", {}))[segs[2]] = value if segs[2] != "faces" \
+                    else fg.__setitem__("faces", value)
+    elif segs[0] == "cam" and len(segs) >= 4:
+        for op in state.get("cam", {}).get("ops", []):
+            if op.get("name") == segs[2] or op.get("id") == segs[2]:
+                op[{"tool_diameter": "tool_diameter", "machined": "machined_pct",
+                    "cycle_time": "cycle_time_s", "feed": "feed_mm_min"}.get(segs[3], segs[3])] = value
+    elif segs[0] == "fea":
+        state.setdefault("fea", {})[{"max_von_mises": "max_von_mises_mpa",
+                                     "max_disp": "max_disp_mm", "yield": "yield_mpa",
+                                     "min_fos": "min_fos"}.get(segs[1], segs[1])] = value
+
+
+def build_translator_corpus(count: int, seed: int, out_path: Path,
+                            paraphraser=None) -> dict:
+    """Emit `count` verified translator pairs following DOMAIN_MIX to a JSONL file.
+    Returns a stats dict (per-domain counts + drops). Engine-free."""
+    paraphraser = paraphraser or paraphrase_default
+    rng = random.Random(seed)
+    kept: dict[str, int] = {}
+    dropped = 0
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w") as fh:
+        made = 0
+        attempts = 0
+        while made < count and attempts < count * 20:
+            attempts += 1
+            dom = _sample_domain(rng)
+            pair = make_pair(dom, rng, paraphraser)
+            if not pair or pair.get("_dropped"):
+                dropped += 1
+                continue
+            fh.write(json.dumps(pair, sort_keys=True) + "\n")
+            kept[dom] = kept.get(dom, 0) + 1
+            made += 1
+    total = sum(kept.values()) or 1
+    return {"kept": kept, "kept_total": sum(kept.values()), "dropped": dropped,
+            "proportions": {d: round(kept.get(d, 0) / total, 3) for d in DOMAIN_MIX},
+            "target_mix": DOMAIN_MIX, "out": str(out_path)}
+
+
 # ============================================================== artifact assembly
 
 
@@ -363,7 +614,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--render", action="store_true", help="also render.png each sample (doc_render_png)")
     ap.add_argument("--out", type=str, default="corpora/gsl_dataset", help="output root directory")
     ap.add_argument("--seed", type=int, default=0, help="base seed; sample i uses seed base+i")
+    ap.add_argument("--translator-pairs", type=int, default=None, metavar="N",
+                    help="ENGINE-FREE: emit N verified gsl-ser/v1 translator pairs following "
+                         "the §Pillar-13 DOMAIN_MIX (paraphrased + groundedness re-checked) "
+                         "to --pairs-out, then exit (no libaicad needed).")
+    ap.add_argument("--pairs-out", type=str, default="corpora/translator_pairs.jsonl",
+                    help="output JSONL for --translator-pairs")
     args = ap.parse_args(argv)
+
+    if args.translator_pairs is not None:
+        stats = build_translator_corpus(args.translator_pairs, args.seed,
+                                        Path(args.pairs_out))
+        print(f"Wrote {stats['kept_total']} verified pairs to {stats['out']} "
+              f"({stats['dropped']} dropped by re-check)")
+        print(f"  mix (kept/target): " + ", ".join(
+            f"{d} {stats['proportions'][d]:.2f}/{stats['target_mix'][d]:.2f}"
+            for d in DOMAIN_MIX))
+        return 0
 
     if not cb.available():
         print("FATAL: the AI-CAD core engine library (libaicad) could not be located/loaded — "

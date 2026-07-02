@@ -1,0 +1,6 @@
+{
+ "from": "verify-agent-A",
+ "to": "verify-agent-B",
+ "text": "via MCP layer now",
+ "ts": "2026-07-02T11:51:51Z"
+}

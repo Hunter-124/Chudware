@@ -1,1 +1,1 @@
-# tools/flywheel package — created by T-H7; T-H5 adds exporter/DVC/Argilla modules here.
+# tools/flywheel package — T-H7 (middleware/shadow) + T-H5 (exporter/DVC/Argilla) modules.

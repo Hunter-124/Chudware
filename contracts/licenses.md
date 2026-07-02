@@ -75,6 +75,10 @@
 | **aiosqlite** (0.22.1, transitive) | MIT | async SQLite backend for langgraph-checkpoint-sqlite | ok |
 | **langchain-core** (1.4.8, transitive) | MIT | langgraph dependency | ok |
 | **langsmith** (0.9.6, transitive) | MIT | langgraph tracing dep (no API key required) | ok |
+| qrcode (T-F6, optional) | MIT | QR code generation for phone handoff URL | ok |
+| open3d (T-F6, optional) | MIT | mesh cleanup + scale normalization post-photogrammetry | ok |
+| Meshroom/AliceVision (T-F6, subprocess only) | MPL-2.0 | photogrammetry reconstruction — NEVER imported, subprocess via MESHROOM_BIN | ok (subprocess) |
+| COLMAP (T-F6, subprocess alternate) | BSD-3 | photogrammetry alternate — NEVER imported, subprocess via COLMAP_BIN | ok (subprocess) |
 
 Rules:
 - Adding any dependency requires a row here in the same change.

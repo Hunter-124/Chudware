@@ -135,6 +135,11 @@ register_piping_tools(mcp)
 from mcp_server.hydraulic_tools import register_hydraulic_tools
 register_hydraulic_tools(mcp)
 
+# Photo capture + photogrammetry entry path for reverse_engineer (Pillar 10 v2).
+# DEFAULT OFF — start_capture_session MCP tool starts the local listener on demand.
+from mcp_server.recon_tools import register_photo_recon_tools
+register_photo_recon_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

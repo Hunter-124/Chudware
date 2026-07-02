@@ -1,2 +1,1 @@
-# tools/flywheel — training-data exporter, DVC versioning, Argilla audit gate
-# T-H5: consent-filtered exporter
+# tools/flywheel package — created by T-H7; T-H5 adds exporter/DVC/Argilla modules here.

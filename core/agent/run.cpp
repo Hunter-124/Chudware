@@ -13,6 +13,7 @@
 
 #include "agent/config.h"
 #include "agent/events.h"
+#include "agent/logging_provider.h"
 #include "agent/machine.h"
 #include "agent/mission.h"
 #include "agent/ops_emit.h"
@@ -315,6 +316,17 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
 
     // ONE provider instance for the whole run (per-role scripted queues must persist).
     ProviderFn provider = make_provider(provider_cfg);
+
+    // T-H7: resolve consent early (same logic as post-run; consent_tier/load_config are
+    // cheap and idempotent — we re-read at emit time too, but need it now for the wrapper).
+    std::string run_consent = consent_tier(load_config());
+    if (offline) run_consent = "off";  // offline hard-overrides to "off" (same as emit site)
+
+    // Wrap with timing + sidecar logging (thin; never changes behaviour).
+    // LoggingProviderState collects the most-recent sidecar paths so emit_ai_artifact
+    // (below) can pass input_ref/output_ref instead of empty strings.
+    aicad::agent::LoggingProviderState lp_state;
+    provider = aicad::agent::wrap_logging(std::move(provider), run_id, run_consent, &lp_state);
     // Output-token budget + INPUT context cap, jointly fitted to the model's context window so a
     // small local window is never overrun (which would truncate the prompt and break the chain).
     const CallBudget budget = fit_call_budget(provider_cfg, call_budget_for(provider_cfg));
@@ -825,8 +837,10 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
         // One artifact per design run; sidecar refs stay empty at run granularity
         // (per-attempt raws are already in attempt_<stage>_<n>.txt via agent_output).
         emit_ai_artifact(events, /*artifact_id=*/run_id, /*insertion_point=*/"IP-1",
-                         model_info, /*prompt_hash=*/"", /*input_ref=*/"",
-                         /*output_ref=*/"", /*base_revision=*/tree0.value("revision", 0),
+                         model_info, /*prompt_hash=*/"",
+                         /*input_ref=*/lp_state.last_input_ref,
+                         /*output_ref=*/lp_state.last_output_ref,
+                         /*base_revision=*/tree0.value("revision", 0),
                          /*verifier_scores=*/json::object(), run_latency_ms, consent);
         if (result.value("status", std::string()) == "done")
             emit_ai_artifact_action(events, /*artifact_id=*/run_id, "applied", revision,

@@ -169,3 +169,18 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02T17:18Z Fable REVIEWED T-G5: LGTM merge-ready (docs-only verify-and-close; wave 1 F1-F4+G1 proven already on master with per-DoD commands in REFACTOR_LOG; root-caused the selMulti break — the fix I committed). ANSWER committed on-branch in work/questions/T-G5.md. MERGE NOTE: opus-vale committed T-G5 status:review to master directly (c92f8d0) while the branch task file still says doing — at merge keep review
 - 2026-07-02T18:00Z sonnet-kilo CLAIMED T-F8 (chained off task/T-F7-narration-core; merge order F7 → {F10, F8})
 - 2026-07-02T18:30Z sonnet-cove CLAIMED T-F16-closeout (finishing fable-arc/OPUS-ARC's DoD checklist; impl untouched)
+- 2026-07-02T17:35Z Fable DISPATCHED wave 2 via chained branches (deps at review, unmerged — same approved pattern as B/E chains): sonnet-kilo T-F8 (off F7), sonnet-bree T-H5 (off H1), sonnet-thorn T-H7 (off H1, conforms to F9 providers/1), sonnet-lux T-E5 (off E3), sonnet-fenn T-F6 (off F5), sonnet-cove T-F16-closeout (finishing OPUS-ARC's checklist — 50+ min silent, presumed dead on budget); peer assignments: opus-vex T-B5 (off B4), opus-vale T-G6 (off G5, dedicated flock'd integrator). Deferred pending merges/deps: T-H8 (needs H3+H4 together), T-F4/T-F17/T-F12 (gated on unstarted WS-A T-A3/T-A4 — Erik: waive or start WS-A?), T-F11 (ship-gated), T-H6/H9/H10/H11 (later chain)
+
+## MERGE PLAN for Erik (Fable, 2026-07-02T17:35Z — the whole queue, one pass)
+
+All branches at status:review. Trivial `services/mcp/server.py` append conflicts everywhere: KEEP ALL LINES. After EACH batch: nothing. After ALL merges: `python3 work/tools/work.py dag && graphify update .` on master, then the wave-2 branches (F8, H5, H7, E5, F6, B5, G6) rebase clean and queue next.
+
+1. **Independent, any order:** T-H2, T-H3, T-H4, T-H1, T-F13, T-F3, T-F5, T-F9, T-C1, T-D1 + opus-vex's `fix/issue-3-bom-mpn` (issue #3).
+2. **F chains:** T-F1 → T-F2 (⚠ EYEBALL: F2 changes desktop FEA material defaults — brass C360 yield 310→124 MPa annealed, alu E 68900→69000; registry-authoritative + conservative, but look); T-F7 → T-F10; T-F14 → T-F15 → T-F16 (closeout in flight — merge F16 only after its REVIEW line lands).
+3. **B chain:** T-B1a → T-B1b → T-B2 → T-B3 → T-B4.
+4. **E chain:** T-E1 → T-E2 → {T-E3, T-E4} (siblings, either order).
+5. **G:** T-G2 → T-G4; T-G5 (docs-only; ⚠ its task file conflicts with master's status:review — keep review).
+6. Post-merge alignment commits (first driver in each area, already noted in task files): req_join ↔ contracts/requirements.md constants; T-H3 imports services/verify/unit_ranges.RANGES; T-H4 groundedness conforms to T-F10's GroundednessChecker protocol (work/questions/T-F10.md ruling).
+7. Then: issue #1 stale-branch cleanup; wave-2 review queue.
+
+**Human-only asks (batched):** (a) DVC remote bucket + Argilla/MLflow hosting for T-H5/T-H6 — T-H5 driver is building offline-first and will file exact asks in work/questions/T-H5.md; (b) model-promotion criteria for T-H9; (c) T-G2's four NEEDS-LIVE click-tests → T-G12 checklist; (d) E3-hooks retarget decision (T-G4 backlog note); (e) WS-A is untouched (Bruh) — T-F4/T-F17/T-F12 stay blocked on T-A3/T-A4 until you start it or waive the dep.

@@ -106,6 +106,10 @@ def provider_offline_safe(provider: Provider) -> bool:
         return _host_is_loopback(base_url)
     if name == "llamacpp":
         return _host_is_loopback(base_url or DEFAULT_LOCAL_BASE_URL)
+    if name == "vllm":
+        # vLLM serves LoRA adapters locally (T-H9); offline-safe only when its endpoint is
+        # loopback — same rule as openai/llamacpp, NOT the never-offline cloud set.
+        return _host_is_loopback(base_url or "http://localhost:8000/v1")
     # Unknown provider with a loopback base_url is allowed; anything else is refused.
     return _host_is_loopback(base_url)
 
@@ -173,6 +177,13 @@ def _resolve_provider(name: str | None, cfg: dict) -> Provider:
                 f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the managed "
                 f"llama.cpp endpoint {base_url!r} is not loopback, so it is refused before "
                 f"probing the server.")
+    if offline and name == "vllm":
+        vc = dict(cfg.get("vllm", {}) or {})
+        base_url = vc.get("base_url") or "http://localhost:8000/v1"
+        if not _host_is_loopback(base_url):
+            raise OfflineModeError(
+                f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the vLLM serving "
+                f"endpoint {base_url!r} is not loopback, so it is refused before construction.")
 
     if not name:
         # Nothing configured: default to a local LM Studio (OpenAI-compatible) endpoint
@@ -252,5 +263,21 @@ def _resolve_provider(name: str | None, cfg: dict) -> Provider:
         # Keep the endpoint explicit in the provider object so offline-safety and diagnostics name it.
         lcfg.setdefault("base_url", DEFAULT_LOCAL_BASE_URL)
         return LlamaCppProvider(lcfg, model=lcfg["model"])
+
+    if name == "vllm":
+        # T-H9: per-task LoRA serving. OpenAI-compatible vLLM instance; the served LoRA is
+        # picked by the `adapter` field. Enters as just another providers/1 adapter.
+        from .providers.vllm_provider import (VLLMProvider, DEFAULT_BASE_URL,
+                                              DEFAULT_MODEL as VLLM_DEFAULT_MODEL)
+
+        vc = dict(cfg.get("vllm", {}) or {})
+        return VLLMProvider(
+            base_model=vc.get("model") or cfg.get("model") or VLLM_DEFAULT_MODEL,
+            adapter=vc.get("adapter"),
+            api_key=cfg.get("api_key") or os.environ.get("OPENAI_API_KEY"),
+            base_url=vc.get("base_url") or DEFAULT_BASE_URL,
+            supports_vision=vc.get("vision", False),
+            timeout=float(vc.get("timeout", 120.0)),
+        )
 
     raise ValueError(f"Unknown provider: {name!r}")

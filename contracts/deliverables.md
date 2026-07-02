@@ -66,6 +66,19 @@ Every `make_*` takes exactly one object, `spec`:
 - `run_id` is opaque; when omitted the engine assigns one and returns it on the record.
 - `outline` and `attached_results` are the load-bearing parts, defined below.
 
+### 2.1 `make_presentation` — allowed formats
+
+`format` ∈ { `pptx` }; default `pptx`. Engine: python-pptx.
+
+### 2.2 `make_report` — allowed formats
+
+`format` ∈ { `docx`, `pdf` }; default `docx`. Engines: python-docx for `docx`;
+WeasyPrint/reportlab (in-process, no subprocess) for `pdf`.
+
+### 2.3 `make_workbook` — allowed formats
+
+`format` ∈ { `xlsx` }; default `xlsx`. Engine: openpyxl.
+
 ### 2.4 Outline blocks
 
 `outline` is an ordered list of blocks. The template decides how a block maps to slides / sections

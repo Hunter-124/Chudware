@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -650,7 +650,7 @@ def _build_provenance(
         "recipe": job.get("recipe", ""),
         "method": recipe.get("method", ""),
         "mlflow_run_id": mlflow_run_id,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     adapter_out.mkdir(parents=True, exist_ok=True)
     (adapter_out / "provenance.json").write_text(

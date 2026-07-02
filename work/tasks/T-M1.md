@@ -3,7 +3,7 @@ id: T-M1
 title: CAM overhaul: fix critical post-processor correctness (C++)
 workstream: M
 owner: opus-iron
-status: review
+status: done
 branch: task/T-M1-cam-overhaul
 day: 1
 priority: 1

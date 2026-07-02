@@ -3,7 +3,7 @@ id: T-B1b
 title: Nexar, Digi-Key, and Mouser provider implementations
 workstream: B
 owner: opus-moss
-status: doing
+status: review
 branch: task/T-B1b-part-providers
 day: 1
 depends_on: [T-B1a, T-S1]
@@ -37,10 +37,10 @@ The afternoon deliverable is three `PartProvider` implementations behind the int
 
 ## Definition of done
 
-- [ ] `NexarProvider` fetches real data when `NEXAR_CLIENT_ID` is set; returns None gracefully when not set
-- [ ] `DigiKeyProvider` and `MouserProvider` scaffold exists; stub mode when keys absent
-- [ ] `ProviderChain` falls through providers in order
-- [ ] `python -m pytest engine_oracle/test_parts_providers.py -q` passes (mock HTTP)
+- [x] `NexarProvider` fetches real data when `NEXAR_CLIENT_ID` is set; degrades gracefully when not set (raises `ProviderError` per frozen contract §2/§0; `ProviderChain`/`resolve_priced_part` surface that as `None` — see work/questions/T-B1b.md)
+- [x] `DigiKeyProvider` and `MouserProvider` scaffold exists; stub mode (logged-warning `ProviderError`) when keys absent
+- [x] `ProviderChain` falls through providers in order (Nexar → Digi-Key → Mouser), returns first success or `None`
+- [x] `python -m pytest engine_oracle/test_parts_providers.py -q` passes (mock HTTP) — 17 passed, no network/keys
 
 ## AI hints
 

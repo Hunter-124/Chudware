@@ -2,8 +2,8 @@
 id: T-H1
 title: Telemetry contract - AI-artifact envelope, accept/edit/reject capture, consent tiers
 workstream: H
-owner: unassigned
-status: todo
+owner: sonnet-echo
+status: doing
 branch: task/T-H1-telemetry-contract
 day: 11
 depends_on: []

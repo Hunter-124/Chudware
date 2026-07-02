@@ -37,6 +37,7 @@ Gate nodes implement human approval checkpoints via LangGraph `interrupt()`. Whe
 - [ ] `executor.resume(run_id, decision)` reloads checkpoint and continues
 - [ ] Autonomy dial applied: `auto` nodes skip gates, `approve` nodes insert gate, `manual` nodes insert gate with pre-filled draft
 - [ ] `python -m pytest services/dag/test_gate.py -q` passes including app-restart simulation (close + reopen checkpoint DB)
+- DEFERRED (foreman review, round 1): C++ wiring of the `pause` verdict — `machine.cpp` `run_stage()` treats only pass/fail/skip/cancelled as terminal, so `pause` is documented as RESERVED in `machine.h` (Python-side LangGraph interrupt only). Wire the C++ side in a follow-up task when a C++ stage machine needs to yield to human input.
 
 ## AI hints
 

@@ -12,6 +12,8 @@ from langgraph.graph import END, StateGraph
 
 from . import context_pack as cp
 from . import node_runner as nr
+from . import autonomy as av
+from . import gate as gt
 
 # ---------------------------------------------------------------------------
 # Schema constants
@@ -141,6 +143,7 @@ def _make_node_handler(
     *,
     agent_fn: Any = None,
     initial_retry_budget: int = cp.DEFAULT_RETRY_BUDGET,
+    autonomy_default: str = "auto",
 ) -> Callable[[DagState], DagState]:
     """Return a LangGraph node function with real capability dispatch.
 
@@ -148,6 +151,7 @@ def _make_node_handler(
     each node is executed via node_runner.run(), which wraps the agent loop
     with an isolated context pack (inputs, allowed tools, retry budget).
 
+    T-A3 wires real interrupt() for approve/manual autonomy via gate.run_gate().
     The verdict returned by node_runner ("done" | "retry" | "escalate") is
     written into the node state so the conditional router built by
     build_state_graph() can route accordingly.
@@ -156,36 +160,84 @@ def _make_node_handler(
         initial_retry_budget: The retry budget to use on the node's FIRST visit
             (when node_state has no retry_remaining yet). Comes from the back-edge's
             retry_budget field. Subsequent visits read from accumulated node_state.
+        autonomy_default: Run-level autonomy floor (from executor.run/resume).
     """
     node_id = node["id"]
     node_type = node["type"]
     node_name = node["name"]
-    autonomy = node.get("autonomy", "auto")
+    # Effective autonomy = max(node's declared level, run-level default).
+    eff_autonomy = av.effective_autonomy(node, autonomy_default=autonomy_default)
 
     def _handle(state: DagState) -> DagState:
         # emit is captured via closure — NOT read from state (callables can't be
         # serialised by the LangGraph checkpoint serde).
         _emit: EmitFn = emit
 
-        # --- autonomy gate ---------------------------------------------------
-        if autonomy == "approve":
-            # T-A3 wires real interrupt(); stub = pass-through with warning
-            warnings.warn(
-                f"Node {node_id!r} autonomy='approve': T-A3 interrupt() not yet wired; "
-                "proceeding without pause (scaffold stub).",
-                stacklevel=2,
-            )
-            if _emit:
-                _emit("dag.node.approval_required", {"node_id": node_id})
+        # --- autonomy gate (T-A3: real interrupt()) --------------------------
+        # NOTE on events: dag.node.paused / dag.node.approval_required /
+        # dag.node.manual_required are NOT emitted here.  On resume, LangGraph
+        # re-executes this handler from the top before interrupt() returns the
+        # decision, so any emit placed before run_gate() double-fires (once on
+        # the initial suspend, again on resume).  Instead executor.run()/resume()
+        # emit those events exactly once per suspend, from the surfaced
+        # '__interrupt__' payloads (which carry node_id + autonomy for this).
+        gate_decision: Optional[str] = None
+        gate_user_output: Optional[dict[str, Any]] = None
 
-        elif autonomy == "manual":
+        if eff_autonomy in ("approve", "manual"):
+            decision, extra_patch = gt.run_gate(
+                node, state, emit=_emit, autonomy=eff_autonomy
+            )
+            if decision == gt.DECISION_REJECT:
+                # Rejected (or unrecognised decision, which fails closed to
+                # reject in run_gate): mark paused without running the node.
+                return {
+                    "node_states": {**state.get("node_states", {}),
+                                    node_id: {"status": "paused", "output": {},
+                                              "verdict": "escalate",
+                                              "gate_decision": decision}},
+                    "run_status": "paused",
+                }
+            gate_decision = decision
+            if decision == "modify":
+                # User-supplied output override; applied below instead of
+                # dispatching the agent.
+                gate_user_output = extra_patch.get("user_output", {})
+            # "approve" → fall through to agent execution below.
+
+        # --- "modify" decision: user-supplied output override -----------------
+        # The user supplied the node's output directly (manual nodes advertise
+        # this in the gate proposal; approve nodes may also modify).  Record the
+        # node as done with that output — the agent is NOT dispatched, so the
+        # override actually takes effect in downstream state.
+        if gate_user_output is not None:
+            prev_ns = state.get("node_states", {}).get(node_id, {})
+            retry_rem = prev_ns.get("retry_remaining", initial_retry_budget)
+            output_state = {
+                "status": "done",
+                "summary": (
+                    f"Node '{node_name}': user-supplied output override "
+                    "(gate decision 'modify'); agent execution skipped."
+                ),
+                "data": gate_user_output,
+                "retry_remaining": retry_rem,
+                "doc_id": node.get("inputs", {}).get("doc_id"),
+            }
+            node_entry = {
+                "status": "done",
+                "output": output_state,
+                "verdict": nr.VERDICT_DONE,
+                "retry_remaining": retry_rem,
+                "gate_decision": "modify",
+            }
             if _emit:
-                _emit("dag.node.manual_required", {"node_id": node_id})
+                _emit("dag.node.done", {
+                    "node_id": node_id,
+                    "output": output_state,
+                })
             return {
                 "node_states": {**state.get("node_states", {}),
-                                node_id: {"status": "paused", "output": {},
-                                          "verdict": "escalate"}},
-                "run_status": "paused",
+                                node_id: node_entry},
             }
 
         # --- verify node stub (T-A4 owns real logic) -------------------------
@@ -197,9 +249,9 @@ def _make_node_handler(
             )
 
         # --- gate node (requires approve/manual — already handled above) -----
-        if node_type == "gate" and autonomy == "auto":
+        if node_type == "gate" and eff_autonomy == "auto":
             warnings.warn(
-                f"Gate node {node_id!r} has autonomy='auto'; gate nodes should use "
+                f"Gate node {node_id!r} has effective autonomy='auto'; gate nodes should use "
                 "'approve' or 'manual'. Running as pass-through.",
                 stacklevel=2,
             )
@@ -230,6 +282,8 @@ def _make_node_handler(
             "verdict": verdict,
             "retry_remaining": output_state.get("retry_remaining", 0),
         }
+        if gate_decision is not None:
+            node_entry["gate_decision"] = gate_decision
 
         new_node_states = {**state.get("node_states", {}), node_id: node_entry}
 
@@ -304,6 +358,7 @@ def build_state_graph(
     emit: EmitFn = None,
     *,
     agent_fn: Any = None,
+    autonomy_default: str = "auto",
 ) -> StateGraph:
     """Validate and assemble an aicad.dag/1 graph JSON into a LangGraph StateGraph.
 
@@ -311,9 +366,12 @@ def build_state_graph(
     with an attached SqliteSaver checkpointer so intermediate states are persisted.
 
     Args:
-        graph_json: The graph document (must conform to aicad.dag/1).
-        emit:       Optional event callback passed into node handlers.
-        agent_fn:   Injectable agent callable for testing (None = live loop).
+        graph_json:        The graph document (must conform to aicad.dag/1).
+        emit:              Optional event callback passed into node handlers.
+        agent_fn:          Injectable agent callable for testing (None = live loop).
+        autonomy_default:  Run-level autonomy floor — one of "auto", "approve", "manual".
+                           Can only RAISE a node's declared level, never lower it.
+                           Passed into each node handler via autonomy.effective_autonomy().
 
     Returns:
         Uncompiled LangGraph StateGraph ready for `.compile(checkpointer=...)`.
@@ -363,7 +421,12 @@ def build_state_graph(
         budget = node_retry_budgets.get(node["id"], cp.DEFAULT_RETRY_BUDGET)
         sg.add_node(
             node["id"],
-            _make_node_handler(node, emit, agent_fn=agent_fn, initial_retry_budget=budget),
+            _make_node_handler(
+                node, emit,
+                agent_fn=agent_fn,
+                initial_retry_budget=budget,
+                autonomy_default=autonomy_default,
+            ),
         )
 
     # Compute forward successors for each node (for routing).

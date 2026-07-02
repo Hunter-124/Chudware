@@ -3,7 +3,7 @@ id: T-U2
 title: Parts browser panel — federated search, detail card, insert
 workstream: U
 owner: sonnet-page
-status: review
+status: done
 branch: task/T-U2-ui
 day: 2
 priority: 2

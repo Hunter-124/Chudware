@@ -123,6 +123,10 @@ register_sourcing_tools(mcp)
 from mcp_server.cost_tools import register_cost_tools
 register_cost_tools(mcp)
 
+# Spec-sheet matching — deterministic part-number → standard-part model (BOLTS/KiCad, workstream B).
+from mcp_server.spec_tools import register_spec_tools
+register_spec_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

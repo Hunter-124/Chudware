@@ -63,6 +63,8 @@
 | cairosvg (T-F14, optional) | LGPL-3.0 | best-effort SVG preview | ok (**import-only**, feature-detected, never bundled or required — LGPL dynamic posture per the Netgen precedent) |
 | pandoc (T-F14, optional) | GPL-2+ | markup conversion | **subprocess-only**, PATH-discovered, never bundled (mere aggregation — same isolation policy as ngspice) |
 | LibreOffice headless (T-F14, optional) | MPL-2.0 | office → PDF for `render_document` previews | **subprocess-only**, PATH-discovered, never bundled |
+| **BOLTS** (boltsparts) | **GPL-3.0** | standard-part spec reference | **NEVER vendored or linked** (T-B4). Same clean-room posture as KiCad: we learn the `.blt` *format* (documented → interop) and reimplement; no BOLTS data or code enters the tree. A user may point our loader at their own BOLTS checkout (their license, their choice). |
+| clean-room ISO/DIN part tables (`engine_oracle/data/bolts/*.blt.yaml`) | project (dimensional data) | deterministic spec-sheet lookup (T-B4) | ok — published ISO/DIN **nominal dimensions are not copyrightable** (same posture as the IPC-7351 row below); transcribed from our own `agent/prompts/shared/cheatsheets/hardware.md` + `core/parts/parts_data.h`, NOT from BOLTS. GPL-clean. |
 
 Rules:
 - Adding any dependency requires a row here in the same change.

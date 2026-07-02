@@ -103,13 +103,13 @@ graph TD
   subgraph WS_P["workstream P"]
     T_P1["T-P1: Unified parts library v1 - parts/1 contract, federated search core, first two adapters"]:::done
     T_P2["T-P2: Unified parts library v2 - all-domain adapters + live vendor federation"]:::done
-    T_P3["T-P3: Unified parts library v3 - part_place insertion parity + agent wiring + demo"]:::todo
+    T_P3["T-P3: Unified parts library v3 - part_place insertion parity + agent wiring + demo"]:::done
   end
   subgraph WS_Q["workstream Q"]
     T_Q1["T-Q1: Packaging & first-run — Linux+Windows installers, dependency bundling"]:::todo
     T_Q2["T-Q2: Autosave, crash recovery & consent-tied diagnostics"]:::todo
     T_Q3["T-Q3: Sample project gallery + guided tours"]:::todo
-    T_Q4["T-Q4: User manual auto-generation — cad_guide + inventory → living docs"]:::todo
+    T_Q4["T-Q4: User manual auto-generation — cad_guide + inventory → living docs"]:::doing
   end
   subgraph WS_U["workstream U"]
     T_U1["T-U1: UI kit: style-conformance scaffold + pattern library for all new feature panels"]:::todo

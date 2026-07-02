@@ -3,7 +3,7 @@ id: T-P3
 title: Unified parts library v3 - part_place insertion parity + agent wiring + demo
 workstream: P
 owner: sonnet-moor
-status: review
+status: done
 branch: task/T-P3-parts-library
 day: 3
 depends_on: [T-P2]

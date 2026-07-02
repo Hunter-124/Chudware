@@ -948,6 +948,154 @@ def test_new_part_seeds_volume_baseline_for_write_diff():
     assert cad_tools._LAST_VOLUME[doc] == r2["volume_mm3"], "baseline updated to the new volume"
 
 
+# ================================================================ AI-experience lane
+# Appended tests (HANDOFF_AI_EXPERIENCE §TODO-2 TESTS-MCP): feature-overlap detection,
+# add_features overlap warnings, coincident-contact interference, and the render caption.
+
+# --- pytest import-shadow repair --------------------------------------------------------
+# Under `python3 -m pytest services/mcp/test_cad_tools.py` pytest's default (prepend)
+# import mode names this module `mcp.test_cad_tools` — this directory has an __init__.py,
+# so the PACKAGE `mcp` becomes services/mcp, shadowing the `mcp` SDK that mcp_server's
+# tool modules import (`from mcp.server.fastmcp import FastMCP`). Repair sys.modules:
+# load the real SDK package as `mcp`, keeping this directory on its __path__ so pytest
+# can still import sibling test modules as `mcp.test_*`. (Runs at import time, before
+# any test body executes; a no-op when `mcp` already resolves to the real SDK — e.g.
+# when run by path as `mcp_server/test_cad_tools.py`.)
+import importlib.util
+
+
+def _unshadow_mcp_sdk() -> None:
+    _here = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+    shadow = sys.modules.get("mcp")
+    sfile = getattr(shadow, "__file__", None)
+    if shadow is None or not sfile or os.path.dirname(os.path.realpath(sfile)) != _here:
+        return  # `mcp` is absent or already the real SDK — nothing to repair
+    for p in list(sys.path):
+        init = os.path.join(os.path.abspath(p or os.getcwd()), "mcp", "__init__.py")
+        if os.path.isfile(init) and os.path.dirname(os.path.realpath(init)) != _here:
+            spec = importlib.util.spec_from_file_location(
+                "mcp", init, submodule_search_locations=[os.path.dirname(init), _here])
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["mcp"] = module  # must be visible to the SDK's own imports
+            spec.loader.exec_module(module)
+            return
+    raise ImportError("could not locate the real `mcp` SDK to un-shadow services/mcp")
+
+
+_unshadow_mcp_sdk()
+
+
+def test_check_feature_overlap_clean_part():
+    """A part whose features don't collide reports no pairs and no dead features."""
+    r, _ = _call("new_part", {"name": "ov_clean"})
+    doc = r["doc_id"]
+    r1, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(40), "width": cb.dim(30), "height": cb.dim(20)})]})
+    assert r1["ok"], r1
+    ov, _ = _call("check_feature_overlap", {"doc_id": doc})
+    assert ov["ok"] is True, ov
+    assert ov["pairs"] == [] and ov["dead_features"] == [], ov
+    assert "No feature overlap" in ov["summary"], ov
+
+
+def test_check_feature_overlap_boss_swallowed():
+    """A cut that erases an EARLIER boss entirely is flagged kind=boss_swallowed — the only
+    overlap kind that sets ok:false — and the boss lands in dead_features (it owns no
+    surviving faces)."""
+    r, _ = _call("new_part", {"name": "ov_swallow"})
+    doc = r["doc_id"]
+    r1, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Base", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(10)})]})
+    assert r1["ok"], r1
+    # A boss pin through the plate (r4, taller than the plate)...
+    r2, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("cylinder", "Boss", {"radius": cb.dim(4), "height": cb.dim(30)})]})
+    assert r2["ok"], r2
+    boss_id = r2["features"][-1]["id"]  # `features` lists the WHOLE tree's rebuild status
+    # ...then a WIDER, taller coaxial cut removes the whole boss (plus a hole in the base).
+    r3, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("cylinder", "Kill",
+                {"radius": cb.dim(6), "height": cb.dim(40), "mode": "cut"})]})
+    assert r3["ok"], r3
+    kill_id = r3["features"][-1]["id"]
+
+    ov, _ = _call("check_feature_overlap", {"doc_id": doc})
+    assert ov["ok"] is False, ov  # boss_swallowed is the one kind that fails the check
+    swallowed = [p for p in ov["pairs"] if p["kind"] == "boss_swallowed"]
+    assert len(swallowed) == 1, ov["pairs"]
+    assert swallowed[0]["a"] == boss_id and swallowed[0]["b"] == kill_id, swallowed
+    assert swallowed[0]["volume_mm3"] > 0, swallowed
+    assert boss_id in ov["dead_features"], ov
+    assert "boss_swallowed" in ov["summary"], ov["summary"]
+
+
+def test_add_features_attaches_overlap_warnings():
+    """add_features runs the batch-scoped overlap check automatically and attaches
+    `overlap_warnings` when the new batch collides with the existing tree (B3)."""
+    r, _ = _call("new_part", {"name": "ov_warn"})
+    doc = r["doc_id"]
+    r1, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Base", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(10)})]})
+    assert r1["ok"], r1
+    assert not r1.get("overlap_warnings"), r1  # first feature alone: nothing to collide with
+    # A boss cylinder overlapping the base volume -> the batch return warns boss_overlap.
+    r2, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("cylinder", "Boss", {"radius": cb.dim(4), "height": cb.dim(30)})]})
+    assert r2["ok"], r2
+    warn = r2.get("overlap_warnings")
+    assert warn, r2
+    assert warn["pairs"] and warn["pairs"][0]["kind"] == "boss_overlap", warn
+    assert warn["summary"], warn
+    assert warn.get("dead_features") == [], warn
+
+
+def test_check_interference_include_coincident_contacts():
+    """include_coincident classifies exactly-touching bodies as `contacts` (the SolidWorks
+    'coincident faces' case) instead of burying them in clearances; without the flag the
+    same pair reports as a 0-distance clearance."""
+    r, _ = _call("new_part", {"name": "touch"})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "B", {"length": cb.dim(40), "width": cb.dim(40), "height": cb.dim(40)})]})
+    # A copy shifted by EXACTLY the box length -> faces touch at x=20, zero overlap.
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("transform", "Dup", {"translate": [40, 0, 0], "copy": True})]})
+
+    ci, _ = _call("check_interference", {"doc_id": doc, "include_coincident": True})
+    assert ci["ok"] is True, ci  # touching is not interfering
+    assert ci["interferences"] == [], ci
+    assert len(ci["contacts"]) == 1, ci
+    assert ci["contacts"][0]["distance"] <= 1e-6, ci
+    assert ci["clearances"] == [], ci  # the pair moved out of clearances
+
+    ci2, _ = _call("check_interference", {"doc_id": doc})
+    assert ci2["ok"] is True, ci2
+    assert ci2["contacts"] == [], ci2
+    assert len(ci2["clearances"]) == 1 and ci2["clearances"][0]["distance"] <= 1e-6, ci2
+
+
+def test_render_part_caption_pairs_image_with_text():
+    """render_part returns [ImageContent, TextContent]: the PNG plus the deterministic
+    scene caption (mcp's _convert_to_content flattens the [Image, str] return), so a
+    non-vision model reading the transcript still gets signal from the render."""
+    doc = _new_plate_with_hole()
+    from mcp_server import server
+
+    # call_tool returns the bare flattened content list for image tools (no structured
+    # result) — same shape test_render_part_returns_image hunts through.
+    result = asyncio.run(server.mcp.call_tool("render_part", {"doc_id": doc}))
+    content = result[0] if isinstance(result, tuple) else result
+    image = _find_image(content)
+    assert image is not None, f"no ImageContent in {content!r}"
+    assert getattr(image, "mimeType", "").startswith("image/") and image.data, image
+    texts = [c for c in content if getattr(c, "type", "") == "text"]
+    assert texts, f"no TextContent caption in {content!r}"
+    caption = texts[0].text
+    assert "iso view of a" in caption, caption
+    assert "60x40x10 mm" in caption, caption
+    assert "occlusion not modeled" in caption, caption
+
+
 if __name__ == "__main__":
     import sys
 

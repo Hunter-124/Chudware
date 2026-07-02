@@ -2,6 +2,8 @@
 
 *Status: design writeup, 2026-06-26. No code changed — this is a review + proposal while the GUI rework is in flight.*
 
+*Status update, 2026-07-01 (AI-experience lane):* Stages 0–2a of Part 3 had already shipped in earlier waves (`describe_part`/`describe_sketch`/`describe_scene` text channel, owner_map join, cad_guide('gsl')). This lane added the remaining deterministic layer: **write-path warnings** (`check_feature_overlap` + `add_features` `overlap_warnings`, core `eval_feature_overlap` over `CompileResult::tool_recs`), **boolean compare** (`eval_compare` RPC → match_pct / missing / extra / residual regions), **face wires** (`doc_face_wires` → doc-schema sketch entities, exposed as `convert_face_to_sketch`), and the **deterministic reverse-engineering pipeline** (`services/mcp/recon_tools.py` `reverse_engineer`: 5-pass recognition → checkpointed rebuild → eval_compare gating). Measured residual now exists: `docs/RECOGNITION_RESIDUAL.md` — deterministic recon is sufficient (NO-GO for GNN) on turned/plate/pocketed/bladed families; adapter training justified (GO) only for ribbed_bracket, shelled_enclosure, swept_pipe, per the §3.4/§3.6 gate.
+
 This document answers three questions:
 
 1. **How does CAD geometry actually reach the model today?** (a complete channel map, code-grounded)

@@ -60,6 +60,12 @@ register_cad_tools(mcp)
 from mcp_server.gsl_tools import register_gsl_tools
 register_gsl_tools(mcp)
 
+# Recon — reverse-engineering: import a STEP/mesh → deterministic feature recognition → an
+# EDITABLE parametric tree, verified against the source solid by boolean comparison
+# (reverse_engineer / compare_parts / convert_face_to_sketch; guide: cad_guide("reverse")).
+from mcp_server.recon_tools import register_recon_tools
+register_recon_tools(mcp)
+
 # Intake — photo-measurement + manufacturing-clarification + first-try-fit. resolve/set process,
 # request/submit photos, confirm critical dims, dfm_check, fit_report, make_fit_coupon.
 from mcp_server.intake_tools import register_intake_tools

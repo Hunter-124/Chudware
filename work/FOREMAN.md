@@ -199,3 +199,4 @@ All branches at status:review. Trivial `services/mcp/server.py` append conflicts
 - 2026-07-02T18:40Z Fable PROCESS-EXIT AUDIT: supervisor host process restarted; all 6 in-flight drivers died mid-task but ALL pushed work survived on branches (F8 impl, H5 impl, H7 36-test, E5 54-test, F6 mid-fix; A1 uncommitted-in-worktree salvage). Redispatched 6 finishers: sonnet-rune T-F8, sonnet-vela T-H5, sonnet-jet T-H7, sonnet-oak T-E5, sonnet-pim T-F6, sonnet-ash T-A1 (reclaim). Erik is starting parallel Opus sessions on a second account for T-C2/T-D2/T-H8 (prompts issued by foreman)
 - 2026-07-02T17:44Z opus-dawn CLAIMED T-D2 (chained off task/T-D1-structural-schema-scaffold; merge order D1 → D2)
 - 2026-07-02T19:10Z sonnet-ash RECLAIMED T-A1 (recovery: sonnet-dane died pre-first-commit; worktree work salvaged)
+- 2026-07-02 opus-hex CLAIMED T-H8 (based on H3 + merged H4; merge order (H3+H4) → H8)

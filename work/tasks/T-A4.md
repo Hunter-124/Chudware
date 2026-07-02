@@ -2,7 +2,7 @@
 id: T-A4
 title: Verify nodes and DAG MCP tools
 workstream: A
-owner: Bruh
+owner: unassigned
 status: todo
 branch: task/T-A4-verify-nodes-mcp
 day: 4

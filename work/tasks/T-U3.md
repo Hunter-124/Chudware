@@ -3,7 +3,7 @@ id: T-U3
 title: CAM workspace UI — job tree, tool table, sim results, post/setup-sheet
 workstream: U
 owner: sonnet-quinn
-status: doing
+status: done
 branch: task/T-U3-ui
 day: 3
 priority: 2

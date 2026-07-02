@@ -513,6 +513,359 @@ def _scene_caption(doc_id: str, views: list) -> str:
     return " ".join(parts)
 
 
+# ================================================================ narration helpers (T-F7)
+
+
+def _gcode_digest(nc_text: str) -> dict:
+    """Parse G-code text for bounds (from G0/G1 moves), feed range, tool-change count.
+    Modal G-code interpretation — deterministic subset only. Never computes toolpath semantics."""
+    import re as _re
+    lines = nc_text.splitlines()
+
+    xs, ys, zs, feeds = [], [], [], []
+    tool_changes = 0
+    x_cur = y_cur = z_cur = None  # track modal position so we detect motion-line X/Y/Z words
+
+    for line in lines:
+        line = line.split(";")[0].split("(")[0].strip().upper()
+        # Tool changes: T<n> M6 pattern
+        if _re.search(r'\bM0*6\b', line):
+            tool_changes += 1
+        # Feed value
+        fm = _re.search(r'F([\d.]+)', line)
+        if fm:
+            try:
+                feeds.append(float(fm.group(1)))
+            except ValueError:
+                pass
+        # Coordinate words on G0/G1 lines (or modal continuation)
+        if _re.search(r'\bG0*[01]\b', line) or (x_cur is not None and _re.search(r'[XYZ][+-]?[\d.]', line)):
+            xm = _re.search(r'X([+-]?[\d.]+)', line)
+            ym = _re.search(r'Y([+-]?[\d.]+)', line)
+            zm = _re.search(r'Z([+-]?[\d.]+)', line)
+            if xm:
+                try:
+                    v = float(xm.group(1)); xs.append(v); x_cur = v
+                except ValueError:
+                    pass
+            if ym:
+                try:
+                    v = float(ym.group(1)); ys.append(v); y_cur = v
+                except ValueError:
+                    pass
+            if zm:
+                try:
+                    v = float(zm.group(1)); zs.append(v); z_cur = v
+                except ValueError:
+                    pass
+
+    def _rng(vals):
+        return [min(vals), max(vals)] if vals else [0.0, 0.0]
+
+    return {
+        "lines": len(lines),
+        "bounds": {"x": _rng(xs), "y": _rng(ys), "z": _rng(zs)},
+        "feed_min": min(feeds) if feeds else 0.0,
+        "feed_max": max(feeds) if feeds else 0.0,
+        "tool_changes": tool_changes,
+    }
+
+
+def _face_label(f: dict) -> str:
+    """'face <sid> (<surf> on <side>)' — the same sid namespace describe_part hands out."""
+    sid = f.get("sid", "?")
+    surf = f.get("surf", "?")
+    side = f.get("side")
+    return f'face {sid} ({surf} on {side})' if side else f'face {sid} ({surf})'
+
+
+def _study_bc_faces(doc_id: str, study: dict) -> dict:
+    """Sid join for the study's boundary conditions: resolve the STORED fixture/load face
+    queries (persisted as the original plain-English queries by _persist_study) against the
+    CURRENT face layer — the same sid namespace describe_part uses. Returns
+    {"fixed": [labels], "loaded": [labels]}; each list empty when a query no longer resolves
+    (the caller degrades gracefully). The per-node stress field is NOT persisted in the study
+    record, so the max-stress node cannot be located from stored data — the loaded faces are
+    the traceable stand-in for where the load (and typically the stress path) enters the part."""
+    out: dict = {"fixed": [], "loaded": []}
+    try:
+        faces = cb.call("doc_query", {"doc_id": doc_id,
+                                      "query": {"of": "face"}}).get("matches", [])
+        by_side: dict = {}
+        for f in faces:
+            if f.get("side"):
+                by_side.setdefault(f["side"], []).append(f)
+
+        def _resolve(q) -> list:
+            # A stored query is either a plain side name ("bottom") or a structured
+            # {"of":"face","side":...} dict — match by side against the live face list.
+            side = q if isinstance(q, str) else (q.get("side") if isinstance(q, dict) else None)
+            return by_side.get(side, []) if side else []
+
+        for q in study.get("fixtures") or []:
+            out["fixed"].extend(_face_label(f) for f in _resolve(q))
+        for ld in study.get("loads") or []:
+            if isinstance(ld, dict) and "face" in ld:
+                out["loaded"].extend(_face_label(f) for f in _resolve(ld["face"]))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _describe_toolpaths_text(job_id: Optional[str] = None) -> str:
+    """Narrate a CAM job's toolpaths — data from cam_tree, cam_simulate, cam_post only."""
+    from mcp_server.cam_tools import _CAM  # shared job state  # noqa: PLC0415
+
+    jid = job_id or _CAM.get("doc_id")
+    if not jid:
+        return _dumps({"ok": False, "error": "No CAM job. Call cam_new_job first."})
+
+    # 1. Job tree — authoritative source for ops, tools, setup hierarchy.
+    # cam_tree returns {"revision", "tree": {id,name,units,post,tools,setups}, "stats"}
+    # (core/cam/session.cpp tree_of) — the job payload is nested under "tree".
+    try:
+        tree_r = cb.call("cam_tree", {"doc_id": jid})
+    except Exception as e:  # noqa: BLE001
+        return _dumps({"ok": False, "error": f"cam_tree failed: {e}"})
+
+    tree = tree_r.get("tree") or {}
+    job_name = tree.get("name", "CAM Job")
+    setups = tree.get("setups", [])
+    tools_by_num = {t["number"]: t for t in tree.get("tools", [])}
+
+    total_ops = sum(len(s.get("operations", [])) for s in setups)
+    lines = [f'CAM job "{job_name}" — {len(setups)} setup(s), {total_ops} operation(s) total']
+
+    # 2. Simulation results (best-effort). cam_simulate returns {"results": [SimResult...]}
+    # with per-setup keys machined_fraction (0..1), cycle_time_s, gouges, rapid_collisions
+    # (core/cam/stock_sim.cpp SimResult::to_json) — narrated verbatim, never recomputed.
+    sim_by_setup: dict = {}
+    sim_available = False
+    try:
+        sim_r = cb.call("cam_simulate", {"doc_id": jid,
+                                         "options": {"resolution": 0.5,
+                                                     "check_gouge": True,
+                                                     "check_rapid": True}})
+        for s in sim_r.get("results", []):
+            sim_by_setup[s.get("setup_id")] = s
+        sim_available = True
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 3. G-code digest (best-effort). cam_post returns {ok, gcode, line_count, tool_changes,
+    # est_time_s, warnings} (core/cam/post.cpp PostResult::to_json) — line/tool-change counts
+    # come from the post itself; only bounds + feed range are parsed from the emitted text.
+    post_r = None
+    gcode_text = None
+    try:
+        post_r = cb.call("cam_post", {"doc_id": jid,
+                                      "options": {"program_name": "AICAD",
+                                                  "program_number": 1000}})
+        gcode_text = post_r.get("gcode")
+    except Exception:  # noqa: BLE001
+        pass
+
+    for setup in setups:
+        setup_name = setup.get("name", "Setup")
+        machine_info = setup.get("machine") or {}
+        machine = machine_info.get("kind", "?") if isinstance(machine_info, dict) else str(machine_info)
+        ops = setup.get("operations", [])
+        setup_id = setup.get("id")
+
+        lines.append(f'\nSetup "{setup_name}" [{machine}] — {len(ops)} op(s)')
+
+        for op in ops:
+            op_name = op.get("name", op.get("type", "?"))
+            op_type = op.get("type", "?")
+            tool_num = op.get("tool_number") or op.get("tool", "?")
+            tool = tools_by_num.get(tool_num, {})
+            tool_type = tool.get("type", "?")
+            tool_diam = tool.get("diameter", "?")
+
+            lines.append(f'  Op "{op_name}" [{op_type}]: T{tool_num} {tool_type} ø{tool_diam}mm')
+
+            params = op.get("params", {}) or {}
+            stepdown = op.get("stepdown") or params.get("stepdown")
+            stepover = op.get("stepover") or params.get("stepover")
+            stock = op.get("stock_to_leave") or params.get("stock_to_leave")
+            engage = op.get("engage_pct") or params.get("engage_pct")
+
+            param_parts = []
+            if stepdown is not None:
+                param_parts.append(f"stepdown {stepdown:.3g}mm")
+            if stepover is not None:
+                param_parts.append(f"stepover {stepover:.3g}mm")
+            if stock is not None:
+                param_parts.append(f"stock-to-leave {stock:.3g}mm")
+            if param_parts:
+                lines.append(f'    {", ".join(param_parts)}')
+            if engage is not None:
+                lines.append(f'    Engage: {engage:.1f}%')
+
+        # Simulation for this setup — SimResult keys narrated verbatim; machined_fraction
+        # is a 0..1 fraction, formatted as a percentage (formatting, not recomputation).
+        sim = sim_by_setup.get(setup_id)
+        if sim:
+            frac = sim.get("machined_fraction")
+            cycle = sim.get("cycle_time_s")
+            gouges = sim.get("gouges", 0)
+            rapids = sim.get("rapid_collisions", 0)
+            remaining = sim.get("remaining_volume_mm3")
+            sim_parts = []
+            if frac is not None:
+                sim_parts.append(f"machined {frac * 100.0:.1f}%")
+            if remaining is not None:
+                sim_parts.append(f"remaining stock {remaining:.0f} mm3")
+            if cycle is not None:
+                sim_parts.append(f"cycle ~{cycle:.1f}s")
+            lines.append(f'  Simulation: {", ".join(sim_parts) if sim_parts else "no data"}'
+                         '  (source: cam_simulate)')
+            lines.append(f'  Gouges: {gouges}; rapid-through-stock collisions: {rapids}'
+                         '  (source: cam_simulate)')
+        elif not sim_available:
+            lines.append('  Simulation: not run — call cam_simulate for cycle time and gouge checks')
+        else:
+            lines.append('  Simulation: no data for this setup')
+
+    # G-code digest — one per posted program (cam_post posts the whole job).
+    if gcode_text:
+        digest = _gcode_digest(gcode_text)
+        b = digest["bounds"]
+        n_lines = post_r.get("line_count", digest["lines"])
+        n_tc = post_r.get("tool_changes", digest["tool_changes"])
+        est = post_r.get("est_time_s")
+        est_txt = f', est. time {est:.1f}s' if isinstance(est, (int, float)) else ""
+        lines.append(
+            f'\nG-code digest (source: cam_post): {n_lines} lines, '
+            f'bounds X[{b["x"][0]:.3g}..{b["x"][1]:.3g}] '
+            f'Y[{b["y"][0]:.3g}..{b["y"][1]:.3g}] '
+            f'Z[{b["z"][0]:.3g}..{b["z"][1]:.3g}] mm, '
+            f'feed {digest["feed_min"]:.0f}–{digest["feed_max"]:.0f} mm/min, '
+            f'{n_tc} tool change(s){est_txt}'
+        )
+    else:
+        lines.append('\nG-code: not available — run cam_post first')
+
+    if not setups:
+        lines.append('No setups configured — call cam_add_setup to add one.')
+
+    lines.append('\n(Source: cam_job_tree, cam_simulate, cam_post — numbers narrated, never recomputed)')
+    return _dumps({"ok": True, "text": "\n".join(lines)})
+
+
+def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str:
+    """Narrate FEA/CFD results — data from the doc's persisted studies (sim_study_list, the
+    same records _persist_study writes after every solve) — never recomputed."""
+    studies = []
+    try:
+        studies_r = cb.call("sim_study_list", {"doc_id": doc_id})
+        studies = studies_r.get("studies", [])
+    except Exception:  # noqa: BLE001
+        pass
+
+    if not studies:
+        return _dumps({"ok": True, "text":
+                       "No simulation results attached — "
+                       "run run_fea_static or run_fea_modal first."})
+
+    if study_name:
+        study = next((s for s in studies if s.get("name") == study_name), None)
+        if not study:
+            return _dumps({"ok": False,
+                           "error": f"No study named {study_name!r}. "
+                                    f"Available: {[s.get('name') for s in studies]}"})
+    else:
+        study = studies[-1]
+
+    stype = study.get("type", "unknown")
+    sname = study.get("name", "Study")
+    mat = study.get("material", {}) or {}
+    mat_name = mat.get("name", "unknown")
+    yield_mpa = mat.get("yield_mpa")
+    results = study.get("results", {}) or {}
+
+    lines = [f'FEA results — "{sname}" ({stype})']
+
+    mat_src = {"fea_static": "run_fea_static", "fea_modal": "run_fea_modal",
+               "cfd_flow": "run_cfd_flow"}.get(stype, "the study record")
+    if yield_mpa is not None:
+        lines.append(f'Material: {mat_name} (yield {yield_mpa:.1f} MPa, '
+                     f'source: {mat_src} material record)')
+    elif mat_name != "unknown":
+        lines.append(f'Material: {mat_name} (yield not specified)')
+
+    if stype == "fea_static":
+        vm = results.get("max_von_mises_mpa")
+        disp = results.get("max_disp_mm")
+        fos = results.get("min_fos")
+        n_dof = study.get("n_dof")
+        mesh_fine = study.get("mesh_fineness", 0.5)
+
+        lines.append('\nStatic stress:')
+        if vm is not None:
+            lines.append(f'  Max von Mises stress: {vm:.1f} MPa  (source: run_fea_static)')
+        else:
+            lines.append('  Max von Mises stress: not available')
+        bc = _study_bc_faces(doc_id, study)
+        if bc["fixed"]:
+            lines.append(f'  Fixed at: {", ".join(bc["fixed"][:4])}  (sid join of the stored '
+                         'fixture queries)')
+        if bc["loaded"]:
+            lines.append(f'  Load applied on: {", ".join(bc["loaded"][:4])}  (sid join of the '
+                         'stored load queries)')
+        lines.append('  Max-stress node location: not stored in the study record — the study '
+                     'persists summary scalars only; re-run run_fea_static for the live field.')
+
+        if disp is not None:
+            lines.append(f'  Max displacement: {disp:.3f} mm  (source: run_fea_static)')
+        else:
+            lines.append('  Max displacement: not available')
+
+        if fos is not None:
+            verdict = "holds" if fos >= 1.0 else "FAILS"
+            lines.append(f'  Min factor of safety: {fos:.2f}  '
+                         f'(yield / max stress; >1 means holds — {verdict})')
+            if yield_mpa is not None and vm is not None:
+                margin = yield_mpa - vm
+                direction = "above" if margin >= 0 else "below"
+                lines.append(f'  Margin: {abs(margin):.1f} MPa {direction} yield')
+        else:
+            lines.append('  Min factor of safety: not available')
+
+        if n_dof is not None:
+            lines.append(f'  Mesh: {n_dof} DOF  (mesh_fineness {mesh_fine:.2f}, tet10 elements)')
+
+        lines.append('\nConvergence note: tet10 (2nd-order) elements used; re-run with finer mesh '
+                     '(mesh_fineness → 0.8) to verify convergence for final design.')
+
+    elif stype == "fea_modal":
+        freqs = results.get("freqs_hz", [])
+        lines.append('\nModal frequencies:')
+        if freqs:
+            for i, f in enumerate(freqs, 1):
+                lines.append(f'  Mode {i}: {f:.1f} Hz  (source: run_fea_modal)')
+        else:
+            lines.append('  No frequency data available')
+        lines.append('\nNote: frequencies depend on boundary conditions and material density; '
+                     'rigid-body modes near 0 Hz indicate insufficient fixtures.')
+
+    elif "cfd" in stype:
+        lines.append('\nCFD results:')
+        for k, v in results.items():
+            if isinstance(v, (int, float)):
+                lines.append(f'  {k}: {v}  (source: run_cfd_flow)')
+
+    else:
+        lines.append(f'\nResults ({stype}):')
+        for k, v in results.items():
+            if isinstance(v, (int, float)):
+                lines.append(f'  {k}: {v}')
+
+    lines.append('\n(Source: sim_study_list — numbers narrated from the stored study, '
+                 'never recomputed)')
+    return _dumps({"ok": True, "text": "\n".join(lines)})
+
+
 def register_gsl_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
@@ -659,5 +1012,33 @@ def register_gsl_tools(mcp: FastMCP) -> None:
 
             lines.append("Computed from B-rep normals; occlusion not modeled.")
             return _dumps({"ok": True, "text": "\n".join(lines), "views": views_out})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    # ---------------------------------------------------------------- narration (T-F7)
+
+    @mcp.tool()
+    def describe_toolpaths(job_id: Optional[str] = None) -> str:
+        """Compact narrative of a CAM job's toolpaths and simulation results — use INSTEAD of
+        dumping the raw cam_job_tree JSON. Returns per-op strategy/tool/stepdown/engagement,
+        cycle-time and gouge/rapid checks from cam_simulate, and a G-code digest (bounds, feed
+        range, tool-change count) from cam_post. Narrates existing numbers only — never
+        recomputes. Call cam_generate + cam_simulate first for full results."""
+        try:
+            return _describe_toolpaths_text(job_id)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def describe_results(doc_id: Optional[str] = None, study_name: Optional[str] = None) -> str:
+        """Compact narrative of FEA/CFD simulation results — use INSTEAD of dumping raw study
+        JSON. Returns max von Mises stress, displacement, factor of safety, margin vs material
+        yield, the fixed/loaded faces named by sid (join of the stored fixture/load queries
+        against describe_part's face layer), modal frequencies in words, and mesh convergence
+        caveats. Narrates the doc's persisted studies (run_fea_static / run_fea_modal /
+        run_cfd_flow records) only — never recomputes. Returns a graceful 'no results
+        attached' message when no study exists."""
+        try:
+            return _describe_results_text(_doc(doc_id), study_name)
         except Exception as e:  # noqa: BLE001
             return _err(e)

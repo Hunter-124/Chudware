@@ -294,6 +294,157 @@ def test_describe_scene_default_views():
     assert set(r["views"]) == {"front", "right", "top", "iso"}, r["views"]
 
 
+# ---------------------------------------------------------------- describe_toolpaths
+
+
+def test_describe_toolpaths_no_job_graceful():
+    """describe_toolpaths with no active CAM job returns a graceful error, not a crash."""
+    from mcp_server.cam_tools import _CAM
+    old = _CAM.get("doc_id")
+    _CAM["doc_id"] = None
+    try:
+        r, _ = _call("describe_toolpaths", {})
+        # Should return JSON with ok:False and a message, not raise
+        assert r is not None
+        assert r.get("ok") is False or "no cam job" in str(r).lower() or "No CAM job" in str(r)
+    finally:
+        _CAM["doc_id"] = old
+
+
+def test_describe_toolpaths_narrates_job_sim_and_gcode():
+    """describe_toolpaths narrates the job/setup/op hierarchy from cam_job_tree, the
+    simulation numbers from cam_simulate, and the G-code digest from cam_post — every
+    section present, every number attributed to its source tool."""
+    rp, _ = _call("new_part", {"name": "cam_narr_plate"})
+    doc = rp["doc_id"]
+    ops = [cb.feat("box", "Plate",
+                   {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(10)})]
+    _call("add_features", {"ops": ops, "doc_id": doc})
+
+    rj, _ = _call("cam_new_job", {"name": "TestJob", "post": "grbl"})
+    assert rj.get("doc_id"), rj
+
+    _call("cam_add_tool", {"number": 1, "type": "endmill_flat", "diameter": 6.0})
+    rs, _ = _call("cam_add_setup", {"name": "Setup1", "machine": "mill3",
+                                    "material": "aluminum"})
+    ro, _ = _call("cam_add_operation", {"type": "face", "tool_number": 1,
+                                        "setup_id": rs["setup_id"], "name": "Face1"})
+    assert ro.get("op_id"), ro
+    _call("cam_generate", {})
+
+    r, _ = _call("describe_toolpaths", {})
+    assert r["ok"], r
+    text = r["text"]
+    # Header from cam_job_tree (nested "tree" payload).
+    assert 'CAM job "TestJob" — 1 setup(s), 1 operation(s) total' in text, text
+    assert 'Setup "Setup1" [mill3] — 1 op(s)' in text, text
+    # One op line: name [type]: Tn tool_type ødiam.
+    assert 'Op "Face1" [face]: T1 endmill_flat ø6.0mm' in text, text
+    # Simulation numbers attributed to cam_simulate (machined %, remaining stock, cycle).
+    assert "Simulation: machined " in text and "(source: cam_simulate)" in text, text
+    assert "remaining stock " in text and " mm3" in text, text
+    assert "Gouges: " in text and "rapid-through-stock collisions: " in text, text
+    # G-code digest attributed to cam_post: line count, bounds, feed range, tool changes.
+    assert "G-code digest (source: cam_post): " in text, text
+    assert " lines, bounds X[" in text and "] Y[" in text and "] Z[" in text, text
+    assert " mm/min, " in text and " tool change(s)" in text, text
+    # Trailing attribution line per contracts/narration.md.
+    assert ("(Source: cam_job_tree, cam_simulate, cam_post — numbers narrated, "
+            "never recomputed)") in text, text
+
+
+# ---------------------------------------------------------------- describe_results
+
+
+def test_describe_results_no_study_graceful():
+    """describe_results with no simulation attached returns the contract's exact
+    graceful-degradation phrase, not a crash or a silent omission."""
+    doc = _new_plate_with_hole()
+    r, _ = _call("describe_results", {"doc_id": doc})
+    assert r["ok"], r
+    assert "No simulation results attached — run run_fea_static or run_fea_modal first." \
+        in r["text"], r
+
+
+def _seed_static_study(doc: str) -> None:
+    """Persist a static study through sim_study_add — the SAME RPC _persist_study uses
+    after a real run_fea_static solve — so the narration is tested against a
+    deterministic fixture with known numbers (no solver / mesh nondeterminism)."""
+    cb.call("sim_study_add", {"doc_id": doc, "study": {
+        "type": "fea_static", "name": "Static stress (steel)", "engine": "cpp",
+        "material": {"name": "steel", "yield_mpa": 250.0, "E_mpa": 200000.0},
+        "fixtures": ["bottom"], "loads": [{"face": "top", "force": [0, 0, -100]}],
+        "mesh_fineness": 0.3,
+        "results": {"max_von_mises_mpa": 12.34567, "max_disp_mm": 0.004321,
+                    "min_fos": 15.0},
+        "n_dof": 3456,
+    }})
+
+
+def test_describe_results_static_study_exact_slots():
+    """Every static-study slot renders with the contract's fixed rounding and source
+    attribution: stress 0.1 MPa, displacement 3 dp, FoS 2 dp, margin, DOF, and the
+    fixture/load sid join against the live face layer."""
+    doc = _new_plate_with_hole()
+    _seed_static_study(doc)
+
+    r, _ = _call("describe_results", {"doc_id": doc})
+    assert r["ok"], r
+    text = r["text"]
+    assert 'FEA results — "Static stress (steel)" (fea_static)' in text, text
+    assert "Material: steel (yield 250.0 MPa, source: run_fea_static material record)" \
+        in text, text
+    # Fixed rounding per contracts/narration.md: 12.34567 -> 12.3 MPa (0.1 MPa),
+    # 0.004321 -> 0.004 mm (3 dp), FoS 2 dp, margin = 250.0 - 12.34567 -> 237.7 (0.1 MPa).
+    assert "Max von Mises stress: 12.3 MPa  (source: run_fea_static)" in text, text
+    assert "Max displacement: 0.004 mm  (source: run_fea_static)" in text, text
+    assert "Min factor of safety: 15.00" in text and "holds" in text, text
+    assert "Margin: 237.7 MPa above yield" in text, text
+    assert "Mesh: 3456 DOF  (mesh_fineness 0.30, tet10 elements)" in text, text
+    # Sid join: the stored fixture/load queries resolve to live face sids (F...).
+    assert "Fixed at: face F" in text and "on bottom" in text, text
+    assert "Load applied on: face F" in text and "on top" in text, text
+    # The per-node field is not persisted — the output says so instead of guessing.
+    assert "Max-stress node location: not stored in the study record" in text, text
+    assert "Convergence note: tet10" in text, text
+    assert ("(Source: sim_study_list — numbers narrated from the stored study, "
+            "never recomputed)") in text, text
+
+
+def test_describe_results_modal_study_and_named_lookup():
+    """Modal studies narrate one 0.1 Hz line per mode; study_name selects a specific
+    study when several are attached (default is the latest)."""
+    doc = _new_plate_with_hole()
+    _seed_static_study(doc)
+    cb.call("sim_study_add", {"doc_id": doc, "study": {
+        "type": "fea_modal", "name": "Modal (steel)", "engine": "cpp",
+        "material": {"name": "steel", "yield_mpa": 250.0},
+        "fixtures": ["bottom"], "n_modes": 3, "mesh_fineness": 0.5,
+        "results": {"freqs_hz": [101.5, 202.25, 350.0], "n_modes": 3},
+    }})
+
+    # Default: the LATEST study (the modal one).
+    r, _ = _call("describe_results", {"doc_id": doc})
+    assert r["ok"], r
+    text = r["text"]
+    assert 'FEA results — "Modal (steel)" (fea_modal)' in text, text
+    assert "Material: steel (yield 250.0 MPa, source: run_fea_modal material record)" \
+        in text, text
+    assert "Mode 1: 101.5 Hz  (source: run_fea_modal)" in text, text
+    assert "Mode 2: 202.2 Hz  (source: run_fea_modal)" in text, text
+    assert "Mode 3: 350.0 Hz  (source: run_fea_modal)" in text, text
+    assert "rigid-body modes near 0 Hz" in text, text
+
+    # Named lookup pulls the static study back.
+    r2, _ = _call("describe_results", {"doc_id": doc, "study_name": "Static stress (steel)"})
+    assert r2["ok"], r2
+    assert "Max von Mises stress: 12.3 MPa" in r2["text"], r2["text"]
+
+    # Unknown name: graceful error listing what IS attached.
+    r3, _ = _call("describe_results", {"doc_id": doc, "study_name": "nope"})
+    assert r3["ok"] is False and "No study named" in r3["error"], r3
+
+
 if __name__ == "__main__":
     if not cb.available():
         print("SKIP: libaicad not staged")

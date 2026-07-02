@@ -12,7 +12,12 @@ depends_on: []
 
 Agents generate assembly instructions, user manuals, and a UL/CE/FCC checklist per product category from the finished design.
 
+**Partially promoted 2026-07-02:** manual + assembly-instruction generation moved to
+workstream F (T-F14 deliverables scaffold, T-F15 templates — see
+`docs/AI_TOOLING_MASTER_PLAN.md` §Pillar 15). This backlog item now covers only the
+compliance-checklist half.
+
 ## Definition of done
 
-- [ ] manual_generate MCP tool producing md/pdf from doc + drawings
-- [ ] Compliance checklist template per product category
+- [ ] Compliance checklist template per product category (UL/CE/FCC), generated via
+      the T-F14 deliverables tools

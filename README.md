@@ -101,6 +101,15 @@ contract, image + camera intake, state→text narration for every domain (CAM, F
 assemblies — GSL everywhere), a converged provider/session layer (MCP-first, subscription
 session auth, BYO key, local models, company-hosted relay), and a trainable ≤4B local
 translator track — see [docs/AI_TOOLING_MASTER_PLAN.md](docs/AI_TOOLING_MASTER_PLAN.md).
+Cut as **workstream F** in [work/](work).
+
+**Deliverables & transparent agents** — agents produce everything an engineer ships
+(design-review decks, calc packages, BOM/cost workbooks, test reports, manuals) through
+open-source format engines (python-pptx/docx/openpyxl, LibreOffice + pandoc as
+subprocesses — we never write format parsers), with in-app previews and artifact cards;
+and every agent runs as a glass box — live plan/thought/action stream, steer-anytime
+(pause, answer, inject, replan), an autonomy dial from advisor to autonomous, and an
+editable design brief so intent is agreed before the run — master plan Pillars 14–15.
 
 **Sourcing + cost estimation** — priced BOMs with supplier lookups (Nexar/Digi-Key/Mouser),
 machining cost from CAM cycle-time, fabrication quotes (Xometry/JLCPCB), and a material-cost

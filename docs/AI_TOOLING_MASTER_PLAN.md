@@ -389,6 +389,59 @@ model, simulate, program, and re-plan:
   DRC/D-C/budget and returns a narrated verdict — the standard verify node.
 - **Escalation:** every node can raise `ask_user` (Pillar 9) with evidence instead of
   failing silently; autonomy dial decides whether it blocks.
+- **Mission-control UX (transparency + steering, user-mandated 2026-07-02):** the agent
+  is a glass box, not a spinner. The app shows, live and streaming: the current plan
+  (DAG run view fed by `describe_project`), the active node, each thought/action/tool
+  call as it happens (the host `activity_panel`/agent-step stream is the seed), and
+  every artifact produced (Pillar 15 cards). The user can steer AT ANY TIME: pause
+  (T-A3 `interrupt()`), answer/override open questions (Pillar 9), inject an
+  instruction, splice the plan (`dag_replan`), or turn the autonomy dial per-run and
+  per-node mid-flight. Autonomy balance is explicit: at `auto` the agent decides and
+  keeps a visible audit trail; at `approve` it proposes design criteria and decisions
+  as diffs the user accepts; at `manual` it drafts, the user drives. Intent
+  interpretation is a first-class step: vague prompts become an editable **design
+  brief** (requirements doc per T-BL09 schema) the user signs off before the run —
+  verify nodes then check against it, and "stay on track" suggestions are deviations
+  from that brief, with evidence.
+
+### Pillar 15 — Deliverables & document tooling (`services/deliverables/` + `deliverable_*` tools)
+
+Added 2026-07-02 (user-mandated): everything a professional engineer ships besides the
+CAD file itself — presentations, reports, calc packages, spreadsheets, manuals — must be
+producible by the built-in agents inside the one application, and previewable in-app.
+
+**Open-source-first (binding):** never build bespoke parsers/writers for common formats.
+Engines (license-guardrail compliant per CONTRIBUTING.md):
+
+| Capability | Engine | License | Mode |
+|---|---|---|---|
+| .pptx write | python-pptx | MIT | in-process |
+| .docx write | python-docx | MIT | in-process |
+| .xlsx read/write (real formulas) | openpyxl | MIT | in-process |
+| Charts/plots | matplotlib | PSF | in-process |
+| HTML/MD → PDF | WeasyPrint / reportlab | BSD | in-process |
+| Format conversion (md↔docx↔odt…) | pandoc | GPL | **subprocess only** |
+| Office → PDF (preview/export) | LibreOffice headless | MPL-2.0 | **subprocess** |
+| PDF → raster preview | pdfium (or poppler) | BSD (GPL) | pdfium in-process; poppler subprocess |
+
+- **Tool family:** `make_presentation(spec)`, `make_report(spec)`, `make_workbook(spec)`,
+  `make_manual(doc)`, `render_document(path) → preview PNGs`, `list_artifacts(run)`.
+  Spec-driven (JSON outline → template), so a 4B model can call them (rule §3.2).
+- **Provenance rule applies (§3.3):** template slots pull numbers from Pillar-11
+  describers, FEA/CFD results, BOM/cost rollups (WS-B), CAM setup sheets, and drawings —
+  the model composes and narrates, it never types a load-bearing numeral by hand.
+- **Standard engineering templates v1:** design-review deck (rendered views/contact
+  sheets, mass props, FEA margins, open risks); calc package (docx/pdf, equations +
+  assumptions + cited material data from Pillar 8); BOM/cost workbook (xlsx with live
+  formulas); test/verification report (requirements → evidence, T-BL09 join); assembly
+  instructions + user manual (absorbs backlog T-BL11's manual half).
+- **Universal preview:** one service-side `render_document` pipeline (LibreOffice→PDF→
+  raster for office formats; native for pdf/svg/png/csv/md) feeding an in-app preview
+  pane + Copilot **artifact cards** — every agent-produced file shows as a card with
+  thumbnail, open-externally, and regenerate actions. External MCP clients get the same
+  previews as image results.
+- Artifacts persist under the project (PDM-lite T-BL10 revisions them later) and are
+  listed by `describe_project` so a resumed agent knows what it already shipped.
 
 ## 3. Cross-cutting rules
 
@@ -404,6 +457,14 @@ model, simulate, program, and re-plan:
 5. **Licensing/monetization:** account-based authorization planned separately (trial/
    personal approval + commercial billing) — not designed here, but nothing in this plan
    may assume a specific license regime.
+6. **Open-source-first for commodity tooling:** file-format read/write, parsing,
+   previews, converters, and computer-interaction plumbing come from established OSS
+   libraries (MIT/BSD/Apache in-process; GPL/MPL subprocess-only; AGPL never — the
+   CONTRIBUTING.md guardrails). We build only the engineering-specific layer on top
+   (templates, provenance joins, GSL narration). Rebuilding a .docx writer is a bug.
+7. **Transparency by default:** every agent surface streams its plan, current action,
+   and tool calls to the UI as it runs, and every run is steerable (pause / answer /
+   inject / replan / autonomy dial) without killing it. No fire-and-forget agents.
 
 ## 4. Execution map (draft — placement decided in closing Q/A)
 
@@ -424,6 +485,10 @@ Proposed as **Workstream F** task files (claimable by autopilot agents) once app
 | T-F11 | 13 | Translator SFT v0 (Qwen3-4B + Gemma 3 4B runs) + GRPO polish + LM Studio serving (gated on T-F10 eval) | T-F10 |
 | T-F13 | 13 | Micro-evaluator #1: feature-recognition hypothesis ranker (gated on RECOGNITION_RESIDUAL) | — |
 | T-F12 | 14 | dag_replan + workflow templates + design_review battery | T-A4, T-F7 |
+| T-F14 | 15 | `contracts/deliverables.md` + `services/deliverables/` scaffold + OSS engine bundle + `make_*`/`render_document` tools | — |
+| T-F15 | 15 | Engineering deliverable templates v1 (deck, calc package, workbook, test report, manual) with provenance joins | T-F14 |
+| T-F16 | 15 | Universal in-app preview pane + Copilot artifact cards (service-side render_document pipeline) | T-F14 |
+| T-F17 | 14 | Mission-control UX: live plan/thought/action stream, steer-anytime, autonomy dial UI, design-brief elicitation | T-A3, T-F3 |
 
 Dependencies into the existing sprint: T-F4→T-A3 (gates), T-F12→T-A4 (verify nodes),
 research helpers feed WS-B T-B5 (spec-sheet AI path) and WS-D T-D4 (code-compliance RAG).
@@ -434,7 +499,9 @@ Asked 2026-07-02; user AFK, so these are recorded as recommendations, not decisi
 
 1. **Sequencing vs the 5-day sprint:** recommended — cut all T-F tasks into
    `work/tasks/` now; F1/F3/F5/F7/F9 have zero file overlap with workstreams A–E and
-   are immediately claimable by autopilot agents. **Blocked on user confirmation.**
+   are immediately claimable by autopilot agents. **CONFIRMED by Erik 2026-07-02**
+   (plan-audit session): workstream F cut into `work/tasks/` including the new
+   Pillar 15 tasks T-F14–T-F17.
 2. **First drivers:** recommended Pillar 8 (research tools — unblocks accurate answers
    for limited models and feeds T-B5/T-D4) and Pillar 11 (narration — biggest GSL gap
    and prerequisite for translator training data) in parallel.

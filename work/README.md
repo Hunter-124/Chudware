@@ -80,6 +80,7 @@ Run `validate` before committing.
 | C | Firmware / embedded | _teammate 2_ |
 | D | Civil / structural | _teammate 3_ |
 | E | Piping / hydraulics (sprint 2) | _unassigned_ |
+| F | AI experience: research/interaction/vision/narration/providers/translator/deliverables (docs/AI_TOOLING_MASTER_PLAN.md) | _agents_ |
 | G | GUI: polish, ShopCraft rename, ui/imgui migration, host/ deletion | Erik + agents |
 
 ## Special tasks: `owner: main-checkout`

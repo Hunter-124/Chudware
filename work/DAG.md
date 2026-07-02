@@ -46,6 +46,25 @@ graph TD
     T_E4["T-E4: 3D CFD handoff for pipe internals"]:::todo
     T_E5["T-E5: Oil-hydraulic circuit design (ISO 1219)"]:::todo
   end
+  subgraph WS_F["workstream F"]
+    T_F1["T-F1: Freeze research_tools contract, scaffold engine/research with web_search + fetch_page"]:::todo
+    T_F10["T-F10: gsl-ser/v1 serialization freeze + slot-fidelity eval harness + dataset factory"]:::todo
+    T_F11["T-F11: Translator SFT v0 + GRPO groundedness polish + local serving"]:::todo
+    T_F12["T-F12: dag_replan, workflow templates, and the design_review verify battery"]:::todo
+    T_F13["T-F13: Micro-evaluator 1 - feature-recognition hypothesis ranker"]:::todo
+    T_F14["T-F14: Deliverables contract + services/deliverables scaffold with OSS engines"]:::todo
+    T_F15["T-F15: Engineering deliverable templates v1 with provenance joins"]:::todo
+    T_F16["T-F16: Universal in-app preview pane + Copilot artifact cards"]:::todo
+    T_F17["T-F17: Mission-control UX - live plan/action stream, steer-anytime, design-brief flow"]:::todo
+    T_F2["T-F2: Research source helpers v1 + unified material registry seed"]:::todo
+    T_F3["T-F3: Freeze interaction contract - ask_user core, in-app dialog, MCP elicitation"]:::todo
+    T_F4["T-F4: Migrate intake, clarify, and DAG gates onto the interaction contract"]:::todo
+    T_F5["T-F5: Image ingestion v1 - real files, provider image slots, fiducial metrology"]:::todo
+    T_F6["T-F6: Guided multi-photo capture, phone handoff, photogrammetry to reverse_engineer"]:::todo
+    T_F7["T-F7: Freeze narration contract + describe_toolpaths + describe_results"]:::todo
+    T_F8["T-F8: describe_assembly, describe_board (GSL promotion), describe_project"]:::todo
+    T_F9["T-F9: Providers contract, tool registry/allow-listing, session-auth spike"]:::todo
+  end
   subgraph WS_G["workstream G"]
     T_G1["T-G1: Land the uncommitted GUI working tree in scoped commits"]:::todo
     T_G10["T-G10: ShopCraft rename tiers 2+3 - build targets, env vars, MCP id, appdata"]:::todo
@@ -109,6 +128,19 @@ graph TD
   T_E2 --> T_E3
   T_E2 --> T_E4
   T_E3 --> T_E5
+  T_F7 --> T_F10
+  T_F10 --> T_F11
+  T_A4 --> T_F12
+  T_F7 --> T_F12
+  T_F14 --> T_F15
+  T_F14 --> T_F16
+  T_A3 --> T_F17
+  T_F3 --> T_F17
+  T_F1 --> T_F2
+  T_F3 --> T_F4
+  T_A3 --> T_F4
+  T_F5 --> T_F6
+  T_F7 --> T_F8
   T_G9 --> T_G10
   T_G3 --> T_G10
   T_G10 --> T_G11

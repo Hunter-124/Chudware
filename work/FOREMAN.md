@@ -172,6 +172,7 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02T18:00Z sonnet-kilo CLAIMED T-F8 (chained off task/T-F7-narration-core; merge order F7 → {F10, F8})
 - 2026-07-02T18:30Z sonnet-cove CLAIMED T-F16-closeout (finishing fable-arc/OPUS-ARC's DoD checklist; impl untouched)
 - 2026-07-02T17:35Z Fable DISPATCHED wave 2 via chained branches (deps at review, unmerged — same approved pattern as B/E chains): sonnet-kilo T-F8 (off F7), sonnet-bree T-H5 (off H1), sonnet-thorn T-H7 (off H1, conforms to F9 providers/1), sonnet-lux T-E5 (off E3), sonnet-fenn T-F6 (off F5), sonnet-cove T-F16-closeout (finishing OPUS-ARC's checklist — 50+ min silent, presumed dead on budget); peer assignments: opus-vex T-B5 (off B4), opus-vale T-G6 (off G5, dedicated flock'd integrator). Deferred pending merges/deps: T-H8 (needs H3+H4 together), T-F4/T-F17/T-F12 (gated on unstarted WS-A T-A3/T-A4 — Erik: waive or start WS-A?), T-F11 (ship-gated), T-H6/H9/H10/H11 (later chain)
+- 2026-07-02T18:45Z sonnet-thorn CLAIMED T-H7 (chained off task/T-H1-telemetry-contract; merge order H1 → {H5, H7})
 
 ## MERGE PLAN for Erik (Fable, 2026-07-02T17:35Z — the whole queue, one pass)
 

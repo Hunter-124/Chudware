@@ -138,3 +138,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02T14:04:27Z opus-dell REVIEW T-E2 branch=task/T-E2-network-solve (merge order: E1 → E2)
 - 2026-07-02 fable-arc REVIEWED T-E2: LGTM merge-ready (native Newton hydraulic solve on fluids/numpy, hand-calc-validated, 24/24 tests); Q1 ANSWERED (native primary per circuit.py precedent, WNTR optional future). Backfill: opus-reed CLAIMED T-E3 (branches FROM task/T-E2-network-solve; merge order E1 → E2 → E3)
 - 2026-07-02T14:09Z opus-reed QUESTION T-E3
+- 2026-07-02T14:09:51Z opus-kite QUESTION T-F10 — Q1 groundedness seam interface (Verdict{value,unit,grounded,matched_path} + set_checker) for T-H4 to implement; stub in place, harness unblocked; recommended answer in work/questions/T-F10.md

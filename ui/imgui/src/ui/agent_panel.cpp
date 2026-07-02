@@ -1,6 +1,7 @@
 // Copilot pane: sessions UX, glass chat bubbles, composer prelude/toolbar (C3).
 #include "agent_panel.h"
 #include "activity_panel.h"
+#include "ask_dialog.h"
 #include "console_panel.h"
 #include "model_registry.h"
 #include "settings_modal.h"
@@ -830,6 +831,10 @@ void drawAgentPanel(AppState& s) {
         drawChatBody(s, busy, canRun);
         break;
     }
+
+    // Interaction contract §8 in-app-dialog transport: renders the pending ask_user
+    // batch (if any) as a modal, independent of which Copilot tab is active.
+    ui::drawAskDialog(s);
 
     (void)S;
 }

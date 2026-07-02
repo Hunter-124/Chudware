@@ -2,8 +2,8 @@
 id: T-D3
 title: Section libraries, D/C ratio checks, and struct_check MCP tool
 workstream: D
-owner: unassigned
-status: todo
+owner: sonnet-mave
+status: doing
 branch: task/T-D3-section-libraries-checks
 day: 3
 depends_on: [T-D2]

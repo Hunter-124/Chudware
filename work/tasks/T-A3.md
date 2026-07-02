@@ -2,8 +2,8 @@
 id: T-A3
 title: Human-in-the-loop gate nodes and autonomy dial
 workstream: A
-owner: Bruh
-status: todo
+owner: sonnet-hale2
+status: doing
 branch: task/T-A3-hitl-gates
 day: 3
 depends_on: [T-A2]

@@ -108,3 +108,10 @@ Rule: the ECAD default distribution stays **GPL-clean**, identical to the CAD po
 | **Argilla server** (Docker) | **Apache-2.0** | Self-hosted human-annotation UI + API (runs as a Docker container on hunter-pc/localhost) | ok — subprocess/Docker isolation; Apache-2.0. Not bundled with the desktop app. |
 | **pandas / pyarrow** | BSD-3 / Apache-2.0 | Argilla client transitive deps | ok — permissive; not shipped in desktop installer. |
 | **huggingface_hub / datasets** | Apache-2.0 | Argilla client transitive deps | ok — Apache-2.0; not shipped in desktop installer. |
+
+## Structural section data (T-D3)
+
+| item | license | role | posture |
+|---|---|---|---|
+| **AISC shapes curated table** (`engine_oracle/data/aisc_shapes/aisc_shapes_curated.json`) | n/a (dimensional facts) | AISC W/S/C section properties for D/C ratio checks | **Clean-room curated table of ~18 common shapes.** Property values (A, Ix, Sx, Zx, …) are dimensional facts re-stated from widely published engineering references (Salmon & Johnson *Steel Structures* 5th ed, NSAI, CISC Handbook) — *not* a bulk copy of the AISC Shapes Database compilation (whose license is not clearly public-domain). The numbers are physical facts of steel geometry; the AISC compilation's selection/layout/commentary is what is proprietary. Posture: same as `analysis.py` `_MATERIALS` block. See `work/questions/T-D3.md` Q1. For unlisted shapes, T-D4/T-D5 can accept a user-supplied AISC XLSX path at runtime (not bundled). |
+| **ANSI/AWC NDS Supplement lumber sizes** (`engine_oracle/data/lumber_table.json`) | n/a (public standard) | Dressed (S4S) lumber actual dimensions + section properties | **Public standard facts.** PS 20 (American Softwood Lumber Standard) dressed sizes are a federal/industry standard; dimensional facts are not copyrightable. Fb/Fc allowable-stress values used in `checks.py` are the same NDS Supplement Table 4A numbers reproduced in open structural textbooks. No NDS document text is copied. |

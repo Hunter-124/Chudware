@@ -1,0 +1,33 @@
+{
+  "_comment": "Nominal-to-actual dressed lumber dimensions and section properties.",
+  "_source": "American Softwood Lumber Standard (PS 20) dressed (S4S) sizes — public standard. Actual dimensions widely published in AWPA, WoodWorks, NDS Supplement (values are physical facts from a public standard, not a proprietary compilation). Section properties computed from actual b×d: A=b*d, Ix=b*d³/12, Iy=d*b³/12, Sx=b*d²/6, Sy=d*b²/6.",
+  "_units": {
+    "b_actual_mm": "actual breadth, mm (strong-axis dimension for flat-use)",
+    "d_actual_mm": "actual depth, mm",
+    "A_mm2": "mm²",
+    "Ix_mm4": "mm⁴ (strong axis: about x, bending in depth direction)",
+    "Sx_mm3": "mm³ (strong-axis elastic section modulus)",
+    "Iy_mm4": "mm⁴ (weak axis)",
+    "Sy_mm3": "mm³ (weak-axis elastic section modulus)"
+  },
+  "_note": "Actual dimensions: 2x = 38 mm (1.5 in), 3x = 64 mm (2.5 in), 4x = 89 mm (3.5 in), 6x = 140 mm (5.5 in), 8x = 184 mm (7.25 in), 10x = 235 mm (9.25 in), 12x = 286 mm (11.25 in). Depth: 4 = 89 mm, 6 = 140 mm, 8 = 184 mm, 10 = 235 mm, 12 = 286 mm. (1 in = 25.4 mm, rounded to 1 mm for standard dressed sizes.)",
+  "lumber": {
+    "2x4":  { "b_actual_mm": 38, "d_actual_mm": 89,  "A_mm2": 3382,  "Ix_mm4": 2.236e6,  "Sx_mm3": 5.025e4,  "Iy_mm4": 4.064e5,  "Sy_mm3": 2.140e4 },
+    "2x6":  { "b_actual_mm": 38, "d_actual_mm": 140, "A_mm2": 5320,  "Ix_mm4": 8.694e6,  "Sx_mm3": 1.242e5,  "Iy_mm4": 6.394e5,  "Sy_mm3": 3.365e4 },
+    "2x8":  { "b_actual_mm": 38, "d_actual_mm": 184, "A_mm2": 6992,  "Ix_mm4": 1.975e7,  "Sx_mm3": 2.147e5,  "Iy_mm4": 8.403e5,  "Sy_mm3": 4.423e4 },
+    "2x10": { "b_actual_mm": 38, "d_actual_mm": 235, "A_mm2": 8930,  "Ix_mm4": 4.117e7,  "Sx_mm3": 3.504e5,  "Iy_mm4": 1.074e6,  "Sy_mm3": 5.652e4 },
+    "2x12": { "b_actual_mm": 38, "d_actual_mm": 286, "A_mm2": 1.087e4,"Ix_mm4": 7.373e7,  "Sx_mm3": 5.156e5,  "Iy_mm4": 1.306e6,  "Sy_mm3": 6.874e4 },
+    "3x4":  { "b_actual_mm": 64, "d_actual_mm": 89,  "A_mm2": 5696,  "Ix_mm4": 3.766e6,  "Sx_mm3": 8.464e4,  "Iy_mm4": 1.944e6,  "Sy_mm3": 6.080e4 },
+    "3x6":  { "b_actual_mm": 64, "d_actual_mm": 140, "A_mm2": 8960,  "Ix_mm4": 1.464e7,  "Sx_mm3": 2.091e5,  "Iy_mm4": 3.057e6,  "Sy_mm3": 9.553e4 },
+    "3x8":  { "b_actual_mm": 64, "d_actual_mm": 184, "A_mm2": 1.178e4,"Ix_mm4": 3.327e7,  "Sx_mm3": 3.616e5,  "Iy_mm4": 4.015e6,  "Sy_mm3": 1.255e5 },
+    "4x4":  { "b_actual_mm": 89, "d_actual_mm": 89,  "A_mm2": 7921,  "Ix_mm4": 5.231e6,  "Sx_mm3": 1.175e5,  "Iy_mm4": 5.231e6,  "Sy_mm3": 1.175e5 },
+    "4x6":  { "b_actual_mm": 89, "d_actual_mm": 140, "A_mm2": 1.246e4,"Ix_mm4": 2.035e7,  "Sx_mm3": 2.907e5,  "Iy_mm4": 5.843e6,  "Sy_mm3": 1.314e5 },
+    "4x8":  { "b_actual_mm": 89, "d_actual_mm": 184, "A_mm2": 1.638e4,"Ix_mm4": 4.624e7,  "Sx_mm3": 5.027e5,  "Iy_mm4": 1.081e7,  "Sy_mm3": 2.430e5 },
+    "4x10": { "b_actual_mm": 89, "d_actual_mm": 235, "A_mm2": 2.092e4,"Ix_mm4": 9.630e7,  "Sx_mm3": 8.196e5,  "Iy_mm4": 1.382e7,  "Sy_mm3": 3.107e5 },
+    "4x12": { "b_actual_mm": 89, "d_actual_mm": 286, "A_mm2": 2.545e4,"Ix_mm4": 1.724e8,  "Sx_mm3": 1.205e6,  "Iy_mm4": 1.681e7,  "Sy_mm3": 3.778e5 },
+    "6x6":  { "b_actual_mm": 140, "d_actual_mm": 140, "A_mm2": 1.960e4,"Ix_mm4": 3.201e7,  "Sx_mm3": 4.572e5,  "Iy_mm4": 3.201e7,  "Sy_mm3": 4.572e5 },
+    "6x8":  { "b_actual_mm": 140, "d_actual_mm": 184, "A_mm2": 2.576e4,"Ix_mm4": 7.275e7,  "Sx_mm3": 7.908e5,  "Iy_mm4": 4.197e7,  "Sy_mm3": 5.996e5 },
+    "6x10": { "b_actual_mm": 140, "d_actual_mm": 235, "A_mm2": 3.290e4,"Ix_mm4": 1.515e8,  "Sx_mm3": 1.289e6,  "Iy_mm4": 5.360e7,  "Sy_mm3": 7.657e5 },
+    "6x12": { "b_actual_mm": 140, "d_actual_mm": 286, "A_mm2": 4.004e4,"Ix_mm4": 2.714e8,  "Sx_mm3": 1.898e6,  "Iy_mm4": 6.523e7,  "Sy_mm3": 9.319e5 }
+  }
+}

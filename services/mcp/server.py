@@ -71,6 +71,13 @@ register_recon_tools(mcp)
 from mcp_server.intake_tools import register_intake_tools
 register_intake_tools(mcp)
 
+# Interaction — the ONE ask_user seam (Pillar 9, contracts/interaction.md): typed questions
+# with suggested defaults surface as MCP elicitations; answers persist + replay via the shared
+# interaction core (services/agent/interaction.py). Callers (intake clarify, DAG gates) migrate
+# onto this in T-F4.
+from mcp_server.interaction_tools import register_interaction_tools
+register_interaction_tools(mcp)
+
 # ECAD (schematic / PCB / native circuit sim).
 from mcp_server.ecad_tools import register_ecad_tools
 register_ecad_tools(mcp)

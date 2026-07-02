@@ -95,6 +95,7 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 sonnet-tomo REVIEW T-H4 branch=task/T-H4-verifier-battery
 - 2026-07-02 sonnet-tomo QUESTION T-H4 (coordination notes only, non-blocking: T-F10 groundedness ownership, T-H3 req_join stub — work/questions/T-H4.md on the branch)
 - 2026-07-02 sonnet-mira CLAIMED T-G2
+- 2026-07-02 sonnet-mira REVIEW T-G2 branch=task/T-G2-doc-tab-input-fix
 
 ## For Erik (batched by Fable — answered-where-possible, only true human calls land here)
 

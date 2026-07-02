@@ -33,9 +33,11 @@ import math
 import os
 from typing import Any, Optional
 
-from engine.piping import catalog, schema
+from engine.piping import catalog, properties, schema
 
 G = 9.80665  # m/s²
+R_UNIVERSAL = properties.R_UNIVERSAL  # J/(mol·K)
+P_ATM = properties.P_ATM              # Pa
 
 # Water @ 20 °C — the default fluid when the caller gives none.
 WATER = {"name": "water", "rho": 998.2, "mu": 1.002e-3}
@@ -468,19 +470,30 @@ def _link_flow(lk: _Link, dH: float) -> tuple[float, float]:
 
 
 def solve(doc: dict, *, boundary, fluid: Optional[dict] = None,
-          pumps: Optional[list] = None, tol_mm: float = _SNAP_TOL_MM,
+          pumps: Optional[list] = None, network_type: str = "liquid",
+          tol_mm: float = _SNAP_TOL_MM,
           max_iter: int = 100, tol_head: float = 1e-6) -> dict:
     """Solve an ``aicad.piping/1`` network for node heads/pressures + link flows.
 
     ``boundary`` is a list of node BCs (``{'node'|'at'|'run', ...}`` + one of ``head`` (m),
     ``pressure`` (kPa gauge), ``demand`` (m³/h) or ``demand_lps``); at least one fixed
-    head/pressure node is required. ``fluid`` = ``{'rho','mu'}`` (default water @20 °C).
-    ``pumps`` is an optional list of ``{'run', 'curve', 'speed_ratio', 'direction'}``.
+    head/pressure node is required. ``fluid`` selects the working fluid — ``None`` (water
+    @20 °C), an explicit ``{'rho','mu'}`` override, or a sourced lookup
+    ``{'name':'water'|'air'|'methane'|'natural_gas'|'nitrogen'|'carbon_dioxide', 'T':K, 'P':Pa}``
+    resolved through :mod:`engine.piping.properties`. ``pumps`` is an optional list of
+    ``{'run', 'curve', 'speed_ratio', 'direction'}``.
+
+    ``network_type`` selects the physics: ``"liquid"`` (incompressible head solve, the default)
+    or ``"gas"`` (isothermal-compressible mass-balance solve on absolute-pressure² — see
+    :func:`solve_gas`; requires a named gas ``fluid`` so molar mass / temperature are known).
 
     Returns a contract-shaped result: on success ``{"ok": True, "nodes": [...], "links": [...],
     "converged": bool, "iterations": int, ...}``; on failure ``{"ok": False, "reason", "hint"}``.
     Never raises for a modelling/data problem.
     """
+    if str(network_type).lower() in ("gas", "compressible"):
+        return solve_gas(doc, boundary=boundary, fluid=fluid, tol_mm=tol_mm,
+                         max_iter=max_iter)
     if schema.validate(doc):
         return _err("piping document failed schema validation",
                     hint="run engine.piping.schema.validate(doc) and fix the errors",
@@ -489,7 +502,9 @@ def solve(doc: dict, *, boundary, fluid: Optional[dict] = None,
         return _err("fluids library not installed",
                     hint="pip install fluids (MIT) to enable the hydraulic solve")
 
-    fl = dict(WATER); fl.update(fluid or {})
+    fl = properties.resolve_solver_fluid(fluid)
+    if not fl.get("ok", True) and "reason" in fl:
+        return fl
     rho, mu = fl["rho"], fl["mu"]
 
     ctx = _build_network(doc, fl, tol_mm)
@@ -663,7 +678,8 @@ def _assemble_result(ctx, nodes, links, H, fl, converged, it, max_imbalance) -> 
         "converged": converged,
         "iterations": it,
         "max_imbalance_m3h": round(max_imbalance * 3600.0, 6),
-        "fluid": {"name": fl.get("name", "custom"), "rho": rho, "mu": fl["mu"]},
+        "fluid": {"name": fl.get("name", "custom"), "rho": rho, "mu": fl["mu"],
+                  "source": fl.get("source"), "phase": fl.get("phase", "liquid")},
         "nodes": node_out,
         "links": link_out,
         "warnings": warnings,
@@ -748,3 +764,460 @@ def pressure_drop_report(doc: dict, result: Optional[dict] = None, *,
         else "underlying solve did not converge — pressures/flows are approximate",
         "next_actions": ["deliver the pressure-drop table or size a pump for total_dp_kpa"],
     }
+
+
+# ── compressible (gas) network solve ──────────────────────────────────────────
+#
+# Isothermal-compressible analogue of the incompressible head solve. The natural nodal
+# potential for steady isothermal gas flow is **absolute pressure squared** φ = P² (Pa²):
+# integrating the isothermal momentum + Darcy friction equation along a pipe gives, per link,
+#
+#     ṁ² · (f·L/D + ΣK) = (A² · M / (R·T·Z)) · (P_a² − P_b²)                        (Weymouth form)
+#
+# so mass flow ṁ ∝ √(Δφ) exactly as the incompressible link flow Q ∝ √(ΔH). Conserving **mass**
+# (not volume — volume is not conserved when density changes with pressure) at every node yields a
+# Newton solve on φ that is the direct compressible sibling of the head solve above, with the same
+# graph-Laplacian Jacobian, Reynolds-refreshed friction and backtracking line search. The small
+# ``2·ln(P_a/P_b)`` momentum term is neglected (Weymouth assumption; it is < a few % of f·L/D for
+# the L/D ratios of real pipe runs) and the gas is treated as ideal (Z = 1) — both documented.
+
+_PHI_JAC_FLOOR_FRAC = 1e-9   # |Δφ| floor (fraction of the potential scale) in the Jacobian only.
+
+
+def _gas_friction_factor(lk: _Link, mdot_abs: float, mu: float) -> float:
+    """Darcy friction factor from the mass-flux Reynolds number Re = ṁ·D/(A·μ)."""
+    from fluids import friction_factor
+    if lk.area <= 0:
+        return 0.02
+    Re = mdot_abs * lk.d_m / (lk.area * mu)
+    if Re < 2100:
+        return max(64.0 / max(Re, 1e-6), 1e-4)
+    return float(friction_factor(Re=max(Re, 1.0), eD=lk.eps / lk.d_m))
+
+
+def _gas_link_flow(lk: _Link, dphi: float, coef_geom: float,
+                   phi_floor: float) -> tuple[float, float]:
+    """Mass flow ṁ (kg/s, a→b positive) and conductance dṁ/dφ for a potential drop Δφ = φ_a−φ_b.
+
+    ``coef_geom`` = A²·M/(R·T·Z) for the link; the resistance is ``f·L/D + ΣK``.
+    """
+    ktot = lk.fd * lk.length_m / lk.d_m + lk.kfit
+    if ktot <= 0 or coef_geom <= 0:
+        return 0.0, 0.0
+    coef = coef_geom / ktot                       # ṁ² = coef·|Δφ|
+    mdot = math.copysign(math.sqrt(coef * abs(dphi)), dphi)
+    p = 0.5 * math.sqrt(coef / max(abs(dphi), phi_floor))
+    return mdot, p
+
+
+def _apply_gas_boundary(ctx, boundary, tol, rho_std) -> Optional[dict]:
+    """Fixed absolute-pressure² nodes + mass demands for the gas solve. Reuses ``_Node.head`` to
+    store φ = P_abs² (Pa²) and ``_Node.demand`` to store the mass demand (kg/s leaving)."""
+    nodes = ctx["nodes"]
+    links_by_id = {lk.id: lk for lk in ctx["links"]}
+    bcs = boundary if isinstance(boundary, list) else boundary.get("nodes", [])
+    n_fixed = 0
+    for bc in bcs:
+        idx = _resolve_node(bc, nodes, links_by_id, tol)
+        if idx is None:
+            return _err(f"boundary reference {bc!r} did not resolve to a node",
+                        hint="use {'node':'n0'} / {'at':[x,y,z]} / {'run':'r1','end':'start'}")
+        nd = nodes[idx]
+        if "pressure_abs" in bc:      # kPa absolute
+            p_abs = float(bc["pressure_abs"]) * 1000.0
+            nd.fixed, nd.head, n_fixed = True, p_abs * p_abs, n_fixed + 1
+        elif "pressure" in bc:        # kPa gauge -> absolute
+            p_abs = float(bc["pressure"]) * 1000.0 + P_ATM
+            nd.fixed, nd.head, n_fixed = True, p_abs * p_abs, n_fixed + 1
+        elif "mass_demand" in bc:     # kg/h leaving (+) / entering (−)
+            nd.demand += float(bc["mass_demand"]) / 3600.0
+        elif "std_demand" in bc or "demand" in bc:   # Nm³/h (standard volume) leaving (+)
+            q_std = float(bc.get("std_demand", bc.get("demand")))
+            nd.demand += q_std * rho_std / 3600.0
+    if n_fixed == 0:
+        return _err("gas network under-constrained: no fixed-pressure node",
+                    hint="give at least one boundary with 'pressure' (kPa gauge) or 'pressure_abs'")
+    return None
+
+
+def solve_gas(doc: dict, *, boundary, fluid: Optional[dict] = None,
+              tol_mm: float = _SNAP_TOL_MM, max_iter: int = 100,
+              tol_mass: float = 1e-9) -> dict:
+    """Isothermal-compressible pipe-network solve (see the module note above).
+
+    ``fluid`` must resolve to a **named gas** (``{'name':'natural_gas'|'methane'|'air'|
+    'nitrogen'|'carbon_dioxide', 'T':K, 'P':Pa}``) so molar mass + temperature are known.
+    ``boundary`` entries fix pressure (``pressure`` kPa gauge / ``pressure_abs`` kPa) or set a
+    demand (``mass_demand`` kg/h, or ``std_demand``/``demand`` in Nm³/h at 15 °C, 1 atm). At
+    least one fixed-pressure node is required. Returns node absolute/gauge pressures and per-link
+    mass flow, standard volumetric flow, mean velocity, Reynolds and pressure drop — contract-
+    shaped on any modelling failure.
+    """
+    if schema.validate(doc):
+        return _err("piping document failed schema validation",
+                    hint="run engine.piping.schema.validate(doc) and fix the errors",
+                    errors=schema.validate(doc))
+    if not have_fluids():
+        return _err("fluids library not installed",
+                    hint="pip install fluids (MIT) to enable the hydraulic solve")
+
+    fl = properties.resolve_solver_fluid(fluid)
+    if not fl.get("ok", True) and "reason" in fl:
+        return fl
+    if fl.get("phase") != "gas" or not fl.get("molar_mass"):
+        return _err("gas network solve needs a named compressible fluid with a molar mass",
+                    hint="pass fluid={'name':'natural_gas','T':288.15,'P':<line Pa>} "
+                         "(also air/methane/nitrogen/carbon_dioxide)")
+    M = fl["molar_mass"]
+    T = fl.get("T_K") or properties.STD_T
+    mu = fl["mu"]
+    rho_std = properties.STD_P * M / (R_UNIVERSAL * properties.STD_T)
+
+    ctx = _build_network(doc, fl, tol_mm)
+    if not ctx.get("nodes"):
+        return ctx
+    err = _apply_gas_boundary(ctx, boundary, tol_mm, rho_std)
+    if err:
+        return err
+
+    nodes, links = ctx["nodes"], ctx["links"]
+    for lk in links:
+        lk.flow = 1e-3  # kg/s seed (reuse .flow slot for mass flow in gas mode)
+
+    free = [nd.idx for nd in nodes if not nd.fixed]
+    pos = {idx: k for k, idx in enumerate(free)}
+    nfree = len(free)
+
+    fixed_phi = [nd.head for nd in nodes if nd.fixed]
+    phi0 = sum(fixed_phi) / len(fixed_phi)
+    phi = [nd.head if nd.fixed else phi0 for nd in nodes]
+    phi_floor = max(_PHI_JAC_FLOOR_FRAC * phi0, 1.0)
+
+    coef = {lk.id: lk.area ** 2 * M / (R_UNIVERSAL * T) for lk in links}
+
+    import numpy as np
+
+    def _residual(phiv) -> np.ndarray:
+        e = np.zeros(nfree)
+        for lk in links:
+            m, _ = _gas_link_flow(lk, phiv[lk.a] - phiv[lk.b], coef[lk.id], phi_floor)
+            lk.flow = m
+            if lk.a in pos:
+                e[pos[lk.a]] -= m
+            if lk.b in pos:
+                e[pos[lk.b]] += m
+        for nd in nodes:
+            if nd.idx in pos:
+                e[pos[nd.idx]] -= nd.demand
+        return e
+
+    converged = nfree == 0
+    it = 0
+    for it in range(1, max_iter + 1) if nfree else []:
+        for lk in links:
+            lk.fd = _gas_friction_factor(lk, max(abs(lk.flow), 1e-9), mu)
+
+        J = np.zeros((nfree, nfree))
+        e = np.zeros(nfree)
+        for lk in links:
+            m, p = _gas_link_flow(lk, phi[lk.a] - phi[lk.b], coef[lk.id], phi_floor)
+            lk.flow = m
+            a, b = lk.a, lk.b
+            if a in pos:
+                e[pos[a]] -= m
+                J[pos[a], pos[a]] -= p
+                if b in pos:
+                    J[pos[a], pos[b]] += p
+            if b in pos:
+                e[pos[b]] += m
+                J[pos[b], pos[b]] -= p
+                if a in pos:
+                    J[pos[b], pos[a]] += p
+        for nd in nodes:
+            if nd.idx in pos:
+                e[pos[nd.idx]] -= nd.demand
+
+        enorm = float(np.max(np.abs(e)))
+        if enorm < tol_mass:
+            converged = True
+            break
+        try:
+            dphi = np.linalg.solve(J, -e)
+        except np.linalg.LinAlgError:
+            return _err("singular gas system (disconnected network?)",
+                        hint="check that every node connects to a fixed-pressure node",
+                        iterations=it)
+
+        base = list(phi)
+        factor = 1.0
+        for _ls in range(40):
+            for idx in free:
+                cand = base[idx] + factor * float(dphi[pos[idx]])
+                phi[idx] = max(cand, 1.0)   # keep P² > 0 (physical)
+            if float(np.max(np.abs(_residual(phi)))) < enorm or factor < 1e-6:
+                break
+            factor *= 0.5
+
+    # settle mass flows against Reynolds-dependent friction at the converged potentials
+    for _ in range(60):
+        dmax = 0.0
+        for lk in links:
+            lk.fd = _gas_friction_factor(lk, max(abs(lk.flow), 1e-9), mu)
+            m, _ = _gas_link_flow(lk, phi[lk.a] - phi[lk.b], coef[lk.id], phi_floor)
+            dmax = max(dmax, abs(m - lk.flow))
+            lk.flow = m
+        if dmax < 1e-12:
+            break
+
+    imbalance = {nd.idx: (-nd.demand if not nd.fixed else 0.0) for nd in nodes}
+    for lk in links:
+        imbalance[lk.b] = imbalance.get(lk.b, 0.0) + lk.flow
+        imbalance[lk.a] = imbalance.get(lk.a, 0.0) - lk.flow
+    free_imb = [abs(v) for nd, v in imbalance.items() if not nodes[nd].fixed]
+    max_imbalance = max(free_imb) if free_imb else 0.0
+
+    return _assemble_gas_result(ctx, nodes, links, phi, fl, M, T, mu, rho_std,
+                                converged, it, max_imbalance)
+
+
+def _assemble_gas_result(ctx, nodes, links, phi, fl, M, T, mu, rho_std,
+                         converged, it, max_imbalance) -> dict:
+    node_out = []
+    for nd in nodes:
+        p_abs = math.sqrt(max(phi[nd.idx], 0.0))
+        node_out.append({
+            "id": nd.id, "xyz": nd.xyz, "fixed": nd.fixed,
+            "pressure_abs_kpa": round(p_abs / 1000.0, 3),
+            "pressure_kpa": round((p_abs - P_ATM) / 1000.0, 3),
+            "mass_demand_kgh": round(nd.demand * 3600.0, 5),
+        })
+    link_out = []
+    for lk in links:
+        m = lk.flow
+        p_a = math.sqrt(max(phi[lk.a], 0.0))
+        p_b = math.sqrt(max(phi[lk.b], 0.0))
+        p_mean = 0.5 * (p_a + p_b)
+        rho_mean = p_mean * M / (R_UNIVERSAL * T)
+        v = m / (lk.area * rho_mean) if lk.area and rho_mean else 0.0
+        Re = abs(m) * lk.d_m / (lk.area * mu) if lk.area else 0.0
+        link_out.append({
+            "id": lk.id, "from": nodes[lk.a].id, "to": nodes[lk.b].id,
+            "length_mm": round(lk.length_m * 1000.0, 2),
+            "id_mm": round(lk.d_m * 1000.0, 3),
+            "mass_flow_kgh": round(m * 3600.0, 5),
+            "std_flow_nm3h": round(m / rho_std * 3600.0, 4) if rho_std else 0.0,
+            "velocity_ms": round(v, 4),
+            "reynolds": round(float(Re), 1),
+            "friction_factor": round(lk.fd, 5),
+            "dp_kpa": round((p_a - p_b) / 1000.0, 4),
+            "k_total": round(lk.kfit, 4),
+        })
+    next_actions = ["deliver node pressures + mass/standard flows"] if converged else \
+        ["verify every run endpoint meets another run or a fixed-pressure boundary node"]
+    return {
+        "ok": True,
+        "network_type": "gas",
+        "converged": converged,
+        "iterations": it,
+        "max_imbalance_kgh": round(max_imbalance * 3600.0, 8),
+        "fluid": {"name": fl.get("name", "custom"), "phase": "gas",
+                  "molar_mass": M, "T_K": round(T, 3), "mu": mu,
+                  "rho_std_kgm3": round(rho_std, 5), "source": fl.get("source")},
+        "assumptions": ["isothermal", "ideal gas (Z=1)",
+                        "Weymouth form (2·ln(P1/P2) momentum term neglected)"],
+        "nodes": node_out,
+        "links": link_out,
+        "warnings": ctx["warnings"],
+        "hint": None if converged else
+        f"gas solve did not converge in {it} iterations "
+        f"(max node imbalance {max_imbalance * 3600.0:.3g} kg/h)",
+        "next_actions": next_actions,
+    }
+
+
+# ── pump/system operating point + NPSH margin ─────────────────────────────────
+
+def _system_head(system: dict, q_m3h: float) -> float:
+    """System-curve head (m) at flow ``q_m3h``: ``static_head_m + k · Q²`` (Q in m³/h)."""
+    return float(system.get("static_head_m", 0.0)) + float(system.get("k", 0.0)) * q_m3h * q_m3h
+
+
+def _interp_curve(pts: list, x: float) -> Optional[float]:
+    """Piecewise-linear interpolation of ``[[x,y],...]`` (sorted by x); ``None`` outside range."""
+    if not pts:
+        return None
+    if x < pts[0][0] or x > pts[-1][0]:
+        return None
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i]
+        x1, y1 = pts[i + 1]
+        if x0 <= x <= x1 and x1 > x0:
+            return y0 + (x - x0) * (y1 - y0) / (x1 - x0)
+    return pts[-1][1]
+
+
+def operating_point(pump_curve, *, system: Optional[dict] = None,
+                    doc: Optional[dict] = None, boundary=None, fluid: Optional[dict] = None,
+                    q_ref_m3h: Optional[float] = None,
+                    npshr_curve=None, suction: Optional[dict] = None,
+                    speed_ratio: float = 1.0) -> dict:
+    """Pump operating (duty) point + NPSH margin.
+
+    Intersects a **pump curve** H_pump(Q) with a **system curve** H_sys(Q) = static +
+    k·Q² to find the duty point (Q*, H*), then evaluates the NPSH margin there.
+
+    ``pump_curve`` — CSV text/path or a :func:`load_pump_curve` dict (flow m³/h, head m).
+    ``system`` — ``{"static_head_m": h0, "k": k}`` (Q in m³/h). If omitted, it is **derived**
+    from ``doc`` + ``boundary`` (+ ``fluid``): a solve at ``q_ref_m3h`` gives the network head
+    loss, so ``k = Δp_head / Q_ref²`` and the static lift from the fixed-node elevations.
+    ``suction`` — for NPSHa: ``{"pressure_kpa": gauge, "elevation_m": z (+ above pump),
+    "friction_m": suction-line loss, "atm_kpa": 101.325, "pvap_kpa": <override>}``. Vapour
+    pressure is otherwise looked up from ``fluid`` via :mod:`engine.piping.properties` (sourced).
+    ``npshr_curve`` — CSV text/path with ``flow,npshr`` (m) columns; NPSHr is interpolated at Q*.
+
+    Returns ``{"ok": True, "duty_point": {...}, "npsh": {...}, ...}`` or contract-shaped failure.
+    """
+    pump = pump_curve if isinstance(pump_curve, dict) and pump_curve.get("ok") else \
+        load_pump_curve(pump_curve, speed_ratio=speed_ratio)
+    if not pump.get("ok"):
+        return pump
+
+    derived = None
+    if system is None:
+        if doc is None or boundary is None:
+            return _err("operating_point needs a 'system' curve or a doc+boundary to derive one",
+                        hint="pass system={'static_head_m':h0,'k':k} or doc=<piping doc>, boundary=[...]")
+        system, derived = _derive_system_curve(doc, boundary, fluid, q_ref_m3h)
+        if isinstance(derived, dict) and derived.get("ok") is False:
+            return derived
+
+    # Intersect: g(Q) = H_pump(Q) − H_sys(Q). Bisect over the pump's flow range for the root.
+    pts = pump["points"]
+    q_lo, q_hi = pts[0][0], pts[-1][0]
+
+    def _g(q):
+        return _pump_head(pump, q / 3600.0) - _system_head(system, q)
+
+    g_lo, g_hi = _g(q_lo), _g(q_hi)
+    if g_lo < 0:
+        return _err("no operating point: system head exceeds pump shutoff head at zero flow",
+                    hint="the pump cannot meet the static lift — raise pump speed or lower static head",
+                    shutoff_head_m=pump["shutoff_head"], static_head_m=system.get("static_head_m"))
+    if g_hi > 0:
+        return _err("no operating point within the pump curve: pump head still exceeds system "
+                    "head at max curve flow",
+                    hint="extend the pump curve to higher flow, or the system is over-pumped",
+                    max_curve_flow_m3h=q_hi)
+    for _ in range(200):
+        q_mid = 0.5 * (q_lo + q_hi)
+        if _g(q_mid) > 0:
+            q_lo = q_mid
+        else:
+            q_hi = q_mid
+        if q_hi - q_lo < 1e-9:
+            break
+    q_star = 0.5 * (q_lo + q_hi)
+    h_star = _system_head(system, q_star)
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "duty_point": {"flow_m3h": round(q_star, 4), "head_m": round(h_star, 4),
+                       "flow_m3s": round(q_star / 3600.0, 8)},
+        "pump": {"shutoff_head_m": pump["shutoff_head"], "max_flow_m3h": pump["max_flow"],
+                 "speed_ratio": pump.get("speed_ratio", speed_ratio)},
+        "system_curve": {"static_head_m": system.get("static_head_m", 0.0), "k": system.get("k", 0.0)},
+        "warnings": [], "next_actions": ["confirm the duty point sits near the pump BEP"],
+    }
+    if derived:
+        result["system_curve"]["derived_from"] = derived
+
+    npsh = _npsh_margin(q_star, suction, fluid, npshr_curve)
+    result["npsh"] = npsh
+    if npsh.get("margin_m") is not None and npsh["margin_m"] < 0:
+        result["warnings"].append("NPSH margin negative — cavitation risk at the duty point")
+        result["next_actions"].insert(0, "raise suction pressure / lower NPSHr — cavitation risk")
+    return result
+
+
+def _derive_system_curve(doc, boundary, fluid, q_ref_m3h):
+    """Fit ``static + k·Q²`` from a network solve at a reference demand.
+
+    Static lift = fixed-node head difference (elevation + fixed pressure); ``k`` from the total
+    dynamic loss at ``q_ref`` divided by Q_ref². Returns ``(system_dict, derived_meta)``.
+    """
+    q_ref = float(q_ref_m3h) if q_ref_m3h else 50.0
+    demand_bc, fixed_bc = None, None
+    bcs = boundary if isinstance(boundary, list) else boundary.get("nodes", [])
+    probe = []
+    for bc in bcs:
+        b = dict(bc)
+        if any(k in bc for k in ("demand", "demand_lps")):
+            b = {k: bc[k] for k in bc if k not in ("demand", "demand_lps")}
+            b["demand"] = q_ref
+            demand_bc = b
+        elif any(k in bc for k in ("pressure", "head")):
+            fixed_bc = bc
+        probe.append(b)
+    if demand_bc is None or fixed_bc is None:
+        return None, _err("cannot derive a system curve",
+                          hint="boundary needs one fixed pressure/head node and one demand node "
+                               "(the operating flow), or pass system={'static_head_m','k'}")
+    res = solve(doc, boundary=probe, fluid=fluid)
+    if not res.get("ok"):
+        return None, res
+    # total dynamic loss (m) = sum of link headloss at q_ref; static = fixed head above the
+    # demand node's elevation datum (z of the demand node).
+    total_loss_m = sum(l["headloss_m"] for l in res["links"])
+    k = total_loss_m / (q_ref * q_ref) if q_ref else 0.0
+    fixed_head = next((n["head_m"] for n in res["nodes"] if n["fixed"]), 0.0)
+    demand_node = next((n for n in res["nodes"]
+                        if abs(n["demand_m3h"] - q_ref) < 1e-3), None)
+    z_demand = (demand_node["xyz"][2] / 1000.0) if demand_node else 0.0
+    static = fixed_head - z_demand
+    meta = {"q_ref_m3h": q_ref, "total_loss_m": round(total_loss_m, 4),
+            "static_head_m": round(static, 4), "k": k}
+    return {"static_head_m": static, "k": k}, meta
+
+
+def _npsh_margin(q_m3h: float, suction: Optional[dict], fluid: Optional[dict],
+                 npshr_curve) -> dict:
+    """NPSH available / required / margin (m) at flow ``q_m3h``.
+
+    NPSHa = (P_atm + P_suction_gauge − P_vapour)/(ρ·g) + z_suction − h_friction.
+    """
+    if suction is None:
+        return {"npsha_m": None, "npshr_m": None, "margin_m": None,
+                "hint": "pass suction={'pressure_kpa','elevation_m','friction_m'} for NPSHa"}
+    fl = properties.resolve_solver_fluid(fluid)
+    if not fl.get("ok", True) and "reason" in fl:
+        return {"npsha_m": None, "npshr_m": None, "margin_m": None, "reason": fl["reason"]}
+    rho = fl["rho"]
+    p_atm = float(suction.get("atm_kpa", P_ATM / 1000.0)) * 1000.0
+    p_suct_g = float(suction.get("pressure_kpa", 0.0)) * 1000.0
+    if "pvap_kpa" in suction:
+        p_vap = float(suction["pvap_kpa"]) * 1000.0
+        pvap_src = "caller-supplied"
+    else:
+        p_vap = fl.get("pvap")
+        pvap_src = fl.get("source")
+        if p_vap is None:
+            return {"npsha_m": None, "npshr_m": None, "margin_m": None,
+                    "hint": "no vapour pressure for this fluid — pass suction={'pvap_kpa':...}"}
+    z = float(suction.get("elevation_m", 0.0))
+    h_fric = float(suction.get("friction_m", 0.0))
+    npsha = (p_atm + p_suct_g - p_vap) / (rho * G) + z - h_fric
+
+    npshr = None
+    if npshr_curve is not None:
+        curve = load_pump_curve(npshr_curve, flow_col="flow", head_col="npshr") \
+            if not isinstance(npshr_curve, dict) else npshr_curve
+        if curve.get("ok"):
+            npshr = _interp_curve(curve["points"], q_m3h)
+    margin = (npsha - npshr) if (npshr is not None) else None
+    out = {"npsha_m": round(npsha, 4),
+           "npshr_m": round(npshr, 4) if npshr is not None else None,
+           "margin_m": round(margin, 4) if margin is not None else None,
+           "rho_kgm3": rho, "pvap_pa": round(p_vap, 3), "pvap_source": pvap_src}
+    if npshr is None:
+        out["hint"] = "pass npshr_curve (flow,npshr CSV) to get the NPSH margin"
+    return out

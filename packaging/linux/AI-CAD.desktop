@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=AI-CAD
+Comment=AI-native parametric CAD
+Exec=AI-CAD2
+Icon=AI-CAD
+Categories=Graphics;Engineering;
+Terminal=false

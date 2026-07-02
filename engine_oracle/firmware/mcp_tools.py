@@ -12,12 +12,14 @@ board) → write/edit sources → ``fw_build`` (BuildResult with parsed warnings
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Optional
 
 from engine.firmware import mcu_pinouts
 from engine.firmware import pinmap as fw_pinmap
 from engine.firmware import project as fw_project
 from engine.firmware import toolchains as fw_toolchains
+from engine.firmware.emulator import SimResult, run_simulation
 
 
 def _err(code: str, message: str, detail: str = "") -> dict:
@@ -135,7 +137,6 @@ def fw_sim_run(params: dict) -> dict:
     # Resolve ELF: explicit param > glob the build dir
     elf_path = params.get("elf_path") or None
     if not elf_path:
-        from pathlib import Path
         build_dir = project.root_dir / project.build_dir
         for pattern in ("*.elf", "*.bin", "*.hex"):
             hits = sorted(build_dir.rglob(pattern))
@@ -145,7 +146,6 @@ def fw_sim_run(params: dict) -> dict:
 
     if not elf_path:
         # No ELF and no build yet — graceful SimResult (caller should run fw_build first)
-        from engine.firmware.emulator import SimResult
         return SimResult(
             passed=False,
             uart_log="no_elf: no .elf found in build dir — run fw_build first",
@@ -153,7 +153,6 @@ def fw_sim_run(params: dict) -> dict:
 
     assertions: list[str] = list(params.get("assertions") or [])
 
-    from engine.firmware.emulator import run_simulation
     result = run_simulation(
         elf_path=str(elf_path),
         mcu_family=project.mcu_family or "cortex-m4",

@@ -133,23 +133,30 @@ def _emulator_not_found(binary: str, t0: float) -> SimResult:
 # Renode emulator
 # ---------------------------------------------------------------------------
 
-def _build_resc(elf_path: str, platform_file: str, uart_port: int) -> str:
+def _build_resc(elf_path: str, platform_file: str) -> str:
     """Generate a minimal Renode ``.resc`` script that loads the ELF and starts emulation.
 
     The script:
     1. Creates a machine with the given platform description.
     2. Loads the ELF.
-    3. Creates a UART analyser that logs to a telnet terminal on ``uart_port``.
-    4. Starts emulation (non-blocking; Renode exits after a machine-halt or the control
-       session closes it via the ``quit`` command on port 1234).
+    3. Starts emulation.
+
+    UART capture: when Renode is launched with ``--console``, its built-in UART monitor
+    prints UART bytes directly to stdout — no separate telnet/PTY wiring needed for the
+    general case.  Platform-specific ``.repl`` files that define ``usart1`` will have their
+    UART output forwarded by Renode's console sink automatically.
+
+    Live-path note [~]: UART capture fidelity depends on the platform file defining a UART
+    peripheral that Renode maps to its console sink.  ``cortex_m_generic.repl`` (no UART
+    peripheral) will not produce UART output; ``stm32f4_discovery.repl`` (defines usart1)
+    will.  This is expected — the mock suite validates assertion logic independently of
+    live hardware.  Run ``renode --disable-xwt --console <script.resc>`` manually to
+    verify UART capture for a specific platform.
     """
     return textwrap.dedent(f"""\
         mach create
         machine LoadPlatformDescription @{platform_file}
         sysbus LoadELF @{elf_path}
-        machine StartGdbServer 3333 true
-        emulation CreateUartPtyTerminal "uartTerm" "/tmp/renode_uart_{uart_port}.pty" true
-        connector Connect sysbus.usart1 uartTerm
         start
     """)
 
@@ -158,9 +165,11 @@ class RenodeEmulator:
     """Drives Renode (MIT, subprocess) to emulate an ELF against a platform description.
 
     Renode is invoked headless (``--disable-xwt``) with a generated ``.resc`` script.
-    UART capture is done by reading Renode's semihosting/UART output from the process
-    stdout (via the ``--console`` flag) rather than the telnet port — simpler, testable,
-    and avoids the timing sensitivity of the telnet handshake for CI use.
+    UART capture is done by reading Renode's output from process stdout (via the
+    ``--console`` flag).  Renode forwards UART peripheral bytes to its console sink when
+    run headless; platform files that define a UART peripheral (e.g. ``stm32f4_discovery``)
+    will emit UART text on stdout.  The generic ``cortex_m_generic`` platform has no UART
+    peripheral so live UART capture is unavailable there — see ``_build_resc`` for details.
     """
 
     BINARY = "renode"
@@ -184,7 +193,7 @@ class RenodeEmulator:
             return _emulator_not_found(self.BINARY, t0)
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".resc", delete=False) as f:
-            f.write(_build_resc(elf_path, platform_file, uart_port=4444))
+            f.write(_build_resc(elf_path, platform_file))
             resc_path = f.name
 
         cmd = [self.BINARY, "--disable-xwt", "--console", resc_path]

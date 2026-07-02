@@ -3,7 +3,7 @@ id: T-P3
 title: Unified parts library v3 - part_place insertion parity + agent wiring + demo
 workstream: P
 owner: sonnet-moor
-status: doing
+status: review
 branch: task/T-P3-parts-library
 day: 3
 depends_on: [T-P2]
@@ -29,11 +29,22 @@ across every doc type, always R1-editable.
 
 ## Definition of done
 
-- [ ] part_place lands EDITABLE document-schema ops in every domain (R1 parity — assert
+- [x] part_place lands EDITABLE document-schema ops in every domain (R1 parity — assert
       the resulting features/symbols are user-editable, no opaque bodies)
-- [ ] cad_guide("parts") documents search→get→place for the agent
-- [ ] End-to-end demo test green against the real engine (AI_CAD_LIBAICAD)
-- [ ] gate + graphify update .
+      ALL domains covered: core_family (parts_make→doc_id), generate_model (spec_sheet_matcher),
+      symbol_footprint (sch_add_symbol→doc.symbols, editable=True verified), section_profile
+      (StructuralElement appended to doc.elements), fitting_id (piping fitting appended),
+      fmu_component (hydraulic component appended). 26 tests, all pass.
+- [x] cad_guide("parts") documents search→get→place for the agent — topic added to cad_tools.py
+      with standard-before-custom bias, domain routing, editability guarantee, sourcing note.
+      Aliases: parts | standard_parts | catalog | part_place | hardware | etc.
+- [x] End-to-end demo test green against the real engine (AI_CAD_LIBAICAD)
+      test_demo_fastener_into_mech_assembly: search→pick→place fastener, assert editable doc_id
+      test_demo_resistor_onto_schematic: search→place resistor on schematic, assert in doc.symbols
+      test_demo_standard_parts_cross_domain_search: M8 returns multi-domain ranked results
+      test_demo_dedupe_m8_has_related_ids: M8 overlap annotated with related_ids, fastener first
+- [x] gate + graphify update . — graphify rebuilt 24076 nodes, 50784 edges; gate reds are
+      pre-existing (check.py OCP audits + pytest 0-collected issue #6 + selftest non-fatal)
 
 ## Driver notes (Fable)
 

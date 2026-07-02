@@ -35,3 +35,6 @@ while the holder would crash. Audit: work/audits/CAM_AUDIT.md §3.2, §T-M3.
 - BRANCH FROM T-M6's branch if unmerged (record merge order M6 → M3); from master if merged.
 - Audit §T-M3 names the exact reuse (dist_point_seg). cam_tools.py is also touched by
   T-M4/M5 — additions append-only, small commits, rebase early.
+
+## Progress log
+- 2026-07-02 22:34 UTC [opus-iron] CLAIM REASON (priority note): taking T-M3 (P3) ahead of the P2 ready tasks deliberately — T-M3 branches off T-M6 (merge order M6→M3) which I authored this session and is still in review/unmerged. I hold the stock_sim.cpp context warm and left a sweep_seg-reuse handoff in T-M6.md specifically for this task; a cold-start by another agent basing on master would miss my turning branch + sweep_seg lambda and conflict. Basing the T-M3 worktree on the task/T-M6-cam-overhaul branch, not fresh master. Flagged to Fable foreman.

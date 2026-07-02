@@ -108,3 +108,14 @@ Rule: the ECAD default distribution stays **GPL-clean**, identical to the CAD po
 | **Argilla server** (Docker) | **Apache-2.0** | Self-hosted human-annotation UI + API (runs as a Docker container on hunter-pc/localhost) | ok — subprocess/Docker isolation; Apache-2.0. Not bundled with the desktop app. |
 | **pandas / pyarrow** | BSD-3 / Apache-2.0 | Argilla client transitive deps | ok — permissive; not shipped in desktop installer. |
 | **huggingface_hub / datasets** | Apache-2.0 | Argilla client transitive deps | ok — Apache-2.0; not shipped in desktop installer. |
+
+## Fleet training runner (T-H6)
+
+| package | license | role | posture |
+|---|---|---|---|
+| **mlflow** (client) | **Apache-2.0** | experiment tracking client — logs params, metrics, artifacts per training run | ok — in-process, dev/internal only; optional import with graceful degradation (logs to ./mlruns if server unreachable). Never shipped in the desktop installer. |
+| **MLflow server** (Docker) | **Apache-2.0** | Self-hosted experiment tracking UI + artifact store (runs as Docker container on hunter-pc/localhost) | ok — subprocess/Docker isolation; Apache-2.0. Not bundled with the desktop app. |
+| **trl** | **Apache-2.0** | HuggingFace TRL — SFTTrainer, DPOTrainer, GRPOTrainer for fine-tuning | ok — in-process, dev/internal only; lazy import (only when training runs). Never shipped in the desktop installer. |
+| **peft** | **Apache-2.0** | HuggingFace PEFT — LoRA adapter training | ok — in-process, dev/internal only; lazy import. Never shipped in the desktop installer. |
+| **Unsloth** | **Apache-2.0** | Fast LoRA training via custom CUDA kernels | ok — in-process, dev/internal only; lazy import with fallback to plain TRL. Never shipped in the desktop installer. |
+| **PyYAML** | **MIT** | YAML recipe file parsing | ok — in-process; already a common transitive dep. Never shipped in the desktop installer. |

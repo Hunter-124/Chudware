@@ -49,7 +49,7 @@ graph TD
   subgraph WS_F["workstream F"]
     T_F1["T-F1: Freeze research_tools contract, scaffold engine/research with web_search + fetch_page"]:::done
     T_F10["T-F10: gsl-ser/v1 serialization freeze + slot-fidelity eval harness + dataset factory"]:::done
-    T_F11["T-F11: Translator SFT v0 + GRPO groundedness polish + local serving"]:::todo
+    T_F11["T-F11: Translator SFT v0 + GRPO groundedness polish + local serving"]:::doing
     T_F12["T-F12: dag_replan, workflow templates, and the design_review verify battery"]:::todo
     T_F13["T-F13: Micro-evaluator 1 - feature-recognition hypothesis ranker"]:::done
     T_F14["T-F14: Deliverables contract + services/deliverables scaffold with OSS engines"]:::done
@@ -97,11 +97,11 @@ graph TD
     T_M2["T-M2: CAM overhaul: true adaptive clearing (trochoidal arc-blend linking)"]:::todo
     T_M3["T-M3: CAM overhaul: holder/shank collision simulation"]:::todo
     T_M4["T-M4: CAM overhaul: feeds/speeds DB unification with engine materials registry"]:::doing
-    T_M5["T-M5: CAM overhaul: OCCT hole-extraction completeness (counterbore/countersink/tilt)"]:::todo
+    T_M5["T-M5: CAM overhaul: OCCT hole-extraction completeness (counterbore/countersink/tilt)"]:::doing
     T_M6["T-M6: CAM overhaul: pocket entry fix + arc-true stock simulation"]:::doing
   end
   subgraph WS_P["workstream P"]
-    T_P1["T-P1: Unified parts library v1 - parts/1 contract, federated search core, first two adapters"]:::doing
+    T_P1["T-P1: Unified parts library v1 - parts/1 contract, federated search core, first two adapters"]:::done
     T_P2["T-P2: Unified parts library v2 - all-domain adapters + live vendor federation"]:::todo
     T_P3["T-P3: Unified parts library v3 - part_place insertion parity + agent wiring + demo"]:::todo
   end

@@ -339,12 +339,9 @@ class TestPartsMCPTools:
 
         mock_mcp.tool = capture_tool
 
-        # parts_tools lives in services/mcp/ — add to sys.path if needed.
-        svc = _REPO / "services" / "mcp"
-        if str(svc) not in sys.path:
-            sys.path.insert(0, str(svc))
         import importlib
-        pt = importlib.import_module("parts_tools")
+        # mcp_server is a symlink to services/mcp at repo root.
+        pt = importlib.import_module("mcp_server.parts_tools")
         pt.register_parts_tools(mock_mcp)
 
     def test_tools_registered(self):

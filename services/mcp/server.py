@@ -153,7 +153,7 @@ register_structural_tools(mcp)
 
 # Unified parts library (T-P1): federated search across all standard-parts catalogs.
 # part_search / part_get over the aicad.parts/1 FTS hub (contracts/parts.md).
-from parts_tools import register_parts_tools
+from mcp_server.parts_tools import register_parts_tools
 register_parts_tools(mcp)
 
 

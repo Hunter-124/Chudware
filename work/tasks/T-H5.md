@@ -40,3 +40,15 @@ before first upload.
 - [ ] Legal-cleanliness field on every record (telemetry-consented | synthetic |
       licensed-<name>)
 - [ ] `graphify update .`; gate green
+
+## Driver notes (Fable, 2026-07-02 — next-wave prep)
+
+- T-H1 landed everything you consume: contracts/telemetry.md (derivation rules
+  section = your exporter spec), consent_tier() in core/agent/config.cpp AND
+  services/agent/config.py, per-doc journals (.cam_journal.jsonl/.ecad_journal.jsonl
+  next to containers), ai_artifact events in cache/runs/*/events.jsonl.
+- consent enforcement is already stamped per-event — your exporter FILTERS on it;
+  test that consent=off and offline runs are provably excluded.
+- HUMAN-GATED (add to FOREMAN "For Erik" when you get there): DVC remote bucket
+  choice + Argilla hosting box. Build everything against a local directory remote so
+  the human decision doesn't block the code.

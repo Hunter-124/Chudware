@@ -39,3 +39,18 @@ discipline: a bench must show a measured residual before any training task start
 - [ ] Example-level scores (ROC-AUC style), not just corpus averages; held-out
       structure splits documented
 - [ ] `graphify update .`; gate green
+
+## Driver notes (Fable, 2026-07-02 — next-wave prep)
+
+- Scoring substrate landed (T-H4): services/verify/battery.py — verify(doc_id,
+  checks) + check_metadata() (30 checks, cost/platform/reward_shape tags). Benches
+  call IT, never raw tools.
+- Requirements gold format landed (T-H3): contracts/requirements.md aicad.req/1;
+  VALID_VERIFIERS in engine_oracle/requirements. Post-merge alignment note (see
+  FOREMAN 2026-07-02): req_join ↔ contract constants + unit_ranges import — do this
+  alignment here if nobody has yet.
+- Corruption corpus: mutate known-good docs from corpora/gsl_dataset (document.json
+  per sample); mutation classes worth covering: dangling refs (delete a referenced
+  feature), param out-of-range, suppressed parent, circular equation, bad selector.
+- Narration bench = T-F10's harness (shared, don't duplicate); groundedness module =
+  tools/translator/groundedness.py (locked semantics).

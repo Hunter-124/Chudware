@@ -40,3 +40,15 @@ regen-fix, IP-20 drawing/doc gen) lands here even before those features fully sh
 - [ ] Consent + offline rules respected end-to-end (shadow never calls cloud in
       offline mode)
 - [ ] `graphify update .`; gate green
+
+## Driver notes (Fable, 2026-07-02 — next-wave prep)
+
+- Emission helpers already exist (T-H1): emit_ai_artifact/emit_ai_artifact_action in
+  core/agent/events.{h,cpp} (call-site precedent: core/agent/run.cpp run_design);
+  Python _emit_ai_artifact in services/agent/loop.py. Your middleware WRAPS provider
+  calls and reuses these — do not add a third emission path.
+- T-F9 (opus-pike) is freezing contracts/providers.md in parallel — your middleware
+  must conform to it; if it hasn't merged when you start, read its branch
+  (task/T-F9-providers-contract) and coordinate via work/questions/T-H7.md.
+- GUI target cannot link core/agent (C-ABI bridge only — see work/questions/T-H1.md);
+  middleware lives in the agent/services layer, never in host/ui code.

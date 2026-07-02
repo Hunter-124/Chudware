@@ -43,3 +43,18 @@ the model; ISO 724/ASME B1.1 computed not fetched).
 - [ ] All helpers return the T-F1 answer contract; tests per helper green
 - [ ] Material registry unified; sim/CAM/DFM read it; no duplicated tables remain
 - [ ] Zero prohibited sources reachable from code; `bash scripts/gate.sh`; `graphify update .`
+
+## Driver notes (Fable, 2026-07-02 — next-wave prep)
+
+- T-F1 (opus-ivy) freezes contracts/research_tools.md — your helpers implement ITS
+  answer contract; read the frozen file, don't re-derive from the master plan.
+- material_lookup: bundled-first (~200 alloys/plastics); bundle-safe seeds per master
+  plan Pillar 8 item 4 — Materials Project (CC-BY, computed), USDA Wood Handbook
+  (public domain). NEVER MatWeb/MakeItFrom/Matmatch (ToS-prohibited). NIST SRD is NOT
+  public domain.
+- thread_spec/fits: COMPUTED from ISO 724 / ASME B1.1 formulas, bundled, no fetch.
+- Unified material registry (engine/materials/): merges engine/sim/materials.json +
+  the CAM cutting DB + DFM process profiles — provenance field per record; single
+  source for the T-F7 narration layer's yield lookups (describe_results cites it).
+- Hard rule: schema extracts {raw_quote, value, unit-enum}; CODE converts units
+  (services/verify/unit_ranges.py from T-H4 has the range table — import it).

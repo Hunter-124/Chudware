@@ -2,8 +2,8 @@
 id: T-A1
 title: Freeze dag_schema.md and scaffold services/dag/
 workstream: A
-owner: Bruh
-status: todo
+owner: sonnet-dane
+status: doing
 branch: task/T-A1-dag-schema-scaffold
 day: 1
 depends_on: [T-S1]

@@ -8,12 +8,18 @@ A leaf module with no back-edge to the bench package makes discovery determinist
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Callable
 
 # BenchResult is only referenced in the type hint of `run`; import lazily-safe from schema
 # (schema.py imports nothing from this package's registration path, so no cycle).
 from .schema import BenchResult
+
+# Committed frozen datasets + reports live here. Kept on the leaf module so bench modules
+# can resolve their dataset paths without importing `runner` (which would re-form the cycle).
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+BENCHES_DIR = os.path.join(_REPO_ROOT, "training", "benches")
 
 
 @dataclass

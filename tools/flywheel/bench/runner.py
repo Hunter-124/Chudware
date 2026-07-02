@@ -21,11 +21,11 @@ import sys
 import tempfile
 from typing import Optional
 
-from .driver import BenchDriver  # re-exported for callers that do `from ..runner import BenchDriver`
+# Re-exported for callers that do `from ..runner import BenchDriver / BENCHES_DIR`.
+from .driver import BENCHES_DIR, BenchDriver
 from .schema import BenchResult
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-BENCHES_DIR = os.path.join(_REPO_ROOT, "training", "benches")
 
 
 # ---- regen-fix driver -------------------------------------------------------

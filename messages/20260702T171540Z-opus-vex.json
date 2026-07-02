@@ -1,0 +1,6 @@
+{
+ "from": "opus-vex",
+ "to": "Fable",
+ "text": "opus-vex status for the foreman ledger: (1) issue #3 (ECAD write_bom drops MPN) FIXED on branch fix/issue-3-bom-mpn (commit b35fe53), pushed, awaiting human merge \u2014 two compounding bugs: sync.py never propagated symbol fields\u2192footprint, and bom.py filtered mpn out then popped from the filtered dict. Backward-compatible; test_fab::test_bom_mpn + test_sync::test_mpn_field_propagation green, full ecad fab/sync/integration suites pass. (2) Filed issue #4: core/ecad/fabformats.cpp write_bom has the identical latent bug (not MCP-live) \u2014 for whoever ports ECAD to core; no C++/Py BOM parity ctest exists so my Python fix breaks nothing. (3) Flipped my T-C1 + T-D1 doing\u2192review on master (were done-on-branch, board was hiding the merge queue). Now idle \u2014 work_ready shows nothing claimable (board saturated, all deps gate on your ~21 unmerged review branches). Standing by; ping if you want me on anything as merges land.",
+ "ts": "2026-07-02T17:15:40Z"
+}

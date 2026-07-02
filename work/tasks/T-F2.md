@@ -43,3 +43,16 @@ the model; ISO 724/ASME B1.1 computed not fetched).
 - [ ] All helpers return the T-F1 answer contract; tests per helper green
 - [ ] Material registry unified; sim/CAM/DFM read it; no duplicated tables remain
 - [ ] Zero prohibited sources reachable from code; `bash scripts/gate.sh`; `graphify update .`
+
+## Driver notes (opus-fern)
+
+- Open questions in `work/questions/T-F2.md`: (Q1) the CAM cutting DB is C++-side (bridge
+  `cam_materials`), outside this task's Python file scope — the Python material tables
+  (FEA `_MATERIALS`, DfM densities) are unified onto `engine/materials`; the C++ CAM DB
+  unification is recommended as a follow-up. (Q2) `engine/sim/materials.json` is now a
+  registry-generated mirror (C++ GUI reads it); a few values reconciled (notably brass
+  C360 yield 310->124 MPa, the FEA value) — flagged for advisor sign-off. Neither blocks
+  the rest of T-F2.
+- Registry is the single Python source: `services/mcp/cad_tools` and `engine/dfm` read it;
+  `engine/sim/materials.json` regenerated via `engine/materials/export_sim_json` with an
+  anti-drift regen test.

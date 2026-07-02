@@ -51,6 +51,8 @@
 | pyamg (M6, optional) | MIT | AMG preconditioner | ok |
 | **python-solvespace** (optional backend) | **GPL-3** | sketch solver alternative | **NOT bundled by default**; in-house `nsolve` is primary. If a user enables it, it installs into their runtime venv on demand with a license notice |
 | numba (optional, M7 perf) | BSD-2 | LBM JIT | ok if added |
+| **pdfminer.six** (optional, T-F2 Pillar 8) | **MIT** | `engine/research/datasheet_fetch` PDF->markdown extraction | ok (**in-process, permissive**). **Optional + feature-detected** — NOT a hard dependency (not in `requirements.txt`); absence degrades to `{ok:false, reason:"no_pdf_tool"}`, CI stays green with no new dep. |
+| ~~PyMuPDF / pymupdf4llm~~ | ~~AGPL-3~~ | ~~PDF->markdown~~ | **EXCLUDED (T-F2)** — AGPL, never imported in-process. `datasheet_fetch` uses only the MIT extractor above. |
 
 Rules:
 - Adding any dependency requires a row here in the same change.

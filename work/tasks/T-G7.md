@@ -2,8 +2,8 @@
 id: T-G7
 title: GUI migration wave 3 - core panels (C1-C6, G3 gate)
 workstream: G
-owner: unassigned
-status: todo
+owner: opus-gale
+status: doing
 branch: task/T-G7-migration-wave3
 day: 8
 depends_on: [T-G6]

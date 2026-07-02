@@ -3,7 +3,7 @@ id: T-M2
 title: CAM overhaul: true adaptive clearing (trochoidal arc-blend linking)
 workstream: M
 owner: opus-flux
-status: review
+status: done
 branch: task/T-M2-cam-overhaul
 day: 2
 depends_on: []

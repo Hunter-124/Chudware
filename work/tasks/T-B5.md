@@ -3,7 +3,7 @@ id: T-B5
 title: Spec-sheet matching v2 - AI path from datasheet and integration demo
 workstream: B
 owner: opus-vane
-status: review
+status: done
 branch: task/T-B5-spec-sheet-ai-integration
 day: 5
 depends_on: [T-B4]

@@ -3,7 +3,7 @@ id: T-Q4
 title: User manual auto-generation — cad_guide + inventory → living docs
 workstream: Q
 owner: opus-flint
-status: review
+status: done
 branch: task/T-Q4-prod
 day: 4
 depends_on: []

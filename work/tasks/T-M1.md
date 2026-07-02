@@ -2,8 +2,8 @@
 id: T-M1
 title: CAM overhaul: fix critical post-processor correctness (C++)
 workstream: M
-owner: sonnet-kest
-status: doing
+owner: unassigned
+status: todo
 branch: task/T-M1-cam-overhaul
 day: 1
 depends_on: []

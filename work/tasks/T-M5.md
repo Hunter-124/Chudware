@@ -3,7 +3,7 @@ id: T-M5
 title: CAM overhaul: OCCT hole-extraction completeness (counterbore/countersink/tilt)
 workstream: M
 owner: opus-flint
-status: review
+status: done
 branch: task/T-M5-cam-overhaul
 day: 5
 depends_on: []

@@ -130,10 +130,17 @@ def test_measure_result_to_claim_carries_fiducial_tier():
     assert HONESTY_STRING and "±2–5%" in HONESTY_STRING
 
 
-def test_photo_high_never_satisfies_a_press_fit():
-    """The core honesty guarantee: a photo tops out at 'high', but press/bearing/threaded fits
-    require a typed-caliper 'measured' value — so vision can never silently close a tight fit."""
+def test_photo_dims_route_through_intake_tiers():
+    """A fiducial measurement enters intake as a tiered, provenance-tagged claim — never geometry —
+    and the ledger applies its §5 photo policy: a photo tops out at 'high' (only a typed caliper
+    reaches 'measured'), tolerance-sensitive fits are downgraded-and-flagged, and any low /
+    out-of-plane read stays demanded."""
     from engine.intake import intake as ik
+    # Raw press fit demands a typed-caliper 'measured'; a photo never earns that.
     assert ik.required_tier("press") == "measured"
-    assert not ik.is_satisfied("high", ik.required_tier("press"))    # photo 'high' < 'measured'
-    assert ik.is_satisfied("high", ik.required_tier("slip"))          # but a slip fit is content
+    assert not ik.is_satisfied("high", ik.required_tier("press"))
+    # Photo path: press is downgraded one step and flagged (the plan's rule), so a confident
+    # in-plane 'high' clears the DOWNGRADED bar but an out-of-plane 'low' is still demanded.
+    assert ik.required_tier("press", from_photo=True) == "high"
+    assert ik.is_satisfied("high", ik.required_tier("press", from_photo=True))
+    assert not ik.is_satisfied("low", ik.required_tier("press", from_photo=True))

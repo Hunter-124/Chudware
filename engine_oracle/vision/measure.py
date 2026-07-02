@@ -10,9 +10,10 @@ a VLM picked, compute the **in-plane** distance in millimetres and score it. The
   because a foreshortened dimension is a guess no matter how many pixels it spans.
 
 The result is handed to the intake ledger as a *claim* (:meth:`MeasureResult.to_claim`) carrying
-``provenance.method = "photo_fiducial"`` and this tier. It never writes geometry, and a press /
-bearing / threaded fit still DEMANDS a typed caliper value — a photo tops out at ``high``, and
-those fits require ``measured``.
+``provenance.method = "photo_fiducial"`` and this tier. It never writes geometry: the intake layer
+sees the ``photo_fiducial`` provenance and applies its own §5 policy — a photo dim feeding a
+tolerance-sensitive fit is downgraded one step and flagged (never promoted to a typed
+``measured``), and an out-of-plane / low-confidence read stays demanded until a caliper closes it.
 """
 from __future__ import annotations
 
@@ -24,10 +25,12 @@ from .calib_sheet import DEFAULT_BOARD, BoardSpec
 from .fiducial import detect_board, load_image, require_cv2
 
 #: UI honesty string (DoD step 5 / master plan Pillar 10). Shown wherever a photo dimension is.
+#: The intake layer then applies its own policy on top: a photo dim feeding a tolerance-sensitive
+#: fit is downgraded one step and flagged (never treated as a typed ``measured`` value), and any
+#: out-of-plane / low-confidence read stays demanded.
 HONESTY_STRING: str = (
     "±2–5% for in-plane dimensions with the marker flat on the measurement plane "
-    "and large in frame; out-of-plane dimensions are flagged low-confidence. A photo never "
-    "satisfies a press/bearing/threaded fit — those still demand a typed caliper value."
+    "and large in frame; out-of-plane dimensions are flagged low-confidence."
 )
 
 # Confidence thresholds (px per mm). Below ~4 px/mm a millimetre is a handful of pixels; above
@@ -79,9 +82,10 @@ class MeasureResult:
     def to_claim(self, feature: str, dim: str, *, fit: Optional[str] = None) -> dict[str, Any]:
         """Shape this result as an intake claim carrying the fiducial tier + provenance.
 
-        The intake layer keys geometry-writing off the confidence tier; a photo_fiducial claim
-        enters at the tier the optics earned (never ``measured`` — only a typed caliper is), so
-        tolerance-critical fits keep demanding a real number.
+        The claim enters the ledger at the tier the optics earned (never ``measured`` — only a
+        typed caliper reaches that). ``provenance.method="photo_fiducial"`` lets ``compute_demands``
+        treat it as a photo dim: tolerance-sensitive fits are downgraded-and-flagged, and any dim
+        still below its (possibly downgraded) required tier keeps demanding a typed value.
         """
         claim: dict[str, Any] = {
             "feature": feature,

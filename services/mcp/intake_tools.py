@@ -341,14 +341,17 @@ def register_intake_tools(mcp: FastMCP) -> None:
         sheet lying flat in the feature's plane fixes the pixel→mm scale via homography. `px_a`/`px_b`
         are [x, y] pixel coords in the FULL-RES image; register it first with
         submit_part_photos(photos=[...]) and pass the returned `photo_id`. `feature`/`dim` name where
-        the result lands (e.g. feature="mount_holes", dim="spacing_mm"); `fit` optionally sets the fit
-        class (press|slip|clearance|…). The confidence tier comes from the marker PIXEL AREA
-        (resolution) and planarity — bigger/flatter markers ⇒ higher tier; out-of-plane is flagged
-        low, never guessed. The dim lands in the intake ledger with provenance.method="photo_fiducial";
-        it NEVER writes geometry, and a press/bearing/threaded fit still DEMANDS a typed caliper value
-        (a photo tops out at 'high'; those need 'measured'). Returns the measurement, its tier +
-        honesty band, and the updated open_demands / gate. Optional `board` overrides the default 5×7
-        30 mm ChArUco spec ({dict_name, squares_x, squares_y, square_len_mm, marker_len_mm}).
+        the result lands — use the BARE taxonomy dim key (e.g. feature="mount_holes", dim="spacing";
+        feature="output_shaft", dim="dia"); `fit` optionally sets the fit class (press|slip|
+        location|clearance|…). The confidence tier comes from the marker PIXEL AREA (resolution) and
+        planarity — bigger/flatter markers ⇒ higher tier; out-of-plane is flagged low, never guessed.
+        The dim lands in the intake ledger with provenance.method="photo_fiducial"; it NEVER writes
+        geometry. The intake layer then applies its policy: a photo dim on a tolerance-sensitive fit
+        is downgraded one step and flagged (never a typed 'measured'), and anything still below its
+        required tier — every out-of-plane/low read — keeps demanding a typed caliper value via
+        confirm_dimensions. Returns the measurement, its tier + honesty band, and the updated
+        open_demands / gate. Optional `board` overrides the default 5×7 30 mm ChArUco spec
+        ({dict_name, squares_x, squares_y, square_len_mm, marker_len_mm}).
         """
         try:
             if _vz is None:

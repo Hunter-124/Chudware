@@ -51,8 +51,11 @@ agents with resource_link to full-res; all deps Apache/BSD, no GPU).
 - `services/mcp/intake_tools.py`: `submit_part_photos(photos=[...])` registers real files;
   new `measure_from_photo(photo_id, [x,y], [x,y], feature, dim, fit?, board?)` lands the
   fiducial measurement in the intake ledger at its marker-area tier with
-  `provenance.method="photo_fiducial"` — never geometry; press/bearing/threaded fits still
-  DEMAND a typed caliper value. cv2-absent ⇒ contract-shaped `{ok:false,reason,hint}`.
+  `provenance.method="photo_fiducial"` — never geometry. The intake §5 policy then applies:
+  a photo dim on a tolerance-sensitive fit is downgraded-and-flagged (never a typed
+  `measured`), and any low / out-of-plane read stays demanded via `confirm_dimensions`.
+  Prior caliper confirmations are preserved across re-measure. cv2-absent ⇒ contract-shaped
+  `{ok:false,reason,hint}`.
 - `services/agent/providers/`: the neutral `image_part` gained an optional `mime`; the
   anthropic/openai/gemini adapters honor it (default png) so downscaled JPEG previews ride
   the existing image slot correctly. **Seam for T-F9:** the C++ provider image slot

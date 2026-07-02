@@ -2,8 +2,8 @@
 id: T-H3
 title: Requirements layer - freeze aicad.req/1 schema + requirements doc CRUD
 workstream: H
-owner: unassigned
-status: todo
+owner: sonnet-riko
+status: doing
 branch: task/T-H3-requirements-schema
 day: 11
 depends_on: []

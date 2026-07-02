@@ -47,5 +47,47 @@ private:
     Callback cb_;
 };
 
+// ---------------------------------------------------------------------------
+// Telemetry helpers — emit the standard ai_artifact / ai_artifact_action /
+// doc_semantic_diff event kinds.  Each stamps "consent" from the caller so
+// the exporter (T-H5) can filter.  These are pure wrappers over
+// RunEvents::emit(); they do NOT upload anything.
+//
+// Note on consent levels:
+//   "off"  — still emit locally (persist-first contract); exporter skips upload.
+//   "meta" — caller is responsible for passing empty strings for input_ref /
+//            output_ref (and edit_ops_ref where applicable) before calling.
+//   "full" — all fields included as-is.
+// ---------------------------------------------------------------------------
+
+json emit_ai_artifact(RunEvents& ev,
+                      const std::string& artifact_id,
+                      const std::string& insertion_point,
+                      const json& model_info,
+                      const std::string& prompt_hash,
+                      const std::string& input_ref,
+                      const std::string& output_ref,
+                      int base_revision,
+                      const json& verifier_scores,
+                      int64_t latency_ms,
+                      const std::string& consent);
+
+json emit_ai_artifact_action(RunEvents& ev,
+                             const std::string& artifact_id,
+                             const std::string& action,
+                             int revision,
+                             const std::string& edit_ops_ref,
+                             int undo_within_ops,
+                             int64_t dwell_ms,
+                             const std::string& note,
+                             const std::string& consent);
+
+json emit_doc_semantic_diff(RunEvents& ev,
+                            const std::string& artifact_id,
+                            int from_revision,
+                            int to_revision,
+                            const std::string& diff_ref,
+                            const std::string& consent);
+
 }  // namespace agent
 }  // namespace aicad

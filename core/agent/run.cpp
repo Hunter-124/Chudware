@@ -801,11 +801,38 @@ json run_design(const std::string& request, const std::string& doc_id, const jso
     };
 
     // ----------------------------------------------------------------- drive
+    const auto t_run0 = std::chrono::steady_clock::now();
     json result = run_machine(state, actions, events, options.value("budgets", json::object()));
 
     // revision = session.revision (re-read live; matches run.py getattr(session,"revision")).
     json tree_now = doc::doc_tree(doc_id);
     int revision = tree_now.value("revision", state.revision);
+
+    // T-H1 telemetry (contracts/telemetry.md): the design run's output is one AI
+    // artifact; the run applies its ops to the live document as it goes, so a
+    // completed run IS the apply — "applied" is inferred from completion
+    // (buttonless v1; the GUI takes the result over the C-ABI bridge and has no
+    // core/agent linkage, so the emission lives here — see work/questions/T-H1.md).
+    {
+        std::string consent = consent_tier(load_config());
+        if (offline) consent = "off";  // options-level offline flag: same hard override
+        const int64_t run_latency_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t_run0).count();
+        const json model_info = {{"provider", provider_cfg.value("name", std::string())},
+                                 {"model", provider_cfg.value("model", std::string())},
+                                 {"adapter", nullptr}};
+        // One artifact per design run; sidecar refs stay empty at run granularity
+        // (per-attempt raws are already in attempt_<stage>_<n>.txt via agent_output).
+        emit_ai_artifact(events, /*artifact_id=*/run_id, /*insertion_point=*/"IP-1",
+                         model_info, /*prompt_hash=*/"", /*input_ref=*/"",
+                         /*output_ref=*/"", /*base_revision=*/tree0.value("revision", 0),
+                         /*verifier_scores=*/json::object(), run_latency_ms, consent);
+        if (result.value("status", std::string()) == "done")
+            emit_ai_artifact_action(events, /*artifact_id=*/run_id, "applied", revision,
+                                    /*edit_ops_ref=*/"", /*undo_within_ops=*/0,
+                                    /*dwell_ms=*/0, /*note=*/"", consent);
+    }
 
     events.emit("run_finished", json{{"status", result["status"]},
                                      {"stop_reason", result["stop_reason"]},

@@ -33,7 +33,23 @@ Every orchestrator event is ALSO appended to
 sidecar files `attempt_<stage>_<n>.txt`) — the Activity panel replays from this after restart,
 and tests assert against it.
 
-## 4. Rules
+## 4. Telemetry — AI artifact capture (T-H1)
+
+Extends the same `events.jsonl` stream. Full schema in `contracts/telemetry.md`.
+
+| kind | data |
+|---|---|
+| `ai_artifact` | `{artifact_id, insertion_point, model:{provider,model,adapter}, prompt_hash, input_ref, output_ref, base_revision, verifier_scores, latency_ms, consent:"off"\|"meta"\|"full"}` — emitted when an AI output is produced |
+| `ai_artifact_action` | `{artifact_id, action:"accepted"\|"applied"\|"edited"\|"rejected"\|"regenerated"\|"undone"\|"flagged", revision, edit_ops_ref?, undo_within_ops, dwell_ms, note?, consent}` — emitted on user reaction |
+| `doc_semantic_diff` | `{artifact_id, from_revision, to_revision, diff_ref, consent}` — emitted alongside `edited` action to record feature-level changes |
+
+Rules specific to telemetry events:
+- `consent` is stamped by the emitter from `consent_tier(cfg)`; the exporter (T-H5) re-checks.
+- `consent:"off"` events are written locally only; the exporter refuses to export them.
+- `offline_enabled(cfg) ⇒ consent:"off"` — hard override, checked at config-resolution time.
+- `meta` tier: `input_ref`, `output_ref`, `edit_ops_ref` fields must be empty strings.
+
+## 5. Rules
 
 - Events are best-effort UI hints; the FINAL response is the source of truth for state.
 - Producers MUST NOT emit events after their final response line.

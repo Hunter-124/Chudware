@@ -8,11 +8,15 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+namespace fs = std::filesystem;
 
 #include "ecad/autoroute.h"
 #include "ecad/container.h"
@@ -92,10 +96,25 @@ Session& require_session(const std::string& doc_id) {
 // trips it back to an identical object.
 std::string snapshot(const json& doc) { return doc.dump(); }
 
+// Flush bounded undo stack to per-doc telemetry journal next to the .ecad+ container.
+// Journal path: <doc_path>.ecad_journal.jsonl. Best-effort; never throws.
+static void flush_ecad_journal(const Session& s) {
+    if (s.path.empty()) return;
+    try {
+        fs::path journal = fs::path(s.path).replace_extension("").string() + ".ecad_journal.jsonl";
+        std::ofstream fh(journal, std::ios::binary | std::ios::trunc);
+        if (!fh) return;
+        for (const auto& snap : s.undo_stack) {
+            fh << snap << "\n";  // undo_stack entries are already serialized strings
+        }
+    } catch (...) {}
+}
+
 void push_undo(Session& s) {
     s.undo_stack.push_back(snapshot(s.doc));
     if (s.undo_stack.size() > kUndoLimit) s.undo_stack.erase(s.undo_stack.begin());
     s.redo_stack.clear();
+    flush_ecad_journal(s);
 }
 
 // Interactive compile uses a COARSER zone-fill grid than the export path

@@ -31,6 +31,11 @@ json load_config();
 // bool(cfg.get("offline_mode", False)).
 bool offline_enabled(const json& cfg);
 
+// consent_tier: resolve the telemetry consent tier from config.
+// Returns "off"|"meta"|"full". offline_enabled(cfg) hard-forces "off".
+// External default is "off". Unknown/missing values default to "off".
+std::string consent_tier(const json& cfg);
+
 // urlparse(base_url).hostname lowercased ∈ {localhost,127.0.0.1,::1,[::1],0.0.0.0}.
 bool host_is_loopback(const std::string& base_url);
 

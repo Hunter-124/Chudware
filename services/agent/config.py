@@ -53,6 +53,25 @@ def offline_enabled(cfg: dict | None = None) -> bool:
     return bool(cfg.get(OFFLINE_SETTING, False))
 
 
+_VALID_CONSENT_TIERS = {"off", "meta", "full"}
+
+
+def consent_tier(cfg: dict) -> str:
+    """Return the telemetry consent tier for the given config.
+
+    - "off"  — no telemetry uploaded (events still written locally)
+    - "meta" — metadata only (timings, model name, hashes; no geometry)
+    - "full" — full telemetry including geometry references
+
+    Offline mode hard-overrides to "off" regardless of any configured value.
+    Unknown values default to "off" (external-default, safe).
+    """
+    if cfg.get(OFFLINE_SETTING):
+        return "off"
+    tier = cfg.get("telemetry_consent", "off")
+    return tier if tier in _VALID_CONSENT_TIERS else "off"
+
+
 def _host_is_loopback(base_url: str | None) -> bool:
     """True if *base_url*'s host is a loopback address (the only egress allowed offline)."""
     if not base_url:

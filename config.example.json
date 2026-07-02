@@ -20,6 +20,8 @@
     "gpu_layers": -1,
     "vision": false
   },
+  "telemetry_consent": "off",
+  "_telemetry_consent_note": "Telemetry capture consent tier: off (default — events stored locally only, never exported) | meta (event kinds + verifier scores + hashes, no geometry/prompts) | full (everything; team dogfood default). offline_mode always hard-forces off. External users default to off. See contracts/telemetry.md.",
   "experimental": {
     "_note": "Opt-in, default-off AI features. All run fully local (ITAR-safe) and are additive — omit this block for the standard copilot. Also settable in Settings → Experimental. See docs/EXPERIMENTAL_AI.md.",
     "vision_review": {

@@ -51,6 +51,7 @@
 | pyamg (M6, optional) | MIT | AMG preconditioner | ok |
 | **python-solvespace** (optional backend) | **GPL-3** | sketch solver alternative | **NOT bundled by default**; in-house `nsolve` is primary. If a user enables it, it installs into their runtime venv on demand with a license notice |
 | numba (optional, M7 perf) | BSD-2 | LBM JIT | ok if added |
+| **fluids** | **MIT** | piping module: ASME B36.10M/B36.19M pipe schedule tables (`fluids.piping.nearest_pipe`) for `engine/piping/catalog.py` | ok. Pure-Python (numpy/scipy dep already present); optional at runtime — `catalog.nearest_pipe` degrades contract-shaped when absent. Fitting geometry is our own CSV of public manufacturer dims — ASME standard text is **not** bundled (dimensions are facts, not copyrightable). |
 
 Rules:
 - Adding any dependency requires a row here in the same change.

@@ -90,6 +90,7 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 Fable REVIEWED T-H3: LGTM merge-ready (1951+ lines, 56/56 tests, scope clean); dispatched sonnet-juno on T-F13
 - 2026-07-02T00:00Z sonnet-juno CLAIMED T-F13
 - 2026-07-02 fable-arc CLAIMED T-F14 (Pillar 15 arc driver: F14→F15→F16, merge order F14 → F15 → F16)
+- 2026-07-02T00:00Z sonnet-juno REVIEW T-F13 branch=task/T-F13-micro-evaluator
 - 2026-07-02 fable-arc DISPATCHED parallel Opus drivers: opus-ivy T-F1, opus-rook T-F3, opus-sage T-F5, opus-pike T-F9 (Erik-authorized widening; T-F3 driver owns agent_panel hot-spot per first-claimer rule, briefed to keep panel edits minimal/append-only)
 - 2026-07-02 sonnet-tomo REVIEW T-H4 branch=task/T-H4-verifier-battery
 - 2026-07-02 sonnet-tomo QUESTION T-H4 (coordination notes only, non-blocking: T-F10 groundedness ownership, T-H3 req_join stub — work/questions/T-H4.md on the branch)

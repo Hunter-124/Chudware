@@ -1,0 +1,310 @@
+"""test_mcp_tools.py — Tests for services/dag/mcp_tools.py (T-A4 DoD).
+
+Uses a MagicMock-based FastMCP stub (same pattern as test_req_tools.py) to avoid
+the services/mcp/ directory shadowing the real `mcp` package when conftest.py
+inserts services/ onto sys.path.
+
+Tests the five DAG MCP tools (dag_plan, dag_run, dag_status, dag_approve, dag_abort).
+executor.run()/resume() are monkeypatched to avoid real LangGraph DB writes.
+
+Import via `dag.mcp_tools` (matching the conftest-provided `dag` package alias) to
+avoid the services/mcp shadow of the `mcp` PyPI package.
+"""
+from __future__ import annotations
+
+import json
+import tempfile
+import uuid
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+
+# ---------------------------------------------------------------------------
+# MagicMock FastMCP stub (mirrors test_req_tools.py pattern)
+# ---------------------------------------------------------------------------
+
+def _make_mcp():
+    """Return a mock FastMCP that records registered tool callables by name."""
+    tools: dict = {}
+    mcp = MagicMock()
+
+    def _tool_decorator():
+        def decorator(fn):
+            tools[fn.__name__] = fn
+            return fn
+        return decorator
+
+    mcp.tool = _tool_decorator
+    mcp._tools = tools
+    return mcp, tools
+
+
+# ---------------------------------------------------------------------------
+# Import register_dag_tools with the stub mcp
+# conftest.py adds services/ to sys.path so `dag` resolves to services/dag.
+# ---------------------------------------------------------------------------
+
+def _build_clients():
+    mcp, tools = _make_mcp()
+    from dag.mcp_tools import register_dag_tools
+    register_dag_tools(mcp)
+    return tools
+
+
+# ---------------------------------------------------------------------------
+# Minimal executor result shapes
+# ---------------------------------------------------------------------------
+
+def _done_result(run_id: str = None, nodes: dict = None) -> dict:
+    rid = run_id or str(uuid.uuid4())
+    return {
+        "run_id": rid,
+        "name": "test-graph",
+        "status": "done",
+        "nodes": nodes or {"n1": {"status": "done", "output": {}}},
+        "checkpoint_db": f"/tmp/{rid}.db",
+        "open_questions": [],
+    }
+
+
+def _paused_result(run_id: str = None) -> dict:
+    rid = run_id or str(uuid.uuid4())
+    return {
+        "run_id": rid,
+        "name": "test-graph",
+        "status": "paused",
+        "nodes": {"gate1": {"status": "paused", "output": {}}},
+        "checkpoint_db": f"/tmp/{rid}.db",
+        "open_questions": [],
+        "interrupted": [{"node_id": "gate1", "batch_id": "b_x",
+                          "schema": "aicad.interaction/1"}],
+    }
+
+
+_MINIMAL_GRAPH: dict = {
+    "schema": "aicad.dag/1",
+    "id": "g1",
+    "name": "test",
+    "nodes": [{"id": "n1", "type": "design", "name": "Node 1",
+               "inputs": {}, "on_fail": "pause", "autonomy": "auto"}],
+    "edges": [],
+}
+
+
+# ---------------------------------------------------------------------------
+# All five tools registered
+# ---------------------------------------------------------------------------
+
+def test_all_five_tools_registered():
+    tools = _build_clients()
+    expected = {"dag_plan", "dag_run", "dag_status", "dag_approve", "dag_abort"}
+    registered = set(tools.keys())
+    missing = expected - registered
+    assert not missing, f"Missing DAG MCP tools: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# dag_run
+# ---------------------------------------------------------------------------
+
+def test_dag_run_starts_new_run():
+    tools = _build_clients()
+    run_result = _done_result()
+    with patch("services.dag.executor.run", return_value=run_result) as mock_run:
+        raw = tools["dag_run"](graph_json=_MINIMAL_GRAPH)
+        result = json.loads(raw)
+    assert result["ok"] is True
+    assert result["status"] == "done"
+    assert "run_id" in result
+    mock_run.assert_called_once()
+
+
+def test_dag_run_resumes_with_run_id():
+    tools = _build_clients()
+    rid = str(uuid.uuid4())
+    resume_result = _done_result(run_id=rid)
+    with patch("services.dag.executor.resume", return_value=resume_result) as mock_resume:
+        raw = tools["dag_run"](graph_json=_MINIMAL_GRAPH, run_id=rid)
+        result = json.loads(raw)
+    assert result["ok"] is True
+    assert result["run_id"] == rid
+    mock_resume.assert_called_once()
+
+
+def test_dag_run_paused_includes_interrupted():
+    tools = _build_clients()
+    paused = _paused_result()
+    with patch("services.dag.executor.run", return_value=paused):
+        raw = tools["dag_run"](graph_json=_MINIMAL_GRAPH)
+        result = json.loads(raw)
+    assert result["ok"] is True
+    assert result["status"] == "paused"
+    assert "interrupted" in result
+    assert len(result["interrupted"]) > 0
+
+
+def test_dag_run_executor_error_returns_ok_false():
+    tools = _build_clients()
+    with patch("services.dag.executor.run", side_effect=ValueError("bad graph")):
+        raw = tools["dag_run"](graph_json=_MINIMAL_GRAPH)
+        result = json.loads(raw)
+    assert result["ok"] is False
+    assert "reason" in result
+
+
+def test_dag_run_not_found_returns_ok_false():
+    tools = _build_clients()
+    rid = str(uuid.uuid4())
+    with patch("services.dag.executor.resume", side_effect=FileNotFoundError("no db")):
+        raw = tools["dag_run"](graph_json=_MINIMAL_GRAPH, run_id=rid)
+        result = json.loads(raw)
+    assert result["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# dag_status — DoD: returns current node ID, run state, gate-pending flag
+# ---------------------------------------------------------------------------
+
+def test_dag_status_unknown_run():
+    tools = _build_clients()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        raw = tools["dag_status"](run_id="nonexistent-id", runs_dir=tmpdir)
+        result = json.loads(raw)
+    assert result["ok"] is False
+    assert "not found" in result["reason"]
+
+
+def test_dag_status_known_run():
+    tools = _build_clients()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        rid = str(uuid.uuid4())
+        (tmp / f"{rid}.db").write_bytes(b"")
+        (tmp / f"{rid}.graph.json").write_text(
+            json.dumps(_MINIMAL_GRAPH), encoding="utf-8"
+        )
+        raw = tools["dag_status"](run_id=rid, runs_dir=tmpdir)
+        result = json.loads(raw)
+    assert result["ok"] is True
+    assert result["run_id"] == rid
+    assert result["db_exists"] is True
+    assert result["node_count"] == 1
+    assert result["node_ids"] == ["n1"]
+
+
+def test_dag_status_returns_gate_pending_and_status_keys():
+    """DoD: dag_status returns current node ID, run state, and gate-pending flag."""
+    tools = _build_clients()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        rid = str(uuid.uuid4())
+        (tmp / f"{rid}.db").write_bytes(b"")
+        (tmp / f"{rid}.graph.json").write_text(
+            json.dumps(_MINIMAL_GRAPH), encoding="utf-8"
+        )
+        raw = tools["dag_status"](run_id=rid, runs_dir=tmpdir)
+        result = json.loads(raw)
+    assert "gate_pending" in result, "dag_status must return gate_pending flag (DoD)"
+    assert "status" in result, "dag_status must return run state (DoD)"
+    assert "node_ids" in result, "dag_status must return current node IDs (DoD)"
+
+
+# ---------------------------------------------------------------------------
+# dag_approve — DoD: resumes a paused gate from outside (e.g. CLI or UI)
+# ---------------------------------------------------------------------------
+
+def test_dag_approve_resumes_with_approve_decision():
+    tools = _build_clients()
+    rid = str(uuid.uuid4())
+    done = _done_result(run_id=rid)
+    with patch("services.dag.executor.resume", return_value=done) as mock_resume:
+        raw = tools["dag_approve"](run_id=rid, graph_json=_MINIMAL_GRAPH)
+        result = json.loads(raw)
+    assert result["ok"] is True
+    assert result["status"] == "done"
+    # Must call executor.resume with decision="approve"
+    call_kwargs = mock_resume.call_args.kwargs
+    assert call_kwargs.get("decision") == "approve", (
+        "dag_approve must call executor.resume(decision='approve')"
+    )
+
+
+def test_dag_approve_not_found_returns_ok_false():
+    tools = _build_clients()
+    with patch("services.dag.executor.resume", side_effect=FileNotFoundError("no db")):
+        raw = tools["dag_approve"](run_id="bad-id")
+        result = json.loads(raw)
+    assert result["ok"] is False
+
+
+def test_dag_approve_chains_on_second_gate():
+    """If another gate fires after approve, interrupted is present."""
+    tools = _build_clients()
+    rid = str(uuid.uuid4())
+    paused2 = _paused_result(run_id=rid)
+    with patch("services.dag.executor.resume", return_value=paused2):
+        raw = tools["dag_approve"](run_id=rid)
+        result = json.loads(raw)
+    assert result["ok"] is True
+    assert result["status"] == "paused"
+    assert "interrupted" in result
+
+
+# ---------------------------------------------------------------------------
+# dag_abort
+# ---------------------------------------------------------------------------
+
+def test_dag_abort_injects_reject_decision():
+    tools = _build_clients()
+    rid = str(uuid.uuid4())
+    paused = {
+        "run_id": rid,
+        "status": "paused",
+        "nodes": {"gate1": {"status": "paused", "output": {}}},
+        "checkpoint_db": f"/tmp/{rid}.db",
+    }
+    with patch("services.dag.executor.resume", return_value=paused) as mock_resume:
+        raw = tools["dag_abort"](run_id=rid)
+        result = json.loads(raw)
+    assert result["ok"] is True
+    # Must call executor.resume with decision="reject"
+    call_kwargs = mock_resume.call_args.kwargs
+    assert call_kwargs.get("decision") == "reject", (
+        "dag_abort must call executor.resume(decision='reject')"
+    )
+
+
+def test_dag_abort_not_found_returns_ok_false():
+    tools = _build_clients()
+    with patch("services.dag.executor.resume", side_effect=FileNotFoundError("no db")):
+        raw = tools["dag_abort"](run_id="bad-id")
+        result = json.loads(raw)
+    assert result["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# dag_plan
+# ---------------------------------------------------------------------------
+
+def test_dag_plan_calls_executor_run():
+    tools = _build_clients()
+    run_result = _done_result()
+    run_result["nodes"]["plan"] = {
+        "status": "done",
+        "output": {"data": {"agent_result": {"schema": "aicad.dag/1", "nodes": []}}},
+    }
+    with patch("services.dag.executor.run", return_value=run_result) as mock_run:
+        raw = tools["dag_plan"](brief="Design a bracket and check interference")
+        result = json.loads(raw)
+    assert result["ok"] is True
+    assert "run_id" in result
+    mock_run.assert_called_once()
+
+
+def test_dag_plan_executor_error_returns_ok_false():
+    tools = _build_clients()
+    with patch("services.dag.executor.run", side_effect=RuntimeError("agent down")):
+        raw = tools["dag_plan"](brief="anything")
+        result = json.loads(raw)
+    assert result["ok"] is False

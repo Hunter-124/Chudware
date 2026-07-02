@@ -12,12 +12,14 @@ board) → write/edit sources → ``fw_build`` (BuildResult with parsed warnings
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Optional
 
 from engine.firmware import mcu_pinouts
 from engine.firmware import pinmap as fw_pinmap
 from engine.firmware import project as fw_project
 from engine.firmware import toolchains as fw_toolchains
+from engine.firmware.emulator import SimResult, run_simulation
 
 
 def _err(code: str, message: str, detail: str = "") -> dict:
@@ -109,3 +111,52 @@ def fw_sources(params: dict) -> dict:
         project.src_paths.sort()
         fw_project.save(project)
     return {"src_paths": list(project.src_paths)}
+
+
+def fw_sim_run(params: dict) -> dict:
+    """``{project_id, elf_path?, scenario?, assertions?:[str]}`` → ``SimResult`` dict (contract §4).
+
+    Runs the firmware emulation loop: discovers the ELF from the project's build dir if
+    ``elf_path`` is omitted, then dispatches to Renode (when installed + a platform file
+    exists) or falls back to QEMU. Neither emulator present → ``passed=False`` with an
+    explanation in ``uart_log`` (graceful degradation, same posture as ``fw_build``).
+
+    ``assertions`` is a list of assertion strings:
+    - ``"uart:<text>"`` — passes when the text appears in the captured UART/semihosting log.
+    - ``"gpio:<PIN>=<level>"`` — passes when the GPIO pin is at the given logic level.
+    - plain string — treated as ``"uart:<text>"``.
+    """
+    project_id = params.get("project_id")
+    if not project_id:
+        return _err("invalid_request", "fw_sim_run requires 'project_id'")
+    try:
+        project = fw_project.load(str(project_id))
+    except FileNotFoundError as e:
+        return _err("unknown_project", str(e))
+
+    # Resolve ELF: explicit param > glob the build dir
+    elf_path = params.get("elf_path") or None
+    if not elf_path:
+        build_dir = project.root_dir / project.build_dir
+        for pattern in ("*.elf", "*.bin", "*.hex"):
+            hits = sorted(build_dir.rglob(pattern))
+            if hits:
+                elf_path = str(hits[0])
+                break
+
+    if not elf_path:
+        # No ELF and no build yet — graceful SimResult (caller should run fw_build first)
+        return SimResult(
+            passed=False,
+            uart_log="no_elf: no .elf found in build dir — run fw_build first",
+        ).to_dict()
+
+    assertions: list[str] = list(params.get("assertions") or [])
+
+    result = run_simulation(
+        elf_path=str(elf_path),
+        mcu_family=project.mcu_family or "cortex-m4",
+        assertions=assertions,
+        timeout_s=float(params.get("timeout_s", 30)),
+    )
+    return result.to_dict()

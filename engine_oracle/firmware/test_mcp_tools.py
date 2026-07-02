@@ -117,3 +117,143 @@ def test_fw_sources_add_and_remove():
 def test_fw_sources_requires_project_id():
     res = fw.fw_sources({})
     assert res.get("code") == "invalid_request"
+
+
+# --------------------------------------------------------------------------- fw_sim_run
+
+
+def test_fw_sim_run_requires_project_id():
+    res = fw.fw_sim_run({})
+    assert res.get("code") == "invalid_request"
+
+
+def test_fw_sim_run_unknown_project_is_error_envelope():
+    res = fw.fw_sim_run({"project_id": "deadbeefcafe"})
+    assert res.get("code") == "unknown_project"
+
+
+def test_fw_sim_run_no_elf_graceful():
+    """No ELF in build dir → SimResult(passed=False) not an error envelope."""
+    proj = fw.fw_new_project({"mcu_family": "cortex-m4"})
+    # Project was created but never built — no .elf exists.
+    res = fw.fw_sim_run({"project_id": proj["project_id"]})
+    # Graceful SimResult shape, not an error envelope
+    assert "passed" in res, "expected SimResult dict, not error envelope"
+    assert res["passed"] is False
+    assert "no_elf" in res.get("uart_log", "")
+    # assertion_results is empty (nothing ran)
+    assert res.get("assertion_results") == []
+
+
+def test_fw_sim_run_emulator_absent_graceful(tmp_path):
+    """Neither renode nor qemu → SimResult(passed=False), not a raise."""
+    from unittest.mock import patch
+
+    proj = fw.fw_new_project({"mcu_family": "cortex-m4"})
+    pid = proj["project_id"]
+
+    # Materialise a fake ELF so the handler passes the no-elf check.
+    import engine.firmware.project as fw_proj
+    loaded = fw_proj.load(pid)
+    fake_elf = loaded.root_dir / "build" / "firmware.elf"
+    fake_elf.parent.mkdir(parents=True, exist_ok=True)
+    fake_elf.write_bytes(b"\x7fELF")  # minimal sentinel
+
+    with patch("engine.firmware.emulator.shutil.which", return_value=None):
+        res = fw.fw_sim_run({"project_id": pid, "elf_path": str(fake_elf),
+                             "assertions": ["uart:BOOT_OK"]})
+
+    assert "passed" in res
+    assert res["passed"] is False
+    assert "emulator_not_found" in res.get("uart_log", "")
+
+
+def test_fw_sim_run_happy_path_mocked(tmp_path):
+    """Mock run_simulation returns passing SimResult — handler passes it through."""
+    from unittest.mock import patch
+    from engine.firmware.emulator import SimResult, AssertionResult
+
+    proj = fw.fw_new_project({"mcu_family": "cortex-m4"})
+    pid = proj["project_id"]
+
+    import engine.firmware.project as fw_proj
+    loaded = fw_proj.load(pid)
+    fake_elf = loaded.root_dir / "build" / "firmware.elf"
+    fake_elf.parent.mkdir(parents=True, exist_ok=True)
+    fake_elf.write_bytes(b"\x7fELF")
+
+    mock_result = SimResult(
+        passed=True,
+        uart_log="BOOT_OK\nDONE\n",
+        gpio_states={"LED": 1},
+        assertion_results=[AssertionResult("uart:BOOT_OK", True, "found in uart_log")],
+        ms=42.0,
+    )
+
+    with patch("engine.firmware.mcp_tools.run_simulation", return_value=mock_result):
+        res = fw.fw_sim_run({
+            "project_id": pid,
+            "elf_path": str(fake_elf),
+            "assertions": ["uart:BOOT_OK"],
+        })
+
+    assert res["passed"] is True
+    assert res["uart_log"] == "BOOT_OK\nDONE\n"
+    assert res["gpio_states"] == {"LED": 1}
+    assert len(res["assertion_results"]) == 1
+    assert res["assertion_results"][0]["passed"] is True
+    assert "ms" in res
+
+
+def test_fw_sim_run_failed_assertions_mocked(tmp_path):
+    """Assertion fails → handler returns SimResult with passed=False."""
+    from unittest.mock import patch
+    from engine.firmware.emulator import SimResult, AssertionResult
+
+    proj = fw.fw_new_project({"mcu_family": "cortex-m4"})
+    pid = proj["project_id"]
+
+    import engine.firmware.project as fw_proj
+    loaded = fw_proj.load(pid)
+    fake_elf = loaded.root_dir / "build" / "firmware.elf"
+    fake_elf.parent.mkdir(parents=True, exist_ok=True)
+    fake_elf.write_bytes(b"\x7fELF")
+
+    mock_result = SimResult(
+        passed=False,
+        uart_log="BOOT_FAILED\n",
+        assertion_results=[AssertionResult("uart:BOOT_OK", False, "'BOOT_OK' not found")],
+        ms=10.0,
+    )
+
+    with patch("engine.firmware.mcp_tools.run_simulation", return_value=mock_result):
+        res = fw.fw_sim_run({
+            "project_id": pid,
+            "elf_path": str(fake_elf),
+            "assertions": ["uart:BOOT_OK"],
+        })
+
+    assert res["passed"] is False
+    assert res["assertion_results"][0]["passed"] is False
+
+
+def test_fw_sim_run_simresult_shape(tmp_path):
+    """Verify SimResult dict shape matches contract §4 exactly."""
+    from unittest.mock import patch
+    from engine.firmware.emulator import SimResult
+
+    proj = fw.fw_new_project({"mcu_family": "cortex-m4"})
+    pid = proj["project_id"]
+
+    import engine.firmware.project as fw_proj
+    loaded = fw_proj.load(pid)
+    fake_elf = loaded.root_dir / "build" / "firmware.elf"
+    fake_elf.parent.mkdir(parents=True, exist_ok=True)
+    fake_elf.write_bytes(b"\x7fELF")
+
+    with patch("engine.firmware.mcp_tools.run_simulation",
+               return_value=SimResult(passed=True, uart_log="ok", ms=1.0)):
+        res = fw.fw_sim_run({"project_id": pid, "elf_path": str(fake_elf)})
+
+    for field in ("passed", "uart_log", "gpio_states", "assertion_results", "ms"):
+        assert field in res, f"SimResult dict missing contract field '{field}'"

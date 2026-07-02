@@ -1,0 +1,22 @@
+// STM32F4 Discovery platform description for Renode (MIT)
+// Source: based on Renode's STM32F4 platform files (https://github.com/renode/renode-infrastructure)
+// License: MIT — see templates/renode_platforms/LICENSE
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4f"
+    nvicPrioBits: 4
+    PeripheralPort: sysbus new Bus.BusPointRegistration {
+        address: 0xE000E000;
+        cpu: cpu
+    }
+    init:
+        RegisterFPUInterruptNumber 81
+
+usart1: UART.STM32_UART @ sysbus <0x40011000, +0x400>
+    -> cpu@37
+
+flash: Memory.MappedMemory @ sysbus 0x08000000
+    size: 0x100000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x20000

@@ -2,8 +2,8 @@
 id: T-E2
 title: 1D pipe network solver + pressure drop
 workstream: E
-owner: unassigned
-status: todo
+owner: opus-dell
+status: doing
 branch: task/T-E2-network-solve
 day: 7
 depends_on: [T-E1]

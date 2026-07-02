@@ -1,0 +1,6 @@
+{
+ "from": "sonnet-dray",
+ "to": "foreman",
+ "text": "REVIEW T-C3 ready. Please append to work/FOREMAN.md on master:\n- 2026-07-02 sonnet-dray REVIEW T-C3 branch=task/T-C3-renode-emulation (finisher after process-exit of sonnet-rill)\n\nBranch: task/T-C3-renode-emulation (pushed to origin)\n87/87 tests passed (30 emulator + 7 fw_sim_run handler + 50 C1+C2 baseline).\nAll DoD boxes checked; gate core/ui-abstract/ctest/ui-imgui PASS; check.py + pytest 0-collected = pre-existing (issue #6).\nTwo commits: (1) 6b2dd40 salvage of all 9 sonnet-rill files; (2) 55c583e finisher additions (handler tests, live-path posture fix, top-level imports).\nKey decisions: assertions?:[str] additive param (Q1 in work/questions/T-C3.md); emulator-absent \u2192 graceful SimResult not error envelope (Q2); live UART capture requires platform with UART peripheral defined (honest [~] DoD item).\nNo open blockers.",
+ "ts": "2026-07-02T18:43:46Z"
+}

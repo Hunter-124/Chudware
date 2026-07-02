@@ -155,10 +155,15 @@ def ensure_runtime(base_python: str | None = None, wheelhouse: Path | None = Non
 
 
 def _find_base_python() -> str:
-    for cand in ("py -3.11", sys.executable):
-        exe = cand.split()[0]
+    # The pinned requirements.txt wheels (build123d et al.) target Python 3.11 specifically;
+    # sys.executable may be a newer interpreter the OS ships as the default `python3` (verified
+    # live: a box with python3 -> 3.14 as default but python3.11 also installed failed to
+    # resolve any pinned wheel until python3.11 was tried explicitly). Prefer 3.11 if present,
+    # falling back to whatever is running this script.
+    candidates = ["py", sys.executable] if sys.platform == "win32" else ["python3.11", sys.executable]
+    for exe in candidates:
         if shutil.which(exe) or Path(exe).exists():
-            return cand if " " not in cand else exe  # callers pass list; simplify
+            return exe
     return sys.executable
 
 

@@ -59,6 +59,28 @@ model. It is unmeasurable offline (needs a served, SFT'd model). Exact spec for 
 4. Record the two success rates + the decision here and re-run
    `--append-residual`. Until then: **HOLD**.
 
+## Known limitation — the scorer under-credits natural prose (T-F10 coordination)
+
+**Verified:** a fully-CORRECT natural-prose caption (e.g. *"This bolt plate measures 120 mm
+by 80 mm and is 10 mm thick…"*, every number right) is scored **fidelity 0.43, 6 missing, 2
+false-`wrong`** and **REJECTED** by the gate → fallback to template. Cause: the FROZEN T-F10
+`slot_accuracy._select` aligns caption numerals to slots by keyword/path proximity, so a
+caption without the `part.bbox.x`-style path tokens mis-aligns its (correct) numbers.
+
+**Why this matters:** the kill-switch WIN axis is *more natural narration* — but the current
+scorer penalizes exactly that. Two consequences:
+1. **v0 is unaffected:** the SFT target is `render_caption` (path-labeled prose), so a
+   distilled model emits path-labeled captions that DO align and pass the gate. The
+   limitation bites only if the translator is pushed toward free natural prose.
+2. **The downstream kill-switch measurement (above) needs a fidelity check that does not
+   punish natural phrasing** — otherwise a genuinely-better natural narrator reads as a
+   fidelity regression. Options (T-F10's call, not fixable here — frozen contract):
+   (a) keep path-labeled captions as the SFT target (safest; narration stays structured);
+   (b) improve `_select` to map domain synonyms ("wide"→bbox.x) before free-prose training;
+   (c) score free prose with the groundedness checker's value-membership only (no slot
+   alignment) for the WIN-axis eval. **Filed as a coordination note for T-F10/downstream.**
+   Pinned by `test_natural_prose_currently_undercredited_KNOWN_LIMITATION`.
+
 ## Scope note
 
 T-F11 v0 delivered: the output gate (shippable), the deterministic GRPO reward, the

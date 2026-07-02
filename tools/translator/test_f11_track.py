@@ -50,6 +50,21 @@ def test_absent_model_uses_template(state):
     text, src, g = gate.narrate(state, None)
     assert src == "template" and text == render_caption(state)
 
+def test_natural_prose_currently_undercredited_KNOWN_LIMITATION(state):
+    """PINS a real limitation (advisor-caught): the FROZEN T-F10 scorer aligns caption
+    numerals to slots by keyword/path proximity, so a fully-CORRECT natural-prose caption
+    (no `part.bbox.x` path tokens) mis-aligns and is REJECTED — the gate falls back to the
+    safe template. Safety holds (never fiction), but the model's natural-prose value is
+    under-credited. Documented in docs/TRANSLATOR_SHIP_VERDICT.md; not fixable here (frozen
+    contract owned by T-F10). If a future T-F10 scorer improvement makes natural prose pass,
+    UPDATE this test — it is a behavior tripwire, not an endorsement of the current behavior."""
+    natural = ("This bolt plate measures 120 mm by 80 mm and is 10 mm thick, with 18 faces "
+               "and 40 edges and rotational symmetry of order 6.")   # all numbers CORRECT
+    text, src, g = gate.narrate(state, natural)
+    assert src == "template"          # correct prose still rejected today (the limitation)
+    # the SFT target is render_caption (path-labeled), so a distilled model emits path-labeled
+    # captions that DO pass — see the path-labeled echo test above.
+
 def test_gate_uses_explicit_checker_not_global_stub(state):
     # gate must not mutate the module default — it stays the stub after we use the adapter
     gate.check_caption(render_caption(state), state, checker=H4GroundednessAdapter())

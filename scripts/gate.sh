@@ -54,6 +54,29 @@ stage_check() {
     fi
 }
 
+# ---- Stage 1.5: manual regen clean (advisory, T-Q4) --------------------------
+# Drift check for the auto-generated docs/manual/*.md (tools/manual_gen.py): regenerates the
+# manual in-memory from the ribbon inventory + cad_guide prose + contracts summary and byte-
+# compares it against the committed baseline. Advisory like check.py — never sets fail_fatal —
+# because manual drift means "someone added a ribbon command or a contract and forgot to rerun
+# `python -m tools.manual_gen`", not a build break.
+stage_manual_gen() {
+    echo "=== manual regen clean (advisory) ==="
+    if ! command -v python3 >/dev/null 2>&1; then
+        record "manual regen clean  SKIP    python3 not on PATH"
+        echo "  SKIP: python3 not installed"
+        return 0
+    fi
+    if python3 -m tools.manual_gen --check > /tmp/gate_manual.out 2>&1; then
+        record "manual regen clean  PASS    docs/manual/*.md matches a fresh regen"
+        echo "  PASS"
+    else
+        record "manual regen clean  FAIL-RECORDED  drift or missing coverage (non-fatal — see /tmp/gate_manual.out)"
+        echo "  FAIL (non-fatal) — /tmp/gate_manual.out:"
+        tail -n 8 /tmp/gate_manual.out | sed 's/^/    /'
+    fi
+}
+
 # ---- OCCT detection ---------------------------------------------------------
 find_occt_config() {
     # Look for the OpenCASCADE CMake config in the standard install locations.
@@ -266,6 +289,7 @@ stage_bench() {
 # ---- main -------------------------------------------------------------------
 CORE_BUILD_OK=0
 stage_check
+stage_manual_gen
 stage_core_build
 stage_ui_abstract
 stage_ctest

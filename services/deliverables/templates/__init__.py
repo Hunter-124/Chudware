@@ -132,6 +132,7 @@ from . import (  # noqa: E402,F401
     calc_package,
     design_review,
     smoke,
+    user_manual,
     verification_report,
 )
 

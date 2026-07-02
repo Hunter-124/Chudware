@@ -2,8 +2,8 @@
 id: T-G4
 title: GUI dead-code and cleanliness pass on host/
 workstream: G
-owner: unassigned
-status: todo
+owner: sonnet-oda
+status: doing
 branch: task/T-G4-gui-dead-code
 day: 2
 depends_on: [T-G1]

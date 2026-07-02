@@ -97,3 +97,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 ## For Erik (batched by Fable — answered-where-possible, only true human calls land here)
 
 - (none yet) Fable answers driver questions in work/questions/ directly; only decisions requiring the human (spend, credentials, merge-order exceptions, scope changes) get queued here.
+- 2026-07-02 Fable REVIEWED T-H4: LGTM merge-ready (1164+ lines, 23/23 tests, 30-check battery); answered its 3 questions on-branch; post-merge alignment note: req_join<->aicad.req/1 + unit_ranges import (non-blocking)

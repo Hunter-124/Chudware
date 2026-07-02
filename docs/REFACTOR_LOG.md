@@ -876,3 +876,26 @@ scope, filed in `work/questions/T-G6.md`; does not block wave-2 shell chrome. **
 ui-abstract/ctest/ui-imgui pass; check.py `feature_surface_audit`+`parity_audit` FAIL are the
 known pre-existing reds (host-era ribbon manifest / absent SW_PARITY_SPEC). **Touched:** none
 (code); docs/task/question files only.
+
+### T-G7 — wave 3 core panels verify-and-close + C2 pmform fix (G3 gate) — 2026-07-03 (opus-gale)
+Chained off task/T-G6-migration-wave2 (merge order T-G6 → T-G7). C1–C6 already ported to
+master by the prior overhaul run (§§ C1–C6); this task verified they render on AI-CAD2 and
+fixed the C2 PropertyManager-form path. **Verified render** (scratch/tg7-shots/): C1 `tree`
+(real worker-built Base/Fillet/Shell), C3 `chat` (glass bubbles + action card + ShopCraft
+branding), C4 `pick`, C5 `equations`/`assembly`/`plan`, one-shot `ecad`. **C2 FIX (real
+bug):** `AI_CAD_SHOT=pmform AI_CAD_PMCMD=extrude` rendered the Model Tree, not the Extrude
+form. Root cause: the pmform scenario `st.dispatch(cmd)`'d the command — which routes to
+`actionBus.submit()` and *executes* it (sets status, returns) without setting `activeTool` —
+so `drawInspector` (only called when `activeTool` non-empty, application.cpp:159; and host of
+`pmApplyShotEnv`) never ran and the PM form never opened. Fix (2 hunks, in-lane): (1)
+`ui/imgui/src/ui/scenarios.cpp` pmform sets `st.activeTool = cmd` (opens the data-driven form
+instead of executing); (2) `ui/abstract/panel_spec.cpp` `panelFormForCommand` now falls back to
+a bare spec NAME (explicit ribbon-command mappings still win), so the DoD's literal
+`AI_CAD_PMCMD=extrude` resolves the same form `extrude_boss` does. Reverified: the full Extrude
+PM form renders inside the FeatureManager tab (From/Direction1/Direction2/Thin Feature/Options,
+selector wells, dropdowns, depth+draft steppers, checkboxes, green✓/red✗ accept-deny), no
+separate PM tab — per AI hint. **G3-gate BLOCKER:** the "all 21 scenarios" DoD is gated on
+issue #7 — 10/21 are ScenarioRunner step machines that deadlock offscreen on mid-loop
+`DocMirror::newPart(worker)` (F4/C6 scope). ~11/21 (one-shots + static) capture fine. G3-gate
+re-scope decision requested from the foreman in work/questions/T-G7.md. **Touched:**
+ui/imgui/src/ui/scenarios.cpp, ui/abstract/panel_spec.cpp (+docs/task/question files).

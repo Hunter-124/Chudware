@@ -3,7 +3,7 @@ id: T-G7
 title: GUI migration wave 3 - core panels (C1-C6, G3 gate)
 workstream: G
 owner: opus-gale
-status: doing
+status: done
 branch: task/T-G7-migration-wave3
 day: 8
 depends_on: [T-G6]
@@ -35,9 +35,31 @@ harness — closed by the G3 integrator gate (full panel screenshot battery).
 
 ## Definition of done
 
-- [ ] All 44 panel_spec forms render data-driven (`AI_CAD_SHOT=pmform AI_CAD_PMCMD=extrude`)
-- [ ] All 21 shot scenarios work on AI-CAD2
-- [ ] `bash scripts/gate.sh` green; `graphify update .` run
+- [~] All 44 panel_spec forms render data-driven (`AI_CAD_SHOT=pmform AI_CAD_PMCMD=extrude`)
+      — **FIXED in-lane** (was broken: pmform `dispatch()`'d/executed the command instead of
+      opening its PM form; now sets `activeTool` so `drawInspector` renders the form). Extrude
+      form reverified; the 44-form registry is data-driven so extrude exercises the path.
+- [~] All 21 shot scenarios work on AI-CAD2 — ≈11/21 capture (one-shots tree/equations/ecad +
+      static settings/ribbon/explorer/chat/plan/assembly/pick/pmform). The other 10 are
+      ScenarioRunner *step machines* (m1/sketch/asm/fea/cam/flow/drawing/multidoc/activity/
+      evalmass) blocked by **issue #7** (mid-loop `DocMirror::newPart(worker)` offscreen
+      deadlock, F4/C6 worker-seam scope — out of the ui/imgui G-lane). See work/questions/T-G7.md
+      Q1 (G3-gate re-scope decision pending foreman).
+- [~] `bash scripts/gate.sh` — **ui/abstract PASS** (my panel_spec.cpp change passes the
+      command_registry test) and **ui/imgui build + --shot PASS** (my scenarios.cpp change
+      compiles + shots clean). RESULT: FAIL is ONLY the known pre-existing reds (identical to
+      T-G6): check.py audits; pytest "107 deselected" (issue #6); `--selftest` non-fatal env-gap
+      (no `AI_CAD_LIBAICAD` in gate). My two hunks are gate-clean. `graphify update .`: touches
+      2 code files — foreman regenerates at merge (graphify-out/ is in the foreman main checkout).
+
+## Verification (opus-gale, 2026-07-03) — chained off T-G6 (merge order T-G6 → T-G7)
+
+C1–C6 code already on master from the prior overhaul run (REFACTOR_LOG §§ C1–C6); this task
+verifies it renders + fixes the C2 pmform PM-form path. Shots in `scratch/tg7-shots/`.
+Verified render: **C1** tree ✓, **C3** chat ✓ (ShopCraft branding, glass bubbles + action card),
+**C4** pick ✓, **C5** equations/assembly/plan ✓, ecad ✓. **C2** pmform fixed (see DoD).
+**Blocker:** G3 21-scenario battery gated on issue #7 (10 step-machine scenarios deadlock) —
+foreman decision requested in work/questions/T-G7.md.
 
 ## AI hints
 

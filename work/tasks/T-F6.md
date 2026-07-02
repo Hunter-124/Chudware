@@ -2,9 +2,9 @@
 id: T-F6
 title: Guided multi-photo capture, phone handoff, photogrammetry to reverse_engineer
 workstream: F
-owner: unassigned
-status: todo
-branch: task/T-F6-photogrammetry
+owner: sonnet-fenn
+status: doing
+branch: task/T-F6-photo-capture
 day: 10
 depends_on: [T-F5]
 ---

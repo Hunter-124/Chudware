@@ -91,3 +91,7 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02T00:00Z sonnet-juno CLAIMED T-F13
 - 2026-07-02 fable-arc CLAIMED T-F14 (Pillar 15 arc driver: F14→F15→F16, merge order F14 → F15 → F16)
 - 2026-07-02 fable-arc DISPATCHED parallel Opus drivers: opus-ivy T-F1, opus-rook T-F3, opus-sage T-F5, opus-pike T-F9 (Erik-authorized widening; T-F3 driver owns agent_panel hot-spot per first-claimer rule, briefed to keep panel edits minimal/append-only)
+
+## For Erik (batched by Fable — answered-where-possible, only true human calls land here)
+
+- (none yet) Fable answers driver questions in work/questions/ directly; only decisions requiring the human (spend, credentials, merge-order exceptions, scope changes) get queued here.

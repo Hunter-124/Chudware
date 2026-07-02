@@ -79,6 +79,11 @@ register_ecad_tools(mcp)
 from mcp_server.cam_tools import register_cam_tools
 register_cam_tools(mcp)
 
+# Requirements (aicad.req/1): CRUD + markdown projection for design briefs.
+# Schema: contracts/requirements.md  Brain: engine_oracle/requirements/requirements.py
+from mcp_server.req_tools import register_req_tools
+register_req_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

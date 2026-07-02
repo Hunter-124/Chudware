@@ -2,8 +2,8 @@
 id: T-P1
 title: Unified parts library v1 - parts/1 contract, federated search core, first two adapters
 workstream: P
-owner: unassigned
-status: todo
+owner: sonnet-gale
+status: doing
 branch: task/T-P1-parts-library
 day: 1
 depends_on: []

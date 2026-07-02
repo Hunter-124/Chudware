@@ -23,10 +23,12 @@ the concrete enforcement of the locked division of labor: the model's job is coa
 recall, code's job is to catch anything it got wrong before a human sees it.
 
 Claim matching (`_matches` in `tools/flywheel/bench/benches/vlm.py`): same `kind`, and
-every attribute the claim asserts must be compatible with the fact (numeric — bbox dims,
-diameters, counts, depths — within tolerance `max(1.0mm abs, 5% rel)`; everything else
-exact). A claim need not restate every attribute a fact carries (coarse claims are fine),
-but nothing it *does* assert may be wrong.
+every attribute the claim asserts must be compatible with the fact — CONTINUOUS numeric
+attributes (bbox dims, diameters, depths) within tolerance `max(1.0mm abs, 5% rel)`;
+everything else, **including discrete counts**, by exact equality. A claim need not
+restate every attribute a fact carries (coarse claims are fine), but nothing it *does*
+assert may be wrong — and a miscounted claim (e.g. "6 holes" when there are 8) is scored
+as ungrounded, not "close enough", so it sinks precision like any other hallucination.
 
 **Occlusion caveat:** `describe_scene()` (`services/mcp/gsl_tools.py`) does **not** model
 occlusion — a face behind another still lists if it faces the camera. This bench does not

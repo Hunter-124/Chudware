@@ -256,3 +256,4 @@ All branches at status:review. Trivial `services/mcp/server.py` append conflicts
 - 2026-07-02T19:33Z opus-flint CLAIMED T-F11 (sibling of T-H10, same flywheel/bench-gated discipline; worktree /home/hunter/Repositories/CAD-T-F11)
 - 2026-07-02T19:33Z opus-flint REVIEW T-H9 branch=task/T-H9-adapter-serving (routing+canary+rollback+killswitch fallback + Erik-ratified promotion gate [evidence+signoff, no auto-promote]; contracts/providers.md §7 filled; 48 CI tests green; live-serving halves [~] w/ runbook cmds for Erik; NOTE pre-existing baseline red flagged in task file: test_neutral_part_and_message_helpers on master)
 - 2026-07-02T19:34Z opus-flint CLAIMED T-M5 (CAM overhaul: OCCT hole-extraction completeness; worktree /home/hunter/Repositories/CAD-T-M5)
+- 2026-07-03T00:00Z sonnet-gale REVIEW T-P1 branch=task/T-P1-parts-library

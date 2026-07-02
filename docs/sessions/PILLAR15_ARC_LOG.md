@@ -192,3 +192,28 @@ gate.sh ui/imgui selMulti failure is PRE-EXISTING, never chase; commit+push ever
   error (unprovisioned OCP runtime), ui/imgui `PanelField::selMulti` build break. No file under
   ui/ or engine/ was modified. Commits: f57d1fe (package+joins), 5991980 (guide+question),
   ece1b89 (arc), 17e826b (tests). Status → review; branch pushed. Next: F16 branches FROM this branch.
+
+### 2026-07-02 — T-F16 driver (Opus): preview seam + standalone pane/cards (final arc leg)
+
+- **Base:** branched FROM `task/T-F15-deliverable-templates` @ 78f3515 (merge order F14→F15→F16;
+  NEVER onto master, which lacks F14/F15). Task file aligned owner fable-arc / status doing (d7ae743).
+- **Python bridge (77b3d78):** `services/deliverables/worker_rpc.py` exposes `render_document` +
+  `list_artifacts` as engine-worker methods (`WORKER_METHODS`), registered append-only in
+  `engine/worker.py` (mirrors the ECAD block, graceful-degrade import). Thin wrappers over
+  `deliverables.api`; each returns the api envelope UNCHANGED plus one additive absolute
+  `project_dir` so the GUI resolves project-relative preview PNG paths. This is the supervisor's
+  "render_document reachable the same way as every other service" — same WorkerClient/AsyncRpc
+  stdio seam, no bespoke transport, no format code in C++. 4 new tests green; full deliverables
+  suite still green in-process (no LibreOffice/pandoc).
+- **ui/abstract seam (ef3f785):** `ui/abstract/artifact_view.h` — pure structs (no ImGui):
+  `ArtifactCard` (projects §3 record), `PreviewModel`/`PreviewPage` (projects §5.4 envelope),
+  `PreviewState` + `previewStateFromReason` mapping §6 reasons → typed placeholders (never blank).
+  Kept clear of panel_spec.*/command_registry.* (other sessions' WIP lanes).
+- **HOT-SPOT decision:** agent_panel.cpp has T-F3 + T-H1 unmerged branches near it. Per supervisor
+  rule, the preview pane + artifact cards are STANDALONE (ui/imgui/src/ui/preview_pane.*,
+  artifact_cards.*, theme/texture_cache.*, platform/open_external.*), wired via the hardcoded
+  panel path (application.cpp Begin block + layout.cpp dock — NOT a runtime registry; that seam
+  doesn't exist in this GUI). agent_panel.cpp is UNTOUCHED. The one DoD bullet that literally wants
+  the card inline in the Copilot bubble stream is deferred to the T-G7 copilot-panels wave rather
+  than risk the hot-spot — see work/questions/T-F16.md. Standalone pane fully satisfies card
+  (thumbnail/open-externally/regenerate) + file-explorer preview + async DoD bullets.

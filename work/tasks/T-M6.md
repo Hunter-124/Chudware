@@ -36,3 +36,6 @@ has zero coverage (G4). Audit: work/audits/CAM_AUDIT.md §3.1-3.3, §T-M6.
 - Audit gives file:line for both defects — surgical fixes, no refactors.
 - You own stock_sim.cpp for this wave; T-M3 branches off you (merge order M6 → M3).
   test_cam.cpp additions append-only (shared with M1/M2).
+
+## Progress log
+- 2026-07-02 22:22 UTC [opus-iron] REVIEW: task/T-M6-cam-overhaul pushed (commit 8d9958a). D3: gen_pocket2d non-helix entry now rapid_xy(entry) before plunge (no more air-plunge from stale XY). D8: stock_sim sweeps arcs along the true arc (center+radius), not the chord — fixes convex-surface gouge false-negatives; per-segment sweep refactored into a sweep_seg lambda. G4: added axisymmetric turning-sim branch (radius-profile R(z) integral) since the top-down dexel can't model diameter reduction; gated on Lathe+cylinder so milling is untouched. +3 tests: pocket-entry rapid-before-plunge, arc mid-bulge cut vs chord, TurnRough removed>0 & machined_fraction>0.3 (~0.72). Verified: test_cam 54/54 (3498 asserts), core ctest 18/18 green. HANDOFF for T-M3 (branches off M6): reuse sweep_seg for holder collision with a Z-offset extent; turning early-returns before the milling dexel. Ready for human merge.

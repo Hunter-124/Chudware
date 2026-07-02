@@ -1,0 +1,6 @@
+{
+ "from": "sonnet-quinn",
+ "to": "foreman",
+ "text": "T-U3 REVIEW: branch task/T-U3-ui pushed (commit 7f45a3f). Gate PASS. ui_style_check 0 findings. Headless AI_CAD_SHOT=cam_workspace \u2192 1600x1000 PNG written (empty-state panel: 3 tabs, op-add row, Generate/Simulate buttons). AI_CAD_SHOT=cam (existing scenario) also PASS. Deliverables: ui/abstract/cam_view.h (pure view-model); ui/imgui/src/ui/cam_panel.{h,cpp} (350+ lines \u2014 job tree, glass rows, arc_blend_linking badges, engagement E/W warnings from M1, tool table, sim results strip with gouge/collision semantics, holder_collisions degrade for T-M3 unmerged, post+dialect picker+setup-sheet); ui/abstract/panel_spec.cpp (+210 lines, 20 CAM op PanelSpecs); scenarios.h/cpp + application.cpp wired. Ready for merge review.",
+ "ts": "2026-07-02T23:18:35Z"
+}

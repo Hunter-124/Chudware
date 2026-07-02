@@ -91,6 +91,27 @@ def test_drawing_callouts_are_dimensions(corpus):
     dwg = next(e for e in man["examples"] if e["kind"] == "drawing")
     assert all(c["kind"] == "dimension" for c in dwg["known_geometry"])
 
+def test_diff_pair_images_actually_differ(corpus):
+    """A 'known-diff render pair' whose renders don't differ would be a silent lie — every
+    diff pair must drop a DEPICTED feature so A/B pixels differ (advisor finding 1)."""
+    man = json.load(open(os.path.join(corpus, "manifest.json")))
+    pairs = [e for e in man["examples"] if e["kind"] == "diff_pair"]
+    assert pairs, "expected at least one diff pair"
+    for p in pairs:
+        a = open(os.path.join(corpus, p["image_a"]), "rb").read()
+        b = open(os.path.join(corpus, p["image_b"]), "rb").read()
+        assert a != b, f"{p['example_id']} A/B images identical — diff not depicted"
+        assert p["known_diff"]["feature"] in ("hole", "bolt_circle")
+
+def test_deterministic_gets_no_credit_on_drawing_callouts(corpus):
+    """The non-vision fallback cannot OCR a 2D drawing's annotation text, so its claims on a
+    drawing must be empty — otherwise it structurally hides the drawing residual (finding 2)."""
+    from tools.flywheel.bench.benches.vlm import deterministic_claims
+    man = json.load(open(os.path.join(corpus, "manifest.json")))
+    dwg = next(e for e in man["examples"] if e["kind"] == "drawing")
+    assert all(c.get("visible") is False for c in dwg["known_geometry"])
+    assert deterministic_claims(dwg["known_geometry"]) == []
+
 
 # ---- the measurement chain (REAL numbers, not all-skip) ---------------------------------
 

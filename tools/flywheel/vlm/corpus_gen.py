@@ -183,26 +183,41 @@ def render_drawing_image(callouts: list[dict], path: str, title: str) -> None:
 
 # ---- corpus assembly --------------------------------------------------------------------
 
+# Features a face-normal / describe_scene B-rep read cannot depict in a schematic and — for
+# a DRAWING — cannot OCR from annotation text. Only a VLM reads these.
+_DEPICTED_COUNTABLE = ("hole", "bolt_circle")
+
+
 def _drawing_callouts(facts: list[dict]) -> list[dict]:
-    """Derive KNOWN dimension callouts from a part's bbox/diameter facts (kind=dimension)."""
+    """Derive KNOWN dimension callouts from a part's bbox/diameter facts. Marked
+    `visible: false` DELIBERATELY: parsing a 2D drawing's annotation TEXT is exactly the
+    task-(b) skill a non-vision `describe_scene`/B-rep read CANNOT do — so the deterministic
+    fallback must get NO recall credit on drawings, which is what exposes the drawing
+    residual a VLM has to earn. (If these were visible:true the fallback would score
+    near-perfect and structurally hide the residual DoD 1 measures.)"""
     out: list[dict] = []
     for f in facts:
         if f.get("kind") == "bbox":
-            out.append({"kind": "dimension", "axis": "x", "value": f["x"], "tolerance": 0.2})
-            out.append({"kind": "dimension", "axis": "y", "value": f["y"], "tolerance": 0.2})
+            out.append({"kind": "dimension", "axis": "x", "value": f["x"],
+                        "tolerance": 0.2, "visible": False})
+            out.append({"kind": "dimension", "axis": "y", "value": f["y"],
+                        "tolerance": 0.2, "visible": False})
         elif "diameter" in f:
             out.append({"kind": "dimension", "feature": f["kind"], "value": f["diameter"],
-                        "tolerance": 0.1})
+                        "tolerance": 0.1, "visible": False})
     return out[:4]
 
 
-def _drop_one_feature(facts: list[dict]) -> tuple[list[dict], dict]:
-    """Make a B-variant by dropping the last COUNTABLE feature — the KNOWN diff fact."""
-    for i in range(len(facts) - 1, -1, -1):
-        if "count" in facts[i] and facts[i].get("kind") not in ("bbox",):
-            b = [f for j, f in enumerate(facts) if j != i]
-            return b, {"kind": "missing_feature", "feature": facts[i]["kind"]}
-    return facts, {"kind": "missing_feature", "feature": "none"}
+def _drop_one_feature(facts: list[dict]) -> tuple[list[dict], dict] | None:
+    """Make a B-variant by dropping a DEPICTED countable feature (hole/bolt_circle) so the
+    A/B images genuinely differ in pixels — a "known-diff render pair" whose renders don't
+    differ would be a silent lie. Returns None when the family has no depictable countable
+    feature to drop (shaft/enclosure) — those get no diff pair rather than an identical one."""
+    for i, f in enumerate(facts):
+        if f.get("kind") in _DEPICTED_COUNTABLE and "count" in f:
+            b = [ff for j, ff in enumerate(facts) if j != i]
+            return b, {"kind": "missing_feature", "feature": f["kind"]}
+    return None
 
 
 def build_manifest(seeds: int = 3) -> dict:
@@ -224,15 +239,17 @@ def build_manifest(seeds: int = 3) -> dict:
                     "provenance": PROVENANCE, "image": f"drawings/{fam}_dwg.png",
                     "known_geometry": callouts, "draw_spec": spec,
                 })
-            if s == 1:  # one diff pair per family
-                b_facts, diff = _drop_one_feature(facts)
-                examples.append({
-                    "example_id": f"{fam}_diff", "kind": "diff_pair", "structure": fam,
-                    "provenance": PROVENANCE,
-                    "image_a": f"pairs/{fam}_a.png", "image_b": f"pairs/{fam}_b.png",
-                    "known_geometry_a": facts, "known_geometry_b": b_facts,
-                    "known_diff": diff, "draw_spec_a": spec, "draw_spec_b": spec,
-                })
+            if s == 1:  # one diff pair per family — ONLY if a depicted feature can be dropped
+                dropped = _drop_one_feature(facts)
+                if dropped is not None:      # shaft/enclosure have none -> no fake identical pair
+                    b_facts, diff = dropped
+                    examples.append({
+                        "example_id": f"{fam}_diff", "kind": "diff_pair", "structure": fam,
+                        "provenance": PROVENANCE,
+                        "image_a": f"pairs/{fam}_a.png", "image_b": f"pairs/{fam}_b.png",
+                        "known_geometry_a": facts, "known_geometry_b": b_facts,
+                        "known_diff": diff, "draw_spec_a": spec, "draw_spec_b": spec,
+                    })
     return {"corpus_id": "vlm_corpus_v1", "provenance": PROVENANCE, "seeds": seeds,
             "n_examples": len(examples), "families": sorted(FAMILIES),
             "examples": examples}

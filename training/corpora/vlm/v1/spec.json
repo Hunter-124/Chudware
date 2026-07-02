@@ -7,8 +7,8 @@
     "plate",
     "shaft"
   ],
-  "hash": "sha256:0ea75582ccb5e330f9bdd2a3b79170ba1eee74739ccae0c3404be64ad8e0c46d",
-  "n_examples": 25,
+  "hash": "sha256:2bbcb64793f34402ea9aa87bb42b0943d0c20171316671e3b298de8ed61906bf",
+  "n_examples": 23,
   "provenance": "synthetic",
   "seeds": 3
 }

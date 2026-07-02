@@ -6,6 +6,7 @@ owner: unassigned
 status: todo
 branch: task/T-F4-interaction-migration
 day: 9
+priority: 3
 depends_on: [T-F3, T-A3]
 ---
 

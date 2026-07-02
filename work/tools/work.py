@@ -127,8 +127,9 @@ def cmd_ready(tasks, errors, args):
     if not rows:
         print("no ready tasks")
         return 0
+    rows.sort(key=lambda t: (int(t.get("priority", 5) or 5), str(t.get("day", "99")), t["id"]))
     for t in rows:
-        print(f"{t['id']:>8}  day {t.get('day','-'):>2}  [{t.get('owner','?')}]  {t['title']}")
+        print(f"{t['id']:>8}  P{t.get('priority', 5)}  day {t.get('day','-'):>2}  [{t.get('owner','?')}]  {t['title']}")
     return 0
 
 
@@ -266,7 +267,10 @@ def cmd_claim(tasks, errors, args):
                      if t["status"] == "todo" and unclaimed(t)
                      and all(tasks.get(d, {}).get("status") == "done"
                              for d in t.get("depends_on", []))]
-            cands.sort(key=lambda t: (str(t.get("day", "99")), t["id"]))
+            # Priority-first auto-claim (Erik, 2026-07-03): lower `priority:` wins
+            # (1 = drop-everything, default 5), then day, then id.
+            cands.sort(key=lambda t: (int(t.get("priority", 5) or 5),
+                                      str(t.get("day", "99")), t["id"]))
         if not cands:
             print("NOTHING-TO-CLAIM: no unclaimed ready tasks (see `board` for in-flight work)")
             return 2

@@ -16,3 +16,5 @@ Connect ECAD connectivity to mechanical routing: harness paths in the assembly, 
 
 - [ ] Harness route feature in assembly docs
 - [ ] Wire length + connector rollup feeds bom_rollup
+
+**PARKED (Erik, 2026-07-03): out of scope for the v1 prototype push — low priority; revisit after the five objectives close.**

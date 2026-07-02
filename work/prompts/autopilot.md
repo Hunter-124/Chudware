@@ -61,3 +61,19 @@ see who holds what.
 - Migration-wave tasks (T-G5..T-G9) are swarm-integrator tasks: you orchestrate
   subagents using the node specs in `docs/GUI_MIGRATION_DAG.md`; that doc's write-sets
   and verify commands are binding.
+
+## OSS-first rule (Erik, 2026-07-03, binding)
+
+Before implementing any significant new subsystem/algorithm, spend 10 minutes
+surveying open source: an existing library or reference implementation beats
+recoding it — the goal is prototype velocity. License guardrails still bind
+absolutely: MIT/BSD/Apache may be imported in-process; GPL/MPL only via
+subprocess isolation; AGPL never; PyMuPDF never. Study-only for incompatible
+licenses (learn the approach, write your own code). Every adopted dep needs a
+contracts/licenses.md row AND a requirements.txt line in the same commit.
+
+## Priority-ordered claiming (Erik, 2026-07-03)
+
+`work.py claim` now picks by `priority:` frontmatter (1 = drop-everything,
+default 5), then day, then id. Don't cherry-pick a lower-priority task ahead of
+a ready P1/P2 without a reason recorded in your claim note.

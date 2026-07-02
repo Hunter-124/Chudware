@@ -16,3 +16,5 @@ Verilator (Artistic-2.0, bundleable) + GHDL/Icarus (GPL, subprocess) with an age
 
 - [ ] hdl_build/hdl_sim MCP tools
 - [ ] Agent loop demo: counter + UART peripheral verified in simulation
+
+**PARKED (Erik, 2026-07-03): out of scope for the v1 prototype push — low priority; revisit after the five objectives close.**

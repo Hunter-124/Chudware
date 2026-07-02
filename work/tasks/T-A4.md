@@ -6,6 +6,7 @@ owner: Bruh
 status: todo
 branch: task/T-A4-verify-nodes-mcp
 day: 4
+priority: 3
 depends_on: [T-A3]
 ---
 

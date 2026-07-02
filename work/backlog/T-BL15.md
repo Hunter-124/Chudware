@@ -47,3 +47,5 @@ settle before this is schedulable:
       the open questions above answered) or explicitly declined it
 - [ ] If refined: a follow-up task/doc section is written with an actual design, and
       *this* task is closed/superseded, not implemented as-is
+
+**PARKED (Erik, 2026-07-03): out of scope for the v1 prototype push — low priority; revisit after the five objectives close.**

@@ -6,6 +6,7 @@ owner: Bruh
 status: todo
 branch: task/T-A5-integration-demo
 day: 5
+priority: 4
 depends_on: [T-A4, T-INT]
 ---
 

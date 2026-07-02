@@ -6,6 +6,7 @@ owner: unassigned
 status: todo
 branch: task/T-C5-firmware-agent-demo
 day: 5
+priority: 3
 depends_on: [T-C4]
 ---
 

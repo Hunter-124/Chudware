@@ -1,9 +1,9 @@
 ---
 id: T-INT
-title: Day-5 integration demo - soil-moisture sensor end-to-end
+title: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)
 workstream: integration
 owner: Bruh
-status: todo
+status: backlog
 branch: task/T-INT-integration-demo
 day: 5
 depends_on: [T-A4, T-B4, T-C4, T-D4]

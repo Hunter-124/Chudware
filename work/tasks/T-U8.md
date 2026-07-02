@@ -6,6 +6,7 @@ owner: unassigned
 status: todo
 branch: task/T-U8-ui
 day: 8
+priority: 4
 depends_on: [T-U1, T-H9]
 ---
 

@@ -6,6 +6,7 @@ owner: unassigned
 status: todo
 branch: task/T-M6-cam-overhaul
 day: 1
+priority: 2
 depends_on: []
 ---
 

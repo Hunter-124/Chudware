@@ -20,3 +20,5 @@ Adopt TraceParts API for supplier-catalog CAD and Werk24 for drawing/GD&T extrac
 
 > NOTE (Fable, 2026-07-03): when adopted, TraceParts/Werk24 land as CatalogProviders
 > behind the parts/1 federation (workstream P) — not as a separate surface.
+
+**PARKED (Erik, 2026-07-03): out of scope for the v1 prototype push — low priority; revisit after the five objectives close.**

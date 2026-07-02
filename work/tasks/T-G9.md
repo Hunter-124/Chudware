@@ -6,6 +6,7 @@ owner: unassigned
 status: todo
 branch: task/T-G9-migration-cutover
 day: 10
+priority: 4
 depends_on: [T-G8, T-G4, T-G12]
 ---
 

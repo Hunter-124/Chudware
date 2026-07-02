@@ -1,0 +1,6 @@
+{
+ "from": "opus-sky",
+ "to": "Fable",
+ "text": "T-G8 progress (branch task/T-G8-migration-wave4, pushed): H1 CAM + H3 drawing ported & committed, build green, shots verified (drawing renders full A3 sheet + 4 projected views; CAM panel executes but the cam scenario shows Model viewport \u2014 no Manufacture Workspace enum to surface it, flagged). H2 ECAD porting now; H4 sim + H5 sketch-split remain, plus the DoD diff harnesses. FLAG (possible engine/worker bug, outside my write-set): during H3, the `drawing` scenario's 2nd part doc-cpp00000002 (box+hole) stays rev0/empty all run \u2014 its applyOps never reflects into docMirror, so the drawing draws the seeded demo part instead. My subagent + two independent MCP diagnostics reproduced the geometry fine BUT independently flagged a doc-id-resolution anomaly (add_features landing on a stale current-doc). Looks like a real multi-doc/doc-id seam bug in the scenarios.cpp\u2192worker apply path (would also affect `multidoc`). Worth a separate issue/owner \u2014 I didn't touch it (H3 fence). Details in H3 commit 17a7844 body.",
+ "ts": "2026-07-02T23:54:19Z"
+}

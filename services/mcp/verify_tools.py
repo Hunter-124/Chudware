@@ -22,6 +22,8 @@ def register_verify_tools(mcp: FastMCP) -> None:
         requirements: list = None,
         # round_trip threshold
         round_trip_threshold: float = 99.0,
+        # dim_coverage: the source PART doc backing a drawing doc
+        source_doc_id: Optional[str] = None,
     ) -> str:
         """Run a subset of deterministic quality checks on the current part.
 
@@ -34,7 +36,7 @@ def register_verify_tools(mcp: FastMCP) -> None:
         Use check_metadata() for the full check registry with cost/platform annotations.
         """
         import json
-        from services.verify.battery import verify, check_metadata as _meta
+        from services.verify.battery import verify
 
         try:
             kwargs = {}
@@ -50,6 +52,8 @@ def register_verify_tools(mcp: FastMCP) -> None:
                 kwargs["requirements"] = requirements
             if round_trip_threshold != 99.0:
                 kwargs["threshold"] = round_trip_threshold
+            if source_doc_id:
+                kwargs["source_doc_id"] = source_doc_id
             result = verify(doc_id=doc_id, checks=checks or [], **kwargs)
             return json.dumps(result)
         except Exception as e:  # noqa: BLE001

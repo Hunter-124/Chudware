@@ -29,25 +29,26 @@ CHECKS: dict[str, tuple[str, str, str, str, str]] = {
     "measure_part":              ("cad",  "measure_part",              "subsecond", "any",   "scalar"),
     "query_geometry":            ("cad",  "query_geometry",            "subsecond", "any",   "findings"),
     "measure_between":           ("cad",  "measure_between",           "subsecond", "any",   "scalar"),
-    "check_interference":        ("cad",  "check_interference",        "subsecond", "any",   "binary"),
-    "check_feature_overlap":     ("cad",  "check_feature_overlap",     "subsecond", "any",   "binary"),
-    "check_symmetry":            ("cad",  "check_symmetry",            "subsecond", "any",   "binary"),
+    # cost classes follow docs/CUSTOM_MODEL_INTEGRATION_SURVEY.md §4.1/4.2
+    "check_interference":        ("cad",  "check_interference",        "seconds",   "any",   "binary"),
+    "check_feature_overlap":     ("cad",  "check_feature_overlap",     "seconds",   "any",   "binary"),
+    "check_symmetry":            ("cad",  "check_symmetry",            "seconds",   "any",   "binary"),
     "wall_thickness":            ("cad",  "wall_thickness",            "seconds",   "any",   "findings"),
     "draft_analysis":            ("cad",  "draft_analysis",            "seconds",   "any",   "findings"),
-    "solve_mates":               ("cad",  "solve_mates",               "subsecond", "any",   "binary"),
+    "solve_mates":               ("cad",  "solve_mates",               "seconds",   "any",   "binary"),
     "review_drawing":            ("cad",  "review_drawing",            "seconds",   "any",   "binary"),
     # --- simulation
-    "run_fea_static":            ("cad",  "run_fea_static",            "seconds",   "any",   "scalar"),
-    "run_fea_modal":             ("cad",  "run_fea_modal",             "seconds",   "any",   "scalar"),
-    "run_cfd_flow":              ("cad",  "run_cfd_flow",              "seconds",   "any",   "scalar"),
+    "run_fea_static":            ("cad",  "run_fea_static",            "minutes",   "any",   "scalar"),
+    "run_fea_modal":             ("cad",  "run_fea_modal",             "minutes",   "any",   "scalar"),
+    "run_cfd_flow":              ("cad",  "run_cfd_flow",              "minutes",   "any",   "scalar"),
     "run_cfd_accurate":          ("cad",  "run_cfd_accurate",          "minutes",   "posix", "scalar"),
     # --- recon
     "compare_parts":             ("recon","compare_parts",             "seconds",   "any",   "scalar"),
     # --- ecad
     "ecad_run_erc":              ("ecad", "ecad_run_erc",              "subsecond", "any",   "binary"),
     "ecad_simulate":             ("ecad", "ecad_simulate",             "seconds",   "any",   "scalar"),
-    "ecad_run_drc":              ("ecad", "ecad_run_drc",              "subsecond", "any",   "binary"),
-    "ecad_run_dfm":              ("ecad", "ecad_run_dfm",              "subsecond", "any",   "findings"),
+    "ecad_run_drc":              ("ecad", "ecad_run_drc",              "seconds",   "any",   "binary"),
+    "ecad_run_dfm":              ("ecad", "ecad_run_dfm",              "seconds",   "any",   "findings"),
     "ecad_check_impedance":      ("ecad", "ecad_check_impedance",      "subsecond", "any",   "scalar"),
     "ecad_check_diff_impedance": ("ecad", "ecad_check_diff_impedance", "subsecond", "any",   "scalar"),
     # --- cam
@@ -56,7 +57,7 @@ CHECKS: dict[str, tuple[str, str, str, str, str]] = {
     "is_manifold":               ("gap",  "is_manifold",               "subsecond", "any",   "binary"),
     "round_trip":                ("gap",  "round_trip",                "seconds",   "any",   "scalar"),
     "groundedness":              ("gap",  "groundedness",              "subsecond", "any",   "scalar"),
-    "unit_sanity":               ("gap",  "unit_sanity",               "subsecond", "any",   "binary"),
+    "unit_sanity":               ("gap",  "unit_sanity",               "subsecond", "any",   "findings"),
     "dim_coverage":              ("gap",  "dim_coverage",              "subsecond", "any",   "scalar"),
     "req_join":                  ("gap",  "req_join",                  "subsecond", "any",   "scalar"),
     "eval_check":                ("gap",  "eval_check_direct",         "subsecond", "any",   "binary"),
@@ -147,12 +148,12 @@ def _gap_round_trip(doc_id: str = None, threshold: float = 99.0, **_) -> str:
     import tempfile
     import os
     from mcp_server import core_bridge as cb
-    from mcp_server.core_bridge import CoreError
     d = doc_id or _cur_doc()
-    step = tempfile.mktemp(suffix=".step")
+    step = tempfile.mktemp(suffix=".step")  # noqa: S306 — same pattern as cad_tools._tmp
     try:
         cb.call("doc_export_step", {"doc_id": d, "path": step})
-        r_imp = cb.call("doc_import", {"path": step})
+        # doc_open is the engine's import path (same op import_part / recover_parts use)
+        r_imp = cb.call("doc_open", {"path": step})
         b_id = r_imp.get("doc_id")
         # compare via compare_parts fn
         compare_fn = _get_fn("recon", "compare_parts")
@@ -169,7 +170,7 @@ def _gap_round_trip(doc_id: str = None, threshold: float = 99.0, **_) -> str:
             "eval_check_clean": clean,
             "threshold": threshold,
         })
-    except (CoreError, Exception) as e:
+    except Exception as e:  # noqa: BLE001
         return json.dumps({"ok": False, "error": str(e)})
     finally:
         try:
@@ -179,16 +180,29 @@ def _gap_round_trip(doc_id: str = None, threshold: float = 99.0, **_) -> str:
 
 
 def _gap_groundedness(model_text: str = "", doc_id: str = None, **_) -> str:
-    """Slot-match numerals in model_text vs current doc state serialization."""
+    """Slot-match numerals in model_text vs the doc's state serialization.
+
+    State = the feature tree (parameter values the text is most likely to cite:
+    lengths, diameters, counts) merged with the mass properties (volume, mass,
+    com). Unmentioned state slots are never penalized, so the breadth is safe.
+    """
     from mcp_server import core_bridge as cb
     d = doc_id or _cur_doc()
+    state: dict = {}
     try:
-        state = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": 7.85})
-    except Exception:
-        state = {}
+        state["tree"] = cb.call("doc_tree", {"doc_id": d})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        state["mass"] = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": 7.85})
+    except Exception:  # noqa: BLE001
+        pass
     from tools.translator.groundedness import check_groundedness
     result = check_groundedness(model_text, state)
-    return json.dumps({"ok": True, **result})
+    ok = not result.get("spurious")  # any ungrounded numeral fails the gate (IP-7)
+    summary = (f"{len(result.get('matched', []))} grounded, "
+               f"{len(result.get('spurious', []))} spurious numeral(s)")
+    return json.dumps({"ok": ok, "summary": summary, **result})
 
 
 def _gap_unit_sanity(doc_id: str = None, **_) -> str:
@@ -204,32 +218,49 @@ def _gap_unit_sanity(doc_id: str = None, **_) -> str:
     return json.dumps({"ok": len(violations) == 0, "violations": violations})
 
 
-def _gap_dim_coverage(doc_id: str = None, **_) -> str:
-    """Count dimensions on the drawing vs unique features — coverage ratio."""
+def _gap_dim_coverage(doc_id: str = None, source_doc_id: str = None, **_) -> str:
+    """Drawing dimension coverage — annotation count vs the source part's feature count.
+
+    doc_id must be a DRAWING document (from make_drawing). Annotations live per-view
+    in drawing_get's sheets->views JSON (core/doc/drawing_session.cpp). When the
+    source part is known (source_doc_id, or recorded in the drawing), coverage =
+    dims / features capped at 1.0; otherwise it degrades to "has any dims at all".
+    """
     from mcp_server import core_bridge as cb
     d = doc_id or _cur_doc()
     try:
-        tree = cb.call("doc_tree", {"doc_id": d})
-        features = (tree.get("tree") or {}).get("features", [])
-        n_features = len(features)
-        try:
-            dims = cb.call("drawing_list_annotations", {"doc_id": d})
-            n_dims = len(dims.get("annotations", []))
-        except Exception:
-            return json.dumps({
-                "ok": False,
-                "error": "drawing_list_annotations not available",
-                "n_dims": 0,
-            })
-        ratio = n_dims / max(n_features, 1)
-        ok = ratio >= 0.5  # at least 0.5 dims per feature
+        full = cb.call("drawing_get", {"doc_id": d})
+        n_dims = 0
+        n_views = 0
+        for sh in full.get("sheets", []) or []:
+            for v in sh.get("views", []) or []:
+                n_views += 1
+                anns = v.get("annotations")
+                if isinstance(anns, list):
+                    n_dims += len(anns)
+        n_features = None
+        src = source_doc_id or full.get("source_doc_id") or full.get("source")
+        if src:
+            try:
+                tree = cb.call("doc_tree", {"doc_id": src})
+                feats = (tree.get("tree") or {}).get("features", [])
+                n_features = len(feats)
+            except Exception:  # noqa: BLE001 — source may have been closed
+                n_features = None
+        if n_features:
+            ratio = min(n_dims / n_features, 1.0)
+            ok = ratio >= 0.5  # at least half the features carry a dimension
+        else:
+            ratio = 1.0 if n_dims > 0 else 0.0
+            ok = n_dims > 0
         return json.dumps({
             "ok": ok,
+            "score": round(ratio, 4),
             "n_dims": n_dims,
+            "n_views": n_views,
             "n_features": n_features,
-            "coverage_ratio": ratio,
         })
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return json.dumps({"ok": False, "error": str(e)})
 
 
@@ -315,7 +346,7 @@ def _extract_score(check_name: str, reward_shape: str, result_json: str) -> tupl
 
     else:  # "findings"
         items = (r.get("pairs") or r.get("faces_below_threshold") or
-                 r.get("violations") or r.get("missed") or [])
+                 r.get("violations") or r.get("spurious") or [])
         score = 1.0 if not items else max(0.0, 1.0 - len(items) * 0.1)
         for item in items:
             findings.append({"check": check_name, "ok": False, "detail": str(item)})

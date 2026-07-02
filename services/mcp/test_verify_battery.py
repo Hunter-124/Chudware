@@ -31,16 +31,35 @@ def test_groundedness_ksi_mpa():
 
 def test_groundedness_spurious():
     from tools.translator.groundedness import check_groundedness
-    # Numeral in text not in state
+    # A numeral in the text with NO state match = hallucination risk -> spurious
     result = check_groundedness("The part is 999 mm tall.", {"height": 50.0})
     assert result["score"] < 0.5
-    assert len(result["spurious"]) >= 1
+    assert len(result["spurious"]) == 1
+    assert result["spurious"][0]["extracted"] == 999.0
+    # the uncited state slot is informational, never penalized
+    assert result["unmentioned_state"][0]["slot"] == "height"
 
 
 def test_groundedness_vacuous():
     from tools.translator.groundedness import check_groundedness
     result = check_groundedness("The design looks great.", {})
     assert result["score"] == pytest.approx(1.0)
+
+
+def test_groundedness_attached_unit():
+    from tools.translator.groundedness import check_groundedness
+    # No space between number and unit ("50mm") must still parse
+    result = check_groundedness("Plate is 50mm x 3in.", {"width": 50.0, "thickness": 76.2})
+    assert result["score"] == pytest.approx(1.0, abs=0.01)
+    assert len(result["matched"]) == 2
+
+
+def test_groundedness_no_false_unit_from_word():
+    from tools.translator.groundedness import check_groundedness
+    # "3 more" must NOT read as "3 m" (3000 mm); bare 3 still matches slot 3.0
+    result = check_groundedness("Add 3 more ribs.", {"rib_count": 3.0})
+    assert result["score"] == pytest.approx(1.0)
+    assert result["matched"][0]["unit"] == ""
 
 
 # ── unit_ranges tests (no engine needed) ────────────────────────────────────
@@ -177,3 +196,38 @@ def test_verify_unknown_check(monkeypatch):
     result = bat.verify(doc_id="x", checks=["nonexistent_check"])
     assert result["scores"]["nonexistent_check"] == 0.0
     assert any("nonexistent_check" in f.get("check", "") for f in result["findings"])
+
+
+def test_verify_findings_deterministic(monkeypatch):
+    """Findings list (not just scores) is identical across repeated runs."""
+    import services.verify.battery as bat
+
+    def mock_get_fn(module_key, fn_name):
+        def stub(**kwargs):
+            return json.dumps({"ok": False, "summary": f"fail-{fn_name}"})
+        return stub
+    monkeypatch.setattr(bat, "_get_fn", mock_get_fn)
+
+    checks = ["check_interference", "check_symmetry", "check_sketch"]
+    r1 = bat.verify(doc_id="x", checks=checks)
+    r2 = bat.verify(doc_id="x", checks=list(reversed(checks)))  # order-independent
+    assert r1["scores"] == r2["scores"]
+    assert r1["findings"] == r2["findings"]
+
+
+def test_verify_overhead_under_50ms(monkeypatch):
+    """DoD: battery overhead over the underlying checks is <50 ms (reward-loop viable).
+
+    With every check stubbed to a no-op, elapsed_ms IS the dispatcher overhead.
+    """
+    import services.verify.battery as bat
+
+    def mock_get_fn(module_key, fn_name):
+        return lambda **kw: json.dumps({"ok": True})
+    monkeypatch.setattr(bat, "_get_fn", mock_get_fn)
+
+    checks = ["check_interference", "check_symmetry", "check_sketch",
+              "measure_part", "ecad_run_erc", "cam_simulate"]
+    bat.verify(doc_id="x", checks=checks)          # warm the signature cache path
+    result = bat.verify(doc_id="x", checks=checks)
+    assert result["elapsed_ms"] < 50.0

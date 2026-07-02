@@ -1,10 +1,18 @@
 """Groundedness checker — slot-match numerals in model text vs CAD state.
 
-Shared between the verify-battery (T-H4) and the GSL eval harness (T-F10).
+ONE implementation, two callers: the verify-battery (T-H4) and the GSL
+slot-fidelity eval harness (T-F10). Also the IP-7 inference output gate.
+
 Usage:
     from tools.translator.groundedness import check_groundedness
     result = check_groundedness(model_text, state_dict)
-    # result: {"score": 0.0..1.0, "matched": [...], "missed": [...], "spurious": [...]}
+    # result: {"score": 0..1,
+    #          "matched":  [...],   # text numerals grounded in a state slot
+    #          "spurious": [...],   # text numerals with NO state match (hallucination risk)
+    #          "unmentioned_state": [...]}  # state slots the text never cites (informational)
+
+score = matched / total_text_numerals — only SPURIOUS numerals cost reward; the
+text is never penalized for not reciting every state value.
 """
 from __future__ import annotations
 
@@ -48,18 +56,22 @@ UNIT_FACTORS: dict[str, tuple[str, float]] = {
 }
 
 # Regex to match numbers (int/float/scientific) with an optional unit token.
-# Captures: (number_str, unit_str_or_empty)
+# The number and unit are SEPARATE named groups so attached units ("50mm") parse.
+# The (?![A-Za-z0-9]) lookahead stops "3 more" reading as "3 m" + "ore".
 _NUM_RE = re.compile(
     r"""
-    [-+]?                       # optional sign
-    (?:
-        \d+\.?\d*               # integer or decimal
-      | \.\d+                   # leading-dot decimal
+    (?P<num>
+        [-+]?                   # optional sign
+        (?: \d+\.?\d*           # integer or decimal
+          | \.\d+ )             # leading-dot decimal
+        (?:[eE][-+]?\d+)?       # optional scientific exponent
     )
-    (?:[eE][-+]?\d+)?           # optional scientific exponent
     (?:\s*                      # optional whitespace before unit
-        (mm²|mm³|mm2|mm3|MPa|GPa|ksi|psi|lbf|kN|kn|kg|lb|cm|ft|in|
-         deg|rad|°|mm|[gmn%])   # unit token (order matters: longer first)
+        (?P<unit>
+            mm²|mm³|mm2|mm3|MPa|GPa|ksi|psi|lbf|kN|kg|lb|cm|ft|in|
+            deg|rad|°|mm|[gmnGMN]|%
+        )
+        (?![A-Za-z0-9])         # unit must end at a word boundary
     )?
     """,
     re.VERBOSE | re.IGNORECASE,
@@ -71,11 +83,10 @@ def _parse_numerals(text: str) -> list[tuple[float, str]]:
     results = []
     for m in _NUM_RE.finditer(text):
         try:
-            val = float(m.group(0).split()[0] if m.group(1) else m.group(0))
-            unit = (m.group(1) or "").strip()
-            results.append((val, unit))
-        except (ValueError, AttributeError):
+            val = float(m.group("num"))
+        except ValueError:
             continue
+        results.append((val, (m.group("unit") or "").strip()))
     return results
 
 
@@ -119,10 +130,10 @@ def check_groundedness(model_text: str, state_dict: dict) -> dict:
 
     Returns:
         {
-            "score": float 0..1,
-            "matched": list of {extracted, unit, slot, slot_value},
-            "missed":  list of {extracted, unit},  # in text but no matching slot
-            "spurious": list of {slot, value},      # in state but not mentioned
+            "score": float 0..1 (= matched / total text numerals),
+            "matched":  list of {extracted, unit, slot, slot_value},
+            "spurious": list of {extracted, unit},   # in text, NO state match — hallucination risk
+            "unmentioned_state": list of {slot, value},  # in state, never cited (informational)
         }
     """
     # Extract and normalize numerals from text
@@ -137,12 +148,13 @@ def check_groundedness(model_text: str, state_dict: dict) -> dict:
     # Also try normalizing slot values (they are assumed to be in SI already)
     slot_norms = [(name, val) for name, val in slots]
 
-    # Edge case: no numerals in text AND no numerals in state → vacuously grounded
-    if not extracted and not slot_norms:
-        return {"score": 1.0, "matched": [], "missed": [], "spurious": []}
+    # Edge case: no numerals in the text → vacuously grounded (nothing to hallucinate)
+    if not extracted:
+        return {"score": 1.0, "matched": [], "spurious": [],
+                "unmentioned_state": [{"slot": n, "value": v} for n, v in slot_norms]}
 
     matched: list[dict] = []
-    missed: list[dict] = []
+    spurious: list[dict] = []
     used_slots: set[str] = set()
 
     for raw_val, unit, norm_val in extracted:
@@ -166,20 +178,17 @@ def check_groundedness(model_text: str, state_dict: dict) -> dict:
                 "slot_value": best_slot[1],
             })
         else:
-            missed.append({"extracted": raw_val, "unit": unit})
+            spurious.append({"extracted": raw_val, "unit": unit})
 
-    spurious = [
+    unmentioned = [
         {"slot": name, "value": val}
         for name, val in slot_norms
         if name not in used_slots
     ]
 
-    total = len(extracted)
-    score = len(matched) / max(total, 1) if total > 0 else 1.0
-
     return {
-        "score": score,
+        "score": len(matched) / len(extracted),
         "matched": matched,
-        "missed": missed,
         "spurious": spurious,
+        "unmentioned_state": unmentioned,
     }

@@ -1,84 +1,101 @@
-# Supervisor handoff — Fable foreman session (2026-07-02)
+# Supervisor handoff — for the OPUS successor foreman (updated 2026-07-02, Fable v2)
 
-For the incoming Fable supervisor. Read this + [FOREMAN.md](FOREMAN.md) (protocol,
-pitfalls, discipline rules, full check-in ledger) before doing anything. Your memory
-directory has `subagent-supervision-lessons` and `pillar16-flywheel-decisions` —
-recall them.
+You are likely an Opus session taking over when Erik's Fable tokens ran out. Read this +
+[FOREMAN.md](FOREMAN.md) (protocol, pitfalls, discipline rules, full ledger + MERGE PLAN)
+before doing anything. Memory dir has `subagent-supervision-lessons`,
+`pillar16-flywheel-decisions`, `gate-selmulti-blocker` (now RESOLVED) — recall them.
 
 ## Your role
 
-You are the FOREMAN, not a builder: dispatch drivers, enforce the FOREMAN protocol,
-review branches to REVIEW verdicts, answer `work/questions/<id>.md` files (commit
-`ANSWER (Fable):` blocks), keep the check-in ledger current, batch true human-only
-decisions into FOREMAN's "For Erik" section. Spend your own tokens on decisions and
-reviews; Sonnet drivers build (Opus for gnarly cross-language work). fable-arc (a
-peer Fable/Opus CLI session) has co-supervisor standing: it reviews the WS-B/E lanes
-and its own arc — its rulings have been sound; don't duplicate its reviews.
+FOREMAN, not builder: dispatch drivers (Sonnet builds; you review), review branches to
+REVIEW verdicts, answer `work/questions/<id>.md` with committed `ANSWER (Fable):` blocks
+(keep the label for ledger continuity), enforce closeout checklists, batch true
+human-only calls into FOREMAN's "For Erik". Audit ground truth via git before believing
+anything (`git show origin/<branch>:work/tasks/<id>.md | grep status` — board shows
+`doing` until merge).
 
-## State at handoff
+## State at this handoff
 
-**~21 branches at status: review awaiting Erik's merges** (statuses live on branches;
-the master board shows `doing` until merge — always audit via
-`git show origin/<branch>:work/tasks/<id>.md | grep status`). Recorded merge orders:
-B1a→B1b→B2→B3→B4 · E1→E2→{E3,E4} · F1→F2 · F14→F15→F16 · G2→G4 · rest independent
-(H1,H2,H3,H4,F7,F13,F3,F5,F9,C1,D1). Merge-time flags: T-F2 changes desktop FEA
-material defaults (fable-arc flagged, Erik must eyeball); trivial `server.py`
-append conflicts everywhere (keep all lines).
+- **~30 branches at status:review.** The complete one-pass **MERGE PLAN for Erik** is in
+  FOREMAN.md (orders, the T-F2 FEA-defaults eyeball flag, keep-all-lines server.py rule,
+  H5/H7 `tools/flywheel/__init__.py` keep-both, T-G5 status conflict).
+- **Master builds clean** since `b569020` (the selMulti break was a half-landed commit,
+  fixed; ui/imgui gate failures are now REAL). T-A1 proved a master-based branch passes
+  the ui/imgui gate.
+- **All wave-2 tasks reviewed LGTM:** F8, H5, H7, E5, F6, A1 (all six survived a host
+  process exit via the finisher pattern — see playbook), F16 (Pillar 15 arc complete).
+- **In flight, NOT yours:** opus-vex on T-B5, opus-vale on T-G6 (dedicated flock'd GUI
+  integrator), Erik's own Opus CLI lanes on T-C2 / T-D2 / T-H8 (prompts already issued —
+  transcripts in this session's log if they need reissuing).
+- **Next dispatches when deps land:** T-A2 → T-A3 → T-A4 (chain off task/T-A1-dag-schema;
+  A3 owns the libaicad.so restage), then T-F4/T-F17/T-F12 (open after A3/A4), T-H6 (after
+  H5 merges), T-H9/H10/H11 (after H8). T-G7+ stay with opus-vale's lane. T-F11 is
+  ship-gated — Erik call.
 
-**In flight:** fable-arc on T-F16 (last of its arc). Nothing else runs; no orphans
-(audited — see FOREMAN STUCK-AUDIT line).
+## THE POINT OF THIS HANDOFF: every hard task is pre-paid
 
-**Blocked next wave — dispatch the moment merges land** (`python3 work/tools/work.py
-ready` after each merge): T-F4, T-F8, T-H5, T-H7, T-H8, T-B5, T-E5, T-F17, T-F6,
-T-F11 (gated), T-F12, T-H6, T-H9, T-H10, T-H11. Every one already carries a
-"Driver notes (Fable)" section — pre-paid pointers; dispatch prompts should tell
-drivers to trust them.
+All nine remaining hard tasks carry a **"Driver notes (Fable)"** section with binding
+architecture rulings — dispatch is mechanical; drivers must trust the notes:
 
-## Dispatch playbook (proven today)
+- **T-F17**: agent_action bridge = worker-RPC per the T-F16 precedent (NO GUI→core/agent
+  linkage); one event vocabulary (`contracts/agent_events.md` binding T-H1 telemetry +
+  aicad.dag/1 events); inherits the deferred panel buttons + inline artifact card unless
+  T-G7 took them.
+- **T-H9**: Erik's ratified promotion gate encoded (shadow-win on verifier-score AND
+  accept-rate + Erik manual sign-off per promotion; NO auto-promote; rollback = table
+  flip). Fills the reserved `routing` stub in contracts/providers.md.
+- **T-H10**: model choices LOCKED (Qwen3-VL-4B primary); v0 = bench+corpus+zero-shot
+  ONLY, no training (RECOGNITION_RESIDUAL discipline).
+- **T-H11**: frontier-first through T-H7 logging; binary verifier = rebuild passes AND
+  compare_parts ≈100% unaffected; migration criteria frozen before training.
+- **T-H6**: extend T-H5's docker-compose + dvc_init helpers; work.py claim idiom; no
+  orchestrator deps.
+- **T-A2/A3/A4, T-F12**: bound to the frozen aicad.dag/1 seams; A4's verify dispatch is
+  reused by F12's design_review.
 
-Spawn general-purpose agents, model sonnet, run_in_background, one per task. The
-prompt must include, verbatim in spirit: (1) agent name `sonnet-<syllable>`; (2) run
-`python3 work/tools/work.py prompt T-XX` and follow the work order exactly incl.
-claim; (3) read FOREMAN.md first, all its rules binding; (4) **WORK INLINE — subagents
-one at a time, results collected in the same turn; NO watchers/fire-and-forget** (the
-#1 Sonnet failure mode; expect to re-enforce it near the finish line anyway with a
-literal closeout checklist: gate → graphify update → honest DoD → status: review →
-push → FOREMAN check-in → final summary); (5) commit+push every ~20 min; (6) known
-pre-existing failures (selMulti, check.py feature_surface_audit, pytest-OCP skips) —
-note, never chase; if gate pytest skips, run manually via
-`~/.local/share/AI-CAD/mcp-venv/bin/pytest` and record counts; (7) chained tasks
-branch FROM their predecessor's branch with merge order recorded in the REVIEW
-check-in; (8) escalations to work/questions/T-XX.md; never merge, never set done;
-(9) final message = concise report to you.
+## Dispatch playbook (proven ×2 today)
 
-## Open threads the successor inherits
+Spawn general-purpose agents, model sonnet, run_in_background, one per task. Prompt must
+include: agent name `sonnet-<syllable>`; work order via `python3 work/tools/work.py
+prompt T-XX`; FOREMAN.md binding; manual chained claim when deps are review-not-done
+(owner+status:doing on master + CLAIMED check-in with merge order; worktree from the
+predecessor branch); **WORK INLINE — foreground subagents one at a time, collected same
+turn, NEVER end a turn waiting** (still the #1 failure mode — 4 of 6 drivers stalled
+this way at first checkpoint; a firm resume message fixes it every time); commit+push
+~20 min; literal closeout checklist (gate → graphify update → honest DoD → status:review
+→ push → FOREMAN check-in → report); escalate via question files; never merge/done.
 
-1. **T-F16** — review it when fable-arc posts REVIEW (or finish/redispatch if arc
-   dies on its Fable budget; its arc log is docs/sessions/PILLAR15_ARC_LOG.md).
-2. **Post-merge alignment commits** (small, first driver in the area does them):
-   req_join ↔ contracts/requirements.md constants + T-H3 importing
-   services/verify/unit_ranges.RANGES (FOREMAN 2026-07-02 note); T-H4's
-   groundedness module conforming to T-F10's GroundednessChecker protocol
-   (fable-arc's interface ruling in work/questions/T-F10.md — harness owns intrinsic
-   tagging, checker owns membership only).
-3. **T-F17 inheritance:** GUI-side action emission needs an `agent_action` bridge
-   RPC (GUI can't link core/agent — C-ABI only; work/questions/T-H1.md).
-4. **Human-gated, batch for Erik:** DVC remote bucket + Argilla/MLflow hosting boxes
-   (T-H5/T-H6); AI-CAD Cloud relay anything; model-promotion criteria (T-H9);
-   T-G2's four NEEDS-LIVE click-tests → T-G12 checklist; E3-hooks retarget decision
-   (T-G4 backlog note); issue #1 stale-branch cleanup after merges.
-5. **T-G5–T-G9** (GUI migration waves): swarm-integrator tasks — each wants a
-   dedicated session with the flock'd build, not a fleet slot.
-6. **Stale staged libaicad.so** predates sim_run_static — next C++ task refreshes it.
+**Finisher pattern (new, proven ×6):** when a driver dies (session limit / process
+exit), its pushed commits + worktree survive. Dispatch a FINISHER: assess git log +
+uncommitted worktree state, salvage coherent work, fill genuine gaps, run the closeout.
+Do NOT restart the task.
 
-## Strategic context (one paragraph)
+**All-skip trap (new):** a suite that skips 100% reads as green. Require REAL executed
+test counts at review; in worktrees the .so lives at `core/build-linux/bin/libaicad.so`
+— `AI_CAD_LIBAICAD=$PWD/core/build-linux/bin/libaicad.so mcp-venv/bin/pytest ...`
+(root cause filed as a GitHub issue; check if fixed).
 
-Today built Pillar 16's foundation: docs/CUSTOM_MODEL_INTEGRATION_SURVEY.md (21 model
-insertion points, flywheel design, roadmap), docs/VLM_OFFLINE_TRACK.md (Qwen3-VL-4B
-primary), workstream H cut and largely built (telemetry capture → data store →
-fleet training → serving/canary), plus F/B/E waves. Ratified decisions: capture now
-train later; multi-state own-machine fleet, job-level distribution only; team dogfood
-corpus first; R1 editability parity (model outputs land as doc-ops/document-schema
-artifacts, always GUI-editable). The long line: merge → next wave (H5/H7/H8, F4/F8) →
-benches (H8) → frontier-logged features (elicitation, regen-fix, drawing gen) →
-first custom models (T-F11 translator, then T-H11 regen-fix per §6 of the survey).
+## Erik's ratified decisions (2026-07-02 — binding, do not re-ask)
+
+1. WS-A opened to agents (Bruh reservation lifted).
+2. T-H5/H6 infra: DVC remote = local file:// default; Argilla+MLflow = docker on this PC.
+3. T-H9 promotion = shadow-win + Erik sign-off each promotion.
+4. T-G12 walkthrough is RECURSIVE until a round yields zero new must-fix findings; T-G9
+   sign-off formally gated on convergence.
+5. Standing: capture-now-train-later; job-level fleet distribution only; team-dogfood
+   corpus; R1 editability parity; Qwen3-VL-4B offline-VLM primary.
+
+## Open for Erik (batch, don't nag)
+
+The merge session (biggest lever — everything compounds on it); T-G12 round 1 after GUI
+merges; E3-hooks retarget decision (T-G4 backlog note); DVC NAS path + `docker compose
+up` when he wants live Argilla/MLflow; T-F11 ship gate; issue #1 stale-branch cleanup
+post-merge.
+
+## Post-merge steps (after Erik merges)
+
+Resolve trivial server.py append conflicts (keep all lines) if asked; then on master:
+`python3 work/tools/work.py dag && graphify update .`; dispatch the newly-ready wave
+(T-A2 first — it unblocks the most); land the recorded alignment commits (req_join ↔
+requirements constants; T-H3 imports unit_ranges.RANGES; T-H4 groundedness conforms to
+T-F10's GroundednessChecker protocol per work/questions/T-F10.md).

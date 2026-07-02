@@ -1,0 +1,114 @@
+"""``datasheet_fetch(source)`` — PDF -> markdown (text + best-effort table layout) for
+datasheets. Contract ``contracts/research_tools.md`` §1/§3.
+
+Pillar 8 legal (CONTRIBUTING.md, ``contracts/licenses.md``): the PDF extractor must be
+**MIT/permissive** — ``pdfminer.six`` (MIT) is used when present. **PyMuPDF / pymupdf4llm
+are AGPL and are never imported in-process here.** The dep is *optional and
+feature-detected*: with no PDF tool installed the helper returns the §6 degradation shape
+(``reason:"no_pdf_tool"``) — CI stays green with zero new hard dependencies.
+"""
+from __future__ import annotations
+
+import io
+import os
+from typing import Optional
+
+from .common import HIGH, MEDIUM, envelope, fail, is_offline, now_ts
+
+_MAX_MD = 200_000  # cap markdown to protect the model window (matches fetch_page §3)
+
+
+def _load_extractor():
+    """Return a ``(text_fn, name)`` for an installed MIT PDF extractor, or ``None``.
+    Only permissive-licensed tools are considered; AGPL PyMuPDF is intentionally excluded."""
+    try:
+        from pdfminer.high_level import extract_text  # type: ignore  # MIT
+        return extract_text, "pdfminer.six"
+    except Exception:  # noqa: BLE001 - optional dep absent
+        return None
+
+
+def _to_markdown(text: str) -> str:
+    """Best-effort text -> markdown: collapse runaway blank lines, keep line structure so
+    tabular whitespace survives. (True cell-grid recovery is a later enhancement.)"""
+    lines = [ln.rstrip() for ln in text.replace("\r\n", "\n").split("\n")]
+    out: list[str] = []
+    blanks = 0
+    for ln in lines:
+        if ln.strip():
+            out.append(ln)
+            blanks = 0
+        else:
+            blanks += 1
+            if blanks <= 1:
+                out.append("")
+    md = "\n".join(out).strip()
+    return md[:_MAX_MD]
+
+
+def _read_bytes(source: str) -> tuple[Optional[bytes], Optional[dict]]:
+    """Load PDF bytes from a local path or URL. Returns ``(data, None)`` or
+    ``(None, degradation)``."""
+    s = str(source).strip()
+    if s.lower().startswith(("http://", "https://")):
+        if is_offline():
+            return None, fail("offline", "Offline mode blocks fetching a remote PDF; pass a local path.")
+        try:
+            import httpx  # BSD, already a dep
+            r = httpx.get(s, follow_redirects=True, timeout=30.0,
+                          headers={"User-Agent": "AI-CAD-research/1.0"})
+            r.raise_for_status()
+            return r.content, None
+        except Exception as exc:  # noqa: BLE001
+            return None, fail("network", f"Could not fetch {s!r}: {exc}.")
+    if not os.path.isfile(s):
+        return None, fail("bad_url", f"No such PDF file: {s!r} (pass a local path or http(s) URL).")
+    try:
+        with open(s, "rb") as fh:
+            return fh.read(), None
+    except OSError as exc:
+        return None, fail("bad_url", f"Could not read {s!r}: {exc}.")
+
+
+def datasheet_fetch(source: str, tier: str = "datasheet") -> dict:
+    """Extract a datasheet PDF (local path or URL) to markdown, returning the §1 envelope
+    plus ``url``/``title``/``content``. Requires an installed MIT PDF tool
+    (``pdfminer.six``); its absence degrades (§6 ``no_pdf_tool``) rather than raising."""
+    if not source or not str(source).strip():
+        return fail("bad_url", "Provide a PDF path or http(s) URL.")
+
+    extractor = _load_extractor()
+    if extractor is None:
+        return fail("no_pdf_tool",
+                    "No permissive PDF extractor installed. Add MIT-licensed 'pdfminer.six' "
+                    "(pip install pdfminer.six). PyMuPDF/pymupdf4llm are AGPL and excluded.")
+    extract_text, tool = extractor
+
+    data, err = _read_bytes(source)
+    if err is not None:
+        return err
+
+    try:
+        text = extract_text(io.BytesIO(data)) or ""
+    except Exception as exc:  # noqa: BLE001 - never raise across the boundary
+        return fail("network", f"PDF extraction failed via {tool}: {exc}.")
+
+    md = _to_markdown(text)
+    if not md:
+        return fail("not_found", f"{source!r} yielded no extractable text (scanned/image PDF?).")
+
+    is_url = str(source).lower().startswith(("http://", "https://"))
+    title = os.path.basename(str(source).split("?")[0]) or "datasheet.pdf"
+    return envelope(
+        f"{title} — datasheet extracted to markdown ({len(md)} chars via {tool})",
+        units=None,
+        source_url=source if is_url else None,
+        quote=None,
+        fetched_ts=now_ts(),
+        confidence=MEDIUM if len(md) < len(text or "") else HIGH,
+        url=source if is_url else None,
+        title=title,
+        content=md,
+        extractor=tool,
+        tier=tier,
+    )

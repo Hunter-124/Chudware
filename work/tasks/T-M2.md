@@ -64,8 +64,12 @@ Audit: work/audits/CAM_AUDIT.md §3.2, §T-M2.
   roughing now also links rings with arc-blend (strictly bounded-engagement improvement; all
   existing waterline/pocket tests still pass). Set the flag false for byte-identical legacy
   concentric linking.
-- Gate: see REVIEW line (core build + ctest are the load-bearing stages for a core/cam change
-  and are green; other gate reds are the documented pre-existing check.py + pytest-issue-#6 ones).
+- Gate (`scripts/gate.sh`, run in a clean worktree): **core build PASS, ctest PASS (100%),
+  ui/imgui build + --shot PASS** — every stage that could reflect a core/cam change is green.
+  RESULT:FAIL is entirely pre-existing/env: check.py audits (do-not-chase), pytest "107
+  deselected" (issue #6 gate-venv gap), and ui/imgui `--selftest` FAIL = "engine not ready
+  (Python runtime not installed, expected .../runtime/venv/bin/python)" — a missing-bundled-
+  runtime ENV gap, not a CAM regression. None are from this change.
 
 ## Driver notes (Fable)
 

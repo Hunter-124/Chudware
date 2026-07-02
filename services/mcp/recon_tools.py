@@ -1251,6 +1251,7 @@ def register_photo_recon_tools(mcp: FastMCP) -> None:
                 })
 
             session = start_session(port=port)
+            port = session.port                       # resolved (port=0 -> ephemeral pick)
             # Store scale_marker_mm alongside the session
             session._scale_marker_mm = scale_marker_mm  # type: ignore[attr-defined]
             _SESSIONS[port] = session
@@ -1288,6 +1289,7 @@ def register_photo_recon_tools(mcp: FastMCP) -> None:
             from engine.vision import photogrammetry as _pg
             from engine.vision import mesh_cleanup as _mc
             import os as _os
+            import shutil as _shutil
             import tempfile
 
             session = _SESSIONS.pop(port, None)
@@ -1318,17 +1320,14 @@ def register_photo_recon_tools(mcp: FastMCP) -> None:
                 )
                 # Clean up work_dir only if we're not handing it off
                 if work_dir is not None and photo_count == 0:
-                    try:
-                        work_dir.cleanup()
-                    except Exception:  # noqa: BLE001
-                        pass
+                    _shutil.rmtree(work_dir, ignore_errors=True)
                 return _dumps(result)
 
             # Run photogrammetry reconstruction
             recon_dir = tempfile.mkdtemp(prefix="aicad_recon_")
             scale_mm = getattr(session, "_scale_marker_mm", None)
             recon = _pg.reconstruct(
-                image_dir=work_dir.name,
+                image_dir=work_dir,
                 out_dir=recon_dir,
                 scale_mm=scale_mm,
             )
@@ -1366,10 +1365,7 @@ def register_photo_recon_tools(mcp: FastMCP) -> None:
 
             # Clean up photo work_dir now that mesh is written to recon_dir
             if work_dir is not None:
-                try:
-                    work_dir.cleanup()
-                except Exception:  # noqa: BLE001
-                    pass
+                _shutil.rmtree(work_dir, ignore_errors=True)
 
             return _dumps(result)
         except Exception as e:  # noqa: BLE001

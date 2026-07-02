@@ -1,6 +1,10 @@
-"""Root conftest.py — stubs optional heavy deps before any package __init__ fires.
+"""Root conftest.py — stub optional heavy deps ONLY when they are genuinely absent.
 
-This lets the vision/photogrammetry tests run without PIL, cv2, open3d installed.
+engine.vision.__init__ eagerly imports engine.vision.ingest, which needs Pillow (a declared
+runtime dep). On a bare box without Pillow/cv2, collection of ANY test that touches engine
+would die on that import — so we stub just enough for import-time. When the real library IS
+installed we must NOT shadow it (T-F5's test_vision.py makes real photos with Pillow), hence
+the try/except-import guard rather than a `sys.modules` presence check.
 """
 from __future__ import annotations
 
@@ -15,29 +19,27 @@ def _stub(name: str, **attrs) -> types.ModuleType:
     return mod
 
 
-# PIL / Pillow — needed by engine.vision.ingest (imported eagerly in __init__)
-if "PIL" not in sys.modules:
+# PIL / Pillow — needed at import time by engine.vision.ingest.
+try:
+    import PIL.Image  # noqa: F401  (real Pillow wins whenever installed)
+except ImportError:
     pil = _stub("PIL")
-    img = _stub("PIL.Image")
 
     class _FakeImage:
         LANCZOS = 1
 
         @staticmethod
         def open(*a, **kw):
-            raise RuntimeError("PIL stub")
+            raise RuntimeError("PIL stub: Pillow is not installed in this test env")
 
         @staticmethod
         def fromarray(*a, **kw):
-            raise RuntimeError("PIL stub")
+            raise RuntimeError("PIL stub: Pillow is not installed in this test env")
 
-    img.Image = _FakeImage
-    img.open = _FakeImage.open
-    img.LANCZOS = _FakeImage.LANCZOS
+    img = _stub("PIL.Image", Image=_FakeImage, open=_FakeImage.open, LANCZOS=1)
     pil.Image = img
     sys.modules["PIL"] = pil
     sys.modules["PIL.Image"] = img
 
-# cv2 — needed by engine.vision.fiducial (imported eagerly in __init__)
-if "cv2" not in sys.modules:
-    sys.modules["cv2"] = _stub("cv2")
+# cv2 — engine.vision.fiducial already guards its own import (HAVE_CV2), so no stub is
+# needed; tests that need real cv2 use pytest.importorskip("cv2").

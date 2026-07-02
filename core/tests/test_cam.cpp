@@ -228,6 +228,58 @@ TEST_CASE("feeds: HSS tool is slower than carbide") {
     CHECK(h.rpm < c.rpm);
 }
 
+TEST_CASE("feeds: merge_cam overwrites only the feeds fields, preserves identity") {
+    CuttingDB db;
+    json cam;
+    cam["id"] = "aluminum";
+    cam["sfm_mill"] = 1234.0;   // only this feeds field supplied
+    json reg;
+    reg["materials"]["some_registry_alloy"]["cam"] = cam;
+    db.merge_cam(reg);
+    const MaterialData* m = db.find("aluminum");
+    REQUIRE(m != nullptr);
+    CHECK(m->sfm_mill == doctest::Approx(1234.0));   // overwritten
+    CHECK(m->sfm_drill == doctest::Approx(300.0));   // untouched (stays in-code)
+    CHECK(m->name == "Aluminum 6061");               // identity preserved
+    CHECK(m->group == "nonferrous");
+    CHECK(m->density_g_cm3 == doctest::Approx(2.70));
+    // A cam.id with no in-code row is skipped (no phantom row added).
+    json reg2;
+    reg2["materials"]["x"]["cam"] = json{{"id", "no_such_group"}, {"sfm_mill", 5.0}};
+    size_t before = db.material_ids().size();
+    db.merge_cam(reg2);
+    CHECK(db.material_ids().size() == before);
+}
+
+#ifdef AICAD_TEST_REGISTRY
+TEST_CASE("feeds: registry cam fold-in reproduces the in-code table byte-identically (T-M4)") {
+    std::ifstream fh(AICAD_TEST_REGISTRY);
+    REQUIRE_MESSAGE(fh.good(), "registry.json not found at AICAD_TEST_REGISTRY");
+    json doc = json::parse(fh, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(doc.is_discarded());
+
+    // Guard against a silent empty-merge false-pass: the registry must actually carry cam sections.
+    int folded = 0;
+    for (auto it = doc["materials"].begin(); it != doc["materials"].end(); ++it)
+        if (it.value().is_object() && it.value().contains("cam")) ++folded;
+    CHECK(folded == 12);
+
+    CuttingDB pure;              // in-code baseline
+    CuttingDB merged;           // in-code + registry cam fold-in
+    merged.merge_cam(doc);
+
+    CHECK(pure.material_ids() == merged.material_ids());
+    for (const auto& id : pure.material_ids()) {
+        const MaterialData* a = pure.find(id);
+        const MaterialData* b = merged.find(id);
+        REQUIRE(a != nullptr);
+        REQUIRE(b != nullptr);
+        // All 14 fields compared via JSON (feeds + identity) — a defaulted mismatch cannot slip.
+        CHECK(a->to_json() == b->to_json());
+    }
+}
+#endif
+
 TEST_CASE("feeds: rigid tap feed equals rpm times pitch") {
     Machine m;
     Tool tap; tap.type = ToolType::Tap; tap.diameter = 5; tap.thread_pitch = 0.8;

@@ -265,6 +265,10 @@ add_executable(test_cam
   tests/test_cam.cpp)
 target_include_directories(test_cam PRIVATE ${doctest_SOURCE_DIR})
 target_link_libraries(test_cam PRIVATE aicad_cam)
+# T-M4: the byte-identical feeds test reads the source-tree registry.json (the CAM fold-in
+# ground truth); pass its absolute path so the test runs from the build dir.
+target_compile_definitions(test_cam PRIVATE
+  AICAD_TEST_REGISTRY="${CMAKE_CURRENT_SOURCE_DIR}/../engine_oracle/materials/registry.json")
 set_target_properties(test_cam PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME cam COMMAND test_cam)

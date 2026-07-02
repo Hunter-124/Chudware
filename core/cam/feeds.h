@@ -46,6 +46,13 @@ class CuttingDB {
 public:
     CuttingDB();                          // loads the builtin table
     void merge(const json& overrides);    // {"materials": [MaterialData...]} merge/replace by id
+    // Fold the engine materials registry's per-material `cam` sub-sections onto this DB
+    // (T-M4 / Issue #2). `registry` is the parsed registry.json ({"materials": {key: {..,
+    // "cam": {"id", sfm_*, ...}}}}); for each material carrying a `cam` object, the 10 feeds
+    // fields are overwritten on the in-code row named by `cam.id` — identity (id/name/group/
+    // density) is preserved, and a `cam.id` with no in-code row is skipped. Additive to
+    // merge(): this only touches cam feeds fields, never adds/replaces whole rows.
+    void merge_cam(const json& registry);
     const MaterialData* find(const std::string& id) const;
     std::vector<std::string> material_ids() const;
     json to_json() const;                 // {"materials": [...]} (full effective table)

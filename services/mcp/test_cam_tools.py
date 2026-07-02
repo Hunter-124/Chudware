@@ -35,6 +35,70 @@ def _build_part_step() -> str:
     return path
 
 
+def _check_registry_foldin(check) -> None:
+    """DoD (T-M4): CuttingDB::builtin() loads the materials registry at RUNTIME (in-code fallback).
+
+    Discriminating check: point the core at a registry copy whose aluminum cam.sfm_mill is a value
+    NOT in the in-code table, in a FRESH subprocess (builtin() is a cached singleton), and confirm
+    cam_materials reflects it — proving a real file load, not a build-time snapshot."""
+    import json
+    import subprocess
+    try:
+        reg = json.loads((_registry_path()).read_text())
+        reg["materials"]["aluminum_6061_t6"]["cam"]["sfm_mill"] = 4321.0
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "registry.json")
+        with open(p, "w") as fh:
+            json.dump(reg, fh)
+    except Exception as e:  # noqa: BLE001
+        print(f"  skip: registry fold-in setup ({e})")
+        return
+    env = dict(os.environ, AICAD_MATERIALS_REGISTRY=p)
+    code = (
+        "import sys; sys.path[:0]=['services/mcp','.']\n"
+        "from mcp_server import core_bridge as cb\n"
+        "m={x['id']:x for x in cb.call('cam_materials',{})['materials']}\n"
+        "print(m['aluminum']['sfm_mill'])\n"
+    )
+    try:
+        out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                             text=True, timeout=120, cwd=os.getcwd())
+        val = float((out.stdout.strip().splitlines() or ["0"])[-1])
+        check(val == 4321.0, "cam_materials reflects the registry at runtime (in-code fallback)")
+        # And unset -> in-code stands (aluminum's builtin sfm_mill is 900). The raw RPC has no
+        # cam_tools wiring, so with no env it falls back to the in-code table.
+        env2 = dict(os.environ)
+        env2.pop("AICAD_MATERIALS_REGISTRY", None)
+        out2 = subprocess.run([sys.executable, "-c", code], env=env2, capture_output=True,
+                             text=True, timeout=120, cwd=os.getcwd())
+        val2 = float((out2.stdout.strip().splitlines() or ["0"])[-1])
+        check(val2 == 900.0, "unset registry -> CuttingDB in-code table stands (headless fallback)")
+    except Exception as e:  # noqa: BLE001
+        check(False, f"registry fold-in runtime check: {e}")
+
+
+def _check_add_setup_material_resolution(check) -> None:
+    """DoD (T-M4): cam_add_setup accepts any registry material ID (translated to a cutting group)."""
+    try:
+        from mcp_server.cam_tools import _resolve_cam_material
+    except Exception as e:  # noqa: BLE001
+        print(f"  skip: cam_add_setup material resolution ({e})")
+        return
+    rid, note = _resolve_cam_material("aluminum_6061_t6")
+    check(rid == "aluminum" and note is None, "registry id 'aluminum_6061_t6' -> group 'aluminum'")
+    ralias, _ = _resolve_cam_material("6061")
+    check(ralias == "aluminum", "registry alias '6061' -> group 'aluminum'")
+    rgroup, _ = _resolve_cam_material("steel_mild")
+    check(rgroup == "steel_mild", "bare CuttingDB id 'steel_mild' passes through")
+    rnone, note2 = _resolve_cam_material("peek")   # a registry material with no cam fold-in
+    check(rnone == "peek" and bool(note2), "registry material w/o cam data accepted + noted")
+
+
+def _registry_path():
+    from engine.materials import registry as _reg
+    return _reg.registry_path()
+
+
 def main() -> int:
     if not cb.available():
         print("SKIP: libaicad not available (build the C++ core to run this test).")
@@ -66,6 +130,10 @@ def main() -> int:
     check("fanuc" in ids and "grbl" in ids, "fanuc + grbl present")
     check(len(cb.call("cam_materials", {})["materials"]) >= 20, "cutting DB has >=20 materials")
     check(len(cb.call("cam_op_types", {})["op_types"]) == 28, "28 operation types")
+
+    # T-M4: the CuttingDB folds the engine materials registry's `cam` sub-sections at runtime.
+    _check_registry_foldin(check)
+    _check_add_setup_material_resolution(check)
 
     # job lifecycle: new -> tools -> setup -> ops -> generate -> post
     job = cb.call("cam_new", {"name": "SmokeJob", "post": "fanuc"})

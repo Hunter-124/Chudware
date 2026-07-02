@@ -126,6 +126,29 @@ training:
     assert recipe["training"]["max_steps"] == 50
 
 
+def test_parse_flat_yaml_fallback_matches_recipes():
+    """The PyYAML-free fallback parser must correctly parse every shipped recipe."""
+    from tools.flywheel.runner import _parse_flat_yaml
+
+    recipes_dir = Path(__file__).resolve().parents[2] / "training" / "recipes"
+    recipe_files = sorted(recipes_dir.glob("*.yaml"))
+    assert len(recipe_files) >= 3, f"expected >=3 recipes in {recipes_dir}"
+    for rf in recipe_files:
+        parsed = _parse_flat_yaml(rf.read_text(encoding="utf-8"))
+        assert parsed["method"] in ("sft", "dpo", "grpo"), rf.name
+        assert parsed["lora"]["r"] == 16, rf.name
+        assert parsed["lora"]["target_modules"] == ["q_proj", "v_proj"], rf.name
+        assert parsed["training"]["per_device_train_batch_size"] == 1, rf.name
+        assert isinstance(parsed["training"]["learning_rate"], float), rf.name
+        assert parsed["training"]["fp16"] is True, rf.name
+        assert parsed["training"]["save_strategy"] == "no", rf.name
+        assert parsed["unsloth"]["enabled"] is True, rf.name
+        assert parsed["output"]["push_to_hub"] is False, rf.name
+    # GRPO seam: reward_model null must parse to None
+    grpo = _parse_flat_yaml((recipes_dir / "grpo_lora.yaml").read_text(encoding="utf-8"))
+    assert grpo["grpo"]["reward_model"] is None
+
+
 def test_can_claim_os_linux_rejected_by_windows():
     """A linux-only job must not be claimed by a Windows runner."""
     job = {"requires_os": "linux", "requires_vram_gb": "0", "requires_cuda": "false"}

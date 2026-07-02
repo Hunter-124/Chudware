@@ -16,7 +16,6 @@ MLflow degrades to local file store when server is unreachable.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import platform
@@ -103,28 +102,32 @@ _LOCK_TIMEOUT = 30      # seconds to wait for lock
 _LOCK_STALE   = 120     # seconds before a lockfile is considered stale
 
 
-def _lock(jobs_dir: Path) -> "os._wrap_file":  # type: ignore[name-defined]
-    """Acquire an exclusive file lock on jobs_dir/.claim.lock.
+def _lock(jobs_dir: Path) -> Path:
+    """Acquire an exclusive advisory lock on jobs_dir/.claim.lock.
 
-    Uses fcntl.flock (POSIX) for cross-process mutual exclusion.
-    Returns the open file object — caller must close it to release.
+    Cross-platform O_EXCL lockfile — the exact idiom of work/tools/work.py
+    (fcntl is POSIX-only; fleet runners include native Windows).  A lockfile
+    older than _LOCK_STALE seconds is treated as abandoned and removed.
 
-    Raises TimeoutError if lock not acquired within _LOCK_TIMEOUT seconds.
+    Returns the lockfile Path — caller must pass it to _unlock() to release.
+    Raises TimeoutError if the lock is not acquired within _LOCK_TIMEOUT seconds.
     """
     lock_path = jobs_dir / ".claim.lock"
     deadline = time.monotonic() + _LOCK_TIMEOUT
 
     while True:
         try:
-            fd = open(lock_path, "a+")  # noqa: WPS515 — intentional keep-open
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # Write our PID + timestamp so stale detection is possible
-            fd.seek(0)
-            fd.truncate()
-            fd.write(f"{os.getpid()} {time.time()}\n")
-            fd.flush()
-            return fd
-        except (OSError, BlockingIOError):
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{os.getpid()} {time.time()}\n".encode())
+            os.close(fd)
+            return lock_path
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > _LOCK_STALE:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except FileNotFoundError:
+                continue  # holder released between open() and stat() — retry
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"Could not acquire claim lock on {lock_path} "
@@ -133,12 +136,9 @@ def _lock(jobs_dir: Path) -> "os._wrap_file":  # type: ignore[name-defined]
             time.sleep(0.05)
 
 
-def _unlock(fd: Any) -> None:
-    """Release an flock-based lock."""
-    try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        fd.close()
+def _unlock(lock_path: Path) -> None:
+    """Release an O_EXCL lockfile-based lock."""
+    Path(lock_path).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +262,7 @@ def claim_job(
     """
     cap = detect_capability()
 
-    fd = _lock(jobs_dir)
+    lock_path = _lock(jobs_dir)
     try:
         candidates = sorted(jobs_dir.glob("*.md"))
         for path in candidates:
@@ -324,7 +324,7 @@ def claim_job(
 
         return None
     finally:
-        _unlock(fd)
+        _unlock(lock_path)
 
 
 def _find_git_root(start: Path) -> Path | None:
@@ -372,15 +372,81 @@ def _load_recipe(recipe_path: Path) -> dict:
     if not recipe_path.exists():
         raise FileNotFoundError(f"Recipe not found: {recipe_path}")
 
+    text = recipe_path.read_text(encoding="utf-8")
     try:
         import yaml  # type: ignore[import]
-        with recipe_path.open(encoding="utf-8") as fh:
-            return yaml.safe_load(fh) or {}
-    except ImportError as exc:
-        raise ImportError(
-            "PyYAML is required to load recipe files. "
-            "Run: pip install PyYAML  (MIT license)"
-        ) from exc
+        return yaml.safe_load(text) or {}
+    except ImportError:
+        # Graceful degradation (same posture as the ML imports): recipes are
+        # deliberately flat two-level YAML, so a minimal parser suffices when
+        # PyYAML is not installed (e.g. the mcp-venv).
+        return _parse_flat_yaml(text)
+
+
+def _parse_scalar(raw: str) -> Any:
+    """Parse a single flat-YAML scalar: null/bool/int/float/quoted/inline-list."""
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        return [_parse_scalar(v) for v in inner.split(",")] if inner else []
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+        return raw[1:-1]
+    low = raw.lower()
+    if low in ("null", "~", ""):
+        return None
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
+def _parse_flat_yaml(text: str) -> dict:
+    """Minimal two-level YAML parser for T-H6 recipe files (PyYAML fallback).
+
+    Supports exactly the recipe subset: top-level ``key: value`` and one level
+    of nesting (``section:`` followed by two-space-indented ``key: value``),
+    scalars (str/int/float/bool/null), quoted strings, and inline lists.
+    Comments (#) and blank lines are ignored.
+    """
+    result: dict[str, Any] = {}
+    section: dict[str, Any] | None = None
+    for line in text.splitlines():
+        stripped = line.split("#", 1)[0].rstrip() if not _in_quotes_hash(line) else line.rstrip()
+        if not stripped.strip():
+            continue
+        indented = stripped.startswith("  ")
+        key, sep, val = stripped.strip().partition(":")
+        if not sep:
+            continue  # not a mapping line; recipe subset has no bare items
+        key = key.strip()
+        val = val.strip()
+        if indented and section is not None:
+            section[key] = _parse_scalar(val)
+        elif val == "":
+            section = {}
+            result[key] = section
+        else:
+            section = None
+            result[key] = _parse_scalar(val)
+    return result
+
+
+def _in_quotes_hash(line: str) -> bool:
+    """True if the first '#' in *line* sits inside a quoted string."""
+    hash_idx = line.find("#")
+    if hash_idx < 0:
+        return False
+    before = line[:hash_idx]
+    return before.count('"') % 2 == 1 or before.count("'") % 2 == 1
 
 
 # ---------------------------------------------------------------------------

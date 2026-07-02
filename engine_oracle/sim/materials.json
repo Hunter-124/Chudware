@@ -1,6 +1,6 @@
 {
   "steel_1018": {
-    "name": "Steel 1018",
+    "name": "Steel AISI 1018",
     "E_mpa": 200000,
     "nu": 0.29,
     "density_g_cm3": 7.87,
@@ -9,30 +9,30 @@
     "endurance_mpa": 220
   },
   "alu_6061": {
-    "name": "Aluminum 6061-T6",
-    "E_mpa": 68900,
+    "name": "Aluminium 6061-T6",
+    "E_mpa": 69000,
     "nu": 0.33,
-    "density_g_cm3": 2.70,
+    "density_g_cm3": 2.7,
     "yield_mpa": 276,
     "ultimate_mpa": 310,
     "endurance_mpa": 96
   },
   "abs": {
-    "name": "ABS",
+    "name": "ABS plastic",
     "E_mpa": 2300,
     "nu": 0.35,
-    "density_g_cm3": 1.05,
+    "density_g_cm3": 1.04,
     "yield_mpa": 40,
     "ultimate_mpa": 44,
-    "endurance_mpa": 13
+    "endurance_mpa": 15
   },
   "pla": {
-    "name": "PLA",
+    "name": "PLA plastic",
     "E_mpa": 3500,
     "nu": 0.36,
     "density_g_cm3": 1.24,
-    "yield_mpa": 55,
-    "ultimate_mpa": 60,
+    "yield_mpa": 50,
+    "ultimate_mpa": 50,
     "endurance_mpa": 18
   },
   "petg": {
@@ -63,10 +63,10 @@
     "endurance_mpa": 510
   },
   "steel_304_stainless": {
-    "name": "Steel AISI 304 Stainless",
+    "name": "Stainless 304",
     "E_mpa": 193000,
     "nu": 0.29,
-    "density_g_cm3": 8.00,
+    "density_g_cm3": 8.0,
     "yield_mpa": 215,
     "ultimate_mpa": 505,
     "endurance_mpa": 240
@@ -84,13 +84,13 @@
     "name": "Cast Iron (Gray)",
     "E_mpa": 110000,
     "nu": 0.26,
-    "density_g_cm3": 7.20,
+    "density_g_cm3": 7.2,
     "yield_mpa": 130,
     "ultimate_mpa": 240,
     "endurance_mpa": 100
   },
   "alu_7075_t6": {
-    "name": "Aluminum 7075-T6",
+    "name": "Aluminium 7075-T6",
     "E_mpa": 71700,
     "nu": 0.33,
     "density_g_cm3": 2.81,
@@ -99,7 +99,7 @@
     "endurance_mpa": 159
   },
   "alu_2024_t3": {
-    "name": "Aluminum 2024-T3",
+    "name": "Aluminium 2024-T3",
     "E_mpa": 73100,
     "nu": 0.33,
     "density_g_cm3": 2.78,
@@ -110,11 +110,11 @@
   "brass_c360": {
     "name": "Brass C360",
     "E_mpa": 97000,
-    "nu": 0.31,
-    "density_g_cm3": 8.50,
-    "yield_mpa": 310,
-    "ultimate_mpa": 400,
-    "endurance_mpa": 130
+    "nu": 0.34,
+    "density_g_cm3": 8.5,
+    "yield_mpa": 124,
+    "ultimate_mpa": 338,
+    "endurance_mpa": 120
   },
   "copper_c110": {
     "name": "Copper C110",
@@ -147,7 +147,7 @@
     "name": "Polycarbonate",
     "E_mpa": 2300,
     "nu": 0.37,
-    "density_g_cm3": 1.20,
+    "density_g_cm3": 1.2,
     "yield_mpa": 62,
     "ultimate_mpa": 66,
     "endurance_mpa": 20
@@ -182,8 +182,8 @@
   "carbon_fiber_ud": {
     "name": "Carbon Fiber (UD, iso-equivalent)",
     "E_mpa": 135000,
-    "nu": 0.30,
-    "density_g_cm3": 1.60,
+    "nu": 0.3,
+    "density_g_cm3": 1.6,
     "yield_mpa": 1500,
     "ultimate_mpa": 1600,
     "endurance_mpa": 640
@@ -191,8 +191,8 @@
   "concrete": {
     "name": "Concrete",
     "E_mpa": 30000,
-    "nu": 0.20,
-    "density_g_cm3": 2.40,
+    "nu": 0.2,
+    "density_g_cm3": 2.4,
     "yield_mpa": 30,
     "ultimate_mpa": 40,
     "endurance_mpa": 18

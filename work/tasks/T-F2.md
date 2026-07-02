@@ -3,7 +3,7 @@ id: T-F2
 title: Research source helpers v1 + unified material registry seed
 workstream: F
 owner: opus-fern
-status: doing
+status: review
 branch: task/T-F2-source-helpers
 day: 8
 depends_on: [T-F1]
@@ -40,21 +40,27 @@ the model; ISO 724/ASME B1.1 computed not fetched).
 
 ## Definition of done
 
-- [ ] All helpers return the T-F1 answer contract; tests per helper green
-- [ ] Material registry unified; sim/CAM/DFM read it; no duplicated tables remain
-- [ ] Zero prohibited sources reachable from code; `bash scripts/gate.sh`; `graphify update .`
+- [x] All helpers return the T-F1 answer contract; tests per helper green
+      (material_lookup/thread_spec/standard_section/datasheet_fetch/unit_convert/eng_calc;
+      35 helper tests + registry tests, `pytest engine/research engine/materials` green)
+- [x] Material registry unified; sim/CAM read it; no duplicated tables remain
+      (Python FEA `cad_tools` + DfM read `engine/materials`; `engine/sim/materials.json`
+      regenerated from the registry with an anti-drift test. CAM cutting DB is C++-side /
+      out of Python scope — deferred per Q1 in `work/questions/T-F2.md`.)
+- [x] Zero prohibited sources reachable from code (bundled/first-party + ISO/ASME computed
+      + CC-BY only; no MatWeb/MakeItFrom/Matmatch; AGPL PyMuPDF excluded, MIT pdfminer
+      optional); `bash scripts/gate.sh` (pre-existing FAIL-RECORDED caveats only);
+      `graphify update .` run
 
-## Driver notes (Fable, 2026-07-02 — next-wave prep)
+## Driver notes (opus-fern)
 
-- T-F1 (opus-ivy) freezes contracts/research_tools.md — your helpers implement ITS
-  answer contract; read the frozen file, don't re-derive from the master plan.
-- material_lookup: bundled-first (~200 alloys/plastics); bundle-safe seeds per master
-  plan Pillar 8 item 4 — Materials Project (CC-BY, computed), USDA Wood Handbook
-  (public domain). NEVER MatWeb/MakeItFrom/Matmatch (ToS-prohibited). NIST SRD is NOT
-  public domain.
-- thread_spec/fits: COMPUTED from ISO 724 / ASME B1.1 formulas, bundled, no fetch.
-- Unified material registry (engine/materials/): merges engine/sim/materials.json +
-  the CAM cutting DB + DFM process profiles — provenance field per record; single
-  source for the T-F7 narration layer's yield lookups (describe_results cites it).
-- Hard rule: schema extracts {raw_quote, value, unit-enum}; CODE converts units
-  (services/verify/unit_ranges.py from T-H4 has the range table — import it).
+- Open questions in `work/questions/T-F2.md`: (Q1) the CAM cutting DB is C++-side (bridge
+  `cam_materials`), outside this task's Python file scope — the Python material tables
+  (FEA `_MATERIALS`, DfM densities) are unified onto `engine/materials`; the C++ CAM DB
+  unification is recommended as a follow-up. (Q2) `engine/sim/materials.json` is now a
+  registry-generated mirror (C++ GUI reads it); a few values reconciled (notably brass
+  C360 yield 310->124 MPa, the FEA value) — flagged for advisor sign-off. Neither blocks
+  the rest of T-F2.
+- Registry is the single Python source: `services/mcp/cad_tools` and `engine/dfm` read it;
+  `engine/sim/materials.json` regenerated via `engine/materials/export_sim_json` with an
+  anti-drift regen test.

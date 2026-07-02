@@ -126,3 +126,23 @@ gate.sh ui/imgui selMulti failure is PRE-EXISTING, never chase; commit+push ever
 ## Questions for Erik (batched — answer when convenient)
 
 - (none yet)
+
+### 2026-07-02 — wave-1 reviews: T-F1 + T-F3 landed; backfills T-B1a + T-E1
+
+- T-F1 (opus-ivy) REVIEWED LGTM merge-ready: contracts/research_tools.md v1 +
+  engine/research scaffold, 14/14 tests, gate fails pre-existing only (selMulti +
+  engine/doc OCP). Branch task/T-F1-research-scaffold @ 4db86d3.
+- T-F3 (opus-rook) REVIEWED LGTM merge-ready: contracts/interaction.md v1 +
+  interaction.py + 3 transports + ui/abstract ask_form + ui/imgui ask_dialog,
+  18/18 pytest, agent_panel.cpp hot-spot held to 1 include + 1 call. Branch
+  task/T-F3-interaction-contract (my Q1-Q3 ANSWER commit 85c4fb7 on top).
+- Supervisor answers issued (Erik's best-effort directive): Q1 ledger/caller split
+  approved (C++ run machine untouched until T-F4); Q2 normalize_dimension approved
+  and declared canonical for T-F2's unit_convert (one implementation); Q3 local
+  XDG mirroring approved. Repo-wide paths.py XDG divergence filed as GitHub issue
+  (label: bug) — found independently by T-F1 and T-F3.
+- Backfilled freed driver slots: opus-wren → T-B1a (sourcing schema), opus-lark →
+  T-E1 (piping scaffold). Concurrent front stays at 5: D2 (T-F14 impl), T-F5,
+  T-F9, T-B1a, T-E1.
+- Note: a separate supervisor instance is running workstream G (T-G2 reviewed,
+  T-G4 sonnet-oda) — WS-G is off-limits to this arc's backfills.

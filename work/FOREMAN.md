@@ -242,3 +242,5 @@ All branches at status:review. Trivial `services/mcp/server.py` append conflicts
 - 2026-07-03T00:55Z opus-gale CLAIMED T-G6 (worktree /home/hunter/Repositories/CAD-T-G6 on branch task/T-G6-migration-wave2 based on origin/master; wave-2 shell chrome — verify-and-close S-nodes vs GUI_MIGRATION_DAG then port the gaps)
 - 2026-07-02T19:02Z opus-flint CLAIMED T-H9 (NOTE: name collision — a second session also using opus-flint claimed T-H10; I am the T-H9 flint, disambiguate by task id)
 - 2026-07-02T19:03Z opus-flux CLAIMED T-H11
+- 2026-07-02T19:07Z opus-flint CLAIMED T-H10
+- 2026-07-02T19:07Z opus-flint QUESTION T-H10 (Q1 spend/scope: real vs mock-proven candidate residual — no llama.cpp/weights on box, network up; recommended answer + provisioning cmds in work/questions/T-H10.md on branch; proceeding on unblocked corpus/harness/recipes/serving)

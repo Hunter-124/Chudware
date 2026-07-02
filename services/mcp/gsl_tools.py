@@ -1032,10 +1032,12 @@ def register_gsl_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def describe_results(doc_id: Optional[str] = None, study_name: Optional[str] = None) -> str:
         """Compact narrative of FEA/CFD simulation results — use INSTEAD of dumping raw study
-        JSON. Returns max von Mises stress with face location (sid join), displacement, factor
-        of safety, margin vs material yield, modal frequencies in words, and mesh convergence
-        caveats. Narrates existing run_fea_static / run_fea_modal numbers only. Returns a
-        graceful 'no results attached' message when no study exists."""
+        JSON. Returns max von Mises stress, displacement, factor of safety, margin vs material
+        yield, the fixed/loaded faces named by sid (join of the stored fixture/load queries
+        against describe_part's face layer), modal frequencies in words, and mesh convergence
+        caveats. Narrates the doc's persisted studies (run_fea_static / run_fea_modal /
+        run_cfd_flow records) only — never recomputes. Returns a graceful 'no results
+        attached' message when no study exists."""
         try:
             return _describe_results_text(_doc(doc_id), study_name)
         except Exception as e:  # noqa: BLE001

@@ -44,7 +44,7 @@ class GeminiProvider(Provider):
         if part["type"] == "text":
             return {"text": part["text"]}
         data = base64.standard_b64encode(Path(part["path"]).read_bytes()).decode("utf-8")
-        return {"inline_data": {"mime_type": "image/png", "data": data}}
+        return {"inline_data": {"mime_type": part.get("mime", "image/png"), "data": data}}
 
     def complete(self, system: str, messages: list[dict], max_tokens: int = 8000) -> str:
         return self.complete_ex(system, messages, max_tokens=max_tokens)[0]

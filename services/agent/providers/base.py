@@ -12,8 +12,10 @@ def text_part(text: str) -> dict:
     return {"type": "text", "text": text}
 
 
-def image_part(path: str) -> dict:
-    return {"type": "image", "path": str(path)}
+def image_part(path: str, mime: str = "image/png") -> dict:
+    # `mime` lets ingested previews (e.g. downscaled JPEG photos, engine.vision) ride the same slot
+    # without being mislabeled png; adapters honor it and default to png for back-compat.
+    return {"type": "image", "path": str(path), "mime": mime}
 
 
 def user(parts: list) -> dict:

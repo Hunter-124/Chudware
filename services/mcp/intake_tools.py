@@ -14,6 +14,8 @@ elicitation is naturally multi-turn over MCP: a tool returns the ask, the user a
 from __future__ import annotations
 
 import json as _json
+import os as _os
+import tempfile as _tempfile
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -23,12 +25,18 @@ from mcp_server.cad_tools import _doc, _dumps, _err
 from engine.dfm import process_profiles as pp
 from engine.intake import intake as ik
 
+try:  # Vision is optional at runtime — a Pillow/module import hiccup must not stop server boot.
+    from engine import vision as _vz
+except Exception:  # noqa: BLE001
+    _vz = None
+
 # doc["meta"] keys (persisted in the .step+).
 _K_PROCESS = "process"
 _K_MEASURED = "measured_parts"
 _K_LEDGER = "crit_dims"
 _K_FIT = "fit_report"
 _K_INTAKE = "intake"
+_K_PHOTOS = "photos"
 
 
 def _get(doc_id: str, key: str):
@@ -59,6 +67,85 @@ def _load_measured(doc_id: str):
     if isinstance(raw, list) and raw:
         return ik.MeasuredPartProfile.from_dict(raw[-1])
     return None
+
+
+# ----------------------------------------------------------------- photo ingestion / metrology
+
+def _load_photos(doc_id: str):
+    """The doc's :class:`PhotoRegistry` (empty if none yet); ``None`` when vision is unavailable."""
+    if _vz is None:
+        return None
+    raw = _get(doc_id, _K_PHOTOS)
+    return _vz.PhotoRegistry.from_dict(raw if isinstance(raw, dict) else {})
+
+
+def _photo_cache_dir(doc_id: str) -> str:
+    return _os.path.join(_tempfile.gettempdir(), "aicad_vision", str(doc_id))
+
+
+def _register_photos(doc_id: str, photos: list) -> list:
+    """Ingest each path -> stable photo_id + downscaled preview (≤1024px/<1MB) + full-res link."""
+    reg = _load_photos(doc_id)
+    cache = _photo_cache_dir(doc_id)
+    out = []
+    for item in photos or []:
+        if isinstance(item, dict):
+            path, lbl = item.get("path"), item.get("label", "part")
+        else:
+            path, lbl = item, "part"
+        rec = reg.register(path, label=lbl, cache_dir=cache)
+        out.append({
+            "photo_id": rec.photo_id, "preview_path": rec.preview_path,
+            "resource_link": rec.resource_link, "mime": rec.mime,
+            "width": rec.width, "height": rec.height,
+            "preview_width": rec.preview_width, "preview_height": rec.preview_height,
+            "preview_bytes": rec.preview_bytes,
+        })
+    _set(doc_id, _K_PHOTOS, reg.to_dict())
+    return out
+
+
+def _preserve_confirmations(old, ledger) -> None:
+    """Carry typed/given/standard resolutions from a prior ledger onto a freshly rebuilt one, so a
+    later photo measurement never silently wipes a confirm_dimensions caliper value."""
+    if old is None:
+        return
+    for r in old.rows:
+        if r.status in ("given", "measured", "standard") and r.nominal_mm is not None \
+                and ledger.row(r.key) is not None:
+            ik.apply_confirmation(ledger, r.key, r.nominal_mm, status=r.status,
+                                  resolved_by=r.resolved_by)
+
+
+def _record_photo_measure(doc_id: str, rec, feature: str, dim: str, res, fit, proc):
+    """Land one fiducial measurement in the intake ledger at ITS tier (never geometry)."""
+    mp = _load_measured(doc_id) or ik.new_measured_part("mp_1", rec.label, source="photo")
+    prov = dict(res.provenance)
+    prov["photo_id"] = rec.photo_id
+    prov["uncert_mm"] = res.uncert_mm
+    feat = mp.feature(feature)
+    if feat is None:
+        arch = ik.classify(feature) or "prism_pocket"
+        mp.features.append(ik.new_measured_feature(
+            feature, arch, dims={dim: res.value_mm}, fit=fit,
+            confidence=res.tier, uncert_mm=res.uncert_mm, provenance=prov))
+    else:
+        feat.dims[dim] = res.value_mm
+        feat.confidence = ik.worst_tier([feat.confidence, res.tier])
+        feat.uncert_mm = res.uncert_mm
+        feat.provenance.update(prov)
+        if fit:
+            feat.fit = fit
+    if rec.photo_id not in [im.get("photo_id") for im in mp.images]:
+        mp.images.append({"photo_id": rec.photo_id, "resource_link": rec.resource_link,
+                          "preview_path": rec.preview_path})
+    old = _load_ledger(doc_id)
+    ledger = ik.build_ledger(mp, process=proc)
+    _preserve_confirmations(old, ledger)
+    demands = ik.compute_demands(mp, ledger, process=proc)
+    _set(doc_id, _K_MEASURED, [mp.to_dict()])
+    _set(doc_id, _K_LEDGER, ledger.to_dict())
+    return mp, ledger, demands
 
 
 def register_intake_tools(mcp: FastMCP) -> None:
@@ -171,19 +258,37 @@ def register_intake_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def submit_part_photos(claims: list, label: str = "part",
-                          doc_id: Optional[str] = None) -> str:
-        """Submit the measurements YOU read from the user's photos as structured claims; we score each.
+    def submit_part_photos(claims: Optional[list] = None, label: str = "part",
+                          doc_id: Optional[str] = None, photos: Optional[list] = None) -> str:
+        """Register the user's real photo FILES and/or submit the measurements you read from them.
 
-        Each claim: {feature, dim, value_mm, scale_source (card|caliper_typed|ruler|coin|none),
-        in_plane (bool), agrees_across_views (bool), edge_quality (sharp|soft), caliper_readout?}.
-        We assign each a confidence tier from those signals, build a MeasuredPartProfile + the
-        critical-dimension ledger for the bound process, and return `open_demands` — the fit-critical
-        dims whose confidence is below what their fit needs (you MUST get a typed caliper number for
-        those via confirm_dimensions; a photo guess won't press-fit). Persists everything in the part.
+        `photos` (optional): a list of image file paths (or {path, label}) the user dropped in — we
+        ingest each into a stable `photo_id`, emit a downscaled preview (≤1024px / <1MB, the agent-
+        facing cap) and keep a `resource_link` to the full-res original, then return those ids. Look
+        at the previews, then measure fit-critical dims deterministically with
+        measure_from_photo(photo_id, [x,y], [x,y], feature, dim) — code measures, you never guess.
+
+        `claims` (optional): measurements YOU read directly, each {feature, dim, value_mm,
+        scale_source (card|caliper_typed|ruler|coin|none), in_plane (bool), agrees_across_views
+        (bool), edge_quality (sharp|soft), caliper_readout?}. We tier each from those signals, build
+        a MeasuredPartProfile + the critical-dimension ledger for the bound process, and return
+        `open_demands` — fit-critical dims whose confidence is below what their fit needs (get a
+        typed caliper number for those via confirm_dimensions; a photo guess won't press-fit).
+        Persists everything in the part. Call with only `photos` to register, only `claims` to
+        measure, or both.
         """
         try:
             d = _doc(doc_id)
+            photo_out = _register_photos(d, photos) if (photos and _vz is not None) else []
+            claims = claims or []
+            if not claims:
+                latest = _get(d, _K_MEASURED)
+                return _dumps({
+                    "ok": True, "photos": photo_out,
+                    "measured_part": (latest[-1] if isinstance(latest, list) and latest else None),
+                    "note": "photos registered — call measure_from_photo(photo_id, [x,y], [x,y], "
+                            "feature, dim) to measure a dimension, or resubmit with claims.",
+                })
             proc = _process_id(d)
             by_feat: dict = {}
             for c in claims:
@@ -220,7 +325,63 @@ def register_intake_tools(mcp: FastMCP) -> None:
             _set(d, _K_LEDGER, ledger.to_dict())
             return _dumps({"ok": True, "measured_part": mp.to_dict(),
                            "open_demands": demands,
+                           "photos": photo_out,
                            "gate_ok": ik.gate_ok(ledger)})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def measure_from_photo(photo_id: str, px_a: list, px_b: list, feature: str, dim: str,
+                           fit: Optional[str] = None, board: Optional[dict] = None,
+                           doc_id: Optional[str] = None) -> str:
+        """Measure ONE in-plane dimension between two pixel points against a ChArUco fiducial.
+
+        You pick the two pixel endpoints on a registered photo; DETERMINISTIC code does the
+        measuring (VLMs pick pixels, code measures — master plan Pillar 10). A printed ChArUco/ArUco
+        sheet lying flat in the feature's plane fixes the pixel→mm scale via homography. `px_a`/`px_b`
+        are [x, y] pixel coords in the FULL-RES image; register it first with
+        submit_part_photos(photos=[...]) and pass the returned `photo_id`. `feature`/`dim` name where
+        the result lands (e.g. feature="mount_holes", dim="spacing_mm"); `fit` optionally sets the fit
+        class (press|slip|clearance|…). The confidence tier comes from the marker PIXEL AREA
+        (resolution) and planarity — bigger/flatter markers ⇒ higher tier; out-of-plane is flagged
+        low, never guessed. The dim lands in the intake ledger with provenance.method="photo_fiducial";
+        it NEVER writes geometry, and a press/bearing/threaded fit still DEMANDS a typed caliper value
+        (a photo tops out at 'high'; those need 'measured'). Returns the measurement, its tier +
+        honesty band, and the updated open_demands / gate. Optional `board` overrides the default 5×7
+        30 mm ChArUco spec ({dict_name, squares_x, squares_y, square_len_mm, marker_len_mm}).
+        """
+        try:
+            if _vz is None:
+                return _dumps({"ok": False, "reason": "vision module unavailable",
+                               "hint": "install Pillow + opencv-python-headless (Apache-2.0)"})
+            if not _vz.HAVE_CV2:
+                return _dumps({"ok": False, "reason": "OpenCV (cv2) is not installed",
+                               "hint": "pip install opencv-python-headless (Apache-2.0; ArUco is "
+                                       "in core objdetect)"})
+            d = _doc(doc_id)
+            reg = _load_photos(d)
+            rec = reg.get(photo_id) if reg else None
+            if rec is None:
+                return _dumps({"ok": False, "reason": f"unknown photo_id {photo_id!r}",
+                               "hint": "register the photo first via submit_part_photos(photos=[...])"})
+            spec = _vz.BoardSpec.from_dict(board) if board else _vz.DEFAULT_BOARD
+            res = _vz.measure_from_photo(rec.path, tuple(px_a), tuple(px_b), spec)
+            if not res.ok:
+                return _dumps({"ok": False, "reason": res.reason, "hint": res.hint,
+                               "measurement": res.to_dict()})
+            proc = _process_id(d)
+            claim = res.to_claim(feature, dim, fit=fit)
+            mp, ledger, demands = _record_photo_measure(d, rec, feature, dim, res, fit, proc)
+            return _dumps({
+                "ok": True,
+                "measurement": res.to_dict(),
+                "claim": claim,
+                "tier": res.tier,
+                "honesty": res.honesty,
+                "measured_part": mp.to_dict(),
+                "open_demands": demands,
+                "gate_ok": ik.gate_ok(ledger),
+            })
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

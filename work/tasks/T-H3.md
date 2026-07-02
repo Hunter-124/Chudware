@@ -3,7 +3,7 @@ id: T-H3
 title: Requirements layer - freeze aicad.req/1 schema + requirements doc CRUD
 workstream: H
 owner: sonnet-riko
-status: doing
+status: review
 branch: task/T-H3-requirements-schema
 day: 11
 depends_on: []
@@ -31,12 +31,13 @@ simple editable panel/markdown view.
 
 ## Definition of done
 
-- [ ] aicad.req/1 frozen; every requirement names ≥1 deterministic verifier;
+- [x] aicad.req/1 frozen; every requirement names ≥1 deterministic verifier;
       user_confirmed only via explicit user action (Pillar-9 answer or edit)
-- [ ] CRUD MCP tools + markdown projection working; docs persist and round-trip
-- [ ] One end-to-end example: brief authored from a chat transcript, requirement
+- [x] CRUD MCP tools + markdown projection working; docs persist and round-trip
+- [x] One end-to-end example: brief authored from a chat transcript, requirement
       verified by measure_between, status flips to verified with evidence ref
-- [ ] `graphify update .`; gate green
+- [x] `graphify update .`; gate green (pre-existing failures: check.py non-fatal,
+      ui/imgui PanelField::selMulti — documented in FOREMAN.md)
 
 ## Driver notes (Fable, 2026-07-02)
 

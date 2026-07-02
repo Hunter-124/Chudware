@@ -182,12 +182,81 @@ edits — `services/mcp/tool_registry.py` + the wiring in `services/mcp/server.p
   this registry is what those lists bind against. Per-context lists arrive later; the seam is
   frozen now.
 
-## 7. RESERVED: `routing` (T-H9 — do NOT spec here)
+## 7. `routing` — per-insertion-point adapter routing (T-H9, additive)
 
-Reserved for T-H9 (per-task LoRA routing). T-H9 will add an `adapter` field and a
-per-insertion-point routing table (which model/LoRA answers at which agent insertion point).
-This section is a placeholder so T-H9 appends without renegotiating v1; leaving it empty is
-intentional. No other task defines `routing`.
+Per-task LoRA serving (Pillar 16, `docs/CUSTOM_MODEL_INTEGRATION_SURVEY.md` §5.7-5.8). A
+served model enters the app as *just another provider* under §2 — the `vllm` adapter
+(`services/agent/providers/vllm_provider.py`) is an OpenAI-compatible client pinned to a vLLM
+instance launched with `--enable-lora`; the LoRA is selected by the request `model` field (the
+served adapter name). This is ADDITIVE: §1-§6 are unchanged, and the `adapter` field below is
+an OPTIONAL concrete-provider attribute, NOT a change to the frozen §2 `Provider` interface.
+
+### 7.1 The `adapter` field
+
+A provider MAY expose `adapter: str | None` — the served LoRA-adapter identifier answering a
+given call (`None` = base model). It is opaque routing state (the flywheel's DVC-versioned
+adapter id / runner `job_id`, e.g. `"IP-13/v3"`), carried into telemetry (§7.5), never a
+message-schema change. The neutral `complete_ex` signature is untouched.
+
+### 7.2 Routing table (the seam)
+
+`{insertion_point → RouteEntry}` decides which brain answers at each agent insertion point
+(`IP-N`). Reference implementation: `services/serving/routing.py`. Persisted in the SAME
+`config.json` as provider settings, under the top-level `"routing"` key (so a canary flip or
+rollback is one single-file edit — no restart). Schema per entry:
+
+```
+RouteEntry = {
+  "provider": str,              # e.g. "vllm" | "llamacpp" (merged-GGUF local serve)
+  "model": str,                 # base model served at the endpoint
+  "adapter_version": str|null,  # DVC-versioned LoRA id, or null = base model / fallback
+  "fallback": Fallback,         # REQUIRED, kill-switch (§7.3)
+  "canary": {"pct": 0..100, "opt_in": [user_id,...], "salt": str},
+  "history": [str, ...]         # prior adapter_versions, for rollback
+}
+Fallback   = {"mode": "deterministic" | "frontier", "provider": str, "model": str}
+```
+
+`resolve(insertion_point, user_id, adapter_healthy) → RouteDecision` picks the concrete
+`{provider, model, adapter}` for a call.
+
+### 7.3 Kill-switch invariant (BINDING)
+
+`fallback` is ALWAYS a deterministic-path OR frontier route — NEVER another experimental
+adapter. A `Fallback` structurally has no `adapter_version` field, so "fall back onto another
+LoRA" is unrepresentable by construction. The fallback doubles as (a) the incumbent for
+canary-excluded traffic and (b) the degrade target when the adapter is unavailable
+(`adapter_healthy=False`), which is how a live serving failure degrades WITHOUT a user-facing
+error. New `vllm` provider is offline-safe only on a loopback endpoint (§5), like `llamacpp`.
+
+### 7.4 Rollout ladder + promotion gate (Erik-ratified 2026-07-02, BINDING)
+
+`shadow (T-H7) → canary (canary.pct % + per-user opt-in) → promote (100%, human-gated) → rollback`.
+
+- **Promote** (`services/serving/promotion.promote`) requires BOTH, and there is NO
+  auto-promote code path: (1) AUTOMATED EVIDENCE — the challenger beats-or-matches the
+  incumbent on BOTH verifier-score AND accept-rate over ≥ N real shadow jobs (evidence is
+  T-H7's `shadow_report` aggregation); AND (2) a HUMAN SIGN-OFF — a `SignOff{approver,
+  report_ref}` referencing the signed-off evidence report. Passing metrics is NECESSARY, NOT
+  SUFFICIENT: only a human supplying a valid sign-off promotes.
+- **Rollback** (`promotion.rollback`) = flip `adapter_version` to a previous DVC-versioned
+  adapter (or to base). Always safe, no confirmation, nothing overwritten — adapters live
+  under DVC versioning, so a rollback is a pure routing flip (documented < 1 min).
+
+### 7.5 Telemetry tag
+
+Every response served by an adapter carries `model.adapter = adapter_version` in its
+`ai_artifact` event (T-H1 schema, which already reserves the `"adapter"` slot in both the
+Python `services/agent/providers/logging_provider.py` and C++ `core/agent/run.cpp` emit
+paths). The single decided write-point is `RouteDecision.telemetry_tag()` — the selected
+adapter is threaded from the routing decision, NOT introspected off the wrapped provider.
+Canary responses (`RouteDecision.is_canary`) are thereby distinguishable in telemetry.
+
+### 7.6 Human-gated seams (out of scope here)
+
+Promotion sign-off (§7.4) and any AI-CAD Cloud relay interaction (§4.3) are human-gated. The
+C++ read-side (`core/agent/run.cpp` provider selection + the `adapter` telemetry slot) follows
+§8 (Python-first, C++ matches later); T-H9 lands the Python seam and the frozen schema above.
 
 ## 8. Conformance
 

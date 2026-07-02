@@ -155,6 +155,11 @@ register_structural_tools(mcp)
 # part_search / part_get over the aicad.parts/1 FTS hub (contracts/parts.md).
 from mcp_server.parts_tools import register_parts_tools
 register_parts_tools(mcp)
+# Adapter serving (T-H9): per-insertion-point LoRA routing table — status ("which brain
+# answered"), canary dial, always-safe rollback, and the Erik-ratified gated promotion
+# (evidence + human sign-off; no auto-promote). Pure-Python, no core dependency.
+from mcp_server.serving_tools import register_serving_tools
+register_serving_tools(mcp)
 
 
 def _install_clean_stdout():

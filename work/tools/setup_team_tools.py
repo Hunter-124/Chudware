@@ -44,26 +44,51 @@ def merge(path: Path, top_key="mcpServers"):
 
 
 def desktop_config_path():
+    """Return (config_path, base_dir_that_should_already_exist_on_any_real_profile).
+
+    base_dir is the OS profile directory Claude Desktop's own "Claude" folder lives
+    under — it exists on any real user account whether or not Desktop has ever been
+    launched, so we use it (not the "Claude" folder itself) to decide whether it's
+    worth attempting to write. This lets setup run BEFORE Desktop's first launch —
+    Desktop will pick up the file the first time it starts.
+    """
     sysname = platform.system()
     if sysname == "Windows":
-        return Path(os.environ.get("APPDATA", "")) / "Claude" / "claude_desktop_config.json"
-    if sysname == "Darwin":
-        return Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
-    return Path.home() / ".config" / "Claude" / "claude_desktop_config.json"
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    elif sysname == "Darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "Claude" / "claude_desktop_config.json", base
 
 
 def main():
     print(f"Registering {SERVER_NAME} MCP server (repo: {REPO})")
+    print(f"Platform: {platform.system()}")
+
     print("Claude Code (project .mcp.json):")
     merge(REPO / ".mcp.json")
+
     print("Claude Desktop:")
-    dp = desktop_config_path()
-    if dp.parent.exists():
+    dp, base = desktop_config_path()
+    if base.exists():
         merge(dp)
     else:
-        print(f"  - skipped ({dp.parent} not found — is Claude Desktop installed?)")
-    print("\nDone. Restart Claude Desktop / new Claude Code session to load the tools.")
-    print("Next: start the sync daemon —  work/workd.sh <your-name>   (or work\\workd.bat)")
+        print(f"  - skipped ({base} not found — unusual profile layout; "
+              f"add it manually once Claude Desktop has run at least once)")
+
+    print("\nDone.")
+    print("  * Claude Code CLI: next time you run `claude` in this repo, it will ask to")
+    print("    approve the new project MCP server (aicad-team) the first time — say yes.")
+    print("    This is a normal one-time security prompt per contributor, not a bug.")
+    print("  * Claude Desktop: fully quit and reopen (not just close the window) to pick")
+    print("    up the config change. If aicad-team still doesn't show in your tool list,")
+    print("    your Desktop version may source MCP servers from account-synced")
+    print("    Connectors settings instead of this file — add it manually via")
+    print("    Settings -> Connectors (or MCP Servers) with:")
+    print(f"      Command: {server_entry()['command']}")
+    print(f"      Args:    {server_entry()['args']}")
+    print("\nNext: start the sync daemon —  work/workd.sh <your-name>   (or work\\workd.bat)")
     return 0
 
 

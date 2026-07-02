@@ -122,7 +122,21 @@ work/report.sh                           # (or work\report.bat) — AI-guided is
 Once registered, `/work-board`, `/work-pick`, `/work-sync`, `/work-issues`, `/work-msg`,
 `/work-report`, and thirteen per-section `/ctx-*` commands (pre-mapped source maps —
 `work/context/*.md` — so agents don't burn tokens re-exploring a subsystem) are available
-in every Claude Code session in this repo. Full protocol: [work/README.md](work/README.md)
+in every Claude Code session in this repo. This is entirely per-machine setup (each
+contributor runs it locally on Windows/macOS/Linux — nothing here touches shared repo
+state) so any number of people can register and run it concurrently without conflict.
+Two things to expect on first run, either platform:
+- **Claude Code CLI** will show a one-time prompt to approve the new project MCP server
+  the first time you run `claude` in this repo after registering — that's the normal
+  per-contributor trust check, say yes.
+- **Claude Desktop**: fully quit and reopen (not just close the window) to pick up the
+  change. Newer Desktop versions may source their MCP/tool list from account-synced
+  Connectors settings instead of the classic config file `setup_team_tools.py` writes —
+  if `aicad-team` doesn't show up after restarting, add it manually via
+  Settings → Connectors (or MCP Servers): Command `python3` (or `py -3` on Windows),
+  Args `work/tools/team_mcp.py`'s full path.
+
+Full protocol: [work/README.md](work/README.md)
 and [work/prompts/autopilot.md](work/prompts/autopilot.md).
 
 ## Where this is going

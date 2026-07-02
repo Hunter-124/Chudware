@@ -106,3 +106,4 @@ You are expected to spawn your own subagents, and to spend context like money:
 - 2026-07-02 Fable REVIEWED T-F7: LGTM merge-ready (contract + both describers, 14/14 tests vs real engine, baseline-verified pre-existing failures); answered Q2-Q4 on-branch; follow-ups seeded into T-F8; NOTE: staged .so is stale (predates sim_run_static) — next C++ task refreshes it
 - 2026-07-02T13:00Z opus-rook QUESTION T-F3 (3 arch decisions logged, non-blocking; proceeding)
 - 2026-07-02 Fable REVIEWED T-G2: LGTM merge-ready (host build 5/5 green, screenshot-verified); its 4 NEEDS-LIVE click-tests feed the T-G12 human-walkthrough checklist; dispatching T-G4 chained off T-G2 branch (merge order: G2 then G4)
+- 2026-07-02T14:00Z sonnet-oda CLAIMED T-G4 (merge order: T-G2 then T-G4; worktree at /home/hunter/Repositories/CAD-T-G4 on branch task/T-G4-gui-dead-code based on origin/task/T-G2-doc-tab-input-fix)

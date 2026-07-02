@@ -2,8 +2,8 @@
 id: T-H2
 title: Canonical doc serialization policy + semantic doc_diff tool
 workstream: H
-owner: unassigned
-status: todo
+owner: sonnet-veda
+status: doing
 branch: task/T-H2-canonical-serialization
 day: 11
 depends_on: []

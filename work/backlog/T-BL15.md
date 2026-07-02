@@ -5,7 +5,7 @@ workstream: backlog
 owner: unassigned
 status: backlog
 branch: task/T-BL15-doc-version-control
-depends_on: []
+depends_on: [T-BL14]
 ---
 
 ## Context

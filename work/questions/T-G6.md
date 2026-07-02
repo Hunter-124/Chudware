@@ -23,7 +23,10 @@ Defined"). This is F4/C6 worker-seam territory (C6 REFACTOR_LOG already flagged 
 scenarios use DocMirror/worker directly until C1–C5/H1–H4 panels land"), outside my
 `ui/imgui/src/ui/**` shell-chrome write-set.
 
-**Recommended action.** File a GitHub issue against the F4/C6 worker seam:
+**Recommended action.** FILED as GitHub issue #7 (https://github.com/Hunter-124/CAD/issues/7).
+Original recommendation below stands — advisor's call on assignee.
+
+File a GitHub issue against the F4/C6 worker seam:
 "ScenarioRunner step-machine scenarios deadlock offscreen on mid-loop
 `DocMirror::newPart(worker)` — blocks --shot capture for sketch/multidoc/m1/fea/…".
 Do NOT hold T-G6 on it (wave-2 shell chrome is complete; H5 wave-2 bar is compile + overlay

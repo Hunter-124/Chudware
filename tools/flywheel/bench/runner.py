@@ -19,20 +19,13 @@ import json
 import os
 import sys
 import tempfile
-from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Optional
 
+from .driver import BenchDriver  # re-exported for callers that do `from ..runner import BenchDriver`
 from .schema import BenchResult
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 BENCHES_DIR = os.path.join(_REPO_ROOT, "training", "benches")
-
-
-@dataclass
-class BenchDriver:
-    bench_id: str
-    # run(smoke: bool, workdir: str) -> BenchResult
-    run: Callable[[bool, str], BenchResult]
 
 
 # ---- regen-fix driver -------------------------------------------------------

@@ -183,3 +183,12 @@ gate.sh ui/imgui selMulti failure is PRE-EXISTING, never chase; commit+push ever
   6/6/5/4/2; numerals present in files; negative provenance_violation per load-bearing slot).
   Golden-file pytest suite (test_templates.py) delegated to a Sonnet subagent; gate + graphify to
   follow. NO new dependencies (all engines already in contract §7 / licenses.md).
+
+- **DoD verified (T-F15 review-ready):** golden-file suite `services/deliverables/test_templates.py`
+  (12 tests) + existing suite = **32/32 green** in-process (no pandoc/LibreOffice). `graphify
+  update .` OK (19361 nodes). `bash scripts/gate.sh`: core build PASS, ui/abstract PASS, ctest 100%
+  PASS; the three RED stages are all PRE-EXISTING and untouched by this task — check.py
+  feature_surface/parity_audit FAIL-RECORDED, engine/doc `No module named 'OCP'` pytest collection
+  error (unprovisioned OCP runtime), ui/imgui `PanelField::selMulti` build break. No file under
+  ui/ or engine/ was modified. Commits: f57d1fe (package+joins), 5991980 (guide+question),
+  ece1b89 (arc), 17e826b (tests). Status → review; branch pushed. Next: F16 branches FROM this branch.

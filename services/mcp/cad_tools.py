@@ -920,6 +920,19 @@ def cad_guide_text(topic: str = "overview") -> str:
         return _GSL_GUIDE
     if topic in ("cam", "machining", "toolpath", "toolpaths", "gcode", "g-code", "mill", "nc"):
         return _CAM_GUIDE
+    if topic in ("deliverables", "deliverable", "report", "presentation", "deck", "workbook",
+                 "spreadsheet", "artifacts", "artifact"):
+        # The deliverables family (make_report/make_presentation/make_workbook/render_document/
+        # list_artifacts) ships in a separate `deliverables` package (T-F14) so this file stays
+        # read-only w.r.t. that node's write-set; lazy-import so the guide degrades to a pointer
+        # if that package isn't present and picks up the real text the moment it lands.
+        try:
+            from deliverables import DELIVERABLES_GUIDE  # noqa: PLC0415
+            return DELIVERABLES_GUIDE
+        except ImportError:
+            return ("Deliverables (spec-driven .pptx/.docx/.pdf/.xlsx with a provenance rule) ship "
+                    "with the deliverables package; make_report/make_presentation/make_workbook/"
+                    "render_document/list_artifacts.")
     if topic in ("reverse", "re", "recognize", "recon"):
         # WS-C (wave 3) ships the recognition pipeline in a separate recon_tools module so this
         # file stays read-only w.r.t. that node's write-set; lazy-import so cad_guide("reverse")
@@ -937,7 +950,7 @@ def cad_guide_text(topic: str = "overview") -> str:
     avail = sorted(p.stem for p in (_prompts_dir() / "shared" / "cheatsheets").glob("*.md")) \
         if (_prompts_dir() / "shared" / "cheatsheets").is_dir() else []
     return (f"No guide for {topic!r}. Topics: overview, simulation, review, intake, gsl, cam, "
-            f"reverse; or a feature cheatsheet: {avail}")
+            f"reverse, deliverables; or a feature cheatsheet: {avail}")
 
 
 # --------------------------------------------------------------------------- register

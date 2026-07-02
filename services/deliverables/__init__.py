@@ -30,6 +30,7 @@ from .api import (
     render_document,
 )
 from .guide import DELIVERABLES_GUIDE
+from .mcp_tools import register_deliverables_tools
 
 __all__ = [
     "make_presentation",
@@ -38,4 +39,5 @@ __all__ = [
     "render_document",
     "list_artifacts",
     "DELIVERABLES_GUIDE",
+    "register_deliverables_tools",
 ]

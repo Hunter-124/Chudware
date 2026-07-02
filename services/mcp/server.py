@@ -79,6 +79,13 @@ register_ecad_tools(mcp)
 from mcp_server.cam_tools import register_cam_tools
 register_cam_tools(mcp)
 
+# Deliverables — spec-driven office artifacts (contract deliverables/1): make_presentation /
+# make_report / make_workbook build real .pptx/.docx/.pdf/.xlsx from a JSON spec with the
+# provenance rule (the model never types a load-bearing number); render_document previews any
+# supported file; list_artifacts reads the artifact registry. Guide: cad_guide('deliverables').
+from deliverables import register_deliverables_tools
+register_deliverables_tools(mcp)
+
 
 def _install_clean_stdout():
     """Point the process's native stdout (fd 1) at a log file and return a private handle to

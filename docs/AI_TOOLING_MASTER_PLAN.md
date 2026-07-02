@@ -443,6 +443,25 @@ Engines (license-guardrail compliant per CONTRIBUTING.md):
 - Artifacts persist under the project (PDM-lite T-BL10 revisions them later) and are
   listed by `describe_project` so a resumed agent knows what it already shipped.
 
+### Pillar 16 — Data flywheel & training pipeline (`tools/flywheel/` + Workstream H)
+
+Added 2026-07-02 (custom-model integration survey — full text in
+[CUSTOM_MODEL_INTEGRATION_SURVEY.md](CUSTOM_MODEL_INTEGRATION_SURVEY.md); VLM research
+in [VLM_OFFLINE_TRACK.md](VLM_OFFLINE_TRACK.md)). Expands Pillar 13 from one translator
+into a product-wide program: 21 model insertion points, telemetry capture
+(`ai_artifact` envelope + accept/edit/reject actions extending `contracts/events.md`),
+consent tiers (off|meta|full; external default OFF; offline/ITAR forces off),
+`aicad.req/1` requirements layer, verifier battery as RL-reward vector, DVC + Argilla
+(two human audit gates: data approval, model promotion), claim-based fleet training
+runner (own machines, mixed OS, multi-state — job-level distribution only, never
+cross-internet single-run training), vLLM per-task LoRA routing with
+shadow→canary→promote rollout and routing-table rollback, and the offline VLM track
+(Qwen3-VL-4B primary). Scope decisions ratified 2026-07-02: capture ships now,
+training on telemetry stays gated at T-F11 (decision #4 stands); team dogfood is the
+initial corpus. New rule **R1 (editability parity):** every model output lands as an
+artifact of an existing human-editable document format — generation converges on
+doc-ops JSON, never opaque artifacts.
+
 ## 3. Cross-cutting rules
 
 1. **Contract-first:** each pillar freezes its `contracts/*.md` before code (C++ cutover
@@ -492,6 +511,13 @@ Proposed as **Workstream F** task files (claimable by autopilot agents) once app
 
 Dependencies into the existing sprint: T-F4→T-A3 (gates), T-F12→T-A4 (verify nodes),
 research helpers feed WS-B T-B5 (spec-sheet AI path) and WS-D T-D4 (code-compliance RAG).
+
+**Workstream H (Pillar 16)** cut 2026-07-02: T-H1 telemetry contract · T-H2 canonical
+serialization + doc_diff · T-H3 aicad.req/1 (supersedes T-BL09) · T-H4 verifier battery ·
+T-H5 data store/Argilla · T-H6 fleet runner · T-H7 frontier logging + shadow ·
+T-H8 eval benches · T-H9 vLLM serving/canary (dep T-F9) · T-H10 offline VLM (dep T-F5) ·
+T-H11 regen-error diagnosis. Task map + rationale:
+[CUSTOM_MODEL_INTEGRATION_SURVEY.md](CUSTOM_MODEL_INTEGRATION_SURVEY.md) §7.
 
 ## 5. Execution decisions (recommended defaults — confirm before cutting tasks)
 

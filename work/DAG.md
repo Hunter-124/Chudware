@@ -79,6 +79,19 @@ graph TD
     T_G8["T-G8: GUI migration wave 4 - hard subsystems (H1-H5, G4 gate)"]:::todo
     T_G9["T-G9: GUI migration wave 5 - polish, parity battery, cutover (P1, P2, G5)"]:::todo
   end
+  subgraph WS_H["workstream H"]
+    T_H1["T-H1: Telemetry contract - AI-artifact envelope, accept/edit/reject capture, consent tiers"]:::todo
+    T_H10["T-H10: Offline VLM track v0 - base pick eval, synthetic render corpus, render-grounded RL"]:::todo
+    T_H11["T-H11: Regen-error diagnosis (IP-18) - frontier ship with logging, corruption corpus, migration gate"]:::todo
+    T_H2["T-H2: Canonical doc serialization policy + semantic doc_diff tool"]:::todo
+    T_H3["T-H3: Requirements layer - freeze aicad.req/1 schema + requirements doc CRUD"]:::todo
+    T_H4["T-H4: Verifier battery API + gap verifiers (groundedness, manifold, unit sanity, dim coverage)"]:::todo
+    T_H5["T-H5: Training data store - consent-filtered exporter, DVC versioning, Argilla audit gate"]:::todo
+    T_H6["T-H6: Fleet training runner - claim-based job queue, cross-OS profiles, MLflow tracking"]:::todo
+    T_H7["T-H7: Frontier-API logging middleware + shadow-mode comparison harness"]:::todo
+    T_H8["T-H8: Product-task eval benchmark suite (elicitation, spec->sketch, regen-fix, CAM, VLM)"]:::todo
+    T_H9["T-H9: Adapter serving - vLLM per-task LoRA routing, canary rollout, rollback story"]:::todo
+  end
   subgraph WS_backlog["workstream backlog"]
     T_BL01["T-BL01: V&V benchmark harness"]:::backlog
     T_BL02["T-BL02: Format interop track (reverse-engineering intake)"]:::backlog
@@ -156,6 +169,17 @@ graph TD
   T_G7 --> T_G8
   T_G8 --> T_G9
   T_G4 --> T_G9
+  T_F5 --> T_H10
+  T_H8 --> T_H10
+  T_H7 --> T_H11
+  T_H8 --> T_H11
+  T_H1 --> T_H5
+  T_H5 --> T_H6
+  T_H1 --> T_H7
+  T_H3 --> T_H8
+  T_H4 --> T_H8
+  T_F9 --> T_H9
+  T_H8 --> T_H9
   T_A4 --> T_INT
   T_B4 --> T_INT
   T_C4 --> T_INT

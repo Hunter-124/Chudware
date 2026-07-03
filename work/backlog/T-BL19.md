@@ -47,3 +47,6 @@ Battery shape:
 - T-BL01's V&V harness (merged) is the report/tolerance-tier pattern to copy.
 - fleet-recovery-patterns memory: the all-skip test trap — assert the battery FAILS
   if every case skips.
+
+## Progress log
+- 2026-07-03 17:07 UTC [opus-marrow] Single-op pass: 32/32 registered modeling ops build live on OCCT libaicad.so. Negative controls verified: cut-that-misses -> engine errors 'removed no material'; open surface -> free_edges issue flags non-manifold. FOUND likely engine bug: boolean fuse of two DISJOINT bodies (100mm apart) returns ok=True with body_count=2 instead of failing per the documented 'disjoint results fail' contract. Building formal harness + will file issue.

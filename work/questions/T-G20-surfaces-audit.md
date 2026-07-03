@@ -32,7 +32,7 @@ complaint is real and independently confirmed.
 | # | Tool | Engine | GUI wiring | Verdict | Key evidence |
 |---|------|--------|-----------|---------|--------------|
 | 1 | surf_extrude | ✅ | ✅ region well | **WORKS** | vol=0, 4 side walls, no caps (correct open surface) |
-| 2 | surf_revolve | ✅ | ✅ | **WORKS** | builds with datum axis **and** an edge-selector axis (K_EDGE well is compatible) |
+| 2 | surf_revolve | ✅ | ❌ **axis well K_EDGE** | **IMPAIRED — GUI wiring** | engine accepts a datum axis (`axis.z`) *and* an edge-selector axis, but the form's axis well is `K_EDGE` (edge-only) not `K_EDGEAXIS` like solid revolve (`pm_forms.cpp` L228). `routeDatumAxis` requires `selKinds.axis`, so it can't fill this well — and on a profile-only doc there's no body edge to pick either. **You cannot pick the datum axis a revolve needs.** Cheap fix below. |
 | 3 | surf_sweep | ✅ | ✅ | **WORKS** | open tube, vol=0 |
 | 4 | surf_loft | ✅ | ✅ | **WORKS** | 4 bspline walls from 2 sections |
 | 5 | surf_planar | ✅ | ✅ | **WORKS** | flat patch from closed region |
@@ -47,7 +47,22 @@ complaint is real and independently confirmed.
 | 14 | surf_delete_face | ✅ | ✅ | **WORKS** | removes a face, opens solid→surface (vol 24000→0) |
 | 15 | surf_replace_face | ⚠️ fragile | ✅ refs resolve | **WORKS but FRAGILE** | succeeds only when the replacement **actually splits** the solid (vol 24000→18000); a coincident/non-intersecting replacement → `"could not heal a solid"` on reasonable inputs |
 
-**Tally:** 11 WORKS · 1 works-fragile (replace_face) · 3 GUI-wiring-broken (ruled/fill/boundary) · 0 engine-dead.
+**Tally:** 10 WORKS · 1 impaired (revolve axis) · 1 works-fragile (replace_face) · 3 GUI-wiring-broken (ruled/fill/boundary) · 0 engine-dead.
+
+### Emit-side proof for the ruled/fill/boundary verdict (not just engine reject-side)
+
+The engine *rejecting* body-edge refs is only half the proof; the other half is that these
+wells can **only** emit body-edge selectors. Verified in `property_manager.cpp`:
+- The sketch-feature routing that produces `{kind:region,sketch:fN}` selectors is gated to
+  specific well keys: **profile/sections** (`profileWell()`, L1255–1268) and **path/centerline**
+  (`routePathFeature()`, L1283–1288). The `edge_a`/`edge_b`/`edges`/`dir1`/`dir2` wells match
+  neither route.
+- Their only input is the viewport geometry pick (`acceptPick`, L977–983: an `Edge` pick into
+  an `.edge` well), which flows through `resolve_pick` → a **body-owned** edge selector.
+So a ruled/fill/boundary well can hold nothing *but* a body-edge ref, which the engine's
+`require_sketch` rejects. The `surf_ruled` PM-form screenshot ("Edge 1 … (pick in viewport)")
+shows exactly this dead-end. (By contrast sweep's `path` and loft's `sections` route sketch
+features via `routePathFeature`/`profileWell`, which is *why* they genuinely work.)
 
 ## The one real wiring bug (ruled / fill / boundary)
 
@@ -82,9 +97,27 @@ Ribbon screenshots (light+dark) confirm Erik's icon complaint. Current glyph →
 Constraint for T-G15: icons must be existing atlas glyphs (68 in `host/assets/icons/atlas.json`);
 `gui_lint --rule icons` must stay clean. If no distinct glyph exists, a new one is needed.
 
-## Cheap wiring fixes applied
+## Cheap wiring fixes
 
-**None.** The three fix candidates are each either not-cheap or not-in-scope:
+**Applied: none landed on this branch** (see reasoning below). **One is recommended with an
+exact diff** so whoever picks it up lands *and verifies* it in a single pass.
+
+### Recommended cheap fix #1 — surf_revolve axis well (one line)
+`host/src/ui/pm_forms.cpp` L681, the `surf_revolve` form's axis well:
+```
+-            Well  ("axis",    "Axis",    "Revolve", K_EDGE, false),
++            Well  ("axis",    "Axis",    "Revolve", K_EDGEAXIS, false),
+```
+This mirrors the solid `revolve` form (L228, already `K_EDGEAXIS`) so the axis well can accept
+a datum axis (`axis.z`). **Evidence it's correct:** the engine already accepts a datum-axis ref
+for `surf_revolve` (driven and confirmed via MCP), and `routeDatumAxis` (L1163) fills any
+`selKinds.axis` well with `{kind:datum,feature:axis.z}`. **Not landed here** because: (a) it
+changes selection *acceptance*, not layout, so a both-mode screenshot verifies nothing about it
+(the parent's screenshot rule targets visual regressions); (b) it does not fully close the tool —
+`readyForPreview` gates surf_revolve only on the `profile` well (L1815), so OK can still fire with
+no axis → engine "axis required" error. Both should be fixed and verified together (see follow-up).
+
+### Why the other candidates are not cheap-in-scope
 - ruled/fill/boundary: needs a design decision + engine or form change + live-pick
   re-verification — a deep fix, not a safe one-liner. → follow-up issue.
 - replace_face fragility: engine robustness / added validation. → follow-up issue.
@@ -94,23 +127,33 @@ No test was weakened and no UI surface was removed (per the T-G12 kill-is-a-huma
 
 ## Follow-ups filed (deep work, not hand-waved)
 
-1. **surf_ruled/fill/boundary edge-well ↔ sketch-wire mismatch** — decide: teach the engine
+Filed as in-repo backlog tasks (GitHub-issue creation is blocked for this agent by policy):
+**`work/backlog/T-BL20.md`** (ruled/fill/boundary edge-well fix + stale cheatsheet) and
+**`work/backlog/T-BL21.md`** (replace_face heal). The surf_revolve axis fix is captured as
+cheap-fix #1 above (one-line diff ready). Detail:
+
+1. **surf_ruled/fill/boundary edge-well ↔ sketch-wire mismatch** (T-BL20) — decide: teach the engine
    to build wires from picked **body edges** (SolidWorks-like, bigger engine work) **or**
    re-target the forms to **sketch/region** pickers (matches today's engine, unusual UX).
-2. **surf_replace_face "could not heal"** — add pre-validation/guidance (replacement must
+2. **surf_revolve axis well + readiness gate** — apply cheap fix #1 (`K_EDGE`→`K_EDGEAXIS`,
+   pm_forms.cpp L681) AND gate `readyForPreview` on the axis well so OK can't fire without an
+   axis; verify end-to-end with a live datum-axis pick. Small, but needs a GUI build to verify.
+3. **surf_replace_face "could not heal"** — add pre-validation/guidance (replacement must
    split the solid) or make the BOP heal robust to coincident/non-intersecting replacements.
-3. **Stale agent cheatsheet** `services/agent/prompts/shared/cheatsheets/surfacing.md` —
+4. **Stale agent cheatsheet** `services/agent/prompts/shared/cheatsheets/surfacing.md` —
    claims `surf_untrim` has "NO compiler / ALWAYS errors" (false since Bug S-1 fix) and does
    not warn that ruled/fill/boundary want sketch refs. Refresh it.
 
 ## Recommendation for Erik — **KEEP**
 
 Keep the Surfaces tab. It is genuinely useful and mostly works: surface-from-profile
-(extrude/revolve/sweep/loft/planar), offset, knit, thicken (the marquee surface→solid step),
-trim, untrim, delete-face all work end-to-end today. The visible breakage reduces to **one
-wiring mismatch on the three edge-fed patch tools** plus **misleading icons** — both fixable
-without touching the kernel. Scrapping would throw away a working surface modeler over a
-form-selector bug and a couple of duplicate glyphs.
+(extrude/sweep/loft/planar), offset, knit, thicken (the marquee surface→solid step),
+trim, untrim, delete-face all work end-to-end today. The breakage is **small and localised to
+the form-selector layer, not the kernel**: three edge-fed patch tools (ruled/fill/boundary)
+whose wells offer body-edge picks the engine won't take, one wrong `selKinds` constant on the
+surf_revolve axis well (a one-line fix), a fragile replace_face heal, and **misleading icons**.
+Every one is fixable without touching the geometry kernel. Scrapping would throw away a working
+surface modeler over a handful of well-kind bugs and a couple of duplicate glyphs.
 
 ## Open questions for Erik (batched — non-blocking)
 

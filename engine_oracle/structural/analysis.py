@@ -97,6 +97,9 @@ def section_properties(section_name: str, material: str = "cedar",
     Returns ``{E, G, nu, A, Iy, Iz, J}`` (MPa / mm units). Section geometry is parsed with the same
     grammar as ``brep.section_profile`` (``WxH`` rectangle, ``I h×b×tw×tf`` / named AISC ``W`` shape,
     ``RHS`` → outer rectangle); unparseable names fall back to the element type's default section.
+    NOTE: unlike ``brep.element_to_brep`` (T-BL21), this still uses the solid outer rectangle for
+    ``RHS`` stiffness/D-C-ratio properties — voiding ``A``/``Iy``/``Iz``/``J`` for hollow sections is
+    a separate, not-yet-scoped change to the analysis path.
     """
     E, G, nu = material_properties(material)
     raw = (section_name or "").strip()
@@ -109,7 +112,7 @@ def section_properties(section_name: str, material: str = "cedar",
         A, Iy, Iz, J = _i_props(d[0], d[1], d[2], d[3])
     elif key.startswith("RHS") and len(_dims(key)) >= 2:
         d = _dims(key)
-        A, Iy, Iz, J = _rect_props(d[0], d[1])   # v1: solid outer rectangle (matches brep)
+        A, Iy, Iz, J = _rect_props(d[0], d[1])   # solid outer rectangle (see NOTE above)
     else:
         d = _dims(key)
         if len(d) >= 2:

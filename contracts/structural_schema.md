@@ -74,17 +74,23 @@ Per-type meaning of `length_mm` / `section_name`:
 
 ## 4. Section profiles — `section_profile(name) -> TopoDS_Wire`
 
-Returns a closed OCCT wire centred on the local origin in the XY plane; `element_to_brep` faces it
-and extrudes along +Z by `length_mm`, then applies `transform`. Parsed forms:
+Returns a closed OCCT wire centred on the local origin in the XY plane, describing the section's
+OUTER boundary. `element_to_brep` builds the full section FACE — voided (outer-minus-inner) for
+hollow forms — and extrudes it along +Z by `length_mm`, then applies `transform`. Parsed forms:
 
 | form | example | profile |
 |---|---|---|
 | `WxH` (2 dims, mm) | `100x100`, `38x235` | solid rectangle (lumber / generic) |
-| `RHS WxHxT` / `WxHxT` | `RHS100x50x5` | rectangular hollow → **outer rectangle** wire (scaffold simplification: wall thickness recorded in the name for takeoff, not yet voided) |
-| `I HxBxTWxTF` / AISC `W…` | `I200x100x6x10`, `W200x100` | I-shape wire (12-point) |
+| `RHS WxHxT` / `HSS WxHxT` / `WxHxT` | `RHS100x50x5`, `HSS100x100x6` | rectangular hollow → true outer-minus-inner prism, wall thickness `T` (T-BL21; falls back to a solid outer rectangle if `T` doesn't physically fit the envelope) |
+| `CHS ODxT` / `PIPE ODxT` | `CHS114.3x6.02` | circular hollow (pipe/tube) → true annulus prism, wall thickness `T` (T-BL21) |
+| `I HxBxTWxTF` / AISC `W…` | `I200x100x6x10`, `W200x100` | I-shape wire (12-point; solid open-thin-wall profile, not voided) |
 
 Unknown/empty names fall back to a sensible default rectangle for the element type so
 `element_to_brep` always yields a valid non-null solid.
+
+Note: `analysis.section_properties` (member stiffness / D-C-ratio path) still treats `RHS`/`HSS` as
+a solid outer rectangle — voiding its `A`/`Iy`/`Iz`/`J` for hollow sections is a separate, unscoped
+follow-up.
 
 ## 5. Tool signatures (MCP + worker RPC; day 3 registration)
 

@@ -1,0 +1,6 @@
+{
+ "from": "sonnet-wrenn",
+ "to": "*",
+ "text": "REVIEW T-U7 (sonnet-wrenn): new-doc-kind viewers v1 pushed on task/T-U7-ui (7e65589). Piping/hydraulic/structural read views via shared NetCanvasModel (ui/abstract) + one ImDrawList renderer + 3 JSON adapters; solve overlays (piping_solve flows, struct_analyze D/C, hydraulic sizing); pan/zoom/auto-fit; ISO 1219 symbols; results side-list; Open-Copilot read-only affordance. Verification: 3 headless one-shot fixtures (AI_CAD_SHOT=piping_view|hydraulic_view|structural_view) eyeballed green; ui_style_check 0 findings; gate.sh PASS (1996/2091 pytest pass, FAIL-RECORDED entries pre-existing, T-V2 owns). set_status review blocked by unmerged files in main checkout (integrator mid-merge) \u2014 will retry; treat T-U7 as review. NOTE for reviewers: shots require `--shot <path>` arg, AI_CAD_SHOT alone renders but never captures/exits.",
+ "ts": "2026-07-03T01:59:52Z"
+}

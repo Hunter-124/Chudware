@@ -14,6 +14,9 @@
 #include "ui/requirements_panel.h"   // T-U5
 #include "ui/transparency_panel.h"   // T-U8
 #include "ui/sim_panel.h"                       // T-U6: sim studies (AI_CAD_SHOT=sim_studies)
+#include "ui/piping_panel.h"       // T-U7 piping viewer
+#include "ui/hydraulic_panel.h"    // T-U7 hydraulic viewer
+#include "ui/structural_panel.h"   // T-U7 structural viewer
 #include "artifact_view.h"
 #include "app/app_state.h"
 #include "viewport/scene.h"
@@ -231,6 +234,9 @@ int ShotConfig::captureFrameBudget() const {
     if (wantRequirements && !requirementsShotDone) return 150;  // T-U5
     if (wantTransparency && !transparencyShotDone) return 150;  // T-U8
     if (wantSimStudies && !simStudiesShotDone) return 150;
+    if (wantPiping && !pipingShotDone) return 150;
+    if (wantHydraulic && !hydraulicShotDone) return 150;
+    if (wantStructural && !structuralShotDone) return 150;
     if (wantTree) return treeShotDone ? 10 : 30;
     if (wantEquations) return equationsShotDone ? 10 : 30;
     if (wantPartsBrowser) return partsBrowserShotDone ? 10 : 30;
@@ -281,6 +287,9 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantRequirements = eq("requirements");   // T-U5
     cfg.wantTransparency = eq("transparency");   // T-U8
     cfg.wantSimStudies   = eq("sim_studies");   // T-U6
+    cfg.wantPiping       = eq("piping_view");       // T-U7
+    cfg.wantHydraulic    = eq("hydraulic_view");    // T-U7
+    cfg.wantStructural   = eq("structural_view");   // T-U7
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
@@ -331,6 +340,27 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantRequirements) ui::openRequirementsPanel();  // T-U5
     if (cfg.wantTransparency) ui::openTransparencyPanel();  // T-U8
     if (cfg.wantSimStudies)   ui::openSimStudiesPanel();  // T-U6
+    if (cfg.wantPiping) {       // T-U7 — seed fixture immediately (no worker needed)
+        ui::openPipingPanel();
+        const std::string pipDoc = R"({"schema":"aicad.piping/1","id":"fix-p","name":"Demo Piping","units":{"system":"MMGS"},"material":"A106-B","runs":[{"id":"r1","name":"Header","nps":2.0,"schedule":"40","path":[[0,0,0],[1000,0,0]],"end_type":"BW","material":null,"bend_radius":null,"suppressed":false},{"id":"r2","name":"Branch","nps":1.5,"schedule":"40","path":[[1000,0,0],[1000,500,0]],"end_type":"BW","material":null,"bend_radius":null,"suppressed":false}],"fittings":[{"id":"ft1","type":"tee","name":"Tee","nps":2.0,"nps2":null,"origin":[1000,0,0],"orient":[0,0,0],"schedule":"40","material":null,"catalog_ref":null,"params":{},"suppressed":false}]})";
+        const std::string pipSolve = R"({"ok":true,"converged":true,"iterations":4,"links":[{"run_id":"r1","flow_m3h":15.2,"velocity_ms":1.7,"pressure_drop_kpa":8.3},{"run_id":"r2","flow_m3h":6.8,"velocity_ms":1.4,"pressure_drop_kpa":4.1}],"nodes":[{"node_id":"n0","pressure_kpa":120.0,"head_m":12.2}]})";
+        ui::seedPipingPanelFromJson(pipDoc, pipSolve);
+        cfg.pipingShotDone = true;
+    }
+    if (cfg.wantHydraulic) {   // T-U7
+        ui::openHydraulicPanel();
+        const std::string hydDoc = R"({"schema":"aicad.hydraulic/1","id":"fix-h","name":"Demo Circuit","units":{"pressure":"bar","flow":"L/min","force":"kN","position":"mm"},"components":[{"id":"c1","type":"reservoir","name":"Tank","x":0,"y":0,"params":{}},{"id":"c2","type":"pump","name":"Gear Pump","x":200,"y":0,"params":{}},{"id":"c3","type":"valve_relief","name":"Relief","x":400,"y":0,"params":{}},{"id":"c4","type":"valve_directional","name":"4/3 DCV","x":600,"y":0,"params":{}},{"id":"c5","type":"cylinder_linear","name":"Lift Cyl","x":800,"y":0,"params":{}}],"hoses":[{"id":"h1","from_port":{"comp_id":"c1","port":"generic"},"to_port":{"comp_id":"c2","port":"generic"}},{"id":"h2","from_port":{"comp_id":"c2","port":"pressure"},"to_port":{"comp_id":"c3","port":"generic"}},{"id":"h3","from_port":{"comp_id":"c2","port":"pressure"},"to_port":{"comp_id":"c4","port":"pressure"}},{"id":"h4","from_port":{"comp_id":"c4","port":"work_a"},"to_port":{"comp_id":"c5","port":"generic"}},{"id":"h5","from_port":{"comp_id":"c4","port":"tank"},"to_port":{"comp_id":"c1","port":"generic"}}],"annotations":[]})";
+        const std::string hydSize = R"({"c2":{"displacement_cc_rev":13.793,"shaft_power_kw":7.843},"c5":{"extend_force_kn":37.306,"extend_flow_lpm":2.4}})";
+        ui::seedHydraulicPanelFromJson(hydDoc, hydSize);
+        cfg.hydraulicShotDone = true;
+    }
+    if (cfg.wantStructural) {  // T-U7
+        ui::openStructuralPanel();
+        const std::string strDoc = R"({"schema":"aicad.structure/1","id":"fix-s","name":"Demo Frame","elements":[{"id":"e1","element_type":"column","section_name":"W8x31","material":"steel","length_mm":3000,"transform":[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]},{"id":"e2","element_type":"beam","section_name":"W10x45","material":"steel","length_mm":4000,"transform":[1,0,0,0,0,1,0,0,0,0,1,0,3000,0,0,1]},{"id":"e3","element_type":"column","section_name":"W8x31","material":"steel","length_mm":3000,"transform":[1,0,0,0,0,1,0,0,0,0,1,0,7000,0,0,1]}],"load_cases":[]})";
+        const std::string strRes = R"({"e1":{"axial_n":-45000,"moment_max_nm":2800000,"deflection_max_mm":1.2,"dc_ratio":0.62,"ok":true},"e2":{"axial_n":0,"moment_max_nm":18000000,"deflection_max_mm":8.4,"dc_ratio":0.85,"ok":true},"e3":{"axial_n":-38000,"moment_max_nm":2200000,"deflection_max_mm":1.1,"dc_ratio":0.58,"ok":true}})";
+        ui::seedStructuralPanelFromJson(strDoc, strRes);
+        cfg.structuralShotDone = true;
+    }
     if (cfg.wantPick) setupPickShot(st);
     if (cfg.wantGlassperf) setupPickShot(st);
 
@@ -643,6 +673,91 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
             std::printf("transparency: fixture seeded (live unavailable: %s)\n",
                         err.c_str());
         }
+    // T-U7: piping network viewer one-shot.
+    // Try live piping_solve; fall back to deterministic fixture (water loop with two runs).
+    if (cfg.wantPiping && !cfg.pipingShotDone) {
+        cfg.pipingShotDone = true;
+        // Fixture: a simple two-run water loop (header + branch) with a solved result.
+        const std::string pipingDocFixture = R"({
+            "schema": "aicad.piping/1",
+            "id": "fix-piping-1",
+            "name": "Demo Piping Loop",
+            "units": {"system": "MMGS"},
+            "material": "A106-B",
+            "runs": [
+                {"id":"r1","name":"Header","nps":2.0,"schedule":"40",
+                 "path":[[0,0,0],[1000,0,0]],"end_type":"BW","material":null,"bend_radius":null,"suppressed":false},
+                {"id":"r2","name":"Branch","nps":1.5,"schedule":"40",
+                 "path":[[1000,0,0],[1000,500,0]],"end_type":"BW","material":null,"bend_radius":null,"suppressed":false}
+            "fittings": [
+                {"id":"ft1","type":"tee","name":"Main Tee","nps":2.0,"nps2":null,
+                 "origin":[1000,0,0],"orient":[0,0,0],"schedule":"40","material":null,"catalog_ref":null,"params":{},"suppressed":false}
+        })";
+        const std::string pipingSolveFixture = R"({
+            "converged": true,
+            "iterations": 4,
+            "links": [
+                {"run_id":"r1","flow_m3h":15.2,"velocity_ms":1.7,"pressure_drop_kpa":8.3},
+                {"run_id":"r2","flow_m3h":6.8,"velocity_ms":1.4,"pressure_drop_kpa":4.1}
+            "nodes": [
+                {"node_id":"n0","pressure_kpa":120.0,"head_m":12.2},
+                {"node_id":"n1","pressure_kpa":111.7,"head_m":11.4}
+        })";
+        ui::seedPipingPanelFromJson(pipingDocFixture, pipingSolveFixture);
+        std::printf("piping_view: fixture seeded\n");
+    // T-U7: hydraulic schematic viewer one-shot.
+    if (cfg.wantHydraulic && !cfg.hydraulicShotDone) {
+        cfg.hydraulicShotDone = true;
+        const std::string hydDocFixture = R"({
+            "schema": "aicad.hydraulic/1",
+            "id": "fix-hyd-1",
+            "name": "Demo Hydraulic Circuit",
+            "units": {"pressure":"bar","flow":"L/min","force":"kN","position":"mm"},
+            "components": [
+                {"id":"c1","type":"reservoir","name":"Tank","x":0,"y":0,"params":{}},
+                {"id":"c2","type":"pump","name":"Gear Pump","x":200,"y":0,"params":{"displacement_cc_rev":13.8}},
+                {"id":"c3","type":"valve_relief","name":"Relief Valve","x":400,"y":0,"params":{"set_pressure_bar":200}},
+                {"id":"c4","type":"valve_directional","name":"4/3 DCV","x":600,"y":0,"params":{}},
+                {"id":"c5","type":"cylinder_linear","name":"Lift Cylinder","x":800,"y":0,"params":{"bore_mm":50,"rod_mm":25,"stroke_mm":300}}
+            "hoses": [
+                {"id":"h1","from_port":{"comp_id":"c1","port":"generic"},"to_port":{"comp_id":"c2","port":"generic"}},
+                {"id":"h2","from_port":{"comp_id":"c2","port":"pressure"},"to_port":{"comp_id":"c3","port":"generic"}},
+                {"id":"h3","from_port":{"comp_id":"c2","port":"pressure"},"to_port":{"comp_id":"c4","port":"pressure"}},
+                {"id":"h4","from_port":{"comp_id":"c4","port":"work_a"},"to_port":{"comp_id":"c5","port":"generic"}},
+                {"id":"h5","from_port":{"comp_id":"c4","port":"tank"},"to_port":{"comp_id":"c1","port":"generic"}}
+            "annotations": []
+        })";
+        // Sizing results: pump + cylinder pre-computed
+        const std::string hydSizingFixture = R"({
+            "c2": {"displacement_cc_rev":13.793,"shaft_power_kw":7.843},
+            "c5": {"extend_force_kn":37.306,"extend_flow_lpm":2.4,"retract_force_kn":28.2,"retract_flow_lpm":1.8}
+        })";
+        ui::seedHydraulicPanelFromJson(hydDocFixture, hydSizingFixture);
+        std::printf("hydraulic_view: fixture seeded\n");
+    // T-U7: structural frame viewer one-shot.
+    if (cfg.wantStructural && !cfg.structuralShotDone) {
+        cfg.structuralShotDone = true;
+        const std::string structDocFixture = R"({
+            "schema": "aicad.structure/1",
+            "id": "fix-struct-1",
+            "name": "Demo Frame",
+            "elements": [
+                {"id":"e1","element_type":"column","section_name":"W8x31","material":"steel",
+                 "length_mm":3000,"transform":[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]},
+                {"id":"e2","element_type":"beam","section_name":"W10x45","material":"steel",
+                 "length_mm":4000,"transform":[1,0,0,0,0,1,0,0,0,0,1,0,3000,0,0,1]},
+                {"id":"e3","element_type":"column","section_name":"W8x31","material":"steel",
+                 "length_mm":3000,"transform":[1,0,0,0,0,1,0,0,0,0,1,0,7000,0,0,1]}
+            "load_cases": []
+        })";
+        // Analysis results: D/C ratios + deflections
+        const std::string structResultsFixture = R"({
+            "e1": {"axial_n":-45000,"moment_max_nm":2800000,"deflection_max_mm":1.2,"dc_ratio":0.62,"ok":true},
+            "e2": {"axial_n":0,"moment_max_nm":18000000,"deflection_max_mm":8.4,"dc_ratio":0.85,"ok":true},
+            "e3": {"axial_n":-38000,"moment_max_nm":2200000,"deflection_max_mm":1.1,"dc_ratio":0.58,"ok":true}
+        })";
+        ui::seedStructuralPanelFromJson(structDocFixture, structResultsFixture);
+        std::printf("structural_view: fixture seeded\n");
         std::fflush(stdout);
     }
 }

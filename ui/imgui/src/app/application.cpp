@@ -17,6 +17,9 @@
 #include "ui/requirements_panel.h"  // T-U5 requirements & verification panel
 #include "ui/transparency_panel.h"  // T-U8 model & telemetry transparency panel
 #include "ui/sim_panel.h"                       // T-U6 simulation studies
+#include "ui/piping_panel.h"       // T-U7 piping viewer
+#include "ui/hydraulic_panel.h"    // T-U7 hydraulic viewer
+#include "ui/structural_panel.h"   // T-U7 structural viewer
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -294,6 +297,45 @@ void Application::frame() {
                                  ImGuiCond_Appearing);
         if (ImGui::Begin("Simulation Studies###sim_studies", ui::simStudiesPanelOpen(), pflags))
             ui::drawSimStudiesPanel(s);
+        ImGui::End();
+    }
+
+    // T-U7 Piping network viewer — read-only v1, screenshot-verifiable via AI_CAD_SHOT=piping_view.
+    if (*ui::pipingPanelOpen()) {
+        const ImGuiViewport* vp7a = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp7a->WorkPos.x + vp7a->WorkSize.x * 0.5f,
+                                       vp7a->WorkPos.y + vp7a->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(760.f * theme::S(), 520.f * theme::S()),
+                                 ImGuiCond_Appearing);
+        if (ImGui::Begin("Piping Network###piping_view", ui::pipingPanelOpen(), pflags))
+            ui::drawPipingPanel(s);
+        ImGui::End();
+    }
+
+    // T-U7 Hydraulic schematic viewer — read-only v1, AI_CAD_SHOT=hydraulic_view.
+    if (*ui::hydraulicPanelOpen()) {
+        const ImGuiViewport* vp7b = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp7b->WorkPos.x + vp7b->WorkSize.x * 0.5f,
+                                       vp7b->WorkPos.y + vp7b->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(760.f * theme::S(), 520.f * theme::S()),
+                                 ImGuiCond_Appearing);
+        if (ImGui::Begin("Hydraulic Schematic###hydraulic_view", ui::hydraulicPanelOpen(), pflags))
+            ui::drawHydraulicPanel(s);
+        ImGui::End();
+    }
+
+    // T-U7 Structural frame viewer — read-only v1, AI_CAD_SHOT=structural_view.
+    if (*ui::structuralPanelOpen()) {
+        const ImGuiViewport* vp7c = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp7c->WorkPos.x + vp7c->WorkSize.x * 0.5f,
+                                       vp7c->WorkPos.y + vp7c->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(760.f * theme::S(), 520.f * theme::S()),
+                                 ImGuiCond_Appearing);
+        if (ImGui::Begin("Structural Frame###structural_view", ui::structuralPanelOpen(), pflags))
+            ui::drawStructuralPanel(s);
         ImGui::End();
     }
 

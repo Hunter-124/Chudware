@@ -45,11 +45,16 @@ per-face overlay). T-BL34 turns that from an open question into scoped work.
       renderThumbnail path is where this hooks; design the per-face overlay first).
 - [ ] Operation-intent annotation overlay composited onto each tile (arrow/highlight/
       direction/before-after cue appropriate to the op family).
-- [ ] **CAM/Manufacture tiles show the real toolpath** (Hunter directive) — v1 (T-BL29)
-      establishes rendering the `cam_simulate` toolpath as the tile + CAM smoke check; v2
-      keeps the toolpath visible and annotates it (cut direction, entry, stock-vs-cut) so
-      the tile reads as "this is the machining move." Never replace the real toolpath with
-      a stylized glyph — the render must stay a genuine engine output.
+- [ ] **Author the Manufacture toolpath icons from scratch** (Hunter directive) — T-BL29
+      DEFERRED the entire Manufacture group (no `cam_simulate` capture path existed in the
+      pipeline), so this task OWNS it, not just annotation. Build the capture path:
+      `cam_new_job → cam_add_tool → cam_add_operation → cam_simulate` → render the real
+      toolpath (moves/cutter path over the stock) → composite per the visual contract, for
+      all five sub-groups (2.5D, Holes, 3D, Turning, Cutting). The rendered toolpath IS a
+      smoke check the CAM op chain works — if an op won't produce a renderable toolpath,
+      FILE it as a CAM bug (issue + task), never fake the tile (WORKFLOW.md §6b). Then
+      annotate (cut direction, entry, stock-vs-cut). Never a stylized glyph — genuine
+      engine output only.
 - [ ] Applied across the icon groups (coordinate with T-BL29's group list so nothing is
       missed — see "continuation" note below).
 - [ ] Atlases regenerated via the pipeline (DERIVED — never hand-edit PNGs). Contact

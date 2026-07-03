@@ -3,7 +3,7 @@ id: T-BL20
 title: FEA/CFD V&V cross-validation - MacNeal-Harder/NAFEMS cases + CalculiX second opinion
 workstream: backlog
 owner: sonnet-doro
-status: doing
+status: review
 branch: task/T-BL20-fea-vv-crossval
 depends_on: []
 lane: simulation
@@ -32,11 +32,11 @@ Scope:
 
 ## Definition of done
 
-- [ ] FEA static + modal cases execute (not SKIP) in the V&V battery via MCP wiring
-- [ ] At least 3 MacNeal-Harder/NAFEMS-style cases with tolerance-tiered error tables
-- [ ] CalculiX subprocess stage cross-checks at least the cantilever case; licenses.md
+- [x] FEA static + modal cases execute (not SKIP) in the V&V battery via MCP wiring
+- [x] At least 3 MacNeal-Harder/NAFEMS-style cases with tolerance-tiered error tables
+- [x] CalculiX subprocess stage cross-checks at least the cantilever case; licenses.md
       row if any new dep is added
-- [ ] gate.sh stage 4.5 covers the new cases; report lands in reports/vv/
+- [x] gate.sh stage 4.5 covers the new cases; report lands in reports/vv/
 
 ## AI hints
 
@@ -44,3 +44,66 @@ Scope:
 - `reports/vv/`, gate.sh stage 4.5 — existing battery structure to extend
 - Engine doc-load & verify contract: doc_new + eq_set + add_feature; CoreError vs
   feature_status for rebuild failure detection
+
+## HANDOFF (sonnet-doro, 2026-07-03)
+
+Delivered in `scripts/vv_benchmark.py`:
+
+- **MCP wiring**: `_mcp_call()` dispatches through the full in-process FastMCP server
+  (`mcp_server.server.mcp.call_tool`, same pattern as `test_roundtrip.py` /
+  `test_cad_tools.py`), since raw `core_bridge.call("sim_run_static", ...)` can't do
+  the face-query -> mesh-point-set resolution `run_fea_static`/`run_fea_modal` do.
+- **5 executed FEA/modal cases** (family `fea-static` + `modal`): FEA1 (cantilever
+  point load, square section, PRECISE, 0.39% err), FEA2 (rect section strong-axis,
+  PRECISE, 0.36% err), FEA3 (uniform pressure load, ENGINEERING — **xfail**, see
+  below), M1 (modal cantilever square, PRECISE, 0.22% err), M2 (modal cantilever
+  rect weak-axis, PRECISE, 0.49% err). All calibrated against a live OCCT build
+  (`core/build-occt-linux/bin/libaicad.so`) before landing.
+- **CalculiX** (family `calculix`): `bench_calculix()` + `_write_calculix_cantilever_inp()`
+  generate a clean-room C3D8 hex-mesh `.inp` for the FEA1 geometry, run `ccx` as a
+  PATH-discovered subprocess (GPL-2 isolation, `contracts/licenses.md` row added),
+  parse the `.dat` tip displacement, and cross-check vs Roark + our own FEA. `ccx`
+  is **not installed in this sandbox** so the live numeric check couldn't be
+  end-to-end verified here — it gracefully SKIPs (same posture as
+  ngspice/Renode/QEMU/probe-rs/esptool elsewhere in this repo). The `.inp` generator
+  itself IS verified without the binary (`TestSmoke::test_calculix_inp_generator`).
+- **Real bug found**: FEA3 (uniform pressure load) surfaced a genuine defect in
+  `core/sim/fea_run.cpp`'s pressure-load branch — the resultant force is not
+  normalized against its own computed `loaded_area` (unlike the force branch, which
+  is), so it drifts with mesh density (~10-95% error, confirmed via an isolated
+  axial-pressure-vs-axial-force diagnostic). Filed as
+  **[issue #9](https://github.com/Hunter-124/CAD/issues/9)** with root-cause
+  analysis; the test is `@pytest.mark.xfail(strict=False)` referencing it (not
+  skipped, not tolerance-loosened — it fails for real, pytest just doesn't red the
+  suite for a tracked, understood bug). Removing the xfail decorator once #9 lands
+  is the acceptance check for that fix.
+- **Robustness**: `_missing_fea_capability()` detects `"unknown method"` responses
+  (the plain `core/build-linux` .so has no OCCT geometry/FEA — only
+  `build-occt-linux` does, same split `gate.sh`'s `stage_modeling` already
+  documents) and downgrades those to SKIP instead of a false FAIL, in both the
+  `bench_*()` report path and the pytest `TestFull` methods. Verified against both
+  `.so` builds.
+
+**Verification performed:**
+- `pytest scripts/vv_benchmark.py::TestSmoke -q` — 8 passed (pure Python, no .so).
+- `AICAD_RUN_VV=full AI_CAD_LIBAICAD=<build-occt-linux>/libaicad.so pytest
+  scripts/vv_benchmark.py -q` — 17 passed, 1 skipped (ccx absent), 1 xfailed
+  (issue #9), 0 unexpected failures.
+- Same full run against the plain `build-linux` .so (no OCCT) — all FEA/modal/ccx
+  cases gracefully SKIP instead of false-failing.
+- `python scripts/check.py` (gate stage 1) — all 4 gates PASS, unaffected.
+- `scripts/gate.sh`'s core CMake/OCCT build (stage 2/2b/3) was **not** re-run from
+  cold in this worktree — this diff touches no C++ (only `scripts/vv_benchmark.py`,
+  `contracts/licenses.md`, this task file), a fresh worktree has no build cache, and
+  gate.sh disables ccache (`CCACHE_DISABLE=1`) — a from-scratch OCCT-linked build
+  would run well past what fits in one foreground gate-run turn. The integrator
+  merging into a warm main checkout (which already has `core/build-linux` +
+  `core/build-occt-linux` built) gets a fast incremental gate run instead.
+- While verifying stage 4 (`pytest mcp_server`), found 8 pre-existing test failures
+  + 34 ECAD collection errors that reproduce identically on an unmodified checkout
+  against either `.so` build — confirmed unrelated to this branch. Filed as
+  **[issue #10](https://github.com/Hunter-124/CAD/issues/10)** for visibility;
+  gate.sh's own policy records these as non-fatal, so nothing here changes gate
+  outcome, but a human should look eventually.
+
+`graphify update .` run after landing. Branch pushed, ready for merge.

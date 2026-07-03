@@ -705,89 +705,220 @@ def bench_structural() -> None:
 
 
 # ===========================================================================
-# FAMILY 6: Modal frequency — Euler-Bernoulli cantilever
-# Reference: vibration theory (Rao "Mechanical Vibrations")
+# T-BL20: shared in-process full-MCP-server dispatch for the C++ FEA cases below.
+#
+# sim_run_static / sim_run_modal are C++ plugins that expect a pre-resolved "study"
+# dict (mesh, fixed-node ids, nodal loads). Building that dict requires the face-query
+# resolution (_resolve_face_points, doc_export_step, ...) that lives in the registered
+# MCP tools (run_fea_static / run_fea_modal) — raw core_bridge.call("sim_run_static", ...)
+# cannot do this itself. So we call the FULL FastMCP server in-process, exactly like
+# services/mcp/test_roundtrip.py and services/mcp/test_cad_tools.py do (mcp_server.server.mcp
+# .call_tool), never a bare core_bridge FFI call and never a real subprocess (the "full MCP
+# server" distinction is tool-registration-vs-raw-FFI, not process boundary).
 # ===========================================================================
 
-def bench_modal() -> None:
-    """Modal frequency validation via analytical beam theory.
+def _mcp_call(name: str, args: dict) -> dict:
+    """Call a registered MCP tool in-process through the full FastMCP server."""
+    import asyncio
+    from mcp_server import server
+    _content, structured = asyncio.run(server.mcp.call_tool(name, args))
+    text = structured.get("result") if isinstance(structured, dict) else None
+    if isinstance(text, str):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {"ok": False, "error": "non-JSON MCP result"}
+    return {"ok": False, "error": "no MCP result payload"}
 
-    Note: C++ sim_run_modal is not exposed on the raw core_bridge (only via
-    full MCP server). These cases use PyNite which also supports modal analysis
-    if the API is available, but mainly document the analytic reference so the
-    CI can verify them against the MCP integration test in the future.
+
+def _fea_ready() -> tuple[bool, str]:
+    """Whether the C++ engine is staged and reachable through mcp_server.core_bridge."""
+    lib_path = os.environ.get("AI_CAD_LIBAICAD", "")
+    if not lib_path or not os.path.exists(lib_path):
+        return False, ("AI_CAD_LIBAICAD not set — C++ FEA is only reachable through the "
+                        "full MCP server (run_fea_static/run_fea_modal)")
+    try:
+        from mcp_server import core_bridge as cb
+    except ImportError as exc:
+        return False, f"mcp_server import failed: {exc}"
+    if not cb.available():
+        return False, "core_bridge reports libaicad not loadable"
+    return True, ""
+
+
+def _missing_fea_capability(error) -> bool:
+    """True when the staged .so genuinely lacks the FEA plugin (plain build-linux has
+    no OCCT geometry kernel — see scripts/gate.sh stage_modeling's note on this same
+    build-linux-vs-build-occt-linux split), as opposed to a real solve-time failure."""
+    return bool(error) and "unknown method" in str(error)
+
+
+# Explicit dict (not a named preset) so the analytic reference and the solver always
+# agree on the exact mechanical properties. NOTE density_g_cm3 is g/cm³ (steel ~7.85),
+# not g/mm³ — this bit us during calibration (a 1000x density error silently manifests
+# as a sqrt(1000)~31.6x modal-frequency error, since f∝1/√ρ).
+_VV_STEEL = {"name": "vv-steel", "E_mpa": 200000.0, "nu": 0.3,
+             "density_g_cm3": 7.85, "yield_mpa": 250.0}
+
+
+def _build_box_part(name: str, length: float, width: float, height: float) -> str:
+    """Build a single-box part via the full MCP server (X=length, Y=width, Z=height —
+    core/doc/document.cpp:6717); returns doc_id."""
+    from mcp_server import core_bridge as cb
+    r = _mcp_call("new_part", {"name": name})
+    if "doc_id" not in r:
+        raise RuntimeError(f"new_part failed: {r}")
+    doc = r["doc_id"]
+    ops = [cb.feat("box", "Beam", {"length": cb.dim(length), "width": cb.dim(width),
+                                    "height": cb.dim(height)})]
+    r2 = _mcp_call("add_features", {"ops": ops, "doc_id": doc})
+    if not r2.get("ok"):
+        raise RuntimeError(f"add_features failed: {r2}")
+    return doc
+
+
+def _fea1_point_load_case() -> dict:
+    """FEA1: cantilever tip deflection, square section, tip point load."""
+    L, b, h, P = 1000.0, 50.0, 50.0, 1000.0
+    E = _VV_STEEL["E_mpa"]
+    I = b * h ** 3 / 12.0
+    ref = P * L ** 3 / (3.0 * E * I)
+    doc = _build_box_part("vv_fea1", L, b, h)
+    r = _mcp_call("run_fea_static", {
+        "fixtures": [{"of": "face", "side": "left"}],
+        "loads": [{"face": {"of": "face", "side": "right"}, "force": [0, 0, -P]}],
+        "material": _VV_STEEL, "doc_id": doc,
+    })
+    got = r.get("summary", {}).get("max_disp_mm") if r.get("ok") else None
+    return {"ok": r.get("ok", False), "got": got, "ref": ref, "error": r.get("error"),
+            "note": f"{b:.0f}×{h:.0f}mm L={L:.0f}mm P={P:.0f}N tip force, tet10 mesh"}
+
+
+def _fea2_rect_section_case() -> dict:
+    """FEA2: cantilever tip deflection, rectangular (b≠h) section, strong-axis point
+    load. A distinct cross-section from FEA1 catches bending-axis / moment-of-inertia
+    mix-ups that a square section can't (I is orientation-independent when b=h)."""
+    L, b, h, P = 1000.0, 20.0, 80.0, 1000.0
+    E = _VV_STEEL["E_mpa"]
+    I = b * h ** 3 / 12.0  # bending about the FZ load axis (h = depth in load direction)
+    ref = P * L ** 3 / (3.0 * E * I)
+    doc = _build_box_part("vv_fea2", L, b, h)
+    r = _mcp_call("run_fea_static", {
+        "fixtures": [{"of": "face", "side": "left"}],
+        "loads": [{"face": {"of": "face", "side": "right"}, "force": [0, 0, -P]}],
+        "material": _VV_STEEL, "doc_id": doc,
+    })
+    got = r.get("summary", {}).get("max_disp_mm") if r.get("ok") else None
+    return {"ok": r.get("ok", False), "got": got, "ref": ref, "error": r.get("error"),
+            "note": f"{b:.0f}×{h:.0f}mm L={L:.0f}mm P={P:.0f}N tip force "
+                    f"(deep section, strong-axis bend)"}
+
+
+def _fea3_uniform_pressure_case() -> dict:
+    """FEA3: cantilever tip deflection under a uniform top-face pressure (Roark UDL case).
+
+    T-BL20 FINDING: this case surfaced a real defect in the C++ pressure-load path
+    (core/sim/fea_run.cpp, the `type == "pressure"` branch of fea_run_static). Unlike
+    the "force" branch — which normalizes by w_sum so the resultant equals the given
+    force vector regardless of any mesh-area bookkeeping error — the pressure branch
+    deposits `pressure * node_nw` directly, with NO normalization against its own
+    computed `loaded_area`. Diagnostic: an axial pressure load and an axial force of
+    the analytically-equal total, applied to the IDENTICAL node set, should give the
+    same displacement; the force case matches Roark to <0.2%, the pressure case is
+    ~10x too large and does not converge as mesh_fineness changes. Filed as a follow-up
+    issue alongside this task. Recorded here as an executed FAIL on purpose — this is
+    exactly the kind of latent correctness risk T-BL20 exists to catch; do not loosen
+    the tolerance to hide it.
     """
-    print("\n--- [modal] Euler-Bernoulli modal frequencies (analytic reference) ---")
+    L, b, h, p = 1000.0, 50.0, 50.0, 0.1  # MPa uniform top-face pressure
+    E = _VV_STEEL["E_mpa"]
+    I = b * h ** 3 / 12.0
+    w = p * b  # N/mm equivalent line load
+    ref = w * L ** 4 / (8.0 * E * I)
+    doc = _build_box_part("vv_fea3", L, b, h)
+    r = _mcp_call("run_fea_static", {
+        "fixtures": [{"of": "face", "side": "left"}],
+        "loads": [{"face": {"of": "face", "side": "top"}, "pressure": p}],
+        "material": _VV_STEEL, "doc_id": doc,
+    })
+    got = r.get("summary", {}).get("max_disp_mm") if r.get("ok") else None
+    return {"ok": r.get("ok", False), "got": got, "ref": ref, "error": r.get("error"),
+            "note": f"{b:.0f}×{h:.0f}mm L={L:.0f}mm p={p}MPa uniform top pressure "
+                    f"(w={w:.1f}N/mm) — KNOWN BUG: pressure-load resultant is not "
+                    f"normalized to loaded_area (core/sim/fea_run.cpp), non-convergent "
+                    f"with mesh density; see filed issue"}
 
-    pynite_available = False
-    try:
-        import Pynite as _  # noqa: F401
-        pynite_available = True
-    except ImportError:
-        pass
 
-    if not pynite_available:
-        print("  Analytic reference (no solver):")
-        _document_modal_references()
+# ===========================================================================
+# FAMILY 6: Modal frequency — Euler-Bernoulli cantilever
+# Reference: vibration theory (Rao "Mechanical Vibrations" 5th ed §8.2 Table 8.1)
+# ===========================================================================
+
+_BETA1 = 1.87510  # first root of cosh(β₁L)cos(β₁L) = -1, i.e. the cantilever B.C.
+
+
+def _modal_case(name: str, L: float, b: float, h: float, weak_axis: bool) -> dict:
+    """First bending-mode frequency, executed via run_fea_modal + an independent
+    Euler-Bernoulli analytic reference. weak_axis=True uses I=h·b³/12 (the SMALLER
+    moment of inertia governs the lowest/first mode when b≠h — a b=h square section
+    doesn't distinguish this, hence a second, asymmetric case)."""
+    E, nu, rho = _VV_STEEL["E_mpa"], _VV_STEEL["nu"], _VV_STEEL["density_g_cm3"]
+    I_mm4 = (h * b ** 3 if weak_axis else b * h ** 3) / 12.0
+    I = I_mm4 * 1e-12  # mm^4 -> m^4
+    A = b * h * 1e-6  # mm^2 -> m^2
+    Lm = L * 1e-3  # mm -> m
+    rho_si = rho * 1000.0  # g/cm^3 -> kg/m^3
+    E_si = E * 1e6  # MPa -> Pa
+    ref = (_BETA1 ** 2 / (2 * math.pi * Lm ** 2)) * math.sqrt(E_si * I / (rho_si * A))
+    doc = _build_box_part(name, L, b, h)
+    r = _mcp_call("run_fea_modal", {
+        "fixtures": [{"of": "face", "side": "left"}],
+        "material": _VV_STEEL, "doc_id": doc, "n_modes": 4,
+    })
+    freqs = r.get("freqs_hz") if r.get("ok") else None
+    got = freqs[0] if freqs else None
+    return {"ok": r.get("ok", False), "got": got, "ref": ref, "error": r.get("error"),
+            "freqs": freqs}
+
+
+def bench_modal() -> None:
+    """Modal frequency validation via analytical beam theory, executed against the C++
+    core through the full MCP server (see the shared-helpers docstring above for why
+    raw core_bridge can't reach sim_run_modal's face-query resolution itself)."""
+    print("\n--- [modal] Euler-Bernoulli modal frequencies (Rao 5th §8.2) ---")
+    ready, reason = _fea_ready()
+    cases = [
+        ("M1-cantilever-square-first-mode",
+         lambda: _modal_case("vv_m1", 1000.0, 50.0, 50.0, False),
+         "Rao 5th §8.2 Table 8.1: β₁L=1.87510, f₁=(β₁L)²/(2πL²)√(EI/ρA)"),
+        ("M2-cantilever-rect-weak-axis-first-mode",
+         lambda: _modal_case("vv_m2", 1000.0, 20.0, 80.0, True),
+         "Rao 5th §8.2: weak-axis I=h·b³/12 governs the first (lowest) mode when b≠h"),
+    ]
+    if not ready:
+        print(f"  (no solver: {reason})")
+        for case_name, _fn, citation in cases:
+            _skip("modal", case_name, reason, citation)
         return
-
-    # Check if PyNite supports modal analysis (added in newer versions)
-    try:
-        from Pynite import FEModel3D
-        m_test = FEModel3D()
-        has_modal = hasattr(m_test, "analyze_linear_buckling") or hasattr(m_test, "modal_eigenvalue")
-    except Exception:
-        has_modal = False
-
-    print("  Analytic reference:")
-    _document_modal_references()
-
-    if not has_modal:
-        # Analytic references already recorded by _document_modal_references()
-        pass
-
-
-def _document_modal_references() -> None:
-    """Print analytic modal frequency references (no engine needed)."""
-    E = 200000.0; rho = 7.85e-3  # steel
-
-    # -- M1: Cantilever first bending mode --
-    # Citation: Rao "Mechanical Vibrations" 5th ed §8.2 Table 8.1
-    #   β₁L = 1.87510 (first root of cosh(β₁L)cos(β₁L) = -1)
-    #   ω₁ = (β₁L)²/L² · √(EI/ρA)
-    #   f₁ = ω₁/(2π)
-    beta1 = 1.87510
-    b_m1, h_m1, L_m1 = 50.0, 50.0, 1000.0
-    I_m1 = b_m1 * h_m1 ** 3 / 12.0 * 1e-12  # m⁴
-    A_m1 = b_m1 * h_m1 * 1e-6  # m²
-    L_m1_m = L_m1 * 1e-3  # m
-    rho_si = rho * 1e6  # kg/m³
-    E_si = E * 1e6  # Pa
-    f1_cant = (beta1 ** 2 / (2 * math.pi * L_m1_m ** 2)) * math.sqrt(
-        E_si * I_m1 / (rho_si * A_m1))
-    print(f"  M1-cantilever-first-mode analytic ref: f₁ = {f1_cant:.1f} Hz "
-          f"(50×50mm steel L=1000mm, Rao 5th §8.2)")
-
-    # -- M2: Simply supported first mode --
-    # Citation: Rao 5th §8.2
-    #   f₁ = π/(2L²) · √(EI/ρA)   [β₁L = π for SS-SS]
-    f1_ss = (math.pi / (2 * L_m1_m ** 2)) * math.sqrt(
-        E_si * I_m1 / (rho_si * A_m1))
-    print(f"  M2-simply-supported-first-mode analytic ref: f₁ = {f1_ss:.1f} Hz "
-          f"(50×50mm steel L=1000mm, Rao 5th §8.2)")
-
-    # Record as analytic references (not executed against solver)
-    _record("modal", "M1-cantilever-first-mode", "N/A", "SKIP",
-            None, f1_cant,
-            f"Analytic ref: {f1_cant:.1f} Hz. C++ sim_run_modal is the validated solver "
-            f"(only via full MCP server). PyNite modal not available.",
-            "Rao 5th §8.2 Table 8.1: β₁L=1.87510 for cantilever",
-            executed=False)
-    _record("modal", "M2-simply-supported-first-mode", "N/A", "SKIP",
-            None, f1_ss,
-            f"Analytic ref: {f1_ss:.1f} Hz. SS-SS first mode: f₁=π/(2L²)√(EI/ρA).",
-            "Rao 5th §8.2: β₁L=π for SS-SS",
-            executed=False)
+    for case_name, fn, citation in cases:
+        try:
+            res = fn()
+        except Exception as exc:
+            _record("modal", case_name, "N/A", "FAIL", None, None, f"error: {exc}", citation)
+            traceback.print_exc()
+            continue
+        if not res["ok"]:
+            err = res.get("error")
+            if _missing_fea_capability(err):
+                _skip("modal", case_name,
+                      f"engine build lacks sim_run_modal (needs core/build-occt-linux, "
+                      f"not the plain build-linux .so): {err}", citation)
+            else:
+                _record("modal", case_name, "N/A", "FAIL", None, res["ref"],
+                         f"run_fea_modal failed: {err}", citation)
+            continue
+        _check("modal", case_name, "PRECISE", res["got"], res["ref"], citation,
+               note=f"f1={res['got']:.2f}Hz (all modes: {res.get('freqs')})")
 
 
 # ===========================================================================
@@ -842,82 +973,192 @@ def bench_cfd_lbm_trend() -> None:
 
 
 # ===========================================================================
-# FAMILY 8: FEA static (C++ core via MCP server)
-# Reference: Euler-Bernoulli cantilever deflection
+# FAMILY 8: FEA static (C++ core via the full MCP server)
+# Reference: Euler-Bernoulli cantilever deflection (Roark 8th)
 # ===========================================================================
 
 def bench_fea_static() -> None:
-    """FEA static analysis via C++ core (geometry pre-step + source audit)."""
-    print("\n--- [fea-static] C++ FEA static (geometry pre-step) ---")
-
-    lib_path = os.environ.get("AI_CAD_LIBAICAD", "")
-    if not lib_path or not os.path.exists(lib_path):
-        _skip("fea-static", "FEA1-cantilever-deflection",
-              "AI_CAD_LIBAICAD not set — C++ FEA only through full MCP server",
-              "Roark 8th Table 8.1 Case 1a: δ=PL³/(3EI)")
+    """FEA static analysis via the C++ core, wired through the full MCP server (see the
+    shared-helpers docstring above bench_modal for why raw core_bridge can't reach
+    sim_run_static's face-query resolution itself)."""
+    print("\n--- [fea-static] C++ FEA static (via full MCP server) ---")
+    ready, reason = _fea_ready()
+    cases = [
+        ("FEA1-cantilever-point-load", _fea1_point_load_case, "PRECISE",
+         "Roark 8th Table 8.1 Case 1a: δ=PL³/(3EI)"),
+        ("FEA2-cantilever-rect-section", _fea2_rect_section_case, "PRECISE",
+         "Roark 8th Table 8.1 Case 1a: δ=PL³/(3EI), b≠h section"),
+        ("FEA3-cantilever-uniform-pressure", _fea3_uniform_pressure_case, "ENGINEERING",
+         "Roark 8th Table 3.1 Case 2a: δ=wL⁴/(8EI)"),
+    ]
+    if not ready:
+        for case_name, _fn, _tier, citation in cases:
+            _skip("fea-static", case_name, reason, citation)
         return
+    for case_name, fn, tier, citation in cases:
+        try:
+            res = fn()
+        except Exception as exc:
+            _record("fea-static", case_name, "N/A", "FAIL", None, None,
+                     f"error: {exc}", citation)
+            traceback.print_exc()
+            continue
+        if not res["ok"]:
+            err = res.get("error")
+            if _missing_fea_capability(err):
+                _skip("fea-static", case_name,
+                      f"engine build lacks sim_run_static (needs core/build-occt-linux, "
+                      f"not the plain build-linux .so): {err}", citation)
+            else:
+                _record("fea-static", case_name, "N/A", "FAIL", None, res["ref"],
+                         f"run_fea_static failed: {err}", citation)
+            continue
+        _check("fea-static", case_name, tier, res["got"], res["ref"], citation,
+               note=res.get("note", ""))
 
-    mcp_path = str(_PROJECT_ROOT / "services" / "mcp")
-    if mcp_path not in sys.path:
-        sys.path.insert(0, mcp_path)
-    try:
-        import core_bridge as cb
-    except ImportError as exc:
-        _skip("fea-static", "FEA1-cantilever-deflection",
-              f"core_bridge import failed: {exc}",
-              "Roark 8th Table 8.1 Case 1a")
-        return
 
-    # Independent reference:
-    # Citation: Roark 8th Table 8.1 Case 1a
-    #   δ_tip = P·L³/(3·E·I)
-    # 50×50mm steel cantilever, L=1000mm, P=1000N
-    L, b, h, P, E = 1000.0, 50.0, 50.0, 1000.0, 200000.0
+# ===========================================================================
+# FAMILY 9: CalculiX (ccx) — second structural opinion (T-BL20)
+# GPL-2 -> subprocess isolation per contracts/licenses.md (same posture as the
+# ngspice/Renode/QEMU rows: PATH-discovered, never bundled, degrades gracefully).
+# Reference: same cantilever as FEA1 — Roark AND our own C++ FEA both get an
+# independent third opinion from ccx.
+# ===========================================================================
+
+def _write_calculix_cantilever_inp(path: str, L: float, b: float, h: float, P: float,
+                                   E: float, nu: float,
+                                   nx: int = 40, ny: int = 4, nz: int = 4) -> dict:
+    """Generate a minimal Abaqus-format .inp for a C3D8 hex-mesh cantilever: fixed at
+    x=0, a total force P (N, -Z) spread evenly over the x=L end nodes. Clean-room:
+    synthesized directly from our own geometry/loads — no NAFEMS/ASME content is
+    reproduced (same fence as T-BL01)."""
+    nnx, nny, nnz = nx + 1, ny + 1, nz + 1
+
+    def nid(i: int, j: int, k: int) -> int:  # 1-based CalculiX node id
+        return 1 + i + j * nnx + k * nnx * nny
+
+    lines = ["*NODE"]
+    for k in range(nnz):
+        for j in range(nny):
+            for i in range(nnx):
+                x, y, z = L * i / nx, b * j / ny, h * k / nz
+                lines.append(f"{nid(i, j, k)}, {x:.6f}, {y:.6f}, {z:.6f}")
+
+    lines.append("*ELEMENT, TYPE=C3D8, ELSET=EBEAM")
+    eid = 1
+    for k in range(nz):
+        for j in range(ny):
+            for i in range(nx):
+                # Standard C3D8 winding: bottom face CCW, top face directly above.
+                n1, n2 = nid(i, j, k), nid(i + 1, j, k)
+                n3, n4 = nid(i + 1, j + 1, k), nid(i, j + 1, k)
+                n5, n6 = nid(i, j, k + 1), nid(i + 1, j, k + 1)
+                n7, n8 = nid(i + 1, j + 1, k + 1), nid(i, j + 1, k + 1)
+                lines.append(f"{eid}, {n1}, {n2}, {n3}, {n4}, {n5}, {n6}, {n7}, {n8}")
+                eid += 1
+
+    fixed = [nid(0, j, k) for k in range(nnz) for j in range(nny)]
+    lines.append("*NSET, NSET=NFIXED")
+    lines.append(", ".join(str(n) for n in fixed))
+    tip = [nid(nx, j, k) for k in range(nnz) for j in range(nny)]
+    lines.append("*NSET, NSET=NTIP")
+    lines.append(", ".join(str(n) for n in tip))
+
+    per_node = P / len(tip)
+    lines += [
+        "*MATERIAL, NAME=STEEL",
+        "*ELASTIC",
+        f"{E:.1f}, {nu:.3f}",
+        "*SOLID SECTION, ELSET=EBEAM, MATERIAL=STEEL",
+        "*BOUNDARY",
+        "NFIXED, 1, 3, 0.0",
+        "*STEP",
+        "*STATIC",
+        "*CLOAD",
+    ]
+    lines += [f"{n}, 3, {-per_node:.6f}" for n in tip]
+    lines += ["*NODE PRINT, NSET=NTIP", "U", "*END STEP"]
+    Path(path).write_text("\n".join(lines) + "\n")
+    return {"n_nodes": nnx * nny * nnz, "n_elements": nx * ny * nz, "tip_nodes": tip}
+
+
+def _parse_ccx_tip_uz(dat_path: str, tip_nodes: list) -> float | None:
+    """Parse a ccx *NODE PRINT U .dat block for the average |U3| over the tip node set."""
+    tip_set = set(tip_nodes)
+    vals: list = []
+    lines = Path(dat_path).read_text().splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].strip().startswith("NODE") and "U1" in lines[i]:
+            j = i + 1
+            while j < len(lines) and lines[j].strip():
+                parts = lines[j].split()
+                if len(parts) >= 4:
+                    try:
+                        if int(parts[0]) in tip_set:
+                            vals.append(float(parts[3]))
+                    except ValueError:
+                        pass
+                j += 1
+        i += 1
+    if not vals:
+        return None
+    return abs(sum(vals) / len(vals))
+
+
+def _calculix_cantilever_case() -> dict:
+    """FEA1's geometry/load re-run through ccx (GPL-2 subprocess, PATH-discovered)."""
+    import shutil
+    ccx = shutil.which("ccx") or shutil.which("ccx_2.20") or shutil.which("calculix")
+    L, b, h, P = 1000.0, 50.0, 50.0, 1000.0
+    E, nu = _VV_STEEL["E_mpa"], _VV_STEEL["nu"]
     I = b * h ** 3 / 12.0
-    delta_ref = P * L ** 3 / (3.0 * E * I)
-
+    ref = P * L ** 3 / (3.0 * E * I)
+    if not ccx:
+        return {"ok": False, "skipped": True, "ref": ref,
+                "reason": "ccx not found on PATH — subprocess-only, PATH-discovered "
+                          "(contracts/licenses.md, GPL-2 isolation); the .inp generator "
+                          "itself is covered by TestSmoke without the binary"}
+    import subprocess
+    import tempfile
+    workdir = tempfile.mkdtemp(prefix="vv_ccx_")
+    job = "vv_cantilever"
+    inp_path = os.path.join(workdir, f"{job}.inp")
+    meta = _write_calculix_cantilever_inp(inp_path, L, b, h, P, E, nu)
     try:
-        import tempfile
-        doc_r = cb.call("doc_new", {"kind": "part", "name": "vv_fea_probe"})
-        doc_id = doc_r["doc_id"]
-        r = cb.call("doc_apply_ops", {
-            "doc_id": doc_id,
-            "ops": [{"op": "add_feature", "feature": {
-                "type": "box", "name": "Cantilever",
-                "params": {
-                    "length": {"value": L, "expr": None},
-                    "width": {"value": b, "expr": None},
-                    "height": {"value": h, "expr": None},
-                },
-            }}]
-        })
-        fs = (r.get("rebuild") or {}).get("feature_status", [])
-        box_ok = fs[0].get("ok") if fs else False
-        step = tempfile.mktemp(suffix=".step")
-        cb.call("doc_export_step", {"doc_id": doc_id, "path": step})
-        step_exists = os.path.exists(step)
-        cb.call("doc_close", {"doc_id": doc_id})
-
-        if box_ok and step_exists:
-            # sim_run_static not callable on raw bridge — record as SKIP-with-reference
-            _record("fea-static", "FEA1-cantilever-deflection", "PRECISE", "SKIP",
-                    None, delta_ref,
-                    f"Geometry pre-step OK (box={box_ok}, STEP={step_exists}). "
-                    f"sim_run_static is C++ plugin — only callable through full MCP server. "
-                    f"Analytic ref: δ=PL³/(3EI)={delta_ref:.4f}mm for 50×50×{L:.0f}mm, P={P}N. "
-                    f"Integration test (TODO) should verify max_disp_mm within 10% of {delta_ref:.2f}.",
-                    "Roark 8th Table 8.1 Case 1a: δ_tip=PL³/(3EI)",
-                    executed=False)
-        else:
-            _record("fea-static", "FEA1-cantilever-deflection", "PRECISE", "FAIL",
-                    None, delta_ref,
-                    f"Geometry pre-step failed: box_ok={box_ok}, STEP={step_exists}. "
-                    f"Cannot proceed to FEA validation.",
-                    "Roark 8th Table 8.1 Case 1a")
+        proc = subprocess.run([ccx, "-i", job], cwd=workdir, capture_output=True,
+                              text=True, timeout=120)
     except Exception as exc:
-        _record("fea-static", "FEA1-cantilever-deflection", "N/A", "FAIL",
-                None, None, f"geometry pre-step error: {exc}", "")
-        traceback.print_exc()
+        return {"ok": False, "skipped": False, "ref": ref,
+                "error": f"ccx subprocess error: {exc}"}
+    dat_path = os.path.join(workdir, f"{job}.dat")
+    if proc.returncode != 0 or not os.path.exists(dat_path):
+        return {"ok": False, "skipped": False, "ref": ref,
+                "error": f"ccx exit {proc.returncode}: {proc.stderr[-400:]}"}
+    got = _parse_ccx_tip_uz(dat_path, meta["tip_nodes"])
+    if got is None:
+        return {"ok": False, "skipped": False, "ref": ref,
+                "error": "could not parse tip UZ from ccx .dat output"}
+    return {"ok": True, "got": got, "ref": ref,
+            "note": f"{b:.0f}×{h:.0f}mm L={L:.0f}mm P={P:.0f}N, "
+                    f"{meta['n_elements']} C3D8 hex elements"}
+
+
+def bench_calculix() -> None:
+    """CalculiX second structural opinion on the FEA1 cantilever."""
+    print("\n--- [calculix] ccx subprocess second opinion ---")
+    citation = ("Roark 8th Table 8.1 Case 1a: δ=PL³/(3EI); cross-checked via CalculiX "
+                "(ccx, GPL-2 subprocess)")
+    res = _calculix_cantilever_case()
+    if res.get("skipped"):
+        _skip("calculix", "CCX1-cantilever-point-load", res["reason"], citation)
+        return
+    if not res["ok"]:
+        _record("calculix", "CCX1-cantilever-point-load", "N/A", "FAIL", None, res["ref"],
+                res.get("error", "ccx run failed"), citation)
+        return
+    _check("calculix", "CCX1-cantilever-point-load", "ENGINEERING", res["got"], res["ref"],
+          citation, note=res.get("note", ""))
 
 
 # ===========================================================================
@@ -995,7 +1236,8 @@ def _generate_report(elapsed: float) -> str:
         "",
         "| Source | Used in |",
         "|--------|---------|",
-        "| Roark 8th ed Table 8.1-8.2 | S1, S2, S3, S4, FEA1 |",
+        "| Roark 8th ed Table 8.1-8.2 | S1, S2, S3, S4, FEA1, FEA2 |",
+        "| Roark 8th ed Table 3.1 (UDL cantilever) | FEA3 |",
         "| Hibbeler *Structural Analysis* 9th §12.1 | S4 |",
         "| Hayt & Kemmerly *Engineering Circuit Analysis* 8th | C1, C3 |",
         "| Sedra & Smith *Microelectronic Circuits* 6th §1.5 | C2 |",
@@ -1005,6 +1247,7 @@ def _generate_report(elapsed: float) -> str:
         "| Vickers Industrial Hydraulics Manual (1992) ch.3 | H2 |",
         "| Rao *Mechanical Vibrations* 5th §8.2 | M1, M2 |",
         "| Anderson *Introduction to Flight* 8th §5.4 | LBM-T1 |",
+        "| CalculiX (ccx, GPL-2, subprocess-only) 3rd-opinion cross-check | CCX1 |",
         "",
         "## CI Integration",
         "",
@@ -1048,6 +1291,7 @@ def main() -> int:
     bench_structural()
     bench_modal()
     bench_fea_static()
+    bench_calculix()
     bench_cfd_lbm_trend()
     elapsed = time.perf_counter() - t0
 
@@ -1255,6 +1499,21 @@ class TestSmoke:
         err = _pct_err(delta_got, delta_ref)
         assert err < PRECISE, f"SS UDL δ err={err:.3f}% > {PRECISE}%"
 
+    def test_calculix_inp_generator(self):
+        """CCX-gen (T-BL20): the CalculiX .inp generator emits self-consistent Abaqus
+        syntax (node/element counts, boundary/load node sets) — checked without ccx
+        itself, so this always runs in the gate even when the binary is absent."""
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "probe.inp")
+        meta = _write_calculix_cantilever_inp(path, 1000.0, 50.0, 50.0, 1000.0,
+                                              200000.0, 0.3, nx=4, ny=2, nz=2)
+        text = Path(path).read_text()
+        assert "*NODE" in text and "*ELEMENT, TYPE=C3D8" in text
+        assert "*BOUNDARY" in text and "*CLOAD" in text
+        assert meta["n_nodes"] == 5 * 3 * 3
+        assert meta["n_elements"] == 4 * 2 * 2
+        assert len(meta["tip_nodes"]) == 3 * 3
+
 
 class TestFull:
     """Full suite: requires AI_CAD_LIBAICAD and external deps.
@@ -1410,6 +1669,84 @@ class TestFull:
         f_peak = float(f[np.argmax(mag)])
         err = _pct_err(f_peak, f0_ref)
         assert err < ENGINEERING, f"RLC resonance freq err={err:.1f}% > {ENGINEERING}%"
+
+    def test_fea_static_point_load(self):
+        """FEA1 (T-BL20): C++ static FEA cantilever tip deflection vs Roark — PRECISE."""
+        ready, reason = _fea_ready()
+        if not ready:
+            pytest.skip(reason)
+        res = _fea1_point_load_case()
+        if not res["ok"] and _missing_fea_capability(res.get("error")):
+            pytest.skip(f"engine build lacks sim_run_static: {res.get('error')}")
+        assert res["ok"], res.get("error")
+        err = _pct_err(res["got"], res["ref"])
+        assert err < PRECISE, f"FEA1 δ err={err:.3f}% > {PRECISE}%"
+
+    def test_fea_static_rect_section(self):
+        """FEA2 (T-BL20): rectangular-section strong-axis cantilever — PRECISE tier."""
+        ready, reason = _fea_ready()
+        if not ready:
+            pytest.skip(reason)
+        res = _fea2_rect_section_case()
+        if not res["ok"] and _missing_fea_capability(res.get("error")):
+            pytest.skip(f"engine build lacks sim_run_static: {res.get('error')}")
+        assert res["ok"], res.get("error")
+        err = _pct_err(res["got"], res["ref"])
+        assert err < PRECISE, f"FEA2 δ err={err:.3f}% > {PRECISE}%"
+
+    @pytest.mark.xfail(
+        reason="T-BL20 / issue #9: pressure-load resultant in core/sim/fea_run.cpp is "
+               "not normalized to its own computed loaded_area (unlike the force path), "
+               "so it drifts with mesh density — confirmed ~10x error via an "
+               "axial-pressure-vs-axial-force diagnostic on the identical node set. "
+               "xfail (not skip/loosened tolerance) so this stays visible until fixed; "
+               "an XPASS here means the engine bug was fixed and this decorator should "
+               "come off.",
+        strict=False)
+    def test_fea_static_uniform_pressure(self):
+        """FEA3 (T-BL20): uniform pressure-load cantilever — ENGINEERING tier."""
+        ready, reason = _fea_ready()
+        if not ready:
+            pytest.skip(reason)
+        res = _fea3_uniform_pressure_case()
+        if not res["ok"] and _missing_fea_capability(res.get("error")):
+            pytest.skip(f"engine build lacks sim_run_static: {res.get('error')}")
+        assert res["ok"], res.get("error")
+        err = _pct_err(res["got"], res["ref"])
+        assert err < ENGINEERING, f"FEA3 δ err={err:.3f}% > {ENGINEERING}% (known bug)"
+
+    def test_fea_modal_cantilever(self):
+        """M1 (T-BL20): C++ modal FEA first bending mode vs Rao — PRECISE tier."""
+        ready, reason = _fea_ready()
+        if not ready:
+            pytest.skip(reason)
+        res = _modal_case("vv_m1_pytest", 1000.0, 50.0, 50.0, False)
+        if not res["ok"] and _missing_fea_capability(res.get("error")):
+            pytest.skip(f"engine build lacks sim_run_modal: {res.get('error')}")
+        assert res["ok"], res.get("error")
+        err = _pct_err(res["got"], res["ref"])
+        assert err < PRECISE, f"M1 f1 err={err:.3f}% > {PRECISE}%"
+
+    def test_fea_modal_rect_weak_axis(self):
+        """M2 (T-BL20): rectangular-section weak-axis first mode — PRECISE tier."""
+        ready, reason = _fea_ready()
+        if not ready:
+            pytest.skip(reason)
+        res = _modal_case("vv_m2_pytest", 1000.0, 20.0, 80.0, True)
+        if not res["ok"] and _missing_fea_capability(res.get("error")):
+            pytest.skip(f"engine build lacks sim_run_modal: {res.get('error')}")
+        assert res["ok"], res.get("error")
+        err = _pct_err(res["got"], res["ref"])
+        assert err < PRECISE, f"M2 f1 err={err:.3f}% > {PRECISE}%"
+
+    def test_calculix_cantilever(self):
+        """CCX1 (T-BL20): ccx second opinion on the FEA1 cantilever — ENGINEERING tier."""
+        res = _calculix_cantilever_case()
+        if res.get("skipped"):
+            pytest.skip(res["reason"])
+        assert res["ok"], res.get("error")
+        err = _pct_err(res["got"], res["ref"])
+        assert err < ENGINEERING, f"CCX1 δ err={err:.3f}% > {ENGINEERING}%"
 
 
 if __name__ == "__main__":

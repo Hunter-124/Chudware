@@ -51,3 +51,6 @@ T-F3 contract instead of three parallel implementations. READ
   (T-H1 landed the helpers: emit_ai_artifact_action in core/agent/events, consent-
   stamped) — a human answer to an agent question is intake gold per
   contracts/telemetry.md derivation rules.
+
+## Progress log
+- 2026-07-03 00:17 UTC [sonnet-clay] REVIEW: Branch task/T-F4-interaction-migration pushed. All three mechanisms migrated onto interaction/1 contract: (1) gate.py — ledger replay-check before interrupt(), _gate_ledger() with 'unknown' sentinel guard; (2) intake_tools.py — _ask_via_contract() via ask_user() with FileLedger(run_id), resolve_process + confirm_dimensions both route through contract; (3) clarify.cpp — additive interaction/1 shape-mirror, existing fields unchanged. Cross-mechanism no-re-ask: 14 new tests (12 pass, 2 honest T-V3 skips). C++: 24 tests pass (136 assertions). Python: 157 pass / 3 skip. gate.sh: core cmake FAIL and pytest FAIL-RECORDED are pre-existing. Question in work/questions/T-F4.md about doc-scoped ledger — proceeding with run-scoped approach (c), no interaction.py edit needed.

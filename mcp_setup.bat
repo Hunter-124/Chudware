@@ -1,9 +1,10 @@
 @echo off
 setlocal EnableDelayedExpansion
 REM ===========================================================================
-REM  AI-CAD MCP setup  --  portable one-click installer
+REM  ShopCraft MCP setup  --  portable one-click installer
 REM
-REM  Wires the AI-CAD MCP server into every MCP client you have installed:
+REM  Wires the ShopCraft MCP server (id "shopcraft"; legacy "ai-cad" entries are
+REM  preserved) into every MCP client you have installed:
 REM      Claude Code, Cursor, VS Code, opencode, Antigravity.
 REM
 REM  What it does:
@@ -14,7 +15,7 @@ REM    2. Verifies the MCP server actually starts.
 REM    3. Writes/merges the right config file for each client (non-destructive).
 REM
 REM  Usage:   mcp_setup.bat              install / re-register
-REM           mcp_setup.bat uninstall   remove the ai-cad entries
+REM           mcp_setup.bat uninstall   remove the shopcraft (and legacy ai-cad) entries
 REM ===========================================================================
 
 set "REPO=%~dp0"
@@ -28,7 +29,7 @@ if /i "%~1"=="remove"      set "MODE=unregister"
 
 echo(
 echo ===========================================================
-echo   AI-CAD MCP setup  (%MODE%)
+echo   ShopCraft MCP setup  (%MODE%)
 echo   repo: %REPO%
 echo ===========================================================
 echo(
@@ -36,7 +37,8 @@ echo(
 REM ---- 1. locate a usable Python -------------------------------------------
 set "PYEXE="
 
-call :try_python "%APPDATA%\AI-CAD\runtime\venv\Scripts\python.exe"
+call :try_python "%APPDATA%\ShopCraft\runtime\venv\Scripts\python.exe"
+if not defined PYEXE call :try_python "%APPDATA%\AI-CAD\runtime\venv\Scripts\python.exe"
 if not defined PYEXE call :try_python "%REPO%\.venv\Scripts\python.exe"
 
 if not defined PYEXE (
@@ -82,10 +84,10 @@ if errorlevel 1 ( echo  ERROR: writing client configs failed. & goto :fail )
 echo(
 echo ===========================================================
 if /i "%MODE%"=="unregister" (
-    echo   Done. The ai-cad MCP server was removed from all clients.
+    echo   Done. The shopcraft (and legacy ai-cad) MCP server was removed from all clients.
 ) else (
     echo   Done. Restart any open client to pick up the server:
-    echo     - Claude Code : reopen this folder; approve "ai-cad" when prompted
+    echo     - Claude Code : reopen this folder; approve "shopcraft" when prompted
     echo     - Cursor      : Settings ^> MCP  (or just reopen the project^)
     echo     - VS Code     : reopen the folder; Start the server in .vscode/mcp.json
     echo     - opencode    : run it from this folder

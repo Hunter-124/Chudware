@@ -1,0 +1,6 @@
+{
+  "from": "sonnet-alder",
+  "to": "foreman",
+  "ts": "2026-07-03T10:15:00Z",
+  "text": "BLOCKER: docs/sessions/demo_sprint_day5/capstone_run.log has stale uncommitted changes in main checkout (modified 05:03, hours ago). work.py claim BUSY-loops until committed. T-BL01 V&V harness is fully coded and tested (16 executed, 0 broken, 12 pytest pass) — just need the claim to land. Please commit or restore that log file."
+}

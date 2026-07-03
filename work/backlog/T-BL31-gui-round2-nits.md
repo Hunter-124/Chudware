@@ -2,8 +2,8 @@
 id: T-BL31
 title: GUI round-2 walkthrough nits — dim-chip bleed live-confirm, load toast pinned over ribbon, empty Mass-Properties pills
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-lira
+status: doing
 priority: 3
 lane: app-gui
 kind: fix

@@ -1264,7 +1264,7 @@ def register_cad_tools(mcp: FastMCP) -> None:
                     fail = [{"id": s.get("id"), "error": s.get("error")} for s in fs
                             if not s.get("ok")]
                     _publish_current(d)  # mirror the rolled-back (or current) state to the app
-                    return {
+                    fail_result = {
                         "ok": False,
                         "doc_id": d,
                         "rolled_back": reverted,
@@ -1273,6 +1273,31 @@ def register_cad_tools(mcp: FastMCP) -> None:
                         "failed_features": fail,
                         "features": feats,
                     }
+                    # T-BL22: rebuild failure -> IP-18 regen_diagnose fix-preview card
+                    # (T-H11 seam). Diagnoses the FAILED tree from the ops response (the
+                    # doc itself was already rolled back above), logs the model call as an
+                    # IP-18 correction trace, and attaches the accept/edit/reject card to
+                    # the failure response for the copilot/caller to surface. Best-effort:
+                    # any error (no provider, no tree) degrades to the plain failure dict.
+                    try:
+                        failed_tree = r.get("tree") or (r.get("rebuild") or {}).get("tree")
+                        if failed_tree:
+                            from services.mcp.regen_tools import diagnose_failed_document
+                            engine_err = "; ".join(
+                                str(f.get("error")) for f in fail if f.get("error")) or None
+                            diag = diagnose_failed_document(
+                                {"revision": r.get("revision", 0), "tree": failed_tree,
+                                 "owner_map": r.get("owner_map") or {}},
+                                engine_error=engine_err)
+                            if diag.get("ok"):
+                                card = dict(diag["card"])
+                                # strip in-process handles (not JSON-serializable intent)
+                                card.pop("_corrupted_document", None)
+                                card.pop("_fixed_document", None)
+                                fail_result["regen_diagnosis"] = card
+                    except Exception:  # noqa: BLE001 — diagnosis must never mask the failure
+                        pass
+                    return fail_result
 
                 out = {
                     "ok": ok,

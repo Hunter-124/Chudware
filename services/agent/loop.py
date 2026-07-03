@@ -1020,12 +1020,25 @@ def run_turn(session: Session, request: str, provider: Provider,
                 _prompt_hash = hashlib.sha256(_prompt_text.encode()).hexdigest()[:16]
             except Exception:  # noqa: BLE001
                 _prompt_hash = ""
+            # T-BL22: when the caller routed this call through a RoutingTable (T-H9), the
+            # RouteDecision rides on the provider — its telemetry_tag() is the decided
+            # write-point for model.adapter, so every canary/adapter response is tagged.
+            _decision = getattr(provider, "_routing_decision", None)
+            if _decision is not None:
+                try:
+                    _model_info = _decision.telemetry_tag()
+                except Exception:  # noqa: BLE001
+                    _model_info = {"provider": _provider_name, "model": _model_name,
+                                   "adapter": None}
+            else:
+                _model_info = {"provider": _provider_name, "model": _model_name,
+                               "adapter": None}
             _emit_ai_artifact(
                 on_event=on_event,
                 run_id=session.name,
                 iteration_index=i,
                 insertion_point="IP-1",
-                model_info={"provider": _provider_name, "model": _model_name, "adapter": None},
+                model_info=_model_info,
                 prompt_hash=_prompt_hash,
                 latency_ms=_iter_latency_ms,
                 consent=_consent,

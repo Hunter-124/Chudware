@@ -1,6 +1,6 @@
 # V&V Benchmark Report — AI-CAD Simulation Backends
 
-**Generated:** 2026-07-03T10:22:05Z  
+**Generated:** 2026-07-03T22:16:12Z  
 **Script:** `scripts/vv_benchmark.py` (T-BL01)  
 **Methodology:** Independent analytic reference solutions (textbook closed-form); no reference values read from the engine under test.  
 **NAFEMS/ASME documents:** NOT bundled. Target values hand-typed with inline citation.  
@@ -9,12 +9,12 @@
 
 | Metric | Count |
 |--------|-------|
-| Executed cases | 16 |
-| PASS | 16 |
-| FAIL | 0 |
+| Executed cases | 21 |
+| PASS | 20 |
+| FAIL | 1 |
 | TREND-PASS | 0 |
-| SKIP (env/dep) | 4 |
-| Elapsed | 0.2s |
+| SKIP (env/dep) | 2 |
+| Elapsed | 69.0s |
 
 ## Tolerance Tiers
 
@@ -70,20 +70,28 @@
 
 | Case | Tier | Verdict | Got | Ref | Err% | Citation |
 |------|------|---------|-----|-----|------|----------|
-| M1-cantilever-first-mode *(skipped)* | N/A | **SKIP** | — | 40.77 | — | Rao 5th §8.2 Table 8.1: β₁L=1.87510 for cantilever |
-| M2-simply-supported-first-mode *(skipped)* | N/A | **SKIP** | — | 114.4 | — | Rao 5th §8.2: β₁L=π for SS-SS |
+| M1-cantilever-square-first-mode | PRECISE | **PASS** | 40.86 | 40.77 | 0.215% | Rao 5th §8.2 Table 8.1: β₁L=1.87510, f₁=(β₁L)²/(2πL²)√(EI/ρA |
+| M2-cantilever-rect-weak-axis-first-mode | PRECISE | **PASS** | 16.39 | 16.31 | 0.492% | Rao 5th §8.2: weak-axis I=h·b³/12 governs the first (lowest) |
 
 ## Family: fea-static
 
 | Case | Tier | Verdict | Got | Ref | Err% | Citation |
 |------|------|---------|-----|-----|------|----------|
-| FEA1-cantilever-deflection *(skipped)* | N/A | **SKIP** | — | — | — | Roark 8th Table 8.1 Case 1a: δ=PL³/(3EI) |
+| FEA1-cantilever-point-load | PRECISE | **PASS** | 3.188 | 3.2 | 0.387% | Roark 8th Table 8.1 Case 1a: δ=PL³/(3EI) |
+| FEA2-cantilever-rect-section | PRECISE | **PASS** | 1.96 | 1.953 | 0.361% | Roark 8th Table 8.1 Case 1a: δ=PL³/(3EI), b≠h section |
+| FEA3-cantilever-uniform-pressure | ENGINEERING | **FAIL** | 2.23 | 6 | 62.826% | Roark 8th Table 3.1 Case 2a: δ=wL⁴/(8EI) |
+
+## Family: calculix
+
+| Case | Tier | Verdict | Got | Ref | Err% | Citation |
+|------|------|---------|-----|-----|------|----------|
+| CCX1-cantilever-point-load *(skipped)* | N/A | **SKIP** | — | — | — | Roark 8th Table 8.1 Case 1a: δ=PL³/(3EI); cross-checked via  |
 
 ## Family: cfd-lbm
 
 | Case | Tier | Verdict | Got | Ref | Err% | Citation |
 |------|------|---------|-----|-----|------|----------|
-| LBM-T1-drag-velocity-squared *(skipped)* | N/A | **SKIP** | — | — | — | Drag equation: F=½ρCdAV² → Cd=const for fixed Re regime |
+| LBM-T1-drag-velocity-squared *(skipped)* | N/A | **SKIP** | — | — | — | Anderson 2016 §5.4: F_drag=½ρCdAV²; Cd=const(V) for incompre |
 
 ## Reference Sources
 
@@ -93,7 +101,8 @@ hand-typed single numbers with inline citation.
 
 | Source | Used in |
 |--------|---------|
-| Roark 8th ed Table 8.1-8.2 | S1, S2, S3, S4, FEA1 |
+| Roark 8th ed Table 8.1-8.2 | S1, S2, S3, S4, FEA1, FEA2 |
+| Roark 8th ed Table 3.1 (UDL cantilever) | FEA3 |
 | Hibbeler *Structural Analysis* 9th §12.1 | S4 |
 | Hayt & Kemmerly *Engineering Circuit Analysis* 8th | C1, C3 |
 | Sedra & Smith *Microelectronic Circuits* 6th §1.5 | C2 |
@@ -103,6 +112,7 @@ hand-typed single numbers with inline citation.
 | Vickers Industrial Hydraulics Manual (1992) ch.3 | H2 |
 | Rao *Mechanical Vibrations* 5th §8.2 | M1, M2 |
 | Anderson *Introduction to Flight* 8th §5.4 | LBM-T1 |
+| CalculiX (ccx, GPL-2, subprocess-only) 3rd-opinion cross-check | CCX1 |
 
 ## CI Integration
 

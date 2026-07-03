@@ -87,6 +87,7 @@
 | open3d (T-F6, optional) | MIT | mesh cleanup + scale normalization post-photogrammetry | ok |
 | Meshroom/AliceVision (T-F6, subprocess only) | MPL-2.0 | photogrammetry reconstruction — NEVER imported, subprocess via MESHROOM_BIN | ok (subprocess) |
 | COLMAP (T-F6, subprocess alternate) | BSD-3 | photogrammetry alternate — NEVER imported, subprocess via COLMAP_BIN | ok (subprocess) |
+| **CalculiX** (`ccx`, optional, T-BL20) | **GPL-2.0** | FEA V&V cross-validation: `scripts/vv_benchmark.py` `bench_calculix()` — an independent structural "second opinion" solver run on a clean-room-generated cantilever `.inp`, cross-checked against Roark and our own C++ FEA | ok. **Subprocess-only**, PATH-discovered (`shutil.which("ccx")`), never bundled or linked (same aggregation isolation as ngspice/Renode/QEMU). Degrades gracefully (SKIP) when absent — not installed in the dev sandbox this task shipped from; the `.inp` generator itself is covered by a pure-Python `TestSmoke` case that needs no binary. |
 
 Rules:
 - Adding any dependency requires a row here in the same change.

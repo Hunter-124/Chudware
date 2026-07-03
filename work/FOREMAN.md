@@ -336,3 +336,4 @@ All branches at status:review. Trivial `services/mcp/server.py` append conflicts
 - 2026-07-03T18:20Z sonnet-gorse REVIEW T-BL23 branch=task/T-BL23-battery-cam-keys
 - 2026-07-03 fable-foreman REVIEWED+MERGED T-BL23: LGTM (gouge pre-gate verified pre-key-loop, gouge_tol=0.05mm makes >0 threshold sound, manifold predicate parity confirmed, 33/33, scope clean); Q1 answered keep-aliases; chips (_gap_eval_check_direct scalar-only + contracts.md drift) cut as T-BL32
 - 2026-07-03 fable-foreman REVIEWED+MERGED T-BL23: LGTM (gouge pre-gate pre-key-loop verified, gouge_tol=0.05mm makes >0 sound, manifold parity confirmed, 38/38 post-union with Hunter's 5336cd1); Q1 answered keep-aliases; contracts.md drift cut T-BL32
+- 2026-07-03 fable-foreman REVIEWED+MERGED T-BL20: LGTM (V&V benchmark honesty verified — refs independently checked, FEA3 caught a real solver bug #9 and reported it as FAIL not back-fit, ccx subprocess+gated; 25 tests); wind-down convergence

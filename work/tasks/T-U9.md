@@ -2,8 +2,8 @@
 id: T-U9
 title: Gallery panel + first-run sample wiring
 workstream: U
-owner: unassigned
-status: todo
+owner: sonnet-reed
+status: doing
 branch: task/T-U9-gallery-ui
 day: 9
 priority: 3

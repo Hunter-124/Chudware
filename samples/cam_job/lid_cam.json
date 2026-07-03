@@ -1,0 +1,20 @@
+{
+  "ok": true,
+  "strategy": "milling",
+  "dialect": "grbl",
+  "op_count": 3,
+  "ops_summary": "face, contour2d, drill",
+  "material": "aluminum",
+  "hole_count": 4,
+  "warnings": [],
+  "sim": [
+    {
+      "setup_id": "setup7",
+      "ok": true,
+      "cycle_time_s": 70.8,
+      "machined_fraction": 0.489,
+      "gouges": 0
+    }
+  ],
+  "gcode_lines": 175
+}

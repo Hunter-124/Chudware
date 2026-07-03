@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "samples": [
+    {
+      "id": "mech_part",
+      "title": "Mounting Bracket",
+      "description": "Machined aluminium bracket: base plate + upright rib, bolt-circle holes, fillets. Teaches the core modelling loop: box primitives, bolt_circle, fillet, material.",
+      "discipline": "mech",
+      "doc_kind": "aicad.part/1",
+      "doc_file": "mech_part/bracket.aicm",
+      "thumbnail": "mech_part/thumbnail.png",
+      "build_script": "mech_part/build.py",
+      "what_it_teaches": [
+        "Box primitives with merge (fuse) to build compound bodies",
+        "bolt_circle for repeating hole patterns",
+        "Fillet on named face-side edges",
+        "Setting material (aluminium_6061) and reading eval_mass"
+      ],
+      "approx_volume_mm3": 88000,
+      "material": "aluminium_6061",
+      "tags": ["beginner", "milling", "aluminium"]
+    },
+    {
+      "id": "cam_job",
+      "title": "Enclosure Lid (with CAM)",
+      "description": "Aluminium lid with mounting holes and a pre-generated GRBL G-code CAM job. Demonstrates the cam_program fast-path: face mill + contour2d, with simulation verification.",
+      "discipline": "cam",
+      "doc_kind": "aicad.part/1",
+      "doc_file": "cam_job/lid.aicm",
+      "cam_file": "cam_job/lid_cam.json",
+      "thumbnail": "cam_job/thumbnail.png",
+      "build_script": "cam_job/build.py",
+      "what_it_teaches": [
+        "cam_program deterministic fast-path (no human prompting)",
+        "GRBL G-code output and machining simulation",
+        "bolt_circle on a thin plate for corner mounting",
+        "Reading cam simulation metrics (cycle_time, machined_fraction, gouges)"
+      ],
+      "approx_volume_mm3": 28600,
+      "material": "aluminium_6061",
+      "tags": ["cam", "milling", "grbl", "aluminium"]
+    },
+    {
+      "id": "structural_frame",
+      "title": "Portal Frame (Weldment)",
+      "description": "Welded steel portal frame: two uprights + top beam from 40×40×2 square tube, auto-mitred at joints. Demonstrates the weld_member sweep feature and cut-list workflow.",
+      "discipline": "structural",
+      "doc_kind": "aicad.part/1",
+      "doc_file": "structural_frame/frame.aicm",
+      "thumbnail": "structural_frame/thumbnail.png",
+      "build_script": "structural_frame/build.py",
+      "what_it_teaches": [
+        "Sketch path as a weld_member spine (open line segments)",
+        "rect_tube profile with w/h/thickness params",
+        "Multi-body result: one solid per member segment",
+        "Mitre corner trimming at shared vertices"
+      ],
+      "approx_volume_mm3": 204000,
+      "material": "steel",
+      "tags": ["structural", "weldment", "steel", "multi-body"]
+    }
+  ]
+}

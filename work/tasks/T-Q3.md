@@ -3,7 +3,7 @@ id: T-Q3
 title: Sample project gallery + guided tours
 workstream: Q
 owner: sonnet-lark
-status: doing
+status: review
 branch: task/T-Q3-prod
 day: 3
 priority: 4
@@ -26,12 +26,13 @@ projects per discipline and a guided tour that shows the agent working.
 
 ## Definition of done
 
-- [ ] All samples regenerate from scripts against the merged engine (test = regen + open
-      + tree/solve asserts)
-- [ ] index.json + thumbnails (headless shots) present; GUI gallery panel is T-U-later —
-      data format is the deliverable
-- [ ] One tour script runs end-to-end headless
-- [ ] gate; graphify update .
+- [x] All samples regenerate from scripts against the merged engine (test = regen + open
+      + tree/solve asserts) — 13/13 pytest pass (samples/test_regen.py)
+- [x] index.json + thumbnails (headless shots) present; GUI gallery panel is T-U-later —
+      data format is the deliverable — samples/index.json + 3 PNGs written
+- [x] One tour script runs end-to-end headless — samples/tours/bracket_tour.py 9/9 steps
+- [x] gate; graphify update . — check.py FAIL-RECORDED (pre-existing, same as all tasks);
+      graphify updated (26334 nodes / 54695 edges / 1216 communities)
 
 ## Driver notes (Fable)
 

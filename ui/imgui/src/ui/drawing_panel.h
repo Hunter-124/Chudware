@@ -21,6 +21,8 @@
 
 #include <string>
 
+#include <nlohmann/json.hpp>
+
 namespace app { struct AppState; }
 
 namespace ui {
@@ -38,5 +40,12 @@ void drawDrawingSheet(app::AppState& state);
 // command wiring is out of this wave's write-set — see task report), ported for completeness /
 // future wiring, mirroring cam_panel's unwired camHandleCommand().
 bool drawingHandleCommand(app::AppState& state, const std::string& cmd);
+
+// T-G9 scenario/parity hooks: read-only access to the panel's active drawing (registry id +
+// cached drawing_get JSON) and a host-refreshDrawingTab-equivalent refresh, so the AI_CAD_SHOT
+// drawing scenario can drive the same detailing RPC sequence host's scenario drives.
+std::string drawingActiveDocId();
+nlohmann::json drawingActiveDoc();
+void drawingRefreshActive(app::AppState& state);
 
 }  // namespace ui

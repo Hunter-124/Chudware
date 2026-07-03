@@ -749,6 +749,11 @@ static void createDrawingFromActive(app::AppState& st, DrawingUI& tab) {
     ui::postToast(ui::ToastLevel::Info, "Drawing created with " + std::to_string(added) + " views");
 }
 
+// --- T-G9 scenario/parity hooks (see drawing_panel.h) -----------------------------------------
+std::string drawingActiveDocId() { return g_dwg.drawingDocId; }
+nlohmann::json drawingActiveDoc() { return g_dwg.drawingDoc; }
+void drawingRefreshActive(app::AppState& st) { refreshDrawing(st, g_dwg); }
+
 bool drawingHandleCommand(app::AppState& st, const std::string& cmd) {
     DrawingUI& tab = g_dwg;
     if (tab.drawingDocId.empty()) {

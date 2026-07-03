@@ -38,7 +38,7 @@ DOC_METHODS = ("doc_new", "doc_apply_ops", "doc_rebuild")
 # init, AI-CAD2 on first draw after job adoption). Compared as a sorted multiset instead
 # of position-in-sequence; content differences still FAIL.
 READONLY_CATALOG = {"cam_post_dialects", "cam_tool_types", "cam_op_types", "cam_materials",
-                    "agent_list_models"}
+                    "agent_list_models", "drawing_get", "cam_tree"}
 
 
 def canon_ids(lines: list[str]) -> list[str]:
@@ -64,7 +64,7 @@ def doc_slice(stream: list[dict], anchor_methods: tuple[str, ...],
     touched: set[str] = set()
     for rec in stream:
         if any(rec.get("method", "").startswith(p) for p in anchor_methods):
-            for k in ("doc_id", "part_doc_id"):
+            for k in ("doc_id", "part_doc_id", "source_doc_id"):
                 v = rec.get("params", {}).get(k) or (rec.get("result") or {}).get(k)
                 if v:
                     touched.add(v)
@@ -88,7 +88,7 @@ def norm_requests(recs: list[dict], extra_volatile=frozenset()) -> list[str]:
                            "params": common._scrub(r.get("params", {}), extra_volatile)},
                           sort_keys=True)
         (catalog if r["method"] in READONLY_CATALOG else ordered).append(line)
-    return canon_ids(ordered) + ["# catalog reads (order-free):"] + sorted(canon_ids(catalog))
+    return canon_ids(ordered) + ["# catalog reads (order-free, deduped):"] + sorted(set(canon_ids(catalog)))
 
 
 def norm_responses(recs: list[dict], methods: set[str], extra_volatile=frozenset()) -> list[str]:

@@ -49,8 +49,14 @@ rework pushed) · eddy (T-BL22, usage limit, work pushed). heath/eddy branches c
   hover-action popup path, NOT pmTooltip) + settings popup transparent OS border (issue #12).
   Ready to dispatch the moment Hunter reopens dispatch (or he takes it himself).
 - **T-BL34** (P3 overhaul, depends_on T-BL29, PARKED for Hunter greenlight): icon pipeline v2 —
-  color the preview-render models + annotate operation intent over the tiles. T-BL29 given a
+  color the preview-render models + annotate operation intent over the tiles; now ALSO owns the
+  Manufacture toolpath icons from scratch (T-BL29 deferred that group). T-BL29 given a
   continuation guarantee (no silent gaps; missed tiles stay open checkboxes).
+- **T-BL36** (P3 app-gui overhaul, todo): FM reference/feature rows — replace the left vertical
+  bar with an animated border around the row background pill on hover/select (ImGui time-phase).
+- **T-BL37** (P3 modeling-core new, todo): origin as a selectable, renderable reference point —
+  engine ref-resolution (point.origin datum) + viewport point render + FM selectable + viewport
+  pick. Cross-cutting, Opus-leaning on the engine ref layer — good candidate for Hunter to steer.
 
 ## Human-gated (waiting on Hunter)
 - **sketch_new label call** (round-2): keep icon-only [ribbon.cpp ribbon_displayLabel L134 intentional]

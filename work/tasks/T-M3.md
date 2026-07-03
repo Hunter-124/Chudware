@@ -4,8 +4,6 @@ title: CAM overhaul: holder/shank collision simulation
 workstream: M
 owner: opus-iron
 status: done
-
-status: doing
 branch: task/T-M3-cam-overhaul
 day: 3
 priority: 3

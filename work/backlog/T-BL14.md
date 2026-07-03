@@ -8,7 +8,7 @@ branch: task/T-BL14-gnn-adapter-training
 depends_on: []
 lane: ml-flywheel
 kind: new
-priority: 4
+priority: 5
 deferred: yes
 ---
 

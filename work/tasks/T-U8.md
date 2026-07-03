@@ -3,7 +3,7 @@ id: T-U8
 title: Model & telemetry transparency UI — consent, which-brain, canary opt-in
 workstream: U
 owner: sonnet-teal
-status: review
+status: done
 branch: task/T-U8-ui
 day: 8
 priority: 4

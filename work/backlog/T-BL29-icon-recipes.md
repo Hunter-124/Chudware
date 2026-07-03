@@ -108,10 +108,17 @@ recipe-writing + eyeballing + any scenario-side extensions called out below.
 ### Manufacture — 2.5D, Holes, 3D, Turning, Cutting
 - [ ] **CAM-simulator capture source required** — `cam_simulate` output, NOT the modeling
       viewport (T-G15 DoD explicit). This is new scenario work; budget accordingly.
-- [ ] Design the capture path: `cam_simulate` -> screenshot -> crop/composite per the
-      visual contract (transparent bg, 4dp radius, ~80% fill)
-- [ ] Recipes for all five Manufacture sub-groups
-- [ ] All generated Manufacture icons eyeballed
+- [ ] **The tile MUST show the actual TOOLPATH** (Hunter directive 2026-07-03) — the
+      rendered moves/cutter path over the stock, not just a machined part. The whole point:
+      a CAM icon that renders a real toolpath IS a smoke check that the op chain
+      (`cam_new_job` → `cam_add_tool` → `cam_add_operation` → `cam_simulate`) produced a
+      valid toolpath. **If a CAM op will not produce a renderable toolpath, that is a CAM
+      BUG to FILE (GitHub issue + backlog task), not an icon to skip or fake.** Leave the
+      checkbox open with the filed issue # per the continuation guarantee.
+- [ ] Design the capture path: `cam_simulate` -> toolpath render -> screenshot ->
+      crop/composite per the visual contract (transparent bg, 4dp radius, ~80% fill)
+- [ ] Recipes for all five Manufacture sub-groups, each showing its toolpath
+- [ ] All generated Manufacture icons eyeballed — confirm a visible toolpath in each
 
 ### Wrap-up
 - [ ] `python3 scripts/icon_pipeline.py --render` succeeds end-to-end with full recipe set
@@ -154,3 +161,4 @@ HANDOFF 2 section with traps and per-group notes.
 
 ## Progress log
 - 2026-07-03 22:58 UTC [sonnet-lumen] (foreman, Hunter direction 2026-07-03) CONTINUATION GUARANTEE: do not close T-BL29 with silent gaps — any icon group/tile you cannot complete must be left as an OPEN checkbox with a one-line reason, not dropped, so the missed/overlooked ones stay trackable. Follow-on task T-BL34 (icon pipeline v2: color the preview models + annotate operation intent over the tiles) depends_on T-BL29 and will re-generate on top of your recipe set — so land the current-pipeline recipes as-is; the coloring/annotation layer is T-BL34's job, not yours. If you surface a NEW gap, add it to T-BL29 or flag it for T-BL34.
+- 2026-07-03 23:04 UTC [sonnet-lumen] (foreman, Hunter directive 2026-07-03) Manufacture group refinement: the CAM tiles MUST show the actual TOOLPATH (cam_simulate rendered moves over the stock), not just a machined part — this makes each CAM icon a smoke check that cam_new_job→cam_add_tool→cam_add_operation→cam_simulate produces a valid toolpath. If any CAM op won't render a toolpath, FILE it (GitHub issue + backlog task) and leave that checkbox OPEN with the issue # — do not skip or fake. Now a DoD convention in WORKFLOW.md §6b. Pure recipe groups (3D Body/Pattern/Multi-body/Curves) are unaffected — keep banking those.

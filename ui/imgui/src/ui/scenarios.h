@@ -43,6 +43,8 @@ struct ShotConfig {
     bool partsBrowserShotDone = false;
     bool wantBom = false;
     bool bomShotDone = false;
+    bool wantRequirements = false;          // T-U5: requirements & verification panel
+    bool requirementsShotDone = false;
 
     // Long-running scenario modes (ScenarioRunner step machines)
     bool wantM1 = false;

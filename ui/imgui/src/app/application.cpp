@@ -21,6 +21,7 @@
 #include "ui/hydraulic_panel.h"    // T-U7 hydraulic viewer
 #include "ui/structural_panel.h"   // T-U7 structural viewer
 #include "ui/gallery_panel.h"       // T-U9 sample gallery
+#include "ui/mission_control_panel.h"  // T-F17 mission-control (DAG run steering) panel
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -351,6 +352,19 @@ void Application::frame() {
                                  ImGuiCond_Appearing);
         if (ImGui::Begin("Sample Gallery###gallery", ui::galleryPanelOpen(), pflags))
             ui::drawGalleryPanel(s);
+        ImGui::End();
+    }
+
+    // Live plan/action stream (run tree + event trail) + gate steering (approve/reject).
+    if (*ui::missionControlPanelOpen()) {
+        const ImGuiViewport* vp5 = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp5->WorkPos.x + vp5->WorkSize.x * 0.5f,
+                                       vp5->WorkPos.y + vp5->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(640.f * theme::S(), 780.f * theme::S()),
+                                 ImGuiCond_Appearing);
+        if (ImGui::Begin("Mission Control###mission_control", ui::missionControlPanelOpen(), pflags))
+            ui::drawMissionControlPanel(s);
         ImGui::End();
     }
 

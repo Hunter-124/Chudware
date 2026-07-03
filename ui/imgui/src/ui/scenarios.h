@@ -58,6 +58,8 @@ struct ShotConfig {
     bool hydraulicShotDone = false;
     bool wantStructural = false;
     bool structuralShotDone = false;
+    bool wantMissionControl = false;        // T-F17: mission-control (DAG steering) panel
+    bool missionControlShotDone = false;
 
     // Long-running scenario modes (ScenarioRunner step machines)
     bool wantM1 = false;

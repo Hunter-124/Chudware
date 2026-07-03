@@ -22,6 +22,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
 from .graph_loader import DagState, EmitFn, build_state_graph, validate_graph
+from .event_journal import EventJournal
 
 # ---------------------------------------------------------------------------
 # Runs directory resolution
@@ -102,12 +103,19 @@ def run(
     if not graph_json_path.exists():
         graph_json_path.write_text(json.dumps(graph_json), encoding="utf-8")
 
-    if emit:
-        emit("dag.run.started", {
-            "run_id": run_id,
-            "graph_id": graph_id,
-            "node_count": node_count,
-        })
+    # T-F17: wrap the caller's emit with an EventJournal so every dag.* event is
+    # persisted to events.jsonl for mission-control replay-on-reopen.
+    # The journal's cache/runs dir is intentionally separate from the checkpoint db_path
+    # (which lives in runs/) per contracts/agent_events.md §1.
+    journal = EventJournal(run_id)
+    emit = journal.wrap(emit)
+
+    emit("dag.run.started", {
+        "run_id": run_id,
+        "graph_id": graph_id,
+        "node_count": node_count,
+        "graph_name": graph_json.get("name", ""),
+    })
 
     # Build the uncompiled StateGraph, then compile with checkpointer inside the CM
     # so the SqliteSaver connection is alive for the full invocation.
@@ -234,6 +242,10 @@ def resume(
         graph_json = json.loads(graph_json_path.read_text(encoding="utf-8"))
 
     validate_graph(graph_json)
+
+    # T-F17: wrap the caller's emit with the journal so resume events are also persisted.
+    journal = EventJournal(run_id)
+    emit = journal.wrap(emit)
 
     # Reconstruct the identical StateGraph topology and compile with the existing DB.
     # LangGraph persists STATE, not structure — the graph must be rebuilt identically.

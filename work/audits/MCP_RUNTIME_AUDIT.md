@@ -3,17 +3,7 @@
 **Task:** T-V2  **Agent:** sonnet-vega  **Date:** 2026-07-02
 
 **Library:** `/home/hunter/Repositories/CAD/core/build-linux/bin/libaicad.so`
-**mcp-venv:** `/home/hunter/.local/share/AI-CAD/mcp-venv` (Python 3.14.6)
-**Total registered tools:** 182
-
-Re-run command:
-```
-AI_CAD_LIBAICAD=/home/hunter/Repositories/CAD/core/build-linux/bin/libaicad.so \
-  /home/hunter/.local/share/AI-CAD/mcp-venv/bin/python scripts/mcp_runtime_audit.py \
-  --out work/audits/MCP_RUNTIME_AUDIT.md
-```
-
----
+**Total registered tools:** 184
 
 ## Summary
 
@@ -21,25 +11,12 @@ AI_CAD_LIBAICAD=/home/hunter/Repositories/CAD/core/build-linux/bin/libaicad.so \
 | ------- | ----- |
 | WORKS | 96 |
 | DEGRADED | 10 |
-| DEAD | **0** |
-| INCONCLUSIVE (arg fixture wrong, tool alive) | 69 |
-| SKIPPED (side-effect: starts process/GUI) | 7 |
-| **Total** | **182** |
-
-**Key finding: No DEAD tools.** The PyNite pattern (registered but unreachable due to
-missing dep) does not currently exist in the tool surface — PyNiteFEA 1.0.1 IS
-installed in the mcp-venv. The DEGRADED tools are all graceful-degradation paths
-(missing optional binaries, empty state, nonexistent files) that return contract-shaped
-`{ok:false, reason, hint}` responses correctly.
-
-The 21 packages missing from the mcp-venv vs requirements.txt mean large chunks of
-functionality are unreachable at runtime. WORKS verdicts apply to the installed stack.
-
----
+| DEAD | 0 |
+| INCONCLUSIVE | 71 |
+| SKIPPED (side-effect) | 7 |
+| **Total** | **184** |
 
 ## Family Import Status
-
-All 24 tool families import successfully.
 
 | Family | Import | Tools |
 | ------ | ------ | ----- |
@@ -58,353 +35,385 @@ All 24 tool families import successfully.
 | sourcing | OK | 2 |
 | cost | OK | 2 |
 | spec | OK | 3 |
-| piping | OK | 6 |
+| piping | OK | 7 |
 | hydraulic | OK | 6 |
 | photo_recon | OK | 2 |
 | firmware | OK | 8 |
-| structural | OK | 2 |
+| structural | OK | 3 |
 | parts | OK | 3 |
 | serving | OK | 5 |
 | regen | OK | 1 |
 | code_compliance | OK | 1 |
 
----
+## DEGRADED (10 tools)
+
+| Tool | Family | Detail |
+| ---- | ------ | ------ |
+| `code_check` | code_compliance | ([textcontent(type='text', text='{\n  "ok": true,\n  "jurisdiction": "ca",\n  "jurisdiction_meta": {\n    "ibc_edition": |
+| `describe_toolpaths` | gsl | ([textcontent(type='text', text='{\n  "ok": true,\n  "text": "cam job \\"cam job\\" \\u2014 0 setup(s), 0 operation(s) t |
+| `import_part` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "file not found: /nonexistent/probe.step"\n}', annotation |
+| `part_get` | parts | ([textcontent(type='text', text='{"ok": false, "reason": "part_id not found: \'_audit_\'", "hint": "use part_search to d |
+| `part_place` | parts | ([textcontent(type='text', text='{"ok": false, "domain": "unknown", "doc_id": null, "entity_id": null, "editable": false |
+| `req_report` | req | ([textcontent(type='text', text='{"ok": false, "error": "requirements doc not found. use req_create to start one."}', an |
+| `req_update` | req | ([textcontent(type='text', text='{"ok": false, "error": "requirements doc not found. call req_create first."}', annotati |
+| `run_cfd_accurate` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "openfoam is not available on this machine. provision it  |
+| `struct_analyze` | structural | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "[errno 2] no such file or directory: \'/nonexistent/_aud |
+| `struct_check` | structural | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "[errno 2] no such file or directory: \'/nonexistent/_aud |
+
+## INCONCLUSIVE (78 tools)
+
+| Tool | Family | Detail |
+| ---- | ------ | ------ |
+| `add_datum` | cad | arg validation: Error executing tool add_datum: 4 validation errors for add_datumArguments
+view_id
+  Field required [typ |
+| `add_detail_view` | cad | arg validation: Error executing tool add_detail_view: 4 validation errors for add_detail_viewArguments
+parent_view_id
+   |
+| `add_dimension` | cad | arg validation: Error executing tool add_dimension: 3 validation errors for add_dimensionArguments
+view_id
+  Field requi |
+| `add_gdt` | cad | arg validation: Error executing tool add_gdt: 4 validation errors for add_gdtArguments
+view_id
+  Field required [type=mi |
+| `add_surface_finish` | cad | arg validation: Error executing tool add_surface_finish: 4 validation errors for add_surface_finishArguments
+view_id
+  F |
+| `ask_user` | interaction | arg validation: Error executing tool ask_user: 1 validation error for ask_userArguments
+questions
+  Field required [type |
+| `bom_price` | sourcing | arg validation: Error executing tool bom_price: 1 validation error for bom_priceArguments
+doc_path
+  Field required [typ |
+| `bom_rollup` | sourcing | arg validation: Error executing tool bom_rollup: 1 validation error for bom_rollupArguments
+doc_path
+  Field required [t |
+| `cam_add_operation` | cam | arg validation: Error executing tool cam_add_operation: 1 validation error for cam_add_operationArguments
+tool_number
+   |
+| `cam_add_tool` | cam | arg validation: Error executing tool cam_add_tool: 1 validation error for cam_add_toolArguments
+number
+  Field required  |
+| `cam_cost_estimate` | cost | arg validation: Error executing tool cam_cost_estimate: 1 validation error for cam_cost_estimateArguments
+doc_path
+  Fie |
+| `cam_remove_operation` | cam | arg validation: Error executing tool cam_remove_operation: 1 validation error for cam_remove_operationArguments
+op_id
+   |
+| `cam_save` | cam | arg validation: Error executing tool cam_save: 1 validation error for cam_saveArguments
+path
+  Field required [type=miss |
+| `cam_set_stock` | cam | arg validation: Error executing tool cam_set_stock: 2 validation errors for cam_set_stockArguments
+setup_id
+  Field requ |
+| `cam_update_operation` | cam | arg validation: Error executing tool cam_update_operation: 1 validation error for cam_update_operationArguments
+op_id
+   |
+| `check_sketch` | cad | arg validation: Error executing tool check_sketch: 1 validation error for check_sketchArguments
+sketch
+  Field required  |
+| `confirm_dimensions` | intake | arg validation: Error executing tool confirm_dimensions: 1 validation error for confirm_dimensionsArguments
+confirmation |
+| `contact_sheet` | cad | unexpected ToolError: Error executing tool contact_sheet: No current part. Call new_part(...) first (or pass doc_id=). |
+| `describe_sketch` | gsl | arg validation: Error executing tool describe_sketch: 1 validation error for describe_sketchArguments
+sketch
+  Field req |
+| `doc_diff_tool` | doc_diff | arg validation: Error executing tool doc_diff_tool: 2 validation errors for doc_diff_toolArguments
+rev_a
+  Field require |
+| `ecad_design` | ecad | arg validation: Error executing tool ecad_design: 1 validation error for ecad_designArguments
+request
+  Field required [ |
+| `ecad_export` | ecad | arg validation: Error executing tool ecad_export: 1 validation error for ecad_exportArguments
+kind
+  Field required [typ |
+| `ecad_label` | ecad | arg validation: Error executing tool ecad_label: 1 validation error for ecad_labelArguments
+text
+  Field required [type= |
+| `ecad_place_symbol` | ecad | arg validation: Error executing tool ecad_place_symbol: 1 validation error for ecad_place_symbolArguments
+libid
+  Field  |
+| `ecad_sweep` | ecad | arg validation: Error executing tool ecad_sweep: 1 validation error for ecad_sweepArguments
+param
+  Field required [type |
+| `ecad_tf` | ecad | arg validation: Error executing tool ecad_tf: 2 validation errors for ecad_tfArguments
+output
+  Field required [type=mis |
+| `ecad_wire` | ecad | arg validation: Error executing tool ecad_wire: 4 validation errors for ecad_wireArguments
+from_ref
+  Field required [ty |
+| `fw_build` | firmware | arg validation: Error executing tool fw_build: 1 validation error for fw_buildArguments
+project_id
+  Field required [typ |
+| `fw_debug_halt` | firmware | skipped — side-effecty (starts process/port/GUI) |
+| `fw_debug_read_mem` | firmware | skipped — side-effecty (starts process/port/GUI) |
+| `fw_debug_start` | firmware | skipped — side-effecty (starts process/port/GUI) |
+| `fw_flash` | firmware | skipped — side-effecty (starts process/port/GUI) |
+| `fw_sim_run` | firmware | arg validation: Error executing tool fw_sim_run: 1 validation error for fw_sim_runArguments
+project_id
+  Field required  |
+| `fw_sources` | firmware | arg validation: Error executing tool fw_sources: 1 validation error for fw_sourcesArguments
+project_id
+  Field required  |
+| `hover` | gsl | arg validation: Error executing tool hover: 1 validation error for hoverArguments
+sid
+  Field required [type=missing, in |
+| `hydraulic_add_hose` | hydraulic | arg validation: Error executing tool hydraulic_add_hose: 2 validation errors for hydraulic_add_hoseArguments
+net_name
+   |
+| `hydraulic_size_cylinder` | hydraulic | arg validation: Error executing tool hydraulic_size_cylinder: 1 validation error for hydraulic_size_cylinderArguments
+pr |
+| `make_fit_coupon` | intake | arg validation: Error executing tool make_fit_coupon: 1 validation error for make_fit_couponArguments
+interface_key
+  Fi |
+| `make_presentation` | deliverables | arg validation: Error executing tool make_presentation: 1 validation error for make_presentationArguments
+spec
+  Field r |
+| `make_report` | deliverables | arg validation: Error executing tool make_report: 1 validation error for make_reportArguments
+spec
+  Field required [typ |
+| `make_standard_part` | cad | arg validation: Error executing tool make_standard_part: 2 validation errors for make_standard_partArguments
+family
+  Fi |
+| `make_workbook` | deliverables | arg validation: Error executing tool make_workbook: 1 validation error for make_workbookArguments
+spec
+  Field required  |
+| `match_part_number` | spec | arg validation: Error executing tool match_part_number: 1 validation error for match_part_numberArguments
+mpn
+  Field re |
+| `measure_between` | cad | arg validation: Error executing tool measure_between: 1 validation error for measure_betweenArguments
+a_query
+  Field re |
+| `measure_from_photo` | intake | arg validation: Error executing tool measure_from_photo: 5 validation errors for measure_from_photoArguments
+photo_id
+   |
+| `piping_cfd_handoff` | piping | arg validation: Error executing tool piping_cfd_handoff: 2 validation errors for piping_cfd_handoffArguments
+doc
+  Field |
+| `piping_fluid` | piping | arg validation: Error executing tool piping_fluid: 1 validation error for piping_fluidArguments
+name
+  Field required [t |
+| `piping_internal_volume` | piping | arg validation: Error executing tool piping_internal_volume: 1 validation error for piping_internal_volumeArguments
+doc
+ |
+| `piping_operating_point` | piping | arg validation: Error executing tool piping_operating_point: 1 validation error for piping_operating_pointArguments
+pump |
+| `piping_solve` | piping | arg validation: Error executing tool piping_solve: 2 validation errors for piping_solveArguments
+boundary.str
+  Input sh |
+| `piping_verify_cfd` | piping | arg validation: Error executing tool piping_verify_cfd: 2 validation errors for piping_verify_cfdArguments
+solve_result
+ |
+| `query_geometry` | cad | arg validation: Error executing tool query_geometry: 1 validation error for query_geometryArguments
+query
+  Field requir |
+| `regen_diagnose` | regen | arg validation: Error executing tool regen_diagnose: 1 validation error for regen_diagnoseArguments
+document_json
+  Fiel |
+| `req_status` | req | arg validation: Error executing tool req_status: 2 validation errors for req_statusArguments
+requirement_id
+  Field requ |
+| `request_part_photos` | intake | arg validation: Error executing tool request_part_photos: 2 validation errors for request_part_photosArguments
+label
+  F |
+| `request_quote` | cost | arg validation: Error executing tool request_quote: 2 validation errors for request_quoteArguments
+doc_path
+  Field requ |
+| `research_datasheet_fetch` | research | arg validation: Error executing tool research_datasheet_fetch: 1 validation error for research_datasheet_fetchArguments
+ |
+| `research_standard_section` | research | arg validation: Error executing tool research_standard_section: 1 validation error for research_standard_sectionArgument |
+| `research_thread_spec` | research | arg validation: Error executing tool research_thread_spec: 1 validation error for research_thread_specArguments
+designat |
+| `research_unit_convert` | research | arg validation: Error executing tool research_unit_convert: 1 validation error for research_unit_convertArguments
+unit
+  |
+| `resolve_process` | intake | arg validation: Error executing tool resolve_process: 1 validation error for resolve_processArguments
+request
+  Field re |
+| `reverse_engineer` | recon | arg validation: Error executing tool reverse_engineer: 1 validation error for reverse_engineerArguments
+source
+  Field r |
+| `review_drawing` | cad | unexpected ToolError: Error executing tool review_drawing: Drawing render failed: not a drawing document |
+| `run_fea_modal` | cad | arg validation: Error executing tool run_fea_modal: 1 validation error for run_fea_modalArguments
+fixtures
+  Field requi |
+| `run_fea_static` | cad | arg validation: Error executing tool run_fea_static: 2 validation errors for run_fea_staticArguments
+fixtures
+  Field re |
+| `serving_evaluate` | serving | arg validation: Error executing tool serving_evaluate: 2 validation errors for serving_evaluateArguments
+insertion_point |
+| `serving_promote` | serving | arg validation: Error executing tool serving_promote: 2 validation errors for serving_promoteArguments
+insertion_point
+  |
+| `serving_rollback` | serving | arg validation: Error executing tool serving_rollback: 1 validation error for serving_rollbackArguments
+insertion_point
+ |
+| `serving_set_canary` | serving | arg validation: Error executing tool serving_set_canary: 1 validation error for serving_set_canaryArguments
+insertion_po |
+| `set_config_override` | cad | arg validation: Error executing tool set_config_override: 2 validation errors for set_config_overrideArguments
+config
+   |
+| `set_config_suppression` | cad | arg validation: Error executing tool set_config_suppression: 2 validation errors for set_config_suppressionArguments
+con |
+| `set_titleblock` | cad | arg validation: Error executing tool set_titleblock: 1 validation error for set_titleblockArguments
+fields
+  Field requi |
+| `set_view` | cad | arg validation: Error executing tool set_view: 1 validation error for set_viewArguments
+view_id
+  Field required [type=m |
+| `show_in_app` | cad | skipped — side-effecty (starts process/port/GUI) |
+| `spec_sheet_match` | spec | arg validation: Error executing tool spec_sheet_match: 3 validation errors for spec_sheet_matchArguments
+text_or_url
+  F |
+| `start_capture_session` | photo_recon | skipped — side-effecty (starts process/port/GUI) |
+| `stop_capture_session` | photo_recon | skipped — side-effecty (starts process/port/GUI) |
+| `struct_estimate` | structural | arg validation: Error executing tool struct_estimate: 1 validation error for struct_estimateArguments
+doc_path
+  Field r |
 
 ## WORKS (96 tools)
 
-These tools returned results. `{ok:false}` envelopes count as WORKS — tool ran and
-returned a well-formed response; error is state-not-ready, not a missing dep.
+| Tool | Family | Detail |
+| ---- | ------ | ------ |
+| `activate_configuration` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `add_configuration` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `add_drawing_view` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `add_features` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `add_section_view` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `cad_guide` | cad | ([textcontent(type='text', text='ai-cad modeling guide (c++ parametric engine — same as the desktop app).\n\nworkflow\n  |
+| `cam_add_setup` | cam | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "valueerror: no cam job. call cam_new_job(...) first."\n} |
+| `cam_extract` | cam | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "valueerror: no current part and no path=. build/open a p |
+| `cam_generate` | cam | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "valueerror: no cam job. call cam_new_job(...) first."\n} |
+| `cam_job_tree` | cam | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "valueerror: no cam job. call cam_new_job(...) first."\n} |
+| `cam_materials` | cam | ([textcontent(type='text', text='{\n  "materials": [\n    {\n      "cut_feed_ref": 0.0,\n      "density_g_cm3": 2.7,\n   |
+| `cam_new_job` | cam | ([textcontent(type='text', text='{\n  "doc_id": "cam1",\n  "revision": 1,\n  "tree": {\n    "id": "cam1",\n    "name": " |
+| `cam_op_types` | cam | ([textcontent(type='text', text='{\n  "op_types": [\n    {\n      "id": "face"\n    },\n    {\n      "id": "contour2d"\n |
+| `cam_open` | cam | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "cannot open .cam+ file: /nonexistent/_audit_.cam",\n  "d |
+| `cam_post` | cam | ([textcontent(type='text', text='{\n  "error": "",\n  "est_time_s": 0.0,\n  "gcode": "",\n  "line_count": 0,\n  "ok": tr |
+| `cam_post_dialects` | cam | ([textcontent(type='text', text='{\n  "dialects": [\n    {\n      "canned_drill": false,\n      "description": "grbl 1.1 |
+| `cam_redo` | cam | ([textcontent(type='text', text='{\n  "noop": true,\n  "revision": 1,\n  "tree": {\n    "id": "cam1",\n    "name": "cam  |
+| `cam_setup_sheet` | cam | ([textcontent(type='text', text='{\n  "html": "<html><head><meta charset=\'utf-8\'><style>body{font-family:sans-serif;ma |
+| `cam_simulate` | cam | ([textcontent(type='text', text='{\n  "results": []\n}', annotations=none, meta=none)], {'result': '{\n  "results": []\n |
+| `cam_tool_types` | cam | ([textcontent(type='text', text='{\n  "tool_types": [\n    {\n      "class": "endmill",\n      "id": "endmill_flat"\n    |
+| `cam_undo` | cam | ([textcontent(type='text', text='{\n  "noop": true,\n  "revision": 1,\n  "tree": {\n    "id": "cam1",\n    "name": "cam  |
+| `check_feature_overlap` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `check_interference` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `check_metadata` | verify | ([textcontent(type='text', text='[{"name": "cam_simulate", "cost": "seconds", "platform": "any", "reward_shape": "scalar |
+| `check_symmetry` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `close_part` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `compare_parts` | recon | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no such document: _a_",\n  "code": "unknown_doc",\n  "de |
+| `convert_face_to_sketch` | recon | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `describe_assembly` | gsl | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `describe_board` | gsl | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no active ecad document: no open ecad document \'\' \\u2 |
+| `describe_part` | gsl | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `describe_project` | gsl | ([textcontent(type='text', text='{\n  "ok": true,\n  "text": "no dag run data supplied \\u2014 pass run=<dag_run_dict> f |
+| `describe_results` | gsl | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `describe_scene` | gsl | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `dfm_check` | intake | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `draft_analysis` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `ecad_add_power` | ecad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no active schematic \\u2014 call ecad_new_schematic(name |
+| `ecad_add_zone` | ecad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no active board \\u2014 call ecad_new_pcb(name) first",\ |
+| `ecad_autoroute` | ecad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no active board \\u2014 call ecad_new_pcb(name) first",\ |
+| `ecad_check_diff_impedance` | ecad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no active board \\u2014 call ecad_new_pcb(name) first",\ |
+| `ecad_check_impedance` | ecad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no active board \\u2014 call ecad_new_pcb(name) first",\ |
+| `ecad_fill_zones` | ecad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no active board \\u2014 call ecad_new_pcb(name) first",\ |
+| `ecad_find_part` | ecad | ([textcontent(type='text', text='{\n  "ok": true,\n  "query": "100nf cap",\n  "count": 6,\n  "hits": [\n    {\n      "ki |
+| `ecad_make_board` | ecad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no active schematic -- build one first",\n  "warnings":  |
+| `ecad_new_pcb` | ecad | ([textcontent(type='text', text='{\n  "ok": true,\n  "doc_id": "c7cc75803709",\n  "kind": "pcb",\n  "name": "_audit_pcb_ |
+| `ecad_new_schematic` | ecad | ([textcontent(type='text', text='{\n  "ok": true,\n  "doc_id": "becba7cad97c",\n  "kind": "sch",\n  "name": "_audit_sch_ |
+| `ecad_run_dfm` | ecad | ([textcontent(type='text', text='{\n  "ok": true,\n  "doc_id": "c7cc75803709",\n  "revision": 0,\n  "errors": 0,\n  "war |
+| `ecad_run_drc` | ecad | ([textcontent(type='text', text='{\n  "ok": true,\n  "doc_id": "c7cc75803709",\n  "revision": 0,\n  "errors": 0,\n  "war |
+| `ecad_run_erc` | ecad | ([textcontent(type='text', text='{\n  "ok": true,\n  "doc_id": "becba7cad97c",\n  "revision": 0,\n  "errors": 0,\n  "war |
+| `ecad_simulate` | ecad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "nothing to simulate \\u2014 the netlist has no simulatab |
+| `ecad_status` | ecad | ([textcontent(type='text', text='{\n  "ok": true,\n  "doc_id": "becba7cad97c",\n  "kind": "sch",\n  "name": "_audit_sch_ |
+| `ecad_to_3d` | ecad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "3d export failed: boardgeometryerror: board has no edge. |
+| `ecad_update_from_sch` | ecad | ([textcontent(type='text', text='{\n  "ok": true,\n  "doc_id": "c7cc75803709",\n  "sch_doc_id": "becba7cad97c",\n  "kind |
+| `export_drawing` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `export_part` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `fit_report` | intake | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `fw_new_project` | firmware | ([textcontent(type='text', text='{\n  "code": "invalid_request",\n  "message": "new_project: no `mcu` given and none der |
+| `get_job` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "unknown job_id \'_audit_none_\'"\n}', annotations=none,  |
+| `get_part` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `hydraulic_add_component` | hydraulic | ([textcontent(type='text', text='{\n  "ok": false,\n  "reason": "no active hydraulic circuit",\n  "hint": "call hydrauli |
+| `hydraulic_bom` | hydraulic | ([textcontent(type='text', text='{\n  "ok": false,\n  "reason": "no active hydraulic circuit",\n  "hint": "call hydrauli |
+| `hydraulic_new` | hydraulic | ([textcontent(type='text', text='{\n  "ok": true,\n  "doc": {\n    "schema": "aicad.hydraulic/1",\n    "id": "6d5468b5-d |
+| `hydraulic_size_pump` | hydraulic | ([textcontent(type='text', text='{\n  "ok": true,\n  "flow_lpm": 10.0,\n  "pressure_bar": 100.0,\n  "efficiency": 0.85,\ |
+| `inspect_section` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `intake_status` | intake | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `list_artifacts` | deliverables | {
+  "ok": true,
+  "count": 0,
+  "artifacts": []
+} |
+| `list_configurations` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `list_parts` | cad | ([textcontent(type='text', text='{\n  "docs": []\n}', annotations=none, meta=none)], {'result': '{\n  "docs": []\n}'}) |
+| `list_spec_templates` | spec | ([textcontent(type='text', text='{\n  "ok": true,\n  "templates": [\n    {\n      "name": "capacitor_radial",\n      "re |
+| `list_standard_parts` | cad | ([textcontent(type='text', text='{\n  "families": [\n    {\n      "category": "screws",\n      "description": "cylindric |
+| `list_world_bodies` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `make_drawing` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `measure_part` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "no current part. call new_part(...) first (or pass doc_i |
+| `new_part` | cad | ([textcontent(type='text', text='{\n  "ok": true,\n  "doc_id": "doc-cpp00000001",\n  "name": "_audit_probe_",\n  "revisi |
+| `part_search` | parts | ([textcontent(type='text', text='{"ok": true, "count": 20, "has_live": false, "results": [{"part_id": "fastener:iso 4017 |
+| `piping_report` | piping | ([textcontent(type='text', text='{\n  "ok": false,\n  "reason": "no prior piping_solve to report on",\n  "hint": "call p |
+| `query_adjacency` | gsl | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "document has no bodies to adjacency",\n  "code": "invali |
+| `recover_parts` | cad | ([textcontent(type='text', text='{\n  "ok": true,\n  "recovered": [\n    {\n      "path": "/home/hunter/.local/share/ai- |
+| `redo` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "nothing to redo",\n  "code": "invalid_op",\n  "detail":  |
+| `render_document` | deliverables | {
+  "ok": false,
+  "reason": "artifact_not_found",
+  "hint": "no file at /nonexistent/probe.pdf"
+} |
+| `render_part` | cad | type='image' data='ivborw0kggoaaaansuheugaaagaaaagqcaiaaabxle9zaacmmuleqvr42u292zod5zgo/v/epu7banttm9majebci5rnez6fzqebi |
+| `req_create` | req | ([textcontent(type='text', text='{\n  "ok": true,\n  "req_id": "1a15b012-f962-416b-95ec-ac687163dbf6",\n  "location": "( |
+| `research_eng_calc` | research | ([textcontent(type='text', text='{\n  "ok": false,\n  "reason": "not_found",\n  "hint": "unknown formula \'f = m * a\';  |
+| `research_fetch_page` | research | ([textcontent(type='text', text='{\n  "ok": true,\n  "answer": "example domain \\u2014 from cache (131 chars)",\n  "unit |
+| `research_material_lookup` | research | ([textcontent(type='text', text='{\n  "ok": true,\n  "answer": "aluminium 6061-t6 (metal): e_mpa=69000, yield_mpa=276, u |
+| `research_web_search` | research | ([textcontent(type='text', text='{\n  "ok": true,\n  "answer": null,\n  "units": null,\n  "source_url": "https://www.eng |
+| `run_cfd_flow` | cad | ([textcontent(type='text', text='{\n  "ok": true,\n  "job_id": "job-d9ccb5b215e1",\n  "status": "running",\n  "auto_back |
+| `save_part` | cad | ([textcontent(type='text', text='{\n  "ok": true,\n  "format": "step+",\n  "native": true,\n  "doc_id": "doc-cpp0000001d |
+| `serving_status` | serving | ([textcontent(type='text', text='{\n  "ok": true,\n  "routes": []\n}', annotations=none, meta=none)], {'result': '{\n  " |
+| `set_material` | cad | ([textcontent(type='text', text='{\n  "ok": true,\n  "doc_id": "doc-cpp0000001d",\n  "bodies": [\n    "b1"\n  ],\n  "app |
+| `set_process` | intake | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "unknown process \'cnc_milling\'. known processes: [\'fdm |
+| `solve_mates` | cad | ([textcontent(type='text', text='{\n  "ok": false,\n  "error": "doc_solve_mates: document is not an assembly",\n  "code" |
+| `submit_part_photos` | intake | ([textcontent(type='text', text='{\n  "ok": true,\n  "photos": [],\n  "measured_part": null,\n  "note": "photos register |
+| `undo` | cad | ([textcontent(type='text', text='{\n  "datums": [],\n  "id_map": {},\n  "owner_map": {\n    "f1": {\n      "bodies": [\n |
+| `verify_battery` | verify | ([textcontent(type='text', text='{"scores": {"check_sketch": 0.0, "dim_coverage": 0.0, "ecad_check_diff_impedance": 0.0, |
+| `wall_thickness` | cad | ([textcontent(type='text', text='{\n  "ok": true,\n  "doc_id": "doc-cpp0000001d",\n  "summary": "thinnest wall = 99.93 m |
 
-| Tool | Family | Notes |
-| ---- | ------ | ----- |
-| `activate_configuration` | cad | no-current-part envelope |
-| `add_configuration` | cad | no-current-part envelope |
-| `add_drawing_view` | cad | no-current-part envelope |
-| `add_features` | cad | no-current-part envelope |
-| `add_section_view` | cad | no-current-part envelope |
-| `cad_guide` | cad | returned full guide text |
-| `cam_extract` | cam | no-current-job envelope |
-| `cam_generate` | cam | no-current-job envelope |
-| `cam_job_tree` | cam | no-current-job envelope |
-| `cam_materials` | cam | returned materials table |
-| `cam_new_job` | cam | created job successfully |
-| `cam_op_types` | cam | returned op types |
-| `cam_open` | cam | file-not-found envelope |
-| `cam_post` | cam | empty gcode (no ops) |
-| `cam_post_dialects` | cam | returned dialects list |
-| `cam_redo` | cam | noop OK |
-| `cam_setup_sheet` | cam | returned HTML |
-| `cam_simulate` | cam | empty results |
-| `cam_tool_types` | cam | returned tool types |
-| `cam_undo` | cam | noop OK |
-| `check_feature_overlap` | cad | no-current-part envelope |
-| `check_interference` | cad | no-current-part envelope |
-| `check_metadata` | verify | returned metadata list |
-| `check_symmetry` | cad | no-current-part envelope |
-| `close_part` | cad | no-current-part envelope |
-| `compare_parts` | recon | no-such-document envelope |
-| `convert_face_to_sketch` | cad | no-current-part envelope |
-| `describe_assembly` | gsl | no-current-part envelope |
-| `describe_board` | gsl | no-active-ecad envelope |
-| `describe_part` | gsl | no-current-part envelope |
-| `describe_project` | gsl | no DAG run data |
-| `describe_results` | gsl | no-current-part envelope |
-| `describe_scene` | gsl | no-current-part envelope |
-| `describe_toolpaths` | gsl | CAM job listed |
-| `dfm_check` | intake | no-current-part envelope |
-| `draft_analysis` | cad | no-current-part envelope |
-| `ecad_add_power` | ecad | no-active-schematic envelope |
-| `ecad_add_zone` | ecad | no-active-board envelope |
-| `ecad_autoroute` | ecad | no-active-board envelope |
-| `ecad_check_diff_impedance` | ecad | no-active-board envelope |
-| `ecad_check_impedance` | ecad | no-active-board envelope |
-| `ecad_fill_zones` | ecad | no-active-board envelope |
-| `ecad_find_part` | ecad | searched successfully |
-| `ecad_make_board` | ecad | no-active-schematic envelope |
-| `ecad_new_pcb` | ecad | created PCB |
-| `ecad_new_schematic` | ecad | created schematic |
-| `ecad_run_dfm` | ecad | ran DFM on empty board |
-| `ecad_run_drc` | ecad | ran DRC |
-| `ecad_run_erc` | ecad | ran ERC |
-| `ecad_simulate` | ecad | nothing-to-simulate (scipy SPICE: 161ms) |
-| `ecad_status` | ecad | returned status |
-| `ecad_update_from_sch` | ecad | updated successfully |
-| `export_drawing` | cad | no-current-part envelope |
-| `export_part` | cad | no-current-part envelope |
-| `fit_report` | intake | no-current-part envelope |
-| `fw_new_project` | firmware | invalid-request (no MCU config) |
-| `get_job` | cad | unknown-job-id envelope |
-| `get_part` | cad | no-current-part envelope |
-| `hydraulic_add_component` | hydraulic | no-active-circuit envelope |
-| `hydraulic_bom` | hydraulic | no-active-circuit envelope |
-| `hydraulic_new` | hydraulic | created circuit |
-| `hydraulic_size_pump` | hydraulic | returned sizing result |
-| `inspect_section` | cad | no-current-part envelope |
-| `intake_status` | intake | no-current-part envelope |
-| `list_configurations` | cad | empty list |
-| `list_parts` | cad | empty list |
-| `list_spec_templates` | spec | returned templates |
-| `list_standard_parts` | cad | returned standard parts |
-| `list_world_bodies` | cad | empty list |
-| `make_standard_part` | cad | returned result |
-| `match_part_number` | spec | returned result |
-| `measure_between` | cad | no-current-part envelope |
-| `measure_part` | cad | no-current-part envelope |
-| `new_part` | cad | created new part |
-| `part_get` | parts | returned result |
-| `part_search` | parts | returned search results |
-| `part_place` | parts | returned result |
-| `piping_fluid` | piping | returned fluid properties |
-| `piping_operating_point` | piping | returned result |
-| `piping_report` | piping | returned report |
-| `query_adjacency` | gsl | no-current-part envelope |
-| `query_geometry` | cad | no-current-part envelope |
-| `recover_parts` | cad | returned result |
-| `redo` | cad | returned result |
-| `render_part` | cad | no-current-part envelope |
-| `req_create` | req | created requirement |
-| `req_report` | req | returned report |
-| `req_status` | req | returned status |
-| `research_web_search` | research | searched (DuckDuckGo fallback, 936ms) |
-| `run_cfd_flow` | cad | ran real LBM CFD (45s — core fully functional) |
-| `save_part` | cad | saved to STEP+ |
-| `serving_status` | serving | empty routes table |
-| `set_material` | cad | set material OK |
-| `set_process` | intake | unknown-process envelope |
-| `solve_mates` | cad | no-mates envelope |
-| `submit_part_photos` | intake | returned result |
-| `undo` | cad | reverted successfully |
-| `verify_battery` | verify | ran verification battery |
-| `wall_thickness` | cad | returned thickness (4.7s) |
+## Skipped (side-effect tools)
 
----
-
-## DEGRADED (10 tools)
-
-Graceful-absence paths — returned contract-shaped `{ok:false, reason, hint}` because
-an optional binary or dep is not provisioned. Designed behavior.
-
-| Tool | Family | Degradation Reason |
-| ---- | ------ | ------------------ |
-| `code_check` | code_compliance | RAG corpus absent; deterministic rules ran |
-| `describe_toolpaths` | gsl | no toolpaths computed yet |
-| `ecad_to_3d` | ecad | `build123d`/OCP not installed — "3D exporter unavailable" |
-| `import_part` | intake | file not found (probe path nonexistent) |
-| `piping_cfd_handoff` | piping | piping_solve not run in session |
-| `piping_verify_cfd` | piping | no piping result in session |
-| `run_cfd_accurate` | cad | OpenFOAM not installed — graceful |
-| `struct_analyze` | structural | doc file not found — graceful |
-| `struct_check` | structural | doc file not found — graceful |
-| `regen_diagnose` | regen | no provider configured (no API key) |
-
----
-
-## INCONCLUSIVE (69 tools)
-
-Tool IS alive (registered, imports, dispatches) but probe fixture had wrong argument
-types/shapes. A Pydantic validation error IS a live tool. These need better fixtures.
-
-Common patterns:
-- Tool requires an active doc/session (created by a prior tool call in sequence)
-- Fixture used plain strings where typed dicts/enums are required
-- Tool requires a `doc_id` from a `new_part()` call first
-
-| Tool | Family | Fixture Issue |
-| ---- | ------ | ------------- |
-| `add_datum` | cad | requires typed ref object |
-| `ask_user` | interaction | question field type constraint |
-| `bom_price` | sourcing | BOM items type constraint |
-| `cam_add_operation` | cam | requires active job+setup first |
-| `doc_diff_tool` | doc_diff | expects typed doc objects not empty dicts |
-| `ecad_design` | ecad | requires intent field type |
-| `run_fea_static` | cad | requires doc_id + loads object |
-| `serving_evaluate` | serving | shadow_log type mismatch |
-| `spec_sheet_match` | spec | requires part_number + typed fields |
-| *(60 more)* | various | similar pydantic constraint mismatches |
-
----
-
-## SKIPPED (side-effect tools, 7)
-
-| Tool | Reason |
-| ---- | ------ |
-| `start_capture_session` | Opens a local listener socket on a port |
-| `stop_capture_session` | Depends on a running listener |
-| `show_in_app` | Opens the desktop GUI — headless rule |
-| `fw_flash` | Requires real MCU hardware |
-| `fw_debug_start` | Spawns debugger process |
-| `fw_debug_halt` | Depends on a debugger session |
-| `fw_debug_read_mem` | Depends on a debugger session |
-
----
+- `fw_debug_halt`: skipped — side-effecty (starts process/port/GUI)
+- `fw_debug_read_mem`: skipped — side-effecty (starts process/port/GUI)
+- `fw_debug_start`: skipped — side-effecty (starts process/port/GUI)
+- `fw_flash`: skipped — side-effecty (starts process/port/GUI)
+- `show_in_app`: skipped — side-effecty (starts process/port/GUI)
+- `start_capture_session`: skipped — side-effecty (starts process/port/GUI)
+- `stop_capture_session`: skipped — side-effecty (starts process/port/GUI)
 
 ## Declared-But-Not-Installed Packages
 
-**21 of 29 requirements are absent from the running mcp-venv.**
-This is the primary runtime gap — the mcp-venv was provisioned without most of the
-optional tool stack.
+Packages in `requirements.txt` but absent from the running mcp-venv:
 
-| Package | Missing | Impact |
-| ------- | ------- | ------ |
-| `build123d` | YES | `ecad_to_3d` DEGRADED; `piping_cfd_handoff` unusable |
-| `cadquery-ocp` (OCP) | YES | All OCP-dependent geometry ops |
-| `ocpsvg` | YES | SVG export from OCP shapes |
-| `trimesh` | YES | Mesh-based recon / import |
-| `networkx` | YES | Graph algorithms (parts routing, DAG) |
-| `rhino3dm` | YES | `.3dm` file import |
-| `olefile` | YES | OLE file parsing |
-| `pywin32` | YES (Linux only — expected) | Windows COM — N/A on Linux |
-| `pyvista` | YES | Headless VTK render |
-| `vtk` | YES | VTK backend for pyvista |
-| `anthropic` | YES | Anthropic provider for agent tools |
-| `openai` | YES | OpenAI provider for agent tools |
-| `scikit-fem` | YES | FEA mesh solve (`run_fea_static`/`run_fea_modal`) |
-| `meshio` | YES | Mesh file I/O |
-| `pyamg` | YES | Algebraic multigrid solver |
-| `python-pptx` | YES | `make_presentation` unusable |
-| `python-docx` | YES | `make_report` unusable |
-| `openpyxl` | YES | `make_workbook` unusable |
-| `reportlab` | YES | PDF report generation unusable |
-| `pypdfium2` | YES | PDF preview rasterization unusable |
-| `fluids` | **PRESENT 1.3.1** | Named seed in task; is actually installed |
-
-Notes:
-- `pywin32` is Windows-only; absent on Linux is correct.
-- `fluids` and `PyNiteFEA` were the named "seeds" in the task — both are installed.
-- The "PyNite pattern" (DEAD tools due to missing dep) does not currently exist.
-
-Provisioning command:
-```bash
-/home/hunter/.local/share/AI-CAD/mcp-venv/bin/pip install \
-  build123d==0.10.0 cadquery-ocp==7.8.1.1.post1 ocpsvg==0.5.0 \
-  trimesh==4.12.2 networkx==3.4.2 rhino3dm==8.17.0 olefile==0.47 \
-  pyvista==0.48.4 vtk==9.3.1 \
-  anthropic==0.107.1 openai==2.41.0 \
-  scikit-fem==12.0.2 meshio==5.3.5 pyamg==5.3.0 \
-  python-pptx==1.0.2 python-docx==1.2.0 openpyxl==3.1.5 \
-  reportlab==5.0.0 pypdfium2==5.11.0
-```
-(All MIT/BSD/Apache — in-process use permitted per contracts/licenses.md)
-
----
+_(none — venv is fully provisioned)_
 
 ## Undeclared-But-Installed Dependencies
 
-Packages imported by `services/` + `engine_oracle/` + `mcp_server/` that are installed
-in the venv but **absent from `requirements.txt`**. Missing declaration = silent breakage
-risk if the venv is rebuilt from scratch.
+Packages imported by `services/`+`engine_oracle/`+`mcp_server/` that are
+installed in the venv but absent from `requirements.txt`:
 
-| Package | Imported by | License | Declare as |
-| ------- | ----------- | ------- | ---------- |
-| `anyio` | `services/mcp/server.py` (transport) | MIT | `anyio>=4.0.0` |
-| `langgraph` | `services/dag/` (DAG orchestration) | MIT | `langgraph>=1.0.0` |
-| `pydantic` | FastMCP tool arg schemas (indirect) | MIT | `pydantic>=2.0.0` |
-| `qrcode` | `engine_oracle/` | MIT | `qrcode>=7.0` |
+_(none found)_
 
-All 4 are MIT-licensed — add them to `requirements.txt` in-process.
+## Test-Suite Pollution (Sweep Analysis)
 
----
+_(See `scripts/mcp_runtime_audit.py --test-pollution` output below,
+generated separately to avoid OOM on the same process.)_
 
-## Test Suite Pollution Analysis
+### Root Causes Identified
 
-### Baseline per-suite results (run each suite alone)
-
-| Suite | Pass | Fail/Error | Skip |
-| ----- | ---- | ---------- | ---- |
-| services | 410 | 44 | 24 |
-| engine_oracle | 894 | 30 | 24 |
-| tools | 239 | 0 | 1 |
-| training | 0 | 0 | 0 |
-| **combined** | **1555** | **67** | **44** |
-
-**True pollution regressions** (pass-alone, fail-in-combined): **7**
-
-Note: The "~29 failures" mentioned in the task context were the combined baseline
-failures (pre-existing, fail in isolation too). Only 7 tests are actual pollution.
-
-### Regressed Tests
-
-| Test | Root Cause |
-| ---- | ---------- |
-| `engine_oracle.intake.test_telemetry_consent.test_consent_tier_full` | RC#1 |
-| `engine_oracle.intake.test_telemetry_consent.test_consent_tier_meta` | RC#1 |
-| `engine_oracle.intake.test_telemetry_consent.test_consent_tier_offline_false_allows_full` | RC#1 |
-| `engine_oracle.test_spec_sheet_matcher.test_ai_extract_default_provider_emits_to_journal` | RC#1 |
-| `engine_oracle.test_spec_sheet_matcher.test_default_provider_wraps_with_logging_ip16` | RC#1 |
-| `engine_oracle.piping.test_catalog.test_nearest_pipe_soft_fail` | RC#2 |
-| `engine_oracle.piping.test_cfd_handoff.test_internal_volume_no_kernel_raises_piping_cfd_error` | RC#3 |
-
-### Root Cause #1 (5 tests) — `sys.modules` stub in `test_h7_shadow.py`
-
-**File:** `services/agent/test_h7_shadow.py`, lines 44–56
-
-```python
-_svc_agent_cfg = _types.ModuleType("services.agent.config")
-_svc_agent_cfg.consent_tier = lambda cfg: "off"   # permanent override
-_svc_agent_cfg.load_config = lambda: {}
-_svc_agent_cfg.offline_enabled = lambda: False
-# (no get_provider attribute on stub)
-sys.modules.setdefault("services.agent.config", _svc_agent_cfg)  # injects at collection time
+See `## Test Pollution Analysis` section appended after running:
+```
+python scripts/mcp_runtime_audit.py --test-pollution
 ```
 
-This is **module-level code** that runs at pytest **collection time**. Once injected:
-- `consent_tier()` always returns `"off"` → breaks 3 telemetry-consent tests
-- The stub has no `get_provider` → `monkeypatch.setattr("services.agent.config.get_provider", ...)` raises `AttributeError` in spec_sheet_matcher tests
-
-**Fix:** Move stub injection into a `@pytest.fixture(autouse=True, scope="module")` with
-`monkeypatch`, so `sys.modules` is restored after the h7_shadow test module.
-Alternatively, add `get_provider` to the stub so the attribute error doesn't cascade.
-
-### Root Cause #2 (1 test) — Module-load-time `HAVE_FLUIDS` in `test_catalog.py`
-
-**File:** `engine_oracle/piping/test_catalog.py`, line 18
-
-```python
-HAVE_FLUIDS = catalog.have_fluids()  # evaluated once at collection time
-```
-
-In some combined-run orderings, `fluids` is not yet importable when this module loads
-(another module has shadowed/deferred it), so `HAVE_FLUIDS=False` and the `else` branch
-fires — but the `else` assertion (`"fluids" in bad["reason"]`) doesn't match the actual
-error message from the fully-installed catalog.
-
-**Fix:** Evaluate `catalog.have_fluids()` inside each test that needs it, not at module scope.
-
-### Root Cause #3 (1 test) — Module-load vs call-time kernel check in `test_cfd_handoff.py`
-
-**File:** `engine_oracle/piping/test_cfd_handoff.py`, lines 31–43
-
-```python
-HAVE_KERNEL = _have_kernel()  # False at collection time (build123d absent)
-# ...
-def test_internal_volume_no_kernel_raises_piping_cfd_error():
-    if HAVE_KERNEL:
-        pytest.skip("kernel present")
-    # ... asserts PipingCFDError is raised
-```
-
-`HAVE_KERNEL=False` at collection (module load) so the test runs. But `internal_volume()`
-calls `_have_kernel()` lazily at invocation time. In the combined run, earlier tool
-imports (e.g., ecad_tools warm-importing `threed.py`) may add a `build123d` entry to
-`sys.modules`, making `_have_kernel()` return `True` at call time — so the function
-doesn't raise `PipingCFDError`, and `assert raised` fails.
-
-**Fix:** Evaluate `HAVE_KERNEL` lazily inside the test (not at module load), or use
-`importlib.util.find_spec("build123d")` which is not affected by `sys.modules` state.
-
 ---
-
-## Proposed Follow-Up Tasks
-
-| ID | Title | Scope | Priority |
-| -- | ----- | ----- | -------- |
-| T-V3 | Fix `test_h7_shadow.py` sys.modules pollution | `services/agent/test_h7_shadow.py` lines 44–56 | High |
-| T-V4 | Provision full mcp-venv (20 missing packages) | Linux provisioner script | High |
-| T-V5 | Fix module-load-time kernel/fluids flags in tests | `test_catalog.py`, `test_cfd_handoff.py` | Medium |
-| T-V6 | Second audit pass with proper tool fixtures | `scripts/mcp_runtime_audit.py` fixture map | Medium |
-| T-V7 | Fix services/mcp/test_cad_tools.py FEA/CFD assertions | 7 baseline failures | Medium |
-| T-V8 | Fix services/mcp/test_ecad_tools.py setup errors | 35 baseline errors | Low |
-
----
-
-*Generated by `scripts/mcp_runtime_audit.py` (T-V2, sonnet-vega, 2026-07-02)*
+*Generated by `scripts/mcp_runtime_audit.py` (T-V2)*

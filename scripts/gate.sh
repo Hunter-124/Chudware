@@ -208,11 +208,11 @@ stage_ctest() {
 # exercise core-calling paths.
 #
 # The files below have known collection errors. They are explicitly ignored so their
-# errors don't abort collection. Status as of T-V3 (2026-07-03):
-#   engine_oracle/doc/test_aicm.py        — REMOVED from ignores (OCP now installed; collects cleanly)
-#   engine_oracle/sim/test_foam_case.py   — T-V2/T-V3: trimesh absent → collection error
-#   engine_oracle/sim/test_lbm.py         — T-V2/T-V3: trimesh absent → collection error
-#   services/agent/test_loop_mock.py      — T-V2/T-V3: hardcoded path to services/engine/samples/ missing
+# errors don't abort collection. Status as of T-V4 (2026-07-03):
+#   engine_oracle/doc/test_aicm.py        — REMOVED from ignores (T-V3: OCP now installed; collects cleanly)
+#   engine_oracle/sim/test_foam_case.py   — REMOVED from ignores (T-V4: trimesh now installed; 14 tests collect)
+#   engine_oracle/sim/test_lbm.py         — REMOVED from ignores (T-V4: trimesh now installed; collects cleanly)
+#   services/agent/test_loop_mock.py      — KEPT: hardcoded path to services/engine/samples/mounting_plate.py missing (pre-existing, not a dep gap)
 #
 # Pre-existing test failures inside the collected suites are RECORDED (non-fatal) here,
 # matching the check.py FAIL-RECORDED policy. Only a hard collection crash or a zero-
@@ -274,8 +274,7 @@ stage_pytest() {
         local ignore_args=()
         # T-V2/T-V3 tracked ignores: collection-error files that poison the whole run.
         # engine_oracle/doc/test_aicm.py was removed (T-V3): OCP now installed, collects cleanly.
-        [ -f "engine_oracle/sim/test_foam_case.py" ]  && ignore_args+=(--ignore=engine_oracle/sim/test_foam_case.py)
-        [ -f "engine_oracle/sim/test_lbm.py" ]        && ignore_args+=(--ignore=engine_oracle/sim/test_lbm.py)
+        # T-V4: foam_case and lbm ignores removed — trimesh now installed, both collect cleanly.
         [ -f "services/agent/test_loop_mock.py" ]     && ignore_args+=(--ignore=services/agent/test_loop_mock.py)
         # T-Q2: test_autosave_recovery must be collected via mcp_server/ (not services/)
         # because it imports mcp_server.cad_tools; from services/ the 'mcp' name resolves
@@ -322,7 +321,7 @@ stage_pytest() {
     done
 
     echo "  total collected ≈ $total_collected tests across ${#dirs[@]} dirs"
-    record "pytest              total ≈ $total_collected collected | $total_passed passed | ignoring 3 files (T-V2/T-V3; test_aicm.py removed from ignores — OCP installed)"
+    record "pytest              total ≈ $total_collected collected | $total_passed passed | ignoring 1 file (test_loop_mock.py: missing fixture path, pre-existing; T-V4: foam_case+lbm+test_aicm ignores removed — trimesh+OCP now installed)"
 
     if [ "$any_hard_fail" -ne 0 ]; then
         record "pytest              FAIL    one or more dirs had a hard collection crash (rc≥2)"

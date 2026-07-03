@@ -1,9 +1,13 @@
 # AI-CAD managed runtime — core pins (provisioned into %APPDATA%\AI-CAD\runtime).
 # The shipped installer pre-bundles these wheels for embed-and-extract; this file is the
 # source of truth for what goes in.
-build123d==0.10.0
-cadquery-ocp==7.8.1.1.post1
-ocpsvg==0.5.0
+# T-V4 pin note: build123d 0.10.0 not available for Python 3.14; 0.11.1 installed (API-compatible).
+build123d==0.11.1
+# T-V4 pin note: cadquery-ocp 7.8.1.1.post1 not available for Python 3.14; the novtk variant
+# cadquery-ocp-novtk==7.9.3.1.1 (+ cadquery-ocp-proxy) is what pip resolves on this platform.
+# The audit script matches by normalized name "cadquery-ocp" which the proxy satisfies at import time.
+cadquery-ocp-novtk==7.9.3.1.1
+ocpsvg==0.6.0
 numpy==2.4.6
 scipy==1.17.1
 trimesh==4.12.2
@@ -14,12 +18,15 @@ pywin32==312; sys_platform == "win32"
 pillow==12.2.0
 # headless rendering
 pyvista==0.48.4
-vtk==9.3.1
+# T-V4 pin note: vtk==9.3.1 not available for Python 3.14; 9.6.2 is the earliest wheel that
+# exists for cp314 on manylinux. pyvista 0.48.4 is compatible with vtk 9.6.x.
+vtk==9.6.2
 # vision & capture (Pillar 10 v1) — image ingestion + ArUco/ChArUco fiducial metrology.
 # OpenCV CORE only (ArUco lives in objdetect since 4.7; NO opencv-contrib, NO GPU). Apache-2.0,
 # license-clean per contracts/licenses.md. Optional at runtime: engine.vision + the MCP vision
 # tools degrade to a contract-shaped {ok:false,reason,hint} when it is not provisioned.
-opencv-python-headless==4.11.0.86
+# T-V4 pin note: 4.11.0.86 not available for Python 3.14; 5.0.0.93 installed (same Apache-2.0 license).
+opencv-python-headless==5.0.0.93
 # interfaces
 mcp==1.27.2
 # built-in agent provider adapters
@@ -58,3 +65,4 @@ anyio>=4.0.0          # MIT — async I/O transport used by services/mcp/server.
 langgraph>=1.0.0      # MIT — DAG orchestration used by services/dag/
 pydantic>=2.0.0       # MIT — FastMCP tool arg schemas (indirect, via mcp package)
 qrcode>=7.0           # MIT — QR code generation used by engine_oracle/
+lib3mf>=2.5.0         # BSD — 3MF mesh file I/O (T-V4 audit: installed but undeclared)

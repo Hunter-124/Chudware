@@ -529,8 +529,23 @@ def run_audit(out_path: Path | None = None) -> dict:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            pkg = line.split("==")[0].split(">=")[0].split("<=")[0].split("!=")[0]
+            # Strip environment markers (e.g. "; sys_platform == 'win32'") before pkg name extraction
+            req_spec = line.split(";")[0].strip()
+            pkg = req_spec.split("==")[0].split(">=")[0].split("<=")[0].split("!=")[0]
             pkg = pkg.strip().lower().replace("_", "-")
+            # Evaluate the marker: skip entries that don't apply to the current platform
+            if ";" in line:
+                import platform as _platform
+                marker = line.split(";", 1)[1].strip()
+                # Simple sys_platform check (covers the only case we have: pywin32)
+                if "sys_platform" in marker:
+                    import sys as _sys
+                    sys_plat = _sys.platform
+                    try:
+                        if not eval(marker, {"sys_platform": sys_plat, "__builtins__": {}}):
+                            continue  # marker evaluates false on this platform — skip
+                    except Exception:
+                        pass  # conservative: don't skip on parse error
             if pkg and pkg not in installed_pkgs:
                 declared_missing.append({"pkg": pkg, "req_line": line})
 
@@ -541,7 +556,8 @@ def run_audit(out_path: Path | None = None) -> dict:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            pkg = line.split("==")[0].split(">=")[0].split("<=")[0].split("!=")[0]
+            req_spec = line.split(";")[0].strip()
+            pkg = req_spec.split("==")[0].split(">=")[0].split("<=")[0].split("!=")[0]
             req_pkgs.add(pkg.strip().lower().replace("_", "-"))
 
     # Stdlib + internal packages to ignore

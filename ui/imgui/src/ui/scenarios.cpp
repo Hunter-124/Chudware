@@ -454,6 +454,8 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
             std::fflush(stdout);
             ui::openCamWorkspacePanel();
         }
+    }
+
     // T-U4: BOM & sourcing panel one-shot.
     // Seeds two bought lines (M3 screw + 608ZZ bearing) with MPNs so the panel renders
     // a realistic table even without a real assembly doc — prices will be BOM_UNPRICED

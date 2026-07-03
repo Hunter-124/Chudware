@@ -57,6 +57,18 @@ rework pushed) · eddy (T-BL22, usage limit, work pushed). heath/eddy branches c
 - **T-BL37** (P3 modeling-core new, todo): origin as a selectable, renderable reference point —
   engine ref-resolution (point.origin datum) + viewport point render + FM selectable + viewport
   pick. Cross-cutting, Opus-leaning on the engine ref layer — good candidate for Hunter to steer.
+- **T-BL35** (P3 app-gui fix, todo): surf_revolve axis well K_EDGE→K_EDGEAXIS + readyForPreview
+  axis gate (T-G20 cheap-fix #1, split out of T-BL28's Option-A engine-only branch).
+- **T-BL38** (P2 app-gui fix, todo): Copilot context bar — auto-track selected-model context
+  window (root bug: per-model context-length not looked up), layout between picker/send,
+  constrain picker width, k-token count + click-through breakdown button.
+- **T-BL39** (P3 app-gui overhaul, todo): Copilot messages — drop the "Assistant"/greeting,
+  show generating model(s) as attribution (read from T-BL22 model_info), compact user/model display.
+- **T-BL40** (P2 app-gui fix, todo): universal in-app elicitation UI — agents question the user
+  inline (multiple choice / short answer / open-ended) via the interaction contract; AUDIT-then-
+  complete (contract+ask_user+in-app dialog already shipped T-F3/F4/F16), round-trip proof required.
+
+Copilot-tab cluster = T-BL38 + T-BL39 + T-BL40 (+ context/model theme); one driver could take all three in a shared build cycle when dispatch reopens.
 
 ## Human-gated (waiting on Hunter)
 - **sketch_new label call** (round-2): keep icon-only [ribbon.cpp ribbon_displayLabel L134 intentional]

@@ -44,3 +44,6 @@ Scope:
 - `reports/vv/`, gate.sh stage 4.5 — existing battery structure to extend
 - Engine doc-load & verify contract: doc_new + eq_set + add_feature; CoreError vs
   feature_status for rebuild failure detection
+
+## Progress log
+- 2026-07-03 22:35 UTC [sonnet-doro] (foreman liveness probe) No branch pushed ~2h after claim. If you are alive: push your worktree branch NOW (even WIP) — work only counts on the remote. If nothing lands by the next foreman sweep the claim gets released per the dead-driver pattern.

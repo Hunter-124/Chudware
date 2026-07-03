@@ -49,10 +49,14 @@ def canon_ids(lines: list[str]) -> list[str]:
     def repl(m: re.Match) -> str:
         tok = m.group(0)
         if tok not in mapping:
-            mapping[tok] = f"<{m.group(1)}#{sum(1 for k in mapping.values() if k.startswith('<'+m.group(1)))+1}>"
+            kind = m.group(1) or "hexid"
+            mapping[tok] = f"<{kind}#{sum(1 for k in mapping.values() if k.startswith('<'+kind))+1}>"
         return mapping[tok]
 
-    rx = re.compile(r"\b(doc-cpp|doc-ecad|cam-doc|drawing-doc|study)[A-Za-z0-9_-]*")
+    # doc-cpp/dwg-cpp style ids, plus the ECAD engine's bare 12-hex session ids
+    # (e.g. ecad_design -> doc_id "90564c7b3bbb", random per process).
+    rx = re.compile(r"\b(doc-cpp|dwg-cpp|doc-ecad|cam-doc|drawing-doc|study)[A-Za-z0-9_-]*"
+                    r"|\b(?=[0-9a-f]{12}\b)(?=.*[0-9])(?=.*[a-f])[0-9a-f]{12}\b")
     return [rx.sub(repl, l) for l in lines]
 
 

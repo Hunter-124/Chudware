@@ -17,7 +17,8 @@
 #include <vector>
 #endif
 
-#include <cstdio>   // T-G9 parity trace (AI_CAD_RPC_TRACE) file append
+#include <cstdio>      // T-G9 parity trace (AI_CAD_RPC_TRACE) file append
+#include <functional>  // T-G9 parity trace secret redaction
 #include <cstdlib>
 #include <string>
 
@@ -553,9 +554,25 @@ bool WorkerClient::call(const std::string& method, const json& params, json& res
 
     const bool ok = callImpl(method, params, result, err, timeoutMs, onEvent);
     try {
+        // Redact credential-bearing fields recursively (agent_list_models et al carry
+        // api_key/base_url auth material) — trace files must never hold live secrets.
+        std::function<void(json&)> redact = [&](json& node) {
+            if (node.is_object()) {
+                for (auto& [k, v] : node.items()) {
+                    if (k == "api_key" || k == "apikey" || k == "token" || k == "secret" ||
+                        k == "password" || k == "authorization")
+                        v = "<redacted>";
+                    else
+                        redact(v);
+                }
+            } else if (node.is_array()) {
+                for (auto& v : node) redact(v);
+            }
+        };
         json rec = {{"method", method}, {"params", params}, {"ok", ok}};
         if (ok) rec["result"] = result;
         else    rec["err"] = err;
+        redact(rec);
         static std::mutex traceMtx;  // two instances (doc + sim worker) share the file
         std::lock_guard<std::mutex> tlk(traceMtx);
         FILE* f = std::fopen(tracePath, "ab");

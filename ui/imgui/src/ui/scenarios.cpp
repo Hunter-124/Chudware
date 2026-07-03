@@ -12,6 +12,8 @@
 #include "ui/cam_panel.h"            // T-U3 CAM workspace (AI_CAD_SHOT=cam_workspace)
 #include "ui/cam/cam_panel.h"        // camLoadJob (Manufacture panel job adoption, AI_CAD_SHOT=cam)
 #include "ui/drawing_panel.h"        // drawingActiveDocId/Doc + refresh (AI_CAD_SHOT=drawing detailing)
+#include "ui/ecad/ecad_panel.h"      // ecadEditorMirror (AI_CAD_SHOT=ecad ai-design adoption)
+#include "ui/ecad/ecad_mirror.h"     // EcadMirror::loadFromTree (complete type for the call above)
 #include "ui/bom_panel.h"
 #include "ui/requirements_panel.h"   // T-U5
 #include "ui/transparency_panel.h"
@@ -470,11 +472,25 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
                            wantPcb ? cmd::DocType::Pcb : cmd::DocType::Schematic});
         st.activeDoc = (int)st.docs.size() - 1;
         st.workspace = wantPcb ? cmd::Workspace::Board : cmd::Workspace::Schematic;
-        if (st.worker.call("ecad_orchestrate",
-                {{"recipe", "divider"}, {"kind", wantPcb ? "pcb" : "sch"}}, res, err, 60000))
-            std::printf("ecad: orchestrate ok\n");
-        else
-            std::printf("ecad: orchestrate skipped (%s)\n", err.c_str());
+        // Host-parity AI-design flow (T-G9 harness finding: this used to call
+        // "ecad_orchestrate" — a method that does not exist in the engine — so the ecad
+        // scenario produced no schematic and no netlist/ERC compile at all). Host's
+        // ecadAiDesign: ecad_design(request) -> ecad_tree(doc_id) -> adopt into the editor.
+        if (st.worker.call("ecad_design",
+                {{"request", "5V resistive divider with 2.5V output"}}, res, err, 60000)) {
+            const std::string id = res.is_object() ? res.value("doc_id", std::string())
+                                                   : std::string();
+            nlohmann::json tree;
+            if (!id.empty() &&
+                st.worker.call("ecad_tree", {{"doc_id", id}}, tree, err, 60000)) {
+                ui::ecadEditorMirror().loadFromTree(tree);
+                std::printf("ecad: ai-design ok doc=%s\n", id.c_str());
+            } else {
+                std::printf("ecad: ecad_tree failed (%s)\n", err.c_str());
+            }
+        } else {
+            std::printf("ecad: ecad_design failed (%s)\n", err.c_str());
+        }
         std::fflush(stdout);
     }
 

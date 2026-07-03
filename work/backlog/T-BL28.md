@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-BL28-surf-edge-wells
 depends_on: []
+priority: 2
+lane: modeling-core
+kind: fix
 ---
 
 ## Context
@@ -45,3 +48,6 @@ body-edge pick that always fails.
   T-G20 report's "The one real wiring bug" section.
 - Cheatsheet stale bit: it claims surf_untrim has "NO compiler" — false since Bug S-1
   (handler at `document.cpp` L5747).
+
+## Progress log
+- 2026-07-03 21:40 UTC [fable-foreman] set P2, lane=modeling-core, kind=fix: foreman hygiene: missing frontmatter blocked claim-ordering

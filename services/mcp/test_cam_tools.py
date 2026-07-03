@@ -351,6 +351,16 @@ def main() -> int:
     check(res0["removed_volume_mm3"] > 0, "sim removed material")
     check(res0["cycle_time_s"] > 0, "sim cycle time > 0")
 
+    # T-M3: check_holder is accepted + forwarded to the core (holder/shank collision sim).
+    # Mirrors the plain cam_simulate call above -- param-plumbing check (DoD), not a claim
+    # about tripping a real collision (needs geometry deep/narrow enough to snag the tool
+    # body, out of scope here).
+    sim_h = cb.call("cam_simulate", {"doc_id": doc, "options": {"check_holder": True}})
+    res0_h = sim_h["results"][0]
+    check("holder_collisions" in res0_h and isinstance(res0_h["holder_collisions"], int),
+          "check_holder=True accepted; holder_collisions surfaced as an int "
+          f"(got {res0_h.get('holder_collisions')!r})")
+
     post = cb.call("cam_post", {"doc_id": doc, "dialect": "fanuc"})
     check(post["ok"], "post ok")
     check("G83" in post["gcode"], "fanuc post emits a G83 peck cycle")

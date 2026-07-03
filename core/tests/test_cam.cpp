@@ -1073,6 +1073,56 @@ TEST_CASE("sim: turning roughing removes stock volume (T-M6 G4)") {
     CHECK(r.remaining_volume_mm3 < r.stock_volume_mm3);
 }
 
+// ── T-M3: holder/shank collision (audit §3.2, §T-M3) ─────────────────────────
+
+// build a deep narrow-pocket job whose walls out-reach the tool's flute length, so
+// the non-cutting shank/holder must crash into them.
+static std::vector<Toolpath> deep_pocket_job(Setup& su, ToolLibrary& lib, double depth) {
+    su = Setup{};
+    su.machine.kind = MachineKind::Mill3;
+    su.stock.type = StockType::Box;
+    su.stock.min = {-15, -15, -(depth + 1)}; su.stock.max = {15, 15, 0};
+    Tool t; t.number = 1; t.type = ToolType::EndmillFlat; t.diameter = 6;
+    t.flute_length = 20; t.shoulder_length = 25; t.shank_diameter = 6; t.holder_diameter = 32;
+    lib = ToolLibrary{}; lib.tools = {t};
+    Operation op; op.id = "dp"; op.type = OpType::Pocket2D; op.tool_number = 1;
+    op.heights.top = 0; op.heights.bottom = -depth; op.stepdown = 3; op.stepover = 3;
+    op.geometry["regions"] = json::array({to_json(square(0, 0, 8))});   // 16x16 pocket
+    su.operations = {op};
+    OpContext ctx; ctx.machine = su.machine; ctx.stock = su.stock; ctx.tool = t;
+    ctx.material_id = "aluminum";
+    return {generate(op, ctx).path};
+}
+
+// deep pocket: 30mm > the 25mm shoulder, so the 32mm holder dips below the stock top
+// and hits the surrounding walls — a crash the tip-only sim (check_holder off) misses.
+TEST_CASE("sim: holder collides on a deep narrow pocket (T-M3)") {
+    Setup su; ToolLibrary lib;
+    auto tps = deep_pocket_job(su, lib, 30.0);
+
+    SimResult off = simulate_setup(su, lib, tps, TriMesh{}, SimOptions{});
+    REQUIRE(off.ok);
+    CHECK(off.holder_collisions == 0);        // default: holder check disabled
+
+    SimOptions so; so.check_holder = true;
+    SimResult on = simulate_setup(su, lib, tps, TriMesh{}, so);
+    REQUIRE(on.ok);
+    CHECK(on.holder_collisions > 0);          // shank/holder crashes into the deep walls
+    bool warned = false;
+    for (auto& w : on.warnings) if (w.find("holder") != std::string::npos) warned = true;
+    CHECK(warned);
+}
+
+// shallow pocket: 4mm « 20mm flute length, the whole non-cutting body stays clear.
+TEST_CASE("sim: holder clears a shallow pocket (T-M3 no false positive)") {
+    Setup su; ToolLibrary lib;
+    auto tps = deep_pocket_job(su, lib, 4.0);
+    SimOptions so; so.check_holder = true;
+    SimResult r = simulate_setup(su, lib, tps, TriMesh{}, so);
+    REQUIRE(r.ok);
+    CHECK(r.holder_collisions == 0);
+}
+
 // ── session + RPC tests (Phase 6) ────────────────────────────────────────────
 TEST_CASE("session: new / apply_ops / generate / post / undo / save+open") {
     json nw = cam_new(json{{"name", "JobA"}, {"post", "fanuc"}});

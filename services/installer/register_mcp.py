@@ -1,6 +1,7 @@
-"""Register AI-CAD as an MCP server in the machine's Claude install(s).
+"""Register ShopCraft (formerly AI-CAD) as an MCP server in the machine's Claude install(s).
 
-Adds an "ai-cad" entry to the `mcpServers` map of:
+Adds a "shopcraft" entry to the `mcpServers` map of (any legacy "ai-cad" entry is left
+in place on register — existing tooling references it — and removed on --unregister):
   * Claude Desktop : %APPDATA%/Claude/claude_desktop_config.json
   * Claude Code     : ~/.claude.json
 
@@ -21,7 +22,8 @@ from pathlib import Path
 
 from engine import paths
 
-SERVER_NAME = "ai-cad"
+SERVER_NAME = "shopcraft"
+SERVER_NAME_LEGACY = "ai-cad"  # left in place on register; removed on --unregister
 
 
 def default_python() -> Path:
@@ -65,11 +67,13 @@ def apply(python_exe: Path, cwd: Path, targets: list[str], dry_run: bool,
         cfg = _load(path)
         servers = cfg.get("mcpServers") or {}
         if unregister:
-            changed = SERVER_NAME in servers
+            changed = SERVER_NAME in servers or SERVER_NAME_LEGACY in servers
             servers.pop(SERVER_NAME, None)
+            servers.pop(SERVER_NAME_LEGACY, None)  # remove legacy id on explicit unregister
         else:
             changed = servers.get(SERVER_NAME) != entry
             servers[SERVER_NAME] = entry
+            # Leave any legacy "ai-cad" entry alone — existing tooling references it.
         cfg["mcpServers"] = servers
 
         wrote = False

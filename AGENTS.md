@@ -1,11 +1,14 @@
-# AGENTS.md — AI-CAD repo navigation + ownership
+# AGENTS.md — ShopCraft (AI-CAD) repo navigation + ownership
 
-This is the canonical agent-navigation and ownership doc for the whole AI-CAD
-codebase. Read this first before any refactor work.
+This is the canonical agent-navigation and ownership doc for the whole ShopCraft
+(formerly AI-CAD; see the T-G10 compatibility rules in README.md — `SHOPCRAFT_*`
+env vars canonical with `AI_CAD_*` honored, `shopcraft` MCP id with `ai-cad`
+preserved, legacy appdata dir honored) codebase. Read this first before any
+refactor work.
 
 ## Project
 
-AI-CAD is a parametric CAD application. The core geometry/document/solver/CAM
+ShopCraft is a parametric CAD application. The core geometry/document/solver/CAM
 engine is a C++ library `libaicad` (under `core/`) that is strangling out a
 legacy Python `engine/` oracle — the two are kept in lockstep by a per-subsystem
 parity corpus until each Python module is flipped off and deleted. The desktop

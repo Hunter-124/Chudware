@@ -5,6 +5,7 @@
 #include <shlobj.h>
 
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 
 namespace platform {
@@ -35,7 +36,22 @@ std::string appdataDir() {
     return std::string(a ? a : ".");
 }
 
-std::string appdataRoot() { return joinPath(appdataDir(), "AI-CAD"); }
+std::string appdataRoot() {
+    // T-G10 alias rule (mirrors engine/paths.py active_root()): a machine with an
+    // existing legacy AI-CAD dir (and no ShopCraft dir yet) keeps using it wholesale —
+    // it may hold the live runtime venv/config, and venvs do not survive relocation.
+    // Fresh installs get ShopCraft. No destructive migration.
+    static const std::string cached = [] {
+        const std::string base = appdataDir();
+        const std::string neu = joinPath(base, "ShopCraft");
+        const std::string legacy = joinPath(base, "AI-CAD");
+        std::error_code ec;
+        if (!std::filesystem::exists(neu, ec) && std::filesystem::exists(legacy, ec))
+            return legacy;
+        return neu;
+    }();
+    return cached;
+}
 
 std::string configPath() { return joinPath(appdataRoot(), "config.json"); }
 
@@ -75,6 +91,6 @@ std::string joinPath(const std::string& a, const std::string& b) {
     return a + "/" + b;
 }
 
-std::string appdataDisplayLabel() { return "%APPDATA%\\AI-CAD"; }
+std::string appdataDisplayLabel() { return "%APPDATA%\\ShopCraft (legacy AI-CAD dir honored)"; }
 
 }  // namespace platform

@@ -33,6 +33,39 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+# ---------------------------------------------------------------- env var compatibility shim
+# SHOPCRAFT_* is the new canonical name for all env vars. AI_CAD_* is the legacy name.
+# Read sites use _env() to prefer new names while honoring old ones (with a one-time warn).
+# Write sites (gate.sh exports, test setdefault calls) are unchanged — they keep working
+# via the fallback.
+
+import warnings as _warnings
+_warned_vars: set = set()
+
+
+def _env(new_name: str, legacy_name: str | None = None, default: str | None = None) -> str | None:
+    """Read an env var preferring the SHOPCRAFT_* name, falling back to AI_CAD_* legacy name.
+
+    Emits a DeprecationWarning once per process per legacy-name when the legacy var is
+    the active source, so callers know to update their scripts.
+    """
+    val = os.environ.get(new_name)
+    if val is not None:
+        return val
+    if legacy_name:
+        val = os.environ.get(legacy_name)
+        if val is not None:
+            if legacy_name not in _warned_vars:
+                _warned_vars.add(legacy_name)
+                _warnings.warn(
+                    f"{legacy_name} is deprecated; use {new_name} instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            return val
+    return default
+
+
 class CoreError(RuntimeError):
     """A hard failure from the C++ core (nonzero rc / OpError envelope / generic error)."""
 
@@ -66,7 +99,7 @@ def dist_dir() -> Path:
     required to exist until the library is first loaded; on Linux there is no ``dist``
     stage and the library is found in a build dir instead (see ``_lib_candidates``).
     """
-    env = os.environ.get("AI_CAD_DIST")
+    env = _env("SHOPCRAFT_DIST", "AI_CAD_DIST")
     if env:
         return Path(env)
     return _repo_root() / "dist" / "AI-CAD"
@@ -79,7 +112,7 @@ def _lib_candidates() -> list[Path]:
     """
     name = _lib_name()
     out: list[Path] = []
-    env_lib = os.environ.get("AI_CAD_LIBAICAD")
+    env_lib = _env("SHOPCRAFT_LIBAICAD", "AI_CAD_LIBAICAD")
     if env_lib:
         out.append(Path(env_lib))
     out.append(dist_dir() / name)  # honours $AI_CAD_DIST; Windows stage default
@@ -154,7 +187,13 @@ def _load() -> ctypes.CDLL:
         # Geometry queries + the agent cheatsheets resolve relative to the prompts dir; point
         # it at the staged/source copy so the MCP behaves identically to the engine. Don't
         # clobber an explicit override.
+        # An explicit SHOPCRAFT_PROMPTS_DIR override must reach the C++ core, which
+        # still reads AI_CAD_PROMPTS_DIR — propagate before the default kicks in.
+        _sc_prompts = os.environ.get("SHOPCRAFT_PROMPTS_DIR")
+        if _sc_prompts:
+            os.environ.setdefault("AI_CAD_PROMPTS_DIR", _sc_prompts)
         os.environ.setdefault("AI_CAD_PROMPTS_DIR", str(_prompts_default()))
+        os.environ.setdefault("SHOPCRAFT_PROMPTS_DIR", os.environ["AI_CAD_PROMPTS_DIR"])
         dll = ctypes.CDLL(str(lib_path))
         dll.aicad_call.restype = ctypes.c_int
         dll.aicad_call.argtypes = [

@@ -196,14 +196,26 @@ def _sanitize_output_path(path: str) -> str:
 # --- live viewport handoff -------------------------------------------------------------
 # The MCP runs in its OWN process with its own engine, so the running desktop app can't see
 # its doc sessions. To make the AI's part visible in the app's viewport, we publish it as a
-# native .step+ doc plus a tiny live.json {rev, step} into %APPDATA%\AI-CAD\handoff\; the host
+# native .step+ doc plus a tiny live.json {rev, step} into <appdata>/<app>/handoff/; the GUI
 # polls that control file each frame (ui::pollAiCadHandoff) and opens/refreshes one tab from it.
+# <app> follows the T-G10 alias rule (ShopCraft, or the legacy AI-CAD dir when it already
+# exists), matching platform::appdataRoot() so publisher and reader agree.
 _PUB: dict = {"rev": None}
 
 
 def _handoff_dir() -> Path:
-    base = os.environ.get("APPDATA") or tempfile.gettempdir()
-    d = Path(base) / "AI-CAD" / "handoff"
+    base = os.environ.get("APPDATA")
+    if not base:
+        if os.name == "nt":
+            base = tempfile.gettempdir()
+        else:
+            # Match platform/paths_linux.cpp appdataDir() — the old tempdir fallback put
+            # the handoff where the GUI never looked on Linux.
+            base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    new_root = Path(base) / "ShopCraft"
+    legacy_root = Path(base) / "AI-CAD"
+    root = legacy_root if (not new_root.exists() and legacy_root.exists()) else new_root
+    d = root / "handoff"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

@@ -43,8 +43,16 @@ bool dirExists(const std::string& p) {
 }  // namespace
 
 // Exported (bootstrap.h) so callers outside this file (e.g. a first-run consent dialog) can
-// locate %APPDATA%/AI-CAD/config.json the same way the runtime provisioner does.
-std::string appdataRoot() { return env_or("APPDATA", "") + "\\AI-CAD"; }
+// locate the per-user config.json the same way the runtime provisioner does.
+// T-G10 alias rule (mirrors engine/paths.py active_root()): keep an existing legacy
+// AI-CAD dir wholesale (it holds the live runtime venv); fresh installs get ShopCraft.
+std::string appdataRoot() {
+    const std::string base = env_or("APPDATA", "");
+    const std::string neu = base + "\\ShopCraft";
+    const std::string legacy = base + "\\AI-CAD";
+    if (!dirExists(neu) && dirExists(legacy)) return legacy;
+    return neu;
+}
 
 namespace {
 
@@ -318,15 +326,24 @@ std::string shq(const std::string& s) {
 }
 }  // namespace
 
-// XDG data root for the managed runtime/cache (mirrors %APPDATA%\AI-CAD on Windows). Exported
+// XDG data root for the managed runtime/cache (mirrors %APPDATA% on Windows). Exported
 // (bootstrap.h) so callers outside this file (e.g. a first-run consent dialog) can locate
-// $XDG_DATA_HOME/AI-CAD/config.json the same way the runtime provisioner does.
+// the per-user config.json the same way the runtime provisioner does.
+// T-G10 alias rule (mirrors engine/paths.py active_root()): keep an existing legacy
+// AI-CAD dir wholesale (it holds the live runtime venv); fresh installs get ShopCraft.
 std::string appdataRoot() {
+    const auto pick = [](const fs::path& base) {
+        const fs::path neu = base / "ShopCraft";
+        const fs::path legacy = base / "AI-CAD";
+        std::error_code ec;
+        if (!fs::exists(neu, ec) && fs::exists(legacy, ec)) return legacy.string();
+        return neu.string();
+    };
     std::string xdg = env_or("XDG_DATA_HOME", "");
-    if (!xdg.empty()) return (fs::path(xdg) / "AI-CAD").string();
+    if (!xdg.empty()) return pick(fs::path(xdg));
     std::string home = env_or("HOME", "");
-    if (!home.empty()) return (fs::path(home) / ".local" / "share" / "AI-CAD").string();
-    return "AI-CAD";
+    if (!home.empty()) return pick(fs::path(home) / ".local" / "share");
+    return pick(fs::path("."));
 }
 
 namespace {

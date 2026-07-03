@@ -245,6 +245,10 @@ stage_pytest() {
 
     # --- wire the engine .so if not already set ---
     local so_path="$REPO/core/build-linux/bin/libaicad.so"
+    # Accept SHOPCRAFT_LIBAICAD as alias for AI_CAD_LIBAICAD (T-G10 rename shim)
+    if [ -n "${SHOPCRAFT_LIBAICAD:-}" ] && [ -z "${AI_CAD_LIBAICAD:-}" ]; then
+        export AI_CAD_LIBAICAD="$SHOPCRAFT_LIBAICAD"
+    fi
     if [ -z "${AI_CAD_LIBAICAD:-}" ] && [ -f "$so_path" ]; then
         export AI_CAD_LIBAICAD="$so_path"
         echo "  AI_CAD_LIBAICAD=$AI_CAD_LIBAICAD (auto-detected)"
@@ -359,6 +363,10 @@ stage_ui_imgui() {
         return 0
     fi
     local shot="/tmp/aicad2-gate-shot.png"
+    # Accept SHOPCRAFT_SHOT as alias for AI_CAD_SHOT (T-G10 rename shim)
+    if [ -n "${SHOPCRAFT_SHOT:-}" ] && [ -z "${AI_CAD_SHOT:-}" ]; then
+        export AI_CAD_SHOT="$SHOPCRAFT_SHOT"
+    fi
     local shot_cmd="AI_CAD_NO_FILE_DIALOGS=1 \"$bin\" --shot \"$shot\" --frames 12"
     if [ -z "${DISPLAY:-}" ] && command -v xvfb-run >/dev/null 2>&1; then
         shot_cmd="xvfb-run -a $shot_cmd"

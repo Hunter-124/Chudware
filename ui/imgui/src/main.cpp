@@ -43,7 +43,33 @@ static void capturePNG(GLFWwindow* win, const char* path) {
     else std::fprintf(stderr, "[shot] FAILED to write %s\n", path);
 }
 
+// T-G10 rename shim: SHOPCRAFT_* are the new canonical env var names; AI_CAD_* remain
+// the internal read names. Propagate new -> old once at startup so every getenv site
+// (this file, scenarios, panels, worker) honors both without churn.
+static void propagateShopcraftEnv() {
+    static const char* kPairs[][2] = {
+        {"SHOPCRAFT_SHOT", "AI_CAD_SHOT"},
+        {"SHOPCRAFT_LIBAICAD", "AI_CAD_LIBAICAD"},
+        {"SHOPCRAFT_REPO", "AI_CAD_REPO"},
+        {"SHOPCRAFT_PYTHON", "AI_CAD_PYTHON"},
+        {"SHOPCRAFT_RPC_TRACE", "AI_CAD_RPC_TRACE"},
+        {"SHOPCRAFT_NO_FILE_DIALOGS", "AI_CAD_NO_FILE_DIALOGS"},
+        {"SHOPCRAFT_PROMPTS_DIR", "AI_CAD_PROMPTS_DIR"},
+    };
+    for (const auto& p : kPairs) {
+        const char* nv = std::getenv(p[0]);
+        if (nv && *nv && !std::getenv(p[1])) {
+#ifdef _WIN32
+            _putenv_s(p[1], nv);
+#else
+            setenv(p[1], nv, 0);
+#endif
+        }
+    }
+}
+
 int main(int argc, char** argv) {
+    propagateShopcraftEnv();
     const char* shotPath = nullptr; int shotFrames = 12; bool demo = false;
     const char* doCmd = nullptr; bool openPalette = false; bool sketch = false;
     bool selftest = false, picktest = false, shelltest = false, edgetest = false, extrudetest = false, apptest = false; bool light = false;

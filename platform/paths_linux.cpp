@@ -1,6 +1,7 @@
 #include "paths.h"
 
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 
 #if defined(__APPLE__)
@@ -36,7 +37,22 @@ std::string appdataDir() {
     return ".";
 }
 
-std::string appdataRoot() { return joinPath(appdataDir(), "AI-CAD"); }
+std::string appdataRoot() {
+    // T-G10 alias rule (mirrors engine/paths.py active_root()): a machine with an
+    // existing legacy AI-CAD dir (and no ShopCraft dir yet) keeps using it wholesale —
+    // it may hold the live mcp-venv/config, and venvs do not survive relocation.
+    // Fresh installs get ShopCraft. No destructive migration.
+    static const std::string cached = [] {
+        const std::string base = appdataDir();
+        const std::string neu = joinPath(base, "ShopCraft");
+        const std::string legacy = joinPath(base, "AI-CAD");
+        std::error_code ec;
+        if (!std::filesystem::exists(neu, ec) && std::filesystem::exists(legacy, ec))
+            return legacy;
+        return neu;
+    }();
+    return cached;
+}
 
 std::string configPath() { return joinPath(appdataRoot(), "config.json"); }
 
@@ -75,7 +91,7 @@ std::string joinPath(const std::string& a, const std::string& b) {
 }
 
 std::string appdataDisplayLabel() {
-    return "$XDG_DATA_HOME/AI-CAD (or ~/.local/share/AI-CAD)";
+    return "$XDG_DATA_HOME/ShopCraft (or ~/.local/share/ShopCraft; legacy AI-CAD dir honored)";
 }
 
 }  // namespace platform

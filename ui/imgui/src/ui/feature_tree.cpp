@@ -3170,7 +3170,10 @@ void pollAiCadHandoff(AppState& st) {
     if (!st.app->workerStarted) return;   // worker not up — nothing can open yet
     if (st.agentV2Running) return;   // an in-app agent run owns the doc; don't fight it
     namespace fs = std::filesystem;
-    static const std::string ctrl = platform::appdataRoot() + "/AI-CAD/handoff/live.json";
+    // appdataRoot() already includes the app dir (ShopCraft, or legacy AI-CAD via the
+    // T-G10 alias rule) — the host-era "/AI-CAD" suffix here doubled the path and made
+    // the poll watch a directory the MCP never writes to.
+    static const std::string ctrl = platform::appdataRoot() + "/handoff/live.json";
 
     static long long shownRev   = -1;   // the rev currently drawn in the mirror tab
     static long long pendingRev = -1;   // the latest rev the MCP published (may be deferred)

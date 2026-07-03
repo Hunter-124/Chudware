@@ -272,6 +272,7 @@ void drawSimSummary() {
 
 // ---- ribbon command handler ----
 void camHandleCommand(app::AppState& st, const std::string& cmd) {
+    st.camActive = true;   // surface CAM panel via viewport content-swap (H1 fix)
     camEnsureVisible();
     refreshDialects(st);
     if (cmd == "cam_new_job") { g.docId.clear(); g.mirror.clear(); ensureJob(st); g.status = "new CAM job"; return; }
@@ -364,6 +365,7 @@ bool camTakeFocusRequest() {
 // panel so it shows up populated instead of empty. Loads the job tree (setups/ops/tools).
 void camLoadJob(app::AppState& st, const std::string& docId) {
     if (docId.empty()) return;
+    st.camActive = true;   // surface CAM panel via viewport content-swap (H1 fix)
     g.docId = docId;
     g.selSetup = 0;
     g.selOp = -1;

@@ -48,7 +48,7 @@ void drawWorkspaceBar(AppState& s, float height) {
             bool active = (s.workspace == w);
             bool primary = (i == 0);   // first workspace is the primary one
             if (chip(cmd::workspaceLabel(w), cmd::workspaceIcon(w), cmd::workspaceLabel(w), active, primary))
-                { s.workspace = w; s.activeTool.clear(); }
+                { s.workspace = w; s.activeTool.clear(); s.camActive = false; }
             if (i == 0 && wss.size() > 1) {
                 // a faint divider between the primary workspace and the specialized workbenches
                 ImVec2 sp = ImGui::GetCursorScreenPos();

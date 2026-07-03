@@ -340,7 +340,7 @@ void AppState::doOpen() {
             docs[activeDoc].type = cmd::DocType::Part;
         }
         if (activeTab >= 0 && activeTab < (int)docTabs.size()) docTabs[activeTab].path = path;
-        workspace = cmd::Workspace::Model;
+        workspace = cmd::Workspace::Model; camActive = false;
         buildTreeFromDoc(); activeTool.clear();
         status = "Opened " + path;
     } else status = std::string("Open failed: ") + engine.lastError();
@@ -350,7 +350,7 @@ void AppState::doOpen() {
 void AppState::seedDemo() {
     docs = { {"Part1", cmd::DocType::Part} };
     activeDoc = 0;
-    workspace = cmd::Workspace::Model;
+    workspace = cmd::Workspace::Model; camActive = false;
 
     actionBus.setDispatcher(&commandDispatcher);
 

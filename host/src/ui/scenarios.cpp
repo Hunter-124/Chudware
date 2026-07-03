@@ -16,9 +16,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <vector>
 
 #include "../core/app_state.h"
+#include "../renderer.h"  // T-G15 iconpipe: transparent thumbnail render + FBO readback
 #include "../core/jobs.h"  // launchAgentRunV2 (C22b activity scenario)
 #include "activity_panel.h"
 #include "cam/cam_panel.h"  // camLoadJob (CAM copilot fast-path scenario)
@@ -892,6 +894,163 @@ void ScenarioRunner::tick(AppState& st) {
 
     // ---------- appearance scenario (AI_CAD_SHOT=appearance) ----------
     runAppearance(st);
+
+    // ---------- T-G15 icon pipeline (AI_CAD_SHOT=iconpipe) ----------
+    runIconPipe(st);
+}
+
+// T-G15 icon pipeline (AI_CAD_SHOT=iconpipe). Recipe-driven clean-viewport icon generator: reads a
+// JSON recipe list from AI_CAD_ICON_RECIPES { out_dir?, px?, recipes:[{name,yaw,pitch,ops:[...]}] }
+// and, one recipe per pass, builds the demo part (newPart + applyOps — the SAME engine contract the
+// other scenarios use) then renders it through the renderer's transparent thumbnail path (no chrome,
+// no gizmo, no datum planes, alpha=0 background) at the recipe camera, writing out_dir/<name>.png.
+// The capture is a thumbnail-FBO readback (NOT the backbuffer), so it is independent of window size
+// and free of UI. Doubles as a smoke test that each tool's op actually runs on the engine.
+void ScenarioRunner::runIconPipe(AppState& st) {
+    if (!ipInit) {
+        ipInit = true;
+        const char* sm = std::getenv("AI_CAD_SHOT");
+        ipWant = st.wantIconPipe && sm && std::strcmp(sm, "iconpipe") == 0;
+        if (ipWant) {
+            const char* repo = std::getenv("AI_CAD_REPO");
+            std::string base = repo ? std::string(repo) : std::string(".");
+            ipOutDir = base + "/scratch/icon_render";
+            const char* rp = std::getenv("AI_CAD_ICON_RECIPES");
+            if (rp) {
+                try {
+                    std::ifstream f(rp);
+                    nlohmann::json j; f >> j;
+                    if (j.contains("out_dir") && j["out_dir"].is_string())
+                        ipOutDir = j["out_dir"].get<std::string>();
+                    if (j.contains("px") && j["px"].is_number())
+                        ipPx = j["px"].get<int>();
+                    if (j.contains("recipes") && j["recipes"].is_array())
+                        for (auto& r : j["recipes"]) ipRecipes.push_back(r);
+                } catch (const std::exception& e) {
+                    std::printf("iconpipe: FAILED to parse recipes '%s': %s\n", rp, e.what());
+                    std::fflush(stdout);
+                }
+            } else {
+                std::printf("iconpipe: AI_CAD_ICON_RECIPES not set — nothing to render\n");
+                std::fflush(stdout);
+            }
+            std::error_code ec; std::filesystem::create_directories(ipOutDir, ec);
+            std::printf("iconpipe: %zu recipes px=%d out=%s\n", ipRecipes.size(), ipPx,
+                        ipOutDir.c_str());
+            std::fflush(stdout);
+        }
+    }
+    if (!(ipWant && st.workerStarted && !st.iconPipeShotDone)) return;
+
+    // Drain EVERY recipe in this single tick. Everything on the recipe path is synchronous on this
+    // thread (applyOps -> in-process libaicad; loadDocMesh -> AICM parse + setMeshes GL upload;
+    // renderThumbnail -> immediate FBO draw; readThumbnailRGBA -> glReadPixels), so no settle
+    // frames or per-frame stepping are needed. This matters headless: full GUI frames are
+    // pathologically slow on an unattended desktop (the compositor can starve a hidden/occluded
+    // window's presents for ~a minute per swap), so one-tick draining is the difference between
+    // seconds and half an hour. The other scenarios step per-frame because they capture the
+    // BACKBUFFER (needs presented frames); this one never does.
+    for (ipIndex = 0; ipIndex < (int)ipRecipes.size(); ++ipIndex) {
+        const nlohmann::json& r = ipRecipes[ipIndex];
+        const std::string name = r.value("name", std::string("icon_") + std::to_string(ipIndex));
+
+        // Build the demo part for this recipe from its ordered "steps". Each step is either
+        // a raw op (applied verbatim) or a {feature, selrefs} pair whose edge/face references are
+        // resolved at runtime from the built geometry (dress-up ops like fillet/chamfer/shell need
+        // real topo picks — a static recipe can't hardcode them). Reuses the m1/multidoc resolvePick
+        // selector patterns so the recipe table stays pure data (owned by scripts/icon_pipeline.py).
+        std::string err;
+        if (!st.docMirror.newPart(st.worker, err)) {
+            std::printf("iconpipe[%s]: new_part FAILED: %s\n", name.c_str(), err.c_str());
+            std::fflush(stdout);
+            continue;  // skip this recipe, keep going
+        }
+        // Resolve a named selector to a JSON array of pick objects (edges/faces).
+        auto resolveSel = [&](const std::string& sel, int n) -> nlohmann::json {
+            nlohmann::json out = nlohmann::json::array();
+            if (sel == "vertical_edges" || sel == "all_edges") {
+                for (int tid = 1; tid <= 12 && (int)out.size() < n; ++tid) {
+                    std::string se;
+                    std::string s = st.docMirror.resolvePick(st.worker, 1, "edge", tid, se);
+                    if (s.empty()) continue;
+                    try {
+                        nlohmann::json o = nlohmann::json::parse(s);
+                        if (sel == "all_edges") { out.push_back(o); continue; }
+                        if (o.contains("axis") && o["axis"].is_array() && o["axis"].size() == 3 &&
+                            std::fabs(o["axis"][2].get<double>()) > 0.9)
+                            out.push_back(o);
+                    } catch (...) {}
+                }
+            } else if (sel == "top_face") {  // face with the highest centroid Z (m1's topFace)
+                nlohmann::json best; double bestZ = -1e30;
+                for (int tid = 1; tid <= 40; ++tid) {
+                    std::string se;
+                    std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, se);
+                    if (s.empty()) break;
+                    try {
+                        nlohmann::json o = nlohmann::json::parse(s);
+                        if (!o.contains("centroid")) continue;
+                        double z = o["centroid"][2].get<double>();
+                        if (z > bestZ) { bestZ = z; best = o; }
+                    } catch (...) {}
+                }
+                if (best.is_object()) out.push_back(best);
+            }
+            return out;
+        };
+        const nlohmann::json steps = r.value("steps", nlohmann::json::array());
+        bool any = false;
+        for (const auto& step : steps) {
+            nlohmann::json feat = step.value("feature", nlohmann::json::object());
+            nlohmann::json ops = nlohmann::json::array();
+            if (feat.is_object() && !feat.empty()) {
+                if (step.contains("selrefs") && step["selrefs"].is_object()) {
+                    nlohmann::json refs = feat.value("refs", nlohmann::json::object());
+                    for (auto it = step["selrefs"].begin(); it != step["selrefs"].end(); ++it) {
+                        std::string sel = it.value().value("select", std::string());
+                        int nn = it.value().value("n", 64);
+                        refs[it.key()] = resolveSel(sel, nn);
+                    }
+                    feat["refs"] = refs;
+                }
+                ops.push_back({{"op", "add_feature"}, {"feature", feat}});
+            } else if (step.contains("op")) {
+                ops.push_back(step);
+            } else {
+                continue;
+            }
+            auto resp = st.docMirror.applyOps(st.worker, ops);
+            any = true;
+            if (resp.ok && !resp.aicm_path.empty()) { std::string le; st.loadDocMesh(resp.aicm_path, le); }
+            std::printf("iconpipe[%s]: step '%s' ok=%d rev=%d\n", name.c_str(),
+                        feat.value("type", step.value("op", std::string("?"))).c_str(),
+                        (int)resp.ok, resp.revision);
+            std::fflush(stdout);
+        }
+        if (!any) {
+            std::printf("iconpipe[%s]: no build steps\n", name.c_str()); std::fflush(stdout);
+            continue;
+        }
+
+        // Render the transparent thumbnail and write the PNG (same tick — see drain note above).
+        const float yaw   = r.value("yaw", 35.0f);
+        const float pitch = r.value("pitch", 28.0f);
+        if (st.renderer) {
+            st.renderer->renderThumbnail(yaw, pitch, ipPx, /*transparentBg=*/true);
+            std::vector<unsigned char> rgba = st.renderer->readThumbnailRGBA(ipPx);
+            // Opacity sanity: count non-transparent pixels so an empty render shows in the log.
+            size_t opaque = 0; for (size_t i = 3; i < rgba.size(); i += 4) if (rgba[i] > 8) ++opaque;
+            std::string out = ipOutDir + "/" + name + ".png";
+            stbi_write_png(out.c_str(), ipPx, ipPx, 4, rgba.data(), ipPx * 4);
+            std::printf("iconpipe[%s]: wrote %s (%dx%d, %zu/%d opaque px)\n", name.c_str(),
+                        out.c_str(), ipPx, ipPx, opaque, ipPx * ipPx);
+            std::fflush(stdout);
+        }
+    }
+
+    st.iconPipeShotDone = true;  // frees the frame loop to exit (see app.cpp shotFrame gate)
+    std::printf("iconpipe: complete — %d icon(s) written to %s\n", ipIndex, ipOutDir.c_str());
+    std::fflush(stdout);
 }
 
 // Appearance scenario (AI_CAD_SHOT=appearance). Same frame-driven step machine + kSettle

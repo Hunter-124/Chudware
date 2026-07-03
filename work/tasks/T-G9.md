@@ -64,3 +64,81 @@ is the production GUI on Linux; `host/` survives only until T-G11's Windows chec
 - De-literal the G8-ported panels: 66 IM_COL32 color literals absorbed into
   scripts/ui_style_check_baseline.json as EXPLICIT DEBT at merge — replace with
   theme:: tokens and shrink the baseline back toward the original 18.
+
+## Progress log
+
+- 2026-07-03 [sonnet-marsh] SESSION 1 (branch task/T-G9-migration-cutover, pushed through the
+  clean-room parity commit). BOTH FOREMAN SCOPE ADDITIONS COMPLETE:
+
+  **Scope addition 2 — de-literal the wave-4 color debt (DONE, a001ecb):**
+  New `ui/imgui/src/theme/domain_tokens.h` (theme::draw2d/camview/featcat/evalview/pmview/
+  panelview) with byte-identical values; all 83 IM_COL32/ImVec4 literals replaced across
+  drawing_panel, cam/cam_panel, feature_tree, evaluate_dialogs, property_manager,
+  settings_modal, sim_manager. preview_pane's OS #ifdef moved to new
+  ui/imgui/src/platform/path_predicates.h. `scripts/ui_style_check_baseline.json`:
+  **63 keys -> 0** (original pre-G8 baseline was 18; the whole debt AND the original
+  baseline are cleared). Checker + selftest green; drawing/cam/tree shots eyeballed —
+  rendering unchanged.
+
+  **Scope addition 1 — the 5 parity diff harnesses (DONE, clean-room 5/5 PASS, 22/22 checks):**
+  Infra: env-gated `AI_CAD_RPC_TRACE` JSONL trace at WorkerClient::call() — the single
+  funnel both binaries' panel RPCs pass through regardless of routing (Python worker,
+  in-process libaicad, ECAD/agent C++ seams); services/worker is linked by BOTH binaries
+  so one hook instruments both. Credential fields (api_key etc.) are redacted. Off by
+  default (tail call when env unset). Harnesses in `tools/gui_parity/` (common.py +
+  run_all.py): capture the same AI_CAD_SHOT scenario on both binaries, diff the
+  normalized domain request slice (engine-minted ids canonicalized; pure catalog reads
+  order-free; timings/paths scrubbed — scrub lists are explicit in the code), then for
+  gcode/DXF/PDF replay each binary's captured state-building requests through
+  mcp_server.core_bridge (same libaicad) and byte-diff the artifacts host-derived vs
+  aicad2-derived. Results (fresh captures, both binaries):
+    - gcode: requests PASS; all 8 post dialects byte-identical (centroid/fanuc/grbl/haas/
+      linuxcnc/mach3/marlin/siemens .nc)
+    - netlist+ERC: requests PASS; compile netlist+erc JSON identical
+    - DXF/PDF: 14/14 requests PASS; drawing.dxf 45598B and drawing.pdf 12898B byte-identical
+    - study: 15/15 requests + 14/14 responses (full solve JSON) identical
+    - sketch: 16/16 solver op-batch requests + 10/10 solver responses identical
+  Run: `python3 tools/gui_parity/run_all.py` (report at scratch/gui_parity/report.txt).
+
+  **REAL DIVERGENCES FOUND AND FIXED (the harnesses' whole point — all were AI-CAD2-side):**
+  1. cam scenario: nlohmann init-list misnesting serialized the Plate feature as an
+     array-of-pairs and silently dropped {centered:true}; host's Bores hole op was missing;
+     camLoadJob adoption never ran (no cam_tree/cam_generate — the "No setups yet" gap
+     deferred from G8). Fixed; cam shot now shows the full job tree + toolpath backplot.
+  2. sketch scenario: was a one-batch "simplified" flow exercising none of the solver
+     op-batch; ported host's incremental flow (per-op adds, enter, drag+commit, set_dim,
+     solve, exit, region extrude).
+  3. drawing scenario: pre-switched to Drafting at configure time so the panel self-created
+     the drawing from the startup demo doc (wrong source); same init-list bug on Plate/Hole;
+     host's detailing (model_items, hole callout, titleblock, critical toleranced dim,
+     drawing_make) missing. Fixed + added read-only scenario hooks to drawing_panel.
+  4. ecad scenario: called `ecad_orchestrate` — a method that DOES NOT EXIST in the engine —
+     so no schematic/netlist/ERC was ever produced. Ported host's ecadAiDesign flow
+     (ecad_design -> ecad_tree -> mirror adopt); shot now shows the real divider schematic
+     with ERC results.
+  5. **PANEL BUG (not scenario): the H4 SimManager port dropped captureSelectionInto() in
+     sim_fixture / sim_load_force / sim_load_pressure** — a viewport pre-selection was
+     silently ignored when adding fixtures/loads via ribbon command. Restored host behavior.
+     fea scenario also ported to host's SimManager flow (was raw sim_run_static with empty
+     fixtures/loads and a STEP path netgen couldn't read).
+
+  **P1:** `python3 scripts/check.py gui_lint theme` — icons clean, theme clean (0 findings
+  each). feature_surface_audit/parity_audit still FAIL against host — pre-existing, their
+  retarget is the G5 step.
+
+  **Write-set note (advisor FYI, work/questions/T-G9.md):** services/worker/worker_client.{h,cpp}
+  (trace hook) and ui/imgui/src/ui/sim_manager.cpp (dropped-capture fix) touched beyond the
+  listed write-set — both are the minimal seam for the mandated harness deliverable / a
+  host-parity regression the harness exposed.
+
+## HANDOFF (remaining, next session or human)
+
+- **P2 21-pair battery:** the harness runs regenerated + I eyeballed aicad2 drawing / cam /
+  ecad / fea / sketch / tree shots (all render correctly, dramatically better than the G8-era
+  captures for cam/ecad/drawing). The formal side-by-side 21-pair sign-off sheet + the
+  ~10-min manual interactive pass remain (human-eye per DoD).
+- **Step 3b / T-G12 convergence on the NEW binary:** human walkthrough — Erik. Blocks G5.
+- **G5 cutover:** retarget scripts/feature_surface_audit.py + scripts/parity_audit.py to
+  ui/imgui + ui/abstract (they still scan host ribbon_def), flip gate.sh primary, AGENTS.md +
+  host/DEPRECATED.md EOL notes. Do NOT start before the G12 walkthrough converges.
+- gate.sh + graphify update run at end of session 1 — see final progress note.

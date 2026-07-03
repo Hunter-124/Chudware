@@ -3,7 +3,7 @@ id: T-BL26
 title: ai-cad MCP freshness audit - server instructions, cad_guide topics, context injection vs shipped capabilities
 workstream: backlog
 owner: sonnet-loch
-status: doing
+status: review
 branch: task/T-BL26-mcp-freshness-audit
 depends_on: []
 lane: ai-copilot

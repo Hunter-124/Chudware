@@ -2,8 +2,8 @@
 id: T-BL22
 title: Wire dormant AI seams into the live loop - adapter routing/telemetry + regen_diagnose binding
 workstream: backlog
-owner: unassigned
-status: todo
+owner: fable-foreman
+status: doing
 branch: task/T-BL22-live-seam-wiring
 depends_on: []
 lane: ai-copilot

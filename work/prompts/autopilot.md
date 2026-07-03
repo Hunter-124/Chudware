@@ -7,6 +7,14 @@ Pick an agent name at start: `opus-<two short random syllables>` (e.g. opus-kata
 unless the user gave you one. Use it for every claim so other agents and humans can
 see who holds what.
 
+GIT IDENTITY IS NOT YOURS (Hunter, 2026-07-03, binding): NEVER run
+`git config user.name` / `user.email` — anywhere, ever. The machine-level git
+identity is the human's (Hunter-124 <haedmonds69@gmail.com>) and all commits are
+authored by him. Your agent name lives ONLY in task frontmatter, claim/note
+messages, and optionally a `Co-Authored-By:` trailer. Past sessions fabricated
+git identities ("sonnet-kier", "Erik Meeks") and poisoned 1,200+ commits — the
+human contact in any doc that says "Erik" is actually Hunter.
+
 ## The loop
 
 1. From the MAIN checkout, on master:

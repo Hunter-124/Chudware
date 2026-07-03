@@ -3,7 +3,7 @@ id: T-U7
 title: New-doc-kind viewers v1 — piping, hydraulic, structural
 workstream: U
 owner: sonnet-wrenn
-status: doing
+status: done
 branch: task/T-U7-ui
 day: 7
 priority: 4

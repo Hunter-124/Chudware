@@ -173,6 +173,16 @@ register_code_compliance_tools(mcp)
 # start/resume/inspect/gate DAG missions without a bespoke integration layer.
 from services.dag.mcp_tools import register_dag_tools
 register_dag_tools(mcp)
+# DAG replan (T-F12): dag_replan splices new nodes into a running checkpointed DAG run.
+# Validates end_condition + retry_budget on every spliced node (DoD enforcement), merges
+# into the persisted graph sidecar, and resumes via executor.resume().
+from services.dag.mcp_tools import register_dag_replan_tools
+register_dag_replan_tools(mcp)
+# Design review battery (T-F12): one-call battery dispatching through DISPATCH_TABLE
+# (verify.py) + battery._get_fn for feature_overlap/dfm.  Returns a narrated verdict
+# card per contracts/narration.md — never a raw JSON dump.
+from services.mcp.design_review_tools import register_design_review_tools
+register_design_review_tools(mcp)
 
 
 def _install_clean_stdout():

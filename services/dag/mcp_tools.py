@@ -437,3 +437,122 @@ def register_dag_tools(mcp) -> None:
                 "Inspect nodes for the gate that was rejected, then re-run with a corrected graph.",
             ],
         })
+
+
+def register_dag_replan_tools(mcp) -> None:
+    """Register the dag_replan MCP tool onto *mcp*.
+
+    Appended by T-F12 (append-only per server.py contract).
+    """
+
+    @mcp.tool()
+    def dag_replan(
+        run_id: str,
+        splice_nodes: list,
+        splice_edges: list,
+        after_node_id: str,
+        decision: str = "approve",
+        autonomy_default: str = "approve",
+    ) -> str:
+        """Splice new nodes into a running DAG run and resume execution.
+
+        Validates the splice (every spliced node must have end_condition + a back-edge
+        with retry_budget), merges the new nodes into the persisted graph sidecar,
+        then resumes the run via executor.resume().
+
+        Answered gate questions are NOT re-asked: the T-F4 ledger is stored in the
+        SqliteSaver checkpoint and replayed automatically on resume.
+
+        Args:
+            run_id:          UUID4 of the paused (or mid-run) DAG run to replan.
+            splice_nodes:    List of aicad.dag/1 node dicts to insert.
+                             Each MUST have: id, type, name, inputs, on_fail, autonomy,
+                             AND a non-empty end_condition.
+            splice_edges:    List of aicad.dag/1 edge dicts.
+                             MUST include at least one back-edge (edge with 'retry_budget')
+                             for EACH spliced node. May also include forward edges.
+            after_node_id:   Existing node id after which the splice is inserted.
+            decision:        Gate decision for resume — 'approve' (default) | 'reject'.
+            autonomy_default: Run-level autonomy floor for the resumed run.
+
+        Returns:
+            {ok, run_id, status, nodes, checkpoint_db, spliced_node_ids}
+            On validation failure: {ok: false, reason, hint}.
+        """
+        try:
+            from services.dag.replan import dag_replan as _replan, ReplannError
+            from services.dag.graph_loader import GraphValidationError
+            from services.dag import executor
+        except ImportError as exc:
+            return _err(f"dag_replan unavailable: {exc}",
+                        hint="Ensure services/dag is on PYTHONPATH.")
+
+        # Step 1: validate + merge splice
+        try:
+            merged_graph = _replan(
+                run_id=run_id,
+                splice_nodes=splice_nodes,
+                splice_edges=splice_edges,
+                after_node_id=after_node_id,
+            )
+        except FileNotFoundError as exc:
+            return _err(str(exc),
+                        hint="Verify run_id matches an existing run (from dag_run).")
+        except ReplannError as exc:
+            return _err(
+                f"Splice validation failed: {exc}",
+                hint=(
+                    "Every spliced node must have a non-empty 'end_condition' and "
+                    "at least one back-edge with 'retry_budget' in splice_edges."
+                ),
+            )
+        except GraphValidationError as exc:
+            return _err(
+                f"Merged graph failed aicad.dag/1 validation: {exc}",
+                hint="Fix the spliced nodes/edges to conform to the schema.",
+            )
+
+        # Step 2: resume with the merged graph
+        try:
+            result = executor.resume(
+                run_id,
+                graph_json=merged_graph,
+                decision=decision,
+                autonomy_default=autonomy_default,
+            )
+        except FileNotFoundError as exc:
+            return _err(str(exc),
+                        hint="Checkpoint DB missing — the run may have already completed.")
+        except Exception as exc:
+            return _err(f"Resume after replan failed: {exc}",
+                        hint="Check that the run is currently paused at a gate.")
+
+        spliced_ids = [n["id"] for n in splice_nodes]
+        interrupted = result.get("interrupted", [])
+        out: dict[str, Any] = {
+            "ok": True,
+            "run_id": result["run_id"],
+            "status": result.get("status", "unknown"),
+            "nodes": result.get("nodes", {}),
+            "checkpoint_db": result.get("checkpoint_db", ""),
+            "spliced_node_ids": spliced_ids,
+        }
+        if interrupted:
+            out["interrupted"] = interrupted
+            out["hint"] = (
+                "Replan applied and run is paused at a gate. "
+                "Call dag_approve to continue."
+            )
+            out["next_actions"] = [
+                f"dag_approve(run_id='{run_id}')",
+                f"dag_abort(run_id='{run_id}')",
+            ]
+        else:
+            out["hint"] = (
+                f"Replan applied. Run resumed and finished with "
+                f"status={result.get('status', 'unknown')!r}."
+            )
+            out["next_actions"] = [
+                f"dag_status(run_id='{run_id}')",
+            ]
+        return _dumps(out)

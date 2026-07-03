@@ -1,0 +1,68 @@
+{
+  "schema": "aicad.dag/1",
+  "id": "tmpl-design-simulate-iterate",
+  "name": "Design → Simulate → Iterate",
+  "nodes": [
+    {
+      "id": "n_design",
+      "type": "design",
+      "name": "Model part",
+      "inputs": {
+        "request": "Model the part per the brief.",
+        "tools": ["cad_guide", "new_part", "add_features", "render_part", "measure_part"]
+      },
+      "tools": ["cad_guide", "new_part", "add_features", "render_part", "measure_part"],
+      "end_condition": "Part geometry is complete and passes render self-review.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_simulate",
+      "type": "simulate",
+      "name": "Run FEA simulation",
+      "inputs": {
+        "request": "Run static FEA on the modelled part. Report factor of safety and max displacement.",
+        "tools": ["run_fea_static", "describe_results"]
+      },
+      "tools": ["run_fea_static", "describe_results"],
+      "end_condition": "FEA completed and factor of safety reported.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    },
+    {
+      "id": "n_verify_fea",
+      "type": "verify",
+      "name": "Structural DC-ratio check",
+      "inputs": {
+        "check_type": "dc_ratio"
+      },
+      "tools": null,
+      "end_condition": "All structural members have dc_ratio ≤ 1.0.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_iterate",
+      "type": "design",
+      "name": "Iterate design on findings",
+      "inputs": {
+        "request": "Update the part geometry based on simulation findings. Resolve any overstressed regions.",
+        "tools": ["add_features", "render_part", "measure_part"]
+      },
+      "tools": ["add_features", "render_part", "measure_part"],
+      "end_condition": "Design changes applied and part regenerated without errors.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    }
+  ],
+  "edges": [
+    {"from": "n_design",   "to": "n_simulate"},
+    {"from": "n_simulate", "to": "n_verify_fea"},
+    {"from": "n_verify_fea", "to": "n_iterate", "retry_budget": 2},
+    {"from": "n_iterate",  "to": "n_verify_fea"}
+  ]
+}

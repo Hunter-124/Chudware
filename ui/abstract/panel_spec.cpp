@@ -825,6 +825,216 @@ const PanelSpec* panelFormForCommand(const std::string& cmdId, std::string& mode
     return nullptr;
 }
 
+// ── T-U3 CAM operation specs (append-only past this line) ────────────────────
+// These are registered alongside the 44 CAD feature forms above. The featureType
+// strings match the cam_* operation type field (e.g. "face", "contour2d", "drill").
+// Panels are built from PanelSpec/PanelField the same way CAD forms are; the renderer
+// in ui/imgui/src/ui/property_manager.cpp reads any PanelSpec uniformly.
+// Heights group is shared across all milling ops; feeds group where relevant.
+
+static const std::vector<PanelSpec>& camOpSpecs() {
+    static const std::vector<PanelSpec> s = {
+        // ── face mill ──────────────────────────────────────────────────────
+        { "face", "Face", "",
+            {Dim ("stepover",     "Stepover",   "Feeds & Passes", 3.0),
+             Dim ("stepdown",     "Stepdown",   "Feeds & Passes", 1.0),
+             Dim ("stock_leave",  "Stock Leave","Feeds & Passes", 0.0),
+             Dim ("feed",         "Feed rate",  "Feeds & Passes", 800),
+             Dim ("rpm",          "Spindle RPM","Feeds & Passes", 8000),
+             Dim ("top",          "Top",        "Heights",  0.0),
+             Dim ("bottom",       "Bottom",     "Heights", -1.0),
+             Dim ("clearance",    "Clearance",  "Heights", 15.0),
+             Dim ("retract",      "Retract",    "Heights",  5.0),
+            }},
+        // ── contour 2D ────────────────────────────────────────────────────
+        {"contour2d", "Contour", "",
+            {Dim ("stepdown",     "Stepdown",   "Feeds & Passes", 2.0),
+             Dim ("stock_leave",  "Stock Leave","Feeds & Passes", 0.0),
+             Check("climb",       "Climb cut",  "Feeds & Passes", true),
+             Dim ("feed",         "Feed rate",  "Feeds & Passes", 600),
+             Dim ("rpm",          "Spindle RPM","Feeds & Passes", 8000),
+             Dim ("top",          "Top",        "Heights",  0.0),
+             Dim ("bottom",       "Bottom",     "Heights", -5.0),
+             Dim ("clearance",    "Clearance",  "Heights", 15.0),
+             Dim ("retract",      "Retract",    "Heights",  5.0),
+            }},
+        // ── pocket 2D ─────────────────────────────────────────────────────
+        {"pocket2d", "Pocket", "",
+            {Dim ("stepover",     "Stepover",   "Feeds & Passes", 3.0),
+             Dim ("stepdown",     "Stepdown",   "Feeds & Passes", 2.0),
+             Dim ("stock_leave",  "Stock Leave","Feeds & Passes", 0.0),
+             Check("climb",       "Climb cut",  "Feeds & Passes", true),
+             Dim ("feed",         "Feed rate",  "Feeds & Passes", 600),
+             Dim ("rpm",          "Spindle RPM","Feeds & Passes", 8000),
+             Dim ("top",          "Top",        "Heights",  0.0),
+             Dim ("bottom",       "Bottom",     "Heights", -5.0),
+             Dim ("clearance",    "Clearance",  "Heights", 15.0),
+             Dim ("retract",      "Retract",    "Heights",  5.0),
+            }},
+        // ── adaptive 2D (engagement-limited) ──────────────────────────────
+        {"adaptive2d", "Adaptive Clearing", "",
+            {Dim ("stepover",     "Stepover",   "Feeds & Passes", 1.5),
+             Dim ("stepdown",     "Stepdown",   "Feeds & Passes", 5.0),
+             Dim ("stock_leave",  "Stock Leave","Feeds & Passes", 0.3),
+             Check("arc_blend_linking","Arc-blend linking","Feeds & Passes", true),
+             Dim ("feed",         "Feed rate",  "Feeds & Passes", 800),
+             Dim ("rpm",          "Spindle RPM","Feeds & Passes", 10000),
+             Dim ("top",          "Top",        "Heights",  0.0),
+             Dim ("bottom",       "Bottom",     "Heights", -5.0),
+             Dim ("clearance",    "Clearance",  "Heights", 15.0),
+             Dim ("retract",      "Retract",    "Heights",  5.0),
+            }},
+        // ── slot ──────────────────────────────────────────────────────────
+        {"slot", "Slot", "",
+            {Dim ("stepdown",     "Stepdown",   "Feeds & Passes", 2.0),
+             Dim ("stock_leave",  "Stock Leave","Feeds & Passes", 0.0),
+             Dim ("feed",         "Feed rate",  "Feeds & Passes", 400),
+             Dim ("rpm",          "Spindle RPM","Feeds & Passes", 8000),
+             Dim ("top",          "Top",        "Heights",  0.0),
+             Dim ("bottom",       "Bottom",     "Heights", -5.0),
+             Dim ("clearance",    "Clearance",  "Heights", 15.0),
+             Dim ("retract",      "Retract",    "Heights",  5.0),
+            }},
+        // ── chamfer 2D ────────────────────────────────────────────────────
+        {"chamfer2d", "Chamfer", "",
+            {Dim ("chamfer_width","Width",       "Passes",  1.0),
+             Dim ("stock_leave",  "Stock Leave", "Passes",  0.0),
+             Dim ("feed",         "Feed rate",   "Passes",  300),
+             Dim ("rpm",          "Spindle RPM", "Passes",  8000),
+             Dim ("clearance",    "Clearance",   "Heights", 15.0),
+             Dim ("retract",      "Retract",     "Heights",  5.0),
+            }},
+        // ── engrave ───────────────────────────────────────────────────────
+        {"engrave", "Engrave", "",
+            {Dim ("depth",        "Depth",       "Passes",  0.2),
+             Dim ("feed",         "Feed rate",   "Passes",  200),
+             Dim ("rpm",          "Spindle RPM", "Passes",  12000),
+             Dim ("clearance",    "Clearance",   "Heights", 10.0),
+             Dim ("retract",      "Retract",     "Heights",  3.0),
+            }},
+        // ── drill ─────────────────────────────────────────────────────────
+        {"drill", "Drill", "",
+            {ComboL("cycle",      "Canned cycle","Options",
+                   "drill|peck|chip_break|bore|tap",
+                   "Drill|Peck|Chip Break|Bore|Tap"),
+             Dim ("peck_depth",   "Peck depth",  "Options",  2.0),
+             Dim ("dwell_ms",     "Dwell (ms)",  "Options",  0.0),
+             Dim ("feed",         "Feed rate",   "Feeds",   200),
+             Dim ("rpm",          "Spindle RPM", "Feeds",   3000),
+             Dim ("clearance",    "Clearance",   "Heights", 10.0),
+             Dim ("retract",      "Retract",     "Heights",  5.0),
+            }},
+        // ── thread mill ───────────────────────────────────────────────────
+        {"thread_mill", "Thread Mill", "",
+            {Dim ("pitch",        "Thread pitch","Options",  1.0),
+             Dim ("lead_in_r",    "Lead-in R",   "Options",  2.0),
+             Dim ("feed",         "Feed rate",   "Feeds",   150),
+             Dim ("rpm",          "Spindle RPM", "Feeds",   3000),
+             Dim ("clearance",    "Clearance",   "Heights", 10.0),
+             Dim ("retract",      "Retract",     "Heights",  5.0),
+            }},
+        // ── 3D parallel (waterline finish) ────────────────────────────────
+        {"parallel3d", "Parallel 3D", "",
+            {Dim ("stepover",     "Stepover",    "Passes",   0.5),
+             Dim ("angle_deg",    "Pass angle",  "Passes",   0.0),
+             Check("arc_blend_linking","Arc-blend linking","Passes", true),
+             Dim ("feed",         "Feed rate",   "Feeds",   500),
+             Dim ("rpm",          "Spindle RPM", "Feeds",   12000),
+             Dim ("clearance",    "Clearance",   "Heights", 15.0),
+             Dim ("retract",      "Retract",     "Heights",  5.0),
+            }},
+        // ── contour 3D (Z-level / waterline) ──────────────────────────────
+        {"contour3d", "Contour 3D", "",
+            {Dim ("stepdown",     "Stepdown",    "Passes",   1.0),
+             Check("arc_blend_linking","Arc-blend linking","Passes", true),
+             Dim ("feed",         "Feed rate",   "Feeds",   500),
+             Dim ("rpm",          "Spindle RPM", "Feeds",   12000),
+             Dim ("clearance",    "Clearance",   "Heights", 15.0),
+             Dim ("retract",      "Retract",     "Heights",  5.0),
+            }},
+        // ── scallop 3D ────────────────────────────────────────────────────
+        {"scallop3d", "Scallop 3D", "",
+            {Dim ("stepover",     "Stepover",    "Passes",   0.5),
+             Dim ("feed",         "Feed rate",   "Feeds",   500),
+             Dim ("rpm",          "Spindle RPM", "Feeds",   12000),
+             Dim ("clearance",    "Clearance",   "Heights", 15.0),
+            }},
+        // ── pocket 3D (waterline roughing) ────────────────────────────────
+        {"pocket3d", "Pocket 3D", "",
+            {Dim ("stepover",     "Stepover",    "Passes",   2.0),
+             Dim ("stepdown",     "Stepdown",    "Passes",   2.0),
+             Check("arc_blend_linking","Arc-blend linking","Passes", true),
+             Dim ("stock_leave",  "Stock Leave", "Passes",   0.3),
+             Dim ("feed",         "Feed rate",   "Feeds",   600),
+             Dim ("rpm",          "Spindle RPM", "Feeds",   10000),
+             Dim ("clearance",    "Clearance",   "Heights", 15.0),
+            }},
+        // ── adaptive clear 3D ─────────────────────────────────────────────
+        {"adaptive_clear3d", "Adaptive Clear 3D", "",
+            {Dim ("stepover",     "Stepover",    "Passes",   1.5),
+             Dim ("stepdown",     "Stepdown",    "Passes",   5.0),
+             Dim ("stock_leave",  "Stock Leave", "Passes",   0.3),
+             Check("arc_blend_linking","Arc-blend linking","Passes", true),
+             Dim ("feed",         "Feed rate",   "Feeds",   800),
+             Dim ("rpm",          "Spindle RPM", "Feeds",   10000),
+             Dim ("clearance",    "Clearance",   "Heights", 15.0),
+            }},
+        // ── turning — rough ───────────────────────────────────────────────
+        {"turn_rough", "Turn Rough", "",
+            {Dim ("depth_of_cut", "Depth of cut","Passes",   2.0),
+             Dim ("stock_leave",  "Stock Leave", "Passes",   0.3),
+             Dim ("feed",         "Feed (mm/rev)","Feeds",   0.3),
+             Dim ("rpm",          "Spindle RPM", "Feeds",   1000),
+            }},
+        // ── turning — finish ──────────────────────────────────────────────
+        {"turn_finish", "Turn Finish", "",
+            {Dim ("stock_leave",  "Stock Leave", "Passes",   0.0),
+             Dim ("feed",         "Feed (mm/rev)","Feeds",   0.1),
+             Dim ("rpm",          "Spindle RPM", "Feeds",   2000),
+            }},
+        // ── turning — face ────────────────────────────────────────────────
+        {"turn_face", "Turn Face", "",
+            {Dim ("depth_of_cut", "Depth of cut","Passes",   1.0),
+             Dim ("feed",         "Feed (mm/rev)","Feeds",   0.2),
+             Dim ("rpm",          "Spindle RPM", "Feeds",   1200),
+            }},
+        // ── turning — groove ──────────────────────────────────────────────
+        {"turn_groove", "Turn Groove", "",
+            {Dim ("width",        "Groove width","Passes",   3.0),
+             Dim ("depth",        "Depth",       "Passes",   2.0),
+             Dim ("feed",         "Feed (mm/rev)","Feeds",   0.05),
+             Dim ("rpm",          "Spindle RPM", "Feeds",   800),
+            }},
+        // ── turning — part/cut-off ────────────────────────────────────────
+        {"turn_part", "Turn Part", "",
+            {Dim ("feed",         "Feed (mm/rev)","Feeds",   0.03),
+             Dim ("rpm",          "Spindle RPM", "Feeds",   600),
+            }},
+        // ── 2D cut (laser / waterjet) ─────────────────────────────────────
+        {"cut2d", "Cut 2D", "",
+            {Dim ("kerf",         "Kerf width",  "Options",  0.2),
+             Dim ("lead_in_r",    "Lead-in R",   "Options",  2.0),
+             Dim ("feed",         "Feed rate",   "Feeds",   3000),
+             Dim ("clearance",    "Clearance",   "Heights",  5.0),
+            }},
+        // ── probe ─────────────────────────────────────────────────────────
+        {"probe", "Probe", "",
+            {ComboL("probe_type", "Probe type",  "Options",
+                   "wcs_set|surface_inspect|bore_center|boss_center",
+                   "Set WCS|Surface Inspect|Bore Center|Boss Center"),
+             Dim ("feed",         "Probe feed",  "Feeds",   200),
+             Dim ("clearance",    "Clearance",   "Heights", 10.0),
+            }},
+    };
+    return s;
+}
+
+// Allow cam_panel + any other caller to look up a CAM op spec by type string.
+const PanelSpec* findCamOpSpec(const char* opType) {
+    for (const auto& s : camOpSpecs())
+        if (std::strcmp(s.featureType, opType) == 0) return &s;
+    return nullptr;
+}
 
 
 }  // namespace aicad::ui

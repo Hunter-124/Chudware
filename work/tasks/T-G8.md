@@ -47,3 +47,6 @@ anti-spaghetti guarantee that behavior survived the port.
   Sketch ribbon tab (`sketch_exit`/`sketch_cancel`), overlays dodge columns via
   `overlayColumnEdge(0/1)`.
 - `AI_CAD_SHOT=flow` needs a ~240s timeout.
+
+## Progress log
+- 2026-07-02 23:54 UTC [opus-sky] WIP branch pushed. Done: H1 CAM (e158e31), H3 drawing (17a7844) — both build green, shots verified via the merged T-G13 fix. H2 ECAD in progress. Remaining: H4 sim, H5 sketch-split, diff harnesses (G-code/netlist/DXF/study), G4 gate. Orchestration plan + per-node handoff in the task file. Flagged a probable engine doc-id-resolution bug (scenario doc2 stays empty) to Fable.

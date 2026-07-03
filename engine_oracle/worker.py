@@ -197,6 +197,35 @@ except Exception as _deliv_import_err:  # noqa: BLE001
         _deliv_import_err)
 # === end Deliverables ===
 
+# === Parts library seam (T-U2, Pillar 17) — part_search / part_get / part_place ===
+# Reaches the unified parts hub (engine_oracle/parts_hub/) over the same worker seam so the
+# C++/ImGui parts browser panel (ui/imgui/src/ui/parts_panel.cpp) fetches results
+# asynchronously via AsyncRpc with no bespoke transport.  Degrades gracefully when the hub
+# or its backing data is unavailable (returns empty results, never a traceback).
+try:
+    from engine_oracle.parts_hub.worker_rpc import WORKER_METHODS as _PARTS_METHODS  # noqa: E402
+    _METHODS.update(_PARTS_METHODS)
+except Exception as _parts_import_err:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger("ai-cad.worker").warning(
+        "engine_oracle.parts_hub.worker_rpc unavailable — part_search/get/place not registered: %s",
+        _parts_import_err)
+# === end Parts library ===
+# === BOM / sourcing seam (T-U4) — bom_rollup / bom_price / request_quote / match_part_number ===
+# Thin wrappers over engine.bom + engine.quote_providers + engine_oracle.spec_sheet_matcher,
+# exposed over the worker seam so the BOM panel (ui/imgui/src/ui/bom_panel.cpp) reaches them
+# via AsyncRpc with no bespoke transport.  Gracefully absent when the engine.bom module is not
+# yet provisioned (e.g. CI without the ML track) — the panel degrades to an error state.
+try:
+    from engine_oracle.sourcing_worker_rpc import WORKER_METHODS as _SOURCING_METHODS  # noqa: E402
+    _METHODS.update(_SOURCING_METHODS)
+except Exception as _sourcing_import_err:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger("ai-cad.worker").warning(
+        "engine_oracle.sourcing_worker_rpc unavailable — bom_price/bom_rollup/request_quote"
+        "/match_part_number not registered: %s", _sourcing_import_err)
+# === end BOM / sourcing ===
+
 
 def _emit(obj: dict) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")

@@ -252,6 +252,18 @@ def cmd_claim(tasks, errors, args):
         return 1
     lock = _lock()
     try:
+        # Refuse to touch the main checkout while a merge/rebase is in progress or
+        # the tree has uncommitted tracked changes — this pull --rebase once began
+        # rebasing a foreman merge session mid-resolution (2026-07-03 near-miss;
+        # same class as the opus-dawn 211-commit incident).
+        gitdir = main / ".git"
+        busy = any((gitdir / m).exists() for m in ("MERGE_HEAD", "rebase-merge", "rebase-apply"))
+        dirty = bool(_git(["status", "--porcelain", "--untracked-files=no"], main).stdout.strip())
+        if busy or dirty:
+            print("BUSY: main checkout has a merge/rebase in progress or uncommitted "
+                  "changes (likely a foreman merge session) — retry claim in ~60s",
+                  file=sys.stderr)
+            return 3
         has_remote = bool(_git(["remote"], main).stdout.strip())
         if has_remote:
             _git(["pull", "--rebase", "--autostash"], main)

@@ -23,14 +23,19 @@ from pathlib import Path
 
 from engine import paths
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent
 REQUIREMENTS = REPO / "requirements.txt"
 APP_PACKAGES = ("engine", "mcp_server", "agent", "installer")
 STAMP = paths.RUNTIME / ".ready.json"
 
 
 def _venv_python() -> Path:
-    return paths.RUNTIME / "venv" / "Scripts" / "python.exe"
+    # Mirrors bootstrap.cpp's runtimePython() layout exactly (both must agree on where the
+    # managed venv's interpreter lives, or the C++ readiness check and this provisioner
+    # disagree on Linux): Scripts/python.exe on Windows, bin/python everywhere else.
+    if sys.platform == "win32":
+        return paths.RUNTIME / "venv" / "Scripts" / "python.exe"
+    return paths.RUNTIME / "venv" / "bin" / "python"
 
 
 def _req_hash() -> str:
@@ -150,10 +155,15 @@ def ensure_runtime(base_python: str | None = None, wheelhouse: Path | None = Non
 
 
 def _find_base_python() -> str:
-    for cand in ("py -3.11", sys.executable):
-        exe = cand.split()[0]
+    # The pinned requirements.txt wheels (build123d et al.) target Python 3.11 specifically;
+    # sys.executable may be a newer interpreter the OS ships as the default `python3` (verified
+    # live: a box with python3 -> 3.14 as default but python3.11 also installed failed to
+    # resolve any pinned wheel until python3.11 was tried explicitly). Prefer 3.11 if present,
+    # falling back to whatever is running this script.
+    candidates = ["py", sys.executable] if sys.platform == "win32" else ["python3.11", sys.executable]
+    for exe in candidates:
         if shutil.which(exe) or Path(exe).exists():
-            return cand if " " not in cand else exe  # callers pass list; simplify
+            return exe
     return sys.executable
 
 

@@ -10,6 +10,10 @@
 #include "ui/settings_modal.h"
 #include "ui/preview_pane.h"
 #include "ui/scaffold_demo_panel.h"
+#include "ui/parts_panel.h"
+#include "ui/cam_panel.h"          // T-U3 CAM workspace
+#include "ui/first_run.h"
+#include "ui/bom_panel.h"
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -187,6 +191,22 @@ void Application::frame() {
         ImGui::End();
     }
 
+    // T-U3 CAM workspace panel: closable, reveals when a cam_* ribbon command fires or
+    // camWorkspaceLoadJob() is called (e.g. from the copilot fast-path). Floats centered on
+    // first open (ImGuiCond_Appearing) so it surfaces over the viewport; zero footprint when closed.
+    // AI_CAD_SHOT=cam_workspace exercises the populated job / sim / post state.
+    if (*ui::camWorkspacePanelOpen()) {
+        const ImGuiViewport* camVp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(camVp->WorkPos.x + camVp->WorkSize.x * 0.5f,
+                                      camVp->WorkPos.y + camVp->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(820.f * theme::S(), 560.f * theme::S()),
+                                 ImGuiCond_Appearing);
+        if (ImGui::Begin("CAM Workspace###cam_workspace", ui::camWorkspacePanelOpen(), pflags))
+            ui::drawCamWorkspacePanel(s);
+        ImGui::End();
+    }
+
     // T-U1 kit demo: closable, proves panel_scaffold.h compiles/renders/screenshots
     // (AI_CAD_SHOT=scaffold_demo). Zero footprint while closed. Not dock-registered (it is a
     // kit demo, not a shipped feature) — floats centered so it doesn't overlap ribbon/tree chrome
@@ -201,10 +221,42 @@ void Application::frame() {
             ui::drawScaffoldDemoPanel(s);
         ImGui::End();
     }
+
+    // T-U2 Parts Browser: closable panel built on panel_scaffold.h (T-U1 kit).
+    // Federated search across all part domains; detail card + insert via part_place (Pillar 17).
+    // Screenshot-verifiable via AI_CAD_SHOT=parts_browser (worker one-shot).
+    // Zero footprint while closed — same convention as drawScaffoldDemoPanel / drawPreviewPane.
+    if (*ui::partsPanelOpen()) {
+        const ImGuiViewport* vp = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
+                                        vp->WorkPos.y + vp->WorkSize.y * 0.5f),
+                                 ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(520.f * theme::S(), 680.f * theme::S()), ImGuiCond_Appearing);
+        if (ImGui::Begin("Parts Browser###parts_browser", ui::partsPanelOpen(), pflags))
+            ui::drawPartsPanel(s);
+        ImGui::End();
+    }
+    // T-U4 BOM & sourcing panel — closable, screenshot-verifiable via AI_CAD_SHOT=bom.
+    // Floats centered (same positioning as scaffold_demo) so it doesn't overlap ribbon/tree chrome.
+    // Zero footprint while closed.
+    if (*ui::bomPanelOpen()) {
+        const ImGuiViewport* vp2 = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp2->WorkPos.x + vp2->WorkSize.x * 0.5f,
+                                       vp2->WorkPos.y + vp2->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(680.f * theme::S(), 480.f * theme::S()),
+                                 ImGuiCond_Appearing);
+        if (ImGui::Begin("BOM & Sourcing###bom", ui::bomPanelOpen(), pflags))
+            ui::drawBomPanel(s);
+        ImGui::End();
+    }
+
     ImGui::PopStyleColor();
 
     if (s.paletteOpen) ui::drawCommandPalette(s);
 
+    ui::maybeOpenFirstRun(s);
+    ui::drawFirstRunDialog(s);
     ui::drawSettingsModal(s, false);
     ui::drawProfilerWindow(s);
     ui::drawCommandSearch(s);

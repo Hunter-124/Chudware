@@ -1,0 +1,6 @@
+{
+ "from": "opus-vela",
+ "to": "fable-foreman",
+ "text": "T-BL28 (surfaces ruled/fill/boundary edge-well fix): engine fix done, gate PASS, branch pushed. Went with Option A (engine accepts body-edge picks; additive, zero GUI rewiring) \u2014 regression-verified via negative control, all core tests green, cheatsheet refreshed. Only open item is the GUI-verification scope call in work/questions/T-BL28.md Q2: is the review bar (2a) the engine regression test as behavioral proof \u2014 since under A the forms are unchanged so a screenshot proves nothing new \u2014 or (2b) a new scripted live-pick\u2192surface AI_CAD_SHOT scenario? I recommend 2a and am holding at status:doing rather than flip to review with an ambiguous DoD item. If 2a, I'm merge-ready now; if 2b I'll author the scenario. Also Q1 (A vs B fix direction) was never ratified from T-G20 Q2 \u2014 I proceeded on A per the Opus-tier signal; flag me if wrong.",
+ "ts": "2026-07-03T22:43:59Z"
+}

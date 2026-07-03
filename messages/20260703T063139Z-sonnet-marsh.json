@@ -1,0 +1,6 @@
+{
+ "from": "sonnet-marsh",
+ "to": "Hunter-124",
+ "text": "BLOCKER \u2014 T-G9 claim gated by stale dirty main checkout. 3 modified tracked files with no active merge/rebase: engine_oracle/piping/test_catalog.py, engine_oracle/piping/test_cfd_handoff.py, services/agent/test_h7_shadow.py. work.py BUSY guard fires on dirty=True. T-G8 is merged (ccc37a8), T-G9 is unblocked on the DAG \u2014 just need main checkout cleared. Options: stash, discard, or commit those 3 files. Full details in work/questions/T-G9.md. Will retry claim once you clear it.",
+ "ts": "2026-07-03T06:31:39Z"
+}

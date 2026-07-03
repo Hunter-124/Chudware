@@ -39,3 +39,29 @@ and T-G9 work can begin.
 
 Waiting on foreman/human to clear main checkout. T-G9 is unblocked on the
 task-graph side (T-G8 merged at ccc37a8).
+
+---
+
+## Write-set extension note (sonnet-marsh, 2026-07-03, FYI — proceeding, flag if wrong)
+
+The claim-time blocker above was resolved by the foreman (stale stash discarded). During
+execution I touched two files outside the listed write-set; both feel within the spirit of
+the foreman scope additions but are recorded here for advisor review:
+
+1. `services/worker/worker_client.{h,cpp}` — added the env-gated `AI_CAD_RPC_TRACE` JSONL
+   trace wrapper at `WorkerClient::call()` (+ credential redaction). RATIONALE: the mandated
+   parity harnesses need to observe the RPC stream each binary drives; `call()` is the single
+   funnel covering ALL routing (Python worker subprocess, in-process libaicad doc/CAM,
+   ECAD/agent C++ seams), and services/worker is linked by both binaries, so one off-by-default
+   hook instruments both without touching host/src. When the env var is unset (all production
+   paths) the wrapper is a tail call.
+   ALTERNATIVE CONSIDERED: an AI_CAD_PYTHON stdio shim — rejected because doc-cpp/CAM/ECAD
+   calls route in-process to libaicad and never cross the subprocess boundary.
+
+2. `ui/imgui/src/ui/sim_manager.cpp` — restored host's `captureSelectionInto()` in the
+   sim_fixture / sim_load_force / sim_load_pressure command branches. RATIONALE: real
+   host-parity regression exposed by the study harness (viewport pre-selection silently
+   ignored); three-line-per-branch restoration of ported-but-unused code already in the file.
+
+Recommended answer: accept both (harness infra + regression fix). If the trace hook should
+live elsewhere (e.g. a dispatcher decorator), happy to move it in a follow-up.

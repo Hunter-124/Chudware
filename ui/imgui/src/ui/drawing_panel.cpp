@@ -45,6 +45,7 @@
 
 #include "app/app_state.h"
 #include "theme/theme.h"
+#include "theme/domain_tokens.h"
 #include "ui/toast.h"
 #include "ui/console_panel.h"
 #include "ui/property_manager.h"   // pmFormatDim — dimension text follows MMGS/IPS like the rest of the UI
@@ -748,6 +749,11 @@ static void createDrawingFromActive(app::AppState& st, DrawingUI& tab) {
     ui::postToast(ui::ToastLevel::Info, "Drawing created with " + std::to_string(added) + " views");
 }
 
+// --- T-G9 scenario/parity hooks (see drawing_panel.h) -----------------------------------------
+std::string drawingActiveDocId() { return g_dwg.drawingDocId; }
+nlohmann::json drawingActiveDoc() { return g_dwg.drawingDoc; }
+void drawingRefreshActive(app::AppState& st) { refreshDrawing(st, g_dwg); }
+
 bool drawingHandleCommand(app::AppState& st, const std::string& cmd) {
     DrawingUI& tab = g_dwg;
     if (tab.drawingDocId.empty()) {
@@ -843,9 +849,9 @@ static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
     bool haveA = rdvec("a", ax, ay), haveB = rdvec("b", bx, by), haveP = rdvec("pos", px, py);
 
     // Critical dims pop red + heavier; selected = orange; otherwise drawing-blue ink.
-    const ImU32 dimCol = critical ? IM_COL32(200, 40, 40, 255)
-                       : selected  ? IM_COL32(220, 120, 30, 255)
-                                   : IM_COL32(40, 90, 180, 255);
+    const ImU32 dimCol = critical ? theme::draw2d::dimCritical()
+                       : selected  ? theme::draw2d::dimSelected()
+                                   : theme::draw2d::dimInk();
     const float thick = std::max(1.0f, (critical ? 1.6f : 1.0f) * s);
 
     std::string txt = djstr(ann, "text");
@@ -853,11 +859,11 @@ static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
         if (t.empty()) return;
         ImVec2 ts = ImGui::CalcTextSize(t.c_str());
         dl->AddRectFilled(ImVec2(tp.x - 2, tp.y - 1), ImVec2(tp.x + ts.x + 2, tp.y + ts.y + 1),
-                          IM_COL32(255, 255, 255, 220), 2.0f);
+                          theme::draw2d::labelPad(), 2.0f);
         dl->AddText(tp, dimCol, t.c_str());
     };
     auto criticalFlag = [&](ImVec2 at) {
-        if (critical) dl->AddText(ImVec2(at.x - 10 * s, at.y - 1), IM_COL32(200, 40, 40, 255), "!");
+        if (critical) dl->AddText(ImVec2(at.x - 10 * s, at.y - 1), theme::draw2d::dimCritical(), "!");
     };
 
     // --- center mark: a small cross at the circle center ---
@@ -896,7 +902,7 @@ static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
                 dl->AddLine(A, P, dimCol, thick);
                 dl->AddCircleFilled(A, 2.0f * s, dimCol);
             }
-            dl->AddCircleFilled(P, r, IM_COL32(255, 255, 255, 235));
+            dl->AddCircleFilled(P, r, theme::draw2d::fillWhite());
             dl->AddCircle(P, r, dimCol, 24, thick);
             if (txt.empty()) {
                 int it = (int)djnum(ann, "item", 0);
@@ -997,7 +1003,7 @@ static void renderDimension(ImDrawList* dl, const nlohmann::json& ann, bool ips,
     ImVec2 mid((A2.x + B2.x) * 0.5f, (A2.y + B2.y) * 0.5f);
     ImVec2 tp(mid.x - ts.x * 0.5f, mid.y - ts.y - 2 * s);
     dl->AddRectFilled(ImVec2(tp.x - 2, tp.y - 1), ImVec2(tp.x + ts.x + 2, tp.y + ts.y + 1),
-                      IM_COL32(255, 255, 255, 220), 2.0f);
+                      theme::draw2d::labelPad(), 2.0f);
     dl->AddText(tp, dimCol, txt.c_str());
     criticalFlag(ImVec2(tp.x, tp.y));
 }
@@ -1013,9 +1019,9 @@ static void renderDrawPrimitives(ImDrawList* dl, const nlohmann::json& ann,
     if (it == ann.end() || !it->is_object()) return;
     const nlohmann::json& d = *it;
     const bool critical = ann.value("critical", false);
-    const ImU32 col = critical ? IM_COL32(200, 40, 40, 255)
-                    : selected  ? IM_COL32(220, 120, 30, 255)
-                                : IM_COL32(40, 90, 180, 255);
+    const ImU32 col = critical ? theme::draw2d::dimCritical()
+                    : selected  ? theme::draw2d::dimSelected()
+                                : theme::draw2d::dimInk();
     const float thick = std::max(1.0f, (critical ? 1.6f : 1.0f) * s);
 
     auto strokePoly = [&](const nlohmann::json& pl, bool dashed) {
@@ -1080,7 +1086,7 @@ static void renderDrawPrimitives(ImDrawList* dl, const nlohmann::json& ann,
             else if (valign == "mid") ty -= fpx * 0.5f;
             // a faint white pad behind the glyphs for legibility over geometry
             dl->AddRectFilled(ImVec2(tx - 1, ty), ImVec2(tx + w + 1, ty + fpx),
-                              IM_COL32(255, 255, 255, 200), 1.0f);
+                              theme::draw2d::textPad(), 1.0f);
             dl->AddText(font, fpx, ImVec2(tx, ty), col, txt.c_str());
         }
     }
@@ -1128,8 +1134,8 @@ static void renderTitleBlock(ImDrawList* dl, const nlohmann::json& sheet,
     const double rx = paperW - margin, by = margin;     // bottom-right corner, inside the trim
     const double lx = rx - bw, ty = by + bh;
     ImVec2 tl = toScreen(lx, ty), br = toScreen(rx, by);
-    const ImU32 ink = IM_COL32(40, 44, 52, 255), line = IM_COL32(60, 64, 74, 255);
-    dl->AddRectFilled(tl, br, IM_COL32(255, 255, 255, 235));
+    const ImU32 ink = theme::draw2d::inkTitle(), line = theme::draw2d::paperBorder();
+    dl->AddRectFilled(tl, br, theme::draw2d::fillWhite());
     dl->AddRect(tl, br, line, 0.0f, 0, 1.4f * s);
     // Two horizontal dividers -> 3 rows: title, drawn/date, scale/rev/sheet + material.
     float h = br.y - tl.y, w = br.x - tl.x;
@@ -1137,7 +1143,7 @@ static void renderTitleBlock(ImDrawList* dl, const nlohmann::json& sheet,
     dl->AddLine(ImVec2(tl.x, r1), ImVec2(br.x, r1), line, 1.0f * s);
     dl->AddLine(ImVec2(tl.x, r2), ImVec2(br.x, r2), line, 1.0f * s);
     auto label = [&](float x, float y, const char* k, const std::string& val) {
-        dl->AddText(ImVec2(x + 3 * s, y + 1 * s), IM_COL32(120, 126, 138, 255), k);
+        dl->AddText(ImVec2(x + 3 * s, y + 1 * s), theme::draw2d::mutedLabel(), k);
         dl->AddText(ImVec2(x + 3 * s, y + ImGui::GetTextLineHeight() * 0.6f + 2 * s), ink,
                     val.c_str());
     };
@@ -1531,7 +1537,7 @@ void drawDrawingSheet(app::AppState& st) {
     // ---- compact status strip (a future ribbon owns Rebuild/Fit/Export/Views/Dimensions once
     // dwg_* ribbon wiring lands — see drawing_panel.h; this strip echoes the active tool's current
     // click-stage + the canvas hotkeys in the meantime) ----
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.63f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::draw2d::statusIdle());
     ImGui::TextUnformatted("Drawing");
     ImGui::PopStyleColor();
     ImGui::SameLine();
@@ -1557,13 +1563,13 @@ void drawDrawingSheet(app::AppState& st) {
         else if (tab.balloonActive)     stageMsg = "Balloon: click to drop an item bubble";
 
         if (stageMsg) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.86f, 0.55f, 0.20f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::draw2d::statusArmed());
             ImGui::TextUnformatted(stageMsg);
             ImGui::PopStyleColor();
             ImGui::SameLine();
             if (ImGui::SmallButton("Done")) disarmDrawTools(tab);
         } else {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.58f, 0.63f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::draw2d::statusIdle());
             ImGui::TextUnformatted("double-click a dim to edit  |  drag to reposition  |  "
                                    "wheel zoom  |  MMB / Space+drag pan  |  Del removes");
             ImGui::PopStyleColor();
@@ -1588,7 +1594,7 @@ void drawDrawingSheet(app::AppState& st) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->PushClipRect(canvasMin, canvasMax, true);
     // Canvas backdrop (a touch darker than the panel so the white paper reads as paper).
-    dl->AddRectFilled(canvasMin, canvasMax, IM_COL32(30, 32, 38, 255));
+    dl->AddRectFilled(canvasMin, canvasMax, theme::draw2d::canvasBackdrop());
 
     // The active sheet: first sheet of the cached drawing_get (the engine makes one A3 sheet "s1").
     const nlohmann::json* sheet = nullptr;
@@ -1602,7 +1608,7 @@ void drawDrawingSheet(app::AppState& st) {
         ImVec2 ts = ImGui::CalcTextSize(msg);
         dl->AddText(ImVec2((canvasMin.x + canvasMax.x) * 0.5f - ts.x * 0.5f,
                            (canvasMin.y + canvasMax.y) * 0.5f - ts.y * 0.5f),
-                    IM_COL32(150, 154, 164, 255), msg);
+                    theme::draw2d::emptyMsg(), msg);
         dl->PopClipRect();
         return;
     }
@@ -1681,20 +1687,20 @@ void drawDrawingSheet(app::AppState& st) {
         ImVec2 p0 = toScreen(0, paperH);          // top-left of paper in screen (maxY -> top)
         ImVec2 p1 = toScreen(paperW, 0);          // bottom-right
         ImVec2 sh0(p0.x + 4 * s, p0.y + 4 * s), sh1(p1.x + 4 * s, p1.y + 4 * s);
-        dl->AddRectFilled(sh0, sh1, IM_COL32(0, 0, 0, 60), 0.0f);
-        dl->AddRectFilled(p0, p1, IM_COL32(252, 252, 250, 255), 0.0f);  // paper is always white
-        dl->AddRect(p0, p1, IM_COL32(60, 64, 74, 255), 0.0f, 0, 1.4f * s);
+        dl->AddRectFilled(sh0, sh1, theme::draw2d::paperShadow(), 0.0f);
+        dl->AddRectFilled(p0, p1, theme::draw2d::paper(), 0.0f);  // paper is always white
+        dl->AddRect(p0, p1, theme::draw2d::paperBorder(), 0.0f, 0, 1.4f * s);
         // Inner trim border (a faint margin line, SolidWorks-style).
         float m = 8.0f * z;  // 8mm margin scaled
         if (m > 4)
             dl->AddRect(ImVec2(p0.x + m, p0.y + m), ImVec2(p1.x - m, p1.y - m),
-                        IM_COL32(150, 154, 164, 200), 0.0f, 0, 1.0f * s);
+                        theme::draw2d::trimLine(), 0.0f, 0, 1.0f * s);
     }
 
     // Line colors: drawings are ink-on-paper, so use fixed dark inks (independent of theme — the
     // paper is always white) for legibility. Hidden lines are a lighter grey + dashed.
-    const ImU32 inkVisible = IM_COL32(28, 32, 40, 255);
-    const ImU32 inkHidden  = IM_COL32(120, 126, 138, 230);
+    const ImU32 inkVisible = theme::draw2d::inkVisible();
+    const ImU32 inkHidden  = theme::draw2d::inkHidden();
     const float visThick = std::max(1.0f, 1.1f * s);
     const float hidThick = std::max(1.0f, 1.0f * s);
 
@@ -1743,9 +1749,9 @@ void drawDrawingSheet(app::AppState& st) {
                 ImVec2 ts = ImGui::CalcTextSize(note.c_str());
                 ImVec2 t0(anchor.x - ts.x * 0.5f - 6, anchor.y - ts.y * 0.5f - 3);
                 ImVec2 t1(t0.x + ts.x + 12, t0.y + ts.y + 6);
-                dl->AddRectFilled(t0, t1, IM_COL32(250, 235, 235, 235), 3.0f);
-                dl->AddRect(t0, t1, IM_COL32(200, 120, 110, 255), 3.0f);
-                dl->AddText(ImVec2(t0.x + 6, t0.y + 3), IM_COL32(150, 60, 50, 255), note.c_str());
+                dl->AddRectFilled(t0, t1, theme::draw2d::errFill(), 3.0f);
+                dl->AddRect(t0, t1, theme::draw2d::errBorder(), 3.0f);
+                dl->AddText(ImVec2(t0.x + 6, t0.y + 3), theme::draw2d::errInk(), note.c_str());
                 continue;
             }
 
@@ -1753,7 +1759,7 @@ void drawDrawingSheet(app::AppState& st) {
             // edges, so the cut outline draws crisply on top). The bore shows as a gap because the
             // engine returns the cut face split into pieces around the hole.
             if (v.contains("section_faces") && v["section_faces"].is_array()) {
-                const ImU32 hatchCol = IM_COL32(70, 90, 130, 200);
+                const ImU32 hatchCol = theme::draw2d::hatch();
                 for (const auto& poly : v["section_faces"]) {
                     if (!poly.is_array() || poly.size() < 3) continue;
                     std::vector<std::array<float, 2>> mm;
@@ -1801,7 +1807,7 @@ void drawDrawingSheet(app::AppState& st) {
 
             // W15: parent-view markers — the cutting line(s) and detail circle(s) the engine
             // attaches to a parent view in drawing_get, drawn over the geometry.
-            const ImU32 markCol = IM_COL32(190, 60, 50, 235);
+            const ImU32 markCol = theme::draw2d::sectionMark();
             const float markThick = std::max(1.2f, 1.3f * s);
             if (v.contains("section_lines") && v["section_lines"].is_array()) {
                 for (const auto& sl : v["section_lines"]) {
@@ -1871,8 +1877,8 @@ void drawDrawingSheet(app::AppState& st) {
                 ImVec2 ts = ImGui::CalcTextSize(lbl);
                 dl->AddRectFilled(ImVec2(lp.x - 2, lp.y - 1),
                                   ImVec2(lp.x + ts.x + 4, lp.y + ts.y + 2),
-                                  IM_COL32(255, 255, 255, 210), 2.0f);
-                dl->AddText(lp, IM_COL32(70, 76, 88, 255), lbl);
+                                  theme::draw2d::weldLabelPad(), 2.0f);
+                dl->AddText(lp, theme::draw2d::weldLabelInk(), lbl);
             }
         }
     }
@@ -1923,7 +1929,7 @@ void drawDrawingSheet(app::AppState& st) {
                 std::vector<ImVec2> chain;
                 for (auto& p : tab.sectionPts) chain.push_back(toScreen(p[0], p[1]));
                 chain.push_back(mouse);
-                addDashedPolyline(dl, chain, IM_COL32(190, 60, 50, 220), 1.4f * s, 10.0f * s,
+                addDashedPolyline(dl, chain, theme::draw2d::sectionPreview(), 1.4f * s, 10.0f * s,
                                   4.0f * s);
             }
             bool dbl = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
@@ -1952,8 +1958,8 @@ void drawDrawingSheet(app::AppState& st) {
             if (tab.detailStage == 1) {
                 ImVec2 c = toScreen(tab.detailCx, tab.detailCy);
                 double rmm = std::hypot(curMx - tab.detailCx, curMy - tab.detailCy);
-                dl->AddCircle(c, (float)rmm * z, IM_COL32(190, 60, 50, 220), 48, 1.4f * s);
-                dl->AddCircleFilled(c, 2.5f * s, IM_COL32(190, 60, 50, 220));
+                dl->AddCircle(c, (float)rmm * z, theme::draw2d::sectionPreview(), 48, 1.4f * s);
+                dl->AddCircleFilled(c, 2.5f * s, theme::draw2d::sectionPreview());
             }
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
                 if (tab.detailStage == 0) {
@@ -1981,18 +1987,18 @@ void drawDrawingSheet(app::AppState& st) {
             bool snapped = snapToVertex(*sheet, curMx, curMy, snapRadiusMm, sx, sy, svid);
             if (snapped) {
                 ImVec2 sp = toScreen(sx, sy);
-                dl->AddCircle(sp, 5.0f * s, IM_COL32(220, 120, 30, 255), 12, 1.6f * s);
-                dl->AddCircleFilled(sp, 2.0f * s, IM_COL32(220, 120, 30, 255));
+                dl->AddCircle(sp, 5.0f * s, theme::draw2d::dimSelected(), 12, 1.6f * s);
+                dl->AddCircleFilled(sp, 2.0f * s, theme::draw2d::dimSelected());
             }
             // Rubber-band preview of the in-progress dimension.
             if (tab.dimStage == 1) {
                 ImVec2 a = toScreen(tab.dimAx, tab.dimAy);
                 ImVec2 b = snapped ? toScreen(sx, sy) : mouse;
-                dl->AddLine(a, b, IM_COL32(220, 120, 30, 160), 1.2f * s);
+                dl->AddLine(a, b, theme::draw2d::toolPreview(), 1.2f * s);
             } else if (tab.dimStage == 2) {
                 ImVec2 a = toScreen(tab.dimAx, tab.dimAy);
                 ImVec2 b = toScreen(tab.dimBx, tab.dimBy);
-                dl->AddLine(a, b, IM_COL32(220, 120, 30, 160), 1.2f * s);
+                dl->AddLine(a, b, theme::draw2d::toolPreview(), 1.2f * s);
             }
             // A left click advances the placement (ignore Space+drag pans).
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
@@ -2024,7 +2030,7 @@ void drawDrawingSheet(app::AppState& st) {
             bool snapped = snapToVertex(*sheet, curMx, curMy, snapRadiusMm * 2.0, sx, sy, svid);
             if (snapped) {
                 ImVec2 sp = toScreen(sx, sy);
-                dl->AddCircle(sp, 5.0f * s, IM_COL32(220, 120, 30, 255), 12, 1.6f * s);
+                dl->AddCircle(sp, 5.0f * s, theme::draw2d::dimSelected(), 12, 1.6f * s);
             }
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
                 std::string overView = !svid.empty() ? svid : viewAtPoint(*sheet, curMx, curMy, 8.0);
@@ -2046,12 +2052,12 @@ void drawDrawingSheet(app::AppState& st) {
             bool snapped = snapToVertex(*sheet, curMx, curMy, snapRadiusMm, sx, sy, svid);
             if (snapped) {
                 ImVec2 sp = toScreen(sx, sy);
-                dl->AddCircle(sp, 5.0f * s, IM_COL32(220, 120, 30, 255), 12, 1.6f * s);
+                dl->AddCircle(sp, 5.0f * s, theme::draw2d::dimSelected(), 12, 1.6f * s);
             }
             if (tab.centerLineStage == 1) {
                 ImVec2 a = toScreen(tab.centerLineAx, tab.centerLineAy);
                 ImVec2 b = snapped ? toScreen(sx, sy) : mouse;
-                addDashedPolyline(dl, {a, b}, IM_COL32(220, 120, 30, 160), 1.2f * s, 9.0f * s, 4.0f * s);
+                addDashedPolyline(dl, {a, b}, theme::draw2d::toolPreview(), 1.2f * s, 9.0f * s, 4.0f * s);
             }
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
                 double mx = snapped ? sx : curMx, my = snapped ? sy : curMy;
@@ -2101,11 +2107,11 @@ void drawDrawingSheet(app::AppState& st) {
             bool snapped = snapToVertex(*sheet, curMx, curMy, snapRadiusMm, sx, sy, svid);
             if (snapped && tab.gdtStage == 0) {
                 ImVec2 sp = toScreen(sx, sy);
-                dl->AddCircle(sp, 5.0f * s, IM_COL32(30, 140, 80, 255), 12, 1.6f * s);
+                dl->AddCircle(sp, 5.0f * s, theme::draw2d::gdtSnap(), 12, 1.6f * s);
             }
             if (tab.gdtStage == 1) {
                 ImVec2 a = toScreen(tab.gdtAx, tab.gdtAy);
-                dl->AddLine(a, mouse, IM_COL32(30, 140, 80, 180), 1.2f * s);
+                dl->AddLine(a, mouse, theme::draw2d::gdtPreview(), 1.2f * s);
             }
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !spaceDown) {
                 if (tab.gdtStage == 0) {
@@ -2201,7 +2207,7 @@ void drawDrawingSheet(app::AppState& st) {
                             ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
                             // ghost rect at the dragged offset
                             ImVec2 g0(hl0.x + dd.x, hl0.y + dd.y), g1(hl1.x + dd.x, hl1.y + dd.y);
-                            dl->AddRect(g0, g1, IM_COL32(40, 120, 220, 230), 2.0f, 0, 1.6f * s);
+                            dl->AddRect(g0, g1, theme::draw2d::viewDragGhost(), 2.0f, 0, 1.6f * s);
                             tab.viewDragDX = dd.x / z;       // sheet-mm offset
                             tab.viewDragDY = -dd.y / z;
                         }
@@ -2251,8 +2257,8 @@ void drawDrawingSheet(app::AppState& st) {
                     }
                     if (s_annDragActive) {
                         ImVec2 selS = toScreen(selx, sely);
-                        dl->AddLine(selS, mouse, IM_COL32(220, 120, 30, 200), 1.2f * s);
-                        dl->AddCircleFilled(mouse, 3.0f * s, IM_COL32(220, 120, 30, 220));
+                        dl->AddLine(selS, mouse, theme::draw2d::annDragLine(), 1.2f * s);
+                        dl->AddCircleFilled(mouse, 3.0f * s, theme::draw2d::annDragDot());
                     }
                 }
                 if (s_annDragActive && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
@@ -2288,9 +2294,9 @@ void drawDrawingSheet(app::AppState& st) {
         const float tableH = rowH * (nRows + 2) + pad * 2;   // header + title + rows
         ImVec2 t0(canvasMax.x - tableW - 10 * s, canvasMin.y + 10 * s);
         ImVec2 t1(t0.x + tableW, t0.y + tableH);
-        dl->AddRectFilled(t0, t1, IM_COL32(252, 252, 250, 240), 3.0f);
-        dl->AddRect(t0, t1, IM_COL32(60, 64, 74, 255), 3.0f, 0, 1.2f * s);
-        const ImU32 ink = IM_COL32(40, 44, 52, 255);
+        dl->AddRectFilled(t0, t1, theme::draw2d::bomFill(), 3.0f);
+        dl->AddRect(t0, t1, theme::draw2d::paperBorder(), 3.0f, 0, 1.2f * s);
+        const ImU32 ink = theme::draw2d::inkTitle();
         float yy = t0.y + pad;
         dl->AddText(ImVec2(t0.x + pad, yy), ink, "Bill of Materials");
         yy += rowH;
@@ -2298,14 +2304,14 @@ void drawDrawingSheet(app::AppState& st) {
             const char* msg = bom.is_object() && bom.contains("note") && bom["note"].is_string()
                                   ? bom["note"].get<std::string>().c_str()
                                   : (isAsm ? "no components" : "part drawing - no BOM");
-            dl->AddText(ImVec2(t0.x + pad, yy), IM_COL32(120, 126, 138, 255), msg);
+            dl->AddText(ImVec2(t0.x + pad, yy), theme::draw2d::mutedLabel(), msg);
         } else {
             // Header row.
             dl->AddText(ImVec2(t0.x + pad, yy), ink, "#");
             dl->AddText(ImVec2(t0.x + pad + wItem, yy), ink, "Part");
             dl->AddText(ImVec2(t0.x + pad + wItem + wName, yy), ink, "Qty");
             dl->AddLine(ImVec2(t0.x + pad, yy + rowH - 2), ImVec2(t1.x - pad, yy + rowH - 2),
-                        IM_COL32(150, 154, 164, 200), 1.0f * s);
+                        theme::draw2d::trimLine(), 1.0f * s);
             yy += rowH;
             for (const auto& r : *rows) {
                 if (!r.is_object()) continue;
@@ -2339,7 +2345,7 @@ void drawDrawingSheet(app::AppState& st) {
         ImVec2 p0(canvasMin.x + 8 * s, canvasMax.y - ts.y - 8 * s);
         ImVec2 p1(p0.x + ts.x + 12, p0.y + ts.y + 6);
         theme::glassBackground(dl, p0, p1, 4.0f);
-        dl->AddText(ImVec2(p0.x + 6, p0.y + 3), IM_COL32(235, 235, 240, 255), hud);
+        dl->AddText(ImVec2(p0.x + 6, p0.y + 3), theme::draw2d::hudText(), hud);
     }
 
     dl->PopClipRect();

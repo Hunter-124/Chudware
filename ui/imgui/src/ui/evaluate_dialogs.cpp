@@ -8,6 +8,7 @@
 #include "app/app_state.h"
 #include "renderer.h"
 #include "theme/theme.h"
+#include "theme/domain_tokens.h"
 #include "ui/appearance_common.h"
 
 namespace ui {
@@ -168,13 +169,13 @@ void EvaluateDialogs::draw(AppState& st) {
         if (pending_) {
             // C39: the eval is in flight on the dispatch thread; the result fills in when
             // it drains. A spinner-ish pulse keeps it obviously alive.
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1));
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::evalview::pending());
             ImGui::TextUnformatted("Computing");
             ImGui::SameLine(0, 0);
             ImGui::TextUnformatted(&"..."[2 - ((int)(ImGui::GetTime() * 3.0) % 3)]);
             ImGui::PopStyleColor();
         } else if (!errorText_.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.35f, 0.30f, 1));
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::evalview::errText());
             ImGui::TextWrapped("%s", errorText_.c_str());
             ImGui::PopStyleColor();
         } else if (openWindow_ == "mass") {
@@ -292,7 +293,7 @@ void EvaluateDialogs::draw(AppState& st) {
             if (result_.contains("issues") && result_["issues"].is_array()) {
                 const auto& issues = result_["issues"];
                 if (issues.empty()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30f, 0.80f, 0.45f, 1));
+                    ImGui::PushStyleColor(ImGuiCol_Text, theme::evalview::okText());
                     ImGui::TextWrapped("No geometry issues found.");
                     ImGui::PopStyleColor();
                 } else {

@@ -17,6 +17,8 @@
 #include <vector>
 #endif
 
+#include <cstdio>      // T-G9 parity trace (AI_CAD_RPC_TRACE) file append
+#include <functional>  // T-G9 parity trace secret redaction
 #include <cstdlib>
 #include <string>
 
@@ -538,8 +540,53 @@ bool WorkerClient::readLine(std::string& line, int timeoutMs) {
 #endif
 }
 
+// T-G9 parity trace: with AI_CAD_RPC_TRACE=<file> set, every call() appends one JSONL
+// record {method, params, ok, result|err}. This is the single funnel all panel RPCs pass
+// through regardless of routing (Python worker subprocess, in-process libaicad doc/CAM
+// core, ECAD/agent C++ paths), so tools/gui_parity/ can capture byte-comparable request/
+// response streams from BOTH GUI binaries (host links services/worker directly too).
+// Env unset (the default, incl. all production runs) = the wrapper is a tail call.
 bool WorkerClient::call(const std::string& method, const json& params, json& result,
                         std::string& err, int timeoutMs, const EventFn& onEvent) {
+    static const char* tracePath = std::getenv("AI_CAD_RPC_TRACE");
+    if (!tracePath || !*tracePath)
+        return callImpl(method, params, result, err, timeoutMs, onEvent);
+
+    const bool ok = callImpl(method, params, result, err, timeoutMs, onEvent);
+    try {
+        // Redact credential-bearing fields recursively (agent_list_models et al carry
+        // api_key/base_url auth material) — trace files must never hold live secrets.
+        std::function<void(json&)> redact = [&](json& node) {
+            if (node.is_object()) {
+                for (auto& [k, v] : node.items()) {
+                    if (k == "api_key" || k == "apikey" || k == "token" || k == "secret" ||
+                        k == "password" || k == "authorization")
+                        v = "<redacted>";
+                    else
+                        redact(v);
+                }
+            } else if (node.is_array()) {
+                for (auto& v : node) redact(v);
+            }
+        };
+        json rec = {{"method", method}, {"params", params}, {"ok", ok}};
+        if (ok) rec["result"] = result;
+        else    rec["err"] = err;
+        redact(rec);
+        static std::mutex traceMtx;  // two instances (doc + sim worker) share the file
+        std::lock_guard<std::mutex> tlk(traceMtx);
+        FILE* f = std::fopen(tracePath, "ab");
+        if (f) {
+            const std::string line = rec.dump() + "\n";
+            std::fwrite(line.data(), 1, line.size(), f);
+            std::fclose(f);
+        }
+    } catch (...) { /* tracing must never break the app */ }
+    return ok;
+}
+
+bool WorkerClient::callImpl(const std::string& method, const json& params, json& result,
+                            std::string& err, int timeoutMs, const EventFn& onEvent) {
     std::lock_guard<std::mutex> lk(callMtx_);
     if (abort_.load()) {  // C39: app is tearing down — intentional, no errorSink toast
         err = "aborted";

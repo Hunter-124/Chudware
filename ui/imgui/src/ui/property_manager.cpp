@@ -2,6 +2,7 @@
 #include "ui/property_manager.h"
 #include "app/app_state.h"
 #include "theme/theme.h"
+#include "theme/domain_tokens.h"
 #include "theme/icons.h"
 #include "panel_spec.h"
 #include "viewport/scene.h"
@@ -1833,8 +1834,8 @@ void PropertyManager::drawBody(app::AppState& st) {
         float okY = hdrMin.y + (hdrH - btnW) * 0.5f;
         ImGui::SetCursorScreenPos(ImVec2(okX, okY));
 
-        ImGui::PushStyleColor(ImGuiCol_Button,     ImVec4(0.08f, 0.38f, 0.24f, 0.9f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.14f, 0.58f, 0.36f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Button,     theme::pmview::okBtn());
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::pmview::okBtnHovered());
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * S, 4.0f * S));
         {
             IconUV okIc = ui::getIcon("ok_badge", 20);

@@ -12,6 +12,7 @@
 #include "cam_mirror.h"
 
 #include "app/app_state.h"
+#include "theme/domain_tokens.h"
 
 #include <algorithm>
 #include <cmath>
@@ -216,9 +217,9 @@ void drawBackplot(app::AppState& /*st*/) {
     if (avail.y < 80) avail.y = 200;
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + avail.y), IM_COL32(24, 26, 30, 255));
+    dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + avail.y), theme::camview::backdrop());
     if (bp.empty()) {
-        dl->AddText(ImVec2(p0.x + 10, p0.y + 10), IM_COL32(160, 160, 160, 255),
+        dl->AddText(ImVec2(p0.x + 10, p0.y + 10), theme::camview::emptyMsg(),
                     "No toolpaths. Add operations, then Generate.");
         ImGui::Dummy(avail);
         return;
@@ -237,14 +238,14 @@ void drawBackplot(app::AppState& /*st*/) {
             dl->AddLine(a, b, col, th);
         }
     };
-    line(bp.rapid,  IM_COL32(200, 60, 60, 120), 1.0f);   // rapid = faint red
-    line(bp.lead,   IM_COL32(80, 200, 120, 200), 1.5f);  // lead = green
-    line(bp.plunge, IM_COL32(80, 180, 220, 220), 1.5f);  // plunge = cyan
-    line(bp.cut,    IM_COL32(90, 150, 240, 255), 1.6f);  // cut = blue
-    line(bp.arc,    IM_COL32(150, 130, 240, 255), 1.6f); // arc = violet
+    line(bp.rapid,  theme::camview::rapid(), 1.0f);   // rapid = faint red
+    line(bp.lead,   theme::camview::lead(), 1.5f);  // lead = green
+    line(bp.plunge, theme::camview::plunge(), 1.5f);  // plunge = cyan
+    line(bp.cut,    theme::camview::cut(), 1.6f);  // cut = blue
+    line(bp.arc,    theme::camview::arc(), 1.6f); // arc = violet
     char info[96];
     std::snprintf(info, sizeof(info), "XY %.1f x %.1f mm   Z %.1f..%.1f", w, h, bp.minz, bp.maxz);
-    dl->AddText(ImVec2(p0.x + 8, p0.y + 8), IM_COL32(150, 160, 170, 255), info);
+    dl->AddText(ImVec2(p0.x + 8, p0.y + 8), theme::camview::dimText(), info);
     ImGui::Dummy(avail);
 }
 
@@ -259,11 +260,11 @@ void drawSimSummary() {
         double t = r.value("cycle_time_s", 0.0);
         ImGui::Text("Cycle time: %dm %02ds", (int)(t / 60), (int)t % 60);
         int gouges = r.value("gouges", 0), rapids = r.value("rapid_collisions", 0);
-        if (gouges > 0) { ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(230, 120, 60, 255));
+        if (gouges > 0) { ImGui::PushStyleColor(ImGuiCol_Text, theme::camview::simWarn());
             ImGui::Text("GOUGES: %d (max %.3f mm)", gouges, r.value("max_gouge_mm", 0.0)); ImGui::PopStyleColor(); }
-        if (rapids > 0) { ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(230, 120, 60, 255));
+        if (rapids > 0) { ImGui::PushStyleColor(ImGuiCol_Text, theme::camview::simWarn());
             ImGui::Text("RAPID THROUGH STOCK: %d", rapids); ImGui::PopStyleColor(); }
-        if (gouges == 0 && rapids == 0) { ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(90, 200, 120, 255));
+        if (gouges == 0 && rapids == 0) { ImGui::PushStyleColor(ImGuiCol_Text, theme::camview::simOk());
             ImGui::TextUnformatted("No gouges or rapid collisions."); ImGui::PopStyleColor(); }
     }
 }

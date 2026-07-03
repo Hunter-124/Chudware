@@ -10,6 +10,11 @@
 #include "ui/scaffold_demo_panel.h"
 #include "ui/parts_panel.h"
 #include "ui/cam_panel.h"            // T-U3 CAM workspace (AI_CAD_SHOT=cam_workspace)
+#include "ui/cam/cam_panel.h"        // camLoadJob (Manufacture panel job adoption, AI_CAD_SHOT=cam)
+#include "ui/drawing_panel.h"        // drawingActiveDocId/Doc + refresh (AI_CAD_SHOT=drawing detailing)
+#include "ui/ecad/ecad_panel.h"      // ecadEditorMirror (AI_CAD_SHOT=ecad ai-design adoption)
+#include "ui/ecad/ecad_mirror.h"     // EcadMirror::loadFromTree (complete type for the call above)
+#include "ui/sim_manager.h"          // simManager() study flow (AI_CAD_SHOT=fea host parity)
 #include "ui/bom_panel.h"
 #include "ui/requirements_panel.h"   // T-U5
 #include "ui/transparency_panel.h"
@@ -314,7 +319,11 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     }
     if (cfg.wantCam) st.workspace = cmd::Workspace::Model;
     if (cfg.wantAsm) st.workspace = cmd::Workspace::Assemble;
-    if (cfg.wantDrawing) st.workspace = cmd::Workspace::Drafting;
+    // wantDrawing: do NOT pre-switch to Drafting here — the Drafting panel self-creates a
+    // drawing from the ACTIVE doc on first render, and at configure time that's the startup
+    // demo doc, not the scenario's Plate (T-G9 harness finding: the captured drawing_new
+    // sourced the wrong document). The drawing scenario flips the workspace itself after
+    // building the Plate, matching host's part-first ordering.
     if (cfg.wantEcad) st.workspace = cmd::Workspace::Schematic;
     if (cfg.wantMultidoc) st.railTab = 0;
     if (cfg.wantActivity) st.railTab = 0;
@@ -464,11 +473,25 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
                            wantPcb ? cmd::DocType::Pcb : cmd::DocType::Schematic});
         st.activeDoc = (int)st.docs.size() - 1;
         st.workspace = wantPcb ? cmd::Workspace::Board : cmd::Workspace::Schematic;
-        if (st.worker.call("ecad_orchestrate",
-                {{"recipe", "divider"}, {"kind", wantPcb ? "pcb" : "sch"}}, res, err, 60000))
-            std::printf("ecad: orchestrate ok\n");
-        else
-            std::printf("ecad: orchestrate skipped (%s)\n", err.c_str());
+        // Host-parity AI-design flow (T-G9 harness finding: this used to call
+        // "ecad_orchestrate" — a method that does not exist in the engine — so the ecad
+        // scenario produced no schematic and no netlist/ERC compile at all). Host's
+        // ecadAiDesign: ecad_design(request) -> ecad_tree(doc_id) -> adopt into the editor.
+        if (st.worker.call("ecad_design",
+                {{"request", "5V resistive divider with 2.5V output"}}, res, err, 60000)) {
+            const std::string id = res.is_object() ? res.value("doc_id", std::string())
+                                                   : std::string();
+            nlohmann::json tree;
+            if (!id.empty() &&
+                st.worker.call("ecad_tree", {{"doc_id", id}}, tree, err, 60000)) {
+                ui::ecadEditorMirror().loadFromTree(tree);
+                std::printf("ecad: ai-design ok doc=%s\n", id.c_str());
+            } else {
+                std::printf("ecad: ecad_tree failed (%s)\n", err.c_str());
+            }
+        } else {
+            std::printf("ecad: ecad_design failed (%s)\n", err.c_str());
+        }
         std::fflush(stdout);
     }
 
@@ -1056,26 +1079,131 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
         if (m1Step <= 5) ++m1Step;
     }
 
-    // ---------- sketch (simplified: rect sketch + extrude) ----------
+    // ---------- sketch (host-parity solver op-batch: incremental rect + drag + dim + solve) ----
+    // T-G9 harness finding: the previous "simplified" flow here (one batched
+    // sketchRectExtrude) exercised none of the solver op-batch host exercises. This is a
+    // faithful port of host/src/ui/scenarios.cpp: entities/constraints added one op at a
+    // time, drag + commit, set_dim 80->100, sketch_solve, enter/exit — the RPC sequence
+    // tools/gui_parity/run_all.py sketch diffs against host.
     if (cfg.wantSketch && st.workerStarted && !cfg.sketchShotDone && cfg.frame >= 5) {
         if (!skDirReady) {
             skDirReady = true;
             skSavePath = repoBase() + "/scratch/sketch_shots";
             std::error_code ec; std::filesystem::create_directories(skSavePath, ec);
         }
+        auto applyOne = [&](const nlohmann::json& op) {
+            return st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+        };
         const int kSettle = 4;
         if (skSettle > 0) { --skSettle; return; }
         if (!sketchCapture.empty()) return;
+        std::string err;
         switch (skStep) {
-            case 0: {
-                std::string err;
-                st.docMirror.newPart(st.worker, err);
+            case 0: {  // new part + sketch + rect (entities/relations/dims) + enter
+                if (!st.docMirror.newPart(st.worker, err)) {
+                    std::printf("sketch: new_part FAILED: %s\n", err.c_str()); std::fflush(stdout);
+                    cfg.sketchShotDone = true; break;
+                }
                 st.addDocTab(false);
+                auto r = applyOne({{"op","add_feature"},{"feature",{
+                    {"type","sketch"},{"name","Sketch1"},
+                    {"refs",{{"plane","plane.top"}}},
+                    {"params",{{"entities",nlohmann::json::array()},
+                               {"constraints",nlohmann::json::array()}}}}}});
+                skFid = (r.id_map.is_object() && r.id_map.contains("$0"))
+                        ? r.id_map["$0"].get<std::string>() : "f1";
+                auto addLine = [&](double x1,double y1,double x2,double y2,bool horiz,
+                                   const std::string& prev)->std::string{
+                    nlohmann::json cs = nlohmann::json::array();
+                    cs.push_back({{"type",horiz?"horizontal":"vertical"},{"refs",{"$self"}}});
+                    if (!prev.empty())
+                        cs.push_back({{"type","coincident"},{"refs",{prev+".p2","$self.p1"}}});
+                    auto rr = applyOne({{"op","sketch_add_entity"},{"sketch",skFid},
+                        {"entity",{{"type","line"},{"p1",{x1,y1}},{"p2",{x2,y2}}}},{"constraints",cs}});
+                    return (rr.id_map.is_object() && rr.id_map.contains("$0"))
+                           ? rr.id_map["$0"].get<std::string>() : "";
+                };
+                skL0 = addLine(0,0,80,0,true,"");
+                skL1 = addLine(80,0,80,40,false,skL0);
+                skL2 = addLine(80,40,0,40,true,skL1);
+                skL3 = addLine(0,40,0,0,false,skL2);
+                applyOne({{"op","sketch_add_constraint"},{"sketch",skFid},
+                    {"constraint",{{"type","coincident"},{"refs",{skL3+".p2",skL0+".p1"}}}}});
+                applyOne({{"op","sketch_add_constraint"},{"sketch",skFid},
+                    {"constraint",{{"type","fix"},{"refs",{skL0+".p1"}}}}});
+                applyOne({{"op","sketch_add_constraint"},{"sketch",skFid},
+                    {"constraint",{{"type","distance"},{"refs",{skL0+".p1",skL0+".p2"}},
+                                   {"value",{{"value",80.0},{"expr",nullptr}}}}}});
+                applyOne({{"op","sketch_add_constraint"},{"sketch",skFid},
+                    {"constraint",{{"type","distance"},{"refs",{skL1+".p1",skL1+".p2"}},
+                                   {"value",{{"value",40.0},{"expr",nullptr}}}}}});
+                // find the width constraint id (the distance on skL0) by scanning the tree
+                skWidthCid.clear();
+                {
+                    const auto& tr = st.docMirror.tree();
+                    if (tr.contains("features"))
+                      for (auto& f : tr["features"])
+                        if (f.value("id",std::string())==skFid && f.contains("params"))
+                          for (auto& c : f["params"].value("constraints",nlohmann::json::array()))
+                            if (c.value("type",std::string())=="distance" && c.contains("refs") &&
+                                c["refs"].size()==2 && c["refs"][0].get<std::string>()==skL0+".p1")
+                              skWidthCid = c.value("id",std::string());
+                }
+                // sketch mode entry (host: SketchMode::enterForFeature -> sketch_enter RPC;
+                // the AI-CAD2 overlay renders from doc state via the sketch seam)
+                nlohmann::json eres;
+                st.worker.call("sketch_enter",
+                    {{"doc_id", st.docMirror.docId()}, {"sketch", skFid}}, eres, err);
                 st.inSketch = true;
-                auto r = st.engine.sketchRectExtrude("plane.top", 80, 40, 10, "Boss-Extrude1");
-                loadMesh(st, r.aicmPath);
-                sketchCapture = skSavePath + "/sketch_03_solid.png";
-                skSettle = kSettle;
+                std::printf("sketch: new sketch %s rect built (width_cid=%s) entered\n",
+                            skFid.c_str(), skWidthCid.c_str());
+                std::fflush(stdout);
+                sketchCapture = skSavePath + "/sketch_01_enter.png"; skSettle = kSettle;
+                break;
+            }
+            case 1: {  // drag a corner + commit, then set width 80 -> 100
+                nlohmann::json dres;
+                nlohmann::json dragP = {{"doc_id",st.docMirror.docId()},{"sketch",skFid},
+                    {"handle",skL1+".p2"},{"xy",nlohmann::json::array({85.0,45.0})}};
+                st.worker.call("sketch_drag", dragP, dres, err);
+                nlohmann::json cres;
+                nlohmann::json cP = {{"doc_id",st.docMirror.docId()},{"sketch",skFid}};
+                st.worker.call("sketch_drag_commit", cP, cres, err);
+                st.docMirror.resync(st.worker);
+                if (!skWidthCid.empty())
+                    st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                        {{"op","sketch_set_dim"},{"sketch",skFid},{"id",skWidthCid},{"value",100.0}}}));
+                nlohmann::json sres;
+                st.worker.call("sketch_solve",
+                    {{"doc_id",st.docMirror.docId()},{"sketch",skFid}}, sres, err);
+                nlohmann::json eres;  // host re-enters to refresh overlay entities/status
+                st.worker.call("sketch_enter",
+                    {{"doc_id", st.docMirror.docId()}, {"sketch", skFid}}, eres, err);
+                std::printf("sketch: drag+commit, width 80->100, re-solved; dof=%d\n",
+                            sres.value("dof",-1));
+                std::fflush(stdout);
+                sketchCapture = skSavePath + "/sketch_02_dim.png"; skSettle = kSettle;
+                break;
+            }
+            case 2: {  // exit + extrude region depth 10
+                nlohmann::json xres;
+                st.worker.call("sketch_exit",
+                    {{"doc_id", st.docMirror.docId()}, {"sketch", skFid}}, xres, err);
+                st.inSketch = false;
+                st.docMirror.resync(st.worker);
+                nlohmann::json region = {{"kind","region"},{"sketch",skFid},
+                    {"centroid",nlohmann::json::array({50.0,20.0})},{"hint_index",0}};
+                auto r = applyOne({{"op","add_feature"},{"feature",{
+                    {"type","extrude"},{"name","Boss-Extrude1"},
+                    {"params",{{"depth",{{"value",10.0},{"expr",nullptr}}},{"end","blind"},{"mode","boss"}}},
+                    {"refs",{{"profile",nlohmann::json::array({region})}}}}}});
+                loadMesh(st, r.aicm_path);
+                bool exok = false;
+                if (r.feature_status.is_array() && !r.feature_status.empty())
+                    exok = r.feature_status.back().value("ok",false);
+                std::printf("sketch: exit + extrude region depth 10 ok=%d\n", (int)exok);
+                std::fflush(stdout);
+                sketchCapture = skSavePath + "/sketch_03_solid.png"; skSettle = kSettle;
                 break;
             }
             default:
@@ -1083,63 +1211,84 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 std::printf("sketch: scenario complete\n");
                 break;
         }
-        if (skStep <= 0) ++skStep;
+        if (skStep <= 2) ++skStep;
     }
 
-    // ---------- fea ----------
+    // ---------- fea (host-parity SimManager study flow) ----------
+    // T-G9 harness finding: the old flow here bypassed the SimManager entirely (raw
+    // sim_run_static with empty fixtures/loads and a worktree-relative STEP netgen could
+    // not read), while host drives the panel: sim_new_static + configureActive +
+    // pick-resolved fixture/load faces + sim_run. Faithful port of host's scenario.
     if (cfg.wantFea && st.workerStarted && !cfg.feaShotDone) {
+        ui::simManager().tick(st);  // pump so completion lands while we wait
         if (feaSettle > 0) { --feaSettle; return; }
         switch (feaStep) {
-            case 0: {
+            case 0: {  // New part + box
                 std::string err;
                 st.docMirror.newPart(st.worker, err);
                 st.addDocTab(false);
-                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
-                    {{"op","add_feature"},{"feature",{
-                        {"type","box"},{"name","Box1"},
-                        {"params",{{"length",dim(60)},{"width",dim(40)},{"height",dim(10)}},
-                                   {"centered",true}}}}}}));
+                nlohmann::json ops = nlohmann::json::array();
+                ops.push_back({{"op","add_feature"},{"feature",{
+                    {"type","box"},{"name","Box1"},{"params",{
+                        {"length",dim(60)},{"width",dim(40)},{"height",dim(10)}}},
+                    {"centered",true}}}});
+                auto r = st.docMirror.applyOps(st.worker, ops);
                 loadMesh(st, r.aicm_path);
+                std::printf("fea: box ok=%d rev=%d\n", (int)r.ok, r.revision);
+                std::fflush(stdout);
                 st.workspace = cmd::Workspace::Simulate;
                 feaSettle = 3; ++feaStep; break;
             }
-            case 1: {
-                std::string stepPath = repoBase() + "/scratch/fea_part.step";
-                nlohmann::json ex, er; std::string e;
-                st.worker.call("doc_export_step",
-                    {{"doc_id", st.docMirror.docId()}, {"path", stepPath}}, ex, e, 60000);
-                nlohmann::json fixFace, loadFace;
-                double bestMin = 1e30, bestMax = -1e30;
-                for (int tid = 1; tid <= 12; ++tid) {
-                    std::string se;
-                    std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, se);
-                    if (s.empty()) continue;
-                    try {
-                        auto o = nlohmann::json::parse(s);
-                        if (!o.contains("centroid")) continue;
-                        double cx = o["centroid"][0].get<double>();
-                        if (cx < bestMin) { bestMin = cx; fixFace = o; }
-                        if (cx > bestMax) { bestMax = cx; loadFace = o; }
-                    } catch (...) {}
-                }
-                nlohmann::json study = {
-                    {"step_path", stepPath},
-                    {"material", {{"E_mpa", 210000}, {"nu", 0.3}, {"density_g_cm3", 7.85}}},
-                    {"mesh", {{"fineness", 0.2}, {"order", 2}}},
-                    {"fixtures", nlohmann::json::array()},
-                    {"loads", nlohmann::json::array()}};
-                std::string note;
-                st.simClient.ensureStarted(note);
-                st.simClient.launch("sim_run_static", {{"study", study}}, note, st.docMirror.docId());
+            case 1: {  // Static study + resolved fixture/load faces (-X end / +X end)
+                ui::simManager().handleCommand(st, "sim_new_static");
+                ui::simManager().configureActive(st, 0.2f, "steel_1018");
+                auto faceAtExtremeX = [&](bool wantMax) -> nlohmann::json {
+                    nlohmann::json best; double bestC = wantMax ? -1e30 : 1e30;
+                    for (int tid = 1; tid <= 12; ++tid) {
+                        std::string se;
+                        std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, se);
+                        if (s.empty()) continue;
+                        try {
+                            auto o = nlohmann::json::parse(s);
+                            if (!o.contains("centroid")) continue;
+                            double cx = o["centroid"][0].get<double>();
+                            if ((wantMax && cx > bestC) || (!wantMax && cx < bestC)) { bestC = cx; best = o; }
+                        } catch (...) {}
+                    }
+                    return best;
+                };
+                nlohmann::json fixFace = faceAtExtremeX(false);
+                nlohmann::json loadFace = faceAtExtremeX(true);
+                // Inject the resolved selectors via the selection -> well capture path.
+                st.selection.clear();
+                { core::SelItem it; it.selector = fixFace.dump(); it.pending_resolve = false;
+                  st.selection.mutableItems().push_back(it); }
+                ui::simManager().handleCommand(st, "sim_fixture");
+                st.selection.clear();
+                { core::SelItem it; it.selector = loadFace.dump(); it.pending_resolve = false;
+                  st.selection.mutableItems().push_back(it); }
+                ui::simManager().handleCommand(st, "sim_load_force");
+                st.selection.clear();
+                std::printf("fea: faces fixCx=%.1f loadCx=%.1f\n",
+                            fixFace.contains("centroid") ? fixFace["centroid"][0].get<double>() : 0.0,
+                            loadFace.contains("centroid") ? loadFace["centroid"][0].get<double>() : 0.0);
+                std::fflush(stdout);
                 feaSettle = 2; ++feaStep; break;
             }
-            case 2: {
+            case 2: {  // Run
+                ui::simManager().handleCommand(st, "sim_run");
+                std::printf("fea: study launched (density 0.4, steel, 100 N)\n");
+                std::fflush(stdout);
+                feaWaitFrames = 0; ++feaStep; break;
+            }
+            case 3: {  // Wait for completion (cap ~90 s)
                 ++feaWaitFrames;
                 if (st.simClient.job().ready.load() || feaWaitFrames > 5400) {
                     cfg.colormapOn = st.simClient.job().ok;
                     cfg.feaShotDone = true;
                     std::printf("fea: done ok=%d frames=%d\n",
                                 (int)st.simClient.job().ok, feaWaitFrames);
+                    std::fflush(stdout);
                 }
                 break;
             }
@@ -1212,17 +1361,44 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 std::string err;
                 st.docMirror.newPart(st.worker, err);
                 st.addDocTab(false);
-                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
-                    {{"op","add_feature"},{"feature",{
-                        {"type","box"},{"name","Plate"},
-                        {"params",{{"length",dim(80)},{"width",dim(60)},{"height",dim(15)}},
-                                   {"centered",true}}}}}}));
+                // Byte-parity with the host cam recipe (T-G9 harness finding: the old
+                // init-list here misnested {"centered",true} INSIDE the params braces —
+                // nlohmann silently turned the whole feature into an array of pairs — and
+                // dropped host's Bores hole op entirely, so the CAM job ran on a different
+                // part than host's).
+                nlohmann::json camOps = nlohmann::json::array();
+                camOps.push_back({{"op","add_feature"},{"feature",{
+                    {"type","box"},{"name","Plate"},{"params",{
+                        {"length",dim(80)},{"width",dim(60)},{"height",dim(15)}}},
+                    {"centered",true}}}});
+                {
+                    nlohmann::json hole;
+                    hole["op"] = "add_feature";
+                    hole["feature"]["type"] = "hole";
+                    hole["feature"]["name"] = "Bores";
+                    hole["feature"]["params"]["style"] = "simple";
+                    hole["feature"]["params"]["standard"] = "custom";
+                    hole["feature"]["params"]["diameter"] = dim(5);
+                    hole["feature"]["params"]["end"] = "through_all";
+                    hole["feature"]["params"]["positions"] = {{-30, -20}, {30, -20}, {30, 20}, {-30, 20}};
+                    hole["feature"]["refs"]["face"] = {{"of", "face"}, {"side", "top"}};
+                    camOps.push_back(hole);
+                }
+                auto r = st.docMirror.applyOps(st.worker, camOps);
                 loadMesh(st, r.aicm_path);
                 nlohmann::json res; std::string e2;
                 st.worker.call("cam_program",
                     {{"doc_id", st.docMirror.docId()}, {"post", "fanuc"}}, res, e2);
                 st.workspace = cmd::Workspace::Model;
                 st.camActive = true;   // surface CAM panel via viewport content-swap (H1 fix)
+                // Adopt the job into the Manufacture panel exactly like host does (T-G9
+                // harness finding: without this the panel showed "No setups yet" and the
+                // cam_tree/cam_generate RPCs host fires were missing from the stream).
+                {
+                    std::string camId = res.is_object()
+                                        ? res.value("cam_doc_id", std::string()) : std::string();
+                    if (!camId.empty()) ui::camLoadJob(st, camId);
+                }
                 std::printf("cam-shot: ok=%d\n", (int)!res.contains("code"));
                 std::fflush(stdout);
                 camSettle = 4; ++camStep; break;
@@ -1452,24 +1628,123 @@ void ScenarioRunner::runDrawing(ShotConfig& cfg, app::AppState& st) {
     const int kSettle = 5;
     if (dwgSettle > 0) { --dwgSettle; return; }
     if (!dwgCapture.empty()) return;
+    auto vid_of = [](const nlohmann::json& v) -> std::string {
+        std::string id = v.value("view_id", std::string());
+        return id.empty() ? v.value("id", std::string()) : id;
+    };
+    std::string err;
     switch (dwgStep) {
-        case 0: {
-            std::string err;
-            st.docMirror.newPart(st.worker, err);
+        case 0: {  // new part + plate (80x50x12) with a central through hole — host recipe,
+                   // object-form features (T-G9 harness finding: the old init-list misnested
+                   // {"centered",true} inside the params braces -> array-of-pairs on the wire)
+            if (!st.docMirror.newPart(st.worker, err)) {
+                std::printf("drawing: new_part FAILED: %s\n", err.c_str()); std::fflush(stdout);
+                cfg.drawingShotDone = true; break;
+            }
             st.addDocTab(false);
-            st.docMirror.applyOps(st.worker, nlohmann::json::array({
-                {{"op","add_feature"},{"feature",{
-                    {"type","box"},{"name","Plate"},
-                    {"params",{{"length",dim(80)},{"width",dim(50)},{"height",dim(12)}},
-                               {"centered",true}}}}},
-                {{"op","add_feature"},{"feature",{
-                    {"type","cylinder"},{"name","Hole"},
-                    {"params",{{"radius",dim(6)},{"height",dim(16)},{"centered",true},
-                               {"mode","cut"}}}}}}}));
-            st.dispatch("make_drawing");
+            nlohmann::json ops = nlohmann::json::array();
+            ops.push_back({{"op","add_feature"},{"feature",{
+                {"type","box"},{"name","Plate"},{"params",{
+                    {"length",dim(80)},{"width",dim(50)},{"height",dim(12)},
+                    {"centered",true}}}}}});
+            ops.push_back({{"op","add_feature"},{"feature",{
+                {"type","cylinder"},{"name","Hole"},{"params",{
+                    {"radius",dim(6)},{"height",dim(16)},
+                    {"centered",true},{"mode","cut"}}}}}});
+            auto r = st.docMirror.applyOps(st.worker, ops);
+            loadMesh(st, r.aicm_path);
+            std::printf("drawing: plate+hole ok=%d rev=%d\n", (int)r.ok, r.revision);
+            std::fflush(stdout);
+            // Now enter Drafting: the panel self-creates the drawing from the ACTIVE (Plate)
+            // doc on next render — host's makeDrawing RPC sequence, right source doc.
+            st.workspace = cmd::Workspace::Drafting;
             dwgSettle = kSettle; ++dwgStep; break;
         }
-        case 1:
+        case 1: {  // Detailing (host case 2): model items + hole callout + critical toleranced
+                   // dim + title block + the copilot drawing_make one-shot.
+            const std::string dwgId = ui::drawingActiveDocId();
+            if (dwgId.empty()) {
+                std::printf("drawing: NO self-created drawing yet\n"); std::fflush(stdout);
+                cfg.drawingShotDone = true; break;
+            }
+            nlohmann::json dwgDoc = ui::drawingActiveDoc();
+            // Find a view with a closed projected circle (the hole in the top view).
+            std::string circVid; double cx = 0, cy = 0; bool haveCirc = false;
+            if (dwgDoc.contains("sheets") && dwgDoc["sheets"].is_array() &&
+                !dwgDoc["sheets"].empty()) {
+                for (const auto& v : dwgDoc["sheets"][0].value("views", nlohmann::json::array())) {
+                    for (const auto& a : v.value("arcs", nlohmann::json::array()))
+                        if (a.value("closed", false) && a.contains("center") &&
+                            a["center"].is_array() && a["center"].size() == 2) {
+                            circVid = vid_of(v);
+                            cx = a["center"][0].get<double>(); cy = a["center"][1].get<double>();
+                            haveCirc = true; break;
+                        }
+                    if (haveCirc) break;
+                }
+            }
+            std::string mvid = circVid;
+            if (mvid.empty() && dwgDoc.contains("sheets")) {
+                const auto& vs = dwgDoc["sheets"][0].value("views", nlohmann::json::array());
+                if (vs.is_array() && !vs.empty()) mvid = vid_of(vs[0]);
+            }
+            nlohmann::json res;
+            if (!mvid.empty())
+                st.worker.call("drawing_model_items",
+                               {{"doc_id", dwgId}, {"view_id", mvid}}, res, err);
+            if (haveCirc) {
+                nlohmann::json r2;
+                st.worker.call("drawing_add_callout",
+                               {{"doc_id", dwgId}, {"view_id", circVid}, {"kind", "hole"},
+                                {"a", nlohmann::json::array({cx, cy})}}, r2, err);
+            }
+            nlohmann::json r3;
+            st.worker.call("drawing_set_titleblock",
+                           {{"doc_id", dwgId}, {"sheet_id", "s1"},
+                            {"fields", {{"title", "PLATE"}, {"drawn_by", "AI-CAD"},
+                                        {"material", "AL 6061"}, {"scale", "1:1"}, {"rev", "A"}}}},
+                           r3, err);
+            ui::drawingRefreshActive(st);
+            // Make the first linear dim a critical +/-0.1 tolerance.
+            dwgDoc = ui::drawingActiveDoc();
+            std::string tvid, tann;
+            if (dwgDoc.contains("sheets"))
+                for (const auto& v : dwgDoc["sheets"][0].value("views", nlohmann::json::array())) {
+                    for (const auto& a : v.value("annotations", nlohmann::json::array()))
+                        if (a.value("type", std::string()) == "linear_dim") {
+                            tvid = vid_of(v); tann = a.value("id", std::string()); break;
+                        }
+                    if (!tann.empty()) break;
+                }
+            if (!tann.empty()) {
+                nlohmann::json r4;
+                st.worker.call("drawing_set_annotation",
+                               {{"doc_id", dwgId}, {"view_id", tvid}, {"ann_id", tann},
+                                {"tol_type", "symmetric"}, {"tol_upper", 0.1}, {"precision", 2},
+                                {"critical", true}}, r4, err);
+            }
+            ui::drawingRefreshActive(st);
+            int nann = 0;
+            dwgDoc = ui::drawingActiveDoc();
+            if (dwgDoc.contains("sheets"))
+                for (const auto& v : dwgDoc["sheets"][0].value("views", nlohmann::json::array()))
+                    nann += (int)v.value("annotations", nlohmann::json::array()).size();
+            std::printf("drawing: detail done circle=%d critical_dim=%s annotations=%d\n",
+                        (int)haveCirc, tann.empty() ? "none" : tann.c_str(), nann);
+            std::fflush(stdout);
+            // Copilot one-shot path: agent-grade drawing_make from the source part.
+            {
+                nlohmann::json r5;
+                nlohmann::json spec = {
+                    {"views", nlohmann::json::array({"front", "top", "right", "iso"})},
+                    {"model_items", true}, {"hole_callouts", true},
+                    {"title", {{"title", "COPILOT"}, {"material", "STEEL"}, {"rev", "A"}}}};
+                st.worker.call("drawing_make",
+                               {{"source_doc_id", st.docMirror.docId()}, {"spec", spec}}, r5, err);
+            }
+            dwgSettle = kSettle; ++dwgStep; break;
+        }
+        case 2:
             dwgCapture = dwgSavePath + "/drawing_01_detailed.png";
             dwgSettle = kSettle; ++dwgStep; break;
         default:

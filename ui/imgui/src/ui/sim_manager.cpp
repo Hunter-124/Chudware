@@ -14,6 +14,7 @@
 
 #include "app/app_state.h"
 #include "theme/theme.h"
+#include "theme/domain_tokens.h"
 #include "theme/icons.h"
 #include "ui/appearance_common.h"
 #include "ui/viewport.h"
@@ -582,10 +583,19 @@ bool SimManager::handleCommand(app::AppState& st, const std::string& cmdId) {
     }
     if (!haveStudy) return true;
     Study& s = studies_[sel_];
-    if (cmdId == "sim_fixture")      { node_ = SimNode::Fixtures; return true; }
-    if (cmdId == "sim_load_force")   { s.loads.push_back(SimLoad{}); persist(st, s);
+    // T-G9 parity fix: the H4 port dropped host's captureSelectionInto() in these three
+    // branches, so a viewport pre-selection was silently ignored when adding a fixture/
+    // load via ribbon command (host adopts it into the well; see host sim_manager.cpp).
+    if (cmdId == "sim_fixture")      { captureSelectionInto(st, s.fixtures); persist(st, s);
+                                       st.selection.clear();
+                                       node_ = SimNode::Fixtures; return true; }
+    if (cmdId == "sim_load_force")   { s.loads.push_back(SimLoad{});
+                                       captureSelectionInto(st, s.loads.back().faces); persist(st, s);
+                                       st.selection.clear();
                                        node_ = SimNode::Load; loadIdx_ = (int)s.loads.size() - 1; return true; }
-    if (cmdId == "sim_load_pressure"){ SimLoad l; l.pressure = true; s.loads.push_back(l); persist(st, s);
+    if (cmdId == "sim_load_pressure"){ SimLoad l; l.pressure = true; s.loads.push_back(l);
+                                       captureSelectionInto(st, s.loads.back().faces); persist(st, s);
+                                       st.selection.clear();
                                        node_ = SimNode::Load; loadIdx_ = (int)s.loads.size() - 1; return true; }
     if (cmdId == "sim_run") { run(st, s); return true; }
     return false;
@@ -1505,7 +1515,7 @@ void SimManager::drawFatigueForm(app::AppState& st, Study& s) {
         auto ink = [&](float a) { return ImGui::ColorConvertFloat4ToU32(ImVec4(inkV.x, inkV.y, inkV.z, inkV.w * a)); };
         dl->AddLine(ImVec2(x0, Y(0)), ImVec2(x1, Y(0)), ink(0.45f), 1.0f);
         dl->AddLine(ImVec2(x0, Y(mean)), ImVec2(x1, Y(mean)), ImGui::ColorConvertFloat4ToU32(c5::warnCol()), 1.0f);
-        ImU32 col = IM_COL32(90, 170, 250, 255);
+        ImU32 col = theme::panelview::sparkline();
         ImVec2 prev(x0, Y(mean));
         for (int i = 1; i <= 60; ++i) {
             float t = (float)i / 60.0f;

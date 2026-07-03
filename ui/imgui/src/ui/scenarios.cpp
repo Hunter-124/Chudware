@@ -12,6 +12,7 @@
 #include "ui/cam_panel.h"            // T-U3 CAM workspace (AI_CAD_SHOT=cam_workspace)
 #include "ui/bom_panel.h"
 #include "ui/requirements_panel.h"   // T-U5
+#include "ui/gallery_panel.h"        // T-U9
 #include "artifact_view.h"
 #include "app/app_state.h"
 #include "viewport/scene.h"
@@ -272,6 +273,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantPmform = eq("pmform");
     cfg.wantPreview = eq("preview");
     cfg.wantScaffoldDemo  = eq("scaffold_demo");
+    cfg.wantGallery       = eq("gallery");
     cfg.wantPartsBrowser  = eq("parts_browser");
     cfg.wantBom          = eq("bom");
     cfg.wantRequirements = eq("requirements");   // T-U5
@@ -318,6 +320,10 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantAssembly) seedAssemblyShot(st);
     if (cfg.wantPreview) seedPreviewShot(st);
     if (cfg.wantScaffoldDemo)  ui::openScaffoldDemoPanel();
+    if (cfg.wantGallery) {
+        ui::openGalleryPanel();
+        ui::selectAndOpenFirstSampleForShot();  // proves click -> doc_open -> editable tree
+    }
     if (cfg.wantPartsBrowser)  ui::openPartsPanel();
     cfg.wantCamWorkspace = eq("cam_workspace");
     if (cfg.wantCamWorkspace) ui::openCamWorkspacePanel();

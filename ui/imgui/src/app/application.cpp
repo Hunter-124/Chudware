@@ -15,6 +15,7 @@
 #include "ui/first_run.h"
 #include "ui/bom_panel.h"
 #include "ui/requirements_panel.h"  // T-U5 requirements & verification panel
+#include "ui/gallery_panel.h"       // T-U9 sample gallery
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -63,6 +64,7 @@ void Application::frame() {
     ImGuiIO& io = ImGui::GetIO();
 
     s.rpc.drain();
+    ui::tickGalleryOpenRequest(s);
     ui::scenarioTick(s);
     s.tickDemoAgent(io.DeltaTime);
 
@@ -262,6 +264,19 @@ void Application::frame() {
                                  ImGuiCond_Appearing);
         if (ImGui::Begin("Requirements###requirements", ui::requirementsPanelOpen(), pflags))
             ui::drawRequirementsPanel(s);
+        ImGui::End();
+    }
+    // T-U9 Sample Gallery panel — closable, screenshot-verifiable via AI_CAD_SHOT=gallery.
+    // Floats centered; zero footprint while closed.
+    if (*ui::galleryPanelOpen()) {
+        const ImGuiViewport* vp4 = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp4->WorkPos.x + vp4->WorkSize.x * 0.5f,
+                                       vp4->WorkPos.y + vp4->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(620.f * theme::S(), 680.f * theme::S()),
+                                 ImGuiCond_Appearing);
+        if (ImGui::Begin("Sample Gallery###gallery", ui::galleryPanelOpen(), pflags))
+            ui::drawGalleryPanel(s);
         ImGui::End();
     }
 

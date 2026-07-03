@@ -2,11 +2,10 @@
 #include "first_run.h"
 
 #include "bootstrap.h"
+#include "gallery_panel.h"
 #include "toast.h"
-#include "viewport.h"
 
 #include "app/app_state.h"
-#include "viewport/scene.h"
 
 #include "imgui.h"
 
@@ -65,18 +64,19 @@ int indexOfTier(const std::string& tier) {
     return 0;  // unknown/absent -> off, matches config.py:consent_tier()'s safe default
 }
 
-// docs/contracts/fixtures/box.aicm — the same fixture scenarios.cpp's setupPickShot() loads,
-// searched the same relative-candidate way (duplicated rather than exported from scenarios.cpp,
-// which keeps it file-local by design for the shot harness).
+// T-U9: samples/mech_part/bracket.aicm (T-Q3) — a real, R1-editable engine sample, opened via
+// the worker (requestOpenSample -> doc_open) rather than the old docs/contracts/fixtures/box.aicm
+// demo-scene fixture (s.scene->loadAicm(), a legacy non-editable preview path). Same
+// relative-candidate search style as scenarios.cpp's setupPickShot()/findBoxAicm().
 bool findSampleAicm(std::string& out) {
     const char* candidates[] = {
-        "docs/contracts/fixtures/box.aicm",
-        "../docs/contracts/fixtures/box.aicm",
-        "../../docs/contracts/fixtures/box.aicm",
-        "../../../docs/contracts/fixtures/box.aicm",
+        "samples/mech_part/bracket.aicm",
+        "../samples/mech_part/bracket.aicm",
+        "../../samples/mech_part/bracket.aicm",
+        "../../../samples/mech_part/bracket.aicm",
     };
     for (const char* c : candidates) {
-        if (std::filesystem::exists(c)) { out = c; return true; }
+        if (std::filesystem::exists(c)) { out = std::filesystem::absolute(c).string(); return true; }
     }
     return false;
 }
@@ -124,9 +124,12 @@ void drawFirstRunDialog(app::AppState& s) {
             if (gOfferSample) {
                 std::string aicm;
                 if (findSampleAicm(aicm)) {
-                    if (s.scene && s.scene->loadAicm(aicm)) s.viewMeshRev = 0;
-                    viewportLoadAicm(aicm);
+                    // Real, R1-editable open via the worker (doc_open) — queued and retried by
+                    // ui::tickGalleryOpenRequest() every frame until the engine/worker has
+                    // finished starting (it's mid-bootstrap right after first-run closes).
+                    requestOpenSample(aicm);
                 }
+                openGalleryPanel();  // show the full gallery too, in case another sample fits better
             }
             gDialogOpen = false;
             ImGui::CloseCurrentPopup();

@@ -12,9 +12,9 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
 - services/mcp/server.py:26 `mcp` FastMCP instance — root MCP server; registers all 26
   tool families via `register_*` functions (L60–185). Instructions string (L29–51) is the
   agent's first-contact map of the full capability surface.
-- services/mcp/server.py:267 `main()` — entrypoint; spawns libaicad.so warmup thread,
+- services/mcp/server.py:298 `main()` — entrypoint; spawns libaicad.so warmup thread,
   redirects native stdout (OCCT prints) to a log file to protect the JSON-RPC channel.
-- services/mcp/cad_tools.py:1158 `register_cad_tools(mcp)` — mechanical CAD + simulation
+- services/mcp/cad_tools.py:1433 `register_cad_tools(mcp)` — mechanical CAD + simulation
   (new_part, add_features, render_part, run_fea_static/modal, run_cfd_flow/accurate,
   export_part, make_drawing, measure_part, check_feature_overlap, check_interference,
   wall_thickness, draft_analysis, list_parts, undo/redo, close_part, recover_parts,

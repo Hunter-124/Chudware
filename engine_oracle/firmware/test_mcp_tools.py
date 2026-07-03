@@ -73,10 +73,16 @@ def test_fw_build_returns_build_result_shape():
     # DoD: fw_build returns {success, elf_path, stderr, warnings} — assert the full BuildResult shape.
     for key in ("success", "elf_path", "map_path", "stderr", "warnings", "returncode", "cmd", "ms"):
         assert key in res, f"BuildResult missing '{key}'"
-    # CI has no arm-none-eabi cross-toolchain, so a real .elf cannot be produced here.
-    assert res["success"] is False
-    assert res["returncode"] != 0            # -1 (cmake absent) or non-zero (cross-compile fails)
     assert isinstance(res["warnings"], list)
+    # T-C5: don't assume the cross-toolchain is absent — assert on the real invariant instead
+    # (the env-assuming-assertion trap: this used to hard-assert success is False, which broke
+    # the moment arm-none-eabi-gcc was actually installed and the build genuinely succeeded).
+    if res["success"]:
+        assert res["elf_path"] and res["elf_path"].endswith((".elf", ".bin", ".hex"))
+        assert res["returncode"] == 0
+    else:
+        assert res["returncode"] != 0        # -1 (cmake absent) or non-zero (cross-compile fails)
+        assert res["elf_path"] is None
 
 
 def test_fw_build_unknown_project_is_error_envelope():

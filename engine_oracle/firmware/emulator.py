@@ -13,7 +13,6 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
-import textwrap
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -133,18 +132,37 @@ def _emulator_not_found(binary: str, t0: float) -> SimResult:
 # Renode emulator
 # ---------------------------------------------------------------------------
 
-def _build_resc(elf_path: str, platform_file: str) -> str:
-    """Generate a minimal Renode ``.resc`` script that loads the ELF and starts emulation.
+def _build_resc(elf_path: str, platform_file: str, run_seconds: float = 5.0) -> str:
+    """Generate a minimal Renode ``.resc`` script that loads the ELF, starts emulation, and lets
+    it run for ``run_seconds`` of wall-clock time before the script (and Renode with it) exits.
 
     The script:
     1. Creates a machine with the given platform description.
     2. Loads the ELF.
     3. Starts emulation.
+    4. Sleeps ``run_seconds`` (the monitor's ``sleep`` command, real time — NOT the same as
+       ``emulation`` virtual time) so the CPU actually executes past its startup code before the
+       machine is disposed.
 
-    UART capture: when Renode is launched with ``--console``, its built-in UART monitor
-    prints UART bytes directly to stdout — no separate telnet/PTY wiring needed for the
-    general case.  Platform-specific ``.repl`` files that define ``usart1`` will have their
-    UART output forwarded by Renode's console sink automatically.
+    T-C5 fix: step 4 was missing entirely — ``start`` returns to the monitor immediately (it
+    launches emulation on a background thread and does not block), so with nothing after it the
+    script reached EOF and Renode disposed the machine within ~1 emulated millisecond, before any
+    meaningful firmware execution. Confirmed live: a firmware image that writes to UART in its
+    main loop produced zero UART output without this — "Machine started" immediately followed by
+    "Machine paused"/"Disposed". No unit test caught this because the mock suite validates
+    assertion-evaluation logic (:func:`evaluate_assertions`) independently of a live Renode
+    subprocess (T-C3 docstring's own admission — the mocks never actually exercised the .resc
+    script's real effect).
+
+    UART capture: ``--console`` alone does NOT forward a UART peripheral's bytes to stdout — a
+    T-C5 fix, confirmed live (``start`` + ``sleep`` alone produced zero UART text even once the
+    firmware was genuinely executing and transmitting). Renode requires an explicit
+    ``showAnalyzer sysbus.<uart-name>`` monitor command to attach that peripheral's terminal
+    output to the console sink (see Renode's own ``scripts/single-node/stm32f4_discovery.resc``).
+    Only emitted when ``platform_file`` actually declares ``usart1`` — issuing it against a
+    platform with no such peripheral (``cortex_m_generic.repl``) errors out per-command (Renode
+    logs and continues) but there is no UART to capture there regardless, so it's skipped
+    entirely for a cleaner log.
 
     Live-path note [~]: UART capture fidelity depends on the platform file defining a UART
     peripheral that Renode maps to its console sink.  ``cortex_m_generic.repl`` (no UART
@@ -153,12 +171,22 @@ def _build_resc(elf_path: str, platform_file: str) -> str:
     live hardware.  Run ``renode --disable-xwt --console <script.resc>`` manually to
     verify UART capture for a specific platform.
     """
-    return textwrap.dedent(f"""\
-        mach create
-        machine LoadPlatformDescription @{platform_file}
-        sysbus LoadELF @{elf_path}
-        start
-    """)
+    has_uart = False
+    try:
+        has_uart = "usart1" in Path(platform_file).read_text(encoding="utf-8")
+    except OSError:
+        pass
+
+    lines = [
+        "mach create",
+        f"machine LoadPlatformDescription @{platform_file}",
+        f"sysbus LoadELF @{elf_path}",
+    ]
+    if has_uart:
+        lines.append("showAnalyzer sysbus.usart1")
+    lines.append("start")
+    lines.append(f"sleep {run_seconds:.1f}")
+    return "\n".join(lines) + "\n"
 
 
 class RenodeEmulator:
@@ -192,8 +220,12 @@ class RenodeEmulator:
         if not shutil.which(self.BINARY):
             return _emulator_not_found(self.BINARY, t0)
 
+        # Leave headroom under the subprocess timeout for Renode's own startup/teardown (~1s) and
+        # the `renode --console` process exit, so `sleep <run_seconds>` finishes comfortably
+        # before `subprocess.run`'s timeout_s would otherwise kill it mid-run.
+        run_seconds = max(1.0, timeout_s - 5.0)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".resc", delete=False) as f:
-            f.write(_build_resc(elf_path, platform_file))
+            f.write(_build_resc(elf_path, platform_file, run_seconds=run_seconds))
             resc_path = f.name
 
         cmd = [self.BINARY, "--disable-xwt", "--console", resc_path]

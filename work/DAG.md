@@ -190,6 +190,7 @@ graph TD
     T_BL38["T-BL38: Copilot context bar — auto-track selected model's context window, place between model picker and send, constrain picker width, k-token count + click-through breakdown"]:::todo
     T_BL39["T-BL39: Copilot messages — remove the 'Assistant'/'Hi! Describe a part…' greeting, show the generating model(s) as attribution, compact the user/model display"]:::todo
     T_BL40["T-BL40: Universal in-app elicitation UI — agents question the user inline (multiple choice, short answer, open-ended) via the interaction contract"]:::todo
+    T_BL41["T-BL41: Sketch — auto-hide dimension/relation annotations by default; dimension tool reveals them and adds/deletes relations"]:::todo
   end
   subgraph WS_integration["workstream integration"]
     T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog

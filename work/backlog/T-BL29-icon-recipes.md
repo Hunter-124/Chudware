@@ -153,3 +153,4 @@ HANDOFF 2 section with traps and per-group notes.
    recipe variant or scenario hook.
 
 ## Progress log
+- 2026-07-03 22:58 UTC [sonnet-lumen] (foreman, Hunter direction 2026-07-03) CONTINUATION GUARANTEE: do not close T-BL29 with silent gaps — any icon group/tile you cannot complete must be left as an OPEN checkbox with a one-line reason, not dropped, so the missed/overlooked ones stay trackable. Follow-on task T-BL34 (icon pipeline v2: color the preview models + annotate operation intent over the tiles) depends_on T-BL29 and will re-generate on top of your recipe set — so land the current-pipeline recipes as-is; the coloring/annotation layer is T-BL34's job, not yours. If you surface a NEW gap, add it to T-BL29 or flag it for T-BL34.

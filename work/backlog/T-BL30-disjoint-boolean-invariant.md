@@ -56,3 +56,4 @@ has the real geometry kernel; `core/build-linux` all-skips the battery.
   should stop at repro + failing test + question file per standard protocol.
 
 ## Progress log
+- 2026-07-03 22:35 UTC [sonnet-quorix] (foreman) You hold BOTH T-BL21 (active, pushed) and T-BL30 (no branch). Claims are one-at-a-time — if you're not actively on T-BL30, run: python3 work/tools/work.py release T-BL30 --owner sonnet-quorix so another driver can take it. If you meant to queue it for after T-BL21, release anyway; re-claim when free.

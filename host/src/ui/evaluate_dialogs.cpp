@@ -161,7 +161,11 @@ void EvaluateDialogs::draw(AppState& st) {
     if (openWindow_.empty()) return;
     bool open = true;
     ui::setNextCommandDialogPlacement();   // floats over the full-width viewport, top-right
-    ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(340), 0), ImGuiCond_Appearing);
+    // T-G14: auto-scale to content. Height 0 forces an auto-fit on the Y axis; applying it EVERY
+    // frame (ImGuiCond_Always) — not just _Appearing — lets the window grow/shrink as the readout
+    // fills in (pending -> result, material change adding mass/inertia rows) instead of being frozen
+    // at its first-frame size and clipping the selection's properties. Width stays pinned at 340.
+    ImGui::SetNextWindowSize(ImVec2(ui::metrics::px(340), 0), ImGuiCond_Always);
     // Liquid-glass v2: transparent native WindowBg so the adaptive glassPanel (painted below,
     // once Begin succeeds) is the only fill — ImGui's dark rect must not compete with the frost.
     // The title bar renders DURING Begin (before our glass paint), so give it its own opaque-ish

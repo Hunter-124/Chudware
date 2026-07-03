@@ -3,7 +3,7 @@ id: T-F4
 title: Migrate intake, clarify, and DAG gates onto the interaction contract
 workstream: F
 owner: sonnet-clay
-status: doing
+status: review
 branch: task/T-F4-interaction-migration
 day: 9
 priority: 3

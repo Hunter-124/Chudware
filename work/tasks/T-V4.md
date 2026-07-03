@@ -2,8 +2,8 @@
 id: T-V4
 title: mcp-venv provisioning - close the 16 remaining declared-dep gaps
 workstream: V
-owner: unassigned
-status: todo
+owner: sonnet-plume
+status: doing
 branch: task/T-V4-venv-provisioning
 day: 4
 priority: 3

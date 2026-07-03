@@ -1152,6 +1152,21 @@ if(AICAD_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(picks PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # T-BL28: ruled/fill/boundary surface ops must accept body-edge selectors (the
+  # K_EDGE-well refs the ribbon emits), not just sketch refs. Drives compile_document
+  # directly (no host loader needed — asserts on CompileResult status/body_count).
+  add_executable(test_surfacing
+    tests/test_surfacing.cpp)
+  target_include_directories(test_surfacing PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_surfacing PRIVATE
+    aicad_doc aicad_geom_occt aicad_geom)
+  set_target_properties(test_surfacing PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME surfacing COMMAND test_surfacing)
+  set_tests_properties(surfacing PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- libaicad: the C ABI SHARED library (the host-integration seam) ---------
   # api/libaicad.{h,cpp} exposes a flat C ABI (aicad_call/aicad_free/aicad_abi_version)
   # over aicad::doc::compile_document so the host can load this lib at runtime

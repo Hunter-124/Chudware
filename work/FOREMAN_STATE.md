@@ -69,6 +69,9 @@ rework pushed) · eddy (T-BL22, usage limit, work pushed). heath/eddy branches c
   complete (contract+ask_user+in-app dialog already shipped T-F3/F4/F16), round-trip proof required.
 
 Copilot-tab cluster = T-BL38 + T-BL39 + T-BL40 (+ context/model theme); one driver could take all three in a shared build cycle when dispatch reopens.
+- **T-BL41** (P3 app-gui overhaul, todo): Sketch — auto-hide dimension/relation glyphs by default;
+  dimension tool reveals them + adds/deletes relations. Display-only (non-destructive); add/delete
+  may reach the sketch constraint API — Opus-leaning if it hits the solver.
 
 ## Human-gated (waiting on Hunter)
 - **sketch_new label call** (round-2): keep icon-only [ribbon.cpp ribbon_displayLabel L134 intentional]

@@ -25,6 +25,7 @@
 #include "theme/theme.h"
 #include "theme/icons.h"
 #include "theme/tokens.h"
+#include "theme/domain_tokens.h"
 #include "ui/toast.h"
 #include "ui/cursors.h"
 
@@ -1532,33 +1533,33 @@ static const char* featureFallback(const std::string& type) {
 // Groups: sketch, solid-add, solid-cut, dress-up, pattern, datum, sheet-metal, weldment, surface.
 static ImU32 categoryColor(const std::string& type, bool isCut) {
     if (type == "sketch")
-        return IM_COL32(86, 152, 245, 180);   // soft blue
+        return theme::featcat::sketch();   // soft blue
     if (isCut && (type == "extrude" || type == "revolve" ||
                   type == "sweep"   || type == "loft"))
-        return IM_COL32(245, 120, 72, 190);   // orange-red (solid-cut)
+        return theme::featcat::solidCut();   // orange-red (solid-cut)
     if (type == "extrude" || type == "revolve" || type == "sweep" || type == "loft" ||
         type == "box" || type == "cylinder" || type == "sphere" ||
         type == "cone" || type == "torus"   || type == "hole")
-        return IM_COL32(45, 212, 191, 190);   // teal accent (solid-add)
+        return theme::featcat::solidAdd();   // teal accent (solid-add)
     if (type == "fillet" || type == "chamfer" || type == "shell" ||
         type == "draft"  || type == "rib")
-        return IM_COL32(155, 120, 220, 190);  // purple (dress-up)
+        return theme::featcat::dressUp();  // purple (dress-up)
     if (type == "linear_pattern" || type == "circular_pattern" || type == "mirror")
-        return IM_COL32(74, 173, 204, 190);   // cyan (pattern)
+        return theme::featcat::pattern();   // cyan (pattern)
     if (type == "plane" || type == "datum_plane" ||
         type == "axis"  || type == "point" || type == "csys")
-        return IM_COL32(100, 140, 210, 190);  // slate-blue (datum)
+        return theme::featcat::datum();  // slate-blue (datum)
     if (type.size() >= 3 && type[0]=='s' && type[1]=='m' && type[2]=='_')
-        return IM_COL32(242, 182, 64, 190);   // amber (sheet-metal)
+        return theme::featcat::sheetMetal();   // amber (sheet-metal)
     if (type.size() >= 5 && type[0]=='w' && type[1]=='e' && type[2]=='l' &&
         type[3]=='d' && type[4]=='_')
-        return IM_COL32(220, 90, 80, 190);    // coral-red (weldment)
+        return theme::featcat::weldment();    // coral-red (weldment)
     if (type.size() >= 5 && type[0]=='s' && type[1]=='u' && type[2]=='r' &&
         type[3]=='f' && type[4]=='_')
-        return IM_COL32(90, 200, 110, 190);   // green (surface)
+        return theme::featcat::surface();   // green (surface)
     if (type == "boolean")
-        return IM_COL32(175, 120, 205, 190);  // soft purple (multi-body boolean)
-    return IM_COL32(120, 130, 148, 140);      // grey (unknown)
+        return theme::featcat::booleanOp();  // soft purple (multi-body boolean)
+    return theme::featcat::unknown();      // grey (unknown)
 }
 
 // ---- C20b: assembly tree (components + Mates folder) ----

@@ -3,6 +3,7 @@
 
 #include "artifact_cards.h"
 #include "platform/open_external.h"
+#include "platform/path_predicates.h"
 #include "theme/texture_cache.h"
 #include "theme/theme.h"
 
@@ -32,14 +33,8 @@ std::string stemOf(const std::string& path) {
     return stem.empty() ? path : stem;
 }
 
-bool isAbsolutePath(const std::string& p) {
-    if (p.empty()) return false;
-    if (p[0] == '/') return true;
-#if defined(_WIN32)
-    if (p.size() > 1 && p[1] == ':') return true;
-#endif
-    return false;
-}
+// isAbsolutePath lives in platform/paths.h (OS branching belongs in the platform layer).
+using platform::isAbsolutePath;
 
 // pages[].image.path / artifacts[].path are project-relative (contract deliverables/1 §5.4/§5.5)
 // — join with the absolute project_dir the worker returned alongside them.

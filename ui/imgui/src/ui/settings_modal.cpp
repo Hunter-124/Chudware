@@ -16,6 +16,7 @@
 
 #include "app/app_state.h"
 #include "theme/theme.h"
+#include "theme/domain_tokens.h"
 #include "cpp_core.h"
 #include "bootstrap.h"
 #include "ui/first_run.h"
@@ -39,7 +40,7 @@ static bool primaryButton(const char* label, const ImVec2& size) {
     ImGui::PushStyleColor(ImGuiCol_Button, theme::vec(p.accent));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::roleVec(p.accent, 1.15f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, theme::vec(p.accentDim));
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.04f, 0.10f, 0.10f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::panelview::accentButtonInk());
     bool r = ImGui::Button(label, size);
     ImGui::PopStyleColor(4);
     return r;

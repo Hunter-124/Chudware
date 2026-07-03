@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-R6-plm-project-hub
 depends_on: [T-R4, T-R5]
+lane: plm-projects
+kind: new
+priority: 3
 ---
 
 ## Context

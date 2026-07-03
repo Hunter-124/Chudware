@@ -7,6 +7,8 @@ status: done
 branch: task/T-G2-doc-tab-input-fix
 day: 1
 depends_on: [T-G1]
+lane: app-gui
+kind: fix
 ---
 
 ## Context

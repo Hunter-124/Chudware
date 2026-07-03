@@ -7,6 +7,8 @@ status: done
 branch: task/T-G4-gui-dead-code
 day: 2
 depends_on: [T-G1]
+lane: app-gui
+kind: fix
 ---
 
 ## Context

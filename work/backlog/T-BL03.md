@@ -6,6 +6,9 @@ owner: unassigned
 status: backlog
 branch: task/T-BL03-intake-gates
 depends_on: []
+lane: ai-copilot
+kind: new
+priority: 4
 ---
 
 ## Context

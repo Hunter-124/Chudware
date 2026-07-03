@@ -7,6 +7,8 @@ status: done
 branch: task/T-E4-cfd-handoff
 day: 8
 depends_on: [T-E2]
+lane: simulation
+kind: new
 ---
 
 ## Context

@@ -24,6 +24,22 @@ ROOT = Path(__file__).resolve().parent.parent  # work/
 STATUSES = {"todo", "doing", "review", "done", "blocked", "backlog"}
 REQUIRED = ("id", "title", "workstream", "owner", "status", "branch", "depends_on")
 
+# Workflow v2 (2026-07-03, Hunter directive — see work/WORKFLOW.md):
+# lane   = user-facing feature area (dashboard swim-rows; "what are we close to shipping")
+# kind   = fix (issue with an existing feature) | overhaul (redesign of existing) | new (unbuilt)
+# deferred: yes = parked plan (ML training, SaaS, ...) — hidden from ready/claim by default
+LANES = {
+    "modeling-core", "assemblies-drawings", "cam", "ecad-firmware", "simulation",
+    "parts-sourcing", "ai-copilot", "app-gui", "plm-projects", "platform-infra",
+    "ml-flywheel",
+}
+KINDS = {"fix", "overhaul", "new"}
+KIND_RANK = {"fix": 0, "overhaul": 1, "new": 2}  # fix-first tiebreak inside a priority
+
+
+def _is_deferred(t):
+    return str(t.get("deferred", "no")).lower() in ("yes", "true", "1")
+
 
 def parse_front_matter(path):
     text = path.read_text(encoding="utf-8")
@@ -78,6 +94,19 @@ def validate(tasks, errors):
         branch = t.get("branch", "")
         if not re.fullmatch(rf"task/{re.escape(tid)}-[A-Za-z0-9-]+", branch):
             errors.append(f"{name}: branch {branch!r} != task/{tid}-<slug>")
+        if "lane" in t and t["lane"] not in LANES:
+            errors.append(f"{name}: bad lane {t['lane']!r} (allowed: {sorted(LANES)})")
+        if "kind" in t and t["kind"] not in KINDS:
+            errors.append(f"{name}: bad kind {t['kind']!r} (allowed: {sorted(KINDS)})")
+        if "deferred" in t and str(t["deferred"]).lower() not in ("yes", "no", "true", "false"):
+            errors.append(f"{name}: deferred must be yes|no, got {t['deferred']!r}")
+        if "priority" in t:
+            try:
+                p = int(t["priority"])
+                if not 1 <= p <= 5:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errors.append(f"{name}: priority must be an int 1..5, got {t['priority']!r}")
         for dep in t.get("depends_on", []):
             if dep not in tasks:
                 errors.append(f"{name}: unknown dependency {dep}")
@@ -119,6 +148,8 @@ def cmd_ready(tasks, errors, args):
     for tid, t in sorted(tasks.items()):
         if t.get("status") != "todo":
             continue
+        if _is_deferred(t) and not getattr(args, "include_deferred", False):
+            continue
         if args.owner and t.get("owner", "").lower() != args.owner.lower():
             continue
         deps = t.get("depends_on", [])
@@ -127,9 +158,11 @@ def cmd_ready(tasks, errors, args):
     if not rows:
         print("no ready tasks")
         return 0
-    rows.sort(key=lambda t: (int(t.get("priority", 5) or 5), str(t.get("day", "99")), t["id"]))
+    rows.sort(key=lambda t: (int(t.get("priority", 5) or 5), str(t.get("day", "99")),
+                             KIND_RANK.get(t.get("kind"), 2), t["id"]))
     for t in rows:
-        print(f"{t['id']:>8}  P{t.get('priority', 5)}  day {t.get('day','-'):>2}  [{t.get('owner','?')}]  {t['title']}")
+        tags = f"{t.get('lane','-'):<18} {t.get('kind','-'):<8}"
+        print(f"{t['id']:>8}  P{t.get('priority', 5)}  {tags}  [{t.get('owner','?')}]  {t['title']}")
     return 0
 
 
@@ -141,6 +174,10 @@ def cmd_board(tasks, errors, args):
         rows = [t for t in rows if t.get("owner", "").lower() == args.owner.lower()]
     if getattr(args, "status", None):
         rows = [t for t in rows if t.get("status", "").lower() == args.status.lower()]
+    if getattr(args, "lane", None):
+        rows = [t for t in rows if t.get("lane", "").lower() == args.lane.lower()]
+    if getattr(args, "kind", None):
+        rows = [t for t in rows if t.get("kind", "").lower() == args.kind.lower()]
 
     if getattr(args, "json", False):
         out = [{k: v for k, v in t.items() if not k.startswith("_")}
@@ -259,6 +296,23 @@ def _set_front_matter(path, **updates):
     path.write_text(text, encoding="utf-8")
 
 
+def _upsert_front_matter(path, **updates):
+    """Like _set_front_matter but inserts missing keys before the closing ---."""
+    text = path.read_text(encoding="utf-8")
+    m = re.match(r"^---\s*\n(.*?)\n---\s*\n", text, re.DOTALL)
+    if not m:
+        raise RuntimeError(f"{path.name}: missing front matter")
+    for key, val in updates.items():
+        fm_block = m.group(1)
+        if re.search(rf"(?m)^{key}:", fm_block):
+            text = text[:m.start(1)] + re.sub(rf"(?m)^{key}:.*$", f"{key}: {val}",
+                                              fm_block, count=1) + text[m.end(1):]
+        else:
+            text = text[:m.end(1)] + f"\n{key}: {val}" + text[m.end(1):]
+        m = re.match(r"^---\s*\n(.*?)\n---\s*\n", text, re.DOTALL)
+    path.write_text(text, encoding="utf-8")
+
+
 def cmd_claim(tasks, errors, args):
     main = _main_worktree()
     if main.resolve() != ROOT.parent.resolve():
@@ -297,13 +351,14 @@ def cmd_claim(tasks, errors, args):
                 return 2
         else:
             cands = [t for t in tasks.values()
-                     if t["status"] == "todo" and unclaimed(t)
+                     if t["status"] == "todo" and unclaimed(t) and not _is_deferred(t)
                      and all(tasks.get(d, {}).get("status") == "done"
                              for d in t.get("depends_on", []))]
             # Priority-first auto-claim (Erik, 2026-07-03): lower `priority:` wins
-            # (1 = drop-everything, default 5), then day, then id.
+            # (1 = drop-everything, default 5), then day, then fix-before-new, then id.
             cands.sort(key=lambda t: (int(t.get("priority", 5) or 5),
-                                      str(t.get("day", "99")), t["id"]))
+                                      str(t.get("day", "99")),
+                                      KIND_RANK.get(t.get("kind"), 2), t["id"]))
         if not cands:
             print("NOTHING-TO-CLAIM: no unclaimed ready tasks (see `board` for in-flight work)")
             return 2
@@ -514,6 +569,184 @@ def cmd_checkdod(tasks, errors, args):
         lock.unlink(missing_ok=True)
 
 
+def cmd_set(tasks, errors, args):
+    """Steer a task's priority/lane/kind/deferred (metadata only — no ownership needed;
+    commits like note/status). This is how humans + foreman re-prioritize the board."""
+    lock = _lock()
+    try:
+        main = _main_worktree()
+        if _git(["remote"], main).stdout.strip():
+            if not _safe_sync(main):
+                print("BUSY: main checkout diverged from origin (foreman mid-session)"
+                      " — retry in ~60s", file=sys.stderr)
+                return 3
+        tasks, _ = load_tasks()
+        if args.task_id not in tasks:
+            raise RuntimeError(f"unknown task {args.task_id}")
+        t = tasks[args.task_id]
+        updates, parts = {}, []
+        if args.priority is not None:
+            if not 1 <= args.priority <= 5:
+                raise RuntimeError("priority must be 1..5")
+            updates["priority"] = args.priority
+            parts.append(f"P{args.priority}")
+        if args.lane:
+            if args.lane not in LANES:
+                raise RuntimeError(f"bad lane (allowed: {sorted(LANES)})")
+            updates["lane"] = args.lane
+            parts.append(f"lane={args.lane}")
+        if args.kind:
+            if args.kind not in KINDS:
+                raise RuntimeError(f"bad kind (allowed: {sorted(KINDS)})")
+            updates["kind"] = args.kind
+            parts.append(f"kind={args.kind}")
+        if args.deferred:
+            updates["deferred"] = args.deferred
+            parts.append(f"deferred={args.deferred}")
+        if not updates:
+            raise RuntimeError("nothing to set (use --priority/--lane/--kind/--deferred)")
+        _upsert_front_matter(t["_path"], **updates)
+        if args.reason:
+            stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+            text = t["_path"].read_text(encoding="utf-8")
+            if "## Progress log" not in text:
+                text = text.rstrip() + "\n\n## Progress log\n"
+            text = text.rstrip() + f"\n- {stamp} [{args.owner}] set {', '.join(parts)}: {args.reason}\n"
+            t["_path"].write_text(text, encoding="utf-8")
+        _commit_task_change(t, f"set {args.task_id} {' '.join(parts)} ({args.owner})")
+        print(f"SET: {args.task_id} {' '.join(parts)}")
+        return 0
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def _dependents_index(tasks):
+    idx = {}
+    for tid, t in tasks.items():
+        for dep in t.get("depends_on", []):
+            idx.setdefault(dep, []).append(tid)
+    return idx
+
+
+def _downstream_open(tasks, tid, idx):
+    """Transitive not-done dependents of tid (the work this task is holding up)."""
+    seen, stack, out = set(), [tid], []
+    while stack:
+        cur = stack.pop()
+        for nxt in idx.get(cur, []):
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            if tasks[nxt].get("status") != "done":
+                out.append(nxt)
+            stack.append(nxt)
+    return out
+
+
+def _open_questions():
+    qs = []
+    qdir = ROOT / "questions"
+    if qdir.is_dir():
+        for path in sorted(qdir.glob("*.md")):
+            n = len(re.findall(r"(?m)^## Q\d+ \(open\)", path.read_text(encoding="utf-8")))
+            if n:
+                qs.append({"file": f"work/questions/{path.name}", "open": n})
+    return qs
+
+
+def _roadblock_impact(tasks, t, idx):
+    down = _downstream_open(tasks, t["id"], idx)
+    live = [d for d in down if not _is_deferred(tasks[d])]
+    min_p = min((int(tasks[d].get("priority", 5) or 5) for d in live), default=None)
+    self_p = int(t.get("priority", 5) or 5)
+    if min_p is not None and min_p <= 2:
+        verdict = "HIGH-IMPACT: blocks P%d work — merge/answer or relink to unblock" % min_p
+    elif self_p >= 4 and (min_p is None or min_p >= 4):
+        verdict = "low-impact: nothing important waits on this — candidate to defer/skip"
+    else:
+        verdict = "normal"
+    return {"blocks": live, "blocks_min_priority": min_p, "verdict": verdict}
+
+
+def cmd_roadblocks(tasks, errors, args):
+    """Everything waiting on a HUMAN, with impact analysis: review-queue merges,
+    open questions, human-owned tasks, blocked tasks. --json for the dashboard."""
+    idx = _dependents_index(tasks)
+    def row(t):
+        r = {k: v for k, v in t.items() if not k.startswith("_")}
+        r.update(_roadblock_impact(tasks, t, idx))
+        return r
+    data = {
+        "review_queue": [row(t) for t in tasks.values() if t.get("status") == "review"],
+        "blocked": [row(t) for t in tasks.values() if t.get("status") == "blocked"],
+        "human_owned": [row(t) for t in tasks.values()
+                        if t.get("owner") == "main-checkout"
+                        and t.get("status") not in ("done", "backlog")],
+        "questions": _open_questions(),
+    }
+    for key in ("review_queue", "blocked", "human_owned"):
+        data[key].sort(key=lambda r: (r["blocks_min_priority"] or 9,
+                                      int(r.get("priority", 5) or 5), r["id"]))
+    if getattr(args, "json", False):
+        print(json.dumps(data))
+        return 0
+    for key, label in (("review_queue", "NEEDS HUMAN MERGE (status: review)"),
+                       ("blocked", "BLOCKED"),
+                       ("human_owned", "HUMAN-OWNED (main-checkout)")):
+        if data[key]:
+            print(f"\n== {label} ==")
+            for r in data[key]:
+                holds = f" — holds up {len(r['blocks'])} task(s)" if r["blocks"] else ""
+                print(f"  {r['id']:>8}  P{r.get('priority', 5)}  [{r.get('owner','?')}]  {r['title']}{holds}")
+                if r["verdict"] != "normal":
+                    print(f"           ^ {r['verdict']}")
+    if data["questions"]:
+        print("\n== OPEN QUESTIONS ==")
+        for q in data["questions"]:
+            print(f"  {q['open']} open in {q['file']}")
+    if not any(data.values()):
+        print("no human roadblocks — nothing is waiting on you")
+    return 0
+
+
+def cmd_lanes(tasks, errors, args):
+    """Per-lane rollup sorted by closeness to shipping. --json for the dashboard."""
+    lanes = {}
+    for t in tasks.values():
+        lane = t.get("lane", "(untagged)")
+        L = lanes.setdefault(lane, {"lane": lane, "total": 0, "done": 0, "doing": 0,
+                                    "review": 0, "todo": 0, "blocked": 0, "backlog": 0,
+                                    "deferred": 0, "fix_open": 0, "new_open": 0})
+        if _is_deferred(t):
+            L["deferred"] += 1
+            continue
+        L["total"] += 1
+        L[t.get("status", "todo")] = L.get(t.get("status", "todo"), 0) + 1
+        if t.get("status") not in ("done",):
+            if t.get("kind") == "fix":
+                L["fix_open"] += 1
+            elif t.get("kind") == "new":
+                L["new_open"] += 1
+    rows = []
+    for L in lanes.values():
+        L["pct_done"] = round(100.0 * L["done"] / L["total"], 1) if L["total"] else 0.0
+        rows.append(L)
+    rows.sort(key=lambda L: (-L["pct_done"], L["lane"]))
+    if getattr(args, "json", False):
+        print(json.dumps(rows))
+        return 0
+    print(f"{'lane':<20} {'done':>5} {'total':>5} {'%':>6}  {'doing':>5} {'review':>6} "
+          f"{'todo':>4} {'blkd':>4}  {'fix-open':>8} {'new-open':>8} {'defer':>5}")
+    for L in rows:
+        print(f"{L['lane']:<20} {L['done']:>5} {L['total']:>5} {L['pct_done']:>5}%  "
+              f"{L['doing']:>5} {L['review']:>6} {L['todo']:>4} {L['blocked']:>4}  "
+              f"{L['fix_open']:>8} {L['new_open']:>8} {L['deferred']:>5}")
+    return 0
+
+
 def cmd_prompt(tasks, errors, args):
     tid = args.task_id
     if tid not in tasks:
@@ -539,11 +772,26 @@ def main():
     sub.add_parser("validate")
     p_ready = sub.add_parser("ready")
     p_ready.add_argument("--owner")
+    p_ready.add_argument("--include-deferred", dest="include_deferred", action="store_true")
     p_board = sub.add_parser("board")
     p_board.add_argument("--workstream")
     p_board.add_argument("--owner")
     p_board.add_argument("--status")
+    p_board.add_argument("--lane")
+    p_board.add_argument("--kind")
     p_board.add_argument("--json", action="store_true")
+    p_set = sub.add_parser("set")
+    p_set.add_argument("task_id")
+    p_set.add_argument("--owner", required=True)
+    p_set.add_argument("--priority", type=int, default=None)
+    p_set.add_argument("--lane", default=None)
+    p_set.add_argument("--kind", default=None)
+    p_set.add_argument("--deferred", default=None, choices=["yes", "no"])
+    p_set.add_argument("--reason", default=None)
+    p_road = sub.add_parser("roadblocks")
+    p_road.add_argument("--json", action="store_true")
+    p_lanes = sub.add_parser("lanes")
+    p_lanes.add_argument("--json", action="store_true")
     sub.add_parser("dag")
     p_prompt = sub.add_parser("prompt")
     p_prompt.add_argument("task_id")
@@ -577,7 +825,8 @@ def main():
           "board": cmd_board, "dag": cmd_dag, "prompt": cmd_prompt,
           "claim": cmd_claim, "note": cmd_note, "status": cmd_status,
           "release": cmd_release, "relink": cmd_relink,
-          "checkdod": cmd_checkdod}[args.cmd]
+          "checkdod": cmd_checkdod, "set": cmd_set,
+          "roadblocks": cmd_roadblocks, "lanes": cmd_lanes}[args.cmd]
     sys.exit(fn(tasks, errors, args))
 
 

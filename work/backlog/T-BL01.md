@@ -6,6 +6,8 @@ owner: sonnet-alder
 status: done
 branch: task/T-BL01-vv-harness
 depends_on: []
+lane: simulation
+kind: new
 ---
 
 ## Context

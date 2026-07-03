@@ -7,6 +7,8 @@ status: done
 branch: task/T-E2-network-solve
 day: 7
 depends_on: [T-E1]
+lane: simulation
+kind: new
 ---
 
 ## Context

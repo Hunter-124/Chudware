@@ -6,6 +6,8 @@ owner: unassigned
 status: backlog
 branch: task/T-BL15-doc-version-control
 depends_on: []
+lane: plm-projects
+kind: new
 ---
 
 ## Context

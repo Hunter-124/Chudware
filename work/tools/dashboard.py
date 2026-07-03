@@ -1,93 +1,110 @@
 #!/usr/bin/env python3
-"""dashboard.py — read-only team-progress viewer for AI-CAD contributors.
+"""dashboard.py — AI-CAD team-progress local web dashboard.
 
-Tkinter (stdlib only). Three tabs, all display-only — nothing here claims,
-edits, or writes anything:
-  1. Human Roadblocks — everything blocked on a human right now (top priority).
-  2. DAG — the master task graph, color-coded, greyed where blocked on unmet
-     deps or awaiting human review. Click a node to see its details (read-only).
-  3. Graphify Preview — live query/explain with a staleness banner.
+Starts a stdlib HTTP server on port 8787 (--port to override),
+serves the single-page app from dashboard_web/, and opens the
+browser automatically (--no-open to skip).
 
-To actually change the plan (claim a task, add a note, edit dependencies,
-change status), talk to an AI driver in Claude Code — it has the same data
-this dashboard shows via the aicad-team MCP tools (work_board, claim, note,
-set_status, work_relink, ...), or let autopilot (work/prompts/autopilot.md)
-decide on its own. Keeping this GUI to pure display avoids a large surface of
-interactive-widget bugs for a window whose only job is "let me see the plan."
+Run:  python3 work/tools/dashboard.py
+      python3 work/tools/dashboard.py --port 8888
+      python3 work/tools/dashboard.py --no-open
 
-Auto-refreshes every 30s; manual "Refresh now" also available.
-
-Run:  python3 work/tools/dashboard.py   (or work/run_version_control.sh/.bat)
+The only write path is POST /api/set which shells out to work.py set
+with validated arguments (list args, never shell=True, bound to 127.0.0.1).
 """
+
+import argparse
 import json
-import queue
+import os
 import re
 import shutil
 import subprocess
 import sys
 import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from socketserver import ThreadingMixIn
+from urllib.parse import parse_qs, urlparse
 
-try:
-    import tkinter as tk
-    from tkinter import messagebox, scrolledtext, ttk
-except ImportError:
-    print("tkinter is not available in this Python install.\n"
-          "  Debian/Ubuntu/Fedora: install the 'python3-tk' package, then re-run.\n"
-          "  Windows/macOS python.org installers include it by default.",
-          file=sys.stderr)
-    sys.exit(1)
-
+# ---------- paths
 TOOLS_DIR = Path(__file__).resolve().parent
-WORK = TOOLS_DIR.parent
-REPO = WORK.parent
-PY = sys.executable or "python3"
+WEB_DIR   = TOOLS_DIR / "dashboard_web"
+WORK_DIR  = TOOLS_DIR.parent
+REPO_DIR  = WORK_DIR.parent
+PY        = sys.executable or "python3"
 
+# Bring _teamlib onto sys.path
+sys.path.insert(0, str(TOOLS_DIR))
 import _teamlib
 
-STATUS_COLORS = {
-    "todo":    ("#e8e8e8", "#999999"),
-    "doing":   ("#cfe3ff", "#4a90d9"),
-    "review":  ("#ffe9b8", "#d9a441"),
-    "done":    ("#cdeec9", "#57a05a"),
-    "blocked": ("#f5c6c6", "#c0504d"),
-    "backlog": ("#f4f0fa", "#b0a3c9"),
+# ---------- valid sets for /api/set
+VALID_LANES = {
+    "modeling-core", "assemblies-drawings", "cam", "ecad-firmware",
+    "simulation", "parts-sourcing", "ai-copilot", "app-gui",
+    "plm-projects", "platform-infra", "ml-flywheel",
 }
-LOCKED_COLOR = ("#d9d9d9", "#888888")
-AUTO_REFRESH_MS = 30_000
+VALID_KINDS = {"fix", "overhaul", "new"}
+VALID_DEFERRED = {"yes", "no"}
 
 
-# ==================================================================== data helpers
+# ============================================================
+# Data helpers (reused from old dashboard.py)
+# ============================================================
 
-def load_board():
-    r = subprocess.run([PY, str(TOOLS_DIR / "work.py"), "board", "--json"],
-                       cwd=str(REPO), capture_output=True, text=True, timeout=30)
+def _run_work(*args, timeout=30):
+    r = subprocess.run(
+        [PY, str(TOOLS_DIR / "work.py"), *args],
+        cwd=str(REPO_DIR), capture_output=True, text=True, timeout=timeout,
+    )
+    return r
+
+
+def load_board_json():
+    r = _run_work("board", "--json")
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or "work.py board --json failed")
     return json.loads(r.stdout)
 
 
+def load_roadblocks_json():
+    r = _run_work("roadblocks", "--json")
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "work.py roadblocks --json failed")
+    return json.loads(r.stdout)
+
+
+def load_lanes_json():
+    r = _run_work("lanes", "--json")
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "work.py lanes --json failed")
+    return json.loads(r.stdout)
+
+
 def load_task_text(task_id):
     for sub in ("tasks", "backlog"):
-        p = WORK / sub / f"{task_id}.md"
+        p = WORK_DIR / sub / f"{task_id}.md"
         if p.exists():
             return p.read_text(encoding="utf-8")
     return ""
 
 
 def parse_dod(text):
-    """Return [(checked, label), ...] for '## Definition of done' checkboxes."""
+    """Return [{"checked": bool, "label": str}, ...] for ## Definition of done."""
     lines = text.splitlines()
     try:
         start = next(i for i, l in enumerate(lines) if l.strip() == "## Definition of done")
     except StopIteration:
         return []
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")),
+        len(lines),
+    )
     items = []
     for i in range(start, end):
         m = re.match(r"^\s*- \[([ xX])\]\s*(.*)", lines[i])
         if m:
-            items.append((m.group(1).lower() == "x", m.group(2)))
+            items.append({"checked": m.group(1).lower() == "x", "label": m.group(2)})
     return items
 
 
@@ -97,323 +114,260 @@ def parse_progress_log(text):
         start = next(i for i, l in enumerate(lines) if l.strip() == "## Progress log")
     except StopIteration:
         return []
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
-    return [l for l in lines[start + 1:end] if l.strip().startswith("- ")]
+    end = next(
+        (i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")),
+        len(lines),
+    )
+    return [l for l in lines[start + 1 : end] if l.strip().startswith("- ")][-5:]
 
 
-def unanswered_questions():
-    """[(stem, open_count), ...] for work/questions/*.md with any '## Qn (open)'."""
-    d = WORK / "questions"
-    out = []
-    if d.is_dir():
-        for p in sorted(d.glob("*.md")):
-            if p.name == "README.md":
-                continue
-            text = p.read_text(encoding="utf-8")
-            opens = re.findall(r"^## Q\d+ \(open\)", text, re.MULTILINE)
-            if opens:
-                out.append((p.stem, len(opens)))
-    return out
+def graphify_freshness_note():
+    return _teamlib.graphify_freshness(REPO_DIR) or ""
 
 
-# ==================================================================== App
+def run_graphify(mode, query):
+    """mode = 'query' or 'explain'. Returns output string."""
+    if shutil.which("graphify") is None:
+        return "graphify CLI not found on PATH — see README setup."
+    try:
+        r = subprocess.run(
+            ["graphify", mode, query],
+            cwd=str(REPO_DIR), capture_output=True, text=True, timeout=60,
+        )
+        return r.stdout.strip() or r.stderr.strip() or "(no output)"
+    except Exception as e:
+        return f"error: {e}"
 
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("AI-CAD — Team Progress (read-only)")
-        self.geometry("1200x780")
-        self.q = queue.Queue()
-        self.tasks = []
-        self.tasks_by_id = {}
-        self.selected_task = None
-        self._build_ui()
-        self.after(150, self._poll_queue)
-        self.refresh_all()
-        self.after(AUTO_REFRESH_MS, self._auto_refresh)
 
-    # ---------------------------------------------------------------- shell
+# ============================================================
+# HTTP handler
+# ============================================================
 
-    def _build_ui(self):
-        bar = ttk.Frame(self)
-        bar.pack(fill="x", padx=8, pady=4)
-        ttk.Label(bar, text="Display-only — to change the plan, ask an AI driver in Claude "
-                            "Code or let autopilot decide.", foreground="#666").pack(side="left")
-        ttk.Button(bar, text="Refresh now", command=self.refresh_all).pack(side="right")
-        self.status_var = tk.StringVar(value="Loading…")
-        ttk.Label(bar, textvariable=self.status_var, foreground="#555").pack(side="right", padx=10)
+CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css":  "text/css; charset=utf-8",
+    ".js":   "application/javascript; charset=utf-8",
+    ".json": "application/json",
+    ".svg":  "image/svg+xml",
+    ".ico":  "image/x-icon",
+}
 
-        self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, padx=8, pady=4)
+SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 
-        self.roadblocks_frame = ttk.Frame(self.nb)
-        self.dag_frame = ttk.Frame(self.nb)
-        self.graphify_frame = ttk.Frame(self.nb)
-        self.nb.add(self.roadblocks_frame, text="Human Roadblocks")
-        self.nb.add(self.dag_frame, text="DAG")
-        self.nb.add(self.graphify_frame, text="Graphify Preview")
 
-        self._build_roadblocks_tab()
-        self._build_dag_tab()
-        self._build_graphify_tab()
+class DashboardHandler(BaseHTTPRequestHandler):
+    """Handle GET (static files + JSON API) and POST (/api/set)."""
 
-    # ---------------------------------------------------------------- refresh / threading
+    def log_message(self, fmt, *args):  # quieter logs
+        pass  # comment out to re-enable access log
 
-    def refresh_all(self):
-        self.status_var.set("Loading…")
-        threading.Thread(target=self._load_board_worker, daemon=True).start()
+    def _send_json(self, data, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
 
-    def _auto_refresh(self):
-        self.refresh_all()
-        self.after(AUTO_REFRESH_MS, self._auto_refresh)
+    def _send_error_json(self, status, msg):
+        self._send_json({"error": msg, "out": msg}, status)
 
-    def _load_board_worker(self):
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        # ---------- root → index.html
+        if path == "/" or path == "":
+            path = "/index.html"
+
+        # ---------- API routes
+        if path.startswith("/api/"):
+            self._handle_api_get(parsed)
+            return
+
+        # ---------- static files from dashboard_web/
+        file_path = WEB_DIR / path.lstrip("/")
+        if not file_path.resolve().is_relative_to(WEB_DIR):
+            self._send_error_json(403, "Forbidden")
+            return
+        if not file_path.exists() or not file_path.is_file():
+            self._send_error_json(404, f"Not found: {path}")
+            return
+
+        suffix = file_path.suffix.lower()
+        ctype = CONTENT_TYPES.get(suffix, "application/octet-stream")
+        body = file_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_api_get(self, parsed):
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+
         try:
-            self.q.put(("board_loaded", (load_board(), None)))
+            if path == "/api/board.json":
+                self._send_json(load_board_json())
+
+            elif path == "/api/roadblocks.json":
+                self._send_json(load_roadblocks_json())
+
+            elif path == "/api/lanes.json":
+                self._send_json(load_lanes_json())
+
+            elif path == "/api/freshness.json":
+                note = graphify_freshness_note()
+                self._send_json({"note": note})
+
+            elif path == "/api/graphify.json":
+                mode  = qs.get("mode", ["query"])[0]
+                query = qs.get("q", [""])[0].strip()
+                if mode not in ("query", "explain"):
+                    self._send_error_json(400, "mode must be query or explain")
+                    return
+                if not query:
+                    self._send_error_json(400, "q is required")
+                    return
+                result = run_graphify(mode, query)
+                self._send_json({"result": result})
+
+            elif path.startswith("/api/task/"):
+                # /api/task/<id>.json
+                task_id = path[len("/api/task/"):]
+                if task_id.endswith(".json"):
+                    task_id = task_id[:-5]
+                if not SAFE_ID_RE.match(task_id):
+                    self._send_error_json(400, "Invalid task id")
+                    return
+                text = load_task_text(task_id)
+                self._send_json({
+                    "dod": parse_dod(text),
+                    "log": parse_progress_log(text),
+                })
+
+            else:
+                self._send_error_json(404, f"Unknown API endpoint: {path}")
+
         except Exception as e:
-            self.q.put(("board_loaded", ([], str(e))))
+            self._send_error_json(500, str(e))
 
-    def _poll_queue(self):
+    def do_POST(self):
+        if self.path != "/api/set":
+            self._send_error_json(404, "Not found")
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
         try:
-            while True:
-                kind, payload = self.q.get_nowait()
-                if kind == "board_loaded":
-                    tasks, err = payload
-                    if err:
-                        self.status_var.set(f"board load error: {err}")
-                    else:
-                        self.tasks = tasks
-                        self.tasks_by_id = {t["id"]: t for t in tasks}
-                        self.render_dag()
-                        self.render_roadblocks()
-                        self.refresh_graphify_freshness()
-                        self.status_var.set(f"loaded {len(tasks)} tasks")
-                elif kind == "graphify_result":
-                    self._show_graphify_result(payload)
-        except queue.Empty:
-            pass
-        self.after(150, self._poll_queue)
-
-    # ---------------------------------------------------------------- tab 1: Human Roadblocks
-
-    def _build_roadblocks_tab(self):
-        f = self.roadblocks_frame
-        ttk.Label(f, text="Everything here is blocked on a human right now — check this tab first.",
-                  font=("TkDefaultFont", 10, "italic")).pack(anchor="w", padx=8, pady=6)
-        self.roadblocks_text = scrolledtext.ScrolledText(f, wrap="word", state="disabled")
-        self.roadblocks_text.pack(fill="both", expand=True, padx=8, pady=4)
-
-    def render_roadblocks(self):
-        lines = []
-        review = [t for t in self.tasks if t.get("status") == "review"]
-        main_checkout = [t for t in self.tasks
-                         if t.get("owner") == "main-checkout" and t.get("status") != "done"]
-        blocked = [t for t in self.tasks if t.get("status") == "blocked"]
-        questions = unanswered_questions()
-
-        if review:
-            lines.append(f"AWAITING MERGE ({len(review)}) — pushed, ready for human review:")
-            lines += [f"  {t['id']:>8}  [{t.get('owner')}]  {t['title']}" for t in review]
-            lines.append("")
-        if questions:
-            lines.append(f"OPEN DRIVER QUESTIONS ({len(questions)}) — need advisor/human answer:")
-            lines += [f"  work/questions/{stem}.md  ({n} open question(s))" for stem, n in questions]
-            lines.append("")
-        if main_checkout:
-            lines.append(f"HUMAN-ONLY TASKS ({len(main_checkout)}) — owner: main-checkout:")
-            lines += [f"  {t['id']:>8}  {t.get('status')}  {t['title']}" for t in main_checkout]
-            lines.append("")
-        if blocked:
-            lines.append(f"BLOCKED TASKS ({len(blocked)}):")
-            lines += [f"  {t['id']:>8}  [{t.get('owner')}]  {t['title']}" for t in blocked]
-            lines.append("")
-        if not lines:
-            lines = ["Nothing is currently blocked on a human."]
-
-        self.roadblocks_text.config(state="normal")
-        self.roadblocks_text.delete("1.0", "end")
-        self.roadblocks_text.insert("1.0", "\n".join(lines))
-        self.roadblocks_text.config(state="disabled")
-
-    # ---------------------------------------------------------------- tab 2: DAG
-
-    def _build_dag_tab(self):
-        f = self.dag_frame
-        ttk.Label(f, text="Legend: grey = locked (unmet deps, or awaiting human review). "
-                          "Click a node for details.").pack(anchor="w", padx=4, pady=2)
-
-        body = ttk.Frame(f)
-        body.pack(fill="both", expand=True)
-        canvas_frame = ttk.Frame(body)
-        canvas_frame.pack(side="left", fill="both", expand=True)
-        self.dag_canvas = tk.Canvas(canvas_frame, background="white")
-        hbar = ttk.Scrollbar(canvas_frame, orient="horizontal", command=self.dag_canvas.xview)
-        vbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.dag_canvas.yview)
-        self.dag_canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
-        self.dag_canvas.grid(row=0, column=0, sticky="nsew")
-        vbar.grid(row=0, column=1, sticky="ns")
-        hbar.grid(row=1, column=0, sticky="ew")
-        canvas_frame.rowconfigure(0, weight=1)
-        canvas_frame.columnconfigure(0, weight=1)
-
-        side = ttk.Frame(body, width=320)
-        side.pack(side="right", fill="y")
-        side.pack_propagate(False)
-        ttk.Label(side, text="Task details", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", padx=8, pady=(8, 2))
-        self.dag_detail = scrolledtext.ScrolledText(side, wrap="word", state="disabled", height=30)
-        self.dag_detail.pack(fill="both", expand=True, padx=8, pady=4)
-        self._set_dag_detail("Click a task node to see its details.")
-
-    def _set_dag_detail(self, text):
-        self.dag_detail.config(state="normal")
-        self.dag_detail.delete("1.0", "end")
-        self.dag_detail.insert("1.0", text)
-        self.dag_detail.config(state="disabled")
-
-    def _node_color(self, t):
-        status = t.get("status", "todo")
-        deps = t.get("depends_on", [])
-        deps_done = all(self.tasks_by_id.get(d, {}).get("status") == "done" for d in deps)
-        if status == "todo" and not deps_done:
-            return LOCKED_COLOR
-        if status == "review":
-            return LOCKED_COLOR
-        return STATUS_COLORS.get(status, STATUS_COLORS["todo"])
-
-    def render_dag(self):
-        c = self.dag_canvas
-        c.delete("all")
-        NODE_W, NODE_H = 190, 46
-        COL_GAP, ROW_GAP = 60, 16
-        by_ws = {}
-        for t in self.tasks:
-            by_ws.setdefault(t.get("workstream", "?"), []).append(t)
-        cols = sorted(by_ws)
-
-        positions, col_headers, max_rows = {}, [], 0
-        for ci, ws in enumerate(cols):
-            x0 = 20 + ci * (NODE_W + COL_GAP)
-            col_headers.append((x0 + NODE_W / 2, ws))
-            rows = sorted(by_ws[ws], key=lambda x: (str(x.get("day", "99")), x["id"]))
-            max_rows = max(max_rows, len(rows))
-            for ri, t in enumerate(rows):
-                y0 = 36 + ri * (NODE_H + ROW_GAP)
-                positions[t["id"]] = (x0, y0, x0 + NODE_W, y0 + NODE_H, t)
-
-        for t in self.tasks:
-            for dep in t.get("depends_on", []):
-                if dep in positions and t["id"] in positions:
-                    dx0, dy0, dx1, dy1, _ = positions[dep]
-                    x0, y0, x1, y1, _ = positions[t["id"]]
-                    c.create_line((dx0 + dx1) / 2, dy1, (x0 + x1) / 2, y0,
-                                  arrow=tk.LAST, fill="#aaaaaa", width=1)
-
-        for cx, ws in col_headers:
-            c.create_text(cx, 14, text=f"workstream {ws}", font=("TkDefaultFont", 10, "bold"))
-
-        for tid, (x0, y0, x1, y1, t) in positions.items():
-            fill, outline = self._node_color(t)
-            rect = c.create_rectangle(x0, y0, x1, y1, fill=fill, outline=outline, width=2)
-            label = f"{t['id']}  {t.get('status', '?')}\n[{t.get('owner', '?')}]\n{t['title'][:32]}"
-            txt = c.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=label,
-                                width=NODE_W - 10, font=("TkDefaultFont", 8))
-            c.tag_bind(rect, "<Button-1>", lambda e, tid=tid: self.on_select_node(tid))
-            c.tag_bind(txt, "<Button-1>", lambda e, tid=tid: self.on_select_node(tid))
-
-        width = 20 + len(cols) * (NODE_W + COL_GAP) + 40
-        height = 36 + max_rows * (NODE_H + ROW_GAP) + 40
-        c.configure(scrollregion=(0, 0, max(width, 400), max(height, 300)))
-
-        if self.selected_task and self.selected_task in self.tasks_by_id:
-            self.on_select_node(self.selected_task)
-
-    def on_select_node(self, task_id):
-        self.selected_task = task_id
-        t = self.tasks_by_id.get(task_id)
-        if not t:
+            payload = json.loads(body)
+        except Exception:
+            self._send_error_json(400, "Invalid JSON body")
             return
-        deps = t.get("depends_on", [])
-        deps_done = all(self.tasks_by_id.get(d, {}).get("status") == "done" for d in deps)
-        locked = (t.get("status") == "todo" and not deps_done) or t.get("status") == "review"
-        lines = [
-            t["id"], t["title"], "",
-            f"status:      {t.get('status')}",
-            f"owner:       {t.get('owner')}",
-            f"workstream:  {t.get('workstream')}",
-            f"day:         {t.get('day', '-')}",
-            f"branch:      {t.get('branch', '-')}",
-            f"depends_on:  {', '.join(deps) or '(none)'}",
-        ]
-        if locked:
-            reason = "awaiting human merge" if t.get("status") == "review" else \
-                     "blocked on: " + ", ".join(d for d in deps
-                                                if self.tasks_by_id.get(d, {}).get("status") != "done")
-            lines += ["", f"LOCKED — {reason}"]
-        self._set_dag_detail("\n".join(lines))
 
-    # ---------------------------------------------------------------- tab 3: Graphify Preview
+        self._handle_api_set(payload)
 
-    def _build_graphify_tab(self):
-        f = self.graphify_frame
-        self.graphify_fresh_var = tk.StringVar(value="")
-        ttk.Label(f, textvariable=self.graphify_fresh_var, foreground="#a55",
-                  wraplength=1100).pack(anchor="w", padx=8, pady=(6, 0))
-
-        row = ttk.Frame(f)
-        row.pack(fill="x", padx=8, pady=6)
-        ttk.Label(row, text="Query:").pack(side="left")
-        self.graphify_q_var = tk.StringVar()
-        entry = ttk.Entry(row, textvariable=self.graphify_q_var, width=70)
-        entry.pack(side="left", padx=4, fill="x", expand=True)
-        entry.bind("<Return>", lambda e: self._on_graphify_query())
-        ttk.Button(row, text="Query", command=self._on_graphify_query).pack(side="left", padx=2)
-        ttk.Button(row, text="Explain", command=self._on_graphify_explain).pack(side="left", padx=2)
-
-        self.graphify_out = scrolledtext.ScrolledText(f, wrap="word", state="disabled")
-        self.graphify_out.pack(fill="both", expand=True, padx=8, pady=4)
-
-    def refresh_graphify_freshness(self):
-        note = _teamlib.graphify_freshness(REPO)
-        self.graphify_fresh_var.set(note.strip() if note else "")
-
-    def _on_graphify_query(self):
-        self._graphify_run(["query", self.graphify_q_var.get().strip()])
-
-    def _on_graphify_explain(self):
-        self._graphify_run(["explain", self.graphify_q_var.get().strip()])
-
-    def _graphify_run(self, args):
-        if not args[-1]:
+    def _handle_api_set(self, payload):
+        task_id = payload.get("id", "")
+        if not task_id or not SAFE_ID_RE.match(task_id):
+            self._send_error_json(400, "Missing or invalid id")
             return
-        threading.Thread(target=self._graphify_worker, args=(args,), daemon=True).start()
 
-    def _graphify_worker(self, args):
-        if shutil.which("graphify") is None:
-            self.q.put(("graphify_result", "graphify CLI not on PATH — see README.md setup."))
-            return
+        cmd = [PY, str(TOOLS_DIR / "work.py"), "set", task_id, "--owner", "dashboard"]
+
+        # priority
+        priority = payload.get("priority")
+        if priority is not None:
+            try:
+                p = int(priority)
+                if not 1 <= p <= 5:
+                    raise ValueError
+            except (ValueError, TypeError):
+                self._send_error_json(400, "priority must be int 1-5")
+                return
+            cmd += ["--priority", str(p)]
+
+        # lane
+        lane = payload.get("lane")
+        if lane is not None:
+            if lane not in VALID_LANES:
+                self._send_error_json(400, f"Invalid lane: {lane}")
+                return
+            cmd += ["--lane", lane]
+
+        # kind
+        kind = payload.get("kind")
+        if kind is not None:
+            if kind not in VALID_KINDS:
+                self._send_error_json(400, f"Invalid kind: {kind}")
+                return
+            cmd += ["--kind", kind]
+
+        # deferred
+        deferred = payload.get("deferred")
+        if deferred is not None:
+            if deferred not in VALID_DEFERRED:
+                self._send_error_json(400, "deferred must be 'yes' or 'no'")
+                return
+            cmd += ["--deferred", deferred]
+
+        # reason (free text — list arg, never shell=True)
+        reason = payload.get("reason", "").strip()
+        if reason:
+            cmd += ["--reason", reason]
+
         try:
-            r = subprocess.run(["graphify", *args], cwd=str(REPO), capture_output=True, text=True, timeout=60)
-            out = r.stdout.strip() or r.stderr.strip() or "(no output)"
+            r = subprocess.run(
+                cmd,
+                cwd=str(REPO_DIR), capture_output=True, text=True, timeout=30,
+            )
+            out = (r.stdout + r.stderr).strip()
+            if r.returncode == 3:
+                # BUSY — work.py uses exit 3 for lock contention
+                self._send_json({"busy": True, "out": out}, status=409)
+                return
+            if r.returncode != 0:
+                self._send_json({"error": True, "out": out}, status=500)
+                return
+            self._send_json({"ok": True, "out": out})
         except Exception as e:
-            out = f"error: {e}"
-        self.q.put(("graphify_result", out))
+            self._send_error_json(500, str(e))
 
-    def _show_graphify_result(self, text):
-        self.refresh_graphify_freshness()
-        self.graphify_out.config(state="normal")
-        self.graphify_out.delete("1.0", "end")
-        self.graphify_out.insert("1.0", text)
-        self.graphify_out.config(state="disabled")
 
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle requests in separate threads (needed for slow graphify/set calls)."""
+    daemon_threads = True
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
+    parser = argparse.ArgumentParser(description="AI-CAD team-progress dashboard")
+    parser.add_argument("--port", type=int, default=8787, help="Port to serve on (default: 8787)")
+    parser.add_argument("--no-open", action="store_true", help="Don't open browser automatically")
+    args = parser.parse_args()
+
+    host = "127.0.0.1"
+    port = args.port
+
+    server = ThreadedHTTPServer((host, port), DashboardHandler)
+    url = f"http://{host}:{port}/"
+    print(f"AI-CAD dashboard: {url}")
+    print("Press Ctrl+C to stop.")
+
+    if not args.no_open:
+        # Slight delay so server is up before browser hits it
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+
     try:
-        app = App()
-    except tk.TclError as e:
-        print(f"Could not open a GUI window ({e}). Run this on your desktop session, "
-              f"not a headless/SSH shell.", file=sys.stderr)
-        sys.exit(1)
-    app.mainloop()
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        server.server_close()
 
 
 if __name__ == "__main__":

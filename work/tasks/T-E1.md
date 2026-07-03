@@ -7,6 +7,8 @@ status: done
 branch: task/T-E1-piping-scaffold
 day: 6
 depends_on: [T-INT]
+lane: simulation
+kind: new
 ---
 
 ## Context

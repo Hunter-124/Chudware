@@ -7,6 +7,8 @@ status: done
 branch: task/T-H4-verifier-battery
 day: 12
 depends_on: []
+lane: platform-infra
+kind: new
 ---
 
 ## Context

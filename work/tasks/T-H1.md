@@ -7,6 +7,8 @@ status: done
 branch: task/T-H1-telemetry-contract
 day: 11
 depends_on: []
+lane: ml-flywheel
+kind: new
 ---
 
 ## Context

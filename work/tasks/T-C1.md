@@ -7,6 +7,8 @@ status: done
 branch: task/T-C1-firmware-scaffold
 day: 1
 depends_on: []
+lane: ecad-firmware
+kind: new
 ---
 
 ## Context

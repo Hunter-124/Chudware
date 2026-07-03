@@ -19,6 +19,18 @@ append-only) or to your task branch (question files), and push.
    work order, then `- <ts> <owner> HANDOFF <id>` here.
 5. Never edit another agent's lines. Never mark tasks done. Never merge to master.
 
+## Workflow v2 (Hunter, 2026-07-03 — work/WORKFLOW.md is the source of truth)
+
+- Board gained `lane` (feature area), `kind` (fix|overhaul|new, fix-first claim
+  tiebreak), `deferred` (parked plans: ML training, SaaS). Steer with
+  `work.py set` / `work_set`; report human load with `work.py roadblocks`.
+- **Roadblock triage is a foreman duty:** HIGH-IMPACT verdicts (blocking P≤2)
+  get same-day merge or relink; low-impact roadblocks get deferred/relinked, not
+  queued — a roadblock that isn't a big deal gets skipped, not waited on.
+- Drivers are **Sonnet by default**; Opus only where the foreman flags gnarly
+  C++/kernel work; Fable never drives. Enforce the MCP freshness rule
+  (WORKFLOW.md §6) at review time.
+
 ## Known pitfalls (read before your first task — these are pre-paid lessons)
 
 - ~~`scripts/gate.sh` ui/imgui stage fails on a PRE-EXISTING `PanelField::selMulti`

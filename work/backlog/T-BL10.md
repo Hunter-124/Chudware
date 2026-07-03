@@ -6,6 +6,8 @@ owner: unassigned
 status: backlog
 branch: task/T-BL10-pdm-lite
 depends_on: []
+lane: plm-projects
+kind: new
 ---
 
 ## Context

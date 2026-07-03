@@ -7,6 +7,8 @@ status: done
 branch: task/T-E5-oil-hydraulics
 day: 9
 depends_on: [T-E3]
+lane: simulation
+kind: new
 ---
 
 ## Context

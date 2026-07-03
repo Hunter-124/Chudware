@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-R2-plm-vault-core
 depends_on: [T-R1]
+lane: plm-projects
+kind: new
+priority: 3
 ---
 
 ## Context

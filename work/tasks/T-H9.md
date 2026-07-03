@@ -7,6 +7,8 @@ status: done
 branch: task/T-H9-adapter-serving
 day: 14
 depends_on: [T-F9, T-H8]
+lane: ml-flywheel
+kind: new
 ---
 
 ## Context

@@ -8,6 +8,8 @@ branch: task/T-V1-sim-backend-audit
 day: 2
 priority: 2
 depends_on: []
+lane: platform-infra
+kind: fix
 ---
 
 ## Context

@@ -8,6 +8,8 @@ branch: task/T-Q2-prod
 day: 2
 priority: 3
 depends_on: []
+lane: platform-infra
+kind: new
 ---
 
 ## Context

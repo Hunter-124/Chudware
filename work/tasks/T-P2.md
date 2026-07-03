@@ -7,6 +7,8 @@ status: done
 branch: task/T-P2-parts-library
 day: 2
 depends_on: [T-P1]
+lane: parts-sourcing
+kind: new
 ---
 
 ## Context

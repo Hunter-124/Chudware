@@ -8,6 +8,8 @@ branch: task/T-V2-mcp-runtime-audit
 day: 2
 priority: 2
 depends_on: []
+lane: platform-infra
+kind: fix
 ---
 
 ## Context

@@ -6,6 +6,9 @@ owner: unassigned
 status: backlog
 branch: task/T-BL13-glass-accent-variance
 depends_on: []
+lane: app-gui
+kind: new
+priority: 4
 ---
 
 ## Context

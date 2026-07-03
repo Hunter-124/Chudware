@@ -7,6 +7,8 @@ status: done
 branch: task/T-F3-interaction-contract
 day: 7
 depends_on: []
+lane: ai-copilot
+kind: new
 ---
 
 ## Context

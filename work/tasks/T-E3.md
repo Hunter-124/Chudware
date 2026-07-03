@@ -7,6 +7,8 @@ status: done
 branch: task/T-E3-gas-heat-props
 day: 8
 depends_on: [T-E2]
+lane: simulation
+kind: new
 ---
 
 ## Context

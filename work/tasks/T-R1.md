@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-R1-plm-contract
 depends_on: []
+lane: plm-projects
+kind: new
+priority: 3
 ---
 
 ## Context

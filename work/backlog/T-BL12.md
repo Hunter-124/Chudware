@@ -6,6 +6,9 @@ owner: unassigned
 status: backlog
 branch: task/T-BL12-paid-apis
 depends_on: []
+lane: parts-sourcing
+kind: new
+priority: 5
 ---
 
 ## Context

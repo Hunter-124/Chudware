@@ -7,6 +7,8 @@ status: done
 branch: task/T-C3-renode-emulation
 day: 3
 depends_on: [T-C2]
+lane: ecad-firmware
+kind: new
 ---
 
 ## Context

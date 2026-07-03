@@ -8,6 +8,8 @@ branch: task/T-U2-ui
 day: 2
 priority: 2
 depends_on: [T-U1, T-P2]
+lane: app-gui
+kind: new
 ---
 
 ## Context

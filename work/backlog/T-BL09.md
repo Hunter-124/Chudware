@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-BL09-req-verify-wiring
 depends_on: [T-H3, T-H4, T-A4]
+lane: ai-copilot
+kind: new
+priority: 3
 ---
 
 ## Context

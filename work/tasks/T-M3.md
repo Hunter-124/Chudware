@@ -8,6 +8,8 @@ branch: task/T-M3-cam-overhaul
 day: 3
 priority: 3
 depends_on: [T-M6]
+lane: cam
+kind: new
 ---
 
 ## Context

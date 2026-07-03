@@ -174,6 +174,7 @@ graph TD
     T_BL23["T-BL23: Verifier battery CAM scoring keys - machined_fraction + gouges in _extract_score"]:::todo
     T_BL24["T-BL24: JLCPCB signed-request auth - rework JLCPCBProvider off the static-bearer assumption"]:::todo
     T_BL25["T-BL25: Doc-scoped IntakeLedger - persist scope=doc answers per interaction.md section 5"]:::todo
+    T_BL26["T-BL26: ai-cad MCP freshness audit - server instructions, cad_guide topics, context injection vs shipped capabilities"]:::todo
   end
   subgraph WS_integration["workstream integration"]
     T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog

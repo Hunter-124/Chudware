@@ -7,6 +7,8 @@ status: done
 branch: task/T-D2-pynite-solve
 day: 2
 depends_on: [T-D1]
+lane: simulation
+kind: new
 ---
 
 ## Context

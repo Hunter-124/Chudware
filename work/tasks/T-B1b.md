@@ -7,6 +7,8 @@ status: done
 branch: task/T-B1b-part-providers
 day: 1
 depends_on: [T-B1a, T-S1]
+lane: parts-sourcing
+kind: new
 ---
 
 ## Context

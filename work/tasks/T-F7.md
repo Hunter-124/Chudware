@@ -7,6 +7,8 @@ status: done
 branch: task/T-F7-narration-core
 day: 6
 depends_on: []
+lane: ai-copilot
+kind: new
 ---
 
 ## Context

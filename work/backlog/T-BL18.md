@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-BL18-gear-bearing-checks
 depends_on: []
+lane: simulation
+kind: new
+priority: 4
 ---
 
 ## Context

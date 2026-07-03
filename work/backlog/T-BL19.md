@@ -6,6 +6,9 @@ owner: opus-marrow
 status: doing
 branch: task/T-BL19-modeling-battery
 depends_on: []
+lane: modeling-core
+kind: fix
+priority: 2
 ---
 
 ## Context

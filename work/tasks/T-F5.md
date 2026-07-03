@@ -7,6 +7,8 @@ status: done
 branch: task/T-F5-image-ingestion
 day: 7
 depends_on: []
+lane: ai-copilot
+kind: new
 ---
 
 ## Context

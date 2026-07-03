@@ -8,6 +8,8 @@ branch: task/T-V4-venv-provisioning
 day: 4
 priority: 3
 depends_on: [T-V3]
+lane: platform-infra
+kind: fix
 ---
 
 ## Context

@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-BL25-doc-intake-ledger
 depends_on: []
+lane: ai-copilot
+kind: fix
+priority: 3
 ---
 
 ## Context

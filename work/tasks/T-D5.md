@@ -8,6 +8,8 @@ branch: task/T-D5-cost-takeoff-demo
 day: 5
 priority: 3
 depends_on: [T-D4, T-B2]
+lane: simulation
+kind: new
 ---
 
 ## Context

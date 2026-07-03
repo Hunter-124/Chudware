@@ -7,6 +7,8 @@ status: done
 branch: task/T-F6-photo-capture
 day: 10
 depends_on: [T-F5]
+lane: ai-copilot
+kind: new
 ---
 
 ## Context

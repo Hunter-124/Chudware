@@ -6,6 +6,9 @@ owner: unassigned
 status: backlog
 branch: task/T-BL07-wire-harness
 depends_on: []
+lane: ecad-firmware
+kind: new
+priority: 5
 ---
 
 ## Context

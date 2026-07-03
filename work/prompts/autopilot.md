@@ -20,9 +20,10 @@ human contact in any doc that says "Erik" is actually Hunter.
 1. From the MAIN checkout, on master:
    `python3 work/tools/work.py claim --owner <your-name>`
    - Output ends `CLAIMED: T-XX` → go to step 2 (the branch name is printed too).
-   - Output `NOTHING-TO-CLAIM` → run `python3 work/tools/work.py board`, report to the
-     user what is in flight and by whom, which tasks are blocked on unmerged review
-     branches, and any open files in work/questions/ — then STOP.
+   - Output `NOTHING-TO-CLAIM` → run `python3 work/tools/work.py board` AND
+     `python3 work/tools/work.py roadblocks`, report to the user what is in flight
+     and by whom, what is waiting on a human (with the impact verdicts), and any
+     open files in work/questions/ — then STOP.
    - PRIORITY POLICY (Erik, 2026-07-02): humans are the bottleneck. In EVERY summary
      (claim, stop, or nothing-to-claim), list the human-blocked queue first: tasks
      owned `main-checkout`, human-owned todo roots (e.g. T-S1), and review branches
@@ -90,8 +91,21 @@ Focus entirely on: (1) core CAD functionality, (2) the AI-harness side of the
 integrations, (3) the GUI. Model fine-tuning / serving / flywheel work is
 DEFERRED — don't claim ML-track tasks ahead of core/GUI work even if ready.
 
-## Priority-ordered claiming (Erik, 2026-07-03)
+## Workflow v2 claiming (Hunter, 2026-07-03 — see work/WORKFLOW.md, binding)
 
-`work.py claim` now picks by `priority:` frontmatter (1 = drop-everything,
-default 5), then day, then id. Don't cherry-pick a lower-priority task ahead of
-a ready P1/P2 without a reason recorded in your claim note.
+`work.py claim` picks by `priority:` (1 = drop-everything, default 5), then day,
+then **kind (fix → overhaul → new** — we repair existing features before adding
+surface), then id. Tasks with `deferred: yes` (parked plans: ML training, SaaS)
+are invisible to ready/claim — never work one without a human un-parking it.
+`lane:` is the user-facing feature area (dashboard swim-row); don't change
+lane/kind/priority yourself — that's `work.py set`, a foreman/human action.
+Don't cherry-pick a lower-priority task ahead of a ready P1/P2 without a reason
+recorded in your claim note.
+
+## MCP freshness rule (Hunter, 2026-07-03, binding — WORKFLOW.md §6)
+
+If your task adds or changes an agent-facing workflow, tool, prompt, or context
+pack, the SAME branch must update the relevant MCP server instructions
+(services/mcp/ or work/tools/team_mcp.py), cad_guide topics if modeling-facing,
+and the touched work/context/ section pack. Ship the capability and its
+discoverability together — an MCP tool agents can't find might as well not exist.

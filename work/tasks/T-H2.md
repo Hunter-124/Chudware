@@ -7,6 +7,8 @@ status: done
 branch: task/T-H2-canonical-serialization
 day: 11
 depends_on: []
+lane: platform-infra
+kind: new
 ---
 
 ## Context

@@ -7,6 +7,8 @@ status: done
 branch: task/T-B5-spec-sheet-ai-integration
 day: 5
 depends_on: [T-B4]
+lane: parts-sourcing
+kind: new
 ---
 
 ## Context

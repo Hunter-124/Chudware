@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-BL21-hollow-sections
 depends_on: []
+lane: modeling-core
+kind: fix
+priority: 3
 ---
 
 ## Context

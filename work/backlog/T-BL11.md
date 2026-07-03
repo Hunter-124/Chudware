@@ -6,6 +6,9 @@ owner: unassigned
 status: backlog
 branch: task/T-BL11-docs-compliance
 depends_on: []
+lane: ai-copilot
+kind: new
+priority: 4
 ---
 
 ## Context

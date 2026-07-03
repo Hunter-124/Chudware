@@ -7,6 +7,8 @@ status: done
 branch: task/T-G5-migration-wave1
 day: 6
 depends_on: [T-G1]
+lane: app-gui
+kind: overhaul
 ---
 
 ## Context

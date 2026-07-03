@@ -7,6 +7,8 @@ status: done
 branch: task/T-H6-fleet-runner
 day: 13
 depends_on: [T-H5]
+lane: ml-flywheel
+kind: new
 ---
 
 ## Context

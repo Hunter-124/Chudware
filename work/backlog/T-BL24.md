@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-BL24-jlcpcb-auth
 depends_on: []
+lane: parts-sourcing
+kind: fix
+priority: 4
 ---
 
 ## Context

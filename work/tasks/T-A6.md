@@ -8,6 +8,8 @@ branch: task/T-A6-capstone-live
 day: 6
 priority: 2
 depends_on: [T-A5]
+lane: ai-copilot
+kind: new
 ---
 
 ## Context

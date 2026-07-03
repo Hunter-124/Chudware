@@ -7,6 +7,8 @@ status: done
 branch: task/T-A2-node-runner
 day: 2
 depends_on: [T-A1]
+lane: ai-copilot
+kind: new
 ---
 
 ## Context

@@ -8,6 +8,8 @@ branch: task/T-D3-section-libraries-checks
 day: 3
 depends_on: [T-D2]
 finisher: sonnet-lume
+lane: simulation
+kind: new
 ---
 
 ## Context

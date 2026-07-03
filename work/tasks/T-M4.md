@@ -7,6 +7,8 @@ status: done
 branch: task/T-M4-cam-overhaul
 day: 4
 depends_on: []
+lane: cam
+kind: overhaul
 ---
 
 ## Context

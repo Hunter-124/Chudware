@@ -7,6 +7,8 @@ status: done
 branch: task/T-C2-compile-loop
 day: 2
 depends_on: [T-C1]
+lane: ecad-firmware
+kind: new
 ---
 
 ## Context

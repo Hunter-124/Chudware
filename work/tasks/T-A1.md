@@ -7,6 +7,8 @@ status: done
 branch: task/T-A1-dag-schema
 day: 1
 depends_on: [T-S1]
+lane: ai-copilot
+kind: new
 ---
 
 ## Context

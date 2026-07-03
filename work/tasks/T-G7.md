@@ -7,6 +7,8 @@ status: done
 branch: task/T-G7-migration-wave3
 day: 8
 depends_on: [T-G6]
+lane: app-gui
+kind: overhaul
 ---
 
 ## Context

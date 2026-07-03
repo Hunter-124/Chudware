@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-R7-plm-sharing-sync
 depends_on: [T-R2, T-R4]
+lane: plm-projects
+kind: new
+priority: 4
 ---
 
 ## Context

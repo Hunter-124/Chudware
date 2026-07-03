@@ -7,6 +7,8 @@ status: done
 branch: task/T-Q4-prod
 day: 4
 depends_on: []
+lane: app-gui
+kind: new
 ---
 
 ## Context

@@ -7,6 +7,8 @@ status: done
 branch: task/T-H3-requirements-schema
 day: 11
 depends_on: []
+lane: modeling-core
+kind: new
 ---
 
 ## Context

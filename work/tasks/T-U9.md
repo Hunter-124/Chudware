@@ -8,6 +8,8 @@ branch: task/T-U9-gallery-ui
 day: 9
 priority: 3
 depends_on: [T-Q3]
+lane: app-gui
+kind: new
 ---
 
 ## Context

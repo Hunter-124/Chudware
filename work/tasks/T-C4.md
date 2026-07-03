@@ -7,6 +7,8 @@ status: done
 branch: task/T-C4-hardware-path
 day: 4
 depends_on: [T-C3]
+lane: ecad-firmware
+kind: new
 ---
 
 ## Context

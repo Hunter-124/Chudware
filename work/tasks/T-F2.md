@@ -7,6 +7,8 @@ status: done
 branch: task/T-F2-source-helpers
 day: 8
 depends_on: [T-F1]
+lane: ai-copilot
+kind: new
 ---
 
 ## Context

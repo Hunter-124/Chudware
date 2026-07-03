@@ -8,6 +8,8 @@ branch: task/T-INF1-gate-pytest
 day: 3
 priority: 2
 depends_on: []
+lane: platform-infra
+kind: fix
 ---
 
 ## Context

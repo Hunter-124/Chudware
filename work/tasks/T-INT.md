@@ -7,6 +7,8 @@ status: backlog
 branch: task/T-INT-integration-demo
 day: 5
 depends_on: [T-A4, T-B4, T-C4, T-D4]
+lane: ai-copilot
+kind: new
 ---
 
 ## Context

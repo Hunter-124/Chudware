@@ -7,6 +7,8 @@ status: done
 branch: task/T-H7-frontier-logging
 day: 12
 depends_on: [T-H1]
+lane: ml-flywheel
+kind: new
 ---
 
 ## Context

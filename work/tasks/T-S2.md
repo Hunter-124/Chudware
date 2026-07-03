@@ -7,6 +7,8 @@ status: done
 branch: task/T-S2-land-ai-experience
 day: 1
 depends_on: []
+lane: platform-infra
+kind: new
 ---
 
 > **Landed 2026-07-02 by direct user approval (session): commit 2cc6fe0; 13/13 pytest green.**

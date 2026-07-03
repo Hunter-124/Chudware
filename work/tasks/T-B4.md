@@ -7,6 +7,8 @@ status: done
 branch: task/T-B4-spec-sheet-deterministic
 day: 4
 depends_on: [T-B3]
+lane: parts-sourcing
+kind: new
 ---
 
 ## Context

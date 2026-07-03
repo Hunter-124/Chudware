@@ -6,6 +6,9 @@ owner: mooseinatree
 status: todo
 branch: task/T-BL02-format-interop
 depends_on: []
+lane: modeling-core
+kind: new
+priority: 3
 ---
 
 ## Context

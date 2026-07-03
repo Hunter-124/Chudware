@@ -8,6 +8,8 @@ branch: task/T-G8-migration-wave4
 day: 9
 priority: 2
 depends_on: [T-G7]
+lane: app-gui
+kind: overhaul
 ---
 
 ## Context

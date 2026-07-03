@@ -8,6 +8,8 @@ branch: task/T-Q3-prod
 day: 3
 priority: 4
 depends_on: []
+lane: app-gui
+kind: new
 ---
 
 ## Context

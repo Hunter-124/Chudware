@@ -8,6 +8,8 @@ branch: task/T-INF2-checkpy-green
 day: 5
 priority: 3
 depends_on: []
+lane: platform-infra
+kind: fix
 ---
 
 ## Context

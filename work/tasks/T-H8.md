@@ -7,6 +7,8 @@ status: done
 branch: task/T-H8-eval-benchmarks
 day: 13
 depends_on: [T-H3, T-H4]
+lane: ml-flywheel
+kind: new
 ---
 
 ## Context

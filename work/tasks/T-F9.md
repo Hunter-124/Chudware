@@ -7,6 +7,8 @@ status: done
 branch: task/T-F9-providers-contract
 day: 7
 depends_on: []
+lane: platform-infra
+kind: new
 ---
 
 ## Context

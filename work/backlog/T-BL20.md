@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-BL20-fea-vv-crossval
 depends_on: []
+lane: simulation
+kind: fix
+priority: 3
 ---
 
 ## Context

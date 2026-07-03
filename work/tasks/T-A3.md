@@ -7,6 +7,8 @@ status: done
 branch: task/T-A3-hitl-gates
 day: 3
 depends_on: [T-A2]
+lane: ai-copilot
+kind: new
 ---
 
 ## Context

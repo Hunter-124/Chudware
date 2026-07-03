@@ -6,6 +6,9 @@ owner: unassigned
 status: backlog
 branch: task/T-BL05-fpga-flow
 depends_on: []
+lane: ecad-firmware
+kind: new
+priority: 5
 ---
 
 ## Context

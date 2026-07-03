@@ -7,6 +7,8 @@ status: done
 branch: task/T-D4-code-compliance
 day: 4
 depends_on: [T-D3]
+lane: simulation
+kind: new
 ---
 
 ## Context

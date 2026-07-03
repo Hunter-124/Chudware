@@ -6,6 +6,9 @@ owner: unassigned
 status: backlog
 branch: task/T-BL08-tolerance-stackup
 depends_on: []
+lane: simulation
+kind: new
+priority: 4
 ---
 
 ## Context

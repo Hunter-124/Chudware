@@ -7,6 +7,9 @@ status: todo
 branch: task/T-S1-api-keys
 day: 1
 depends_on: []
+lane: platform-infra
+kind: new
+priority: 4
 ---
 
 ## Context

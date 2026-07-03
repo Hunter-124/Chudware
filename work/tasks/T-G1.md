@@ -7,6 +7,8 @@ status: done
 branch: task/T-G1-land-gui-tree
 day: 1
 depends_on: []
+lane: app-gui
+kind: overhaul
 ---
 
 > **Landed 2026-07-02 by direct user approval (session): commits ac45df9 + 7a61230; m1 reopen TREE MISMATCH filed separately.**

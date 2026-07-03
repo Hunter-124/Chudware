@@ -7,6 +7,8 @@ status: done
 branch: task/T-B2-bom-rollup
 day: 2
 depends_on: [T-B1b]
+lane: parts-sourcing
+kind: new
 ---
 
 ## Context

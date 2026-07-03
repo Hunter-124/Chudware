@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-R4-plm-items-releases
 depends_on: [T-R2]
+lane: plm-projects
+kind: new
+priority: 3
 ---
 
 ## Context

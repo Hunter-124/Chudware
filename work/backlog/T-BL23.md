@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-BL23-battery-cam-keys
 depends_on: []
+lane: cam
+kind: fix
+priority: 3
 ---
 
 ## Context

@@ -8,6 +8,8 @@ branch: task/T-V3-env-pollution
 day: 3
 priority: 2
 depends_on: [T-V2]
+lane: platform-infra
+kind: fix
 ---
 
 ## Context

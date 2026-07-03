@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-CAD Mission Control</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-dot"></span>
+    <span class="brand-name">AI-CAD</span>
+    <span class="brand-sub">Mission Control</span>
+  </div>
+  <nav class="nav">
+    <button class="nav-btn active" data-view="overview">Overview</button>
+    <button class="nav-btn" data-view="map">Map</button>
+  </nav>
+  <div class="topbar-right">
+    <button class="ghost-btn" id="graphify-btn" title="Ask the code knowledge graph">Ask the codebase</button>
+    <span class="refresh-note" id="refresh-note">loading…</span>
+  </div>
+</header>
+
+<!-- ============ OVERVIEW ============ -->
+<main id="view-overview" class="view">
+
+  <section class="hero">
+    <div class="hero-line" id="hero-line">Loading the board…</div>
+    <div class="stat-row" id="stat-row"></div>
+  </section>
+
+  <section class="section" id="needs-you-section">
+    <div class="section-head">
+      <h2>Needs you</h2>
+      <span class="section-sub">things only a human can do — most important first</span>
+    </div>
+    <div class="cards" id="needs-you-cards"></div>
+  </section>
+
+  <section class="section">
+    <div class="section-head">
+      <h2>Feature progress</h2>
+      <span class="section-sub">closest to finished on top — click a row to see its map</span>
+    </div>
+    <div class="lanes" id="lane-rows"></div>
+  </section>
+
+</main>
+
+<!-- ============ MAP ============ -->
+<main id="view-map" class="view hidden">
+  <div class="map-toolbar">
+    <input id="map-search" type="search" placeholder="Find a task…" autocomplete="off">
+    <label class="toggle"><input type="checkbox" id="t-hide-done" checked><span>Hide finished</span></label>
+    <label class="toggle"><input type="checkbox" id="t-show-paused"><span>Show paused</span></label>
+    <span class="map-lane-filter" id="map-lane-filter"></span>
+    <span class="spacer"></span>
+    <button class="ghost-btn" id="zoom-out" title="Zoom out">−</button>
+    <button class="ghost-btn" id="zoom-in" title="Zoom in">+</button>
+    <button class="ghost-btn" id="zoom-fit">Fit</button>
+  </div>
+  <div class="map-wrap" id="map-wrap">
+    <svg id="map-svg"></svg>
+  </div>
+  <div class="legend" id="legend"></div>
+</main>
+
+<!-- ============ TASK DRAWER ============ -->
+<div id="drawer-scrim" class="scrim hidden"></div>
+<aside id="drawer" class="drawer hidden">
+  <div class="drawer-head">
+    <div class="drawer-head-text">
+      <div class="drawer-id" id="drawer-id"></div>
+      <h3 id="drawer-title"></h3>
+      <div class="drawer-statusline" id="drawer-statusline"></div>
+    </div>
+    <button class="ghost-btn" id="drawer-close">✕</button>
+  </div>
+  <div class="drawer-badges" id="drawer-badges"></div>
+  <div class="drawer-body">
+    <div class="drawer-section" id="drawer-deps"></div>
+    <div class="drawer-section">
+      <h4>Checklist</h4>
+      <ul class="dod" id="drawer-dod"><li class="muted">loading…</li></ul>
+    </div>
+    <div class="drawer-section">
+      <h4>Latest activity</h4>
+      <ul class="log" id="drawer-log"><li class="muted">loading…</li></ul>
+    </div>
+    <div class="drawer-section steer">
+      <h4>Steer this task</h4>
+      <div class="steer-row"><label>Importance</label><div class="seg" id="steer-priority"></div></div>
+      <div class="steer-row"><label>Area</label><select id="steer-lane"></select></div>
+      <div class="steer-row"><label>Type</label><select id="steer-kind">
+        <option value="fix">Fix something broken</option>
+        <option value="overhaul">Redo something existing</option>
+        <option value="new">Build something new</option>
+      </select></div>
+      <div class="steer-row"><label>Paused</label>
+        <label class="toggle"><input type="checkbox" id="steer-deferred"><span>skip this for now</span></label>
+      </div>
+      <input id="steer-reason" type="text" placeholder="Why? (optional — goes in the task log)">
+      <button class="primary-btn" id="steer-apply">Apply changes</button>
+    </div>
+  </div>
+</aside>
+
+<!-- ============ GRAPHIFY MODAL ============ -->
+<div id="graphify-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3>Ask the codebase</h3>
+      <button class="ghost-btn" id="graphify-close">✕</button>
+    </div>
+    <div class="modal-controls">
+      <select id="graphify-mode">
+        <option value="query">Search</option>
+        <option value="explain">Explain</option>
+      </select>
+      <input id="graphify-q" type="text" placeholder="e.g. how does autosave recovery work?">
+      <button class="primary-btn" id="graphify-go">Ask</button>
+    </div>
+    <div class="freshness" id="graphify-freshness"></div>
+    <pre id="graphify-out" class="graphify-out">Results appear here.</pre>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="app.js"></script>
+</body>
+</html>

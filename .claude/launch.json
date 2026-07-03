@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["work/tools/dashboard.py", "--port", "8791", "--no-open"],
+      "port": 8791
+    }
+  ]
+}

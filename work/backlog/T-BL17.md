@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-BL17-vibration-response
 depends_on: []
+lane: simulation
+kind: new
+priority: 4
 ---
 
 ## Context

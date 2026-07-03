@@ -6,6 +6,9 @@ owner: unassigned
 status: backlog
 branch: task/T-BL06-certified-export
 depends_on: []
+lane: platform-infra
+kind: new
+priority: 5
 ---
 
 ## Context

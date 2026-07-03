@@ -7,6 +7,8 @@ status: done
 branch: task/T-B3-cost-model
 day: 3
 depends_on: [T-B2]
+lane: parts-sourcing
+kind: new
 ---
 
 ## Context

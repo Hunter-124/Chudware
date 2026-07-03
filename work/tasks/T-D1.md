@@ -7,6 +7,8 @@ status: done
 branch: task/T-D1-structural-schema-scaffold
 day: 1
 depends_on: []
+lane: simulation
+kind: new
 ---
 
 ## Context

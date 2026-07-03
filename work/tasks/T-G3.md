@@ -7,6 +7,8 @@ status: done
 branch: task/T-G3-shopcraft-branding
 day: 2
 depends_on: [T-G2]
+lane: app-gui
+kind: overhaul
 ---
 
 ## Context

@@ -262,6 +262,34 @@ TOOLS = [
       "Graphify relationship trace between two named entities (files, symbols, "
       "concepts) — how A connects to B through the codebase graph.",
       {"a": S, "b": S}, ["a", "b"]),
+    T("work_set",
+      "Steer task metadata: lane, kind, priority, deferred flag, and/or reason. "
+      "Use to park ML/SaaS work (deferred=yes — skipped by ready/claim), reprioritize, "
+      "or reclassify fix|overhaul|new. Owner is required (either pass it or set via "
+      "whoami first — co-located agents clobber shared identity, so pass owner "
+      "explicitly on mutating calls). Commits like note().",
+      {"task_id": S, "owner": S,
+       "priority": {"type": "integer", "minimum": 1, "maximum": 5},
+       "lane": {"type": "string", "enum": [
+           "modeling-core", "assemblies-drawings", "cam", "ecad-firmware",
+           "simulation", "parts-sourcing", "ai-copilot", "app-gui",
+           "plm-projects", "platform-infra", "ml-flywheel"]},
+       "kind": {"type": "string", "enum": ["fix", "overhaul", "new"]},
+       "deferred": {"type": "string", "enum": ["yes", "no"]},
+       "reason": S},
+      ["task_id"]),
+    T("work_roadblocks",
+      "Human-attention queue: review tasks awaiting merge (HIGH-IMPACT if they block "
+      "P1/P2 work), blocked tasks, and human-owned open questions. Check this FIRST "
+      "when coming online — it surfaces the fastest way to unblock agents. "
+      "format='json' returns structured objects with blocks/verdict fields.",
+      {"format": {"type": "string", "enum": ["text", "json"]}}),
+    T("work_lanes",
+      "Per-lane ship-readiness rollup: done/total/%, doing/review/todo/blocked counts, "
+      "open fix and new work counts, deferred count. Lanes are user-facing feature "
+      "areas (modeling-core, cam, app-gui, ai-copilot, …). "
+      "format='json' returns structured objects for programmatic callers.",
+      {"format": {"type": "string", "enum": ["text", "json"]}}),
 ]
 
 
@@ -435,6 +463,29 @@ def call_tool(name, a):
         return _graphify("explain", a["concept"])[0]
     if name == "graphify_path":
         return _graphify("path", a["a"], a["b"])[0]
+    if name == "work_set":
+        args = ["set", a["task_id"], "--owner", _need(a, "owner")]
+        if a.get("priority") is not None:
+            args += ["--priority", str(a["priority"])]
+        if a.get("lane"):
+            args += ["--lane", a["lane"]]
+        if a.get("kind"):
+            args += ["--kind", a["kind"]]
+        if a.get("deferred"):
+            args += ["--deferred", a["deferred"]]
+        if a.get("reason"):
+            args += ["--reason", a["reason"]]
+        return _work(*args)[0]
+    if name == "work_roadblocks":
+        args = ["roadblocks"]
+        if a.get("format") == "json":
+            args.append("--json")
+        return _work(*args)[0]
+    if name == "work_lanes":
+        args = ["lanes"]
+        if a.get("format") == "json":
+            args.append("--json")
+        return _work(*args)[0]
     raise ValueError(f"unknown tool {name}")
 
 
@@ -468,7 +519,23 @@ def main():
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": SERVER_INFO,
                 "instructions": (
-                    "AI-CAD team coordination server. Start with work_board. " + COORD_RULES),
+                    "AI-CAD team coordination server. Full policy: work/WORKFLOW.md. "
+                    "WHEN COMING ONLINE: run work_roadblocks first — it surfaces the "
+                    "human-attention queue (review tasks awaiting merge, blocked tasks, "
+                    "open questions) and is the fastest way to unblock other agents. "
+                    "Then work_board for full situational awareness. "
+                    "LANES: tasks belong to a user-facing feature area (lane): "
+                    "modeling-core, assemblies-drawings, cam, ecad-firmware, simulation, "
+                    "parts-sourcing, ai-copilot, app-gui, plm-projects, platform-infra, "
+                    "ml-flywheel. Use work_lanes for per-lane ship-readiness rollup. "
+                    "KIND: fix|overhaul|new — ready/claim tiebreak fix-before-new within "
+                    "a priority level, so bugs get cleared before new features. "
+                    "DEFERRED: tasks with deferred=yes (ML training, SaaS work, parked "
+                    "plans) are invisible to ready/claim — they do not compete for "
+                    "agent bandwidth. Use work_set to park or unpark tasks. "
+                    "STEERING: work_set changes lane/kind/priority/deferred on any task "
+                    "(owner required — pass explicitly, do not rely on shared identity). "
+                    + COORD_RULES),
             })
         elif method in ("notifications/initialized", "notifications/cancelled"):
             continue  # notifications: no response

@@ -308,3 +308,192 @@ class TestAskUserReplay:
         }
         r = ask_user([gate_q], scope="run", run_id=run_id, ledger=ledger, autonomy="auto")
         assert r[gate_q_id]["source"] == "resumed"
+
+
+# ---------------------------------------------------------------------------
+# §5 — Doc-scoped IntakeLedger: cross-session no-re-ask (T-BL25 DoD)
+#
+# The store is the doc's IntakeState meta record ("intake" key), round-tripped
+# as JSON into the .step+ (contract §5 — answers travel WITH the document, so
+# the engine's per-process doc_id churn cannot orphan them).  These tests are
+# pure Python: the doc meta store is simulated with REAL JSON serialization
+# between sessions (json.dumps on set / json.loads on get — exactly what the
+# .step+ round-trip does to the record).  The production engine-backed reopen
+# test (doc_new -> record -> doc_save -> doc_open -> replay) lives in
+# services/mcp/test_intake_ledger.py.
+# ---------------------------------------------------------------------------
+
+def _json_meta_store():
+    """A doc-meta store that round-trips every value through JSON, like .step+."""
+    import json as _json
+
+    blob: dict[tuple, str] = {}
+
+    def get_meta(doc_id: str, key: str):
+        raw = blob.get((doc_id, key))
+        return _json.loads(raw) if raw is not None else None
+
+    def set_meta(doc_id: str, key: str, value) -> None:
+        blob[(doc_id, key)] = _json.dumps(value)
+
+    return blob, get_meta, set_meta
+
+
+class TestIntakeLedgerCrossSession:
+    """IntakeLedger persists scope=doc answers in the doc's IntakeState record.
+
+    'Two separate simulated sessions on the same doc' means: session 2 constructs
+    a brand-new IntakeLedger over the JSON-serialized store — it NEVER reuses the
+    session-1 in-memory object.  The transport must NOT be called in session 2.
+    """
+
+    def test_answer_survives_simulated_reopen(self):
+        """Session 1 records a dimension; session 2 replays it without any transport."""
+        from services.mcp.intake_ledger import IntakeLedger
+
+        doc_id = f"doc_{uuid.uuid4().hex[:12]}"
+        blob, get_meta, set_meta = _json_meta_store()
+
+        q = {
+            "id": "shaft.dia",
+            "kind": "dimension",
+            "family": "length",
+            "prompt": "Shaft diameter?",
+            "suggested": {"value": 8.0, "unit": "mm"},
+            "required": False,
+        }
+
+        # --- Session 1: answer lands in the doc's intake meta record ---
+        ledger1 = IntakeLedger(doc_id, get_meta=get_meta, set_meta=set_meta)
+        r1 = ask_user([q], scope="doc", doc_id=doc_id, ledger=ledger1, autonomy="auto")
+        assert r1["shaft.dia"]["source"] == "default"
+        assert r1["shaft.dia"]["canonical"]["unit"] == "mm"
+        assert (doc_id, "intake") in blob, "intake meta record must exist after session 1"
+
+        # --- Session 2: brand-new IntakeLedger over the serialized store ---
+        transport_calls: list = []
+
+        class BoomTransport:
+            """Fails the test if the transport is invoked — the ledger must replay."""
+            def ask(self, batch):  # pragma: no cover
+                transport_calls.append(batch.batch_id)
+                return {}
+
+        ledger2 = IntakeLedger(doc_id, get_meta=get_meta, set_meta=set_meta)
+        r2 = ask_user([q], scope="doc", doc_id=doc_id, ledger=ledger2,
+                      transport=BoomTransport(), blocking=True, autonomy="approve")
+        assert len(transport_calls) == 0, (
+            "Transport was invoked in session 2 — IntakeLedger did not replay"
+        )
+        assert r2["shaft.dia"]["source"] == "resumed"
+        assert r2["shaft.dia"]["canonical"] == r1["shaft.dia"]["canonical"]
+
+    def test_different_docs_are_isolated(self):
+        """Two docs do not share each other's intake ledger records."""
+        from services.mcp.intake_ledger import IntakeLedger
+
+        blob, get_meta, set_meta = _json_meta_store()
+
+        q = {
+            "id": "bore.dia",
+            "kind": "dimension",
+            "family": "length",
+            "prompt": "Bore diameter?",
+            "suggested": {"value": 10.0, "unit": "mm"},
+            "required": False,
+        }
+
+        ledger_a = IntakeLedger("doc_a", get_meta=get_meta, set_meta=set_meta)
+        ask_user([q], scope="doc", doc_id="doc_a", ledger=ledger_a, autonomy="auto")
+
+        ledger_b = IntakeLedger("doc_b", get_meta=get_meta, set_meta=set_meta)
+        assert ledger_b.answered("bore.dia") is None, (
+            "doc_b must not see doc_a's answer — records are keyed per document"
+        )
+
+        ledger_a2 = IntakeLedger("doc_a", get_meta=get_meta, set_meta=set_meta)
+        assert ledger_a2.answered("bore.dia") is not None
+
+    def test_intake_state_roundtrip_preserves_interaction(self):
+        """IntakeState.from_dict(to_dict()) keeps the interaction records — the
+        wipe hazard: intake tools that load/save the state via the dataclass must
+        never drop answers recorded by the ledger."""
+        from engine.intake.intake import IntakeState
+
+        st = IntakeState(status="awaiting_user", doc_id="doc_x")
+        st.interaction = {
+            "questions": [{"id": "shaft.dia", "kind": "dimension"}],
+            "answers": {"shaft.dia": {
+                "value": {"value": 8.0, "unit": "mm"},
+                "canonical": {"value": 8.0, "unit": "mm"},
+                "source": "user", "at": "2026-07-03T00:00:00Z"}},
+        }
+        rt = IntakeState.from_dict(st.to_dict())
+        assert rt.interaction["answers"]["shaft.dia"]["canonical"]["value"] == 8.0
+        assert rt.interaction["questions"][0]["id"] == "shaft.dia"
+
+    def test_ledger_preserves_other_intake_state_fields(self):
+        """record_answer must load-modify-save: needs/status written by intake
+        tools between ledger calls survive."""
+        from services.mcp.intake_ledger import IntakeLedger
+
+        blob, get_meta, set_meta = _json_meta_store()
+        doc_id = "doc_lms"
+
+        # An intake tool wrote a resume token first.
+        set_meta(doc_id, "intake", {
+            "status": "awaiting_user",
+            "needs": [{"kind": "photo", "label": "motor"}],
+            "pending_request_id": "req_1",
+            "doc_id": doc_id, "revision": 3,
+        })
+
+        ledger = IntakeLedger(doc_id, get_meta=get_meta, set_meta=set_meta)
+        ledger.record_answer("shaft.dia", {"value": {"value": 8.0, "unit": "mm"},
+                                           "source": "user", "at": "t"})
+
+        state = get_meta(doc_id, "intake")
+        assert state["status"] == "awaiting_user"
+        assert state["needs"] == [{"kind": "photo", "label": "motor"}]
+        assert state["pending_request_id"] == "req_1"
+        assert state["revision"] == 3
+        assert state["interaction"]["answers"]["shaft.dia"]["source"] == "user"
+
+    def test_ask_via_contract_routes_doc_id_to_intake_ledger(self):
+        """_ask_via_contract with doc_id (no run_id) persists via the doc store."""
+        from services.mcp.intake_ledger import IntakeLedger
+        from services.mcp.intake_tools import _ask_via_contract
+
+        doc_id = f"doc_{uuid.uuid4().hex[:12]}"
+        blob, get_meta, set_meta = _json_meta_store()
+        ledger = IntakeLedger(doc_id, get_meta=get_meta, set_meta=set_meta)
+
+        q = {
+            "id": "intake.dim.output_shaft.dia",
+            "kind": "dimension",
+            "family": "length",
+            "prompt": "Output shaft diameter?",
+            "suggested": {"value": 6.0, "unit": "mm"},
+            "required": False,
+        }
+
+        # Session 1: answer via doc-scoped _ask_via_contract
+        answers1 = _ask_via_contract([q], run_id=None, doc_id=doc_id, ledger=ledger)
+        assert answers1["intake.dim.output_shaft.dia"]["source"] == "default"
+        assert (doc_id, "intake") in blob
+
+        # Session 2: brand-new ledger over the serialized store — must replay.
+        ledger2 = IntakeLedger(doc_id, get_meta=get_meta, set_meta=set_meta)
+        transport_calls: list = []
+
+        class TrackingTransport:
+            def ask(self, batch) -> dict:
+                transport_calls.append(batch.batch_id)
+                return {qq.id: qq.suggested for qq in batch.questions}
+
+        answers2 = _ask_via_contract([q], run_id=None, doc_id=doc_id, ledger=ledger2,
+                                     transport=TrackingTransport())
+        assert len(transport_calls) == 0, (
+            "Transport was called in session 2 — doc-scope replay broken"
+        )
+        assert answers2["intake.dim.output_shaft.dia"]["source"] == "resumed"

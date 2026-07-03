@@ -261,6 +261,29 @@ class FileLedger:
         self._append({"t": "answer", "id": qid, "answer": answer})
 
 
+def _default_doc_ledger(doc_id: str) -> "Ledger":
+    """Default ledger for a ``scope=doc`` batch: the document's IntakeLedger
+    (contract §5 — answers persist inside the doc's ``IntakeState`` meta record,
+    round-tripped as JSON into the .step+, so they travel WITH the document and
+    survive save/reopen regardless of the per-process doc_id the engine mints).
+
+    Lazy import keeps this module stdlib-only at load time; when the engine
+    bridge is unavailable (pure-Python test runs without libaicad) we fall back
+    to a session-local :class:`MemoryLedger`, same as before the doc path existed.
+    """
+    try:
+        try:
+            from services.mcp.intake_ledger import IntakeLedger
+        except ImportError:
+            from mcp_server.intake_ledger import IntakeLedger  # type: ignore
+        from mcp_server import core_bridge as cb  # type: ignore
+        if cb.available():
+            return IntakeLedger(doc_id)
+    except Exception:  # pragma: no cover - engine-less environments
+        pass
+    return MemoryLedger()
+
+
 # --------------------------------------------------------------------------- #
 # Transports (contract §8) — dumb: batch in, raw answers out                   #
 # --------------------------------------------------------------------------- #
@@ -443,7 +466,12 @@ def ask_user(questions, *, scope: str = "run", run_id: str | None = None,
     _validate(batch)
 
     if ledger is None:
-        ledger = FileLedger(batch.run_id) if batch.scope == "run" else MemoryLedger()
+        if batch.scope == "run":
+            ledger = FileLedger(batch.run_id)
+        elif batch.doc_id:
+            ledger = _default_doc_ledger(batch.doc_id)
+        else:
+            ledger = MemoryLedger()
 
     results: dict[str, dict] = {}
     to_ask: list[Question] = []

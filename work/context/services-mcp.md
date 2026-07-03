@@ -8,7 +8,6 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
            deliverables/1 (deliverables package)
 
 ## Entry points
-
 - services/mcp/server.py:26 `mcp` FastMCP instance — root MCP server; registers all 26
   tool families via `register_*` functions (L60–185). Instructions string (L29–51) is the
   agent's first-contact map of the full capability surface.
@@ -84,6 +83,7 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
   DAG orchestrator: dag_plan, dag_run, dag_status, dag_approve, dag_abort, dag_replan.
 - services/mcp/design_review_tools.py:32 `register_design_review_tools(mcp)` — one-call
   geometry battery narrated via contracts/narration.md: design_review(doc_id, checks?).
+- services/mcp/intake_ledger.py `IntakeLedger(doc_id)` — doc-scoped interaction answer store (contracts/interaction.md §5): persists ask_user Q/A inside the doc's IntakeState meta record (rides the .step+, survives save/reopen — doc_id is per-process, the record travels with the doc); no FastMCP import, get/set injectable for engine-less tests. Used by intake_tools._ask_via_contract and ask_user's scope=doc default ledger (T-BL25)
 
 ## How it connects
 

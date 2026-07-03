@@ -1294,7 +1294,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  it confirms the pressure/flow budget is achievable."
         )
     if topic in ("firmware", "fw", "embedded", "mcu", "fw_build", "fw_new_project",
-                 "flash", "debug", "sim_run"):
+                 "flash", "debug", "fw_sim_run"):
         return (
             "FIRMWARE — embedded compile loop: build, sim, flash, debug\n\n"
             "Tools: fw_new_project / fw_build / fw_sources / fw_sim_run /\n"

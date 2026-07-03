@@ -174,16 +174,19 @@ graph TD
     T_BL22["T-BL22: Wire dormant AI seams into the live loop - adapter routing/telemetry + regen_diagnose binding"]:::doing
     T_BL23["T-BL23: Verifier battery CAM scoring keys - machined_fraction + gouges in _extract_score"]:::done
     T_BL24["T-BL24: JLCPCB signed-request auth - rework JLCPCBProvider off the static-bearer assumption"]:::todo
-    T_BL25["T-BL25: Doc-scoped IntakeLedger - persist scope=doc answers per interaction.md section 5"]:::doing
+    T_BL25["T-BL25: Doc-scoped IntakeLedger - persist scope=doc answers per interaction.md section 5"]:::done
     T_BL26["T-BL26: ai-cad MCP freshness audit - server instructions, cad_guide topics, context injection vs shipped capabilities"]:::done
     T_BL27["T-BL27: Surfaces — surf_replace_face 'could not heal' unless the replacement splits the solid"]:::doing
     T_BL28["T-BL28: Surfaces — ruled/fill/boundary forms feed body-edge picks the engine rejects (needs sketch refs)"]:::blocked
-    T_BL29["T-BL29: Screenshot-icon recipes — remaining groups (revolve/sweep/loft, Pattern, Multi-body, Curves, Sheet Metal Create, Appearance Display, Manufacture, appr_glass/appr_paint)"]:::doing
+    T_BL29["T-BL29: Screenshot-icon recipes — remaining groups (revolve/sweep/loft, Pattern, Multi-body, Curves, Sheet Metal Create, Appearance Display, Manufacture, appr_glass/appr_paint)"]:::done
     T_BL30["T-BL30: Engine — boolean fuse/cut/common of disjoint bodies silently succeeds; enforce the single-connected-solid invariant (issue"]:::doing
     T_BL31["T-BL31: GUI round-2 walkthrough nits — dim-chip bleed live-confirm, load toast pinned over ribbon, empty Mass-Properties pills"]:::doing
     T_BL32["T-BL32: docs/manual/contracts.md drift — missing license_debt.md row + document the new CAM scoring keys"]:::todo
     T_BL33["T-BL33: Dark-mode GUI residual — FM plane-row text + hover-action tooltips black-on-black (issue"]:::todo
     T_BL34["T-BL34: Icon pipeline v2 — color the preview-render models + annotate operation intent over the tiles"]:::todo
+    T_BL35["T-BL35: Surfaces — surf_revolve axis well rejects datum axis (K_EDGE→K_EDGEAXIS) + gate readyForPreview on the axis well"]:::todo
+    T_BL36["T-BL36: FM reference/feature rows — replace left vertical bar with an animated border around the row background when selected/highlighted"]:::todo
+    T_BL37["T-BL37: Origin as a selectable, renderable reference point — FM selectable + viewport point render + engine ref-resolution"]:::todo
   end
   subgraph WS_integration["workstream integration"]
     T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog

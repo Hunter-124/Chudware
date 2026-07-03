@@ -347,7 +347,14 @@ void applyTheme(Theme t, float scale) {
     c[ImGuiCol_WindowBg]            = fromRole(p.windowBg);
     c[ImGuiCol_ChildBg]             = fromRole(p.panelBg);
     c[ImGuiCol_PopupBg]             = fromRole(p.glassBg);
-    c[ImGuiCol_Border]              = fromRole(p.border);
+    // T-G14: subwindow / popup OS-border. p.border is tuned for SEPARATORS (soft, low-contrast) and
+    // read as "fully transparent" on floating windows — especially in light mode where a light-grey
+    // border sits on a near-white window over the light viewport. Give the WINDOW/POPUP border its
+    // own higher-contrast value (separators stay on the softer p.border below) so every floating
+    // subwindow reads a crisp outline in BOTH themes. Not a new palette role (contract is
+    // append-only); resolved inline from the theme.
+    c[ImGuiCol_Border]              = (t == Theme::Light) ? rgba(0.55f, 0.58f, 0.64f, 1.0f)
+                                                          : rgba(0.34f, 0.39f, 0.49f, 0.95f);
     c[ImGuiCol_BorderShadow]        = rgba(0,0,0,0);
     c[ImGuiCol_FrameBg]             = fromRole(p.frameBg);
     c[ImGuiCol_FrameBgHovered]      = fromRole(p.frameBgHovered);

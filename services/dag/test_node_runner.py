@@ -11,18 +11,14 @@ Or with real engine available:
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
-# Ensure services/ is on sys.path (mirrors conftest.py for the dag package).
-_SERVICES = Path(__file__).parent.parent
-if str(_SERVICES) not in sys.path:
-    sys.path.insert(0, str(_SERVICES))
-
+# `dag` resolves via the repo-root symlink (dag -> services/dag, matching
+# agent/deliverables/engine/installer/mcp_server) — see services/dag/conftest.py for why
+# this no longer does sys.path.insert(0, services_dir) (T-V3: that shadowed the real mcp SDK).
 from dag import context_pack as cp
 from dag import node_runner as nr
 from dag import executor, graph_loader

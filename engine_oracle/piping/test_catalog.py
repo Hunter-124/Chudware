@@ -15,8 +15,13 @@ except Exception:  # noqa: BLE001
 
 from engine.piping import catalog
 
-HAVE_FLUIDS = catalog.have_fluids()
-_needs_fluids = (pytest.mark.skipif(not HAVE_FLUIDS, reason="fluids not installed")
+# Evaluate lazily via a function to avoid module-load-time shadowing in combined
+# pytest runs (RC#2 from T-V2 audit: HAVE_FLUIDS=False at collection time in some
+# orderings even when fluids is installed, because another module deferred it).
+def _have_fluids() -> bool:
+    return catalog.have_fluids()
+
+_needs_fluids = (pytest.mark.skipif(not _have_fluids(), reason="fluids not installed")
                  if pytest else (lambda f: f))
 
 
@@ -39,8 +44,10 @@ def test_nearest_pipe_by_od_and_alias():
 
 def test_nearest_pipe_soft_fail():
     # Unknown size -> contract-shaped, never raises.
+    # Evaluate have_fluids() lazily at test-run time (not at collection time)
+    # to avoid RC#2 from the T-V2 audit (module-load-time flag wrong in combined runs).
     bad = catalog.nearest_pipe(nps=999)
-    if HAVE_FLUIDS:
+    if _have_fluids():
         assert isinstance(bad, dict) and bad["ok"] is False and "hint" in bad
     else:
         assert isinstance(bad, dict) and "fluids" in bad["reason"]
@@ -69,7 +76,7 @@ def test_available_sizes_nonempty():
 
 
 def main():
-    if HAVE_FLUIDS:
+    if _have_fluids():
         test_nearest_pipe_nps()
         test_nearest_pipe_by_od_and_alias()
     else:

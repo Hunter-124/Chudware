@@ -18,12 +18,21 @@ import types
 # and also support `pytest` launched from the repo root.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-# doc_diff_tools imports `from mcp.server.fastmcp import FastMCP` at module
-# level for MCP tool registration.  The `mcp` SDK may not be installed in the
-# test environment, or it may conflict with the local services/mcp package.
-# Inject a minimal stub so the module-level import succeeds without pulling in
-# the full SDK — the pure-Python doc_diff logic doesn't need FastMCP at all.
-if "mcp.server.fastmcp" not in sys.modules:
+# doc_diff_tools imports `from mcp.server.fastmcp import FastMCP` at module level for MCP
+# tool registration. The pure-Python doc_diff logic doesn't need FastMCP at all, so when the
+# real `mcp` SDK genuinely isn't installed, inject a minimal stub rather than fail collection.
+#
+# T-V3 fix: this used to stub unconditionally whenever "mcp.server.fastmcp" wasn't ALREADY in
+# sys.modules — i.e. whenever this file happened to be the first to touch `mcp` in the
+# process — permanently replacing FastMCP with the bare `object` class in sys.modules for
+# every test collected afterward in the same session (confirmed live:
+# `mcp_server/server.py`'s real `FastMCP(...)` call then raised `TypeError: object() takes no
+# arguments`, and anything importing `Image` from fastmcp got `ImportError`). Try the real SDK
+# first; only stub on a genuine ImportError, so an environment that HAS mcp installed (this
+# one) never gets the fake `object`-as-FastMCP substituted in.
+try:
+    import mcp.server.fastmcp  # noqa: F401
+except ImportError:
     _stub_mcp = sys.modules.get("mcp") or types.ModuleType("mcp")
     _stub_server = types.ModuleType("mcp.server")
     _stub_fastmcp = types.ModuleType("mcp.server.fastmcp")

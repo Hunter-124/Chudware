@@ -1,12 +1,9 @@
-"""conftest.py — make services/dag importable as 'dag' when pytest runs from repo root.
+"""conftest.py — services/dag is importable bare as 'dag' via the repo-root symlink
+(dag -> services/dag, matching agent/deliverables/engine/installer/mcp_server).
 
-Mirrors the implicit sys.path insertion that services/agent/ gets from its __init__.py
-being found by pytest's rootdir import logic.  Adding services/ to sys.path here gives
-the same effect for the dag package.
+T-V3: this used to `sys.path.insert(0, services_dir)` to fake the same effect — but
+putting services/ itself on sys.path makes services/mcp/ resolve as a top-level `mcp`
+package, shadowing the real installed mcp SDK ("mcp.server is not a package") for
+every OTHER test collected afterward in the same session. The repo-root symlink gives
+the same bare-`dag`-importability without that collision; nothing left to do here.
 """
-import sys
-from pathlib import Path
-
-_services_dir = str(Path(__file__).parent.parent)
-if _services_dir not in sys.path:
-    sys.path.insert(0, _services_dir)

@@ -2,8 +2,8 @@
 id: T-BL21
 title: Hollow structural sections - model true wall voids (RHS/HSS) for mass/interference correctness
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-quorix
+status: doing
 branch: task/T-BL21-hollow-sections
 depends_on: []
 lane: modeling-core

@@ -3,7 +3,7 @@ id: T-A5
 title: Integration day - run demo mission end-to-end
 workstream: A
 owner: sonnet-vale
-status: doing
+status: review
 branch: task/T-A5-integration-demo
 day: 5
 priority: 4

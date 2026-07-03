@@ -191,6 +191,10 @@ graph TD
     T_BL39["T-BL39: Copilot messages — remove the 'Assistant'/'Hi! Describe a part…' greeting, show the generating model(s) as attribution, compact the user/model display"]:::todo
     T_BL40["T-BL40: Universal in-app elicitation UI — agents question the user inline (multiple choice, short answer, open-ended) via the interaction contract"]:::todo
     T_BL41["T-BL41: Sketch — auto-hide dimension/relation annotations by default; dimension tool reveals them and adds/deletes relations"]:::todo
+    T_BL42["T-BL42: Feature tree — extrude/revolve/sweep/loft absorb their sketches/references as hidden children; eye-toggle to show+highlight; sketches stay reusable"]:::todo
+    T_BL43["T-BL43: Sketch external references — project external faces/edges/planes into a sketch, fix Convert Entities, select external features while in a sketch"]:::todo
+    T_BL44["T-BL44: Sketch — spacebar orients the view normal to the active sketch plane"]:::todo
+    T_BL45["T-BL45: 3D sketcher — OSS survey + design/plan freeze (data model, 3D constraint solver, integration with 2D sketch + features)"]:::todo
   end
   subgraph WS_integration["workstream integration"]
     T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog

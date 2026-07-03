@@ -42,10 +42,12 @@ def _ask_via_contract(questions: list, run_id: Optional[str], transport=None,
     supplied so answers persist to the run ledger and replay on resume (§5 — a
     dimension confirmed here is visible to a DAG gate for the same run_id, never re-asked).
 
-    When ``doc_id`` is supplied (and no ``run_id``), uses DocLedger(doc_id) so answers
-    persist to the doc-scoped sidecar and survive process restart (contract §5
-    "scope=doc" path — T-BL25).  A dimension confirmed in one session is never
-    re-asked in the next session for the same doc.
+    When ``doc_id`` is supplied (and no ``run_id``), uses IntakeLedger(doc_id) so
+    answers persist inside the document's IntakeState meta record, round-tripped
+    as JSON into the .step+ via doc_set_meta (contract §5 "scope=doc" — T-BL25).
+    The store travels WITH the document, so a dimension confirmed in one session
+    is never re-asked after the doc is saved and reopened — even though the
+    engine mints a fresh doc_id on every open (core/doc/session.cpp new_doc_id).
 
     Falls back to MemoryLedger when neither run_id nor doc_id is available.
 
@@ -57,16 +59,20 @@ def _ask_via_contract(questions: list, run_id: Optional[str], transport=None,
     """
     try:
         from services.agent.interaction import (
-            DocLedger, FileLedger, MemoryLedger, ask_user, make_batch)
+            FileLedger, MemoryLedger, ask_user, make_batch)
     except ImportError:
         from agent.interaction import (  # type: ignore
-            DocLedger, FileLedger, MemoryLedger, ask_user, make_batch)
+            FileLedger, MemoryLedger, ask_user, make_batch)
+    try:
+        from services.mcp.intake_ledger import IntakeLedger
+    except ImportError:
+        from mcp_server.intake_ledger import IntakeLedger  # type: ignore
 
     if ledger is None:
         if run_id:
             ledger = FileLedger(run_id)
         elif doc_id:
-            ledger = DocLedger(doc_id)
+            ledger = IntakeLedger(doc_id)
         else:
             ledger = MemoryLedger()
 
@@ -78,10 +84,6 @@ def _ask_via_contract(questions: list, run_id: Optional[str], transport=None,
     elif doc_id:
         scope, effective_run_id, effective_doc_id = "doc", None, doc_id
     else:
-        # Legacy: no run_id, no doc_id — MemoryLedger, scope=run (batch validation
-        # requires run_id for scope=run, so use scope=doc with no doc_id skips
-        # validation; keep "run" + None to preserve prior behaviour for callers
-        # that only supply a MemoryLedger injection).
         scope, effective_run_id, effective_doc_id = "run", None, None
 
     # Non-blocking: the MCP tool layer is multi-turn; it surfaces questions to the
@@ -356,6 +358,11 @@ def register_intake_tools(mcp: FastMCP) -> None:
             st.status = "awaiting_user"
             st.pending_request_id = req.get("request_id_seed")
             st.needs = [{"kind": "photo", "label": label, "request_id": st.pending_request_id}]
+            # Carry forward doc-scoped interaction Q/A records (contract §5): a fresh
+            # photo request must never wipe answers already confirmed for this doc.
+            prior = _get(d, _K_INTAKE)
+            if isinstance(prior, dict) and isinstance(prior.get("interaction"), dict):
+                st.interaction = prior["interaction"]
             _set(d, _K_INTAKE, st.to_dict())
             return _dumps({"ok": True, "request": req, "request_id": st.pending_request_id,
                            "status": "awaiting_user"})
@@ -521,9 +528,12 @@ def register_intake_tools(mcp: FastMCP) -> None:
             # the answer is also persisted in the interaction ledger for replay.
             # - When run_id is supplied: persists to the run-scoped FileLedger so a
             #   DAG gate for the same run_id never re-asks (cross-mechanism no-re-ask).
-            # - When only doc_id is available: persists to the doc-scoped DocLedger so
-            #   the answer survives process restart (contract §5 scope=doc — T-BL25).
-            if (run_id or d) and confirmations:
+            # - Otherwise: persists to the doc's IntakeLedger (IntakeState meta,
+            #   rides the .step+) so the answer survives save/reopen (§5 — T-BL25).
+            #   `d` is the RESOLVED doc-id string (cad_tools._doc raises when there
+            #   is no doc), the same identity the _K_LEDGER write above targets —
+            #   so a confirmation always has a valid persistence target here.
+            if confirmations:
                 questions = []
                 for c in confirmations:
                     key = c.get("key")

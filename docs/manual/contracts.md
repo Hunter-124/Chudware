@@ -1,6 +1,6 @@
 # Contracts Summary
 
-27 frozen contracts under `contracts/`:
+28 frozen contracts under `contracts/`:
 
 - `README.md` — contracts/ — frozen interface seams
 - `agent_events.md` — Contract: Agent Events — `aicad.agent_events/1`
@@ -15,6 +15,7 @@
 - `hydraulic_schema.md` — Contract: `aicad.hydraulic/1` — ISO 1219 Hydraulic Circuit Schema
 - `icons.md` — Contract: Icon Pipeline — v1
 - `interaction.md` — Contract: Interaction — `ask_user` — v1
+- `license_debt.md` — License debt register — cleanroom-before-SaaS
 - `licenses.md` — Contract: Dependency License Ledger
 - `mesh_format.md` — Contract: AICM v1 — tessellation + overlay binary format
 - `narration.md` — Narration Style Guide

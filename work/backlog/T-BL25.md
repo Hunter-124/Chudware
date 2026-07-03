@@ -31,35 +31,58 @@ the user across sessions).
       the same doc (not just two mechanisms in one run)
 - [x] ask_user/intake call sites route scope=doc through it per contract §5
 
-## Implementation notes (sonnet-heath, 2026-07-03)
+## Implementation notes (sonnet-heath, 2026-07-03 — REWORKED per foreman review)
 
-### Persistence choice: doc-scoped sidecar (DocLedger)
+### Rework history
 
-Chose **sidecar** over IntakeState-backed approach:
-- `intake_tools.py` saves IntakeState via `doc_set_meta` (C++ bridge) — round-tripping
-  that in tests requires libaicad.so; tests must be stdlib-only.
-- Contract §5 explicitly allows "with the doc **or alongside it**".
-- FileLedger pattern mirrors cleanly; zero new deps.
+**v1 (REJECTED):** cache sidecar keyed on doc_id at `<cache>/docs/<doc_id>/interaction.jsonl`.
+Foreman review found doc_id is a PER-PROCESS counter (`core/doc/session.cpp new_doc_id()`
+L223 mints `doc-cpp%08llx`; `doc_open` stamps a fresh id every open) — the sidecar was
+unfindable after restart, and the v1 tests missed it because they injected `path=` and
+never exercised the production lookup. Also deviated from contract §5's specified store.
 
-Sidecar lives at `<AICAD_CACHE_ROOT>/docs/<doc_id>/interaction.jsonl`.
-`AICAD_CACHE_ROOT` env var overrides for tests (same pattern as FileLedger).
+**v2 (this branch):** contract §5 as written — answers persist in the document's
+`IntakeState` record, round-tripped as JSON into the `.step+` via `doc_set_meta`/
+`doc_get_meta` ("Same records; different store"). The store travels WITH the document,
+so the per-process doc_id churn is irrelevant by construction.
 
 ### Changes
 
-- `services/agent/interaction.py`: `doc_dir()` + `DocLedger` class (mirrors FileLedger,
-  keyed on doc_id). `ask_user()` scope=doc branch now uses `DocLedger(batch.doc_id)`
-  instead of falling back to `MemoryLedger`.
-- `services/mcp/intake_tools.py`: `_ask_via_contract()` gains `doc_id` kwarg; picks
-  DocLedger when doc_id supplied. `confirm_dimensions()` routes scope=doc when run_id
-  absent but doc_id available.
-- `services/dag/test_intake_gate_ledger.py`: `TestDocLedgerCrossSession` — 3 tests
-  covering cross-session no-re-ask (BoomTransport), doc isolation, and intake routing.
+- `engine_oracle/intake/intake.py`: additive `IntakeState.interaction` field
+  (`{"questions": [...], "answers": {qid: answer}}`); to_dict/from_dict round-trip it
+  so dataclass load/save paths never wipe recorded answers.
+- `services/mcp/intake_ledger.py` (NEW): `IntakeLedger` — Ledger-protocol adapter over
+  the doc's intake meta record. No FastMCP import (safe for interaction.py's lazy
+  default path); engine bridge imported lazily; `get_meta`/`set_meta` injectable for
+  engine-less tests; every mutation is load-modify-save so concurrent IntakeState
+  field writes (status/needs) are preserved.
+- `services/agent/interaction.py`: `_default_doc_ledger()` — ask_user's scope=doc
+  default ledger is now IntakeLedger(doc_id) when the engine bridge is available,
+  MemoryLedger otherwise (module stays stdlib-only at load).
+- `services/mcp/intake_tools.py`: `_ask_via_contract(doc_id=...)` routes to
+  IntakeLedger; `confirm_dimensions` persists scope=doc when run_id absent (guard
+  fixed — `d` verified to be the RESOLVED doc-id string from `cad_tools._doc`, the
+  same identity the crit_dims write uses, so `if confirmations:` suffices);
+  `request_part_photos` carries forward prior interaction records when it rebuilds
+  the IntakeState (wipe hazard closed).
 
-### Test results
+### Tests
 
-- `services/dag/test_intake_gate_ledger.py`: 17/17 pass + 2 pre-existing skips
-- `services/agent/test_interaction.py`: 18/18 pass
-- Total: 35 pass, 2 skip
+- `services/dag/test_intake_gate_ledger.py::TestIntakeLedgerCrossSession` (5 tests,
+  pure Python): cross-session replay over a JSON-round-tripping meta store
+  (BoomTransport asserts no re-ask), doc isolation, IntakeState round-trip
+  preservation, load-modify-save field preservation, _ask_via_contract routing.
+- `services/mcp/test_intake_ledger.py` (NEW, 3 tests vs REAL engine): doc_new →
+  record → doc_save → doc_open (asserts the reopened doc_id DIFFERS) → fresh
+  IntakeLedger from the doc alone replays with transport never invoked; same via
+  ask_user's DEFAULT ledger path (nothing injected); confirm_dimensions call-site
+  answer survives save+reopen. All 3 PASS against libaicad.so.
+
+### Test results (v2)
+
+- dag + agent + intake suites: 336 passed / 2 skipped; only pre-existing failures
+  (test_h7_shadow offline-mode + test_providers_conformance, both red on master)
+- services/mcp/test_intake_ledger.py: 3/3 vs real engine
 
 ## AI hints
 

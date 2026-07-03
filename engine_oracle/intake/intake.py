@@ -360,6 +360,11 @@ class IntakeState:
     pending_request_id: Optional[str] = None
     doc_id: Optional[str] = None
     revision: int = 0
+    # Doc-scoped interaction Q/A records (contracts/interaction.md §5, T-BL25):
+    # {"questions": [<question dict>...], "answers": {qid: <answer dict>}}.
+    # Same records as the run-scoped FileLedger; different store — persisted
+    # with this state into the .step+ so a confirmed answer survives reopen.
+    interaction: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -368,6 +373,7 @@ class IntakeState:
             "pending_request_id": self.pending_request_id,
             "doc_id": self.doc_id,
             "revision": self.revision,
+            "interaction": copy.deepcopy(self.interaction),
         }
 
     @classmethod
@@ -378,6 +384,7 @@ class IntakeState:
             pending_request_id=d.get("pending_request_id"),
             doc_id=d.get("doc_id"),
             revision=int(d.get("revision", 0)),
+            interaction=copy.deepcopy(d.get("interaction") or {}),
         )
 
 

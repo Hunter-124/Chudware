@@ -14,7 +14,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# T-V3 fix: .resolve() first so this lands on repo root regardless of whether the file was
+# reached via the installer/ symlink or its real services/installer/ path — the old
+# dirname(dirname(...)) on the unresolved path landed on services/ when pytest collects the
+# real path, which makes services/mcp/ resolve as a top-level `mcp` package, shadowing the
+# real installed SDK.
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from installer import setup_file_assoc as fa  # noqa: E402
 

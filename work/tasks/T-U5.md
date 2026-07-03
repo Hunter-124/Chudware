@@ -3,7 +3,7 @@ id: T-U5
 title: Requirements & verification panel — req status, battery results
 workstream: U
 owner: sonnet-dove
-status: review
+status: done
 branch: task/T-U5-ui
 day: 5
 priority: 3

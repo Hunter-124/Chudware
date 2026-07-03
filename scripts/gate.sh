@@ -207,12 +207,12 @@ stage_ctest() {
 # skip via @pytest.importorskip); the stage still runs and collects — it just won't
 # exercise core-calling paths.
 #
-# The four files below have known collection errors tracked by T-V2 (cross-suite
-# pollution audit). They are explicitly ignored so their errors don't abort collection:
-#   engine_oracle/doc/test_aicm.py        — T-V2
-#   engine_oracle/sim/test_foam_case.py   — T-V2
-#   engine_oracle/sim/test_lbm.py         — T-V2
-#   services/agent/test_loop_mock.py      — T-V2
+# The files below have known collection errors. They are explicitly ignored so their
+# errors don't abort collection. Status as of T-V3 (2026-07-03):
+#   engine_oracle/doc/test_aicm.py        — REMOVED from ignores (OCP now installed; collects cleanly)
+#   engine_oracle/sim/test_foam_case.py   — T-V2/T-V3: trimesh absent → collection error
+#   engine_oracle/sim/test_lbm.py         — T-V2/T-V3: trimesh absent → collection error
+#   services/agent/test_loop_mock.py      — T-V2/T-V3: hardcoded path to services/engine/samples/ missing
 #
 # Pre-existing test failures inside the collected suites are RECORDED (non-fatal) here,
 # matching the check.py FAIL-RECORDED policy. Only a hard collection crash or a zero-
@@ -272,8 +272,8 @@ stage_pytest() {
 
         # Build the ignore flags (only for dirs that have the relevant files).
         local ignore_args=()
-        # T-V2 tracked ignores: collection-error files that poison the whole run
-        [ -f "engine_oracle/doc/test_aicm.py" ]      && ignore_args+=(--ignore=engine_oracle/doc/test_aicm.py)
+        # T-V2/T-V3 tracked ignores: collection-error files that poison the whole run.
+        # engine_oracle/doc/test_aicm.py was removed (T-V3): OCP now installed, collects cleanly.
         [ -f "engine_oracle/sim/test_foam_case.py" ]  && ignore_args+=(--ignore=engine_oracle/sim/test_foam_case.py)
         [ -f "engine_oracle/sim/test_lbm.py" ]        && ignore_args+=(--ignore=engine_oracle/sim/test_lbm.py)
         [ -f "services/agent/test_loop_mock.py" ]     && ignore_args+=(--ignore=services/agent/test_loop_mock.py)
@@ -322,7 +322,7 @@ stage_pytest() {
     done
 
     echo "  total collected ≈ $total_collected tests across ${#dirs[@]} dirs"
-    record "pytest              total ≈ $total_collected collected | $total_passed passed | ignoring 4 files tracked by T-V2"
+    record "pytest              total ≈ $total_collected collected | $total_passed passed | ignoring 3 files (T-V2/T-V3; test_aicm.py removed from ignores — OCP installed)"
 
     if [ "$any_hard_fail" -ne 0 ]; then
         record "pytest              FAIL    one or more dirs had a hard collection crash (rc≥2)"

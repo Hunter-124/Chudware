@@ -50,3 +50,11 @@ fluids==1.3.1
 # structural discipline module (engine_oracle/structural): member forces + deflections via
 # PyNiteFEA (MIT, in-process — see contracts/licenses.md row, T-D2).
 PyNiteFEA==1.0.1
+
+# Undeclared-but-installed transitive dependencies (T-V2 audit, T-V3 fix).
+# These were installed in mcp-venv but absent from requirements.txt; missing declaration
+# = silent breakage if the venv is rebuilt from scratch. All MIT-licensed (in-process OK).
+anyio>=4.0.0          # MIT — async I/O transport used by services/mcp/server.py
+langgraph>=1.0.0      # MIT — DAG orchestration used by services/dag/
+pydantic>=2.0.0       # MIT — FastMCP tool arg schemas (indirect, via mcp package)
+qrcode>=7.0           # MIT — QR code generation used by engine_oracle/

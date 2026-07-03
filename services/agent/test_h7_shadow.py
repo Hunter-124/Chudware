@@ -33,27 +33,60 @@ if str(_ROOT) not in sys.path:
 # ---------------------------------------------------------------------------
 import types as _types
 
-# engine.paths stub
+# engine.paths stub — harmless module-level injection (DATA is a temp path, never written).
+# This does NOT pollute other test modules because engine.paths is not used by any other
+# test suite in a conflicting way.
 _engine_pkg = _types.ModuleType("engine")
 _engine_paths = _types.ModuleType("engine.paths")
 _engine_paths.DATA = Path("/tmp/ai_cad_test_data")  # never actually written in tests
 sys.modules.setdefault("engine", _engine_pkg)
 sys.modules.setdefault("engine.paths", _engine_paths)
 
-# services.agent.config stub
-_svc_agent_cfg = _types.ModuleType("services.agent.config")
-_svc_agent_cfg.consent_tier = lambda cfg: "off"  # type: ignore[attr-defined]
-_svc_agent_cfg.load_config = lambda: {}           # type: ignore[attr-defined]
-_svc_agent_cfg.offline_enabled = lambda: False    # type: ignore[attr-defined]
-def _assert_offline_safe_stub(provider):  # type: ignore[no-redef]
-    """Stub that mirrors the real config check: raise for non-offline-safe providers."""
-    if not getattr(provider, "offline_safe", False):
-        raise RuntimeError(
-            f"assert_offline_safe: provider {getattr(provider, 'name', '?')!r} "
-            "is not offline-safe"
-        )
-_svc_agent_cfg.assert_offline_safe = _assert_offline_safe_stub  # type: ignore[attr-defined]
-sys.modules.setdefault("services.agent.config", _svc_agent_cfg)
+# ---------------------------------------------------------------------------
+# services.agent.config stub — injected via a session-scoped autouse fixture
+# so sys.modules["services.agent.config"] is RESTORED after this module runs.
+# Previously this was a bare sys.modules.setdefault() at collection time, which
+# caused 5 pollution regressions in engine_oracle tests (RC#1 from T-V2 audit):
+#   - consent_tier() always returned "off" → broke 3 telemetry-consent tests
+#   - missing get_provider attr → AttributeError in spec_sheet_matcher tests
+# ---------------------------------------------------------------------------
+
+def _make_svc_agent_config_stub() -> _types.ModuleType:
+    """Build the services.agent.config stub module used by this test file."""
+    stub = _types.ModuleType("services.agent.config")
+    stub.consent_tier = lambda cfg: "off"       # type: ignore[attr-defined]
+    stub.load_config = lambda: {}               # type: ignore[attr-defined]
+    stub.offline_enabled = lambda: False        # type: ignore[attr-defined]
+    stub.get_provider = lambda name=None: None  # type: ignore[attr-defined]  # prevents attr cascade
+
+    def _assert_offline_safe(provider):  # type: ignore[no-redef]
+        if not getattr(provider, "offline_safe", False):
+            raise RuntimeError(
+                f"assert_offline_safe: provider {getattr(provider, 'name', '?')!r} "
+                "is not offline-safe"
+            )
+    stub.assert_offline_safe = _assert_offline_safe  # type: ignore[attr-defined]
+    return stub
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _patch_svc_agent_config():
+    """Inject services.agent.config stub for this module only; restore on teardown.
+
+    scope="module" means this runs once per test module, not once per test.
+    The explicit save/restore guarantees other test modules (e.g. telemetry_consent,
+    spec_sheet_matcher) see the real services.agent.config — fixing the 5 RC#1
+    pollution regressions identified in the T-V2 audit.
+    """
+    _SENTINEL = object()
+    key = "services.agent.config"
+    _saved = sys.modules.get(key, _SENTINEL)
+    sys.modules[key] = _make_svc_agent_config_stub()
+    yield
+    if _saved is _SENTINEL:
+        sys.modules.pop(key, None)
+    else:
+        sys.modules[key] = _saved  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Now it is safe to import the modules under test.

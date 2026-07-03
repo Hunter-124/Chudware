@@ -2,8 +2,8 @@
 id: T-U8
 title: Model & telemetry transparency UI — consent, which-brain, canary opt-in
 workstream: U
-owner: unassigned
-status: todo
+owner: sonnet-teal
+status: done
 branch: task/T-U8-ui
 day: 8
 priority: 4
@@ -36,3 +36,20 @@ model answered (Erik-ratified serving rules; offline/ITAR forces telemetry off).
   unmerged (record merge order) and consume its read API; question file for gaps.
 - Copy honesty: never imply cloud-off when a frontier provider is active — the
   which-brain string is the anti-surprise feature.
+
+## Progress log
+- 2026-07-03 01:29 UTC [sonnet-teal] REVIEW CHECK-IN — branch task/T-U8-ui pushed, gate PASS.
+
+Files delivered:
+- ui/abstract/transparency_view.h — pure view-model (TransparencyModel, ServingRouteRow, SidecarEntry, TransparencyPanelState); no ImGui/GL
+- ui/imgui/src/ui/transparency_panel.{h,cpp} — T-U1 scaffold panel, 4 sections:
+  1. Consent tier: radio OFF/meta/full using existing currentConsentIndex/setConsentIndex; radio disabled (not hidden) when offlineMode=true
+  2. Active AI Brain: serving_status RPC → table per route (endpoint/provider/model/adapter/canary%); honest "not serving" state when empty
+  3. Early-Adopter Canary Opt-In: per-route checkbox, only shown when canary_pct > 0; calls serving_set_canary; never calls serving_promote
+  4. Telemetry Sidecars: stat-scans appdataRoot()/crashes (T-Q2) + telemetry/sidecars (T-H7); shows exists/empty/file-count
+- scenarios.{h,cpp} — wantTransparency/transparencyShotDone flags + fixture (stable+canary routes); seedTransparencyPanelForShot()
+- application.cpp — panel wiring appended after requirements panel
+
+Erik-ratified rules honoured: consent default OFF, offline forces OFF, canary default OFF, no auto-promotion, serving_promote never wired.
+Screenshot AI_CAD_SHOT=transparency: panel renders fixture (PNG verified visually).
+ui_style_check: 0 findings. gate.sh: PASS.

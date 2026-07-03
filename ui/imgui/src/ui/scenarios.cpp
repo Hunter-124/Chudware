@@ -11,6 +11,8 @@
 #include "ui/parts_panel.h"
 #include "ui/cam_panel.h"            // T-U3 CAM workspace (AI_CAD_SHOT=cam_workspace)
 #include "ui/bom_panel.h"
+#include "ui/requirements_panel.h"   // T-U5
+#include "ui/transparency_panel.h"   // T-U8
 #include "artifact_view.h"
 #include "app/app_state.h"
 #include "viewport/scene.h"
@@ -225,6 +227,8 @@ int ShotConfig::captureFrameBudget() const {
     if (wantCam && !camShotDone) return 999999;
     if (wantEcad && !ecadShotDone) return 150;
     if (wantBom && !bomShotDone) return 150;
+    if (wantRequirements && !requirementsShotDone) return 150;  // T-U5
+    if (wantTransparency && !transparencyShotDone) return 150;  // T-U8
     if (wantTree) return treeShotDone ? 10 : 30;
     if (wantEquations) return equationsShotDone ? 10 : 30;
     if (wantPartsBrowser) return partsBrowserShotDone ? 10 : 30;
@@ -272,6 +276,8 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantScaffoldDemo  = eq("scaffold_demo");
     cfg.wantPartsBrowser  = eq("parts_browser");
     cfg.wantBom          = eq("bom");
+    cfg.wantRequirements = eq("requirements");   // T-U5
+    cfg.wantTransparency = eq("transparency");   // T-U8
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
@@ -319,6 +325,8 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantCamWorkspace = eq("cam_workspace");
     if (cfg.wantCamWorkspace) ui::openCamWorkspacePanel();
     if (cfg.wantBom)          ui::openBomPanel();
+    if (cfg.wantRequirements) ui::openRequirementsPanel();  // T-U5
+    if (cfg.wantTransparency) ui::openTransparencyPanel();  // T-U8
     if (cfg.wantPick) setupPickShot(st);
     if (cfg.wantGlassperf) setupPickShot(st);
 
@@ -493,6 +501,143 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
             })";
             ui::seedBomPanelFromJson(fixture);
             std::printf("bom: fixture seeded (live unavailable: %s)\n", err.c_str());
+        }
+        std::fflush(stdout);
+    }
+
+    // T-U5 Requirements & verification panel.
+    // Tries a live req_report RPC; falls back to a deterministic fixture that exercises
+    // every valid status (proposed/user_confirmed/verified/failed/waived) plus two battery
+    // checks (one pass, one fail with evidence) so the screenshot proves all readout paths.
+    if (cfg.wantRequirements && !cfg.requirementsShotDone) {
+        cfg.requirementsShotDone = true;
+        nlohmann::json res;
+        std::string err;
+        bool liveOk = st.worker.call("req_report", {{"doc_path", ""}}, res, err, 15000);
+        if (liveOk && res.value("ok", false) &&
+                res.contains("requirements") && res["requirements"].is_array() &&
+                !res["requirements"].empty()) {
+            std::string resStr = res.dump();
+            ui::seedRequirementsPanelFromJson(resStr);
+            std::printf("requirements: live req_report ok (%d reqs)\n",
+                        (int)res["requirements"].size());
+        } else {
+            // Fixture: covers proposed/user_confirmed/verified/failed/waived statuses
+            // and 2 battery checks (pass + fail) — proves every rendering branch.
+            const std::string fixture = R"json({
+                "ok": true,
+                "requirements": [
+                    {
+                        "id": "req_001",
+                        "kind": "dimensional",
+                        "status": "verified",
+                        "text": "Overall envelope shall not exceed bounding box",
+                        "quantity": {"op": "<=", "value": 150, "unit": "mm"},
+                        "verify_by": [{"id": "v_geom_01"}]
+                    },
+                    {
+                        "id": "req_002",
+                        "kind": "material",
+                        "status": "proposed",
+                        "text": "Body material shall be 6061-T6 aluminum",
+                        "quantity": null,
+                        "verify_by": []
+                    },
+                    {
+                        "id": "req_003",
+                        "kind": "functional",
+                        "status": "failed",
+                        "text": "Static deflection under 500 N load shall not exceed 0.5 mm",
+                        "quantity": {"op": "<=", "value": 0.5, "unit": "mm"},
+                        "verify_by": [{"id": "v_fea_01"}]
+                    },
+                    {
+                        "id": "req_004",
+                        "kind": "cost",
+                        "status": "user_confirmed",
+                        "text": "Unit production cost target",
+                        "quantity": {"op": "<=", "value": 85, "unit": "USD"},
+                        "verify_by": []
+                    },
+                    {
+                        "id": "req_005",
+                        "kind": "standard",
+                        "status": "waived",
+                        "text": "RoHS compliance (waived for prototype run)",
+                        "quantity": null,
+                        "verify_by": []
+                    }
+                ],
+                "battery": {
+                    "checks": [
+                        {
+                            "check": "interference",
+                            "passed": true,
+                            "summary": "No interference detected (0 pairs)",
+                            "elapsed_ms": 42
+                        },
+                        {
+                            "check": "budget",
+                            "passed": false,
+                            "summary": "Cost estimate $112 exceeds $85 target",
+                            "elapsed_ms": 8
+                        }
+                    ]
+                }
+            })json";
+            ui::seedRequirementsPanelFromJson(fixture);
+            std::printf("requirements: fixture seeded (live unavailable: %s)\n", err.c_str());
+        }
+        std::fflush(stdout);
+    }
+
+    // T-U8 Model & telemetry transparency panel.
+    // Tries a live serving_status RPC; falls back to a fixture that exercises every
+    // rendering branch: two routes (one stable, one canary), honest "not-opted-in"
+    // canary state, and real sidecar dir scan.
+    if (cfg.wantTransparency && !cfg.transparencyShotDone) {
+        cfg.transparencyShotDone = true;
+        nlohmann::json res;
+        std::string err;
+        bool liveOk = st.worker.call("serving_status", nlohmann::json::object(),
+                                     res, err, 5000);
+        if (liveOk && res.value("ok", false) &&
+                res.contains("routes") && res["routes"].is_array()) {
+            ui::seedTransparencyPanelForShot(res.dump());
+            std::printf("transparency: live serving_status ok (%d routes)\n",
+                        (int)res["routes"].size());
+        } else {
+            // Fixture: one stable route + one canary route, user not opted in.
+            // Exercises which-brain table, canary section, and the "not opted in"
+            // honest state.  Sidecar dirs are scanned from the real filesystem.
+            const std::string fixture = R"json({
+                "ok": true,
+                "routes": [
+                    {
+                        "insertion_point": "copilot",
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "adapter_version": "",
+                        "canary_pct": 0,
+                        "opt_in_count": 0,
+                        "opt_in": [],
+                        "fallback": {"mode": "none", "provider": "", "model": ""}
+                    },
+                    {
+                        "insertion_point": "reviewer",
+                        "provider": "vllm",
+                        "model": "Qwen3-4B",
+                        "adapter_version": "v0.2.1",
+                        "canary_pct": 15,
+                        "opt_in_count": 3,
+                        "opt_in": [],
+                        "fallback": {"mode": "provider", "provider": "openai", "model": "gpt-4o"}
+                    }
+                ]
+            })json";
+            ui::seedTransparencyPanelForShot(fixture);
+            std::printf("transparency: fixture seeded (live unavailable: %s)\n",
+                        err.c_str());
         }
         std::fflush(stdout);
     }

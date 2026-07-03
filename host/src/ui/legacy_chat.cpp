@@ -20,6 +20,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cctype>
 #include <filesystem>
@@ -1263,26 +1264,48 @@ static void drawCopilotHeader(AppState& st, bool busy) {
         ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(h, h));
         ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
     }
-    ImGui::PushFont(st.fonts.medium);
-    ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
-    ImGui::TextUnformatted("ShopCraft Copilot");
-    ImGui::PopStyleColor();
-    ImGui::PopFont();
-
+    // Right-side control cluster: [Sessions|< Chat toggle] [settings gear] [status dot]. Its width
+    // is measured from the CURRENT label each frame and the cluster is hard-anchored to the column's
+    // right edge, so every control is ALWAYS on-screen and clickable at any tab width. (T-G17: the
+    // settings gear + status dot used to overflow off the right edge on a normal-width column.)
     const ImGuiStyle& style = ImGui::GetStyle();
     const float lh = ImGui::GetTextLineHeight();
-    float sessW = ImGui::CalcTextSize("Sessions").x + style.FramePadding.x * 2.0f;
-    float gearW = lh;
-    float cluster = sessW + style.ItemSpacing.x + gearW + style.ItemSpacing.x + lh;
+    const float gearW = lh + 2 * sc;
+    const bool sessionsOpen = st.showSessionsPicker;
+    const char* sessLabel = sessionsOpen ? "< Chat" : "Sessions";
+    const float sessW = ImGui::CalcTextSize(sessLabel).x + style.FramePadding.x * 2.0f;
+    const float dotW  = lh;
+    const float cluster = sessW + style.ItemSpacing.x + gearW + style.ItemSpacing.x + dotW;
+
+    // Anchor the cluster to the column's right edge, held off the very edge by a small inset so the
+    // status dot is never clipped. The title takes whatever room is left up to the cluster and shows
+    // the best-fitting brand label (full -> "Copilot" -> logo only) rather than a hard mid-word clip.
+    const float rightInset = 4.0f * sc;
+    const float anchorX     = ImGui::GetContentRegionMax().x - cluster - rightInset;
+    const float titleStartX = ImGui::GetCursorPosX();
+    const float titleAvail  = anchorX - titleStartX - style.ItemSpacing.x;
+    ImGui::PushFont(st.fonts.medium);
+    const float fullW  = ImGui::CalcTextSize("ShopCraft Copilot").x;
+    const float shortW = ImGui::CalcTextSize("Copilot").x;
+    const char* useTitle = (titleAvail >= fullW)  ? "ShopCraft Copilot"
+                         : (titleAvail >= shortW) ? "Copilot"
+                                                  : nullptr;
+    if (useTitle) {
+        ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textPrimary);
+        ImGui::TextUnformatted(useTitle);
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopFont();
+
     ImGui::SameLine();
-    float xRight = ImGui::GetContentRegionMax().x - cluster;
-    if (xRight > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(xRight);
+    if (anchorX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(anchorX);
 
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::SmallButton("Sessions")) st.showSessionsPicker = !st.showSessionsPicker;
+    if (ImGui::SmallButton(sessLabel)) st.showSessionsPicker = !st.showSessionsPicker;
     if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Show or hide the session list — switch chats out of order.");
+        ImGui::SetTooltip(sessionsOpen ? "Back to the chat."
+                                       : "Sessions — switch between chats.");
 
     ImGui::SameLine();
     IconUV gear = ui::getIcon("settings", 20);
@@ -1318,19 +1341,22 @@ static void drawSessionsPanel(AppState& st, bool busy) {
     const ui::AdaptiveSurface& surf = chatSurf();
     ensureConversations(st);
 
-    if (ImGui::Button("+ New session") && !busy) { newConversation(st); st.prompt[0] = 0; }
+    // New-session button spans the full tab width (T-G17 item 6). The Sessions<->Back toggle now
+    // lives in the header (drawCopilotHeader), so there is no separate "Back to chat" control here.
+    if (busy) ImGui::BeginDisabled();
+    if (ImGui::Button("+ New session", ImVec2(-1, 0))) { newConversation(st); st.prompt[0] = 0; }
+    if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Start a fresh conversation.");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Back to chat")) st.showSessionsPicker = false;
 
-    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0, 6 * sc));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
     ImGui::TextUnformatted("Switch sessions — running ones keep working in the background.");
     ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, 4 * sc));
-    // Session rows sit directly on the pane glass — adaptive ink, not theme text.
-    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::Dummy(ImVec2(0, 6 * sc));
 
+    const ImGuiStyle& style = ImGui::GetStyle();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float pad = 8 * sc;
     for (int i = 0; i < (int)st.conversations.size(); ++i) {
         Conversation& c = st.conversations[i];
         std::string title = c.title.empty() ? ("Chat " + std::to_string(i + 1)) : c.title;
@@ -1340,25 +1366,56 @@ static void drawSessionsPanel(AppState& st, bool busy) {
             if (!it->fromUser && it->running) { running = true; break; }
         if (i == st.activeConv && aiTurnActive(st)) running = true;
         bool active = (i == st.activeConv);
+
         ImGui::PushID(i);
-        float trashW = ImGui::GetFrameHeight();
-        float rowW = ImGui::GetContentRegionAvail().x;
-        std::string label = title;
-        if (running) label += "  \xe2\x80\xa2 running";
-        if (ImGui::Selectable(label.c_str(), active, 0,
-                              ImVec2(rowW - trashW - 4 * sc, 0)) && !busy)
-            switchConversation(st, i);
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - trashW);
+        const float rowH    = ImGui::GetFrameHeight() + 6 * sc;   // roomy, touch-friendly row
+        const float trashSz = ImGui::GetFrameHeight();            // square trash box
+        const ImVec2 rowMin = ImGui::GetCursorScreenPos();
+        const float  rowW   = ImGui::GetContentRegionAvail().x;
+        const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + rowH);
+        const float  midY   = rowMin.y + rowH * 0.5f;
+        const float  fh     = ImGui::GetFontSize();
+
+        // Whole-row click target (everything left of the trash) switches to that session.
+        bool picked = ImGui::InvisibleButton("##pickconv", ImVec2(rowW - trashSz - pad, rowH));
+        bool rowHov = ImGui::IsItemHovered();
+        if (picked && !busy) switchConversation(st, i);
+
+        // Glass row pill — matches the FeatureManager rows: alternating stripe + a restrained accent
+        // card for the active session, a light wash on hover. Drawn behind the (later) text.
+        float wash = active ? 0.52f : (rowHov ? 0.44f : 0.32f);
+        ui::glassRowBackground(dl, rowMin, rowMax, 6.0f, (i % 2) == 1, active, wash);
+
+        // Title text, vertically centered in the row. Primary adaptive ink on every row so inactive
+        // sessions stay readable over the light glass (active is set apart by its accent card, not by
+        // dimming the text). Adaptive ink only — T-G14 owns the dark-mode color work.
+        ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
+        dl->AddText(ImVec2(rowMin.x + pad, midY - fh * 0.5f), ink, title.c_str());
+        if (running) {
+            float tw = ImGui::CalcTextSize(title.c_str()).x;
+            ImVec4 rc = semanticOnGlass(ui::palette.accent, surf);
+            dl->AddText(ImVec2(rowMin.x + pad + tw + 8 * sc, midY - fh * 0.5f),
+                        ImGui::ColorConvertFloat4ToU32(rc), "\xe2\x80\xa2 running");
+        }
+
+        // Trash button: right-anchored WITH an inset so it never clips the column edge, and
+        // vertically centered on the row (T-G17 item 4).
+        const float img  = trashSz - 8 * sc;
+        const float btnW = img + style.FramePadding.x * 2.0f;
+        const float btnH = img + style.FramePadding.y * 2.0f;
+        ImGui::SetCursorScreenPos(ImVec2(rowMax.x - btnW - 2 * sc, midY - btnH * 0.5f));
         IconUV trash = ui::getIcon("delete", 20);
         bool del = trash.valid
-            ? ImGui::ImageButton("##delconv", trash.texId,
-                                 ImVec2(trashW - 8 * sc, trashW - 8 * sc), trash.uv0, trash.uv1)
+            ? ImGui::ImageButton("##delconv", trash.texId, ImVec2(img, img), trash.uv0, trash.uv1)
             : ImGui::SmallButton("x");
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Delete this session");
-        if (del && !busy) { closeConversation(st, i); ImGui::PopID(); break; }
+        bool doDel = del && !busy;
+
+        // Advance the ImGui cursor past the row (the buttons above left it mid-row).
+        ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + 3 * sc));
         ImGui::PopID();
+        if (doDel) { closeConversation(st, i); break; }
     }
-    ImGui::PopStyleColor();   // session-row ink
 }
 
 
@@ -1731,7 +1788,7 @@ static bool providerUsable(AppState& st, int provider);
 static bool localModelLoaded(const ProviderModels& pm, const std::string& id);
 
 // Shared provider + model picker. Returns true if a setting changed this frame.
-bool drawProviderModelPicker(AppState& st, bool busy) {
+bool drawProviderModelPicker(AppState& st, bool busy, bool slim) {
     (void)busy;
     Settings& s = st.settings;
     const float S = ui::uiScale;
@@ -2005,8 +2062,10 @@ bool drawProviderModelPicker(AppState& st, bool busy) {
     }
 
     // ---- manage which models appear in the chat picker (VS-Code-Copilot "Manage models") ----
-    ImGui::Dummy(ImVec2(0, 6 * S));
-    if (ImGui::CollapsingHeader("Manage models (chat picker)")) {
+    // Advanced-only (T-G17): the full add/remove/configure management UI lives ONLY in the Advanced
+    // settings window; the in-tab settings view (slim) keeps just the quick provider/model picker.
+    if (!slim) ImGui::Dummy(ImVec2(0, 6 * S));
+    if (!slim && ImGui::CollapsingHeader("Manage models (chat picker)")) {
         dimText("Uncheck a model to hide it from the composer's model dropdown. Only available "
                 "models (keyed cloud / loaded local) appear there; this just trims that list.");
         ImGui::Dummy(ImVec2(0, 2 * S));
@@ -2161,7 +2220,9 @@ static void drawAISettingsBody(AppState& st, bool busy) {
     // uses the same widget, so the two never diverge). Persist on change — this popover has no
     // Save button; run mode, units, and theme live in their canonical Settings-modal tabs
     // (Agent / General / Appearance) instead of duplicating here with divergent persistence.
-    if (ui::drawProviderModelPicker(st, busy)) saveSettings(settings);
+    // slim=true: the in-tab view is a quick picker only. The full "Manage models" management UI is
+    // reachable via "Advanced settings..." below (opens the Settings window's AI tab).
+    if (ui::drawProviderModelPicker(st, busy, /*slim=*/true)) saveSettings(settings);
 
     if (ImGui::Button("Advanced settings...", ImVec2(-1, 0))) st.openSettings = true;
     if (ImGui::Button("Repair / install runtime", ImVec2(-1, 0)) &&
@@ -3224,6 +3285,8 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         // "Reset layout" (slot 1 = Copilot column) restores the default width + expands it.
         if (ui::takeOverlayColumnReset(1)) { s_paneW = 0.0f; s_cpCollapsed = false; }
         if (s_paneW <= 0.0f) s_paneW = ui::metrics::dockRightTarget();
+        if (std::getenv("AI_CAD_COPILOT_NARROW"))       // T-G17 shot: capture the narrowest column
+            s_paneW = ui::metrics::dockRightMin();
         const float maxW = std::max((band.maxX - band.minX) * 0.5f,
                                     ui::metrics::dockRightMin());
         s_paneW = std::min(std::max(s_paneW, ui::metrics::dockRightMin()), maxW);
@@ -3331,6 +3394,27 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // run BEFORE the header/composer touch st.conversations, so the seeded/persisted chat is
     // adopted rather than cleared.
     syncChatToDoc(st);
+
+    // T-G17 screenshot hook: AI_CAD_COPILOT_VIEW forces a Copilot sub-view (and tops up a couple of
+    // demo sessions) so the sessions/settings layouts can be captured headless in both themes. Runs
+    // AFTER syncChatToDoc (which rebinds st.conversations to the doc) and re-tops-up each frame so
+    // the demo rows survive to the capture frame. Screenshot-only — gated on the env var, no effect
+    // in a normal run.
+    if (const char* cpView = std::getenv("AI_CAD_COPILOT_VIEW")) {
+        ensureConversations(st);
+        st.conversations[0].title = "Knurled hex standoff";
+        while (st.conversations.size() < 3) {
+            Conversation cx; cx.id = newConvId(st);
+            cx.title = (st.conversations.size() == 1) ? "Bracket + FEA study"
+                                                      : "Gearbox housing revision";
+            st.conversations.push_back(std::move(cx));
+        }
+        if (std::strcmp(cpView, "sessions") == 0) {
+            st.showSessionsPicker = true;  gShowSettingsView = false;
+        } else if (std::strcmp(cpView, "settings") == 0) {
+            gShowSettingsView = true;  st.showSessionsPicker = false;
+        }
+    }
 
     ImGui::Dummy(ImVec2(0, ui::metrics::U(1.5f)));
     drawCopilotHeader(st, busy);

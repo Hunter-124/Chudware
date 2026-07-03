@@ -20,7 +20,9 @@ void drawAIPanel(AppState& state, bool busy, bool canRun);
 // provider API key, reasoning-effort knob, local base URL/vision, offline toggle). Rendered
 // in BOTH the Settings modal's AI tab and the inline AI Settings tab so they never diverge.
 // Returns true if a setting changed this frame (caller may persist).
-bool drawProviderModelPicker(AppState& state, bool busy);
+// `slim` = true drops the heavy "Manage models (chat picker)" management block, which lives ONLY
+// in the Advanced settings window; the in-tab view keeps just the quick provider/model picker.
+bool drawProviderModelPicker(AppState& state, bool busy, bool slim = false);
 
 // Probe local-endpoint model availability (agent_list_models) into state.providerModels.
 // Throttled internally; pass force=true to probe immediately (e.g. on a base-URL change).

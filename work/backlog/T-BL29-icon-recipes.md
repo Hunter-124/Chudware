@@ -2,8 +2,8 @@
 id: T-BL29
 title: Screenshot-icon recipes — remaining groups (revolve/sweep/loft, Pattern, Multi-body, Curves, Sheet Metal Create, Appearance Display, Manufacture, appr_glass/appr_paint)
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-lumen
+status: doing
 priority: 3
 lane: app-gui
 kind: fix

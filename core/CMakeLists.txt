@@ -687,6 +687,17 @@ if(AICAD_WITH_OCCT)
   set_tests_properties(overlay_surface PROPERTIES
     ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # T-BL27: surf_replace_face_solid heal regression (cut-through + coincident-patch cases).
+  add_executable(test_surfacing tests/test_surfacing.cpp)
+  target_include_directories(test_surfacing PRIVATE
+    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_surfacing PRIVATE aicad_geom_occt)
+  set_target_properties(test_surfacing PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME surfacing COMMAND test_surfacing)
+  set_tests_properties(surfacing PROPERTIES
+    ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # Verification: tessellate -> write_aicm -> HOST render::parseAicm round-trip.
   add_executable(test_geom_aicm
     tests/test_geom_aicm.cpp)

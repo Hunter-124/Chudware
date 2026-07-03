@@ -187,6 +187,7 @@ graph TD
     T_BL35["T-BL35: Surfaces — surf_revolve axis well rejects datum axis (K_EDGE→K_EDGEAXIS) + gate readyForPreview on the axis well"]:::todo
     T_BL36["T-BL36: FM reference/feature rows — replace left vertical bar with an animated border around the row background when selected/highlighted"]:::todo
     T_BL37["T-BL37: Origin as a selectable, renderable reference point — FM selectable + viewport point render + engine ref-resolution"]:::todo
+    T_BL38["T-BL38: Copilot context bar — auto-track selected model's context window, place between model picker and send, constrain picker width, k-token count + click-through breakdown"]:::todo
   end
   subgraph WS_integration["workstream integration"]
     T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog

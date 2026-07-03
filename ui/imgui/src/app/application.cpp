@@ -5,6 +5,8 @@
 #include "ui/viewport.h"
 #include "ui/scenarios.h"
 #include "ui/cursors.h"
+#include "ui/cam/cam_panel.h"
+#include "ui/ecad/ecad_panel.h"
 #include "ui/command_search.h"
 #include "ui/file_explorer.h"
 #include "ui/settings_modal.h"
@@ -184,6 +186,21 @@ void Application::frame() {
     }
     ImGui::End();
     ImGui::PopStyleVar();
+
+    // H1: CAM dock window — kept as a registered ImGui window for docking-layout consistency, but
+    // drawCamManager() is now called INSIDE drawViewport() as a content-swap (st.camActive gate)
+    // rather than here. Drawing from two sites per frame would double-submit the same ImGui IDs.
+    // camTakeFocusRequest()/SetNextWindowFocus() removed: the content-swap in viewport.cpp surfaces
+    // CAM without needing to bring a separate dock tab forward (that approach was proven not to work
+    // in headless mode — see work/tasks/T-G8.md "TRIED + FAILED").
+    ImGui::Begin("CAM", nullptr, pflags);
+    ImGui::End();
+
+    // H2: ECAD dock window — same rationale as CAM above. drawEcadEditor() now lives inside
+    // drawViewport() gated on workspace==Schematic||Board. The separate Begin("ECAD") block here
+    // is a no-draw stub kept only for dock-layout consistency.
+    ImGui::Begin("ECAD", nullptr, pflags);
+    ImGui::End();
 
     if (ImGui::Begin("Assistant###agent", nullptr, pflags))
         ui::drawAgentPanel(s);

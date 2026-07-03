@@ -1222,6 +1222,7 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 st.worker.call("cam_program",
                     {{"doc_id", st.docMirror.docId()}, {"post", "fanuc"}}, res, e2);
                 st.workspace = cmd::Workspace::Model;
+                st.camActive = true;   // surface CAM panel via viewport content-swap (H1 fix)
                 std::printf("cam-shot: ok=%d\n", (int)!res.contains("code"));
                 std::fflush(stdout);
                 camSettle = 4; ++camStep; break;

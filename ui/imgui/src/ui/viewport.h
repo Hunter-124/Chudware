@@ -35,6 +35,24 @@ GlassTimings viewportGlassTimings();
 // is not initialized or the file fails to parse.
 bool viewportLoadAicm(const std::string& path);
 
+// H4 (sim results): load a result-overlay .aicm (FEA/CFD worker output — render::DocMesh::scalars/
+// displacements, ui/viewport/render/aicm_loader.h) straight into the GL viewport pipeline, exactly
+// like viewportLoadAicm, but ALSO attaches the named per-vertex scalar field (empty = first field
+// found on each body) as Renderer::PartMesh::scalar/scalarMin/scalarMax (and displacement, if the
+// overlay carries one) so the shaded pass can colormap it. Turns colormap mode on. Returns true and
+// fills vmin/vmax (raw SI units — the caller applies the display-unit factor) + dispScaleHint on
+// success; false (state untouched) if the file/pipeline/field is missing.
+bool viewportLoadResultAicm(const std::string& path, const std::string& scalarField,
+                            float& vmin, float& vmax, float& dispScaleHint);
+
+// Thin wrappers over the live GlViewport's Renderer so result panels (sim_manager) don't need the
+// GL pipeline's internals — mirrors the C19 result colormap/deform controls host exposed via
+// AppState::renderer directly.
+void viewportSetColormapMode(bool on);
+void viewportSetDeformScale(float scale);
+float viewportDeformScale();
+bool viewportScalarRange(float& vmin, float& vmax);
+
 // Draw the central Viewport dock window content (mesh, nav, HUD, tools).
 void drawViewport(app::AppState& s);
 

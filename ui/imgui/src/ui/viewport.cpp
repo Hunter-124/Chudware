@@ -8,6 +8,10 @@
 #include "ui/view_selector.h"
 #include "ui/section_tool.h"
 #include "ui/legend.h"
+#include "ui/drawing_panel.h"
+#include "ui/sim_manager.h"
+#include "ui/cam/cam_panel.h"
+#include "ui/ecad/ecad_panel.h"
 #include "app/app_state.h"
 #include "theme/theme.h"
 #include "theme/icons.h"
@@ -418,6 +422,83 @@ bool viewportLoadAicm(const std::string& path) {
     return uploadDocMeshes(doc);
 }
 
+// H4: like uploadDocMeshes, but attaches doc.scalars/doc.displacements (per-body, matched by
+// body_id) onto each PartMesh so the shaded pass can colormap/deform the result. Returns the
+// chosen field's [vmin,vmax] (the first body that carries it) and a suggested deform-scale hint
+// (the largest body's ScalarField-adjacent DispField::scale_hint, or 1.0 if none).
+static bool uploadResultMeshes(const render::DocMesh& doc, const std::string& scalarField,
+                               float& vmin, float& vmax, float& dispScaleHint) {
+    if (!g_glVp) return false;
+    std::vector<Renderer::PartMesh> pms;
+    pms.reserve(doc.bodies.size());
+    bool foundScalar = false;
+    dispScaleHint = 1.0f;
+    for (const auto& b : doc.bodies) {
+        if (b.pos.empty()) continue;
+        Renderer::PartMesh pm;
+        pm.mesh = meshFromBody(b);
+        pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
+        pm.metallic = b.metallic; pm.roughness = b.roughness;
+        pm.body_id = b.body_id;
+        pm.faces.reserve(b.faces.size());
+        for (const auto& fr : b.faces)
+            pm.faces.push_back({fr.face_id, fr.first_tri, fr.tri_count});
+
+        for (const auto& sc : doc.scalars) {
+            if (sc.body_id != b.body_id) continue;
+            if (!scalarField.empty() && sc.name != scalarField) continue;
+            if (sc.values.size() != b.n_verts) continue;
+            pm.scalar = sc.values;
+            pm.scalarMin = sc.vmin; pm.scalarMax = sc.vmax;
+            if (!foundScalar) { vmin = sc.vmin; vmax = sc.vmax; foundScalar = true; }
+            break;
+        }
+        for (const auto& d : doc.displacements) {
+            if (d.body_id != b.body_id) continue;
+            if (d.vec.size() != (size_t)b.n_verts * 3) continue;
+            pm.disp = d.vec;
+            pm.dispScaleHint = d.scale_hint;
+            dispScaleHint = d.scale_hint;
+            break;
+        }
+        pms.push_back(std::move(pm));
+    }
+    g_glVp->setMeshes(pms);
+    if (!foundScalar) { vmin = 0.f; vmax = 1.f; }
+    return !pms.empty();
+}
+
+bool viewportLoadResultAicm(const std::string& path, const std::string& scalarField,
+                            float& vmin, float& vmax, float& dispScaleHint) {
+    if (!g_glVp) return false;
+    render::DocMesh doc;
+    std::string err;
+    if (!render::loadAicmFile(path, doc, err)) {
+        std::fprintf(stderr, "viewport: result aicm load failed: %s\n", err.c_str());
+        return false;
+    }
+    if (!g_glVp->setDoc(doc, err)) {
+        std::fprintf(stderr, "viewport: result setDoc failed: %s\n", err.c_str());
+        return false;
+    }
+    bool ok = uploadResultMeshes(doc, scalarField, vmin, vmax, dispScaleHint);
+    if (ok) g_glVp->renderer().setColormapMode(true);
+    return ok;
+}
+
+void viewportSetColormapMode(bool on) {
+    if (g_glVp) g_glVp->renderer().setColormapMode(on);
+}
+void viewportSetDeformScale(float scale) {
+    if (g_glVp) g_glVp->renderer().setDeformScale(scale);
+}
+float viewportDeformScale() {
+    return g_glVp ? g_glVp->renderer().deformScale() : 0.f;
+}
+bool viewportScalarRange(float& vmin, float& vmax) {
+    return g_glVp && g_glVp->renderer().scalarRange(vmin, vmax);
+}
+
 void setViewportPipeline(aicad::viewport::GlViewport* viewport) {
     g_glVp = viewport;
     // A7: register the screen->viewport-local luminance sampler ONCE. Captureless lambda reads
@@ -481,6 +562,48 @@ void drawViewport(AppState& s) {
     ImGuiDockNode* node = ImGui::GetWindowDockNode();
     if (node) node->LocalFlags |= ImGuiDockNodeFlags_NoTabBar;
     if (docTabStripHeight(s) > 0.f) drawDocTabs(s, ImGui::GetContentRegionAvail().x);
+
+    // H3: the Drafting workspace hosts the 2D drawing sheet INSIDE this same central Viewport
+    // window instead of the 3D render — mirroring host, which swaps the central area's content by
+    // active-tab kind rather than docking Drawing as a separate tab (unlike CAM/ECAD, which share
+    // this dock node as their own windows). "make_drawing" (app/app_state.cpp dispatch) flips
+    // workspace to Drafting; drawDrawingSheet self-creates the drawing on first render.
+    // H4: sim tick() runs EVERY frame drawViewport draws (not gated to the Simulate workspace) so a
+    // result overlay left showing gets restored to the editable model the instant the user navigates
+    // away (e.g. back to Model) — mirrors host's tick() running unconditionally each frame. Cheap when
+    // idle (no doc / no studies): syncResultView + the owner-gated SimClient drain both early-out.
+    ui::simManager().tick(s);
+
+    if (s.workspace == cmd::Workspace::Drafting) {
+        ui::drawDrawingSheet(s);
+        return;
+    }
+
+    // H2: ECAD (Schematic/Board) workspaces host the ECAD editor INSIDE this viewport window
+    // (content-swap, full takeover) instead of the 3D render. Moving it here — rather than keeping
+    // it as a separate dock tab sharing the central node — is the fix for the headless surfacing
+    // gap: the central dock node hides its tab bar (NoTabBar), so the separate "ECAD" dock window
+    // was never brought forward in headless/offscreen shots. The begin("ECAD") block in
+    // application.cpp is now a no-draw stub (kept for dock-layout registration, never draws).
+    {
+        const cmd::Workspace ews = s.effectiveWorkspace();
+        if (ews == cmd::Workspace::Schematic || ews == cmd::Workspace::Board) {
+            ui::drawEcadEditor(s);
+            return;
+        }
+    }
+
+    // H1: CAM panel content-swap. Same headless surfacing gap as ECAD above. The cam scenario
+    // sets st.camActive = true after building the job; cleared when leaving to a non-CAM mode.
+    if (s.camActive) {
+        ui::drawCamManager(s);
+        return;
+    }
+
+    // The Simulate workspace overlays the study tree/setup/results column ON TOP of the same 3D
+    // model viewport (sim results — a colormap + legend — read on the part itself), unlike
+    // Drafting's full takeover above. The column is drawn near the end of this function, after the
+    // 3D scene + HUD (see drawEmbedded call below).
 
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImVec2 sz = ImGui::GetContentRegionAvail();
@@ -625,6 +748,7 @@ void drawViewport(AppState& s) {
 
     if (r)
         drawHeadsUpToolbar(s, io, dl, a, b, *r, s.inSketch);
+    if (s.workspace == cmd::Workspace::Simulate) ui::simManager().drawEmbedded(s, a, b);
     drawLegend(s, dl, a, b);
     drawOrientationGizmo(dl, ImVec2(b.x - 52.f * S, a.y + 52.f * S));
 

@@ -163,6 +163,9 @@ void loadSettings(Settings& s) {
                 }
             }
         }
+        // T-G21: pinned-column vertical-collapse state.
+        s.fmCollapsed = j.value("fm_collapsed", false);
+        s.copilotCollapsed = j.value("copilot_collapsed", false);
         // Wave 3: File Explorer workspace + Recent files.
         s.workspaceDir = j.value("workspace_dir", std::string());
         s.recentFiles.clear();
@@ -271,6 +274,9 @@ void saveSettings(const Settings& s) {
         }
         if (!glassJ.empty()) j["appearance"] = {{"glass", glassJ}};
     }
+    // T-G21: pinned-column vertical-collapse state.
+    j["fm_collapsed"] = s.fmCollapsed;
+    j["copilot_collapsed"] = s.copilotCollapsed;
     // Wave 3: File Explorer workspace + Recent files.
     if (!s.workspaceDir.empty()) j["workspace_dir"] = s.workspaceDir;
     j["recent_files"] = s.recentFiles;

@@ -2,8 +2,8 @@
 id: T-A6
 title: Capstone round 2 - live-backend verify (real docs through the verify nodes)
 workstream: A
-owner: unassigned
-status: todo
+owner: sonnet-yarrow
+status: doing
 branch: task/T-A6-capstone-live
 day: 6
 priority: 2

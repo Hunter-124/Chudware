@@ -44,6 +44,14 @@ struct ShotConfig {
     bool wantBom = false;
     bool bomShotDone = false;
 
+    // T-U7: new-doc-kind viewers (piping, hydraulic, structural)
+    bool wantPiping = false;
+    bool pipingShotDone = false;
+    bool wantHydraulic = false;
+    bool hydraulicShotDone = false;
+    bool wantStructural = false;
+    bool structuralShotDone = false;
+
     // Long-running scenario modes (ScenarioRunner step machines)
     bool wantM1 = false;
     bool m1ShotDone = false;

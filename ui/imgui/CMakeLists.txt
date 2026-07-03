@@ -64,6 +64,9 @@ target_link_libraries(imgui_lib PUBLIC glfw)
 if(NOT TARGET aicad_ui_abstract)
   add_subdirectory("${REPO}/ui/abstract" "${CMAKE_BINARY_DIR}/ui_abstract" EXCLUDE_FROM_ALL)
 endif()
+# T-U7: adapter .cpps (piping_view, hydraulic_view, structural_view) need nlohmann/json.
+# json is fetched by this CMakeLists; wire its include dir into aicad_ui_abstract here.
+target_include_directories(aicad_ui_abstract PRIVATE ${json_SOURCE_DIR}/single_include)
 
 # --- platform + viewport (viewport may already be added by root preset) -------
 add_subdirectory("${REPO}/platform" "${CMAKE_BINARY_DIR}/aicad_platform" EXCLUDE_FROM_ALL)

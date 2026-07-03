@@ -3310,7 +3310,10 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         // T-G21 shot: mirrors AI_CAD_FM_COLLAPSED — --ui-screenshot always resets the overlay
         // columns for determinism (see the reset branch above), which clobbers the persisted
         // collapse setting before it can render; force it back for the collapsed capture.
-        if (std::getenv("AI_CAD_COPILOT_COLLAPSED")) s_cpCollapsed = true;
+        if (std::getenv("AI_CAD_COPILOT_COLLAPSED")) {
+            s_cpCollapsed = true;
+            s_cpAnim.snap(true, colH);  // snap immediately — headless captures must not depend on frame count
+        }
         const float maxW = std::max((band.maxX - band.minX) * 0.5f,
                                     ui::metrics::dockRightMin());
         s_paneW = std::min(std::max(s_paneW, ui::metrics::dockRightMin()), maxW);

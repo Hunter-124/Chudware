@@ -286,7 +286,10 @@ void drawLeftPane(AppState& st,
     // branch above always fires) — the persisted collapse setting can't survive that on its own.
     // AI_CAD_FM_COLLAPSED forces the collapsed capture the same way AI_CAD_COPILOT_NARROW forces
     // a pane width; no effect outside a screenshot run.
-    if (std::getenv("AI_CAD_FM_COLLAPSED")) s_collapsed = true;
+    if (std::getenv("AI_CAD_FM_COLLAPSED")) {
+        s_collapsed = true;
+        s_anim.snap(true, colH);  // snap immediately — headless captures must not depend on frame count
+    }
 
     // ---- pinned full-height-or-collapsed glass column -------------------------------------------
     // Position is pinned every frame; WIDTH is resized via ImGui's invisible edge hit-zone

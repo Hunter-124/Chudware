@@ -31,6 +31,19 @@ struct PanelCollapseAnim {
         return h;
     }
 
+    // Snap immediately to the collapsed or expanded target with no animation — use from code paths
+    // that force a state deterministically (e.g. AI_CAD_FM_COLLAPSED env var in screenshot mode)
+    // so headless captures don't depend on how many frames have elapsed.
+    // For collapsed: sets h to headerH if already measured, otherwise to 1.0f (tiny, so bodyVisible()
+    // returns false immediately) — tick() will hold near headerH once it's measured the next frame.
+    // For expanded: sets h directly to fullH.
+    void snap(bool collapsed, float fullH) {
+        if (!collapsed) { h = fullH; return; }
+        // If headerH is known, snap exactly; otherwise use 1px so bodyVisible() is already false
+        // and tick() will snap to headerH as soon as it's measured (one-frame lag, same as init).
+        h = headerH > 0.0f ? headerH : 1.0f;
+    }
+
     // Call right after drawing the header content (before anything else in the body): records
     // this frame's header height from the current cursor position, symmetric top/bottom padded,
     // so a fully collapsed window shows exactly the header and nothing else.

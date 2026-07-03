@@ -242,6 +242,14 @@ public:
     // (the LeftPane container child, or draw()'s dock/floating window). No-op unless active().
     void drawBody(AppState& st);
 
+    // T-G19: OK / Cancel command buttons, relocated ABOVE the PM into the left-pane top row
+    // (between the Configurations tab and the collapse chevron). layout.cpp calls this from that row
+    // while a form is active; the cluster is right-aligned so it ENDS at `rightX` and is vertically
+    // centered on `centerY` (both screen-space px). Clicking OK commits (commit() guards readiness);
+    // Cancel reverts every preview batch. No-op unless active(). Returns the cluster's pixel width so
+    // the caller can reserve space / avoid the chevron.
+    float drawChromeButtons(AppState& st, float rightX, float centerY);
+
     // Feed a resolved viewport pick into the active selector well (called from the selection
     // observer). Returns true if the pick was consumed (an active well accepted it). pickBody/
     // pickTopo are the id-pass identity of the clicked element (0/0 if unknown), stored so the

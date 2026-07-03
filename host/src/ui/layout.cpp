@@ -430,8 +430,11 @@ void drawLeftPane(AppState& st,
     const float rowPad     = 6.0f * S;
     const float railRowH   = rowPad + btn + rowPad;   // full top-row height (icons + top/bottom pad)
     const float paneInnerWFull = ImGui::GetContentRegionAvail().x;
-    // The row spans the full pane width MINUS the chevron chip reserved at the right end.
-    const float railW = std::max(btn, paneInnerWFull - chevRsv);
+    // T-G19: the tab-strip child now spans ONLY the tab buttons (was the whole row minus the chevron).
+    // This frees the top row's right span — between the last tab (Configurations) and the collapse
+    // chevron — for the relocated OK/Cancel command buttons rendered below while a form is active.
+    const float tabsW = nTabs * btn + (nTabs - 1) * gap;
+    const float railW = std::max(btn, tabsW);
 
     // Zero the child's WindowPadding so the row background/origin and the buttons share one origin.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
@@ -461,6 +464,16 @@ void drawLeftPane(AppState& st,
         }
     }
     ImGui::EndChild();
+
+    // T-G19: relocated OK/Cancel command buttons. Erik round-1 asked for them ABOVE the PM, between
+    // the Configurations tab and the collapse chevron. Rendered on the pane window (after the tab-strip
+    // child so their hit rect is clean), right-aligned to end just left of the chevron, vertically
+    // centered on the chevron. The PropertyManager owns commit/cancel + the form-ready guard.
+    if (pmActive && pm) {
+        const float chevLeftX  = lpPaneRect.Max.x - chevSz - 8.0f * S;
+        const float rowCenterY = lpPaneRect.Min.y + 8.0f * S + chevSz * 0.5f;
+        pm->drawChromeButtons(st, chevLeftX - 8.0f * S, rowCenterY);
+    }
 
     // Horizontal separator under the icon row, spanning the full pane width on the pane draw list.
     {

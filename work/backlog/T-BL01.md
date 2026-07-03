@@ -3,7 +3,7 @@ id: T-BL01
 title: V&V benchmark harness
 workstream: backlog
 owner: sonnet-alder
-status: review
+status: done
 branch: task/T-BL01-vv-harness
 depends_on: []
 ---

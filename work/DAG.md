@@ -80,6 +80,7 @@ graph TD
     T_G19["T-G19: 3D-feature PM chrome - OK/Cancel redesign+relocation, extrude depth/draft double-display fix"]:::review
     T_G2["T-G2: Restore doc-tab input, shrink Copilot header, PM button contrast"]:::done
     T_G20["T-G20: Surfaces tab audit - AI-driven test of every surface tool; fix or recommend scrap"]:::doing
+    T_G21["T-G21: Vertical collapse for Feature Manager + Copilot columns (buttons stay at top)"]:::todo
     T_G3["T-G3: ShopCraft rename tier 1 - user-visible branding strings"]:::done
     T_G4["T-G4: GUI dead-code and cleanliness pass on host/"]:::done
     T_G5["T-G5: GUI migration wave 1 - foundation libs (F1-F4 + G1 gate)"]:::done
@@ -237,6 +238,7 @@ graph TD
   T_G18 --> T_G11
   T_G19 --> T_G11
   T_G20 --> T_G11
+  T_G21 --> T_G11
   T_G2 --> T_G12
   T_G7 --> T_G13
   T_G9 --> T_G14
@@ -247,6 +249,7 @@ graph TD
   T_G9 --> T_G19
   T_G1 --> T_G2
   T_G9 --> T_G20
+  T_G9 --> T_G21
   T_G2 --> T_G3
   T_G1 --> T_G4
   T_G1 --> T_G5

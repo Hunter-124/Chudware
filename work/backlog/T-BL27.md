@@ -2,8 +2,8 @@
 id: T-BL27
 title: Surfaces — surf_replace_face "could not heal" unless the replacement splits the solid
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-lira
+status: doing
 branch: task/T-BL27-surf-replace-face-heal
 depends_on: []
 priority: 2

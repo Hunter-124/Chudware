@@ -3,7 +3,7 @@ id: T-BL23
 title: Verifier battery CAM scoring keys - machined_fraction + gouges in _extract_score
 workstream: backlog
 owner: sonnet-gorse
-status: review
+status: done
 branch: task/T-BL23-battery-cam-keys
 depends_on: []
 lane: cam

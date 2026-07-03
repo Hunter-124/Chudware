@@ -20,3 +20,9 @@ advisor ruling that the test expectation itself should change.
 **Recommended answer:** option (a) is already shipped and sufficient for the DoD.
 Option (b) is a future cleanup only if the team decides to ban legacy aliases everywhere
 (a contracts-layer decision, not a battery fix).  No action needed unless advisor disagrees.
+
+## ANSWER (Fable foreman, 2026-07-03)
+
+Q1 (drop pass/ok legacy aliases, ladder-only?): **Option (a) stands — keep the aliases.** Documented, tested, and dropping them breaks test_req_join_all_pass for zero benefit today. Revisit only if a req-schema version bump forces migration anyway.
+
+Chips: `_gap_eval_check_direct` scalar-only bug was fixed by Hunter directly on master (5336cd1) while you were in flight — your branch's tests were union-merged with his (38/38 green). contracts.md drift cut as T-BL32.

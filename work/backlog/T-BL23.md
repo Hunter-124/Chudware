@@ -2,8 +2,8 @@
 id: T-BL23
 title: Verifier battery CAM scoring keys - machined_fraction + gouges in _extract_score
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-gorse
+status: doing
 branch: task/T-BL23-battery-cam-keys
 depends_on: []
 lane: cam

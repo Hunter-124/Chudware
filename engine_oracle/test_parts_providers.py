@@ -113,7 +113,7 @@ _NEXAR_RESPONSE = {
     "data": {"supSearchMpn": {"results": [{"part": {
         "mpn": "LM317T",
         "manufacturer": {"name": "Texas Instruments"},
-        "datasheetUrl": "https://example.com/lm317.pdf",
+        "bestDatasheet": {"url": "https://example.com/lm317.pdf"},
         "sellers": [
             {"company": {"name": "Digi-Key"}, "offers": [
                 {"inventoryLevel": 5000, "moq": 1, "factoryLeadDays": 21, "prices": [

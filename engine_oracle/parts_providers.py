@@ -265,7 +265,7 @@ class NexarProvider(PartProvider):
         "        mpn manufacturer { name }"
         "        sellers { company { name }"
         "          offers { inventoryLevel moq prices { price quantity currency } factoryLeadDays } }"
-        "        datasheetUrl"
+        "        bestDatasheet { url }"
         "      }"
         "    }"
         "  }"
@@ -323,7 +323,7 @@ class NexarProvider(PartProvider):
             supplier="Nexar",
             part_number=part_number,
             description=(f"{manufacturer} {part_number}".strip()),
-            product_url=str(part.get("datasheetUrl") or ""),
+            product_url=str((part.get("bestDatasheet") or {}).get("url") or ""),
             specs={"manufacturer": manufacturer} if manufacturer else {},
             source="api",
         )

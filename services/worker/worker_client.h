@@ -43,6 +43,14 @@ public:
     void abortPending() { abort_.store(true); }
 
 private:
+    // Real call() body; the public call() wraps it with the T-G9 parity trace (env
+    // AI_CAD_RPC_TRACE=<file> appends one JSONL record per RPC — method/params/ok/result —
+    // regardless of routing: Python worker, in-process libaicad, ECAD/agent C++ paths).
+    // Off (no env) = byte-for-byte the previous behavior.
+    bool callImpl(const std::string& method, const nlohmann::json& params,
+                  nlohmann::json& result, std::string& err, int timeoutMs,
+                  const EventFn& onEvent);
+
     bool readLine(std::string& line, int timeoutMs);
 
 #ifdef _WIN32

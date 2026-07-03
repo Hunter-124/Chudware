@@ -10,6 +10,7 @@
 #include "ui/scaffold_demo_panel.h"
 #include "ui/parts_panel.h"
 #include "ui/cam_panel.h"            // T-U3 CAM workspace (AI_CAD_SHOT=cam_workspace)
+#include "ui/cam/cam_panel.h"        // camLoadJob (Manufacture panel job adoption, AI_CAD_SHOT=cam)
 #include "ui/bom_panel.h"
 #include "ui/requirements_panel.h"   // T-U5
 #include "ui/transparency_panel.h"
@@ -1212,17 +1213,44 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 std::string err;
                 st.docMirror.newPart(st.worker, err);
                 st.addDocTab(false);
-                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
-                    {{"op","add_feature"},{"feature",{
-                        {"type","box"},{"name","Plate"},
-                        {"params",{{"length",dim(80)},{"width",dim(60)},{"height",dim(15)}},
-                                   {"centered",true}}}}}}));
+                // Byte-parity with the host cam recipe (T-G9 harness finding: the old
+                // init-list here misnested {"centered",true} INSIDE the params braces —
+                // nlohmann silently turned the whole feature into an array of pairs — and
+                // dropped host's Bores hole op entirely, so the CAM job ran on a different
+                // part than host's).
+                nlohmann::json camOps = nlohmann::json::array();
+                camOps.push_back({{"op","add_feature"},{"feature",{
+                    {"type","box"},{"name","Plate"},{"params",{
+                        {"length",dim(80)},{"width",dim(60)},{"height",dim(15)}}},
+                    {"centered",true}}}});
+                {
+                    nlohmann::json hole;
+                    hole["op"] = "add_feature";
+                    hole["feature"]["type"] = "hole";
+                    hole["feature"]["name"] = "Bores";
+                    hole["feature"]["params"]["style"] = "simple";
+                    hole["feature"]["params"]["standard"] = "custom";
+                    hole["feature"]["params"]["diameter"] = dim(5);
+                    hole["feature"]["params"]["end"] = "through_all";
+                    hole["feature"]["params"]["positions"] = {{-30, -20}, {30, -20}, {30, 20}, {-30, 20}};
+                    hole["feature"]["refs"]["face"] = {{"of", "face"}, {"side", "top"}};
+                    camOps.push_back(hole);
+                }
+                auto r = st.docMirror.applyOps(st.worker, camOps);
                 loadMesh(st, r.aicm_path);
                 nlohmann::json res; std::string e2;
                 st.worker.call("cam_program",
                     {{"doc_id", st.docMirror.docId()}, {"post", "fanuc"}}, res, e2);
                 st.workspace = cmd::Workspace::Model;
                 st.camActive = true;   // surface CAM panel via viewport content-swap (H1 fix)
+                // Adopt the job into the Manufacture panel exactly like host does (T-G9
+                // harness finding: without this the panel showed "No setups yet" and the
+                // cam_tree/cam_generate RPCs host fires were missing from the stream).
+                {
+                    std::string camId = res.is_object()
+                                        ? res.value("cam_doc_id", std::string()) : std::string();
+                    if (!camId.empty()) ui::camLoadJob(st, camId);
+                }
                 std::printf("cam-shot: ok=%d\n", (int)!res.contains("code"));
                 std::fflush(stdout);
                 camSettle = 4; ++camStep; break;

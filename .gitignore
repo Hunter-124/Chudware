@@ -5,6 +5,9 @@ __pycache__/
 .venv-mcp/
 .pip-cache/
 
+# secrets
+.env
+
 # C++ host build output (parallel agent build dirs included)
 host/build*/
 

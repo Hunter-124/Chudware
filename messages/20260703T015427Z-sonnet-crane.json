@@ -1,0 +1,6 @@
+{
+ "from": "sonnet-crane",
+ "to": "erik",
+ "text": "REVIEW T-F17 (mission-control UX): branch task/T-F17-mission-control pushed, gate PASS.\n\nDeliverables committed:\n- contracts/agent_events.md: aicad.agent_events/1 schema (8 dag.* event types)\n- services/dag/event_journal.py: EventJournal \u2014 wraps emit(), persists to events.jsonl; 6/6 tests pass\n- services/dag/executor.py: EventJournal wired into run() and resume()\n- ui/abstract/mission_control_view.h: MissionControlView model (run tree, event stream, steer state)\n- host/src/ui/mission_control_panel.{h,cpp}: ImGui panel \u2014 run tree / event trail / steering controls; loadReplay() from events.jsonl\n- host/src/ui/scenarios.{h,cpp}: AI_CAD_SHOT=mission_control static capture (36 capstone events, 2 runs, 13 nodes)\n- host/src/app.cpp: panel wired, vsync disabled in shot mode (glfwSwapInterval(0) \u2014 fixes headless hang)\n- Screenshot: scratch/mission_control_shots/mission_control_01_capstone.png (197KB, 1340x838)\n\nPartial DoD note: event schema + journal + panel + scenario screenshot are solid. Worker RPC seam (dag_pause/dag_approve/dag_inject/dag_set_autonomy) is stubbed in the panel \u2014 live steering not yet wired. Design-brief flow not implemented. These depend on T-A3/T-F3.",
+ "ts": "2026-07-03T01:54:27Z"
+}

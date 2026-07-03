@@ -2,8 +2,8 @@
 id: T-BL19
 title: Modeling-op combination battery - engine-level AI testing of feature tools and sequences
 workstream: backlog
-owner: unassigned
-status: todo
+owner: opus-marrow
+status: doing
 branch: task/T-BL19-modeling-battery
 depends_on: []
 ---

@@ -181,3 +181,15 @@ None requiring human input. The following were resolved inline:
 - **`autonomy_default` value** — resolved to `"auto"` (not `"approve"`) per advisor guidance and executor.py docstring
 - **Verify escalations vs. overall run status** — resolved: `_resolve_run_status` correctly marks the run "failed" when any node fails; the DoD requirement is that gate+report complete, not that the overall status be "done"
 - **Single entry-point constraint** — resolved by sequential verify chain; no contract change needed
+
+## Round 2 addendum (foreman, 2026-07-04)
+
+Renode v1.15.3 is now provisioned at `~/.local/share/AI-CAD/renode/` (portable, MIT,
+subprocess-only). With it on PATH the firmware pillar's failure cause CHANGED and is
+now precisely: the round-2 demo firmware blocks polling ADC1 (0x40012000), which the
+minimal stm32f4 .repl does not model — Renode boots the ELF and emulates for real
+(sysbus warnings in the UART log prove live emulation). T-C5's demo firmware avoided
+this by printing before/without the blocking ADC read ("SOIL: 0" captured). Two
+one-line paths to 6/6: (a) borrow C5's non-blocking main.c pattern for the round-2
+firmware, or (b) add a stub ADC peripheral to the .repl. Run with:
+`PATH="$HOME/.local/share/AI-CAD/renode:$PATH" ... run_capstone_demo.py`

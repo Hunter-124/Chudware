@@ -3,7 +3,7 @@ id: T-U6
 title: Simulation studies manager — study list, results, convergence caveats
 workstream: U
 owner: sonnet-finch
-status: doing
+status: review
 branch: task/T-U6-ui
 day: 6
 priority: 4

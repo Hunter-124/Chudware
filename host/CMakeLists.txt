@@ -116,6 +116,9 @@ add_executable(AI-CAD
   # --- C22b: Activity panel + prompt editor + orchestrator wiring ---
   src/ui/activity_panel.cpp
   # --- end C22b ---
+  # --- T-F17: Mission-control panel (DAG run stream + steering) ---
+  src/ui/mission_control_panel.cpp
+  # --- end T-F17 ---
   # --- Wave N: AI-ECAD 2D GUI (schematic / PCB editor) ---
   src/ui/ecad/ecad_mirror.cpp
   src/ui/ecad/ecad_canvas.cpp
@@ -160,6 +163,7 @@ endif()
 
 target_include_directories(AI-CAD PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/..    # allows #include "ui/abstract/mission_control_view.h" (T-F17)
   ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker
   ${stb_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/extern/glad/include

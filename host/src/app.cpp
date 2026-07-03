@@ -77,6 +77,9 @@
 // --- C22b: Activity panel + prompt editor ---
 #include "ui/activity_panel.h"
 // --- end C22b ---
+// --- T-F17: Mission-control panel ---
+#include "ui/mission_control_panel.h"
+// --- end T-F17 ---
 // --- C20b: assembly UI ---
 #include "ui/asm_panels.h"
 // --- end C20b ---
@@ -763,7 +766,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     GLFWwindow* win = glfwCreateWindow(shot ? 1340 : 1440, shot ? 838 : 900, "ShopCraft", nullptr, nullptr);
     if (!win) { glfwTerminate(); return 1; }
     glfwMakeContextCurrent(win);
-    glfwSwapInterval(1);
+    glfwSwapInterval(shot ? 0 : 1);  // disable vsync in headless/shot mode — Xvfb has no real vblank
     if (!gladLoadGL((GLADloadfunc)glfwGetProcAddress)) return 1;
 
     const std::string assets = exeDir() + "/assets";  // '/' is valid on Windows + POSIX
@@ -932,6 +935,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     ui::ActivityPanel activityPanel;
     st.activityPanel = &activityPanel;
     // --- end C22b ---
+    // --- T-F17: MissionControlPanel — DAG run stream + steering ---
+    ui::MissionControlPanel missionControlPanel;
+    // --- end T-F17 ---
 
     // --- C20b: AsmPanels — owned here, borrowed via st.asmPanels (opaque void*). ---
     ui::AsmPanels asmPanels;
@@ -1432,6 +1438,8 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // C22b: activity shot — new part doc -> agent_run_v2 -> Activity panel -> Settings Agents tab
     st.wantActivity = shot && shotMode && std::strcmp(shotMode, "activity") == 0;
     if (st.wantActivity) { st.showActivityPanel = true; }
+    // T-F17: mission_control shot — replay capstone events.jsonl into the mission-control panel
+    st.wantMissionControl = shot && shotMode && std::strcmp(shotMode, "mission_control") == 0;
     // C20b: assembly shot — author base/peg parts, new assembly, insert + mate + interference.
     st.wantAsm = shot && shotMode && std::strcmp(shotMode, "asm") == 0;
     // AI_CAD_MATEFORM: a lightweight Mate-form-only variant of the asm shot for visual verification
@@ -1655,7 +1663,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // six step machines + their per-step backbuffer captures, extracted to ui::ScenarioRunner
     // (ui/scenarios.cpp). tick() advances the active scenario before each frame; endFrame()
     // handles the captures and the scenario-driven swap+continue / swap+break at loop bottom.
-    ui::ScenarioRunner scenarios(activityPanel);
+    ui::ScenarioRunner scenarios(activityPanel, missionControlPanel);
 
     auto desiredThemeForFrame = [&st]() {
         if (const char* envTheme = std::getenv("AI_CAD_THEME")) {
@@ -2739,6 +2747,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // button / the activity shot). No-op unless st.showActivityPanel; was previously
         // unreachable because only the in-pane tab hosted drawBody.
         activityPanel.draw(st);
+        // T-F17: mission-control panel — draws when wantMissionControl scenario is active
+        // or when the user opens it (future: add a menu entry / View > Mission Control).
+        if (st.wantMissionControl) missionControlPanel.draw(st);
         if (st.wantFocusViewport > 0) { ImGui::SetNextWindowFocus(); st.wantFocusViewport--; }
         ui::drawViewportPanel(st, io, busy);
         if (st.wantFocusEcad > 0) {

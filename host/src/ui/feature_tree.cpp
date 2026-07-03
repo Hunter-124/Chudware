@@ -129,12 +129,45 @@ static void treeIcon(const char* name, const char* fallback, float size = 16.0f,
     }
 }
 
+// ---- shared row hover paint (the ONE approved treatment, used panel-wide) ----
+// T-G18 (Erik round-1): the feature rows' hover — an accent-outline pill + a soft treeHover
+// wash, inset 2/1 dp, 4 dp corners — is the ratified look. Every row in the panel (feature
+// rows AND the filename/equations/material/bodies/origin/plane meta rows) now routes through
+// THIS one function so the hover is pixel-identical everywhere; the meta rows used to fall
+// through to ImGui's default HeaderHovered paint, which read as the "terrible" hover Erik
+// flagged. `hovered` is passed in (not sampled here) because a feature row's last item is its
+// status badge, not the node, so the caller captures IsItemHovered at the node.
+static void fmRowHoverPaint(ImVec2 rowMin, ImVec2 rowMax, bool hovered, bool selected) {
+    if (selected || !hovered || ImGui::IsMouseDragging(ImGuiMouseButton_Left)) return;
+    const auto& pal = fmPalette();
+    const float S = ui::uiScale;
+    ImVec2 hovMin(rowMin.x + 2.0f * S, rowMin.y + 1.0f * S);
+    ImVec2 hovMax(rowMax.x - 3.0f * S, rowMax.y - 1.0f * S);
+    ImVec4 hoverCol(pal.accent[0], pal.accent[1], pal.accent[2], 0.45f);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRect(hovMin, hovMax, ImGui::ColorConvertFloat4ToU32(hoverCol),
+                4.0f * S, 0, std::max(1.0f, 1.0f * S));
+    dl->AddRectFilled(hovMin, hovMax, ui::Palette::toU32(pal.treeHover), 4.0f * S);
+}
+
 // Frosted row pill at the current cursor (full content width). Stripe index advances per call.
 // Height is the FRAME height only (font + FramePadding), never WithSpacing — a pill that also
 // covered the inter-row spacing bled into the next row / the section dividers and read as
 // stacked, overlapping slabs (visual-review fix).
+//
+// T-G18: fmRowPill()/fmRowPillEnd() bracket every meta/header row. fmRowPill pushes the SAME
+// FramePadding featureRow() uses (so every row is the same height + text baseline) and the
+// SAME transparent HeaderHovered/HeaderActive (so ImGui's default hover never paints); the
+// returned rect feeds fmRowPillEnd(), which pops those styles and draws the shared hover on
+// the row's just-submitted item. Pairs must balance (one End per Pill) or the style stack
+// asserts; for folders, call End right after the header node and BEFORE its children.
+struct FmRowRect { ImVec2 mn, mx; };
 static int s_fmStripeIdx = 0;
-static void fmRowPill(bool selected = false) {
+static FmRowRect fmRowPill(bool selected = false) {
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(3.0f * ui::uiScale, 3.0f * ui::uiScale));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0, 0, 0, 0));
     const float rowH = ImGui::GetFrameHeight();
     ImVec2 rowMin = ImGui::GetCursorScreenPos();
     float availW = ImGui::GetContentRegionAvail().x;
@@ -142,6 +175,13 @@ static void fmRowPill(bool selected = false) {
     const float wash = selected ? 0.42f : 0.26f;
     ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin, rowMax, 3.5f,
                            (s_fmStripeIdx++ % 2) == 0, selected, wash);
+    return {rowMin, rowMax};
+}
+static void fmRowPillEnd(const FmRowRect& r, bool selected = false) {
+    bool hovered = ImGui::IsItemHovered();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(1);
+    fmRowHoverPaint(r.mn, r.mx, hovered, selected);
 }
 
 // Draw a row's type icon INSIDE the (empty) leaf-arrow slot of the TreeNodeEx that was just
@@ -1372,7 +1412,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             }
             FStatus fs = getFeatureStatus(statusArr, cid);
 
-            fmRowPill();
+            FmRowRect compRect = fmRowPill();
             // SolidWorks marks fixed components with a "(f)" prefix.
             std::string label = (fixed ? "(f) " : "") + cname;
             if (suppressed) label += " [S]";
@@ -1381,6 +1421,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             ImVec2 compRowPos = ImGui::GetCursorScreenPos();
             ImGui::TreeNodeEx((label + "##comp_" + cid).c_str(), lf);
             treeIconInArrowSlot(compRowPos, isAsm ? "assembly" : "part", isAsm ? "[A]" : "[P]");
+            fmRowPillEnd(compRect);
             featureBadge(fs.ok, !fs.error.empty(), fs.error, fs.dangling, false, fs.warning);
             ++ci;
         }
@@ -1389,11 +1430,13 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
     ImGui::Separator();
 
     // ---- Mates folder ----
-    fmRowPill();
+    FmRowRect matesRect = fmRowPill();
     treeIcon("mates_folder", "[M]", 16.0f);
     ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
     ImGuiTreeNodeFlags ff = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth;
-    if (ImGui::TreeNodeEx("Mates##mates_folder", ff)) {
+    bool matesOpen = ImGui::TreeNodeEx("Mates##mates_folder", ff);
+    fmRowPillEnd(matesRect);
+    if (matesOpen) {
         if (tree.contains("mates") && tree["mates"].is_array()) {
             // Per-type running index so each mate gets a SolidWorks-style name "Concentric1".
             std::map<std::string, int> typeCount;
@@ -1417,7 +1460,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                 std::string row = disp + pair;
                 if (msup) row += " [S]";
 
-                fmRowPill();
+                FmRowRect mateRect = fmRowPill();
                 if (msup) ImGui::PushStyleColor(ImGuiCol_Text,
                     ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.75f));
                 ImGuiTreeNodeFlags mf = ImGuiTreeNodeFlags_Leaf |
@@ -1426,6 +1469,7 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                 ImGui::TreeNodeEx((row + "##mate_" + mid).c_str(), mf);
                 treeIconInArrowSlot(mateRowPos, "mate", "[m]", msup ? 0.6f : 1.0f);
                 if (msup) ImGui::PopStyleColor();
+                fmRowPillEnd(mateRect);
 
                 pushTreePopupGlass();
                 if (ImGui::BeginPopupContextItem(("##mctx_" + mid).c_str())) {
@@ -1972,8 +2016,9 @@ void drawFeatureTreeBody(AppState& st,
         ImGuiTreeNodeFlags rootFlags =
             ImGuiTreeNodeFlags_DefaultOpen |
             ImGuiTreeNodeFlags_SpanFullWidth;
-        fmRowPill();
+        FmRowRect rootRect = fmRowPill();
         bool rootOpen = ImGui::TreeNodeEx(docName.c_str(), rootFlags);
+        fmRowPillEnd(rootRect);
 
         // C26: root-row "Appearance…" — sets the primary body's color (the common single-body
         // case). Body key "b1" matches the engine's per-body appearance key (session._write_aicm).
@@ -2035,10 +2080,11 @@ void drawFeatureTreeBody(AppState& st,
                                        ImGuiTreeNodeFlags_SpanFullWidth;
                 char eqLabel[64];
                 std::snprintf(eqLabel, sizeof(eqLabel), "Equations (%d)##eqhdr", eqCount);
-                fmRowPill();
+                FmRowRect eqRect = fmRowPill();
                 ImVec2 eqRowPos = ImGui::GetCursorScreenPos();
                 ImGui::TreeNodeEx(eqLabel, f);
                 treeIconInArrowSlot(eqRowPos, "equations", "[=]");
+                fmRowPillEnd(eqRect);
                 // Double-click the node to open the Equations / Global Variables editor (SolidWorks).
                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                     st.showEquations = true;
@@ -2057,10 +2103,11 @@ void drawFeatureTreeBody(AppState& st,
                         if (!key.empty()) matKey = key;
                     }
                 }
-                fmRowPill();
+                FmRowRect matRect = fmRowPill();
                 ImVec2 matRowPos = ImGui::GetCursorScreenPos();
                 ImGui::TreeNodeEx("Material##mat_hdr", f);
                 treeIconInArrowSlot(matRowPos, "material", "[M]");
+                fmRowPillEnd(matRect);
                 // W2 (material UX): right-click the Material node to assign a PHYSICAL material.
                 // Each choice (a) sets the part's material key (set_material) — read by FEA studies
                 // and shown on this row — and (b) recolours every body to the material's look via a
@@ -2138,11 +2185,12 @@ void drawFeatureTreeBody(AppState& st,
                 if (!isAsmDoc && st.hasDocMesh && nBodies >= 1) {
                     char hdr[64];
                     std::snprintf(hdr, sizeof(hdr), "Solid Bodies (%d)##solid_bodies", nBodies);
-                    fmRowPill();
+                    FmRowRect bodiesRect = fmRowPill();
                     treeIcon("body_folder", "[F]", 16.0f);   // #4.4: was borrowed "mates_folder"
                     ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                     bool open = ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_DefaultOpen |
                                                        ImGuiTreeNodeFlags_SpanFullWidth);
+                    fmRowPillEnd(bodiesRect);
                     if (open) {
                         for (int bi = 0; bi < nBodies; ++bi) {
                             bool hidden = !st.bodyVisible[bi];
@@ -2153,7 +2201,7 @@ void drawFeatureTreeBody(AppState& st,
                             ImGuiTreeNodeFlags bf = ImGuiTreeNodeFlags_Leaf |
                                                     ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                                     ImGuiTreeNodeFlags_SpanFullWidth;
-                            fmRowPill();
+                            FmRowRect bodyRect = fmRowPill();
                             if (hidden)
                                 ImGui::PushStyleColor(ImGuiCol_Text,
                                     ImVec4(pal.textDim[0], pal.textDim[1],
@@ -2165,6 +2213,7 @@ void drawFeatureTreeBody(AppState& st,
                             treeIconInArrowSlot(bodyRowPos, "part", "[B]",
                                                 hidden ? 0.45f : 1.0f);
                             if (hidden) ImGui::PopStyleColor();
+                            fmRowPillEnd(bodyRect);
                             // Capture row interactions NOW; BeginPopupContextItem binds to the
                             // LAST item, so it must come right after TreeNodeEx, before any
                             // other widget.
@@ -2217,10 +2266,11 @@ void drawFeatureTreeBody(AppState& st,
             {
                 ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_DefaultOpen |
                                        ImGuiTreeNodeFlags_SpanFullWidth;
-                fmRowPill();
+                FmRowRect originRect = fmRowPill();
                 treeIcon("origin", "[O]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);
                 bool originOpen = ImGui::TreeNodeEx("Origin##origin", f);
+                fmRowPillEnd(originRect);
                 if (originOpen) {
                     static const char* kPlanes[] = {"Front Plane", "Top Plane", "Right Plane"};
                     bool planesAutoShow = !st.hasDocMesh && st.docMirror.hasDoc() && !st.planesUserToggled;
@@ -2234,13 +2284,14 @@ void drawFeatureTreeBody(AppState& st,
                         ImGuiTreeNodeFlags pf = ImGuiTreeNodeFlags_Leaf |
                                                 ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                                 ImGuiTreeNodeFlags_SpanFullWidth;
-                        if (st.planeEmphasis == pi) pf |= ImGuiTreeNodeFlags_Selected;
+                        // T-G18: selection is shown by fmRowPill's glass card (like feature rows);
+                        // the ImGui Selected/Header paint on top read heavier than a feature row.
                         bool planeShownEff = st.showPlane[pi] || planesAutoShow;
                         bool hidden = !planeShownEff;
                         // Pill FIRST (at the row's true left edge — drawing it after the icon left
                         // a misaligned slab starting right of the indent), then the node, then the
                         // icon into the leaf arrow slot. Hidden planes keep a readable dim state.
-                        fmRowPill(st.planeEmphasis == pi);
+                        FmRowRect planeRect = fmRowPill(st.planeEmphasis == pi);
                         if (hidden)
                             ImGui::PushStyleColor(ImGuiCol_Text,
                                 ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
@@ -2249,6 +2300,7 @@ void drawFeatureTreeBody(AppState& st,
                         treeIconInArrowSlot(planeRowPos, "ref_plane", "[P]",
                                             hidden ? 0.45f : 1.0f);
                         if (hidden) ImGui::PopStyleColor();
+                        fmRowPillEnd(planeRect, st.planeEmphasis == pi);
                         ImVec2 pNodeMin = ImGui::GetItemRectMin();
                         ImVec2 pNodeMax = ImGui::GetItemRectMax();
                         float  pEyeSz = 14.0f * ui::uiScale, pEyePad = 6.0f * ui::uiScale;
@@ -2585,16 +2637,8 @@ void drawFeatureTreeBody(AppState& st,
                         ctx.editCallback = &editCallback;
 
                         RowResult rr = featureRow(ctx, st);
-                        if (rr.hovered && !sel && !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-                            ImVec2 hovMin(rowMin.x + 2.0f * S, rowMin.y + 1.0f * S);
-                            ImVec2 hovMax(rowMax.x - 3.0f * S, rowMax.y - 1.0f * S);
-                            ImVec4 hoverCol(pal.accent[0], pal.accent[1], pal.accent[2], 0.45f);
-                            ImGui::GetWindowDrawList()->AddRect(
-                                hovMin, hovMax, ImGui::ColorConvertFloat4ToU32(hoverCol),
-                                4.0f * S, 0, std::max(1.0f, 1.0f * S));
-                            ImGui::GetWindowDrawList()->AddRectFilled(
-                                hovMin, hovMax, Palette::toU32(pal.treeHover), 4.0f * S);
-                        }
+                        // T-G18: shared hover paint (identical to every meta/header row).
+                        fmRowHoverPaint(rowMin, rowMax, rr.hovered, sel);
 
                         // ---- rollback-bar drag hit-test (item 4) ----
                         // While the bar is being dragged, find which row's gap the cursor is over so
@@ -2724,13 +2768,14 @@ void drawFeatureTreeBody(AppState& st,
                                     ImVec4(pal.text[0], pal.text[1], pal.text[2], 1.0f));
                                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                                     ImVec2(0, 4.0f * ui::uiScale));
-                                fmRowPill();
+                                FmRowRect fldRect = fmRowPill();
                                 treeIcon("body_folder", "[F]", 16.0f);   // #4.4: was "mates_folder"
                                 ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                                 folderOpen = ImGui::TreeNodeEx(
                                     (folder + "##fld_" + folder).c_str(),
                                     ImGuiTreeNodeFlags_DefaultOpen |
                                     ImGuiTreeNodeFlags_SpanFullWidth);
+                                fmRowPillEnd(fldRect);
                                 ImGui::PopStyleVar();
                                 ImGui::PopStyleColor();
                             }

@@ -43,6 +43,15 @@ rework pushed) · eddy (T-BL22, usage limit, work pushed). heath/eddy branches c
   — clean-room, cuttable as Sonnet tasks when Hunter wants them. T-BL02 itself stays mooseinatree's.
 - **Offline ML tracks**: deferred (WORKFLOW.md §3) — capture/eval seams shipped, training parked.
 
+## Captured from Hunter's live dark-mode review (2026-07-03) — tracked, awaiting dispatch
+- **T-BL33** (P2 fix, todo): FM plane-row text + hover-action tooltips black-on-black in dark
+  mode (issue #11 — round-2 H1 "PASS" was a false-positive code audit; real bug is the FM
+  hover-action popup path, NOT pmTooltip) + settings popup transparent OS border (issue #12).
+  Ready to dispatch the moment Hunter reopens dispatch (or he takes it himself).
+- **T-BL34** (P3 overhaul, depends_on T-BL29, PARKED for Hunter greenlight): icon pipeline v2 —
+  color the preview-render models + annotate operation intent over the tiles. T-BL29 given a
+  continuation guarantee (no silent gaps; missed tiles stay open checkboxes).
+
 ## Human-gated (waiting on Hunter)
 - **sketch_new label call** (round-2): keep icon-only [ribbon.cpp ribbon_displayLabel L134 intentional]
   vs restore label — gates T-G12 round-3 convergence.

@@ -3,7 +3,7 @@ id: T-G9
 title: GUI migration wave 5 - polish, parity battery, cutover (P1, P2, G5)
 workstream: G
 owner: sonnet-marsh
-status: doing
+status: review
 branch: task/T-G9-migration-cutover
 day: 10
 priority: 4
@@ -142,3 +142,21 @@ is the production GUI on Linux; `host/` survives only until T-G11's Windows chec
   ui/imgui + ui/abstract (they still scan host ribbon_def), flip gate.sh primary, AGENTS.md +
   host/DEPRECATED.md EOL notes. Do NOT start before the G12 walkthrough converges.
 - gate.sh + graphify update run at end of session 1 — see final progress note.
+- 2026-07-03 [sonnet-marsh] END SESSION 1: `bash scripts/gate.sh` RESULT PASS (check.py +
+  pytest suites FAIL-RECORDED pre-existing, identical profile to the T-G8 merge gate;
+  ui_style_check advisory now a clean PASS — was fail-recorded). `graphify update .` run.
+  Status -> review: both foreman scope additions complete; P2 formal sign-off sheet,
+  T-G12 convergence, and G5 cutover remain (human-gated / next session — see HANDOFF).
+
+## DoD status at review
+
+- [x] gui_lint theme clean (icons + theme 0 findings). Adaptive-glass shortcomings sweep:
+      no NEW over-viewport surfaces off the API found; formal GLASS_DESIGN_SPEC shortcomings
+      list review folded into the G12 walkthrough round.
+- [~] 21/21 scenario pairs: harness regenerated + eyeballed drawing/cam/ecad/fea/sketch/tree
+      (all correct); formal per-pair sign-off sheet + interactive manual pass OUTSTANDING.
+- [ ] T-G12 loop CONVERGED on new binary — HUMAN (Erik), blocks cutover.
+- [ ] host/DEPRECATED.md criteria 1-4 — G5, blocked on the two rows above.
+- [x] gate.sh green (RESULT PASS); graphify update run.
+- [x] SCOPE ADD 1: 5 parity harnesses built + clean-room 5/5 PASS (22/22 checks), real diffs.
+- [x] SCOPE ADD 2: 66-literal color debt cleared (83 occurrences), baseline 63 -> 0 keys.

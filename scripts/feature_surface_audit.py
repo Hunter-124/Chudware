@@ -26,6 +26,8 @@ HANDLER_FILES = [
     REPO / "host" / "src" / "ui" / "asm_panels.cpp",
     REPO / "host" / "src" / "ui" / "evaluate_dialogs.cpp",
     REPO / "host" / "src" / "ui" / "sim_panel.cpp",
+    REPO / "host" / "src" / "ui" / "drawing_panel.cpp",  # dwg_* ribbon commands
+    REPO / "host" / "src" / "ui" / "cam" / "cam_panel.cpp",  # cam_* ribbon commands
 ]
 
 ROW_RE = re.compile(
@@ -38,7 +40,13 @@ STRCMP_RE = re.compile(r'std::strcmp\(\s*cmd_id\s*,\s*"([^"]+)"\s*\)')
 # App-level prefix dispatchers. A command under one of these domains is considered handled when the
 # dispatcher owns the prefix; individual unsupported subcommands should be disabled/stretch in the
 # ribbon table, not silently fall through.
-PREFIX_DISPATCH = ("ecad_", "sch_", "pcb_", "sim_", "eval_", "asm_")
+#
+# cam_  : camHandleCommand() in host/src/ui/cam/cam_panel.cpp owns the full cam_ prefix.
+#         cam_op_* commands are dispatched via an initializer-list map (not literal cmd== strings)
+#         so the regex harvest misses them; the prefix rule is correct here.
+# dwg_  : drawingHandleCmd() in host/src/ui/drawing_panel.cpp owns the full dwg_ prefix.
+#         All dwg_* ribbon commands are handled by explicit if-chains in that function.
+PREFIX_DISPATCH = ("ecad_", "sch_", "pcb_", "sim_", "eval_", "asm_", "cam_", "dwg_")
 
 
 def read(path: Path) -> str:

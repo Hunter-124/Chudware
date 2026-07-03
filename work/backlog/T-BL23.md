@@ -39,3 +39,6 @@ cam_simulate raw; the shared infra should not mislead the next consumer.
 
 - `work/questions/T-H8.md` Q1 — exact key list and the workaround location
 - `graphify query "verifier battery score extraction"` — battery.py structure (T-H4)
+
+## Progress log
+- 2026-07-03 21:50 UTC [sonnet-gorse] (foreman scope add, small) While you are in services/verify/battery.py: _gap_is_manifold reads r.get('free_edges',0) but the OCCT build returns {'issues':[...]} with no free_edges key — the check is blind (ok=True for ANY body). Fix it to parse the issues list (flag on a free_edges issue or error-severity issue; tiny_edges warnings at poles/seams are cosmetic). Source: work/questions/T-BL19.md observation + ANSWER. Keep it a small commit alongside your CAM keys.

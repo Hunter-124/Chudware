@@ -31,6 +31,7 @@ struct ShotConfig {
     bool wantScaffoldDemo = false;
     bool wantCamWorkspace = false;            // T-U3: populate + screenshot the CAM workspace panel
     bool camWorkspaceShotDone = false;
+    bool wantGallery = false;                 // T-U9: sample gallery (loads from disk, no RPC wait)
 
     // Worker one-shot shots (fire once when workerStarted)
     bool wantTree = false;

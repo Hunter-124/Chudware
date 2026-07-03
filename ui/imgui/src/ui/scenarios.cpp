@@ -16,6 +16,7 @@
 #include "ui/piping_panel.h"       // T-U7 piping viewer
 #include "ui/hydraulic_panel.h"    // T-U7 hydraulic viewer
 #include "ui/structural_panel.h"   // T-U7 structural viewer   // T-U8
+#include "ui/gallery_panel.h"        // T-U9
 #include "ui/sim_panel.h"                       // T-U6: sim studies (AI_CAD_SHOT=sim_studies)
 #include "artifact_view.h"
 #include "app/app_state.h"
@@ -286,6 +287,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantPiping       = eq("piping_view");       // T-U7
     cfg.wantHydraulic    = eq("hydraulic_view");    // T-U7
     cfg.wantStructural   = eq("structural_view");   // T-U7
+    cfg.wantGallery       = eq("gallery");
     cfg.wantSimStudies   = eq("sim_studies");   // T-U6
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
@@ -356,6 +358,10 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
         const std::string strRes = R"({"e1":{"axial_n":-45000,"moment_max_nm":2800000,"deflection_max_mm":1.2,"dc_ratio":0.62,"ok":true},"e2":{"axial_n":0,"moment_max_nm":18000000,"deflection_max_mm":8.4,"dc_ratio":0.85,"ok":true},"e3":{"axial_n":-38000,"moment_max_nm":2200000,"deflection_max_mm":1.1,"dc_ratio":0.58,"ok":true}})";
         ui::seedStructuralPanelFromJson(strDoc, strRes);
         cfg.structuralShotDone = true;
+    }
+    if (cfg.wantGallery) {
+        ui::openGalleryPanel();
+        ui::selectAndOpenFirstSampleForShot();  // proves click -> doc_open -> editable tree
     }
     if (cfg.wantSimStudies)   ui::openSimStudiesPanel();  // T-U6
     if (cfg.wantPick) setupPickShot(st);

@@ -20,6 +20,7 @@
 #include "ui/piping_panel.h"       // T-U7 piping viewer
 #include "ui/hydraulic_panel.h"    // T-U7 hydraulic viewer
 #include "ui/structural_panel.h"   // T-U7 structural viewer
+#include "ui/gallery_panel.h"       // T-U9 sample gallery
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -336,6 +337,20 @@ void Application::frame() {
                                  ImGuiCond_Appearing);
         if (ImGui::Begin("Structural Frame###structural_view", ui::structuralPanelOpen(), pflags))
             ui::drawStructuralPanel(s);
+        ImGui::End();
+    }
+
+    // T-U9 Sample Gallery panel — closable, screenshot-verifiable via AI_CAD_SHOT=gallery.
+    // Floats centered; zero footprint while closed.
+    if (*ui::galleryPanelOpen()) {
+        const ImGuiViewport* vp4 = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp4->WorkPos.x + vp4->WorkSize.x * 0.5f,
+                                       vp4->WorkPos.y + vp4->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(620.f * theme::S(), 680.f * theme::S()),
+                                 ImGuiCond_Appearing);
+        if (ImGui::Begin("Sample Gallery###gallery", ui::galleryPanelOpen(), pflags))
+            ui::drawGalleryPanel(s);
         ImGui::End();
     }
 

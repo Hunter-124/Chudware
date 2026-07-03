@@ -1221,7 +1221,9 @@ def register_cad_tools(mcp: FastMCP) -> None:
         Returns revision, body_count, volume_mm3, and per-feature status (ok / error / warning)
         so you can immediately tell a dropped cut, a failed reference, or a stray extra body.
         Then call render_part() to LOOK at the result. On a validation error the whole batch is
-        rejected — read `error`, fix the ops, call again.
+        rejected — read `error`, fix the ops, call again. A rebuild-failure response may also
+        carry `regen_diagnosis`: an IP-18 fix-preview card (diagnosis + editable fix_ops +
+        verifier verdict) — record your verdict with regen_resolve(card, action).
 
         HEAVY OPS: a costly op (a global fillet/chamfer/shell/boolean on a many-edged body) is
         run on a worker thread and AUTO-HANDED-OFF to the background if it overruns the call

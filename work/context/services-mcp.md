@@ -11,6 +11,7 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
 - services/mcp/recon_tools.py:677 `register_recon_tools(mcp)` — reverse-engineering/intake (reverse_engineer, compare_parts, convert_face_to_sketch, resolve_process, dfm_check)
 - services/mcp/ecad_tools.py:420 `register_ecad_tools(mcp)` — schematic/PCB tools (ecad_new_schematic, ecad_new_pcb, ecad_place_symbol, ecad_autoroute, ecad_simulate, ecad_to_3d)
 - services/mcp/cam_tools.py:49 `register_cam_tools(mcp)` — CAM/toolpath (cam_new_job, cam_add_setup, cam_add_tool, cam_add_operation, cam_simulate, cam_post)
+- services/mcp/regen_tools.py `register_regen_tools(mcp)` — IP-18 rebuild-failure repair (regen_diagnose → fix-preview card; regen_resolve records accept/edit/reject as a T-H1 action trace). LIVE since T-BL22: a failed add_features batch auto-attaches the card as `regen_diagnosis`; traces journal to CACHE/telemetry/events.jsonl when no caller sink exists
 - services/mcp/core_bridge.py:20 `call(method, params)` — thin ctypes RPC bridge to libaicad.dll (JSON string-in/out); resolves library via $AI_CAD_LIBAICAD / $AI_CAD_DIST / build dirs
 - services/mcp/test_roundtrip.py:5 `python -m mcp_server.test_roundtrip` — integration test: list tools, new_part, add_features, render, measure, run_fea_static, export
 

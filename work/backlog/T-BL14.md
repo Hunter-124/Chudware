@@ -6,6 +6,10 @@ owner: unassigned
 status: backlog
 branch: task/T-BL14-gnn-adapter-training
 depends_on: []
+lane: ml-flywheel
+kind: new
+priority: 4
+deferred: yes
 ---
 
 ## Context

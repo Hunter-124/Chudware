@@ -72,6 +72,16 @@ Copilot-tab cluster = T-BL38 + T-BL39 + T-BL40 (+ context/model theme); one driv
 - **T-BL41** (P3 app-gui overhaul, todo): Sketch — auto-hide dimension/relation glyphs by default;
   dimension tool reveals them + adds/deletes relations. Display-only (non-destructive); add/delete
   may reach the sketch constraint API — Opus-leaning if it hits the solver.
+- **T-BL42** (P2 app-gui overhaul): feature tree absorbs consumed sketches/refs as hidden children
+  (extrude/revolve/sweep/loft); eye-toggle shows+highlights; NOT default planes/bodies; sketches stay reusable.
+- **T-BL43** (P2 modeling-core new, OPUS): sketch external references — select external geometry in a
+  sketch, fix Convert Entities, project external faces/edges/planes as sketch refs. OCCT projection = gnarly.
+- **T-BL44** (P2 app-gui fix, small): spacebar orients view normal-to the active sketch plane.
+- **T-BL45** (P3 modeling-core new, OPUS): 3D sketcher DESIGN/PLAN freeze (OSS survey incl. SolveSpace
+  GPL guardrail, data model, 3D constraint solver, integration) — plan-only, T-R1 precedent; Hunter to steer.
+
+Sketch-workflow cluster = T-BL41 + T-BL42 + T-BL43 + T-BL44 (+ T-BL45 as the forward plan). Hunter flagged
+these "decently high priority" (2026-07-03).
 
 ## Human-gated (waiting on Hunter)
 - **sketch_new label call** (round-2): keep icon-only [ribbon.cpp ribbon_displayLabel L134 intentional]

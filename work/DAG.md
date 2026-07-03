@@ -74,10 +74,10 @@ graph TD
     T_G13["T-G13: Fix issue 7 (scenario deadlock) - ScenarioRunner step-machine scenarios deadlock offscreen"]:::done
     T_G14["T-G14: Dark-mode readability + popup/subwindow correctness (black-on-black text, transparent borders, evaluate window sizing)"]:::doing
     T_G15["T-G15: Screenshot-based icon pipeline + broken/missing icon fixes (ribbon-wide icon regeneration)"]:::doing
-    T_G16["T-G16: Ribbon liquid-glass restyle - match the modern iOS-style UI of tooltips/Copilot"]:::doing
-    T_G17["T-G17: Copilot tab cleanup - settings reachable, model picker slim, sessions UX, general polish"]:::todo
-    T_G18["T-G18: Feature manager restyle - row styling parity, centering/margins, regenerated FM icons"]:::todo
-    T_G19["T-G19: 3D-feature PM chrome - OK/Cancel redesign+relocation, extrude depth/draft double-display fix"]:::doing
+    T_G16["T-G16: Ribbon liquid-glass restyle - match the modern iOS-style UI of tooltips/Copilot"]:::review
+    T_G17["T-G17: Copilot tab cleanup - settings reachable, model picker slim, sessions UX, general polish"]:::doing
+    T_G18["T-G18: Feature manager restyle - row styling parity, centering/margins, regenerated FM icons"]:::doing
+    T_G19["T-G19: 3D-feature PM chrome - OK/Cancel redesign+relocation, extrude depth/draft double-display fix"]:::review
     T_G2["T-G2: Restore doc-tab input, shrink Copilot header, PM button contrast"]:::done
     T_G20["T-G20: Surfaces tab audit - AI-driven test of every surface tool; fix or recommend scrap"]:::doing
     T_G3["T-G3: ShopCraft rename tier 1 - user-visible branding strings"]:::done
@@ -120,6 +120,15 @@ graph TD
     T_Q3["T-Q3: Sample project gallery + guided tours"]:::done
     T_Q4["T-Q4: User manual auto-generation — cad_guide + inventory → living docs"]:::done
   end
+  subgraph WS_R["workstream R"]
+    T_R1["T-R1: PLM v1 - OSS survey + freeze contracts/plm.md (vault schema, lifecycle, lock/remote protocol)"]:::todo
+    T_R2["T-R2: PLM vault core - services/plm/ engine, auto-history, checkpoint/release/restore, plm_* MCP tools"]:::todo
+    T_R3["T-R3: PLM change intelligence - plain-language summaries, AI-assist/AI-managed tiers, compare views"]:::todo
+    T_R4["T-R4: PLM items & releases - part numbers, rev letters, release pinning + BOM freeze, where-used"]:::todo
+    T_R5["T-R5: PLM in-editor GUI - history timeline panel, rev badges, checkpoint/release toolbar, compare view (all doc kinds)"]:::todo
+    T_R6["T-R6: PLM Project Hub - full-screen master workspace (item grid, activity, release board, where-used, Copilot dock)"]:::todo
+    T_R7["T-R7: PLM sharing & team sync v1 - remote profiles, one-button Sync, advisory locks, copy-as-variant conflicts"]:::todo
+  end
   subgraph WS_U["workstream U"]
     T_U1["T-U1: UI kit: style-conformance scaffold + pattern library for all new feature panels"]:::done
     T_U2["T-U2: Parts browser panel — federated search, detail card, insert"]:::done
@@ -149,12 +158,12 @@ graph TD
     T_BL07["T-BL07: Wire harness / cable design"]:::backlog
     T_BL08["T-BL08: Tolerance stack-up analysis"]:::backlog
     T_BL09["T-BL09: Wire the requirements layer to the verify battery (req evidence auto-population)"]:::todo
-    T_BL10["T-BL10: PDM-lite (git-backed revisioning)"]:::backlog
+    T_BL10["T-BL10: SUPERSEDED by workstream R — PDM-lite (git-backed revisioning)"]:::backlog
     T_BL11["T-BL11: Docs + compliance generation"]:::backlog
     T_BL12["T-BL12: TraceParts + Werk24 paid tiers"]:::backlog
     T_BL13["T-BL13: Per-document glass accent + luminance-variance scrim boost"]:::backlog
     T_BL14["T-BL14: GNN adapter training for GO families + sw_fixtures STEP export"]:::backlog
-    T_BL15["T-BL15: PROPOSAL — in-app document version control (needs human refinement first)"]:::backlog
+    T_BL15["T-BL15: SUPERSEDED by workstream R — in-app document version control (Pillar 19)"]:::backlog
     T_BL16["T-BL16: Motion/kinematics simulation of mechanisms"]:::todo
     T_BL17["T-BL17: Random/harmonic vibration response (frequency response analysis)"]:::todo
     T_BL18["T-BL18: Gear/bearing life and AGMA tooth-strength checks"]:::todo
@@ -264,6 +273,16 @@ graph TD
   T_M6 --> T_M3
   T_P1 --> T_P2
   T_P2 --> T_P3
+  T_R1 --> T_R2
+  T_R2 --> T_R3
+  T_R2 --> T_R4
+  T_R2 --> T_R5
+  T_R3 --> T_R5
+  T_U1 --> T_R5
+  T_R4 --> T_R6
+  T_R5 --> T_R6
+  T_R2 --> T_R7
+  T_R4 --> T_R7
   T_G6 --> T_U1
   T_U1 --> T_U2
   T_P2 --> T_U2

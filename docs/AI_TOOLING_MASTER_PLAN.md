@@ -568,3 +568,22 @@ consent default OFF), autosave/crash recovery + consent-tied diagnostics (Q2), s
 gallery + tours (Q3, Pillar-17 dogfood), auto-generated living manual (Q4, the reserved
 make_manual template). UI edit-parity for the U7 doc kinds is deliberately deferred to
 walkthrough-driven prioritization.
+
+## Pillar 19 — PLM version control (added 2026-07-03, Hunter directive; workstream R)
+
+Version control for the documents *users* create — parts, assemblies, drawings, ECAD,
+CAM, requirements — designed with **ease of use as the #1 priority**: users never learn
+version control; it happens to them. Three nouns (Project / History / Checkpoint-
+Release), automatic history on save, plain-language timelines (doc_diff + narration,
+never hashes), fixed minimal lifecycle (In work → Released → Superseded). AI-assist
+default (Copilot drafts messages, flags stale refs) with an opt-in AI-managed tier and
+manual-only floor — manual controls always primary. Architecture: snapshot-based on the
+T-H2 canonical serialization, per-project **hidden git vault** (containers exploded on
+check-in), local-first with the sharing spectrum local → shared folder → any self-hosted
+git remote → AI-CAD Cloud remote (seam only, Pillar-12 human gate). Team v1 = advisory
+locks + one-button Sync + copy-as-variant, NO merge UI. GUI: history panel/rev badges/
+compare in every editor (T-U1 kit) + a full-screen **Project Hub** master workspace.
+Source of truth: [PLM_VERSION_CONTROL_PLAN.md](PLM_VERSION_CONTROL_PLAN.md); contract
+freezes at `contracts/plm.md` (T-R1). Supersedes backlog T-BL15/T-BL10. Execution:
+workstream R (T-R1 survey+contract → T-R2 vault core → T-R3 change intelligence ∥ T-R4
+items/releases → T-R5 editor GUI → T-R6 Project Hub; T-R7 sharing/sync parallel).

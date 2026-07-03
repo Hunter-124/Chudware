@@ -1,6 +1,6 @@
 ---
 id: T-BL15
-title: PROPOSAL — in-app document version control (needs human refinement first)
+title: SUPERSEDED by workstream R — in-app document version control (Pillar 19)
 workstream: backlog
 owner: unassigned
 status: backlog
@@ -49,3 +49,9 @@ settle before this is schedulable:
       *this* task is closed/superseded, not implemented as-is
 
 **PARKED (Erik, 2026-07-03): out of scope for the v1 prototype push — low priority; revisit after the five objectives close.**
+
+**SUPERSEDED (Hunter directive, 2026-07-03, later the same day): un-parked and refined.
+The human review this task asked for happened — all open questions above are answered
+in [docs/PLM_VERSION_CONTROL_PLAN.md](../../docs/PLM_VERSION_CONTROL_PLAN.md)
+(Pillar 19). Execution is workstream R: T-R1 (contract) → T-R7 (team sync). Do not
+claim this file; claim the T-R tasks.**

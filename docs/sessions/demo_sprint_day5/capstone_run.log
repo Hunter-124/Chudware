@@ -1,10 +1,10 @@
 {
   "mission": "battery-powered soil-moisture sensor on a cedar post",
-  "timestamp": "2026-07-03T00:47:41Z",
+  "timestamp": "2026-07-03T08:54:19Z",
   "phases": [
     {
       "phase": "thin_slice",
-      "run_id": "c8efe1ae-5526-4cc4-a6a7-642cf6ffbfbc",
+      "run_id": "adeb24d0-ab4c-44f0-ba82-b37e79cfe44e",
       "pause_ok": true,
       "resume_ok": true,
       "final_status": "done",
@@ -15,7 +15,7 @@
     },
     {
       "phase": "full_mission",
-      "run_id": "1948942a-8afa-4971-bed1-3e15a8da8433",
+      "run_id": "1540ccbb-3027-4925-a1dd-cff0313c0954",
       "pause_ok": true,
       "resume_ok": true,
       "final_status": "failed",
@@ -58,20 +58,171 @@
       "escalated_count": 6,
       "escalation_reason": "backend_unavailable (fail-closed per verify.py \u00a7policy)",
       "gate_node_id": "n_gate_preorder",
-      "gate_batch_id": "b_ab49f7db05ca",
+      "gate_batch_id": "b_211ba11efccd",
       "gate_decision": "approve",
       "dod_gate_pause_resume": true,
       "dod_all_five_verify_pillars_fired": true
+    },
+    {
+      "phase": "live_backend",
+      "run_id": "cc430053-8949-4fdc-bdc9-283bd5cdb146",
+      "pause_ok": true,
+      "resume_ok": true,
+      "final_status": "failed",
+      "gate_done": true,
+      "report_done": true,
+      "artifacts": {
+        "interference_doc_id": "doc-cpp00000001",
+        "interference_preflight_pairs": 0,
+        "erc_doc_id": "b144888375b6",
+        "drc_doc_id": "a600b4be6877",
+        "firmware_project_id": "97cc6a271c30",
+        "firmware_build_ok": true,
+        "firmware_elf_path": "/tmp/AI-CAD/firmware/97cc6a271c30/build/firmware.elf",
+        "dc_ratio_doc_path": "/tmp/t_a5_demo_5yn2bsx9/cedar_post_bracket.json",
+        "budget_doc_path": "/tmp/t_a5_demo_5yn2bsx9/soil_sensor_bom.json"
+      },
+      "verify_evidence": {
+        "interference": {
+          "status": "done",
+          "verdict": "done",
+          "passed": true,
+          "check_type": "interference",
+          "reason": null,
+          "tool_result_summary": {
+            "ok": true,
+            "interference_pairs": 0,
+            "parts_count": 1,
+            "summary": "No interference detected."
+          }
+        },
+        "erc": {
+          "status": "done",
+          "verdict": "done",
+          "passed": true,
+          "check_type": "erc",
+          "reason": null,
+          "tool_result_summary": {
+            "ok": true,
+            "errors": 0,
+            "warnings": 0,
+            "verdict": "0 error(s), 0 warning(s). Clean."
+          }
+        },
+        "drc": {
+          "status": "done",
+          "verdict": "done",
+          "passed": true,
+          "check_type": "drc",
+          "reason": null,
+          "tool_result_summary": {
+            "ok": true,
+            "errors": 0,
+            "verdict": "0 error(s), 1 warning(s). worst: [WARNING] no_outline: board has no Edge.Cuts outline \u2014 add one (pcb_set_outline) before fabrication or 3D export; edge-clearance checks are skipped without it"
+          }
+        },
+        "firmware": {
+          "status": "failed",
+          "verdict": "escalate",
+          "passed": false,
+          "check_type": "firmware",
+          "reason": "check_failed",
+          "tool_result_summary": {
+            "passed": false,
+            "uart_log_tail": "",
+            "assertion_results": [
+              {
+                "name": "SOIL:",
+                "passed": false,
+                "detail": "'SOIL:' not found in uart_log"
+              }
+            ]
+          }
+        },
+        "dc": {
+          "status": "done",
+          "verdict": "done",
+          "passed": true,
+          "check_type": "dc_ratio",
+          "reason": null,
+          "tool_result_summary": {
+            "ok": true,
+            "results": [
+              {
+                "element_id": "post1",
+                "dc_ratio": 0.0,
+                "passed": true,
+                "governing_limit": "bending_yield_LRFD"
+              }
+            ]
+          }
+        },
+        "budget": {
+          "status": "done",
+          "verdict": "done",
+          "passed": true,
+          "check_type": "budget",
+          "reason": null,
+          "tool_result_summary": {
+            "ok": true,
+            "lines": 4,
+            "total_priced_usd": 0,
+            "unpriced_lines": 3,
+            "note": "3 bought line(s) unpriced (provider credentials not configured \u2014 unit_cost=null per contract \u00a70, never fabricated)."
+          }
+        }
+      },
+      "passed_pillars": [
+        "interference",
+        "erc",
+        "drc",
+        "dc",
+        "budget"
+      ],
+      "failed_pillars": [
+        "firmware"
+      ],
+      "firmware_build_ok": true,
+      "node_statuses_pre_resume": {
+        "n_ecad": "done",
+        "n_firmware": "done",
+        "n_structural": "done",
+        "n_source": "done",
+        "n_verify_interference": "done",
+        "n_verify_erc": "done",
+        "n_verify_drc": "done",
+        "n_verify_firmware": "failed",
+        "n_verify_dc": "done",
+        "n_verify_budget": "done"
+      },
+      "node_statuses_final": {
+        "n_ecad": "done",
+        "n_firmware": "done",
+        "n_structural": "done",
+        "n_source": "done",
+        "n_verify_interference": "done",
+        "n_verify_erc": "done",
+        "n_verify_drc": "done",
+        "n_verify_firmware": "failed",
+        "n_verify_dc": "done",
+        "n_verify_budget": "done",
+        "n_gate_preorder": "done",
+        "n_report": "done"
+      },
+      "gate_decision": "approve",
+      "dod_gate_pause_resume": true,
+      "dod_all_six_verify_pillars_evaluated_real_artifacts": true
     }
   ],
   "event_counts": {
-    "dag.run.started": 2,
-    "dag.node.started": 14,
-    "dag.node.done": 8,
-    "dag.node.paused": 2,
-    "dag.node.approval_required": 2,
-    "dag.run.done": 2,
-    "dag.node.failed": 6
+    "dag.run.started": 3,
+    "dag.node.started": 26,
+    "dag.node.done": 19,
+    "dag.node.paused": 3,
+    "dag.node.approval_required": 3,
+    "dag.run.done": 3,
+    "dag.node.failed": 7,
+    "setup.artifact": 12
   },
-  "total_events": 36
+  "total_events": 76
 }

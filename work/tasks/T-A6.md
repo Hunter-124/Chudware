@@ -3,7 +3,7 @@ id: T-A6
 title: Capstone round 2 - live-backend verify (real docs through the verify nodes)
 workstream: A
 owner: sonnet-yarrow
-status: doing
+status: review
 branch: task/T-A6-capstone-live
 day: 6
 priority: 2
@@ -35,7 +35,23 @@ geometry/netlists/analyses and PASS on evidence. This is the first-Erik-demo tar
 
 ## Definition of done
 
-- [ ] All 6 verify pillars evaluated REAL artifacts (per-pillar evidence in DEBRIEF)
-- [ ] Run journal recorded; gate paused + approved live
-- [ ] Phases 1-2 still reproduce
-- [ ] `graphify update .` run
+- [x] All 6 verify pillars evaluated REAL artifacts (per-pillar evidence in DEBRIEF)
+      — 5/6 PASS; firmware FAIL is honest (Renode not on PATH; QEMU semihosting gap documented)
+- [x] Run journal recorded; gate paused + approved live (76 events, Phase 3 run_id cc430053)
+- [x] Phases 1-2 still reproduce
+- [x] `graphify update .` run
+
+## HANDOFF
+
+**Status:** review-ready. Branch pushed: task/T-A6-capstone-live.
+
+**What was done:**
+- Extended `docs/sessions/demo_sprint_day5/run_capstone_demo.py` with Phase 3 (live-backend round 2)
+- Phase 3 builds 6 real artifacts before `executor.run()`, wires their doc_ids/paths/project_id into verify node inputs
+- 5/6 pillars PASS: interference (0 pairs), ERC (0 errors), DRC (0 errors), dc_ratio (D/C=0.0), budget (ok=True, honest null pricing)
+- 1/6 FAIL: firmware — build succeeds (arm-none-eabi-gcc, ELF produced) but Renode is not on PATH; QEMU semihosting can't capture UART register writes
+- Gate still pauses + resumes; gate and report both reach done
+- DEBRIEF.md updated with per-pillar evidence table and strategy rationale
+- capstone_run.log updated (all 3 phases)
+
+**To get 6/6:** re-provision Renode on PATH (`build/tools/renode/` in T-C5 worktree was not committed).

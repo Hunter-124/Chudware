@@ -75,8 +75,7 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
   library (aicad.parts/1): part_search, part_get, part_place.
 - services/mcp/serving_tools.py:28 `register_serving_tools(mcp)` — LoRA adapter routing:
   serving_status, serving_set_canary, serving_rollback, serving_evaluate, serving_promote.
-- services/mcp/regen_tools.py:89 `register_regen_tools(mcp)` — rebuild-failure diagnosis:
-  regen_diagnose(document_json, reference_json?).
+- services/mcp/regen_tools.py `register_regen_tools(mcp)` — IP-18 rebuild-failure repair (regen_diagnose → fix-preview card; regen_resolve records accept/edit/reject as a T-H1 action trace). LIVE since T-BL22: a failed add_features batch auto-attaches the card as `regen_diagnosis`; traces journal to CACHE/telemetry/events.jsonl when no caller sink exists
 - services/mcp/code_compliance_tools.py:23 `register_code_compliance_tools(mcp)` —
   building-code checks (IBC/ASCE/NFPA + RAG): code_check(doc_path, codes?, jurisdiction?).
 - services/dag/mcp_tools.py:100 `register_dag_tools(mcp)` + `register_dag_replan_tools(mcp)` —
@@ -84,6 +83,8 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
 - services/mcp/design_review_tools.py:32 `register_design_review_tools(mcp)` — one-call
   geometry battery narrated via contracts/narration.md: design_review(doc_id, checks?).
 - services/mcp/intake_ledger.py `IntakeLedger(doc_id)` — doc-scoped interaction answer store (contracts/interaction.md §5): persists ask_user Q/A inside the doc's IntakeState meta record (rides the .step+, survives save/reopen — doc_id is per-process, the record travels with the doc); no FastMCP import, get/set injectable for engine-less tests. Used by intake_tools._ask_via_contract and ask_user's scope=doc default ledger (T-BL25)
+- services/mcp/core_bridge.py:20 `call(method, params)` — thin ctypes RPC bridge to libaicad (JSON string-in/out); resolves library via $AI_CAD_LIBAICAD / $AI_CAD_DIST / build dirs
+- services/mcp/test_roundtrip.py:5 `python -m mcp_server.test_roundtrip` — integration test: list tools, new_part, add_features, render, measure, run_fea_static, export
 
 ## How it connects
 

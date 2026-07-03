@@ -95,6 +95,30 @@ def _agent_design(params: dict, emit_event: EmitFn) -> dict:
         _SESSIONS[session_id] = session
 
     provider = config.get_provider()
+    # T-BL22: per-insertion-point adapter routing (T-H9 seam, IP-1 = the design loop).
+    # When config.json carries a "routing" entry for IP-1, resolve which brain answers:
+    # a non-fallback decision re-resolves the provider (e.g. a vLLM-served LoRA) and the
+    # decision is stamped onto the provider so loop.py tags every ai_artifact with the
+    # adapter version (RouteDecision.telemetry_tag()). No table / no IP-1 entry / any
+    # error -> the existing provider unchanged (the kill-switch fallback path).
+    try:
+        from services.serving.routing import load_routing_table
+
+        _rt = load_routing_table(cfg)
+        if "IP-1" in _rt:
+            _decision = _rt.resolve("IP-1", user_id=str(session_id or ""))
+            if not _decision.is_fallback:
+                try:
+                    provider = config.get_provider(_decision.provider, cfg)
+                    # Stamp the decision so loop._emit_ai_artifact tags every response
+                    # with the served adapter (telemetry_tag()). Fallback decisions are
+                    # NOT stamped — the default provider answers and its own name/model
+                    # (adapter None) is the truthful tag.
+                    provider._routing_decision = _decision
+                except Exception:  # adapter endpoint unavailable -> kill-switch degrade:
+                    pass           # keep the default provider, untagged (adapter None)
+    except Exception:  # noqa: BLE001 — routing is optional; never break the design loop
+        pass
     run = loop.run_turn(session, request, provider,
                         on_event=emit_event, max_iters=max_iters,
                         plan_first=bool(plan))

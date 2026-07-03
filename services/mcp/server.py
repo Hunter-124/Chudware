@@ -79,6 +79,11 @@ mcp = FastMCP(
         "reverse, deliverables, requirements, dag, verify, interaction, sourcing, cost, spec, "
         "piping, hydraulic, firmware, structural, regen, code_compliance, serving, design_review, "
         "doc_diff, plm."
+        "REBUILD FAILURE? A failed add_features batch may carry a `regen_diagnosis` fix-preview "
+        "card (diagnosis + editable fix_ops + verifier verdict). Record your verdict with "
+        "regen_resolve(card, 'accept'|'edit'|'reject') — accept/edit returns the fixed document; "
+        "regen_diagnose(document_json) runs the same diagnosis on any failed doc directly.\n"
+        "ECAD (schematic/PCB) tools are also available (ecad_*)."
     ),
 )
 
@@ -192,8 +197,9 @@ register_parts_tools(mcp)
 from mcp_server.serving_tools import register_serving_tools
 register_serving_tools(mcp)
 # Regen diagnosis (T-H11 / IP-18): on a rebuild failure, diagnose + propose editable fix-ops as
-# an accept/edit/reject card, logged as an IP-18 correction trace. Callable backend seam; the
-# copilot binding is T-F17.
+# an accept/edit/reject card, logged as an IP-18 correction trace. LIVE since T-BL22:
+# add_features attaches the card on rebuild failure; regen_resolve records the accept/edit/
+# reject action trace (journaled to CACHE/telemetry/events.jsonl).
 from mcp_server.regen_tools import register_regen_tools
 register_regen_tools(mcp)
 # Code compliance (T-D4): deterministic rule engine + agentic RAG for building-code checks.

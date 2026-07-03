@@ -63,12 +63,13 @@ def test_tool_registration_and_json_contract():
     class _FakeMCP:
         def tool(self):
             def deco(fn):
-                captured["fn"] = fn
+                captured[fn.__name__] = fn
                 return fn
             return deco
 
     RT.register_regen_tools(_FakeMCP())
-    fn = captured["fn"]
+    assert "regen_diagnose" in captured
+    fn = captured["regen_diagnose"]
     doc = _corrupt("suppressed_parent", seed=4)
     # inject an oracle provider by monkeypatching the resolver for this call
     orig = RT._resolve_provider
@@ -88,10 +89,11 @@ def test_tool_reports_bad_json():
     class _FakeMCP:
         def tool(self):
             def deco(fn):
-                captured["fn"] = fn
+                captured[fn.__name__] = fn
                 return fn
             return deco
 
     RT.register_regen_tools(_FakeMCP())
-    result = json.loads(captured["fn"]("{not valid json"))
+    assert "regen_diagnose" in captured
+    result = json.loads(captured["regen_diagnose"]("{not valid json"))
     assert result["ok"] is False and "invalid JSON" in result["error"]

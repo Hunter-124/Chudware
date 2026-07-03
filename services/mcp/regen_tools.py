@@ -5,18 +5,39 @@ diagnosis (``services.agent.regen_diagnosis``), verifies the proposed fix agains
 when present, and returns a fix-preview card (``services.agent.regen_card``). The provider call
 is logged as an IP-18 correction trace via T-H7's LoggingProvider.
 
-This is the shared surface the copilot / orchestrator call on a rebuild-failure event —
-registered the way T-F16 registered its worker RPCs: a live, callable backend that fires the
-moment any caller invokes it. It harvests REAL correction traces only once a caller (T-F17's
-copilot binding) wires it to the rebuild-failure event; until then it is a callable-but-uncalled
-surface (same posture T-F16 shipped its preview pane in).
+This is the shared surface the copilot / orchestrator call on a rebuild-failure event.
+LIVE SINCE T-BL22: ``add_features`` (cad_tools.py) invokes ``diagnose_failed_document`` on
+every rebuild failure and attaches the fix-preview card to its failure response, and
+``regen_resolve`` records the user's accept/edit/reject as a T-H1 ``ai_artifact_action``
+correction trace. When no caller-supplied event sink exists (the MCP tool path), events are
+journaled to ``CACHE/telemetry/events.jsonl`` (the spec_sheet_matcher precedent) so the
+"every LLM call is flywheel-logged" guarantee stays real.
 """
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from services.agent.regen_diagnosis import detect_failures
+
+
+def _journal_sink() -> Callable[[dict], None]:
+    """Durable default event sink: append each telemetry event to the journal.
+
+    Mirrors engine/spec_sheet_matcher._make_journal_sink — used when no caller-supplied
+    sink exists (the MCP tool path), so IP-18 correction traces persist instead of being
+    dropped. Failures are swallowed; telemetry must never break a call.
+    """
+    def _sink(event: dict) -> None:
+        try:
+            from engine import paths
+            out = paths.CACHE / "telemetry" / "events.jsonl"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with out.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+    return _sink
 
 
 def _resolve_provider():
@@ -76,6 +97,10 @@ def diagnose_failed_document(document: dict, *, provider=None,
             "reason": "no provider configured for regen diagnosis (set one to enable IP-18 fixes)",
             "failures": [f.to_dict() for f in detect_failures(document)],
         }
+    if on_event is None:
+        # T-BL22: no caller sink (the MCP tool path) -> journal the IP-18 correction trace
+        # to CACHE/telemetry/events.jsonl instead of dropping it on the floor.
+        on_event = _journal_sink()
 
     from services.agent.regen_diagnosis import diagnose
     from services.agent.regen_card import build_fix_preview
@@ -119,3 +144,44 @@ def register_regen_tools(mcp) -> None:
         result = diagnose_failed_document(
             document, reference_document=reference, engine_error=engine_error or None)
         return json.dumps(result, default=str)
+
+    @mcp.tool()
+    def regen_resolve(card_json: str, action: str, edit_ops_json: str = "",
+                      note: str = "") -> str:
+        """Record the user's/agent's verdict on a regen fix-preview card: accept, edit, or reject.
+
+        ``card_json``: the ``card`` object from ``regen_diagnose`` (or the ``regen_diagnosis``
+        field of a failed ``add_features`` response). ``action``: ``"accept"`` | ``"edit"`` |
+        ``"reject"``. ``edit_ops_json`` (edit only): the amended fix-ops JSON array, re-applied
+        to the ORIGINAL corrupted document.
+
+        Emits the T-H1 ``ai_artifact_action`` correction trace (journaled to the telemetry
+        events log, correlated to the diagnosis's IP-18 artifact and carrying its verifier
+        score). Returns ``{ok, action, document}`` — ``document`` is the fixed doc to load on
+        accept/edit (null on reject, or when the card carries no document handles).
+        """
+        try:
+            card = json.loads(card_json)
+        except json.JSONDecodeError as e:
+            return json.dumps({"ok": False, "error": f"card_json: invalid JSON — {e}"})
+        if not isinstance(card, dict) or card.get("kind") != "fix_preview_card":
+            return json.dumps({"ok": False,
+                               "error": "card_json must be a fix_preview_card object"})
+        edit_ops = None
+        if edit_ops_json.strip():
+            try:
+                edit_ops = json.loads(edit_ops_json)
+            except json.JSONDecodeError as e:
+                return json.dumps({"ok": False, "error": f"edit_ops_json: invalid JSON — {e}"})
+        from services.agent.regen_card import ACCEPT, EDIT, REJECT, resolve
+        if action not in (ACCEPT, EDIT, REJECT):
+            return json.dumps({"ok": False,
+                               "error": f"action must be one of {(ACCEPT, EDIT, REJECT)}"})
+        try:
+            from services.agent.config import consent_tier, load_config
+            consent = consent_tier(load_config())
+        except Exception:  # noqa: BLE001
+            consent = "meta"
+        doc = resolve(card, action, _journal_sink(), edit_ops=edit_ops,
+                      consent=consent, note=note)
+        return json.dumps({"ok": True, "action": action, "document": doc}, default=str)

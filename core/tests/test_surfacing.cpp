@@ -177,3 +177,42 @@ TEST_CASE("surf_ruled from two sketch refs still works (T-BL28 no regression)") 
     }
     CHECK(found);
 }
+
+// (4) surf_boundary from body edges. Shares the exact add_wire_edges -> surf_sketch_wire
+//     path as surf_fill, but the ref slot is dir1 (+ optional dir2) — cover it explicitly
+//     so the test literally exercises all three edge-fed forms (DoD "all three"). dir1 =
+//     the four top-face edges as a boundary loop.
+TEST_CASE("surf_boundary from body edges builds a patch (T-BL28)") {
+    const double W = 40.0, H = 30.0, D = 20.0;
+
+    TopoDS_Shape box = geom::make_box(W, H, D);
+    std::vector<aicad::doc::TopoInfo> infos = aicad::doc::describe_edges(box);
+    json dir1 = json::array();
+    std::set<std::tuple<long long, long long, long long>> seen;
+    for (const aicad::doc::TopoInfo& info : infos) {
+        if (std::abs(info.centroid.z() - D) > 1e-4) continue;  // top-face edges only
+        auto key = std::make_tuple(
+            static_cast<long long>(std::llround(info.centroid.x() * 1e4)),
+            static_cast<long long>(std::llround(info.centroid.y() * 1e4)),
+            static_cast<long long>(std::llround(info.centroid.z() * 1e4)));
+        if (!seen.insert(key).second) continue;
+        dir1.push_back(aicad::doc::make_selector(info));
+    }
+    REQUIRE(dir1.size() == 4);
+
+    json doc;
+    doc["features"] = json::array({
+        corner_box("x1", W, H, D),
+        json{{"id", "b1"}, {"type", "surf_boundary"}, {"dir1", dir1}},
+    });
+
+    CompileResult r = compile_document(doc, json::object());
+    REQUIRE(r.ok);
+    bool found = false;
+    for (const auto& s : r.statuses) {
+        if (s.id == "b1") { found = true; CHECK_MESSAGE(s.ok, "surf_boundary failed: " << s.error); }
+        CHECK(s.ok);
+    }
+    CHECK(found);
+    CHECK(r.body_count == 2);  // box + the boundary patch
+}

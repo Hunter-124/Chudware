@@ -1,10 +1,10 @@
 {
   "mission": "battery-powered soil-moisture sensor on a cedar post",
-  "timestamp": "2026-07-03T08:54:19Z",
+  "timestamp": "2026-07-03T09:02:44Z",
   "phases": [
     {
       "phase": "thin_slice",
-      "run_id": "adeb24d0-ab4c-44f0-ba82-b37e79cfe44e",
+      "run_id": "b9fda6c9-dbf5-45c2-9aa1-d687d31803f8",
       "pause_ok": true,
       "resume_ok": true,
       "final_status": "done",
@@ -15,7 +15,7 @@
     },
     {
       "phase": "full_mission",
-      "run_id": "1540ccbb-3027-4925-a1dd-cff0313c0954",
+      "run_id": "df50d25b-8a1f-4fcd-b60e-af757846213f",
       "pause_ok": true,
       "resume_ok": true,
       "final_status": "failed",
@@ -58,14 +58,14 @@
       "escalated_count": 6,
       "escalation_reason": "backend_unavailable (fail-closed per verify.py \u00a7policy)",
       "gate_node_id": "n_gate_preorder",
-      "gate_batch_id": "b_211ba11efccd",
+      "gate_batch_id": "b_643ecaa433f4",
       "gate_decision": "approve",
       "dod_gate_pause_resume": true,
       "dod_all_five_verify_pillars_fired": true
     },
     {
       "phase": "live_backend",
-      "run_id": "cc430053-8949-4fdc-bdc9-283bd5cdb146",
+      "run_id": "ce5209ef-5226-4fb1-b226-0660a7160cbf",
       "pause_ok": true,
       "resume_ok": true,
       "final_status": "failed",
@@ -74,13 +74,13 @@
       "artifacts": {
         "interference_doc_id": "doc-cpp00000001",
         "interference_preflight_pairs": 0,
-        "erc_doc_id": "b144888375b6",
-        "drc_doc_id": "a600b4be6877",
-        "firmware_project_id": "97cc6a271c30",
+        "erc_doc_id": "70d6c636774a",
+        "drc_doc_id": "b0aac65e23a3",
+        "firmware_project_id": "074fc060ae93",
         "firmware_build_ok": true,
-        "firmware_elf_path": "/tmp/AI-CAD/firmware/97cc6a271c30/build/firmware.elf",
-        "dc_ratio_doc_path": "/tmp/t_a5_demo_5yn2bsx9/cedar_post_bracket.json",
-        "budget_doc_path": "/tmp/t_a5_demo_5yn2bsx9/soil_sensor_bom.json"
+        "firmware_elf_path": "/tmp/AI-CAD/firmware/074fc060ae93/build/firmware.elf",
+        "dc_ratio_doc_path": "/tmp/t_a5_demo_a5y16l07/cedar_post_bracket.json",
+        "budget_doc_path": "/tmp/t_a5_demo_a5y16l07/soil_sensor_bom.json"
       },
       "verify_evidence": {
         "interference": {
@@ -129,14 +129,8 @@
           "reason": "check_failed",
           "tool_result_summary": {
             "passed": false,
-            "uart_log_tail": "",
-            "assertion_results": [
-              {
-                "name": "SOIL:",
-                "passed": false,
-                "detail": "'SOIL:' not found in uart_log"
-              }
-            ]
+            "uart_log_tail": "timeout: renode exceeded 30s",
+            "assertion_results": []
           }
         },
         "dc": {

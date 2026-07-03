@@ -45,6 +45,8 @@ struct ShotConfig {
     bool bomShotDone = false;
     bool wantRequirements = false;          // T-U5: requirements & verification panel
     bool requirementsShotDone = false;
+    bool wantTransparency = false;          // T-U8: model & telemetry transparency panel
+    bool transparencyShotDone = false;
 
     // Long-running scenario modes (ScenarioRunner step machines)
     bool wantM1 = false;

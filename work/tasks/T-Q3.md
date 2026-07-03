@@ -2,8 +2,8 @@
 id: T-Q3
 title: Sample project gallery + guided tours
 workstream: Q
-owner: unassigned
-status: todo
+owner: sonnet-lark
+status: doing
 branch: task/T-Q3-prod
 day: 3
 priority: 4

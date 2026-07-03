@@ -2,8 +2,8 @@
 id: T-BL25
 title: Doc-scoped IntakeLedger - persist scope=doc answers per interaction.md section 5
 workstream: backlog
-owner: sonnet-heath
-status: doing
+owner: unassigned
+status: todo
 branch: task/T-BL25-doc-intake-ledger
 depends_on: []
 lane: ai-copilot

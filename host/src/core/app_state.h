@@ -1054,6 +1054,8 @@ struct AppState {
     bool drawingShotDone = false;  // guard so the drawing scenario runs exactly once
     bool wantEvalMass = false;  // C19: AI_CAD_SHOT=evalmass mass-properties window
     bool evalMassShotDone = false;
+    bool wantIconPipe = false;  // T-G15: AI_CAD_SHOT=iconpipe — recipe-driven clean-viewport icon render
+    bool iconPipeShotDone = false;  // guard: keeps the frame loop alive until every recipe is captured
 
     // ---- SketchMode (C18) — in-sketch tools/overlay; typed like the PropertyManager (W1-B) ----
     ui::SketchMode* sketchMode = nullptr;  // active doc's sketch (per DocSession; re-seated on switch)

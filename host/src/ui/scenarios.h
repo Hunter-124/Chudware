@@ -12,6 +12,9 @@
 #pragma once
 
 #include <string>
+#include <vector>
+
+#include <nlohmann/json.hpp>
 
 struct AppState;
 
@@ -101,6 +104,19 @@ private:
     int apStep = 0, apSettle = 0;
     std::string apSavePath, apCapture;
     bool apDirReady = false;
+
+    // ---------- T-G15 icon pipeline (AI_CAD_SHOT=iconpipe) ----------
+    // Recipe-driven clean-viewport icon generator: read a JSON recipe list (env AI_CAD_ICON_RECIPES),
+    // and for each recipe build a demo part (newPart + applyOps), render it through the renderer's
+    // transparent thumbnail path (no chrome, no gizmo, alpha=0 background) at the recipe camera, and
+    // write out_dir/<name>.png. Doubles as a smoke test that every tool's op actually runs.
+    // All recipes drain in ONE tick (everything on the path is synchronous; no backbuffer capture),
+    // so headless runs don't pay the per-frame present cost.
+    void runIconPipe(AppState& st);
+    bool ipInit = false, ipWant = false;
+    int ipIndex = 0, ipPx = 128;
+    std::string ipOutDir;
+    std::vector<nlohmann::json> ipRecipes;
 
     // ---------- C22b activity scenario (AI_CAD_SHOT=activity) ----------
     int actStep = 0, actSettle = 0, actWaitFrames = 0;

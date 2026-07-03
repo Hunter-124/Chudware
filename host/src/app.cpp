@@ -760,6 +760,11 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // creates a normal window and strips the frame later via the WndProc in chrome::install.)
     glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
 #endif
+    // T-G15 dev/test hook: AI_CAD_HIDDEN=1 creates the window unmapped so headless shot runs never
+    // enter the compositor's present path (on an unattended desktop the compositor can starve a new
+    // window's swaps indefinitely — observed as multi-minute drmSyncobjTimelineWait stalls). GL
+    // rendering + glReadPixels work as normal on the hidden window's framebuffer. Shot-mode only.
+    if (shot && std::getenv("AI_CAD_HIDDEN")) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     GLFWwindow* win = glfwCreateWindow(shot ? 1340 : 1440, shot ? 838 : 900, "ShopCraft", nullptr, nullptr);
     if (!win) { glfwTerminate(); return 1; }
     glfwMakeContextCurrent(win);
@@ -1423,6 +1428,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     st.wantDrawing = shot && shotMode && std::strcmp(shotMode, "drawing") == 0;
     if (st.wantDrawing) { st.showRibbon = true; st.showFeatureTree = true; }
     st.wantEvalMass = shot && shotMode && std::strcmp(shotMode, "evalmass") == 0;  // C19 mass props
+    st.wantIconPipe = shot && shotMode && std::strcmp(shotMode, "iconpipe") == 0;  // T-G15 icon render
     if (st.wantFea || st.wantFlow) {
         st.showSimulationTools = true;
         st.showRibbon = true;
@@ -1458,6 +1464,25 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         if (const char* tabEnv = std::getenv("AI_CAD_TAB")) {
             int t = std::atoi(tabEnv);
             if (t >= 0 && t <= AppState::RT_Manufacture) st.ribbonTab = t;
+        }
+        // T-G15: named alias for AI_CAD_TAB so in-context icon verification reads self-documenting
+        // (e.g. AI_CAD_RIBBON_TAB=appearance). Also unblocks T-G16's per-tab ribbon-glass captures.
+        if (const char* tn = std::getenv("AI_CAD_RIBBON_TAB")) {
+            const std::string t = tn;
+            int idx = -1;
+            if      (t == "features")   idx = AppState::RT_Features;
+            else if (t == "sketch")     idx = AppState::RT_Sketch;
+            else if (t == "evaluate")   idx = AppState::RT_Evaluate;
+            else if (t == "simulation") idx = AppState::RT_Simulation;
+            else if (t == "assembly")   idx = AppState::RT_Assembly;
+            else if (t == "sheetmetal") idx = AppState::RT_SheetMetal;
+            else if (t == "weldments")  idx = AppState::RT_Weldments;
+            else if (t == "pcb")        idx = AppState::RT_PCB;
+            else if (t == "surfaces")   idx = AppState::RT_Surfaces;
+            else if (t == "appearance") idx = AppState::RT_Appearance;
+            else if (t == "manufacture")idx = AppState::RT_Manufacture;
+            if (idx >= 0) st.ribbonTab = idx;
+            else { std::fprintf(stderr, "AI_CAD_RIBBON_TAB: unknown tab '%s'\n", tn); }
         }
     }
     // pmform shot: open a PropertyManager form headlessly for visual verification of its field
@@ -3051,6 +3076,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // cam shot: wait for the worker + the build/load scenario, then give the CAM tab a few
         // frames to come forward (camLoadJob re-requests focus for ~10 frames) before capturing.
         if (st.wantCam) shotFrame = st.camShotDone ? 60 : 99999;
+        // T-G15 iconpipe: keep the loop alive (offscreen icon renders happen in tick()) until every
+        // recipe is captured, then exit promptly — the --shot backbuffer capture is a throwaway.
+        if (st.wantIconPipe) shotFrame = st.iconPipeShotDone ? 3 : 99999;
         if (shot && ++st.frame >= shotFrame) {
             std::vector<unsigned char> px(dw * dh * 4);
             glReadBuffer(GL_BACK);

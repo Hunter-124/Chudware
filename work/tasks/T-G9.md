@@ -54,3 +54,13 @@ is the production GUI on Linux; `host/` survives only until T-G11's Windows chec
 
 - The `feature_surface_audit`/`parity_audit` failures were PRE-EXISTING against host —
   after retargeting they must actually pass, that's the point of the gate.
+
+## Scope additions (foreman, 2026-07-04, at T-G8 merge)
+
+- The 5 parity diff harnesses deferred from T-G8's DoD (G-code ×8 post dialects,
+  netlist+ERC, DXF/PDF, study JSON, sketch-solver op-batch) — engine RPCs are
+  byte-identical to host per the finisher, so these should diff clean; build the
+  harness infra in tools/ and prove it.
+- De-literal the G8-ported panels: 66 IM_COL32 color literals absorbed into
+  scripts/ui_style_check_baseline.json as EXPLICIT DEBT at merge — replace with
+  theme:: tokens and shrink the baseline back toward the original 18.

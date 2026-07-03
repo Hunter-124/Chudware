@@ -177,7 +177,7 @@ graph TD
     T_BL25["T-BL25: Doc-scoped IntakeLedger - persist scope=doc answers per interaction.md section 5"]:::done
     T_BL26["T-BL26: ai-cad MCP freshness audit - server instructions, cad_guide topics, context injection vs shipped capabilities"]:::done
     T_BL27["T-BL27: Surfaces — surf_replace_face 'could not heal' unless the replacement splits the solid"]:::doing
-    T_BL28["T-BL28: Surfaces — ruled/fill/boundary forms feed body-edge picks the engine rejects (needs sketch refs)"]:::blocked
+    T_BL28["T-BL28: Surfaces — ruled/fill/boundary forms feed body-edge picks the engine rejects (needs sketch refs)"]:::done
     T_BL29["T-BL29: Screenshot-icon recipes — remaining groups (revolve/sweep/loft, Pattern, Multi-body, Curves, Sheet Metal Create, Appearance Display, Manufacture, appr_glass/appr_paint)"]:::done
     T_BL30["T-BL30: Engine — boolean fuse/cut/common of disjoint bodies silently succeeds; enforce the single-connected-solid invariant (issue"]:::doing
     T_BL31["T-BL31: GUI round-2 walkthrough nits — dim-chip bleed live-confirm, load toast pinned over ribbon, empty Mass-Properties pills"]:::doing
@@ -195,6 +195,7 @@ graph TD
     T_BL43["T-BL43: Sketch external references — project external faces/edges/planes into a sketch, fix Convert Entities, select external features while in a sketch"]:::todo
     T_BL44["T-BL44: Sketch — spacebar orients the view normal to the active sketch plane"]:::todo
     T_BL45["T-BL45: 3D sketcher — OSS survey + design/plan freeze (data model, 3D constraint solver, integration with 2D sketch + features)"]:::todo
+    T_BL46["T-BL46: Sketch — larger drag dead zone / element-drag priority so repositioning/resizing elements doesn't instantly pan the view"]:::todo
   end
   subgraph WS_integration["workstream integration"]
     T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog

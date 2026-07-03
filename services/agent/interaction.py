@@ -196,6 +196,20 @@ def run_dir(run_id: str) -> Path:
     return d
 
 
+def doc_dir(doc_id: str) -> Path:
+    """Return ``<cache>/docs/<doc_id>/``, creating it if needed.
+
+    Doc-scoped interaction answers live here alongside the doc's run history so
+    a confirmed dimension survives process restart (contract §5 "scope=doc" path).
+    ``doc_id`` is the document identity string (same value used as the .step+
+    record identifier by the C++ engine).  The directory is gitignored (it is
+    under the user cache root, not the source tree).
+    """
+    d = cache_root() / "docs" / doc_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 class Ledger(Protocol):
     def answered(self, qid: str) -> dict | None: ...
     def record_question(self, q: dict) -> None: ...
@@ -228,6 +242,59 @@ class FileLedger:
     def __init__(self, run_id: str, path: Path | None = None) -> None:
         self.run_id = run_id
         self.path = path or (run_dir(run_id) / "interaction.jsonl")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._answers: dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("t") == "answer":
+                self._answers[rec["id"]] = rec["answer"]
+
+    def _append(self, rec: dict) -> None:
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+
+    def answered(self, qid: str) -> dict | None:
+        return self._answers.get(qid)
+
+    def record_question(self, q: dict) -> None:
+        self._append({"t": "question", **q})
+
+    def record_answer(self, qid: str, answer: dict) -> None:
+        self._answers[qid] = answer
+        self._append({"t": "answer", "id": qid, "answer": answer})
+
+
+class DocLedger:
+    """Doc-scoped JSONL ledger at ``<cache>/docs/<doc_id>/interaction.jsonl``.
+
+    Mirrors :class:`FileLedger` but keyed on *document identity* rather than
+    run identity (contract §5 "scope=doc" path).  Answers persist across process
+    restarts: a dimension confirmed in one session is never re-asked in the next
+    (the DoD requirement for T-BL25).
+
+    The file format is identical to :class:`FileLedger`:
+    one JSON object per line, ``{"t": "question"|"answer", ...}``.  Answers
+    replay by ``id``; unknown extra fields are tolerated (contract §10).
+
+    ``path`` is injectable for tests (``tmp_path / "interaction.jsonl"``).
+    In production the file lives at ``<AICAD_CACHE_ROOT>/docs/<doc_id>/interaction.jsonl``,
+    which is the same cache root the C++ run machine uses (``core/agent/paths.cpp``).
+    """
+
+    def __init__(self, doc_id: str, path: Path | None = None) -> None:
+        self.doc_id = doc_id
+        self.path = path or (doc_dir(doc_id) / "interaction.jsonl")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._answers: dict[str, dict] = {}
         self._load()
@@ -443,7 +510,12 @@ def ask_user(questions, *, scope: str = "run", run_id: str | None = None,
     _validate(batch)
 
     if ledger is None:
-        ledger = FileLedger(batch.run_id) if batch.scope == "run" else MemoryLedger()
+        if batch.scope == "run":
+            ledger = FileLedger(batch.run_id)
+        elif batch.doc_id:
+            ledger = DocLedger(batch.doc_id)
+        else:
+            ledger = MemoryLedger()
 
     results: dict[str, dict] = {}
     to_ask: list[Question] = []

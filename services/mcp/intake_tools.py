@@ -34,14 +34,20 @@ except Exception:  # noqa: BLE001
 # collision (T-V3) must not prevent process_profiles / intake from loading.  The ask_user
 # path is only exercised at call time via _ask_via_contract(), never at module import.
 def _ask_via_contract(questions: list, run_id: Optional[str], transport=None,
-                      ledger=None) -> dict:
+                      ledger=None, doc_id: Optional[str] = None) -> dict:
     """Route a batch of questions through the ONE interaction contract (§3 envelope).
 
     This replaces bespoke Q/A plumbing in resolve_process (process clarification) and
     confirm_dimensions (caliper demands).  Uses FileLedger(run_id) when run_id is
     supplied so answers persist to the run ledger and replay on resume (§5 — a
     dimension confirmed here is visible to a DAG gate for the same run_id, never re-asked).
-    Falls back to MemoryLedger when no run_id is available (doc-only sessions).
+
+    When ``doc_id`` is supplied (and no ``run_id``), uses DocLedger(doc_id) so answers
+    persist to the doc-scoped sidecar and survive process restart (contract §5
+    "scope=doc" path — T-BL25).  A dimension confirmed in one session is never
+    re-asked in the next session for the same doc.
+
+    Falls back to MemoryLedger when neither run_id nor doc_id is available.
 
     ``transport`` and ``ledger`` are injectable for tests (no live MCP client needed).
     When ``transport`` is None and ``run_id`` is present the call is non-blocking so
@@ -51,13 +57,32 @@ def _ask_via_contract(questions: list, run_id: Optional[str], transport=None,
     """
     try:
         from services.agent.interaction import (
-            FileLedger, MemoryLedger, ask_user, make_batch)
+            DocLedger, FileLedger, MemoryLedger, ask_user, make_batch)
     except ImportError:
         from agent.interaction import (  # type: ignore
-            FileLedger, MemoryLedger, ask_user, make_batch)
+            DocLedger, FileLedger, MemoryLedger, ask_user, make_batch)
 
     if ledger is None:
-        ledger = FileLedger(run_id) if run_id else MemoryLedger()
+        if run_id:
+            ledger = FileLedger(run_id)
+        elif doc_id:
+            ledger = DocLedger(doc_id)
+        else:
+            ledger = MemoryLedger()
+
+    # Determine scope: run-scoped when run_id is known; doc-scoped when doc_id is
+    # known; fall back to "run" scope with MemoryLedger for legacy callers that
+    # supply neither (non-persisting session-local path, same as before T-BL25).
+    if run_id:
+        scope, effective_run_id, effective_doc_id = "run", run_id, None
+    elif doc_id:
+        scope, effective_run_id, effective_doc_id = "doc", None, doc_id
+    else:
+        # Legacy: no run_id, no doc_id — MemoryLedger, scope=run (batch validation
+        # requires run_id for scope=run, so use scope=doc with no doc_id skips
+        # validation; keep "run" + None to preserve prior behaviour for callers
+        # that only supply a MemoryLedger injection).
+        scope, effective_run_id, effective_doc_id = "run", None, None
 
     # Non-blocking: the MCP tool layer is multi-turn; it surfaces questions to the
     # user and returns.  We record Q/A into the ledger so that if a later turn
@@ -65,9 +90,9 @@ def _ask_via_contract(questions: list, run_id: Optional[str], transport=None,
     # the ledger without re-asking.
     return ask_user(
         questions,
-        scope="run" if run_id else "doc",
-        run_id=run_id,
-        doc_id=None,
+        scope=scope,
+        run_id=effective_run_id,
+        doc_id=effective_doc_id,
         blocking=transport is not None,
         transport=transport,
         ledger=ledger,
@@ -493,9 +518,12 @@ def register_intake_tools(mcp: FastMCP) -> None:
             still = [r.key for r in ik.unresolved_critical(ledger)]
 
             # Route each confirmed dimension through the interaction contract so that
-            # the answer is also persisted in the run ledger (if run_id supplied).
-            # This makes confirmed dims visible to DAG gates (cross-mechanism no-re-ask).
-            if run_id and confirmations:
+            # the answer is also persisted in the interaction ledger for replay.
+            # - When run_id is supplied: persists to the run-scoped FileLedger so a
+            #   DAG gate for the same run_id never re-asks (cross-mechanism no-re-ask).
+            # - When only doc_id is available: persists to the doc-scoped DocLedger so
+            #   the answer survives process restart (contract §5 scope=doc — T-BL25).
+            if (run_id or d) and confirmations:
                 questions = []
                 for c in confirmations:
                     key = c.get("key")
@@ -511,7 +539,8 @@ def register_intake_tools(mcp: FastMCP) -> None:
                             "why": "Fit-critical dimension from caliper measurement.",
                         })
                 if questions:
-                    _ask_via_contract(questions, run_id=run_id)
+                    _ask_via_contract(questions, run_id=run_id,
+                                      doc_id=d if not run_id else None)
 
             return _dumps({"ok": True, "gate_ok": ik.gate_ok(ledger),
                            "still_blocking": still})

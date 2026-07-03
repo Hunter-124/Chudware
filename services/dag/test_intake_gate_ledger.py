@@ -308,3 +308,129 @@ class TestAskUserReplay:
         }
         r = ask_user([gate_q], scope="run", run_id=run_id, ledger=ledger, autonomy="auto")
         assert r[gate_q_id]["source"] == "resumed"
+
+
+# ---------------------------------------------------------------------------
+# §5 — Doc-scoped ledger: cross-session no-re-ask (T-BL25 DoD)
+# ---------------------------------------------------------------------------
+
+class TestDocLedgerCrossSession:
+    """DocLedger persists scope=doc answers across process restarts.
+
+    'Two separate simulated sessions on the same doc' means: session 2 constructs
+    a fresh DocLedger from the same on-disk file — it NEVER reuses the session-1
+    in-memory object.  The transport must NOT be called in session 2.
+    """
+
+    def test_doc_ledger_persists_answer_across_sessions(self, tmp_path):
+        """Session 1 records a dimension; session 2 replays it without any transport."""
+        from services.agent.interaction import DocLedger, ask_user
+
+        doc_id = f"doc_{uuid.uuid4().hex[:12]}"
+        ledger_path = tmp_path / "interaction.jsonl"
+
+        q = {
+            "id": "shaft.dia",
+            "kind": "dimension",
+            "family": "length",
+            "prompt": "Shaft diameter?",
+            "suggested": {"value": 8.0, "unit": "mm"},
+            "required": False,
+        }
+
+        # --- Session 1: answer is recorded to the sidecar file ---
+        ledger1 = DocLedger(doc_id, path=ledger_path)
+        r1 = ask_user([q], scope="doc", doc_id=doc_id, ledger=ledger1, autonomy="auto")
+        assert r1["shaft.dia"]["source"] == "default"
+        assert r1["shaft.dia"]["canonical"]["unit"] == "mm"
+        assert ledger_path.exists(), "sidecar file must be written after session 1"
+
+        # --- Session 2: fresh DocLedger instance from the SAME file (process restart) ---
+        transport_calls: list = []
+
+        class BoomTransport:
+            """Fails the test if the transport is invoked — the ledger must replay."""
+            def ask(self, batch):  # pragma: no cover
+                transport_calls.append(batch.batch_id)
+                return {}
+
+        ledger2 = DocLedger(doc_id, path=ledger_path)   # new object, same file
+        r2 = ask_user([q], scope="doc", doc_id=doc_id, ledger=ledger2,
+                      transport=BoomTransport(), blocking=True, autonomy="approve")
+        assert len(transport_calls) == 0, (
+            "Transport was invoked in session 2 — DocLedger did not replay from disk"
+        )
+        assert r2["shaft.dia"]["source"] == "resumed"
+        assert r2["shaft.dia"]["canonical"] == r1["shaft.dia"]["canonical"]
+
+    def test_doc_ledger_different_docs_are_isolated(self, tmp_path):
+        """Two docs with different doc_ids do not share each other's ledger."""
+        from services.agent.interaction import DocLedger, ask_user
+
+        path_a = tmp_path / "doc_a.jsonl"
+        path_b = tmp_path / "doc_b.jsonl"
+
+        q = {
+            "id": "bore.dia",
+            "kind": "dimension",
+            "family": "length",
+            "prompt": "Bore diameter?",
+            "suggested": {"value": 10.0, "unit": "mm"},
+            "required": False,
+        }
+
+        # Record the answer only for doc_a
+        ledger_a1 = DocLedger("doc_a", path=path_a)
+        ask_user([q], scope="doc", doc_id="doc_a", ledger=ledger_a1, autonomy="auto")
+
+        # doc_b ledger is fresh — should NOT see doc_a's answer
+        ledger_b = DocLedger("doc_b", path=path_b)
+        assert ledger_b.answered("bore.dia") is None, (
+            "doc_b should not see doc_a's answer — ledgers must be isolated per doc_id"
+        )
+
+        # doc_a's ledger does see its own answer on reload
+        ledger_a2 = DocLedger("doc_a", path=path_a)
+        assert ledger_a2.answered("bore.dia") is not None, (
+            "doc_a ledger reload should find its own previously recorded answer"
+        )
+
+    def test_ask_via_contract_routes_doc_id_to_doc_ledger(self, tmp_path):
+        """_ask_via_contract with doc_id (no run_id) uses DocLedger and persists."""
+        from services.agent.interaction import DocLedger
+        from services.mcp.intake_tools import _ask_via_contract
+
+        doc_id = f"doc_{uuid.uuid4().hex[:12]}"
+        ledger_path = tmp_path / "interaction.jsonl"
+        ledger = DocLedger(doc_id, path=ledger_path)
+
+        q = {
+            "id": "intake.dim.output_shaft.dia",
+            "kind": "dimension",
+            "family": "length",
+            "prompt": "Output shaft diameter?",
+            "suggested": {"value": 6.0, "unit": "mm"},
+            "required": False,
+        }
+
+        # Session 1: answer via doc-scoped _ask_via_contract
+        answers1 = _ask_via_contract([q], run_id=None, doc_id=doc_id, ledger=ledger)
+        assert "intake.dim.output_shaft.dia" in answers1
+        assert answers1["intake.dim.output_shaft.dia"]["source"] == "default"
+        assert ledger_path.exists()
+
+        # Session 2: fresh ledger from same file — must replay, no transport needed
+        ledger2 = DocLedger(doc_id, path=ledger_path)
+        transport_calls: list = []
+
+        class TrackingTransport:
+            def ask(self, batch) -> dict:
+                transport_calls.append(batch.batch_id)
+                return {qq.id: qq.suggested for qq in batch.questions}
+
+        answers2 = _ask_via_contract([q], run_id=None, doc_id=doc_id, ledger=ledger2,
+                                     transport=TrackingTransport())
+        assert len(transport_calls) == 0, (
+            "Transport was called in session 2 — _ask_via_contract doc-scope replay broken"
+        )
+        assert answers2["intake.dim.output_shaft.dia"]["source"] == "resumed"

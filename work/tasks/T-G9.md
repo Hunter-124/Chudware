@@ -64,3 +64,6 @@ is the production GUI on Linux; `host/` survives only until T-G11's Windows chec
 - De-literal the G8-ported panels: 66 IM_COL32 color literals absorbed into
   scripts/ui_style_check_baseline.json as EXPLICIT DEBT at merge — replace with
   theme:: tokens and shrink the baseline back toward the original 18.
+
+## Progress log
+- 2026-07-03 06:56 UTC [sonnet-marsh] CHECKPOINT a001ecb pushed: scope-addition 2 DONE — all 83 wave-4 color literals de-literaled into theme::draw2d/camview/featcat/etc domain tokens (byte-identical values), preview_pane ifdef moved to platform layer, ui_style_check baseline 63 keys -> 0 (beats the 'toward 18' target). Build green, drawing/cam/tree shots eyeballed unchanged. Next: the 5 parity diff harnesses in tools/.

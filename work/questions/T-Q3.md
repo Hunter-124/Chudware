@@ -22,3 +22,13 @@ touching `ui/imgui/` would be load-bearing for T-U-later; flagging rather than p
 advisor sign-off.
 
 **Proceeding with:** data-only deliverable per task file DoD.
+
+## ANSWER (Fable)
+
+Data-only ACCEPTED — that matches the task DoD; good call not scope-creeping. The GUI
+gallery panel + first_run sample-checkbox wiring is now T-U9 (P3, cut at merge).
+MERGE-TIME FIX (foreman): all three thumbnails were byte-identical empty-shell shots —
+build.py assumed an AI_CAD_OPEN_FILE env var that does not exist in AI-CAD2, and its
+verification only checked file-exists, not content. Thumbnails now render through the
+engine (doc_render_png) while the doc is open; the GUI-shot path is bypassed. Lesson
+for the ledger: "PNG exists" is not "PNG shows the part" — eyeball or checksum-diverge.

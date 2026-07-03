@@ -122,6 +122,10 @@ def build_bracket(cb) -> dict:
 
     # ── Step 6: save native .aicm ─────────────────────────────────────────────
     cb.call("doc_save", {"doc_id": doc_id, "path": str(OUTPUT_AICM)})
+    # Engine-rendered thumbnail while the doc is still open (doc_render_png).
+    # The old GUI-shot path captured an EMPTY shell 3x: AI-CAD2 has no
+    # AI_CAD_OPEN_FILE support, so --shot never loaded the doc (foreman fix).
+    cb.call("doc_render_png", {"doc_id": doc_id, "out_path": str(OUTPUT_PNG)})
     cb.call("doc_close", {"doc_id": doc_id})
 
     feature_count = _count_ok_features(r)
@@ -147,6 +151,8 @@ def make_thumbnail() -> bool:
     Render a headless thumbnail by loading the saved .aicm into AI-CAD2
     via the --shot flag.  Returns True if the PNG was written.
     """
+    if OUTPUT_PNG.exists():
+        return True  # engine-rendered during build; GUI shot cannot load docs
     # Try multiple known binary locations (worktree and main repo)
     candidates = [
         REPO / "ui" / "imgui" / "build" / "bin" / "AI-CAD2",

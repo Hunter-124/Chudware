@@ -108,6 +108,10 @@ def build_frame(cb) -> dict:
 
     # ── Save ──────────────────────────────────────────────────────────────────
     cb.call("doc_save", {"doc_id": doc_id, "path": str(OUTPUT_AICM)})
+    # Engine-rendered thumbnail while the doc is still open (doc_render_png).
+    # The old GUI-shot path captured an EMPTY shell 3x: AI-CAD2 has no
+    # AI_CAD_OPEN_FILE support, so --shot never loaded the doc (foreman fix).
+    cb.call("doc_render_png", {"doc_id": doc_id, "out_path": str(OUTPUT_PNG)})
     cb.call("doc_close", {"doc_id": doc_id})
 
     feature_count = len(r.get("rebuild", {}).get("feature_status", []))
@@ -132,6 +136,8 @@ def _find_binary() -> "Path | None":
 
 
 def make_thumbnail() -> bool:
+    if OUTPUT_PNG.exists():
+        return True  # engine-rendered during build; GUI shot cannot load docs
     binary = _find_binary()
     if binary is None:
         print("  [SKIP] AI-CAD2 binary not found")

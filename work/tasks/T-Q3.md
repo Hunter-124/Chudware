@@ -3,7 +3,7 @@ id: T-Q3
 title: Sample project gallery + guided tours
 workstream: Q
 owner: sonnet-lark
-status: review
+status: done
 branch: task/T-Q3-prod
 day: 3
 priority: 4

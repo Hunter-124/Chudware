@@ -699,9 +699,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
         if ((mainHov || dropHov) && enabled) {
-            ImU32 hBg = ui::Palette::toU32(ui::palette.buttonHovered);
-            dl->AddRectFilled(p0, ImVec2(p0.x + bw, p0.y + bh), hBg,
-                              ui::metrics::ribbonBtnRound());
+            ui::glassRowBackground(dl, p0, ImVec2(p0.x + bw, p0.y + bh), 4.0f);
         }
         {
             float ax = p0.x + mainW + kArrowW * s * 0.5f;
@@ -718,9 +716,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     } else {
         if (mainHov && enabled) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
-            ImU32 hBg = ui::Palette::toU32(ui::palette.buttonHovered);
-            dl->AddRectFilled(p0, ImVec2(p0.x + bw, p0.y + bh), hBg,
-                              ui::metrics::ribbonBtnRound());
+            ui::glassRowBackground(dl, p0, ImVec2(p0.x + bw, p0.y + bh), 4.0f);
         }
     }
 
@@ -848,9 +844,7 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
         bool dropHov = ImGui::IsItemHovered();
         ImDrawList* dl = ImGui::GetWindowDrawList();
         if ((mainHov || dropHov) && enabled)
-            dl->AddRectFilled(p0, ImVec2(p0.x + totalW, p0.y + rowH),
-                              ui::Palette::toU32(ui::palette.buttonHovered),
-                              ui::metrics::ribbonBtnRound());
+            ui::glassRowBackground(dl, p0, ImVec2(p0.x + totalW, p0.y + rowH), 4.0f);
         {
             float ax = p0.x + mainW + kDropArrowW * s * 0.5f;
             float ay = p0.y + rowH * 0.5f;
@@ -865,9 +859,7 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
     } else {
         if (mainHov && enabled) {
             ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->AddRectFilled(p0, ImVec2(p0.x + totalW, p0.y + rowH),
-                              ui::Palette::toU32(ui::palette.buttonHovered),
-                              ui::metrics::ribbonBtnRound());
+            ui::glassRowBackground(dl, p0, ImVec2(p0.x + totalW, p0.y + rowH), 4.0f);
         }
     }
 
@@ -1202,6 +1194,16 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     ImDrawList* dl   = ImGui::GetWindowDrawList();
     ImVec2      wPos = ImGui::GetWindowPos();
 
+    // Liquid-glass chrome: paint the shared glass material (the SAME glassBackground helper the
+    // tooltips use) over the band so the ribbon matches the rest of the app. Full-width flush band
+    // -> rounding 0 (rounded corners would gap at the window edges); the glass READ comes from the
+    // translucent fill + inner shine + hairline border. See SHARED VISUAL CONTRACT in
+    // work/tasks/T-G15.md (opus-gleam, 2026-07-03).
+    {
+        ImVec2 wSize = ImGui::GetWindowSize();
+        ui::glassBackground(dl, wPos, ImVec2(wPos.x + wSize.x, wPos.y + wSize.y), 0.0f);
+    }
+
     // --- Tab strip ---
     float tabTopPad = 0.0f;
     float tabBtnH   = tabH;
@@ -1226,10 +1228,9 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         ImGui::PopID();
 
         if (isAct || tabHov) {
-            ImU32 bg = isAct ? ImGui::ColorConvertFloat4ToU32(ribbon_chromeTint(palette.ribbonTabActive))
-                             : Palette::toU32(palette.buttonHovered);
-            dl->AddRectFilled(tp0, tp1, bg, ui::metrics::ribbonBtnRound(),
-                isAct ? ImDrawFlags_RoundCornersTop : 0);
+            // Shared glass pill: the active tab gets the restrained accent card (selected=true),
+            // a hovered tab a light frosted wash. Same helper as the Copilot/FeatureManager rows.
+            ui::glassRowBackground(dl, tp0, tp1, 4.0f, /*stripe*/false, /*selected*/isAct);
         }
         if (isAct) {
             float tabInset = ui::metrics::ribbonSmSplitInset();

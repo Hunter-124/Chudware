@@ -2,7 +2,7 @@
 id: T-A5
 title: Integration day - run demo mission end-to-end
 workstream: A
-owner: Bruh
+owner: unassigned
 status: todo
 branch: task/T-A5-integration-demo
 day: 5

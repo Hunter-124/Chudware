@@ -95,14 +95,27 @@ captures need `AI_CAD_PYTHON`/venv provisioned.
 
 ### OPEN central follow-up — CAM/ECAD headless surfacing (application.cpp/layout.cpp)
 
-CAM and ECAD are separate dock tabs sharing the central node with Viewport; the node's
-`ImGuiDockNodeFlags_NoTabBar` does NOT honor `SetNextWindowFocus()` reliably headless, so the
-cam/ecad shots show the Model viewport (ribbon/workspace bar are correct). Drawing + sim do NOT
-have this problem because they content-swap/overlay INSIDE the Viewport window (workspace-gated)
-rather than being separate dock tabs. FIX OPTIONS: (a) set the dock node's SelectedTabId via
-`ImGui::DockBuilderGetNode(...)->SelectedTabId = ImGui::GetID("CAM"/"ECAD")` when that
-workspace/mode is active; or (b) restructure CAM/ECAD to render inside the Viewport window like
-drawing/sim. Bounded, high-value for Erik's walkthrough — do before G4 sign-off.
+CAM and ECAD are separate dock tabs sharing the central node with Viewport; the node hides its
+tab bar (`ImGuiDockNodeFlags_NoTabBar`), so the cam/ecad shots show the Model viewport (ribbon/
+workspace bar ARE correct). Drawing + sim do NOT have this problem because they content-swap/
+overlay INSIDE the Viewport window (workspace-gated) rather than being separate dock tabs.
+
+TRIED + FAILED (opus-sky, both proven not to surface the panel headless — do NOT re-attempt):
+(1) per-frame `SetNextWindowFocus()` on the CAM/ECAD window (committed H1/H2 code);
+(2) setting the dock node's `SelectedTabId = w->TabId` directly each frame after submitting all
+three central windows (via `FindWindowByName`/`w->DockNode`, imgui_internal). Both build + shot
+exit 0 but the central area still renders the 3D Viewport — the Viewport window (docked LAST in
+layout.cpp:53, and the one doing the GL render under `PassthruCentralNode`) stays the selected
+tab regardless. Likely the tab-bar-hidden node's selection is re-derived from focus/GL-passthru,
+not `SelectedTabId`.
+
+RECOMMENDED FIX = option (b), the proven pattern: render CAM + ECAD INSIDE the Viewport window
+as a workspace/mode-gated content swap (exactly like H3 drawing's `if (workspace==Drafting){
+drawDrawingSheet(s); return; }` in viewport.cpp, and H4 sim's `drawEmbedded`). CAM needs a
+mode/flag signal (there is no Manufacture Workspace enum — add one, or gate on an st.camActive
+flag set by the cam scenario/command). This removes CAM/ECAD from the central dock node entirely.
+Bounded, high-value for Erik's walkthrough — do before G4 sign-off. Panels render + execute
+correctly TODAY (verified via frame trace); only the headless which-tab-is-forward is affected.
 
 ### Panel-dispatch wiring pattern (for H2–H5)
 
@@ -116,10 +129,12 @@ GLOB_RECURSEs `src/*.cpp` — no CMakeLists edit needed for new files.
 
 ### Remaining work (H1-H4 DONE)
 
-1. **H5 sketch (completion)** — host `sketch_mode.cpp` is 8,314 LOC; split into
-   `ui/imgui/src/ui/sketch/{sketch_mode,tools,constraints,overlay,edit}.*` (the split IS the
-   modularity payoff — do NOT port as one file). Uses F1 camera API. `ui/imgui/src/ui/sketch/`
-   already exists from earlier waves — build on it. Verify `AI_CAD_SHOT=sketch` + `AI_CAD_SHOT=asm`.
+1. **H5 sketch — ALREADY PORTED (earlier waves; H5 "spans waves 2-4").**
+   `ui/imgui/src/ui/sketch/` is already 8,631 LOC across the modular split
+   (sketch_mode/tools/constraints/edit/overlay/internal/seam/palette + airfoil) — the split
+   payoff is DONE. `AI_CAD_SHOT=sketch` already renders (Sketch ribbon + "Fully Defined" + real
+   geometry — verified during T-G13). Remaining H5 DoD is only the **solver op-batch diff vs
+   host** (a harness, item 2), NOT more porting. Confirm `AI_CAD_SHOT=asm` too.
 2. **Diff harnesses** (integrator infra, `tools/`): run the SAME job on host AI-CAD + new AI-CAD2
    and byte/JSON-diff artifacts — G-code across 8 post dialects, netlist JSON + ERC, DXF/PDF
    export, study JSON. Since the compute is engine-side and RPCs were kept byte-identical, these

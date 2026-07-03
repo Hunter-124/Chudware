@@ -33,9 +33,35 @@ Lead-time risk: API approvals for Nexar, Digi-Key, Mouser, Xometry, JLCPCB, and 
 ## Definition of done
 
 - [ ] Applications submitted for all six providers (Nexar, Digi-Key, Mouser, Xometry, JLCPCB, McMaster)
-- [ ] At least Nexar key is active and a test GraphQL query returns part data
-- [ ] Keys stored in `.env`, `.env` is in `.gitignore`
+- [x] At least Nexar key is active and a test GraphQL query returns part data
+- [x] Keys stored in `.env`, `.env` is in `.gitignore`
 - [ ] Status of each application noted (pending / active) in a comment block at top of `engine_oracle/vendor_parts.py`
+
+## Status (2026-07-03)
+
+Only two of six keys obtained so far — Digi-Key, Mouser, Xometry, McMaster still pending
+(Erik hasn't gotten to those applications yet).
+
+- **Nexar: ACTIVE, verified live.** `client_id`/`client_secret` in
+  `~/.local/share/AI-CAD/config.json` under `parts_providers.nexar` (the app's real
+  credential source per `_resolve_creds` — `.env` is env-var fallback only and nothing
+  in this repo auto-loads it). Ran `NexarProvider().fetch("NE555P")` against the real
+  API and got live pricing/stock back.
+  - **Real bug found+fixed while verifying:** the `supSearchMpn` GraphQL query asked
+    for a `datasheetUrl` field that no longer exists on Nexar's `SupPart` type (schema
+    drift since T-B1b) — every `fetch()` call was silently swallowing the GraphQL error
+    and returning "no supply results" instead of real data. Introspected the live schema,
+    found the field moved to `bestDatasheet { url }`, fixed the query + mapper in
+    `engine_oracle/parts_providers.py`, updated the mocked test fixture in
+    `test_parts_providers.py` (`datasheetUrl` → `bestDatasheet.url`). 17/17 tests pass.
+- **JLCPCB: keys held, NOT wired.** Got an `accesskey`/`secretkey` pair (JLCPCB's real
+  Open API auth model — signed requests, not a static bearer token). But
+  `engine_oracle/quote_providers.py::JLCPCBProvider` only supports a single static
+  bearer token (`JLCPCB_KEY` / `quote_providers.jlcpcb.api_key`) — a scaffold-era
+  assumption that doesn't match the real API. Raw keys recorded in `.env` (see comment
+  there); needs a small follow-up task to rework `JLCPCBProvider`'s auth flow before
+  these can be used. Not attempted blind — didn't want to guess-implement a signing
+  scheme without the real API docs in hand.
 
 ## AI hints
 

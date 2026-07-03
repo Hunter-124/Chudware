@@ -2,8 +2,8 @@
 id: T-G9
 title: GUI migration wave 5 - polish, parity battery, cutover (P1, P2, G5)
 workstream: G
-owner: unassigned
-status: todo
+owner: sonnet-marsh
+status: doing
 branch: task/T-G9-migration-cutover
 day: 10
 priority: 4

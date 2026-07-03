@@ -3244,70 +3244,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
             }
         }
-        // ---- Fixed active-feature readout panel (top-right, left of the Copilot column) ----
-        // While a feature's PropertyManager is creating/editing, its dimensions (Depth, Draft angle,
-        // …) are mirrored into a compact read-only glass panel pinned to the top-right of the
-        // viewport — just left of the Copilot column — instead of floating over the geometry. Editing
-        // still happens in the PM form / by dragging the handles; this is a status readout.
-        {
-            const std::string activeFid =
-                (st.propertyManager && st.propertyManager->hasPreviewTarget())
-                    ? st.propertyManager->targetId() : std::string();
-            if (!inSketch && !activeFid.empty() && st.docMirror.hasDoc()) {
-                std::vector<DimCandidate> cands = dimCandidates(st, activeFid);
-                if (!cands.empty()) {
-                    const float sc = ui::uiScale;
-                    std::string title = "Active Feature";
-                    if (const nlohmann::json* feat = findFeature(st.docMirror.tree(), activeFid)) {
-                        std::string nm = feat->value("name", std::string());
-                        if (nm.empty()) nm = feat->value("type", std::string());
-                        if (!nm.empty()) title = nm;
-                    }
-                    struct Row { std::string k, v; };
-                    std::vector<Row> rows;
-                    rows.reserve(cands.size());
-                    for (const auto& c : cands) {
-                        std::string vS = c.angle
-                            ? (std::to_string((int)std::lround(c.value)) + "°")
-                            : ui::pmFormatDim(c.value, st.ips());
-                        rows.push_back({ c.label.empty() ? c.param : c.label, vS });
-                    }
-                    const float padX = 10.0f * sc, padY = 8.0f * sc;
-                    const float rowH = ImGui::GetTextLineHeight() + 4.0f * sc;
-                    const float headerH = ImGui::GetTextLineHeight() + 8.0f * sc;
-                    float contentW = ImGui::CalcTextSize(title.c_str()).x;
-                    for (const auto& r : rows) {
-                        float w = ImGui::CalcTextSize(r.k.c_str()).x + 20.0f * sc +
-                                  ImGui::CalcTextSize(r.v.c_str()).x;
-                        contentW = std::max(contentW, w);
-                    }
-                    const float panelW = contentW + padX * 2;
-                    const float panelH = padY * 2 + headerH + (float)rows.size() * rowH;
-                    const float cpEdge = ui::overlayColumnEdge(1);
-                    const float x1 = (cpEdge >= 0.0f ? cpEdge : cr1.x) - 12.0f * sc;
-                    const float x0 = x1 - panelW;
-                    const float y0 = cr0.y + 44.0f * sc;   // below the viewport toolbar row
-                    ImRect pr(ImVec2(x0, y0), ImVec2(x1, y0 + panelH));
-                    const ui::AdaptiveSurface& afSurf =
-                        ui::adaptivePanel(ui::panelId("vp_active_feature"), pr, ui::GlassGroup::Hud);
-                    ui::glassPanel(vdl, pr, ui::GlassLevel::Thin, 7.0f, afSurf);
-                    vdl->AddRect(pr.Min, pr.Max, ui::Palette::toU32(ui::palette.accentSoft),
-                                 7.0f * sc, 0, 1.0f * sc);
-                    float ty = y0 + padY;
-                    ui::glassText(vdl, nullptr, ImGui::GetFontSize(), ImVec2(x0 + padX, ty),
-                                  afSurf, title.c_str());
-                    ty += headerH;
-                    for (const auto& r : rows) {
-                        ui::glassText(vdl, nullptr, ImGui::GetFontSize(), ImVec2(x0 + padX, ty),
-                                      afSurf, r.k.c_str());
-                        ImVec2 vsz = ImGui::CalcTextSize(r.v.c_str());
-                        ui::glassText(vdl, nullptr, ImGui::GetFontSize(),
-                                      ImVec2(x1 - padX - vsz.x, ty), afSurf, r.v.c_str());
-                        ty += rowH;
-                    }
-                }
-            }
-        }
+        // T-G19: The far-right "Active Feature" dimension readout panel that used to be pinned
+        // top-right (left of the Copilot column) was REMOVED. It mirrored the PM's dimension
+        // fields (Depth, Draft angle, radii, …) for EVERY feature via dimCandidates(activeFid),
+        // producing the depth/draft double-display Erik reported (once in the PM, once behind the
+        // Copilot tab). The PM form is the single source of truth for these values; the live
+        // drag-time readout chip (above) still follows the cursor while a dim handle is dragged.
 
         // C25 W3-J: apply ground-shadow visibility (last call wins; app.cpp may set it per-frame
         // before viewport_panel runs — the ordering means this value wins for the rendered frame,

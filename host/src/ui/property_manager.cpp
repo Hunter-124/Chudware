@@ -2138,6 +2138,78 @@ static bool pmSectionHeader(const char* label, const Palette& pal) {
     return open;
 }
 
+// T-G19: OK / Cancel command buttons, relocated ABOVE the PM into the left-pane top row (between
+// the Configurations tab and the collapse chevron — Erik round-1). Rendered by layout.cpp from that
+// row while a form is active. Wider than the old 26dp squares, with regenerated ok_check / cancel_x
+// glyphs. The cluster is right-aligned to END at `rightX`, vertically centered on `centerY`. Clicking
+// OK commits (commit() still guards form readiness + toasts on failure); Cancel reverts every preview
+// batch. Returns the cluster's pixel width (0 when inactive) so the caller can reserve space.
+float PropertyManager::drawChromeButtons(AppState& st, float rightX, float centerY) {
+    if (!active_ || !form_) return 0.0f;
+    const float S   = ui::uiScale;
+    const auto& pal = ui::palette;
+    const float btnW     = 40.0f * S;    // wider than the old 26dp square (Erik: "make them wider")
+    const float btnH     = 26.0f * S;
+    const float gap      = 6.0f * S;
+    const float icSz     = 18.0f * S;
+    const float clusterW = btnW * 2.0f + gap;
+    const float x0       = rightX - clusterW;
+    const float y0       = centerY - btnH * 0.5f;
+
+    // Draw at absolute screen positions but leave the caller's layout cursor untouched.
+    const ImVec2 savedCur = ImGui::GetCursorScreenPos();
+    ImGui::PushID("pm_chrome_okcancel");
+    bool ok = false, cancel = false;
+
+    // Confirm (OK) — palette statusOk role (adapts to the active theme; no baked greens).
+    ImGui::SetCursorScreenPos(ImVec2(x0, y0));
+    ImGui::PushStyleColor(ImGuiCol_Button,
+        ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 0.90f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+        ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 1.0f));
+    {
+        IconUV okIc = getIcon("ok_check", 20);
+        if (okIc.valid) {
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                ImVec2((btnW - icSz) * 0.5f, (btnH - icSz) * 0.5f));
+            ok = ImGui::ImageButton("##pm_ok", okIc.texId, ImVec2(icSz, icSz), okIc.uv0, okIc.uv1);
+            ImGui::PopStyleVar();
+        } else {
+            ok = ImGui::Button("OK##pm", ImVec2(btnW, btnH));
+        }
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("OK (Enter)");
+    ImGui::PopStyleColor(2);
+
+    // Cancel — neutral button fill, error-red on hover.
+    ImGui::SetCursorScreenPos(ImVec2(x0 + btnW + gap, y0));
+    ImGui::PushStyleColor(ImGuiCol_Button,
+        ImVec4(pal.button[0], pal.button[1], pal.button[2], 0.90f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+        ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], pal.statusErr[3]));
+    {
+        IconUV cancelIc = getIcon("cancel_x", 20);
+        if (cancelIc.valid) {
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                ImVec2((btnW - icSz) * 0.5f, (btnH - icSz) * 0.5f));
+            cancel = ImGui::ImageButton("##pm_cancel", cancelIc.texId, ImVec2(icSz, icSz),
+                                        cancelIc.uv0, cancelIc.uv1);
+            ImGui::PopStyleVar();
+        } else {
+            cancel = ImGui::Button("X##pm", ImVec2(btnW, btnH));
+        }
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cancel (Esc)");
+    ImGui::PopStyleColor(2);
+
+    ImGui::PopID();
+    ImGui::SetCursorScreenPos(savedCur);   // restore the caller's layout flow
+
+    if (ok)     commit(st);
+    else if (cancel) cancelEdits(st);
+    return clusterW;
+}
+
 // Wave 1D: standalone wrapper — owns the FeatureManager-slot Begin/End plus the C37-F floating
 // fallback, then defers the form content to drawBody(). The Wave 1D tabbed left pane calls
 // drawBody() directly inside its "LeftPane" container child (no separate window).
@@ -2273,11 +2345,6 @@ void PropertyManager::drawBody(AppState& st) {
         const float hdrPadH   = 10.0f * S;
         const float accentBarW = 4.0f * S;
         const float rowAvail  = std::max(1.0f, ImGui::GetContentRegionAvail().x);
-        float btnW            = 26.0f * S;
-        const float gap       = 6.0f * S;
-        if (btnW * 2.0f + gap > rowAvail - 50.0f * S)
-            btnW = std::max(16.0f * S, (rowAvail - 50.0f * S - gap) * 0.5f);
-        const float actionW   = btnW * 2.0f + gap;
         const float hdrH      = glyphSz + hdrPadV * 2.0f;
 
         // Mode-aware icon: use the cut variant for boss/cut operations when mode_ is "cut".
@@ -2320,47 +2387,11 @@ void PropertyManager::drawBody(AppState& st) {
         ImGui::TextUnformatted(title_.c_str());
         ImGui::PopStyleColor();
 
-        // OK / Cancel — right-aligned within the glass header row.
-        float okX = hdrMin.x + rowAvail - actionW - hdrPadH;
-        float okY = hdrMin.y + (hdrH - btnW) * 0.5f;
-        ImGui::SetCursorScreenPos(ImVec2(okX, okY));
-
-        // Palette-role confirm button (statusOk adapts to the light theme; no baked greens).
-        ImGui::PushStyleColor(ImGuiCol_Button,
-            ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 0.85f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-            ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 1.0f));
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * S, 4.0f * S));
-        {
-            IconUV okIc = getIcon("ok_badge", 20);
-            if (okIc.valid)
-                ok = ImGui::ImageButton("##pm_ok", okIc.texId,
-                         ImVec2(btnW - 8.0f * S, btnW - 8.0f * S), okIc.uv0, okIc.uv1);
-            else
-                ok = ImGui::Button("OK##pm", ImVec2(btnW, btnW));
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("OK (Enter)");
-        ImGui::PopStyleVar();
-        ImGui::PopStyleColor(2);
-
-        ImGui::SameLine(0, gap);
-
-        ImGui::PushStyleColor(ImGuiCol_Button,
-            ImVec4(pal.button[0], pal.button[1], pal.button[2], 0.9f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-            ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], pal.statusErr[3]));
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * S, 4.0f * S));
-        {
-            IconUV cancelIc = getIcon("error_badge", 20);
-            if (cancelIc.valid)
-                cancel = cancel || ImGui::ImageButton("##pm_cancel", cancelIc.texId,
-                             ImVec2(btnW - 8.0f * S, btnW - 8.0f * S), cancelIc.uv0, cancelIc.uv1);
-            else
-                cancel = cancel || ImGui::Button("X##pm", ImVec2(btnW, btnW));
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cancel (Esc)");
-        ImGui::PopStyleVar();
-        ImGui::PopStyleColor(2);
+        // T-G19: OK / Cancel buttons no longer live in this in-PM header strip. Per Erik's round-1
+        // walkthrough they were relocated ABOVE the PM — into the left-pane top row, between the
+        // Configurations tab and the collapse chevron — and are rendered by drawChromeButtons(),
+        // which layout.cpp calls from that row while a form is active. The keyboard Enter/Esc commit
+        // path (below) is unchanged and still drives commit()/cancelEdits() directly.
 
         // Resume layout below the glass header strip.
         ImGui::SetCursorScreenPos(ImVec2(hdrMin.x, hdrMax.y + 4.0f * S));

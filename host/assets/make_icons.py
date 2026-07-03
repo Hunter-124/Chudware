@@ -2001,15 +2001,21 @@ def draw_orientation(d, cell, p):
 
 @icon("ok_check")
 def draw_ok_check(d, cell, p):
+    # T-G19: bold WHITE checkmark for the relocated PropertyManager OK button. The button supplies a
+    # saturated statusOk-green fill in BOTH themes, so a white glyph reads cleanly on light + dark
+    # (the old p.ok-green check was near-invisible on a green pill). Larger + thicker than before so
+    # it stays legible in the wider chrome button.
     s = cell * SS
-    lw = stroke_width(cell) * 2
-    check_mark(d, s/2, s/2, s*0.32, p.ok, lw)
+    lw = max(2, int(round(stroke_width(cell) * 2.6)))
+    check_mark(d, s * 0.5, s * 0.54, s * 0.40, (255, 255, 255), lw)
 
 @icon("cancel_x")
 def draw_cancel_x(d, cell, p):
+    # T-G19: bold WHITE X for the relocated PropertyManager Cancel button (the button fill supplies
+    # the red — neutral at rest, statusErr on hover). White reads on both themes.
     s = cell * SS
-    lw = stroke_width(cell) * 2
-    x_sign(d, s/2, s/2, s*0.32, p.err, lw)
+    lw = max(2, int(round(stroke_width(cell) * 2.6)))
+    x_sign(d, s * 0.5, s * 0.5, s * 0.36, (255, 255, 255), lw)
 
 @icon("settings")
 def draw_settings(d, cell, p):

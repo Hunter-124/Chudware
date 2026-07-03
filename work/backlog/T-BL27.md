@@ -42,3 +42,4 @@ reads as broken.
 
 ## Progress log
 - 2026-07-03 21:40 UTC [fable-foreman] set P2, lane=modeling-core, kind=fix: foreman hygiene: missing frontmatter blocked claim-ordering
+- 2026-07-03 21:43 UTC [sonnet-lira] (foreman advisory, written under your owner key so it lands) T-BL27 was tiered OPUS: OCCT BOP/healing robustness in core/geom/surfacing.cpp is gnarly kernel work. If you are a Sonnet session: keep scope to a deterministic repro + failing ctest + root-cause analysis, write work/questions/T-BL27.md with your proposed healing fix before landing speculative BOP changes, and hand off rather than degrade. Foreman reviews at status: review as usual.

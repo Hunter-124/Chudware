@@ -40,15 +40,22 @@ def test_legacy_dir_present_wins(paths_mod):
     assert (base / "AI-CAD").exists()
 
 
-def test_both_dirs_present_new_wins(paths_mod):
+def test_both_dirs_present_legacy_wins_without_marker(paths_mod):
+    # Hardened 2026-07-04: a bare ShopCraft dir (no config.json install marker)
+    # must NOT steal the root from live legacy data — stray cache dirs happen.
     paths, base = paths_mod
     (base / "AI-CAD").mkdir()
     (base / "ShopCraft").mkdir()
     importlib.reload(paths)
-    assert paths.ROOT == base / "ShopCraft"
-    # Legacy dir untouched.
-    assert (base / "AI-CAD").exists()
+    assert paths.ROOT == base / "AI-CAD"
 
+def test_both_dirs_present_new_wins_with_marker(paths_mod):
+    paths, base = paths_mod
+    (base / "AI-CAD").mkdir()
+    (base / "ShopCraft").mkdir()
+    (base / "ShopCraft" / "config.json").write_text("{}")
+    importlib.reload(paths)
+    assert paths.ROOT == base / "ShopCraft"
 
 def test_data_roots_order_and_legacy_never_deleted(paths_mod):
     paths, base = paths_mod

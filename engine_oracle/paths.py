@@ -72,7 +72,12 @@ def active_root() -> Path:
     """
     new = appdata_root()
     legacy = appdata_root_legacy()
-    if not new.exists() and legacy.exists():
+    # Legacy wins whenever it exists and the new dir holds no REAL install
+    # (config.json marker) — a stray empty/cache-only ShopCraft dir created by one
+    # process must not flip the root away from the live AI-CAD data (2026-07-04:
+    # exactly that split-brain put autosaves/handoff in a fresh ShopCraft dir
+    # while the venv/config stayed in AI-CAD).
+    if legacy.exists() and not (new / "config.json").exists():
         return legacy
     return new
 

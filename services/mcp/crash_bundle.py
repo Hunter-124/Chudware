@@ -43,7 +43,7 @@ def _crash_dir() -> Path:
     else:
         try:
             from engine import paths as _paths
-            d = _paths.appdata_root() / "crashes"
+            d = _paths.ROOT / "crashes"  # alias-aware root, not the always-new dir
         except Exception:
             d = Path(os.environ.get("APPDATA") or "/tmp") / "AI-CAD" / "crashes"
     d.mkdir(parents=True, exist_ok=True)

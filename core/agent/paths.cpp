@@ -36,7 +36,10 @@ fs::path pick_app_dir(const fs::path& base) {
     const fs::path neu = base / "ShopCraft";
     const fs::path legacy = base / "AI-CAD";
     std::error_code ec;
-    if (!fs::exists(neu, ec) && fs::exists(legacy, ec)) return legacy;
+    // Legacy wins whenever it exists and the new dir holds no real install marker
+    // (config.json) — a stray cache-only ShopCraft dir must not flip the root
+    // (mirrors engine/paths.py active_root(), hardened 2026-07-04).
+    if (fs::exists(legacy, ec) && !fs::exists(neu / "config.json", ec)) return legacy;
     return neu;
 }
 }  // namespace

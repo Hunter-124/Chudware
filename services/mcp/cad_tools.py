@@ -270,7 +270,7 @@ def _autosave_dir() -> Path:
     else:
         try:
             from engine import paths as _paths  # noqa: PLC0415
-            d = _paths.appdata_root() / "mcp_autosave"
+            d = _paths.ROOT / "mcp_autosave"  # alias-aware root, not the always-new dir
         except Exception:  # noqa: BLE001
             d = Path(tempfile.gettempdir()) / "AI-CAD" / "mcp_autosave"
     d.mkdir(parents=True, exist_ok=True)

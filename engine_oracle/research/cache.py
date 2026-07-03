@@ -37,7 +37,7 @@ def knowledge_root() -> Path:
         return Path(override)
     from engine import paths
 
-    return paths.appdata_root() / "knowledge"
+    return paths.ROOT / "knowledge"  # alias-aware root, not the always-new dir
 
 
 def _key(url: str, variant: str = "") -> str:

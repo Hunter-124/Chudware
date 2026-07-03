@@ -1461,6 +1461,15 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // 8=Surfaces .. 11=Appearance 12=Manufacture) for headless per-tab verification.
     if (st.wantRibbon) {
         st.showRibbon = true; st.ribbonTab = AppState::RT_Features;
+        // T-BL31 NEW-3: the ShopCraft on-load toast pins over the ribbon's top-left and occluded
+        // icon verification (weld_gusset, appr_mat_aluminum/steel in the T-G12 round-2 walkthrough).
+        // Suppress toasts for per-tab ribbon captures by default; AI_CAD_SHOT_KEEPTOAST=1 re-enables
+        // them (for verifying the toast's own position/theming against the ribbon).
+        if (!(std::getenv("AI_CAD_SHOT_KEEPTOAST") && *std::getenv("AI_CAD_SHOT_KEEPTOAST")))
+            st.suppressToasts = true;
+        else
+            st.toast(ui::ToastLevel::Info,
+                     "ShopCraft: live view of the AI's part — it updates as it builds");
         if (const char* tabEnv = std::getenv("AI_CAD_TAB")) {
             int t = std::atoi(tabEnv);
             if (t >= 0 && t <= AppState::RT_Manufacture) st.ribbonTab = t;

@@ -15,6 +15,7 @@
 
 #include "../core/app_state.h"
 #include "../ui_theme.h"
+#include "layout.h"  // ui::overlayBand — anchor below the REAL ribbon bottom, not a guessed inset
 
 namespace ui {
 
@@ -50,12 +51,16 @@ void drawToasts(AppState& st) {
     const float scale = ui::uiScale;
 
     // Anchor top-LEFT of the main viewport (toasts float over everything, SolidWorks-style).
-    // A modest inset from the left edge and below the title/ribbon area.
+    // A modest inset from the left edge, below the REAL ribbon bottom (T-BL31 NEW-3: a fixed
+    // 64dp guess undershot the ribbon's actual height and pinned the card over its leftmost
+    // groups). overlayBand().minY is the same ribbon-bottom Y the FeatureManager/Copilot columns
+    // already anchor to; fall back to a modest fixed inset for the pre-publish first frame.
     ImGuiViewport* vp = ImGui::GetMainViewport();
     const float pad     = 12.0f * scale;
     const float toastW  = 320.0f * scale;
     const float rowGap  = 8.0f * scale;
-    const float topInset = 64.0f * scale;  // clear the title bar + ribbon
+    const ui::OverlayBand& band = ui::overlayBand();
+    const float topInset = band.valid ? (band.minY - vp->Pos.y) + 8.0f * scale : 64.0f * scale;
     float x = vp->Pos.x + pad;
     float y = vp->Pos.y + topInset;
 

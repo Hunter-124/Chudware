@@ -3521,6 +3521,16 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     const ImU32 leaderCol = ImGui::ColorConvertFloat4ToU32(
                         ImVec4(vpal.accent[0], vpal.accent[1], vpal.accent[2], 0.8f));
                     const ImU32 chipBord = ui::Palette::toU32(vpal.accent);
+                    // Dodge the pinned Copilot column the same way the HUD pick-status readout
+                    // (above) and viewport toolbar do — the viewport rect spans full width under
+                    // the pinned glass columns, so clamping to cr1.x alone lets these chips render
+                    // behind the Copilot pane (T-BL31 NEW-1: reproduced with a real extrude PM —
+                    // "Depth"/"Draft angle" chips bled behind the Copilot header).
+                    float rightBound = cr1.x;
+                    {
+                        const float e = ui::overlayColumnEdge(1);
+                        if (e > cr0.x + 80.0f * sc && e < cr1.x) rightBound = e;
+                    }
                     // Limit to ~3 chips; stagger vertically so anchored chips don't overlap.
                     int shown = 0, anchoredRow = 0, dockRow = 0;
                     for (const auto& ci : items) {
@@ -3541,13 +3551,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             drawLeader = true;
                             ++anchoredRow;
                         } else {
-                            // No geometry: dock top-right, under the HUD pick readout.
-                            chipTL = ImVec2(cr1.x - cw - 12.0f * sc,
+                            // No geometry: dock top-right (below the HUD pick readout), inset from
+                            // the Copilot column edge rather than the raw viewport edge.
+                            chipTL = ImVec2(rightBound - cw - 12.0f * sc,
                                             cr0.y + 44.0f * sc + dockRow * (ch + 6.0f * sc));
                             ++dockRow;
                         }
-                        // Clamp the chip inside the viewport rect.
-                        if (chipTL.x + cw > cr1.x - 4) chipTL.x = cr1.x - cw - 4;
+                        // Clamp the chip inside the viewport rect, dodging the Copilot column.
+                        if (chipTL.x + cw > rightBound - 4) chipTL.x = rightBound - cw - 4;
                         if (chipTL.x < cr0.x + 4)       chipTL.x = cr0.x + 4;
                         if (chipTL.y + ch > cr1.y - 4) chipTL.y = cr1.y - ch - 4;
                         if (chipTL.y < cr0.y + 4)       chipTL.y = cr0.y + 4;

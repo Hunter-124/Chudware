@@ -488,6 +488,7 @@ void AppState::pushRecentFile(const std::string& path) {
 // reach ImGui's clock from here cheaply), so we leave born=0 and let drawToasts stamp it.
 // C39: thread-safe — the worker errorSink calls this from background threads.
 void AppState::toast(ui::ToastLevel level, std::string msg) {
+    if (suppressToasts) return;
     ui::Toast t;
     t.level = level;
     t.msg = std::move(msg);

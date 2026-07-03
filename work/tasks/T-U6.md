@@ -2,8 +2,8 @@
 id: T-U6
 title: Simulation studies manager — study list, results, convergence caveats
 workstream: U
-owner: unassigned
-status: todo
+owner: sonnet-finch
+status: doing
 branch: task/T-U6-ui
 day: 6
 priority: 4

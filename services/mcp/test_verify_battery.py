@@ -255,6 +255,144 @@ def test_verify_overhead_under_50ms(monkeypatch):
     assert result["elapsed_ms"] < 50.0
 
 
+# ── T-BL23: CAM scoring keys (machined_fraction + gouges) ───────────────────
+
+def test_extract_score_machined_fraction_clean():
+    """machined_fraction 0..1 maps 1:1 when gouges==0."""
+    from services.verify.battery import _extract_score
+    score, findings = _extract_score(
+        "cam_simulate", "scalar",
+        json.dumps({"ok": True, "machined_fraction": 0.92, "gouges": 0}))
+    assert score == pytest.approx(0.92)
+    assert findings == []
+
+
+def test_extract_score_machined_fraction_gouge_gates_to_zero():
+    """Any gouge forces score=0.0 even when machined_fraction is high (T-BL23 DoD item 2)."""
+    from services.verify.battery import _extract_score
+    score, findings = _extract_score(
+        "cam_simulate", "scalar",
+        json.dumps({"ok": True, "machined_fraction": 0.96, "gouges": 1,
+                    "max_gouge_mm": 0.35}))
+    assert score == 0.0
+    assert len(findings) == 1
+    assert findings[0]["check"] == "cam_simulate"
+    assert "gouge" in findings[0]["detail"].lower()
+    assert "1" in findings[0]["detail"]  # gouge count surfaced
+
+
+def test_extract_score_multiple_gouges_surfaced():
+    """Gouge count is surfaced in the finding detail string."""
+    from services.verify.battery import _extract_score
+    score, findings = _extract_score(
+        "cam_simulate", "scalar",
+        json.dumps({"ok": False, "machined_fraction": 0.75, "gouges": 3,
+                    "max_gouge_mm": 1.2}))
+    assert score == 0.0
+    assert "3" in findings[0]["detail"]
+
+
+def test_extract_score_zero_gouges_uses_machined_fraction():
+    """Explicit gouges=0 still falls through to machined_fraction (not bare ok fallback)."""
+    from services.verify.battery import _extract_score
+    score, findings = _extract_score(
+        "cam_simulate", "scalar",
+        json.dumps({"ok": True, "machined_fraction": 0.55, "gouges": 0}))
+    assert score == pytest.approx(0.55)
+    assert findings == []
+
+
+def test_extract_score_no_gouges_key_falls_through():
+    """When gouges key is absent, machined_fraction is still recognized."""
+    from services.verify.battery import _extract_score
+    score, findings = _extract_score(
+        "cam_simulate", "scalar",
+        json.dumps({"ok": True, "machined_fraction": 0.88}))
+    assert score == pytest.approx(0.88)
+
+
+# ── T-BL23: _gap_is_manifold issues-list fix ─────────────────────────────────
+
+def test_gap_is_manifold_issues_free_edges_fails(monkeypatch):
+    """A free_edges issue in the issues list → non-manifold (not watertight)."""
+    import services.verify.battery as bat
+
+    def fake_cb_call(op, args):
+        return {"issues": [{"kind": "free_edges", "severity": "error", "count": 4}],
+                "tiny_edges": 0}
+
+    import mcp_server.core_bridge as cb
+    monkeypatch.setattr(cb, "call", fake_cb_call)
+
+    r = json.loads(bat._gap_is_manifold(doc_id="fake"))
+    assert r["ok"] is False
+    assert r["free_edges"] == 1  # one free_edges issue entry
+    assert "not watertight" in r["summary"]
+
+
+def test_gap_is_manifold_tiny_edges_only_is_manifold(monkeypatch):
+    """tiny_edges warnings alone (curved seam/pole) do NOT fail manifold (T-BL19 finding)."""
+    import services.verify.battery as bat
+
+    def fake_cb_call(op, args):
+        return {"issues": [{"kind": "tiny_edges", "severity": "warning", "count": 2}],
+                "tiny_edges": 2}
+
+    import mcp_server.core_bridge as cb
+    monkeypatch.setattr(cb, "call", fake_cb_call)
+
+    r = json.loads(bat._gap_is_manifold(doc_id="fake"))
+    assert r["ok"] is True
+    assert r["free_edges"] == 0
+    assert r["summary"] == "manifold"
+
+
+def test_gap_is_manifold_no_issues_scalar_fallback_manifold(monkeypatch):
+    """Empty issues list + free_edges==0 scalar → manifold (scalar fallback path)."""
+    import services.verify.battery as bat
+
+    def fake_cb_call(op, args):
+        return {"issues": [], "free_edges": 0, "tiny_edges": 0}
+
+    import mcp_server.core_bridge as cb
+    monkeypatch.setattr(cb, "call", fake_cb_call)
+
+    r = json.loads(bat._gap_is_manifold(doc_id="fake"))
+    assert r["ok"] is True
+
+
+def test_gap_is_manifold_no_issues_scalar_fallback_non_manifold(monkeypatch):
+    """Empty issues list + free_edges>0 scalar → non-manifold (scalar fallback path)."""
+    import services.verify.battery as bat
+
+    def fake_cb_call(op, args):
+        return {"issues": [], "free_edges": 4, "tiny_edges": 0}
+
+    import mcp_server.core_bridge as cb
+    monkeypatch.setattr(cb, "call", fake_cb_call)
+
+    r = json.loads(bat._gap_is_manifold(doc_id="fake"))
+    assert r["ok"] is False
+    assert r["free_edges"] == 4
+
+
+def test_gap_is_manifold_error_severity_fails(monkeypatch):
+    """Any issue with severity==error → non-manifold, even if kind is not free_edges."""
+    import services.verify.battery as bat
+
+    def fake_cb_call(op, args):
+        return {"issues": [{"kind": "invalid_face", "severity": "error"}],
+                "tiny_edges": 0}
+
+    import mcp_server.core_bridge as cb
+    monkeypatch.setattr(cb, "call", fake_cb_call)
+
+    r = json.loads(bat._gap_is_manifold(doc_id="fake"))
+    assert r["ok"] is False
+
+
+
+
 # ── _gap_eval_check_direct issues-list fix (same latent bug T-BL23 fixed in
 #    _gap_is_manifold: eval_check emits an `issues` list, not bare scalars) ──
 

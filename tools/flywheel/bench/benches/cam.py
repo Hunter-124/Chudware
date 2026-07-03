@@ -6,19 +6,14 @@ much material it removed — a high `machined_fraction` never masks a gouge. Oth
 score is the raw `machined_fraction` (0..1), and `passed` additionally requires clearing a
 completion bar (`machined_fraction >= TARGET_FRACTION`, default 0.90).
 
-Substrate ruling (work/questions/T-H8.md Q1, non-blocking, proceeding on the recommended
-answer): the T-H4 verifier battery (`services/verify/battery.py`) is a thin dispatcher
-whose generic `_extract_score` only recognizes `match_pct/score/min_fos/cd/
-max_von_mises_mpa/coverage_ratio` — it does not know `machined_fraction` or `gouges`, so
-running `cam_simulate` only through the battery silently degrades to a bare pass/fail `ok`
-and throws away the two numbers this bench is defined on. So this bench reads
-`cam_simulate`'s RAW result directly for its numbers (`sim["results"][i]`, exact field
-names: `ok, error, removed_volume_mm3, remaining_volume_mm3, stock_volume_mm3,
-machined_fraction, cycle_time_s, gouges, max_gouge_mm, rapid_collisions, warnings`), and
-separately records the battery's own `cam_simulate` check score (a bare 0/1) alongside as
-the through-battery signal (`detail["battery_cam_simulate"]`), for CI/gate comparability.
-`services/verify/battery.py` is NOT modified by this bench — extending `_extract_score` to
-understand CAM's scalar fields is a T-H4 follow-up, filed but out of scope here.
+Battery path (T-BL23): `_extract_score` now recognises `machined_fraction` (scalar) and
+treats `gouges` as a binary-safety pre-gate (any gouge → score 0.0, count surfaced in
+findings). This bench routes its score computation through `battery._extract_score` directly
+so the battery path and the raw-result path produce identical verdicts on every fixture.
+The raw `cam_simulate` result is still read for diagnostics (`detail` fields, aggregates,
+ROC labels) — only the *score* derivation delegates to the battery function.
+The `battery_cam_simulate` detail field (through-battery check score from `verify()`) is
+still populated in live mode for CI/gate comparability.
 
 Two evaluation paths:
   * fixture mode (offline, default, no core needed): each committed job fixture under
@@ -51,6 +46,7 @@ from ..baseline import Baseline, pending_frontier
 from ..dataset import DatasetSpec
 from ..metrics import mean, pass_rate, roc_auc, residual as residual_metric
 from ..schema import BenchResult, ExampleScore
+from services.verify.battery import _extract_score as _battery_extract_score
 
 TARGET_FRACTION = 0.90  # survey §6 CAM success bar: gouge-free AND machined_fraction >= this
 
@@ -161,8 +157,12 @@ def score_example(fixture: dict, *, live_sim: Optional[LiveSim] = None,
     machined_fraction = float(raw.get("machined_fraction", 0.0))
     gouge_free = gouges == 0
 
-    # a gouge is a hard fail: never let a high machined_fraction mask it.
-    score = machined_fraction if gouge_free else 0.0
+    # Route score derivation through the battery's _extract_score so this bench and
+    # any future battery consumer produce identical verdicts (T-BL23 DoD item 3).
+    # The gouge pre-gate in _extract_score ensures gouges > 0 → score 0.0 regardless
+    # of machined_fraction.  machined_fraction is a clean 0..1 scalar, so it maps 1:1.
+    score, _bat_findings = _battery_extract_score(
+        "cam_simulate", "scalar", json.dumps(raw))
     passed = bool(gouge_free and machined_fraction >= target)
 
     detail: dict[str, Any] = {

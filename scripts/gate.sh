@@ -422,6 +422,70 @@ stage_bench() {
     echo "  PASS"; tail -n 8 /tmp/gate_bench.out | sed 's/^/    /'
 }
 
+# ---- Stage 4.5: V&V benchmark smoke (T-BL01) --------------------------------
+# Optional, env-gated SKIP: runs the V&V benchmark harness in smoke mode
+# (pure-Python families only — no .so required for the smoke subset).
+# Default is SKIP (stays green) so the gate does not depend on external deps;
+# set AICAD_RUN_VV=smoke (or =full) to opt in.
+# - AICAD_RUN_VV=smoke  → pytest scripts/vv_benchmark.py::TestSmoke  (fast, no .so)
+# - AICAD_RUN_VV=full   → pytest scripts/vv_benchmark.py  (all suites, needs .so + deps)
+stage_vv() {
+    echo "=== [4.5/6] V&V benchmark smoke (T-BL01) ==="
+    if [ -z "${AICAD_RUN_VV:-}" ]; then
+        record "vv-bench (T-BL01)   SKIP    set AICAD_RUN_VV=smoke or =full to run V&V harness"
+        echo "  SKIP: AICAD_RUN_VV not set"
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        record "vv-bench (T-BL01)   SKIP    python3 not on PATH"
+        echo "  SKIP: python3 not installed"
+        return 0
+    fi
+
+    local mcp_venv="$HOME/.local/share/AI-CAD/mcp-venv/bin/python"
+    local venv_py=""
+    if [ -x "$mcp_venv" ] && "$mcp_venv" -m pytest --version >/dev/null 2>&1; then
+        venv_py="$mcp_venv"
+    else
+        venv_py="python3"
+    fi
+
+    # Wire AI_CAD_LIBAICAD if not set and the .so exists (for full mode)
+    local so_path="$REPO/core/build-linux/bin/libaicad.so"
+    if [ -z "${AI_CAD_LIBAICAD:-}" ] && [ -f "$so_path" ]; then
+        export AI_CAD_LIBAICAD="$so_path"
+    fi
+
+    local pytest_args=()
+    if [ "${AICAD_RUN_VV}" = "full" ]; then
+        pytest_args=("scripts/vv_benchmark.py")
+        echo "  mode: full (all V&V suites)"
+    else
+        pytest_args=("scripts/vv_benchmark.py::TestSmoke")
+        echo "  mode: smoke (pure-Python subset)"
+    fi
+
+    export AICAD_RUN_VV
+    if PYTHONPATH="$REPO:${PYTHONPATH:-}" "$venv_py" -m pytest \
+            "${pytest_args[@]}" -q --tb=short > /tmp/gate_vv.out 2>&1; then
+        local summary_line
+        summary_line="$(grep -E '[0-9]+ passed' /tmp/gate_vv.out | tail -1 || echo 'ok')"
+        record "vv-bench (T-BL01)   PASS    $summary_line"
+        echo "  PASS ($summary_line)"
+    else
+        local rc=$?
+        if [ "$rc" -eq 5 ]; then
+            record "vv-bench (T-BL01)   SKIP    no tests collected (check venv + deps)"
+            echo "  SKIP: no tests collected"
+        else
+            record "vv-bench (T-BL01)   FAIL    pytest exit $rc (see /tmp/gate_vv.out)"
+            echo "  FAIL: V&V suite (see /tmp/gate_vv.out):"
+            tail -n 15 /tmp/gate_vv.out | sed 's/^/    /'
+            fail_fatal=1
+        fi
+    fi
+}
+
 # ---- main -------------------------------------------------------------------
 CORE_BUILD_OK=0
 stage_check
@@ -431,6 +495,7 @@ stage_core_build
 stage_ui_abstract
 stage_ctest
 stage_pytest
+stage_vv
 stage_ui_imgui
 stage_bench
 

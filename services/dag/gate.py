@@ -25,6 +25,14 @@ from typing import Any, Optional
 
 from langgraph.types import interrupt
 
+# Interaction contract (contracts/interaction.md §5 replay, §7 events).
+# Lazy import at call time to keep gate.py importable without the full agent stack;
+# tests that mock run_gate() can inject a ledger directly.
+try:
+    from services.agent.interaction import FileLedger, MemoryLedger
+except ImportError:
+    from agent.interaction import FileLedger, MemoryLedger  # type: ignore
+
 # Local type aliases (avoid circular import with graph_loader).
 # DagState and EmitFn are also defined in graph_loader; use the same shapes.
 DagState = dict  # dict[str, Any]
@@ -103,11 +111,54 @@ def make_gate_payload(
     }
 
 
+def _record_gate_answer(ledger, question_id: str, raw_value: Any, decision_str: str) -> None:
+    """Persist the gate decision to the interaction ledger (contract §5).
+
+    Stores a boolean approval answer (kind=approval value shape) so replay logic
+    in both run_gate() and ask_user() can skip re-asking if the same gate question
+    id appears again (e.g. via intake tool or a second agent pass).
+    Best-effort: a ledger write failure must never block the gate.
+    """
+    import time as _time
+    try:
+        ledger.record_answer(question_id, {
+            "value": raw_value,
+            "source": "user",
+            "at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        })
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_UNKNOWN_RUN_ID = "unknown"
+
+
+def _gate_ledger(run_id: str, ledger=None):
+    """Return the interaction ledger for this run (injectable for tests).
+
+    Uses FileLedger (run-scoped JSONL) when run_id is a real id so gate answers
+    written by intake tools (via ask_user with scope='run') replay here without
+    re-asking.  Falls back to MemoryLedger when run_id is the 'unknown' sentinel
+    (state not yet populated) or when FileLedger init fails — so a transient
+    storage failure never blocks the gate, and cross-run contamination is avoided.
+    Pass a ledger directly in tests for hermeticity.
+    """
+    if ledger is not None:
+        return ledger
+    if not run_id or run_id == _UNKNOWN_RUN_ID:
+        return MemoryLedger()
+    try:
+        return FileLedger(run_id)
+    except Exception:  # noqa: BLE001 — never block the gate on a ledger init failure
+        return MemoryLedger()
+
+
 def run_gate(
     node: dict[str, Any],
     state: DagState,
     emit: EmitFn = None,
     autonomy: Optional[str] = None,
+    ledger=None,
 ) -> tuple[str, dict[str, Any]]:
     """Execute a gate check-point inline inside a node handler.
 
@@ -140,6 +191,30 @@ def run_gate(
 
     # Build the interaction payload (aicad.interaction/1 shape for T-F4 compat).
     payload = make_gate_payload(node, run_id, autonomy=autonomy)
+    question_id = payload["questions"][0]["id"]  # "gate.<node_id>"
+
+    # --- Ledger replay (contracts/interaction.md §5) ----------------------
+    # Before calling interrupt(), check whether this gate question was already
+    # answered in the run's interaction ledger (e.g. an intake tool recorded
+    # an approval for this gate id via ask_user(scope="run")).  If yes, skip
+    # the interrupt() entirely so the run never re-asks.
+    #
+    # This is approach (a) from work/questions/T-F4.md: an explicit replay-check
+    # here rather than wrapping interrupt() as an ask_user transport, which would
+    # risk re-entering _emit() and breaking the event-dedup contract (T-A3).
+    led = _gate_ledger(run_id, ledger)
+    prior = led.answered(question_id)
+    if prior is not None:
+        # Already answered — return the stored decision without suspending.
+        raw = prior.get("value")
+        if raw is None or raw is True or raw == DECISION_APPROVE:
+            return DECISION_APPROVE, {}
+        if raw is False or raw == DECISION_REJECT:
+            return DECISION_REJECT, {}
+        if isinstance(raw, dict) and raw.get("action") == "modify":
+            return "modify", {"user_output": raw.get("output", {})}
+        # Unknown stored value: fail closed.
+        return DECISION_REJECT, {}
 
     # --- LangGraph interrupt() -------------------------------------------
     # Empirically verified (LangGraph 1.2.7, 2026-07-02):
@@ -166,17 +241,22 @@ def run_gate(
     decision = interrupt(payload)
 
     # Normalise the decision.
+    import time as _time
     if decision is None or decision is True or decision == DECISION_APPROVE:
+        _record_gate_answer(led, question_id, True, DECISION_APPROVE)
         return DECISION_APPROVE, {}
     if decision is False or decision == DECISION_REJECT:
+        _record_gate_answer(led, question_id, False, DECISION_REJECT)
         return DECISION_REJECT, {}
     if isinstance(decision, dict) and decision.get("action") == "modify":
+        _record_gate_answer(led, question_id, decision, "modify")
         return "modify", {"user_output": decision.get("output", {})}
 
     # Unknown value — FAIL CLOSED.  This is a human-approval safety gate:
     # an unrecognised decision must never be treated as consent.  Reject
     # (the caller re-pauses the node) and keep the warning for diagnosis.
     import warnings
+    _record_gate_answer(led, question_id, decision, DECISION_REJECT)
     warnings.warn(
         f"Gate node {node_id!r}: unrecognised decision {decision!r}; "
         "treating as reject (fail-closed).",

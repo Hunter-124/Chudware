@@ -30,6 +30,50 @@ try:  # Vision is optional at runtime — a Pillow/module import hiccup must not
 except Exception:  # noqa: BLE001
     _vz = None
 
+# Interaction contract (contracts/interaction.md).  Lazy import: the mcp.server namespace
+# collision (T-V3) must not prevent process_profiles / intake from loading.  The ask_user
+# path is only exercised at call time via _ask_via_contract(), never at module import.
+def _ask_via_contract(questions: list, run_id: Optional[str], transport=None,
+                      ledger=None) -> dict:
+    """Route a batch of questions through the ONE interaction contract (§3 envelope).
+
+    This replaces bespoke Q/A plumbing in resolve_process (process clarification) and
+    confirm_dimensions (caliper demands).  Uses FileLedger(run_id) when run_id is
+    supplied so answers persist to the run ledger and replay on resume (§5 — a
+    dimension confirmed here is visible to a DAG gate for the same run_id, never re-asked).
+    Falls back to MemoryLedger when no run_id is available (doc-only sessions).
+
+    ``transport`` and ``ledger`` are injectable for tests (no live MCP client needed).
+    When ``transport`` is None and ``run_id`` is present the call is non-blocking so
+    the MCP tool does not stall: the questions are recorded and the suggested defaults
+    are auto-accepted, just like a non-interactive pipeline run.  The caller (MCP tool)
+    then returns the question payload to the user for the next turn.
+    """
+    try:
+        from services.agent.interaction import (
+            FileLedger, MemoryLedger, ask_user, make_batch)
+    except ImportError:
+        from agent.interaction import (  # type: ignore
+            FileLedger, MemoryLedger, ask_user, make_batch)
+
+    if ledger is None:
+        ledger = FileLedger(run_id) if run_id else MemoryLedger()
+
+    # Non-blocking: the MCP tool layer is multi-turn; it surfaces questions to the
+    # user and returns.  We record Q/A into the ledger so that if a later turn
+    # (or a DAG gate for the same run) re-encounters the same id, it replays from
+    # the ledger without re-asking.
+    return ask_user(
+        questions,
+        scope="run" if run_id else "doc",
+        run_id=run_id,
+        doc_id=None,
+        blocking=transport is not None,
+        transport=transport,
+        ledger=ledger,
+        autonomy="auto",   # auto-accept suggested defaults when no transport
+    )
+
 # doc["meta"] keys (persisted in the .step+).
 _K_PROCESS = "process"
 _K_MEASURED = "measured_parts"
@@ -154,17 +198,53 @@ def register_intake_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def resolve_process(request: str, material: Optional[str] = None,
-                        quantity: Optional[int] = None) -> str:
+                        quantity: Optional[int] = None,
+                        run_id: Optional[str] = None) -> str:
         """Decide the manufacturing process from the request (FDM 3D-printing is the default).
 
         Returns {chosen, confidence, runner_up, ambiguous, must_block, clarification, assumptions,
-        why}. If `ambiguous` is true, ASK the user the single `clarification` question before
-        building (e.g. sheet-metal vs CNC for a flat metal plate); otherwise proceed and record the
-        assumption. If `must_block` (e.g. metal asked of FDM), surface it — don't silently switch.
-        This drives the process-CLARIFY gate; bind the choice with set_process().
+        why, interaction?}. When `ambiguous` is true the tool routes the single clarification
+        question through the interaction contract (contracts/interaction.md) and returns an
+        `interaction` key with the question batch — the answer is recorded in the run ledger
+        (run_id) so a DAG gate for the same run never re-asks.  Pass run_id to enable cross-
+        mechanism replay; omit to use a session-local memory ledger.
+        Bind the resolved choice with set_process().
         """
         try:
-            return _dumps(pp.resolve_process(request, material=material, quantity=quantity))
+            resolution = pp.resolve_process(request, material=material, quantity=quantity)
+            result = dict(resolution)
+            clarification = resolution.get("clarification")
+            if clarification and resolution.get("ambiguous") and not resolution.get("must_block"):
+                # Route the clarification through the ONE interaction contract.
+                # The question key is stable (based on the runner_up pair) so the ledger
+                # can replay it on resume (contract §5).
+                runner_up = resolution.get("runner_up") or "alternative"
+                chosen = resolution.get("chosen", "fdm")
+                q_id = f"process.clarify.{chosen}_vs_{runner_up}"
+                questions = [{
+                    "id": q_id,
+                    "kind": "choice",
+                    "prompt": clarification,
+                    "suggested": chosen,
+                    "required": False,
+                    "why": resolution.get("why", "Process is ambiguous for this request."),
+                    "options": [
+                        {"value": chosen, "label": chosen},
+                        {"value": runner_up, "label": runner_up},
+                    ],
+                }]
+                answers = _ask_via_contract(questions, run_id=run_id)
+                answered_value = answers.get(q_id, {}).get("value")
+                if answered_value and answered_value != chosen:
+                    result["chosen"] = answered_value
+                result["interaction"] = {
+                    "schema": "aicad.interaction/1",
+                    "question_id": q_id,
+                    "question": clarification,
+                    "answered": answered_value,
+                    "source": answers.get(q_id, {}).get("source", "default"),
+                }
+            return _dumps(result)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -389,13 +469,18 @@ def register_intake_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def confirm_dimensions(confirmations: list, doc_id: Optional[str] = None) -> str:
+    def confirm_dimensions(confirmations: list, doc_id: Optional[str] = None,
+                           run_id: Optional[str] = None) -> str:
         """Close fit-critical demands with TYPED caliper values (the dims we refuse to guess).
 
         `confirmations`: [{key, value_mm}] — e.g. [{"key":"output_shaft.dia","value_mm":3.0},
         {"key":"mount_holes.spacing","value_mm":18.0}]. Marks each ledger row measured/given and
         returns what's still blocking + whether the critical-dim gate is now clear (so geometry can
         commit). Persists the updated ledger.
+
+        When `run_id` is supplied each confirmed dimension is ALSO recorded in the run-scoped
+        interaction ledger (contracts/interaction.md §5) so a DAG gate for the same run_id
+        never re-asks for these values.
         """
         try:
             d = _doc(doc_id)
@@ -406,6 +491,28 @@ def register_intake_tools(mcp: FastMCP) -> None:
                 ik.apply_confirmation(ledger, c.get("key"), c.get("value_mm"))
             _set(d, _K_LEDGER, ledger.to_dict())
             still = [r.key for r in ik.unresolved_critical(ledger)]
+
+            # Route each confirmed dimension through the interaction contract so that
+            # the answer is also persisted in the run ledger (if run_id supplied).
+            # This makes confirmed dims visible to DAG gates (cross-mechanism no-re-ask).
+            if run_id and confirmations:
+                questions = []
+                for c in confirmations:
+                    key = c.get("key")
+                    val_mm = c.get("value_mm")
+                    if key is not None and val_mm is not None:
+                        questions.append({
+                            "id": f"intake.dim.{key}",
+                            "kind": "dimension",
+                            "family": "length",
+                            "prompt": f"Caliper value for {key}?",
+                            "suggested": {"value": float(val_mm), "unit": "mm"},
+                            "required": False,
+                            "why": "Fit-critical dimension from caliper measurement.",
+                        })
+                if questions:
+                    _ask_via_contract(questions, run_id=run_id)
+
             return _dumps({"ok": True, "gate_ok": ik.gate_ok(ledger),
                            "still_blocking": still})
         except Exception as e:  # noqa: BLE001

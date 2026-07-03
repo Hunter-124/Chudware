@@ -15,6 +15,7 @@
 #include "ui/first_run.h"
 #include "ui/bom_panel.h"
 #include "ui/requirements_panel.h"  // T-U5 requirements & verification panel
+#include "ui/transparency_panel.h"  // T-U8 model & telemetry transparency panel
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -262,6 +263,20 @@ void Application::frame() {
                                  ImGuiCond_Appearing);
         if (ImGui::Begin("Requirements###requirements", ui::requirementsPanelOpen(), pflags))
             ui::drawRequirementsPanel(s);
+        ImGui::End();
+    }
+    // T-U8 Model & telemetry transparency panel — closable, screenshot-verifiable via
+    // AI_CAD_SHOT=transparency. Floats centered; zero footprint while closed.
+    // Exposes consent tier, which-brain, canary opt-in, and sidecar readout.
+    if (*ui::transparencyPanelOpen()) {
+        const ImGuiViewport* vp4 = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp4->WorkPos.x + vp4->WorkSize.x * 0.5f,
+                                       vp4->WorkPos.y + vp4->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(560.f * theme::S(), 540.f * theme::S()),
+                                 ImGuiCond_Appearing);
+        if (ImGui::Begin("Model & Telemetry###transparency", ui::transparencyPanelOpen(), pflags))
+            ui::drawTransparencyPanel(s);
         ImGui::End();
     }
 

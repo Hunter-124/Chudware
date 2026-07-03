@@ -12,6 +12,7 @@
 #include "ui/cam_panel.h"            // T-U3 CAM workspace (AI_CAD_SHOT=cam_workspace)
 #include "ui/bom_panel.h"
 #include "ui/requirements_panel.h"   // T-U5
+#include "ui/transparency_panel.h"   // T-U8
 #include "artifact_view.h"
 #include "app/app_state.h"
 #include "viewport/scene.h"
@@ -227,6 +228,7 @@ int ShotConfig::captureFrameBudget() const {
     if (wantEcad && !ecadShotDone) return 150;
     if (wantBom && !bomShotDone) return 150;
     if (wantRequirements && !requirementsShotDone) return 150;  // T-U5
+    if (wantTransparency && !transparencyShotDone) return 150;  // T-U8
     if (wantTree) return treeShotDone ? 10 : 30;
     if (wantEquations) return equationsShotDone ? 10 : 30;
     if (wantPartsBrowser) return partsBrowserShotDone ? 10 : 30;
@@ -275,6 +277,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantPartsBrowser  = eq("parts_browser");
     cfg.wantBom          = eq("bom");
     cfg.wantRequirements = eq("requirements");   // T-U5
+    cfg.wantTransparency = eq("transparency");   // T-U8
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
@@ -323,6 +326,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantCamWorkspace) ui::openCamWorkspacePanel();
     if (cfg.wantBom)          ui::openBomPanel();
     if (cfg.wantRequirements) ui::openRequirementsPanel();  // T-U5
+    if (cfg.wantTransparency) ui::openTransparencyPanel();  // T-U8
     if (cfg.wantPick) setupPickShot(st);
     if (cfg.wantGlassperf) setupPickShot(st);
 
@@ -583,6 +587,57 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
             })json";
             ui::seedRequirementsPanelFromJson(fixture);
             std::printf("requirements: fixture seeded (live unavailable: %s)\n", err.c_str());
+        }
+        std::fflush(stdout);
+    }
+
+    // T-U8 Model & telemetry transparency panel.
+    // Tries a live serving_status RPC; falls back to a fixture that exercises every
+    // rendering branch: two routes (one stable, one canary), honest "not-opted-in"
+    // canary state, and real sidecar dir scan.
+    if (cfg.wantTransparency && !cfg.transparencyShotDone) {
+        cfg.transparencyShotDone = true;
+        nlohmann::json res;
+        std::string err;
+        bool liveOk = st.worker.call("serving_status", nlohmann::json::object(),
+                                     res, err, 5000);
+        if (liveOk && res.value("ok", false) &&
+                res.contains("routes") && res["routes"].is_array()) {
+            ui::seedTransparencyPanelForShot(res.dump());
+            std::printf("transparency: live serving_status ok (%d routes)\n",
+                        (int)res["routes"].size());
+        } else {
+            // Fixture: one stable route + one canary route, user not opted in.
+            // Exercises which-brain table, canary section, and the "not opted in"
+            // honest state.  Sidecar dirs are scanned from the real filesystem.
+            const std::string fixture = R"json({
+                "ok": true,
+                "routes": [
+                    {
+                        "insertion_point": "copilot",
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "adapter_version": "",
+                        "canary_pct": 0,
+                        "opt_in_count": 0,
+                        "opt_in": [],
+                        "fallback": {"mode": "none", "provider": "", "model": ""}
+                    },
+                    {
+                        "insertion_point": "reviewer",
+                        "provider": "vllm",
+                        "model": "Qwen3-4B",
+                        "adapter_version": "v0.2.1",
+                        "canary_pct": 15,
+                        "opt_in_count": 3,
+                        "opt_in": [],
+                        "fallback": {"mode": "provider", "provider": "openai", "model": "gpt-4o"}
+                    }
+                ]
+            })json";
+            ui::seedTransparencyPanelForShot(fixture);
+            std::printf("transparency: fixture seeded (live unavailable: %s)\n",
+                        err.c_str());
         }
         std::fflush(stdout);
     }

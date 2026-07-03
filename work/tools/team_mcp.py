@@ -26,8 +26,10 @@ PROTOCOL_FALLBACK = "2025-06-18"
 SERVER_INFO = {"name": "aicad-team", "version": "1.0.0"}
 
 COORD_RULES = (
-    "Coordination rules: call whoami(name=...) once per machine so owner/agent "
-    "params can be omitted afterward. Claim work ONLY via claim() (kind='task'|"
+    "Coordination rules: call whoami(github='your-username') once per checkout — it "
+    "stores a gitignored identity (work/sync/identity.json) that becomes the default "
+    "owner + commit author for your board changes, and powers my_work (what's waiting "
+    "on you). owner/agent params can then be omitted. Claim work ONLY via claim() (kind='task'|"
     "'issue') — atomic, the only legitimate way in; legacy work_claim/issue_claim "
     "still work and route to the same place. Before fixing any bug, run issue_list "
     "and claim(kind='issue', id=N) it so fixes never overlap. Post note() on "
@@ -140,11 +142,20 @@ S = {"type": "string"}
 KIND = {"type": "string", "enum": ["task", "issue"]}
 TOOLS = [
     T("whoami",
-      "Get or set your persistent identity for this machine (stored in "
-      "work/sync/.identity). Set it once per session/machine and every other tool's "
-      "owner/agent/from_agent param can be omitted afterward — removes typo-prone "
-      "repeated free-text names. Call with no args to check what's currently set.",
-      {"name": S}),
+      "Get or set your identity for this checkout (stored gitignored in "
+      "work/sync/identity.json). A human contributor is identified by their GitHub "
+      "username: pass github=... once (auto-detected from `gh`/`git config` if you "
+      "call with no args) and it becomes the default owner + commit author for your "
+      "board changes, and drives my_work. name=/email= set commit-authorship fields; "
+      "name= alone (no github) sets an ephemeral agent working-name for autonomous "
+      "drivers. Call with no args to see/auto-detect what's set.",
+      {"github": S, "name": S, "email": S}),
+    T("my_work",
+      "What's on YOUR plate right now, by your stored identity (or pass owner=): "
+      "tasks you're mid-way through, your branches awaiting a human merge, and "
+      "anything of yours that's blocked. Call this when you sit down to see what's "
+      "waiting for you.",
+      {"owner": S}),
     T("claim",
       "Atomically claim a task or GitHub issue — the ONLY legitimate way to take "
       "either kind of work; same double-claim protection either way. "
@@ -368,11 +379,30 @@ def call_tool(name, a):
     _heartbeat_async(who, name)
 
     if name == "whoami":
+        fields = {}
+        if a.get("github"):
+            fields["github_user"] = a["github"]
+        if a.get("email"):
+            fields["git_email"] = a["email"]
+        # name= with github/email present is the display name; name= alone is the
+        # legacy ephemeral agent working-name.
         if a.get("name"):
-            _teamlib.set_identity(a["name"])
-            return f"identity set: {a['name']}"
-        cur = _teamlib.get_identity()
-        return f"current identity: {cur}" if cur else "no identity set — call whoami(name=...) once"
+            fields["display_name" if (a.get("github") or a.get("email")) else "agent_name"] = a["name"]
+        if fields:
+            _teamlib.set_profile(**fields)
+        prof = _teamlib.resolve_and_store(a.get("github"))
+        if not prof:
+            return "no identity set — call whoami(github='your-username') once"
+        lines = [f"github:  {prof.get('github_user', '(unknown — pass github=)')}",
+                 f"name:    {prof.get('display_name', '(unset)')}",
+                 f"email:   {prof.get('git_email', '(unset — uses machine git identity)')}"]
+        if prof.get("agent_name"):
+            lines.append(f"agent:   {prof['agent_name']} (autonomous working-name)")
+        lines.append("board changes commit as: "
+                     + ("this identity" if prof.get("git_email") else "the machine git identity"))
+        return "\n".join(lines)
+    if name == "my_work":
+        return _work("mine", *(["--owner", a["owner"]] if a.get("owner") else []))[0]
     if name == "claim":
         return _unified_claim(a)
     if name == "release":
@@ -520,9 +550,13 @@ def main():
                 "serverInfo": SERVER_INFO,
                 "instructions": (
                     "AI-CAD team coordination server. Full policy: work/WORKFLOW.md. "
-                    "WHEN COMING ONLINE: run work_roadblocks first — it surfaces the "
-                    "human-attention queue (review tasks awaiting merge, blocked tasks, "
-                    "open questions) and is the fastest way to unblock other agents. "
+                    "IDENTITY: call whoami(github='your-username') once per checkout — "
+                    "stored gitignored (work/sync/identity.json), it becomes the default "
+                    "owner + git commit-author for your board changes and drives my_work. "
+                    "WHEN COMING ONLINE: run my_work to see what's waiting on YOU, then "
+                    "work_roadblocks — it surfaces the whole human-attention queue "
+                    "(review tasks awaiting merge, blocked tasks, open questions) and is "
+                    "the fastest way to unblock other agents. "
                     "Then work_board for full situational awareness. "
                     "LANES: tasks belong to a user-facing feature area (lane): "
                     "modeling-core, assemblies-drawings, cam, ecad-firmware, simulation, "

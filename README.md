@@ -46,6 +46,12 @@ graphify .                               # once; `graphify hook install` keeps i
 # 2. Register the team-coordination MCP server (Claude Code CLI + Claude Desktop)
 python3 work/tools/setup_team_tools.py   # then approve the one-time trust prompt in `claude`
 
+# 2a. Tell the tooling who you are (once) — GitHub username, auto-filled from gh/git
+python3 work/tools/work.py whoami --github <your-username>   # or whoami(github=...) via MCP
+#   stored gitignored in work/sync/identity.json; becomes your default task owner + the
+#   author of your board commits (via per-commit env, never `git config`) and powers
+#   `work.py mine` / the my_work MCP tool ("what's waiting on me")
+
 # 3. Register the ShopCraft CAD MCP server with your agent clients
 python3 services/installer/setup_mcp_clients.py           # (Windows: mcp_setup.bat)
 python3 services/installer/setup_mcp_clients.py --detect  # verify what's wired where
@@ -62,8 +68,9 @@ plans write straight back to the board. Optional extras: `work/workd.sh <name>` 
 daemon) and `work/report.sh` (AI-guided bug/idea reporter → GitHub issue + backlog task).
 
 When you sit down to work the board, follow the human protocol in
-[work/WORKFLOW.md](work/WORKFLOW.md) §5 — merge the review queue top-down, answer the
-human-only questions, adjust priorities. Everything else runs without you.
+[work/WORKFLOW.md](work/WORKFLOW.md) §5 — check `work.py mine` for what's waiting on you,
+merge the review queue top-down, answer the human-only questions, adjust priorities.
+Everything else runs without you.
 
 ---
 

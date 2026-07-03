@@ -20,7 +20,31 @@ import sys
 import time
 from pathlib import Path
 
+try:                       # identity/profile helpers live beside this script
+    import _teamlib
+except Exception:          # never let a helper import break the core CLI
+    _teamlib = None
+
 ROOT = Path(__file__).resolve().parent.parent  # work/
+
+
+def _identity_owner():
+    """The stored contributor identity (GitHub username / agent name), or None."""
+    if _teamlib is None:
+        return None
+    try:
+        return _teamlib.owner_name()
+    except Exception:
+        return None
+
+
+def _resolve_owner(args):
+    """Owner from --owner, else the stored identity. Errors clearly if neither."""
+    owner = getattr(args, "owner", None) or _identity_owner()
+    if not owner:
+        raise RuntimeError("no --owner given and no identity set — run "
+                           "`work.py whoami --github <username>` once, or pass --owner")
+    return owner
 STATUSES = {"todo", "doing", "review", "done", "blocked", "backlog"}
 REQUIRED = ("id", "title", "workstream", "owner", "status", "branch", "depends_on")
 
@@ -236,7 +260,17 @@ def cmd_dag(tasks, errors, _args):
 
 
 def _git(args, cwd, check=False):
-    r = subprocess.run(["git"] + args, cwd=str(cwd), capture_output=True, text=True)
+    # Author board commits AS the identified contributor via per-subprocess env
+    # (GIT_AUTHOR_*/GIT_COMMITTER_*). We NEVER run `git config user.*`; if no
+    # identity email is known, env is None and the machine identity is used.
+    env = None
+    if args and args[0] == "commit" and _teamlib is not None:
+        try:
+            env = _teamlib.commit_env()
+        except Exception:
+            env = None
+    r = subprocess.run(["git"] + args, cwd=str(cwd), capture_output=True,
+                       text=True, env=env)
     if check and r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {r.stderr.strip()}")
     return r
@@ -747,6 +781,72 @@ def cmd_lanes(tasks, errors, args):
     return 0
 
 
+def cmd_whoami(tasks, errors, args):
+    """Show or set the contributor identity (GitHub username) for this checkout.
+    Stored gitignored in work/sync/identity.json; used to author board commits and
+    to answer `work.py mine`."""
+    if _teamlib is None:
+        print("ERROR: _teamlib helper not importable", file=sys.stderr)
+        return 1
+    if args.github or args.name or args.email:
+        fields = {}
+        if args.github:
+            fields["github_user"] = args.github
+        if args.name:
+            fields["display_name"] = args.name
+        if args.email:
+            fields["git_email"] = args.email
+        _teamlib.set_profile(**fields)
+    prof = _teamlib.resolve_and_store(args.github) if not args.name and not args.email \
+        else _teamlib.get_profile()
+    if not prof:
+        print("no identity set — run: work.py whoami --github <your-username>")
+        return 0
+    print(f"github:  {prof.get('github_user', '(unknown — pass --github)')}")
+    print(f"name:    {prof.get('display_name', '(unset)')}")
+    print(f"email:   {prof.get('git_email', '(unset — commits use machine identity)')}")
+    if prof.get("agent_name"):
+        print(f"agent:   {prof['agent_name']} (autonomous working-name)")
+    print(f"commits authored as: "
+          f"{'this identity' if prof.get('git_email') else 'the machine git identity'}")
+    return 0
+
+
+def cmd_mine(tasks, errors, args):
+    """What's on YOUR plate: tasks you own (in progress), your branches awaiting a
+    human merge, and tasks that name you. Matches any of your identity aliases
+    (GitHub username / agent working-name)."""
+    if args.owner:
+        aliases = [args.owner.lower()]
+        label = args.owner
+    elif _teamlib is not None and _teamlib.identity_aliases():
+        aliases = _teamlib.identity_aliases()
+        label = _teamlib.human_name() or aliases[0]
+    else:
+        print("ERROR: no --owner given and no identity set — run "
+              "`work.py whoami --github <username>` once", file=sys.stderr)
+        return 1
+    mine = [t for t in tasks.values() if t.get("owner", "").lower() in aliases]
+    doing = [t for t in mine if t.get("status") == "doing"]
+    review = [t for t in mine if t.get("status") == "review"]
+    blocked = [t for t in mine if t.get("status") == "blocked"]
+
+    def show(label, rows):
+        if not rows:
+            return
+        print(f"\n== {label} ==")
+        for t in sorted(rows, key=lambda x: (int(x.get("priority", 5) or 5), x["id"])):
+            print(f"  {t['id']:>8}  P{t.get('priority', 5)}  {t.get('lane','-'):<16}  {t['title']}")
+
+    print(f"identity: {label}")
+    show("IN PROGRESS (yours to finish)", doing)
+    show("AWAITING HUMAN MERGE (your review branches)", review)
+    show("BLOCKED (need a decision)", blocked)
+    if not (doing or review or blocked):
+        print("\nnothing assigned to you right now — `work.py ready` shows claimable work")
+    return 0
+
+
 def cmd_prompt(tasks, errors, args):
     tid = args.task_id
     if tid not in tasks:
@@ -780,9 +880,11 @@ def main():
     p_board.add_argument("--lane")
     p_board.add_argument("--kind")
     p_board.add_argument("--json", action="store_true")
+    # --owner is OPTIONAL on mutating commands: it defaults to the stored identity
+    # (work.py whoami --github ...). Resolved centrally below before dispatch.
     p_set = sub.add_parser("set")
     p_set.add_argument("task_id")
-    p_set.add_argument("--owner", required=True)
+    p_set.add_argument("--owner")
     p_set.add_argument("--priority", type=int, default=None)
     p_set.add_argument("--lane", default=None)
     p_set.add_argument("--kind", default=None)
@@ -792,41 +894,59 @@ def main():
     p_road.add_argument("--json", action="store_true")
     p_lanes = sub.add_parser("lanes")
     p_lanes.add_argument("--json", action="store_true")
+    p_who = sub.add_parser("whoami")
+    p_who.add_argument("--github", help="your GitHub username")
+    p_who.add_argument("--name", help="display name for commit authorship")
+    p_who.add_argument("--email", help="git email for commit authorship")
+    p_mine = sub.add_parser("mine")
+    p_mine.add_argument("--owner")
     sub.add_parser("dag")
     p_prompt = sub.add_parser("prompt")
     p_prompt.add_argument("task_id")
     p_claim = sub.add_parser("claim")
-    p_claim.add_argument("--owner", required=True)
+    p_claim.add_argument("--owner")
     p_claim.add_argument("--task")
     p_note = sub.add_parser("note")
     p_note.add_argument("task_id")
-    p_note.add_argument("--owner", required=True)
+    p_note.add_argument("--owner")
     p_note.add_argument("--text", required=True)
     p_status = sub.add_parser("status")
     p_status.add_argument("task_id")
-    p_status.add_argument("--owner", required=True)
+    p_status.add_argument("--owner")
     p_status.add_argument("--status", required=True, choices=sorted(STATUSES))
     p_rel = sub.add_parser("release")
     p_rel.add_argument("task_id")
-    p_rel.add_argument("--owner", required=True)
+    p_rel.add_argument("--owner")
     p_relink = sub.add_parser("relink")
     p_relink.add_argument("task_id")
-    p_relink.add_argument("--owner", required=True)
+    p_relink.add_argument("--owner")
     p_relink.add_argument("--depends-on", dest="depends_on", default=None)
     p_relink.add_argument("--workstream", default=None)
     p_checkdod = sub.add_parser("checkdod")
     p_checkdod.add_argument("task_id")
-    p_checkdod.add_argument("--owner", required=True)
+    p_checkdod.add_argument("--owner")
     p_checkdod.add_argument("--index", type=int, required=True)
     p_checkdod.add_argument("--checked", required=True, choices=["true", "false"])
     args = ap.parse_args()
+
+    # Default --owner to the stored identity for commands that write as a person
+    # (NOT board/ready, where --owner is a filter, nor whoami).
+    MUTATING = {"claim", "note", "status", "release", "relink", "checkdod", "set"}
+    if args.cmd in MUTATING:
+        try:
+            args.owner = _resolve_owner(args)
+        except RuntimeError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+
     tasks, errors = load_tasks()
     fn = {"validate": cmd_validate, "ready": cmd_ready,
           "board": cmd_board, "dag": cmd_dag, "prompt": cmd_prompt,
           "claim": cmd_claim, "note": cmd_note, "status": cmd_status,
           "release": cmd_release, "relink": cmd_relink,
           "checkdod": cmd_checkdod, "set": cmd_set,
-          "roadblocks": cmd_roadblocks, "lanes": cmd_lanes}[args.cmd]
+          "roadblocks": cmd_roadblocks, "lanes": cmd_lanes,
+          "whoami": cmd_whoami, "mine": cmd_mine}[args.cmd]
     sys.exit(fn(tasks, errors, args))
 
 

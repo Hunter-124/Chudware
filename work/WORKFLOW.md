@@ -68,9 +68,18 @@ foreman sweeps open questions every session.
 
 ## 5. Human session protocol (minimize Hunter's minutes)
 
+**One-time, once per checkout:** `python3 work/tools/work.py whoami --github <your-user>`
+(or `whoami(github=...)` via MCP). This stores a gitignored identity
+(`work/sync/identity.json`, GitHub-username-keyed, auto-filled from `gh`/`git config`)
+that (a) becomes the default `--owner` so you never re-type it, (b) authors your board
+commits as you — via per-commit `GIT_AUTHOR_*` env, **never** `git config` (see §0/identity
+rule), and (c) powers `work.py mine` / the `my_work` MCP tool. `work.py mine` = what's on
+your plate: in-progress, your review branches awaiting merge, your blocked tasks.
+
 When you sit down:
 1. `work/run_version_control.sh` → **Mission view**: the roadblocks strip is
    ordered by impact — work top-down. Low-impact cards have one-click Defer.
+   (`work.py mine` gives the same "what's waiting on me" answer in the terminal.)
 2. Merge the review queue in the listed chain order (or tell the foreman to).
 3. Answer only the questions marked human-only.
 4. Adjust priorities/lanes/defers directly in the UI (or `work.py set`) — that IS

@@ -48,3 +48,12 @@ the FEA bridge is wired in the full MCP integration test suite.
 runs `ccx` subprocess with a minimal cantilever .inp file and checks the output
 against Roark. CalculiX is GPL2 → subprocess only (already in licenses.md posture).
 Suggest: file as a separate T-BL02 backlog task.
+
+## ANSWER (Q1) — Fable advisor, 2026-07-03
+
+Ratified as-delivered (the task merged with exactly this scope; DoD items checked).
+The deferred FEA/CFD cross-validation is now a real filed task: **T-BL20**
+(`work/backlog/T-BL20.md`) — MCP-wired FEA cases, MacNeal-Harder/NAFEMS-style
+clean-room benchmarks, and the CalculiX subprocess second opinion. (T-BL02 was
+already taken by format interop, hence the new id.) The CLAIM BLOCKER above is
+stale — capstone_run.log was committed and T-BL01 is done/merged.

@@ -72,14 +72,14 @@ graph TD
     T_G11["T-G11: Windows build verify, then delete host/ and all deprecated GUI code"]:::todo
     T_G12["T-G12: Human UI walkthrough - recursive element-by-element feedback loop until converged"]:::doing
     T_G13["T-G13: Fix issue 7 (scenario deadlock) - ScenarioRunner step-machine scenarios deadlock offscreen"]:::done
-    T_G14["T-G14: Dark-mode readability + popup/subwindow correctness (black-on-black text, transparent borders, evaluate window sizing)"]:::todo
-    T_G15["T-G15: Screenshot-based icon pipeline + broken/missing icon fixes (ribbon-wide icon regeneration)"]:::todo
-    T_G16["T-G16: Ribbon liquid-glass restyle - match the modern iOS-style UI of tooltips/Copilot"]:::todo
+    T_G14["T-G14: Dark-mode readability + popup/subwindow correctness (black-on-black text, transparent borders, evaluate window sizing)"]:::doing
+    T_G15["T-G15: Screenshot-based icon pipeline + broken/missing icon fixes (ribbon-wide icon regeneration)"]:::doing
+    T_G16["T-G16: Ribbon liquid-glass restyle - match the modern iOS-style UI of tooltips/Copilot"]:::doing
     T_G17["T-G17: Copilot tab cleanup - settings reachable, model picker slim, sessions UX, general polish"]:::todo
     T_G18["T-G18: Feature manager restyle - row styling parity, centering/margins, regenerated FM icons"]:::todo
-    T_G19["T-G19: 3D-feature PM chrome - OK/Cancel redesign+relocation, extrude depth/draft double-display fix"]:::todo
+    T_G19["T-G19: 3D-feature PM chrome - OK/Cancel redesign+relocation, extrude depth/draft double-display fix"]:::doing
     T_G2["T-G2: Restore doc-tab input, shrink Copilot header, PM button contrast"]:::done
-    T_G20["T-G20: Surfaces tab audit - AI-driven test of every surface tool; fix or recommend scrap"]:::todo
+    T_G20["T-G20: Surfaces tab audit - AI-driven test of every surface tool; fix or recommend scrap"]:::doing
     T_G3["T-G3: ShopCraft rename tier 1 - user-visible branding strings"]:::done
     T_G4["T-G4: GUI dead-code and cleanliness pass on host/"]:::done
     T_G5["T-G5: GUI migration wave 1 - foundation libs (F1-F4 + G1 gate)"]:::done
@@ -158,7 +158,13 @@ graph TD
     T_BL16["T-BL16: Motion/kinematics simulation of mechanisms"]:::todo
     T_BL17["T-BL17: Random/harmonic vibration response (frequency response analysis)"]:::todo
     T_BL18["T-BL18: Gear/bearing life and AGMA tooth-strength checks"]:::todo
-    T_BL19["T-BL19: Modeling-op combination battery - engine-level AI testing of feature tools and sequences"]:::todo
+    T_BL19["T-BL19: Modeling-op combination battery - engine-level AI testing of feature tools and sequences"]:::doing
+    T_BL20["T-BL20: FEA/CFD V&V cross-validation - MacNeal-Harder/NAFEMS cases + CalculiX second opinion"]:::todo
+    T_BL21["T-BL21: Hollow structural sections - model true wall voids (RHS/HSS) for mass/interference correctness"]:::todo
+    T_BL22["T-BL22: Wire dormant AI seams into the live loop - adapter routing/telemetry + regen_diagnose binding"]:::todo
+    T_BL23["T-BL23: Verifier battery CAM scoring keys - machined_fraction + gouges in _extract_score"]:::todo
+    T_BL24["T-BL24: JLCPCB signed-request auth - rework JLCPCBProvider off the static-bearer assumption"]:::todo
+    T_BL25["T-BL25: Doc-scoped IntakeLedger - persist scope=doc answers per interaction.md section 5"]:::todo
   end
   subgraph WS_integration["workstream integration"]
     T_INT["T-INT: ABSORBED into T-A5 - day-5 integration demo (capstone consolidated, Erik 2026-07-03)"]:::backlog

@@ -39,3 +39,11 @@ Python doc-kind registry** — the parametric doc engine was moved into the C++ 
 rectangle** (solid), per the step 4 wording ("rectangular wire profile extruded"). The wall
 thickness is preserved in `section_name` for takeoff but not yet voided from the solid. Confirm
 that is acceptable for v1, or whether the hollow should be modelled (face-with-hole prism) now.
+
+## ANSWER (Q3) — Fable advisor, 2026-07-03
+
+Solid-outer accepted for v1 (shipped and merged). But it is a real correctness gap —
+volume/mass/interference are wrong for every hollow member — so the true
+face-with-hole modeling is now filed as **T-BL21** (`work/backlog/T-BL21.md`),
+including a guard that the T-D5 takeoff path (which uses per-length handbook mass)
+stays byte-identical.

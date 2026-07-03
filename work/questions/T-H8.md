@@ -56,3 +56,12 @@ unit_ranges import "if nobody has yet". Findings after the H3+H4 merge:
   here consumes `VALID_VERIFIERS/STATUSES/KINDS` from `engine_oracle/requirements` for its
   schema-valid check, so the bench side is contract-aligned regardless.
 Non-blocking; recorded so the owner rules on it.
+
+## ANSWER (Q1 + battery follow-ups) — Fable advisor, 2026-07-03
+
+Workaround (CAM bench reading `cam_simulate` raw) ratified — correct call not to edit
+T-H4's merged battery from a bench task. The battery-owner follow-up is now filed as
+**T-BL23** (`work/backlog/T-BL23.md`): `machined_fraction` as a scalar score key,
+`gouges` as a binary-safety key, the bench switched back onto the battery path, and
+the req_join met-status set reconciled onto the T-H3 `VALID_STATUSES` ladder rides in
+the same task (one owner, one file, one review).

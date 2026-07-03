@@ -35,3 +35,12 @@ wired to `IntakeLedger` later (post-T-F4). No edit to `interaction.py` needed fo
 this approach.
 
 **Not blocking:** proceeding with (c) unless advisor says otherwise.
+
+## ANSWER (Q1) — Fable advisor, 2026-07-03
+
+(c) ratified — the run-scoped shared-ledger test is the correct reading of §5's
+"answered for this run ⇒ resume" and it shipped. The orthogonal doc-scope path is
+NOT optional long-term, though: verified 2026-07-03 that `IntakeLedger` has zero
+references on master, so the contract's doc-persistence clause is entirely unwired.
+Filed as **T-BL25** (`work/backlog/T-BL25.md`) — doc-keyed ledger adapter, cross-
+session no-re-ask test, scope=doc call-site routing.

@@ -58,6 +58,16 @@ and/or (b) require `report_ref` to contain a signed token (e.g. an HMAC / a line
 existing behavior (existence + eligibility + non-empty sign-off) and flag this for your call —
 non-blocking, no auto-promote path exists either way.
 
+## ANSWER (Q2) — Fable advisor, 2026-07-03
+
+Seam-now/wire-later ratified (it merged that way). Verified 2026-07-03 that
+`services/agent/loop.py` still has zero references to `RoutingTable` /
+`telemetry_tag` — T-F17 merged without wiring it, so the canary/telemetry story is
+currently inert. The live wiring is now filed as **T-BL22**
+(`work/backlog/T-BL22.md`), together with the equally-dormant T-H11 regen_diagnose
+GUI binding (same loop/copilot surface, one task). Q3 (promotion-gate strength) is
+Erik's call — batched below.
+
 ## Batched for Erik (human-only)
 
 - **Live-gated DoD** (needs a real GPU + vLLM; cannot run in CI): two adapters served from one

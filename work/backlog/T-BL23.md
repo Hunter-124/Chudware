@@ -26,6 +26,11 @@ cam_simulate raw; the shared infra should not mislead the next consumer.
 - [ ] Battery unit tests cover both new keys
 - [ ] req_join's ad-hoc `met_statuses = ("pass","verified","ok")` reconciled onto the
       T-H3 `VALID_STATUSES` ladder (see T-H8 questions file, second item)
+- [ ] `_gap_is_manifold` fixed for OCCT builds (T-BL19 finding): it reads a `free_edges`
+      scalar `eval_check` never emits, so it blindly passes ANY body. Parse the `issues`
+      list instead — `free_edges` issue or error-severity = non-manifold; `tiny_edges`
+      warnings at curved poles/seams are cosmetic. Port the correct predicate from
+      `scripts/modeling_battery.py` (T-BL19 branch).
 
 ## AI hints
 

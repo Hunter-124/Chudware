@@ -1,82 +1,120 @@
 # ShopCraft (formerly AI-CAD)
 
-A **SolidWorks-class parametric CAD application** — native C++ desktop app with a ribbon UI,
-FeatureManager tree, PropertyManager, and a constraint-solver sketcher — built on the
-**OpenCASCADE** B-rep kernel (via [build123d](https://build123d.readthedocs.io/)), with an
-**AI orchestrator** and an **MCP server** so the same document can be driven by hand or by an
-agent (the built-in chat, or any external agent such as Claude Code).
+A **SolidWorks-class parametric CAD application** — native C++ desktop app (ribbon UI,
+FeatureManager tree, constraint-solver sketcher) on the **OpenCASCADE** B-rep kernel, with an
+**AI orchestrator** and an **MCP server** so the same document can be driven by hand or by any
+agent (the built-in copilot, Claude Code, Cursor, …). Mechanical CAD, assemblies, drawings,
+sheet metal, CAM, ECAD, FEA/CFD, sourcing/BOM — one document model under all of it.
 
-> **Status:** a working parametric modeler with sketches + constraint solver, the full common
-> feature set (extrude/revolve/sweep/loft/rib/shell/draft/fillet/chamfer/hole/pattern/mirror),
-> assemblies + mates, sheet metal, surfacing, weldments, drawings, FEA (static/modal), LBM CFD,
-> SPICE simulation, an **ECAD** module (schematic/PCB/native sim/Gerber), a full **CAM** suite
-> (milling/turning/laser-plasma-waterjet, G-code for GRBL/LinuxCNC/Fanuc/Haas/Marlin/Siemens),
-> a standard-parts library, and multi-format import/export (STEP/IGES/BREP/STL/3MF/OBJ/PLY/
-> glTF/3dm + SolidWorks COM + Parasolid) plus the native **`.step+`** document.
->
-> **AI-experience layer (GSL):** a deterministic **Geometry-Semantics Layer** sits between the
-> kernel and every agent-facing surface (`describe_part`/`describe_sketch`/`describe_scene`,
-> `render_part`/`contact_sheet` image+caption pairs, `cad_guide`) so an agent without vision can
-> still read named, stable geometry — see
-> [docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md](docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md).
-> Self-check RPCs (`check_feature_overlap`, `check_interference`, `eval_compare`,
-> `doc_face_wires`) let the copilot verify its own work. A gated GNN face-recognition scaffold
-> lives at `tools/gsl_gnn/` — deferred until deterministic recognition is measured failing.
->
-> **C++/CUDA core rewrite (in progress):** the Python engine is being replaced subsystem by
-> subsystem with a pure-C++ core (`libaicad.dll`). It runs today as a strangler: **24/24**
-> geometric-feature parity, **42/42** stateful doc-session parity, FEA static/modal (4/4), and a
-> completed SPICE epic (35/35 device parity, 10/10 netlist parity). Still Python-only: CFD,
-> ECAD, formats, assemblies, and the agent/MCP layer. **Settings → General → Engine** shows which
-> engine is live.
->
-> **GUI (in transition — workstream G in [work/](work)):** the shipping desktop GUI is
-> `host/` with the adaptive **liquid-glass v2** overlay design (full-bleed viewport,
-> transparent floating columns, per-element glass pills — locked decisions in
-> [docs/HANDOFF_GUI_OVERHAUL.md](docs/HANDOFF_GUI_OVERHAUL.md) §1 and
-> [docs/HANDOFF_SHOPCRAFT_GUI_POLISH.md](docs/HANDOFF_SHOPCRAFT_GUI_POLISH.md)). It is being
-> ported wave-by-wave into the modular `ui/imgui` + `ui/viewport` + `platform/` +
-> `services/worker` split — node-level plan in
-> [docs/GUI_MIGRATION_DAG.md](docs/GUI_MIGRATION_DAG.md) — after which `host/` is deleted
-> (criteria in [host/DEPRECATED.md](host/DEPRECATED.md)). The tiered rename **AI-CAD →
-> ShopCraft** landed with T-G3 (branding) and T-G10 (infrastructure). Compatibility rules
-> (T-G10, all additive — nothing breaks):
-> - **Env vars:** `SHOPCRAFT_*` are the canonical names (`SHOPCRAFT_SHOT`,
->   `SHOPCRAFT_LIBAICAD`, `SHOPCRAFT_DIST`, ...); the legacy `AI_CAD_*` names keep
->   working everywhere (deprecation warning where practical).
-> - **Binary:** the `ui/imgui` build produces `AI-CAD2` plus a `ShopCraft`
->   symlink/copy in the same bin dir — either name launches.
-> - **MCP server id:** new registrations use `shopcraft`; existing `ai-cad` entries are
->   preserved until an explicit `--unregister`.
-> - **App data dir:** machines with an existing `AI-CAD` data dir keep using it wholesale
->   (it holds the live venv/config); fresh installs get `ShopCraft`
->   (`engine/paths.py active_root()` — mirrored in `platform/paths_*.cpp`,
->   `core/agent/paths.cpp`, `services/worker/bootstrap.cpp`). No automatic moves.
+---
+
+## 🤖 If you are an AI agent, start here
+
+Five rules put you on the right path instantly — everything else hangs off them:
+
+1. **Orient with graphify, not grep.** This repo has a knowledge graph. Run
+   `graphify query "<your question>"` (or `graphify explain` / `graphify path`) before reading
+   source — a repo hook **enforces** this. Read raw files only after the graph orients you.
+2. **All work flows through the task board.** `python3 work/tools/work.py ready` shows what's
+   claimable; `claim --owner <your-name>` is the *only* legitimate way to take a task (atomic,
+   race-safe). Never work unclaimed, never merge to master, never set a task to `done` — humans
+   merge. The full loop: [work/prompts/autopilot.md](work/prompts/autopilot.md).
+3. **The workflow policy is [work/WORKFLOW.md](work/WORKFLOW.md).** Priorities, lanes
+   (feature areas), `kind: fix|overhaul|new` (fixes claim first), `deferred: yes` plans you must
+   not touch, the roadblock-skip protocol, and the MCP-freshness rule (ship a capability and its
+   discoverability in the same branch).
+4. **Verify before review.** `bash scripts/gate.sh` (build + tests) must show no new reds;
+   run `graphify update .` after code changes. GUI work verifies via the headless screenshot
+   harness (`AI_CAD_SHOT=<scenario>`).
+5. **Coordinate, don't collide.** `work_board` / `issue_list` before touching anything;
+   questions go in `work/questions/<task-id>.md`; progress notes via `note`. Prefer the
+   `aicad-team` MCP tools (`whoami` once, then `claim`, `work_prompt`, `note`, `set_status`) —
+   same system as the CLI.
+
+New-to-a-subsystem? `section_context(section="core-cam")` (or the `/ctx-*` skills) loads a
+maintained source map instead of you re-exploring it.
+
+## 🧑‍🔧 If you are a human, start here
+
+One-time, per-machine setup of the internal tooling (each contributor runs this locally;
+nothing touches shared repo state):
+
+```bash
+# 1. Build the code knowledge graph for your checkout (gitignored, regenerable)
+graphify .                               # once; `graphify hook install` keeps it fresh per-commit
+
+# 2. Register the team-coordination MCP server (Claude Code CLI + Claude Desktop)
+python3 work/tools/setup_team_tools.py   # then approve the one-time trust prompt in `claude`
+
+# 3. Register the ShopCraft CAD MCP server with your agent clients
+python3 services/installer/setup_mcp_clients.py           # (Windows: mcp_setup.bat)
+python3 services/installer/setup_mcp_clients.py --detect  # verify what's wired where
+
+# 4. Open Mission Control — the team dashboard
+work/run_version_control.sh              # (Windows: work\run_version_control.bat)
+```
+
+**Mission Control** (`localhost:8787`) is the master view: what needs *you* right now
+(review-queue merges, stuck tasks, open questions — ordered by impact, with "safe to skip"
+verdicts), per-feature progress lanes sorted by closest-to-shipping, and a pan/zoom dependency
+map of every task. You steer from there too: priorities, feature areas, and pausing/unpausing
+plans write straight back to the board. Optional extras: `work/workd.sh <name>` (presence
+daemon) and `work/report.sh` (AI-guided bug/idea reporter → GitHub issue + backlog task).
+
+When you sit down to work the board, follow the human protocol in
+[work/WORKFLOW.md](work/WORKFLOW.md) §5 — merge the review queue top-down, answer the
+human-only questions, adjust priorities. Everything else runs without you.
+
+---
+
+## What exists today
+
+A working parametric modeler: sketches + constraint solver, the full common feature set
+(extrude/revolve/sweep/loft/rib/shell/draft/fillet/chamfer/hole/pattern/mirror), assemblies +
+mates, sheet metal, surfacing, weldments, drawings, FEA (static/modal), LBM CFD, SPICE, an
+**ECAD** module (schematic/PCB/sim/Gerber), a full **CAM** suite (milling/turning/laser-plasma-
+waterjet; G-code for GRBL/LinuxCNC/Fanuc/Haas/Marlin/Siemens), a federated standard-parts
+library, and multi-format interop (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3dm + SolidWorks COM +
+Parasolid) around the native **`.step+`** document.
+
+Three things distinguish the architecture:
+
+- **GSL — the Geometry-Semantics Layer.** A deterministic state→text layer between the kernel
+  and every agent surface (`describe_part/sketch/scene`, `render_part`, `cad_guide`), so an
+  agent without vision still reads named, stable geometry; self-check RPCs
+  (`check_feature_overlap`, `check_interference`, `eval_compare`) let the copilot verify its own
+  work. See [docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md](docs/GEOMETRY_LLM_REPRESENTATION_REVIEW.md).
+- **C++/CUDA core rewrite (strangler, in progress).** `core/` builds `libaicad`, replacing the
+  Python engine subsystem-by-subsystem: 24/24 feature parity, 42/42 doc-session parity, FEA
+  4/4, SPICE 35/35. Still Python: CFD, ECAD, formats, assemblies, agent/MCP layer.
+  Settings → General → Engine shows which is live.
+- **GUI migration (workstream G, nearly done).** The modular `ui/imgui` + `ui/viewport` app
+  (liquid-glass overlay design — full-bleed viewport, transparent floating columns) has
+  absorbed the legacy `host/` GUI wave-by-wave; `host/` is deleted at T-G11 after the final
+  polish tasks land. New UI work goes in `ui/`, never `host/`. Rename compatibility (T-G3/T-G10):
+  `SHOPCRAFT_*` env vars canonical (`AI_CAD_*` still honored), binary `AI-CAD2` + `ShopCraft`
+  symlink, MCP id `shopcraft` (existing `ai-cad` preserved), existing `AI-CAD` appdata dirs
+  keep working.
 
 ## How it works
 
-A native C++ binary is the product. The desktop app (GLFW + Dear ImGui + OpenGL viewport) talks
-to a **Python kernel worker** over newline-delimited JSON-RPC. The worker holds the parametric
-document — a feature tree compiled to OCCT solids, tessellated for the viewport, and exported to
-STEP/STL/etc. The same engine is exposed over an **MCP server** for external agents, and a
-built-in **agent loop** can design from a natural-language prompt.
-
 ```
             ┌────────────────────────────────────────────────────────────┐
-            │  AI-CAD.exe  (native C++ — ribbon UI, feature tree, sketcher)│
- user / AI →│   viewport (GLFW+ImGui+GL)   chat/agent   MCP server ◀───────┼── external agent
-            │                    │ JSON-RPC over stdio                     │
-            │                    ▼                                         │
-            │   Python kernel worker  →  engine/doc feature compiler       │
-            │   build123d → OpenCASCADE → tessellate + export              │
+            │  ShopCraft (native C++ — ribbon UI, feature tree, sketcher) │
+ user / AI →│   viewport (GLFW+ImGui+GL)   copilot   MCP server ◀─────────┼── external agent
+            │                    │ JSON-RPC over stdio                    │
+            │                    ▼                                        │
+            │   Python kernel worker  →  engine/doc feature compiler      │
+            │   build123d → OpenCASCADE → tessellate + export             │
             └────────────────────────────────────────────────────────────┘
-        in progress:  core/  (pure C++/CUDA)  →  libaicad.dll  replaces the worker
+        in progress:  core/ (pure C++/CUDA) → libaicad replaces the worker
                       runtime + cache live in %APPDATA%\AI-CAD
 ```
 
-## Layout (post-refactor — see [AGENTS.md](AGENTS.md))
+## Layout
+
 ```
-contracts/       frozen interface seams (worker RPC, doc schema, selectors, mesh, …)
+contracts/       frozen interface seams (worker RPC, doc schema, doc ops, parts, plm, …)
 core/            pure C++/CUDA kernel → libaicad (zero-Python target)
 engine_oracle/   Python parity oracle (frozen; deleted last) — root `engine` symlink
 services/
@@ -86,251 +124,91 @@ services/
   installer/     provisioning + packaging — root `installer` symlink
 ui/
   abstract/      framework-agnostic UI seam (view-model, commands, panel specs)
-  imgui/         ImGui desktop GUI rewrite — root `app` symlink
-  viewport/      shared OpenGL pipeline (scaffold)
-host/            today's production GUI; EOL after the ui/imgui port (host/DEPRECATED.md)
+  imgui/         the desktop GUI — root `app` symlink
+  viewport/      shared OpenGL pipeline
+host/            legacy GUI (deprecated — deleted at T-G11; don't add code here)
 corpora/         test fixtures (sketch, render, sw_parity, sw_fixtures)
 docs/ tools/ scripts/ third_party/
-work/            git-tracked task system (see work/README.md)
+work/            task board + team tooling (WORKFLOW.md, tasks/, tools/, Mission Control)
 ```
 
-## Contributor setup: graphify + the team-coordination tools
+## How work gets organized (Workflow v2)
 
-Two pieces of **internal dev tooling** (not part of the shipped product) make working on
-this codebase in parallel with a team, human or AI, much cheaper:
+Tasks are git-tracked markdown files in `work/tasks/` + `work/backlog/` with frontmatter:
+`priority` (1–5), `lane` (user-facing feature area — the dashboard swim-rows), `kind`
+(`fix` | `overhaul` | `new`; fixes claim first within a priority), `deferred: yes` (parked
+plans — currently ML training and SaaS hosting — invisible to claiming). Key commands:
 
-**graphify** — a persistent knowledge graph of this codebase (god nodes, community
-structure, cross-file relationships) that Claude Code queries instead of repeated raw
-grep/read loops. `.claude/settings.json` wires a repo-wide hook that *requires* Claude to
-run `graphify query`/`explain`/`path` before grepping or reading source once the graph
-exists, so build it once per clone:
-
-```
-graphify .                 # one-time: build graphify-out/graph.json for this checkout
-graphify hook install      # optional: auto-rebuild graph.json after every git commit
-```
-
-`graphify-out/` is a local, per-machine build artifact (gitignored — it bakes in absolute
-paths and is fully regenerable) — every contributor builds their own, it is never pushed.
-The `graphify claude install` CLAUDE.md wiring is already done project-wide; you only need
-the one-time build above. See [.claude/skills/graphify/SKILL.md](.claude/skills/graphify/SKILL.md)
-for the full command set.
-
-**Team coordination (`work/`)** — file-based task tracking plus a live sync layer for
-multiple contributors (human or AI) working the [work/](work) task board at once, in
-parallel Claude Code CLI / Claude Desktop sessions, without overlapping fixes:
-
-```
-python3 work/tools/setup_team_tools.py   # one-time: registers the aicad-team MCP server
-                                          # with Claude Code CLI + Claude Desktop
-work/workd.sh <your-name>                # (or work\workd.bat) — presence/sync daemon,
-                                          # leave running while you work
-work/report.sh                           # (or work\report.bat) — AI-guided issue reporter
-                                          # GUI: draft a bug/idea -> linked GitHub issue +
-                                          # work/backlog task in one step
-work/run_version_control.sh              # (or work\run_version_control.bat) — read-only
-                                          # team-progress dashboard: Human Roadblocks / DAG /
-                                          # Graphify Preview (display only — see below)
-```
-
-Once registered, `/work-board`, `/work-pick`, `/work-sync`, `/work-issues`, `/work-msg`,
-`/work-report`, `/work-dashboard`, and thirteen per-section `/ctx-*` commands (pre-mapped source maps —
-`work/context/*.md` — so agents don't burn tokens re-exploring a subsystem) are available
-in every Claude Code session in this repo. This is entirely per-machine setup (each
-contributor runs it locally on Windows/macOS/Linux — nothing here touches shared repo
-state) so any number of people can register and run it concurrently without conflict.
-Two things to expect on first run, either platform:
-- **Claude Code CLI** will show a one-time prompt to approve the new project MCP server
-  the first time you run `claude` in this repo after registering — that's the normal
-  per-contributor trust check, say yes.
-- **Claude Desktop**: fully quit and reopen (not just close the window) to pick up the
-  change. Newer Desktop versions may source their MCP/tool list from account-synced
-  Connectors settings instead of the classic config file `setup_team_tools.py` writes —
-  if `aicad-team` doesn't show up after restarting, add it manually via
-  Settings → Connectors (or MCP Servers): Command `python3` (or `py -3` on Windows),
-  Args `work/tools/team_mcp.py`'s full path.
-
-**The desired path to contributing** — once registered, an agent (or human driving one)
-has everything needed in the `aicad-team` MCP tools; no raw `git`/`gh` juggling required:
-
-```
-whoami(name="you")                      # once per machine — every owner/agent param below
-                                         # can then be omitted, resolved from this identity
-work_board(format="json")               # situational awareness: full task board (optional
-                                         # workstream/owner/status filters) + who's online +
-                                         # open issues — call this first, always
-claim(kind="task")                      # atomically claim the next ready task (kind="issue"
-                                         # + id=N claims a GitHub issue instead) — the ONLY
-                                         # legitimate way in, same double-claim protection
-                                         # for both kinds
-work_prompt(task_id="T-XX")             # emit the self-contained work order for it
-  ...do the work, on the branch the work order names...
-note(kind="task", id="T-XX", text=...)  # log progress so parallel sessions/humans stay
-                                         # current — use at real milestones (kind="issue"
-                                         # posts a GitHub comment instead)
-set_status(kind="task", id="T-XX",      # doing -> review when pushed and awaiting human
-           status="review")            # merge (status can never be set to "done" here —
-                                         # that's a human merge-time action)
-
-issue_list()                            # before fixing any bug: check nobody else has it
-graphify_query / graphify_explain /     # scoped subgraph answers instead of repeated
-  graphify_path                         # grep/read loops — flags staleness automatically
-section_context(section="core-cam")     # pre-mapped source map for a subsystem — no-args
-                                         # listing now includes a one-line blurb per section
-team_status / team_send                 # who else is active right now, and message them —
-                                         # presence auto-updates as you call these tools,
-                                         # no daemon required
-```
-
-`claim`/`release`/`set_status`/`note` collapse what used to be two parallel systems
-(`work_claim`/`work_release`/`work_status`/`work_note` for tasks, `issue_claim`/
-`issue_comment` for GitHub issues) into one `kind`-tagged model — the legacy names still
-work and route to the same place, so nothing already scripted against them breaks. Same
-rules either way (MCP tools or the `/work-*` slash commands are two doors to the same
-system): claim before starting, note progress, never flip anything to `done` yourself,
-and check `issue_list`/`work_board` before touching something someone else might already
-be on. `/work-dashboard` gives the same picture visually and read-only (task DAG,
-human-roadblock queue, graphify preview) for anyone who'd rather look than call tools
-directly — it never claims/edits/writes anything itself; do that here in chat (or let
-autopilot decide) instead. Full protocol: [work/README.md](work/README.md)
-and [work/prompts/autopilot.md](work/prompts/autopilot.md).
-
-## Where this is going
-
-AI-CAD is expanding into an **idea-to-production platform** — one prompt carries a project from
-concept through mechanical design, electronics, firmware, structural checks, and priced BOM to a
-ready-to-order package. The full decision record and rationale is in
-[docs/PLATFORM_ADR.md](docs/PLATFORM_ADR.md); the 5-day walking-skeleton sprint is in
-[docs/SPRINT_5DAY_PLAN.md](docs/SPRINT_5DAY_PLAN.md).
-
-**DAG workflow orchestrator** — projects as checkpointed graphs (LangGraph + SQLite); limited-
-context models execute nodes; explicit end conditions so loops terminate; human approval gates
-per node; autonomy dial from "AI does everything" to "AI as advisor."
-
-**AI tooling & infrastructure overhaul** — the layer under every pillar: agent web-research
-tools (materials/datasheets/standards with provenance), a unified ask-user interaction
-contract, image + camera intake, state→text narration for every domain (CAM, FEA/CFD, ECAD,
-assemblies — GSL everywhere), a converged provider/session layer (MCP-first, subscription
-session auth, BYO key, local models, company-hosted relay), and a trainable ≤4B local
-translator track — see [docs/AI_TOOLING_MASTER_PLAN.md](docs/AI_TOOLING_MASTER_PLAN.md).
-Cut as **workstream F** in [work/](work).
-
-**Deliverables & transparent agents** — agents produce everything an engineer ships
-(design-review decks, calc packages, BOM/cost workbooks, test reports, manuals) through
-open-source format engines (python-pptx/docx/openpyxl, LibreOffice + pandoc as
-subprocesses — we never write format parsers), with in-app previews and artifact cards;
-and every agent runs as a glass box — live plan/thought/action stream, steer-anytime
-(pause, answer, inject, replan), an autonomy dial from advisor to autonomous, and an
-editable design brief so intent is agreed before the run — master plan Pillars 14–15.
-
-**Sourcing + cost estimation** — priced BOMs with supplier lookups (Nexar/Digi-Key/Mouser),
-machining cost from CAM cycle-time, fabrication quotes (Xometry/JLCPCB), and a material-cost
-model with user-overridable rate tables.
-
-**Spec-sheet → model matching** — pair purchased parts (no CAD file) to generated or library
-models using datasheet extraction; standard fasteners/bearings from BOLTS blt tables; AI path
-extracts a dimension dict from a pasted listing and fills a parametric template.
-
-**Firmware/embedded environment** — compile firmware targeting the MCU seeded from the ECAD
-schematic BOM (pin-map header generated from the netlist), emulate in Renode (MIT) so the agent
-can test without hardware, then flash via probe-rs or esptool.
-
-**Civil/structural/carpentry suite** — structural elements (beam/column/post/joist/stud-wall/
-footing) compiled to B-rep, analyzed with PyNite (MIT), AISC + dimensional lumber section
-libraries, D/C ratio checks (labeled preliminary), cost takeoff × ENR-seeded rate tables.
-
-**Format interop / reverse-engineering track** — openNURBS/.3dm (MIT, no reversing needed),
-Parasolid payload extraction from NX/Solid Edge, then clean-room parsers for CATIA V5, Inventor,
-Altium, and DXF/DWG; goal is to break vendor lock-in under the DMCA interop exemption.
-
-## Linux gate
 ```bash
-bash scripts/gate.sh    # check.py + core build/ctest + ui/abstract test
+python3 work/tools/work.py ready        # what's claimable, in claim order
+python3 work/tools/work.py roadblocks   # what's waiting on a HUMAN, with impact verdicts
+python3 work/tools/work.py lanes        # ship-readiness per feature area
+python3 work/tools/work.py set T-XX --owner you --priority 2 --deferred no   # steer
 ```
 
-## Build & run the desktop app
-Needs Visual Studio 2022 (MSVC), CMake, and a provisioned runtime.
+Roles: **Sonnet drivers** claim and execute; **one Fable foreman** reviews, merges, triages
+roadblocks (low-impact roadblocks get skipped/deferred, not queued); **humans** merge to done
+and answer human-only questions. Canonical policy: [work/WORKFLOW.md](work/WORKFLOW.md).
+Dependency graph: [work/DAG.md](work/DAG.md) (`work.py dag` regenerates).
+
+## Build & run
+
+**Linux gate (CI-equivalent):**
+```bash
+bash scripts/gate.sh    # check.py + core build/ctest + ui tests
+```
+
+**Windows desktop app** (VS 2022 + CMake):
 ```powershell
-# 1. provision the managed runtime (once) -> %APPDATA%\AI-CAD\runtime\venv
-py -3.11 -m installer.provision --with-app-code
-
-# 2. build the native host (Release). build.bat is the normal entry point:
-build.bat            # compile host + sync into dist\AI-CAD\ (use after C++ or .py edits)
-build.bat host       # compile the exe only (does not touch dist\)
-build.bat app        # only re-sync Python app code into dist\ (fastest for .py-only changes)
-
-# 3. run it
-dist\AI-CAD\AI-CAD.exe            # full build (dist synced)
-host\build\bin\Release\AI-CAD.exe # a `build.bat host` build runs from here (dist NOT synced)
+py -3.11 -m installer.provision --with-app-code   # once: runtime venv -> %APPDATA%\AI-CAD
+build.bat                                          # compile + sync dist\AI-CAD\
+dist\AI-CAD\AI-CAD.exe                             # run (first launch self-provisions)
 ```
-Headless render / design (verifies the whole pipeline without the GUI):
-```powershell
-host\build\bin\Release\AI-CAD.exe --build engine\samples\mounting_plate.py out.png
-host\build\bin\Release\AI-CAD.exe --design "a 30mm knurled hex standoff" out.png
-```
-On first launch `AI-CAD.exe` self-provisions `%APPDATA%\AI-CAD` from the payload (offline wheelhouse).
-Force/inspect: `AI-CAD.exe --ensure-runtime`. Package: `py -3.11 -m installer.build_release --zip`.
+`build.bat host` compiles the exe only; `build.bat app` re-syncs Python-only changes.
+Headless smoke (no GUI): `AI-CAD.exe --design "a 30mm knurled hex standoff" out.png`.
+Package a release: `py -3.11 -m installer.build_release --zip`.
 
-## The C++/CUDA core (in progress)
-The pure-C++ core lives in `core/` and builds `libaicad.dll`. Developed against the Python
-engine as a differential oracle — never weaken an assertion, match Python unless Python is
-provably buggy.
+**C++ core:**
 ```powershell
 cmake -S core -B core/build-occt -DAICAD_WITH_OCCT=ON
 cmake --build core/build-occt --config Release
-ctest --test-dir core/build-occt -C Release --output-on-failure   # C++ core doctest suite (parity proof, incl. the libaicad load probe)
-# Legacy Python-vs-C++ differential harnesses (cpp_parity.py, cpp_session_parity.py) are documented
-# in docs/CPP_MIGRATION.md but not present in this tree — use ctest + core/tests/ until restored.
+ctest --test-dir core/build-occt -C Release --output-on-failure
 ```
+Developed against the Python engine as a differential oracle — never weaken an assertion;
+match Python unless Python is provably buggy. See [docs/CPP_MIGRATION.md](docs/CPP_MIGRATION.md).
 
-## Engine dev & tests
-The managed runtime lives at `%APPDATA%\AI-CAD\runtime\venv`. Engine suites are plain
-`main()`-runner test modules (house style):
+**Engine dev & tests** (managed venv at `%APPDATA%\AI-CAD\runtime\venv`; suites are plain
+`main()`-runner modules):
 ```powershell
 $py = "$env:APPDATA\AI-CAD\runtime\venv\Scripts\python.exe"
-& $py -m engine.run_model mounting_plate         # v1: build + render a sample -> %APPDATA%\AI-CAD\cache
-& $py -m engine.doc.test_sketch_solver           # run one engine test suite
-& $py -m mcp_server.test_roundtrip               # MCP roundtrip self-test
-& $py -m mcp_server.server                        # run the MCP server (stdio) for an external agent
-```
-Drive the built-in agent loop from a prompt (needs an API key, or use the mock provider):
-```powershell
-$env:ANTHROPIC_API_KEY = "sk-ant-..."   # or copy config.example.json to %APPDATA%\AI-CAD\config.json
-& $py -m agent.run_agent "a 60x40x12mm bracket with two M5 clearance holes and a filleted back edge"
-& $py -m agent.test_loop_mock           # verify the loop logic with no API key
+& $py -m engine.doc.test_sketch_solver      # one engine suite
+& $py -m mcp_server.test_roundtrip          # MCP roundtrip self-test
+& $py -m mcp_server.server                  # run the MCP server (stdio)
+& $py -m agent.run_agent "a 60x40x12mm bracket with two M5 clearance holes"   # needs API key
+& $py -m agent.test_loop_mock               # agent loop, no key needed
 ```
 
-## Wire the MCP server into external agents
-Register the ShopCraft MCP server (id `shopcraft`; pre-existing `ai-cad` entries are
-preserved) with every supported client (Claude Code, Cursor, VS Code, opencode,
-Antigravity) in one shot:
-```powershell
-mcp_setup.bat            # portable wrapper around installer/setup_mcp_clients.py
-```
-On Linux/macOS run the underlying script directly:
-```bash
-python3 services/installer/setup_mcp_clients.py          # register (idempotent)
-python3 services/installer/setup_mcp_clients.py --detect # what's wired where
-```
+## Where this is going
 
-## Contributing & task tracking
+ShopCraft is expanding into an **idea-to-production platform** — one prompt from concept
+through mechanical design, electronics, firmware, structural checks, and priced BOM to a
+ready-to-order package. Decision records, in reading order:
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for workflow, rules, and AI-tooling guidance.
+| Plan | What it covers |
+|---|---|
+| [docs/PLATFORM_ADR.md](docs/PLATFORM_ADR.md) | Platform pillars: DAG workflow orchestrator, sourcing/cost, spec-sheet matching, firmware/Renode, structural suite, format interop |
+| [docs/AI_TOOLING_MASTER_PLAN.md](docs/AI_TOOLING_MASTER_PLAN.md) | Pillars 8–19: research tools, interaction, vision, narration, providers, translator, deliverables, flywheel, parts library, feature-UI productization, PLM |
+| [docs/PLM_VERSION_CONTROL_PLAN.md](docs/PLM_VERSION_CONTROL_PLAN.md) | PLM version control for user documents (Pillar 19, workstream R): ease-of-use-first, hidden git vault, Project Hub |
 
-Tasks are git-tracked YAML files in `work/` (see [work/README.md](work/README.md)). List
-unblocked work with:
-```bash
-python3 work/tools/work.py ready
-```
-Each task lives on a branch named `task/<id>-<slug>`. The dependency graph is
-[work/DAG.md](work/DAG.md) (regenerate with `python3 work/tools/work.py dag`). Autonomous
-agents pick up tasks via [work/prompts/autopilot.md](work/prompts/autopilot.md); workstream
-G (GUI polish → ShopCraft rename → `ui/imgui` migration → `host/` deletion) has extra
-build/verify rules noted there.
+Currently parked (per [work/WORKFLOW.md](work/WORKFLOW.md) §3): custom-model training and
+SaaS/cloud hosting — capture/eval seams stay, build-out waits.
 
-## Model-author contract (v1 `script` features)
-Scripts run with the full `build123d` namespace in scope and assign the final shape to
-**`result`** (a `Part`/`Solid`/`Compound`, or a `BuildPart`/`BuildSketch` context — the kernel
-unwraps it). Anything printed is captured and returned. See
-[contracts/](contracts) for the frozen interface contracts (doc schema, ops, RPC,
-selectors, mesh/`.step+` formats).
+## Contributing
+
+[CONTRIBUTING.md](CONTRIBUTING.md) has the rules (license guardrails, OSS-first, style);
+[work/README.md](work/README.md) documents the task system;
+[work/prompts/autopilot.md](work/prompts/autopilot.md) is the autonomous-driver loop.
+
+**Model-author contract (v1 `script` features):** scripts run with the full `build123d`
+namespace in scope and assign the final shape to `result`; printed output is captured.
+Frozen interface contracts live in [contracts/](contracts).

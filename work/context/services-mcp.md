@@ -12,6 +12,7 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
 - services/mcp/ecad_tools.py:420 `register_ecad_tools(mcp)` — schematic/PCB tools (ecad_new_schematic, ecad_new_pcb, ecad_place_symbol, ecad_autoroute, ecad_simulate, ecad_to_3d)
 - services/mcp/cam_tools.py:49 `register_cam_tools(mcp)` — CAM/toolpath (cam_new_job, cam_add_setup, cam_add_tool, cam_add_operation, cam_simulate, cam_post)
 - services/mcp/core_bridge.py:20 `call(method, params)` — thin ctypes RPC bridge to libaicad.dll (JSON string-in/out); resolves library via $AI_CAD_LIBAICAD / $AI_CAD_DIST / build dirs
+- services/mcp/intake_ledger.py `IntakeLedger(doc_id)` — doc-scoped interaction answer store (contracts/interaction.md §5): persists ask_user Q/A inside the doc's IntakeState meta record (rides the .step+, survives save/reopen — doc_id is per-process, the record travels with the doc); no FastMCP import, get/set injectable for engine-less tests. Used by intake_tools._ask_via_contract and ask_user's scope=doc default ledger (T-BL25)
 - services/mcp/test_roundtrip.py:5 `python -m mcp_server.test_roundtrip` — integration test: list tools, new_part, add_features, render, measure, run_fea_static, export
 
 ## How it connects

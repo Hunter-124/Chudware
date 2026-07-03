@@ -512,7 +512,10 @@ def register_intake_tools(mcp: FastMCP) -> None:
 
         When `run_id` is supplied each confirmed dimension is ALSO recorded in the run-scoped
         interaction ledger (contracts/interaction.md §5) so a DAG gate for the same run_id
-        never re-asks for these values.
+        never re-asks for these values.  Without a run_id the dimension is recorded in the
+        DOCUMENT's intake ledger instead (IntakeState, persisted inside the .step+): it
+        survives save/close/reopen, so a dimension you confirm today is never re-asked in a
+        later session on the same part.
         """
         try:
             d = _doc(doc_id)

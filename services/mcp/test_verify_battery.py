@@ -253,3 +253,79 @@ def test_verify_overhead_under_50ms(monkeypatch):
     bat.verify(doc_id="x", checks=checks)          # warm the signature cache path
     result = bat.verify(doc_id="x", checks=checks)
     assert result["elapsed_ms"] < 50.0
+
+
+# ── _gap_eval_check_direct issues-list fix (same latent bug T-BL23 fixed in
+#    _gap_is_manifold: eval_check emits an `issues` list, not bare scalars) ──
+
+def test_gap_eval_check_direct_issues_free_edges_fails(monkeypatch):
+    """A free_edges issue in the issues list -> not ok."""
+    import services.verify.battery as bat
+
+    def fake_cb_call(op, args):
+        return {"issues": [{"kind": "free_edges", "severity": "error", "count": 4}],
+                "tiny_edges": 0}
+
+    import mcp_server.core_bridge as cb
+    monkeypatch.setattr(cb, "call", fake_cb_call)
+
+    r = json.loads(bat._gap_eval_check_direct(doc_id="fake"))
+    assert r["ok"] is False
+
+
+def test_gap_eval_check_direct_tiny_edges_only_is_ok(monkeypatch):
+    """tiny_edges warnings alone do NOT fail the check."""
+    import services.verify.battery as bat
+
+    def fake_cb_call(op, args):
+        return {"issues": [{"kind": "tiny_edges", "severity": "warning", "count": 2}],
+                "tiny_edges": 2}
+
+    import mcp_server.core_bridge as cb
+    monkeypatch.setattr(cb, "call", fake_cb_call)
+
+    r = json.loads(bat._gap_eval_check_direct(doc_id="fake"))
+    assert r["ok"] is True
+
+
+def test_gap_eval_check_direct_error_severity_fails(monkeypatch):
+    """Any issue with severity==error fails, even if kind is not free_edges."""
+    import services.verify.battery as bat
+
+    def fake_cb_call(op, args):
+        return {"issues": [{"kind": "invalid_face", "severity": "error"}],
+                "tiny_edges": 0}
+
+    import mcp_server.core_bridge as cb
+    monkeypatch.setattr(cb, "call", fake_cb_call)
+
+    r = json.loads(bat._gap_eval_check_direct(doc_id="fake"))
+    assert r["ok"] is False
+
+
+def test_gap_eval_check_direct_no_issues_scalar_fallback_ok(monkeypatch):
+    """Empty issues list + free_edges==0 + invalid_faces==0 scalars -> ok (fallback path)."""
+    import services.verify.battery as bat
+
+    def fake_cb_call(op, args):
+        return {"issues": [], "free_edges": 0, "invalid_faces": 0, "tiny_edges": 0}
+
+    import mcp_server.core_bridge as cb
+    monkeypatch.setattr(cb, "call", fake_cb_call)
+
+    r = json.loads(bat._gap_eval_check_direct(doc_id="fake"))
+    assert r["ok"] is True
+
+
+def test_gap_eval_check_direct_no_issues_scalar_fallback_not_ok(monkeypatch):
+    """Empty issues list + invalid_faces>0 scalar -> not ok (fallback path)."""
+    import services.verify.battery as bat
+
+    def fake_cb_call(op, args):
+        return {"issues": [], "free_edges": 0, "invalid_faces": 2, "tiny_edges": 0}
+
+    import mcp_server.core_bridge as cb
+    monkeypatch.setattr(cb, "call", fake_cb_call)
+
+    r = json.loads(bat._gap_eval_check_direct(doc_id="fake"))
+    assert r["ok"] is False

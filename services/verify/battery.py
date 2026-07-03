@@ -146,13 +146,26 @@ def _gap_is_manifold(doc_id: str = None, **_) -> str:
 
 
 def _gap_eval_check_direct(doc_id: str = None, **_) -> str:
-    """Direct eval_check exposure (BRepCheck + free/tiny-edge census)."""
+    """Direct eval_check exposure (BRepCheck + free/tiny-edge census).
+
+    Reads the ``issues`` list from eval_check (OCCT BRepCheck) rather than the bare
+    ``free_edges``/``invalid_faces`` scalars, which eval_check never emits on its own
+    (same latent bug T-BL23 fixed in ``_gap_is_manifold``; see T-BL19 finding).
+    Not ok = any issue with kind=="free_edges" OR severity=="error".
+    Falls back to the scalar fields if the issues list is absent (forward-compat).
+    """
     from mcp_server import core_bridge as cb
     from mcp_server.core_bridge import CoreError
     d = doc_id or _cur_doc()
     try:
         r = cb.call("eval_check", {"doc_id": d})
-        ok = r.get("free_edges", 0) == 0 and r.get("invalid_faces", 0) == 0
+        iss = r.get("issues", [])
+        if iss:
+            bad = [i for i in iss
+                   if i.get("kind") == "free_edges" or i.get("severity") == "error"]
+            ok = len(bad) == 0
+        else:
+            ok = r.get("free_edges", 0) == 0 and r.get("invalid_faces", 0) == 0
         return json.dumps({"ok": ok, "doc_id": d, **r})
     except CoreError as e:
         return json.dumps({"ok": False, "error": str(e)})

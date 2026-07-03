@@ -1143,6 +1143,278 @@ def cad_guide_text(topic: str = "overview") -> str:
         except ImportError:
             return ("Reverse-engineering guide ships with the recon tools (wave 3); use "
                     "import_part + describe_part + compare workflow meanwhile.")
+    if topic in ("requirements", "req", "req_create", "req_update", "req_status", "req_report",
+                 "brief", "design_brief"):
+        return (
+            "REQUIREMENTS (aicad.req/1) — design-brief CRUD + markdown projection\n\n"
+            "Schema: contracts/requirements.md  |  Engine: engine_oracle/requirements/\n\n"
+            "WORKFLOW:\n"
+            "  req_create(title, body)              Create a new requirements doc; returns req_id.\n"
+            "  req_update(req_id, needs?, reqs?)    Add/edit individual need or requirement rows.\n"
+            "  req_status(req_id)                   Current fulfilment table (met/partial/open).\n"
+            "  req_report(req_id)                   Full markdown projection for sharing.\n\n"
+            "BIAS: capture requirements BEFORE modeling — req_create at project start, then\n"
+            "reference req_id in every verify_battery call so the battery knows what to check.\n"
+            "A requirement without a verifier is aspirational; wire them up."
+        )
+    if topic in ("dag", "dag_plan", "dag_run", "dag_status", "dag_approve", "dag_abort",
+                 "dag_replan", "orchestrate", "mission", "project_run", "workflow"):
+        return (
+            "DAG ORCHESTRATOR — multi-step missions with gates, budgets, and human approvals\n\n"
+            "Tools: dag_plan / dag_run / dag_status / dag_approve / dag_abort / dag_replan\n"
+            "Schema: contracts/dag_schema.md\n\n"
+            "WORKFLOW:\n"
+            "  dag_plan(goal, nodes)     Draft a DAG of tool-call nodes with retry budgets\n"
+            "                            and end_conditions.  Returns a plan dict.\n"
+            "  dag_run(plan)             Execute the plan; checkpoints each node; returns run_id.\n"
+            "  dag_status(run_id)        Poll: nodes done/doing/blocked/pending, budget usage.\n"
+            "  dag_approve(run_id, node) Ungate a human-approval node so the run continues.\n"
+            "  dag_abort(run_id)         Cancel a running mission cleanly.\n"
+            "  dag_replan(run_id, nodes) Splice new nodes into a RUNNING checkpointed run\n"
+            "                            (validates end_condition + retry_budget on every node).\n\n"
+            "NARRATION: describe_project(run=dag_status(...)['run']) gives a human-readable\n"
+            "  summary (nodes done/doing/blocked, budget, open questions) instead of raw JSON.\n\n"
+            "BIAS: use DAG for any mission with 3+ sequential tool calls that could fail\n"
+            "  independently — it checkpoints progress and resumes after transient errors."
+        )
+    if topic in ("verify", "verify_battery", "battery", "check", "done", "sign-off"):
+        return (
+            "VERIFY BATTERY — deterministic done-check before calling a design finished\n\n"
+            "Tools: verify_battery(doc_id, checks?) / check_metadata()\n\n"
+            "MANDATORY before declaring done:\n"
+            "  verify_battery(doc_id)   Runs the full battery: feature overlap, interference,\n"
+            "                           wall thickness, draft angles, DFM, and any req_id-linked\n"
+            "                           requirement checks.  Returns a verdict card per\n"
+            "                           contracts/narration.md — PASS/WARN/FAIL per check.\n"
+            "  check_metadata()         Confirms doc has title, material, and process set.\n\n"
+            "ALSO: check_feature_overlap() and check_interference() run individual checks.\n\n"
+            "BIAS: never report 'done' to a user until verify_battery returns no FAILs.\n"
+            "  A WARN is a judgment call — narrate it; don't silently ignore it.\n"
+            "  Wire req_id into the battery call so requirement fulfilment is checked too."
+        )
+    if topic in ("interaction", "elicitation", "ask_user", "clarify", "questions"):
+        return (
+            "INTERACTION / ELICITATION — the single ask_user seam (contracts/interaction.md)\n\n"
+            "Tool: ask_user(questions, scope?)\n\n"
+            "  ask_user([\n"
+            "    {'id': 'material', 'prompt': 'What material?',\n"
+            "     'type': 'choice', 'choices': ['aluminum', 'steel', 'titanium'],\n"
+            "     'default': 'aluminum'},\n"
+            "    {'id': 'load_n', 'prompt': 'Max load in N?', 'type': 'number', 'default': 500},\n"
+            "  ])\n\n"
+            "  Returns a dict {id: answer} for each question.  Answers persist + replay:\n"
+            "  calling with the same scope + id again returns the stored answer without\n"
+            "  re-prompting the user (idempotent within a session).\n\n"
+            "BIAS: batch all unknowns into ONE ask_user call, not separate calls.\n"
+            "  Use 'default' everywhere — agents should make reasonable assumptions and\n"
+            "  only surface genuinely ambiguous choices.  Scope='run' (default) resets\n"
+            "  each dag_run; scope='session' persists across runs."
+        )
+    if topic in ("sourcing", "bom", "bom_rollup", "bom_price", "vendor", "purchase"):
+        return (
+            "SOURCING / BOM — unified BOM roll-up + approved-provider price resolution\n\n"
+            "Tools: bom_rollup(doc_path) / bom_price(doc_path)\n\n"
+            "  bom_rollup(doc_path)   Roll up the assembly or part tree into a flat BOM.\n"
+            "                         Returns line items: qty, part_id, description, sourcing[].\n"
+            "  bom_price(doc_path)    Resolve live prices via approved providers (Nexar, DK,\n"
+            "                         Mouser); returns costed BOM with unit/ext price columns.\n\n"
+            "WORKFLOW: model → part_place (for standard parts) → bom_rollup → bom_price.\n"
+            "  Each PartRecord from part_search carries a sourcing[] list — bom_rollup\n"
+            "  merges these into the assembly BOM automatically.\n"
+            "BIAS: always prefer part_search/part_place for hardware (fasteners, bearings,\n"
+            "  electrical components) — they arrive pre-sourced.  Custom geometry (made parts)\n"
+            "  get cost estimates from cam_cost_estimate / request_quote."
+        )
+    if topic in ("cost", "cost_estimate", "cam_cost", "quote", "request_quote", "pricing"):
+        return (
+            "COST-OUT — made-part cost model + approved quote-out APIs\n\n"
+            "Tools: cam_cost_estimate(doc_path, material?, process?) / request_quote(doc_path, vendor, qty?)\n\n"
+            "  cam_cost_estimate(doc_path)   Material + machining cost seed from the CAM job.\n"
+            "                                Returns cost_usd_low/mid/high, cycle_time_min.\n"
+            "                                Call AFTER cam_generate so toolpaths exist.\n"
+            "  request_quote(doc_path, vendor, quantity)\n"
+            "                                Submit a quote request to an approved provider.\n"
+            "                                Returns quote_id; provider contacts out-of-band.\n\n"
+            "BIAS: cam_cost_estimate first for internal budget; request_quote for PO decisions.\n"
+            "  Never invent prices — use these tools; the provenance rule applies here too."
+        )
+    if topic in ("spec", "spec_sheet", "spec_sheet_match", "match_part_number",
+                 "datasheet", "mpn", "part_number"):
+        return (
+            "SPEC-SHEET MATCHING — deterministic part-number → standard-part model\n\n"
+            "Tools: match_part_number(mpn) / spec_sheet_match(text_or_url, mpn, template) / list_spec_templates()\n\n"
+            "  match_part_number(mpn)              Resolve an MPN to a PartRecord (BOLTS/KiCad).\n"
+            "                                      Returns part_id usable in part_place.\n"
+            "  spec_sheet_match(text_or_url, mpn, template)\n"
+            "                                      Extract structured parameters from a datasheet\n"
+            "                                      PDF/URL using a named template.\n"
+            "  list_spec_templates()               Show available extraction templates.\n\n"
+            "WORKFLOW: paste/URL a datasheet → spec_sheet_match → part_place with extracted params.\n"
+            "BIAS: use match_part_number before custom geometry — if the MPN resolves, you get\n"
+            "  an editable, pre-sourced part in one call."
+        )
+    if topic in ("piping", "pipe", "pipe_network", "fluid", "pressure_drop",
+                 "piping_solve", "piping_report"):
+        return (
+            "PIPING — routed pipe networks: steady-state 1-D hydraulic solve + CFD handoff\n\n"
+            "Tools: piping_solve / piping_report / piping_operating_point / piping_fluid /\n"
+            "       piping_internal_volume / piping_cfd_handoff / piping_verify_cfd\n\n"
+            "WORKFLOW:\n"
+            "  1. Build pipe network doc (nodes + segments + fittings via part_place).\n"
+            "  2. piping_fluid(name, T, P)          Resolve fluid properties at operating point.\n"
+            "  3. piping_solve(doc, boundary)        1-D hydraulic solve: flows + pressure map.\n"
+            "  4. piping_report(doc)                 Narrated pressure-drop + velocity report.\n"
+            "  5. piping_operating_point(pump_curve, system_curve)\n"
+            "                                        Intersect pump + system curves → duty point.\n"
+            "  6. piping_internal_volume(doc)        Total fluid volume (for line-sizing / purge).\n"
+            "  7. piping_cfd_handoff(doc)            Export mesh + BCs for external CFD solver.\n"
+            "  8. piping_verify_cfd(solve_result)    Validate CFD result against 1-D baseline.\n\n"
+            "BIAS: use piping_solve first (fast, deterministic); escalate to CFD only when\n"
+            "  3-D effects (mixing, cavitation, complex geometry) matter."
+        )
+    if topic in ("hydraulic", "hydraulics", "iso1219", "hydraulic_circuit",
+                 "hydraulic_new", "cylinder", "pump"):
+        return (
+            "HYDRAULIC — ISO 1219 circuit design + component sizing\n\n"
+            "Tools: hydraulic_new / hydraulic_add_component / hydraulic_add_hose /\n"
+            "       hydraulic_size_cylinder / hydraulic_size_pump / hydraulic_bom\n\n"
+            "WORKFLOW:\n"
+            "  hydraulic_new(name)                  Create a new hydraulic circuit doc.\n"
+            "  hydraulic_add_component(doc, type, params)\n"
+            "                                       Add pump, valve, cylinder, reservoir, etc.\n"
+            "                                       (or use part_place with domain='hydraulic').\n"
+            "  hydraulic_add_hose(doc, from, to, params)\n"
+            "                                       Connect components with sized hose/tube.\n"
+            "  hydraulic_size_cylinder(doc, force, stroke, pressure)\n"
+            "                                       Size cylinder bore + rod from load + pressure.\n"
+            "  hydraulic_size_pump(doc, flow, pressure)\n"
+            "                                       Size pump displacement + motor power.\n"
+            "  hydraulic_bom(doc)                   BOM with ISO 1219 part numbers + sourcing.\n\n"
+            "BIAS: size with hydraulic_size_cylinder/size_pump BEFORE placing components —\n"
+            "  it confirms the pressure/flow budget is achievable."
+        )
+    if topic in ("firmware", "fw", "embedded", "mcu", "fw_build", "fw_new_project",
+                 "flash", "debug", "sim_run"):
+        return (
+            "FIRMWARE — embedded compile loop: build, sim, flash, debug\n\n"
+            "Tools: fw_new_project / fw_build / fw_sources / fw_sim_run /\n"
+            "       fw_flash / fw_debug_start / fw_debug_halt / fw_debug_read_mem\n\n"
+            "WORKFLOW:\n"
+            "  fw_new_project(name, mcu_family)     Scaffold a CMake firmware project.\n"
+            "                                       Auto-selects toolchain; generates pinmap.h\n"
+            "                                       from linked ECAD board netlist.\n"
+            "  fw_sources(project_id, add)          Add source files to the project.\n"
+            "  fw_build(project_id)                 Compile; returns ELF path + errors.\n"
+            "  fw_sim_run(project_id, scenario)     Run ELF through Renode/QEMU with assertions.\n"
+            "  fw_flash(elf_path, chip, port)       Flash ELF to target hardware.\n"
+            "  fw_debug_start/halt/read_mem(chip)   GDB-over-SWD debug session controls.\n\n"
+            "BIAS: always fw_sim_run before fw_flash — catches assertion failures without\n"
+            "  hardware.  Link the ECAD board doc so pinmap.h is auto-generated."
+        )
+    if topic in ("structural", "structure", "struct", "struct_analyze", "struct_check",
+                 "struct_estimate", "beam", "frame", "truss", "steel_design"):
+        return (
+            "STRUCTURAL — member forces & deflections for aicad.structure/1 docs (PyNite)\n\n"
+            "Tools: struct_analyze / struct_check / struct_estimate\n\n"
+            "WORKFLOW:\n"
+            "  Build structure doc via part_place(domain='section') for beams/columns.\n"
+            "  struct_analyze(doc_path, load_combo)  Member forces, deflections, reactions.\n"
+            "                                        load_combo: 'DEAD_LIVE' (default),\n"
+            "                                        'DEAD_LIVE_WIND', 'DEAD_LIVE_SEISMIC'.\n"
+            "  struct_check(doc_path, load_combo)    Code check (AISC 360 / NDS) — PASS/FAIL\n"
+            "                                        per member with UC ratios.\n"
+            "  struct_estimate(doc_path)             Quick material + fabrication cost estimate.\n\n"
+            "BIAS: struct_check after struct_analyze — the check references the analysis results.\n"
+            "  Use part_search('W8x31') + part_place for AISC sections; standard-before-custom."
+        )
+    if topic in ("regen", "regen_diagnose", "rebuild", "repair", "fix_ops"):
+        return (
+            "REGEN DIAGNOSIS — on a rebuild failure, diagnose + propose editable fix-ops\n\n"
+            "Tool: regen_diagnose(document_json, reference_json?)\n\n"
+            "  regen_diagnose(document_json)         Diagnose a doc that failed to rebuild.\n"
+            "                                        Returns a verdict card: root cause,\n"
+            "                                        proposed fix-ops as an accept/edit/reject\n"
+            "                                        card, and a correction trace (IP-18 log).\n\n"
+            "WHEN TO USE: call after add_features returns any feature with ok=false, or when\n"
+            "  close_part / export_part / run_fea_* fail with a regen error.\n"
+            "WORKFLOW: add_features → check feature ok flags → if any false, regen_diagnose\n"
+            "  → apply the proposed fix-ops → re-run add_features → verify_battery.\n"
+            "NOTE: regen_diagnose is the backend seam; the copilot binding (T-F17) will\n"
+            "  surface it in the desktop UI automatically."
+        )
+    if topic in ("code_compliance", "code_check", "building_code", "compliance",
+                 "ibc", "asce", "nfpa"):
+        return (
+            "CODE COMPLIANCE — deterministic rule engine + agentic RAG for building-code checks\n\n"
+            "Tool: code_check(doc_path, codes?, jurisdiction?)\n\n"
+            "  code_check(doc_path)                  Run compliance checks against applicable\n"
+            "                                        building codes (IBC, ASCE 7, NFPA, etc.).\n"
+            "                                        Returns PASS/WARN/FAIL per clause with\n"
+            "                                        code citation and remediation hint.\n"
+            "  code_check(doc_path, codes=['IBC2021'], jurisdiction='CA')\n"
+            "                                        Scope to specific code edition + jurisdiction.\n\n"
+            "BIAS: run code_check after struct_check for anything that will be permitted.\n"
+            "  RAG citations are sourced from the research tools (research_fetch_page) —\n"
+            "  the model never recalls code text from training."
+        )
+    if topic in ("serving", "serving_status", "adapter", "lora", "canary",
+                 "serving_promote", "serving_rollback", "serving_evaluate"):
+        return (
+            "ADAPTER SERVING — per-insertion-point LoRA routing: status, canary, promote, rollback\n\n"
+            "Tools: serving_status / serving_set_canary / serving_rollback /\n"
+            "       serving_evaluate / serving_promote\n\n"
+            "  serving_status()                      Show which adapter version is live at each\n"
+            "                                        insertion point + current canary %, eval\n"
+            "                                        scores, and promotion eligibility.\n"
+            "  serving_set_canary(insertion_point, pct)\n"
+            "                                        Dial canary traffic: 0=off, 100=full.\n"
+            "  serving_evaluate(insertion_point, shadow_log)\n"
+            "                                        Score a shadow log against the baseline.\n"
+            "  serving_promote(insertion_point, adapter_version, evidence)\n"
+            "                                        Promote after evidence + human sign-off.\n"
+            "                                        Auto-promote is disabled; always gated.\n"
+            "  serving_rollback(insertion_point, to_version?)\n"
+            "                                        Instantly revert to last stable version.\n\n"
+            "BIAS: evaluate before promote; rollback is always safe and instant."
+        )
+    if topic in ("design_review", "review_battery", "review_design", "full_review"):
+        return (
+            "DESIGN REVIEW BATTERY — one-call battery: overlap + DFM + verify narrated verdict\n\n"
+            "Tool: design_review(doc_id, checks?)\n\n"
+            "  design_review(doc_id)                 Dispatch the full review battery:\n"
+            "                                        feature_overlap, dfm_check, wall_thickness,\n"
+            "                                        draft_analysis, interference (assemblies).\n"
+            "                                        Returns a narrated verdict card per\n"
+            "                                        contracts/narration.md — never raw JSON.\n"
+            "  design_review(doc_id, checks=['dfm', 'overlap'])\n"
+            "                                        Scope to specific checks.\n\n"
+            "RELATIONSHIP TO verify_battery: design_review is geometry-focused (what's wrong\n"
+            "  with the shape); verify_battery is requirement-focused (does it meet the spec).\n"
+            "  Run both before declaring done."
+        )
+    if topic in ("doc_diff", "diff", "compare", "revision", "doc_diff_tool"):
+        return (
+            "DOC DIFF — semantic feature-level diff between two document revisions\n\n"
+            "Tool: doc_diff_tool(rev_a, rev_b)\n\n"
+            "  doc_diff_tool(rev_a, rev_b)           Semantic diff of two part/assembly docs.\n"
+            "                                        Returns: added/removed/changed features\n"
+            "                                        with parameter deltas, body count change,\n"
+            "                                        and a human-readable summary string.\n\n"
+            "WORKFLOW: snapshot doc = close_part(doc_id, return_doc=True) → modify → diff.\n"
+            "  Or compare two versions from PLM history (see cad_guide('plm')).\n"
+            "BIAS: diff after every significant edit session so the change record is explicit."
+        )
+    if topic in ("plm", "versioning", "snapshot", "history", "project_vault"):
+        return (
+            "PLM / PROJECT VAULT — snapshot-based version history (T-R2 fills this topic)\n\n"
+            "Status: PLM tools (plm_*) are reserved for workstream R (T-R1..T-R7).\n"
+            "        This topic stub will be replaced by the full guide when T-R2 lands.\n\n"
+            "Available now via PLM seams:\n"
+            "  doc_diff_tool(rev_a, rev_b)  — diff any two doc snapshots you hold.\n"
+            "  close_part(doc_id)            — returns the serialized doc for snapshotting.\n"
+            "  list_parts()                  — shows all open docs with revision counters.\n\n"
+            "See also: cad_guide('doc_diff') for the diff tool."
+        )
     # Otherwise treat the topic as a per-feature cheatsheet name (hole, fillet, revolve, ...).
     sheet = _read_prompt(f"shared/cheatsheets/{topic}.md")
     if sheet:
@@ -1150,7 +1422,10 @@ def cad_guide_text(topic: str = "overview") -> str:
     avail = sorted(p.stem for p in (_prompts_dir() / "shared" / "cheatsheets").glob("*.md")) \
         if (_prompts_dir() / "shared" / "cheatsheets").is_dir() else []
     return (f"No guide for {topic!r}. Topics: overview, simulation, review, intake, gsl, cam, "
-            f"narration, parts, reverse, deliverables; or a feature cheatsheet: {avail}")
+            f"narration, parts, reverse, deliverables, requirements, dag, verify, interaction, "
+            f"sourcing, cost, spec, piping, hydraulic, firmware, structural, regen, "
+            f"code_compliance, serving, design_review, doc_diff, plm; "
+            f"or a feature cheatsheet: {avail}")
 
 
 # --------------------------------------------------------------------------- register
@@ -1175,10 +1450,27 @@ def register_cad_tools(mcp: FastMCP) -> None:
         text summaries of CAM jobs and FEA/CFD results instead of raw JSON dumps),
         "parts" (standard-parts library: search→get→place workflow, standard-before-custom
         bias, domain routing, editability guarantee, sourcing), "reverse"
-        (reverse-engineering an imported STEP/mesh into an editable feature tree —
-        tools land in a later wave; call it for the current status), or a single feature's
-        cheatsheet by name ("hole", "fillet", "revolve", "loft", "sweep", "shell", "chamfer",
-        "pattern", "mirror", "sketch", "airfoil", "drawing", "hardware", ...).
+        (reverse-engineering an imported STEP/mesh into an editable feature tree),
+        "requirements" (req_create/update/status/report — design-brief CRUD),
+        "dag" (dag_plan/run/status/approve/abort/replan — multi-step mission orchestration),
+        "verify" (verify_battery — done-check before declaring a design finished),
+        "interaction" (ask_user elicitation seam — batch unknowns into one call),
+        "sourcing" (bom_rollup/bom_price — BOM roll-up + approved-provider pricing),
+        "cost" (cam_cost_estimate/request_quote — made-part cost model),
+        "spec" (match_part_number/spec_sheet_match — MPN resolution + datasheet extraction),
+        "piping" (piping_solve/report/... — 1-D hydraulic solve + CFD handoff),
+        "hydraulic" (hydraulic_new/add_component/... — ISO 1219 circuit design),
+        "firmware" (fw_new_project/build/sim_run/flash/debug — embedded compile loop),
+        "structural" (struct_analyze/check/estimate — PyNite member forces + code check),
+        "regen" (regen_diagnose — diagnose + propose fix-ops on rebuild failure),
+        "code_compliance" (code_check — building-code compliance with RAG citations),
+        "serving" (serving_status/set_canary/promote/rollback — LoRA adapter routing),
+        "design_review" (design_review — one-call geometry battery narrated verdict),
+        "doc_diff" (doc_diff_tool — semantic feature-level diff between two revisions),
+        "plm" (project-vault versioning stub — T-R2 fills this),
+        or a single feature's cheatsheet by name ("hole", "fillet", "revolve", "loft",
+        "sweep", "shell", "chamfer", "pattern", "mirror", "sketch", "airfoil",
+        "drawing", "hardware", ...).
         """
         return cad_guide_text(topic)
 

@@ -36,11 +36,45 @@ and adds the mechanical check.
   either the server instructions or a cad_guide topic; fails on future drift
 - work/context/ section packs: refresh services-mcp pack if stale
 
+## Audit table (T-BL26 findings — sonnet-loch, 2026-07-03)
+
+| Family | Key tools | In server instructions? | cad_guide topic? | Verdict |
+|---|---|---|---|---|
+| cad | new_part, add_features, render_part, run_fea_*, export_part | YES | overview/simulation/review | OK |
+| gsl | describe_part, describe_scene, query_adjacency, hover | YES (describe_*/cad_guide('gsl')) | gsl | OK |
+| recon | reverse_engineer, compare_parts, convert_face_to_sketch | comment only | reverse | FIXED (instructions) |
+| intake | intake_status, dfm_check, confirm_dimensions | comment only | intake | FIXED (instructions) |
+| interaction | ask_user | MISSING | MISSING | FIXED (both) |
+| ecad | ecad_new_*, ecad_autoroute, ecad_simulate | YES (ecad_*) | — | FIXED (instructions note ecad) |
+| cam | cam_new_job, cam_add_*, cam_generate, cam_post | MISSING | cam | FIXED (instructions) |
+| doc_diff | doc_diff_tool | MISSING | MISSING | FIXED (both) |
+| req | req_create, req_update, req_status, req_report | MISSING | MISSING | FIXED (both) |
+| verify | verify_battery, check_metadata | MISSING | MISSING | FIXED (both) |
+| research | research_web_search, research_fetch_page | MISSING | — | FIXED (instructions) |
+| deliverables | make_report, make_presentation, make_workbook | MISSING | deliverables | FIXED (instructions) |
+| sourcing | bom_rollup, bom_price | MISSING | MISSING | FIXED (both) |
+| cost | cam_cost_estimate, request_quote | MISSING | MISSING | FIXED (both) |
+| spec | match_part_number, spec_sheet_match | MISSING | MISSING | FIXED (both) |
+| piping | piping_solve, piping_report, piping_cfd_handoff | MISSING | MISSING | FIXED (both) |
+| hydraulic | hydraulic_new, hydraulic_add_component, hydraulic_size_* | MISSING | MISSING | FIXED (both) |
+| firmware | fw_new_project, fw_build, fw_sim_run, fw_flash | MISSING | MISSING | FIXED (both) |
+| structural | struct_analyze, struct_check, struct_estimate | MISSING | MISSING | FIXED (both) |
+| parts | part_search, part_get, part_place | MISSING | parts | FIXED (instructions + bias) |
+| serving | serving_status, serving_set_canary, serving_promote | MISSING | MISSING | FIXED (both) |
+| regen | regen_diagnose | MISSING | MISSING | FIXED (both) |
+| code_compliance | code_check | MISSING | MISSING | FIXED (both) |
+| dag | dag_plan, dag_run, dag_status, dag_approve, dag_replan | MISSING | MISSING | FIXED (both) |
+| design_review | design_review | MISSING | MISSING | FIXED (both) |
+| photo_recon | start/stop_capture_session, request/submit_part_photos | comment only | reverse | OK (subsumed) |
+
+Summary: 21 of 26 families were missing from server instructions; 17 had no cad_guide topic.
+All gaps fixed in commit 7623fbf.
+
 ## Definition of done
 
-- [ ] Audit table committed (tool family -> where taught -> verdict fixed/ok)
-- [ ] Server instructions + cad_guide cover all shipped tool families incl. parts
+- [x] Audit table committed (tool family -> where taught -> verdict fixed/ok)
+- [x] Server instructions + cad_guide cover all shipped tool families incl. parts
       library, CAM overhaul, narration, requirements, doc_diff, DAG tools
-- [ ] Consistency test green and wired into the pytest gate stage
-- [ ] work/context/services-mcp pack refreshed
-- [ ] gate + graphify update .
+- [x] Consistency test green and wired into the pytest gate stage
+- [x] work/context/services-mcp pack refreshed
+- [x] gate + graphify update . (graphify done; gate stages 1-3 PASS, stage 4 running)

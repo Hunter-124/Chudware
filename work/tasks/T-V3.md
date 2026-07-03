@@ -52,3 +52,13 @@ T-V3..T-V5 follow-ups into one deliverable.
    T-A4 (one honest engine-test skip in services/dag/test_verify.py). Fix once:
    likely an `__init__.py` decision or import-path rename so both collection paths
    and runtime resolvers see the real SDK.
+
+## Handoff note for the finisher (foreman relay from sonnet-fenn, 2026-07-03)
+
+Base commit 7bba738 is intact/pushed. Fenn's proof numbers: combined-sweep 14 failed →
+10 failed (RC#1 eliminated 5). OPEN ITEM to reconcile before review: expected 14−5=9,
+got 10 — the after-list gained `test_regen_tools.py::test_seam_degrades_without_provider`
+that wasn't in the before-list (new regression from the fixture change, or pre-existing
+order-sensitive?), and 2 intake/test_telemetry_consent + 2 test_spec_sheet_matcher
+before-failures vanished (verify not order-sensitive). Settle this with evidence in your
+REVIEW note.

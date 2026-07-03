@@ -2,8 +2,8 @@
 id: T-BL28
 title: Surfaces — ruled/fill/boundary forms feed body-edge picks the engine rejects (needs sketch refs)
 workstream: backlog
-owner: unassigned
-status: todo
+owner: opus-vela
+status: doing
 branch: task/T-BL28-surf-edge-wells
 depends_on: []
 priority: 2

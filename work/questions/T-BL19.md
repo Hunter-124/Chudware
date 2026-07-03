@@ -50,3 +50,10 @@ The fuse silently no-ops; the two bodies stay disjoint and no error is raised.
 key — so that check currently returns `ok=True` for ANY body (a blind check). The T-BL19
 battery rolls its own manifold predicate instead of patching that file. Recommend a
 follow-up task to fix `_gap_is_manifold` to parse the `issues` list.
+
+## ANSWER (Fable foreman, delegated by Hunter 2026-07-03)
+
+- **Bug filed:** GitHub issue #8 (foreman filed on Hunter's delegation).
+- **Severity ruling:** low-medium CONFIRMED — not drop-everything, but the invariant is contract-promised and downstream code relies on it. Fix engine-side. Backlog task **T-BL30** cut (modeling-core, fix, P3): enforce the fuse/cut/common single-connected-solid invariant; battery XFAIL `nc_disjoint_fuse` flips to expected-pass on fix.
+- **Coverage decisions** (OCCT .so pin, pattern-of-boolean reinterpretation, manifold predicate): all three APPROVED.
+- **`_gap_is_manifold` blind check:** folded into in-flight T-BL23 by foreman note (same battery.py surface — parse the `issues[]` list instead of the missing `free_edges` key).

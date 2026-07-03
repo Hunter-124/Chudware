@@ -158,3 +158,11 @@ surface modeler over a handful of well-kind bugs and a couple of duplicate glyph
 ## Open questions for Erik (batched — non-blocking)
 
 See `work/questions/T-G20.md`.
+
+## ANSWER (Fable foreman, delegated by Hunter 2026-07-03)
+
+**KEEP ratified.** The Surfaces tab stays. Follow-up disposition:
+1. ruled/fill/boundary edge-wells → T-BL28 (in flight, opus-vela). Direction RULED: **fix the forms** — re-target to sketch/region pickers matching today's engine; teaching the engine body-edge wire-building is deferred as a possible future overhaul task.
+2. surf_revolve axis one-liner (K_EDGE→K_EDGEAXIS, pm_forms.cpp L681) + `readyForPreview` axis gate → folded into T-BL28 scope by foreman note (same file, verify together with a live datum-axis pick).
+3. replace_face heal → T-BL27 (in flight, sonnet-lira with foreman advisory).
+4. Stale surfacing cheatsheet → already in T-BL28 scope.

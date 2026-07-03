@@ -12,11 +12,11 @@
 #include "ui/cam_panel.h"            // T-U3 CAM workspace (AI_CAD_SHOT=cam_workspace)
 #include "ui/bom_panel.h"
 #include "ui/requirements_panel.h"   // T-U5
-#include "ui/transparency_panel.h"   // T-U8
-#include "ui/sim_panel.h"                       // T-U6: sim studies (AI_CAD_SHOT=sim_studies)
+#include "ui/transparency_panel.h"
 #include "ui/piping_panel.h"       // T-U7 piping viewer
 #include "ui/hydraulic_panel.h"    // T-U7 hydraulic viewer
-#include "ui/structural_panel.h"   // T-U7 structural viewer
+#include "ui/structural_panel.h"   // T-U7 structural viewer   // T-U8
+#include "ui/sim_panel.h"                       // T-U6: sim studies (AI_CAD_SHOT=sim_studies)
 #include "artifact_view.h"
 #include "app/app_state.h"
 #include "viewport/scene.h"
@@ -234,9 +234,6 @@ int ShotConfig::captureFrameBudget() const {
     if (wantRequirements && !requirementsShotDone) return 150;  // T-U5
     if (wantTransparency && !transparencyShotDone) return 150;  // T-U8
     if (wantSimStudies && !simStudiesShotDone) return 150;
-    if (wantPiping && !pipingShotDone) return 150;
-    if (wantHydraulic && !hydraulicShotDone) return 150;
-    if (wantStructural && !structuralShotDone) return 150;
     if (wantTree) return treeShotDone ? 10 : 30;
     if (wantEquations) return equationsShotDone ? 10 : 30;
     if (wantPartsBrowser) return partsBrowserShotDone ? 10 : 30;
@@ -286,10 +283,10 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantBom          = eq("bom");
     cfg.wantRequirements = eq("requirements");   // T-U5
     cfg.wantTransparency = eq("transparency");   // T-U8
-    cfg.wantSimStudies   = eq("sim_studies");   // T-U6
     cfg.wantPiping       = eq("piping_view");       // T-U7
     cfg.wantHydraulic    = eq("hydraulic_view");    // T-U7
     cfg.wantStructural   = eq("structural_view");   // T-U7
+    cfg.wantSimStudies   = eq("sim_studies");   // T-U6
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
@@ -339,7 +336,6 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantBom)          ui::openBomPanel();
     if (cfg.wantRequirements) ui::openRequirementsPanel();  // T-U5
     if (cfg.wantTransparency) ui::openTransparencyPanel();  // T-U8
-    if (cfg.wantSimStudies)   ui::openSimStudiesPanel();  // T-U6
     if (cfg.wantPiping) {       // T-U7 — seed fixture immediately (no worker needed)
         ui::openPipingPanel();
         const std::string pipDoc = R"({"schema":"aicad.piping/1","id":"fix-p","name":"Demo Piping","units":{"system":"MMGS"},"material":"A106-B","runs":[{"id":"r1","name":"Header","nps":2.0,"schedule":"40","path":[[0,0,0],[1000,0,0]],"end_type":"BW","material":null,"bend_radius":null,"suppressed":false},{"id":"r2","name":"Branch","nps":1.5,"schedule":"40","path":[[1000,0,0],[1000,500,0]],"end_type":"BW","material":null,"bend_radius":null,"suppressed":false}],"fittings":[{"id":"ft1","type":"tee","name":"Tee","nps":2.0,"nps2":null,"origin":[1000,0,0],"orient":[0,0,0],"schedule":"40","material":null,"catalog_ref":null,"params":{},"suppressed":false}]})";
@@ -361,6 +357,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
         ui::seedStructuralPanelFromJson(strDoc, strRes);
         cfg.structuralShotDone = true;
     }
+    if (cfg.wantSimStudies)   ui::openSimStudiesPanel();  // T-U6
     if (cfg.wantPick) setupPickShot(st);
     if (cfg.wantGlassperf) setupPickShot(st);
 
@@ -673,8 +670,9 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
             std::printf("transparency: fixture seeded (live unavailable: %s)\n",
                         err.c_str());
         }
-    // T-U7: piping network viewer one-shot.
-    // Try live piping_solve; fall back to deterministic fixture (water loop with two runs).
+        std::fflush(stdout);
+    }
+
     if (cfg.wantPiping && !cfg.pipingShotDone) {
         cfg.pipingShotDone = true;
         // Fixture: a simple two-run water loop (header + branch) with a solved result.
@@ -689,23 +687,30 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
                  "path":[[0,0,0],[1000,0,0]],"end_type":"BW","material":null,"bend_radius":null,"suppressed":false},
                 {"id":"r2","name":"Branch","nps":1.5,"schedule":"40",
                  "path":[[1000,0,0],[1000,500,0]],"end_type":"BW","material":null,"bend_radius":null,"suppressed":false}
+            ],
             "fittings": [
                 {"id":"ft1","type":"tee","name":"Main Tee","nps":2.0,"nps2":null,
                  "origin":[1000,0,0],"orient":[0,0,0],"schedule":"40","material":null,"catalog_ref":null,"params":{},"suppressed":false}
+            ]
         })";
         const std::string pipingSolveFixture = R"({
+            "ok": true,
             "converged": true,
             "iterations": 4,
             "links": [
                 {"run_id":"r1","flow_m3h":15.2,"velocity_ms":1.7,"pressure_drop_kpa":8.3},
                 {"run_id":"r2","flow_m3h":6.8,"velocity_ms":1.4,"pressure_drop_kpa":4.1}
+            ],
             "nodes": [
                 {"node_id":"n0","pressure_kpa":120.0,"head_m":12.2},
                 {"node_id":"n1","pressure_kpa":111.7,"head_m":11.4}
+            ]
         })";
         ui::seedPipingPanelFromJson(pipingDocFixture, pipingSolveFixture);
         std::printf("piping_view: fixture seeded\n");
-    // T-U7: hydraulic schematic viewer one-shot.
+        std::fflush(stdout);
+    }
+
     if (cfg.wantHydraulic && !cfg.hydraulicShotDone) {
         cfg.hydraulicShotDone = true;
         const std::string hydDocFixture = R"({
@@ -719,12 +724,14 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
                 {"id":"c3","type":"valve_relief","name":"Relief Valve","x":400,"y":0,"params":{"set_pressure_bar":200}},
                 {"id":"c4","type":"valve_directional","name":"4/3 DCV","x":600,"y":0,"params":{}},
                 {"id":"c5","type":"cylinder_linear","name":"Lift Cylinder","x":800,"y":0,"params":{"bore_mm":50,"rod_mm":25,"stroke_mm":300}}
+            ],
             "hoses": [
                 {"id":"h1","from_port":{"comp_id":"c1","port":"generic"},"to_port":{"comp_id":"c2","port":"generic"}},
                 {"id":"h2","from_port":{"comp_id":"c2","port":"pressure"},"to_port":{"comp_id":"c3","port":"generic"}},
                 {"id":"h3","from_port":{"comp_id":"c2","port":"pressure"},"to_port":{"comp_id":"c4","port":"pressure"}},
                 {"id":"h4","from_port":{"comp_id":"c4","port":"work_a"},"to_port":{"comp_id":"c5","port":"generic"}},
                 {"id":"h5","from_port":{"comp_id":"c4","port":"tank"},"to_port":{"comp_id":"c1","port":"generic"}}
+            ],
             "annotations": []
         })";
         // Sizing results: pump + cylinder pre-computed
@@ -734,7 +741,9 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
         })";
         ui::seedHydraulicPanelFromJson(hydDocFixture, hydSizingFixture);
         std::printf("hydraulic_view: fixture seeded\n");
-    // T-U7: structural frame viewer one-shot.
+        std::fflush(stdout);
+    }
+
     if (cfg.wantStructural && !cfg.structuralShotDone) {
         cfg.structuralShotDone = true;
         const std::string structDocFixture = R"({
@@ -748,6 +757,7 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
                  "length_mm":4000,"transform":[1,0,0,0,0,1,0,0,0,0,1,0,3000,0,0,1]},
                 {"id":"e3","element_type":"column","section_name":"W8x31","material":"steel",
                  "length_mm":3000,"transform":[1,0,0,0,0,1,0,0,0,0,1,0,7000,0,0,1]}
+            ],
             "load_cases": []
         })";
         // Analysis results: D/C ratios + deflections

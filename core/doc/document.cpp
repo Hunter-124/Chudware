@@ -3430,6 +3430,18 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     // combine: build123d's `+` runs .clean() (ShapeUpgrade_UnifySameDomain),
                     // so flush coplanar faces from the two welded blocks merge into one. Match it.
                     out = ::geom::unify_same_domain(out);
+                    // NO SILENT DISJOINT FUSE (issue #8): the BOOLEAN contract in
+                    // ops_cheatsheet.md promises a fuse produces ONE connected solid. Two
+                    // operands that don't intersect or touch still pass BRepAlgoAPI_Fuse's
+                    // IsDone() — OCCT happily returns a >1-solid compound — so mirror the
+                    // disjoint check the cut/intersect branch below already applies instead of
+                    // silently accepting a multi-body "fuse".
+                    int nsolids = 0;
+                    for (TopExp_Explorer sx(out, TopAbs_SOLID); sx.More(); sx.Next()) ++nsolids;
+                    if (nsolids != 1)
+                        throw std::runtime_error(
+                            "boolean: fuse produced " + std::to_string(nsolids) +
+                            " disjoint solids (operands must intersect or touch)");
                 } else {
                     // subtract / intersect: the oracle (boolean.py) calls getattr(result,
                     // "volume", 0.0) <= 1e-9 -> FAIL. build123d's `volume` attribute is

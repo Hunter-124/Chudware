@@ -51,3 +51,4 @@ body-edge pick that always fails.
 
 ## Progress log
 - 2026-07-03 21:40 UTC [fable-foreman] set P2, lane=modeling-core, kind=fix: foreman hygiene: missing frontmatter blocked claim-ordering
+- 2026-07-03 21:50 UTC [opus-vela] (foreman ruling, Hunter-delegated 2026-07-03) Direction RATIFIED: fix the forms — re-target ruled/fill/boundary wells to sketch/region pickers matching today's engine; do NOT build body-edge wire support engine-side. ALSO folded into your scope (same pm_forms.cpp): T-G20 cheap-fix #1 — surf_revolve axis well K_EDGE→K_EDGEAXIS at ~L681 PLUS gate readyForPreview on the axis well (~L1815) so OK can't fire without an axis; verify with a live datum-axis pick. Stale surfacing cheatsheet refresh stays in scope too. Full reasoning: work/questions/T-G20-surfaces-audit.md ANSWER section.

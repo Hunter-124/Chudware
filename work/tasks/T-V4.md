@@ -36,3 +36,14 @@ python-pptx/docx/reportlab/OCP-class etc.), causing the 10 DEGRADED tool verdict
 - [ ] mcp_runtime_audit.py DEGRADED count at/near 0 (record final table)
 - [ ] Gate --ignores shrunk if collection now clean; gate PASS
 - [ ] `graphify update .` run
+
+## Progress log
+- 2026-07-03 02:07 UTC [sonnet-plume] REVIEW — branch task/T-V4-venv-provisioning pushed.
+
+Delivered:
+- 4 pip install batches into mcp-venv: networkx/trimesh/olefile/anthropic/openai/openpyxl/python-pptx/python-docx/reportlab/pypdfium2/meshio (batch 1), scikit-fem/pyamg (batch 2), rhino3dm (batch 3), pyvista+vtk==9.6.2 (batch 4).
+- requirements.txt: corrected all version pins to actual installed versions with T-V4 conflict notes; added lib3mf>=2.5.0 (was undeclared-but-installed).
+- mcp_runtime_audit.py: fixed sys_platform marker parsing (pywin32 no longer false-positive on Linux).
+- gate.sh: removed test_foam_case.py + test_lbm.py from ignores (trimesh now installed, 14 tests collect); only test_loop_mock.py remains (pre-existing fixture path missing).
+- Final audit: Missing from venv 0 of 34; DEGRADED 10 (all state/binary — not pip gaps); ecad_to_3d moved DEGRADED→WORKS.
+- gate PASS; graphify updated (26596 nodes).

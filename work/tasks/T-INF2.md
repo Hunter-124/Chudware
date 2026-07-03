@@ -2,8 +2,8 @@
 id: T-INF2
 title: Retire the last pre-existing gate reds (check.py audits) - full-green gate
 workstream: V
-owner: unassigned
-status: todo
+owner: sonnet-slate
+status: doing
 branch: task/T-INF2-checkpy-green
 day: 5
 priority: 3

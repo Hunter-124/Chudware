@@ -2,13 +2,20 @@
 
 Updated: 2026-07-03 by fable-foreman → **WIND-DOWN MODE** (Hunter wants the wheel back).
 
-## MODE: WIND-DOWN (Hunter directive, 2026-07-03)
-Hunter is taking direct control of direction for the next stretch to steer the
-ambitious, human-review-heavy work. Foreman job now:
-- **NO new dispatch.** No wave 2, no new claims, no new task cuts except closeout bookkeeping.
-- Let in-flight agents CONVERGE. Merge clean review branches; **park (don't re-dispatch)**
-  anything that needs rework or whose driver dies. Goal = a QUIET board handed to Hunter.
-- Keep answering questions (advisor role) but open no new fronts.
+## MODE: FOREMAN OFFLINE — handed off to two OPUS DRIVER sessions (2026-07-03)
+fable-foreman (this Fable session) is winding DOWN. Direction + execution handed to two
+human-run OPUS driver sessions running in parallel:
+- **opus-hunter** (Hunter) — product/app-gui focus: the GUI+sketch+Copilot clusters + design
+  tasks (T-R1 PLM, T-BL45 3D sketcher). Identity already Hunter's; --owner opus-hunter explicit.
+- **mooseinatree** — modeling-core/interop focus: T-BL02, sketch-projection engine (T-BL43),
+  .3dm/DXF importers, engine work. Own machine/checkout: whoami --github mooseinatree once.
+Both are AWARE of each other (team_send broadcast posted). Coordinate via the board: claim()
+atomically before working, note() progress, STOP AT REVIEW (never merge — human/foreman action),
+run work_board/team_status first. No live foreman merges right now — review branches queue for a
+later human/foreman merge pass.
+
+Prior mode (still the discipline): NO auto-dispatch by anyone; converge in-flight; park don't
+re-drive dead work; the goal was a quiet board — now handed off.
 
 ## Standing orders (still binding)
 - Identity: commits author as Hunter-124. NEVER `git config user.*`, NEVER `whoami` — --owner explicit.

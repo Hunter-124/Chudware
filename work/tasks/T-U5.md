@@ -2,8 +2,8 @@
 id: T-U5
 title: Requirements & verification panel — req status, battery results
 workstream: U
-owner: unassigned
-status: todo
+owner: sonnet-dove
+status: doing
 branch: task/T-U5-ui
 day: 5
 priority: 3

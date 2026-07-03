@@ -2,8 +2,8 @@
 id: T-BL20
 title: FEA/CFD V&V cross-validation - MacNeal-Harder/NAFEMS cases + CalculiX second opinion
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-doro
+status: doing
 branch: task/T-BL20-fea-vv-crossval
 depends_on: []
 lane: simulation

@@ -13,9 +13,16 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
 # Allow `python mcp_server/test_cad_tools.py` (script dir, not repo root, lands on path).
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# T-V3 fix: .resolve() first so this lands on repo root regardless of whether the file was
+# reached via the mcp_server/ symlink or its real services/mcp/ path — dirname(dirname(...))
+# on the unresolved path landed on services/ when pytest collects the real path, which makes
+# services/mcp/ itself resolve as a top-level `mcp` package, shadowing the real installed SDK.
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import pytest
 

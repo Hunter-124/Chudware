@@ -110,7 +110,7 @@ class TestExecutorSmoke:
         assert event_types.count("dag.node.done") == 2
 
     def test_importable_as_from_dag_import_executor(self) -> None:
-        """DoD: `from dag import executor` must work (services/ on sys.path per conftest)."""
+        """DoD: `from dag import executor` must work (dag -> services/dag repo-root symlink)."""
         from dag import executor as _exec  # noqa: F401
         assert callable(_exec.run)
 

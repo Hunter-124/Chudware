@@ -3,7 +3,7 @@ id: T-C5
 title: firmware.md agent prompt and demo firmware in Renode
 workstream: C
 owner: sonnet-reed
-status: doing
+status: review
 branch: task/T-C5-firmware-agent-demo
 day: 5
 priority: 3

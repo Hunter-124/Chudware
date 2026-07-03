@@ -2278,8 +2278,23 @@
   "appr_metal",
   "appr_plastic",
   "chamfer",
+  "circular_pattern",
+  "combine",
+  "curve_helix",
   "extrude_boss",
   "fillet",
-  "shell"
+  "intersect",
+  "linear_pattern",
+  "loft",
+  "loft_cut",
+  "mirror",
+  "revolve_boss",
+  "revolve_cut",
+  "shell",
+  "sm_base_flange",
+  "sm_flat_pattern",
+  "subtract",
+  "sweep",
+  "sweep_cut"
  ]
 }

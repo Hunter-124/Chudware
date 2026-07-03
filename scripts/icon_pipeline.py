@@ -88,16 +88,46 @@ def appearance(metallic: float, roughness: float, rgb: tuple[float, float, float
             "metallic": metallic, "roughness": roughness}
 
 
-def sketch(entities: list, plane: str = "plane.front", name: str = "Sk") -> dict:
-    """Single add_feature step that creates a sketch WITH inline entities (params.entities).
-    Using inline entities keeps each iconpipe step self-contained (one add_feature op per
-    applyOps call). The feature is assigned a persistent id by the engine (f1, f2, ...) which
-    later steps reference by that id -- NOT $N batch-local refs (those only work within one
-    applyOps batch; each step is its own call in the runner)."""
-    return {"op": "add_feature", "feature": {
+def sketch(entities: list, plane: str = "plane.front", name: str = "Sk",
+           sketch_id: str | None = None) -> list:
+    """Returns a LIST of iconpipe steps: one empty add_feature + one sketch_add_entity
+    per entity.  The runner applies each step as its own applyOps call; inline
+    params.entities is NOT supported by the engine (the sketch is always created empty,
+    then entities are added via sketch_add_entity — proven empirically, see T-BL29 log).
+    sketch_id is the persistent feature id the engine will assign (e.g. 'f1') — used so
+    sketch_add_entity steps reference the right sketch.  If omitted, callers must pass
+    the id via the recipe's steps directly."""
+    steps: list = [{"op": "add_feature", "feature": {
         "type": "sketch", "name": name,
-        "params": {"entities": entities, "constraints": []},
-        "refs": {"plane": plane}}}
+        "params": {"entities": [], "constraints": []},
+        "refs": {"plane": plane}}}]
+    if sketch_id:
+        for ent in entities:
+            steps.append({"op": "sketch_add_entity", "sketch": sketch_id, "entity": ent})
+    else:
+        # Caller must add sketch_add_entity steps manually with the correct id,
+        # or use sketch_with_id() below.
+        for ent in entities:
+            steps.append({"_sketch_entity_deferred": True, "entity": ent})
+    return steps
+
+
+def sketch_with_id(entities: list, plane: str, name: str, fid: str,
+                   offset: float | None = None) -> list:
+    """Returns a LIST of iconpipe steps for a sketch at a known persistent feature id.
+    Creates the sketch empty, then adds each entity via sketch_add_entity referencing fid.
+    Optional offset (mm) shifts the plane along its normal (for loft sections at height)."""
+    feat: dict = {
+        "type": "sketch", "name": name,
+        "params": {"entities": [], "constraints": []},
+        "refs": {"plane": plane},
+    }
+    if offset is not None:
+        feat["offset"] = offset
+    steps: list = [{"op": "add_feature", "feature": feat}]
+    for ent in entities:
+        steps.append({"op": "sketch_add_entity", "sketch": fid, "entity": ent})
+    return steps
 
 
 def datum(axis: str) -> dict:
@@ -126,200 +156,154 @@ def body_sel(feature_id: str) -> dict:
 
 RECIPES: dict[str, dict] = {
     # -----------------------------------------------------------------------
-    # Features -> 3D Body (first tranche: extrude_boss already live; adding remaining)
+    # Features -> 3D Body
     # -----------------------------------------------------------------------
 
-    # A plain solid block reads as "create a 3D body / boss".
+    # Plain solid block reads as "create a 3D body / boss".
     "extrude_boss": {"yaw": 35, "pitch": 26, "steps": [box(52, 40, 34)]},
 
-    # revolve_boss: L-shaped cross-section on plane.front, revolved 360° around the
-    # Y-axis.  plane.front is the XZ plane (right=X, up=Z); the axis is X=0 in the sketch,
-    # which maps to the world Y-axis (axis=[0,1,0]).  Profile stays at sketch-x > 0 (= world
-    # X > 0) so it never crosses the axis (cheatsheet mistake #1).
+    # revolve_boss: stepped-rectangle profile on plane.front (XZ), revolve around Z axis.
+    # plane.front = XZ; sketch-x = world-X, sketch-y = world-Z.
+    # Profile at sketch-x=[5,20] (world X), sketch-y=[-18,18] (world Z).
+    # Revolve axis = Z (world Z, which lies IN the XZ plane at X=0).
+    # Result: hollow cylinder (inner r=5, outer r=20, height=36mm), like a cup/boss.
+    # f1=sketch, f2=revolve.
     "revolve_boss": {"yaw": 35, "pitch": 20, "steps": [
-        # Step 1: sketch (plane.front = XZ). axis at sketch-x=0 (construction),
-        # L-profile at sketch-x=4..22 (world X=4..22).
-        sketch([
-            {"type": "line", "p1": [0, -20], "p2": [0, 20], "id": "axis",
-             "construction": True},
-            {"type": "line", "p1": [4, -18], "p2": [22, -18], "id": "e1"},
-            {"type": "line", "p1": [22, -18], "p2": [22, 10], "id": "e2"},
-            {"type": "line", "p1": [22, 10], "p2": [12, 10], "id": "e3"},
-            {"type": "line", "p1": [12, 10], "p2": [12, 18], "id": "e4"},
-            {"type": "line", "p1": [12, 18], "p2": [4, 18], "id": "e5"},
-            {"type": "line", "p1": [4, 18], "p2": [4, -18], "id": "e6"},
-        ], plane="plane.front", name="RevolveSk"),
-        # Step 2: revolve 360° about the axis line in the sketch (Y-axis in world).
-        # axis centroid=[0,0,0], axis=[0,1,0] matches the construction line at sketch-x=0
-        # on plane.front (XZ).  owner_feature="f1" is the sketch id.
+        *sketch_with_id([
+            {"type": "line", "p1": [5, -18], "p2": [20, -18], "id": "e1"},
+            {"type": "line", "p1": [20, -18], "p2": [20, 18], "id": "e2"},
+            {"type": "line", "p1": [20, 18], "p2": [5, 18], "id": "e3"},
+            {"type": "line", "p1": [5, 18], "p2": [5, -18], "id": "e4"},
+        ], plane="plane.front", name="RevolveSk", fid="f1"),
         {"op": "add_feature", "feature": {
             "type": "revolve", "name": "Revolve1",
             "params": {"mode": "boss", "angle": dim(360)},
             "refs": {
-                "profile": [region("f1", 13, 0)],
-                "axis": axis_edge("f1", 0, 0, 0, 0, 1, 0, 40),
-            }}}]},
+                "profile": [region("f1", 12, 0)],
+                "axis": datum("axis.z"),
+            }}},
+    ]},
 
-    # revolve_cut: open cylinder (sketch+extrude) with a revolved groove cut
+    # revolve_cut: circle extrude cylinder → revolve-cut a groove.
+    # f1=circle sketch, f2=cylinder extrude, f3=groove sketch, f4=revolve-cut.
     "revolve_cut": {"yaw": 35, "pitch": 20, "steps": [
-        # Step 1: cylinder via circle sketch + extrude
-        sketch([
+        *sketch_with_id([
             {"type": "circle", "center": [0, 0], "radius": 20, "id": "c1"},
-        ], plane="plane.top", name="CylSk"),
+        ], plane="plane.top", name="CylSk", fid="f1"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Cyl1",
             "params": {"mode": "boss", "depth": dim(40)},
             "refs": {"profile": [region("f1", 0, 0)]}}},
-        # Step 2: groove profile on plane.front (XZ).  Cyl extrudes +Z from Z=0 to Z=40.
-        # Groove cross-section: thin rect at world-X=[12,20], world-Z=[17,23] (mid-height).
-        # In plane.front coords: sketch-x=world-X, sketch-y=world-Z.
-        sketch([
-            {"type": "line", "p1": [0, -25], "p2": [0, 25], "id": "axis",
-             "construction": True},
+        # Groove: thin rect at world-X=[12,20], world-Z=[17,23] on plane.front
+        *sketch_with_id([
+            {"type": "line", "p1": [0, -25], "p2": [0, 25], "id": "axis", "construction": True},
             {"type": "line", "p1": [12, 17], "p2": [20, 17], "id": "g1"},
             {"type": "line", "p1": [20, 17], "p2": [20, 23], "id": "g2"},
             {"type": "line", "p1": [20, 23], "p2": [12, 23], "id": "g3"},
             {"type": "line", "p1": [12, 23], "p2": [12, 17], "id": "g4"},
-        ], plane="plane.front", name="GrooveSk"),
-        # Step 3: revolve-cut 360° about Y-axis (sketch-x=0 on plane.front)
+        ], plane="plane.front", name="GrooveSk", fid="f3"),
         {"op": "add_feature", "feature": {
             "type": "revolve", "name": "Groove1",
             "params": {"mode": "cut", "angle": dim(360)},
             "refs": {
                 "profile": [region("f3", 16, 20)],
-                "axis": axis_edge("f3", 0, 0, 0, 0, 1, 0, 50),
-            }}}]},
+                "axis": datum("axis.z"),
+            }}},
+    ]},
 
-    # sweep: circle profile swept along an L-path -- classic pipe / rail icon
-    # Profile sketch (f1) on plane.right (YZ), path sketch (f2) on plane.top (XY).
+    # sweep: circle profile (f1) on plane.right, L-path (f2) on plane.top → pipe.
     "sweep": {"yaw": 40, "pitch": 28, "steps": [
-        # Step 1: circular profile (r=5) on plane.right
-        sketch([
+        *sketch_with_id([
             {"type": "circle", "center": [0, 0], "radius": 5, "id": "c1"},
-        ], plane="plane.right", name="SwProf"),
-        # Step 2: L-shaped open path on plane.top
-        sketch([
+        ], plane="plane.right", name="SwProf", fid="f1"),
+        *sketch_with_id([
             {"type": "line", "p1": [0, 0], "p2": [30, 0], "id": "p1"},
             {"type": "line", "p1": [30, 0], "p2": [30, 25], "id": "p2"},
-        ], plane="plane.top", name="SwPath"),
-        # Step 3: sweep (profile=f1, path=f2)
+        ], plane="plane.top", name="SwPath", fid="f2"),
         {"op": "add_feature", "feature": {
             "type": "sweep", "name": "Pipe1",
             "params": {"mode": "boss"},
             "refs": {
                 "profile": [region("f1", 0, 0)],
                 "path": region("f2", 15, 0),
-            }}}]},
+            }}},
+    ]},
 
-    # sweep_cut: same pipe host, then sweep-cut a slot along a curved path
+    # sweep_cut: base block (f1 sketch, f2 extrude), cut profile (f3 sketch),
+    # path (f4 sketch), sweep-cut (f5).
     "sweep_cut": {"yaw": 40, "pitch": 28, "steps": [
-        # Step 1: base block
-        sketch([
+        *sketch_with_id([
             {"type": "line", "p1": [-25, -15], "p2": [25, -15], "id": "b1"},
             {"type": "line", "p1": [25, -15], "p2": [25, 15], "id": "b2"},
             {"type": "line", "p1": [25, 15], "p2": [-25, 15], "id": "b3"},
             {"type": "line", "p1": [-25, 15], "p2": [-25, -15], "id": "b4"},
-        ], plane="plane.top", name="BaseSk"),
+        ], plane="plane.top", name="BaseSk", fid="f1"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Base1",
             "params": {"mode": "boss", "depth": dim(20)},
             "refs": {"profile": [region("f1", 0, 0)]}}},
-        # Step 2: small square cut profile on plane.right
-        sketch([
+        *sketch_with_id([
             {"type": "line", "p1": [-4, 8], "p2": [4, 8], "id": "c1"},
             {"type": "line", "p1": [4, 8], "p2": [4, 16], "id": "c2"},
             {"type": "line", "p1": [4, 16], "p2": [-4, 16], "id": "c3"},
             {"type": "line", "p1": [-4, 16], "p2": [-4, 8], "id": "c4"},
-        ], plane="plane.right", name="CutProf"),
-        # Step 3: straight path on plane.top
-        sketch([
+        ], plane="plane.right", name="CutProf", fid="f3"),
+        *sketch_with_id([
             {"type": "line", "p1": [-20, 0], "p2": [20, 0], "id": "p1"},
-        ], plane="plane.top", name="CutPath"),
-        # Step 4: sweep-cut
+        ], plane="plane.top", name="CutPath", fid="f4"),
         {"op": "add_feature", "feature": {
             "type": "sweep", "name": "SlotCut",
             "params": {"mode": "cut"},
             "refs": {
                 "profile": [region("f3", 0, 12)],
                 "path": region("f4", 0, 0),
-            }}}]},
+            }}},
+    ]},
 
-    # loft: circle at bottom, square at top (50mm up) -- the classic blend icon
+    # loft: circle (f1, Z=0) → square (f2, Z=50) → loft boss (f3).
     "loft": {"yaw": 35, "pitch": 30, "steps": [
-        # Step 1: circle sketch on plane.top (Z=0)
-        sketch([
+        *sketch_with_id([
             {"type": "circle", "center": [0, 0], "radius": 18, "id": "c1"},
-        ], plane="plane.top", name="LoftBot"),
-        # Step 2: square sketch on plane.top offset 50mm up
-        # offset is a TOP-LEVEL feature field (document.cpp reads feat.at("offset"),
-        # not params.offset); refs.plane sets the base plane.
-        {"op": "add_feature", "feature": {
-            "type": "sketch", "name": "LoftTop",
-            "params": {
-                "entities": [
-                    {"type": "line", "p1": [-12, -12], "p2": [12, -12], "id": "s1"},
-                    {"type": "line", "p1": [12, -12], "p2": [12, 12], "id": "s2"},
-                    {"type": "line", "p1": [12, 12], "p2": [-12, 12], "id": "s3"},
-                    {"type": "line", "p1": [-12, 12], "p2": [-12, -12], "id": "s4"},
-                ],
-                "constraints": [],
-            },
-            "offset": 50,
-            "refs": {"plane": "plane.top"}}},
-        # Step 3: loft (sections: f1 bottom, f2 top)
+        ], plane="plane.top", name="LoftBot", fid="f1"),
+        *sketch_with_id([
+            {"type": "line", "p1": [-12, -12], "p2": [12, -12], "id": "s1"},
+            {"type": "line", "p1": [12, -12], "p2": [12, 12], "id": "s2"},
+            {"type": "line", "p1": [12, 12], "p2": [-12, 12], "id": "s3"},
+            {"type": "line", "p1": [-12, 12], "p2": [-12, -12], "id": "s4"},
+        ], plane="plane.top", name="LoftTop", fid="f2", offset=50),
         {"op": "add_feature", "feature": {
             "type": "loft", "name": "Blend1",
             "params": {"mode": "boss"},
-            "refs": {
-                "sections": [region("f1", 0, 0), region("f2", 0, 0)],
-            }}}]},
+            "refs": {"sections": [region("f1", 0, 0), region("f2", 0, 0)]}}},
+    ]},
 
-    # loft_cut: sketch+extrude block (non-centered, top at Z=36) with a loft-cut pocket
+    # loft_cut: block (f1 sketch, f2 extrude) with loft-cut pocket
+    # from large circle (f3, Z=36) to small square (f4, Z=16) → loft-cut (f5).
     "loft_cut": {"yaw": 35, "pitch": 30, "steps": [
-        # Step 1: base block via sketch+extrude (NOT box, which is centered).
-        # Sketch on plane.top (Z=0), extrude +Z to Z=36.
-        sketch([
+        *sketch_with_id([
             {"type": "line", "p1": [-26, -20], "p2": [26, -20], "id": "b1"},
             {"type": "line", "p1": [26, -20], "p2": [26, 20], "id": "b2"},
             {"type": "line", "p1": [26, 20], "p2": [-26, 20], "id": "b3"},
             {"type": "line", "p1": [-26, 20], "p2": [-26, -20], "id": "b4"},
-        ], plane="plane.top", name="BlockSk"),
+        ], plane="plane.top", name="BlockSk", fid="f1"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Block",
             "params": {"mode": "boss", "depth": dim(36)},
             "refs": {"profile": [region("f1", 0, 0)]}}},
-        # Step 2: large circle at top face (Z=36)
-        {"op": "add_feature", "feature": {
-            "type": "sketch", "name": "LCTop",
-            "params": {
-                "entities": [
-                    {"type": "circle", "center": [0, 0], "radius": 16, "id": "c1"},
-                ],
-                "constraints": [],
-            },
-            "offset": 36,
-            "refs": {"plane": "plane.top"}}},
-        # Step 3: small square at mid-height (Z=16)
-        {"op": "add_feature", "feature": {
-            "type": "sketch", "name": "LCMid",
-            "params": {
-                "entities": [
-                    {"type": "line", "p1": [-5, -5], "p2": [5, -5], "id": "s1"},
-                    {"type": "line", "p1": [5, -5], "p2": [5, 5], "id": "s2"},
-                    {"type": "line", "p1": [5, 5], "p2": [-5, 5], "id": "s3"},
-                    {"type": "line", "p1": [-5, 5], "p2": [-5, -5], "id": "s4"},
-                ],
-                "constraints": [],
-            },
-            "offset": 16,
-            "refs": {"plane": "plane.top"}}},
-        # Step 4: loft-cut from top (f3) down to mid (f4)
+        *sketch_with_id([
+            {"type": "circle", "center": [0, 0], "radius": 16, "id": "c1"},
+        ], plane="plane.top", name="LCTop", fid="f3", offset=36),
+        *sketch_with_id([
+            {"type": "line", "p1": [-5, -5], "p2": [5, -5], "id": "s1"},
+            {"type": "line", "p1": [5, -5], "p2": [5, 5], "id": "s2"},
+            {"type": "line", "p1": [5, 5], "p2": [-5, 5], "id": "s3"},
+            {"type": "line", "p1": [-5, 5], "p2": [-5, -5], "id": "s4"},
+        ], plane="plane.top", name="LCMid", fid="f4", offset=16),
         {"op": "add_feature", "feature": {
             "type": "loft", "name": "TaperPocket",
             "params": {"mode": "cut"},
-            "refs": {
-                "sections": [region("f3", 0, 0), region("f4", 0, 0)],
-            }}}]},
+            "refs": {"sections": [region("f3", 0, 0), region("f4", 0, 0)]}}},
+    ]},
 
     # -----------------------------------------------------------------------
     # Features -> Dress-up (first tranche already live -- do NOT redo)
@@ -344,286 +328,233 @@ RECIPES: dict[str, dict] = {
          "selrefs": {"remove": {"select": "top_face", "n": 1}}}]},
 
     # -----------------------------------------------------------------------
-    # Features -> Pattern  (cheatsheet: seed MUST be sketch-based, not a bare box)
+    # Features -> Pattern  (seed MUST be sketch-based -- bare box not patternable)
     # -----------------------------------------------------------------------
 
-    # linear_pattern: sketch+extrude boss, then 1x3 linear pattern along X
+    # linear_pattern: plate (f1 sk, f2 ext) + seed boss (f3 sk, f4 ext) + pattern (f5).
     "linear_pattern": {"yaw": 35, "pitch": 26, "steps": [
-        # Step 1: base plate
-        sketch([
+        *sketch_with_id([
             {"type": "line", "p1": [-35, -15], "p2": [35, -15], "id": "b1"},
             {"type": "line", "p1": [35, -15], "p2": [35, 15], "id": "b2"},
             {"type": "line", "p1": [35, 15], "p2": [-35, 15], "id": "b3"},
             {"type": "line", "p1": [-35, 15], "p2": [-35, -15], "id": "b4"},
-        ], plane="plane.top", name="PlateSk"),
+        ], plane="plane.top", name="PlateSk", fid="f1"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Plate",
             "params": {"mode": "boss", "depth": dim(8)},
             "refs": {"profile": [region("f1", 0, 0)]}}},
-        # Step 2: seed boss (circle extrude at x=-22)
-        sketch([
+        *sketch_with_id([
             {"type": "circle", "center": [-22, 0], "radius": 7, "id": "c1"},
-        ], plane="plane.top", name="BossSk"),
+        ], plane="plane.top", name="BossSk", fid="f3"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Boss",
             "params": {"mode": "boss", "depth": dim(12)},
             "refs": {"profile": [region("f3", -22, 0)]}}},
-        # Step 3: linear pattern 3× along X, 22mm pitch
         {"op": "add_feature", "feature": {
             "type": "linear_pattern", "name": "LinPat",
-            "params": {
-                "count1": 3,
-                "spacing1": dim(22),
-            },
-            "refs": {
-                "dir1": datum("axis.x"),
-                "features": ["f4"],
-            }}}]},
+            "params": {"count1": 3, "spacing1": dim(22)},
+            "refs": {"dir1": datum("axis.x"), "features": ["f4"]}}},
+    ]},
 
-    # circular_pattern: extrude boss, then 6× around Z
+    # circular_pattern: disc (f1 sk, f2 ext) + spoke (f3 sk, f4 ext) + circ-pat (f5).
     "circular_pattern": {"yaw": 0, "pitch": 60, "steps": [
-        # Step 1: base disc
-        sketch([
+        *sketch_with_id([
             {"type": "circle", "center": [0, 0], "radius": 22, "id": "base"},
-        ], plane="plane.top", name="DiscSk"),
+        ], plane="plane.top", name="DiscSk", fid="f1"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Disc",
             "params": {"mode": "boss", "depth": dim(6)},
             "refs": {"profile": [region("f1", 0, 0)]}}},
-        # Step 2: seed spoke (thin rectangle offset from center)
-        sketch([
+        *sketch_with_id([
             {"type": "line", "p1": [6, -3], "p2": [20, -3], "id": "s1"},
             {"type": "line", "p1": [20, -3], "p2": [20, 3], "id": "s2"},
             {"type": "line", "p1": [20, 3], "p2": [6, 3], "id": "s3"},
             {"type": "line", "p1": [6, 3], "p2": [6, -3], "id": "s4"},
-        ], plane="plane.top", name="SpokeSk"),
+        ], plane="plane.top", name="SpokeSk", fid="f3"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Spoke",
             "params": {"mode": "boss", "depth": dim(10)},
             "refs": {"profile": [region("f3", 13, 0)]}}},
-        # Step 3: circular pattern 6× around Z axis
         {"op": "add_feature", "feature": {
             "type": "circular_pattern", "name": "Wheel",
-            "params": {
-                "count": 6,
-                "angle": dim(360),
-                "equal_spacing": True,
-            },
-            "refs": {
-                "axis": datum("axis.z"),
-                "features": ["f4"],
-            }}}]},
+            "params": {"count": 6, "angle": dim(360), "equal_spacing": True},
+            "refs": {"axis": datum("axis.z"), "features": ["f4"]}}},
+    ]},
 
-    # mirror: sketch+extrude boss on one side, mirror across right plane
+    # mirror: base (f1 sk, f2 ext) + L-boss (f3 sk, f4 ext) + mirror (f5).
     "mirror": {"yaw": 35, "pitch": 26, "steps": [
-        # Step 1: asymmetric base
-        sketch([
+        *sketch_with_id([
             {"type": "line", "p1": [-30, -14], "p2": [30, -14], "id": "b1"},
             {"type": "line", "p1": [30, -14], "p2": [30, 14], "id": "b2"},
             {"type": "line", "p1": [30, 14], "p2": [-30, 14], "id": "b3"},
             {"type": "line", "p1": [-30, 14], "p2": [-30, -14], "id": "b4"},
-        ], plane="plane.top", name="BaseSk"),
+        ], plane="plane.top", name="BaseSk", fid="f1"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Base",
             "params": {"mode": "boss", "depth": dim(8)},
             "refs": {"profile": [region("f1", 0, 0)]}}},
-        # Step 2: L-bracket seed on right side
-        sketch([
+        *sketch_with_id([
             {"type": "line", "p1": [4, -10], "p2": [26, -10], "id": "l1"},
             {"type": "line", "p1": [26, -10], "p2": [26, 10], "id": "l2"},
             {"type": "line", "p1": [26, 10], "p2": [14, 10], "id": "l3"},
             {"type": "line", "p1": [14, 10], "p2": [14, 0], "id": "l4"},
             {"type": "line", "p1": [14, 0], "p2": [4, 0], "id": "l5"},
             {"type": "line", "p1": [4, 0], "p2": [4, -10], "id": "l6"},
-        ], plane="plane.top", name="LBSk"),
+        ], plane="plane.top", name="LBSk", fid="f3"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "LBoss",
             "params": {"mode": "boss", "depth": dim(16)},
             "refs": {"profile": [region("f3", 15, -5)]}}},
-        # Step 3: mirror across front plane (YZ) -- mirrors x+ boss to x- side
         {"op": "add_feature", "feature": {
             "type": "mirror", "name": "Mir1",
             "params": {},
-            "refs": {
-                "plane": datum("plane.front"),
-                "features": ["f4"],
-            }}}]},
+            "refs": {"plane": datum("plane.front"), "features": ["f4"]}}},
+    ]},
 
     # -----------------------------------------------------------------------
-    # Features -> Multi-body  (cheatsheet: boolean needs TWO bodies; second body
-    # must be OFFSET so there's a meaningful overlap zone, not total containment)
+    # Features -> Multi-body  (two-body setup; merge=False keeps bodies separate)
     # -----------------------------------------------------------------------
 
-    # combine (union): two overlapping extrude bosses merged into one body
+    # combine: block (f1 sk, f2 ext no-merge) + cylinder (f3 sk, f4 ext no-merge) + union.
     "combine": {"yaw": 35, "pitch": 26, "steps": [
-        # Body 1: base block
-        sketch([
+        *sketch_with_id([
             {"type": "line", "p1": [-20, -14], "p2": [20, -14], "id": "b1"},
             {"type": "line", "p1": [20, -14], "p2": [20, 14], "id": "b2"},
             {"type": "line", "p1": [20, 14], "p2": [-20, 14], "id": "b3"},
             {"type": "line", "p1": [-20, 14], "p2": [-20, -14], "id": "b4"},
-        ], plane="plane.top", name="Body1Sk"),
+        ], plane="plane.top", name="Body1Sk", fid="f1"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Body1",
             "params": {"mode": "boss", "depth": dim(24)},
             "merge": False,
             "refs": {"profile": [region("f1", 0, 0)]}}},
-        # Body 2: offset cylinder (partially overlapping)
-        sketch([
+        *sketch_with_id([
             {"type": "circle", "center": [16, 0], "radius": 14, "id": "c1"},
-        ], plane="plane.top", name="Body2Sk"),
+        ], plane="plane.top", name="Body2Sk", fid="f3"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Body2",
             "params": {"mode": "boss", "depth": dim(24)},
             "merge": False,
             "refs": {"profile": [region("f3", 16, 0)]}}},
-        # boolean combine (union): targets=Body1, tools=Body2
         {"op": "add_feature", "feature": {
             "type": "boolean", "name": "Union1",
             "params": {"op": "union"},
-            "refs": {
-                "targets": [body_sel("f2")],
-                "tools": [body_sel("f4")],
-            }}}]},
+            "refs": {"targets": [body_sel("f2")], "tools": [body_sel("f4")]}}},
+    ]},
 
-    # subtract: block with a cylinder tool subtracted from it
+    # subtract: block target (f1 sk, f2 ext) + cylinder tool (f3 sk, f4 ext) + subtract.
     "subtract": {"yaw": 35, "pitch": 26, "steps": [
-        # Body 1: target block
-        sketch([
+        *sketch_with_id([
             {"type": "line", "p1": [-22, -16], "p2": [22, -16], "id": "b1"},
             {"type": "line", "p1": [22, -16], "p2": [22, 16], "id": "b2"},
             {"type": "line", "p1": [22, 16], "p2": [-22, 16], "id": "b3"},
             {"type": "line", "p1": [-22, 16], "p2": [-22, -16], "id": "b4"},
-        ], plane="plane.top", name="TgtSk"),
+        ], plane="plane.top", name="TgtSk", fid="f1"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Target",
             "params": {"mode": "boss", "depth": dim(28)},
             "merge": False,
             "refs": {"profile": [region("f1", 0, 0)]}}},
-        # Body 2: cylinder tool (centered, slightly taller to visibly pierce)
-        sketch([
+        *sketch_with_id([
             {"type": "circle", "center": [0, 0], "radius": 11, "id": "c1"},
-        ], plane="plane.top", name="ToolSk"),
+        ], plane="plane.top", name="ToolSk", fid="f3"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Tool",
             "params": {"mode": "boss", "depth": dim(34)},
             "merge": False,
             "refs": {"profile": [region("f3", 0, 0)]}}},
-        # boolean subtract: cut cylinder from block
         {"op": "add_feature", "feature": {
             "type": "boolean", "name": "Sub1",
             "params": {"op": "subtract"},
-            "refs": {
-                "targets": [body_sel("f2")],
-                "tools": [body_sel("f4")],
-            }}}]},
+            "refs": {"targets": [body_sel("f2")], "tools": [body_sel("f4")]}}},
+    ]},
 
-    # intersect: block ∩ cylinder = rounded rectangular solid
+    # intersect: square block (f1 sk, f2 ext) ∩ cylinder (f3 sk, f4 ext) → intersect.
     "intersect": {"yaw": 35, "pitch": 26, "steps": [
-        # Body 1: block
-        sketch([
+        *sketch_with_id([
             {"type": "line", "p1": [-20, -20], "p2": [20, -20], "id": "b1"},
             {"type": "line", "p1": [20, -20], "p2": [20, 20], "id": "b2"},
             {"type": "line", "p1": [20, 20], "p2": [-20, 20], "id": "b3"},
             {"type": "line", "p1": [-20, 20], "p2": [-20, -20], "id": "b4"},
-        ], plane="plane.top", name="BlkSk"),
+        ], plane="plane.top", name="BlkSk", fid="f1"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Block",
             "params": {"mode": "boss", "depth": dim(30)},
             "merge": False,
             "refs": {"profile": [region("f1", 0, 0)]}}},
-        # Body 2: cylinder (same height, slightly smaller radius -- clear intersection)
-        sketch([
+        *sketch_with_id([
             {"type": "circle", "center": [0, 0], "radius": 18, "id": "c1"},
-        ], plane="plane.top", name="CylSk"),
+        ], plane="plane.top", name="CylSk", fid="f3"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Cyl",
             "params": {"mode": "boss", "depth": dim(30)},
             "merge": False,
             "refs": {"profile": [region("f3", 0, 0)]}}},
-        # boolean intersect
         {"op": "add_feature", "feature": {
             "type": "boolean", "name": "Isect1",
             "params": {"op": "intersect"},
-            "refs": {
-                "targets": [body_sel("f2")],
-                "tools": [body_sel("f4")],
-            }}}]},
+            "refs": {"targets": [body_sel("f2")], "tools": [body_sel("f4")]}}},
+    ]},
 
     # -----------------------------------------------------------------------
-    # Features -> Curves  (curve_helix: yields a path, not a solid by itself;
-    # must sweep a profile along it to show a visible coil in the icon)
+    # Features -> Curves
+    # curve_helix emits no solid alone -- sweep a wire circle along the helix.
+    # f1=wire circle sketch, f2=helix, f3=sweep spring.
     # -----------------------------------------------------------------------
 
-    # curve_helix: spring coil (helix path + sweep of a circle profile)
     "curve_helix": {"yaw": 35, "pitch": 30, "steps": [
-        # Step 1: wire profile circle (r=1.5mm, centered at (coil_radius=10, 0) on plane.front)
-        sketch([
+        *sketch_with_id([
             {"type": "circle", "center": [10, 0], "radius": 1.5, "id": "c1"},
-        ], plane="plane.front", name="WireProf"),
-        # Step 2: helix (base=plane.top, radius=10mm, pitch=5mm, 4 turns → height=20mm)
+        ], plane="plane.front", name="WireProf", fid="f1"),
         {"op": "add_feature", "feature": {
             "type": "helix", "name": "CoilPath",
-            "params": {
-                "pitch": dim(5),
-                "height": dim(20),
-                "radius": dim(10),
-            },
+            "params": {"pitch": dim(5), "height": dim(20), "radius": dim(10)},
             "refs": {"base": "plane.top"}}},
-        # Step 3: sweep the wire along the helix
         {"op": "add_feature", "feature": {
             "type": "sweep", "name": "Spring",
             "params": {"mode": "boss"},
-            "refs": {
-                "profile": [region("f1", 10, 0)],
-                "path": "f2",
-            }}}]},
+            "refs": {"profile": [region("f1", 10, 0)], "path": "f2"}}},
+    ]},
 
     # -----------------------------------------------------------------------
-    # Sheet Metal -> Create  (sm_base_flange and sm_flat_pattern only;
-    # sm_edge_flange/sm_hem/sm_jog PARKED -- need resolved edge selector
-    # that the iconpipe runner doesn't support yet -- see work/questions/T-BL29.md)
+    # Sheet Metal -> Create  (sm_edge_flange/sm_hem/sm_jog parked -- need
+    # resolved edge selector not available in iconpipe runner; see T-BL29.md)
     # -----------------------------------------------------------------------
 
-    # sm_base_flange: L-shaped sheet-metal blank (80×50mm, t=2mm)
+    # sm_base_flange: rect blank, t=2mm. f1=profile sketch, f2=base_flange.
     "sm_base_flange": {"yaw": 35, "pitch": 30, "steps": [
-        # Step 1: rectangular profile sketch
-        sketch([
+        *sketch_with_id([
             {"type": "line", "p1": [-25, -20], "p2": [25, -20], "id": "b1"},
             {"type": "line", "p1": [25, -20], "p2": [25, 20], "id": "b2"},
             {"type": "line", "p1": [25, 20], "p2": [-25, 20], "id": "b3"},
             {"type": "line", "p1": [-25, 20], "p2": [-25, -20], "id": "b4"},
-        ], plane="plane.top", name="FlangeSk"),
-        # Step 2: sm_base_flange (thickness=2mm)
-        {"op": "add_feature", "feature": {
-            "type": "sm_base_flange", "name": "BaseFlange",
-            "params": {"thickness": dim(2)},
-            "refs": {"profile": [region("f1", 0, 0)]}}}]},
-
-    # sm_flat_pattern: same base flange then flatten -- shows developed blank
-    "sm_flat_pattern": {"yaw": 0, "pitch": 90, "steps": [
-        # Step 1: profile sketch
-        sketch([
-            {"type": "line", "p1": [-25, -20], "p2": [25, -20], "id": "b1"},
-            {"type": "line", "p1": [25, -20], "p2": [25, 20], "id": "b2"},
-            {"type": "line", "p1": [25, 20], "p2": [-25, 20], "id": "b3"},
-            {"type": "line", "p1": [-25, 20], "p2": [-25, -20], "id": "b4"},
-        ], plane="plane.top", name="FlangeSk"),
-        # Step 2: base flange
+        ], plane="plane.top", name="FlangeSk", fid="f1"),
         {"op": "add_feature", "feature": {
             "type": "sm_base_flange", "name": "BaseFlange",
             "params": {"thickness": dim(2)},
             "refs": {"profile": [region("f1", 0, 0)]}}},
-        # Step 3: flatten to developed blank
+    ]},
+
+    # sm_flat_pattern: same base then flatten. f1=sketch, f2=flange, f3=flat_pattern.
+    "sm_flat_pattern": {"yaw": 0, "pitch": 90, "steps": [
+        *sketch_with_id([
+            {"type": "line", "p1": [-25, -20], "p2": [25, -20], "id": "b1"},
+            {"type": "line", "p1": [25, -20], "p2": [25, 20], "id": "b2"},
+            {"type": "line", "p1": [25, 20], "p2": [-25, 20], "id": "b3"},
+            {"type": "line", "p1": [-25, 20], "p2": [-25, -20], "id": "b4"},
+        ], plane="plane.top", name="FlangeSk", fid="f1"),
         {"op": "add_feature", "feature": {
-            "type": "sm_flat_pattern", "name": "Flat",
-            "params": {}}}]},
+            "type": "sm_base_flange", "name": "BaseFlange",
+            "params": {"thickness": dim(2)},
+            "refs": {"profile": [region("f1", 0, 0)]}}},
+        {"op": "add_feature", "feature": {
+            "type": "sm_flat_pattern", "name": "Flat", "params": {}}},
+    ]},
 
     # -----------------------------------------------------------------------
     # Appearance -> Material (first tranche already live -- do NOT redo)
-    # appr_glass / appr_paint: these atlas cells exist but are NOT wired to any
-    # ribbon button (ribbon_def.cpp has no entry for them). Generating icons for
-    # them is vestigial work; documented and skipped. See work/questions/T-BL29.md.
+    # appr_glass / appr_paint: atlas cells exist but NOT wired to any ribbon button.
+    # See work/questions/T-BL29.md Q4 — skipped.
     # -----------------------------------------------------------------------
 
     "appr_metal":   {"yaw": 33, "pitch": 26, "steps": [
@@ -634,18 +565,32 @@ RECIPES: dict[str, dict] = {
         box(48, 40, 26)]},                                               # engine default grey
 
     # -----------------------------------------------------------------------
-    # Appearance -> Display: display_shaded / display_shaded_edges / display_hlr /
-    # display_hlv / display_wireframe are line-art SDF glyphs. They are NOT
-    # photographic icons. The SDF invisible-icon bug (kFar int32 overflow) was
-    # fixed in T-G15 (kFar=1<<12). In-context verification via AI_CAD_RIBBON_TAB=Appearance
-    # is the correct check -- adding them here as photographic renders would override
-    # the correct line-art with a boring box screenshot. Skipped -- see task notes.
+    # Appearance -> Display: display_* are line-art SDF glyphs, NOT photographic.
+    # SDF invisible-icon bug (kFar int32 overflow) fixed in T-G15 (kFar=1<<12).
+    # In-context verification via AI_CAD_RIBBON_TAB=Appearance is the right check.
+    # Not added here -- photographic renders would override correct line-art glyphs.
     # -----------------------------------------------------------------------
 }
 
 
+def _flatten_steps(steps: list) -> list:
+    """Flatten any step that is itself a list (e.g. from sketch_with_id) into a flat list.
+    Deferred sketch entity placeholders (_sketch_entity_deferred) are silently dropped
+    here -- callers should use sketch_with_id() with an explicit fid instead."""
+    out = []
+    for s in steps:
+        if isinstance(s, list):
+            out.extend(_flatten_steps(s))
+        elif isinstance(s, dict) and s.get("_sketch_entity_deferred"):
+            pass  # dropped; see sketch() docstring
+        else:
+            out.append(s)
+    return out
+
+
 def write_recipes(path: Path) -> None:
-    recipes = [{"name": n, "yaw": r["yaw"], "pitch": r["pitch"], "steps": r["steps"]}
+    recipes = [{"name": n, "yaw": r["yaw"], "pitch": r["pitch"],
+                "steps": _flatten_steps(r["steps"])}
                for n, r in RECIPES.items()]
     path.write_text(json.dumps({"out_dir": str(RENDER_DIR), "px": RENDER_PX,
                                 "recipes": recipes}, indent=1), encoding="utf-8")

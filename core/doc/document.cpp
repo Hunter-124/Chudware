@@ -898,18 +898,6 @@ CompileResult compile_document(const json& doc, const json& env_json) {
             throw std::runtime_error("surf: profile sketch has no closed face");
         return src.faces;
     };
-    // Resolve a sketch-id curve ref to its raw closed/open wire (for ruled rails /
-    // fill / boundary boundary curves). The ref is a region selector or a bare id.
-    auto surf_sketch_wire = [&](const json& ref, const char* slot) -> TopoDS_Wire {
-        const std::string sk = selector_owner_id(ref);
-        if (sk.empty())
-            throw std::runtime_error(std::string("surf: malformed ") + slot + " ref");
-        const SketchResult& src = require_sketch(results, sk, slot);
-        TopoDS_Wire w = aicad::geom::wire_from_solved_sketch(src.entities, src.plane);
-        if (w.IsNull())
-            throw std::runtime_error(std::string("surf: ") + slot + " sketch produced no wire");
-        return w;
-    };
     // Planar-face normal (build123d face.normal_at() analogue): the geometric surface
     // normal at the face's UV midpoint, used to set the surf_extrude sweep direction.
     auto src_face_normal = [&](const TopoDS_Face& f) -> Eigen::Vector3d {
@@ -1053,6 +1041,36 @@ CompileResult compile_document(const json& doc, const json& env_json) {
             throw std::runtime_error(std::string(slot) + ": edge selector dangling — " + reason);
         }
         return ep.edges.front();
+    };
+    // Resolve a curve ref for the ruled/fill/boundary surface forms to a wire. Two ref
+    // shapes are accepted (T-BL28):
+    //   (1) a SKETCH/region ref (bare sketch id or {kind:region,sketch:fN}) — build a
+    //       wire from the whole solved sketch (the MCP path + profile-well GUI picks);
+    //   (2) a BODY-EDGE selector (the K_EDGE ribbon wells emit these) — resolve the
+    //       picked edge against its body and lift it into a single-edge wire. This is the
+    //       SolidWorks-style "ruled/boundary surface between body edges" UX the forms
+    //       advertise; before T-BL28 the engine rejected it ("… is a solid body, not a
+    //       sketch"). Edge resolution reuses resolve_edge_sel (geom-query + dangling
+    //       errors + last_body_shape), so cross-body picks resolve against the most-recent
+    //       body — the v1 limit; a single-body ruled/fill/boundary is the common case.
+    // Discriminator: owner resolves to a SketchResult -> sketch path; ANYTHING ELSE
+    // (including a null-owner raw-geometry selector, selector_owner_id() == "") -> edge
+    // path, so a body-edge pick is never misrouted into require_sketch.
+    auto surf_sketch_wire = [&](const json& ref, const char* slot) -> TopoDS_Wire {
+        const std::string sk = selector_owner_id(ref);
+        auto it = sk.empty() ? results.end() : results.find(sk);
+        if (it != results.end() && std::holds_alternative<SketchResult>(it->second)) {
+            const SketchResult& src = std::get<SketchResult>(it->second);
+            TopoDS_Wire w = aicad::geom::wire_from_solved_sketch(src.entities, src.plane);
+            if (w.IsNull())
+                throw std::runtime_error(std::string("surf: ") + slot + " sketch produced no wire");
+            return w;
+        }
+        TopoDS_Edge e = resolve_edge_sel(ref, slot);
+        TopoDS_Wire w = BRepBuilderAPI_MakeWire(e).Wire();
+        if (w.IsNull())
+            throw std::runtime_error(std::string("surf: ") + slot + " edge produced no wire");
+        return w;
     };
     // Validate that any FEATURE id a selector names (refs.<slot>.feature / owner_feature)
     // refers to a feature that actually exists in this compile (Bug K4). The picks

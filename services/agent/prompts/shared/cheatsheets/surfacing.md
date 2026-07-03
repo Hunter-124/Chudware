@@ -31,6 +31,12 @@ INVOCATION:
     surface body produced by an earlier surf_* op). surf_knit surfaces = a LIST of these objects.
   - surf_revolve axis = {"kind":"datum","feature":"axis.z"} — only the reserved axis.x/y/z datums
     pass; kind:"axis" is rejected.
+  - surf_ruled (edge_a/edge_b), surf_fill (edges), surf_boundary (dir1/dir2) each take EITHER a
+    sketch/region ref (a whole solved sketch becomes the rail/boundary curve) OR a BODY-EDGE
+    selector — the {"kind":"edge","owner_feature":"$N",...} object a viewport edge pick produces
+    (the GUI ribbon wells emit these). A single picked edge becomes a one-edge rail; this is the
+    SolidWorks-style "ruled/boundary surface between body edges" path. Edges resolve against the
+    most-recent body, so keep the picked edges on the current body.
   - face refs (offset / delete_face / replace_face) need the RESOLVED face selector object from a
     query — NOT the {"of":"face",...} shorthand. Unlike shell/fillet (which resolve a query
     internally), these surf_* slots resolve refs.faces directly and reject a bare query as
@@ -68,10 +74,11 @@ KNOWN LIMITS:
    section's edge count changes) — OCCT's offset is fragile there. It works on planar / ruled /
    rect->rect lofts. If a thicken fails, keep matching section topology, or build the wall into the
    profile (loft a thin closed ring) instead.
-2. surf_untrim is listed by the validator but has NO compiler — it ALWAYS errors ("no compiler for
-   feature type 'surf_untrim'"). Do not use it.
+2. (none currently) — surf_untrim now has a working handler (creates an untrimmed patch as a new
+   body, source surface intact); the old "no compiler for surf_untrim" note is obsolete.
 
 Confirmed against core/doc/validate.cpp (FEATURE_TYPES surf_*), core/doc/document.cpp handlers, and
 core/geom/surfacing.cpp; live driver pass: planar/extrude/revolve/sweep/loft/ruled/offset/fill/
-boundary/knit/thicken/trim/delete_face/replace_face all build (surf_thicken loft caveat above;
-surf_untrim has no handler).
+boundary/knit/thicken/trim/untrim/delete_face/replace_face all build (surf_thicken loft caveat
+above). ruled/fill/boundary accept body-edge picks as of T-BL28 (regression: core/tests/
+test_surfacing.cpp).

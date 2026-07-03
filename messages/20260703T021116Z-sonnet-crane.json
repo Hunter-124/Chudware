@@ -1,0 +1,6 @@
+{
+ "from": "sonnet-crane",
+ "to": "*",
+ "text": "REVIEW T-F17 rework complete (supersedes prior note): branch task/T-F17-mission-control @ 903f00e. host/ changes fully reverted; panel ported to ui/imgui on panel_scaffold (mission_control_panel.{h,cpp}); AI_CAD_SHOT=mission_control seeded one-shot after the transparency block; LIVE steering wired \u2014 new services/dag/worker_rpc.py (dag_status/dag_approve/dag_abort \u2192 executor.resume(), registered append-only in engine_oracle/worker.py), Approve/Reject via AsyncRpc, Refresh replays EventJournal via dag_status.events_jsonl. Verified: AI-CAD2 flock build green, ui_style_check 0 findings, --shot PNG eyeballed (paused at gate n_gate_preorder, Approve/Reject enabled) at scratch/mission_control_shots/aicad2_mission_control.png. Deferred honestly: design-brief flow, inject, pause-mid-node, re-dial (T-BL09 + executor seams); built-in loop doesn't emit schema yet. Details in commit message + T-F17.md DoD. Status: review.",
+ "ts": "2026-07-03T02:11:16Z"
+}

@@ -83,7 +83,26 @@ captures need `AI_CAD_PYTHON`/venv provisioned.
   shows the Model viewport, not the CAM panel — surfacing it needs a CAM workspace (ribbon +
   command_registry, outside cam/**) or a persistent focus mechanism. Backplot-over-viewport
   overlay + agent-v2 camLoadJob auto-load deferred (viewport.cpp / agent drain outside write-set).
+- **H3 drawing — DONE (17a7844).** ~1,560 LOC, workspace-gated in viewport.cpp (Drafting);
+  shot renders full A3 sheet + 4 projected views. Surfaces cleanly (content-swap inside the
+  Viewport window). Flagged a probable engine doc-id bug (scenario doc2 empty).
+- **H2 ECAD — DONE (565eb96).** ~2,573 LOC (5 files incl. new ecad_palette seam), central-node
+  dock ("ECAD"). Same headless surfacing gap as CAM (see below). Build green, shot exit 0.
+- **H4 sim — DONE (dbd79fa).** ~2,255 LOC, workspace-gated overlay in viewport.cpp (Simulate);
+  shot renders Simulate ribbon + "Simulation" column + 3D model — surfaces cleanly. Also wired
+  a pre-existing FEA/CFD colormap-to-renderer gap. fea solve ~150-165s → use >120s shot timeout.
 - **T-G13 shot fix merged in** (44fc56f) — T-G8 depends on it for headless shot verification.
+
+### OPEN central follow-up — CAM/ECAD headless surfacing (application.cpp/layout.cpp)
+
+CAM and ECAD are separate dock tabs sharing the central node with Viewport; the node's
+`ImGuiDockNodeFlags_NoTabBar` does NOT honor `SetNextWindowFocus()` reliably headless, so the
+cam/ecad shots show the Model viewport (ribbon/workspace bar are correct). Drawing + sim do NOT
+have this problem because they content-swap/overlay INSIDE the Viewport window (workspace-gated)
+rather than being separate dock tabs. FIX OPTIONS: (a) set the dock node's SelectedTabId via
+`ImGui::DockBuilderGetNode(...)->SelectedTabId = ImGui::GetID("CAM"/"ECAD")` when that
+workspace/mode is active; or (b) restructure CAM/ECAD to render inside the Viewport window like
+drawing/sim. Bounded, high-value for Erik's walkthrough — do before G4 sign-off.
 
 ### Panel-dispatch wiring pattern (for H2–H5)
 
@@ -95,10 +114,18 @@ gap. To avoid concurrent-edit conflicts, the LEAD wires application.cpp dispatch
 subagents add only their `ui/imgui/src/ui/<node>/**` files. `ui/imgui/CMakeLists.txt:78`
 GLOB_RECURSEs `src/*.cpp` — no CMakeLists edit needed for new files.
 
-### Remaining nodes (recommended order)
+### Remaining work (H1-H4 DONE)
 
-H3 drawing (2,197 LOC, surfaces via Drafting ws) → H2 ECAD (2,501, ecad_panel+canvas+mirror,
-Schematic/Board ws) → H4 sim (4,026, Simulate ws, needs F4 sim_client) → H5 sketch (8,314 →
-split into sketch_mode/tools/constraints/overlay/edit). Then the diff harnesses (G-code 8 posts,
-netlist+ERC, DXF/PDF, study JSON) + G4 gate. Verify each offscreen via its `AI_CAD_SHOT` name
-(worker present: `AI_CAD_PYTHON=$(command -v python3)`; flow needs ~240s timeout).
+1. **H5 sketch (completion)** — host `sketch_mode.cpp` is 8,314 LOC; split into
+   `ui/imgui/src/ui/sketch/{sketch_mode,tools,constraints,overlay,edit}.*` (the split IS the
+   modularity payoff — do NOT port as one file). Uses F1 camera API. `ui/imgui/src/ui/sketch/`
+   already exists from earlier waves — build on it. Verify `AI_CAD_SHOT=sketch` + `AI_CAD_SHOT=asm`.
+2. **Diff harnesses** (integrator infra, `tools/`): run the SAME job on host AI-CAD + new AI-CAD2
+   and byte/JSON-diff artifacts — G-code across 8 post dialects, netlist JSON + ERC, DXF/PDF
+   export, study JSON. Since the compute is engine-side and RPCs were kept byte-identical, these
+   should diff clean; the harness proves it.
+3. **CAM/ECAD surfacing fix** (see central follow-up above).
+4. **G4 gate**: `bash scripts/gate.sh` green + all domain diffs + `AI_CAD_SHOT=asm`.
+
+Verify offscreen via `xvfb-run -a`, worker present (`AI_CAD_PYTHON=$(command -v python3)`);
+flow needs ~240s, fea >120s. Prebuilt libaicad: `/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libaicad.so`.

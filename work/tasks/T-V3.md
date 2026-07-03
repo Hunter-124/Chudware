@@ -3,7 +3,7 @@ id: T-V3
 title: Runtime env provisioning + test-pollution fixes (T-V2 follow-ups)
 workstream: V
 owner: sonnet-reed
-status: doing
+status: review
 branch: task/T-V3-env-pollution
 day: 3
 priority: 2

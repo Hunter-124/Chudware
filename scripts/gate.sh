@@ -486,6 +486,70 @@ stage_vv() {
     fi
 }
 
+# ---- Stage 4.6: Modeling-op combination battery (T-BL19) --------------------
+# Optional, env-gated SKIP: drives the C++ feature engine through every registered
+# modeling op + a pairwise/sequence matrix and asserts on live geometry. Default is
+# SKIP (stays green) so the normal gate never depends on the OCCT .so; opt in with:
+# - AICAD_RUN_MODELING=smoke → pytest ...::TestSmoke  (registry integrity, no .so)
+# - AICAD_RUN_MODELING=full  → full live battery       (needs OCCT libaicad.so)
+# NOTE: full mode needs the OCCT geometry kernel (core/build-occt-linux/bin/libaicad.so);
+# the plain build-linux .so has no geometry and would ALL-SKIP (which the battery fails).
+stage_modeling() {
+    echo "=== [4.6/6] Modeling-op combination battery (T-BL19) ==="
+    if [ -z "${AICAD_RUN_MODELING:-}" ]; then
+        record "modeling (T-BL19)   SKIP    set AICAD_RUN_MODELING=smoke or =full"
+        echo "  SKIP: AICAD_RUN_MODELING not set"
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        record "modeling (T-BL19)   SKIP    python3 not on PATH"
+        echo "  SKIP: python3 not installed"
+        return 0
+    fi
+
+    local mcp_venv="$HOME/.local/share/AI-CAD/mcp-venv/bin/python"
+    local venv_py="python3"
+    if [ -x "$mcp_venv" ] && "$mcp_venv" -m pytest --version >/dev/null 2>&1; then
+        venv_py="$mcp_venv"
+    fi
+
+    # Full mode needs the OCCT geometry .so; prefer it, else fall back to any built .so.
+    if [ -z "${AI_CAD_LIBAICAD:-}" ]; then
+        for cand in "$REPO/core/build-occt-linux/bin/libaicad.so" \
+                    "$REPO/core/build-linux/bin/libaicad.so"; do
+            [ -f "$cand" ] && export AI_CAD_LIBAICAD="$cand" && break
+        done
+    fi
+
+    local pytest_args=()
+    if [ "${AICAD_RUN_MODELING}" = "full" ]; then
+        pytest_args=("scripts/modeling_battery.py")
+        echo "  mode: full (live geometry battery; .so=${AI_CAD_LIBAICAD:-<none>})"
+    else
+        pytest_args=("scripts/modeling_battery.py::TestSmoke")
+        echo "  mode: smoke (registry integrity, no .so)"
+    fi
+
+    if PYTHONPATH="$REPO:${PYTHONPATH:-}" "$venv_py" -m pytest \
+            "${pytest_args[@]}" -q --tb=short > /tmp/gate_modeling.out 2>&1; then
+        local summary_line
+        summary_line="$(grep -E '[0-9]+ passed' /tmp/gate_modeling.out | tail -1 || echo 'ok')"
+        record "modeling (T-BL19)   PASS    $summary_line"
+        echo "  PASS ($summary_line)"
+    else
+        local rc=$?
+        if [ "$rc" -eq 5 ]; then
+            record "modeling (T-BL19)   SKIP    no tests collected (check venv + deps)"
+            echo "  SKIP: no tests collected"
+        else
+            record "modeling (T-BL19)   FAIL    pytest exit $rc (see /tmp/gate_modeling.out)"
+            echo "  FAIL: modeling battery (see /tmp/gate_modeling.out):"
+            tail -n 15 /tmp/gate_modeling.out | sed 's/^/    /'
+            fail_fatal=1
+        fi
+    fi
+}
+
 # ---- main -------------------------------------------------------------------
 CORE_BUILD_OK=0
 stage_check
@@ -496,6 +560,7 @@ stage_ui_abstract
 stage_ctest
 stage_pytest
 stage_vv
+stage_modeling
 stage_ui_imgui
 stage_bench
 

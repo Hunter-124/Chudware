@@ -1,0 +1,2197 @@
+{
+  "summary": {
+    "total": 50,
+    "executed": 50,
+    "pass": 49,
+    "fail": 0,
+    "xfail": 1,
+    "error": 0
+  },
+  "coverage": {
+    "registered": [
+      "bolt_circle",
+      "boolean",
+      "box",
+      "chamfer",
+      "circular_pattern",
+      "cone",
+      "cylinder",
+      "draft",
+      "extrude",
+      "fillet",
+      "helix",
+      "hole",
+      "linear_pattern",
+      "loft",
+      "mirror",
+      "revolve",
+      "rib",
+      "script",
+      "shell",
+      "sketch",
+      "sm_base_flange",
+      "sm_edge_flange",
+      "sm_flat_pattern",
+      "sm_hem",
+      "sm_jog",
+      "sphere",
+      "split",
+      "surf_boundary",
+      "surf_delete_face",
+      "surf_extrude",
+      "surf_fill",
+      "surf_knit",
+      "surf_loft",
+      "surf_offset",
+      "surf_planar",
+      "surf_replace_face",
+      "surf_revolve",
+      "surf_ruled",
+      "surf_sweep",
+      "surf_thicken",
+      "surf_trim",
+      "sweep",
+      "text",
+      "thread",
+      "torus",
+      "transform",
+      "weld_end_cap",
+      "weld_gusset",
+      "weld_member"
+    ],
+    "covered": [
+      "bolt_circle",
+      "boolean",
+      "box",
+      "chamfer",
+      "circular_pattern",
+      "cone",
+      "cylinder",
+      "draft",
+      "extrude",
+      "fillet",
+      "helix",
+      "hole",
+      "linear_pattern",
+      "loft",
+      "mirror",
+      "revolve",
+      "rib",
+      "shell",
+      "sketch",
+      "sm_base_flange",
+      "sm_edge_flange",
+      "sphere",
+      "split",
+      "surf_planar",
+      "surf_thicken",
+      "sweep",
+      "text",
+      "thread",
+      "torus",
+      "transform",
+      "weld_member"
+    ],
+    "not_covered": [
+      "script",
+      "sm_flat_pattern",
+      "sm_hem",
+      "sm_jog",
+      "surf_boundary",
+      "surf_delete_face",
+      "surf_extrude",
+      "surf_fill",
+      "surf_knit",
+      "surf_loft",
+      "surf_offset",
+      "surf_replace_face",
+      "surf_revolve",
+      "surf_ruled",
+      "surf_sweep",
+      "surf_trim",
+      "weld_end_cap",
+      "weld_gusset"
+    ],
+    "pct": 63.3
+  },
+  "libaicad": "/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libaicad.so",
+  "generated": "2026-07-03T17:23:21Z",
+  "results": [
+    {
+      "id": "box",
+      "category": "primitive",
+      "kind": "single",
+      "ops_covered": [
+        "box"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 24000.0,
+      "seed_volume": null,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol!=",
+          "ok": true,
+          "detail": "vol 0->24000 (\u0394+24000)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 1.2489070892333984
+    },
+    {
+      "id": "cylinder",
+      "category": "primitive",
+      "kind": "single",
+      "ops_covered": [
+        "cylinder"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 21205.750411731104,
+      "seed_volume": null,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol!=",
+          "ok": true,
+          "detail": "vol 0->21206 (\u0394+21206)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.027126789093017578
+    },
+    {
+      "id": "sphere",
+      "category": "primitive",
+      "kind": "single",
+      "ops_covered": [
+        "sphere"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 14137.16694115407,
+      "seed_volume": null,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol!=",
+          "ok": true,
+          "detail": "vol 0->14137 (\u0394+14137)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [
+        {
+          "kind": "tiny_edges",
+          "severity": "warning",
+          "text": "2 tiny edge(s) shorter than 0.01 mm"
+        }
+      ],
+      "elapsed": 0.1646134853363037
+    },
+    {
+      "id": "cone",
+      "category": "primitive",
+      "kind": "single",
+      "ops_covered": [
+        "cone"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 8508.480103472359,
+      "seed_volume": null,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol!=",
+          "ok": true,
+          "detail": "vol 0->8508 (\u0394+8508)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.07248663902282715
+    },
+    {
+      "id": "torus",
+      "category": "primitive",
+      "kind": "single",
+      "ops_covered": [
+        "torus"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 9869.604401089357,
+      "seed_volume": null,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol!=",
+          "ok": true,
+          "detail": "vol 0->9870 (\u0394+9870)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.3878788948059082
+    },
+    {
+      "id": "extrude_boss",
+      "category": "sketch2d",
+      "kind": "single",
+      "ops_covered": [
+        "sketch",
+        "extrude"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 9047.786842338604,
+      "seed_volume": null,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol!=",
+          "ok": true,
+          "detail": "vol 0->9048 (\u0394+9048)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.016175270080566406
+    },
+    {
+      "id": "extrude_cut",
+      "category": "sketch2d",
+      "kind": "single",
+      "ops_covered": [
+        "sketch",
+        "extrude"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 17591.504561362028,
+      "seed_volume": 19200.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 19200->17592 (\u0394-1608)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.05551004409790039
+    },
+    {
+      "id": "revolve",
+      "category": "sketch2d",
+      "kind": "single",
+      "ops_covered": [
+        "sketch",
+        "revolve"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 42910.63851332392,
+      "seed_volume": null,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol!=",
+          "ok": true,
+          "detail": "vol 0->42911 (\u0394+42911)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [
+        {
+          "kind": "tiny_edges",
+          "severity": "warning",
+          "text": "2 tiny edge(s) shorter than 0.01 mm"
+        }
+      ],
+      "elapsed": 1.126218318939209
+    },
+    {
+      "id": "loft",
+      "category": "sketch2d",
+      "kind": "single",
+      "ops_covered": [
+        "sketch",
+        "loft"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 53950.27734317552,
+      "seed_volume": null,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol!=",
+          "ok": true,
+          "detail": "vol 0->53950 (\u0394+53950)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.17200016975402832
+    },
+    {
+      "id": "sweep",
+      "category": "sketch2d",
+      "kind": "single",
+      "ops_covered": [
+        "sketch",
+        "sweep"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 2010.6192982974676,
+      "seed_volume": null,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol!=",
+          "ok": true,
+          "detail": "vol 0->2011 (\u0394+2011)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.04614973068237305
+    },
+    {
+      "id": "helix_spring",
+      "category": "curve",
+      "kind": "single",
+      "ops_covered": [
+        "sketch",
+        "helix",
+        "sweep"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 1065.917318931266,
+      "seed_volume": null,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol!=",
+          "ok": true,
+          "detail": "vol 0->1066 (\u0394+1066)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 2.1889865398406982
+    },
+    {
+      "id": "fillet",
+      "category": "dress",
+      "kind": "single",
+      "ops_covered": [
+        "fillet"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 23340.84937505542,
+      "seed_volume": 24000.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 24000->23341 (\u0394-659)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [
+        {
+          "kind": "tiny_edges",
+          "severity": "warning",
+          "text": "8 tiny edge(s) shorter than 0.01 mm"
+        }
+      ],
+      "elapsed": 0.2918405532836914
+    },
+    {
+      "id": "chamfer",
+      "category": "dress",
+      "kind": "single",
+      "ops_covered": [
+        "chamfer"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 22524.0,
+      "seed_volume": 24000.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 24000->22524 (\u0394-1476)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.1519465446472168
+    },
+    {
+      "id": "shell",
+      "category": "dress",
+      "kind": "single",
+      "ops_covered": [
+        "shell"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 7152.0,
+      "seed_volume": 24000.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 24000->7152 (\u0394-16848)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.09357213973999023
+    },
+    {
+      "id": "draft",
+      "category": "dress",
+      "kind": "single",
+      "ops_covered": [
+        "draft"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 23475.068018844457,
+      "seed_volume": 24000.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol!=",
+          "ok": true,
+          "detail": "vol 24000->23475 (\u0394-525)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.04786992073059082
+    },
+    {
+      "id": "rib",
+      "category": "structural",
+      "kind": "single",
+      "ops_covered": [
+        "sketch",
+        "rib"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 20118.73335177334,
+      "seed_volume": 19200.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol>",
+          "ok": true,
+          "detail": "vol 19200->20119 (\u0394+919)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.22324514389038086
+    },
+    {
+      "id": "split",
+      "category": "structural",
+      "kind": "single",
+      "ops_covered": [
+        "split"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 24000.0,
+      "seed_volume": 24000.0,
+      "bodies": 2,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol==",
+          "ok": true,
+          "detail": "vol 24000->24000 (\u0394+0)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=2 want=2"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.057280540466308594
+    },
+    {
+      "id": "boolean_fuse",
+      "category": "structural",
+      "kind": "single",
+      "ops_covered": [
+        "boolean"
+      ],
+      "note": "overlapping fuse: single connected solid",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 33283.18530717959,
+      "seed_volume": 42707.963267948966,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 42708->33283 (\u0394-9425)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.11827588081359863
+    },
+    {
+      "id": "boolean_cut",
+      "category": "structural",
+      "kind": "single",
+      "ops_covered": [
+        "boolean"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 20968.142105107596,
+      "seed_volume": 37053.09649148734,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 37053->20968 (\u0394-16085)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.11196136474609375
+    },
+    {
+      "id": "hole_simple",
+      "category": "intent",
+      "kind": "single",
+      "ops_covered": [
+        "hole"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 18973.805328941533,
+      "seed_volume": 19200.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 19200->18974 (\u0394-226)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.09646892547607422
+    },
+    {
+      "id": "hole_cbore",
+      "category": "intent",
+      "kind": "single",
+      "ops_covered": [
+        "hole"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 18773.528797275187,
+      "seed_volume": 19200.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 19200->18774 (\u0394-426)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.14063382148742676
+    },
+    {
+      "id": "bolt_circle",
+      "category": "intent",
+      "kind": "single",
+      "ops_covered": [
+        "bolt_circle"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 39269.90816987242,
+      "seed_volume": 40212.38596594935,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 40212->39270 (\u0394-942)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.6188740730285645
+    },
+    {
+      "id": "linear_pattern",
+      "category": "pattern",
+      "kind": "single",
+      "ops_covered": [
+        "sketch",
+        "extrude",
+        "linear_pattern"
+      ],
+      "note": "3 bosses along X",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 20707.964473723103,
+      "seed_volume": 19200.0,
+      "bodies": 2,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol>",
+          "ok": true,
+          "detail": "vol 19200->20708 (\u0394+1508)"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.14697051048278809
+    },
+    {
+      "id": "circular_pattern",
+      "category": "pattern",
+      "kind": "single",
+      "ops_covered": [
+        "sketch",
+        "extrude",
+        "circular_pattern"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 43228.31491339552,
+      "seed_volume": 40212.38596594935,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol>",
+          "ok": true,
+          "detail": "vol 40212->43228 (\u0394+3016)"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.3238959312438965
+    },
+    {
+      "id": "mirror",
+      "category": "pattern",
+      "kind": "single",
+      "ops_covered": [
+        "sketch",
+        "extrude",
+        "mirror"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 20205.30964914873,
+      "seed_volume": 19200.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol>",
+          "ok": true,
+          "detail": "vol 19200->20205 (\u0394+1005)"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.20208430290222168
+    },
+    {
+      "id": "transform_move",
+      "category": "transform",
+      "kind": "single",
+      "ops_covered": [
+        "transform"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 24000.0,
+      "seed_volume": 24000.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol==",
+          "ok": true,
+          "detail": "vol 24000->24000 (\u0394+0)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.023047208786010742
+    },
+    {
+      "id": "transform_copy",
+      "category": "transform",
+      "kind": "single",
+      "ops_covered": [
+        "transform"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 48000.0,
+      "seed_volume": 24000.0,
+      "bodies": 2,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol>",
+          "ok": true,
+          "detail": "vol 24000->48000 (\u0394+24000)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=2 want=2"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.024722576141357422
+    },
+    {
+      "id": "sm_base_flange",
+      "category": "sheetmetal",
+      "kind": "single",
+      "ops_covered": [
+        "sm_base_flange"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 4800.0,
+      "seed_volume": null,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol!=",
+          "ok": true,
+          "detail": "vol 0->4800 (\u0394+4800)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.026038169860839844
+    },
+    {
+      "id": "sm_edge_flange",
+      "category": "sheetmetal",
+      "kind": "sequence",
+      "ops_covered": [
+        "sm_base_flange",
+        "sm_edge_flange"
+      ],
+      "note": "90\u00b0 bend off a base-flange rim (resolved edge)",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 6870.563174868856,
+      "seed_volume": 4800.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol>",
+          "ok": true,
+          "detail": "vol 4800->6871 (\u0394+2071)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.4194364547729492
+    },
+    {
+      "id": "weld_member",
+      "category": "weldment",
+      "kind": "single",
+      "ops_covered": [
+        "sketch",
+        "weld_member"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 22400.000000000015,
+      "seed_volume": null,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol!=",
+          "ok": true,
+          "detail": "vol 0->22400 (\u0394+22400)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.07082462310791016
+    },
+    {
+      "id": "surf_thicken",
+      "category": "surfacing",
+      "kind": "single",
+      "ops_covered": [
+        "sketch",
+        "surf_planar",
+        "surf_thicken"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 2400.0,
+      "seed_volume": null,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol!=",
+          "ok": true,
+          "detail": "vol 0->2400 (\u0394+2400)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.05056285858154297
+    },
+    {
+      "id": "thread",
+      "category": "thread",
+      "kind": "single",
+      "ops_covered": [
+        "cylinder",
+        "thread"
+      ],
+      "note": "external M12 V-groove",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 3259.9763327291266,
+      "seed_volume": 3392.9200658769764,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 3393->3260 (\u0394-133)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 15.32770824432373
+    },
+    {
+      "id": "text_engrave",
+      "category": "text",
+      "kind": "single",
+      "ops_covered": [
+        "text"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 19186.017511602928,
+      "seed_volume": 19200.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 19200->19186 (\u0394-14)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 1.6147115230560303
+    },
+    {
+      "id": "fillet_then_shell",
+      "category": "sequence",
+      "kind": "sequence",
+      "ops_covered": [
+        "fillet",
+        "shell"
+      ],
+      "note": "shell after fillet (rounded pockets)",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 7012.938009881545,
+      "seed_volume": 24000.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 24000->7013 (\u0394-16987)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.11562013626098633
+    },
+    {
+      "id": "shell_then_fillet",
+      "category": "sequence",
+      "kind": "sequence",
+      "ops_covered": [
+        "shell",
+        "fillet"
+      ],
+      "note": "",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 7148.137166941146,
+      "seed_volume": 24000.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 24000->7148 (\u0394-16852)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.10858368873596191
+    },
+    {
+      "id": "draft_then_shell",
+      "category": "sequence",
+      "kind": "sequence",
+      "ops_covered": [
+        "draft",
+        "shell"
+      ],
+      "note": "moulded pocket wall",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 7094.707972828103,
+      "seed_volume": 24000.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 24000->7095 (\u0394-16905)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.04059553146362305
+    },
+    {
+      "id": "hole_then_chamfer",
+      "category": "sequence",
+      "kind": "sequence",
+      "ops_covered": [
+        "hole",
+        "chamfer"
+      ],
+      "note": "countersink-by-chamfer on a bore edge",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 18784.262572174946,
+      "seed_volume": 19200.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 19200->18784 (\u0394-416)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.06624746322631836
+    },
+    {
+      "id": "pattern_of_hole",
+      "category": "sequence",
+      "kind": "sequence",
+      "ops_covered": [
+        "hole",
+        "linear_pattern"
+      ],
+      "note": "cut-through-pattern: a bore array",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 18571.681469282044,
+      "seed_volume": 19200.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 19200->18572 (\u0394-628)"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.14072036743164062
+    },
+    {
+      "id": "pattern_of_cut",
+      "category": "sequence",
+      "kind": "sequence",
+      "ops_covered": [
+        "sketch",
+        "extrude",
+        "linear_pattern"
+      ],
+      "note": "cut-through-pattern of a subtractive feature",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 29987.256842043047,
+      "seed_volume": 32400.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 32400->29987 (\u0394-2413)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.20111918449401855
+    },
+    {
+      "id": "mirror_of_cut",
+      "category": "sequence",
+      "kind": "sequence",
+      "ops_covered": [
+        "sketch",
+        "extrude",
+        "mirror"
+      ],
+      "note": "mirror a subtractive feature",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 26915.044407846122,
+      "seed_volume": 28800.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 28800->26915 (\u0394-1885)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.10018587112426758
+    },
+    {
+      "id": "boolean_then_fillet",
+      "category": "sequence",
+      "kind": "sequence",
+      "ops_covered": [
+        "boolean",
+        "fillet"
+      ],
+      "note": "round the fuse seam",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 41057.42478011262,
+      "seed_volume": 50095.573684677205,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.3690028190612793
+    },
+    {
+      "id": "revolve_then_shell",
+      "category": "sequence",
+      "kind": "sequence",
+      "ops_covered": [
+        "revolve",
+        "shell"
+      ],
+      "note": "hollow a solid revolved cup (seed=revolve, test=shell)",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 15387.520817282813,
+      "seed_volume": 78539.81633974485,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 78540->15388 (\u0394-63152)"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.04725933074951172
+    },
+    {
+      "id": "bolt_circle_then_shell",
+      "category": "sequence",
+      "kind": "sequence",
+      "ops_covered": [
+        "bolt_circle",
+        "shell"
+      ],
+      "note": "flanged cap: holes then hollow",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 14341.37046363741,
+      "seed_volume": 40212.38596594935,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 40212->14341 (\u0394-25871)"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.5029816627502441
+    },
+    {
+      "id": "recipe_mount_bracket",
+      "category": "recipe",
+      "kind": "recipe",
+      "ops_covered": [
+        "box",
+        "fillet",
+        "shell",
+        "bolt_circle",
+        "chamfer"
+      ],
+      "note": "fillet->shell->bolt-circle->chamfer",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 9585.060462457925,
+      "seed_volume": 19200.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 19200->9585 (\u0394-9615)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.40020322799682617
+    },
+    {
+      "id": "recipe_pulley",
+      "category": "recipe",
+      "kind": "recipe",
+      "ops_covered": [
+        "cylinder",
+        "extrude",
+        "circular_pattern",
+        "hole"
+      ],
+      "note": "hub + lightening holes + bore",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 47548.00481208149,
+      "seed_volume": 57726.765009712435,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 57727->47548 (\u0394-10179)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.24057936668395996
+    },
+    {
+      "id": "recipe_enclosure",
+      "category": "recipe",
+      "kind": "recipe",
+      "ops_covered": [
+        "box",
+        "shell",
+        "fillet",
+        "hole"
+      ],
+      "note": "shelled + rounded + vented box",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 13566.283185307186,
+      "seed_volume": 60000.0,
+      "bodies": 1,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "vol<",
+          "ok": true,
+          "detail": "vol 60000->13566 (\u0394-46434)"
+        },
+        {
+          "name": "bodies",
+          "ok": true,
+          "detail": "bodies=1 want=1"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=True want=True"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.2249584197998047
+    },
+    {
+      "id": "nc_cut_misses_body",
+      "category": "negative",
+      "kind": "negative",
+      "ops_covered": [
+        "extrude"
+      ],
+      "note": "a cut that misses the body must be REJECTED (removed no material)",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 19200.0,
+      "seed_volume": 19200.0,
+      "bodies": null,
+      "manifold": null,
+      "overlap_clean": null,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=False want=False errs=['extrude cut removed no material']"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.02289104461669922
+    },
+    {
+      "id": "nc_open_surface_nonmanifold",
+      "category": "negative",
+      "kind": "negative",
+      "ops_covered": [
+        "surf_planar"
+      ],
+      "note": "a bare open surface (4 free edges) must read as NON-manifold",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 0.0,
+      "seed_volume": null,
+      "bodies": null,
+      "manifold": false,
+      "overlap_clean": true,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=True want=True"
+        },
+        {
+          "name": "manifold",
+          "ok": true,
+          "detail": "manifold=False want=False"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [
+        {
+          "kind": "free_edges",
+          "severity": "warning",
+          "text": "4 free edge(s) detected (open shell)"
+        }
+      ],
+      "elapsed": 0.015271663665771484
+    },
+    {
+      "id": "nc_pattern_of_explicit_boolean",
+      "category": "negative",
+      "kind": "negative",
+      "ops_covered": [
+        "boolean",
+        "linear_pattern"
+      ],
+      "note": "documented engine constraint: an explicit `boolean` feature is NOT patternable (only sketch boss/cut/hole); pattern the subtractive sketch-feature instead",
+      "executed": true,
+      "verdict": "PASS",
+      "volume": 28440.000000000004,
+      "seed_volume": 29520.0,
+      "bodies": null,
+      "manifold": null,
+      "overlap_clean": null,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": true,
+          "detail": "rebuild=False want=False errs=[\"linear pattern: feature 'f3' has no patternable geometry (must be an earlier boss/cut/hole, and listed before this feature)\"]"
+        }
+      ],
+      "reason": "all expectations met",
+      "xfail": null,
+      "issues": [],
+      "elapsed": 0.05187225341796875
+    },
+    {
+      "id": "nc_disjoint_fuse",
+      "category": "negative",
+      "kind": "negative",
+      "ops_covered": [
+        "boolean"
+      ],
+      "note": "documented contract: disjoint fuse must fail; engine returns ok+2 bodies (BUG)",
+      "executed": true,
+      "verdict": "XFAIL",
+      "volume": 1999.9999999999995,
+      "seed_volume": 1999.9999999999995,
+      "bodies": 2,
+      "manifold": true,
+      "overlap_clean": false,
+      "checks": [
+        {
+          "name": "rebuild",
+          "ok": false,
+          "detail": "rebuild=True want=False"
+        }
+      ],
+      "reason": "rebuild: rebuild=True want=False",
+      "xfail": "GH#disjoint-fuse",
+      "issues": [],
+      "elapsed": 0.09401416778564453
+    }
+  ]
+}

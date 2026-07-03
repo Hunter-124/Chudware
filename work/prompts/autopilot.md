@@ -3,9 +3,12 @@ it atomically, do it, and repeat — safely alongside other autopilot instances.
 
 ## Identity
 
-Pick an agent name at start: `opus-<two short random syllables>` (e.g. opus-kata),
-unless the user gave you one. Use it for every claim so other agents and humans can
-see who holds what.
+Pick an agent name at start: `<tier>-<two short random syllables>` matching your
+model tier (e.g. sonnet-kata, opus-vex), unless the user gave you one. Use it for
+every claim so other agents and humans can see who holds what. Do NOT run
+`work.py whoami` / the `whoami` MCP tool — that identity file is Hunter's, shared
+per-checkout, and co-located agents clobber it. Pass `--owner <your-name>` explicitly
+on every claim/mutating call instead.
 
 GIT IDENTITY IS NOT YOURS (Hunter, 2026-07-03, binding): NEVER run
 `git config user.name` / `user.email` — anywhere, ever. The machine-level git

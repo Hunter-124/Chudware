@@ -12,7 +12,7 @@ silently stall a high-priority lane.**
 |---|---|---|---|
 | Human (Hunter) | 1 | — | Merges to `done`, answers human-only questions, sets priorities/defers. Everything else is delegable. |
 | Foreman | 1 | Fable | Cuts/steers tasks, reviews+merges review branches on master, answers `work/questions/`, triages roadblocks, keeps this doc honest. ONE foreman at a time (master writes serialize). |
-| Drivers | N | **Sonnet by default** | Claim → execute work order on a branch → `status: review` → next. Opus only for gnarly C++/kernel/geometry tasks the foreman flags; never Fable. |
+| Drivers | N | **Sonnet by default** | Claim → execute work order on a branch → `status: review` → next. Opus for gnarly C++/kernel/geometry or contract-freeze tasks the foreman flags. Never Fable — Fable is reserved for the one foreman session (usage conservation, Hunter 2026-07-03). Opus drivers still stop at `status: review` — merging stays foreman-only. |
 | Subagents | per driver | Sonnet/Haiku | Exploration, bulk reads, builds/tests, mechanical refactors. Drivers take back diffs/summaries only. |
 
 Token rules (binding, from FOREMAN.md "Context & cost discipline" — still in force):

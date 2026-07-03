@@ -1184,8 +1184,13 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding,   0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,    ImVec2(0, 0));
-    // Solid chrome band, subtly following the Global glass tint (no-op at default strength 0).
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ribbon_chromeTint(palette.ribbonBg));
+    // Translucent chrome base so the glassBackground layers below actually read as glass — the
+    // tooltip does the same via a transparent PopupBg. Keep the chrome-tint hue (so the band still
+    // follows the Global glass tint) but drop its alpha; the glass fill/shine/border supply the
+    // surface. See SHARED VISUAL CONTRACT in work/tasks/T-G15.md.
+    ImVec4 ribbonBase = ribbon_chromeTint(palette.ribbonBg);
+    ribbonBase.w = 0.0f;
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ribbonBase);
 
     ImGui::Begin("##RibbonBar", nullptr, flags);
     ImGui::PopStyleVar(3);

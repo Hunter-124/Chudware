@@ -6,6 +6,9 @@ owner: unassigned
 status: todo
 branch: task/T-R5-plm-editor-gui
 depends_on: [T-R2, T-R3, T-U1]
+lane: plm-projects
+kind: new
+priority: 3
 ---
 
 ## Context
@@ -32,6 +35,12 @@ schematic/PCB, CAM workspace (T-U3), and the U7 viewers.
   2D overlay; change list docked from plm_compare semantic output
 - Session-vs-history clarity: panel splits "Session changes" (undo/redo) from
   "Project history" (persistent) — the two-timelines confusion killer
+- **FM Save/Open strip replacement (Hunter, 2026-07-03):** the bottom-of-FM
+  filename + Save/Open strip becomes the vault entry point — Save stays (cuts an
+  auto-history entry per T-R2), Open relocates to the Project Hub/recents, and the
+  strip gains Checkpoint + a compact "history" affordance (opens the panel).
+  Restyle to the T-U1 kit with proper dark-mode contrast (T-G14 finding 7 fixes
+  the current tokens first; don't ship a second bespoke style)
 
 ## Definition of done
 

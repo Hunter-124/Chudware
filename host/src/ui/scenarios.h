@@ -20,7 +20,6 @@ namespace ui {
 class PropertyManager;
 class EvaluateDialogs;
 class ActivityPanel;
-class MissionControlPanel;
 
 class ScenarioRunner {
 public:
@@ -37,8 +36,8 @@ public:
     // EvaluateDialogs are now PER-DOCUMENT — the scenarios resolve them from st.propertyManager /
     // st.evaluateDialogs (re-seated on the doc they create), so they are no longer passed here. The
     // SimManager is likewise per-document (st.simManager), so the FEA scenario resolves it too.
-    explicit ScenarioRunner(ActivityPanel& activityPanel, MissionControlPanel& mcPanel)
-        : activityPanel(activityPanel), mcPanel(mcPanel) {}
+    explicit ScenarioRunner(ActivityPanel& activityPanel)
+        : activityPanel(activityPanel) {}
 
     // Advance the active scenario's step machine (no-op when no AI_CAD_SHOT scenario mode
     // is active). Call once per frame, before ImGui::NewFrame().
@@ -51,15 +50,6 @@ public:
 
 private:
     ActivityPanel& activityPanel;
-    MissionControlPanel& mcPanel;
-
-    // ---------- T-F17 mission_control scenario (AI_CAD_SHOT=mission_control) ----------
-    // Static one-shot capture: write a capstone events.jsonl to the cache/runs dir,
-    // load it into MissionControlPanel, wait for settle, screenshot.
-    // Avoids the step-machine deadlock (issue #7) by using a pre-written log not a live run.
-    int mcStep = 0, mcSettle = 0;
-    std::string mcSavePath, mcCapture, mcJsonlPath;
-    bool mcDirReady = false;
 
     // ---------- C17 M1 integration scenario (AI_CAD_SHOT=m1) ----------
     int m1Step = 0;            // which scenario step we are on

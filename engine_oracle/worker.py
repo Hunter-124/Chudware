@@ -226,6 +226,23 @@ except Exception as _sourcing_import_err:  # noqa: BLE001
         "/match_part_number not registered: %s", _sourcing_import_err)
 # === end BOM / sourcing ===
 
+# === DAG steering seam (T-F17) — dag_status / dag_approve / dag_abort ===
+# Reaches the DAG orchestrator (services/dag/) over the same worker seam so the
+# mission-control panel (ui/imgui/src/ui/mission_control_panel.cpp) can steer a
+# gate-paused run (approve/reject) and locate the events.jsonl replay trail via
+# AsyncRpc.  Thin wrappers over services.dag.executor — same single-implementation
+# delegation as the dag_* MCP tools.  Gracefully absent when langgraph isn't
+# provisioned (returns ok:false envelopes, never a traceback).
+try:
+    from services.dag.worker_rpc import WORKER_METHODS as _DAG_METHODS  # noqa: E402
+    _METHODS.update(_DAG_METHODS)
+except Exception as _dag_import_err:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger("ai-cad.worker").warning(
+        "services.dag.worker_rpc unavailable — dag_status/dag_approve/dag_abort"
+        " not registered: %s", _dag_import_err)
+# === end DAG steering ===
+
 
 def _emit(obj: dict) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")

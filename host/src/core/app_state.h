@@ -1115,8 +1115,6 @@ struct AppState {
     bool multidocShotDone = false; // guard so the multidoc scenario runs exactly once per shot
     bool wantActivity = false;  // C22b: AI_CAD_SHOT=activity scripted orchestrator run + activity panel
     bool activityShotDone = false; // guard so the activity scenario runs exactly once
-    bool wantMissionControl = false;     // T-F17: AI_CAD_SHOT=mission_control — replay capstone events.jsonl
-    bool missionControlShotDone = false; // guard so the mission_control scenario runs exactly once
 
     // ---- W1-B: toast notification queue (rendered by ui::drawToasts in app.cpp) ----
     // C39: guarded by toastsMtx — the worker errorSink posts toasts from background threads

@@ -13,6 +13,7 @@
 #include "ui/bom_panel.h"
 #include "ui/requirements_panel.h"   // T-U5
 #include "ui/transparency_panel.h"   // T-U8
+#include "ui/mission_control_panel.h"  // T-F17
 #include "artifact_view.h"
 #include "app/app_state.h"
 #include "viewport/scene.h"
@@ -229,6 +230,7 @@ int ShotConfig::captureFrameBudget() const {
     if (wantBom && !bomShotDone) return 150;
     if (wantRequirements && !requirementsShotDone) return 150;  // T-U5
     if (wantTransparency && !transparencyShotDone) return 150;  // T-U8
+    if (wantMissionControl && !missionControlShotDone) return 150;  // T-F17
     if (wantTree) return treeShotDone ? 10 : 30;
     if (wantEquations) return equationsShotDone ? 10 : 30;
     if (wantPartsBrowser) return partsBrowserShotDone ? 10 : 30;
@@ -278,6 +280,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantBom          = eq("bom");
     cfg.wantRequirements = eq("requirements");   // T-U5
     cfg.wantTransparency = eq("transparency");   // T-U8
+    cfg.wantMissionControl = eq("mission_control");  // T-F17
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
@@ -327,6 +330,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantBom)          ui::openBomPanel();
     if (cfg.wantRequirements) ui::openRequirementsPanel();  // T-U5
     if (cfg.wantTransparency) ui::openTransparencyPanel();  // T-U8
+    if (cfg.wantMissionControl) ui::openMissionControlPanel();  // T-F17
     if (cfg.wantPick) setupPickShot(st);
     if (cfg.wantGlassperf) setupPickShot(st);
 
@@ -639,6 +643,57 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
             std::printf("transparency: fixture seeded (live unavailable: %s)\n",
                         err.c_str());
         }
+        std::fflush(stdout);
+    }
+
+    // T-F17 Mission Control panel.
+    // Seeds the panel from a capstone-shaped aicad.agent_events/1 JSONL fixture
+    // (contracts/agent_events.md §3; run shape from the T-A5 capstone demo).
+    // The trail ends PAUSED at the pre-order gate (dag.node.approval_required is
+    // the last event) so the screenshot shows the steering controls live:
+    // Approve/Reject enabled, wired to dag_approve/dag_abort (services/dag/
+    // worker_rpc.py → executor.resume()).  Same worker-one-shot settle pattern
+    // as wantTransparency — no step machine (issue-#7 offscreen deadlock).
+    if (cfg.wantMissionControl && !cfg.missionControlShotDone) {
+        cfg.missionControlShotDone = true;
+        const char* ts = "2026-07-03T00:47:41Z";
+        std::string j;
+        auto ev = [&](const char* body) {
+            j += std::string("{\"ts\":\"") + ts + "\"," + body + "}\n";
+        };
+        // Phase 1: thin-slice (design + gate), completed.
+        ev(R"j("kind":"dag.run.started","run_id":"c8efe1ae","graph_id":"thin-slice-soil-sensor","node_count":2,"graph_name":"Thin-slice: design+gate")j");
+        ev(R"j("kind":"dag.node.started","run_id":"c8efe1ae","node_id":"n_design","node_type":"design","node_name":"ECAD schematic stub")j");
+        ev(R"j("kind":"dag.node.done","run_id":"c8efe1ae","node_id":"n_design","output_summary":"Stub ECAD design completed")j");
+        ev(R"j("kind":"dag.node.started","run_id":"c8efe1ae","node_id":"n_gate_preorder","node_type":"gate","node_name":"Pre-order gate")j");
+        ev(R"j("kind":"dag.node.paused","run_id":"c8efe1ae","node_id":"n_gate_preorder","reason":"gate")j");
+        ev(R"j("kind":"dag.node.approval_required","run_id":"c8efe1ae","node_id":"n_gate_preorder")j");
+        ev(R"j("kind":"dag.node.done","run_id":"c8efe1ae","node_id":"n_gate_preorder","output_summary":"Gate approved")j");
+        ev(R"j("kind":"dag.run.done","run_id":"c8efe1ae","status":"done","node_states":{"n_design":{"status":"done"},"n_gate_preorder":{"status":"done"}})j");
+        // Phase 2: full mission — ends paused at the pre-order gate (steering live).
+        ev(R"j("kind":"dag.run.started","run_id":"1948942a","graph_id":"full-mission-soil-sensor","node_count":10,"graph_name":"Battery-Powered Soil-Moisture Sensor")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_ecad","node_type":"ecad","node_name":"ECAD schematic")j");
+        ev(R"j("kind":"dag.node.done","run_id":"1948942a","node_id":"n_ecad","output_summary":"Schematic: ATtiny85 + SHT31, battery circuit")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_firmware","node_type":"firmware","node_name":"Firmware")j");
+        ev(R"j("kind":"dag.node.done","run_id":"1948942a","node_id":"n_firmware","output_summary":"AVR-C firmware stub generated")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_structural","node_type":"structural","node_name":"Structural FEA")j");
+        ev(R"j("kind":"dag.node.done","run_id":"1948942a","node_id":"n_structural","output_summary":"FEA passed - min FOS 2.4")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_source","node_type":"source","node_name":"BOM sourcing")j");
+        ev(R"j("kind":"dag.node.done","run_id":"1948942a","node_id":"n_source","output_summary":"BOM: 12 parts, $4.23 estimated")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_verify_interference","node_type":"verify","node_name":"Verify: interference")j");
+        ev(R"j("kind":"dag.node.failed","run_id":"1948942a","node_id":"n_verify_interference","error":"backend_unavailable (fail-closed)")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_verify_erc","node_type":"verify","node_name":"Verify: ERC")j");
+        ev(R"j("kind":"dag.node.failed","run_id":"1948942a","node_id":"n_verify_erc","error":"backend_unavailable (fail-closed)")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_verify_drc","node_type":"verify","node_name":"Verify: DRC")j");
+        ev(R"j("kind":"dag.node.failed","run_id":"1948942a","node_id":"n_verify_drc","error":"backend_unavailable (fail-closed)")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_verify_budget","node_type":"verify","node_name":"Verify: budget")j");
+        ev(R"j("kind":"dag.node.failed","run_id":"1948942a","node_id":"n_verify_budget","error":"backend_unavailable (fail-closed)")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_gate_preorder","node_type":"gate","node_name":"Pre-order gate")j");
+        ev(R"j("kind":"dag.node.paused","run_id":"1948942a","node_id":"n_gate_preorder","reason":"gate")j");
+        ev(R"j("kind":"dag.node.approval_required","run_id":"1948942a","node_id":"n_gate_preorder")j");
+        ui::seedMissionControlPanelFromJsonl(j);
+        std::printf("mission_control: fixture seeded (%zu bytes, paused at gate)\n",
+                    j.size());
         std::fflush(stdout);
     }
 }

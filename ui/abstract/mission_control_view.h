@@ -1,7 +1,7 @@
 #pragma once
 // Mission-control view-model (T-F17): pure structs, no ImGui/GL/GLFW.
-// The panel (host/src/ui/mission_control_panel.h) projects dag.* events from
-// events.jsonl into these structs and renders from them.  Style exemplar:
+// The panel (ui/imgui/src/ui/mission_control_panel.h) projects dag.* events
+// from events.jsonl into these structs and renders from them.  Style exemplar:
 // ui/abstract/artifact_view.h (same no-ImGui rule).
 //
 // Contract binding (contracts/agent_events.md §3):

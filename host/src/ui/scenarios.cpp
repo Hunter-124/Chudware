@@ -16,13 +16,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <vector>
 
 #include "../core/app_state.h"
 #include "../core/jobs.h"  // launchAgentRunV2 (C22b activity scenario)
 #include "activity_panel.h"
-#include "mission_control_panel.h"  // T-F17: mission-control scenario
 #include "cam/cam_panel.h"  // camLoadJob (CAM copilot fast-path scenario)
 #include "asm_panels.h"
 #include "evaluate_dialogs.h"
@@ -886,116 +884,6 @@ void ScenarioRunner::tick(AppState& st) {
     }
     // --- end C22b activity scenario ---
 
-    // --- T-F17 mission_control scenario (AI_CAD_SHOT=mission_control) ---
-    // Static one-shot capture per the issue-#7 constraint: no live agent run.
-    // Step 0: create dirs + write capstone events.jsonl to cache/runs/<run_id>/
-    // Step 1: load events.jsonl into MissionControlPanel, settle
-    // Step 2: screenshot the panel
-    if (st.wantMissionControl && !st.missionControlShotDone && st.frame >= 5) {
-        if (!mcDirReady) {
-            mcDirReady = true;
-            const char* repo = std::getenv("AI_CAD_REPO");
-            std::string base = repo ? std::string(repo) : std::string(".");
-            mcSavePath = base + "/scratch/mission_control_shots";
-            std::error_code ec;
-            std::filesystem::create_directories(mcSavePath, ec);
-
-            // Write a capstone-representative events.jsonl to the cache/runs dir.
-            // This is the 36-event reference log from the T-A5 capstone demo
-            // (docs/sessions/demo_sprint_day5/capstone_run.log summary,
-            //  contracts/agent_events.md §6).
-            std::string runId = "capstone-demo-f17";
-            std::string cacheRunDir = std::string(appdataDir()) +
-                "/AI-CAD/cache/runs/" + runId;
-            std::filesystem::create_directories(cacheRunDir, ec);
-            mcJsonlPath = cacheRunDir + "/events.jsonl";
-
-            // Write the reference event stream (thin-slice + mission phases).
-            // 14 dag.node.started + 8 dag.node.done + 6 dag.node.failed +
-            // 2 dag.node.paused + 2 dag.node.approval_required +
-            // 2 dag.run.started + 2 dag.run.done = 36 events
-            const char* ts = "2026-07-03T00:47:41Z";
-            std::string evts = "";
-            // Phase 1: thin-slice (design + gate)
-            evts += std::string("{\"kind\":\"dag.run.started\",\"ts\":\"") + ts + "\",\"run_id\":\"c8efe1ae\",\"graph_id\":\"thin-slice-soil-sensor\",\"node_count\":2,\"graph_name\":\"Thin-slice: design+gate\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.started\",\"ts\":\"") + ts + "\",\"run_id\":\"c8efe1ae\",\"node_id\":\"n_design\",\"node_type\":\"design\",\"node_name\":\"ECAD schematic stub\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.done\",\"ts\":\"") + ts + "\",\"run_id\":\"c8efe1ae\",\"node_id\":\"n_design\",\"output_summary\":\"Stub ECAD design completed\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.started\",\"ts\":\"") + ts + "\",\"run_id\":\"c8efe1ae\",\"node_id\":\"n_gate_preorder\",\"node_type\":\"gate\",\"node_name\":\"Pre-order gate\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.paused\",\"ts\":\"") + ts + "\",\"run_id\":\"c8efe1ae\",\"node_id\":\"n_gate_preorder\",\"reason\":\"gate\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.approval_required\",\"ts\":\"") + ts + "\",\"run_id\":\"c8efe1ae\",\"node_id\":\"n_gate_preorder\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.done\",\"ts\":\"") + ts + "\",\"run_id\":\"c8efe1ae\",\"node_id\":\"n_gate_preorder\",\"output_summary\":\"Gate approved\"}\n";
-            evts += std::string("{\"kind\":\"dag.run.done\",\"ts\":\"") + ts + "\",\"run_id\":\"c8efe1ae\",\"status\":\"done\",\"node_states\":{\"n_design\":{\"status\":\"done\"},\"n_gate_preorder\":{\"status\":\"done\"}}}\n";
-            // Phase 2: full mission (10 nodes)
-            evts += std::string("{\"kind\":\"dag.run.started\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"graph_id\":\"full-mission-soil-sensor\",\"node_count\":10,\"graph_name\":\"Battery-Powered Soil-Moisture Sensor\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.started\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_ecad\",\"node_type\":\"ecad\",\"node_name\":\"ECAD schematic\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.done\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_ecad\",\"output_summary\":\"Schematic: ATtiny85 + SHT31, battery circuit\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.started\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_firmware\",\"node_type\":\"firmware\",\"node_name\":\"Firmware\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.done\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_firmware\",\"output_summary\":\"AVR-C firmware stub generated\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.started\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_structural\",\"node_type\":\"structural\",\"node_name\":\"Structural FEA\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.done\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_structural\",\"output_summary\":\"FEA passed — min FOS 2.4\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.started\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_source\",\"node_type\":\"source\",\"node_name\":\"BOM sourcing\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.done\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_source\",\"output_summary\":\"BOM: 12 parts, $4.23 estimated\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.started\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_verify_interference\",\"node_type\":\"verify\",\"node_name\":\"Verify: interference\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.failed\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_verify_interference\",\"error\":\"backend_unavailable (fail-closed)\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.started\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_verify_erc\",\"node_type\":\"verify\",\"node_name\":\"Verify: ERC\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.failed\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_verify_erc\",\"error\":\"backend_unavailable (fail-closed)\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.started\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_verify_drc\",\"node_type\":\"verify\",\"node_name\":\"Verify: DRC\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.failed\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_verify_drc\",\"error\":\"backend_unavailable (fail-closed)\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.started\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_verify_firmware\",\"node_type\":\"verify\",\"node_name\":\"Verify: firmware\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.failed\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_verify_firmware\",\"error\":\"backend_unavailable (fail-closed)\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.started\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_verify_dc\",\"node_type\":\"verify\",\"node_name\":\"Verify: DC ratio\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.failed\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_verify_dc\",\"error\":\"backend_unavailable (fail-closed)\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.started\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_verify_budget\",\"node_type\":\"verify\",\"node_name\":\"Verify: budget\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.failed\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_verify_budget\",\"error\":\"backend_unavailable (fail-closed)\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.started\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_gate_preorder\",\"node_type\":\"gate\",\"node_name\":\"Pre-order gate\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.paused\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_gate_preorder\",\"reason\":\"gate\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.approval_required\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_gate_preorder\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.done\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_gate_preorder\",\"output_summary\":\"Gate approved\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.started\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_report\",\"node_type\":\"report\",\"node_name\":\"Report\"}\n";
-            evts += std::string("{\"kind\":\"dag.node.done\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"node_id\":\"n_report\",\"output_summary\":\"Mission report: 4 done, 6 verify-escalated, gate approved\"}\n";
-            evts += std::string("{\"kind\":\"dag.run.done\",\"ts\":\"") + ts + "\",\"run_id\":\"1948942a\",\"status\":\"failed\",\"node_states\":{\"n_ecad\":{\"status\":\"done\"},\"n_firmware\":{\"status\":\"done\"},\"n_structural\":{\"status\":\"done\"},\"n_source\":{\"status\":\"done\"},\"n_verify_interference\":{\"status\":\"failed\"},\"n_verify_erc\":{\"status\":\"failed\"},\"n_verify_drc\":{\"status\":\"failed\"},\"n_verify_firmware\":{\"status\":\"failed\"},\"n_verify_dc\":{\"status\":\"failed\"},\"n_verify_budget\":{\"status\":\"failed\"},\"n_gate_preorder\":{\"status\":\"done\"},\"n_report\":{\"status\":\"done\"}}}\n";
-
-            std::ofstream jf(mcJsonlPath, std::ios::out | std::ios::trunc);
-            if (jf.is_open()) { jf << evts; jf.flush(); }
-            jf.close();
-
-            std::printf("mission_control: wrote %zu-byte events.jsonl to %s\n",
-                        evts.size(), mcJsonlPath.c_str());
-            std::fflush(stdout);
-            mcStep = 1;
-            mcSettle = 6;
-        }
-
-        const int kSettle = 4;
-        if (mcSettle > 0) { --mcSettle; }
-        else if (mcCapture.empty()) {
-            switch (mcStep) {
-                case 1: {
-                    // Load the events.jsonl into the panel
-                    bool ok = mcPanel.loadReplay(mcJsonlPath);
-                    std::printf("mission_control: loadReplay -> %s (%zu events)\n",
-                                ok ? "ok" : "FAILED", mcPanel.view().events.size());
-                    std::fflush(stdout);
-                    mcSettle = kSettle * 2; ++mcStep; break;
-                }
-                case 2: {
-                    // Screenshot the mission-control panel
-                    std::printf("mission_control: shot1 mission_control panel\n");
-                    std::fflush(stdout);
-                    mcCapture = mcSavePath + "/mission_control_01_capstone.png";
-                    mcSettle = kSettle; ++mcStep; break;
-                }
-                default:
-                    st.missionControlShotDone = true;
-                    std::printf("mission_control: scenario complete (%zu nodes, %zu events)\n",
-                                mcPanel.view().nodes.size(), mcPanel.view().events.size());
-                    std::fflush(stdout);
-                    break;
-            }
-        }
-    }
-    // --- end T-F17 mission_control scenario ---
-
     // ---------- multi-document scenario (AI_CAD_SHOT=multidoc) ----------
     runMultidoc(st);
 
@@ -1658,29 +1546,6 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         return st.activityShotDone ? FrameAction::Break : FrameAction::Continue;
     }
     // --- end C22b activity shot capture ---
-
-    // --- T-F17 mission_control shot capture (static one-shot) ---
-    if (st.wantMissionControl) {
-        ++st.frame;
-        // Draw the mission-control panel explicitly (it's not in the normal layout for the host app).
-        // We open it as a standalone ImGui window so the screenshot captures it.
-        // Note: this fires BEFORE ImGui::Render() in the frame loop, so we just note the
-        // need to draw — the panel is drawn by the app.cpp frame loop via a wantMissionControl
-        // branch (add there if needed; for the scenario the standalone window is sufficient).
-        if (!mcCapture.empty()) {
-            std::error_code ec; std::filesystem::create_directories(mcSavePath, ec);
-            // Mirror the final step to screenshotPath
-            const char* mirror = screenshotPath;
-            writeBackbufferPng(mcCapture.c_str(), dw, dh, mirror);
-            std::printf("mission_control: screenshot -> %s (%dx%d)\n",
-                        mcCapture.c_str(), dw, dh);
-            std::fflush(stdout);
-            mcCapture.clear();
-        }
-        glfwSwapBuffers(st.win);
-        return st.missionControlShotDone ? FrameAction::Break : FrameAction::Continue;
-    }
-    // --- end T-F17 mission_control shot capture ---
 
     // appearance scenario: single capture (mirrored to the caller's --ui-screenshot target),
     // waiting for any async worker call to drain so the modal + preview are settled.

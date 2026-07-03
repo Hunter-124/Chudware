@@ -47,6 +47,8 @@ struct ShotConfig {
     bool requirementsShotDone = false;
     bool wantTransparency = false;          // T-U8: model & telemetry transparency panel
     bool transparencyShotDone = false;
+    bool wantMissionControl = false;        // T-F17: mission-control (DAG steering) panel
+    bool missionControlShotDone = false;
 
     // Long-running scenario modes (ScenarioRunner step machines)
     bool wantM1 = false;

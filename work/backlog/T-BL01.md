@@ -3,7 +3,7 @@ id: T-BL01
 title: V&V benchmark harness
 workstream: backlog
 owner: unassigned
-status: backlog
+status: todo
 branch: task/T-BL01-vv-harness
 depends_on: []
 ---

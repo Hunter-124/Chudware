@@ -1,0 +1,77 @@
+{
+  "mission": "battery-powered soil-moisture sensor on a cedar post",
+  "timestamp": "2026-07-03T00:47:41Z",
+  "phases": [
+    {
+      "phase": "thin_slice",
+      "run_id": "c8efe1ae-5526-4cc4-a6a7-642cf6ffbfbc",
+      "pause_ok": true,
+      "resume_ok": true,
+      "final_status": "done",
+      "node_statuses": {
+        "n_design": "done",
+        "n_gate_preorder": "done"
+      }
+    },
+    {
+      "phase": "full_mission",
+      "run_id": "1948942a-8afa-4971-bed1-3e15a8da8433",
+      "pause_ok": true,
+      "resume_ok": true,
+      "final_status": "failed",
+      "gate_done": true,
+      "report_done": true,
+      "node_statuses_pre_resume": {
+        "n_ecad": "done",
+        "n_firmware": "done",
+        "n_structural": "done",
+        "n_source": "done",
+        "n_verify_interference": "failed",
+        "n_verify_erc": "failed",
+        "n_verify_drc": "failed",
+        "n_verify_firmware": "failed",
+        "n_verify_dc": "failed",
+        "n_verify_budget": "failed"
+      },
+      "node_statuses_final": {
+        "n_ecad": "done",
+        "n_firmware": "done",
+        "n_structural": "done",
+        "n_source": "done",
+        "n_verify_interference": "failed",
+        "n_verify_erc": "failed",
+        "n_verify_drc": "failed",
+        "n_verify_firmware": "failed",
+        "n_verify_dc": "failed",
+        "n_verify_budget": "failed",
+        "n_gate_preorder": "done",
+        "n_report": "done"
+      },
+      "escalated_verify_nodes": [
+        "n_verify_interference",
+        "n_verify_erc",
+        "n_verify_drc",
+        "n_verify_firmware",
+        "n_verify_dc",
+        "n_verify_budget"
+      ],
+      "escalated_count": 6,
+      "escalation_reason": "backend_unavailable (fail-closed per verify.py \u00a7policy)",
+      "gate_node_id": "n_gate_preorder",
+      "gate_batch_id": "b_ab49f7db05ca",
+      "gate_decision": "approve",
+      "dod_gate_pause_resume": true,
+      "dod_all_five_verify_pillars_fired": true
+    }
+  ],
+  "event_counts": {
+    "dag.run.started": 2,
+    "dag.node.started": 14,
+    "dag.node.done": 8,
+    "dag.node.paused": 2,
+    "dag.node.approval_required": 2,
+    "dag.run.done": 2,
+    "dag.node.failed": 6
+  },
+  "total_events": 36
+}

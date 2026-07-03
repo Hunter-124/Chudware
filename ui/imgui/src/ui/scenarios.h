@@ -43,6 +43,8 @@ struct ShotConfig {
     bool partsBrowserShotDone = false;
     bool wantBom = false;
     bool bomShotDone = false;
+    bool wantSimStudies = false;                 // T-U6: sim studies panel (AI_CAD_SHOT=sim_studies)
+    bool simStudiesShotDone = false;
 
     // Long-running scenario modes (ScenarioRunner step machines)
     bool wantM1 = false;

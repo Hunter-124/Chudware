@@ -10,6 +10,8 @@
 #include "ui/legend.h"
 #include "ui/drawing_panel.h"
 #include "ui/sim_manager.h"
+#include "ui/cam/cam_panel.h"
+#include "ui/ecad/ecad_panel.h"
 #include "app/app_state.h"
 #include "theme/theme.h"
 #include "theme/icons.h"
@@ -574,6 +576,27 @@ void drawViewport(AppState& s) {
 
     if (s.workspace == cmd::Workspace::Drafting) {
         ui::drawDrawingSheet(s);
+        return;
+    }
+
+    // H2: ECAD (Schematic/Board) workspaces host the ECAD editor INSIDE this viewport window
+    // (content-swap, full takeover) instead of the 3D render. Moving it here — rather than keeping
+    // it as a separate dock tab sharing the central node — is the fix for the headless surfacing
+    // gap: the central dock node hides its tab bar (NoTabBar), so the separate "ECAD" dock window
+    // was never brought forward in headless/offscreen shots. The begin("ECAD") block in
+    // application.cpp is now a no-draw stub (kept for dock-layout registration, never draws).
+    {
+        const cmd::Workspace ews = s.effectiveWorkspace();
+        if (ews == cmd::Workspace::Schematic || ews == cmd::Workspace::Board) {
+            ui::drawEcadEditor(s);
+            return;
+        }
+    }
+
+    // H1: CAM panel content-swap. Same headless surfacing gap as ECAD above. The cam scenario
+    // sets st.camActive = true after building the job; cleared when leaving to a non-CAM mode.
+    if (s.camActive) {
+        ui::drawCamManager(s);
         return;
     }
 

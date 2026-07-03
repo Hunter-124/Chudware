@@ -99,6 +99,7 @@ struct AppState {
     cmd::Workspace workspace = cmd::Workspace::Model;
     bool  inSketch = false;
     bool  sketchPlanePickActive = false;
+    bool  camActive = false;   // H1 CAM content-swap: true while the CAM panel should be forward
 
     std::string activeTool;
     std::string toolExtrudeOp;

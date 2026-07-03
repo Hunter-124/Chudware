@@ -1,6 +1,7 @@
 #include "app/app_state.h"
 #include "platform/file_dialog.h"
 #include "viewport/scene.h"
+#include "ui/ecad/ecad_panel.h"
 #include <cstring>
 #include <string>
 
@@ -175,11 +176,16 @@ void AppState::dispatch(const char* cmdId) {
     if (std::strcmp(cmdId, "ecad_new_sch") == 0) {
         docs.push_back({"Schematic1", cmd::DocType::Schematic});
         activeDoc = (int)docs.size() - 1; workspace = cmd::Workspace::Schematic;
+        // H2: create the real worker ecad doc + load it into the ECAD panel's editor mirror (the
+        // demo doc-tab bookkeeping above is unchanged; this is the dispatch-site delegate into
+        // ui/ecad/** — see ecad_panel.h::ecadHandleNewDoc).
+        if (workerStarted) ui::ecadHandleNewDoc(*this, "sch");
         status = "Created Schematic1"; syncViewModel(); return;
     }
     if (std::strcmp(cmdId, "ecad_new_pcb") == 0) {
         docs.push_back({"Board1", cmd::DocType::Pcb});
         activeDoc = (int)docs.size() - 1; workspace = cmd::Workspace::Board;
+        if (workerStarted) ui::ecadHandleNewDoc(*this, "pcb");
         status = "Created Board1"; syncViewModel(); return;
     }
     if (std::strcmp(cmdId, "ecad_ai_design") == 0) {

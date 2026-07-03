@@ -6,6 +6,7 @@
 #include "ui/scenarios.h"
 #include "ui/cursors.h"
 #include "ui/cam/cam_panel.h"
+#include "ui/ecad/ecad_panel.h"
 #include "ui/command_search.h"
 #include "ui/file_explorer.h"
 #include "ui/settings_modal.h"
@@ -180,6 +181,23 @@ void Application::frame() {
     if (ui::camTakeFocusRequest()) ImGui::SetNextWindowFocus();
     if (ImGui::Begin("CAM", nullptr, pflags))
         ui::drawCamManager(s);
+    ImGui::End();
+
+    // H2: ECAD (Schematic/Board) workspace — shares the central dock node with Viewport/CAM (same
+    // tab-bar-hidden mechanics as CAM above; ecadTakeFocusRequest() drives which tab is forward).
+    // Unlike CAM's decaying one-shot (a known surfacing gap — see work/tasks/T-G8.md: "no Manufacture
+    // workspace exists, so the cam scenario shows the Model viewport"), ECAD IS a real workspace
+    // (Schematic/Board), so it also self-heals every frame the workspace is active — matching the
+    // "workspace-surfaced panels... key off st.workspace" pattern the other H2-H5 nodes use (drawing/
+    // sim/sketch), just applied to a central-dock tab instead of an in-viewport content swap.
+    // Self-contained, no-op-safe: drawEcadEditor renders the "design with AI / start blank" launchpad
+    // until an ecad_new_sch/ecad_new_pcb command or the AI launchpad populates it.
+    const cmd::Workspace ws = s.effectiveWorkspace();
+    const bool ecadWorkspaceActive =
+        ws == cmd::Workspace::Schematic || ws == cmd::Workspace::Board;
+    if (ui::ecadTakeFocusRequest() || ecadWorkspaceActive) ImGui::SetNextWindowFocus();
+    if (ImGui::Begin("ECAD", nullptr, pflags))
+        ui::drawEcadEditor(s);
     ImGui::End();
 
     if (ImGui::Begin("Assistant###agent", nullptr, pflags))

@@ -37,6 +37,8 @@ SCRATCH = os.path.join(REPO, "scratch", "gui_parity")
 
 HOST_BIN = os.path.join(REPO, "host", "build-linux", "bin", "AI-CAD")
 NEW_BIN = os.path.join(REPO, "ui", "imgui", "build", "bin", "AI-CAD2")
+# ShopCraft is a post-build symlink/copy of AI-CAD2 (T-G10). Both names work.
+SHOPCRAFT_BIN = os.path.join(REPO, "ui", "imgui", "build", "bin", "ShopCraft")
 
 BINARIES = {"host": HOST_BIN, "aicad2": NEW_BIN}
 

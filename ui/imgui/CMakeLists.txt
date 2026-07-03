@@ -128,3 +128,23 @@ add_custom_command(TARGET AI-CAD2 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           "${HOST}/assets/icons" "$<TARGET_FILE_DIR:AI-CAD2>/resources/icons"
   VERBATIM)
+
+# Additive ShopCraft alias: create a symlink ShopCraft -> AI-CAD2 in the bin dir
+# so scripts using the new name work without breaking any existing AI-CAD2 references.
+if(NOT WIN32)
+    add_custom_command(TARGET AI-CAD2 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+            "$<TARGET_FILE_NAME:AI-CAD2>"
+            "$<TARGET_FILE_DIR:AI-CAD2>/ShopCraft"
+        COMMENT "Creating ShopCraft -> AI-CAD2 symlink"
+    )
+endif()
+
+if(WIN32)
+    add_custom_command(TARGET AI-CAD2 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:AI-CAD2>"
+            "$<TARGET_FILE_DIR:AI-CAD2>/ShopCraft.exe"
+        COMMENT "Creating ShopCraft.exe copy"
+    )
+endif()

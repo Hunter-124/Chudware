@@ -1,4 +1,9 @@
-"""Register the AI-CAD MCP server into every MCP-capable client on this machine.
+"""Register the ShopCraft MCP server into every MCP-capable client on this machine.
+
+The server is registered under the new name ``shopcraft`` (formerly ``ai-cad``). Existing
+``ai-cad`` entries in client configs are left in place on normal registration so that
+tooling still referencing the old name continues to work; they are removed only on an
+explicit ``--unregister`` run.
 
 One server, five clients. This writes/merges the right config file in the right format
 for each of:
@@ -15,7 +20,7 @@ are correct for it. Antigravity has no project-scoped config, so it is wired glo
 
 The writes are idempotent and non-destructive: existing servers in each file are preserved,
 each file is backed up (*.aicad-bak) before the first change, and re-running only rewrites a
-file when the "ai-cad" entry would actually change.
+file when the "shopcraft" (or legacy "ai-cad") entry would actually change.
 
 Pure standard library on purpose -- it must run under any Python, including one without the
 engine's heavy dependencies installed.
@@ -39,7 +44,8 @@ import shutil
 import sys
 from pathlib import Path
 
-SERVER_NAME = "ai-cad"
+SERVER_NAME = "shopcraft"
+SERVER_NAME_LEGACY = "ai-cad"
 
 
 # --------------------------------------------------------------------------- entry shapes
@@ -130,11 +136,14 @@ def _apply_one(t: dict, unregister: bool, dry_run: bool) -> dict:
         servers = {}
 
     if unregister:
-        changed = SERVER_NAME in servers
+        changed = SERVER_NAME in servers or SERVER_NAME_LEGACY in servers
         servers.pop(SERVER_NAME, None)
+        servers.pop(SERVER_NAME_LEGACY, None)  # remove legacy id on explicit unregister
     else:
         changed = servers.get(SERVER_NAME) != t["entry"]
         servers[SERVER_NAME] = t["entry"]
+        # Leave any legacy "ai-cad" entry in place — existing tooling references it.
+        # Run with --unregister then re-register to clean up the old entry.
 
     cfg[t["key"]] = servers
     for k, v in t.get("extra", {}).items():
@@ -165,7 +174,7 @@ def _status_of(t: dict) -> dict:
     cfg = _load(path) if path.exists() else {}
     if not isinstance(cfg, dict):
         cfg = {}
-    connected = SERVER_NAME in (cfg.get(t["key"]) or {})
+    connected = SERVER_NAME in (cfg.get(t["key"]) or {}) or SERVER_NAME_LEGACY in (cfg.get(t["key"]) or {})
     present = path.exists() or path.parent.exists()
     return {"client": t["client"], "path": str(path), "present": present,
             "connected": connected}
@@ -220,7 +229,7 @@ def main(argv: list[str]) -> int:
     action = "Unregistering" if args.unregister else "Registering"
     if args.wizard:
         action = "Connecting detected"
-    print(f"{action} '{SERVER_NAME}' MCP server")
+    print(f"{action} '{SERVER_NAME}' MCP server (legacy: '{SERVER_NAME_LEGACY}')")
     print(f"  python : {py}")
     print(f"  repo   : {repo}")
     print()

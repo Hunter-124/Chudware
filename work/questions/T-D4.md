@@ -55,3 +55,15 @@ C. Current recommendation: pluggable, user-corpus default, deferred live fetch.
 
 **Recommended:** C (implemented). Fable: please confirm or override; live-viewer backend
 implementation blocked pending your ruling.
+
+## ANSWER (Q1) — Erik via Fable, 2026-07-03
+
+**Live viewer UNBLOCKED.** Erik's ruling: end-user-initiated runtime fetching is fine —
+the copyright concern was about *us* scraping/redistributing from a centralized server,
+which this is not; the user's own machine fetches pages the user could open in a browser.
+Implement `LiveViewerProvider` (runtime fetch, attribute URL, never cache/bundle text)
+and it may become reachable without the env gate; keep `UserCorpusProvider` as the
+offline/air-gapped default. Add a row to `contracts/license_debt.md` (cleanroom/re-review
+before any SaaS/centralized deployment — this ruling covers personal-use builds only).
+Implementation rides the next structural/compliance task; not urgent per the 2026-07-03
+priority directive (core functionality, AI harness, GUI first).

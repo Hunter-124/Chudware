@@ -62,15 +62,25 @@ see who holds what.
   subagents using the node specs in `docs/GUI_MIGRATION_DAG.md`; that doc's write-sets
   and verify commands are binding.
 
-## OSS-first rule (Erik, 2026-07-03, binding)
+## OSS-first rule (Erik, 2026-07-03, binding; license posture relaxed same day)
 
 Before implementing any significant new subsystem/algorithm, spend 10 minutes
 surveying open source: an existing library or reference implementation beats
-recoding it — the goal is prototype velocity. License guardrails still bind
-absolutely: MIT/BSD/Apache may be imported in-process; GPL/MPL only via
-subprocess isolation; AGPL never; PyMuPDF never. Study-only for incompatible
-licenses (learn the approach, write your own code). Every adopted dep needs a
+recoding it — the goal is prototype velocity. Every adopted dep still needs a
 contracts/licenses.md row AND a requirements.txt line in the same commit.
+
+LICENSE POSTURE (Erik, 2026-07-03): these are personal-use builds — license
+compliance may be relaxed for velocity (bundling/vendoring encumbered material
+is allowed) PROVIDED every shortcut adds a row to `contracts/license_debt.md`
+(the cleanroom-before-SaaS register). A shortcut without a debt row is a
+policy violation. Prefer permissive deps when the cost is equal; the old
+guardrails (GPL via subprocess, no AGPL) remain good defaults, not hard walls.
+
+## Priority directive (Erik, 2026-07-03)
+
+Focus entirely on: (1) core CAD functionality, (2) the AI-harness side of the
+integrations, (3) the GUI. Model fine-tuning / serving / flywheel work is
+DEFERRED — don't claim ML-track tasks ahead of core/GUI work even if ready.
 
 ## Priority-ordered claiming (Erik, 2026-07-03)
 

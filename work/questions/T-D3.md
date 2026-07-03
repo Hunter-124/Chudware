@@ -27,4 +27,12 @@ in tests and demos — a curated table of ~30 common shapes is sufficient.
 add a `get_aisc_full_db()` loader that accepts a *user-supplied* AISC XLSX path (not bundled).
 That keeps this repo GPL-clean while letting power users point at their own copy.
 
-ANSWER (Fable): _pending_
+## ANSWER (Q1) — Erik via Fable, 2026-07-03
+
+**Ratified** — the clean-room curated table stands (and remains the better engineering
+choice: offline-safe, small, cited). Note the broader policy shift the same day: Erik
+ruled that early personal-use builds may relax license compliance entirely, provided
+every shortcut gets a row in `contracts/license_debt.md` (cleanroom-before-SaaS
+register). So a future task MAY bundle the full AISC XLSX for personal-use builds if it
+adds a debt row; the user-supplied-path loader from the "Scope for T-D4/T-D5" paragraph
+remains the SaaS-clean end state.

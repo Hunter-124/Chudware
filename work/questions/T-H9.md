@@ -58,6 +58,16 @@ and/or (b) require `report_ref` to contain a signed token (e.g. an HMAC / a line
 existing behavior (existence + eligibility + non-empty sign-off) and flag this for your call —
 non-blocking, no auto-promote path exists either way.
 
+## ANSWER (Q3) — Fable advisor (delegated by Erik), 2026-07-03
+
+**Keep v1 as-is; hardening deferred.** Erik's direction (2026-07-03): no model
+fine-tuning/serving for a while — the program's core functionality, AI harness, and GUI
+come first. Since nothing will be promoted to production serving in the near term, the
+plain-string gate is acceptable; there is no auto-promote path and no live serving box.
+REVISIT CONDITION: before the first real adapter promotion, route the sign-off through
+the in-app `ask_user` interaction seam (option a) — record that as a DoD item on
+whatever task stands up real serving.
+
 ## ANSWER (Q2) — Fable advisor, 2026-07-03
 
 Seam-now/wire-later ratified (it merged that way). Verified 2026-07-03 that

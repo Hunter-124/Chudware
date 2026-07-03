@@ -1,0 +1,6 @@
+{
+ "from": "fable-foreman",
+ "to": "*",
+ "text": "HANDOFF / COORDINATION (fable-foreman winding down, 2026-07-03): Two human-run OPUS DRIVER sessions are starting in parallel \u2014 Hunter (owner: opus-hunter) and mooseinatree (owner: mooseinatree). You two are aware of each other; coordinate via this board. RULES: (1) claim() atomically BEFORE working \u2014 never touch a task you didn't claim; run work_board / team_status first to see who holds what. (2) Distinct owner names, pass --owner explicitly, NEVER run git config user.*. (3) Stop at status:review \u2014 NEVER merge to master or mark done (human/foreman merge-time action); review branches queue for a later merge pass. (4) note() meaningful progress so the other session sees it. IN FLIGHT (do not collide): T-BL21+T-BL30 (sonnet-quorix), T-BL27+T-BL31 (sonnet-lira), T-G21 (sonnet-fenn, at review) \u2014 autopilot agents, may be alive or dead; verify via work_board before touching. READY QUEUE is deep (run work_ready): sketch cluster T-BL41/42/43/44/46 + Copilot T-BL38/39/40 + FM T-BL33/36/37 (Hunter's product focus); T-BL02 interop + .3dm/DXF importers (mooseinatree's specialty). T-R1 (PLM contract freeze) + T-BL45 (3D sketcher plan) are Opus design tasks Hunter wants to steer. Full state: work/FOREMAN_STATE.md.",
+ "ts": "2026-07-03T23:45:09Z"
+}

@@ -7,6 +7,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -2061,6 +2062,23 @@ static void pushTextColor(const float c[4]) {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], c[3]));
 }
 
+// T-G14: drawBody() pushes ImGuiCol_Text = surf.textPrimary (adaptive, DARK over the light
+// viewport) as the default so on-panel VALUE text tracks the frosted-glass tint. But a tooltip is
+// a SEPARATE popup window whose PopupBg is the THEME-toned glassBg (dark in the dark theme), so it
+// must use THEME-toned text (pal.text = light in the dark theme), not the adaptive backdrop tone —
+// otherwise the inherited surf.textPrimary paints dark text on the dark popup (black-on-black).
+// Mirror the open-combo pattern (which re-pushes pal.text). Use this for every tooltip inside the
+// drawBody/label call-graph.
+static void pmTooltip(const char* fmt, ...) {
+    const auto& t = ui::palette.text;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(t[0], t[1], t[2], t[3]));
+    va_list args;
+    va_start(args, fmt);
+    ImGui::SetTooltipV(fmt, args);
+    va_end(args);
+    ImGui::PopStyleColor();
+}
+
 // C37-F: descriptions for each form type shown under the title.
 static const char* formDescription(const char* type) {
     if (!type) return "";
@@ -2111,7 +2129,7 @@ static bool pmCompactLabel(const char* label, const char* suffix,
         ImGui::TextUnformatted(shown.c_str());
         ImGui::PopStyleColor();
         (void)clipped;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", full.c_str());
+        if (ImGui::IsItemHovered()) pmTooltip("%s", full.c_str());
         ImGui::SameLine(labelW);
         return true;
     }
@@ -2376,7 +2394,7 @@ void PropertyManager::drawBody(AppState& st) {
             else
                 ok = ImGui::Button("OK##pm", ImVec2(btnW, btnW));
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("OK (Enter)");
+        if (ImGui::IsItemHovered()) pmTooltip("OK (Enter)");
         ImGui::PopStyleVar();
         ImGui::PopStyleColor(2);
 
@@ -2395,7 +2413,7 @@ void PropertyManager::drawBody(AppState& st) {
             else
                 cancel = cancel || ImGui::Button("X##pm", ImVec2(btnW, btnW));
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cancel (Esc)");
+        if (ImGui::IsItemHovered()) pmTooltip("Cancel (Esc)");
         ImGui::PopStyleVar();
         ImGui::PopStyleColor(2);
 
@@ -2428,7 +2446,7 @@ void PropertyManager::drawBody(AppState& st) {
         ImGui::PopStyleColor(4);
         if (aiBusy_) ImGui::EndDisabled();
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Ask AI to fill safe visible fields or activate the next reference well");
+            pmTooltip("Ask AI to fill safe visible fields or activate the next reference well");
         if (!aiMessage_.empty()) {
             pushTextColor(aiBusy_ ? pal.textDim : pal.accent);
             ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
@@ -2531,7 +2549,7 @@ void PropertyManager::drawBody(AppState& st) {
                                                           : (useIps ? " [in]" : " [mm]");
                 pmCompactLabel(f.def->label, unitSuffix, pal, enabled);
                 if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("Not yet supported by engine");
+                    pmTooltip("Not yet supported by engine");
 
                 // Widgets audit: bounded dims (angles, draft, k-factor) are sliders; open-ended
                 // ones (depth, radii, spacing) are drags — both show the unit in the value text and
@@ -2669,7 +2687,7 @@ void PropertyManager::drawBody(AppState& st) {
                     }
                     ImGui::PopStyleColor(2);
                     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip(exprBound
+                        pmTooltip(exprBound
                             ? "Unbind the equation (keep the current value)"
                             : (textMode
                                 ? "Back to slider entry"
@@ -2682,7 +2700,7 @@ void PropertyManager::drawBody(AppState& st) {
                                 pmFieldValueText(f.def, f.dimValue, useIps).c_str());
                     ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Bound to equation '%s'", f.dimExpr.c_str());
+                        pmTooltip("Bound to equation '%s'", f.dimExpr.c_str());
                 }
                 // C37-F: inline red error — shown as a red hint line, not silently ignored.
                 if (enabled && !f.dimError.empty()) {
@@ -2760,11 +2778,11 @@ void PropertyManager::drawBody(AppState& st) {
                 // C37-F: tooltip on the well button.
                 if (wellHovered) {
                     if (f.wellActive)
-                        ImGui::SetTooltip("Active — pick faces/edges in the viewport");
+                        pmTooltip("Active — pick faces/edges in the viewport");
                     else if (!f.picks.empty())
-                        ImGui::SetTooltip("Click to re-activate; right-click to clear");
+                        pmTooltip("Click to re-activate; right-click to clear");
                     else
-                        ImGui::SetTooltip("Click to activate pick target");
+                        pmTooltip("Click to activate pick target");
                 }
 
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
@@ -2789,7 +2807,7 @@ void PropertyManager::drawBody(AppState& st) {
             case PMFieldKind::Combo: {
                 pmCompactLabel(f.def->label, "", pal, enabled);
                 if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("Not yet supported by engine");
+                    pmTooltip("Not yet supported by engine");
                 // Build display labels (comboLabels if provided, else fall back to comboOptions).
                 std::string lblSrc = f.def->comboLabels ? f.def->comboLabels
                                    : (f.def->comboOptions ? f.def->comboOptions : "");
@@ -2889,7 +2907,7 @@ void PropertyManager::drawBody(AppState& st) {
                     if (enabled) { f.checkValue = val; dirty_ = true; lastEditTime_ = ImGui::GetTime(); }
                 }
                 if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("Not yet supported by engine");
+                    pmTooltip("Not yet supported by engine");
                 break;
             }
             case PMFieldKind::Int: {

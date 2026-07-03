@@ -1057,26 +1057,131 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
         if (m1Step <= 5) ++m1Step;
     }
 
-    // ---------- sketch (simplified: rect sketch + extrude) ----------
+    // ---------- sketch (host-parity solver op-batch: incremental rect + drag + dim + solve) ----
+    // T-G9 harness finding: the previous "simplified" flow here (one batched
+    // sketchRectExtrude) exercised none of the solver op-batch host exercises. This is a
+    // faithful port of host/src/ui/scenarios.cpp: entities/constraints added one op at a
+    // time, drag + commit, set_dim 80->100, sketch_solve, enter/exit — the RPC sequence
+    // tools/gui_parity/run_all.py sketch diffs against host.
     if (cfg.wantSketch && st.workerStarted && !cfg.sketchShotDone && cfg.frame >= 5) {
         if (!skDirReady) {
             skDirReady = true;
             skSavePath = repoBase() + "/scratch/sketch_shots";
             std::error_code ec; std::filesystem::create_directories(skSavePath, ec);
         }
+        auto applyOne = [&](const nlohmann::json& op) {
+            return st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+        };
         const int kSettle = 4;
         if (skSettle > 0) { --skSettle; return; }
         if (!sketchCapture.empty()) return;
+        std::string err;
         switch (skStep) {
-            case 0: {
-                std::string err;
-                st.docMirror.newPart(st.worker, err);
+            case 0: {  // new part + sketch + rect (entities/relations/dims) + enter
+                if (!st.docMirror.newPart(st.worker, err)) {
+                    std::printf("sketch: new_part FAILED: %s\n", err.c_str()); std::fflush(stdout);
+                    cfg.sketchShotDone = true; break;
+                }
                 st.addDocTab(false);
+                auto r = applyOne({{"op","add_feature"},{"feature",{
+                    {"type","sketch"},{"name","Sketch1"},
+                    {"refs",{{"plane","plane.top"}}},
+                    {"params",{{"entities",nlohmann::json::array()},
+                               {"constraints",nlohmann::json::array()}}}}}});
+                skFid = (r.id_map.is_object() && r.id_map.contains("$0"))
+                        ? r.id_map["$0"].get<std::string>() : "f1";
+                auto addLine = [&](double x1,double y1,double x2,double y2,bool horiz,
+                                   const std::string& prev)->std::string{
+                    nlohmann::json cs = nlohmann::json::array();
+                    cs.push_back({{"type",horiz?"horizontal":"vertical"},{"refs",{"$self"}}});
+                    if (!prev.empty())
+                        cs.push_back({{"type","coincident"},{"refs",{prev+".p2","$self.p1"}}});
+                    auto rr = applyOne({{"op","sketch_add_entity"},{"sketch",skFid},
+                        {"entity",{{"type","line"},{"p1",{x1,y1}},{"p2",{x2,y2}}}},{"constraints",cs}});
+                    return (rr.id_map.is_object() && rr.id_map.contains("$0"))
+                           ? rr.id_map["$0"].get<std::string>() : "";
+                };
+                skL0 = addLine(0,0,80,0,true,"");
+                skL1 = addLine(80,0,80,40,false,skL0);
+                skL2 = addLine(80,40,0,40,true,skL1);
+                skL3 = addLine(0,40,0,0,false,skL2);
+                applyOne({{"op","sketch_add_constraint"},{"sketch",skFid},
+                    {"constraint",{{"type","coincident"},{"refs",{skL3+".p2",skL0+".p1"}}}}});
+                applyOne({{"op","sketch_add_constraint"},{"sketch",skFid},
+                    {"constraint",{{"type","fix"},{"refs",{skL0+".p1"}}}}});
+                applyOne({{"op","sketch_add_constraint"},{"sketch",skFid},
+                    {"constraint",{{"type","distance"},{"refs",{skL0+".p1",skL0+".p2"}},
+                                   {"value",{{"value",80.0},{"expr",nullptr}}}}}});
+                applyOne({{"op","sketch_add_constraint"},{"sketch",skFid},
+                    {"constraint",{{"type","distance"},{"refs",{skL1+".p1",skL1+".p2"}},
+                                   {"value",{{"value",40.0},{"expr",nullptr}}}}}});
+                // find the width constraint id (the distance on skL0) by scanning the tree
+                skWidthCid.clear();
+                {
+                    const auto& tr = st.docMirror.tree();
+                    if (tr.contains("features"))
+                      for (auto& f : tr["features"])
+                        if (f.value("id",std::string())==skFid && f.contains("params"))
+                          for (auto& c : f["params"].value("constraints",nlohmann::json::array()))
+                            if (c.value("type",std::string())=="distance" && c.contains("refs") &&
+                                c["refs"].size()==2 && c["refs"][0].get<std::string>()==skL0+".p1")
+                              skWidthCid = c.value("id",std::string());
+                }
+                // sketch mode entry (host: SketchMode::enterForFeature -> sketch_enter RPC;
+                // the AI-CAD2 overlay renders from doc state via the sketch seam)
+                nlohmann::json eres;
+                st.worker.call("sketch_enter",
+                    {{"doc_id", st.docMirror.docId()}, {"sketch", skFid}}, eres, err);
                 st.inSketch = true;
-                auto r = st.engine.sketchRectExtrude("plane.top", 80, 40, 10, "Boss-Extrude1");
-                loadMesh(st, r.aicmPath);
-                sketchCapture = skSavePath + "/sketch_03_solid.png";
-                skSettle = kSettle;
+                std::printf("sketch: new sketch %s rect built (width_cid=%s) entered\n",
+                            skFid.c_str(), skWidthCid.c_str());
+                std::fflush(stdout);
+                sketchCapture = skSavePath + "/sketch_01_enter.png"; skSettle = kSettle;
+                break;
+            }
+            case 1: {  // drag a corner + commit, then set width 80 -> 100
+                nlohmann::json dres;
+                nlohmann::json dragP = {{"doc_id",st.docMirror.docId()},{"sketch",skFid},
+                    {"handle",skL1+".p2"},{"xy",nlohmann::json::array({85.0,45.0})}};
+                st.worker.call("sketch_drag", dragP, dres, err);
+                nlohmann::json cres;
+                nlohmann::json cP = {{"doc_id",st.docMirror.docId()},{"sketch",skFid}};
+                st.worker.call("sketch_drag_commit", cP, cres, err);
+                st.docMirror.resync(st.worker);
+                if (!skWidthCid.empty())
+                    st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                        {{"op","sketch_set_dim"},{"sketch",skFid},{"id",skWidthCid},{"value",100.0}}}));
+                nlohmann::json sres;
+                st.worker.call("sketch_solve",
+                    {{"doc_id",st.docMirror.docId()},{"sketch",skFid}}, sres, err);
+                nlohmann::json eres;  // host re-enters to refresh overlay entities/status
+                st.worker.call("sketch_enter",
+                    {{"doc_id", st.docMirror.docId()}, {"sketch", skFid}}, eres, err);
+                std::printf("sketch: drag+commit, width 80->100, re-solved; dof=%d\n",
+                            sres.value("dof",-1));
+                std::fflush(stdout);
+                sketchCapture = skSavePath + "/sketch_02_dim.png"; skSettle = kSettle;
+                break;
+            }
+            case 2: {  // exit + extrude region depth 10
+                nlohmann::json xres;
+                st.worker.call("sketch_exit",
+                    {{"doc_id", st.docMirror.docId()}, {"sketch", skFid}}, xres, err);
+                st.inSketch = false;
+                st.docMirror.resync(st.worker);
+                nlohmann::json region = {{"kind","region"},{"sketch",skFid},
+                    {"centroid",nlohmann::json::array({50.0,20.0})},{"hint_index",0}};
+                auto r = applyOne({{"op","add_feature"},{"feature",{
+                    {"type","extrude"},{"name","Boss-Extrude1"},
+                    {"params",{{"depth",{{"value",10.0},{"expr",nullptr}}},{"end","blind"},{"mode","boss"}}},
+                    {"refs",{{"profile",nlohmann::json::array({region})}}}}}});
+                loadMesh(st, r.aicm_path);
+                bool exok = false;
+                if (r.feature_status.is_array() && !r.feature_status.empty())
+                    exok = r.feature_status.back().value("ok",false);
+                std::printf("sketch: exit + extrude region depth 10 ok=%d\n", (int)exok);
+                std::fflush(stdout);
+                sketchCapture = skSavePath + "/sketch_03_solid.png"; skSettle = kSettle;
                 break;
             }
             default:
@@ -1084,7 +1189,7 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 std::printf("sketch: scenario complete\n");
                 break;
         }
-        if (skStep <= 0) ++skStep;
+        if (skStep <= 2) ++skStep;
     }
 
     // ---------- fea ----------

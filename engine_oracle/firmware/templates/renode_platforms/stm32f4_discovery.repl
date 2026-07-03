@@ -1,19 +1,26 @@
 // STM32F4 Discovery platform description for Renode (MIT)
 // Source: based on Renode's STM32F4 platform files (https://github.com/renode/renode-infrastructure)
 // License: MIT — see templates/renode_platforms/LICENSE
+//
+// T-C5 fix: the inline `PeripheralPort: sysbus new Bus.BusPointRegistration { ... }` + `init:
+// RegisterFPUInterruptNumber` block is not valid Renode .repl syntax for CPU.CortexM in this
+// Renode version — `machine LoadPlatformDescription` failed with a parser error right at `new`
+// ("expected attribute list end"), confirmed live. Never actually loaded in Renode before T-C5
+// (T-C3's tests mock the subprocess). Replaced with the real, working NVIC + cpu wiring from
+// Renode's own bundled platforms/cpus/stm32f4.repl (IRQ number 37 for USART1 matches the real
+// STM32F407 vector table, same as upstream).
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 72000000
+    IRQ -> cpu@0
 
 cpu: CPU.CortexM @ sysbus
     cpuType: "cortex-m4f"
-    nvicPrioBits: 4
-    PeripheralPort: sysbus new Bus.BusPointRegistration {
-        address: 0xE000E000;
-        cpu: cpu
-    }
-    init:
-        RegisterFPUInterruptNumber 81
+    nvic: nvic
 
-usart1: UART.STM32_UART @ sysbus <0x40011000, +0x400>
-    -> cpu@37
+usart1: UART.STM32_UART @ sysbus <0x40011000, +0x100>
+    -> nvic@37
 
 flash: Memory.MappedMemory @ sysbus 0x08000000
     size: 0x100000

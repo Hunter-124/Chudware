@@ -1,10 +1,21 @@
 // Generic Cortex-M platform description for Renode (MIT)
-// Minimal: flash + SRAM + CPU only; no peripheral mapping.
+// Minimal: flash + SRAM + CPU + NVIC only; no other peripheral mapping.
 // License: MIT — see templates/renode_platforms/LICENSE
+//
+// T-C5 fix: Renode's CPU.CortexM constructor requires an `nvic` (IRQControllers.NVIC) reference
+// — this file never declared one, so `machine LoadPlatformDescription` failed outright
+// ("Could not find suitable constructor... Could not find corresponding attribute for parameter
+// 'nvic'"), confirmed live. Never actually loaded in Renode before T-C5 (T-C3's tests mock the
+// subprocess). Syntax mirrors Renode's own bundled platforms/cpus/stm32f4.repl.
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 72000000
+    IRQ -> cpu@0
 
 cpu: CPU.CortexM @ sysbus
     cpuType: "cortex-m4"
-    nvicPrioBits: 4
+    nvic: nvic
 
 flash: Memory.MappedMemory @ sysbus 0x08000000
     size: 0x100000

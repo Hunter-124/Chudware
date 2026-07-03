@@ -1467,6 +1467,30 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     if (shot && shotMode && std::strcmp(shotMode, "pmform") == 0) {
         st.showRibbon = true;
         st.showFeatureTree = true;  // ensure the left pane (which hosts the PM tab) is visible
+        // T-G14 verification harness: optionally load a part into the viewport so the docked
+        // panels sample a LIVE (light) backdrop — that regime (adaptive DARK text over the
+        // light viewport) is where Erik's dark-mode black-on-black actually manifests; without
+        // a loaded doc the panes fall back to the theme palette (light text) and hide the bug.
+        // Gated on AI_CAD_PMBOX=1 so the default pmform shot is unchanged.
+        if (const char* box = std::getenv("AI_CAD_PMBOX"); box && *box && std::strcmp(box, "0") != 0) {
+            std::string aicm;
+            const char* candidates[] = {
+                "contracts/fixtures/box.aicm",
+                "../contracts/fixtures/box.aicm",
+                "../../contracts/fixtures/box.aicm",
+            };
+            for (const char* c : candidates) {
+                FILE* f = std::fopen(c, "rb");
+                if (f) { std::fclose(f); aicm = c; break; }
+            }
+            std::string lerr;
+            if (!aicm.empty() && st.loadDocMesh(aicm, lerr)) {
+                st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;  // iso so the box fills the viewport
+            } else {
+                std::fprintf(stderr, "pmform: AI_CAD_PMBOX load failed (%s): %s\n",
+                             aicm.empty() ? "not found" : aicm.c_str(), lerr.c_str());
+            }
+        }
         if (const char* cmd = std::getenv("AI_CAD_PMCMD"))
             if (*cmd && !st.propertyManager->openForCommand(st, cmd))
                 std::fprintf(stderr, "pmform: no form for command '%s'\n", cmd);

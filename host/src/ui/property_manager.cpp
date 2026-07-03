@@ -7,6 +7,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -2061,6 +2062,23 @@ static void pushTextColor(const float c[4]) {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], c[3]));
 }
 
+// T-G14: drawBody() pushes ImGuiCol_Text = surf.textPrimary (adaptive, DARK over the light
+// viewport) as the default so on-panel VALUE text tracks the frosted-glass tint. But a tooltip is
+// a SEPARATE popup window whose PopupBg is the THEME-toned glassBg (dark in the dark theme), so it
+// must use THEME-toned text (pal.text = light in the dark theme), not the adaptive backdrop tone —
+// otherwise the inherited surf.textPrimary paints dark text on the dark popup (black-on-black).
+// Mirror the open-combo pattern (which re-pushes pal.text). Use this for every tooltip inside the
+// drawBody/label call-graph.
+static void pmTooltip(const char* fmt, ...) {
+    const auto& t = ui::palette.text;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(t[0], t[1], t[2], t[3]));
+    va_list args;
+    va_start(args, fmt);
+    ImGui::SetTooltipV(fmt, args);
+    va_end(args);
+    ImGui::PopStyleColor();
+}
+
 // C37-F: descriptions for each form type shown under the title.
 static const char* formDescription(const char* type) {
     if (!type) return "";
@@ -2087,16 +2105,36 @@ static bool pmCompactLabel(const char* label, const char* suffix,
     // instead of theme-static pal.text/pal.textDim. Enabled -> primary, disabled -> dimmer secondary.
     const ui::AdaptiveSurface& surf = pmSurf();
     pushTextColorV(enabled ? surf.textPrimary : surf.textSecondary);
+    std::string full = std::string(label) + (suffix ? suffix : "");
     if (inlineRow) {
         ImGui::AlignTextToFramePadding();
-        ImGui::Text("%s%s", label, suffix ? suffix : "");
+        // T-G14: the field column starts at SameLine(labelW). If the label text is WIDER than the
+        // column (e.g. "Tangent propagation"), the next widget lands ON TOP of the tail of the text
+        // (Erik's PM-tool-menu overlap). Truncate the drawn label to the column budget with an
+        // ellipsis (full text stays in the hover tooltip, per this row's stated two-column intent)
+        // so the widget at labelW never overlaps.
+        const float gap    = ImGui::GetStyle().ItemInnerSpacing.x;
+        const float budget = labelW - gap;
+        std::string shown = full;
+        bool clipped = false;
+        if (ImGui::CalcTextSize(shown.c_str()).x > budget && budget > 0.0f) {
+            clipped = true;
+            const char* ell = "\xE2\x80\xA6";  // U+2026 ellipsis
+            const float ellW = ImGui::CalcTextSize(ell).x;
+            while (!shown.empty() &&
+                   ImGui::CalcTextSize(shown.c_str()).x + ellW > budget)
+                shown.pop_back();
+            shown += ell;
+        }
+        ImGui::TextUnformatted(shown.c_str());
         ImGui::PopStyleColor();
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s%s", label, suffix ? suffix : "");
+        (void)clipped;
+        if (ImGui::IsItemHovered()) pmTooltip("%s", full.c_str());
         ImGui::SameLine(labelW);
         return true;
     }
 
-    ImGui::Text("%s%s", label, suffix ? suffix : "");
+    ImGui::TextUnformatted(full.c_str());
     ImGui::PopStyleColor();
     return false;
 }
@@ -2156,10 +2194,18 @@ void PropertyManager::draw(AppState& st) {
         ImGui::SetNextWindowPos(ImVec2(80.0f * ui::uiScale, 80.0f * ui::uiScale),
                                 ImGuiCond_Appearing);
         // Frosted-glass fill so the floating PropertyManager fallback joins the app-wide glass
-        // family (the docked FeatureManager keeps its solid panel chrome).
+        // family (the docked FeatureManager keeps its solid panel chrome). T-G14: use the ADAPTIVE
+        // tint for the intended window rect (NOT the theme-static pal.glassBg, which is dark in the
+        // dark theme and gave black-on-black over the light viewport). drawBody's own pmSurf()
+        // samples the same backdrop for text, so fill + text stay contrasting. Same panelId as the
+        // docked column so both resolve to the same cached surface.
+        const float uS = ui::uiScale;
+        const ImRect floatRect(ImVec2(80.0f * uS, 80.0f * uS),
+                               ImVec2((80.0f + 260.0f) * uS, (80.0f + 400.0f) * uS));
+        const ui::AdaptiveSurface& fsurf =
+            ui::adaptivePanel(ui::panelId("host_left_glass"), floatRect, ui::GlassGroup::FeatureManager);
         ImGui::PushStyleColor(ImGuiCol_WindowBg,
-            ImVec4(ui::palette.glassBg[0], ui::palette.glassBg[1],
-                   ui::palette.glassBg[2], ui::palette.glassBg[3]));
+            ImVec4(fsurf.tint.x, fsurf.tint.y, fsurf.tint.z, 0.92f));
         const bool pmFloat = ImGui::Begin("##PMFloating", nullptr,
                           ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav);
         ImGui::PopStyleColor();
@@ -2231,6 +2277,15 @@ void PropertyManager::drawBody(AppState& st) {
         ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.26f));
     ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
         ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.30f));
+    // T-G14: value/default text must also track the live glass tint. Field VALUE widgets
+    // (SliderFloat/DragFloat/InputText "##dim", Int, Text) render with the DEFAULT ImGuiCol_Text,
+    // which is the theme-static pal.text (light in dark theme). Over the light viewport the group
+    // card + frame fills are the adaptive LIGHT tint, so theme-static light value text washed out
+    // (and dark-on-dark in the palette-fallback regime). Push surf.textPrimary as the default so
+    // values contrast the same surface the labels/fills use. In the palette-fallback regime
+    // surf.textPrimary == pal.text, so this is a strict no-op there and only corrects the
+    // live-backdrop regime. Popped on EVERY exit path (balanced with the 3 FrameBg colors below).
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
     // ---- C37-F: Keyboard policy -------------------------------------------
     // Gather focus/hover state for this PM window BEFORE processing buttons.
@@ -2339,7 +2394,7 @@ void PropertyManager::drawBody(AppState& st) {
             else
                 ok = ImGui::Button("OK##pm", ImVec2(btnW, btnW));
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("OK (Enter)");
+        if (ImGui::IsItemHovered()) pmTooltip("OK (Enter)");
         ImGui::PopStyleVar();
         ImGui::PopStyleColor(2);
 
@@ -2358,7 +2413,7 @@ void PropertyManager::drawBody(AppState& st) {
             else
                 cancel = cancel || ImGui::Button("X##pm", ImVec2(btnW, btnW));
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cancel (Esc)");
+        if (ImGui::IsItemHovered()) pmTooltip("Cancel (Esc)");
         ImGui::PopStyleVar();
         ImGui::PopStyleColor(2);
 
@@ -2391,7 +2446,7 @@ void PropertyManager::drawBody(AppState& st) {
         ImGui::PopStyleColor(4);
         if (aiBusy_) ImGui::EndDisabled();
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Ask AI to fill safe visible fields or activate the next reference well");
+            pmTooltip("Ask AI to fill safe visible fields or activate the next reference well");
         if (!aiMessage_.empty()) {
             pushTextColor(aiBusy_ ? pal.textDim : pal.accent);
             ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
@@ -2418,8 +2473,8 @@ void PropertyManager::drawBody(AppState& st) {
 
         // Wave 1D: drawBody() does NOT own the window — early-out is a plain return; the caller
         // (draw() or the LeftPane container) closes its own Begin/child.
-        if (ok)     { ImGui::PopStyleColor(3); commit(st);      return; }
-        if (cancel) { ImGui::PopStyleColor(3); cancelEdits(st); return; }
+        if (ok)     { ImGui::PopStyleColor(4); commit(st);      return; }
+        if (cancel) { ImGui::PopStyleColor(4); cancelEdits(st); return; }
     }
 
     // ---- field rows grouped by `group`, collapsible ------------------------
@@ -2455,10 +2510,14 @@ void PropertyManager::drawBody(AppState& st) {
                                     ImVec2(9.0f * ui::uiScale, 7.0f * ui::uiScale));
                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                                     ImVec2(7.0f * ui::uiScale, 5.0f * ui::uiScale));
-                // PM group cards adopt the frosted-glass roles so each form section reads as a
-                // floating glass card (translucent glassBg lets the panel bleed through subtly).
+                // PM group cards adopt the ADAPTIVE glass tint (surf.tint) — NOT the theme-static
+                // pal.glassBg — so the card fill tracks the SAME live-backdrop surface the labels
+                // and values read against (surf.textPrimary/textSecondary). T-G14: pal.glassBg is
+                // dark in the dark theme, which over the light viewport gave dark card + dark
+                // adaptive label text (black-on-black), and light-on-light when the tone flipped.
+                // surf.tint contrasts surf.text* by construction in both themes and both regimes.
                 ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                    ImVec4(pal.glassBg[0], pal.glassBg[1], pal.glassBg[2], pal.glassBg[3]));
+                    ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0.55f));
                 ImGui::PushStyleColor(ImGuiCol_Border,
                     ImVec4(pal.glassBorder[0], pal.glassBorder[1], pal.glassBorder[2],
                            pal.glassBorder[3]));
@@ -2490,7 +2549,7 @@ void PropertyManager::drawBody(AppState& st) {
                                                           : (useIps ? " [in]" : " [mm]");
                 pmCompactLabel(f.def->label, unitSuffix, pal, enabled);
                 if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("Not yet supported by engine");
+                    pmTooltip("Not yet supported by engine");
 
                 // Widgets audit: bounded dims (angles, draft, k-factor) are sliders; open-ended
                 // ones (depth, radii, spacing) are drags — both show the unit in the value text and
@@ -2628,7 +2687,7 @@ void PropertyManager::drawBody(AppState& st) {
                     }
                     ImGui::PopStyleColor(2);
                     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip(exprBound
+                        pmTooltip(exprBound
                             ? "Unbind the equation (keep the current value)"
                             : (textMode
                                 ? "Back to slider entry"
@@ -2641,7 +2700,7 @@ void PropertyManager::drawBody(AppState& st) {
                                 pmFieldValueText(f.def, f.dimValue, useIps).c_str());
                     ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Bound to equation '%s'", f.dimExpr.c_str());
+                        pmTooltip("Bound to equation '%s'", f.dimExpr.c_str());
                 }
                 // C37-F: inline red error — shown as a red hint line, not silently ignored.
                 if (enabled && !f.dimError.empty()) {
@@ -2719,11 +2778,11 @@ void PropertyManager::drawBody(AppState& st) {
                 // C37-F: tooltip on the well button.
                 if (wellHovered) {
                     if (f.wellActive)
-                        ImGui::SetTooltip("Active — pick faces/edges in the viewport");
+                        pmTooltip("Active — pick faces/edges in the viewport");
                     else if (!f.picks.empty())
-                        ImGui::SetTooltip("Click to re-activate; right-click to clear");
+                        pmTooltip("Click to re-activate; right-click to clear");
                     else
-                        ImGui::SetTooltip("Click to activate pick target");
+                        pmTooltip("Click to activate pick target");
                 }
 
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
@@ -2748,7 +2807,7 @@ void PropertyManager::drawBody(AppState& st) {
             case PMFieldKind::Combo: {
                 pmCompactLabel(f.def->label, "", pal, enabled);
                 if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("Not yet supported by engine");
+                    pmTooltip("Not yet supported by engine");
                 // Build display labels (comboLabels if provided, else fall back to comboOptions).
                 std::string lblSrc = f.def->comboLabels ? f.def->comboLabels
                                    : (f.def->comboOptions ? f.def->comboOptions : "");
@@ -2848,7 +2907,7 @@ void PropertyManager::drawBody(AppState& st) {
                     if (enabled) { f.checkValue = val; dirty_ = true; lastEditTime_ = ImGui::GetTime(); }
                 }
                 if (f.def->comingSoon && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("Not yet supported by engine");
+                    pmTooltip("Not yet supported by engine");
                 break;
             }
             case PMFieldKind::Int: {
@@ -3008,8 +3067,9 @@ void PropertyManager::drawBody(AppState& st) {
     pmWidgetActivePrevFrame_ = ImGui::IsAnyItemActive() &&
         ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
 
-    // Balanced pop for the 3 FrameBg colors pushed after surf was resolved (above).
-    ImGui::PopStyleColor(3);
+    // Balanced pop for the 3 FrameBg colors + 1 adaptive Text color pushed after surf was
+    // resolved (above).
+    ImGui::PopStyleColor(4);
 }
 
 }  // namespace ui

@@ -128,11 +128,11 @@ No test was weakened and no UI surface was removed (per the T-G12 kill-is-a-huma
 ## Follow-ups filed (deep work, not hand-waved)
 
 Filed as in-repo backlog tasks (GitHub-issue creation is blocked for this agent by policy):
-**`work/backlog/T-BL26.md`** (ruled/fill/boundary edge-well fix + stale cheatsheet) and
+**`work/backlog/T-BL28.md`** (ruled/fill/boundary edge-well fix + stale cheatsheet) and
 **`work/backlog/T-BL27.md`** (replace_face heal). The surf_revolve axis fix is captured as
 cheap-fix #1 above (one-line diff ready). Detail:
 
-1. **surf_ruled/fill/boundary edge-well ↔ sketch-wire mismatch** (T-BL26) — decide: teach the engine
+1. **surf_ruled/fill/boundary edge-well ↔ sketch-wire mismatch** (T-BL28) — decide: teach the engine
    to build wires from picked **body edges** (SolidWorks-like, bigger engine work) **or**
    re-target the forms to **sketch/region** pickers (matches today's engine, unusual UX).
 2. **surf_revolve axis well + readiness gate** — apply cheap fix #1 (`K_EDGE`→`K_EDGEAXIS`,

@@ -3,7 +3,7 @@ id: T-BL19
 title: Modeling-op combination battery - engine-level AI testing of feature tools and sequences
 workstream: backlog
 owner: opus-marrow
-status: review
+status: done
 branch: task/T-BL19-modeling-battery
 depends_on: []
 lane: modeling-core

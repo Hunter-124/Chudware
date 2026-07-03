@@ -1,4 +1,4 @@
-# AI-CAD
+# ShopCraft (formerly AI-CAD)
 
 A **SolidWorks-class parametric CAD application** — native C++ desktop app with a ribbon UI,
 FeatureManager tree, PropertyManager, and a constraint-solver sketcher — built on the
@@ -38,9 +38,20 @@ agent (the built-in chat, or any external agent such as Claude Code).
 > ported wave-by-wave into the modular `ui/imgui` + `ui/viewport` + `platform/` +
 > `services/worker` split — node-level plan in
 > [docs/GUI_MIGRATION_DAG.md](docs/GUI_MIGRATION_DAG.md) — after which `host/` is deleted
-> (criteria in [host/DEPRECATED.md](host/DEPRECATED.md)). A tiered rename **AI-CAD →
-> ShopCraft** is queued alongside (branding first; build targets/env vars/MCP id/appdata
-> after the cutover, so tooling breaks once, not thrice).
+> (criteria in [host/DEPRECATED.md](host/DEPRECATED.md)). The tiered rename **AI-CAD →
+> ShopCraft** landed with T-G3 (branding) and T-G10 (infrastructure). Compatibility rules
+> (T-G10, all additive — nothing breaks):
+> - **Env vars:** `SHOPCRAFT_*` are the canonical names (`SHOPCRAFT_SHOT`,
+>   `SHOPCRAFT_LIBAICAD`, `SHOPCRAFT_DIST`, ...); the legacy `AI_CAD_*` names keep
+>   working everywhere (deprecation warning where practical).
+> - **Binary:** the `ui/imgui` build produces `AI-CAD2` plus a `ShopCraft`
+>   symlink/copy in the same bin dir — either name launches.
+> - **MCP server id:** new registrations use `shopcraft`; existing `ai-cad` entries are
+>   preserved until an explicit `--unregister`.
+> - **App data dir:** machines with an existing `AI-CAD` data dir keep using it wholesale
+>   (it holds the live venv/config); fresh installs get `ShopCraft`
+>   (`engine/paths.py active_root()` — mirrored in `platform/paths_*.cpp`,
+>   `core/agent/paths.cpp`, `services/worker/bootstrap.cpp`). No automatic moves.
 
 ## How it works
 
@@ -290,10 +301,16 @@ $env:ANTHROPIC_API_KEY = "sk-ant-..."   # or copy config.example.json to %APPDAT
 ```
 
 ## Wire the MCP server into external agents
-Register the AI-CAD MCP server with every supported client (Claude Code, Cursor, VS Code,
-opencode, Antigravity) in one shot:
+Register the ShopCraft MCP server (id `shopcraft`; pre-existing `ai-cad` entries are
+preserved) with every supported client (Claude Code, Cursor, VS Code, opencode,
+Antigravity) in one shot:
 ```powershell
 mcp_setup.bat            # portable wrapper around installer/setup_mcp_clients.py
+```
+On Linux/macOS run the underlying script directly:
+```bash
+python3 services/installer/setup_mcp_clients.py          # register (idempotent)
+python3 services/installer/setup_mcp_clients.py --detect # what's wired where
 ```
 
 ## Contributing & task tracking

@@ -1,6 +1,6 @@
 # Foreman hot state (overwrite each wake — cheap re-orientation after compaction)
 
-Updated: 2026-07-03T08:45Z by Fable foreman (overnight autonomous mode, Erik asleep ~10h).
+Updated: 2026-07-04T02:00Z by Fable foreman (overnight, ~5h in).
 
 ## Standing orders (Erik)
 - Work until usage runs out; conserve Fable (44% left) — delegate to Sonnet agents, terse wakes.
@@ -15,10 +15,10 @@ Updated: 2026-07-03T08:45Z by Fable foreman (overnight autonomous mode, Erik asl
 4. Overwrite this file. Keep responses short.
 
 ## In flight (as of update time)
-- opus-sky → T-G13 (issue #7 deadlock) | sonnet-reed → T-U1 (style kit) | sonnet-vega → T-V2 (MCP runtime audit) | sonnet-orin → T-INF1 (gate stage fix)
-- opus-iron free (M1+M6 merged) — will auto-claim (next P2: T-Q1, then P3s)
-- Merged tonight: M1, M6, V1(+same-night provisioning: fluids/build123d/ngspice; piping_internal_volume @mcp.tool() bug fixed), H10-residual (NO-GO zero-shot F1 0.034), G6, G7, M2, M4, M5, H9, H11, F11, B5, Q4, A3, D4.
-- Ready queue next: Q1(P2), Q2, A4, C5, D5, F4 (P3), then P4s. U2-U8 unlock on U1; G8 on G13.
+- opus-sky → T-G8 ONLY remaining task (hard-subsystem ports; checkpoint pushed, CAM/ECAD content-swap restructure in progress; branch cold 4h, session shows live CPU — nudge posted, finisher NOT yet dispatched)
+- Blocked behind G8: T-G9 → T-G10 → T-G11 (the last chain)
+- COMPLETE workstreams tonight: A, B, C, D, E, F, H, M, P, Q, U, V. ~55+ tasks merged this session.
+- Erik human items: G12 round-1 walkthrough, vendor keys (T-S1), H-lane runbook halves, live-backend capstone round 2 (great first demo)
 
 ## Verification recipes
 - pytest: `AI_CAD_LIBAICAD=$PWD/core/build-linux/bin/libaicad.so ~/.local/share/AI-CAD/mcp-venv/bin/python -m pytest <dirs> -q`

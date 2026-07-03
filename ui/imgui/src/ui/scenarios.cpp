@@ -14,6 +14,7 @@
 #include "ui/drawing_panel.h"        // drawingActiveDocId/Doc + refresh (AI_CAD_SHOT=drawing detailing)
 #include "ui/ecad/ecad_panel.h"      // ecadEditorMirror (AI_CAD_SHOT=ecad ai-design adoption)
 #include "ui/ecad/ecad_mirror.h"     // EcadMirror::loadFromTree (complete type for the call above)
+#include "ui/sim_manager.h"          // simManager() study flow (AI_CAD_SHOT=fea host parity)
 #include "ui/bom_panel.h"
 #include "ui/requirements_panel.h"   // T-U5
 #include "ui/transparency_panel.h"
@@ -1213,60 +1214,81 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
         if (skStep <= 2) ++skStep;
     }
 
-    // ---------- fea ----------
+    // ---------- fea (host-parity SimManager study flow) ----------
+    // T-G9 harness finding: the old flow here bypassed the SimManager entirely (raw
+    // sim_run_static with empty fixtures/loads and a worktree-relative STEP netgen could
+    // not read), while host drives the panel: sim_new_static + configureActive +
+    // pick-resolved fixture/load faces + sim_run. Faithful port of host's scenario.
     if (cfg.wantFea && st.workerStarted && !cfg.feaShotDone) {
+        ui::simManager().tick(st);  // pump so completion lands while we wait
         if (feaSettle > 0) { --feaSettle; return; }
         switch (feaStep) {
-            case 0: {
+            case 0: {  // New part + box
                 std::string err;
                 st.docMirror.newPart(st.worker, err);
                 st.addDocTab(false);
-                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
-                    {{"op","add_feature"},{"feature",{
-                        {"type","box"},{"name","Box1"},
-                        {"params",{{"length",dim(60)},{"width",dim(40)},{"height",dim(10)}},
-                                   {"centered",true}}}}}}));
+                nlohmann::json ops = nlohmann::json::array();
+                ops.push_back({{"op","add_feature"},{"feature",{
+                    {"type","box"},{"name","Box1"},{"params",{
+                        {"length",dim(60)},{"width",dim(40)},{"height",dim(10)}}},
+                    {"centered",true}}}});
+                auto r = st.docMirror.applyOps(st.worker, ops);
                 loadMesh(st, r.aicm_path);
+                std::printf("fea: box ok=%d rev=%d\n", (int)r.ok, r.revision);
+                std::fflush(stdout);
                 st.workspace = cmd::Workspace::Simulate;
                 feaSettle = 3; ++feaStep; break;
             }
-            case 1: {
-                std::string stepPath = repoBase() + "/scratch/fea_part.step";
-                nlohmann::json ex, er; std::string e;
-                st.worker.call("doc_export_step",
-                    {{"doc_id", st.docMirror.docId()}, {"path", stepPath}}, ex, e, 60000);
-                nlohmann::json fixFace, loadFace;
-                double bestMin = 1e30, bestMax = -1e30;
-                for (int tid = 1; tid <= 12; ++tid) {
-                    std::string se;
-                    std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, se);
-                    if (s.empty()) continue;
-                    try {
-                        auto o = nlohmann::json::parse(s);
-                        if (!o.contains("centroid")) continue;
-                        double cx = o["centroid"][0].get<double>();
-                        if (cx < bestMin) { bestMin = cx; fixFace = o; }
-                        if (cx > bestMax) { bestMax = cx; loadFace = o; }
-                    } catch (...) {}
-                }
-                nlohmann::json study = {
-                    {"step_path", stepPath},
-                    {"material", {{"E_mpa", 210000}, {"nu", 0.3}, {"density_g_cm3", 7.85}}},
-                    {"mesh", {{"fineness", 0.2}, {"order", 2}}},
-                    {"fixtures", nlohmann::json::array()},
-                    {"loads", nlohmann::json::array()}};
-                std::string note;
-                st.simClient.ensureStarted(note);
-                st.simClient.launch("sim_run_static", {{"study", study}}, note, st.docMirror.docId());
+            case 1: {  // Static study + resolved fixture/load faces (-X end / +X end)
+                ui::simManager().handleCommand(st, "sim_new_static");
+                ui::simManager().configureActive(st, 0.2f, "steel_1018");
+                auto faceAtExtremeX = [&](bool wantMax) -> nlohmann::json {
+                    nlohmann::json best; double bestC = wantMax ? -1e30 : 1e30;
+                    for (int tid = 1; tid <= 12; ++tid) {
+                        std::string se;
+                        std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, se);
+                        if (s.empty()) continue;
+                        try {
+                            auto o = nlohmann::json::parse(s);
+                            if (!o.contains("centroid")) continue;
+                            double cx = o["centroid"][0].get<double>();
+                            if ((wantMax && cx > bestC) || (!wantMax && cx < bestC)) { bestC = cx; best = o; }
+                        } catch (...) {}
+                    }
+                    return best;
+                };
+                nlohmann::json fixFace = faceAtExtremeX(false);
+                nlohmann::json loadFace = faceAtExtremeX(true);
+                // Inject the resolved selectors via the selection -> well capture path.
+                st.selection.clear();
+                { core::SelItem it; it.selector = fixFace.dump(); it.pending_resolve = false;
+                  st.selection.mutableItems().push_back(it); }
+                ui::simManager().handleCommand(st, "sim_fixture");
+                st.selection.clear();
+                { core::SelItem it; it.selector = loadFace.dump(); it.pending_resolve = false;
+                  st.selection.mutableItems().push_back(it); }
+                ui::simManager().handleCommand(st, "sim_load_force");
+                st.selection.clear();
+                std::printf("fea: faces fixCx=%.1f loadCx=%.1f\n",
+                            fixFace.contains("centroid") ? fixFace["centroid"][0].get<double>() : 0.0,
+                            loadFace.contains("centroid") ? loadFace["centroid"][0].get<double>() : 0.0);
+                std::fflush(stdout);
                 feaSettle = 2; ++feaStep; break;
             }
-            case 2: {
+            case 2: {  // Run
+                ui::simManager().handleCommand(st, "sim_run");
+                std::printf("fea: study launched (density 0.4, steel, 100 N)\n");
+                std::fflush(stdout);
+                feaWaitFrames = 0; ++feaStep; break;
+            }
+            case 3: {  // Wait for completion (cap ~90 s)
                 ++feaWaitFrames;
                 if (st.simClient.job().ready.load() || feaWaitFrames > 5400) {
                     cfg.colormapOn = st.simClient.job().ok;
                     cfg.feaShotDone = true;
                     std::printf("fea: done ok=%d frames=%d\n",
                                 (int)st.simClient.job().ok, feaWaitFrames);
+                    std::fflush(stdout);
                 }
                 break;
             }

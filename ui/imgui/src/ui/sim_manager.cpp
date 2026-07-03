@@ -583,10 +583,19 @@ bool SimManager::handleCommand(app::AppState& st, const std::string& cmdId) {
     }
     if (!haveStudy) return true;
     Study& s = studies_[sel_];
-    if (cmdId == "sim_fixture")      { node_ = SimNode::Fixtures; return true; }
-    if (cmdId == "sim_load_force")   { s.loads.push_back(SimLoad{}); persist(st, s);
+    // T-G9 parity fix: the H4 port dropped host's captureSelectionInto() in these three
+    // branches, so a viewport pre-selection was silently ignored when adding a fixture/
+    // load via ribbon command (host adopts it into the well; see host sim_manager.cpp).
+    if (cmdId == "sim_fixture")      { captureSelectionInto(st, s.fixtures); persist(st, s);
+                                       st.selection.clear();
+                                       node_ = SimNode::Fixtures; return true; }
+    if (cmdId == "sim_load_force")   { s.loads.push_back(SimLoad{});
+                                       captureSelectionInto(st, s.loads.back().faces); persist(st, s);
+                                       st.selection.clear();
                                        node_ = SimNode::Load; loadIdx_ = (int)s.loads.size() - 1; return true; }
-    if (cmdId == "sim_load_pressure"){ SimLoad l; l.pressure = true; s.loads.push_back(l); persist(st, s);
+    if (cmdId == "sim_load_pressure"){ SimLoad l; l.pressure = true; s.loads.push_back(l);
+                                       captureSelectionInto(st, s.loads.back().faces); persist(st, s);
+                                       st.selection.clear();
                                        node_ = SimNode::Load; loadIdx_ = (int)s.loads.size() - 1; return true; }
     if (cmdId == "sim_run") { run(st, s); return true; }
     return false;

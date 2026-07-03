@@ -3,6 +3,8 @@ id: T-M3
 title: CAM overhaul: holder/shank collision simulation
 workstream: M
 owner: opus-iron
+status: done
+
 status: doing
 branch: task/T-M3-cam-overhaul
 day: 3
@@ -23,12 +25,41 @@ while the holder would crash. Audit: work/audits/CAM_AUDIT.md §3.2, §T-M3.
 
 ## Definition of done
 
-- [ ] Shank/holder swept-cylinder check against remaining stock dexels (reuse the tip's
+- [x] Shank/holder swept-cylinder check against remaining stock dexels (reuse the tip's
       segment-sweep, Z-extent flute_length..overall_length)
-- [ ] holder_collisions accumulated in SimResult + warning emitted
-- [ ] check_holder exposed through cam_simulate MCP tool
-- [ ] Deep-pocket test where the shank obviously hits the walls (asserts collisions > 0)
-- [ ] core build + ctest green; mcp-venv cam tool tests green; `graphify update .`
+- [x] holder_collisions accumulated in SimResult + warning emitted
+- [x] check_holder exposed through cam_simulate MCP tool
+- [x] Deep-pocket test where the shank obviously hits the walls (asserts collisions > 0)
+- [x] core build + ctest green; mcp-venv cam tool tests green; `graphify update .`
+
+## DONE (opus-iron, 2026-07-02)
+
+Commits `09d8614` (C++ core) + `1f08b94` (MCP surface) on `task/T-M3-cam-overhaul`, stacked
+on T-M6 (merge order **M6 → M3** — this branch contains T-M6's commits; merge T-M6 first).
+
+**Collision model (reuses the tip's `dist_point_seg` sweep — audit §T-M3).** `holder_hit_seg`
+sweeps the non-cutting body per cutting (sub-)segment: within the shank radius, remaining
+stock above `tip_z + flute_length` hits the shank; in the annulus out to the holder radius,
+stock above `tip_z + shoulder_length` hits the holder. `tip_z` tracks the tip along the
+segment so a plunge raises the whole envelope with it. Gated on `opt.check_holder`, so the
+default sim path is byte-unchanged. `SimResult.holder_collisions` (per-move count) + a warning
++ `to_json` field. `session.cpp cam_simulate` forwards `check_holder` into `SimOptions`.
+
+**MCP (subagent, sonnet).** `cam_simulate` MCP tool gains `check_holder: bool=False`, threaded
+into the RPC `options` exactly like `check_rapid`; `holder_collisions` flows through the raw
+passthrough result. Test added in `test_cam_tools.py`.
+
+**Tests.** C++ (append-only): a 30 mm-deep 16×16 pocket (deeper than the 25 mm shoulder) →
+`holder_collisions>0` + warning with the flag on, `0` with it off; a 4 mm shallow pocket stays
+clear (no false positive). MCP: `check_holder=True accepted; holder_collisions surfaced as int`.
+
+**Verified (real, not skipped).** `test_cam` 56/56 (3505 asserts); full core ctest 18/18 green;
+built `libaicad.so` (OCCT) from this branch and ran the mcp-venv cam-tool test against it →
+`ALL CAM SMOKE CHECKS PASSED` (the check_holder assertion executed live, not SKIP).
+`graphify update .` run.
+
+**Handoff:** the `sweep_seg`/`holder_hit_seg` split lives in `simulate_setup`; turning still
+early-returns before it. `cam_tools.py` is also touched by T-M4/M5 — my addition is append-only.
 
 ## Driver notes (Fable)
 

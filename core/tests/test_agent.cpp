@@ -304,3 +304,97 @@ TEST_CASE("role sniffing") {
     CHECK(RoleScriptedProvider::role_of("...planning a CAD build...") == "planner");
     CHECK(RoleScriptedProvider::role_of("nope") == "?");
 }
+
+// T-F4: clarify() interaction/1 shape-mirror tests.
+// The existing {ready, questions, assumptions} output must be preserved (additive only).
+// The new "interaction" field must conform to aicad.interaction/1 (contracts/interaction.md).
+#include "agent/clarify.h"
+
+TEST_CASE("clarify: interaction field present and schema correct") {
+    // clarify with a question-producing reply
+    auto complete = [](const std::string&, const std::string&) -> std::string {
+        return R"(```json
+{"ready": false, "questions": [
+  {"key": "shaft_dia", "ask": "Shaft diameter?", "unit": "mm", "suggested": "8"}
+], "assumptions": []}
+```)";
+    };
+    ojson result = clarify("make a shaft", ojson(nullptr), "doc1", 1, ojson::array(), complete);
+
+    // Legacy fields must be preserved (additive contract).
+    CHECK(result.contains("ready"));
+    CHECK(result.contains("questions"));
+    CHECK(result.contains("assumptions"));
+    CHECK(result["ready"] == false);
+    CHECK(result["questions"].size() == 1);
+    // Legacy: ask field holds the question text; key is the short id.
+    CHECK(result["questions"][0]["ask"] == "Shaft diameter?");
+    CHECK(result["questions"][0]["key"] == "shaft_dia");
+
+    // New T-F4 interaction field.
+    CHECK(result.contains("interaction"));
+    const auto& ia = result["interaction"];
+    CHECK(ia["schema"] == "aicad.interaction/1");
+    CHECK(ia["blocking"] == false);
+    CHECK(ia["scope"] == "run");
+    CHECK(ia.contains("questions"));
+    CHECK(ia["questions"].size() == 1);
+    const auto& iq = ia["questions"][0];
+    CHECK(iq["id"] == "shaft_dia");     // stable ledger key = the `key` field
+    CHECK(iq["kind"] == "dimension");   // non-empty unit → dimension
+    CHECK(iq["prompt"] == "Shaft diameter?");
+    CHECK(iq["required"] == false);
+    CHECK(iq["family"] == "length");
+    CHECK(iq["suggested"]["unit"] == "mm");
+    CHECK(iq["suggested"]["value"] == doctest::Approx(8.0));
+}
+
+TEST_CASE("clarify: interaction field on ready=true (no questions)") {
+    auto complete = [](const std::string&, const std::string&) -> std::string {
+        return R"({"ready": true, "questions": [], "assumptions": ["assume M3"]})";
+    };
+    ojson result = clarify("make M3 standoff", ojson(nullptr), "d", 1, ojson::array(), complete);
+    CHECK(result["ready"] == true);
+    CHECK(result["questions"].size() == 0);
+    // interaction still present, but with empty questions array.
+    CHECK(result.contains("interaction"));
+    CHECK(result["interaction"]["questions"].size() == 0);
+}
+
+TEST_CASE("clarify: text-kind question when unit is empty") {
+    auto complete = [](const std::string&, const std::string&) -> std::string {
+        return R"({"ready": false, "questions": [
+          {"key": "finish", "ask": "Surface finish?", "unit": "", "suggested": "as_machined"}
+        ], "assumptions": []})";
+    };
+    ojson result = clarify("make part", ojson(nullptr), "d", 1, ojson::array(), complete);
+    const auto& iq = result["interaction"]["questions"][0];
+    CHECK(iq["kind"] == "text");
+    CHECK(iq["suggested"] == "as_machined");
+}
+
+TEST_CASE("clarify: interaction fields additive — existing callers unaffected") {
+    // Verifies that adding 'interaction' to the output does not remove or rename
+    // any existing field (safe for drawClarifyCard / ClarifyState consumers).
+    auto complete = [](const std::string&, const std::string&) -> std::string {
+        return R"({"ready": false, "questions": [
+          {"key": "bore", "ask": "Bore diameter?", "unit": "mm", "suggested": "10"},
+          {"key": "finish", "ask": "Surface finish?", "unit": "", "suggested": "anodized"}
+        ], "assumptions": ["standard tolerance"]})";
+    };
+    ojson result = clarify("make housing", ojson(nullptr), "d", 1, ojson::array(), complete);
+
+    // Legacy shape (unchanged).
+    CHECK(result["ready"] == false);
+    CHECK(result["questions"].size() == 2);
+    CHECK(result["questions"][0]["key"] == "bore");
+    CHECK(result["questions"][0]["ask"] == "Bore diameter?");
+    CHECK(result["questions"][0]["unit"] == "mm");
+    CHECK(result["questions"][0]["suggested"] == "10");
+    CHECK(result["assumptions"].size() == 1);
+    CHECK(result["assumptions"][0] == "standard tolerance");
+
+    // Additive: interaction present alongside legacy.
+    CHECK(result.contains("interaction"));
+    CHECK(result["interaction"]["questions"].size() == 2);
+}

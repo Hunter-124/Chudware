@@ -168,6 +168,21 @@ register_regen_tools(mcp)
 # Code compliance (T-D4): deterministic rule engine + agentic RAG for building-code checks.
 from mcp_server.code_compliance_tools import register_code_compliance_tools
 register_code_compliance_tools(mcp)
+# DAG orchestrator MCP tools (T-A4): dag_plan / dag_run / dag_status / dag_approve / dag_abort.
+# These five tools expose the services/dag executor to MCP clients so a model or UI can
+# start/resume/inspect/gate DAG missions without a bespoke integration layer.
+from services.dag.mcp_tools import register_dag_tools
+register_dag_tools(mcp)
+# DAG replan (T-F12): dag_replan splices new nodes into a running checkpointed DAG run.
+# Validates end_condition + retry_budget on every spliced node (DoD enforcement), merges
+# into the persisted graph sidecar, and resumes via executor.resume().
+from services.dag.mcp_tools import register_dag_replan_tools
+register_dag_replan_tools(mcp)
+# Design review battery (T-F12): one-call battery dispatching through DISPATCH_TABLE
+# (verify.py) + battery._get_fn for feature_overlap/dfm.  Returns a narrated verdict
+# card per contracts/narration.md — never a raw JSON dump.
+from services.mcp.design_review_tools import register_design_review_tools
+register_design_review_tools(mcp)
 
 
 def _install_clean_stdout():
@@ -232,10 +247,19 @@ def _warm_core() -> None:
         # Recover any docs auto-saved before a previous restart so a client-timeout kill doesn't
         # permanently drop the user's open parts (they reload with fresh ids; list_parts shows them).
         try:
-            from mcp_server.cad_tools import recover_autosaved
+            from mcp_server.cad_tools import recover_autosaved, start_periodic_autosave
             recover_autosaved()
+            # Arm the periodic autosave timer AFTER recovery (so we don't re-save stale files).
+            start_periodic_autosave()
         except Exception:
             pass
+    except Exception:
+        pass
+    # Install crash-bundle handler AFTER recovery so a crash on first load still
+    # writes a useful bundle with the autosave references from this session.
+    try:
+        from mcp_server import crash_bundle
+        crash_bundle.install()
     except Exception:
         pass
 

@@ -1,0 +1,100 @@
+{
+  "schema": "aicad.dag/1",
+  "id": "tmpl-ecad-firmware-emulate",
+  "name": "ECAD → Firmware → Emulate",
+  "nodes": [
+    {
+      "id": "n_ecad",
+      "type": "ecad",
+      "name": "Design schematic and PCB",
+      "inputs": {
+        "request": "Design the schematic and route the PCB. Run ERC and DRC to a clean board.",
+        "tools": ["ecad_new_schematic", "ecad_new_pcb", "ecad_place_symbol", "ecad_wire",
+                  "ecad_run_erc", "ecad_run_drc", "ecad_autoroute", "ecad_fill_zones"]
+      },
+      "tools": ["ecad_new_schematic", "ecad_new_pcb", "ecad_place_symbol", "ecad_wire",
+                "ecad_run_erc", "ecad_run_drc", "ecad_autoroute", "ecad_fill_zones"],
+      "end_condition": "PCB routed with zero ERC errors and zero DRC errors.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_verify_erc",
+      "type": "verify",
+      "name": "ERC gate",
+      "inputs": {
+        "check_type": "erc"
+      },
+      "tools": null,
+      "end_condition": "ERC passes with zero errors.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_verify_drc",
+      "type": "verify",
+      "name": "DRC gate",
+      "inputs": {
+        "check_type": "drc"
+      },
+      "tools": null,
+      "end_condition": "DRC passes with zero errors.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_firmware",
+      "type": "firmware",
+      "name": "Build firmware",
+      "inputs": {
+        "request": "Generate firmware for the board. Build and flash.",
+        "tools": ["fw_new_project", "fw_build", "fw_sources", "fw_flash"]
+      },
+      "tools": ["fw_new_project", "fw_build", "fw_sources", "fw_flash"],
+      "end_condition": "Firmware compiles without errors and flashes successfully.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    },
+    {
+      "id": "n_verify_fw",
+      "type": "verify",
+      "name": "Firmware simulation gate",
+      "inputs": {
+        "check_type": "firmware"
+      },
+      "tools": null,
+      "end_condition": "All firmware assertions pass in simulation.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_fw_fix",
+      "type": "firmware",
+      "name": "Fix firmware on assertion failures",
+      "inputs": {
+        "request": "Fix firmware based on assertion failure report from simulation.",
+        "tools": ["fw_sources", "fw_build", "fw_sim_run"]
+      },
+      "tools": ["fw_sources", "fw_build", "fw_sim_run"],
+      "end_condition": "Firmware fixed and rebuilt without compile errors.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    }
+  ],
+  "edges": [
+    {"from": "n_ecad",       "to": "n_verify_erc"},
+    {"from": "n_verify_erc", "to": "n_verify_drc"},
+    {"from": "n_verify_drc", "to": "n_firmware"},
+    {"from": "n_firmware",   "to": "n_verify_fw"},
+    {"from": "n_verify_fw",  "to": "n_fw_fix"},
+    {"from": "n_fw_fix",     "to": "n_verify_fw",  "retry_budget": 3},
+    {"from": "n_verify_erc", "to": "n_ecad",        "retry_budget": 2},
+    {"from": "n_verify_drc", "to": "n_ecad",        "retry_budget": 2}
+  ]
+}

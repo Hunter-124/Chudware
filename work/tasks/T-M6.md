@@ -3,6 +3,8 @@ id: T-M6
 title: CAM overhaul: pocket entry fix + arc-true stock simulation
 workstream: M
 owner: opus-iron
+status: review
+
 status: done
 branch: task/T-M6-cam-overhaul
 day: 1

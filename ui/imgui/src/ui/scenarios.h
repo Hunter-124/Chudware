@@ -28,6 +28,10 @@ struct ShotConfig {
     bool wantExplorer = false;
     bool wantPmform = false;
     bool wantPreview = false;
+    bool wantScaffoldDemo = false;
+    bool wantCamWorkspace = false;            // T-U3: populate + screenshot the CAM workspace panel
+    bool camWorkspaceShotDone = false;
+    bool wantGallery = false;                 // T-U9: sample gallery (loads from disk, no RPC wait)
 
     // Worker one-shot shots (fire once when workerStarted)
     bool wantTree = false;
@@ -36,6 +40,26 @@ struct ShotConfig {
     bool equationsShotDone = false;
     bool wantEcad = false;
     bool ecadShotDone = false;
+    bool wantPartsBrowser = false;
+    bool partsBrowserShotDone = false;
+    bool wantBom = false;
+    bool bomShotDone = false;
+    bool wantRequirements = false;          // T-U5: requirements & verification panel
+    bool requirementsShotDone = false;
+    bool wantTransparency = false;          // T-U8: model & telemetry transparency panel
+    bool transparencyShotDone = false;
+    bool wantSimStudies = false;                 // T-U6: sim studies panel (AI_CAD_SHOT=sim_studies)
+    bool simStudiesShotDone = false;
+
+    // T-U7: new-doc-kind viewers (piping, hydraulic, structural)
+    bool wantPiping = false;
+    bool pipingShotDone = false;
+    bool wantHydraulic = false;
+    bool hydraulicShotDone = false;
+    bool wantStructural = false;
+    bool structuralShotDone = false;
+    bool wantMissionControl = false;        // T-F17: mission-control (DAG steering) panel
+    bool missionControlShotDone = false;
 
     // Long-running scenario modes (ScenarioRunner step machines)
     bool wantM1 = false;

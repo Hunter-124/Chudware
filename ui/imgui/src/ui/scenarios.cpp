@@ -7,6 +7,18 @@
 #include "ui/settings_modal.h"
 #include "ui/file_explorer.h"
 #include "ui/preview_pane.h"
+#include "ui/scaffold_demo_panel.h"
+#include "ui/parts_panel.h"
+#include "ui/cam_panel.h"            // T-U3 CAM workspace (AI_CAD_SHOT=cam_workspace)
+#include "ui/bom_panel.h"
+#include "ui/requirements_panel.h"   // T-U5
+#include "ui/transparency_panel.h"
+#include "ui/piping_panel.h"       // T-U7 piping viewer
+#include "ui/hydraulic_panel.h"    // T-U7 hydraulic viewer
+#include "ui/structural_panel.h"   // T-U7 structural viewer   // T-U8
+#include "ui/gallery_panel.h"        // T-U9
+#include "ui/mission_control_panel.h"  // T-F17
+#include "ui/sim_panel.h"                       // T-U6: sim studies (AI_CAD_SHOT=sim_studies)
 #include "artifact_view.h"
 #include "app/app_state.h"
 #include "viewport/scene.h"
@@ -220,8 +232,13 @@ int ShotConfig::captureFrameBudget() const {
     if (wantFea && !feaShotDone) return 999999;
     if (wantCam && !camShotDone) return 999999;
     if (wantEcad && !ecadShotDone) return 150;
+    if (wantBom && !bomShotDone) return 150;
+    if (wantRequirements && !requirementsShotDone) return 150;  // T-U5
+    if (wantTransparency && !transparencyShotDone) return 150;  // T-U8
+    if (wantSimStudies && !simStudiesShotDone) return 150;
     if (wantTree) return treeShotDone ? 10 : 30;
     if (wantEquations) return equationsShotDone ? 10 : 30;
+    if (wantPartsBrowser) return partsBrowserShotDone ? 10 : 30;
     if (isScenarioMode()) return 999999;
     if (wantGlassperf) return glassperfShotDone ? 10 : 400;
     return 6;
@@ -263,6 +280,17 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantAsm = eq("asm");
     cfg.wantPmform = eq("pmform");
     cfg.wantPreview = eq("preview");
+    cfg.wantScaffoldDemo  = eq("scaffold_demo");
+    cfg.wantPartsBrowser  = eq("parts_browser");
+    cfg.wantBom          = eq("bom");
+    cfg.wantRequirements = eq("requirements");   // T-U5
+    cfg.wantTransparency = eq("transparency");   // T-U8
+    cfg.wantPiping       = eq("piping_view");       // T-U7
+    cfg.wantHydraulic    = eq("hydraulic_view");    // T-U7
+    cfg.wantStructural   = eq("structural_view");   // T-U7
+    cfg.wantGallery       = eq("gallery");
+    cfg.wantMissionControl = eq("mission_control");  // T-F17
+    cfg.wantSimStudies   = eq("sim_studies");   // T-U6
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
@@ -305,6 +333,40 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantPlan) seedPlanShot(st);
     if (cfg.wantAssembly) seedAssemblyShot(st);
     if (cfg.wantPreview) seedPreviewShot(st);
+    if (cfg.wantScaffoldDemo)  ui::openScaffoldDemoPanel();
+    if (cfg.wantPartsBrowser)  ui::openPartsPanel();
+    cfg.wantCamWorkspace = eq("cam_workspace");
+    if (cfg.wantCamWorkspace) ui::openCamWorkspacePanel();
+    if (cfg.wantBom)          ui::openBomPanel();
+    if (cfg.wantRequirements) ui::openRequirementsPanel();  // T-U5
+    if (cfg.wantTransparency) ui::openTransparencyPanel();  // T-U8
+    if (cfg.wantPiping) {       // T-U7 — seed fixture immediately (no worker needed)
+        ui::openPipingPanel();
+        const std::string pipDoc = R"({"schema":"aicad.piping/1","id":"fix-p","name":"Demo Piping","units":{"system":"MMGS"},"material":"A106-B","runs":[{"id":"r1","name":"Header","nps":2.0,"schedule":"40","path":[[0,0,0],[1000,0,0]],"end_type":"BW","material":null,"bend_radius":null,"suppressed":false},{"id":"r2","name":"Branch","nps":1.5,"schedule":"40","path":[[1000,0,0],[1000,500,0]],"end_type":"BW","material":null,"bend_radius":null,"suppressed":false}],"fittings":[{"id":"ft1","type":"tee","name":"Tee","nps":2.0,"nps2":null,"origin":[1000,0,0],"orient":[0,0,0],"schedule":"40","material":null,"catalog_ref":null,"params":{},"suppressed":false}]})";
+        const std::string pipSolve = R"({"ok":true,"converged":true,"iterations":4,"links":[{"run_id":"r1","flow_m3h":15.2,"velocity_ms":1.7,"pressure_drop_kpa":8.3},{"run_id":"r2","flow_m3h":6.8,"velocity_ms":1.4,"pressure_drop_kpa":4.1}],"nodes":[{"node_id":"n0","pressure_kpa":120.0,"head_m":12.2}]})";
+        ui::seedPipingPanelFromJson(pipDoc, pipSolve);
+        cfg.pipingShotDone = true;
+    }
+    if (cfg.wantHydraulic) {   // T-U7
+        ui::openHydraulicPanel();
+        const std::string hydDoc = R"({"schema":"aicad.hydraulic/1","id":"fix-h","name":"Demo Circuit","units":{"pressure":"bar","flow":"L/min","force":"kN","position":"mm"},"components":[{"id":"c1","type":"reservoir","name":"Tank","x":0,"y":0,"params":{}},{"id":"c2","type":"pump","name":"Gear Pump","x":200,"y":0,"params":{}},{"id":"c3","type":"valve_relief","name":"Relief","x":400,"y":0,"params":{}},{"id":"c4","type":"valve_directional","name":"4/3 DCV","x":600,"y":0,"params":{}},{"id":"c5","type":"cylinder_linear","name":"Lift Cyl","x":800,"y":0,"params":{}}],"hoses":[{"id":"h1","from_port":{"comp_id":"c1","port":"generic"},"to_port":{"comp_id":"c2","port":"generic"}},{"id":"h2","from_port":{"comp_id":"c2","port":"pressure"},"to_port":{"comp_id":"c3","port":"generic"}},{"id":"h3","from_port":{"comp_id":"c2","port":"pressure"},"to_port":{"comp_id":"c4","port":"pressure"}},{"id":"h4","from_port":{"comp_id":"c4","port":"work_a"},"to_port":{"comp_id":"c5","port":"generic"}},{"id":"h5","from_port":{"comp_id":"c4","port":"tank"},"to_port":{"comp_id":"c1","port":"generic"}}],"annotations":[]})";
+        const std::string hydSize = R"({"c2":{"displacement_cc_rev":13.793,"shaft_power_kw":7.843},"c5":{"extend_force_kn":37.306,"extend_flow_lpm":2.4}})";
+        ui::seedHydraulicPanelFromJson(hydDoc, hydSize);
+        cfg.hydraulicShotDone = true;
+    }
+    if (cfg.wantStructural) {  // T-U7
+        ui::openStructuralPanel();
+        const std::string strDoc = R"({"schema":"aicad.structure/1","id":"fix-s","name":"Demo Frame","elements":[{"id":"e1","element_type":"column","section_name":"W8x31","material":"steel","length_mm":3000,"transform":[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]},{"id":"e2","element_type":"beam","section_name":"W10x45","material":"steel","length_mm":4000,"transform":[1,0,0,0,0,1,0,0,0,0,1,0,3000,0,0,1]},{"id":"e3","element_type":"column","section_name":"W8x31","material":"steel","length_mm":3000,"transform":[1,0,0,0,0,1,0,0,0,0,1,0,7000,0,0,1]}],"load_cases":[]})";
+        const std::string strRes = R"({"e1":{"axial_n":-45000,"moment_max_nm":2800000,"deflection_max_mm":1.2,"dc_ratio":0.62,"ok":true},"e2":{"axial_n":0,"moment_max_nm":18000000,"deflection_max_mm":8.4,"dc_ratio":0.85,"ok":true},"e3":{"axial_n":-38000,"moment_max_nm":2200000,"deflection_max_mm":1.1,"dc_ratio":0.58,"ok":true}})";
+        ui::seedStructuralPanelFromJson(strDoc, strRes);
+        cfg.structuralShotDone = true;
+    }
+    if (cfg.wantGallery) {
+        ui::openGalleryPanel();
+        ui::selectAndOpenFirstSampleForShot();  // proves click -> doc_open -> editable tree
+    }
+    if (cfg.wantMissionControl) ui::openMissionControlPanel();  // T-F17
+    if (cfg.wantSimStudies)   ui::openSimStudiesPanel();  // T-U6
     if (cfg.wantPick) setupPickShot(st);
     if (cfg.wantGlassperf) setupPickShot(st);
 
@@ -372,6 +434,26 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
         std::fflush(stdout);
     }
 
+    // Parts browser: seed the panel model from a synchronous part_search call so the
+    // screenshot shows populated results without needing an async RPC round-trip.
+    // Follows the same worker-one-shot settle pattern as wantEquations / wantTree.
+    // No step machine — avoids the T-G13/issue-#7 offscreen deadlock.
+    if (cfg.wantPartsBrowser && !cfg.partsBrowserShotDone) {
+        cfg.partsBrowserShotDone = true;
+        nlohmann::json res;
+        std::string err;
+        if (st.worker.call("part_search", {{"query", "M8"}, {"limit", 20}}, res, err, 5000)) {
+            // Directly seed the panel's file-static model so render shows real rows.
+            ui::seedPartsPanelFromJson(res.dump(), "M8");
+            std::printf("parts_browser: seed search ok (count=%d)\n",
+                        res.value("count", 0));
+        } else {
+            std::printf("parts_browser: seed search failed (worker not ready): %s\n",
+                        err.c_str());
+        }
+        std::fflush(stdout);
+    }
+
     if (cfg.wantEcad && !cfg.ecadShotDone) {
         cfg.ecadShotDone = true;
         nlohmann::json res;
@@ -387,6 +469,356 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
             std::printf("ecad: orchestrate ok\n");
         else
             std::printf("ecad: orchestrate skipped (%s)\n", err.c_str());
+        std::fflush(stdout);
+    }
+
+    // T-U3: CAM workspace panel screenshot — build a plate + run cam_program, then adopt
+    // the job into the new ui/imgui cam_panel (camWorkspaceLoadJob). One-shot like wantTree.
+    if (cfg.wantCamWorkspace && !cfg.camWorkspaceShotDone) {
+        cfg.camWorkspaceShotDone = true;
+        std::string err;
+        if (st.docMirror.newPart(st.worker, err)) {
+            st.addDocTab(false);
+            auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                {{"op","add_feature"},{"feature",{
+                    {"type","box"},{"name","Plate"},
+                    {"params",{{"length",dim(80)},{"width",dim(60)},{"height",dim(15)}}}}}}}));
+            loadMesh(st, r.aicm_path);
+            nlohmann::json camRes;
+            std::string e2;
+            bool camOk = st.worker.call("cam_program",
+                {{"doc_id", st.docMirror.docId()}, {"post", "grbl"}}, camRes, e2, 30000);
+            std::string camDocId = (camOk && camRes.is_object())
+                                   ? camRes.value("cam_doc_id", std::string()) : std::string();
+            std::printf("cam_workspace-shot: ok=%d cam_doc=%s\n",
+                        (int)camOk, camDocId.c_str());
+            std::fflush(stdout);
+            if (!camDocId.empty())
+                ui::camWorkspaceLoadJob(st, camDocId);
+            else
+                ui::openCamWorkspacePanel();  // show empty panel if program failed
+        } else {
+            std::printf("cam_workspace-shot: doc_new failed: %s\n", err.c_str());
+            std::fflush(stdout);
+            ui::openCamWorkspacePanel();
+        }
+    }
+
+    // T-U4: BOM & sourcing panel one-shot.
+    // Seeds two bought lines (M3 screw + 608ZZ bearing) with MPNs so the panel renders
+    // a realistic table even without a real assembly doc — prices will be BOM_UNPRICED
+    // unless a sourcing provider is configured, which is the correct unpriced state.
+    if (cfg.wantBom && !cfg.bomShotDone) {
+        cfg.bomShotDone = true;
+        // Try the live bom_price RPC first; if the engine.bom module is not provisioned
+        // the call fails and we fall back to seeding deterministic fixture rows.
+        nlohmann::json res;
+        std::string err;
+        bool liveOk = st.worker.call("bom_price", {{"doc_path", ""}}, res, err, 15000);
+        if (liveOk && res.value("ok", false) && res.contains("bom") && res["bom"].is_array()
+                && !res["bom"].empty()) {
+            std::string resStr = res.dump();
+            ui::seedBomPanelFromJson(resStr);
+            std::printf("bom: live rollup ok (%d lines)\n", (int)res["bom"].size());
+        } else {
+            // Fixture: two bought lines with MPNs, null prices (correct unpriced state).
+            const std::string fixture = R"({
+                "ok": true,
+                "bom": [
+                    {"line_id":"fix_1","kind":"bought","quantity":4,"unit":"ea",
+                     "description":"M3x10 Socket Head Cap Screw","mpn":"ISO4762-M3x10-A2",
+                     "vendor_part":{"supplier":"McMaster-Carr"},
+                     "unit_cost":null,"ext_cost":null},
+                    {"line_id":"fix_2","kind":"bought","quantity":2,"unit":"ea",
+                     "description":"608ZZ Deep Groove Bearing","mpn":"608ZZ",
+                     "vendor_part":{"supplier":""},
+                     "unit_cost":null,"ext_cost":null},
+                    {"line_id":"fix_3","kind":"made","quantity":1,"unit":"ea",
+                     "description":"6061-T6 Aluminum Plate 12mm","mpn":"",
+                     "vendor_part":null,
+                     "unit_cost":null,"ext_cost":null}
+                ]
+            })";
+            ui::seedBomPanelFromJson(fixture);
+            std::printf("bom: fixture seeded (live unavailable: %s)\n", err.c_str());
+        }
+        std::fflush(stdout);
+    }
+
+    // T-U5 Requirements & verification panel.
+    // Tries a live req_report RPC; falls back to a deterministic fixture that exercises
+    // every valid status (proposed/user_confirmed/verified/failed/waived) plus two battery
+    // checks (one pass, one fail with evidence) so the screenshot proves all readout paths.
+    if (cfg.wantRequirements && !cfg.requirementsShotDone) {
+        cfg.requirementsShotDone = true;
+        nlohmann::json res;
+        std::string err;
+        bool liveOk = st.worker.call("req_report", {{"doc_path", ""}}, res, err, 15000);
+        if (liveOk && res.value("ok", false) &&
+                res.contains("requirements") && res["requirements"].is_array() &&
+                !res["requirements"].empty()) {
+            std::string resStr = res.dump();
+            ui::seedRequirementsPanelFromJson(resStr);
+            std::printf("requirements: live req_report ok (%d reqs)\n",
+                        (int)res["requirements"].size());
+        } else {
+            // Fixture: covers proposed/user_confirmed/verified/failed/waived statuses
+            // and 2 battery checks (pass + fail) — proves every rendering branch.
+            const std::string fixture = R"json({
+                "ok": true,
+                "requirements": [
+                    {
+                        "id": "req_001",
+                        "kind": "dimensional",
+                        "status": "verified",
+                        "text": "Overall envelope shall not exceed bounding box",
+                        "quantity": {"op": "<=", "value": 150, "unit": "mm"},
+                        "verify_by": [{"id": "v_geom_01"}]
+                    },
+                    {
+                        "id": "req_002",
+                        "kind": "material",
+                        "status": "proposed",
+                        "text": "Body material shall be 6061-T6 aluminum",
+                        "quantity": null,
+                        "verify_by": []
+                    },
+                    {
+                        "id": "req_003",
+                        "kind": "functional",
+                        "status": "failed",
+                        "text": "Static deflection under 500 N load shall not exceed 0.5 mm",
+                        "quantity": {"op": "<=", "value": 0.5, "unit": "mm"},
+                        "verify_by": [{"id": "v_fea_01"}]
+                    },
+                    {
+                        "id": "req_004",
+                        "kind": "cost",
+                        "status": "user_confirmed",
+                        "text": "Unit production cost target",
+                        "quantity": {"op": "<=", "value": 85, "unit": "USD"},
+                        "verify_by": []
+                    },
+                    {
+                        "id": "req_005",
+                        "kind": "standard",
+                        "status": "waived",
+                        "text": "RoHS compliance (waived for prototype run)",
+                        "quantity": null,
+                        "verify_by": []
+                    }
+                ],
+                "battery": {
+                    "checks": [
+                        {
+                            "check": "interference",
+                            "passed": true,
+                            "summary": "No interference detected (0 pairs)",
+                            "elapsed_ms": 42
+                        },
+                        {
+                            "check": "budget",
+                            "passed": false,
+                            "summary": "Cost estimate $112 exceeds $85 target",
+                            "elapsed_ms": 8
+                        }
+                    ]
+                }
+            })json";
+            ui::seedRequirementsPanelFromJson(fixture);
+            std::printf("requirements: fixture seeded (live unavailable: %s)\n", err.c_str());
+        }
+        std::fflush(stdout);
+    }
+
+    // T-U8 Model & telemetry transparency panel.
+    // Tries a live serving_status RPC; falls back to a fixture that exercises every
+    // rendering branch: two routes (one stable, one canary), honest "not-opted-in"
+    // canary state, and real sidecar dir scan.
+    if (cfg.wantTransparency && !cfg.transparencyShotDone) {
+        cfg.transparencyShotDone = true;
+        nlohmann::json res;
+        std::string err;
+        bool liveOk = st.worker.call("serving_status", nlohmann::json::object(),
+                                     res, err, 5000);
+        if (liveOk && res.value("ok", false) &&
+                res.contains("routes") && res["routes"].is_array()) {
+            ui::seedTransparencyPanelForShot(res.dump());
+            std::printf("transparency: live serving_status ok (%d routes)\n",
+                        (int)res["routes"].size());
+        } else {
+            // Fixture: one stable route + one canary route, user not opted in.
+            // Exercises which-brain table, canary section, and the "not opted in"
+            // honest state.  Sidecar dirs are scanned from the real filesystem.
+            const std::string fixture = R"json({
+                "ok": true,
+                "routes": [
+                    {
+                        "insertion_point": "copilot",
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "adapter_version": "",
+                        "canary_pct": 0,
+                        "opt_in_count": 0,
+                        "opt_in": [],
+                        "fallback": {"mode": "none", "provider": "", "model": ""}
+                    },
+                    {
+                        "insertion_point": "reviewer",
+                        "provider": "vllm",
+                        "model": "Qwen3-4B",
+                        "adapter_version": "v0.2.1",
+                        "canary_pct": 15,
+                        "opt_in_count": 3,
+                        "opt_in": [],
+                        "fallback": {"mode": "provider", "provider": "openai", "model": "gpt-4o"}
+                    }
+                ]
+            })json";
+            ui::seedTransparencyPanelForShot(fixture);
+            std::printf("transparency: fixture seeded (live unavailable: %s)\n",
+                        err.c_str());
+        }
+        std::fflush(stdout);
+    }
+
+    if (cfg.wantPiping && !cfg.pipingShotDone) {
+        cfg.pipingShotDone = true;
+        // Fixture: a simple two-run water loop (header + branch) with a solved result.
+        const std::string pipingDocFixture = R"({
+            "schema": "aicad.piping/1",
+            "id": "fix-piping-1",
+            "name": "Demo Piping Loop",
+            "units": {"system": "MMGS"},
+            "material": "A106-B",
+            "runs": [
+                {"id":"r1","name":"Header","nps":2.0,"schedule":"40",
+                 "path":[[0,0,0],[1000,0,0]],"end_type":"BW","material":null,"bend_radius":null,"suppressed":false},
+                {"id":"r2","name":"Branch","nps":1.5,"schedule":"40",
+                 "path":[[1000,0,0],[1000,500,0]],"end_type":"BW","material":null,"bend_radius":null,"suppressed":false}
+            ],
+            "fittings": [
+                {"id":"ft1","type":"tee","name":"Main Tee","nps":2.0,"nps2":null,
+                 "origin":[1000,0,0],"orient":[0,0,0],"schedule":"40","material":null,"catalog_ref":null,"params":{},"suppressed":false}
+            ]
+        })";
+        const std::string pipingSolveFixture = R"({
+            "ok": true,
+            "converged": true,
+            "iterations": 4,
+            "links": [
+                {"run_id":"r1","flow_m3h":15.2,"velocity_ms":1.7,"pressure_drop_kpa":8.3},
+                {"run_id":"r2","flow_m3h":6.8,"velocity_ms":1.4,"pressure_drop_kpa":4.1}
+            ],
+            "nodes": [
+                {"node_id":"n0","pressure_kpa":120.0,"head_m":12.2},
+                {"node_id":"n1","pressure_kpa":111.7,"head_m":11.4}
+            ]
+        })";
+        ui::seedPipingPanelFromJson(pipingDocFixture, pipingSolveFixture);
+        std::printf("piping_view: fixture seeded\n");
+        std::fflush(stdout);
+    }
+
+    if (cfg.wantHydraulic && !cfg.hydraulicShotDone) {
+        cfg.hydraulicShotDone = true;
+        const std::string hydDocFixture = R"({
+            "schema": "aicad.hydraulic/1",
+            "id": "fix-hyd-1",
+            "name": "Demo Hydraulic Circuit",
+            "units": {"pressure":"bar","flow":"L/min","force":"kN","position":"mm"},
+            "components": [
+                {"id":"c1","type":"reservoir","name":"Tank","x":0,"y":0,"params":{}},
+                {"id":"c2","type":"pump","name":"Gear Pump","x":200,"y":0,"params":{"displacement_cc_rev":13.8}},
+                {"id":"c3","type":"valve_relief","name":"Relief Valve","x":400,"y":0,"params":{"set_pressure_bar":200}},
+                {"id":"c4","type":"valve_directional","name":"4/3 DCV","x":600,"y":0,"params":{}},
+                {"id":"c5","type":"cylinder_linear","name":"Lift Cylinder","x":800,"y":0,"params":{"bore_mm":50,"rod_mm":25,"stroke_mm":300}}
+            ],
+            "hoses": [
+                {"id":"h1","from_port":{"comp_id":"c1","port":"generic"},"to_port":{"comp_id":"c2","port":"generic"}},
+                {"id":"h2","from_port":{"comp_id":"c2","port":"pressure"},"to_port":{"comp_id":"c3","port":"generic"}},
+                {"id":"h3","from_port":{"comp_id":"c2","port":"pressure"},"to_port":{"comp_id":"c4","port":"pressure"}},
+                {"id":"h4","from_port":{"comp_id":"c4","port":"work_a"},"to_port":{"comp_id":"c5","port":"generic"}},
+                {"id":"h5","from_port":{"comp_id":"c4","port":"tank"},"to_port":{"comp_id":"c1","port":"generic"}}
+            ],
+            "annotations": []
+        })";
+        // Sizing results: pump + cylinder pre-computed
+        const std::string hydSizingFixture = R"({
+            "c2": {"displacement_cc_rev":13.793,"shaft_power_kw":7.843},
+            "c5": {"extend_force_kn":37.306,"extend_flow_lpm":2.4,"retract_force_kn":28.2,"retract_flow_lpm":1.8}
+        })";
+        ui::seedHydraulicPanelFromJson(hydDocFixture, hydSizingFixture);
+        std::printf("hydraulic_view: fixture seeded\n");
+        std::fflush(stdout);
+    }
+
+    if (cfg.wantStructural && !cfg.structuralShotDone) {
+        cfg.structuralShotDone = true;
+        const std::string structDocFixture = R"({
+            "schema": "aicad.structure/1",
+            "id": "fix-struct-1",
+            "name": "Demo Frame",
+            "elements": [
+                {"id":"e1","element_type":"column","section_name":"W8x31","material":"steel",
+                 "length_mm":3000,"transform":[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]},
+                {"id":"e2","element_type":"beam","section_name":"W10x45","material":"steel",
+                 "length_mm":4000,"transform":[1,0,0,0,0,1,0,0,0,0,1,0,3000,0,0,1]},
+                {"id":"e3","element_type":"column","section_name":"W8x31","material":"steel",
+                 "length_mm":3000,"transform":[1,0,0,0,0,1,0,0,0,0,1,0,7000,0,0,1]}
+            ],
+            "load_cases": []
+        })";
+        // Analysis results: D/C ratios + deflections
+        const std::string structResultsFixture = R"({
+            "e1": {"axial_n":-45000,"moment_max_nm":2800000,"deflection_max_mm":1.2,"dc_ratio":0.62,"ok":true},
+            "e2": {"axial_n":0,"moment_max_nm":18000000,"deflection_max_mm":8.4,"dc_ratio":0.85,"ok":true},
+            "e3": {"axial_n":-38000,"moment_max_nm":2200000,"deflection_max_mm":1.1,"dc_ratio":0.58,"ok":true}
+        })";
+        ui::seedStructuralPanelFromJson(structDocFixture, structResultsFixture);
+        std::printf("structural_view: fixture seeded\n");
+        std::fflush(stdout);
+    }
+    if (cfg.wantMissionControl && !cfg.missionControlShotDone) {
+        cfg.missionControlShotDone = true;
+        const char* ts = "2026-07-03T00:47:41Z";
+        std::string j;
+        auto ev = [&](const char* body) {
+            j += std::string("{\"ts\":\"") + ts + "\"," + body + "}\n";
+        };
+        // Phase 1: thin-slice (design + gate), completed.
+        ev(R"j("kind":"dag.run.started","run_id":"c8efe1ae","graph_id":"thin-slice-soil-sensor","node_count":2,"graph_name":"Thin-slice: design+gate")j");
+        ev(R"j("kind":"dag.node.started","run_id":"c8efe1ae","node_id":"n_design","node_type":"design","node_name":"ECAD schematic stub")j");
+        ev(R"j("kind":"dag.node.done","run_id":"c8efe1ae","node_id":"n_design","output_summary":"Stub ECAD design completed")j");
+        ev(R"j("kind":"dag.node.started","run_id":"c8efe1ae","node_id":"n_gate_preorder","node_type":"gate","node_name":"Pre-order gate")j");
+        ev(R"j("kind":"dag.node.paused","run_id":"c8efe1ae","node_id":"n_gate_preorder","reason":"gate")j");
+        ev(R"j("kind":"dag.node.approval_required","run_id":"c8efe1ae","node_id":"n_gate_preorder")j");
+        ev(R"j("kind":"dag.node.done","run_id":"c8efe1ae","node_id":"n_gate_preorder","output_summary":"Gate approved")j");
+        ev(R"j("kind":"dag.run.done","run_id":"c8efe1ae","status":"done","node_states":{"n_design":{"status":"done"},"n_gate_preorder":{"status":"done"}})j");
+        // Phase 2: full mission — ends paused at the pre-order gate (steering live).
+        ev(R"j("kind":"dag.run.started","run_id":"1948942a","graph_id":"full-mission-soil-sensor","node_count":10,"graph_name":"Battery-Powered Soil-Moisture Sensor")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_ecad","node_type":"ecad","node_name":"ECAD schematic")j");
+        ev(R"j("kind":"dag.node.done","run_id":"1948942a","node_id":"n_ecad","output_summary":"Schematic: ATtiny85 + SHT31, battery circuit")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_firmware","node_type":"firmware","node_name":"Firmware")j");
+        ev(R"j("kind":"dag.node.done","run_id":"1948942a","node_id":"n_firmware","output_summary":"AVR-C firmware stub generated")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_structural","node_type":"structural","node_name":"Structural FEA")j");
+        ev(R"j("kind":"dag.node.done","run_id":"1948942a","node_id":"n_structural","output_summary":"FEA passed - min FOS 2.4")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_source","node_type":"source","node_name":"BOM sourcing")j");
+        ev(R"j("kind":"dag.node.done","run_id":"1948942a","node_id":"n_source","output_summary":"BOM: 12 parts, $4.23 estimated")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_verify_interference","node_type":"verify","node_name":"Verify: interference")j");
+        ev(R"j("kind":"dag.node.failed","run_id":"1948942a","node_id":"n_verify_interference","error":"backend_unavailable (fail-closed)")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_verify_erc","node_type":"verify","node_name":"Verify: ERC")j");
+        ev(R"j("kind":"dag.node.failed","run_id":"1948942a","node_id":"n_verify_erc","error":"backend_unavailable (fail-closed)")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_verify_drc","node_type":"verify","node_name":"Verify: DRC")j");
+        ev(R"j("kind":"dag.node.failed","run_id":"1948942a","node_id":"n_verify_drc","error":"backend_unavailable (fail-closed)")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_verify_budget","node_type":"verify","node_name":"Verify: budget")j");
+        ev(R"j("kind":"dag.node.failed","run_id":"1948942a","node_id":"n_verify_budget","error":"backend_unavailable (fail-closed)")j");
+        ev(R"j("kind":"dag.node.started","run_id":"1948942a","node_id":"n_gate_preorder","node_type":"gate","node_name":"Pre-order gate")j");
+        ev(R"j("kind":"dag.node.paused","run_id":"1948942a","node_id":"n_gate_preorder","reason":"gate")j");
+        ev(R"j("kind":"dag.node.approval_required","run_id":"1948942a","node_id":"n_gate_preorder")j");
+        ui::seedMissionControlPanelFromJsonl(j);
+        std::printf("mission_control: fixture seeded (%zu bytes, paused at gate)\n",
+                    j.size());
         std::fflush(stdout);
     }
 }
@@ -465,6 +897,49 @@ void ScenarioRunner::tickGlassperf(ShotConfig& cfg, app::AppState& st) {
 
 void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
     tickSimpleShots(cfg, st);
+
+    // ---------- sim_studies (T-U6) — no worker needed; fixture seeds directly ----------
+    // Runs unconditionally (not gated on workerStarted) so the panel populates on frame 1.
+    // The panel auto-reloads via AsyncRpc when a real doc is opened later.
+    if (cfg.wantSimStudies && !cfg.simStudiesShotDone) {
+        cfg.simStudiesShotDone = true;
+        const std::string fixture = R"json({
+            "ok": true,
+            "studies": [
+                {
+                    "id": "fix_fea_1",
+                    "type": "fea_static",
+                    "name": "Static stress (steel)",
+                    "engine": "cpp",
+                    "material": {"name": "steel", "yield_mpa": 250.0},
+                    "mesh_fineness": 0.5,
+                    "n_dof": 18432,
+                    "results": {
+                        "max_von_mises_mpa": 73.4,
+                        "max_disp_mm": 0.127,
+                        "min_fos": 3.41
+                    }
+                },
+                {
+                    "id": "fix_cfd_1",
+                    "type": "cfd_flow",
+                    "name": "CFD wind tunnel (air, 10 m/s, aoa 0)",
+                    "engine": "cpp-lbm",
+                    "params": {"velocity": 10.0, "aoa": 0.0, "fluid": "air"},
+                    "results": {
+                        "drag_n": 0.214,
+                        "lift_n": 0.003,
+                        "cd": 1.872,
+                        "reynolds": 68000.0,
+                        "converged": true
+                    }
+                }
+            ]
+        })json";
+        ui::seedSimStudiesPanelFromJson(fixture);
+        std::printf("sim_studies: fixture seeded\n");
+        std::fflush(stdout);
+    }
 
     // ---------- preview (T-F16) ----------
     // Re-arm the Preview dock-tab focus every frame: the window is created on frame 1 and only

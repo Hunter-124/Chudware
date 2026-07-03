@@ -8,6 +8,9 @@ add_library(aicad_ui_abstract STATIC
     command_registry.cpp
     panel_spec.cpp
     ask_form.cpp
+    piping_view.cpp       # T-U7 piping doc → net canvas adapter
+    hydraulic_view.cpp    # T-U7 hydraulic doc → net canvas adapter
+    structural_view.cpp   # T-U7 structural doc → net canvas adapter
 )
 target_include_directories(aicad_ui_abstract PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

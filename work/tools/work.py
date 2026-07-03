@@ -205,6 +205,24 @@ def _git(args, cwd, check=False):
     return r
 
 
+def _safe_sync(main):
+    """Sync the main checkout WITHOUT ever rebasing the foreman's unpushed merges.
+
+    pull --rebase here twice stranded the checkout mid-replay and once clobbered
+    refs/heads/master (2026-07-03 incidents). Policy: ahead-only -> nothing to do;
+    behind-only -> fast-forward; diverged -> caller must bail (return False).
+    """
+    _git(["fetch", "--quiet"], main)
+    r = _git(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"], main)
+    counts = r.stdout.split()
+    ahead, behind = (int(counts[0]), int(counts[1])) if len(counts) == 2 else (0, 0)
+    if ahead and behind:
+        return False
+    if behind:
+        _git(["merge", "--ff-only", "@{upstream}"], main)
+    return True
+
+
 def _main_worktree():
     r = _git(["rev-parse", "--git-common-dir"], ROOT.parent, check=True)
     common = Path(r.stdout.strip())
@@ -252,9 +270,24 @@ def cmd_claim(tasks, errors, args):
         return 1
     lock = _lock()
     try:
+        # Refuse to touch the main checkout while a merge/rebase is in progress or
+        # the tree has uncommitted tracked changes — this pull --rebase once began
+        # rebasing a foreman merge session mid-resolution (2026-07-03 near-miss;
+        # same class as the opus-dawn 211-commit incident).
+        gitdir = main / ".git"
+        busy = any((gitdir / m).exists() for m in ("MERGE_HEAD", "rebase-merge", "rebase-apply"))
+        dirty = bool(_git(["status", "--porcelain", "--untracked-files=no"], main).stdout.strip())
+        if busy or dirty:
+            print("BUSY: main checkout has a merge/rebase in progress or uncommitted "
+                  "changes (likely a foreman merge session) — retry claim in ~60s",
+                  file=sys.stderr)
+            return 3
         has_remote = bool(_git(["remote"], main).stdout.strip())
         if has_remote:
-            _git(["pull", "--rebase", "--autostash"], main)
+            if not _safe_sync(main):
+                print("BUSY: main checkout diverged from origin (foreman mid-session)"
+                      " — retry in ~60s", file=sys.stderr)
+                return 3
         tasks, errors = load_tasks()  # reload under lock, post-pull
         unclaimed = lambda t: t.get("owner", "unassigned") in ("unassigned", "", "none")
         if args.task:
@@ -320,7 +353,10 @@ def cmd_note(tasks, errors, args):
     try:
         main = _main_worktree()
         if _git(["remote"], main).stdout.strip():
-            _git(["pull", "--rebase", "--autostash"], main)
+            if not _safe_sync(main):
+                print("BUSY: main checkout diverged from origin (foreman mid-session)"
+                      " — retry in ~60s", file=sys.stderr)
+                return 3
         tasks, _ = load_tasks()
         t = _owned_task(tasks, args.task_id, args.owner)
         stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
@@ -351,7 +387,10 @@ def cmd_status(tasks, errors, args):
     try:
         main = _main_worktree()
         if _git(["remote"], main).stdout.strip():
-            _git(["pull", "--rebase", "--autostash"], main)
+            if not _safe_sync(main):
+                print("BUSY: main checkout diverged from origin (foreman mid-session)"
+                      " — retry in ~60s", file=sys.stderr)
+                return 3
         tasks, _ = load_tasks()
         t = _owned_task(tasks, args.task_id, args.owner)
         cur, new = t.get("status"), args.status
@@ -377,7 +416,10 @@ def cmd_release(tasks, errors, args):
     try:
         main = _main_worktree()
         if _git(["remote"], main).stdout.strip():
-            _git(["pull", "--rebase", "--autostash"], main)
+            if not _safe_sync(main):
+                print("BUSY: main checkout diverged from origin (foreman mid-session)"
+                      " — retry in ~60s", file=sys.stderr)
+                return 3
         tasks, _ = load_tasks()
         t = _owned_task(tasks, args.task_id, args.owner)
         _set_front_matter(t["_path"], owner="unassigned", status="todo")
@@ -398,7 +440,10 @@ def cmd_relink(tasks, errors, args):
     try:
         main = _main_worktree()
         if _git(["remote"], main).stdout.strip():
-            _git(["pull", "--rebase", "--autostash"], main)
+            if not _safe_sync(main):
+                print("BUSY: main checkout diverged from origin (foreman mid-session)"
+                      " — retry in ~60s", file=sys.stderr)
+                return 3
         tasks, _ = load_tasks()
         if args.task_id not in tasks:
             raise RuntimeError(f"unknown task {args.task_id}")
@@ -438,7 +483,10 @@ def cmd_checkdod(tasks, errors, args):
     try:
         main = _main_worktree()
         if _git(["remote"], main).stdout.strip():
-            _git(["pull", "--rebase", "--autostash"], main)
+            if not _safe_sync(main):
+                print("BUSY: main checkout diverged from origin (foreman mid-session)"
+                      " — retry in ~60s", file=sys.stderr)
+                return 3
         tasks, _ = load_tasks()
         if args.task_id not in tasks:
             raise RuntimeError(f"unknown task {args.task_id}")

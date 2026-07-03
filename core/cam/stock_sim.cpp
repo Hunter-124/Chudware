@@ -252,9 +252,18 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
 
     // lower the field along every cutting move; flag rapids through stock
     int rapid_hits = 0;
+    int holder_hits = 0;
     for (const Toolpath& tp : toolpaths) {
         const Tool* tl = tools.find(tp.tool_number);
         double r = tl ? tl->effective_radius() : 1.0;
+        // non-cutting tool body for holder/shank collision (audit T-M3): the flutes cut
+        // to tip_z..tip_z+flute_length at radius r; above that the (wider) shank runs to
+        // the shoulder and the holder above that. Any remaining stock that rises into
+        // those non-cutting zones is a crash the tip-only sim misses.
+        double shank_r = tl ? tl->shank_diameter * 0.5 : 0;
+        double holder_r = tl ? tl->holder_diameter * 0.5 : 0;
+        double flute_len = tl ? tl->flute_length : 0;
+        double shoulder_len = tl ? tl->shoulder_length : 0;
         Vec3 prev{0, 0, 1e9};
         bool have = false;
         // lower the dexel field under the tool disc along one straight sub-segment a→b
@@ -280,6 +289,35 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
                     }
                 }
         };
+        // does the non-cutting body sweep of a→b intersect any remaining stock? Within
+        // the shank radius, stock above the flute end hits the shank; in the annulus out
+        // to the holder radius, stock above the shoulder hits the holder. tip_z tracks the
+        // tip along the segment so a plunging move raises the whole envelope with it.
+        auto holder_hit_seg = [&](const Vec3& a, const Vec3& b) -> bool {
+            double rr = std::max(shank_r, holder_r);
+            if (rr <= 0) return false;
+            double minx = std::min(a.x, b.x) - rr, maxx = std::max(a.x, b.x) + rr;
+            double miny = std::min(a.y, b.y) - rr, maxy = std::max(a.y, b.y) + rr;
+            int i0 = std::max(0, (int)std::floor((minx - flo.x) / res_mm));
+            int i1 = std::min(nx - 1, (int)std::ceil((maxx - flo.x) / res_mm));
+            int j0 = std::max(0, (int)std::floor((miny - flo.y) / res_mm));
+            int j1 = std::min(ny - 1, (int)std::ceil((maxy - flo.y) / res_mm));
+            for (int j = j0; j <= j1; ++j)
+                for (int i = i0; i <= i1; ++i) {
+                    double x = flo.x + i * res_mm, y = flo.y + j * res_mm;
+                    double t;
+                    double d = dist_point_seg(x, y, a.x, a.y, b.x, b.y, t);
+                    if (d > rr) continue;
+                    double tipz = a.z + (b.z - a.z) * t;
+                    double h = field.raw(i, j);
+                    if (d <= shank_r) {
+                        if (h > tipz + flute_len + opt.gouge_tol) return true;
+                    } else if (d <= holder_r) {
+                        if (h > tipz + shoulder_len + opt.gouge_tol) return true;
+                    }
+                }
+            return false;
+        };
         for (const Move& m : tp.moves) {
             if (m.kind == MoveKind::Dwell || m.kind == MoveKind::ToolChange) continue;
             Vec3 to = m.to;
@@ -287,6 +325,8 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
             bool cutting = (m.kind == MoveKind::Cut || m.kind == MoveKind::Plunge ||
                             m.kind == MoveKind::Lead || m.kind == MoveKind::Arc);
             bool rapid = (m.kind == MoveKind::Rapid || m.kind == MoveKind::Retract);
+            bool check_holder = cutting && opt.check_holder && (shank_r > 0 || holder_r > 0);
+            bool holder_hit = false;
             if (m.kind == MoveKind::Arc) {
                 // sweep the TRUE arc (center+radius carried on the Move), not the chord:
                 // a chord bows inside a convex arc and under-removes near the midpoint,
@@ -310,11 +350,14 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
                                     cy + rad * std::sin(a0 + da * f),
                                     prev.z + (to.z - prev.z) * f};
                     sweep_seg(a, b, cutting, rapid);
+                    if (check_holder && !holder_hit) holder_hit = holder_hit_seg(a, b);
                     a = b;
                 }
             } else {
                 sweep_seg(prev, to, cutting, rapid);
+                if (check_holder) holder_hit = holder_hit_seg(prev, to);
             }
+            if (holder_hit) ++holder_hits;
             prev = to;
         }
     }
@@ -326,6 +369,8 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
     res.remaining_volume_mm3 = std::max(0.0, stock_vol - removed);
     res.rapid_collisions = rapid_hits;
     if (rapid_hits > 0) res.warnings.push_back("rapid move(s) pass through remaining stock");
+    res.holder_collisions = holder_hits;
+    if (holder_hits > 0) res.warnings.push_back("tool holder/shank collides with remaining stock");
 
     // gouge: remaining material below the part surface
     if (has_part && opt.check_gouge) {
@@ -369,7 +414,7 @@ json SimResult::to_json(bool include_field) const {
            {"remaining_volume_mm3", remaining_volume_mm3}, {"stock_volume_mm3", stock_volume_mm3},
            {"machined_fraction", machined_fraction}, {"cycle_time_s", cycle_time_s},
            {"gouges", gouges}, {"max_gouge_mm", max_gouge_mm}, {"rapid_collisions", rapid_collisions},
-           {"warnings", warnings}};
+           {"holder_collisions", holder_collisions}, {"warnings", warnings}};
     if (include_field && remaining.nx() > 0) {
         json zs = json::array();
         for (int jj = 0; jj < remaining.ny(); ++jj)

@@ -2,8 +2,8 @@
 id: T-Q3
 title: Sample project gallery + guided tours
 workstream: Q
-owner: unassigned
-status: todo
+owner: sonnet-lark
+status: done
 branch: task/T-Q3-prod
 day: 3
 priority: 4
@@ -26,15 +26,34 @@ projects per discipline and a guided tour that shows the agent working.
 
 ## Definition of done
 
-- [ ] All samples regenerate from scripts against the merged engine (test = regen + open
-      + tree/solve asserts)
-- [ ] index.json + thumbnails (headless shots) present; GUI gallery panel is T-U-later —
-      data format is the deliverable
-- [ ] One tour script runs end-to-end headless
-- [ ] gate; graphify update .
+- [x] All samples regenerate from scripts against the merged engine (test = regen + open
+      + tree/solve asserts) — 13/13 pytest pass (samples/test_regen.py)
+- [x] index.json + thumbnails (headless shots) present; GUI gallery panel is T-U-later —
+      data format is the deliverable — samples/index.json + 3 PNGs written
+- [x] One tour script runs end-to-end headless — samples/tours/bracket_tour.py 9/9 steps
+- [x] gate; graphify update . — check.py FAIL-RECORDED (pre-existing, same as all tasks);
+      graphify updated (26334 nodes / 54695 edges / 1216 communities)
 
 ## Driver notes (Fable)
 
 - Samples double as integration tests and marketing shots — make them GOOD parts
   (use describe_part + check_feature_overlap to self-review; the ai-cad MCP guide's
   own loop). Every sample uses standard parts where possible (Pillar 17 dogfood).
+
+## Progress log
+- 2026-07-03 00:42 UTC [sonnet-lark] REVIEW T-Q3 branch=task/T-Q3-prod @ 508e517 — sample gallery + guided tours.
+
+Three real engine-built samples, all built via core_bridge (doc_new+doc_apply_ops+cam_program), not hand-authored:
+- samples/mech_part/: Mounting Bracket (Al 6061, bolt_circle holes, fillets, 88k mm³), headless thumbnail rendered
+- samples/cam_job/: Enclosure Lid + GRBL CAM (3 ops: face/contour2d/drill, 0 gouges, 2.1min cycle), lid_cam.json summary
+- samples/structural_frame/: Portal Frame (rect_tube weld_member, 3 bodies, mitre joints, 204k mm³), headless thumbnail
+
+Deliverables:
+- samples/index.json with 3 entries (title/discipline/doc_kind/what_it_teaches/thumbnail)
+- samples/test_regen.py: 13/13 pytest PASS (regen + feature-tree-clean + file-present asserts)
+- samples/tours/bracket_tour.py: 9/9 tour steps headless PASS (cam step: 3 ops, 351 G-code lines, 0 gouges)
+- samples/tours/test_tour.py: 2/2 PASS; 15/15 total
+
+Scope question: work/questions/T-Q3.md — GUI gallery panel + first_run wiring flagged as T-U-later per task DoD; data-only deliverable implemented per task file.
+
+Gate: check.py FAIL-RECORDED (pre-existing ribbon/parity gaps). graphify update: 26334 nodes/54695 edges/1216 communities.

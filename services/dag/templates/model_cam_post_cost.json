@@ -1,0 +1,87 @@
+{
+  "schema": "aicad.dag/1",
+  "id": "tmpl-model-cam-post-cost",
+  "name": "Model → CAM → Post → Cost",
+  "nodes": [
+    {
+      "id": "n_model",
+      "type": "design",
+      "name": "Model part for machining",
+      "inputs": {
+        "request": "Model the part with machining-ready geometry. Apply draft angles and avoid undercuts.",
+        "tools": ["cad_guide", "new_part", "add_features", "render_part",
+                  "check_feature_overlap", "dfm_check"]
+      },
+      "tools": ["cad_guide", "new_part", "add_features", "render_part",
+                "check_feature_overlap", "dfm_check"],
+      "end_condition": "Part modelled, rendered, and DFM check passes.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_cam",
+      "type": "design",
+      "name": "Set up CAM job and toolpaths",
+      "inputs": {
+        "request": "Create a CAM job, set stock, add operations, and generate toolpaths.",
+        "tools": ["cam_new_job", "cam_set_stock", "cam_add_setup", "cam_add_tool",
+                  "cam_add_operation", "cam_generate", "cam_simulate", "describe_toolpaths"]
+      },
+      "tools": ["cam_new_job", "cam_set_stock", "cam_add_setup", "cam_add_tool",
+                "cam_add_operation", "cam_generate", "cam_simulate", "describe_toolpaths"],
+      "end_condition": "Toolpaths generated and simulation shows zero gouges.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    },
+    {
+      "id": "n_post",
+      "type": "design",
+      "name": "Post-process G-code",
+      "inputs": {
+        "request": "Post-process the CAM job to produce G-code for the target machine.",
+        "tools": ["cam_post", "cam_post_dialects", "cam_setup_sheet"]
+      },
+      "tools": ["cam_post", "cam_post_dialects", "cam_setup_sheet"],
+      "end_condition": "G-code posted successfully and setup sheet generated.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    },
+    {
+      "id": "n_cost",
+      "type": "verify",
+      "name": "Budget check",
+      "inputs": {
+        "check_type": "budget"
+      },
+      "tools": null,
+      "end_condition": "BOM price resolves successfully (ok=true).",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_cam_fix",
+      "type": "design",
+      "name": "Revise CAM for cost targets",
+      "inputs": {
+        "request": "Revise toolpaths or operations to reduce cycle time and meet cost targets.",
+        "tools": ["cam_update_operation", "cam_generate", "cam_simulate", "cam_cost_estimate"]
+      },
+      "tools": ["cam_update_operation", "cam_generate", "cam_simulate", "cam_cost_estimate"],
+      "end_condition": "CAM revised and regenerated without errors.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    }
+  ],
+  "edges": [
+    {"from": "n_model",   "to": "n_cam"},
+    {"from": "n_cam",     "to": "n_post"},
+    {"from": "n_post",    "to": "n_cost"},
+    {"from": "n_cost",    "to": "n_cam_fix"},
+    {"from": "n_cam_fix", "to": "n_cost",   "retry_budget": 2}
+  ]
+}

@@ -146,7 +146,46 @@ ojson clarify(const std::string& request, const ojson& doc, const std::string& d
 
     // ready = explicit truthy `ready`, OR there are no questions to ask.
     bool ready = (parsed.contains("ready") && truthy(parsed["ready"])) || questions.empty();
-    return ojson{{"ready", ready}, {"questions", questions}, {"assumptions", assumptions}};
+
+    // T-F4: additive aicad.interaction/1 mirror (contracts/interaction.md §1, §3).
+    // Emits the same questions reshaped as interaction/1 "dimension"/"text" questions
+    // alongside the legacy {key, ask, unit, suggested} fields — existing callers
+    // (drawClarifyCard, ClarifyState) are unaffected; new callers use "interaction".
+    // The batch is non-blocking with suggested defaults, capped at 4 (the proven cap).
+    ojson interaction_questions = ojson::array();
+    for (const auto& q : questions) {
+        std::string key = q.contains("key") ? q["key"].get<std::string>() : "";
+        std::string ask = q.contains("ask") ? q["ask"].get<std::string>() : "";
+        std::string unit = q.contains("unit") ? q["unit"].get<std::string>() : "";
+        std::string suggested_str = q.contains("suggested") ? q["suggested"].get<std::string>() : "";
+        // Decide kind: non-empty unit → dimension, else → text.
+        std::string kind = (!unit.empty()) ? "dimension" : "text";
+        ojson iq = ojson::object();
+        iq["id"]      = key.empty() ? ask.substr(0, 32) : key;  // stable ledger key
+        iq["kind"]    = kind;
+        iq["prompt"]  = ask;
+        iq["required"] = false;
+        if (kind == "dimension") {
+            iq["family"]   = "length";  // default; angle/count not in clarify vocab
+            iq["suggested"] = ojson{{"value", 0.0}, {"unit", unit}};
+            // If suggested_str parses as a number, embed it.
+            try { iq["suggested"]["value"] = std::stod(suggested_str); }
+            catch (...) {}
+        } else {
+            iq["suggested"] = suggested_str;
+        }
+        interaction_questions.push_back(iq);
+    }
+    // batch_id is omitted (no uuid on the C++ side); callers may add one.
+    ojson interaction = ojson{
+        {"schema",    "aicad.interaction/1"},
+        {"scope",     "run"},
+        {"blocking",  false},   // clarify is non-blocking — suggested defaults apply
+        {"questions", interaction_questions},
+    };
+
+    return ojson{{"ready", ready}, {"questions", questions},
+                 {"assumptions", assumptions}, {"interaction", interaction}};
 }
 
 }  // namespace agent

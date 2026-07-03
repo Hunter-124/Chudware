@@ -2,8 +2,8 @@
 id: T-A4
 title: Verify nodes and DAG MCP tools
 workstream: A
-owner: Bruh
-status: todo
+owner: sonnet-hollis
+status: done
 branch: task/T-A4-verify-nodes-mcp
 day: 4
 priority: 3
@@ -57,3 +57,15 @@ Verify nodes run deterministic checks as end conditions: `check_interference` (m
   the existing registration pattern (hydraulic_tools.py / cost_tools.py are recent
   exemplars). dag_approve resumes T-A3 gates — it is the MCP twin of resume(run_id,
   decision); keep one implementation.
+
+## Progress log
+- 2026-07-02 23:51 UTC [sonnet-hollis] REVIEW: branch task/T-A4-verify-nodes-mcp pushed.
+
+What landed:
+- services/dag/verify.py: deterministic verify node runner dispatching 6 check types (interference/erc/drc/firmware/dc_ratio/budget) to real MCP tools via battery._get_fn singleton. DISPATCH_TABLE is public API for T-F12 reuse. Fail-closed: backend_unavailable/tool_error/predicate_error → ESCALATE; check_failed → RETRY/ESCALATE by budget. Never auto-pass.
+- services/dag/mcp_tools.py: dag_plan/dag_run/dag_status/dag_approve/dag_abort handlers. dag_approve = executor.resume(decision="approve") — ONE implementation. dag_status is restart-safe from .graph.json sidecar.
+- services/dag/graph_loader.py: verify nodes WITH check_type routed to vr.run(); WITHOUT check_type fall through to node_runner (agent path, backward compat).
+- services/mcp/server.py: append-only registration of register_dag_tools(mcp).
+- Tests: 125 passed, 1 skipped (real engine, AI_CAD_LIBAICAD gate). Gate: PASS.
+
+[~] bom_price/fw_sim_run/struct_check degrade to ESCALATE if WS-B/C/D not merged (mocked in tests per driver rules).

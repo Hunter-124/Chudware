@@ -40,7 +40,13 @@ bool dirExists(const std::string& p) {
     DWORD a = GetFileAttributesA(p.c_str());
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
+}  // namespace
+
+// Exported (bootstrap.h) so callers outside this file (e.g. a first-run consent dialog) can
+// locate %APPDATA%/AI-CAD/config.json the same way the runtime provisioner does.
 std::string appdataRoot() { return env_or("APPDATA", "") + "\\AI-CAD"; }
+
+namespace {
 
 std::string runCapture(const std::string& cmd) {
     std::string out;
@@ -310,7 +316,11 @@ std::string shq(const std::string& s) {
     o += "'";
     return o;
 }
-// XDG data root for the managed runtime/cache (mirrors %APPDATA%\AI-CAD on Windows).
+}  // namespace
+
+// XDG data root for the managed runtime/cache (mirrors %APPDATA%\AI-CAD on Windows). Exported
+// (bootstrap.h) so callers outside this file (e.g. a first-run consent dialog) can locate
+// $XDG_DATA_HOME/AI-CAD/config.json the same way the runtime provisioner does.
 std::string appdataRoot() {
     std::string xdg = env_or("XDG_DATA_HOME", "");
     if (!xdg.empty()) return (fs::path(xdg) / "AI-CAD").string();
@@ -318,6 +328,9 @@ std::string appdataRoot() {
     if (!home.empty()) return (fs::path(home) / ".local" / "share" / "AI-CAD").string();
     return "AI-CAD";
 }
+
+namespace {
+
 std::string runCapture(const std::string& cmd) {
     std::string out;
     FILE* p = popen(cmd.c_str(), "r");

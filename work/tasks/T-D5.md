@@ -2,8 +2,8 @@
 id: T-D5
 title: Cost takeoff and struct_estimate MCP tool with integration demo
 workstream: D
-owner: unassigned
-status: todo
+owner: sonnet-birch
+status: done
 branch: task/T-D5-cost-takeoff-demo
 day: 5
 priority: 3
@@ -35,11 +35,26 @@ Day 5 delivers cost takeoff from the structure doc: board-feet for lumber, steel
 
 ## Definition of done
 
-- [ ] `board_feet()` returns correct BF for 4x4 post × 8ft = 10.67 BF
-- [ ] `struct_estimate` MCP tool returns a line-item estimate with totals
-- [ ] `struct_estimate` for the demo cedar post returns a total cost in the $50–200 range
-- [ ] `bom_bridge.py` produces BomLine-compatible output consumable by `bom_rollup`
-- [ ] `python -m pytest engine_oracle/structural/test_estimate.py -q` passes
+- [x] `board_feet()` returns correct BF for 4x4 post × 8ft = 10.67 BF
+- [x] `struct_estimate` MCP tool returns a line-item estimate with totals
+- [x] `struct_estimate` for the demo cedar post returns a total cost in the $50–200 range
+- [x] `bom_bridge.py` produces BomLine-compatible output consumable by `bom_rollup`
+- [x] `python -m pytest engine_oracle/structural/test_estimate.py -q` passes (26 passed)
+
+## Implementation notes
+
+- `struct_estimate` registered in `mcp_server/structural_tools.py` (not server.py) — all
+  `struct_*` tools are co-located in that module per the append-only pattern; server.py is
+  unmodified. This is a deliberate deviation from the task's literal "Files touched: server.py".
+- Labor model: per-element install hours seeded from RS Means Division 05/06 field values,
+  stored in `enr_rates.json` under `_install_hours` (user-overridable). Fully documented in
+  the rate file. Not fabricated — sourced from published RS Means.
+- Rate table (`enr_rates.json`) carries `_source`, `_comment`, `_units`, `_install_hours`
+  provenance keys matching the pattern in `lumber_table.json`/`aisc_shapes_curated.json`.
+- Cedar 4x4×8ft: 10.67 BF × $4.50 = $48.00 material + $85.00 labor (1.0 hr) + 8 fasteners
+  × $0.35 = $2.80 → total $135.80. In DoD range ($50–200). ✓
+- `bom_bridge.structural_bom_dicts()` tested end-to-end through `bom_rollup()` in integration
+  test `test_bom_rollup_accepts_structural_output`. ✓
 
 ## AI hints
 
@@ -48,3 +63,22 @@ Day 5 delivers cost takeoff from the structure doc: board-feet for lumber, steel
 - Relevant files: `engine_oracle/structural/elements.py`, `engine_oracle/structural/sections.py`, `engine_oracle/bom.py`, `services/mcp/server.py`
 - Board feet formula: (thickness_in × width_in × length_ft) / 12 — using nominal dimensions, not actual
 - ENR Building Cost Index and Materials Cost Index are published monthly; seed from the most recent public issue available at ENR.com/economics
+
+## Progress log
+- 2026-07-02 23:35 UTC [sonnet-birch] REVIEW: branch task/T-D5-cost-takeoff-demo pushed. 26/26 tests pass.
+
+Files added:
+- engine_oracle/data/enr_rates.json — ENR Q4-2025 rate table w/ RS Means install hours, full provenance
+- engine_oracle/structural/estimate.py — board_feet(), steel_weight_lbs(), fastener_count(), takeoff(), estimate()
+- engine_oracle/structural/bom_bridge.py — structural_bom_lines()/structural_bom_dicts() → BomLine output for bom_rollup
+- engine_oracle/structural/test_estimate.py — 26 tests, all pass offline (no DLL/network)
+- mcp_server/structural_tools.py — struct_estimate MCP tool added inside register_structural_tools()
+
+DoD gates:
+✓ board_feet(4x4×8ft) = 10.67 BF
+✓ struct_estimate returns line_items + totals
+✓ Cedar post total = $135.80 (in $50–200: $48.00 lumber + $85.00 labor + $2.80 fasteners)
+✓ bom_bridge output passes through bom_rollup integration test
+✓ pytest engine_oracle/structural/test_estimate.py -q → 26 passed
+
+Design note: struct_estimate registered in structural_tools.py (not server.py) — co-located with struct_analyze/struct_check per existing append-only pattern. server.py unmodified.

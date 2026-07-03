@@ -17,6 +17,8 @@
 #include "app/app_state.h"
 #include "theme/theme.h"
 #include "cpp_core.h"
+#include "bootstrap.h"
+#include "ui/first_run.h"
 #include <platform/paths.h>
 
 namespace ui {
@@ -570,6 +572,28 @@ void drawSettingsModal(app::AppState& st, bool busy) {
                     ImGui::SameLine();
                     if (ImGui::Button("Clear (use built-in)"))
                         std::fill(s_spBuf.begin(), s_spBuf.end(), 0);
+
+                    ImGui::Dummy(ImVec2(0, 8 * sc));
+                    ImGui::SeparatorText("Privacy");
+                    {
+                        int consent = ui::currentConsentIndex();
+                        bool changed = false;
+                        for (int i = 0; i < 3; ++i)
+                            changed |= ImGui::RadioButton(ui::consentLabel(i), &consent, i);
+                        if (changed) ui::setConsentIndex(consent);
+                    }
+
+                    ImGui::Dummy(ImVec2(0, 8 * sc));
+                    ImGui::SeparatorText("Runtime");
+                    const bool ready = runtimeReady();
+                    ImGui::TextColored(ready ? TVEC(good) : TVEC(warn),
+                                       "%s", ready ? "Runtime ready" : "Runtime not installed");
+                    const bool repairing = ui::runtimeRepairInProgress();
+                    if (repairing) ImGui::BeginDisabled();
+                    if (ImGui::Button(ready ? "Repair Runtime" : "Set Up Runtime"))
+                        ui::triggerRuntimeRepair(true);
+                    if (repairing) { ImGui::EndDisabled(); ImGui::SameLine(); ImGui::TextDisabled("working..."); }
+
                     ImGui::EndTabItem();
                 }
                 if (ImGui::BeginTabItem("Experimental", nullptr,

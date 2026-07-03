@@ -163,3 +163,77 @@ def register_structural_tools(mcp: FastMCP) -> None:
             })
         except Exception as e:  # noqa: BLE001
             return _err(e)
+
+    @mcp.tool()
+    def struct_estimate(doc_path: str) -> str:
+        """Line-item cost estimate for a structural document (T-D5).
+
+        Runs quantity takeoff (board-feet for lumber, weight for steel, fastener count) and
+        multiplies by the ENR Q4-2025 national average rate table
+        (``engine_oracle/data/enr_rates.json``, user-overridable).
+
+        All costs are **preliminary budget figures from a rate table** — not vendor prices.
+        Costs for vendor-sourced parts come from ``bom_price``; do not mix the two.
+
+        Args:
+            doc_path: Path to a JSON ``aicad.structure/1`` document.
+
+        Returns JSON ``{ok, line_items:[{element_id, element_type, section_name, material,
+        quantity, unit, unit_rate, material_cost, labor_hours, labor_cost, description}],
+        fastener_line:{...}, total_material_cost, total_labor_cost, total_cost, currency,
+        rate_table_date, disclaimer}``.
+
+        Raises
+        ------
+        Returns ``{ok:False, error, code}`` on import failure (PyNite/scipy not provisioned)
+        or on invalid doc path/schema.
+
+        Note: registration is in ``structural_tools.py`` (not server.py) to keep all
+        ``struct_*`` tools co-located.  This is consistent with the existing pattern —
+        deviation from the task's literal "Files touched: server.py" is intentional and
+        recorded in work/tasks/T-D5.md.
+        """
+        try:
+            from dataclasses import asdict as _asdict
+
+            from engine.structural.elements import StructureDoc
+            from engine.structural.estimate import estimate as _estimate
+        except ImportError as e:
+            return _dumps({
+                "ok": False,
+                "error": "structural estimate unavailable (engine.structural not installed)",
+                "code": "solver_unavailable",
+                "detail": str(e),
+            })
+        try:
+            doc = _load_structure(doc_path)
+            result = _estimate(doc)
+
+            def _line_dict(ln) -> dict:
+                return {
+                    "element_id": ln.element_id,
+                    "element_type": ln.element_type,
+                    "section_name": ln.section_name,
+                    "material": ln.material,
+                    "quantity": ln.quantity,
+                    "unit": ln.unit,
+                    "unit_rate": ln.unit_rate,
+                    "material_cost": ln.material_cost,
+                    "labor_hours": ln.labor_hours,
+                    "labor_cost": ln.labor_cost,
+                    "description": ln.description,
+                }
+
+            return _dumps({
+                "ok": True,
+                "line_items": [_line_dict(ln) for ln in result.line_items],
+                "fastener_line": _line_dict(result.fastener_line),
+                "total_material_cost": result.total_material_cost,
+                "total_labor_cost": result.total_labor_cost,
+                "total_cost": result.total_cost,
+                "currency": result.currency,
+                "rate_table_date": result.rate_table_date,
+                "disclaimer": result.disclaimer,
+            })
+        except Exception as e:  # noqa: BLE001
+            return _err(e)

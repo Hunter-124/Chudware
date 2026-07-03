@@ -13,6 +13,7 @@
 #include "ui/bom_panel.h"
 #include "ui/requirements_panel.h"   // T-U5
 #include "ui/transparency_panel.h"   // T-U8
+#include "ui/sim_panel.h"                       // T-U6: sim studies (AI_CAD_SHOT=sim_studies)
 #include "artifact_view.h"
 #include "app/app_state.h"
 #include "viewport/scene.h"
@@ -229,6 +230,7 @@ int ShotConfig::captureFrameBudget() const {
     if (wantBom && !bomShotDone) return 150;
     if (wantRequirements && !requirementsShotDone) return 150;  // T-U5
     if (wantTransparency && !transparencyShotDone) return 150;  // T-U8
+    if (wantSimStudies && !simStudiesShotDone) return 150;
     if (wantTree) return treeShotDone ? 10 : 30;
     if (wantEquations) return equationsShotDone ? 10 : 30;
     if (wantPartsBrowser) return partsBrowserShotDone ? 10 : 30;
@@ -278,6 +280,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantBom          = eq("bom");
     cfg.wantRequirements = eq("requirements");   // T-U5
     cfg.wantTransparency = eq("transparency");   // T-U8
+    cfg.wantSimStudies   = eq("sim_studies");   // T-U6
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
@@ -327,6 +330,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantBom)          ui::openBomPanel();
     if (cfg.wantRequirements) ui::openRequirementsPanel();  // T-U5
     if (cfg.wantTransparency) ui::openTransparencyPanel();  // T-U8
+    if (cfg.wantSimStudies)   ui::openSimStudiesPanel();  // T-U6
     if (cfg.wantPick) setupPickShot(st);
     if (cfg.wantGlassperf) setupPickShot(st);
 
@@ -717,6 +721,49 @@ void ScenarioRunner::tickGlassperf(ShotConfig& cfg, app::AppState& st) {
 
 void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
     tickSimpleShots(cfg, st);
+
+    // ---------- sim_studies (T-U6) — no worker needed; fixture seeds directly ----------
+    // Runs unconditionally (not gated on workerStarted) so the panel populates on frame 1.
+    // The panel auto-reloads via AsyncRpc when a real doc is opened later.
+    if (cfg.wantSimStudies && !cfg.simStudiesShotDone) {
+        cfg.simStudiesShotDone = true;
+        const std::string fixture = R"json({
+            "ok": true,
+            "studies": [
+                {
+                    "id": "fix_fea_1",
+                    "type": "fea_static",
+                    "name": "Static stress (steel)",
+                    "engine": "cpp",
+                    "material": {"name": "steel", "yield_mpa": 250.0},
+                    "mesh_fineness": 0.5,
+                    "n_dof": 18432,
+                    "results": {
+                        "max_von_mises_mpa": 73.4,
+                        "max_disp_mm": 0.127,
+                        "min_fos": 3.41
+                    }
+                },
+                {
+                    "id": "fix_cfd_1",
+                    "type": "cfd_flow",
+                    "name": "CFD wind tunnel (air, 10 m/s, aoa 0)",
+                    "engine": "cpp-lbm",
+                    "params": {"velocity": 10.0, "aoa": 0.0, "fluid": "air"},
+                    "results": {
+                        "drag_n": 0.214,
+                        "lift_n": 0.003,
+                        "cd": 1.872,
+                        "reynolds": 68000.0,
+                        "converged": true
+                    }
+                }
+            ]
+        })json";
+        ui::seedSimStudiesPanelFromJson(fixture);
+        std::printf("sim_studies: fixture seeded\n");
+        std::fflush(stdout);
+    }
 
     // ---------- preview (T-F16) ----------
     // Re-arm the Preview dock-tab focus every frame: the window is created on frame 1 and only

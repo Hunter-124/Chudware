@@ -16,6 +16,7 @@
 #include "ui/bom_panel.h"
 #include "ui/requirements_panel.h"  // T-U5 requirements & verification panel
 #include "ui/transparency_panel.h"  // T-U8 model & telemetry transparency panel
+#include "ui/sim_panel.h"                       // T-U6 simulation studies
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -277,6 +278,22 @@ void Application::frame() {
                                  ImGuiCond_Appearing);
         if (ImGui::Begin("Model & Telemetry###transparency", ui::transparencyPanelOpen(), pflags))
             ui::drawTransparencyPanel(s);
+        ImGui::End();
+    }
+
+    // T-U6 Simulation Studies panel — closable, screenshot-verifiable via AI_CAD_SHOT=sim_studies.
+    // Floats centered on first open. Shows FEA/CFD study list with honest solver caveats
+    // (Cd uncalibrated for LBM per SIM_AUDIT.md; convergence note for FEA).
+    // Zero footprint while closed.
+    if (*ui::simStudiesPanelOpen()) {
+        const ImGuiViewport* vp3 = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vp3->WorkPos.x + vp3->WorkSize.x * 0.5f,
+                                       vp3->WorkPos.y + vp3->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(560.f * theme::S(), 520.f * theme::S()),
+                                 ImGuiCond_Appearing);
+        if (ImGui::Begin("Simulation Studies###sim_studies", ui::simStudiesPanelOpen(), pflags))
+            ui::drawSimStudiesPanel(s);
         ImGui::End();
     }
 

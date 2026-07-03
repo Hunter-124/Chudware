@@ -99,6 +99,16 @@ agent-facing workflow, tool, prompt, or context pack MUST, in the same branch:
 Tracked as a DoD convention; T-BL26 audits the current drift and adds a
 consistency check so this stays true mechanically.
 
+## 6b. Derived-asset honesty (DoD convention, Hunter 2026-07-03)
+
+Screenshot-derived icons must show REAL engine output, never a stylized stand-in.
+In particular **CAM / Manufacture icons must render the real `cam_simulate` toolpath
+over the stock** — so each CAM icon doubles as a smoke check that the op chain
+(`cam_new_job` → `cam_add_tool` → `cam_add_operation` → `cam_simulate`) actually
+produces a valid toolpath. If an op won't produce a renderable toolpath, that is a
+**CAM bug to FILE (issue + backlog task), never an icon to skip or fake.** Tracked in
+T-BL29 (Manufacture group) and carried forward by T-BL34 (color + annotate the toolpath).
+
 ## 7. Command crib sheet
 
 ```

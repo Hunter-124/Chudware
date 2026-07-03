@@ -45,6 +45,11 @@ per-face overlay). T-BL34 turns that from an open question into scoped work.
       renderThumbnail path is where this hooks; design the per-face overlay first).
 - [ ] Operation-intent annotation overlay composited onto each tile (arrow/highlight/
       direction/before-after cue appropriate to the op family).
+- [ ] **CAM/Manufacture tiles show the real toolpath** (Hunter directive) — v1 (T-BL29)
+      establishes rendering the `cam_simulate` toolpath as the tile + CAM smoke check; v2
+      keeps the toolpath visible and annotates it (cut direction, entry, stock-vs-cut) so
+      the tile reads as "this is the machining move." Never replace the real toolpath with
+      a stylized glyph — the render must stay a genuine engine output.
 - [ ] Applied across the icon groups (coordinate with T-BL29's group list so nothing is
       missed — see "continuation" note below).
 - [ ] Atlases regenerated via the pipeline (DERIVED — never hand-edit PNGs). Contact

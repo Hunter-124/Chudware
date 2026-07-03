@@ -115,7 +115,7 @@
     "pct": 63.3
   },
   "libaicad": "/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libaicad.so",
-  "generated": "2026-07-03T17:23:21Z",
+  "generated": "2026-07-03T17:39:35Z",
   "results": [
     {
       "id": "box",
@@ -157,7 +157,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 1.2489070892333984
+      "elapsed": 0.7562549114227295
     },
     {
       "id": "cylinder",
@@ -199,7 +199,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.027126789093017578
+      "elapsed": 0.019498109817504883
     },
     {
       "id": "sphere",
@@ -247,7 +247,7 @@
           "text": "2 tiny edge(s) shorter than 0.01 mm"
         }
       ],
-      "elapsed": 0.1646134853363037
+      "elapsed": 0.09016942977905273
     },
     {
       "id": "cone",
@@ -289,7 +289,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.07248663902282715
+      "elapsed": 0.029676437377929688
     },
     {
       "id": "torus",
@@ -331,7 +331,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.3878788948059082
+      "elapsed": 0.27691030502319336
     },
     {
       "id": "extrude_boss",
@@ -374,7 +374,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.016175270080566406
+      "elapsed": 0.018607616424560547
     },
     {
       "id": "extrude_cut",
@@ -417,7 +417,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.05551004409790039
+      "elapsed": 0.06439518928527832
     },
     {
       "id": "revolve",
@@ -466,7 +466,7 @@
           "text": "2 tiny edge(s) shorter than 0.01 mm"
         }
       ],
-      "elapsed": 1.126218318939209
+      "elapsed": 0.961026668548584
     },
     {
       "id": "loft",
@@ -509,7 +509,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.17200016975402832
+      "elapsed": 0.16260790824890137
     },
     {
       "id": "sweep",
@@ -552,7 +552,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.04614973068237305
+      "elapsed": 0.04077458381652832
     },
     {
       "id": "helix_spring",
@@ -596,7 +596,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 2.1889865398406982
+      "elapsed": 2.1925296783447266
     },
     {
       "id": "fillet",
@@ -644,7 +644,7 @@
           "text": "8 tiny edge(s) shorter than 0.01 mm"
         }
       ],
-      "elapsed": 0.2918405532836914
+      "elapsed": 0.11007308959960938
     },
     {
       "id": "chamfer",
@@ -686,7 +686,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.1519465446472168
+      "elapsed": 0.07341361045837402
     },
     {
       "id": "shell",
@@ -728,7 +728,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.09357213973999023
+      "elapsed": 0.05663466453552246
     },
     {
       "id": "draft",
@@ -770,7 +770,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.04786992073059082
+      "elapsed": 0.02874016761779785
     },
     {
       "id": "rib",
@@ -813,7 +813,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.22324514389038086
+      "elapsed": 0.1602611541748047
     },
     {
       "id": "split",
@@ -855,7 +855,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.057280540466308594
+      "elapsed": 0.05786013603210449
     },
     {
       "id": "boolean_fuse",
@@ -897,7 +897,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.11827588081359863
+      "elapsed": 0.07543635368347168
     },
     {
       "id": "boolean_cut",
@@ -939,7 +939,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.11196136474609375
+      "elapsed": 0.05323147773742676
     },
     {
       "id": "hole_simple",
@@ -981,7 +981,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.09646892547607422
+      "elapsed": 0.044016361236572266
     },
     {
       "id": "hole_cbore",
@@ -1023,7 +1023,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.14063382148742676
+      "elapsed": 0.07525849342346191
     },
     {
       "id": "bolt_circle",
@@ -1065,7 +1065,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.6188740730285645
+      "elapsed": 0.24085354804992676
     },
     {
       "id": "linear_pattern",
@@ -1104,7 +1104,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.14697051048278809
+      "elapsed": 0.0845181941986084
     },
     {
       "id": "circular_pattern",
@@ -1143,7 +1143,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.3238959312438965
+      "elapsed": 0.13783597946166992
     },
     {
       "id": "mirror",
@@ -1154,7 +1154,7 @@
         "extrude",
         "mirror"
       ],
-      "note": "",
+      "note": "mirrored boss; asserts check_feature_overlap finds no bad pairs (has teeth)",
       "executed": true,
       "verdict": "PASS",
       "volume": 20205.30964914873,
@@ -1177,12 +1177,17 @@
           "name": "manifold",
           "ok": true,
           "detail": "manifold=True want=True"
+        },
+        {
+          "name": "overlap",
+          "ok": true,
+          "detail": "overlap_clean=True want=True"
         }
       ],
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.20208430290222168
+      "elapsed": 0.06520318984985352
     },
     {
       "id": "transform_move",
@@ -1224,7 +1229,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.023047208786010742
+      "elapsed": 0.01051783561706543
     },
     {
       "id": "transform_copy",
@@ -1266,7 +1271,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.024722576141357422
+      "elapsed": 0.012488842010498047
     },
     {
       "id": "sm_base_flange",
@@ -1308,7 +1313,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.026038169860839844
+      "elapsed": 0.012637615203857422
     },
     {
       "id": "sm_edge_flange",
@@ -1351,7 +1356,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.4194364547729492
+      "elapsed": 0.15984368324279785
     },
     {
       "id": "weld_member",
@@ -1394,7 +1399,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.07082462310791016
+      "elapsed": 0.02077937126159668
     },
     {
       "id": "surf_thicken",
@@ -1438,7 +1443,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.05056285858154297
+      "elapsed": 0.016970396041870117
     },
     {
       "id": "thread",
@@ -1481,7 +1486,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 15.32770824432373
+      "elapsed": 8.043771505355835
     },
     {
       "id": "text_engrave",
@@ -1523,7 +1528,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 1.6147115230560303
+      "elapsed": 0.5801680088043213
     },
     {
       "id": "fillet_then_shell",
@@ -1566,7 +1571,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.11562013626098633
+      "elapsed": 0.08592963218688965
     },
     {
       "id": "shell_then_fillet",
@@ -1609,7 +1614,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.10858368873596191
+      "elapsed": 0.09165167808532715
     },
     {
       "id": "draft_then_shell",
@@ -1652,7 +1657,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.04059553146362305
+      "elapsed": 0.031734466552734375
     },
     {
       "id": "hole_then_chamfer",
@@ -1695,7 +1700,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.06624746322631836
+      "elapsed": 0.048775434494018555
     },
     {
       "id": "pattern_of_hole",
@@ -1733,7 +1738,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.14072036743164062
+      "elapsed": 0.10394930839538574
     },
     {
       "id": "pattern_of_cut",
@@ -1777,7 +1782,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.20111918449401855
+      "elapsed": 0.10510087013244629
     },
     {
       "id": "mirror_of_cut",
@@ -1821,7 +1826,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.10018587112426758
+      "elapsed": 0.07668614387512207
     },
     {
       "id": "boolean_then_fillet",
@@ -1859,7 +1864,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.3690028190612793
+      "elapsed": 0.1460590362548828
     },
     {
       "id": "revolve_then_shell",
@@ -1897,7 +1902,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.04725933074951172
+      "elapsed": 0.0328669548034668
     },
     {
       "id": "bolt_circle_then_shell",
@@ -1935,7 +1940,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.5029816627502441
+      "elapsed": 0.24262118339538574
     },
     {
       "id": "recipe_mount_bracket",
@@ -1981,7 +1986,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.40020322799682617
+      "elapsed": 0.30827927589416504
     },
     {
       "id": "recipe_pulley",
@@ -2026,7 +2031,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.24057936668395996
+      "elapsed": 0.18680930137634277
     },
     {
       "id": "recipe_enclosure",
@@ -2071,7 +2076,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.2249584197998047
+      "elapsed": 0.15053033828735352
     },
     {
       "id": "nc_cut_misses_body",
@@ -2098,7 +2103,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.02289104461669922
+      "elapsed": 0.007210969924926758
     },
     {
       "id": "nc_open_surface_nonmanifold",
@@ -2136,7 +2141,7 @@
           "text": "4 free edge(s) detected (open shell)"
         }
       ],
-      "elapsed": 0.015271663665771484
+      "elapsed": 0.00541234016418457
     },
     {
       "id": "nc_pattern_of_explicit_boolean",
@@ -2164,7 +2169,7 @@
       "reason": "all expectations met",
       "xfail": null,
       "issues": [],
-      "elapsed": 0.05187225341796875
+      "elapsed": 0.01522970199584961
     },
     {
       "id": "nc_disjoint_fuse",
@@ -2191,7 +2196,7 @@
       "reason": "rebuild: rebuild=True want=False",
       "xfail": "GH#disjoint-fuse",
       "issues": [],
-      "elapsed": 0.09401416778564453
+      "elapsed": 0.02578878402709961
     }
   ]
 }

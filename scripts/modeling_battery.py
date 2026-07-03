@@ -254,7 +254,9 @@ add("circular_pattern", "pattern", "single",
 add("mirror", "pattern", "single", ("sketch", "extrude", "mirror"), seed_plate(),
     [*boss_on_top(0), feat("mirror", "Mr", {},
                            {"plane": {"kind": "datum", "feature": "plane.right"},
-                            "features": ["$2"]})], expect_vol=">")
+                            "features": ["$2"]})], expect_vol=">",
+    expect_overlap_clean=True,
+    note="mirrored boss; asserts check_feature_overlap finds no bad pairs (has teeth)")
 # transform
 add("transform_move", "transform", "single", ("transform",), seed_box(),
     [feat("transform", "Mv", {"translate": [50, 0, 0]})],
@@ -801,7 +803,8 @@ class TestFull:
     def _run(self):
         import pytest
         try:
-            return run_battery(run_overlap=False)
+            # run_overlap=True so the expect_overlap_clean assertion is exercised in CI
+            return run_battery(run_overlap=True)
         except EngineUnavailable as e:
             pytest.skip(f"no live engine: {e}")
 

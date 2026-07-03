@@ -1,6 +1,6 @@
 # Modeling-Op Combination Battery — AI-CAD Feature Engine
 
-**Generated:** 2026-07-03T17:23:21Z  
+**Generated:** 2026-07-03T17:39:35Z  
 **Script:** `scripts/modeling_battery.py` (T-BL19)  
 **Engine:** `/home/hunter/Repositories/CAD/core/build-occt-linux/bin/libaicad.so`  
 **Method:** each case drives the real C++ feature engine via core_bridge (doc_new + doc_apply_ops) and asserts on live geometry (rebuild status, manifoldness, volume sign, body count).  
@@ -15,7 +15,7 @@
 | FAIL | 0 |
 | XFAIL (known bug) | 1 |
 | ERROR | 0 |
-| Elapsed | 28.8s |
+| Elapsed | 16.5s |
 
 ## Coverage
 

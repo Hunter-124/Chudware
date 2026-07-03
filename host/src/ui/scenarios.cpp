@@ -807,7 +807,11 @@ void ScenarioRunner::tick(AppState& st) {
             case 1: {
                 st.evaluateDialogs->handleCommand(st, "eval_mass_props");
                 std::printf("evalmass: mass properties window opened\n"); std::fflush(stdout);
-                ++evalStep; break;
+                // T-G14: the eval runs async on the dispatch thread; give it frames to drain so the
+                // result (mass/volume/CoM/inertia rows) populates before capture. Without this the
+                // window is captured while still "Computing" (or 1 frame after), so it never shows
+                // the auto-size-to-content behaviour the T-G14 fix restores.
+                evalSettle = 40; ++evalStep; break;
             }
             default:
                 st.evalMassShotDone = true;

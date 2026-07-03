@@ -29,10 +29,16 @@ from engine_oracle.requirements.requirements import VALID_STATUSES as _REQ_VALID
 # Derived from the canonical set so any schema rename propagates automatically.
 _WAIVED_STATUS: str = next(s for s in _REQ_VALID_STATUSES if s == "waived")
 
-# The "met" set: "verified" is the canonical passing status (from aicad.req/1);
-# "pass" and "ok" are legacy aliases accepted by this battery for interoperability.
-# They are NOT in VALID_STATUSES — do not replace the full tuple with it.
-_REQ_MET_STATUSES: tuple[str, ...] = ("pass", "verified", "ok")
+# The canonical "met" status from aicad.req/1 — derived so any ladder rename propagates.
+_VERIFIED_STATUS: str = next(s for s in _REQ_VALID_STATUSES if s == "verified")
+
+# The "met" set: canonical status + legacy aliases accepted for interoperability.
+# "pass" and "ok" are NOT in VALID_STATUSES; they are explicit aliases kept here so
+# older requirement documents don't silently fail.  The canonical anchor (_VERIFIED_STATUS)
+# is derived from the ladder — if the schema renames "verified", this tuple tracks it.
+# (T-BL23 DoD item 5, option (a).  Option (b) — drop aliases entirely — requires an
+# advisor ruling; see work/questions/T-BL23.md.)
+_REQ_MET_STATUSES: tuple[str, ...] = (_VERIFIED_STATUS, "pass", "ok")
 
 # ---------------------------------------------------------------------------
 # Check registry
@@ -126,20 +132,37 @@ def _cur_doc() -> str:
 # ---------------------------------------------------------------------------
 
 def _gap_is_manifold(doc_id: str = None, **_) -> str:
-    """Check: free_edges == 0 (manifold solid)."""
+    """Check: body is a closed manifold solid (no free-edge or error-severity issues).
+
+    Reads the ``issues`` list from eval_check (OCCT BRepCheck) rather than the bare
+    ``free_edges`` scalar, which eval_check never emits on its own (T-BL19 finding).
+    Non-manifold = any issue with kind=="free_edges" OR severity=="error".
+    tiny_edges warnings on curved seams/poles are cosmetic and do NOT fail manifold.
+    Falls back to ``free_edges`` scalar if the issues list is absent (forward-compat).
+    """
     from mcp_server import core_bridge as cb
     from mcp_server.core_bridge import CoreError
     d = doc_id or _cur_doc()
     try:
         r = cb.call("eval_check", {"doc_id": d})
-        fe = r.get("free_edges", 0)
+        iss = r.get("issues", [])
+        if iss:
+            # Primary path: inspect the structured issue list.
+            bad = [i for i in iss
+                   if i.get("kind") == "free_edges" or i.get("severity") == "error"]
+            ok = len(bad) == 0
+            fe_count = sum(1 for i in iss if i.get("kind") == "free_edges")
+        else:
+            # Fallback: scalar field (older engine / no issue list).
+            fe_count = r.get("free_edges", 0)
+            ok = fe_count == 0
         tiny = r.get("tiny_edges", 0)
-        ok = fe == 0
         return json.dumps({
             "ok": ok,
-            "free_edges": fe,
+            "free_edges": fe_count,
             "tiny_edges": tiny,
-            "summary": "manifold" if ok else f"{fe} free edge(s) — not watertight",
+            "issues": iss,
+            "summary": "manifold" if ok else f"{fe_count} free edge(s) — not watertight",
         })
     except CoreError as e:
         return json.dumps({"ok": False, "error": str(e)})
@@ -355,33 +378,45 @@ def _extract_score(check_name: str, reward_shape: str, result_json: str) -> tupl
 
     elif reward_shape == "scalar":
         score = 0.0  # default
-        found = False
-        for key in ("match_pct", "score", "min_fos", "cd", "max_von_mises_mpa",
-                    "coverage_ratio"):
-            if key in r:
-                val = r[key]
-                if key == "match_pct":
-                    score = min(float(val) / 100.0, 1.0)
-                elif key == "min_fos":
-                    score = min(float(val) / 2.0, 1.0)  # FoS 2+ → 1.0
-                elif key == "max_von_mises_mpa":
-                    score = 1.0 if r.get("ok", True) else 0.0
-                else:
-                    fval = float(val)
-                    if 0.0 <= fval <= 1.0:
-                        score = fval
-                    else:
-                        score = min(abs(fval) / 100.0, 1.0)
-                found = True
-                break
-        if not found:
-            score = 1.0 if r.get("ok", False) else 0.0
-        if not r.get("ok", True):
+
+        # CAM gouge pre-gate: any gouge is a hard fail regardless of machined_fraction.
+        # Must be checked BEFORE the key loop so a high machined_fraction never masks it.
+        gouges = r.get("gouges")
+        if gouges is not None and int(gouges) > 0:
+            score = 0.0
             findings.append({
                 "check": check_name,
                 "ok": False,
-                "detail": r.get("summary") or r.get("error") or "",
+                "detail": f"gouge(s) detected: {int(gouges)} (max_gouge_mm={r.get('max_gouge_mm', '?')})",
             })
+        else:
+            found = False
+            for key in ("match_pct", "score", "min_fos", "cd", "max_von_mises_mpa",
+                        "coverage_ratio", "machined_fraction"):
+                if key in r:
+                    val = r[key]
+                    if key == "match_pct":
+                        score = min(float(val) / 100.0, 1.0)
+                    elif key == "min_fos":
+                        score = min(float(val) / 2.0, 1.0)  # FoS 2+ → 1.0
+                    elif key == "max_von_mises_mpa":
+                        score = 1.0 if r.get("ok", True) else 0.0
+                    else:
+                        fval = float(val)
+                        if 0.0 <= fval <= 1.0:
+                            score = fval
+                        else:
+                            score = min(abs(fval) / 100.0, 1.0)
+                    found = True
+                    break
+            if not found:
+                score = 1.0 if r.get("ok", False) else 0.0
+            if not r.get("ok", True):
+                findings.append({
+                    "check": check_name,
+                    "ok": False,
+                    "detail": r.get("summary") or r.get("error") or "",
+                })
 
     else:  # "findings"
         items = (r.get("pairs") or r.get("faces_below_threshold") or

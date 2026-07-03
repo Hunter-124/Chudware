@@ -420,52 +420,49 @@ def draw_csys(d, cell, p):
 
 @icon("origin")
 def draw_origin(d, cell, p):
-    """Part origin: RGB stubs + faint default-plane corner at 0,0,0."""
+    """Part origin: three RGB axis arrows fanning from one point (T-G18 regen)."""
     s = cell * SS
-    lw = stroke_width(cell)
-    cx, cy = s/2, s/2
-    stub = s * 0.22
-    # faint corner of three default planes (distinct from ref_plane / ref_csys)
-    corner = [(cx - s*0.14, cy + s*0.10), (cx + s*0.06, cy - s*0.16), (cx + s*0.18, cy + s*0.04)]
-    d.polygon(corner, fill=_rgba(p.stroke, 22))
-    d.line(corner + [corner[0]], fill=_rgba(p.stroke, 90), width=max(1, lw//2))
-    arrow(d, cx, cy, cx + stub, cy, p.err, lw)           # +X
-    arrow(d, cx, cy, cx, cy - stub, p.ok, lw)            # +Y
-    arrow(d, cx, cy, cx - stub * 0.7, cy + stub * 0.7, p.accent, lw)  # +Z
-    filled_circle(d, cx, cy, s * 0.08, p.accent)
-    filled_circle(d, cx, cy, s * 0.04, p.stroke)
+    lw = int(stroke_width(cell) * 1.35)
+    ox, oy = s * 0.40, s * 0.60          # origin low-left so the axes read up/right
+    L = s * 0.34
+    RED, GRN, BLU = (229, 72, 72), (72, 190, 110), (86, 132, 240)
+    arrow(d, ox, oy, ox - L * 0.60, oy + L * 0.60, BLU, lw)   # +Z (iso, drawn first/behind)
+    arrow(d, ox, oy, ox + L, oy, RED, lw)                     # +X (right)
+    arrow(d, ox, oy, ox, oy - L, GRN, lw)                     # +Y (up)
+    filled_circle(d, ox, oy, s * 0.058, p.stroke)
+    filled_circle(d, ox, oy, s * 0.028, p.accent)
 
 @icon("equations")
 def draw_equations(d, cell, p):
-    """Parametric relation: Σ variable = expression."""
+    """Global variables / equations: a bold Σ with an equals sign (T-G18 regen)."""
     s = cell * SS
-    lw = stroke_width(cell)
-    # Sigma glyph (left)
-    d.arc([s*0.10, s*0.22, s*0.34, s*0.78], start=200, end=340, fill=p.accent, width=lw*2)
-    d.line([(s*0.14, s*0.50), (s*0.30, s*0.50)], fill=p.accent, width=lw)
-    # equals bars (center)
-    y1, y2 = s*0.44, s*0.56
-    d.line([(s*0.38, y1), (s*0.62, y1)], fill=p.stroke, width=lw*2)
-    d.line([(s*0.38, y2), (s*0.62, y2)], fill=p.stroke, width=lw*2)
-    # D1 / D2 dimension chips (right)
-    for i, y in enumerate([s*0.28, s*0.68]):
-        d.rounded_rectangle([s*0.66, y, s*0.88, y + s*0.14], radius=int(s*0.03),
-                             fill=_rgba(p.accent, 40 if i else 28), outline=p.accent,
-                             width=max(1, lw//2))
+    lw = int(stroke_width(cell) * 1.7)
+    # Bold sigma (zig-zag) on the left-center — deep middle vertex so it reads as Σ, not "["
+    top, bot = s * 0.24, s * 0.76
+    xr, xl = s * 0.50, s * 0.18
+    xm, ym = s * 0.44, s * 0.50
+    polyline(d, [(xr, top), (xl, top), (xm, ym), (xl, bot), (xr, bot)], p.accent, lw)
+    # Equals sign to the right (two even bars)
+    ex0, ex1 = s * 0.60, s * 0.82
+    d.line([(ex0, s * 0.42), (ex1, s * 0.42)], fill=p.stroke, width=lw)
+    d.line([(ex0, s * 0.58), (ex1, s * 0.58)], fill=p.stroke, width=lw)
 
 @icon("material")
 def draw_material(d, cell, p):
-    """Glossy material swatch sphere on a flat chip."""
+    """Glossy material swatch sphere (T-G18 regen; T-G15 screenshot preset icons supersede)."""
     s = cell * SS
     lw = stroke_width(cell)
-    d.rounded_rectangle([s*0.14, s*0.62, s*0.86, s*0.86], radius=int(s*0.04),
-                         fill=_rgba(p.stroke, 28), outline=p.stroke, width=lw)
-    cx, cy, r = s*0.50, s*0.42, s*0.28
-    filled_circle(d, cx, cy, r, _rgba(p.accent, 100))
+    cx, cy, r = s * 0.50, s * 0.50, s * 0.32
+    # NOTE: this pipeline's ImageDraw REPLACES pixels (no alpha blend), so translucent shapes
+    # must NOT be stacked — a later fill overwrites, it does not composite. Draw one solid body.
+    filled_circle(d, cx, cy, r, _rgba(p.accent, 235))
     circle(d, cx, cy, r, outline=p.stroke, lw=lw)
-    filled_circle(d, cx - r*0.30, cy - r*0.32, r*0.18, _rgba((255, 255, 255), 140))
-    d.arc([cx - r, cy - r, cx + r, cy + r], start=25, end=145,
-          fill=_rgba(p.stroke, 110), width=max(1, lw//2))
+    # Specular highlight (opaque white) reads as gloss.
+    filled_circle(d, cx - r * 0.33, cy - r * 0.35, r * 0.19, (255, 255, 255, 235))
+    filled_circle(d, cx - r * 0.29, cy - r * 0.31, r * 0.08, (255, 255, 255, 255))
+    # Bottom rim shading arc for a rounded, seated read.
+    d.arc([cx - r, cy - r, cx + r, cy + r], start=25, end=150,
+          fill=_rgba(p.stroke, 150), width=max(1, lw // 2))
 
 @icon("mates_folder")
 def draw_mates_folder(d, cell, p):
@@ -2079,25 +2076,25 @@ def draw_new_doc(d, cell, p):
 
 @icon("undo")
 def draw_undo(d, cell, p):
+    """Bold single-tone counter-clockwise circular arrow (T-G18 regen)."""
     s = cell * SS
-    lw = stroke_width(cell)
+    lw = int(stroke_width(cell) * 2.1)
     cx, cy = s*0.52, s*0.52
-    r = s*0.30
-    arc_segment(d, cx, cy, r, 182, 360, p.stroke, lw*2)
-    arc_segment(d, cx, cy, r, 0, 92, _rgba(p.accent, 190), lw*2)
-    arrow(d, cx - r, cy, cx - r - s*0.11, cy - s*0.14, p.stroke, lw*2)
-    filled_circle(d, cx + r*0.62, cy - r*0.52, max(1, lw//2), p.accent)
+    r = s*0.31
+    arc_segment(d, cx, cy, r, 182, 360, p.accent, lw)
+    arc_segment(d, cx, cy, r, 0, 92, p.accent, lw)
+    arrow(d, cx - r, cy, cx - r - s*0.13, cy - s*0.15, p.accent, lw)
 
 @icon("redo")
 def draw_redo(d, cell, p):
+    """Bold single-tone clockwise circular arrow (T-G18 regen)."""
     s = cell * SS
-    lw = stroke_width(cell)
+    lw = int(stroke_width(cell) * 2.1)
     cx, cy = s*0.48, s*0.52
-    r = s*0.30
-    arc_segment(d, cx, cy, r, 180, 358, p.stroke, lw*2)
-    arc_segment(d, cx, cy, r, 88, 180, _rgba(p.accent, 190), lw*2)
-    arrow(d, cx + r, cy, cx + r + s*0.11, cy - s*0.14, p.stroke, lw*2)
-    filled_circle(d, cx - r*0.62, cy - r*0.52, max(1, lw//2), p.accent)
+    r = s*0.31
+    arc_segment(d, cx, cy, r, 180, 358, p.accent, lw)
+    arc_segment(d, cx, cy, r, 88, 180, p.accent, lw)
+    arrow(d, cx + r, cy, cx + r + s*0.13, cy - s*0.15, p.accent, lw)
 
 @icon("theme_toggle")
 def draw_theme_toggle(d, cell, p):

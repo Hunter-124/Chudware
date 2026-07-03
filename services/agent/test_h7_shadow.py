@@ -33,14 +33,27 @@ if str(_ROOT) not in sys.path:
 # ---------------------------------------------------------------------------
 import types as _types
 
-# engine.paths stub — harmless module-level injection (DATA is a temp path, never written).
-# This does NOT pollute other test modules because engine.paths is not used by any other
-# test suite in a conflicting way.
-_engine_pkg = _types.ModuleType("engine")
-_engine_paths = _types.ModuleType("engine.paths")
-_engine_paths.DATA = Path("/tmp/ai_cad_test_data")  # never actually written in tests
-sys.modules.setdefault("engine", _engine_pkg)
-sys.modules.setdefault("engine.paths", _engine_paths)
+# engine.paths stub — the old bare-ModuleType("engine") injection was NOT harmless:
+# it replaced the real `engine` package in sys.modules with a non-package, breaking
+# `engine.piping` (etc.) imports in any test module collected AFTER this one
+# ("'engine' is not a package" — the last big cross-dir pollution root, 2026-07-04).
+# Import the real package when available and only fill in the paths attribute.
+try:
+    import engine as _engine_pkg  # the real package (repo-root symlink -> engine_oracle)
+except ImportError:
+    _engine_pkg = _types.ModuleType("engine")
+    sys.modules.setdefault("engine", _engine_pkg)
+if "engine.paths" not in sys.modules:
+    try:
+        import engine.paths as _engine_paths  # real module; has ROOT (DATA never existed)
+    except ImportError:
+        _engine_paths = _types.ModuleType("engine.paths")
+        sys.modules["engine.paths"] = _engine_paths
+        _engine_pkg.paths = _engine_paths
+else:
+    _engine_paths = sys.modules["engine.paths"]
+if not hasattr(_engine_paths, "DATA"):
+    _engine_paths.DATA = Path("/tmp/ai_cad_test_data")  # legacy attr some shadow tests read
 
 # ---------------------------------------------------------------------------
 # services.agent.config stub — injected via a session-scoped autouse fixture

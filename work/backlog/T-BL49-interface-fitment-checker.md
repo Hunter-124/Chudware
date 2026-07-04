@@ -3,7 +3,7 @@ id: T-BL49
 title: AI fitment & interface-alignment checker — interface_check tool for mating components (hole patterns, coaxiality, contact planes, fastener clearance)
 workstream: backlog
 owner: opus-gill
-status: doing
+status: review
 priority: 2
 lane: ai-copilot
 kind: new

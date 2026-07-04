@@ -49,7 +49,6 @@ def import_dxf(path: str | Path) -> list[tuple[str, Any]]:
     Raises ``ValueError`` when the file cannot be read or carries no importable 2D geometry.
     """
     import ezdxf
-    from build123d import Compound
 
     try:
         doc = ezdxf.readfile(str(path))
@@ -58,16 +57,26 @@ def import_dxf(path: str | Path) -> list[tuple[str, Any]]:
     except ezdxf.DXFStructureError as exc:
         raise ValueError(f"'{path}' is not a valid DXF file: {exc}") from exc
 
+    return bodies_from_doc(doc, Path(path).stem or "dxf", source=str(path))
+
+
+def bodies_from_doc(doc, stem: str, source: str = "") -> list[tuple[str, Any]]:
+    """Convert an ezdxf ``Drawing`` → ``[(name, shape)]`` (faces + free wires as one Compound body).
+
+    Shared by the DXF importer and the DWG importer (which obtains the same ezdxf ``Drawing`` from an
+    external DWG→DXF converter). ``source`` is only used to make the "no geometry" error legible.
+    """
+    from build123d import Compound
+
     edges, skipped = _entities_to_edges(doc.modelspace())
     if not edges:
         raise ValueError(
-            f"DXF '{path}' has no importable 2D geometry "
+            f"'{source or stem}' has no importable 2D geometry "
             f"({skipped} unsupported/empty entity(ies) skipped — text, dimensions, hatches and "
             "3D mesh entities are not imported).")
 
     faces, wires = _assemble_wires(edges)
     shapes: list[Any] = [*faces, *wires]
-    stem = Path(path).stem or "dxf"
     body = shapes[0] if len(shapes) == 1 else Compound(children=shapes)
     return [(stem, body)]
 

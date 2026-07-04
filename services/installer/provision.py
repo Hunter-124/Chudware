@@ -23,7 +23,24 @@ from pathlib import Path
 
 from engine import paths
 
-REPO = Path(__file__).resolve().parent.parent.parent
+def _find_repo() -> Path:
+    """Locate the repo root (the dir holding requirements.txt) by walking up from this file.
+
+    Robust to how ``installer`` is laid out: on a normal checkout ``installer`` is a symlink to
+    ``services/installer`` (so ``__file__`` resolves 3 levels below the root), but on Windows —
+    where git symlinks materialize as real top-level directory copies — it sits only 2 levels
+    below. A fixed ``parent.parent.parent`` overshoots by one there and picks the wrong root
+    (the source of the "Could not open requirements file" first-run failure). Anchoring on the
+    requirements.txt marker instead is correct under either layout.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "requirements.txt").is_file():
+            return parent
+    return here.parent.parent.parent  # historical fallback (services/installer symlink depth)
+
+
+REPO = _find_repo()
 REQUIREMENTS = REPO / "requirements.txt"
 APP_PACKAGES = ("engine", "mcp_server", "agent", "installer")
 STAMP = paths.RUNTIME / ".ready.json"

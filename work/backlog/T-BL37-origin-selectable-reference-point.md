@@ -68,3 +68,18 @@ engine ref-resolution + viewport rendering + FM selectability all have to agree 
   first, note it for T-BL36 so it covers the new row.
 
 ## Progress log
+- 2026-07-04 17:10 UTC [sonnet-alba] Implemented all four DoD dimensions. Commit eab9b052 on branch task/T-BL37-origin-selectable-reference-point.
+
+Engine ref-resolution: resolve_point() in document.cpp now accepts "point.origin" as alias for (0,0,0). RESERVED_DATUMS in validate.cpp updated so schema validation passes it in all SelOrDatum slots. Back-compat "origin" retained.
+
+Viewport render: Synthetic RefDatum{Kind::Point, (0,0,0), id="point.origin"} injected into renderer datum set on every doc rebuild via app.cpp. Uses existing Kind::Point gold-cross draw code. Hidden by default via hiddenFeatures["point.origin"] on new doc (matches plane hidden-by-default).
+
+FM selectable: Origin row body click sets selectedFeatureId="point.origin" with chevron-expand decoupled via OpenOnArrow flag. Eye toggle add/removes from hiddenFeatures. "point.origin" exempted from live-feature prune. FM click also routes into active PM point well.
+
+PM point well: PMSelKinds gains bool point; routeDatumPoint() and activeWellWantsPoint() added (mirrors routeDatumAxis pattern). activeWellKindHint emits "points".
+
+Viewport pick: drawPointPicker() added to SketchMode — screen-space 2D distance test against projected point datums with accent-circle highlight; wired into viewport_panel.cpp picker chain after axis picker.
+
+Docs: ops_cheatsheet.md, guide-overview.md, overview.md updated with canonical "point.origin" vocab.
+
+Gate: PASS (scripts/gate.sh — ctest 100%, check.py PASS, ui/imgui PASS). 60/60 test_document assertions pass in T-BL37-specific build dir.

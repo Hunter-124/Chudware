@@ -276,7 +276,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantMultidoc = eq("multidoc");
     cfg.wantEcad = eq("ecad");
     cfg.wantSketch = eq("sketch");
-    cfg.wantSketchDispatch = eq("sketch_dispatch_probe");  // T-BL47 proof
+    cfg.wantSketchDispatch = eq("sketch_dispatch");  // T-BL48 proof: dispatch→drain→active_
     cfg.wantFea = eq("fea");
     cfg.wantCam = eq("cam");
     cfg.wantFlow = eq("flow");
@@ -1215,6 +1215,160 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
         if (skStep <= 2) ++skStep;
     }
 
+    // ---------- sketch_dispatch (T-BL48: prove the REAL interactive entry path) ----------
+    // Unlike `sketch` (which force-sets st.inSketch and drives via direct sketch_enter RPCs,
+    // bypassing dispatch), this scenario NEVER touches st.inSketch itself. Entry happens only
+    // through the dispatch → AppState::pendingSketchCmds/pendingSketchEditFid channel, drained
+    // in ui/viewport.cpp where the single s_sketch + SketchHost live. The drain runs
+    // onRibbonCommand→enterNewOnSelection→enterForFeature (active_=true) / enterForFeature (edit),
+    // then sets s.inSketch = s_sketch.active() || planePicking(). The overlay is double-gated
+    // (if(s.inSketch) in viewport.cpp AND if(!active_) return in sketch_overlay.cpp), so a
+    // rendered overlay PNG proves active_ became true via dispatch. Because inSketch only flips
+    // on the NEXT frame's drain, every drain-dependent transition (enter/exit/reedit) dispatches
+    // on one step + settles, then captures on the following step once the drain has run.
+    if (cfg.wantSketchDispatch && st.workerStarted && !cfg.sketchDispatchShotDone && cfg.frame >= 5) {
+        if (!sdDirReady) {
+            sdDirReady = true;
+            sdSavePath = repoBase() + "/scratch/sketch_dispatch_shots";
+            std::error_code ec; std::filesystem::create_directories(sdSavePath, ec);
+        }
+        auto applyOne = [&](const nlohmann::json& op) {
+            return st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+        };
+        const int kSettle = 4;
+        if (sdSettle > 0) { --sdSettle; return; }
+        if (!sketchDispatchCapture.empty()) return;
+        std::string err;
+        switch (sdStep) {
+            case 0: {  // new part + sketch feature + 4-line rectangle profile (no entry yet)
+                if (!st.docMirror.newPart(st.worker, err)) {
+                    std::printf("sketch_dispatch: new_part FAILED: %s\n", err.c_str());
+                    std::fflush(stdout);
+                    cfg.sketchDispatchShotDone = true; break;
+                }
+                st.addDocTab(false);
+                auto r = applyOne({{"op","add_feature"},{"feature",{
+                    {"type","sketch"},{"name","Sketch1"},
+                    {"refs",{{"plane","plane.top"}}},
+                    {"params",{{"entities",nlohmann::json::array()},
+                               {"constraints",nlohmann::json::array()}}}}}});
+                sdFid = (r.id_map.is_object() && r.id_map.contains("$0"))
+                        ? r.id_map["$0"].get<std::string>() : "f1";
+                // A closed rectangle so the step-9 region extrude has a real profile to consume.
+                auto addLine = [&](double x1,double y1,double x2,double y2,bool horiz,
+                                   const std::string& prev)->std::string{
+                    nlohmann::json cs = nlohmann::json::array();
+                    cs.push_back({{"type",horiz?"horizontal":"vertical"},{"refs",{"$self"}}});
+                    if (!prev.empty())
+                        cs.push_back({{"type","coincident"},{"refs",{prev+".p2","$self.p1"}}});
+                    auto rr = applyOne({{"op","sketch_add_entity"},{"sketch",sdFid},
+                        {"entity",{{"type","line"},{"p1",{x1,y1}},{"p2",{x2,y2}}}},{"constraints",cs}});
+                    return (rr.id_map.is_object() && rr.id_map.contains("$0"))
+                           ? rr.id_map["$0"].get<std::string>() : "";
+                };
+                sdL0 = addLine(0,0,80,0,true,"");
+                sdL1 = addLine(80,0,80,40,false,sdL0);
+                sdL2 = addLine(80,40,0,40,true,sdL1);
+                sdL3 = addLine(0,40,0,0,false,sdL2);
+                applyOne({{"op","sketch_add_constraint"},{"sketch",sdFid},
+                    {"constraint",{{"type","coincident"},{"refs",{sdL3+".p2",sdL0+".p1"}}}}});
+                st.docMirror.resync(st.worker);
+                std::printf("sketch_dispatch: sketch %s + rect built (NOT yet entered)\n",
+                            sdFid.c_str());
+                std::fflush(stdout);
+                break;  // no capture, no settle: advance immediately to the dispatch step
+            }
+            case 1: {  // pre-select the plane, then dispatch("sketch_new") — DIRECT entry
+                // Pre-selecting a datum plane routes enterNewOnSelection → createSketchOnPlane
+                // → enterForFeature directly (no plane-pick). The viewport propagates
+                // host.selectedFeatureId = st.selectedFeature before running onRibbonCommand.
+                st.selectedFeature = "plane.top";
+                st.dispatch("sketch_new");  // pushes to pendingSketchCmds; drain runs next frame
+                std::printf("sketch_dispatch: dispatched sketch_new (plane.top pre-selected); "
+                            "awaiting drain\n");
+                std::fflush(stdout);
+                sdSettle = kSettle;  // let the viewport drain run enterNewOnSelection → active_
+                break;
+            }
+            case 2: {  // drain has run: st.inSketch must now be true — capture the overlay
+                std::printf("sketch_dispatch: after drain inSketch=%d (overlay proves active_)\n",
+                            (int)st.inSketch);
+                std::fflush(stdout);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_01_enter.png";
+                sdSettle = kSettle;
+                break;
+            }
+            case 3: {  // activate the Line tool via dispatch; profile already visible
+                st.dispatch("sk_line");  // tool activation; does not move inSketch
+                std::printf("sketch_dispatch: dispatched sk_line (draw tool active)\n");
+                std::fflush(stdout);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_02_draw.png";
+                sdSettle = kSettle;
+                break;
+            }
+            case 4: {  // dispatch("sketch_exit") — drain runs exitSketch next frame
+                st.dispatch("sketch_exit");
+                std::printf("sketch_dispatch: dispatched sketch_exit; awaiting drain\n");
+                std::fflush(stdout);
+                sdSettle = kSettle;
+                break;
+            }
+            case 5: {  // drain ran exitSketch: st.inSketch must now be false — capture
+                std::printf("sketch_dispatch: after exit drain inSketch=%d\n", (int)st.inSketch);
+                std::fflush(stdout);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_03_exit.png";
+                sdSettle = kSettle;
+                break;
+            }
+            case 6: {  // MY delta: edit-existing via pendingSketchEditFid → enterForFeature
+                st.pendingSketchEditFid = sdFid;  // drain runs enterForFeature (active_ true) next frame
+                std::printf("sketch_dispatch: armed pendingSketchEditFid=%s; awaiting drain\n",
+                            sdFid.c_str());
+                std::fflush(stdout);
+                sdSettle = kSettle;
+                break;
+            }
+            case 7: {  // drain re-entered the sketch: st.inSketch true again — capture reedit
+                std::printf("sketch_dispatch: after reedit drain inSketch=%d\n", (int)st.inSketch);
+                std::fflush(stdout);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_04_reedit.png";
+                sdSettle = kSettle;
+                break;
+            }
+            case 8: {  // exit the reedit cleanly (drain) before extruding so the solid is unobscured
+                st.dispatch("sketch_exit");
+                std::printf("sketch_dispatch: dispatched sketch_exit after reedit; awaiting drain\n");
+                std::fflush(stdout);
+                sdSettle = kSettle;
+                break;
+            }
+            case 9: {  // downstream consumption: extrude the sketch region depth 10
+                st.docMirror.resync(st.worker);
+                nlohmann::json region = {{"kind","region"},{"sketch",sdFid},
+                    {"centroid",nlohmann::json::array({50.0,20.0})},{"hint_index",0}};
+                auto r = applyOne({{"op","add_feature"},{"feature",{
+                    {"type","extrude"},{"name","Boss-Extrude1"},
+                    {"params",{{"depth",{{"value",10.0},{"expr",nullptr}}},{"end","blind"},{"mode","boss"}}},
+                    {"refs",{{"profile",nlohmann::json::array({region})}}}}}});
+                loadMesh(st, r.aicm_path);
+                bool exok = false;
+                if (r.feature_status.is_array() && !r.feature_status.empty())
+                    exok = r.feature_status.back().value("ok",false);
+                std::printf("sketch_dispatch: extrude region depth 10 ok=%d\n", (int)exok);
+                std::fflush(stdout);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_05_extrude.png";
+                sdSettle = kSettle;
+                break;
+            }
+            default:
+                cfg.sketchDispatchShotDone = true;
+                std::printf("sketch_dispatch: scenario complete\n");
+                std::fflush(stdout);
+                break;
+        }
+        if (sdStep <= 9) ++sdStep;
+    }
+
     // ---------- fea (host-parity SimManager study flow) ----------
     // T-G9 harness finding: the old flow here bypassed the SimManager entirely (raw
     // sim_run_static with empty fixtures/loads and a worktree-relative STEP netgen could
@@ -1793,6 +1947,14 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppSt
         if (!sketchCapture.empty()) { mirrorLast(sketchCapture, "sketch_03_solid"); sketchCapture.clear(); }
         if (win) glfwSwapBuffers(win);
         return cfg.sketchShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+    if (cfg.wantSketchDispatch) {
+        if (!sketchDispatchCapture.empty()) {
+            mirrorLast(sketchDispatchCapture, "sketch_dispatch_05_extrude");
+            sketchDispatchCapture.clear();
+        }
+        if (win) glfwSwapBuffers(win);
+        return cfg.sketchDispatchShotDone ? FrameAction::Break : FrameAction::Continue;
     }
     if (cfg.wantAsm) {
         if (!asmCapture.empty() && !st.rpc.busy()) { mirrorLast(asmCapture, "asm_01_seated"); asmCapture.clear(); }

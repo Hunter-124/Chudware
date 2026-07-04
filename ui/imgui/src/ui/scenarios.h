@@ -96,7 +96,7 @@ struct ShotConfig {
     int  glassperfFrame = 0;
 
     bool isScenarioMode() const {
-        return wantM1 || wantSketch || wantAsm || wantFea || wantFlow || wantCam
+        return wantM1 || wantSketch || wantSketchDispatch || wantAsm || wantFea || wantFlow || wantCam
             || wantDrawing || wantEvalMass || wantActivity || wantMultidoc;
     }
 
@@ -134,6 +134,12 @@ private:
     std::string skSavePath, skFid, skL0, skL1, skL2, skL3, skWidthCid;
     bool skDirReady = false;
     std::string sketchCapture;
+
+    // sketch_dispatch (T-BL48: prove the real interactive entry path via dispatch→drain)
+    int sdStep = 0, sdSettle = 0;
+    std::string sdSavePath, sdFid, sdL0, sdL1, sdL2, sdL3;
+    bool sdDirReady = false;
+    std::string sketchDispatchCapture;
 
     // asm
     int asmStep = 0, asmSettle = 0;

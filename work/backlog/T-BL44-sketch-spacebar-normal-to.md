@@ -2,8 +2,8 @@
 id: T-BL44
 title: Sketch — spacebar orients the view normal to the active sketch plane
 workstream: backlog
-owner: opus-hunter
-status: blocked
+owner: unassigned
+status: todo
 priority: 2
 lane: app-gui
 kind: fix
@@ -41,3 +41,4 @@ quick-win, but Hunter wants it in with the sketch-workflow batch.
 
 ## Progress log
 - 2026-07-04 00:24 UTC [opus-hunter] BLOCKED by opus-hunter. Root cause: ui/imgui interactive sketcher entry is not wired. The only active_=true setter (sketch_mode.cpp:351 enterForFeature) is never dispatched — onRibbonCommand/enterForFeature/enterNewOnSelection have ZERO callers in ui/imgui|app (only in deprecated host/, ref wiring host/src/app.cpp:994). s_sketch is a viewport function-local static with no command sink; feature_tree.cpp:315 = void* sketchMode=nullptr. So there is no active-sketch state for Space to orient to; a correct handler is committed on task/T-BL44-sketch-spacebar-normal-to but necessarily no-ops (NOT merged). Full finding + recommendation in work/questions/T-BL44.md. Scoped block: T-BL44/T-BL41/T-BL46 need the active_ overlay → blocked on a "wire ui/imgui sketch entry" prerequisite (untracked; recommend cutting it, Opus-tier). T-BL42 is NOT blocked (feature-tree/doc-state). Handler collapses to trivial once wiring lands.
+- 2026-07-04 [fable-helm] UNBLOCKED: T-BL48 wiring at review (task/T-BL48-wire-imgui-sketch-entry). opus-hunter session ended; released to unassigned. Handler already committed on this task's branch — remaining work is rebase onto the T-BL48 branch + behavioral re-verify (s_sketch.cameraLock path) + screenshots.

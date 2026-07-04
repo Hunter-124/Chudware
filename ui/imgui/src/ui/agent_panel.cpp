@@ -72,6 +72,9 @@ static void syncBlocksToSession(AppState& s) {
     ensureSessions();
     gSessions[gActiveSession].blocks = s.agent.blocks;
     gSessions[gActiveSession].running = s.agent.running;
+    // Propagate real token count whenever the engine has reported one.
+    if (s.agent.lastInputTokens > 0)
+        gSessions[gActiveSession].contextUsed = s.agent.lastInputTokens;
 }
 
 static void loadSessionToAgent(AppState& s, int idx) {
@@ -145,7 +148,8 @@ static bool aiTurnActive(const AppState& s) {
 static int effectiveContextWindow() {
     AppSettings& cfg = appSettings();
     if (cfg.contextWindow > 0) return cfg.contextWindow;
-    return defaultContextWindowForModel(cfg.provider, cfg.model);
+    // Use registry-first lookup: prefers ModelInfo.contextLength, falls back to heuristic.
+    return modelContextWindow(cfg.provider, cfg.model);
 }
 
 static std::string fmtTokens(int n) {
@@ -578,14 +582,96 @@ static void drawComposerPrelude(AppState& s) {
         ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
         ImGui::EndPopup();
     }
-    int used = gSessions.empty() ? 0 : gSessions[gActiveSession].contextUsed;
-    const float room = ImGui::GetContentRegionAvail().x;
-    const float w = measureContextMeter(used, effectiveContextWindow(), room);
-    const float x = ImGui::GetContentRegionMax().x - w;
-    if (x > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(x);
-    drawContextMeter(used, effectiveContextWindow(), room);
+    // Context meter lives in the toolbar row (between model picker and send). Nothing more here.
     ImGui::PopStyleVar();
     ImGui::Dummy(ImVec2(0, 4.f * S));
+}
+
+// Draw the context bar as a button: shows "12k / 200k" usage, hover/press animations match the
+// rest of the toolbar row. Clicking opens a breakdown popup limited to categories the session
+// genuinely tracks (total input tokens from the engine; fabricated categories are NOT shown).
+static void drawContextBarButton(AppState& s) {
+    const float S = theme::S();
+    const theme::AdaptiveSurface& surf = agentSurf();
+    int used = gSessions.empty() ? 0 : gSessions[gActiveSession].contextUsed;
+    int win  = effectiveContextWindow();
+
+    // Build label: "12k / 200k" preferred, "ctx 12k/200k" when space is tight.
+    std::string usedStr = fmtTokens(used);
+    std::string winStr  = fmtTokens(win);
+    char label[64];
+    std::snprintf(label, sizeof(label), "%s / %s", usedStr.c_str(), winStr.c_str());
+
+    // Colour the text by fill fraction (good / warn / bad) for quick visual scan.
+    const float frac = win > 0 ? std::min(1.f, (float)used / (float)win) : 0.f;
+    ImU32 barFg = frac < 0.5f ? TCOL(good) : frac < 0.85f ? TCOL(warn) : TCOL(bad);
+    (void)barFg;  // used below in the mini progress bar
+
+    // Translucent button matching toolbar style.
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  theme::roleVec(theme::pal().hover, 0.55f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,   theme::roleVec(theme::pal().active, 0.60f));
+    ImGui::PushStyleColor(ImGuiCol_Text,           surf.textSecondary);
+
+    bool clicked = ImGui::Button(label);
+
+    // Draw a slim progress bar underline inside the button rect, after the button is placed.
+    {
+        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+        const float barH = 2.f * S;
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImU32 track = TCOL(accentSoft);
+        dl->AddRectFilled(ImVec2(mn.x, mx.y - barH), mx, track, 0.f);
+        if (frac > 0.f)
+            dl->AddRectFilled(ImVec2(mn.x, mx.y - barH),
+                              ImVec2(mn.x + (mx.x - mn.x) * frac, mx.y), barFg, 0.f);
+    }
+
+    ImGui::PopStyleColor(4);
+
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Context usage — click for breakdown");
+
+    if (clicked) ImGui::OpenPopup("##ctxbreakdown");
+
+    // Breakdown popup — shows only what the session genuinely tracks.
+    ImGui::SetNextWindowSizeConstraints(ImVec2(260.f * S, 0), ImVec2(380.f * S, FLT_MAX));
+    if (ImGui::BeginPopup("##ctxbreakdown")) {
+        ImGui::PushFont(theme::font(theme::Font::H2));
+        ImGui::TextColored(surf.textPrimary, "Context breakdown");
+        ImGui::PopFont();
+        ImGui::Separator();
+
+        // Only show what the session actually tracks.
+        if (used > 0) {
+            // The engine reports a total input-token count per turn (input_tokens from the
+            // agent result JSON). That is the only per-category data we receive — show it
+            // as "Conversation (last turn)" rather than guessing sub-categories.
+            char buf[80];
+            std::snprintf(buf, sizeof(buf), "%s tok", fmtTokens(used).c_str());
+            ImGui::TextColored(surf.textSecondary, "Conversation (last turn input)");
+            ImGui::SameLine();
+            ImGui::TextColored(surf.textPrimary, "%s", buf);
+        } else {
+            ImGui::TextColored(surf.textSecondary,
+                "(No turn completed yet — send a message to see usage)");
+        }
+        ImGui::Separator();
+        ImGui::TextColored(surf.textSecondary, "Model context window");
+        ImGui::SameLine();
+        ImGui::TextColored(surf.textPrimary, "%s tok", fmtTokens(win).c_str());
+
+        // Honest note: per-category breakdown (system prompt, tool defs, etc.) requires the
+        // engine to expose per-block token counts, which it does not currently report.
+        ImGui::Dummy(ImVec2(0, 4.f * S));
+        ImGui::PushFont(theme::font(theme::Font::Label));
+        ImGui::TextColored(surf.textSecondary,
+            "Per-category breakdown (system prompt, tool defs,\n"
+            "history, current input) requires engine support\n"
+            "that is not yet wired.");
+        ImGui::PopFont();
+        ImGui::EndPopup();
+    }
 }
 
 static void drawComposerToolbar(AppState& s, bool busy, bool canStart, bool active,
@@ -603,11 +689,38 @@ static void drawComposerToolbar(AppState& s, bool busy, bool canStart, bool acti
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::roleVec(theme::pal().hover, 0.55f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, theme::roleVec(theme::pal().active, 0.60f));
 
+    // ---- Model picker — constrained to max 160p so context bar is never overlapped ----
     char modelLabel[160];
     composerModelLabel(modelLabel, sizeof(modelLabel));
+    const float kPickerMaxW = 160.f * S;
+    // Measure the label; if wider than max, it is ellipsized inside a fixed-width button.
+    const float labelW = ImGui::CalcTextSize(modelLabel).x + 16.f * S;  // 16 = 2× frame padding
+    const float pickerW = std::min(labelW, kPickerMaxW);
+    // Ellipsize label if it won't fit.
+    char pickerLabel[160];
+    if (labelW > kPickerMaxW) {
+        // Truncate to fit; append "…" (UTF-8 ellipsis).
+        // Binary search would be ideal; a simple byte-chop is safe for ASCII + known UTF-8 here.
+        std::strncpy(pickerLabel, modelLabel, sizeof(pickerLabel) - 1);
+        pickerLabel[sizeof(pickerLabel) - 1] = '\0';
+        float tw = ImGui::CalcTextSize(pickerLabel).x + 16.f * S;
+        const char* ellipsis = "\xe2\x80\xa6";  // U+2026 …
+        const float ellW = ImGui::CalcTextSize(ellipsis).x;
+        int len = (int)std::strlen(pickerLabel);
+        while (len > 0 && tw + ellW > kPickerMaxW) {
+            pickerLabel[--len] = '\0';
+            tw = ImGui::CalcTextSize(pickerLabel).x + 16.f * S;
+        }
+        std::strncat(pickerLabel, ellipsis, sizeof(pickerLabel) - len - 1);
+    } else {
+        std::strncpy(pickerLabel, modelLabel, sizeof(pickerLabel) - 1);
+        pickerLabel[sizeof(pickerLabel) - 1] = '\0';
+    }
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    bool openModelDd = ImGui::Button(modelLabel);
+    bool openModelDd = ImGui::Button(pickerLabel, ImVec2(pickerW, 0));
     ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered() && labelW > kPickerMaxW)
+        ImGui::SetTooltip("%s", modelLabel);  // full name on hover when ellipsized
     if (openModelDd) ImGui::OpenPopup("##modeldropdown");
     ImGui::SameLine();
 
@@ -642,8 +755,24 @@ static void drawComposerToolbar(AppState& s, bool busy, bool canStart, bool acti
         ImGui::PopStyleColor();
     }
 
+    // ---- Context bar — sits between model picker row and send button ----
     const float sendSz = ImGui::GetFrameHeight();
+    // Reserve space for [context bar] [send] at the right edge.
+    int used = gSessions.empty() ? 0 : gSessions[gActiveSession].contextUsed;
+    int win  = effectiveContextWindow();
+    std::string usedStr = fmtTokens(used);
+    std::string winStr  = fmtTokens(win);
+    char ctxLabel[64];
+    std::snprintf(ctxLabel, sizeof(ctxLabel), "%s / %s", usedStr.c_str(), winStr.c_str());
+    const float ctxLabelW = ImGui::CalcTextSize(ctxLabel).x + 16.f * S;
+    const float ctxGap    = 6.f * S;
+    const float ctxRight  = ImGui::GetContentRegionMax().x - sendSz - ctxGap - ctxLabelW - ctxGap;
     ImGui::SameLine();
+    if (ctxRight > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(ctxRight);
+    drawContextBarButton(s);
+    ImGui::SameLine(0, ctxGap);
+
+    // ---- Send / Stop button ----
     float rightX = ImGui::GetContentRegionMax().x - sendSz;
     if (rightX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rightX);
 
@@ -701,7 +830,8 @@ static void submitTurn(AppState& s, const std::string& text) {
         {"run_id", "ui"}, {"request", text},
         {"doc_id", s.docMirror.docId()}, {"stages", nlohmann::json::array({"intake", "model"})}});
     s.startDemoAgent(text);
-    gSessions[gActiveSession].contextUsed = 1200 + (int)s.agent.blocks.size() * 400;
+    // contextUsed is updated from real input_tokens once the turn completes (see tickDemoAgent).
+    // While the turn is in-flight the previous value is kept — do not fabricate a number.
     gSessions[gActiveSession].running = true;
 }
 

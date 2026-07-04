@@ -457,6 +457,9 @@ void AppState::tickDemoAgent(float dt) {
         std::string engaged = result.value("engaged", std::string("agent"));
         int itok = result.value("input_tokens", 0);
         int otok = result.value("output_tokens", 0);
+        // Store real token counts so the context bar can show live k-token usage.
+        if (itok > 0) agent.lastInputTokens  = itok;
+        if (otok > 0) agent.lastOutputTokens = otok;
         AgentBlock us; us.kind = BlockKind::Usage; us.anim = 0.f;
         us.body = engaged;
         if (itok > 0 || otok > 0)

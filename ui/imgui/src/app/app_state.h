@@ -31,6 +31,7 @@ struct AgentBlock {
     std::string  body;
     std::string  args;
     std::string  result;
+    std::string  modelName;  // attribution: model that produced this block (empty = unknown)
     ActionStatus status = ActionStatus::Ok;
     bool         expanded = false;
     float        anim = 0.f;
@@ -49,6 +50,9 @@ struct AgentThread {
     float demoTimer = 0.f;
     bool  demoOpOk = false;
     std::string demoOpMsg;
+    // Real token counts from the last completed agent turn (0 = no data yet).
+    int lastInputTokens  = 0;
+    int lastOutputTokens = 0;
 };
 
 struct TreeNode {

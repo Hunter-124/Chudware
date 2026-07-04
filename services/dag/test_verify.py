@@ -68,9 +68,11 @@ def _tool_err(**fields) -> str:
 # ---------------------------------------------------------------------------
 
 def test_dispatch_table_contains_all_check_types():
-    expected = {"interference", "erc", "drc", "firmware", "dc_ratio", "budget"}
+    expected = {"interference", "erc", "drc", "firmware", "dc_ratio", "budget",
+                # T-BL04 advanced-FEA verify nodes.
+                "fatigue", "thermal", "buckling", "contact"}
     assert expected == set(DISPATCH_TABLE.keys()), (
-        "DISPATCH_TABLE must cover all six check types (T-F12 reuses this verbatim)"
+        "DISPATCH_TABLE must cover every check type (T-F12 reuses this verbatim)"
     )
 
 

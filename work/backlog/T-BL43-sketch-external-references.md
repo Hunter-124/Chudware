@@ -56,3 +56,30 @@ tool work properly. Together these let a sketch reference the rest of the model.
 - Related: T-BL42 (absorbed sketches reusable as refs), T-BL41 (dimension/relation display).
 
 ## Progress log
+
+- 2026-07-04 opus-brae: ROOT CAUSE of "Convert Entities broken" found — both GUIs (host
+  sketch_mode.cpp applyConvertRef + ui/imgui sketch_overlay.cpp) emit a `sketch_convert` op that
+  was contracted in doc_ops.md (C53) but NEVER implemented in the C++ engine, so every Convert
+  Entities click failed with `unsupported`. Also: the old contracted math (sketch_project_ref)
+  only handled lines + axis-parallel circles, faces only as intersection lines.
+- 2026-07-04 opus-brae: shipped (commit f8aedf76 + follow-on): (1) projection kernel in
+  core/doc/recon.{h,cpp} — project_edges_to_plane/face_boundary_edges, orthographic GeomProjLib
+  projection then classify (oblique circle → ellipse BY CONSTRUCTION; perpendicular edge → point;
+  splines → sampled polyline w/ approx flag); (2) op_sketch_convert in session.cpp (contract-
+  conformant: real geometry default, fix-pinned, $idx/$idx#k id_map, convert_failed) — fixes BOTH
+  GUIs with zero GUI changes; (3) read-only sketch_project_entities RPC (libaicad-dispatched) for
+  preview/agent flows; (4) resolve_sketch_plane refactored to doc-level (resolve_sketch_plane_doc)
+  so the ops path can resolve planes.
+- 2026-07-04 opus-brae: contracts/doc_ops.md — appended dated amendment for the upgraded
+  projection math (append-only; ratification question in work/questions/T-BL43.md Q1).
+- 2026-07-04 opus-brae: ASSOCIATIVITY HONESTY: delivered ONE-SHOT projection only. No stored
+  source link; converted geometry does not follow source-model edits. Follow-up filed:
+  work/backlog/T-BL49-associative-convert-entities.md.
+- 2026-07-04 opus-brae: headless real-flow verify green vs worktree .so (core_bridge): box →
+  sketch on top face → project bottom-face loop (4 lines, construction) → insert → coincident-
+  constrain new line to projected edge; boss on 45° datum → oblique circle → ELLIPSE via MCP
+  path; datum plane → intersection line. Analytic probe: ellipse rx=10 ry=7.071=10·cos45°.
+- 2026-07-04 opus-brae: ui/imgui in-GUI seam: interactive sketch entry is being wired by T-BL48
+  (opus-tarn) — the Convert tool code path (sketch_overlay.cpp:2707 SketchTool::Convert →
+  applyConvertRef → sketch_convert op) is engine-complete from this branch; once T-BL48 lands,
+  the in-GUI click flow reaches the now-working op with no further changes here.

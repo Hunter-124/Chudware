@@ -129,6 +129,23 @@ zero-length `dir` raise `invalid_op`. A reference that cannot be projected raise
 the `unsupported_ref` it bubbles up). Like all op errors these reject the whole batch with no state
 change (§2).
 
+> **Amendment (T-BL43, 2026-07-04) — `sketch_convert` projection math upgraded.** The op is now
+> implemented in the C++ engine (it was contracted in C53 but had no engine handler — every GUI
+> Convert Entities click failed with `unsupported`). Per Hunter's 2026-07-03 direction the
+> projection is now true orthographic projection along the sketch normal (OCCT `GeomProjLib`),
+> superseding the "same math as `sketch_project_ref`" bullet above for this op:
+> a **face** Ref projects ALL its boundary wires (outer + hole loops) as entities — not just a
+> plane-intersection line; an **oblique circular edge** projects to an `ellipse`/`ellipse_arc`
+> (axis need not be parallel to the sketch normal); an edge (near-)perpendicular to the plane
+> collapses to a `point`; unclassifiable curves fall back to a sampled 24-seg polyline. A
+> **datum** Ref keeps the intersection-line semantics (a plane has no boundary). New optional
+> fields: `construction:bool` (default `false` — real, extrudable geometry, as above) and
+> `fix:bool` (default `true` — the whole-entity `fix` pin, as above). Projection is ONE-SHOT:
+> converted entities do not update when the source model changes (associative update is a filed
+> follow-up). `sketch_project_ref` (the read-only preview RPC) is unchanged; the richer
+> read-only companion is `sketch_project_entities` `{doc_id, sketch, refs:[Ref…]}` →
+> `{ok, entities (no ids, construction:true), approx, sources, plane_frame}`.
+
 **Sketch move/copy (C54 — translate or duplicate the selection by a delta):**
 
 | op | fields |

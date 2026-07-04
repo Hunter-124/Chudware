@@ -94,6 +94,12 @@
 #include <BRep_Tool.hxx>
 #include <BRepTools.hxx>
 #include <GC_MakeArcOfCircle.hxx>
+#include <Geom_BSplineCurve.hxx>
+#include <TColgp_Array1OfPnt.hxx>
+#include <TColStd_Array1OfReal.hxx>
+#include <TColStd_Array1OfInteger.hxx>
+#include <gp_Elips.hxx>
+#include <gp_Ax2.hxx>
 #include <GProp_GProps.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 #include <IGESControl_Controller.hxx>
@@ -532,6 +538,76 @@ long get_i(const Entity& e, int code, long def_val = 0) {
     return def_val;
 }
 
+// Collect EVERY value for `code`, in document order. SPLINE repeats 10/20/30 (control points)
+// and 40 (knots); get_d's first-match is not enough for those.
+std::vector<double> get_all_d(const Entity& e, int code) {
+    std::vector<double> out;
+    for (const Tag& t : e.tags)
+        if (t.code == code) {
+            try { out.push_back(std::stod(t.value)); } catch (const std::exception&) {}
+        }
+    return out;
+}
+
+// DXF SPLINE → OCCT B-spline edge. Control-point + knot form (the common machine-DXF case — e.g.
+// every curve in a splined art file): poles = 10/20/30, degree = 71, flat knot vector = 40,
+// optional per-pole weights = 41. The flat DXF knots are compressed into OCCT's
+// (unique knots, multiplicities). Returns a null edge on any failure (caller counts it skipped).
+// Fit-point-only splines (no control points) are not handled here — a further follow-up.
+TopoDS_Edge spline_edge(const Entity& e) {
+    const int degree = static_cast<int>(get_i(e, 71, 3));
+    std::vector<double> xs = get_all_d(e, 10), ys = get_all_d(e, 20), zs = get_all_d(e, 30);
+    std::vector<double> knots_flat = get_all_d(e, 40);
+    std::vector<double> weights = get_all_d(e, 41);
+    const std::size_t n = xs.size();
+    if (n < 2 || degree < 1 ||
+        knots_flat.size() != n + static_cast<std::size_t>(degree) + 1)
+        return TopoDS_Edge();
+
+    TColgp_Array1OfPnt poles(1, static_cast<int>(n));
+    for (std::size_t i = 0; i < n; ++i)
+        poles.SetValue(static_cast<int>(i) + 1,
+                       gp_Pnt(xs[i], ys[i], i < zs.size() ? zs[i] : 0.0));
+
+    std::vector<double> uk;   // unique knot values
+    std::vector<int> um;      // their multiplicities
+    for (double k : knots_flat) {
+        if (!uk.empty() && std::abs(k - uk.back()) < 1e-9) ++um.back();
+        else { uk.push_back(k); um.push_back(1); }
+    }
+    TColStd_Array1OfReal occt_knots(1, static_cast<int>(uk.size()));
+    TColStd_Array1OfInteger occt_mults(1, static_cast<int>(um.size()));
+    for (std::size_t i = 0; i < uk.size(); ++i) {
+        occt_knots.SetValue(static_cast<int>(i) + 1, uk[i]);
+        occt_mults.SetValue(static_cast<int>(i) + 1, um[i]);
+    }
+
+    Handle(Geom_BSplineCurve) curve;
+    if (weights.size() == n) {
+        TColStd_Array1OfReal w(1, static_cast<int>(n));
+        for (std::size_t i = 0; i < n; ++i) w.SetValue(static_cast<int>(i) + 1, weights[i]);
+        curve = new Geom_BSplineCurve(poles, w, occt_knots, occt_mults, degree);
+    } else {
+        curve = new Geom_BSplineCurve(poles, occt_knots, occt_mults, degree);
+    }
+    return BRepBuilderAPI_MakeEdge(curve);
+}
+
+// DXF ELLIPSE → OCCT elliptical-arc edge. center = 10/20/30, major-axis endpoint RELATIVE to the
+// center = 11/21/31, ratio (minor/major) = 40, start/end params (radians) = 41/42.
+TopoDS_Edge ellipse_edge(const Entity& e) {
+    const double cx = get_d(e, 10), cy = get_d(e, 20), cz = get_d(e, 30);
+    const double mx = get_d(e, 11), my = get_d(e, 21), mz = get_d(e, 31);
+    const double ratio = get_d(e, 40, 1.0);
+    double u0 = get_d(e, 41, 0.0), u1 = get_d(e, 42, 2.0 * kPi);
+    const double major = std::sqrt(mx * mx + my * my + mz * mz);
+    if (major < 1e-12) return TopoDS_Edge();
+    gp_Ax2 ax(gp_Pnt(cx, cy, cz), gp_Dir(0.0, 0.0, 1.0), gp_Dir(mx, my, mz));
+    gp_Elips el(ax, major, major * ratio);
+    if (u1 <= u0) u1 += 2.0 * kPi;
+    return BRepBuilderAPI_MakeEdge(el, u0, u1);
+}
+
 // A DXF polyline *bulge* segment → circular-arc edge (port of _bulge_arc). bulge =
 // tan(theta/4); the arc apex sits off the chord midpoint along the left normal by the
 // signed sagitta bulge*chord/2. A three-point arc through (p1, apex, p2) reproduces it
@@ -677,9 +753,15 @@ std::vector<TopoDS_Edge> dxf_entities_to_edges(const std::vector<dxf::Entity>& e
                 dxf::lwpolyline_to_edges(e, edges);
             } else if (e.type == "POLYLINE") {
                 polyline_old_style_to_edges(entities, i, edges);
+            } else if (e.type == "SPLINE") {
+                TopoDS_Edge se = dxf::spline_edge(e);
+                if (!se.IsNull()) edges.push_back(se);
+            } else if (e.type == "ELLIPSE") {
+                TopoDS_Edge ee = dxf::ellipse_edge(e);
+                if (!ee.IsNull()) edges.push_back(ee);
             } else {
-                // ELLIPSE / SPLINE / INSERT / TEXT / DIMENSION / HATCH / … — out of scope for
-                // this increment (see the file-level comment); counted as skipped.
+                // INSERT / TEXT / DIMENSION / HATCH / … — out of scope for this increment
+                // (see the file-level comment); counted as skipped by the size check below.
             }
         } catch (const Standard_Failure&) {
             // one bad entity must not abort the whole import

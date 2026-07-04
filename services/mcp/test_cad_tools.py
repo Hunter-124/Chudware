@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -1101,6 +1102,167 @@ def test_render_part_caption_pairs_image_with_text():
     assert "iso view of a" in caption, caption
     assert "60x40x10 mm" in caption, caption
     assert "occlusion not modeled" in caption, caption
+
+
+# ================================================================ T-BL16 motion/kinematics
+# simulate_motion: drive one dimensional mate over a range, re-solve the mate graph each step,
+# return per-body trajectory + swept interference (reuses solve_mates + check_interference).
+
+def _bar_part(name: str, L: float, W: float, H: float, sidecar: str) -> tuple:
+    """Build a box part, save it as a .step+ component file, return (path, faces)."""
+    r, _ = _call("new_part", {"name": name})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", name, {"length": cb.dim(L), "width": cb.dim(W), "height": cb.dim(H)})]})
+    faces = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face"}}).get("matches", [])
+    path = os.path.join(sidecar, f"{name}.step+")
+    cb.call("doc_save", {"doc_id": doc, "path": path})
+    return path, faces
+
+
+def _build_swinging_arm_assembly(tmp_path) -> tuple:
+    """A driven single-DOF planar CRANK mechanism (honestly named: not a full 4-bar; see
+    work/questions/T-BL16.md for the fidelity decision — the tool itself drives any dimensional
+    mate, so 4-bar/cam-follower need no tool change; this is the minimal *stable* mechanism that
+    regression-tests every simulate_motion behavior):
+
+      * a fixed Ground bar, parked far out in +Y and coplanar (Z=0), only there to give the drive
+        + planar-lock mates a fixed reference — it is NOT in the Arm's swing region, so it never
+        pollutes the interference sweep;
+      * a free Arm bar pivoting about the origin, driven by an `angle` mate (its `value`) and
+        held IN the Z-plane by a `parallel` mate (wide-face to wide-face) — without that lock a
+        single angle mate leaves ~5 free DOF and the solver returns an arbitrary out-of-plane
+        pose;
+      * a fixed Obstacle block sitting in the Arm's swing arc at (14,14).
+
+    Driving the angle mate 0->~150 deg swings the Arm from CLEAR into the Obstacle (~120 deg).
+    Returns (asm_doc_id, drive_mate_id, arm_component_id)."""
+    sidecar = str(tmp_path)
+    bar, bar_faces = _bar_part("Bar", 40, 4, 4, sidecar)
+    obs, _ = _bar_part("Obstacle", 10, 10, 10, sidecar)
+
+    asm = cb.call("doc_new", {"name": "SwingArm", "kind": "assembly"})["doc_id"]
+
+    def rev():
+        return cb.call("doc_tree", {"doc_id": asm}).get("revision", 0)
+
+    grd_xf = [1, 0, 0, 0, 0, 1, 0, 200, 0, 0, 1, 0, 0, 0, 0, 1]   # Ground far +Y, out of the arc
+    obs_xf = [1, 0, 0, 14, 0, 1, 0, 14, 0, 0, 1, 0, 0, 0, 0, 1]   # Obstacle in the swing arc
+    cb.call("doc_apply_ops", {"doc_id": asm, "base_revision": rev(), "with_tess": False, "ops": [
+        {"op": "asm_insert_component", "source": {"path": bar}, "name": "Ground", "fixed": True,
+         "transform": grd_xf},
+        {"op": "asm_insert_component", "source": {"path": bar}, "name": "Arm", "fixed": False},
+        {"op": "asm_insert_component", "source": {"path": obs}, "name": "Obstacle", "fixed": True,
+         "transform": obs_xf},
+    ]})
+    # drive: angle between the +X end-faces of both bars; lock: parallel between the +Z wide faces.
+    xsel = max(bar_faces, key=lambda f: abs(f.get("centroid", [0, 0, 0])[0]))
+    zsel = max(bar_faces, key=lambda f: abs(f.get("centroid", [0, 0, 0])[2]))
+    r = cb.call("doc_apply_ops", {"doc_id": asm, "base_revision": rev(), "with_tess": False, "ops": [
+        {"op": "asm_add_mate", "mate": {
+            "type": "angle", "align": "aligned", "suppressed": False,
+            "refs": [{"component": "k1", "selector": xsel},
+                     {"component": "k2", "selector": xsel}], "value": {"value": 0.0}}},
+        {"op": "asm_add_mate", "mate": {
+            "type": "parallel", "align": "aligned", "suppressed": False,
+            "refs": [{"component": "k1", "selector": zsel},
+                     {"component": "k2", "selector": zsel}]}},
+    ]})
+    drive_mate_id = r.get("id_map", {}).get("$0")
+    return asm, drive_mate_id, "k2"
+
+
+def test_simulate_motion_trajectory_and_swept_interference(tmp_path):
+    """simulate_motion drives the angle mate 0->150 deg, returns a per-body trajectory whose
+    Arm pose actually changes step-to-step (real PLANAR motion, continuous — no branch flip, no
+    out-of-plane wander), and flags the first step where the swinging Arm hits the Obstacle."""
+    asm, mate_id, arm_id = _build_swinging_arm_assembly(tmp_path)
+    r, _ = _call("simulate_motion", {"doc_id": asm, "mate_id": mate_id,
+                                     "start": 0.0, "stop": 150.0, "steps": 16})
+    assert r["ok"], r
+    assert r["mate_id"] == mate_id, r
+    assert r["driver"]["type"] == "angle" and r["driver"]["unit"] == "deg", r["driver"]
+    traj = r["trajectory"]
+    assert len(traj) == 16, r
+
+    def arm_xf(frame):
+        return next(b["transform"] for b in frame["bodies"] if b["component"] == arm_id)
+
+    def arm_angle(frame):
+        xf = arm_xf(frame)
+        return math.degrees(math.atan2(xf[4], xf[0]))
+
+    # (1) REAL MOTION: the Arm's rotation changes substantially across the sweep (not stuck).
+    angles = [arm_angle(f) for f in traj]
+    assert abs(angles[-1] - angles[0]) > 90.0, f"Arm barely moved: {angles}"
+    # (2) CONTINUITY (no branch flip): adjacent steps never jump by a large angle.
+    for a, b in zip(angles, angles[1:]):
+        assert abs(b - a) < 25.0, f"discontinuous pose (branch flip) between {a} and {b}: {angles}"
+    # (3) PLANARITY: the parallel mate keeps rotation in the Z-plane — the out-of-plane transform
+    #     terms (R02,R12,R20,R21) stay ~0 at every step (guards the underconstraint failure mode
+    #     where a lone angle mate lets the solver tilt the Arm out of plane).
+    for f in traj:
+        xf = arm_xf(f)
+        oop = max(abs(xf[2]), abs(xf[6]), abs(xf[8]), abs(xf[9]))
+        assert oop < 1e-6, f"Arm left the Z-plane (out-of-plane term {oop}) at value {f['value']}"
+
+    # (4) SWEPT INTERFERENCE REGRESSION: the Arm is CLEAR early and HITS the Obstacle later.
+    inter = r["interference"]
+    assert inter["checked"] is True, inter
+    step = inter["first_collision_step"]
+    assert step is not None, f"expected a collision as the Arm swings into the Obstacle: {r}"
+    assert step > 0, f"start pose should be clear, collision only mid-sweep: {inter}"
+    assert not traj[0].get("interference"), "first frame must be collision-free"
+    assert traj[step].get("interference"), "flagged collision step must actually interfere"
+    pair = {inter["detail"][0]["a"], inter["detail"][0]["b"]}
+    assert pair == {"Arm", "Obstacle"}, f"unexpected clash pair {pair}: {inter}"
+
+
+def test_simulate_motion_restores_original_mate_value(tmp_path):
+    """A motion study is non-destructive: after the sweep the driven mate is back at its start
+    value and the assembly is where it began."""
+    asm, mate_id, _ = _build_swinging_arm_assembly(tmp_path)
+
+    def mate_value():
+        mates = (cb.call("doc_tree", {"doc_id": asm}).get("tree") or {}).get("mates") or []
+        m = next(mm for mm in mates if mm.get("id") == mate_id)
+        v = m.get("value")
+        return v.get("value") if isinstance(v, dict) else v
+
+    assert mate_value() == 0.0
+    r, _ = _call("simulate_motion", {"doc_id": asm, "mate_id": mate_id,
+                                     "start": 0.0, "stop": 90.0, "steps": 7,
+                                     "check_interference": False})
+    assert r["ok"], r
+    assert mate_value() == 0.0, "driven mate must be restored to its original value after a study"
+
+
+def test_simulate_motion_autopicks_single_drivable_mate(tmp_path):
+    """With exactly one drivable (dimensional) mate, mate_id may be omitted."""
+    asm, mate_id, _ = _build_swinging_arm_assembly(tmp_path)
+    r, _ = _call("simulate_motion", {"doc_id": asm, "start": 0.0, "stop": 30.0, "steps": 4,
+                                     "check_interference": False})
+    assert r["ok"], r
+    assert r["mate_id"] == mate_id, r
+
+
+def test_simulate_motion_rejects_non_dimensional_mate(tmp_path):
+    """Driving a mate that has no swept value is a clear, fixable error (not a crash)."""
+    asm, mate_id, _ = _build_swinging_arm_assembly(tmp_path)
+    # add a coincident mate (no driven value) and try to drive IT.
+    endsel = {"kind": "face", "centroid": [0.0, 0.0, 3.0], "normal": [0.0, 0.0, 1.0]}
+    r = cb.call("doc_apply_ops", {
+        "doc_id": asm, "base_revision": cb.call("doc_tree", {"doc_id": asm}).get("revision", 0),
+        "with_tess": False,
+        "ops": [{"op": "asm_add_mate", "mate": {
+            "type": "coincident", "align": "aligned", "suppressed": False,
+            "refs": [{"component": "k1", "selector": endsel},
+                     {"component": "k2", "selector": endsel}]}}]})
+    coincident_id = r.get("id_map", {}).get("$0")
+    out, _ = _call("simulate_motion", {"doc_id": asm, "mate_id": coincident_id,
+                                       "start": 0.0, "stop": 10.0, "steps": 3})
+    assert out["ok"] is False, out
+    assert "coincident" in out["error"] or "dimensional" in out["error"], out
 
 
 if __name__ == "__main__":

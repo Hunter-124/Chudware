@@ -32,6 +32,7 @@ struct ShotConfig {
     bool wantCamWorkspace = false;            // T-U3: populate + screenshot the CAM workspace panel
     bool camWorkspaceShotDone = false;
     bool wantGallery = false;                 // T-U9: sample gallery (loads from disk, no RPC wait)
+    bool wantQuestion = false;               // T-BL40: inline ask_user question cards
 
     // Worker one-shot shots (fire once when workerStarted)
     bool wantTree = false;

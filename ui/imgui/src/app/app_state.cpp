@@ -4,6 +4,7 @@
 #include "ui/ecad/ecad_panel.h"
 #include <cstring>
 #include <string>
+#include <nlohmann/json.hpp>
 
 namespace app {
 
@@ -398,6 +399,7 @@ void AppState::startDemoAgent(const std::string& userText) {
 
     if (engineReady && engine.hasDoc()) {
         agentIsReal = true;
+        agentLastRequest_ = userText;
         agent.demoStep = -1;
         engine.startAgent(userText);
         AgentBlock spinner; spinner.kind = BlockKind::Action;
@@ -419,6 +421,23 @@ void AppState::tickDemoAgent(float dt) {
         if (b.kind == BlockKind::Action && b.status == ActionStatus::Running) b.spin += dt * 6.f;
     }
 
+    // Interaction contract §8: consumer side — when the inline question card writes
+    // askAnswersJson, the agent was suspended (status=waiting_for_answer). Re-launch.
+    // The FileLedger replay (contract §5) means the resumed agent skips already-answered
+    // questions and continues from where it left off. See work/questions/T-BL40.md.
+    if (agent.running && agentIsReal && !askAnswersJson.empty()) {
+        // The pending_ask_answers JSON was already persisted to the run ledger by the
+        // Python InAppWaitTransport before returning waiting_for_answer. Clearing here
+        // lets the GUI know the answer was consumed; the agent will replay on relaunch.
+        askAnswersJson.clear();
+        // Re-launch the agent with the same original request. The ledger replay skips
+        // any questions already answered in the previous partial run.
+        if (!agentLastRequest_.empty()) {
+            engine.startAgent(agentLastRequest_);
+        }
+        return;
+    }
+
     if (agent.running && agentIsReal && engine.agentDone()) {
         nlohmann::json result = engine.takeAgentResult();
         bool ok = !result.contains("ok") || result.value("ok", true);
@@ -426,22 +445,93 @@ void AppState::tickDemoAgent(float dt) {
         if (result.contains("status") && result.value("status", std::string()) == "failed")
             ok = false;
 
-        for (auto it = agent.blocks.rbegin(); it != agent.blocks.rend(); ++it) {
-            if (it->kind == BlockKind::Action && it->status == ActionStatus::Running) {
-                it->status = ok ? ActionStatus::Ok : ActionStatus::Failed;
-                it->result = ok ? "Done" : (errMsg.empty() ? "Agent run failed" : errMsg);
-                break;
-            }
-        }
-
+        // Check for ask_question events FIRST — they suspend the run completion.
+        bool hasQuestion = false;
         if (result.contains("events") && result["events"].is_array()) {
             for (const auto& ev : result["events"]) {
                 std::string kind = ev.value("kind", std::string());
+                if (kind == "ask_question") {
+                    // The event data is the §3 batch envelope JSON (or the question field).
+                    // Build a minimal batch envelope from the event if not already one.
+                    nlohmann::json batchJson;
+                    if (ev.contains("batch_id")) {
+                        batchJson = ev;  // full batch envelope in event data
+                    } else {
+                        // Single question embedded directly; wrap it.
+                        batchJson = nlohmann::json{
+                            {"schema", "aicad.interaction/1"},
+                            {"batch_id", ev.value("batch_id", "b_" + std::string("inline"))},
+                            {"scope", ev.value("scope", "run")},
+                            {"blocking", true},
+                            {"questions", nlohmann::json::array({ev})}
+                        };
+                    }
+                    std::string batchStr = batchJson.dump();
+                    aicad::ui::AskForm form = aicad::ui::parseAskBatch(batchStr);
+                    if (!form.fields.empty()) {
+                        AgentBlock qb;
+                        qb.kind = BlockKind::Question;
+                        qb.title = "Agent question";
+                        qb.anim = 0.f;
+                        qb.askForm = form;
+                        // Seed widget state from suggested defaults.
+                        qb.askFields.resize(form.fields.size());
+                        // (initInlineField is static in agent_panel.cpp; we replicate the
+                        // seed logic here for the text/approval defaults only — the GUI
+                        // will re-seed via initInlineField on first draw if askFields are
+                        // empty. We set them to zero-init so the card recognizes them as
+                        // needing initialization.)
+                        agent.blocks.push_back(std::move(qb));
+                        hasQuestion = true;
+                    }
+                }
                 if (kind == "run_note") {
                     AgentBlock t; t.kind = BlockKind::Thinking; t.title = "Thinking";
                     t.body = ev.value("note", ev.dump(2)); t.anim = 0.f;
                     agent.blocks.push_back(t);
                 }
+            }
+        }
+
+        // Handle Option B: result has status=waiting_for_answer + pending_batch (§8,
+        // work/questions/T-BL40.md). The Python agent exited cleanly mid-run and persisted
+        // its question to the FileLedger. On re-launch it replays answered questions.
+        if (!hasQuestion && result.contains("status") &&
+            result.value("status", std::string()) == "waiting_for_answer" &&
+            result.contains("pending_batch")) {
+            std::string batchStr = result["pending_batch"].dump();
+            aicad::ui::AskForm form = aicad::ui::parseAskBatch(batchStr);
+            if (!form.fields.empty()) {
+                AgentBlock qb;
+                qb.kind = BlockKind::Question;
+                qb.title = "Agent question";
+                qb.anim = 0.f;
+                qb.askForm = form;
+                qb.askFields.resize(form.fields.size());
+                agent.blocks.push_back(std::move(qb));
+                hasQuestion = true;
+            }
+        }
+
+        if (hasQuestion) {
+            // The run is suspended pending user answer. Mark the spinner as waiting.
+            for (auto it = agent.blocks.rbegin(); it != agent.blocks.rend(); ++it) {
+                if (it->kind == BlockKind::Action && it->status == ActionStatus::Running) {
+                    it->title = "Waiting for your answer…";
+                    break;
+                }
+            }
+            // Do NOT mark agent.running = false; we stay in-progress until answer arrives.
+            // The consumer check at the top of tickDemoAgent re-launches the agent once
+            // the inline card writes askAnswersJson (see work/questions/T-BL40.md §Option B).
+            return;
+        }
+
+        for (auto it = agent.blocks.rbegin(); it != agent.blocks.rend(); ++it) {
+            if (it->kind == BlockKind::Action && it->status == ActionStatus::Running) {
+                it->status = ok ? ActionStatus::Ok : ActionStatus::Failed;
+                it->result = ok ? "Done" : (errMsg.empty() ? "Agent run failed" : errMsg);
+                break;
             }
         }
 

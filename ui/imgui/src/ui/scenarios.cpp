@@ -136,6 +136,132 @@ static void seedAssemblyShot(app::AppState& st) {
     st.workspace = cmd::Workspace::Assemble;
 }
 
+// T-BL40: seeds three Question blocks (one per required widget modality) so the headless
+// screenshot harness captures each variant without a live agent or worker round-trip.
+// The batch JSON follows the interaction contract §3 envelope exactly.
+static void seedQuestionShot(app::AppState& st) {
+    using app::AgentBlock;
+    using app::BlockKind;
+    using aicad::ui::parseAskBatch;
+
+    // Context: user asked to design something; agent needs clarification.
+    AgentBlock u; u.kind = BlockKind::UserMsg;
+    u.body = "Design me a custom bracket for the motor mount.";
+    u.anim = 1.f;
+    st.agent.blocks.push_back(u);
+
+    // Block 1: multiple choice (single-select + multi-select) — choice question kind.
+    {
+        const char* batchJson = R"({
+            "schema": "aicad.interaction/1",
+            "batch_id": "b_shot_choice",
+            "scope": "run",
+            "run_id": "r_shot",
+            "blocking": true,
+            "questions": [
+                {
+                    "id": "material",
+                    "kind": "choice",
+                    "prompt": "What material should the bracket be made from?",
+                    "why": "Drives wall thickness and surface finish options.",
+                    "suggested": "aluminium_6061",
+                    "required": true,
+                    "options": [
+                        {"value": "aluminium_6061", "label": "Aluminium 6061"},
+                        {"value": "steel_mild",    "label": "Mild steel"},
+                        {"value": "carbon_fibre",  "label": "Carbon fibre"}
+                    ]
+                },
+                {
+                    "id": "features",
+                    "kind": "choice",
+                    "prompt": "Which optional features do you need?",
+                    "suggested": ["drain_slot"],
+                    "required": false,
+                    "multi": true,
+                    "options": [
+                        {"value": "drain_slot",  "label": "Drain slot"},
+                        {"value": "gussets",     "label": "Gussets"},
+                        {"value": "cable_clips", "label": "Cable clips"}
+                    ]
+                }
+            ]
+        })";
+        AgentBlock qb; qb.kind = BlockKind::Question; qb.title = "Agent question";
+        qb.anim = 1.f;
+        qb.askForm = parseAskBatch(batchJson);
+        qb.askFields.resize(qb.askForm.fields.size());
+        st.agent.blocks.push_back(std::move(qb));
+    }
+
+    // Block 2: short answer (single-line text) + dimension.
+    {
+        const char* batchJson = R"({
+            "schema": "aicad.interaction/1",
+            "batch_id": "b_shot_text",
+            "scope": "run",
+            "run_id": "r_shot",
+            "blocking": true,
+            "questions": [
+                {
+                    "id": "label",
+                    "kind": "text",
+                    "prompt": "Short label to engrave on the bracket (e.g. part number)?",
+                    "suggested": "BKT-001",
+                    "required": false
+                },
+                {
+                    "id": "flange_width",
+                    "kind": "dimension",
+                    "family": "length",
+                    "prompt": "Flange width?",
+                    "suggested": {"value": 25, "unit": "mm"},
+                    "required": true
+                }
+            ]
+        })";
+        AgentBlock qb; qb.kind = BlockKind::Question; qb.title = "Agent question";
+        qb.anim = 1.f;
+        qb.askForm = parseAskBatch(batchJson);
+        qb.askFields.resize(qb.askForm.fields.size());
+        st.agent.blocks.push_back(std::move(qb));
+    }
+
+    // Block 3: open-ended (multiline text) + approval.
+    {
+        const char* batchJson = R"({
+            "schema": "aicad.interaction/1",
+            "batch_id": "b_shot_openended",
+            "scope": "run",
+            "run_id": "r_shot",
+            "blocking": true,
+            "questions": [
+                {
+                    "id": "special_notes",
+                    "kind": "text",
+                    "multiline": true,
+                    "prompt": "Any special requirements or notes for this bracket?",
+                    "suggested": "",
+                    "required": false
+                },
+                {
+                    "id": "proceed",
+                    "kind": "approval",
+                    "prompt": "Proceed with building the bracket using your answers above?",
+                    "proposal": "Build bracket with selected options and dimensions",
+                    "suggested": true,
+                    "required": true
+                }
+            ]
+        })";
+        AgentBlock qb; qb.kind = BlockKind::Question; qb.title = "Agent question";
+        qb.anim = 1.f;
+        qb.askForm = parseAskBatch(batchJson);
+        qb.askFields.resize(qb.askForm.fields.size());
+        st.agent.blocks.push_back(std::move(qb));
+    }
+}
+
 // Seeds the T-F16 preview pane deterministically (no worker round-trip): a few representative
 // artifact cards + a Ready PreviewModel pointing at a PNG that's guaranteed to exist on disk
 // (the icon atlas already bundled under resourcesDir/icons/) so the shot renders a real texture.
@@ -294,6 +420,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantHydraulic    = eq("hydraulic_view");    // T-U7
     cfg.wantStructural   = eq("structural_view");   // T-U7
     cfg.wantGallery       = eq("gallery");
+    cfg.wantQuestion      = eq("question");           // T-BL40: inline ask_user cards
     cfg.wantMissionControl = eq("mission_control");  // T-F17
     cfg.wantSimStudies   = eq("sim_studies");   // T-U6
     cfg.wantGlassperf = eq("glassperf");
@@ -342,6 +469,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantPlan) seedPlanShot(st);
     if (cfg.wantAssembly) seedAssemblyShot(st);
     if (cfg.wantPreview) seedPreviewShot(st);
+    if (cfg.wantQuestion) seedQuestionShot(st);  // T-BL40
     if (cfg.wantScaffoldDemo)  ui::openScaffoldDemoPanel();
     if (cfg.wantPartsBrowser)  ui::openPartsPanel();
     cfg.wantCamWorkspace = eq("cam_workspace");

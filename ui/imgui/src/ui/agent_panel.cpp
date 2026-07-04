@@ -349,6 +349,266 @@ static void drawErrorBubble(AgentBlock& b) {
     endGlassBubble(gb);
 }
 
+// Unit tables for dimension questions (mirrors ask_dialog.cpp).
+static constexpr const char* kLengthUnits[] = {"mm", "cm", "m", "in", "ft"};
+static constexpr const char* kAngleUnits[]  = {"deg"};
+static constexpr const char* kCountUnits[]  = {"count"};
+static void unitsForFamily(const std::string& family,
+                            const char* const*& units, int& count) {
+    if (family == "angle")      { units = kAngleUnits; count = 1; }
+    else if (family == "count") { units = kCountUnits; count = 1; }
+    else                        { units = kLengthUnits; count = 5; }
+}
+
+// Seed InlineFieldState from the field's typed `suggested` JSON (contract §2).
+static void initInlineField(InlineFieldState& fs,
+                             const aicad::ui::AskField& f) {
+    using aicad::ui::AskFieldKind;
+    nlohmann::json sug = nlohmann::json::parse(f.suggestedJson, nullptr, false);
+    fs = InlineFieldState{};
+    switch (f.kind) {
+    case AskFieldKind::Dimension: {
+        if (!sug.is_discarded() && sug.is_object()) {
+            auto vit = sug.find("value");
+            if (vit != sug.end() && vit->is_number()) fs.dimValue = vit->get<double>();
+            std::string unit = sug.value("unit", std::string());
+            const char* const* units; int n;
+            unitsForFamily(f.family, units, n);
+            for (int i = 0; i < n; ++i) if (unit == units[i]) { fs.dimUnitIdx = i; break; }
+        }
+        break;
+    }
+    case AskFieldKind::Choice: {
+        fs.choiceChecked.assign(f.options.size(), false);
+        if (!sug.is_discarded()) {
+            if (!f.multi) {
+                std::string sv = sug.is_string() ? sug.get<std::string>() : std::string();
+                for (size_t i = 0; i < f.options.size(); ++i)
+                    if (f.options[i] == sv) { fs.choiceIdx = (int)i; break; }
+            } else {
+                // multi-select: suggested is an array or a single value
+                auto mark = [&](const std::string& v) {
+                    for (size_t i = 0; i < f.options.size(); ++i)
+                        if (f.options[i] == v) fs.choiceChecked[i] = true;
+                };
+                if (sug.is_array()) {
+                    for (const auto& sv : sug) if (sv.is_string()) mark(sv.get<std::string>());
+                } else if (sug.is_string()) {
+                    mark(sug.get<std::string>());
+                }
+            }
+        }
+        break;
+    }
+    case AskFieldKind::Text:
+    case AskFieldKind::FileRequest: {
+        std::string sv = (!sug.is_discarded() && sug.is_string())
+                          ? sug.get<std::string>() : std::string();
+        fs.textBuf = sv;
+        break;
+    }
+    case AskFieldKind::Approval:
+        fs.approved = (!sug.is_discarded() && sug.is_boolean()) && sug.get<bool>();
+        break;
+    }
+}
+
+// Collect raw answer strings from InlineFieldState → map for buildAnswersJson.
+static std::map<std::string, std::string>
+collectInlineAnswers(const aicad::ui::AskForm& form,
+                     const std::vector<InlineFieldState>& states) {
+    using aicad::ui::AskFieldKind;
+    std::map<std::string, std::string> raw;
+    for (size_t i = 0; i < form.fields.size() && i < states.size(); ++i) {
+        const auto& f  = form.fields[i];
+        const auto& fs = states[i];
+        switch (f.kind) {
+        case AskFieldKind::Dimension: {
+            const char* const* units; int n;
+            unitsForFamily(f.family, units, n);
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "%g %s", fs.dimValue,
+                          (fs.dimUnitIdx >= 0 && fs.dimUnitIdx < n) ? units[fs.dimUnitIdx] : "");
+            raw[f.id] = buf;
+            break;
+        }
+        case AskFieldKind::Choice:
+            if (f.multi) {
+                // Build JSON array string for buildAnswersJson.
+                nlohmann::json arr = nlohmann::json::array();
+                for (size_t j = 0; j < f.options.size() && j < fs.choiceChecked.size(); ++j)
+                    if (fs.choiceChecked[j]) arr.push_back(f.options[j]);
+                raw[f.id] = arr.dump();
+            } else {
+                raw[f.id] = (fs.choiceIdx >= 0 && fs.choiceIdx < (int)f.options.size())
+                                ? f.options[fs.choiceIdx] : std::string();
+            }
+            break;
+        case AskFieldKind::Approval:
+            raw[f.id] = fs.approved ? "true" : "false";
+            break;
+        case AskFieldKind::Text:
+        case AskFieldKind::FileRequest:
+        default:
+            raw[f.id] = fs.textBuf;
+            break;
+        }
+    }
+    return raw;
+}
+
+// Inline question card — renders an ask_user batch as an interactive card inside the
+// Copilot transcript. The card stays editable until the user presses Submit; after that
+// it shows a read-only answered summary. Returns true on the frame Submit is pressed.
+// Writes the §4 answer envelope into b.askAnswersJson and sets b.askAnswered.
+// Also mirrors into s.askAnswersJson so the agent-event pump can pick it up.
+static bool drawQuestionCard(AppState& s, AgentBlock& b) {
+    using aicad::ui::AskFieldKind;
+    const float S = theme::S();
+    const float w = ImGui::GetContentRegionAvail().x;
+
+    GlassBubble gb = beginGlassBubble("##qGlass", w, theme::MaterialLevel::Thin, 8.f * S);
+    ImGui::BeginChild(ImGui::GetID(&b), ImVec2(w, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    // Header row: question icon + "Agent question"
+    inlineIconGlass("agent", 16.f * S, TCOL(accent));
+    ImGui::SameLine(0, 8.f * S);
+    ImGui::PushFont(theme::font(theme::Font::Label));
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(TCOL(accent)), "Agent question");
+    ImGui::PopFont();
+
+    bool submitted = false;
+
+    // Seed widget state from suggested defaults on first draw.
+    if (b.askFields.size() != b.askForm.fields.size())
+        b.askFields.resize(b.askForm.fields.size());
+    for (size_t i = 0; i < b.askForm.fields.size(); ++i) {
+        if (!b.askFields[i].seeded) {
+            initInlineField(b.askFields[i], b.askForm.fields[i]);
+            b.askFields[i].seeded = true;
+        }
+    }
+
+    if (b.askAnswered) {
+        // Read-only summary after submission.
+        ImGui::SameLine(0, 12.f * S);
+        ImGui::TextColored(agentSurf().textSecondary, "(answered)");
+    } else {
+        // Editable fields.
+        ImGui::Spacing();
+        for (size_t i = 0; i < b.askForm.fields.size() && i < b.askFields.size(); ++i) {
+            const auto& f  = b.askForm.fields[i];
+            InlineFieldState& fs = b.askFields[i];
+
+            ImGui::PushID((int)i);
+            ImGui::PushTextWrapPos(0);
+            ImGui::TextColored(agentSurf().textPrimary, "%s", f.prompt.c_str());
+            ImGui::PopTextWrapPos();
+            if (!f.why.empty()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", f.why.c_str());
+            }
+
+            switch (f.kind) {
+            case AskFieldKind::Dimension: {
+                const char* const* units; int n;
+                unitsForFamily(f.family, units, n);
+                ImGui::SetNextItemWidth(160.f * S);
+                ImGui::InputDouble("##val", &fs.dimValue, 0.0, 0.0, "%.4g");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(90.f * S);
+                ImGui::Combo("##unit", &fs.dimUnitIdx, units, n);
+                break;
+            }
+            case AskFieldKind::Choice: {
+                if (!f.multi) {
+                    // Single-select: radio buttons for <=6 opts, combo otherwise.
+                    if (f.options.size() <= 6) {
+                        for (int oi = 0; oi < (int)f.options.size(); ++oi) {
+                            ImGui::PushID(oi);
+                            ImGui::RadioButton(f.options[oi].c_str(), &fs.choiceIdx, oi);
+                            ImGui::PopID();
+                        }
+                    } else {
+                        std::vector<const char*> opts;
+                        opts.reserve(f.options.size());
+                        for (const auto& o : f.options) opts.push_back(o.c_str());
+                        ImGui::SetNextItemWidth(-1.f);
+                        ImGui::Combo("##choice", &fs.choiceIdx, opts.data(), (int)opts.size());
+                    }
+                } else {
+                    // Multi-select: checkboxes.
+                    if (fs.choiceChecked.size() != f.options.size())
+                        fs.choiceChecked.assign(f.options.size(), false);
+                    for (size_t oi = 0; oi < f.options.size(); ++oi) {
+                        ImGui::PushID((int)oi);
+                        ImGui::Checkbox(f.options[oi].c_str(), &fs.choiceChecked[oi]);
+                        ImGui::PopID();
+                    }
+                }
+                break;
+            }
+            case AskFieldKind::Text: {
+                // Reserve a mutable buffer. TextBuf is std::string — expose via InputText.
+                fs.textBuf.resize(std::max(fs.textBuf.size(), (size_t)1));
+                ImGui::SetNextItemWidth(-1.f);
+                if (f.multiline) {
+                    // Open-ended: multiline field.
+                    fs.textBuf.resize(std::max(fs.textBuf.size(), (size_t)512));
+                    ImGui::InputTextMultiline("##text", fs.textBuf.data(), fs.textBuf.capacity(),
+                                             ImVec2(-1.f, 80.f * S));
+                    // Sync capacity used → actual size (InputText writes a null terminator).
+                    fs.textBuf.resize(std::strlen(fs.textBuf.data()));
+                } else {
+                    // Short answer: single-line field.
+                    fs.textBuf.resize(std::max(fs.textBuf.size(), (size_t)256));
+                    ImGui::InputText("##text", fs.textBuf.data(), fs.textBuf.capacity());
+                    fs.textBuf.resize(std::strlen(fs.textBuf.data()));
+                }
+                break;
+            }
+            case AskFieldKind::FileRequest:
+                fs.textBuf.resize(std::max(fs.textBuf.size(), (size_t)512));
+                ImGui::SetNextItemWidth(-1.f);
+                ImGui::InputTextWithHint("##path", "file path or paste", fs.textBuf.data(),
+                                         fs.textBuf.capacity());
+                fs.textBuf.resize(std::strlen(fs.textBuf.data()));
+                break;
+            case AskFieldKind::Approval:
+                ImGui::Checkbox("Approve", &fs.approved);
+                break;
+            }
+            ImGui::Spacing();
+            ImGui::PopID();
+        }
+
+        ImGui::Separator();
+        if (ImGui::Button("Submit")) {
+            auto raw = collectInlineAnswers(b.askForm, b.askFields);
+            b.askAnswersJson = aicad::ui::buildAnswersJson(b.askForm, raw);
+            b.askAnswered = true;
+            // Mirror to AppState so the event pump can pick it up.
+            s.askAnswersJson = b.askAnswersJson;
+            submitted = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Accept defaults")) {
+            // Pre-fill with suggested defaults (already seeded at init); just submit.
+            auto raw = collectInlineAnswers(b.askForm, b.askFields);
+            b.askAnswersJson = aicad::ui::buildAnswersJson(b.askForm, raw);
+            b.askAnswered = true;
+            s.askAnswersJson = b.askAnswersJson;
+            submitted = true;
+        }
+    }
+
+    ImGui::EndChild();
+    endGlassBubble(gb);
+    return submitted;
+}
+
 static void drawBlock(AppState& s, AgentBlock& b, int idx, float panelW) {
     const float S = theme::S();
     ImGui::PushID(idx);
@@ -381,6 +641,9 @@ static void drawBlock(AppState& s, AgentBlock& b, int idx, float panelW) {
         break;
     case BlockKind::Error:
         drawErrorBubble(b);
+        break;
+    case BlockKind::Question:
+        drawQuestionCard(s, b);
         break;
     default:
         ImGui::TextColored(agentSurf().textSecondary, "%s", b.body.c_str());

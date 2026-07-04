@@ -7,6 +7,7 @@
 #include "view_model.h"
 #include "action_bus.h"
 #include "app/doc_engine.h"
+#include "ask_form.h"   // AskForm: interaction contract §3 batch model
 
 #include "worker_client.h"
 #include "doc_mirror.h"
@@ -22,8 +23,20 @@ namespace viewport { class Scene; }
 
 namespace app {
 
-enum class BlockKind { UserMsg, Thinking, Action, AssistantMsg, Plan, Usage, Error };
+enum class BlockKind { UserMsg, Thinking, Action, AssistantMsg, Plan, Usage, Error, Question };
 enum class ActionStatus { Running, Ok, Failed };
+
+// Per-field inline widget state for a Question block.
+// Allocated once when the block is created; updated each frame by drawQuestionCard().
+struct InlineFieldState {
+    double              dimValue   = 0.0;
+    int                 dimUnitIdx = 0;
+    int                 choiceIdx  = 0;          // single-select
+    std::vector<bool>   choiceChecked;           // multi-select (parallel to AskForm options)
+    bool                approved   = false;
+    std::string         textBuf;                 // text / file-request (heap, no fixed cap)
+    bool                seeded     = false;      // true once initInlineField() has run
+};
 
 struct AgentBlock {
     BlockKind    kind;
@@ -37,6 +50,11 @@ struct AgentBlock {
     float        spin = 0.f;
     std::vector<std::string> plan;
     std::vector<bool>        planDone;
+    // Question block state (kind == BlockKind::Question only).
+    aicad::ui::AskForm              askForm;
+    std::vector<InlineFieldState>   askFields;   // parallel to askForm.fields
+    bool                            askAnswered = false;  // true once Submit pressed
+    std::string                     askAnswersJson;       // §4 answer envelope when answered
 };
 
 struct AgentThread {
@@ -128,6 +146,7 @@ struct AppState {
 
     AgentThread agent;
     bool agentIsReal = false;
+    std::string agentLastRequest_;  // original user request for agent replay on answer
 
     aicad::ui::DocViewModel viewModel;
     aicad::ui::ActionBus actionBus;

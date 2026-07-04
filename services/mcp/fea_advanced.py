@@ -448,27 +448,45 @@ def build_contact_block_inp(L: float, b: float, h: float, E: float, nu: float,
 # CalculiX .dat result parsers
 # =====================================================================
 
+# CalculiX *NODE PRINT variable → the phrase its .dat result-block header carries.
+_DAT_HEADER_KEYWORD = {
+    "NT": "temperature",     # *NODE PRINT NT  → "temperatures ... for set ..."
+    "U": "displacement",     # *NODE PRINT U   → "displacements ..."
+    "RF": "force",           # *NODE PRINT RF  → "forces (reaction) ..."
+}
+
+
 def parse_dat_nodal(dat_path: str, key: str, node_set: list,
                     component: int = 1) -> Optional[float]:
-    """Parse a ccx *NODE PRINT .dat block whose header contains `key` (e.g. "NT" for
-    temperature, "U1"/"RF1" for a component). Return the averaged value of the given
-    1-based `component` column over `node_set`. Returns None if nothing parsed."""
+    """Parse a ccx *NODE PRINT .dat block for the variable `key` (CalculiX names:
+    "NT" temperature, "U" displacement, "RF" reaction force). Return the averaged
+    value of the given 1-based `component` column over `node_set`. None if nothing
+    parsed.
+
+    ccx labels the result block with a natural-language header ("temperatures for
+    set NMID", "forces (reaction) ..."), NOT the terse variable name, so we match on
+    the mapped keyword (with the raw key as a fallback)."""
     want = set(node_set)
     vals: list = []
+    kw = _DAT_HEADER_KEYWORD.get(key.upper(), key.lower())
     lines = Path(dat_path).read_text().splitlines()
     i = 0
     while i < len(lines):
         header = lines[i].strip()
-        if key in header and ("temperature" in header.lower()
-                              or "displacement" in header.lower()
-                              or "force" in header.lower()
-                              or header.upper().startswith(key)
-                              or f" {key}" in header.upper()):
+        hl = header.lower()
+        if (kw in hl or key.upper() in header.upper()) and header:
+            # ccx puts one or more blank lines between the header and the data rows;
+            # scan forward through the block, skipping blanks, until data STARTS then
+            # ends (a blank line after data began, or a non-numeric header line).
             j = i + 1
             got_block = False
-            while j < len(lines) and lines[j].strip():
-                parts = lines[j].split()
-                if parts and parts[0].lstrip("-").isdigit():
+            started = False
+            while j < len(lines):
+                row = lines[j]
+                parts = row.split()
+                is_data = bool(parts) and parts[0].lstrip("-").isdigit()
+                if is_data:
+                    started = True
                     try:
                         nid = int(parts[0])
                         col = component  # 1-based column after the node id
@@ -477,6 +495,8 @@ def parse_dat_nodal(dat_path: str, key: str, node_set: list,
                             got_block = True
                     except (ValueError, IndexError):
                         pass
+                elif started:
+                    break  # data block ended
                 j += 1
             if got_block:
                 i = j

@@ -21,8 +21,11 @@ cannot exist on the current `Engine` interface without engine-level changes.
 
 - The full inline question card renderer (`drawQuestionCard`) with all five contract
   question kinds, including multi-select choice and multiline text.
-- A headless scenario that pushes `BlockKind::Question` blocks with pre-built AskForms,
-  simulates user answers, and captures screenshots (light + dark) for each widget type.
+- A headless scenario that pushes `BlockKind::Question` blocks with pre-built AskForms
+  and captures screenshots (light + dark) for each widget type. **Note: the scenario
+  proves render only** — it does not click Submit or produce a §4 answer envelope.
+  The Submit/collectInlineAnswers path is implemented in `drawQuestionCard` but
+  exercised only in the live UI; no automated round-trip test exists yet.
 - The `ask_question` event handler in `tickDemoAgent` that WOULD produce question blocks
   when the engine delivers them — ready to activate when the engine supports mid-run
   notification.
@@ -67,3 +70,28 @@ returns `waiting_for_answer`) plus the C++ handling of that result status.
 
 **Please approve Option B or redirect to Option A before this driver implements the
 real engine round-trip. The inline card rendering and scenario proof are complete.**
+
+## Status at review (2026-07-04, sonnet-pell)
+
+**What is verified complete:**
+- `AskField.multi` / `AskField.multiline` parse + serialize (ask_form.cpp, `buildAnswersJson`)
+- `drawQuestionCard`: all five contract question kinds including radio/checkbox choice and
+  InputTextMultiline open-ended; default seeding; Submit + Accept defaults buttons
+- `BlockKind::Question` in `AgentBlock`; `InlineFieldState` with multi-select bool-array
+- C++ consumer in `tickDemoAgent`: handles `ask_question` events and `waiting_for_answer`
+  result status — wired and ready but **currently inert** (Python never emits these)
+- Headless screenshot scenario (`AI_CAD_SHOT=question`): light + dark captures eyeballed,
+  choice (radio + checkbox) and short-answer + dimension and multiline + approval all visible
+- `gate.sh` PASS
+
+**What is NOT done (awaiting A/B decision):**
+- Python `agent_run_v2` never returns `waiting_for_answer` / `pending_batch` — these
+  strings are absent from the entire Python codebase. The C++ consumer is dead code
+  until Option A or B is implemented on the Python side.
+- `Engine::startAgent()` calls `worker_.call()` with no `onEvent` — streaming events
+  from `interaction.py`'s `on_event` callback never reach the GUI result.
+- No automated round-trip test (Submit → §4 envelope → agent continue).
+
+The `ask_user` interaction contract IS unit-tested in Python (`test_interaction.py`:
+replay at lines 176-183, ask_question→ask_answer ordering at lines 273-275). The
+missing piece is the GUI-transport binding in `agent_run_v2`.

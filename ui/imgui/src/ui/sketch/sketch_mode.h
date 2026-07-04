@@ -115,6 +115,13 @@ public:
     bool elementDragActive() const {
         return dragging_ || dragArmed_ || groupDragArmed_ || dimDragging_;
     }
+    // T-BL46: project a sketch UV coordinate to screen pixels using the same affine basis
+    // that hitTestHandle() uses. Only valid after buildBasis() has run (i.e. once the sketch
+    // overlay has drawn at least one frame). Returns (0,0) if the basis is not yet built.
+    ImVec2 handleScreenPos(float u, float v) const {
+        if (!basisOk_) return ImVec2(0, 0);
+        return uvToScreen(u, v);
+    }
     // T-BL48: true while arming/awaiting a plane pick for a NEW sketch (active_ is still
     // false then). The viewport keeps AppState::inSketch true during this so the plane-pick
     // overlay (drawn only when inSketch) stays alive until the user picks a plane or cancels.

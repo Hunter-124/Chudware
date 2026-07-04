@@ -1449,47 +1449,62 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 sdSettle = kSettle;
                 break;
             }
-            case 16: {  // compute element screen coords; position mouse there; record camera
-                // The rect bottom edge (L0) runs world (0,0,0)→(80,0,0). Mid = (40,0,0).
-                // worldToScreen projects it onto the current camera's NDC → screen pixel.
-                auto* gvp = ui::viewportGl();
+            case 16: {  // compute element screen coords via sketchMode().uvToScreen; record camera
+                // Use uvToScreen(80,0) — the EXACT same projection hitTestHandle() uses for the
+                // rect's bottom-right corner endpoint (.p2 of L0, UV=(80,0) in sketch space).
+                // Using worldToScreen was wrong: sketch UV != world coords (depends on frame_).
                 ImVec2 bMin = ui::viewportImageMin();
                 ImVec2 bMax = ui::viewportImageMax();
-                if (gvp && bMax.x > bMin.x && bMax.y > bMin.y) {
-                    const auto& cam = gvp->renderer().camera();
-                    int vw = (int)(bMax.x - bMin.x);
-                    int vh = (int)(bMax.y - bMin.y);
-                    ViewportScreen vs{bMin.x, bMin.y};
-                    ScreenPt sp;
-                    if (worldToScreen(cam, vs, vw, vh, 40.f, 0.f, 0.f, sp)) {
-                        sdElemPtX = sp.x; sdElemPtY = sp.y;
-                    } else {
-                        // fallback: centre of image rect — will still be inside sketch overlay
+                std::printf("sketch_dispatch[T-BL46]: imageRect bMin=(%.0f,%.0f) bMax=(%.0f,%.0f)\n",
+                            bMin.x, bMin.y, bMax.x, bMax.y);
+                // uvToScreen is only valid if basisOk_ (buildBasis ran at least once after
+                // entering the sketch).  If the rect is too small it hasn't run yet.
+                if (bMax.x > bMin.x && bMax.y > bMin.y) {
+                    // Project all four corners via handleScreenPos() — the same affine basis
+                    // that hitTestHandle() uses. Pick whichever is inside the image rect.
+                    // Prefer (80,0) → (80,40) → (0,40) → (0,0) (far corner first).
+                    struct { float u, v; } corners[] = {{80,0},{80,40},{0,40},{0,0}};
+                    bool found = false;
+                    for (auto& c : corners) {
+                        ImVec2 s = ui::sketchMode().handleScreenPos(c.u, c.v);
+                        if (s.x >= bMin.x && s.x <= bMax.x && s.y >= bMin.y && s.y <= bMax.y) {
+                            sdElemPtX = s.x; sdElemPtY = s.y; found = true;
+                            std::printf("sketch_dispatch[T-BL46]: handle UV=(%.0f,%.0f) → screen=(%.0f,%.0f)\n",
+                                        c.u, c.v, s.x, s.y);
+                            break;
+                        }
+                        std::printf("sketch_dispatch[T-BL46]: UV=(%.0f,%.0f) → screen=(%.0f,%.0f) [outside rect]\n",
+                                    c.u, c.v, s.x, s.y);
+                    }
+                    if (!found) {
+                        // Nothing projected inside — use image centre (won't arm a handle, but at
+                        // least imgHovered=true so the camera-still test via dead-zone still runs).
                         sdElemPtX = (bMin.x + bMax.x) * 0.5f;
                         sdElemPtY = (bMin.y + bMax.y) * 0.5f;
+                        std::printf("sketch_dispatch[T-BL46]: no corner in rect — using image centre\n");
                     }
                     // Empty-space anchor: guaranteed inside the image rect but away from the
                     // element.  Use a fixed fractional offset from bMin so it survives any
                     // camera orientation — the overlay hit-test will find nothing there.
-                    // (World-space projection of far points can land off-screen at steep pitch.)
                     sdEmptyPtX = bMin.x + (bMax.x - bMin.x) * 0.85f;
                     sdEmptyPtY = bMin.y + (bMax.y - bMin.y) * 0.85f;
                 } else {
                     // viewport not wired (rare in headless): use safe screen fallbacks
                     sdElemPtX = 400.f; sdElemPtY = 300.f;
                     sdEmptyPtX = 80.f; sdEmptyPtY = 80.f;
+                    std::printf("sketch_dispatch[T-BL46]: viewport not wired — using fallback coords\n");
                 }
                 // Record camera before element drag
                 sdDragPreYaw   = ui::viewportState().yaw;
                 sdDragPrePitch = ui::viewportState().pitch;
-                // Position mouse over the element (hover populates hit-test next frame)
+                // Position mouse over the handle endpoint; hover populates hitTestHandle next frame
                 ImGui::GetIO().AddMousePosEvent(sdElemPtX, sdElemPtY);
-                std::printf("sketch_dispatch[T-BL46]: element screen pos=(%.0f,%.0f) "
+                std::printf("sketch_dispatch[T-BL46]: element handle screen pos=(%.0f,%.0f) "
                             "empty pos=(%.0f,%.0f) camera yaw=%.1f pitch=%.1f\n",
                             sdElemPtX, sdElemPtY, sdEmptyPtX, sdEmptyPtY,
                             sdDragPreYaw, sdDragPrePitch);
                 std::fflush(stdout);
-                sdSettle = 2;  // let hover register before click
+                sdSettle = 3;  // hover needs 3 frames to populate hitTestHandle result
                 break;
             }
             case 17: {  // LMB down at element pos — overlay arms dragArmed_/groupDragArmed_

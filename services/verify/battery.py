@@ -57,6 +57,10 @@ CHECKS: dict[str, tuple[str, str, str, str, str]] = {
     "wall_thickness":            ("cad",  "wall_thickness",            "seconds",   "any",   "findings"),
     "draft_analysis":            ("cad",  "draft_analysis",            "seconds",   "any",   "findings"),
     "solve_mates":               ("cad",  "solve_mates",               "seconds",   "any",   "binary"),
+    # T-BL49: design-time interface alignment (hole patterns, coaxiality, contact planes,
+    # fastener pass-through) between mating components.  Implemented directly (gap) since it
+    # lives in its own module; "findings" reward shape reads its `findings` list.
+    "interface_check":           ("gap",  "interface_check",           "seconds",   "any",   "findings"),
     "review_drawing":            ("cad",  "review_drawing",            "seconds",   "any",   "binary"),
     # --- simulation
     "run_fea_static":            ("cad",  "run_fea_static",            "minutes",   "any",   "scalar"),
@@ -356,7 +360,18 @@ def _gap_req_join(doc_id: str = None, requirements: list = None, **_) -> str:
     })
 
 
+def _gap_interface_check(doc_id: str = None, fastener: str = None, components: list = None, **_) -> str:
+    """T-BL49 interface alignment check — thin passthrough to the tool implementation.
+
+    Returns the tool's stable JSON verbatim (ok + findings); the battery's "findings" reward
+    shape reads the `findings` list. Kept as a gap fn because interface_check lives in its own
+    module (not one of the private-MCP modules)."""
+    from services.mcp.interface_check_tools import run_interface_check
+    return run_interface_check(doc_id=doc_id, fastener=fastener, components=components)
+
+
 GAP_FNS: dict[str, Any] = {
+    "interface_check":   _gap_interface_check,
     "is_manifold":       _gap_is_manifold,
     "round_trip":        _gap_round_trip,
     "groundedness":      _gap_groundedness,
@@ -432,11 +447,24 @@ def _extract_score(check_name: str, reward_shape: str, result_json: str) -> tupl
                 })
 
     else:  # "findings"
-        items = (r.get("pairs") or r.get("faces_below_threshold") or
-                 r.get("violations") or r.get("spurious") or [])
-        score = 1.0 if not items else max(0.0, 1.0 - len(items) * 0.1)
-        for item in items:
-            findings.append({"check": check_name, "ok": False, "detail": str(item)})
+        # interface_check (T-BL49) reports a `findings` list of {severity, detail, fix, ...};
+        # only severity=="fail" entries should drive the score/fail (warns are advisory). Other
+        # findings-shaped checks use pairs/violations/etc. and every listed item counts.
+        if "findings" in r and isinstance(r.get("findings"), list):
+            fails = [f for f in r["findings"]
+                     if isinstance(f, dict) and f.get("severity") == "fail"]
+            score = 1.0 if r.get("ok", not fails) and not fails else max(0.0, 1.0 - len(fails) * 0.1)
+            for f in fails:
+                detail = f.get("detail") or str(f)
+                if f.get("fix"):
+                    detail = f"{detail}  -> fix: {f['fix']}"
+                findings.append({"check": check_name, "ok": False, "detail": detail})
+        else:
+            items = (r.get("pairs") or r.get("faces_below_threshold") or
+                     r.get("violations") or r.get("spurious") or [])
+            score = 1.0 if not items else max(0.0, 1.0 - len(items) * 0.1)
+            for item in items:
+                findings.append({"check": check_name, "ok": False, "detail": str(item)})
 
     return score, findings
 

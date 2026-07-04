@@ -220,6 +220,12 @@ register_dag_replan_tools(mcp)
 # card per contracts/narration.md — never a raw JSON dump.
 from services.mcp.design_review_tools import register_design_review_tools
 register_design_review_tools(mcp)
+# Interface alignment checker (T-BL49): interface_check inspects mating component pairs for
+# hole-pattern registration, bore coaxiality, contact-plane flushness, and fastener pass-through
+# — the layout errors that pass check_interference (no clash) but are still wrong.  Reuses
+# doc_query (per-body faces), asm_world_bodies, cam_extract holes, research_thread_spec.
+from mcp_server.interface_check_tools import register_interface_check_tools
+register_interface_check_tools(mcp)
 
 
 def _install_clean_stdout():

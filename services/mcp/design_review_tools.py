@@ -80,6 +80,7 @@ def register_design_review_tools(mcp: "FastMCP") -> None:
 # All check names available in design_review
 _ALL_CHECKS = [
     "interference",
+    "interface_check",
     "erc",
     "drc",
     "feature_overlap",
@@ -93,7 +94,7 @@ _ALL_CHECKS = [
 _DISPATCH_CHECKS = ["interference", "erc", "drc", "firmware", "dc_ratio", "budget"]
 
 # Checks handled via direct battery._get_fn calls
-_DIRECT_CHECKS = ["feature_overlap", "dfm"]
+_DIRECT_CHECKS = ["feature_overlap", "dfm", "interface_check"]
 
 
 def _run_design_review(
@@ -195,6 +196,25 @@ def _call_direct_check(check_name: str, doc_id: Optional[str]) -> dict[str, Any]
         def default_pred(r: dict) -> bool:  # type: ignore[misc]
             return bool(r.get("ok", False)) and int(r.get("violations", 1)) == 0
 
+    elif check_name == "interface_check":
+        # T-BL49: interface_check lives in its own module (not a private-MCP module), so call
+        # its implementation directly rather than via battery._get_fn.  Passes iff ok and no
+        # severity=="fail" finding.
+        try:
+            from services.mcp.interface_check_tools import run_interface_check as tool_fn
+        except ImportError as exc:
+            return {"status": "unavailable", "reason": f"interface_check unavailable: {exc}"}
+        kwargs = {}
+        if doc_id:
+            kwargs["doc_id"] = doc_id
+
+        def default_pred(r: dict) -> bool:  # type: ignore[misc]
+            fails = [f for f in r.get("findings", [])
+                     if isinstance(f, dict) and f.get("severity") == "fail"]
+            return bool(r.get("ok", False)) and not fails
+
+        return _invoke_tool(check_name, tool_fn, kwargs, default_pred)
+
     else:
         return {"status": "unavailable", "reason": f"unknown direct check: {check_name!r}"}
 
@@ -286,6 +306,7 @@ def _invoke_tool(
 # Human-friendly labels for each check
 _CHECK_LABELS: dict[str, str] = {
     "interference":    "Interference (clash check)",
+    "interface_check": "Interface alignment (holes/coaxiality/contact/fastener)",
     "erc":             "ERC (electrical rule check)",
     "drc":             "DRC (design rule check)",
     "feature_overlap": "Feature overlap (own-part collision)",
@@ -395,6 +416,13 @@ def _check_detail_pass(check_name: str, result: dict) -> str:
     if check_name == "interference":
         n = len(result.get("interferences", []))
         return f"0 interference pairs (source: check_interference.interferences)"
+    if check_name == "interface_check":
+        n = len(result.get("pairs", []))
+        warns = len([f for f in result.get("findings", [])
+                     if isinstance(f, dict) and f.get("severity") == "warn"])
+        return (f"{n} interface(s) aligned"
+                + (f", {warns} advisory note(s)" if warns else "")
+                + "  (source: interface_check)")
     if check_name == "erc":
         errs = result.get("errors", 0)
         warns = result.get("warnings", 0)
@@ -436,6 +464,14 @@ def _check_detail_fail(check_name: str, result: dict) -> str:
             b = items[0].get("b", "?")
             summary = f" (e.g. {a} ↔ {b})"
         return f"{n} interference pair(s){summary}  (source: check_interference)"
+    if check_name == "interface_check":
+        fails = [f for f in result.get("findings", [])
+                 if isinstance(f, dict) and f.get("severity") == "fail"]
+        first = ""
+        if fails:
+            f0 = fails[0]
+            first = f" (e.g. {f0.get('detail', '?')})"
+        return f"{len(fails)} alignment failure(s){first}  (source: interface_check)"
     if check_name == "erc":
         errs = result.get("errors", "?")
         return f"{errs} ERC error(s)  (source: ecad_run_erc)"

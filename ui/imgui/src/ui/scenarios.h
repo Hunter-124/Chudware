@@ -136,10 +136,12 @@ private:
     std::string sketchCapture;
 
     // sketch_dispatch (T-BL48: prove the real interactive entry path via dispatch→drain)
+    // Extended by T-BL44: steps 10-13 inject Space key and verify normal-to orient.
     int sdStep = 0, sdSettle = 0;
     std::string sdSavePath, sdFid, sdL0, sdL1, sdL2, sdL3;
     bool sdDirReady = false;
     std::string sketchDispatchCapture;
+    float sdPreSpaceYaw = 0.f, sdPreSpacePitch = 0.f;  // T-BL44: camera state before Space
 
     // asm
     int asmStep = 0, asmSettle = 0;

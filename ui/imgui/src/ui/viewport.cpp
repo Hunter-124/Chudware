@@ -773,6 +773,23 @@ void drawViewport(AppState& s) {
         s_sketch.drawGhosts(host, a, b, vw, vh);
         if (s.inSketch)
             s_sketch.drawOverlay(host, io, a, b, vw, vh, imgHovered);
+
+        // T-BL44: Space orients the view normal-to the active sketch plane ("Normal To").
+        // cameraLock() returns the fronto-parallel yaw/pitch that sketch entry computed from the
+        // plane normal (sketch_mode.cpp enterForFeature); writing g_vpState re-orients the live
+        // camera via syncCameraToGl() next frame. Instant by design — the app cancels camera tweens
+        // while a sketch is active (cancelCameraAnimation, ~L626), and sketch entry itself snaps, so
+        // a tween would be fought frame-by-frame. Runs after the orbit read-back above so it is not
+        // clobbered. Space is otherwise free in sketch mode: the view-cube's Space handler is gated
+        // off during sketch (line ~786 !s.inSketch) and drawing_panel's Space-pan is the 2D Drafting
+        // workspace. Guarded on !WantTextInput so the Modify box keeps Space for text entry.
+        if (s.inSketch && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+            float nYaw = 0.f, nPitch = 0.f;
+            if (s_sketch.cameraLock(nYaw, nPitch)) {
+                g_vpState.yaw = nYaw;
+                g_vpState.pitch = nPitch;
+            }
+        }
     }
 
     s_shortcutBar.update(s, imgHovered, s.inSketch, a, b);

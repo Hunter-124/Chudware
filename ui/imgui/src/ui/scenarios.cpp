@@ -1360,13 +1360,82 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 sdSettle = kSettle;
                 break;
             }
+            // T-BL44: Space → orient view normal-to the active sketch plane.
+            // Steps 10-13 re-enter the sketch, rotate the camera to a clearly non-normal
+            // angle (yaw=99, pitch=55), inject a Space key press via ImGui IO, then verify
+            // on the following frame that g_vpState snapped to cameraLock()'s normal-to
+            // yaw/pitch (plane.top normal = yaw=0, pitch=90 by convention). We capture
+            // before (rotated) + after (normal-to) screenshots as visual evidence.
+            case 10: {  // re-enter the sketch (drain → active_ + inSketch)
+                st.pendingSketchEditFid = sdFid;
+                std::printf("sketch_dispatch[T-BL44]: re-entering sketch for Space test; "
+                            "awaiting drain\n");
+                std::fflush(stdout);
+                sdSettle = kSettle;
+                break;
+            }
+            case 11: {  // drain ran; rotate camera away from normal and capture "before" screenshot
+                std::printf("sketch_dispatch[T-BL44]: after re-enter inSketch=%d; "
+                            "rotating camera to (yaw=99 pitch=55) for Space snap test\n",
+                            (int)st.inSketch);
+                std::fflush(stdout);
+                // Directly write g_vpState so syncCameraToGl pushes it to the GL camera.
+                // We record the pre-Space values here; Space fires NEXT step after the
+                // orbit read-back has settled at 99/55.
+                ui::viewportState().yaw   = 99.f;
+                ui::viewportState().pitch = 55.f;
+                sdPreSpaceYaw   = 99.f;
+                sdPreSpacePitch = 55.f;
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_06_before_space.png";
+                sdSettle = 2;  // let the GL camera settle at 99/55 before Space
+                break;
+            }
+            case 12: {  // camera settled at 99/55; inject Space — handler reads g_vpState via cameraLock
+                std::printf("sketch_dispatch[T-BL44]: current yaw=%.1f pitch=%.1f; injecting Space\n",
+                            ui::viewportState().yaw, ui::viewportState().pitch);
+                std::fflush(stdout);
+                // Keep the rotated camera for this frame so the orbit read-back starts at 99/55.
+                ui::viewportState().yaw   = 99.f;
+                ui::viewportState().pitch = 55.f;
+                // Inject Space key press/release into ImGui IO so the handler in viewport.cpp
+                // fires this drawViewport call (after the orbit read-back that sets 99/55).
+                ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, true);
+                ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, false);
+                sdSettle = 2;  // let the snap settle into g_vpState
+                break;
+            }
+            case 13: {  // Space has fired; capture after-state and log yaw/pitch delta
+                float yw = ui::viewportState().yaw;
+                float pt = ui::viewportState().pitch;
+                std::printf("sketch_dispatch[T-BL44]: after Space: yaw=%.1f pitch=%.1f "
+                            "(was yaw=%.1f pitch=%.1f) inSketch=%d\n",
+                            yw, pt, sdPreSpaceYaw, sdPreSpacePitch, (int)st.inSketch);
+                // cameraLock for plane.top is yaw=0/180 pitch=~90 (normal-to XY plane).
+                // Verify the snap moved significantly away from our rotated (99,55) angle.
+                bool snapped = (std::fabs(yw - sdPreSpaceYaw) > 5.f ||
+                                std::fabs(pt - sdPreSpacePitch) > 5.f);
+                std::printf("sketch_dispatch[T-BL44]: Space snap %s (delta yaw=%.1f pitch=%.1f)\n",
+                            snapped ? "PASS" : "WARN-no-change",
+                            std::fabs(yw - sdPreSpaceYaw), std::fabs(pt - sdPreSpacePitch));
+                std::fflush(stdout);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_07_space_normal_to.png";
+                sdSettle = kSettle;
+                break;
+            }
+            case 14: {  // exit cleanly
+                st.dispatch("sketch_exit");
+                std::printf("sketch_dispatch[T-BL44]: exiting sketch after Space test\n");
+                std::fflush(stdout);
+                sdSettle = kSettle;
+                break;
+            }
             default:
                 cfg.sketchDispatchShotDone = true;
                 std::printf("sketch_dispatch: scenario complete\n");
                 std::fflush(stdout);
                 break;
         }
-        if (sdStep <= 9) ++sdStep;
+        if (sdStep <= 14) ++sdStep;
     }
 
     // ---------- fea (host-parity SimManager study flow) ----------
@@ -1950,7 +2019,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppSt
     }
     if (cfg.wantSketchDispatch) {
         if (!sketchDispatchCapture.empty()) {
-            mirrorLast(sketchDispatchCapture, "sketch_dispatch_05_extrude");
+            mirrorLast(sketchDispatchCapture, "sketch_dispatch_07_space_normal_to");
             sketchDispatchCapture.clear();
         }
         if (win) glfwSwapBuffers(win);

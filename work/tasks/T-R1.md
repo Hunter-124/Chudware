@@ -2,8 +2,8 @@
 id: T-R1
 title: PLM v1 - OSS survey + freeze contracts/plm.md (vault schema, lifecycle, lock/remote protocol)
 workstream: R
-owner: unassigned
-status: todo
+owner: opus-hunter
+status: doing
 branch: task/T-R1-plm-contract
 depends_on: []
 lane: plm-projects

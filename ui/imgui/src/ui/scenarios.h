@@ -66,6 +66,8 @@ struct ShotConfig {
     bool m1ShotDone = false;
     bool wantSketch = false;
     bool sketchShotDone = false;
+    bool wantSketchConvert = false;         // T-BL43: Convert Entities in-sketch shot
+    bool sketchConvertShotDone = false;
     bool wantAsm = false;
     bool asmShotDone = false;
     bool wantFea = false;
@@ -94,8 +96,8 @@ struct ShotConfig {
     int  glassperfFrame = 0;
 
     bool isScenarioMode() const {
-        return wantM1 || wantSketch || wantAsm || wantFea || wantFlow || wantCam
-            || wantDrawing || wantEvalMass || wantActivity || wantMultidoc;
+        return wantM1 || wantSketch || wantSketchConvert || wantAsm || wantFea || wantFlow
+            || wantCam || wantDrawing || wantEvalMass || wantActivity || wantMultidoc;
     }
 
     // Frame budget for the generic capture path (flow allows ~240 s at 60 Hz).
@@ -132,6 +134,12 @@ private:
     std::string skSavePath, skFid, skL0, skL1, skL2, skL3, skWidthCid;
     bool skDirReady = false;
     std::string sketchCapture;
+
+    // sketch_convert (T-BL43)
+    int scvStep = 0, scvSettle = 0;
+    std::string scvSavePath, scvFid;
+    bool scvDirReady = false;
+    std::string scvCapture;
 
     // asm
     int asmStep = 0, asmSettle = 0;

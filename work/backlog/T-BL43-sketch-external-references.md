@@ -83,3 +83,19 @@ tool work properly. Together these let a sketch reference the rest of the model.
   (opus-tarn) — the Convert tool code path (sketch_overlay.cpp:2707 SketchTool::Convert →
   applyConvertRef → sketch_convert op) is engine-complete from this branch; once T-BL48 lands,
   the in-GUI click flow reaches the now-working op with no further changes here.
+- 2026-07-04 opus-brae: SELECTION-BOUNDARY finding (DoD bullet 1): the in-sketch selection
+  system ALREADY permits external picks in both GUIs — the Convert Entities tool
+  (pickFinalPreferEdge id-pass edge/face picks while a sketch is open; host sketch_mode.cpp
+  C53 block, ui/imgui sketch_overlay.cpp:2707) and Smart Dimension's external-ref picks
+  (model edge / planar face / datum plane → addProjectedDimRef → projected + fix-pinned
+  construction entity). They were dead ends only because the sketch_convert op (Convert) had
+  no engine handler — fixed on this branch — and project_ref previews were line/circle-only.
+  This matches SolidWorks interaction: external geometry is selectable in-sketch THROUGH the
+  reference-consuming tools (convert/dimension), and projected copies are the mechanism that
+  keeps non-coplanar geometry from entering the sketch raw (per this task's driver note). No
+  blanket allow-external change to the idle-tool sketch selection filter was made — deliberate,
+  to avoid colliding with T-BL48's entry-dispatch wiring and T-BL44/41 in the same files.
+- 2026-07-04 opus-brae: added ctest regression test_sketch_convert (4 cases / 36 asserts,
+  commit 0867513a) + AI_CAD_SHOT=sketch_convert headless GUI scenario (scenarios.{h,cpp}) —
+  box → empty sketch on top face → sketch_convert(bottom face) → sketch_enter → capture;
+  intentionally OUTSIDE the gui_parity `sketch` diff set (host scenario has no convert step).

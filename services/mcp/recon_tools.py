@@ -1265,6 +1265,143 @@ def register_recon_tools(mcp: FastMCP) -> None:
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
+    @mcp.tool()
+    def project_into_sketch(sketch: str, refs: Union[list, dict],
+                            doc_id: Optional[str] = None,
+                            construction: bool = False) -> str:
+        """"Convert entities" INTO an existing sketch — SolidWorks-style edge/face projection that
+        appends real (or construction) geometry to a sketch you are already working in.
+
+        DISTINCT FROM convert_face_to_sketch, which creates an entirely NEW sketch on one planar
+        face's own plane.  Use THIS tool when you have an open sketch and want to trace edges or
+        faces from the surrounding solid into it — the way SolidWorks "Convert Entities" works.
+
+        Behaviour:
+          * Each projected entity is appended as a real sketch entity (lines/arcs/circles/
+            ellipses; oblique circular edges become ellipses; near-perpendicular edges collapse to
+            a point; unclassifiable curves fall back to a 24-seg polyline with approx:true).
+          * Every new entity is immediately pinned with a whole-entity `fix` relation so it
+            cannot drift during sketch solving.
+          * Projection is ONE-SHOT (non-associative): converted geometry does NOT update if
+            the source model changes later — this is a deliberate trade-off matching the engine's
+            current capability.  Associative "sketch links" are a filed follow-up.
+
+        construction : if True the projected entities are flagged construction (blue in the app);
+                       they define references but are excluded from extruded regions.
+
+        refs grammar (a single ref or a list of refs):
+          Datum plane:  "front" | "top" | "right"
+                        OR  {"datum": "front"}   — the plane's intersection with the sketch plane
+                        becomes a line.
+          Face:         "F<sid>"  (a face sid from describe_part, e.g. "Fdb31d2")
+                        OR  a side word ("top"/"bottom"/"left"/"right"/"front"/"back") — resolved
+                        via doc_query to the matching face sid
+                        OR  {"kind": "face", "selector": {"sid": "Fdb31d2"}}
+                        A face ref projects ALL its boundary wires (outer + hole loops).
+          Edge:         "E<sid>"  (an edge sid from describe_part, e.g. "E4a7c9")
+                        OR  {"kind": "edge", "selector": {"sid": "E4a7c9"}}
+
+        Examples:
+          project_into_sketch("s2", "front")
+              -> projects the front datum plane intersection line into sketch s2
+          project_into_sketch("s2", ["Fdb31d2", "E4a7c9"])
+              -> projects a face's full wire loop + one edge into sketch s2
+          project_into_sketch("s2", {"kind":"face","selector":{"sid":"Fdb31d2"}},
+                              construction=True)
+              -> appends construction geometry tracing the face's wires
+
+        Returns {ok, doc_id, sketch, entity_ids, construction,
+                 note:"one-shot projection: converted geometry does NOT update if the source model
+                      changes"}.
+        entity_ids lists the ids of every appended entity in order (first is "$0", rest are
+        "$0#1", "$0#2", … from the engine id_map).
+        """
+        try:
+            d = _doc(doc_id)
+
+            # ---- normalise to a list ----
+            raw = refs if isinstance(refs, list) else [refs]
+            norm_refs: list = []
+
+            _DATUMS = {"front", "top", "right"}
+            _SIDES = {"top", "bottom", "left", "right", "front", "back"}
+
+            for ref in raw:
+                # Already a well-formed dict — pass through unchanged
+                if isinstance(ref, dict):
+                    norm_refs.append(ref)
+                    continue
+
+                # String shorthand
+                s = ref.strip()
+                if s in _DATUMS:
+                    # Datum plane takes priority over face-side words for front/top/right
+                    norm_refs.append({"datum": s})
+                elif s.startswith("F"):
+                    # Face sid — verify it exists
+                    got = cb.call("doc_query", {"doc_id": d,
+                                                "query": {"of": "face"}}).get("matches", [])
+                    match = next((m for m in got if m.get("sid") == s), None)
+                    if match is None:
+                        return _dumps({"ok": False, "error":
+                                       f"no face with sid {s!r} (call describe_part for current "
+                                       f"sids, or use a side word for the face-side lookup)"})
+                    norm_refs.append({"kind": "face", "selector": match})
+                elif s.startswith("E"):
+                    # Edge sid — verify it exists
+                    got = cb.call("doc_query", {"doc_id": d,
+                                                "query": {"of": "edge"}}).get("matches", [])
+                    match = next((m for m in got if m.get("sid") == s), None)
+                    if match is None:
+                        return _dumps({"ok": False, "error":
+                                       f"no edge with sid {s!r} (call describe_part or "
+                                       f"query_geometry to list edge sids)"})
+                    norm_refs.append({"kind": "edge", "selector": match})
+                elif s in _SIDES:
+                    # Side word for a face — resolve via doc_query
+                    got = cb.call("doc_query", {"doc_id": d,
+                                                "query": {"of": "face", "side": s}
+                                                }).get("matches", [])
+                    if not got:
+                        return _dumps({"ok": False, "error":
+                                       f"no face with side {s!r} — check describe_part; for "
+                                       f"datum planes use 'front'/'top'/'right' directly"})
+                    norm_refs.append({"kind": "face", "selector": got[0]})
+                else:
+                    return _dumps({"ok": False, "error":
+                                   f"unrecognised ref {s!r} — expected a datum string "
+                                   f"('front'/'top'/'right'), a face sid ('F…'), an edge sid "
+                                   f"('E…'), a side word, or a ref dict"})
+
+            op = {"op": "sketch_convert", "sketch": sketch, "refs": norm_refs,
+                  "construction": construction}
+            r = cb.call("doc_apply_ops", {"doc_id": d, "ops": [op]})
+            ok, bad = _feature_ok(r)
+            if not ok:
+                return _dumps({"ok": False, "error": "sketch_convert op failed to build",
+                               "failed_features": bad})
+
+            # Collect entity ids: "$0" is the first; "$0#1", "$0#2", … are the rest
+            id_map = r.get("id_map") or {}
+            first = id_map.get("$0")
+            entity_ids: list = []
+            if first is not None:
+                entity_ids.append(first)
+                k = 1
+                while True:
+                    nxt = id_map.get(f"$0#{k}")
+                    if nxt is None:
+                        break
+                    entity_ids.append(nxt)
+                    k += 1
+
+            return _dumps({"ok": True, "doc_id": d, "sketch": sketch,
+                           "entity_ids": entity_ids, "construction": construction,
+                           "note": ("one-shot projection: converted geometry does NOT update "
+                                    "if the source model changes")})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
 
 # ---------------------------------------------------------------- photo-capture + photogrammetry entry path (T-F6)
 

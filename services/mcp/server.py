@@ -104,7 +104,8 @@ register_gsl_tools(_reg.view(mcp, "gsl"))
 
 # Recon — reverse-engineering: import a STEP/mesh → deterministic feature recognition → an
 # EDITABLE parametric tree, verified against the source solid by boolean comparison
-# (reverse_engineer / compare_parts / convert_face_to_sketch; guide: cad_guide("reverse")).
+# (reverse_engineer / compare_parts / convert_face_to_sketch / project_into_sketch;
+# guide: cad_guide("reverse")).
 from mcp_server.recon_tools import register_recon_tools
 register_recon_tools(_reg.view(mcp, "recon"))
 

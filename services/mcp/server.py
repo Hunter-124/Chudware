@@ -71,14 +71,16 @@ mcp = FastMCP(
         "REPAIR: if add_features returns ok=false on any feature, call regen_diagnose() to get "
         "a fix-ops card (cad_guide('regen')).\n"
         "DIFF + REVIEW: doc_diff_tool(rev_a, rev_b) for semantic change records (cad_guide('doc_diff')); "
-        "design_review(doc_id) for a one-call geometry battery (cad_guide('design_review')).\n"
+        "design_review(doc_id) for a one-call geometry battery (cad_guide('design_review')); "
+        "stackup_analyze(dims) for 1D worst-case + RSS tolerance stack-up over a dimension chain "
+        "(cad_guide('tolerance_stackup')).\n"
         "DELIVERABLES: make_report/make_presentation/make_workbook build real office files "
         "(cad_guide('deliverables')). RESEARCH: research_web_search/research_fetch_page for "
         "look-it-up, never recall — the model never types a load-bearing number from memory.\n"
         "All cad_guide topics: overview, simulation, review, intake, gsl, cam, narration, parts, "
         "reverse, deliverables, requirements, dag, verify, interaction, sourcing, cost, spec, "
         "piping, hydraulic, firmware, structural, regen, code_compliance, serving, design_review, "
-        "doc_diff, plm."
+        "doc_diff, plm, tolerance_stackup."
         "REBUILD FAILURE? A failed add_features batch may carry a `regen_diagnosis` fix-preview "
         "card (diagnosis + editable fix_ops + verifier verdict). Record your verdict with "
         "regen_resolve(card, 'accept'|'edit'|'reject') — accept/edit returns the fixed document; "
@@ -220,6 +222,10 @@ register_dag_replan_tools(mcp)
 # card per contracts/narration.md — never a raw JSON dump.
 from services.mcp.design_review_tools import register_design_review_tools
 register_design_review_tools(mcp)
+# Tolerance stack-up analysis (T-BL08): 1D worst-case + RSS over a chain of feature
+# dimensions.  Pure-Python; no C++ engine required.  See cad_guide('tolerance_stackup').
+from services.mcp.tolerance_tools import register_tolerance_tools
+register_tolerance_tools(mcp)
 
 
 def _install_clean_stdout():

@@ -1,7 +1,7 @@
 {
  "agent": "Hunter-124",
  "host": "hunter-pc",
- "activity": "graphify_query",
+ "activity": "graphify_explain",
  "task": "",
- "ts": "2026-07-04T20:38:49Z"
+ "ts": "2026-07-04T20:38:50Z"
 }

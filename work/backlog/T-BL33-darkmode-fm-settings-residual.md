@@ -3,7 +3,7 @@ id: T-BL33
 title: Dark-mode GUI residual — FM plane-row text + hover-action tooltips black-on-black (issue #11); settings popup transparent OS border (issue #12)
 workstream: backlog
 owner: opus-hunter
-status: doing
+status: review
 priority: 2
 lane: app-gui
 kind: fix

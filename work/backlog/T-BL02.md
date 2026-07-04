@@ -3,7 +3,7 @@ id: T-BL02
 title: Format interop track (reverse-engineering intake)
 workstream: backlog
 owner: mooseinatree
-status: todo
+status: doing
 branch: task/T-BL02-format-interop
 depends_on: []
 lane: modeling-core
@@ -30,3 +30,25 @@ normal agent auto-claim path — coordinate with mooseinatree on which format is
 - [ ] Each format lands as an engine/doc/formats.py importer with fixture round-trip tests
 - [ ] Clean-room protocol memo followed for every reversed format
 - [ ] ODA membership decision recorded for DWG/Revit
+
+## Progress log
+
+### 2026-07-03 — mooseinatree (Opus driver, isolated Windows checkout)
+
+Picking up the greenlit no-reversing slice: **DXF import via ezdxf (MIT)**. Status:
+- `.3dm` (rhino3dm, MIT) importer/exporter already exists in engine/doc/formats.py at
+  the mesh level (NURBS/Brep-only .3dm still skip — rhino3dm has no mesher; documented).
+- `.dxf` is entirely absent (no ext map, no FormatInfo, no importer) → building it now:
+  `engine_oracle/doc/formats_dxf.py` (new module, mirrors formats_solidworks.py),
+  wired into the registry + import_path; ezdxf → build123d edges → wires → faces where
+  closed → Compound. Import-only for now (2D→DXF export deferred; stated honestly).
+
+**Environment note (this Windows checkout only, local/non-committed):** the top-level
+`engine`, `mcp_server`, `dag`, `deliverables`, `agent`, `installer`, `app`, `corpus*`,
+`test_fixtures_sw` names are git symlinks (mode 120000, e.g. `engine → engine_oracle`)
+that got materialized as real directory copies because core.symlinks=false on Windows.
+Git reported all 11 as "deleted", which tripped `work.py claim`'s dirty-tree guard
+(BUSY on every claim). Remedy applied: `git update-index --skip-worktree` on those 11
+paths — local-only, reversible (`--no-skip-worktree`), does NOT change committed content
+or the Linux symlink layout. Canonical edits go in the tracked tree (`engine_oracle/`);
+the runtime `engine/` copy is kept in sync for pytest (Python imports resolve to `engine/`).

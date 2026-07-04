@@ -952,6 +952,9 @@ void AppState::clearViewportForNewDoc() {
     bodyVisible.clear();
     docBodyIds.clear();
     hiddenFeatures.clear();
+    // T-BL37: origin point glyph is hidden by default (matches planes' hidden-by-default
+    // behavior). The FM eye toggle removes this entry to show it.
+    hiddenFeatures.insert("point.origin");
     applyBodyVisibility();
     applyDatumVisibility();
     asmParts.clear();

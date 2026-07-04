@@ -4550,6 +4550,80 @@ bool SketchMode::drawAxisPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
     return true;
 }
 
+// T-BL37: hit-test displayed point datums (world origin + user-created point features) in screen
+// space. A 2D distance test against the projected world point, within a grab radius. On click,
+// routes the point datum into the active PM well via routeDatumPoint().
+bool SketchMode::drawPointPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
+                                 const ImVec2& imgMax, int vw, int vh, bool imgHovered) {
+    if (active_) return false;
+    auto* pm = st.propertyManager;
+    if (!st.renderer || !st.workerStarted || !pm || !pm->active() ||
+        !pm->activeWellWantsPoint() || !imgHovered)
+        return false;
+
+    const auto& cam = st.renderer->camera();
+    const ImVec2 mouse = io.MousePos;
+    const float grabRadius = 10.0f * ui::uiScale;
+
+    // Collect all point-kind datums that are not hidden (including the synthetic origin).
+    // The renderer's refDatums_ is not directly accessible, so we rebuild from docMirror
+    // (user-created) plus the synthetic origin.
+    struct PointCandidate { float wx, wy, wz; std::string fid, name; };
+    std::vector<PointCandidate> candidates;
+
+    // Synthetic world origin — always included (visibility handled by hidden check below).
+    if (!st.hiddenFeatures.count("point.origin"))
+        candidates.push_back({0.0f, 0.0f, 0.0f, "point.origin", "Origin"});
+
+    // User-created point-datum features from docMirror.
+    const nlohmann::json& datums = st.docMirror.refDatums();
+    if (datums.is_array()) {
+        for (const auto& d : datums) {
+            if (!d.is_object() || d.value("kind", std::string()) != "point") continue;
+            std::string fid = d.value("id", std::string());
+            if (fid.empty() || st.hiddenFeatures.count(fid)) continue;
+            const auto& pt = d.contains("point") ? d["point"] : nlohmann::json();
+            if (!pt.is_array() || pt.size() < 3) continue;
+            candidates.push_back({(float)pt[0].get<double>(),
+                                   (float)pt[1].get<double>(),
+                                   (float)pt[2].get<double>(),
+                                   fid, d.value("name", fid)});
+        }
+    }
+
+    // Find the closest candidate within grab radius.
+    float best = grabRadius;
+    std::string bestFid, bestName;
+    ImVec2 bestScreen;
+    for (const auto& c : candidates) {
+        ImVec2 s;
+        if (!worldToScreen(cam, imgMin, vw, vh, c.wx, c.wy, c.wz, s)) continue;
+        float dx = mouse.x - s.x, dy = mouse.y - s.y;
+        float d = std::sqrt(dx * dx + dy * dy);
+        if (d < best) {
+            best = d;
+            bestFid = c.fid;
+            bestName = c.name;
+            bestScreen = s;
+        }
+    }
+    if (bestFid.empty()) return false;
+
+    // Highlight: draw an accent circle around the projected point glyph.
+    const auto& pal = ui::palette;
+    ImDrawList* wdl = ImGui::GetWindowDrawList();
+    wdl->PushClipRect(imgMin, imgMax, true);
+    wdl->AddCircle(bestScreen, grabRadius * 0.8f, col(pal.accent, 0.95f), 24, 2.0f * ui::uiScale);
+    glassHudBanner(wdl, "sk_pm_point_banner", imgMin, imgMax, imgMin.y + 52.0f * ui::uiScale,
+                   "Click the reference point");
+    wdl->PopClipRect();
+
+    st.requestCursor(ui::CursorKind::Hand);
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        pm->routeDatumPoint(bestFid, bestName);
+    return true;
+}
+
 bool SketchMode::drawCurvePathPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
                                      const ImVec2& imgMax, int vw, int vh, bool imgHovered) {
     if (active_) return false;                  // editing a sketch: that overlay owns the canvas

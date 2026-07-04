@@ -52,6 +52,7 @@ enum class PMFieldKind { Dim, SelectorWell, Combo, Check, Int, DatumRef, Feature
 // — the SolidWorks "click a reference plane" interaction reused outside the new-sketch flow.
 struct PMSelKinds {
     bool face = false, edge = false, vertex = false, body = false, plane = false, axis = false;
+    bool point = false;  // T-BL37: world-origin point ("point.origin") or point-datum feature
 };
 
 // One row of a feature form (data-driven; one per param/ref in feature_params order).
@@ -320,6 +321,9 @@ public:
     // datum's name). Stores a {"kind":"datum","feature":fid} selector — the engine's revolve /
     // pattern axis slots resolve it via resolve_axis_ref. Re-picking the same axis toggles it off.
     bool routeDatumAxis(const std::string& fid, const std::string& label);
+    // T-BL37: route origin/point-datum into a SelectorWell that has selKinds.point=true.
+    bool routeDatumPoint(const std::string& fid, const std::string& label = "");
+    bool activeWellWantsPoint() const;  // T-BL37
 
     // Human phrase for the active well's accepted topology ("edges", "faces or edges", …), or ""
     // when no selector well is active. Used to toast feedback when a pick is rejected for the

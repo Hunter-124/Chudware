@@ -26,7 +26,8 @@ using std::vector;
 // --------------------------------------------------------------------------- tables
 
 const std::set<string> RESERVED_DATUMS = {
-    "origin", "plane.front", "plane.top", "plane.right",
+    "origin", "point.origin",  // T-BL37: "point.origin" is the canonical prefixed form; "origin" kept for back-compat
+    "plane.front", "plane.top", "plane.right",
     "axis.x", "axis.y", "axis.z",
 };
 

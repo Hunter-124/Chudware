@@ -25,6 +25,18 @@ they render on transparency so the one asset works on the ribbon glass in both l
 dark mode. Modified-face emphasis (selection-highlight colour) is a follow-up layer (needs
 a highlight overlay in the thumbnail FBO keyed by selection topo-ids) -- see the handoff.
 
+T-BL34 (v2): three layers on top of the T-G15 flow --
+  * operation-COLOR emphasis: recipes color the op-created body with the app accent
+    teal (ui_theme accent #2DD4BF) via set_appearance, so the tile reads "this is what
+    the op made" (per-face emphasis is still a renderer follow-up; per-body v1).
+  * operation-INTENT annotation: a minimal overlay (arrow / rotation cue / mirror line /
+    boolean badge) composited onto the tile in Python post-render (ANNOTATIONS table).
+  * Manufacture toolpath tiles: scripts/cam_toolpath_icons.py drives the REAL CAM chain
+    (cam_new -> add_tool/setup/operation -> cam_generate -> cam_simulate) and renders the
+    generated cutter moves over the stock (Hunter directive 2026-07-04: showcase the
+    generated toolpaths). Those cells (cam_*) are appended to the atlas byte-preservingly
+    by ensure_cells(); ribbon_def.cpp points the Manufacture op buttons at them.
+
 Usage:
   python3 scripts/icon_pipeline.py --render        # run the app + regenerate + inject
   python3 scripts/icon_pipeline.py --inject-only   # re-tile from existing scratch renders
@@ -79,6 +91,17 @@ def box(length=52.0, width=40.0, height=30.0, name="Box1") -> dict:
 # glass/paint presets) are handed off -- Manufacture needs the CAM-simulator source, not
 # this modeling viewport; patterns/booleans need their op schemas verified first.
 # ---------------------------------------------------------------------------------------
+
+
+# App accent teal (ui_theme.cpp dark accent #2DD4BF; also the icons-contract teal).
+ACCENT_RGB = (0.176, 0.831, 0.749)
+
+
+def accent(body_id: str = "b1") -> dict:
+    """Color the op-created body with the selection-accent so the tile highlights
+    what the operation produced (T-BL34 per-body emphasis, v1)."""
+    return {"op": "set_appearance", "id": body_id, "color": list(ACCENT_RGB),
+            "metallic": 0.05, "roughness": 0.45}
 
 
 def appearance(metallic: float, roughness: float, rgb: tuple[float, float, float]) -> dict:
@@ -160,7 +183,7 @@ RECIPES: dict[str, dict] = {
     # -----------------------------------------------------------------------
 
     # Plain solid block reads as "create a 3D body / boss".
-    "extrude_boss": {"yaw": 35, "pitch": 26, "steps": [box(52, 40, 34)]},
+    "extrude_boss": {"yaw": 35, "pitch": 26, "steps": [box(52, 40, 34), accent()]},
 
     # revolve_boss: stepped-rectangle profile on plane.front (XZ), revolve around Z axis.
     # plane.front = XZ; sketch-x = world-X, sketch-y = world-Z.
@@ -182,6 +205,7 @@ RECIPES: dict[str, dict] = {
                 "profile": [region("f1", 12, 0)],
                 "axis": datum("axis.z"),
             }}},
+        accent(),
     ]},
 
     # revolve_cut: circle extrude cylinder → revolve-cut a groove.
@@ -227,6 +251,7 @@ RECIPES: dict[str, dict] = {
                 "profile": [region("f1", 0, 0)],
                 "path": region("f2", 15, 0),
             }}},
+        accent(),
     ]},
 
     # sweep_cut: base block (f1 sketch, f2 extrude), cut profile (f3 sketch),
@@ -275,6 +300,7 @@ RECIPES: dict[str, dict] = {
             "type": "loft", "name": "Blend1",
             "params": {"mode": "boss"},
             "refs": {"sections": [region("f1", 0, 0), region("f2", 0, 0)]}}},
+        accent(),
     ]},
 
     # loft_cut: block (f1 sketch, f2 extrude) with loft-cut pocket
@@ -349,11 +375,13 @@ RECIPES: dict[str, dict] = {
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Boss",
             "params": {"mode": "boss", "depth": dim(12)},
+            "merge": False,
             "refs": {"profile": [region("f3", -22, 0)]}}},
         {"op": "add_feature", "feature": {
             "type": "linear_pattern", "name": "LinPat",
             "params": {"count1": 3, "spacing1": dim(22)},
             "refs": {"dir1": datum("axis.x"), "features": ["f4"]}}},
+        accent("b2"),
     ]},
 
     # circular_pattern: disc (f1 sk, f2 ext) + spoke (f3 sk, f4 ext) + circ-pat (f5).
@@ -374,11 +402,13 @@ RECIPES: dict[str, dict] = {
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "Spoke",
             "params": {"mode": "boss", "depth": dim(10)},
+            "merge": False,
             "refs": {"profile": [region("f3", 13, 0)]}}},
         {"op": "add_feature", "feature": {
             "type": "circular_pattern", "name": "Wheel",
             "params": {"count": 6, "angle": dim(360), "equal_spacing": True},
             "refs": {"axis": datum("axis.z"), "features": ["f4"]}}},
+        accent("b2"),
     ]},
 
     # mirror: base (f1 sk, f2 ext) + L-boss (f3 sk, f4 ext) + mirror (f5).
@@ -394,21 +424,24 @@ RECIPES: dict[str, dict] = {
             "params": {"mode": "boss", "depth": dim(8)},
             "refs": {"profile": [region("f1", 0, 0)]}}},
         *sketch_with_id([
-            {"type": "line", "p1": [4, -10], "p2": [26, -10], "id": "l1"},
-            {"type": "line", "p1": [26, -10], "p2": [26, 10], "id": "l2"},
-            {"type": "line", "p1": [26, 10], "p2": [14, 10], "id": "l3"},
-            {"type": "line", "p1": [14, 10], "p2": [14, 0], "id": "l4"},
-            {"type": "line", "p1": [14, 0], "p2": [4, 0], "id": "l5"},
-            {"type": "line", "p1": [4, 0], "p2": [4, -10], "id": "l6"},
+            {"type": "line", "p1": [4, -12], "p2": [26, -12], "id": "l1"},
+            {"type": "line", "p1": [26, -12], "p2": [26, -3], "id": "l2"},
+            {"type": "line", "p1": [26, -3], "p2": [14, -3], "id": "l3"},
+            {"type": "line", "p1": [14, -3], "p2": [14, -8], "id": "l4"},
+            {"type": "line", "p1": [14, -8], "p2": [4, -8], "id": "l5"},
+            {"type": "line", "p1": [4, -8], "p2": [4, -12], "id": "l6"},
         ], plane="plane.top", name="LBSk", fid="f3"),
         {"op": "add_feature", "feature": {
             "type": "extrude", "name": "LBoss",
             "params": {"mode": "boss", "depth": dim(16)},
-            "refs": {"profile": [region("f3", 15, -5)]}}},
+            "refs": {"profile": [region("f3", 15, -7)]}}},
         {"op": "add_feature", "feature": {
             "type": "mirror", "name": "Mir1",
             "params": {},
             "refs": {"plane": datum("plane.front"), "features": ["f4"]}}},
+        # NOTE(T-BL34): merge=False + accent broke the mirror copy (only the seed
+        # rendered); reverted to the proven merged recipe -- the dash annotation
+        # carries the intent. Per-body emphasis here needs the per-face follow-up.
     ]},
 
     # -----------------------------------------------------------------------
@@ -514,6 +547,7 @@ RECIPES: dict[str, dict] = {
             "type": "sweep", "name": "Spring",
             "params": {"mode": "boss"},
             "refs": {"profile": [region("f1", 10, 0)], "path": "f2"}}},
+        accent(),
     ]},
 
     # -----------------------------------------------------------------------
@@ -571,6 +605,191 @@ RECIPES: dict[str, dict] = {
     # Not added here -- photographic renders would override correct line-art glyphs.
     # -----------------------------------------------------------------------
 }
+
+
+# ---------------------------------------------------------------------------------------
+# T-BL34: operation-intent annotation overlays. Minimal, one cue per tile, composited in
+# Python post-render (never in the C++ renderer). Coordinates are normalized (0..1) tile
+# space. Drawn at 4x then downscaled so they stay crisp at 32/20 px.
+#   arrow  [x0,y0,x1,y1]      straight arrow head at (x1,y1)         (direction of the op)
+#   arc    [cx,cy,r,a0,a1]    circular arrow, degrees, head at a1    (rotation/revolve)
+#   dash   [x0,y0,x1,y1]      dashed line                            (mirror/symmetry plane)
+#   darrow [x0,y0,x1,y1]      double-headed arrow                    (unfold/flatten)
+#   badge  "+"|"-"|"n"        corner disc badge                      (boolean union/cut/isect)
+#   ring   [cx,cy,r]          spotlight ring                         (look-here: fillet edge)
+# Colors: app accent teal + dark keyline so the cue reads on BOTH theme backgrounds.
+# ---------------------------------------------------------------------------------------
+ANNOTATIONS: dict[str, dict] = {
+    "extrude_boss":     {"arrow": [0.84, 0.66, 0.84, 0.20]},
+    "revolve_boss":     {"arc": [0.50, 0.22, 0.17, 210, 330]},
+    "revolve_cut":      {"arc": [0.50, 0.22, 0.17, 210, 330]},
+    "sweep":            {"arrow": [0.68, 0.52, 0.68, 0.16]},
+    "sweep_cut":        {"arrow": [0.22, 0.36, 0.72, 0.36]},
+    "loft":             {"arrow": [0.85, 0.72, 0.85, 0.24]},
+    "loft_cut":         {"arrow": [0.50, 0.10, 0.50, 0.42]},
+    "fillet":           {"ring": [0.23, 0.48, 0.14]},
+    "chamfer":          {"ring": [0.23, 0.48, 0.14]},
+    "shell":            {"arrow": [0.50, 0.08, 0.50, 0.38]},
+    "linear_pattern":   {"arrow": [0.24, 0.28, 0.78, 0.28]},
+    "circular_pattern": {"arc": [0.50, 0.48, 0.34, -50, 190]},
+    "mirror":           {"dash": [0.10, 0.63, 0.94, 0.38]},  # y=0 plane trace
+    "combine":          {"badge": "+"},
+    "subtract":         {"badge": "-"},
+    "intersect":        {"badge": "n"},
+    "curve_helix":      {"arc": [0.50, 0.26, 0.18, 220, 320]},
+    "sm_flat_pattern":  {"darrow": [0.20, 0.42, 0.80, 0.42]},
+    # appr_* tiles: no annotation -- they ARE the material preset.
+    # cam_* tiles: the backplot colors already annotate cut/rapid/entry; no overlay.
+}
+
+_TEAL = (45, 212, 191, 255)
+_KEYLINE = (8, 34, 30, 210)
+
+
+def _draw_arrow(d, p0, p1, w, col):
+    import math as _m
+    d.line([p0, p1], fill=col, width=w)
+    ang = _m.atan2(p1[1] - p0[1], p1[0] - p0[0])
+    ah = w * 3.2
+    for da in (2.55, -2.55):
+        d.line([p1, (p1[0] + ah * _m.cos(ang + da), p1[1] + ah * _m.sin(ang + da))],
+               fill=col, width=w)
+
+
+def _annotation_layer(spec: dict, px: int) -> Image.Image:
+    """Render one annotation spec to a transparent px*px layer (4x supersampled)."""
+    import math as _m
+    from PIL import ImageDraw
+    S = 4
+    sp = px * S
+    img = Image.new("RGBA", (sp, sp), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    W = max(3, sp // 34)          # cue stroke width
+    KW = W + max(2, W // 2)       # keyline width
+
+    def P(x, y):
+        return (x * sp, y * sp)
+
+    for col, w in ((_KEYLINE, KW), (_TEAL, W)):
+        if "arrow" in spec:
+            x0, y0, x1, y1 = spec["arrow"]
+            _draw_arrow(d, P(x0, y0), P(x1, y1), w, col)
+        if "darrow" in spec:
+            x0, y0, x1, y1 = spec["darrow"]
+            mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+            _draw_arrow(d, P(mx, my), P(x1, y1), w, col)
+            _draw_arrow(d, P(mx, my), P(x0, y0), w, col)
+        if "dash" in spec:
+            x0, y0, x1, y1 = spec["dash"]
+            n = 7
+            for i in range(n):
+                t0, t1 = i / n, (i + 0.62) / n
+                d.line([P(x0 + (x1 - x0) * t0, y0 + (y1 - y0) * t0),
+                        P(x0 + (x1 - x0) * t1, y0 + (y1 - y0) * t1)], fill=col, width=w)
+        if "arc" in spec:
+            cx, cy, r, a0, a1 = spec["arc"]
+            bb = [P(cx - r, cy - r)[0], P(cx - r, cy - r)[1],
+                  P(cx + r, cy + r)[0], P(cx + r, cy + r)[1]]
+            d.arc(bb, start=min(a0, a1), end=max(a0, a1), fill=col, width=w)
+            a1r = _m.radians(a1)
+            tip = (cx * sp + r * sp * _m.cos(a1r), cy * sp + r * sp * _m.sin(a1r))
+            tang = a1r + (_m.pi / 2 if a1 >= a0 else -_m.pi / 2)
+            back = (tip[0] - w * 3.0 * _m.cos(tang), tip[1] - w * 3.0 * _m.sin(tang))
+            _draw_arrow(d, back, tip, w, col)
+        if "ring" in spec:
+            cx, cy, r = spec["ring"]
+            bb = [P(cx - r, cy - r)[0], P(cx - r, cy - r)[1],
+                  P(cx + r, cy + r)[0], P(cx + r, cy + r)[1]]
+            d.ellipse(bb, outline=col, width=w)
+        if "badge" in spec:
+            r = sp * 0.14
+            bx, by = sp * 0.80, sp * 0.20
+            if col is _KEYLINE:
+                d.ellipse([bx - r - KW, by - r - KW, bx + r + KW, by + r + KW], fill=col)
+            else:
+                d.ellipse([bx - r, by - r, bx + r, by + r], fill=col)
+                sym = spec["badge"]
+                sw = max(3, W)
+                a = r * 0.52
+                ink = (6, 26, 23, 255)
+                if sym == "+":
+                    d.line([bx - a, by, bx + a, by], fill=ink, width=sw)
+                    d.line([bx, by - a, bx, by + a], fill=ink, width=sw)
+                elif sym == "-":
+                    d.line([bx - a, by, bx + a, by], fill=ink, width=sw)
+                else:  # "n" -> intersection cup
+                    d.arc([bx - a, by - a, bx + a, by + a * 1.6],
+                          start=180, end=360, fill=ink, width=sw)
+                    d.line([bx - a, by, bx - a, by + a * 0.8], fill=ink, width=sw)
+                    d.line([bx + a, by, bx + a, by + a * 0.8], fill=ink, width=sw)
+    return img.resize((px, px), Image.LANCZOS)
+
+
+def load_tile(name: str) -> Image.Image | None:
+    """Load a rendered tile and composite its operation-intent annotation (if any).
+    Single source used by both atlas injection and the contact sheets, so what
+    Hunter reviews is exactly what ships."""
+    src = RENDER_DIR / f"{name}.png"
+    if not src.exists():
+        return None
+    img = Image.open(src).convert("RGBA")
+    spec = ANNOTATIONS.get(name)
+    if spec:
+        img = img.copy()
+        img.alpha_composite(_annotation_layer(spec, img.size[0]))
+    return img
+
+
+# ---------------------------------------------------------------------------------------
+# T-BL34: byte-preserving atlas extension for NEW cells (the cam_* Manufacture tiles).
+# Existing rows/UVs are untouched; new 34px rows are appended at the bottom following the
+# exact make_icons.py layout (@32 at x=0,y+1; @20 at x=34,y+7). make_icons.py also knows
+# these names (CONTRACT_NAMES + drawers), so a full atlas regen produces the same layout;
+# this path just avoids regenerating (and re-eyeballing) all ~190 existing glyph rows.
+# ---------------------------------------------------------------------------------------
+
+def ensure_cells(names: list[str]) -> None:
+    atlas_path = ICON_DIR / "atlas.json"
+    atlas = json.loads(atlas_path.read_text(encoding="utf-8"))
+    cells = atlas["cell"]
+    missing = [n for n in names if f"{n}@32" not in cells]
+    if not missing:
+        return
+    # placeholder glyphs come from make_icons.py's registered drawers (SDF-style line
+    # art) so a cell is never blank even if its toolpath render fails.
+    sys.path.insert(0, str(REPO / "host" / "assets"))
+    try:
+        import make_icons as mi
+
+        def placeholder(name, sz, fn):
+            pal = mi.DARK if fn == "atlas_dark.png" else mi.LIGHT
+            return mi._render_icon(name, sz, pal)
+    except Exception as e:  # pragma: no cover -- make_icons import is best-effort
+        print(f"   ensure_cells: no placeholder glyphs ({e})")
+
+        def placeholder(name, sz, fn):
+            return Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
+    row_h = 34
+    w, h = atlas["atlas_px"]
+    new_h = h + row_h * len(missing)
+    for fn in ("atlas_dark.png", "atlas_light.png"):
+        im = Image.open(ICON_DIR / fn).convert("RGBA")
+        grown = Image.new("RGBA", (w, new_h), (0, 0, 0, 0))
+        grown.paste(im, (0, 0))
+        for i, name in enumerate(missing):
+            y = h + i * row_h
+            for x, sz, yoff in ((0, 32, 1), (34, 20, 7)):
+                g = placeholder(name, sz, fn)
+                grown.paste(g, (x, y + yoff), g)
+        grown.save(ICON_DIR / fn)
+    for i, name in enumerate(missing):
+        y = h + i * row_h
+        cells[f"{name}@32"] = {"x": 0, "y": y + 1, "w": 32, "h": 32}
+        cells[f"{name}@20"] = {"x": 34, "y": y + 7, "w": 20, "h": 20}
+    atlas["atlas_px"] = [w, new_h]
+    atlas_path.write_text(json.dumps(atlas, indent=1), encoding="utf-8")
+    print(f"[icon_pipeline] atlas extended with {len(missing)} new cell row(s): "
+          f"{', '.join(missing)}")
 
 
 def _flatten_steps(steps: list) -> list:
@@ -649,11 +868,10 @@ def inject(names: list[str]) -> list[str]:
     atlases = {fn: Image.open(ICON_DIR / fn).convert("RGBA")
                for fn in ("atlas_dark.png", "atlas_light.png")}
     for name in names:
-        src = RENDER_DIR / f"{name}.png"
-        if not src.exists():
-            print(f"   SKIP {name}: no render at {src}")
+        render = load_tile(name)  # annotated tile (T-BL34) or None if not rendered
+        if render is None:
+            print(f"   SKIP {name}: no render at {RENDER_DIR / (name + '.png')}")
             continue
-        render = Image.open(src).convert("RGBA")
         for key in (f"{name}@32", f"{name}@20"):
             if key not in cells:
                 continue
@@ -681,33 +899,36 @@ def inject(names: list[str]) -> list[str]:
 
 
 def contact_sheet(names: list[str]) -> None:
-    """One image of every generated tile (on a checkerboard so transparency is visible)."""
-    cols = 4
+    """Light + dark review sheets of every tile, at review size AND true 32px ribbon
+    size, using load_tile so annotations/coloring are exactly what ships (T-BL34)."""
+    from PIL import ImageDraw
+    themes = {
+        "dark": {"bg": (44, 46, 52, 255), "fg": (230, 230, 230, 255),
+                 "path": CONTACT_SHEET.with_name("icon_contact_sheet_dark.png")},
+        "light": {"bg": (238, 240, 243, 255), "fg": (40, 44, 50, 255),
+                  "path": CONTACT_SHEET.with_name("icon_contact_sheet_light.png")},
+    }
+    cols = 6
     cell, pad, label = 96, 12, 16
     rows = (len(names) + cols - 1) // cols
     W, H = cols * (cell + pad) + pad, rows * (cell + label + pad) + pad
-    sheet = Image.new("RGBA", (W, H), (44, 46, 52, 255))
-    # checkerboard swatch to reveal transparency
-    chk = Image.new("RGBA", (cell, cell), (200, 200, 200, 255))
-    for y in range(0, cell, 8):
-        for x in range(0, cell, 8):
-            if (x // 8 + y // 8) % 2:
-                for yy in range(y, min(y + 8, cell)):
-                    for xx in range(x, min(x + 8, cell)):
-                        chk.putpixel((xx, yy), (150, 150, 150, 255))
-    from PIL import ImageDraw
-    draw = ImageDraw.Draw(sheet)
-    for i, name in enumerate(names):
-        cx = pad + (i % cols) * (cell + pad)
-        cy = pad + (i // cols) * (cell + label + pad)
-        sheet.alpha_composite(chk, (cx, cy))
-        src = RENDER_DIR / f"{name}.png"
-        if src.exists():
-            r = Image.open(src).convert("RGBA").resize((cell, cell), Image.LANCZOS)
-            sheet.alpha_composite(r, (cx, cy))
-        draw.text((cx + 2, cy + cell + 2), name, fill=(230, 230, 230, 255))
-    sheet.convert("RGB").save(CONTACT_SHEET)
-    print(f"[icon_pipeline] contact sheet -> {CONTACT_SHEET}")
+    for theme, t in themes.items():
+        sheet = Image.new("RGBA", (W, H), t["bg"])
+        draw = ImageDraw.Draw(sheet)
+        for i, name in enumerate(names):
+            cx = pad + (i % cols) * (cell + pad)
+            cy = pad + (i // cols) * (cell + label + pad)
+            tile = load_tile(name)
+            if tile is not None:
+                r = tile.resize((cell, cell), Image.LANCZOS)
+                sheet.alpha_composite(r, (cx, cy))
+                r32 = tile.resize((32, 32), Image.LANCZOS)   # true ribbon size
+                sheet.alpha_composite(r32, (cx + cell - 34, cy + cell - 34))
+            draw.text((cx + 2, cy + cell + 2), name, fill=t["fg"])
+        sheet.convert("RGB").save(t["path"])
+        print(f"[icon_pipeline] contact sheet ({theme}) -> {t['path']}")
+    # legacy single-sheet path stays valid for older tooling/links
+    shutil.copy2(themes["dark"]["path"], CONTACT_SHEET)
 
 
 def main(argv=None) -> int:
@@ -724,19 +945,30 @@ def main(argv=None) -> int:
             print(f"{n:16s} yaw={r['yaw']:>3} pitch={r['pitch']:>3} steps={len(r['steps'])}")
         return 0
 
-    names = list(RECIPES.keys())
+    from cam_toolpath_icons import CAM_CELLS, render_all as cam_render_all
+
+    names = list(RECIPES.keys()) + CAM_CELLS
+    cam_failures: dict[str, str] = {}
     if args.render:
         recipes_json = REPO / "scratch" / "icon_recipes.json"
         recipes_json.parent.mkdir(parents=True, exist_ok=True)
         write_recipes(recipes_json)
         rc = run_app(recipes_json, theme=args.theme)
         print(f"[icon_pipeline] app exit={rc}")
+        # T-BL34: Manufacture tiles from the REAL CAM chain (also a CAM smoke test)
+        _, cam_failures = cam_render_all()
 
     if args.render or args.inject_only:
+        ensure_cells(CAM_CELLS)   # append cam_* atlas cells if this atlas predates them
         done = inject(names)
         contact_sheet(names)
         if not done:
             sys.exit("no icons injected -- check the render step")
+        if cam_failures:
+            print("[icon_pipeline] CAM TILE FAILURES (file as CAM bugs, do NOT fake):")
+            for n, err in cam_failures.items():
+                print(f"   {n}: {err}")
+            return 1
     elif not args.list:
         ap.print_help()
     return 0

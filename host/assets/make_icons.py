@@ -85,6 +85,15 @@ CONTRACT_NAMES: list[str] = [
     # Sketch shape drop-ins (polygon dropdown variants + star) and airfoil
     "poly_triangle", "poly_square", "poly_pentagon", "poly_octagon", "poly_star",
     "airfoil",
+    # ---- T-BL34 (append-only): Manufacture toolpath tiles. The shipped art is the
+    # photographic toolpath render from scripts/cam_toolpath_icons.py (real cam_generate
+    # output); these drawers are line-art FALLBACKS so a cell is never blank.
+    "cam_face", "cam_contour2d", "cam_pocket2d", "cam_adaptive2d", "cam_slot",
+    "cam_chamfer2d", "cam_engrave",
+    "cam_drill", "cam_thread_mill",
+    "cam_parallel3d", "cam_waterline3d", "cam_scallop3d", "cam_pocket3d",
+    "cam_turn_rough", "cam_turn_finish", "cam_turn_face", "cam_turn_part",
+    "cam_cut2d", "cam_probe",
 ]
 
 # FM + ribbon-adjacent refresh scope (Agent 3 — fm_copilot_gui_rectify).
@@ -2994,6 +3003,158 @@ def draw_airfoil(d, cell, p):
     polyline(d, lo, p.stroke, lw)
     d.line([le, te], fill=_rgba(p.accent, 140), width=max(1, lw//2))
     filled_circle(d, le[0], le[1], lw*0.95, p.accent)
+
+
+# ---------------------------------------------------------------------------
+# T-BL34 fallback drawers: Manufacture toolpath cells. Shipped art is the real
+# cam_generate render (icon_pipeline.py); these read as "toolpath over stock".
+# ---------------------------------------------------------------------------
+
+def _cam_stock(d, cell, p, top=0.42):
+    """Iso-ish stock slab: top face parallelogram + front edge."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    quad = [(s*0.14, s*top+s*0.16), (s*0.42, s*top), (s*0.88, s*top+s*0.10),
+            (s*0.60, s*top+s*0.26)]
+    d.polygon(quad, fill=_rgba(p.fill, 60), outline=None)
+    polyline(d, quad + [quad[0]], p.stroke, max(1, lw//2))
+    return quad
+
+
+def _zig(cell, x0, y0, x1, y1, n):
+    s_ = cell * SS
+    pts = []
+    for i in range(n + 1):
+        t = i / n
+        x = x0 + (x1 - x0) * t
+        pts.append((s_*x, s_*(y0 if i % 2 == 0 else y1)))
+    return pts
+
+
+def _cam_25d(pattern):
+    def draw(d, cell, p):
+        _cam_stock(d, cell, p)
+        lw = stroke_width(cell)
+        s = cell * SS
+        if pattern == "zig":
+            polyline(d, _zig(cell, 0.24, 0.44, 0.74, 0.54, 6), p.accent, lw)
+        elif pattern == "loop":
+            polyline(d, [(s*0.28, s*0.50), (s*0.46, s*0.40), (s*0.78, s*0.46),
+                         (s*0.58, s*0.58), (s*0.28, s*0.50)], p.accent, lw)
+        elif pattern == "spiral":
+            polyline(d, [(s*0.50, s*0.50), (s*0.60, s*0.46), (s*0.56, s*0.56),
+                         (s*0.42, s*0.52), (s*0.48, s*0.40), (s*0.70, s*0.44),
+                         (s*0.66, s*0.60), (s*0.34, s*0.56)], p.accent, lw)
+        elif pattern == "slot":
+            polyline(d, [(s*0.30, s*0.56), (s*0.70, s*0.42)], p.accent, lw + 2)
+        elif pattern == "vee":
+            polyline(d, [(s*0.30, s*0.44), (s*0.44, s*0.56), (s*0.58, s*0.42),
+                         (s*0.72, s*0.54)], p.accent, lw)
+    return draw
+
+
+def _cam_drill_glyph(helix=False):
+    def draw(d, cell, p):
+        _cam_stock(d, cell, p, top=0.40)
+        lw = stroke_width(cell)
+        s = cell * SS
+        for x in ((0.38, 0.62) if not helix else (0.5,)):
+            d.line([(s*x, s*0.16), (s*x, s*0.62)], fill=_rgba(p.accent, 255), width=lw)
+            d.polygon([(s*(x-0.05), s*0.56), (s*(x+0.05), s*0.56), (s*x, s*0.68)],
+                      fill=_rgba(p.accent, 255))
+        if helix:
+            for i in range(3):
+                y = 0.28 + i * 0.12
+                d.arc([s*0.36, s*(y-0.05), s*0.64, s*(y+0.05)], start=0, end=180,
+                      fill=_rgba(p.accent2, 230), width=max(1, lw//2))
+    return draw
+
+
+def _cam_3d(kind):
+    def draw(d, cell, p):
+        lw = stroke_width(cell)
+        s = cell * SS
+        # hump surface
+        polyline(d, [(s*0.12, s*0.66), (s*0.30, s*0.62), (s*0.44, s*0.36),
+                     (s*0.62, s*0.36), (s*0.74, s*0.60), (s*0.90, s*0.64)],
+                 p.stroke, max(1, lw//2))
+        if kind == "raster":
+            for dy in (0.0, 0.10, 0.20):
+                polyline(d, [(s*0.16, s*(0.60+dy*0.3)), (s*0.44, s*(0.42+dy*0.35)),
+                             (s*0.62, s*(0.42+dy*0.35)), (s*0.86, s*(0.58+dy*0.3))],
+                         p.accent, max(1, lw//2) if dy else lw)
+        elif kind == "rings":
+            for r, y in ((0.10, 0.42), (0.18, 0.50), (0.26, 0.58)):
+                d.ellipse([s*(0.52-r), s*(y-r*0.36), s*(0.52+r), s*(y+r*0.36)],
+                          outline=_rgba(p.accent, 255), width=max(1, lw//2))
+        elif kind == "wave":
+            for dy in (0.0, 0.10):
+                polyline(d, _zig(cell, 0.16, 0.50+dy, 0.86, 0.58+dy, 8), p.accent,
+                         max(1, lw//2) if dy else lw)
+        elif kind == "bowl":
+            d.arc([s*0.24, s*0.30, s*0.78, s*0.74], start=20, end=160,
+                  fill=_rgba(p.accent, 255), width=lw)
+            d.arc([s*0.34, s*0.38, s*0.68, s*0.66], start=20, end=160,
+                  fill=_rgba(p.accent, 255), width=max(1, lw//2))
+    return draw
+
+
+def _cam_turn(kind):
+    def draw(d, cell, p):
+        lw = stroke_width(cell)
+        s = cell * SS
+        # bar stock silhouette (horizontal cylinder)
+        d.rounded_rectangle([s*0.14, s*0.30, s*0.86, s*0.70], radius=s*0.10,
+                            outline=_rgba(p.stroke, 255), width=max(1, lw//2))
+        if kind == "rough":
+            for i, x in enumerate((0.30, 0.44, 0.58)):
+                d.line([(s*x, s*0.30), (s*x, s*(0.44 + i*0.06))],
+                       fill=_rgba(p.accent, 255), width=lw)
+        elif kind == "finish":
+            polyline(d, [(s*0.20, s*0.34), (s*0.42, s*0.34), (s*0.52, s*0.42),
+                         (s*0.72, s*0.42), (s*0.80, s*0.50)], p.accent, lw)
+        elif kind == "face":
+            d.line([(s*0.82, s*0.30), (s*0.82, s*0.70)], fill=_rgba(p.accent, 255),
+                   width=lw)
+        elif kind == "part":
+            d.line([(s*0.52, s*0.24), (s*0.52, s*0.62)], fill=_rgba(p.accent, 255),
+                   width=lw)
+            d.polygon([(s*0.47, s*0.56), (s*0.57, s*0.56), (s*0.52, s*0.70)],
+                      fill=_rgba(p.accent, 255))
+    return draw
+
+
+def _cam_cut(d, cell, p):
+    quad = _cam_stock(d, cell, p, top=0.44)
+    lw = stroke_width(cell)
+    s = cell * SS
+    polyline(d, [(s*0.34, s*0.52), (s*0.52, s*0.44), (s*0.70, s*0.50),
+                 (s*0.52, s*0.58), (s*0.34, s*0.52)], p.accent, lw)
+    d.line([(s*0.52, s*0.14), (s*0.52, s*0.44)], fill=_rgba(p.err, 255), width=lw)
+
+
+def _cam_probe(d, cell, p):
+    lw = stroke_width(cell)
+    s = cell * SS
+    d.line([(s*0.50, s*0.12), (s*0.50, s*0.52)], fill=_rgba(p.stroke, 255), width=lw)
+    filled_circle(d, s*0.50, s*0.58, lw*1.6, p.accent)
+    d.arc([s*0.30, s*0.44, s*0.70, s*0.78], start=200, end=340,
+          fill=_rgba(p.accent2, 230), width=max(1, lw//2))
+
+
+for _n, _fn in {
+    "cam_face": _cam_25d("zig"), "cam_contour2d": _cam_25d("loop"),
+    "cam_pocket2d": _cam_25d("spiral"), "cam_adaptive2d": _cam_25d("spiral"),
+    "cam_slot": _cam_25d("slot"), "cam_chamfer2d": _cam_25d("loop"),
+    "cam_engrave": _cam_25d("vee"),
+    "cam_drill": _cam_drill_glyph(False), "cam_thread_mill": _cam_drill_glyph(True),
+    "cam_parallel3d": _cam_3d("raster"), "cam_waterline3d": _cam_3d("rings"),
+    "cam_scallop3d": _cam_3d("wave"), "cam_pocket3d": _cam_3d("bowl"),
+    "cam_turn_rough": _cam_turn("rough"), "cam_turn_finish": _cam_turn("finish"),
+    "cam_turn_face": _cam_turn("face"), "cam_turn_part": _cam_turn("part"),
+    "cam_cut2d": _cam_cut, "cam_probe": _cam_probe,
+}.items():
+    _REGISTRY[_n] = _fn
 
 
 # ---------------------------------------------------------------------------

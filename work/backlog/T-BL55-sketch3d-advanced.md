@@ -1,11 +1,11 @@
 ---
-id: T-BL53
+id: T-BL55
 title: 3D sketcher P5 — advanced constraints + solver robustness
 workstream: backlog
 owner: unassigned
 status: backlog
-branch: task/T-BL53-sketch3d-advanced
-depends_on: [T-BL51, T-BL52]
+branch: task/T-BL55-sketch3d-advanced
+depends_on: [T-BL53, T-BL54]
 lane: modeling-core
 kind: new
 priority: 5
@@ -15,7 +15,7 @@ deferred: yes
 ## Context
 
 Phase 5 of the 3D sketcher plan (`docs/SKETCH3D_PLAN.md`, T-BL45). PARKED until greenlight.
-Final hardening phase; depends on P3 (T-BL51) and P4 (T-BL52).
+Final hardening phase; depends on P3 (T-BL53) and P4 (T-BL54).
 
 ## Scope
 

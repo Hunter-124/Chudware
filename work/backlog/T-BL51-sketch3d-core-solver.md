@@ -1,10 +1,10 @@
 ---
-id: T-BL49
+id: T-BL51
 title: 3D sketcher P1 — sketch3d data model + core Newton solver skeleton
 workstream: backlog
 owner: unassigned
 status: backlog
-branch: task/T-BL49-sketch3d-core
+branch: task/T-BL51-sketch3d-core
 depends_on: [T-BL45]
 lane: modeling-core
 kind: new

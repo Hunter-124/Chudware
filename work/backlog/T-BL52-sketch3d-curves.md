@@ -1,11 +1,11 @@
 ---
-id: T-BL50
+id: T-BL52
 title: 3D sketcher P2 — 3D curves + relational constraints + edge-body emit
 workstream: backlog
 owner: unassigned
 status: backlog
-branch: task/T-BL50-sketch3d-curves
-depends_on: [T-BL49]
+branch: task/T-BL52-sketch3d-curves
+depends_on: [T-BL51]
 lane: modeling-core
 kind: new
 priority: 4
@@ -15,7 +15,7 @@ deferred: yes
 ## Context
 
 Phase 2 of the 3D sketcher plan (`docs/SKETCH3D_PLAN.md`, T-BL45). PARKED until greenlight.
-Depends on P1 (T-BL49).
+Depends on P1 (T-BL51).
 
 ## Scope
 

@@ -1,11 +1,11 @@
 ---
-id: T-BL52
+id: T-BL54
 title: 3D sketcher P4 — GUI viewport mode (3D dragging) + GSL describe
 workstream: backlog
 owner: unassigned
 status: backlog
-branch: task/T-BL52-sketch3d-gui
-depends_on: [T-BL50, T-BL48]
+branch: task/T-BL54-sketch3d-gui
+depends_on: [T-BL52, T-BL48]
 lane: app-gui
 kind: new
 priority: 4
@@ -15,7 +15,7 @@ deferred: yes
 ## Context
 
 Phase 4 of the 3D sketcher plan (`docs/SKETCH3D_PLAN.md`, T-BL45). PARKED until greenlight.
-Depends on P2 (T-BL50) for the solver+entities and on T-BL48 (sketch-entry wiring) — see
+Depends on P2 (T-BL52) for the solver+entities and on T-BL48 (sketch-entry wiring) — see
 `uiimgui-sketcher-entry-unwired`: interactive sketch dispatch in `ui/imgui` must be wired first.
 
 ## Scope

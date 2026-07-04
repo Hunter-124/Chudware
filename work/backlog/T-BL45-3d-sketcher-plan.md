@@ -55,6 +55,13 @@ before any build.
   PROPOSAL for Hunter sign-off. Data model = new `sketch3d` feature type (plane-free [x,y,z]).
   Integration is largely already wired: sweep `refs.path: sel(edge, region-chain)` already accepts
   a 3D edge body (helix precedent) -> feature integration is mostly emit-an-edge-body. Cut 5
-  deferred build tasks T-BL49..T-BL53 (P1-P5). DECISION-NEEDED for Hunter: (A) parity oracle
+  deferred build tasks T-BL51..T-BL55 (P1-P5). DECISION-NEEDED for Hunter: (A) parity oracle
   Python-first vs C++-first, (B) build-own vs GPL-subprocess, (C) near-term scope/greenlight order.
   Status -> review; doc-only, no engine build.
+- 2026-07-04 opus-corm: RENUMBER — follow-on tasks originally cut as T-BL49..T-BL53 collided
+  with T-BL49-interface-fitment-checker / T-BL50-layout-first-critical-dims cut earlier today
+  on master (different filenames, same ids — silent duplicate-id risk). Renumbered to
+  T-BL51..T-BL55 (P1→T-BL51 core-solver, P2→T-BL52 curves, P3→T-BL53 features, P4→T-BL54 gui,
+  P5→T-BL55 advanced); depends_on chain, branch names, and all refs in docs/SKETCH3D_PLAN.md
+  updated. RULE (future task-cutting): check BOTH work/backlog/ and work/tasks/ on up-to-date
+  origin/master for the next free id — ids are global across the board.

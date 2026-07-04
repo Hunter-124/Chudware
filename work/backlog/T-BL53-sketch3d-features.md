@@ -1,11 +1,11 @@
 ---
-id: T-BL51
+id: T-BL53
 title: 3D sketcher P3 — feature integration (sweep path, loft guide-curves)
 workstream: backlog
 owner: unassigned
 status: backlog
-branch: task/T-BL51-sketch3d-features
-depends_on: [T-BL50]
+branch: task/T-BL53-sketch3d-features
+depends_on: [T-BL52]
 lane: modeling-core
 kind: new
 priority: 4
@@ -15,7 +15,7 @@ deferred: yes
 ## Context
 
 Phase 3 of the 3D sketcher plan (`docs/SKETCH3D_PLAN.md`, T-BL45). PARKED until greenlight.
-Depends on P2 (T-BL50). This is the highest-value slice: 3D sketch paths driving sweeps.
+Depends on P2 (T-BL52). This is the highest-value slice: 3D sketch paths driving sweeps.
 
 ## Scope
 

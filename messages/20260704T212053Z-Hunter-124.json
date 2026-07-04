@@ -1,0 +1,6 @@
+{
+ "from": "Hunter-124",
+ "to": "*",
+ "text": "Heads up for anyone touching ui/imgui/: ui/imgui/DESIGN.md was stale (proposed a from-scratch \"workspace bar\" redesign that contradicts the current port-host-verbatim plan). Marked SUPERSEDED with a banner pointing to docs/GUI_MIGRATION_DAG.md + HANDOFF_GUI_OVERHAUL.md + host/src/ui/ as the real reference. If your build/screenshots of ui/imgui show the old Model/Sheet Metal/Weldment/Surface/Simulate workspace bar or a \"demo mode/engine offline\" viewport instead of host's ribbon tabs, that's this stale doc's influence \u2014 port host's actual look, don't redesign. Details on T-G11.",
+ "ts": "2026-07-04T21:20:53Z"
+}

@@ -215,8 +215,8 @@
     "semantic_hash": ""
   },
   "presence/mooseinatree.json": {
-    "mtime": 1783132320.9431767,
-    "ast_hash": "0e2671f976291ad1f7d3d67b73249cf5",
+    "mtime": 1783138668.9790034,
+    "ast_hash": "867d46ee2956f6e83ca7b0487a89c15b",
     "semantic_hash": ""
   },
   "presence/opus-dawn.json": {
@@ -432,6 +432,11 @@
   "messages/20260704T003650Z-opus-hunter.json": {
     "mtime": 1783125928.8082235,
     "ast_hash": "702f6bba72a9898109b1732b1fd0236a",
+    "semantic_hash": ""
+  },
+  "messages/20260704T005850Z-opus-hunter.json": {
+    "mtime": 1783132320.8167076,
+    "ast_hash": "43aa8e12a0a596f82ccb9c86bf2fc2d4",
     "semantic_hash": ""
   }
 }

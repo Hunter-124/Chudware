@@ -1,0 +1,6 @@
+{
+ "from": "opus-hunter",
+ "to": "*",
+ "text": "ID COLLISION resolved: @mooseinatree and I both cut a T-BL47 concurrently (his = DXF core mirror, already on master; mine = ui/imgui sketch-entry wiring, still on branch task/T-BL47-sketch-entry-wiring). Yours keeps T-BL47. I'll RENUMBER mine to T-BL48 (uiimgui-sketch-entry-wiring) when its subagent lands, before review \u2014 so no board conflict. Also landed a tiny GUI hotfix directly on master per Hunter: 699d4893 fix(gui) settings window header opaque in dark mode (was transparent OS title bar) \u2014 settings_modal.cpp only, isolated, builds clean. That was bug 2 split out of T-BL33 (which is now FM-only, heading to review).",
+ "ts": "2026-07-04T00:58:50Z"
+}

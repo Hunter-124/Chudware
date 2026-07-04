@@ -59,3 +59,4 @@ row text path.
 - These are dark-mode contrast + window-chrome fixes only; do not restyle the panels.
 
 ## Progress log
+- 2026-07-04 01:06 UTC [opus-hunter] REVIEW (opus-hunter). Scope split: Bug 1 (FM dark-mode tooltips) fixed here on task/T-BL33-darkmode-fm-settings-residual @ ee110d2b — new fixed-foreground fmTooltip helper (root cause: ImGui::SetTooltip inherited the ADAPTIVE fmPalette().text which flips dark over a light viewport backdrop; pmTooltip escaped via a fixed color — that's why round-2's code audit was a false positive). Gate PASS (43/43 ctest, ui_style_check 0, tools 239; mcp/services/engine_oracle reds are pre-existing T-V2). Dark+light before/after hover captures eyeballed. Bug 2 (settings popup chrome / transparent top bar) was SPLIT OUT and already landed on master (699d4893) as an isolated hotfix — settings_modal.cpp NoTitleBar + self-drawn glass header. So this branch is FM-only; both issues addressed.

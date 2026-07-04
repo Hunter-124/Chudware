@@ -2,6 +2,9 @@
 #include "ui/scenarios.h"
 
 #include "ui/viewport.h"
+#include "ui/sketch/sketch_mode.h"   // T-BL46: full type for sketchMode().elementDragActive()
+#include "viewport_impl.h"            // T-BL46: GlViewport full type (renderer().camera())
+#include "renderer.h"                 // T-BL46: worldToScreen(), ViewportScreen
 
 #include "ui/ribbon.h"
 #include "ui/settings_modal.h"

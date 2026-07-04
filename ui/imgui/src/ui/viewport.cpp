@@ -34,6 +34,9 @@ static MouseGestures              s_gestures;
 static ViewSelector               s_viewSelector;
 static SectionTool                s_sectionTool;
 static float                      s_huFade = 0.25f;
+// T-BL46: moved to file scope so elementDragActive() is accessible before the if(r) block
+// where it was previously declared as a local static.  Single instance — same semantics.
+static SketchMode                 s_sketch;
 
 static bool   s_zoomAreaArmed = false;
 static bool   s_zoomAreaDragging = false;
@@ -47,6 +50,13 @@ static ImVec2 s_bdMax  = {0, 0};
 static bool   s_bdLive = false;
 
 ViewportState& viewportState() { return g_vpState; }
+// T-BL46: accessor so scenarios.cpp can read s_sketch.elementDragActive() without friendship.
+SketchMode& sketchMode() { return s_sketch; }
+// T-BL46: expose the GlViewport for world→screen coordinate computation in scenarios.
+aicad::viewport::GlViewport* viewportGl() { return g_glVp; }
+// T-BL46: published image rect accessors (safe to call from scenarios tick).
+ImVec2 viewportImageMin() { return s_bdMin; }
+ImVec2 viewportImageMax() { return s_bdMax; }
 
 ImU32 glassIconHalo(const theme::AdaptiveSurface& surf, float alphaMul) {
     // Opposite vibrancy tone from surf's text (A8: theme-independent tokens stand in for the
@@ -636,20 +646,33 @@ void drawViewport(AppState& s) {
             imgHovered = ImGui::IsItemHovered();
 
             if (imgHovered && !s_viewSelector.active() && !s_gestures.active()) {
+                // T-BL46: left-button drag threshold and capture priority.
+                // (a) kLmbDragPx — dead zone before left-button camera nav engages. 8 px is
+                //     large enough to absorb accidental micro-drags while starting a click
+                //     but small enough that intentional view-drag is not sluggish.
+                // (b) s_sketch.elementDragActive() — capture priority: if the sketch overlay
+                //     has armed or is executing an element drag (handle reshape, group/profile
+                //     translate, dim-text drag) the LEFT BUTTON must not also navigate the
+                //     camera. Middle/right buttons remain unambiguous view-nav and keep 0 px.
+                //     The overlay arms on mouse-down and promotes to live drag past 4 px; both
+                //     states must block camera nav or a fast drag still steals to the view.
+                static constexpr float kLmbDragPx = 8.f;
+                const bool sketchCapture = s.inSketch && s_sketch.elementDragActive();
+
                 bool dragging = ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.f) ||
                                 ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.f) ||
-                                ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.f);
+                                ImGui::IsMouseDragging(ImGuiMouseButton_Left, kLmbDragPx);
 
                 if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.f)) {
                     if (io.KeyCtrl) g_glVp->pan(io.MouseDelta.x, io.MouseDelta.y);
                     else            g_glVp->orbit(-io.MouseDelta.x * 0.01f, io.MouseDelta.y * 0.01f);
                 } else if (ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.f)) {
                     g_glVp->pan(io.MouseDelta.x, io.MouseDelta.y);
-                } else if (g_vpState.vpDragMode == 1 &&
-                           ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.f)) {
+                } else if (!sketchCapture && g_vpState.vpDragMode == 1 &&
+                           ImGui::IsMouseDragging(ImGuiMouseButton_Left, kLmbDragPx)) {
                     g_glVp->pan(io.MouseDelta.x, io.MouseDelta.y);
-                } else if (g_vpState.vpDragMode == 0 &&
-                           ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.f) &&
+                } else if (!sketchCapture && g_vpState.vpDragMode == 0 &&
+                           ImGui::IsMouseDragging(ImGuiMouseButton_Left, kLmbDragPx) &&
                            !s_zoomAreaArmed) {
                     g_glVp->orbit(-io.MouseDelta.x * 0.01f, io.MouseDelta.y * 0.01f);
                 }
@@ -726,7 +749,6 @@ void drawViewport(AppState& s) {
         host.sketchPlanePickActive = s.inSketch;
         host.hasDocMesh = live;
         host.idPass = &g_glVp->idPass();
-        static SketchMode s_sketch;
 
         // T-BL47/48: drain pending sketch commands from AppState. dispatch() pushes ribbon
         // command ids; the Feature Manager pushes an edit/reparent target fid. Both are executed

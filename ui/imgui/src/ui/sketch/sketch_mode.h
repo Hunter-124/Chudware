@@ -108,6 +108,13 @@ struct SketchEntity {
 class SketchMode {
 public:
     bool active() const { return active_; }
+    // T-BL46: true when the sketch overlay has armed or is executing an element drag
+    // (handle reshape, group/profile translate, or dimension-text drag). While this is
+    // true, viewport.cpp must not fire camera orbit/pan on left-button drag so that
+    // element drags always win the capture over view navigation.
+    bool elementDragActive() const {
+        return dragging_ || dragArmed_ || groupDragArmed_ || dimDragging_;
+    }
     // T-BL48: true while arming/awaiting a plane pick for a NEW sketch (active_ is still
     // false then). The viewport keeps AppState::inSketch true during this so the plane-pick
     // overlay (drawn only when inSketch) stays alive until the user picks a plane or cancels.

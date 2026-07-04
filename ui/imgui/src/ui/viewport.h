@@ -85,4 +85,18 @@ struct ViewportState {
 
 ViewportState& viewportState();
 
+// T-BL46: expose the file-scope SketchMode so scenarios.cpp can read elementDragActive().
+// Returns a const ref — callers must not mutate it.
+class SketchMode;
+SketchMode& sketchMode();
+
+// T-BL46: expose the GlViewport so scenarios.cpp can call renderer().camera() + worldToScreen()
+// to compute exact screen coordinates for element hit tests.  Returns nullptr when not wired.
+aicad::viewport::GlViewport* viewportGl();
+
+// T-BL46: published viewport image rect (screen coords), updated each frame — safe to read from
+// scenarios.cpp tick to get a/b for worldToScreen ViewportScreen and IsItemHovered coordinates.
+ImVec2 viewportImageMin();
+ImVec2 viewportImageMax();
+
 }  // namespace ui

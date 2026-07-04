@@ -80,3 +80,12 @@ not let it fall off the board.
   injection) — keep it in the Python pipeline, not the C++ renderer, where practical.
 
 ## Progress log
+
+- 2026-07-04 [fable-helm] GREENLIT by Hunter (live session): "make sure that eventually we
+  get around to generating the rest of the gui icons too, and make the manufacturing ones
+  showcase the generated tool-paths that the tools are used for instead of just screenshots
+  of the types of shapes they're supposed to be used on." The "do NOT start until Hunter
+  greenlights" park is lifted; the Manufacture-toolpath DoD item is the binding
+  interpretation of his directive. Dependency T-BL29 is done. NOTE: driver-notes paths
+  reference deprecated host/src — the pipeline hooks may have moved to ui/imgui during the
+  migration waves; verify where AI_CAD_SHOT=iconpipe lives NOW before editing.

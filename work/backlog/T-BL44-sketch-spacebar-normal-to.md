@@ -7,7 +7,7 @@ status: blocked
 priority: 2
 lane: app-gui
 kind: fix
-depends_on: []
+depends_on: [T-BL48]
 branch: task/T-BL44-sketch-spacebar-normal-to
 ---
 

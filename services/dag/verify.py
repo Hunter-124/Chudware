@@ -100,6 +100,7 @@ def _check_budget_default(r: dict) -> bool:
 
 
 # DISPATCH_TABLE is the T-F12-reusable public symbol.
+# check_type 'requirement' is handled separately (see _run_requirement_verify) — not in this table.
 DISPATCH_TABLE: dict[str, tuple[str, str, Callable[[dict], bool]]] = {
     "interference": ("cad",        "check_interference",   _check_interference_default),
     "erc":          ("ecad",       "ecad_run_erc",         _check_erc_default),
@@ -274,6 +275,18 @@ def run(
     })
 
     t0 = time.monotonic()
+
+    # ---- Requirement auto-verification ----------------------------------------
+    if check_type == "requirement":
+        return _run_requirement_verify(
+            node_id=node_id,
+            node_name=node_name,
+            node_inputs=node_inputs,
+            retry_remaining=retry_remaining,
+            emit=emit,
+            tool_fn_override=tool_fn_override,
+            t0=t0,
+        )
 
     # -- Resolve check type ---------------------------------------------------
     if not check_type or check_type not in DISPATCH_TABLE:
@@ -488,6 +501,257 @@ def _make_output(
         "evidence": result,
         "doc_id": node_inputs.get("doc_id"),
     }
+
+
+def _run_requirement_verify(
+    node_id: str,
+    node_name: str,
+    node_inputs: dict[str, Any],
+    retry_remaining: int,
+    emit: EmitFn,
+    tool_fn_override: Callable | None,
+    t0: float,
+) -> tuple[str, dict[str, Any]]:
+    """Auto-verify a single requirement by running its named verify_by verifiers.
+
+    check_type == "requirement" branch of run().
+    node_inputs must include:
+      req_id      — requirement ID to verify (e.g. "R1")
+      req_path    — (optional) path to .req.json file
+      req_doc_id  — (optional) doc-meta doc_id holding the req doc
+      doc_id      — (optional) geometry doc the verifiers run against
+
+    Fail-closed: any exception / missing req → ESCALATE.
+    At least one verify_by verifier must pass (score >= 0.5) to flip to verified.
+    VALID_VERIFIERS not in battery.CHECKS are skipped (v1 limitation, not a failure).
+    """
+    from services.verify.battery import CHECKS as _BATTERY_CHECKS
+    from services.verify.battery import _extract_score as _battery_extract_score
+
+    req_id: str | None = node_inputs.get("req_id")
+    req_path: str | None = node_inputs.get("req_path")
+    req_doc_id: str | None = node_inputs.get("req_doc_id")
+    geo_doc_id: str | None = node_inputs.get("doc_id")
+
+    def _escalate(reason: str, summary: str) -> tuple[str, dict[str, Any]]:
+        out = _make_output(
+            VERDICT_ESCALATE, node_inputs, retry_remaining, "requirement",
+            result=None, passed=False, reason=reason, summary=summary,
+            elapsed_ms=(time.monotonic() - t0) * 1000.0,
+        )
+        _emit_ev(emit, "dag.node.failed", {"node_id": node_id, "error": summary})
+        return VERDICT_ESCALATE, out
+
+    if not req_id:
+        return _escalate("missing_req_id",
+                         f"Verify node {node_name!r}: check_type='requirement' requires req_id in node_inputs.")
+
+    # Load requirements doc
+    try:
+        from services.mcp.req_tools import _load_doc as _req_load_doc
+        req_doc = _req_load_doc(doc_id=req_doc_id, req_path=req_path)
+    except Exception as exc:
+        return _escalate("req_load_error",
+                         f"Verify node {node_name!r}: failed to load req doc: {exc}")
+
+    if req_doc is None:
+        return _escalate("req_doc_not_found",
+                         f"Verify node {node_name!r}: req doc not found "
+                         f"(req_path={req_path!r}, req_doc_id={req_doc_id!r}).")
+
+    # Find requirement
+    req_obj = None
+    for r in req_doc.requirements:
+        if r.id == req_id:
+            req_obj = r
+            break
+    if req_obj is None:
+        return _escalate("req_id_not_found",
+                         f"Verify node {node_name!r}: requirement {req_id!r} not found in doc.")
+
+    # Collect supported verifiers (those in battery.CHECKS)
+    _UNSUPPORTED_IN_BATTERY = {"confirm_dimensions", "dfm_check", "fit_report"}
+    supported: list[dict] = []
+    unsupported: list[str] = []
+    for vr in req_obj.verify_by:
+        name = vr.verifier
+        if name in _UNSUPPORTED_IN_BATTERY or name not in _BATTERY_CHECKS:
+            unsupported.append(name)
+        else:
+            supported.append({"verifier": name, "args": vr.args})
+
+    if not supported:
+        return _escalate("no_supported_verifiers",
+                         f"Verify node {node_name!r}: requirement {req_id!r} has no verifiers "
+                         f"supported by the battery (v1 limitation). "
+                         f"Unsupported: {unsupported}")
+
+    # Run verifiers — at least one must pass
+    verifier_results: list[dict[str, Any]] = []
+    any_passed = False
+    elapsed_ms = 0.0
+
+    for vr_entry in supported:
+        verifier_name = vr_entry["verifier"]
+        module_key, fn_name, cost, platform_req, reward_shape = _BATTERY_CHECKS[verifier_name]
+
+        # Platform check
+        import sys as _sys
+        is_posix = _sys.platform != "win32"
+        if platform_req == "posix" and not is_posix:
+            verifier_results.append({
+                "verifier": verifier_name, "skipped": True, "reason": "platform_mismatch",
+            })
+            continue
+
+        # Resolve tool function
+        if tool_fn_override is not None:
+            tool_fn = tool_fn_override
+        else:
+            try:
+                tool_fn = _get_fn(module_key, fn_name)
+            except Exception as exc:
+                verifier_results.append({
+                    "verifier": verifier_name, "error": str(exc), "passed": False,
+                })
+                continue
+
+        # Build kwargs
+        call_kwargs: dict[str, Any] = {}
+        if geo_doc_id is not None:
+            call_kwargs["doc_id"] = geo_doc_id
+
+        # Call
+        try:
+            raw_result = tool_fn(**call_kwargs)
+        except Exception as exc:
+            verifier_results.append({
+                "verifier": verifier_name, "error": str(exc), "passed": False,
+            })
+            continue
+
+        # Extract score
+        score, findings = _battery_extract_score(verifier_name, reward_shape, raw_result)
+        passed_this = score >= 0.5
+
+        if isinstance(raw_result, str):
+            try:
+                import json as _json
+                result_dict = _json.loads(raw_result)
+            except Exception:
+                result_dict = {"raw": raw_result}
+        else:
+            result_dict = raw_result if isinstance(raw_result, dict) else {"raw": str(raw_result)}
+
+        verifier_results.append({
+            "verifier": verifier_name,
+            "passed": passed_this,
+            "score": score,
+            "result": result_dict,
+            "findings": findings,
+            "source": "battery",
+        })
+        if passed_this:
+            any_passed = True
+
+    elapsed_ms = (time.monotonic() - t0) * 1000.0
+
+    # Build evidence list for writeback
+    import datetime as _dt
+    _now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    evidence_list = [
+        {
+            "verifier": r["verifier"],
+            "result": r.get("result", {}),
+            "ts": _now,
+            "source": "battery",
+        }
+        for r in verifier_results
+        if not r.get("skipped") and "error" not in r
+    ]
+
+    # Writeback to requirements doc — FAIL-CLOSED: a pass verdict whose status
+    # flip did not land would fabricate "verified" (this file's mandatory policy).
+    if evidence_list:
+        try:
+            _record_req_result(
+                req_id=req_id,
+                passed=any_passed,
+                evidence=evidence_list,
+                req_path=req_path,
+                req_doc_id=req_doc_id,
+            )
+        except Exception as exc:
+            return _escalate(
+                "req_writeback_error",
+                f"Verify node {node_name!r}: verifier(s) ran for {req_id!r} "
+                f"(passed={any_passed}) but the requirements-doc writeback failed: {exc}",
+            )
+
+    result_summary = {
+        "req_id": req_id,
+        "verifiers_run": verifier_results,
+        "unsupported": unsupported,
+        "any_passed": any_passed,
+        "evidence_count": len(evidence_list),
+    }
+
+    if any_passed:
+        verdict = VERDICT_DONE
+        summary = (
+            f"Verify node {node_name!r}: requirement {req_id!r} VERIFIED "
+            f"by battery ({len(verifier_results)} verifier(s) run) "
+            f"in {elapsed_ms / 1000:.1f}s."
+        )
+        out = _make_output(
+            verdict, node_inputs, retry_remaining, "requirement",
+            result=result_summary, passed=True,
+            reason=None, summary=summary, elapsed_ms=elapsed_ms,
+        )
+        _emit_ev(emit, "dag.node.done", {"node_id": node_id, "output": out})
+    else:
+        new_budget = max(0, retry_remaining - 1)
+        verdict = VERDICT_ESCALATE if new_budget == 0 else VERDICT_RETRY
+        summary = (
+            f"Verify node {node_name!r}: requirement {req_id!r} FAILED "
+            f"({len(verifier_results)} verifier(s) run, none passed) "
+            + ("escalating (budget exhausted)" if verdict == VERDICT_ESCALATE
+               else f"retrying (budget remaining: {new_budget})")
+            + f" in {elapsed_ms / 1000:.1f}s."
+        )
+        out = _make_output(
+            verdict, node_inputs, new_budget, "requirement",
+            result=result_summary, passed=False,
+            reason="check_failed", summary=summary, elapsed_ms=elapsed_ms,
+        )
+        if verdict == VERDICT_ESCALATE:
+            _emit_ev(emit, "dag.node.failed", {"node_id": node_id, "error": summary})
+        else:
+            _emit_ev(emit, "dag.node.paused",
+                     {"node_id": node_id, "reason": f"retry (budget remaining: {new_budget})"})
+
+    return verdict, out
+
+
+def _record_req_result(
+    req_id: str,
+    passed: bool,
+    evidence: list[dict[str, Any]],
+    req_path: str | None,
+    req_doc_id: str | None,
+) -> None:
+    """Write verification result back into the requirements doc via req_tools helpers.
+
+    Uses _load_doc / set_status / _save_doc directly (internal helpers, not MCP tools)
+    so no FastMCP registration is needed from here.
+    """
+    from services.mcp.req_tools import _load_doc, _save_doc
+    doc = _load_doc(doc_id=req_doc_id, req_path=req_path)
+    if doc is None:
+        raise ValueError(f"req doc not found for writeback (req_path={req_path!r}, req_doc_id={req_doc_id!r})")
+    new_status = "verified" if passed else "failed"
+    doc.set_status(req_id, new_status, who="agent", evidence=evidence)
+    _save_doc(doc, doc_id=req_doc_id, req_path=req_path)
 
 
 def _emit_ev(emit: EmitFn, event_type: str, payload: dict[str, Any]) -> None:

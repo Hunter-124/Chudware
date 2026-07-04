@@ -38,6 +38,8 @@ def register_design_review_tools(mcp: "FastMCP") -> None:
         checks: Optional[list] = None,
         target_budget: Optional[float] = None,
         doc_path: Optional[str] = None,
+        req_ids: Optional[list] = None,
+        req_path: Optional[str] = None,
     ) -> str:
         """Run a comprehensive design review battery and return a narrated verdict card.
 
@@ -56,6 +58,12 @@ def register_design_review_tools(mcp: "FastMCP") -> None:
             target_budget: Optional budget cap (float) for the 'budget' check.
                            When supplied, the budget check uses this as its pass threshold.
             doc_path:      Optional path to an aicad.structure/1 doc for dc_ratio/budget checks.
+            req_ids:       Optional list of aicad.req/1 requirement IDs (e.g. ["R1"]).
+                           Each is auto-verified by running its named verify_by verifiers
+                           via the battery; the result (status flip + evidence ref) is
+                           written back into the requirements doc automatically (T-BL09).
+            req_path:      Path to the .req.json requirements doc for req_ids (omit when
+                           the req doc is stored as doc-meta on doc_id).
 
         Returns:
             Narrated verdict card (str).  Sections:
@@ -70,6 +78,8 @@ def register_design_review_tools(mcp: "FastMCP") -> None:
             checks=checks,
             target_budget=target_budget,
             doc_path=doc_path,
+            req_ids=req_ids,
+            req_path=req_path,
         )
 
 
@@ -101,13 +111,18 @@ def _run_design_review(
     checks: Optional[list] = None,
     target_budget: Optional[float] = None,
     doc_path: Optional[str] = None,
+    req_ids: Optional[list] = None,
+    req_path: Optional[str] = None,
     *,
     tool_fn_overrides: Optional[dict[str, Any]] = None,
+    req_tool_fn_override: Optional[Any] = None,
 ) -> str:
     """Run the design review battery and return narrated verdict text.
 
     tool_fn_overrides: dict {check_name: callable} for test injection.
                        Overrides ONLY the specified checks; others use real tools.
+    req_tool_fn_override: callable injected as the verifier tool for ALL req_ids
+                       checks (test injection, mirrors verify.run's tool_fn_override).
     """
     active_checks = checks if checks is not None else _ALL_CHECKS
     overrides = tool_fn_overrides or {}
@@ -128,8 +143,63 @@ def _run_design_review(
         else:
             results[check_name] = _call_direct_check(check_name, doc_id)
 
+    # Requirement auto-verification (T-BL09) — each req_id runs its verify_by
+    # verifiers via the same battery registry and writes status + evidence back
+    # into the requirements doc (services/dag/verify._run_requirement_verify).
+    req_results: dict[str, Any] = {}
+    if req_ids:
+        for rid in req_ids:
+            req_results[str(rid)] = _call_requirement_check(
+                str(rid), doc_id, req_path, req_tool_fn_override,
+            )
+
     elapsed_ms = (time.monotonic() - t_start) * 1000.0
-    return _narrate(results, doc_id, elapsed_ms)
+    return _narrate(results, doc_id, elapsed_ms, req_results=req_results)
+
+
+def _call_requirement_check(
+    req_id: str,
+    doc_id: Optional[str],
+    req_path: Optional[str],
+    tool_fn_override: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Auto-verify one aicad.req/1 requirement via the DAG requirement path."""
+    try:
+        import time as _time
+        from services.dag.verify import _run_requirement_verify, VERDICT_DONE
+    except ImportError as exc:
+        return {"status": "unavailable", "reason": f"verify module unavailable: {exc}"}
+
+    node_inputs: dict[str, Any] = {
+        "check_type": "requirement",
+        "req_id": req_id,
+        "req_path": req_path,
+        # Only use doc_id as the req-doc holder when no req_path was given
+        # (req_tools._load_doc prioritizes doc_id over req_path).
+        "req_doc_id": None if req_path else doc_id,
+        "doc_id": doc_id,
+    }
+    try:
+        verdict, output_state = _run_requirement_verify(
+            node_id=f"design-review-req-{req_id}",
+            node_name=f"design_review({req_id})",
+            node_inputs=node_inputs,
+            retry_remaining=1,
+            emit=None,
+            tool_fn_override=tool_fn_override,
+            t0=_time.monotonic(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "reason": f"requirement check raised: {exc}", "passed": False}
+
+    data = output_state.get("data", {})
+    if verdict == VERDICT_DONE:
+        return {"status": "done", "passed": True, "result": data.get("tool_result")}
+    reason = data.get("reason", "check_failed")
+    if reason == "check_failed":
+        return {"status": "done", "passed": False, "result": data.get("tool_result")}
+    return {"status": "error", "reason": output_state.get("summary", reason),
+            "passed": False, "result": data.get("tool_result")}
 
 
 def _call_dispatch_check(
@@ -296,11 +366,17 @@ _CHECK_LABELS: dict[str, str] = {
 }
 
 
-def _narrate(results: dict[str, Any], doc_id: Optional[str], elapsed_ms: float) -> str:
+def _narrate(
+    results: dict[str, Any],
+    doc_id: Optional[str],
+    elapsed_ms: float,
+    req_results: Optional[dict[str, Any]] = None,
+) -> str:
     """Build a narrated verdict card from battery results.
 
     Format follows contracts/narration.md:
-      header → per-check (pass/fail/skip/unavail) → overall → caveats → source.
+      header → per-check (pass/fail/skip/unavail) → requirements → overall →
+      caveats → source.
     """
     lines: list[str] = []
 
@@ -353,6 +429,25 @@ def _narrate(results: dict[str, Any], doc_id: Optional[str], elapsed_ms: float) 
         else:
             lines.append(f"  ? {label}: unknown status={status!r}")
             skip_count += 1
+
+    # Requirements section (T-BL09 — auto-verified aicad.req/1 requirements)
+    if req_results:
+        lines.append("")
+        lines.append("Requirements (auto-verified, evidence written back):")
+        for rid in sorted(req_results):
+            r = req_results[rid]
+            status = r.get("status")
+            if status == "done" and r.get("passed"):
+                lines.append(f"  ✓ {rid}: VERIFIED — status + battery evidence written to req doc")
+                pass_count += 1
+            elif status == "done":
+                lines.append(f"  ✗ {rid}: FAILED — status 'failed' + battery evidence written to req doc")
+                fail_count += 1
+            else:
+                reason = r.get("reason", "requirement check unavailable")
+                lines.append(f"  ? {rid}: {reason}")
+                caveats.append(f"Requirement {rid}: {reason}")
+                unavail_count += 1
 
     # Overall verdict
     lines.append("")

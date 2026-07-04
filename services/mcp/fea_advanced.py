@@ -386,8 +386,9 @@ def build_contact_block_inp(L: float, b: float, h: float, E: float, nu: float,
     base = [nid(i, j, 0) for j in range(nny) for i in range(nnx)]
 
     # Lower-block top element faces. For our C3D8 node winding the +z face is the
-    # 5-6-7-8 face, which is CalculiX face label S2. The top layer of elements is
-    # k=nz-1; element id of the (i,j,k) hex is 1 + i + j*nx + k*nx*ny.
+    # 5-6-7-8 face = CalculiX face 2 (label "S2") per the CalculiX manual's
+    # hexahedral face table (P2 = nodes 5-8-7-6). The top element layer is k=nz-1;
+    # element id of the (i,j,k) hex is 1 + i + j*nx + k*nx*ny.
     def eid_of(i: int, j: int, k: int) -> int:
         return 1 + i + j * nx + k * nx * ny
     top_elem_faces = [eid_of(i, j, nz - 1) for j in range(ny) for i in range(nx)]

@@ -1,432 +1,437 @@
 {
   "messages/20260702T121446Z-fable-survey.json": {
-    "mtime": 1783125344.2682326,
+    "mtime": 1783125928.832222,
     "ast_hash": "17e62eae9eff2d4c0ba3a2aab4dca30e",
     "semantic_hash": ""
   },
   "messages/20260702T170910Z-opus-vale.json": {
-    "mtime": 1783125344.2682326,
+    "mtime": 1783125928.832222,
     "ast_hash": "ef2ba720d8f81ae3ded3c2f6f0ac5802",
     "semantic_hash": ""
   },
   "messages/20260702T171252Z-opus-vega.json": {
-    "mtime": 1783125344.2692347,
+    "mtime": 1783125928.833222,
     "ast_hash": "3713222643231b17d3f5bd9166a651a3",
     "semantic_hash": ""
   },
   "messages/20260702T171427Z-Fable.json": {
-    "mtime": 1783125344.269744,
+    "mtime": 1783125928.833222,
     "ast_hash": "ac52961e36189fe3d010577e919fe6e0",
     "semantic_hash": ""
   },
   "messages/20260702T171430Z-Fable.json": {
-    "mtime": 1783125344.269744,
+    "mtime": 1783125928.833222,
     "ast_hash": "c7411ae02ac5179e3a04278ae038df56",
     "semantic_hash": ""
   },
   "messages/20260702T171540Z-opus-vex.json": {
-    "mtime": 1783125344.2707539,
+    "mtime": 1783125928.833222,
     "ast_hash": "f7fe80e68f08fdcbf4fadbd0ce756124",
     "semantic_hash": ""
   },
   "messages/20260702T171658Z-opus-vega.json": {
-    "mtime": 1783125344.2707539,
+    "mtime": 1783125928.8347294,
     "ast_hash": "04700e26a130f23bfaa5ef90907675a2",
     "semantic_hash": ""
   },
   "messages/20260702T171953Z-Fable.json": {
-    "mtime": 1783125344.2707539,
+    "mtime": 1783125928.8347294,
     "ast_hash": "1349b3cc490625258e0941bcccd7da79",
     "semantic_hash": ""
   },
   "messages/20260702T172000Z-Fable.json": {
-    "mtime": 1783125344.2717636,
+    "mtime": 1783125928.8347294,
     "ast_hash": "e73052e34476c42638695e7a37fc44c7",
     "semantic_hash": ""
   },
   "messages/20260702T172029Z-opus-vega.json": {
-    "mtime": 1783125344.2717636,
+    "mtime": 1783125928.8357382,
     "ast_hash": "c5db9a65a7cfdcae1df7dc49072f5e02",
     "semantic_hash": ""
   },
   "messages/20260702T180834Z-opus-dawn.json": {
-    "mtime": 1783125344.2727633,
+    "mtime": 1783125928.8357382,
     "ast_hash": "69ae251c5d3e1a3c3d23a52a049062be",
     "semantic_hash": ""
   },
   "messages/20260702T180949Z-Fable.json": {
-    "mtime": 1783125344.2727633,
+    "mtime": 1783125928.8357382,
     "ast_hash": "ecf4d8cbb7b06fd72555ee7263f8b0b7",
     "semantic_hash": ""
   },
   "messages/20260702T184346Z-sonnet-dray.json": {
-    "mtime": 1783125344.2737634,
+    "mtime": 1783125928.8357382,
     "ast_hash": "bb210e0fce009aea6fd63c6104674560",
     "semantic_hash": ""
   },
   "messages/20260702T184455Z-sonnet-tarn.json": {
-    "mtime": 1783125344.2737634,
+    "mtime": 1783125928.8357382,
     "ast_hash": "1739dde712a5b7ec09a1211693687f60",
     "semantic_hash": ""
   },
   "messages/20260702T223329Z-opus-iron.json": {
-    "mtime": 1783125344.274762,
+    "mtime": 1783125928.8372452,
     "ast_hash": "c8e8a3a8a4c9e420e216a8c191d71b2e",
     "semantic_hash": ""
   },
   "messages/20260702T223751Z-opus-sky.json": {
-    "mtime": 1783125344.274762,
+    "mtime": 1783125928.8372452,
     "ast_hash": "6f7666c561e96e6ee932482e2d7cf0b1",
     "semantic_hash": ""
   },
   "messages/20260702T225209Z-opus-iron.json": {
-    "mtime": 1783125344.274762,
+    "mtime": 1783125928.8372452,
     "ast_hash": "b8f9e79530f9d806a00fb3274a8dd474",
     "semantic_hash": ""
   },
   "messages/20260702T225358Z-opus-iron.json": {
-    "mtime": 1783125344.274762,
+    "mtime": 1783125928.838251,
     "ast_hash": "7c890ad7f5a60e9bebdb78f684eaaab3",
     "semantic_hash": ""
   },
   "messages/20260702T230735Z-sonnet-page.json": {
-    "mtime": 1783125344.2762692,
+    "mtime": 1783125928.838251,
     "ast_hash": "b932f12a1bb779f814da78388dbd3f44",
     "semantic_hash": ""
   },
   "messages/20260702T231129Z-opus-sky.json": {
-    "mtime": 1783125344.2762692,
+    "mtime": 1783125928.838251,
     "ast_hash": "1bebd048fae8723ac1e44211d1e47226",
     "semantic_hash": ""
   },
   "messages/20260702T231835Z-sonnet-quinn.json": {
-    "mtime": 1783125344.2772813,
+    "mtime": 1783125928.838251,
     "ast_hash": "e1315a04194d3fe1364d71a33a1b991b",
     "semantic_hash": ""
   },
   "messages/20260702T232010Z-sonnet-reed.json": {
-    "mtime": 1783125344.2772813,
+    "mtime": 1783125928.838251,
     "ast_hash": "751d1ec27f39d1f6117ea9b2814da4c3",
     "semantic_hash": ""
   },
   "messages/20260702T233106Z-sonnet-fenn.json": {
-    "mtime": 1783125344.2772813,
+    "mtime": 1783125928.8397563,
     "ast_hash": "712f446c94321e44237d4c53a23f5665",
     "semantic_hash": ""
   },
   "messages/20260702T235419Z-opus-sky.json": {
-    "mtime": 1783125344.2782943,
+    "mtime": 1783125928.8397563,
     "ast_hash": "70ab5452f2b99c96a02ed2482097c684",
     "semantic_hash": ""
   },
   "messages/20260702T235439Z-opus-sky.json": {
-    "mtime": 1783125344.2782943,
+    "mtime": 1783125928.840768,
     "ast_hash": "cdfbd0da84614a822c619e18c94dcb8c",
     "semantic_hash": ""
   },
   "messages/20260702T235539Z-sonnet-fenn.json": {
-    "mtime": 1783125344.2792964,
+    "mtime": 1783125928.840768,
     "ast_hash": "8cee7607ff4d2bce0d0add1fb42b1e41",
     "semantic_hash": ""
   },
   "messages/20260703T013906Z-sonnet-plume.json": {
-    "mtime": 1783125344.2798061,
+    "mtime": 1783125928.8417702,
     "ast_hash": "483077015fb3b9d12c859a9d35a244fb",
     "semantic_hash": ""
   },
   "messages/20260703T015427Z-sonnet-crane.json": {
-    "mtime": 1783125344.280819,
+    "mtime": 1783125928.8417702,
     "ast_hash": "ca1d962641d296eae8d98d164940243c",
     "semantic_hash": ""
   },
   "messages/20260703T015952Z-sonnet-wrenn.json": {
-    "mtime": 1783125344.280819,
+    "mtime": 1783125928.8417702,
     "ast_hash": "2c10dac04efecdb4954efdc3e849c596",
     "semantic_hash": ""
   },
   "messages/20260703T020949Z-sonnet-crane.json": {
-    "mtime": 1783125344.2818172,
+    "mtime": 1783125928.8427677,
     "ast_hash": "34b2f2049592e7109c9fa272083c872a",
     "semantic_hash": ""
   },
   "messages/20260703T021022Z-sonnet-crane.json": {
-    "mtime": 1783125344.2818172,
+    "mtime": 1783125928.8427677,
     "ast_hash": "01af937680da8c1e0bd2cfdb7fd932db",
     "semantic_hash": ""
   },
   "messages/20260703T021116Z-sonnet-crane.json": {
-    "mtime": 1783125344.2818172,
+    "mtime": 1783125928.8427677,
     "ast_hash": "02001947e8f3ea7dfba1d4c952a536c9",
     "semantic_hash": ""
   },
   "messages/20260703T062154Z-sonnet-gable.json": {
-    "mtime": 1783125344.2828152,
+    "mtime": 1783125928.8437624,
     "ast_hash": "368a29545901c2fab84eecb5ce297bfa",
     "semantic_hash": ""
   },
   "messages/20260703T063139Z-sonnet-marsh.json": {
-    "mtime": 1783125344.2833242,
+    "mtime": 1783125928.8437624,
     "ast_hash": "e78a76ebfab7d964042e25857b34a7ac",
     "semantic_hash": ""
   },
   "messages/20260703T100632Z-sonnet-alder.json": {
-    "mtime": 1783125344.2833242,
+    "mtime": 1783125928.8437624,
     "ast_hash": "47eea1569ef28245607d695091335a76",
     "semantic_hash": ""
   },
   "messages/20260703T102048Z-sonnet-alder-to-foreman.json": {
-    "mtime": 1783125344.2843359,
+    "mtime": 1783125928.8447618,
     "ast_hash": "589ecf62174777014b80d94cffff6031",
     "semantic_hash": ""
   },
   "messages/20260703T102733Z-sonnet-alder.json": {
-    "mtime": 1783125344.2843359,
+    "mtime": 1783125928.8447618,
     "ast_hash": "f6b7f5fae570adf76a9545c06fb142f2",
     "semantic_hash": ""
   },
   "messages/20260703T224359Z-opus-vela.json": {
-    "mtime": 1783125344.2843359,
+    "mtime": 1783125928.8447618,
     "ast_hash": "912b94372b5c3f51c5b0abd0b3efafeb",
     "semantic_hash": ""
   },
   "messages/20260703T234449Z-fable-foreman.json": {
-    "mtime": 1783125344.2853448,
+    "mtime": 1783125928.8457627,
     "ast_hash": "4ecf050db89099ab73e15c71852d09a9",
     "semantic_hash": ""
   },
   "messages/20260703T234509Z-fable-foreman.json": {
-    "mtime": 1783125344.2863364,
+    "mtime": 1783125928.8457627,
     "ast_hash": "8f13a5580e0391d604d8ea3a0da1ff04",
     "semantic_hash": ""
   },
   "messages/20260704T002439Z-opus-hunter.json": {
-    "mtime": 1783125344.2873495,
+    "mtime": 1783125928.8457627,
     "ast_hash": "b7bf812264355bef834b66cbbbd7677b",
     "semantic_hash": ""
   },
   "presence/Hunter-124.json": {
-    "mtime": 1783125344.288347,
+    "mtime": 1783125928.8457627,
     "ast_hash": "c35099a8f392a56222fd319d8a912ea0",
     "semantic_hash": ""
   },
   "presence/fable-foreman.json": {
-    "mtime": 1783125344.2873495,
+    "mtime": 1783125928.8457627,
     "ast_hash": "0b78d726ede81c4652db3f322460cae0",
     "semantic_hash": ""
   },
   "presence/mooseinatree.json": {
-    "mtime": 1783125924.9127831,
+    "mtime": 1783125928.847275,
     "ast_hash": "5a8e0d9b608780096982a754d9fcb963",
     "semantic_hash": ""
   },
   "presence/opus-dawn.json": {
-    "mtime": 1783125344.2893455,
+    "mtime": 1783125928.848289,
     "ast_hash": "3ccec43c8fef0019dc8965cddf42ea3a",
     "semantic_hash": ""
   },
   "presence/opus-hunter.json": {
-    "mtime": 1783125344.2898526,
+    "mtime": 1783125928.848289,
     "ast_hash": "ef754c7c31814d79f62067d1124a741a",
     "semantic_hash": ""
   },
   "presence/opus-iron.json": {
-    "mtime": 1783125344.2898526,
+    "mtime": 1783125928.8493025,
     "ast_hash": "c3f45906e3852b06c6d74ec341c6c080",
     "semantic_hash": ""
   },
   "presence/opus-ridge.json": {
-    "mtime": 1783125344.2898526,
+    "mtime": 1783125928.8498447,
     "ast_hash": "ce5b031bf61dd1432e2bfa5184ccb31a",
     "semantic_hash": ""
   },
   "presence/opus-sky.json": {
-    "mtime": 1783125344.2908616,
+    "mtime": 1783125928.8498447,
     "ast_hash": "d02e96d48d68de986ed4acb5f35ab71b",
     "semantic_hash": ""
   },
   "presence/opus-vale.json": {
-    "mtime": 1783125344.2908616,
+    "mtime": 1783125928.8508549,
     "ast_hash": "27d67ab2b02bbda7454bdd2546945d3f",
     "semantic_hash": ""
   },
   "presence/opus-vega.json": {
-    "mtime": 1783125344.2918699,
+    "mtime": 1783125928.8508549,
     "ast_hash": "9d8370d26ed50908896df9fbd02e5c74",
     "semantic_hash": ""
   },
   "presence/opus-vela.json": {
-    "mtime": 1783125344.2918699,
+    "mtime": 1783125928.8508549,
     "ast_hash": "68a60cecb23746d153d6b88c6aa87c0c",
     "semantic_hash": ""
   },
   "presence/opus-vex.json": {
-    "mtime": 1783125344.2918699,
+    "mtime": 1783125928.8518522,
     "ast_hash": "4524e78988f5a7e8e6a2daba1263de8a",
     "semantic_hash": ""
   },
   "presence/sonnet-alder.json": {
-    "mtime": 1783125344.292873,
+    "mtime": 1783125928.8518522,
     "ast_hash": "b4441431d06ea7cf0539c8913294f27b",
     "semantic_hash": ""
   },
   "presence/sonnet-ash.json": {
-    "mtime": 1783125344.292873,
+    "mtime": 1783125928.8518522,
     "ast_hash": "2fd1548f030ca6dfbc4c9b31f0ab6ed9",
     "semantic_hash": ""
   },
   "presence/sonnet-birch.json": {
-    "mtime": 1783125344.2938764,
+    "mtime": 1783125928.8528535,
     "ast_hash": "07859e89e6e34093db3ef626935750c9",
     "semantic_hash": ""
   },
   "presence/sonnet-brack.json": {
-    "mtime": 1783125344.2938764,
+    "mtime": 1783125928.8528535,
     "ast_hash": "56b0bf1c6f47d38e44d9d99cc6b584c8",
     "semantic_hash": ""
   },
   "presence/sonnet-brio.json": {
-    "mtime": 1783125344.294871,
+    "mtime": 1783125928.8528535,
     "ast_hash": "0721916cc99f5eec6f5847c07c2db635",
     "semantic_hash": ""
   },
   "presence/sonnet-clay.json": {
-    "mtime": 1783125344.294871,
+    "mtime": 1783125928.8528535,
     "ast_hash": "d449b86f0609d6a2cd72000d52e641f9",
     "semantic_hash": ""
   },
   "presence/sonnet-crane.json": {
-    "mtime": 1783125344.294871,
+    "mtime": 1783125928.8543694,
     "ast_hash": "9508402980068d2d715c836774c8c7ec",
     "semantic_hash": ""
   },
   "presence/sonnet-dove.json": {
-    "mtime": 1783125344.294871,
+    "mtime": 1783125928.8543694,
     "ast_hash": "722bc976a479c8535c9462c6f2d692c5",
     "semantic_hash": ""
   },
   "presence/sonnet-dray.json": {
-    "mtime": 1783125344.2963808,
+    "mtime": 1783125928.8553855,
     "ast_hash": "7f3bb80c839c915af43a082a087b0035",
     "semantic_hash": ""
   },
   "presence/sonnet-elm.json": {
-    "mtime": 1783125344.2963808,
+    "mtime": 1783125928.8553855,
     "ast_hash": "7dc8b59976dd1a45e4bf2bff88f8e999",
     "semantic_hash": ""
   },
   "presence/sonnet-fenn.json": {
-    "mtime": 1783125344.2973948,
+    "mtime": 1783125928.85639,
     "ast_hash": "01ad650f60525c3f4b5f1a1f74ea7f4d",
     "semantic_hash": ""
   },
   "presence/sonnet-finch.json": {
-    "mtime": 1783125344.2973948,
+    "mtime": 1783125928.85639,
     "ast_hash": "931f57d23ff3c28209fad515ceb9a695",
     "semantic_hash": ""
   },
   "presence/sonnet-gable.json": {
-    "mtime": 1783125344.2983909,
+    "mtime": 1783125928.85639,
     "ast_hash": "f926426ce6f9b3eba6dc21ec9b7fa219",
     "semantic_hash": ""
   },
   "presence/sonnet-hollis.json": {
-    "mtime": 1783125344.2983909,
+    "mtime": 1783125928.85639,
     "ast_hash": "7dcbf4bc316bdade0e57853ae83cf376",
     "semantic_hash": ""
   },
   "presence/sonnet-lark.json": {
-    "mtime": 1783125344.2983909,
+    "mtime": 1783125928.8573883,
     "ast_hash": "245bd936f5e089b37cfc09e1a3471777",
     "semantic_hash": ""
   },
   "presence/sonnet-lyra.json": {
-    "mtime": 1783125344.299396,
+    "mtime": 1783125928.8579075,
     "ast_hash": "2a06abac0215a5e9d3039a7e037cbb55",
     "semantic_hash": ""
   },
   "presence/sonnet-marsh.json": {
-    "mtime": 1783125344.2999103,
+    "mtime": 1783125928.8579075,
     "ast_hash": "54fad0c9eb77bc50278ef3c7c3d922cd",
     "semantic_hash": ""
   },
   "presence/sonnet-moss.json": {
-    "mtime": 1783125344.3009336,
+    "mtime": 1783125928.858422,
     "ast_hash": "fcc77cc9ed563184145e9b6427768d1e",
     "semantic_hash": ""
   },
   "presence/sonnet-page.json": {
-    "mtime": 1783125344.3019483,
+    "mtime": 1783125928.858422,
     "ast_hash": "9d62b2068c2efcd295f55825e7654da4",
     "semantic_hash": ""
   },
   "presence/sonnet-pike2.json": {
-    "mtime": 1783125344.3019483,
+    "mtime": 1783125928.858422,
     "ast_hash": "91f79dfe70b133867105ae5f3a8a8e02",
     "semantic_hash": ""
   },
   "presence/sonnet-plume.json": {
-    "mtime": 1783125344.3029482,
+    "mtime": 1783125928.8594272,
     "ast_hash": "ffc4c224870904ec25100742e85ce15b",
     "semantic_hash": ""
   },
   "presence/sonnet-quinn.json": {
-    "mtime": 1783125344.3029482,
+    "mtime": 1783125928.8594272,
     "ast_hash": "1e1873d1ce901e448c10f5eafe5fad47",
     "semantic_hash": ""
   },
   "presence/sonnet-reed.json": {
-    "mtime": 1783125344.3039453,
+    "mtime": 1783125928.859947,
     "ast_hash": "17bcbf5d827c246bab08b79ead63716d",
     "semantic_hash": ""
   },
   "presence/sonnet-rook.json": {
-    "mtime": 1783125344.3039453,
+    "mtime": 1783125928.859947,
     "ast_hash": "accd490eb6afd13a1eb66082c7291cfe",
     "semantic_hash": ""
   },
   "presence/sonnet-sable.json": {
-    "mtime": 1783125344.3049445,
+    "mtime": 1783125928.859947,
     "ast_hash": "ce2bd444ec0b7c49f27f7994da4ea1e8",
     "semantic_hash": ""
   },
   "presence/sonnet-slate.json": {
-    "mtime": 1783125344.3049445,
+    "mtime": 1783125928.859947,
     "ast_hash": "a531599d33b165764597f4afa4e6c220",
     "semantic_hash": ""
   },
   "presence/sonnet-tarn.json": {
-    "mtime": 1783125344.3049445,
+    "mtime": 1783125928.8609562,
     "ast_hash": "c26c93b6e97f2030fe479555c5807217",
     "semantic_hash": ""
   },
   "presence/sonnet-teal.json": {
-    "mtime": 1783125344.3064532,
+    "mtime": 1783125928.8609562,
     "ast_hash": "96c822b4dfd311dd2f57c2263bd6632a",
     "semantic_hash": ""
   },
   "presence/sonnet-vega.json": {
-    "mtime": 1783125344.3064532,
+    "mtime": 1783125928.8609562,
     "ast_hash": "890e8faf1ce071a04b4d31e7829151f9",
     "semantic_hash": ""
   },
   "presence/sonnet-wren2.json": {
-    "mtime": 1783125344.3074687,
+    "mtime": 1783125928.8619668,
     "ast_hash": "2029e7050019e90236a210345519e2b9",
     "semantic_hash": ""
   },
   "presence/sonnet-wrenn.json": {
-    "mtime": 1783125344.3074687,
+    "mtime": 1783125928.86296,
     "ast_hash": "a04be10e8833fbf24e4ab5b005e97359",
     "semantic_hash": ""
   },
   "presence/sonnet-yarrow.json": {
-    "mtime": 1783125344.3074687,
+    "mtime": 1783125928.86296,
     "ast_hash": "a5f53ab64c39ad531e2d803db696c8e3",
     "semantic_hash": ""
   },
   "README.md": {
-    "mtime": 1783125344.2632208,
+    "mtime": 1783125928.8273337,
     "ast_hash": "7a903f92c740586f940034feea88f7be",
+    "semantic_hash": ""
+  },
+  "messages/20260704T003650Z-opus-hunter.json": {
+    "mtime": 1783125928.8082235,
+    "ast_hash": "702f6bba72a9898109b1732b1fd0236a",
     "semantic_hash": ""
   }
 }

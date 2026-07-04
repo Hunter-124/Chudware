@@ -189,6 +189,13 @@ add_library(aicad_cam STATIC
 target_include_directories(aicad_cam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_cam PUBLIC
   aicad_clipper2 aicad_miniz nlohmann_json::nlohmann_json)
+# MSVC only defines M_PI et al. in <cmath> when _USE_MATH_DEFINES is set; the CAM math
+# (helix/adaptive/stock-sim) relies on them. GCC/Clang expose them by default, so this is
+# a no-op there. Target-scoped to avoid redefinition warnings in files that set it locally.
+if(MSVC)
+  # PUBLIC so consumers (e.g. test_cam) that use M_PI via the CAM headers get it too.
+  target_compile_definitions(aicad_cam PUBLIC _USE_MATH_DEFINES)
+endif()
 set_property(TARGET aicad_cam PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 

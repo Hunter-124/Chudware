@@ -1176,8 +1176,16 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         drawEyeGlyph(eyeDl, eyeMin, eyeMax, shown, overEye, fmSurf());
         if (overEye) {
             ImGui::SetTooltip(shown ? "Hide" : "Show");
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 toggleFeatureEye(st, fid, c.ownedBodies, shown);
+                // T-BL42: un-hiding an absorbed sketch selects + highlights it so it's easy
+                // to spot in the viewport (ghost goes visible; tree row gets selection card).
+                if (c.nested && !shown && c.type == "sketch") {
+                    st.selectedFeatureId = fid;
+                    selectFeatureInViewport(st, fid);
+                    st.treeScrollToSelection = true;
+                }
+            }
         }
     }
 

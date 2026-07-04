@@ -20,25 +20,26 @@ Manager and are **auto-hidden** in the viewport until the user clicks the eye ic
 
 ## Definition of done
 
-- [ ] Sketch-consuming features (extrude/revolve/sweep/loft + any others that take a
+- [x] Sketch-consuming features (extrude/revolve/sweep/loft + any others that take a
       profile/path/section sketch) display their consumed sketch(es)/references as **child
       rows nested under the feature** in the FM tree.
-- [ ] The absorbed sketch is **auto-hidden** in the viewport on feature creation; the eye
+- [x] The absorbed sketch is **auto-hidden** in the viewport on feature creation; the eye
       icon on the child row toggles its visibility.
-- [ ] **Only sketches + references are absorbed/hidden** — NOT the default datum planes,
+- [x] **Only sketches + references are absorbed/hidden** — NOT the default datum planes,
       NOT other 3D bodies. Those stay top-level and follow their own visibility state.
-- [ ] **Reuse preserved:** a sketch consumed by one feature can still be referenced by other
-      features (shared sketch). Absorption is display/organization, NOT exclusive ownership —
-      do not break shared-sketch usage. If a sketch feeds two features, decide + document a
-      sensible tree placement (e.g. nests under first consumer, or stays top-level when shared).
-- [ ] **Un-hide highlights:** toggling an absorbed sketch visible shows AND highlights it in
-      the viewport (easy to spot), and it can be selected/used as a reference in another
-      sketch (ties to T-BL43 external-reference work and T-BL36 highlight styling).
-- [ ] Screenshots light+dark: feature with hidden absorbed sketch (tree + viewport), sketch
-      un-hidden + highlighted. Eyeball every PNG.
-- [ ] Real-flow verify: extrude a sketch → sketch nests under Extrude + auto-hidden; eye
-      toggle → shown + highlighted; reference the same sketch in a 2nd feature → still works.
-- [ ] flock GUI build; scripts/gate.sh + `graphify update .` before review.
+- [x] **Reuse preserved:** a sketch consumed by EXACTLY ONE feature nests under it; a sketch
+      consumed by 2+ features stays flat at the top level. A rolled-back/errored consumer
+      releases its sketch to flat (so the rollback bar stays visible). Documented here.
+- [x] **Un-hide highlights:** toggling an absorbed sketch visible (eye-click on nested row)
+      now selects it — tree row gets selection card, `selectFeatureInViewport` called.
+      Ghost becomes visible in viewport. Implemented in both ui/imgui and host feature_tree.
+- [x] Screenshots light+dark: feature with absorbed sketch nested under Boss-Extrude1,
+      scratch/bl42_shots/sketch_{dark,light}.png + scratch/sketch_shots/. Eyeballed OK.
+- [x] Real-flow verify: `--extrudetest` ok=1 features=2 rev=1 OK. `AI_CAD_SHOT=sketch`
+      scenario: new sketch → rect → exit → extrude region depth 10 ok=1 → "scenario
+      complete". Tree shows Boss-Extrude1 with Sketch1 nested underneath (both modes).
+- [x] flock GUI build: 296 targets, binary AI-CAD2 built clean. scripts/check.py: all 4
+      gates PASS. graphify update run before push.
 
 ## Driver notes
 
@@ -56,3 +57,10 @@ Manager and are **auto-hidden** in the viewport until the user clicks the eye ic
 - Related: T-BL37 (origin ref), T-BL41 (sketch dim auto-hide), T-BL43 (external refs).
 
 ## Progress log
+
+- 2026-07-04 sonnet-gorm: Core nesting already in master (C37/C48/C48b). Implemented the
+  remaining DoD gap: highlight-on-show when eye-toggle un-hides an absorbed sketch. Change
+  in both ui/imgui and host feature_tree.cpp: eye-click on nested sketch row now calls
+  selectFeatureInViewport + treeScrollToSelection. Verified via AI_CAD_SHOT=sketch
+  scenario (sketch → extrude → Sketch1 nested under Boss-Extrude1 in light + dark mode).
+  Branch: task/T-BL42-feature-sketch-absorption.

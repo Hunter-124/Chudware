@@ -2,8 +2,8 @@
 id: T-BL48
 title: Wire ui/imgui interactive sketcher entry — dispatch sketch enter/edit/exit so active sketch editing works (unblocks T-BL41/44/46)
 workstream: backlog
-owner: unassigned
-status: todo
+owner: opus-tarn
+status: doing
 priority: 2
 lane: app-gui
 kind: fix

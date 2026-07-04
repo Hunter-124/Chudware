@@ -2,8 +2,8 @@
 id: T-BL42
 title: Feature tree — extrude/revolve/sweep/loft absorb their sketches/references as hidden children; eye-toggle to show+highlight; sketches stay reusable
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-gorm
+status: doing
 priority: 2
 lane: app-gui
 kind: overhaul

@@ -356,12 +356,10 @@ void AppState::seedDemo() {
 
     docMirror.setListener([this]() { onDocMutation(); });
 
+    // T-BL39: empty state — no greeting card. Chat starts blank; the input placeholder
+    // already hints "Describe what to build…". A greeting block would show "Assistant"
+    // attribution with no real model metadata, which is exactly what T-BL39 removes.
     agent.blocks.clear();
-    AgentBlock w; w.kind = BlockKind::AssistantMsg; w.anim = 1.f;
-    w.title = "Assistant";
-    w.body  = "Hi - I'm your CAD copilot. Ask me to model something, run a simulation, or "
-              "explain a feature. You'll see my thinking and every action I take, inline.";
-    agent.blocks.push_back(w);
 
     tryStartWorker();
 
@@ -445,7 +443,11 @@ void AppState::tickDemoAgent(float dt) {
             }
         }
 
+        std::string engaged = result.value("engaged", std::string("agent"));
         AgentBlock m; m.kind = BlockKind::AssistantMsg; m.anim = 0.f;
+        // T-BL39: stamp the real model name from the engine result so the GUI can show
+        // per-message attribution. "engaged" carries the adapter/model id the loop used.
+        m.modelName = engaged;
         if (ok) {
             int rev = result.value("revision", -1);
             m.body = "Done." + (rev >= 0 ? "  Model is at rev " + std::to_string(rev) + "." : "");
@@ -453,8 +455,6 @@ void AppState::tickDemoAgent(float dt) {
             m.body = "The copilot run failed: " + (errMsg.empty() ? "unknown error" : errMsg);
         }
         agent.blocks.push_back(m);
-
-        std::string engaged = result.value("engaged", std::string("agent"));
         int itok = result.value("input_tokens", 0);
         int otok = result.value("output_tokens", 0);
         // Store real token counts so the context bar can show live k-token usage.
@@ -521,7 +521,10 @@ void AppState::tickDemoAgent(float dt) {
             agent.demoStep = 3; agent.demoTimer = 0.f;
         } break;
         case 3: if (agent.demoTimer > 0.5f) {
-            AgentBlock m; m.kind = BlockKind::AssistantMsg; m.title = "Assistant";
+            AgentBlock m; m.kind = BlockKind::AssistantMsg;
+            // T-BL39: modelName instead of hardcoded "Assistant". Demo path labels itself
+            // "demo" so attribution is honest (no real model was called in this path).
+            m.modelName = "demo";
             m.body = agent.demoOpOk
                 ? "Done - I drilled the four mounting holes through the base. Next I can place the "
                   "regulator, the input/output caps, and route the power net. Want me to continue?"

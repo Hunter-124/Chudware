@@ -283,7 +283,7 @@ static void drawUserBubble(const std::string& text, float panelW) {
     ImGui::GetWindowDrawList()->AddRect(bubble.Min, bubble.Max,
                                         theme::roleU32(theme::pal().accent, 0.55f), 8.f * S, 0, 1.f * S);
     ImGui::PopID();
-    ImGui::Dummy(ImVec2(0, 6.f * S));
+    ImGui::Dummy(ImVec2(0, 4.f * S));  // T-BL39: tighter user bubble bottom gap (was 6pt)
 }
 
 static void drawActionCard(AgentBlock& b) {
@@ -328,16 +328,26 @@ static void drawActionCard(AgentBlock& b) {
 
 static void drawAssistantBubble(AgentBlock& b) {
     const float S = theme::S();
+    const theme::AdaptiveSurface& surf = agentSurf();
     const float w = ImGui::GetContentRegionAvail().x;
     GlassBubble gb = beginGlassBubble("##asstGlass", w, theme::MaterialLevel::Thin, 8.f * S);
     ImGui::BeginChild("##asst", ImVec2(w, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
-    inlineIconGlass("agent", 16.f * S, ImGui::ColorConvertFloat4ToU32(agentSurf().textPrimary));
-    ImGui::SameLine(0, 8.f * S);
+
+    // T-BL39: real model attribution. modelName is stamped by the agent loop from the
+    // engine "engaged" field (real path) or "demo" (scripted demo path). Falls back to
+    // "AI" only when metadata is absent — never "Assistant" (that was a lie).
+    // surf.textSecondary is theme-adaptive — safe in dark mode (no black-on-black, T-BL33).
+    const std::string& attrName = b.modelName.empty() ? std::string("AI") : b.modelName;
+
+    inlineIconGlass("agent", 14.f * S, ImGui::ColorConvertFloat4ToU32(surf.textPrimary));
+    ImGui::SameLine(0, 6.f * S);
     ImGui::PushFont(theme::font(theme::Font::Label));
-    ImGui::TextColored(agentSurf().textSecondary, "Assistant");
+    ImGui::TextColored(surf.textSecondary, "%s", attrName.c_str());
     ImGui::PopFont();
+
+    // Compact: body immediately after attribution line, no extra spacer between them.
     ImGui::PushTextWrapPos(0);
-    ImGui::TextColored(agentSurf().textPrimary, "%s", b.body.c_str());
+    ImGui::TextColored(surf.textPrimary, "%s", b.body.c_str());
     ImGui::PopTextWrapPos();
     ImGui::EndChild();
     endGlassBubble(gb);
@@ -391,7 +401,7 @@ static void drawBlock(AppState& s, AgentBlock& b, int idx, float panelW) {
         break;
     }
     ImGui::PopStyleVar();
-    ImGui::Dummy(ImVec2(0, 7.f * S));
+    ImGui::Dummy(ImVec2(0, 4.f * S));  // T-BL39: tighter inter-block rhythm (was 7pt)
     ImGui::PopID();
 }
 
@@ -850,8 +860,23 @@ static void drawChatBody(AppState& s, bool busy, bool canRun) {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##transcript", ImVec2(0, chatH), false);
     const float logW = ImGui::GetContentRegionAvail().x;
-    if (gShowSessions) drawSessionsList(s, busy);
-    else for (int i = 0; i < (int)a.blocks.size(); ++i) drawBlock(s, a.blocks[i], i, logW);
+    if (gShowSessions) {
+        drawSessionsList(s, busy);
+    } else if (a.blocks.empty()) {
+        // T-BL39: empty state — no greeting card. Minimal centered hint so the panel
+        // doesn't look broken; disappears as soon as the first message arrives.
+        const theme::AdaptiveSurface& surf = agentSurf();
+        ImGui::Dummy(ImVec2(0, chatH * 0.35f));
+        ImGui::PushFont(theme::font(theme::Font::Label));
+        const char* hint = "Type below to start a conversation.";
+        float hw = ImGui::CalcTextSize(hint).x;
+        float avail = ImGui::GetContentRegionAvail().x;
+        if (avail > hw) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - hw) * 0.5f);
+        ImGui::TextColored(surf.textSecondary, "%s", hint);
+        ImGui::PopFont();
+    } else {
+        for (int i = 0; i < (int)a.blocks.size(); ++i) drawBlock(s, a.blocks[i], i, logW);
+    }
     if (!gShowSessions && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 40.f * S)
         ImGui::SetScrollHereY(1.f);
     ImGui::EndChild();

@@ -1473,12 +1473,15 @@ void SketchMode::drawOverlay(SketchHost& st, ImGuiIO& io, const ImVec2& imgMin, 
     }
 
     // ---- C-bug2: relation badges (geometric / non-dimensional constraints) ----
+    // T-BL41: badges are HIDDEN by default; they only render when the SmartDim (dimension/relation)
+    // tool is active so the canvas stays uncluttered during normal modelling.
     // Drawn HERE, BENEATH the entity lines, so geometry stays crisp on top (the user complaint was
     // badges sitting on the lines). Three phases: (1) collect each badge's initial chip center plus
     // the geometry point it annotates, (2) relax overlapping chips apart, (3) draw a hairline leader
     // from the geometry to any displaced chip, then the chip. Dimension annotations still render
     // AFTER the entity loop (they read better on top of geometry).
-    {
+    relHits_.clear();   // always clear so stale hit-rects don't accumulate when badges are hidden
+    if (tool_ == SketchTool::SmartDim) {
         const float bs = 16.0f * ui::sketch::uiScale();                 // chip side
         const ImU32 relBg        = col(pal.sketchRelBg);
         const ImU32 relBorder    = col(pal.sketchRelBorder);
@@ -1619,7 +1622,7 @@ void SketchMode::drawOverlay(SketchHost& st, ImGuiIO& io, const ImVec2& imgMin, 
             }
         }
         // (3) Draw: hairline leader (only when the chip drifted off its anchor) + chip + hit-rect.
-        relHits_.clear();
+        // Note: relHits_.clear() is now done BEFORE the SmartDim gate above.
         for (const auto& b : badges) {
             const ImVec2 gp = b.pos;
             if (std::hypot(gp.x - b.anchor.x, gp.y - b.anchor.y) > bs)
@@ -1832,8 +1835,11 @@ void SketchMode::drawOverlay(SketchHost& st, ImGuiIO& io, const ImVec2& imgMin, 
         dl->AddRectFilled(ImVec2(p.x - 4, p.y - 4), ImVec2(p.x + 4, p.y + 4), col(pal.accent), 1.5f);
     }
 
-    // ---- C37-D: dimension annotations (always rendered, ON TOP of entity lines) ----
-    {
+    // ---- C37-D: dimension annotations (only rendered when SmartDim tool active, T-BL41) ----
+    // T-BL41: dimensions are hidden by default; they only render when SmartDim is active.
+    // dimHoverCid_ must be cleared when hidden so drag/delete handlers don't fire on stale ids.
+    if (tool_ != SketchTool::SmartDim) { dimHoverCid_.clear(); }
+    if (tool_ == SketchTool::SmartDim) {
         const ImU32 dimLineCol = col(pal.sketchDimLine, 0.85f);
         const ImU32 dimTextCol = col(pal.sketchInk);
         const ImU32 dimDrivenCol = col(pal.consoleDim);     // dimmer for driven (reference) dims
@@ -2007,9 +2013,10 @@ void SketchMode::drawOverlay(SketchHost& st, ImGuiIO& io, const ImVec2& imgMin, 
         }
     }
 
-    // Drag (only when no drawing tool is active): hit-test handles, drag with sketch_drag, release
-    // commits. At most one sketch_drag per frame (throttled by dragFrame_).
-    if (tool_ == SketchTool::None) {
+    // Drag / relation-badge interaction: active when no drawing tool is armed OR when SmartDim is
+    // active. SmartDim needs badge hover + click (to select/delete a relation) and right-click
+    // context menu (to add a new relation via "Add Relation..."). T-BL41: extended to SmartDim.
+    if (tool_ == SketchTool::None || tool_ == SketchTool::SmartDim) {
         // C37-D: a hovered/dragging dimension text claims the click (dim drag/edit above handles it).
         auto toggleSel = [&](const std::string& id) {
             auto it = std::find(selIds_.begin(), selIds_.end(), id);
@@ -2061,44 +2068,55 @@ void SketchMode::drawOverlay(SketchHost& st, ImGuiIO& io, const ImVec2& imgMin, 
         int effRegion = hovRegion >= 0 ? hovRegion : entityLoopRegion_;
 
         // ---- C51: pre-highlight — outline exactly what a click will select, drawn on top. ----
+        // T-BL41: geometry (handle/entity/region) highlights only apply in None mode; SmartDim
+        // has its own cursor (Crosshair) and entity highlight logic in the SmartDim block below.
+        // Badge hover highlight applies in both modes (badge tint driven by hoverRelCid_).
         const ImU32 hiCol = col(pal.accent);
-        if (!hovHandle.empty()) {
-            dl->AddCircle(uvToScreen(hovHu, hovHv), 6.0f, col(pal.hoverHighlight), 16, 2.0f);
-            st.requestCursor(ui::sketch::CursorKind::Hand);
-        } else if (effRegion >= 0) {
-            for (const auto& id : regions_[effRegion].ids)
-                if (const SketchEntity* e = entById(id)) strokeEntityOutline(dl, *e, hiCol, 2.6f);
-            hotRegion_ = effRegion;          // brighten the region fill (next frame)
-            st.requestCursor(ui::sketch::CursorKind::Hand);
-        } else if (!hovEnt.empty()) {
-            if (const SketchEntity* e = entById(hovEnt)) strokeEntityOutline(dl, *e, hiCol, 2.6f);
-            hotRegion_ = -1;
-            st.requestCursor(ui::sketch::CursorKind::Hand);
+        if (tool_ == SketchTool::None) {
+            if (!hovHandle.empty()) {
+                dl->AddCircle(uvToScreen(hovHu, hovHv), 6.0f, col(pal.hoverHighlight), 16, 2.0f);
+                st.requestCursor(ui::sketch::CursorKind::Hand);
+            } else if (effRegion >= 0) {
+                for (const auto& id : regions_[effRegion].ids)
+                    if (const SketchEntity* e = entById(id)) strokeEntityOutline(dl, *e, hiCol, 2.6f);
+                hotRegion_ = effRegion;          // brighten the region fill (next frame)
+                st.requestCursor(ui::sketch::CursorKind::Hand);
+            } else if (!hovEnt.empty()) {
+                if (const SketchEntity* e = entById(hovEnt)) strokeEntityOutline(dl, *e, hiCol, 2.6f);
+                hotRegion_ = -1;
+                st.requestCursor(ui::sketch::CursorKind::Hand);
+            } else {
+                if (hovRel.empty()) hotRegion_ = -1;   // badge hover is tinted in the render pass
+                else st.requestCursor(ui::sketch::CursorKind::Hand);
+            }
         } else {
-            if (hovRel.empty()) hotRegion_ = -1;   // badge hover is tinted in the render pass
-            else st.requestCursor(ui::sketch::CursorKind::Hand);
+            // SmartDim: badge hover cursor only (geometry cursor set by SmartDim block below).
+            if (!hovRel.empty()) st.requestCursor(ui::sketch::CursorKind::Hand);
         }
 
         if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !dragging_ &&
             !dragArmed_ && !groupDragArmed_ && !dimDragging_ && dimHoverCid_.empty()) {
-            if (!hovHandle.empty()) {
-                // C50: ARM a potential drag on this point handle — release without moving selects
-                // the handle; a move past threshold reshapes (single point).
-                dragArmed_ = true; pendingHandle_ = hovHandle; dragDownPos_ = io.MousePos;
-            } else if (!hovRel.empty()) {
-                toggleRel(hovRel);                    // relations select on click (no drag)
-            } else if (effRegion >= 0) {
-                // C51: profile interior, or a dwelled edge's loop -> arm a group drag of the loop;
-                // release without moving selects the whole loop.
-                groupDragArmed_ = true; boxStart_ = io.MousePos; boxCtrl_ = io.KeyCtrl;
-                groupClickKind_ = 2; groupClickRegion_ = effRegion; groupClickEnt_.clear();
-            } else if (!hovEnt.empty()) {
-                // C51: entity body -> arm a group drag (the whole selection if this entity is in
-                // it, else just this entity); release without moving selects it.
-                groupDragArmed_ = true; boxStart_ = io.MousePos; boxCtrl_ = io.KeyCtrl;
-                groupClickKind_ = 1; groupClickEnt_ = hovEnt; groupClickRegion_ = -1;
-            } else {
-                boxArmed_ = true; boxStart_ = io.MousePos; boxCtrl_ = io.KeyCtrl;   // empty canvas
+            if (!hovRel.empty()) {
+                toggleRel(hovRel);                    // relations select on click (no drag) — both modes
+            } else if (tool_ == SketchTool::None) {
+                // Geometry pick/drag actions only in selection mode (SmartDim has its own click path).
+                if (!hovHandle.empty()) {
+                    // C50: ARM a potential drag on this point handle — release without moving selects
+                    // the handle; a move past threshold reshapes (single point).
+                    dragArmed_ = true; pendingHandle_ = hovHandle; dragDownPos_ = io.MousePos;
+                } else if (effRegion >= 0) {
+                    // C51: profile interior, or a dwelled edge's loop -> arm a group drag of the loop;
+                    // release without moving selects the whole loop.
+                    groupDragArmed_ = true; boxStart_ = io.MousePos; boxCtrl_ = io.KeyCtrl;
+                    groupClickKind_ = 2; groupClickRegion_ = effRegion; groupClickEnt_.clear();
+                } else if (!hovEnt.empty()) {
+                    // C51: entity body -> arm a group drag (the whole selection if this entity is in
+                    // it, else just this entity); release without moving selects it.
+                    groupDragArmed_ = true; boxStart_ = io.MousePos; boxCtrl_ = io.KeyCtrl;
+                    groupClickKind_ = 1; groupClickEnt_ = hovEnt; groupClickRegion_ = -1;
+                } else {
+                    boxArmed_ = true; boxStart_ = io.MousePos; boxCtrl_ = io.KeyCtrl;   // empty canvas
+                }
             }
         }
         // Armed handle: promote to a real (single-point reshape) drag past the threshold. The
@@ -2239,10 +2257,12 @@ void SketchMode::drawOverlay(SketchHost& st, ImGuiIO& io, const ImVec2& imgMin, 
         }
         // (Handle/entity/loop/relation hover highlight is drawn by the C51 pre-highlight above.)
 
-        // C37-D: right-click with no tool active -> small context menu (gestures are off in-sketch,
-        // so the RMB is free; consume it before anything else can).
-        if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !dimPopupOpen_)
-            ImGui::OpenPopup("##SketchCtx");
+        // C37-D: right-click -> small context menu (gestures are off in-sketch, so the RMB is free).
+        // T-BL41: also active in SmartDim when no picks are in progress (SmartDim RMB with picks
+        // clears the pick buffer in the SmartDim block below — that takes priority).
+        bool rmbForMenu = imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !dimPopupOpen_
+                          && (tool_ == SketchTool::None || dimPicks_.empty());
+        if (rmbForMenu) ImGui::OpenPopup("##SketchCtx");
     }
     if (ImGui::BeginPopup("##SketchCtx")) {
         if (!selIds_.empty()) {

@@ -432,6 +432,12 @@ void AppState::tickDemoAgent(float dt) {
             }
         }
 
+        // T-BL39: extract real model attribution from the ai_artifact telemetry event
+        // that the engine emits for every successful design run (T-H1 / T-BL22 envelope).
+        // Format: "<provider> · <model-slug>" — mirrors the T-BL38 composer row style so
+        // per-message attribution is visually consistent with the input-row model label.
+        // Falls back to "" (drawAssistantBubble shows "AI") if telemetry is absent.
+        std::string modelAttr;
         if (result.contains("events") && result["events"].is_array()) {
             for (const auto& ev : result["events"]) {
                 std::string kind = ev.value("kind", std::string());
@@ -439,15 +445,23 @@ void AppState::tickDemoAgent(float dt) {
                     AgentBlock t; t.kind = BlockKind::Thinking; t.title = "Thinking";
                     t.body = ev.value("note", ev.dump(2)); t.anim = 0.f;
                     agent.blocks.push_back(t);
+                } else if (kind == "ai_artifact" && modelAttr.empty()) {
+                    // ai_artifact carries model_info as ev["model"] = {provider, model, adapter}.
+                    // Pull both; show "Provider · model-slug" (same rhythm as composerModelLabel).
+                    if (ev.contains("model") && ev["model"].is_object()) {
+                        std::string prov  = ev["model"].value("provider", std::string());
+                        std::string mslug = ev["model"].value("model", std::string());
+                        if (!mslug.empty()) {
+                            modelAttr = prov.empty() ? mslug : (prov + " \xc2\xb7 " + mslug);
+                        }
+                    }
                 }
             }
         }
 
-        std::string engaged = result.value("engaged", std::string("agent"));
         AgentBlock m; m.kind = BlockKind::AssistantMsg; m.anim = 0.f;
-        // T-BL39: stamp the real model name from the engine result so the GUI can show
-        // per-message attribution. "engaged" carries the adapter/model id the loop used.
-        m.modelName = engaged;
+        // T-BL39: real model attribution from the ai_artifact telemetry event.
+        m.modelName = modelAttr;
         if (ok) {
             int rev = result.value("revision", -1);
             m.body = "Done." + (rev >= 0 ? "  Model is at rev " + std::to_string(rev) + "." : "");
@@ -461,7 +475,7 @@ void AppState::tickDemoAgent(float dt) {
         if (itok > 0) agent.lastInputTokens  = itok;
         if (otok > 0) agent.lastOutputTokens = otok;
         AgentBlock us; us.kind = BlockKind::Usage; us.anim = 0.f;
-        us.body = engaged;
+        us.body = modelAttr.empty() ? std::string("AI") : modelAttr;
         if (itok > 0 || otok > 0)
             us.body += "  |  " + std::to_string(itok) + "→" + std::to_string(otok) + " tok";
         agent.blocks.push_back(us);

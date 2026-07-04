@@ -333,10 +333,11 @@ static void drawAssistantBubble(AgentBlock& b) {
     GlassBubble gb = beginGlassBubble("##asstGlass", w, theme::MaterialLevel::Thin, 8.f * S);
     ImGui::BeginChild("##asst", ImVec2(w, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
 
-    // T-BL39: real model attribution. modelName is stamped by the agent loop from the
-    // engine "engaged" field (real path) or "demo" (scripted demo path). Falls back to
-    // "AI" only when metadata is absent — never "Assistant" (that was a lie).
-    // surf.textSecondary is theme-adaptive — safe in dark mode (no black-on-black, T-BL33).
+    // T-BL39: real model attribution. modelName is stamped from the ai_artifact telemetry
+    // event emitted by the engine loop (T-H1/T-BL22 envelope: ev["model"].provider + model).
+    // Demo path labels itself "demo". Falls back to "AI" only when metadata is absent —
+    // never "Assistant". surf.textSecondary is theme-adaptive (no black-on-black, T-BL33).
+    // Format "Provider · slug" mirrors composerModelLabel() in the input row (T-BL38 parity).
     const std::string& attrName = b.modelName.empty() ? std::string("AI") : b.modelName;
 
     inlineIconGlass("agent", 14.f * S, ImGui::ColorConvertFloat4ToU32(surf.textPrimary));

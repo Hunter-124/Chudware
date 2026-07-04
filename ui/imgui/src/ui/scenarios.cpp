@@ -63,8 +63,17 @@ static std::string repoBase() {
 static void loadMesh(app::AppState& st, const std::string& aicm) {
     if (aicm.empty()) return;
     if (st.scene) st.scene->loadAicm(aicm);
-    st.viewMeshRev = st.engine.revision();
-    st.buildTreeFromDoc();
+    // Feed the REAL GL viewport pipeline (st.scene is the legacy scaffold), same as
+    // setupPickShot below — otherwise the viewport keeps whatever mesh it already had
+    // (e.g. the startup demo body).
+    ui::viewportLoadAicm(aicm);
+    st.buildTreeFromDoc();  // resets viewMeshRev = -1 (engineReady) — restamp AFTER this,
+    st.viewMeshRev = st.engine.revision();  // else ensureDocLoaded() "helpfully" reloads
+                                             // from the stale engine.aicmPath() (never
+                                             // updated — this harness calls docMirror
+                                             // .applyOps() directly, bypassing Engine::
+                                             // apply()/ingest()) and clobbers the mesh
+                                             // we just pushed above.
 }
 
 static void writeBackbufferPng(const char* path, int dw, int dh, const char* mirrorPath = nullptr) {

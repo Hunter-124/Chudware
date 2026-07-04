@@ -2,8 +2,8 @@
 id: T-BL41
 title: Sketch — auto-hide dimension/relation annotations by default; dimension tool reveals them and adds/deletes relations
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-dill
+status: doing
 priority: 3
 lane: app-gui
 kind: overhaul

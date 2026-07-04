@@ -71,4 +71,47 @@ pass through the stack.
   side; T-BL50 covers the plan-first workflow that calls this tool. Keep the tool's
   JSON output stable/documented — T-BL50's coverage gate consumes it.
 
+## JSON contract (for T-BL50 — STABLE, version 1)
+
+`interface_check(doc_id?, components?=[a,b,...], fastener?="M6", proximity_mm?=2.0)` returns
+JSON (full field docs at the top of `services/mcp/interface_check_tools.py`):
+
+```
+{
+  "ok": bool,                # True iff NO finding has severity "fail"
+  "doc_id": str,
+  "tool": "interface_check", "version": 1,
+  "components": [{"id","name","bbox"}],
+  "pairs": [                 # one per examined component-pair interface
+    {"a","b","a_name","b_name",
+     "checks": {
+       "hole_pattern":         {"status","matched":[],"misaligned":[{pos_delta_mm,offset_vec_mm,dia_delta_mm,fix}],"unmatched_a":[],"unmatched_b":[],"summary"},
+       "coaxiality":           {"status","pairs":[{a_feature,b_feature,axis_offset_mm,axis_angle_deg,status,fix}],"summary"},
+       "contact_plane":        {"status","gap_mm","parallel_angle_deg","a_feature","b_feature","fix","summary"},
+       "fastener_passthrough": {"status","fastener","nominal_mm","stacks":[{nominal_mm,min_hole_dia_mm,clearance_mm,passes,fix}],"summary"}
+     }}
+  ],
+  "findings": [              # flat, agent-actionable; the payload design_review/verify narrate
+    {"severity":"fail"|"warn","component_a","component_b","check","feature","error_mm","detail","fix"}
+  ],
+  "summary": str, "scope_note": str
+}
+```
+
+T-BL50's coverage gate should read `ok` + `findings[].severity=="fail"` (advisory `warn`
+findings do not fail the gate). `check` ∈ {hole_pattern, coaxiality, contact_plane,
+fastener_passthrough}. Field names/`version` are frozen; additive-only changes bump `version`.
+
 ## Progress log
+
+- 2026-07-04 opus-gill: shipped `interface_check` (services/mcp/interface_check_tools.py):
+  4 sub-checks (hole-pattern registration, bore coaxiality, contact-plane flushness, fastener
+  pass-through). Reuses `doc_query` (per-body faces via a new 1-based `body_id` selector added
+  to core/doc/session.cpp, mirroring eval_measure/eval_mass — default preserves bodies[-1]),
+  `asm_world_bodies`, and `research_thread_spec` (no new fit tables). Wired into the review
+  loop: `verify` battery (services/verify/battery.py), `design_review`
+  (services/mcp/design_review_tools.py), server.py registration, and cad_guide('review').
+  Regression: services/mcp/test_interface_check.py — misaligned 4-hole bracket+plate FLAGGED
+  with pos_delta≈1.5mm in +X; corrected (dx=0) PASSES; M8 fastener fails / M5 passes; plus a
+  doc_query body_id per-body + out-of-range unit test. Built + tested against a worktree-local
+  core build (system OCCT); main checkout left clean.

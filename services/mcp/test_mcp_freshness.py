@@ -243,6 +243,9 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
     "design_review": {
         "design_review",
     },
+    "interface_check": {
+        "interface_check",
+    },
 }
 
 # All tool names across all families (deduplicated — some tools like hover appear in
@@ -280,6 +283,7 @@ _FAMILY_SIGNALS: dict[str, list[str]] = {
     "code_compliance": ["code_check", "cad_guide('code_compliance')", "code_compliance"],
     "dag":           ["dag_plan", "dag_run", "cad_guide('dag')", "dag"],
     "design_review": ["design_review", "cad_guide('design_review')"],
+    "interface_check": ["interface_check", "interface alignment", "cad_guide('design_review')"],
 }
 
 

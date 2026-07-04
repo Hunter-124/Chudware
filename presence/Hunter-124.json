@@ -1,7 +1,7 @@
 {
  "agent": "Hunter-124",
  "host": "hunter-pc",
- "activity": "whoami",
+ "activity": "issue_list",
  "task": "",
  "ts": "2026-07-04T17:09:30Z"
 }

@@ -93,3 +93,8 @@ Hunter re-confirmed the sketcher batch as a top priority 2026-07-04.
   viewport.cpp use s_sketch.active()/cameraLock(yaw,pitch) (T-BL44 handler already does);
   outside the viewport read AppState::inSketch (drain keeps it = active_ || planePicking_);
   to ENTER programmatically: dispatch a sketch cmd id or set pendingSketchEditFid.
+- 2026-07-04 opus-tarn: a stray one-line loadMesh->viewportLoadAicm patch (evicted from the
+  main checkout by helm, likely my scenario subagent's off-worktree edit) was applied +
+  rebuilt + re-run here: it does NOT fix the stale-mesh quirk (post-extrude shot still shows
+  the demo body). Reverted — not shipping an unverified fix; the quirk chip stands with this
+  data point (the fix needs the active-tab/doc mesh path, not just an aicm load).

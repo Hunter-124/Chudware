@@ -63,3 +63,4 @@ toggled.
   depth should stop at a repro + question file rather than guessing at constraint semantics.
 
 ## Progress log
+- 2026-07-04 21:09 UTC [sonnet-dill] Implementation complete. Branch task/T-BL41-sketch-dimension-autohide pushed. Three changes in sketch_overlay.cpp: (1) relation badges gated on SmartDim with relHits_.clear() pre-gate, (2) dim annotations gated on SmartDim with dimHoverCid_ cleared when hidden, (3) badge interaction (toggleRel + context menu) extended to SmartDim while keeping geometry drag/box-select None-only. Build PASS, --shot PASS, selftest PASS. Gate services pytest hung on pre-existing CAD-T-BL39 teardown issue — not related to this change.

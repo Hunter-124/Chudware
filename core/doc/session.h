@@ -462,4 +462,17 @@ nlohmann::json doc_sketch_probe(const std::string& doc_id, const std::string& sk
 nlohmann::json doc_sketch_project_ref(const std::string& doc_id, const std::string& sketch_fid,
                                       const nlohmann::json& ref);
 
+// sketch_project_entities (T-BL43 "Convert Entities" / external references): project a LIST of
+// external refs (datum plane / face / model edge) onto the active sketch's (u,v) plane and
+// return ready-to-insert doc-schema §3.1 REFERENCE entities (construction:true). Uses OCCT
+// orthographic projection (GeomProjLib) + recon.cpp's curve classifier, so faces project all
+// their boundary wires and tilted circles become ellipses correctly (the Convert-Entities fix).
+// READ-ONLY (compiles current bodies, no mutation); the caller inserts the returned entities
+// via sketch_add_entity ops so the projected geometry becomes constrainable. One-shot (not
+// associative — see T-BL43 follow-up). `refs` is a list of {"datum":...} or
+// {"kind":"face|edge","selector":{...}}. Returns {ok, entities, approx, sources, plane_frame}.
+nlohmann::json doc_sketch_project_entities(const std::string& doc_id,
+                                           const std::string& sketch_fid,
+                                           const nlohmann::json& refs);
+
 }  // namespace aicad::doc

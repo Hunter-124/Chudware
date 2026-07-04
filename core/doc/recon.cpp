@@ -19,6 +19,7 @@
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepBndLib.hxx>
+#include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepGProp.hxx>
 #include <BRepTools.hxx>
 #include <BRepTools_WireExplorer.hxx>
@@ -26,6 +27,10 @@
 #include <GProp_GProps.hxx>
 #include <GeomAbs_CurveType.hxx>
 #include <GeomAbs_SurfaceType.hxx>
+#include <Geom_Curve.hxx>
+#include <Geom_Plane.hxx>
+#include <Geom_TrimmedCurve.hxx>
+#include <GeomProjLib.hxx>
 #include <Standard_Failure.hxx>
 #include <TopAbs.hxx>
 #include <TopExp.hxx>
@@ -34,9 +39,11 @@
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <TopoDS_Wire.hxx>
+#include <gp_Ax3.hxx>
 #include <gp_Circ.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Elips.hxx>
+#include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
 
 using nlohmann::json;
@@ -471,6 +478,128 @@ json face_wires(const TopoDS_Face& face) {
         {"wires", wires},
         {"approx", any_approx},
     };
+}
+
+// ------------------------------------------------------------- C3: project external edges
+
+namespace {
+
+// Build the OCCT Geom_Plane matching a SketchPlane frame (origin + u/v/normal). Used as the
+// projection target for GeomProjLib::ProjectOnPlane (orthographic drop along the sketch normal).
+Handle(Geom_Plane) geom_plane_of(const aicad::geom::SketchPlane& p) {
+    gp_Pnt o(p.origin.x(), p.origin.y(), p.origin.z());
+    gp_Dir n(p.normal.x(), p.normal.y(), p.normal.z());
+    gp_Dir u(p.uAxis.x(), p.uAxis.y(), p.uAxis.z());
+    return new Geom_Plane(gp_Ax3(o, n, u));
+}
+
+// True iff the whole edge collapses to (near) a single point once projected onto `plane` — i.e.
+// the edge is (near) perpendicular to the plane, so its orthographic image is a point, not a
+// curve. Callers emit a "point" reference entity (or skip) rather than a zero-length curve.
+bool projected_edge_is_point(const TopoDS_Edge& edge, const aicad::geom::SketchPlane& plane,
+                             std::array<double, 2>& pt_out) {
+    BRepAdaptor_Curve ca(edge);
+    const double t0 = ca.FirstParameter(), t1 = ca.LastParameter();
+    const std::array<double, 2> a = project2(plane, ca.Value(t0));
+    double maxd = 0.0;
+    for (int i = 1; i <= 8; ++i) {
+        const std::array<double, 2> q =
+            project2(plane, ca.Value(t0 + (t1 - t0) * (static_cast<double>(i) / 8.0)));
+        maxd = std::max(maxd, std::hypot(q[0] - a[0], q[1] - a[1]));
+    }
+    pt_out = a;
+    return maxd < 1e-7;
+}
+
+// Project ONE source 3D edge orthographically onto `plane` (along the plane normal), rebuild a
+// TopoDS_Edge from the projected curve, and hand it to the existing in-plane emitters. Because
+// the projected curve genuinely LIES in the plane, GeomAbs classification is correct BY
+// CONSTRUCTION: a tilted circle projects to a Geom_Ellipse and comes back as an "ellipse"/
+// "ellipse_arc"; a line stays a line; anything unclassifiable falls through to the sampled
+// polyline path (approx). Closed source edges (full circles/ellipses) emit a single closed
+// "circle"/"ellipse" entity via emit_full_loop_entities. Perpendicular edges collapse to a
+// "point" reference entity. Appends to `entities`; returns the new entity ids.
+std::vector<std::string> emit_projected_edge(json& entities, const TopoDS_Edge& src_edge,
+                                             const aicad::geom::SketchPlane& plane, int& next_id,
+                                             bool& any_approx) {
+    // Perpendicular edge -> single reference point (nothing to project into a curve).
+    std::array<double, 2> pt{};
+    if (projected_edge_is_point(src_edge, plane, pt)) {
+        const std::string id = "e" + std::to_string(next_id++);
+        entities.push_back(json{{"id", id}, {"type", "point"}, {"construction", true},
+                                 {"p", {pt[0], pt[1]}}});
+        return {id};
+    }
+
+    Standard_Real f = 0.0, l = 0.0;
+    Handle(Geom_Curve) c3d = BRep_Tool::Curve(src_edge, f, l);
+    if (c3d.IsNull()) {
+        // No 3D curve (degenerate/seam edge) — nothing to project.
+        return {};
+    }
+    Handle(Geom_Plane) gpln = geom_plane_of(plane);
+    gp_Dir ndir(plane.normal.x(), plane.normal.y(), plane.normal.z());
+    Handle(Geom_Curve) proj;
+    try {
+        proj = GeomProjLib::ProjectOnPlane(new Geom_TrimmedCurve(c3d, f, l), gpln, ndir,
+                                           /*KeepParametrization=*/Standard_True);
+    } catch (const Standard_Failure&) {
+        proj.Nullify();
+    }
+    if (proj.IsNull()) return {};
+
+    // Rebuild an edge over the same [f,l] param window so the emitters see the exact trim.
+    TopoDS_Edge pedge;
+    try {
+        pedge = BRepBuilderAPI_MakeEdge(proj, proj->FirstParameter(), proj->LastParameter());
+    } catch (const Standard_Failure&) {
+        return {};
+    }
+    if (pedge.IsNull()) return {};
+
+    // A closed source edge (full circle/ellipse/closed spline) stays a single closed loop.
+    if (BRep_Tool::IsClosed(pedge) || src_edge.Closed() ||
+        proj->Value(proj->FirstParameter()).Distance(proj->Value(proj->LastParameter())) < 1e-7) {
+        std::vector<std::string> ids = emit_full_loop_entities(entities, pedge, plane, next_id,
+                                                               any_approx);
+        for (const std::string& id : ids)
+            for (json& e : entities)
+                if (e.value("id", std::string()) == id) e["construction"] = true;
+        return ids;
+    }
+    std::vector<std::string> ids = emit_edge_entities(entities, pedge, plane, next_id, any_approx);
+    for (const std::string& id : ids)
+        for (json& e : entities)
+            if (e.value("id", std::string()) == id) e["construction"] = true;
+    return ids;
+}
+
+}  // namespace
+
+std::vector<ProjectedEntity> project_edges_to_plane(const std::vector<TopoDS_Edge>& edges,
+                                                    const aicad::geom::SketchPlane& plane,
+                                                    bool& any_approx) {
+    json entities = json::array();
+    int next_id = 1;
+    any_approx = false;
+    std::vector<ProjectedEntity> out;
+    for (const TopoDS_Edge& e : edges) {
+        const std::size_t before = entities.size();
+        emit_projected_edge(entities, e, plane, next_id, any_approx);
+        for (std::size_t k = before; k < entities.size(); ++k) {
+            json ent = entities[k];
+            ent.erase("id");  // caller re-assigns from the sketch's own id generator on insert
+            out.push_back(ProjectedEntity{std::move(ent)});
+        }
+    }
+    return out;
+}
+
+std::vector<TopoDS_Edge> face_boundary_edges(const TopoDS_Face& face) {
+    std::vector<TopoDS_Edge> edges;
+    for (TopExp_Explorer ex(face, TopAbs_EDGE); ex.More(); ex.Next())
+        edges.push_back(TopoDS::Edge(ex.Current()));
+    return edges;
 }
 
 }  // namespace aicad::doc

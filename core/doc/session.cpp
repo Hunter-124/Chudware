@@ -8941,4 +8941,110 @@ json doc_sketch_project_ref(const std::string& doc_id, const std::string& sketch
                   {{"reason", "bad kind"}});
 }
 
+// session.cpp::doc_sketch_project_entities (T-BL43 "Convert Entities" / external references) —
+// project one or more external references (datum plane, planar/any face, model edge) onto the
+// ACTIVE sketch's (u,v) plane and return ready-to-insert doc-schema §3.1 reference entities.
+//
+// Unlike doc_sketch_project_ref (read-only PREVIEW, lines/circles only, returns ONE entity),
+// this is the real Convert-Entities kernel: it uses GeomProjLib orthographic projection +
+// recon.cpp's full curve classifier, so a face projects ALL its boundary wires (not just a
+// plane-intersection line) and a tilted circle correctly becomes an ellipse. Every returned
+// entity carries construction:true (reference geometry). This RPC is READ-ONLY (compiles the
+// current bodies, no doc mutation); the caller inserts the returned entities into the sketch
+// via sketch_add_entity ops through doc_apply_ops, which owns the rebuild/undo/rev-bump and
+// makes the projected geometry constrainable by new sketch entities.
+//
+// `refs` is a LIST of ref objects, each {"datum":"front|top|right"} or
+// {"kind":"face"|"edge","selector":{...}} (same selector grammar as sketch_project_ref).
+// `body` optionally names which solid body to resolve face/edge selectors against (default:
+// the last body). Returns {ok, entities:[...(no id)...], approx, sources:[...], plane_frame}.
+// The associativity link back to the source is NOT stored — this is one-shot projection; the
+// associative-update follow-up is filed separately (see work/questions / T-BL43 progress log).
+json doc_sketch_project_entities(const std::string& doc_id, const std::string& sketch_fid,
+                                 const json& refs) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    json& feat = find_sketch_feature(s, sketch_fid);
+    aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
+    Eigen::Vector3d O1 = plane.origin, u = plane.uAxis, v = plane.vAxis, n1 = plane.normal;
+
+    if (!refs.is_array() || refs.empty())
+        throw OpError("invalid_op",
+                      "sketch_project_entities: 'refs' must be a non-empty list of ref objects",
+                      {{"reason", "bad refs"}});
+
+    CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+
+    json all_entities = json::array();
+    json sources = json::array();
+    bool any_approx = false;
+
+    auto append_entities = [&](const std::vector<aicad::doc::ProjectedEntity>& pes) {
+        for (const aicad::doc::ProjectedEntity& pe : pes) all_entities.push_back(pe.entity);
+    };
+
+    // A datum plane has no boundary to convert — keep the intersection-LINE semantics (identical
+    // to sketch_project_ref's datum branch) so "project the front plane into this sketch" gives
+    // the plane's trace as one reference line spanning the model.
+    auto project_datum = [&](const std::string& name_in) {
+        std::string name = name_in;
+        if (name.rfind("plane.", 0) != 0) name = "plane." + name;
+        gp_Pln pln = eval_resolve_plane(name);
+        Eigen::Vector3d O2(pln.Location().X(), pln.Location().Y(), pln.Location().Z());
+        gp_Dir nd = pln.Axis().Direction();
+        Eigen::Vector3d n2(nd.X(), nd.Y(), nd.Z());
+        auto [p_near, t] = plane_plane_line_uv(O1, u, v, n1, O2, n2);
+        double diag = 0.0;
+        for (const TopoDS_Shape& sh : r.shapes) diag = std::max(diag, sim_bbox_diag(sh));
+        double half = std::max(2.0 * diag, 100.0);
+        Eigen::Vector2d p1 = p_near - half * t, p2 = p_near + half * t;
+        all_entities.push_back(json{{"type", "line"}, {"construction", true},
+                                    {"p1", json::array({p1.x(), p1.y()})},
+                                    {"p2", json::array({p2.x(), p2.y()})}});
+        sources.push_back(json{{"kind", "datum"}, {"name", name}});
+    };
+
+    for (const json& ref : refs) {
+        if (!ref.is_object() || (!ref.contains("datum") && !ref.contains("kind")))
+            throw OpError("invalid_op",
+                          "sketch_project_entities: each ref needs 'datum' or 'kind'+'selector'",
+                          {{"reason", "bad ref"}});
+        if (ref.contains("datum")) { project_datum(ref["datum"].get<std::string>()); continue; }
+
+        if (r.shapes.empty())
+            throw OpError("invalid_op", "sketch_project_entities: no solid bodies",
+                          {{"reason", "no solid bodies"}});
+        const TopoDS_Shape& body = r.shapes.back();  // multi-body best-match deferred (as ref)
+        double diag = sim_bbox_diag(body);
+        json sel = ref.contains("selector") ? ref["selector"] : json(nullptr);
+        std::string kind = ref.value("kind", std::string());
+
+        if (kind == "face") {
+            TopoDS_Shape sub = eval_resolve_ref(sel, body, diag);
+            TopoDS_Face face = TopoDS::Face(sub);
+            // Convert Entities on a whole face = project ALL its boundary wires (outer + holes).
+            std::vector<TopoDS_Edge> edges = aicad::doc::face_boundary_edges(face);
+            bool approx = false;
+            append_entities(aicad::doc::project_edges_to_plane(edges, plane, approx));
+            any_approx = any_approx || approx;
+            sources.push_back(json{{"kind", "face"}, {"selector", sel},
+                                   {"edges", static_cast<int>(edges.size())}});
+        } else if (kind == "edge") {
+            TopoDS_Shape sub = eval_resolve_ref(sel, body, diag);
+            TopoDS_Edge edge = TopoDS::Edge(sub);
+            bool approx = false;
+            append_entities(aicad::doc::project_edges_to_plane({edge}, plane, approx));
+            any_approx = any_approx || approx;
+            sources.push_back(json{{"kind", "edge"}, {"selector", sel}});
+        } else {
+            throw OpError("invalid_op",
+                          "sketch_project_entities: ref kind '" + kind + "' must be face|edge",
+                          {{"reason", "bad kind"}});
+        }
+    }
+
+    return json{{"ok", true}, {"entities", all_entities}, {"approx", any_approx},
+                {"sources", sources}, {"plane_frame", plane_frame(plane)}};
+}
+
 }  // namespace aicad::doc

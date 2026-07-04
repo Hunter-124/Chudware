@@ -2,8 +2,8 @@
 id: T-BL50
 title: Layout-first planning helper — critical-dimension & interface capture up front, with a coverage gate so the AI can't miss critical dims
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-rush
+status: doing
 priority: 2
 lane: ai-copilot
 kind: new

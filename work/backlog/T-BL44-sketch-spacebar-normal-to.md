@@ -3,7 +3,7 @@ id: T-BL44
 title: Sketch — spacebar orients the view normal to the active sketch plane
 workstream: backlog
 owner: opus-hunter
-status: doing
+status: blocked
 priority: 2
 lane: app-gui
 kind: fix

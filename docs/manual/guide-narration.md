@@ -22,7 +22,9 @@ NARRATION TOOLS — compact text summaries of every domain state:
     boxes and origins (from asm_world_bodies), interference/clearance pairs
     (volumes + gap distances from eval_interference), and mate solve status.
     Use INSTEAD of dumping asm_world_bodies JSON.
-    Call solve_mates first for the latest placement.
+    Call solve_mates first for the latest placement. To validate that mating
+    interfaces LINE UP (hole patterns, coaxial bores, flush contact faces,
+    fastener pass-through) — not just that nothing clashes — run interface_check.
 
   describe_board([doc_id])
     Narrates an active schematic or PCB: component roster (ref/value/footprint),

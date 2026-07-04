@@ -278,6 +278,26 @@ plane.right = YZ (normal +X). A sketch `offset`:<mm> shifts the sketch plane ALO
 (positive = +Z on top, +Y on front, +X on right); a negative offset goes the other way. When
 sketching ON a face, `offset` lifts along that face's outward normal.
 
+----------------------------------------------------------------- SKETCH OPS (append to an existing sketch feature)
+
+sketch_add_entity   {"op":"sketch_add_entity","sketch":"$0","entity":{...}}
+                    Add a line/circle/arc/spline/polygon/airfoil/point entity to a sketch.
+
+sketch_convert      {"op":"sketch_convert","sketch":"<sketch-fid>","refs":[Ref,...],"construction":false,"fix":true}
+                    Project external geometry INTO an existing sketch (SolidWorks "Convert Entities").
+                    Each Ref is {"datum":"front"|"top"|"right"} for a datum plane (intersection line)
+                    OR {"kind":"face"|"edge","selector":{"sid":"<sid>"}} for solid geometry.
+                    A face ref projects ALL its boundary wires (outer + hole loops); oblique circular
+                    edges become ellipses; near-perpendicular edges collapse to a point.
+                    construction:false (default) = real, extrudable geometry; true = blue reference lines.
+                    fix:true (default) = each entity is pinned with a whole-entity fix relation.
+                    ONE-SHOT: projected entities do NOT update when the source model changes.
+                    id_map: first new entity → "$<op-index>"; rest → "$<op-index>#1", "$<op-index>#2", …
+                    e.g. project the front datum plane and one face's wires into sketch s2:
+                    {"op":"sketch_convert","sketch":"s2",
+                     "refs":[{"datum":"front"},{"kind":"face","selector":{"sid":"Fdb31d2"}}]}
+                    Use project_into_sketch() MCP tool for the ergonomic string-ref interface.
+
 ----------------------------------------------------------------- EDIT an existing feature
   edit_feature   {"op":"edit_feature","id":"f1","params":{"length":{"value":80,"expr":null}}}
   set_suppressed {"op":"set_suppressed","id":"f3","value":true}

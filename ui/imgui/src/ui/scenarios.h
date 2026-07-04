@@ -142,11 +142,11 @@ private:
     bool sdDirReady = false;
     std::string sketchDispatchCapture;
     float sdPreSpaceYaw = 0.f, sdPreSpacePitch = 0.f;  // T-BL44: camera state before Space
-    // T-BL46: drag discriminator test state
-    ImVec2 sdElemPt  = {0.f, 0.f};  // screen pos of projected edge midpoint (element hit)
-    ImVec2 sdEmptyPt = {0.f, 0.f};  // screen pos of empty-space anchor (no entity hit)
-    float  sdDragPreYaw  = 0.f, sdDragPrePitch  = 0.f;  // camera before element drag
-    float  sdEmptyPreYaw = 0.f, sdEmptyPrePitch = 0.f;  // camera before empty-space drag
+    // T-BL46: drag discriminator test state (plain floats — no ImVec2 dependency in header)
+    float sdElemPtX  = 0.f, sdElemPtY  = 0.f;   // screen pos of projected edge midpoint (element hit)
+    float sdEmptyPtX = 0.f, sdEmptyPtY = 0.f;   // screen pos of empty-space anchor (no entity hit)
+    float sdDragPreYaw  = 0.f, sdDragPrePitch  = 0.f;  // camera before element drag
+    float sdEmptyPreYaw = 0.f, sdEmptyPrePitch = 0.f;  // camera before empty-space drag
 
     // asm
     int asmStep = 0, asmSettle = 0;

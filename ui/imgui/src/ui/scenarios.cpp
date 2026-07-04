@@ -1425,11 +1425,182 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 sdSettle = kSettle;
                 break;
             }
-            case 14: {  // exit cleanly
+            case 14: {  // exit cleanly after Space test; T-BL46 drag tests begin at case 15
                 st.dispatch("sketch_exit");
                 std::printf("sketch_dispatch[T-BL44]: exiting sketch after Space test\n");
                 std::fflush(stdout);
                 sdSettle = kSettle;
+                break;
+            }
+            // ---- T-BL46: drag dead-zone / element-drag capture priority ----
+            // Root-cause fix: s_sketch.elementDragActive() gates camera nav at the
+            // ImGui left-button drag threshold, so an element drag captures before the
+            // camera can compete.  The four tests below inject real ImGui mouse events
+            // (AddMousePosEvent + AddMouseButtonEvent) so the sketch overlay's own
+            // hit-test arms dragArmed_/groupDragArmed_ on mouse-down; we do NOT force
+            // those flags directly.  The two verify metrics:
+            //   element drag → camera Δyaw + Δpitch ≈ 0  (capture-priority working)
+            //   empty-space drag → camera Δyaw or Δpitch > 0 (view nav still alive)
+            case 15: {  // re-enter the sketch so overlay hit-test is live
+                st.pendingSketchEditFid = sdFid;
+                std::printf("sketch_dispatch[T-BL46]: re-entering sketch for drag tests; "
+                            "awaiting drain\n");
+                std::fflush(stdout);
+                sdSettle = kSettle;
+                break;
+            }
+            case 16: {  // compute element screen coords; position mouse there; record camera
+                // The rect bottom edge (L0) runs world (0,0,0)→(80,0,0). Mid = (40,0,0).
+                // worldToScreen projects it onto the current camera's NDC → screen pixel.
+                auto* gvp = ui::viewportGl();
+                ImVec2 bMin = ui::viewportImageMin();
+                ImVec2 bMax = ui::viewportImageMax();
+                if (gvp && bMax.x > bMin.x && bMax.y > bMin.y) {
+                    const auto& cam = gvp->renderer().camera();
+                    int vw = (int)(bMax.x - bMin.x);
+                    int vh = (int)(bMax.y - bMin.y);
+                    ViewportScreen vs{bMin.x, bMin.y};
+                    ScreenPt sp;
+                    if (worldToScreen(cam, vs, vw, vh, 40.f, 0.f, 0.f, sp)) {
+                        sdElemPtX = sp.x; sdElemPtY = sp.y;
+                    } else {
+                        // fallback: centre of image rect — will still be inside sketch overlay
+                        sdElemPtX = (bMin.x + bMax.x) * 0.5f;
+                        sdElemPtY = (bMin.y + bMax.y) * 0.5f;
+                    }
+                    // Empty-space anchor: guaranteed inside the image rect but away from the
+                    // element.  Use a fixed fractional offset from bMin so it survives any
+                    // camera orientation — the overlay hit-test will find nothing there.
+                    // (World-space projection of far points can land off-screen at steep pitch.)
+                    sdEmptyPtX = bMin.x + (bMax.x - bMin.x) * 0.85f;
+                    sdEmptyPtY = bMin.y + (bMax.y - bMin.y) * 0.85f;
+                } else {
+                    // viewport not wired (rare in headless): use safe screen fallbacks
+                    sdElemPtX = 400.f; sdElemPtY = 300.f;
+                    sdEmptyPtX = 80.f; sdEmptyPtY = 80.f;
+                }
+                // Record camera before element drag
+                sdDragPreYaw   = ui::viewportState().yaw;
+                sdDragPrePitch = ui::viewportState().pitch;
+                // Position mouse over the element (hover populates hit-test next frame)
+                ImGui::GetIO().AddMousePosEvent(sdElemPtX, sdElemPtY);
+                std::printf("sketch_dispatch[T-BL46]: element screen pos=(%.0f,%.0f) "
+                            "empty pos=(%.0f,%.0f) camera yaw=%.1f pitch=%.1f\n",
+                            sdElemPtX, sdElemPtY, sdEmptyPtX, sdEmptyPtY,
+                            sdDragPreYaw, sdDragPrePitch);
+                std::fflush(stdout);
+                sdSettle = 2;  // let hover register before click
+                break;
+            }
+            case 17: {  // LMB down at element pos — overlay arms dragArmed_/groupDragArmed_
+                ImGui::GetIO().AddMousePosEvent(sdElemPtX, sdElemPtY);
+                ImGui::GetIO().AddMouseButtonEvent(0, true);   // LMB press
+                std::printf("sketch_dispatch[T-BL46]: LMB down at element (%.0f,%.0f); "
+                            "elementDragActive=%d\n",
+                            sdElemPtX, sdElemPtY,
+                            (int)ui::sketchMode().elementDragActive());
+                std::fflush(stdout);
+                sdSettle = 1;  // one frame for arm to register
+                break;
+            }
+            case 18: {  // slow drag: move +20px right, LMB still held
+                // A 20px move exceeds the overlay's 4px arm threshold → dragging_ becomes true.
+                // The camera gate (sketchCapture=true) must keep Δyaw≈0, Δpitch≈0.
+                float dragX = sdElemPtX + 20.f;
+                float dragY = sdElemPtY;
+                ImGui::GetIO().AddMousePosEvent(dragX, dragY);
+                // Note: AddMouseButtonEvent not called — button stays held from case 17.
+                float yaw   = ui::viewportState().yaw;
+                float pitch = ui::viewportState().pitch;
+                float dYaw   = std::fabs(yaw   - sdDragPreYaw);
+                float dPitch = std::fabs(pitch - sdDragPrePitch);
+                bool elemActive = ui::sketchMode().elementDragActive();
+                std::printf("sketch_dispatch[T-BL46]: slow-drag +20px: "
+                            "elementDragActive=%d camera Δyaw=%.2f Δpitch=%.2f → %s\n",
+                            (int)elemActive, dYaw, dPitch,
+                            (dYaw < 0.5f && dPitch < 0.5f) ? "PASS(cam_still)"
+                                                            : "WARN(cam_moved)");
+                std::fflush(stdout);
+                sdSettle = 1;
+                break;
+            }
+            case 19: {  // fast drag: additional +40px (large jump), verify cam still blocked
+                float fastX = sdElemPtX + 60.f;
+                float fastY = sdElemPtY + 30.f;
+                ImGui::GetIO().AddMousePosEvent(fastX, fastY);
+                float yaw   = ui::viewportState().yaw;
+                float pitch = ui::viewportState().pitch;
+                float dYaw   = std::fabs(yaw   - sdDragPreYaw);
+                float dPitch = std::fabs(pitch - sdDragPrePitch);
+                bool elemActive = ui::sketchMode().elementDragActive();
+                std::printf("sketch_dispatch[T-BL46]: fast-drag +60px/+30px: "
+                            "elementDragActive=%d camera Δyaw=%.2f Δpitch=%.2f → %s\n",
+                            (int)elemActive, dYaw, dPitch,
+                            (dYaw < 0.5f && dPitch < 0.5f) ? "PASS(cam_still)"
+                                                            : "WARN(cam_moved)");
+                std::fflush(stdout);
+                // Release LMB and capture screenshot as evidence
+                ImGui::GetIO().AddMouseButtonEvent(0, false);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_08_elem_drag.png";
+                sdSettle = kSettle;
+                break;
+            }
+            case 20: {  // empty-space drag: position mouse, record pre-drag camera state
+                // Record camera state BEFORE any drag. We settle 2 frames so the overlay
+                // hover-test sees no entity at sdEmptyPt (elementDragActive stays false).
+                sdEmptyPreYaw   = ui::viewportState().yaw;
+                sdEmptyPrePitch = ui::viewportState().pitch;
+                ImGui::GetIO().AddMousePosEvent(sdEmptyPtX, sdEmptyPtY);
+                std::printf("sketch_dispatch[T-BL46]: empty-space drag start; "
+                            "camera yaw=%.1f pitch=%.1f inSketch=%d elementDragActive=%d\n",
+                            sdEmptyPreYaw, sdEmptyPrePitch, (int)st.inSketch,
+                            (int)ui::sketchMode().elementDragActive());
+                std::fflush(stdout);
+                sdSettle = 2;  // hover settle — overlay hit-test must NOT arm element drag
+                break;
+            }
+            case 21: {  // LMB down at empty-space pos — no element arm expected
+                ImGui::GetIO().AddMousePosEvent(sdEmptyPtX, sdEmptyPtY);
+                ImGui::GetIO().AddMouseButtonEvent(0, true);
+                std::printf("sketch_dispatch[T-BL46]: LMB down at empty pos (%.0f,%.0f); "
+                            "elementDragActive=%d (must be 0)\n",
+                            sdEmptyPtX, sdEmptyPtY,
+                            (int)ui::sketchMode().elementDragActive());
+                std::fflush(stdout);
+                sdSettle = 1;  // let button-down frame register
+                break;
+            }
+            case 22: {  // inject move — MouseDelta becomes non-zero this frame → orbit fires
+                // The orbit call: g_glVp->orbit(-io.MouseDelta.x*0.01, io.MouseDelta.y*0.01)
+                // runs in drawViewport AFTER this tick. We read the result on the NEXT step.
+                float emX = sdEmptyPtX + 80.f;   // large delta to clear 8px threshold easily
+                float emY = sdEmptyPtY + 60.f;
+                ImGui::GetIO().AddMousePosEvent(emX, emY);
+                std::printf("sketch_dispatch[T-BL46]: injecting empty-space move to (%.0f,%.0f); "
+                            "orbit will fire in drawViewport this frame\n", emX, emY);
+                std::fflush(stdout);
+                sdSettle = 1;  // let drawViewport orbit call update g_vpState this frame
+                break;
+            }
+            case 23: {  // read camera AFTER the orbit frame — Δ>0 proves view nav unblocked
+                float yaw   = ui::viewportState().yaw;
+                float pitch = ui::viewportState().pitch;
+                float dYaw   = std::fabs(yaw   - sdEmptyPreYaw);
+                float dPitch = std::fabs(pitch - sdEmptyPrePitch);
+                bool elemActive = ui::sketchMode().elementDragActive();
+                bool viewMoved  = (dYaw > 0.1f || dPitch > 0.1f);
+                // sketchCapture=false when elementDragActive=0 → camera nav unblocked.
+                // A non-zero orbit delta proves the 8px gate + sketchCapture gate both clear.
+                std::printf("sketch_dispatch[T-BL46]: empty-space orbit result: "
+                            "elementDragActive=%d camera Δyaw=%.2f Δpitch=%.2f → %s\n",
+                            (int)elemActive, dYaw, dPitch,
+                            viewMoved ? "PASS(cam_moved)" : "WARN(cam_still—imgHovered?)");
+                std::fflush(stdout);
+                ImGui::GetIO().AddMouseButtonEvent(0, false);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_09_empty_drag.png";
+                sdSettle = kSettle;
+                // Exit sketch cleanly
+                st.dispatch("sketch_exit");
                 break;
             }
             default:
@@ -1438,7 +1609,7 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 std::fflush(stdout);
                 break;
         }
-        if (sdStep <= 14) ++sdStep;
+        if (sdStep <= 23) ++sdStep;
     }
 
     // ---------- fea (host-parity SimManager study flow) ----------
@@ -2022,7 +2193,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppSt
     }
     if (cfg.wantSketchDispatch) {
         if (!sketchDispatchCapture.empty()) {
-            mirrorLast(sketchDispatchCapture, "sketch_dispatch_07_space_normal_to");
+            mirrorLast(sketchDispatchCapture, "sketch_dispatch_09_empty_drag");
             sketchDispatchCapture.clear();
         }
         if (win) glfwSwapBuffers(win);

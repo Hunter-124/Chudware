@@ -2,8 +2,8 @@
 id: T-BL37
 title: Origin as a selectable, renderable reference point — FM selectable + viewport point render + engine ref-resolution
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-alba
+status: doing
 priority: 3
 lane: modeling-core
 kind: new

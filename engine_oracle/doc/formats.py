@@ -8,6 +8,8 @@ Formats supported
 * **BREP** — via ``build123d.export_brep`` / ``import_brep``.
 * **STL** — via ``build123d.export_stl`` / ``import_stl`` (mesh only; no parametrics).
 * **3MF** — via ``build123d.Mesher`` / ``lib3mf`` (mesh only).
+* **DXF** — via ``ezdxf`` (``engine.doc.formats_dxf``); 2D vector drawings → planar B-rep
+  wires/faces (import only). See that module for the entity coverage matrix.
 
 Public API
 ----------
@@ -61,6 +63,7 @@ _EXT_TO_FORMAT: dict[str, str] = {
     ".gltf": "gltf",
     ".glb": "glb",
     ".3dm": "3dm",
+    ".dxf": "dxf",
     ".sldprt": "sldprt",
     ".sldasm": "sldasm",
     ".x_t": "x_t",
@@ -99,6 +102,9 @@ FORMAT_REGISTRY: list[FormatInfo] = [
     FormatInfo("gltf", "glTF", [".gltf"], "mesh"),
     FormatInfo("glb", "glTF binary", [".glb"], "mesh"),
     FormatInfo("3dm", "Rhino", [".3dm"], "rhino"),
+    # DXF (2D vector drawings) — imported to planar B-rep wires/faces via ezdxf (MIT). Import-only
+    # for now; 2D-projection-from-3D DXF export is a separate follow-up, so can_export is False.
+    FormatInfo("dxf", "AutoCAD DXF", [".dxf"], "brep", can_export=False),
     # Proprietary — import is experimental (SolidWorks COM → STEP, else preview/error); we never
     # write these, so can_export is False (export STEP instead).
     FormatInfo("sldprt", "SolidWorks part", [".sldprt"], "proprietary", can_export=False),
@@ -238,6 +244,11 @@ def export_document(
     if fmt == "3dm":
         return _export_3dm(session_bodies, path)
 
+    if fmt == "dxf":
+        raise ValueError(
+            "writing DXF is not supported yet (import-only). Export STEP/IGES for B-rep or a mesh "
+            "format for tessellated geometry; 2D-projection-to-DXF is a planned follow-up.")
+
     if fmt in ("sldprt", "sldasm", "x_t", "x_b"):
         raise ValueError(
             f"writing {fmt.upper()} is not supported (proprietary closed format). Export STEP (.step) "
@@ -283,6 +294,9 @@ def import_path(
         return _load_mesh_trimesh(path, fmt)
     elif fmt == "3dm":
         return _import_3dm(path)
+    elif fmt == "dxf":
+        from engine.doc.formats_dxf import import_dxf
+        return import_dxf(path)
     elif fmt in ("sldprt", "sldasm"):
         from engine.doc.formats_solidworks import import_solidworks
         return import_solidworks(path)

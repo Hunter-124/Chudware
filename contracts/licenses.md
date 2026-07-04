@@ -32,6 +32,7 @@
 | trimesh | MIT | voxelize, ray casts, mesh import/export lane (STL/OBJ/PLY/glTF) | ok |
 | networkx | BSD-3 | trimesh scene-graph dep (multi-mesh OBJ/glTF import) | ok |
 | rhino3dm | MIT | Rhino .3dm import/export (mesh-level) | ok |
+| ezdxf | MIT | DXF (2D vector) import → planar B-rep wires/faces (engine.doc.formats_dxf) | ok (in-process; MIT permissive) |
 | olefile | BSD-2 | OLE2 probe for legacy SolidWorks .sldprt preview (experimental) | ok |
 | pywin32 | PSF-2.0 | optional SolidWorks COM automation (Windows-only, feature-detected) | ok |
 | numpy / scipy | BSD-3 | math, solvers | ok |

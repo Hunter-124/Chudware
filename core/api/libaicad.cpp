@@ -42,6 +42,7 @@
 // For the dispatch-boundary structured-exception (SEH) guard that converts a hardware
 // fault (access violation) into a clean JSON error + orphaned-lock recovery, instead of
 // leaving the session mutex held => "resource deadlock would occur" on the next call.
+#define NOMINMAX          // <windows.h>'s min/max macros clobber std::min/std::max (used below); no-op on Linux
 #include <windows.h>
 #include <excpt.h>
 #endif

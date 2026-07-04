@@ -2,6 +2,7 @@
 // database. Values are clean-room, drawn from public machining-handbook ranges
 // (Machinery's Handbook / tool-maker speed-&-feed charts are dimensional facts,
 // not copyrightable); they are conservative defaults a user is expected to tune.
+#define _USE_MATH_DEFINES  // MSVC needs this before <cmath> for M_PI (mirrors geom/plane.cpp)
 #include "cam/feeds.h"
 
 #include <algorithm>

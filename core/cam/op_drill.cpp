@@ -1,6 +1,7 @@
 // core/cam/op_drill.cpp — hole-making: drilling canned cycles (long-hand moves
 // for sim/backplot; the post collapses them into G81/G83/G73/G84/G85/G86 from the
 // operation metadata) and helical thread milling.
+#define _USE_MATH_DEFINES  // MSVC needs this before <cmath> for M_PI (mirrors geom/plane.cpp)
 #include <algorithm>
 #include <cmath>
 

@@ -1,4 +1,5 @@
 // core/cam/toolpath.cpp — toolpath assembly helpers shared by the generators.
+#define _USE_MATH_DEFINES  // MSVC needs this before <cmath> for M_PI (mirrors geom/plane.cpp)
 #include "cam/toolpath.h"
 
 #include "cam/geometry.h"

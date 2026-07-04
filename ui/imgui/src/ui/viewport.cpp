@@ -728,9 +728,13 @@ void drawViewport(AppState& s) {
         host.idPass = &g_glVp->idPass();
         static SketchMode s_sketch;
 
-        // T-BL47: drain pending sketch ribbon commands from AppState.
-        // dispatch() pushes them; we execute them here where SketchHost + s_sketch exist.
-        if (!s.pendingSketchCmds.empty()) {
+        // T-BL47/48: drain pending sketch commands from AppState. dispatch() pushes ribbon
+        // command ids; the Feature Manager pushes an edit/reparent target fid. Both are executed
+        // here — the only place SketchHost + the single s_sketch instance exist.
+        bool drainedSketch = !s.pendingSketchCmds.empty()
+                          || !s.pendingSketchEditFid.empty()
+                          || !s.pendingSketchReparentFid.empty();
+        if (drainedSketch) {
             // Propagate the current app selection so enterNewOnSelection can pick up a
             // pre-selected plane (e.g. "plane.front") and enter directly without plane-pick.
             host.selectedFeatureId = s.selectedFeature;
@@ -738,6 +742,18 @@ void drawViewport(AppState& s) {
                 s_sketch.onRibbonCommand(host, cmd);
             }
             s.pendingSketchCmds.clear();
+            // T-BL48: edit an existing sketch from the Feature Manager (double-click / ctx-menu).
+            // enterForFeature opens the sketcher directly on the target fid (active_ = true).
+            if (!s.pendingSketchEditFid.empty()) {
+                s_sketch.enterForFeature(host, s.pendingSketchEditFid);
+                s.pendingSketchEditFid.clear();
+            }
+            // T-BL48: "Edit Sketch Plane/Face" — arm plane-pick to reparent an existing sketch
+            // (active_ stays false, planePicking_ becomes true until the user picks a plane).
+            if (!s.pendingSketchReparentFid.empty()) {
+                s_sketch.beginPlaneEdit(host, s.pendingSketchReparentFid);
+                s.pendingSketchReparentFid.clear();
+            }
             // T-BL47 write-back: enterForFeature sets host.yaw/pitch/zoom/pan on the copy;
             // push them back to g_vpState so syncCameraToGl picks them up this frame.
             g_vpState.yaw    = host.yaw;

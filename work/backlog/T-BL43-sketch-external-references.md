@@ -74,7 +74,8 @@ tool work properly. Together these let a sketch reference the rest of the model.
   projection math (append-only; ratification question in work/questions/T-BL43.md Q1).
 - 2026-07-04 opus-brae: ASSOCIATIVITY HONESTY: delivered ONE-SHOT projection only. No stored
   source link; converted geometry does not follow source-model edits. Follow-up filed:
-  work/backlog/T-BL49-associative-convert-entities.md.
+  work/backlog/T-BL51-associative-convert-entities.md (T-BL49/50 were already taken today —
+  interface-fitment-checker / layout-first-critical-dims — so this follow-up is T-BL51).
 - 2026-07-04 opus-brae: headless real-flow verify green vs worktree .so (core_bridge): box →
   sketch on top face → project bottom-face loop (4 lines, construction) → insert → coincident-
   constrain new line to projected edge; boss on 45° datum → oblique circle → ELLIPSE via MCP

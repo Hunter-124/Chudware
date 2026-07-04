@@ -68,6 +68,17 @@ Back-edges (retry loops) **must** carry `retry_budget`:
 9. **`verify`:** always `null` for now (T-A4 owns the verifier battery).
 10. **Gate nodes** must have `autonomy: "approve"` or `autonomy: "manual"` — never
     `"auto"`.
+11. **Layout-first (T-BL50 — MANDATORY for any design node):** The FIRST node of any
+    graph that contains a `design`, `structural`, or `simulate` node MUST call
+    `layout_plan(doc_id, envelope_x_mm, envelope_y_mm, envelope_z_mm, critical_dims,
+    interfaces)` to capture the overall envelope, every interface between components,
+    and every critical dimension (value + tolerance + why-critical) BEFORE any modeling
+    starts. Design nodes downstream must reference the layout plan doc_id and implement
+    the planned dimensions. The LAST `verify` node before any `report` or `gate`
+    (done) node MUST include `layout_coverage` in its checks
+    (`design_review(doc_id, checks=["layout_coverage", ...])`) to confirm all critical
+    dims and interfaces have been verified. A plan that skips layout_plan or skips the
+    layout_coverage gate is INVALID.
 
 ## Node type guidance
 

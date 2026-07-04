@@ -82,6 +82,8 @@ CHECKS: dict[str, tuple[str, str, str, str, str]] = {
     "dim_coverage":              ("gap",  "dim_coverage",              "subsecond", "any",   "scalar"),
     "req_join":                  ("gap",  "req_join",                  "subsecond", "any",   "scalar"),
     "eval_check":                ("gap",  "eval_check_direct",         "subsecond", "any",   "binary"),
+    # T-BL50: layout-first critical-dim & interface coverage gate
+    "layout_coverage":           ("gap",  "layout_coverage",           "subsecond", "any",   "scalar"),
 }
 
 # ---------------------------------------------------------------------------
@@ -356,6 +358,151 @@ def _gap_req_join(doc_id: str = None, requirements: list = None, **_) -> str:
     })
 
 
+def _layout_coverage_cb():
+    """Return core_bridge for layout_coverage (lazy import, patchable in tests)."""
+    try:
+        from mcp_server import core_bridge as _cb
+        return _cb
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _gap_layout_coverage(doc_id: str = None, **_) -> str:
+    """Layout-plan critical-dim & interface coverage gate (T-BL50).
+
+    Reads the ``layout_plan`` doc-meta envelope (schema aicad.layout/1) to find which
+    requirement IDs are flagged as critical_dim or interface, then checks each one in
+    the associated aicad.req/1 doc for verification evidence.
+
+    A requirement is considered COVERED when:
+      - status == "verified"  AND  trace.evidence is non-empty, OR
+      - status == "user_confirmed"  (user explicitly signed off — counts as evidence), OR
+      - status == "waived"  (user exempted it)
+
+    A requirement is UNCOVERED when status is "proposed" or "failed", or when
+    status == "verified" but trace.evidence == [] (inconsistent — same rule as req_join).
+
+    Score = covered / total_critical.  ok = score >= 1.0 (all covered).
+    If no layout_plan meta exists: ok=True, score=1.0, note="no layout plan on file".
+    """
+    d = doc_id or _cur_doc()
+    try:
+        cb = _layout_coverage_cb()
+        if cb is None:
+            return json.dumps({"ok": False, "error": "core_bridge unavailable"})
+
+        # Load layout_plan envelope
+        try:
+            raw_plan = cb.call("doc_get_meta", {"doc_id": d, "key": "layout_plan"}).get("value")
+        except Exception:
+            raw_plan = None
+
+        if not isinstance(raw_plan, dict) or raw_plan.get("schema") != "aicad.layout/1":
+            return json.dumps({
+                "ok": True,
+                "score": 1.0,
+                "note": "no layout plan on file — layout_plan() not called before modeling",
+                "covered": 0,
+                "total": 0,
+                "uncovered": [],
+            })
+
+        critical_ids = list(raw_plan.get("critical_req_ids") or [])
+        interface_ids = list(raw_plan.get("interface_req_ids") or [])
+        all_layout_ids = critical_ids + interface_ids
+
+        if not all_layout_ids:
+            return json.dumps({
+                "ok": True,
+                "score": 1.0,
+                "note": "layout plan exists but no critical dims or interfaces recorded",
+                "covered": 0,
+                "total": 0,
+                "uncovered": [],
+            })
+
+        # Load the aicad.req/1 doc
+        try:
+            raw_req = cb.call("doc_get_meta", {"doc_id": d, "key": "requirements"}).get("value")
+        except Exception:
+            raw_req = None
+
+        if not isinstance(raw_req, dict):
+            # No req doc — all uncovered
+            return json.dumps({
+                "ok": False,
+                "score": 0.0,
+                "note": "layout plan references requirements but no req doc found on this doc",
+                "covered": 0,
+                "total": len(all_layout_ids),
+                "uncovered": all_layout_ids,
+            })
+
+        req_by_id: dict[str, dict] = {
+            r["id"]: r for r in raw_req.get("requirements", []) if isinstance(r, dict)
+        }
+
+        covered = 0
+        uncovered: list[dict] = []
+
+        for rid in all_layout_ids:
+            req = req_by_id.get(rid)
+            if req is None:
+                uncovered.append({"id": rid, "reason": "requirement not found in req doc"})
+                continue
+
+            status = req.get("status", "proposed")
+            evidence = (req.get("trace") or {}).get("evidence") or []
+            kind = req.get("kind", "?")
+
+            if status == _WAIVED_STATUS:
+                covered += 1  # user explicitly waived
+            elif status == "user_confirmed":
+                covered += 1  # user signed off explicitly
+            elif status == _VERIFIED_STATUS and evidence:
+                covered += 1  # verified with evidence
+            elif status == _VERIFIED_STATUS and not evidence:
+                # Inconsistent: claims verified but no evidence (same rule as req_join)
+                uncovered.append({
+                    "id": rid,
+                    "kind": kind,
+                    "status": status,
+                    "reason": "status=verified but trace.evidence is empty (inconsistent)",
+                })
+            else:
+                qty = req.get("quantity") or {}
+                param = qty.get("param", "?") if qty else "?"
+                uncovered.append({
+                    "id": rid,
+                    "kind": kind,
+                    "status": status,
+                    "param": param,
+                    "reason": f"not yet verified (status={status!r})",
+                })
+
+        total = len(all_layout_ids)
+        score = covered / total if total else 1.0
+        ok = len(uncovered) == 0
+
+        return json.dumps({
+            "ok": ok,
+            "score": round(score, 4),
+            "covered": covered,
+            "total": total,
+            "uncovered": uncovered,
+            "critical_count": len(critical_ids),
+            "interface_count": len(interface_ids),
+            "note": (
+                "all layout-critical dims and interfaces verified"
+                if ok else
+                f"{len(uncovered)} layout-critical item(s) lack verification evidence"
+            ),
+        })
+
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": str(e)})
+
+
 GAP_FNS: dict[str, Any] = {
     "is_manifold":       _gap_is_manifold,
     "round_trip":        _gap_round_trip,
@@ -364,6 +511,7 @@ GAP_FNS: dict[str, Any] = {
     "dim_coverage":      _gap_dim_coverage,
     "req_join":          _gap_req_join,
     "eval_check_direct": _gap_eval_check_direct,
+    "layout_coverage":   _gap_layout_coverage,  # T-BL50
 }
 
 

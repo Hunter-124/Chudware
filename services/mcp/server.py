@@ -136,6 +136,11 @@ register_doc_diff_tools(mcp)
 from mcp_server.req_tools import register_req_tools
 register_req_tools(mcp)
 
+# Layout-first planning helper (T-BL50) — capture envelope + critical dims + interfaces
+# BEFORE modeling; coverage gate (layout_coverage) surfaces in design_review.
+from mcp_server.layout_plan_tools import register_layout_plan_tools
+register_layout_plan_tools(mcp)
+
 # Verify battery (T-H4) — deterministic check dispatcher for RL reward + CI gate.
 from mcp_server.verify_tools import register_verify_tools
 register_verify_tools(mcp)

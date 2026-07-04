@@ -25,6 +25,23 @@
         "AICAD_BUILD_APP": "ON",
         "AICAD_BUILD_UI_ABSTRACT": "ON"
       }
+    },
+    {
+      "name": "windows-core",
+      "displayName": "Windows core (libaicad, Ninja + MSVC, OCCT off)",
+      "description": "Configure the C++ core with MSVC. Run from an 'x64 Native Tools Command Prompt for VS 2022' (or after vcvars64.bat) so cl/link are on PATH. OCCT off = the self-contained fast build; verified on Win11 + MSVC 14.44. See docs/BUILD_WINDOWS.md.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-core",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "AICAD_BUILD_CORE": "ON",
+        "AICAD_WITH_OCCT": "OFF"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     }
   ],
   "buildPresets": [
@@ -36,6 +53,11 @@
     {
       "name": "linux-app",
       "configurePreset": "linux-app",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-core",
+      "configurePreset": "windows-core",
       "configuration": "Release"
     }
   ]

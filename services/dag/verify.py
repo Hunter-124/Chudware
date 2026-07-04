@@ -98,6 +98,20 @@ def _check_budget_default(r: dict) -> bool:
     """
     return bool(r.get("ok", False))
 
+def _check_vibration_default(r: dict) -> bool:
+    """Pass when ok=True AND the tool's own spec verdict passed (T-BL17).
+
+    run_fea_frequency_response returns verdict=None when the node supplied no
+    vibration_spec — that is NOT a pass (fail-closed: the caller must state the
+    requirement, either via vibration_spec inputs or an explicit end_condition).
+    """
+    if not r.get("ok", False):
+        return False
+    verdict = r.get("verdict")
+    if not isinstance(verdict, dict):
+        return False
+    return bool(verdict.get("passed", False))
+
 
 # DISPATCH_TABLE is the T-F12-reusable public symbol.
 DISPATCH_TABLE: dict[str, tuple[str, str, Callable[[dict], bool]]] = {
@@ -107,6 +121,7 @@ DISPATCH_TABLE: dict[str, tuple[str, str, Callable[[dict], bool]]] = {
     "firmware":     ("firmware",   "fw_sim_run",           _check_firmware_default),
     "dc_ratio":     ("structural", "struct_check",         _check_dc_ratio_default),
     "budget":       ("sourcing",   "bom_price",            _check_budget_default),
+    "vibration":    ("cad",        "run_fea_frequency_response", _check_vibration_default),
 }
 
 

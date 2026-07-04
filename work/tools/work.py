@@ -20,6 +20,17 @@ import sys
 import time
 from pathlib import Path
 
+# Windows consoles default to a legacy code page (e.g. cp1252) that cannot encode
+# characters like U+2192 (→) that appear in task titles, which crashed `board`
+# with UnicodeEncodeError. Force UTF-8 output so the CLI is robust on any console;
+# this is a no-op where stdout is already UTF-8. stdout may be a plain pipe with no
+# reconfigure(), so guard it.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 try:                       # identity/profile helpers live beside this script
     import _teamlib
 except Exception:          # never let a helper import break the core CLI

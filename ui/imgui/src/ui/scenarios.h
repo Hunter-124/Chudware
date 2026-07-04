@@ -66,6 +66,8 @@ struct ShotConfig {
     bool m1ShotDone = false;
     bool wantSketch = false;
     bool sketchShotDone = false;
+    bool wantSketchDispatch = false;   // T-BL47: prove dispatch→pendingSketchCmds→active_ path
+    bool sketchDispatchShotDone = false;
     bool wantAsm = false;
     bool asmShotDone = false;
     bool wantFea = false;

@@ -731,6 +731,9 @@ void drawViewport(AppState& s) {
         // T-BL47: drain pending sketch ribbon commands from AppState.
         // dispatch() pushes them; we execute them here where SketchHost + s_sketch exist.
         if (!s.pendingSketchCmds.empty()) {
+            // Propagate the current app selection so enterNewOnSelection can pick up a
+            // pre-selected plane (e.g. "plane.front") and enter directly without plane-pick.
+            host.selectedFeatureId = s.selectedFeature;
             for (const auto& cmd : s.pendingSketchCmds) {
                 s_sketch.onRibbonCommand(host, cmd);
             }

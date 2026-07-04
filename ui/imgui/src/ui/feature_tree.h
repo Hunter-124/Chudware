@@ -4,6 +4,7 @@
 
 #include <functional>
 #include <string>
+#include <unordered_set>
 
 namespace app { struct AppState; }
 
@@ -26,6 +27,11 @@ bool        featureTreeOpenPath(app::AppState& st, const std::string& path, bool
 std::string featureTreeOpenDialog(app::AppState& st);
 std::string featureTreeSaveDoc(app::AppState& st, bool saveAs);
 std::string featureTreeActivePath();
+
+// T-BL37: read-only views of the FM's datum-visibility/selection state (hidden set +
+// primary selected id) for the viewport's reference-datum push.
+const std::unordered_set<std::string>& featureTreeHiddenFeatures();
+const std::string& featureTreeSelectedFeatureId();
 
 void pollAiCadHandoff(app::AppState& st);
 

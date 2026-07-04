@@ -13,6 +13,7 @@ enum class FieldKind {
 // Topology kinds a selector well accepts (mirrors feature_params sel(kinds…)).
 struct SelectorKinds {
     bool face = false, edge = false, vertex = false, body = false, plane = false, axis = false;
+    bool point = false;  // T-BL37: world-origin point ("point.origin") or point-datum feature
 };
 
 struct PanelField {

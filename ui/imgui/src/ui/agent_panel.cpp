@@ -379,7 +379,7 @@ static void initInlineField(InlineFieldState& fs,
         break;
     }
     case AskFieldKind::Choice: {
-        fs.choiceChecked.assign(f.options.size(), false);
+        fs.choiceChecked.assign(f.options.size(), 0);
         if (!sug.is_discarded()) {
             if (!f.multi) {
                 std::string sv = sug.is_string() ? sug.get<std::string>() : std::string();
@@ -389,7 +389,7 @@ static void initInlineField(InlineFieldState& fs,
                 // multi-select: suggested is an array or a single value
                 auto mark = [&](const std::string& v) {
                     for (size_t i = 0; i < f.options.size(); ++i)
-                        if (f.options[i] == v) fs.choiceChecked[i] = true;
+                        if (f.options[i] == v) fs.choiceChecked[i] = 1;
                 };
                 if (sug.is_array()) {
                     for (const auto& sv : sug) if (sv.is_string()) mark(sv.get<std::string>());
@@ -541,10 +541,12 @@ static bool drawQuestionCard(AppState& s, AgentBlock& b) {
                 } else {
                     // Multi-select: checkboxes.
                     if (fs.choiceChecked.size() != f.options.size())
-                        fs.choiceChecked.assign(f.options.size(), false);
+                        fs.choiceChecked.assign(f.options.size(), 0);
                     for (size_t oi = 0; oi < f.options.size(); ++oi) {
                         ImGui::PushID((int)oi);
-                        ImGui::Checkbox(f.options[oi].c_str(), &fs.choiceChecked[oi]);
+                        bool checked = fs.choiceChecked[oi] != 0;
+                        if (ImGui::Checkbox(f.options[oi].c_str(), &checked))
+                            fs.choiceChecked[oi] = checked ? 1 : 0;
                         ImGui::PopID();
                     }
                 }

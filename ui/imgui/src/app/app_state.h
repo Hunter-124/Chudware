@@ -32,7 +32,7 @@ struct InlineFieldState {
     double              dimValue   = 0.0;
     int                 dimUnitIdx = 0;
     int                 choiceIdx  = 0;          // single-select
-    std::vector<bool>   choiceChecked;           // multi-select (parallel to AskForm options)
+    std::vector<char>   choiceChecked;           // multi-select (parallel to AskForm options); char not bool to avoid vector<bool> proxy
     bool                approved   = false;
     std::string         textBuf;                 // text / file-request (heap, no fixed cap)
     bool                seeded     = false;      // true once initInlineField() has run

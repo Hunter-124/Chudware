@@ -372,6 +372,7 @@ int ShotConfig::captureFrameBudget() const {
     if (wantPartsBrowser) return partsBrowserShotDone ? 10 : 30;
     if (isScenarioMode()) return 999999;
     if (wantGlassperf) return glassperfShotDone ? 10 : 400;
+    if (wantQuestion) return 20;  // T-BL40: let layout stabilize (frame 1 has near-zero logW)
     return 6;
 }
 

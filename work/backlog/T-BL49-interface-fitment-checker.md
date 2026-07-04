@@ -3,7 +3,7 @@ id: T-BL49
 title: AI fitment & interface-alignment checker — interface_check tool for mating components (hole patterns, coaxiality, contact planes, fastener clearance)
 workstream: backlog
 owner: opus-gill
-status: doing
+status: review
 priority: 2
 lane: ai-copilot
 kind: new
@@ -115,3 +115,20 @@ fastener_passthrough}. Field names/`version` are frozen; additive-only changes b
   with pos_delta≈1.5mm in +X; corrected (dx=0) PASSES; M8 fastener fails / M5 passes; plus a
   doc_query body_id per-body + out-of-range unit test. Built + tested against a worktree-local
   core build (system OCCT); main checkout left clean.
+- 2026-07-04 opus-gill (resume after crash): finished the interrupted checkpoint — an
+  incomplete `_holes_from_faces` → `_cylinders_from_faces` refactor had left a dangling call
+  + mismatched `_check_coaxiality` signature (would NameError at runtime). Completed the split
+  (per-body cylinders cached once as (bores, bosses); hole_pattern + fastener run on bores,
+  coaxiality now matches boss/shaft-in-bore both directions) and re-wired the callsites.
+  Confirmed the body_id doc_query change is on-branch (commit e98b4b90) and unit-tested; stray
+  main-checkout edit was NOT needed. Rebased on origin/master (clean). All 8 tests PASS against
+  the real engine (core/build-linux/bin/libaicad.so) — verified executed, not skipped.
+- **INTEGRATOR / T-BL50 join point:** once `services/mcp/layout_plan_tools.py` lands, add
+  `"interface_check"` to its `_INTERFACE_VERIFIERS` map so the layout coverage gate consumes
+  this tool's output. Gate reads top-level `ok` + any `findings[].severity=="fail"` (advisory
+  `warn` does not fail the gate). JSON contract above is version 1, frozen (additive-only bumps
+  `version`). NOTE: the ctypes bridge (`mcp_server/core_bridge.py`) resolves the .so root as
+  `parents[1]` = the repo's `services/` dir, so its default search paths point under
+  `services/core/build-*` which do not exist in a normal checkout; set
+  `AI_CAD_LIBAICAD=<repo>/core/build-linux/bin/libaicad.so` (or stage the .so) to run the
+  engine-backed tests — otherwise `cb.available()` is False and the suite silently all-skips.

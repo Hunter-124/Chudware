@@ -3,7 +3,7 @@ id: T-BL04
 title: Fatigue + thermal + buckling + contact FEA (CalculiX)
 workstream: backlog
 owner: opus-fell
-status: doing
+status: review
 branch: task/T-BL04-calculix-fea
 depends_on: []
 lane: simulation

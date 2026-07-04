@@ -3,7 +3,7 @@ id: T-BL48
 title: Wire ui/imgui interactive sketch entry — dispatch ribbon/sketch commands to s_sketch so enterForFeature runs (unblocks T-BL44/41/46)
 workstream: backlog
 owner: opus-hunter
-status: doing
+status: review
 priority: 2
 lane: app-gui
 kind: fix

@@ -2,8 +2,8 @@
 id: T-BL32
 title: docs/manual/contracts.md drift — missing license_debt.md row + document the new CAM scoring keys
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-osier
+status: doing
 priority: 4
 lane: platform-infra
 kind: fix

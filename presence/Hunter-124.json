@@ -1,7 +1,7 @@
 {
  "agent": "Hunter-124",
  "host": "hunter-pc",
- "activity": "graphify_query",
+ "activity": "whoami",
  "task": "",
- "ts": "2026-07-04T21:11:39Z"
+ "ts": "2026-07-04T21:20:07Z"
 }

@@ -3,7 +3,7 @@ id: T-BL35
 title: Surfaces — surf_revolve axis well rejects datum axis (K_EDGE→K_EDGEAXIS) + gate readyForPreview on the axis well
 workstream: backlog
 owner: mooseinatree
-status: doing
+status: review
 priority: 3
 lane: app-gui
 kind: fix

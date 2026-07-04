@@ -19,6 +19,21 @@ run_fea_static(fixtures, loads, material) — linear static stress.
 
 run_fea_modal(fixtures, material, n_modes) — natural frequencies (Hz) of the held part.
 
+run_fea_frequency_response(fixtures, excitation_dir, sweep_hz, zeta, base_accel_g,
+  psd_breakpoints, vibration_spec, ...) — harmonic + random vibration response (T-BL17).
+  Answers "does this part resonate and fail under the vibe spec", not just "what are its
+  natural frequencies". Builds on run_fea_modal's modes via modal superposition:
+    Harmonic: SDOF-per-mode transmissibility sweep → response acceleration (g) vs frequency
+              (peak_accel_g, peak_freq_hz). base_accel_g sets the input amplitude.
+    Random:   Miles' equation per mode (Steinberg Eq. 6.6) → per-mode + total GRMS.
+              REQUIRES psd_breakpoints=[[f_hz, g2_per_hz], ...] — with no PSD given the
+              random field degrades to {ok:false, reason:"no_psd_provided"} (it NEVER
+              assumes a default vibration profile).
+  vibration_spec {"max_peak_accel_g": g, "max_grms": g} → pass/fail verdict (DAG-gateable).
+  zeta damping default 0.02 (2%) — an ASSUMPTION, always echoed in the result.
+  Response is acceleration amplification only: mode shapes are unit-normalized, so physical
+  displacement/stress amplitudes are NOT recovered (see result.limitations).
+
 run_cfd_flow(velocity, aoa, fluid) — LBM wind tunnel over the whole part/assembly.
   velocity m/s, aoa degrees, fluid "air"|"water". Returns drag (N), lift (N), Cd, frontal
   area, and Reynolds number. Coarse grid by default — a directional estimate, raise `cells`

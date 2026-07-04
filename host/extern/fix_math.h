@@ -51,7 +51,7 @@ long __cdecl lroundf(float);
 float __cdecl modff(float, float*);
 float __cdecl nearbyintf(float);
 float __cdecl nextafterf(float, float);
-float __cdecl nexttowardf(float, float);
+float __cdecl nexttowardf(float, long double);
 float __cdecl powf(float, float);
 float __cdecl remainderf(float, float);
 float __cdecl remquof(float, float, int*);

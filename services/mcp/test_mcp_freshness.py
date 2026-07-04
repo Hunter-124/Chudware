@@ -243,6 +243,9 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
     "design_review": {
         "design_review",
     },
+    "mechanical": {
+        "gear_check", "bearing_life",
+    },
 }
 
 # All tool names across all families (deduplicated — some tools like hover appear in
@@ -280,6 +283,7 @@ _FAMILY_SIGNALS: dict[str, list[str]] = {
     "code_compliance": ["code_check", "cad_guide('code_compliance')", "code_compliance"],
     "dag":           ["dag_plan", "dag_run", "cad_guide('dag')", "dag"],
     "design_review": ["design_review", "cad_guide('design_review')"],
+    "mechanical":    ["gear_check", "bearing_life", "mechanical"],
 }
 
 
@@ -321,6 +325,7 @@ def _build_coverage_corpus() -> str:
             "requirements", "dag", "verify", "interaction", "sourcing",
             "cost", "spec", "piping", "hydraulic", "firmware", "structural",
             "regen", "code_compliance", "serving", "design_review", "doc_diff", "plm",
+            "mechanical",
         ]
         for t in all_topics:
             try:
@@ -413,7 +418,7 @@ class TestMCPFreshness(unittest.TestCase):
         required_in_fallback = [
             "requirements", "dag", "verify", "interaction", "sourcing",
             "cost", "spec", "piping", "hydraulic", "firmware", "structural",
-            "regen", "code_compliance", "serving", "design_review", "doc_diff", "plm",
+            "mechanical", "regen", "code_compliance", "serving", "design_review", "doc_diff", "plm",
         ]
         missing = [t for t in required_in_fallback if t not in fallback]
         self.assertFalse(
@@ -429,7 +434,7 @@ class TestMCPFreshness(unittest.TestCase):
             "doc_diff", "req", "verify", "research", "deliverables",
             "sourcing", "cost", "spec", "piping", "hydraulic", "firmware",
             "structural", "parts", "serving", "regen", "code_compliance",
-            "dag", "design_review",
+            "dag", "design_review", "mechanical",
         }
         missing = required_families - set(_TOOL_FAMILIES.keys())
         self.assertFalse(

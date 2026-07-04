@@ -220,6 +220,9 @@ register_dag_replan_tools(mcp)
 # card per contracts/narration.md — never a raw JSON dump.
 from services.mcp.design_review_tools import register_design_review_tools
 register_design_review_tools(mcp)
+# Mechanical engineering checks (T-BL18): AGMA gear tooth stress + ISO 281 bearing life.
+from mcp_server.mechanical_tools import register_mechanical_tools
+register_mechanical_tools(mcp)
 
 
 def _install_clean_stdout():

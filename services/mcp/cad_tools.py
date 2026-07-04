@@ -1415,6 +1415,28 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  list_parts()                  — shows all open docs with revision counters.\n\n"
             "See also: cad_guide('doc_diff') for the diff tool."
         )
+    if topic in ("mechanical", "gear_check", "bearing_life", "gear", "bearing",
+                 "agma", "iso281", "transmission", "power_transmission"):
+        return (
+            "MECHANICAL CHECKS — AGMA gear tooth stress + ISO 281 bearing L10 life\n\n"
+            "Tools: gear_check / bearing_life\n\n"
+            "  gear_check(Wt, module, face_width, pitch_diameter, J, I, ...)\n"
+            "    AGMA 2001 bending + contact (pitting) stress for spur gears.\n"
+            "    Returns sigma_bending_MPa, sigma_contact_MPa, SF_bending, SF_contact.\n"
+            "    J (bending geometry factor) and I (contact geometry factor) are required inputs\n"
+            "    from AGMA 908 charts or textbook tables (not bundled — cite your source).\n"
+            "    Default Cp=191 MPa^0.5 (steel/steel, Shigley's Table 14-8).\n"
+            "    Supply allowable_bending_stress (S_t) and allowable_contact_stress (S_c)\n"
+            "    to get safety factors; omit for stress-only output.\n\n"
+            "  bearing_life(C, Fr, Fa, n_rpm, bearing_type, ...)\n"
+            "    ISO 281 L10 life: L10h = 10^6/(60n) * (C/P)^p.\n"
+            "    C = dynamic load rating (N) — supply from manufacturer datasheet.\n"
+            "    The parts catalog (bearing:ISO 15:*) carries bore/od/width only — no C.\n"
+            "    Never fabricate C; if unknown, ask the user or mark the field TBD.\n"
+            "    bearing_type: 'ball' (p=3) or 'roller' (p=10/3).\n\n"
+            "Both tools return a disclaimer — preliminary estimates, not certified analysis.\n"
+            "Reference: Shigley's MED 10th ed., Ch. 11 (bearing) + Ch. 14 (gear)."
+        )
     # Otherwise treat the topic as a per-feature cheatsheet name (hole, fillet, revolve, ...).
     sheet = _read_prompt(f"shared/cheatsheets/{topic}.md")
     if sheet:
@@ -1423,7 +1445,7 @@ def cad_guide_text(topic: str = "overview") -> str:
         if (_prompts_dir() / "shared" / "cheatsheets").is_dir() else []
     return (f"No guide for {topic!r}. Topics: overview, simulation, review, intake, gsl, cam, "
             f"narration, parts, reverse, deliverables, requirements, dag, verify, interaction, "
-            f"sourcing, cost, spec, piping, hydraulic, firmware, structural, regen, "
+            f"sourcing, cost, spec, piping, hydraulic, firmware, structural, mechanical, regen, "
             f"code_compliance, serving, design_review, doc_diff, plm; "
             f"or a feature cheatsheet: {avail}")
 
@@ -1462,6 +1484,7 @@ def register_cad_tools(mcp: FastMCP) -> None:
         "hydraulic" (hydraulic_new/add_component/... — ISO 1219 circuit design),
         "firmware" (fw_new_project/build/sim_run/flash/debug — embedded compile loop),
         "structural" (struct_analyze/check/estimate — PyNite member forces + code check),
+        "mechanical" (gear_check/bearing_life — AGMA gear tooth stress + ISO 281 bearing life),
         "regen" (regen_diagnose — diagnose + propose fix-ops on rebuild failure),
         "code_compliance" (code_check — building-code compliance with RAG citations),
         "serving" (serving_status/set_canary/promote/rollback — LoRA adapter routing),

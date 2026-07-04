@@ -666,10 +666,12 @@ static bool dropPathHasKnownExt(const std::string& path) {
     std::transform(ext.begin(), ext.end(), ext.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
     // F4: every importable 3D format (see engine/doc/formats.py FORMAT_REGISTRY / doc_formats RPC)
-    // plus the ECAD/KiCad family. The GL-thread pump branches CAD vs ECAD by extension.
+    // plus the ECAD/KiCad family and the 2D DXF/DWG lane. The GL-thread pump branches CAD vs
+    // ECAD by extension.
     return ext == ".step+" || ext == ".step" || ext == ".stp" || ext == ".iges" || ext == ".igs" ||
            ext == ".brep"  || ext == ".stl"  || ext == ".3mf" || ext == ".obj"  || ext == ".ply"  ||
            ext == ".gltf"  || ext == ".glb"  || ext == ".3dm" ||
+           ext == ".dxf" || ext == ".dwg" ||
            ext == ".sldprt" || ext == ".sldasm" || ext == ".x_t" || ext == ".x_b" ||  // experimental (SW COM)
            ext == ".ecad+" || ext == ".ecad" ||
            ext == ".kicad_sch" || ext == ".kicad_pcb";

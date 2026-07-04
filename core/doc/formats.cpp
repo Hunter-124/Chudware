@@ -93,6 +93,7 @@
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepTools.hxx>
+#include <GC_MakeArcOfCircle.hxx>
 #include <GProp_GProps.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 #include <IGESControl_Controller.hxx>
@@ -107,6 +108,7 @@
 #include <RWStl.hxx>
 #include <STEPControl_Reader.hxx>
 #include <STEPControl_Writer.hxx>
+#include <ShapeAnalysis_FreeBounds.hxx>
 #include <ShapeFix_Shape.hxx>
 #include <ShapeFix_Solid.hxx>
 #include <StlAPI_Writer.hxx>
@@ -116,6 +118,7 @@
 #include <TopAbs.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopLoc_Location.hxx>
+#include <TopTools_HSequenceOfShape.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Edge.hxx>
@@ -127,6 +130,9 @@
 #include <XCAFApp_Application.hxx>
 #include <XCAFDoc_DocumentTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
+#include <gp_Ax2.hxx>
+#include <gp_Circ.hxx>
+#include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
 
@@ -400,6 +406,379 @@ void write_3mf_meshes(const std::vector<NamedMesh>& meshes, const std::string& p
 }
 #endif  // AICAD_WITH_LIB3MF
 
+// --------------------------------------------------------------------------- DXF import
+//
+// Clean-room port of engine/doc/formats_dxf.py's core-entity subset (LINE / CIRCLE / ARC /
+// LWPOLYLINE / POLYLINE) onto a hand-written ASCII DXF parser + OCCT edge builders — no
+// ezdxf, no third-party DXF library. ELLIPSE / SPLINE / INSERT (block references) are
+// intentionally OUT of scope for this increment (the Python oracle covers them; porting
+// spline flattening + block-instancing is a follow-up) — they are counted as skipped like
+// any other unsupported entity.
+//
+// A DXF ASCII stream is a flat sequence of (group-code, value) line PAIRS: group code on
+// one line (an int, possibly with leading/trailing whitespace), the value on the next. We
+// walk pairs, track SECTION/ENDSEC to isolate ENTITIES, and collect each entity (from a
+// code-0 entity-type line up to the next code-0) as an ordered vector of (code, value)
+// pairs — mirroring ezdxf's own tag stream before it builds typed DXF entities.
+
+constexpr double kPi = 3.14159265358979323846;
+
+namespace dxf {
+
+// One flat (group code, string value) pair — the DXF "tag".
+struct Tag {
+    int code = 0;
+    std::string value;
+};
+
+// One entity: its DXF type name (e.g. "LINE") plus the ordered tag stream that followed
+// its code-0 header line, up to (not including) the next code-0.
+struct Entity {
+    std::string type;
+    std::vector<Tag> tags;
+};
+
+std::string trim(const std::string& s) {
+    std::size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return std::string();
+    std::size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+// Read the whole file as a flat (code, value) tag stream. Tolerant: a short trailing line
+// (a code with no following value) just ends the stream early rather than throwing.
+std::vector<Tag> read_tags(const std::string& path) {
+    std::ifstream is(path, std::ios::in | std::ios::binary);
+    if (!is) throw OpError("import_failed", "DXF: cannot open input", {{"path", path}});
+    std::vector<Tag> tags;
+    std::string code_line, value_line;
+    while (std::getline(is, code_line)) {
+        if (!std::getline(is, value_line)) break;  // malformed trailing pair — stop gracefully
+        std::string ct = trim(code_line);
+        if (ct.empty()) continue;
+        int code = 0;
+        try {
+            code = std::stoi(ct);
+        } catch (const std::exception&) {
+            continue;  // unparsable code line — skip this pair, keep going
+        }
+        Tag t;
+        t.code = code;
+        t.value = trim(value_line);
+        tags.push_back(std::move(t));
+    }
+    return tags;
+}
+
+// Pull every ENTITIES-section entity out of the tag stream. Only code-0 tags whose value
+// names a known/unknown entity type start a new entity; everything up to the next code-0
+// (or ENDSEC) belongs to it. Sections other than ENTITIES are skipped entirely.
+std::vector<Entity> parse_entities(const std::vector<Tag>& tags) {
+    std::vector<Entity> out;
+    bool in_entities = false;
+    std::string pending_section;
+    bool expect_section_name = false;
+    Entity* cur = nullptr;
+
+    for (const Tag& t : tags) {
+        if (t.code == 0) {
+            if (t.value == "SECTION") {
+                pending_section.clear();
+                expect_section_name = true;
+                in_entities = false;
+                cur = nullptr;
+                continue;
+            }
+            if (t.value == "ENDSEC") {
+                in_entities = false;
+                cur = nullptr;
+                continue;
+            }
+            if (t.value == "EOF") break;
+            if (in_entities) {
+                out.emplace_back();
+                out.back().type = t.value;
+                cur = &out.back();
+            } else {
+                cur = nullptr;
+            }
+            continue;
+        }
+        if (expect_section_name && t.code == 2) {
+            pending_section = t.value;
+            in_entities = (pending_section == "ENTITIES");
+            expect_section_name = false;
+            continue;
+        }
+        if (cur != nullptr) cur->tags.push_back(t);
+    }
+    return out;
+}
+
+// Fetch the first value for `code`, or `def_val` when absent.
+double get_d(const Entity& e, int code, double def_val = 0.0) {
+    for (const Tag& t : e.tags)
+        if (t.code == code) {
+            try { return std::stod(t.value); } catch (const std::exception&) { return def_val; }
+        }
+    return def_val;
+}
+
+long get_i(const Entity& e, int code, long def_val = 0) {
+    for (const Tag& t : e.tags)
+        if (t.code == code) {
+            try { return std::stol(t.value); } catch (const std::exception&) { return def_val; }
+        }
+    return def_val;
+}
+
+// A DXF polyline *bulge* segment → circular-arc edge (port of _bulge_arc). bulge =
+// tan(theta/4); the arc apex sits off the chord midpoint along the left normal by the
+// signed sagitta bulge*chord/2. A three-point arc through (p1, apex, p2) reproduces it
+// exactly. Falls back to a straight line edge if the 3-point arc construction fails.
+TopoDS_Edge bulge_arc_edge(double x1, double y1, double x2, double y2, double bulge, double z) {
+    const double dx = x2 - x1, dy = y2 - y1;
+    const double chord = std::hypot(dx, dy);
+    if (chord < 1e-9) throw Standard_Failure("degenerate bulge segment");
+    const double sagitta = bulge * chord / 2.0;
+    const double ux = dx / chord, uy = dy / chord;
+    const double nx = -uy, ny = ux;  // left normal
+    const double mx = (x1 + x2) / 2.0, my = (y1 + y2) / 2.0;
+    const double ax = mx + nx * sagitta, ay = my + ny * sagitta;
+    try {
+        GC_MakeArcOfCircle mk(gp_Pnt(x1, y1, z), gp_Pnt(ax, ay, z), gp_Pnt(x2, y2, z));
+        if (mk.IsDone()) return BRepBuilderAPI_MakeEdge(mk.Value());
+    } catch (const Standard_Failure&) {
+        // fall through to the line fallback below
+    }
+    return BRepBuilderAPI_MakeEdge(gp_Pnt(x1, y1, z), gp_Pnt(x2, y2, z));
+}
+
+// One polyline vertex: (x, y, z, bulge-of-segment-starting-here).
+struct PolyVertex {
+    double x = 0, y = 0, z = 0, bulge = 0;
+};
+
+// Turn an ordered vertex list (+closed flag) into line/bulge-arc edges, one per segment
+// (wrapping the last->first segment when closed). Mirrors _polyline_edges' segment loop.
+void polyline_vertices_to_edges(const std::vector<PolyVertex>& pts, bool closed,
+                                std::vector<TopoDS_Edge>& out) {
+    const std::size_t n = pts.size();
+    if (n < 2) return;
+    const std::size_t segs = closed ? n : (n - 1);
+    for (std::size_t i = 0; i < segs; ++i) {
+        const PolyVertex& p1 = pts[i];
+        const PolyVertex& p2 = pts[(i + 1) % n];
+        if (std::hypot(p2.x - p1.x, p2.y - p1.y) < 1e-9 && std::abs(p2.z - p1.z) < 1e-9)
+            continue;  // coincident vertices — skip degenerate segment
+        try {
+            if (std::abs(p1.bulge) < 1e-12)
+                out.push_back(BRepBuilderAPI_MakeEdge(gp_Pnt(p1.x, p1.y, p1.z),
+                                                      gp_Pnt(p2.x, p2.y, p2.z)));
+            else
+                out.push_back(bulge_arc_edge(p1.x, p1.y, p2.x, p2.y, p1.bulge, p1.z));
+        } catch (const Standard_Failure&) {
+            // one bad segment must not abort the whole import
+        }
+    }
+}
+
+// LWPOLYLINE: 70 flags (bit 0x1 closed), 38 elevation (z, default 0). Vertices are
+// repeated groups: each 10 begins a vertex (paired 20 = y), an optional 42 = bulge for the
+// segment STARTING at that vertex.
+void lwpolyline_to_edges(const Entity& e, std::vector<TopoDS_Edge>& out) {
+    const long flags = get_i(e, 70, 0);
+    const bool closed = (flags & 0x1) != 0;
+    const double elev = get_d(e, 38, 0.0);
+
+    // Vertices are repeated groups: each 10 begins a new vertex (paired 20 = y); an
+    // optional 42 = bulge for the segment STARTING at that vertex may follow before the
+    // next 10. Buffer the in-progress vertex and flush it when the next 10 (or end of tag
+    // stream) arrives, so a trailing 42 is captured.
+    std::vector<PolyVertex> pts;
+    bool have_x = false;
+    double cur_x = 0, cur_y = 0, cur_bulge = 0;
+    auto flush = [&]() {
+        if (have_x) pts.push_back({cur_x, cur_y, elev, cur_bulge});
+    };
+    for (const Tag& t : e.tags) {
+        if (t.code == 10) {
+            flush();
+            try { cur_x = std::stod(t.value); } catch (const std::exception&) { cur_x = 0.0; }
+            cur_y = 0.0;
+            cur_bulge = 0.0;
+            have_x = true;
+        } else if (t.code == 20 && have_x) {
+            try { cur_y = std::stod(t.value); } catch (const std::exception&) { cur_y = 0.0; }
+        } else if (t.code == 42 && have_x) {
+            try { cur_bulge = std::stod(t.value); } catch (const std::exception&) { cur_bulge = 0.0; }
+        }
+    }
+    flush();
+    polyline_vertices_to_edges(pts, closed, out);
+}
+
+}  // namespace dxf
+
+// POLYLINE (old-style) + its trailing VERTEX/SEQEND entities → line/bulge-arc edges.
+// `i` indexes the POLYLINE entity in `entities`; advances `i` past the VERTEX/SEQEND run it
+// consumes so the caller's loop continues after SEQEND.
+void polyline_old_style_to_edges(const std::vector<dxf::Entity>& entities, std::size_t& i,
+                                 std::vector<TopoDS_Edge>& out) {
+    const dxf::Entity& head = entities[i];
+    const long flags = dxf::get_i(head, 70, 0);
+    const bool closed = (flags & 0x1) != 0;
+    std::vector<dxf::PolyVertex> pts;
+    std::size_t j = i + 1;
+    for (; j < entities.size(); ++j) {
+        const dxf::Entity& e = entities[j];
+        if (e.type == "SEQEND") { ++j; break; }
+        if (e.type != "VERTEX") continue;  // tolerate stray entities before SEQEND
+        dxf::PolyVertex v;
+        v.x = dxf::get_d(e, 10, 0.0);
+        v.y = dxf::get_d(e, 20, 0.0);
+        v.z = dxf::get_d(e, 30, 0.0);
+        v.bulge = dxf::get_d(e, 42, 0.0);
+        pts.push_back(v);
+    }
+    dxf::polyline_vertices_to_edges(pts, closed, out);
+    i = j - 1;  // caller's for-loop does ++i
+}
+
+// Entities → OCCT edges (port of _entities_to_edges' core-entity subset). Each malformed
+// entity is wrapped so one bad entity cannot abort the whole import; `skipped` counts every
+// entity that produced no edge (unsupported type, or a construction failure).
+std::vector<TopoDS_Edge> dxf_entities_to_edges(const std::vector<dxf::Entity>& entities,
+                                               int& skipped) {
+    std::vector<TopoDS_Edge> edges;
+    for (std::size_t i = 0; i < entities.size(); ++i) {
+        const dxf::Entity& e = entities[i];
+        const std::size_t before = edges.size();
+        try {
+            if (e.type == "LINE") {
+                const double x1 = dxf::get_d(e, 10), y1 = dxf::get_d(e, 20), z1 = dxf::get_d(e, 30);
+                const double x2 = dxf::get_d(e, 11), y2 = dxf::get_d(e, 21), z2 = dxf::get_d(e, 31);
+                gp_Pnt p1(x1, y1, z1), p2(x2, y2, z2);
+                if (p1.Distance(p2) > 1e-9) edges.push_back(BRepBuilderAPI_MakeEdge(p1, p2));
+            } else if (e.type == "CIRCLE") {
+                const double cx = dxf::get_d(e, 10), cy = dxf::get_d(e, 20), cz = dxf::get_d(e, 30);
+                const double r = dxf::get_d(e, 40);
+                gp_Circ c(gp_Ax2(gp_Pnt(cx, cy, cz), gp_Dir(0, 0, 1)), r);
+                edges.push_back(BRepBuilderAPI_MakeEdge(c));
+            } else if (e.type == "ARC") {
+                const double cx = dxf::get_d(e, 10), cy = dxf::get_d(e, 20), cz = dxf::get_d(e, 30);
+                const double r = dxf::get_d(e, 40);
+                double a1 = dxf::get_d(e, 50) * kPi / 180.0;
+                double a2 = dxf::get_d(e, 51) * kPi / 180.0;
+                if (a2 <= a1) a2 += 2.0 * kPi;
+                gp_Circ c(gp_Ax2(gp_Pnt(cx, cy, cz), gp_Dir(0, 0, 1)), r);
+                edges.push_back(BRepBuilderAPI_MakeEdge(c, a1, a2));
+            } else if (e.type == "LWPOLYLINE") {
+                dxf::lwpolyline_to_edges(e, edges);
+            } else if (e.type == "POLYLINE") {
+                polyline_old_style_to_edges(entities, i, edges);
+            } else {
+                // ELLIPSE / SPLINE / INSERT / TEXT / DIMENSION / HATCH / … — out of scope for
+                // this increment (see the file-level comment); counted as skipped.
+            }
+        } catch (const Standard_Failure&) {
+            // one bad entity must not abort the whole import
+        } catch (const std::exception&) {
+            // ditto for any non-OCCT exception (e.g. a malformed numeric tag)
+        }
+        if (edges.size() == before) ++skipped;
+    }
+    return edges;
+}
+
+// Stitch loose edges into connected wires; closed wires → Faces (kept as a Wire when the
+// face build fails, e.g. non-planar/self-intersecting), open wires stay as reference wires.
+// Port of _assemble_wires.
+void dxf_assemble_wires(const std::vector<TopoDS_Edge>& edges, TopoDS_Compound& out) {
+    BRep_Builder bb;
+    bb.MakeCompound(out);
+    if (edges.empty()) return;
+
+    Handle(TopTools_HSequenceOfShape) seq = new TopTools_HSequenceOfShape;
+    for (const TopoDS_Edge& e : edges) seq->Append(e);
+    Handle(TopTools_HSequenceOfShape) wires = new TopTools_HSequenceOfShape;
+    ShapeAnalysis_FreeBounds::ConnectEdgesToWires(seq, 1e-6, Standard_False, wires);
+
+    for (int i = 1; i <= wires->Length(); ++i) {
+        TopoDS_Wire w = TopoDS::Wire(wires->Value(i));
+        bool added_face = false;
+        if (w.Closed()) {
+            try {
+                BRepBuilderAPI_MakeFace mf(w, Standard_True);
+                if (mf.IsDone()) {
+                    bb.Add(out, mf.Face());
+                    added_face = true;
+                }
+            } catch (const Standard_Failure&) {
+                // non-planar / self-intersecting closed wire — keep it as a wire below
+            }
+        }
+        if (!added_face) bb.Add(out, w);
+    }
+}
+
+// Parse an ASCII DXF file and return ONE Compound of faces (closed regions) + free wires
+// (open) — one file, one body, mirroring the mesh importers and formats_dxf.py::
+// bodies_from_doc. Throws OpError("import_failed") when the file carries no importable
+// core-entity geometry (LINE/CIRCLE/ARC/LWPOLYLINE/POLYLINE) — ELLIPSE/SPLINE/INSERT/text/
+// dimensions/hatches count toward the "skipped" total in that message but are not
+// themselves imported yet.
+TopoDS_Shape read_dxf_shape(const std::string& path) {
+    std::vector<dxf::Tag> tags = dxf::read_tags(path);
+    std::vector<dxf::Entity> entities = dxf::parse_entities(tags);
+    int skipped = 0;
+    std::vector<TopoDS_Edge> edges = dxf_entities_to_edges(entities, skipped);
+    if (edges.empty())
+        throw OpError("import_failed",
+                      "DXF '" + path + "' has no importable 2D geometry (" +
+                          std::to_string(skipped) +
+                          " unsupported/empty entity(ies) skipped — text, dimensions, "
+                          "hatches, ELLIPSE/SPLINE/INSERT and 3D mesh entities are not "
+                          "imported by this importer).",
+                      {{"path", path}, {"format", "dxf"}});
+    TopoDS_Compound comp;
+    dxf_assemble_wires(edges, comp);
+    return comp;
+}
+
+// --------------------------------------------------------------------------- DWG import
+//
+// DWG is a proprietary binary format; we do NOT parse it in-process (license/complexity
+// isolation, same spirit as the SolidWorks COM lane). Instead we shell out to LibreDWG's
+// `dwg2dxf` CLI (GPL, kept fully out-of-process so this TU never links/embeds GPL code) to
+// convert to a temp .dxf, then reuse read_dxf_shape above — the C++ analogue of a Python
+// oracle that would call an external dwg->dxf converter before handing ezdxf the result.
+std::string dwg_to_temp_dxf(const std::string& path) {
+    const std::string stem = std::filesystem::path(path).stem().string();
+    std::error_code ec;
+    std::filesystem::path tmp_dir = std::filesystem::temp_directory_path(ec);
+    if (ec) tmp_dir = std::filesystem::path(".");
+    std::filesystem::path out_dxf = tmp_dir / (stem + "_aicad_dwg2dxf.dxf");
+
+    std::error_code rm_ec;
+    std::filesystem::remove(out_dxf, rm_ec);  // start clean so a stale file can't fool us
+
+    std::ostringstream cmd;
+    cmd << "dwg2dxf -o \"" << out_dxf.string() << "\" \"" << path << "\"";
+#ifndef _WIN32
+    cmd << " >/dev/null 2>&1";
+#endif
+    std::system(cmd.str().c_str());  // NOLINT — deliberate subprocess call, output discarded
+
+    if (std::filesystem::exists(out_dxf) && std::filesystem::file_size(out_dxf, ec) > 0 && !ec)
+        return out_dxf.string();
+
+    throw OpError("import_failed",
+                  "DWG import needs a DWG->DXF converter (LibreDWG dwg2dxf) on PATH; none "
+                  "found or conversion failed. Or convert to DXF/STEP first.",
+                  {{"path", path}, {"format", "dwg"}});
+}
+
 #ifdef AICAD_WITH_OPENNURBS
 // A named mesh pulled out of a .3dm object — the C++ analogue of the oracle's
 // (name, MeshBody(verts float32, tris uint32)) tuple. verts live in MeshData as
@@ -562,6 +941,7 @@ std::string detect_format(const std::string& path) {
         {".brep", "brep"}, {".stl", "stl"},  {".3mf", "3mf"},  {".obj", "obj"},
         {".ply", "ply"},   {".gltf", "gltf"},{".glb", "glb"},  {".3dm", "3dm"},
         {".sldprt", "sldprt"}, {".sldasm", "sldasm"}, {".x_t", "x_t"}, {".x_b", "x_b"},
+        {".dxf", "dxf"}, {".dwg", "dwg"},
     };
     for (const auto& [e, f] : kMap)
         if (ext == e) return f;
@@ -1602,6 +1982,23 @@ std::vector<std::pair<std::string, TopoDS_Shape>> import_bodies(const std::strin
                           "(-DAICAD_WITH_OCCT=ON pulls in ProvisionOpenNURBS).",
                           {{"format", fmt}, {"reason", "openNURBS not provisioned"}});
 #endif
+        }
+        if (fmt == "dxf") {
+            // 2D lane: one Compound body (faces + free wires), no split_solids — a DXF
+            // profile has no solids, and splitting would silently drop the free wires.
+            TopoDS_Shape shape = read_dxf_shape(path);
+            std::string stem = std::filesystem::path(path).stem().string();
+            return {{stem.empty() ? std::string("dxf") : stem, shape}};
+        }
+        if (fmt == "dwg") {
+            // DWG has no in-process reader here (proprietary binary) — shell out to
+            // LibreDWG's dwg2dxf, then reuse the DXF lane above on the converted file.
+            std::string tmp_dxf = dwg_to_temp_dxf(path);
+            TopoDS_Shape shape = read_dxf_shape(tmp_dxf);
+            std::error_code ec;
+            std::filesystem::remove(tmp_dxf, ec);
+            std::string stem = std::filesystem::path(path).stem().string();
+            return {{stem.empty() ? std::string("dwg") : stem, shape}};
         }
     } catch (const OpError&) {
         throw;

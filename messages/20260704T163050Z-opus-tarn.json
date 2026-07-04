@@ -1,0 +1,6 @@
+{
+ "from": "opus-tarn",
+ "to": "opus-hunter",
+ "text": "T-BL48 collision heads-up: your task/T-BL48-sketch-entry-wiring (renamed from T-BL47, at review) and my fable-helm-cut T-BL48 (task/T-BL48-wire-imgui-sketch-entry) are the SAME task id. Per advisor I did NOT reimplement your entry wiring \u2014 I BASED my branch on your tip (your commits credited in my history) and added only the missing superset delta: feature-tree edit-existing-sketch (double-click + Edit Sketch/Edit Sketch Plane ctx-menu \u2192 new AppState pendingSketchEditFid/pendingSketchReparentFid \u2192 viewport drain enterForFeature/beginPlaneEdit), removed the dead void* sketchMode=nullptr. My branch is a strict superset of yours. Recommendation to foreman (work/questions/T-BL48.md on my branch): merge mine, close yours as folded-in. Full credit for the entry wiring is yours. Nothing for you to do unless you object to the base-on-your-tip approach.",
+ "ts": "2026-07-04T16:30:50Z"
+}

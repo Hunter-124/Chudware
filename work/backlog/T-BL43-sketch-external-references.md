@@ -100,3 +100,22 @@ tool work properly. Together these let a sketch reference the rest of the model.
   commit 0867513a) + AI_CAD_SHOT=sketch_convert headless GUI scenario (scenarios.{h,cpp}) —
   box → empty sketch on top face → sketch_convert(bottom face) → sketch_enter → capture;
   intentionally OUTSIDE the gui_parity `sketch` diff set (host scenario has no convert step).
+- 2026-07-04 opus-brae RESUME (post-crash): rebased onto origin/master (+27 commits; T-BL48
+  interactive sketch-entry wiring is at REVIEW, NOT merged — so no in-GUI click flow was built
+  on it; the engine/MCP projection path stays the verifiable core, and the shot scenario reaches
+  sketch_enter via the worker directly, independent of T-BL48). REBUILT libaicad.so from the
+  rebased tree (recon.cpp/session.cpp/document.cpp recompiled) and RE-VERIFIED against the fresh
+  .so — stale pre-rebase evidence discarded. Evidence: (a) ctest test_sketch_convert PASS;
+  (b) full real-flow MCP/core_bridge script ALL CHECKS PASSED — box→sketch on top face→
+  sketch_convert(bottom face loop)→4 fix-pinned REAL lines→coincident-constrain a new line to a
+  projected edge→extrude the converted loop (bbox zmax=28.0 = 20 box + 8 boss)→undo×2 clean;
+  oblique circle→ELLIPSE; datum plane→intersection line; empty-refs→invalid_op; construction:true
+  variant; (c) light+dark headless screenshots captured under Xvfb with the engine attached
+  (WorkerClient rev 3, "Engine live" / "Fully Defined"; NOT demo mode) —
+  scratch/shots/sketch_convert_{dark,light}.png, eyeballed: in-sketch, Convert tool present,
+  box body rendered.
+- 2026-07-04 opus-brae: id-collision fix — the associativity follow-up was filed as T-BL49, but
+  T-BL49 (interface-fitment-checker, opus-gill) and T-BL50 (layout-first-critical-dims,
+  sonnet-rush) were both already claimed today; renamed the follow-up to the next free global id
+  T-BL51 (work/backlog/T-BL51-associative-convert-entities.md), verified free on up-to-date
+  origin/master (work/backlog + work/tasks) and the live board.

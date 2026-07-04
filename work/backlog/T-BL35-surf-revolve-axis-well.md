@@ -58,3 +58,15 @@ VERIFICATION DONE:
 - check.py: all 4 gates PASS (surfacing no drift). graphify update . done.
 
 RESIDUAL (for human merge-time check): the DoD's fully-interactive "datum-axis pick -> successful surface" could NOT be completed in a Claude-launched instance. Even with AI_CAD_PYTHON pointed at the real Roaming venv, the live app fell back to the Python worker with "unknown method: doc_new" â€” libaicad.dll (staged in dist/AI-CAD with all 102 OCCT siblings) did not load/wire in the sandbox-launched process. This is the known "my launches get redirected; the user's Explorer launch gets the real runtime" limitation, orthogonal to this change. A normal Explorer launch should complete the live pick trivially. Filing an issue for the runtime-wiring + fix_math.h build breakage.
+- 2026-07-04 05:13 UTC [mooseinatree] ENGINE-LEVEL LIVE VERIFY (headless, real C++ core via core_bridge â€” the same libaicad the GUI form drives):
+built doc_new(part) -> sketch profile on plane.front -> surf_revolve(angle 360) with axis ref
+{"kind":"datum","feature":"axis.z"}. Result: rebuild OK, surf_revolve feature error=None and
+dangling_refs=[] (the DATUM-AXIS ref resolved â€” the exact behavior the K_EDGE->K_EDGEAXIS well fix
+enables), producing a valid 4-face revolved surface. doc_render_png shows the revolved ring surface.
+
+This substantiates T-BL35 end-to-end: (form) K_EDGEAXIS arms routeDatumAxis which emits
+{kind:datum,feature:axis} -> (engine) resolves that ref and builds the surface. The only DoD item not
+done is the literal in-GUI mouse pick, which is blocked by a SEPARATE Windows runtime issue: in a
+Claude-launched host the in-process C++ doc core doesn't wire up (doc ops fall back to the Python worker,
+which no longer implements doc_new), so sketch/draw silently no-op. The DLL itself is fine headlessly.
+Left at status=review; the in-GUI pick is trivial to confirm on a normal user launch.

@@ -2,8 +2,8 @@
 id: T-BL17
 title: Random/harmonic vibration response (frequency response analysis)
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-wick
+status: doing
 branch: task/T-BL17-vibration-response
 depends_on: []
 lane: simulation

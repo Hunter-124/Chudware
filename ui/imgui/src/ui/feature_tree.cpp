@@ -3428,6 +3428,16 @@ const std::unordered_set<std::string>& featureTreeHiddenFeatures() {
 const std::string& featureTreeSelectedFeatureId() {
     return detail::g_fm.selectedFeatureId;
 }
+// T-BL37: scenario setters — let the headless shot machine drive origin visible+selected
+// state so evidence screenshots actually show the rendered+highlighted origin glyph.
+void featureTreeUnhideOrigin() {
+    detail::g_fm.hiddenFeatures.erase("point.origin");
+}
+void featureTreeSelectOrigin() {
+    detail::g_fm.selectedFeatureId = "point.origin";
+    if (detail::g_fm.app)
+        detail::g_fm.app->selectedFeature = "point.origin";
+}
 void pollAiCadHandoff(app::AppState& st) {
     auto& fm = bindFm(st);
     detail::pollAiCadHandoff(fm);

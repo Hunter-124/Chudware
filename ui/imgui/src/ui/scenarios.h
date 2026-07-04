@@ -34,6 +34,8 @@ struct ShotConfig {
     bool wantGallery = false;                 // T-U9: sample gallery (loads from disk, no RPC wait)
 
     // Worker one-shot shots (fire once when workerStarted)
+    bool wantOrigin = false;        // T-BL37: origin glyph visible + selected (AI_CAD_SHOT=origin)
+    bool originShotDone = false;
     bool wantTree = false;
     bool treeShotDone = false;
     bool wantEquations = false;

@@ -32,6 +32,10 @@ std::string featureTreeActivePath();
 // primary selected id) for the viewport's reference-datum push.
 const std::unordered_set<std::string>& featureTreeHiddenFeatures();
 const std::string& featureTreeSelectedFeatureId();
+// T-BL37: scenario setters — used by AI_CAD_SHOT=origin to drive visible+selected state
+// so the headless evidence screenshot shows the rendered+highlighted origin glyph.
+void featureTreeUnhideOrigin();
+void featureTreeSelectOrigin();
 
 void pollAiCadHandoff(app::AppState& st);
 

@@ -161,12 +161,41 @@ void AppState::dispatch(const char* cmdId) {
     const cmd::Command* c = cmd::find(cmdId);
     std::string label = c ? c->label : cmdId;
 
-    if (std::strcmp(cmdId, "sketch_new") == 0) {
-        inSketch = true; activeTool.clear();
-        status = "Editing Sketch1"; syncViewModel(); return;
-    }
-    if (std::strcmp(cmdId, "sketch_exit") == 0) {
-        inSketch = false; status = "Ready"; syncViewModel(); return;
+    // T-BL47: sketch ribbon commands — route through pendingSketchCmds so the viewport
+    // frame (where SketchHost + s_sketch live) can drain them via onRibbonCommand.
+    // The set below mirrors every id handled in SketchMode::onRibbonCommand (sketch_mode.cpp).
+    static const char* kSketchCmds[] = {
+        "sketch_new", "sketch_exit",
+        "sk_line", "sk_rect_corner", "sk_circle", "sk_arc_center", "sk_slot",
+        "smart_dim",
+        "sk_rect_3pt_corner", "sk_rect_3pt_center", "sk_parallelogram",
+        "sk_circle_perimeter",
+        "sk_slot_ctr_str", "sk_slot_arc_ctr", "sk_slot_arc_3pt",
+        "sk_ellipse_partial", "sk_parabola", "sk_conic",
+        "sk_trim", "sk_extend", "sk_offset_ent",
+        "sk_fillet", "sk_chamfer",
+        "sk_mirror", "sk_lin_pattern", "sk_circ_pattern", "sk_convert_ent",
+        "sk_move", "sk_arc_tangent", "sk_arc_3pt", "sk_polygon",
+        "sk_poly_tri", "sk_poly_quad", "sk_poly_pent", "sk_poly_hex",
+        "sk_poly_oct", "sk_poly_star",
+        "sk_rect_center", "sk_point",
+        "sk_ellipse", "sk_ellipse_big",
+        "sk_spline", "sk_spline_style", "sk_text", "sk_spline_equation",
+        nullptr
+    };
+    for (const char** p = kSketchCmds; *p; ++p) {
+        if (std::strcmp(cmdId, *p) == 0) {
+            pendingSketchCmds.push_back(cmdId);
+            // optimistically update inSketch for workspace routing
+            if (std::strcmp(cmdId, "sketch_new") == 0) {
+                inSketch = true; activeTool.clear();
+                status = "Editing Sketch1"; syncViewModel();
+            } else if (std::strcmp(cmdId, "sketch_exit") == 0) {
+                // actual inSketch=false will happen after drain in viewport
+                status = "Ready";
+            }
+            return;
+        }
     }
     if (std::strcmp(cmdId, "make_drawing") == 0) {
         docs.push_back({"Drawing1", cmd::DocType::Drawing});

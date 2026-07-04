@@ -727,6 +727,27 @@ void drawViewport(AppState& s) {
         host.hasDocMesh = live;
         host.idPass = &g_glVp->idPass();
         static SketchMode s_sketch;
+
+        // T-BL47: drain pending sketch ribbon commands from AppState.
+        // dispatch() pushes them; we execute them here where SketchHost + s_sketch exist.
+        if (!s.pendingSketchCmds.empty()) {
+            for (const auto& cmd : s.pendingSketchCmds) {
+                s_sketch.onRibbonCommand(host, cmd);
+            }
+            s.pendingSketchCmds.clear();
+            // T-BL47 write-back: enterForFeature sets host.yaw/pitch/zoom/pan on the copy;
+            // push them back to g_vpState so syncCameraToGl picks them up this frame.
+            g_vpState.yaw    = host.yaw;
+            g_vpState.pitch  = host.pitch;
+            g_vpState.zoom   = host.zoom;
+            g_vpState.pan[0] = host.pan[0];
+            g_vpState.pan[1] = host.pan[1];
+            g_vpState.pan[2] = host.pan[2];
+            // Keep inSketch in sync with the authoritative active_ flag.
+            s.inSketch = s_sketch.active();
+            s.syncViewModel();
+        }
+
         s_sketch.drawGhosts(host, a, b, vw, vh);
         if (s.inSketch)
             s_sketch.drawOverlay(host, io, a, b, vw, vh, imgHovered);

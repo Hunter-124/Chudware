@@ -746,8 +746,11 @@ void drawViewport(AppState& s) {
             g_vpState.pan[0] = host.pan[0];
             g_vpState.pan[1] = host.pan[1];
             g_vpState.pan[2] = host.pan[2];
-            // Keep inSketch in sync with the authoritative active_ flag.
-            s.inSketch = s_sketch.active();
+            // Keep inSketch in sync with the sketcher state. Include planePicking(): a
+            // sketch_new with no pre-selected plane arms plane-pick (active_ still false),
+            // and the plane-pick overlay only draws while inSketch — dropping to active()
+            // alone would kill the overlay before the user can pick a plane (T-BL48).
+            s.inSketch = s_sketch.active() || s_sketch.planePicking();
             s.syncViewModel();
         }
 

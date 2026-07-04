@@ -678,7 +678,7 @@ static const std::vector<PMFormDef>& forms() {
         // --- surf_revolve --- refs.profile[]/axis; params angle.
         { "surf_revolve", "Revolved Surface", "revolve_boss", {
             Well  ("profile", "Profile", "Revolve", K_FACE, true),
-            Well  ("axis",    "Axis",    "Revolve", K_EDGE, false),
+            Well  ("axis",    "Axis",    "Revolve", K_EDGEAXIS, false),  // K_EDGEAXIS (not K_EDGE) so a datum axis is accepted — mirrors solid revolve
             Range (Angle("angle",   "Angle",   "Revolve", 360.0), 0.0, 360.0),
         }},
         // --- surf_sweep --- refs.profile[]/path/guides[]; no params.

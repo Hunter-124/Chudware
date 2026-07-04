@@ -150,7 +150,75 @@ static void seedQuestionShot(app::AppState& st) {
     u.anim = 1.f;
     st.agent.blocks.push_back(u);
 
-    // Block 1: multiple choice (single-select + multi-select) — choice question kind.
+    // Block 1: short answer (single-line text) + dimension — pushed first so it scrolls above.
+    {
+        const char* batchJson = R"({
+            "schema": "aicad.interaction/1",
+            "batch_id": "b_shot_text",
+            "scope": "run",
+            "run_id": "r_shot",
+            "blocking": true,
+            "questions": [
+                {
+                    "id": "label",
+                    "kind": "text",
+                    "prompt": "Short label to engrave on the bracket (e.g. part number)?",
+                    "suggested": "BKT-001",
+                    "required": false
+                },
+                {
+                    "id": "flange_width",
+                    "kind": "dimension",
+                    "family": "length",
+                    "prompt": "Flange width?",
+                    "suggested": {"value": 25, "unit": "mm"},
+                    "required": true
+                }
+            ]
+        })";
+        AgentBlock qb; qb.kind = BlockKind::Question; qb.title = "Agent question";
+        qb.anim = 1.f;
+        qb.askForm = parseAskBatch(batchJson);
+        qb.askFields.resize(qb.askForm.fields.size());
+        st.agent.blocks.push_back(std::move(qb));
+    }
+
+    // Block 2: open-ended (multiline text) + approval.
+    {
+        const char* batchJson = R"({
+            "schema": "aicad.interaction/1",
+            "batch_id": "b_shot_openended",
+            "scope": "run",
+            "run_id": "r_shot",
+            "blocking": true,
+            "questions": [
+                {
+                    "id": "special_notes",
+                    "kind": "text",
+                    "multiline": true,
+                    "prompt": "Any special requirements or notes for this bracket?",
+                    "suggested": "",
+                    "required": false
+                },
+                {
+                    "id": "proceed",
+                    "kind": "approval",
+                    "prompt": "Proceed with building the bracket using your answers above?",
+                    "proposal": "Build bracket with selected options and dimensions",
+                    "suggested": true,
+                    "required": true
+                }
+            ]
+        })";
+        AgentBlock qb; qb.kind = BlockKind::Question; qb.title = "Agent question";
+        qb.anim = 1.f;
+        qb.askForm = parseAskBatch(batchJson);
+        qb.askFields.resize(qb.askForm.fields.size());
+        st.agent.blocks.push_back(std::move(qb));
+    }
+
+    // Block 3 (last = visible at bottom): multiple choice (single-select + multi-select).
+    // The agent panel scrolls to bottom, so this block is guaranteed in-frame.
     {
         const char* batchJson = R"({
             "schema": "aicad.interaction/1",
@@ -184,73 +252,6 @@ static void seedQuestionShot(app::AppState& st) {
                         {"value": "gussets",     "label": "Gussets"},
                         {"value": "cable_clips", "label": "Cable clips"}
                     ]
-                }
-            ]
-        })";
-        AgentBlock qb; qb.kind = BlockKind::Question; qb.title = "Agent question";
-        qb.anim = 1.f;
-        qb.askForm = parseAskBatch(batchJson);
-        qb.askFields.resize(qb.askForm.fields.size());
-        st.agent.blocks.push_back(std::move(qb));
-    }
-
-    // Block 2: short answer (single-line text) + dimension.
-    {
-        const char* batchJson = R"({
-            "schema": "aicad.interaction/1",
-            "batch_id": "b_shot_text",
-            "scope": "run",
-            "run_id": "r_shot",
-            "blocking": true,
-            "questions": [
-                {
-                    "id": "label",
-                    "kind": "text",
-                    "prompt": "Short label to engrave on the bracket (e.g. part number)?",
-                    "suggested": "BKT-001",
-                    "required": false
-                },
-                {
-                    "id": "flange_width",
-                    "kind": "dimension",
-                    "family": "length",
-                    "prompt": "Flange width?",
-                    "suggested": {"value": 25, "unit": "mm"},
-                    "required": true
-                }
-            ]
-        })";
-        AgentBlock qb; qb.kind = BlockKind::Question; qb.title = "Agent question";
-        qb.anim = 1.f;
-        qb.askForm = parseAskBatch(batchJson);
-        qb.askFields.resize(qb.askForm.fields.size());
-        st.agent.blocks.push_back(std::move(qb));
-    }
-
-    // Block 3: open-ended (multiline text) + approval.
-    {
-        const char* batchJson = R"({
-            "schema": "aicad.interaction/1",
-            "batch_id": "b_shot_openended",
-            "scope": "run",
-            "run_id": "r_shot",
-            "blocking": true,
-            "questions": [
-                {
-                    "id": "special_notes",
-                    "kind": "text",
-                    "multiline": true,
-                    "prompt": "Any special requirements or notes for this bracket?",
-                    "suggested": "",
-                    "required": false
-                },
-                {
-                    "id": "proceed",
-                    "kind": "approval",
-                    "prompt": "Proceed with building the bracket using your answers above?",
-                    "proposal": "Build bracket with selected options and dimensions",
-                    "suggested": true,
-                    "required": true
                 }
             ]
         })";

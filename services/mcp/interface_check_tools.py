@@ -89,7 +89,7 @@ from __future__ import annotations
 
 import json
 import math
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -201,36 +201,41 @@ def _planar_faces_for_body(cb, doc_id: str, body_id: int) -> list[dict]:
     return [m for m in r.get("matches", []) if m.get("surf") in ("plane", "flat")]
 
 
-def _holes_from_faces(round_faces: list[dict]) -> list[dict]:
-    """Derive per-body hole records (bore cylinders) from cylindrical faces.
+def _cylinders_from_faces(round_faces: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split cylindrical faces into (bores, bosses) — concave holes vs convex shafts/bosses.
 
-    A "hole" is a concave (bore) cylindrical face. Each record carries the axis, a point on
-    the axis (centroid), the diameter, and a plain-words position ref. Faces of the same
-    bore split by seams are merged by near-collinear axis + equal radius."""
-    holes: list[dict] = []
+    Each record carries the axis direction, a point on the axis (centroid), radius/diameter,
+    and `kind` ("bore"|"boss"). Faces of the SAME cylinder split by seams are merged by
+    near-collinear axis + equal radius. Bores drive hole-pattern + fastener checks; bores AND
+    bosses drive coaxiality (a boss/shaft on one component seating into a bore on the other)."""
+    bores: list[dict] = []
+    bosses: list[dict] = []
     for f in round_faces:
-        if f.get("concavity") not in ("bore", "concave"):
-            continue  # bosses/outer cylinders are not through-holes; handled by coaxiality
+        concavity = f.get("concavity")
+        is_bore = concavity in ("bore", "concave")
+        target = bores if is_bore else bosses
         axis = _unit(_v(f.get("axis", [0, 0, 1])))
         centroid = _v(f.get("centroid", [0, 0, 0]))
         radius = float(f.get("radius", 0.0))
         merged = False
-        for h in holes:
+        for h in target:
             if abs(h["radius"] - radius) < 1e-3 and \
                _perp_distance_between_axes(h["centroid"], h["axis"], centroid, axis) < 1e-2 and \
                _axis_angle_deg(h["axis"], axis) < 1.0:
                 merged = True
                 break
         if not merged:
-            holes.append({"axis": axis, "centroid": centroid, "radius": radius,
-                          "dia": round(radius * 2, 4), "sid": f.get("sid")})
-    return holes
+            target.append({"axis": axis, "centroid": centroid, "radius": radius,
+                           "dia": round(radius * 2, 4), "sid": f.get("sid"),
+                           "kind": "bore" if is_bore else "boss"})
+    return bores, bosses
 
 
 def _hole_ref(h: dict) -> str:
-    """Plain-words reference for a hole (the style the engine already uses)."""
+    """Plain-words reference for a cylinder (bore/boss) — the style the engine already uses."""
     c = h["centroid"]
-    return f"hole Ø{h['dia']:g} at ({c[0]:.1f}, {c[1]:.1f}, {c[2]:.1f})"
+    word = "boss" if h.get("kind") == "boss" else "hole"
+    return f"{word} Ø{h['dia']:g} at ({c[0]:.1f}, {c[1]:.1f}, {c[2]:.1f})"
 
 
 # ---------------------------------------------------------------------------
@@ -304,51 +309,64 @@ def _pub_hole(h: dict) -> dict:
             "axis": [round(a, 4) for a in h["axis"]], "ref": _hole_ref(h)}
 
 
-def _check_coaxiality(a_holes, b_holes, offset_tol, angle_tol, findings,
+def _check_coaxiality(a_bosses, b_bores, b_bosses, a_bores, offset_tol, angle_tol, findings,
                       a_id, b_id, a_name, b_name):
-    """Mating cylindrical features across the interface: are their axes coaxial?
+    """Coaxiality of MATING CYLINDRICAL features across the interface — bore/boss & shaft/bore.
 
-    We reuse the hole (bore) axes already extracted. Two bores that were MATCHED positionally
-    but whose axes tilt/offset beyond tolerance are the coaxiality failures (bore/boss,
-    shaft/bore misalignment shows up here as axis offset + angle)."""
+    A boss/shaft on one component that seats into a bore on the other should be COAXIAL. We
+    match each boss to the nearest opposite-component bore whose radius it plausibly fits
+    (|Δr| small) and whose axis is roughly aligned, then report the perpendicular axis offset
+    and angular tilt. (Bore-to-bore hole registration is the hole_pattern check's job; this
+    check is specifically the boss-in-bore / shaft-in-bore fit that hole_pattern can't see.)"""
     pairs = []
-    used_b = set()
-    for ha in a_holes:
-        best, best_off, best_ang, best_j = None, HOLE_MATCH_LATERAL_MM, None, None
-        for j, hb in enumerate(b_holes):
-            if j in used_b:
+
+    def match_bosses(bosses, bores, boss_owner, bore_owner):
+        used = set()
+        for bo in bosses:
+            best, best_off, best_ang, best_j = None, HOLE_MATCH_LATERAL_MM, None, None
+            for j, br in enumerate(bores):
+                if j in used:
+                    continue
+                # a boss can only seat into a bore of similar-or-larger radius
+                if bo["radius"] - br["radius"] > 0.5:
+                    continue
+                off = _perp_distance_between_axes(bo["centroid"], bo["axis"],
+                                                  br["centroid"], br["axis"])
+                if off < best_off:
+                    best, best_off, best_ang, best_j = br, off, \
+                        _axis_angle_deg(bo["axis"], br["axis"]), j
+            if best is None:
                 continue
-            off = _perp_distance_between_axes(ha["centroid"], ha["axis"], hb["centroid"], hb["axis"])
-            ang = _axis_angle_deg(ha["axis"], hb["axis"])
-            # only consider bores that plausibly mate (roughly aligned laterally)
-            if off < best_off:
-                best, best_off, best_ang, best_j = hb, off, ang, j
-        if best is None:
-            continue
-        used_b.add(best_j)
-        ok = best_off <= offset_tol and best_ang <= angle_tol
-        rec = {"a_feature": _hole_ref(ha), "b_feature": _hole_ref(best),
-               "axis_offset_mm": round(best_off, 4), "axis_angle_deg": round(best_ang, 4),
-               "status": "pass" if ok else "fail"}
-        if not ok:
-            rec["fix"] = (f"re-align {b_name} bore axis to {a_name}: "
-                          f"{best_off:.3f} mm offset, {best_ang:.2f}° tilt to remove")
-            findings.append({
-                "severity": "fail", "component_a": a_id, "component_b": b_id,
-                "check": "coaxiality", "feature": _hole_ref(ha),
-                "error_mm": round(best_off, 4),
-                "detail": (f"mating bores on {a_name}/{b_name} not coaxial: axis offset "
-                           f"{best_off:.3f} mm, angular misalignment {best_ang:.2f}°"),
-                "fix": rec["fix"],
-            })
-        pairs.append(rec)
+            used.add(best_j)
+            ok = best_off <= offset_tol and best_ang <= angle_tol
+            rec = {"a_feature": _hole_ref(bo) + f" ({boss_owner})",
+                   "b_feature": _hole_ref(best) + f" ({bore_owner})",
+                   "axis_offset_mm": round(best_off, 4), "axis_angle_deg": round(best_ang, 4),
+                   "status": "pass" if ok else "fail"}
+            if not ok:
+                rec["fix"] = (f"re-align the {boss_owner} boss/shaft into the {bore_owner} bore: "
+                              f"{best_off:.3f} mm axis offset, {best_ang:.2f}° tilt to remove")
+                findings.append({
+                    "severity": "fail", "component_a": a_id, "component_b": b_id,
+                    "check": "coaxiality", "feature": _hole_ref(bo),
+                    "error_mm": round(best_off, 4),
+                    "detail": (f"{boss_owner} boss/shaft not coaxial with the {bore_owner} bore "
+                               f"it mates: axis offset {best_off:.3f} mm, angular misalignment "
+                               f"{best_ang:.2f}°"),
+                    "fix": rec["fix"],
+                })
+            pairs.append(rec)
+
+    match_bosses(a_bosses, b_bores, a_name, b_name)   # A's boss into B's bore
+    match_bosses(b_bosses, a_bores, b_name, a_name)   # B's boss into A's bore
     status = "fail" if any(p["status"] == "fail" for p in pairs) else ("pass" if pairs else "skip")
     return {"status": status, "pairs": pairs,
-            "summary": f"{sum(1 for p in pairs if p['status']=='pass')}/{len(pairs)} bore pairs coaxial"
-                       if pairs else "no mating bores detected"}
+            "summary": (f"{sum(1 for p in pairs if p['status']=='pass')}/{len(pairs)} "
+                        f"boss/bore pairs coaxial") if pairs
+                       else "no mating boss/shaft-in-bore features detected"}
 
 
-def _check_contact_plane(cb, doc_id, a_id, b_id, a_name, b_name, a_planes, b_planes,
+def _check_contact_plane(a_id, b_id, a_name, b_name, a_planes, b_planes,
                          angle_tol, gap_tol, findings):
     """Do the two components have flush, coplanar mating faces where they meet?
 
@@ -406,8 +424,8 @@ def _check_fastener_passthrough(a_holes, b_holes, fastener, findings, a_id, b_id
         return {"status": "skip", "fastener": None, "stacks": [],
                 "summary": "no fastener given (pass fastener='M6' to check pass-through)"}
     try:
-        from engine.research import thread_spec as _ts
-        spec = _ts.thread_spec(str(fastener))
+        from engine.research.thread_spec import thread_spec as _thread_spec
+        spec = _thread_spec(str(fastener))
     except Exception as e:  # noqa: BLE001
         return {"status": "skip", "fastener": fastener, "stacks": [],
                 "summary": f"could not resolve fastener spec: {e}"}
@@ -524,15 +542,16 @@ def run_interface_check(
                     if a["bbox"] and b["bbox"] and _bbox_gap(a["bbox"], b["bbox"]) <= proximity_mm:
                         pairs_to_check.append((a, b))
 
-        # Cache per-body geometry.
-        holes_cache: dict[int, list] = {}
+        # Cache per-body geometry. Cylinders are split once into (bores, bosses):
+        # bores drive hole-pattern + fastener checks, bores AND bosses drive coaxiality.
+        cyl_cache: dict[int, tuple[list, list]] = {}
         planes_cache: dict[int, list] = {}
 
-        def holes_for(meta):
+        def cylinders_for(meta):
             bid = meta["body_id"]
-            if bid not in holes_cache:
-                holes_cache[bid] = _holes_from_faces(_round_faces_for_body(cb, d, bid))
-            return holes_cache[bid]
+            if bid not in cyl_cache:
+                cyl_cache[bid] = _cylinders_from_faces(_round_faces_for_body(cb, d, bid))
+            return cyl_cache[bid]
 
         def planes_for(meta):
             bid = meta["body_id"]
@@ -543,19 +562,23 @@ def run_interface_check(
         all_findings: list[dict] = []
         pair_results: list[dict] = []
         for a, b in pairs_to_check:
-            a_holes, b_holes = holes_for(a), holes_for(b)
+            a_bores, a_bosses = cylinders_for(a)
+            b_bores, b_bosses = cylinders_for(b)
             checks = {}
+            # Hole-pattern registration is bore-to-bore across the interface.
             checks["hole_pattern"] = _check_hole_pattern(
-                a_holes, b_holes, pos_tol_mm, dia_tol_mm, all_findings,
+                a_bores, b_bores, pos_tol_mm, dia_tol_mm, all_findings,
                 a["id"], b["id"], a["name"], b["name"])
+            # Coaxiality is boss/shaft-in-bore (A's boss into B's bore and vice-versa).
             checks["coaxiality"] = _check_coaxiality(
-                a_holes, b_holes, coax_offset_tol_mm, coax_angle_tol_deg, all_findings,
-                a["id"], b["id"], a["name"], b["name"])
+                a_bosses, b_bores, b_bosses, a_bores, coax_offset_tol_mm, coax_angle_tol_deg,
+                all_findings, a["id"], b["id"], a["name"], b["name"])
             checks["contact_plane"] = _check_contact_plane(
-                cb, d, a["id"], b["id"], a["name"], b["name"],
+                a["id"], b["id"], a["name"], b["name"],
                 planes_for(a), planes_for(b), plane_angle_tol_deg, plane_gap_tol_mm, all_findings)
+            # Fastener pass-through is through the bore stack.
             checks["fastener_passthrough"] = _check_fastener_passthrough(
-                a_holes, b_holes, fastener, all_findings,
+                a_bores, b_bores, fastener, all_findings,
                 a["id"], b["id"], a["name"], b["name"])
             pair_results.append({"a": a["id"], "b": b["id"],
                                  "a_name": a["name"], "b_name": b["name"], "checks": checks})

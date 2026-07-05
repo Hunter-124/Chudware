@@ -27,6 +27,70 @@ REPO = Path(__file__).resolve().parent.parent
 APP_LLAMA = paths.LLAMACPP
 SERVER_NAMES = ("llama-server.exe", "server.exe", "llama-server", "server")
 
+# ---------------------------------------------------------------------------
+# GPU / build-variant selection (T-W31)
+#
+# The installed runtime at APP_LLAMA may carry per-variant build trees produced
+# from the pinned source checkout (tag b9860, commit fdb1db8 — see
+# services/agent/local_runtime.py LLAMA_CPP_PINNED_BUILD for provenance):
+#
+#   APP_LLAMA/build-cuda/bin/llama-server   GGML_CUDA=ON  (sm_86; T-W29 bench +
+#                                           integrator smoke: gemma3-4b-qat
+#                                           -ngl 99 -np 8 -c 32768 -> ~4.8 GB
+#                                           VRAM, 482 tok/s aggregate vs 332 CPU)
+#   APP_LLAMA/build/bin/llama-server        GGML_CUDA=OFF (CPU-only)
+#   APP_LLAMA/llama-server[.exe]            flat legacy layout (variant unknown)
+#
+# When an NVIDIA GPU is present the CUDA variant is preferred; otherwise the
+# CPU build is used (graceful fallback — a CUDA binary without a driver would
+# fail to load libggml-cuda). Detection is env-overridable for CI and users:
+#
+#   AICAD_LLAMA_VARIANT=cuda|cpu   force a variant (wins over detection)
+# ---------------------------------------------------------------------------
+
+_VARIANT_ENV = "AICAD_LLAMA_VARIANT"
+
+
+def cuda_available() -> bool:
+    """Best-effort NVIDIA GPU probe: ``nvidia-smi -L`` exits 0 and lists a GPU.
+
+    Env override: ``AICAD_LLAMA_VARIANT=cuda`` forces True, ``=cpu`` forces
+    False. Never raises; absence of the tool means no usable GPU.
+    """
+    forced = os.environ.get(_VARIANT_ENV, "").strip().lower()
+    if forced == "cuda":
+        return True
+    if forced == "cpu":
+        return False
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=5,
+        )
+        return out.returncode == 0 and "GPU" in (out.stdout or "")
+    except Exception:  # noqa: BLE001 - no nvidia-smi / sandbox / timeout
+        return False
+
+
+def _variant_dirs(base: Path, prefer_cuda: bool) -> list[Path]:
+    """Ordered server search dirs for *base* given the GPU preference."""
+    cuda_bin = base / "build-cuda" / "bin"
+    cpu_bin = base / "build" / "bin"
+    if prefer_cuda:
+        return [cuda_bin, cpu_bin, base]
+    return [cpu_bin, base]
+
+
+def server_variant(server: Path | None) -> str:
+    """Classify a discovered server binary path: ``cuda`` | ``cpu`` | ``unknown``."""
+    if server is None:
+        return "unknown"
+    parts = {p.name for p in server.parents}
+    if "build-cuda" in parts:
+        return "cuda"
+    if "build" in parts:
+        return "cpu"
+    return "unknown"
+
 
 def _expand_path(value: object) -> Path:
     """Expand user/env vars before turning config text into a filesystem path."""
@@ -54,12 +118,22 @@ def _candidate_model_dirs(bundle_dir: Path | None = None) -> list[Path]:
     return bases
 
 
-def find_server(root: Path | None = None) -> Path | None:
+def find_server(root: Path | None = None, *, prefer_cuda: bool | None = None) -> Path | None:
+    """Locate a llama-server binary under *root* (default: the installed runtime).
+
+    Searches the per-variant build trees first (``build-cuda/bin`` when an
+    NVIDIA GPU is present, else ``build/bin``), then the flat legacy layout.
+    *prefer_cuda* overrides GPU auto-detection (used by tests / callers that
+    already probed).
+    """
     base = root or APP_LLAMA
-    for name in SERVER_NAMES:
-        p = base / name
-        if p.exists():
-            return p
+    if prefer_cuda is None:
+        prefer_cuda = cuda_available()
+    for d in _variant_dirs(base, prefer_cuda):
+        for name in SERVER_NAMES:
+            p = d / name
+            if p.exists():
+                return p
     return None
 
 
@@ -96,6 +170,8 @@ def status() -> dict:
         "root": str(APP_LLAMA),
         "installed": server is not None,
         "server": str(server) if server else "",
+        "variant": server_variant(server),
+        "cuda_available": cuda_available(),
         "models_dir": str(paths.MODELS),
         "default_model": str(model) if model else "",
     }
@@ -113,7 +189,15 @@ def _http_models_ready(base_url: str) -> bool:
 def ensure_server_running(cfg: dict | None = None) -> dict:
     """Ensure the configured llama.cpp server is reachable, launching it if configured.
 
-    cfg keys: base_url, server_path, model_path, auto_start, port, host, ctx_size, gpu_layers.
+    cfg keys: base_url, server_path, model_path, auto_start, port, host, ctx_size,
+    gpu_layers, parallel, startup_timeout_sec.
+
+    Variant-aware defaults (T-W31): when the discovered binary is the CUDA build
+    and the caller did not set them, ``gpu_layers`` defaults to 99 (full offload)
+    and ``parallel``/``ctx_size`` default to 8/32768 — the exact configuration the
+    integrator smoke verified on the RTX 3080 Ti (health ok, ~4.8 GB VRAM, GBNF
+    valid, 482 tok/s aggregate; see benchmarks/tokenmaxx/REPORT.md + T-W31 notes).
+    Explicit cfg values always win (T-W28 user-override discipline).
     """
     cfg = cfg or {}
     host = str(cfg.get("host") or "127.0.0.1")
@@ -147,15 +231,36 @@ def ensure_server_running(cfg: dict | None = None) -> dict:
             f"a .gguf file in {paths.MODELS}."
         )
 
+    variant = server_variant(server)
+    ctx_size = cfg.get("ctx_size")
+    gpu_layers = cfg.get("gpu_layers")
+    parallel = cfg.get("parallel")
+    if variant == "cuda":
+        # Shipped CUDA defaults = the integrator-verified smoke configuration
+        # (b9860 build-cuda, -ngl 99 -np 8 -c 32768). User cfg wins when set.
+        if gpu_layers is None:
+            gpu_layers = 99
+        if parallel is None and ctx_size is None:
+            parallel, ctx_size = 8, 32768
+
     args = [str(server), "--host", host, "--port", str(port), "--model", str(model)]
-    if cfg.get("ctx_size"):
-        args += ["--ctx-size", str(int(cfg["ctx_size"]))]
-    if cfg.get("gpu_layers") is not None:
-        args += ["--n-gpu-layers", str(int(cfg["gpu_layers"]))]
+    if ctx_size:
+        args += ["--ctx-size", str(int(ctx_size))]
+    if gpu_layers is not None:
+        args += ["--n-gpu-layers", str(int(gpu_layers))]
+    if parallel:
+        args += ["--parallel", str(int(parallel))]
 
     log_dir = paths.ROOT / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log = open(log_dir / "llamacpp-server.log", "ab")
+    # Provenance line so the log always records which variant/offload was chosen.
+    log.write(
+        (f"[ai-cad] launching llama-server variant={variant} "
+         f"n_gpu_layers={gpu_layers} parallel={parallel} ctx_size={ctx_size} "
+         f"server={server}\n").encode()
+    )
+    log.flush()
     subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, cwd=str(server.parent),
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
@@ -163,7 +268,10 @@ def ensure_server_running(cfg: dict | None = None) -> dict:
     while time.time() < deadline:
         if _http_models_ready(base_url):
             return {"status": "ready", "base_url": base_url, "launched": True,
-                    "server": str(server), "model": str(model)}
+                    "server": str(server), "model": str(model),
+                    "variant": variant,
+                    "n_gpu_layers": gpu_layers, "parallel": parallel,
+                    "ctx_size": ctx_size}
         time.sleep(0.25)
     raise RuntimeError(
         f"llama.cpp server was launched but did not become ready at {base_url}. "

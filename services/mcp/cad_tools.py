@@ -883,6 +883,13 @@ WORKFLOW
                                             (coincident/horizontal/parallel/tangent/...) + DRIVING
                                             DIMENSIONS, not loose geometry; check_sketch("s1")
                                             reports dof + conflicts so you can reach fully-defined.
+     preflight_ops(ops)                     OPTIONAL but recommended before big edits: dry-runs
+                                            the planned ops on a shadow clone — checks dangling
+                                            refs, impossible fillets, hole-through-nothing, and
+                                            downstream feature breaks — WITHOUT touching the live
+                                            doc. Returns aicad.preflight/1 with advisory_items.
+                                            A fail verdict is advisory (never blocks); add_features
+                                            runs preflight automatically (AI_CAD_PREFLIGHT=1).
   3. render_part()                          SEE it — an annotated, colour-coded image (faces
                                             tinted + labelled TOP/FRONT/RIGHT...). Self-review
                                             against the request; iterate add_features to fix.
@@ -1540,6 +1547,16 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 before_hist = _face_hist(d)
                 before_vol = _LAST_VOLUME.get(d)
 
+                # T-W12 auto-preflight: dry-run on shadow clone before mutating.
+                # Freedom rule: fail verdict never blocks — we proceed regardless;
+                # if verdict==fail we log a preflight_overridden event after apply.
+                _pf_result: dict = {}
+                try:
+                    from services.mcp.preflight_tools import run_auto_preflight
+                    _pf_result = run_auto_preflight(d, "add_features", ops)
+                except Exception:  # noqa: BLE001
+                    pass
+
                 r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
                 fs = (r.get("rebuild") or {}).get("feature_status", [])
                 feats = [{"id": s.get("id"), "ok": s.get("ok"),
@@ -1642,6 +1659,19 @@ def register_cad_tools(mcp: FastMCP) -> None:
                     if pub:
                         out["shown_in_app"] = True
                     _autosave(d)  # persist so a server restart can recover this doc
+                # T-W12: attach preflight advisory items and log override event.
+                if _pf_result:
+                    adv_items = _pf_result.get("advisory_items") or []
+                    if adv_items:
+                        out["preflight_advisory"] = adv_items
+                    pf_verdict = _pf_result.get("verdict", "skipped")
+                    if pf_verdict == "fail":
+                        # Applied despite failed preflight — log audit trigger (§11).
+                        try:
+                            from services.mcp.preflight_tools import log_preflight_override
+                            log_preflight_override(d, "add_features", _pf_result)
+                        except Exception:  # noqa: BLE001
+                            pass
                 return out
 
             if background:

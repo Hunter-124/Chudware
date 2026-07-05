@@ -224,6 +224,15 @@ add("boolean_cut", "structural", "single", ("boolean",),
      feat("cylinder", "B", {"radius": dim(8), "height": dim(50), "merge": False})],
     [feat("boolean", "Cut", {"op": "cut", "a": "f1", "b": "f2"})],
     expect_vol="<", expect_bodies=1)
+add("boolean_fuse_touching_face", "structural", "single", ("boolean",),
+    [feat("box", "A", {"length": dim(10), "width": dim(10), "height": dim(10)}),
+     feat("box", "B", {"length": dim(10), "width": dim(10), "height": dim(10),
+                       "at": [10, 0, 0], "merge": False})],
+    [feat("boolean", "Fuse", {"op": "fuse", "a": "f1", "b": "f2"})],
+    expect_vol="==", expect_bodies=1,
+    note="the T-BL30 disjoint-fuse invariant's boundary: two boxes sharing an exact "
+         "coincident face (no overlap, no gap) is NOT disjoint — must weld into ONE "
+         "solid (full combined volume), not be rejected")
 # intent
 add("hole_simple", "intent", "single", ("hole",), seed_plate(),
     [feat("hole", "Hl", {"style": "simple", "end": "through_all", "diameter": dim(6)},
@@ -451,8 +460,15 @@ add("nc_disjoint_fuse", "negative", "negative", ("boolean",),
                        "at": [100, 0, 0], "merge": False})],
     [feat("boolean", "F", {"op": "fuse", "a": "f1", "b": "f2"})],
     expect_rebuild=False, expect_manifold=None,
-    xfail="GH#disjoint-fuse",
-    note="documented contract: disjoint fuse must fail; engine returns ok+2 bodies (BUG)")
+    note="documented contract: disjoint fuse must fail (issue #8, fixed by T-BL30)")
+add("nc_disjoint_cut", "negative", "negative", ("boolean",),
+    [feat("box", "A", {"length": dim(100), "width": dim(10), "height": dim(10)}),
+     feat("box", "B", {"length": dim(20), "width": dim(20), "height": dim(20),
+                       "merge": False})],
+    [feat("boolean", "F", {"op": "cut", "a": "f1", "b": "f2"})],
+    expect_rebuild=False, expect_manifold=None,
+    note="a full-cross-section tool slicing a body into two disconnected remnants must fail "
+         "(same disjoint-result invariant as nc_disjoint_fuse, T-BL30)")
 
 
 # --------------------------------------------------------------------------- engine glue

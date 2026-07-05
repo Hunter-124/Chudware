@@ -20,6 +20,7 @@
 #include "imgui.h"
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -83,8 +84,13 @@ namespace {
 
 void drawTile(app::AppState& s, int idx) {
     const float S = theme::S();
-    const auto& t = gModel.tiles[idx];
+    // T-DP13: mutable ref so we can tick spinT each frame.
+    auto& t = gModel.tiles[idx];
+    const bool building = (t.node_status == "building");
     ImGui::PushID(idx);
+
+    // T-DP13: tick spinner accumulator for live activity animation.
+    if (building) t.spinT += ImGui::GetIO().DeltaTime;
 
     const float tileW = ImGui::GetContentRegionAvail().x;
     const ImVec2 mn = ImGui::GetCursorScreenPos();
@@ -110,14 +116,35 @@ void drawTile(app::AppState& s, int idx) {
         ImGui::TextColored(TVEC(txt2), "(no render yet)");
     }
 
-    // Title.
+    // Title row.
     ImGui::TextUnformatted(t.title.empty() ? t.doc_id.c_str() : t.title.c_str());
 
-    // Chips row: status badge, owner, model, lease.
-    ImGui::TextColored(statusColor(t.node_status), "%s", t.node_status.c_str());
-    ImGui::SameLine();
+    // T-DP13: live activity indicator row — spinning arc + "building…" text when
+    // node_status == "building".  Reuses the same spinning-arc vocabulary as
+    // agent_panel.cpp drawActionCard (ActionStatus::Running).
+    if (building) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float arcR = 6.f * S;
+        ImVec2 cp = ImGui::GetCursorScreenPos();
+        cp.x += arcR + 2.f * S;
+        cp.y += arcR + 1.f * S;
+        const float angle = t.spinT * 3.8f;
+        dl->PathClear();
+        dl->PathArcTo(cp, arcR, angle, angle + 4.2f, 12);
+        dl->PathStroke(TCOL(accent), 0, 2.f * S);
+        ImGui::Dummy(ImVec2(arcR * 2.f + 4.f * S, arcR * 2.f + 2.f * S));
+        ImGui::SameLine(0, 6.f * S);
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(TCOL(accent)), "building\xe2\x80\xa6");
+    }
+
+    // Chips row: owner, model, lease — status badge shown only when not actively building
+    // (the spinning arc + "building…" text above already communicates that state).
+    if (!building) {
+        ImGui::TextColored(statusColor(t.node_status), "%s", t.node_status.c_str());
+        ImGui::SameLine();
+    }
     ImGui::TextColored(TVEC(accent), "%s", t.owner.c_str());
-    ImGui::TextColored(TVEC(txt2), "%s · %s lease", t.model.c_str(), t.lease.c_str());
+    ImGui::TextColored(TVEC(txt2), "%s  \xc2\xb7  %s lease", t.model.c_str(), t.lease.c_str());
 
     // Click-through button spanning the tile.
     if (ImGui::Button("Open doc", ImVec2(-1, 0))) {

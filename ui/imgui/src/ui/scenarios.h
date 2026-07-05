@@ -72,6 +72,9 @@ struct ShotConfig {
     bool agentInspectorShotDone = false;
     bool wantWatchGrid = false;             // 3-part workspace fixture
     bool watchGridShotDone = false;
+    // T-DP13: multi-file agent view — 2 docs under concurrent agent work (fixture-seeded).
+    bool wantAgentMultifile = false;
+    bool agentMultifileShotDone = false;
     bool wantAgentSettings = false;         // valid routing view
     bool wantAgentSettingsError = false;    // validation-error routing view
     bool agentSettingsShotDone = false;

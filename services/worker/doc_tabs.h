@@ -27,6 +27,14 @@ struct DocTab {
     std::string ecadDocId;
     int ecadRevision = -1;
 
+    // T-DP13: per-tab agent attribution + live activity state.
+    // agentRunning drives the live dot/spinner in doc_tabs.cpp drawOneTab().
+    // agentOwner/agentModel are set from workspace_status events (aicad.workspace/1).
+    bool        agentRunning = false;   // true while an agent holds a write lease on this doc
+    std::string agentOwner;             // role name, e.g. "feature_modeler"
+    std::string agentModel;             // model slug, e.g. "qwen2.5-coder-7b"
+    float       agentSpinT = 0.f;       // spinner animation time (seconds, per-tab)
+
     std::string displayTitle() const;
 };
 

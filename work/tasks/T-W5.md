@@ -8,7 +8,7 @@ branch: task/T-W5-advisory-engine
 depends_on: [T-W1]
 lane: ai-copilot
 kind: new
-priority: 2
+priority: 1
 ---
 
 ## Context
@@ -79,3 +79,15 @@ the hot path.
   OUT of scope (future task).
 - T-W2/T-W3 may merge mid-task: integrate via their contract shapes, feature-flag the
   candidate-fix providers individually.
+
+## Scope update 2026-07-04 (in-app pivot — Hunter directive)
+
+Priority raised to 1: the in-app copilot harness (services/agent + GUI) is the sole
+integration target for this task. Changes vs the original spec:
+- SKIP the MCP freshness rule steps (server instructions, cad_guide topics, manual
+  regen) — external MCP surface polish is parked in T-W20 (deferred batch task).
+- Registering tools with the MCP server is OPTIONAL — do it only when it is one
+  decorator on the same function and costs nothing; never let it drive design.
+- Acceptance = the capability working through the IN-APP path (services/agent hosts,
+  loop.py / dag runner / pipeline), proven by python tests. graphify update . still
+  required (that serves our own agents).

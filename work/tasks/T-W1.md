@@ -3,7 +3,7 @@ id: T-W1
 title: Design ledger - persistent mission state with budgeted rendering (aicad.ledger/1)
 workstream: W
 owner: sonnet-loam
-status: review
+status: done
 branch: task/T-W1-design-ledger
 depends_on: []
 lane: ai-copilot

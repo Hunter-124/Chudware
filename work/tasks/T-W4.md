@@ -8,7 +8,7 @@ branch: task/T-W4-calculators
 depends_on: [T-W3]
 lane: ai-copilot
 kind: new
-priority: 3
+priority: 1
 ---
 
 ## Context
@@ -69,3 +69,15 @@ live geometry, so models receive computed numbers ("thread engagement needed: 9 
 - materials.json fields: E_mpa, nu, density_g_cm3, yield_mpa, ultimate_mpa,
   endurance_mpa (engine_oracle/sim/materials.json).
 - Keep each calc pure + stdlib/numpy only; no LLM anywhere in this task.
+
+## Scope update 2026-07-04 (in-app pivot — Hunter directive)
+
+Priority raised to 1: the in-app copilot harness (services/agent + GUI) is the sole
+integration target for this task. Changes vs the original spec:
+- SKIP the MCP freshness rule steps (server instructions, cad_guide topics, manual
+  regen) — external MCP surface polish is parked in T-W20 (deferred batch task).
+- Registering tools with the MCP server is OPTIONAL — do it only when it is one
+  decorator on the same function and costs nothing; never let it drive design.
+- Acceptance = the capability working through the IN-APP path (services/agent hosts,
+  loop.py / dag runner / pipeline), proven by python tests. graphify update . still
+  required (that serves our own agents).

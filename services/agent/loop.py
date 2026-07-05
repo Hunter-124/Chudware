@@ -965,6 +965,10 @@ def run_turn(session: Session, request: str, provider: Provider,
     # Role card seam (T-W7): a single-role run applies the named role card's system
     # prompt + tool allowlist for the whole turn. Best-effort — an unknown role or a
     # missing roles module leaves the default behaviour intact (never breaks a run).
+    # NOTE: the allowlist policy is process-global (services/mcp/tool_registry) and is
+    # left pinned to this role after the run — intended for a one-shot role-scoped run.
+    # The DAG node runner (services/dag/node_runner) re-applies per node, so multi-role
+    # missions never inherit a stale policy from here.
     if role:
         try:
             from services.agent import roles as _roles

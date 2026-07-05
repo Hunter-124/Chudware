@@ -93,7 +93,10 @@ def _apply(state: dict, event: dict) -> dict:
         dim_id = payload.get("id")
         state_entry = {k: v for k, v in payload.items()
                        if k in ("id", "name", "value", "unit", "driver",
-                                "tolerance", "status", "confirmed_by", "refs")}
+                                "tolerance", "status", "confirmed_by", "refs",
+                                # §21 additive fields — derivation DAG + linking
+                                "derived_from", "derivation", "linked",
+                                "cited_by_departments")}
         existing = next((d for d in state["dimensions"] if d["id"] == dim_id), None)
         if existing:
             existing.update(state_entry)
@@ -234,21 +237,52 @@ class Ledger:
                          tolerance: dict | None = None,
                          status: str = "proposed",
                          confirmed_by: str | None = None,
-                         refs: dict | None = None) -> dict:
-        """Append a dimension event.  ``provenance`` is required (contract rule)."""
+                         refs: dict | None = None,
+                         # §21 additive fields
+                         derived_from: list[str] | None = None,
+                         derivation: str | None = None,
+                         linked: dict | None = None,
+                         cited_by_departments: list[str] | None = None) -> dict:
+        """Append a dimension event.  ``provenance`` is required (contract rule).
+
+        §21: if *status* is ``'derived'`` or *derivation* is provided and
+        *derived_from* is empty, a provenance-violation warning is attached to the
+        event payload (overseer audit trigger on repeat) — but the write still
+        succeeds (validator warns, does not block).
+        """
         if not provenance:
             raise ValueError(
                 f"dimension {dim_id!r}: provenance is required "
                 "(must be: tool result / calc / table / user answer)"
             )
-        return self.append(actor, "dimension", {
+        payload: dict = {
             "id": dim_id, "name": name, "value": value, "unit": unit,
             "driver": driver, "tolerance": tolerance or {},
             "status": status, "confirmed_by": confirmed_by,
             "refs": refs or {},
             # provenance lives in the event payload for audit; not in materialized state
             "provenance": provenance,
-        })
+        }
+        # §21 additive fields — only set when provided to keep events lean
+        if derived_from is not None:
+            payload["derived_from"] = derived_from
+        if derivation is not None:
+            payload["derivation"] = derivation
+        if linked is not None:
+            payload["linked"] = linked
+        if cited_by_departments is not None:
+            payload["cited_by_departments"] = cited_by_departments
+
+        # §21 provenance-violation warning: derived dim without derived_from refs
+        is_derived = (status == "derived") or bool(derivation)
+        has_refs = bool(derived_from)
+        if is_derived and not has_refs:
+            payload["_provenance_warning"] = (
+                f"dimension {dim_id!r} is derived but has no derived_from refs — "
+                "provenance violation (overseer audit trigger on repeat)"
+            )
+
+        return self.append(actor, "dimension", payload)
 
     def add_question(self, actor: str, question_id: str, text: str,
                      blocking: bool = False) -> dict:

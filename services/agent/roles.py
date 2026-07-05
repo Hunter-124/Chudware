@@ -32,9 +32,10 @@ Design notes locked with the advisor:
   * ``$ref`` (e.g. ``aicad.deliverables/1``) has no loadable JSON-Schema file — the
     schemas live as prose examples in the contract. The GBNF emitter treats an
     unresolved ``$ref`` as an opaque JSON object node (permissive); it never crashes.
-  * The only allowlist tools that do not yet resolve are ``delegate`` and
-    ``workspace_status`` (land with sibling W tasks). ``validate_role`` reports them
-    as feature-flagged, not as errors.
+  * ``delegate`` is now a real registered tool (T-W14 landed,
+    services/mcp/delegation_tools.py). ``workspace_status`` and the org-layer tools
+    (channel_send, request_resolve, council_convene) remain feature-flagged until
+    their sibling W tasks land.
 """
 from __future__ import annotations
 
@@ -64,10 +65,12 @@ STAGES = (
 MAX_TOOLS_PER_ROLE = 14
 
 # Allowlist tools that do not yet resolve to a registered MCP tool — they land with
-# sibling W tasks (delegation tree T-W14, workspace status). Reported by the loader
-# as feature-flagged rather than as errors, so the 13 authored cards load cleanly.
+# sibling W tasks (workspace status T-W23+). Reported by the loader as feature-flagged
+# rather than as errors, so the authored cards load cleanly.
+# NOTE: ``delegate`` was removed from this set when T-W14 landed
+# (services/mcp/delegation_tools.py registers it in the catalog).
 FEATURE_FLAGGED_TOOLS = frozenset({
-    "delegate",  # lands with T-W14
+    # delegate (T-W14) and workspace_status (T-W16) are registered now.
     # org layer (land with T-W22/T-W23)
     "channel_send", "request_resolve", "council_convene",
 })

@@ -10,8 +10,8 @@ Covers the T-W7 Definition of Done:
   - the GBNF emitter produces a grammar that PARSES a valid handoff and rejects a
     malformed one (proven with a self-contained GBNF acceptor — no new dependency);
   - the sketch_profile playbook matches docs/ADVISOR_ARCHITECTURE.md §2.4;
-  - the only feature-flagged (not-yet-registered) allowlist tools are delegate and
-    workspace_status.
+  - ``delegate`` is now registered (T-W14); the remaining feature-flagged tools are
+    workspace_status and the org-layer tools (channel_send, request_resolve, council_convene).
 
 Runs headless: no FastMCP, no libaicad, no network, no LLM. The tool catalog is
 built by registering the MCP tool modules against a stub (the same pattern
@@ -327,8 +327,8 @@ class TestLoadAndValidate(unittest.TestCase):
         findings = roles.validate_suite(tool_names=_CATALOG)
         flagged = {f.message.split("'")[1] for f in roles.flags(findings)
                    if "not yet registered" in f.message}
-        self.assertEqual(flagged, {"delegate",
-                                   "channel_send", "request_resolve", "council_convene"})
+        # delegate (T-W14) and workspace_status (T-W16) are registered now.
+        self.assertEqual(flagged, {"channel_send", "request_resolve", "council_convene"})
 
     def test_allowlists_within_cap(self):
         for card in roles.load_all_roles().values():

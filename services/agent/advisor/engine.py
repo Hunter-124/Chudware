@@ -254,9 +254,16 @@ def _finding_to_item(seq: int, stage: str, f: Finding) -> dict:
 def build_advisory(obs: Observation) -> dict:
     """Convert a normalized :class:`Observation` into an aicad.advisory/1 block.
 
-    Returns ``{schema, seq, stage, items, user_override}``.  ``items`` is the
-    materialized list (renderer applies the token budget + drop policy).  Items
-    are sorted highest-severity-first so the renderer drops from the tail.
+    Returns ``{schema, seq, stage, items, user_override, failure_cards}``.
+    ``items`` is the materialized list (renderer applies the token budget + drop
+    policy).  Items are sorted highest-severity-first so the renderer drops from
+    the tail.
+
+    ``failure_cards`` (T-W8): blocker-severity items are promoted to
+    ``aicad.failure/1`` cards via :func:`failures.promote_advisory_blockers`.
+    Cards are returned in the advisory block and are also available via
+    :func:`build_advisory` for harness dispatch.  Non-blocker advisories are
+    NOT promoted — they remain advisory items only.
     """
     items = [_finding_to_item(obs.seq, obs.stage, f) for f in obs.findings]
 
@@ -268,13 +275,25 @@ def build_advisory(obs: Observation) -> dict:
 
     items.sort(key=lambda it: -SEVERITY_ORDER.get(it["severity"], 0))
 
-    return {
+    advisory = {
         "schema": SCHEMA,
         "seq": obs.seq,
         "stage": obs.stage,
         "items": items,
         "user_override": obs.user_override,
     }
+
+    # T-W8: promote blocker advisories to failure cards (harness-owned).
+    # Import locally to avoid circular import (failures.py imports nothing from engine.py).
+    try:
+        from .failures import promote_advisory_blockers
+        advisory["failure_cards"] = promote_advisory_blockers(
+            advisory, stage=obs.stage
+        )
+    except Exception:  # noqa: BLE001
+        advisory["failure_cards"] = []
+
+    return advisory
 
 
 def max_severity(advisory: dict) -> str:

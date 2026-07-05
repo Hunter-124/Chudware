@@ -1299,7 +1299,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             return ("Reverse-engineering guide ships with the recon tools (wave 3); use "
                     "import_part + describe_part + compare workflow meanwhile.")
     if topic in ("requirements", "req", "req_create", "req_update", "req_status", "req_report",
-                 "brief", "design_brief"):
+                 "brief", "design_brief", "layout_plan", "layout", "critical_dim"):
         return (
             "REQUIREMENTS (aicad.req/1) — design-brief CRUD + markdown projection\n\n"
             "Schema: contracts/requirements.md  |  Engine: engine_oracle/requirements/\n\n"
@@ -1320,7 +1320,38 @@ def cad_guide_text(topic: str = "overview") -> str:
             "with a source='battery' evidence ref — closing idea → requirement → proof.\n\n"
             "BIAS: capture requirements BEFORE modeling — req_create at project start, then\n"
             "reference req_id in every verify_battery call so the battery knows what to check.\n"
-            "A requirement without a verifier is aspirational; wire them up."
+            "A requirement without a verifier is aspirational; wire them up.\n\n"
+            "LAYOUT-FIRST — MANDATORY before any modeling (T-BL50):\n"
+            "  layout_plan(doc_id,\n"
+            "              envelope_x_mm, envelope_y_mm, envelope_z_mm,\n"
+            "              critical_dims=[{param, value, unit, tol_plus, tol_minus, why, verify_by},...],\n"
+            "              interfaces=[{id, desc, verify_by},...],\n"
+            "              note='intent summary')\n\n"
+            "  Call layout_plan() FIRST — before add_features — to record:\n"
+            "    - Overall bounding envelope (x/y/z mm)\n"
+            "    - Critical dimensions: value + tolerance + why-critical (each becomes a req)\n"
+            "    - Component interfaces: what mates to what, via which features\n\n"
+            "  Each entry becomes an aicad.req/1 requirement (kind=dimensional or interface)\n"
+            "  visible in req_report and checked by the coverage gate at sign-off.\n\n"
+            "  layout_plan_report(doc_id)  — human-readable coverage state per dim/interface.\n\n"
+            "COVERAGE GATE — mandatory before declaring done:\n"
+            "  design_review(doc_id, checks=['layout_coverage', ...])\n"
+            "    WARN/FAIL if any critical dim or interface has no verification evidence.\n"
+            "    Passes when every critical dim has status=verified+evidence, user_confirmed,\n"
+            "    or waived. An agent finishing a part with an unverified critical dim gets\n"
+            "    WARN/FAIL — not silence.\n\n"
+            "What counts as evidence per dim type:\n"
+            "  dimensional  → measure_between, measure_part, query_geometry, confirm_dimensions,\n"
+            "                  run_fea_static/modal, fit_report\n"
+            "  interface    → check_interference, solve_mates, measure_between, fit_report,\n"
+            "                  interface_check (T-BL49, when available)\n\n"
+            "FULL LOOP:\n"
+            "  1. layout_plan(doc_id, ...)           capture before modeling\n"
+            "  2. add_features(...)                  model to the plan\n"
+            "  3. measure_between(...) / req_status(requirement_id, 'verified', evidence=[...])\n"
+            "                                        record evidence as each dim is confirmed\n"
+            "  4. design_review(doc_id, ['layout_coverage'])  gate before done\n"
+            "  5. verify_battery(doc_id)             final battery\n"
         )
     if topic in ("dag", "dag_plan", "dag_run", "dag_status", "dag_approve", "dag_abort",
                  "dag_replan", "orchestrate", "mission", "project_run", "workflow"):

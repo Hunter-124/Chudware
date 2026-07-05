@@ -3,7 +3,7 @@ id: T-BL50
 title: Layout-first planning helper — critical-dimension & interface capture up front, with a coverage gate so the AI can't miss critical dims
 workstream: backlog
 owner: sonnet-rush
-status: doing
+status: review
 priority: 2
 lane: ai-copilot
 kind: new
@@ -69,3 +69,12 @@ modeling, and nothing GATES a design review on that capture being covered.
   wiring, in flight).
 
 ## Progress log
+
+- 2026-07-04T00:00:00Z sonnet-rush: Implemented. layout_plan_tools.py (new MCP tools
+  layout_plan + layout_plan_report), _gap_layout_coverage in battery.py (additive),
+  layout_coverage wired into design_review_tools.py, dag_planner.md Rule 11 added,
+  cad_guide_text requirements/layout_plan topic updated, server.py registration.
+  15 tests in test_layout_plan.py, all green. gate.sh PASS. graphify update done.
+  Seam: battery.py edits additive only (T-BL09/vetch safe). T-BL49/opus-gill join
+  point: add "interface_check" to _INTERFACE_VERIFIERS in layout_plan_tools.py when
+  tool lands.

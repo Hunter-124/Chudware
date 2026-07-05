@@ -98,6 +98,7 @@ _ALL_CHECKS = [
     "firmware",
     "dc_ratio",
     "budget",
+    "layout_coverage",  # T-BL50: critical-dim & interface coverage gate
 ]
 
 # Checks that use DISPATCH_TABLE directly
@@ -105,6 +106,9 @@ _DISPATCH_CHECKS = ["interference", "erc", "drc", "firmware", "dc_ratio", "budge
 
 # Checks handled via direct battery._get_fn calls
 _DIRECT_CHECKS = ["feature_overlap", "dfm", "interface_check"]
+
+# Checks handled via battery GAP_FNS (gap verifiers implemented directly in battery.py)
+_GAP_CHECKS = ["layout_coverage"]
 
 
 def _run_design_review(
@@ -141,6 +145,8 @@ def _run_design_review(
                                                        doc_id, doc_path, target_budget)
         elif check_name in _DISPATCH_CHECKS:
             results[check_name] = _call_dispatch_check(check_name, doc_id, doc_path, target_budget)
+        elif check_name in _GAP_CHECKS:
+            results[check_name] = _call_gap_check(check_name, doc_id)
         else:
             results[check_name] = _call_direct_check(check_name, doc_id)
 
@@ -201,6 +207,32 @@ def _call_requirement_check(
         return {"status": "done", "passed": False, "result": data.get("tool_result")}
     return {"status": "error", "reason": output_state.get("summary", reason),
             "passed": False, "result": data.get("tool_result")}
+
+
+def _call_gap_check(check_name: str, doc_id: Optional[str]) -> dict[str, Any]:
+    """Call a GAP_FNS verifier directly from battery (layout_coverage and similar).
+
+    GAP verifiers live in battery.GAP_FNS — they are pure Python functions that call
+    core_bridge directly, not tool-manager functions.  We look them up via the CHECKS
+    registry to find the fn_name key, then call GAP_FNS[fn_name] directly.
+    """
+    try:
+        from services.verify.battery import CHECKS, GAP_FNS
+    except ImportError as exc:
+        return {"status": "unavailable", "reason": f"battery module unavailable: {exc}"}
+
+    if check_name not in CHECKS:
+        return {"status": "unavailable", "reason": f"unknown gap check: {check_name!r}"}
+
+    _, fn_name, _, _, reward_shape = CHECKS[check_name]
+    fn = GAP_FNS.get(fn_name)
+    if fn is None:
+        return {"status": "unavailable", "reason": f"GAP_FNS missing fn {fn_name!r}"}
+
+    def default_pred(r: dict) -> bool:
+        return bool(r.get("ok", False))
+
+    return _invoke_tool(check_name, lambda **kw: fn(doc_id=doc_id, **kw), {}, default_pred)
 
 
 def _call_dispatch_check(
@@ -384,6 +416,7 @@ _CHECK_LABELS: dict[str, str] = {
     "firmware":        "Firmware simulation assertions",
     "dc_ratio":        "Structural DC-ratio",
     "budget":          "BOM budget check",
+    "layout_coverage": "Layout coverage (critical dims & interfaces)",  # T-BL50
 }
 
 
@@ -508,6 +541,13 @@ def _narrate(
 
 def _check_detail_pass(check_name: str, result: dict) -> str:
     """One-line pass detail narrated verbatim from result keys."""
+    if check_name == "layout_coverage":
+        covered = result.get("covered", 0)
+        total = result.get("total", 0)
+        note = result.get("note", "")
+        if total == 0:
+            return f"no critical dims/interfaces on file — {note}  (source: layout_plan meta)"
+        return f"{covered}/{total} critical dim(s)/interface(s) verified  (source: layout_plan meta)"
     if check_name == "interference":
         n = len(result.get("interferences", []))
         return f"0 interference pairs (source: check_interference.interferences)"
@@ -550,6 +590,16 @@ def _check_detail_pass(check_name: str, result: dict) -> str:
 
 def _check_detail_fail(check_name: str, result: dict) -> str:
     """One-line fail detail narrated verbatim from result keys."""
+    if check_name == "layout_coverage":
+        covered = result.get("covered", 0)
+        total = result.get("total", 0)
+        uncovered = result.get("uncovered", [])
+        ids = ", ".join(u.get("id", "?") for u in uncovered[:3])
+        more = f" + {len(uncovered) - 3} more" if len(uncovered) > 3 else ""
+        return (
+            f"{total - covered}/{total} critical dim(s)/interface(s) unverified: "
+            f"{ids}{more}  (source: layout_plan meta)"
+        )
     if check_name == "interference":
         items = result.get("interferences", [])
         n = len(items)

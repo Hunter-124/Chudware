@@ -206,6 +206,41 @@ def test_distinct_blockers_do_not_escalate(tmp_path):
     assert not o.audit("stage_exit", AuditScope(run_id="run_d", stage="assembly")).escalated
 
 
+def test_repeat_blocker_escalates_across_fresh_overseers(tmp_path):
+    # THE in-app path: audit_now builds a FRESH Overseer per call. The blocker
+    # counter must survive across calls (rehydrated from the persisted ledger),
+    # else escalation-at-2 can never fire through a real call site.
+    lpath = tmp_path / "run_rehydrate.ledger.json"
+    scope = {"stage": "feature", "roles": ["feature_modeler"]}
+
+    def _one_call():
+        from services.agent.advisor import overseer_tools as ot
+        prov = _CannedProvider([_blocker_audit()])   # same finding each time
+        return ot.audit_now("run_rehydrate", scope, trigger="stage_exit",
+                            providers={"mock": prov}, ledger_path=lpath)
+
+    r1 = _one_call()
+    assert not r1["escalated"], "first fresh-Overseer blocker must not escalate"
+    r2 = _one_call()
+    assert r2["escalated"], "second call (fresh Overseer) must escalate via ledger rehydration"
+    assert "human" in r2["escalation_text"].lower()
+
+
+def test_prior_findings_rehydrated_into_evidence(tmp_path):
+    # The "you already flagged X" dedupe must survive fresh-Overseer-per-call: a
+    # second audit's prompt should carry the first audit's fingerprint.
+    ledger = Ledger("run_prior", tmp_path / "ledger.json")
+    o1 = Overseer(provider=_CannedProvider([_blocker_audit()]),
+                  role_card={"system_prompt": "audit."}, ledger=ledger)
+    o1.audit("stage_exit", AuditScope(run_id="run_prior", stage="feature"))
+    # Fresh Overseer, new provider — its evidence must include the prior audit.
+    prov2 = _CannedProvider([_ok_audit()])
+    o2 = Overseer(provider=prov2, role_card={"system_prompt": "audit."}, ledger=ledger)
+    o2.audit("stage_exit", AuditScope(run_id="run_prior", stage="assembly"))
+    user_msg = prov2.calls[0][1][0]["content"]
+    assert "PRIOR-FINDINGS" in user_msg, "prior audits must be surfaced to a fresh Overseer"
+
+
 # ---------------------------------------------------------------------------
 # Verdicts → advisory items (source.kind == "llm"), token logging, ledger event
 # ---------------------------------------------------------------------------

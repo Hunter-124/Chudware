@@ -537,6 +537,40 @@ class Overseer:
         self._seen_triggers: set[str] = set()
         # Repeat-blocker counter, keyed by verdict fingerprint.
         self._blocker_counts: dict[str, int] = {}
+        # Rehydrate the blocker counter from persisted audits.  CRITICAL: the in-app
+        # entry points build a FRESH Overseer per call (audit_now / the dag seam), so
+        # without this, the counter would reset to 0 every trigger and escalation-at-2
+        # could never fire through a real call site.  The ledger persists every audit,
+        # so we replay prior blocker fingerprints on construction.
+        self._rehydrate_from_ledger()
+
+    def _rehydrate_from_ledger(self) -> None:
+        """Prime ``_blocker_counts`` from prior ``audit`` events on the ledger."""
+        if self.ledger is None:
+            return
+        for ev in getattr(self.ledger, "events", []) or []:
+            if ev.get("kind") != "audit":
+                continue
+            for v in (ev.get("payload") or {}).get("verdicts", []):
+                if v.get("severity") == "blocker":
+                    fp = _fingerprint(v)
+                    self._blocker_counts[fp] = self._blocker_counts.get(fp, 0) + 1
+
+    def prior_findings_from_ledger(self) -> tuple[list[dict], list[dict]]:
+        """Return (prior_audits, prior_advisories) recorded on the ledger.
+
+        Used to feed ``assemble_evidence`` so the prompt-level "you already flagged
+        X" dedupe works across fresh-Overseer-per-call in-app entries.
+        """
+        audits: list[dict] = []
+        advisories: list[dict] = []
+        for ev in getattr(self.ledger, "events", []) or []:
+            k = ev.get("kind")
+            if k == "audit":
+                audits.append(ev.get("payload") or {})
+            elif k == "advisory":
+                advisories.append(ev.get("payload") or {})
+        return audits, advisories
 
     # -- debounce -----------------------------------------------------------
 
@@ -585,6 +619,11 @@ class Overseer:
         if self.provider is None:
             return AuditResult(audit={}, advisory=_empty_advisory(scope),
                                skipped="no provider configured for overseer (routing seam)")
+
+        # Prior findings default to what the ledger already recorded, so the
+        # "you already flagged X" dedupe survives fresh-Overseer-per-call in-app use.
+        if prior_audits is None and prior_advisories is None and self.ledger is not None:
+            prior_audits, prior_advisories = self.prior_findings_from_ledger()
 
         evidence = assemble_evidence(
             trigger, scope,

@@ -3,7 +3,7 @@ id: T-W6
 title: Feeds/speeds and machining data tables + CAM advisor integration
 workstream: W
 owner: sonnet-crag
-status: doing
+status: review
 branch: task/T-W6-feeds-speeds
 depends_on: []
 lane: ai-copilot

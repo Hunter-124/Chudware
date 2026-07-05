@@ -350,6 +350,64 @@ tool is reserved for T-R6's Hub), `plm_cloud_login` (Pillar-12 gate).
 `preflight_failed`, `stale_ref`, `unsaved_changes`, `locked`, `contended`,
 `reserved_remote`, `remote_unreachable`, `invalid_mode`, `not_found`.
 
+### 7.1 In-process `VaultClient` seam — `services/plm/client.py` (normative)
+
+The `plm_*` MCP tools in §7 are the **user/agent-driven** surface (one object in,
+the envelope out). Separately, in-process AI machinery — specifically the
+**T-W18 PLM bridge** (`services/agent/plm_bridge.py`, contract
+`advisor.md §15 aicad.plmlink/1`) — needs a thin Python client, **not** a round
+trip through MCP, to land AI-authored milestone checkpoints with full attribution.
+That client is a normative seam of `aicad.plm/1` so T-R2 builds exactly what the
+already-shipped bridge imports; it is not a parallel API.
+
+- **Class + import path (frozen):** `services.plm.client.PLMVaultClient`. The
+  bridge imports it lazily behind the `AICAD_PLM_BRIDGE=1` feature flag and falls
+  back to its in-memory `MockVault` when the import fails (T-R2 not yet merged) or
+  the flag is unset. T-R2 MUST provide `PLMVaultClient` at exactly this dotted
+  path with the surface below; renaming either is a breaking change (version bump).
+- **Surface (frozen — must satisfy the `VaultClient` Protocol in `plm_bridge.py`
+  verbatim):**
+
+```python
+class PLMVaultClient:  # duck-types services.agent.plm_bridge.VaultClient
+    def is_available(self) -> bool: ...
+    def checkpoint(self, project_id: str, message: str,
+                   item_id: str | None = None,
+                   author_kind: str = "ai",
+                   run_id: str | None = None,
+                   artifact_id: str | None = None) -> dict: ...
+    def project_id_for_run(self, run_id: str) -> str | None: ...
+```
+
+- **`checkpoint(...)` is the AI-authored twin of `plm_checkpoint` (§7) and the
+  ONLY path that writes the §3.4 `ai` attribution block.** It cuts a
+  `kind:"checkpoint"` entry over the shadow tree exactly like `plm_checkpoint`,
+  and additionally, when `author_kind=="ai"`, stamps `meta.json.author.kind:"ai"`
+  and the `ai` block (§3.4) from `run_id` (→ `ai.run_id`) and `artifact_id`
+  (→ `ai.artifact_id`; the bridge passes the `buildgraph_node` here), joining the
+  T-H1 telemetry envelope. It returns the **same success shape as
+  `plm_checkpoint`**: `{ok, commit, entry}` where `entry` carries at minimum
+  `{commit, kind, authored_at, author, message}` (and the `ai` block for AI
+  entries). Failure returns the §0 envelope `{ok:false, reason, hint}`.
+  **The MCP `plm_checkpoint` envelope (§7) is NOT widened to carry
+  `run_id`/`artifact_id`/`author_kind`** — the AI-attribution parameters live only
+  on this in-process seam; the two surfaces stay deliberately distinct (§8.4 keeps
+  AI attribution + reversibility a MUST on every AI-cut entry regardless of which
+  seam cut it).
+- **`is_available()`** returns `True` only when the vault module is importable AND
+  a vault can be opened/served; when it returns `False` the bridge queues its
+  `plmlink` events in the ledger and flushes on availability (advisor.md §15
+  "no lost annotations"). A `PLMVaultClient` MUST NOT raise on unavailability —
+  it reports `False`.
+- **`project_id_for_run(run_id)` is BEST-EFFORT, not a mandated registry.** v1
+  MAY return `None`; there is no required run→project backing store in
+  `aicad.plm/1`. The bridge's primary path passes `project_id` explicitly to
+  `on_milestone(...)`, and `project_id_for_run` is only the fallback lookup. T-R2
+  MAY back it with an in-vault run→project map if convenient, but callers MUST NOT
+  depend on it resolving; a `None` return with no explicit `project_id` simply
+  queues the link. Making this a mandatory registry is a future (`aicad.plm/2`)
+  concern, deliberately deferred so it is not re-litigated against a frozen v1.
+
 ## 8. Ease-of-use invariants (NORMATIVE — MUST/SHALL)
 
 These are contract obligations on every producer/consumer of `aicad.plm/1`, not
@@ -410,4 +468,13 @@ control").
   versions the whole document including its configurations (plan §3.5, §6).
 - **Telemetry (`telemetry.md` / T-H1):** AI PLM actions route through the existing
   `ai_artifact` envelope; §3.4 `ai` block references its `artifact_id`/`run_id`.
+- **PLM bridge (`advisor.md §15` `aicad.plmlink/1` / T-W18):** the already-shipped
+  `services/agent/plm_bridge.py` is a **consumer** of this contract, not a parallel
+  one. Its agent milestone checkpoints (`plan_ratified`, `part_done`,
+  `mission_done`, `stage_exit:{part_verify,assembly,sim}`, `change_request`) land
+  as ordinary `kind:"checkpoint"` history entries (§3.2) via the §7.1 in-process
+  `PLMVaultClient.checkpoint(...)` seam; each `aicad.plmlink/1` record's
+  `checkpoint_ref` is the returned `entry.commit`. The bridge's Pillar-19
+  git-vocabulary guard is the same normative rule as §8.1. No PLM-side schema is
+  owed to the bridge beyond the §7.1 seam and the §3.4 `ai` block it fills.
 ```

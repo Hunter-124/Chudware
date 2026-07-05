@@ -2271,14 +2271,58 @@ void drawFeatureTreeBody(AppState& st,
             treeSectionDivider("Reference");
 
             // Origin — expandable; the three default planes nest underneath (no duplicate flat list).
+            // T-BL37: the Origin row body is now selectable (sets selectedFeatureId = "point.origin")
+            // while the chevron still expands/collapses the child planes.
             {
                 ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_DefaultOpen |
-                                       ImGuiTreeNodeFlags_SpanFullWidth;
-                FmRowRect originRect = fmRowPill();
+                                       ImGuiTreeNodeFlags_SpanFullWidth |
+                                       ImGuiTreeNodeFlags_OpenOnArrow;
+                bool originSelected = (st.selectedFeatureId == "point.origin");
+                bool originHidden   = st.hiddenFeatures.count("point.origin") > 0;
+                FmRowRect originRect = fmRowPill(originSelected);
                 treeIcon("origin", "[O]", 16.0f);
                 ImGui::SameLine(0, 4 * ui::uiScale);
+                if (originHidden)
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
                 bool originOpen = ImGui::TreeNodeEx("Origin##origin", f);
-                fmRowPillEnd(originRect);
+                if (originHidden) ImGui::PopStyleColor();
+                // Eye toggle for the origin point glyph.
+                {
+                    ImVec2 oNodeMin = ImGui::GetItemRectMin();
+                    ImVec2 oNodeMax = ImGui::GetItemRectMax();
+                    float  oEyeSz = 14.0f * ui::uiScale, oEyePad = 6.0f * ui::uiScale;
+                    ImVec2 oEyeMin(oNodeMax.x - oEyeSz - oEyePad,
+                                   oNodeMin.y + (oNodeMax.y - oNodeMin.y - oEyeSz) * 0.5f);
+                    ImVec2 oEyeMax(oEyeMin.x + oEyeSz, oEyeMin.y + oEyeSz);
+                    bool   oOverEye = ImGui::IsMouseHoveringRect(oEyeMin, oEyeMax);
+                    {
+                        ImDrawList* odl = ImGui::GetWindowDrawList();
+                        drawEyeGlyph(odl, oEyeMin, oEyeMax, !originHidden, oOverEye, fmSurf());
+                        if (oOverEye) {
+                            ImGui::SetTooltip(originHidden ? "Show Origin" : "Hide Origin");
+                            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                                if (originHidden)
+                                    st.hiddenFeatures.erase("point.origin");
+                                else {
+                                    st.hiddenFeatures.insert("point.origin");
+                                    if (originSelected) st.selectedFeatureId.clear();
+                                }
+                                st.applyDatumVisibility();
+                            }
+                        }
+                    }
+                    // Body-click (not on eye, not on chevron) → select the origin point.
+                    // If a PM point-well is active, also route "point.origin" into it.
+                    if (!oOverEye && ImGui::IsItemClicked()) {
+                        st.selection.clear();
+                        st.selectedFeatureId = "point.origin";
+                        if (st.propertyManager && st.propertyManager->active() &&
+                            st.propertyManager->activeWellWantsPoint())
+                            st.propertyManager->routeDatumPoint("point.origin", "Origin");
+                    }
+                }
+                fmRowPillEnd(originRect, originSelected);
                 if (originOpen) {
                     static const char* kPlanes[] = {"Front Plane", "Top Plane", "Right Plane"};
                     bool planesAutoShow = !st.hasDocMesh && st.docMirror.hasDoc() && !st.planesUserToggled;
@@ -2399,8 +2443,10 @@ void drawFeatureTreeBody(AppState& st,
                         bool isOriginPlane = selectedFeatureId == "plane.front" ||
                                              selectedFeatureId == "plane.top"   ||
                                              selectedFeatureId == "plane.right";
+                        // T-BL37: "point.origin" is a synthetic ref like the planes — not a feature.
+                        bool isOriginPoint = selectedFeatureId == "point.origin";
                         if (!selectedFeatureId.empty() && !live.count(selectedFeatureId) &&
-                            !isOriginPlane) {
+                            !isOriginPlane && !isOriginPoint) {
                             selectedFeatureId.clear();
                             clearFeatureHighlight(st);
                         }

@@ -6,6 +6,7 @@
 #include "viewport_impl.h"            // T-BL46: GlViewport full type (renderer().camera())
 #include "renderer.h"                 // T-BL46: worldToScreen(), ViewportScreen
 
+#include "ui/feature_tree.h"        // T-BL37: featureTreeUnhideOrigin/featureTreeSelectOrigin
 #include "ui/ribbon.h"
 #include "ui/settings_modal.h"
 #include "ui/file_explorer.h"
@@ -269,6 +270,7 @@ int ShotConfig::captureFrameBudget() const {
     if (wantRequirements && !requirementsShotDone) return 150;  // T-U5
     if (wantTransparency && !transparencyShotDone) return 150;  // T-U8
     if (wantSimStudies && !simStudiesShotDone) return 150;
+    if (wantOrigin) return originShotDone ? 10 : 30;  // T-BL37
     if (wantTree) return treeShotDone ? 10 : 30;
     if (wantEquations) return equationsShotDone ? 10 : 30;
     if (wantPartsBrowser) return partsBrowserShotDone ? 10 : 30;
@@ -297,6 +299,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantPlan = eq("plan");
     cfg.wantPick = eq("pick");
     cfg.wantRibbon = eq("ribbon");
+    cfg.wantOrigin = eq("origin");   // T-BL37: origin point glyph visible + selected
     cfg.wantTree = eq("tree");
     cfg.wantExplorer = eq("explorer");
     cfg.wantEquations = eq("equations");
@@ -480,6 +483,34 @@ void scenarioTick(app::AppState& st) {
 void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
     if (!st.workerStarted) st.tryStartWorker();
     if (!st.workerStarted) return;
+
+    // T-BL37: origin glyph rendered + selected evidence shot (AI_CAD_SHOT=origin).
+    // Creates a minimal doc so the engine is live and the Reference/Origin row populates,
+    // then unhides the origin point glyph and selects it so the screenshot shows both.
+    if (cfg.wantOrigin && !cfg.originShotDone) {
+        cfg.originShotDone = true;
+        std::string err;
+        if (st.docMirror.newPart(st.worker, err)) {
+            st.addDocTab(false);
+            auto r1 = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                {{"op","add_feature"},{"feature",{
+                    {"type","box"},{"name","Box1"},
+                    {"params",{{"length",dim(80)},{"width",dim(60)},{"height",dim(40)}}}
+                }}}
+            }));
+            loadMesh(st, r1.aicm_path);
+            std::printf("origin: box ok=%d rev=%d\n", (int)r1.ok, r1.revision);
+        } else {
+            std::printf("origin: doc_new failed: %s\n", err.c_str());
+        }
+        // Un-hide the origin point glyph and select it — these drive syncRefDatums()
+        // in viewport.cpp which calls r.setHiddenDatums / r.setSelectedDatumId each frame.
+        featureTreeUnhideOrigin();
+        featureTreeSelectOrigin();
+        st.status = "Origin: point glyph visible + selected";
+        std::printf("origin: glyph unhidden + selected\n");
+        std::fflush(stdout);
+    }
 
     if (cfg.wantTree && !cfg.treeShotDone) {
         cfg.treeShotDone = true;

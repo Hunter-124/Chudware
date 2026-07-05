@@ -2498,13 +2498,21 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive && !planePickerHot)
             axisPickerHot = sketch->drawAxisPicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
+        // ---- datum-point picker (world origin / user point-datum into a point well) ----
+        // T-BL37: runs when a feature PM with an active point-accepting well is open. Highlights
+        // the origin glyph on hover and routes "point.origin" on click. Model-pick is suppressed.
+        bool pointPickerHot = false;
+        if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive && !planePickerHot &&
+            !axisPickerHot)
+            pointPickerHot = sketch->drawPointPicker(st, io, vr0, vr1, vw, vh, imgHovered);
+
         // ---- sweep/loft path picker (click a displayed helix / curve to set it as the path) ----
         // Runs when a feature PM with an active path/centerline well is open. Returns true while the
         // cursor is over a drawn curve datum, so the model-pick click below is suppressed (the curve
         // click routes the feature into the path well via routePathFeature).
         bool curvePickerHot = false;
         if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive && !planePickerHot &&
-            !axisPickerHot)
+            !axisPickerHot && !pointPickerHot)
             curvePickerHot = sketch->drawCurvePathPicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- general datum selection: click a displayed reference axis to select it ----
@@ -2513,13 +2521,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // pick below (a click off the axis still falls through to the id-buffer).
         bool datumSelectHot = false;
         if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive &&
-            !planePickerHot && !axisPickerHot && !curvePickerHot)
+            !planePickerHot && !axisPickerHot && !pointPickerHot && !curvePickerHot)
             datumSelectHot = sketch->drawDatumSelect(st, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- fillet/chamfer dashed old-edge overlay (deselect targets over the live round) ----
         bool blendDeselectHot = false;
         if (!inSketch && !st.sketchPlanePickActive && !planePickerHot && !axisPickerHot &&
-            !datumSelectHot)
+            !pointPickerHot && !datumSelectHot)
             blendDeselectHot = drawBlendEdgeOverlay(st, renderer, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- hover + click selection (once per frame; only while a doc mesh is loaded) ----
@@ -2529,7 +2537,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // Instant3D: while a push-pull OR dimension drag owns the mouse, freeze hover and swallow
             // the click so the press that grabbed the handle doesn't also re-select / clear.
             if (imgHovered && !s_lmbDragActive && !regionPickerHot && !planePickerHot &&
-                !axisPickerHot && !curvePickerHot && !datumSelectHot && !blendDeselectHot &&
+                !axisPickerHot && !pointPickerHot && !curvePickerHot && !datumSelectHot && !blendDeselectHot &&
                 !s_pp.active && !s_dim.active) {
                 int px = (int)(io.MousePos.x - vr0.x);
                 int py = (int)(io.MousePos.y - vr0.y);

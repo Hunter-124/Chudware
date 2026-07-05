@@ -291,7 +291,9 @@ struct FmState {
     bool hasDocMesh = false;
     std::vector<uint8_t> bodyVisible;
     std::vector<uint32_t> docBodyIds;
-    std::unordered_set<std::string> hiddenFeatures;
+    // T-BL37: origin point glyph hidden by default (matches planes' hidden-by-default);
+    // the Origin row's eye toggle removes the entry to show it.
+    std::unordered_set<std::string> hiddenFeatures{"point.origin"};
     bool treeScrollToSelection = false;
     bool showEquations = false;
     bool handoffQuietOpen = false;
@@ -350,6 +352,8 @@ struct FmState {
         showPlane[0] = showPlane[1] = showPlane[2] = false;
         planeEmphasis = -1;
         planesUserToggled = false;
+        // T-BL37: fresh doc -> origin point glyph back to hidden-by-default.
+        hiddenFeatures.insert("point.origin");
         if (app && app->scene) app->scene->clearSelection();
     }
     void applyBodyVisibility() {}
@@ -2464,13 +2468,63 @@ static void drawFeatureTreeBodyImpl(AppState& st,
             treeSectionDivider("Reference");
 
             // Origin — expandable; the three default planes nest underneath (no duplicate flat list).
+            // T-BL37: the Origin row body is now selectable (sets selectedFeatureId = "point.origin")
+            // while the chevron still expands/collapses the child planes. An eye toggle shows/hides
+            // the world-origin point glyph in the viewport (hiddenFeatures["point.origin"]).
             {
                 ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_DefaultOpen |
-                                       ImGuiTreeNodeFlags_SpanFullWidth;
-                fmRowPill();
+                                       ImGuiTreeNodeFlags_SpanFullWidth |
+                                       ImGuiTreeNodeFlags_OpenOnArrow;
+                bool originSelected = (st.selectedFeatureId == "point.origin");
+                bool originHidden   = st.hiddenFeatures.count("point.origin") > 0;
+                fmRowPill(originSelected);
                 treeIcon("origin", "[O]", 16.0f);
                 ImGui::SameLine(0, 4 * theme::S());
+                if (originHidden)
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.85f));
                 bool originOpen = ImGui::TreeNodeEx("Origin##origin", f);
+                if (originHidden) ImGui::PopStyleColor();
+                // Eye toggle for the origin point glyph.
+                {
+                    ImVec2 oNodeMin = ImGui::GetItemRectMin();
+                    ImVec2 oNodeMax = ImGui::GetItemRectMax();
+                    float  oEyeSz = 14.0f * theme::S(), oEyePad = 6.0f * theme::S();
+                    ImVec2 oEyeMin(oNodeMax.x - oEyeSz - oEyePad,
+                                   oNodeMin.y + (oNodeMax.y - oNodeMin.y - oEyeSz) * 0.5f);
+                    ImVec2 oEyeMax(oEyeMin.x + oEyeSz, oEyeMin.y + oEyeSz);
+                    bool   oOverEye = ImGui::IsMouseHoveringRect(oEyeMin, oEyeMax);
+                    {
+                        ImDrawList* odl = ImGui::GetWindowDrawList();
+                        float a = !originHidden ? (oOverEye ? 1.0f : 0.70f)
+                                                : (oOverEye ? 0.55f : 0.28f);
+                        ImVec2 oEyeC((oEyeMin.x + oEyeMax.x) * 0.5f, (oEyeMin.y + oEyeMax.y) * 0.5f);
+                        float  oEyeHalf = (oEyeMax.x - oEyeMin.x) * 0.5f;
+                        icons::drawGlass(odl, "hide_show_eye", oEyeC, oEyeHalf, fmIconTint(a),
+                                         fmGlassHalo());
+                        if (originHidden)
+                            odl->AddLine(ImVec2(oEyeMin.x, oEyeMax.y), ImVec2(oEyeMax.x, oEyeMin.y),
+                                         ImGui::ColorConvertFloat4ToU32(ImVec4(pal.textDim[0],
+                                             pal.textDim[1], pal.textDim[2], 0.9f)),
+                                         std::max(1.0f, 1.5f * theme::S()));
+                        if (oOverEye) {
+                            ImGui::SetTooltip(originHidden ? "Show Origin" : "Hide Origin");
+                            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                                if (originHidden)
+                                    st.hiddenFeatures.erase("point.origin");
+                                else {
+                                    st.hiddenFeatures.insert("point.origin");
+                                    if (originSelected) st.selectedFeatureId.clear();
+                                }
+                            }
+                        }
+                    }
+                    // Body-click (not on eye, not on chevron) → select the origin point.
+                    if (!oOverEye && ImGui::IsItemClicked()) {
+                        st.app->selection.clear();
+                        st.selectedFeatureId = "point.origin";
+                    }
+                }
                 if (originOpen) {
                     static const char* kPlanes[] = {"Front Plane", "Top Plane", "Right Plane"};
                     bool planesAutoShow = !st.hasDocMesh && st.app->docMirror.hasDoc() && !st.planesUserToggled;
@@ -2595,8 +2649,10 @@ static void drawFeatureTreeBodyImpl(AppState& st,
                         bool isOriginPlane = selectedFeatureId == "plane.front" ||
                                              selectedFeatureId == "plane.top"   ||
                                              selectedFeatureId == "plane.right";
+                        // T-BL37: "point.origin" is a synthetic ref like the planes — not a feature.
+                        bool isOriginPoint = selectedFeatureId == "point.origin";
                         if (!selectedFeatureId.empty() && !live.count(selectedFeatureId) &&
-                            !isOriginPlane) {
+                            !isOriginPlane && !isOriginPoint) {
                             selectedFeatureId.clear();
                             clearFeatureHighlight(st);
                         }
@@ -3384,6 +3440,24 @@ std::string featureTreeSaveDoc(app::AppState& st, bool saveAs) {
     return p;
 }
 std::string featureTreeActivePath() { return detail::featureTreeActivePath(); }
+// T-BL37: read-only views of the FM's datum-visibility/selection state so the viewport's
+// reference-datum push can feed Renderer::setHiddenDatums / setSelectedDatumId each frame.
+const std::unordered_set<std::string>& featureTreeHiddenFeatures() {
+    return detail::g_fm.hiddenFeatures;
+}
+const std::string& featureTreeSelectedFeatureId() {
+    return detail::g_fm.selectedFeatureId;
+}
+// T-BL37: scenario setters — let the headless shot machine drive origin visible+selected
+// state so evidence screenshots actually show the rendered+highlighted origin glyph.
+void featureTreeUnhideOrigin() {
+    detail::g_fm.hiddenFeatures.erase("point.origin");
+}
+void featureTreeSelectOrigin() {
+    detail::g_fm.selectedFeatureId = "point.origin";
+    if (detail::g_fm.app)
+        detail::g_fm.app->selectedFeature = "point.origin";
+}
 void pollAiCadHandoff(app::AppState& st) {
     auto& fm = bindFm(st);
     detail::pollAiCadHandoff(fm);

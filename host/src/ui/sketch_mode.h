@@ -177,6 +177,14 @@ public:
     bool drawAxisPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin, const ImVec2& imgMax,
                         int vw, int vh, bool imgHovered);
 
+    // T-BL37: while a feature PM is open with an active well that accepts a point (selKinds.point),
+    // the world-origin point glyph (and any point-datum features) are hit-tested in screen space.
+    // Hovering highlights the glyph and a left-click routes "point.origin" into the well via
+    // routeDatumPoint(). Returns true while the cursor is within pick radius so model picking
+    // doesn't also fire.
+    bool drawPointPicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin, const ImVec2& imgMax,
+                         int vw, int vh, bool imgHovered);
+
     // While a feature PM is open with an active path/centerline well (activeWellWantsPathFeature),
     // the displayed curve datums (docMirror::refDatums kind=="curve" — a helix/spiral/spline) are
     // hit-tested in screen space; hovering highlights one and a left-click routes that curve feature

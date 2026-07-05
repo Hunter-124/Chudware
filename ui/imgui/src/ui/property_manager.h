@@ -71,10 +71,13 @@ public:
 
     bool routeDatumPlane(const std::string& datumId, const std::string& label = "");
     bool routeDatumAxis(const std::string& fid, const std::string& label);
+    // T-BL37: route origin/point-datum into a SelectorWell that has selKinds.point=true.
+    bool routeDatumPoint(const std::string& fid, const std::string& label = "");
     bool routePathFeature(const std::string& fid, const std::string& name, bool isCurve);
 
     bool activeWellWantsPlane() const;
     bool activeWellWantsAxis() const;
+    bool activeWellWantsPoint() const;  // T-BL37
     bool activeWellWantsPathFeature() const;
     bool activeWellWantsBody() const;
     bool activeWellPrefersEdge() const;

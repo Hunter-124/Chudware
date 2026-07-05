@@ -209,7 +209,8 @@ that carry geometry to copy — an EXTRUDE boss/cut, a HOLE, a REVOLVE/SWEEP/LOF
   mirror  refs.plane = {"kind":"datum","feature":"plane.right"} (or a planar face), refs.features = ["f2", ...].
   `count*` are plain INTEGERS; spacings/angles are dim objects.
   Reserved datums: planes "plane.top"/"plane.front"/"plane.right", axes "axis.x"/"axis.y"/"axis.z",
-  point "origin" — referenced as {"kind":"datum","feature":"<name>"}.
+  point "point.origin" (canonical; bare "origin" also accepted) — referenced as {"kind":"datum","feature":"point.origin"}.
+  The world origin is selectable in the FeatureManager and renders as a glyph in the viewport.
   WHAT'S PATTERNABLE/MIRRORABLE: sketch-based features (extrude/revolve/sweep/loft boss or cut,
   hole) and transforms. Primitives (box/cylinder/...) are NOT — rebuild them as sketch+extrude.
 

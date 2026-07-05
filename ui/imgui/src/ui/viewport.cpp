@@ -1,5 +1,6 @@
 #include "ui/viewport.h"
 #include "ui/doc_tabs.h"
+#include "ui/feature_tree.h"
 #include "ui/shortcut_bar.h"
 #include "ui/sketch/sketch_mode.h"
 #include "ui/sketch/sketch_seam.h"
@@ -150,11 +151,76 @@ bool ensureDocLoaded(AppState& s) {
     return true;
 }
 
+// T-BL37: push feature datum geometry (axes/planes/points/csys/curves) + the synthetic
+// world-origin point to the renderer each frame. Datums build no body, so the engine ships
+// them out-of-band in doc_mirror::refDatums; the origin point is injected host-side with
+// id "point.origin" (its FM eye toggle hides it via the hidden set, like any datum).
+// Cheap: the datum list is tiny (a handful of structs), so a per-frame rebuild is simpler
+// and safer than change-tracking across the FM/doc-mutation seams.
+void syncRefDatums(AppState& s, Renderer& r) {
+    auto v3 = [](const nlohmann::json& a, Vec3 dflt) -> Vec3 {
+        if (a.is_array() && a.size() == 3 && a[0].is_number())
+            return Vec3((float)a[0].get<double>(), (float)a[1].get<double>(),
+                        (float)a[2].get<double>());
+        return dflt;
+    };
+    std::vector<Renderer::RefDatum> rds;
+    const nlohmann::json& datums = s.docMirror.refDatums();
+    if (datums.is_array()) {
+        for (const auto& d : datums) {
+            if (!d.is_object()) continue;
+            Renderer::RefDatum rd;
+            const std::string k = d.value("kind", std::string());
+            if (k == "axis") {
+                rd.kind = Renderer::RefDatum::Kind::Axis;
+                rd.origin = v3(d.value("point", nlohmann::json()), Vec3(0, 0, 0));
+                rd.dir    = v3(d.value("dir", nlohmann::json()), Vec3(0, 0, 1));
+            } else if (k == "plane" || k == "csys") {
+                rd.kind = (k == "csys") ? Renderer::RefDatum::Kind::Csys
+                                        : Renderer::RefDatum::Kind::Plane;
+                rd.origin = v3(d.value("origin", nlohmann::json()), Vec3(0, 0, 0));
+                rd.dir    = v3(d.value("normal", nlohmann::json()), Vec3(0, 0, 1));
+                rd.xdir   = v3(d.value("x_dir", nlohmann::json()), Vec3(1, 0, 0));
+                rd.ydir   = v3(d.value("y_dir", nlohmann::json()), Vec3(0, 1, 0));
+            } else if (k == "point") {
+                rd.kind = Renderer::RefDatum::Kind::Point;
+                rd.origin = v3(d.value("point", nlohmann::json()), Vec3(0, 0, 0));
+            } else if (k == "curve") {
+                rd.kind = Renderer::RefDatum::Kind::Curve;
+                if (d.contains("points") && d["points"].is_array()) {
+                    rd.points.reserve(d["points"].size());
+                    for (const auto& p : d["points"])
+                        rd.points.push_back(v3(p, Vec3(0, 0, 0)));
+                }
+                if (rd.points.size() < 2) continue;  // nothing to draw
+            } else {
+                continue;
+            }
+            rd.id = d.value("id", std::string());
+            rd.name = d.value("name", std::string());
+            rds.push_back(rd);
+        }
+    }
+    // Synthetic world-origin point datum (T-BL37) — only while a document is open.
+    if (s.docMirror.hasDoc()) {
+        Renderer::RefDatum originPt;
+        originPt.kind   = Renderer::RefDatum::Kind::Point;
+        originPt.origin = Vec3(0.0f, 0.0f, 0.0f);
+        originPt.id     = "point.origin";
+        originPt.name   = "Origin";
+        rds.push_back(originPt);
+    }
+    r.setRefDatums(std::move(rds));
+    r.setHiddenDatums(featureTreeHiddenFeatures());
+    r.setSelectedDatumId(featureTreeSelectedFeatureId());
+}
+
 void renderViewport(AppState& s, int w, int h) {
     if (!g_glVp || w < 8 || h < 8) return;
     ensureDocLoaded(s);  // best-effort: an EMPTY scene still renders the GL studio backdrop
 
     Renderer& r = g_glVp->renderer();
+    syncRefDatums(s, r);
     g_glVp->resize(w, h);
     syncCameraToGl();
     r.setDisplayStyle(static_cast<DisplayStyle>(g_vpState.displayStyle));

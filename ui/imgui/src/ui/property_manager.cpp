@@ -1034,6 +1034,15 @@ bool PropertyManager::activeWellWantsAxis() const {
     return false;
 }
 
+// T-BL37: returns true when the active selector well accepts a point datum.
+bool PropertyManager::activeWellWantsPoint() const {
+    for (const auto& f : fields_)
+        if (f.def->kind == FieldKind::SelectorWell && f.wellActive &&
+            fieldVisible(*f.def, fields_))
+            return f.def->selKinds.point;
+    return false;
+}
+
 bool PropertyManager::activeWellPrefersEdge() const {
     for (const auto& f : fields_)
         if (f.def->kind == FieldKind::SelectorWell && f.wellActive &&
@@ -1113,6 +1122,33 @@ bool PropertyManager::routeDatumPlane(const std::string& datumId, const std::str
     return true;
 }
 
+// T-BL37: route a point-datum (world origin or user-created point datum) into the active
+// selector well. Uses the {kind:"datum",feature:fid} selector so resolve_point in
+// compile_document() picks it up. "point.origin" is the canonical world-origin id.
+bool PropertyManager::routeDatumPoint(const std::string& fid, const std::string& label) {
+    PMField* well = activeWell();
+    if (!well || !well->def->selKinds.point || fid.empty()) return false;
+    // Toggle off if this exact datum point is already in the well (SolidWorks re-pick).
+    for (size_t i = 0; i < well->picks.size(); ++i) {
+        const auto& sel = well->picks[i].selector;
+        if (sel.is_object() && sel.value("kind", std::string()) == "datum" &&
+            sel.value("feature", std::string()) == fid) {
+            well->picks.erase(well->picks.begin() + i);
+            dirty_ = true; lastEditTime_ = ImGui::GetTime();
+            return true;
+        }
+    }
+    if (!well->def->selMulti) well->picks.clear();   // single-ref wells hold one pick
+    PMSelEntry e;
+    e.selector = {{"kind", "datum"}, {"feature", fid}};  // resolve_point accepts this
+    e.label = label.empty() ? fid : label;
+    well->picks.push_back(e);
+    well->wellDangling = false;
+    dirty_ = true; lastEditTime_ = ImGui::GetTime();
+    advanceWellAfterFill(well);
+    return true;
+}
+
 std::string PropertyManager::activeWellKindHint() const {
     for (const auto& f : fields_) {
         if (f.def->kind != FieldKind::SelectorWell || !f.wellActive ||
@@ -1125,6 +1161,7 @@ std::string PropertyManager::activeWellKindHint() const {
         if (k.body)   parts.push_back("bodies");
         if (k.plane)  parts.push_back("planes");
         if (k.axis)   parts.push_back("axes");
+        if (k.point)  parts.push_back("points");  // T-BL37
         std::string s;
         for (size_t i = 0; i < parts.size(); ++i) {
             if (i) s += (i + 1 == parts.size()) ? " or " : ", ";

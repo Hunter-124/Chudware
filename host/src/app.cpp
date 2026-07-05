@@ -1338,6 +1338,17 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 rd.name = d.value("name", std::string());
                 rds.push_back(rd);
             }
+            // T-BL37: inject the synthetic world-origin point datum so the renderer draws
+            // a point glyph at (0,0,0). Eye-toggle in the FeatureManager hides/shows it
+            // via hiddenFeatures — same mechanism as every user-created datum feature.
+            {
+                Renderer::RefDatum originPt;
+                originPt.kind   = Renderer::RefDatum::Kind::Point;
+                originPt.origin = Vec3(0.0f, 0.0f, 0.0f);
+                originPt.id     = "point.origin";
+                originPt.name   = "Origin";
+                rds.push_back(originPt);
+            }
             st.renderer->setRefDatums(std::move(rds));
             st.applyDatumVisibility();   // re-apply the FeatureManager eye hides to the fresh datums
         }

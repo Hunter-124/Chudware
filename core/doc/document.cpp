@@ -930,7 +930,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
         else if (ref.is_object() && ref.value("kind", std::string()) == "datum" &&
                  ref.contains("feature") && ref["feature"].is_string())
             fid = ref["feature"].get<std::string>();
-        if (fid == "origin") return Eigen::Vector3d(0, 0, 0);
+        if (fid == "origin" || fid == "point.origin") return Eigen::Vector3d(0, 0, 0);
         if (!fid.empty()) {
             auto it = results.find(fid);
             if (it != results.end() && std::holds_alternative<PointResult>(it->second))

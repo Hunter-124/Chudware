@@ -69,3 +69,6 @@ schematic/PCB, CAM workspace (T-U3), and the U7 viewers.
 - **Checkpoint/release message drafts:** LOCAL model tier drafts from the T-R3 change
   summary (offline-safe, free); plain manual box fallback when no local model is
   provisioned. Frontier is never required for this.
+
+## Progress log
+- 2026-07-05 20:22 UTC [fable-quill] DRIVER DIED (session limit, resets Jul 10). Integrator preserved all work to origin/task/T-R5-plm-editor-gui: committed plm worker-RPC seam (7cc85e5d) + WIP commit rescuing uncommitted panel files (plm_panel.cpp/h, ui/abstract/plm_view.h, toast wiring). Does NOT build clean yet — mid-build. Needs a finisher to complete the panel + wire it in. Hunter's locked design decisions are in the task file.

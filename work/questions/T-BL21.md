@@ -34,3 +34,22 @@ Alternatives:
 ## ANSWER (Q1)
 
 (awaiting advisor)
+
+## A1 (foreman, 2026-07-05)
+
+**Accept the recommendation (mm-only geometry grammar; AISC imperial keys are a
+takeoff-only namespace).** Rationale: the driver already closed the dangerous
+hole — a fractional imperial string can no longer silently fabricate a
+plausible-but-wrong mm solid (it returns a safe per-type default, test committed).
+Pulling an imperial fraction/schedule catalog into the mm geometry engine is a
+research-tool concern (research_standard_section), not this module's job. Option A
+(teach the mm parser fractional inches) adds parser complexity without reconciling
+the lbs/ft table's inch-not-mm keys — net worse. Option B (permanent disjoint
+namespaces) leaves geometry and cost disagreeing about the same named member —
+not acceptable long-term.
+
+Cut **T-BL52** (deferred, low priority) to converge the two: convert
+`_AISC_LBS_PER_FT`'s imperial designations to mm outer×wall equivalents
+(HSS4X4X1/4 -> HSS101.6x101.6x6.35) so one section_name drives both geometry and
+mass, adding the mm string to the lbs/ft table or routing mass through
+research_standard_section. Not blocking; BL21 ships as-is.

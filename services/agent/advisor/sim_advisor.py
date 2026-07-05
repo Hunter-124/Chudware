@@ -265,6 +265,145 @@ def thermal_anchor(
 
 
 # ---------------------------------------------------------------------------
+# Fatigue anchor helper (Goodman / Soderberg S-N hand-calc reference) — T-SIM4
+# ---------------------------------------------------------------------------
+
+#: Citation for every number fatigue_anchor produces. The criteria equations and the
+#: S-N line constants are hand-typed from the named handbook sections; no text is
+#: reproduced. The same Eq 6-14..6-16 / Eq 6-8 references are already validated
+#: against literal hand-calc values in scripts/vv_benchmark.py (FAT1..FAT3).
+_FATIGUE_SOURCE = (
+    "Shigley's Mechanical Engineering Design, 10th ed.: mean-stress criteria §6-12 "
+    "(Soderberg Eq. 6-45, mod-Goodman Eq. 6-46); high-cycle S-N line Eq. 6-14..6-16 "
+    "(f=0.9); unmodified endurance estimate Se'=0.5·Sut (Sut≤1400 MPa) else 700 MPa, "
+    "Eq. 6-8"
+)
+
+
+def fatigue_anchor(
+    sigma_max_mpa: float,
+    sigma_min_mpa: float,
+    ultimate_mpa: float,
+    yield_mpa: Optional[float] = None,
+    endurance_mpa: Optional[float] = None,
+    method: str = "goodman",
+) -> Optional[dict]:
+    """Hand-calc high-cycle-fatigue reference (S-N anchor) for a cyclic stress state.
+
+    Same contract as :func:`compute_beam_anchor` / :func:`thermal_anchor`: returns a
+    dict with the analytic reference numbers + provenance (``source`` cites the
+    handbook), or ``None`` when the mapping is not confident (missing/invalid strength
+    data, reversed max/min, Soderberg without a yield strength, unknown method).
+
+    The math is INDEPENDENT of the engine solver (core/sim/fea_fatigue.cpp) and of the
+    host mirror (services/mcp/fea_advanced.py) — it exists to cross-check them:
+
+      sa = (σmax − σmin)/2,  sm = (σmax + σmin)/2
+      sa_eq  (Goodman)   = sa / (1 − sm⁺/Sut)          [Shigley Eq. 6-46 rearranged]
+      sa_eq  (Soderberg) = sa / (1 − sm⁺/Sy)           [Shigley Eq. 6-45 rearranged]
+      N = (sa_eq/a)^(1/b),  a=(0.9·Sut)²/Se,  b=−⅓·log10(0.9·Sut/Se)   [Eq. 6-14..6-16]
+
+    where sm⁺ = max(sm, 0): a compressive mean stress is NOT taken as a fatigue
+    benefit here, deliberately matching the engine's convention (fea_fatigue.cpp
+    clamps the mean the same way) so anchor-vs-engine comparisons are apples-to-apples.
+
+    Parameters
+    ----------
+    sigma_max_mpa, sigma_min_mpa : float
+        Peak / valley of the cyclic stress at the critical point, MPa.
+    ultimate_mpa : float
+        Sut (required).
+    yield_mpa : float | None
+        Sy — required for ``method="soderberg"``.
+    endurance_mpa : float | None
+        Corrected endurance limit Se. When absent, the unmodified estimate
+        Se' = 0.5·Sut (capped at 700 MPa for Sut > 1400 MPa, Shigley Eq. 6-8) is
+        used and flagged in ``se_source``.
+    method : str
+        ``"goodman"`` (default) or ``"soderberg"``.
+    """
+    try:
+        smax = float(sigma_max_mpa)
+        smin = float(sigma_min_mpa)
+        sut = float(ultimate_mpa)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(smax) and math.isfinite(smin) and math.isfinite(sut)):
+        return None
+    if sut <= 0 or smax < smin:
+        return None
+    method = (method or "").lower()
+    if method not in ("goodman", "soderberg"):
+        return None
+    sy = None
+    if yield_mpa is not None:
+        sy = float(yield_mpa)
+        if not (math.isfinite(sy) and sy > 0):
+            sy = None
+    if method == "soderberg" and sy is None:
+        return None
+
+    # Endurance limit: given (already Marin-corrected by the caller) or the
+    # unmodified Shigley Eq. 6-8 estimate.
+    if endurance_mpa is not None and float(endurance_mpa) > 0:
+        se = float(endurance_mpa)
+        se_source = "given (caller-corrected)"
+    else:
+        se = 0.5 * sut if sut <= 1400.0 else 700.0
+        se_source = "estimated Se'=0.5*Sut capped 700 MPa (Shigley Eq. 6-8, unmodified)"
+
+    sa = (smax - smin) / 2.0
+    sm = (smax + smin) / 2.0
+    sm_eff = max(sm, 0.0)  # compressive mean -> no benefit (matches engine)
+
+    out = {
+        "method": method,
+        "sa_mpa": sa,
+        "sm_mpa": sm,
+        "se_mpa": se,
+        "se_source": se_source,
+        "sut_mpa": sut,
+        "sy_mpa": sy,
+        "source": _FATIGUE_SOURCE,
+    }
+
+    if sa <= 0.0:
+        # No stress amplitude — not a fatigue problem (static load).
+        out.update({"sa_eq_mpa": 0.0, "regime": "static_no_amplitude",
+                    "cycles": None, "fos_endurance": None})
+        return out
+
+    denom_ref = sut if method == "goodman" else sy
+    denom = 1.0 - sm_eff / denom_ref
+    if denom <= 1e-9:
+        # Mean stress at/above the static strength — fails statically, not in fatigue.
+        out.update({"sa_eq_mpa": None, "regime": "static_overload",
+                    "cycles": 1, "fos_endurance": 0.0})
+        return out
+
+    sa_eq = sa / denom
+    out["sa_eq_mpa"] = sa_eq
+    out["fos_endurance"] = se / sa_eq
+
+    # S-N life (Shigley Eq. 6-14..6-16, f=0.9). Same clamps as the host mirror
+    # (services/mcp/fea_advanced.py sn_life) so cross-checks agree bit-for-bit.
+    if sa_eq <= se:
+        out.update({"regime": "infinite", "cycles": None})
+        return out
+    f = 0.9
+    a = (f * sut) ** 2 / se
+    b = -(1.0 / 3.0) * math.log10((f * sut) / se)
+    n = (sa_eq / a) ** (1.0 / b)
+    if not math.isfinite(n) or n < 1.0:
+        n = 1.0
+    if n > 1e6:
+        n = 1e6
+    out["cycles"] = n
+    out["regime"] = "static_overload" if sa_eq >= sut else "finite"
+    return out
+
+
+# ---------------------------------------------------------------------------
 # BC lint helpers
 # ---------------------------------------------------------------------------
 

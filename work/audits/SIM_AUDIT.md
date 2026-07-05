@@ -210,3 +210,51 @@ Re-run verdict: **PASS — all executed checks green.**
   BROKEN → REAL (build123d/OCP imports clean).
 - `ecad_simulate [ngspice]`: subprocess path now present.
 - Remaining SKIP: OpenFOAM (`run_cfd_accurate`) — heavyweight install, deferred.
+
+---
+
+## T-SIM4 re-run (2026-07-05) — live FEA validation depth
+
+`scripts/sim_audit.py` extended: the FEA family now solves LIVE on the raw
+bridge, plus two new families — fatigue (S-N math anchors + live engine
+cross-check) and thermal (plane-wall anchors + live conduction solve).
+
+**Skip count: 23 → 15. Executed: 8 → 16. BROKEN: 0. Verdict: PASS.**
+
+### Correction to the T-V1 "Key Architectural Finding"
+
+The T-V1 claim that `sim_run_static`/`sim_run_modal` are "not accessible via the
+core_bridge JSON-RPC bridge" is true only for the plain `core/build-linux` .so.
+The **AICAD_WITH_NETGEN** build (`core/build-occt-linux/bin/libaicad.so`)
+registers `sim_run_static`, `sim_run_modal`, `sim_run_fatigue` and
+`sim_run_thermal` directly in `core/api/libaicad.cpp` — raw `cb.call()` reaches
+them with a pre-resolved study (step_path + facesets from
+`doc_query`/`doc_face_points`). No full MCP server needed. The standalone-pytest
+consequence: `services/mcp/test_fea_live_bridge.py` (T-SIM4) now runs
+cantilever static+modal against beam theory in the local gate.
+
+### New / upgraded verdict rows (2026-07-05)
+
+| Tool | Verdict | Evidence |
+|---|---|---|
+| `run_fea_static` [live] | **VALIDATED** | Cantilever 50×50mm × 1 m steel, P=1000 N: max_disp = 3.1876 mm vs Roark 8th Table 8.1 case 1a δ=PL³/3EI = 3.2000 mm — **0.39%** (n_dof 6630, tet10) |
+| `run_fea_modal` [live] | **VALIDATED** | f₁ = 40.86 Hz vs Rao 5th §8.2 Table 8.1 (β₁L=1.87510) 40.77 Hz — **0.22%**; square-section bending pair degenerate (40.86/40.87), next pair 253 Hz |
+| `sn_life` (fea_advanced) | **VALIDATED** | sa_eq=250, Se=200, Sut=400 MPa → N=72 627 vs Shigley 10th Eq 6-14..6-16 hand calc 72 627 — 0.00% |
+| `fatigue_anchor` (sim_advisor, T-SIM4) | **VALIDATED** | Goodman R=0 case: sa_eq=133.333 MPa vs Eq 6-46 hand calc 133.333 — 0.000%; regime=infinite, FoS=1.50 |
+| `run_fea_fatigue` [live] | **VALIDATED** | Fully-reversed load on the live static field: engine Goodman sa_eq = static peak vM = 34.3938 MPa (0.000%) and = fatigue_anchor (0.000%) — engine/host/anchor triple agreement |
+| `thermal_anchor` (sim_advisor) | **VALIDATED** | Fourier plane wall q=kΔT/L: 500 000 W/m² vs hand calc — 0.000% (Incropera §3.1) |
+| `sim_run_thermal` [live] | **VALIDATED** | Bar 100×20×20 mm, k=50 W/mK, 100 °C Dirichlet + convection h=500 W/m²K→20 °C: cold face 60.26 °C vs series-resistance closed form 60.0 °C — **0.43%**; hot face exact |
+
+Remaining SKIPs (15) are provisioning/degradation rows (OpenFOAM absent,
+ngspice pass-through, schema-only tools, source-audit REAL rows) — none are
+physics checks that could run on this machine but didn't.
+
+### Re-run instructions (updated)
+
+```bash
+AI_CAD_LIBAICAD=core/build-occt-linux/bin/libaicad.so \
+    ~/.local/share/AI-CAD/mcp-venv/bin/python scripts/sim_audit.py
+```
+
+Expected: 16 executed, 0 BROKEN, PASS. (With the plain build-linux .so the FEA
+families fall back to source-audit REAL verdicts + honest skips.)

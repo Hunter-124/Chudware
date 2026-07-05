@@ -600,3 +600,122 @@ class TestThermalBcLint:
         assert anchor_items, items
         assert anchor_items[0]["_anchor"] is not None
         assert anchor_items[0]["_anchor"]["mode"] == "conduction"
+
+
+# ---------------------------------------------------------------------------
+# 10. Fatigue anchor (T-SIM4) — Goodman / Soderberg S-N hand-calc reference
+# ---------------------------------------------------------------------------
+#
+# Citation honesty: every expected number below is hand-computed in the docstring
+# from the named handbook equations (Shigley's Mechanical Engineering Design,
+# 10th ed. — mean-stress criteria §6-12 Eq. 6-45/6-46, S-N line Eq. 6-14..6-16
+# with f=0.9, unmodified endurance Se'=0.5·Sut Eq. 6-8). The Eq. 6-14..6-16
+# constants are ALSO validated against the same literal (7.2627e4 cycles) in
+# scripts/vv_benchmark.py FAT1 and services/mcp/test_fea_advanced.py, so this
+# anchor, the host S-N mirror, and the V&V bench all agree on one cited line.
+
+from services.agent.advisor.sim_advisor import fatigue_anchor
+
+
+class TestFatigueAnchor:
+    def test_goodman_zero_based_infinite_life(self):
+        """R=0 (zero-based) cycle, machined-steel-like Sut=400 MPa, no Se given.
+
+        Hand calc (Shigley 10th):
+          Se' = 0.5·Sut = 200 MPa                       (Eq. 6-8)
+          sa = (200-0)/2 = 100, sm = (200+0)/2 = 100 MPa
+          sa_eq = sa/(1 - sm/Sut) = 100/(1 - 100/400) = 133.333 MPa   (Eq. 6-46)
+          sa_eq < Se' -> infinite life; FoS = Se/sa_eq = 200/133.333 = 1.5
+        """
+        a = fatigue_anchor(200.0, 0.0, ultimate_mpa=400.0, method="goodman")
+        assert a is not None
+        assert math.isclose(a["sa_mpa"], 100.0)
+        assert math.isclose(a["sm_mpa"], 100.0)
+        assert math.isclose(a["se_mpa"], 200.0)
+        assert math.isclose(a["sa_eq_mpa"], 400.0 / 3.0, rel_tol=1e-9)
+        assert a["regime"] == "infinite"
+        assert a["cycles"] is None
+        assert math.isclose(a["fos_endurance"], 1.5, rel_tol=1e-9)
+        assert "Shigley" in a["source"]
+
+    def test_fully_reversed_finite_life_matches_shigley_sn(self):
+        """Fully reversed sa=250 MPa, Se=200, Sut=400 — the FAT1 literal.
+
+        Hand calc (Shigley 10th Eq. 6-14..6-16, f=0.9):
+          a = (0.9·400)²/200 = 648.0
+          b = -⅓·log10(0.9·400/200) = -⅓·log10(1.8) = -0.085085
+          N = (250/648)^(1/b) = 7.2627e4 cycles
+        Cross-checked bit-for-bit against the host S-N mirror
+        (services/mcp/fea_advanced.py sn_life) so the anchor and the host layer
+        can never drift apart silently.
+        """
+        a = fatigue_anchor(250.0, -250.0, ultimate_mpa=400.0,
+                           endurance_mpa=200.0, method="goodman")
+        assert a is not None
+        assert math.isclose(a["sm_mpa"], 0.0)
+        assert math.isclose(a["sa_eq_mpa"], 250.0)
+        assert a["regime"] == "finite"
+        assert math.isclose(a["cycles"], 7.2627e4, rel_tol=0.01)
+        from services.mcp.fea_advanced import sn_life
+        assert math.isclose(a["cycles"], sn_life(250.0, 200.0, 400.0), rel_tol=1e-12)
+
+    def test_soderberg_more_conservative_than_goodman(self):
+        """Tensile-mean cycle σmax=180 / σmin=20 MPa; Sut=400, Sy=250, Se=200.
+
+        Hand calc: sa=80, sm=100 MPa.
+          Goodman   (Eq. 6-46): sa_eq = 80/(1-100/400) = 106.667 MPa
+          Soderberg (Eq. 6-45): sa_eq = 80/(1-100/250) = 133.333 MPa
+        Soderberg replaces Sut with Sy, so it must always be the more
+        conservative (larger sa_eq, smaller FoS) of the two.
+        """
+        g = fatigue_anchor(180.0, 20.0, ultimate_mpa=400.0, yield_mpa=250.0,
+                           endurance_mpa=200.0, method="goodman")
+        s = fatigue_anchor(180.0, 20.0, ultimate_mpa=400.0, yield_mpa=250.0,
+                           endurance_mpa=200.0, method="soderberg")
+        assert g is not None and s is not None
+        assert math.isclose(g["sa_eq_mpa"], 320.0 / 3.0, rel_tol=1e-9)
+        assert math.isclose(s["sa_eq_mpa"], 400.0 / 3.0, rel_tol=1e-9)
+        assert s["sa_eq_mpa"] > g["sa_eq_mpa"]
+        assert s["fos_endurance"] < g["fos_endurance"]
+
+    def test_compressive_mean_gives_no_benefit(self):
+        """σmax=100 / σmin=-300: sa=200, sm=-100 MPa. The anchor clamps sm to 0
+        (matching core/sim/fea_fatigue.cpp), so sa_eq == sa for both methods."""
+        for method in ("goodman", "soderberg"):
+            a = fatigue_anchor(100.0, -300.0, ultimate_mpa=400.0, yield_mpa=250.0,
+                               endurance_mpa=200.0, method=method)
+            assert a is not None, method
+            assert math.isclose(a["sm_mpa"], -100.0)
+            assert math.isclose(a["sa_eq_mpa"], 200.0), method
+
+    def test_se_estimate_caps_at_700_for_high_strength(self):
+        """Sut=1600 MPa > 1400 -> Se' capped at 700 MPa (Shigley Eq. 6-8)."""
+        a = fatigue_anchor(300.0, -300.0, ultimate_mpa=1600.0)
+        assert a is not None
+        assert math.isclose(a["se_mpa"], 700.0)
+        assert "6-8" in a["se_source"]
+
+    def test_static_overload_when_mean_reaches_strength(self):
+        """sm=400 == Sut -> Goodman denominator collapses: static failure, not fatigue."""
+        a = fatigue_anchor(500.0, 300.0, ultimate_mpa=400.0, endurance_mpa=200.0)
+        assert a is not None
+        assert a["regime"] == "static_overload"
+        assert a["fos_endurance"] == 0.0
+
+    def test_no_amplitude_is_not_a_fatigue_problem(self):
+        a = fatigue_anchor(150.0, 150.0, ultimate_mpa=400.0)
+        assert a is not None
+        assert a["regime"] == "static_no_amplitude"
+        assert a["cycles"] is None
+
+    def test_not_confident_paths_return_none(self):
+        # Missing/invalid ultimate strength.
+        assert fatigue_anchor(200.0, 0.0, ultimate_mpa=0.0) is None
+        assert fatigue_anchor(200.0, 0.0, ultimate_mpa=float("nan")) is None
+        # Reversed max/min.
+        assert fatigue_anchor(0.0, 200.0, ultimate_mpa=400.0) is None
+        # Soderberg without a yield strength.
+        assert fatigue_anchor(200.0, 0.0, ultimate_mpa=400.0,
+                              method="soderberg") is None
+        # Unknown method.
+        assert fatigue_anchor(200.0, 0.0, ultimate_mpa=400.0, method="gerber") is None

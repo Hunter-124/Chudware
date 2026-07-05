@@ -3,7 +3,7 @@ id: T-W2
 title: Sketch completion suite - auto-coincident pass, constraint advisor, sketch_health
 workstream: W
 owner: opus-reed
-status: doing
+status: review
 branch: task/T-W2-sketch-completion
 depends_on: []
 lane: ai-copilot

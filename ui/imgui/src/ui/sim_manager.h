@@ -161,6 +161,10 @@ struct Study {
 
     // Result state (transient — regenerated on Run; never persisted).
     bool hasResult = false;
+    // T-SIM2: per-study "Show contour" toggle. Lives on the Study (not one SimManager member) so
+    // it is per-study by construction — toggling contour off on study A never leaks to study B's
+    // Results view. Default on: a fresh result shows its contour immediately (SolidWorks style).
+    bool contourOn = true;
     std::string summary;
     std::string banner;
     std::vector<float> dragTrace;

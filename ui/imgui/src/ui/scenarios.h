@@ -116,6 +116,13 @@ struct ShotConfig {
     bool colormapOn = false;
     bool legendOn = false;
 
+    // T-SIM2: fea_overlay — load a precomputed FEA result AICM (real solver+skinning output,
+    // generated offline because Netgen is not provisionable in CI) and render the color-mapped
+    // contour + legend, without needing the live mesher. Settle-based one-shot (no worker solve).
+    bool wantFeaOverlay = false;
+    bool feaOverlayShotDone = false;
+    int  feaOverlaySettle = 0;
+
     // Perf harness (frame-driven; runs independent of workerStarted — see
     // ScenarioRunner::tickGlassperf).
     bool wantGlassperf = false;
@@ -124,8 +131,8 @@ struct ShotConfig {
 
     bool isScenarioMode() const {
         return wantM1 || wantSketch || wantSketchDispatch || wantSketchAutohide || wantSketchConvert
-            || wantAsm || wantFea || wantFlow || wantCam || wantDrawing || wantEvalMass
-            || wantActivity || wantMultidoc;
+            || wantAsm || wantFea || wantFeaOverlay || wantFlow || wantCam || wantDrawing
+            || wantEvalMass || wantActivity || wantMultidoc;
     }
 
     // Frame budget for the generic capture path (flow allows ~240 s at 60 Hz).

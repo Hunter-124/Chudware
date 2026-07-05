@@ -402,6 +402,7 @@ void setScenarioContext(ScenarioRunner* runner, ShotConfig* cfg) {
 int ShotConfig::captureFrameBudget() const {
     if (wantFlow && !flowShotDone) return 999999;
     if (wantFea && !feaShotDone) return 999999;
+    if (wantFeaOverlay && !feaOverlayShotDone) return 999999;  // T-SIM2: spin until overlay settles
     if (wantCam && !camShotDone) return 999999;
     if (wantEcad && !ecadShotDone) return 150;
     if (wantBom && !bomShotDone) return 150;
@@ -450,6 +451,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantSketchAutohide = eq("sketch_autohide");  // T-BL41 proof: annotations hidden unless SmartDim
     cfg.wantSketchConvert = eq("sketch_convert");   // T-BL43 Convert Entities in-sketch shot
     cfg.wantFea = eq("fea");
+    cfg.wantFeaOverlay = eq("fea_overlay");   // T-SIM2: precomputed-result contour render
     cfg.wantCam = eq("cam");
     cfg.wantFlow = eq("flow");
     cfg.wantDrawing = eq("drawing");
@@ -529,7 +531,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
         st.workspace = cmd::Workspace::Sketch;
         ribbon::applyShotEnv(st);
     }
-    if (cfg.wantFea || cfg.wantFlow) {
+    if (cfg.wantFea || cfg.wantFlow || cfg.wantFeaOverlay) {
         st.workspace = cmd::Workspace::Simulate;
         ribbon::applyShotEnv(st);
     }
@@ -2205,6 +2207,45 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
         }
     }
 
+    // ---------- fea_overlay (T-SIM2): render a precomputed FEA result contour ----------
+    // Netgen (the live tet mesher) is not provisionable in this environment, so the fully-live
+    // meshed solve cannot run here. This scenario instead loads a result AICM produced offline
+    // by the REAL fea_static_solve + static_overlay (surface skinning + nodal-field mapping +
+    // the T-SIM2 size cap) and drives the SAME viewport contour path the app uses at runtime
+    // (viewportLoadResultAicm -> C19 colormap LUT + deformed shape + legend). No worker needed.
+    if (cfg.wantFeaOverlay && !cfg.feaOverlayShotDone) {
+        // Re-assert the result overlay EVERY frame until capture. The viewport's per-frame
+        // ensureDocLoaded() reloads the editable model mesh whenever the engine revision moves
+        // (tab/doc setup during startup), which would clobber a one-shot overlay load — the real
+        // app avoids this by re-applying the overlay each frame from syncResultView() while the
+        // Results node is active. We mirror that here, and pin viewMeshRev to a sentinel so
+        // ensureDocLoaded() does not fight us on the settle frames.
+        const std::string aicm = repoBase() + "/contracts/fixtures/sim2_cantilever_result.aicm";
+        float vmin = 0.f, vmax = 1.f, dispHint = 1.f;
+        const bool ok = viewportLoadResultAicm(aicm, "von_mises", vmin, vmax, dispHint);
+        if (ok) {
+            // Make ensureDocLoaded() return early (viewMeshRev == revision && hasMesh()) so it does
+            // NOT re-derive the editable model mesh over our just-loaded result overlay.
+            st.viewMeshRev = st.engine.revision();
+            auto& vs = viewportState();
+            vs.legendOn    = true;
+            vs.legendTitle = "von Mises";
+            vs.legendUnits = "MPa";
+            vs.legendMin   = vmin;
+            vs.legendMax   = vmax;
+            if (dispHint > 0.f) viewportSetDeformScale(dispHint);  // SolidWorks-style deformed shape
+            st.workspace = cmd::Workspace::Simulate;
+        }
+        if (cfg.feaOverlaySettle == 0) {
+            std::printf("fea_overlay: load ok=%d vmin=%.3g vmax=%.3g dispHint=%.3g (%s)\n",
+                        (int)ok, vmin, vmax, dispHint, aicm.c_str());
+            std::fflush(stdout);
+            cfg.feaOverlaySettle = 8;  // hold a few frames so the colormap upload + camera frame settle
+        } else if (--cfg.feaOverlaySettle == 0) {
+            cfg.feaOverlayShotDone = true;
+        }
+    }
+
     // ---------- flow (240 s cap at 60 Hz) ----------
     if (cfg.wantFlow && st.workerStarted && !cfg.flowShotDone) {
         if (flowSettle > 0) { --flowSettle; return; }
@@ -2739,6 +2780,15 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppSt
     }
     if (cfg.wantFlow) {
         if (cfg.flowShotDone) {
+            writeBackbufferPng(screenshotPath, dw, dh);
+            if (win) glfwSwapBuffers(win);
+            return FrameAction::Break;
+        }
+        if (win) glfwSwapBuffers(win);
+        return FrameAction::Continue;
+    }
+    if (cfg.wantFeaOverlay) {  // T-SIM2: capture the precomputed-result contour once it settles
+        if (cfg.feaOverlayShotDone) {
             writeBackbufferPng(screenshotPath, dw, dh);
             if (win) glfwSwapBuffers(win);
             return FrameAction::Break;

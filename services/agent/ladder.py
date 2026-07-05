@@ -224,13 +224,47 @@ def _artifact_of(reply: str, rung: str) -> dict:
 
 # --------------------------------------------------------------------------- ledger scoping
 
+_ARTIFACTS_HEADER = "## Artifacts"
+
+
+def _strip_artifacts_section(rendered: str) -> str:
+    """Remove the ledger's Artifacts section from a render.
+
+    The fresh-context rule must NOT depend on token-budget truncation. A rung's prior
+    artifacts arrive ONLY through the explicit, §22-scoped ``prior_artifacts`` — never
+    through the ledger. Rung artifacts ARE recorded to the ledger (replayability), so
+    we defensively excise the Artifacts section from every rung's ledger slice: this
+    guarantees a prior rung's artifact (e.g. the function_map) can never re-enter a
+    later rung (C/D) via the ledger, at ANY budget. (Belt-and-suspenders: the ladder
+    also stores only a compact artifact SUMMARY, not the payload — see _record_artifact.)
+    """
+    lines = rendered.splitlines()
+    out: list[str] = []
+    skipping = False
+    for line in lines:
+        if line.strip().startswith(_ARTIFACTS_HEADER):
+            skipping = True
+            continue
+        if skipping:
+            # a blank line or a new top-level "## " header ends the section
+            if line.startswith("## ") and not line.strip().startswith(_ARTIFACTS_HEADER):
+                skipping = False
+                out.append(line)
+            # else: still inside the artifacts block → drop the line
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def _scoped_ledger_slice(ledger: Ledger, rung: str) -> str:
     """The scoped ledger render for a rung. Rung A needs the full spec (brief +
     requirements + dimensions); later rungs get a lean dims-only slice (their real
     input is the prior artifact, not the ledger). All rungs stay within the
-    design_thinker ledger budget so no rung ever sees the whole mission log."""
+    design_thinker ledger budget so no rung ever sees the whole mission log, and the
+    Artifacts section is excised so a prior rung's artifact can never leak in via the
+    ledger regardless of budget (fresh-context by construction, not by truncation)."""
     budget = _LEDGER_BUDGET_TOKENS if rung == "function_map" else 300
-    return ledger_render(ledger, budget)
+    return _strip_artifacts_section(ledger_render(ledger, budget))
 
 
 def _acceptance_criteria(ledger: Ledger) -> list[str]:
@@ -334,6 +368,13 @@ def run_ladder(
     Returns a LadderResult.
     """
     card = load_role("design_thinker")
+    # §22: MANDATORY at full — all four rungs run (no pre-seeding a rung away). At
+    # minimal a frontier model may skip earlier rungs via seed_artifacts, but the
+    # validators still run on whatever IS produced.
+    if deliberation == "full" and seed_artifacts:
+        raise ValueError(
+            "deliberation='full' runs all four rungs; seed_artifacts is only for "
+            "'minimal' (frontier direct-to-rung). Use deliberation='minimal' to seed.")
     artifacts: dict[str, dict] = dict(seed_artifacts or {})
     all_findings: list[dict] = []
 
@@ -347,9 +388,13 @@ def run_ladder(
             ledger, provider, card, rung, scoped, on_event=on_event)
         all_findings.extend(findings)
         if artifact is None:
-            # exhausted bounces → council (if available) or escalate
-            if council_cb is not None and rung == "build_pathway":
-                pass  # council would arbitrate, but a failed D has nothing to critique
+            # Exhausted MAX_BOUNCES on this rung. §22: "2 bounces → council or
+            # escalate". A council can only critique a VALID artifact (its seats read
+            # the artifact); a rung that never produced a valid artifact has nothing to
+            # convene over, so we escalate. The council DOES run — on a valid rung D —
+            # via council_cb below (the §22 checkpoint), not here.
+            if on_event:
+                on_event("ladder_escalate", {"rung": rung, "reason": "bounces_exhausted"})
             return LadderResult(status="escalated", artifacts=artifacts,
                                 escalated_rung=rung, findings=all_findings)
         artifacts[rung] = artifact
@@ -386,12 +431,25 @@ def run_ladder(
 # --------------------------------------------------------------------------- ledger events
 
 def _record_artifact(ledger: Ledger, rung: str, artifact: dict) -> None:
-    """Write a rung artifact to the ledger as a replayable artifact event."""
+    """Write a rung artifact to the ledger as a replayable artifact event.
+
+    The event payload records a compact SUMMARY (schema/rung/id + a shallow shape
+    fingerprint), NOT the full artifact body. Two reasons: (1) the ledger's Artifacts
+    section only surfaces {kind,id,path,stage,note} anyway; (2) keeping the payload out
+    of queryable ``state["artifacts"]`` means no downstream rung's ledger slice can
+    ever carry a prior rung's artifact text — the fresh-context rule holds by
+    construction, not by render truncation. The full artifact lives in the ladder's
+    in-memory ``artifacts`` dict (the real data flow) and, replayably, in the rung
+    handoff event the executor would emit in the live pipeline."""
+    fingerprint = {k: (len(v) if isinstance(v, list) else "…")
+                   for k, v in artifact.items()}
     ledger.append("design_thinker", "artifact", {
         "schema": "aicad.ladder/1",
         "id": rung,
         "rung": rung,
-        "artifact": artifact,
+        "kind": "ladder_artifact",
+        "note": f"{rung} shape={fingerprint}",
+        "stage": "spec" if rung != "build_pathway" else "layout",
     })
 
 

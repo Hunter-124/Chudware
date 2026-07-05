@@ -161,6 +161,7 @@ class ScriptedLadderProvider:
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.replies: list[dict] = []  # what we returned, per rung
 
     def complete(self, system: str, messages: list[dict], max_tokens: int = 8000) -> str:
         # Flatten the assembled prompt (system + all message text) — this IS the rung's
@@ -173,13 +174,15 @@ class ScriptedLadderProvider:
         if rung == "function_map":
             # Plant the sentinel in rung A's private reasoning — it must never reach B/C/D.
             reasoning = f"{reasoning} {SENTINEL}"
-        return json.dumps({
+        reply = json.dumps({
             "schema": "aicad.handoff/1",
             "role": "design_thinker",
             "status": "done",
             "summary": f"emitted {rung}",
             "outputs": {"rung": rung, "artifact": artifact, "reasoning_summary": reasoning},
         })
+        self.replies.append({"rung": rung, "reply": reply})
+        return reply
 
 
 # --------------------------------------------------------------------------- base
@@ -206,19 +209,41 @@ class TestFreshContext(_LadderTestCase):
         return result, prov, by_rung
 
     def test_fresh_context_no_leak(self):
-        """A sentinel planted in rung A's reasoning appears in NO downstream rung's
-        assembled context. This is the leak-detection assertion."""
+        """A sentinel planted in rung A's REPLY appears in NO downstream rung's
+        assembled INPUT context. Proven positively: the sentinel really did enter the
+        system (it is in rung A's reply), and then it is absent from every rung's input
+        — so the assertion cannot pass vacuously if the planting silently broke."""
         _result, prov, by_rung = self._run_and_capture()
-        # Sanity: the sentinel really was emitted by rung A.
-        self.assertTrue(any(SENTINEL in json.dumps(c) for c in prov.calls) is False,
-                        "sentinel must live only in the REPLY, never fed back into a prompt")
-        # No rung's INPUT context may contain the sentinel.
+        # Positive control: the sentinel WAS emitted in rung A's reply.
+        a_replies = [r["reply"] for r in prov.replies if r["rung"] == "function_map"]
+        self.assertTrue(a_replies, "rung A never produced a reply")
+        self.assertTrue(any(SENTINEL in r for r in a_replies),
+                        "positive control failed: sentinel not in rung A reply — the "
+                        "leak test would be vacuous; fix the fixture before trusting it")
+        # It must appear in NO rung's INPUT context (system + messages).
         for rung, calls in by_rung.items():
             for call in calls:
                 self.assertNotIn(
                     SENTINEL, call["flat"],
                     f"rung {rung!r} context leaked the rung-A sentinel — fresh-context violated",
                 )
+
+    def test_ledger_slice_excludes_prior_artifacts_at_any_budget(self):
+        """The fresh-context rule must NOT rest on token-budget truncation. After a full
+        run, the downstream rungs' ledger slices exclude the Artifacts section, so a
+        prior rung's artifact (the function_map text) cannot re-enter via the ledger at
+        ANY budget."""
+        from services.agent.ledger import ledger_render
+        prov = ScriptedLadderProvider()
+        ladder.run_ladder(self.ledger, prov, deliberation="full")
+        # High-budget raw render (worst case for leakage).
+        big = ledger_render(self.ledger, 100000)
+        stripped = ladder._strip_artifacts_section(big)
+        self.assertNotIn("locate the 6202 bearing", stripped,
+                         "function_map text must not survive in a downstream ledger slice")
+        # And the executor's actual downstream slice is clean too.
+        c_slice = ladder._scoped_ledger_slice(self.ledger, "linkage_map")
+        self.assertNotIn("locate the 6202 bearing", c_slice)
 
     def test_fresh_context_scoping(self):
         """Each rung's context contains EXACTLY the artifacts §22 names for it, and

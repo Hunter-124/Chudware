@@ -74,3 +74,12 @@ langgraph>=1.0.0      # MIT — DAG orchestration used by services/dag/
 pydantic>=2.0.0       # MIT — FastMCP tool arg schemas (indirect, via mcp package)
 qrcode>=7.0           # MIT — QR code generation used by engine_oracle/
 lib3mf>=2.5.0         # BSD — 3MF mesh file I/O (T-V4 audit: installed but undeclared)
+
+# user-authenticated headless-browser acquisition (T-X1, Hunter directive 2026-07-04).
+# Apache-2.0. Chosen over Selenium/Puppeteer-node: first-party async+sync Python API and
+# built-in persistent-context (storage_state) support, which is exactly the "save the
+# user's own logged-in session locally" primitive this workstream needs. Chromium browser
+# binary is a separate one-time `playwright install chromium` step, not a pip dependency
+# (see services/browser/README.md); services/browser/session.py lazy-imports this package
+# so its absence degrades cleanly instead of crashing MCP server startup.
+playwright==1.61.0

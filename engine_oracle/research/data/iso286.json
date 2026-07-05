@@ -1,0 +1,285 @@
+{
+  "_schema": "aicad.iso286/1",
+  "_citation": "ISO 286-2:2010 + ISO 286-1:2010",
+  "_notes": [
+    "IT grades IT5-IT12 computed from i = 0.45*D^(1/3) + 0.001*D, D = geometric mean of range bounds (um), rounded to nearest integer um. source.kind='closed_form'.",
+    "Fundamental deviations for lowercase shafts a-h and js: formula-derived (source.kind='closed_form'). Shafts k,n,p,r,s: tabulated from ISO 286-1 Table 9 (source.kind='table').",
+    "Hole deviations: H only (EI=0, ES=+IT) in this release; K/M/N/P/R/S require the delta-correction rule (ISO 286-1 clause 5.3) and are deferred (marked 'todo'). T-W3 spot-checks only exercise H holes.",
+    "D_mean convention: for range [lo, hi], D = sqrt(lo*hi) except 1-3 where D = sqrt(1*3) = 1.732 mm.",
+    "All deviations in micrometres (um). Sign convention: positive = above nominal, negative = below nominal.",
+    "Ranges use ISO 286 'over X up to and including Y' convention (e.g. 50mm falls in 30-50 range, not 50-80)."
+  ],
+
+  "it_grades": {
+    "_formula": "IT = round(multiplier * i), where i = 0.45*D^(1/3)+0.001*D (um), D in mm",
+    "_multipliers": {"IT5": 7, "IT6": 10, "IT7": 16, "IT8": 25, "IT9": 40, "IT10": 64, "IT11": 100, "IT12": 160},
+    "_source_kind": "closed_form",
+    "ranges": [
+      {
+        "over_mm": 1, "up_to_mm": 3, "D_mean_mm": 1.732, "i_um": 0.5422,
+        "IT5": 4, "IT6": 5, "IT7": 9, "IT8": 14, "IT9": 22, "IT10": 35, "IT11": 54, "IT12": 87
+      },
+      {
+        "over_mm": 3, "up_to_mm": 6, "D_mean_mm": 4.243, "i_um": 0.7327,
+        "IT5": 5, "IT6": 7, "IT7": 12, "IT8": 18, "IT9": 29, "IT10": 47, "IT11": 73, "IT12": 117
+      },
+      {
+        "over_mm": 6, "up_to_mm": 10, "D_mean_mm": 7.746, "i_um": 0.8981,
+        "IT5": 6, "IT6": 9, "IT7": 14, "IT8": 22, "IT9": 36, "IT10": 57, "IT11": 90, "IT12": 144
+      },
+      {
+        "over_mm": 10, "up_to_mm": 18, "D_mean_mm": 13.416, "i_um": 1.0827,
+        "IT5": 8, "IT6": 11, "IT7": 17, "IT8": 27, "IT9": 43, "IT10": 69, "IT11": 108, "IT12": 173
+      },
+      {
+        "over_mm": 18, "up_to_mm": 30, "D_mean_mm": 23.238, "i_um": 1.3074,
+        "IT5": 9, "IT6": 13, "IT7": 21, "IT8": 33, "IT9": 52, "IT10": 84, "IT11": 131, "IT12": 209
+      },
+      {
+        "over_mm": 30, "up_to_mm": 50, "D_mean_mm": 38.730, "i_um": 1.5612,
+        "IT5": 11, "IT6": 16, "IT7": 25, "IT8": 39, "IT9": 62, "IT10": 100, "IT11": 156, "IT12": 250
+      },
+      {
+        "over_mm": 50, "up_to_mm": 80, "D_mean_mm": 63.246, "i_um": 1.8561,
+        "IT5": 13, "IT6": 19, "IT7": 30, "IT8": 46, "IT9": 74, "IT10": 119, "IT11": 186, "IT12": 297
+      },
+      {
+        "over_mm": 80, "up_to_mm": 120, "D_mean_mm": 97.980, "i_um": 2.1725,
+        "IT5": 15, "IT6": 22, "IT7": 35, "IT8": 54, "IT9": 87, "IT10": 139, "IT11": 217, "IT12": 348
+      },
+      {
+        "over_mm": 120, "up_to_mm": 180, "D_mean_mm": 146.969, "i_um": 2.5217,
+        "IT5": 18, "IT6": 25, "IT7": 40, "IT8": 63, "IT9": 101, "IT10": 161, "IT11": 252, "IT12": 403
+      },
+      {
+        "over_mm": 180, "up_to_mm": 250, "D_mean_mm": 212.132, "i_um": 2.8959,
+        "IT5": 20, "IT6": 29, "IT7": 46, "IT8": 72, "IT9": 116, "IT10": 185, "IT11": 290, "IT12": 463
+      },
+      {
+        "over_mm": 250, "up_to_mm": 315, "D_mean_mm": 280.624, "i_um": 3.2268,
+        "IT5": 23, "IT6": 32, "IT7": 52, "IT8": 81, "IT9": 129, "IT10": 207, "IT11": 323, "IT12": 516
+      },
+      {
+        "over_mm": 315, "up_to_mm": 400, "D_mean_mm": 354.965, "i_um": 3.5412,
+        "IT5": 25, "IT6": 35, "IT7": 57, "IT8": 89, "IT9": 142, "IT10": 227, "IT11": 354, "IT12": 567
+      },
+      {
+        "over_mm": 400, "up_to_mm": 500, "D_mean_mm": 447.214, "i_um": 3.8885,
+        "IT5": 27, "IT6": 39, "IT7": 62, "IT8": 97, "IT9": 156, "IT10": 249, "IT11": 389, "IT12": 622
+      }
+    ]
+  },
+
+  "shaft_deviations": {
+    "_note": "Upper deviation (es) in um. Lower deviation ei = es - IT_grade. Negative = below nominal.",
+    "d": {
+      "_formula": "es = -16 * D^0.44 (um), rounded to nearest integer",
+      "_source_kind": "closed_form",
+      "_citation": "ISO 286-1:2010 Table 9 formula group",
+      "ranges": [
+        {"over_mm": 1, "up_to_mm": 3, "es_um": -20},
+        {"over_mm": 3, "up_to_mm": 6, "es_um": -30},
+        {"over_mm": 6, "up_to_mm": 10, "es_um": -39},
+        {"over_mm": 10, "up_to_mm": 18, "es_um": -50},
+        {"over_mm": 18, "up_to_mm": 30, "es_um": -64},
+        {"over_mm": 30, "up_to_mm": 50, "es_um": -80},
+        {"over_mm": 50, "up_to_mm": 80, "es_um": -99},
+        {"over_mm": 80, "up_to_mm": 120, "es_um": -120},
+        {"over_mm": 120, "up_to_mm": 180, "es_um": -144},
+        {"over_mm": 180, "up_to_mm": 250, "es_um": -169},
+        {"over_mm": 250, "up_to_mm": 315, "es_um": -191},
+        {"over_mm": 315, "up_to_mm": 400, "es_um": -212},
+        {"over_mm": 400, "up_to_mm": 500, "es_um": -235}
+      ]
+    },
+    "e": {
+      "_formula": "es = -11 * D^0.41 (um), rounded to nearest integer",
+      "_source_kind": "closed_form",
+      "_citation": "ISO 286-1:2010 Table 9 formula group",
+      "ranges": [
+        {"over_mm": 1, "up_to_mm": 3, "es_um": -14},
+        {"over_mm": 3, "up_to_mm": 6, "es_um": -20},
+        {"over_mm": 6, "up_to_mm": 10, "es_um": -25},
+        {"over_mm": 10, "up_to_mm": 18, "es_um": -32},
+        {"over_mm": 18, "up_to_mm": 30, "es_um": -40},
+        {"over_mm": 30, "up_to_mm": 50, "es_um": -49},
+        {"over_mm": 50, "up_to_mm": 80, "es_um": -60},
+        {"over_mm": 80, "up_to_mm": 120, "es_um": -72},
+        {"over_mm": 120, "up_to_mm": 180, "es_um": -85},
+        {"over_mm": 180, "up_to_mm": 250, "es_um": -99},
+        {"over_mm": 250, "up_to_mm": 315, "es_um": -111},
+        {"over_mm": 315, "up_to_mm": 400, "es_um": -122},
+        {"over_mm": 400, "up_to_mm": 500, "es_um": -134}
+      ]
+    },
+    "f": {
+      "_formula": "es = -5.5 * D^0.41 (um), rounded to nearest integer",
+      "_source_kind": "closed_form",
+      "_citation": "ISO 286-1:2010 Table 9 formula group",
+      "ranges": [
+        {"over_mm": 1, "up_to_mm": 3, "es_um": -7},
+        {"over_mm": 3, "up_to_mm": 6, "es_um": -10},
+        {"over_mm": 6, "up_to_mm": 10, "es_um": -13},
+        {"over_mm": 10, "up_to_mm": 18, "es_um": -16},
+        {"over_mm": 18, "up_to_mm": 30, "es_um": -20},
+        {"over_mm": 30, "up_to_mm": 50, "es_um": -25},
+        {"over_mm": 50, "up_to_mm": 80, "es_um": -30},
+        {"over_mm": 80, "up_to_mm": 120, "es_um": -36},
+        {"over_mm": 120, "up_to_mm": 180, "es_um": -43},
+        {"over_mm": 180, "up_to_mm": 250, "es_um": -49},
+        {"over_mm": 250, "up_to_mm": 315, "es_um": -55},
+        {"over_mm": 315, "up_to_mm": 400, "es_um": -61},
+        {"over_mm": 400, "up_to_mm": 500, "es_um": -67}
+      ]
+    },
+    "g": {
+      "_formula": "es = -2.5 * D^0.34 (um), rounded to nearest integer",
+      "_source_kind": "closed_form",
+      "_citation": "ISO 286-1:2010 Table 9 formula group",
+      "ranges": [
+        {"over_mm": 1, "up_to_mm": 3, "es_um": -3},
+        {"over_mm": 3, "up_to_mm": 6, "es_um": -4},
+        {"over_mm": 6, "up_to_mm": 10, "es_um": -5},
+        {"over_mm": 10, "up_to_mm": 18, "es_um": -6},
+        {"over_mm": 18, "up_to_mm": 30, "es_um": -7},
+        {"over_mm": 30, "up_to_mm": 50, "es_um": -9},
+        {"over_mm": 50, "up_to_mm": 80, "es_um": -10},
+        {"over_mm": 80, "up_to_mm": 120, "es_um": -12},
+        {"over_mm": 120, "up_to_mm": 180, "es_um": -14},
+        {"over_mm": 180, "up_to_mm": 250, "es_um": -15},
+        {"over_mm": 250, "up_to_mm": 315, "es_um": -17},
+        {"over_mm": 315, "up_to_mm": 400, "es_um": -18},
+        {"over_mm": 400, "up_to_mm": 500, "es_um": -20}
+      ]
+    },
+    "h": {
+      "_note": "h shaft: fundamental deviation es=0 always. ei = -IT_grade.",
+      "_source_kind": "closed_form",
+      "_citation": "ISO 286-1:2010 §5.2 — h shaft zero-deviation reference"
+    },
+    "js": {
+      "_note": "js shaft: symmetric; es = +floor(IT/2), ei = -ceil(IT/2). Formula-derived.",
+      "_source_kind": "closed_form",
+      "_citation": "ISO 286-1:2010 §5.2 — js bilateral tolerance"
+    },
+    "k": {
+      "_note": "k shaft: upper deviation es tabulated (ISO 286-1 Table 8, IT6 values shown). source.kind=table. es is non-negative (transition/slight-interference). ei = es - IT_grade.",
+      "_source_kind": "table",
+      "_citation": "ISO 286-1:2010 Table 8",
+      "ranges": [
+        {"over_mm": 1, "up_to_mm": 3, "es_um": 0},
+        {"over_mm": 3, "up_to_mm": 6, "es_um": 1},
+        {"over_mm": 6, "up_to_mm": 10, "es_um": 1},
+        {"over_mm": 10, "up_to_mm": 18, "es_um": 1},
+        {"over_mm": 18, "up_to_mm": 30, "es_um": 2},
+        {"over_mm": 30, "up_to_mm": 50, "es_um": 2},
+        {"over_mm": 50, "up_to_mm": 80, "es_um": 2},
+        {"over_mm": 80, "up_to_mm": 120, "es_um": 3},
+        {"over_mm": 120, "up_to_mm": 180, "es_um": 3},
+        {"over_mm": 180, "up_to_mm": 250, "es_um": 4},
+        {"over_mm": 250, "up_to_mm": 315, "es_um": 4},
+        {"over_mm": 315, "up_to_mm": 400, "es_um": 4},
+        {"over_mm": 400, "up_to_mm": 500, "es_um": 5}
+      ]
+    },
+    "n": {
+      "_note": "n shaft: upper deviation es tabulated (ISO 286-1 Table 9). source.kind=table.",
+      "_source_kind": "table",
+      "_citation": "ISO 286-1:2010 Table 9",
+      "ranges": [
+        {"over_mm": 1, "up_to_mm": 3, "es_um": 4},
+        {"over_mm": 3, "up_to_mm": 6, "es_um": 8},
+        {"over_mm": 6, "up_to_mm": 10, "es_um": 10},
+        {"over_mm": 10, "up_to_mm": 18, "es_um": 12},
+        {"over_mm": 18, "up_to_mm": 30, "es_um": 17},
+        {"over_mm": 30, "up_to_mm": 50, "es_um": 20},
+        {"over_mm": 50, "up_to_mm": 80, "es_um": 26},
+        {"over_mm": 80, "up_to_mm": 120, "es_um": 30},
+        {"over_mm": 120, "up_to_mm": 180, "es_um": 36},
+        {"over_mm": 180, "up_to_mm": 250, "es_um": 42},
+        {"over_mm": 250, "up_to_mm": 315, "es_um": 48},
+        {"over_mm": 315, "up_to_mm": 400, "es_um": 56},
+        {"over_mm": 400, "up_to_mm": 500, "es_um": 62}
+      ]
+    },
+    "p": {
+      "_note": "p shaft: upper deviation es tabulated (ISO 286-1 Table 9). source.kind=table. es > 0 = interference above nominal.",
+      "_source_kind": "table",
+      "_citation": "ISO 286-1:2010 Table 9",
+      "ranges": [
+        {"over_mm": 1, "up_to_mm": 3, "es_um": 12},
+        {"over_mm": 3, "up_to_mm": 6, "es_um": 20},
+        {"over_mm": 6, "up_to_mm": 10, "es_um": 24},
+        {"over_mm": 10, "up_to_mm": 18, "es_um": 29},
+        {"over_mm": 18, "up_to_mm": 30, "es_um": 35},
+        {"over_mm": 30, "up_to_mm": 50, "es_um": 42},
+        {"over_mm": 50, "up_to_mm": 80, "es_um": 51},
+        {"over_mm": 80, "up_to_mm": 120, "es_um": 59},
+        {"over_mm": 120, "up_to_mm": 180, "es_um": 68},
+        {"over_mm": 180, "up_to_mm": 250, "es_um": 79},
+        {"over_mm": 250, "up_to_mm": 315, "es_um": 88},
+        {"over_mm": 315, "up_to_mm": 400, "es_um": 98},
+        {"over_mm": 400, "up_to_mm": 500, "es_um": 108}
+      ]
+    },
+    "r": {
+      "_note": "r shaft: upper deviation es tabulated (ISO 286-1 Table 9). source.kind=table.",
+      "_source_kind": "table",
+      "_citation": "ISO 286-1:2010 Table 9",
+      "ranges": [
+        {"over_mm": 1, "up_to_mm": 3, "es_um": 6},
+        {"over_mm": 3, "up_to_mm": 6, "es_um": 10},
+        {"over_mm": 6, "up_to_mm": 10, "es_um": 13},
+        {"over_mm": 10, "up_to_mm": 18, "es_um": 16},
+        {"over_mm": 18, "up_to_mm": 30, "es_um": 21},
+        {"over_mm": 30, "up_to_mm": 50, "es_um": 25},
+        {"over_mm": 50, "up_to_mm": 80, "es_um": 34},
+        {"over_mm": 80, "up_to_mm": 120, "es_um": 41},
+        {"over_mm": 120, "up_to_mm": 180, "es_um": 50},
+        {"over_mm": 180, "up_to_mm": 250, "es_um": 60},
+        {"over_mm": 250, "up_to_mm": 315, "es_um": 66},
+        {"over_mm": 315, "up_to_mm": 400, "es_um": 78},
+        {"over_mm": 400, "up_to_mm": 500, "es_um": 87}
+      ]
+    },
+    "s": {
+      "_note": "s shaft: upper deviation es tabulated (ISO 286-1 Table 9). source.kind=table.",
+      "_source_kind": "table",
+      "_citation": "ISO 286-1:2010 Table 9",
+      "ranges": [
+        {"over_mm": 1, "up_to_mm": 3, "es_um": 14},
+        {"over_mm": 3, "up_to_mm": 6, "es_um": 19},
+        {"over_mm": 6, "up_to_mm": 10, "es_um": 23},
+        {"over_mm": 10, "up_to_mm": 18, "es_um": 28},
+        {"over_mm": 18, "up_to_mm": 30, "es_um": 35},
+        {"over_mm": 30, "up_to_mm": 50, "es_um": 43},
+        {"over_mm": 50, "up_to_mm": 80, "es_um": 59},
+        {"over_mm": 80, "up_to_mm": 120, "es_um": 79},
+        {"over_mm": 120, "up_to_mm": 180, "es_um": 108},
+        {"over_mm": 180, "up_to_mm": 250, "es_um": 140},
+        {"over_mm": 250, "up_to_mm": 315, "es_um": 170},
+        {"over_mm": 315, "up_to_mm": 400, "es_um": 208},
+        {"over_mm": 400, "up_to_mm": 500, "es_um": 252}
+      ]
+    }
+  },
+
+  "hole_deviations": {
+    "_note": "H hole: EI=0 (fundamental deviation), ES=+IT_grade. This is the hole-basis reference. Other uppercase holes (G, F, E, D, JS, K, N, P, R, S) require the delta-correction rule per ISO 286-1 clause 5.3 and are deferred (marked 'todo'). T-W3 spot-checks use H holes only.",
+    "H": {
+      "_note": "H hole: EI=0, ES=+IT_grade. formula-derived.",
+      "_source_kind": "closed_form",
+      "_citation": "ISO 286-1:2010 §5.2 — H hole zero-deviation reference"
+    },
+    "G": {"_todo": "G hole deviation requires -es_g + delta correction per ISO 286-1 §5.3. Deferred."},
+    "F": {"_todo": "F hole deviation deferred."},
+    "E": {"_todo": "E hole deviation deferred."},
+    "D": {"_todo": "D hole deviation deferred."},
+    "JS": {"_note": "JS hole: bilateral, ES=+floor(IT/2), EI=-ceil(IT/2). Symmetric, formula-derived.", "_source_kind": "closed_form"},
+    "K": {"_todo": "K hole deviation requires delta correction per ISO 286-1 §5.3. Deferred."},
+    "N": {"_todo": "N hole deviation requires delta correction per ISO 286-1 §5.3. Deferred."},
+    "P": {"_todo": "P hole deviation requires delta correction per ISO 286-1 §5.3. Deferred."},
+    "R": {"_todo": "R hole deviation deferred."},
+    "S": {"_todo": "S hole deviation deferred."}
+  }
+}

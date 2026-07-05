@@ -12,6 +12,7 @@ from .cache import Cache, knowledge_root
 from .datasheet_fetch import datasheet_fetch
 from .eng_calc import eng_calc
 from .fetch_page import fetch_page
+from .fits import fit_calc, recommend_fit, tolerance_band
 from .material_lookup import material_lookup
 from .standard_section import standard_section
 from .thread_spec import thread_spec
@@ -28,6 +29,10 @@ __all__ = [
     "datasheet_fetch",
     "unit_convert",
     "eng_calc",
+    # T-W3 ISO 286 fit calculator (aicad.calc/1 envelope)
+    "fit_calc",
+    "recommend_fit",
+    "tolerance_band",
     "Cache",
     "knowledge_root",
     "common",

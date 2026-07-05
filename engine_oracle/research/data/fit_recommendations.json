@@ -1,0 +1,118 @@
+{
+  "_schema": "aicad.fit_recommendations/1",
+  "_citation": "ISO 286-2:2010, Shigley's Mechanical Engineering Design (10th ed.), Machinery's Handbook (31st ed.)",
+  "_note": "Maps functional keywords to recommended ISO 286 fit classes with rationale. Append-friendly for future expansions (T-W6 feeds/speeds will sit beside this).",
+
+  "fits": [
+    {
+      "id": "free_running",
+      "keywords": ["free", "free run", "free running", "loose", "coarse"],
+      "character": "clearance",
+      "recommended_classes": ["H11/d11", "H9/d9"],
+      "typical_clearance_range_um": [40, 500],
+      "rationale": "Large clearance for freely rotating parts in poor alignment or temperature variation. Not intended for precision bearing surfaces.",
+      "applications": ["loose pulleys", "agricultural machinery", "non-precision shafts", "rapid assembly"],
+      "notes": "H11/d11 is the go-to when fit doesn't matter much; H9/d9 for moderate precision needs."
+    },
+    {
+      "id": "easy_running",
+      "keywords": ["easy", "easy run", "easy running", "run", "running", "bearing", "journal"],
+      "character": "clearance",
+      "recommended_classes": ["H9/f9", "H8/f7"],
+      "typical_clearance_range_um": [10, 100],
+      "rationale": "Moderate clearance for rotating parts that need lubrication. Good general-purpose running fit.",
+      "applications": ["general shaft bearings", "journal bearings", "gear shafts", "pump shafts"],
+      "notes": "H8/f7 is widely used for precision running fits. Requires lubrication."
+    },
+    {
+      "id": "sliding",
+      "keywords": ["slide", "sliding", "precision slide", "precision sliding", "slide fit"],
+      "character": "clearance",
+      "recommended_classes": ["H7/g6"],
+      "typical_clearance_range_um": [2, 25],
+      "rationale": "Small controlled clearance for sliding without rotation. Parts can be assembled/disassembled by hand.",
+      "applications": ["lathe spindles", "milling arbors", "precision machine slides", "gearbox shafts not rotating"],
+      "notes": "Classic precision sliding fit. 20H7/g6 gives 0.007-0.041mm clearance on 20mm nominal."
+    },
+    {
+      "id": "close_running",
+      "keywords": ["close", "close run", "close running", "high speed", "accurate", "precision run"],
+      "character": "clearance",
+      "recommended_classes": ["H8/h7", "H7/h6"],
+      "typical_clearance_range_um": [0, 30],
+      "rationale": "Very small clearance for precision fits; parts can be pushed together by hand under light pressure.",
+      "applications": ["precision spindles", "instrument bearings", "high-speed shafts with good alignment"],
+      "notes": "Smallest reliable clearance class. H7/h6 gives near-zero to small clearance."
+    },
+    {
+      "id": "location_clearance",
+      "keywords": ["locate", "location", "locating", "location clearance", "snug"],
+      "character": "clearance",
+      "recommended_classes": ["H7/h6", "H6/h5"],
+      "typical_clearance_range_um": [0, 21],
+      "rationale": "Precise location with minimum clearance. Allows assembly/disassembly without press.",
+      "applications": ["hubs on shafts", "precision locating pins", "gauges", "master gears"],
+      "notes": "Tightest reliable clearance. H7/h6 is the most common precision-location class."
+    },
+    {
+      "id": "location_transition",
+      "keywords": ["transition", "location transition", "accurate location", "push"],
+      "character": "transition",
+      "recommended_classes": ["H7/k6", "H7/n6"],
+      "typical_clearance_range_um": [-13, 21],
+      "rationale": "Transition fit: slight clearance or slight interference depending on actual sizes. Location without relying on press fit.",
+      "applications": ["hubs", "gears on shafts", "coupling halves", "spigots"],
+      "notes": "k6 gives primarily clearance with occasional zero-play; n6 gives slight interference. Both require a key or pin to transmit torque."
+    },
+    {
+      "id": "location_interference",
+      "keywords": ["location interference", "drive", "tight", "light press"],
+      "character": "transition_to_press",
+      "recommended_classes": ["H7/p6"],
+      "typical_clearance_range_um": [-42, -1],
+      "rationale": "Light interference fit requiring a press. Provides good location and limited torque transfer without keys on smaller diameters.",
+      "applications": ["permanent gears", "bushings in housings", "bronze bearings in housings", "dowel holes"],
+      "notes": "50H7/p6 gives 0.001-0.042mm interference — press fit, not hand assembly. Verify with fit_calc."
+    },
+    {
+      "id": "press_fit",
+      "keywords": ["press", "press fit", "force", "force fit", "shrink", "interference", "heavy press"],
+      "character": "press",
+      "recommended_classes": ["H7/r6", "H7/s6"],
+      "typical_clearance_range_um": [-93, -1],
+      "rationale": "Substantial interference requiring hydraulic press or thermal expansion. Reliable torque and axial load without fasteners.",
+      "applications": ["wheel hubs", "heavy-duty gear hubs", "permanent bushings", "bearing seats (heavy)"],
+      "notes": "r6 is moderate press; s6 is heavy press. Thermal assembly recommended for large diameters."
+    },
+    {
+      "id": "dowel",
+      "keywords": ["dowel", "dowel pin", "pin", "precision pin"],
+      "character": "press",
+      "recommended_classes": ["H7/p6", "H7/n6"],
+      "typical_clearance_range_um": [-42, 0],
+      "rationale": "Dowel pins need interference or tight transition to maintain location under repeated assembly.",
+      "applications": ["fixture dowels", "alignment pins", "jig dowels"],
+      "notes": "Use p6 for permanent dowels, n6 for removable. Material matters: steel in aluminum vs steel in steel."
+    },
+    {
+      "id": "bearing_seat_inner",
+      "keywords": ["bearing seat", "bearing inner", "bearing bore", "inner ring"],
+      "character": "transition_to_press",
+      "recommended_classes": ["H7/k6", "H7/m6", "H7/n6"],
+      "typical_clearance_range_um": [-25, 10],
+      "rationale": "Rolling bearing inner ring on shaft: k6 for rotating inner ring with light load, m6/n6 for heavier loads.",
+      "applications": ["deep groove ball bearings", "cylindrical roller bearings", "tapered roller bearings"],
+      "notes": "Follow bearing manufacturer recommendation. ISO 286 fits may be tighter than generic table when outer ring rotates."
+    },
+    {
+      "id": "bearing_seat_outer",
+      "keywords": ["bearing housing", "bearing outer", "bearing outer ring", "outer ring"],
+      "character": "clearance",
+      "recommended_classes": ["H7/f7", "H7/g6", "H7/h6"],
+      "typical_clearance_range_um": [0, 50],
+      "rationale": "Rolling bearing outer ring in housing: typically clearance or transition for stationary outer ring, to allow creep if misloaded.",
+      "applications": ["housing bores for ball bearings", "plummer blocks"],
+      "notes": "Clearance fit is standard unless bearing supports rotating load — then use interference on outer ring."
+    }
+  ]
+}

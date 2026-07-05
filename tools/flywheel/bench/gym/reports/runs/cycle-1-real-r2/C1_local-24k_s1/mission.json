@@ -1,0 +1,12 @@
+{
+  "status": "failed",
+  "phase": "build",
+  "phases_completed": [
+    "intake",
+    "specify",
+    "plan"
+  ],
+  "findings": [],
+  "stop_reason": "build_incomplete",
+  "mode": "real"
+}

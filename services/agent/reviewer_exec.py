@@ -91,7 +91,9 @@ def _resolve_fn(tool: str) -> Callable[..., Any] | None:
                 continue
     except Exception:  # noqa: BLE001
         pass
-    return None
+    # 4) research/engineering-calc tools (fit_calc, tap_drill, research_*…) — the
+    # spec_writer role's main toolset; registered in mcp_server.research_tools.
+    return _resolve_extra("research", tool)
 
 
 # One private FastMCP per extra module_key, built once.
@@ -114,6 +116,12 @@ def _resolve_extra(module_key: str, fn_name: str) -> Callable[..., Any] | None:
             elif module_key == "cad":
                 from mcp_server.cad_tools import register_cad_tools
                 register_cad_tools(mcp)
+            elif module_key == "research":
+                # T-W30: the spec_writer/reviewer role cards allow research_* +
+                # fit_calc/recommend_fit — these live in research_tools, not the
+                # battery modules, so agent turns need this branch to dispatch them.
+                from mcp_server.research_tools import register_research_tools
+                register_research_tools(mcp)
             else:
                 return None
             _EXTRA_MCP[module_key] = mcp

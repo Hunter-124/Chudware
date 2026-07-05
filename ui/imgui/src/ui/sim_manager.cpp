@@ -2,9 +2,11 @@
 #include "ui/sim_manager.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -20,6 +22,7 @@
 #include "ui/appearance_common.h"
 #include "ui/viewport.h"
 #include <platform/paths.h>
+#include <platform/run_subprocess.h>
 
 namespace ui {
 
@@ -513,6 +516,10 @@ void SimManager::refresh(app::AppState& st) {
                     s.meshAspectAvg = p.meshAspectAvg; s.meshAspectMax = p.meshAspectMax;
                     s.meshJacobianMin = p.meshJacobianMin; s.meshPctPoor = p.meshPctPoor;
                     s.meshAspectHist = p.meshAspectHist;
+                    // T-SIM3: advisor postcheck result is transient — carry it across refresh.
+                    s.advisorVerdict = p.advisorVerdict; s.advisorMatClass = p.advisorMatClass;
+                    s.advisorSf = p.advisorSf; s.advisorNarration = p.advisorNarration;
+                    s.advisorItems = p.advisorItems;
                     if (!p.summary.empty()) s.summary = p.summary;
                     break;
                 }
@@ -594,7 +601,12 @@ bool SimManager::handleCommand(app::AppState& st, const std::string& cmdId) {
     const bool haveStudy = sel_ >= 0 && sel_ < (int)studies_.size();
     if (cmdId == "sim_material" || cmdId == "sim_results" || cmdId == "sim_mesh") {
         if (!haveStudy) return true;
-        if (cmdId == "sim_material")      node_ = SimNode::Material;
+        if (cmdId == "sim_material") {
+            // T-SIM3: the ribbon command now opens the material-assignment dialog (it used
+            // to only navigate to the Material node, leaving no way to actually assign).
+            node_ = SimNode::Material;
+            matDialogOpen_ = true;
+        }
         else if (cmdId == "sim_results")  node_ = SimNode::Results;
         else                              node_ = SimNode::Mesh;
         return true;
@@ -739,6 +751,10 @@ nlohmann::json SimManager::facePointsFor(app::AppState& st, const nlohmann::json
 }
 
 void SimManager::run(app::AppState& st, Study& s) {
+    // T-SIM3: advisor precheck runs BEFORE any dispatch (BC lint + mesh suggestion rendered
+    // as an advisory card in the panel). Advise-never-veto: this only returns false when the
+    // user opted into blocking via AI_CAD_SIM_PRECHECK_BLOCK=1.
+    if (!advisorPrecheck(st, s)) return;
     // T-SIM1: a Thermal study is a steady-state CONDUCTION FEA (sim_run_thermal), NOT the
     // OpenFOAM-CHT flow path. Intercept it here before the isFlowFamily() branch (which stays
     // shared with the Flow study and the T-SIM2/T-SIM3 rendering) so the flow dispatch is
@@ -1030,6 +1046,168 @@ void SimManager::runThermal(app::AppState& st, Study& s) {
     c5::addLog(st, note);
 }
 
+// ---------------------------------------------------------------- sim advisor (T-SIM3)
+// The T-W9 sim advisor (services/agent/advisor/sim_advisor.py) is the single source of
+// advisor policy (BC lint, mesh suggestion, margin_policy.json verdict, narration). The GUI
+// calls it through the one-shot JSON shim services/agent/advisor/sim_advisor_cli.py — the
+// rules are never re-implemented in C++.
+
+// Freedom rule (advise, never veto): dispatch is blocked ONLY when the user explicitly sets
+// AI_CAD_SIM_PRECHECK_BLOCK=1|true. Note sim_advisor.py's own module default is block-ON for
+// agent callers; the GUI passes its effective gate through to the subprocess so the returned
+// severity labels ("blocker" vs "action") match what the GUI will actually do.
+static bool precheckBlockEnabled() {
+    const char* v = std::getenv("AI_CAD_SIM_PRECHECK_BLOCK");
+    return v && (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0);
+}
+
+// Run one advisor request through the CLI shim (stdin JSON -> stdout JSON). Failures set
+// `err` and return null — callers treat an unreachable advisor as "no advice" (never veto).
+static nlohmann::json callSimAdvisor(const nlohmann::json& request, std::string& err) {
+    const char* py = std::getenv("AI_CAD_PYTHON");
+    const std::string python = (py && *py) ? py : "python3";
+    const std::string script = repoRoot() + "/services/agent/advisor/sim_advisor_cli.py";
+    std::error_code ec;
+    if (!std::filesystem::exists(script, ec)) { err = "advisor shim not found: " + script; return {}; }
+    const std::string cmd = std::string("AI_CAD_SIM_PRECHECK_BLOCK=") +
+                            (precheckBlockEnabled() ? "1" : "0") + " " +
+                            platform::shellQuote(python) + " " + platform::shellQuote(script);
+    bool ok = false;
+    const std::string out = platform::runShellCapture(cmd, request.dump(), ok);
+    if (!ok || out.empty()) { err = "advisor call failed (is python3 available?)"; return {}; }
+    try {
+        auto j = nlohmann::json::parse(out);
+        if (!j.value("ok", false)) { err = j.value("error", std::string("advisor error")); return {}; }
+        return j;
+    } catch (...) { err = "advisor returned unparseable output"; return {}; }
+}
+
+// Mission context (inspectability rule): when a mission run id is present in the
+// environment, the shim appends a ledger artifact event for each advisory call.
+static void addMissionContext(nlohmann::json& req) {
+    const char* run = std::getenv("AI_CAD_MISSION_RUN_ID");
+    if (run && *run) req["ledger_run_id"] = run;
+}
+
+// Build the study-spec dict sim_advisor.precheck/postcheck expect. Face lists mirror what
+// dispatch will actually send (loads with no captured faces are skipped, exactly like
+// runStaticOrModal/runThermal do), so the advisor lints the real solve inputs. Material
+// numbers come from the cited data tables via materials() — provenance rule.
+nlohmann::json SimManager::advisorSpec(app::AppState& st, const Study& s, bool withResults) const {
+    (void)st;
+    nlohmann::json spec;
+    spec["type"] = studyTypeKey(s.type);
+    spec["mesh_fineness"] = s.meshFineness;
+    nlohmann::json mat = nlohmann::json::object();
+    const int mi = materialIndexByKey(s.materialKey);
+    if (mi >= 0) {
+        const auto& m = materials()[mi];
+        mat = {{"name", m.name}, {"E_mpa", m.E_mpa}, {"yield_mpa", m.yield_mpa},
+               {"ultimate_mpa", m.ultimate_mpa}};
+    }
+    nlohmann::json fixtures = nlohmann::json::array();
+    nlohmann::json loads = nlohmann::json::array();
+    if (s.type == StudyType::Thermal) {
+        const double k = thermalConductivityFor(s.materialKey);
+        if (k > 0.0) mat["k_w_mk"] = k;
+        for (size_t i = 0; i < s.fixtures.picks.size(); ++i)
+            fixtures.push_back({{"temp_c", s.thermalHotTempC}});
+        for (const auto& ld : s.loads) {
+            if (ld.faces.empty()) continue;
+            if (s.thermalUseColdFace)      fixtures.push_back({{"temp_c", s.thermalColdTempC}});
+            else if (s.thermalUseFlux)     loads.push_back({{"type", "flux"}, {"magnitude", s.thermalFluxWm2}});
+            else                           loads.push_back({{"type", "convection"},
+                                                            {"h", s.thermalConvH}, {"t_amb_c", s.thermalAmbC}});
+        }
+    } else {
+        for (size_t i = 0; i < s.fixtures.picks.size(); ++i)
+            fixtures.push_back("face_" + std::to_string(i + 1));
+        for (const auto& ld : s.loads) {
+            if (ld.faces.empty()) continue;
+            if (ld.pressure) loads.push_back({{"type", "pressure"}, {"magnitude", ld.pressureMpa}});
+            else             loads.push_back({{"force", {ld.vec[0], ld.vec[1], ld.vec[2]}}});
+        }
+    }
+    spec["fixtures"] = fixtures;
+    spec["loads"] = loads;
+    spec["material"] = mat;
+    if (withResults) spec["results"] = s.resultSummary;
+    return spec;
+}
+
+bool SimManager::advisorPrecheck(app::AppState& st, Study& s) {
+    precheckItems_ = nlohmann::json::array();
+    precheckStudyId_ = s.id;
+    precheckBlocked_ = false;
+    advisorNote_.clear();
+    // The T-W9 battery covers static-family BC lint + the thermal datum lint; Flow and Modal
+    // have no advisor checks yet — dispatch them unadvised rather than inventing rules here.
+    if (s.type != StudyType::Static && s.type != StudyType::Fatigue && s.type != StudyType::Thermal)
+        return true;
+    nlohmann::json req = {{"mode", "precheck"}, {"study", advisorSpec(st, s, false)},
+                          {"study_id", s.id}};
+    addMissionContext(req);
+    std::string err;
+    nlohmann::json res = callSimAdvisor(req, err);
+    if (!err.empty()) {
+        advisorNote_ = "Advisor unavailable — ran without precheck (" + err + ")";
+        c5::addLog(st, "[sim] advisor precheck skipped: " + err);
+        return true;  // freedom rule: an unreachable advisor must never block a run
+    }
+    precheckItems_ = res.value("items", nlohmann::json::array());
+    bool hasBlocker = false;
+    for (const auto& it : precheckItems_)
+        if (it.value("severity", std::string()) == "blocker") hasBlocker = true;
+    c5::addLog(st, "[sim] advisor precheck: " + std::to_string(precheckItems_.size()) +
+                   " item(s)" + (hasBlocker ? " (blocker)" : ""));
+    if (hasBlocker && precheckBlockEnabled()) {
+        precheckBlocked_ = true;
+        c5::toast(ToastLevel::Warn, "Run blocked by sim precheck (AI_CAD_SIM_PRECHECK_BLOCK=1)");
+        return false;
+    }
+    return true;
+}
+
+void SimManager::advisorPostcheck(app::AppState& st, Study& s) {
+    s.advisorVerdict.clear();
+    s.advisorMatClass.clear();
+    s.advisorSf = 0.0;
+    s.advisorNarration.clear();
+    s.advisorItems = nlohmann::json::array();
+    // The margin policy is a static-stress verdict (max von Mises vs yield/ultimate).
+    if (s.type != StudyType::Static) return;
+    nlohmann::json req = {{"mode", "postcheck"}, {"study", advisorSpec(st, s, true)},
+                          {"study_id", s.id}};
+    if (precheckStudyId_ == s.id && precheckItems_.is_array() && !precheckItems_.empty())
+        req["precheck_items"] = precheckItems_;  // share one anchor computation (T-W9 contract)
+    addMissionContext(req);
+    std::string err;
+    nlohmann::json res = callSimAdvisor(req, err);
+    if (!err.empty()) { c5::addLog(st, "[sim] advisor postcheck skipped: " + err); return; }
+    s.advisorVerdict = res.value("verdict", std::string());
+    s.advisorMatClass = res.value("mat_class", std::string());
+    s.advisorSf = res.value("sf_used", 0.0);
+    s.advisorNarration = res.value("narration", std::string());
+    s.advisorItems = res.value("items", nlohmann::json::array());
+    if (!s.advisorVerdict.empty())
+        c5::addLog(st, "[sim] advisor verdict: " + s.advisorVerdict +
+                       " (" + s.advisorMatClass + ")");
+}
+
+// T-SIM3 shot seam — see sim_manager.h. Numbers are a seeded fixture; the postcheck is live.
+void SimManager::debugSeedStaticResult(app::AppState& st, double vmMpa, double dispMm, double minFos) {
+    if (sel_ < 0 || sel_ >= (int)studies_.size()) return;
+    Study& s = studies_[sel_];
+    s.hasResult = true;
+    s.resultSummary = {{"max_von_mises_mpa", vmMpa}, {"max_disp_mm", dispMm}, {"min_fos", minFos}};
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "max vM %.2f MPa | max disp %.4f mm | min FoS %.2f",
+                  vmMpa, dispMm, minFos);
+    s.summary = buf;
+    node_ = SimNode::Results;
+    advisorPostcheck(st, s);
+}
+
 // ---------------------------------------------------------------- tick / result view
 
 void SimManager::clearResultOverlay(app::AppState&) {
@@ -1202,6 +1380,10 @@ void SimManager::tick(app::AppState& st) {
                 s.summary = buf;
             }
             c5::addLog(st, "[sim] FEA done: " + s.summary);
+            // T-SIM3: advisor postcheck — margin verdict (PASS/WARN/FAIL vs margin_policy.json)
+            // + narration, rendered with the results (drawResultControls). Static only; the
+            // policy is a stress-vs-yield rule.
+            if (s.type == StudyType::Static) advisorPostcheck(st, s);
         }
         persist(st, s);
         node_ = SimNode::Results;
@@ -1334,12 +1516,20 @@ void SimManager::drawStudyRow(app::AppState& st, int i) {
         if (ImGui::MenuItem("Delete study")) wantDelete = true;
         ImGui::EndPopup();
     }
+    int pendingDeleteLoad = -1;  // T-SIM3: per-load delete from the tree (applied after the loop)
     if (open) {
         auto child = [&](const char* icon, const std::string& label, SimNode n, bool ok, const char* tip, int loadI = -1) {
             const bool selected = selStudy && node_ == n && (n != SimNode::Load || loadIdx_ == loadI);
             IconUV iv = getIcon(icon, 20);
             if (iv.valid) { ImGui::Image(iv.texId, ImVec2(15*theme::S(), 15*theme::S()), iv.uv0, iv.uv1); ImGui::SameLine(0, 5*theme::S()); }
             if (ImGui::Selectable(label.c_str(), selected)) { sel_ = i; node_ = n; loadIdx_ = loadI; }
+            // T-SIM3: loads get a right-click Delete on their tree row (the form's X remains).
+            if (n == SimNode::Load && loadI >= 0) {
+                if (ImGui::BeginPopupContextItem((label + "##loadctx").c_str())) {
+                    if (ImGui::MenuItem("Delete load")) pendingDeleteLoad = loadI;
+                    ImGui::EndPopup();
+                }
+            }
             ImGui::SameLine();
             ImGui::TextColored(ok ? c5::accent() : c5::warnCol(), ok ? "\xe2\x80\xa2" : "?");
             simTip(tip);
@@ -1388,6 +1578,14 @@ void SimManager::drawStudyRow(app::AppState& st, int i) {
               s.hasResult ? "" : "Run the study to generate results.");
         ImGui::TreePop();
     }
+    if (pendingDeleteLoad >= 0 && pendingDeleteLoad < (int)s.loads.size()) {
+        s.loads.erase(s.loads.begin() + pendingDeleteLoad);
+        if (node_ == SimNode::Load) {
+            if (loadIdx_ > pendingDeleteLoad) --loadIdx_;
+            else if (loadIdx_ == pendingDeleteLoad) { node_ = SimNode::Study; loadIdx_ = -1; }
+        }
+        persist(st, s);
+    }
     ImGui::PopID();
     if (wantDelete) deleteStudy(st, i);
 }
@@ -1429,7 +1627,132 @@ void SimManager::drawCustomMaterialPopup(app::AppState& st, Study& s) {
     }
 }
 
+// T-SIM3: modal material-assignment dialog. Sources, in order: the document's own material
+// (quick-assign chip), then the global library = built-in engine/sim/materials.json + the
+// user's custom_materials.json (via materials()). Every number shown comes from those data
+// tables — provenance rule, nothing invented in the GUI. Assignment is whole-body: it sets
+// Study::materialKey (per-face assignment needs solver-side regions; out of scope, cheap it
+// is not).
+void SimManager::drawMaterialDialog(app::AppState& st, Study& s) {
+    const float S = theme::S();
+    if (matDialogOpen_) {
+        ImGui::OpenPopup("Assign material");
+        matDialogOpen_ = false;
+        matFilter_[0] = '\0';
+        matDialogSel_ = materialIndexByKey(s.materialKey);
+    }
+    ImGui::SetNextWindowSize(ImVec2(560 * S, 0), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Assign material", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+    const auto& mats = materials();
+
+    // Document material quick-assign (when the part carries one that the library resolves).
+    std::string partKey;
+    const nlohmann::json& tr = st.docMirror.tree();
+    if (tr.is_object() && tr.contains("material") && tr["material"].is_object())
+        partKey = tr["material"].value("key", std::string());
+    const int partIdx = partKey.empty() ? -1 : materialIndexByKey(partKey);
+    if (partIdx >= 0) {
+        ImGui::TextColored(c5::txtDim(), "Part material:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton((mats[partIdx].name + "##partmat").c_str())) {
+            s.materialKey = mats[partIdx].key;
+            persist(st, s);
+            ImGui::CloseCurrentPopup();
+        }
+        simTip("Assign the document's own material to this study.");
+        ImGui::Spacing();
+    }
+
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##matfilter", "Filter by name...", matFilter_, sizeof(matFilter_));
+    ImGui::Spacing();
+
+    auto passesFilter = [&](const Material& m) {
+        if (!matFilter_[0]) return true;
+        auto lower = [](std::string v) {
+            for (char& c : v) c = (char)std::tolower((unsigned char)c);
+            return v;
+        };
+        const std::string f = lower(matFilter_);
+        return lower(m.name).find(f) != std::string::npos ||
+               lower(m.key).find(f) != std::string::npos;
+    };
+    if (ImGui::BeginTable("##matlib", 5,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+                          ImVec2(-FLT_MIN, 260 * S))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Material", ImGuiTableColumnFlags_WidthStretch, 2.2f);
+        ImGui::TableSetupColumn("E (MPa)");
+        ImGui::TableSetupColumn("Yield (MPa)");
+        ImGui::TableSetupColumn("Density (g/cm3)");
+        ImGui::TableSetupColumn("Library");
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < (int)mats.size(); ++i) {
+            const auto& m = mats[i];
+            if (!passesFilter(m)) continue;
+            ImGui::PushID(i);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            const bool cur = (m.key == s.materialKey);
+            if (ImGui::Selectable(m.name.c_str(), matDialogSel_ == i,
+                                  ImGuiSelectableFlags_SpanAllColumns |
+                                  ImGuiSelectableFlags_AllowDoubleClick)) {
+                matDialogSel_ = i;
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    s.materialKey = m.key;
+                    persist(st, s);
+                    ImGui::PopID();
+                    ImGui::EndTable();
+                    ImGui::CloseCurrentPopup();
+                    ImGui::EndPopup();
+                    return;
+                }
+            }
+            if (cur) { ImGui::SameLine(); ImGui::TextColored(c5::accent(), "\xe2\x80\xa2"); }
+            ImGui::TableNextColumn(); ImGui::Text("%.0f", m.E_mpa);
+            ImGui::TableNextColumn(); ImGui::Text("%.0f", m.yield_mpa);
+            ImGui::TableNextColumn(); ImGui::Text("%.2f", m.density_g_cm3);
+            ImGui::TableNextColumn();
+            ImGui::TextColored(c5::txtDim(), "%s", m.custom ? "custom" : "built-in");
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::TextColored(c5::txtDim(),
+                       "Values from engine/sim/materials.json + your custom library.");
+    ImGui::Spacing();
+
+    const bool haveSel = matDialogSel_ >= 0 && matDialogSel_ < (int)mats.size();
+    if (!haveSel) ImGui::BeginDisabled();
+    if (ImGui::Button("Assign", ImVec2(120 * S, 0))) {
+        s.materialKey = mats[matDialogSel_].key;
+        persist(st, s);
+        ImGui::CloseCurrentPopup();
+    }
+    if (!haveSel) ImGui::EndDisabled();
+    simTip("Assign the selected material to this study (whole body).");
+    ImGui::SameLine();
+    if (ImGui::Button("New custom material...", ImVec2(200 * S, 0))) {
+        if (haveSel) {
+            std::snprintf(cmName_, sizeof(cmName_), "%s", (mats[matDialogSel_].name + " (copy)").c_str());
+            cmE_ = (float)mats[matDialogSel_].E_mpa; cmNu_ = (float)mats[matDialogSel_].nu;
+            cmDensity_ = (float)mats[matDialogSel_].density_g_cm3;
+            cmYield_ = (float)mats[matDialogSel_].yield_mpa;
+            cmUlt_ = (float)mats[matDialogSel_].ultimate_mpa;
+            cmEnd_ = (float)mats[matDialogSel_].endurance_mpa;
+        }
+        ImGui::OpenPopup("New material");
+    }
+    drawCustomMaterialPopup(st, s);  // nested modal; adds to the custom library + assigns
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(120 * S, 0))) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
 void SimManager::drawMaterialCombo(app::AppState& st, Study& s) {
+    ImGui::SeparatorText("Material");
     const float S = theme::S();
     const float fh = ImGui::GetFrameHeight();
     const auto& mats = materials();
@@ -1460,6 +1783,10 @@ void SimManager::drawMaterialCombo(app::AppState& st, Study& s) {
         ImGui::TextColored(c5::txtDim(), "E %.0f MPa  -  nu %.2f  -  yield %.0f MPa  -  rho %.2f g/cm3",
                            m.E_mpa, m.nu, m.yield_mpa, m.density_g_cm3);
     }
+    // T-SIM3: full library browser (doc material + built-ins + custom, filter + properties).
+    if (ImGui::Button("Browse material library...", ImVec2(-FLT_MIN, 0)))
+        matDialogOpen_ = true;
+    simTip("Pick from the document material and the material library, with the table values shown.");
 }
 
 void SimManager::drawWellRow(app::AppState& st, const char* label, SimWell& well, const char* tip) {
@@ -1470,37 +1797,43 @@ void SimManager::drawWellRow(app::AppState& st, const char* label, SimWell& well
     }
     simTip("Select faces in the viewport (click / ctrl-click), then click here to add them.");
     if (!well.picks.empty()) {
+        // T-SIM3: per-entry delete is a visible affordance (an "x" beside each captured
+        // face), not just the old right-click gesture (which still works).
+        const float S = theme::S();
         for (int k = 0; k < (int)well.picks.size(); ++k) {
             ImGui::PushID(k);
             ImGui::SmallButton(("Face " + std::to_string(k + 1)).c_str());
-            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            bool remove = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+            simTip("A captured face. Right-click (or the x) removes it.");
+            ImGui::SameLine(0, 2.f * S);
+            remove = ImGui::SmallButton("x") || remove;
+            simTip("Remove this face from the list.");
+            if (remove) {
                 well.picks.erase(well.picks.begin() + k);
                 if (sel_ >= 0 && sel_ < (int)studies_.size()) persist(st, studies_[sel_]);
                 ImGui::PopID();
                 break;
             }
-            simTip("Right-click to remove this face.");
-            if (k % 4 != 3 && k + 1 < (int)well.picks.size()) ImGui::SameLine();
+            if (k % 3 != 2 && k + 1 < (int)well.picks.size()) ImGui::SameLine(0, 8.f * S);
             ImGui::PopID();
         }
-        ImGui::SameLine();
+        ImGui::SameLine(0, 8.f * S);
         if (ImGui::SmallButton("Clear")) { well.picks.clear(); if (sel_ >= 0 && sel_ < (int)studies_.size()) persist(st, studies_[sel_]); }
+        simTip("Remove all captured faces.");
     }
 }
 
 void SimManager::drawFixturesForm(app::AppState& st, Study& s) {
-    ImGui::PushFont(theme::font(theme::Font::H2));
-    ImGui::TextUnformatted(s.type == StudyType::Modal ? "Fixtures (optional)" : "Fixtures");
-    ImGui::PopFont();
+    // T-SIM3 style pass: forms use SeparatorText section headers (the glass-column kit
+    // language the fatigue form already speaks) instead of ad-hoc H2 text.
+    ImGui::SeparatorText(s.type == StudyType::Modal ? "Fixtures (optional)" : "Fixtures");
     ImGui::TextWrapped("Faces that are clamped (zero displacement).");
     ImGui::Spacing();
     drawWellRow(st, "Fixed faces", s.fixtures, "Faces held rigidly in place.");
 }
 
 void SimManager::drawLoadsForm(app::AppState& st, Study& s) {
-    ImGui::PushFont(theme::font(theme::Font::H2));
-    ImGui::TextUnformatted("Loads");
-    ImGui::PopFont();
+    ImGui::SeparatorText("Loads");
     const float S = theme::S();
     for (int li = 0; li < (int)s.loads.size(); ++li) {
         SimLoad& ld = s.loads[li];
@@ -1540,9 +1873,7 @@ void SimManager::drawLoadsForm(app::AppState& st, Study& s) {
 }
 
 void SimManager::drawMeshForm(app::AppState& st, Study& s) {
-    ImGui::PushFont(theme::font(theme::Font::H2));
-    ImGui::TextUnformatted("Mesh");
-    ImGui::PopFont();
+    ImGui::SeparatorText("Mesh");
     ImGui::TextWrapped("The mesh the solve runs on. Finer captures stress concentrations better but takes longer.");
     ImGui::Spacing();
     const bool modal = (s.type == StudyType::Modal);
@@ -1626,9 +1957,7 @@ void SimManager::drawMeshForm(app::AppState& st, Study& s) {
     }
     if (s.meshHasQuality) {
         ImGui::Spacing();
-        ImGui::PushFont(theme::font(theme::Font::H2));
-        ImGui::TextUnformatted("Mesh quality");
-        ImGui::PopFont();
+        ImGui::SeparatorText("Mesh quality");
         ImGui::Text("Aspect ratio: %.2f avg, %.2f worst", s.meshAspectAvg, s.meshAspectMax);
         ImGui::Text("Min Jacobian: %.3f", s.meshJacobianMin);
         ImVec4 poorCol = s.meshPctPoor < 1.0f ? c5::accent() : s.meshPctPoor < 5.0f ? c5::warnCol() : c5::errCol();
@@ -1761,9 +2090,7 @@ void SimManager::drawFatigueResults(app::AppState& st, Study& s) {
     const double SeC = sm.value("se_corrected_mpa", 0.0), Sut = sm.value("sut_mpa", 0.0);
     const double SeD = reliability_ke(s.fatigueReliability) * SeC;
     UnitSys u = unitSys(st);
-    ImGui::PushFont(theme::font(theme::Font::H2));
-    ImGui::TextUnformatted("Fatigue theories");
-    ImGui::PopFont();
+    ImGui::SeparatorText("Fatigue theories");
     ImGui::TextColored(c5::txtDim(), "Design Se (reliability-adjusted): %.0f %s", SeD * u.stressFromMpa, u.stress);
     if (ImGui::BeginTable("##fattab", 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH)) {
         ImGui::TableSetupColumn("Theory"); ImGui::TableSetupColumn("sa_eq"); ImGui::TableSetupColumn("FoS"); ImGui::TableSetupColumn("Life (cycles)");
@@ -1940,10 +2267,41 @@ void SimManager::drawResultControls(app::AppState& st, Study& s) {
     if (!s.hasResult) { ImGui::TextWrapped("No results yet. Set up the study and press Run."); return; }
     const UnitSys u = unitSys(st);
     char b[80];
-    ImGui::PushFont(theme::font(theme::Font::H2));
-    ImGui::TextUnformatted("Results");
-    ImGui::PopFont();
+    ImGui::SeparatorText("Results");
     ImGui::Spacing();
+
+    // T-SIM3: advisor margin verdict (sim_advisor.postcheck vs margin_policy.json). FAIL is
+    // loud (error colour, H2, bordered row) but never modal — the results stay fully usable.
+    if (!s.advisorVerdict.empty()) {
+        const ImVec4 vcol = (s.advisorVerdict == "PASS") ? c5::accent()
+                          : (s.advisorVerdict == "WARN") ? c5::warnCol() : c5::errCol();
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, c5::glassBg());
+        ImGui::PushStyleColor(ImGuiCol_Border, vcol);
+        ImGui::BeginChild("##sim_verdict", ImVec2(-FLT_MIN, 0),
+                          ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY |
+                          ImGuiChildFlags_AlwaysUseWindowPadding);
+        ImGui::PushFont(theme::font(theme::Font::H2));
+        ImGui::TextColored(vcol, "Advisor verdict: %s", s.advisorVerdict.c_str());
+        ImGui::PopFont();
+        ImGui::SameLine();
+        ImGui::TextColored(c5::txtDim(), "(%s, SF %.1f)", s.advisorMatClass.c_str(), s.advisorSf);
+        simTip("Margin verdict from engine_oracle/sim/margin_policy.json via the sim advisor "
+               "(max stress x SF vs yield/ultimate).");
+        // Narration: the advisor's explanation lines (margin math, beam anchor, divergence).
+        if (!s.advisorNarration.empty()) {
+            std::istringstream nls(s.advisorNarration);
+            std::string line;
+            while (std::getline(nls, line)) {
+                if (line.empty()) continue;
+                ImGui::PushStyleColor(ImGuiCol_Text, c5::txtDim());
+                ImGui::TextWrapped("%s", line.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor(2);
+        ImGui::Spacing();
+    }
 
     if (s.type == StudyType::Static || s.type == StudyType::Fatigue || isFlowFamily(s.type)) {
         const ResultField* arr = (s.type == StudyType::Static) ? kStaticFields
@@ -2086,7 +2444,7 @@ void SimManager::drawResultControls(app::AppState& st, Study& s) {
 // the hot temperature); the cold-side boundary is set here + applied to the Load faces as a
 // convection film, a heat flux, or a second fixed temperature (mirrors force/pressure choice).
 void SimManager::drawThermalForm(app::AppState& st, Study& s) {
-    ImGui::TextUnformatted("Steady-state heat conduction");
+    ImGui::SeparatorText("Steady-state heat conduction");
     ImGui::TextDisabled("Fixtures = fixed-temperature (hot) faces. Loads = cold-side boundary.");
     ImGui::Spacing();
 
@@ -2143,6 +2501,73 @@ void SimManager::drawThermalForm(app::AppState& st, Study& s) {
     }
 }
 
+// T-SIM3: precheck advisory card — aicad.advisory/1 items from sim_advisor.precheck rendered
+// in the panel before/alongside dispatch. Severity colours: blocker=err, action=warn,
+// info/hint=dim. Dismissable (advise, never veto); a dispatch block only happens when the
+// user set AI_CAD_SIM_PRECHECK_BLOCK=1, and says so explicitly.
+void SimManager::drawAdvisoryCard(app::AppState& st, Study& s) {
+    (void)st;
+    const bool mine = (precheckStudyId_ == s.id) && !s.id.empty();
+    const bool haveItems = mine && precheckItems_.is_array() && !precheckItems_.empty();
+    const bool haveNote = mine && !advisorNote_.empty();
+    if (!haveItems && !haveNote) return;
+    const float S = theme::S();
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, c5::glassBg());
+    ImGui::PushStyleColor(ImGuiCol_Border, c5::glassBorder());
+    ImGui::BeginChild("##sim_advisory", ImVec2(-FLT_MIN, 0),
+                      ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY |
+                      ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PushFont(theme::font(theme::Font::H2));
+    ImGui::TextColored(c5::accent(), "Advisor precheck");
+    ImGui::PopFont();
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - 18.f * S);
+    if (ImGui::SmallButton("x##advdismiss")) {
+        precheckItems_ = nlohmann::json::array();
+        precheckStudyId_.clear();
+        precheckBlocked_ = false;
+        advisorNote_.clear();
+    }
+    simTip("Dismiss this advisory. The advisor advises; it never vetoes your run.");
+    if (haveNote) ImGui::TextColored(c5::txtDim(), "%s", advisorNote_.c_str());
+    if (haveItems) {
+        for (int i = 0; i < (int)precheckItems_.size(); ++i) {
+            const auto& it = precheckItems_[(size_t)i];
+            const std::string sev = it.value("severity", std::string("info"));
+            const ImVec4 col = (sev == "blocker") ? c5::errCol()
+                             : (sev == "action")  ? c5::warnCol() : c5::txtDim();
+            ImGui::PushID(i);
+            ImGui::TextColored(col, "[%s]", sev.c_str());
+            ImGui::SameLine();
+            ImGui::TextWrapped("%s", it.value("finding", std::string()).c_str());
+            if (it.contains("candidate_fixes") && it["candidate_fixes"].is_array() &&
+                !it["candidate_fixes"].empty()) {
+                const auto& fx = it["candidate_fixes"][0];
+                const std::string hint = fx.contains("params") && fx["params"].is_object()
+                                             ? fx["params"].value("hint", std::string())
+                                             : std::string();
+                if (!hint.empty()) {
+                    ImGui::Indent(12.f * S);
+                    ImGui::PushStyleColor(ImGuiCol_Text, c5::txtDim());
+                    ImGui::TextWrapped("Fix: %s", hint.c_str());
+                    ImGui::PopStyleColor();
+                    ImGui::Unindent(12.f * S);
+                }
+            }
+            ImGui::PopID();
+        }
+    }
+    if (precheckBlocked_) {
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, c5::errCol());
+        ImGui::TextWrapped("Run blocked by precheck (AI_CAD_SIM_PRECHECK_BLOCK=1). "
+                           "Resolve the blockers above, or unset the variable to run anyway.");
+        ImGui::PopStyleColor();
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor(2);
+}
+
 void SimManager::drawForm(app::AppState& st, Study& s) {
     const float S = theme::S();
     ImGui::PushFont(theme::font(theme::Font::H2));
@@ -2193,6 +2618,11 @@ void SimManager::drawForm(app::AppState& st, Study& s) {
             else drawMaterialCombo(st, s);
             break;
     }
+
+    // T-SIM3: the material dialog + the precheck advisory card live at the form level so
+    // they are reachable from every node of the selected study.
+    drawMaterialDialog(st, s);
+    drawAdvisoryCard(st, s);
 
     {
         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();

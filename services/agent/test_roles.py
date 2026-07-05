@@ -542,6 +542,30 @@ class TestGbnfEmitter(unittest.TestCase):
         grammar = roles.schema_to_gbnf(card.handoff_schema)  # must not raise
         self.assertTrue(grammar.startswith("root ::="))
 
+    def test_grammar_permits_optional_replan_request(self):
+        """The GBNF must PERMIT a non-required output like replan_request — every
+        worker prompt can emit one (the anti-grind valve, contract §3.7/§17). A
+        grammar that only allowed required keys would make replan impossible on the
+        exact (local) tier the grammar exists for."""
+        for rid in ("spec_writer", "sketcher", "feature_modeler", "layout_engineer",
+                    "sim_engineer", "cam_programmer", "fixer"):
+            card = roles.load_role(rid)
+            self.assertIn("replan_request",
+                          card.handoff_schema["properties"]["outputs"].get("properties", {}),
+                          rid)
+            acceptor = _Gbnf(roles.schema_to_gbnf(card.handoff_schema))
+            handoff = _with_replan(card.handoff_schema)
+            import json as _json
+            self.assertTrue(acceptor.accepts(_json.dumps(handoff)),
+                            f"{rid}: grammar rejected a replan-bearing handoff")
+
+    def test_required_keys_still_enforced(self):
+        """The optional-members tail must not let a required key be dropped."""
+        card = roles.load_role("sketcher")
+        acceptor = _Gbnf(roles.schema_to_gbnf(card.handoff_schema))
+        # outputs is required at the top level — an envelope missing it is rejected
+        self.assertFalse(acceptor.accepts('{"status": "done", "summary": "x"}'))
+
 
 # ---------------------------------------------------------------------------
 # helper: build a minimal valid JSON string for a handoff schema (for GBNF proof)
@@ -550,6 +574,19 @@ class TestGbnfEmitter(unittest.TestCase):
 def _minimal_valid_json(schema, depth=0):
     import json as _json
     return _json.dumps(_minimal_value(schema, depth))
+
+
+def _with_replan(schema):
+    """A minimal valid handoff value for ``schema`` with a replan_request object added
+    to outputs (an optional member the grammar must permit)."""
+    val = _minimal_value(schema)
+    outputs = val.get("outputs")
+    if isinstance(outputs, dict):
+        outputs["replan_request"] = {
+            "schema": "aicad.replan/1", "scope": "approach",
+            "reason": "two failures, better route", "urgency": "opportunistic",
+        }
+    return val
 
 
 def _minimal_value(schema, depth=0):

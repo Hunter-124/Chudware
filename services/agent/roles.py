@@ -691,21 +691,36 @@ class _GbnfBuilder:
     def _emit_object(self, schema: dict[str, Any], hint: str) -> str:
         props: dict[str, Any] = schema.get("properties", {}) or {}
         required: list[str] = list(schema.get("required", []))
-        # Emit required properties as a fixed key order (grammar guarantees presence &
-        # shape; JSON object key order is free but a fixed order is valid JSON and keeps
-        # the grammar deterministic). Optional properties are omitted from the grammar —
-        # the model MAY include extra keys via the fallback below.
+        # Guaranteed structure = the REQUIRED keys, in a fixed order, each with its
+        # typed sub-rule (JSON key order is free but a fixed order is valid JSON and
+        # keeps the grammar deterministic). Optional/extra members — crucially
+        # ``replan_request``, the anti-grind flexibility valve every worker prompt
+        # can emit (contract §3.7 / §17) — are PERMITTED via a trailing
+        # ``( "," key ":" value )*`` production. Without this the grammar would
+        # forbid a grammar-constrained local model from ever emitting a replan.
+        # Structure stays: required keys are still guaranteed present and typed.
         if not required and not props:
             return "object"  # unconstrained object
 
+        optional_tail = '( ws "," ws string ws ":" ws value )*'
+
+        if not required:
+            # No required keys: any members (all props are optional) — but we still
+            # know it's an object. Accept zero-or-more string:value members.
+            name = self.fresh(hint + "-obj")
+            return self.add(
+                name,
+                f'"{{" ws ( string ws ":" ws value {optional_tail} )? ws "}}"',
+            )
+
         parts: list[str] = ['"{" ws']
-        emitted_keys = required or list(props.keys())
-        for i, key in enumerate(emitted_keys):
+        for i, key in enumerate(required):
             subschema = props.get(key, {})
             sub_rule = self.emit(subschema, f"{hint}-{key}") if isinstance(subschema, dict) else "value"
             sep = ' ws "," ws ' if i > 0 else " "
             parts.append(f'{sep}{_gbnf_string_literal(key)} ws ":" ws {sub_rule}')
-        parts.append(' ws "}"')
+        # Allow any optional/extra members after the required ones (e.g. replan_request).
+        parts.append(f' {optional_tail} ws "}}"')
         name = self.fresh(hint + "-obj")
         return self.add(name, "".join(parts))
 

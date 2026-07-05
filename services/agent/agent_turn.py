@@ -69,12 +69,25 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
              max_tokens: int | None = None,
              ledger=None,
              actor: str | None = None,
-             tool_dispatch: Callable[[str, dict], Any] | None = None) -> TurnResult:
+             tool_dispatch: Callable[[str, dict], Any] | None = None,
+             mission_dispatch: Any | None = None,
+             tools_text: str | None = None) -> TurnResult:
     """Run a bounded tool-executing turn and return a :class:`TurnResult`.
 
     *tool_dispatch* is injectable ``(tool_name, args) -> result``; the default
     dispatches against the live MCP registry via :func:`_dispatch_tool`.  Tests
     inject a deterministic dispatcher (no engine).
+
+    *mission_dispatch* (T-W32) is the run-scoped dispatch layer
+    (``services.agent.mission_dispatch.MissionDispatch``): consulted BEFORE the
+    global registry so mission-context tools (ledger_get/ledger_note, dag_plan,
+    ask_user, delegate, part_search) resolve against THIS run.  Ignored when a
+    custom *tool_dispatch* is injected (the injector owns resolution).
+
+    *tools_text* (T-W32) is the rendered §9.1 tools slot (trimmed schemas for the
+    node's allowed tools — see ``services.agent.tool_schemas``).  When present it
+    replaces the bare "Allowed tools:" name list, so the model sees real kwargs
+    instead of guessing them.
 
     *max_tokens* caps each model completion.  Callers on a known tier pass the
     tier's ``generation_headroom`` (tiers.yaml — the same budget source the
@@ -82,12 +95,23 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     budgets rather than an ad-hoc constant.  Default 2048 when no tier is known."""
     budget = int(max_tool_calls if max_tool_calls is not None else 8)
     completion_cap = int(max_tokens) if max_tokens else 2048
-    dispatch = tool_dispatch or _dispatch_tool
+    if tool_dispatch is not None:
+        dispatch = tool_dispatch
+    elif mission_dispatch is not None:
+        def dispatch(tool: str, args: dict) -> Any:
+            fn = mission_dispatch.resolve(tool)
+            if fn is not None:
+                return fn(**(args or {}))
+            return _dispatch_tool(tool, args)
+    else:
+        dispatch = _dispatch_tool
     allow = set(allowed_tools or [])
     actor = actor or name
 
     system = (system_prompt or "") + "\n\n" + _SYSTEM_BASE
-    if allow:
+    if tools_text:
+        system += "\n\n" + tools_text
+    elif allow:
         system += "\nAllowed tools: " + ", ".join(sorted(allow))
 
     messages: list[dict] = [{"role": "user", "content": _parts(request)}]
@@ -182,6 +206,23 @@ def _parse_directive(reply: str) -> dict | None:
         return obj if isinstance(obj, dict) else None
     except (json.JSONDecodeError, ValueError):
         return None
+
+
+def resolver_for(mission_dispatch: Any | None = None) -> Callable[[str], Any]:
+    """Return a ``(tool_name) -> callable | None`` resolver mirroring run_turn's
+    dispatch order: mission-scoped layer first, then the global registry (T-W32).
+
+    The tool-schema renderer (``tool_schemas.render_tools_block``) uses this SAME
+    resolver, so the schemas injected into the prompt are exactly the callables the
+    dispatcher will invoke — never a schema the dispatch layer would reject."""
+    def _resolve(tool: str):
+        if mission_dispatch is not None:
+            fn = mission_dispatch.resolve(tool)
+            if fn is not None:
+                return fn
+        from services.agent.reviewer_exec import _resolve_fn
+        return _resolve_fn(tool)
+    return _resolve
 
 
 def _dispatch_tool(tool: str, args: dict) -> Any:

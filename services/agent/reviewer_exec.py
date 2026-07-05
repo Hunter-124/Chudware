@@ -93,7 +93,19 @@ def _resolve_fn(tool: str) -> Callable[..., Any] | None:
         pass
     # 4) research/engineering-calc tools (fit_calc, tap_drill, research_*…) — the
     # spec_writer role's main toolset; registered in mcp_server.research_tools.
-    return _resolve_extra("research", tool)
+    fn = _resolve_extra("research", tool)
+    if fn is not None:
+        return fn
+    # 5) T-W32 dispatch-coverage gap: role cards allow GSL describers
+    # (describe_part/describe_project/…), parts-library tools (part_get/part_place;
+    # part_search also resolves mission-scoped) and the ledger tools (ledger_get/
+    # ledger_note with an explicit run_id) — none of which the battery singleton
+    # builds.  Same one-FastMCP-per-module pattern; still ONE process-wide registry.
+    for module_key in ("gsl", "parts", "ledger", "preflight", "regen", "buildgraph"):
+        fn = _resolve_extra(module_key, tool)
+        if fn is not None:
+            return fn
+    return None
 
 
 # One private FastMCP per extra module_key, built once.
@@ -122,6 +134,36 @@ def _resolve_extra(module_key: str, fn_name: str) -> Callable[..., Any] | None:
                 # battery modules, so agent turns need this branch to dispatch them.
                 from mcp_server.research_tools import register_research_tools
                 register_research_tools(mcp)
+            elif module_key == "gsl":
+                # T-W32: describe_part/describe_project/describe_scene… — the GSL
+                # describers every worker card allows; live in gsl_tools.
+                from mcp_server.gsl_tools import register_gsl_tools
+                register_gsl_tools(mcp)
+            elif module_key == "parts":
+                # T-W32: part_get/part_place (part_search also has a mission-scoped
+                # handler) — the standard-parts library surface.
+                from mcp_server.parts_tools import register_parts_tools
+                register_parts_tools(mcp)
+            elif module_key == "ledger":
+                # T-W32: ledger_get/ledger_note resolve globally with an explicit
+                # run_id; inside a mission the run-scoped dispatcher binds it.
+                from mcp_server.ledger_tools import register_ledger_tools
+                register_ledger_tools(mcp)
+            elif module_key == "preflight":
+                # T-W32: preflight_ops — the feature_modeler card's mandated
+                # pre-mutation check.
+                from mcp_server.preflight_tools import register_preflight_tools
+                register_preflight_tools(mcp)
+            elif module_key == "regen":
+                # T-W32: regen_diagnose/regen_resolve — the fixer/feature_modeler
+                # rebuild-failure toolset.
+                from mcp_server.regen_tools import register_regen_tools
+                register_regen_tools(mcp)
+            elif module_key == "buildgraph":
+                # T-W32: buildgraph_plan/buildgraph_status — the orchestrator /
+                # department_manager / overseer build-order surface.
+                from services.agent.buildgraph.mcp_tools import register_buildgraph_tools
+                register_buildgraph_tools(mcp)
             else:
                 return None
             _EXTRA_MCP[module_key] = mcp

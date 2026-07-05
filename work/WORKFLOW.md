@@ -109,6 +109,21 @@ produces a valid toolpath. If an op won't produce a renderable toolpath, that is
 **CAM bug to FILE (issue + backlog task), never an icon to skip or fake.** Tracked in
 T-BL29 (Manufacture group) and carried forward by T-BL34 (color + annotate the toolpath).
 
+## 6c. GUI ownership policy (T-G24, 2026-07-05)
+
+`ui/imgui/` is the **sole active GUI target**. `host/` is reference-only for T-G23
+(Chrome port) and is deleted by T-G11.
+
+Rules for all drivers:
+- **New GUI work goes in `ui/imgui/` only.** Do not touch `host/` for features or fixes.
+- **Double-patching both trees requires explicit lead approval.** If a task looks like
+  it needs both, stop and surface it before writing code.
+- `host/` is deleted by T-G11 — but only after T-G23 + T-G25 land AND a human Windows
+  build is verified. T-G11's `depends_on` reflects this.
+- Scripted shot launches (gate.sh, tools/gui_parity/run_all.py) use `xvfb-run` unless
+  `AI_CAD_SHOT_HEADED=1` is set, even when `DISPLAY` is present. Set that env var for
+  interactive/walkthrough runs.
+
 ## 7. Command crib sheet
 
 ```

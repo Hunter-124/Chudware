@@ -31,11 +31,30 @@ using json = nlohmann::json;
 using aicad::doc::doc_new;
 using aicad::doc::doc_apply_ops;
 using aicad::doc::doc_set_meta;
+using aicad::doc::doc_tree;
 using aicad::doc::doc_sketch_auto_constrain;
 using aicad::doc::doc_sketch_health;
 using aicad::doc::doc_sketch_regions;
 
 namespace {
+
+// Count persisted coincident constraints on a sketch feature (read from doc_tree). This
+// asserts on the actual CONSTRAINT set, not geometry — a touching rectangle is
+// geometrically closed with zero constraints, so only a constraint count proves the
+// auto-coincident pass ran.
+int persisted_coincident_count(const std::string& doc_id, const std::string& fid) {
+    json tree = doc_tree(doc_id);
+    if (!tree.contains("tree") || !tree["tree"].contains("features")) return -1;
+    for (const json& f : tree["tree"]["features"]) {
+        if (f.value("id", std::string()) != fid) continue;
+        int n = 0;
+        if (f.contains("params") && f["params"].contains("constraints"))
+            for (const json& c : f["params"]["constraints"])
+                if (c.value("type", std::string()) == "coincident") ++n;
+        return n;
+    }
+    return -1;
+}
 
 // A line entity p1->p2 (no constraints of its own).
 json line(const char* id, double x1, double y1, double x2, double y2) {
@@ -214,21 +233,60 @@ TEST_CASE("sketch_health names the free variables of an under-constrained sketch
     CHECK_MESSAGE(shaped, "advisory items must be aicad.advisory/1-shaped: " << h["advisory"].dump());
 }
 
-TEST_CASE("on-edit auto-coincident fires without an explicit auto_constrain call") {
+TEST_CASE("on-edit auto-coincident fires on add_feature without an explicit call") {
     // Build the touching rectangle with auto_coincident LEFT ON (default). The on-edit pass
-    // in apply_ops_locked must add the coincidents during doc_apply_ops itself, so health
-    // reports a closed profile with NO explicit doc_sketch_auto_constrain call here.
+    // in apply_ops_locked must add 4 coincident constraints DURING the add_feature op itself
+    // (the primary path the MCP add_features tool / copilot use). We assert on the persisted
+    // CONSTRAINT set — geometry alone is closed with zero constraints, so this is the real
+    // proof the automatic default-on pass ran.
     auto [doc_id, fid] = make_sketch_doc(touching_rect_entities(), json::array(), true);
 
+    CHECK_MESSAGE(persisted_coincident_count(doc_id, fid) == 4,
+        "default-on auto pass must add 4 coincidents on add_feature, got "
+        << persisted_coincident_count(doc_id, fid));
+
     json h = doc_sketch_health(doc_id, fid);
-    CHECK_MESSAGE(h["closure"]["open_endpoints"].empty(),
-        "default-on auto pass should have closed the profile on edit: "
-        << h["closure"].dump());
-    // And the region enumeration should see a material region.
+    CHECK(h["closure"]["open_endpoints"].empty());
     json regs = doc_sketch_regions(doc_id, fid);
     int material = 0;
     for (const json& r : regs.value("regions", json::array()))
         if (r.value("is_material", false)) ++material;
     CHECK_MESSAGE(material >= 1,
         "the auto-closed profile should yield a material region: " << regs.dump());
+}
+
+TEST_CASE("auto_constrain default-off leaves add_feature sketches untouched") {
+    // With sketch.auto_coincident=false the on-edit pass must NOT run — 0 coincidents added.
+    auto [doc_id, fid] = make_sketch_doc(touching_rect_entities(), json::array(), false);
+    CHECK_MESSAGE(persisted_coincident_count(doc_id, fid) == 0,
+        "auto pass must be OFF when the meta flag is false, got "
+        << persisted_coincident_count(doc_id, fid));
+}
+
+TEST_CASE("auto_constrain mints non-colliding ids on a pre-constrained sketch") {
+    // A rectangle already carrying c1..c4 coincidents on THREE corners, with the fourth
+    // corner left open (no coincident). The auto pass must mint the new constraint id as
+    // c5+ (IdGen scans nested sketch constraint ids), not collide with c1..c4 -> the batch
+    // must validate and persist. Author 3 explicit coincidents + a 4th touching-but-loose
+    // corner; auto adds the missing one.
+    json ents = touching_rect_entities();  // e1..e4, corners touch
+    json cons = json::array({
+        rel("c1", "coincident", {"e1.p2", "e2.p1"}),
+        rel("c2", "coincident", {"e2.p2", "e3.p1"}),
+        rel("c3", "coincident", {"e3.p2", "e4.p1"}),
+        // e4.p2 <-> e1.p1 left UNcoincident (the corner at the origin).
+    });
+    auto [doc_id, fid] = make_sketch_doc(ents, cons, false);
+    json res = doc_sketch_auto_constrain(doc_id, fid, json{{"apply", true}});
+    CHECK_MESSAGE(res["applied"].size() == 1,
+        "exactly the one missing corner should be added: " << res.dump());
+    // The minted id must be c5 (not a duplicate of c1..c4) — proven by the batch persisting.
+    std::string minted = res["applied"][0].get<std::string>();
+    // Only c1..c3 were authored, so the mint must be c4+ (IdGen scans nested sketch ids) —
+    // never a duplicate of an existing id.
+    bool collides = (minted == "c1" || minted == "c2" || minted == "c3");
+    CHECK_MESSAGE(!collides, "auto pass minted a colliding constraint id: " << minted);
+    CHECK(persisted_coincident_count(doc_id, fid) == 4);
+    json h = doc_sketch_health(doc_id, fid);
+    CHECK(h["conflicting"].empty());
 }

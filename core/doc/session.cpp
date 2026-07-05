@@ -2667,22 +2667,38 @@ bool is_readonly_batch(const json& ops) {
 void maybe_auto_constrain(json& working, const std::vector<std::string>& sketch_fids,
                           IdGen& gen);
 
-// The set of sketch feature ids a batch of ops touched (any op whose kind starts
-// "sketch_"), resolving the op's "sketch" ref through id_map ($N placeholders). Used to
-// scope the auto-coincident pass to only the sketches the user actually edited.
+// The set of sketch feature ids a batch of ops touched. Two sources: (1) a
+// `sketch_*` op's "sketch" ref (interactive editing), and (2) an `add_feature` op that
+// CREATES a sketch — the primary path the MCP add_features tool and copilot use to
+// author a sketch (its feature carries entities/constraints inline). For (2) the minted
+// fid is id_map["$<idx>"]. Refs resolve through id_map ($N placeholders). Scopes the
+// auto-coincident pass to only the sketches this batch actually created or edited.
 std::vector<std::string> touched_sketch_fids(const json& ops, const json& id_map) {
     std::vector<std::string> out;
     if (!ops.is_array()) return out;
-    for (const json& op : ops) {
+    auto add = [&](const std::string& fid) {
+        if (!fid.empty() && std::find(out.begin(), out.end(), fid) == out.end())
+            out.push_back(fid);
+    };
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        const json& op = ops[i];
         if (!op.is_object()) continue;
         const std::string k = op.value("op", std::string());
+        if (k == "add_feature") {
+            // A sketch created in this batch — its fid is id_map["$<idx>"].
+            if (op.contains("feature") && op["feature"].is_object() &&
+                op["feature"].value("type", std::string()) == "sketch") {
+                const std::string ph = "$" + std::to_string(i);
+                if (id_map.contains(ph) && id_map[ph].is_string())
+                    add(id_map[ph].get<std::string>());
+            }
+            continue;
+        }
         if (k.rfind("sketch_", 0) != 0) continue;  // not a sketch op
         if (!op.contains("sketch")) continue;
         json ref = op["sketch"];
         resolve_placeholders_deep(ref, id_map);
-        if (!ref.is_string()) continue;
-        const std::string fid = ref.get<std::string>();
-        if (std::find(out.begin(), out.end(), fid) == out.end()) out.push_back(fid);
+        if (ref.is_string()) add(ref.get<std::string>());
     }
     return out;
 }

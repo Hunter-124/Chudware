@@ -1755,14 +1755,27 @@ def register_cad_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            # The kernel dispatch method is "sketch_solve" and keys the feature id as
-            # "sketch" (not "doc_sketch_solve"/"sketch_fid" — those never dispatched, so
-            # check_sketch silently errored). Read-only solve of the named sketch feature.
-            r = cb.call("sketch_solve", {"doc_id": d, "sketch": sketch})
+            # sketch_health is the read-only source of truth (never touches the interactive
+            # active_sketch state). It returns status/dof plus the narrated read; its
+            # conflicting/redundant are [{id,type,suggestion}] objects, from which we pull the
+            # ids for check_sketch's id-list contract. (The old "doc_sketch_solve"/"sketch_fid"
+            # call never dispatched — wrong method + key — so check_sketch silently errored.)
+            r = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
             status = r.get("status", "")
             dof = r.get("dof", 0)
-            conflicting = r.get("conflicting", []) or []
-            redundant = r.get("redundant", []) or []
+
+            def _ids(items):
+                out = []
+                for it in items or []:
+                    if isinstance(it, dict) and it.get("id") is not None:
+                        out.append(it["id"])
+                    elif isinstance(it, str):
+                        out.append(it)
+                return out
+
+            conflicting = _ids(r.get("conflicting"))
+            redundant = _ids(r.get("redundant"))
+            narration = r.get("dof_narration")
             if conflicting:
                 summary = (f"Over-defined: {len(conflicting)} conflicting constraint(s) "
                            f"{conflicting} — remove one to resolve the contradiction.")
@@ -1771,24 +1784,17 @@ def register_cad_tools(mcp: FastMCP) -> None:
             else:
                 summary = (f"Under-defined: {dof} degree(s) of freedom remain — add geometric "
                            f"relations and/or driving dimensions until dof reaches 0.")
+                if narration:
+                    summary += f" Free: {narration}"
                 if redundant:
                     summary += f" (Also {len(redundant)} redundant: {redundant}.)"
             out = {"ok": True, "doc_id": d, "sketch": sketch, "status": status,
                    "dof": dof, "fully_defined": (status == "full" or dof == 0),
-                   "conflicting": conflicting, "redundant": redundant, "summary": summary}
-            # Enrich with the narrated read from sketch_health (best-effort — never break
-            # check_sketch if the health RPC is unavailable or errors).
-            try:
-                health = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
-                out["open_endpoints"] = (health.get("closure") or {}).get("open_endpoints")
-                out["dof_narration"] = health.get("dof_narration")
-                out["schedule"] = health.get("schedule")
-                out["advisory"] = health.get("advisory")
-                narration = health.get("dof_narration")
-                if narration and status != "full" and dof != 0 and not conflicting:
-                    out["summary"] += f" Free: {narration}"
-            except Exception:  # noqa: BLE001
-                pass
+                   "conflicting": conflicting, "redundant": redundant, "summary": summary,
+                   # narrated enrichment straight from sketch_health (the advisor source).
+                   "open_endpoints": (r.get("closure") or {}).get("open_endpoints"),
+                   "dof_narration": narration, "schedule": r.get("schedule"),
+                   "advisory": r.get("advisory")}
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)

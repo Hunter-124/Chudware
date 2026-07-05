@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -114,6 +115,25 @@ static ImU32 fmIconTintDim(float a) {
     return ImGui::ColorConvertFloat4ToU32(ImVec4(f[0], f[1], f[2], f[3] * a));
 }
 static ImU32 fmGlassHalo() { return g_fmGlassHalo; }
+
+// T-BL33: readable FM tooltips. ImGui::SetTooltip renders SYNCHRONOUSLY (BeginTooltip/TextV/End at
+// call time), so it inherits whatever ImGuiCol_Text is on the stack. The FM body pushes the ADAPTIVE
+// text color (fmPalette().text == live->textPrimary), which flips DARK over a light viewport backdrop
+// (theme.cpp adaptiveSurface: darkText = lum > 0.5). A plain SetTooltip then paints dark text on the
+// dark glassBg PopupBg -> black-on-black. Fix: push the FIXED theme foreground (pal.txt0 — near-white
+// in dark, near-black in light; always contrasts the dark popup), exactly like pmTooltip pushes
+// ui::palette.text. Do NOT use fmPalette().text here — that is the poisoned adaptive value.
+static void fmTooltipV(const char* fmt, va_list args) {
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::vec(theme::pal().txt0));
+    ImGui::SetTooltipV(fmt, args);
+    ImGui::PopStyleColor();
+}
+static void fmTooltip(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    fmTooltipV(fmt, args);
+    va_end(args);
+}
 
 // ---- appearance_common (inlined; host appearance_common.cpp) -------------------
 struct MaterialPreset { const char* name; float metallic, roughness, rgb[3]; };
@@ -548,7 +568,7 @@ static void featureBadge(bool ok, bool hasError, const std::string& errText,
     if (hollow) dl->AddCircle(center, r, col, 0, std::max(1.0f, 1.5f * S));
     else        dl->AddCircleFilled(center, r, col);
     if (hasTip && ImGui::IsMouseHoveringRect(p, ImVec2(p.x + w, p.y + lineH)))
-        ImGui::SetTooltip("%s", tip.c_str());
+        fmTooltip("%s", tip.c_str());
 }
 
 // ---- glass popover styling (shared by every FeatureManager popup) ----
@@ -1385,7 +1405,7 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
                                       fmPalette().textDim[2], 0.9f)),
                            std::max(1.0f, 1.5f * theme::S()));
         if (overEye) {
-            ImGui::SetTooltip(shown ? "Hide" : "Show");
+            fmTooltip(shown ? "Hide" : "Show");
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 toggleFeatureEye(st, fid, c.ownedBodies, shown);
                 // T-BL42: un-hiding an absorbed sketch selects + highlights it so it's easy
@@ -1732,7 +1752,7 @@ static bool toolbarIconBtn(const char* id, const char* iconName, const char* too
     ImU32 tint = enabled ? fmIconTint(1.0f) : fmIconTintDim(150.f / 255.f);
     icons::drawGlass(dl, iconName, ImVec2(p0.x + off + iz * 0.5f, p0.y + off + iz * 0.5f),
                      iz * 0.5f, tint, fmGlassHalo());
-    if (hov && tooltip) ImGui::SetTooltip("%s", tooltip);
+    if (hov && tooltip) fmTooltip("%s", tooltip);
     ImGui::PopID();
     return clicked;
 }
@@ -2026,8 +2046,8 @@ static void drawRollbackBarLine(AppState& st, bool enabled, const std::string& b
     rdl->AddRectFilled(ImVec2(hx, ly - hh * 0.5f), ImVec2(hx + hw, ly + hh * 0.5f),
                        fmToU32(pal.accent), std::max(1.0f, 3.0f * rsc));  // #4.5
     if (hovered && !active)
-        ImGui::SetTooltip("Rollback bar — drag up/down to roll the model back/forward,\n"
-                          "or drop a feature here to move it to the end");
+        fmTooltip("Rollback bar — drag up/down to roll the model back/forward,\n"
+                  "or drop a feature here to move it to the end");
 
     // Drop target: a dragged feature row landing on the bar goes to the end (kept from C24).
     if (enabled && ImGui::BeginDragDropTarget()) {
@@ -2172,8 +2192,8 @@ static void drawFeatureManagerTopStrip(AppState& st) {
             nameAndGroupFeatures(st);
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Auto-name every feature (Boss-Extrude1, Fillet2, ...) and\n"
-                              "group dress-up / patterns / reference geometry into folders.");
+            fmTooltip("Auto-name every feature (Boss-Extrude1, Fillet2, ...) and\n"
+                      "group dress-up / patterns / reference geometry into folders.");
         if (!can) ImGui::EndDisabled();
     }
 
@@ -2376,8 +2396,8 @@ static void drawFeatureTreeBodyImpl(AppState& st,
                     ImGui::PopStyleColor();
                 }
                 if (ImGui::IsItemHovered()) {
-                    if (matKey.empty()) ImGui::SetTooltip("No material assigned — right-click to assign");
-                    else ImGui::SetTooltip("Material: %s", matLabel);
+                    if (matKey.empty()) fmTooltip("No material assigned — right-click to assign");
+                    else fmTooltip("Material: %s", matLabel);
                 }
             }
 
@@ -2458,7 +2478,7 @@ static void drawFeatureTreeBodyImpl(AppState& st,
                             popTreePopupGlass();
                             if (rowClicked) setBodyShown(st, bi, hidden);
                             if (rowHovered)
-                                ImGui::SetTooltip(hidden ? "Show %s" : "Hide %s", bname);
+                                fmTooltip(hidden ? "Show %s" : "Hide %s", bname);
                         }
                         ImGui::TreePop();
                     }
@@ -2568,7 +2588,7 @@ static void drawFeatureTreeBodyImpl(AppState& st,
                                                  pal.textDim[1], pal.textDim[2], 0.9f)),
                                              std::max(1.0f, 1.5f * theme::S()));
                             if (pOverEye) {
-                                ImGui::SetTooltip(hidden ? "Show %s" : "Hide %s", kPlanes[pi]);
+                                fmTooltip(hidden ? "Show %s" : "Hide %s", kPlanes[pi]);
                                 if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                                     static const char* kPlaneEyeId[] = {"plane.front","plane.top","plane.right"};
                                     takePlaneControl();
@@ -2606,10 +2626,10 @@ static void drawFeatureTreeBodyImpl(AppState& st,
                             }
                         }
                         if (ImGui::IsItemHovered() && !pOverEye)
-                            ImGui::SetTooltip(st.sketchPlanePickActive ? "Sketch on %s"
-                                              : ((false)
-                                                     ? "Dimension to %s"
-                                                     : (hidden ? "Show %s" : "Hide %s")), kPlanes[pi]);
+                            fmTooltip(st.sketchPlanePickActive ? "Sketch on %s"
+                                      : ((false)
+                                             ? "Dimension to %s"
+                                             : (hidden ? "Show %s" : "Hide %s")), kPlanes[pi]);
                     }
                     ImGui::TreePop();
                 }
@@ -3194,7 +3214,7 @@ static void drawFeatureTreeBodyImpl(AppState& st,
             ImGui::TextUnformatted(fileLabel.c_str());
             ImGui::PopStyleColor();
             if (!s_docPath.empty() && ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", s_docPath.c_str());
+                fmTooltip("%s", s_docPath.c_str());
             bool canSave = st.app->docMirror.hasDoc();
             if (!canSave) ImGui::BeginDisabled();
             {

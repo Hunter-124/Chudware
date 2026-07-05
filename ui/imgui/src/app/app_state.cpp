@@ -386,12 +386,10 @@ void AppState::seedDemo() {
 
     docMirror.setListener([this]() { onDocMutation(); });
 
+    // T-BL39: empty state — no greeting card. Chat starts blank; the input placeholder
+    // already hints "Describe what to build…". A greeting block would show "Assistant"
+    // attribution with no real model metadata, which is exactly what T-BL39 removes.
     agent.blocks.clear();
-    AgentBlock w; w.kind = BlockKind::AssistantMsg; w.anim = 1.f;
-    w.title = "Assistant";
-    w.body  = "Hi - I'm your CAD copilot. Ask me to model something, run a simulation, or "
-              "explain a feature. You'll see my thinking and every action I take, inline.";
-    agent.blocks.push_back(w);
 
     tryStartWorker();
 
@@ -476,6 +474,12 @@ void AppState::tickDemoAgent(float dt) {
 
         // Check for ask_question events FIRST — they suspend the run completion.
         bool hasQuestion = false;
+        // T-BL39: extract real model attribution from the ai_artifact telemetry event
+        // that the engine emits for every successful design run (T-H1 / T-BL22 envelope).
+        // Format: "<provider> · <model-slug>" — mirrors the T-BL38 composer row style so
+        // per-message attribution is visually consistent with the input-row model label.
+        // Falls back to "" (drawAssistantBubble shows "AI") if telemetry is absent.
+        std::string modelAttr;
         if (result.contains("events") && result["events"].is_array()) {
             for (const auto& ev : result["events"]) {
                 std::string kind = ev.value("kind", std::string());
@@ -518,6 +522,16 @@ void AppState::tickDemoAgent(float dt) {
                     AgentBlock t; t.kind = BlockKind::Thinking; t.title = "Thinking";
                     t.body = ev.value("note", ev.dump(2)); t.anim = 0.f;
                     agent.blocks.push_back(t);
+                } else if (kind == "ai_artifact" && modelAttr.empty()) {
+                    // ai_artifact carries model_info as ev["model"] = {provider, model, adapter}.
+                    // Pull both; show "Provider · model-slug" (same rhythm as composerModelLabel).
+                    if (ev.contains("model") && ev["model"].is_object()) {
+                        std::string prov  = ev["model"].value("provider", std::string());
+                        std::string mslug = ev["model"].value("model", std::string());
+                        if (!mslug.empty()) {
+                            modelAttr = prov.empty() ? mslug : (prov + " \xc2\xb7 " + mslug);
+                        }
+                    }
                 }
             }
         }
@@ -565,6 +579,8 @@ void AppState::tickDemoAgent(float dt) {
         }
 
         AgentBlock m; m.kind = BlockKind::AssistantMsg; m.anim = 0.f;
+        // T-BL39: real model attribution from the ai_artifact telemetry event.
+        m.modelName = modelAttr;
         if (ok) {
             int rev = result.value("revision", -1);
             m.body = "Done." + (rev >= 0 ? "  Model is at rev " + std::to_string(rev) + "." : "");
@@ -572,12 +588,13 @@ void AppState::tickDemoAgent(float dt) {
             m.body = "The copilot run failed: " + (errMsg.empty() ? "unknown error" : errMsg);
         }
         agent.blocks.push_back(m);
-
-        std::string engaged = result.value("engaged", std::string("agent"));
         int itok = result.value("input_tokens", 0);
         int otok = result.value("output_tokens", 0);
+        // Store real token counts so the context bar can show live k-token usage.
+        if (itok > 0) agent.lastInputTokens  = itok;
+        if (otok > 0) agent.lastOutputTokens = otok;
         AgentBlock us; us.kind = BlockKind::Usage; us.anim = 0.f;
-        us.body = engaged;
+        us.body = modelAttr.empty() ? std::string("AI") : modelAttr;
         if (itok > 0 || otok > 0)
             us.body += "  |  " + std::to_string(itok) + "→" + std::to_string(otok) + " tok";
         agent.blocks.push_back(us);
@@ -637,7 +654,10 @@ void AppState::tickDemoAgent(float dt) {
             agent.demoStep = 3; agent.demoTimer = 0.f;
         } break;
         case 3: if (agent.demoTimer > 0.5f) {
-            AgentBlock m; m.kind = BlockKind::AssistantMsg; m.title = "Assistant";
+            AgentBlock m; m.kind = BlockKind::AssistantMsg;
+            // T-BL39: modelName instead of hardcoded "Assistant". Demo path labels itself
+            // "demo" so attribution is honest (no real model was called in this path).
+            m.modelName = "demo";
             m.body = agent.demoOpOk
                 ? "Done - I drilled the four mounting holes through the base. Next I can place the "
                   "regulator, the input/output caps, and route the power net. Want me to continue?"

@@ -108,15 +108,26 @@ static void resetDemoState(app::AppState& st) {
 static void seedChatShot(app::AppState& st) {
     using app::AgentBlock;
     using app::BlockKind;
+    // T-BL39: seed modelName on assistant blocks so the chat shot shows real attribution.
+    // Two turns with the same model (as the real single-provider path) — attribution must
+    // appear on each bubble and must never read "Assistant".
     AgentBlock u; u.kind = BlockKind::UserMsg;
     u.body = "make it 30mm tall with a chamfered top edge";
     st.agent.blocks.push_back(u);
-    AgentBlock a; a.kind = BlockKind::AssistantMsg;
-    a.body = "Raised the standoff to 30mm and chamfered the top rim.";
     AgentBlock t; t.kind = BlockKind::Thinking; t.title = "Thinking";
     t.body = "Edit the open hex standoff: 30mm tall + chamfered top.";
+    AgentBlock a; a.kind = BlockKind::AssistantMsg;
+    a.modelName = "Anthropic \xc2\xb7 claude-sonnet-4-6";  // mirrors ai_artifact model_info format
     a.body = "Done — height 30mm, 1mm chamfer on the top rim.";
     st.agent.blocks.insert(st.agent.blocks.end(), {t, a});
+    // Second turn to show attribution is per-message (multi-turn conversation).
+    AgentBlock u2; u2.kind = BlockKind::UserMsg;
+    u2.body = "add 4 M3 mounting holes on the base";
+    AgentBlock a2; a2.kind = BlockKind::AssistantMsg;
+    a2.modelName = "Anthropic \xc2\xb7 claude-sonnet-4-6";
+    a2.body = "Added a 4-hole M3 bolt circle on the bottom face.";
+    a2.anim = 1.f;
+    st.agent.blocks.insert(st.agent.blocks.end(), {u2, a2});
 }
 
 static void seedPlanShot(app::AppState& st) {

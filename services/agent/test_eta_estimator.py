@@ -384,3 +384,66 @@ class TestDefaultTPS:
         # 249 / 482 = ~0.52 s
         assert not ne.unknown
         assert abs(ne.eta_seconds - 249 / 482.0) < 0.5
+
+
+# ---------------------------------------------------------------------------
+# 8. Loop emitter (_emit_eta_for_remaining)
+# Tests that the function emits a mission.eta event to the on_event callback
+# and writes to the EventJournal.  All assertions use only behaviour
+# observable from the outside — no internal state access.
+# ---------------------------------------------------------------------------
+
+class TestEmitEtaForRemaining:
+    """Tests for services.agent.loop._emit_eta_for_remaining (T-DP18)."""
+
+    def _collect(self):
+        """Return a list and an on_event callback that appends to it."""
+        events: list[dict] = []
+        def on_event(ev: dict) -> None:
+            events.append(ev)
+        return events, on_event
+
+    def test_emits_mission_eta_kind(self):
+        from services.agent.loop import _emit_eta_for_remaining
+        events, on_event = self._collect()
+        _emit_eta_for_remaining(on_event, "specify")
+        assert any(e.get("kind") == "mission.eta" for e in events)
+
+    def test_label_present_and_starts_with_eta(self):
+        from services.agent.loop import _emit_eta_for_remaining
+        events, on_event = self._collect()
+        _emit_eta_for_remaining(on_event, "specify")
+        eta_evs = [e for e in events if e.get("kind") == "mission.eta"]
+        assert eta_evs, "no mission.eta event emitted"
+        assert eta_evs[0]["label"].startswith("ETA")
+
+    def test_remaining_phases_shrinks_as_mission_advances(self):
+        from services.agent.loop import _emit_eta_for_remaining
+        events_full, on_full = self._collect()
+        events_late, on_late = self._collect()
+        _emit_eta_for_remaining(on_full, "specify")
+        _emit_eta_for_remaining(on_late, "deliver")
+        ev_full = next(e for e in events_full if e.get("kind") == "mission.eta")
+        ev_late = next(e for e in events_late if e.get("kind") == "mission.eta")
+        assert len(ev_full["remaining_phases"]) > len(ev_late["remaining_phases"])
+
+    def test_no_event_on_none_on_event(self):
+        """Passing on_event=None must not raise and must not crash."""
+        from services.agent.loop import _emit_eta_for_remaining
+        _emit_eta_for_remaining(None, "build")  # should not raise
+
+    def test_journal_write_with_run_id(self, tmp_path):
+        """When run_id is given, an events.jsonl line is written."""
+        import json
+        from services.agent.loop import _emit_eta_for_remaining
+        from services.dag.event_journal import run_events_path
+        run_id = "test_eta_run_wiring"
+        _emit_eta_for_remaining(None, "build", run_id=run_id,
+                                tps_aggregate=LOCAL_TPS_DEFAULT_AGG8)
+        path = run_events_path(run_id)
+        assert path.exists(), "events.jsonl not created"
+        lines = [l for l in path.read_text().splitlines() if l.strip()]
+        eta_lines = [json.loads(l) for l in lines
+                     if json.loads(l).get("kind") == "mission.eta"]
+        assert eta_lines, "no mission.eta line in events.jsonl"
+        assert eta_lines[-1]["label"].startswith("ETA")

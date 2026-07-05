@@ -79,6 +79,30 @@ not let it fall off the board.
 - Annotation compositing is a post-render step (overlay onto the RGBA tile before atlas
   injection) — keep it in the Python pipeline, not the C++ renderer, where practical.
 
+## HANDOFF — reserved for mooseinatree (Hunter directive 2026-07-05)
+
+Hunter: "the rest of the icon generation should be delegated to mooseinatree since
+that's pretty straightforward." This task is RESERVED for mooseinatree — other agents,
+do not claim it.
+
+State you inherit (branch `task/T-BL34-icon-pipeline-v2-color-annotate`):
+- sonnet-ivo committed substantial work then went silent 2026-07-04 13:22:
+  - 6fc57ace — icon pipeline v2: real CAM toolpath tiles, accent emphasis, intent annotations
+  - 09fe65d8 — light+dark contact sheets + in-context ribbon captures "for review"
+- Status was never flipped; unknown how much DoD verification actually happened.
+
+Your job (finisher pattern):
+1. Check out the branch, merge master in (T-W17 GUI panels landed since the cut).
+2. Audit the committed work against the DoD checkboxes above — especially: EVERY tile
+   eyeballed (light + dark), Manufacture toolpath tiles are genuine engine output (never
+   stylized glyphs — WORKFLOW.md §6b), atlases regenerated via the pipeline (never
+   hand-edited PNGs), contact sheet ready for Hunter's review.
+3. Fill any gaps (missed groups per the continuation guarantee above), run
+   scripts/gate.sh + `graphify update .`, flip to status: review with a work note
+   summarizing what you verified vs redid. Never merge to master, never set done.
+
+No rush — proceed when you're online; nothing blocks on this.
+
 ## Progress log
 
 - 2026-07-04 [fable-helm] GREENLIT by Hunter (live session): "make sure that eventually we

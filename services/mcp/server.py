@@ -154,6 +154,11 @@ register_cam_tools(_reg.view(mcp, "cam"))
 # Doc diff — semantic feature-level diff between two document revisions (T-H2).
 from mcp_server.doc_diff_tools import register_doc_diff_tools
 register_doc_diff_tools(mcp)
+# PLM vault (Pillar 19, aicad.plm/1): hidden git-backed version history —
+# Project/History/Checkpoint/Release/Restore. Schema: contracts/plm.md.
+# Engine: services/plm/. Zero user-facing git vocabulary (contract §8).
+from mcp_server.plm_tools import register_plm_tools
+register_plm_tools(mcp)
 # Requirements (aicad.req/1): CRUD + markdown projection for design briefs.
 # Schema: contracts/requirements.md  Brain: engine_oracle/requirements/requirements.py
 from mcp_server.req_tools import register_req_tools

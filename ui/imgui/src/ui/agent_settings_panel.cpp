@@ -17,13 +17,13 @@
 #include "agent_settings_view.h"   // ui/abstract/
 
 #include "app/app_state.h"
+#include "platform/run_subprocess.h"
 #include "theme/theme.h"
 #include "theme/tokens.h"
 
 #include "imgui.h"
 #include <nlohmann/json.hpp>
 
-#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -46,40 +46,18 @@ std::string envOr(const char* key, const char* dflt) {
     return (v && *v) ? std::string(v) : std::string(dflt);
 }
 
-// POSIX single-quote for the shell.
-std::string shq(const std::string& s) {
-    std::string out = "'";
-    for (char c : s) { if (c == '\'') out += "'\\''"; else out += c; }
-    out += "'"; return out;
-}
-
 // Run `python3 -m services.agent.routing <sub>` in the repo root. `stdinText`
 // (if non-empty) is fed on stdin. Returns stdout; sets ok. No-op-safe: if no
 // repo/python is discoverable this returns ok=false and the caller keeps the
-// current model (offline/shot mode is unaffected — it never calls this).
+// current model (offline/shot mode is unaffected — it never calls this). The
+// OS-specific process spawn lives in platform/run_subprocess.
 std::string runRoutingCli(const std::string& sub, const std::string& stdinText, bool& ok) {
-    ok = false;
-#if defined(_WIN32)
-    (void)sub; (void)stdinText; return {};   // wired on POSIX; Windows uses worker path (future)
-#else
     const std::string py   = envOr("AI_CAD_PYTHON", "python3");
     const std::string repo = envOr("AI_CAD_REPO", ".");
-    std::string cmd = "cd " + shq(repo) + " && " + shq(py) +
-                      " -m services.agent.routing " + sub + " 2>/dev/null";
-    if (!stdinText.empty()) {
-        // Feed stdin via a here-doc-free approach: printf the JSON then pipe.
-        cmd = "printf '%s' " + shq(stdinText) + " | " + cmd;
-    }
-    FILE* p = popen(cmd.c_str(), "r");
-    if (!p) return {};
-    std::string out;
-    char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), p)) > 0) out.append(buf, n);
-    int rc = pclose(p);
-    ok = (rc == 0) && !out.empty();
-    return out;
-#endif
+    const std::string cmd = "cd " + platform::shellQuote(repo) + " && " +
+                            platform::shellQuote(py) +
+                            " -m services.agent.routing " + sub + " 2>/dev/null";
+    return platform::runShellCapture(cmd, stdinText, ok);
 }
 
 // ---- view JSON -> model ----------------------------------------------------

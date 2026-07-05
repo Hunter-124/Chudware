@@ -61,3 +61,4 @@ Key findings:
 - 4 undeclared-but-installed deps: anyio, langgraph, pydantic, qrcode (all MIT)
 - 7 true pollution regressions (not ~29): primary cause is test_h7_shadow.py injecting sys.modules["services.agent.config"] stub at collection time; 2 secondary causes (module-load-time HAVE_FLUIDS/HAVE_KERNEL flags)
 - Proposed T-V3..T-V8 follow-up tasks in the audit doc
+- 2026-07-05 18:57 UTC [sonnet-vega] test_vlm_track.py::test_residual_report_verdicts hits live localhost:1234 (hardcoded LM-Studio URL, ~line 199) — fails HTTP 500 whenever a real llama-server occupies the port (constant during tokenmaxx trials). Fix: unroutable port like siblings or mock urlopen. Env-flake, not a regression. (foreman)

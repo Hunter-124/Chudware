@@ -1,9 +1,22 @@
-# contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.2)
+# contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.3)
 
-Frozen 2026-07-04; §10–§15 added same day (1.0 → 1.1), §16–§17 added same day
-(1.1 → 1.2). All bumps additive. Companion to `docs/ADVISOR_ARCHITECTURE.md`
-(Pillar 20) and `docs/COPILOT_MISSION_PIPELINE.md` (pipeline operation).
-Additive changes bump the minor (`aicad.advisor/1.1`); breaking changes require a new
+Frozen 2026-07-04; §10–§15 added same day (1.0 → 1.1), §16–§17 (1.1 → 1.2),
+§18–§21 org layer (1.2 → 1.3). All bumps additive. Companion to
+`docs/ADVISOR_ARCHITECTURE.md` (Pillar 20) and `docs/COPILOT_MISSION_PIPELINE.md`
+(pipeline operation).
+
+1.3 additive amendments to earlier sections:
+- §17 replan `scope` gains `org` (restructure departments/channels/hierarchy) —
+  routes to orchestrator + overseer audit.
+- §12 delegation nodes gain `kind: worker|ponder`. `ponder` = a read-only,
+  budget-bounded spin-off of the requesting role for deep-diving one question
+  ("what's the best datum scheme here?"); auto-approved at ANY depth (read-only
+  tools + hard token budget make it safe), result lands as a ledger note.
+- §8 tier profiles gain `deliberation: full|standard|minimal`. INVERTED DIAL
+  (Hunter 2026-07-04): local tiers default `full` (tokens are free — councils,
+  ponders, trigger packs all on), frontier defaults `minimal` (tokens cost money;
+  councils only where risk warrants).
+Additive changes bump the minor; breaking changes require a new
 major and a migration note here. All schemas are JSON; all lengths mm, angles deg,
 masses g (canonical units per the interaction contract's `normalize_dimension`).
 
@@ -439,3 +452,158 @@ overseer audit; `spec` → overseer, and user if any acceptance criterion change
 edit and are ledger events; denied requests return with a reason the role can act
 on. A role that has emitted a `blocked` replan_request stops working until ruled on
 — it never continues down the failed path.
+
+## §18 Organization runtime (`aicad.org/1`)
+
+Departments are instantiated per mission from the deliverable manifest: each
+deliverable cluster (a deliverable plus its depends_on satellites, e.g. part +
+its drawing + its cam_program) gets a department. The org chart is a ledger
+artifact and re-chartable mid-mission via replan scope=org.
+
+```json
+{
+  "schema": "aicad.org/1",
+  "departments": [{
+    "id": "dept_bottom_shell",
+    "deliverables": ["DL1", "DL4"],
+    "manager": {"role": "department_manager", "delegation_node": "dg_..."},
+    "members": [{"role": "sketcher", "delegation_node": "dg_..."}],
+    "advisors": ["foreman", "overseer"],
+    "status": "forming|active|blocked|delivered|dissolved"
+  }],
+  "channels": [{
+    "id": "ch_shell_lid",
+    "between": ["dept_bottom_shell", "dept_lid"],
+    "created_from": "interface: lid_parting_plane (layout skeleton)",
+    "status": "open|closed"
+  }],
+  "chart_revision": 3
+}
+```
+
+Channel messages are ledger events:
+`{channel, from_dept, kind: info|question|decision|warning|interface_change,
+body <=120 words, refs (DIM/DL/AC/node ids), needs_ack}`. Rules: an
+`interface_change` message is MANDATORY before any department alters a
+dimension another department cites (the derivation tree §21 knows who cites
+it); unacked interface_changes block the sender's stage exit, not the send.
+Channels are created automatically from manifest dependencies + layout
+interfaces; departments may open more (ledger event, why required).
+
+Worker requests (`aicad.request/1`) — the raise-your-hand primitive:
+
+```json
+{
+  "schema": "aicad.request/1",
+  "id": "rq_...",
+  "from": "dg_...", "to": "manager|orchestrator|overseer",
+  "kind": "context|resource|information|communication|concern|escalation",
+  "body": "the bore spec cites DIM7 but the ledger shows it superseded",
+  "refs": {},
+  "resolution": {"by": null, "action": null, "ts": null},
+  "sla": "next_manager_turn"
+}
+```
+
+Rules: every request gets an explicit resolution (grant, deny-with-reason,
+escalate) — silent expiry is forbidden; unresolved `concern` requests older
+than one manager turn auto-surface in the overseer's next audit (accountability
+without human intervention). Managers report department status upward every N
+node completions (structured: done/next/blocked/requests-open) — reports are
+ledger events the orchestrator and transparency UI consume.
+
+## §19 Councils (`aicad.council/1`)
+
+A council is a structured, seat-based deliberation — the token-cheap way to get
+multi-angle judgment before committing. Not a chat: each seat produces a typed
+position, the chair synthesizes, dissents are RECORDED.
+
+```json
+{
+  "schema": "aicad.council/1",
+  "id": "cn_...",
+  "kind": "build_strategy|spec_review|failure_review|org_review|custom",
+  "topic": "how to build DL1 bottom-shell",
+  "seats": [{"persona": "manufacturing", "focus": "setup count, tool access, stock"},
+            {"persona": "tolerancing",  "focus": "datums, stackups, critical dims"},
+            {"persona": "fitment",      "focus": "interfaces, clearances, assembly order"},
+            {"persona": "simplicity",   "focus": "fewest features that satisfy the ACs"}],
+  "rounds": 2,
+  "inputs": {"ledger_refs": [], "buildgraph": null},
+  "positions": [{"seat": "manufacturing", "position": "", "risks": [], "must_haves": []}],
+  "synthesis": {"decision": "", "rationale": "", "rejected_alternatives": []},
+  "dissents": [{"seat": "", "dissent": "", "trigger_condition": "revisit if wall <2mm"}],
+  "chair": "department_manager"
+}
+```
+
+Rules: the BUILD-STRATEGY council is a Phase 3 exit requirement per part above
+trivial complexity (config: feature count threshold); its synthesis feeds the
+buildgraph planner and its must_haves become validator checks. Seats run as
+ponder delegations (same model, different persona prompt — cheap on local).
+Dissents carry trigger_conditions; the foreman watches them and re-raises the
+dissent as an advisory if the condition occurs (a recorded minority report with
+teeth). round 2 lets seats respond to each other's round-1 positions —
+"councils interact" without freeform chat. Council outputs are ledger events.
+
+## §20 Trigger-based context injection (`aicad.trigger/1`)
+
+Fine-grained companion to the stage battery: a data-driven table mapping what
+the model is DOING to context it should HAVE. Evaluated by the foreman after
+every model turn (output text) and tool call.
+
+```yaml
+schema: aicad.trigger/1        # services/agent/advisor/triggers.yaml
+triggers:
+  - id: thread_mention
+    match: {keywords: ["tap", "thread", "M[0-9]+x?", "UNC", "UNF"], tools: [], events: []}
+    inject:
+      context_pack: threads    # short authored snippet: callout format, class defaults
+      prerun_calcs: [{calc: tap_drill, inputs_from: match}]
+      exemplar: "M6x1.0 tapped hole: pilot 5.0, engagement >=1.5d in aluminum"
+    budget_tokens: 250
+    cooldown_turns: 8          # don't re-inject while it's still in context
+  - id: bearing_seat
+    match: {keywords: ["bearing", "seat", "bore.*press"], tools: [part_search]}
+    inject: {context_pack: bearing_fits, prerun_calcs: [{calc: fit_calc}]}
+    budget_tokens: 300
+    cooldown_turns: 8
+```
+
+Rules: injections render inside the [ADVISORY] block as severity=info CONTEXT
+items and count against the advisory slot budget (drop-first when over). Regex
+keywords match model OUTPUT and user text routed to the role; `inputs_from:
+match` lets prerun calcs pull the matched value (M6x1.0 → tap_drill("M6x1.0")).
+Cooldown prevents nagging. The table is data — departments/users can add
+triggers; every firing is a ledger event (which trigger, what matched, tokens).
+
+## §21 Dimension derivation tree & invalidation (extends `aicad.ledger/1`)
+
+Additive fields on ledger dimension entries:
+
+```json
+{
+  "id": "DIM9", "name": "boss_od", "value": 28.0,
+  "derived_from": ["DIM7", "calc:press_fit:pf_123", "D14"],
+  "derivation": "DIM7 (bore 20 H7) + 2*min_wall(4.0, from wall_thickness calc)",
+  "linked": {"eq_id": "eq_boss_od", "expr": "bore_d + 2*boss_wall"},
+  "cited_by_departments": ["dept_lid"]
+}
+```
+
+Rules:
+- `derived_from` forms a DAG over dimensions, decisions, calc results, and
+  assumptions. Writing a derived dimension WITHOUT derived_from refs is a
+  provenance violation (validator warns; overseer audit trigger on repeat).
+- LINKED DIMENSIONS FIRST: when a derivation is expressible as an equation, the
+  helper binds it into the engine (`eq_set`) so geometry re-drives on change;
+  `linked.eq_id` records the binding. Roles' prompts already push this; the
+  helper makes it one call (`link_dimension(DIM9)`).
+- Invalidation: `mark_faulty(ref, why)` walks dependents through the derivation
+  DAG + buildgraph refs + AC checks and emits an impact report
+  (`aicad.impact/1`): `{faulty, affected_dims[], affected_nodes[],
+  affected_checks[], recommended: [{target, action: relink|recompute|rebuild|
+  reverify, why}]}`. The report routes as a change plan (§11) — assessed, not
+  auto-executed; linked dimensions typically downgrade "rebuild" to
+  "recompute + reverify" (the equation already propagated the value).
+- The impact walker is deterministic and unit-tested; no LLM in the walk.

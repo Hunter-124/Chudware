@@ -315,6 +315,19 @@ Pillar 19 (workstream R) integration, taken as a design input now:
   this request" are answerable from the PLM timeline.
 - Feature-flagged against vault availability; codes to the workstream R contract.
 
+### 2.17 Organization layer (1.3 — contract §18–§21, T-W21..T-W24)
+
+Departments (per deliverable cluster, chaired by the authored department_manager
+role) with auto-created inter-department channels and an enforced
+interface_change discipline; worker requests with mandatory explicit resolution
+and concern-aging into overseer audits; seated COUNCILS (authored personas:
+manufacturing/tolerancing/fitment/simplicity) gating build strategy before
+geometry, with recorded dissents the foreman watches; trigger-based context
+injection (keyword/tool/event → context packs + pre-run calcs); and the
+dimension DERIVATION TREE with linked-dimension eq_set binding and the
+deterministic mark_faulty impact walker. Deliberation dial is inverted: local
+tiers get full machinery (tokens free), frontier minimal.
+
 ## 3. Context budget (local-24k reference layout)
 
 | Slot | Tokens |

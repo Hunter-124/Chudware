@@ -84,7 +84,19 @@ the *composition* never changes — that is the context-management discipline.
   problems. User approval per autonomy dial.
 - Exit gate: spec audited; all criteria covered by the verification plan.
 
-### Phase 3 — PLAN (orchestrator; layout_engineer for assemblies)
+### Phase 2.5 — ORGANIZE (org runtime, contract §18; added 1.3)
+
+After specs exist, the org runtime instantiates DEPARTMENTS from deliverable
+clusters (part + its drawing/CAM satellites), each chaired by a
+department_manager with its own workers, budget, and ledger scope. Channels are
+auto-created between departments that share interfaces; the interface_change
+message discipline (§18) is what keeps parallel departments from silently
+breaking each other. Workers raise requests (context/resource/info/comms/
+concern) that managers MUST explicitly resolve; aged concerns surface in
+overseer audits automatically. The chart is re-organizable mid-mission via
+replan scope=org — the hierarchy serves the mission, not vice versa.
+
+### Phase 3 — PLAN (orchestrator; layout_engineer for assemblies; councils)
 
 - Assemblies first get a layout: layout_engineer builds the skeleton doc (envelopes
   as simple solids, interface planes/axes, clearance budgets) — the deterministic
@@ -93,7 +105,17 @@ the *composition* never changes — that is the context-management discipline.
   graphs (aicad.buildgraph/1); the buildgraph validator must pass (missing
   prerequisites are findings, not surprises); role/model assignments come from
   routing.yaml; multi-part missions pre-plan doc leases.
-- Exit gate: graphs valid, overseer ratified, budgets allocated.
+- BUILD-STRATEGY COUNCIL (contract §19; added 1.3): before a part's build graph
+  is ratified, its department convenes the four-seat council (manufacturing /
+  tolerancing / fitment / simplicity — authored personas, run as cheap ponder
+  delegations of the same model). Round 1: independent positions. Round 2: seats
+  respond to each other. Chair synthesizes; must_haves become buildgraph
+  validator checks; DISSENTS are recorded with trigger_conditions the foreman
+  watches — a minority report that re-raises itself if its condition occurs.
+  This is the "figure out the best way to build it from all angles BEFORE
+  building" gate.
+- Exit gate: graphs valid, council synthesis recorded (above the complexity
+  threshold), overseer ratified, budgets allocated.
 
 ### Phase 4 — BUILD (workers; parallel per part doc)
 
@@ -164,6 +186,15 @@ redirects work and escalates.
    advisory/system slots.
 7. **Flexibility has a schema.** Replan requests keep out-of-the-box thinking
    inside the ledger where the overseer and the human can see it.
+8. **The dial is INVERTED for deliberation (1.3).** Local tokens are free —
+   local tiers get FULL deliberation (councils, ponder spin-offs, trigger
+   context packs all default-on); frontier tiers get minimal (councils only
+   where risk warrants). More machinery for weaker models, not less.
+9. **Truth has a tree (1.3).** Derived dimensions record what they derive from
+   (§21); linked dimensions bind into engine equations so change propagates by
+   math; mark_faulty walks the tree and reports exactly what needs
+   relink/recompute/rebuild/reverify — an early error never silently poisons
+   later features.
 
 ## 4. Worked example (compressed)
 

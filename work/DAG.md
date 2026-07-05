@@ -154,22 +154,26 @@ graph TD
     T_W10["T-W10: Model tier profiles + local-model harness - budget enforcement, GBNF outputs, per-tier prompt sizing"]:::todo
     T_W11["T-W11: Advisory loop end-to-end benchmark - mission through roles+advisories on local and frontier tiers"]:::todo
     T_W12["T-W12: Tool preflight - dry-run plan validation on shadow doc clones (aicad.preflight/1)"]:::done
-    T_W13["T-W13: Overseer plan-audit engine + user change-request routing (aicad.audit/1)"]:::todo
+    T_W13["T-W13: Overseer plan-audit engine + user change-request routing (aicad.audit/1)"]:::doing
     T_W14["T-W14: Hierarchical delegation with approval chain + model routing table (aicad.delegation/1, aicad.routing/1)"]:::todo
     T_W15["T-W15: Build-order DAG planner - part/feature dependency graph with deterministic validation (aicad.buildgraph/1)"]:::done
     T_W16["T-W16: Multi-document agent workspace - doc leases, parallel part fan-out, per-doc event streams"]:::todo
-    T_W17["T-W17: Transparency inspector + model-source settings GUI (advisor observability, routing editor, multi-viewport watch)"]:::todo
-    T_W18["T-W18: PLM integration - agent milestone checkpoints, ledger-annotated history, change-request links (aicad.plmlink/1)"]:::todo
+    T_W17["T-W17: Transparency inspector + model-source settings GUI (advisor observability, routing editor, multi-viewport watch)"]:::doing
+    T_W18["T-W18: PLM integration - agent milestone checkpoints, ledger-annotated history, change-request links (aicad.plmlink/1)"]:::done
     T_W19["T-W19: Mission pipeline glue - intake/spec/plan/build phase machine, manifest validator, replan routing"]:::todo
     T_W2["T-W2: Sketch completion suite - auto-coincident pass, constraint advisor, sketch_health"]:::done
     T_W20["T-W20: MCP surface catch-up batch - register/document all Pillar 20 tools for external clients (deferred)"]:::todo
+    T_W21["T-W21: Trigger-based context injection - keyword/action/event triggers with context packs and prerun calcs"]:::todo
+    T_W22["T-W22: Organization runtime - departments, managers, channels, worker requests (aicad.org/1)"]:::todo
+    T_W23["T-W23: Council primitive + build-strategy council - seated deliberation with recorded dissents"]:::todo
+    T_W24["T-W24: Dimension derivation tree, invalidation impact walker, linked-dimension helper (eq_set binding)"]:::todo
     T_W3["T-W3: ISO 286 fits and tolerance data + fit_calc + suggest_dimension_scheme"]:::done
-    T_W4["T-W4: Engineering calculator registry - bolted joints, threads, press fits, beams, walls + geometry auto-prefill"]:::todo
-    T_W5["T-W5: Advisory engine (foreman) - stage tracking, check batteries, advisory injection"]:::todo
+    T_W4["T-W4: Engineering calculator registry - bolted joints, threads, press fits, beams, walls + geometry auto-prefill"]:::done
+    T_W5["T-W5: Advisory engine (foreman) - stage tracking, check batteries, advisory injection"]:::done
     T_W6["T-W6: Feeds/speeds and machining data tables + CAM advisor integration"]:::done
-    T_W7["T-W7: Role cards and playbooks v1 - ten predefined roles with rich prompts, scoped tools, structured handoffs"]:::todo
-    T_W8["T-W8: Failure cards and bounded fixer loop - unified diagnosis with candidate fixes and escalation"]:::todo
-    T_W9["T-W9: Simulation verification advisor - pre-sim sanity, hand-calc cross-check, margin-policy narration"]:::todo
+    T_W7["T-W7: Role cards and playbooks v1 - ten predefined roles with rich prompts, scoped tools, structured handoffs"]:::doing
+    T_W8["T-W8: Failure cards and bounded fixer loop - unified diagnosis with candidate fixes and escalation"]:::doing
+    T_W9["T-W9: Simulation verification advisor - pre-sim sanity, hand-calc cross-check, margin-policy narration"]:::doing
   end
   subgraph WS_backlog["workstream backlog"]
     T_BL01["T-BL01: V&V benchmark harness"]:::done
@@ -368,6 +372,10 @@ graph TD
   T_W7 --> T_W19
   T_W15 --> T_W19
   T_W19 --> T_W20
+  T_W5 --> T_W21
+  T_W7 --> T_W22
+  T_W14 --> T_W22
+  T_W7 --> T_W23
   T_W3 --> T_W4
   T_W1 --> T_W5
   T_W1 --> T_W7

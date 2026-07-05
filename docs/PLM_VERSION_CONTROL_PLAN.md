@@ -6,6 +6,14 @@ T-BL10 (PDM-lite). This document answers T-BL15's open questions and is the
 source of truth for workstream R. Detailed schemas freeze in `contracts/plm.md`
 (T-R1) — this doc fixes intent, UX model, and architecture direction.
 
+> **T-R1 CONTRACT FROZEN (2026-07-03).** The detailed schemas are now frozen in
+> [`contracts/plm.md`](../contracts/plm.md) (`aicad.plm/1`). The OSS survey +
+> git-binding verdict live in [`docs/PLM_OSS_SURVEY.md`](PLM_OSS_SURVEY.md):
+> **git binding = dulwich (Apache-2.0 arm) primary, subprocess `git` optional
+> accelerator, pygit2 declined** (lightweight + cross-platform + Fedora/Windows
+> parity, no per-platform native wheel, in-process-clean under the guardrails).
+> §3.1 below stands; this note records the resolved binding.
+
 ## 0. Design principles (ordered — #1 wins conflicts)
 
 1. **Ease of use is the #1 priority.** Users must never have to *learn* version

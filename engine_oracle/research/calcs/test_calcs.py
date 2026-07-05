@@ -28,9 +28,13 @@ from engine_oracle.research.calcs.press_fit import press_fit_raw
 class TestRegistry:
     def test_all_six_calcs_registered(self):
         registered = set(list_calcs().keys())
+        # The six original calcs, plus the T-DP3 design-pipeline geometry helpers
+        # (bend_allowance, draft_check). The registry is extensible — assert the
+        # required calcs are a subset rather than an exact match.
         expected = {"beam", "bolted_joint", "thread_engagement",
-                    "press_fit", "wall_thickness", "snap_fit"}
-        assert expected == registered, f"Missing: {expected - registered}"
+                    "press_fit", "wall_thickness", "snap_fit",
+                    "bend_allowance", "draft_check"}
+        assert expected <= registered, f"Missing: {expected - registered}"
 
     def test_run_calc_unknown_returns_fail(self):
         r = run_calc("nonexistent", {})

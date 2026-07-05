@@ -302,14 +302,15 @@ def _class_match(tok, ch):
 class TestLoadAndValidate(unittest.TestCase):
     def test_thirteen_roles_load(self):
         # 13 pipeline roles + department_manager + design_thinker (org/ladder
-        # layers, authored post-branch). council_seats.yaml is data, not a card.
+        # layers) + geometry_designer (design-pipeline Stage 2, T-DP3).
+        # council_seats.yaml is data, not a card.
         cards = roles.load_all_roles()
-        self.assertEqual(len(cards), 15, sorted(cards))
+        self.assertEqual(len(cards), 16, sorted(cards))
         for rid in ("intake_analyst", "clarifier", "spec_writer", "orchestrator",
                     "layout_engineer", "sketcher", "feature_modeler",
                     "assembly_fit_engineer", "sim_engineer", "cam_programmer",
                     "reviewer", "fixer", "overseer",
-                    "department_manager", "design_thinker"):
+                    "department_manager", "design_thinker", "geometry_designer"):
             self.assertIn(rid, cards)
 
     def test_six_playbooks_load(self):

@@ -10,5 +10,7 @@ from . import thread_engagement  # noqa: F401
 from . import press_fit       # noqa: F401
 from . import wall_thickness  # noqa: F401
 from . import snap_fit        # noqa: F401
+from . import bend_allowance  # noqa: F401  (T-DP3: sheet-metal geometry helper)
+from . import draft_check     # noqa: F401  (T-DP3: molded-draft geometry helper)
 
 from .registry import run_calc, list_calcs, get_calc, calc_envelope, calc_fail  # noqa: F401

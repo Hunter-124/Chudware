@@ -231,3 +231,79 @@ triggers:
       exemplar: "Min engagement: 1.0×D steel-in-steel; 1.5×D aluminum; 2.0×D plastic (Machinery's Handbook)"
     budget_tokens: 200
     cooldown_turns: 10
+
+  # T-DP6 pre-op advisory injection triggers (append-only, per DP3 coordination note)
+  # These inject context BEFORE the model operates on geometry, so relevant
+  # process/clearance facts are in context when the op executes.
+
+  - id: interference_pre_op
+    match:
+      keywords:
+        - "\\bplace\\b"
+        - "\\bassemble\\b"
+        - "\\bmount\\b"
+        - "\\bmate\\b"
+        - "\\bcheck interference\\b"
+        - "\\bclearance\\b"
+        - "\\boverlap\\b"
+      tools:
+        - part_place
+        - solve_mates
+        - check_interference
+      events:
+        - assembly_body_added
+    inject:
+      context_pack: interference_pre_op
+      prerun_calcs: []
+      exemplar: "After placing bodies run check_interference; interference > 0 mm³ is a blocker (advisor names axis + depth)"
+    budget_tokens: 200
+    cooldown_turns: 6
+
+  - id: dfm_pre_op
+    match:
+      keywords:
+        - "\\bmanufactur\\b"
+        - "\\bmachine\\b"
+        - "\\bprint\\b"
+        - "\\bmold\\b"
+        - "\\bprocess\\b"
+        - "\\bDFM\\b"
+        - "\\bdesign for\\b"
+        - "\\bwall\\b"
+        - "\\bdraft\\b"
+      tools:
+        - set_process
+        - dfm_check
+        - wall_thickness
+        - resolve_process
+      events: []
+    inject:
+      context_pack: dfm_pre_op
+      prerun_calcs: []
+      exemplar: "Run dfm_check before export; wall < process minimum and missing draft are blockers (advisor names delta + fix)"
+    budget_tokens: 200
+    cooldown_turns: 8
+
+  - id: interface_check_pre_op
+    match:
+      keywords:
+        - "\\binterface\\b"
+        - "\\balign\\b"
+        - "\\bhole pattern\\b"
+        - "\\bbolt holes\\b"
+        - "\\bcoaxial\\b"
+        - "\\bcontact face\\b"
+        - "\\bfastener\\b"
+        - "\\bregister\\b"
+        - "\\bpass.through\\b"
+      tools:
+        - interface_check
+        - part_place
+        - solve_mates
+      events: []
+    inject:
+      context_pack: interface_check_pre_op
+      prerun_calcs: []
+      exemplar: "interface_check catches hole-pattern offset, coaxiality error, contact-plane gap — all pass interference but are still wrong"
+    budget_tokens: 200
+    cooldown_turns: 8

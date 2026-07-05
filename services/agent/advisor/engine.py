@@ -25,6 +25,7 @@ may merge mid-task; feature-flag the candidate-fix providers individually") via
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -95,11 +96,59 @@ def _adv_id(seq: int, kind: str, salt: str) -> str:
     return f"adv_{h}"
 
 
-def _fix_interference(f: Finding) -> tuple[list[dict], list[str]]:
-    """Interference → fit-based bore/shaft suggestion when diameters are known.
+def _overlap_axis_from_bboxes(bbox_a: dict, bbox_b: dict) -> tuple[str, float]:
+    """Derive the minimum-translation-separation axis and penetration depth from two AABBs.
 
-    On the **doc path** the adapter measures cylindrical-face diameters and puts
-    them in ``f.extra`` (``bore_d`` / ``shaft_d`` / ``fit`` / ``feature``): we run
+    The kernel returns ``parts:[{name, bbox:{min:[x,y,z], max:[x,y,z], size:[...]}, volume}]``
+    but no pre-computed axis.  We compute it here from the AABB intersection: the axis whose
+    overlap extent is **smallest** is the direction the model must move the fewest mm to resolve
+    the clash.
+
+    Returns ``(axis_label, penetration_mm)`` where ``axis_label`` is e.g. ``"+X"``, ``"-Y"``
+    (the direction body_b should move to exit body_a), and ``penetration_mm`` is the overlap
+    depth along that axis.  Returns ``("?", 0.0)`` when bbox data is missing or degenerate.
+
+    Source: kernel ``interference_report`` → ``parts[i].bbox.{min,max}``; calculation is
+    purely from those numbers — no geometry guess-work.
+    """
+    try:
+        mn_a = bbox_a.get("min", [])
+        mx_a = bbox_a.get("max", [])
+        mn_b = bbox_b.get("min", [])
+        mx_b = bbox_b.get("max", [])
+        if len(mn_a) < 3 or len(mx_a) < 3 or len(mn_b) < 3 or len(mx_b) < 3:
+            return "?", 0.0
+        axes = ["X", "Y", "Z"]
+        overlaps: list[tuple[float, str, bool]] = []  # (depth, axis_name, b_is_positive)
+        for i, ax in enumerate(axes):
+            lo = max(mn_a[i], mn_b[i])
+            hi = min(mx_a[i], mx_b[i])
+            depth = hi - lo
+            if depth <= 0.0:
+                return "?", 0.0  # no AABB overlap on this axis → degenerate
+            # positive direction: b's max is greater than a's max → b extends in +axis
+            # relative to a, so moving b in +axis increases separation.
+            b_positive = mx_b[i] > mx_a[i]
+            overlaps.append((depth, ax, b_positive))
+        # minimum-translation axis = smallest overlap depth
+        overlaps.sort(key=lambda t: t[0])
+        min_depth, min_ax, b_pos = overlaps[0]
+        sign = "+" if b_pos else "-"
+        return f"{sign}{min_ax}", round(min_depth, 3)
+    except Exception:  # noqa: BLE001
+        return "?", 0.0
+
+
+def _fix_interference(f: Finding) -> tuple[list[dict], list[str]]:
+    """Interference → targeted diagnosis with axis + magnitude + named fix.
+
+    T-DP6 upgrade: the finding now names the colliding bodies, the overlap
+    magnitude in mm³, the MTS (minimum-translation-separation) axis derived from
+    the per-body AABBs already in the kernel return, and a targeted move/resize
+    suggestion with a concrete distance.
+
+    On the **doc path** the adapter may also carry cylindrical-face diameters
+    (``bore_d`` / ``shaft_d`` / ``feature`` in ``f.extra``): when present we run
     ``fit_calc`` (T-W3) and emit an ``edit_feature_param`` fix with real numbers.
 
     On the **loop path** no diameters exist (``res.fit`` carries volume + names
@@ -134,14 +183,36 @@ def _fix_interference(f: Finding) -> tuple[list[dict], list[str]]:
                 "confidence": "table",
             }], helper
 
-    # Loop path (or fit provider off / calc failed): heuristic move/resize.
-    a = f.refs.get("bodies", ["A", "B"])[0] if f.refs.get("bodies") else "one body"
+    # Loop path (or fit provider off / calc failed): axis-derived move/resize fix.
+    bodies = f.refs.get("bodies", [])
+    a_name = bodies[0] if bodies else "body_a"
+    b_name = bodies[1] if len(bodies) > 1 else "body_b"
+    vol = f.numbers.get("overlap_mm3", "?")
+
+    # Derive axis from per-body bboxes when the adapter captured them (doc path).
+    bbox_a = f.extra.get("bbox_a") or {}
+    bbox_b = f.extra.get("bbox_b") or {}
+    axis, depth_mm = _overlap_axis_from_bboxes(bbox_a, bbox_b)
+
+    if axis != "?" and depth_mm > 0.0:
+        hint = (f"move or resize {b_name} by ≥{depth_mm:.3f} mm along {axis} "
+                f"to eliminate the overlap")
+        basis = (f"{a_name}↔{b_name} overlap {vol} mm³; "
+                 f"MTS axis {axis}, depth {depth_mm:.3f} mm (from kernel AABB)")
+        pred = "interference cleared along the minimum-translation axis"
+        confidence = "calc"  # derived from kernel AABB numbers — not a pure heuristic
+    else:
+        hint = f"shrink or move {a_name} or {b_name} to eliminate the overlap"
+        basis = f"bodies overlap {vol} mm³; axis unavailable (no bbox data)"
+        pred = "removes the interference volume"
+        confidence = "heuristic"
+
     return [{
         "action": "resize_or_move_body",
-        "params": {"body": a, "hint": "shrink the overlapping feature or move it clear"},
-        "basis": f"bodies overlap {f.numbers.get('overlap_mm3', '?')} mm³",
-        "predicted_effect": "removes the interference volume",
-        "confidence": "heuristic",
+        "params": {"body": b_name, "hint": hint, "axis": axis, "depth_mm": depth_mm},
+        "basis": basis,
+        "predicted_effect": pred,
+        "confidence": confidence,
     }], helper
 
 
@@ -251,6 +322,145 @@ def _fix_sim_divergence(f: Finding) -> tuple[list[dict], list[str]]:
     return [fix], helper
 
 
+def _fix_wall_thickness(f: Finding) -> tuple[list[dict], list[str]]:
+    """Thin wall → process-specific minimum wall advisory with resize hint.
+
+    T-DP6: emits the measured minimum, the process minimum, and a targeted
+    param edit suggestion.  Numbers come from ``eval_thickness`` (kernel ray-cast)
+    via the adapter — never invented.
+    """
+    helper = ["wall_thickness", "dfm_check", "describe_part"]
+    mn = f.numbers.get("min_thickness_mm")
+    limit = f.numbers.get("limit_mm")
+    process = f.numbers.get("process", "the selected process")
+
+    if mn is not None and limit is not None:
+        delta = round(float(limit) - float(mn), 3)
+        basis = (f"measured minimum wall {mn:.3f} mm < {process} minimum {limit:.3f} mm "
+                 f"(Δ={delta:+.3f} mm) — from eval_thickness kernel ray-cast")
+        fix_hint = (f"increase the thinnest wall by ≥{delta:.3f} mm "
+                    f"(target ≥{limit:.3f} mm for {process})")
+        pred = f"minimum wall ≥{limit:.3f} mm — {process} manufacturable"
+        confidence = "table"  # process minimum from ProcessProfile table
+    else:
+        basis = f.finding
+        fix_hint = "increase the thinnest wall to meet the process minimum"
+        pred = "wall clears the process minimum"
+        confidence = "heuristic"
+
+    return [{
+        "action": "thicken_wall",
+        "params": {"hint": fix_hint, "min_thickness_mm": limit},
+        "basis": basis,
+        "predicted_effect": pred,
+        "confidence": confidence,
+    }], helper
+
+
+def _fix_dfm(f: Finding) -> tuple[list[dict], list[str]]:
+    """DFM check failure → per-issue targeted fix (wall or draft).
+
+    T-DP6: DFM issues carry a ``checks`` list (each with ``check``, ``value``,
+    ``limit``, ``note``).  We emit one fix per failed check so the fixer can
+    apply them independently.  Numbers come from the DFM adapter — never invented.
+    """
+    helper = ["dfm_check", "wall_thickness", "draft_analysis", "describe_part"]
+    checks = f.extra.get("checks") or []
+    fixes: list[dict] = []
+
+    for ck in checks:
+        if ck.get("ok"):
+            continue
+        chk_name = ck.get("check", "unknown")
+        note = ck.get("note", chk_name)
+        if chk_name == "min_wall":
+            val = ck.get("value_mm")
+            lim = ck.get("limit_mm")
+            delta = round(float(lim) - float(val), 3) if (val is not None and lim is not None) else None
+            hint = (f"increase thinnest wall by ≥{delta:.3f} mm" if delta is not None
+                    else "increase thinnest wall to process minimum")
+            fixes.append({
+                "action": "thicken_wall",
+                "params": {"hint": hint, "target_mm": lim},
+                "basis": note,
+                "predicted_effect": "min_wall check passes",
+                "confidence": "table",
+            })
+        elif chk_name == "draft":
+            faces_below = ck.get("faces_below", "?")
+            fixes.append({
+                "action": "add_draft",
+                "params": {"hint": f"{faces_below} face(s) need draft; add ≥1° per face"},
+                "basis": note,
+                "predicted_effect": "draft check passes",
+                "confidence": "table",
+            })
+        else:
+            fixes.append({
+                "action": "fix_dfm_issue",
+                "params": {"check": chk_name, "hint": note},
+                "basis": note,
+                "predicted_effect": f"{chk_name} check passes",
+                "confidence": "heuristic",
+            })
+
+    if not fixes:
+        # Fallback — §3 non-info invariant
+        fixes = [{
+            "action": "run_dfm_review",
+            "params": {"hint": "re-run dfm_check after geometry changes"},
+            "basis": f.finding,
+            "predicted_effect": "DFM issues resolved",
+            "confidence": "heuristic",
+        }]
+    return fixes, helper
+
+
+def _fix_interface_fitment(f: Finding) -> tuple[list[dict], list[str]]:
+    """Interface alignment failure → per-check targeted fix.
+
+    T-DP6: interface_check findings carry a ``severity`` (fail/warn), a ``check``
+    name (hole_pattern, coaxiality, contact_plane, fastener_passthrough), an
+    ``error_mm`` or ``detail``, and a pre-computed ``fix`` string (T-BL49 contract).
+    We lift the pre-computed fix into a candidate_fix so the fixer loop can apply
+    it directly without re-running the checker.
+    """
+    helper = ["interface_check", "measure_between", "fit_calc"]
+    checks = f.extra.get("findings") or []
+    fixes: list[dict] = []
+
+    for ck in checks:
+        if ck.get("severity") not in ("fail", "warn"):
+            continue
+        chk_name = ck.get("check", "interface")
+        detail = ck.get("detail", chk_name)
+        precomputed_fix = ck.get("fix", "")
+        err_mm = ck.get("error_mm")
+        params: dict = {"hint": precomputed_fix or detail}
+        if err_mm is not None:
+            params["error_mm"] = err_mm
+        basis = detail
+        if err_mm is not None:
+            basis = f"{detail} (error = {err_mm:.3f} mm)"
+        fixes.append({
+            "action": f"fix_{chk_name}",
+            "params": params,
+            "basis": basis,
+            "predicted_effect": f"{chk_name} passes",
+            "confidence": "calc",  # pre-computed by interface_check geometry analysis
+        })
+
+    if not fixes:
+        fixes = [{
+            "action": "run_interface_check",
+            "params": {"hint": "re-run interface_check after geometry changes"},
+            "basis": f.finding,
+            "predicted_effect": "interface alignment issues resolved",
+            "confidence": "heuristic",
+        }]
+    return fixes, helper
+
+
 _FIX_PROVIDERS = {
     "interference": _fix_interference,
     "overlap": _fix_overlap,
@@ -259,6 +469,10 @@ _FIX_PROVIDERS = {
     "sim_bc": _fix_sim_bc,
     "sim_margin": _fix_sim_margin,
     "sim_divergence": _fix_sim_divergence,
+    # T-DP6 diagnostic advisors
+    "wall_thickness": _fix_wall_thickness,
+    "dfm": _fix_dfm,
+    "interface_fitment": _fix_interface_fitment,
 }
 
 

@@ -141,12 +141,29 @@ def _run_check(check: str, doc_id: str, call: Any) -> list[Finding]:
         return _check_sketch(doc_id, call, check)
     if check == stages.CHECK_REBUILD:
         return _check_rebuild(doc_id, call)
+    # T-DP6 diagnostic advisor checks
+    if check == stages.CHECK_WALL_THICKNESS:
+        return _check_wall_thickness(doc_id, call)
+    if check == stages.CHECK_DFM:
+        return _check_dfm(doc_id, call)
+    if check == stages.CHECK_INTERFACE_FITMENT:
+        return _check_interface_fitment(doc_id, call)
     # part_verify / sim / cam presence checks are advisory-only presence flags.
     return []
 
 
 def _check_interference(doc_id: str, call: Any) -> list[Finding]:
     r = call("doc_eval_interference", doc_id=doc_id) or {}
+    # Build a name→bbox lookup from the ``parts`` list so the engine can derive
+    # the minimum-translation-separation axis without a second RPC call.
+    # T-DP6: kernel returns {parts:[{name, bbox:{min,max,size}, volume}], interferences:[{a,b,volume}]}
+    bbox_by_name: dict[str, dict] = {}
+    for part in r.get("parts", []):
+        name = part.get("name")
+        bbox = part.get("bbox")
+        if name and bbox:
+            bbox_by_name[name] = bbox
+
     out: list[Finding] = []
     for it in r.get("interferences", []):
         # The doc path CAN carry cylindrical-face diameters + the feature id when
@@ -159,18 +176,26 @@ def _check_interference(doc_id: str, call: Any) -> list[Finding]:
                 "fit": it.get("fit", "H7/g6"),
                 "nominal": it.get("nominal", it.get("shaft_d")),
             }
+        # T-DP6: carry bbox data so engine._fix_interference can derive the MTS axis.
+        a_name = it.get("a", "")
+        b_name = it.get("b", "")
+        if a_name in bbox_by_name:
+            extra["bbox_a"] = bbox_by_name[a_name]
+        if b_name in bbox_by_name:
+            extra["bbox_b"] = bbox_by_name[b_name]
+
         vol = it.get("volume")
         out.append(Finding(
             kind="interference",
             check=stages.CHECK_INTERFERENCE,
             severity="blocker",  # assembly interference gates stage exit (§9.3)
             finding=it.get("summary")
-                    or (f"bodies {it.get('a')}/{it.get('b')} interfere "
+                    or (f"bodies {a_name}/{b_name} interfere "
                         f"{vol} mm³"),
             numbers={"overlap_mm3": vol,
                      **({"bore_d": it["bore_d"], "shaft_d": it["shaft_d"]}
-                        if extra else {})},
-            refs={"doc_id": doc_id, "bodies": [it.get("a"), it.get("b")],
+                        if it.get("bore_d") is not None else {})},
+            refs={"doc_id": doc_id, "bodies": [a_name, b_name],
                   "features": [extra["feature"]] if extra.get("feature") else []},
             source_kind="kernel",
             source_detail="doc_eval_interference",
@@ -243,6 +268,175 @@ def _check_rebuild(doc_id: str, call: Any) -> list[Finding]:
             source_kind="kernel",
             source_detail="doc_feature_status",
             extra={"diagnosis": feat.get("diagnosis")},
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# T-DP6: wall_thickness, DFM, and interface_fitment checks
+# ---------------------------------------------------------------------------
+
+def _check_wall_thickness(doc_id: str, call: Any) -> list[Finding]:
+    """Run eval_thickness + resolve process minimum → thin-wall Finding.
+
+    Numbers: ``min_thickness_mm`` (kernel ray-cast), ``limit_mm`` (ProcessProfile
+    table), ``process`` (name string).  Source: kernel ray-cast — cited as such.
+    Returns an ``action`` finding when wall < limit, ``info`` when OK.
+    """
+    try:
+        th = call("eval_thickness", doc_id=doc_id) or {}
+    except Exception:  # noqa: BLE001
+        return []
+    mn = th.get("min_thickness_mm")
+    if mn is None:
+        return []  # open/sheet body — no thickness measurement
+
+    # Attempt to resolve the process minimum from the process profile bound to this doc.
+    limit: Optional[float] = None
+    proc_name: str = "process"
+    try:
+        proc_info = call("doc_get_process", doc_id=doc_id) or {}
+        proc_name = proc_info.get("process") or "process"
+        params = proc_info.get("params") or {}
+        lim_val = params.get("min_wall_mm")
+        if lim_val is not None:
+            limit = float(lim_val)
+    except Exception:  # noqa: BLE001
+        pass
+
+    if limit is not None and mn < limit:
+        finding_text = (f"thinnest wall {mn:.3f} mm < {proc_name} minimum {limit:.3f} mm "
+                        f"(Δ={limit - mn:+.3f} mm) — from eval_thickness kernel ray-cast")
+        severity = "action"
+    elif limit is not None:
+        finding_text = (f"thinnest wall {mn:.3f} mm meets {proc_name} minimum {limit:.3f} mm "
+                        f"— from eval_thickness kernel ray-cast")
+        # OK wall — emit info so the advisory is available but non-blocking.
+        return [Finding(
+            kind="wall_thickness",
+            check=stages.CHECK_WALL_THICKNESS,
+            severity="info",
+            finding=finding_text,
+            numbers={"min_thickness_mm": mn, "limit_mm": limit, "process": proc_name},
+            refs={"doc_id": doc_id},
+            source_kind="kernel",
+            source_detail="eval_thickness",
+            extra={},
+        )]
+    else:
+        finding_text = f"thinnest wall {mn:.3f} mm — from eval_thickness kernel ray-cast"
+        severity = "info"
+
+    return [Finding(
+        kind="wall_thickness",
+        check=stages.CHECK_WALL_THICKNESS,
+        severity=severity,
+        finding=finding_text,
+        numbers={"min_thickness_mm": mn,
+                 **({"limit_mm": limit, "process": proc_name} if limit is not None else {})},
+        refs={"doc_id": doc_id},
+        source_kind="kernel",
+        source_detail="eval_thickness",
+        extra={"process": proc_name, "limit_mm": limit},
+    )]
+
+
+def _check_dfm(doc_id: str, call: Any) -> list[Finding]:
+    """Run dfm_check (eval_thickness + eval_draft against ProcessProfile) → DFM Finding.
+
+    Returns a ``blocker`` Finding when any DFM check fails (dfm_pass=False), ``info``
+    otherwise.  The ``checks`` list is carried in ``extra`` so the fix provider can
+    emit per-issue targeted fixes without re-calling the tool.
+    """
+    try:
+        dfm = call("dfm_check", doc_id=doc_id) or {}
+    except Exception:  # noqa: BLE001
+        return []
+    dfm_pass = dfm.get("dfm_pass", True)
+    checks = dfm.get("checks") or []
+    proc = dfm.get("process", "process")
+
+    failed = [c for c in checks if not c.get("ok", True)]
+    if not dfm_pass and failed:
+        issues = "; ".join(c.get("note", c.get("check", "")) for c in failed)
+        finding_text = f"DFM FAIL ({proc}): {issues}"
+        severity = "blocker"
+    else:
+        finding_text = f"DFM PASS ({proc}): all {len(checks)} check(s) OK"
+        severity = "info"
+
+    return [Finding(
+        kind="dfm",
+        check=stages.CHECK_DFM,
+        severity=severity,
+        finding=finding_text,
+        numbers={"dfm_pass": int(dfm_pass), "n_checks": len(checks),
+                 "n_failed": len(failed)},
+        refs={"doc_id": doc_id},
+        source_kind="kernel",
+        source_detail="dfm_check+eval_thickness+eval_draft",
+        extra={"checks": checks, "process": proc},
+    )]
+
+
+def _check_interface_fitment(doc_id: str, call: Any) -> list[Finding]:
+    """Run interface_check (T-BL49) → per-pair alignment Findings.
+
+    Each failed/warned finding in the interface_check ``findings`` list becomes an
+    ``action`` Finding; the pre-computed ``fix`` string from T-BL49 is carried in
+    ``extra`` so the engine fix provider can lift it directly into a candidate_fix.
+    """
+    try:
+        ic = call("interface_check", doc_id=doc_id) or {}
+    except Exception:  # noqa: BLE001
+        return []
+    # Only process a genuine interface_check v1 response (tool key present).
+    # An empty {} from a fixture or a tool that is not yet wired returns nothing
+    # so we do not inject spurious info items into unrelated tests.
+    if ic.get("tool") != "interface_check":
+        return []
+    ic_findings = ic.get("findings") or []
+    out: list[Finding] = []
+
+    # Group findings by component pair for a compact summary.
+    failed = [f for f in ic_findings if f.get("severity") in ("fail", "warn")]
+    if not failed:
+        # No issues — emit info so there's an explicit advisory record.
+        return [Finding(
+            kind="interface_fitment",
+            check=stages.CHECK_INTERFACE_FITMENT,
+            severity="info",
+            finding=ic.get("summary", "interface alignment OK"),
+            numbers={"n_findings": 0},
+            refs={"doc_id": doc_id},
+            source_kind="kernel",
+            source_detail="interface_check",
+            extra={},
+        )]
+
+    # Emit one action Finding per failing component pair (grouped by a+b).
+    pairs_seen: set[tuple] = set()
+    for fc in failed:
+        a = fc.get("component_a", "?")
+        b = fc.get("component_b", "?")
+        pair_key = (min(a, b), max(a, b))
+        if pair_key in pairs_seen:
+            continue  # already emitted a finding for this pair — carry extra findings there
+        pairs_seen.add(pair_key)
+        pair_findings = [f for f in failed
+                         if set([f.get("component_a"), f.get("component_b")]) == {a, b}]
+        issues = "; ".join(pf.get("detail", pf.get("check", "")) for pf in pair_findings)
+        finding_text = f"interface alignment FAIL {a}↔{b}: {issues}"
+        out.append(Finding(
+            kind="interface_fitment",
+            check=stages.CHECK_INTERFACE_FITMENT,
+            severity="action",
+            finding=finding_text,
+            numbers={"n_findings": len(pair_findings)},
+            refs={"doc_id": doc_id, "bodies": [a, b]},
+            source_kind="kernel",
+            source_detail="interface_check",
+            extra={"findings": pair_findings},
         ))
     return out
 

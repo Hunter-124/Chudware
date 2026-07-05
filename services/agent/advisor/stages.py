@@ -156,6 +156,10 @@ CHECK_OPEN_PROFILE = "open_profile"
 # T-W22 org-layer: sender's stage exit is blocked until recipients ack
 # every interface_change the sender posted (§18).
 CHECK_INTERFACE_CHANGE = "interface_change_acked"
+# T-DP6: diagnostic advisor checks — DFM, wall thickness, interface alignment
+CHECK_DFM = "dfm"
+CHECK_WALL_THICKNESS = "wall_thickness"
+CHECK_INTERFACE_FITMENT = "interface_fitment"
 
 
 # ---------------------------------------------------------------------------
@@ -203,15 +207,20 @@ _STAGE_SPEC: dict[str, dict] = {
         "playbook_default": None,
     },
     "part_verify": {
-        "check_battery": [CHECK_PART_VERIFY],
-        "helper_tools": ["verify_battery", "measure_part", "wall_thickness"],
+        # T-DP6: wall_thickness (fast ray-cast) and DFM (process gate) run at part_verify;
+        # both are advisory — they never block exit (wall_thickness → action, DFM → blocker
+        # only on a hard process failure). CHECK_PART_VERIFY is the legacy verify_battery gate.
+        "check_battery": [CHECK_PART_VERIFY, CHECK_WALL_THICKNESS, CHECK_DFM],
+        "helper_tools": ["verify_battery", "measure_part", "wall_thickness", "dfm_check"],
         "exit_gate": [CHECK_PART_VERIFY],
         "playbook_default": None,
     },
     "assembly": {
-        "check_battery": [CHECK_INTERFERENCE],
+        # T-DP6: interface_fitment (hole-pattern / coaxiality / contact-plane) runs at assembly
+        # alongside the hard-clash interference gate.
+        "check_battery": [CHECK_INTERFERENCE, CHECK_INTERFACE_FITMENT],
         "helper_tools": ["check_interference", "fit_calc", "measure_between",
-                         "solve_mates"],
+                         "solve_mates", "interface_check"],
         "exit_gate": [CHECK_INTERFERENCE],
         "playbook_default": None,
     },

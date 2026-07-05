@@ -228,6 +228,73 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "budget_tokens": 200,
         "cooldown_turns": 10,
     },
+    # T-DP6 pre-op advisory injection triggers (append-only per DP3 coordination note).
+    # Each fires BEFORE the model operates so relevant facts are in context at op time.
+    {
+        "id": "interference_pre_op",
+        "match": {
+            "keywords": [
+                r"\bplace\b", r"\bassemble\b", r"\bmount\b", r"\bmate\b",
+                r"\bcheck interference\b", r"\bclearance\b", r"\boverlap\b",
+            ],
+            "tools": ["part_place", "solve_mates", "check_interference"],
+            "events": ["assembly_body_added"],
+        },
+        "inject": {
+            "context_pack": "interference_pre_op",
+            "prerun_calcs": [],
+            "exemplar": (
+                "After placing bodies run check_interference; interference > 0 mm³ is a "
+                "blocker (advisor names axis + depth)"
+            ),
+        },
+        "budget_tokens": 200,
+        "cooldown_turns": 6,
+    },
+    {
+        "id": "dfm_pre_op",
+        "match": {
+            "keywords": [
+                r"\bmanufactur\b", r"\bmachine\b", r"\bprint\b", r"\bmold\b",
+                r"\bprocess\b", r"\bDFM\b", r"\bdesign for\b",
+                r"\bwall\b", r"\bdraft\b",
+            ],
+            "tools": ["set_process", "dfm_check", "wall_thickness", "resolve_process"],
+            "events": [],
+        },
+        "inject": {
+            "context_pack": "dfm_pre_op",
+            "prerun_calcs": [],
+            "exemplar": (
+                "Run dfm_check before export; wall < process minimum and missing draft "
+                "are blockers (advisor names delta + fix)"
+            ),
+        },
+        "budget_tokens": 200,
+        "cooldown_turns": 8,
+    },
+    {
+        "id": "interface_check_pre_op",
+        "match": {
+            "keywords": [
+                r"\binterface\b", r"\balign\b", r"\bhole pattern\b",
+                r"\bbolt holes\b", r"\bcoaxial\b", r"\bcontact face\b",
+                r"\bfastener\b", r"\bregister\b", r"\bpass.through\b",
+            ],
+            "tools": ["interface_check", "part_place", "solve_mates"],
+            "events": [],
+        },
+        "inject": {
+            "context_pack": "interface_check_pre_op",
+            "prerun_calcs": [],
+            "exemplar": (
+                "interface_check catches hole-pattern offset, coaxiality error, "
+                "contact-plane gap — all pass interference but are still wrong"
+            ),
+        },
+        "budget_tokens": 200,
+        "cooldown_turns": 8,
+    },
 ]
 
 _CHARS_PER_TOKEN = 4  # repo-wide heuristic (matches render.py / ledger.py)

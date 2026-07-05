@@ -513,10 +513,13 @@ void drawMissionControlPanel(app::AppState& s) {
     spec.icon  = "activity";
 
     ui::drawPanelScaffold(spec, gScaffoldState, [&]() { drawContent(s); });
+}
 
-    // T-DP18: mirror whole-mission ETA from the view-model into AppState so
-    // status_bar.cpp can display the chip without an additional data path.
-    // Written every frame (cheap string/float copy); status_bar reads it.
+void syncMissionEtaToAppState(app::AppState& s) {
+    // T-DP18: mirror whole-mission ETA from the panel view-model into AppState
+    // so status_bar.cpp can display the chip without an additional data path.
+    // Called unconditionally every frame from application.cpp so the chip
+    // updates even when Mission Control panel is closed.
     s.agent.etaLabel   = gView.etaLabel;
     s.agent.etaSeconds = gView.etaSeconds;
     s.agent.etaLowS    = gView.etaLowS;

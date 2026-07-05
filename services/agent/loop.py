@@ -830,6 +830,98 @@ def _emit(on_event: EventFn | None, **data) -> None:
             pass  # a flaky UI sink must never break the design loop
 
 
+# T-DP18: ordered pipeline phase names (post-INTAKE) used to build the
+# remaining-subtask list for ETA estimation.  Mirrors _PHASE_NODE_PREFIXES
+# order.  CLARIFY and CORRECT are not in the happy path and are omitted;
+# the estimator handles them if reached by their phase-name prefix fallback.
+_ETA_PHASE_ORDER = ("specify", "plan", "build", "verify", "deliver")
+
+
+def _emit_eta_for_remaining(
+    on_event: EventFn | None,
+    current_phase: str,
+    *,
+    run_id: str | None = None,
+    tps_aggregate: float | None = None,
+) -> None:
+    """Emit a ``mission.eta`` event for phases not yet completed.
+
+    Called after each phase entry so the GUI clock chip refreshes as the
+    mission advances.  The *current_phase* is included in remaining (it is
+    in-progress).  Uses the ETAEstimator with token costs from the T-W29/W31
+    bench (benchmarks/tokenmaxx/results/matrix.json).
+
+    The event is written to TWO sinks so the GUI receives it regardless of
+    how the caller wires ``on_event``:
+
+    1. ``on_event({...})``  — the live callback (updates in-process listeners
+       such as the MCP WS bridge; may be None).
+    2. ``EventJournal(run_id).emit(...)`` — the per-run events.jsonl file that
+       the mission-control panel polls via dag_status → seedFromJsonlText.
+       Written only when *run_id* is provided.
+
+    NOTE on honesty: the phase→bench-shape mapping (_PHASE_TO_SHAPE in
+    eta_estimator.py) is a heuristic, not directly measured.  The token
+    counts themselves are real bench measurements.  When no data exists for
+    a phase (unknown=True) the label degrades to "ETA unknown" rather than
+    fabricating a number.  The TPS denominator defaults to the integrator
+    smoke value (482 tok/s, T-W31) when no live rate is injected.
+    """
+    try:
+        from services.agent.eta_estimator import ETAEstimator, SubtaskSpec
+
+        # Build remaining-subtask list: current phase + all that follow it.
+        idx = _ETA_PHASE_ORDER.index(current_phase) if current_phase in _ETA_PHASE_ORDER else -1
+        if idx < 0:
+            remaining_phases = list(_ETA_PHASE_ORDER)
+        else:
+            remaining_phases = list(_ETA_PHASE_ORDER[idx:])
+
+        remaining = [SubtaskSpec(node_id=ph, role_shape=ph) for ph in remaining_phases]
+        if not remaining:
+            return
+
+        est = ETAEstimator(tps_aggregate=tps_aggregate)
+        meta = est.mission_eta(remaining)
+        label = ETAEstimator.format_eta(meta)
+
+        # Per-node labels for the DAG widget (T-DP17 accessor).
+        nodes_labels: dict[str, str] = {}
+        for ph, ne in meta.node_etas.items():
+            nodes_labels[ph] = ETAEstimator.format_node_eta(ne)
+
+        payload: dict = {
+            "label": label,
+            "remaining_phases": remaining_phases,
+        }
+        if meta.eta_seconds is not None:
+            payload["eta_s"] = meta.eta_seconds
+        if meta.eta_low_s is not None:
+            payload["low_s"] = meta.eta_low_s
+        if meta.eta_high_s is not None:
+            payload["high_s"] = meta.eta_high_s
+        if nodes_labels:
+            payload["nodes"] = nodes_labels
+
+        # Sink 1: live callback (for in-process / WS listeners).
+        if on_event is not None:
+            try:
+                on_event({"kind": "mission.eta", **payload})
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Sink 2: EventJournal → events.jsonl (for dag_status panel replay).
+        if run_id is not None:
+            try:
+                from services.dag.event_journal import EventJournal
+                EventJournal(run_id).emit("mission.eta", payload)
+            except Exception:  # noqa: BLE001
+                pass
+
+    except Exception:  # noqa: BLE001
+        pass  # ETA is best-effort — never block the mission
+
+
 def _emit_ai_artifact(
     on_event: EventFn | None,
     run_id: str,
@@ -1462,6 +1554,9 @@ def run_mission(
     # --- Phase 0: INTAKE ---------------------------------------------------
     machine.enter(Phase.INTAKE)
     _emit_phase(Phase.INTAKE, "INTAKE: building deliverable manifest")
+    # T-DP18: emit initial ETA estimate covering all phases so the status-bar
+    # clock chip lights up as soon as the mission starts.
+    _emit_eta_for_remaining(on_event, "specify", run_id=run_id)
     tracker = BounceTracker()
     manifest: dict | None = None
     findings: list = []
@@ -1557,7 +1652,7 @@ def run_mission(
 
     reached, status, stop_reason = _drive_phases_from_dag(
         machine, manifest, graph, dag_result, completed, _emit_phase, Phase,
-        ledger=ledger)
+        ledger=ledger, on_event=on_event, run_id=run_id)
 
     return MissionRun(
         request=request, run_id=run_id, phase=reached, status=status,
@@ -1582,7 +1677,8 @@ _PHASE_NODE_PREFIXES: list[tuple[str, tuple[str, ...]]] = [
 
 def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
                            emit_phase, Phase, *,
-                           ledger=None) -> "tuple[str, str, str]":
+                           ledger=None, on_event: "EventFn | None" = None,
+                           run_id: str | None = None) -> "tuple[str, str, str]":
     """Advance the PhaseMachine phase-by-phase using the DAG node outcomes,
     logging each phase (enter/exit + gate) to the ledger stage_log.
 
@@ -1630,6 +1726,9 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
         machine.enter(phase)
         emit_phase(phase, f"Phase {phase.value}")
         reached = phase.value
+        # T-DP18: refresh the GUI clock chip after each phase entry so the
+        # status-bar ETA counts down as the mission advances.
+        _emit_eta_for_remaining(on_event, phase.value, run_id=run_id)
 
         if not all_done:
             # This phase's nodes did not all complete → mission is at this phase.

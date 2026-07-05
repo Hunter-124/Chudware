@@ -385,6 +385,9 @@ void Application::frame() {
             ui::drawMissionControlPanel(s);
         ImGui::End();
     }
+    // T-DP18: mirror ETA every frame regardless of whether Mission Control is open,
+    // so the status-bar clock chip updates even when the panel is closed.
+    ui::syncMissionEtaToAppState(s);
 
     // T-W17 Agent Inspector — advisor/agent observability, replayable from a run
     // dir. Screenshot-verifiable via AI_CAD_SHOT=agent_inspector[_empty].

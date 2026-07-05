@@ -137,6 +137,22 @@ def run(
     node_inputs: dict[str, Any] = context_pack.get("node_inputs") or {}
     retry_remaining: int = context_pack.get("retry_remaining", 1)
 
+    # Role card (T-W7): a node may carry a ``role:`` field naming a predefined role
+    # card in services/agent/roles/*.yaml. When present, the card's system prompt +
+    # tool allowlist govern the node's agent turn. Applying the card is best-effort:
+    # a missing card or import failure must never break node execution (it just runs
+    # with the default prompt / no extra tool scoping), matching the ledger seam
+    # discipline elsewhere in this pipeline.
+    role_card = _resolve_role_card(node)
+    if role_card is not None:
+        _apply_role_tool_policy(role_card)
+        context_pack = dict(context_pack)
+        context_pack["role_id"] = role_card.id
+        context_pack["role_system_prompt"] = role_card.system_prompt
+        # The node's tools: allowlist and the card's allowlist should agree; the card
+        # is authoritative for a role-typed node, so expose its concrete tools.
+        context_pack.setdefault("allowed_tools", list(role_card.concrete_tools))
+
     # Build the request string passed to the agent.
     request = _build_request(node_type, node_inputs, context_pack)
 
@@ -223,6 +239,36 @@ def run(
         })
 
     return verdict, output_state
+
+
+# ---------------------------------------------------------------------------
+# Role card application (T-W7)
+# ---------------------------------------------------------------------------
+
+def _resolve_role_card(node: dict[str, Any]) -> Any:
+    """Return the RoleCard for ``node['role']`` if the node names one, else None.
+
+    Best-effort: any failure (no role field, unknown role, roles module unavailable)
+    returns None so the node runs with default behaviour."""
+    role_id = node.get("role")
+    if not role_id:
+        return None
+    try:
+        from services.agent import roles  # noqa: PLC0415
+        return roles.load_role(str(role_id))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _apply_role_tool_policy(role_card: Any) -> None:
+    """Bind the role card's tool allowlist into the MCP tool_registry (the ONE
+    dispatch enforcement point). Best-effort — a missing registry never breaks the
+    run."""
+    try:
+        from mcp_server import tool_registry as reg  # noqa: PLC0415
+        role_card.apply_tool_policy(reg)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ---------------------------------------------------------------------------

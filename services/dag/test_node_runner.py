@@ -548,3 +548,58 @@ class TestSection14NarrationFields:
         assert any(q.get("node") == "n1" for q in result["open_questions"]), (
             f"Expected n1 escalation in open_questions, got: {result['open_questions']}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Role card wiring (T-W7): a node's ``role:`` field applies the card
+# ---------------------------------------------------------------------------
+
+class TestRoleCardWiring:
+    """A DAG node may carry a ``role:`` field naming a predefined role card
+    (services/agent/roles/*.yaml). node_runner loads it, applies its tool
+    allowlist to the MCP registry, and injects its system prompt + tools into
+    the context pack. Missing/unknown roles degrade to default behaviour."""
+
+    def _captured_pack(self):
+        captured = {}
+
+        def _fn(request: str, pack: dict) -> Any:
+            captured.update(pack)
+            return _fake_run("confirmed", True)
+
+        return _fn, captured
+
+    def test_role_node_injects_prompt_and_tools(self):
+        from mcp_server import tool_registry as reg
+        reg.reset_policy()
+        agent_fn, captured = self._captured_pack()
+        node = {"id": "n1", "type": "design", "name": "Sketch",
+                "role": "sketcher", "inputs": {"request": "draw a plate"}}
+        verdict, out = nr.run(node, {"node_inputs": node["inputs"],
+                                     "retry_remaining": 1}, agent_fn=agent_fn)
+        assert verdict == "done"
+        assert captured.get("role_id") == "sketcher"
+        assert "SKETCHER" in captured.get("role_system_prompt", "")
+        # the sketcher card's allowlist is now bound in the registry
+        assert reg.is_allowed("sketch_health")
+        assert not reg.is_allowed("cam_post")
+        assert "sketch_health" in captured.get("allowed_tools", [])
+        reg.reset_policy()
+
+    def test_unknown_role_degrades(self):
+        agent_fn, captured = self._captured_pack()
+        node = {"id": "n1", "type": "design", "name": "X",
+                "role": "does_not_exist", "inputs": {"request": "x"}}
+        verdict, out = nr.run(node, {"node_inputs": node["inputs"],
+                                     "retry_remaining": 1}, agent_fn=agent_fn)
+        assert verdict == "done"
+        assert "role_id" not in captured  # no card applied, ran with defaults
+
+    def test_no_role_field_unchanged(self):
+        agent_fn, captured = self._captured_pack()
+        node = {"id": "n1", "type": "design", "name": "X",
+                "inputs": {"request": "x"}}
+        verdict, out = nr.run(node, {"node_inputs": node["inputs"],
+                                     "retry_remaining": 1}, agent_fn=agent_fn)
+        assert verdict == "done"
+        assert "role_id" not in captured

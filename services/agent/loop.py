@@ -762,6 +762,7 @@ class Session:
     turns: int = 0
     compact: bool = False                # set once a provider overflows: stay in compact mode
     plan: dict | None = None             # build plan drafted before the first code pass
+    role_prompt: str | None = None       # T-W7: role card system prompt (overrides SYSTEM_PROMPT)
 
 
 def _emit(on_event: EventFn | None, **data) -> None:
@@ -920,7 +921,12 @@ def _generate(session: Session, provider: Provider, on_event: EventFn | None,
         override = (agent_config.load_config().get("system_prompt") or "").strip()
     except Exception:  # noqa: BLE001
         pass
-    base_prompt = override or SYSTEM_PROMPT
+    # T-W7: a role card's system prompt scopes this run (single-role loop or a
+    # role-typed DAG node). It takes precedence over the built-in prompt; a GUI
+    # config override still wins (the human's explicit global choice). The compact
+    # prompt still takes over on a context overflow, as before.
+    role_prompt = (getattr(session, "role_prompt", None) or "").strip()
+    base_prompt = override or role_prompt or SYSTEM_PROMPT
     for level in range(_MAX_COMPACT_PASSES + 1):
         compact = session.compact or level > 0
         system = SYSTEM_PROMPT_COMPACT if compact else base_prompt
@@ -939,7 +945,8 @@ def _generate(session: Session, provider: Provider, on_event: EventFn | None,
 def run_turn(session: Session, request: str, provider: Provider,
              on_event: EventFn | None = None, max_iters: int | None = None,
              plan_first: bool = False,
-             buildgraph_first: bool = False) -> AgentRun:
+             buildgraph_first: bool = False,
+             role: str | None = None) -> AgentRun:
     """Run one user turn against a persistent ``session``, refining until the render matches
     the request (the model declares "done"), it stops making progress, or ``max_iters`` is hit
     (default ``DEFAULT_MAX_ITERS``). With ``plan_first``, the first turn opens with a planning
@@ -954,6 +961,22 @@ def run_turn(session: Session, request: str, provider: Provider,
     agent_config.assert_offline_safe(provider)
     out_dir = paths.model_dir(session.name)
     first_turn = not session.messages
+
+    # Role card seam (T-W7): a single-role run applies the named role card's system
+    # prompt + tool allowlist for the whole turn. Best-effort — an unknown role or a
+    # missing roles module leaves the default behaviour intact (never breaks a run).
+    if role:
+        try:
+            from services.agent import roles as _roles
+            _card = _roles.load_role(role)
+            session.role_prompt = _card.system_prompt
+            try:
+                from mcp_server import tool_registry as _reg
+                _card.apply_tool_policy(_reg)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            pass
 
     # Design ledger seam (T-W1, Pillar 20): create/load per-run ledger.
     # Best-effort — a ledger failure must never break the run (mirrors interaction._emit).
@@ -1250,8 +1273,10 @@ def run_turn(session: Session, request: str, provider: Provider,
 
 
 def run(request: str, provider: Provider, name: str = "agent_model",
-        max_iters: int | None = None, on_event: EventFn | None = None) -> AgentRun:
+        max_iters: int | None = None, on_event: EventFn | None = None,
+        role: str | None = None) -> AgentRun:
     """One-shot design (no persistent session) - back-compatible entry point used by the
-    CLI and tests. For multi-turn refinement, create a ``Session`` and call ``run_turn``."""
+    CLI and tests. For multi-turn refinement, create a ``Session`` and call ``run_turn``.
+    ``role`` (T-W7): apply a predefined role card's system prompt + tool allowlist."""
     return run_turn(Session(name=name), request, provider,
-                    on_event=on_event, max_iters=max_iters)
+                    on_event=on_event, max_iters=max_iters, role=role)

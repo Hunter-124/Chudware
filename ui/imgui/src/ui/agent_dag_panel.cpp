@@ -48,11 +48,15 @@ float gPanX = 0.f;
 float gPanY = 0.f;
 bool  gDragging = false;
 
+// Shot-seam: force a specific render mode (set by agentDagShotForceMode before the frame).
+aicad::ui::DagWidgetMode gForcedMode = aicad::ui::DagWidgetMode::Full;
+bool gHasForcedMode = false;
+
 // ── Layout constants ─────────────────────────────────────────────────────
 
 constexpr float kNodeW       = 130.f;  // node box width  (logical px @ 1.0×)
 constexpr float kNodeH       = 46.f;   // node box height
-constexpr float kLayerGapY   = 80.f;   // vertical distance between layers
+constexpr float kLayerGapY   = 50.f;   // vertical distance between layers (compact to fit 5+ layers)
 constexpr float kSlotGapX    = 148.f;  // horizontal distance between nodes in a layer
 
 // ── JSON helpers ─────────────────────────────────────────────────────────
@@ -509,7 +513,7 @@ static void drawCanvas(float canvasW, float canvasH) {
             // Label (truncated)
             {
                 std::string lbl = n.label;
-                if (lbl.size() > 16) lbl = lbl.substr(0, 15) + "…";
+                if (lbl.size() > 16) lbl = lbl.substr(0, 14) + "...";
                 ImVec2 textPos{mn.x + 6.f * scale, mn.y + 7.f * scale};
                 ImGui::SetCursorScreenPos(textPos);
                 ImGui::PushStyleColor(ImGuiCol_Text, theme::rgba(p.txt0));
@@ -523,7 +527,7 @@ static void drawCanvas(float canvasW, float canvasH) {
                 ImGui::SetCursorScreenPos(dotPos);
                 ImGui::PushStyleColor(ImGuiCol_Text, statusBorderColor(n.status));
                 ImGui::SetWindowFontScale(0.78f);
-                ImGui::Text("● %s", statusStr(n.status));
+                ImGui::Text("* %s", statusStr(n.status));
                 ImGui::SetWindowFontScale(1.f);
                 ImGui::PopStyleColor();
             }
@@ -540,6 +544,9 @@ static void drawCanvas(float canvasW, float canvasH) {
 void drawAgentDagPanel(app::AppState& /*s*/, aicad::ui::DagWidgetMode mode) {
     const float scale = theme::S();
     const auto& p = theme::pal();
+
+    // Shot seam: allow scenarios.cpp to override the render mode before the frame.
+    if (gHasForcedMode) { mode = gForcedMode; }
 
     // Lay out every frame (cheap for ~10 nodes)
     layoutDag(scale);
@@ -612,6 +619,11 @@ void seedAgentDagPanelFromJsonl(const std::string& jsonl_text) {
 
 void agentDagShotSelectNode(const std::string& nodeId) {
     gModel.selectedNodeId = nodeId;
+}
+
+void agentDagShotForceMode(aicad::ui::DagWidgetMode mode) {
+    gForcedMode    = mode;
+    gHasForcedMode = true;
 }
 
 }  // namespace ui

@@ -1190,7 +1190,7 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
         };
 
         // Mission run
-        ev(R"j("kind":"dag.run.started","run_id":"dp17fix","graph_name":"Bracket — Guided Design Pipeline","graph_id":"bracket-guided-dp")j");
+        ev(R"j("kind":"dag.run.started","run_id":"dp17fix","graph_name":"Bracket: Guided Design Pipeline","graph_id":"bracket-guided-dp")j");
 
         // Orchestrator node (root)
         ev(R"j("kind":"dag.node.started","run_id":"dp17fix","node_id":"n_orch","node_type":"mission","node_name":"Orchestrator")j");
@@ -1224,9 +1224,15 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
 
         ui::seedAgentDagPanelFromJsonl(j);
 
-        // For the full shot: pre-select the geometry_designer node so the detail pane renders
-        if (cfg.wantAgentDag)
+        // Force the render mode matching the shot name.
+        // agentDagShotForceMode overrides the DagWidgetMode::Full default in application.cpp
+        // so the compact shot actually exercises the Compact branch.
+        if (cfg.wantAgentDag) {
+            ui::agentDagShotForceMode(aicad::ui::DagWidgetMode::Full);
             ui::agentDagShotSelectNode("n_geom");
+        } else {
+            ui::agentDagShotForceMode(aicad::ui::DagWidgetMode::Compact);
+        }
 
         std::printf("agent_dag: fixture seeded (%zu bytes) mode=%s\n",
                     j.size(), cfg.wantAgentDag ? "full" : "compact");

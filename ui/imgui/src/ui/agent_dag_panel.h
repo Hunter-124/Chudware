@@ -41,4 +41,8 @@ void seedAgentDagPanelFromJsonl(const std::string& jsonl_text);
 // Call after seedAgentDagPanelFromJsonl().
 void agentDagShotSelectNode(const std::string& nodeId);
 
+// Shot helper: override the render mode for the next frame.
+// Allows scenarios.cpp to force Compact mode without changing application.cpp.
+void agentDagShotForceMode(aicad::ui::DagWidgetMode mode);
+
 }  // namespace ui

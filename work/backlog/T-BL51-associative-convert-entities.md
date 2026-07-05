@@ -8,7 +8,7 @@ priority: 3
 lane: modeling-core
 kind: new
 depends_on: [T-BL43]
-branch:
+branch: task/T-BL51-associative-convert-entities
 ---
 
 ## Context

@@ -70,6 +70,12 @@ class Observation:
     seq: int = 0
     doc_id: str = ""
     user_override: bool = False     # §9.2: a live user instruction conflicts
+    # T-W21 trigger fields — all optional; default-empty keeps existing callers intact.
+    output_text: str = ""           # model/user text for keyword matching (§20)
+    tool_names: list[str] = field(default_factory=list)   # tool calls this turn
+    events: list[str] = field(default_factory=list)       # geometry events this turn
+    cooldown_state: Optional[dict] = None  # {trigger_id: last_fired_seq}; None=no cooldown
+    trigger_ledger_sink: Optional[Any] = None  # callable(events) to log firings
 
 
 # ---------------------------------------------------------------------------
@@ -275,12 +281,37 @@ def build_advisory(obs: Observation) -> dict:
 
     items.sort(key=lambda it: -SEVERITY_ORDER.get(it["severity"], 0))
 
+    # T-W21 §20: append trigger-based context items (severity=info, tail position
+    # so the global drop-first policy drops them before findings).
+    trigger_events: list[dict] = []
+    if obs.output_text or obs.tool_names or obs.events:
+        try:
+            from .triggers import match_triggers  # noqa: PLC0415
+            ctx_items, trigger_events = match_triggers(
+                output_text=obs.output_text,
+                tool_names=obs.tool_names,
+                events=obs.events,
+                seq=obs.seq,
+                cooldown_state=obs.cooldown_state,
+            )
+            items.extend(ctx_items)
+        except Exception:  # noqa: BLE001
+            pass  # trigger layer never breaks the advisory pass
+
+    # Dispatch ledger events for trigger firings (§20: every firing is logged).
+    if trigger_events and obs.trigger_ledger_sink is not None:
+        try:
+            obs.trigger_ledger_sink(trigger_events)
+        except Exception:  # noqa: BLE001
+            pass
+
     advisory = {
         "schema": SCHEMA,
         "seq": obs.seq,
         "stage": obs.stage,
         "items": items,
         "user_override": obs.user_override,
+        "trigger_events": trigger_events,  # available for host-side ledger writes
     }
 
     # T-W8: promote blocker advisories to failure cards (harness-owned).

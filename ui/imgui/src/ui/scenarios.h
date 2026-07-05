@@ -80,6 +80,8 @@ struct ShotConfig {
     bool sketchShotDone = false;
     bool wantSketchDispatch = false;   // T-BL47: prove dispatch→pendingSketchCmds→active_ path
     bool sketchDispatchShotDone = false;
+    bool wantSketchAutohide = false;   // T-BL41: dim/relation annotations hidden unless SmartDim armed
+    bool sketchAutohideShotDone = false;
     bool wantAsm = false;
     bool asmShotDone = false;
     bool wantFea = false;
@@ -108,8 +110,8 @@ struct ShotConfig {
     int  glassperfFrame = 0;
 
     bool isScenarioMode() const {
-        return wantM1 || wantSketch || wantSketchDispatch || wantAsm || wantFea || wantFlow || wantCam
-            || wantDrawing || wantEvalMass || wantActivity || wantMultidoc;
+        return wantM1 || wantSketch || wantSketchDispatch || wantSketchAutohide || wantAsm || wantFea
+            || wantFlow || wantCam || wantDrawing || wantEvalMass || wantActivity || wantMultidoc;
     }
 
     // Frame budget for the generic capture path (flow allows ~240 s at 60 Hz).
@@ -159,6 +161,12 @@ private:
     float sdEmptyPtX = 0.f, sdEmptyPtY = 0.f;   // screen pos of empty-space anchor (no entity hit)
     float sdDragPreYaw  = 0.f, sdDragPrePitch  = 0.f;  // camera before element drag
     float sdEmptyPreYaw = 0.f, sdEmptyPrePitch = 0.f;  // camera before empty-space drag
+
+    // sketch_autohide (T-BL41: dim/relation annotations hidden by default; SmartDim reveals)
+    int saStep = 0, saSettle = 0;
+    std::string saSavePath, saFid, saL0, saL1, saL2, saL3;
+    bool saDirReady = false;
+    std::string sketchAutohideCapture;
 
     // asm
     int asmStep = 0, asmSettle = 0;

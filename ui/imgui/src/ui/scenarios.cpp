@@ -305,6 +305,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantEcad = eq("ecad");
     cfg.wantSketch = eq("sketch");
     cfg.wantSketchDispatch = eq("sketch_dispatch");  // T-BL48 proof: dispatch→drain→active_
+    cfg.wantSketchAutohide = eq("sketch_autohide");  // T-BL41 proof: annotations hidden unless SmartDim
     cfg.wantFea = eq("fea");
     cfg.wantCam = eq("cam");
     cfg.wantFlow = eq("flow");
@@ -1723,6 +1724,110 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
         if (sdStep <= 24) ++sdStep;
     }
 
+    // ---------- sketch_autohide (T-BL41: annotations hidden unless SmartDim armed) ----------
+    // Proves the auto-hide DoD headlessly: build a genuinely CONSTRAINED sketch (rectangle with
+    // horizontal/vertical + coincident relations AND a driving 80 mm distance dimension), enter it
+    // via the real dispatch path (tool defaults to SketchTool::None), and capture two static states:
+    //   (a) tool OFF  -> clean geometry, NO dimension/relation glyphs (auto-hidden)
+    //   (b) SmartDim  -> ALL dimensions + relations revealed
+    // Entry/drain timing mirrors sketch_dispatch: inSketch only flips on the NEXT frame's viewport
+    // drain, and a rendered overlay PNG proves active_ became true via dispatch (double-gated).
+    if (cfg.wantSketchAutohide && st.workerStarted && !cfg.sketchAutohideShotDone && cfg.frame >= 5) {
+        if (!saDirReady) {
+            saDirReady = true;
+            saSavePath = repoBase() + "/scratch/sketch_autohide_shots";
+            std::error_code ec; std::filesystem::create_directories(saSavePath, ec);
+        }
+        auto applyOne = [&](const nlohmann::json& op) {
+            return st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+        };
+        const int kSettle = 4;
+        if (saSettle > 0) { --saSettle; return; }
+        if (!sketchAutohideCapture.empty()) return;
+        std::string err;
+        switch (saStep) {
+            case 0: {  // new part + sketch feature + constrained rectangle + a distance dimension
+                if (!st.docMirror.newPart(st.worker, err)) {
+                    std::printf("sketch_autohide: new_part FAILED: %s\n", err.c_str());
+                    std::fflush(stdout);
+                    cfg.sketchAutohideShotDone = true; break;
+                }
+                st.addDocTab(false);
+                auto r = applyOne({{"op","add_feature"},{"feature",{
+                    {"type","sketch"},{"name","Sketch1"},
+                    {"refs",{{"plane","plane.top"}}},
+                    {"params",{{"entities",nlohmann::json::array()},
+                               {"constraints",nlohmann::json::array()}}}}}});
+                saFid = (r.id_map.is_object() && r.id_map.contains("$0"))
+                        ? r.id_map["$0"].get<std::string>() : "f1";
+                // Rectangle with per-edge horizontal/vertical + chained coincident RELATIONS —
+                // these are the geometric-relation glyphs the auto-hide must suppress by default.
+                auto addLine = [&](double x1,double y1,double x2,double y2,bool horiz,
+                                   const std::string& prev)->std::string{
+                    nlohmann::json cs = nlohmann::json::array();
+                    cs.push_back({{"type",horiz?"horizontal":"vertical"},{"refs",{"$self"}}});
+                    if (!prev.empty())
+                        cs.push_back({{"type","coincident"},{"refs",{prev+".p2","$self.p1"}}});
+                    auto rr = applyOne({{"op","sketch_add_entity"},{"sketch",saFid},
+                        {"entity",{{"type","line"},{"p1",{x1,y1}},{"p2",{x2,y2}}}},{"constraints",cs}});
+                    return (rr.id_map.is_object() && rr.id_map.contains("$0"))
+                           ? rr.id_map["$0"].get<std::string>() : "";
+                };
+                saL0 = addLine(0,0,80,0,true,"");
+                saL1 = addLine(80,0,80,40,false,saL0);
+                saL2 = addLine(80,40,0,40,true,saL1);
+                saL3 = addLine(0,40,0,0,false,saL2);
+                applyOne({{"op","sketch_add_constraint"},{"sketch",saFid},
+                    {"constraint",{{"type","coincident"},{"refs",{saL3+".p2",saL0+".p1"}}}}});
+                // A driving 80 mm distance DIMENSION on the bottom edge — the dimensional glyph the
+                // auto-hide must suppress by default and SmartDim must reveal. Placement offsets it
+                // clear of the geometry so it reads in the capture.
+                applyOne({{"op","sketch_add_constraint"},{"sketch",saFid},
+                    {"constraint",{{"type","distance"},{"refs",{saL0+".p1",saL0+".p2"}},
+                                   {"value",{{"value",80.0},{"expr",nullptr}}},
+                                   {"placement",nlohmann::json::array({40.0,-15.0})}}}});
+                st.docMirror.resync(st.worker);
+                std::printf("sketch_autohide: constrained rect + 80mm dim built (fid=%s)\n",
+                            saFid.c_str());
+                std::fflush(stdout);
+                break;  // advance immediately to the dispatch step
+            }
+            case 1: {  // enter the EXISTING sketch we built (not a new empty one) via edit-fid path.
+                // drain routes pendingSketchEditFid → enterForFeature (active_=true, tool_=None),
+                // loading saFid's rectangle + dimension + relations. (dispatch("sketch_new") would
+                // instead create a NEW empty sketch — wrong doc, nothing to show/hide.)
+                st.pendingSketchEditFid = saFid;
+                std::printf("sketch_autohide: armed pendingSketchEditFid=%s; awaiting drain\n",
+                            saFid.c_str());
+                std::fflush(stdout);
+                saSettle = kSettle;
+                break;
+            }
+            case 2: {  // drain ran: inSketch true, tool=None -> capture the AUTO-HIDDEN state
+                std::printf("sketch_autohide: after drain inSketch=%d tool=None (glyphs HIDDEN)\n",
+                            (int)st.inSketch);
+                std::fflush(stdout);
+                sketchAutohideCapture = saSavePath + "/sketch_autohide_01_tooloff.png";
+                saSettle = kSettle;
+                break;
+            }
+            case 3: {  // arm Smart Dimension via dispatch -> ALL dims + relations revealed
+                st.dispatch("smart_dim");  // routes onRibbonCommand → tool_ = SketchTool::SmartDim
+                std::printf("sketch_autohide: dispatched smart_dim (SmartDim armed → glyphs SHOWN)\n");
+                std::fflush(stdout);
+                sketchAutohideCapture = saSavePath + "/sketch_autohide_02_toolon.png";
+                saSettle = kSettle;
+                break;
+            }
+            default:
+                cfg.sketchAutohideShotDone = true;
+                std::printf("sketch_autohide: scenario complete\n");
+                std::fflush(stdout);
+                break;
+        }
+        if (saStep <= 3) ++saStep;
+    }
+
     // ---------- fea (host-parity SimManager study flow) ----------
     // T-G9 harness finding: the old flow here bypassed the SimManager entirely (raw
     // sim_run_static with empty fixtures/loads and a worktree-relative STEP netgen could
@@ -2309,6 +2414,14 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppSt
         }
         if (win) glfwSwapBuffers(win);
         return cfg.sketchDispatchShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+    if (cfg.wantSketchAutohide) {
+        if (!sketchAutohideCapture.empty()) {
+            mirrorLast(sketchAutohideCapture, "sketch_autohide_02_toolon");
+            sketchAutohideCapture.clear();
+        }
+        if (win) glfwSwapBuffers(win);
+        return cfg.sketchAutohideShotDone ? FrameAction::Break : FrameAction::Continue;
     }
     if (cfg.wantAsm) {
         if (!asmCapture.empty() && !st.rpc.busy()) { mirrorLast(asmCapture, "asm_01_seated"); asmCapture.clear(); }

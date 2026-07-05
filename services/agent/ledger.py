@@ -29,6 +29,16 @@ from services.agent.interaction import cache_root
 SCHEMA = "aicad.ledger/1"
 _CHARS_PER_TOKEN = 4  # repo-wide heuristic
 
+# T-DP1: design-pipeline event kind → state section (contract design_pipeline.md §4).
+# One place both _apply and the section allow-lists read, so the four kinds stay in
+# lockstep across the ledger, mission_dispatch, and the phase gates.
+_DP_KIND_SECTION: dict[str, str] = {
+    "feature": "features",
+    "geometry_spec": "geometry_specs",
+    "linkage": "linkages",
+    "build_node": "build_nodes",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -66,6 +76,13 @@ def _empty_state(run_id: str) -> dict:
         #   {id, result: PASS|FAIL|NOT-CHECKED, check_tool, pass_rule,
         #    detail, evidence}
         "criterion_results": [],
+        # T-DP1: design-pipeline stage artifacts (contract design_pipeline.md §3/§4,
+        # extends aicad.ledger/1). Each is a typed handoff the six-stage refinement
+        # writes; the flagged phase gates READ these (never the handoff prose).
+        "features": [],          # Stage 1 feature[] (feature_architect, T-DP2)
+        "geometry_specs": [],    # Stage 2 geometry_spec[] (geometry_designer, T-DP3)
+        "linkages": [],          # Stage 3 linkage[] (linkage_planner, T-DP4)
+        "build_nodes": [],       # Stage 4 build_node[] (build_strategist)
     }
 
 
@@ -147,6 +164,20 @@ def _apply(state: dict, event: dict) -> dict:
             existing.update(payload)
         else:
             state["artifacts"].append(dict(payload))
+
+    elif kind in ("feature", "geometry_spec", "linkage", "build_node"):
+        # T-DP1: design-pipeline stage artifacts. All four materialize the same way
+        # — upsert by id into the matching state section (last-write-wins field
+        # merge, matching the dimension / criterion_result pattern). provenance (on
+        # geometry_spec) stays in the event payload for audit AND in state (the gate
+        # reads state.geometry_specs[].provenance).
+        section = _DP_KIND_SECTION[kind]
+        item_id = payload.get("id")
+        existing = next((x for x in state[section] if x.get("id") == item_id), None)
+        if existing:
+            existing.update(dict(payload))
+        else:
+            state[section].append(dict(payload))
 
     return state
 
@@ -350,6 +381,131 @@ class Ledger:
             "check_tool": check_tool, "pass_rule": pass_rule,
             "detail": detail, "evidence": evidence or {},
         })
+
+    # ------------------------------------------------------------------
+    # T-DP1: design-pipeline stage-artifact writers
+    # (contract design_pipeline.md §3/§4 — extends aicad.ledger/1)
+    # ------------------------------------------------------------------
+
+    def add_feature(self, actor: str, feature_id: str, function: str,
+                    driving_requirement: str,
+                    interfaces_with: list[str] | None = None,
+                    criticality: str = "important") -> dict:
+        """Append a Stage-1 ``feature`` event (feature_architect, T-DP2).
+
+        Mirrors §22 rung-A features[]. The coverage rule (every feature traces to a
+        requirement/assumption; every requirement maps to ≥1 feature) is a T-DP2
+        checker, not this writer — the writer only records the typed handoff."""
+        return self.append(actor, "feature", {
+            "id": feature_id,
+            "function": function,
+            "driving_requirement": driving_requirement,
+            "interfaces_with": interfaces_with or [],
+            "criticality": criticality,
+        })
+
+    def add_geometry_spec(self, actor: str, spec_id: str,
+                          realizes: list[str],
+                          shapes: list[dict],
+                          provenance: str,
+                          nominal_dims: list[dict] | None = None,
+                          tolerances: list[dict] | None = None,
+                          datum_refs: list[str] | None = None) -> dict:
+        """Append a Stage-2 ``geometry_spec`` event (geometry_designer, T-DP3).
+
+        ``provenance`` is REQUIRED (contract §3.2 / §4) — the geometry-side twin of
+        the dimension provenance rule: never recall a number. A spec written without
+        provenance is rejected here (and at the mission_dispatch back door)."""
+        if not provenance:
+            raise ValueError(
+                f"geometry_spec {spec_id!r}: provenance is required "
+                "(must be: tool result / calc / table / user answer)"
+            )
+        return self.append(actor, "geometry_spec", {
+            "id": spec_id,
+            "realizes": realizes or [],
+            "shapes": shapes or [],
+            "nominal_dims": nominal_dims or [],
+            "tolerances": tolerances or [],
+            "datum_refs": datum_refs or [],
+            "provenance": provenance,
+        })
+
+    def add_linkage(self, actor: str, linkage_id: str = "LINK_MAIN",
+                    datum_tree: list[dict] | None = None,
+                    reference_edges: list[dict] | None = None,
+                    shared_interfaces: list[dict] | None = None) -> dict:
+        """Append a Stage-3 ``linkage`` event (linkage_planner, T-DP4).
+
+        Mirrors §22 rung-C. Reference integrity (no dangling refs / no cycles) and
+        interface consistency are T-DP4 checkers, not this writer."""
+        return self.append(actor, "linkage", {
+            "id": linkage_id,
+            "datum_tree": datum_tree or [],
+            "reference_edges": reference_edges or [],
+            "shared_interfaces": shared_interfaces or [],
+        })
+
+    def add_build_node(self, actor: str, node_id: str, op: str,
+                       elements: list[str] | None = None,
+                       deps: list[str] | None = None,
+                       orientation: str = "",
+                       sketch_plane: str = "",
+                       why: str = "") -> dict:
+        """Append a Stage-4 ``build_node`` event (build_strategist).
+
+        Mirrors §22 rung-D steps[]; lowers into an aicad.buildgraph/1 node. Cycle /
+        missing-ref validation is the buildgraph validator's job (advisor.md §13)."""
+        return self.append(actor, "build_node", {
+            "id": node_id,
+            "op": op,
+            "elements": elements or [],
+            "deps": deps or [],
+            "orientation": orientation,
+            "sketch_plane": sketch_plane,
+            "why": why,
+        })
+
+    # ------------------------------------------------------------------
+    # T-DP1: scoped-slice accessors (contract design_pipeline.md §9)
+    # Read-only views the mission-dispatch layer (T-W30/W32) hands to
+    # fresh-context stages — a stage sees only the prior rung's artifacts.
+    # ------------------------------------------------------------------
+
+    def features(self) -> list[dict]:
+        """Stage-1 features[] — the input Stage 2 realizes."""
+        return list(self.state.get("features", []))
+
+    def geometry_specs(self) -> list[dict]:
+        """Stage-2 geometry_spec[] — the input Stage 3 links and Stage 4 orders."""
+        return list(self.state.get("geometry_specs", []))
+
+    def linkages(self) -> list[dict]:
+        """Stage-3 linkage[] — the input Stage 4 orders."""
+        return list(self.state.get("linkages", []))
+
+    def build_nodes(self) -> list[dict]:
+        """Stage-4 build_node[] — compiled into the buildgraph at PLAN."""
+        return list(self.state.get("build_nodes", []))
+
+    def slice_for_stage(self, stage: str) -> dict:
+        """The minimal typed inputs a design-pipeline stage needs (§22 fresh-context
+        rule: never the full ledger). ``stage`` is a design-pipeline stage name
+        (``decompose`` | ``geometry`` | ``linkage`` | ``buildpath``). Unknown stages
+        return an empty slice (the caller falls back to a full ledger_render)."""
+        s = (stage or "").lower()
+        if s == "decompose":
+            # Stage 1 reasons from the brief + requirements only (the ledger render
+            # already carries those); it needs no prior stage artifact.
+            return {}
+        if s == "geometry":
+            return {"features": self.features()}
+        if s == "linkage":
+            return {"geometry_specs": self.geometry_specs()}
+        if s == "buildpath":
+            return {"geometry_specs": self.geometry_specs(),
+                    "linkages": self.linkages()}
+        return {}
 
     # ------------------------------------------------------------------
     # Class-method loader

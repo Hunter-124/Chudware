@@ -510,5 +510,106 @@ class TestMCPTools(unittest.TestCase):
         self.assertIn("Round-trip test", result["rendered"])
 
 
+# ---------------------------------------------------------------------------
+# T-DP1  Design-pipeline stage artifacts (contract design_pipeline.md §3/§4/§9)
+# ---------------------------------------------------------------------------
+
+class TestDesignPipelineKinds(unittest.TestCase):
+    def _populate(self, ledger: Ledger) -> None:
+        ledger.add_feature("feature_architect", "FT1", "mount to chassis rail",
+                           driving_requirement="R2", interfaces_with=["FT2"],
+                           criticality="critical")
+        ledger.add_geometry_spec("geometry_designer", "G1", realizes=["FT1"],
+                                 shapes=[{"op": "extrude", "kind": "profile_op"}],
+                                 provenance="wall_thickness.py: min 4.0 mm",
+                                 nominal_dims=[{"name": "wall", "value": 4.0,
+                                                "unit": "mm"}])
+        ledger.add_linkage("linkage_planner",
+                           datum_tree=[{"id": "A", "kind": "plane",
+                                        "defined_by": "base face"}],
+                           reference_edges=[{"from": "G1", "to": "A",
+                                             "relation": "sketch_on_datum"}])
+        ledger.add_build_node("build_strategist", "BN1", op="extrude",
+                              elements=["G1"], deps=[], orientation="base XY",
+                              sketch_plane="datum A", why="base feature")
+
+    def test_new_sections_present_and_empty(self):
+        run_id, path = _fresh("dp_sections")
+        ledger = Ledger(run_id, path)
+        for section in ("features", "geometry_specs", "linkages", "build_nodes"):
+            self.assertIsInstance(ledger.state[section], list)
+            self.assertEqual(ledger.state[section], [])
+
+    def test_writers_populate_state(self):
+        run_id, path = _fresh("dp_write")
+        ledger = Ledger(run_id, path)
+        self._populate(ledger)
+        self.assertEqual(len(ledger.events), 4)
+        self.assertEqual(ledger.state["features"][0]["id"], "FT1")
+        self.assertEqual(ledger.state["geometry_specs"][0]["realizes"], ["FT1"])
+        self.assertEqual(ledger.state["linkages"][0]["id"], "LINK_MAIN")
+        self.assertEqual(ledger.state["build_nodes"][0]["op"], "extrude")
+
+    def test_geometry_spec_requires_provenance(self):
+        run_id, path = _fresh("dp_prov")
+        ledger = Ledger(run_id, path)
+        with self.assertRaises(ValueError):
+            ledger.add_geometry_spec("geometry_designer", "Gx", realizes=["FT1"],
+                                     shapes=[], provenance="")
+        # No event was written on the rejected call.
+        self.assertEqual(ledger.events, [])
+
+    def test_roundtrip_replay_and_disk(self):
+        """Core DoD: the four new kinds survive replay + a disk reload."""
+        run_id, path = _fresh("dp_roundtrip")
+        ledger = Ledger(run_id, path)
+        self._populate(ledger)
+        # Replay from events only.
+        replayed = _materialize(ledger.events, run_id)
+        for section in ("features", "geometry_specs", "linkages", "build_nodes"):
+            self.assertEqual(replayed[section], ledger.state[section])
+        # Disk reload.
+        ledger2 = Ledger.load(run_id, path)
+        self.assertEqual(len(ledger2.events), 4)
+        self.assertEqual(ledger2.state["geometry_specs"][0]["provenance"],
+                         "wall_thickness.py: min 4.0 mm")
+
+    def test_upsert_by_id_last_write_wins(self):
+        run_id, path = _fresh("dp_upsert")
+        ledger = Ledger(run_id, path)
+        ledger.add_feature("fa", "FT1", "mount", driving_requirement="R1")
+        ledger.add_feature("fa", "FT1", "mount", driving_requirement="R1",
+                           criticality="critical")
+        self.assertEqual(len(ledger.state["features"]), 1)
+        self.assertEqual(ledger.state["features"][0]["criticality"], "critical")
+
+    def test_slice_for_stage_is_scoped(self):
+        run_id, path = _fresh("dp_slice")
+        ledger = Ledger(run_id, path)
+        self._populate(ledger)
+        # decompose: no prior artifact (reasons from brief/requirements).
+        self.assertEqual(ledger.slice_for_stage("decompose"), {})
+        # geometry: features only.
+        geo = ledger.slice_for_stage("geometry")
+        self.assertEqual(set(geo), {"features"})
+        # linkage: geometry only (never features).
+        lnk = ledger.slice_for_stage("linkage")
+        self.assertEqual(set(lnk), {"geometry_specs"})
+        # buildpath: geometry + linkage.
+        bp = ledger.slice_for_stage("buildpath")
+        self.assertEqual(set(bp), {"geometry_specs", "linkages"})
+        # unknown stage → empty slice (caller falls back to full render).
+        self.assertEqual(ledger.slice_for_stage("nope"), {})
+
+    def test_accessors_return_copies(self):
+        run_id, path = _fresh("dp_copies")
+        ledger = Ledger(run_id, path)
+        self._populate(ledger)
+        feats = ledger.features()
+        feats.append({"id": "ROGUE"})
+        # Mutating the returned list does not corrupt ledger state.
+        self.assertEqual(len(ledger.state["features"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

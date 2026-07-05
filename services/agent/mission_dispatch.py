@@ -34,8 +34,14 @@ import json
 from typing import Any, Callable, Optional
 
 # Mirrors mcp_server/ledger_tools.py VALID_KINDS (the tool this shadows).
+# T-DP1 additive: the four design-pipeline stage kinds (contract design_pipeline.md §4).
 _LEDGER_NOTE_KINDS = {"brief", "decision", "dimension", "question",
-                      "requirement", "stage", "artifact", "note"}
+                      "requirement", "stage", "artifact", "note",
+                      "feature", "geometry_spec", "linkage", "build_node"}
+
+# T-DP1: kinds that require a `provenance` field on write (the "never recall a
+# number" rule) — dimension (contract §2) + geometry_spec (contract §3.2/§4).
+_PROVENANCE_REQUIRED_KINDS = {"dimension", "geometry_spec"}
 
 
 class MissionDispatch:
@@ -95,7 +101,9 @@ class MissionDispatch:
             return {"ok": False, "error": "no ledger bound to this mission run"}
         if section:
             allowed = {"brief", "requirements", "decisions", "dimensions",
-                       "questions", "stage_log", "artifacts"}
+                       "questions", "stage_log", "artifacts",
+                       # T-DP1 design-pipeline sections (contract §4/§9)
+                       "features", "geometry_specs", "linkages", "build_nodes"}
             if section not in allowed:
                 return {"ok": False, "error": f"unknown section {section!r}",
                         "allowed": sorted(allowed)}
@@ -123,9 +131,9 @@ class MissionDispatch:
                     "valid_kinds": sorted(_LEDGER_NOTE_KINDS)}
         body = dict(payload or {})
         body.update({k: v for k, v in extra.items() if not k.startswith("_")})
-        if kind == "dimension" and not body.get("provenance"):
+        if kind in _PROVENANCE_REQUIRED_KINDS and not body.get("provenance"):
             return {"ok": False,
-                    "error": ("dimension events require a 'provenance' field "
+                    "error": (f"{kind} events require a 'provenance' field "
                               "(tool result / calc / table / user answer)")}
         try:
             event = led.append(actor, kind, body)

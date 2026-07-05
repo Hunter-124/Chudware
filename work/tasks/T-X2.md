@@ -2,8 +2,8 @@
 id: T-X2
 title: Source adapter framework + GrabCAD/TraceParts adapters
 workstream: X
-owner: unassigned
-status: todo
+owner: sonnet-drift
+status: doing
 branch: task/T-X2-source-adapters
 depends_on: [T-X1]
 lane: parts-sourcing

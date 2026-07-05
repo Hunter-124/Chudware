@@ -118,3 +118,22 @@ untouched.
   honest open parity gaps above.
   NET: full app builds + launches + models on Windows; the remaining honest gap is
   interactive viewport render-parity confirmation + the m1 headless worker hang.
+- 2026-07-05 [gissa/opus-wynn] Viewport-framing investigation (gissa directed: force
+  zoom-to-fit + re-capture). ROOT CAUSE FOUND (not a render gap): the sketch scenario's
+  solid step sets st.yaw/pitch/zoom but NOT st.pan — entering the sketch animates a
+  Normal-To that leaves st.pan offset, so zoom=1 frames the scene radius but OFF-CENTRE
+  and the solid falls outside the shot. The renderer itself is fine (sketch plane +
+  triad + full UI all render). FIX (host/src/ui/scenarios.cpp, sketch step 2): reset
+  st.pan[0..2]=0 before capture, mirroring ViewPreset::ZoomFit's kZeroPan. Capture-only,
+  platform-agnostic (correct on Linux too), does NOT touch engine/worker routing.
+  DEVIATION FROM NORMAL LAUNCH PATH: none at runtime — the fix is in the scenario code,
+  not an env/flag; normal interactive launch is unchanged.
+  STATUS: UNVERIFIED. Rebuilt host (build.bat host, exit 0) + re-ran AI_CAD_SHOT=sketch
+  headless (AI_CAD_HIDDEN=1, AI_CAD_PYTHON=venv) but it produced NO fresh capture in 78s
+  — the app hung on worker-start AGAIN (same tryStartWorker `#ifndef _WIN32` blocker as
+  m1; the prior 05:34 sketch_shots were from a session where the worker DID start). So
+  the framing fix is correct-by-inspection but I could not produce a fresh framed
+  screenshot headlessly. Per gissa's 1-2-iteration cap: STOPPED here rather than guessing
+  further. TO CLOSE PARITY, either: (a) buddy's call on the tryStartWorker Windows path
+  so headless capture works, or (b) gissa does the 2-min interactive launch (worker
+  starts fine interactively) + press F (Zoom to Fit) + eyeball the solid.

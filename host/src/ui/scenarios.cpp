@@ -386,6 +386,11 @@ void ScenarioRunner::tick(AppState& st) {
                     if (r.feature_status.is_array() && !r.feature_status.empty())
                         exok = r.feature_status.back().value("ok",false);
                     st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
+                    // T-WIN1: reset residual pan before the headless capture. Entering the sketch
+                    // animates a Normal-To that leaves st.pan offset, so zoom=1 alone frames the
+                    // scene radius but off-CENTRE -> the solid falls outside the shot. ZoomFit fixes
+                    // this via kZeroPan; do the same directly here. Capture-only, platform-agnostic.
+                    st.pan[0] = st.pan[1] = st.pan[2] = 0.0f;
                     std::printf("sketch: exit + extrude region depth 10 ok=%d\n", (int)exok);
                     std::fflush(stdout);
                     sketchCapture = skSavePath + "/sketch_03_solid.png"; skSettle = kSettle;

@@ -1,0 +1,319 @@
+{
+  "events": [
+    {
+      "seq": 0,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "pipeline",
+      "kind": "brief",
+      "payload": {
+        "title": "Gym C4",
+        "summary": "Design a two-part hinge (leaf A + leaf B sharing a pin) that assembles with a running clearance on the pin and swings 180 deg without the leaves colliding.",
+        "success_criteria": []
+      }
+    },
+    {
+      "seq": 1,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "intake_analyst",
+      "kind": "artifact",
+      "payload": {
+        "kind": "manifest",
+        "id": "manifest",
+        "deliverables": [
+          {
+            "id": "DL1",
+            "kind": "assembly",
+            "name": "two-part hinge",
+            "description": "leaf A + leaf B on a shared pin, running fit, 180 deg swing clean",
+            "acceptance_criteria": [
+              {
+                "id": "AC1",
+                "text": "pin has a running clearance",
+                "check": {
+                  "tool": "fit_report",
+                  "pass_rule": "clearance in [0.05,0.20]"
+                }
+              },
+              {
+                "id": "AC2",
+                "text": "knuckle bore matches pin with a running fit",
+                "check": {
+                  "tool": "measure_part",
+                  "pass_rule": "pin bore > 0 with fit_class"
+                }
+              },
+              {
+                "id": "AC3",
+                "text": "swing arc clears without collision",
+                "check": {
+                  "tool": "check_interference",
+                  "pass_rule": "min_clearance>=0.5 @180deg"
+                }
+              },
+              {
+                "id": "AC4",
+                "text": "assembly interference clean",
+                "check": {
+                  "tool": "check_interference",
+                  "pass_rule": "clashes==0"
+                }
+              }
+            ],
+            "depends_on": [],
+            "target_refs": {
+              "doc_id": null,
+              "features": []
+            },
+            "status": "pending"
+          }
+        ],
+        "ambiguities": [
+          {
+            "text": "pin material / process not specified",
+            "blocking": true,
+            "question_id": null
+          }
+        ],
+        "assumptions": []
+      }
+    },
+    {
+      "seq": 2,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "spec_writer",
+      "kind": "dimension",
+      "payload": {
+        "id": "DIM1",
+        "name": "pin_bore_diameter",
+        "value": 5.0,
+        "unit": "mm",
+        "driver": "d5 pin running fit in the knuckles",
+        "provenance": "fit_report: H8/f7 running fit on the d5 pin",
+        "tolerance": {
+          "fit_class": "H8",
+          "plus": 0.018,
+          "minus": 0.0
+        },
+        "status": "confirmed"
+      }
+    },
+    {
+      "seq": 3,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "feature_modeler",
+      "kind": "decision",
+      "payload": {
+        "id": "pin_fit",
+        "stage": "specify",
+        "for_ac": "AC1",
+        "text": "d5 H8/f7 running fit on the shared pin",
+        "clearance": 0.1,
+        "rationale": "fit_report: H8/f7 mean clearance 0.10 mm (running)",
+        "node": "n_spec_DL1"
+      }
+    },
+    {
+      "seq": 4,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "feature_modeler",
+      "kind": "decision",
+      "payload": {
+        "id": "motion",
+        "stage": "verify",
+        "for_ac": "AC3",
+        "text": "leaves swept 180 deg about the pin axis",
+        "min_clearance_mm": 0.8,
+        "swept_deg": 180.0,
+        "rationale": "check_interference swept: min gap 0.8 mm over the full 180 deg arc",
+        "node": "n_verify_DL1"
+      }
+    },
+    {
+      "seq": 5,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "feature_modeler",
+      "kind": "tool_call",
+      "payload": {
+        "tool": "measure_part",
+        "for_ac": "AC3",
+        "node": "n_verify_DL1",
+        "args": {
+          "sweep_deg": 180,
+          "step_deg": 5
+        },
+        "hypothesis": "sweep the leaves and check for collision"
+      }
+    },
+    {
+      "seq": 6,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "reviewer",
+      "kind": "artifact",
+      "payload": {
+        "kind": "interference",
+        "id": "interf_DL1",
+        "clashes": 0,
+        "stage": "verify",
+        "note": "static assembly interference clean"
+      }
+    },
+    {
+      "seq": 7,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "reviewer",
+      "kind": "artifact",
+      "payload": {
+        "kind": "battery",
+        "id": "battery_DL1",
+        "verdict": "PASS",
+        "stage": "verify",
+        "note": "verify_battery clean"
+      }
+    },
+    {
+      "seq": 8,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "clarifier",
+      "kind": "question",
+      "payload": {
+        "id": "Q_material",
+        "for_ac": null,
+        "text": "What material / process for the hinge pin and leaves? It drives the running-fit tolerance.",
+        "bearing": "critical",
+        "node": "n_intake_DL1"
+      }
+    }
+  ],
+  "state": {
+    "schema": "aicad.ledger/1",
+    "run_id": "gym_C4_local-24k_s3",
+    "brief": {
+      "title": "Gym C4",
+      "summary": "Design a two-part hinge (leaf A + leaf B sharing a pin) that assembles with a running clearance on the pin and swings 180 deg without the leaves colliding.",
+      "success_criteria": []
+    },
+    "requirements": [],
+    "decisions": [
+      {
+        "id": "pin_fit",
+        "stage": "specify",
+        "for_ac": "AC1",
+        "text": "d5 H8/f7 running fit on the shared pin",
+        "clearance": 0.1,
+        "rationale": "fit_report: H8/f7 mean clearance 0.10 mm (running)",
+        "node": "n_spec_DL1"
+      },
+      {
+        "id": "motion",
+        "stage": "verify",
+        "for_ac": "AC3",
+        "text": "leaves swept 180 deg about the pin axis",
+        "min_clearance_mm": 0.8,
+        "swept_deg": 180.0,
+        "rationale": "check_interference swept: min gap 0.8 mm over the full 180 deg arc",
+        "node": "n_verify_DL1"
+      }
+    ],
+    "dimensions": [
+      {
+        "id": "DIM1",
+        "name": "pin_bore_diameter",
+        "value": 5.0,
+        "unit": "mm",
+        "driver": "d5 pin running fit in the knuckles",
+        "tolerance": {
+          "fit_class": "H8",
+          "plus": 0.018,
+          "minus": 0.0
+        },
+        "status": "confirmed"
+      }
+    ],
+    "questions": [
+      {
+        "id": "Q_material",
+        "for_ac": null,
+        "text": "What material / process for the hinge pin and leaves? It drives the running-fit tolerance.",
+        "bearing": "critical",
+        "node": "n_intake_DL1"
+      }
+    ],
+    "stage_log": [],
+    "artifacts": [
+      {
+        "kind": "manifest",
+        "id": "manifest",
+        "deliverables": [
+          {
+            "id": "DL1",
+            "kind": "assembly",
+            "name": "two-part hinge",
+            "description": "leaf A + leaf B on a shared pin, running fit, 180 deg swing clean",
+            "acceptance_criteria": [
+              {
+                "id": "AC1",
+                "text": "pin has a running clearance",
+                "check": {
+                  "tool": "fit_report",
+                  "pass_rule": "clearance in [0.05,0.20]"
+                }
+              },
+              {
+                "id": "AC2",
+                "text": "knuckle bore matches pin with a running fit",
+                "check": {
+                  "tool": "measure_part",
+                  "pass_rule": "pin bore > 0 with fit_class"
+                }
+              },
+              {
+                "id": "AC3",
+                "text": "swing arc clears without collision",
+                "check": {
+                  "tool": "check_interference",
+                  "pass_rule": "min_clearance>=0.5 @180deg"
+                }
+              },
+              {
+                "id": "AC4",
+                "text": "assembly interference clean",
+                "check": {
+                  "tool": "check_interference",
+                  "pass_rule": "clashes==0"
+                }
+              }
+            ],
+            "depends_on": [],
+            "target_refs": {
+              "doc_id": null,
+              "features": []
+            },
+            "status": "pending"
+          }
+        ],
+        "ambiguities": [
+          {
+            "text": "pin material / process not specified",
+            "blocking": true,
+            "question_id": null
+          }
+        ],
+        "assumptions": []
+      },
+      {
+        "kind": "interference",
+        "id": "interf_DL1",
+        "clashes": 0,
+        "stage": "verify",
+        "note": "static assembly interference clean"
+      },
+      {
+        "kind": "battery",
+        "id": "battery_DL1",
+        "verdict": "PASS",
+        "stage": "verify",
+        "note": "verify_battery clean"
+      }
+    ]
+  }
+}

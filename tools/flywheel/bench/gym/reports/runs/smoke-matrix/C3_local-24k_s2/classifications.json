@@ -1,0 +1,17 @@
+[
+  {
+    "failure_class": "incoherent_geometry",
+    "detail": "acceptance criteria failed: AC2, AC4",
+    "evidence_seqs": [
+      5
+    ],
+    "evidence": [
+      {
+        "seq": 5,
+        "kind": "artifact",
+        "actor": "reviewer",
+        "why": "verify_battery / AC check failed"
+      }
+    ]
+  }
+]

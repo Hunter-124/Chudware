@@ -1,0 +1,447 @@
+{
+  "cycle": "cycle-1",
+  "tiers": [
+    "local-24k",
+    "frontier-200k"
+  ],
+  "execution_mode": "mock",
+  "execution_probe": {
+    "core_available": false,
+    "frontier_key": false,
+    "local_model": true,
+    "real_agent_fn": false,
+    "mode": "mock"
+  },
+  "pass_rates": {
+    "matrix": {
+      "C1|frontier-200k": {
+        "pass_rate": 1.0,
+        "n": 3
+      },
+      "C1|local-24k": {
+        "pass_rate": 1.0,
+        "n": 3
+      },
+      "C2|frontier-200k": {
+        "pass_rate": 1.0,
+        "n": 3
+      },
+      "C2|local-24k": {
+        "pass_rate": 1.0,
+        "n": 3
+      },
+      "C3|frontier-200k": {
+        "pass_rate": 0.667,
+        "n": 3
+      },
+      "C3|local-24k": {
+        "pass_rate": 0.667,
+        "n": 3
+      },
+      "C4|frontier-200k": {
+        "pass_rate": 1.0,
+        "n": 3
+      },
+      "C4|local-24k": {
+        "pass_rate": 1.0,
+        "n": 3
+      },
+      "C5|frontier-200k": {
+        "pass_rate": 0.667,
+        "n": 3
+      },
+      "C5|local-24k": {
+        "pass_rate": 0.667,
+        "n": 3
+      },
+      "C6|frontier-200k": {
+        "pass_rate": 1.0,
+        "n": 3
+      },
+      "C6|local-24k": {
+        "pass_rate": 1.0,
+        "n": 3
+      }
+    },
+    "per_challenge": {
+      "C1": 1.0,
+      "C2": 1.0,
+      "C3": 0.667,
+      "C4": 1.0,
+      "C5": 0.667,
+      "C6": 1.0
+    },
+    "per_tier": {
+      "frontier-200k": 0.889,
+      "local-24k": 0.889
+    },
+    "overall": 0.889
+  },
+  "taxonomy": {
+    "counts": {
+      "wrong_question": 4,
+      "incoherent_geometry": 4,
+      "tool_misuse": 6,
+      "context_loss": 4,
+      "abstraction_skip": 2,
+      "grind": 4,
+      "advisory_ignored": 2
+    },
+    "evidence": {
+      "tool_misuse": [
+        {
+          "challenge": "C1",
+          "tier": "local-24k",
+          "seed": 2,
+          "detail": "used measure_part for AC2 but check tool is fit_report",
+          "evidence_seqs": [
+            4
+          ]
+        },
+        {
+          "challenge": "C1",
+          "tier": "frontier-200k",
+          "seed": 2,
+          "detail": "used measure_part for AC2 but check tool is fit_report",
+          "evidence_seqs": [
+            4
+          ]
+        },
+        {
+          "challenge": "C4",
+          "tier": "local-24k",
+          "seed": 3,
+          "detail": "used measure_part for AC3 but check tool is check_interference",
+          "evidence_seqs": [
+            5
+          ]
+        },
+        {
+          "challenge": "C4",
+          "tier": "frontier-200k",
+          "seed": 3,
+          "detail": "used measure_part for AC3 but check tool is check_interference",
+          "evidence_seqs": [
+            5
+          ]
+        },
+        {
+          "challenge": "C5",
+          "tier": "local-24k",
+          "seed": 3,
+          "detail": "used measure_part for AC2 but check tool is cam_simulate",
+          "evidence_seqs": [
+            4
+          ]
+        },
+        {
+          "challenge": "C5",
+          "tier": "frontier-200k",
+          "seed": 3,
+          "detail": "used measure_part for AC2 but check tool is cam_simulate",
+          "evidence_seqs": [
+            4
+          ]
+        }
+      ],
+      "context_loss": [
+        {
+          "challenge": "C1",
+          "tier": "local-24k",
+          "seed": 3,
+          "detail": "cited nonexistent ref(s): DIM99",
+          "evidence_seqs": [
+            7
+          ]
+        },
+        {
+          "challenge": "C1",
+          "tier": "frontier-200k",
+          "seed": 3,
+          "detail": "cited nonexistent ref(s): DIM99",
+          "evidence_seqs": [
+            7
+          ]
+        },
+        {
+          "challenge": "C6",
+          "tier": "local-24k",
+          "seed": 2,
+          "detail": "cited nonexistent ref(s): DIM88",
+          "evidence_seqs": [
+            7
+          ]
+        },
+        {
+          "challenge": "C6",
+          "tier": "frontier-200k",
+          "seed": 2,
+          "detail": "cited nonexistent ref(s): DIM88",
+          "evidence_seqs": [
+            7
+          ]
+        }
+      ],
+      "advisory_ignored": [
+        {
+          "challenge": "C2",
+          "tier": "local-24k",
+          "seed": 2,
+          "detail": "advisory ADV1 (petg_snap_marginal) contradicted without dispute",
+          "evidence_seqs": [
+            8,
+            9
+          ]
+        },
+        {
+          "challenge": "C2",
+          "tier": "frontier-200k",
+          "seed": 2,
+          "detail": "advisory ADV1 (petg_snap_marginal) contradicted without dispute",
+          "evidence_seqs": [
+            8,
+            9
+          ]
+        }
+      ],
+      "abstraction_skip": [
+        {
+          "challenge": "C2",
+          "tier": "local-24k",
+          "seed": 3,
+          "detail": "ladder validator bounced: geometry_plan emitted before function_map omissions checklist",
+          "evidence_seqs": [
+            8
+          ]
+        },
+        {
+          "challenge": "C2",
+          "tier": "frontier-200k",
+          "seed": 3,
+          "detail": "ladder validator bounced: geometry_plan emitted before function_map omissions checklist",
+          "evidence_seqs": [
+            8
+          ]
+        }
+      ],
+      "incoherent_geometry": [
+        {
+          "challenge": "C3",
+          "tier": "local-24k",
+          "seed": 2,
+          "detail": "acceptance criteria failed: AC2, AC4",
+          "evidence_seqs": [
+            5
+          ]
+        },
+        {
+          "challenge": "C3",
+          "tier": "frontier-200k",
+          "seed": 2,
+          "detail": "acceptance criteria failed: AC2, AC4",
+          "evidence_seqs": [
+            5
+          ]
+        },
+        {
+          "challenge": "C5",
+          "tier": "local-24k",
+          "seed": 2,
+          "detail": "acceptance criteria failed: AC2, AC4",
+          "evidence_seqs": [
+            5
+          ]
+        },
+        {
+          "challenge": "C5",
+          "tier": "frontier-200k",
+          "seed": 2,
+          "detail": "acceptance criteria failed: AC2, AC4",
+          "evidence_seqs": [
+            5
+          ]
+        }
+      ],
+      "grind": [
+        {
+          "challenge": "C3",
+          "tier": "local-24k",
+          "seed": 3,
+          "detail": "3 attempts on 'n_build_DL1' with no changed hypothesis",
+          "evidence_seqs": [
+            6,
+            7,
+            8
+          ]
+        },
+        {
+          "challenge": "C3",
+          "tier": "frontier-200k",
+          "seed": 3,
+          "detail": "3 attempts on 'n_build_DL1' with no changed hypothesis",
+          "evidence_seqs": [
+            6,
+            7,
+            8
+          ]
+        },
+        {
+          "challenge": "C6",
+          "tier": "local-24k",
+          "seed": 3,
+          "detail": "3 attempts on 'n_build_DL1' with no changed hypothesis",
+          "evidence_seqs": [
+            7,
+            8,
+            9
+          ]
+        },
+        {
+          "challenge": "C6",
+          "tier": "frontier-200k",
+          "seed": 3,
+          "detail": "3 attempts on 'n_build_DL1' with no changed hypothesis",
+          "evidence_seqs": [
+            7,
+            8,
+            9
+          ]
+        }
+      ],
+      "wrong_question": [
+        {
+          "challenge": "C4",
+          "tier": "local-24k",
+          "seed": 2,
+          "detail": "asked a question with no bearing: 'What color should the hinge be?'",
+          "evidence_seqs": [
+            8
+          ]
+        },
+        {
+          "challenge": "C4",
+          "tier": "local-24k",
+          "seed": 2,
+          "detail": "missed a critical blocking ambiguity: 'pin material / process not specified'",
+          "evidence_seqs": [
+            1
+          ]
+        },
+        {
+          "challenge": "C4",
+          "tier": "frontier-200k",
+          "seed": 2,
+          "detail": "asked a question with no bearing: 'What color should the hinge be?'",
+          "evidence_seqs": [
+            8
+          ]
+        },
+        {
+          "challenge": "C4",
+          "tier": "frontier-200k",
+          "seed": 2,
+          "detail": "missed a critical blocking ambiguity: 'pin material / process not specified'",
+          "evidence_seqs": [
+            1
+          ]
+        }
+      ]
+    }
+  },
+  "recommended_dials": [
+    {
+      "trigger_class": "wrong_question",
+      "occurrences": 4,
+      "knob": "playbook_enforcement / clarifier batch gate",
+      "action": "keep step_locked on local tiers; ensure the clarifier playbook's blocking-ambiguity check is enforced before Phase 2 (config, not prose)",
+      "kind": "config/data"
+    },
+    {
+      "trigger_class": "incoherent_geometry",
+      "occurrences": 4,
+      "knob": "AI_CAD_COUNCIL_FEATURE_THRESHOLD",
+      "action": "lower the build-strategy-council feature threshold so more parts get the four-seat review before build (more machinery for weaker models)",
+      "kind": "config/data"
+    },
+    {
+      "trigger_class": "tool_misuse",
+      "occurrences": 6,
+      "knob": "tiers.yaml max_tools_per_role / tool_schema_trim",
+      "action": "tighten the per-role tool allowlist so the wrong tool is not in scope; keep preflight on (config), and enable the tool-choice trigger pack",
+      "kind": "config/data"
+    },
+    {
+      "trigger_class": "context_loss",
+      "occurrences": 4,
+      "knob": "tiers.yaml budgets.ledger / budgets.state",
+      "action": "raise the ledger/state slot budget so cited refs stay in the render (shrink history first, never advisory) \u2014 assembly-time budget assertion",
+      "kind": "config/data"
+    },
+    {
+      "trigger_class": "abstraction_skip",
+      "occurrences": 2,
+      "knob": "deliberation (ladder mandatory) + ladder validator max-bounce",
+      "action": "confirm deliberation=full pins the design-cognition ladder mandatory; the validator bounce is working \u2014 no relaxation warranted",
+      "kind": "config/data"
+    },
+    {
+      "trigger_class": "grind",
+      "occurrences": 4,
+      "knob": "gym grind_threshold / anti-grind replan gate",
+      "action": "the anti-grind rule (2 attempts then replan) is the lever; ensure the replan gate is enabled so a 3rd identical attempt cannot happen",
+      "kind": "config/data"
+    },
+    {
+      "trigger_class": "advisory_ignored",
+      "occurrences": 2,
+      "knob": "trigger-pack enablement + advisory slot budget",
+      "action": "keep the foreman advisory injection on (deliberation=full) and ensure the advisory slot budget is not shrunk below its floor",
+      "kind": "config/data"
+    }
+  ],
+  "lead_findings": [
+    {
+      "trigger_class": "wrong_question",
+      "occurrences": "4",
+      "lead_lever": "clarifier role card prompt: strengthen 'ask about the blocking ambiguity FIRST, suppress cosmetic questions' wording"
+    },
+    {
+      "trigger_class": "tool_misuse",
+      "occurrences": "6",
+      "lead_lever": "role card prompt: add the 'each AC names its check tool; use THAT tool' reminder to the relevant worker cards"
+    },
+    {
+      "trigger_class": "advisory_ignored",
+      "occurrences": "2",
+      "lead_lever": "worker role card prompt: 'if you disagree with an advisory, file a replan_request \u2014 do not silently proceed'"
+    }
+  ],
+  "applied_dials": [
+    {
+      "knob": "gym.grind_threshold",
+      "from": 3,
+      "to": 2,
+      "change": "tighten anti-grind sensitivity 3 -> 2 attempts"
+    },
+    {
+      "knob": "AI_CAD_COUNCIL_FEATURE_THRESHOLD",
+      "from": "5",
+      "to": "3",
+      "change": "lower council feature threshold 5 -> 3 (more parts get the four-seat review before build)"
+    }
+  ],
+  "deltas": {
+    "grind_threshold_3_to_2": {
+      "grind_before": 4,
+      "grind_after": 4,
+      "delta": 0,
+      "measurable": true,
+      "note": "deterministic reclassification of identical ledgers \u2014 a real delta"
+    },
+    "council_threshold_5_to_3": {
+      "measurable": false,
+      "note": "applied to config env; pass-rate delta needs a real model in BUILD (mock replay does not convene councils) \u2014 pending-provision"
+    }
+  },
+  "n_cells": 36
+}

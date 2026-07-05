@@ -1,0 +1,254 @@
+{
+  "events": [
+    {
+      "seq": 0,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "pipeline",
+      "kind": "brief",
+      "payload": {
+        "title": "Gym C5",
+        "summary": "Design an L-bracket and a CAM program to machine it from 6061 with zero gouges.",
+        "success_criteria": []
+      }
+    },
+    {
+      "seq": 1,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "intake_analyst",
+      "kind": "artifact",
+      "payload": {
+        "kind": "manifest",
+        "id": "manifest",
+        "deliverables": [
+          {
+            "id": "DL1",
+            "kind": "cam_program",
+            "name": "L-bracket + CAM program",
+            "description": "an L-bracket in 6061 plus a gouge-free CAM program to machine it",
+            "acceptance_criteria": [
+              {
+                "id": "AC1",
+                "text": "L-bracket built",
+                "check": {
+                  "tool": "measure_part",
+                  "pass_rule": "thickness > 0"
+                }
+              },
+              {
+                "id": "AC2",
+                "text": "CAM program is gouge-free",
+                "check": {
+                  "tool": "cam_simulate",
+                  "pass_rule": "gouges == 0"
+                }
+              },
+              {
+                "id": "AC3",
+                "text": "machined fraction >= 0.90",
+                "check": {
+                  "tool": "cam_simulate",
+                  "pass_rule": "machined_fraction >= 0.90"
+                }
+              },
+              {
+                "id": "AC4",
+                "text": "geometry coherent",
+                "check": {
+                  "tool": "verify_battery",
+                  "pass_rule": "PASS"
+                }
+              }
+            ],
+            "depends_on": [],
+            "target_refs": {
+              "doc_id": null,
+              "features": []
+            },
+            "status": "pending"
+          }
+        ],
+        "ambiguities": [],
+        "assumptions": [
+          {
+            "text": "material 6061-T6 aluminum",
+            "basis": "requested material",
+            "needs_confirm": false
+          }
+        ]
+      }
+    },
+    {
+      "seq": 2,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "spec_writer",
+      "kind": "dimension",
+      "payload": {
+        "id": "DIM1",
+        "name": "bracket_thickness",
+        "value": 6.0,
+        "unit": "mm",
+        "driver": "L-bracket web/flange thickness in 6061",
+        "provenance": "measure_part: wall thickness of the L-bracket web",
+        "tolerance": {
+          "fit_class": null,
+          "plus": 0.1,
+          "minus": 0.1
+        },
+        "status": "confirmed"
+      }
+    },
+    {
+      "seq": 3,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "feature_modeler",
+      "kind": "decision",
+      "payload": {
+        "id": "cam_sim",
+        "stage": "verify",
+        "for_ac": "AC2",
+        "text": "3-axis CAM sim of the L-bracket program",
+        "gouges": 2,
+        "machined_fraction": 0.95,
+        "rationale": "cam_simulate: 2 gouges into the model — incoherent toolpath",
+        "node": "n_build_DL1"
+      }
+    },
+    {
+      "seq": 4,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "feature_modeler",
+      "kind": "tool_call",
+      "payload": {
+        "tool": "cam_simulate",
+        "for_ac": "AC2",
+        "node": "n_build_DL1",
+        "args": {
+          "program": "L_bracket_6061",
+          "stock": "6061"
+        },
+        "hypothesis": "simulate toolpaths for gouges and coverage"
+      }
+    },
+    {
+      "seq": 5,
+      "ts": "2026-07-05T04:16:41Z",
+      "actor": "reviewer",
+      "kind": "artifact",
+      "payload": {
+        "kind": "battery",
+        "id": "battery_DL1",
+        "verdict": "FAIL",
+        "stage": "verify",
+        "note": "verify_battery FAIL: CAM gouges breach the model surface"
+      }
+    }
+  ],
+  "state": {
+    "schema": "aicad.ledger/1",
+    "run_id": "gym_C5_local-24k_s2",
+    "brief": {
+      "title": "Gym C5",
+      "summary": "Design an L-bracket and a CAM program to machine it from 6061 with zero gouges.",
+      "success_criteria": []
+    },
+    "requirements": [],
+    "decisions": [
+      {
+        "id": "cam_sim",
+        "stage": "verify",
+        "for_ac": "AC2",
+        "text": "3-axis CAM sim of the L-bracket program",
+        "gouges": 2,
+        "machined_fraction": 0.95,
+        "rationale": "cam_simulate: 2 gouges into the model — incoherent toolpath",
+        "node": "n_build_DL1"
+      }
+    ],
+    "dimensions": [
+      {
+        "id": "DIM1",
+        "name": "bracket_thickness",
+        "value": 6.0,
+        "unit": "mm",
+        "driver": "L-bracket web/flange thickness in 6061",
+        "tolerance": {
+          "fit_class": null,
+          "plus": 0.1,
+          "minus": 0.1
+        },
+        "status": "confirmed"
+      }
+    ],
+    "questions": [],
+    "stage_log": [],
+    "artifacts": [
+      {
+        "kind": "manifest",
+        "id": "manifest",
+        "deliverables": [
+          {
+            "id": "DL1",
+            "kind": "cam_program",
+            "name": "L-bracket + CAM program",
+            "description": "an L-bracket in 6061 plus a gouge-free CAM program to machine it",
+            "acceptance_criteria": [
+              {
+                "id": "AC1",
+                "text": "L-bracket built",
+                "check": {
+                  "tool": "measure_part",
+                  "pass_rule": "thickness > 0"
+                }
+              },
+              {
+                "id": "AC2",
+                "text": "CAM program is gouge-free",
+                "check": {
+                  "tool": "cam_simulate",
+                  "pass_rule": "gouges == 0"
+                }
+              },
+              {
+                "id": "AC3",
+                "text": "machined fraction >= 0.90",
+                "check": {
+                  "tool": "cam_simulate",
+                  "pass_rule": "machined_fraction >= 0.90"
+                }
+              },
+              {
+                "id": "AC4",
+                "text": "geometry coherent",
+                "check": {
+                  "tool": "verify_battery",
+                  "pass_rule": "PASS"
+                }
+              }
+            ],
+            "depends_on": [],
+            "target_refs": {
+              "doc_id": null,
+              "features": []
+            },
+            "status": "pending"
+          }
+        ],
+        "ambiguities": [],
+        "assumptions": [
+          {
+            "text": "material 6061-T6 aluminum",
+            "basis": "requested material",
+            "needs_confirm": false
+          }
+        ]
+      },
+      {
+        "kind": "battery",
+        "id": "battery_DL1",
+        "verdict": "FAIL",
+        "stage": "verify",
+        "note": "verify_battery FAIL: CAM gouges breach the model surface"
+      }
+    ]
+  }
+}

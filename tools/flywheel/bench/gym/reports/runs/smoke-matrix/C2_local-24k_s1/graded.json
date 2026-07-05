@@ -1,0 +1,30 @@
+{
+  "challenge": "C2",
+  "criteria": [
+    {
+      "id": "AC1",
+      "text": "PCB clearance >= 0.5 mm",
+      "result": "PASS",
+      "detail": "PCB clearance 0.5 mm >= 0.5 mm"
+    },
+    {
+      "id": "AC2",
+      "text": "wall thickness >= 1.5 mm (PETG min)",
+      "result": "PASS",
+      "detail": "wall 2.0 mm >= 1.5 mm"
+    },
+    {
+      "id": "AC3",
+      "text": "snap engages within PETG allowable strain",
+      "result": "PASS",
+      "detail": "snap strain 0.032 <= 0.04 and engaged"
+    },
+    {
+      "id": "AC4",
+      "text": "verify_battery PASS (coherent geometry)",
+      "result": "PASS",
+      "detail": "verify_battery PASS"
+    }
+  ],
+  "passed": true
+}

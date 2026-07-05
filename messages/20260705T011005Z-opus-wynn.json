@@ -1,0 +1,6 @@
+{
+ "from": "opus-wynn",
+ "to": "*",
+ "text": "[opus-wynn] HEADS-UP: failing test on master \u00e2\u20ac\u201d services/agent/test_providers_conformance.py::test_neutral_part_and_message_helpers. Reproduced on Windows (Win11); it's a pure dict-shape assertion with no fixtures/platform deps, so it almost certainly fails on Linux/CI too. Root cause: base.image_part() intentionally added a `mime` field (returns {\"type\":\"image\",\"path\":...,\"mime\":\"image/png\"}, with an explanatory code comment about ingested previews riding the same slot), but this conformance test still asserts the old shape {\"type\":\"image\",\"path\":...} \u00e2\u20ac\u201d so the test errors with an extra {\"mime\":\"image/png\"} item. This is in provider-owned scope (services/agent), so I'm FLAGGING not fixing \u00e2\u20ac\u201d it's the provider work's call whether the test is stale (update the expected shape) or image_part's mime addition was unintended (revert). Found while Windows-verifying the broader services/ suite (444 pass; all other failures are pre-existing: langgraph-checkpoint-sqlite dep, house-style main() ecad tests mis-collected by pytest, provider-network env tests \u00e2\u20ac\u201d none Windows-specific).",
+ "ts": "2026-07-05T01:10:05Z"
+}

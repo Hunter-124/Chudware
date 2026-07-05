@@ -82,6 +82,39 @@ untouched.
 - Robocopy staging in build.bat uses /R:2 /W:1 — a locked DLL means a running
   app/MCP is holding libaicad.dll / OCCT TK*.dll; close them and rerun.
 
+## Reviewer summary (current state — 2026-07-05)
+
+Cold-read snapshot for a reviewer who wasn't following live; the dated Progress log below
+has the full trail.
+
+VERIFIED on Windows (Win11, MSVC 14.44 / VS2022):
+- Full OCCT core builds (windows-occt preset); ctest **48/49** — the 1 fail is
+  `freecad_parity` (point-on-ellipse), a pre-existing MSVC-vs-GCC solver diff, NOT a
+  Windows regression.
+- Core DLLs stage next to the exe; host imgui GUI builds + launches + renders.
+- Engine + sketch solver + UI reach parity: a real parametric solid builds
+  (Sketch1 → Boss-Extrude1 → Body1); sketch solver hits "Fully Defined DOF: 0".
+
+OPEN — headless viewport parity screenshot is UNVERIFIED. Root-caused to a camera-framing
+bug (NOT a render gap) and fixed on this branch (commit 82c785bf), but the fix is unverified
+because re-capture is blocked by the standing worker-start hang (below). Closes via a 2-min
+interactive eyeball (launch AI-CAD.exe → create a part → press F to Zoom-to-Fit) OR the
+worker-start fix.
+
+FIX ON THIS BRANCH FOR REVIEW — commit 82c785bf, `host/src/ui/scenarios.cpp` sketch step 2:
+the shot reset yaw/pitch/zoom but not `st.pan`; entering the sketch leaves pan offset, so the
+solid framed off-centre. Fix resets `st.pan[0..2]=0` before capture, mirroring
+`ViewPreset::ZoomFit`'s `kZeroPan`. Capture-only, Linux-safe, no engine/worker change; normal
+interactive launch path is UNCHANGED. Status: UNVERIFIED (see OPEN above).
+
+STANDING BLOCKER (buddy / app-gui territory — NOT a WIN-lane fix; do not touch without sign-off):
+`AppState::tryStartWorker()` gates the in-process libaicad fallback `#ifndef _WIN32`
+(`host/src/core/app_state.cpp:580`) = Linux-only, so on Windows the app requires the managed
+Python worker; when worker-start / the venv-freshness re-provision stalls, headless scenarios
+hang with NO stdout diagnostic (errors go to the in-app log only). **Observed twice:**
+(1) `AI_CAD_SHOT=m1`, (2) `AI_CAD_SHOT=sketch` re-capture — both recorded here for whoever
+picks up the Windows worker-start fix.
+
 ## Progress log
 - 2026-07-05 [gissa/opus-wynn] Branch task/T-WIN1-win10-bringup created off master
   c745f0fe. Preserved prior verified WIN work as commit 750c0bbb (fix_math.h /FI

@@ -273,6 +273,11 @@ register_buildgraph_tools(mcp)
 # risk-class READ; stage_set / advisory_dispute are WRITE (ledger-logged, §9.3).
 from services.mcp.advisor_tools import register_advisor_tools
 register_advisor_tools(_reg.view(mcp, "advisor"))
+# Workspace (T-W16, Pillar 20 §2.14): multi-doc lease registry + per-doc event streams.
+# workspace_status / workspace_doc_events are risk-class READ (named in _READ_EXACT);
+# no write-lease required to poll status.
+from services.mcp.workspace_tools import register_workspace_tools
+register_workspace_tools(_reg.view(mcp, "workspace"))
 
 
 def _install_clean_stdout():

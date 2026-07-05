@@ -31,6 +31,7 @@
 #include "ui/watch_grid_panel.h"       // T-W17
 #include "ui/agent_settings_panel.h"   // T-W17
 #include "ui/ai_effort_section.h"      // T-W28
+#include "ui/agent_dag_panel.h"        // T-DP17
 #include "ui/sim_panel.h"                       // T-U6: sim studies (AI_CAD_SHOT=sim_studies)
 #include "artifact_view.h"
 #include "app/app_state.h"
@@ -471,7 +472,9 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantStructural   = eq("structural_view");   // T-U7
     cfg.wantGallery       = eq("gallery");
     cfg.wantQuestion      = eq("question");           // T-BL40: inline ask_user cards
-    cfg.wantMissionControl = eq("mission_control");  // T-F17
+    cfg.wantMissionControl   = eq("mission_control");   // T-F17
+    cfg.wantAgentDag         = eq("agent_dag");         // T-DP17
+    cfg.wantAgentDagCompact  = eq("agent_dag_compact"); // T-DP17
     cfg.wantAgentInspector      = eq("agent_inspector");        // T-W17
     cfg.wantAgentInspectorEmpty = eq("agent_inspector_empty");  // T-W17
     cfg.wantAgentInspectorFailure    = eq("agent_inspector_failure");    // T-W17
@@ -605,6 +608,8 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
         ui::selectAndOpenFirstSampleForShot();  // proves click -> doc_open -> editable tree
     }
     if (cfg.wantMissionControl) ui::openMissionControlPanel();  // T-F17
+    if (cfg.wantAgentDag || cfg.wantAgentDagCompact)           // T-DP17
+        ui::openAgentDagPanel();
 
     // T-W17 — seed from committed fixture run dirs immediately (no worker needed).
     if (cfg.wantAgentInspector || cfg.wantAgentInspectorEmpty ||
@@ -1167,6 +1172,64 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
         ui::seedMissionControlPanelFromJsonl(j);
         std::printf("mission_control: fixture seeded (%zu bytes, paused at gate)\n",
                     j.size());
+        std::fflush(stdout);
+    }
+
+    // T-DP17: Agent DAG widget — fixture-seeded with a multi-layer workflow:
+    //   • 2 mission phases (design pipeline + verification pass)
+    //   • 3 delegation sub-agents (feature_architect, geometry_designer, build_strategist)
+    //   • explicit edges so the layered layout shows hierarchy
+    //   Full shot: pre-selects "n_geom" so the detail pane renders.
+    //   Compact shot: no selection, graph only.
+    if ((cfg.wantAgentDag || cfg.wantAgentDagCompact) && !cfg.agentDagShotDone) {
+        cfg.agentDagShotDone = true;
+        const char* ts = "2026-07-05T10:22:00Z";
+        std::string j;
+        auto ev = [&](const char* body) {
+            j += std::string("{\"ts\":\"") + ts + "\"," + body + "}\n";
+        };
+
+        // Mission run
+        ev(R"j("kind":"dag.run.started","run_id":"dp17fix","graph_name":"Bracket — Guided Design Pipeline","graph_id":"bracket-guided-dp")j");
+
+        // Orchestrator node (root)
+        ev(R"j("kind":"dag.node.started","run_id":"dp17fix","node_id":"n_orch","node_type":"mission","node_name":"Orchestrator")j");
+        ev(R"j("kind":"dag.node.done","run_id":"dp17fix","node_id":"n_orch","output_summary":"Pipeline dispatched — 3 sub-agents active")j");
+
+        // Feature architect sub-agent (delegation)
+        ev(R"j("kind":"delegation.spawn","parent_id":"n_orch","child_id":"n_feat","role":"feature_architect","model":"qwen3-4b","tokens_granted":8192)j");
+        ev(R"j("kind":"delegation.update","id":"n_feat","status":"running","current_tool":"add_features","tokens_spent":1840,"ledger_slice":"stage=FUNCTIONAL_DECOMP")j");
+        ev(R"j("kind":"delegation.update","id":"n_feat","status":"done","tokens_spent":3210)j");
+
+        // Geometry designer sub-agent
+        ev(R"j("kind":"delegation.spawn","parent_id":"n_orch","child_id":"n_geom","role":"geometry_designer","model":"qwen3-4b","tokens_granted":8192)j");
+        ev(R"j("kind":"delegation.update","id":"n_geom","status":"running","current_tool":"fit_calc","tokens_spent":2048,"ledger_slice":"stage=GEOMETRY_REALIZATION feature=mount_boss")j");
+
+        // Build strategist sub-agent
+        ev(R"j("kind":"delegation.spawn","parent_id":"n_orch","child_id":"n_build","role":"build_strategist","model":"qwen3-4b","tokens_granted":6000)j");
+        ev(R"j("kind":"delegation.update","id":"n_build","status":"blocked","tokens_spent":512,"ledger_slice":"waiting on geometry_designer")j");
+
+        // Verify + gate nodes
+        ev(R"j("kind":"dag.node.started","run_id":"dp17fix","node_id":"n_verify","node_type":"verify","node_name":"Verify: interference")j");
+        ev(R"j("kind":"dag.node.failed","run_id":"dp17fix","node_id":"n_verify","error":"geometry_designer still running")j");
+        ev(R"j("kind":"dag.node.started","run_id":"dp17fix","node_id":"n_gate","node_type":"gate","node_name":"Approve build plan")j");
+        ev(R"j("kind":"dag.node.paused","run_id":"dp17fix","node_id":"n_gate","reason":"gate")j");
+        ev(R"j("kind":"dag.node.approval_required","run_id":"dp17fix","node_id":"n_gate")j");
+
+        // Explicit edges to build the graph hierarchy
+        ev(R"j("kind":"dag.edge","from":"n_feat","to":"n_geom")j");
+        ev(R"j("kind":"dag.edge","from":"n_geom","to":"n_build")j");
+        ev(R"j("kind":"dag.edge","from":"n_build","to":"n_verify")j");
+        ev(R"j("kind":"dag.edge","from":"n_build","to":"n_gate")j");
+
+        ui::seedAgentDagPanelFromJsonl(j);
+
+        // For the full shot: pre-select the geometry_designer node so the detail pane renders
+        if (cfg.wantAgentDag)
+            ui::agentDagShotSelectNode("n_geom");
+
+        std::printf("agent_dag: fixture seeded (%zu bytes) mode=%s\n",
+                    j.size(), cfg.wantAgentDag ? "full" : "compact");
         std::fflush(stdout);
     }
 }

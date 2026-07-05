@@ -26,6 +26,7 @@
 #include "ui/mission_control_panel.h"  // T-F17 mission-control (DAG run steering) panel
 #include "ui/agent_inspector_panel.h"  // T-W17 agent inspector (advisor observability)
 #include "ui/watch_grid_panel.h"       // T-W17 multi-viewport watch grid
+#include "ui/agent_dag_panel.h"        // T-DP17 interactive agent DAG widget
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -412,6 +413,20 @@ void Application::frame() {
     }
     // T-W17 Agent Settings now renders inline in the Settings modal's AI tab
     // (settings consolidation: the popup is the only settings surface).
+
+    // T-DP17 Agent DAG — interactive node-graph of the running workflow.
+    // Compact mode embedded in overlay; Full mode here as a standalone window.
+    if (*ui::agentDagPanelOpen()) {
+        const ImGuiViewport* vpd = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vpd->WorkPos.x + vpd->WorkSize.x * 0.5f,
+                                       vpd->WorkPos.y + vpd->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(820.f * theme::S(), 640.f * theme::S()),
+                                 ImGuiCond_Appearing);
+        if (ImGui::Begin("Agent DAG###agent_dag", ui::agentDagPanelOpen(), pflags))
+            ui::drawAgentDagPanel(s, aicad::ui::DagWidgetMode::Full);
+        ImGui::End();
+    }
 
     ImGui::PopStyleColor();
 

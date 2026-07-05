@@ -3,7 +3,7 @@ id: T-W4
 title: Engineering calculator registry - bolted joints, threads, press fits, beams, walls + geometry auto-prefill
 workstream: W
 owner: sonnet-birk
-status: review
+status: done
 branch: task/T-W4-calculators
 depends_on: [T-W3]
 lane: ai-copilot

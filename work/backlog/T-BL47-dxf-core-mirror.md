@@ -3,7 +3,7 @@ id: T-BL47
 title: DXF import — C++ core mirror (reach GUI/MCP import_part end-to-end)
 workstream: backlog
 owner: mooseinatree
-status: review
+status: done
 priority: 3
 lane: modeling-core
 kind: new

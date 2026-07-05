@@ -3,7 +3,7 @@ id: T-X3
 title: part_search federation seam - browser adapters as providers
 workstream: X
 owner: sonnet-drift
-status: review
+status: done
 branch: task/T-X3-part-search-federation
 depends_on: [T-X2]
 lane: parts-sourcing

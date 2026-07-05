@@ -3,7 +3,7 @@ id: T-BL46
 title: Sketch — larger drag dead zone / element-drag priority so repositioning/resizing elements doesn't instantly pan the view
 workstream: backlog
 owner: sonnet-harle
-status: review
+status: done
 priority: 2
 lane: app-gui
 kind: fix

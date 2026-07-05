@@ -24,6 +24,11 @@ def _setup_stubs():
     cb = types.ModuleType("mcp_server.core_bridge")
     cb.available = lambda: False
     cb.call = lambda method, params=None: {}
+    # Issue #17: the real services/mcp/cad_tools.py does `from .core_bridge import
+    # CoreError` at import time; when this stub wins the services.mcp.core_bridge
+    # sys.modules slot first (full-dir sweeps: dimension < fea_advanced), a missing
+    # CoreError aborts the WHOLE mcp_server collection. Keep the stub import-compatible.
+    cb.CoreError = type("CoreError", (Exception,), {})
     sys.modules.setdefault("mcp_server.core_bridge", cb)
     sys.modules.setdefault("core_bridge", cb)
     sys.modules.setdefault("services.mcp.core_bridge", cb)

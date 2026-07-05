@@ -67,7 +67,7 @@ MAX_TOOLS_PER_ROLE = 14
 # sibling W tasks (delegation tree T-W14, workspace status). Reported by the loader
 # as feature-flagged rather than as errors, so the 13 authored cards load cleanly.
 FEATURE_FLAGGED_TOOLS = frozenset({
-    "delegate", "workspace_status",
+    "delegate",  # lands with T-W14
     # org layer (land with T-W22/T-W23)
     "channel_send", "request_resolve", "council_convene",
 })

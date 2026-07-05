@@ -327,7 +327,7 @@ class TestLoadAndValidate(unittest.TestCase):
         findings = roles.validate_suite(tool_names=_CATALOG)
         flagged = {f.message.split("'")[1] for f in roles.flags(findings)
                    if "not yet registered" in f.message}
-        self.assertEqual(flagged, {"delegate", "workspace_status",
+        self.assertEqual(flagged, {"delegate",
                                    "channel_send", "request_resolve", "council_convene"})
 
     def test_allowlists_within_cap(self):

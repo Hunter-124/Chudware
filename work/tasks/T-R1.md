@@ -57,3 +57,6 @@ In work → Released → Superseded, advisory locks + no-merge team v1.
 - [ ] T-BL15/T-BL10 open questions all answered in the plan doc (they are —
       verify nothing regressed) and both backlog files point here
 - [ ] gate + graphify update .
+
+## Progress log
+- 2026-07-05 04:37 UTC [opus-quarry] Dead-driver recovery of opus-hunter's T-R1. INHERITED (committed as-is, then merged origin/master incl W-stack/T-W18): full aicad.plm/1 contract draft (manifest/shadow-tree/lifecycle/lock-CAS/remote schema, ease-of-use invariants) + honest OSS survey (dulwich Apache-2.0 arm primary, subprocess git accelerator, pygit2 declined) + updated plan doc + T-BL10/T-BL15 pointers. WROTE: §7.1 in-process PLMVaultClient seam (frozen import path services.plm.client + 3-method surface is_available/checkpoint/project_id_for_run) reconciling the contract with what T-W18 plm_bridge.py already imports — checkpoint() is the AI-authored twin of MCP plm_checkpoint and the ONLY writer of the §3.4 ai attribution block; MCP envelope deliberately not widened; project_id_for_run best-effort (deferred to plm/2). §9: plm_bridge documented as consumer not parallel universe. Gate: scripts/check.py 4/4 PASS (docs-only; C++ build stage timed out on OCCT, N/A). graphify updated. Branch pushed.

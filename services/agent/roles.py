@@ -66,7 +66,11 @@ MAX_TOOLS_PER_ROLE = 14
 # Allowlist tools that do not yet resolve to a registered MCP tool — they land with
 # sibling W tasks (delegation tree T-W14, workspace status). Reported by the loader
 # as feature-flagged rather than as errors, so the 13 authored cards load cleanly.
-FEATURE_FLAGGED_TOOLS = frozenset({"delegate", "workspace_status"})
+FEATURE_FLAGGED_TOOLS = frozenset({
+    "delegate", "workspace_status",
+    # org layer (land with T-W22/T-W23)
+    "channel_send", "request_resolve", "council_convene",
+})
 
 _ROLES_DIR = Path(__file__).resolve().parent / "roles"
 _PLAYBOOKS_DIR = Path(__file__).resolve().parent / "playbooks"
@@ -281,7 +285,12 @@ def load_all_roles(*, roles_dir: Path | None = None) -> dict[str, RoleCard]:
     d = roles_dir or _ROLES_DIR
     out: dict[str, RoleCard] = {}
     for path in sorted(d.glob("*.yaml")):
-        card = _role_from_dict(yaml.safe_load(path.read_text()), source=str(path))
+        data = yaml.safe_load(path.read_text())
+        # roles/ also holds non-card data files (e.g. council_seats.yaml,
+        # schema aicad.council_seats/1) - only aicad.role/1 documents are cards.
+        if not isinstance(data, dict) or data.get("schema") != ROLE_SCHEMA:
+            continue
+        card = _role_from_dict(data, source=str(path))
         out[card.id] = card
     return out
 

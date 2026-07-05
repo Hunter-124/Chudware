@@ -3,7 +3,7 @@ id: T-W7
 title: Role cards and playbooks v1 - ten predefined roles with rich prompts, scoped tools, structured handoffs
 workstream: W
 owner: opus-vint
-status: review
+status: done
 branch: task/T-W7-roles-playbooks
 depends_on: [T-W1]
 lane: ai-copilot

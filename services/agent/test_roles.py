@@ -300,12 +300,15 @@ def _class_match(tok, ch):
 
 class TestLoadAndValidate(unittest.TestCase):
     def test_thirteen_roles_load(self):
+        # 13 pipeline roles + department_manager + design_thinker (org/ladder
+        # layers, authored post-branch). council_seats.yaml is data, not a card.
         cards = roles.load_all_roles()
-        self.assertEqual(len(cards), 13, sorted(cards))
+        self.assertEqual(len(cards), 15, sorted(cards))
         for rid in ("intake_analyst", "clarifier", "spec_writer", "orchestrator",
                     "layout_engineer", "sketcher", "feature_modeler",
                     "assembly_fit_engineer", "sim_engineer", "cam_programmer",
-                    "reviewer", "fixer", "overseer"):
+                    "reviewer", "fixer", "overseer",
+                    "department_manager", "design_thinker"):
             self.assertIn(rid, cards)
 
     def test_six_playbooks_load(self):
@@ -324,7 +327,8 @@ class TestLoadAndValidate(unittest.TestCase):
         findings = roles.validate_suite(tool_names=_CATALOG)
         flagged = {f.message.split("'")[1] for f in roles.flags(findings)
                    if "not yet registered" in f.message}
-        self.assertEqual(flagged, {"delegate", "workspace_status"})
+        self.assertEqual(flagged, {"delegate", "workspace_status",
+                                   "channel_send", "request_resolve", "council_convene"})
 
     def test_allowlists_within_cap(self):
         for card in roles.load_all_roles().values():

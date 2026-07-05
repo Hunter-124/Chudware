@@ -153,18 +153,19 @@ graph TD
     T_W1["T-W1: Design ledger - persistent mission state with budgeted rendering (aicad.ledger/1)"]:::review
     T_W10["T-W10: Model tier profiles + local-model harness - budget enforcement, GBNF outputs, per-tier prompt sizing"]:::todo
     T_W11["T-W11: Advisory loop end-to-end benchmark - mission through roles+advisories on local and frontier tiers"]:::todo
-    T_W12["T-W12: Tool preflight - dry-run plan validation on shadow doc clones (aicad.preflight/1)"]:::todo
+    T_W12["T-W12: Tool preflight - dry-run plan validation on shadow doc clones (aicad.preflight/1)"]:::review
     T_W13["T-W13: Overseer plan-audit engine + user change-request routing (aicad.audit/1)"]:::todo
     T_W14["T-W14: Hierarchical delegation with approval chain + model routing table (aicad.delegation/1, aicad.routing/1)"]:::todo
-    T_W15["T-W15: Build-order DAG planner - part/feature dependency graph with deterministic validation (aicad.buildgraph/1)"]:::todo
+    T_W15["T-W15: Build-order DAG planner - part/feature dependency graph with deterministic validation (aicad.buildgraph/1)"]:::doing
     T_W16["T-W16: Multi-document agent workspace - doc leases, parallel part fan-out, per-doc event streams"]:::todo
     T_W17["T-W17: Transparency inspector + model-source settings GUI (advisor observability, routing editor, multi-viewport watch)"]:::todo
     T_W18["T-W18: PLM integration - agent milestone checkpoints, ledger-annotated history, change-request links (aicad.plmlink/1)"]:::todo
+    T_W19["T-W19: Mission pipeline glue - intake/spec/plan/build phase machine, manifest validator, replan routing"]:::todo
     T_W2["T-W2: Sketch completion suite - auto-coincident pass, constraint advisor, sketch_health"]:::doing
-    T_W3["T-W3: ISO 286 fits and tolerance data + fit_calc + suggest_dimension_scheme"]:::doing
+    T_W3["T-W3: ISO 286 fits and tolerance data + fit_calc + suggest_dimension_scheme"]:::review
     T_W4["T-W4: Engineering calculator registry - bolted joints, threads, press fits, beams, walls + geometry auto-prefill"]:::todo
     T_W5["T-W5: Advisory engine (foreman) - stage tracking, check batteries, advisory injection"]:::todo
-    T_W6["T-W6: Feeds/speeds and machining data tables + CAM advisor integration"]:::doing
+    T_W6["T-W6: Feeds/speeds and machining data tables + CAM advisor integration"]:::review
     T_W7["T-W7: Role cards and playbooks v1 - ten predefined roles with rich prompts, scoped tools, structured handoffs"]:::todo
     T_W8["T-W8: Failure cards and bounded fixer loop - unified diagnosis with candidate fixes and escalation"]:::todo
     T_W9["T-W9: Simulation verification advisor - pre-sim sanity, hand-calc cross-check, margin-policy narration"]:::todo
@@ -362,6 +363,9 @@ graph TD
   T_W5 --> T_W17
   T_W15 --> T_W17
   T_W1 --> T_W18
+  T_W5 --> T_W19
+  T_W7 --> T_W19
+  T_W15 --> T_W19
   T_W3 --> T_W4
   T_W1 --> T_W5
   T_W1 --> T_W7

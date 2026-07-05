@@ -1,7 +1,8 @@
-# contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.1)
+# contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.2)
 
-Frozen 2026-07-04; §10–§15 added same day (minor bump 1.0 → 1.1, additive only).
-Companion to `docs/ADVISOR_ARCHITECTURE.md` (Pillar 20).
+Frozen 2026-07-04; §10–§15 added same day (1.0 → 1.1), §16–§17 added same day
+(1.1 → 1.2). All bumps additive. Companion to `docs/ADVISOR_ARCHITECTURE.md`
+(Pillar 20) and `docs/COPILOT_MISSION_PIPELINE.md` (pipeline operation).
 Additive changes bump the minor (`aicad.advisor/1.1`); breaking changes require a new
 major and a migration note here. All schemas are JSON; all lengths mm, angles deg,
 masses g (canonical units per the interaction contract's `normalize_dimension`).
@@ -362,3 +363,69 @@ Rules: agents never touch git directly — only Pillar 19 nouns (Project/History
 Checkpoint). Checkpoint messages are drafted from ledger events (provenance rule) and
 carry the dimension rationales verbatim. When the R vault is unavailable the links
 queue in the ledger and flush on availability (no lost annotations).
+
+## §16 Deliverable manifest (`aicad.deliverables/1`)
+
+Produced at intake by the intake_analyst role + deterministic validation; the
+mission's definition of done. Lives in the ledger (`artifacts` kind `manifest`).
+
+```json
+{
+  "schema": "aicad.deliverables/1",
+  "request_verbatim": "the user's words, unedited",
+  "deliverables": [{
+    "id": "DL1",
+    "kind": "part|assembly|drawing|cam_program|analysis|report|modification",
+    "name": "bearing mount bracket",
+    "description": "<=60 words, in the user's terms",
+    "acceptance_criteria": [{
+      "id": "AC1",
+      "text": "bore is a sliding fit on the d20 g6 shaft",
+      "check": {"tool": "fit_report|verify_battery|measure_part|cam_simulate|run_fea_static|review_drawing|manual",
+                 "params_hint": {}, "pass_rule": "clearance in [0.007,0.041]"}
+    }],
+    "depends_on": ["DL2"],
+    "target_refs": {"doc_id": null, "features": []},
+    "status": "pending|specifying|planned|building|verifying|done|blocked"
+  }],
+  "ambiguities": [{"text": "", "blocking": false, "question_id": null}],
+  "assumptions": [{"text": "", "basis": "", "needs_confirm": true}]
+}
+```
+
+Rules (validator-enforced, deterministic): every deliverable has ≥1 acceptance
+criterion; every criterion names an executable `check` tool (kind `manual` requires
+`needs_confirm` on an assumption or an ask_user); `modification` deliverables must
+resolve `target_refs` against an existing doc before planning; blocking ambiguities
+route to the clarifier before Phase 2. Acceptance criteria are the reviewer's
+checklist verbatim — verification is running the named checks, not vibes.
+
+## §17 Replan / deviation request (`aicad.replan/1`)
+
+The flexibility mechanism: any role may propose changing the process instead of
+retrying it. Emitted as a handoff output or mid-work tool call (`replan_request`).
+
+```json
+{
+  "schema": "aicad.replan/1",
+  "id": "rp_...",
+  "from_role": "feature_modeler",
+  "scope": "approach|buildgraph|spec|requirement",
+  "reason": "loft between these profiles self-intersects at the neck",
+  "evidence": {"failure_cards": ["fc_..."], "advisories": [], "attempts": 2},
+  "proposal": {
+    "summary": "replace loft with revolve + cut; same envelope, simpler topology",
+    "buildgraph_changes": [{"op": "add|remove|reorder|reassign", "node": {}, "why": ""}],
+    "spec_changes": [], "requirement_changes": []
+  },
+  "urgency": "opportunistic|blocked"
+}
+```
+
+Approval routing (harness-enforced): `approach` (how a node gets built, spec
+untouched) → orchestrator approves; `buildgraph` (order/structure) → orchestrator +
+overseer audit; `spec` → overseer, and user if any acceptance criterion changes;
+`requirement` → always user. Approved requests splice via dag_replan/buildgraph
+edit and are ledger events; denied requests return with a reason the role can act
+on. A role that has emitted a `blocked` replan_request stops working until ruled on
+— it never continues down the failed path.

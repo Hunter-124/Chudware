@@ -115,11 +115,16 @@ both the DAG node runner and standalone loop. Contract §4 fixes the schema:
 ledger_sections (read/write), handoff_schema (structured JSON the role must emit),
 context_recipe (which describers at what budget), escalation_policy`.
 
-v1 roles: `orchestrator`, `clarifier`, `layout_engineer`, `sketcher`,
-`feature_modeler`, `assembly_fit_engineer`, `sim_engineer`, `cam_programmer`,
-`reviewer`, `fixer`. Each system prompt is *rich*: identity, quality bar, the stage
-playbook inline, worked micro-examples, exact output format, and the "you will receive
-ADVISORY blocks — treat computed numbers as ground truth" rule.
+v1 roles (13, prompts AUTHORED by the lead in `services/agent/roles/*.yaml` —
+canonical, loaded verbatim): `intake_analyst`, `clarifier`, `spec_writer`,
+`orchestrator`, `layout_engineer`, `sketcher`, `feature_modeler`,
+`assembly_fit_engineer`, `sim_engineer`, `cam_programmer`, `reviewer`, `fixer`,
+`overseer`. Each system prompt is *rich*: identity, quality bar, method, worked
+micro-examples, exact output format, a shared UNIVERSAL RULES block (numbers never
+invented; advisories are ground truth; ledger over chat; honest handoffs; the
+two-failures-then-replan anti-grind rule), and role-specific judgment sections.
+How they compose into a mission is specified in `docs/COPILOT_MISSION_PIPELINE.md`
+(phases, exit gates, context recipes, replan routing).
 
 Handoffs are structured JSON (grammar-constrained for local models), written into the
 ledger — the next role never needs the previous role's chat.
@@ -342,6 +347,7 @@ T-W1 + T-W5 ──────────────────────�
 T-W5 ─→ T-W17 transparency UI + settings (app-gui)
 T-W7 ─→ T-W16 multi-doc workspace
 T-W1 ─→ T-W18 PLM integration (plm-projects, ← workstream R contract)
+T-W5 + T-W7 + T-W15 ─→ T-W19 mission pipeline glue (docs/COPILOT_MISSION_PIPELINE.md)
 ```
 
 Wave 1 (launched 2026-07-04): T-W1, T-W2, T-W3, T-W6. Wave 1b (no deps): T-W12, T-W15.

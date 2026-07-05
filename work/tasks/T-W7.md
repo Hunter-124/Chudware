@@ -13,11 +13,17 @@ priority: 2
 
 ## Context
 
-Pillar 20 (docs/ADVISOR_ARCHITECTURE.md §2.3–2.4, contracts/advisor.md §4 §6). Ten
-data-driven role cards + stage playbooks so missions split across sub-agents without
-losing the goal or blowing a 24k context: rich system prompts, tool allowlists
-(enforced via the existing tool_registry allow-list mechanism), context recipes,
-grammar-constrainable JSON handoffs written to the ledger (T-W1).
+Pillar 20 (docs/ADVISOR_ARCHITECTURE.md §2.3–2.4, contracts/advisor.md §4 §6).
+UPDATE 2026-07-04 (lead): the THIRTEEN role cards are ALREADY AUTHORED by the lead
+session in `services/agent/roles/*.yaml` (intake_analyst, clarifier, spec_writer,
+orchestrator, layout_engineer, sketcher, feature_modeler, assembly_fit_engineer,
+sim_engineer, cam_programmer, reviewer, fixer, overseer) — their system prompts are
+canonical; load them VERBATIM (verbatim-splice policy), do not rewrite or "improve"
+them. Your scope: the loader/validator, handoff validation + GBNF emitter, context
+assembler, playbooks, and host wiring. If a card has a mechanical defect (schema
+mismatch, tool name that doesn't exist), fix the mechanical field and note it —
+prompt WORDING changes go back to the lead via a task note. See also
+docs/COPILOT_MISSION_PIPELINE.md for how the roles compose.
 
 ## Files / areas touched
 
@@ -37,14 +43,12 @@ grammar-constrainable JSON handoffs written to the ledger (T-W1).
 1. Read the architecture doc + contract §4 §6 fully. Schemas frozen.
 2. Loader/validator + handoff schema → GBNF grammar emitter (survey OSS: outlines /
    llama.cpp json-schema-to-grammar — OSS-first directive — before writing one).
-3. Write the ten role cards. System prompts must be RICH, in the style of loop.py's
-   SYSTEM_PROMPT (worked micro-examples, antipattern list, exact output format), plus
-   the mandatory lines: "ADVISORY blocks contain kernel/table-computed numbers —
-   treat them as ground truth; you may dispute via advisory_dispute", and the role's
-   handoff obligation. Tool allowlists ≤14 tools/role (docs §3 budget). Steal proven
-   content: PLAN_PROMPT → orchestrator/layout; VERIFY → reviewer; regen flow → fixer;
-   deterministic_op_plan pattern → cam_programmer. Layout_engineer must align with
-   T-BL50 (layout-first planning helper — check its branch/notes, reuse not duplicate).
+3. Load and validate the thirteen AUTHORED role cards in services/agent/roles/
+   (see Context — verbatim, no prompt rewrites). Validate: schema conformance,
+   every tool_allowlist entry resolves to a registered tool (report unresolved ones
+   as notes — some land with sibling W tasks; feature-flag those), allowlists ≤14
+   tools, handoff schemas parse. Layout_engineer must align with T-BL50 (layout-
+   first planning helper — check its branch/notes, reuse not duplicate).
 4. Write ≥6 playbooks per contract §6 with per-step helper_tools, checklists, output
    schema fragments; the sketch_profile playbook exactly as docs §2.4 (uses
    sketch_health/suggest_dimension_scheme names from T-W2/T-W3 contracts).

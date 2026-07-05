@@ -203,11 +203,56 @@ def _fix_rebuild(f: Finding) -> tuple[list[dict], list[str]]:
     }], helper
 
 
+def _fix_sim_bc(f: Finding) -> tuple[list[dict], list[str]]:
+    """BC-lint issue → advisory fix stub (real fix in sim_advisor._bc_fix)."""
+    helper = ["run_fea_static", "describe_part"]
+    kind = f.extra.get("bc_kind", "no_fixture")
+    fix = {
+        "action": "fix_bc",
+        "params": {"bc_issue": kind, "hint": "Correct the boundary condition before solving."},
+        "basis": f.finding,
+        "predicted_effect": "FEA solve proceeds with valid boundary conditions.",
+        "confidence": "heuristic",
+    }
+    return [fix], helper
+
+
+def _fix_sim_margin(f: Finding) -> tuple[list[dict], list[str]]:
+    """Margin verdict → redesign suggestion."""
+    helper = ["run_fea_static", "describe_results"]
+    sf = f.numbers.get("sf_yield", 1.5)
+    mat_class = f.numbers.get("mat_class", "general")
+    fix = {
+        "action": "redesign_cross_section",
+        "params": {"hint": f"Reduce stress or increase section — target: max_stress × {sf} ≤ yield."},
+        "basis": f"margin_policy [{mat_class}] SF={sf}",
+        "predicted_effect": "Part passes margin check.",
+        "confidence": "heuristic",
+    }
+    return [fix], helper
+
+
+def _fix_sim_divergence(f: Finding) -> tuple[list[dict], list[str]]:
+    """FEA/anchor divergence → BC review."""
+    helper = ["run_fea_static", "describe_results"]
+    fix = {
+        "action": "review_bc_and_loads",
+        "params": {"hint": "Verify fixture faces and load magnitudes match the physical setup."},
+        "basis": "FEA result diverges from beam-anchor by > 5×; likely a BC error.",
+        "predicted_effect": "Result converges with hand-calc estimate.",
+        "confidence": "heuristic",
+    }
+    return [fix], helper
+
+
 _FIX_PROVIDERS = {
     "interference": _fix_interference,
     "overlap": _fix_overlap,
     "open_profile": _fix_open_profile,
     "rebuild": _fix_rebuild,
+    "sim_bc": _fix_sim_bc,
+    "sim_margin": _fix_sim_margin,
+    "sim_divergence": _fix_sim_divergence,
 }
 
 

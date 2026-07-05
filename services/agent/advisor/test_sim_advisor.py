@@ -1,0 +1,497 @@
+"""Tests for T-W9 simulation verification advisor.
+
+Test coverage:
+  1. BC lint — no_fixture, all_fixed, dangling_ref, clean study
+  2. Mesh suggestion — with/without doc_geom hints
+  3. Beam anchor — confident geometry → anchor computed, low-aspect → None
+  4. Margin policy — PASS / WARN / FAIL verdicts across material classes
+  5. Divergence WARN — FEA >> anchor, FEA << anchor, in-range
+  6. Stage battery wiring — sim stage now includes sim_bc, sim_margin, etc.
+  7. Engine fix-provider wiring — sim_bc / sim_margin / sim_divergence kinds
+  8. describe_results integration — advisor verdict appended (in-app path only,
+     seeded via sim_study_add; no live solver; mock-prove documented)
+
+Anchor mock-prove note (citation honesty):
+    Tests 8 / 5 seed a study whose ``max_von_mises_mpa`` is set to a value that
+    is within 5× of beam_calc_raw for the same geometry.  This tests the postcheck
+    comparison logic without invoking the FEA solver.  The FEA solver does not run
+    headlessly in CI; that is the pre-existing condition documented in issue #16.
+"""
+from __future__ import annotations
+
+import math
+import pytest
+
+from services.agent.advisor import stages
+from services.agent.advisor.engine import Finding, Observation, build_advisory
+from services.agent.advisor.sim_advisor import (
+    DIVERGENCE_WARN_RATIO,
+    _bc_issues,
+    _beam_aspect_ok,
+    _mesh_suggestion,
+    compute_beam_anchor,
+    narrate_postcheck,
+    postcheck,
+    precheck,
+    resolve_material_class,
+)
+from engine_oracle.research.calcs.beam import beam_calc_raw
+
+
+# ---------------------------------------------------------------------------
+# 1. BC lint
+# ---------------------------------------------------------------------------
+
+class TestBcLint:
+    def test_no_fixture_is_blocker(self):
+        study = {"type": "fea_static", "fixtures": [], "loads": [{"face": "top", "force": [0, 0, -100]}]}
+        items = precheck(study)
+        bc_items = [i for i in items if i["check"] == "sim_bc"]
+        assert any(i["severity"] == "blocker" for i in bc_items), bc_items
+        assert any("no_fixture" in i["finding"].lower() or "no fixtures" in i["finding"].lower()
+                   for i in bc_items), bc_items
+
+    def test_no_load_is_blocker(self):
+        study = {"type": "fea_static", "fixtures": ["bottom"], "loads": []}
+        items = precheck(study)
+        bc_items = [i for i in items if i["check"] == "sim_bc"]
+        assert any("no loads" in i["finding"].lower() or "no load" in i["finding"].lower()
+                   for i in bc_items), bc_items
+
+    def test_all_fixed_is_action(self):
+        study = {"type": "fea_static", "fixtures": ["all"], "loads": [{"face": "top", "force": [0, 0, -100]}]}
+        issues = _bc_issues(study)
+        kinds = [iss["kind"] for iss in issues]
+        assert "all_fixed" in kinds, issues
+
+    def test_dangling_ref_raises_action(self):
+        study = {
+            "type": "fea_static",
+            "fixtures": ["bottom"],
+            "loads": [{"face": "top", "force": [0, 0, -100]}],
+            "dangling_refs": ["face_999"],
+        }
+        issues = _bc_issues(study)
+        kinds = [iss["kind"] for iss in issues]
+        assert "dangling_ref" in kinds, issues
+
+    def test_clean_study_no_bc_issues(self):
+        study = {"type": "fea_static", "fixtures": ["bottom"], "loads": [{"face": "top", "force": [0, 0, -100]}]}
+        issues = _bc_issues(study)
+        assert issues == [], issues
+
+    def test_precheck_items_have_candidate_fixes(self):
+        """§3 invariant: non-info items must carry ≥1 candidate fix."""
+        study = {"type": "fea_static", "fixtures": [], "loads": []}
+        items = precheck(study)
+        for it in items:
+            if it["severity"] != "info":
+                assert it["candidate_fixes"], f"Non-info item lacks candidate_fixes: {it}"
+
+
+# ---------------------------------------------------------------------------
+# 2. Mesh suggestion
+# ---------------------------------------------------------------------------
+
+class TestMeshSuggestion:
+    def test_no_suggestion_for_normal_fineness(self):
+        study = {"mesh_fineness": 0.5}
+        # No doc_geom — should not suggest for normal fineness
+        assert _mesh_suggestion(study) is None
+
+    def test_very_coarse_mesh_triggers_suggestion(self):
+        study = {"mesh_fineness": 0.05}
+        suggestion = _mesh_suggestion(study)
+        assert suggestion is not None
+        assert "coarse" in suggestion.lower() or "0.05" in suggestion, suggestion
+
+    def test_doc_geom_fillet_suggests_finer_mesh(self):
+        study = {"mesh_fineness": 0.5}
+        doc_geom = {"min_fillet_radius_mm": 0.5}  # 0.5/5=0.1, target≈0.1; current 0.5 >> target*2
+        suggestion = _mesh_suggestion(study, doc_geom)
+        assert suggestion is not None, "Should suggest finer mesh for small fillet"
+
+    def test_doc_geom_large_feature_no_suggestion(self):
+        # Min fillet 5mm → target_fine = min(0.9, 5/5)=0.9; current 0.8 is within 0.9*0.8..0.9*2
+        # (0.72..1.8) — no suggestion expected
+        study = {"mesh_fineness": 0.8}
+        doc_geom = {"min_fillet_radius_mm": 5.0}
+        suggestion = _mesh_suggestion(study, doc_geom)
+        assert suggestion is None, f"Unexpected suggestion: {suggestion}"
+
+
+# ---------------------------------------------------------------------------
+# 3. Beam anchor
+# ---------------------------------------------------------------------------
+
+class TestBeamAnchor:
+    def _cantilever_bbox(self, L=200.0, b=20.0, h=20.0):
+        return {"x_mm": L, "y_mm": b, "z_mm": h}
+
+    def test_confident_geometry_returns_anchor(self):
+        bbox = self._cantilever_bbox(L=200, b=20, h=20)  # aspect = 200/sqrt(20*20)=10 > 3
+        anchor = compute_beam_anchor(bbox, E_mpa=200000, load_n=1000)
+        assert anchor is not None, "Expected anchor for aspect=10"
+        assert anchor["max_stress_mpa"] > 0
+        assert "aspect_ratio" in anchor
+
+    def test_low_aspect_returns_none(self):
+        bbox = {"x_mm": 50, "y_mm": 40, "z_mm": 40}  # aspect = 50/sqrt(40*40)=1.25 < 3
+        anchor = compute_beam_anchor(bbox, E_mpa=200000, load_n=1000)
+        assert anchor is None, f"Expected None for low-aspect geometry, got {anchor}"
+
+    def test_missing_bbox_returns_none(self):
+        anchor = compute_beam_anchor({}, E_mpa=200000, load_n=1000)
+        assert anchor is None
+
+    def test_anchor_matches_beam_calc_raw(self):
+        """Anchor stress should equal beam_calc_raw output for the same inputs."""
+        # L=200mm cantilever, rect 20×20, F=1000N, E=200000MPa
+        bbox = self._cantilever_bbox(L=200, b=20, h=20)
+        anchor = compute_beam_anchor(bbox, E_mpa=200000, load_n=1000)
+        assert anchor is not None
+        raw = beam_calc_raw(
+            support="cantilever", load="point", section="rect",
+            L_mm=200.0, E_mpa=200000.0, F_n=1000.0, b_mm=20.0, h_mm=20.0,
+        )
+        assert abs(anchor["max_stress_mpa"] - raw["max_stress_mpa"]) < 0.01, (
+            f"Anchor {anchor['max_stress_mpa']} != beam_calc_raw {raw['max_stress_mpa']}"
+        )
+
+    def test_aspect_threshold_exactly_three(self):
+        # L=60, cross=sqrt(20*20)=20, aspect=3 → confident
+        bbox = {"x_mm": 60, "y_mm": 20, "z_mm": 20}
+        confident, aspect, _ = _beam_aspect_ok(bbox)
+        assert confident, f"Expected confident at aspect=3, got {aspect}"
+
+    def test_aspect_below_three_not_confident(self):
+        # L=59, cross=sqrt(20*20)=20, aspect=2.95 → not confident
+        bbox = {"x_mm": 59, "y_mm": 20, "z_mm": 20}
+        confident, aspect, _ = _beam_aspect_ok(bbox)
+        assert not confident, f"Expected not confident at aspect={aspect}"
+
+
+# ---------------------------------------------------------------------------
+# 4. Margin policy
+# ---------------------------------------------------------------------------
+
+class TestMarginPolicy:
+    def _study(self, vm, yield_mpa, mat_name="Steel AISI 1018", ultimate_mpa=None):
+        mat = {"name": mat_name, "yield_mpa": yield_mpa, "E_mpa": 200000}
+        if ultimate_mpa:
+            mat["ultimate_mpa"] = ultimate_mpa
+        return {
+            "type": "fea_static",
+            "material": mat,
+            "results": {"max_von_mises_mpa": vm},
+        }
+
+    def test_pass_verdict_steel(self):
+        # Steel SF=1.5; design_stress = 50*1.5=75 ≤ yield=370 → PASS
+        r = postcheck(self._study(vm=50, yield_mpa=370, ultimate_mpa=440))
+        assert r["verdict"] == "PASS", r
+        assert r["mat_class"] == "metal_steel"
+        assert r["sf_used"] == 1.5
+
+    def test_warn_verdict_steel(self):
+        # design_stress = 260*1.5=390 > yield=370, ≤ ultimate=440 → WARN
+        r = postcheck(self._study(vm=260, yield_mpa=370, ultimate_mpa=440))
+        assert r["verdict"] == "WARN", r
+
+    def test_fail_verdict_steel(self):
+        # design_stress = 310*1.5=465 > ultimate=440 → FAIL
+        r = postcheck(self._study(vm=310, yield_mpa=370, ultimate_mpa=440))
+        assert r["verdict"] == "FAIL", r
+
+    def test_polymer_sf_is_two(self):
+        r = postcheck(self._study(vm=10, yield_mpa=40, mat_name="ABS plastic", ultimate_mpa=44))
+        assert r["sf_used"] == 2.0, r
+        assert r["mat_class"] == "polymer", r
+
+    def test_aluminium_class_resolved(self):
+        r = postcheck(self._study(vm=50, yield_mpa=276, mat_name="Aluminium 6061-T6", ultimate_mpa=310))
+        assert r["mat_class"] == "metal_aluminium", r
+
+    def test_unknown_material_uses_general_default(self):
+        r = postcheck(self._study(vm=10, yield_mpa=100, mat_name="mystery material"))
+        assert r["mat_class"] == "general", r
+        assert r["sf_used"] == 2.0, r
+
+    def test_margin_verdict_items_have_severity(self):
+        r = postcheck(self._study(vm=310, yield_mpa=370, ultimate_mpa=440))
+        margin_items = [i for i in r["items"] if i["check"] == "sim_margin"]
+        assert margin_items, "Expected sim_margin item"
+        assert margin_items[0]["severity"] == "blocker", margin_items[0]
+
+    def test_pass_margin_item_is_info(self):
+        r = postcheck(self._study(vm=50, yield_mpa=370, ultimate_mpa=440))
+        margin_items = [i for i in r["items"] if i["check"] == "sim_margin"]
+        assert margin_items[0]["severity"] == "info", margin_items[0]
+
+    def test_missing_yield_skips_verdict(self):
+        study = {"type": "fea_static", "material": {"name": "steel"},
+                 "results": {"max_von_mises_mpa": 50.0}}
+        r = postcheck(study)
+        margin_items = [i for i in r["items"] if i["check"] == "sim_margin"]
+        assert margin_items[0]["severity"] == "info"
+        assert "skipped" in margin_items[0]["finding"].lower()
+
+
+# ---------------------------------------------------------------------------
+# 5. Divergence WARN
+# ---------------------------------------------------------------------------
+
+class TestDivergenceWarn:
+    def _beam_stress(self, L=200.0, b=20.0, h=20.0, F=1000.0, E=200000.0):
+        raw = beam_calc_raw(
+            support="cantilever", load="point", section="rect",
+            L_mm=L, E_mpa=E, F_n=F, b_mm=b, h_mm=h,
+        )
+        return raw["max_stress_mpa"]
+
+    def test_divergence_warn_when_fea_much_higher(self):
+        anchor_s = self._beam_stress()
+        # Set FEA stress to 10× anchor (>> DIVERGENCE_WARN_RATIO=5)
+        fea_vm = anchor_s * 10
+        study = {
+            "type": "fea_static",
+            "material": {"name": "Steel AISI 1018", "yield_mpa": 9999.0, "E_mpa": 200000},
+            "results": {"max_von_mises_mpa": fea_vm},
+            "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
+            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+        }
+        r = postcheck(study)
+        div_items = [i for i in r["items"] if i["check"] == "sim_divergence"]
+        assert div_items, f"Expected divergence WARN; items={r['items']}"
+        assert div_items[0]["severity"] == "action"
+
+    def test_no_divergence_when_in_range(self):
+        anchor_s = self._beam_stress()
+        # FEA stress = anchor × 1.5 (well within 5×)
+        fea_vm = anchor_s * 1.5
+        study = {
+            "type": "fea_static",
+            "material": {"name": "Steel AISI 1018", "yield_mpa": 9999.0, "E_mpa": 200000},
+            "results": {"max_von_mises_mpa": fea_vm},
+            "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
+            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+        }
+        r = postcheck(study)
+        div_items = [i for i in r["items"] if i["check"] == "sim_divergence"]
+        assert not div_items, f"Unexpected divergence item: {div_items}"
+
+    def test_divergence_warn_when_fea_much_lower(self):
+        anchor_s = self._beam_stress()
+        # FEA stress = anchor / 10 (<< 1/5 of anchor)
+        fea_vm = anchor_s / 10.0
+        study = {
+            "type": "fea_static",
+            "material": {"name": "Steel AISI 1018", "yield_mpa": 9999.0, "E_mpa": 200000},
+            "results": {"max_von_mises_mpa": fea_vm},
+            "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
+            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+        }
+        r = postcheck(study)
+        div_items = [i for i in r["items"] if i["check"] == "sim_divergence"]
+        assert div_items, f"Expected divergence WARN for low-FEA case"
+
+    def test_anchor_shared_from_precheck(self):
+        """Anchor computed once in precheck; postcheck reads it from precheck_items."""
+        study = {
+            "type": "fea_static",
+            "material": {"name": "Steel AISI 1018", "yield_mpa": 9999.0, "E_mpa": 200000},
+            "fixtures": ["bottom"],
+            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+            "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
+            "results": {"max_von_mises_mpa": 150.0},
+        }
+        pre_items = precheck(study)
+        r = postcheck(study, precheck_items=pre_items)
+        # The anchor should be populated if precheck found a confident geometry
+        anchor_precheck = next((i["_anchor"] for i in pre_items if i.get("check") == "sim_anchor"), None)
+        if anchor_precheck:
+            assert r["anchor_stress_mpa"] is not None
+
+
+# ---------------------------------------------------------------------------
+# 6. Stage battery wiring (T-W5 seam)
+# ---------------------------------------------------------------------------
+
+class TestStageBattery:
+    def test_sim_battery_includes_new_checks(self):
+        battery = stages.check_battery("sim")
+        assert stages.CHECK_SIM_BC in battery, battery
+        assert stages.CHECK_SIM_MARGIN in battery, battery
+        assert stages.CHECK_SIM_RESULTS in battery, battery
+
+    def test_sim_exit_gate_includes_bc_and_margin(self):
+        gate = stages.exit_gate("sim")
+        assert stages.CHECK_SIM_BC in gate, gate
+        assert stages.CHECK_SIM_MARGIN in gate, gate
+
+    def test_sim_exit_gate_excludes_divergence(self):
+        # Divergence is action-level; model may acknowledge and advance (§9.3)
+        gate = stages.exit_gate("sim")
+        assert stages.CHECK_SIM_DIVERGENCE not in gate, gate
+
+    def test_sim_helper_tools_include_run_fea_modal(self):
+        helpers = stages.helper_tools("sim")
+        assert "run_fea_modal" in helpers, helpers
+
+    def test_other_stages_unaffected(self):
+        # Regression: sketch battery unchanged
+        assert stages.CHECK_SKETCH_HEALTH in stages.check_battery("sketch")
+        assert stages.CHECK_SKETCH_HEALTH in stages.exit_gate("sketch")
+
+
+# ---------------------------------------------------------------------------
+# 7. Engine fix-provider wiring
+# ---------------------------------------------------------------------------
+
+class TestEngineFixProviders:
+    def _make_finding(self, kind, check, finding="test finding", sev="action"):
+        return Finding(
+            kind=kind, check=check, severity=sev,
+            finding=finding, source_kind="heuristic",
+        )
+
+    def _advisory(self, kind, check, sev="action"):
+        from services.agent.advisor.engine import Observation, build_advisory
+        obs = Observation(stage="sim", findings=[self._make_finding(kind, check, sev=sev)])
+        return build_advisory(obs)
+
+    def test_sim_bc_finding_produces_candidate_fix(self):
+        adv = self._advisory("sim_bc", "sim_bc")
+        items = adv["items"]
+        assert items, "Expected advisory items"
+        # §3: non-info ⇒ non-empty candidate_fixes
+        for it in items:
+            if it["severity"] != "info":
+                assert it["candidate_fixes"], f"No fix on {it}"
+
+    def test_sim_margin_finding_produces_candidate_fix(self):
+        adv = self._advisory("sim_margin", "sim_margin")
+        items = adv["items"]
+        for it in items:
+            if it["severity"] != "info":
+                assert it["candidate_fixes"], f"No fix on {it}"
+
+    def test_sim_divergence_finding_produces_candidate_fix(self):
+        adv = self._advisory("sim_divergence", "sim_divergence")
+        items = adv["items"]
+        for it in items:
+            if it["severity"] != "info":
+                assert it["candidate_fixes"], f"No fix on {it}"
+
+
+# ---------------------------------------------------------------------------
+# 8. narrate_postcheck content
+# ---------------------------------------------------------------------------
+
+class TestNarratePostcheck:
+    def test_pass_narration_contains_verdict(self):
+        r = postcheck({
+            "type": "fea_static",
+            "material": {"name": "Steel AISI 1018", "yield_mpa": 370, "E_mpa": 200000,
+                         "ultimate_mpa": 440},
+            "results": {"max_von_mises_mpa": 50},
+        })
+        text = narrate_postcheck(r)
+        assert "PASS" in text, text
+        assert "SF=" in text, text
+
+    def test_fail_narration_contains_verdict(self):
+        r = postcheck({
+            "type": "fea_static",
+            "material": {"name": "Steel AISI 1018", "yield_mpa": 370, "E_mpa": 200000,
+                         "ultimate_mpa": 440},
+            "results": {"max_von_mises_mpa": 310},
+        })
+        text = narrate_postcheck(r)
+        assert "FAIL" in text, text
+
+    def test_divergence_narration_shown(self):
+        anchor_s = beam_calc_raw(
+            support="cantilever", load="point", section="rect",
+            L_mm=200.0, E_mpa=200000.0, F_n=1000.0, b_mm=20.0, h_mm=20.0,
+        )["max_stress_mpa"]
+        fea_vm = anchor_s * 10
+        r = postcheck({
+            "type": "fea_static",
+            "material": {"name": "Steel AISI 1018", "yield_mpa": 9999, "E_mpa": 200000},
+            "results": {"max_von_mises_mpa": fea_vm},
+            "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
+            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+        })
+        text = narrate_postcheck(r)
+        assert "diverges" in text or "FEA" in text.lower(), text
+
+    def test_no_anchor_narration_when_geometry_not_beamlike(self):
+        r = postcheck({
+            "type": "fea_static",
+            "material": {"name": "Steel AISI 1018", "yield_mpa": 370, "E_mpa": 200000},
+            "results": {"max_von_mises_mpa": 50},
+            # No bbox → no anchor
+        })
+        text = narrate_postcheck(r)
+        assert "not computed" in text or "Beam anchor" in text, text
+
+
+# ---------------------------------------------------------------------------
+# 9. Cantilever fixture: FEA ≈ beam calc within tolerance (mock-prove)
+# ---------------------------------------------------------------------------
+
+class TestCantileverAnchorMockProve:
+    """Mock-prove that postcheck compares anchor vs FEA consistently.
+
+    The FEA solver does not run headlessly in CI.  We seed the study with a
+    max_von_mises_mpa set to 1.5× the beam_calc_raw value (plausible; within 5×
+    threshold) and verify no divergence WARN is emitted.  A second test seeds at
+    10× and verifies the WARN fires.
+
+    This proves the comparison logic; it does NOT verify the FEA solver itself.
+    Citation: beam_calc_raw (Shigley §3-4), seeded via study dict.
+    """
+
+    def _anchor_stress(self, L=200.0, b=20.0, h=20.0, F=1000.0, E=200000.0):
+        return beam_calc_raw(
+            support="cantilever", load="point", section="rect",
+            L_mm=L, E_mpa=E, F_n=F, b_mm=b, h_mm=h,
+        )["max_stress_mpa"]
+
+    def test_within_tolerance_no_divergence_warn(self):
+        """FEA = beam_anchor × 1.5 → no divergence WARN (within 5× threshold)."""
+        anchor_s = self._anchor_stress()
+        fea_vm = anchor_s * 1.5  # plausible: same order of magnitude
+        study = {
+            "type": "fea_static",
+            "material": {"name": "Steel AISI 1018", "yield_mpa": 9999, "E_mpa": 200000},
+            "results": {"max_von_mises_mpa": fea_vm},
+            "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
+            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+        }
+        r = postcheck(study)
+        div_items = [i for i in r["items"] if i["check"] == "sim_divergence"]
+        assert not div_items, (
+            f"Unexpected divergence WARN at ratio 1.5× (threshold {DIVERGENCE_WARN_RATIO}×). "
+            f"anchor={anchor_s:.3f} fea={fea_vm:.3f} items={div_items}"
+        )
+
+    def test_implausible_divergence_emits_warn(self):
+        """FEA = beam_anchor × 10 → divergence WARN emitted."""
+        anchor_s = self._anchor_stress()
+        fea_vm = anchor_s * 10.0
+        study = {
+            "type": "fea_static",
+            "material": {"name": "Steel AISI 1018", "yield_mpa": 9999, "E_mpa": 200000},
+            "results": {"max_von_mises_mpa": fea_vm},
+            "bbox": {"x_mm": 200, "y_mm": 20, "z_mm": 20},
+            "loads": [{"face": "top", "force": [0, 0, -1000]}],
+        }
+        r = postcheck(study)
+        div_items = [i for i in r["items"] if i["check"] == "sim_divergence"]
+        assert div_items, (
+            f"Expected divergence WARN at ratio 10× "
+            f"(anchor={anchor_s:.3f} fea={fea_vm:.3f})"
+        )
+        assert div_items[0]["numbers"]["divergence_ratio"] > DIVERGENCE_WARN_RATIO

@@ -862,6 +862,18 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
             if isinstance(v, (int, float)):
                 lines.append(f'  {k}: {v}')
 
+    # T-W9: additive sim-advisor verdict (margin policy + beam anchor + suggestions).
+    # Only run for fea_static studies (beam-anchor comparison only meaningful for static).
+    if stype == "fea_static":
+        try:
+            from services.agent.advisor.sim_advisor import postcheck, narrate_postcheck  # noqa: PLC0415
+            pc = postcheck(study)
+            verdict_text = narrate_postcheck(pc)
+            if verdict_text:
+                lines.append(verdict_text)
+        except Exception:  # noqa: BLE001
+            pass  # advisor postcheck is advisory-only; never crash describe_results
+
     lines.append('\n(Source: sim_study_list — numbers narrated from the stored study, '
                  'never recomputed)')
     return _dumps({"ok": True, "text": "\n".join(lines)})

@@ -1,17 +1,25 @@
 """``datasheet_fetch(source)`` — PDF -> markdown (text + best-effort table layout) for
-datasheets. Contract ``contracts/research_tools.md`` §1/§3.
+datasheets. Contract ``contracts/research_tools.md`` §1/§3/§9.
 
 Pillar 8 legal (CONTRIBUTING.md, ``contracts/licenses.md``): the PDF extractor must be
 **MIT/permissive** — ``pdfminer.six`` (MIT) is used when present. **PyMuPDF / pymupdf4llm
 are AGPL and are never imported in-process here.** The dep is *optional and
 feature-detected*: with no PDF tool installed the helper returns the §6 degradation shape
 (``reason:"no_pdf_tool"``) — CI stays green with zero new hard dependencies.
+
+T-X4: on a 401/403 from a plain fetch, retries once via T-X1's authenticated browser
+session (``services/browser``) IF a matching site profile already exists — never
+triggers a login from this path. See ``_try_browser_fallback`` below and
+``contracts/research_tools.md`` §9.
 """
 from __future__ import annotations
 
 import io
 import os
+import tempfile
+from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from .common import HIGH, MEDIUM, envelope, fail, is_offline, now_ts
 
@@ -46,28 +54,70 @@ def _to_markdown(text: str) -> str:
     return md[:_MAX_MD]
 
 
-def _read_bytes(source: str) -> tuple[Optional[bytes], Optional[dict]]:
-    """Load PDF bytes from a local path or URL. Returns ``(data, None)`` or
-    ``(None, degradation)``."""
+def _try_browser_fallback(url: str) -> tuple[Optional[bytes], Optional[str]]:
+    """On a 401/403 from a plain fetch, retry ``url`` via T-X1's authenticated browser
+    session — ONLY when a matching site profile already exists (never triggers a login
+    from this path; a missing profile just falls through to the existing degradation).
+
+    ``services.browser`` is an optional peer package (Playwright is one of its own lazy
+    runtime deps) — any import failure here degrades to "no fallback available", same
+    posture as the ``_load_extractor`` optional-dependency check above.
+
+    Returns ``(data, session_profile_used)`` on success, or ``(None, None)``.
+    """
+    try:
+        from services.browser import profiles as _profiles
+        from services.browser.session import browser_download
+    except Exception:  # noqa: BLE001 - services.browser / playwright not available
+        return None, None
+
+    site = urlparse(url).netloc
+    if not site or not _profiles.has_profile(site):
+        return None, None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "datasheet.pdf"
+        result = browser_download(url, site, dest)
+        if not result.get("ok"):
+            return None, None
+        try:
+            data = dest.read_bytes()
+        except OSError:
+            return None, None
+        return data, result.get("session_profile_used")
+
+
+def _read_bytes(source: str) -> tuple[Optional[bytes], Optional[dict], Optional[str]]:
+    """Load PDF bytes from a local path or URL.
+
+    Returns ``(data, None, session_profile_used)`` on success or ``(None, degradation, None)``
+    on failure. ``session_profile_used`` is non-``None`` only when the T-X4 authenticated-
+    browser fallback served the bytes (additive; ``None`` for the plain-fetch and local-file
+    paths, unchanged from before this task).
+    """
     s = str(source).strip()
     if s.lower().startswith(("http://", "https://")):
         if is_offline():
-            return None, fail("offline", "Offline mode blocks fetching a remote PDF; pass a local path.")
+            return None, fail("offline", "Offline mode blocks fetching a remote PDF; pass a local path."), None
         try:
             import httpx  # BSD, already a dep
             r = httpx.get(s, follow_redirects=True, timeout=30.0,
                           headers={"User-Agent": "AI-CAD-research/1.0"})
+            if r.status_code in (401, 403):
+                data, session_profile_used = _try_browser_fallback(s)
+                if data is not None:
+                    return data, None, session_profile_used
             r.raise_for_status()
-            return r.content, None
+            return r.content, None, None
         except Exception as exc:  # noqa: BLE001
-            return None, fail("network", f"Could not fetch {s!r}: {exc}.")
+            return None, fail("network", f"Could not fetch {s!r}: {exc}."), None
     if not os.path.isfile(s):
-        return None, fail("bad_url", f"No such PDF file: {s!r} (pass a local path or http(s) URL).")
+        return None, fail("bad_url", f"No such PDF file: {s!r} (pass a local path or http(s) URL)."), None
     try:
         with open(s, "rb") as fh:
-            return fh.read(), None
+            return fh.read(), None, None
     except OSError as exc:
-        return None, fail("bad_url", f"Could not read {s!r}: {exc}.")
+        return None, fail("bad_url", f"Could not read {s!r}: {exc}."), None
 
 
 def datasheet_fetch(source: str, tier: str = "datasheet") -> dict:
@@ -84,7 +134,7 @@ def datasheet_fetch(source: str, tier: str = "datasheet") -> dict:
                     "(pip install pdfminer.six). PyMuPDF/pymupdf4llm are AGPL and excluded.")
     extract_text, tool = extractor
 
-    data, err = _read_bytes(source)
+    data, err, session_profile_used = _read_bytes(source)
     if err is not None:
         return err
 
@@ -111,4 +161,5 @@ def datasheet_fetch(source: str, tier: str = "datasheet") -> dict:
         content=md,
         extractor=tool,
         tier=tier,
+        session_profile_used=session_profile_used,
     )

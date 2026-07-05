@@ -762,3 +762,18 @@ class TestMissionNodeRequests:
         graph = build_mission_graph(self._manifest(), graph_id="t", org_layer=True)
         for n in graph["nodes"]:
             assert n["inputs"].get("request"), f"{n['id']} has no request"
+
+def test_role_policy_is_scoped_to_the_turn():
+    """T-W30 gate-sweep regression: applying a role card's allowlist must NOT
+    leak into the process-global tool_registry after the node turn returns
+    (it broke ~78 unrelated cad/gsl tool tests in the combined sweep)."""
+    from mcp_server import tool_registry as reg
+    reg.reset_policy()
+    assert reg.is_allowed("export_part")  # default: everything allowed
+    node = {"id": "n1", "type": "design", "name": "BUILD DL1",
+            "inputs": {"role": "feature_modeler"}}
+    nr.run(node, cp.assemble(node, {}),
+           agent_fn=lambda req, pack: _fake_run("confirmed", True))
+    # export_part is NOT in feature_modeler's allowlist — if the policy leaked,
+    # this dispatch-time check now refuses it.
+    assert reg.is_allowed("export_part"), "role tool policy leaked past the node turn"

@@ -229,7 +229,14 @@ def run(
     # with the default prompt / no extra tool scoping), matching the ledger seam
     # discipline elsewhere in this pipeline.
     role_card = _resolve_role_card(node)
+    restore_tool_policy = None
     if role_card is not None:
+        # T-W30: the registry policy is PROCESS-GLOBAL — scope it to THIS node's
+        # turn (snapshot now, restore after the agent returns). Leaving it set
+        # leaked one node's role allowlist into every later dispatch in the
+        # process (caught as ~78 cad_tools/gsl_tools refusals in the gate sweep
+        # once mission nodes started resolving their cards).
+        restore_tool_policy = _snapshot_tool_policy()
         _apply_role_tool_policy(role_card)
         context_pack = dict(context_pack)
         context_pack["role_id"] = role_card.id
@@ -280,6 +287,10 @@ def run(
             "doc_id": node_inputs.get("doc_id"),
         }
         return VERDICT_ESCALATE, output_state
+    finally:
+        # Restore the pre-turn registry policy (role scoping is per-turn).
+        if restore_tool_policy is not None:
+            restore_tool_policy()
 
     elapsed_ms = (time.monotonic() - t0) * 1000.0
 
@@ -392,6 +403,33 @@ def _apply_role_tool_policy(role_card: Any) -> None:
         role_card.apply_tool_policy(reg)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _snapshot_tool_policy() -> "Optional[Callable[[], None]]":
+    """Capture the tool_registry's current policy; return a restore callable.
+
+    T-W30: ``set_policy`` mutates module globals, so a role's allowlist applied
+    for one node turn would otherwise leak into the whole process (every later
+    dispatch, and every later test in a combined sweep). Reads the registry's
+    private fields deliberately — there is no public getter — with the same
+    best-effort discipline as ``_apply_role_tool_policy``."""
+    try:
+        from mcp_server import tool_registry as reg  # noqa: PLC0415
+        prev_allow = set(reg._ACTIVE_ALLOW) if reg._ACTIVE_ALLOW is not None else None
+        prev_deny = set(reg._ACTIVE_DENY_RISK) if reg._ACTIVE_DENY_RISK is not None else None
+        prev_set = bool(reg._POLICY_SET)
+
+        def _restore() -> None:
+            try:
+                if prev_set:
+                    reg.set_policy(allow=prev_allow, deny_risk=prev_deny)
+                else:
+                    reg.reset_policy()
+            except Exception:  # noqa: BLE001
+                pass
+        return _restore
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------------------

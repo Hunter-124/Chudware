@@ -43,6 +43,9 @@ struct DagNodeRow {
     std::string outputSummary;  // ≤120 chars from dag.node.done
     std::string errorText;      // from dag.node.failed
     bool expanded = false;      // whether the event sub-list is open in the UI
+    // T-DP18: per-node ETA for the DAG widget.  Empty = not-yet-estimated.
+    // Format: "~1m 30s" / "~30s – 2m" / "?" (set from mission.eta events).
+    std::string etaNodeLabel;
 };
 
 // -------------------------------------------------------------------------
@@ -116,6 +119,14 @@ struct DagRunView {
     SteeringState steering;
 
     bool hasRun = false;        // false = empty state (no run loaded/started)
+
+    // T-DP18: whole-mission ETA, mirrored into AppState.agent each frame.
+    // Set by "mission.eta" events from the backend estimator.
+    // etaSeconds < 0 = no estimate / all-unknown.
+    std::string etaLabel;       // pre-formatted for status-bar chip
+    float etaSeconds = -1.f;
+    float etaLowS    = -1.f;
+    float etaHighS   = -1.f;
 };
 
 // -------------------------------------------------------------------------

@@ -39,4 +39,9 @@ bool* missionControlPanelOpen();
 // without a live DAG round-trip.
 void seedMissionControlPanelFromJsonl(const std::string& jsonl_text);
 
+// T-DP18: mirror whole-mission ETA from the panel view-model into AppState so
+// the status-bar chip updates every frame even when Mission Control is closed.
+// Call unconditionally each frame (cheap string/float copy).
+void syncMissionEtaToAppState(app::AppState& s);
+
 } // namespace ui

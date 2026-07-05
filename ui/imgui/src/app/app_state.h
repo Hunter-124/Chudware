@@ -71,6 +71,16 @@ struct AgentThread {
     // Real token counts from the last completed agent turn (0 = no data yet).
     int lastInputTokens  = 0;
     int lastOutputTokens = 0;
+
+    // T-DP18: live mission ETA from the backend estimator.
+    // etaLabel is pre-formatted for the status-bar chip (e.g. "ETA ~2m 30s").
+    // etaSeconds < 0 means no estimate available (no history / all unknown).
+    // etaLowS / etaHighS bound the uncertainty range; both < 0 when unknown.
+    // Written by the agent service loop; read by the render thread (status_bar.cpp).
+    std::string etaLabel;        // "ETA ~Xs" / "ETA Xs – Ys" / "ETA unknown" / ""
+    float       etaSeconds = -1.f;
+    float       etaLowS    = -1.f;
+    float       etaHighS   = -1.f;
 };
 
 struct TreeNode {

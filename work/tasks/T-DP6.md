@@ -38,3 +38,6 @@ calculator/data/context) and AFTER (diagnose, target). Interface components carr
 - [ ] Pre-op advisory injection wired via aicad.trigger; post-op diagnosis feeds the fixer loop
       (bounded, not endless).
 - [ ] gate.sh PASS; graphify update.
+
+## Progress log
+- 2026-07-05 22:11 UTC [sonnet-rust1] 36 new tests all pass (256 total in advisor suite, zero regressions). 4 checkers upgraded: interference (axis+depth from real kernel bbox), wall_thickness, DFM, interface_fitment. Pre-op triggers appended (append-only). Pushed task/T-DP6-diagnostic-advisors. Awaiting gate.sh result.

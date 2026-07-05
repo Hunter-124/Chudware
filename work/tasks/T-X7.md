@@ -31,21 +31,29 @@ this task adds the commerce-vendor adapters:
 
 ## Definition of done
 
-- [ ] Adapter per vendor above following the T-X2 AdapterBase contract (rate-limited,
-      profile-scoped, terms-wall detection, NEVER auto-accepting agreements, NEVER
-      storing credentials — cookies live only in Playwright profiles).
-- [ ] Registered as part_search federation providers (T-X3 seam) with provider tags so
-      the parts panel can facet by vendor; degraded/CI-safe when profiles are absent
-      (same skip discipline as GrabCAD/TraceParts adapters).
-- [ ] McMaster STEP download lands through the standard import_part path with source
-      metadata (vendor, SKU, URL, fetched-at) on the part record for BOM/sourcing.
-- [ ] Structured price/availability records feed bom_price's approved-provider seam —
-      numbers copied from vendor pages with provenance URL, never LLM-generated.
-- [ ] docs/SOURCING_VENDOR_SURVEY.md — manufacturing-service shortlist with per-service
-      notes (quote flow, upload formats, auth walls, ToS flags for license_debt.md).
-- [ ] Selector fixtures + unit tests (mocked HTML) green in gate venv; live-session
-      integration tests gated behind T-X6's env flag; license_debt.md rows appended per
-      vendor as needed.
+- [x] Adapter per vendor (8d6d4483): amazon/mcmaster/jlcpcb/pcbway.py on the T-X2
+      contract — rate-limit + absent-profile skip inherited from session.py (adapters only
+      call browser_fetch/browser_download), terms-wall detection (mcmaster/jlcpcb/pcbway),
+      Amazon bot-challenge → login_required (never bypass), NEVER auto-accept ToS, NEVER
+      store creds.
+- [x] Registered as part_search federation providers (8d6d4483): the __init__.py import
+      line was extended; all_adapters()→hub.py auto-registers each as `browser_<key>`; the
+      absent-profile CI-degraded skip is inherited from session.py (verified by the existing
+      test_x3_browser_catalog discipline). Vendor facet tag = provider_id `browser_<key>`.
+- [ ] McMaster STEP → import_part with source metadata — PARTIAL: acquire() returns
+      provenance + `sku`; the T-X3 place.py import_file path already carries the record's
+      provenance/params. REMAINING: thread `sku` from the acquire envelope into the
+      BrowserCatalogAdapter part-record `params` so vendor/SKU/URL/fetched-at all land on
+      the imported part. See HANDOFF.
+- [ ] Structured price/availability → bom_price approved-provider seam — NOT DONE (the
+      main remaining work): browser adapters don't auto-feed bom_price (API-key chain). See
+      HANDOFF for the two options + anchors. Fail-closed, provenance-URL, never generated.
+- [x] docs/SOURCING_VENDOR_SURVEY.md (9be7a5ed) — 6-service shortlist (Xometry, Protolabs
+      Network, Craftcloud, SendCutSend, JLC3DP, OSH Park) ranked by quote-automation +
+      adapter difficulty, per-service notes, build-order rec for T-X9.
+- [x] Selector fixtures + unit tests green (8d6d4483): mocked-HTML per-vendor tests, 45
+      passed (repo .venv — mcp-venv path absent on this Windows box; live integration stays
+      T-X6-gated). license_debt.md rows 5-8 appended (43775595).
 
 ## Driver notes
 
@@ -58,3 +66,48 @@ this task adds the commerce-vendor adapters:
 
 ## Progress log
 - 2026-07-05 19:35 UTC [opus-wynn] Claimed + started (opus-wynn, Windows). Branch task/T-X7-vendor-adapters-wave2 off current master. Orienting via recon of the T-X2 AdapterBase contract (services/browser/adapters/) + grabcad/traceparts reference adapters + T-X3 part_search federation seam + bom_price approved-provider seam + import_part CAD path. Plan: mirror the smallest reference adapter for each of Amazon/McMaster/JLCPCB/PCBWay with the same guardrails (rate-limited, profile-scoped, terms-wall + login_required/challenge surfacing, NEVER auto-accept ToS, NEVER store creds, never bypass captcha), register as federation providers with CI-degraded skip when profiles absent, + docs/SOURCING_VENDOR_SURVEY.md. NOTE: unrelated Discord-notifier WIP (notify_discord.py + discord_bot.py + requirements-discord-bot.txt) is present uncommitted in this checkout's working tree from a prior session â€” NOT mine, NOT part of T-X7; I am preserving it untouched and will never stage it in T-X7 commits.
+
+## HANDOFF (opus-wynn, 2026-07-05) — 2 DoD items remain
+
+**State:** branch `task/T-X7-vendor-adapters-wave2` pushed. DONE + committed: 4 adapters +
+tests (8d6d4483, 45 passed), survey doc (9be7a5ed), license_debt rows 5-8 (43775595),
+federation registration (automatic). Two integration items remain; both are small-to-medium
+and well-scoped by the recon anchors below. `status` left at `doing` — do NOT flip to review
+until these land + the Linux gate passes.
+
+**Env caveats (same as T-G25):** full `scripts/gate.sh` can't run on this Windows box
+(python3 app-alias, system-OCCT, Linux ctest) and `graphify update .` — graphify CLI isn't
+provisioned here. Run both on the Linux/CI side at merge. The adapter unit tests DO run:
+`./.venv/Scripts/python.exe -m pytest services/browser/adapters/test_adapters.py -q` (45 pass).
+
+**Landmine:** `work/tools/notify_discord.py` (+ `discord_bot.py`, `requirements-discord-bot.txt`)
+are unrelated Discord-notifier WIP left uncommitted in this checkout by a prior session. NOT
+part of T-X7 — never stage them. Stage only your specific files each commit.
+
+### Item 3 — McMaster SKU → part-record params (small)
+`mcmaster.py acquire()` already returns `provenance_envelope(..., sku=<part#>)`. The T-X3
+placement path (`engine_oracle/parts_hub/place.py`, `import_file` kind) already carries the
+record's provenance/params to the imported part. REMAINING: in
+`services/browser/adapters/parts_provider.py` `BrowserCatalogAdapter.get()` (~lines 96-110,
+where `provenance`/`params:{site,url}` are attached), also propagate the acquire envelope's
+`sku` (and any price) into `params` so vendor/SKU/URL/fetched-at all land on the part. Add a
+test in `parts_provider`'s test alongside the existing catalog tests. (parts_provider.py is
+shared T-X3 code — additive fields only, don't rename.)
+
+### Item 4 — Structured price → bom_price approved-provider seam (main remaining work)
+`bom_price` (`services/mcp/sourcing_tools.py:36-52`) → `engine.bom.resolve_prices`
+(`engine/bom.py:286-311`) → `ProviderChain([Nexar,DigiKey,Mouser])`
+(`engine_oracle/parts_providers.py:471-473`) — an API-key system, NOT the browser adapters.
+Two viable ways to wire the T-X7 browser vendors' parsed price/stock in (pick one, note the
+choice; escalate to advisor via work/questions/T-X7.md if unsure):
+  (a) A thin `PartProvider` subclass in `parts_providers.py` whose `fetch(mpn)` delegates to a
+      browser adapter's cached search/acquire result, returning `dataclasses.asdict(VendorPart)`
+      with the real `product_url` provenance — and raising `ProviderError` (fail-closed) on a
+      miss, never guessing (match the existing stub providers at parts_providers.py:150-213).
+      Register it in the chain behind the API providers.
+  (b) Populate `engine.vendor_parts.VendorPart` (unit_price/price_breaks/stock/moq/lead_time
+      + provenance URL) from the adapter's parsed page and index it so `bom.rollup`'s
+      vendor_lookup picks it up.
+HARD CONSTRAINT (bom.py:307, parts_providers.py:6-7): every number is copied literally from
+the parsed vendor page with a provenance URL — NEVER LLM-generated; a miss yields `None`/
+`ProviderError`, never a guessed price. Add mocked-HTML → price-record unit tests.

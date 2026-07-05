@@ -33,9 +33,9 @@ Design notes locked with the advisor:
     schemas live as prose examples in the contract. The GBNF emitter treats an
     unresolved ``$ref`` as an opaque JSON object node (permissive); it never crashes.
   * ``delegate`` is now a real registered tool (T-W14 landed,
-    services/mcp/delegation_tools.py). ``workspace_status`` and the org-layer tools
-    (channel_send, request_resolve, council_convene) remain feature-flagged until
-    their sibling W tasks land.
+    services/mcp/delegation_tools.py). ``workspace_status`` is registered (T-W16).
+    The org-layer tools (channel_send, request_resolve, council_convene, request_raise)
+    are now registered via services/mcp/org_tools.py (T-W22 landed).
 """
 from __future__ import annotations
 
@@ -71,8 +71,10 @@ MAX_TOOLS_PER_ROLE = 14
 # (services/mcp/delegation_tools.py registers it in the catalog).
 FEATURE_FLAGGED_TOOLS = frozenset({
     # delegate (T-W14) and workspace_status (T-W16) are registered now.
-    # org layer (land with T-W22/T-W23)
-    "channel_send", "request_resolve", "council_convene",
+    # org layer tools (channel_send, request_resolve, council_convene) landed with
+    # T-W22 (services/mcp/org_tools.py registers them in the catalog).
+    # request_raise is also registered; it is not in department_manager's allowlist
+    # but workers call it, so it must resolve.
 })
 
 _ROLES_DIR = Path(__file__).resolve().parent / "roles"

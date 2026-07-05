@@ -1,6 +1,6 @@
 # T-BL21 — questions / escalations
 
-## Q1 (open) — canonical HSS `section_name` grammar: mm vs. the imperial catalog
+## Q1 (resolved — see A1, foreman 2026-07-05) — canonical HSS `section_name` grammar: mm vs. the imperial catalog
 
 Context: `brep.py`'s new hollow-section parser (RHS/HSS/CHS/PIPE) is mm-based, matching every
 other form in `section_profile` (`WxH`, `I HxBxTWxTF`). But the codebase's own *existing* HSS

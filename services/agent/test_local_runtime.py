@@ -422,3 +422,50 @@ class TestLiveSmoke(unittest.TestCase):
         tier = detect_tier(n_ctx)
         assert tier in ("local-24k", "local-48k", "mid", "frontier")
         print(f"\nLIVE: n_ctx={n_ctx} → tier={tier}")  # noqa: T201
+
+
+# --------------------------------------------------------------------------- T-W29
+# Backend-selection seam + extras-guarded transformers backend.
+# These run in the GATE venv (no torch) and must stay green there: the point is
+# that the optional backend degrades HONESTLY, not that torch is installed.
+
+
+class TestBackendSeam(unittest.TestCase):
+    def test_select_backend_default_llamacpp(self) -> None:
+        from services.agent.local_runtime import select_backend
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AICAD_LOCAL_BACKEND", None)
+            assert select_backend() == "llamacpp"
+
+    def test_select_backend_env_override(self) -> None:
+        from services.agent.local_runtime import select_backend
+        with patch.dict(os.environ, {"AICAD_LOCAL_BACKEND": "transformers"}):
+            assert select_backend() == "transformers"
+
+    def test_select_backend_cfg(self) -> None:
+        from services.agent.local_runtime import select_backend
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AICAD_LOCAL_BACKEND", None)
+            assert select_backend({"local_backend": "transformers"}) == "transformers"
+
+    def test_select_backend_rejects_unknown(self) -> None:
+        from services.agent.local_runtime import LocalRuntimeError, select_backend
+        with patch.dict(os.environ, {"AICAD_LOCAL_BACKEND": "bogus"}):
+            with pytest.raises(LocalRuntimeError, match="unknown local backend"):
+                select_backend()
+
+    def test_transformers_available_never_raises(self) -> None:
+        # Must be callable and return a bool even with no torch (gate venv).
+        from services.agent.local_runtime import transformers_available
+        assert isinstance(transformers_available(), bool)
+
+    def test_transformers_backend_honest_skip_without_extras(self) -> None:
+        # In the gate venv torch is absent → constructing must raise
+        # BackendUnavailable, NOT crash at import time.
+        from services.agent.local_runtime import (
+            BackendUnavailable, TransformersBackend, transformers_available,
+        )
+        if transformers_available():
+            pytest.skip("torch/transformers present — honest-skip path not exercised")
+        with pytest.raises(BackendUnavailable, match="separate venv|SEPARATE venv"):
+            TransformersBackend("any/model")

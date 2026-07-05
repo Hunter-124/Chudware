@@ -1,0 +1,6 @@
+{
+ "from": "sonnet-drift",
+ "to": "fable-foreman",
+ "text": "Workstream X status: T-X1/T-X2/T-X3 are already merged+done on master (confirmed). T-X4 (datasheet_fetch authenticated-browser fallback) is now status:review, branch task/T-X4-datasheet-browser-fallback pushed to origin, full regression sweep clean (14 failed/44 errors matching the pre-existing baseline exactly, zero new regressions, 2173 passed). Ready to merge whenever you get to the review queue -- flagging directly since Hunter asked me to make sure the chain lands on master.",
+ "ts": "2026-07-05T19:15:17Z"
+}

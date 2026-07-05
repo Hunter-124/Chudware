@@ -352,6 +352,110 @@ def register_cam_tools(mcp: FastMCP) -> None:
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
+    # ------------------------------------------------------------------ T-W6 feeds/speeds tools
+
+    @mcp.tool()
+    def feeds_speeds(
+        material: str,
+        tool_type: str,
+        tool_dia: float,
+        operation: str,
+        max_rpm: Optional[float] = None,
+        min_rpm: Optional[float] = None,
+        max_feed: Optional[float] = None,
+        min_feed: Optional[float] = None,
+    ) -> str:
+        """Compute table-driven rpm / feed / stepdown / stepover envelope for a
+        material + tool type + operation (aicad.calc/1, contracts/advisor.md §7).
+
+        Returns a recommended midpoint and the full [min, max] envelope so the
+        advisory engine can range-check caller-supplied params. Use
+        ``cam_check_feeds_envelope`` to get an advisory item when params are outside
+        this range.
+
+        Parameters
+        ----------
+        material : str
+            Material id or alias — any id from ``cam_materials()`` or the simulation
+            materials list (``alu_6061``, ``steel_1018``, ``ti_6al4v``, ``abs``,
+            ``pla``, ``nylon_pa12``, ``cast_iron_gray``, ``inconel_718``, …).
+        tool_type : str
+            One of: ``endmill_flat``, ``endmill_ball``, ``drill``, ``tap``,
+            ``face_mill``.
+        tool_dia : float
+            Tool diameter in mm.
+        operation : str
+            One of: ``roughing``, ``finishing``, ``slotting``, ``drilling``.
+        max_rpm, min_rpm, max_feed, min_feed : float, optional
+            Machine envelope overrides (mm/min for feeds, RPM for speed). Unset fields
+            use conservative benchtop-VMC defaults (max_rpm=15000, max_feed=5000).
+        """
+        from engine_oracle.research import machining as _m  # noqa: PLC0415
+        lim: dict = {}
+        if max_rpm  is not None: lim["max_rpm"]  = max_rpm
+        if min_rpm  is not None: lim["min_rpm"]  = min_rpm
+        if max_feed is not None: lim["max_feed"] = max_feed
+        if min_feed is not None: lim["min_feed"] = min_feed
+        mat, note = _resolve_cam_material(material)
+        result = _m.feeds_speeds(mat, tool_type, tool_dia, operation, lim or None)
+        if note:
+            result.setdefault("notes", []).append(note)
+        return _dumps(result)
+
+    @mcp.tool()
+    def cam_check_feeds_envelope(
+        material: str,
+        tool_type: str,
+        tool_dia: float,
+        operation: str,
+        rpm: Optional[float] = None,
+        feed: Optional[float] = None,
+        stepdown: Optional[float] = None,
+        stepover: Optional[float] = None,
+        max_rpm: Optional[float] = None,
+        min_rpm: Optional[float] = None,
+        max_feed: Optional[float] = None,
+        min_feed: Optional[float] = None,
+    ) -> str:
+        """Check whether supplied cutting params fall within the feeds/speeds table
+        envelope. Returns an ``aicad.advisory/1`` item (contracts/advisor.md §3) with
+        ``severity=hint`` and clamped ``candidate_fixes`` when any param is out of range,
+        or ``{ok: true, in_envelope: true}`` when everything is within bounds.
+
+        This is the CAM advisor seam: the CAM stage check battery calls this after
+        ``cam_add_operation``; out-of-envelope params are surfaced as advisory hints
+        before simulation discovers gouges.
+        """
+        from engine_oracle.research import machining as _m  # noqa: PLC0415
+        lim: dict = {}
+        if max_rpm  is not None: lim["max_rpm"]  = max_rpm
+        if min_rpm  is not None: lim["min_rpm"]  = min_rpm
+        if max_feed is not None: lim["max_feed"] = max_feed
+        if min_feed is not None: lim["min_feed"] = min_feed
+        mat, _note = _resolve_cam_material(material)
+        adv = _m.check_envelope(
+            mat, tool_type, tool_dia, operation, lim or None,
+            rpm=rpm, feed=feed, stepdown=stepdown, stepover=stepover,
+        )
+        if adv is None:
+            return _dumps({"ok": True, "in_envelope": True,
+                           "message": "All supplied params are within the feeds/speeds table envelope."})
+        return _dumps(adv)
+
+    @mcp.tool()
+    def tap_drill(thread: str) -> str:
+        """Return the standard tap drill diameter for a thread designation
+        (aicad.calc/1, contracts/advisor.md §7).
+
+        Accepts metric coarse (``M6x1.0``, ``M8``), metric fine, UNC
+        (``1/4-20``, ``#10-24``) and UNF designations. Returns
+        ``answer.tap_drill_mm`` (mm) and ``answer.pct_thread`` (typically 75%).
+        Use ``research_thread_spec`` for full thread geometry (minor/pitch diameter,
+        tensile stress area, etc.).
+        """
+        from engine_oracle.research import machining as _m  # noqa: PLC0415
+        return _dumps(_m.tap_drill(thread))
+
     @mcp.tool()
     def cam_tool_types() -> str:
         """List the supported tool types and their cutting-data class."""

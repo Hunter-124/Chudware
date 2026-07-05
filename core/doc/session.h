@@ -454,6 +454,28 @@ nlohmann::json doc_sketch_exit(const std::string& doc_id, const std::string& ske
 nlohmann::json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
                                 const nlohmann::json& action);
 
+// T-W2 sketch completion suite.
+//
+// doc_sketch_auto_constrain: deterministic auto-coincident pass. Scans entity
+//   endpoints, pairs those within tol_mm (default 1e-4) that are not already
+//   coincident-constrained, and (apply=false) returns the proposals
+//   [{a:{handle}, b:{handle}, gap_mm}], or (apply=true) adds a `coincident`
+//   constraint per proposal PERSISTENTLY (one undoable batch), each guarded by an
+//   add->analyze->rollback-on-conflict safety check (a proposal that turns the
+//   system conflicting is skipped, NOT applied). Returns {applied, skipped_conflicting,
+//   regions_before, regions_after, proposals}. `opts` = {tol_mm?, apply?}.
+//
+// doc_sketch_health: read-only narrated constraint-state report — closure (regions +
+//   open chains with the gap-endpoint handles named), dof with the free variables in
+//   plain words, per-entity under/full/over status, redundant/conflicting tags with
+//   removal suggestions, and a heuristic ordered constraint schedule (geometric
+//   constraints then driving dimensions). Also emits the same findings as frozen
+//   aicad.advisory/1 items under "advisory". No mutation, no rebuild, no rev bump.
+nlohmann::json doc_sketch_auto_constrain(const std::string& doc_id,
+                                         const std::string& sketch_fid,
+                                         const nlohmann::json& opts);
+nlohmann::json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid);
+
 // sketch_project_ref: read-only projection of a datum plane / planar face / model edge
 // into the sketch's (u,v) plane (engine/doc/session.py sketch_project_ref). `ref` is
 // {"datum":...} or {"kind":"face|edge","selector":{...}}; returns {entity, source}.

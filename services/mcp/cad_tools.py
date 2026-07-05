@@ -933,6 +933,15 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
                          constraint roster with driving-dimension values, closed-region count/
                          area, and the DOF (fully/under/over-defined) verdict — the sketch
                          equivalent of describe_part, for reviewing layout before you extrude it.
+  sketch_health(id)      the narrated constraint read: WHICH free variables remain (dof in plain
+                         words), open chain endpoints, per-entity under/full/over, redundant/
+                         conflicting with removal hints, and an ORDERED schedule (relations first,
+                         then driving dims) to reach dof 0 — the sketch loop is edit -> sketch_health
+                         -> add the scheduled relations / sketch_auto_constrain -> repeat.
+  sketch_auto_constrain(id)  stitch near-touching endpoints coincident (apply=True, default) or
+                         just propose them (apply=False); each add is rollback-safe (skips any that
+                         would conflict) and it reports which chains closed. Runs automatically after
+                         edits when doc meta sketch.auto_coincident is on (default).
   describe_scene(views)  the TEXT equivalent of render_part/contact_sheet for a model with no
                          vision: per requested view (default front/right/top/iso), which faces
                          face the camera (by sid/surf/side/dims) plus the part bbox — computed
@@ -1808,11 +1817,27 @@ def register_cad_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            r = cb.call("doc_sketch_solve", {"doc_id": d, "sketch_fid": sketch})
+            # sketch_health is the read-only source of truth (never touches the interactive
+            # active_sketch state). It returns status/dof plus the narrated read; its
+            # conflicting/redundant are [{id,type,suggestion}] objects, from which we pull the
+            # ids for check_sketch's id-list contract. (The old "doc_sketch_solve"/"sketch_fid"
+            # call never dispatched — wrong method + key — so check_sketch silently errored.)
+            r = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
             status = r.get("status", "")
             dof = r.get("dof", 0)
-            conflicting = r.get("conflicting", []) or []
-            redundant = r.get("redundant", []) or []
+
+            def _ids(items):
+                out = []
+                for it in items or []:
+                    if isinstance(it, dict) and it.get("id") is not None:
+                        out.append(it["id"])
+                    elif isinstance(it, str):
+                        out.append(it)
+                return out
+
+            conflicting = _ids(r.get("conflicting"))
+            redundant = _ids(r.get("redundant"))
+            narration = r.get("dof_narration")
             if conflicting:
                 summary = (f"Over-defined: {len(conflicting)} conflicting constraint(s) "
                            f"{conflicting} — remove one to resolve the contradiction.")
@@ -1821,11 +1846,18 @@ def register_cad_tools(mcp: FastMCP) -> None:
             else:
                 summary = (f"Under-defined: {dof} degree(s) of freedom remain — add geometric "
                            f"relations and/or driving dimensions until dof reaches 0.")
+                if narration:
+                    summary += f" Free: {narration}"
                 if redundant:
                     summary += f" (Also {len(redundant)} redundant: {redundant}.)"
-            return _dumps({"ok": True, "doc_id": d, "sketch": sketch, "status": status,
-                           "dof": dof, "fully_defined": (status == "full" or dof == 0),
-                           "conflicting": conflicting, "redundant": redundant, "summary": summary})
+            out = {"ok": True, "doc_id": d, "sketch": sketch, "status": status,
+                   "dof": dof, "fully_defined": (status == "full" or dof == 0),
+                   "conflicting": conflicting, "redundant": redundant, "summary": summary,
+                   # narrated enrichment straight from sketch_health (the advisor source).
+                   "open_endpoints": (r.get("closure") or {}).get("open_endpoints"),
+                   "dof_narration": narration, "schedule": r.get("schedule"),
+                   "advisory": r.get("advisory")}
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

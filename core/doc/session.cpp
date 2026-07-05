@@ -2660,6 +2660,49 @@ bool is_readonly_batch(const json& ops) {
     return true;
 }
 
+// T-W2: after a sketch-mutating batch is applied to `working`, add auto-coincident
+// constraints to the touched sketches (config-gated, default ON). Defined far below;
+// forward-declared here so apply_ops_locked can call it. `working` is the post-op doc,
+// pre-compile; `sketch_fids` are the sketch features the batch touched; `gen` mints ids.
+void maybe_auto_constrain(json& working, const std::vector<std::string>& sketch_fids,
+                          IdGen& gen);
+
+// The set of sketch feature ids a batch of ops touched. Two sources: (1) a
+// `sketch_*` op's "sketch" ref (interactive editing), and (2) an `add_feature` op that
+// CREATES a sketch — the primary path the MCP add_features tool and copilot use to
+// author a sketch (its feature carries entities/constraints inline). For (2) the minted
+// fid is id_map["$<idx>"]. Refs resolve through id_map ($N placeholders). Scopes the
+// auto-coincident pass to only the sketches this batch actually created or edited.
+std::vector<std::string> touched_sketch_fids(const json& ops, const json& id_map) {
+    std::vector<std::string> out;
+    if (!ops.is_array()) return out;
+    auto add = [&](const std::string& fid) {
+        if (!fid.empty() && std::find(out.begin(), out.end(), fid) == out.end())
+            out.push_back(fid);
+    };
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+        const json& op = ops[i];
+        if (!op.is_object()) continue;
+        const std::string k = op.value("op", std::string());
+        if (k == "add_feature") {
+            // A sketch created in this batch — its fid is id_map["$<idx>"].
+            if (op.contains("feature") && op["feature"].is_object() &&
+                op["feature"].value("type", std::string()) == "sketch") {
+                const std::string ph = "$" + std::to_string(i);
+                if (id_map.contains(ph) && id_map[ph].is_string())
+                    add(id_map[ph].get<std::string>());
+            }
+            continue;
+        }
+        if (k.rfind("sketch_", 0) != 0) continue;  // not a sketch op
+        if (!op.contains("sketch")) continue;
+        json ref = op["sketch"];
+        resolve_placeholders_deep(ref, id_map);
+        if (ref.is_string()) add(ref.get<std::string>());
+    }
+    return out;
+}
+
 // Apply an op batch to a session that the caller already holds g_mtx for (the shared
 // transactional core of doc_apply_ops; doc_import_file reuses it).
 json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coalesce) {
@@ -2675,6 +2718,15 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
     IdGen gen(working);
     for (std::size_t i = 0; i < ops.size(); ++i)
         apply_one(working, ops[i], i, gen, id_map);
+
+    // T-W2 auto-coincident: on a sketch-mutating batch, pin touching endpoints (within
+    // tolerance) as coincident BEFORE validation/compile, so touching-corner profiles
+    // are already closed when the model sees them. Config-gated (default ON), best-effort
+    // — it only ADDS safe (non-conflicting) coincident constraints; a failure is silent.
+    {
+        std::vector<std::string> sk_fids = touched_sketch_fids(ops, id_map);
+        if (!sk_fids.empty()) maybe_auto_constrain(working, sk_fids, gen);
+    }
 
     std::vector<std::string> errs = validate_document(working);
     if (!errs.empty()) {
@@ -8537,9 +8589,11 @@ json poly_to_json(const std::vector<Eigen::Vector2d>& p) {
 
 }  // namespace
 
-json doc_sketch_regions(const std::string& doc_id, const std::string& sketch_fid) {
-    DocLock lk;
-    Session& s = require_session(doc_id);
+// Region enumeration on an ALREADY-LOCKED session (no DocLock). The public RPC is a
+// thin locking wrapper; internal callers (T-W2 auto-constrain closure delta) that
+// already hold the DocLock call this directly to avoid re-entering the non-recursive
+// g_mtx (which would deadlock).
+json sketch_regions_locked(Session& s, const std::string& sketch_fid) {
     json& feat = find_sketch_feature(s, sketch_fid);
     aicad::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
 
@@ -8645,6 +8699,12 @@ json doc_sketch_regions(const std::string& doc_id, const std::string& sketch_fid
     out["bbox_diag"] = diag;
     out["regions"] = regions;
     return out;
+}
+
+json doc_sketch_regions(const std::string& doc_id, const std::string& sketch_fid) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    return sketch_regions_locked(s, sketch_fid);
 }
 
 json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
@@ -8784,6 +8844,496 @@ json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
     out["conflicting"] = strvec_json(conflicting);
     out["redundant"] = strvec_json(redundant);
     out["would_over_define"] = would;
+    return out;
+}
+
+// ------------------------------------------------------- T-W2 sketch completion
+namespace {
+
+// Is `sketch.auto_coincident` enabled for this doc? Stored in doc["meta"] (the
+// doc_meta_set/get key-value store); DEFAULT ON per the Hunter directive — absent or
+// non-bool reads as true. Only an explicit `false` disables the on-edit auto pass.
+bool sketch_auto_coincident_enabled(const json& doc) {
+    if (doc.contains("meta") && doc["meta"].is_object() &&
+        doc["meta"].contains("sketch.auto_coincident")) {
+        const json& v = doc["meta"]["sketch.auto_coincident"];
+        if (v.is_boolean()) return v.get<bool>();
+    }
+    return true;
+}
+
+// Entity id of a handle ("L4.p2" -> "L4"; bare "P3" -> "P3").
+std::string handle_eid(const std::string& h) { return h.substr(0, h.find('.')); }
+
+// Do the sketch's constraints ALREADY coincident-link the two handles? A coincident
+// constraint pins a pair of point handles; we treat a pair as already linked when a
+// `coincident` constraint references BOTH handles (exact-handle match, the granularity
+// the auto pass proposes at). Cheap O(constraints) scan.
+bool already_coincident(const json& constraints, const std::string& ha,
+                        const std::string& hb) {
+    if (!constraints.is_array()) return false;
+    for (const json& c : constraints) {
+        if (!c.is_object() || c.value("type", std::string()) != "coincident") continue;
+        if (!c.contains("refs") || !c["refs"].is_array()) continue;
+        bool a = false, b = false;
+        for (const json& r : c["refs"]) {
+            if (!r.is_string()) continue;
+            const std::string s = r.get<std::string>();
+            if (s == ha) a = true;
+            if (s == hb) b = true;
+        }
+        if (a && b) return true;
+    }
+    return false;
+}
+
+// Proximity scan: pairs of coincidence-eligible endpoints within tol_mm that are NOT
+// already coincident-constrained. Read-only over the SOLVED coords. Each endpoint joins
+// at most one NEW proposal (a greedy union so a shared corner emits one edge, not a
+// clique). Endpoints on the SAME entity are never paired (self-coincidence is noise).
+// Returns [{a:{handle}, b:{handle}, gap_mm}], nearest-first.
+json coincident_proposals(const json& solved_coords, const json& constraints,
+                          double tol_mm) {
+    std::vector<aicad::sketch::Endpoint> eps =
+        aicad::sketch::entity_endpoints(solved_coords);
+    struct Cand { int i, j; double gap; };
+    std::vector<Cand> cands;
+    for (size_t i = 0; i < eps.size(); ++i)
+        for (size_t j = i + 1; j < eps.size(); ++j) {
+            if (handle_eid(eps[i].handle) == handle_eid(eps[j].handle)) continue;
+            double dx = eps[i].x - eps[j].x, dy = eps[i].y - eps[j].y;
+            double gap = std::sqrt(dx * dx + dy * dy);
+            if (gap > tol_mm) continue;
+            if (already_coincident(constraints, eps[i].handle, eps[j].handle)) continue;
+            cands.push_back({(int)i, (int)j, gap});
+        }
+    std::sort(cands.begin(), cands.end(),
+              [](const Cand& a, const Cand& b) { return a.gap < b.gap; });
+    std::vector<bool> used(eps.size(), false);
+    json out = json::array();
+    for (const Cand& c : cands) {
+        if (used[c.i] || used[c.j]) continue;  // greedy: one new pin per endpoint
+        used[c.i] = used[c.j] = true;
+        out.push_back({{"a", {{"handle", eps[c.i].handle}}},
+                       {"b", {{"handle", eps[c.j].handle}}},
+                       {"gap_mm", c.gap}});
+    }
+    return out;
+}
+
+// Count closed material regions of a solved sketch WITHOUT the OCCT region machinery
+// (health/auto-constrain report closure via loop chains, cheaper than doc_sketch_regions
+// and available in the non-OCCT build). A "closed chain" = every open-curve endpoint
+// (line/arc/slot/spline p1/p2/start/end) shares its position (within eps) with exactly
+// one other endpoint; we report the count of endpoints still dangling (unmatched).
+// Returns {closed_chains_ok, open_endpoints:[handles]} — the narration source.
+json closure_summary(const json& solved_coords) {
+    std::vector<aicad::sketch::Endpoint> eps =
+        aicad::sketch::entity_endpoints(solved_coords);
+    // circle/point centers are not chain endpoints; keep only p1/p2/start/end handles.
+    std::vector<aicad::sketch::Endpoint> chain;
+    for (const auto& e : eps) {
+        auto dot = e.handle.find('.');
+        if (dot == std::string::npos) continue;  // bare point / circle center handled below
+        std::string sub = e.handle.substr(dot + 1);
+        if (sub == "p1" || sub == "p2" || sub == "start" || sub == "end")
+            chain.push_back(e);
+    }
+    const double eps_mm = 1e-4;
+    std::vector<bool> matched(chain.size(), false);
+    for (size_t i = 0; i < chain.size(); ++i)
+        for (size_t j = i + 1; j < chain.size(); ++j) {
+            if (matched[i] && matched[j]) continue;
+            double dx = chain[i].x - chain[j].x, dy = chain[i].y - chain[j].y;
+            if (std::sqrt(dx * dx + dy * dy) <= eps_mm) { matched[i] = matched[j] = true; }
+        }
+    json open_eps = json::array();
+    for (size_t i = 0; i < chain.size(); ++i)
+        if (!matched[i]) open_eps.push_back(chain[i].handle);
+    json out;
+    out["open_endpoints"] = open_eps;
+    out["closed_chains_ok"] = open_eps.empty();
+    return out;
+}
+
+// The number of MATERIAL regions of the feature's solved sketch, via the region
+// loop detection — used for the before/after closure delta. Caller MUST already hold
+// the DocLock (uses sketch_regions_locked, no re-lock). Returns -1 if regions can't be
+// computed (e.g. non-OCCT build); callers fall back to closure_summary.
+int material_region_count(Session& s, const std::string& sketch_fid) {
+    try {
+        json r = sketch_regions_locked(s, sketch_fid);
+        if (!r.contains("regions") || !r["regions"].is_array()) return -1;
+        int n = 0;
+        for (const json& reg : r["regions"])
+            if (reg.value("is_material", false)) ++n;
+        return n;
+    } catch (...) {
+        return -1;
+    }
+}
+
+// Solve `feat` cold and hand back the SketchSolution (for auto-constrain add/analyze).
+aicad::sketch::SketchSolution solve_feat_cold(Session& s, const json& feat) {
+    json env = env_from_doc(s.doc);
+    json params = sketch_params(feat);
+    json sk;
+    sk["entities"] = params.contains("entities") ? params["entities"] : json::array();
+    sk["constraints"] = params.contains("constraints") ? params["constraints"] : json::array();
+    return aicad::sketch::solve_sketch(sk, env, std::nullopt);
+}
+
+// Add each proposal as a `coincident` constraint into `entities_ref`/`constraints_ref`
+// (a mutable params object) with per-proposal add->analyze->rollback-on-CONFLICT safety:
+// a proposal that turns the system conflicting is dropped; a proposal that is merely
+// REDUNDANT (the loop is already pinned) is KEPT — redundant coincidents are harmless
+// and are exactly what closes a touching-corner profile. `gen` mints constraint ids.
+// Returns {applied:[cids], skipped_conflicting:int}. Mutates params IN PLACE on success.
+json apply_coincident_proposals(json& params, const json& proposals, const json& env,
+                                IdGen& gen) {
+    if (!params.contains("constraints") || !params["constraints"].is_array())
+        params["constraints"] = json::array();
+    json applied = json::array();
+    int skipped = 0;
+    for (const json& p : proposals) {
+        if (!p.is_object() || !p.contains("a") || !p.contains("b")) continue;
+        std::string ha = p["a"].value("handle", std::string());
+        std::string hb = p["b"].value("handle", std::string());
+        if (ha.empty() || hb.empty()) continue;
+        const std::string cid = gen.next("c");
+        json c = {{"id", cid}, {"type", "coincident"},
+                  {"refs", json::array({ha, hb})}};
+        // Trial-add on a COPY, analyze; keep only if it does not become conflicting.
+        json trial = params;
+        trial["constraints"].push_back(c);
+        json sk;
+        sk["entities"] = trial["entities"];
+        sk["constraints"] = trial["constraints"];
+        aicad::sketch::SketchSolution sol =
+            aicad::sketch::solve_sketch(sk, env, std::nullopt);
+        bool conflicts = false;
+        for (const std::string& t : sol.conflicting)
+            if (t == cid) conflicts = true;
+        if (conflicts || !sol.converged) { ++skipped; continue; }
+        params["constraints"].push_back(std::move(c));  // commit into live params
+        applied.push_back(cid);
+    }
+    return json{{"applied", applied}, {"skipped_conflicting", skipped}};
+}
+
+// Run the auto-coincident pass on every sketch feature `working` touched, IN PLACE,
+// before the enclosing apply_ops_locked compiles/persists the batch. Gated on the
+// doc's sketch.auto_coincident meta flag (default ON). `sketch_fids` are the sketch
+// feature ids sketch-mutating ops in this batch referenced. Silent + best-effort: any
+// failure on a feature leaves it untouched (never blocks the user's edit). This is the
+// "touching endpoints are already coincident before the model sees a not-closed error"
+// path — it adds constraints, so touching-corner profiles close automatically.
+void maybe_auto_constrain(json& working, const std::vector<std::string>& sketch_fids,
+                          IdGen& gen) {
+    if (!sketch_auto_coincident_enabled(working)) return;
+    if (!working.contains("features") || !working["features"].is_array()) return;
+    const double tol_mm = 1e-4;
+    json env = env_from_doc(working);
+    for (const std::string& fid : sketch_fids) {
+        for (json& feat : working["features"]) {
+            if (!feat.is_object() || feat.value("id", std::string()) != fid) continue;
+            if (feat.value("type", std::string()) != "sketch") continue;
+            if (!feat.contains("params") || !feat["params"].is_object()) continue;
+            try {
+                json params = feat["params"];
+                json sk;
+                sk["entities"] = params.value("entities", json::array());
+                sk["constraints"] = params.value("constraints", json::array());
+                aicad::sketch::SketchSolution sol =
+                    aicad::sketch::solve_sketch(sk, env, std::nullopt);
+                if (!sol.converged) break;  // don't auto-touch a broken sketch
+                json proposals = coincident_proposals(sol.entities, sk["constraints"], tol_mm);
+                if (proposals.empty()) break;
+                json res = apply_coincident_proposals(params, proposals, env, gen);
+                if (res["applied"].is_array() && !res["applied"].empty())
+                    feat["params"] = params;  // write the pinned constraints back
+            } catch (...) { /* best-effort: leave the feature untouched */ }
+            break;
+        }
+    }
+}
+
+}  // namespace
+
+json doc_sketch_auto_constrain(const std::string& doc_id, const std::string& sketch_fid,
+                               const json& opts) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    json& feat = find_sketch_feature(s, sketch_fid);
+    json env = env_from_doc(s.doc);
+
+    double tol_mm = 1e-4;
+    bool apply = true;
+    if (opts.is_object()) {
+        if (opts.contains("tol_mm") && opts["tol_mm"].is_number())
+            tol_mm = opts["tol_mm"].get<double>();
+        if (opts.contains("apply") && opts["apply"].is_boolean())
+            apply = opts["apply"].get<bool>();
+    }
+
+    // Solve current geometry, gather the coincident proposals (read-only either way).
+    aicad::sketch::SketchSolution sol = solve_feat_cold(s, feat);
+    json params = sketch_params(feat);
+    json cons = params.contains("constraints") ? params["constraints"] : json::array();
+    json proposals = coincident_proposals(sol.entities, cons, tol_mm);
+
+    json out;
+    out["proposals"] = proposals;
+
+    if (!apply) {
+        out["applied"] = json::array();
+        out["skipped_conflicting"] = 0;
+        out["converged"] = sol.converged;
+        return out;
+    }
+
+    int regions_before = material_region_count(s, sketch_fid);
+
+    // Trial-apply each proposal with rollback-on-conflict into a working params copy.
+    json work_params = params;
+    if (!work_params.contains("entities")) work_params["entities"] = json::array();
+    if (!work_params.contains("constraints")) work_params["constraints"] = json::array();
+    IdGen gen(s.doc);
+    json applied_res = apply_coincident_proposals(work_params, proposals, env, gen);
+
+    out["applied"] = applied_res["applied"];
+    out["skipped_conflicting"] = applied_res["skipped_conflicting"];
+
+    // Persist the accepted constraints as ONE undoable batch (only if any landed).
+    if (applied_res["applied"].is_array() && !applied_res["applied"].empty()) {
+        push_undo(s);
+        // Write the augmented constraints array back into the live feature params.
+        json& live = find_sketch_feature(s, sketch_fid);
+        if (live.contains("params") && live["params"].is_object())
+            live["params"]["constraints"] = work_params["constraints"];
+        else
+            live["constraints"] = work_params["constraints"];
+        s.revision += 1;
+        s.dirty = true;
+        if (s.active_sketch) s.active_sketch->solve_state.reset();
+        try {
+            CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
+            (void)r;
+        } catch (...) { /* closure count below still reflects the constraints */ }
+    }
+
+    int regions_after = material_region_count(s, sketch_fid);
+    out["regions_before"] = regions_before;
+    out["regions_after"] = regions_after;
+    out["converged"] = sol.converged;
+    return out;
+}
+
+json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    json& feat = find_sketch_feature(s, sketch_fid);
+    json env = env_from_doc(s.doc);
+
+    json params = sketch_params(feat);
+    json sk;
+    sk["entities"] = params.contains("entities") ? params["entities"] : json::array();
+    sk["constraints"] = params.contains("constraints") ? params["constraints"] : json::array();
+
+    aicad::sketch::SketchSolution sol = aicad::sketch::solve_sketch(sk, env, std::nullopt);
+
+    // ---- closure ------------------------------------------------------------
+    json closure = closure_summary(sol.entities);
+    int mregions = material_region_count(s, sketch_fid);
+    if (mregions >= 0) closure["material_regions"] = mregions;
+
+    // ---- free-variable narration -------------------------------------------
+    std::vector<aicad::sketch::FreeVar> fvs = aicad::sketch::free_variables(sk, env);
+    json free_vars = json::array();
+    // Group per entity for a readable phrase ("line L4: end x, end y").
+    std::map<std::string, std::vector<std::string>> by_ent;
+    std::vector<std::string> ent_order;
+    for (const auto& fv : fvs) {
+        if (!by_ent.count(fv.entity)) ent_order.push_back(fv.entity);
+        by_ent[fv.entity].push_back(fv.param);
+        free_vars.push_back({{"entity", fv.entity}, {"param", fv.param}, {"var", fv.var}});
+    }
+    std::string dof_narration;
+    for (const std::string& eid : ent_order) {
+        if (!dof_narration.empty()) dof_narration += "; ";
+        std::string et;
+        for (const json& e : sk["entities"])
+            if (e.value("id", std::string()) == eid) { et = e.value("type", std::string()); break; }
+        dof_narration += et + " " + eid + " ";
+        const auto& ps = by_ent[eid];
+        for (size_t i = 0; i < ps.size(); ++i) {
+            if (i) dof_narration += ", ";
+            dof_narration += ps[i];
+        }
+    }
+    if (dof_narration.empty())
+        dof_narration = (sol.dof <= 0) ? "fully constrained (no free variables)"
+                                       : "unconstrained rigid-body freedom";
+
+    // ---- per-entity status --------------------------------------------------
+    json statuses = json::object();
+    for (const auto& kv : sol.statuses) statuses[kv.first] = kv.second;
+
+    // ---- redundant / conflicting with removal suggestions -------------------
+    json cons_by_id = json::object();
+    for (const json& c : sk["constraints"])
+        if (c.is_object() && c.contains("id"))
+            cons_by_id[c["id"].get<std::string>()] = c;
+    auto tag_finding = [&](const std::string& cid, const char* kind) -> json {
+        json rec;
+        rec["id"] = cid;
+        std::string ctype = cons_by_id.contains(cid)
+                                ? cons_by_id[cid].value("type", std::string("?"))
+                                : std::string("?");
+        rec["type"] = ctype;
+        rec["suggestion"] = std::string("remove ") + kind + " constraint " + cid +
+                            " (" + ctype + ")";
+        return rec;
+    };
+    json redundant = json::array();
+    for (const std::string& cid : sol.redundant) redundant.push_back(tag_finding(cid, "redundant"));
+    json conflicting = json::array();
+    for (const std::string& cid : sol.conflicting) conflicting.push_back(tag_finding(cid, "conflicting"));
+
+    // ---- overall verdict ----------------------------------------------------
+    std::string status = overall_status(statuses, sol.dof, sol.conflicting, sol.redundant,
+                                        cons_by_id);
+
+    // ---- constraint schedule (heuristic: geometric first, then driving dims) --
+    // Order the free DOFs into a suggested closing sequence. We do NOT fabricate exact
+    // constraints; we phrase actionable steps a driver can turn into add_constraint /
+    // sketch_set_dim calls. Geometric relations (coincident endpoints from the open
+    // chains) precede dimensions, matching how a person constrains a sketch.
+    json schedule = json::array();
+    // Step group 1: close open chains via coincident (from the closure gap endpoints).
+    if (closure.contains("open_endpoints") && closure["open_endpoints"].is_array() &&
+        !closure["open_endpoints"].empty()) {
+        json step;
+        step["order"] = 1;
+        step["kind"] = "geometric";
+        step["action"] = "coincident";
+        step["why"] = "close the open profile chain at the dangling endpoints";
+        step["handles"] = closure["open_endpoints"];
+        schedule.push_back(step);
+    }
+    // Step group 2: pin remaining geometric freedoms (per free variable, grouped).
+    int order = 2;
+    for (const std::string& eid : ent_order) {
+        json step;
+        step["order"] = order++;
+        step["kind"] = "dimension";
+        step["action"] = "add driving dimension / geometric relation";
+        std::string why = eid + " is under-constrained in ";
+        const auto& ps = by_ent[eid];
+        for (size_t i = 0; i < ps.size(); ++i) { if (i) why += ", "; why += ps[i]; }
+        step["why"] = why;
+        step["entity"] = eid;
+        schedule.push_back(step);
+    }
+
+    // ---- advisory/1 emittable items -----------------------------------------
+    // Frozen aicad.advisory/1 shape (contracts/advisor.md §3): each finding carries
+    // severity / check / finding / refs / candidate_fixes / source. Conflicts are
+    // blockers, open profiles + under-constrained DOF are actions, a clean full sketch
+    // is info. candidate_fixes is non-empty except for the info verdict.
+    json advisory = json::array();
+    int adv = 0;
+    auto adv_id = [&]() { return std::string("adv_skh_") + std::to_string(adv++); };
+    for (const json& cf : conflicting) {
+        advisory.push_back({
+            {"schema", "aicad.advisory/1"}, {"id", adv_id()}, {"stage", "sketch"},
+            {"severity", "blocker"}, {"check", "sketch_conflict"},
+            {"finding", std::string("constraint ") + cf.value("id", "?") + " (" +
+                        cf.value("type", "?") + ") conflicts — the sketch cannot solve"},
+            {"refs", {{"doc_id", doc_id}, {"sketch", sketch_fid},
+                      {"constraints", json::array({cf.value("id", "?")})}}},
+            {"candidate_fixes", json::array({{
+                {"action", "delete_constraint"},
+                {"params", {{"id", cf.value("id", "?")}}},
+                {"basis", "removing the over-defining constraint restores a solvable system"},
+                {"predicted_effect", "sketch solves; DOF returns to >= 0"},
+                {"confidence", "kernel"}}})},
+            {"source", {{"kind", "kernel"}, {"detail", "System::analyze conflicting_tags"}}}});
+    }
+    if (closure.contains("open_endpoints") && closure["open_endpoints"].is_array() &&
+        !closure["open_endpoints"].empty()) {
+        advisory.push_back({
+            {"schema", "aicad.advisory/1"}, {"id", adv_id()}, {"stage", "sketch"},
+            {"severity", "action"}, {"check", "sketch_open_profile"},
+            {"finding", std::string("open profile: ") +
+                        std::to_string(closure["open_endpoints"].size()) +
+                        " endpoint(s) not joined — the loop will not close for extrude"},
+            {"refs", {{"doc_id", doc_id}, {"sketch", sketch_fid},
+                      {"handles", closure["open_endpoints"]}}},
+            {"candidate_fixes", json::array({{
+                {"action", "sketch_auto_constrain"},
+                {"params", {{"sketch", sketch_fid}, {"apply", true}}},
+                {"basis", "touching endpoints within tolerance can be auto-coincident"},
+                {"predicted_effect", "dangling endpoints pinned; chains close"},
+                {"confidence", "heuristic"}}})},
+            {"source", {{"kind", "kernel"}, {"detail", "closure_summary loop endpoints"}}}});
+    }
+    if (sol.dof > 0 && !free_vars.empty()) {
+        advisory.push_back({
+            {"schema", "aicad.advisory/1"}, {"id", adv_id()}, {"stage", "sketch"},
+            {"severity", "action"}, {"check", "sketch_underconstrained"},
+            {"finding", std::string("under-constrained: dof ") + std::to_string(sol.dof) +
+                        " — free: " + dof_narration},
+            {"refs", {{"doc_id", doc_id}, {"sketch", sketch_fid}}},
+            {"numbers", {{"dof", sol.dof}}},
+            {"candidate_fixes", json::array({{
+                {"action", "apply_constraint_schedule"},
+                {"params", {{"schedule", schedule}}},
+                {"basis", "geometric relations first, then driving dimensions, per DOF"},
+                {"predicted_effect", "dof -> 0 (fully constrained)"},
+                {"confidence", "heuristic"}}})},
+            {"source", {{"kind", "kernel"}, {"detail", "System::analyze dof + SVD null-space"}}}});
+    }
+    for (const json& rf : redundant) {
+        advisory.push_back({
+            {"schema", "aicad.advisory/1"}, {"id", adv_id()}, {"stage", "sketch"},
+            {"severity", "hint"}, {"check", "sketch_redundant"},
+            {"finding", std::string("redundant constraint ") + rf.value("id", "?") + " (" +
+                        rf.value("type", "?") + ") adds no new information"},
+            {"refs", {{"doc_id", doc_id}, {"sketch", sketch_fid},
+                      {"constraints", json::array({rf.value("id", "?")})}}},
+            {"candidate_fixes", json::array({{
+                {"action", "delete_constraint"},
+                {"params", {{"id", rf.value("id", "?")}}},
+                {"basis", "the relation is already implied by other constraints"},
+                {"predicted_effect", "no geometry change; a cleaner constraint set"},
+                {"confidence", "kernel"}}})},
+            {"source", {{"kind", "kernel"}, {"detail", "System::analyze redundant_tags"}}}});
+    }
+    if (advisory.empty()) {
+        advisory.push_back({
+            {"schema", "aicad.advisory/1"}, {"id", adv_id()}, {"stage", "sketch"},
+            {"severity", "info"}, {"check", "sketch_health"},
+            {"finding", "sketch is fully constrained and closed"},
+            {"refs", {{"doc_id", doc_id}, {"sketch", sketch_fid}}},
+            {"candidate_fixes", json::array()},
+            {"source", {{"kind", "kernel"}, {"detail", "System::analyze"}}}});
+    }
+
+    json out;
+    out["ok"] = true;
+    out["sketch"] = sketch_fid;
+    out["status"] = status;
+    out["dof"] = sol.dof;
+    out["converged"] = sol.converged;
+    out["closure"] = closure;
+    out["dof_narration"] = dof_narration;
+    out["free_variables"] = free_vars;
+    out["statuses"] = statuses;
+    out["redundant"] = redundant;
+    out["conflicting"] = conflicting;
+    out["schedule"] = schedule;
+    out["advisory"] = advisory;
     return out;
 }
 

@@ -62,13 +62,13 @@ enumerates closed regions. Missing: auto-constraint inference and narration.
 
 ## Definition of done
 
-- [ ] Auto-coincident closes touching-endpoint profiles automatically (default on),
+- [x] Auto-coincident closes touching-endpoint profiles automatically (default on),
       with rollback safety on conflicts
-- [ ] `sketch_health` narrates closure, DOF in plain words, per-entity status,
+- [x] `sketch_health` narrates closure, DOF in plain words, per-entity status,
       redundant/conflicting tags, and an ordered constraint schedule
-- [ ] Both exposed via MCP; check_sketch enriched; server instructions + cad_guide updated
-- [ ] C++ tests pass in the build (see linux-build memory: host/build vs build-linux)
-- [ ] Output shapes emittable as aicad.advisory/1 items (severity, finding,
+- [x] Both exposed via MCP; check_sketch enriched; server instructions + cad_guide updated
+- [x] C++ tests pass in the build (see linux-build memory: host/build vs build-linux)
+- [x] Output shapes emittable as aicad.advisory/1 items (severity, finding,
       candidate_fixes, refs)
 
 ## AI hints

@@ -3,7 +3,7 @@ id: T-DP17
 title: Interactive agent DAG / flowchart widget — clickable nodes to sub-agent detail
 workstream: DP
 owner: sonnet-mira1
-status: doing
+status: review
 branch: task/T-DP17-agent-dag-widget
 depends_on: []
 lane: app-gui

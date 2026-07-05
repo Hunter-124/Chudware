@@ -250,6 +250,14 @@ register_dag_tools(mcp)
 # into the persisted graph sidecar, and resumes via executor.resume().
 from services.dag.mcp_tools import register_dag_replan_tools
 register_dag_replan_tools(mcp)
+# Mission pipeline (T-W19): mission_start / mission_status / replan_request.
+# The copilot's mission front door — INTAKE→DELIVER phase machine on top of the
+# ledger + roles + buildgraph + DAG.  mission_status renders phase state from the
+# ledger stage_log (what mission control + the GUI consume); replan_request routes
+# an aicad.replan/1 request per contract §17.  The in-app path is
+# services.agent.loop.run_mission.
+from services.mcp.mission_tools import register_mission_tools
+register_mission_tools(mcp)
 # Design review battery (T-F12): one-call battery dispatching through DISPATCH_TABLE
 # (verify.py) + battery._get_fn for feature_overlap/dfm.  Returns a narrated verdict
 # card per contracts/narration.md — never a raw JSON dump.

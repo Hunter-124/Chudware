@@ -72,3 +72,19 @@ flag out-of-envelope choices instead of letting sim discover gouges.
   (services/mcp/cam_tools.py).
 - OSS-first: survey existing open feeds/speeds datasets before hand-authoring; record
   license in contracts/license_debt.md if anything is vendored.
+
+## Progress log
+- 2026-07-05 00:23 UTC [sonnet-crag] Landed feeds/speeds table + CAM advisor integration on branch task/T-W6-feeds-speeds.
+
+What was built:
+- engine_oracle/research/data/feeds_speeds.json: 8-material × 4-5 tool-type envelope table (alu_6061, steel_1018, steel_304_stainless, ti_6al4v, abs, pla, nylon_pa12, cast_iron_gray, inconel_718) with per-row Machinery's Handbook citations. OSS survey found no permissive open dataset (FSWizard/HSMAdvisor proprietary, OpenCAMLib has no data tables); values anchored to core/cam/feeds.cpp CuttingDB in-repo first-party table.
+- engine_oracle/research/machining.py: feeds_speeds() + tap_drill() returning aicad.calc/1 envelopes (contracts/advisor.md §7); check_envelope() producing aicad.advisory/1 items (severity=hint, candidate_fixes with confidence=table) per §3.
+- engine_oracle/research/test_machining.py: 30 tests all pass.
+- services/mcp/cam_tools.py: feeds_speeds, cam_check_feeds_envelope, tap_drill MCP tools wired.
+- _CAM_GUIDE + server instructions updated with feeds/speeds workflow docs.
+
+Test results: 30/30 new tests pass; 74/74 research tests total pass. cam bench deterministic_op_plan unchanged (stepdown=2, stepover=3 preserved). graphify update run.
+
+Key test results: alu_6061 10mm endmill roughing rpm_mid=8727 (in [3k-12k]); Ti rpm_mid=2707 < Al/3=2909 confirmed; tap_drill(M6x1.0)=5.0mm; 4x feed fires advisory with clamped candidate_fix.
+
+No open questions.

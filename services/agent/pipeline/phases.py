@@ -90,27 +90,33 @@ class GateResult:
 
 @dataclass
 class PipelineFlags:
-    """Feature flags for the 1.3 org layer (T-W22/T-W23 NOT merged → default off).
+    """Feature flags for the 1.3 org layer.
 
-    Read from the environment so the whole mission machine can be flipped on when
-    the sibling tasks land, without a code change:
-      * ``AICAD_ORG_LAYER=1``      → enable Phase 2.5 ORGANIZE + replan scope=org.
+    T-W22 landed: org_layer default is now ON (Phase 2.5 ORGANIZE is live).
+    build_council and overseer remain env-gated (T-W23 / T-W13 not merged).
+
+    Environment overrides (always respected):
+      * ``AICAD_ORG_LAYER=0``      → disable Phase 2.5 ORGANIZE (test/compat).
+      * ``AICAD_ORG_LAYER=1``      → explicit enable (no-op; already on by default).
       * ``AICAD_BUILD_COUNCIL=1``  → require build-strategy council synthesis at the
         PLAN exit gate (contract §19).
       * ``AICAD_OVERSEER=1``       → overseer audit triggers are live (T-W13).
     """
-    org_layer: bool = False
+    org_layer: bool = True   # T-W22 landed — ORGANIZE phase is live
     build_council: bool = False
     overseer: bool = False
 
     @classmethod
     def from_env(cls) -> "PipelineFlags":
-        def _on(name: str) -> bool:
-            return os.environ.get(name, "0") in ("1", "true", "True")
+        def _on(name: str, default: bool) -> bool:
+            val = os.environ.get(name)
+            if val is None:
+                return default
+            return val in ("1", "true", "True")
         return cls(
-            org_layer=_on("AICAD_ORG_LAYER"),
-            build_council=_on("AICAD_BUILD_COUNCIL"),
-            overseer=_on("AICAD_OVERSEER"),
+            org_layer=_on("AICAD_ORG_LAYER", True),   # default ON (T-W22)
+            build_council=_on("AICAD_BUILD_COUNCIL", False),
+            overseer=_on("AICAD_OVERSEER", False),
         )
 
 

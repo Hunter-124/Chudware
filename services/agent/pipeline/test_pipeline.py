@@ -258,10 +258,19 @@ def test_clarify_skipped_without_blocking_ambiguity():
 
 
 def test_organize_skipped_unless_flag_on():
+    # T-W22: org_layer=True is now the default. Explicit False skips ORGANIZE.
     off = PhaseMachine(flags=PipelineFlags(org_layer=False))
     assert off.next_phase(Phase.SPECIFY, {}) is Phase.PLAN  # ORGANIZE skipped
     on = PhaseMachine(flags=PipelineFlags(org_layer=True))
     assert on.next_phase(Phase.SPECIFY, {}) is Phase.ORGANIZE
+
+
+def test_organize_is_default_on():
+    """T-W22: PipelineFlags() default now has org_layer=True."""
+    flags = PipelineFlags()
+    assert flags.org_layer is True
+    m = PhaseMachine()
+    assert m.next_phase(Phase.SPECIFY, {}) is Phase.ORGANIZE
 
 
 def test_build_council_gate_flagged():
@@ -413,7 +422,9 @@ def test_end_to_end_all_phases_mock(tmp_path):
 
     run_id = f"t_w19_e2e_{uuid.uuid4().hex[:8]}"
     ledger = Ledger.load(run_id, path=tmp_path / "ledger.json")
-    machine = PhaseMachine(ledger=ledger, flags=PipelineFlags())
+    # Use org_layer=False for this focused 8-phase dry run (avoids needing a real
+    # org chart fixture here; the org-layer e2e is covered in test_org.py T-W22).
+    machine = PhaseMachine(ledger=ledger, flags=PipelineFlags(org_layer=False))
 
     manifest = _valid_manifest()
 
@@ -432,7 +443,7 @@ def test_end_to_end_all_phases_mock(tmp_path):
     machine.exit(Phase.SPECIFY, machine.run_gate(Phase.SPECIFY, {
         "spec_audited": True, "uncovered_criteria": []}))
 
-    # ORGANIZE skipped (flag off) → PLAN.
+    # ORGANIZE skipped (org_layer=False in this test) → PLAN.
     assert machine.next_phase(Phase.SPECIFY, {}) is Phase.PLAN
 
     # Phase 3 PLAN — build graph valid + ratified.

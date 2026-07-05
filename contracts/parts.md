@@ -28,6 +28,7 @@
   | `hydraulic` | ISO 1219 hydraulic components (T-E5) | SEAM (T-P2) |
   | `ecad` | Electronic components / KiCad symbols (T-B4) | SEAM (T-P2) |
   | `mech_family` | Additional parametric domains beyond core | extensible |
+  | `catalog` | Third-party CAD catalog models (GrabCAD, TraceParts) acquired via the user's own authenticated browser session (T-X2/T-X3) — the §6.3 "paid catalog provider" seam, populated by the browser-session mechanism instead of/alongside a paid API | v1 (T-X3), additive domain |
 
 - **part_id scheme**: `"<domain>:<catalog_id>"` — stable, globally unique, round-trippable
   via `get(part_id)`. Examples: `"fastener:ISO4762:M8"`, `"bearing:ISO15:6205"`,
@@ -94,6 +95,7 @@ geometry — the record carries no inline mesh or B-rep. Reserved `kind` values:
 | `section_profile` | Structural-section sweep (T-D3) | `standard`, `designation` |
 | `fitting_id` | Piping fitting catalog key (T-E1) | `fitting_id` |
 | `fmu_component` | FMU/ISO-1219 hydraulic component (T-E5) | `component_id` |
+| `import_file` | Local CAD file already on disk (T-X3: browser-acquired STEP/IGES) — routes through the same `import_file` core RPC `import_part` uses | `path` |
 
 ## 3. CatalogProvider protocol (frozen)
 
@@ -172,3 +174,9 @@ the doc_id. It also wires the parts search into the agent context guide
 
 TraceParts / Werk24 and similar paid catalogs join as `CatalogProvider` adapters
 (live-search, no `iter_records`) behind the same seam when volume justifies spend.
+**Populated instead by T-X2/T-X3 (Hunter directive 2026-07-04):** `services/browser/
+adapters/parts_provider.py`'s `BrowserCatalogAdapter` wraps GrabCAD/TraceParts as
+`domain="catalog"` live-search providers using the user's own authenticated browser
+session rather than a paid API — the parked `work/backlog/T-BL12.md` plan is a
+different mechanism for an overlapping catalog and is untouched by this. Both
+mechanisms can coexist behind this same seam if the paid-API plan is ever revived.

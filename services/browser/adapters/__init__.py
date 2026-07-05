@@ -125,3 +125,11 @@ def download_dir(site: str) -> Path:
     d = paths.BROWSER_DOWNLOADS / slug(site)
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+# Side-effecting: each site module calls register(...) at import time. Imported here
+# (not left to whoever happens to import a specific site module first) so all_adapters()
+# is reliably populated as soon as this package is imported — e.g. by
+# engine_oracle.parts_hub.hub.PartsHub.bootstrap() (T-X3), which only imports this
+# package's top level.
+from . import grabcad, traceparts  # noqa: E402,F401

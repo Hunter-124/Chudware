@@ -257,6 +257,9 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
     "tolerance_stackup": {
         "stackup_analyze",
     },
+    "mechanical": {
+        "gear_check", "bearing_life",
+    },
 }
 
 # All tool names across all families (deduplicated — some tools like hover appear in
@@ -298,6 +301,7 @@ _FAMILY_SIGNALS: dict[str, list[str]] = {
     "buildgraph":    ["buildgraph_plan", "buildgraph_status", "buildgraph", "aicad.buildgraph/1"],
     "interface_check": ["interface_check", "interface alignment", "cad_guide('design_review')"],
     "tolerance_stackup": ["stackup_analyze", "cad_guide('tolerance_stackup')", "tolerance_stackup"],
+    "mechanical":    ["gear_check", "bearing_life", "mechanical"],
 }
 
 
@@ -340,6 +344,7 @@ def _build_coverage_corpus() -> str:
             "cost", "spec", "piping", "hydraulic", "firmware", "structural",
             "regen", "code_compliance", "serving", "design_review", "doc_diff", "plm",
             "tolerance_stackup",
+            "mechanical",
         ]
         for t in all_topics:
             try:
@@ -436,6 +441,7 @@ class TestMCPFreshness(unittest.TestCase):
             "cost", "spec", "piping", "hydraulic", "firmware", "structural",
             "regen", "code_compliance", "serving", "design_review", "doc_diff", "plm",
             "tolerance_stackup",
+            "mechanical",
         ]
         missing = [t for t in required_in_fallback if t not in fallback]
         self.assertFalse(
@@ -451,7 +457,7 @@ class TestMCPFreshness(unittest.TestCase):
             "doc_diff", "req", "verify", "research", "deliverables",
             "sourcing", "cost", "spec", "piping", "hydraulic", "firmware",
             "structural", "parts", "serving", "regen", "code_compliance",
-            "dag", "design_review", "ledger", "tolerance_stackup",
+            "dag", "design_review", "ledger", "tolerance_stackup", "mechanical",
         }
         missing = required_families - set(_TOOL_FAMILIES.keys())
         self.assertFalse(

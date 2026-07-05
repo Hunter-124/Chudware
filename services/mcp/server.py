@@ -304,6 +304,9 @@ register_interface_check_tools(mcp)
 # dimensions.  Pure-Python; no C++ engine required.  See cad_guide('tolerance_stackup').
 from services.mcp.tolerance_tools import register_tolerance_tools
 register_tolerance_tools(mcp)
+# Mechanical engineering checks (T-BL18): AGMA gear tooth stress + ISO 281 bearing life.
+from mcp_server.mechanical_tools import register_mechanical_tools
+register_mechanical_tools(mcp)
 
 
 def _install_clean_stdout():

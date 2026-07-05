@@ -55,3 +55,17 @@ schematic/PCB, CAM workspace (T-U3), and the U7 viewers.
       commit/branch/merge/push/pull/repo = no hits
 - [ ] T-U1 style-conformance checks pass; AI_CAD_SHOT headless scenarios added
       for panel/compare/release flows; gate + graphify update .
+
+## Locked decisions (Hunter, 2026-07-05 planning session)
+
+- **Timeline density:** collapse auto-saves between checkpoints into an expandable
+  group ("12 saves" row, thumbnails on expand); checkpoints + releases are the story rows.
+- **Released-doc editing:** AUTO-BRANCH SILENTLY — first edit on a Released doc creates
+  the next-rev draft behind the scenes; a toast announces it and MUST carry a
+  "back to rev B (discard draft)" affordance so nobody is confused about where they are.
+  No read-only wall, no prompt.
+- **Part numbers:** auto-suggest from a configurable scheme (e.g. PRJ-00042) pre-filled
+  at first release, freely editable in the field.
+- **Checkpoint/release message drafts:** LOCAL model tier drafts from the T-R3 change
+  summary (offline-safe, free); plain manual box fallback when no local model is
+  provisioned. Frontier is never required for this.

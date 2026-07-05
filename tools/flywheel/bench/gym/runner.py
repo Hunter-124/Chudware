@@ -298,6 +298,17 @@ def _run_mission_real(challenge: Challenge, run_id: str) -> dict | None:
     Honest failure handling: a mission/DAG/model error is CAPTURED into the mission
     record (and the ledger already holds whatever real events were emitted), never
     swallowed — the C1 proof needs the observed failure class, not a hidden stub."""
+    # A cell is deterministic, so a re-run must start CLEAN: run_mission does
+    # Ledger.load(run_id) which APPENDS to any existing mission ledger — a stale
+    # file from an earlier attempt would contaminate the folded events. Same rule
+    # as the gym cell ledger above.
+    try:
+        from services.agent.ledger import run_ledger_path
+        mp = run_ledger_path(run_id)
+        if mp.exists():
+            mp.unlink()
+    except Exception:  # noqa: BLE001 — best-effort cleanup
+        pass
     try:
         from services.agent import loop, config
         provider = config.get_provider()  # AI_CAD_PROVIDER / routing / local default

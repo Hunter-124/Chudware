@@ -3,7 +3,7 @@ id: T-R3
 title: PLM change intelligence - plain-language summaries, AI-assist/AI-managed tiers, compare views
 workstream: R
 owner: unassigned
-status: todo
+status: done
 branch: task/T-R3-plm-change-intelligence
 depends_on: [T-R2]
 lane: plm-projects

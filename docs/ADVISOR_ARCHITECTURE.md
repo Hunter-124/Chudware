@@ -29,6 +29,15 @@ Design rules:
    inside a 24k window.
 4. **Every failure is a card, every card has candidate fixes, every retry is bounded.**
    After N attempts the loop escalates (ask_user or dag_replan) — never endless.
+5. **Freedom rule (Hunter, 2026-07-04).** Helpers, checkers, and oversight *inform,
+   audit, and escalate — they never veto a model's action*. The only hard gates are
+   the existing human-gated ones (kernel-fact dispute waivers §9.3, autonomy dial,
+   destructive/external actions). Complexity goes into help, not restrictions; the
+   tier profile decides how much help is injected, per the model in use.
+6. **Everything injected is inspectable.** Every block a model received, every check
+   that ran, every delegation and audit verdict is an event on the ledger stream and
+   visible in the transparency UI (§2.15) — troubleshooting the helpers is a
+   first-class requirement.
 
 ## 1. What we build on (reuse map — do not rebuild)
 
@@ -202,6 +211,105 @@ essential for small models), compaction aggressiveness. Ships with profiles:
 `local-24k`, `local-48k`, `mid`, `frontier`. Bench harness runs the same mission
 across tiers.
 
+### 2.10 Tool preflight — plans checked before they touch the doc (T-W12)
+
+Every mutating tool family gains a `preflight` capability: the planned ops are
+dry-run against a **shadow clone** of the document (serialize → clone → apply →
+capture `feature_status`/solver status → discard). Preflight validates: references
+resolve (faces/edges/features by stable id), parameters sane (positive dims, tool
+reach, fillet ≤ adjacent wall), predicted rebuild outcome, and downstream impact
+(which later features reference what's being edited). Results are `aicad.advisory/1`
+items (`check: preflight`). Per the freedom rule a failed preflight does NOT block —
+but "mutation applied after failed preflight, without a dispute" is recorded and is
+an automatic audit trigger (§2.11). External MCP clients get it as an explicit
+`preflight_ops` tool; the internal loop runs it automatically.
+
+### 2.11 Overseer & plan audit (T-W13)
+
+A supervisory role bound to the **highest-capability model available** in the user's
+configured sources (§2.12 routing). It does NOT review every turn (cost); it fires at
+defined checkpoints: plan ratification, stage-exit gates, failure-card escalations,
+post-failed-preflight mutations, and **every user change-request**. It consumes the
+ledger, the active plan/build graph, role handoffs, advisory history, and preflight
+results — and emits `aicad.audit/1` verdicts: finding class (`plan_gap | wrong_order |
+spec_drift | missed_requirement | bad_fix | cot_error`), evidence refs, required
+action. Verdicts are injected to the working role as advisories; repeated failures on
+the same finding escalate to the human via ask_user.
+
+**Change-request routing** is the overseer's second job and the fix for "user asks
+for a change and the agent flails": the request is mapped onto the ledger + build
+graph (which requirements, dimensions, features, and parts it touches), turned into a
+scoped change plan (with preflight), and dispatched to the right role(s) — so a "make
+the bore fit the new 25 mm shaft" edit touches exactly the bore feature, its ledger
+dimension, its fit calc, and re-runs only affected checks.
+
+### 2.12 Hierarchical delegation & model routing (T-W14)
+
+Any agent may request a sub-agent (`role`, task brief, token/attempt budget). Depth-1
+requests from the orchestrator auto-approve; **deeper requests require approval from
+the mission overseer** (policy configurable: auto | overseer | human — the approval
+chain Hunter specified). The delegation tree — who spawned whom, why, with what
+budget and model — is a ledger artifact rendered live in the transparency UI.
+
+Model routing: `services/agent/routing.yaml` maps role × tier → provider/model from
+the user's configured sources, editable in GUI settings (§2.15). Defaults: overseer →
+strongest source; orchestrator/reviewer → strong; sketcher/feature/cam roles →
+cheap/local; fixer → strong (it touches broken states). Budgets inherit down the tree
+(a sub-agent's spend counts against its parent's grant); depth cap default 3.
+
+### 2.13 Build-order DAG (T-W15)
+
+A deterministic planner that turns a build plan into `aicad.buildgraph/1`: nodes are
+parts, features, and ops with **declared prerequisites** (datum before dependent
+sketch; boss before the fillet that blends it; holes after the boss they pierce;
+parts before their mates; verify joins after fan-outs). Validation catches missing
+prerequisites and dangling references *before anything is built* — the "don't miss
+anything on complex components" mechanism. The orchestrator executes in topological
+order, marks node status on the graph (mission-control visible), and for assemblies
+fans part nodes out to parallel sub-agents (§2.14), joining at mate/verify nodes.
+This is the fine-grained complement to `services/dag` missions: mission DAG = which
+jobs; build graph = in what order inside a modeling job. `dag_plan` learns to emit
+build-graph nodes for modeling missions.
+
+### 2.14 Multi-document agent workspace (T-W16)
+
+Parallel part building for assemblies: a **doc ownership registry** (agent leases a
+doc_id; mutations by non-owners are rejected with the owner named; leases expire on
+handoff/death), buildgraph fan-out spawning one modeling sub-agent per part doc, and
+a per-doc event stream so the GUI can render N live viewports at once — the user
+watches every agent's part evolve simultaneously. Assembly-level roles (fit engineer,
+reviewer) take read leases; the world/assembly doc has a single writer at a time.
+
+### 2.15 Transparency & control UI (T-W17)
+
+Two GUI surfaces (ui/imgui, per the pinned-glass-column design language):
+
+- **Inspector panel**: per-turn view of exactly what each agent received (ledger
+  render, advisory block, playbook step — verbatim), tool calls with preflight
+  results, delegation tree with approvals/budgets, audit verdicts, failure cards with
+  attempt history. Driven entirely off the ledger event stream, so any session is
+  replayable offline — this is the troubleshooting window for the helper layer itself.
+- **Settings**: model sources & per-role/tier routing preferences (the routing.yaml
+  editor), delegation approval policy, advisory verbosity, auto-coincident and
+  preflight toggles. Approval prompts (delegation, waivers) surface through the
+  existing interaction contract transports.
+
+### 2.16 PLM / version-control integration (T-W18)
+
+Pillar 19 (workstream R) integration, taken as a design input now:
+
+- **Milestone checkpoints**: stage-exit passes, audit-passed plans, and per-part
+  completions in an assembly fan-out create history entries in the hidden git vault
+  (snapshot-based, per Pillar 19) — agents produce the same Project/History/Checkpoint
+  nouns humans do, never raw git.
+- **Plain-language annotations**: ledger decision/dimension events attach to history
+  entries ("bore set to 20.02 for H7/g6 sliding fit on shaft S1 — advisory adv_…"),
+  which is exactly the AI-drafted history message tier Pillar 19 already planned.
+- **Change-requests reference checkpoints**: the overseer's change plans record which
+  checkpoint they modify, so "undo that change" and "what did the agent change for
+  this request" are answerable from the PLM timeline.
+- Feature-flagged against vault availability; codes to the workstream R contract.
+
 ## 3. Context budget (local-24k reference layout)
 
 | Slot | Tokens |
@@ -227,9 +335,16 @@ T-W1 ledger ─────┬─→ T-W5 advisory engine ─┬─→ T-W8 fail
 T-W2 sketch suite ─────────────────────────┤                             │
 T-W3 fits/tolerance data ─→ T-W4 calculators ─→ T-W9 sim advisor ────────┘
 T-W6 feeds/speeds data ──────────────────────────────────────────────────┘ (via CAM path)
+
+T-W12 preflight (no deps) ──────────────┬─→ T-W13 overseer/audit ─→ T-W14 delegation+routing
+T-W15 build-order DAG (no deps) ────────┤         (also ← T-W1, T-W5)      (also ← T-W7)
+T-W1 + T-W5 ────────────────────────────┘
+T-W5 ─→ T-W17 transparency UI + settings (app-gui)
+T-W7 ─→ T-W16 multi-doc workspace
+T-W1 ─→ T-W18 PLM integration (plm-projects, ← workstream R contract)
 ```
 
-Wave 1 (no deps, parallel now): T-W1, T-W2, T-W3, T-W6.
+Wave 1 (launched 2026-07-04): T-W1, T-W2, T-W3, T-W6. Wave 1b (no deps): T-W12, T-W15.
 
 ## 5. Beyond-the-competition bets (lead suggestions)
 

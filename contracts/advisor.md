@@ -1,6 +1,7 @@
-# contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1)
+# contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.1)
 
-Frozen 2026-07-04. Companion to `docs/ADVISOR_ARCHITECTURE.md` (Pillar 20).
+Frozen 2026-07-04; §10–§15 added same day (minor bump 1.0 → 1.1, additive only).
+Companion to `docs/ADVISOR_ARCHITECTURE.md` (Pillar 20).
 Additive changes bump the minor (`aicad.advisor/1.1`); breaking changes require a new
 major and a migration note here. All schemas are JSON; all lengths mm, angles deg,
 masses g (canonical units per the interaction contract's `normalize_dimension`).
@@ -215,3 +216,149 @@ profiles:
    block the model's next action — models may fix or contest (`advisory_dispute` tool
    logs to ledger; disputes with `kernel` sources require ask_user to waive).
 4. All injected blocks are reproducible offline from the ledger event log (replay).
+
+## §10 Preflight result (`aicad.preflight/1`)
+
+Dry-run of planned ops on a shadow doc clone; never mutates the live doc.
+
+```json
+{
+  "schema": "aicad.preflight/1",
+  "id": "pf_...",
+  "target": {"doc_id": "", "tool": "add_features", "ops_hash": ""},
+  "verdict": "pass|warn|fail",
+  "checks": [{
+    "check": "refs_resolve|params_sane|rebuild_predict|downstream_impact",
+    "result": "pass|warn|fail",
+    "detail": "fillet r=5 exceeds adjacent wall 3.2 on F9",
+    "refs": {"features": ["F9"], "faces": []}
+  }],
+  "predicted": {"feature_status": [], "dof": null, "interference_delta": null},
+  "downstream": [{"feature": "F12", "relation": "references edited face f_5"}],
+  "advisory_items": [ /* aicad.advisory/1 items, ready to inject */ ]
+}
+```
+
+Rules: freedom rule applies — `fail` never blocks; applying a failed-preflight
+mutation without an `advisory_dispute` is logged (`preflight_overridden` ledger
+event) and is an automatic audit trigger (§11). Shadow clones are ephemeral; the
+implementation must guarantee zero live-doc side effects (clone via doc
+serialization, never in-place).
+
+## §11 Overseer audit record (`aicad.audit/1`)
+
+```json
+{
+  "schema": "aicad.audit/1",
+  "id": "aud_...",
+  "trigger": "plan_ratify|stage_exit|escalation|preflight_override|change_request|manual",
+  "scope": {"run_id": "", "stage": "", "roles": [], "buildgraph_nodes": []},
+  "verdicts": [{
+    "class": "plan_gap|wrong_order|spec_drift|missed_requirement|bad_fix|cot_error|ok",
+    "finding": "plan mills the pocket before drilling datum holes used as fixture refs",
+    "evidence": {"ledger_events": [], "advisories": [], "handoffs": [], "preflight": []},
+    "required_action": {"kind": "replan|reorder|edit|ask_user|none", "detail": "", "dispatch_role": null},
+    "severity": "info|action|blocker"
+  }],
+  "model": {"provider": "", "id": ""},
+  "tokens": 0
+}
+```
+
+Rules: overseer runs at trigger points only, never per-turn. Verdicts are delivered
+as advisory items (`source.kind: llm`, so renderers mark them as review findings,
+not kernel facts). Two `blocker` audits with the same `class+finding` fingerprint ⇒
+mandatory ask_user. Change-request trigger: every user-issued fix/change first
+produces an audit-scoped change plan (affected requirements/dimensions/features/
+parts listed with ledger refs) before any mutation is dispatched.
+
+## §12 Delegation tree (`aicad.delegation/1`)
+
+```json
+{
+  "schema": "aicad.delegation/1",
+  "nodes": [{
+    "id": "dg_...", "parent": null,
+    "role": "sketcher", "brief": "<=80 words, self-contained",
+    "requested_by": "orchestrator",
+    "approval": {"policy": "auto|overseer|human", "approved_by": "", "ts": ""},
+    "model": {"provider": "", "id": "", "tier": "local-24k"},
+    "budget": {"tokens_granted": 0, "tokens_spent": 0, "attempts": 0},
+    "docs": [{"doc_id": "", "lease": "write|read"}],
+    "status": "pending|approved|running|done|failed|revoked"
+  }],
+  "depth_cap": 3
+}
+```
+
+Rules: depth-1 from the orchestrator auto-approves; deeper requires the mission
+overseer's approval (or human, per policy). Budgets inherit: child spend accrues to
+every ancestor; a node whose ancestors' remaining budget hits zero is revoked by the
+harness. The tree lives in the ledger (`artifacts` kind `delegation`) and every
+transition is an event.
+
+## §13 Build graph (`aicad.buildgraph/1`)
+
+```json
+{
+  "schema": "aicad.buildgraph/1",
+  "mission": "",
+  "nodes": [{
+    "id": "bg_...", "kind": "part|feature|op|mate|verify|checkpoint",
+    "label": "bore F7 in bracket",
+    "doc_id": "", "refs": {"features": [], "parts": []},
+    "requires": ["bg_datum1", "bg_boss3"],
+    "why": "hole pierces boss3 - must exist first",
+    "status": "pending|building|done|failed|skipped",
+    "assigned": null
+  }]
+}
+```
+
+Rules: graph is validated deterministically before execution (cycle check, dangling
+`requires`, refs resolve against the plan); execution is topological; `verify` nodes
+join fan-outs; `checkpoint` nodes emit PLM history entries (§15). Standard prerequisite
+rules (datum→sketch, boss→blend/pierce, parts→mates) live in the planner as data, and
+the validator's findings are advisory items.
+
+## §14 Model routing & sources (`aicad.routing/1`) — `services/agent/routing.yaml`
+
+```yaml
+schema: aicad.routing/1
+sources:                      # user-configured in GUI settings
+  - id: anthropic_api        # provider seam per Pillar 12 (no consumer-OAuth reuse)
+    kind: anthropic|openai|openrouter|lmstudio|llamacpp|ollama
+    models: [{id: claude-sonnet-4-6, tier: frontier}, ...]
+assignments:                  # role -> ordered preference list, first available wins
+  overseer:      [strongest]  # 'strongest'/'cheapest' resolve against sources at runtime
+  orchestrator:  [strongest]
+  reviewer:      [strong]
+  fixer:         [strong]
+  sketcher:      [cheap_local, strong]   # fall through if local source offline
+  default:       [cheap_local, strong]
+approval_policy: {depth_1: auto, deeper: overseer}
+```
+
+Rules: routing changes are ledger events (troubleshooting: "which model did that").
+GUI settings edit this file through a validated form, never free text. If only one
+source exists, all roles collapse onto it and delegation still works (same model,
+scoped contexts).
+
+## §15 PLM checkpoint link (`aicad.plmlink/1`)
+
+```json
+{
+  "schema": "aicad.plmlink/1",
+  "checkpoint_ref": "<workstream-R history entry id>",
+  "run_id": "", "buildgraph_node": "bg_...",
+  "trigger": "stage_exit|plan_ratified|part_done|mission_done|change_request",
+  "message": "plain-language, AI-drafted per Pillar 19 tier",
+  "ledger_events": [/* seqs folded into the history annotation */],
+  "change_request": {"audit_id": "aud_...", "modifies_checkpoint": null}
+}
+```
+
+Rules: agents never touch git directly — only Pillar 19 nouns (Project/History/
+Checkpoint). Checkpoint messages are drafted from ledger events (provenance rule) and
+carry the dimension rationales verbatim. When the R vault is unavailable the links
+queue in the ledger and flush on availability (no lost annotations).

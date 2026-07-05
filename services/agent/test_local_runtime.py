@@ -118,6 +118,17 @@ class TestGetServedNCtx(unittest.TestCase):
             result = get_served_n_ctx(srv.base_url)
         assert result == 32768
 
+    def test_reads_nested_default_generation_settings_n_ctx(self) -> None:
+        # b9860 (pinned build) nests the served per-slot context here —
+        # verified against the live CUDA server in the T-W31 smoke.
+        from services.agent.local_runtime import get_served_n_ctx
+
+        props_response = {"default_generation_settings": {"n_ctx": 4096},
+                          "total_slots": 8}
+        with _MockHTTPServer({"/props": (200, props_response)}) as srv:
+            result = get_served_n_ctx(srv.base_url)
+        assert result == 4096
+
     def test_fallback_to_model_n_ctx_train(self) -> None:
         from services.agent.local_runtime import get_served_n_ctx
 
@@ -367,6 +378,186 @@ class TestRegisterRoutingSource(unittest.TestCase):
             routing_yaml=Path("/nonexistent/routing.yaml"),
         )
         assert result is False
+
+
+class TestCudaVariantSelection(unittest.TestCase):
+    """T-W31: CUDA build selection + pin reconcile (detection mocked — gate-safe)."""
+
+    @staticmethod
+    def _make_layout(root: Path, *, cuda: bool = True, cpu: bool = True,
+                     flat: bool = False) -> None:
+        if cuda:
+            d = root / "build-cuda" / "bin"
+            d.mkdir(parents=True)
+            (d / "llama-server").write_text("#!/bin/sh\n")
+        if cpu:
+            d = root / "build" / "bin"
+            d.mkdir(parents=True)
+            (d / "llama-server").write_text("#!/bin/sh\n")
+        if flat:
+            (root / "llama-server").write_text("#!/bin/sh\n")
+
+    def test_pin_reconciled_to_benchmarked_build(self) -> None:
+        # T-W29 provenance: installed + benchmarked runtime is b9860 (fdb1db8),
+        # NOT the previously recorded b9871.
+        from services.agent import local_runtime
+
+        assert local_runtime.LLAMA_CPP_PINNED_BUILD == "b9860"
+        assert local_runtime.LLAMA_CPP_PINNED_COMMIT == "fdb1db8"
+
+    def test_find_server_prefers_cuda_when_gpu_present(self) -> None:
+        from installer import llamacpp
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._make_layout(root, cuda=True, cpu=True)
+            p = llamacpp.find_server(root, prefer_cuda=True)
+            assert p is not None and "build-cuda" in str(p)
+            assert llamacpp.server_variant(p) == "cuda"
+
+    def test_find_server_cpu_fallback_without_gpu(self) -> None:
+        from installer import llamacpp
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._make_layout(root, cuda=True, cpu=True)
+            p = llamacpp.find_server(root, prefer_cuda=False)
+            assert p is not None and "build-cuda" not in str(p)
+            assert llamacpp.server_variant(p) == "cpu"
+
+    def test_find_server_cuda_preference_falls_back_to_cpu_build(self) -> None:
+        from installer import llamacpp
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._make_layout(root, cuda=False, cpu=True)
+            p = llamacpp.find_server(root, prefer_cuda=True)
+            assert p is not None
+            assert llamacpp.server_variant(p) == "cpu"
+
+    def test_find_server_flat_legacy_layout(self) -> None:
+        from installer import llamacpp
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._make_layout(root, cuda=False, cpu=False, flat=True)
+            p = llamacpp.find_server(root, prefer_cuda=True)
+            assert p is not None
+            assert llamacpp.server_variant(p) == "unknown"
+
+    def test_cuda_available_env_override(self) -> None:
+        from installer import llamacpp
+
+        with patch.dict(os.environ, {"AICAD_LLAMA_VARIANT": "cuda"}):
+            assert llamacpp.cuda_available() is True
+        with patch.dict(os.environ, {"AICAD_LLAMA_VARIANT": "cpu"}):
+            assert llamacpp.cuda_available() is False
+
+    def test_cuda_available_no_tool_is_false(self) -> None:
+        from installer import llamacpp
+
+        with patch.dict(os.environ, {"AICAD_LLAMA_VARIANT": ""}), \
+             patch("installer.llamacpp.subprocess.run",
+                   side_effect=FileNotFoundError("nvidia-smi")):
+            assert llamacpp.cuda_available() is False
+
+    def _run_ensure(self, root: Path, cfg: dict) -> tuple[dict, list[str]]:
+        """Drive ensure_server_running with spawn/health/paths mocked (gate-safe)."""
+        from installer import llamacpp
+
+        captured: list[str] = []
+
+        def fake_popen(args, **kwargs):
+            captured.extend(str(a) for a in args)
+            return MagicMock()
+
+        gguf = root / "model.gguf"
+        gguf.write_bytes(b"GGUF")
+        fake_paths = MagicMock()
+        fake_paths.ROOT = root
+        fake_paths.MODELS = root
+        with patch("installer.llamacpp._http_models_ready",
+                   side_effect=[False, True]), \
+             patch("installer.llamacpp.subprocess.Popen", side_effect=fake_popen), \
+             patch("installer.llamacpp.paths", fake_paths), \
+             patch("installer.llamacpp.find_default_model", return_value=gguf):
+            res = llamacpp.ensure_server_running(cfg)
+        return res, captured
+
+    def test_ensure_running_cuda_defaults_ngl_and_parallel(self) -> None:
+        # Shipped CUDA defaults = the integrator-verified smoke config
+        # (-ngl 99 -np 8 -c 32768). Result reports variant + offload.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._make_layout(root, cuda=True, cpu=False)
+            server = root / "build-cuda" / "bin" / "llama-server"
+            res, args = self._run_ensure(
+                root, {"server_path": str(server), "port": _free_port()})
+            assert res["variant"] == "cuda"
+            assert res["n_gpu_layers"] == 99
+            assert res["parallel"] == 8
+            assert res["ctx_size"] == 32768
+            assert args[args.index("--n-gpu-layers") + 1] == "99"
+            assert "--parallel" in args
+
+    def test_ensure_running_cuda_user_cfg_wins(self) -> None:
+        # T-W28 discipline: explicit user cfg beats shipped CUDA defaults.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._make_layout(root, cuda=True, cpu=False)
+            server = root / "build-cuda" / "bin" / "llama-server"
+            res, args = self._run_ensure(
+                root, {"server_path": str(server), "port": _free_port(),
+                       "gpu_layers": 10, "ctx_size": 8192})
+            assert res["n_gpu_layers"] == 10
+            assert res["parallel"] is None  # ctx pinned -> no parallel default
+            assert args[args.index("--n-gpu-layers") + 1] == "10"
+            assert "--parallel" not in args
+
+    def test_ensure_running_cpu_build_gets_no_gpu_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._make_layout(root, cuda=False, cpu=True)
+            server = root / "build" / "bin" / "llama-server"
+            res, args = self._run_ensure(
+                root, {"server_path": str(server), "port": _free_port()})
+            assert res["variant"] == "cpu"
+            assert res["n_gpu_layers"] is None
+            assert "--n-gpu-layers" not in args
+            assert "--parallel" not in args
+
+    def test_launch_log_records_variant_and_offload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._make_layout(root, cuda=True, cpu=False)
+            server = root / "build-cuda" / "bin" / "llama-server"
+            self._run_ensure(root, {"server_path": str(server),
+                                    "port": _free_port()})
+            log = (root / "logs" / "llamacpp-server.log").read_text()
+            assert "variant=cuda" in log
+            assert "n_gpu_layers=99" in log
+
+    def test_register_routing_source_accepts_model_list(self) -> None:
+        # T-W31: the provisioner registers BOTH bundled models (W29 role split).
+        from services.agent.local_runtime import register_routing_source
+
+        with tempfile.TemporaryDirectory() as td:
+            routing = Path(td) / "routing.yaml"
+            routing.write_text(yaml.safe_dump({
+                "schema": "aicad.routing/1",
+                "sources": [],
+                "assignments": {"default": ["cheap_local"]},
+            }), encoding="utf-8")
+            changed = register_routing_source(
+                "http://127.0.0.1:8765/v1",
+                ["qwen3-4b", "gemma3-4b-qat"],
+                "cheap_local",
+                routing_yaml=routing,
+            )
+            assert changed is True
+            data = yaml.safe_load(routing.read_text())
+            ids = [m["id"] for m in data["sources"][0]["models"]]
+            assert ids == ["qwen3-4b", "gemma3-4b-qat"]
 
 
 class TestRuntimeInfo(unittest.TestCase):

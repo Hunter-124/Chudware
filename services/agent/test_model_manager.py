@@ -159,6 +159,68 @@ class TestRegistry(unittest.TestCase):
         assert "fallback_file" in _REGISTRY["gemma3-4b-qat"]
 
 
+class TestW29RoleMapping(unittest.TestCase):
+    """T-W31: the W29 tokenmaxx role-model mapping shipped as registry data.
+
+    Numbers/verdicts from benchmarks/tokenmaxx/REPORT.md (copied, not re-derived):
+    qwen3-4b GBNF broken -> prompted_json fan-out; gemma3-4b-qat GBNF 100% ->
+    gbnf_worker; gemma4-e4b dropped; DiffusionGemma NO-GO.
+    """
+
+    def test_qwen3_is_prompted_json_fanout(self) -> None:
+        from services.agent.model_manager import _REGISTRY
+
+        assert _REGISTRY["qwen3-4b"]["structured_output"] == "prompted_json"
+        assert _REGISTRY["qwen3-4b"]["role_shape"] == "fanout"
+
+    def test_gemma3_is_gbnf_worker(self) -> None:
+        from services.agent.model_manager import _REGISTRY
+
+        assert _REGISTRY["gemma3-4b-qat"]["structured_output"] == "gbnf"
+        assert _REGISTRY["gemma3-4b-qat"]["role_shape"] == "gbnf_worker"
+
+    def test_dropped_models_not_in_registry(self) -> None:
+        # gemma4-e4b dropped (slower/larger, no upside); DiffusionGemma NO-GO.
+        from services.agent.model_manager import _REGISTRY
+
+        assert "gemma4-e4b" not in _REGISTRY
+        assert not any("diffusion" in k.lower() for k in _REGISTRY)
+
+    def test_structured_output_for(self) -> None:
+        from services.agent.model_manager import structured_output_for
+
+        assert structured_output_for("qwen3-4b") == "prompted_json"
+        assert structured_output_for("gemma3-4b-qat") == "gbnf"
+        # Unknown model -> the caller's tier default.
+        assert structured_output_for("some-user-model") == "gbnf"
+        assert structured_output_for("some-user-model", default="json_mode") == "json_mode"
+
+    def test_model_for_role_shape(self) -> None:
+        from services.agent.model_manager import model_for_role_shape
+
+        assert model_for_role_shape("gbnf_worker") == "gemma3-4b-qat"
+        assert model_for_role_shape("fanout") == "qwen3-4b"
+        assert model_for_role_shape("nonsense") is None
+
+    def test_list_models_exposes_capabilities(self) -> None:
+        from services.agent.model_manager import list_models
+
+        by_id = {m["id"]: m for m in list_models()}
+        assert by_id["qwen3-4b"]["structured_output"] == "prompted_json"
+        assert by_id["gemma3-4b-qat"]["structured_output"] == "gbnf"
+        assert by_id["qwen3-4b"]["parallel_slots"] == 8
+
+    def test_tiers_yaml_local_models_block_agrees(self) -> None:
+        # tiers.yaml shipped defaults and the registry must never drift apart.
+        from services.agent.model_manager import model_for_role_shape
+        from services.agent.tiers import load_local_models
+
+        block = load_local_models()
+        assert block["gbnf_worker"] == model_for_role_shape("gbnf_worker")
+        assert block["fanout"] == model_for_role_shape("fanout")
+        assert block["parallel_slots"] == 8
+
+
 # --------------------------------------------------------------------------- list_models
 
 

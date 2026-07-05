@@ -18,9 +18,10 @@ does NOT provide:
 Design note: this module deliberately does NOT re-implement spawn/health logic.
 It composes with ``installer.llamacpp.ensure_server_running()`` via cfg injection.
 
-GBNF grammar support: verified present in llama.cpp b9871 (July 2026, the pinned
-release for this task).  ``/v1/chat/completions`` accepts ``grammar`` (raw GBNF
-string) in the request body.  ``roles.py:schema_to_gbnf()`` output is compatible.
+GBNF grammar support: verified present in llama.cpp b9860 (the pinned release —
+see ``LLAMA_CPP_PINNED_BUILD``).  ``/v1/chat/completions`` accepts ``grammar``
+(raw GBNF string) in the request body.  ``roles.py:schema_to_gbnf()`` output is
+compatible (T-W29 bench: gemma3-4b-qat 100% grammar compliance on b9860).
 """
 from __future__ import annotations
 
@@ -53,8 +54,19 @@ __all__ = [
 
 # --------------------------------------------------------------------------- constants
 
-# Pinned llama.cpp release this task was built and verified against.
-LLAMA_CPP_PINNED_BUILD = "b9871"
+# Pinned llama.cpp release the shipped runtime was built and VERIFIED against.
+#
+# Pin reconcile (T-W31): T-W26 recorded "b9871", but the runtime actually
+# installed at ~/.local/share/AI-CAD/llamacpp is release tag b9860 (commit
+# fdb1db8) — both the CPU build (build/bin) and the CUDA build (build-cuda/bin,
+# sm_86) are compiled from that checkout. Everything we have evidence for ran
+# on b9860: the T-W29 tokenmaxx bench (GBNF 100% on gemma3-4b-qat, 476 tok/s
+# qwen3-4b @ N=8) and the integrator CUDA smoke (2026-07-05: -ngl 99 -np 8
+# -c 32768, ~4.8 GB VRAM, 482 tok/s aggregate). The pin therefore records the
+# benchmarked build, not the aspirational one. See
+# benchmarks/tokenmaxx/REPORT.md "Runtime provenance".
+LLAMA_CPP_PINNED_BUILD = "b9860"
+LLAMA_CPP_PINNED_COMMIT = "fdb1db8"
 
 # The source id written to routing.yaml by auto-registration.
 _ROUTING_SOURCE_ID = "bundled_llamacpp"
@@ -100,6 +112,10 @@ class RuntimeInfo:
         self.tier: Optional[str] = tier
         self.server_path: str = raw.get("server", "")
         self.model_path: str = raw.get("model", "")
+        # T-W31: which build variant the installer selected ("cuda"|"cpu"|
+        # "unknown") and the GPU offload it launched with (None = server default).
+        self.variant: str = raw.get("variant", "unknown")
+        self.n_gpu_layers: Optional[int] = raw.get("n_gpu_layers")
 
     def as_dict(self) -> dict:
         return {
@@ -109,6 +125,8 @@ class RuntimeInfo:
             "tier": self.tier,
             "server": self.server_path,
             "model": self.model_path,
+            "variant": self.variant,
+            "n_gpu_layers": self.n_gpu_layers,
         }
 
 
@@ -139,6 +157,14 @@ def get_served_n_ctx(base_url: str, *, timeout: float = 2.0) -> Optional[int]:
         val = data.get("n_ctx")
         if isinstance(val, int) and val > 0:
             return val
+        # b9860 (the pinned build) nests the served per-slot context under
+        # default_generation_settings.n_ctx — verified against the live server
+        # (T-W31 CUDA smoke). Per-slot n_ctx is the honest budget for a turn.
+        dgs = data.get("default_generation_settings", {})
+        if isinstance(dgs, dict):
+            val = dgs.get("n_ctx")
+            if isinstance(val, int) and val > 0:
+                return val
         # Some older builds surface it under "model.n_ctx_train"
         model_info = data.get("model", {})
         if isinstance(model_info, dict):
@@ -254,7 +280,7 @@ def stop(base_url: str, *, timeout: float = 5.0) -> bool:
 
 def register_routing_source(
     base_url: str,
-    model_id: str,
+    model_id: "str | list[str]",
     tier: Optional[str],
     *,
     routing_yaml: Optional[Path] = None,
@@ -274,7 +300,9 @@ def register_routing_source(
     base_url:
         The server's base URL (e.g. ``http://127.0.0.1:8765/v1``).
     model_id:
-        The model registry id (e.g. ``qwen3-4b``).
+        The model registry id (e.g. ``qwen3-4b``) or a list of ids — the T-W31
+        provisioner registers BOTH bundled models (qwen3-4b + gemma3-4b-qat) so
+        the W29 role-shape split is resolvable from routing.yaml.
     tier:
         Tier name string (e.g. ``local-24k``).  Falls back to ``cheap_local``
         if ``None`` (safe default for a 4B model).
@@ -304,16 +332,14 @@ def register_routing_source(
         return False
 
     effective_tier = tier or "cheap_local"
+    model_ids = [model_id] if isinstance(model_id, str) else list(model_id)
 
     new_source = {
         "id": source_id,
         "kind": "llamacpp",
         "base_url": base_url,
         "models": [
-            {
-                "id": model_id,
-                "tier": effective_tier,
-            }
+            {"id": mid, "tier": effective_tier} for mid in model_ids
         ],
         # Auto-registered on first model provision — user may edit freely.
         "_auto_registered": True,

@@ -3,7 +3,7 @@ id: T-X1
 title: Browser session service - persistent per-site login profiles + headless fetch
 workstream: X
 owner: sonnet-drift
-status: doing
+status: review
 branch: task/T-X1-browser-sessions
 depends_on: []
 lane: parts-sourcing

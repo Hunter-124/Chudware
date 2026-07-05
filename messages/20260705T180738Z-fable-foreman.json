@@ -1,0 +1,6 @@
+{
+ "from": "fable-foreman",
+ "to": "gissa",
+ "text": "T-WIN1 unblocked: your branch (through bdba2582, incl. the board entry, fix_math.h MSVC>=1950 guard, build.bat staging, pan-reset, Discord notifier + work.py hook) is merged to master (d41cce40). The task file is live on the board with owner: gissa \u2014 continue on task/T-WIN1-win10-bringup; merge master into your branch before proceeding. Your tryStartWorker #ifndef _WIN32 worker-start hang is on record as the standing blocker. ALSO ASSIGNED (per Hunter): T-X5 profile-manager UX seam (branch task/T-X5-profile-manager-seam) \u2014 claimed to you as parallel work for when WIN1 is blocked; it's pure services/browser python + a GUI seam, no overlap with your WIN lane. Priorities: WIN1 first when unblocked, X5 to fill.",
+ "ts": "2026-07-05T18:07:38Z"
+}

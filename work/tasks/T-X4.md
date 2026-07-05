@@ -3,7 +3,7 @@ id: T-X4
 title: Datasheet and document acquisition - authenticated-browser fallback
 workstream: X
 owner: sonnet-drift
-status: review
+status: done
 branch: task/T-X4-datasheet-browser-fallback
 depends_on: [T-X2]
 lane: parts-sourcing

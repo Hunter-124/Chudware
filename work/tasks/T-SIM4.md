@@ -3,7 +3,7 @@ id: T-SIM4
 title: Solver validation depth - fatigue S-N anchor, FEA live bridge integration test, sim_audit extension
 workstream: SIM
 owner: fable-birch
-status: doing
+status: done
 branch: task/T-SIM4-solver-validation
 depends_on: [T-SIM1]
 lane: simulation

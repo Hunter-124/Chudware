@@ -30,6 +30,7 @@
 #include "ui/agent_inspector_panel.h"  // T-W17
 #include "ui/watch_grid_panel.h"       // T-W17
 #include "ui/agent_settings_panel.h"   // T-W17
+#include "ui/ai_effort_section.h"      // T-W28
 #include "ui/sim_panel.h"                       // T-U6: sim studies (AI_CAD_SHOT=sim_studies)
 #include "artifact_view.h"
 #include "app/app_state.h"
@@ -344,6 +345,10 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantSettingsAdvanced   = eq("settings_advanced");
     cfg.wantComposerDropdown   = eq("composer_dropdown");
     cfg.wantPermissionsPopup   = eq("permissions_popup");
+    // T-W28: AI Effort section shots (settings modal AI tab, fixture-seeded)
+    cfg.wantAiEffortSimple   = eq("ai_effort_simple");
+    cfg.wantAiEffortAdvanced = eq("ai_effort_advanced");
+    cfg.wantAiEffortWarn     = eq("ai_effort_warn");
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
@@ -367,6 +372,12 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantSettingsAdvanced) {
         settingsUi().openSettings = true;
         settingsUi().openSettingsTab = 3;
+    }
+    // T-W28: AI Effort shots — open the modal on the AI tab; the effort model is
+    // seeded from a committed fixture below (no python subprocess in shot mode).
+    if (cfg.wantAiEffortSimple || cfg.wantAiEffortAdvanced || cfg.wantAiEffortWarn) {
+        settingsUi().openSettings = true;
+        settingsUi().openSettingsTab = 1;
     }
     if (cfg.wantComposerDropdown) {
         // Composer model dropdown: seed chat state so the composer is visible and the
@@ -496,6 +507,22 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
             std::printf("agent_settings: seeded from %s (%zu bytes)\n", vf.c_str(), json.size());
         } else {
             std::printf("agent_settings: fixtures dir not found\n");
+        }
+        std::fflush(stdout);
+    }
+    // T-W28: seed the AI Effort section from a committed effort view fixture.
+    if (cfg.wantAiEffortSimple || cfg.wantAiEffortAdvanced || cfg.wantAiEffortWarn) {
+        std::string fx;
+        if (findFixturesDir(fx)) {
+            const char* which = cfg.wantAiEffortWarn       ? "/effort/effort_view_warn.json"
+                                : cfg.wantAiEffortAdvanced ? "/effort/effort_view_advanced.json"
+                                                           : "/effort/effort_view.json";
+            const std::string vf = fx + which;
+            const std::string json = readWholeFile(vf);
+            ui::seedAiEffortFromViewJson(json);
+            std::printf("ai_effort: seeded from %s (%zu bytes)\n", vf.c_str(), json.size());
+        } else {
+            std::printf("ai_effort: fixtures dir not found\n");
         }
         std::fflush(stdout);
     }

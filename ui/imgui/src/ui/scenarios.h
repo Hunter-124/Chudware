@@ -83,6 +83,11 @@ struct ShotConfig {
     bool wantComposerDropdown = false;
     bool wantPermissionsPopup = false;
 
+    // T-W28: AI Effort section shots (fixture-seeded, settings modal AI tab)
+    bool wantAiEffortSimple = false;    // simple mode, 4-level dial
+    bool wantAiEffortAdvanced = false;  // advanced mode, grouped knobs + overrides
+    bool wantAiEffortWarn = false;      // advanced mode with warn-never-block advisories
+
     // Long-running scenario modes (ScenarioRunner step machines)
     bool wantM1 = false;
     bool m1ShotDone = false;

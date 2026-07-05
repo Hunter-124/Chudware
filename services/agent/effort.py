@@ -1,4 +1,4 @@
-"""effort.py — harness effort resolution: presets + per-tier user overrides (T-W28).
+"""effort.py - harness effort resolution: presets + per-tier user overrides (T-W28).
 
 Contract: contracts/advisor.md §8 + 1.3 addendum (deliberation dial) + the §8.1
 effort addendum added by T-W28 (additive 1.4 → 1.5).
@@ -10,13 +10,13 @@ pipeline (loop.run_mission), the design gym (tools/flywheel/bench/gym) and the
 settings GUI (via the ``python3 -m services.agent.effort`` CLI) all obtain the
 effective harness knob set. Precedence, lowest to highest:
 
-    shipped baseline   — derived live from tiers.yaml + the shipped code
+    shipped baseline   - derived live from tiers.yaml + the shipped code
                          constants (ladder / councils / delegation / failures /
                          overseer / triggers). Nothing duplicated, nothing
                          invented: see ``_shipped_baseline``.
-    preset overrides   — services/agent/effort_presets.yaml (aicad.effort/1),
+    preset overrides   - services/agent/effort_presets.yaml (aicad.effort/1),
                          ``overrides.all`` then ``overrides.<tier>``.
-    user overrides     — config.json ``ai_effort.overrides.<tier>`` (the same
+    user overrides     - config.json ``ai_effort.overrides.<tier>`` (the same
                          config.json config.py already owns; save_config's
                          read-merge-write keeps other keys intact).
 
@@ -27,7 +27,7 @@ Freedom rule (warn-never-block)
 -------------------------------
 ``warnings_for(profile)`` mirrors routing.warnings_for: it returns plain-string
 advisories explaining WHY a combination is questionable. Nothing is ever
-blocked or silently clamped — a user override above a contract cap is stored
+blocked or silently clamped - a user override above a contract cap is stored
 verbatim and warned about; runtime enforcement stays where it always lived
 (e.g. delegation.DEPTH_CAP).
 
@@ -79,10 +79,10 @@ class EffortError(ValueError):
 
 # --------------------------------------------------------------------------- knob table
 #
-# name → (group, type, choices) — the GUI's grouping contract (task DoD groups:
+# name → (group, type, choices) - the GUI's grouping contract (task DoD groups:
 # Deliberation / Parallelization / Safety nets / Context). type is "enum",
 # "bool" or "int"; enums list their choices. Structural int floors are NOT
-# enforced here (freedom rule) — they only inform warnings.
+# enforced here (freedom rule) - they only inform warnings.
 
 KNOBS: dict[str, dict[str, Any]] = {
     # -- Deliberation --------------------------------------------------------
@@ -169,7 +169,7 @@ def _council_for_deliberation(deliberation: str) -> str:
 
 def _shipped_baseline(profile: TierProfile) -> dict[str, Any]:
     """Derive the shipped knob values for one tier. Every number here comes
-    from an existing shipped constant — see the import sites below."""
+    from an existing shipped constant - see the import sites below."""
     # Deferred imports: pull the real shipped constants so the baseline can
     # never drift from the code (numbers provenance rule).
     from services.agent.ladder import MAX_BOUNCES                      # = 2
@@ -178,7 +178,7 @@ def _shipped_baseline(profile: TierProfile) -> dict[str, Any]:
     from services.agent.advisor.failures import _DEFAULT_BUDGETS
 
     return {
-        # Deliberation — tiers.yaml is the master source for the dial.
+        # Deliberation - tiers.yaml is the master source for the dial.
         "deliberation": profile.deliberation,
         "ladder": _ladder_for_deliberation(profile.deliberation),
         "ladder_max_bounces": MAX_BOUNCES,
@@ -346,32 +346,32 @@ def warnings_for(profile: EffortProfile, tier_profile: TierProfile) -> list[str]
     if v["delegation_depth"] > DEPTH_CAP:
         out.append(
             f"delegation depth {v['delegation_depth']} exceeds the contract §12 hard cap "
-            f"({DEPTH_CAP}) — the runtime will still enforce the cap; the extra depth buys nothing")
+            f"({DEPTH_CAP}) - the runtime will still enforce the cap; the extra depth buys nothing")
     if v["council"] == "always" and v["deliberation"] == "minimal":
         out.append(
-            "councils are set to 'always' while the deliberation dial is 'minimal' — "
+            "councils are set to 'always' while the deliberation dial is 'minimal' - "
             "every mission convenes councils yet the rest of the minimal dial skips the "
             "machinery that makes their output cheap to consume; consider 'risk_gated'")
     if v["council"] != "off" and v["council_seats"] < 2:
         out.append(
-            f"a council with {v['council_seats']} seat(s) cannot dissent — "
+            f"a council with {v['council_seats']} seat(s) cannot dissent - "
             "two or more seats are needed for round-2 disagreement to mean anything")
     if not v["preflight"]:
         out.append(
-            "preflight is off — mutating tool calls reach the engine unchecked; "
+            "preflight is off - mutating tool calls reach the engine unchecked; "
             "failures surface later as rebuild errors instead of being caught up front (§10)")
     if v["overseer_cadence"] == "manual_only":
         out.append(
-            "overseer audits are manual-only — plan ratification and stage exits go "
+            "overseer audits are manual-only - plan ratification and stage exits go "
             "unaudited unless someone asks (§11)")
     if not v["trigger_injection"] and v["deliberation"] == "full":
         out.append(
-            "full deliberation with trigger injection off — councils run but domain "
+            "full deliberation with trigger injection off - councils run but domain "
             "guardrail packs (threads, bearing fits, ...) never inject (§20)")
     if any(a <= 0 for a in v["failure_max_attempts"].values()):
         zeroed = sorted(k for k, a in v["failure_max_attempts"].items() if a <= 0)
         out.append(
-            f"failure classes {zeroed} have 0 fix attempts — every such failure escalates "
+            f"failure classes {zeroed} have 0 fix attempts - every such failure escalates "
             "straight to the user (§5 on_exhaust)")
     # §8 budget invariant check: swapping the history budget must keep
     # slots + headroom ≤ context_tokens, else the assembler shrinks every turn.
@@ -380,12 +380,12 @@ def warnings_for(profile: EffortProfile, tier_profile: TierProfile) -> list[str]
     if fixed + v["history_budget_tokens"] + tier_profile.generation_headroom > tier_profile.context_tokens:
         out.append(
             f"history budget {v['history_budget_tokens']} breaks the §8 invariant for "
-            f"{profile.tier} (slots + headroom > context {tier_profile.context_tokens}) — "
+            f"{profile.tier} (slots + headroom > context {tier_profile.context_tokens}) - "
             "the turn assembler will shrink history/state on every turn to compensate")
     if profile.level == "maximum" and profile.tier == "frontier":
         out.append(
             "Maximum effort on the frontier tier runs councils, ponders and full context "
-            "packs on paid tokens — expect the highest possible per-mission cost")
+            "packs on paid tokens - expect the highest possible per-mission cost")
     return out
 
 
@@ -402,7 +402,7 @@ def record_effort_snapshot(
 
     Records ALL tiers (the mission may delegate across tiers via routing), plus
     which tier is known-active if the caller knows it. Returns the event dict.
-    Event kind: ``effort_profile`` (replayable — payload carries every resolved
+    Event kind: ``effort_profile`` (replayable - payload carries every resolved
     value + its source).
     """
     tiers = load_all_tiers()
@@ -431,7 +431,7 @@ def save_effort_settings(settings: dict) -> dict:
     """Validate + persist {"level","mode","overrides"} into config.json.
 
     Warnings never block a save (freedom rule); structural errors (unknown
-    knob/level/tier) DO raise — those are malformed input, not user freedom.
+    knob/level/tier) DO raise - those are malformed input, not user freedom.
     """
     level = settings.get("level", DEFAULT_LEVEL)
     if level not in LEVELS:

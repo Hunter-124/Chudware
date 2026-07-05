@@ -16,6 +16,7 @@
 // both the permissions popup and the AI tab's checkboxes call saveAppSettings
 // immediately on toggle (no deferred Save button needed for those fields).
 #include "ui/settings_modal.h"
+#include "ui/ai_effort_section.h"   // T-W28: harness effort (Simple/Advanced)
 #include "ui/model_picker.h"
 #include "ui/model_registry.h"
 
@@ -253,6 +254,9 @@ static void drawAiModelsTab(app::AppState& st, bool busy, AppSettings& s) {
     ImGui::Dummy(ImVec2(0, 4.f * sc));
     if (ImGui::Button("Open Agent Settings\xe2\x80\xa6", ImVec2(180.f * sc, 0)))
         s_ui.wantAgentSettings = true;
+
+    // ---- Harness effort (T-W28) ------------------------------------------------
+    drawAiEffortSection(st);
 }
 
 // ---------------------------------------------------------------------------

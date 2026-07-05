@@ -69,3 +69,6 @@ local models viable across a whole mission.
 - Answer-ledger precedent: `services/agent/interaction.py` (answers.jsonl) — mirror
   its cache_root/runs/<run_id>/ pathing so both ledgers sit together.
 - Do not invent extra ledger sections; additive changes need a contract minor bump.
+
+## Progress log
+- 2026-07-05 00:11 UTC [sonnet-loam] Implemented aicad.ledger/1: Ledger class (event log + replay-from-events + budgeted renderer), ledger_get/ledger_note MCP tools (registered as ledger family, ledger_get classified as read via _READ_EXACT fix), loop.py artifact+decision seam behind AI_CAD_LEDGER flag. 33 tests pass: python -m pytest services/agent/test_ledger.py -q → 33 passed in 0.05s. Deviation: tool_registry.py added to files-touched to fix ledger_get risk classification (required by DoD step 4).

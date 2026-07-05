@@ -1,0 +1,65 @@
+schema: aicad.playbook/1
+id: sketch_profile
+stage: sketch
+# Verbatim from docs/ADVISOR_ARCHITECTURE.md §2.4 (the canonical worked example).
+# Helper tool names align with the sketcher role allowlist and T-W2/T-W3 contracts
+# (sketch_health, suggest_dimension_scheme).
+steps:
+  - id: datums
+    goal: identify functional surfaces and datum choice
+    helper_tools: [describe_part]
+    checklist:
+      - every mating surface named
+      - datum stated with reason
+    output:
+      type: object
+      required: [datum, functional_surfaces]
+  - id: entities
+    goal: draft the entity list roughly (constraints, not coordinates, carry precision)
+    helper_tools: [describe_sketch, add_features]
+    checklist:
+      - profile entities drawn roughly
+      - describe_sketch run after the edit batch
+      - no hand-computed exact coordinates
+    output:
+      type: object
+      required: [entities]
+  - id: close
+    goal: close the profile (regions and gaps)
+    helper_tools: [sketch_health]
+    checklist:
+      - sketch_health reports profile closed
+      - every gap the health card named is resolved
+    output:
+      type: object
+      required: [closed, gaps]
+  - id: geometric_constraints
+    goal: apply geometric constraints first (auto-coincident already applied; advisor lists remaining DOF)
+    helper_tools: [sketch_health, sketch_auto_constrain]
+    checklist:
+      - horizontal/vertical/parallel/perpendicular/tangent/concentric/symmetric applied where intent demands
+      - remaining DOF from sketch_health noted
+      - no duplicate coincidents added over auto-coincident
+    output:
+      type: object
+      required: [constraints_applied, dof_remaining]
+  - id: driving_dimensions
+    goal: apply driving dimensions, function-critical first (manufacturing method + material)
+    helper_tools: [suggest_dimension_scheme, fit_calc]
+    checklist:
+      - function-critical dimensions applied first
+      - every driving dimension value comes from the ledger/spec (fit_calc for fit-driven diameters)
+      - each committed dimension has a ledger DIM entry or cites an existing one
+    output:
+      type: object
+      required: [driving_dimensions]
+  - id: verify
+    goal: confirm the exit gate — fully constrained, closed, no conflicting tags
+    helper_tools: [sketch_health, check_sketch]
+    checklist:
+      - sketch_health reports closed, DOF=0, no conflicts
+      - no "just in case" over-constraint added
+    output:
+      type: object
+      required: [closed, dof, conflicts]
+exit_gate: [sketch_fully_constrained, profile_closed, no_conflicting_tags]

@@ -1,0 +1,55 @@
+schema: aicad.playbook/1
+id: layout_first
+stage: layout
+# Owning role: layout_engineer. Helper tools ⊆ layout_engineer.tool_allowlist.
+# Aligns with the T-BL50 layout-first planning helper (docs/COPILOT_MISSION_PIPELINE.md
+# Phase 3): this is the structured checklist an agent follows to build the skeleton;
+# the deterministic fitment reference every part cites. No duplicate skeleton logic —
+# the layout_engineer role prompt is the behavioural guide, this is its step scaffold.
+steps:
+  - id: fixed_first
+    goal: place fixed/reference items first (the PCB, a customer-supplied shaft)
+    helper_tools: [ledger_get, part_search, new_part]
+    checklist:
+      - fixed/reference envelopes placed before free ones
+      - standard parts that define geometry sourced via part_search (no guessed OD)
+    output:
+      type: object
+      required: [fixed_items]
+  - id: envelopes
+    goal: create each future part as its ENVELOPE ONLY (box/cylinder/simple extrusion), named after the deliverable
+    helper_tools: [add_features, describe_scene]
+    checklist:
+      - one envelope per deliverable, named DLn_envelope
+      - no detail features, no fillets
+    output:
+      type: object
+      required: [envelopes]
+  - id: interfaces
+    goal: make interfaces explicit geometry — named planes/axes/point-patterns
+    helper_tools: [add_features, query_geometry]
+    checklist:
+      - every interface is named geometry a human understands from the name alone
+      - each interface has a ledger dimension entry (position + orientation + driver)
+    output:
+      type: object
+      required: [interfaces]
+  - id: clearance_budgets
+    goal: record a minimum clearance and why between every pair of envelopes that could collide
+    helper_tools: [measure_between, measure_part]
+    checklist:
+      - every stated budget verified with measure_between, never eyeballed from a render
+      - each budget recorded as a decision with its why (thermal / tolerance stack / hand-room)
+    output:
+      type: object
+      required: [clearance_budgets]
+  - id: conflict_check
+    goal: confirm envelopes coexist within budgets; a conflict is a spec conflict, not a quiet shrink
+    helper_tools: [describe_scene, render_part]
+    checklist:
+      - envelopes that cannot coexist → replan_request scope=spec with exact numbers
+      - interfaces list handed off as the contract downstream workers build against
+    output:
+      type: object
+      required: [coexist_ok]
+exit_gate: [skeleton_built, interfaces_named, clearance_budgets_recorded]

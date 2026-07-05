@@ -2,8 +2,8 @@
 id: T-R5
 title: PLM in-editor GUI - history timeline panel, rev badges, checkpoint/release toolbar, compare view (all doc kinds)
 workstream: R
-owner: unassigned
-status: todo
+owner: fable-quill
+status: doing
 branch: task/T-R5-plm-editor-gui
 depends_on: [T-R2, T-R3, T-U1]
 lane: plm-projects

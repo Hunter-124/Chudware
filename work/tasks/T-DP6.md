@@ -41,3 +41,4 @@ calculator/data/context) and AFTER (diagnose, target). Interface components carr
 
 ## Progress log
 - 2026-07-05 22:11 UTC [sonnet-rust1] 36 new tests all pass (256 total in advisor suite, zero regressions). 4 checkers upgraded: interference (axis+depth from real kernel bbox), wall_thickness, DFM, interface_fitment. Pre-op triggers appended (append-only). Pushed task/T-DP6-diagnostic-advisors. Awaiting gate.sh result.
+- 2026-07-05 22:19 UTC [sonnet-rust1] gate.sh PASS — 36 new tests all pass (256 total in advisor suite, zero regressions). FAIL-RECORDED entries are pre-existing (T-V2 cleanup), not introduced by this branch. Real-engine interference test with libaicad.so confirms: two overlapping boxes → volume=4000.0 mm³, axis=+X, depth_mm≈10.0, confidence=calc. 4 checkers upgraded to diagnostic advisors (interference + wall_thickness + dfm + interface_fitment). Pre-op triggers wired via aicad.trigger/1. Branch task/T-DP6-diagnostic-advisors ready for merge review.

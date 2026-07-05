@@ -3,7 +3,7 @@ id: T-DP13
 title: Multi-file agent view — watch N agents build N parts simultaneously
 workstream: DP
 owner: sonnet-vale1
-status: doing
+status: review
 branch: task/T-DP13-multifile-agent-view
 depends_on: []
 lane: app-gui

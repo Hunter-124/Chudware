@@ -3,7 +3,7 @@ id: T-BL27
 title: Surfaces — surf_replace_face "could not heal" unless the replacement splits the solid
 workstream: backlog
 owner: sonnet-lira
-status: review
+status: done
 branch: task/T-BL27-surf-replace-face-heal
 depends_on: []
 priority: 2
@@ -64,3 +64,8 @@ reads as broken.
   this task's suite to core/tests/test_surf_replace_face_heal.cpp with its own CMake target/
   ctest name `surf_replace_face_heal` (test_surfacing target name was already taken). Both
   suites now build and register independently; full ctest + gate re-run before merge to master.
+- 2026-07-05 [opus-sweep] Verified on Windows (windows-occt preset, MSVC 14.44, OCCT 7.9.3):
+  clean 460/460 build, ctest 52/53 (only pre-existing freecad_parity MSVC/GCC solver-convergence
+  diff fails, same as documented on every prior Windows core build — unrelated to this task).
+  Both `surfacing` (T-BL28) and `surf_replace_face_heal` (this task) pass. Merged --no-ff to
+  master, status -> done.

@@ -2,8 +2,8 @@
 id: T-W3
 title: ISO 286 fits and tolerance data + fit_calc + suggest_dimension_scheme
 workstream: W
-owner: unassigned
-status: todo
+owner: sonnet-fife
+status: doing
 branch: task/T-W3-fits-tolerances
 depends_on: []
 lane: ai-copilot

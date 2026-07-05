@@ -453,6 +453,9 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantSketchConvert = eq("sketch_convert");   // T-BL43 Convert Entities in-sketch shot
     cfg.wantFea = eq("fea");
     cfg.wantFeaOverlay = eq("fea_overlay");   // T-SIM2: precomputed-result contour render
+    cfg.wantSimMaterial = eq("sim_material");   // T-SIM3: material-assignment dialog
+    cfg.wantSimPrecheck = eq("sim_precheck");   // T-SIM3: advisor precheck advisory card
+    cfg.wantSimPostcheck = eq("sim_postcheck"); // T-SIM3: advisor margin verdict on Results
     cfg.wantCam = eq("cam");
     cfg.wantFlow = eq("flow");
     cfg.wantDrawing = eq("drawing");
@@ -542,7 +545,8 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
         st.workspace = cmd::Workspace::Sketch;
         ribbon::applyShotEnv(st);
     }
-    if (cfg.wantFea || cfg.wantFlow || cfg.wantFeaOverlay) {
+    if (cfg.wantFea || cfg.wantFlow || cfg.wantFeaOverlay ||
+        cfg.wantSimMaterial || cfg.wantSimPrecheck || cfg.wantSimPostcheck) {
         st.workspace = cmd::Workspace::Simulate;
         ribbon::applyShotEnv(st);
     }
@@ -2275,6 +2279,95 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
         }
     }
 
+    // ---------- T-SIM3: sim UI overhaul shots (material dialog / precheck card / postcheck) ----
+    // Shared doc+study setup mirrors the fea scenario. No live solve is attempted (Netgen is
+    // not provisionable headless — see fea_overlay above); the postcheck shot seeds the result
+    // NUMBERS as a fixture via SimManager::debugSeedStaticResult, while the advisor
+    // precheck/postcheck calls themselves run the real python sim_advisor via the CLI shim.
+    if ((cfg.wantSimMaterial || cfg.wantSimPrecheck || cfg.wantSimPostcheck) && st.workerStarted &&
+        !cfg.simMaterialShotDone && !cfg.simPrecheckShotDone && !cfg.simPostcheckShotDone) {
+        if (simUiSettle > 0) { --simUiSettle; return; }
+        switch (simUiStep) {
+            case 0: {  // New part + box, Simulate workspace
+                std::string err;
+                st.docMirror.newPart(st.worker, err);
+                st.addDocTab(false);
+                nlohmann::json ops = nlohmann::json::array();
+                ops.push_back({{"op","add_feature"},{"feature",{
+                    {"type","box"},{"name","Box1"},{"params",{
+                        {"length",dim(60)},{"width",dim(40)},{"height",dim(10)}}},
+                    {"centered",true}}}});
+                auto r = st.docMirror.applyOps(st.worker, ops);
+                loadMesh(st, r.aicm_path);
+                st.workspace = cmd::Workspace::Simulate;
+                std::printf("sim_ui: box ok=%d rev=%d\n", (int)r.ok, r.revision);
+                std::fflush(stdout);
+                simUiSettle = 3; ++simUiStep; break;
+            }
+            case 1: {  // Static study (+ resolved BC faces for the postcheck variant)
+                ui::simManager().handleCommand(st, "sim_new_static");
+                // sim_precheck stays UNCONSTRAINED (no fixtures/loads) with a very coarse
+                // mesh so the precheck emits its BC findings + the mesh suggestion.
+                ui::simManager().configureActive(st, cfg.wantSimPrecheck ? 0.15f : 0.4f,
+                                                 "steel_1018");
+                if (cfg.wantSimPostcheck) {
+                    auto faceAtExtremeX = [&](bool wantMax) -> nlohmann::json {
+                        nlohmann::json best; double bestC = wantMax ? -1e30 : 1e30;
+                        for (int tid = 1; tid <= 12; ++tid) {
+                            std::string se;
+                            std::string s = st.docMirror.resolvePick(st.worker, 1, "face", tid, se);
+                            if (s.empty()) continue;
+                            try {
+                                auto o = nlohmann::json::parse(s);
+                                if (!o.contains("centroid")) continue;
+                                double cx = o["centroid"][0].get<double>();
+                                if ((wantMax && cx > bestC) || (!wantMax && cx < bestC)) { bestC = cx; best = o; }
+                            } catch (...) {}
+                        }
+                        return best;
+                    };
+                    nlohmann::json fixFace = faceAtExtremeX(false);
+                    nlohmann::json loadFace = faceAtExtremeX(true);
+                    st.selection.clear();
+                    { core::SelItem it; it.selector = fixFace.dump(); it.pending_resolve = false;
+                      st.selection.mutableItems().push_back(it); }
+                    ui::simManager().handleCommand(st, "sim_fixture");
+                    st.selection.clear();
+                    { core::SelItem it; it.selector = loadFace.dump(); it.pending_resolve = false;
+                      st.selection.mutableItems().push_back(it); }
+                    ui::simManager().handleCommand(st, "sim_load_force");
+                    st.selection.clear();
+                }
+                simUiSettle = 2; ++simUiStep; break;
+            }
+            case 2: {  // Drive the surface under test
+                if (cfg.wantSimMaterial) {
+                    ui::simManager().handleCommand(st, "sim_material");  // navigates + opens dialog
+                    std::printf("sim_ui: material dialog opened\n");
+                } else if (cfg.wantSimPrecheck) {
+                    // Run on the unconstrained study: precheck card populates; the static
+                    // dispatch then aborts on its own no-fixture guard (advise-never-veto).
+                    ui::simManager().handleCommand(st, "sim_run");
+                    std::printf("sim_ui: precheck run issued\n");
+                } else {
+                    // steel_1018 yield 370 / ultimate 440 MPa; 300 x SF1.5 = 450 > 440 -> FAIL,
+                    // exercising the loud-but-not-modal verdict styling.
+                    ui::simManager().debugSeedStaticResult(st, 300.0, 0.42, 1.23);
+                    std::printf("sim_ui: postcheck seeded (vM=300 MPa on steel_1018)\n");
+                }
+                std::fflush(stdout);
+                simUiSettle = 12; ++simUiStep; break;
+            }
+            default:
+                if (cfg.wantSimMaterial)  cfg.simMaterialShotDone = true;
+                if (cfg.wantSimPrecheck)  cfg.simPrecheckShotDone = true;
+                if (cfg.wantSimPostcheck) cfg.simPostcheckShotDone = true;
+                std::printf("sim_ui: scenario complete (%s)\n", cfg.name ? cfg.name : "?");
+                std::fflush(stdout);
+                break;
+        }
+    }
+
     // ---------- flow (240 s cap at 60 Hz) ----------
     if (cfg.wantFlow && st.workerStarted && !cfg.flowShotDone) {
         if (flowSettle > 0) { --flowSettle; return; }
@@ -2818,6 +2911,17 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppSt
     }
     if (cfg.wantFeaOverlay) {  // T-SIM2: capture the precomputed-result contour once it settles
         if (cfg.feaOverlayShotDone) {
+            writeBackbufferPng(screenshotPath, dw, dh);
+            if (win) glfwSwapBuffers(win);
+            return FrameAction::Break;
+        }
+        if (win) glfwSwapBuffers(win);
+        return FrameAction::Continue;
+    }
+    if (cfg.wantSimMaterial || cfg.wantSimPrecheck || cfg.wantSimPostcheck) {  // T-SIM3
+        const bool done = cfg.simMaterialShotDone || cfg.simPrecheckShotDone ||
+                          cfg.simPostcheckShotDone;
+        if (done) {
             writeBackbufferPng(screenshotPath, dw, dh);
             if (win) glfwSwapBuffers(win);
             return FrameAction::Break;

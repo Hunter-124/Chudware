@@ -20,6 +20,7 @@
 #include "theme/domain_tokens.h"
 #include "theme/icons.h"
 #include "ui/appearance_common.h"
+#include "ui/layout.h"
 #include "ui/viewport.h"
 #include <platform/paths.h>
 #include <platform/run_subprocess.h>
@@ -1089,6 +1090,38 @@ static void addMissionContext(nlohmann::json& req) {
     if (run && *run) req["ledger_run_id"] = run;
 }
 
+// The advisor writes typographic UTF-8 (— ≥ × ⇒ ≈ °C …) that the app font atlas does not
+// cover — those bytes rendered as '?'. Fold the known symbols to ASCII for display (the raw
+// JSON is preserved in the Study / logs; this is presentation-only).
+static std::string asciiFold(const std::string& in) {
+    static const struct { const char* from; const char* to; } kMap[] = {
+        {"\xe2\x80\x94", "-"},   // — em dash
+        {"\xe2\x80\x93", "-"},   // – en dash
+        {"\xe2\x89\xa5", ">="},  // ≥
+        {"\xe2\x89\xa4", "<="},  // ≤
+        {"\xe2\x89\x88", "~"},   // ≈
+        {"\xc3\x97",     "x"},   // ×
+        {"\xe2\x87\x92", "=>"},  // ⇒
+        {"\xe2\x80\xb2", "'"},   // ′ prime
+        {"\xe2\x80\x99", "'"},   // ’
+        {"\xc2\xb0",     " deg"},// ° (degree)
+        {"\xc2\xb2",     "2"},   // ²
+        {"\xc2\xb3",     "3"},   // ³
+        {"\xc2\xb7",     "."},   // ·
+        {"\xce\x94",     "d"},   // Δ
+    };
+    std::string out = in;
+    for (const auto& m : kMap) {
+        size_t pos = 0;
+        const size_t flen = std::strlen(m.from);
+        while ((pos = out.find(m.from, pos)) != std::string::npos) {
+            out.replace(pos, flen, m.to);
+            pos += std::strlen(m.to);
+        }
+    }
+    return out;
+}
+
 // Build the study-spec dict sim_advisor.precheck/postcheck expect. Face lists mirror what
 // dispatch will actually send (loads with no captured faces are skipped, exactly like
 // runStaticOrModal/runThermal do), so the advisor lints the real solve inputs. Material
@@ -1432,7 +1465,11 @@ static const char* kPresetLabels[4] = {
 void SimManager::drawEmbedded(app::AppState& st, const ImVec2& vpMin, const ImVec2& vpMax) {
     const float S = theme::S();
     const float colW = 360.f * S;
-    ImVec2 colMin(vpMin.x + 8.f * S, vpMin.y + 8.f * S);
+    // T-SIM3: dodge the pinned FeatureManager column (overlay slot 0) instead of pinning at
+    // the same left edge underneath it — the studies panel was buried under the Model Tree.
+    const float fmEdge = overlayColumnEdge(0);
+    const float colX = std::max(vpMin.x, fmEdge > 0.f ? fmEdge : vpMin.x) + 8.f * S;
+    ImVec2 colMin(colX, vpMin.y + 8.f * S);
     float colH = std::max(200.f * S, (vpMax.y - vpMin.y) - 16.f * S);
     ImGui::SetCursorScreenPos(colMin);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, c5::glassBg());
@@ -1531,7 +1568,19 @@ void SimManager::drawStudyRow(app::AppState& st, int i) {
                 }
             }
             ImGui::SameLine();
-            ImGui::TextColored(ok ? c5::accent() : c5::warnCol(), ok ? "\xe2\x80\xa2" : "?");
+            if (ok) {
+                // T-SIM3 style pass: U+2022 "•" is not in the app font atlas (it rendered as
+                // '?', indistinguishable from the warn marker) — draw the status dot directly.
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                const float r = 2.5f * theme::S();
+                const float lh = ImGui::GetTextLineHeight();
+                dl->AddCircleFilled(ImVec2(p.x + r, p.y + lh * 0.55f), r,
+                                    ImGui::ColorConvertFloat4ToU32(c5::accent()));
+                ImGui::Dummy(ImVec2(2.f * r + 2.f, lh));
+            } else {
+                ImGui::TextColored(c5::warnCol(), "?");
+            }
             simTip(tip);
         };
         const std::string matName = [&]{
@@ -2293,8 +2342,11 @@ void SimManager::drawResultControls(app::AppState& st, Study& s) {
             std::string line;
             while (std::getline(nls, line)) {
                 if (line.empty()) continue;
+                // The narration's first line restates the verdict the H2 headline already
+                // shows — skip it to keep the card tight.
+                if (line.rfind("Advisor verdict", 0) == 0) continue;
                 ImGui::PushStyleColor(ImGuiCol_Text, c5::txtDim());
-                ImGui::TextWrapped("%s", line.c_str());
+                ImGui::TextWrapped("%s", asciiFold(line).c_str());
                 ImGui::PopStyleColor();
             }
         }
@@ -2539,7 +2591,7 @@ void SimManager::drawAdvisoryCard(app::AppState& st, Study& s) {
             ImGui::PushID(i);
             ImGui::TextColored(col, "[%s]", sev.c_str());
             ImGui::SameLine();
-            ImGui::TextWrapped("%s", it.value("finding", std::string()).c_str());
+            ImGui::TextWrapped("%s", asciiFold(it.value("finding", std::string())).c_str());
             if (it.contains("candidate_fixes") && it["candidate_fixes"].is_array() &&
                 !it["candidate_fixes"].empty()) {
                 const auto& fx = it["candidate_fixes"][0];
@@ -2549,7 +2601,7 @@ void SimManager::drawAdvisoryCard(app::AppState& st, Study& s) {
                 if (!hint.empty()) {
                     ImGui::Indent(12.f * S);
                     ImGui::PushStyleColor(ImGuiCol_Text, c5::txtDim());
-                    ImGui::TextWrapped("Fix: %s", hint.c_str());
+                    ImGui::TextWrapped("Fix: %s", asciiFold(hint).c_str());
                     ImGui::PopStyleColor();
                     ImGui::Unindent(12.f * S);
                 }

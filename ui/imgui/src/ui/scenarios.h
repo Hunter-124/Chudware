@@ -128,6 +128,18 @@ struct ShotConfig {
     bool feaOverlayShotDone = false;
     int  feaOverlaySettle = 0;
 
+    // T-SIM3: sim UI overhaul shots. sim_material = material-assignment dialog open;
+    // sim_precheck = advisor precheck advisory card after Run on an unconstrained study;
+    // sim_postcheck = advisor margin-verdict row on Results. The postcheck shot seeds the
+    // result NUMBERS as a fixture (Netgen cannot mesh headless — same honesty pattern as
+    // fea_overlay), but the advisor precheck/postcheck subprocess calls are live.
+    bool wantSimMaterial = false;
+    bool simMaterialShotDone = false;
+    bool wantSimPrecheck = false;
+    bool simPrecheckShotDone = false;
+    bool wantSimPostcheck = false;
+    bool simPostcheckShotDone = false;
+
     // Perf harness (frame-driven; runs independent of workerStarted — see
     // ScenarioRunner::tickGlassperf).
     bool wantGlassperf = false;
@@ -137,7 +149,8 @@ struct ShotConfig {
     bool isScenarioMode() const {
         return wantM1 || wantSketch || wantSketchDispatch || wantSketchAutohide || wantSketchConvert
             || wantAsm || wantFea || wantFeaOverlay || wantFlow || wantCam || wantDrawing
-            || wantEvalMass || wantActivity || wantMultidoc;
+            || wantEvalMass || wantActivity || wantMultidoc
+            || wantSimMaterial || wantSimPrecheck || wantSimPostcheck;
     }
 
     // Frame budget for the generic capture path (flow allows ~240 s at 60 Hz).
@@ -209,6 +222,9 @@ private:
     // fea / flow
     int feaStep = 0, feaSettle = 0, feaWaitFrames = 0;
     int flowStep = 0, flowSettle = 0, flowWaitFrames = 0;
+
+    // T-SIM3 sim UI shots (material dialog / precheck card / postcheck verdict)
+    int simUiStep = 0, simUiSettle = 0;
 
     // evalmass
     int evalStep = 0, evalSettle = 0;

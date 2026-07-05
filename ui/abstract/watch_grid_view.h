@@ -25,6 +25,8 @@ struct WatchTile {
     std::string node_status;    // pending|building|done|failed|skipped (buildgraph)
     std::string lease;          // write|read
     std::string render_abs_path; // absolute path to latest render PNG ("" if none)
+    // T-DP13: per-tile live activity animation accumulator (ticked each frame by watch_grid_panel).
+    float       spinT = 0.f;
 };
 
 struct WatchGridModel {

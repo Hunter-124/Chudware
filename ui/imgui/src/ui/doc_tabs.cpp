@@ -6,6 +6,7 @@
 #include "theme/tokens.h"
 #include "imgui.h"
 #include "imgui_internal.h"
+#include <cmath>
 #include <string>
 
 namespace ui {
@@ -66,13 +67,21 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     std::string label = t.displayTitle();
     if (t.dirty) label += " *";
 
+    // T-DP13: tick per-tab agent spinner animation.
+    const float dt = ImGui::GetIO().DeltaTime;
+    if (t.agentRunning) t.agentSpinT += dt;
+
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float padX = theme::U(1.5f);
     const float closeW = 18.f * S;
     const float iconSz = 16.f * S;
     const float iconGap = theme::U(0.75f);
     const float textW = ImGui::CalcTextSize(label.c_str()).x;
-    const float tabW = padX + iconSz + iconGap + textW + 6.f * S + closeW + padX * 0.5f;
+    // T-DP13: reserve space for the live activity dot when an agent is running.
+    const float agentDotDiam = 7.f * S;
+    const float agentDotGap  = 4.f * S;
+    const float agentExtraW  = t.agentRunning ? (agentDotGap + agentDotDiam) : 0.f;
+    const float tabW = padX + iconSz + iconGap + textW + agentExtraW + 6.f * S + closeW + padX * 0.5f;
     const float tabH = barH;
 
     const ImVec2 p0(x, y0);
@@ -107,7 +116,26 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
                        p0.y + (tabH - ImGui::GetFontSize()) * 0.5f),
                 textCol, label.c_str());
 
-    if (hovered && !t.path.empty())
+    // T-DP13: live agent activity indicator — pulsing dot in the tab when an agent
+    // holds a write lease on this doc.  Uses the same accent-dot vocabulary as the
+    // Copilot header (agent_panel.cpp drawCopilotHeader).
+    if (t.agentRunning) {
+        const float dotR   = agentDotDiam * 0.5f;
+        const float dotCx  = p0.x + padX + iconSz + iconGap + textW + agentDotGap + dotR;
+        const float dotCy  = p0.y + tabH * 0.5f;
+        // Pulse: brightness oscillates on a ~1.2 s cycle.
+        const float pulse  = 0.55f + 0.45f * std::sin(t.agentSpinT * 5.2f);
+        const ImU32 dotCol = theme::roleU32(theme::pal().accent, pulse);
+        dl->AddCircleFilled(ImVec2(dotCx, dotCy), dotR, dotCol);
+    }
+
+    if (hovered && t.agentRunning && !t.agentOwner.empty()) {
+        // Attribution tooltip: agent role + model when available.
+        if (!t.agentModel.empty())
+            ImGui::SetTooltip("Agent: %s\nModel: %s", t.agentOwner.c_str(), t.agentModel.c_str());
+        else
+            ImGui::SetTooltip("Agent: %s", t.agentOwner.c_str());
+    } else if (hovered && !t.path.empty())
         ImGui::SetTooltip("%s%s", t.path.c_str(), t.dirty ? "  (unsaved changes)" : "");
     else if (hovered && t.dirty)
         ImGui::SetTooltip("Unsaved changes");

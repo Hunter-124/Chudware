@@ -418,6 +418,7 @@ int ShotConfig::captureFrameBudget() const {
     if (isScenarioMode()) return 999999;
     if (wantGlassperf) return glassperfShotDone ? 10 : 400;
     if (wantQuestion) return 20;  // T-BL40: let layout stabilize (frame 1 has near-zero logW)
+    if (wantAgentMultifile) return 20;  // T-DP13: let activity spinners animate a few frames
     return 6;
 }
 
@@ -479,6 +480,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantAgentInspectorFailure    = eq("agent_inspector_failure");    // T-W17
     cfg.wantAgentInspectorDelegation = eq("agent_inspector_delegation"); // T-W17
     cfg.wantWatchGrid           = eq("watch_grid");             // T-W17
+    cfg.wantAgentMultifile      = eq("agent_multifile");        // T-DP13
     cfg.wantAgentSettings       = eq("agent_settings");         // T-W17
     cfg.wantAgentSettingsError  = eq("agent_settings_error");   // T-W17
     cfg.wantSimStudies   = eq("sim_studies");   // T-U6
@@ -637,6 +639,22 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
             std::printf("watch_grid: loaded workspace %s\n", ws.c_str());
         } else {
             std::printf("watch_grid: fixtures dir not found\n");
+        }
+        std::fflush(stdout);
+    }
+    // T-DP13: agent_multifile — 2 docs under concurrent agent work (fixture-seeded, no worker).
+    // Opens the Watch Grid panel (reuse T-W17 substrate) seeded from the r_concurrent_agents
+    // fixture: both docs are node_status=building so the live activity indicators are visible.
+    // Doc tabs also have agentRunning=true wired in tickSimpleShots to show per-tab running dots.
+    if (cfg.wantAgentMultifile) {
+        std::string fx;
+        if (findFixturesDir(fx)) {
+            const std::string ws = fx + "/runs/r_concurrent_agents/workspace_status.json";
+            ui::openWatchGridPanel();
+            ui::loadWatchWorkspace(ws);
+            std::printf("agent_multifile: loaded workspace %s\n", ws.c_str());
+        } else {
+            std::printf("agent_multifile: fixtures dir not found\n");
         }
         std::fflush(stdout);
     }

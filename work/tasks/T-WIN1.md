@@ -89,3 +89,32 @@ untouched.
   Linux untouched. Task file drafted here for foreman review because no board entry
   for T-WIN1 existed. NOT self-claimed / not merged — awaiting foreman to land this
   on master's board, then gissa claims atomically and proceeds with stages 1-7.
+- 2026-07-05 [gissa/opus-wynn] Verification pass on this Win11 box (MSVC 14.44, VS2022).
+  STAGES 1-3 VERIFIED:
+  * Stage 1 — full OCCT core (windows-occt preset) already built + current; `ctest`
+    = **48/49** (mesher_autopick PASSES at 159s — earlier "timeout" was only a 120s
+    ctest limit; the one real fail is `freecad_parity` point-on-ellipse solver
+    non-convergence, which matches the documented Windows baseline, pre-existing).
+  * Stage 2 — libaicad.dll + OCCT TK*.dll stage into dist\AI-CAD\ next to the exe (✓).
+  * Stage 3 — host imgui GUI (AI-CAD.exe) builds via build.bat + stages (✓).
+  STAGE 4-6 PARTIAL, honest findings:
+  * The GUI renders fully on Windows (verified from headless `AI_CAD_SHOT=sketch`
+    captures in scratch/sketch_shots): ribbon, FeatureManager, Copilot, dark theme all
+    correct; sketch solver = "Fully Defined DOF: 0"; engine created a real parametric
+    solid (Sketch1 -> Boss-Extrude1 -> Solid Bodies(1)/Body1). => kernel + solver + UI
+    reach parity.
+  * OPEN: viewport GEOMETRY framing in headless capture is blank/unframed (background/
+    plane/triad render, but the profile/solid aren't visibly framed) — needs an
+    INTERACTIVE visible-window eyeball on Windows to confirm final render parity. This
+    is the right spot for gissa (human at the GUI) to verify.
+  * BLOCKER: `AI_CAD_SHOT=m1` hangs headless — Windows `tryStartWorker()` needs the
+    Python worker (in-process libaicad fallback is `#ifndef _WIN32`, Linux-only,
+    host/src/core/app_state.cpp:580); worker-start / venv-freshness re-provision stalls
+    with no stdout diagnostic (errors go to the in-app log). Flagged for app-gui/engine
+    owner; NOT a WIN-lane fix (deliberate "Python worker is the Windows production path"
+    design per that file's comment).
+  DOCS: docs/BUILD_WINDOWS.md updated — replaced the stale "Not yet verified: ImGui
+  desktop app" section with the verified build+headless-capture flow and the three
+  honest open parity gaps above.
+  NET: full app builds + launches + models on Windows; the remaining honest gap is
+  interactive viewport render-parity confirmation + the m1 headless worker hang.

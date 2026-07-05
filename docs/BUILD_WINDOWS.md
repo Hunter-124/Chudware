@@ -105,7 +105,45 @@ plus a missing `langgraph-checkpoint-sqlite` dependency that blocks `services/da
 - **Legacy `UnicodeEncodeError` on `work.py board`** was a cp1252-console bug, fixed on `master`
   (`work.py` forces UTF-8 stdout). If you hit it on an old checkout, pull latest.
 
-## Not yet verified
+## Desktop app (`host/`) — Windows status (T-WIN1)
 
-- **ImGui desktop app** (`AICAD_BUILD_APP=ON`) — still references `host/extern/glad`; blocked on the
-  `host/` deletion + a Windows app preset.
+The imgui desktop host **builds, launches, and renders on Windows 10/11** (MSVC 14.44,
+VS 2022). Build it with:
+
+```
+build.bat            REM configures host\ (VS 2022 gen), compiles AI-CAD.exe, stages dist\AI-CAD\
+```
+
+`build.bat` stages `libaicad.dll` + the OCCT/Netgen sibling DLLs next to the exe (it now
+finds them in **either** the VS `core\build-occt\bin\Release` layout **or** the Ninja
+`build\windows-occt\bin` preset layout — see the dual-layout staging fix).
+
+**Headless screenshot capture** (drives the GUI with no visible window):
+
+```
+set AI_CAD_HIDDEN=1
+set AI_CAD_REPO=C:\path\to\CAD
+set AI_CAD_SHOT=sketch      REM scenarios: settings|chat|ribbon|pmform|m1|sketch|asm|fea|...
+dist\AI-CAD\AI-CAD.exe      REM writes PNGs to %AI_CAD_REPO%\scratch\<scenario>_shots\
+```
+
+Verified via the `sketch` scenario: UI chrome (ribbon, FeatureManager, Copilot, dark theme)
+renders correctly; the sketch solver reports **Fully Defined DOF: 0**; and the engine builds
+a real parametric solid (`Sketch1 -> Boss-Extrude1 -> Solid Bodies(1)/Body1`). So the
+**geometry kernel, sketch constraint solver, and UI all reach parity on Windows.**
+
+### Open parity gaps (T-WIN1, honest status)
+
+- **Viewport geometry framing in headless capture is unconfirmed.** In `sketch`-scenario
+  captures the viewport *background* renders (sketch plane, origin triad) but the sketch
+  profile / extruded solid are not visibly framed. Undetermined whether the geometry is
+  drawn-but-not-zoomed-to-fit vs not drawn under `AI_CAD_HIDDEN`. **Needs an interactive
+  (visible-window) eyeball on Windows to confirm final render parity vs Linux.**
+- **`AI_CAD_SHOT=m1` scenario hangs headless.** On Windows `AppState::tryStartWorker()` requires
+  the managed **Python worker** (the in-process `libaicad` fallback is `#ifndef _WIN32`,
+  Linux-only — `host/src/core/app_state.cpp`); if worker start / the venv-freshness re-provision
+  gate stalls, the scenario never fires. The app is console-subsystem but its diagnostics go to
+  the in-app log (not stdout), so headless runs are hard to observe. Filed for the app-gui/engine
+  owner; not a WIN-lane fix.
+- **`freecad_parity` ctest** (48/49) — pre-existing MSVC-vs-GCC solver-convergence diff on the
+  point-on-ellipse case; reproduced here, not a Windows regression (see above).

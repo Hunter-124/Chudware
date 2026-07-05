@@ -431,25 +431,28 @@ def run_ladder(
 # --------------------------------------------------------------------------- ledger events
 
 def _record_artifact(ledger: Ledger, rung: str, artifact: dict) -> None:
-    """Write a rung artifact to the ledger as a replayable artifact event.
+    """Write a rung artifact to the ledger as a REPLAYABLE artifact event.
 
-    The event payload records a compact SUMMARY (schema/rung/id + a shallow shape
-    fingerprint), NOT the full artifact body. Two reasons: (1) the ledger's Artifacts
-    section only surfaces {kind,id,path,stage,note} anyway; (2) keeping the payload out
-    of queryable ``state["artifacts"]`` means no downstream rung's ledger slice can
-    ever carry a prior rung's artifact text — the fresh-context rule holds by
-    construction, not by render truncation. The full artifact lives in the ladder's
-    in-memory ``artifacts`` dict (the real data flow) and, replayably, in the rung
-    handoff event the executor would emit in the live pipeline."""
-    fingerprint = {k: (len(v) if isinstance(v, list) else "…")
-                   for k, v in artifact.items()}
+    §22: "Rung artifacts (all ledger events, all replayable)" and Rung E: workers
+    receive "the SLICE of the ladder artifacts their node cites" — that slice is read
+    from the ledger, so the FULL artifact body MUST persist here. The event carries the
+    full ``artifact`` plus the ledger's native artifact fields (kind/id/note/stage) so
+    it is both replayable AND legible in the Artifacts section.
+
+    This does NOT reopen the fresh-context leak: ``ledger_render``'s Artifacts renderer
+    reads only {kind,id,path,stage,note} and never touches the ``artifact`` key, so the
+    body never surfaces in a render at any budget; and every downstream rung's ledger
+    slice additionally excises the Artifacts section (``_strip_artifacts_section``). The
+    body is persisted-and-replayable, yet unreachable by a later rung — both invariants
+    hold, proven by test_ladder_slice_excludes_prior_artifacts_at_any_budget."""
     ledger.append("design_thinker", "artifact", {
         "schema": "aicad.ladder/1",
         "id": rung,
         "rung": rung,
         "kind": "ladder_artifact",
-        "note": f"{rung} shape={fingerprint}",
+        "note": f"{rung} ({len(artifact)} slots)",
         "stage": "spec" if rung != "build_pathway" else "layout",
+        "artifact": artifact,  # full body — replayable; Rung-E slice source (T-W19)
     })
 
 

@@ -323,6 +323,21 @@ class TestHappyPath(_LadderTestCase):
         rungs = {e["payload"].get("id") or e["payload"].get("rung") for e in arts}
         # each of the four rung artifacts recorded
         self.assertGreaterEqual(len(arts), 4)
+        self.assertTrue({"function_map", "geometry_plan", "linkage_map",
+                         "build_pathway"} <= rungs, f"missing rung artifacts: {rungs}")
+
+    def test_ladder_artifact_events_are_replayable(self):
+        """§22: 'all ledger events, all replayable'. Rung E reads the SLICE of ladder
+        artifacts a node cites from the ledger (T-W19 seam) — so the FULL artifact body
+        MUST persist in the event, not just a summary."""
+        prov = ScriptedLadderProvider()
+        ladder.run_ladder(self.ledger, prov, deliberation="full")
+        fm_event = next(e for e in self.ledger.events
+                        if e["kind"] == "artifact" and e["payload"].get("rung") == "function_map")
+        body = fm_event["payload"].get("artifact")
+        self.assertIsInstance(body, dict, "artifact event must carry the full body")
+        self.assertIn("functions", body, "function_map body must be replayable in full")
+        self.assertEqual(body["functions"][0]["statement"], "locate the 6202 bearing")
 
 
 # --------------------------------------------------------------------------- VALIDATORS

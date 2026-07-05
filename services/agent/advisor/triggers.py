@@ -258,12 +258,26 @@ _NOMINAL_MM_RE = re.compile(
 _TABLE: Optional[list[dict]] = None
 
 
+def _raw_triggers() -> list[dict]:
+    """triggers.yaml is the runtime table when PyYAML is available (contract
+    §20: the table is user-editable data); the builtin mirror is the fallback
+    for yaml-less environments."""
+    try:
+        import yaml  # type: ignore
+        data = yaml.safe_load(_YAML_PATH.read_text())
+        entries = data.get("triggers", []) if isinstance(data, dict) else []
+        if entries:
+            return entries
+    except Exception:  # noqa: BLE001 — fail soft to the builtin mirror
+        pass
+    return _BUILTIN_TRIGGERS
+
+
 def load_table() -> list[dict]:
     """Compile the trigger table and cache it.
 
-    The runtime source is :data:`_BUILTIN_TRIGGERS` (Python dict literal,
-    mirrors ``triggers.yaml`` exactly).  ``triggers.yaml`` is the canonical
-    human-readable spec but is not loaded at runtime to avoid a PyYAML dep.
+    Runtime source: ``triggers.yaml`` when parseable (user-editable per
+    contract §20), else :data:`_BUILTIN_TRIGGERS` (an exact mirror).
 
     Each entry is compiled from the raw dict into a matcher-ready form with
     pre-compiled ``re.Pattern`` objects.
@@ -273,7 +287,7 @@ def load_table() -> list[dict]:
         return _TABLE
 
     compiled: list[dict] = []
-    for t in _BUILTIN_TRIGGERS:
+    for t in _raw_triggers():
         match_spec = t.get("match", {})
         kw_patterns: list[re.Pattern] = []
         for kw in match_spec.get("keywords", []):

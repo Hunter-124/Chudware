@@ -686,3 +686,168 @@ class TestOrgToolRegistration:
         flagged = {f.message.split("'")[1] for f in roles.flags(findings)
                    if "not yet registered" in f.message}
         assert flagged == set(), f"Unexpected feature flags: {flagged}"
+
+
+# ---------------------------------------------------------------------------
+# 9. STAGE EXIT-GATE WIRING (stages.check_interface_change_gate)
+# ---------------------------------------------------------------------------
+
+class TestStageExitGateWiring:
+    """Proof: the real stages.py gate function blocks on unacked interface_change.
+
+    This is the 'discriminating test' the advisor requested: we call the actual
+    foreman-callable gate, not just the OrgState predicate, to prove the wiring
+    is real (§18: 'enforced at stage-exit').
+    """
+
+    def _make_two_dept_org(self):
+        manifest = {
+            "schema": "aicad.deliverables/1",
+            "request_verbatim": "part and drawing",
+            "deliverables": [
+                {"id": "DL1", "kind": "part", "name": "p",
+                 "acceptance_criteria": [
+                     {"id": "AC1", "text": "ok",
+                      "check": {"tool": "fit_report", "pass_rule": "ok"}}],
+                 "depends_on": []},
+                {"id": "DL2", "kind": "drawing", "name": "drw",
+                 "acceptance_criteria": [
+                     {"id": "AC2", "text": "ok",
+                      "check": {"tool": "review_drawing", "pass_rule": "ok"}}],
+                 "depends_on": ["DL1"]},
+            ],
+        }
+        chart = build_org_chart(manifest)
+        org = OrgState(org_chart=chart)
+        ch_id = chart["channels"][0]["id"]
+        return org, "dept_DL1", "dept_DL2", ch_id
+
+    def test_gate_passes_when_no_interface_change_sent(self):
+        """check_interface_change_gate returns False (not blocked) with no messages."""
+        from services.agent.advisor.stages import check_interface_change_gate
+        org, dept_a, dept_b, ch_id = self._make_two_dept_org()
+        assert not check_interface_change_gate(org, dept_a)
+
+    def test_gate_blocks_after_interface_change_sent(self):
+        """check_interface_change_gate returns True (BLOCKED) after unacked send."""
+        from services.agent.advisor.stages import check_interface_change_gate
+        org, dept_a, dept_b, ch_id = self._make_two_dept_org()
+        org.channel_send(ch_id, dept_a, "interface_change",
+                         "bore diameter changed to 20.02mm — update drawing dims")
+        assert check_interface_change_gate(org, dept_a), (
+            "Gate should block sender after unacked interface_change"
+        )
+
+    def test_gate_unblocks_after_ack(self):
+        """check_interface_change_gate returns False once recipient acks."""
+        from services.agent.advisor.stages import check_interface_change_gate
+        org, dept_a, dept_b, ch_id = self._make_two_dept_org()
+        msg = org.channel_send(ch_id, dept_a, "interface_change",
+                               "bore diameter changed to 20.02mm — update drawing dims")
+        assert check_interface_change_gate(org, dept_a)
+        org.channel_ack(msg["id"], dept_b)
+        assert not check_interface_change_gate(org, dept_a)
+
+    def test_gate_is_inert_when_org_state_is_none(self):
+        """Passing None org_state never raises and always returns False (safe no-op)."""
+        from services.agent.advisor.stages import check_interface_change_gate
+        assert not check_interface_change_gate(None, "dept_DL1")
+
+
+# ---------------------------------------------------------------------------
+# 10. OVERSEER CONCERN FEED — assemble_evidence integration
+# ---------------------------------------------------------------------------
+
+class TestOverseerConcernFeedIntegration:
+    """Proof: aged unresolved concerns surface in the overseer's assemble_evidence.
+
+    This is the second discriminating test the advisor required: we call the
+    actual assemble_evidence function (not just check the producer helper) and
+    assert the concern appears in the resulting evidence bundle (§18 → §11).
+    """
+
+    def _aged_concern_org(self):
+        """Return an OrgState that has one aged unresolved concern."""
+        os.environ["AICAD_OVERSEER"] = "1"
+        org = OrgState(org_chart=build_org_chart({
+            "schema": "aicad.deliverables/1",
+            "request_verbatim": "x",
+            "deliverables": [{"id": "DL1", "kind": "part", "name": "p",
+                               "acceptance_criteria": [
+                                   {"id": "AC1", "text": "ok",
+                                    "check": {"tool": "fit_report", "pass_rule": "ok"}}],
+                               "depends_on": []}],
+        }))
+        req = org.request_raise("dg_abc", "manager", "concern",
+                                "tolerance stack looks inconsistent with DIM7")
+        org.advance_turn()
+        return org, req
+
+    def test_org_concerns_appear_in_evidence_bundle(self):
+        """assemble_evidence with org_concerns → [ORG-CONCERNS] block present."""
+        from services.agent.advisor.overseer import assemble_evidence, AuditScope
+        try:
+            org, req = self._aged_concern_org()
+            concerns = unresolved_concern_contexts(org)
+            assert concerns, "Fixture must yield at least one aged concern"
+
+            scope = AuditScope(run_id="test-run", stage="feature",
+                               roles=["foreman"], buildgraph_nodes=1)
+            evidence = assemble_evidence(
+                "stage_exit", scope,
+                org_concerns=concerns,
+            )
+            assert "[ORG-CONCERNS]" in evidence, (
+                "assemble_evidence must include [ORG-CONCERNS] block when org_concerns given"
+            )
+            assert req["id"] in evidence, (
+                "The specific request id must appear in the evidence bundle"
+            )
+            assert "[/ORG-CONCERNS]" in evidence
+        finally:
+            os.environ.pop("AICAD_OVERSEER", None)
+
+    def test_no_org_concerns_block_when_none_passed(self):
+        """assemble_evidence without org_concerns → no [ORG-CONCERNS] block."""
+        from services.agent.advisor.overseer import assemble_evidence, AuditScope
+        scope = AuditScope(run_id="test-run", stage="feature",
+                           roles=["foreman"], buildgraph_nodes=1)
+        evidence = assemble_evidence("stage_exit", scope)
+        assert "[ORG-CONCERNS]" not in evidence
+
+    def test_no_org_concerns_block_when_empty_list_passed(self):
+        """assemble_evidence with empty org_concerns → no [ORG-CONCERNS] block."""
+        from services.agent.advisor.overseer import assemble_evidence, AuditScope
+        scope = AuditScope(run_id="test-run", stage="feature",
+                           roles=["foreman"], buildgraph_nodes=1)
+        evidence = assemble_evidence("stage_exit", scope, org_concerns=[])
+        assert "[ORG-CONCERNS]" not in evidence
+
+
+# ---------------------------------------------------------------------------
+# 11. DEPARTMENT_MANAGER card loads and drives a fixture department
+# ---------------------------------------------------------------------------
+
+class TestDepartmentManagerCard:
+    """Proof: roles.load_role('department_manager') loads verbatim and
+    the card's role id can be attached to a fixture department (DoD §3).
+    """
+
+    def test_department_manager_card_loads(self):
+        """load_role('department_manager') must not raise and must return a RoleCard."""
+        from services.agent.roles import load_role
+        card = load_role("department_manager")
+        assert card.id == "department_manager"
+
+    def test_department_manager_card_drives_fixture_dept(self):
+        """The loaded card's role id matches the 'manager.role' set by build_org_chart."""
+        from services.agent.roles import load_role
+        card = load_role("department_manager")
+        manifest = _4deliverable_manifest()
+        chart = build_org_chart(manifest)
+        # Every department's manager.role must match the card id verbatim.
+        for dept in chart["departments"]:
+            assert dept["manager"]["role"] == card.id, (
+                f"dept {dept['id']} manager.role={dept['manager']['role']!r} "
+                f"!= card.id={card.id!r}"
+            )

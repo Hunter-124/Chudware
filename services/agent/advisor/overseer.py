@@ -311,6 +311,7 @@ def assemble_evidence(
     prior_audits: list[dict] | None = None,
     prior_advisories: list[dict] | None = None,
     change_plan: dict | None = None,
+    org_concerns: list[dict] | None = None,
     budget: EvidenceBudget | None = None,
 ) -> str:
     """Assemble the budgeted evidence bundle the audit prompt sees.
@@ -318,6 +319,11 @@ def assemble_evidence(
     ``ledger_text`` is the caller's ``ledger_render(ledger, budget.ledger)`` output
     (passed in so this module stays decoupled from the Ledger class).  Everything
     else is optional — an audit degrades gracefully when a section is absent.
+
+    ``org_concerns`` — list of unresolved-concern context dicts from
+    ``org.unresolved_concern_contexts()``.  When non-empty the concerns are
+    appended as an [ORG-CONCERNS] block so the auditor can flag long-running
+    worker issues (T-W22, §18 concern-aging rule).
     """
     budget = budget or EvidenceBudget()
     parts: list[str] = [f"TRIGGER: {trigger}",
@@ -341,6 +347,14 @@ def assemble_evidence(
         parts.append("[CHANGE-PLAN UNDER AUDIT]\n"
                      + json.dumps(change_plan, ensure_ascii=False, indent=2)
                      + "\n[/CHANGE-PLAN]")
+    if org_concerns:
+        # Unresolved worker concerns that have aged past one manager turn (§18).
+        # Surface them so the auditor can decide whether to escalate.
+        lines = [f"  • [{c['request_id']}] from={c['from']} "
+                 f"raised_turn={c['raised_turn']} current_turn={c['current_turn']}: "
+                 f"{c['body'][:120]}"
+                 for c in org_concerns]
+        parts.append("[ORG-CONCERNS]\n" + "\n".join(lines) + "\n[/ORG-CONCERNS]")
     return "\n\n".join(parts)
 
 
@@ -624,12 +638,17 @@ class Overseer:
         prior_audits: list[dict] | None = None,
         prior_advisories: list[dict] | None = None,
         change_plan: dict | None = None,
+        org_concerns: list[dict] | None = None,
     ) -> AuditResult:
         """Run one audit at a trigger point.  Never raises — degrades to a result.
 
         Returns an :class:`AuditResult`.  A missing provider or a debounced trigger
         yields ``skipped``; a malformed reply yields ``error`` (with an empty audit,
         so the mission proceeds — a broken auditor must not block work).
+
+        ``org_concerns`` — optional list of aged unresolved concerns from
+        ``org.unresolved_concern_contexts()``.  Forwarded to ``assemble_evidence``
+        so the [ORG-CONCERNS] block is visible to the auditor (T-W22, §18).
         """
         if trigger not in TRIGGERS:
             return AuditResult(audit={}, advisory=_empty_advisory(scope),
@@ -652,7 +671,7 @@ class Overseer:
             trigger, scope,
             ledger_text=ledger_text, buildgraph=buildgraph, handoffs=handoffs,
             prior_audits=prior_audits, prior_advisories=prior_advisories,
-            change_plan=change_plan, budget=self.budget,
+            change_plan=change_plan, org_concerns=org_concerns, budget=self.budget,
         )
         user_msg = _audit_user_message(trigger, evidence)
 

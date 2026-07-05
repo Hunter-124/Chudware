@@ -680,51 +680,6 @@ def has_unacked_interface_changes(org_state: OrgState, from_dept: str) -> bool:
     return org_state.has_unacked_interface_changes(from_dept)
 
 
-# ---------------------------------------------------------------------------
-# cited_by_departments — who must be notified on a dimension change (§18 + §21)
-# ---------------------------------------------------------------------------
-
-def cited_by_departments(
-    dim_id: str,
-    org_state: OrgState,
-    ledger: Any,  # services.agent.ledger.Ledger
-) -> list[str]:
-    """Return dept ids that cite ``dim_id`` in their deliverables' dimensions.
-
-    Uses the derivation DAG (services/agent/derivation.py) to find downstream
-    dimensions that reference ``dim_id``, then maps them to departments via the
-    org chart deliverable membership.
-
-    Returns a list of dept ids (may be empty).  Deterministic; no LLM.
-    """
-    from services.agent.derivation import build_dag  # MERGED (T-W14+ chain)
-
-    dag = build_dag(ledger)  # {dim_id: [upstream_ids]}
-    # Build reverse: {upstream: [downstreams]}
-    rev: dict[str, list[str]] = {}
-    for child, parents in dag.items():
-        for par in parents:
-            rev.setdefault(par, []).append(child)
-
-    # Collect all downstream dim ids (BFS).
-    visited: set[str] = set()
-    queue = [dim_id]
-    while queue:
-        cur = queue.pop(0)
-        for child in rev.get(cur, []):
-            if child not in visited:
-                visited.add(child)
-                queue.append(child)
-
-    if not visited:
-        return []
-
-    # TODO: map dim ids to department deliverables via ledger dimensions.
-    # Currently the ledger dimension refs don't carry a deliverable id.
-    # Return all dept ids as a conservative fallback (notifies everyone).
-    # T-W23+ can refine this when dimension→deliverable mapping is explicit.
-    return [d["id"] for d in org_state.org_chart.get("departments", [])]
-
 
 # ---------------------------------------------------------------------------
 # Utility

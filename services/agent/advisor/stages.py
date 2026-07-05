@@ -153,6 +153,9 @@ CHECK_SIM_DIVERGENCE = "sim_divergence"
 CHECK_SIM_MESH = "sim_mesh"
 CHECK_CAM_SIM = "cam_sim"
 CHECK_OPEN_PROFILE = "open_profile"
+# T-W22 org-layer: sender's stage exit is blocked until recipients ack
+# every interface_change the sender posted (§18).
+CHECK_INTERFACE_CHANGE = "interface_change_acked"
 
 
 # ---------------------------------------------------------------------------
@@ -278,3 +281,29 @@ def next_stage(stage: str) -> Optional[str]:
     except ValueError:
         return None
     return STAGES[i + 1] if i + 1 < len(STAGES) else None
+
+
+# ---------------------------------------------------------------------------
+# Org-layer exit-gate helper (T-W22, §18)
+# ---------------------------------------------------------------------------
+
+def check_interface_change_gate(
+    org_state,   # services.agent.org.OrgState — duck-typed to avoid circular import
+    from_dept: str,
+) -> bool:
+    """Return True (BLOCKED) if *from_dept* has unacked interface_change messages.
+
+    The foreman calls this at stage exit: if blocked, the sender's stage advance
+    is gated until every recipient in the channel has acknowledged the change (§18).
+
+    ``org_state`` is the ``OrgState`` instance for the current mission; pass
+    ``None`` (or any falsy value) to skip the check — safe to call unconditionally
+    even when the org layer is disabled (``PipelineFlags.org_layer=False``).
+    """
+    if org_state is None:
+        return False
+    # Duck-typed call — works with real OrgState and any compatible mock.
+    fn = getattr(org_state, "has_unacked_interface_changes", None)
+    if fn is None:
+        return False
+    return bool(fn(from_dept))

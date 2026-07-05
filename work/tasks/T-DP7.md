@@ -2,8 +2,8 @@
 id: T-DP7
 title: Sketch-completion + GSL-status-to-text + critical-dimension scheme helpers
 workstream: DP
-owner: unassigned
-status: todo
+owner: sonnet-brook1
+status: doing
 branch: task/T-DP7-sketch-gsl-helpers
 depends_on: []
 lane: modeling-core

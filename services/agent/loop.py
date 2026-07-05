@@ -33,6 +33,11 @@ from mcp_server.fit_narration import _format_fit  # single home for fit/clearanc
 # Gated by AI_CAD_LEDGER env var (default on); failures are always best-effort.
 _LEDGER_ENABLED = os.environ.get("AI_CAD_LEDGER", "1") not in ("0", "false", "False")
 
+# Advisory engine / foreman (T-W5, Pillar 20): after each build, the foreman runs
+# the stage battery over the result and prepends an [ADVISORY] block to the next
+# model turn.  Gated by AI_CAD_ADVISOR (default on); best-effort like the ledger.
+_ADVISOR_ENABLED = os.environ.get("AI_CAD_ADVISOR", "1") not in ("0", "false", "False")
+
 from . import config as agent_config
 from .providers.base import Provider, assistant, image_part, text_part, user
 
@@ -683,6 +688,36 @@ def _repeat_nudge(res: "ModelResult | AssemblyResult") -> str:
     return msg
 
 
+def _advisory_block(res: "ModelResult | AssemblyResult", seq: int,
+                    ledger=None) -> str:
+    """Run the foreman over a build result and return an [ADVISORY] block (T-W5).
+
+    The loop path has no doc_id — only ``res.fit`` (interference by part name +
+    volume) and ``res.error`` (rebuild) are available, so only those findings
+    fire (see services/agent/advisor/adapters.py).  Best-effort: any failure
+    returns "" so the design loop never breaks.  Advisories are also logged to
+    the ledger event stream (§3) when one is present.
+    """
+    if not _ADVISOR_ENABLED:
+        return ""
+    try:
+        from services.agent.advisor import adapters as _adv_adapters
+        from services.agent.advisor import engine as _adv_engine
+        from services.agent.advisor import render as _adv_render
+        obs = _adv_adapters.observe_build(res, seq=seq)
+        if not obs.findings:
+            return ""
+        advisory = _adv_engine.build_advisory(obs)
+        if ledger is not None:
+            try:
+                ledger.append("foreman", "advisory", advisory)
+            except Exception:  # noqa: BLE001
+                pass
+        return _adv_render.render_advisory(advisory)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _diff(old: str | None, new: str) -> str | None:
     """Unified diff old->new, or None when there is nothing meaningful to show."""
     if not old or old == new:
@@ -1188,6 +1223,9 @@ def run_turn(session: Session, request: str, provider: Provider,
                 prompt_text = VERIFY               # genuine progress -> normal verdict request
                 if noop_change:                    # edited code, byte-identical geometry
                     prompt_text = NOOP_CHANGE_NOTE + "\n" + VERIFY
+            # Foreman advisory (T-W5, §9.1): computed before the verdict prompt so
+            # it leads the next user turn — the block is prepended to the feedback.
+            _adv = _advisory_block(res, seq=i, ledger=_ledger)
             # Show the render (+ fit report) and ask for the next step.
             if sheet_i and getattr(provider, "supports_vision", True):
                 feedback = [text_part(_feedback_ok(res)), image_part(sheet_i),
@@ -1195,6 +1233,8 @@ def run_turn(session: Session, request: str, provider: Provider,
             else:
                 feedback = [text_part(_feedback_ok(res) + _no_vision_note(res) +
                                       "\n" + prompt_text)]
+            if _adv:
+                feedback.insert(0, text_part(_adv))
             session.messages.append(user(feedback))
         else:
             fail_streak += 1
@@ -1204,9 +1244,15 @@ def run_turn(session: Session, request: str, provider: Provider,
             if same_err_streak >= _SAME_ERROR_LIMIT or fail_streak >= _MAX_FAIL_STREAK:
                 stop_reason = "failed"
                 break
+            # Foreman advisory on the rebuild failure (T-W5): wraps the error as a
+            # rebuild-class finding with regen_diagnose as the helper tool.
+            _adv = _advisory_block(res, seq=i, ledger=_ledger)
             # If a prior version built, tell the model it can revert instead of devolving.
             can_revert = last_ok_res is not None or session.last_ok_res is not None
-            session.messages.append(user([text_part(_feedback_err(res, can_revert=can_revert))]))
+            err_parts = [text_part(_feedback_err(res, can_revert=can_revert))]
+            if _adv:
+                err_parts.insert(0, text_part(_adv))
+            session.messages.append(user(err_parts))
 
     # Prefer the last successful build over the last attempted build, so a failing
     # refinement iteration doesn't mask a good model that was already produced.

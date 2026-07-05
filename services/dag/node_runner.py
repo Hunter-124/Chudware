@@ -32,8 +32,23 @@ Event emission:
 """
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Callable, Optional
+
+# Advisory engine / foreman (T-W5, Pillar 20): after a node step, the foreman runs
+# the stage battery over the node's doc (if it carries one) and the advisory block
+# is attached to output_state["advisory"] for injection into the next node's
+# context pack.  Gated by AI_CAD_ADVISOR (default on); best-effort.
+_ADVISOR_ENABLED = os.environ.get("AI_CAD_ADVISOR", "1") not in ("0", "false", "False")
+
+# node_type → advisory stage (the stage whose battery the foreman runs post-step).
+_NODE_TYPE_STAGE: dict[str, str] = {
+    "design": "feature",
+    "structural": "sim",
+    "simulate": "sim",
+    "ecad": "feature",
+}
 
 # ---------------------------------------------------------------------------
 # Verdict type
@@ -203,6 +218,12 @@ def run(
         "doc_id": doc_id,
     }
 
+    # Foreman advisory pass (T-W5, §9.1): run the stage battery over the node's doc
+    # and attach the rendered block for the next node's context pack.  Best-effort.
+    adv_block = _run_advisory(node_type, doc_id, seq=int(elapsed_ms) & 0xFFFF)
+    if adv_block:
+        output_state["advisory"] = adv_block
+
     # Emit appropriate §11 completion event.
     if verdict == VERDICT_DONE:
         _emit(emit, "dag.node.done", {
@@ -317,6 +338,30 @@ def _build_summary(
     if verdict == VERDICT_RETRY:
         return f"{node_name} needs retry ({stop_reason}) after {elapsed_s:.1f}s."
     return f"{node_name} escalated ({stop_reason}) after {elapsed_s:.1f}s."
+
+
+def _run_advisory(node_type: str, doc_id: str | None, seq: int = 0) -> str:
+    """Run the foreman over *doc_id* and return an [ADVISORY] block (T-W5).
+
+    The DAG path DOES carry a doc_id, so the full stage battery (interference,
+    overlap, sketch health, rebuild) can fire against the live doc via the core
+    RPCs.  Best-effort: any failure (no doc, no bridge, no advisor package)
+    returns "" so node execution never breaks.
+    """
+    if not _ADVISOR_ENABLED or not doc_id:
+        return ""
+    stage = _NODE_TYPE_STAGE.get(node_type)
+    if stage is None:
+        return ""
+    try:
+        from services.agent.advisor import adapters, engine, render
+        obs = adapters.observe_doc(doc_id, stage, seq=seq)
+        if not obs.findings:
+            return ""
+        advisory = engine.build_advisory(obs)
+        return render.render_advisory(advisory)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _emit(emit: EmitFn, event_type: str, payload: dict[str, Any]) -> None:

@@ -248,3 +248,62 @@ Sequencing: **T-DP1 first (blocks the role/overseer/council/delegation tier).** 
 are independent and can start immediately. T-DP2/3/4 (roles) parallel after D1. D5/D6
 (overseer/advisory) after D1. D8/D9 after roles. D10 after roles+councils. GUI (D11/12/13)
 after their backend seams. D14 after the R-stack PLM GUI (R5) matures.
+
+---
+
+## 9. Presentation & workspaces (Hunter directive, 2026-07-05)
+
+The AI system needs a real home in the UI, and the app needs clean switching between its
+major modes. Two principles: **full-viewport workspaces** for modes that own the screen
+(ECAD today; AI-Agent and PLM-management next), and a **persistent glass copilot overlay**
+for modes where you model while chatting (Modeling, Sim, CAM, Drawing).
+
+### 9.1 Workspace-switching architecture  *(T-DP15)*
+A single registry of **workspaces**, each declaring its toolbar/menu context and whether it
+is **full-viewport** (owns the screen, like ECAD) or **overlay-hosting** (viewport + the
+pinned glass copilot column). Switching is a first-class action in the workspace bar
+(existing `workspace_bar.cpp`, ui/imgui). Registered workspaces: Modeling, Sketch, Assembly,
+Drawing, Simulation, CAM, **ECAD** (full-viewport, exists), **AI-Agent** (full-viewport,
+NEW), **PLM-management** (full-viewport project hub, NEW — the cross-project view; per-doc
+PLM stays inline via R5), Settings stays a **modal** (consolidated, T-G22 — not a workspace).
+Each workspace restores its own toolbar, panels, and camera/scene context on entry.
+
+### 9.2 The AI-Agent workspace (full-screen comprehensive copilot)  *(T-DP16)*
+A dedicated full-viewport workspace — like ECAD's takeover — for driving and managing the
+agent system. **The glass copilot overlay stays exactly as it is in the modeling section
+(same styling)** for chatting while you model; the AI-Agent workspace is the *comprehensive*
+surface you switch to when you want to see and steer the whole operation. It contains:
+- **The interactive DAG as the centerpiece** (§9.3) — the live mission/build graph.
+- **Worker steering**: pause/resume/redirect/kill any agent or sub-agent; adjust a role's
+  model or effort on the fly; approve/deny a pending sub-agent spawn (ties to the
+  overseer-discretion delegation, T-DP9).
+- **Session management**: list, switch, fork, and resume agent sessions; the multi-file view
+  (T-DP13) so several parts under concurrent work are visible at once.
+- **The transparency stream** (T-DP11): helpers/advisories/councils/tool-calls, inline.
+Switching INTO this workspace replaces the viewport with the comprehensive view; switching
+out returns to the model with the overlay copilot intact.
+
+### 9.3 Interactive agent DAG / flowchart widget  *(T-DP17)*
+A clickable node-graph of the running workflow: mission phases, the build DAG
+(`aicad.buildgraph/1`), and the **delegation tree** (which agent spawned which sub-agent).
+Clicking a node opens that element's detail — the sub-agent's role, model, current tool call,
+ledger slice, token spend, and status (queued / running / blocked / done / failed). Live
+status colouring; the same widget embeds small in the overlay copilot (compact) and large in
+the AI-Agent workspace (full). Reuses the mission workspace event streams (`aicad.mission`)
+and the delegation tree (`aicad.delegation/1`). Glass design language, dark-mode contrast.
+
+### 9.4 AI time-remaining estimator  *(T-DP18)*
+A live **ETA to part-complete**: `remaining_tokens / effective_tokens_per_sec`, where
+`remaining_tokens` = Σ over not-yet-done subtasks of their **expected token cost** (from the
+gym-measured per-role/per-stage token tables — the same measurements W31/W32 recorded, fed by
+the tuning loop T-DP10), and `effective_tokens_per_sec` = the live aggregate rate across
+running slots (the CUDA server's measured throughput). Shown as a **status-bar clock** (whole
+mission) and as **per-node ETAs on the DAG** (§9.3). Honest about uncertainty: shows a range
+when a subtask has few historical samples; never invents a number. Frontier-model runs use the
+provider's observed rate.
+
+### 9.5 Sequencing & collision note
+`workspace_bar.cpp` / doc-tabs / `application.cpp` are shared GUI surfaces — DP13 (multi-file)
+lands first, then DP15 (workspace framework), then DP16 (AI workspace) builds on both. DP17
+(DAG widget) and DP18 (estimator) are more self-contained (a new widget; a backend calc + a
+status-bar element) and can proceed alongside. All ui/imgui only; host/ is reference-only.

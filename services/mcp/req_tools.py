@@ -272,4 +272,117 @@ def register_req_tools(mcp: "FastMCP") -> None:
         if format == "json":
             return json.dumps(doc.to_dict(), indent=2)
 
-        return doc.to_markdown()
+        return _markdown_with_battery_evidence(doc)
+
+    @mcp.tool()
+    def req_verify_by_id(
+        requirement_id: str,
+        doc_id: Optional[str] = None,
+        req_path: Optional[str] = None,
+        req_doc_id: Optional[str] = None,
+    ) -> str:
+        """Auto-verify a single requirement by running its named ``verify_by`` verifiers.
+
+        Runs the battery verifiers listed in the requirement's ``verify_by`` field,
+        writes the result (status + evidence) back into the requirements doc, and
+        returns a JSON summary.
+
+        Verifiers not supported by the battery in v1 (``confirm_dimensions``,
+        ``dfm_check``, ``fit_report``) are skipped and noted in the response.
+
+        Args:
+            requirement_id: The requirement ID to verify (e.g. "R1").
+            doc_id:         Geometry document the verifiers run against.
+            req_path:       Path to the ``.req.json`` file holding the requirements doc.
+            req_doc_id:     Doc-meta doc_id holding the requirements doc (alternative
+                            to req_path; if omitted, falls back to ``doc_id``).
+
+        Returns JSON: ``{ok, requirement_id, status, evidence_count, verifiers_run, unsupported}``.
+        """
+        from services.dag.verify import _run_requirement_verify, VERDICT_DONE
+        import time as _time
+        import json as _json
+
+        # Only fall back to the geometry doc_id as the req-doc holder when no
+        # req_path is given: _load_doc prioritizes doc_id and never falls
+        # through to req_path, so a stray fallback would shadow the file.
+        _req_doc_id = req_doc_id or (doc_id if not req_path else None)
+        node_inputs: dict = {
+            "req_id": requirement_id,
+            "req_path": req_path,
+            "req_doc_id": _req_doc_id,
+            "doc_id": doc_id,
+            "check_type": "requirement",
+        }
+        verdict, output_state = _run_requirement_verify(
+            node_id="mcp-req-verify",
+            node_name=f"req_verify_by_id({requirement_id})",
+            node_inputs=node_inputs,
+            retry_remaining=1,
+            emit=None,
+            tool_fn_override=None,
+            t0=_time.monotonic(),
+        )
+        result = output_state.get("data", {}).get("tool_result") or {}
+        reason = output_state.get("data", {}).get("reason")
+        if verdict == VERDICT_DONE:
+            status = "verified"
+        elif reason == "check_failed":
+            status = "failed"
+        else:
+            status = "error"  # doc/req not found, no supported verifiers, writeback error…
+        return _json.dumps({
+            "ok": verdict == VERDICT_DONE,
+            "requirement_id": requirement_id,
+            "status": status,
+            "evidence_count": result.get("evidence_count", 0),
+            "verifiers_run": result.get("verifiers_run", []),
+            "unsupported": result.get("unsupported", []),
+            "summary": output_state.get("summary", ""),
+        }, indent=2)
+
+
+def _markdown_with_battery_evidence(doc) -> str:
+    """Extend the standard markdown projection with a battery-evidence section.
+
+    Battery evidence entries carry ``source == "battery"`` in their evidence list.
+    Hand-entered evidence lacks that marker.
+    This is additive — the base ``to_markdown()`` output is unchanged.
+    """
+    base = doc.to_markdown()
+
+    from engine_oracle.requirements.requirements import _sort_key
+
+    # Check if any requirements have battery evidence
+    battery_lines: list[str] = []
+    for req in sorted(doc.requirements, key=lambda r: _sort_key(r.id)):
+        b_evs = [
+            ev for ev in req.trace.evidence
+            if isinstance(ev, dict) and ev.get("source") == "battery"
+        ]
+        h_evs = [
+            ev for ev in req.trace.evidence
+            if isinstance(ev, dict) and ev.get("source") != "battery"
+        ]
+        if b_evs or h_evs:
+            battery_lines.append(f"### {req.id} — {req.status}")
+            if b_evs:
+                battery_lines.append(f"**Battery-populated evidence** ({len(b_evs)} entry/entries):")
+                for ev in b_evs:
+                    verifier = ev.get("verifier", "?")
+                    ts = ev.get("ts", "?")
+                    res = ev.get("result", {})
+                    ok_str = "PASS" if res.get("ok", False) else "FAIL"
+                    battery_lines.append(f"  - `{verifier}` at {ts}: {ok_str}")
+            if h_evs:
+                battery_lines.append(f"**Hand-entered evidence** ({len(h_evs)} entry/entries):")
+                for ev in h_evs:
+                    verifier = ev.get("verifier", "?")
+                    ts = ev.get("ts", "?")
+                    battery_lines.append(f"  - `{verifier}` at {ts}")
+
+    if not battery_lines:
+        return base
+
+    evidence_section = "\n## Evidence\n\n" + "\n".join(battery_lines) + "\n"
+    return base + evidence_section

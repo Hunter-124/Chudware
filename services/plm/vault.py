@@ -233,6 +233,52 @@ class Vault:
         return {"item": items_mod.item_view(out["item"]),
                 "working_rev": out["working_rev"]}
 
+    def set_part_number_prefix(self, prefix: str) -> dict[str, Any]:
+        """Configure the part-number scheme (T-R5 locked decision: numbers
+        auto-suggest from a configurable scheme, e.g. ``PRJ-00042``).
+
+        Only the prefix is configurable in v1; the counter stays the
+        zero-padded max+1 rule in :func:`manifest.next_part_number`. Existing
+        item numbers are never rewritten — the scheme applies to future
+        suggestions only. Returns ``{part_number_prefix, next_part_number}``.
+        """
+        clean = "".join(ch for ch in prefix.upper() if ch.isalnum())
+        if not clean:
+            raise VaultError("invalid_mode",
+                             "a part-number prefix needs letters or digits")
+        m = self.manifest()
+        if m.get("part_number_prefix") != clean:
+            m["part_number_prefix"] = clean
+            self._commit_manifest_change(m)
+            m = self.manifest()
+        return {"part_number_prefix": m["part_number_prefix"],
+                "next_part_number": manifest.next_part_number(m)}
+
+    def discard_working_rev(self, item_id: str) -> dict[str, Any]:
+        """Undo a "start rev C" draft: return the working file to the item's
+        last released form and mark it Released again (T-R5 locked decision —
+        the auto-branch toast's "back to rev B (discard draft)" affordance).
+
+        Forward-only like everything else: the return itself is a new history
+        entry, so even a discarded draft can be recovered from the timeline.
+        """
+        m = self.manifest()
+        item = manifest.find_item(m, item_id)
+        if item is None:
+            raise VaultError("invalid_item", f"no such item: {item_id}")
+        pins = [rr for rr in item.get("released_revs", []) or [] if rr.get("commit")]
+        if not pins:
+            raise VaultError("not_found",
+                             "this design has no released version to return to")
+        if item["lifecycle"] == manifest.LIFECYCLE_RELEASED:
+            return {"item": items_mod.item_view(item), "entry": None}
+        res = self.restore(pins[-1]["commit"], item_id)
+        m = self.manifest()
+        item = manifest.find_item(m, item_id)
+        item["lifecycle"] = manifest.LIFECYCLE_RELEASED
+        self._commit_manifest_change(m)
+        return {"item": items_mod.item_view(item), "entry": res["entry"]}
+
     def _commit_manifest_change(self, m: dict[str, Any]) -> str:
         """Persist a manifest-only change as an auto entry (§3.1: the manifest
         is re-committed with every history entry)."""

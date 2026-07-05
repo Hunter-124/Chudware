@@ -80,3 +80,39 @@ integration target for this task. Changes vs the original spec:
 - Acceptance = the capability working through the IN-APP path (services/agent hosts,
   loop.py / dag runner / pipeline), proven by python tests. graphify update . still
   required (that serves our own agents).
+
+## Progress log
+- 2026-07-05 02:59 UTC [sonnet-lark] Implementation complete. Branch task/T-W9-sim-advisor pushed.
+
+## What was built
+
+**services/agent/advisor/sim_advisor.py** (new, 420 lines):
+- `precheck(study, doc_geom)` — BC lint (no fixture/load → blocker, all-fixed/dangling → action), mesh-size suggestion from min fillet/wall, beam_calc_raw anchor (aspect ≥ 3 → confident; else "no anchor"). Returns aicad.advisory/1-shaped items.
+- `postcheck(study, precheck_items, doc_geom)` — margin-policy verdict (PASS/WARN/FAIL per SF), FEA/anchor divergence WARN (>5× ratio, both directions), Kt-pattern suggestion for fillet/sharp-edge max-stress faces.
+- `narrate_postcheck(r)` — additive text appended to describe_results output.
+- `AI_CAD_SIM_PRECHECK_BLOCK` env gate (default on) — deliberate §9.3 deviation documented in module docstring.
+
+**engine_oracle/sim/margin_policy.json** (new):
+metal_steel SF=1.5/2.0, metal_aluminium SF=1.5/2.5, metal_titanium SF=1.4/2.0, polymer SF=2.0/3.0, general SF=2.0/3.0. Sources: Shigley 10th §6-12.
+
+**services/agent/advisor/stages.py** — added CHECK_SIM_BC/MARGIN/ANCHOR/DIVERGENCE/MESH; sim battery now [sim_bc, sim_results, sim_margin, sim_divergence, sim_mesh, sim_anchor]; exit gate: [sim_bc, sim_results, sim_margin].
+
+**services/agent/advisor/engine.py** — fix providers for sim_bc, sim_margin, sim_divergence registered in _FIX_PROVIDERS.
+
+**services/mcp/gsl_tools.py** — additive postcheck narration appended to fea_static describe_results path; guarded so advisor failure never crashes narration. Existing frozen-string tests unaffected.
+
+**services/agent/advisor/test_sim_advisor.py** — 43 tests, all offline (no FEA solver, no network).
+
+## Test output
+43 passed, 0 new regressions
+Baseline: 23 failed / 40 errors (all pre-existing issue #16, unchanged)
+Suite: 1260 passed, 23 failed, 35 skipped, 40 errors (vs 1217/23/35/40 before)
+
+## Citation honesty
+FEA solver does not run headlessly in CI. Divergence tests seed a study dict with max_von_mises_mpa set to 1.5× / 10× beam_calc_raw output for same geometry — proves comparison logic, does NOT verify the FEA solver. Documented in test docstrings.
+
+## DoD checkboxes
+- [x] Precheck catches BC-lint fixture classes and suggests mesh size
+- [x] Hand-calc anchor emitted for beam-like fixtures; divergence WARN works
+- [x] describe_results narrates margin verdict + geometry-linked suggestions
+- [x] Wired as sim-stage battery + exit gate; tests pass

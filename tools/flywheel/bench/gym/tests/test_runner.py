@@ -16,6 +16,30 @@ from tools.flywheel.bench.gym import report as report_mod
 from tools.flywheel.bench.gym.taxonomy import TAXONOMY
 
 
+def test_probe_reports_real_agent_fn_when_wired():
+    """T-W30 regression: the execution probe must report real_agent_fn=True now that
+    node_runner._default_agent_fn is the real tool-executing turn (config provider
+    seam + agent_turn), NOT the historical silent stub that imported a non-existent
+    services.agent.providers.anthropic module. This test FAILS if the stub returns."""
+    probe = execution_probe()
+    assert probe.real_agent_fn is True, (
+        "node_runner._default_agent_fn is not the real tool-executing turn "
+        "(regressed to the silent stub?)")
+
+
+def test_default_agent_fn_is_not_the_silent_stub():
+    """Directly assert the node_runner default no longer imports the wrong provider
+    module and no longer returns a hardcoded confirmed stub."""
+    import inspect
+    from services.dag import node_runner
+    src = inspect.getsource(node_runner._default_agent_fn)
+    assert "providers.anthropic " not in src and "providers.anthropic\n" not in src, \
+        "still importing the non-existent providers.anthropic module"
+    assert "agent_turn" in src, "default agent_fn must run the tool-calling turn"
+    assert "get_provider" in src, \
+        "default agent_fn must resolve the provider via the config seam"
+
+
 def test_single_cell_produces_replayable_run_dir(tmp_path):
     probe = execution_probe()
     ch = load_challenge("C1")

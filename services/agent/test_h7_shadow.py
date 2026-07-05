@@ -94,12 +94,28 @@ def _patch_svc_agent_config():
     _SENTINEL = object()
     key = "services.agent.config"
     _saved = sys.modules.get(key, _SENTINEL)
-    sys.modules[key] = _make_svc_agent_config_stub()
+    stub = _make_svc_agent_config_stub()
+    sys.modules[key] = stub
+    # ALSO patch the parent-package attribute: once the REAL config module has been
+    # imported anywhere earlier in the session (e.g. the T-W30 execute_dag path in
+    # pipeline tests imports it for provider resolution), ``from services.agent
+    # import config`` resolves the *package attribute*, not sys.modules — so the
+    # sys.modules stub alone silently stops taking effect (order-dependent flake).
+    _pkg = sys.modules.get("services.agent")
+    _saved_attr = getattr(_pkg, "config", _SENTINEL) if _pkg is not None else _SENTINEL
+    if _pkg is not None:
+        _pkg.config = stub  # type: ignore[attr-defined]
     yield
     if _saved is _SENTINEL:
         sys.modules.pop(key, None)
     else:
         sys.modules[key] = _saved  # type: ignore[assignment]
+    if _pkg is not None:
+        if _saved_attr is _SENTINEL:
+            if getattr(_pkg, "config", None) is stub:
+                del _pkg.config  # type: ignore[attr-defined]
+        else:
+            _pkg.config = _saved_attr  # type: ignore[attr-defined]
 
 # ---------------------------------------------------------------------------
 # Now it is safe to import the modules under test.

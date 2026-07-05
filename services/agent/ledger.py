@@ -60,6 +60,12 @@ def _empty_state(run_id: str) -> dict:
         "questions": [],
         "stage_log": [],
         "artifacts": [],
+        # T-W30: per-acceptance-criterion verification results written by the
+        # reviewer role (reviewer_exec.run_acceptance_checks). The VERIFY phase
+        # gate READS these — it never fabricates PASS. Each entry:
+        #   {id, result: PASS|FAIL|NOT-CHECKED, check_tool, pass_rule,
+        #    detail, evidence}
+        "criterion_results": [],
     }
 
 
@@ -122,6 +128,17 @@ def _apply(state: dict, event: dict) -> dict:
             entry = {"stage": stage, "entered": payload.get("entered", _now()),
                      "exited": payload.get("exited"), "exit_gate": payload.get("exit_gate")}
             state["stage_log"].append(entry)
+
+    elif kind == "criterion_result":
+        # T-W30: reviewer's per-criterion verdict. Keyed by ac id; last write wins
+        # (a re-review after a CORRECT loop overwrites the earlier verdict).
+        ac_id = payload.get("id")
+        existing = next((c for c in state["criterion_results"]
+                         if c.get("id") == ac_id), None)
+        if existing:
+            existing.update(dict(payload))
+        else:
+            state["criterion_results"].append(dict(payload))
 
     elif kind == "artifact":
         art_id = payload.get("id")
@@ -315,6 +332,23 @@ class Ledger:
         return self.append(actor, "artifact", {
             "kind": kind, "id": artifact_id, "path": path,
             "stage": stage, "note": note,
+        })
+
+    def add_criterion_result(self, actor: str, ac_id: str, result: str,
+                             *, check_tool: str = "", pass_rule: str = "",
+                             detail: str = "",
+                             evidence: dict | None = None) -> dict:
+        """Record one acceptance-criterion verdict (T-W30).
+
+        ``result`` is one of ``PASS`` / ``FAIL`` / ``NOT-CHECKED`` (the reviewer
+        role's only allowed verdicts). ``evidence`` is the raw check-tool output
+        that produced the verdict — the proof the named tool genuinely ran (the
+        VERIFY gate reads only the verdict, but the evidence makes a PASS
+        auditable and a NOT-CHECKED honest)."""
+        return self.append(actor, "criterion_result", {
+            "id": ac_id, "result": result,
+            "check_tool": check_tool, "pass_rule": pass_rule,
+            "detail": detail, "evidence": evidence or {},
         })
 
     # ------------------------------------------------------------------

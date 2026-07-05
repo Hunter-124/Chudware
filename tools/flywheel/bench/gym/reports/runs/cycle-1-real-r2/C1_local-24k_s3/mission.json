@@ -1,0 +1,13 @@
+{
+  "status": "failed",
+  "phase": "verify",
+  "phases_completed": [
+    "intake",
+    "specify",
+    "plan",
+    "build"
+  ],
+  "findings": [],
+  "stop_reason": "verify_incomplete",
+  "mode": "real"
+}

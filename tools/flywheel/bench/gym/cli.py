@@ -99,10 +99,13 @@ def cmd_run(args) -> int:
         challenge_ids = challenge_ids or ["C1"]
 
     cycle = args.cycle
-    cr = run_cycle(cycle=cycle, tiers=tiers, challenge_ids=challenge_ids)
+    cr = run_cycle(cycle=cycle, tiers=tiers, challenge_ids=challenge_ids,
+                   real=args.real)
 
     applied, deltas = ([], {})
-    if not args.no_adjust:
+    # The assess-adjust-rerun dials are mock-replay measurements; skip them for a
+    # real run (the cells already executed genuinely; reclassifying is meaningless).
+    if not args.no_adjust and not args.real:
         applied, deltas = adjust_and_rerun(cr, challenge_ids=challenge_ids, tiers=cr.tiers)
 
     rep = report_mod.build_report(cr, applied_dials=applied, deltas=deltas)
@@ -129,6 +132,10 @@ def main(argv=None) -> int:
     r.add_argument("--tiers", default=None, help="comma list, e.g. local-24k,frontier-200k")
     r.add_argument("--challenges", default=None, help="comma list, e.g. C1,C3")
     r.add_argument("--smoke", action="store_true", help="C1 only, local tier, seed 1")
+    r.add_argument("--real", action="store_true",
+                   help="REAL execution: execute_dag=True + real agent_fn + resolved "
+                        "provider (honoured per-cell only when the probe reports "
+                        "real-runnable). T-W30.")
     r.add_argument("--no-adjust", action="store_true", help="skip the assess-adjust-rerun step")
     r.set_defaults(func=cmd_run)
     args = ap.parse_args(argv)

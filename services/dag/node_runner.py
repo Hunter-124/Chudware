@@ -94,26 +94,96 @@ class _StubAgentResult:
         self.result = None
 
 
-def _default_agent_fn(request: str, context_pack: dict[str, Any]) -> Any:
-    """Invoke services/agent/loop.run() with provider from agent config.
+def make_default_agent_fn(ledger=None) -> "Callable[[str, dict[str, Any]], Any]":
+    """Return the default tool-executing agent_fn with *ledger* bound (T-W30).
 
-    Imported lazily to avoid hard dependency when the engine is absent
-    (test environments). Falls back to a stub AgentResult (T-A1 behavior)
-    when the live agent loop or provider cannot be imported — this keeps
-    the existing executor tests green while real dispatch works in production.
-    """
+    The mission pipeline (loop.run_mission) uses this to thread its run ledger
+    into every node's agent turn, so each turn's tool calls / handoffs land as
+    ``agent_turn`` events — the inspectability half of the execution-reality
+    contract.  A standalone DAG run (no ledger) gets the same behaviour minus
+    the events."""
+    def _agent_fn(request: str, context_pack: dict[str, Any]) -> Any:
+        return _default_agent_fn(request, context_pack, ledger=ledger)
+    return _agent_fn
+
+
+def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
+                      ledger=None) -> Any:
+    """Run a real tool-executing agent turn for this DAG node (T-W30).
+
+    Resolves the provider from the agent config seam (``config.get_provider`` —
+    honours ``AI_CAD_PROVIDER`` / routing.yaml / the local llama.cpp default), then
+    runs a bounded tool-calling turn (``agent_turn.run_turn``): the model proposes
+    MCP tool calls, they are dispatched against the live engine, results are fed
+    back, and a structured handoff is returned.  The node's ``allowed_tools`` scope
+    the callable tools.
+
+    Provider resolution is the actual fix for the historical silent-stub bug: the
+    old code imported ``services.agent.providers.anthropic`` (wrong module name —
+    the module is ``anthropic_provider``), so the import ALWAYS failed and every
+    "live" node degraded to ``_StubAgentResult``.  We now import the real seam.
+
+    Fail-closed on genuine unavailability (no provider constructible — e.g. no model
+    server and no API key): return a NON-success stub so the node ESCALATES rather
+    than silently reporting a fabricated success.  A raised exception is surfaced by
+    ``run()`` as an escalate verdict."""
+    from services.agent import config  # noqa: PLC0415 — real import, no wrong name
+    from services.agent import agent_turn  # noqa: PLC0415
+
+    node_name = context_pack.get("node_name", "dag_node")
     try:
-        from services.agent import loop  # noqa: PLC0415
-        from services.agent.providers.anthropic import AnthropicProvider  # noqa: PLC0415
-        provider = AnthropicProvider()
-        node_name = context_pack.get("node_name", "dag_node")
-        return loop.run(request=request, provider=provider, name=node_name)
-        # NOTE: loop.run() has no allowed_tools parameter — tool filtering is
-        # expressed as advisory prose in the request string (see _build_request).
-        # Real injection is a T-A4/T-A5 seam; loop.py is read-only per Driver notes.
-    except (ImportError, ModuleNotFoundError):
-        # Engine or provider unavailable (CI, offline, no API key) — use stub.
-        return _StubAgentResult()
+        provider = config.get_provider()
+    except Exception as exc:  # noqa: BLE001 — no constructible provider
+        # Do NOT return a confirmed stub: that is the fabrication bug. Signal a
+        # non-success so the node escalates and the failure is visible.
+        return _UnavailableAgentResult(f"no provider available: {exc}")
+
+    allowed_tools = context_pack.get("allowed_tools")
+    # Per-node tool budget: context pack value, else an env cap (lets a bench cap the
+    # turn length for a time-boxed real run), else the agent_turn default.
+    max_tools = context_pack.get("max_tools_per_turn")
+    if max_tools is None:
+        env_cap = os.environ.get("AI_CAD_AGENT_MAX_TOOL_CALLS")
+        if env_cap:
+            try:
+                max_tools = int(env_cap)
+            except ValueError:
+                max_tools = None
+    return agent_turn.run_turn(
+        request=request, provider=provider, name=node_name,
+        allowed_tools=allowed_tools,
+        system_prompt=context_pack.get("role_system_prompt"),
+        max_tool_calls=max_tools,
+        max_tokens=_tier_generation_budget(),
+        ledger=ledger, actor=node_name)
+
+
+def _tier_generation_budget() -> "int | None":
+    """Per-completion token cap from the ACTIVE tier's profile (T-W28 seam).
+
+    Reads ``AI_CAD_TIER`` (tiers.detect_tier_from_env — the same manual-override
+    knob the effort resolution path honours) and returns that tier's
+    ``generation_headroom`` from tiers.yaml.  None (agent_turn's shipped default)
+    when no tier is set or the tiers layer is unavailable — best-effort, never
+    blocks node execution."""
+    try:
+        from services.agent.tiers import detect_tier_from_env, load_tier
+        tier_name = detect_tier_from_env()
+        if not tier_name:
+            return None
+        return int(load_tier(tier_name).generation_headroom)
+    except Exception:  # noqa: BLE001 — tiers layer optional at node level
+        return None
+
+
+class _UnavailableAgentResult:
+    """Returned when no provider can be constructed — a NON-success result so the
+    node escalates (never a fabricated ``confirmed`` success)."""
+    def __init__(self, reason: str) -> None:
+        self.stop_reason = "failed"
+        self.success = False
+        self.final_code = None
+        self.result = {"error": reason}
 
 
 # ---------------------------------------------------------------------------
@@ -159,14 +229,33 @@ def run(
     # with the default prompt / no extra tool scoping), matching the ledger seam
     # discipline elsewhere in this pipeline.
     role_card = _resolve_role_card(node)
+    restore_tool_policy = None
     if role_card is not None:
+        # T-W30: the registry policy is PROCESS-GLOBAL — scope it to THIS node's
+        # turn (snapshot now, restore after the agent returns). Leaving it set
+        # leaked one node's role allowlist into every later dispatch in the
+        # process (caught as ~78 cad_tools/gsl_tools refusals in the gate sweep
+        # once mission nodes started resolving their cards).
+        restore_tool_policy = _snapshot_tool_policy()
         _apply_role_tool_policy(role_card)
         context_pack = dict(context_pack)
         context_pack["role_id"] = role_card.id
         context_pack["role_system_prompt"] = role_card.system_prompt
         # The node's tools: allowlist and the card's allowlist should agree; the card
         # is authoritative for a role-typed node, so expose its concrete tools.
-        context_pack.setdefault("allowed_tools", list(role_card.concrete_tools))
+        # T-W30: context_pack.assemble() ALWAYS sets "allowed_tools" (None = open),
+        # so the old setdefault() never fired and the card allowlist was silently
+        # dropped — the real C1 run showed the model free-inventing tool names
+        # because its prompt listed none. The card fills the OPEN case only; an
+        # explicit node ``tools:`` list still wins.
+        if context_pack.get("allowed_tools") is None:
+            context_pack["allowed_tools"] = list(role_card.concrete_tools)
+    elif node_inputs.get("role_prompt"):
+        # No loadable card, but the mission compiler embedded the role prompt
+        # verbatim in inputs (mission_template._node) — use it so the node still
+        # runs with its role's system prompt.
+        context_pack = dict(context_pack)
+        context_pack["role_system_prompt"] = str(node_inputs["role_prompt"])
 
     # Build the request string passed to the agent.
     request = _build_request(node_type, node_inputs, context_pack)
@@ -198,6 +287,10 @@ def run(
             "doc_id": node_inputs.get("doc_id"),
         }
         return VERDICT_ESCALATE, output_state
+    finally:
+        # Restore the pre-turn registry policy (role scoping is per-turn).
+        if restore_tool_policy is not None:
+            restore_tool_policy()
 
     elapsed_ms = (time.monotonic() - t0) * 1000.0
 
@@ -284,8 +377,14 @@ def _resolve_role_card(node: dict[str, Any]) -> Any:
     """Return the RoleCard for ``node['role']`` if the node names one, else None.
 
     Best-effort: any failure (no role field, unknown role, roles module unavailable)
-    returns None so the node runs with default behaviour."""
-    role_id = node.get("role")
+    returns None so the node runs with default behaviour.
+
+    T-W30: the mission compiler (services/dag/mission_template._node) carries the
+    role in ``inputs.role`` — accept it as well as a top-level ``role`` field.
+    Reading only ``node['role']`` meant NO mission-graph node ever resolved its
+    card, so role prompts + tool allowlists were silently dropped (the real C1
+    run showed the model free-inventing tool names as a direct result)."""
+    role_id = node.get("role") or (node.get("inputs") or {}).get("role")
     if not role_id:
         return None
     try:
@@ -304,6 +403,33 @@ def _apply_role_tool_policy(role_card: Any) -> None:
         role_card.apply_tool_policy(reg)
     except Exception:  # noqa: BLE001
         pass
+
+
+def _snapshot_tool_policy() -> "Optional[Callable[[], None]]":
+    """Capture the tool_registry's current policy; return a restore callable.
+
+    T-W30: ``set_policy`` mutates module globals, so a role's allowlist applied
+    for one node turn would otherwise leak into the whole process (every later
+    dispatch, and every later test in a combined sweep). Reads the registry's
+    private fields deliberately — there is no public getter — with the same
+    best-effort discipline as ``_apply_role_tool_policy``."""
+    try:
+        from mcp_server import tool_registry as reg  # noqa: PLC0415
+        prev_allow = set(reg._ACTIVE_ALLOW) if reg._ACTIVE_ALLOW is not None else None
+        prev_deny = set(reg._ACTIVE_DENY_RISK) if reg._ACTIVE_DENY_RISK is not None else None
+        prev_set = bool(reg._POLICY_SET)
+
+        def _restore() -> None:
+            try:
+                if prev_set:
+                    reg.set_policy(allow=prev_allow, deny_risk=prev_deny)
+                else:
+                    reg.reset_policy()
+            except Exception:  # noqa: BLE001
+                pass
+        return _restore
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------------------

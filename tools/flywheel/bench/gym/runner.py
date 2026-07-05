@@ -77,19 +77,39 @@ def execution_probe() -> ExecProbe:
 
     local = _local_model_present()
 
-    # A "real" tool-executing agent_fn is the node_runner's default path succeeding.
-    # In this repo that import points at services.agent.providers.anthropic (which does
-    # not exist — the module is anthropic_provider), so the default agent_fn stubs.
-    real_agent = False
-    try:
-        import importlib
-        importlib.import_module("services.agent.providers.anthropic")
-        real_agent = True
-    except Exception:
-        real_agent = False
+    # A "real" tool-executing agent_fn is the node_runner's default path being a
+    # genuine tool-calling turn rather than the silent stub.  T-W30 fixed the
+    # historical bug where node_runner imported a non-existent
+    # ``services.agent.providers.anthropic`` module (the module is
+    # ``anthropic_provider``) and every "live" node degraded to _StubAgentResult.
+    # We now probe the REAL seam: the default agent_fn must resolve to a turn built
+    # on the tool-calling loop (agent_turn) via the config provider seam — importable
+    # AND wired, not a stub.
+    real_agent = _real_agent_fn_present()
 
     return ExecProbe(core_available=core, frontier_key=frontier,
                      local_model=local, real_agent_fn=real_agent)
+
+
+def _real_agent_fn_present() -> bool:
+    """True when node_runner's default agent_fn is the real tool-executing turn.
+
+    Checks that (a) the tool-calling turn module imports, (b) the provider config
+    seam imports, and (c) node_runner wires them (no ``providers.anthropic`` stub
+    import).  Pure import inspection — no model call, no network, no side effect."""
+    try:
+        import importlib
+        importlib.import_module("services.agent.agent_turn")
+        importlib.import_module("services.agent.config")
+        nr = importlib.import_module("services.dag.node_runner")
+        src = importlib.import_module("inspect").getsource(nr._default_agent_fn)
+        # The fixed path calls the config provider seam + agent_turn; the old stub
+        # path imported the (nonexistent) providers.anthropic module.
+        return ("agent_turn" in src and "config" in src
+                and "providers.anthropic " not in src
+                and "providers.anthropic\n" not in src)
+    except Exception:
+        return False
 
 
 def _core_so_present() -> bool:
@@ -195,14 +215,22 @@ class CellResult:
 
 def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
              probe: ExecProbe, grind_threshold: int = 3,
-             runs_dir: Path | None = None) -> CellResult:
+             runs_dir: Path | None = None, real: bool = False) -> CellResult:
     """Run one (challenge, tier, seed) cell end to end and grade + classify it.
 
     *runs_dir* overrides the output root (default ``reports/runs``); tests pass a tmp
     dir so the suite never writes under the committed ``reports/`` tree.
+
+    *real* (T-W30): when True AND the probe reports a real-runnable environment,
+    drive the FULL pipeline with execute_dag=True, the node_runner's real
+    tool-executing agent_fn, and a resolved local/frontier provider — the mission
+    genuinely executes tool calls and the reviewer genuinely runs the acceptance
+    checks (no scripted ledger replay).  Otherwise the cell runs in MOCK mode: the
+    real phase machine to PLAN + scripted ledger turns as the gradeable signal.
     """
     from services.agent.ledger import Ledger
 
+    real_mode = bool(real and probe.can_run_real)
     run_id = f"gym_{challenge.id}_{tier}_s{seed}"
     base = runs_dir if runs_dir is not None else (REPORTS_DIR / "runs")
     run_dir = Path(base) / cycle / f"{challenge.id}_{tier}_s{seed}"
@@ -225,12 +253,16 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
     effort_profile = resolve_effort(tier)
     record_effort_snapshot(ledger, active_tier=effort_profile.tier)
 
-    # Drive the real phase machine through run_mission (INTAKE + manifest validate +
-    # graph compile), execute_dag=False so we do not depend on the (absent) real agent.
-    mission = _run_mission_safe(challenge, run_id)
-
-    # Replay the scripted turns into the ledger (the gradeable signal in mock mode).
-    replay_turns_into_ledger(ledger, challenge, seed)
+    if real_mode:
+        # REAL: run the full pipeline, then FOLD the mission's own ledger (written at
+        # the default run path by run_mission) into THIS gym ledger so the real
+        # tool_call / agent_turn / criterion_result events are graded/classified.
+        mission = _run_mission_real(challenge, run_id)
+        _merge_mission_ledger(run_id, ledger)
+    else:
+        # MOCK: drive the phase machine to PLAN (execute_dag=False) + scripted turns.
+        mission = _run_mission_safe(challenge, run_id)
+        replay_turns_into_ledger(ledger, challenge, seed)
 
     ledger_doc = json.loads((run_dir / "ledger.json").read_text(encoding="utf-8"))
 
@@ -243,7 +275,8 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
         grind_threshold=grind_threshold)
 
     cell = CellResult(
-        challenge=challenge.id, tier=tier, seed=seed, mode=probe.mode,
+        challenge=challenge.id, tier=tier, seed=seed,
+        mode="real" if real_mode else "mock",
         passed=bool(graded["passed"]), graded=graded, classifications=classifications,
         mission_status=(mission or {}).get("status", "n/a"),
         mission_phase=(mission or {}).get("phase", "n/a"),
@@ -256,6 +289,63 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
     (run_dir / "mission.json").write_text(json.dumps(mission or {}, indent=2, default=str),
                                           encoding="utf-8")
     return cell
+
+
+def _run_mission_real(challenge: Challenge, run_id: str) -> dict | None:
+    """Drive the FULL pipeline for a REAL cell (T-W30): execute_dag=True with the
+    node_runner's real tool-executing agent_fn and a resolved provider.
+
+    Honest failure handling: a mission/DAG/model error is CAPTURED into the mission
+    record (and the ledger already holds whatever real events were emitted), never
+    swallowed — the C1 proof needs the observed failure class, not a hidden stub."""
+    # A cell is deterministic, so a re-run must start CLEAN: run_mission does
+    # Ledger.load(run_id) which APPENDS to any existing mission ledger — a stale
+    # file from an earlier attempt would contaminate the folded events. Same rule
+    # as the gym cell ledger above.
+    try:
+        from services.agent.ledger import run_ledger_path
+        mp = run_ledger_path(run_id)
+        if mp.exists():
+            mp.unlink()
+    except Exception:  # noqa: BLE001 — best-effort cleanup
+        pass
+    try:
+        from services.agent import loop, config
+        provider = config.get_provider()  # AI_CAD_PROVIDER / routing / local default
+        mr = loop.run_mission(
+            challenge.request, provider,
+            name=run_id, intake_fn=make_intake_fn(challenge),
+            execute_dag=True, autonomy_default="auto")
+        return {"status": mr.status, "phase": mr.phase,
+                "phases_completed": mr.phases_completed,
+                "findings": mr.findings, "stop_reason": mr.stop_reason,
+                "mode": "real"}
+    except Exception as exc:  # a real-run failure is DATA, not a crash
+        return {"status": "error", "phase": "intake", "mode": "real",
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _merge_mission_ledger(run_id: str, gym_ledger) -> None:
+    """Fold the mission's own ledger (written by run_mission at the default run path)
+    into the gym cell ledger, so the real events land in the committed run dir.
+
+    run_mission does ``Ledger.load(run_id)`` → ``run_ledger_path(run_id)``; the gym
+    ledger is a separate file under the run dir.  We copy the mission events across
+    (skipping the gym's own brief) so grading/classification see the real turns."""
+    try:
+        from services.agent.ledger import run_ledger_path
+        import json as _json
+        mp = run_ledger_path(run_id)
+        if not mp.exists():
+            return
+        mdoc = _json.loads(mp.read_text(encoding="utf-8"))
+        for ev in mdoc.get("events", []):
+            if ev.get("kind") == "brief":
+                continue  # the gym ledger already has its own brief
+            gym_ledger.append(ev.get("actor", "mission"), ev.get("kind", "note"),
+                              ev.get("payload", {}))
+    except Exception:  # noqa: BLE001 — merge is best-effort, never fatal
+        pass
 
 
 def _run_mission_safe(challenge: Challenge, run_id: str) -> dict | None:
@@ -294,11 +384,15 @@ class CycleResult:
 def run_cycle(cycle: str = "cycle-1", *, tiers: list[str] | None = None,
               challenge_ids: list[str] | None = None,
               grind_threshold: int = 3,
-              runs_dir: Path | None = None) -> CycleResult:
+              runs_dir: Path | None = None,
+              real: bool = False) -> CycleResult:
     """Run the full challenge x tier x seed matrix and return the cycle result.
 
     *runs_dir* overrides the output root (tests pass a tmp dir; the CLI leaves it None
-    so the committed ``reports/runs`` tree is written for cycle-1)."""
+    so the committed ``reports/runs`` tree is written for cycle-1).
+
+    *real* (T-W30): request REAL execution (honoured per-cell only when the probe
+    reports a real-runnable environment)."""
     probe = execution_probe()
     tiers = tiers or ["local-24k", "frontier-200k"]
     challenges = load_challenges()
@@ -311,5 +405,6 @@ def run_cycle(cycle: str = "cycle-1", *, tiers: list[str] | None = None,
             for seed in ch.seeds:
                 result.cells.append(
                     run_cell(ch, tier, seed, cycle=cycle, probe=probe,
-                             grind_threshold=grind_threshold, runs_dir=runs_dir))
+                             grind_threshold=grind_threshold, runs_dir=runs_dir,
+                             real=real))
     return result

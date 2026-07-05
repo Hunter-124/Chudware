@@ -603,3 +603,177 @@ class TestRoleCardWiring:
                                      "retry_remaining": 1}, agent_fn=agent_fn)
         assert verdict == "done"
         assert "role_id" not in captured
+
+
+# ---------------------------------------------------------------------------
+# T-W30 finisher — default agent_fn: ledger threading + tier budget seam
+# ---------------------------------------------------------------------------
+
+class _TurnScriptedProvider:
+    """Finish immediately with a done directive (agent_turn protocol)."""
+    name = "scripted"
+
+    def complete(self, system, messages, max_tokens=None):
+        return '```json\n{"done": true, "handoff": {"summary": "done"}}\n```'
+
+
+class TestDefaultAgentFnSeams:
+    def test_make_default_agent_fn_threads_ledger_into_turn(self, monkeypatch):
+        """loop.run_mission binds its ledger via make_default_agent_fn; the turn's
+        events must land on that ledger (DoD: ledger events for every turn)."""
+        from services.agent import config as agent_config
+
+        monkeypatch.setattr(agent_config, "get_provider",
+                            lambda name=None, cfg=None: _TurnScriptedProvider())
+
+        events = []
+
+        class _ListLedger:
+            def append(self, actor, kind, payload):
+                events.append({"actor": actor, "kind": kind, "payload": payload})
+
+        agent_fn = nr.make_default_agent_fn(ledger=_ListLedger())
+        res = agent_fn("do the node", {"node_name": "n_build", "allowed_tools": []})
+        assert res.success is True
+        assert any(e["kind"] == "agent_turn" for e in events), events
+        assert all(e["actor"] == "n_build" for e in events)
+
+    def test_default_agent_fn_passes_tier_generation_budget(self, monkeypatch):
+        """AI_CAD_TIER set → run_turn gets that tier's generation_headroom as
+        max_tokens (bounded by tier budgets, aicad.effort/1 seam)."""
+        from services.agent import config as agent_config
+        from services.agent import agent_turn as at
+        from services.agent.tiers import load_tier
+
+        monkeypatch.setattr(agent_config, "get_provider",
+                            lambda name=None, cfg=None: _TurnScriptedProvider())
+        monkeypatch.setenv("AI_CAD_TIER", "local-24k")
+
+        seen = {}
+        real_run_turn = at.run_turn
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real_run_turn(*args, **kwargs)
+
+        monkeypatch.setattr(at, "run_turn", _spy)
+        nr._default_agent_fn("go", {"node_name": "n1"})
+        assert seen.get("max_tokens") == load_tier("local-24k").generation_headroom
+
+    def test_default_agent_fn_no_tier_uses_default_cap(self, monkeypatch):
+        """No AI_CAD_TIER → max_tokens None → agent_turn's shipped 2048 default."""
+        from services.agent import config as agent_config
+        from services.agent import agent_turn as at
+
+        monkeypatch.setattr(agent_config, "get_provider",
+                            lambda name=None, cfg=None: _TurnScriptedProvider())
+        monkeypatch.delenv("AI_CAD_TIER", raising=False)
+
+        seen = {}
+        real_run_turn = at.run_turn
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real_run_turn(*args, **kwargs)
+
+        monkeypatch.setattr(at, "run_turn", _spy)
+        nr._default_agent_fn("go", {"node_name": "n1"})
+        assert seen.get("max_tokens") is None
+
+
+class TestRoleCardWiring:
+    """T-W30 real-run regressions: mission-graph nodes carry role in inputs.role
+    (mission_template._node); the runner must resolve the card from there and must
+    apply the card allowlist when the context pack's allowed_tools is OPEN (None).
+    Both were silently broken (node['role'] only + setdefault on a present key) —
+    the real C1 run showed model tool-name hallucination as the direct symptom."""
+
+    def _capture_pack(self):
+        seen = {}
+
+        def _agent_fn(request, context_pack):
+            seen["request"] = request
+            seen["pack"] = context_pack
+            return _fake_run("confirmed", True)
+        return seen, _agent_fn
+
+    def test_role_resolves_from_inputs_role(self):
+        node = {"id": "n1", "type": "design", "name": "BUILD DL1",
+                "inputs": {"role": "feature_modeler"}}
+        pack = cp.assemble(node, {})
+        seen, agent_fn = self._capture_pack()
+        verdict, _ = nr.run(node, pack, agent_fn=agent_fn)
+        assert verdict == "done"
+        assert seen["pack"].get("role_id") == "feature_modeler"
+        assert seen["pack"].get("role_system_prompt"), "card prompt must be applied"
+
+    def test_card_allowlist_fills_open_allowed_tools(self):
+        from services.agent.roles import load_role
+        node = {"id": "n1", "type": "design", "name": "BUILD DL1",
+                "inputs": {"role": "feature_modeler"}}
+        pack = cp.assemble(node, {})
+        assert pack["allowed_tools"] is None  # open before the card applies
+        seen, agent_fn = self._capture_pack()
+        nr.run(node, pack, agent_fn=agent_fn)
+        assert seen["pack"]["allowed_tools"] == \
+            list(load_role("feature_modeler").concrete_tools)
+
+    def test_explicit_node_tools_still_win_over_card(self):
+        node = {"id": "n1", "type": "design", "name": "BUILD DL1",
+                "tools": ["measure_part"],
+                "inputs": {"role": "feature_modeler"}}
+        pack = cp.assemble(node, {})
+        seen, agent_fn = self._capture_pack()
+        nr.run(node, pack, agent_fn=agent_fn)
+        assert seen["pack"]["allowed_tools"] == ["measure_part"]
+
+
+class TestMissionNodeRequests:
+    """T-W30: mission node requests must EMBED the manifest content (verbatim
+    request + deliverable + acceptance criteria), not reference an absent brief."""
+
+    def _manifest(self):
+        return {
+            "schema": "aicad.deliverables/1",
+            "request_verbatim": "make a flanged bushing with a d20 sliding-fit bore",
+            "deliverables": [{
+                "id": "DL1", "kind": "part", "name": "flanged bushing",
+                "description": "bushing with flange",
+                "acceptance_criteria": [
+                    {"id": "AC1", "text": "bore d20 H7",
+                     "check": {"tool": "fit_report", "pass_rule": "clearance in [0.007,0.041]"}},
+                ],
+                "depends_on": [], "status": "pending",
+            }],
+            "ambiguities": [], "assumptions": [],
+        }
+
+    def test_build_node_request_carries_manifest_content(self):
+        from dag.mission_template import build_mission_graph
+        graph = build_mission_graph(self._manifest(), graph_id="t")
+        build = next(n for n in graph["nodes"] if n["id"] == "n_build_DL1")
+        req = build["inputs"]["request"]
+        assert "make a flanged bushing" in req          # verbatim mission request
+        assert "AC1" in req and "fit_report" in req     # the criterion + named tool
+        assert "clearance in [0.007,0.041]" in req      # the pass rule
+
+    def test_every_mission_node_has_a_request(self):
+        from dag.mission_template import build_mission_graph
+        graph = build_mission_graph(self._manifest(), graph_id="t", org_layer=True)
+        for n in graph["nodes"]:
+            assert n["inputs"].get("request"), f"{n['id']} has no request"
+
+def test_role_policy_is_scoped_to_the_turn():
+    """T-W30 gate-sweep regression: applying a role card's allowlist must NOT
+    leak into the process-global tool_registry after the node turn returns
+    (it broke ~78 unrelated cad/gsl tool tests in the combined sweep)."""
+    from mcp_server import tool_registry as reg
+    reg.reset_policy()
+    assert reg.is_allowed("export_part")  # default: everything allowed
+    node = {"id": "n1", "type": "design", "name": "BUILD DL1",
+            "inputs": {"role": "feature_modeler"}}
+    nr.run(node, cp.assemble(node, {}),
+           agent_fn=lambda req, pack: _fake_run("confirmed", True))
+    # export_part is NOT in feature_modeler's allowlist — if the policy leaked,
+    # this dispatch-time check now refuses it.
+    assert reg.is_allowed("export_part"), "role tool policy leaked past the node turn"

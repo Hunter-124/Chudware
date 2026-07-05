@@ -19,6 +19,27 @@ from dag.graph_loader import GraphValidationError, validate_graph
 
 
 # ---------------------------------------------------------------------------
+# Deterministic agent_fn for executor-mechanics tests.
+#
+# T-W30: the node_runner default agent_fn is now a REAL tool-executing turn
+# (config provider + agent_turn) — with no model server it honestly escalates
+# rather than fabricating success. These smoke tests exercise executor mechanics
+# (checkpoint DB, event emission, graph traversal), NOT the live agent, so they
+# inject a deterministic done-result agent_fn (the intended test pattern).
+# ---------------------------------------------------------------------------
+
+class _DoneAgentResult:
+    stop_reason = "confirmed"
+    success = True
+    final_code = None
+    result = None
+
+
+def _done_agent_fn(request, context_pack):
+    return _DoneAgentResult()
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
@@ -60,7 +81,7 @@ class TestExecutorSmoke:
     def test_two_node_graph_runs_and_creates_checkpoint(self, tmp_path: Path) -> None:
         """DoD: executor.run() executes a two-node graph and writes a checkpoint .db."""
         graph = _two_node_graph()
-        result = executor.run(graph, runs_dir=tmp_path)
+        result = executor.run(graph, runs_dir=tmp_path, agent_fn=_done_agent_fn)
 
         # Run result shape
         assert "run_id" in result
@@ -88,7 +109,7 @@ class TestExecutorSmoke:
         """Checkpoint file is named <run_id>.db."""
         graph = _two_node_graph()
         fixed_id = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
-        result = executor.run(graph, run_id=fixed_id, runs_dir=tmp_path)
+        result = executor.run(graph, run_id=fixed_id, runs_dir=tmp_path, agent_fn=_done_agent_fn)
         db_path = Path(result["checkpoint_db"])
         assert db_path.name == f"{fixed_id}.db"
 
@@ -100,7 +121,7 @@ class TestExecutorSmoke:
             events.append((event_type, payload))
 
         graph = _two_node_graph()
-        executor.run(graph, runs_dir=tmp_path, emit=_emit)
+        executor.run(graph, runs_dir=tmp_path, emit=_emit, agent_fn=_done_agent_fn)
 
         event_types = [e[0] for e in events]
         assert "dag.run.started" in event_types
@@ -214,7 +235,7 @@ class TestSingleNode:
             ],
             "edges": [],
         }
-        result = executor.run(graph, runs_dir=tmp_path)
+        result = executor.run(graph, runs_dir=tmp_path, agent_fn=_done_agent_fn)
         assert result["status"] == "done"
         assert result["nodes"]["n1"]["status"] == "done"
         assert Path(result["checkpoint_db"]).exists()

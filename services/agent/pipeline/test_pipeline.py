@@ -540,6 +540,22 @@ def test_run_mission_execute_dag_records_all_phases_in_ledger(monkeypatch):
     def _mock_agent(request, context_pack):
         return _DoneResult()
 
+    # T-W30: the VERIFY gate now reads REAL reviewer criterion results from the
+    # ledger (no fabricated PASS). This is an all-nodes-done integration case, so
+    # stand in a reviewer that records PASS for every AC — the pipeline completes
+    # ONLY because the reviewer passed the criteria, which is the honest contract.
+    def _reviewer_pass(manifest, ledger, *, doc_id=None, actor="reviewer"):
+        out = {}
+        for d in manifest.get("deliverables", []):
+            for ac in d.get("acceptance_criteria", []):
+                ledger.add_criterion_result(actor, ac["id"], "PASS",
+                                            check_tool=ac["check"]["tool"],
+                                            pass_rule=ac["check"].get("pass_rule", ""))
+                out[ac["id"]] = "PASS"
+        return out
+    monkeypatch.setattr("services.agent.reviewer_exec.run_acceptance_checks",
+                        _reviewer_pass)
+
     run_id = f"t_w19_dag_{uuid.uuid4().hex[:8]}"
     good = _valid_manifest()
     result = loop.run_mission(
@@ -571,6 +587,17 @@ def test_mission_status_tool_renders_all_phases(monkeypatch):
     class _DoneResult:
         stop_reason = "confirmed"; success = True; final_code = None; result = None
 
+    # T-W30: stand in a reviewer that PASSes every AC so the honest VERIFY gate
+    # (which reads real criterion results) lets the mission reach deliver.
+    def _reviewer_pass(manifest, ledger, *, doc_id=None, actor="reviewer"):
+        for d in manifest.get("deliverables", []):
+            for ac in d.get("acceptance_criteria", []):
+                ledger.add_criterion_result(actor, ac["id"], "PASS",
+                                            check_tool=ac["check"]["tool"])
+        return {}
+    monkeypatch.setattr("services.agent.reviewer_exec.run_acceptance_checks",
+                        _reviewer_pass)
+
     run_id = f"t_w19_status_{uuid.uuid4().hex[:8]}"
     loop.run_mission(
         "make a bracket", MockProvider([]), name=run_id,
@@ -594,3 +621,85 @@ def test_mission_status_tool_renders_all_phases(monkeypatch):
     for expected in ("intake", "specify", "plan", "build", "verify", "deliver"):
         assert expected in status["phases_complete"], status["phases_complete"]
     assert status["current_phase"] is None  # deliver exited → nothing open
+
+
+# ---------------------------------------------------------------------------
+# T-W30 — honest VERIFY gate (reviewer results, not fabricated PASS)
+# ---------------------------------------------------------------------------
+
+def _run_mission_all_nodes_done(run_id, manifest, reviewer, monkeypatch):
+    """Drive run_mission with every DAG node done and *reviewer* recording AC
+    results — returns the MissionRun. Shared by the honesty tests."""
+    monkeypatch.setenv("AI_CAD_ADVISOR", "0")
+    from services.agent import loop
+    from services.agent.providers.mock_provider import MockProvider
+
+    class _DoneResult:
+        stop_reason = "confirmed"; success = True; final_code = None; result = None
+
+    monkeypatch.setattr("services.agent.reviewer_exec.run_acceptance_checks", reviewer)
+    return loop.run_mission(
+        "make a bracket", MockProvider([]), name=run_id,
+        intake_fn=lambda req: copy.deepcopy(manifest),
+        execute_dag=True, agent_fn=lambda r, c: _DoneResult(),
+        autonomy_default="auto")
+
+
+def test_verify_gate_fails_on_failing_criterion(monkeypatch):
+    """A deliberately FAILING acceptance criterion must NOT pass VERIFY: the
+    mission routes to CORRECT, deliver is never reached, and the failing AC is
+    named in the stop_reason. This is the fabricated-PASS bug's regression."""
+    def _reviewer_fail(manifest, ledger, *, doc_id=None, actor="reviewer"):
+        for d in manifest.get("deliverables", []):
+            for ac in d.get("acceptance_criteria", []):
+                ledger.add_criterion_result(actor, ac["id"], "FAIL",
+                                            check_tool=ac["check"]["tool"],
+                                            detail="deliberately failed")
+        return {}
+
+    run_id = f"t_w30_fail_{uuid.uuid4().hex[:8]}"
+    result = _run_mission_all_nodes_done(run_id, _valid_manifest(),
+                                         _reviewer_fail, monkeypatch)
+
+    assert result.status != "done", result.status
+    assert result.phase != "deliver"
+    assert result.phase == "correct", result.phase       # routed to CORRECT
+    assert "verify_failed" in (result.stop_reason or "")
+    assert "AC1" in (result.stop_reason or "")
+    # The ledger did NOT record a verify exit gate (the phase never exited).
+    from services.agent.ledger import Ledger
+    stages = [s["stage"] for s in Ledger.load(run_id).state["stage_log"]]
+    assert "deliver" not in stages
+
+
+def test_verify_gate_fails_on_unchecked_criterion(monkeypatch):
+    """A criterion with NO reviewer result must fail VERIFY too — silence cannot
+    fabricate a pass (the vacuous-pass hole). The reviewer here records nothing."""
+    def _reviewer_silent(manifest, ledger, *, doc_id=None, actor="reviewer"):
+        return {}  # writes no criterion_result events
+
+    run_id = f"t_w30_silent_{uuid.uuid4().hex[:8]}"
+    result = _run_mission_all_nodes_done(run_id, _valid_manifest(),
+                                         _reviewer_silent, monkeypatch)
+
+    assert result.status != "done", result.status
+    assert result.phase == "correct", result.phase
+    assert "verify_failed" in (result.stop_reason or "")
+
+
+def test_verify_gate_passes_only_when_reviewer_passes(monkeypatch):
+    """Complement: when the reviewer records PASS for every AC, VERIFY exits and
+    the mission reaches deliver. Proves the gate is driven by ledger results."""
+    def _reviewer_pass(manifest, ledger, *, doc_id=None, actor="reviewer"):
+        for d in manifest.get("deliverables", []):
+            for ac in d.get("acceptance_criteria", []):
+                ledger.add_criterion_result(actor, ac["id"], "PASS",
+                                            check_tool=ac["check"]["tool"])
+        return {}
+
+    run_id = f"t_w30_pass_{uuid.uuid4().hex[:8]}"
+    result = _run_mission_all_nodes_done(run_id, _valid_manifest(),
+                                         _reviewer_pass, monkeypatch)
+
+    assert result.status == "done", (result.status, result.stop_reason)
+    assert result.phase == "deliver"

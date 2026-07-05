@@ -1,9 +1,8 @@
 # Building AI-CAD on Windows
 
-Status: the **OCCT-free C++ core** and the **Python runtime + test suite** are verified on
-Windows 11 (MSVC 14.44 / VS 2022 Build Tools, CMake 4.3, Ninja 1.13, Python 3.12). The full
-OCCT geometry kernel and the ImGui desktop app are not yet wired for Windows (see
-[Not yet](#not-yet-verified)).
+Status: the **C++ core (with and without the OCCT geometry kernel)** and the **Python runtime +
+test suite** are verified on Windows 11 (MSVC 14.44 / VS 2022 Build Tools, CMake 4.3, Ninja 1.13,
+Python 3.12). The ImGui desktop app is not yet wired for Windows (see [Not yet](#not-yet-verified)).
 
 ## 0. One-time checkout fix — symlinks
 
@@ -54,6 +53,25 @@ convergence difference.
 Windows portability notes baked into the build:
 - `core/cam` gets `_USE_MATH_DEFINES` (MSVC hides `M_PI` behind it; GCC/Clang don't).
 - `ui/abstract` links `nlohmann_json` explicitly (no ambient system include on Windows).
+- `test_cam` uses `temp_directory_path()` instead of a hardcoded `/tmp`.
+
+## 2b. Build the core WITH the OCCT geometry kernel
+
+```bat
+cmake --preset windows-occt
+cmake --build --preset windows-occt
+ctest --test-dir build/windows-occt --output-on-failure
+```
+
+The **first** configure downloads OCCT 7.9.3 (~250 MB) and builds Netgen once (cached under
+`third_party/`, a few minutes). Verified on Win11 + MSVC 14.44: **clean build, 48/49 ctest**
+(only `freecad_parity` fails — the same MSVC-vs-GCC solver-convergence diff as the OCCT-free build).
+
+Windows-specific fixes this required:
+- `core/CMakeLists.txt` defines `NOMINMAX` for MSVC — `<windows.h>` (pulled in by OCCT headers)
+  otherwise defines `min`/`max` macros that clobber `std::min`/`std::max`.
+- `ProvisionNetgen.cmake` picks the install target by generator (Ninja uses `install`, not the
+  Visual Studio `INSTALL`).
 
 ## 3. Python runtime + tests
 
@@ -72,7 +90,5 @@ plus a missing `langgraph-checkpoint-sqlite` dependency that blocks `services/da
 
 ## Not yet verified
 
-- **OCCT geometry kernel** (`AICAD_WITH_OCCT=ON`) — `cmake/ProvisionOCCT.cmake` auto-downloads
-  OCCT; the Windows path is untested.
 - **ImGui desktop app** (`AICAD_BUILD_APP=ON`) — still references `host/extern/glad`; blocked on the
   `host/` deletion + a Windows app preset.

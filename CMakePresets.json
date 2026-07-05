@@ -42,6 +42,23 @@
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
       }
+    },
+    {
+      "name": "windows-occt",
+      "displayName": "Windows core + OCCT (libaicad, Ninja + MSVC, OCCT on)",
+      "description": "Configure the C++ core with the OCCT geometry kernel + Netgen mesher on MSVC. First configure auto-downloads OCCT 7.9.3 (~250 MB) and builds Netgen once (cached under third_party/). Run from an 'x64 Native Tools Command Prompt for VS 2022'. Verified on Win11 + MSVC 14.44: clean build, 48/49 ctest. See docs/BUILD_WINDOWS.md.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-occt",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "AICAD_BUILD_CORE": "ON",
+        "AICAD_WITH_OCCT": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     }
   ],
   "buildPresets": [
@@ -58,6 +75,11 @@
     {
       "name": "windows-core",
       "configurePreset": "windows-core",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-occt",
+      "configurePreset": "windows-occt",
       "configuration": "Release"
     }
   ]

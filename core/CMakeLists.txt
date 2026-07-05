@@ -24,6 +24,14 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 # builds the geometry kernel + smoke test (see cmake/ProvisionOCCT.cmake).
 option(AICAD_WITH_OCCT "Provision + link the OCCT geometry kernel (Wave 2)" OFF)
 
+# MSVC: <windows.h> (pulled in transitively by OCCT headers) defines min()/max() macros that
+# clobber std::min / std::max / std::numeric_limits<>::min, breaking e.g. core/api/libaicad.cpp.
+# Suppress project-wide. Harmless without OCCT (windows.h isn't included then); mirrors the
+# per-file `#define NOMINMAX` already present in a few sources.
+if(MSVC)
+  add_compile_definitions(NOMINMAX)
+endif()
+
 include(FetchContent)
 
 # --- Eigen (header-only linear algebra; replaces numpy/scipy.linalg) ---------

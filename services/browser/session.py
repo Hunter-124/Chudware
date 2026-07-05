@@ -10,7 +10,13 @@ imports Playwright directly:
   uploaded, never read by this module into logs or metadata.
 - :func:`browser_fetch` — opens the SAME persistent profile HEADLESS and
   navigates to a URL under the user's saved session, rate-limited per site
-  (:mod:`services.browser.ratelimit`).
+  (:mod:`services.browser.ratelimit`). Returns rendered HTML — not suitable
+  for binary artifacts (a browser hands those to its download manager rather
+  than rendering them).
+- :func:`browser_download` (T-X2) — fetches a URL's raw bytes under the same
+  saved session via Playwright's ``APIRequestContext`` (no page navigation),
+  the right primitive for CAD/PDF downloads. Same rate-limiting and
+  degradation posture as ``browser_fetch``.
 
 Playwright (Apache-2.0) is an optional runtime dependency (see
 ``requirements.txt``). Both functions lazy-import it so importing this module
@@ -25,6 +31,7 @@ the user in a HEADED window, never automate around it.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from engine.research.common import fail, now_ts
@@ -119,4 +126,46 @@ def browser_fetch(url: str, site: str, *, nav_timeout: float = DEFAULT_NAV_TIMEO
 
     profiles.save_meta(site, last_used_ts=time.time())
     return {"ok": True, "url": url, "status": status, "content": content,
+            "fetched_ts": now_ts(), "session_profile_used": profiles.slug(site)}
+
+
+def browser_download(url: str, site: str, dest: Path, *, nav_timeout: float = DEFAULT_NAV_TIMEOUT_S,
+                     min_interval: float = ratelimit.DEFAULT_MIN_INTERVAL_S,
+                     _sync_playwright: Callable[[], Any] | None = None) -> dict:
+    """Download raw bytes from ``url`` under ``site``'s saved session, writing them to ``dest``.
+
+    Uses the persistent context's ``request`` (Playwright's ``APIRequestContext``,
+    which shares the context's cookies) rather than page navigation — the
+    right tool for a CAD/PDF file, which a real page load would hand to the
+    browser's download manager instead of returning as page content.
+    """
+    if not profiles.has_profile(site):
+        return fail("no_profile", f"no saved browser session for site '{site}' — "
+                                    f"call browser_login('{site}') first")
+    try:
+        sync_playwright = _sync_playwright or _import_sync_playwright()
+    except RuntimeError as exc:
+        return fail("playwright_not_installed", str(exc))
+
+    ratelimit.wait(site, min_interval=min_interval)
+    profile_path = profiles.profile_dir(site)
+    try:
+        try:
+            with sync_playwright() as pw:
+                context = pw.chromium.launch_persistent_context(str(profile_path), headless=True)
+                try:
+                    response = context.request.get(url, timeout=nav_timeout * 1000)
+                    status = response.status
+                    body = response.body()
+                finally:
+                    context.close()
+        except Exception as exc:  # noqa: BLE001
+            return fail("browser_download_failed", str(exc))
+    finally:
+        ratelimit.mark_hit(site)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(body)
+    profiles.save_meta(site, last_used_ts=time.time())
+    return {"ok": True, "url": url, "status": status, "dest": str(dest), "bytes": len(body),
             "fetched_ts": now_ts(), "session_profile_used": profiles.slug(site)}

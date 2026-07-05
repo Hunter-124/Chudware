@@ -243,6 +243,9 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
     "design_review": {
         "design_review",
     },
+    "buildgraph": {
+        "buildgraph_plan", "buildgraph_status",
+    },
 }
 
 # All tool names across all families (deduplicated — some tools like hover appear in
@@ -280,6 +283,7 @@ _FAMILY_SIGNALS: dict[str, list[str]] = {
     "code_compliance": ["code_check", "cad_guide('code_compliance')", "code_compliance"],
     "dag":           ["dag_plan", "dag_run", "cad_guide('dag')", "dag"],
     "design_review": ["design_review", "cad_guide('design_review')"],
+    "buildgraph":    ["buildgraph_plan", "buildgraph_status", "buildgraph", "aicad.buildgraph/1"],
 }
 
 
@@ -391,6 +395,7 @@ class TestMCPFreshness(unittest.TestCase):
             "bom_rollup",                           # sourcing
             "cam_cost_estimate",                    # cost
             "serving_status",                       # adapter serving
+            "buildgraph_plan",                      # build-order DAG planner
         ]
         corpus_lower = self._corpus.lower()
         missing = [t for t in must_appear if t.lower() not in corpus_lower]

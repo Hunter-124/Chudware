@@ -397,6 +397,15 @@ def _plan_text(plan: dict) -> str:
         lines.extend(f"  - {f}" for f in p["features"])
     if plan.get("fit"):
         lines.append(f"Fit: {plan['fit']}")
+    # T-W15: append ordered build checklist when buildgraph_first was used
+    checklist = plan.get("buildgraph_checklist")
+    if checklist:
+        lines.append("\nBUILD ORDER (prerequisite-safe; follow this sequence):")
+        lines.extend(f"  {i + 1}. {step}" for i, step in enumerate(checklist))
+    warnings = plan.get("buildgraph_warnings")
+    if warnings:
+        lines.append("\nBUILD PLAN WARNINGS (resolve before building):")
+        lines.extend(f"  ! {w}" for w in warnings)
     text = "\n".join(lines)
     return text if len(text) <= 1800 else text[:1800] + "\n...[plan truncated]"
 
@@ -423,6 +432,50 @@ def _make_plan(session: Session, request: str, provider: Provider,
         return None
     session.plan = plan
     _emit(on_event, kind="plan", turn=turn, plan=plan, raw=_cap(reply, 4000))
+    return plan
+
+
+def _make_plan_with_buildgraph(
+    session: "Session",
+    request: str,
+    provider: "Provider",
+    on_event: "EventFn | None",
+) -> "dict | None":
+    """Run planning then attach an ordered build checklist from aicad.buildgraph/1.
+
+    T-W15 seam (behind AICAD_BUILDGRAPH_PLAN=1 env flag or buildgraph_first=True).
+    Best-effort: buildgraph failure only emits an advisory; the plan itself is kept.
+    """
+    plan = _make_plan(session, request, provider, on_event)
+    if plan is None:
+        return None
+    try:
+        from services.agent.buildgraph.planner import build_graph
+        graph, advisories = build_graph(plan)
+        nodes = graph.get("nodes", [])
+        # Build an ordered checklist: topo order with kinds and labels
+        ordered = [
+            f"[{n['kind']}] {n['label']}"
+            for n in nodes
+            if n.get("kind") != "checkpoint"
+        ]
+        if ordered:
+            plan["buildgraph_checklist"] = ordered
+        if advisories:
+            blocker_findings = [
+                item["finding"]
+                for adv in advisories
+                for item in adv.get("items", [])
+                if item.get("severity") == "blocker"
+            ]
+            if blocker_findings:
+                plan["buildgraph_warnings"] = blocker_findings
+        session.plan = plan
+        turn = session.turns + 1
+        _emit(on_event, kind="buildgraph", turn=turn,
+              node_count=len(nodes), advisory_count=len(advisories))
+    except Exception:  # noqa: BLE001
+        pass  # buildgraph failure never blocks the build
     return plan
 
 
@@ -880,12 +933,15 @@ def _generate(session: Session, provider: Provider, on_event: EventFn | None,
 
 def run_turn(session: Session, request: str, provider: Provider,
              on_event: EventFn | None = None, max_iters: int | None = None,
-             plan_first: bool = False) -> AgentRun:
+             plan_first: bool = False,
+             buildgraph_first: bool = False) -> AgentRun:
     """Run one user turn against a persistent ``session``, refining until the render matches
     the request (the model declares "done"), it stops making progress, or ``max_iters`` is hit
     (default ``DEFAULT_MAX_ITERS``). With ``plan_first``, the first turn opens with a planning
     call (parts / dimensions / features) that is streamed as a "plan" event and injected into
-    the design conversation. Streams progress via ``on_event`` and returns an AgentRun."""
+    the design conversation. With ``buildgraph_first`` (T-W15), the plan is also run through
+    the LLM-free build-order planner to produce an ordered checklist injected into the prompt.
+    Streams progress via ``on_event`` and returns an AgentRun."""
     if max_iters is None:
         max_iters = DEFAULT_MAX_ITERS
     # OFFLINE MODE defense-in-depth (C35): the legacy loop is the second call site (the
@@ -894,8 +950,15 @@ def run_turn(session: Session, request: str, provider: Provider,
     out_dir = paths.model_dir(session.name)
     first_turn = not session.messages
 
+    # AICAD_BUILDGRAPH_PLAN env var enables buildgraph_first site-wide without code changes.
+    import os as _os
+    if _os.environ.get("AICAD_BUILDGRAPH_PLAN") == "1":
+        buildgraph_first = True
+
     if first_turn:
-        if plan_first:
+        if buildgraph_first:
+            _make_plan_with_buildgraph(session, request, provider, on_event)
+        elif plan_first:
             _make_plan(session, request, provider, on_event)
         opening = FIRST_USER.format(request=request)
         if session.plan:

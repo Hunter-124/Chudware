@@ -57,6 +57,11 @@ mcp = FastMCP(
         "can check fulfilment (cad_guide('requirements')).\n"
         "MULTI-STEP MISSIONS: for 3+ sequential tool calls that can fail independently, use "
         "dag_plan → dag_run with checkpointing (cad_guide('dag')).\n"
+        "BUILD-ORDER PLANNING: for complex parts/assemblies, call buildgraph_plan(plan_json) "
+        "to convert a BUILD PLAN or dag/1 mission into an aicad.buildgraph/1 prerequisite graph "
+        "(datum→sketch, boss→pierce, parts→mates order); validator findings are advisory items. "
+        "buildgraph_status(run_id) reports node statuses. "
+        "Use before executing multi-feature parts to catch missing prerequisites.\n"
         "UNKNOWNS: batch all user questions into ONE ask_user([{id, prompt, type, default}, ...]) "
         "call with defaults for every field (cad_guide('interaction')).\n"
         "BOM + COST: after placing parts, bom_rollup() → bom_price() for a costed BOM; "
@@ -220,6 +225,12 @@ register_dag_replan_tools(mcp)
 # card per contracts/narration.md — never a raw JSON dump.
 from services.mcp.design_review_tools import register_design_review_tools
 register_design_review_tools(mcp)
+# Build-order DAG planner (T-W15): buildgraph_plan / buildgraph_status.
+# LLM-free planner converts BUILD PLAN / dag/1 mission into aicad.buildgraph/1 graph
+# with prerequisite edges; validator findings are aicad.advisory/1 items.
+# ready_nodes() surface for T-W16 multi-doc fan-out.
+from services.agent.buildgraph.mcp_tools import register_buildgraph_tools
+register_buildgraph_tools(mcp)
 
 
 def _install_clean_stdout():

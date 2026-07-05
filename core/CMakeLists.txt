@@ -931,6 +931,22 @@ if(AICAD_WITH_OCCT)
   add_test(NAME sketch_drag_rpc COMMAND test_sketch_drag_rpc)
   set_tests_properties(sketch_drag_rpc PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- T-W2 sketch completion suite (auto-coincident + sketch_health) ----------
+  # Auto-coincident closes touching-corner profiles (default on, rollback-safe on
+  # conflict) and doc_sketch_health narrates closure / DOF free variables / advisory.
+  # RPC-level (doc_new -> doc_apply_ops -> doc_sketch_auto_constrain / _health), headless.
+  add_executable(test_sketch_autoconstrain
+    tests/test_sketch_autoconstrain.cpp)
+  target_include_directories(test_sketch_autoconstrain PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_sketch_autoconstrain PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_sketch_autoconstrain PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME sketch_autoconstrain COMMAND test_sketch_autoconstrain)
+  set_tests_properties(sketch_autoconstrain PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- Simulation-study persistence + mutate RPCs (doc_sim_study_*) -----------
   # Exercises the full study lifecycle (add/edit/list/save+open/delete) on a blank
   # part. doc_new/doc_open compile the empty document through OCCT, so this is gated

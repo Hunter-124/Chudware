@@ -2665,6 +2665,18 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                 params.value("sketch", std::string()),
                                 params.contains("action") ? params["action"] : json::object()),
                             out_json, 0);
+            // T-W2 sketch completion suite.
+            if (m == "sketch_auto_constrain")
+                return emit(aicad::doc::doc_sketch_auto_constrain(
+                                params.value("doc_id", std::string()),
+                                params.value("sketch", std::string()),
+                                params.contains("opts") ? params["opts"] : json::object()),
+                            out_json, 0);
+            if (m == "sketch_health")
+                return emit(aicad::doc::doc_sketch_health(
+                                params.value("doc_id", std::string()),
+                                params.value("sketch", std::string())),
+                            out_json, 0);
             if (m == "sketch_project_ref")
                 return emit(aicad::doc::doc_sketch_project_ref(
                                 params.value("doc_id", std::string()),

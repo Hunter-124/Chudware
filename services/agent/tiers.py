@@ -218,6 +218,26 @@ def load_all_tiers(*, path: Path | None = None) -> dict[str, TierProfile]:
     return out
 
 
+def load_local_models(*, path: Path | None = None) -> dict:
+    """Return tiers.yaml's ``local_models`` block — the shipped bundled-model
+    defaults per role shape (T-W31, applying the T-W29 tokenmaxx bench).
+
+    Keys: ``gbnf_worker`` / ``fanout`` (bundled model ids) and
+    ``parallel_slots`` (recommended llama-server ``--parallel``). Returns ``{}``
+    when the block is absent (older tiers.yaml). Shipped defaults only —
+    routing.yaml role->model bindings and T-W28 user overrides always win.
+    """
+    p = path or _TIERS_PATH
+    data = yaml.safe_load(p.read_text())
+    schema = data.get("schema")
+    if schema != TIER_SCHEMA:
+        raise TierError(f"{p}: schema is {schema!r}, expected {TIER_SCHEMA!r}")
+    block = data.get("local_models") or {}
+    if not isinstance(block, dict):
+        raise TierError(f"{p}: 'local_models' must be a mapping")
+    return dict(block)
+
+
 # --------------------------------------------------------------------------- tier detection
 
 def detect_tier(context_length: int) -> str:

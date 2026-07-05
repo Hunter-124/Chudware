@@ -11,6 +11,30 @@
 #   frontier    = minimal (tokens cost money; councils only where risk warrants)
 
 schema: aicad.tier/1
+
+# Bundled local-model defaults per role shape — T-W31, applying the T-W29
+# tokenmaxx bench (benchmarks/tokenmaxx/REPORT.md "RECOMMENDATION — role x stage
+# mapping"; integrator-approved; numbers copied, never re-derived):
+#   gbnf_worker: gemma3-4b-qat — 100% schema_to_gbnf grammar compliance,
+#                smallest footprint (3086 MB), 332 tok/s aggregate @ N=8.
+#   fanout:      qwen3-4b — fastest single-stream (175 tok/s) and best parallel
+#                scaler (476 tok/s @ N=8), BUT its GBNF path is broken
+#                (thinking-mode vs grammar deadlock, bench GBNF success 0.0) so
+#                it must use prompted-JSON + roles.validate_handoff.
+#   gemma4-e4b dropped (slower + larger than gemma3-qat, no upside);
+#   DiffusionGemma NO-GO on 12 GB (26B-A4B MoE, 16 GB min quant, draft-CLI only).
+# parallel_slots: recommended llama-server --parallel on the bundled CUDA
+# runtime (integrator smoke: -np 8 -c 32768 -> ~4.8 GB VRAM, 482 tok/s).
+#
+# SHIPPED DEFAULTS ONLY. Per-model capability data lives in
+# services/agent/model_manager._REGISTRY (structured_output / role_shape);
+# actual role->model bindings live in routing.yaml (contract advisor.md §14)
+# and user edits there always win (T-W28 override discipline).
+local_models:
+  gbnf_worker: gemma3-4b-qat
+  fanout: qwen3-4b
+  parallel_slots: 8
+
 profiles:
   local-24k:
     # Context: 24576 tokens. Layout per docs/ADVISOR_ARCHITECTURE.md §3 (local-24k reference).

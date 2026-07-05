@@ -47,6 +47,8 @@ __all__ = [
     "provision",
     "list_models",
     "get_model_path",
+    "structured_output_for",
+    "model_for_role_shape",
     "ModelProvisionError",
     "_REGISTRY",
 ]
@@ -55,6 +57,28 @@ __all__ = [
 # Registry
 # ---------------------------------------------------------------------------
 
+# Per-model capability fields (T-W31, applying the T-W29 tokenmaxx bench —
+# benchmarks/tokenmaxx/REPORT.md, numbers copied verbatim, never re-derived):
+#
+#   structured_output  "gbnf" | "prompted_json" — how this model must produce
+#                      structured handoffs on the local llama.cpp runtime.
+#                      qwen3-4b's GBNF path is BROKEN (thinking-mode vs grammar
+#                      deadlock; bench GBNF success 0.0) so it uses prompted-JSON
+#                      + roles.validate_handoff (bench JSON first-pass 1.00).
+#                      gemma3-4b-qat follows schema_to_gbnf grammars at 100%.
+#   role_shape         "fanout"      — speed / parallel fan-out roles
+#                      (qwen3-4b: 175 tok/s single-stream, 476 tok/s @ N=8);
+#                      "gbnf_worker" — grammar-constrained worker roles
+#                      (gemma3-4b-qat: 100% GBNF, smallest footprint 3086 MB,
+#                      332 tok/s @ N=8).
+#   parallel_slots     recommended llama-server --parallel for this model on the
+#                      bundled CUDA runtime (12 GB has headroom past N=8).
+#
+# Deliberately NOT in the registry (REPORT.md "TL;DR recommendation"):
+#   gemma4-e4b       — dropped: GBNF 100% but slower (115 tok/s) and larger
+#                      (3464 MB) than gemma3-4b-qat with no measured upside.
+#   diffusiongemma   — NO-GO on 12 GB: 26B-A4B MoE, smallest quant 16 GB,
+#                      draft-CLI only (no server / grammar / parallel slots).
 _REGISTRY: dict[str, dict[str, Any]] = {
     "qwen3-4b": {
         "id": "qwen3-4b",
@@ -66,6 +90,9 @@ _REGISTRY: dict[str, dict[str, Any]] = {
         "ctx": 32768,
         "license": "Apache-2.0",
         "sha256": None,
+        "structured_output": "prompted_json",
+        "role_shape": "fanout",
+        "parallel_slots": 8,
     },
     "gemma3-4b-qat": {
         "id": "gemma3-4b-qat",
@@ -77,6 +104,9 @@ _REGISTRY: dict[str, dict[str, Any]] = {
         "ctx": 131072,
         "license": "Gemma-ToU",
         "sha256": None,
+        "structured_output": "gbnf",
+        "role_shape": "gbnf_worker",
+        "parallel_slots": 8,
     },
 }
 
@@ -309,6 +339,9 @@ def list_models() -> list[dict[str, Any]]:
                 "quant": entry["quant"],
                 "ctx": entry["ctx"],
                 "license": entry["license"],
+                "structured_output": entry.get("structured_output", "gbnf"),
+                "role_shape": entry.get("role_shape", ""),
+                "parallel_slots": entry.get("parallel_slots"),
                 "present": _resolve_existing(entry) is not None,
             }
         )
@@ -330,3 +363,38 @@ def get_model_path(model_id: str) -> Path | None:
     if model_id not in _REGISTRY:
         return None
     return _resolve_existing(_REGISTRY[model_id])
+
+
+def structured_output_for(model_id: str, default: str = "gbnf") -> str:
+    """Return how *model_id* must produce structured handoffs on the local runtime.
+
+    ``"gbnf"`` — pass a ``roles.schema_to_gbnf`` grammar to llama-server;
+    ``"prompted_json"`` — prompt for JSON and validate via
+    ``roles.validate_handoff`` (retry on failure).
+
+    This is the ONE lookup the turn path uses to honour the T-W29 finding that
+    a tier's ``structured_output: gbnf`` setting must be downgraded per-model
+    when the model's grammar path is broken (qwen3-4b). Unknown models fall back
+    to *default* (the tier's own setting).
+    """
+    entry = _REGISTRY.get(model_id)
+    if entry is None:
+        return default
+    return str(entry.get("structured_output", default))
+
+
+def model_for_role_shape(shape: str) -> str | None:
+    """Return the bundled model id shipped as the default for *role_shape*.
+
+    Shapes (T-W29 role x stage mapping): ``"gbnf_worker"`` (grammar-constrained
+    worker roles) -> gemma3-4b-qat; ``"fanout"`` (speed / parallel fan-out
+    roles) -> qwen3-4b. Returns ``None`` for unknown shapes.
+
+    NOTE: this is the SHIPPED capability default only. Actual role->model
+    bindings live in routing.yaml (contract advisor.md section 14) and user
+    edits there always win.
+    """
+    for entry in _REGISTRY.values():
+        if entry.get("role_shape") == shape:
+            return str(entry["id"])
+    return None

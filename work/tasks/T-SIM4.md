@@ -39,3 +39,6 @@ T-V1 audit left validation debt on solvers that are REAL but never live-checked:
 - graphify rule: `graphify query "<question>"` before raw-file reading.
 - Branch task/T-SIM4-solver-validation, worktree ../CAD-T-SIM4. Stop at status: review.
 - OpenFOAM integration is NOT this task (see T-SIM5, deferred).
+
+## Progress log
+- 2026-07-05 19:43 UTC [fable-birch] fatigue_anchor (Goodman/Soderberg, Shigley 10th Eq 6-45/6-46 + 6-14..6-16 + 6-8 cited) landed w/ 8 tests; live FEA bridge test landed (cantilever static 0.39% vs Roark, modal 40.86 Hz vs 40.77 Rao anchor 0.22%, runs in gate via occt-build fallback); sim_audit extended 8->16 executed / 23->15 skipped incl live fatigue+thermal cross-checks, SIM_AUDIT.md verdict table appended. Gate running.

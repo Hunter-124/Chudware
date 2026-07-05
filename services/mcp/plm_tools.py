@@ -13,8 +13,14 @@ users as-is.
 
 Registration: ``register_plm_tools(mcp)`` → adds plm_init, plm_open, plm_save,
 plm_checkpoint, plm_release, plm_history, plm_restore, plm_status, plm_compare,
-plm_set_ai_mode (T-R3).
+plm_set_ai_mode (T-R3), plm_item_set + plm_where_used (T-R4).
 Remote/lock tools (plm_add_remote, plm_sync, plm_lock, plm_unlock) are T-R7.
+
+plm_where_used note: §7 reserves this name for T-R6's Hub; the T-R4 task card
+ships the thin envelope early ({ok, consumers} over the derived index in
+services/plm/whereused.py). Flagged in the T-R4 work note for integrator
+review — dropping to in-process-only is a two-line change if §7 is read
+strictly.
 """
 from __future__ import annotations
 
@@ -101,21 +107,97 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(commit=res["commit"], entry=res["entry"])
 
     @mcp.tool()
-    def plm_release(path: str, item_id: str, message: str) -> str:
-        """Release an item: stamp the next revision letter, mark it Released, and
-        freeze its exact form. A release note (``message``) is required.
-        Returns ``{ok, commit, rev}``."""
+    def plm_release(path: str, item_id: str, message: str = "",
+                    confirm: bool = False) -> str:
+        """Release an item: checks first (unsaved changes, out-of-date
+        component references, never-released components), then stamps the
+        next revision letter, marks it Released, freezes its exact form and —
+        for assemblies — pins every component to its exact revision and
+        freezes the bill of materials. Problems found by the checks block the
+        release unless ``confirm`` is true (they are warnings, not walls).
+        Returns ``{ok, commit, rev, preflight, bom_freeze?, stamp_orders}``;
+        on blocked pre-flight: ``{ok:false, reason:"preflight_failed",
+        problems:[…]}``."""
         try:
             Vault, VaultError = _vault_module()
         except ImportError:
             return _err("no_vault", "version history is not available on this machine")
         try:
+            from services.plm import release as release_mod
+
             v = Vault.open(path)
-            res = v.release(item_id, message)
-            v.close()
+            try:
+                res = release_mod.release(v, item_id, message, confirm=confirm)
+            finally:
+                v.close()
+        except VaultError as e:
+            problems = getattr(e, "problems", None)
+            if problems is not None:
+                return json.dumps({"ok": False, "reason": e.reason,
+                                   "hint": e.hint, "problems": problems})
+            return _err(e.reason, e.hint)
+        return _ok(commit=res["commit"], rev=res["rev"], entry=res["entry"],
+                   preflight=res["preflight"],
+                   bom_freeze=res.get("bom_freeze"),
+                   stamp_orders=res["stamp_orders"])
+
+    @mcp.tool()
+    def plm_item_set(path: str, item_id: str, part_number: str = "",
+                     start_new_rev: bool = False) -> str:
+        """Edit an item's registry entry: give it a new part number (kept
+        unique within the project) and/or start a new revision of a released
+        item so it can be edited again ("start rev C" — released designs are
+        never changed in place). Returns ``{ok, item, working_rev?}``."""
+        try:
+            Vault, VaultError = _vault_module()
+        except ImportError:
+            return _err("no_vault", "version history is not available on this machine")
+        if not part_number and not start_new_rev:
+            return _err("invalid_mode", "nothing to change — give a part number "
+                        "or ask to start a new revision")
+        try:
+            v = Vault.open(path)
+            try:
+                fields: dict[str, Any] = {}
+                if part_number:
+                    fields["item"] = v.set_part_number(item_id, part_number)
+                if start_new_rev:
+                    out = v.start_new_rev(item_id)
+                    fields["item"] = out["item"]
+                    fields["working_rev"] = out["working_rev"]
+            finally:
+                v.close()
         except VaultError as e:
             return _err(e.reason, e.hint)
-        return _ok(commit=res["commit"], rev=res["rev"], entry=res["entry"])
+        return _ok(**fields)
+
+    @mcp.tool()
+    def plm_where_used(path: str, item_id: str, transitive: bool = False) -> str:
+        """Answer "where is this used?": the assemblies, drawings and CAM jobs
+        that consume an item (directly, or the whole chain with
+        ``transitive``). Derived live from the project — never stale.
+        Returns ``{ok, consumers}``."""
+        try:
+            Vault, VaultError = _vault_module()
+        except ImportError:
+            return _err("no_vault", "version history is not available on this machine")
+        try:
+            from services.plm import whereused
+
+            v = Vault.open(path)
+            try:
+                m = v.manifest()
+                docs = whereused.docs_at_head(v)
+                try:
+                    consumers = whereused.where_used(m, docs, item_id,
+                                                     transitive=transitive)
+                except KeyError:
+                    return _err("invalid_item", f"no such item: {item_id}")
+            finally:
+                v.close()
+        except VaultError as e:
+            return _err(e.reason, e.hint)
+        return _ok(consumers=consumers)
 
     @mcp.tool()
     def plm_history(path: str, item_id: str = "", limit: int = 0) -> str:

@@ -24,6 +24,7 @@ from typing import Any
 
 from services.plm import assist, gitbind, manifest, snapshot
 from services.plm import history as hist  # aliased: Vault.history() method shadows the name
+from services.plm import items as items_mod
 from services.plm import summarize
 
 # document containers we version (contract §2)
@@ -31,6 +32,22 @@ _CONTAINER_SUFFIXES = (".step+", ".ecad+")
 
 # doc-kind inference from container extension (best-effort; refined by document.json)
 _SUFFIX_KIND = {".step+": "part", ".ecad+": "ecad"}
+
+# authoritative doc-kind from the document's schema string (T-R4: drawings and
+# CAM jobs share the .step+ container, so the suffix alone is not enough)
+_SCHEMA_KIND = {
+    "aicad.part": "part",
+    "aicad.asm": "assembly",
+    "aicad.drawing": "drawing",
+    "aicad.pcb": "ecad",
+    "aicad.sch": "ecad",
+    "aicad.cam": "cam",
+    "aicad.req": "requirements",
+}
+
+
+def _kind_from_schema(schema: str) -> str | None:
+    return _SCHEMA_KIND.get(str(schema).split("/", 1)[0])
 
 
 class VaultError(Exception):
@@ -136,8 +153,12 @@ class Vault:
         if kind not in (hist.KIND_AUTO, hist.KIND_CHECKPOINT, hist.KIND_RESTORE):
             raise VaultError("invalid_mode", f"save does not accept kind={kind!r}")
         m = self.manifest()
-        files = self._explode_project_into_shadow(m, kind=kind, message=message,
-                                                  author=author, ai=ai)
+        # T-R4 lifecycle rule (contract §4): no edit-in-place of a Released
+        # item — "start a new revision" first. Restore is exempt (§8.3: you
+        # can always go back).
+        files = self._explode_project_into_shadow(
+            m, kind=kind, message=message, author=author, ai=ai,
+            enforce_released_lock=(kind != hist.KIND_RESTORE))
         author = author or _user_author()
         emeta = gitbind.EntryMeta(
             kind=kind,
@@ -183,14 +204,45 @@ class Vault:
         if m.get("ai_mode") == mode:
             return mode
         m["ai_mode"] = mode
+        self._commit_manifest_change(m)
+        return mode
+
+    # -- item registry (T-R4, contract §4) ----------------------------------
+
+    def set_part_number(self, item_id: str, part_number: str) -> dict[str, Any]:
+        """Edit an item's part number (auto-assigned, user-editable; unique
+        within the project — contract §4). Persists via a manifest entry."""
+        m = self.manifest()
+        try:
+            item = items_mod.set_part_number(m, item_id, part_number)
+        except items_mod.ItemRuleError as e:
+            raise VaultError(e.reason, e.hint)
+        self._commit_manifest_change(m)
+        return items_mod.item_view(item)
+
+    def start_new_rev(self, item_id: str) -> dict[str, Any]:
+        """The "start rev C" action: a Released item goes back to *In work*
+        so it can be edited; the working file carries forward (contract §4,
+        no edit-in-place of Released). Idempotent when already In work."""
+        m = self.manifest()
+        try:
+            out = items_mod.start_new_rev(m, item_id)
+        except items_mod.ItemRuleError as e:
+            raise VaultError(e.reason, e.hint)
+        self._commit_manifest_change(m)
+        return {"item": items_mod.item_view(out["item"]),
+                "working_rev": out["working_rev"]}
+
+    def _commit_manifest_change(self, m: dict[str, Any]) -> str:
+        """Persist a manifest-only change as an auto entry (§3.1: the manifest
+        is re-committed with every history entry)."""
         files = self._explode_project_into_shadow(m, kind=hist.KIND_AUTO, message="")
         author = _user_author()
         emeta = gitbind.EntryMeta(
             kind=hist.KIND_AUTO, message="",
             author_name=author["display"], author_email=f'{author["id"]}@aicad.local',
         )
-        self._bind.commit_tree(files, emeta)
-        return mode
+        return self._bind.commit_tree(files, emeta)
 
     # -- deterministic message drafting (T-R3) ------------------------------
 
@@ -270,17 +322,25 @@ class Vault:
     def release(self, item_id: str, message: str, *,
                 geometry_step: bytes | None = None,
                 author: dict[str, Any] | None = None,
-                skip_preflight: bool = False) -> dict[str, Any]:
-        """Release an item (contract §5): rev stamp + lifecycle + geometry freeze.
+                skip_preflight: bool = False,
+                bom_pins: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Release an item (contract §5): rev stamp + lifecycle + geometry
+        freeze + (for assemblies) the BOM freeze pin set.
 
-        v1 engine core: rev++/lifecycle transition/geometry.step freeze + BOM
-        pin recording. The full pre-flight battery + drawing title-block stamp
-        are T-R4; this cuts the atomic release entry the contract requires.
+        This is the atomic release ENTRY. The full T-R4 flow — pre-flight
+        battery, component-pin computation, stamp orders — is orchestrated by
+        :func:`services.plm.release.release`, which passes ``bom_pins`` here.
+        The In-work → Released transition is enforced: releasing an
+        already-Released item needs "start a new revision" first (§4).
         """
         m = self.manifest()
         item = manifest.find_item(m, item_id)
         if item is None:
             raise VaultError("invalid_item", f"no such item: {item_id}")
+        try:
+            items_mod.require_in_work_for_release(item)
+        except items_mod.ItemRuleError as e:
+            raise VaultError(e.reason, e.hint)
         if not message and assist.allowed(self.ai_mode(), "draft_message"):
             # assisted+ tiers: deterministically draft the release note from
             # the changes since the last released revision (user-editable —
@@ -304,6 +364,14 @@ class Vault:
             "lifecycle": manifest.LIFECYCLE_RELEASED,
         })
 
+        # BOM freeze (contract §5.5): pin the component reference set to the
+        # exact revs computed by services.plm.release.component_pins.
+        freeze = None
+        if bom_pins is not None:
+            freeze = {"assembly_item": item_id, "rev": new_rev, "commit": None,
+                      "pins": bom_pins}
+            m.setdefault("bom_freezes", []).append(freeze)
+
         # explode project, freezing geometry.step for the released item only (§5.4)
         files = self._explode_project_into_shadow(
             m, kind=hist.KIND_RELEASE, message=message, author=author,
@@ -324,6 +392,8 @@ class Vault:
         # released_revs[].commit MUST be non-null in the stored manifest so §4/§5
         # readers can locate the frozen geometry.step later.
         item["released_revs"][-1]["commit"] = commit
+        if freeze is not None:
+            freeze["commit"] = commit
         files["manifest.json"] = manifest.dumps(m)
         pin_meta = gitbind.EntryMeta(
             kind=hist.KIND_RELEASE, message=message,
@@ -370,6 +440,7 @@ class Vault:
         self, m: dict[str, Any], *, kind: str, message: str,
         author: dict[str, Any] | None = None, ai: dict[str, Any] | None = None,
         geometry_for: dict[str, bytes] | None = None,
+        enforce_released_lock: bool = False,
     ) -> dict[str, bytes]:
         """Explode every project container into the shadow tree + manifest.
 
@@ -392,10 +463,14 @@ class Vault:
             doc_uuid = doc.get("id", "")
             rel = path.name
             item = manifest.find_item_by_path(m, rel)
+            schema_kind = _kind_from_schema(doc.get("schema", ""))
             if item is None:
                 suffix = next((s for s in _CONTAINER_SUFFIXES if rel.endswith(s)), "")
                 item = manifest.register_item(
-                    m, doc_uuid=doc_uuid, kind=_SUFFIX_KIND.get(suffix, "part"), path=rel)
+                    m, doc_uuid=doc_uuid,
+                    kind=schema_kind or _SUFFIX_KIND.get(suffix, "part"), path=rel)
+            elif schema_kind and item["kind"] != schema_kind:
+                item["kind"] = schema_kind  # refine a suffix-guessed kind
             iid = item["item_id"]
             ai_block = ai if (ai and author.get("kind") == "ai") else None
             meta_json = hist.make_meta(
@@ -408,6 +483,12 @@ class Vault:
             # plain-language change summary per entry (T-R3, contract §2
             # summary.txt): deterministic, numerals copied from doc_diff.
             prev_raw = head_tree.get(snapshot.item_prefix(iid) + "document.json")
+            if (enforce_released_lock and prev_raw is not None
+                    and prev_raw != exploded.document_json):
+                try:
+                    items_mod.guard_released_edit(m, [iid])
+                except items_mod.ItemRuleError as e:
+                    raise VaultError(e.reason, e.hint)
             summary = self._item_summary(prev_raw, exploded.document_json, rel)
             files.update(snapshot.item_paths(
                 iid, exploded, meta_json=meta_json,
@@ -466,11 +547,7 @@ class Vault:
         return dirty
 
     def _item_view(self, it: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "item_id": it["item_id"], "path": it["path"], "kind": it["kind"],
-            "part_number": it.get("part_number"), "rev": it.get("rev"),
-            "lifecycle": it["lifecycle"],
-        }
+        return items_mod.item_view(it)
 
     def _entry_view(self, commit: str, tree: dict[str, bytes], item_id: str | None) -> dict[str, Any]:
         cmeta = self._bind.commit_meta(commit)

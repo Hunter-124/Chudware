@@ -314,6 +314,9 @@ def test_second_release_supersedes_prior(tmp_path):
     try:
         iid = v.status()["items"][0]["item_id"]
         v.release(iid, "rev A")
+        # T-R4 lifecycle rule: a Released item is never edited in place —
+        # "start a new revision" first, then the edit + next release.
+        v.start_new_rev(iid)
         _write(tmp_path, "Bracket.step+", _part(5.0))
         v.save("auto")
         rel_b = v.release(iid, "rev B")

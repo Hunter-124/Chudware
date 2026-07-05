@@ -432,6 +432,11 @@ void Application::frame() {
     ui::maybeOpenFirstRun(s);
     ui::drawFirstRunDialog(s);
     ui::drawSettingsModal(s, false);
+    // T-G22: AI tab "Open Agent Settings" button sets wantAgentSettings; dispatch here.
+    if (ui::settingsUi().wantAgentSettings) {
+        ui::settingsUi().wantAgentSettings = false;
+        ui::openAgentSettingsPanel();
+    }
     ui::drawProfilerWindow(s);
     ui::drawCommandSearch(s);
     ui::drawToasts(s);

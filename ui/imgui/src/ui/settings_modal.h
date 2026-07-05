@@ -49,6 +49,9 @@ struct SettingsUiState {
     bool profilerRunning = false;
     std::string pendingPromptRole;
     bool wantSettings = false;
+    bool wantAgentSettings = false;         // T-G22: link from AI tab → T-W17 agent settings panel
+    bool openComposerModelDropdown = false; // T-G22: shot trigger — open composer model popup
+    bool openPermissionsPopup = false;      // T-G22: shot trigger — open Permissions popup
 };
 
 struct SettingsEntry {

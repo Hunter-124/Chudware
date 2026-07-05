@@ -3,6 +3,7 @@
 #include "activity_panel.h"
 #include "ask_dialog.h"
 #include "console_panel.h"
+#include "model_picker.h"
 #include "model_registry.h"
 #include "settings_modal.h"
 
@@ -460,7 +461,7 @@ static void drawCopilotHeader(AppState& s, bool busy) {
             openSettings = ImGui::SmallButton("set");
         if (openSettings) {
             settingsUi().openSettings = true;
-            settingsUi().openSettingsTab = 2;
+            settingsUi().openSettingsTab = 1;  // T-G22: tab 1 = "AI Models & Routing" (was tab 2 before tab rename)
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("AI settings");
     }
@@ -476,55 +477,26 @@ static void drawCopilotHeader(AppState& s, bool busy) {
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
 }
 
+// drawModelDropdown — delegates to the shared model_picker component (T-G22).
+// Preset lists and search chrome live in ui/model_picker.{h,cpp}; single source of
+// truth is model_registry.h.  This function is called inside a BeginPopup/EndPopup.
 static void drawModelDropdown(bool busy) {
     (void)busy;
-    const float S = theme::S();
-    static char search[64] = {};
-    if (ImGui::IsWindowAppearing()) { search[0] = 0; ImGui::SetKeyboardFocusHere(); }
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputTextWithHint("##modelsearch", "Search models", search, sizeof(search));
-    ImGui::Separator();
     AppSettings& cfg = appSettings();
-    bool picked = false;
-    ImGui::BeginChild("##modellist", ImVec2(0, 240.f * S), ImGuiChildFlags_None);
-    auto showRow = [&](int provider, const std::string& id, const std::string& label) {
-        if (search[0]) {
-            std::string q = search;
-            for (char& c : q) c = (char)std::tolower((unsigned char)c);
-            std::string hay = label + id;
-            for (char& c : hay) c = (char)std::tolower((unsigned char)c);
-            if (hay.find(q) == std::string::npos) return;
-        }
-        bool sel = cfg.provider == provider && id == cfg.model;
-        if (ImGui::Selectable(label.c_str(), sel)) {
-            cfg.provider = provider;
-            std::strncpy(cfg.model, id.c_str(), sizeof(cfg.model) - 1);
-            saveAppSettings(cfg);
-            picked = true;
-        }
-    };
-    for (const auto& m : builtinModels()) showRow(m.provider, m.id, m.label);
-    if (!cfg.offlineMode) {
-        ImGui::Separator();
-        ImGui::TextColored(TVEC(txt2), "Cloud presets");
-        for (const auto& p : cloudPresets()) {
-            showRow(PROV_CLOUDCOMPAT, p.id, p.label);
-            if (picked && !p.baseUrl.empty())
-                std::strncpy(cfg.baseUrl, p.baseUrl.c_str(), sizeof(cfg.baseUrl) - 1);
-        }
-    }
-    ImGui::Separator();
-    ImGui::TextColored(TVEC(txt2), "Local presets");
-    for (const auto& p : localPresets()) {
-        showRow(PROV_LOCAL, p.id, p.label);
-        if (picked && !p.baseUrl.empty()) {
-            cfg.provider = PROV_LOCAL;
-            std::strncpy(cfg.baseUrl, p.baseUrl.c_str(), sizeof(cfg.baseUrl) - 1);
-            cfg.vision = p.vision;
-        }
-    }
-    ImGui::EndChild();
-    if (picked) ImGui::CloseCurrentPopup();
+    ModelPickerSelection sel;
+    sel.provider = cfg.provider;
+    sel.modelId  = cfg.model;
+    drawModelPicker(cfg.offlineMode, sel,
+                    [&](int prov, const std::string& id,
+                        const std::string& base, bool vision) {
+                        cfg.provider = prov;
+                        std::strncpy(cfg.model, id.c_str(), sizeof(cfg.model) - 1);
+                        if (!base.empty())
+                            std::strncpy(cfg.baseUrl, base.c_str(), sizeof(cfg.baseUrl) - 1);
+                        cfg.vision = vision;
+                        saveAppSettings(cfg);
+                    },
+                    /*closeOnPick=*/true);
 }
 
 static void drawComposerPrelude(AppState& s) {
@@ -563,6 +535,11 @@ static void drawComposerPrelude(AppState& s) {
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
     bool openPerm = ImGui::SmallButton(permLabel);
     ImGui::PopStyleColor(4);
+    // T-G22: shot trigger — open permissions popup for screenshot capture
+    if (settingsUi().openPermissionsPopup) {
+        settingsUi().openPermissionsPopup = false;
+        ImGui::OpenPopup("##cmpperm");
+    }
     if (openPerm) ImGui::OpenPopup("##cmpperm");
     if (ImGui::BeginPopup("##cmpperm")) {
         bool off = cfg.offlineMode;
@@ -608,6 +585,11 @@ static void drawComposerToolbar(AppState& s, bool busy, bool canStart, bool acti
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
     bool openModelDd = ImGui::Button(modelLabel);
     ImGui::PopStyleColor();
+    // T-G22: shot trigger — open model dropdown for screenshot capture
+    if (settingsUi().openComposerModelDropdown) {
+        settingsUi().openComposerModelDropdown = false;
+        ImGui::OpenPopup("##modeldropdown");
+    }
     if (openModelDd) ImGui::OpenPopup("##modeldropdown");
     ImGui::SameLine();
 

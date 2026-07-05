@@ -18,6 +18,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -27,6 +28,10 @@ from typing import Callable, Optional
 from engine import paths, render
 from engine.kernel import AssemblyResult, ModelResult, run_code_multi
 from mcp_server.fit_narration import _format_fit  # single home for fit/clearance text (T-F8)
+
+# Design ledger (T-W1, Pillar 20): lazy import to keep loop.py startup fast.
+# Gated by AI_CAD_LEDGER env var (default on); failures are always best-effort.
+_LEDGER_ENABLED = os.environ.get("AI_CAD_LEDGER", "1") not in ("0", "false", "False")
 
 from . import config as agent_config
 from .providers.base import Provider, assistant, image_part, text_part, user
@@ -894,6 +899,16 @@ def run_turn(session: Session, request: str, provider: Provider,
     out_dir = paths.model_dir(session.name)
     first_turn = not session.messages
 
+    # Design ledger seam (T-W1, Pillar 20): create/load per-run ledger.
+    # Best-effort — a ledger failure must never break the run (mirrors interaction._emit).
+    _ledger = None
+    if _LEDGER_ENABLED:
+        try:
+            from services.agent.ledger import Ledger
+            _ledger = Ledger.load(session.name)
+        except Exception:  # noqa: BLE001
+            pass
+
     if first_turn:
         if plan_first:
             _make_plan(session, request, provider, on_event)
@@ -1044,6 +1059,27 @@ def run_turn(session: Session, request: str, provider: Provider,
                 consent=_consent,
             )
 
+            # Ledger: record artifact event for each successful build (best-effort).
+            if _ledger is not None:
+                try:
+                    import hashlib as _hl
+                    _art_id = "art_" + _hl.sha256(
+                        (session.name + str(i)).encode()
+                    ).hexdigest()[:12]
+                    _stl = str(res.stl_path) if res.stl_path else ""
+                    _sheet = str(sheet_i) if sheet_i else ""
+                    _art_path = _sheet or _stl
+                    _ledger.add_artifact(
+                        actor="loop",
+                        kind="render" if _sheet else "doc",
+                        artifact_id=_art_id,
+                        path=_art_path,
+                        stage="feature",
+                        note=f"iter={i} stl={_stl}",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
         if res.ok and res.stl_path:
             fail_streak = 0
             same_err_streak = 0
@@ -1058,6 +1094,20 @@ def run_turn(session: Session, request: str, provider: Provider,
             if decision["done"] and i >= 1 and not changed:
                 converged = True
                 stop_reason = "confirmed"
+                # Ledger: record a decision event when the model declares done (best-effort).
+                if _ledger is not None:
+                    try:
+                        import uuid as _uuid
+                        _dec_id = "D_done_" + _uuid.uuid4().hex[:8]
+                        _ledger.add_decision(
+                            actor="loop",
+                            decision_id=_dec_id,
+                            stage="feature",
+                            text="Model confirmed design complete",
+                            rationale=decision.get("notes", "") or "model declared done",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 break
             # 2) Stagnation — geometry stopped changing but the model won't declare done.
             #    First repeat(s) get a pointed nudge to actually change something; if it keeps

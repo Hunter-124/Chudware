@@ -12,6 +12,8 @@ Routing table (keyed on ``geometry_ref["kind"]``, per contracts/parts.md §2):
   section_profile  → add StructuralElement to aicad.structure/1 doc (editable schema op)
   fitting_id       → append fitting record to aicad.piping/1 doc fittings list
   fmu_component    → append component record to aicad.hydraulic/1 doc components list
+  import_file      → import_file RPC (same primitive import_part uses) → new editable doc
+                     (T-X3: browser-acquired STEP/IGES files, domain="catalog")
 
 Each placer returns a ``PlacementResult`` dict:
 
@@ -31,6 +33,7 @@ Error contract: always returns a dict, never raises to the MCP layer.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -354,6 +357,49 @@ def _place_fmu_component(gref: dict, doc_context: dict | None,
                     "Ensure engine_oracle.hydraulic.schema is importable.")
 
 
+def _place_import_file(gref: dict, doc_context: dict | None,
+                       params: dict | None) -> dict:
+    """T-X3: import a local CAD file (browser-acquired STEP/IGES) as a new editable doc.
+
+    Uses the same ``import_file`` core RPC that the ``import_part`` MCP tool wraps
+    (``services/mcp/cad_tools.py``) — a genuine ``doc_id``, not just the file path
+    (contrast with ``generate_model``'s convention above). Full parametric feature
+    recovery from an imported B-rep is NOT attempted automatically here — that is
+    the ``reverse_engineer`` MCP tool's job and needs geometric judgment a generic
+    placer shouldn't guess at; the result's ``detail.hint`` names it as the
+    recommended next step.
+    """
+    domain = "import_file"
+    path = gref.get("path")
+    if not path:
+        return _err(domain, "geometry_ref missing 'path'",
+                    "Fetch the PartRecord via part_get to confirm geometry_ref fields.")
+    if not os.path.isfile(path):
+        return _err(domain, f"file not found: {path}",
+                    "The browser-acquired file may have been moved or cleaned up.")
+    try:
+        svc = _REPO / "services" / "mcp"
+        if str(svc) not in sys.path:
+            sys.path.insert(0, str(svc))
+        import core_bridge as cb  # type: ignore  # noqa: PLC0415
+
+        as_solid = bool((params or {}).get("as_solid", False))
+        r = cb.call("import_file", {"path": path, "as_solid": as_solid})
+        doc_id = r.get("doc_id")
+        if not doc_id:
+            return _err(domain, "import_file RPC returned no doc_id",
+                        "The core may have rejected the file format.")
+        return _ok(domain, doc_id, doc_id, {
+            "imported_from": path,
+            "body_count": r.get("body_count"),
+            "hint": "call reverse_engineer(source=doc_id) for parametric feature "
+                    "recovery where the geometry supports it",
+        })
+    except Exception as exc:  # noqa: BLE001
+        return _err(domain, f"import_file RPC failed: {exc}",
+                    "Ensure the native core is available (AI_CAD_LIBAICAD).")
+
+
 # ── dispatch table ────────────────────────────────────────────────────────────
 
 _PLACERS = {
@@ -363,6 +409,7 @@ _PLACERS = {
     "section_profile":  _place_section_profile,
     "fitting_id":       _place_fitting_id,
     "fmu_component":    _place_fmu_component,
+    "import_file":      _place_import_file,
 }
 
 

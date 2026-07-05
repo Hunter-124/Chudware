@@ -1,23 +1,31 @@
-"""Unified parts-library MCP tools — aicad.parts/1 (T-P1 + T-P2 + T-P3).
+"""Unified parts-library MCP tools — aicad.parts/1 (T-P1 + T-P2 + T-P3 + T-X3).
 
 Exposes three tools over the federated parts hub:
 
 - ``part_search(query, domain?, limit?)`` — FTS5-ranked search across all indexed providers.
   T-P2: domain filter extended to section | fitting | hydraulic | ecad.
-  Live vendor results (ecad_vendor) carry source:"live" in each PartRecord and are
-  returned as a fallback when the local index has no hits.
-- ``part_get(part_id)`` — retrieve a single PartRecord by its stable part_id.
+  T-X3: domain "catalog" added — GrabCAD/TraceParts results via the user's own
+  authenticated browser session (services/browser/adapters, contracts/parts.md §6.3's
+  reserved "paid catalog provider" seam, browser-session mechanism instead).
+  Live vendor results (ecad_vendor, browser catalog adapters) carry source:"live" in each
+  PartRecord and are returned as a fallback when the local index has no hits.
+- ``part_get(part_id)`` — retrieve a single PartRecord by its stable part_id. For a
+  "catalog" part_id this is also what triggers the actual browser download (T-X3);
+  search() only returns lightweight not-yet-downloaded stubs.
 - ``part_place(part_id, doc?, params?)`` — T-P3: insert a standard part into a doc,
   routing geometry_ref to the correct domain path.  Always returns editable doc-schema
-  ops (R1 parity).  Every domain: core_family/generate_model → new mech part doc;
-  symbol_footprint → sch_add_symbol; section_profile → structural element;
+  ops (R1 parity).  Every domain: core_family/generate_model/import_file → new mech part
+  doc; symbol_footprint → sch_add_symbol; section_profile → structural element;
   fitting_id → piping fitting; fmu_component → hydraulic component.
 
 The hub is lazy-initialized on the first call; subsequent calls reuse the in-memory FTS index.
 No network, no keys, no core dependency for the fastener/bearing adapter (they run on the
 bundled clean-room YAML tables). The core-families adapter degrades gracefully when libaicad
 is absent. All T-P2 adapters degrade gracefully (empty results, not tracebacks) when their
-backing data or credentials are absent — CI-safe.
+backing data or credentials are absent — CI-safe. T-X3's browser catalog providers degrade
+the SAME way: no saved browser login profile for a site = that provider contributes zero
+results, silently — existing part_search/part_place behavior when no profile exists is
+unchanged.
 
 Source attribution: each PartRecord's ``source`` field is "live" for live vendor results and
 absent (local) for index results. ``part_search`` also reports ``has_live`` in the response
@@ -49,7 +57,13 @@ def _err(reason: str, hint: str = "") -> str:
 
 
 def register_parts_tools(mcp: FastMCP) -> None:
-    """Register part_search, part_get, and part_place MCP tools (append-only)."""
+    """Register part_search, part_get, and part_place MCP tools (append-only).
+
+    T-X3's browser catalog providers register themselves lazily, inside
+    ``engine_oracle.parts_hub.hub.PartsHub.bootstrap()`` (same timing as every
+    other provider, including T-P2's live-vendor adapter) — NOT here, so this
+    function keeps the hub's existing "first real call" laziness intact.
+    """
 
     @mcp.tool()
     def part_search(query: str, domain: str = "", limit: int = 20) -> str:

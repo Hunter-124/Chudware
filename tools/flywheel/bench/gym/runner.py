@@ -62,15 +62,14 @@ class ExecProbe:
 
 
 def execution_probe() -> ExecProbe:
-    """Probe the environment for real-execution capability — no side effects."""
-    core = False
-    try:
-        import sys
-        sys.path.insert(0, str(_repo_root() / "services"))
-        from mcp_server import core_bridge as cb  # type: ignore
-        core = bool(cb.available())
-    except Exception:
-        core = False
+    """Probe the environment for real-execution capability — NO side effects.
+
+    Crucially this must not *load* the C++ core or mutate ``sys.path``: doing either
+    leaks global state into sibling tests (loading the core enriches ``cad_guide_text``,
+    which flips the manual-drift check). So core presence is detected by inspecting the
+    resolvable ``.so`` path only — never by importing core_bridge and calling
+    ``available()`` (which dlopen's the library)."""
+    core = _core_so_present()
 
     frontier = any(os.environ.get(k) for k in
                    ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
@@ -91,6 +90,23 @@ def execution_probe() -> ExecProbe:
 
     return ExecProbe(core_available=core, frontier_key=frontier,
                      local_model=local, real_agent_fn=real_agent)
+
+
+def _core_so_present() -> bool:
+    """Is a libaicad .so resolvable WITHOUT loading it? Checks the same env knobs
+    core_bridge honours ($AI_CAD_LIBAICAD / $AI_CAD_DIST) plus the conventional build
+    output path — pure filesystem inspection, no dlopen, no import side effect."""
+    direct = os.environ.get("AI_CAD_LIBAICAD")
+    if direct and Path(direct).exists():
+        return True
+    dist = os.environ.get("AI_CAD_DIST")
+    if dist and (Path(dist) / "libaicad.so").exists():
+        return True
+    for p in (_repo_root() / "core" / "build-linux" / "bin" / "libaicad.so",
+              _repo_root() / "core" / "build" / "bin" / "libaicad.so"):
+        if p.exists():
+            return True
+    return False
 
 
 def _local_model_present() -> bool:

@@ -1,0 +1,45 @@
+# Model routing & sources — schema aicad.routing/1 (contracts/advisor.md §14).
+#
+# INITIAL DEFAULTS ONLY. Per Hunter (2026-07-04) every role assignment is
+# user-owned: the GUI settings panel (T-W17) is the owner of this file and edits
+# it through routing.py validation — never free text. No role→model binding is
+# hardcoded anywhere outside this file; code must not special-case any role's
+# model choice. 'strongest'/'cheapest'/'cheap_local' resolve against `sources`
+# at runtime (routing.py resolve()).
+#
+# Source kinds (NO consumer-OAuth kinds — Pillar 12): anthropic | openai |
+# openrouter | lmstudio | llamacpp | ollama.
+schema: aicad.routing/1
+
+sources:
+  # A local llama.cpp / LM Studio style source is the shipped default so the
+  # copilot works fully offline out of the box. The user adds cloud sources
+  # (anthropic/openai/openrouter) in GUI settings; when they do, 'strongest'
+  # starts resolving to them.
+  - id: local_llamacpp
+    kind: llamacpp
+    models:
+      - {id: qwen2.5-coder-7b, tier: local}
+      - {id: qwen2.5-coder-32b, tier: local_large}
+
+# role -> ordered preference list; first available (resolvable to a live source)
+# wins. 'strongest'/'cheapest' are symbolic tiers resolved against sources at
+# runtime. Every role in services/agent/roles/ appears here plus `default`.
+# Defaults follow docs/ADVISOR_ARCHITECTURE.md §2.12.
+assignments:
+  overseer:               [strongest]           # audit quality gates the whole mission
+  orchestrator:           [strongest]
+  reviewer:               [strong]
+  fixer:                  [strong]               # touches broken states
+  intake_analyst:         [strong]
+  spec_writer:            [strong]
+  clarifier:              [cheap_local, strong]
+  layout_engineer:        [cheap_local, strong]
+  sketcher:               [cheap_local, strong]  # fall through if local offline
+  feature_modeler:        [cheap_local, strong]
+  cam_programmer:         [cheap_local, strong]
+  sim_engineer:           [strong, cheap_local]
+  assembly_fit_engineer:  [strong, cheap_local]
+  default:                [cheap_local, strong]
+
+approval_policy: {depth_1: auto, deeper: overseer}

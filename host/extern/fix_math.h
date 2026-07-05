@@ -6,6 +6,13 @@
 #pragma once
 #include <math.h>
 
+// Only the MSVC 14.51 (VS 2026, _MSC_VER >= 1950) UCRT drops these global-namespace
+// C99 float-math declarations. Earlier toolsets (e.g. MSVC 14.44 / _MSC_VER 1944,
+// VS 2022) already declare them in <corecrt_math.h>, so force-including these here
+// would redeclare them — and worse, clash on functions like nexttowardf whose real
+// signature is (float, long double), producing C2733. Guard so this is a no-op there.
+#if defined(_MSC_VER) && _MSC_VER >= 1950
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -70,3 +77,5 @@ float __cdecl truncf(float);
 #ifdef __cplusplus
 }
 #endif
+
+#endif  // _MSC_VER >= 1950

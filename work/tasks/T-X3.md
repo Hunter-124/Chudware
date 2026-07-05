@@ -2,8 +2,8 @@
 id: T-X3
 title: part_search federation seam - browser adapters as providers
 workstream: X
-owner: unassigned
-status: todo
+owner: sonnet-drift
+status: doing
 branch: task/T-X3-part-search-federation
 depends_on: [T-X2]
 lane: parts-sourcing

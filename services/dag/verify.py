@@ -102,6 +102,20 @@ def _check_budget_default(r: dict) -> bool:
     """
     return bool(r.get("ok", False))
 
+def _check_vibration_default(r: dict) -> bool:
+    """Pass when ok=True AND the tool's own spec verdict passed (T-BL17).
+
+    run_fea_frequency_response returns verdict=None when the node supplied no
+    vibration_spec — that is NOT a pass (fail-closed: the caller must state the
+    requirement, either via vibration_spec inputs or an explicit end_condition).
+    """
+    if not r.get("ok", False):
+        return False
+    verdict = r.get("verdict")
+    if not isinstance(verdict, dict):
+        return False
+    return bool(verdict.get("passed", False))
+
 
 # T-BL04 advanced-FEA default predicates (fail-closed; caller supplies an
 # end_condition for a real numeric gate). A "skipped" result (backend absent)
@@ -147,6 +161,7 @@ DISPATCH_TABLE: dict[str, tuple[str, str, Callable[[dict], bool]]] = {
     "thermal":      ("cad",        "run_fea_thermal",      _check_thermal_default),
     "buckling":     ("cad",        "run_fea_buckling",     _check_buckling_default),
     "contact":      ("cad",        "run_fea_contact",      _check_contact_default),
+    "vibration":    ("cad",        "run_fea_frequency_response", _check_vibration_default),
 }
 
 

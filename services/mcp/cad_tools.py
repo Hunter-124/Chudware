@@ -897,6 +897,21 @@ run_fea_contact(pressure_mpa, material) — nonlinear large-deflection CONTACT F
   (*STATIC,NLGEOM + *CONTACT PAIR). Two-block proxy demonstrating load transfer across a touching
   interface (press/snap-fits). ccx subprocess; absent ⇒ {skipped:true}.
 
+run_fea_frequency_response(fixtures, excitation_dir, sweep_hz, zeta, base_accel_g,
+  psd_breakpoints, vibration_spec, ...) — harmonic + random vibration response (T-BL17).
+  Answers "does this part resonate and fail under the vibe spec", not just "what are its
+  natural frequencies". Builds on run_fea_modal's modes via modal superposition:
+    Harmonic: SDOF-per-mode transmissibility sweep → response acceleration (g) vs frequency
+              (peak_accel_g, peak_freq_hz). base_accel_g sets the input amplitude.
+    Random:   Miles' equation per mode (Steinberg Eq. 6.6) → per-mode + total GRMS.
+              REQUIRES psd_breakpoints=[[f_hz, g2_per_hz], ...] — with no PSD given the
+              random field degrades to {ok:false, reason:"no_psd_provided"} (it NEVER
+              assumes a default vibration profile).
+  vibration_spec {"max_peak_accel_g": g, "max_grms": g} → pass/fail verdict (DAG-gateable).
+  zeta damping default 0.02 (2%) — an ASSUMPTION, always echoed in the result.
+  Response is acceleration amplification only: mode shapes are unit-normalized, so physical
+  displacement/stress amplitudes are NOT recovered (see result.limitations).
+
 run_cfd_flow(velocity, aoa, fluid) — LBM wind tunnel over the whole part/assembly.
   velocity m/s, aoa degrees, fluid "air"|"water". Returns drag (N), lift (N), Cd, frontal
   area, and Reynolds number. Coarse grid by default — a directional estimate, raise `cells`
@@ -2754,6 +2769,133 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
                                "note": "solving on a worker thread — poll get_job(job_id)"})
             return _dumps(_solve_sync_or_handoff("fea_modal", _solve))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def run_fea_frequency_response(fixtures: list, excitation_dir: Optional[list] = None,
+                                   sweep_hz: Optional[list] = None, zeta: float = 0.02,
+                                   base_accel_g: float = 1.0,
+                                   psd_breakpoints: Optional[list] = None,
+                                   vibration_spec: Optional[dict] = None,
+                                   n_modes: int = 6,
+                                   material: Union[str, dict] = "steel",
+                                   mesh_fineness: float = 0.5,
+                                   doc_id: Optional[str] = None,
+                                   background: bool = False) -> str:
+        """Harmonic + random (PSD) vibration response of the held part vs a base excitation.
+
+        Extends run_fea_modal into a frequency-response solve by modal superposition:
+        each mode becomes an SDOF oscillator (participation-factor weighted); harmonic
+        response uses the classical transmissibility sweep, random response uses Miles'
+        equation per mode (Steinberg 2000 Eq. 6.6). Modes combine by SRSS.
+
+        fixtures       : face queries held fixed (base/support) — same syntax as run_fea_modal.
+        excitation_dir : base-excitation unit direction [dx,dy,dz]; default [0,0,1] (Z-up axis).
+        sweep_hz       : harmonic sweep points; default 200 log-spaced points, 10–2000 Hz.
+        zeta           : modal damping ratio (default 0.02 = 2% — an assumption, echoed back).
+        base_accel_g   : harmonic base input amplitude in g (default 1.0 = unit sweep).
+        psd_breakpoints: [[f_hz, psd_g2_per_hz], ...] random-vibration input (log-log
+                         interpolated). OMITTED → the random field returns
+                         {ok:false, reason:"no_psd_provided"} — no default profile is assumed.
+        vibration_spec : {"max_peak_accel_g": g} and/or {"max_grms": g} → pass/fail `verdict`
+                         (the DAG verify-node end condition). Omitted → verdict is null.
+
+        Returns {ok, freqs_hz, harmonic:{sweep_hz, accel_g, peak_accel_g, peak_freq_hz,
+        per_mode, citation, limitations}, random:{per_mode, total_grms, ...} | degraded,
+        verdict, damping_assumption}. Response is acceleration amplification (g) —
+        physical displacement/stress are NOT recovered (unit-normalized mode shapes).
+        """
+        try:
+            d = _doc(doc_id)
+            mat = _resolve_material(material)
+            ex_dir = [float(x) for x in (excitation_dir or [0.0, 0.0, 1.0])]
+            if sweep_hz is not None:
+                sweep = [float(f) for f in sweep_hz]
+            else:  # default: 200 log-spaced points across the common vibe-test band
+                sweep = [10.0 * (2000.0 / 10.0) ** (i / 199.0) for i in range(200)]
+            psd = None
+            if psd_breakpoints is not None:
+                psd = [(float(p[0]), float(p[1])) for p in psd_breakpoints]
+            step = _tmp(".step")
+            cb.call("doc_export_step", {"doc_id": d, "path": step})
+            fixture_sets: list = []
+            for q in fixtures:
+                fixture_sets.extend(_resolve_face_points(d, q))
+            if fixtures and not fixture_sets:
+                return _dumps({"ok": False, "error": "no fixture faces resolved — "
+                               "the face queries you provided didn't match any surface "
+                               "points. Use query_geometry() to find the right face query."})
+            study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
+                     "mesh_order": 2, "fineness": mesh_fineness}
+
+            def _solve() -> dict:
+                res = cb.call("sim_run_modal", {"study": study, "n_modes": n_modes})
+                if not res.get("ok"):
+                    return {"ok": False, "doc_id": d,
+                            "error": res.get("error", "modal solve failed")}
+                freqs = res.get("freqs_hz", [])
+                shapes = res.get("mode_shapes", [])
+                n_nodes = int(res.get("n_nodes", 0))
+                if not freqs or not shapes or n_nodes <= 0:
+                    return {"ok": False, "doc_id": d, "error":
+                            "modal solve returned no mode shapes — cannot build the "
+                            "frequency response (need freqs_hz + mode_shapes + n_nodes)"}
+                # Total mass from the solid at the study material's density (eval_mass
+                # returns mass_g = volume_mm3 * density; kg = g / 1000).
+                dens = float(mat.get("density_g_cm3", 0.0))
+                meas = cb.call("eval_mass", {"doc_id": d, "density_g_cm3": dens})
+                total_mass_kg = float((meas or {}).get("mass_g") or 0.0) / 1000.0
+                if total_mass_kg <= 0.0:
+                    return {"ok": False, "doc_id": d, "error":
+                            "could not determine part mass (volume or density missing) — "
+                            "set a material with density_g_cm3 and ensure the part has "
+                            "solid volume"}
+                # Lazy import — keeps server module load independent of numpy availability.
+                from engine_oracle.sim.vibration import (
+                    evaluate_vibration_spec, harmonic_response, miles_response)
+                harm = harmonic_response(
+                    freqs_hz=freqs, mode_shapes_flat=shapes, n_nodes=n_nodes,
+                    total_mass_kg=total_mass_kg, excitation_dir=ex_dir,
+                    sweep_hz=sweep, zeta=zeta, base_accel_g=base_accel_g)
+                if psd is not None:
+                    rand: dict = miles_response(
+                        freqs_hz=freqs, mode_shapes_flat=shapes, n_nodes=n_nodes,
+                        total_mass_kg=total_mass_kg, excitation_dir=ex_dir,
+                        psd_breakpoints=psd, zeta=zeta)
+                    rand["ok"] = True
+                else:  # honest degrade — NEVER assume a default vibration profile
+                    rand = {"ok": False, "reason": "no_psd_provided",
+                            "hint": "Provide psd_breakpoints=[[f_hz, g2_per_hz], ...] "
+                                    "(e.g. from the qualification spec) for random-"
+                                    "vibration GRMS via Miles' equation."}
+                verdict = evaluate_vibration_spec(
+                    vibration_spec, harm, rand if rand.get("ok") else None)
+                _persist_study(d, {
+                    "type": "fea_frequency_response",
+                    "name": f"Frequency response ({mat.get('name', material)})",
+                    "engine": "cpp+py_modal_superposition",
+                    "material": mat, "fixtures": fixtures, "n_modes": n_modes,
+                    "mesh_fineness": mesh_fineness,
+                    "results": {"freqs_hz": freqs,
+                                "peak_accel_g": harm.get("peak_accel_g"),
+                                "peak_freq_hz": harm.get("peak_freq_hz"),
+                                "total_grms": rand.get("total_grms"),
+                                "verdict": verdict},
+                })
+                return {"ok": True, "doc_id": d, "material": mat.get("name", material),
+                        "freqs_hz": freqs, "harmonic": harm, "random": rand,
+                        "verdict": verdict,
+                        "damping_assumption": f"zeta={zeta} (Q={1.0 / (2.0 * zeta):g}) — "
+                                              "assumed modal damping, not measured",
+                        "saved_to_study": True}
+
+            _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
+            if background:
+                jid = _start_job("fea_frequency_response", _solve)
+                return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d,
+                               "note": "solving on a worker thread — poll get_job(job_id)"})
+            return _dumps(_solve_sync_or_handoff("fea_frequency_response", _solve))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

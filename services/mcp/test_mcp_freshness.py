@@ -254,6 +254,9 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
     "interface_check": {
         "interface_check",
     },
+    "tolerance_stackup": {
+        "stackup_analyze",
+    },
 }
 
 # All tool names across all families (deduplicated — some tools like hover appear in
@@ -294,6 +297,7 @@ _FAMILY_SIGNALS: dict[str, list[str]] = {
     "ledger":         ["ledger_get", "ledger_note", "design ledger", "ledger"],
     "buildgraph":    ["buildgraph_plan", "buildgraph_status", "buildgraph", "aicad.buildgraph/1"],
     "interface_check": ["interface_check", "interface alignment", "cad_guide('design_review')"],
+    "tolerance_stackup": ["stackup_analyze", "cad_guide('tolerance_stackup')", "tolerance_stackup"],
 }
 
 
@@ -335,6 +339,7 @@ def _build_coverage_corpus() -> str:
             "requirements", "dag", "verify", "interaction", "sourcing",
             "cost", "spec", "piping", "hydraulic", "firmware", "structural",
             "regen", "code_compliance", "serving", "design_review", "doc_diff", "plm",
+            "tolerance_stackup",
         ]
         for t in all_topics:
             try:
@@ -406,6 +411,7 @@ class TestMCPFreshness(unittest.TestCase):
             "cam_cost_estimate",                    # cost
             "serving_status",                       # adapter serving
             "buildgraph_plan",                      # build-order DAG planner
+            "stackup_analyze",                      # tolerance stack-up
         ]
         corpus_lower = self._corpus.lower()
         missing = [t for t in must_appear if t.lower() not in corpus_lower]
@@ -429,6 +435,7 @@ class TestMCPFreshness(unittest.TestCase):
             "requirements", "dag", "verify", "interaction", "sourcing",
             "cost", "spec", "piping", "hydraulic", "firmware", "structural",
             "regen", "code_compliance", "serving", "design_review", "doc_diff", "plm",
+            "tolerance_stackup",
         ]
         missing = [t for t in required_in_fallback if t not in fallback]
         self.assertFalse(
@@ -444,7 +451,7 @@ class TestMCPFreshness(unittest.TestCase):
             "doc_diff", "req", "verify", "research", "deliverables",
             "sourcing", "cost", "spec", "piping", "hydraulic", "firmware",
             "structural", "parts", "serving", "regen", "code_compliance",
-            "dag", "design_review", "ledger",
+            "dag", "design_review", "ledger", "tolerance_stackup",
         }
         missing = required_families - set(_TOOL_FAMILIES.keys())
         self.assertFalse(

@@ -1491,6 +1491,36 @@ def cad_guide_text(topic: str = "overview") -> str:
             "                                        Instantly revert to last stable version.\n\n"
             "BIAS: evaluate before promote; rollback is always safe and instant."
         )
+    if topic in ("tolerance_stackup", "stackup", "stackup_analyze", "tolerance_stack"):
+        return (
+            "TOLERANCE STACK-UP ANALYSIS — 1D worst-case + RSS over a dimension chain\n\n"
+            "Tool: stackup_analyze(dims, mode='both')\n\n"
+            "  stackup_analyze(dims)              Compute worst-case AND RSS for a 1D\n"
+            "                                     dimension chain.  Returns nominal_gap,\n"
+            "                                     total_tol, gap_max/gap_min for each\n"
+            "                                     mode, and contributors[] sorted by\n"
+            "                                     worst-case sensitivity (highest first).\n\n"
+            "  dims format (list of dicts):\n"
+            "    { name, nominal, tol, direction (+1/-1), ref?, assumed? }\n"
+            "    tol = half-tolerance (± value, >= 0).\n"
+            "    direction = sign in the 1D chain (+1 adds to gap, -1 subtracts).\n"
+            "    assumed = true if tol was defaulted (honest-degrade: reported separately).\n\n"
+            "  mode: 'worst_case' | 'rss' | 'both' (default).\n\n"
+            "HONEST DEGRADE: if the CAD doc lacks tolerance data on a dimension, pass\n"
+            "  assumed=true and a reasonable tol.  The tool lists all assumed dim names\n"
+            "  in assumed_dims[] so the caller can flag them in the report.\n\n"
+            "SENSITIVITY RANKING: contributors[] is sorted descending by contrib_wc\n"
+            "  (= |direction| * tol).  The first row is the dimension that dominates\n"
+            "  the stack -- the highest-leverage target for tolerance tightening.\n\n"
+            "DISCLAIMER: result carries 'Preliminary stack-up -- not a certified tolerance\n"
+            "  analysis. Verify with a qualified dimensional-metrology engineer before\n"
+            "  release.' Always surface this to the user.\n\n"
+            "REFERENCE: Fischer, 'Mechanical Tolerance Stackup and Analysis,' 2nd ed.,\n"
+            "  CRC Press 2011, Ch. 3 (equal-bilateral 1D chain formulas).\n\n"
+            "WORKFLOW: review critical dims -> dfm_check() for process capability ->\n"
+            "  stackup_analyze() for assembly gap variation -> fit_report() for\n"
+            "  modeled-vs-measured clearance check."
+        )
     if topic in ("design_review", "review_battery", "review_design", "full_review"):
         return (
             "DESIGN REVIEW BATTERY — one-call battery: overlap + DFM + verify narrated verdict\n\n"
@@ -1546,7 +1576,7 @@ def cad_guide_text(topic: str = "overview") -> str:
     return (f"No guide for {topic!r}. Topics: overview, simulation, review, intake, gsl, cam, "
             f"narration, parts, reverse, deliverables, requirements, dag, verify, interaction, "
             f"sourcing, cost, spec, piping, hydraulic, firmware, structural, regen, "
-            f"code_compliance, serving, design_review, doc_diff, plm; "
+            f"code_compliance, serving, design_review, doc_diff, plm, tolerance_stackup; "
             f"or a feature cheatsheet: {avail}")
 
 
@@ -1590,6 +1620,7 @@ def register_cad_tools(mcp: FastMCP) -> None:
         "design_review" (design_review — one-call geometry battery narrated verdict),
         "doc_diff" (doc_diff_tool — semantic feature-level diff between two revisions),
         "plm" (project-vault versioning stub — T-R2 fills this),
+        "tolerance_stackup" (stackup_analyze — 1D worst-case + RSS tolerance stack-up),
         or a single feature's cheatsheet by name ("hole", "fillet", "revolve", "loft",
         "sweep", "shell", "chamfer", "pattern", "mirror", "sketch", "airfoil",
         "drawing", "hardware", ...).

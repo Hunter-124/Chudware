@@ -3,7 +3,7 @@ id: T-W9
 title: Simulation verification advisor - pre-sim sanity, hand-calc cross-check, margin-policy narration
 workstream: W
 owner: sonnet-lark
-status: doing
+status: review
 branch: task/T-W9-sim-advisor
 depends_on: [T-W4, T-W5]
 lane: simulation

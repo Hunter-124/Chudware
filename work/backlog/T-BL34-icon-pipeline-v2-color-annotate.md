@@ -89,3 +89,4 @@ not let it fall off the board.
   interpretation of his directive. Dependency T-BL29 is done. NOTE: driver-notes paths
   reference deprecated host/src — the pipeline hooks may have moved to ui/imgui during the
   migration waves; verify where AI_CAD_SHOT=iconpipe lives NOW before editing.
+- 2026-07-05 04:12 UTC [sonnet-ivo] Driver sonnet-ivo stalled 2026-07-04 13:22 (contact sheets committed for review on task branch, then silence; status never flipped). Hunter directive (overnight 2026-07-05): remaining icon generation is DELEGATED TO MOOSEINATREE. Claim released; task reserved for mooseinatree — see HANDOFF section in task file.

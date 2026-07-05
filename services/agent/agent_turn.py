@@ -37,8 +37,11 @@ _RETRY = "max_iters"
 _NOCODE = "no_code"
 _FAILED = "failed"
 
-_TOOL_CALL_RE = re.compile(
-    r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+# T-W32: match the fenced BODY (not a brace pair) — the old r"\{.*?\}" non-greedy
+# pattern truncated at the FIRST closing brace, so any tool call with nested args
+# (e.g. {"tool": "x", "args": {"a": {...}}}) failed to parse and the model's valid
+# directive was dropped as free text (observed live in the r4 PLAN node).
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
 class TurnResult:
@@ -189,20 +192,41 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
 # ---------------------------------------------------------------------------
 
 def _parse_directive(reply: str) -> dict | None:
-    """Extract the first fenced JSON object from *reply*; None if absent/invalid."""
+    """Extract the first JSON directive object from *reply*; None if absent/invalid.
+
+    Accepts, in order: fenced ```json blocks (nested braces fine — the whole fence
+    body is parsed), a bare JSON object reply, and an UNTERMINATED fence (a local
+    model hitting its completion cap mid-fence still yields its complete JSON
+    object). ``raw_decode`` parses the first complete object and tolerates
+    trailing prose — never a truncated-brace parse."""
     if not reply:
         return None
-    m = _TOOL_CALL_RE.search(reply)
-    candidate = m.group(1) if m else None
-    if candidate is None:
-        # Some models emit a bare JSON object with no fence.
-        stripped = reply.strip()
-        if stripped.startswith("{") and stripped.endswith("}"):
-            candidate = stripped
-    if candidate is None:
+    candidates: list[str] = [m.group(1) for m in _FENCE_RE.finditer(reply)]
+    stripped = reply.strip()
+    if stripped.startswith("{"):
+        candidates.append(stripped)
+    else:
+        # Unterminated fence: parse from the first '{' after the opening fence.
+        fence = stripped.find("```")
+        if fence != -1:
+            brace = stripped.find("{", fence)
+            if brace != -1:
+                candidates.append(stripped[brace:])
+    for cand in candidates:
+        obj = _loads_first_object(cand)
+        if obj is not None:
+            return obj
+    return None
+
+
+def _loads_first_object(text: str) -> dict | None:
+    """Parse the first complete JSON object at the start of *text* (trailing
+    prose/junk tolerated); None when it isn't a dict or doesn't parse."""
+    text = text.strip()
+    if not text.startswith("{"):
         return None
     try:
-        obj = json.loads(candidate)
+        obj, _end = json.JSONDecoder().raw_decode(text)
         return obj if isinstance(obj, dict) else None
     except (json.JSONDecodeError, ValueError):
         return None

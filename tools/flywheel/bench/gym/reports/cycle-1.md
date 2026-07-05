@@ -4,6 +4,8 @@
 
 > HONESTY NOTE: this cycle ran in MOCK mode. The mission pipeline drives INTAKE + manifest validation + DAG compile for real, but the per-node reasoning is REPLAYED from scripted turns (no tool-executing agent_fn, no provisioned model, no C++ core in this environment — see the probe below). Pass rates and taxonomy counts are the harness + classifier exercised end to end on labeled fixtures. A model-behaviour DELTA from a dial change is only measurable once a real model is provisioned; structural-dial deltas (council threshold, budgets) ARE real.
 
+> TIER IS A PASS-THROUGH DIMENSION IN MOCK MODE: scripted turns are tier-invariant, so a challenge's `local-24k` and `frontier-200k` rows are identical by construction. The two-tier matrix proves the harness runs per-tier; it does NOT show tier-dependent model behaviour (that needs a real model). Read the tier split as scaffolding, not signal.
+
 | probe | value |
 |---|---|
 | mode | `mock` |
@@ -97,14 +99,14 @@
 {
   "grind_threshold_3_to_2": {
     "grind_before": 4,
-    "grind_after": 4,
-    "delta": 0,
+    "grind_after": 6,
+    "delta": 2,
     "measurable": true,
-    "note": "deterministic reclassification of identical ledgers \u2014 a real delta"
+    "note": "deterministic reclassification of identical ledgers \u2014 a real delta. The +delta is C3/seed3's 2-attempt n_verify_DL1 node, which fires grind only once the threshold drops to 2: the assess-adjust-rerun loop actually reclassifying a cell."
   },
   "council_threshold_5_to_3": {
     "measurable": false,
-    "note": "applied to config env; pass-rate delta needs a real model in BUILD (mock replay does not convene councils) \u2014 pending-provision"
+    "note": "applied to an in-process os.environ var ONLY (evaporates at process exit; persists to no config file) \u2014 pass-rate delta needs a real model in BUILD (mock replay does not convene councils) \u2014 pending-provision"
   }
 }
 ```

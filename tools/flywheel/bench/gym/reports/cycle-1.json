@@ -433,14 +433,14 @@
   "deltas": {
     "grind_threshold_3_to_2": {
       "grind_before": 4,
-      "grind_after": 4,
-      "delta": 0,
+      "grind_after": 6,
+      "delta": 2,
       "measurable": true,
-      "note": "deterministic reclassification of identical ledgers \u2014 a real delta"
+      "note": "deterministic reclassification of identical ledgers \u2014 a real delta. The +delta is C3/seed3's 2-attempt n_verify_DL1 node, which fires grind only once the threshold drops to 2: the assess-adjust-rerun loop actually reclassifying a cell."
     },
     "council_threshold_5_to_3": {
       "measurable": false,
-      "note": "applied to config env; pass-rate delta needs a real model in BUILD (mock replay does not convene councils) \u2014 pending-provision"
+      "note": "applied to an in-process os.environ var ONLY (evaporates at process exit; persists to no config file) \u2014 pass-rate delta needs a real model in BUILD (mock replay does not convene councils) \u2014 pending-provision"
     }
   },
   "n_cells": 36

@@ -184,6 +184,12 @@ def render_markdown(report: dict[str, Any]) -> str:
                  "dial change is only measurable once a real model is provisioned; "
                  "structural-dial deltas (council threshold, budgets) ARE real.")
         L.append("")
+        L.append("> TIER IS A PASS-THROUGH DIMENSION IN MOCK MODE: scripted turns are "
+                 "tier-invariant, so a challenge's `local-24k` and `frontier-200k` rows "
+                 "are identical by construction. The two-tier matrix proves the harness "
+                 "runs per-tier; it does NOT show tier-dependent model behaviour (that "
+                 "needs a real model). Read the tier split as scaffolding, not signal.")
+        L.append("")
     p = report["execution_probe"]
     L.append("| probe | value |")
     L.append("|---|---|")

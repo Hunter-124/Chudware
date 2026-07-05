@@ -73,7 +73,10 @@ def adjust_and_rerun(cycle_result, *, challenge_ids, tiers) -> tuple[list[dict],
         "grind_after": tight_tax.get("grind", 0),
         "delta": tight_tax.get("grind", 0) - base_tax.get("grind", 0),
         "measurable": True,
-        "note": "deterministic reclassification of identical ledgers — a real delta",
+        "note": "deterministic reclassification of identical ledgers — a real delta. "
+                "The +delta is C3/seed3's 2-attempt n_verify_DL1 node, which fires grind "
+                "only once the threshold drops to 2: the assess-adjust-rerun loop actually "
+                "reclassifying a cell.",
     }
 
     # 2) council feature threshold 5 -> 3 (config env applied; behavioural delta pending).
@@ -81,8 +84,9 @@ def adjust_and_rerun(cycle_result, *, challenge_ids, tiers) -> tuple[list[dict],
     applied.append(ch)
     deltas["council_threshold_5_to_3"] = {
         "measurable": False,
-        "note": "applied to config env; pass-rate delta needs a real model in BUILD "
-                "(mock replay does not convene councils) — pending-provision",
+        "note": "applied to an in-process os.environ var ONLY (evaporates at process "
+                "exit; persists to no config file) — pass-rate delta needs a real model "
+                "in BUILD (mock replay does not convene councils) — pending-provision",
     }
     return applied, deltas
 

@@ -152,6 +152,15 @@ def _seed_scripts() -> dict[int, dict[str, list[dict]]]:
                       "node": "n_build_DL1",
                       "args": {"load_N": 500, "direction": "radial", "material": "1045"},
                       "hypothesis": "rerun fea unchanged"})
+    # A SECOND node with exactly TWO identical attempts. This does NOT fire grind at the
+    # default threshold 3, but DOES at 2 — so the assess-adjust-rerun loop's grind 3->2
+    # tightening promotes exactly this node, giving a real, deterministic +1 delta (the
+    # anti-grind sensitivity dial actually changing a classification). See report deltas.
+    for _ in range(2):
+        grind.append({"_kind": "tool_call", "tool": "run_fea_modal",
+                      "node": "n_verify_DL1",
+                      "args": {"modes": 6, "material": "1045"},
+                      "hypothesis": "rerun modal unchanged"})
 
     return {
         1: {"DL1": clean},

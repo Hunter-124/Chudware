@@ -2,7 +2,7 @@
   "events": [
     {
       "seq": 0,
-      "ts": "2026-07-05T04:16:26Z",
+      "ts": "2026-07-05T04:26:08Z",
       "actor": "pipeline",
       "kind": "brief",
       "payload": {
@@ -13,7 +13,7 @@
     },
     {
       "seq": 1,
-      "ts": "2026-07-05T04:16:26Z",
+      "ts": "2026-07-05T04:26:08Z",
       "actor": "intake_analyst",
       "kind": "artifact",
       "payload": {
@@ -79,7 +79,7 @@
     },
     {
       "seq": 2,
-      "ts": "2026-07-05T04:16:26Z",
+      "ts": "2026-07-05T04:26:08Z",
       "actor": "spec_writer",
       "kind": "dimension",
       "payload": {
@@ -99,7 +99,7 @@
     },
     {
       "seq": 3,
-      "ts": "2026-07-05T04:16:26Z",
+      "ts": "2026-07-05T04:26:08Z",
       "actor": "feature_modeler",
       "kind": "decision",
       "payload": {
@@ -115,7 +115,7 @@
     },
     {
       "seq": 4,
-      "ts": "2026-07-05T04:16:26Z",
+      "ts": "2026-07-05T04:26:08Z",
       "actor": "feature_modeler",
       "kind": "tool_call",
       "payload": {
@@ -131,7 +131,7 @@
     },
     {
       "seq": 5,
-      "ts": "2026-07-05T04:16:26Z",
+      "ts": "2026-07-05T04:26:08Z",
       "actor": "reviewer",
       "kind": "artifact",
       "payload": {

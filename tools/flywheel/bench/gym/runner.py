@@ -178,12 +178,18 @@ class CellResult:
 
 
 def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
-             probe: ExecProbe, grind_threshold: int = 3) -> CellResult:
-    """Run one (challenge, tier, seed) cell end to end and grade + classify it."""
+             probe: ExecProbe, grind_threshold: int = 3,
+             runs_dir: Path | None = None) -> CellResult:
+    """Run one (challenge, tier, seed) cell end to end and grade + classify it.
+
+    *runs_dir* overrides the output root (default ``reports/runs``); tests pass a tmp
+    dir so the suite never writes under the committed ``reports/`` tree.
+    """
     from services.agent.ledger import Ledger
 
     run_id = f"gym_{challenge.id}_{tier}_s{seed}"
-    run_dir = REPORTS_DIR / "runs" / cycle / f"{challenge.id}_{tier}_s{seed}"
+    base = runs_dir if runs_dir is not None else (REPORTS_DIR / "runs")
+    run_dir = Path(base) / cycle / f"{challenge.id}_{tier}_s{seed}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # Fresh ledger for this cell (its own file under the run dir). A cell is
@@ -262,8 +268,12 @@ class CycleResult:
 
 def run_cycle(cycle: str = "cycle-1", *, tiers: list[str] | None = None,
               challenge_ids: list[str] | None = None,
-              grind_threshold: int = 3) -> CycleResult:
-    """Run the full challenge x tier x seed matrix and return the cycle result."""
+              grind_threshold: int = 3,
+              runs_dir: Path | None = None) -> CycleResult:
+    """Run the full challenge x tier x seed matrix and return the cycle result.
+
+    *runs_dir* overrides the output root (tests pass a tmp dir; the CLI leaves it None
+    so the committed ``reports/runs`` tree is written for cycle-1)."""
     probe = execution_probe()
     tiers = tiers or ["local-24k", "frontier-200k"]
     challenges = load_challenges()
@@ -276,5 +286,5 @@ def run_cycle(cycle: str = "cycle-1", *, tiers: list[str] | None = None,
             for seed in ch.seeds:
                 result.cells.append(
                     run_cell(ch, tier, seed, cycle=cycle, probe=probe,
-                             grind_threshold=grind_threshold))
+                             grind_threshold=grind_threshold, runs_dir=runs_dir))
     return result

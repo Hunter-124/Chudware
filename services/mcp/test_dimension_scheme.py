@@ -56,7 +56,18 @@ def _setup_stubs():
     ct._err = lambda e: json.dumps({"ok": False, "error": str(e)})
     ct._doc = lambda d: d
     sys.modules.setdefault("mcp_server.cad_tools", ct)
-    sys.modules.setdefault("mcp_server", types.ModuleType("mcp_server"))
+    ms = types.ModuleType("mcp_server")
+    sys.modules.setdefault("mcp_server", ms)
+
+    # fit_narration stub — gsl_tools imports _format_fit at module level
+    fn_mod = types.ModuleType("mcp_server.fit_narration")
+    fn_mod._format_fit = lambda fit_result: ""  # no-op for offline tests
+    sys.modules.setdefault("mcp_server.fit_narration", fn_mod)
+    # Make mcp_server a package so submodule attribute access works
+    pkg = sys.modules["mcp_server"]
+    pkg.fit_narration = fn_mod
+    pkg.cad_tools = ct
+    pkg.core_bridge = cb
 
     # engine stub (for research imports in fits.py / material_lookup.py)
     eng = types.ModuleType("engine")
@@ -85,6 +96,7 @@ from engine_oracle.dfm.process_profiles import get_profile  # noqa: E402
 from services.mcp.dimension_scheme_tools import (  # noqa: E402
     _plan_from_entities,
     _make_fixture_sketch as _dim_fixture,
+    _make_bore_sketch,
     _it_grade_for_process,
     _bilateral_tolerance,
     _find_bolt_patterns,
@@ -231,6 +243,227 @@ class TestFitsIntegration(unittest.TestCase):
         result = fit_calc(50.0, "H7/p6")
         self.assertTrue(result["ok"])
         self.assertEqual(result["answer"]["fit_character"], "press")
+
+
+class TestProcessDifferentiation(unittest.TestCase):
+    """DoD 3 — T-DP7: machined bore vs printed hole produce different dimension schemes.
+
+    The differences are sourced from engine_oracle/dfm/process_profiles.py:
+    - cnc_mill: hole_comp_mm=0.0, IT grade 7 (±~0.010 mm at 20mm)
+    - fdm:      hole_comp_mm=0.20, IT grade 12 (±~0.090 mm at 20mm)
+
+    A bore modeled at 20mm nominal should be:
+    - CNC: suggested_value=20.0 (no comp), IT7 tolerance band ~0.021 mm
+    - FDM: suggested_value=20.20 (+0.20 comp so the PRINTED hole finishes at 20mm), IT12 ~0.180 mm
+    """
+
+    NOMINAL_MM = 20.0
+
+    def _bore_plan(self, process: str) -> list[dict]:
+        entities = _make_bore_sketch(self.NOMINAL_MM)
+        it_grade = _it_grade_for_process(process)
+        return _plan_from_entities(entities, process, it_grade,
+                                   nominal_fallback_mm=self.NOMINAL_MM)
+
+    # ── IT-grade differs ─────────────────────────────────────────────────────────
+
+    def test_cnc_uses_it7_fdm_uses_it12(self):
+        """CNC→IT7, FDM→IT12: a different precision tier, not a rounding diff."""
+        self.assertEqual(_it_grade_for_process("cnc_mill"), 7)
+        self.assertEqual(_it_grade_for_process("fdm"), 12)
+
+    def test_tolerance_band_differs_by_process(self):
+        """IT7 at 20mm = 0.021 mm band; IT12 at 20mm = 0.209 mm band — a ~10× spread.
+        Values computed from ISO 286-1:2010 Table 1 via _it_value_um().
+        IT7:  mult=16, D=sqrt(18*30)≈23.2 → i≈1.307 → 16*1.307≈20.9→21µm → 0.021mm.
+        IT12: mult=160 → 160*1.307≈209µm → 0.209mm.
+        """
+        tol_cnc = _bilateral_tolerance(self.NOMINAL_MM, 7)
+        tol_fdm = _bilateral_tolerance(self.NOMINAL_MM, 12)
+        # CNC band: IT7 at 20mm → 21µm = 0.021 mm
+        self.assertAlmostEqual(tol_cnc["band_mm"], 0.021, places=6)
+        # FDM band: IT12 at 20mm → 209µm = 0.209 mm
+        self.assertAlmostEqual(tol_fdm["band_mm"], 0.209, places=6)
+        # The FDM band is materially wider — not a float-precision tie
+        self.assertGreater(tol_fdm["band_mm"], tol_cnc["band_mm"] * 5)
+
+    # ── hole_comp_mm differs ─────────────────────────────────────────────────────
+
+    def test_cnc_bore_no_hole_comp(self):
+        """CNC mill has hole_comp_mm=0 — the modeled diameter equals the nominal."""
+        plan = self._bore_plan("cnc_mill")
+        dia_items = [i for i in plan if i["dim_type"] == "diameter"]
+        self.assertTrue(len(dia_items) >= 1, "expected at least one diameter dim")
+        for item in dia_items:
+            self.assertAlmostEqual(item["hole_comp_mm"], 0.0, places=6,
+                                   msg="CNC has no hole compensation")
+            # suggested_value = nominal (no comp) — verify it equals NOMINAL_MM
+            sv = item.get("suggested_value")
+            if sv is not None:
+                self.assertAlmostEqual(sv, self.NOMINAL_MM, places=3,
+                                       msg="CNC: suggested_value should be the nominal diameter")
+
+    def test_fdm_bore_gets_positive_hole_comp(self):
+        """FDM has hole_comp_mm=0.20 — the modeled diameter is 0.20mm larger than nominal
+        so the printed hole finishes at the nominal size after shrinkage."""
+        plan = self._bore_plan("fdm")
+        dia_items = [i for i in plan if i["dim_type"] == "diameter"]
+        self.assertTrue(len(dia_items) >= 1, "expected at least one diameter dim")
+        for item in dia_items:
+            self.assertAlmostEqual(item["hole_comp_mm"], 0.20, places=6,
+                                   msg="FDM hole_comp_mm must be 0.20 (from process_profiles)")
+            sv = item.get("suggested_value")
+            if sv is not None:
+                # FDM: model the hole 0.20 mm larger so the FINISHED hole is NOMINAL_MM
+                self.assertAlmostEqual(sv, self.NOMINAL_MM + 0.20, places=3,
+                                       msg="FDM: suggested_value should be nominal + hole_comp")
+
+    def test_machined_vs_printed_schemes_differ(self):
+        """The two plans differ in both IT grade string and suggested_value — end-to-end proof."""
+        cnc_plan = self._bore_plan("cnc_mill")
+        fdm_plan = self._bore_plan("fdm")
+
+        cnc_grades = {i["default_tolerance"]["it_grade"] for i in cnc_plan}
+        fdm_grades = {i["default_tolerance"]["it_grade"] for i in fdm_plan}
+        self.assertIn("IT7", cnc_grades, "CNC plan must carry IT7 tolerance")
+        self.assertIn("IT12", fdm_grades, "FDM plan must carry IT12 tolerance")
+        self.assertNotEqual(cnc_grades, fdm_grades,
+                            "CNC and FDM must produce different IT grade sets")
+
+        cnc_comp = {i["hole_comp_mm"] for i in cnc_plan}
+        fdm_comp = {i["hole_comp_mm"] for i in fdm_plan}
+        self.assertNotEqual(cnc_comp, fdm_comp,
+                            "CNC and FDM must produce different hole_comp_mm values")
+
+    def test_hole_comp_sourced_from_process_profiles(self):
+        """The hole_comp values match process_profiles.PROFILES — they are never invented.
+        get_profile() nests DFM params under a 'params' key; extract from there."""
+        from engine_oracle.dfm.process_profiles import get_profile
+        cnc_prof = get_profile("cnc_mill")
+        fdm_prof = get_profile("fdm")
+
+        def _get_comp(prof: dict) -> float:
+            params = prof.get("params") or prof
+            return float(params.get("hole_comp_mm") or 0.0)
+
+        expected_cnc_comp = _get_comp(cnc_prof)
+        expected_fdm_comp = _get_comp(fdm_prof)
+
+        cnc_plan = self._bore_plan("cnc_mill")
+        fdm_plan = self._bore_plan("fdm")
+
+        for item in cnc_plan:
+            self.assertAlmostEqual(item["hole_comp_mm"], expected_cnc_comp, places=6,
+                                   msg="CNC hole_comp must match process_profiles")
+        for item in fdm_plan:
+            self.assertAlmostEqual(item["hole_comp_mm"], expected_fdm_comp, places=6,
+                                   msg="FDM hole_comp must match process_profiles")
+
+
+class TestSketchHealthText(unittest.TestCase):
+    """DoD 4 (offline portion) — T-DP7: sketch_health_text() renders the three key states.
+
+    The live-bridge tests (≥3 states against real engine) are in test_gsl_tools.py.
+    These offline tests verify the renderer logic using synthetic health dicts.
+    """
+
+    def _make_health(self, *, dof: int = 0, status: str = "full",
+                     open_endpoints: list | None = None,
+                     mat_regions: int | None = None,
+                     conflicting: list | None = None,
+                     redundant: list | None = None,
+                     schedule: list | None = None,
+                     dof_narration: str = "") -> dict:
+        closure: dict = {"open_endpoints": open_endpoints or [],
+                         "closed_chains_ok": not bool(open_endpoints)}
+        if mat_regions is not None:
+            closure["material_regions"] = mat_regions
+        return {
+            "ok": True,
+            "status": status,
+            "dof": dof,
+            "dof_narration": dof_narration,
+            "closure": closure,
+            "conflicting": conflicting or [],
+            "redundant": redundant or [],
+            "schedule": schedule or [],
+            "free_variables": [],
+        }
+
+    def _text(self, **kw) -> str:
+        from services.mcp.gsl_tools import sketch_health_text
+        return sketch_health_text(self._make_health(**kw))
+
+    # ── State A: fully constrained + closed ──────────────────────────────────────
+
+    def test_state_a_fully_defined(self):
+        """State A: closed profile, DOF 0 → reads 'CLOSED' and 'fully constrained'."""
+        t = self._text(dof=0, status="full", open_endpoints=[], mat_regions=1)
+        self.assertIn("CLOSED", t)
+        self.assertIn("1 material region", t)
+        self.assertIn("fully constrained", t)
+        self.assertNotIn("OPEN", t)
+        self.assertNotIn("CONFLICT", t)
+
+    # ── State B: open profile + underconstrained ─────────────────────────────────
+
+    def test_state_b_open_underconstrained(self):
+        """State B: open profile + DOF>0 → reports dangling endpoints + DOF narration + schedule."""
+        sched = [
+            {"order": 1, "kind": "geometric", "action": "coincident",
+             "why": "close the open chain", "handles": ["e1.p2", "e2.p1"]},
+            {"order": 2, "kind": "dimension", "action": "add driving dimension",
+             "why": "e1 is under-constrained in x, y", "entity": "e1"},
+        ]
+        t = self._text(dof=3, status="under",
+                       open_endpoints=["e1.p2", "e2.p1"],
+                       dof_narration="line e1 x, y; line e2 x",
+                       schedule=sched)
+        self.assertIn("OPEN", t)
+        self.assertIn("e1.p2", t)
+        self.assertIn("e2.p1", t)
+        self.assertIn("sketch_auto_constrain", t)
+        self.assertIn("DOF: 3", t)
+        self.assertIn("line e1 x, y; line e2 x", t)
+        # Schedule should list both steps
+        self.assertIn("1. [geometric] coincident", t)
+        self.assertIn("2. [dimension] add driving dimension", t)
+        self.assertIn("close the open chain", t)
+
+    # ── State C: conflicting / over-defined ──────────────────────────────────────
+
+    def test_state_c_conflicting(self):
+        """State C: conflicting constraints → reports OVER-CONSTRAINED + lists conflicts."""
+        t = self._text(dof=-1, status="over",
+                       conflicting=[{"id": "c5", "type": "distance",
+                                     "suggestion": "remove conflicting constraint c5 (distance)"}])
+        self.assertIn("OVER-CONSTRAINED", t)
+        self.assertIn("CONFLICT c5", t)
+        self.assertIn("distance", t)
+        self.assertIn("remove conflicting constraint", t)
+
+    # ── Schedule handles-vs-entity rendering ─────────────────────────────────────
+
+    def test_schedule_handles_rendered(self):
+        """Schedule step with handles list renders the handles inline."""
+        sched = [{"order": 1, "kind": "geometric", "action": "coincident",
+                  "why": "close chain", "handles": ["e3.p2", "e4.p1"]}]
+        t = self._text(dof=1, status="under", schedule=sched)
+        self.assertIn("e3.p2", t)
+        self.assertIn("e4.p1", t)
+
+    def test_empty_schedule_when_fully_defined(self):
+        """No schedule emitted when DOF=0 and status=full → just says 'nothing to do'."""
+        t = self._text(dof=0, status="full", schedule=[])
+        self.assertIn("nothing to do", t)
+
+    def test_redundant_constraint_listed(self):
+        """Redundant constraints appear in the output with their id, type, suggestion."""
+        t = self._text(dof=0, status="full",
+                       redundant=[{"id": "c9", "type": "horizontal",
+                                   "suggestion": "remove redundant constraint c9 (horizontal)"}])
+        self.assertIn("REDUNDANT c9", t)
+        self.assertIn("horizontal", t)
 
 
 if __name__ == "__main__":

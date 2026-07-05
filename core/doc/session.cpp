@@ -2775,7 +2775,14 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
     // — it only ADDS safe (non-conflicting) coincident constraints; a failure is silent.
     {
         std::vector<std::string> sk_fids = touched_sketch_fids(ops, id_map);
-        if (!sk_fids.empty()) maybe_auto_constrain(working, sk_fids, gen);
+        if (!sk_fids.empty()) {
+            // Reseed IdGen from `working` (not from the original doc) so that authored
+            // entity/constraint ids embedded inside add_feature ops are visible to gen.
+            // Without this, gen starts at its pre-op maximum and mints ids that collide
+            // with authored ids in the newly-inserted feature params (T-DP7).
+            gen.scan(working);
+            maybe_auto_constrain(working, sk_fids, gen);
+        }
     }
 
     std::vector<std::string> errs = validate_document(working);

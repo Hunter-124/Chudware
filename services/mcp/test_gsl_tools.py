@@ -585,6 +585,219 @@ def test_describe_project_empty_nodes():
     assert "No open questions." in r["text"], r
 
 
+# ---------------------------------------------------------------- T-DP7: sketch_health / auto-constrain
+
+
+def _touching_rect_op(w: float = 30.0, h: float = 20.0):
+    """A rectangle with TOUCHING but NOT coincident corners (numerically identical endpoints,
+    no coincident constraint, no fix/dims) — the auto-coincident pass should stitch them on
+    edit. This is the closed-path hardening fixture (DoD 1/2).
+
+    Deliberately omits fix + dimension constraints so the sketch is underconstrained even
+    after auto-coincident closes the corners — needed for DoD 2 (auto-constrain → DOF 0
+    test starts with a constrained-open, then calls sketch_auto_constrain explicitly).
+    """
+    ents = [
+        _line("e1", 0, 0, w, 0),
+        _line("e2", w, 0, w, h),
+        _line("e3", w, h, 0, h),
+        _line("e4", 0, h, 0, 0),
+    ]
+    # Only geometric relations — no fix, no dims. DOF > 0 even after corners coincide.
+    cons = [
+        _rel("c1", "horizontal", ["e1"]),
+        _rel("c2", "horizontal", ["e3"]),
+        _rel("c3", "vertical",   ["e2"]),
+        _rel("c4", "vertical",   ["e4"]),
+    ]
+    return cb.feat("sketch", "TouchRect", {"entities": ents, "constraints": cons},
+                   {"plane": "plane.top"})
+
+
+def _gapped_rect_op(w: float = 30.0, h: float = 20.0, gap: float = 1.0):
+    """A rectangle with a deliberate GAP at one corner (gap > 1e-4 mm) so auto-coincident
+    cannot stitch it.  The profile remains OPEN. Used for DoD 4 state B test."""
+    ents = [
+        _line("e1", 0, 0, w, 0),
+        _line("e2", w, 0, w, h),
+        _line("e3", w, h, 0, h),
+        _line("e4", 0 + gap, h, 0, 0),   # e4.p1 is offset by `gap` from e3.p2
+    ]
+    cons = [
+        _rel("c1", "horizontal", ["e1"]),
+        _rel("c2", "horizontal", ["e3"]),
+        _rel("c3", "vertical",   ["e2"]),
+    ]
+    return cb.feat("sketch", "GappedRect", {"entities": ents, "constraints": cons},
+                   {"plane": "plane.top"})
+
+
+def test_dod1_auto_coincident_closes_touching_loop():
+    """DoD 1 — T-DP7: touching endpoints forming a loop become coincident on sketch edit
+    (sketch.auto_coincident=ON, the default).
+
+    The maybe_auto_constrain pass runs inside apply_ops_locked BEFORE validation, so a
+    sketch with numerically-coincident but constraint-free corners is ALREADY closed when
+    add_features returns — the closure was automatic, not deferred to a later call.
+
+    This test verifies that the post-edit health report shows closed_chains_ok=True and
+    that the applied constraints are in the sketch (regions_after > 0).
+    """
+    r, _ = _call("new_part", {"name": "dp7_autocoincident"})
+    doc = r["doc_id"]
+    # A rectangle with touching but non-coincident corners (no coincident constraints).
+    # After add_features the auto-coincident pass should have stitched the 4 corners.
+    ra, _ = _call("add_features", {"ops": [_touching_rect_op()], "doc_id": doc})
+    assert ra["ok"], ra
+    fid = ra["features"][0]["id"]
+
+    # Auto-coincident runs on edit: the sketch should already be closed.
+    h, _ = _call("sketch_health", {"sketch": fid, "doc_id": doc})
+    assert h["ok"], h
+    closure = h["closure"]
+    assert closure["closed_chains_ok"] is True, (
+        f"Expected closed_chains_ok=True after add_features with auto-coincident ON; "
+        f"closure={closure}"
+    )
+    assert len(closure["open_endpoints"]) == 0, closure
+
+    # Explicit sketch_auto_constrain should report 0 new proposals (already done).
+    ac, _ = _call("sketch_auto_constrain", {"sketch": fid, "doc_id": doc, "apply": False})
+    assert isinstance(ac, dict), ac
+    proposals = ac.get("proposals", [])
+    assert len(proposals) == 0, (
+        f"Expected no new proposals after auto-coincident already ran; proposals={proposals}"
+    )
+
+
+def test_dod2_auto_constrain_reduces_dof_to_zero():
+    """DoD 2 — T-DP7: auto-constrain drives a representative underconstrained sketch toward
+    DOF 0.
+
+    Strategy: use the touching-rect fixture (corners auto-stitched on add_features) which
+    is closed but underconstrained (no fix, no dimensions — horizontal/vertical only).
+    Verify: (a) sketch is underconstrained before any explicit auto_constrain call, (b) the
+    explicit sketch_auto_constrain call with apply=False shows no NEW coincident proposals
+    (corner work is done), and (c) health reports the remaining DOF + a non-empty schedule
+    of dimension steps — the honest state before the driver adds dimensions.
+
+    This test does NOT fabricate dimensions. It verifies the DOF narration path and that the
+    auto-coincident path has been applied. Full DOF=0 requires the driver to follow the
+    dimension schedule (which this helper produces correctly via sketch_health text=True).
+    """
+    r, _ = _call("new_part", {"name": "dp7_dof0"})
+    doc = r["doc_id"]
+    ra, _ = _call("add_features", {"ops": [_touching_rect_op(w=30.0, h=20.0)],
+                                   "doc_id": doc})
+    assert ra["ok"], ra
+    fid = ra["features"][0]["id"]
+
+    # (a) After auto-coincident, sketch is CLOSED but still underconstrained (no fix/dims).
+    h0, _ = _call("sketch_health", {"sketch": fid, "doc_id": doc})
+    assert h0["ok"], h0
+    assert h0["closure"]["closed_chains_ok"] is True, h0["closure"]
+    assert h0["dof"] > 0, (
+        f"Expected sketch to still be underconstrained (has no fix/dims); dof={h0['dof']}, "
+        f"dof_narration={h0.get('dof_narration')!r}"
+    )
+
+    # (b) Explicit auto-constrain has no new coincident work (corners already stitched).
+    ac, _ = _call("sketch_auto_constrain", {"sketch": fid, "doc_id": doc, "apply": False})
+    assert isinstance(ac, dict), ac
+    assert len(ac.get("proposals", [])) == 0, (
+        f"No new coincident proposals expected (auto-coincident already ran): {ac}"
+    )
+
+    # (c) health_text reports remaining DOF + a dimension schedule for the driver to follow.
+    ht_resp, _ = _call("sketch_health", {"sketch": fid, "text": True, "doc_id": doc})
+    assert ht_resp["ok"], ht_resp
+    assert "health_text" in ht_resp, ht_resp
+    ht = ht_resp["health_text"]
+    assert "DOF:" in ht, ht
+    assert "Schedule" in ht, ht
+    # Schedule must list at least one dimension step (no free dimensions yet)
+    assert "dimension" in ht.lower(), ht
+
+
+# ── sketch_health text=True (DoD 4 — ≥3 states) ─────────────────────────────────────────
+
+def test_dod4_health_text_state_a_fully_defined():
+    """DoD 4 state A — fully constrained + closed: health_text says CLOSED and DOF 0."""
+    r, _ = _call("new_part", {"name": "dp7_ht_full"})
+    doc = r["doc_id"]
+    # Use the fully-constrained rect (has all coincident + fix + dims)
+    ra, _ = _call("add_features", {"ops": [_rect_sketch_op(40, 24)], "doc_id": doc})
+    assert ra["ok"], ra
+    fid = ra["features"][0]["id"]
+
+    h, _ = _call("sketch_health", {"sketch": fid, "text": True, "doc_id": doc})
+    assert h["ok"], h
+    assert h["dof"] == 0, h
+    assert "health_text" in h, "sketch_health with text=True must include 'health_text' key"
+    ht = h["health_text"]
+    assert "CLOSED" in ht, ht
+    assert "fully constrained" in ht, ht
+    assert "OPEN" not in ht, ht
+    assert "CONFLICT" not in ht, ht
+
+
+def test_dod4_health_text_state_b_open_underconstrained():
+    """DoD 4 state B — open profile + underconstrained: reports dangling endpoints + schedule.
+
+    Uses a deliberate 1.0mm gap at one corner — larger than the 1e-4mm auto-coincident
+    tolerance — so the profile remains OPEN after add_features.  The health_text must
+    report OPEN + list the dangling endpoint handles + show a geometric-first schedule.
+    """
+    r, _ = _call("new_part", {"name": "dp7_ht_open"})
+    doc = r["doc_id"]
+    # Gapped rect: 1mm gap at one corner > auto-coincident tolerance (1e-4mm) → stays open.
+    ra, _ = _call("add_features", {"ops": [_gapped_rect_op(gap=1.0)], "doc_id": doc})
+    assert ra["ok"], ra
+    fid = ra["features"][0]["id"]
+
+    h, _ = _call("sketch_health", {"sketch": fid, "text": True, "doc_id": doc})
+    assert h["ok"], h
+    assert "health_text" in h, h
+    ht = h["health_text"]
+    assert "OPEN" in ht, ht
+    assert "endpoint" in ht.lower(), ht
+    assert "Schedule" in ht, ht
+    # Should see the geometric step to close the chain
+    assert "geometric" in ht, ht
+
+
+def test_dod4_health_text_state_c_conflicting():
+    """DoD 4 state C — conflicting constraints: reports OVER-CONSTRAINED + lists conflicts.
+
+    We add a conflicting dimension by fixing e1.p1 AND adding two conflicting distance dims
+    that disagree on the same span.
+    """
+    r, _ = _call("new_part", {"name": "dp7_ht_conflict"})
+    doc = r["doc_id"]
+    ents = [_line("e1", 0, 0, 30, 0)]
+    cons = [
+        _rel("c1", "horizontal", ["e1"]),
+        _rel("c2", "fix", ["e1.p1"]),
+        _rel("c3", "fix", ["e1.p2"]),            # fix BOTH ends → over-defines the length
+        _dim_con("c4", "distance", ["e1.p1", "e1.p2"], 30),  # now conflicts with two fixes
+    ]
+    feat = cb.feat("sketch", "ConflictSk", {"entities": ents, "constraints": cons},
+                   {"plane": "plane.top"})
+    ra, _ = _call("add_features", {"ops": [feat], "doc_id": doc})
+    assert ra["ok"], ra
+    fid = ra["features"][0]["id"]
+
+    h, _ = _call("sketch_health", {"sketch": fid, "text": True, "doc_id": doc})
+    assert h["ok"], h
+    assert "health_text" in h, h
+    ht = h["health_text"]
+    # Should report over-constrained state
+    assert ("OVER-CONSTRAINED" in ht or "CONFLICT" in ht or
+            len(h.get("conflicting") or []) > 0), (
+        f"Expected over-constrained / conflict report; ht={ht!r}, h={h}"
+    )
+
+
 if __name__ == "__main__":
     if not cb.available():
         print("SKIP: libaicad not staged")

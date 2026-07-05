@@ -292,6 +292,12 @@ register_advisor_tools(_reg.view(mcp, "advisor"))
 # no write-lease required to poll status.
 from services.mcp.workspace_tools import register_workspace_tools
 register_workspace_tools(_reg.view(mcp, "workspace"))
+# Interface alignment checker (T-BL49): interface_check inspects mating component pairs for
+# hole-pattern registration, bore coaxiality, contact-plane flushness, and fastener pass-through
+# — the layout errors that pass check_interference (no clash) but are still wrong.  Reuses
+# doc_query (per-body faces), asm_world_bodies, cam_extract holes, research_thread_spec.
+from mcp_server.interface_check_tools import register_interface_check_tools
+register_interface_check_tools(mcp)
 
 
 def _install_clean_stdout():

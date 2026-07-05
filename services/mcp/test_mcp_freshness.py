@@ -250,6 +250,9 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
     "buildgraph": {
         "buildgraph_plan", "buildgraph_status",
     },
+    "interface_check": {
+        "interface_check",
+    },
 }
 
 # All tool names across all families (deduplicated — some tools like hover appear in
@@ -289,6 +292,7 @@ _FAMILY_SIGNALS: dict[str, list[str]] = {
     "design_review": ["design_review", "cad_guide('design_review')"],
     "ledger":         ["ledger_get", "ledger_note", "design ledger", "ledger"],
     "buildgraph":    ["buildgraph_plan", "buildgraph_status", "buildgraph", "aicad.buildgraph/1"],
+    "interface_check": ["interface_check", "interface alignment", "cad_guide('design_review')"],
 }
 
 

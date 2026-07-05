@@ -71,4 +71,64 @@ pass through the stack.
   side; T-BL50 covers the plan-first workflow that calls this tool. Keep the tool's
   JSON output stable/documented — T-BL50's coverage gate consumes it.
 
+## JSON contract (for T-BL50 — STABLE, version 1)
+
+`interface_check(doc_id?, components?=[a,b,...], fastener?="M6", proximity_mm?=2.0)` returns
+JSON (full field docs at the top of `services/mcp/interface_check_tools.py`):
+
+```
+{
+  "ok": bool,                # True iff NO finding has severity "fail"
+  "doc_id": str,
+  "tool": "interface_check", "version": 1,
+  "components": [{"id","name","bbox"}],
+  "pairs": [                 # one per examined component-pair interface
+    {"a","b","a_name","b_name",
+     "checks": {
+       "hole_pattern":         {"status","matched":[],"misaligned":[{pos_delta_mm,offset_vec_mm,dia_delta_mm,fix}],"unmatched_a":[],"unmatched_b":[],"summary"},
+       "coaxiality":           {"status","pairs":[{a_feature,b_feature,axis_offset_mm,axis_angle_deg,status,fix}],"summary"},
+       "contact_plane":        {"status","gap_mm","parallel_angle_deg","a_feature","b_feature","fix","summary"},
+       "fastener_passthrough": {"status","fastener","nominal_mm","stacks":[{nominal_mm,min_hole_dia_mm,clearance_mm,passes,fix}],"summary"}
+     }}
+  ],
+  "findings": [              # flat, agent-actionable; the payload design_review/verify narrate
+    {"severity":"fail"|"warn","component_a","component_b","check","feature","error_mm","detail","fix"}
+  ],
+  "summary": str, "scope_note": str
+}
+```
+
+T-BL50's coverage gate should read `ok` + `findings[].severity=="fail"` (advisory `warn`
+findings do not fail the gate). `check` ∈ {hole_pattern, coaxiality, contact_plane,
+fastener_passthrough}. Field names/`version` are frozen; additive-only changes bump `version`.
+
 ## Progress log
+
+- 2026-07-04 opus-gill: shipped `interface_check` (services/mcp/interface_check_tools.py):
+  4 sub-checks (hole-pattern registration, bore coaxiality, contact-plane flushness, fastener
+  pass-through). Reuses `doc_query` (per-body faces via a new 1-based `body_id` selector added
+  to core/doc/session.cpp, mirroring eval_measure/eval_mass — default preserves bodies[-1]),
+  `asm_world_bodies`, and `research_thread_spec` (no new fit tables). Wired into the review
+  loop: `verify` battery (services/verify/battery.py), `design_review`
+  (services/mcp/design_review_tools.py), server.py registration, and cad_guide('review').
+  Regression: services/mcp/test_interface_check.py — misaligned 4-hole bracket+plate FLAGGED
+  with pos_delta≈1.5mm in +X; corrected (dx=0) PASSES; M8 fastener fails / M5 passes; plus a
+  doc_query body_id per-body + out-of-range unit test. Built + tested against a worktree-local
+  core build (system OCCT); main checkout left clean.
+- 2026-07-04 opus-gill (resume after crash): finished the interrupted checkpoint — an
+  incomplete `_holes_from_faces` → `_cylinders_from_faces` refactor had left a dangling call
+  + mismatched `_check_coaxiality` signature (would NameError at runtime). Completed the split
+  (per-body cylinders cached once as (bores, bosses); hole_pattern + fastener run on bores,
+  coaxiality now matches boss/shaft-in-bore both directions) and re-wired the callsites.
+  Confirmed the body_id doc_query change is on-branch (commit e98b4b90) and unit-tested; stray
+  main-checkout edit was NOT needed. Rebased on origin/master (clean). All 8 tests PASS against
+  the real engine (core/build-linux/bin/libaicad.so) — verified executed, not skipped.
+- **INTEGRATOR / T-BL50 join point:** once `services/mcp/layout_plan_tools.py` lands, add
+  `"interface_check"` to its `_INTERFACE_VERIFIERS` map so the layout coverage gate consumes
+  this tool's output. Gate reads top-level `ok` + any `findings[].severity=="fail"` (advisory
+  `warn` does not fail the gate). JSON contract above is version 1, frozen (additive-only bumps
+  `version`). NOTE: the ctypes bridge (`mcp_server/core_bridge.py`) resolves the .so root as
+  `parents[1]` = the repo's `services/` dir, so its default search paths point under
+  `services/core/build-*` which do not exist in a normal checkout; set
+  `AI_CAD_LIBAICAD=<repo>/core/build-linux/bin/libaicad.so` (or stage the .so) to run the
+  engine-backed tests — otherwise `cb.available()` is False and the suite silently all-skips.

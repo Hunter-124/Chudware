@@ -181,6 +181,15 @@ struct Study {
 
     // Thermal result scalars (T-SIM1; transient, regenerated on Run).
     double maxTempC = 0.0, minTempC = 0.0;
+
+    // T-SIM3: sim-advisor postcheck result (transient, regenerated on Run completion).
+    // Verdict is PASS/WARN/FAIL vs engine_oracle/sim/margin_policy.json; narration is the
+    // advisor's multi-line explanation (narrate_postcheck). Empty verdict = advisor not run.
+    std::string advisorVerdict;
+    std::string advisorMatClass;
+    double advisorSf = 0.0;
+    std::string advisorNarration;
+    nlohmann::json advisorItems;     // aicad.advisory/1 items from postcheck
 };
 
 // Which sub-node of a study the tree has selected (drives the form).
@@ -221,6 +230,12 @@ public:
     // ---- scripted-shot helpers (AI_CAD_SHOT=fea/flow), preserved from host's SimPanel ----
     void configureActive(app::AppState& st, float density, const std::string& materialKey);
     void configureActiveFlow(app::AppState& st, int fluid, float aoaDeg, float sideslipDeg, int preset);
+    // T-SIM3 shot seams: open the material-assignment dialog for the selected study, and
+    // seed a completed static result on it then run the REAL advisor postcheck over it
+    // (fixture-seeded numbers because Netgen cannot mesh headless — same honesty pattern
+    // as the fea_overlay / sim_studies scenarios; the advisor call itself is live).
+    void openMaterialDialog() { matDialogOpen_ = true; }
+    void debugSeedStaticResult(app::AppState& st, double vmMpa, double dispMm, double minFos);
 
     // Material lookup (singleton: built-in engine/sim/materials.json + user custom_materials.json).
     struct Material {
@@ -256,6 +271,14 @@ private:
     void drawResultControls(app::AppState& st, Study& s);
     void drawWellRow(app::AppState& st, const char* label, SimWell& well, const char* tip);
     void drawCustomMaterialPopup(app::AppState& st, Study& s);
+    // T-SIM3: modal material-assignment dialog (doc material + global library + custom).
+    void drawMaterialDialog(app::AppState& st, Study& s);
+    // T-SIM3: sim-advisor (T-W9) wiring. Precheck returns true when dispatch may proceed —
+    // advise-never-veto: only AI_CAD_SIM_PRECHECK_BLOCK=1 turns blocker findings into a stop.
+    bool advisorPrecheck(app::AppState& st, Study& s);
+    void advisorPostcheck(app::AppState& st, Study& s);
+    nlohmann::json advisorSpec(app::AppState& st, const Study& s, bool withResults) const;
+    void drawAdvisoryCard(app::AppState& st, Study& s);
     void drawFatigueForm(app::AppState& st, Study& s);
     void drawFatigueResults(app::AppState& st, Study& s);   // per-theory FoS/life table
 
@@ -309,6 +332,17 @@ private:
     char cmName_[64] = "";
     float cmE_ = 70000.0f, cmNu_ = 0.30f, cmDensity_ = 2.7f, cmYield_ = 250.0f;
     float cmUlt_ = 310.0f, cmEnd_ = 96.0f;
+
+    // T-SIM3: material-assignment dialog state.
+    bool matDialogOpen_ = false;
+    char matFilter_[64] = "";
+    int  matDialogSel_ = -1;
+
+    // T-SIM3: last precheck advisory (transient; belongs to study precheckStudyId_).
+    nlohmann::json precheckItems_ = nlohmann::json::array();
+    std::string precheckStudyId_;
+    bool precheckBlocked_ = false;
+    std::string advisorNote_;   // advisor-unavailable note ("" = advisor reachable)
 };
 
 // File-static singleton accessor (mirrors ui::propertyManager()).

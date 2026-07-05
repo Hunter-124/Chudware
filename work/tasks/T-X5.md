@@ -2,8 +2,8 @@
 id: T-X5
 title: Profile manager UX seam - list/refresh/delete site profiles + expiry detection
 workstream: X
-owner: unassigned
-status: todo
+owner: gissa
+status: doing
 branch: task/T-X5-profile-manager-seam
 depends_on: [T-X1]
 lane: parts-sourcing

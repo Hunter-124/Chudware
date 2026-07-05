@@ -19,6 +19,25 @@ run_fea_static(fixtures, loads, material) — linear static stress.
 
 run_fea_modal(fixtures, material, n_modes) — natural frequencies (Hz) of the held part.
 
+run_fea_fatigue(fixtures, loads, material, load_type, theory) — high-cycle FATIGUE life.
+  Reuses the static stress field, then applies the mean-stress theory (goodman/gerber/
+  soderberg/asme/morrow) + Marin endurance correction + Shigley S-N line to report cycles-
+  to-failure and a factor of safety. load_type "reversed"|"zero_based"|"ratio" sets the
+  cyclic spectrum. regime="infinite" ⇒ runout (>1e6 cycles). Same FEA backend as run_fea_static.
+
+run_fea_thermal(hot_faces, cold_faces, material) — steady-state THERMAL (heat conduction) via
+  CalculiX (ccx). hot_faces/cold_faces each carry a {face + temperature °C}. Solves a prismatic
+  box proxy sized to the part bbox (through-conduction estimate). ccx is a GPL-2.0 subprocess
+  (PATH-discovered); if absent it returns {skipped:true} — never a fabricated result.
+
+run_fea_buckling(fixtures, load, material, n_modes) — linear (eigenvalue) BUCKLING via CalculiX.
+  Returns the critical load factors λ (applied load × λ = Pcr); λ<1 buckles below the load.
+  Box-proxy Euler-column estimate for slender members. ccx subprocess; absent ⇒ {skipped:true}.
+
+run_fea_contact(pressure_mpa, material) — nonlinear large-deflection CONTACT FEA via CalculiX
+  (*STATIC,NLGEOM + *CONTACT PAIR). Two-block proxy demonstrating load transfer across a touching
+  interface (press/snap-fits). ccx subprocess; absent ⇒ {skipped:true}.
+
 run_fea_frequency_response(fixtures, excitation_dir, sweep_hz, zeta, base_accel_g,
   psd_breakpoints, vibration_spec, ...) — harmonic + random vibration response (T-BL17).
   Answers "does this part resonate and fail under the vibe spec", not just "what are its

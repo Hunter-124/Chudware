@@ -14,6 +14,12 @@ import pytest
 
 from services.mcp import fea_advanced as fa
 
+# Import the registrar EARLY, before sibling tests (_ensure_stubs) pollute
+# sys.modules with stub mcp/anyio packages — cad_tools.py imports FastMCP at
+# module level, so it must be imported while the REAL mcp package is accessible.
+# (Same rule as test_mcp_freshness.py; needed for the mcp_server/ mirror suite.)
+from services.mcp.cad_tools import register_cad_tools as _register_cad_tools
+
 
 # --------------------------------------------------------------------- fatigue math
 
@@ -119,12 +125,25 @@ def test_dat_nodal_parser_averages():
 
 # --------------------------------------------------------------------- MCP tool degrade
 
+class _CaptureMCP:
+    """Minimal FastMCP stand-in capturing @mcp.tool() registrations — collects
+    cleanly whether or not the real ``mcp`` package is importable at call time
+    (register_cad_tools never touches FastMCP internals)."""
+
+    def __init__(self):
+        self.tools: dict = {}
+
+    def tool(self, *args, **kwargs):
+        def dec(fn):
+            self.tools[kwargs.get("name", fn.__name__)] = fn
+            return fn
+        return dec
+
+
 def _cad_tools():
-    from mcp.server.fastmcp import FastMCP
-    from services.mcp.cad_tools import register_cad_tools
-    m = FastMCP("test")
-    register_cad_tools(m)
-    return {n: t.fn for n, t in m._tool_manager._tools.items()}
+    m = _CaptureMCP()
+    _register_cad_tools(m)
+    return m.tools
 
 
 def test_all_four_tools_registered():

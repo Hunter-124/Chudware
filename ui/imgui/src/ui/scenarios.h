@@ -108,7 +108,7 @@ struct ShotConfig {
     int  glassperfFrame = 0;
 
     bool isScenarioMode() const {
-        return wantM1 || wantSketch || wantAsm || wantFea || wantFlow || wantCam
+        return wantM1 || wantSketch || wantSketchDispatch || wantAsm || wantFea || wantFlow || wantCam
             || wantDrawing || wantEvalMass || wantActivity || wantMultidoc;
     }
 
@@ -146,6 +146,19 @@ private:
     std::string skSavePath, skFid, skL0, skL1, skL2, skL3, skWidthCid;
     bool skDirReady = false;
     std::string sketchCapture;
+
+    // sketch_dispatch (T-BL48: prove the real interactive entry path via dispatch→drain)
+    // Extended by T-BL44: steps 10-13 inject Space key and verify normal-to orient.
+    int sdStep = 0, sdSettle = 0;
+    std::string sdSavePath, sdFid, sdL0, sdL1, sdL2, sdL3;
+    bool sdDirReady = false;
+    std::string sketchDispatchCapture;
+    float sdPreSpaceYaw = 0.f, sdPreSpacePitch = 0.f;  // T-BL44: camera state before Space
+    // T-BL46: drag discriminator test state (plain floats — no ImVec2 dependency in header)
+    float sdElemPtX  = 0.f, sdElemPtY  = 0.f;   // screen pos of projected edge midpoint (element hit)
+    float sdEmptyPtX = 0.f, sdEmptyPtY = 0.f;   // screen pos of empty-space anchor (no entity hit)
+    float sdDragPreYaw  = 0.f, sdDragPrePitch  = 0.f;  // camera before element drag
+    float sdEmptyPreYaw = 0.f, sdEmptyPrePitch = 0.f;  // camera before empty-space drag
 
     // asm
     int asmStep = 0, asmSettle = 0;

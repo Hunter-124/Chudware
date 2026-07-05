@@ -2,6 +2,9 @@
 #include "ui/scenarios.h"
 
 #include "ui/viewport.h"
+#include "ui/sketch/sketch_mode.h"   // T-BL46: full type for sketchMode().elementDragActive()
+#include "viewport_impl.h"            // T-BL46: GlViewport full type (renderer().camera())
+#include "renderer.h"                 // T-BL46: worldToScreen(), ViewportScreen
 
 #include "ui/ribbon.h"
 #include "ui/settings_modal.h"
@@ -301,7 +304,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantMultidoc = eq("multidoc");
     cfg.wantEcad = eq("ecad");
     cfg.wantSketch = eq("sketch");
-    cfg.wantSketchDispatch = eq("sketch_dispatch_probe");  // T-BL47 proof
+    cfg.wantSketchDispatch = eq("sketch_dispatch");  // T-BL48 proof: dispatch→drain→active_
     cfg.wantFea = eq("fea");
     cfg.wantCam = eq("cam");
     cfg.wantFlow = eq("flow");
@@ -1296,6 +1299,430 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
         if (skStep <= 2) ++skStep;
     }
 
+    // ---------- sketch_dispatch (T-BL48: prove the REAL interactive entry path) ----------
+    // Unlike `sketch` (which force-sets st.inSketch and drives via direct sketch_enter RPCs,
+    // bypassing dispatch), this scenario NEVER touches st.inSketch itself. Entry happens only
+    // through the dispatch → AppState::pendingSketchCmds/pendingSketchEditFid channel, drained
+    // in ui/viewport.cpp where the single s_sketch + SketchHost live. The drain runs
+    // onRibbonCommand→enterNewOnSelection→enterForFeature (active_=true) / enterForFeature (edit),
+    // then sets s.inSketch = s_sketch.active() || planePicking(). The overlay is double-gated
+    // (if(s.inSketch) in viewport.cpp AND if(!active_) return in sketch_overlay.cpp), so a
+    // rendered overlay PNG proves active_ became true via dispatch. Because inSketch only flips
+    // on the NEXT frame's drain, every drain-dependent transition (enter/exit/reedit) dispatches
+    // on one step + settles, then captures on the following step once the drain has run.
+    if (cfg.wantSketchDispatch && st.workerStarted && !cfg.sketchDispatchShotDone && cfg.frame >= 5) {
+        if (!sdDirReady) {
+            sdDirReady = true;
+            sdSavePath = repoBase() + "/scratch/sketch_dispatch_shots";
+            std::error_code ec; std::filesystem::create_directories(sdSavePath, ec);
+        }
+        auto applyOne = [&](const nlohmann::json& op) {
+            return st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+        };
+        const int kSettle = 4;
+        if (sdSettle > 0) { --sdSettle; return; }
+        if (!sketchDispatchCapture.empty()) return;
+        std::string err;
+        switch (sdStep) {
+            case 0: {  // new part + sketch feature + 4-line rectangle profile (no entry yet)
+                if (!st.docMirror.newPart(st.worker, err)) {
+                    std::printf("sketch_dispatch: new_part FAILED: %s\n", err.c_str());
+                    std::fflush(stdout);
+                    cfg.sketchDispatchShotDone = true; break;
+                }
+                st.addDocTab(false);
+                auto r = applyOne({{"op","add_feature"},{"feature",{
+                    {"type","sketch"},{"name","Sketch1"},
+                    {"refs",{{"plane","plane.top"}}},
+                    {"params",{{"entities",nlohmann::json::array()},
+                               {"constraints",nlohmann::json::array()}}}}}});
+                sdFid = (r.id_map.is_object() && r.id_map.contains("$0"))
+                        ? r.id_map["$0"].get<std::string>() : "f1";
+                // A closed rectangle so the step-9 region extrude has a real profile to consume.
+                auto addLine = [&](double x1,double y1,double x2,double y2,bool horiz,
+                                   const std::string& prev)->std::string{
+                    nlohmann::json cs = nlohmann::json::array();
+                    cs.push_back({{"type",horiz?"horizontal":"vertical"},{"refs",{"$self"}}});
+                    if (!prev.empty())
+                        cs.push_back({{"type","coincident"},{"refs",{prev+".p2","$self.p1"}}});
+                    auto rr = applyOne({{"op","sketch_add_entity"},{"sketch",sdFid},
+                        {"entity",{{"type","line"},{"p1",{x1,y1}},{"p2",{x2,y2}}}},{"constraints",cs}});
+                    return (rr.id_map.is_object() && rr.id_map.contains("$0"))
+                           ? rr.id_map["$0"].get<std::string>() : "";
+                };
+                sdL0 = addLine(0,0,80,0,true,"");
+                sdL1 = addLine(80,0,80,40,false,sdL0);
+                sdL2 = addLine(80,40,0,40,true,sdL1);
+                sdL3 = addLine(0,40,0,0,false,sdL2);
+                applyOne({{"op","sketch_add_constraint"},{"sketch",sdFid},
+                    {"constraint",{{"type","coincident"},{"refs",{sdL3+".p2",sdL0+".p1"}}}}});
+                st.docMirror.resync(st.worker);
+                std::printf("sketch_dispatch: sketch %s + rect built (NOT yet entered)\n",
+                            sdFid.c_str());
+                std::fflush(stdout);
+                break;  // no capture, no settle: advance immediately to the dispatch step
+            }
+            case 1: {  // pre-select the plane, then dispatch("sketch_new") — DIRECT entry
+                // Pre-selecting a datum plane routes enterNewOnSelection → createSketchOnPlane
+                // → enterForFeature directly (no plane-pick). The viewport propagates
+                // host.selectedFeatureId = st.selectedFeature before running onRibbonCommand.
+                st.selectedFeature = "plane.top";
+                st.dispatch("sketch_new");  // pushes to pendingSketchCmds; drain runs next frame
+                std::printf("sketch_dispatch: dispatched sketch_new (plane.top pre-selected); "
+                            "awaiting drain\n");
+                std::fflush(stdout);
+                sdSettle = kSettle;  // let the viewport drain run enterNewOnSelection → active_
+                break;
+            }
+            case 2: {  // drain has run: st.inSketch must now be true — capture the overlay
+                std::printf("sketch_dispatch: after drain inSketch=%d (overlay proves active_)\n",
+                            (int)st.inSketch);
+                std::fflush(stdout);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_01_enter.png";
+                sdSettle = kSettle;
+                break;
+            }
+            case 3: {  // activate the Line tool via dispatch; profile already visible
+                st.dispatch("sk_line");  // tool activation; does not move inSketch
+                std::printf("sketch_dispatch: dispatched sk_line (draw tool active)\n");
+                std::fflush(stdout);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_02_draw.png";
+                sdSettle = kSettle;
+                break;
+            }
+            case 4: {  // dispatch("sketch_exit") — drain runs exitSketch next frame
+                st.dispatch("sketch_exit");
+                std::printf("sketch_dispatch: dispatched sketch_exit; awaiting drain\n");
+                std::fflush(stdout);
+                sdSettle = kSettle;
+                break;
+            }
+            case 5: {  // drain ran exitSketch: st.inSketch must now be false — capture
+                std::printf("sketch_dispatch: after exit drain inSketch=%d\n", (int)st.inSketch);
+                std::fflush(stdout);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_03_exit.png";
+                sdSettle = kSettle;
+                break;
+            }
+            case 6: {  // MY delta: edit-existing via pendingSketchEditFid → enterForFeature
+                st.pendingSketchEditFid = sdFid;  // drain runs enterForFeature (active_ true) next frame
+                std::printf("sketch_dispatch: armed pendingSketchEditFid=%s; awaiting drain\n",
+                            sdFid.c_str());
+                std::fflush(stdout);
+                sdSettle = kSettle;
+                break;
+            }
+            case 7: {  // drain re-entered the sketch: st.inSketch true again — capture reedit
+                std::printf("sketch_dispatch: after reedit drain inSketch=%d\n", (int)st.inSketch);
+                std::fflush(stdout);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_04_reedit.png";
+                sdSettle = kSettle;
+                break;
+            }
+            case 8: {  // exit the reedit cleanly (drain) before extruding so the solid is unobscured
+                st.dispatch("sketch_exit");
+                std::printf("sketch_dispatch: dispatched sketch_exit after reedit; awaiting drain\n");
+                std::fflush(stdout);
+                sdSettle = kSettle;
+                break;
+            }
+            case 9: {  // downstream consumption: extrude the sketch region depth 10
+                st.docMirror.resync(st.worker);
+                nlohmann::json region = {{"kind","region"},{"sketch",sdFid},
+                    {"centroid",nlohmann::json::array({50.0,20.0})},{"hint_index",0}};
+                auto r = applyOne({{"op","add_feature"},{"feature",{
+                    {"type","extrude"},{"name","Boss-Extrude1"},
+                    {"params",{{"depth",{{"value",10.0},{"expr",nullptr}}},{"end","blind"},{"mode","boss"}}},
+                    {"refs",{{"profile",nlohmann::json::array({region})}}}}}});
+                loadMesh(st, r.aicm_path);
+                bool exok = false;
+                if (r.feature_status.is_array() && !r.feature_status.empty())
+                    exok = r.feature_status.back().value("ok",false);
+                std::printf("sketch_dispatch: extrude region depth 10 ok=%d\n", (int)exok);
+                std::fflush(stdout);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_05_extrude.png";
+                sdSettle = kSettle;
+                break;
+            }
+            // T-BL44: Space → orient view normal-to the active sketch plane.
+            // Steps 10-13 re-enter the sketch, rotate the camera to a clearly non-normal
+            // angle (yaw=99, pitch=55), inject a Space key press via ImGui IO, then verify
+            // on the following frame that g_vpState snapped to cameraLock()'s normal-to
+            // yaw/pitch (plane.top normal = yaw=0, pitch=90 by convention). We capture
+            // before (rotated) + after (normal-to) screenshots as visual evidence.
+            case 10: {  // re-enter the sketch (drain → active_ + inSketch)
+                st.pendingSketchEditFid = sdFid;
+                std::printf("sketch_dispatch[T-BL44]: re-entering sketch for Space test; "
+                            "awaiting drain\n");
+                std::fflush(stdout);
+                sdSettle = kSettle;
+                break;
+            }
+            case 11: {  // drain ran; rotate camera away from normal and capture "before" screenshot
+                std::printf("sketch_dispatch[T-BL44]: after re-enter inSketch=%d; "
+                            "rotating camera to (yaw=99 pitch=55) for Space snap test\n",
+                            (int)st.inSketch);
+                std::fflush(stdout);
+                // Directly write g_vpState so syncCameraToGl pushes it to the GL camera.
+                // We record the pre-Space values here; Space fires NEXT step after the
+                // orbit read-back has settled at 99/55.
+                ui::viewportState().yaw   = 99.f;
+                ui::viewportState().pitch = 55.f;
+                sdPreSpaceYaw   = 99.f;
+                sdPreSpacePitch = 55.f;
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_06_before_space.png";
+                sdSettle = 2;  // let the GL camera settle at 99/55 before Space
+                break;
+            }
+            case 12: {  // camera settled at 99/55; inject Space — handler reads g_vpState via cameraLock
+                std::printf("sketch_dispatch[T-BL44]: current yaw=%.1f pitch=%.1f; injecting Space\n",
+                            ui::viewportState().yaw, ui::viewportState().pitch);
+                std::fflush(stdout);
+                // Keep the rotated camera for this frame so the orbit read-back starts at 99/55.
+                ui::viewportState().yaw   = 99.f;
+                ui::viewportState().pitch = 55.f;
+                // Inject Space key press/release into ImGui IO so the handler in viewport.cpp
+                // fires this drawViewport call (after the orbit read-back that sets 99/55).
+                ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, true);
+                ImGui::GetIO().AddKeyEvent(ImGuiKey_Space, false);
+                sdSettle = 2;  // let the snap settle into g_vpState
+                break;
+            }
+            case 13: {  // Space has fired; capture after-state and log yaw/pitch delta
+                float yw = ui::viewportState().yaw;
+                float pt = ui::viewportState().pitch;
+                std::printf("sketch_dispatch[T-BL44]: after Space: yaw=%.1f pitch=%.1f "
+                            "(was yaw=%.1f pitch=%.1f) inSketch=%d\n",
+                            yw, pt, sdPreSpaceYaw, sdPreSpacePitch, (int)st.inSketch);
+                // cameraLock for plane.top is yaw=0/180 pitch=~90 (normal-to XY plane).
+                // Verify the snap moved significantly away from our rotated (99,55) angle.
+                bool snapped = (std::fabs(yw - sdPreSpaceYaw) > 5.f ||
+                                std::fabs(pt - sdPreSpacePitch) > 5.f);
+                std::printf("sketch_dispatch[T-BL44]: Space snap %s (delta yaw=%.1f pitch=%.1f)\n",
+                            snapped ? "PASS" : "WARN-no-change",
+                            std::fabs(yw - sdPreSpaceYaw), std::fabs(pt - sdPreSpacePitch));
+                std::fflush(stdout);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_07_space_normal_to.png";
+                sdSettle = kSettle;
+                break;
+            }
+            case 14: {  // exit cleanly after Space test; T-BL46 drag tests begin at case 15
+                st.dispatch("sketch_exit");
+                std::printf("sketch_dispatch[T-BL44]: exiting sketch after Space test\n");
+                std::fflush(stdout);
+                sdSettle = kSettle;
+                break;
+            }
+            // ---- T-BL46: drag dead-zone / element-drag capture priority ----
+            // Root-cause fix: s_sketch.elementDragActive() gates camera nav at the
+            // ImGui left-button drag threshold, so an element drag captures before the
+            // camera can compete.  The four tests below inject real ImGui mouse events
+            // (AddMousePosEvent + AddMouseButtonEvent) so the sketch overlay's own
+            // hit-test arms dragArmed_/groupDragArmed_ on mouse-down; we do NOT force
+            // those flags directly.  The two verify metrics:
+            //   element drag → camera Δyaw + Δpitch ≈ 0  (capture-priority working)
+            //   empty-space drag → camera Δyaw or Δpitch > 0 (view nav still alive)
+            case 15: {  // re-enter the sketch so overlay hit-test is live
+                st.pendingSketchEditFid = sdFid;
+                std::printf("sketch_dispatch[T-BL46]: re-entering sketch for drag tests; "
+                            "awaiting drain\n");
+                std::fflush(stdout);
+                sdSettle = kSettle;
+                break;
+            }
+            case 16: {  // compute element screen coords via sketchMode().uvToScreen; record camera
+                // Use uvToScreen(80,0) — the EXACT same projection hitTestHandle() uses for the
+                // rect's bottom-right corner endpoint (.p2 of L0, UV=(80,0) in sketch space).
+                // Using worldToScreen was wrong: sketch UV != world coords (depends on frame_).
+                ImVec2 bMin = ui::viewportImageMin();
+                ImVec2 bMax = ui::viewportImageMax();
+                std::printf("sketch_dispatch[T-BL46]: imageRect bMin=(%.0f,%.0f) bMax=(%.0f,%.0f)\n",
+                            bMin.x, bMin.y, bMax.x, bMax.y);
+                // uvToScreen is only valid if basisOk_ (buildBasis ran at least once after
+                // entering the sketch).  If the rect is too small it hasn't run yet.
+                if (bMax.x > bMin.x && bMax.y > bMin.y) {
+                    // Project all four corners via handleScreenPos() — the same affine basis
+                    // that hitTestHandle() uses. Pick whichever is inside the image rect.
+                    // Prefer (80,0) → (80,40) → (0,40) → (0,0) (far corner first).
+                    struct { float u, v; } corners[] = {{80,0},{80,40},{0,40},{0,0}};
+                    bool found = false;
+                    for (auto& c : corners) {
+                        ImVec2 s = ui::sketchMode().handleScreenPos(c.u, c.v);
+                        if (s.x >= bMin.x && s.x <= bMax.x && s.y >= bMin.y && s.y <= bMax.y) {
+                            sdElemPtX = s.x; sdElemPtY = s.y; found = true;
+                            std::printf("sketch_dispatch[T-BL46]: handle UV=(%.0f,%.0f) → screen=(%.0f,%.0f)\n",
+                                        c.u, c.v, s.x, s.y);
+                            break;
+                        }
+                        std::printf("sketch_dispatch[T-BL46]: UV=(%.0f,%.0f) → screen=(%.0f,%.0f) [outside rect]\n",
+                                    c.u, c.v, s.x, s.y);
+                    }
+                    if (!found) {
+                        // Nothing projected inside — use image centre (won't arm a handle, but at
+                        // least imgHovered=true so the camera-still test via dead-zone still runs).
+                        sdElemPtX = (bMin.x + bMax.x) * 0.5f;
+                        sdElemPtY = (bMin.y + bMax.y) * 0.5f;
+                        std::printf("sketch_dispatch[T-BL46]: no corner in rect — using image centre\n");
+                    }
+                    // Empty-space anchor: guaranteed inside the image rect but away from the
+                    // element.  Use a fixed fractional offset from bMin so it survives any
+                    // camera orientation — the overlay hit-test will find nothing there.
+                    sdEmptyPtX = bMin.x + (bMax.x - bMin.x) * 0.85f;
+                    sdEmptyPtY = bMin.y + (bMax.y - bMin.y) * 0.85f;
+                } else {
+                    // viewport not wired (rare in headless): use safe screen fallbacks
+                    sdElemPtX = 400.f; sdElemPtY = 300.f;
+                    sdEmptyPtX = 80.f; sdEmptyPtY = 80.f;
+                    std::printf("sketch_dispatch[T-BL46]: viewport not wired — using fallback coords\n");
+                }
+                // Record camera before element drag
+                sdDragPreYaw   = ui::viewportState().yaw;
+                sdDragPrePitch = ui::viewportState().pitch;
+                // Position mouse over the handle endpoint; hover populates hitTestHandle next frame
+                ImGui::GetIO().AddMousePosEvent(sdElemPtX, sdElemPtY);
+                std::printf("sketch_dispatch[T-BL46]: element handle screen pos=(%.0f,%.0f) "
+                            "empty pos=(%.0f,%.0f) camera yaw=%.1f pitch=%.1f\n",
+                            sdElemPtX, sdElemPtY, sdEmptyPtX, sdEmptyPtY,
+                            sdDragPreYaw, sdDragPrePitch);
+                std::fflush(stdout);
+                sdSettle = 3;  // hover needs 3 frames to populate hitTestHandle result
+                break;
+            }
+            case 17: {  // LMB down at element pos — overlay arms dragArmed_/groupDragArmed_
+                ImGui::GetIO().AddMousePosEvent(sdElemPtX, sdElemPtY);
+                ImGui::GetIO().AddMouseButtonEvent(0, true);   // LMB press
+                std::printf("sketch_dispatch[T-BL46]: LMB down at element (%.0f,%.0f); "
+                            "elementDragActive=%d\n",
+                            sdElemPtX, sdElemPtY,
+                            (int)ui::sketchMode().elementDragActive());
+                std::fflush(stdout);
+                sdSettle = 1;  // one frame for arm to register
+                break;
+            }
+            case 18: {  // inject slow drag: +20px right, LMB still held; read result next tick
+                // A 20px move exceeds the overlay's 4px arm threshold → dragging_ becomes true.
+                // drawViewport processes the drag AFTER this tick, so we read camera on case 19.
+                float dragX = sdElemPtX + 20.f;
+                float dragY = sdElemPtY;
+                ImGui::GetIO().AddMousePosEvent(dragX, dragY);
+                std::printf("sketch_dispatch[T-BL46]: injecting slow-drag +20px → (%.0f,%.0f); "
+                            "elementDragActive=%d; camera read on next tick\n",
+                            dragX, dragY, (int)ui::sketchMode().elementDragActive());
+                std::fflush(stdout);
+                sdSettle = 1;  // let drawViewport process delta before reading camera
+                break;
+            }
+            case 19: {  // READ slow-drag result (after drawViewport processed it)
+                {
+                    float yaw   = ui::viewportState().yaw;
+                    float pitch = ui::viewportState().pitch;
+                    float dYaw   = std::fabs(yaw   - sdDragPreYaw);
+                    float dPitch = std::fabs(pitch - sdDragPrePitch);
+                    bool elemActive = ui::sketchMode().elementDragActive();
+                    std::printf("sketch_dispatch[T-BL46]: slow-drag result: "
+                                "elementDragActive=%d camera Δyaw=%.2f Δpitch=%.2f → %s\n",
+                                (int)elemActive, dYaw, dPitch,
+                                (dYaw < 0.5f && dPitch < 0.5f) ? "PASS(cam_still)"
+                                                                : "WARN(cam_moved)");
+                    std::fflush(stdout);
+                }
+                // Now inject fast drag: large jump (+60/+30) to stress-test the dead-zone path.
+                // drawViewport reads MouseDelta from the CURRENT frame's injected pos;
+                // we read the result on case 20 (next tick).
+                float fastX = sdElemPtX + 60.f;
+                float fastY = sdElemPtY + 30.f;
+                ImGui::GetIO().AddMousePosEvent(fastX, fastY);
+                std::printf("sketch_dispatch[T-BL46]: injecting fast-drag +60px/+30px → (%.0f,%.0f); "
+                            "elementDragActive=%d; camera read on next tick\n",
+                            fastX, fastY, (int)ui::sketchMode().elementDragActive());
+                std::fflush(stdout);
+                sdSettle = 1;  // let drawViewport process this large delta
+                break;
+            }
+            case 20: {  // READ fast-drag result; release LMB; capture screenshot
+                float yaw   = ui::viewportState().yaw;
+                float pitch = ui::viewportState().pitch;
+                float dYaw   = std::fabs(yaw   - sdDragPreYaw);
+                float dPitch = std::fabs(pitch - sdDragPrePitch);
+                bool elemActive = ui::sketchMode().elementDragActive();
+                std::printf("sketch_dispatch[T-BL46]: fast-drag result: "
+                            "elementDragActive=%d camera Δyaw=%.2f Δpitch=%.2f → %s\n",
+                            (int)elemActive, dYaw, dPitch,
+                            (dYaw < 0.5f && dPitch < 0.5f) ? "PASS(cam_still)"
+                                                            : "WARN(cam_moved)");
+                std::fflush(stdout);
+                ImGui::GetIO().AddMouseButtonEvent(0, false);  // release LMB
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_08_elem_drag.png";
+                sdSettle = kSettle;
+                break;
+            }
+            case 21: {  // empty-space drag: record pre-drag camera state, position mouse
+                // Record camera state BEFORE any empty-space drag. Settle 2 frames so the
+                // overlay hover-test sees no entity at sdEmptyPt (elementDragActive stays false).
+                sdEmptyPreYaw   = ui::viewportState().yaw;
+                sdEmptyPrePitch = ui::viewportState().pitch;
+                ImGui::GetIO().AddMousePosEvent(sdEmptyPtX, sdEmptyPtY);
+                std::printf("sketch_dispatch[T-BL46]: empty-space hover start; "
+                            "camera yaw=%.1f pitch=%.1f inSketch=%d elementDragActive=%d\n",
+                            sdEmptyPreYaw, sdEmptyPrePitch, (int)st.inSketch,
+                            (int)ui::sketchMode().elementDragActive());
+                std::fflush(stdout);
+                sdSettle = 2;  // hover settle — overlay hit-test must NOT arm element drag
+                break;
+            }
+            case 22: {  // LMB down at empty-space pos — no element arm expected
+                ImGui::GetIO().AddMousePosEvent(sdEmptyPtX, sdEmptyPtY);
+                ImGui::GetIO().AddMouseButtonEvent(0, true);
+                std::printf("sketch_dispatch[T-BL46]: LMB down at empty pos (%.0f,%.0f); "
+                            "elementDragActive=%d (must be 0)\n",
+                            sdEmptyPtX, sdEmptyPtY,
+                            (int)ui::sketchMode().elementDragActive());
+                std::fflush(stdout);
+                sdSettle = 1;  // let button-down frame register
+                break;
+            }
+            case 23: {  // inject large empty-space move — orbit fires in drawViewport this frame
+                // The orbit call: g_glVp->orbit(-io.MouseDelta.x*0.01, io.MouseDelta.y*0.01)
+                // runs in drawViewport AFTER this tick. We read the result on case 24.
+                float emX = sdEmptyPtX + 80.f;   // large delta clears 8px dead-zone easily
+                float emY = sdEmptyPtY + 60.f;
+                ImGui::GetIO().AddMousePosEvent(emX, emY);
+                std::printf("sketch_dispatch[T-BL46]: injecting empty-space move to (%.0f,%.0f); "
+                            "orbit fires in drawViewport; read result on next tick\n", emX, emY);
+                std::fflush(stdout);
+                sdSettle = 1;  // let drawViewport orbit call update g_vpState
+                break;
+            }
+            case 24: {  // READ empty-space result — Δ>0 proves view nav still works
+                float yaw   = ui::viewportState().yaw;
+                float pitch = ui::viewportState().pitch;
+                float dYaw   = std::fabs(yaw   - sdEmptyPreYaw);
+                float dPitch = std::fabs(pitch - sdEmptyPrePitch);
+                bool elemActive = ui::sketchMode().elementDragActive();
+                bool viewMoved  = (dYaw > 0.1f || dPitch > 0.1f);
+                // sketchCapture=false when elementDragActive=0 → camera nav unblocked.
+                // A non-zero orbit delta proves the 8px gate + sketchCapture gate both clear.
+                std::printf("sketch_dispatch[T-BL46]: empty-space orbit result: "
+                            "elementDragActive=%d camera Δyaw=%.2f Δpitch=%.2f → %s\n",
+                            (int)elemActive, dYaw, dPitch,
+                            viewMoved ? "PASS(cam_moved)" : "WARN(cam_still—imgHovered?)");
+                std::fflush(stdout);
+                ImGui::GetIO().AddMouseButtonEvent(0, false);
+                sketchDispatchCapture = sdSavePath + "/sketch_dispatch_09_empty_drag.png";
+                sdSettle = kSettle;
+                // Exit sketch cleanly
+                st.dispatch("sketch_exit");
+                break;
+            }
+            default:
+                cfg.sketchDispatchShotDone = true;
+                std::printf("sketch_dispatch: scenario complete\n");
+                std::fflush(stdout);
+                break;
+        }
+        if (sdStep <= 24) ++sdStep;
+    }
+
     // ---------- fea (host-parity SimManager study flow) ----------
     // T-G9 harness finding: the old flow here bypassed the SimManager entirely (raw
     // sim_run_static with empty fixtures/loads and a worktree-relative STEP netgen could
@@ -1874,6 +2301,14 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppSt
         if (!sketchCapture.empty()) { mirrorLast(sketchCapture, "sketch_03_solid"); sketchCapture.clear(); }
         if (win) glfwSwapBuffers(win);
         return cfg.sketchShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+    if (cfg.wantSketchDispatch) {
+        if (!sketchDispatchCapture.empty()) {
+            mirrorLast(sketchDispatchCapture, "sketch_dispatch_09_empty_drag");
+            sketchDispatchCapture.clear();
+        }
+        if (win) glfwSwapBuffers(win);
+        return cfg.sketchDispatchShotDone ? FrameAction::Break : FrameAction::Continue;
     }
     if (cfg.wantAsm) {
         if (!asmCapture.empty() && !st.rpc.busy()) { mirrorLast(asmCapture, "asm_01_seated"); asmCapture.clear(); }

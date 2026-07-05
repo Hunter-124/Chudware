@@ -105,6 +105,17 @@ struct AppState {
     // where the SketchHost + s_sketch static exist. Push here from dispatch(), drain there.
     std::vector<std::string> pendingSketchCmds;
 
+    // T-BL48: edit-an-existing-sketch entry. The ribbon command queue above carries only
+    // command-id strings (sketch_new has no target); editing a *specific* sketch row from the
+    // Feature Manager needs the target feature id. The feature tree pushes the fid here (double
+    // click / "Edit Sketch" ctx-menu); the viewport drain calls s_sketch.enterForFeature(fid).
+    // "Edit Sketch Plane/Face" re-parents an existing sketch, so it routes through the reparent
+    // field which arms s_sketch.beginPlaneEdit(fid). This is the one shared sketch-mode state
+    // that feature tree + ribbon + viewport all reach — it supersedes feature_tree's old
+    // `void* sketchMode=nullptr` placeholder (removed: the queue push IS the state handoff).
+    std::string pendingSketchEditFid;      // enter the sketcher on this existing sketch feature
+    std::string pendingSketchReparentFid;  // arm plane-pick to move this sketch onto a new plane
+
     std::string activeTool;
     std::string toolExtrudeOp;
 

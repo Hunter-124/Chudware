@@ -312,7 +312,10 @@ struct FmState {
     } clipboard;
 
     bool sketchPlanePickActive = false;
-    void* sketchMode = nullptr;
+    // T-BL48: the old `void* sketchMode = nullptr` placeholder is gone. The feature tree no
+    // longer needs a handle to the sketcher: the single SketchMode instance lives in the
+    // viewport frame (viewport.cpp s_sketch), and edit-sketch actions from here hand a target
+    // fid to it through AppState::pendingSketchEditFid / pendingSketchReparentFid, drained there.
     void* propertyManager = nullptr;
 
     void bind(app::AppState& st) {
@@ -1217,11 +1220,17 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         if (isSketch) {
             // A sketch gets "Edit Sketch" (enter the sketcher) + "Edit Sketch Plane" (re-pick the
             // plane it sits on) — NOT the generic "Edit" form, which doesn't apply to a sketch.
-            if (ImGui::MenuItem("Edit Sketch")) {
-                /* sketch ctx deferred */
+            if (ImGui::MenuItem("Edit Sketch") && st.app) {
+                // T-BL48: enter the sketcher on this existing sketch. The viewport frame owns the
+                // single s_sketch instance + SketchHost, so we hand the target fid to it via
+                // AppState (drained in viewport.cpp → s_sketch.enterForFeature). This queue push
+                // is the shared sketch-mode state handoff that replaces the old sketchMode void*.
+                st.app->pendingSketchEditFid = fid;
             }
-            if (ImGui::MenuItem("Edit Sketch Plane/Face")) {
-                /* sketch ctx deferred */
+            if (ImGui::MenuItem("Edit Sketch Plane/Face") && st.app) {
+                // T-BL48: re-parent this sketch onto a new plane/face — arm plane-pick via the
+                // viewport drain (→ s_sketch.beginPlaneEdit).
+                st.app->pendingSketchReparentFid = fid;
             }
         } else if (c.editCallback && *c.editCallback) {
             if (ImGui::MenuItem("Edit")) (*c.editCallback)(fid);
@@ -2865,7 +2874,10 @@ static void drawFeatureTreeBodyImpl(AppState& st,
                             selectedFeatureId = fid;
                             s_multiSel.clear();
                             selectFeatureInViewport(st, fid);
-                            if (ftype == "sketch") {                /* sketch enter deferred until SketchHost wire */
+                            if (ftype == "sketch") {
+                                // T-BL48: double-click a sketch row → enter the sketcher on it
+                                // (same path as the "Edit Sketch" ctx-menu). Drained in viewport.cpp.
+                                if (st.app) st.app->pendingSketchEditFid = fid;
                             } else if (editCallback) {
                                 editCallback(fid);
                             }

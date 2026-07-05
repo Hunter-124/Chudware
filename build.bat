@@ -81,22 +81,29 @@ if /i not "%MODE%"=="app" (
   rem --- stage the C++ core (libaicad.dll + its OCCT/Netgen sibling DLLs) next to
   rem     the exe so the host loads the in-process C++ engine with NO env override
   rem     (AI_CAD_LIBAICAD). This is the production engine for parts / sim / agent.
-  set "CORE_BIN=%ROOT%\core\build-occt\bin\Release"
-  if exist "%ROOT%\core\build-occt\bin\Release\libaicad.dll" (
-    echo [build] staging C++ core DLLs from core\build-occt\bin\Release ...
+  rem CORE_BIN: try the VS multi-config layout first (core\build-occt\bin\Release), then the
+  rem Ninja `windows-occt` CMake-preset layout (build\windows-occt\bin, no per-config subdir).
+  rem The preset in CMakePresets.json builds to build\windows-occt, so that's the usual Windows
+  rem location -- checking only the VS path silently ships an app with NO modeling engine.
+  set "CORE_BIN="
+  if exist "%ROOT%\core\build-occt\bin\Release\libaicad.dll" set "CORE_BIN=%ROOT%\core\build-occt\bin\Release"
+  if not defined CORE_BIN if exist "%ROOT%\build\windows-occt\bin\libaicad.dll" set "CORE_BIN=%ROOT%\build\windows-occt\bin"
+  if defined CORE_BIN (
+    echo [build] staging C++ core DLLs from %CORE_BIN% ...
     rem /R:2 /W:1 so a DLL locked by a RUNNING app/MCP fails fast (≈2s) instead of robocopy's
     rem default million-retry (which hangs the build for ~30 min). If this fails, close the
     rem desktop app AND any running MCP server (they hold libaicad.dll + the OCCT TK*.dll), then rerun.
-    robocopy "%ROOT%\core\build-occt\bin\Release" "%DIST%" *.dll /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
+    robocopy "%CORE_BIN%" "%DIST%" *.dll /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul
     if errorlevel 8 (
       echo [build] ERROR: could not stage core DLLs -- a DLL is locked. Close AI-CAD.exe AND any
       echo [build]        running AI-CAD MCP server ^(both load libaicad.dll / OCCT TK*.dll^), then rerun.
       goto :fail
     )
   ) else (
-    echo [build] WARNING: core\build-occt\bin\Release\libaicad.dll not found -- C++ core NOT staged.
-    echo [build]          The app will fall back to the Python worker. Build the core with:
-    echo [build]          cmake --build core\build-occt --config Release
+    echo [build] WARNING: libaicad.dll not found in core\build-occt\bin\Release OR build\windows-occt\bin
+    echo [build]          -- C++ core NOT staged. Doc/sketch/extrude ops have NO engine (the Python
+    echo [build]          worker no longer owns modeling); the app opens but cannot create geometry.
+    echo [build]          Build the core:  cmake --build --preset windows-occt
   )
 )
 

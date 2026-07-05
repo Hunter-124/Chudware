@@ -157,6 +157,18 @@ def test_context_loss_cites_nonexistent_ref():
     assert fired and "DIM99" in fired[0].detail
 
 
+def test_context_loss_manifest_ids_are_known():
+    """T-W32: REAL cells pass the manifest as an argument (no scripted manifest
+    artifact event) — citing the manifest's own DL/AC ids must NOT be context_loss."""
+    lg = _ledger([
+        {"kind": "agent_turn", "payload": {"event": "done",
+            "text": "handoff for DL1: AC1 satisfied pending review"}},
+    ])
+    res = classify_ledger(lg, manifest=_MANIFEST,
+                          graded={"criteria": [], "passed": True})
+    assert not [c for c in res if c.failure_class == FailureClass.CONTEXT_LOSS.value]
+
+
 # --- abstraction_skip -------------------------------------------------------
 
 def test_abstraction_skip_ladder_bounce():

@@ -135,9 +135,21 @@ def _call_succeeded(p: dict) -> bool:
 _REF_RE = re.compile(r"\b(DL\d+|AC\d+|DIM\d+|FN\d+|FT\d+|G\d+)\b")
 
 
-def _known_ids(events: list[dict]) -> set[str]:
-    """Every DL/AC/DIM/FN/FT/G id the ledger has actually MINTED (declared)."""
+def _known_ids(events: list[dict], manifest: dict | None = None) -> set[str]:
+    """Every DL/AC/DIM/FN/FT/G id the ledger has actually MINTED (declared).
+
+    T-W32: REAL cells don't replay the manifest as an artifact event (the mission
+    pipeline records the manifest artifact without its deliverables payload), so
+    ids the MANIFEST declares (DL/AC) are also known when the caller passes it —
+    otherwise every real run citing its own deliverable id was a context_loss
+    false positive."""
     known: set[str] = set()
+    for dl in (manifest or {}).get("deliverables", []) or []:
+        if dl.get("id"):
+            known.add(dl["id"])
+        for ac in dl.get("acceptance_criteria", []) or []:
+            if ac.get("id"):
+                known.add(ac["id"])
     for e in events:
         p = e.get("payload") or {}
         kind = e.get("kind")
@@ -316,9 +328,10 @@ _CHECK_TOOLS = frozenset({
 })
 
 
-def _detect_context_loss(events: list[dict]) -> list[Classification]:
+def _detect_context_loss(events: list[dict],
+                         manifest: dict | None = None) -> list[Classification]:
     out: list[Classification] = []
-    known = _known_ids(events)
+    known = _known_ids(events, manifest)
     for e in events:
         p = e.get("payload") or {}
         # Only inspect free-text/ref fields a role authored (not the manifest artifact).
@@ -457,7 +470,7 @@ def classify_ledger(ledger: dict[str, Any], *, manifest: dict | None = None,
     if not stall:
         results += _detect_incoherent_geometry(events, graded)
     results += _detect_tool_misuse(events, manifest)
-    results += _detect_context_loss(events)
+    results += _detect_context_loss(events, manifest)
     results += _detect_abstraction_skip(events)
     results += _detect_grind(events, grind_threshold)
     results += _detect_advisory_ignored(events)

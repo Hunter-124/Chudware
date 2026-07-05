@@ -61,6 +61,18 @@ struct ShotConfig {
     bool wantMissionControl = false;        // T-F17: mission-control (DAG steering) panel
     bool missionControlShotDone = false;
 
+    // T-W17: transparency inspector + watch grid + settings (fixture-seeded, no worker)
+    bool wantAgentInspector = false;            // populated run dir (Turns, turn 0)
+    bool wantAgentInspectorEmpty = false;       // empty run dir
+    bool wantAgentInspectorFailure = false;     // select the fixer turn: failure card + audit
+    bool wantAgentInspectorDelegation = false;  // force the Delegation tab
+    bool agentInspectorShotDone = false;
+    bool wantWatchGrid = false;             // 3-part workspace fixture
+    bool watchGridShotDone = false;
+    bool wantAgentSettings = false;         // valid routing view
+    bool wantAgentSettingsError = false;    // validation-error routing view
+    bool agentSettingsShotDone = false;
+
     // Long-running scenario modes (ScenarioRunner step machines)
     bool wantM1 = false;
     bool m1ShotDone = false;

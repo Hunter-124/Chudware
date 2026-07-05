@@ -75,6 +75,14 @@ struct ShotConfig {
     bool wantAgentSettingsError = false;    // validation-error routing view
     bool agentSettingsShotDone = false;
 
+    // T-G22: per-tab settings shots + composer dropdown + permissions popup
+    bool wantSettingsGeneral = false;
+    bool wantSettingsAI = false;
+    bool wantSettingsPrompts = false;
+    bool wantSettingsAdvanced = false;
+    bool wantComposerDropdown = false;
+    bool wantPermissionsPopup = false;
+
     // Long-running scenario modes (ScenarioRunner step machines)
     bool wantM1 = false;
     bool m1ShotDone = false;

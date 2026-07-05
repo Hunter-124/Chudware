@@ -337,12 +337,47 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantAgentSettings       = eq("agent_settings");         // T-W17
     cfg.wantAgentSettingsError  = eq("agent_settings_error");   // T-W17
     cfg.wantSimStudies   = eq("sim_studies");   // T-U6
+    // T-G22: per-tab settings shots + composer dropdown + permissions popup
+    cfg.wantSettingsGeneral    = eq("settings_general");
+    cfg.wantSettingsAI         = eq("settings_ai");
+    cfg.wantSettingsPrompts    = eq("settings_prompts");
+    cfg.wantSettingsAdvanced   = eq("settings_advanced");
+    cfg.wantComposerDropdown   = eq("composer_dropdown");
+    cfg.wantPermissionsPopup   = eq("permissions_popup");
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
     if (cfg.wantSettings) {
         settingsUi().wantSettings = true;
         settingsUi().openSettings = true;
+    }
+    // T-G22: per-tab settings shots — open modal on the appropriate tab
+    if (cfg.wantSettingsGeneral) {
+        settingsUi().openSettings = true;
+        settingsUi().openSettingsTab = 0;
+    }
+    if (cfg.wantSettingsAI) {
+        settingsUi().openSettings = true;
+        settingsUi().openSettingsTab = 1;
+    }
+    if (cfg.wantSettingsPrompts) {
+        settingsUi().openSettings = true;
+        settingsUi().openSettingsTab = 2;
+    }
+    if (cfg.wantSettingsAdvanced) {
+        settingsUi().openSettings = true;
+        settingsUi().openSettingsTab = 3;
+    }
+    if (cfg.wantComposerDropdown) {
+        // Composer model dropdown: seed chat state so the composer is visible and the
+        // dropdown opens on the next frame via the UI infrastructure.
+        seedChatShot(st);
+        settingsUi().openComposerModelDropdown = true;
+    }
+    if (cfg.wantPermissionsPopup) {
+        // Permissions popup: seed chat so the prelude bar is visible, open the popup.
+        seedChatShot(st);
+        settingsUi().openPermissionsPopup = true;
     }
     if (cfg.wantExplorer) st.railTab = kFilesRailTab;
     if (cfg.wantRibbon) {
@@ -2208,7 +2243,7 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 actSettle = kSettle; ++actStep; break;
             case 4:
                 settingsUi().openSettings = true;
-                settingsUi().openSettingsTab = 3;
+                settingsUi().openSettingsTab = 2;  // T-G22: tab 2 = Prompts (pendingPromptRole drives jumpToAgents)
                 settingsUi().pendingPromptRole = "modeler";
                 actSettle = kSettle * 2; ++actStep; break;
             case 5:

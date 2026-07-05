@@ -3,7 +3,7 @@ id: T-DP6
 title: Advisory expansion — every checker becomes a diagnostic advisor with a targeted fix + tool
 workstream: DP
 owner: sonnet-rust1
-status: doing
+status: review
 branch: task/T-DP6-diagnostic-advisors
 depends_on: [T-DP1]
 lane: ai-copilot

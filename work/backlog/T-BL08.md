@@ -3,7 +3,7 @@ id: T-BL08
 title: Tolerance stack-up analysis
 workstream: backlog
 owner: sonnet-brill
-status: review
+status: done
 branch: task/T-BL08-tolerance-stackup
 depends_on: []
 lane: simulation

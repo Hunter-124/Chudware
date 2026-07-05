@@ -3,7 +3,7 @@ id: T-BL30
 title: Engine — boolean fuse/cut/common of disjoint bodies silently succeeds; enforce the single-connected-solid invariant (issue #8)
 workstream: backlog
 owner: sonnet-quorix
-status: review
+status: done
 priority: 3
 lane: modeling-core
 kind: fix

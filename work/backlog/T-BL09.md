@@ -3,7 +3,7 @@ id: T-BL09
 title: Wire the requirements layer to the verify battery (req evidence auto-population)
 workstream: backlog
 owner: sonnet-vetch
-status: review
+status: done
 branch: task/T-BL09-req-verify-wiring
 depends_on: [T-H3, T-H4, T-A4]
 lane: ai-copilot

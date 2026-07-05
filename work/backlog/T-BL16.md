@@ -3,7 +3,7 @@ id: T-BL16
 title: Motion/kinematics simulation of mechanisms
 workstream: backlog
 owner: opus-dune
-status: review
+status: done
 branch: task/T-BL16-motion-simulation
 depends_on: []
 lane: simulation

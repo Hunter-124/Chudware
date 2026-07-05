@@ -3,7 +3,7 @@ id: T-BL18
 title: Gear/bearing life and AGMA tooth-strength checks
 workstream: backlog
 owner: sonnet-merle
-status: review
+status: done
 branch: task/T-BL18-gear-bearing-checks
 depends_on: []
 lane: simulation

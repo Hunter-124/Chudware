@@ -3,7 +3,7 @@ id: T-SIM1
 title: Thermal FEA solver - steady-state heat conduction kernel + sim_new_thermal end-to-end
 workstream: SIM
 owner: opus-terra
-status: doing
+status: review
 branch: task/T-SIM1-thermal-fea
 depends_on: []
 lane: simulation

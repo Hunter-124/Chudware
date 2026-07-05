@@ -39,3 +39,20 @@ interfaces_with, criticality} written to the ledger.
 - [ ] Ledger `feature` events written + read by the Stage-1 gate.
 - [ ] Gym: a C1-class task produces a coherent feature list (real run, honest result).
 - [ ] gate.sh PASS; graphify update.
+
+## Progress log
+- 2026-07-05 22:19 UTC [sonnet-teal1] DoD met — all deliverables landed on branch task/T-DP2-feature-architect (worktree /home/hunter/Repositories/CAD-T-DP2).
+
+Commits:
+  9e1293bb — feature_architect.yaml, functional_decomposition.py, test_coverage_checker.py, phases.py extension
+  2ccfb9e9 — C1-DP2 gym challenge, run_dp2_gym.py, run artifacts (3 seeds)
+
+Deliverables:
+1. services/agent/roles/feature_architect.yaml — rich system prompt: 8-primitive function vocabulary (MOUNT/MATE/SEAL/BEAR-LOAD/CLEAR/FASTEN/LOCATE/DISSIPATE), 6 part-class checklists in prompt + 8 in code, UNIVERSAL RULES, completeness-critic slot declared (T-DP8 hook)
+2. services/agent/pipeline/functional_decomposition.py — PART_CLASS_CHECKLISTS (8 classes: bracket/housing/shaft/plate/enclosure/fitting/fastener/seal), check_requirement_coverage(), gate_context_from_ledger()
+3. services/agent/pipeline/phases.py — _gate_decompose extended: untraced_features/orphan_requirements surface as reasons when caller supplies them; gate name stays "features_present"; DP1 tests unchanged
+4. services/agent/pipeline/test_coverage_checker.py — 28 new tests (82 total, all green)
+5. Gym C1-DP2: seed1 PASS (5 features, all traced, all 3 reqs covered, DECOMPOSE gate passes); seed2 FAIL-correct (untraced FT-04 surfaces in reasons); seed3 FAIL-correct (orphan R-03 surfaces in reasons)
+
+gate.sh: PASS (exit 0). FAIL-RECORDED items (mcp_server, services, engine_oracle) are all pre-existing, owned by T-V2.
+graphify update: 35144 nodes, 71312 edges, 1618 communities.

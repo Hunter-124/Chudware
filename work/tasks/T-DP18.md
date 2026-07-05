@@ -3,7 +3,7 @@ id: T-DP18
 title: AI time-remaining estimator — tokens/s x expected tokens per subtask
 workstream: DP
 owner: sonnet-fenn1
-status: review
+status: done
 branch: task/T-DP18-time-estimator
 depends_on: []
 lane: ai-copilot

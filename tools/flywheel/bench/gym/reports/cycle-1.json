@@ -6,7 +6,7 @@
   ],
   "execution_mode": "mock",
   "execution_probe": {
-    "core_available": false,
+    "core_available": true,
     "frontier_key": false,
     "local_model": true,
     "real_agent_fn": false,

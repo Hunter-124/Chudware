@@ -12,7 +12,7 @@
 | real_agent_fn | `False` |
 | frontier_key | `False` |
 | local_model | `True` |
-| core_available | `False` |
+| core_available | `True` |
 
 ## Pass rates — challenge x tier
 

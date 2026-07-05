@@ -101,6 +101,10 @@ struct AppState {
     bool  sketchPlanePickActive = false;
     bool  camActive = false;   // H1 CAM content-swap: true while the CAM panel should be forward
 
+    // T-BL47: pending sketch ribbon commands — drained each frame in viewport.cpp
+    // where the SketchHost + s_sketch static exist. Push here from dispatch(), drain there.
+    std::vector<std::string> pendingSketchCmds;
+
     std::string activeTool;
     std::string toolExtrudeOp;
 

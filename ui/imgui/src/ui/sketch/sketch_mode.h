@@ -108,6 +108,10 @@ struct SketchEntity {
 class SketchMode {
 public:
     bool active() const { return active_; }
+    // T-BL48: true while arming/awaiting a plane pick for a NEW sketch (active_ is still
+    // false then). The viewport keeps AppState::inSketch true during this so the plane-pick
+    // overlay (drawn only when inSketch) stays alive until the user picks a plane or cancels.
+    bool planePicking() const { return planePicking_; }
     const std::string& sketchId() const { return fid_; }
 
     // Enter/exit. enterForFeature opens an existing sketch feature (tree "Edit Sketch");

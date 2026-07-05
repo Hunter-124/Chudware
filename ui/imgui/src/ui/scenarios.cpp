@@ -301,6 +301,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantMultidoc = eq("multidoc");
     cfg.wantEcad = eq("ecad");
     cfg.wantSketch = eq("sketch");
+    cfg.wantSketchDispatch = eq("sketch_dispatch_probe");  // T-BL47 proof
     cfg.wantFea = eq("fea");
     cfg.wantCam = eq("cam");
     cfg.wantFlow = eq("flow");

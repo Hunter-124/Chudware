@@ -146,6 +146,11 @@ CHECK_REBUILD = "rebuild"
 CHECK_INTERFERENCE = "interference"
 CHECK_PART_VERIFY = "part_verify"
 CHECK_SIM_RESULTS = "sim_results"
+CHECK_SIM_BC = "sim_bc"
+CHECK_SIM_MARGIN = "sim_margin"
+CHECK_SIM_ANCHOR = "sim_anchor"
+CHECK_SIM_DIVERGENCE = "sim_divergence"
+CHECK_SIM_MESH = "sim_mesh"
 CHECK_CAM_SIM = "cam_sim"
 CHECK_OPEN_PROFILE = "open_profile"
 
@@ -208,9 +213,22 @@ _STAGE_SPEC: dict[str, dict] = {
         "playbook_default": None,
     },
     "sim": {
-        "check_battery": [CHECK_SIM_RESULTS],
-        "helper_tools": ["describe_results", "run_fea_static"],
-        "exit_gate": [CHECK_SIM_RESULTS],
+        # Battery order: BC lint first (cheap deterministic), then margin/divergence
+        # (post-solve), then mesh hint (advisory).  Anchor (sim_anchor) is informational
+        # only and not in the exit gate.
+        "check_battery": [
+            CHECK_SIM_BC,
+            CHECK_SIM_RESULTS,
+            CHECK_SIM_MARGIN,
+            CHECK_SIM_DIVERGENCE,
+            CHECK_SIM_MESH,
+            CHECK_SIM_ANCHOR,
+        ],
+        "helper_tools": ["describe_results", "run_fea_static", "run_fea_modal", "run_cfd_flow"],
+        # Exit gate: BC lint + margin must PASS before advancing.
+        # Divergence is action-level (not a blocker) so the model may acknowledge and
+        # proceed; it is NOT in the exit gate per §9.3.
+        "exit_gate": [CHECK_SIM_BC, CHECK_SIM_RESULTS, CHECK_SIM_MARGIN],
         "playbook_default": None,
     },
     "cam": {

@@ -21,6 +21,7 @@ from engine.research.unit_convert import normalizer_source
 # Submodule object (not the package-level re-export) so we can monkeypatch its
 # module-bound ``is_offline`` name — same pattern as test_research.py's _OfflineToggle.
 material_lookup_mod = importlib.import_module("engine.research.material_lookup")
+datasheet_fetch_mod = importlib.import_module("engine.research.datasheet_fetch")
 
 
 # --------------------------------------------------------------------------- unit_convert
@@ -253,3 +254,86 @@ def test_datasheet_fetch_missing_local_file():
     # "no_pdf_tool" if pdfminer.six isn't installed, "bad_url" if it is but the file
     # doesn't exist — either is a correct degradation depending on the environment.
     assert out["reason"] in {"no_pdf_tool", "bad_url"}
+
+
+# ------------------------------------------------------- datasheet_fetch: T-X4 browser fallback
+
+class _FakeHttpResponse:
+    """Stands in for ``httpx.Response`` — just enough for datasheet_fetch's usage."""
+
+    def __init__(self, status_code: int, content: bytes = b""):
+        self.status_code = status_code
+        self.content = content
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+@pytest.fixture()
+def fake_pdf_extractor(monkeypatch):
+    """Force a working PDF extractor so these tests don't depend on pdfminer.six being
+    installed — isolates the T-X4 fallback logic from the unrelated "no_pdf_tool"
+    degradation already covered above."""
+    monkeypatch.setattr(datasheet_fetch_mod, "_load_extractor",
+                        lambda: (lambda data: "hello datasheet", "fake-extractor"))
+
+
+def test_datasheet_fetch_plain_success_never_calls_browser_fallback(monkeypatch, fake_pdf_extractor):
+    """DoD case 1: plain fetch succeeds -> browser path never invoked, zero behavior change."""
+    import httpx
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakeHttpResponse(200, b"%PDF-1.4 ..."))
+
+    def _boom(url):
+        raise AssertionError("browser fallback must not be invoked when the plain fetch succeeds")
+
+    monkeypatch.setattr(datasheet_fetch_mod, "_try_browser_fallback", _boom)
+
+    out = research.datasheet_fetch("https://example-vendor.com/widget.pdf")
+    assert out["ok"] is True
+    assert out["session_profile_used"] is None
+
+
+def test_datasheet_fetch_403_with_profile_falls_back_to_browser(monkeypatch, fake_pdf_extractor):
+    """DoD case 2: 403 + an existing matching profile -> browser fallback succeeds."""
+    import httpx
+    from services.browser import profiles as browser_profiles
+    from services.browser import session as browser_session
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakeHttpResponse(403))
+    monkeypatch.setattr(browser_profiles, "has_profile", lambda site: site == "example-vendor.com")
+
+    downloaded: dict = {}
+
+    def _fake_browser_download(url, site, dest, **kwargs):
+        dest.write_bytes(b"%PDF-1.4 fetched via browser session")
+        downloaded["site"] = site
+        return {"ok": True, "url": url, "session_profile_used": site}
+
+    monkeypatch.setattr(browser_session, "browser_download", _fake_browser_download)
+
+    out = research.datasheet_fetch("https://example-vendor.com/widget.pdf")
+    assert out["ok"] is True
+    assert out["session_profile_used"] == "example-vendor.com"
+    assert downloaded["site"] == "example-vendor.com"
+
+
+def test_datasheet_fetch_403_without_profile_degrades_unchanged(monkeypatch, fake_pdf_extractor):
+    """DoD case 3: 403 + no saved profile -> existing degradation, unchanged (no login
+    ever triggered from this path)."""
+    import httpx
+    from services.browser import profiles as browser_profiles
+    from services.browser import session as browser_session
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _FakeHttpResponse(403))
+    monkeypatch.setattr(browser_profiles, "has_profile", lambda site: False)
+
+    def _boom(*a, **k):
+        raise AssertionError("browser_download must never run without an existing profile")
+
+    monkeypatch.setattr(browser_session, "browser_download", _boom)
+
+    out = research.datasheet_fetch("https://example-vendor.com/widget.pdf")
+    assert out["ok"] is False
+    assert out["reason"] == "network"

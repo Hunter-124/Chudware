@@ -184,3 +184,40 @@ only. No API key committed to code — keys come from config/env.
 `v1` — 2026-07-02. Ships `web_search`, `fetch_page`, cache, offline degradation.
 Future helpers (T-F2+: `extract_structured`, `material_lookup`, `thread_spec`,
 `standard_section`, `datasheet_fetch`, …) append here and reuse the §1 envelope.
+
+## 9. `datasheet_fetch(source, tier?)` — authenticated-browser fallback (T-X4, additive)
+
+`engine_oracle/research/datasheet_fetch.py` extracts a datasheet PDF (local path or
+`http(s)` URL) to markdown, returning the §1 envelope plus `url`, `title`, `content`,
+`extractor`, `tier`.
+
+**T-X4 addition (additive field, existing consumers unaffected):** when a plain fetch
+returns HTTP 401 or 403 (a paywall/login-wall signal) **and** a matching browser session
+profile already exists for that URL's host (`services/browser/profiles.py`, saved via
+the user's own `browser_login` — see workstream X / T-X1), the helper retries once via
+`services/browser/session.py`'s `browser_download` under that saved session before
+falling back to the existing degradation. **No login is ever triggered from this path** —
+a missing profile degrades exactly as before this task (`reason:"network"`).
+
+The envelope gains one additive field:
+
+```json
+{
+  "ok": true,
+  "url": "https://example-vendor.com/parts/widget.pdf",
+  "title": "widget.pdf",
+  "content": "# widget\n...",
+  "extractor": "pdfminer.six",
+  "tier": "datasheet",
+  "session_profile_used": "example-vendor.com",
+  "answer": "widget.pdf — datasheet extracted to markdown (…)",
+  "units": null, "source_url": "https://example-vendor.com/parts/widget.pdf",
+  "quote": null, "fetched_ts": "...", "confidence": "high", "cached": false
+}
+```
+
+- `session_profile_used`: `str | null` — the site key (URL host) of the browser profile
+  that served the bytes, or `null` when the plain fetch succeeded / no fallback applied
+  (the common case; behavior byte-identical to before T-X4).
+- Uses `browser_download` (not `browser_fetch`) — a PDF is binary and must not go through
+  a rendered-page-content path.

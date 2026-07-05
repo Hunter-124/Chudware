@@ -2,8 +2,8 @@
 id: T-DP4
 title: linkage_planner role + reference-integrity / datum / interface-consistency checkers
 workstream: DP
-owner: unassigned
-status: todo
+owner: sonnet-jade1
+status: doing
 branch: task/T-DP4-linkage-planner
 depends_on: [T-DP1]
 lane: ai-copilot

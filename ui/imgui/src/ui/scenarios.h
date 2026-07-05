@@ -82,6 +82,11 @@ struct ShotConfig {
     bool wantAgentSettingsError = false;    // validation-error routing view
     bool agentSettingsShotDone = false;
 
+    // T-DP17: Agent DAG widget (fixture-seeded, no worker RPC)
+    bool wantAgentDag        = false;   // full mode — node-graph + detail pane (node pre-selected)
+    bool wantAgentDagCompact = false;   // compact mode — graph only
+    bool agentDagShotDone    = false;
+
     // T-G22: per-tab settings shots + composer dropdown + permissions popup
     bool wantSettingsGeneral = false;
     bool wantSettingsAI = false;

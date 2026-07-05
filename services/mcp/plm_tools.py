@@ -12,7 +12,8 @@ plain language; the machine ``commit`` field is an internal id, not rendered to
 users as-is.
 
 Registration: ``register_plm_tools(mcp)`` → adds plm_init, plm_open, plm_save,
-plm_checkpoint, plm_release, plm_history, plm_restore, plm_status, plm_compare.
+plm_checkpoint, plm_release, plm_history, plm_restore, plm_status, plm_compare,
+plm_set_ai_mode (T-R3).
 Remote/lock tools (plm_add_remote, plm_sync, plm_lock, plm_unlock) are T-R7.
 """
 from __future__ import annotations
@@ -168,32 +169,56 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(**st)
 
     @mcp.tool()
-    def plm_compare(path: str, commit_a: str, commit_b: str, item_id: str) -> str:
-        """Compare an item between two history points. Reuses the semantic
-        ``doc_diff`` engine (visual ``eval_compare`` narration lands in T-R3).
-        Returns ``{ok, doc_diff}``."""
+    def plm_compare(path: str, commit_a: str, commit_b: str, item_id: str,
+                    visual: bool = False, out_dir: str = "") -> str:
+        """Compare an item between two history points: a plain-language change
+        list plus the semantic detail, and — when ``visual`` is true — a
+        side-by-side visual of the two versions (match percentage + rendered
+        images; drawings also get a 2D overlay). The visual half degrades
+        gracefully on machines without the 3D engine.
+        Returns ``{ok, doc_diff, summary, eval_compare?}``."""
         try:
             Vault, VaultError = _vault_module()
         except ImportError:
             return _err("no_vault", "version history is not available on this machine")
         try:
-            from services.plm import snapshot
-            from services.mcp.doc_diff_tools import doc_diff
+            from services.plm import compare as plm_compare_mod
 
             v = Vault.open(path)
             try:
-                tree_a = v._bind.read_tree(commit_a)
-                tree_b = v._bind.read_tree(commit_b)
-            except KeyError:
+                doc_a, doc_b = plm_compare_mod.docs_at(v, commit_a, commit_b, item_id)
+            finally:
                 v.close()
-                return _err("not_found", "one of those points in history could not be found")
-            pa = snapshot.item_prefix(item_id) + "document.json"
-            doc_a_raw = tree_a.get(pa)
-            doc_b_raw = tree_b.get(pa)
-            v.close()
-            if doc_a_raw is None or doc_b_raw is None:
-                return _err("invalid_item", "that item is not in one of those points")
-            diff = doc_diff(json.loads(doc_a_raw), json.loads(doc_b_raw))
+            sem = plm_compare_mod.semantic_compare(doc_a, doc_b)
+            fields: dict[str, Any] = {"doc_diff": sem["doc_diff"],
+                                      "summary": sem["summary"]}
+            if visual:
+                import tempfile
+
+                od = out_dir or tempfile.mkdtemp(prefix="aicad_plm_compare_")
+                fields["eval_compare"] = plm_compare_mod.visual_compare(doc_a, doc_b, od)
         except VaultError as e:
             return _err(e.reason, e.hint)
-        return _ok(doc_diff=diff)
+        return _ok(**fields)
+
+    @mcp.tool()
+    def plm_set_ai_mode(path: str, mode: str) -> str:
+        """Set how much the AI helps with this project's history:
+        ``manual`` (buttons only), ``assisted`` (drafts messages, suggests
+        checkpoints, flags out-of-date references — the default), or
+        ``managed`` (the copilot also records checkpoints itself at task
+        boundaries; every AI entry is marked and one click undoes it).
+        Returns ``{ok, ai_mode}``."""
+        try:
+            Vault, VaultError = _vault_module()
+        except ImportError:
+            return _err("no_vault", "version history is not available on this machine")
+        try:
+            v = Vault.open(path)
+            try:
+                out = v.set_ai_mode(mode)
+            finally:
+                v.close()
+        except VaultError as e:
+            return _err(e.reason, e.hint)
+        return _ok(ai_mode=out)

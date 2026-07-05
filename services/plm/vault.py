@@ -22,8 +22,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from services.plm import gitbind, manifest, snapshot
+from services.plm import assist, gitbind, manifest, snapshot
 from services.plm import history as hist  # aliased: Vault.history() method shadows the name
+from services.plm import summarize
 
 # document containers we version (contract §2)
 _CONTAINER_SUFFIXES = (".step+", ".ecad+")
@@ -150,9 +151,88 @@ class Vault:
 
     def checkpoint(self, message: str = "", *, author: dict[str, Any] | None = None,
                    ai: dict[str, Any] | None = None, item_id: str | None = None) -> dict[str, Any]:
-        """Cut a named checkpoint entry (contract §3.2)."""
+        """Cut a named checkpoint entry (contract §3.2).
+
+        When *message* is empty and the project's assist tier allows drafting
+        (``assisted``/``managed``), a deterministic plain-language draft is
+        templated from the semantic diff (contract §7 ``plm_checkpoint``:
+        "drafts message from doc_diff if omitted"). At the ``manual`` floor
+        the empty message stays empty — no assist behavior of any kind.
+        """
+        if not message and assist.allowed(self.ai_mode(), "draft_message"):
+            message = self.draft_message(item_id=item_id)
         return self.save(hist.KIND_CHECKPOINT, message=message, author=author,
                          ai=ai, item_id=item_id)
+
+    # -- assist tier (T-R3, contract §4 ai_mode) ----------------------------
+
+    def ai_mode(self) -> str:
+        """The project's assist tier: manual | assisted | managed (§4)."""
+        return self.manifest().get("ai_mode", assist.DEFAULT_MODE)
+
+    def set_ai_mode(self, mode: str) -> str:
+        """Persist the assist tier for this project (contract §7 plm_set_ai_mode).
+
+        The tier lives in ``manifest.json`` and is re-committed like any other
+        manifest change, so it follows the project everywhere.
+        """
+        if mode not in manifest.AI_MODES:
+            raise VaultError("invalid_mode",
+                             "the assistance level can be manual, assisted, or managed")
+        m = self.manifest()
+        if m.get("ai_mode") == mode:
+            return mode
+        m["ai_mode"] = mode
+        files = self._explode_project_into_shadow(m, kind=hist.KIND_AUTO, message="")
+        author = _user_author()
+        emeta = gitbind.EntryMeta(
+            kind=hist.KIND_AUTO, message="",
+            author_name=author["display"], author_email=f'{author["id"]}@aicad.local',
+        )
+        self._bind.commit_tree(files, emeta)
+        return mode
+
+    # -- deterministic message drafting (T-R3) ------------------------------
+
+    def draft_message(self, item_id: str | None = None) -> str:
+        """Deterministic plain-language draft of "what changed since the last
+        entry" — the template behind Copilot-drafted checkpoint messages.
+
+        Numbers are copied from the semantic diff, never invented (Pillar 13).
+        Returns ``""`` when nothing changed (an empty draft, not filler).
+        """
+        m = self.manifest()
+        head = self._bind.head_commit()
+        head_tree = self._bind.read_tree(head) if head else {}
+        parts: list[str] = []
+        for it in m["items"]:
+            if item_id is not None and it["item_id"] != item_id:
+                continue
+            exploded = self._working_exploded(it)
+            if exploded is None:
+                continue
+            prev_raw = head_tree.get(snapshot.item_prefix(it["item_id"]) + "document.json")
+            if prev_raw is not None and prev_raw == exploded.document_json:
+                continue  # unchanged item — nothing to say
+            parts.append(self._item_summary(prev_raw, exploded.document_json, it["path"]))
+        return " ".join(p for p in parts if p and p != "No design changes.")
+
+    def draft_release_note(self, item_id: str) -> str:
+        """Deterministic draft of a release note: everything that changed on
+        this item since its last released revision (or its first version)."""
+        m = self.manifest()
+        item = manifest.find_item(m, item_id)
+        if item is None:
+            raise VaultError("invalid_item", f"no such item: {item_id}")
+        exploded = self._working_exploded(item)
+        if exploded is None:
+            return ""
+        base_raw: bytes | None = None
+        pins = [rr for rr in item.get("released_revs", []) or [] if rr.get("commit")]
+        if pins:
+            base_tree = self._bind.read_tree(pins[-1]["commit"])
+            base_raw = base_tree.get(snapshot.item_prefix(item_id) + "document.json")
+        return self._item_summary(base_raw, exploded.document_json, item["path"])
 
     def restore(self, commit: str, item_id: str | None = None) -> dict[str, Any]:
         """Forward-only restore (contract §3.3): re-assemble the working files
@@ -201,6 +281,11 @@ class Vault:
         item = manifest.find_item(m, item_id)
         if item is None:
             raise VaultError("invalid_item", f"no such item: {item_id}")
+        if not message and assist.allowed(self.ai_mode(), "draft_message"):
+            # assisted+ tiers: deterministically draft the release note from
+            # the changes since the last released revision (user-editable —
+            # an explicit message always wins; manual tier never drafts).
+            message = self.draft_release_note(item_id)
         if not message:
             raise VaultError("preflight_failed", "a release needs a note")
 
@@ -294,6 +379,8 @@ class Vault:
         author = author or _user_author()
         geometry_for = geometry_for or {}
         files: dict[str, bytes] = {}
+        head = self._bind.head_commit()
+        head_tree = self._bind.read_tree(head) if head else {}
         for path in self._project_containers():
             raw = path.read_bytes()
             try:
@@ -318,12 +405,45 @@ class Vault:
                 doc_uuid=doc_uuid, rev=item.get("rev"), lifecycle=item["lifecycle"],
                 ai=ai_block,
             )
+            # plain-language change summary per entry (T-R3, contract §2
+            # summary.txt): deterministic, numerals copied from doc_diff.
+            prev_raw = head_tree.get(snapshot.item_prefix(iid) + "document.json")
+            summary = self._item_summary(prev_raw, exploded.document_json, rel)
             files.update(snapshot.item_paths(
                 iid, exploded, meta_json=meta_json,
+                summary_txt=summary.encode("utf-8"),
                 geometry_step=geometry_for.get(iid),
             ))
         files["manifest.json"] = manifest.dumps(m)
         return files
+
+    def _working_exploded(self, item: dict[str, Any]) -> snapshot.ExplodedItem | None:
+        """Explode an item's current working container (None when unreadable)."""
+        path = self.project_dir / item["path"]
+        if not path.is_file():
+            return None
+        try:
+            return snapshot.explode_container(path.read_bytes())
+        except Exception:
+            return None
+
+    def _item_summary(self, prev_raw: bytes | None, cur_raw: bytes, rel_path: str) -> str:
+        """Deterministic summary between two canonical document blobs.
+
+        Degrades to an empty string if the semantic diff engine is not
+        importable — a missing summary must never block a save.
+        """
+        import json as _json
+        try:
+            cur_doc = _json.loads(cur_raw.decode("utf-8"))
+            if prev_raw is None:
+                return summarize.summarize_first_version(cur_doc, rel_path)
+            if prev_raw == cur_raw:
+                return "No design changes."
+            prev_doc = _json.loads(prev_raw.decode("utf-8"))
+            return summarize.summary_between_docs(prev_doc, cur_doc, rel_path)
+        except Exception:
+            return ""
 
     def _dirty_items(self, m: dict[str, Any]) -> list[str]:
         """Return item_ids whose working container differs from HEAD's canonical form."""

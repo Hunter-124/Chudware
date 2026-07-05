@@ -3,7 +3,7 @@ id: T-DP1
 title: Freeze design-pipeline contract (aicad.designpipe/1) + wire six stages into the phase machine
 workstream: DP
 owner: opus-drift1
-status: review
+status: done
 branch: task/T-DP1-design-pipeline-contract
 depends_on: []
 lane: ai-copilot

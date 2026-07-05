@@ -311,12 +311,40 @@ def _gate_decompose(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
 
     Reads the ledger: passes when ≥1 ``feature`` event exists (``ctx['features']``,
     a pure read of ``state.features``). Semantic coverage (every requirement mapped)
-    is a T-DP2 checker that layers on top — this gate only requires presence."""
+    is a T-DP2 checker that layers on top — this gate only requires presence.
+
+    When the caller supplies coverage findings (``ctx['untraced_features']`` or
+    ``ctx['orphan_requirements']``), those are surfaced as additional gate reasons
+    without changing the gate name (``"features_present"``). This is the T-DP2
+    "extend gate context, not gate signature" contract (design_pipeline.md §5).
+    """
+    reasons: list[str] = []
     if not (ctx.get("features") or []):
-        return GateResult(False, "features_present",
-                          ["no feature[] artifacts in the ledger — Stage 1 "
-                           "(functional decomposition) produced nothing to build on"])
-    return GateResult(True, "features_present")
+        reasons.append(
+            "no feature[] artifacts in the ledger — Stage 1 "
+            "(functional decomposition) produced nothing to build on"
+        )
+        # No point surfacing coverage findings when there are no features.
+        return GateResult(False, "features_present", reasons)
+
+    # T-DP2: optional coverage findings — present only when the caller ran
+    # ``functional_decomposition.gate_context_from_ledger`` (or supplied them
+    # manually). The gate name stays "features_present" in all cases so the
+    # existing DP1 tests continue to pass unchanged.
+    untraced = ctx.get("untraced_features") or []
+    orphaned = ctx.get("orphan_requirements") or []
+    if untraced:
+        reasons.append(
+            f"features with no requirement trace (untraced): {untraced} — "
+            "each must reference a ledger req_id or declare assumption:<slug>"
+        )
+    if orphaned:
+        reasons.append(
+            f"requirements with no covering feature (orphaned): {orphaned} — "
+            "add a feature for each or mark the requirement cancelled"
+        )
+
+    return GateResult(not reasons, "features_present", reasons)
 
 
 def _gate_geometry(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:

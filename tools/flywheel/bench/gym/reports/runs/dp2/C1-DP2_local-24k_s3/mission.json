@@ -1,0 +1,13 @@
+{
+  "status": "blocked",
+  "phase": "intake",
+  "phases_completed": [],
+  "findings": [
+    "[error] criterion_check: DL1/FA1: criterion must name a 'check' with a tool {'id': 'DL1', 'ac': 'FA1'}",
+    "[error] criterion_check: DL1/FA2: criterion must name a 'check' with a tool {'id': 'DL1', 'ac': 'FA2'}",
+    "[error] criterion_check: DL1/FA3: criterion must name a 'check' with a tool {'id': 'DL1', 'ac': 'FA3'}",
+    "[error] criterion_check: DL1/FA4: criterion must name a 'check' with a tool {'id': 'DL1', 'ac': 'FA4'}",
+    "[error] criterion_check: DL1/FA5: criterion must name a 'check' with a tool {'id': 'DL1', 'ac': 'FA5'}"
+  ],
+  "stop_reason": "manifest_invalid_escalated"
+}

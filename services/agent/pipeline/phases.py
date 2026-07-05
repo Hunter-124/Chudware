@@ -3,8 +3,9 @@
 The mission machine is a linear phase sequence with two feature-flagged additions
 (the 1.3 org layer):
 
-    INTAKE → [CLARIFY] → SPECIFY → [ORGANIZE] → PLAN → BUILD → VERIFY
-             → [CORRECT ↺] → DELIVER
+    INTAKE → [CLARIFY] → SPECIFY
+             → [DECOMPOSE → GEOMETRY → LINKAGE → BUILDPATH]   (T-DP1, flagged OFF)
+             → [ORGANIZE] → PLAN → BUILD → VERIFY → [CORRECT ↺] → DELIVER
 
 Each phase has an EXIT GATE: a named deterministic check that must pass before the
 mission advances.  A gate never calls a model — it inspects durable state (the
@@ -43,6 +44,15 @@ class Phase(str, Enum):
     INTAKE = "intake"
     CLARIFY = "clarify"
     SPECIFY = "specify"
+    # T-DP1: the six-stage design-pipeline refinement of the SPECIFY→PLAN span
+    # (docs/AGENT_DESIGN_PIPELINE.md §2, contract design_pipeline.md §6). These four
+    # phases are feature-flagged (PipelineFlags.design_pipeline, default OFF) and are
+    # skipped by next_phase when off — the existing pipeline is unchanged. Stage 0
+    # (intent) = INTAKE/SPECIFY; Stage 5 (execution) = the existing BUILD phase.
+    DECOMPOSE = "decompose"      # Stage 1 — functional decomposition (feature[])
+    GEOMETRY = "geometry"        # Stage 2 — geometry realization (geometry_spec[])
+    LINKAGE = "linkage"          # Stage 3 — topology / linkage (linkage[])
+    BUILDPATH = "buildpath"      # Stage 4 — build-path planning (build_node[])
     ORGANIZE = "organize"        # Phase 2.5 (contract §18) — feature-flagged
     PLAN = "plan"
     BUILD = "build"
@@ -57,6 +67,11 @@ PHASE_ORDER: tuple[Phase, ...] = (
     Phase.INTAKE,
     Phase.CLARIFY,
     Phase.SPECIFY,
+    # T-DP1 design-pipeline stages — skipped unless the design_pipeline flag is on.
+    Phase.DECOMPOSE,
+    Phase.GEOMETRY,
+    Phase.LINKAGE,
+    Phase.BUILDPATH,
     Phase.ORGANIZE,
     Phase.PLAN,
     Phase.BUILD,
@@ -64,6 +79,12 @@ PHASE_ORDER: tuple[Phase, ...] = (
     Phase.CORRECT,
     Phase.DELIVER,
 )
+
+# T-DP1: the design-pipeline phases, in order — the set next_phase skips when the
+# design_pipeline flag is off.
+_DESIGN_PIPELINE_PHASES: frozenset[Phase] = frozenset({
+    Phase.DECOMPOSE, Phase.GEOMETRY, Phase.LINKAGE, Phase.BUILDPATH,
+})
 
 
 class PhaseError(RuntimeError):
@@ -101,10 +122,14 @@ class PipelineFlags:
       * ``AICAD_BUILD_COUNCIL=1``  → require build-strategy council synthesis at the
         PLAN exit gate (contract §19).
       * ``AICAD_OVERSEER=1``       → overseer audit triggers are live (T-W13).
+      * ``AICAD_DESIGN_PIPELINE=1`` → run the six-stage design-pipeline refinement
+        (T-DP1: DECOMPOSE→GEOMETRY→LINKAGE→BUILDPATH between SPECIFY and PLAN).
+        Default OFF — the existing pipeline is unchanged when off (contract §6).
     """
     org_layer: bool = True   # T-W22 landed — ORGANIZE phase is live
     build_council: bool = False
     overseer: bool = False
+    design_pipeline: bool = False   # T-DP1 — six-stage refinement, default OFF
 
     @classmethod
     def from_env(cls) -> "PipelineFlags":
@@ -117,6 +142,7 @@ class PipelineFlags:
             org_layer=_on("AICAD_ORG_LAYER", True),   # default ON (T-W22)
             build_council=_on("AICAD_BUILD_COUNCIL", False),
             overseer=_on("AICAD_OVERSEER", False),
+            design_pipeline=_on("AICAD_DESIGN_PIPELINE", False),  # default OFF (T-DP1)
         )
 
 
@@ -204,6 +230,11 @@ class PhaseMachine:
         for cand in PHASE_ORDER[idx + 1:]:
             if cand is Phase.CLARIFY and not context.get("has_blocking_ambiguity"):
                 continue
+            # T-DP1: the four design-pipeline phases are skipped unless the flag is on.
+            # With the flag off, next_phase(SPECIFY) advances straight to ORGANIZE/PLAN
+            # exactly as before — the existing pipeline is byte-for-byte unchanged.
+            if cand in _DESIGN_PIPELINE_PHASES and not self.flags.design_pipeline:
+                continue
             if cand is Phase.ORGANIZE and not self.flags.org_layer:
                 continue
             if cand is Phase.CORRECT and not context.get("open_failure_cards"):
@@ -273,6 +304,78 @@ def _gate_specify(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
                        f"{uncovered}")
     return GateResult(not reasons, "spec_audited_criteria_covered", reasons,
                       overseer=True)
+
+
+def _gate_decompose(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
+    """Stage 1 exit — ``features_present`` (contract design_pipeline.md §5).
+
+    Reads the ledger: passes when ≥1 ``feature`` event exists (``ctx['features']``,
+    a pure read of ``state.features``). Semantic coverage (every requirement mapped)
+    is a T-DP2 checker that layers on top — this gate only requires presence."""
+    if not (ctx.get("features") or []):
+        return GateResult(False, "features_present",
+                          ["no feature[] artifacts in the ledger — Stage 1 "
+                           "(functional decomposition) produced nothing to build on"])
+    return GateResult(True, "features_present")
+
+
+def _gate_geometry(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
+    """Stage 2 exit — ``geometry_specs_present`` (contract §5).
+
+    Reads the ledger: every feature id is realized by ≥1 geometry_spec AND every
+    geometry_spec carries provenance (the "never recall a number" rule, enforced at
+    write time too but re-checked here so the gate is self-contained)."""
+    reasons: list[str] = []
+    features = ctx.get("features") or []
+    specs = ctx.get("geometry_specs") or []
+    if not specs:
+        reasons.append("no geometry_spec[] artifacts in the ledger — Stage 2 "
+                       "(geometry realization) produced nothing")
+    realized: set[str] = set()
+    for s in specs:
+        realized.update(s.get("realizes") or [])
+    uncovered = [f.get("id") for f in features if f.get("id") not in realized]
+    if uncovered:
+        reasons.append(f"features with no realizing geometry_spec: {uncovered}")
+    no_prov = [s.get("id") for s in specs if not s.get("provenance")]
+    if no_prov:
+        reasons.append(f"geometry_spec without provenance (rejected rule): {no_prov}")
+    return GateResult(not reasons, "geometry_specs_present", reasons, overseer=True)
+
+
+def _gate_linkage(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
+    """Stage 3 exit — ``linkage_present`` (contract §5).
+
+    Reads the ledger: passes when ≥1 ``linkage`` event exists. Reference integrity
+    and interface consistency are T-DP4 checkers — this gate requires presence."""
+    if not (ctx.get("linkages") or []):
+        return GateResult(False, "linkage_present",
+                          ["no linkage[] artifact in the ledger — Stage 3 "
+                           "(topology / linkage) produced no skeleton"])
+    return GateResult(True, "linkage_present")
+
+
+def _gate_buildpath(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
+    """Stage 4 exit — ``build_nodes_present`` (contract §5).
+
+    Reads the ledger: ≥1 build_node exists AND every build_node.elements id resolves
+    to a geometry_spec id (no dangling element ref). Cycle/dep validation is the
+    buildgraph validator's job at the PLAN gate (advisor.md §13)."""
+    reasons: list[str] = []
+    nodes = ctx.get("build_nodes") or []
+    specs = ctx.get("geometry_specs") or []
+    if not nodes:
+        reasons.append("no build_node[] artifacts in the ledger — Stage 4 "
+                       "(build-path planning) produced no ordered pathway")
+    spec_ids = {s.get("id") for s in specs}
+    dangling: list[str] = []
+    for n in nodes:
+        for el in (n.get("elements") or []):
+            if el not in spec_ids:
+                dangling.append(f"{n.get('id')}→{el}")
+    if dangling:
+        reasons.append(f"build_node elements referencing no geometry_spec: {dangling}")
+    return GateResult(not reasons, "build_nodes_present", reasons, overseer=True)
 
 
 def _gate_organize(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
@@ -361,6 +464,11 @@ _GATES: dict[Phase, GateCheck] = {
     Phase.INTAKE: _gate_intake,
     Phase.CLARIFY: _gate_clarify,
     Phase.SPECIFY: _gate_specify,
+    # T-DP1 design-pipeline stage gates (contract design_pipeline.md §5)
+    Phase.DECOMPOSE: _gate_decompose,
+    Phase.GEOMETRY: _gate_geometry,
+    Phase.LINKAGE: _gate_linkage,
+    Phase.BUILDPATH: _gate_buildpath,
     Phase.ORGANIZE: _gate_organize,
     Phase.PLAN: _gate_plan,
     Phase.BUILD: _gate_build,

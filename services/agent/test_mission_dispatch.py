@@ -73,6 +73,29 @@ class TestLedgerTools:
                              payload={"id": "DIM1", "name": "bore", "value": 10})
         assert out["ok"] is False and "provenance" in out["error"]
 
+    def test_geometry_spec_requires_provenance(self, md):
+        # T-DP1: geometry_spec is the geometry-side twin of the dimension rule —
+        # the mission-dispatch back door enforces provenance too.
+        out = md.ledger_note(kind="geometry_spec",
+                             payload={"id": "G1", "realizes": ["FT1"]})
+        assert out["ok"] is False and "provenance" in out["error"]
+        ok = md.ledger_note(kind="geometry_spec",
+                            payload={"id": "G1", "realizes": ["FT1"],
+                                     "provenance": "fit_calc"})
+        assert ok["ok"] is True
+
+    def test_dp_kinds_accepted_and_readable(self, md):
+        # T-DP1: the four design-pipeline kinds write and read back through dispatch.
+        assert md.ledger_note(kind="feature",
+                              payload={"id": "FT1", "function": "mount",
+                                       "driving_requirement": "R1"})["ok"]
+        assert md.ledger_note(kind="linkage", payload={"id": "LINK_MAIN"})["ok"]
+        assert md.ledger_note(kind="build_node",
+                              payload={"id": "BN1", "op": "extrude"})["ok"]
+        got = md.ledger_get(section="features")
+        assert got["ok"] is True
+        assert any(f.get("id") == "FT1" for f in got["data"])
+
     def test_foreign_run_id_is_scoped_to_own_run(self, md):
         out = md.ledger_note(kind="note", payload={"text": "hi"},
                              run_id="someone_elses_run")

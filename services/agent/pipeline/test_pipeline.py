@@ -295,6 +295,93 @@ def test_correct_loop_reentry_is_legal():
 
 
 # ===========================================================================
+# 2b. T-DP1 design-pipeline stages (flagged refinement, contract design_pipeline.md)
+# ===========================================================================
+
+def test_design_pipeline_default_off_specify_advances_as_before():
+    """Flag off (default): SPECIFY → ORGANIZE/PLAN exactly as before — the four
+    design-pipeline phases are skipped. The load-bearing flag-off invariant."""
+    flags = PipelineFlags()
+    assert flags.design_pipeline is False
+    # org on (default) → SPECIFY → ORGANIZE, DP phases skipped
+    assert PhaseMachine().next_phase(Phase.SPECIFY, {}) is Phase.ORGANIZE
+    # org off too → SPECIFY → PLAN, DP phases still skipped
+    off = PhaseMachine(flags=PipelineFlags(org_layer=False))
+    assert off.next_phase(Phase.SPECIFY, {}) is Phase.PLAN
+
+
+def test_design_pipeline_flag_on_visits_four_stages():
+    """Flag on: SPECIFY → DECOMPOSE → GEOMETRY → LINKAGE → BUILDPATH → (ORGANIZE/PLAN)."""
+    m = PhaseMachine(flags=PipelineFlags(design_pipeline=True, org_layer=False))
+    assert m.next_phase(Phase.SPECIFY, {}) is Phase.DECOMPOSE
+    assert m.next_phase(Phase.DECOMPOSE, {}) is Phase.GEOMETRY
+    assert m.next_phase(Phase.GEOMETRY, {}) is Phase.LINKAGE
+    assert m.next_phase(Phase.LINKAGE, {}) is Phase.BUILDPATH
+    assert m.next_phase(Phase.BUILDPATH, {}) is Phase.PLAN  # org off → PLAN
+
+
+def test_dp_flag_from_env():
+    import os
+    os.environ["AICAD_DESIGN_PIPELINE"] = "1"
+    try:
+        assert PipelineFlags.from_env().design_pipeline is True
+    finally:
+        del os.environ["AICAD_DESIGN_PIPELINE"]
+    assert PipelineFlags.from_env().design_pipeline is False
+
+
+def test_decompose_gate_reads_ledger_features():
+    m = PhaseMachine()
+    assert not m.run_gate(Phase.DECOMPOSE, {"features": []}).passed
+    g = m.run_gate(Phase.DECOMPOSE, {"features": [{"id": "FT1"}]})
+    assert g.passed and g.gate == "features_present"
+
+
+def test_geometry_gate_requires_coverage_and_provenance():
+    m = PhaseMachine()
+    features = [{"id": "FT1"}]
+    # no specs → fail
+    assert not m.run_gate(Phase.GEOMETRY,
+                          {"features": features, "geometry_specs": []}).passed
+    # spec realizes FT1 but has no provenance → fail
+    bad = [{"id": "G1", "realizes": ["FT1"], "provenance": ""}]
+    r = m.run_gate(Phase.GEOMETRY, {"features": features, "geometry_specs": bad})
+    assert not r.passed and any("provenance" in x for x in r.reasons)
+    # uncovered feature → fail
+    uncov = [{"id": "G1", "realizes": ["FT9"], "provenance": "fit_calc"}]
+    r2 = m.run_gate(Phase.GEOMETRY, {"features": features, "geometry_specs": uncov})
+    assert not r2.passed and any("FT1" in str(x) for x in r2.reasons)
+    # covered + provenance → pass, overseer flag set
+    good = [{"id": "G1", "realizes": ["FT1"], "provenance": "fit_calc"}]
+    r3 = m.run_gate(Phase.GEOMETRY, {"features": features, "geometry_specs": good})
+    assert r3.passed and r3.overseer
+
+
+def test_linkage_gate_reads_ledger():
+    m = PhaseMachine()
+    assert not m.run_gate(Phase.LINKAGE, {"linkages": []}).passed
+    assert m.run_gate(Phase.LINKAGE, {"linkages": [{"id": "LINK_MAIN"}]}).passed
+
+
+def test_buildpath_gate_rejects_dangling_element_ref():
+    m = PhaseMachine()
+    specs = [{"id": "G1"}]
+    # no nodes → fail
+    assert not m.run_gate(Phase.BUILDPATH,
+                          {"build_nodes": [], "geometry_specs": specs}).passed
+    # node references a geometry_spec that doesn't exist → fail
+    dangling = [{"id": "BN1", "op": "extrude", "elements": ["G9"]}]
+    r = m.run_gate(Phase.BUILDPATH,
+                   {"build_nodes": dangling, "geometry_specs": specs})
+    assert not r.passed and any("G9" in str(x) for x in r.reasons)
+    # clean node → pass
+    ok = [{"id": "BN1", "op": "extrude", "elements": ["G1"]}]
+    r2 = m.run_gate(Phase.BUILDPATH,
+                    {"build_nodes": ok, "geometry_specs": specs})
+    assert r2.passed and r2.gate == "build_nodes_present"
+
+
+# ===========================================================================
 # 3. Replan routing matrix (contract §17)
 # ===========================================================================
 

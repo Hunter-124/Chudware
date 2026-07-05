@@ -24,6 +24,16 @@ freely but must not edit them. One owner per round per append-only file (see
 - `events.md` — async event payloads (`sim_progress`, etc.).
 - `feature_params.md` — per-feature-type param/field tables (PM form order).
 
+## Agent-layer contracts (Pillar 20 / design pipeline)
+
+- `advisor.md` — advisory layer: design ledger (`aicad.ledger/1`), roles, triggers,
+  councils, tiers, effort presets, cognition ladder (`aicad.ladder/1`).
+- `design_pipeline.md` — guided design-thinking pipeline (`aicad.designpipe/1`, T-DP1):
+  the six-stage IO schemas (`feature`/`geometry_spec`/`linkage`/`build_node`), the new
+  ledger event kinds (**extends `aicad.ledger/1`**), the ledger-reading stage-gate
+  definitions, the effort/auto-mode hooks, and the geometry-kind → trigger bindings.
+  Refines (does not replace) `advisor.md` §2/§20/§22/§23 and `phases.py`.
+
 ## Frozen subdirectories /附属 files
 
 - `ecad/` — ECAD sub-contracts (`ecad_rpc.md`, `ecad_ops.md`, `sch_schema.md`,

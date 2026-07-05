@@ -34,3 +34,6 @@ shot-verified. Independent — can start now against the existing mission worksp
 - [ ] User can switch/tile between parts being built concurrently.
 - [ ] Shot scenario: 2+ parts under concurrent agent work, EYEBALLED.
 - [ ] ui_style_check clean; gate.sh PASS; graphify update.
+
+## Progress log
+- 2026-07-05 20:43 UTC [sonnet-vale1] Starting T-DP13: multi-file agent view. Running graphify to orient on mission workspace + ui/imgui substrate.

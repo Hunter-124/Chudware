@@ -689,7 +689,9 @@ def _repeat_nudge(res: "ModelResult | AssemblyResult") -> str:
 
 
 def _advisory_block(res: "ModelResult | AssemblyResult", seq: int,
-                    ledger=None) -> str:
+                    ledger=None, output_text: str = "",
+                    tool_names: "list[str] | None" = None,
+                    cooldown_state: "dict | None" = None) -> str:
     """Run the foreman over a build result and return an [ADVISORY] block (T-W5).
 
     The loop path has no doc_id — only ``res.fit`` (interference by part name +
@@ -697,6 +699,9 @@ def _advisory_block(res: "ModelResult | AssemblyResult", seq: int,
     fire (see services/agent/advisor/adapters.py).  Best-effort: any failure
     returns "" so the design loop never breaks.  Advisories are also logged to
     the ledger event stream (§3) when one is present.
+
+    T-W21: ``output_text`` / ``tool_names`` / ``cooldown_state`` are threaded
+    into the Observation so trigger-based context injection fires on this turn.
     """
     if not _ADVISOR_ENABLED:
         return ""
@@ -705,9 +710,26 @@ def _advisory_block(res: "ModelResult | AssemblyResult", seq: int,
         from services.agent.advisor import engine as _adv_engine
         from services.agent.advisor import render as _adv_render
         obs = _adv_adapters.observe_build(res, seq=seq)
-        if not obs.findings:
+        # T-W21: wire trigger fields so context packs fire on matching turns.
+        obs.output_text = output_text or ""
+        obs.tool_names = list(tool_names or [])
+        obs.cooldown_state = cooldown_state
+
+        def _ledger_sink(events: list) -> None:
+            if ledger is not None and events:
+                try:
+                    for ev in events:
+                        ledger.append("foreman", "trigger_fired", ev)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        obs.trigger_ledger_sink = _ledger_sink
+
+        if not obs.findings and not obs.output_text and not obs.tool_names:
             return ""
         advisory = _adv_engine.build_advisory(obs)
+        if not advisory.get("items"):
+            return ""
         if ledger is not None:
             try:
                 ledger.append("foreman", "advisory", advisory)
@@ -1250,9 +1272,11 @@ def run_turn(session: Session, request: str, provider: Provider,
                 prompt_text = VERIFY               # genuine progress -> normal verdict request
                 if noop_change:                    # edited code, byte-identical geometry
                     prompt_text = NOOP_CHANGE_NOTE + "\n" + VERIFY
-            # Foreman advisory (T-W5, §9.1): computed before the verdict prompt so
-            # it leads the next user turn — the block is prepended to the feedback.
-            _adv = _advisory_block(res, seq=i, ledger=_ledger)
+            # Foreman advisory (T-W5 + T-W21 §20): computed before the verdict prompt
+            # so it leads the next user turn — block prepended to the feedback.
+            # T-W21: pass reply text so keyword triggers can fire on model output.
+            _adv = _advisory_block(res, seq=i, ledger=_ledger,
+                                   output_text=reply or "")
             # Show the render (+ fit report) and ask for the next step.
             if sheet_i and getattr(provider, "supports_vision", True):
                 feedback = [text_part(_feedback_ok(res)), image_part(sheet_i),
@@ -1271,9 +1295,10 @@ def run_turn(session: Session, request: str, provider: Provider,
             if same_err_streak >= _SAME_ERROR_LIMIT or fail_streak >= _MAX_FAIL_STREAK:
                 stop_reason = "failed"
                 break
-            # Foreman advisory on the rebuild failure (T-W5): wraps the error as a
-            # rebuild-class finding with regen_diagnose as the helper tool.
-            _adv = _advisory_block(res, seq=i, ledger=_ledger)
+            # Foreman advisory on the rebuild failure (T-W5 + T-W21 §20): wraps the
+            # error as a rebuild-class finding; also fires keyword triggers.
+            _adv = _advisory_block(res, seq=i, ledger=_ledger,
+                                   output_text=reply or "")
             # If a prior version built, tell the model it can revert instead of devolving.
             can_revert = last_ok_res is not None or session.last_ok_res is not None
             err_parts = [text_part(_feedback_err(res, can_revert=can_revert))]

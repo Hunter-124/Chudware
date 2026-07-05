@@ -90,6 +90,7 @@ LLAMACPP = ROOT / "llamacpp"        # optional managed llama.cpp server payload
 MODELS = ROOT / "models"            # user / bundled GGUF models
 VENDOR_PARTS = ROOT / "vendor_parts"  # approved/manual supplier CAD + metadata cache
 PARTS_LIBRARY = ROOT / "parts_library"  # watched folder of user-dropped CAD files (auto-registered)
+BROWSER_PROFILES = ROOT / "browser_profiles"  # T-X1: local-only per-site browser login profiles
 
 
 def parts_library_dir() -> Path:

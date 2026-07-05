@@ -217,6 +217,14 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
     ledger = Ledger(run_id, path=ledger_path)
     ledger.set_brief("pipeline", title=f"Gym {challenge.id}", summary=challenge.request[:400])
 
+    # T-W28: the gym reads the SAME effort resolution path as the mission
+    # pipeline and the settings GUI (tiers.resolve_effort → presets + user
+    # overrides), and snapshots it into the cell ledger like a real mission.
+    from services.agent.tiers import resolve_effort
+    from services.agent.effort import record_effort_snapshot
+    effort_profile = resolve_effort(tier)
+    record_effort_snapshot(ledger, active_tier=effort_profile.tier)
+
     # Drive the real phase machine through run_mission (INTAKE + manifest validate +
     # graph compile), execute_dag=False so we do not depend on the (absent) real agent.
     mission = _run_mission_safe(challenge, run_id)
@@ -227,7 +235,8 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
     ledger_doc = json.loads((run_dir / "ledger.json").read_text(encoding="utf-8"))
 
     # Independent grading + taxonomy classification.
-    ctx = {"challenge": challenge.id, "seed": seed, "tier": tier}
+    ctx = {"challenge": challenge.id, "seed": seed, "tier": tier,
+           "effort": effort_profile.to_payload()}
     graded = challenge.grade(ledger_doc, ctx)
     classifications = classify_ledger(
         ledger_doc, manifest=challenge.manifest, graded=graded,

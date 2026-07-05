@@ -1,7 +1,8 @@
-# contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.4)
+# contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.5)
 
 Frozen 2026-07-04; §10–§15 added same day (1.0 → 1.1), §16–§17 (1.1 → 1.2),
-§18–§21 org layer (1.2 → 1.3), §22 design cognition ladder (1.3 → 1.4). All bumps additive. Companion to
+§18–§21 org layer (1.2 → 1.3), §22 design cognition ladder (1.3 → 1.4),
+§23 harness effort presets & user overrides (1.4 → 1.5, T-W28). All bumps additive. Companion to
 `docs/ADVISOR_ARCHITECTURE.md` (Pillar 20) and `docs/COPILOT_MISSION_PIPELINE.md`
 (pipeline operation).
 
@@ -673,3 +674,37 @@ ladder is mandatory at deliberation=full (local), optional at minimal
 (frontier models may emit rung D directly — validators still run). Rungs may
 run as ponder delegations of one design_thinker or as separate delegations —
 identical contexts either way (fresh-context rule is what matters).
+
+## §23 Harness effort presets & user overrides (`aicad.effort/1`) — `services/agent/effort_presets.yaml`
+
+1.5 additive (T-W28). §8 tier profiles remain the SHIPPED defaults; this section
+adds USER OWNERSHIP of the dial. Same principle as the §14 addendum: shipped
+values are initial defaults only — nothing hardcoded outside user-editable
+config.
+
+- Presets: `effort_presets.yaml` (`schema: aicad.effort/1`) defines the four
+  Simple-mode levels `eco | standard | deliberate | maximum`, each a set of knob
+  overrides (`overrides.all`, then `overrides.<tier>`) applied over a baseline
+  DERIVED at load time from tiers.yaml and the shipped code constants (ladder
+  MAX_BOUNCES, delegation DEPTH_CAP, councils seat budgets/threshold, failure
+  attempt budgets, overseer trigger points, trigger packs). `standard` is the
+  identity preset — the §8 1.3 INVERTED DIAL survives untouched.
+- Knob set (grouped for the GUI): Deliberation (`deliberation`, `ladder`,
+  `ladder_max_bounces`, `council`, `council_seats`, `council_feature_threshold`,
+  `ponder_round1_tokens`, `ponder_round2_tokens`), Parallelization
+  (`delegation_depth`, `worker_fan_out` 0=uncapped, `multi_doc_parallel`),
+  Safety nets (`preflight`, `overseer_cadence: every_trigger|stage_exit_only|
+  manual_only`, `failure_max_attempts` per class), Context
+  (`history_budget_tokens`, `trigger_injection`, `trigger_cooldown_scale`,
+  `context_pack_verbosity`).
+- User overrides: config.json `ai_effort: {level, mode: simple|advanced,
+  overrides: {<tier>: {<knob>: value}}}`. Resolution precedence (ONE path,
+  `services/agent/effort.resolve_effort`, re-exported by tiers.py; mission
+  pipeline, design gym and GUI all use it): shipped < preset.all < preset.<tier>
+  < user override. Every resolved knob carries provenance
+  (`shipped | preset:<level> | override`).
+- Freedom rule: absurd combinations WARN with the reason (mirrors §14
+  warn-never-block) and are stored verbatim — never blocked, never silently
+  clamped. Runtime hard caps (e.g. §12 DEPTH_CAP) stay enforced at runtime.
+- Ledger: mission start appends one `kind: effort_profile` event with the fully
+  resolved values + provenance for every tier (replayable).

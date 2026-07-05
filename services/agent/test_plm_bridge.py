@@ -33,6 +33,7 @@ from services.agent.plm_bridge import (
     make_buildgraph_node_emit_hook,
 )
 from services.agent.ledger import Ledger
+from services.agent.buildgraph.executor import run_sync
 
 
 # ---------------------------------------------------------------------------
@@ -582,3 +583,150 @@ class TestProvenanceFromEvents:
         assert "ISO 286-2" in msg, (
             f"Provenance from event not in message: {msg!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 11. Real executor integration — capability proven through run_sync
+# ---------------------------------------------------------------------------
+
+class TestRealExecutorIntegration:
+    """Prove the bridge seam against the actual BuildGraphExecutor, not a
+    hand-crafted payload.  Uses run_sync from executor.py (T-W15) so the emit
+    contract is exercised end-to-end.
+
+    Note: live loop.py wiring lands with T-W16's executor driver (T-W16
+    calls ready_nodes() and dispatches sub-agents).  Until T-W16 merges,
+    run_sync is the correct single-process path for integration testing.
+    """
+
+    def _make_fixture_graph(self) -> dict:
+        return {
+            "schema": "aicad.buildgraph/1",
+            "mission": "widget_assy",
+            "nodes": [
+                {"id": "n_part",  "kind": "part",       "label": "bracket",      "requires": []},
+                {"id": "n_verify","kind": "verify",      "label": "verify_bracket","requires": ["n_part"]},
+                {"id": "n_ck1",   "kind": "checkpoint",  "label": "part_done_bracket","requires": ["n_verify"]},
+                {"id": "n_ck2",   "kind": "checkpoint",  "label": "mission_done", "requires": ["n_ck1"]},
+            ],
+        }
+
+    def test_run_sync_cuts_two_checkpoints(self, tmp_path):
+        """run_sync on a graph with two checkpoint nodes cuts exactly two PLM
+        checkpoints via the real executor emit path."""
+        vault = MockVault()
+        vault.register_project("run_exec_test", "proj_exec")
+        bridge = PLMBridge(run_id="run_exec_test", vault=vault)
+        ledger_path = tmp_path / "ledger.json"
+        from services.agent.ledger import Ledger
+        ledger = Ledger(run_id="run_exec_test", path=ledger_path)
+        bridge.attach_ledger(ledger)
+
+        graph = self._make_fixture_graph()
+        hook = make_buildgraph_node_emit_hook(bridge, graph)
+
+        # node_fn: every node succeeds immediately
+        def node_fn(node):
+            return True, {}
+
+        ex = run_sync(graph, node_fn, emit=hook)
+
+        assert ex.is_succeeded(), f"Executor did not succeed: {ex.all_statuses()}"
+        # Two checkpoint-kind nodes → two PLM checkpoints
+        assert len(vault.checkpoints) == 2, (
+            f"Expected 2 checkpoints, got {len(vault.checkpoints)}: "
+            f"{[c['entry'] for c in vault.checkpoints]}"
+        )
+
+    def test_run_sync_checkpoint_triggers_correct(self, tmp_path):
+        """The two checkpoints use part_done and mission_done triggers
+        respectively, confirming label→trigger mapping through the real executor."""
+        vault = MockVault()
+        vault.register_project("run_exec_test2", "proj_exec2")
+        bridge = PLMBridge(run_id="run_exec_test2", vault=vault)
+        ledger_path = tmp_path / "ledger2.json"
+        from services.agent.ledger import Ledger
+        ledger = Ledger(run_id="run_exec_test2", path=ledger_path)
+        bridge.attach_ledger(ledger)
+
+        graph = self._make_fixture_graph()
+        hook = make_buildgraph_node_emit_hook(bridge, graph)
+
+        def node_fn(node):
+            return True, {}
+
+        run_sync(graph, node_fn, emit=hook)
+
+        # Collect plmlink events from ledger to inspect triggers
+        plmlink_events = [e for e in ledger.events if e.get("kind") == "plmlink"]
+        triggers = {e["payload"]["buildgraph_node"]: e["payload"]["trigger"]
+                    for e in plmlink_events}
+        assert triggers.get("n_ck1") == "part_done", f"n_ck1 trigger: {triggers}"
+        assert triggers.get("n_ck2") == "mission_done", f"n_ck2 trigger: {triggers}"
+
+    def test_run_sync_non_checkpoint_nodes_produce_no_checkpoints(self, tmp_path):
+        """part and verify nodes must not create PLM checkpoints."""
+        vault = MockVault()
+        vault.register_project("run_exec_test3", "proj_exec3")
+        bridge = PLMBridge(run_id="run_exec_test3", vault=vault)
+        ledger_path = tmp_path / "ledger3.json"
+        from services.agent.ledger import Ledger
+        ledger = Ledger(run_id="run_exec_test3", path=ledger_path)
+        bridge.attach_ledger(ledger)
+
+        # Graph with only non-checkpoint nodes
+        graph_no_ck = {
+            "schema": "aicad.buildgraph/1",
+            "mission": "no_checkpoints",
+            "nodes": [
+                {"id": "n_p1", "kind": "part",   "label": "shaft",  "requires": []},
+                {"id": "n_v1", "kind": "verify",  "label": "verify", "requires": ["n_p1"]},
+            ],
+        }
+        hook = make_buildgraph_node_emit_hook(bridge, graph_no_ck)
+
+        def node_fn(node):
+            return True, {}
+
+        run_sync(graph_no_ck, node_fn, emit=hook)
+
+        assert len(vault.checkpoints) == 0, (
+            f"Expected 0 checkpoints for non-checkpoint nodes, got "
+            f"{len(vault.checkpoints)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 12. Vocabulary scan over all enabled trigger/stage message prefixes
+# ---------------------------------------------------------------------------
+
+class TestVocabScanAllEnabledTriggers:
+    """Every message prefix that can appear for an enabled trigger must be
+    free of git vocabulary (contracts/plm.md §8.1).
+
+    Covers the assembly bug fixed by this task: 'Assembly stage complete.'
+    contained the word 'stage' which _scan_git_vocab would catch.
+    """
+
+    _STAGE_EXIT_STAGES = ["part_verify", "assembly", "sim"]
+    _SIMPLE_TRIGGERS = ["plan_ratified", "part_done", "mission_done", "change_request"]
+
+    def _draft_prefix_only(self, trigger: str, stage: str | None = None) -> str:
+        """Draft a message with no ledger events (only the trigger prefix line)."""
+        return draft_checkpoint_message([], trigger=trigger, stage=stage)
+
+    def test_simple_trigger_prefixes_are_vocab_clean(self):
+        for trigger in self._SIMPLE_TRIGGERS:
+            msg = self._draft_prefix_only(trigger)
+            hits = _scan_git_vocab(msg)
+            assert not hits, (
+                f"Git vocab {hits!r} in '{trigger}' message: {msg!r}"
+            )
+
+    def test_stage_exit_prefixes_are_vocab_clean(self):
+        for stage in self._STAGE_EXIT_STAGES:
+            msg = self._draft_prefix_only("stage_exit", stage=stage)
+            hits = _scan_git_vocab(msg)
+            assert not hits, (
+                f"Git vocab {hits!r} in 'stage_exit:{stage}' message: {msg!r}"
+            )

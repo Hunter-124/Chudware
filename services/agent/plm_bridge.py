@@ -277,9 +277,9 @@ def draft_checkpoint_message(
     elif trigger == "stage_exit" and stage:
         stage_label = {
             "part_verify": "Part verification passed.",
-            "assembly": "Assembly stage complete.",
-            "sim": "Simulation complete.",
-        }.get(stage, f"Stage {stage!r} complete.")
+            "assembly": "Assembly verification passed.",
+            "sim": "Simulation passed.",
+        }.get(stage, f"{stage.replace('_', ' ').title()} complete.")
         parts.append(stage_label)
 
     if dimension_parts:
@@ -568,43 +568,6 @@ class PLMBridge:
 # ---------------------------------------------------------------------------
 # Buildgraph executor hook (T-W15 seam)
 # ---------------------------------------------------------------------------
-
-def make_buildgraph_emit_hook(bridge: "PLMBridge") -> Any:
-    """Return an emit callback for BuildGraphExecutor that fires PLM checkpoints.
-
-    Usage:
-        executor = BuildGraphExecutor(graph, emit=make_buildgraph_emit_hook(bridge))
-
-    The hook fires on "buildgraph.node.done" events for checkpoint-kind nodes,
-    mapping them to the appropriate PLM trigger (part_done or mission_done).
-    This is the real T-W15 seam — no feature flag needed since T-W15 is merged.
-    """
-    def _emit(event_type: str, payload: dict[str, Any]) -> None:
-        if event_type != "buildgraph.node.done":
-            return
-        node_id = payload.get("node_id", "")
-        # We need the full node dict to check kind and label.
-        # The executor passes status but not the node dict — look it up via
-        # the bridge's cached graph if available, else use the event payload.
-        node_kind = payload.get("kind", "")
-        node_label = payload.get("label", "")
-
-        trigger: str | None = None
-        if node_label == "mission_done" or node_kind == "checkpoint" and "mission" in node_label:
-            trigger = "mission_done"
-        elif node_kind == "checkpoint" or "part_done" in node_label:
-            trigger = "part_done"
-
-        if trigger is None:
-            return
-
-        bridge.on_milestone(
-            trigger=trigger,
-            buildgraph_node=node_id,
-        )
-
-    return _emit
-
 
 def make_buildgraph_node_emit_hook(bridge: "PLMBridge", graph: dict[str, Any]) -> Any:
     """Like make_buildgraph_emit_hook but has access to the graph node dicts.

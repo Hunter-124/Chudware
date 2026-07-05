@@ -177,7 +177,14 @@ class Server:
             "--no-webui",
         ]
         logf = self.log_path.open("w")
-        self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT)
+        # Some llama.cpp builds ship a thin launcher that dlopen's
+        # libllama-server-impl.so next to the binary. Ensure that dir is on the
+        # library path so the CUDA build loads.
+        env = dict(os.environ)
+        bindir = str(Path(self.server_bin).resolve().parent)
+        env["LD_LIBRARY_PATH"] = bindir + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+        self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                                     env=env)
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.proc.poll() is not None:
@@ -249,6 +256,8 @@ class Server:
                         delta = j["choices"][0]["delta"].get("content", "")
                     except Exception:
                         delta = ""
+                    if delta is None:
+                        delta = ""
                     if delta and ttft is None:
                         ttft = time.perf_counter() - t0
                     chunks.append(delta)
@@ -262,12 +271,26 @@ class Server:
         elapsed = time.perf_counter() - t0
         usage = j.get("usage", {})
         text = j["choices"][0]["message"]["content"]
+        # llama-server reports an authoritative `timings` block: decode rate
+        # (predicted_per_second) excludes HTTP/queue/prompt-eval noise. Prefer it
+        # for single-stream decode TPS; fall back to client-side wall time.
+        timings = j.get("timings", {}) or {}
         return {
             "text": text,
             "elapsed_s": elapsed,
             "completion_tokens": usage.get("completion_tokens"),
             "prompt_tokens": usage.get("prompt_tokens"),
+            "server_decode_tps": timings.get("predicted_per_second"),
+            "server_predicted_ms": timings.get("predicted_ms"),
+            "server_prompt_ms": timings.get("prompt_ms"),
         }
+
+    def warmup(self) -> None:
+        """One throwaway generation to pay CUDA-graph capture before timing."""
+        try:
+            self.chat([{"role": "user", "content": "hi"}], max_tokens=4)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- prompts
@@ -446,14 +469,21 @@ def measure_single_stream(srv: Server, *, max_tokens: int = 256) -> dict:
                         "brackets, covering feeds, speeds, and workholding."}]
     # TTFT via streaming.
     s = srv.chat(msgs, max_tokens=max_tokens, stream_ttft=True)
-    # TPS via non-streaming (accurate completion_tokens/elapsed).
+    # TPS via non-streaming. Prefer the SERVER's authoritative decode rate
+    # (excludes HTTP/queue/prompt-eval); client wall-time is reported alongside
+    # for cross-checking.
     n = srv.chat(msgs, max_tokens=max_tokens)
-    tps = None
+    client_tps = None
     if n["completion_tokens"] and n["elapsed_s"] > 0:
-        tps = n["completion_tokens"] / n["elapsed_s"]
+        client_tps = n["completion_tokens"] / n["elapsed_s"]
+    server_tps = n.get("server_decode_tps")
     return {
         "ttft_s": round(s["ttft_s"], 4) if s.get("ttft_s") else None,
-        "decode_tps": round(tps, 2) if tps else None,
+        # decode_tps = the authoritative server number when available.
+        "decode_tps": round(server_tps, 2) if server_tps else (
+            round(client_tps, 2) if client_tps else None),
+        "server_decode_tps": round(server_tps, 2) if server_tps else None,
+        "client_wall_tps": round(client_tps, 2) if client_tps else None,
         "completion_tokens": n["completion_tokens"],
         "elapsed_s": round(n["elapsed_s"], 3),
     }
@@ -473,11 +503,17 @@ def measure_parallel(srv: Server, n_slots: int, *, max_tokens: int = 256) -> dic
     wall = time.perf_counter() - t0
     total_tokens = sum(r["completion_tokens"] or 0 for r in results)
     peak_used = used_vram_mb()
+    # Mean per-stream server decode TPS (for the single-stream self-check at N=1).
+    per_stream = [r.get("server_decode_tps") for r in results
+                  if r.get("server_decode_tps")]
+    mean_server_tps = (round(sum(per_stream) / len(per_stream), 2)
+                       if per_stream else None)
     return {
         "n_slots": n_slots,
         "wall_s": round(wall, 3),
         "total_completion_tokens": total_tokens,
         "aggregate_tps": round(total_tokens / wall, 2) if wall > 0 else None,
+        "mean_per_stream_server_tps": mean_server_tps,
         "vram_used_mb": peak_used,
     }
 
@@ -613,13 +649,16 @@ def measure_long_context(srv: Server, *, target_ctx: int = 24576) -> dict:
     try:
         r = srv.chat(msgs, max_tokens=64, stream_ttft=True)
         n = srv.chat(msgs, max_tokens=64)
-        tps = (n["completion_tokens"] / n["elapsed_s"]
-               if n["completion_tokens"] and n["elapsed_s"] > 0 else None)
+        server_tps = n.get("server_decode_tps")
+        client_tps = (n["completion_tokens"] / n["elapsed_s"]
+                      if n["completion_tokens"] and n["elapsed_s"] > 0 else None)
         return {
             "ok": True,
             "prompt_tokens": n.get("prompt_tokens"),
             "ttft_s": round(r["ttft_s"], 3) if r.get("ttft_s") else None,
-            "decode_tps": round(tps, 2) if tps else None,
+            "decode_tps": round(server_tps, 2) if server_tps else (
+                round(client_tps, 2) if client_tps else None),
+            "prompt_eval_ms": n.get("server_prompt_ms"),
         }
     except Exception as e:
         return {"ok": False, "error": str(e)[:160]}
@@ -665,6 +704,7 @@ def bench_model(model_id: str, *, server_bin: str, parallel_ns: list[int],
     srv = Server(path, n_ctx=8192, n_parallel=1, server_bin=server_bin)
     try:
         srv.start()
+        srv.warmup()  # pay CUDA-graph capture before timing
         result["gpu_offloaded"] = srv.gpu_offloaded
         loaded_used = used_vram_mb()
         result["vram_footprint_mb"] = (loaded_used - base_used) if loaded_used else None
@@ -687,6 +727,7 @@ def bench_model(model_id: str, *, server_bin: str, parallel_ns: list[int],
                   n_parallel=max_parallel, server_bin=server_bin)
     try:
         srv2.start()
+        srv2.warmup()
         for n in parallel_ns:
             free_now = free_vram_mb()
             if free_now is not None and free_now < HEADROOM_MB:
@@ -699,6 +740,23 @@ def bench_model(model_id: str, *, server_bin: str, parallel_ns: list[int],
     finally:
         srv2.stop()
     result["parallel"] = parallel_results
+
+    # Self-check (advisor): single-stream decode TPS must agree with the
+    # per-stream server TPS at N=1 (same physical operation). A large mismatch
+    # means the harness is measuring queue/HTTP noise, not decode speed.
+    try:
+        ss = (result.get("single_stream") or {}).get("decode_tps")
+        n1 = next((p.get("mean_per_stream_server_tps") for p in parallel_results
+                   if isinstance(p, dict) and p.get("n_slots") == 1), None)
+        if ss and n1 and n1 > 0:
+            ratio = ss / n1
+            result["selfcheck_ss_vs_n1"] = {
+                "single_stream_tps": ss, "n1_per_stream_tps": n1,
+                "ratio": round(ratio, 2),
+                "ok": 0.8 <= ratio <= 1.25,
+            }
+    except Exception:
+        pass
     time.sleep(2)
 
     # Phase 3: 24k context (separate load with big ctx).
@@ -706,6 +764,7 @@ def bench_model(model_id: str, *, server_bin: str, parallel_ns: list[int],
         srv3 = Server(path, n_ctx=24576, n_parallel=1, server_bin=server_bin)
         try:
             srv3.start()
+            srv3.warmup()
             result["long_context_24k"] = measure_long_context(srv3)
             lc_used = used_vram_mb()
             result["vram_used_24k_mb"] = lc_used

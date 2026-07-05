@@ -345,6 +345,16 @@ GUI settings edit this file through a validated form, never free text. If only o
 source exists, all roles collapse onto it and delegation still works (same model,
 scoped contexts).
 
+ALL role assignments are user-owned (Hunter, 2026-07-04): every role listed in
+`assignments` — including `overseer` — appears as an editable row in the settings
+GUI. The values shipped in routing.yaml (overseer→strongest, sketcher→cheap_local,
+…) are INITIAL DEFAULTS only; no role→model binding may be hardcoded anywhere
+outside routing.yaml, and code must not special-case any role's model choice. The
+settings UI shows the resolved model per role (what `strongest` currently resolves
+to, given configured sources) so the user sees the actual consequence, and warns —
+never blocks — when a choice is likely to hurt (e.g. overseer on a 4B local model:
+"audit quality gates the whole mission").
+
 ## §15 PLM checkpoint link (`aicad.plmlink/1`)
 
 ```json

@@ -104,7 +104,12 @@ std::vector<TopoDS_Shape> split_solid_by_surface(const TopoDS_Shape& target,
 // --- surf_replace_face: split `solid` by the replacement `surface`, keep the
 // piece(s) that do NOT carry any face at `target_centroids` (the retained side),
 // fuse them into one solid. `diag` is the solid's bbox diagonal (tolerance scale).
-// Empty on a failure to heal a positive-volume solid.
+// The replacement is tried as-is first (it may already cut clean through the
+// solid); if that doesn't divide it, the tool face(s) are nudged a hair into the
+// solid (handles a replacement coincident with the target face) and, for planar
+// replacements, enlarged to safely span the solid (handles a replacement smaller
+// than the target face's footprint) before retrying. Empty on a failure to heal
+// a positive-volume solid.
 TopoDS_Shape surf_replace_face_solid(const TopoDS_Shape& solid,
                                      const std::vector<Eigen::Vector3d>& target_centroids,
                                      const TopoDS_Shape& surface, double diag);

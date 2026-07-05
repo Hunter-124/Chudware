@@ -725,6 +725,19 @@ if(AICAD_WITH_OCCT)
   set_target_properties(gen_sim2_result_fixture PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+  # T-BL27: surf_replace_face_solid heal regression (cut-through + coincident-patch cases).
+  # Own file/target (test_surfacing / core/tests/test_surfacing.cpp is T-BL28's ruled/fill/
+  # boundary body-edge-selector suite — landed independently, same insertion point).
+  add_executable(test_surf_replace_face_heal tests/test_surf_replace_face_heal.cpp)
+  target_include_directories(test_surf_replace_face_heal PRIVATE
+    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_surf_replace_face_heal PRIVATE aicad_geom_occt)
+  set_target_properties(test_surf_replace_face_heal PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME surf_replace_face_heal COMMAND test_surf_replace_face_heal)
+  set_tests_properties(surf_replace_face_heal PROPERTIES
+    ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # Verification: tessellate -> write_aicm -> HOST render::parseAicm round-trip.
   add_executable(test_geom_aicm
     tests/test_geom_aicm.cpp)

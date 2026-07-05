@@ -44,3 +44,6 @@ tolerances, datum_refs, provenance} to the ledger.
       printed → different minimums).
 - [ ] Ledger geometry_spec events with provenance; Stage-2 gate reads them.
 - [ ] gate.sh PASS; graphify update.
+
+## Progress log
+- 2026-07-05 22:06 UTC [opus-cyan1] Registry + role shipped: 10 geometry kinds bound to triggers, resolve_helpers(kind,material,process) returns real calc/profile numbers with provenance; machined-vs-printed gating verified (cnc wall 0.5 vs fdm 1.0, tol 0.05 vs 0.4). Added bend_allowance+draft_check calcs, sheet_bend+molded_draft triggers, geometry_designer.yaml, localized GEOMETRY gate-ctx branch. 28 new tests + 198 affected green. Running gate.

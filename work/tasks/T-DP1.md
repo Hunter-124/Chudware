@@ -41,3 +41,6 @@ path; helpers are offered, stages are skippable checkpoints, scaffolding scales 
 - [ ] phases.py runs the six-stage refinement behind a flag; current phase tests green when off.
 - [ ] Stage gates read the ledger; unit test per gate.
 - [ ] gate.sh PASS; graphify update.
+
+## Progress log
+- 2026-07-05 21:07 UTC [opus-drift1] T-DP1 complete on branch task/T-DP1-design-pipeline-contract (pushed). Froze contracts/design_pipeline.md (aicad.designpipe/1) extending aicad.ledger/1 (§21 precedent; advisor.md §2 untouched): feature/geometry_spec/linkage/build_node kinds, ledger-reading stage gates, effort + geometry-kind trigger bindings. Wired 4 flagged phases (DECOMPOSE/GEOMETRY/LINKAGE/BUILDPATH; AICAD_DESIGN_PIPELINE default OFF) into phases.py; ledger writers/slice-accessors; mission_dispatch provenance guard for geometry_spec. services/agent suite 1016 pass, +16 new T-DP1 tests. gate: check.py + core build + ctest + manual regen PASS. services/mcp gate failures are pre-existing (my diff touches zero services/mcp files).

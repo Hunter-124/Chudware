@@ -146,8 +146,16 @@ register_verify_tools(mcp)
 
 # Research (Pillar 8): look-it-up-instead-of-recall. web_search + fetch_page return the
 # provenance-stamped answer envelope; per-user local cache; offline-safe degradation.
+# T-W3: also registers fit_calc + recommend_fit (ISO 286, aicad.calc/1 envelope).
+# Rule: call fit_calc BEFORE hole_sizing / bore decisions; recommend_fit to choose the class.
 from mcp_server.research_tools import register_research_tools
 register_research_tools(mcp)
+
+# Dimension scheme planner (T-W3 / Pillar 20): suggest_dimension_scheme reads a sketch
+# entity roster and emits an ordered process-aware dimension plan (IT-grade tolerances,
+# bolt-pattern datum rules, needs_user_confirm flags for function-critical dims).
+from mcp_server.dimension_scheme_tools import register_dimension_scheme_tools
+register_dimension_scheme_tools(mcp)
 
 # Deliverables — spec-driven office artifacts (contract deliverables/1): make_presentation /
 # make_report / make_workbook build real .pptx/.docx/.pdf/.xlsx from a JSON spec with the

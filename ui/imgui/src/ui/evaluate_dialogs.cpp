@@ -1,5 +1,6 @@
 // Evaluate dialogs — ported from host/src/ui/evaluate_dialogs.cpp (C5).
 #include "ui/evaluate_dialogs.h"
+#include "ui/layout.h"   // T-G23: setNextCommandDialogPlacement (overlay-band float anchor)
 
 #include <cstdio>
 
@@ -161,6 +162,9 @@ bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
 void EvaluateDialogs::draw(AppState& st) {
     if (openWindow_.empty()) return;
     bool open = true;
+    // T-G23: the docked rightBottom task-pane slot is gone (overlay layout) — float these result
+    // dialogs top-right inside the overlay band, left of the Copilot column, on first open.
+    ui::setNextCommandDialogPlacement();
     ImGui::SetNextWindowSize(ImVec2(c5::px(340), 0), ImGuiCond_Appearing);
     // Frosted-glass fill so evaluate result windows float as part of the app-wide glass family
     // (translucent glassBg lets the viewport bleed through subtly; content stays legible).

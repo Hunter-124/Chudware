@@ -139,32 +139,31 @@ void Application::frame() {
     ui::drawTitleBar(s, titleH);
     ui::drawWorkspaceBar(s, wsH);
     ui::drawContextToolbar(s, tbH);
+    (void)railW;   // T-G23: the standalone left rail is gone — its tabs live inside the glass column.
 
     float midH = ImGui::GetContentRegionAvail().y - statusH;
     if (midH < 0) midH = 0;
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##rail", ImVec2(railW, midH), false,
-                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-    ui::drawActivityRail(s, railW);
-    ImGui::EndChild();
-    ImGui::PopStyleColor();
-
-    ImGui::SameLine(0, 0);
+    // T-G23 overlay layout: the dockspace hosts ONLY the central document window (Viewport/ECAD/CAM),
+    // full-width edge-to-edge. The FeatureManager + Copilot are pinned glass columns drawn OVER it
+    // (drawLeftPane / drawRightPane below), not docked task panes. Publish the overlay band (ribbon
+    // bottom -> status-bar top) so those columns anchor their geometry; the old ##rail child and the
+    // left/right dock splits are GONE (buildDefaultLayout is now a single splitless central node).
+    const ImVec2 bandMin = ImGui::GetCursorScreenPos();
+    const float dockW = ImGui::GetContentRegionAvail().x;
+    ui::setOverlayBand(bandMin.x, bandMin.y, bandMin.x + dockW, bandMin.y + midH);
 
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_DockingEmptyBg, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_SeparatorHovered, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_SeparatorActive, ImVec4(0, 0, 0, 0));
-    const float dockW = ImGui::GetContentRegionAvail().x;
     ImGuiID dockId = ImGui::GetID("##dockspace");
     ImGui::DockSpace(dockId, ImVec2(0, midH), ImGuiDockNodeFlags_PassthruCentralNode);
     if (!layoutBuilt_) {
         buildDefaultLayout(dockId, ImVec2(dockW > 1.f ? dockW : 1440.f, midH));
         layoutBuilt_ = true;
     }
-    ui::drawDockSplitters(dockId);
     ImGui::PopStyleColor(5);
 
     ui::drawStatusBar(s, statusH);
@@ -173,11 +172,10 @@ void Application::frame() {
 
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0,0,0,0));
     ImGuiWindowFlags pflags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground;
-    if (ImGui::Begin("Browser###left", nullptr, pflags)) {
-        if (!s.activeTool.empty()) ui::drawInspector(s);
-        ui::drawLeftDock(s);
-    }
-    ImGui::End();
+
+    // Pinned glass FeatureManager column over the viewport's left edge (replaces "Browser###left").
+    // Hosts the rail tabs + tree/bodies/files/configs + the PropertyManager form (drawInspector).
+    ui::drawLeftPane(s);
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     if (ImGui::Begin("Viewport###viewport", nullptr, pflags | ImGuiWindowFlags_NoScrollbar |
@@ -205,15 +203,16 @@ void Application::frame() {
     ImGui::Begin("ECAD", nullptr, pflags);
     ImGui::End();
 
-    if (ImGui::Begin("Assistant###agent", nullptr, pflags))
-        ui::drawAgentPanel(s);
-    ImGui::End();
+    // Pinned glass Copilot column over the viewport's right edge (replaces "Assistant###agent").
+    ui::drawRightPane(s);
 
-    // T-F16 preview pane: closable, docked in the lower-right task-pane slot (layout.cpp).
-    // Focus is requested BEFORE Begin (a hidden dock tab's Begin returns false, so an in-window
+    // T-F16 preview pane: closable. T-G23 removed the docked rightBottom slot (overlay layout), so it
+    // now floats — anchored top-right inside the overlay band, left of the Copilot column, on first
+    // open. Focus is requested BEFORE Begin (a hidden window's Begin returns false, so an in-window
     // SetWindowFocus would never run). Zero footprint while closed.
     if (*ui::previewPaneOpen()) {
         if (ui::previewTakeFocusRequest()) ImGui::SetNextWindowFocus();
+        ui::setNextCommandDialogPlacement();
         if (ImGui::Begin("Preview###preview", ui::previewPaneOpen(), pflags))
             ui::drawPreviewPane(s);
         ImGui::End();

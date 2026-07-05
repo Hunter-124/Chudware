@@ -1,5 +1,6 @@
 // Design Table panel — ported from host/src/ui/design_table_panel.cpp (C5).
 #include "ui/design_table_panel.h"
+#include "ui/layout.h"   // T-G23: setNextCommandDialogPlacement (overlay-band float anchor)
 
 #include <algorithm>
 #include <cstdio>
@@ -261,6 +262,7 @@ void DesignTablePanel::buildCandidates(AppState& st, std::vector<Candidate>& out
 
 void DesignTablePanel::draw(AppState& st) {
     if (!showDesignTablePanel()) return;
+    ui::setNextCommandDialogPlacement();   // T-G23: float in overlay band (docked slot removed)
     if (!ImGui::Begin("Design Table", &showDesignTablePanel())) { ImGui::End(); return; }
 
         ImVec4 accentCol = c5::accent(); accentCol.w = 1.f;

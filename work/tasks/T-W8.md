@@ -79,3 +79,21 @@ integration target for this task. Changes vs the original spec:
 - Acceptance = the capability working through the IN-APP path (services/agent hosts,
   loop.py / dag runner / pipeline), proven by python tests. graphify update . still
   required (that serves our own agents).
+
+## Progress log
+- 2026-07-05 02:57 UTC [sonnet-ferrow] DONE (sonnet-ferrow). Branch task/T-W8-failure-cards pushed.
+
+Built:
+- services/agent/advisor/failures.py — all 8 failure classes produce §5-compliant aicad.failure/1 cards. Deterministic fc_id from hash(class+where+why) — budget-reset proof. Verbatim-splice policy: regen_diagnose card.diagnosis embedded as-is (handles dataclass or dict), dfm/cam/sim tool results embedded verbatim. record_attempt() enforces one-candidate-per-attempt + predicted/measured recording. budget_exhausted() + escalate() fire at exactly budget exhaustion (harness-owned, never model). Both ask_user (advisory blocker item with all attempt evidence) and dag_replan (splice via services/dag/replan.dag_replan with bounded retry back-edge) wired; graceful fallback to ask_user when dag params absent. Cards + attempts written as ledger "artifact" events.
+- services/agent/advisor/engine.py — build_advisory() extended to include failure_cards key: blocker items promoted via promote_advisory_blockers().
+- services/agent/advisor/test_failures.py — 64 tests covering all 8 factories, stable id, one-fix-per-attempt, improved/worse/same/new_failure classification, off-by-one budget, escalation timing, verbatim-splice, promote_advisory_blockers, ledger integration.
+
+Test results: 64 new pass, 0 new failures. Pre-existing failures (issue #16): test_neutral_part_and_message_helpers, test_h7_shadow::test_offline_mode_refuses_cloud_provider — both unchanged.
+
+Full suite: `287 passed, 1 skipped, 2 failed (pre-existing)` via `.venv-mcp/bin/python -m pytest services/agent -q --ignore=services/agent/test_loop_mock.py`
+
+graphify update . run — 30000 nodes, 61183 edges, 1418 communities.
+
+Tool shape sources used: real dfm_check ("checks" not "findings"), cam_simulate SimResult struct (gouges/rapid_collisions/holder_collisions), doc_sketch_health "conflicting" key (not conflicting_tags). All confirmed from source by subagent.
+
+No deviations from spec. fixer.yaml escalation_policy.max_attempts=1 (per-engagement, single-shot) is distinct from card budget.max_attempts=3 (outer harness loop) — both honored per advisor guidance.

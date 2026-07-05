@@ -322,6 +322,8 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantMissionControl = eq("mission_control");  // T-F17
     cfg.wantAgentInspector      = eq("agent_inspector");        // T-W17
     cfg.wantAgentInspectorEmpty = eq("agent_inspector_empty");  // T-W17
+    cfg.wantAgentInspectorFailure    = eq("agent_inspector_failure");    // T-W17
+    cfg.wantAgentInspectorDelegation = eq("agent_inspector_delegation"); // T-W17
     cfg.wantWatchGrid           = eq("watch_grid");             // T-W17
     cfg.wantAgentSettings       = eq("agent_settings");         // T-W17
     cfg.wantAgentSettingsError  = eq("agent_settings_error");   // T-W17
@@ -407,13 +409,19 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantMissionControl) ui::openMissionControlPanel();  // T-F17
 
     // T-W17 — seed from committed fixture run dirs immediately (no worker needed).
-    if (cfg.wantAgentInspector || cfg.wantAgentInspectorEmpty) {
+    if (cfg.wantAgentInspector || cfg.wantAgentInspectorEmpty ||
+        cfg.wantAgentInspectorFailure || cfg.wantAgentInspectorDelegation) {
         std::string fx;
         if (findFixturesDir(fx)) {
             const std::string run = fx + (cfg.wantAgentInspectorEmpty ? "/runs/r_empty"
                                                                       : "/runs/r_demo_bracket");
             ui::openAgentInspectorPanel();
             ui::loadInspectorRunDir(run);
+            // Failure/audit render only for the fixer turn (index 2); the
+            // Delegation tab body renders only when active — force each so the
+            // shots actually exercise those surfaces.
+            if (cfg.wantAgentInspectorFailure)    ui::inspectorShotSelectTurn(2);
+            if (cfg.wantAgentInspectorDelegation) ui::inspectorShotForceDelegationTab();
             std::printf("agent_inspector: loaded run dir %s\n", run.c_str());
         } else {
             std::printf("agent_inspector: fixtures dir not found\n");

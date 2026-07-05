@@ -31,6 +31,7 @@ namespace {
 bool gOpen = false;
 ui::PanelScaffoldState gScaffoldState;
 aicad::ui::AgentInspectorModel gModel;
+bool gForceDelegationTab = false;   // one-shot: open Delegation tab (shot use)
 
 using aicad::ui::InspectorState;
 using nlohmann::json;
@@ -520,7 +521,10 @@ void drawContent(app::AppState&) {
 
     if (ImGui::BeginTabBar("##inspectorTabs")) {
         if (ImGui::BeginTabItem("Turns")) {
-            const float listH = ImGui::GetContentRegionAvail().y * 0.42f;
+            // Turn list gets a modest slice; the detail pane (verbatim context,
+            // preflight table, failure card + attempt history, audit verdicts)
+            // gets the majority so a selected turn's full record is visible.
+            const float listH = ImGui::GetContentRegionAvail().y * 0.32f;
             ImGui::BeginChild("##turnList", ImVec2(0, listH), ImGuiChildFlags_None);
             drawTurnList();
             ImGui::EndChild();
@@ -529,7 +533,9 @@ void drawContent(app::AppState&) {
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Delegation")) {
+        ImGuiTabItemFlags delegFlags = gForceDelegationTab ? ImGuiTabItemFlags_SetSelected : 0;
+        if (ImGui::BeginTabItem("Delegation", nullptr, delegFlags)) {
+            gForceDelegationTab = false;  // one-shot: honor once, then let the user click freely
             ImGui::BeginChild("##deleg", ImVec2(0, 0), ImGuiChildFlags_None);
             drawDelegationTree();
             ImGui::EndChild();
@@ -562,5 +568,11 @@ void drawAgentInspectorPanel(app::AppState& s) {
 
 void openAgentInspectorPanel() { gOpen = true; }
 bool* agentInspectorPanelOpen() { return &gOpen; }
+
+void inspectorShotSelectTurn(int turnIndex) {
+    if (turnIndex >= 0 && turnIndex < (int)gModel.turns.size())
+        gModel.selectedTurn = turnIndex;
+}
+void inspectorShotForceDelegationTab() { gForceDelegationTab = true; }
 
 }  // namespace ui

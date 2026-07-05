@@ -31,4 +31,12 @@ bool* agentInspectorPanelOpen();
 // Safe to call repeatedly (re-reads). Malformed/missing → Error/Empty state.
 void loadInspectorRunDir(const std::string& absRunDir);
 
+// Shot helpers so headless captures can exercise every panel surface (the
+// Delegation tab body and the failure-card/audit detail only render when active/
+// selected). Call after loadInspectorRunDir().
+//   - inspectorShotSelectTurn(n): select turn index n (shows its failure/audit).
+//   - inspectorShotForceDelegationTab(): open the Delegation tab this session.
+void inspectorShotSelectTurn(int turnIndex);
+void inspectorShotForceDelegationTab();
+
 }  // namespace ui

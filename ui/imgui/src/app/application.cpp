@@ -395,7 +395,7 @@ void Application::frame() {
         ImGui::SetNextWindowPos(ImVec2(vpi->WorkPos.x + vpi->WorkSize.x * 0.5f,
                                        vpi->WorkPos.y + vpi->WorkSize.y * 0.5f),
                                 ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-        ImGui::SetNextWindowSize(ImVec2(680.f * theme::S(), 720.f * theme::S()), ImGuiCond_Appearing);
+        ImGui::SetNextWindowSize(ImVec2(680.f * theme::S(), 860.f * theme::S()), ImGuiCond_Appearing);
         if (ImGui::Begin("Agent Inspector###agent_inspector", ui::agentInspectorPanelOpen(), pflags))
             ui::drawAgentInspectorPanel(s);
         ImGui::End();

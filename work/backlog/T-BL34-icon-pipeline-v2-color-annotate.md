@@ -2,8 +2,8 @@
 id: T-BL34
 title: Icon pipeline v2 — color the preview-render models + annotate operation intent over the tiles
 workstream: backlog
-owner: sonnet-ivo
-status: doing
+owner: unassigned
+status: todo
 priority: 3
 lane: app-gui
 kind: overhaul

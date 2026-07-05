@@ -3,7 +3,7 @@ id: T-W8
 title: Failure cards and bounded fixer loop - unified diagnosis with candidate fixes and escalation
 workstream: W
 owner: sonnet-ferrow
-status: review
+status: done
 branch: task/T-W8-failure-cards
 depends_on: [T-W5]
 lane: ai-copilot

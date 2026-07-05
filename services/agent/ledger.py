@@ -258,8 +258,10 @@ class Ledger:
         })
 
     def answer_question(self, actor: str, question_id: str, answer: str) -> dict:
+        # Do NOT send text=None — that would null the stored question text via _apply's
+        # existing.update(payload).  Only send the fields being changed.
         return self.append(actor, "question", {
-            "id": question_id, "text": None,
+            "id": question_id,
             "status": "answered", "answer": answer, "blocking": False,
         })
 
@@ -411,14 +413,32 @@ def _render_artifacts(artifacts: list[dict]) -> list[str]:
     return _section_lines("Artifacts", entries)
 
 
+def _count_entries(state: dict) -> dict[str, int]:
+    """Return the data-entry count for each section (used in dropped footer)."""
+    open_qs = [q for q in state.get("questions", []) if q.get("status") == "open"]
+    return {
+        "brief": 1 if (state.get("brief", {}).get("title") or
+                       state.get("brief", {}).get("summary")) else 0,
+        "dimensions": len(state.get("dimensions", [])),
+        "questions": len(open_qs),
+        "decisions": len(state.get("decisions", [])),
+        "requirements": len(state.get("requirements", [])),
+        "stage_log": len(state.get("stage_log", [])),
+        "artifacts": len(state.get("artifacts", [])),
+    }
+
+
 def ledger_render(ledger: "Ledger", budget_tokens: int) -> str:
     """Produce a compact, deterministic text rendering of the ledger state.
 
     Priority order (contract §2): brief → active-stage dimensions → open questions
     → decisions → requirements → stage_log → artifacts.
 
-    Truncation is whole-entry only; a trailing ``(+N more entries)`` line is
-    appended when sections are dropped.  Never truncates mid-entry.
+    Truncation is whole-entry only with strict priority: once a section does not fit,
+    all lower-priority sections are also dropped (higher priority always beats lower
+    priority — we never skip a large high-priority section to include a smaller
+    lower-priority one).  A trailing ``(+N more entries)`` footer counts total
+    data entries that were not rendered.  Never truncates mid-entry.
     """
     budget_chars = budget_tokens * _CHARS_PER_TOKEN
     state = ledger.state
@@ -426,7 +446,7 @@ def ledger_render(ledger: "Ledger", budget_tokens: int) -> str:
 
     header = f"[LEDGER schema={SCHEMA} run_id={ledger.run_id}]\n"
 
-    # Build sections in priority order
+    # Build sections in priority order — order is the contract, do not reorder.
     sections: list[tuple[str, list[str]]] = [
         ("brief", _render_brief(state.get("brief", {}))),
         ("dimensions", _render_dimensions(state.get("dimensions", []), active_stage)),
@@ -436,23 +456,31 @@ def ledger_render(ledger: "Ledger", budget_tokens: int) -> str:
         ("stage_log", _render_stage_log(state.get("stage_log", []))),
         ("artifacts", _render_artifacts(state.get("artifacts", []))),
     ]
+    entry_counts = _count_entries(state)
 
     used_chars = len(header)
     output_lines: list[str] = [header]
-    dropped = 0
+    dropped_entries = 0
+    budget_exhausted = False  # once True, all remaining sections are dropped
 
     for section_name, lines in sections:
         section_text = "\n".join(lines)
         if not section_text.strip():
+            continue  # empty section — skip without penalising the budget
+        if budget_exhausted:
+            # Strict priority: once budget is gone, every lower-priority section drops.
+            dropped_entries += entry_counts.get(section_name, 0)
             continue
         if used_chars + len(section_text) + 1 <= budget_chars:
             output_lines.append(section_text)
             used_chars += len(section_text) + 1
         else:
-            dropped += 1
+            # This section doesn't fit — drop it and all lower-priority sections.
+            budget_exhausted = True
+            dropped_entries += entry_counts.get(section_name, 0)
 
-    if dropped:
-        output_lines.append(f"(+{dropped} more entries)")
+    if dropped_entries:
+        output_lines.append(f"(+{dropped_entries} more entries)")
 
     output_lines.append("[/LEDGER]")
     return "\n".join(output_lines)

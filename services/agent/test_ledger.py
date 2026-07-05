@@ -262,12 +262,59 @@ class TestLedgerRender(unittest.TestCase):
         self.assertIn("Requirements", out)
 
     def test_render_whole_entry_truncation(self):
-        """When budget is tight, dropped sections show a (+N more entries) line."""
+        """When budget is tight, dropped sections show a (+N more entries) line with entry count."""
         ledger = self._make_populated_ledger()
-        # Very tight budget — only brief should fit
+        # Very tight budget — only brief should fit; everything else dropped
         out = ledger_render(ledger, 50)
-        if "(+" in out:
-            self.assertIn("more entries", out)
+        # At this budget decisions/dimensions/questions/requirements/stage_log/artifacts drop
+        self.assertIn("(+", out)
+        self.assertIn("more entries", out)
+        # The count must be a positive integer
+        import re
+        m = re.search(r"\(\+(\d+) more entries\)", out)
+        self.assertIsNotNone(m, f"Expected (+N more entries) in: {out!r}")
+        self.assertGreater(int(m.group(1)), 0)
+
+    def test_render_strict_priority_no_skip_ahead(self):
+        """CRITICAL: if a high-priority section overflows, lower-priority sections are also dropped.
+
+        Build a ledger where decisions is large (many entries) and artifacts is tiny (1 entry).
+        Set a budget that fits: header + brief + dimensions + questions, but NOT decisions.
+        Verify that artifacts (lower priority than decisions) is also absent from the output,
+        and that the dropped count reflects the dropped entries (decisions + artifacts).
+        """
+        run_id, path = _fresh("priority_strict")
+        ledger = Ledger(run_id, path)
+        # Brief + dimensions + questions will be small
+        ledger.set_brief("human", "Priority test", "short summary", [])
+        ledger.upsert_dimension("foreman", "DIM1", "width", 10.0, "mm",
+                                "fits slot", provenance="user answer")
+        ledger.add_question("human", "Q1", "Material?", blocking=False)
+        # Add many decisions so the Decisions section is large
+        for i in range(20):
+            ledger.add_decision("foreman", f"D{i:02d}", "layout",
+                                f"Decision text number {i} — verbose rationale here",
+                                f"rationale {i}: some engineering justification")
+        # Add ONE tiny artifact (lower priority than decisions)
+        ledger.add_artifact("loop", "render", "art_tiny", "/tmp/x.png", "feature",
+                            note="tiny artifact")
+
+        # Render at a budget that fits header+brief+dims+questions but NOT decisions (20 entries)
+        out = ledger_render(ledger, 200)
+
+        # Decisions section must NOT appear (it was too large)
+        self.assertNotIn("Decision text number", out,
+                         "Decisions section appeared despite being over budget")
+        # Artifacts section must NOT appear either (strict priority: once budget is exhausted,
+        # all lower-priority sections are dropped too — no skip-ahead to fit smaller ones)
+        self.assertNotIn("art_tiny", out,
+                         "Artifacts appeared after Decisions was dropped — priority order violated")
+        # The dropped count must include all 20 decisions + 1 artifact = 21
+        import re
+        m = re.search(r"\(\+(\d+) more entries\)", out)
+        self.assertIsNotNone(m, f"Expected (+N more entries) footer in: {out!r}")
+        self.assertEqual(int(m.group(1)), 21,
+                         f"Expected 21 dropped entries (20 decisions + 1 artifact), got {m.group(1)}")
 
     def test_render_priority_order_brief_first(self):
         """Brief appears before decisions in the output."""
@@ -321,6 +368,20 @@ class TestUpsertHelpers(unittest.TestCase):
         q = ledger.state["questions"][0]
         self.assertEqual(q["status"], "answered")
         self.assertEqual(q["answer"], "Aluminium 6061")
+
+    def test_answer_question_preserves_text(self):
+        """answer_question must not null the original question text (data-loss guard)."""
+        run_id, path = _fresh("q_preserve_text")
+        ledger = Ledger(run_id, path)
+        original_text = "What is the target material hardness?"
+        ledger.add_question("human", "Q2", original_text, blocking=True)
+        ledger.answer_question("foreman", "Q2", "60 HRC per spec sheet")
+        q = ledger.state["questions"][0]
+        # The question text must survive the answer event — not be nulled out
+        self.assertEqual(q["text"], original_text,
+                         f"Question text was nulled after answer_question: got {q['text']!r}")
+        self.assertEqual(q["answer"], "60 HRC per spec sheet")
+        self.assertEqual(q["status"], "answered")
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,30 @@
+# Rung D — authored by the lead, canonical. Fresh context: geometry_plan + linkage_map.
+schema: aicad.playbook/1
+id: ladder_pathway
+stage: layout
+steps:
+  - id: orientation
+    goal: Choose the build orientation and base feature - the decision everything else hangs on.
+    helper_tools: []
+    checklist:
+      - "base feature is the element the datum scheme lives on"
+      - "orientation_rationale states why THIS way up (datum access, sketch plane availability, pattern symmetry)"
+      - ">=1 alternate orientation considered and rejected with a reason"
+    output: {slots: [orientation_rationale: str, alternates_considered: "[{summary, rejected_because}]"]}
+  - id: sequence
+    goal: Order every element into build steps - each step on a plane/face that EXISTS by then.
+    helper_tools: []
+    checklist:
+      - "datums/base first; bosses before the cuts that pierce them; patterns after seeds; shell placed deliberately; fillets/chamfers last in their region"
+      - "every step has why ('bore needs the boss solid to cut into') and risks ([] is allowed but suspicious on cuts)"
+      - "walk your own sequence: does step n's sketch_on exist at step n? every G built exactly once?"
+    output: {slots: [steps: "[{n, op, elements: [G], sketch_on, orientation, why, risks}]"]}
+  - id: handover
+    goal: Final self-check before the council and the compiler see it.
+    helper_tools: []
+    checklist:
+      - "conflicts from rung B all resolved by some step or flagged in defects"
+      - "the pathway compiles in your head to a DAG with no cycles"
+      - "you would hand this to a stranger and they could build the part"
+    output: {slots: [defects: "[]"]}
+exit_gate: [artifact_validates_as_build_pathway, council_build_strategy_if_required]

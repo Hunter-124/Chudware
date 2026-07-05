@@ -1,0 +1,29 @@
+# Rung A — authored by the lead, canonical. Loaded verbatim (aicad.playbook/1).
+schema: aicad.playbook/1
+id: ladder_functions
+stage: spec
+steps:
+  - id: functions
+    goal: State what the part must DO, as verb-noun functions traced to acceptance criteria.
+    helper_tools: [ledger_get]
+    checklist:
+      - "every acceptance criterion is served by >=1 function"
+      - "every function is verb-noun ('transmit torque', 'locate the PCB'), not a shape"
+      - "loads/motions/environments named where the spec implies them"
+    output: {slots: [functions: "[{id: FN, statement, driven_by: [AC]}]"]}
+  - id: features
+    goal: Derive every feature the functions demand - the complete feature manifest.
+    helper_tools: [part_search]
+    checklist:
+      - "every function realized by >=1 feature; every feature serves >=1 function"
+      - "each feature has purpose, interfaces_with, criticality"
+      - "standard parts identified as features ('bearing seat FOR 6202'), not modeled shapes"
+    output: {slots: [features: "[{id: FT, name, purpose, serves: [FN], interfaces_with, criticality}]"]}
+  - id: omissions
+    goal: Walk the standard feature classes and answer yes/no/why for EACH - the forcing function against forgotten features.
+    helper_tools: []
+    checklist:
+      - "all 8 classes answered: mounting, location/alignment, retention, sealing, venting, clearance/service-access, strength/stiffening, manufacturability aids"
+      - "every 'no' has a why; every 'yes' points at an FT id"
+    output: {slots: [omissions_check: "[{class, considered: yes|no, why, ft_refs}]", defects: "input-spec problems found, or []"]}
+exit_gate: [artifact_validates_as_function_map]

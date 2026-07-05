@@ -105,6 +105,17 @@ replan scope=org — the hierarchy serves the mission, not vice versa.
   graphs (aicad.buildgraph/1); the buildgraph validator must pass (missing
   prerequisites are findings, not surprises); role/model assignments come from
   routing.yaml; multi-part missions pre-plan doc leases.
+- DESIGN COGNITION LADDER (contract §22; added 1.4): for each part, Phase 3
+  climbs the four-rung ladder — function_map (every feature the functions
+  demand, with the 8-class omissions checklist), geometry_plan (shapes that
+  realize each feature, params symbolic-with-basis), linkage_map (datums,
+  linked-dimension equations, constraint schedules), build_pathway (ordered
+  steps, orientation, sketch planes). EACH RUNG IS A FRESH CONTEXT — a small
+  model reasons about one abstraction level at a time; deterministic
+  validators bounce incomplete rungs (max 2); the pathway compiles losslessly
+  into the buildgraph. This is the punch-through-the-abstraction-layers
+  mechanism: mandatory at deliberation=full (local), optional at minimal
+  (frontier may emit rung D directly; validators still run).
 - BUILD-STRATEGY COUNCIL (contract §19; added 1.3): before a part's build graph
   is ratified, its department convenes the four-seat council (manufacturing /
   tolerancing / fitment / simplicity — authored personas, run as cheap ponder

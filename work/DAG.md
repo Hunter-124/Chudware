@@ -163,16 +163,17 @@ graph TD
     T_W19["T-W19: Mission pipeline glue - intake/spec/plan/build phase machine, manifest validator, replan routing"]:::todo
     T_W2["T-W2: Sketch completion suite - auto-coincident pass, constraint advisor, sketch_health"]:::done
     T_W20["T-W20: MCP surface catch-up batch - register/document all Pillar 20 tools for external clients (deferred)"]:::todo
-    T_W21["T-W21: Trigger-based context injection - keyword/action/event triggers with context packs and prerun calcs"]:::todo
+    T_W21["T-W21: Trigger-based context injection - keyword/action/event triggers with context packs and prerun calcs"]:::doing
     T_W22["T-W22: Organization runtime - departments, managers, channels, worker requests (aicad.org/1)"]:::todo
     T_W23["T-W23: Council primitive + build-strategy council - seated deliberation with recorded dissents"]:::todo
-    T_W24["T-W24: Dimension derivation tree, invalidation impact walker, linked-dimension helper (eq_set binding)"]:::todo
+    T_W24["T-W24: Dimension derivation tree, invalidation impact walker, linked-dimension helper (eq_set binding)"]:::doing
+    T_W25["T-W25: Design cognition ladder runtime - fresh-context rung executor, inter-rung validators, buildgraph compiler"]:::todo
     T_W3["T-W3: ISO 286 fits and tolerance data + fit_calc + suggest_dimension_scheme"]:::done
     T_W4["T-W4: Engineering calculator registry - bolted joints, threads, press fits, beams, walls + geometry auto-prefill"]:::done
     T_W5["T-W5: Advisory engine (foreman) - stage tracking, check batteries, advisory injection"]:::done
     T_W6["T-W6: Feeds/speeds and machining data tables + CAM advisor integration"]:::done
     T_W7["T-W7: Role cards and playbooks v1 - ten predefined roles with rich prompts, scoped tools, structured handoffs"]:::doing
-    T_W8["T-W8: Failure cards and bounded fixer loop - unified diagnosis with candidate fixes and escalation"]:::doing
+    T_W8["T-W8: Failure cards and bounded fixer loop - unified diagnosis with candidate fixes and escalation"]:::review
     T_W9["T-W9: Simulation verification advisor - pre-sim sanity, hand-calc cross-check, margin-policy narration"]:::doing
   end
   subgraph WS_backlog["workstream backlog"]
@@ -376,6 +377,7 @@ graph TD
   T_W7 --> T_W22
   T_W14 --> T_W22
   T_W7 --> T_W23
+  T_W7 --> T_W25
   T_W3 --> T_W4
   T_W1 --> T_W5
   T_W1 --> T_W7

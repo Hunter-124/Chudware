@@ -1,7 +1,7 @@
-# contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.3)
+# contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.4)
 
 Frozen 2026-07-04; §10–§15 added same day (1.0 → 1.1), §16–§17 (1.1 → 1.2),
-§18–§21 org layer (1.2 → 1.3). All bumps additive. Companion to
+§18–§21 org layer (1.2 → 1.3), §22 design cognition ladder (1.3 → 1.4). All bumps additive. Companion to
 `docs/ADVISOR_ARCHITECTURE.md` (Pillar 20) and `docs/COPILOT_MISSION_PIPELINE.md`
 (pipeline operation).
 
@@ -607,3 +607,69 @@ Rules:
   auto-executed; linked dimensions typically downgrade "rebuild" to
   "recompute + reverify" (the equation already propagated the value).
 - The impact walker is deterministic and unit-tested; no LLM in the walk.
+
+## §22 Design cognition ladder (`aicad.ladder/1`)
+
+The guided multi-step thinking chain for turning a spec into a buildable plan.
+Each rung runs in a FRESH context (only the previous rung's typed artifact + a
+scoped ledger slice — never the full conversation), so a small model reasons
+about exactly ONE abstraction level at a time. Deterministic validators sit
+between rungs; councils critique at the marked checkpoints. Rung templates are
+authored playbooks (services/agent/playbooks/ladder_*.yaml — canonical, loaded
+verbatim); the design_thinker role executes them.
+
+```
+spec ─A→ function_map ─B→ geometry_plan ─C→ linkage_map ─D→ build_pathway ─compile→ buildgraph ─E→ execution
+         (what it DOES,    (what SHAPES     (how geometry   (what ORDER, what      (T-W15)        (Phase 4)
+          what FEATURES)    realize each     REFERENCES      orientation, which
+                            feature)         geometry)       plane each sketch on)
+```
+
+Rung artifacts (all ledger events, all replayable):
+
+A. `function_map`: {functions: [{id: FN1, statement: "verb-noun, e.g. transmit
+   torque from shaft to arm", driven_by: [AC ids]}], features: [{id: FT1,
+   name, purpose, serves: [FN ids], interfaces_with: [], criticality:
+   critical|important|nice}], omissions_check: [{class, considered: yes|no,
+   why}]} — omissions_check MUST cover the standard classes: mounting,
+   location/alignment, retention, sealing, venting, clearance/service access,
+   strength/stiffening, manufacturability aids (draft/fillets/chamfers). A
+   feature manifest without the checklist is invalid: the checklist is the
+   forcing function for "think about ALL the major features."
+
+B. `geometry_plan` (fresh context: function_map + envelope/interfaces only):
+   {elements: [{id: G1, kind: primitive|profile_op, op: extrude|revolve|loft|
+   sweep|hole|pattern|shell|fillet..., description, params: [{name, basis:
+   "derived: bore_d + 2*wall" | "spec: DIM7" | "free"}], realizes: [FT ids],
+   orientation_hint}], shared: [G ids serving multiple features], conflicts:
+   [{pair: [G,G], overlap_concern, resolution_needed}]}. Validator: every FT
+   covered by ≥1 element; every element realizes ≥1 FT (orphan geometry is a
+   finding); conflicts must carry resolutions before rung D.
+
+C. `linkage_map` (fresh context: geometry_plan only): {datums: [{id, kind:
+   plane|axis|point, defined_by, why}], links: [{from: "G3.width", to:
+   "G1.bore_d", relation: "= bore_d + 2*wall", why}] (these become §21 linked
+   dimensions), constraint_plans: per profile the geometric-then-driving
+   schedule, driving_dims: [{name, owner, derived_from}], reference_tree:
+   parent/child geometry refs}. Validator: no circular links; every driving
+   dim has owner + basis; every datum used ≥1 time; link expressions parse.
+
+D. `build_pathway` (fresh context: geometry_plan + linkage_map): {steps:
+   [{n, op, elements: [G ids], sketch_on: datum/face ref, orientation, why:
+   "why this step here", risks: []}], orientation_rationale, alternates_
+   considered: [{summary, rejected_because}]}. Validator: every element built
+   exactly once; datums/faces exist before use (walk the sequence); compiles
+   losslessly into aicad.buildgraph/1 (steps → nodes, why → edge whys).
+
+E. Execution: existing Phase 4 machinery. Workers receive the buildgraph node
+   plus the SLICE of the ladder artifacts their node cites — never the whole
+   ladder.
+
+Rules: rung outputs are grammar-constrained on local tiers; a validator bounce
+returns to the SAME rung with the finding (max 2 bounces, then council or
+escalate); the build-strategy council (§19) critiques rung D output before
+compilation — seats receive geometry_plan + build_pathway, not the chat. The
+ladder is mandatory at deliberation=full (local), optional at minimal
+(frontier models may emit rung D directly — validators still run). Rungs may
+run as ponder delegations of one design_thinker or as separate delegations —
+identical contexts either way (fresh-context rule is what matters).

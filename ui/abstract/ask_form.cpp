@@ -64,6 +64,7 @@ AskForm parseAskBatch(const std::string& batchJson) {
         f.suggestedJson = q.contains("suggested") ? q["suggested"].dump() : std::string("null");
 
         if (kind == AskFieldKind::Choice) {
+            f.multi = q.value("multi", false);
             auto oit = q.find("options");
             if (oit != q.end() && oit->is_array()) {
                 for (const auto& o : *oit) {
@@ -74,6 +75,9 @@ AskForm parseAskBatch(const std::string& batchJson) {
                         f.options.push_back(o.get<std::string>());
                 }
             }
+        }
+        if (kind == AskFieldKind::Text) {
+            f.multiline = q.value("multiline", false);
         }
 
         form.fields.push_back(std::move(f));
@@ -108,6 +112,15 @@ std::string buildAnswersJson(const AskForm& form,
                                                            : nlohmann::json::array({raw})}};
             break;
         case AskFieldKind::Choice:
+            if (f.multi) {
+                // multi-select: rawValues[id] is a JSON array string (e.g. `["a","b"]`)
+                // produced by the inline card; parse it back to a proper JSON array.
+                nlohmann::json arr = nlohmann::json::parse(raw, nullptr, false);
+                value = (arr.is_array()) ? arr : nlohmann::json::array();
+            } else {
+                value = raw;
+            }
+            break;
         case AskFieldKind::Text:
         default:
             value = raw;

@@ -68,4 +68,88 @@ conversation and that answers round-trip back to the agent.
   channel is unclear, write work/questions/T-BL40.md with the concrete seam question rather
   than guessing. Do NOT change the frozen interaction contract without a question file.
 
+## Audit findings (sonnet-pell, 2026-07-04)
+
+### What EXISTS today
+
+**Contract layer** (`contracts/interaction.md`) — Fully frozen. Five question kinds
+(choice, dimension, text, file_request, approval), typed `suggested` defaults, batch
+envelope (≤4 questions), answer envelope with provenance, scope=run/doc persistence,
+eight transports including the in-app dialog.
+
+**Python core** (`services/agent/interaction.py`) — Complete: `Question`, `QuestionBatch`,
+`ask_user()`, `CLITransport`, `InAppTransport`, `MCPElicitationTransport`, `FileLedger`,
+`MemoryLedger`, `_default_doc_ledger()`. Normalization, provenance, replay all
+implemented. `InAppTransport` accepts a `provider` callback.
+
+**MCP tool** (`services/mcp/interaction_tools.py`) — `ask_user` tool registered.
+Uses `_elicit_raw()` for MCP elicitation. For in-app, builds `raw` from elicitation
+results and wraps in `InAppTransport(lambda b: raw)` — but that lambda returns
+whatever MCP collected, NOT the GUI state machine answer.
+
+**Abstract UI model** (`ui/abstract/ask_form.h` / `ask_form.cpp`) — `AskForm`,
+`AskField`, `parseAskBatch()`, `buildAnswersJson()` all implemented.
+**Gap: `AskField` lacks `multi` (choice multi-select) and `multiline` (text open-ended)
+fields** — `parseAskBatch` silently drops them, so multi-select and multiline cannot
+render or serialize.
+
+**ImGui modal** (`ui/imgui/src/ui/ask_dialog.cpp`) — `drawAskDialog()` is a
+`BeginPopupModal` (blocking modal, NOT inline). Reads `s.pendingAskBatchJson`,
+renders all five kinds with pre-filled defaults, on Submit writes `s.askAnswersJson`.
+**Does NOT meet DoD** (modal not inline). Field-render switch exists and can be
+factored into a shared helper. **Gap: choice Combo is single-select only (no checkboxes
+for multi=true); text InputText is single-line only (no InputTextMultiline for
+multiline=true).**
+
+**AppState** (`ui/imgui/src/app/app_state.h`, lines 136-138) — Has
+`pendingAskBatchJson`, `askAnswersJson`, `askDialogOpen` fields.
+
+**Agent event loop** (`app_state.cpp`, `tickDemoAgent`):
+- Real path: `startDemoAgent` → `engine.startAgent()` → poll `engine.agentDone()` →
+  `engine.takeAgentResult()`. Result event loop (line 437) handles only `run_note`.
+  **No `ask_question` event handler; `pendingAskBatchJson` is never written.**
+- Demo path: scripted `demoStep` state machine. No question support.
+
+**Scenario harness** (`ui/imgui/src/ui/scenarios.cpp`) — Headless screenshot scenarios.
+Push `UserMsg`, `AssistantMsg`, `Plan`, `Thinking` blocks. **No question scenario.**
+
+### What is MISSING
+
+1. **`BlockKind::Question` does not exist** — no inline question card in the transcript.
+   Need to add `Question` to the enum, add parsed question data to `AgentBlock`, add
+   `drawQuestionCard()`, and handle it in `drawBlock`.
+
+2. **`AskField` missing `multi` and `multiline`** — must add fields, update
+   `parseAskBatch()` and `buildAnswersJson()` (multi-select serializes as `[value]`
+   array per contract §1).
+
+3. **No producer of `pendingAskBatchJson` during a real run** — `tickDemoAgent`'s
+   result-event loop does not handle `ask_question` events. Need to write
+   `pendingAskBatchJson` when an `ask_question` event arrives from the engine, and
+   suspend run-completion until `askAnswersJson` is populated.
+
+4. **No consumer of `askAnswersJson`** — nothing reads it to unblock the agent.
+   Need a per-frame check: when `askAnswersJson` is freshly set, feed it back to the
+   engine and resume.
+
+5. **Choice multi-select not rendered** — need checkbox list for `multi=true`.
+   `FieldState.choiceIdx` is scalar; need a bool-array for multi.
+
+6. **Text open-ended not rendered** — need `InputTextMultiline` for `multiline=true`.
+
+7. **No screenshot scenario for question widgets** — need question scenarios for
+   headless screenshots (light + dark, each widget type).
+
+### Round-trip mechanism
+
+The `pendingAskBatchJson` / `askAnswersJson` handshake is the live mechanism (not
+orphaned). The producer→consumer chain to add:
+- **Producer**: `tickDemoAgent` result-event loop handles `ask_question` → sets
+  `s.pendingAskBatchJson`, marks run NOT done yet.
+- **Consumer**: per-frame check in `tickDemoAgent`: if `!askAnswersJson.empty()` and
+  we are waiting for an answer → clear it, feed answers back to engine, mark done.
+- **Demo proof**: scenario harness pushes `BlockKind::Question` blocks directly with
+  a pre-built AskForm, captures screenshots. Satisfies the render proof.
+- **No contract change required.** All gaps are rendering + wiring gaps.
+
 ## Progress log

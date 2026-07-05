@@ -220,7 +220,11 @@ def run(
 
     # Foreman advisory pass (T-W5, §9.1): run the stage battery over the node's doc
     # and attach the rendered block for the next node's context pack.  Best-effort.
-    adv_block = _run_advisory(node_type, doc_id, seq=int(elapsed_ms) & 0xFFFF)
+    # NOTE: unlike the loop.py seam, the DAG path has no run_id/ledger handle here,
+    # so DAG-path advisories are injected but NOT yet logged to the ledger event
+    # stream — offline replay of DAG-injected blocks (§3/§9.4) is deferred until a
+    # ledger handle is threaded through the context pack (tracked for T-W19 glue).
+    adv_block = _run_advisory(node_type, doc_id, seq=retry_remaining)
     if adv_block:
         output_state["advisory"] = adv_block
 

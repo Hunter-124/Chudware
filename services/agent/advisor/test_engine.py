@@ -305,3 +305,80 @@ def test_loop_injects_advisory_block(tmp_path, monkeypatch):
     assert "[ADVISORY" in joined, "advisory block was not injected into the loop messages"
     assert "rebuild" in joined
     assert "regen_diagnose" in joined            # helper tool advertised
+
+
+# ---------------------------------------------------------------------------
+# dag node runner injection — output_state["advisory"] populated (DoD: both hosts)
+# ---------------------------------------------------------------------------
+
+def _fake_overlap_rpc(method, **kw):
+    # The design node runs the FEATURE battery ([rebuild, feature_overlap]) — NOT
+    # interference — so the fixture must return an overlap to produce a finding.
+    if method == "doc_eval_feature_overlap":
+        return {"overlaps": [{"summary": "F2 swallowed by F1",
+                              "classification": "swallowed",
+                              "features": ["F1", "F2"]}]}
+    return {}
+
+
+def test_node_runner_injects_advisory(monkeypatch):
+    from services.dag import node_runner
+    monkeypatch.setattr(adapters, "_default_rpc", lambda: _fake_overlap_rpc)
+    monkeypatch.setenv("AI_CAD_ADVISOR", "1")
+
+    class _R:
+        stop_reason = "confirmed"
+        success = True
+        final_code = None
+        result = None
+
+    node = {"id": "n1", "type": "design", "name": "build"}
+    ctx = {"node_inputs": {"doc_id": "doc1"}, "retry_remaining": 1}
+    verdict, out = node_runner.run(node, ctx, agent_fn=lambda req, cp: _R())
+    assert verdict == "done"
+    assert "[ADVISORY" in out.get("advisory", ""), "DAG node did not inject an advisory"
+    assert "swallowed" in out["advisory"] or "reorder" in out["advisory"]
+
+
+def test_node_runner_no_doc_no_advisory(monkeypatch):
+    # A node without a doc_id must not attach an advisory (no doc to check).
+    from services.dag import node_runner
+    monkeypatch.setattr(adapters, "_default_rpc", lambda: _fake_overlap_rpc)
+
+    class _R:
+        stop_reason = "confirmed"
+        success = True
+        final_code = None
+        result = None
+
+    node = {"id": "n2", "type": "design", "name": "build"}
+    ctx = {"node_inputs": {}, "retry_remaining": 1}
+    _, out = node_runner.run(node, ctx, agent_fn=lambda req, cp: _R())
+    assert "advisory" not in out
+
+
+# ---------------------------------------------------------------------------
+# advise() MCP tool — on-demand battery over a doc
+# ---------------------------------------------------------------------------
+
+def test_advise_tool_returns_block(monkeypatch):
+    monkeypatch.setattr(adapters, "_default_rpc", lambda: _fake_rpc_two_body_bore_shaft)
+    from services.mcp import advisor_tools
+
+    captured = {}
+
+    class _MCP:
+        def tool(self):
+            def deco(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return deco
+
+    advisor_tools.register_advisor_tools(_MCP())
+    r = captured["advise"]("doc1", stage="assembly")
+    assert r["ok"] is True
+    assert "[ADVISORY" in r["block"]
+    assert r["has_blocker"] is True              # interference on the doc path gates exit
+    # unknown stage rejected
+    bad = captured["advise"]("doc1", stage="nonsense")
+    assert not bad["ok"]

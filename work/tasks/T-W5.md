@@ -64,12 +64,36 @@ the hot path.
 
 ## Definition of done
 
-- [ ] Stage inference + per-stage batteries + exit gates per contract §1
-- [ ] aicad.advisory/1 items with computed candidate_fixes for interference/overlap/
-      open-profile/rebuild classes
-- [ ] Budgeted rendering with §9 precedence + no silent truncation
-- [ ] Injection live in loop.py AND dag node runner behind default-on flag
-- [ ] advise/stage_set/advisory_dispute registered; tests pass; instructions updated
+- [x] Stage inference + per-stage batteries + exit gates per contract §1
+      (services/agent/advisor/stages.py)
+- [x] aicad.advisory/1 items with computed candidate_fixes for interference/overlap/
+      open-profile/rebuild classes (engine.py; interference→fit_calc on the doc path,
+      heuristic on the loop path where no diameters exist — §3-compliant)
+- [x] Budgeted rendering with §9 precedence + no silent truncation (render.py)
+- [x] Injection live in loop.py AND dag node runner behind default-on AI_CAD_ADVISOR
+- [x] advise/stage_set/advisory_dispute registered; tests pass (19 new, 223 agent
+      suite pass; 2 pre-existing unrelated failures documented below)
+
+## Notes / deferrals (opus-hale, 2026-07-04)
+
+- Loop.py has no doc_id (build123d-code path): only res.fit (interference) +
+  res.error (rebuild) fire there. Interference on the loop path carries NO
+  cylindrical-face diameters (kernel _fit_report gives {a,b,volume}), so the
+  flagship interference→fit_calc computed fix runs on the DOC path (advise /
+  DAG nodes, where doc_eval_interference can surface bore/shaft Ø + feature id).
+  On the loop path the interference item stays §3-compliant via a heuristic
+  move/resize fix + fit_calc advertised as a helper. Full stage vocabulary +
+  batteries are defined in stages.py regardless (T-W7 / pipeline cite them).
+- DAG-path advisories are injected (output_state["advisory"]) but NOT yet logged
+  to the ledger — node_runner has no run_id/ledger handle. Offline replay of
+  DAG-injected blocks (§3/§9.4) is deferred to the T-W19 pipeline glue that
+  threads a ledger handle through the context pack. Loop.py advisories ARE logged.
+- Pre-existing agent-suite failures (confirmed on clean master via stash+compare,
+  204/2 clean → 223/2 with T-W5): test_providers_conformance::
+  test_neutral_part_and_message_helpers and test_h7_shadow offline-mode
+  (order-dependent pollution; passes in isolation on clean master). Not T-W5.
+  test_loop_mock.py has a pre-existing collection error (missing sample path in
+  the worktree checkout) — also not T-W5.
 
 ## AI hints
 

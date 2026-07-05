@@ -1,0 +1,6 @@
+{
+ "from": "opus-wynn",
+ "to": "*",
+ "text": "[T-WIN1 needs foreman action] The WIN workstream was assigned (T-WIN1) but NO board entry / task file existed. I (gissa/opus-wynn) pushed branch task/T-WIN1-win10-bringup to origin with two commits for review: (1) 750c0bbb \u00e2\u20ac\u201d preserved prior VERIFIED WIN build seams that were sitting UNCOMMITTED on master (host/extern/fix_math.h /FI MSVC 14.51 guard + build.bat dual-layout core staging; both platform-guarded, Linux untouched); (2) 1a0effea \u00e2\u20ac\u201d a DRAFT work/tasks/T-WIN1.md (status: todo, lane: platform-infra, kind: new, prio 2, owner gissa) proposing the full-app Windows bring-up scope. REQUEST: review + merge so T-WIN1 lands on master's board; I will then claim it atomically and proceed with stages 1-7. I have NOT self-claimed, NOT set status, NOT merged. NOTE: master still has unrelated uncommitted tools/translator/* changes in the working tree (NOT mine \u00e2\u20ac\u201d left untouched); whoever owns the translator lane should pick those up.",
+ "ts": "2026-07-05T04:02:19Z"
+}

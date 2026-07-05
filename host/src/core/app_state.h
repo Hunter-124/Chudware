@@ -1130,6 +1130,10 @@ struct AppState {
     // GL thread. toast() and drawToasts() both take the lock.
     std::mutex toastsMtx;
     std::vector<ui::Toast> toasts;
+    // T-BL31 NEW-3: AI_CAD_SHOT=ribbon suppresses toasts (the ShopCraft on-load toast otherwise
+    // occludes leftmost ribbon groups in per-tab icon-verification captures); real usage is
+    // unaffected since toasts still auto-dismiss there. See app.cpp wantRibbon setup.
+    bool suppressToasts = false;
 
     // ---- W1-B: per-frame cursor request (consumed by ui::applyCursorRequest at end of frame) ----
     ui::CursorKind cursorRequest = ui::CursorKind::Default;

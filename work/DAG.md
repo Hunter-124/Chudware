@@ -151,30 +151,40 @@ graph TD
   end
   subgraph WS_W["workstream W"]
     T_W1["T-W1: Design ledger - persistent mission state with budgeted rendering (aicad.ledger/1)"]:::done
-    T_W10["T-W10: Model tier profiles + local-model harness - budget enforcement, GBNF outputs, per-tier prompt sizing"]:::todo
+    T_W10["T-W10: Model tier profiles + local-model harness - budget enforcement, GBNF outputs, per-tier prompt sizing"]:::done
     T_W11["T-W11: Advisory loop end-to-end benchmark - mission through roles+advisories on local and frontier tiers"]:::todo
     T_W12["T-W12: Tool preflight - dry-run plan validation on shadow doc clones (aicad.preflight/1)"]:::done
-    T_W13["T-W13: Overseer plan-audit engine + user change-request routing (aicad.audit/1)"]:::doing
-    T_W14["T-W14: Hierarchical delegation with approval chain + model routing table (aicad.delegation/1, aicad.routing/1)"]:::todo
+    T_W13["T-W13: Overseer plan-audit engine + user change-request routing (aicad.audit/1)"]:::done
+    T_W14["T-W14: Hierarchical delegation with approval chain + model routing table (aicad.delegation/1, aicad.routing/1)"]:::done
     T_W15["T-W15: Build-order DAG planner - part/feature dependency graph with deterministic validation (aicad.buildgraph/1)"]:::done
-    T_W16["T-W16: Multi-document agent workspace - doc leases, parallel part fan-out, per-doc event streams"]:::todo
+    T_W16["T-W16: Multi-document agent workspace - doc leases, parallel part fan-out, per-doc event streams"]:::done
     T_W17["T-W17: Transparency inspector + model-source settings GUI (advisor observability, routing editor, multi-viewport watch)"]:::doing
     T_W18["T-W18: PLM integration - agent milestone checkpoints, ledger-annotated history, change-request links (aicad.plmlink/1)"]:::done
-    T_W19["T-W19: Mission pipeline glue - intake/spec/plan/build phase machine, manifest validator, replan routing"]:::todo
+    T_W19["T-W19: Mission pipeline glue - intake/spec/plan/build phase machine, manifest validator, replan routing"]:::done
     T_W2["T-W2: Sketch completion suite - auto-coincident pass, constraint advisor, sketch_health"]:::done
     T_W20["T-W20: MCP surface catch-up batch - register/document all Pillar 20 tools for external clients (deferred)"]:::todo
-    T_W21["T-W21: Trigger-based context injection - keyword/action/event triggers with context packs and prerun calcs"]:::doing
-    T_W22["T-W22: Organization runtime - departments, managers, channels, worker requests (aicad.org/1)"]:::todo
-    T_W23["T-W23: Council primitive + build-strategy council - seated deliberation with recorded dissents"]:::todo
-    T_W24["T-W24: Dimension derivation tree, invalidation impact walker, linked-dimension helper (eq_set binding)"]:::doing
-    T_W25["T-W25: Design cognition ladder runtime - fresh-context rung executor, inter-rung validators, buildgraph compiler"]:::todo
+    T_W21["T-W21: Trigger-based context injection - keyword/action/event triggers with context packs and prerun calcs"]:::done
+    T_W22["T-W22: Organization runtime - departments, managers, channels, worker requests (aicad.org/1)"]:::doing
+    T_W23["T-W23: Council primitive + build-strategy council - seated deliberation with recorded dissents"]:::done
+    T_W24["T-W24: Dimension derivation tree, invalidation impact walker, linked-dimension helper (eq_set binding)"]:::done
+    T_W25["T-W25: Design cognition ladder runtime - fresh-context rung executor, inter-rung validators, buildgraph compiler"]:::doing
+    T_W26["T-W26: Bundled local inference - llama.cpp packaged with the app + model auto-provisioning (Gemma/Qwen 4B class)"]:::todo
+    T_W27["T-W27: Design gym - graded challenge suite, failure taxonomy, assess-adjust-rerun tuning loop for local models"]:::todo
     T_W3["T-W3: ISO 286 fits and tolerance data + fit_calc + suggest_dimension_scheme"]:::done
     T_W4["T-W4: Engineering calculator registry - bolted joints, threads, press fits, beams, walls + geometry auto-prefill"]:::done
     T_W5["T-W5: Advisory engine (foreman) - stage tracking, check batteries, advisory injection"]:::done
     T_W6["T-W6: Feeds/speeds and machining data tables + CAM advisor integration"]:::done
-    T_W7["T-W7: Role cards and playbooks v1 - ten predefined roles with rich prompts, scoped tools, structured handoffs"]:::doing
-    T_W8["T-W8: Failure cards and bounded fixer loop - unified diagnosis with candidate fixes and escalation"]:::review
-    T_W9["T-W9: Simulation verification advisor - pre-sim sanity, hand-calc cross-check, margin-policy narration"]:::doing
+    T_W7["T-W7: Role cards and playbooks v1 - ten predefined roles with rich prompts, scoped tools, structured handoffs"]:::done
+    T_W8["T-W8: Failure cards and bounded fixer loop - unified diagnosis with candidate fixes and escalation"]:::done
+    T_W9["T-W9: Simulation verification advisor - pre-sim sanity, hand-calc cross-check, margin-policy narration"]:::done
+  end
+  subgraph WS_X["workstream X"]
+    T_X1["T-X1: Browser session service - persistent per-site login profiles + headless fetch"]:::review
+    T_X2["T-X2: Source adapter framework + GrabCAD/TraceParts adapters"]:::doing
+    T_X3["T-X3: part_search federation seam - browser adapters as providers"]:::todo
+    T_X4["T-X4: Datasheet and document acquisition - authenticated-browser fallback"]:::todo
+    T_X5["T-X5: Profile manager UX seam - list/refresh/delete site profiles + expiry detection"]:::todo
+    T_X6["T-X6: Hardening - license register, captcha/2FA failure modes, gated integration tests"]:::todo
   end
   subgraph WS_backlog["workstream backlog"]
     T_BL01["T-BL01: V&V benchmark harness"]:::done
@@ -378,10 +388,18 @@ graph TD
   T_W14 --> T_W22
   T_W7 --> T_W23
   T_W7 --> T_W25
+  T_W25 --> T_W27
+  T_W26 --> T_W27
   T_W3 --> T_W4
   T_W1 --> T_W5
   T_W1 --> T_W7
   T_W5 --> T_W8
   T_W4 --> T_W9
   T_W5 --> T_W9
+  T_X1 --> T_X2
+  T_X2 --> T_X3
+  T_X2 --> T_X4
+  T_X1 --> T_X5
+  T_X3 --> T_X6
+  T_X4 --> T_X6
 ```

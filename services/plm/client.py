@@ -51,6 +51,24 @@ class PLMVaultClient:
         """Best-effort run→project lookup; ``None`` is a valid answer (§7.1)."""
         return self._run_projects.get(run_id)
 
+    def ai_mode_for_project(self, project_id: str) -> str | None:
+        """The project's assist tier (manual|assisted|managed), or None when
+        the project is unknown/unreadable. Used by the PLM bridge to honor the
+        tier before cutting AI entries (T-R3; plan §2)."""
+        project_dir = self._project_paths.get(project_id)
+        if project_dir is None or not Path(project_dir).is_dir():
+            return None
+        try:
+            from services.plm.vault import Vault
+
+            v = Vault.open(project_dir)
+            try:
+                return v.ai_mode()
+            finally:
+                v.close()
+        except Exception:
+            return None
+
     # -- VaultClient Protocol ---------------------------------------------
 
     def is_available(self) -> bool:
@@ -79,13 +97,22 @@ class PLMVaultClient:
         Returns the same success shape as the MCP ``plm_checkpoint`` tool:
         ``{ok, commit, entry}``; ``{ok:false, reason, hint}`` on failure.
         """
-        from services.plm import history
+        from services.plm import assist, history
         from services.plm.vault import Vault, VaultError
 
         project_dir = self._project_paths.get(project_id)
         if project_dir is None or not Path(project_dir).is_dir():
             return {"ok": False, "reason": "invalid_project",
                     "hint": "that project could not be found"}
+
+        # Assist-tier floor (T-R3, plan §2 / contract §8.4): an AI-authored
+        # entry may only be cut when the project opted into AI-managed mode.
+        # Manual buttons (author_kind="user") are always available.
+        if author_kind == "ai":
+            mode = self.ai_mode_for_project(project_id)
+            if not assist.allowed(mode, "auto_checkpoint"):
+                return {"ok": False, "reason": "invalid_mode",
+                        "hint": "AI-managed versioning is turned off for this project"}
 
         author: dict[str, Any]
         ai_block: dict[str, Any] | None

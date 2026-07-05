@@ -248,6 +248,10 @@ def test_release_requires_note(tmp_path):
     _write(tmp_path, "Bracket.step+", _part())
     v = Vault.open(tmp_path)
     try:
+        # T-R3: in assisted/managed tiers an omitted note is drafted
+        # deterministically; the "a release needs a note" rule is enforced
+        # whenever no draft is available — pin the manual tier to prove it.
+        v.set_ai_mode("manual")
         iid = v.status()["items"][0]["item_id"]
         with pytest.raises(VaultError) as e:
             v.release(iid, "")
@@ -405,6 +409,8 @@ def test_client_checkpoint_writes_ai_attribution(tmp_path):
     _write(tmp_path, "Bracket.step+", _part())
     v = Vault.open(tmp_path)
     pid = v.status()["project_id"]
+    # T-R3 assist-tier floor: AI-authored entries require the managed tier
+    v.set_ai_mode("managed")
     v.close()
 
     c = PLMVaultClient()

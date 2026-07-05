@@ -679,3 +679,86 @@ class TestDefaultAgentFnSeams:
         monkeypatch.setattr(at, "run_turn", _spy)
         nr._default_agent_fn("go", {"node_name": "n1"})
         assert seen.get("max_tokens") is None
+
+
+class TestRoleCardWiring:
+    """T-W30 real-run regressions: mission-graph nodes carry role in inputs.role
+    (mission_template._node); the runner must resolve the card from there and must
+    apply the card allowlist when the context pack's allowed_tools is OPEN (None).
+    Both were silently broken (node['role'] only + setdefault on a present key) —
+    the real C1 run showed model tool-name hallucination as the direct symptom."""
+
+    def _capture_pack(self):
+        seen = {}
+
+        def _agent_fn(request, context_pack):
+            seen["request"] = request
+            seen["pack"] = context_pack
+            return _fake_run("confirmed", True)
+        return seen, _agent_fn
+
+    def test_role_resolves_from_inputs_role(self):
+        node = {"id": "n1", "type": "design", "name": "BUILD DL1",
+                "inputs": {"role": "feature_modeler"}}
+        pack = cp.assemble(node, {})
+        seen, agent_fn = self._capture_pack()
+        verdict, _ = nr.run(node, pack, agent_fn=agent_fn)
+        assert verdict == "done"
+        assert seen["pack"].get("role_id") == "feature_modeler"
+        assert seen["pack"].get("role_system_prompt"), "card prompt must be applied"
+
+    def test_card_allowlist_fills_open_allowed_tools(self):
+        from services.agent.roles import load_role
+        node = {"id": "n1", "type": "design", "name": "BUILD DL1",
+                "inputs": {"role": "feature_modeler"}}
+        pack = cp.assemble(node, {})
+        assert pack["allowed_tools"] is None  # open before the card applies
+        seen, agent_fn = self._capture_pack()
+        nr.run(node, pack, agent_fn=agent_fn)
+        assert seen["pack"]["allowed_tools"] == \
+            list(load_role("feature_modeler").concrete_tools)
+
+    def test_explicit_node_tools_still_win_over_card(self):
+        node = {"id": "n1", "type": "design", "name": "BUILD DL1",
+                "tools": ["measure_part"],
+                "inputs": {"role": "feature_modeler"}}
+        pack = cp.assemble(node, {})
+        seen, agent_fn = self._capture_pack()
+        nr.run(node, pack, agent_fn=agent_fn)
+        assert seen["pack"]["allowed_tools"] == ["measure_part"]
+
+
+class TestMissionNodeRequests:
+    """T-W30: mission node requests must EMBED the manifest content (verbatim
+    request + deliverable + acceptance criteria), not reference an absent brief."""
+
+    def _manifest(self):
+        return {
+            "schema": "aicad.deliverables/1",
+            "request_verbatim": "make a flanged bushing with a d20 sliding-fit bore",
+            "deliverables": [{
+                "id": "DL1", "kind": "part", "name": "flanged bushing",
+                "description": "bushing with flange",
+                "acceptance_criteria": [
+                    {"id": "AC1", "text": "bore d20 H7",
+                     "check": {"tool": "fit_report", "pass_rule": "clearance in [0.007,0.041]"}},
+                ],
+                "depends_on": [], "status": "pending",
+            }],
+            "ambiguities": [], "assumptions": [],
+        }
+
+    def test_build_node_request_carries_manifest_content(self):
+        from dag.mission_template import build_mission_graph
+        graph = build_mission_graph(self._manifest(), graph_id="t")
+        build = next(n for n in graph["nodes"] if n["id"] == "n_build_DL1")
+        req = build["inputs"]["request"]
+        assert "make a flanged bushing" in req          # verbatim mission request
+        assert "AC1" in req and "fit_report" in req     # the criterion + named tool
+        assert "clearance in [0.007,0.041]" in req      # the pass rule
+
+    def test_every_mission_node_has_a_request(self):
+        from dag.mission_template import build_mission_graph
+        graph = build_mission_graph(self._manifest(), graph_id="t", org_layer=True)
+        for n in graph["nodes"]:
+            assert n["inputs"].get("request"), f"{n['id']} has no request"

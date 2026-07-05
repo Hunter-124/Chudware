@@ -76,6 +76,40 @@ def _role_prompt(role_id: str) -> str:
         return ""
 
 
+def _mission_context(manifest: dict[str, Any]) -> str:
+    """The mission request VERBATIM — the context every node request embeds.
+
+    T-W30: the real C1 run proved the synthesized node requests referenced 'the
+    project brief' without CONTAINING it, so the model (correctly) stalled asking
+    for it. Every node request now carries the manifest's request_verbatim —
+    nothing invented, just the §16 content the mission was compiled from."""
+    req = (manifest.get("request_verbatim") or "").strip()
+    return f"Mission request (verbatim):\n{req}" if req else ""
+
+
+def _deliverable_request(manifest: dict[str, Any], d: dict[str, Any],
+                         job: str) -> str:
+    """A node request built from the deliverable's OWN manifest entry: name,
+    kind, description and acceptance criteria (with each criterion's named check
+    tool + pass rule), plus the verbatim mission request. *job* states this
+    node's task in one sentence."""
+    lines = [j for j in (_mission_context(manifest),) if j]
+    name = d.get("name") or d.get("id") or "?"
+    desc = (d.get("description") or "").strip()
+    lines.append(f"Deliverable {d.get('id')}: {name} (kind: {d.get('kind')})"
+                 + (f" — {desc}" if desc else ""))
+    acs = d.get("acceptance_criteria") or []
+    if acs:
+        lines.append("Acceptance criteria:")
+        for ac in acs:
+            check = ac.get("check") or {}
+            lines.append(f"- {ac.get('id')}: {ac.get('text')}"
+                         f" [check tool: {check.get('tool', '?')};"
+                         f" pass rule: {check.get('pass_rule', '?')}]")
+    lines.append(f"Your job on this node: {job}")
+    return "\n".join(lines)
+
+
 def _node(
     node_id: str,
     node_type: str,
@@ -92,7 +126,8 @@ def _node(
     so the node runner (services/dag/node_runner) can scope the turn to the role
     without re-reading the card.  ``inputs.role`` is the id (the runner applies the
     tool allowlist from it)."""
-    node_inputs: dict[str, Any] = dict(inputs or {})
+    node_inputs: dict[str, Any] = {k: v for k, v in (inputs or {}).items()
+                                   if v is not None}
     node_inputs["role"] = role
     node_inputs["role_prompt"] = _role_prompt(role)
     return {
@@ -143,10 +178,19 @@ def build_mission_graph(
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
 
+    # T-W30: every node request EMBEDS the mission/deliverable content (verbatim
+    # manifest data) — a synthesized request that merely references 'the project
+    # brief' stalls a real model turn (proved by the C1 real run).
+    mission_ctx = _mission_context(manifest)
+
     # --- Phase 0: INTAKE ---------------------------------------------------
     intake_id = "n_intake"
     nodes.append(_node(intake_id, _TYPE_INTAKE, "INTAKE: build manifest",
-                       "intake_analyst", autonomy=default_autonomy))
+                       "intake_analyst", autonomy=default_autonomy,
+                       inputs={"request": (
+                           f"{mission_ctx}\n\nYour job on this node: confirm the "
+                           "deliverable manifest for this mission is complete and "
+                           "recorded." if mission_ctx else None)}))
     tail = intake_id
 
     # --- Phase 1: CLARIFY (only when a blocking ambiguity exists) ----------
@@ -164,7 +208,13 @@ def build_mission_graph(
         sid = f"n_spec_{did}"
         spec_ids[did] = sid
         nodes.append(_node(sid, _TYPE_SPEC, f"SPECIFY {did}: {d.get('name', '')}",
-                           "spec_writer", inputs={"deliverable": did},
+                           "spec_writer",
+                           inputs={"deliverable": did,
+                                   "request": _deliverable_request(
+                                       manifest, d,
+                                       "write the engineering specification for this "
+                                       "deliverable (dimensions, fits, materials) and "
+                                       "record the key values.")},
                            autonomy=default_autonomy))
         edges.append({"from": tail, "to": sid})
     # A join point so the following phases depend on ALL specs.  It is a plan-type
@@ -175,7 +225,11 @@ def build_mission_graph(
     # run to approve/manual to gate every node, including this one).
     spec_join = "n_spec_done"
     nodes.append(_node(spec_join, "plan", "SPECIFY complete (overseer audit point)",
-                       "overseer", on_fail="pause", autonomy=default_autonomy))
+                       "overseer", on_fail="pause", autonomy=default_autonomy,
+                       inputs={"request": (
+                           f"{mission_ctx}\n\nYour job on this node: audit that every "
+                           "deliverable's specification is complete; report any gap."
+                           if mission_ctx else None)}))
     for sid in spec_ids.values():
         edges.append({"from": sid, "to": spec_join})
     tail = spec_join
@@ -184,7 +238,11 @@ def build_mission_graph(
     if org_layer:
         org_id = "n_organize"
         nodes.append(_node(org_id, _TYPE_ORGANIZE, "ORGANIZE: instantiate departments",
-                           "department_manager", autonomy=default_autonomy))
+                           "department_manager", autonomy=default_autonomy,
+                           inputs={"request": (
+                               f"{mission_ctx}\n\nYour job on this node: group the "
+                               "mission's deliverables into departments and confirm "
+                               "each has an owner role." if mission_ctx else None)}))
         edges.append({"from": tail, "to": org_id})
         tail = org_id
 
@@ -197,7 +255,11 @@ def build_mission_graph(
         tail = layout_id
     plan_id = "n_plan"
     nodes.append(_node(plan_id, _TYPE_PLAN, "PLAN: mission DAG + build graphs",
-                       "orchestrator", on_fail="pause", autonomy=default_autonomy))
+                       "orchestrator", on_fail="pause", autonomy=default_autonomy,
+                       inputs={"request": (
+                           f"{mission_ctx}\n\nYour job on this node: produce the build "
+                           "plan (ordered steps per deliverable) for this mission."
+                           if mission_ctx else None)}))
     edges.append({"from": tail, "to": plan_id})
 
     # --- Phase 4: BUILD (fan-out per buildable deliverable) ----------------
@@ -212,7 +274,13 @@ def build_mission_graph(
         # BUILD depends on PLAN (build graphs) + this deliverable's SPEC. Independent
         # parts share no edge → the executor ready-set runs them in parallel.
         nodes.append(_node(bid, _TYPE_BUILD, f"BUILD {did}: {d.get('name', '')}",
-                           role, inputs={"deliverable": did},
+                           role,
+                           inputs={"deliverable": did,
+                                   "request": _deliverable_request(
+                                       manifest, d,
+                                       "build this deliverable's geometry with the "
+                                       "engine tools so every acceptance criterion "
+                                       "can pass.")},
                            on_fail="pause", autonomy=default_autonomy))
         edges.append({"from": plan_id, "to": bid})
 
@@ -223,7 +291,13 @@ def build_mission_graph(
         vid = f"n_verify_{did}"
         verify_ids[did] = vid
         nodes.append(_node(vid, _TYPE_VERIFY, f"VERIFY {did}: run acceptance checks",
-                           "reviewer", inputs={"deliverable": did},
+                           "reviewer",
+                           inputs={"deliverable": did,
+                                   "request": _deliverable_request(
+                                       manifest, d,
+                                       "run each acceptance criterion's NAMED check "
+                                       "tool and report PASS/FAIL/NOT-CHECKED per "
+                                       "criterion — never guess a result.")},
                            on_fail="pause", autonomy=default_autonomy))
         edges.append({"from": build_ids[did], "to": vid})
 
@@ -234,7 +308,13 @@ def build_mission_graph(
         del_id = f"n_deliver_{did}"
         role = _DELIVER_ROLE_BY_KIND.get(kind, "reviewer")
         nodes.append(_node(del_id, _TYPE_DELIVER, f"DELIVER {did}: {kind}",
-                           role, inputs={"deliverable": did},
+                           role,
+                           inputs={"deliverable": did,
+                                   "request": _deliverable_request(
+                                       manifest, d,
+                                       "summarise what was built and verified for "
+                                       "this deliverable, from the recorded results "
+                                       "only — do not invent outcomes.")},
                            on_fail="skip", autonomy=default_autonomy))
         # Deliver depends on this deliverable's VERIFY when it was built; otherwise
         # on its SPEC (e.g. a report deliverable with no build node).

@@ -236,7 +236,19 @@ def run(
         context_pack["role_system_prompt"] = role_card.system_prompt
         # The node's tools: allowlist and the card's allowlist should agree; the card
         # is authoritative for a role-typed node, so expose its concrete tools.
-        context_pack.setdefault("allowed_tools", list(role_card.concrete_tools))
+        # T-W30: context_pack.assemble() ALWAYS sets "allowed_tools" (None = open),
+        # so the old setdefault() never fired and the card allowlist was silently
+        # dropped — the real C1 run showed the model free-inventing tool names
+        # because its prompt listed none. The card fills the OPEN case only; an
+        # explicit node ``tools:`` list still wins.
+        if context_pack.get("allowed_tools") is None:
+            context_pack["allowed_tools"] = list(role_card.concrete_tools)
+    elif node_inputs.get("role_prompt"):
+        # No loadable card, but the mission compiler embedded the role prompt
+        # verbatim in inputs (mission_template._node) — use it so the node still
+        # runs with its role's system prompt.
+        context_pack = dict(context_pack)
+        context_pack["role_system_prompt"] = str(node_inputs["role_prompt"])
 
     # Build the request string passed to the agent.
     request = _build_request(node_type, node_inputs, context_pack)
@@ -354,8 +366,14 @@ def _resolve_role_card(node: dict[str, Any]) -> Any:
     """Return the RoleCard for ``node['role']`` if the node names one, else None.
 
     Best-effort: any failure (no role field, unknown role, roles module unavailable)
-    returns None so the node runs with default behaviour."""
-    role_id = node.get("role")
+    returns None so the node runs with default behaviour.
+
+    T-W30: the mission compiler (services/dag/mission_template._node) carries the
+    role in ``inputs.role`` — accept it as well as a top-level ``role`` field.
+    Reading only ``node['role']`` meant NO mission-graph node ever resolved its
+    card, so role prompts + tool allowlists were silently dropped (the real C1
+    run showed the model free-inventing tool names as a direct result)."""
+    role_id = node.get("role") or (node.get("inputs") or {}).get("role")
     if not role_id:
         return None
     try:

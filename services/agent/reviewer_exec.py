@@ -76,12 +76,22 @@ def _resolve_fn(tool: str) -> Callable[..., Any] | None:
         fn = _resolve_extra(module_key, fn_name)
         if fn is not None:
             return fn
-    # 3) last resort: try the battery singleton directly under a cad key.
+    # 3) last resort: try each battery singleton module in turn (cad first — it
+    # carries the modeling/measure/describe tools role agents actually call; then
+    # recon/ecad/cam). T-W30: the agent-turn dispatcher shares this resolver, so
+    # a role-card tool like add_features or render_part must resolve here.
     try:
         from services.verify.battery import _get_fn
-        return _get_fn("cad", tool)
+        for module_key in ("cad", "recon", "ecad", "cam"):
+            try:
+                fn = _get_fn(module_key, tool)
+                if fn is not None:
+                    return fn
+            except Exception:  # noqa: BLE001 — try the next module
+                continue
     except Exception:  # noqa: BLE001
-        return None
+        pass
+    return None
 
 
 # One private FastMCP per extra module_key, built once.

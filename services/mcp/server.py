@@ -267,6 +267,12 @@ register_ledger_tools(_reg.view(mcp, "ledger"))
 # ready_nodes() surface for T-W16 multi-doc fan-out.
 from services.agent.buildgraph.mcp_tools import register_buildgraph_tools
 register_buildgraph_tools(mcp)
+# Advisory engine / foreman (T-W5, Pillar 20): advise / stage_set / advisory_dispute.
+# advise runs a stage's read-only check battery over a doc on demand (aicad.advisory/1);
+# the in-app loop.py + dag node runner already run the foreman automatically. advise is
+# risk-class READ; stage_set / advisory_dispute are WRITE (ledger-logged, §9.3).
+from services.mcp.advisor_tools import register_advisor_tools
+register_advisor_tools(_reg.view(mcp, "advisor"))
 
 
 def _install_clean_stdout():

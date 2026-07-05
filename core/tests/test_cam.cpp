@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <filesystem>
 
 #include "cam/geometry.h"
 #include "cam/feeds.h"
@@ -1166,8 +1167,8 @@ TEST_CASE("session: new / apply_ops / generate / post / undo / save+open") {
     json re = cam_redo(doc);
     CHECK(cam_tree(doc)["stats"]["operations"].get<int>() == 1);
 
-    // save + open round-trip
-    std::string path = "/tmp/aicad_test.cam+";
+    // save + open round-trip (portable temp path — /tmp doesn't exist on Windows)
+    std::string path = (std::filesystem::temp_directory_path() / "aicad_test.cam+").string();
     json sv = cam_save(doc, path);
     CHECK(sv["path"] == path);
     json op2 = cam_open(path);

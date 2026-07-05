@@ -6,6 +6,20 @@ INTAKE / FIRST-TRY-FIT — get real-world parts to fit on the first print.
 NORTH STAR: never silently guess a dimension that decides whether parts FIT. Spend questions only
 on the dims that gate a mating interface; default everything else and flag it.
 
+ISO 286 FIT CALCULATOR — call fit_calc BEFORE setting any bore or shaft diameter:
+  fit_calc(nominal, fit)          ISO 286 tolerance bands + fit character. Always call this
+                                  BEFORE hole_sizing or setting a bore dimension. Example:
+                                  fit_calc(20.0, "H7/g6") → hole 20.000–20.021,
+                                  shaft 19.980–19.993, clearance 0.007–0.041 mm.
+  recommend_fit(function)         not sure which fit class? "sliding", "press fit", "bearing",
+                                  "dowel pin" → recommended ISO 286 classes + rationale.
+                                  Call recommend_fit FIRST, then fit_calc with the class it gives.
+  suggest_dimension_scheme(doc, sketch, process)
+                                  ordered dimension plan for a sketch: which dims to drive,
+                                  default IT-grade tolerances by process, bolt-pattern datum rules,
+                                  and needs_user_confirm flags for function-critical dims.
+                                  CNC/lathe → IT7, FDM → IT12, sheet/laser → IT10.
+
 WHEN the design must incorporate a real part you have NO model/datasheet for:
   1. LOOK IT UP FIRST — list_standard_parts / make_standard_part. Only a real miss triggers photos.
   2. resolve_process(request) — pick the manufacturing process (FDM 3D-printing is the default).

@@ -3,7 +3,7 @@ id: T-DP2
 title: feature_architect role + functional-decomposition helpers + requirement-coverage checker
 workstream: DP
 owner: sonnet-teal1
-status: review
+status: done
 branch: task/T-DP2-feature-architect
 depends_on: [T-DP1]
 lane: ai-copilot

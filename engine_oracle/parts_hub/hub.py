@@ -68,8 +68,26 @@ class PartsHub:
         self.register(HydraulicComponentsAdapter())
         self.register(EcadKicadAdapter())
         self.register(EcadVendorAdapter())
+        self._register_browser_catalog_adapters()
         # Build the index immediately so first search is fast.
         self._ensure_index()
+
+    def _register_browser_catalog_adapters(self) -> None:
+        """T-X3: register each services/browser SourceAdapter as a live CatalogProvider
+        (domain="catalog") — the contracts/parts.md §6.3 seam reserved for "paid catalog
+        providers" (TraceParts/Werk24), populated here by the browser-session mechanism
+        instead. Best-effort: services/browser is an optional peer package (Playwright is
+        a lazy runtime dependency of its own session module) — any import/registration
+        failure here must never break hub bootstrap, so this degrades to a no-op, same
+        posture as EcadVendorAdapter's ProviderChain-unavailable degradation above."""
+        try:
+            from services.browser.adapters import all_adapters
+            from services.browser.adapters.parts_provider import BrowserCatalogAdapter
+
+            for adapter in all_adapters():
+                self.register(BrowserCatalogAdapter(adapter))
+        except Exception:  # noqa: BLE001 — optional integration, never fatal at bootstrap
+            pass
 
     # ------------------------------------------------------------------
     # Index management

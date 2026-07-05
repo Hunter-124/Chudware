@@ -289,6 +289,22 @@ def grammar_for_tier(
     return schema_to_gbnf(handoff_schema)
 
 
+# --------------------------------------------------------------------------- effort resolution (T-W28)
+
+def resolve_effort(tier: str, **kwargs):
+    """Resolve the effective harness effort profile for *tier*.
+
+    Shipped defaults (this module's tiers.yaml + the shipped code constants)
+    layered under the active effort preset (services/agent/effort_presets.yaml)
+    and per-tier user overrides (config.json ``ai_effort``).  The mission
+    pipeline, the design gym and the settings GUI all resolve through this ONE
+    path.  Import is deferred (mirrors grammar_for_tier) to avoid cycles —
+    effort.py imports this module.
+    """
+    from services.agent.effort import resolve_effort as _resolve
+    return _resolve(tier, **kwargs)
+
+
 # --------------------------------------------------------------------------- turn assembler
 
 def _count_tokens(text: str) -> int:

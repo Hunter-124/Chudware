@@ -145,8 +145,26 @@ struct Study {
     float flowSolidKappa = 200.0f;
     float flowPowerW = 20.0f;
 
+    // Thermal (steady-state conduction FEA, T-SIM1). Distinct from the OpenFOAM-CHT flow
+    // "thermal" fields above — these drive the sim_run_thermal conduction backend. Fixtures
+    // carry the fixed hot temperature; a cold face is set by a second fixture temp, a
+    // convection film, or a heat flux (mirrors force/pressure load choices).
+    float thermalHotTempC = 100.0f;     // Dirichlet temperature applied to fixture faces
+    bool  thermalUseColdFace = false;   // second Dirichlet (cold) face uses a load slot as the target
+    float thermalColdTempC = 20.0f;
+    bool  thermalUseConvection = true;  // convection (Robin) film on the load face(s)
+    float thermalConvH = 25.0f;         // film coefficient, W/(m^2·K)
+    float thermalAmbC = 20.0f;          // ambient/bulk temperature, °C
+    bool  thermalUseFlux = false;       // heat-flux (Neumann) load on the load face(s)
+    float thermalFluxWm2 = 0.0f;        // applied surface flux, W/m^2 (>0 = into the body)
+    float thermalKwmk = 0.0f;           // conductivity used (resolved from the table; 0 = auto)
+
     // Result state (transient — regenerated on Run; never persisted).
     bool hasResult = false;
+    // T-SIM2: per-study "Show contour" toggle. Lives on the Study (not one SimManager member) so
+    // it is per-study by construction — toggling contour off on study A never leaks to study B's
+    // Results view. Default on: a fresh result shows its contour immediately (SolidWorks style).
+    bool contourOn = true;
     std::string summary;
     std::string banner;
     std::vector<float> dragTrace;
@@ -160,6 +178,9 @@ struct Study {
     double cpMin = 0, cpMax = 0, vmaxMps = 0;
     std::vector<std::string> flowFields;
     std::vector<std::string> solverNotes;
+
+    // Thermal result scalars (T-SIM1; transient, regenerated on Run).
+    double maxTempC = 0.0, minTempC = 0.0;
 };
 
 // Which sub-node of a study the tree has selected (drives the form).
@@ -231,6 +252,7 @@ private:
     void drawMaterialCombo(app::AppState& st, Study& s);
     void drawMeshForm(app::AppState& st, Study& s);
     void drawFlowForm(app::AppState& st, Study& s);
+    void drawThermalForm(app::AppState& st, Study& s);  // T-SIM1 conduction inputs
     void drawResultControls(app::AppState& st, Study& s);
     void drawWellRow(app::AppState& st, const char* label, SimWell& well, const char* tip);
     void drawCustomMaterialPopup(app::AppState& st, Study& s);
@@ -254,6 +276,7 @@ private:
     void runStaticOrModal(app::AppState& st, Study& s);
     void runFlow(app::AppState& st, Study& s);
     void runFatigue(app::AppState& st, Study& s);
+    void runThermal(app::AppState& st, Study& s);  // T-SIM1: steady-state conduction dispatch
     nlohmann::json facePointsFor(app::AppState& st, const nlohmann::json& selector, std::string& err);
 
     // pick capture: append every currently-selected face into `well` (st.selection).

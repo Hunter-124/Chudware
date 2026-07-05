@@ -57,3 +57,20 @@ The human review this task asked for happened — all open questions above are a
 in [docs/PLM_VERSION_CONTROL_PLAN.md](../../docs/PLM_VERSION_CONTROL_PLAN.md)
 (Pillar 19). Execution is workstream R: T-R1 (contract) → T-R7 (team sync). Do not
 claim this file; claim the T-R tasks.**
+
+**CONTRACT FROZEN (T-R1, 2026-07-03):** every open question above is answered by
+[docs/PLM_VERSION_CONTROL_PLAN.md](../../docs/PLM_VERSION_CONTROL_PLAN.md) +
+[contracts/plm.md](../../contracts/plm.md) (`aicad.plm/1`, frozen). Mapping of this
+file's open questions → answers:
+- *What "version control" means for a feature-tree doc* → snapshot-based on the
+  T-H2 canonical `document.json` (contracts/plm.md §0, §2; plan §3.1). Not
+  op-log, not branch/merge (non-goal, plan §6).
+- *Local-only vs AI-CAD Cloud/account* → local-first, zero-account; any git remote
+  the user controls for self-hosting; `aicad-cloud` remote RESERVED config-only
+  behind the Pillar-12 gate (contracts/plm.md §6.1).
+- *Multi-user concurrent editing* → out of scope; team v1 = advisory locks +
+  no-merge + copy-as-new-item conflict guard (contracts/plm.md §6).
+- *Relation to the DAG checkpoint store* → deliberately NOT reused (plan §3.5).
+- *UI surface* → separate History panel + rev badges + Project Hub, not the
+  FeatureManager; undo/redo stay session-scoped and distinct from history
+  (plan §3.5, §4; contracts/plm.md §9).

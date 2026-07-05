@@ -3,6 +3,7 @@
 // axial depth-of-cut, helical entry, and smooth concentric offset linking.
 // Clean-room: an engagement-limited concentric-offset clearer with a trochoidal
 // helical entry, the standard public approach (no VoluMill/Adaptive source used).
+#define _USE_MATH_DEFINES  // MSVC needs this before <cmath> for M_PI (mirrors geom/plane.cpp)
 #include <algorithm>
 #include <cmath>
 

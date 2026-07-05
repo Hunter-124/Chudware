@@ -154,6 +154,11 @@ register_cam_tools(_reg.view(mcp, "cam"))
 # Doc diff — semantic feature-level diff between two document revisions (T-H2).
 from mcp_server.doc_diff_tools import register_doc_diff_tools
 register_doc_diff_tools(mcp)
+# PLM vault (Pillar 19, aicad.plm/1): hidden git-backed version history —
+# Project/History/Checkpoint/Release/Restore. Schema: contracts/plm.md.
+# Engine: services/plm/. Zero user-facing git vocabulary (contract §8).
+from mcp_server.plm_tools import register_plm_tools
+register_plm_tools(mcp)
 # Requirements (aicad.req/1): CRUD + markdown projection for design briefs.
 # Schema: contracts/requirements.md  Brain: engine_oracle/requirements/requirements.py
 from mcp_server.req_tools import register_req_tools
@@ -287,6 +292,12 @@ register_advisor_tools(_reg.view(mcp, "advisor"))
 # no write-lease required to poll status.
 from services.mcp.workspace_tools import register_workspace_tools
 register_workspace_tools(_reg.view(mcp, "workspace"))
+# Interface alignment checker (T-BL49): interface_check inspects mating component pairs for
+# hole-pattern registration, bore coaxiality, contact-plane flushness, and fastener pass-through
+# — the layout errors that pass check_interference (no clash) but are still wrong.  Reuses
+# doc_query (per-body faces), asm_world_bodies, cam_extract holes, research_thread_spec.
+from mcp_server.interface_check_tools import register_interface_check_tools
+register_interface_check_tools(mcp)
 
 
 def _install_clean_stdout():

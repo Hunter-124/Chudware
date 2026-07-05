@@ -4,6 +4,7 @@
 #include "ui/ecad/ecad_panel.h"
 #include <cstring>
 #include <string>
+#include <nlohmann/json.hpp>
 
 namespace app {
 
@@ -385,12 +386,10 @@ void AppState::seedDemo() {
 
     docMirror.setListener([this]() { onDocMutation(); });
 
+    // T-BL39: empty state — no greeting card. Chat starts blank; the input placeholder
+    // already hints "Describe what to build…". A greeting block would show "Assistant"
+    // attribution with no real model metadata, which is exactly what T-BL39 removes.
     agent.blocks.clear();
-    AgentBlock w; w.kind = BlockKind::AssistantMsg; w.anim = 1.f;
-    w.title = "Assistant";
-    w.body  = "Hi - I'm your CAD copilot. Ask me to model something, run a simulation, or "
-              "explain a feature. You'll see my thinking and every action I take, inline.";
-    agent.blocks.push_back(w);
 
     tryStartWorker();
 
@@ -427,6 +426,7 @@ void AppState::startDemoAgent(const std::string& userText) {
 
     if (engineReady && engine.hasDoc()) {
         agentIsReal = true;
+        agentLastRequest_ = userText;
         agent.demoStep = -1;
         engine.startAgent(userText);
         AgentBlock spinner; spinner.kind = BlockKind::Action;
@@ -448,12 +448,127 @@ void AppState::tickDemoAgent(float dt) {
         if (b.kind == BlockKind::Action && b.status == ActionStatus::Running) b.spin += dt * 6.f;
     }
 
+    // Interaction contract §8: consumer side — when the inline question card writes
+    // askAnswersJson, the agent was suspended (status=waiting_for_answer). Re-launch.
+    // The FileLedger replay (contract §5) means the resumed agent skips already-answered
+    // questions and continues from where it left off. See work/questions/T-BL40.md.
+    if (agent.running && agentIsReal && !askAnswersJson.empty()) {
+        // The pending_ask_answers JSON was already persisted to the run ledger by the
+        // Python InAppWaitTransport before returning waiting_for_answer. Clearing here
+        // lets the GUI know the answer was consumed; the agent will replay on relaunch.
+        askAnswersJson.clear();
+        // Re-launch the agent with the same original request. The ledger replay skips
+        // any questions already answered in the previous partial run.
+        if (!agentLastRequest_.empty()) {
+            engine.startAgent(agentLastRequest_);
+        }
+        return;
+    }
+
     if (agent.running && agentIsReal && engine.agentDone()) {
         nlohmann::json result = engine.takeAgentResult();
         bool ok = !result.contains("ok") || result.value("ok", true);
         std::string errMsg = result.value("error", std::string());
         if (result.contains("status") && result.value("status", std::string()) == "failed")
             ok = false;
+
+        // Check for ask_question events FIRST — they suspend the run completion.
+        bool hasQuestion = false;
+        // T-BL39: extract real model attribution from the ai_artifact telemetry event
+        // that the engine emits for every successful design run (T-H1 / T-BL22 envelope).
+        // Format: "<provider> · <model-slug>" — mirrors the T-BL38 composer row style so
+        // per-message attribution is visually consistent with the input-row model label.
+        // Falls back to "" (drawAssistantBubble shows "AI") if telemetry is absent.
+        std::string modelAttr;
+        if (result.contains("events") && result["events"].is_array()) {
+            for (const auto& ev : result["events"]) {
+                std::string kind = ev.value("kind", std::string());
+                if (kind == "ask_question") {
+                    // The event data is the §3 batch envelope JSON (or the question field).
+                    // Build a minimal batch envelope from the event if not already one.
+                    nlohmann::json batchJson;
+                    if (ev.contains("batch_id")) {
+                        batchJson = ev;  // full batch envelope in event data
+                    } else {
+                        // Single question embedded directly; wrap it.
+                        batchJson = nlohmann::json{
+                            {"schema", "aicad.interaction/1"},
+                            {"batch_id", ev.value("batch_id", "b_" + std::string("inline"))},
+                            {"scope", ev.value("scope", "run")},
+                            {"blocking", true},
+                            {"questions", nlohmann::json::array({ev})}
+                        };
+                    }
+                    std::string batchStr = batchJson.dump();
+                    aicad::ui::AskForm form = aicad::ui::parseAskBatch(batchStr);
+                    if (!form.fields.empty()) {
+                        AgentBlock qb;
+                        qb.kind = BlockKind::Question;
+                        qb.title = "Agent question";
+                        qb.anim = 0.f;
+                        qb.askForm = form;
+                        // Seed widget state from suggested defaults.
+                        qb.askFields.resize(form.fields.size());
+                        // (initInlineField is static in agent_panel.cpp; we replicate the
+                        // seed logic here for the text/approval defaults only — the GUI
+                        // will re-seed via initInlineField on first draw if askFields are
+                        // empty. We set them to zero-init so the card recognizes them as
+                        // needing initialization.)
+                        agent.blocks.push_back(std::move(qb));
+                        hasQuestion = true;
+                    }
+                }
+                if (kind == "run_note") {
+                    AgentBlock t; t.kind = BlockKind::Thinking; t.title = "Thinking";
+                    t.body = ev.value("note", ev.dump(2)); t.anim = 0.f;
+                    agent.blocks.push_back(t);
+                } else if (kind == "ai_artifact" && modelAttr.empty()) {
+                    // ai_artifact carries model_info as ev["model"] = {provider, model, adapter}.
+                    // Pull both; show "Provider · model-slug" (same rhythm as composerModelLabel).
+                    if (ev.contains("model") && ev["model"].is_object()) {
+                        std::string prov  = ev["model"].value("provider", std::string());
+                        std::string mslug = ev["model"].value("model", std::string());
+                        if (!mslug.empty()) {
+                            modelAttr = prov.empty() ? mslug : (prov + " \xc2\xb7 " + mslug);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle Option B: result has status=waiting_for_answer + pending_batch (§8,
+        // work/questions/T-BL40.md). The Python agent exited cleanly mid-run and persisted
+        // its question to the FileLedger. On re-launch it replays answered questions.
+        if (!hasQuestion && result.contains("status") &&
+            result.value("status", std::string()) == "waiting_for_answer" &&
+            result.contains("pending_batch")) {
+            std::string batchStr = result["pending_batch"].dump();
+            aicad::ui::AskForm form = aicad::ui::parseAskBatch(batchStr);
+            if (!form.fields.empty()) {
+                AgentBlock qb;
+                qb.kind = BlockKind::Question;
+                qb.title = "Agent question";
+                qb.anim = 0.f;
+                qb.askForm = form;
+                qb.askFields.resize(form.fields.size());
+                agent.blocks.push_back(std::move(qb));
+                hasQuestion = true;
+            }
+        }
+
+        if (hasQuestion) {
+            // The run is suspended pending user answer. Mark the spinner as waiting.
+            for (auto it = agent.blocks.rbegin(); it != agent.blocks.rend(); ++it) {
+                if (it->kind == BlockKind::Action && it->status == ActionStatus::Running) {
+                    it->title = "Waiting for your answer…";
+                    break;
+                }
+            }
+            // Do NOT mark agent.running = false; we stay in-progress until answer arrives.
+            // The consumer check at the top of tickDemoAgent re-launches the agent once
+            // the inline card writes askAnswersJson (see work/questions/T-BL40.md §Option B).
+            return;
+        }
 
         for (auto it = agent.blocks.rbegin(); it != agent.blocks.rend(); ++it) {
             if (it->kind == BlockKind::Action && it->status == ActionStatus::Running) {
@@ -463,18 +578,9 @@ void AppState::tickDemoAgent(float dt) {
             }
         }
 
-        if (result.contains("events") && result["events"].is_array()) {
-            for (const auto& ev : result["events"]) {
-                std::string kind = ev.value("kind", std::string());
-                if (kind == "run_note") {
-                    AgentBlock t; t.kind = BlockKind::Thinking; t.title = "Thinking";
-                    t.body = ev.value("note", ev.dump(2)); t.anim = 0.f;
-                    agent.blocks.push_back(t);
-                }
-            }
-        }
-
         AgentBlock m; m.kind = BlockKind::AssistantMsg; m.anim = 0.f;
+        // T-BL39: real model attribution from the ai_artifact telemetry event.
+        m.modelName = modelAttr;
         if (ok) {
             int rev = result.value("revision", -1);
             m.body = "Done." + (rev >= 0 ? "  Model is at rev " + std::to_string(rev) + "." : "");
@@ -482,12 +588,13 @@ void AppState::tickDemoAgent(float dt) {
             m.body = "The copilot run failed: " + (errMsg.empty() ? "unknown error" : errMsg);
         }
         agent.blocks.push_back(m);
-
-        std::string engaged = result.value("engaged", std::string("agent"));
         int itok = result.value("input_tokens", 0);
         int otok = result.value("output_tokens", 0);
+        // Store real token counts so the context bar can show live k-token usage.
+        if (itok > 0) agent.lastInputTokens  = itok;
+        if (otok > 0) agent.lastOutputTokens = otok;
         AgentBlock us; us.kind = BlockKind::Usage; us.anim = 0.f;
-        us.body = engaged;
+        us.body = modelAttr.empty() ? std::string("AI") : modelAttr;
         if (itok > 0 || otok > 0)
             us.body += "  |  " + std::to_string(itok) + "→" + std::to_string(otok) + " tok";
         agent.blocks.push_back(us);
@@ -547,7 +654,10 @@ void AppState::tickDemoAgent(float dt) {
             agent.demoStep = 3; agent.demoTimer = 0.f;
         } break;
         case 3: if (agent.demoTimer > 0.5f) {
-            AgentBlock m; m.kind = BlockKind::AssistantMsg; m.title = "Assistant";
+            AgentBlock m; m.kind = BlockKind::AssistantMsg;
+            // T-BL39: modelName instead of hardcoded "Assistant". Demo path labels itself
+            // "demo" so attribution is honest (no real model was called in this path).
+            m.modelName = "demo";
             m.body = agent.demoOpOk
                 ? "Done - I drilled the four mounting holes through the base. Next I can place the "
                   "regulator, the input/output caps, and route the power net. Want me to continue?"

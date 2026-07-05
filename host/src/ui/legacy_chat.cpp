@@ -36,6 +36,7 @@
 
 #include "legacy_chat.h"
 #include "layout.h"          // ui::overlayBand / takeOverlayColumnReset — pinned-column geometry
+#include "panel_collapse.h"  // ui::PanelCollapseAnim — shared vertical-collapse animation (T-G21)
 #include "doc_tabs.h"        // ui::docTabStripHeight — top inset so the column clears the tab band
 #include "model_registry.h"  // ui::ModelInfo / capability flags / provider mapping
 #include "metrics.h"          // ui::metrics::px/U/asmHeaderIconGap
@@ -1227,16 +1228,20 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
 }
 
 // ---- header: logo + "AI-CAD Copilot" + Sessions + status dot ----
-// Copilot collapse-to-pill state (file scope so the header's collapse chevron and drawAIPanel's
-// pill/expand logic share it). Mirrors the FeatureManager collapse.
+// Copilot vertical-collapse state (file scope so the header's collapse chevron and drawAIPanel's
+// height animation share it). Mirrors the FeatureManager collapse (T-G21: rolls UP to this header
+// strip instead of shrinking to a pill in both axes). Seeded from st.settings.copilotCollapsed on
+// drawAIPanel's first call (see s_cpInited there) so a collapsed column stays collapsed across
+// restarts.
 static bool s_cpCollapsed = false;
 
 static void drawCopilotHeader(AppState& st, bool busy) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
 
-    // Collapse-to-pill chevron LEADS the header row (in-flow, so it never overlaps the logo). "»"
-    // tucks the column away to the right into a small pill (re-expanded from the pill in drawAIPanel).
+    // Collapse chevron LEADS the header row (in-flow, so it never overlaps the logo). "»" tucks
+    // the column's body away, rolling the column up to just this header row (T-G21); the same
+    // chevron toggles it back open.
     {
         const float cb = ImGui::GetTextLineHeight();
         const ImVec2 c0 = ImGui::GetCursorScreenPos();
@@ -1254,8 +1259,12 @@ static void drawCopilotHeader(AppState& st, bool busy) {
             wdl->AddLine(ImVec2(m.x + ox - a * 0.5f, m.y - a), ImVec2(m.x + ox + a * 0.5f, m.y), cc, 1.6f * sc);
             wdl->AddLine(ImVec2(m.x + ox + a * 0.5f, m.y), ImVec2(m.x + ox - a * 0.5f, m.y + a), cc, 1.6f * sc);
         }
-        if (hov) ImGui::SetTooltip("Collapse");
-        if (clk) s_cpCollapsed = true;
+        if (hov) ImGui::SetTooltip(s_cpCollapsed ? "Expand" : "Collapse");
+        if (clk) {
+            s_cpCollapsed = !s_cpCollapsed;
+            st.settings.copilotCollapsed = s_cpCollapsed;
+            saveSettings(st.settings);
+        }
         ImGui::SameLine(0, ui::metrics::asmHeaderIconGap());
     }
 
@@ -3255,7 +3264,13 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     refreshModelAvailability(st, false);
 
     static float s_paneW = 0.0f;                    // column width (px), session-persistent
-    // s_cpCollapsed is file-scoped (shared with drawCopilotHeader's collapse chevron).
+    // s_cpCollapsed is file-scoped (shared with drawCopilotHeader's collapse chevron). Seed it
+    // once from the persisted setting (T-G21: a collapsed Copilot column stays collapsed across
+    // restarts) — can't do this at s_cpCollapsed's own file-scope initializer since that runs
+    // before loadSettings, so seed lazily on this function's first call instead.
+    static bool s_cpInited = false;
+    if (!s_cpInited) { s_cpCollapsed = st.settings.copilotCollapsed; s_cpInited = true; }
+    static ui::PanelCollapseAnim s_cpAnim;
     // Anchor to the overlay band app.cpp publishes each frame (ribbon bottom -> status-bar top),
     // inset by the doc-tab strip on top — the SAME geometry source as the FeatureManager column in
     // layout.cpp drawLeftPane, so the two pinned columns always share top/bottom edges. Falls back
@@ -3283,60 +3298,32 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         const float colY = band.minY + 4.0f * ui::uiScale;   // hug the ribbon (moved up per design)
         const float colH = std::max(120.0f * ui::uiScale, band.maxY - margin - colY);
         // "Reset layout" (slot 1 = Copilot column) restores the default width + expands it.
-        if (ui::takeOverlayColumnReset(1)) { s_paneW = 0.0f; s_cpCollapsed = false; }
+        if (ui::takeOverlayColumnReset(1)) {
+            s_paneW = 0.0f;
+            s_cpCollapsed = false;
+            st.settings.copilotCollapsed = false;
+            saveSettings(st.settings);
+        }
         if (s_paneW <= 0.0f) s_paneW = ui::metrics::dockRightTarget();
         if (std::getenv("AI_CAD_COPILOT_NARROW"))       // T-G17 shot: capture the narrowest column
             s_paneW = ui::metrics::dockRightMin();
+        // T-G21 shot: mirrors AI_CAD_FM_COLLAPSED — --ui-screenshot always resets the overlay
+        // columns for determinism (see the reset branch above), which clobbers the persisted
+        // collapse setting before it can render; force it back for the collapsed capture.
+        if (std::getenv("AI_CAD_COPILOT_COLLAPSED")) {
+            s_cpCollapsed = true;
+            s_cpAnim.snap(true, colH);  // snap immediately — headless captures must not depend on frame count
+        }
         const float maxW = std::max((band.maxX - band.minX) * 0.5f,
                                     ui::metrics::dockRightMin());
         s_paneW = std::min(std::max(s_paneW, ui::metrics::dockRightMin()), maxW);
 
-        // Collapse-to-pill (mirrors the FeatureManager): draw a small glass pill at the column's
-        // top-right anchor that re-expands on click, and publish that pill's LEFT edge so the
-        // viewport HUD + doc-tab strip dodge it just like the full column.
-        if (s_cpCollapsed) {
-            const float S = ui::uiScale;
-            const float pill = 40.0f * S;
-            const float px = band.maxX - margin - pill;
-            ui::publishOverlayColumnEdge(1, px);
-            ImGui::SetNextWindowPos(ImVec2(px, colY), ImGuiCond_Always);
-            ImGui::SetNextWindowSize(ImVec2(pill, pill), ImGuiCond_Always);
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, pill * 0.5f);
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-            const ImGuiWindowFlags pf = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking |
-                ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
-                ImGuiWindowFlags_NoSavedSettings;
-            if (ImGui::Begin("##CopilotPill", nullptr, pf)) {
-                const ImVec2 pp = ImGui::GetWindowPos();
-                const ImRect prr(pp, ImVec2(pp.x + pill, pp.y + pill));
-                const ui::AdaptiveSurface& ps = ui::adaptivePanel(
-                    ui::panelId("host_agent_glass_pill"), prr, ui::GlassGroup::Copilot);
-                ImDrawList* pdl = ImGui::GetWindowDrawList();
-                ui::glassPanel(pdl, prr, ui::GlassLevel::UltraThin, pill * 0.5f / S, ps);
-                const bool clicked = ImGui::InvisibleButton("##cp_expand", ImVec2(pill, pill));
-                // "«" — expand the column back out toward the viewport.
-                const ImU32 gc = ImGui::ColorConvertFloat4ToU32(ps.textPrimary);
-                const ImVec2 cc(pp.x + pill * 0.5f, pp.y + pill * 0.5f);
-                const float ca = 4.0f * S;
-                for (int i = 0; i < 2; ++i) {
-                    const float ox = (i == 0 ? -2.5f : 2.5f) * S;
-                    pdl->AddLine(ImVec2(cc.x + ox + ca * 0.5f, cc.y - ca),
-                                 ImVec2(cc.x + ox - ca * 0.5f, cc.y), gc, 1.8f * S);
-                    pdl->AddLine(ImVec2(cc.x + ox - ca * 0.5f, cc.y),
-                                 ImVec2(cc.x + ox + ca * 0.5f, cc.y + ca), gc, 1.8f * S);
-                }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("ShopCraft Copilot");
-                if (clicked) s_cpCollapsed = false;
-            }
-            ImGui::End();
-            ImGui::PopStyleVar(3);
-            return;
-        }
-
+        // T-G21: vertical collapse — the column rolls UP to its header row (drawCopilotHeader)
+        // instead of shrinking to a pill in both axes (mirrors the FeatureManager column; see
+        // ui::PanelCollapseAnim). Width is unaffected by collapse.
+        const float winH = s_cpAnim.tick(s_cpCollapsed, colH);
         ImGui::SetNextWindowPos(ImVec2(band.maxX - margin - s_paneW, colY), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(s_paneW, colH), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(s_paneW, winH), ImGuiCond_Always);
         flags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoScrollbar |
@@ -3419,77 +3406,85 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     ImGui::Dummy(ImVec2(0, ui::metrics::U(1.5f)));
     drawCopilotHeader(st, busy);
     ImGui::Separator();
-    drawRuntimeBanner(st);
 
-    // Reserve the composer's height (measured last frame) so the conversation log fills the rest.
-    static float s_composerH = 0.0f;
-    const float bottomClearance = ui::metrics::U(5);
-    float reserve = (s_composerH > 0 ? s_composerH
-                                     : ImGui::GetFrameHeightWithSpacing() * 4.0f) +
-                    ui::metrics::U(2) + bottomClearance;
-    float chatH = ImGui::GetContentRegionAvail().y - reserve;
-    if (chatH < ui::metrics::px(120.0f)) chatH = ui::metrics::px(120.0f);
+    // T-G21: the title row + separator above IS the header strip a vertical collapse rolls up to
+    // — measure it (cursor position right after, symmetric-padded) so PanelCollapseAnim knows the
+    // exact collapsed target, same one-frame-lag trick as s_composerH below. Everything from the
+    // runtime banner down is gated on bodyVisible() so a collapsed column costs nothing per frame.
+    s_cpAnim.measureHeader();
+    if (s_cpAnim.bodyVisible()) {
+        drawRuntimeBanner(st);
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_None);
-    if (gShowSettingsView) {
-        drawSettingsView(st, busy);
-    } else if (st.showSessionsPicker) {
-        drawSessionsPanel(st, busy);
-    } else {
-        const float logW = ImGui::GetContentRegionAvail().x;
-        for (size_t mi = 0; mi < st.chat.size(); ++mi) {
-            ChatMsg& m = st.chat[mi];
-            ImGui::PushID((int)mi);
-            if (m.fromUser) {
-                drawUserBlock(m, fonts, logW);
+        // Reserve the composer's height (measured last frame) so the conversation log fills the rest.
+        static float s_composerH = 0.0f;
+        const float bottomClearance = ui::metrics::U(5);
+        float reserve = (s_composerH > 0 ? s_composerH
+                                         : ImGui::GetFrameHeightWithSpacing() * 4.0f) +
+                        ui::metrics::U(2) + bottomClearance;
+        float chatH = ImGui::GetContentRegionAvail().y - reserve;
+        if (chatH < ui::metrics::px(120.0f)) chatH = ui::metrics::px(120.0f);
+
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+        ImGui::BeginChild("chatlog", ImVec2(0, chatH), ImGuiChildFlags_None);
+        if (gShowSettingsView) {
+            drawSettingsView(st, busy);
+        } else if (st.showSessionsPicker) {
+            drawSessionsPanel(st, busy);
+        } else {
+            const float logW = ImGui::GetContentRegionAvail().x;
+            for (size_t mi = 0; mi < st.chat.size(); ++mi) {
+                ChatMsg& m = st.chat[mi];
+                ImGui::PushID((int)mi);
+                if (m.fromUser) {
+                    drawUserBlock(m, fonts, logW);
+                    ImGui::PopID();
+                    continue;
+                }
+                drawAssistantTurn(st, m, fonts, logW);
+                ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));
                 ImGui::PopID();
-                continue;
             }
-            drawAssistantTurn(st, m, fonts, logW);
-            ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));
-            ImGui::PopID();
+            if (!st.showSessionsPicker && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12)
+                ImGui::SetScrollHereY(1.0f);
         }
-        if (!st.showSessionsPicker && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12)
-            ImGui::SetScrollHereY(1.0f);
-    }
-    const bool  logScrolled = ImGui::GetScrollY() > 0.5f;
-    const ImVec2 logP0 = ImGui::GetWindowPos();
-    const float  logVisW = ImGui::GetWindowSize().x;
-    ImGui::EndChild();
-
-    // Top fade mask over the conversation scroll viewport: once the log is scrolled, the first
-    // visible line clips mid-glyph right under the header divider — wash those half glyphs out
-    // with a surface-tint gradient instead of showing them cut (visual-review fix). Drawn in its
-    // own input-transparent overlay CHILD submitted after the log, because the message cards are
-    // nested child windows that render after both the log's and this window's draw lists.
-    if (logScrolled) {
-        const ImVec2 keep = ImGui::GetCursorPos();
-        // One full text row tall, so a mid-glyph clipped line is washed out along its whole height.
-        const float fadeH = ImGui::GetTextLineHeight() + ui::metrics::px(6.0f);
-        ImGui::SetCursorScreenPos(logP0);
-        ImGui::BeginChild("##chatlog_fade", ImVec2(logVisW, fadeH), ImGuiChildFlags_None,
-                          ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoScrollbar |
-                          ImGuiWindowFlags_NoScrollWithMouse);
-        const ui::AdaptiveSurface& fsurf = chatSurf();
-        const ImU32 top = ImGui::ColorConvertFloat4ToU32(
-            ImVec4(fsurf.tint.x, fsurf.tint.y, fsurf.tint.z, 0.92f));
-        const ImU32 clear = ImGui::ColorConvertFloat4ToU32(
-            ImVec4(fsurf.tint.x, fsurf.tint.y, fsurf.tint.z, 0.0f));
-        ImGui::GetWindowDrawList()->AddRectFilledMultiColor(
-            logP0, ImVec2(logP0.x + logVisW, logP0.y + fadeH), top, top, clear, clear);
+        const bool  logScrolled = ImGui::GetScrollY() > 0.5f;
+        const ImVec2 logP0 = ImGui::GetWindowPos();
+        const float  logVisW = ImGui::GetWindowSize().x;
         ImGui::EndChild();
-        ImGui::SetCursorPos(keep);
-    }
-    ImGui::PopStyleColor();
 
-    // ---- composer (measure its height for next frame's reserve) ----
-    ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
-    ImGui::BeginGroup();
-    drawComposer(st, busy, canRun);
-    ImGui::EndGroup();
-    s_composerH = ImGui::GetItemRectSize().y + ui::metrics::U(1);
-    ImGui::Dummy(ImVec2(0, bottomClearance));
+        // Top fade mask over the conversation scroll viewport: once the log is scrolled, the first
+        // visible line clips mid-glyph right under the header divider — wash those half glyphs out
+        // with a surface-tint gradient instead of showing them cut (visual-review fix). Drawn in its
+        // own input-transparent overlay CHILD submitted after the log, because the message cards are
+        // nested child windows that render after both the log's and this window's draw lists.
+        if (logScrolled) {
+            const ImVec2 keep = ImGui::GetCursorPos();
+            // One full text row tall, so a mid-glyph clipped line is washed out along its whole height.
+            const float fadeH = ImGui::GetTextLineHeight() + ui::metrics::px(6.0f);
+            ImGui::SetCursorScreenPos(logP0);
+            ImGui::BeginChild("##chatlog_fade", ImVec2(logVisW, fadeH), ImGuiChildFlags_None,
+                              ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoScrollbar |
+                              ImGuiWindowFlags_NoScrollWithMouse);
+            const ui::AdaptiveSurface& fsurf = chatSurf();
+            const ImU32 top = ImGui::ColorConvertFloat4ToU32(
+                ImVec4(fsurf.tint.x, fsurf.tint.y, fsurf.tint.z, 0.92f));
+            const ImU32 clear = ImGui::ColorConvertFloat4ToU32(
+                ImVec4(fsurf.tint.x, fsurf.tint.y, fsurf.tint.z, 0.0f));
+            ImGui::GetWindowDrawList()->AddRectFilledMultiColor(
+                logP0, ImVec2(logP0.x + logVisW, logP0.y + fadeH), top, top, clear, clear);
+            ImGui::EndChild();
+            ImGui::SetCursorPos(keep);
+        }
+        ImGui::PopStyleColor();
+
+        // ---- composer (measure its height for next frame's reserve) ----
+        ImGui::Dummy(ImVec2(0, ui::metrics::U(1)));
+        ImGui::BeginGroup();
+        drawComposer(st, busy, canRun);
+        ImGui::EndGroup();
+        s_composerH = ImGui::GetItemRectSize().y + ui::metrics::U(1);
+        ImGui::Dummy(ImVec2(0, bottomClearance));
+    }  // s_cpAnim.bodyVisible()
 
     ImGui::End();
 }

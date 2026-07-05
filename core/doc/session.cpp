@@ -5289,8 +5289,23 @@ json doc_query(const std::string& doc_id, const json& query) {
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     if (r.shapes.empty())
         throw_no_bodies(doc_id, r, "query");
-    // Query the LAST body (bridge.py policy: bodies[-1]).
-    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(r.shapes.back(), query);
+    // Default: query the LAST body (bridge.py policy: bodies[-1]). An optional 1-based
+    // "body_id" in the query dict selects a SPECIFIC surviving solid instead — the same
+    // per-body selection eval_measure/eval_mass/eval_check already expose via eval_active_shape.
+    // This lets a caller (e.g. interface_check, T-BL49) enumerate each component's faces in a
+    // multibody/assembly doc, which the last-body-only default cannot do. 0/absent = last body.
+    int body_id = query.is_object() && query.contains("body_id") && query["body_id"].is_number()
+                      ? query["body_id"].get<int>() : 0;
+    const TopoDS_Shape* shape = &r.shapes.back();
+    if (body_id >= 1) {
+        if (body_id > static_cast<int>(r.shapes.size()))
+            throw OpError("invalid_op",
+                          "body_id " + std::to_string(body_id) + " out of range (doc has " +
+                              std::to_string(r.shapes.size()) + " bodies)",
+                          {{"reason", "bad body_id"}});
+        shape = &r.shapes[static_cast<std::size_t>(body_id - 1)];
+    }
+    aicad::doc::QueryPicks qp = aicad::doc::resolve_geom_query(*shape, query);
     if (!qp.error.empty())
         throw OpError("invalid_op", qp.error);
     int count = qp.selectors.is_array() ? static_cast<int>(qp.selectors.size()) : 0;

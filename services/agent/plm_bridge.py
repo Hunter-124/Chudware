@@ -368,6 +368,14 @@ class PLMBridge:
         if resolved_project_id is None and self._vault is not None:
             resolved_project_id = self._vault.project_id_for_run(self.run_id)
 
+        # Assist-tier gate (T-R3, plan §2): the copilot cuts checkpoints BY
+        # ITSELF only in AI-managed mode. When the vault can report the
+        # project's tier and it is not "managed", do nothing — no cut, no
+        # queue (the user has not opted into AI-cut entries). Vaults that
+        # cannot report a tier (mock/legacy) keep the previous behavior.
+        if resolved_project_id and not self._managed_mode_allows(resolved_project_id):
+            return None
+
         dedup = _dedup_key(self.run_id, trigger, buildgraph_node, audit_id)
 
         # Build plmlink record (§15 schema)
@@ -426,6 +434,21 @@ class PLMBridge:
         self._record_plmlink(plmlink)
         return plmlink
 
+    def _managed_mode_allows(self, project_id: str) -> bool:
+        """True unless the vault reports a non-managed assist tier (T-R3).
+
+        Duck-typed: vaults without ``ai_mode_for_project`` (MockVault, older
+        clients) cannot report a tier, so the gate stays open for them.
+        """
+        probe = getattr(self._vault, "ai_mode_for_project", None)
+        if not callable(probe):
+            return True
+        try:
+            mode = probe(project_id)
+        except Exception:
+            return True
+        return mode is None or mode == "managed"
+
     # ------------------------------------------------------------------
     # Offline flush
     # ------------------------------------------------------------------
@@ -447,6 +470,9 @@ class PLMBridge:
 
         if not resolved_project_id:
             return {"flushed": 0, "skipped": 0, "failed": 0, "error": "no_project_id"}
+
+        if not self._managed_mode_allows(resolved_project_id):
+            return {"flushed": 0, "skipped": 0, "failed": 0, "error": "ai_managed_off"}
 
         # Collect already-flushed dedup keys
         flushed_keys = self._flushed_dedup_keys()

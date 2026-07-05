@@ -32,10 +32,20 @@ static bool chip(const char* id, const char* icon, const char* label, bool activ
 
 void drawWorkspaceBar(AppState& s, float height) {
     const float S = theme::S();
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, TVEC(bg1));
+    // T-G23: the SW-style workspace tab strip shares the ribbon's T-G16 liquid-glass band treatment
+    // (adaptive surface + Thin material) so the tab row + ribbon read as one continuous glass chrome
+    // band over the full-width viewport, instead of an opaque bg1 strip.
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##wsbar", ImVec2(0, height), false,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    {
+        ImVec2 bwp = ImGui::GetWindowPos(), bws = ImGui::GetWindowSize();
+        ImRect bandRect(bwp, ImVec2(bwp.x + bws.x, bwp.y + bws.y));
+        const theme::AdaptiveSurface& bandSurf =
+            theme::adaptivePanel(theme::panelId("wsbar_glass"), bandRect);
+        theme::glassPanel(dl, bandRect, theme::MaterialLevel::Thin, 0.f, bandSurf);
+    }
     ImGui::SetCursorPos(ImVec2(12*S, (height-24*S)*0.5f));
 
     if (s.inSketch) {

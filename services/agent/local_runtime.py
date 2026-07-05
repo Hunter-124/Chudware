@@ -44,6 +44,11 @@ __all__ = [
     "register_routing_source",
     "LocalRuntimeError",
     "RuntimeInfo",
+    # Optional GPU transformers backend (T-W29) — extras-guarded.
+    "transformers_available",
+    "TransformersBackend",
+    "select_backend",
+    "BackendUnavailable",
 ]
 
 # --------------------------------------------------------------------------- constants
@@ -337,3 +342,150 @@ def register_routing_source(
         raise LocalRuntimeError(f"Failed to update routing.yaml: {exc}") from exc
 
     return True
+
+
+# --------------------------------------------------------------------------- T-W29
+# Optional GPU transformers backend + backend-selection seam.
+#
+# WHY THIS EXISTS (T-W29 tokenmaxx bench): the llama.cpp path (above) cannot run
+# non-autoregressive / diffusion decode and has no PyTorch dependency. A second,
+# EXTRAS-GUARDED backend lets us drive HuggingFace `transformers` models on the GPU
+# (e.g. a diffusion LM, or an autoregressive model for cross-checking) without
+# pulling torch into the gate venv. It is used by the bench and is the documented
+# seam T-W27's gym cycle 2 reuses for quality grading (backend chosen by env/config,
+# NOT a fork).
+#
+# HARD RULE honoured here: importing torch/transformers is deferred to call time and
+# wrapped so that when the extras are absent (the default gate venv) every entry point
+# fails cleanly with BackendUnavailable — no import-time crash, no all-skip pretense.
+# The bench proves it by RUNNING against a real torch venv on this machine.
+#
+# torch/transformers venv (documented, kept OUT of the gate venv):
+#     ~/.local/share/AI-CAD/torch-venv   (torch cu124 + transformers)
+# Point the bench / a backend consumer at it via that interpreter, e.g.
+#     ~/.local/share/AI-CAD/torch-venv/bin/python -m ...
+#
+# Backend selection seam (env-driven, config-overridable):
+#     AICAD_LOCAL_BACKEND = "llamacpp" (default) | "transformers"
+#     AICAD_TRANSFORMERS_MODEL = HF repo id or local path (transformers backend only)
+
+
+class BackendUnavailable(LocalRuntimeError):
+    """Raised when a requested backend's optional extras are not installed."""
+
+
+def transformers_available() -> bool:
+    """Return True iff torch + transformers import AND CUDA is visible.
+
+    Never raises. Safe to call from the gate venv (returns False there).
+    """
+    try:
+        import torch  # noqa: PLC0415
+        import transformers  # noqa: PLC0415,F401
+        return bool(torch.cuda.is_available())
+    except Exception:  # noqa: BLE001 - optional dep / no GPU
+        return False
+
+
+class TransformersBackend:
+    """Minimal GPU text-generation backend over HuggingFace ``transformers``.
+
+    Extras-guarded: constructing it imports torch/transformers lazily and raises
+    ``BackendUnavailable`` if they are missing. This is the non-llama.cpp path used
+    to bench diffusion / PyTorch models and the seam gym cycle 2 selects by config.
+
+    This class deliberately keeps a tiny surface (load / generate / unload). It does
+    NOT implement GBNF grammar constraint — transformers has no llama.cpp grammar
+    engine — so structured output on this path is prompted-JSON + external validation
+    (see ``services.agent.roles.validate_handoff``). That asymmetry is the key
+    tokenmaxx finding this backend exists to measure.
+    """
+
+    def __init__(self, model_id: str, *, dtype: str = "auto",
+                 device_map: str = "cuda", trust_remote_code: bool = False) -> None:
+        if not transformers_available():
+            raise BackendUnavailable(
+                "transformers backend requires torch+transformers with CUDA. "
+                "Install into a SEPARATE venv (e.g. ~/.local/share/AI-CAD/torch-venv) "
+                "— never the gate venv."
+            )
+        self.model_id = model_id
+        self.dtype = dtype
+        self.device_map = device_map
+        self.trust_remote_code = trust_remote_code
+        self._model = None
+        self._tok = None
+
+    def load(self) -> "TransformersBackend":
+        import torch  # noqa: PLC0415
+        from transformers import (  # noqa: PLC0415
+            AutoModelForCausalLM, AutoTokenizer,
+        )
+        dtype = None if self.dtype == "auto" else getattr(torch, self.dtype, None)
+        self._tok = AutoTokenizer.from_pretrained(
+            self.model_id, trust_remote_code=self.trust_remote_code)
+        self._model = AutoModelForCausalLM.from_pretrained(
+            self.model_id,
+            torch_dtype=dtype if dtype is not None else "auto",
+            device_map=self.device_map,
+            trust_remote_code=self.trust_remote_code,
+        )
+        return self
+
+    def generate(self, messages: list, *, max_new_tokens: int = 256,
+                 temperature: float = 0.0) -> dict:
+        """Chat-generate. Returns {text, prompt_tokens, completion_tokens, elapsed_s}."""
+        import torch  # noqa: PLC0415
+        if self._model is None:
+            self.load()
+        prompt = self._tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        inputs = self._tok(prompt, return_tensors="pt").to(self._model.device)
+        gen_kw: dict = {"max_new_tokens": max_new_tokens}
+        if temperature and temperature > 0:
+            gen_kw.update(do_sample=True, temperature=temperature)
+        else:
+            gen_kw.update(do_sample=False)
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            out = self._model.generate(**inputs, **gen_kw)
+        elapsed = time.perf_counter() - t0
+        prompt_len = inputs["input_ids"].shape[1]
+        new_tokens = out[0][prompt_len:]
+        text = self._tok.decode(new_tokens, skip_special_tokens=True)
+        return {
+            "text": text,
+            "prompt_tokens": int(prompt_len),
+            "completion_tokens": int(new_tokens.shape[0]),
+            "elapsed_s": elapsed,
+        }
+
+    def unload(self) -> None:
+        self._model = None
+        self._tok = None
+        try:
+            import torch  # noqa: PLC0415
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def select_backend(cfg: Optional[dict] = None) -> str:
+    """Return the local backend id to use: ``"llamacpp"`` (default) or
+    ``"transformers"``.
+
+    Resolution order (later wins): built-in default -> ``cfg["local_backend"]`` ->
+    ``AICAD_LOCAL_BACKEND`` env. This is the documented seam (T-W29 DoD) that lets
+    T-W27 gym cycle 2 pick a backend by config without forking the runtime.
+    """
+    import os as _os  # noqa: PLC0415
+    backend = "llamacpp"
+    if cfg and cfg.get("local_backend"):
+        backend = str(cfg["local_backend"])
+    env = _os.environ.get("AICAD_LOCAL_BACKEND")
+    if env:
+        backend = env
+    if backend not in ("llamacpp", "transformers"):
+        raise LocalRuntimeError(f"unknown local backend {backend!r}")
+    return backend

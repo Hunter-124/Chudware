@@ -1,5 +1,6 @@
 // core/cam/op_milling.cpp — 2.5D milling generators: face, contour/profile,
 // pocket (with islands), slot, 2D chamfer, helical bore.
+#define _USE_MATH_DEFINES  // MSVC needs this before <cmath> for M_PI (mirrors geom/plane.cpp)
 #include <algorithm>
 #include <cmath>
 

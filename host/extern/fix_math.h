@@ -51,7 +51,7 @@ long __cdecl lroundf(float);
 float __cdecl modff(float, float*);
 float __cdecl nearbyintf(float);
 float __cdecl nextafterf(float, float);
-float __cdecl nexttowardf(float, float);
+float __cdecl nexttowardf(float, long double);  // C99 signature (2nd arg long double) — matches the UCRT; (float,float) is an extern-C overload conflict (C2733) on the 10.0.26100 SDK
 float __cdecl powf(float, float);
 float __cdecl remainderf(float, float);
 float __cdecl remquof(float, float, int*);

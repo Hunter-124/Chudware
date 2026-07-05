@@ -1,5 +1,5 @@
-// T-U3 CAM workspace panel for the ui/imgui shell.
-#include <string> Hosts the job/setup/op tree, tool table
+// T-U3 CAM workspace panel for the ui/imgui shell. Hosts the job/setup/op tree, tool table
+#include <string>
 // editor, sim-result strip (machined fraction, gouges, engagement warnings from T-M2/M4), and
 // post-processor / setup-sheet actions. Built on panel_scaffold.h + theme:: tokens.
 // See docs/UI_PATTERN_LIBRARY.md, docs/GLASS_DESIGN_SPEC.md, and ui/abstract/cam_view.h.

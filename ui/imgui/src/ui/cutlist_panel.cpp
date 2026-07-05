@@ -1,5 +1,6 @@
 // Weldment Cut List — ported from host/src/ui/cutlist_panel.cpp (C5).
 #include "ui/cutlist_panel.h"
+#include "ui/layout.h"   // T-G23: setNextCommandDialogPlacement (overlay-band float anchor)
 
 #include <string>
 
@@ -60,6 +61,7 @@ void CutListPanel::refresh(AppState& st) {
 
 void CutListPanel::draw(AppState& st) {
     if (!showCutListPanel()) return;
+    ui::setNextCommandDialogPlacement();   // T-G23: float in overlay band (docked slot removed)
     if (!ImGui::Begin("Cut List", &showCutListPanel())) { ImGui::End(); return; }
 
         ImVec4 accentCol = c5::accent(); accentCol.w = 1.f;

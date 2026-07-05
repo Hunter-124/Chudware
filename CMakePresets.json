@@ -17,7 +17,7 @@
     {
       "name": "linux-app",
       "displayName": "Linux app (ImGui GUI, Ninja)",
-      "description": "Configure the new ImGui desktop GUI under app/.",
+      "description": "Configure the new ImGui desktop GUI (ui/imgui/). Output: build/linux-app/bin/AI-CAD2.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-app",
       "cacheVariables": {

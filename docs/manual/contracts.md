@@ -1,9 +1,9 @@
 # Contracts Summary
 
-29 frozen contracts under `contracts/`:
+30 frozen contracts under `contracts/`:
 
 - `README.md` — contracts/ — frozen interface seams
-- `advisor.md` — contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.4)
+- `advisor.md` — contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.5)
 - `agent_events.md` — Contract: Agent Events — `aicad.agent_events/1`
 - `dag_schema.md` — Contract: DAG Orchestrator Schema — `aicad.dag/1`
 - `deliverables.md` — Contract: Deliverables — `deliverables/1`
@@ -22,6 +22,7 @@
 - `narration.md` — Narration Style Guide
 - `parts.md` — Contract: Unified Parts Library — `aicad.parts/1`
 - `piping_schema.md` — Contract: `aicad.piping/1` document schema
+- `plm.md` — Contract: PLM / Version Control — `aicad.plm/1`
 - `providers.md` — Contract: Providers & Session Layer — v1
 - `requirements.md` — Contract: Requirements layer — `aicad.req/1`
 - `research_tools.md` — Contract: Research tools — look-it-up instead of recall (`research_*`)

@@ -3,7 +3,7 @@ id: T-R4
 title: PLM items & releases - part numbers, rev letters, release pinning + BOM freeze, where-used
 workstream: R
 owner: unassigned
-status: todo
+status: done
 branch: task/T-R4-plm-items-releases
 depends_on: [T-R2]
 lane: plm-projects

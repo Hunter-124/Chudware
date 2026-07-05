@@ -2,7 +2,16 @@
 Type=Application
 Name=AI-CAD
 Comment=AI-native parametric CAD
-Exec=AI-CAD2
+Exec=AI-CAD2 %F
 Icon=AI-CAD
 Categories=Graphics;Engineering;
 Terminal=false
+X-BinaryName=AI-CAD2
+X-SourceTree=ui/imgui
+# NOTE: binary is built as ui/imgui/build/bin/AI-CAD2 (preset: linux-app,
+# output: build/linux-app/bin/AI-CAD2). In the AppImage this is staged to
+# usr/bin/AI-CAD2 and launched via AppRun. For system installs, install
+# build/linux-app/bin/AI-CAD2 to a PATH directory.
+# BRANDING NOTE for Hunter: window title is "ShopCraft" (T-G3) but binary/desktop
+# name is AI-CAD2/AI-CAD. Renaming binary or product name is Hunter's call — not
+# changed here per T-G24 policy.

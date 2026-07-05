@@ -23,6 +23,8 @@ struct AskField {
     std::vector<std::string> options;  // choice: option values (label collapsed to value if absent)
     std::string family = "length";     // dimension: "length" | "angle" | "count"
     bool required = false;
+    bool multi = false;                // choice: true → multi-select, answer is JSON array (§1)
+    bool multiline = false;            // text: true → open-ended multiline field
 };
 
 struct AskForm {
@@ -41,6 +43,7 @@ AskForm parseAskBatch(const std::string& batchJson);
 // rawValues holes are skipped (unanswered fields don't appear in the envelope).
 // Dimension raw values are "<num> <unit>" (e.g. "0.5 in"); the `canonical` field is
 // NOT computed here (the Python core normalizes, contract §8/§10) -- only `value`.
+// Multi-select choice fields: rawValues[id] is a JSON array string (e.g. `["a","b"]`).
 std::string buildAnswersJson(const AskForm& form,
                               const std::map<std::string, std::string>& rawValues);
 

@@ -1441,6 +1441,17 @@ def run_mission(
         except Exception:  # noqa: BLE001
             ledger = None
 
+    # T-W28: snapshot the effective effort profile (presets + user overrides,
+    # all tiers) as a replayable ledger event at mission start. Best-effort —
+    # a missing/broken effort config must never block a mission.
+    if ledger is not None:
+        try:
+            from services.agent.effort import record_effort_snapshot
+            from services.agent.tiers import detect_tier_from_env
+            record_effort_snapshot(ledger, active_tier=detect_tier_from_env())
+        except Exception:  # noqa: BLE001
+            pass
+
     machine = PhaseMachine(ledger=ledger, flags=flags)
     completed: list[str] = []
 

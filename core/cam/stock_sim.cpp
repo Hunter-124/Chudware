@@ -1,6 +1,7 @@
 // core/cam/stock_sim.cpp — material-removal simulation, cycle-time estimation,
 // and the classified backplot. A top-down Z-dexel grid (HeightField) of the stock
 // is lowered by each cutting move; removed volume = initial minus remaining.
+#define _USE_MATH_DEFINES  // MSVC needs this before <cmath> for M_PI (mirrors geom/plane.cpp)
 #include "cam/stock_sim.h"
 
 #include <algorithm>

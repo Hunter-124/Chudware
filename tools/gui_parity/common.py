@@ -91,7 +91,12 @@ def run_scenario(binary_key: str, scenario: str, timeout_s: int = 300,
     env = resolve_env({"AI_CAD_SHOT": scenario, "AI_CAD_RPC_TRACE": trace})
     # Both binaries accept --shot; host also honors --ui-screenshot but --shot is common.
     flag = "--ui-screenshot" if binary_key == "host" else "--shot"
-    cmd = ["xvfb-run", "-a", bin_path, flag, shot]
+    # Use xvfb-run unless AI_CAD_SHOT_HEADED=1 (interactive walkthrough mode). This
+    # overrides DISPLAY so scripted runs never pop windows onto the user's desktop.
+    if os.environ.get("AI_CAD_SHOT_HEADED", "0") == "1":
+        cmd = [bin_path, flag, shot]
+    else:
+        cmd = ["xvfb-run", "-a", bin_path, flag, shot]
     t0 = time.time()
     # cwd: a per-binary dir so any cwd-relative artifact writes don't collide.
     proc = subprocess.run(cmd, env=env, cwd=run_dir, timeout=timeout_s,

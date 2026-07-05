@@ -22,6 +22,7 @@ struct ModelInfo {
     std::string label;
     bool vision = true;
     bool reasoning = true;
+    int contextLength = 0;  // 0 = use defaultContextWindowForModel fallback
 };
 
 inline const char* providerConfigName(int provider) {
@@ -86,13 +87,14 @@ inline const char* categoryLabel(const std::string& key) {
 }
 
 inline const std::vector<ModelInfo>& builtinModels() {
+    // contextLength is tokens (provider-documented). 0 = defer to defaultContextWindowForModel.
     static const std::vector<ModelInfo> kModels = {
-        {PROV_GEMINI, "gemini-2.5-pro", "Gemini 2.5 Pro", true, true},
-        {PROV_GEMINI, "gemini-2.5-flash", "Gemini 2.5 Flash", true, true},
-        {PROV_GEMINI, "gemini-2.0-flash", "Gemini 2.0 Flash", true, false},
-        {PROV_ANTHROPIC, "claude-opus-4-8", "Claude Opus 4.8", true, true},
-        {PROV_OPENAI, "gpt-4o", "GPT-4o", true, false},
-        {PROV_OPENAI, "o3", "OpenAI o3", false, true},
+        {PROV_GEMINI,    "gemini-2.5-pro",   "Gemini 2.5 Pro",   true,  true,  1048576},
+        {PROV_GEMINI,    "gemini-2.5-flash", "Gemini 2.5 Flash", true,  true,  1048576},
+        {PROV_GEMINI,    "gemini-2.0-flash", "Gemini 2.0 Flash", true,  false, 1048576},
+        {PROV_ANTHROPIC, "claude-opus-4-8",  "Claude Opus 4.8",  true,  true,  200000},
+        {PROV_OPENAI,    "gpt-4o",           "GPT-4o",           true,  false, 128000},
+        {PROV_OPENAI,    "o3",               "OpenAI o3",        false, true,  200000},
     };
     return kModels;
 }
@@ -199,6 +201,16 @@ inline int defaultContextWindowForModel(int provider, const std::string& id) {
         case PROV_CLOUDCOMPAT: return 128000;
         default: return 8192;
     }
+}
+
+// Returns the provider-documented context window for the selected model.
+// Prefers ModelInfo.contextLength when the registry entry knows the model; falls back to
+// the substring heuristic so new/custom models still get a reasonable value.
+inline int modelContextWindow(int provider, const std::string& id) {
+    for (const auto& m : builtinModels())
+        if (m.provider == provider && m.id == id && m.contextLength > 0)
+            return m.contextLength;
+    return defaultContextWindowForModel(provider, id);
 }
 
 inline int reasoningEffortOptions(int provider, const std::string& id,

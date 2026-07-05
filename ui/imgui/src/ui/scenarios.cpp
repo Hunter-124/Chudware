@@ -30,6 +30,7 @@
 #include "ui/agent_inspector_panel.h"  // T-W17
 #include "ui/watch_grid_panel.h"       // T-W17
 #include "ui/agent_settings_panel.h"   // T-W17
+#include "ui/ai_effort_section.h"      // T-W28
 #include "ui/sim_panel.h"                       // T-U6: sim studies (AI_CAD_SHOT=sim_studies)
 #include "artifact_view.h"
 #include "app/app_state.h"
@@ -108,15 +109,26 @@ static void resetDemoState(app::AppState& st) {
 static void seedChatShot(app::AppState& st) {
     using app::AgentBlock;
     using app::BlockKind;
+    // T-BL39: seed modelName on assistant blocks so the chat shot shows real attribution.
+    // Two turns with the same model (as the real single-provider path) — attribution must
+    // appear on each bubble and must never read "Assistant".
     AgentBlock u; u.kind = BlockKind::UserMsg;
     u.body = "make it 30mm tall with a chamfered top edge";
     st.agent.blocks.push_back(u);
-    AgentBlock a; a.kind = BlockKind::AssistantMsg;
-    a.body = "Raised the standoff to 30mm and chamfered the top rim.";
     AgentBlock t; t.kind = BlockKind::Thinking; t.title = "Thinking";
     t.body = "Edit the open hex standoff: 30mm tall + chamfered top.";
+    AgentBlock a; a.kind = BlockKind::AssistantMsg;
+    a.modelName = "Anthropic \xc2\xb7 claude-sonnet-4-6";  // mirrors ai_artifact model_info format
     a.body = "Done — height 30mm, 1mm chamfer on the top rim.";
     st.agent.blocks.insert(st.agent.blocks.end(), {t, a});
+    // Second turn to show attribution is per-message (multi-turn conversation).
+    AgentBlock u2; u2.kind = BlockKind::UserMsg;
+    u2.body = "add 4 M3 mounting holes on the base";
+    AgentBlock a2; a2.kind = BlockKind::AssistantMsg;
+    a2.modelName = "Anthropic \xc2\xb7 claude-sonnet-4-6";
+    a2.body = "Added a 4-hole M3 bolt circle on the bottom face.";
+    a2.anim = 1.f;
+    st.agent.blocks.insert(st.agent.blocks.end(), {u2, a2});
 }
 
 static void seedPlanShot(app::AppState& st) {
@@ -142,6 +154,133 @@ static void seedAssemblyShot(app::AppState& st) {
     a.body = "Built a 3-part assembly. The peg passes through both plates.";
     st.agent.blocks.push_back(a);
     st.workspace = cmd::Workspace::Assemble;
+}
+
+// T-BL40: seeds three Question blocks (one per required widget modality) so the headless
+// screenshot harness captures each variant without a live agent or worker round-trip.
+// The batch JSON follows the interaction contract §3 envelope exactly.
+static void seedQuestionShot(app::AppState& st) {
+    using app::AgentBlock;
+    using app::BlockKind;
+    using aicad::ui::parseAskBatch;
+
+    // Context: user asked to design something; agent needs clarification.
+    AgentBlock u; u.kind = BlockKind::UserMsg;
+    u.body = "Design me a custom bracket for the motor mount.";
+    u.anim = 1.f;
+    st.agent.blocks.push_back(u);
+
+    // Block 1: short answer (single-line text) + dimension — pushed first so it scrolls above.
+    {
+        const char* batchJson = R"({
+            "schema": "aicad.interaction/1",
+            "batch_id": "b_shot_text",
+            "scope": "run",
+            "run_id": "r_shot",
+            "blocking": true,
+            "questions": [
+                {
+                    "id": "label",
+                    "kind": "text",
+                    "prompt": "Short label to engrave on the bracket (e.g. part number)?",
+                    "suggested": "BKT-001",
+                    "required": false
+                },
+                {
+                    "id": "flange_width",
+                    "kind": "dimension",
+                    "family": "length",
+                    "prompt": "Flange width?",
+                    "suggested": {"value": 25, "unit": "mm"},
+                    "required": true
+                }
+            ]
+        })";
+        AgentBlock qb; qb.kind = BlockKind::Question; qb.title = "Agent question";
+        qb.anim = 1.f;
+        qb.askForm = parseAskBatch(batchJson);
+        qb.askFields.resize(qb.askForm.fields.size());
+        st.agent.blocks.push_back(std::move(qb));
+    }
+
+    // Block 2: open-ended (multiline text) + approval.
+    {
+        const char* batchJson = R"({
+            "schema": "aicad.interaction/1",
+            "batch_id": "b_shot_openended",
+            "scope": "run",
+            "run_id": "r_shot",
+            "blocking": true,
+            "questions": [
+                {
+                    "id": "special_notes",
+                    "kind": "text",
+                    "multiline": true,
+                    "prompt": "Any special requirements or notes for this bracket?",
+                    "suggested": "",
+                    "required": false
+                },
+                {
+                    "id": "proceed",
+                    "kind": "approval",
+                    "prompt": "Proceed with building the bracket using your answers above?",
+                    "proposal": "Build bracket with selected options and dimensions",
+                    "suggested": true,
+                    "required": true
+                }
+            ]
+        })";
+        AgentBlock qb; qb.kind = BlockKind::Question; qb.title = "Agent question";
+        qb.anim = 1.f;
+        qb.askForm = parseAskBatch(batchJson);
+        qb.askFields.resize(qb.askForm.fields.size());
+        st.agent.blocks.push_back(std::move(qb));
+    }
+
+    // Block 3 (last = visible at bottom): multiple choice (single-select + multi-select).
+    // The agent panel scrolls to bottom, so this block is guaranteed in-frame.
+    {
+        const char* batchJson = R"({
+            "schema": "aicad.interaction/1",
+            "batch_id": "b_shot_choice",
+            "scope": "run",
+            "run_id": "r_shot",
+            "blocking": true,
+            "questions": [
+                {
+                    "id": "material",
+                    "kind": "choice",
+                    "prompt": "What material should the bracket be made from?",
+                    "why": "Drives wall thickness and surface finish options.",
+                    "suggested": "aluminium_6061",
+                    "required": true,
+                    "options": [
+                        {"value": "aluminium_6061", "label": "Aluminium 6061"},
+                        {"value": "steel_mild",    "label": "Mild steel"},
+                        {"value": "carbon_fibre",  "label": "Carbon fibre"}
+                    ]
+                },
+                {
+                    "id": "features",
+                    "kind": "choice",
+                    "prompt": "Which optional features do you need?",
+                    "suggested": ["drain_slot"],
+                    "required": false,
+                    "multi": true,
+                    "options": [
+                        {"value": "drain_slot",  "label": "Drain slot"},
+                        {"value": "gussets",     "label": "Gussets"},
+                        {"value": "cable_clips", "label": "Cable clips"}
+                    ]
+                }
+            ]
+        })";
+        AgentBlock qb; qb.kind = BlockKind::Question; qb.title = "Agent question";
+        qb.anim = 1.f;
+        qb.askForm = parseAskBatch(batchJson);
+        qb.askFields.resize(qb.askForm.fields.size());
+        st.agent.blocks.push_back(std::move(qb));
+    }
 }
 
 // Seeds the T-F16 preview pane deterministically (no worker round-trip): a few representative
@@ -264,6 +403,7 @@ void setScenarioContext(ScenarioRunner* runner, ShotConfig* cfg) {
 int ShotConfig::captureFrameBudget() const {
     if (wantFlow && !flowShotDone) return 999999;
     if (wantFea && !feaShotDone) return 999999;
+    if (wantFeaOverlay && !feaOverlayShotDone) return 999999;  // T-SIM2: spin until overlay settles
     if (wantCam && !camShotDone) return 999999;
     if (wantEcad && !ecadShotDone) return 150;
     if (wantBom && !bomShotDone) return 150;
@@ -276,6 +416,7 @@ int ShotConfig::captureFrameBudget() const {
     if (wantPartsBrowser) return partsBrowserShotDone ? 10 : 30;
     if (isScenarioMode()) return 999999;
     if (wantGlassperf) return glassperfShotDone ? 10 : 400;
+    if (wantQuestion) return 20;  // T-BL40: let layout stabilize (frame 1 has near-zero logW)
     return 6;
 }
 
@@ -311,6 +452,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantSketchAutohide = eq("sketch_autohide");  // T-BL41 proof: annotations hidden unless SmartDim
     cfg.wantSketchConvert = eq("sketch_convert");   // T-BL43 Convert Entities in-sketch shot
     cfg.wantFea = eq("fea");
+    cfg.wantFeaOverlay = eq("fea_overlay");   // T-SIM2: precomputed-result contour render
     cfg.wantCam = eq("cam");
     cfg.wantFlow = eq("flow");
     cfg.wantDrawing = eq("drawing");
@@ -328,6 +470,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantHydraulic    = eq("hydraulic_view");    // T-U7
     cfg.wantStructural   = eq("structural_view");   // T-U7
     cfg.wantGallery       = eq("gallery");
+    cfg.wantQuestion      = eq("question");           // T-BL40: inline ask_user cards
     cfg.wantMissionControl = eq("mission_control");  // T-F17
     cfg.wantAgentInspector      = eq("agent_inspector");        // T-W17
     cfg.wantAgentInspectorEmpty = eq("agent_inspector_empty");  // T-W17
@@ -337,12 +480,57 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantAgentSettings       = eq("agent_settings");         // T-W17
     cfg.wantAgentSettingsError  = eq("agent_settings_error");   // T-W17
     cfg.wantSimStudies   = eq("sim_studies");   // T-U6
+    // T-G22: per-tab settings shots + composer dropdown + permissions popup
+    cfg.wantSettingsGeneral    = eq("settings_general");
+    cfg.wantSettingsAI         = eq("settings_ai");
+    cfg.wantSettingsPrompts    = eq("settings_prompts");
+    cfg.wantSettingsAdvanced   = eq("settings_advanced");
+    cfg.wantComposerDropdown   = eq("composer_dropdown");
+    cfg.wantPermissionsPopup   = eq("permissions_popup");
+    // T-W28: AI Effort section shots (settings modal AI tab, fixture-seeded)
+    cfg.wantAiEffortSimple   = eq("ai_effort_simple");
+    cfg.wantAiEffortAdvanced = eq("ai_effort_advanced");
+    cfg.wantAiEffortWarn     = eq("ai_effort_warn");
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
     if (cfg.wantSettings) {
         settingsUi().wantSettings = true;
         settingsUi().openSettings = true;
+    }
+    // T-G22: per-tab settings shots — open modal on the appropriate tab
+    if (cfg.wantSettingsGeneral) {
+        settingsUi().openSettings = true;
+        settingsUi().openSettingsTab = 0;
+    }
+    if (cfg.wantSettingsAI) {
+        settingsUi().openSettings = true;
+        settingsUi().openSettingsTab = 1;
+    }
+    if (cfg.wantSettingsPrompts) {
+        settingsUi().openSettings = true;
+        settingsUi().openSettingsTab = 2;
+    }
+    if (cfg.wantSettingsAdvanced) {
+        settingsUi().openSettings = true;
+        settingsUi().openSettingsTab = 3;
+    }
+    // T-W28: AI Effort shots — open the modal on the AI tab; the effort model is
+    // seeded from a committed fixture below (no python subprocess in shot mode).
+    if (cfg.wantAiEffortSimple || cfg.wantAiEffortAdvanced || cfg.wantAiEffortWarn) {
+        settingsUi().openSettings = true;
+        settingsUi().openSettingsTab = 1;
+    }
+    if (cfg.wantComposerDropdown) {
+        // Composer model dropdown: seed chat state so the composer is visible and the
+        // dropdown opens on the next frame via the UI infrastructure.
+        seedChatShot(st);
+        settingsUi().openComposerModelDropdown = true;
+    }
+    if (cfg.wantPermissionsPopup) {
+        // Permissions popup: seed chat so the prelude bar is visible, open the popup.
+        seedChatShot(st);
+        settingsUi().openPermissionsPopup = true;
     }
     if (cfg.wantExplorer) st.railTab = kFilesRailTab;
     if (cfg.wantRibbon) {
@@ -354,7 +542,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
         st.workspace = cmd::Workspace::Sketch;
         ribbon::applyShotEnv(st);
     }
-    if (cfg.wantFea || cfg.wantFlow) {
+    if (cfg.wantFea || cfg.wantFlow || cfg.wantFeaOverlay) {
         st.workspace = cmd::Workspace::Simulate;
         ribbon::applyShotEnv(st);
     }
@@ -383,6 +571,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantPlan) seedPlanShot(st);
     if (cfg.wantAssembly) seedAssemblyShot(st);
     if (cfg.wantPreview) seedPreviewShot(st);
+    if (cfg.wantQuestion) seedQuestionShot(st);  // T-BL40
     if (cfg.wantScaffoldDemo)  ui::openScaffoldDemoPanel();
     if (cfg.wantPartsBrowser)  ui::openPartsPanel();
     cfg.wantCamWorkspace = eq("cam_workspace");
@@ -461,6 +650,22 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
             std::printf("agent_settings: seeded from %s (%zu bytes)\n", vf.c_str(), json.size());
         } else {
             std::printf("agent_settings: fixtures dir not found\n");
+        }
+        std::fflush(stdout);
+    }
+    // T-W28: seed the AI Effort section from a committed effort view fixture.
+    if (cfg.wantAiEffortSimple || cfg.wantAiEffortAdvanced || cfg.wantAiEffortWarn) {
+        std::string fx;
+        if (findFixturesDir(fx)) {
+            const char* which = cfg.wantAiEffortWarn       ? "/effort/effort_view_warn.json"
+                                : cfg.wantAiEffortAdvanced ? "/effort/effort_view_advanced.json"
+                                                           : "/effort/effort_view.json";
+            const std::string vf = fx + which;
+            const std::string json = readWholeFile(vf);
+            ui::seedAiEffortFromViewJson(json);
+            std::printf("ai_effort: seeded from %s (%zu bytes)\n", vf.c_str(), json.size());
+        } else {
+            std::printf("ai_effort: fixtures dir not found\n");
         }
         std::fflush(stdout);
     }
@@ -1858,6 +2063,8 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 break;
         }
         if (saStep <= 3) ++saStep;
+    }
+
     // ---------- sketch_convert (T-BL43 Convert Entities: external face loop -> in-sketch) ----
     // Builds a 40x40x20 box, opens an EMPTY sketch on its top face, then fires the exact
     // `sketch_convert` op the GUI Convert tool emits (host + ui/imgui applyConvertRef) with
@@ -2024,6 +2231,45 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 break;
             }
             default: cfg.feaShotDone = true; break;
+        }
+    }
+
+    // ---------- fea_overlay (T-SIM2): render a precomputed FEA result contour ----------
+    // Netgen (the live tet mesher) is not provisionable in this environment, so the fully-live
+    // meshed solve cannot run here. This scenario instead loads a result AICM produced offline
+    // by the REAL fea_static_solve + static_overlay (surface skinning + nodal-field mapping +
+    // the T-SIM2 size cap) and drives the SAME viewport contour path the app uses at runtime
+    // (viewportLoadResultAicm -> C19 colormap LUT + deformed shape + legend). No worker needed.
+    if (cfg.wantFeaOverlay && !cfg.feaOverlayShotDone) {
+        // Re-assert the result overlay EVERY frame until capture. The viewport's per-frame
+        // ensureDocLoaded() reloads the editable model mesh whenever the engine revision moves
+        // (tab/doc setup during startup), which would clobber a one-shot overlay load — the real
+        // app avoids this by re-applying the overlay each frame from syncResultView() while the
+        // Results node is active. We mirror that here, and pin viewMeshRev to a sentinel so
+        // ensureDocLoaded() does not fight us on the settle frames.
+        const std::string aicm = repoBase() + "/contracts/fixtures/sim2_cantilever_result.aicm";
+        float vmin = 0.f, vmax = 1.f, dispHint = 1.f;
+        const bool ok = viewportLoadResultAicm(aicm, "von_mises", vmin, vmax, dispHint);
+        if (ok) {
+            // Make ensureDocLoaded() return early (viewMeshRev == revision && hasMesh()) so it does
+            // NOT re-derive the editable model mesh over our just-loaded result overlay.
+            st.viewMeshRev = st.engine.revision();
+            auto& vs = viewportState();
+            vs.legendOn    = true;
+            vs.legendTitle = "von Mises";
+            vs.legendUnits = "MPa";
+            vs.legendMin   = vmin;
+            vs.legendMax   = vmax;
+            if (dispHint > 0.f) viewportSetDeformScale(dispHint);  // SolidWorks-style deformed shape
+            st.workspace = cmd::Workspace::Simulate;
+        }
+        if (cfg.feaOverlaySettle == 0) {
+            std::printf("fea_overlay: load ok=%d vmin=%.3g vmax=%.3g dispHint=%.3g (%s)\n",
+                        (int)ok, vmin, vmax, dispHint, aicm.c_str());
+            std::fflush(stdout);
+            cfg.feaOverlaySettle = 8;  // hold a few frames so the colormap upload + camera frame settle
+        } else if (--cfg.feaOverlaySettle == 0) {
+            cfg.feaOverlayShotDone = true;
         }
     }
 
@@ -2206,7 +2452,7 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 actSettle = kSettle; ++actStep; break;
             case 4:
                 settingsUi().openSettings = true;
-                settingsUi().openSettingsTab = 3;
+                settingsUi().openSettingsTab = 2;  // T-G22: tab 2 = Prompts (pendingPromptRole drives jumpToAgents)
                 settingsUi().pendingPromptRole = "modeler";
                 actSettle = kSettle * 2; ++actStep; break;
             case 5:
@@ -2539,6 +2785,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppSt
         }
         if (win) glfwSwapBuffers(win);
         return cfg.sketchAutohideShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
     if (cfg.wantSketchConvert) {
         if (!scvCapture.empty()) { mirrorLast(scvCapture, "sketch_convert_01_insketch"); scvCapture.clear(); }
         if (win) glfwSwapBuffers(win);
@@ -2560,6 +2807,15 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppSt
     }
     if (cfg.wantFlow) {
         if (cfg.flowShotDone) {
+            writeBackbufferPng(screenshotPath, dw, dh);
+            if (win) glfwSwapBuffers(win);
+            return FrameAction::Break;
+        }
+        if (win) glfwSwapBuffers(win);
+        return FrameAction::Continue;
+    }
+    if (cfg.wantFeaOverlay) {  // T-SIM2: capture the precomputed-result contour once it settles
+        if (cfg.feaOverlayShotDone) {
             writeBackbufferPng(screenshotPath, dw, dh);
             if (win) glfwSwapBuffers(win);
             return FrameAction::Break;

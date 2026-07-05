@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <sstream>
 
@@ -391,6 +392,12 @@ nlohmann::json SimManager::studyToJson(const Study& s) {
                      {"surface", s.fatigueSurface}, {"load_case", s.fatigueLoadCase},
                      {"size_mm", s.fatigueSizeMm}, {"temp_c", s.fatigueTempC},
                      {"reliability", s.fatigueReliability}}},
+        // T-SIM1: thermal (conduction) BC INPUTS — persisted so a refresh keeps the user's
+        // settings (parallel to the flow block; conductivity is re-derived from the material).
+        {"thermal", {{"hot_temp_c", s.thermalHotTempC}, {"use_cold_face", s.thermalUseColdFace},
+                     {"cold_temp_c", s.thermalColdTempC}, {"use_convection", s.thermalUseConvection},
+                     {"conv_h", s.thermalConvH}, {"amb_c", s.thermalAmbC},
+                     {"use_flux", s.thermalUseFlux}, {"flux_wm2", s.thermalFluxWm2}}},
         {"result_summary", s.summary},
     };
 }
@@ -438,6 +445,17 @@ Study SimManager::studyFromJson(const nlohmann::json& j) {
         s.flowWallTempC = fl.value("wall_temp_c", 80.0); s.flowWallFluxWm2 = fl.value("wall_flux_wm2", 0.0);
         s.flowWallPowerW = fl.value("wall_power_w", 10.0); s.flowSolidKappa = fl.value("solid_kappa", 200.0);
         s.flowPowerW = fl.value("power_w", 20.0);
+    }
+    if (j.contains("thermal") && j["thermal"].is_object()) {
+        const auto& th = j["thermal"];
+        s.thermalHotTempC = th.value("hot_temp_c", 100.0);
+        s.thermalUseColdFace = th.value("use_cold_face", false);
+        s.thermalColdTempC = th.value("cold_temp_c", 20.0);
+        s.thermalUseConvection = th.value("use_convection", true);
+        s.thermalConvH = th.value("conv_h", 25.0);
+        s.thermalAmbC = th.value("amb_c", 20.0);
+        s.thermalUseFlux = th.value("use_flux", false);
+        s.thermalFluxWm2 = th.value("flux_wm2", 0.0);
     }
     if (j.contains("fatigue") && j["fatigue"].is_object()) {
         const auto& fa = j["fatigue"];
@@ -657,7 +675,11 @@ void SimManager::applyResultField(app::AppState& st, Study& s) {
     std::string label, unit; double fromSI = 1.0;
     fieldMeta(u, activeScalarField_, label, unit, fromSI);
     auto& vs = viewportState();
-    vs.legendOn = true;
+    // T-SIM2: honour this study's "Show contour" toggle on (re)load. viewportLoadResultAicm
+    // unconditionally turns the colormap on, so re-apply the toggle intent here and gate the
+    // legend to match — a field switch or result reload with contour OFF stays off.
+    viewportSetColormapMode(s.contourOn);
+    vs.legendOn = s.contourOn;
     vs.legendTitle = label;
     vs.legendUnits = unit;
     vs.legendMin = (float)(vmin * fromSI);
@@ -717,6 +739,11 @@ nlohmann::json SimManager::facePointsFor(app::AppState& st, const nlohmann::json
 }
 
 void SimManager::run(app::AppState& st, Study& s) {
+    // T-SIM1: a Thermal study is a steady-state CONDUCTION FEA (sim_run_thermal), NOT the
+    // OpenFOAM-CHT flow path. Intercept it here before the isFlowFamily() branch (which stays
+    // shared with the Flow study and the T-SIM2/T-SIM3 rendering) so the flow dispatch is
+    // untouched — additive seam only.
+    if (s.type == StudyType::Thermal) { runThermal(st, s); return; }
     if (isFlowFamily(s.type)) runFlow(st, s);
     else if (s.type == StudyType::Fatigue) runFatigue(st, s);
     else runStaticOrModal(st, s);
@@ -910,6 +937,99 @@ void SimManager::runFlow(app::AppState& st, Study& s) {
     c5::addLog(st, note);
 }
 
+// T-SIM1: thermal conductivity table (W/m·K) keyed by the same sim keys as materials.json.
+// Loaded from the cited data file engine/sim/thermal_conductivity.json (never invented
+// inline). Returns 0.0 when the material has no tabulated conductivity.
+static double thermalConductivityFor(const std::string& materialKey) {
+    static std::map<std::string, double> table;
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        try {
+            std::ifstream f(repoRoot() + "/engine/sim/thermal_conductivity.json");
+            if (f) {
+                nlohmann::json j; f >> j;
+                for (auto it = j.begin(); it != j.end(); ++it)
+                    if (it.key().rfind("_", 0) != 0 && it.value().is_number())
+                        table[it.key()] = it.value().get<double>();
+            }
+        } catch (...) { /* missing/table parse failure -> empty table, auto=0 */ }
+    }
+    auto it = table.find(materialKey);
+    return it != table.end() ? it->second : 0.0;
+}
+
+void SimManager::runThermal(app::AppState& st, Study& s) {
+    if (!st.docMirror.hasDoc()) { c5::addLog(st, "[sim] no document to analyse"); return; }
+    // Conductivity from the cited data table (W/m·K); the glue converts to mesh units.
+    const double k_w_mk = thermalConductivityFor(s.materialKey);
+    if (!(k_w_mk > 0.0)) {
+        c5::toast(ToastLevel::Warn, "This material has no thermal conductivity in the table");
+        c5::addLog(st, "[sim] thermal: material '" + s.materialKey + "' has no conductivity (k)");
+        return;
+    }
+    s.thermalKwmk = (float)k_w_mk;
+    std::string stepPath = platform::joinPath(platform::cacheDir(), "sim_thermal.step");
+    {
+        nlohmann::json r, p = {{"doc_id", st.docMirror.docId()}, {"path", stepPath}};
+        std::string e;
+        if (!st.worker.call("doc_export_step", p, r, e, 60000) || r.contains("code")) {
+            c5::addLog(st, "[sim] export STEP failed: " + (r.contains("code") ? r.value("message", e) : e));
+            c5::toast(ToastLevel::Error, "Simulation: export failed");
+            return;
+        }
+        lastStepPath_ = r.value("path", stepPath);
+    }
+    // Fixtures -> Dirichlet fixed-temperature faces (all at the hot temperature).
+    nlohmann::json fixtures = nlohmann::json::array();
+    for (const auto& p : s.fixtures.picks) {
+        std::string e; auto fp = facePointsFor(st, p.selector, e);
+        if (!fp.is_null() && fp.contains("points")) { fp["temp_c"] = s.thermalHotTempC; fixtures.push_back(fp); }
+    }
+    if (fixtures.empty()) {
+        c5::addLog(st, "[sim] thermal: add at least one fixed-temperature face before running");
+        c5::toast(ToastLevel::Warn, "Add a fixed-temperature face before running");
+        return;
+    }
+    // Loads -> the cold-side boundary on the LOAD faces: a second fixed temperature, a
+    // convection film, or a heat flux (mirrors how the force/pressure dialogs map load faces).
+    nlohmann::json loads = nlohmann::json::array();
+    nlohmann::json coldFixtures = nlohmann::json::array();
+    for (const auto& ld : s.loads) {
+        nlohmann::json faces = nlohmann::json::array();
+        for (const auto& p : ld.faces.picks) {
+            std::string e; auto fp = facePointsFor(st, p.selector, e);
+            if (!fp.is_null() && fp.contains("points")) {
+                if (faces.empty()) faces = fp;
+                else for (auto& pt : fp["points"]) faces["points"].push_back(pt);
+            }
+        }
+        if (faces.empty()) continue;
+        if (s.thermalUseColdFace) {
+            faces["temp_c"] = s.thermalColdTempC;
+            coldFixtures.push_back(faces);
+        } else if (s.thermalUseFlux) {
+            loads.push_back({{"faces", faces}, {"type", "flux"}, {"magnitude", s.thermalFluxWm2}});
+        } else {  // convection (default)
+            loads.push_back({{"faces", faces}, {"type", "convection"},
+                             {"h", s.thermalConvH}, {"t_amb_c", s.thermalAmbC}});
+        }
+    }
+    for (auto& cf : coldFixtures) fixtures.push_back(cf);
+
+    nlohmann::json material = {{"k_w_mk", k_w_mk}};
+    nlohmann::json study = {{"step_path", lastStepPath_}, {"material", material},
+                            {"fixtures", fixtures}, {"loads", loads}};
+    addMeshParams(study, s, s.meshOrder);
+    std::string note;
+    if (st.simClient.launch("sim_run_thermal", {{"study", study}}, note, st.docMirror.docId())) {
+        clearTransientResult(s);
+        resultShown_ = false; shownStudyId_.clear();
+        running_ = true; runningStudy_ = sel_; runningStudyId_ = s.id;
+    }
+    c5::addLog(st, note);
+}
+
 // ---------------------------------------------------------------- tick / result view
 
 void SimManager::clearResultOverlay(app::AppState&) {
@@ -992,9 +1112,30 @@ void SimManager::tick(app::AppState& st) {
         }
         const auto& res = job.result;
         s.hasResult = true;
+        s.contourOn = true;  // T-SIM2: a fresh result shows its contour by default
         s.solverNotes.clear();
         if (res.contains("solver_notes") && res["solver_notes"].is_array())
             for (const auto& n : res["solver_notes"]) if (n.is_string()) s.solverNotes.push_back(n.get<std::string>());
+        if (s.type == StudyType::Thermal) {
+            // T-SIM1: steady-state conduction result — {summary:{max_temp_c,min_temp_c},
+            // temperature[n], n_nodes,...}. Parsed here before the shared isFlowFamily branch
+            // (which handles the OpenFOAM-CHT flow result) so the flow path stays untouched.
+            s.nNodes = res.value("n_nodes", 0); s.nElems = res.value("n_elems", 0);
+            s.nDof = res.value("n_dof", 0);
+            s.resultSummary = (res.contains("summary") && res["summary"].is_object())
+                                  ? res["summary"] : nlohmann::json::object();
+            s.maxTempC = s.resultSummary.value("max_temp_c", 0.0);
+            s.minTempC = s.resultSummary.value("min_temp_c", 0.0);
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "max %.1f degC | min %.1f degC (k=%.1f W/m.K)",
+                          s.maxTempC, s.minTempC, s.thermalKwmk);
+            s.summary = buf;
+            resultShown_ = true; shownStudyId_ = s.id;
+            c5::addLog(st, "[sim] thermal done: " + s.summary);
+            persist(st, s);
+            node_ = SimNode::Results;
+            return;
+        }
         if (isFlowFamily(s.type)) {
             s.dragN = res.value("drag_n", 0.0); s.liftN = res.value("lift_n", 0.0);
             s.sideN = res.value("side_n", 0.0); s.cd = res.value("cd", 0.0); s.cl = res.value("cl", 0.0);
@@ -1069,6 +1210,20 @@ void SimManager::tick(app::AppState& st) {
 
 // ---- pre-flight readiness gate ----
 static bool studyReady(const Study& s, std::string& blocker) {
+    // T-SIM1: a thermal conduction study needs a material (for conductivity) and at least one
+    // fixed-temperature (hot) face. Checked before the isFlowFamily early-return, which stays
+    // the gate for the actual Flow study.
+    if (s.type == StudyType::Thermal) {
+        if (s.materialKey.empty()) {
+            blocker = "Material required - pick a material with a thermal conductivity.";
+            return false;
+        }
+        if (s.fixtures.empty()) {
+            blocker = "At least one fixed-temperature (hot) face is required.";
+            return false;
+        }
+        return true;
+    }
     if (isFlowFamily(s.type)) return true;
     if (s.materialKey.empty()) { blocker = "Material required - pick a material before running."; return false; }
     if (s.type != StudyType::Modal && s.fixtures.empty()) {
@@ -1196,9 +1351,6 @@ void SimManager::drawStudyRow(app::AppState& st, int i) {
         if (!isFlowFamily(s.type))
             child("material", "Material: " + matName, SimNode::Material, !s.materialKey.empty(),
                   s.materialKey.empty() ? "No material assigned - pick one before running." : "");
-        if (s.type == StudyType::Thermal)
-            child("study_thermal", "Heat source / wall BC", SimNode::Study, true,
-                  "Configure the thermal boundary condition in the study form.");
         if (!isFlowFamily(s.type)) {
             bool hasFix = !s.fixtures.empty();
             child("fixture", "Fixtures (" + s.fixtures.label() + ")", SimNode::Fixtures, hasFix,
@@ -1212,6 +1364,23 @@ void SimManager::drawStudyRow(app::AppState& st, int i) {
                     child(ld.pressure ? "load_pressure" : "load_force", lbl, SimNode::Load, !ld.faces.empty(),
                           ld.faces.empty() ? "This load has no faces selected." : "", li);
                 }
+            }
+            child("mesh", "Mesh", SimNode::Mesh, true, "Mesh density for the solve.");
+        }
+        // T-SIM1: Thermal (conduction) tree — a self-contained ADDITIVE branch (does not touch
+        // the shared !isFlowFamily block above or the Flow tree). Material / fixed-temp faces /
+        // cold-boundary loads / mesh, then the shared Results node below.
+        if (s.type == StudyType::Thermal) {
+            child("material", "Material: " + matName, SimNode::Material, !s.materialKey.empty(),
+                  s.materialKey.empty() ? "Pick a material with a thermal conductivity." : "");
+            bool hasFix = !s.fixtures.empty();
+            child("fixture", "Fixed-temp faces (" + s.fixtures.label() + ")", SimNode::Fixtures, hasFix,
+                  hasFix ? "" : "A thermal study needs at least one fixed-temperature face.");
+            for (int li = 0; li < (int)s.loads.size(); ++li) {
+                const SimLoad& ld = s.loads[li];
+                std::string lbl = "Cold boundary " + std::to_string(li + 1) + " (" + ld.faces.label() + ")";
+                child("load_pressure", lbl, SimNode::Load, !ld.faces.empty(),
+                      ld.faces.empty() ? "This boundary has no faces selected." : "", li);
             }
             child("mesh", "Mesh", SimNode::Mesh, true, "Mesh density for the solve.");
         }
@@ -1811,7 +1980,16 @@ void SimManager::drawResultControls(app::AppState& st, Study& s) {
         return std::string(b);
     };
     if (s.type != StudyType::Fatigue && ImGui::BeginTable("##restab", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH)) {
-        if (s.type == StudyType::Modal) {
+        if (s.type == StudyType::Thermal) {
+            // T-SIM1: steady-state conduction results row (max/min temperature).
+            const auto& sm = s.resultSummary;
+            std::snprintf(b, sizeof(b), "%.1f degC", sm.value("max_temp_c", s.maxTempC));
+            row("Max temperature", b);
+            std::snprintf(b, sizeof(b), "%.1f degC", sm.value("min_temp_c", s.minTempC));
+            row("Min temperature", b);
+            std::snprintf(b, sizeof(b), "%.1f W/m.K", s.thermalKwmk);
+            row("Conductivity (k)", b);
+        } else if (s.type == StudyType::Modal) {
             for (size_t i = 0; i < s.freqs.size(); ++i) {
                 std::snprintf(b, sizeof(b), "%.2f Hz", s.freqs[i]);
                 row(("Mode " + std::to_string(i + 1)).c_str(), b);
@@ -1883,8 +2061,15 @@ void SimManager::drawResultControls(app::AppState& st, Study& s) {
     }
 
     ImGui::Spacing(); ImGui::Separator();
-    bool colormapOn = true;  // the panel keeps the colormap on while Results is the active view
-    if (ImGui::Checkbox("Show colormap", &colormapOn)) viewportSetColormapMode(colormapOn);
+    // T-SIM2: "Show contour" per-study toggle — persisted on the Study (s.contourOn) so it reflects
+    // real state across frames AND is per-study (was a per-frame `true` local that never tracked the
+    // toggle). Off hides BOTH the colormap pass and the legend bar so the part reads plainly.
+    if (ImGui::Checkbox("Show contour", &s.contourOn)) {
+        viewportSetColormapMode(s.contourOn);
+        viewportState().legendOn = s.contourOn;
+    }
+    simTip("Colour-map the selected result field over the part, with a min/max legend. "
+           "Turn off to see the plain shaded model.");
     if (!isFlowFamily(s.type)) {
         float curScale = viewportDeformScale();
         ImGui::Spacing();
@@ -1894,6 +2079,67 @@ void SimManager::drawResultControls(app::AppState& st, Study& s) {
         if (ImGui::SmallButton("1x (true)")) viewportSetDeformScale(1.0f);
         ImGui::SameLine();
         if (ImGui::SmallButton("Off")) viewportSetDeformScale(0.0f);
+    }
+}
+
+// T-SIM1: steady-state conduction inputs. Hot faces come from the Fixtures node (each held at
+// the hot temperature); the cold-side boundary is set here + applied to the Load faces as a
+// convection film, a heat flux, or a second fixed temperature (mirrors force/pressure choice).
+void SimManager::drawThermalForm(app::AppState& st, Study& s) {
+    ImGui::TextUnformatted("Steady-state heat conduction");
+    ImGui::TextDisabled("Fixtures = fixed-temperature (hot) faces. Loads = cold-side boundary.");
+    ImGui::Spacing();
+
+    // Conductivity readout from the cited table (auto from the selected material).
+    const double k = thermalConductivityFor(s.materialKey);
+    if (k > 0.0) {
+        s.thermalKwmk = (float)k;
+        ImGui::Text("Conductivity k = %.1f W/m.K", k);
+        simTip("From engine/sim/thermal_conductivity.json (cited data table).");
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, c5::warnCol());
+        ImGui::TextWrapped("Selected material has no tabulated thermal conductivity — pick a "
+                           "material with a k value (Material node).");
+        ImGui::PopStyleColor();
+    }
+    ImGui::Spacing();
+
+    ImGui::TextUnformatted("Fixed (hot) face temperature (degC)"); ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputFloat("##thot", &s.thermalHotTempC, 0, 0, "%.1f");
+    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Cold-side boundary (on Load faces)");
+    // Three mutually-exclusive modes: convection film, heat flux, or a fixed cold temperature.
+    int mode = s.thermalUseColdFace ? 2 : (s.thermalUseFlux ? 1 : 0);
+    static const char* kModes[3] = {"Convection film (h, T_ambient)", "Heat flux (W/m2)",
+                                    "Fixed temperature (degC)"};
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##thmode", kModes[mode])) {
+        for (int i = 0; i < 3; ++i)
+            if (ImGui::Selectable(kModes[i], mode == i)) {
+                s.thermalUseConvection = (i == 0);
+                s.thermalUseFlux = (i == 1);
+                s.thermalUseColdFace = (i == 2);
+                persist(st, s);
+            }
+        ImGui::EndCombo();
+    }
+    if (mode == 0) {
+        ImGui::TextUnformatted("Film coefficient h (W/m2.K)"); ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputFloat("##thh", &s.thermalConvH, 0, 0, "%.1f");
+        if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+        ImGui::TextUnformatted("Ambient temperature (degC)"); ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputFloat("##thamb", &s.thermalAmbC, 0, 0, "%.1f");
+        if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+    } else if (mode == 1) {
+        ImGui::TextUnformatted("Surface heat flux (W/m2, + into part)"); ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputFloat("##thflux", &s.thermalFluxWm2, 0, 0, "%.1f");
+        if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+    } else {
+        ImGui::TextUnformatted("Cold face temperature (degC)"); ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::InputFloat("##thcold", &s.thermalColdTempC, 0, 0, "%.1f");
+        if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
     }
 }
 
@@ -1925,8 +2171,10 @@ void SimManager::drawForm(app::AppState& st, Study& s) {
             drawResultControls(st, s);
             break;
         case SimNode::Material:
-            if (!isFlowFamily(s.type)) drawMaterialCombo(st, s);
-            else if (isFlowFamily(s.type)) drawFlowForm(st, s);
+            // Thermal (conduction) picks a material for its conductivity, like the FEA studies.
+            if (s.type == StudyType::Thermal) drawMaterialCombo(st, s);
+            else if (!isFlowFamily(s.type)) drawMaterialCombo(st, s);
+            else drawFlowForm(st, s);
             break;
         case SimNode::Fixtures:
             drawFixturesForm(st, s);
@@ -1939,7 +2187,8 @@ void SimManager::drawForm(app::AppState& st, Study& s) {
             break;
         case SimNode::Study:
         default:
-            if (isFlowFamily(s.type)) drawFlowForm(st, s);
+            if (s.type == StudyType::Thermal) { drawMaterialCombo(st, s); ImGui::Separator(); drawThermalForm(st, s); }
+            else if (isFlowFamily(s.type)) drawFlowForm(st, s);
             else if (s.type == StudyType::Fatigue) { drawMaterialCombo(st, s); ImGui::Separator(); drawFatigueForm(st, s); }
             else drawMaterialCombo(st, s);
             break;

@@ -1,4 +1,5 @@
 // core/cam/geometry.cpp — 2D machining geometry over Clipper2 (Boost license).
+#define _USE_MATH_DEFINES  // MSVC needs this before <cmath> for M_PI (mirrors geom/plane.cpp)
 #include "cam/geometry.h"
 
 #include <algorithm>

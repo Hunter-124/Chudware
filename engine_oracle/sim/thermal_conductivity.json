@@ -1,0 +1,40 @@
+{
+  "_source": {
+    "quantity": "k_w_mk",
+    "units": "W/(m*K)",
+    "description": "Thermal conductivity (isotropic, near room temperature ~20-25 C) for the steady-state heat-conduction FEA solver (core/sim/fea_thermal). Keyed by the same sim keys as engine_oracle/sim/materials.json. Values are room-temperature engineering references; conductivity varies with temperature and (for metals) with alloy temper, so these are defaults a user can override per study.",
+    "references": [
+      "Incropera, DeWitt, Bergman & Lavine, Fundamentals of Heat and Mass Transfer, 6th ed., Table A.1 (metals) / A.3 (nonmetals).",
+      "ASM International, ASM Handbook Vol. 2, Properties and Selection: Nonferrous Alloys (Al/Cu/Ti/Mg alloy conductivities).",
+      "MatWeb material property datasheets (polymers: ABS/PLA/PETG/Nylon/PC/PEEK/PMMA — manufacturer typical values).",
+      "Engineering Toolbox, Thermal Conductivity of common Materials (concrete, glass, lead cross-check)."
+    ],
+    "note": "Provenance table for T-SIM1. Kept separate from materials.json because that file is a generated mirror guarded by test_export_sim_json; adding fields there would break the mirror contract. The FEA study reads material.k_w_mk; this table supplies the cited default."
+  },
+  "steel_1018": 51.9,
+  "alu_6061": 167.0,
+  "abs": 0.17,
+  "pla": 0.13,
+  "petg": 0.29,
+  "nylon_pa12": 0.25,
+  "ti_6al4v": 6.7,
+  "steel_304_stainless": 16.2,
+  "steel_1045": 49.8,
+  "cast_iron_gray": 53.0,
+  "alu_7075_t6": 130.0,
+  "alu_2024_t3": 121.0,
+  "brass_c360": 115.0,
+  "copper_c110": 388.0,
+  "magnesium_az31b": 96.0,
+  "ti_grade_2": 16.4,
+  "polycarbonate": 0.20,
+  "nylon_66": 0.25,
+  "peek": 0.25,
+  "acrylic_pmma": 0.19,
+  "carbon_fiber_ud": 5.0,
+  "concrete": 1.4,
+  "glass_soda_lime": 1.0,
+  "tungsten": 173.0,
+  "inconel_718": 11.4,
+  "lead": 35.3
+}

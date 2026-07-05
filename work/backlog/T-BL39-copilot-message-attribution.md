@@ -3,7 +3,7 @@ id: T-BL39
 title: Copilot messages — remove the "Assistant"/"Hi! Describe a part…" greeting, show the generating model(s) as attribution, compact the user/model display
 workstream: backlog
 owner: sonnet-pell
-status: review
+status: done
 priority: 3
 lane: app-gui
 kind: overhaul

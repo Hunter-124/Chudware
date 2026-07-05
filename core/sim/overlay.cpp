@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -16,6 +17,36 @@
 namespace aicad::sim {
 
 namespace {
+
+// ── Result-overlay size cap (T-SIM2) ──────────────────────────────────────────
+// The result overlay is the FEA BOUNDARY surface: its triangles are uploaded to a
+// single GL VBO, re-deformed on the CPU on every deform-scale change, and each vertex
+// carries ~15 per-node scalar fields. That triangle budget is what bounds interactive
+// render + upload cost. We CANNOT decimate to honour the cap: every surface vertex is
+// tied to a volume node via surf_to_vol, and the per-node solver fields are mapped by
+// DIRECT INDEXING through it — dropping vertices would corrupt that mapping and silently
+// falsify the plotted field. So the cap is enforced as a HARD GUARD, not a decimation:
+// above it we refuse to emit the overlay (return "" — the study still returns its scalar
+// summary + narration; only the spatial contour is withheld, and the UI already handles
+// an empty overlay path by falling back to the editable model mesh). The number below is
+// deliberately generous — a correctly-set mesh_fineness never approaches it; hitting it
+// means the mesh is pathologically fine and the user should lower mesh_fineness (or use
+// mesh_order 1 / draft) to get a contour. ~1.5M boundary tris ≈ 750k surface verts ≈
+// 45 MB of f32 positions + normals + 15 scalar fields, an interactive-render ceiling.
+constexpr size_t kMaxOverlayTris = 1500000;
+
+// True when the built boundary surface is within the render/upload budget. `where` is a
+// short label for the diagnostic log (best-effort, cap breach is rare).
+bool overlay_within_cap(const aicm::AicmBody& bt, const char* where) {
+    const size_t ntri = bt.idx.size() / 3;
+    if (ntri <= kMaxOverlayTris) return true;
+    std::fprintf(stderr,
+                 "[sim] %s: result surface has %zu boundary triangles (cap %zu) — "
+                 "skipping contour overlay; lower mesh_fineness or use draft (order 1) "
+                 "meshing for a spatial plot.\n",
+                 where, ntri, kMaxOverlayTris);
+    return false;
+}
 
 // (n_verts*3) surface vertex positions (float pos -> double), like _surface_verts.
 std::vector<double> surface_verts(const aicm::AicmBody& bt) {
@@ -339,6 +370,7 @@ std::string static_overlay(const std::string& step_path,
     try {
         FeaSurface fs = fea_surface_body(vol_points, tets, nodes_per_elem);
         aicm::AicmBody bt = fs.body;
+        if (!overlay_within_cap(bt, "static_overlay")) return std::string();
         std::vector<double> surf = surface_verts(bt);
 
         std::vector<double> vm_s = map_to_surface_direct(fs.surf_to_vol, von_mises, 1);
@@ -459,6 +491,7 @@ std::string fatigue_overlay(const std::string& step_path,
     try {
         FeaSurface fs = fea_surface_body(vol_points, tets, nodes_per_elem);
         aicm::AicmBody bt = fs.body;
+        if (!overlay_within_cap(bt, "fatigue_overlay")) return std::string();
 
         std::vector<double> ff_s = map_to_surface_direct(fs.surf_to_vol, fatigue_fos, 1);
         std::vector<double> life_s = map_to_surface_direct(fs.surf_to_vol, life_log10, 1);
@@ -489,6 +522,7 @@ std::string modal_overlay(const std::string& step_path,
     try {
         FeaSurface fs = fea_surface_body(vol_points, tets, nodes_per_elem);
         aicm::AicmBody bt = fs.body;
+        if (!overlay_within_cap(bt, "modal_overlay")) return std::string();
         std::vector<double> surf = surface_verts(bt);
 
         std::vector<double> dvec_s = map_to_surface_direct(fs.surf_to_vol, mode_shape, 3);

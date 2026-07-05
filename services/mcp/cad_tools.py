@@ -1090,7 +1090,9 @@ def cad_guide_text(topic: str = "overview") -> str:
             "    boxes and origins (from asm_world_bodies), interference/clearance pairs\n"
             "    (volumes + gap distances from eval_interference), and mate solve status.\n"
             "    Use INSTEAD of dumping asm_world_bodies JSON.\n"
-            "    Call solve_mates first for the latest placement.\n\n"
+            "    Call solve_mates first for the latest placement. To validate that mating\n"
+            "    interfaces LINE UP (hole patterns, coaxial bores, flush contact faces,\n"
+            "    fastener pass-through) — not just that nothing clashes — run interface_check.\n\n"
             "  describe_board([doc_id])\n"
             "    Narrates an active schematic or PCB: component roster (ref/value/footprint),\n"
             "    net list with members, ERC/DRC violation counts, and unconnected pins.\n"
@@ -1431,11 +1433,19 @@ def cad_guide_text(topic: str = "overview") -> str:
             "Tool: design_review(doc_id, checks?)\n\n"
             "  design_review(doc_id)                 Dispatch the full review battery:\n"
             "                                        feature_overlap, dfm_check, wall_thickness,\n"
-            "                                        draft_analysis, interference (assemblies).\n"
+            "                                        draft_analysis, interference + interface_check\n"
+            "                                        (assemblies/multi-body).\n"
             "                                        Returns a narrated verdict card per\n"
             "                                        contracts/narration.md — never raw JSON.\n"
             "  design_review(doc_id, checks=['dfm', 'overlap'])\n"
             "                                        Scope to specific checks.\n\n"
+            "INTERFACE ALIGNMENT (assemblies/multi-body): interface_check(doc_id) is part of the\n"
+            "  battery and also stands alone. It catches the layout errors that PASS interference\n"
+            "  (nothing overlaps) but are still wrong — bolt holes that don't register, mating\n"
+            "  bores that aren't coaxial, contact faces that aren't flush, a fastener that can't\n"
+            "  pass the stack. Run it while laying out a multi-component assembly so the fit is\n"
+            "  right the first time; pass fastener='M6' to also check pass-through. Every finding\n"
+            "  names the components, the feature, the numeric error, and a fix direction.\n\n"
             "RELATIONSHIP TO verify_battery: design_review is geometry-focused (what's wrong\n"
             "  with the shape); verify_battery is requirement-focused (does it meet the spec).\n"
             "  Run both before declaring done."
@@ -2384,12 +2394,16 @@ def register_cad_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def import_part(path: str, into: Optional[str] = None, as_solid: bool = False,
                     resolve_features: bool = True) -> str:
-        """Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/STEP+/…) as a body.
+        """Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3DM/DXF/DWG/STEP+/…) as a body.
 
         Lets you assemble components built or exported separately, or recover geometry from a file
         after a session reset. `into` = an existing doc_id to add the body to the CURRENT part
         (for assembly); omit it to open the file as a NEW part (made current). `as_solid` sews a
         mesh (STL/OBJ/…) into a solid on import; B-rep formats already import as solids.
+
+        DXF/DWG are 2D vector drawings: they import as planar wires + faces (closed loops become
+        faces) — reference/profile geometry to extrude or dimension, not a solid. DWG needs a
+        DWG→DXF converter (LibreDWG `dwg2dxf`) on PATH; without one it errors with a hint.
 
         SOLIDWORKS (.sldprt): with `resolve_features=True` (default) and no `into`, the part is
         opened by RECONSTRUCTING its SolidWorks feature tree (sketches with relations, reference

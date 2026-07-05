@@ -75,11 +75,13 @@ void publishDocTabBandBottom(float y);
 float docTabBandBottom();
 
 // Draw the tabbed SolidWorks-style left manager as a pinned full-height rounded glass column over
-// the viewport's left edge (~12dp margins, below the doc-tab band). Owns the vertical icon-tab
-// strip + the active tab's body, the PM auto-switch (open-edge -> PropertyManager tab, close-edge
-// -> FeatureManager tab), the collapse-to-pill affordance, and the invisible right-edge resize.
-// editCallback is forwarded to the FeatureManager body (a tree "Edit" reopens a PM form). Call
-// every frame in place of the old drawFeatureTree/PM block.
+// the viewport's left edge (~12dp margins, below the doc-tab band). Owns the horizontal icon-tab
+// row + the active tab's body, the PM auto-switch (open-edge -> PropertyManager tab, close-edge
+// -> FeatureManager tab), the vertical collapse-to-header-strip affordance (T-G21: the column
+// rolls UP to its top tab row + collapse chevron instead of shrinking to a small pill; see
+// ui::PanelCollapseAnim in panel_collapse.h — shared with the Copilot column), and the invisible
+// right-edge resize. editCallback is forwarded to the FeatureManager body (a tree "Edit" reopens a
+// PM form). Call every frame in place of the old drawFeatureTree/PM block.
 void drawLeftPane(AppState& st,
                   const std::function<void(const std::string& featureId)>& editCallback = {});
 

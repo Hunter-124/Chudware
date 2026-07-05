@@ -3,7 +3,7 @@ id: T-BL43
 title: Sketch external references — project external faces/edges/planes into a sketch, fix Convert Entities, select external features while in a sketch
 workstream: backlog
 owner: opus-brae
-status: review
+status: done
 priority: 2
 lane: modeling-core
 kind: new

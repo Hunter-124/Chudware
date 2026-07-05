@@ -2,8 +2,8 @@
 id: T-DP3
 title: geometry_designer role + proactive op-aware helper/calculator registry
 workstream: DP
-owner: unassigned
-status: todo
+owner: opus-cyan1
+status: doing
 branch: task/T-DP3-geometry-designer
 depends_on: [T-DP1]
 lane: ai-copilot

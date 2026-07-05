@@ -69,3 +69,6 @@ schematic/PCB, CAM workspace (T-U3), and the U7 viewers.
 - **Checkpoint/release message drafts:** LOCAL model tier drafts from the T-R3 change
   summary (offline-safe, free); plain manual box fallback when no local model is
   provisioned. Frontier is never required for this.
+
+## Progress log
+- 2026-07-05 19:54 UTC [fable-quill] Python seam landed (7cc85e5d): services/plm/worker_rpc.py exposes plm_* over the engine-worker transport (same Vault impl as MCP tools) + T-R5 seams plm_scheme_set / plm_discard_draft / plm_draft (local-model tier w/ manual-box fallback, validated git-vocab-free + numeral-faithful). vault.set_part_number_prefix + vault.discard_working_rev added. 101 plm tests green (21 new). Next: ui/imgui panel + toolbar + tabs + strip.

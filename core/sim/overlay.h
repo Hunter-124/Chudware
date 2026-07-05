@@ -53,6 +53,16 @@ std::vector<double> map_to_surface(const std::vector<double>& surf_xyz,
                                    const std::vector<double>& vol_xyz,
                                    const std::vector<double>& vol_values, int dim);
 
+// Size cap (T-SIM2): the boundary surface these writers emit is uploaded to a single GL
+// VBO, CPU-re-deformed on every deform-scale change, and carries ~15 per-node scalar
+// fields per vertex. When the extracted surface exceeds kMaxOverlayTris (~1.5M boundary
+// triangles) the writer returns "" instead of emitting an overlay — a HARD GUARD, not a
+// decimation: every surface vertex is bound to a volume node (surf_to_vol) and the solver
+// fields are mapped by direct indexing, so dropping vertices would falsify the plotted
+// field. The study still returns its scalar summary + narration; only the spatial contour
+// is withheld, and the UI falls back to the editable model mesh. Hitting the cap means the
+// mesh is pathologically fine — lower mesh_fineness or use draft (order 1) meshing.
+//
 // Build the static-result overlay AICM and write it to a temp .aicm; returns the
 // absolute path (empty string on any failure — best-effort, never throws). Mirrors
 // engine/sim/overlay.static_overlay: SCLR(von_mises 0..max_vm), SCLR(disp_mag

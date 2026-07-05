@@ -281,6 +281,13 @@ private:
     // an AppState field the new tree doesn't carry — kept here instead, see header note).
     std::string activeScalarField_;
 
+    // T-SIM2: per-study "Show contour" toggle state. Persisted here (not a per-frame local) so the
+    // checkbox reflects the real on/off state across frames; drives BOTH the viewport colormap pass
+    // and the legend bar so toggling off cleanly hides the whole contour overlay. Default on: a
+    // fresh result shows its contour immediately (SolidWorks behaviour). Re-armed to on each time a
+    // new result is loaded (applyResultField), so a per-study choice never leaks to the next study.
+    bool contourOn_ = true;
+
     int unitsMode_ = 0;  // 0 follow document, 1 SI, 2 US — SimManager's own state (see header note)
 
     char cmName_[64] = "";

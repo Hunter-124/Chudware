@@ -657,7 +657,11 @@ void SimManager::applyResultField(app::AppState& st, Study& s) {
     std::string label, unit; double fromSI = 1.0;
     fieldMeta(u, activeScalarField_, label, unit, fromSI);
     auto& vs = viewportState();
-    vs.legendOn = true;
+    // T-SIM2: honour the per-study "Show contour" toggle on (re)load. viewportLoadResultAicm
+    // unconditionally turns the colormap on, so re-apply the toggle intent here and gate the
+    // legend to match — a field switch or result reload with contour OFF stays off.
+    viewportSetColormapMode(contourOn_);
+    vs.legendOn = contourOn_;
     vs.legendTitle = label;
     vs.legendUnits = unit;
     vs.legendMin = (float)(vmin * fromSI);
@@ -992,6 +996,7 @@ void SimManager::tick(app::AppState& st) {
         }
         const auto& res = job.result;
         s.hasResult = true;
+        contourOn_ = true;  // T-SIM2: a fresh result shows its contour by default (per-study intent re-armed)
         s.solverNotes.clear();
         if (res.contains("solver_notes") && res["solver_notes"].is_array())
             for (const auto& n : res["solver_notes"]) if (n.is_string()) s.solverNotes.push_back(n.get<std::string>());
@@ -1883,8 +1888,15 @@ void SimManager::drawResultControls(app::AppState& st, Study& s) {
     }
 
     ImGui::Spacing(); ImGui::Separator();
-    bool colormapOn = true;  // the panel keeps the colormap on while Results is the active view
-    if (ImGui::Checkbox("Show colormap", &colormapOn)) viewportSetColormapMode(colormapOn);
+    // T-SIM2: "Show contour" per-study toggle — persisted in contourOn_ so it reflects real state
+    // across frames (was a per-frame `true` local that never tracked the toggle). Off hides BOTH the
+    // colormap pass and the legend bar so the part reads plainly.
+    if (ImGui::Checkbox("Show contour", &contourOn_)) {
+        viewportSetColormapMode(contourOn_);
+        viewportState().legendOn = contourOn_;
+    }
+    simTip("Colour-map the selected result field over the part, with a min/max legend. "
+           "Turn off to see the plain shaded model.");
     if (!isFlowFamily(s.type)) {
         float curScale = viewportDeformScale();
         ImGui::Spacing();

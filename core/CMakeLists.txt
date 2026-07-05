@@ -702,6 +702,17 @@ if(AICAD_WITH_OCCT)
   set_tests_properties(overlay_surface PROPERTIES
     ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # T-SIM2: regenerator for the committed result-contour AICM fixture used by the
+  # AI_CAD_SHOT=fea_overlay headless scenario. Builds a structured cantilever tet mesh in code
+  # (Netgen-free — the mesher is the only unavailable piece in CI), runs the real fea_static_solve,
+  # and skins + field-maps it via static_overlay (in aicad_geom_occt). Not a ctest (it writes a
+  # file); run by hand to refresh contracts/fixtures/sim2_cantilever_result.aicm.
+  add_executable(gen_sim2_result_fixture tests/gen_sim2_result_fixture.cpp)
+  target_include_directories(gen_sim2_result_fixture PRIVATE ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(gen_sim2_result_fixture PRIVATE aicad_geom_occt aicad_sim)
+  set_target_properties(gen_sim2_result_fixture PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
   # Verification: tessellate -> write_aicm -> HOST render::parseAicm round-trip.
   add_executable(test_geom_aicm
     tests/test_geom_aicm.cpp)

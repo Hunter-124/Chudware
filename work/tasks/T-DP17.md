@@ -42,3 +42,22 @@ design; dark-mode contrast; ui_style_check clean; EYEBALL shots.
 
 ## Progress log
 - 2026-07-05 21:13 UTC [sonnet-mira1] agent_dag_panel shipped: view model (agent_dag_view.h), panel .cpp/.h, wired into application.cpp + scenarios. Two shots: agent_dag (full+detail, pre-selected node n_geom) and agent_dag_compact (graph-only). Build clean, ui_style_check 0 findings. Branch pushed; gate.sh running.
+- 2026-07-05 21:31 UTC [sonnet-mira1] T-DP17 ready for review. Branch: task/T-DP17-agent-dag-widget, tip b21ab4e7.
+
+Shipped:
+- ui/abstract/agent_dag_view.h — pure view-model (DagWidgetNode, DagWidgetEdge, AgentDagModel, DagWidgetMode, status/kind enums)
+- ui/imgui/src/ui/agent_dag_panel.h/.cpp — full widget (~640 lines): JSONL event projection, Kahn topo-sort layered layout, ImDrawList bezier-edge canvas, glass detail pane, T-U1 scaffold integration
+- application.cpp — one Begin/End window block wiring the panel
+- scenarios.cpp — fixture with 6 nodes across 5 layers (mission + 3 delegation sub-agents + verify + gate) seeding both shots
+
+Shot scenarios (HEADLESS, eyeballed):
+- AI_CAD_SHOT=agent_dag (full mode, 1600x1000): floating Agent DAG window, all 6 nodes visible, bezier edges, detail pane for geometry_designer (role/model/tool/ledger/tokens), status colors: teal=done, teal-highlight=running, amber=blocked, red=failed
+- AI_CAD_SHOT=agent_dag_compact (compact mode, 1600x1000): canvas-only embedded panel, all 6 nodes including red failed VFY and amber blocked GATE visible at depth 4, no scaffold header
+
+Fixes from advisor review (commit b21ab4e7):
+- agentDagShotForceMode() seam: compact branch now has real execution coverage
+- kLayerGapY 80->50: depth-4 nodes no longer clip
+- ASCII glyphs: "..." and "*" replace UTF-8 ellipsis/bullet (no tofu)
+- Mission name ASCII (colon not em-dash)
+
+ui_style_check: 0 findings. Build: 0 new warnings. gate.sh running.

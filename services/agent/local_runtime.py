@@ -157,6 +157,14 @@ def get_served_n_ctx(base_url: str, *, timeout: float = 2.0) -> Optional[int]:
         val = data.get("n_ctx")
         if isinstance(val, int) and val > 0:
             return val
+        # b9860 (the pinned build) nests the served per-slot context under
+        # default_generation_settings.n_ctx — verified against the live server
+        # (T-W31 CUDA smoke). Per-slot n_ctx is the honest budget for a turn.
+        dgs = data.get("default_generation_settings", {})
+        if isinstance(dgs, dict):
+            val = dgs.get("n_ctx")
+            if isinstance(val, int) and val > 0:
+                return val
         # Some older builds surface it under "model.n_ctx_train"
         model_info = data.get("model", {})
         if isinstance(model_info, dict):

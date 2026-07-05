@@ -118,6 +118,17 @@ class TestGetServedNCtx(unittest.TestCase):
             result = get_served_n_ctx(srv.base_url)
         assert result == 32768
 
+    def test_reads_nested_default_generation_settings_n_ctx(self) -> None:
+        # b9860 (pinned build) nests the served per-slot context here —
+        # verified against the live CUDA server in the T-W31 smoke.
+        from services.agent.local_runtime import get_served_n_ctx
+
+        props_response = {"default_generation_settings": {"n_ctx": 4096},
+                          "total_slots": 8}
+        with _MockHTTPServer({"/props": (200, props_response)}) as srv:
+            result = get_served_n_ctx(srv.base_url)
+        assert result == 4096
+
     def test_fallback_to_model_n_ctx_train(self) -> None:
         from services.agent.local_runtime import get_served_n_ctx
 

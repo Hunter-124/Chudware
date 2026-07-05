@@ -777,3 +777,103 @@ def test_role_policy_is_scoped_to_the_turn():
     # export_part is NOT in feature_modeler's allowlist — if the policy leaked,
     # this dispatch-time check now refuses it.
     assert reg.is_allowed("export_part"), "role tool policy leaked past the node turn"
+
+
+# ---------------------------------------------------------------------------
+# T-W32 — tool-schema injection + run-scoped dispatcher wiring
+# ---------------------------------------------------------------------------
+
+class TestToolSchemaAndMissionDispatchWiring:
+    def test_make_default_agent_fn_builds_mission_dispatch_from_ledger(self, monkeypatch, tmp_path):
+        """A bound ledger yields a run-scoped dispatcher; ledger_note dispatches
+        against THIS run (mission hit) instead of 'could not be resolved'."""
+        from services.agent import config as agent_config
+        from services.agent.ledger import Ledger
+
+        class _P:
+            def __init__(self):
+                self._replies = [
+                    '```json\n{"tool": "ledger_note", "args": {"kind": "note", '
+                    '"payload": {"text": "hello"}}}\n```',
+                    '```json\n{"done": true, "handoff": {}}\n```',
+                ]
+
+            def complete(self, system, messages, max_tokens=None):
+                return self._replies.pop(0)
+
+        monkeypatch.setattr(agent_config, "get_provider",
+                            lambda name=None, cfg=None: _P())
+
+        led = Ledger("t_w32_node", path=tmp_path / "ledger.json")
+
+        # keep the ledger off-disk: capture appends in-memory
+        events = []
+        monkeypatch.setattr(led, "_save", lambda: None)
+        agent_fn = nr.make_default_agent_fn(ledger=led)
+        res = agent_fn("note it", {"node_name": "n1",
+                                   "allowed_tools": ["ledger_note"]})
+        assert res.success is True
+        call = res.result["calls"][0]
+        assert call["tool"] == "ledger_note" and call["ok"] is True, call
+
+    def test_tools_slot_rendered_measured_and_logged(self, monkeypatch, tmp_path):
+        """allowed_tools → run_turn gets a rendered tools_text and the ledger
+        carries ONE tools_slot event with the MEASURED token cost + tier."""
+        from services.agent import config as agent_config
+        from services.agent import agent_turn as at
+        from services.agent.ledger import Ledger
+
+        class _P:
+            def complete(self, system, messages, max_tokens=None):
+                return '```json\n{"done": true, "handoff": {}}\n```'
+
+        monkeypatch.setattr(agent_config, "get_provider",
+                            lambda name=None, cfg=None: _P())
+        monkeypatch.setenv("AI_CAD_TIER", "local-24k")
+
+        led = Ledger("t_w32_slot", path=tmp_path / "ledger.json")
+        monkeypatch.setattr(led, "_save", lambda: None)
+
+        seen = {}
+        real_run_turn = at.run_turn
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real_run_turn(*args, **kwargs)
+
+        monkeypatch.setattr(at, "run_turn", _spy)
+        agent_fn = nr.make_default_agent_fn(ledger=led)
+        agent_fn("go", {"node_name": "n1", "allowed_tools": ["ledger_note"]})
+
+        assert seen.get("tools_text"), "tools slot was not rendered"
+        assert "ledger_note(" in seen["tools_text"]
+        assert seen.get("mission_dispatch") is not None
+        slots = [e for e in led.events
+                 if (e.get("payload") or {}).get("event") == "tools_slot"]
+        assert len(slots) == 1
+        p = slots[0]["payload"]
+        assert p["tier"] == "local-24k" and p["tokens"] > 0
+        assert p["budget_tokens"] == 2500  # tiers.yaml local-24k budgets.tools
+        assert p["trimmed"] is True
+
+    def test_no_allowed_tools_no_slot(self, monkeypatch):
+        """An open-tools node (allowed_tools None) renders no schema block."""
+        from services.agent import config as agent_config
+        from services.agent import agent_turn as at
+
+        class _P:
+            def complete(self, system, messages, max_tokens=None):
+                return '```json\n{"done": true, "handoff": {}}\n```'
+
+        monkeypatch.setattr(agent_config, "get_provider",
+                            lambda name=None, cfg=None: _P())
+        seen = {}
+        real_run_turn = at.run_turn
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real_run_turn(*args, **kwargs)
+
+        monkeypatch.setattr(at, "run_turn", _spy)
+        nr._default_agent_fn("go", {"node_name": "n1"})
+        assert seen.get("tools_text") is None

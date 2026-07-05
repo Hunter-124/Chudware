@@ -94,21 +94,38 @@ class _StubAgentResult:
         self.result = None
 
 
-def make_default_agent_fn(ledger=None) -> "Callable[[str, dict[str, Any]], Any]":
+def make_default_agent_fn(ledger=None,
+                          mission_dispatch=None) -> "Callable[[str, dict[str, Any]], Any]":
     """Return the default tool-executing agent_fn with *ledger* bound (T-W30).
 
     The mission pipeline (loop.run_mission) uses this to thread its run ledger
     into every node's agent turn, so each turn's tool calls / handoffs land as
     ``agent_turn`` events — the inspectability half of the execution-reality
     contract.  A standalone DAG run (no ledger) gets the same behaviour minus
-    the events."""
+    the events.
+
+    T-W32: when a *ledger* is bound and no explicit *mission_dispatch* is given,
+    a run-scoped :class:`services.agent.mission_dispatch.MissionDispatch` is built
+    from it, so run-scoped tools (ledger_get/ledger_note, dag_plan, ask_user,
+    delegate, part_search) resolve against THIS run instead of erroring out of
+    the process-wide registry.  Best-effort: a failure to build the dispatcher
+    never blocks node execution (turns just lack the mission layer)."""
+    if mission_dispatch is None and ledger is not None:
+        try:
+            from services.agent.mission_dispatch import MissionDispatch  # noqa: PLC0415
+            mission_dispatch = MissionDispatch(
+                run_id=getattr(ledger, "run_id", "") or "", ledger=ledger)
+        except Exception:  # noqa: BLE001 — mission layer optional
+            mission_dispatch = None
+
     def _agent_fn(request: str, context_pack: dict[str, Any]) -> Any:
-        return _default_agent_fn(request, context_pack, ledger=ledger)
+        return _default_agent_fn(request, context_pack, ledger=ledger,
+                                 mission_dispatch=mission_dispatch)
     return _agent_fn
 
 
 def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
-                      ledger=None) -> Any:
+                      ledger=None, mission_dispatch=None) -> Any:
     """Run a real tool-executing agent turn for this DAG node (T-W30).
 
     Resolves the provider from the agent config seam (``config.get_provider`` —
@@ -149,29 +166,53 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
                 max_tools = int(env_cap)
             except ValueError:
                 max_tools = None
+
+    # T-W32: render the §9.1 tools slot — trimmed schemas for EXACTLY the node's
+    # allowed tools, within the tier's budgets.tools, resolved through the SAME
+    # mission-first resolver the dispatcher uses.  Measured cost is logged to the
+    # ledger (one tools_slot event per node turn) — recorded, never invented.
+    profile = _tier_profile()
+    tools_text = None
+    if allowed_tools:
+        try:
+            from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
+            tools_text, meta = render_tools_block(
+                list(allowed_tools),
+                resolver=agent_turn.resolver_for(mission_dispatch),
+                budget_tokens=(profile.budgets.tools if profile else None),
+                trim=(profile.tool_schema_trim if profile else True))
+            if ledger is not None and tools_text:
+                try:
+                    ledger.append(node_name, "agent_turn", {
+                        "event": "tools_slot",
+                        "tier": profile.name if profile else None, **meta})
+                except Exception:  # noqa: BLE001 — logging is best-effort
+                    pass
+        except Exception:  # noqa: BLE001 — schema rendering must never block a node
+            tools_text = None
+
     return agent_turn.run_turn(
         request=request, provider=provider, name=node_name,
         allowed_tools=allowed_tools,
         system_prompt=context_pack.get("role_system_prompt"),
         max_tool_calls=max_tools,
-        max_tokens=_tier_generation_budget(),
-        ledger=ledger, actor=node_name)
+        max_tokens=(int(profile.generation_headroom) if profile else None),
+        ledger=ledger, actor=node_name,
+        mission_dispatch=mission_dispatch, tools_text=tools_text)
 
 
-def _tier_generation_budget() -> "int | None":
-    """Per-completion token cap from the ACTIVE tier's profile (T-W28 seam).
+def _tier_profile():
+    """The ACTIVE tier's profile from ``AI_CAD_TIER`` (T-W28 seam), or None.
 
-    Reads ``AI_CAD_TIER`` (tiers.detect_tier_from_env — the same manual-override
-    knob the effort resolution path honours) and returns that tier's
-    ``generation_headroom`` from tiers.yaml.  None (agent_turn's shipped default)
-    when no tier is set or the tiers layer is unavailable — best-effort, never
-    blocks node execution."""
+    Same manual-override knob the effort resolution path honours.  None when no
+    tier is set or the tiers layer is unavailable — best-effort, never blocks
+    node execution (callers fall back to agent_turn / tool_schemas defaults)."""
     try:
         from services.agent.tiers import detect_tier_from_env, load_tier
         tier_name = detect_tier_from_env()
         if not tier_name:
             return None
-        return int(load_tier(tier_name).generation_headroom)
+        return load_tier(tier_name)
     except Exception:  # noqa: BLE001 — tiers layer optional at node level
         return None
 

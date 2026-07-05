@@ -157,6 +157,18 @@ def test_context_loss_cites_nonexistent_ref():
     assert fired and "DIM99" in fired[0].detail
 
 
+def test_context_loss_manifest_ids_are_known():
+    """T-W32: REAL cells pass the manifest as an argument (no scripted manifest
+    artifact event) — citing the manifest's own DL/AC ids must NOT be context_loss."""
+    lg = _ledger([
+        {"kind": "agent_turn", "payload": {"event": "done",
+            "text": "handoff for DL1: AC1 satisfied pending review"}},
+    ])
+    res = classify_ledger(lg, manifest=_MANIFEST,
+                          graded={"criteria": [], "passed": True})
+    assert not [c for c in res if c.failure_class == FailureClass.CONTEXT_LOSS.value]
+
+
 # --- abstraction_skip -------------------------------------------------------
 
 def test_abstraction_skip_ladder_bounce():
@@ -226,13 +238,116 @@ def test_advisory_not_ignored_when_disputed():
     assert not [c for c in res if c.failure_class == FailureClass.ADVISORY_IGNORED.value]
 
 
+# --- execution_stall (T-W32, foreman-sanctioned) -----------------------------
+
+def test_execution_stall_all_calls_failed_suppresses_incoherent():
+    """The cycle-1-real-r3 shape: every real tool call errored (agent_turn events),
+    ACs failed — execution_stall must fire WITH evidence seqs, and
+    incoherent_geometry (whose evidence would be empty) must be suppressed."""
+    lg = _ledger([
+        {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "ledger_get",
+            "args": {}, "ok": False, "error": "tool 'ledger_get' could not be resolved"}},
+        {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "add_features",
+            "args": {"features": []}, "ok": False,
+            "error": "add_features() got an unexpected keyword argument 'features'"}},
+    ])
+    graded = {"criteria": [{"id": "AC1", "result": "FAIL"}], "passed": False}
+    res = classify_ledger(lg, manifest=_MANIFEST, graded=graded)
+    stall = [c for c in res if c.failure_class == FailureClass.EXECUTION_STALL.value]
+    assert len(stall) == 1, _classes(res)
+    assert stall[0].evidence_seqs == [0, 1], "must ref the errored call events"
+    assert stall[0].evidence, "must carry evidence refs"
+    assert not [c for c in res
+                if c.failure_class == FailureClass.INCOHERENT_GEOMETRY.value], \
+        "a pre-BUILD stall must not classify as incoherent_geometry"
+
+
+def test_execution_stall_turns_without_any_tool_call():
+    lg = _ledger([
+        {"kind": "agent_turn", "payload": {"event": "turn", "kind": "text",
+                                           "text": "I need more information."}},
+        {"kind": "agent_turn", "payload": {"event": "turn", "kind": "text",
+                                           "text": "Please provide the brief."}},
+    ])
+    graded = {"criteria": [{"id": "AC1", "result": "FAIL"}], "passed": False}
+    res = classify_ledger(lg, manifest=_MANIFEST, graded=graded)
+    stall = [c for c in res if c.failure_class == FailureClass.EXECUTION_STALL.value]
+    assert stall and stall[0].evidence_seqs
+
+
+def test_no_stall_when_one_call_succeeded():
+    """One successful execution means the run got past the stall — a failed AC is
+    then genuine incoherent_geometry, not execution_stall."""
+    lg = _ledger([
+        {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "ledger_get",
+            "args": {}, "ok": False, "error": "tool 'ledger_get' could not be resolved"}},
+        {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "add_features",
+            "args": {"ops": []}, "ok": True, "result": "{\"ok\": true}"}},
+    ])
+    graded = {"criteria": [{"id": "AC1", "result": "FAIL"}], "passed": False}
+    res = classify_ledger(lg, manifest=_MANIFEST, graded=graded)
+    assert not [c for c in res
+                if c.failure_class == FailureClass.EXECUTION_STALL.value]
+    assert [c for c in res
+            if c.failure_class == FailureClass.INCOHERENT_GEOMETRY.value]
+
+
+def test_no_stall_on_passed_run_or_empty_ledger():
+    graded_pass = {"criteria": [{"id": "AC1", "result": "PASS"}], "passed": True}
+    lg = _ledger([
+        {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "x",
+                                           "ok": False, "error": "boom"}},
+    ])
+    assert not [c for c in classify_ledger(lg, manifest=None, graded=graded_pass)
+                if c.failure_class == FailureClass.EXECUTION_STALL.value]
+    # no tool activity at all (mock cells without agent turns) → not a stall
+    graded_fail = {"criteria": [{"id": "AC1", "result": "FAIL"}], "passed": False}
+    empty = _ledger([{"kind": "artifact", "payload": {"kind": "battery",
+                                                      "id": "battery_DL1"}}])
+    res = classify_ledger(empty, manifest=None, graded=graded_fail)
+    assert not [c for c in res
+                if c.failure_class == FailureClass.EXECUTION_STALL.value]
+    assert [c for c in res
+            if c.failure_class == FailureClass.INCOHERENT_GEOMETRY.value]
+
+
+def test_kwarg_error_call_is_also_tool_misuse_but_resolution_gap_is_not():
+    """T-W32 normalisation: an agent-turn call the tool REJECTED (bad kwargs) is
+    tool_misuse; a pure resolution failure is a harness gap → stall only."""
+    lg = _ledger([
+        {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "add_features",
+            "args": {"x": 1}, "ok": False,
+            "error": "add_features() got an unexpected keyword argument 'x'"}},
+        {"kind": "agent_turn", "payload": {"event": "tool_call", "tool": "ledger_get",
+            "args": {}, "ok": False, "error": "tool 'ledger_get' could not be resolved"}},
+    ])
+    res = classify_ledger(lg, manifest=None,
+                          graded={"criteria": [], "passed": False})
+    misuse = [c for c in res if c.failure_class == FailureClass.TOOL_MISUSE.value]
+    assert len(misuse) == 1 and "add_features" in misuse[0].detail
+
+
+def test_grind_counts_real_agent_turn_calls():
+    same = {"event": "tool_call", "tool": "ledger_get", "args": {}, "ok": False,
+            "error": "tool 'ledger_get' could not be resolved", "node": "n1"}
+    lg = _ledger([
+        {"kind": "agent_turn", "payload": dict(same)},
+        {"kind": "agent_turn", "payload": dict(same)},
+        {"kind": "agent_turn", "payload": dict(same)},
+    ])
+    res = classify_ledger(lg, manifest=None,
+                          graded={"criteria": [], "passed": False},
+                          grind_threshold=3)
+    assert [c for c in res if c.failure_class == FailureClass.GRIND.value]
+
+
 def test_every_taxonomy_class_is_covered():
     """Guard: the test file exercises every class in TAXONOMY."""
     covered = {
         FailureClass.WRONG_QUESTION.value, FailureClass.INCOHERENT_GEOMETRY.value,
         FailureClass.TOOL_MISUSE.value, FailureClass.CONTEXT_LOSS.value,
         FailureClass.ABSTRACTION_SKIP.value, FailureClass.GRIND.value,
-        FailureClass.ADVISORY_IGNORED.value,
+        FailureClass.ADVISORY_IGNORED.value, FailureClass.EXECUTION_STALL.value,
     }
     assert covered == set(TAXONOMY), f"uncovered classes: {set(TAXONOMY) - covered}"
 

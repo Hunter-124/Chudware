@@ -39,3 +39,6 @@ design; dark-mode contrast; ui_style_check clean; EYEBALL shots.
 - [ ] Node click opens detail (role/model/tool/ledger-slice/tokens/status); live colouring.
 - [ ] Compact + full render modes both shot-verified, EYEBALLED.
 - [ ] ui_style_check clean; gate.sh PASS; graphify update.
+
+## Progress log
+- 2026-07-05 21:13 UTC [sonnet-mira1] agent_dag_panel shipped: view model (agent_dag_view.h), panel .cpp/.h, wired into application.cpp + scenarios. Two shots: agent_dag (full+detail, pre-selected node n_geom) and agent_dag_compact (graph-only). Build clean, ui_style_check 0 findings. Branch pushed; gate.sh running.

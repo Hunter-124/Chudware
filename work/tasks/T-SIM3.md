@@ -55,3 +55,6 @@ T-U6 (studies manager) per the T-V1 audit + scope pass:
 - ADDITIVE SEAMS ONLY vs T-SIM1/T-SIM2 (parallel): sim_manager.cpp is shared ground —
   keep your edits scoped to material dialog + precheck/postcheck hooks + panel styling;
   do not touch thermal dispatch (T-SIM1) or contour rendering (T-SIM2).
+
+## Progress log
+- 2026-07-05 19:29 UTC [fable-cove] Claimed T-SIM3, worktree ../CAD-T-SIM3 on task/T-SIM3-sim-ui-overhaul. Oriented via graphify: sim_manager.cpp/.h read, sim_advisor.py precheck/postcheck API read, margin_policy.json read. Plan: (1) material assignment dialog (doc material + engine/sim/materials.json library + custom), (2) precheck via python CLI shim on Run with AI_CAD_SIM_PRECHECK_BLOCK gating (GUI default = never veto), (3) postcheck verdict row in results, (4) fixtures/loads delete+edit affordances, (5) glass-column style pass, (6) shot scenarios light+dark. Baseline build running.

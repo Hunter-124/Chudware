@@ -55,3 +55,6 @@ this task adds the commerce-vendor adapters:
   and on any captcha/challenge surface `login_required`/`challenge` to the user, never
   attempt bypass. Same for every vendor.
 - Python venv for gate: `~/.local/share/AI-CAD/mcp-venv/bin/python`.
+
+## Progress log
+- 2026-07-05 19:35 UTC [opus-wynn] Claimed + started (opus-wynn, Windows). Branch task/T-X7-vendor-adapters-wave2 off current master. Orienting via recon of the T-X2 AdapterBase contract (services/browser/adapters/) + grabcad/traceparts reference adapters + T-X3 part_search federation seam + bom_price approved-provider seam + import_part CAD path. Plan: mirror the smallest reference adapter for each of Amazon/McMaster/JLCPCB/PCBWay with the same guardrails (rate-limited, profile-scoped, terms-wall + login_required/challenge surfacing, NEVER auto-accept ToS, NEVER store creds, never bypass captcha), register as federation providers with CI-degraded skip when profiles absent, + docs/SOURCING_VENDOR_SURVEY.md. NOTE: unrelated Discord-notifier WIP (notify_discord.py + discord_bot.py + requirements-discord-bot.txt) is present uncommitted in this checkout's working tree from a prior session â€” NOT mine, NOT part of T-X7; I am preserving it untouched and will never stage it in T-X7 commits.

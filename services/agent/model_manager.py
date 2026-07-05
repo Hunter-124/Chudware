@@ -116,6 +116,28 @@ def _dest_path(entry: dict[str, Any]) -> Path:
     return _model_dir() / entry["file"]
 
 
+def _resolve_existing(entry: dict[str, Any]) -> Path | None:
+    """Return the on-disk GGUF for *entry*, accepting either the flat layout
+    (``MODELS/<file>``) or a per-model subdir (``MODELS/<id>/<file>``).
+
+    The bundled provisioner and some external tools drop the GGUF under a
+    per-model subdirectory; this makes ``get_model_path`` find it either way
+    (T-W30 — the C1 proof run's qwen3-4b lives under ``models/qwen3-4b/``)."""
+    flat = _model_dir() / entry["file"]
+    if flat.exists():
+        return flat
+    nested = _model_dir() / entry["id"] / entry["file"]
+    if nested.exists():
+        return nested
+    # Fallback: any GGUF under a subdir named after the model id.
+    subdir = _model_dir() / entry["id"]
+    if subdir.is_dir():
+        ggufs = sorted(subdir.glob("*.gguf"))
+        if ggufs:
+            return ggufs[0]
+    return None
+
+
 def _part_path(entry: dict[str, Any]) -> Path:
     return _model_dir() / (entry["file"] + ".part")
 
@@ -238,10 +260,11 @@ def provision(model_id: str, *, force: bool = False) -> dict[str, Any]:
     entry = _REGISTRY[model_id]
     dest = _dest_path(entry)
 
-    if dest.exists() and not force:
+    existing = _resolve_existing(entry)
+    if existing is not None and not force:
         return {
             "status": "already_present",
-            "path": str(dest),
+            "path": str(existing),
             "model_id": model_id,
         }
 
@@ -276,10 +299,8 @@ def list_models() -> list[dict[str, Any]]:
     Each dict contains: ``id``, ``repo``, ``file``, ``quant``, ``ctx``,
     ``license``, ``present`` (bool).
     """
-    model_dir = _model_dir()
     result: list[dict[str, Any]] = []
     for entry in _REGISTRY.values():
-        path = model_dir / entry["file"]
         result.append(
             {
                 "id": entry["id"],
@@ -288,7 +309,7 @@ def list_models() -> list[dict[str, Any]]:
                 "quant": entry["quant"],
                 "ctx": entry["ctx"],
                 "license": entry["license"],
-                "present": path.exists(),
+                "present": _resolve_existing(entry) is not None,
             }
         )
     return result
@@ -308,5 +329,4 @@ def get_model_path(model_id: str) -> Path | None:
     """
     if model_id not in _REGISTRY:
         return None
-    path = _dest_path(_REGISTRY[model_id])
-    return path if path.exists() else None
+    return _resolve_existing(_REGISTRY[model_id])

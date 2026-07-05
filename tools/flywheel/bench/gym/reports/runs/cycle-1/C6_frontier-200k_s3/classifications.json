@@ -1,0 +1,19 @@
+[
+  {
+    "failure_class": "grind",
+    "detail": "3 attempts on 'n_build_DL1' with no changed hypothesis",
+    "evidence_seqs": [
+      7,
+      8,
+      9
+    ],
+    "evidence": [
+      {
+        "seq": 7,
+        "kind": "tool_call",
+        "actor": "feature_modeler",
+        "why": "3 identical attempts (anti-grind)"
+      }
+    ]
+  }
+]

@@ -1534,7 +1534,8 @@ def run_mission(
             findings=[str(f) for f in findings])
 
     reached, status, stop_reason = _drive_phases_from_dag(
-        machine, manifest, graph, dag_result, completed, _emit_phase, Phase)
+        machine, manifest, graph, dag_result, completed, _emit_phase, Phase,
+        ledger=ledger)
 
     return MissionRun(
         request=request, run_id=run_id, phase=reached, status=status,
@@ -1558,7 +1559,8 @@ _PHASE_NODE_PREFIXES: list[tuple[str, tuple[str, ...]]] = [
 
 
 def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
-                           emit_phase, Phase) -> "tuple[str, str, str]":
+                           emit_phase, Phase, *,
+                           ledger=None) -> "tuple[str, str, str]":
     """Advance the PhaseMachine phase-by-phase using the DAG node outcomes,
     logging each phase (enter/exit + gate) to the ledger stage_log.
 
@@ -1566,6 +1568,12 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
     whose realising nodes did not all reach ``done`` (a paused/failed DAG); that
     phase is entered (so mission_status shows the mission is *at* it) but not
     exited.  On full completion the machine reaches DELIVER.
+
+    VERIFY is NOT derived from node completion (T-W30): before its gate runs the
+    reviewer (``reviewer_exec.run_acceptance_checks``) executes each acceptance
+    criterion's named check tool and writes per-criterion results to the ledger;
+    the gate reads those results.  A criterion the reviewer did not PASS fails the
+    gate and routes the mission to CORRECT.
     """
     node_states = dag_result.get("nodes", {}) or {}
 
@@ -1577,10 +1585,9 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
         return [n["id"] for n in graph.get("nodes", [])
                 if any(n["id"].startswith(p) for p in prefixes)]
 
-    # AC ids for the VERIFY gate (a mission with a real reviewer would record
-    # per-criterion results in the ledger; here we derive PASS from node completion,
-    # which is what the mock end-to-end proves — a real reviewer node writes the
-    # criterion_results the gate reads).
+    # Every acceptance-criterion id declared in the manifest.  The VERIFY gate
+    # context enumerates ALL of these so a criterion with NO reviewer result
+    # cannot slip through as a vacuous pass (silence => NOT-CHECKED => non-pass).
     ac_ids = [ac.get("id") for d in manifest.get("deliverables", [])
               for ac in (d.get("acceptance_criteria") or [])]
 
@@ -1609,13 +1616,33 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
             stop_reason = f"{phase.value}_incomplete"
             break
 
-        gate = machine.run_gate(phase, _phase_gate_context(phase, ac_ids, Phase))
+        # T-W30: run the reviewer's acceptance checks at VERIFY entry, so the gate
+        # reads REAL per-criterion results (not a fabricated PASS floor).
+        if phase is Phase.VERIFY:
+            _run_reviewer_checks(manifest, ledger, dag_result)
+
+        gate = machine.run_gate(
+            phase, _phase_gate_context(phase, ac_ids, Phase, ledger=ledger))
         try:
             machine.exit(phase, gate)
             completed.append(phase.value)
         except Exception as exc:  # noqa: BLE001 — a failed gate stops the mission here
-            status = "blocked"
-            stop_reason = f"{phase.value}_gate_failed: {exc}"
+            # A failed VERIFY gate is a real criterion failure: route to CORRECT
+            # (the phase machine legally allows VERIFY→CORRECT) rather than a bare
+            # block, and surface the failing criteria as open failure cards.
+            if phase is Phase.VERIFY:
+                failing = _failing_criteria(manifest, ledger, ac_ids)
+                try:
+                    machine.enter(Phase.CORRECT)
+                    emit_phase(Phase.CORRECT, "CORRECT: acceptance criteria failed")
+                    reached = Phase.CORRECT.value
+                except Exception:  # noqa: BLE001
+                    pass
+                status = "needs_correction"
+                stop_reason = f"verify_failed: {failing}"
+            else:
+                status = "blocked"
+                stop_reason = f"{phase.value}_gate_failed: {exc}"
             break
     else:
         # Every phase exited cleanly.
@@ -1626,15 +1653,18 @@ def _drive_phases_from_dag(machine, manifest, graph, dag_result, completed,
     return reached, status, stop_reason
 
 
-def _phase_gate_context(phase, ac_ids, Phase) -> dict:
+def _phase_gate_context(phase, ac_ids, Phase, *, ledger=None) -> dict:
     """Build the exit-gate context for *phase* from a completed DAG.
 
-    A completed phase's nodes are ``done``, so the deterministic gate inputs are
-    satisfied: the plan is ratified (the DAG's approve nodes gated it), specs are
-    audited (the overseer gate node ran), criteria pass (the reviewer nodes ran),
-    no nodes are unresolved.  A real mission overwrites these with the reviewer's
-    actual per-criterion results via the ledger; this derivation is the honest
-    floor (a phase whose nodes all completed did satisfy its structural gate)."""
+    For the structural phases (SPECIFY/PLAN/BUILD/DELIVER) a completed phase's
+    nodes are ``done``, so the deterministic gate inputs are satisfied.
+
+    VERIFY is DIFFERENT (T-W30): its context is NOT fabricated.  The criterion
+    results come from ``criterion_result`` events the reviewer wrote to the ledger
+    (``reviewer_exec.run_acceptance_checks``).  Every declared AC id is enumerated
+    and defaults to ``NOT-CHECKED`` — a criterion with no reviewer verdict is
+    non-pass, so silence can never fabricate a PASS.  Waived criteria come from the
+    ledger too (a user answer that waives an AC)."""
     if phase is Phase.SPECIFY:
         return {"spec_audited": True, "uncovered_criteria": []}
     if phase is Phase.PLAN:
@@ -1643,11 +1673,70 @@ def _phase_gate_context(phase, ac_ids, Phase) -> dict:
     if phase is Phase.BUILD:
         return {"unresolved_nodes": []}
     if phase is Phase.VERIFY:
-        return {"criterion_results": {ac: "PASS" for ac in ac_ids},
-                "waived_criteria": []}
+        recorded, waived = _ledger_criterion_results(ledger)
+        # Enumerate EVERY declared criterion; default any with no reviewer verdict
+        # to NOT-CHECKED (the gate treats non-PASS as failing → routes to CORRECT).
+        results = {ac: recorded.get(ac, "NOT-CHECKED") for ac in ac_ids}
+        return {"criterion_results": results, "waived_criteria": sorted(waived)}
     if phase is Phase.DELIVER:
         return {"mission_report_emitted": True}
     return {}
+
+
+def _ledger_criterion_results(ledger) -> "tuple[dict[str, str], set]":
+    """Read the reviewer's ``criterion_result`` events + waived criteria from the
+    ledger.  Returns ``({ac_id: verdict}, {waived_ac_id, ...})``.  Empty on a
+    missing ledger — which, combined with the ALL-ac enumeration above, yields an
+    all-NOT-CHECKED (non-pass) context rather than a vacuous pass."""
+    recorded: dict[str, str] = {}
+    waived: set = set()
+    if ledger is None:
+        return recorded, waived
+    try:
+        for ev in getattr(ledger, "events", []) or []:
+            if ev.get("kind") == "criterion_result":
+                p = ev.get("payload", {})
+                ac = p.get("id")
+                if ac:
+                    recorded[ac] = p.get("result", "NOT-CHECKED")
+            elif ev.get("kind") == "question":
+                # a criterion may be waived by a confirmed ask_user answer.
+                p = ev.get("payload", {})
+                if p.get("waives_criterion"):
+                    waived.add(p["waives_criterion"])
+    except Exception:  # noqa: BLE001
+        pass
+    return recorded, waived
+
+
+def _failing_criteria(manifest, ledger, ac_ids) -> list[str]:
+    """The ac ids that did NOT pass (for open_failure_cards / CORRECT routing)."""
+    recorded, waived = _ledger_criterion_results(ledger)
+    return [ac for ac in ac_ids
+            if recorded.get(ac, "NOT-CHECKED") != "PASS" and ac not in waived]
+
+
+def _run_reviewer_checks(manifest, ledger, dag_result) -> None:
+    """Invoke the deterministic reviewer to run each AC's named check tool and
+    record per-criterion results on the ledger.  Best-effort: any failure leaves
+    the criteria unrecorded → NOT-CHECKED → the gate fails closed (never a
+    fabricated pass)."""
+    if ledger is None:
+        return
+    try:
+        from services.agent import reviewer_exec
+        # Resolve the doc the mission built (if the DAG surfaced one) so the check
+        # tools run against real geometry; None lets each tool fall back to _CUR.
+        doc_id = None
+        nodes = (dag_result or {}).get("nodes", {}) or {}
+        for ns in nodes.values():
+            d = (ns.get("output") or {}).get("doc_id") or ns.get("doc_id")
+            if d:
+                doc_id = d
+                break
+        reviewer_exec.run_acceptance_checks(manifest, ledger, doc_id=doc_id)
+    except Exception:  # noqa: BLE001 — a broken reviewer must not fabricate a pass
+        pass
 
 
 def _run_intake(request: str, provider: Provider,

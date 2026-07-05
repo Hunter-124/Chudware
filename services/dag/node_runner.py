@@ -95,25 +95,61 @@ class _StubAgentResult:
 
 
 def _default_agent_fn(request: str, context_pack: dict[str, Any]) -> Any:
-    """Invoke services/agent/loop.run() with provider from agent config.
+    """Run a real tool-executing agent turn for this DAG node (T-W30).
 
-    Imported lazily to avoid hard dependency when the engine is absent
-    (test environments). Falls back to a stub AgentResult (T-A1 behavior)
-    when the live agent loop or provider cannot be imported — this keeps
-    the existing executor tests green while real dispatch works in production.
-    """
+    Resolves the provider from the agent config seam (``config.get_provider`` —
+    honours ``AI_CAD_PROVIDER`` / routing.yaml / the local llama.cpp default), then
+    runs a bounded tool-calling turn (``agent_turn.run_turn``): the model proposes
+    MCP tool calls, they are dispatched against the live engine, results are fed
+    back, and a structured handoff is returned.  The node's ``allowed_tools`` scope
+    the callable tools.
+
+    Provider resolution is the actual fix for the historical silent-stub bug: the
+    old code imported ``services.agent.providers.anthropic`` (wrong module name —
+    the module is ``anthropic_provider``), so the import ALWAYS failed and every
+    "live" node degraded to ``_StubAgentResult``.  We now import the real seam.
+
+    Fail-closed on genuine unavailability (no provider constructible — e.g. no model
+    server and no API key): return a NON-success stub so the node ESCALATES rather
+    than silently reporting a fabricated success.  A raised exception is surfaced by
+    ``run()`` as an escalate verdict."""
+    from services.agent import config  # noqa: PLC0415 — real import, no wrong name
+    from services.agent import agent_turn  # noqa: PLC0415
+
+    node_name = context_pack.get("node_name", "dag_node")
     try:
-        from services.agent import loop  # noqa: PLC0415
-        from services.agent.providers.anthropic import AnthropicProvider  # noqa: PLC0415
-        provider = AnthropicProvider()
-        node_name = context_pack.get("node_name", "dag_node")
-        return loop.run(request=request, provider=provider, name=node_name)
-        # NOTE: loop.run() has no allowed_tools parameter — tool filtering is
-        # expressed as advisory prose in the request string (see _build_request).
-        # Real injection is a T-A4/T-A5 seam; loop.py is read-only per Driver notes.
-    except (ImportError, ModuleNotFoundError):
-        # Engine or provider unavailable (CI, offline, no API key) — use stub.
-        return _StubAgentResult()
+        provider = config.get_provider()
+    except Exception as exc:  # noqa: BLE001 — no constructible provider
+        # Do NOT return a confirmed stub: that is the fabrication bug. Signal a
+        # non-success so the node escalates and the failure is visible.
+        return _UnavailableAgentResult(f"no provider available: {exc}")
+
+    allowed_tools = context_pack.get("allowed_tools")
+    # Per-node tool budget: context pack value, else an env cap (lets a bench cap the
+    # turn length for a time-boxed real run), else the agent_turn default.
+    max_tools = context_pack.get("max_tools_per_turn")
+    if max_tools is None:
+        env_cap = os.environ.get("AI_CAD_AGENT_MAX_TOOL_CALLS")
+        if env_cap:
+            try:
+                max_tools = int(env_cap)
+            except ValueError:
+                max_tools = None
+    return agent_turn.run_turn(
+        request=request, provider=provider, name=node_name,
+        allowed_tools=allowed_tools,
+        system_prompt=context_pack.get("role_system_prompt"),
+        max_tool_calls=max_tools)
+
+
+class _UnavailableAgentResult:
+    """Returned when no provider can be constructed — a NON-success result so the
+    node escalates (never a fabricated ``confirmed`` success)."""
+    def __init__(self, reason: str) -> None:
+        self.stop_reason = "failed"
+        self.success = False
+        self.final_code = None
+        self.result = {"error": reason}
 
 
 # ---------------------------------------------------------------------------

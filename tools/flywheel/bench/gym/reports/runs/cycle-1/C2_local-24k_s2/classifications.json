@@ -1,0 +1,24 @@
+[
+  {
+    "failure_class": "advisory_ignored",
+    "detail": "advisory ADV1 (petg_snap_marginal) contradicted without dispute",
+    "evidence_seqs": [
+      8,
+      9
+    ],
+    "evidence": [
+      {
+        "seq": 8,
+        "kind": "advisory",
+        "actor": "foreman",
+        "why": "advisory shown"
+      },
+      {
+        "seq": 9,
+        "kind": "decision",
+        "actor": "feature_modeler",
+        "why": "later action contradicts it"
+      }
+    ]
+  }
+]

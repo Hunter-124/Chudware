@@ -1,0 +1,32 @@
+[
+  {
+    "failure_class": "wrong_question",
+    "detail": "asked a question with no bearing: 'What color should the hinge be?'",
+    "evidence_seqs": [
+      8
+    ],
+    "evidence": [
+      {
+        "seq": 8,
+        "kind": "question",
+        "actor": "clarifier",
+        "why": "question marked no-bearing/useless"
+      }
+    ]
+  },
+  {
+    "failure_class": "wrong_question",
+    "detail": "missed a critical blocking ambiguity: 'pin material / process not specified'",
+    "evidence_seqs": [
+      1
+    ],
+    "evidence": [
+      {
+        "seq": 1,
+        "kind": "artifact",
+        "actor": "intake_analyst",
+        "why": "blocking ambiguity never clarified"
+      }
+    ]
+  }
+]

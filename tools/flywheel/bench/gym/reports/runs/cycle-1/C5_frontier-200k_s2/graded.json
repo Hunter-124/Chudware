@@ -1,0 +1,30 @@
+{
+  "challenge": "C5",
+  "criteria": [
+    {
+      "id": "AC1",
+      "text": "L-bracket built (thickness > 0, provenance)",
+      "result": "PASS",
+      "detail": "bracket thickness 6.0 mm (provenance present)"
+    },
+    {
+      "id": "AC2",
+      "text": "CAM program gouge-free",
+      "result": "FAIL",
+      "detail": "cam_sim reports 2 gouges"
+    },
+    {
+      "id": "AC3",
+      "text": "machined fraction >= 0.90",
+      "result": "PASS",
+      "detail": "machined fraction 0.95 >= 0.9"
+    },
+    {
+      "id": "AC4",
+      "text": "verify_battery PASS (coherent geometry)",
+      "result": "FAIL",
+      "detail": "verify_battery verdict FAIL"
+    }
+  ],
+  "passed": false
+}

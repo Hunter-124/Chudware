@@ -1,0 +1,31 @@
+{
+  "events": [
+    {
+      "seq": 0,
+      "ts": "2026-07-05T05:43:32Z",
+      "actor": "pipeline",
+      "kind": "brief",
+      "payload": {
+        "title": "Gym C1",
+        "summary": "Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.",
+        "success_criteria": []
+      }
+    }
+  ],
+  "state": {
+    "schema": "aicad.ledger/1",
+    "run_id": "gym_C1_local-24k_s1",
+    "brief": {
+      "title": "Gym C1",
+      "summary": "Design a flanged bushing with a sliding-fit bore for a 20 mm shaft and a 4-hole M4 bolt circle on the flange.",
+      "success_criteria": []
+    },
+    "requirements": [],
+    "decisions": [],
+    "dimensions": [],
+    "questions": [],
+    "stage_log": [],
+    "artifacts": [],
+    "criterion_results": []
+  }
+}

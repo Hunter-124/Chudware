@@ -12,8 +12,9 @@ ShopCraft is a parametric CAD application. The core geometry/document/solver/CAM
 engine is a C++ library `libaicad` (under `core/`) that is strangling out a
 legacy Python `engine/` oracle — the two are kept in lockstep by a per-subsystem
 parity corpus until each Python module is flipped off and deleted. The desktop
-GUI is an ImGui shell (under `app/`, with the older `host/` tree being migrated
-into `app/` and then deleted). The active refactor plan lives at
+GUI is an ImGui shell under `ui/imgui/` — this is the **sole active GUI target**.
+The older `host/` tree is reference-only (T-G23 Chrome-port source) and is deleted
+by T-G11. The active refactor plan lives at
 `/home/hunter/.cursor/plans/cad_modular_refactor_+_gui_abstraction_6371dd9f.plan.md`
 and is the source of truth for the target layered layout and the per-phase DAG.
 
@@ -26,8 +27,8 @@ physically lives today. "→ moves" marks dirs slated to move per the plan.
 | Dir | Purpose (current) | Plan target |
 |-----|-------------------|-------------|
 | `core/` | Pure C++/CUDA kernel → `libaicad` (the zero-Python engine target): geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. | Stays `core/`. |
-| `host/` | Legacy C++ ImGui desktop host: `src/ui/*` (panels/editors), `src/render/*` (GL viewport), `src/core/*` (app_state/doc_mirror/worker_client). **End-of-life** — migrated into `app/` + `ui/` + `services/worker/`, then deleted (N4b). | → `app/` + `ui/` + `services/worker/`; deleted N4b. |
-| `app/` | New ImGui desktop GUI rewrite (`src/ui/*`, `src/platform/*`). The first concrete backend over the future `ui/abstract` view-model seam. | → `ui/imgui/` (+ `platform/`). |
+| `host/` | Legacy C++ ImGui desktop host: `src/ui/*` (panels/editors), `src/render/*` (GL viewport), `src/core/*` (app_state/doc_mirror/worker_client). **Reference-only** for T-G23 Chrome-port; deleted by T-G11 after T-G23+T-G25 land + Windows verify. Do NOT patch for new features — use `ui/imgui/` only. | Deleted by T-G11. |
+| `app/` | **Removed (T-G24, 2026-07-05).** Was a convenience symlink → `ui/imgui/`. Use `ui/imgui/` directly. Build output: `build/linux-app/`. | Deleted. |
 | `engine_oracle/` | Python parity oracle (frozen while `core/` catches up). Root `engine` symlink preserves imports. Deleted LAST (N6b). | Deleted N6b. |
 | `services/agent/` | Built-in agent loop (Python now → C++ later). Root `agent` symlink. | C++ at N5e. |
 | `services/mcp/` | MCP server for external agents. Root `mcp_server` symlink. | C++ at N5e. |
@@ -44,6 +45,18 @@ physically lives today. "→ moves" marks dirs slated to move per the plan.
 | `scripts/` | Repo gates + audits: `check.py`, `gate.sh`, etc. | Stays. |
 | `third_party/` | Vendored third-party deps. | Stays. |
 | `scratch/` | Throwaway scratch area. | Stays (non-blocking). |
+
+## GUI ownership policy (T-G24, 2026-07-05)
+
+- **`ui/imgui/` is the ONLY target for new GUI work.** Never patch `host/` for new
+  features or bug fixes — `host/` is reference-only for T-G23.
+- **Double-patching both `host/` and `ui/imgui/` requires explicit lead approval.**
+  If your task seems to require touching both, stop and ask.
+- `host/` is deleted by T-G11, which depends on T-G23 and T-G25 landing first plus
+  a human-verified Windows build.
+- Scripted GUI launches (gate.sh, tools/gui_parity/run_all.py) always use `xvfb-run`
+  when available unless `AI_CAD_SHOT_HEADED=1` is set. Set that env var for
+  interactive/walkthrough runs (T-G12 protocol) to see a real window.
 
 ## Swarm operating rules
 

@@ -89,3 +89,26 @@ integration target for this task. Changes vs the original spec:
 - Acceptance = the capability working through the IN-APP path (services/agent hosts,
   loop.py / dag runner / pipeline), proven by python tests. graphify update . still
   required (that serves our own agents).
+
+## Progress log
+- 2026-07-05 03:09 UTC [opus-vint] T-W7 complete, status->review. Branch task/T-W7-roles-playbooks pushed.
+
+DELIVERED (services/agent/roles.py + services/agent/playbooks/ + host wiring):
+- Loader/validator for the 13 AUTHORED role cards (loaded VERBATIM) + 6 playbooks (aicad.role/1, aicad.playbook/1). Validates schema, stage vocabulary (contract §1), tool resolution vs the MCP tool_registry, allowlist <=14, playbook_default resolution, handoff-schema compilation. All 13 roles + 6 playbooks validate with ZERO errors.
+- Context assembler in contract §9.1 order (prompt->ledger->stage state->ADVISORY->playbook step->history). Advisory block + describers injected as params/callback (no import of services/agent/advisor/ per §9.1 coordination with T-W5).
+- Handoff validator + ledger persistence (kind='handoff', actor=role); enforces the maxLength/enum constraints GBNF cannot. Round-trips through the T-W1 ledger.
+- JSON-schema->GBNF emitter (structure-only, llama.cpp GBNF). $ref (aicad.deliverables/1 etc.) treated as opaque object (never crashes). OSS-surveyed llama.cpp json-schema-to-grammar; wrote a minimal vendored-free subset (no new dep). ADVISOR-CAUGHT FIX: the emitter now PERMITS optional handoff members so a grammar-constrained local model can still emit replan_request (the anti-grind valve, §3.7/§17) - the first cut forbade it.
+- 6 playbooks: sketch_profile (verbatim per ADVISOR_ARCHITECTURE.md §2.4), feature_sequence, layout_first, assembly_fit, sim_study, cam_job. Every step helper_tools subset of the owning role's allowlist.
+- Hosts consume cards: services/dag/node_runner.py applies a node's role: field (loads card, binds allowlist into tool_registry, injects prompt+tools); services/agent/loop.py run()/run_turn() accept role=. Both backward-compatible (no role -> unchanged).
+
+TESTS: services/agent/test_roles.py (29, incl. a self-contained GBNF acceptor PROVING every role's grammar parses a valid handoff and rejects malformed JSON; llama.cpp unavailable so real-runtime parse-verify is deferred) + 3 role-wiring tests in services/dag/test_node_runner.py. Targeted: 60 passed. Full services/agent (excl. pre-existing-broken test_loop_mock.py collection): 229 passed, only 2 pre-existing-on-master failures (test_h7_shadow offline-mode ordering, test_providers_conformance image_part mime). services/dag: 176 passed. Zero regressions.
+
+MECHANICAL CARD FIXES: NONE. All 13 cards loaded verbatim, validated clean - no schema/tool/allowlist defects to fix.
+
+LEAD FLAGS (see work/questions/T-W7.md on the branch):
+- cam_programmer prompt says 'tap_drill sizes the pilot' but tap_drill is NOT in its allowlist (already at the 14 cap). Cannot add (cap) or reword (verbatim) - lead decision. Recommend the foreman supply the pilot size via ADVISORY. cam_job playbook deliberately omits tap_drill from step helpers pending this.
+- delegate + workspace_status (orchestrator/overseer) are feature-flagged: not yet registered, land with sibling W tasks; loader reports them as flags not errors. No action needed.
+
+DEVIATIONS: (1) task said .venv-mcp/bin/python which doesn't exist; used the gate's ~/.local/share/AI-CAD/mcp-venv (what scripts/gate.sh Stage 4 uses). (2) Per the in-app pivot scope: SKIPPED MCP-freshness steps; NO MCP tool registration added (roles are consumed via the in-app services/agent + services/dag hosts, proven by python tests). (3) layout_first authored fresh - confirmed NO T-BL50 artifact existed on this branch to reuse. (4) Loop role path leaves the process-global tool policy pinned to the last role (intended for one-shot role runs; node_runner re-applies per node so multi-role missions never inherit stale policy) - documented in loop.py. (5) graphify update . run. services-agent context pack refreshed (serves our own agents).
+
+GATE: build stages PASS (check.py, core CMake+OCCT, ui/abstract, ctest core 100%). Stage-4 pytest: mcp_server + services sweeps FAIL-RECORDED (non-fatal per gate policy) = PRE-EXISTING (identical 9 failed/34 errors on clean master, all ecad_tools - unrelated to T-W7); services sweep 724 passed incl. my code. Gate hit the 550s wall-clock timeout during the final engine_oracle pytest stage (environment build+4-sweep runtime exceeds 550s), an env timing limit, not a code failure.

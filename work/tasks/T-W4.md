@@ -81,3 +81,22 @@ integration target for this task. Changes vs the original spec:
 - Acceptance = the capability working through the IN-APP path (services/agent hosts,
   loop.py / dag runner / pipeline), proven by python tests. graphify update . still
   required (that serves our own agents).
+
+## Progress log
+- 2026-07-05 02:37 UTC [sonnet-birk] Implementation complete. Branch: task/T-W4-calculators (pushed).
+
+Built:
+- engine_oracle/research/calcs/ package: registry.py (aicad.calc/1 envelope builder + dispatch), beam.py, bolted_joint.py, thread_engagement.py, press_fit.py, wall_thickness.py, snap_fit.py
+- services/agent/advisor/prefill.py — standalone geometry auto-prefill module with DocQuerier Protocol (stub-testable without C++ engine)
+- services/mcp/research_tools.py — extended research_eng_calc to route to new registry first, added list_calcs discovery tool
+
+Test results: 53/53 new tests pass; 116/116 existing research suite (test_fits, test_machining, test_research, test_source_helpers) pass — zero regressions.
+
+Key reference cases verified:
+- beam cantilever: δ=FL³/(3EI) matches Shigley §3-4 to floating-point precision
+- bolted joint M6: A_t=20.1mm² matches Shigley Table 8-1; recommended torque ~10.8 N·m
+- thread engagement M6 into 6061: ~8.85mm recommended (work-order anchor ~9mm ✓)
+- press fit: radial/diametral split explicit; Lamé p=60.9 MPa for 50mm d, 0.05mm interference
+- snap fit: ε=1.5hδ/L² viability check matches Bayer design guide formula
+
+Deviations: wall_thickness and snap_fit use source.kind="heuristic" (process rules, not closed-form derivations) — noted in citations. MCP freshness / server instructions skipped per in-app pivot directive. graphify update run (29756 nodes, 60653 edges).

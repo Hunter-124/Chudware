@@ -1,0 +1,51 @@
+schema: aicad.playbook/1
+id: assembly_fit
+stage: assembly
+# Owning role: assembly_fit_engineer. Helper tools ⊆ assembly_fit_engineer.tool_allowlist.
+steps:
+  - id: assemble
+    goal: place each part in the layout frame and mate to the skeleton's interface geometry
+    helper_tools: [ledger_get, part_place, describe_assembly]
+    checklist:
+      - parts placed against the skeleton's authoritative interface planes/axes
+      - each part mated to interface geometry, not eyeballed positions
+    output:
+      type: object
+      required: [placed_parts]
+  - id: solve
+    goal: solve mates; resolve or deliberately record every remaining DOF
+    helper_tools: [solve_mates, list_world_bodies]
+    checklist:
+      - under-mated bodies either mated or recorded WHY free (e.g. hinge — rotational DOF intended)
+    output:
+      type: object
+      required: [solved, dof_remaining]
+  - id: prove_fits
+    goal: prove every interface with measured numbers, not eyes
+    helper_tools: [check_interference, fit_report, measure_between, fit_calc]
+    checklist:
+      - check_interference across all bodies (fit-aware thresholds from ledger budgets)
+      - fit_report for mating pairs; measure_between for every recorded clearance budget
+      - fit_results lists EVERY interface with measured vs required and a verdict
+    output:
+      type: object
+      required: [fit_results]
+  - id: near_miss
+    goal: flag clearances that pass but eat >80% of budget as decision-with-warning
+    helper_tools: [measure_between, render_part]
+    checklist:
+      - budget-eating near-misses recorded now (tolerance stack will eat the rest)
+      - fastener patterns checked through stacks (measure_between on hole axes)
+    output:
+      type: object
+      required: [warnings]
+  - id: route_part_changes
+    goal: route part-geometry fixes as failure evidence — you own the assembly, not the parts
+    helper_tools: [ledger_note]
+    checklist:
+      - interference resolved by mate/position/orientation, never by resizing a part here
+      - part changes routed as a failure card through the orchestrator to the part's fixer
+    output:
+      type: object
+      required: [routed]
+exit_gate: [mates_solved, all_interfaces_measured, budgets_met_or_routed]

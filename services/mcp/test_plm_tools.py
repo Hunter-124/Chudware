@@ -139,3 +139,28 @@ def test_tool_error_hints_no_git_vocab(tmp_path, tools):
     assert res["ok"] is False
     words = set(res["hint"].lower().replace(".", " ").split())
     assert not (words & _GIT_VOCAB), f"git vocab in hint: {res['hint']!r}"
+
+
+def test_end_to_end_via_real_fastmcp_dispatch(tmp_path):
+    """DoD 'plm_* exercised end-to-end via MCP client': dispatch through the real
+    FastMCP.call_tool path, not the capture shim — open → checkpoint → history."""
+    import asyncio
+
+    (tmp_path / "Bracket.step+").write_bytes(_container(_part()))
+    mcp = FastMCP("plm-e2e")
+    register_plm_tools(mcp)
+
+    async def _run():
+        _content, opened = await mcp.call_tool("plm_open", {"path": str(tmp_path)})
+        opened = json.loads(opened["result"]) if isinstance(opened.get("result"), str) else opened["result"]
+        assert opened["ok"] is True
+        _content, cp = await mcp.call_tool(
+            "plm_checkpoint", {"path": str(tmp_path), "message": "e2e checkpoint"})
+        cp = json.loads(cp["result"]) if isinstance(cp.get("result"), str) else cp["result"]
+        assert cp["ok"] is True
+        _content, h = await mcp.call_tool("plm_history", {"path": str(tmp_path)})
+        h = json.loads(h["result"]) if isinstance(h.get("result"), str) else h["result"]
+        assert h["ok"] is True
+        assert any(e["message"] == "e2e checkpoint" for e in h["entries"])
+
+    asyncio.run(_run())

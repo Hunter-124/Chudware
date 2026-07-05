@@ -184,10 +184,20 @@ def test_roundtrip_restore_matches_original(tmp_path, name, base_doc, edit):
         # restore to the original checkpoint
         v.restore(orig_commit)
 
-        # the working container's document.json must be semantically identical
-        restored = _doc_from_container((tmp_path / name).read_bytes())
+        # (1) canonical document.json byte-equality — the real proof restore is
+        # faithful for ALL kinds (doc_diff only models part/asm, so on drawing/pcb
+        # a semantic diff is vacuously empty; byte-equality is the honest check).
+        restored_raw = (tmp_path / name).read_bytes()
+        restored_canonical = snapshot.explode_container(restored_raw).document_json
+        head = v._bind.head_commit()
+        # the item's stored blob at the restore entry must equal the working form
+        iid = v.status()["items"][0]["item_id"]
+        stored = v._bind.read_blob_at(head, snapshot.item_prefix(iid) + "document.json")
+        assert restored_canonical == stored, f"{name}: restored blob != working form"
+
+        # (2) semantic doc_diff empty (meaningful for part/asm; harmless elsewhere)
+        restored = _doc_from_container(restored_raw)
         diff = doc_diff(base_doc, restored)
-        # every diff bucket empty (float noise below µm already suppressed)
         for key in ("features_added", "features_removed", "features_changed",
                     "params_changed", "mate_deltas", "suppression_flips"):
             assert not diff.get(key), f"{name}: non-empty {key}: {diff.get(key)}"
@@ -258,6 +268,28 @@ def test_release_freezes_geometry_step(tmp_path):
         assert tree[snapshot.item_prefix(iid) + "geometry.step"] == geom
     finally:
         v.close()
+
+
+def test_release_pin_is_persisted_not_null(tmp_path):
+    # regression: released_revs[].commit must be non-null in the STORED manifest
+    # so §4/§5 readers can locate the frozen geometry.step later (frozen store).
+    _write(tmp_path, "Bracket.step+", _part())
+    v = Vault.open(tmp_path)
+    iid = v.status()["items"][0]["item_id"]
+    rel = v.release(iid, "rev A")
+    v.close()
+    # reopen: read the persisted manifest, not the in-memory one
+    v2 = Vault.open(tmp_path)
+    try:
+        item = manifest.find_item(v2.manifest(), iid)
+        pin = item["released_revs"][-1]
+        assert pin["rev"] == "A"
+        assert pin["commit"] is not None, "release pin persisted as null"
+        # the pinned commit must actually carry the frozen geometry-freeze entry
+        tree = v2._bind.read_tree(pin["commit"])
+        assert snapshot.item_prefix(iid) + "meta.json" in tree
+    finally:
+        v2.close()
 
 
 def test_non_release_commits_have_no_geometry(tmp_path):

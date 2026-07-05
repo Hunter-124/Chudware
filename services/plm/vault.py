@@ -230,11 +230,24 @@ class Vault:
             author_name=author["display"], author_email=f'{author["id"]}@aicad.local',
         )
         commit = self._bind.commit_tree(files, emeta)
-        # back-fill the release commit id into the just-recorded rev + re-commit
-        # manifest so released_revs points at the actual release commit.
+
+        # Back-fill the release commit id into the rev pin. A commit cannot embed
+        # its own hash, so the manifest just committed still has commit:null for
+        # this rev. Persist the pin with a tiny follow-up commit that rewrites ONLY
+        # manifest.json over the same tree (append-only-safe; the release stays the
+        # authoritative geometry-freeze entry, this just resolves the pointer).
+        # released_revs[].commit MUST be non-null in the stored manifest so §4/§5
+        # readers can locate the frozen geometry.step later.
         item["released_revs"][-1]["commit"] = commit
-        return {"commit": commit, "rev": new_rev,
-                "entry": self._entry_view(commit, self._bind.read_tree(commit), item_id),
+        files["manifest.json"] = manifest.dumps(m)
+        pin_meta = gitbind.EntryMeta(
+            kind=hist.KIND_RELEASE, message=message,
+            author_name=author["display"], author_email=f'{author["id"]}@aicad.local',
+        )
+        pinned_commit = self._bind.commit_tree(files, pin_meta)
+
+        return {"commit": pinned_commit, "release_commit": commit, "rev": new_rev,
+                "entry": self._entry_view(pinned_commit, self._bind.read_tree(pinned_commit), item_id),
                 "prior_rev": prior_rev}
 
     # -- maintenance -------------------------------------------------------

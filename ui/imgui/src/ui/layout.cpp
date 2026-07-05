@@ -269,10 +269,13 @@ void drawLeftPane(app::AppState& s) {
     const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
     const ImRect paneRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
     publishOverlayColumnEdge(0, paneRect.Max.x);
+    // The whole-column glass slab is NOT painted here — drawLeftDock() paints the ONE "browser_glass"
+    // UltraThin surface for the body and drawActivityRail() paints "rail_glass", exactly as they did
+    // when docked. Painting a third "left_pane_glass" slab underneath stacked the tint (density
+    // mismatch between rail strip and body). We still resolve the pane surface for the chevron chip
+    // + ambient text contrast (idempotent per frame).
     const theme::AdaptiveSurface& surf =
-        theme::adaptivePanel(theme::panelId("left_pane_glass"), paneRect);
-    theme::glassPanel(ImGui::GetWindowDrawList(), paneRect, theme::MaterialLevel::UltraThin,
-                      bubbleDp, surf);
+        theme::adaptivePanel(theme::panelId("browser_glass"), paneRect);
 
     if (drawCollapseChip(paneRect, /*pointLeft=*/true, surf)) { s_collapsed = true; ImGui::End(); return; }
 

@@ -1,5 +1,6 @@
 // Assembly UI panels — ported from host/src/ui/asm_panels.cpp (C5).
 #include "ui/asm_panels.h"
+#include "ui/layout.h"   // T-G23: setNextCommandDialogPlacement (overlay-band float anchor)
 
 #include <algorithm>
 #include <cfloat>
@@ -141,6 +142,7 @@ bool AsmPanels::insertComponent(AppState& st, const std::string& path,
 void AsmPanels::drawInsert(AppState& st) {
     if (!insertOpen_) return;
     bool open = true;
+    ui::setNextCommandDialogPlacement();   // T-G23: float in overlay band (docked slot removed)
     ImGui::SetNextWindowSize(ImVec2(380 * c5::scale(), 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (insertFocus_) { ImGui::SetNextWindowFocus(); insertFocus_ = false; }
     pushGlassWindow();
@@ -1014,6 +1016,7 @@ bool AsmPanels::setExplode(AppState& st, bool active, float factor) {
 void AsmPanels::drawExplode(AppState& st) {
     if (!explodeOpen_) return;
     bool open = true;
+    ui::setNextCommandDialogPlacement();   // T-G23: float in overlay band (docked slot removed)
     ImGui::SetNextWindowSize(ImVec2(300 * c5::scale(), 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (explodeFocus_) { ImGui::SetNextWindowFocus(); explodeFocus_ = false; }
     pushGlassWindow();
@@ -1080,6 +1083,7 @@ void AsmPanels::refreshInterference(AppState& st) {
 void AsmPanels::drawInterference(AppState& st) {
     if (!interferenceOpen_) return;
         bool open = true;
+    ui::setNextCommandDialogPlacement();   // T-G23: float in overlay band (docked slot removed)
     ImGui::SetNextWindowSize(ImVec2(420 * c5::scale(), 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (interferenceFocus_) { ImGui::SetNextWindowFocus(); interferenceFocus_ = false; }
     pushGlassWindow();
@@ -1202,6 +1206,7 @@ void AsmPanels::refreshBom(AppState& st) {
 void AsmPanels::drawBom(AppState& st) {
     if (!bomOpen_) return;
     bool open = true;
+    ui::setNextCommandDialogPlacement();   // T-G23: float in overlay band (docked slot removed)
     ImGui::SetNextWindowSize(ImVec2(560 * c5::scale(), 0), ImGuiCond_Appearing);  // W1-B (item 10): DPI
     if (bomFocus_) { ImGui::SetNextWindowFocus(); bomFocus_ = false; }
     pushGlassWindow();

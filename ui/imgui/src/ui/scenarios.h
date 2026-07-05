@@ -3,6 +3,9 @@
 #pragma once
 
 #include <string>
+#include <vector>
+
+#include <nlohmann/json.hpp>
 
 struct GLFWwindow;
 
@@ -117,6 +120,11 @@ struct ShotConfig {
     bool wantMultidoc = false;
     bool multidocShotDone = false;
 
+    // T-G25: icon pipeline (recipe-driven clean-viewport icon render, ported from host's T-G15).
+    // Drains ALL recipes in a single tick (see ScenarioRunner::runIconPipe) — no per-frame settle.
+    bool wantIconPipe = false;
+    bool iconPipeShotDone = false;
+
     // Sim overlay hints (fea/flow wait for colormap)
     bool colormapOn = false;
     bool legendOn = false;
@@ -137,7 +145,7 @@ struct ShotConfig {
     bool isScenarioMode() const {
         return wantM1 || wantSketch || wantSketchDispatch || wantSketchAutohide || wantSketchConvert
             || wantAsm || wantFea || wantFeaOverlay || wantFlow || wantCam || wantDrawing
-            || wantEvalMass || wantActivity || wantMultidoc;
+            || wantEvalMass || wantActivity || wantMultidoc || wantIconPipe;
     }
 
     // Frame budget for the generic capture path (flow allows ~240 s at 60 Hz).
@@ -159,6 +167,7 @@ public:
 private:
     void runMultidoc(ShotConfig& cfg, app::AppState& st);
     void runDrawing(ShotConfig& cfg, app::AppState& st);
+    void runIconPipe(ShotConfig& cfg, app::AppState& st);
     void tickGlassperf(ShotConfig& cfg, app::AppState& st);
     void tickSimpleShots(ShotConfig& cfg, app::AppState& st);
 
@@ -234,6 +243,12 @@ private:
     int dwgStep = 0, dwgSettle = 0;
     bool dwgDirReady = false;
     std::string dwgSavePath, dwgCapture;
+
+    // T-G25 icon pipeline (ported from host's T-G15 runIconPipe)
+    bool ipInit = false, ipWant = false;
+    int ipIndex = 0, ipPx = 128;
+    std::string ipOutDir;
+    std::vector<nlohmann::json> ipRecipes;
 };
 
 // Bind runner + config for the frame loop (main.cpp calls once after configureShot).

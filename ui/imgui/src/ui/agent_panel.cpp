@@ -673,33 +673,79 @@ static void drawBlock(AppState& s, AgentBlock& b, int idx, float panelW) {
 }
 
 static void drawSessionsList(AppState& s, bool busy) {
+    const float S = theme::S();
     const theme::AdaptiveSurface& surf = agentSurf();
     ensureSessions();
-    if (ImGui::Button("+ New session") && !busy) newSession(s);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Back to chat")) gShowSessions = false;
+    // New-session button spans the full tab width (T-G25 gap 3). The Sessions<->Back toggle
+    // lives in the header (drawCopilotHeader), so there is no separate "Back to chat" control
+    // here (T-G25 gap 2 — mirrors host legacy_chat.cpp's drawSessionsPanel).
+    if (busy) ImGui::BeginDisabled();
+    if (ImGui::Button("+ New session", ImVec2(-1, 0))) newSession(s);
+    if (busy) ImGui::EndDisabled();
     ImGui::Separator();
     ImGui::TextColored(surf.textSecondary,
         "Switch sessions — running ones keep working in the background.");
-    ImGui::Dummy(ImVec2(0, 4.f * theme::S()));
+    ImGui::Dummy(ImVec2(0, 4.f * S));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
     for (int i = 0; i < (int)gSessions.size(); ++i) {
         std::string label = gSessions[i].title;
-        if (gSessions[i].running || (i == gActiveSession && aiTurnActive(s)))
-            label += "  \xe2\x80\xa2 running";
+        bool running = gSessions[i].running || (i == gActiveSession && aiTurnActive(s));
+        bool active = (i == gActiveSession);
+
         ImGui::PushID(i);
-        float trashW = ImGui::GetFrameHeight();
-        float rowW = ImGui::GetContentRegionAvail().x;
-        if (ImGui::Selectable(label.c_str(), i == gActiveSession, 0,
-                              ImVec2(rowW - trashW - 4.f * theme::S(), 0)) && !busy)
-            loadSessionToAgent(s, i);
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - trashW);
-        if (ImGui::SmallButton("x") && !busy && (int)gSessions.size() > 1) {
-            closeSession(s, i);
-            ImGui::PopID();
-            break;
+        const float rowH   = ImGui::GetFrameHeight() + 6.f * S;   // roomy, touch-friendly row
+        const float trashSz = ImGui::GetFrameHeight();            // square trash box
+        const ImVec2 rowMin = ImGui::GetCursorScreenPos();
+        const float  rowW   = ImGui::GetContentRegionAvail().x;
+        const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + rowH);
+        const float  midY   = rowMin.y + rowH * 0.5f;
+        const float  fh     = ImGui::GetFontSize();
+        const float  pad    = 8.f * S;
+
+        // Whole-row click target (everything left of the trash) switches to that session.
+        bool picked = ImGui::InvisibleButton("##pickconv", ImVec2(rowW - trashSz - pad, rowH));
+        bool rowHov = ImGui::IsItemHovered();
+        if (picked && !busy) loadSessionToAgent(s, i);
+
+        // Glass row pill — matches the FeatureManager rows: alternating stripe + a restrained
+        // accent card for the active session, a light wash on hover (T-G25 gap 1).
+        float wash = active ? theme::rowWash::selected
+                             : (rowHov ? theme::rowWash::hover : theme::rowWash::idle);
+        theme::glassRowBackground(dl, rowMin, rowMax, 4.f * S, (i % 2) == 1, active, wash);
+
+        // Title text, vertically centered in the row.
+        ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
+        dl->AddText(ImVec2(rowMin.x + pad, midY - fh * 0.5f), ink, label.c_str());
+        if (running) {
+            float tw = ImGui::CalcTextSize(label.c_str()).x;
+            ImU32 rc = ImGui::ColorConvertFloat4ToU32(theme::roleVec(theme::pal().accent, 1.f));
+            dl->AddText(ImVec2(rowMin.x + pad + tw + 8.f * S, midY - fh * 0.5f), rc,
+                        "\xe2\x80\xa2 running");
         }
+
+        // Trash button: right-anchored with an inset so it never clips the column edge, and
+        // vertically centered on the row (T-G25 gap 1). No atlas/SDF trash glyph exists in this
+        // build (grepped icons.cpp aliasMap + atlas), so mirror doc_tabs.cpp's hand-drawn "x"
+        // close affordance instead — same InvisibleButton + AddLine cross pattern already used
+        // for tab-close in this codebase.
+        const float btn = trashSz;
+        ImGui::SetCursorScreenPos(ImVec2(rowMax.x - btn - 2.f * S, midY - btn * 0.5f));
+        bool del = ImGui::InvisibleButton("##delconv", ImVec2(btn, btn))
+                   && !busy && (int)gSessions.size() > 1;
+        bool delHov = ImGui::IsItemHovered();
+        const ImVec2 xc(rowMax.x - btn * 0.5f - 2.f * S, midY);
+        if (delHov) dl->AddCircleFilled(xc, btn * 0.5f, TCOL(bad));
+        const float g = btn * 0.22f;
+        ImU32 xCol = ImGui::ColorConvertFloat4ToU32(delHov ? surf.textPrimary : surf.textTertiary);
+        dl->AddLine(ImVec2(xc.x - g, xc.y - g), ImVec2(xc.x + g, xc.y + g), xCol, 1.6f * S);
+        dl->AddLine(ImVec2(xc.x - g, xc.y + g), ImVec2(xc.x + g, xc.y - g), xCol, 1.6f * S);
+        if (delHov) ImGui::SetTooltip("Delete this session");
+
+        // Advance the ImGui cursor past the row (the buttons above left it mid-row).
+        ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + 3.f * S));
         ImGui::PopID();
+        if (del) { closeSession(s, i); break; }
     }
     ImGui::PopStyleColor();
 }
@@ -707,26 +753,50 @@ static void drawSessionsList(AppState& s, bool busy) {
 static void drawCopilotHeader(AppState& s, bool busy) {
     const float S = theme::S();
     const theme::AdaptiveSurface& surf = agentSurf();
-    ImGui::PushFont(theme::font(theme::Font::H2));
-    inlineIconGlass("agent", 18.f * S, ImGui::ColorConvertFloat4ToU32(surf.textPrimary));
-    ImGui::SameLine(0, 8.f * S);
-    ImGui::TextColored(surf.textPrimary, "ShopCraft Copilot");
-    ImGui::PopFont();
 
+    // Right-side control cluster width is measured from the LIVE toggle label so the settings
+    // gear can't drift/overlap when the label swaps ("Sessions" vs "< Chat") — mirrors host
+    // sessLabel/sessW at legacy_chat.cpp:1284-1285 (T-G25 gap 2).
     const ImGuiStyle& style = ImGui::GetStyle();
     const float lh = ImGui::GetTextLineHeight();
-    float sessW = ImGui::CalcTextSize("Sessions").x + style.FramePadding.x * 2.f;
-    float gearW = lh;
-    float cluster = sessW + style.ItemSpacing.x + gearW + style.ItemSpacing.x + lh;
+    const bool sessionsOpen = gShowSessions;
+    const char* sessLabel = sessionsOpen ? "< Chat" : "Sessions";
+    const float sessW = ImGui::CalcTextSize(sessLabel).x + style.FramePadding.x * 2.f;
+    const float gearW = lh;
+    const float cluster = sessW + style.ItemSpacing.x + gearW + style.ItemSpacing.x + lh;
+
+    // Compact copilot title: a smaller (Label, not H2) font plus a 3-tier fallback — full
+    // "ShopCraft Copilot" / short "Copilot" / logo-only — based on the width actually left over
+    // once the right-side cluster is accounted for (T-G25 gap 4; mirrors host legacy_chat.cpp
+    // drawCopilotHeader's titleAvail/fullW/shortW logic).
+    const float rightInset = 4.f * S;
+    const float anchorX     = ImGui::GetContentRegionMax().x - cluster - rightInset;
+    const float titleStartX = ImGui::GetCursorPosX();
+    const float iconW       = 18.f * S + 8.f * S;  // icon + SameLine gap reserved before the title
+    const float titleAvail  = anchorX - titleStartX - iconW - style.ItemSpacing.x;
+
+    inlineIconGlass("agent", 18.f * S, ImGui::ColorConvertFloat4ToU32(surf.textPrimary));
+    ImGui::SameLine(0, 8.f * S);
+    ImGui::PushFont(theme::font(theme::Font::Label));
+    const float fullW  = ImGui::CalcTextSize("ShopCraft Copilot").x;
+    const float shortW = ImGui::CalcTextSize("Copilot").x;
+    const char* useTitle = (titleAvail >= fullW)  ? "ShopCraft Copilot"
+                         : (titleAvail >= shortW) ? "Copilot"
+                                                  : nullptr;
+    if (useTitle) ImGui::TextColored(surf.textPrimary, "%s", useTitle);
+    else ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight()));  // logo-only: icon already drawn
+    ImGui::PopFont();
+
     ImGui::SameLine();
     float xRight = ImGui::GetContentRegionMax().x - cluster;
     if (xRight > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(xRight);
 
     if (busy) ImGui::BeginDisabled();
-    if (ImGui::SmallButton("Sessions")) gShowSessions = !gShowSessions;
+    if (ImGui::SmallButton(sessLabel)) gShowSessions = !gShowSessions;
     if (busy) ImGui::EndDisabled();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Show or hide the session list.");
+        ImGui::SetTooltip(sessionsOpen ? "Back to the chat."
+                                       : "Show or hide the session list.");
 
     ImGui::SameLine();
     {

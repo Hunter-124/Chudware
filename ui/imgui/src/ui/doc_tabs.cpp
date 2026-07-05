@@ -1,4 +1,4 @@
-#include "ui/doc_tabs.h"
+#include "ui/doc_tab_strip.h"
 #include "app/app_state.h"
 #include "ui/command_registry.h"
 #include "theme/theme.h"

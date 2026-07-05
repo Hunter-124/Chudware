@@ -1021,7 +1021,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
 // re-render when nothing changed. CRITICALLY restores every GL state the main pass depends on:
 // the bound framebuffer (0), the full-window viewport is re-set by the next drawCurrent() (which
 // always binds fbo_ + sets glViewport), but we still leave GL in a clean, predictable state here.
-unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
+unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px, bool transparentBg) {
     if (px < 16) px = 16;
 
     // Lazily (re)allocate the dedicated thumb target when missing or the size changed.
@@ -1047,9 +1047,9 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
         thumbValid_ = false;  // size change forces a re-render below
     }
 
-    // Cache: re-use the existing texture if the orientation and meshes are unchanged.
+    // Cache: re-use the existing texture if the orientation, meshes and bg mode are unchanged.
     if (thumbValid_ && thumbMeshRev_ == meshesRevision_ &&
-        thumbYaw_ == yawDeg && thumbPitch_ == pitchDeg) {
+        thumbYaw_ == yawDeg && thumbPitch_ == pitchDeg && thumbTransparent_ == transparentBg) {
         return thumbTex_;
     }
 
@@ -1058,19 +1058,28 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
     glViewport(0, 0, px, px);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
+    if (transparentBg) glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // T-G25: transparent icon tile
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    // Solid light studio background (single fill via the gradient shader with all three stops equal
-    // — avoids a separate clear-color path and keeps the same near-white look as the main view).
-    glDisable(GL_DEPTH_TEST);
-    glUseProgram(bgProg_);
-    glUniform3fv(glGetUniformLocation(bgProg_, "uTop"), 1, bgTop_);
-    glUniform3fv(glGetUniformLocation(bgProg_, "uMid"), 1, bgMid_);
-    glUniform3fv(glGetUniformLocation(bgProg_, "uBot"), 1, bgBot_);
-    glBindVertexArray(bgVao_);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-    glBindVertexArray(0);
-    glEnable(GL_DEPTH_TEST);
+    if (transparentBg) {
+        // T-G25 icon pipeline: no studio fill — leave the tile transparent so the lit part
+        // composites over alpha=0. Part fragments are opaque (uAlpha=1 below); silhouettes are
+        // hard-edged (no supersample) so alpha stays a clean 0/255 mask.
+        glDisable(GL_BLEND);
+    } else {
+        // Solid light studio background (single fill via the gradient shader with all three stops
+        // equal — avoids a separate clear-color path and keeps the same near-white look as the
+        // main view).
+        glDisable(GL_DEPTH_TEST);
+        glUseProgram(bgProg_);
+        glUniform3fv(glGetUniformLocation(bgProg_, "uTop"), 1, bgTop_);
+        glUniform3fv(glGetUniformLocation(bgProg_, "uMid"), 1, bgMid_);
+        glUniform3fv(glGetUniformLocation(bgProg_, "uBot"), 1, bgBot_);
+        glBindVertexArray(bgVao_);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glBindVertexArray(0);
+        glEnable(GL_DEPTH_TEST);
+    }
 
     const float sceneR = (radius_ > 0.0f) ? radius_ : kEmptySceneRadius;
     const float deg = 3.14159265f / 180.0f;
@@ -1145,8 +1154,28 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px) {
 
     thumbYaw_ = yawDeg; thumbPitch_ = pitchDeg;
     thumbMeshRev_ = meshesRevision_;
+    thumbTransparent_ = transparentBg;
     thumbValid_ = true;
     return thumbTex_;
+}
+
+// T-G25: read back the thumbnail FBO (the last renderThumbnail target) as px*px RGBA, flipped to
+// top-left origin — the clean, transparent-capable icon capture the pipeline saves as a PNG.
+// Ported from host/src/renderer.cpp Renderer::readThumbnailRGBA (same flip loop).
+std::vector<unsigned char> Renderer::readThumbnailRGBA(int px) const {
+    if (px < 16) px = 16;
+    std::vector<unsigned char> raw((size_t)px * px * 4, 0);
+    if (!thumbFbo_) return raw;
+    glBindFramebuffer(GL_FRAMEBUFFER, thumbFbo_);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, px, px, GL_RGBA, GL_UNSIGNED_BYTE, raw.data());
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    std::vector<unsigned char> out((size_t)px * px * 4, 0);
+    for (int y = 0; y < px; ++y) {
+        const unsigned char* src = &raw[(size_t)y * px * 4];
+        std::copy(src, src + (size_t)px * 4, &out[(size_t)(px - 1 - y) * px * 4]);
+    }
+    return out;
 }
 
 // Soft elliptical contact shadow on a virtual ground plane just below the model bbox. Z is up

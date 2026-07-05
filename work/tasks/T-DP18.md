@@ -41,3 +41,6 @@ status-bar element — low GUI collision, can start now.
 - [ ] Status-bar clock shows whole-mission ETA; per-node ETA exposed for the DAG widget.
 - [ ] Degrades honestly (range/unknown) with no history; frontier uses observed rate.
 - [ ] gate.sh PASS; graphify update.
+
+## Progress log
+- 2026-07-05 21:12 UTC [sonnet-fenn1] Backend estimator complete (39/39 tests pass). Token costs: qwen3-4b micro_evals output tokens (480/953/249 per role shape). TPS: 475.86 agg N=8, 482 integrator smoke. Status-bar ETA chip + DagRunView/AppState fields wired. Gate running.

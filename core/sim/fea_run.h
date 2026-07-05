@@ -54,4 +54,18 @@ nlohmann::json fea_run_static(const nlohmann::json& study);
 // {ok, freqs_hz, mode_shapes, n_modes, n_nodes, n_dof}. Never throws.
 nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes);
 
+// Combined steady-state THERMAL (heat conduction) run. `study` carries the same
+// mesh (step_path | inline points/tets) + material fields, plus thermal BCs:
+//   material.k_w_mk (float) -> conductivity W/(m·K); default from the study or a fallback
+//   fixtures: [{points,tol_mm, temp_c:<float>}]        Dirichlet fixed-temperature faces
+//   loads:    [{faces:{points,tol_mm}, type:"flux",       magnitude:<W/m^2>}   heat flux
+//              {faces:{points,tol_mm}, type:"convection",  h:<W/m^2K>, t_amb_c:<°C>}]
+// The mesh length unit is mm, so the glue converts W/(m·K)→W/(mm·K), W/m^2→W/mm^2,
+// W/(m^2·K)→W/(mm^2·K) before calling the kernel (fea_thermal_solve). Returns
+//   {ok, temperature[n], n_nodes, n_dof, n_elems, mesh_type_used,
+//    summary:{max_temp_c, min_temp_c}, flux_summary:[...per convection/flux face...],
+//    solver_notes}.
+// Never throws: a bad mesh / singular model returns {ok:false, error}.
+nlohmann::json fea_run_thermal(const nlohmann::json& study);
+
 }  // namespace aicad::sim

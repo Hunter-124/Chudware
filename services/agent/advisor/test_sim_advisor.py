@@ -34,6 +34,8 @@ from services.agent.advisor.sim_advisor import (
     postcheck,
     precheck,
     resolve_material_class,
+    thermal_anchor,
+    _thermal_bc_issues,
 )
 from engine_oracle.research.calcs.beam import beam_calc_raw
 
@@ -495,3 +497,106 @@ class TestCantileverAnchorMockProve:
             f"(anchor={anchor_s:.3f} fea={fea_vm:.3f})"
         )
         assert div_items[0]["numbers"]["divergence_ratio"] > DIVERGENCE_WARN_RATIO
+
+
+# ---------------------------------------------------------------------------
+# 9. Thermal anchor (1D plane-wall Fourier reference) — T-SIM1
+# ---------------------------------------------------------------------------
+
+class TestThermalAnchor:
+    def _wall_bbox(self, L_mm=10.0, w=100.0, hh=100.0):
+        # thinnest side is the through-thickness direction (L_mm)
+        return {"x_mm": w, "y_mm": hh, "z_mm": L_mm}
+
+    def test_conduction_anchor_matches_fourier(self):
+        # q'' = k ΔT / L. k=50 W/mK, ΔT=80 K, L=10mm=0.01m -> q = 50*80/0.01 = 400000 W/m^2
+        anchor = thermal_anchor(self._wall_bbox(L_mm=10.0), k_w_mk=50.0,
+                                t_hot_c=100.0, t_cold_c=20.0)
+        assert anchor is not None
+        assert anchor["mode"] == "conduction"
+        assert anchor["q_w_m2"] == pytest.approx(400000.0, rel=1e-9)
+        assert "Incropera" in anchor["source"]
+
+    def test_convection_anchor_matches_series_resistance(self):
+        # Series resistance: q = (T_hot - T_amb)/(L/k + 1/h); T_cold = T_amb + q/h.
+        L_m = 10.0 / 1000.0
+        k, h, t_hot, t_amb = 50.0, 100.0, 100.0, 20.0
+        q_expect = (t_hot - t_amb) / (L_m / k + 1.0 / h)
+        tcold_expect = t_amb + q_expect / h
+        anchor = thermal_anchor(self._wall_bbox(L_mm=10.0), k_w_mk=k, t_hot_c=t_hot,
+                                h_w_m2k=h, t_amb_c=t_amb)
+        assert anchor is not None
+        assert anchor["mode"] == "convection"
+        assert anchor["q_w_m2"] == pytest.approx(q_expect, rel=1e-9)
+        assert anchor["t_cold_c"] == pytest.approx(tcold_expect, rel=1e-9)
+
+    def test_missing_bbox_returns_none(self):
+        assert thermal_anchor({}, k_w_mk=50.0, t_hot_c=100.0, t_cold_c=20.0) is None
+
+    def test_bad_conductivity_returns_none(self):
+        assert thermal_anchor(self._wall_bbox(), k_w_mk=0.0, t_hot_c=100.0, t_cold_c=20.0) is None
+
+    def test_no_cold_datum_returns_none(self):
+        # Only a hot face, no cold temp and no convection -> not confident.
+        assert thermal_anchor(self._wall_bbox(), k_w_mk=50.0, t_hot_c=100.0) is None
+
+
+# ---------------------------------------------------------------------------
+# 10. Thermal BC lint (singular temperature datum) — T-SIM1
+# ---------------------------------------------------------------------------
+
+class TestThermalBcLint:
+    def test_pure_neumann_is_singular(self):
+        # Only a flux load, no fixed-T and no convection -> singular.
+        issues = _thermal_bc_issues({
+            "type": "thermal",
+            "fixtures": [],
+            "loads": [{"type": "flux", "magnitude": 500.0}],
+        })
+        kinds = [i["kind"] for i in issues]
+        assert "thermal_singular" in kinds, issues
+
+    def test_convection_alone_is_not_singular(self):
+        # A convection film anchors the datum even with no fixed-T.
+        issues = _thermal_bc_issues({
+            "type": "thermal",
+            "fixtures": [],
+            "loads": [{"type": "convection", "h": 25.0, "t_amb_c": 20.0}],
+        })
+        kinds = [i["kind"] for i in issues]
+        assert "thermal_singular" not in kinds, issues
+
+    def test_fixed_temp_is_not_singular(self):
+        issues = _thermal_bc_issues({
+            "type": "thermal",
+            "fixtures": [{"points": [[0, 0, 0]], "temp_c": 100.0}],
+            "loads": [{"type": "flux", "magnitude": 500.0}],
+        })
+        kinds = [i["kind"] for i in issues]
+        assert "thermal_singular" not in kinds, issues
+
+    def test_precheck_routes_thermal_singular_as_blocker(self):
+        # A thermal study with no datum should raise a blocker BC item through precheck.
+        study = {"type": "thermal", "fixtures": [], "loads": [], "material": {"k_w_mk": 50.0}}
+        items = precheck(study)
+        bc = [i for i in items if i["check"] == "sim_bc"]
+        assert any(i["severity"] == "blocker" for i in bc), bc
+        # And every non-info precheck item carries a candidate fix (§3 invariant).
+        for it in items:
+            if it["severity"] != "info":
+                assert it["candidate_fixes"], it
+
+    def test_precheck_emits_thermal_anchor(self):
+        study = {
+            "type": "thermal",
+            "material": {"k_w_mk": 50.0},
+            "bbox": {"x_mm": 100, "y_mm": 100, "z_mm": 10},
+            "fixtures": [{"points": [[0, 0, 0]], "temp_c": 100.0},
+                         {"points": [[10, 0, 0]], "temp_c": 20.0}],
+            "loads": [],
+        }
+        items = precheck(study)
+        anchor_items = [i for i in items if i["check"] == "sim_anchor"]
+        assert anchor_items, items
+        assert anchor_items[0]["_anchor"] is not None
+        assert anchor_items[0]["_anchor"]["mode"] == "conduction"

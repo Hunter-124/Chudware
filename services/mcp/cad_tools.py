@@ -837,7 +837,7 @@ def _first_temperature(faces: list, label: str) -> float:
 
 # --------------------------------------------------------------------- the guide text
 
-_GUIDE_PROMPTS = ["overview", "review", "simulation"]
+_GUIDE_PROMPTS = ["overview", "review", "simulation", "motion"]
 
 
 def _prompts_dir() -> Path:
@@ -933,6 +933,44 @@ Heavy solves: run_cfd_flow / run_fea_* accept background=True (run_cfd_accurate 
 background) → return a job_id immediately; poll get_job(job_id) for the result. This keeps a long
 solve from tripping the transport timeout (which would otherwise drop the session). After a
 restart, recover_parts() reloads auto-saved docs.
+"""
+
+_MOTION_GUIDE = """\
+MOTION / KINEMATICS GUIDE — make an assembly MOVE, and check it clears as it goes.
+
+simulate_motion(mate_id, start, stop, steps, ...) is the assembly-motion study: it DRIVES one
+mate through a range and re-solves the whole mate graph at each sample, so the rest of the
+mechanism follows — SolidWorks-Motion / Onshape-Assembly-Motion for the common KINEMATIC case.
+
+WHAT IT ANSWERS: "does this linkage / crank / cam / gear-train move the way I meant, and does
+anything CLASH as it sweeps?" It returns a trajectory (every body's world 4x4 pose per step) plus
+a per-step interference sweep that flags the FIRST colliding step.
+
+SCOPE (v1): KINEMATICS ONLY — position (and, by sampling, velocity). NO forces, torque, inertia
+or contact dynamics. It is geometry-of-motion + collision, not loads. (A dynamics follow-up would
+add mass/inertia, joint torques and a time integrator on top of this same driven-mate loop.)
+
+HOW TO USE
+  1. Open/build an ASSEMBLY with mates (asm_insert_component + asm_add_mate; solve_mates to seat
+     it). You DRIVE a DIMENSIONAL mate — one whose `value` means motion: angle / angle_limit
+     (deg), distance / distance_limit (mm), gear / rack_pinion / screw. A revolute/concentric/
+     slot mate has no value to sweep; drive the angle/distance mate that DIMENSIONS that joint.
+  2. simulate_motion(mate_id="m3", start=0, stop=360, steps=48, loop=True) — sweep the driver
+     0->360 and close the cycle. Omit mate_id if there's exactly one drivable mate; omit start to
+     begin at the mate's current value.
+  3. Read the result: trajectory[i].bodies[j].transform is body j's world pose at sample i (the
+     datum a viewer animates); interference.first_collision_step / _value is the first clash (with
+     the interfering pair in `detail`). The study RESTORES the driven mate to its original value
+     when it finishes — it reads motion, it doesn't leave the assembly moved.
+
+TIPS
+  * More `steps` = smoother playback and safer against a re-solve flipping a tight mechanism to a
+    mirror pose (positions carry forward step-to-step, so a fine sweep stays on one branch).
+  * A single angle/distance mate under-constrains a free body (it removes one DOF of six); pin the
+    unwanted DOF with extra mates (e.g. a `parallel` to keep a planar linkage in-plane) so the
+    driven pose is unique.
+  * Swept interference reuses check_interference per step — it does not reimplement collision;
+    tune it with min_clearance_mm just like a static check.
 """
 
 _OVERVIEW_HEADER = """\
@@ -1125,6 +1163,9 @@ def cad_guide_text(topic: str = "overview") -> str:
         return _read_prompt("reviewer.md") or "(reviewer guide unavailable)"
     if topic in ("simulation", "sim", "fea", "cfd"):
         return _SIM_GUIDE
+    if topic in ("motion", "kinematics", "kinematic", "mechanism", "simulate_motion",
+                 "linkage", "animate", "playback"):
+        return _MOTION_GUIDE
     if topic in ("intake", "fit", "fits", "iso286", "tolerance", "measure",
                  "manufacturing", "dfm", "photos"):
         return _INTAKE_GUIDE
@@ -1615,8 +1656,8 @@ def cad_guide_text(topic: str = "overview") -> str:
         return sheet
     avail = sorted(p.stem for p in (_prompts_dir() / "shared" / "cheatsheets").glob("*.md")) \
         if (_prompts_dir() / "shared" / "cheatsheets").is_dir() else []
-    return (f"No guide for {topic!r}. Topics: overview, simulation, review, intake, gsl, cam, "
-            f"narration, parts, reverse, deliverables, requirements, dag, verify, interaction, "
+    return (f"No guide for {topic!r}. Topics: overview, simulation, motion, review, intake, gsl, "
+            f"cam, narration, parts, reverse, deliverables, requirements, dag, verify, interaction, "
             f"sourcing, cost, spec, piping, hydraulic, firmware, structural, mechanical, regen, "
             f"code_compliance, serving, design_review, doc_diff, plm, tolerance_stackup; "
             f"or a feature cheatsheet: {avail}")
@@ -1637,7 +1678,8 @@ def register_cad_tools(mcp: FastMCP) -> None:
         taught. topic="overview" (default) gives the workflow + full op cheatsheet (primitives,
         sketch+extrude/revolve/loft/sweep, fillet/chamfer/shell/draft, holes, bolt_circle,
         patterns/mirror, edits) and the plain-English geometry-query predicates. Other topics:
-        "simulation" (FEA/CFD how-to), "review" (how to read the annotated render), "gsl" (the
+        "simulation" (FEA/CFD how-to), "motion" (simulate_motion — drive a mate to animate an
+        assembly + swept interference, kinematics), "review" (how to read the annotated render), "gsl" (the
         progressive TEXT read of a part's geometry — describe_part/describe_sketch/
         describe_scene/hover/query_adjacency — including the non-vision self-review path),
         "narration" (how to use describe_toolpaths and describe_results to get compact
@@ -3637,6 +3679,207 @@ def register_cad_tools(mcp: FastMCP) -> None:
             _publish_current(d)
             return _dumps({"ok": True, "doc_id": d, "revision": r.get("revision"),
                            "status": (r.get("rebuild") or {}).get("doc_status")})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    # Mate types whose `value` is a driven dimension we can sweep to MOVE the mechanism.
+    # (revolute/prismatic freedom is provided by concentric/coincident/slot mates that have
+    # no value; you drive the DIMENSIONAL mate that parameterizes that freedom.)
+    _DRIVABLE_MATE_TYPES = {
+        "angle": "deg", "angle_limit": "deg",
+        "distance": "mm", "distance_limit": "mm",
+        "gear": "ratio", "rack_pinion": "mm", "screw": "mm",
+    }
+
+    def _asm_mates(doc_id: str) -> list:
+        """The doc's non-suppressed mate dicts (from doc_tree)."""
+        tr = cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}
+        mates = tr.get("mates") if isinstance(tr, dict) else None
+        return mates if isinstance(mates, list) else []
+
+    def _asm_body_transforms(doc_id: str) -> list:
+        """Per-component world 4x4 transform (row-major 16) after the current solve.
+
+        Read from doc_tree's components[].transform — the pose doc_solve_mates writes back
+        (NOT asm_world_bodies, which only returns bboxes; a bbox cannot orient a body for
+        animation, so the trajectory carries the full transform instead)."""
+        tr = cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}
+        comps = tr.get("components") if isinstance(tr, dict) else None
+        out = []
+        for c in (comps or []):
+            if c.get("suppressed"):
+                continue
+            out.append({"component": c.get("id"),
+                        "name": c.get("name") or c.get("id"),
+                        "transform": c.get("transform")})
+        return out
+
+    @mcp.tool()
+    def simulate_motion(mate_id: Optional[str] = None, start: Optional[float] = None,
+                        stop: Optional[float] = None, steps: int = 24,
+                        check_interference: bool = True, min_clearance_mm: float = 0.0,
+                        loop: bool = False, doc_id: Optional[str] = None) -> str:
+        """Kinematic motion study: DRIVE one mate over a range, re-solve the mechanism each
+        step, return the trajectory (every body's pose per step) + a swept interference check.
+
+        This is the "does this linkage / cam / gear-train clear everything as it moves?" tool —
+        SolidWorks Motion / Onshape Assembly-Motion for the common kinematic case. It drives ONE
+        DIMENSIONAL mate (its `value`) across a sweep and re-solves the whole mate graph at each
+        sample, so the rest of the mechanism follows. Positions carry forward step-to-step (the
+        previous solved pose warm-starts the next), so a full-cycle sweep stays on one branch
+        instead of flipping to a mirror configuration.
+
+        Scope: KINEMATICS ONLY (position, v1) — no forces, inertia, torque or contact dynamics
+        (a dynamics follow-up would add those). It answers geometry-of-motion + collision, not
+        loads.
+
+        mate_id : which mate to drive. Must be a DIMENSIONAL mate whose value means motion —
+                  one of angle / angle_limit (deg), distance / distance_limit (mm),
+                  gear / rack_pinion / screw. A revolute/concentric/slot mate has no value to
+                  sweep: drive the angle/distance mate that dimensions that joint instead. Omit
+                  to have the tool pick the single drivable mate if there is exactly one.
+        start,stop : the value range to sweep (in the mate's unit — deg or mm). Omit `start` to
+                  begin at the mate's current value. `stop` is required.
+        steps   : number of SAMPLES across [start, stop] inclusive (>=2). More = finer/smoother
+                  and safer against branch flips on tight mechanisms.
+        loop    : if True, append a final sample back at `start` (close the cycle, e.g. a crank
+                  0->360->0) so playback loops seamlessly.
+        check_interference : run check_interference (eval_interference) at EACH step and flag the
+                  FIRST step whose bodies clash. Reuses the existing interference engine — this
+                  tool never reimplements collision. min_clearance_mm is forwarded to it.
+
+        Returns {ok, doc_id, mate_id, driver:{type,unit,start,stop,steps,samples},
+                 trajectory:[{i, value, dof, converged, bodies:[{component,name,transform}]}],
+                 interference:{checked, first_collision_step, first_collision_value, detail},
+                 summary}. Each `transform` is the body's world 4x4 (row-major 16) at that sample
+        — the per-step per-body pose a viewer needs to animate the mechanism (the GUI-playback
+        seam; see cad_guide('motion')). The driven mate is RESTORED to its original value when
+        the study finishes (a study reads motion; it does not leave the assembly moved).
+        """
+        try:
+            d = _doc(doc_id)
+            mates = _asm_mates(d)
+            if not mates:
+                raise ValueError("simulate_motion: document has no mates (not an assembly, or "
+                                 "no mates added). Build/open an assembly with mates first.")
+            drivable = [m for m in mates
+                        if m.get("type") in _DRIVABLE_MATE_TYPES and not m.get("suppressed")]
+            if mate_id is None:
+                if len(drivable) == 1:
+                    mate = drivable[0]
+                    mate_id = mate.get("id")
+                elif not drivable:
+                    raise ValueError("simulate_motion: no drivable (dimensional) mate found. "
+                                     "Drivable types: " + ", ".join(sorted(_DRIVABLE_MATE_TYPES))
+                                     + ". Add e.g. an angle mate to drive the joint.")
+                else:
+                    ids = ", ".join(f"{m.get('id')}({m.get('type')})" for m in drivable)
+                    raise ValueError("simulate_motion: multiple drivable mates — pass mate_id. "
+                                     f"Candidates: {ids}")
+            else:
+                mate = next((m for m in mates if m.get("id") == mate_id), None)
+                if mate is None:
+                    raise ValueError(f"simulate_motion: mate '{mate_id}' not found.")
+                if mate.get("type") not in _DRIVABLE_MATE_TYPES:
+                    raise ValueError(
+                        f"simulate_motion: mate '{mate_id}' is a '{mate.get('type')}' mate with "
+                        "no driven value to sweep. Drive a dimensional mate "
+                        "(" + ", ".join(sorted(_DRIVABLE_MATE_TYPES)) + ") instead.")
+            mtype = mate.get("type")
+            unit = _DRIVABLE_MATE_TYPES[mtype]
+
+            def _cur_value(m: dict) -> float:
+                v = m.get("value")
+                if isinstance(v, dict):
+                    return float(v.get("value", 0.0))
+                if isinstance(v, (int, float)):
+                    return float(v)
+                return 0.0
+
+            orig_value = _cur_value(mate)
+            if start is None:
+                start = orig_value
+            if stop is None:
+                raise ValueError("simulate_motion: `stop` is required (the end of the sweep).")
+            steps = int(steps)
+            if steps < 2:
+                raise ValueError("simulate_motion: `steps` must be >= 2.")
+
+            samples = [start + (stop - start) * i / (steps - 1) for i in range(steps)]
+            if loop:
+                samples.append(start)
+
+            def _set_and_solve(val: float) -> dict:
+                cb.call("doc_apply_ops", {
+                    "doc_id": d,
+                    "base_revision": cb.call("doc_tree", {"doc_id": d}).get("revision", 0),
+                    "ops": [{"op": "asm_edit_mate", "id": mate_id, "value": {"value": float(val)}}],
+                    "with_tess": False})
+                return cb.call("doc_solve_mates", {"doc_id": d})
+
+            trajectory = []
+            first_collision_step = None
+            first_collision_value = None
+            first_collision_detail = None
+            try:
+                for i, val in enumerate(samples):
+                    sm = _set_and_solve(val)
+                    status = (sm.get("rebuild") or {}).get("doc_status") or {}
+                    mate_stat = (sm.get("rebuild") or {}).get("mates")
+                    converged = True
+                    dof = None
+                    if isinstance(status, dict):
+                        dof = status.get("dof")
+                    if isinstance(mate_stat, list):
+                        converged = all(s.get("status") in ("ok", "redundant")
+                                        for s in mate_stat)
+                    frame = {"i": i, "value": round(val, 9),
+                             "converged": bool(converged),
+                             "bodies": _asm_body_transforms(d)}
+                    if dof is not None:
+                        frame["dof"] = dof
+                    if check_interference:
+                        clash = cb.call("eval_interference",
+                                        {"doc_id": d, "include_coincident": False,
+                                         "min_clearance_mm": float(min_clearance_mm)})
+                        inters = clash.get("interferences") or []
+                        frame["interference"] = bool(inters)
+                        if inters and first_collision_step is None:
+                            first_collision_step = i
+                            first_collision_value = round(val, 9)
+                            first_collision_detail = inters
+                    trajectory.append(frame)
+            finally:
+                # ALWAYS restore the mechanism to where it started — a study is non-destructive.
+                try:
+                    _set_and_solve(orig_value)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            _publish_current(d)
+
+            if check_interference and first_collision_step is not None:
+                summary = (f"drove {mtype} mate '{mate_id}' {start:g}->{stop:g} {unit} over "
+                           f"{len(samples)} samples; INTERFERENCE first at step "
+                           f"{first_collision_step} (value {first_collision_value:g} {unit}).")
+            elif check_interference:
+                summary = (f"drove {mtype} mate '{mate_id}' {start:g}->{stop:g} {unit} over "
+                           f"{len(samples)} samples; no interference across the sweep.")
+            else:
+                summary = (f"drove {mtype} mate '{mate_id}' {start:g}->{stop:g} {unit} over "
+                           f"{len(samples)} samples (interference check skipped).")
+
+            return _dumps({
+                "ok": True, "doc_id": d, "mate_id": mate_id,
+                "driver": {"type": mtype, "unit": unit, "start": start, "stop": stop,
+                           "steps": steps, "samples": len(samples), "loop": bool(loop)},
+                "trajectory": trajectory,
+                "interference": {"checked": bool(check_interference),
+                                 "first_collision_step": first_collision_step,
+                                 "first_collision_value": first_collision_value,
+                                 "detail": first_collision_detail},
+                "summary": summary,
+            })
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

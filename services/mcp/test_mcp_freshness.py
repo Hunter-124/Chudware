@@ -137,7 +137,7 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
         "wall_thickness", "draft_analysis",
         "bom_price", "bom_rollup",
         "hover", "show_in_app",
-        "solve_mates", "list_world_bodies",
+        "solve_mates", "list_world_bodies", "simulate_motion",
         "list_configurations", "add_configuration", "activate_configuration",
         "list_standard_parts", "set_config_override", "set_config_suppression",
         "inspect_section", "recover_parts", "make_fit_coupon",
@@ -338,7 +338,7 @@ def _build_coverage_corpus() -> str:
     _guide_fn = _cad_guide_text_real
     if _guide_fn is not None:
         all_topics = [
-            "overview", "simulation", "review", "intake", "gsl", "cam",
+            "overview", "simulation", "motion", "review", "intake", "gsl", "cam",
             "narration", "parts", "reverse", "deliverables",
             "requirements", "dag", "verify", "interaction", "sourcing",
             "cost", "spec", "piping", "hydraulic", "firmware", "structural",

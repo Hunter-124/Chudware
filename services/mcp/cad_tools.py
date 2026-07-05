@@ -996,11 +996,28 @@ TYPICAL LOOP
                        checks, estimated cycle time.
   8. cam_post("fanuc") emit the NC program; cam_setup_sheet() for the operator sheet.
 
+FEEDS & SPEEDS ADVISOR (T-W6 — table-driven, aicad.calc/1 contract)
+  Before cam_add_operation, call feeds_speeds() to get a recommended envelope:
+    feeds_speeds("alu_6061", "endmill_flat", 10.0, "roughing")
+    → {schema:"aicad.calc/1", answer:{rpm:{min,mid,max}, feed:{min,mid,max},
+       stepdown:{min,mid,max}, stepover:{min,mid,max}, chipload, coolant, provenance}}
+  After adding the op, call cam_check_feeds_envelope() to flag risky values:
+    cam_check_feeds_envelope("alu_6061", "endmill_flat", 10.0, "roughing", rpm=50000)
+    → {schema:"aicad.advisory/1", items:[{severity:"hint", candidate_fixes:[clamped_values]}]}
+  For tap operations, get the drill size first:
+    tap_drill("M6x1.0")  → {answer:{tap_drill_mm:5.0, pct_thread:75}}
+    tap_drill("1/4-20")  → {answer:{tap_drill_mm:5.1, ...}}
+  Supported tool_types: endmill_flat, endmill_ball, drill, tap, face_mill.
+  Supported operations: roughing, finishing, slotting, drilling.
+  Materials: alu_6061, steel_1018, steel_304_stainless, ti_6al4v, abs, pla,
+             nylon_pa12, cast_iron_gray, inconel_718 (+ aliases from cam_materials()).
+
 PLATFORMS: 3-axis mill, router, 4/5-axis (3+2), lathe / mill-turn, laser, plasma, waterjet.
 POSTS: grbl, linuxcnc, fanuc, haas, mach3, marlin (laser), siemens (840D), centroid/tormach —
   fully data-driven (cam_post_dialects() lists them); per-controller canned cycles, arc IJK/R,
   work offsets, tool changes, coolant, laser power gating.
-REFERENCE: cam_post_dialects(), cam_materials() (cutting-data DB), cam_tool_types(), cam_op_types().
+REFERENCE: cam_post_dialects(), cam_materials() (cutting-data DB), cam_tool_types(), cam_op_types(),
+           feeds_speeds(), cam_check_feeds_envelope(), tap_drill().
 Address geometry the same plain-English way as modeling — extract regions/holes/sections from the
 part, don't hand-type coordinates unless you must.
 """

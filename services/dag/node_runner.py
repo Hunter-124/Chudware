@@ -94,7 +94,21 @@ class _StubAgentResult:
         self.result = None
 
 
-def _default_agent_fn(request: str, context_pack: dict[str, Any]) -> Any:
+def make_default_agent_fn(ledger=None) -> "Callable[[str, dict[str, Any]], Any]":
+    """Return the default tool-executing agent_fn with *ledger* bound (T-W30).
+
+    The mission pipeline (loop.run_mission) uses this to thread its run ledger
+    into every node's agent turn, so each turn's tool calls / handoffs land as
+    ``agent_turn`` events — the inspectability half of the execution-reality
+    contract.  A standalone DAG run (no ledger) gets the same behaviour minus
+    the events."""
+    def _agent_fn(request: str, context_pack: dict[str, Any]) -> Any:
+        return _default_agent_fn(request, context_pack, ledger=ledger)
+    return _agent_fn
+
+
+def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
+                      ledger=None) -> Any:
     """Run a real tool-executing agent turn for this DAG node (T-W30).
 
     Resolves the provider from the agent config seam (``config.get_provider`` —
@@ -139,7 +153,27 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any]) -> Any:
         request=request, provider=provider, name=node_name,
         allowed_tools=allowed_tools,
         system_prompt=context_pack.get("role_system_prompt"),
-        max_tool_calls=max_tools)
+        max_tool_calls=max_tools,
+        max_tokens=_tier_generation_budget(),
+        ledger=ledger, actor=node_name)
+
+
+def _tier_generation_budget() -> "int | None":
+    """Per-completion token cap from the ACTIVE tier's profile (T-W28 seam).
+
+    Reads ``AI_CAD_TIER`` (tiers.detect_tier_from_env — the same manual-override
+    knob the effort resolution path honours) and returns that tier's
+    ``generation_headroom`` from tiers.yaml.  None (agent_turn's shipped default)
+    when no tier is set or the tiers layer is unavailable — best-effort, never
+    blocks node execution."""
+    try:
+        from services.agent.tiers import detect_tier_from_env, load_tier
+        tier_name = detect_tier_from_env()
+        if not tier_name:
+            return None
+        return int(load_tier(tier_name).generation_headroom)
+    except Exception:  # noqa: BLE001 — tiers layer optional at node level
+        return None
 
 
 class _UnavailableAgentResult:

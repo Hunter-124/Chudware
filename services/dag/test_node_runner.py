@@ -603,3 +603,79 @@ class TestRoleCardWiring:
                                      "retry_remaining": 1}, agent_fn=agent_fn)
         assert verdict == "done"
         assert "role_id" not in captured
+
+
+# ---------------------------------------------------------------------------
+# T-W30 finisher — default agent_fn: ledger threading + tier budget seam
+# ---------------------------------------------------------------------------
+
+class _TurnScriptedProvider:
+    """Finish immediately with a done directive (agent_turn protocol)."""
+    name = "scripted"
+
+    def complete(self, system, messages, max_tokens=None):
+        return '```json\n{"done": true, "handoff": {"summary": "done"}}\n```'
+
+
+class TestDefaultAgentFnSeams:
+    def test_make_default_agent_fn_threads_ledger_into_turn(self, monkeypatch):
+        """loop.run_mission binds its ledger via make_default_agent_fn; the turn's
+        events must land on that ledger (DoD: ledger events for every turn)."""
+        from services.agent import config as agent_config
+
+        monkeypatch.setattr(agent_config, "get_provider",
+                            lambda name=None, cfg=None: _TurnScriptedProvider())
+
+        events = []
+
+        class _ListLedger:
+            def append(self, actor, kind, payload):
+                events.append({"actor": actor, "kind": kind, "payload": payload})
+
+        agent_fn = nr.make_default_agent_fn(ledger=_ListLedger())
+        res = agent_fn("do the node", {"node_name": "n_build", "allowed_tools": []})
+        assert res.success is True
+        assert any(e["kind"] == "agent_turn" for e in events), events
+        assert all(e["actor"] == "n_build" for e in events)
+
+    def test_default_agent_fn_passes_tier_generation_budget(self, monkeypatch):
+        """AI_CAD_TIER set → run_turn gets that tier's generation_headroom as
+        max_tokens (bounded by tier budgets, aicad.effort/1 seam)."""
+        from services.agent import config as agent_config
+        from services.agent import agent_turn as at
+        from services.agent.tiers import load_tier
+
+        monkeypatch.setattr(agent_config, "get_provider",
+                            lambda name=None, cfg=None: _TurnScriptedProvider())
+        monkeypatch.setenv("AI_CAD_TIER", "local-24k")
+
+        seen = {}
+        real_run_turn = at.run_turn
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real_run_turn(*args, **kwargs)
+
+        monkeypatch.setattr(at, "run_turn", _spy)
+        nr._default_agent_fn("go", {"node_name": "n1"})
+        assert seen.get("max_tokens") == load_tier("local-24k").generation_headroom
+
+    def test_default_agent_fn_no_tier_uses_default_cap(self, monkeypatch):
+        """No AI_CAD_TIER → max_tokens None → agent_turn's shipped 2048 default."""
+        from services.agent import config as agent_config
+        from services.agent import agent_turn as at
+
+        monkeypatch.setattr(agent_config, "get_provider",
+                            lambda name=None, cfg=None: _TurnScriptedProvider())
+        monkeypatch.delenv("AI_CAD_TIER", raising=False)
+
+        seen = {}
+        real_run_turn = at.run_turn
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real_run_turn(*args, **kwargs)
+
+        monkeypatch.setattr(at, "run_turn", _spy)
+        nr._default_agent_fn("go", {"node_name": "n1"})
+        assert seen.get("max_tokens") is None

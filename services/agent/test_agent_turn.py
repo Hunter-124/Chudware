@@ -93,3 +93,51 @@ def test_dispatch_error_fed_back_then_recovered():
     # the failed call is recorded, and the model got a chance to finish.
     assert res.result["calls"][0]["ok"] is False
     assert res.success is True  # finished with a handoff after the error feedback
+
+
+def test_turn_honours_max_tokens_cap():
+    """T-W30 finisher: the per-completion cap is passed through to the provider
+    (tier generation_headroom when the caller knows the tier; 2048 default)."""
+    seen = {}
+
+    class _CapProvider:
+        name = "cap"
+
+        def complete(self, system, messages, max_tokens=None):
+            seen["max_tokens"] = max_tokens
+            return '```json\n{"done": true, "handoff": {}}\n```'
+
+    agent_turn.run_turn("go", _CapProvider(), tool_dispatch=lambda t, a: {})
+    assert seen["max_tokens"] == 2048  # shipped default (no tier known)
+
+    agent_turn.run_turn("go", _CapProvider(), max_tokens=8000,
+                        tool_dispatch=lambda t, a: {})
+    assert seen["max_tokens"] == 8000  # caller-supplied tier budget wins
+
+
+def test_turn_logs_every_tool_call_to_ledger():
+    """T-W30 DoD: ledger events for every turn — each dispatched tool call is
+    appended as an agent_turn event when a ledger is supplied."""
+    provider = _ScriptedProvider([
+        '```json\n{"tool": "measure_part", "args": {"doc_id": "d1"}}\n```',
+        '```json\n{"tool": "fit_report", "args": {}}\n```',
+        '```json\n{"done": true, "handoff": {"summary": "ok"}}\n```',
+    ])
+
+    class _ListLedger:
+        def __init__(self):
+            self.events = []
+
+        def append(self, actor, kind, payload):
+            self.events.append({"actor": actor, "kind": kind, "payload": payload})
+
+    ledger = _ListLedger()
+    res = agent_turn.run_turn("check the part", provider,
+                              allowed_tools=["measure_part", "fit_report"],
+                              ledger=ledger, actor="feature_modeler",
+                              tool_dispatch=lambda t, a: {"ok": True})
+    assert res.success is True
+    kinds = [e["payload"].get("event") for e in ledger.events
+             if e["kind"] == "agent_turn"]
+    assert kinds.count("tool_call") == 2, ledger.events
+    assert all(e["actor"] == "feature_modeler" for e in ledger.events)

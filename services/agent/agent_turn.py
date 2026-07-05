@@ -66,6 +66,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
              allowed_tools: list[str] | None = None,
              system_prompt: str | None = None,
              max_tool_calls: int | None = None,
+             max_tokens: int | None = None,
              ledger=None,
              actor: str | None = None,
              tool_dispatch: Callable[[str, dict], Any] | None = None) -> TurnResult:
@@ -73,8 +74,14 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
 
     *tool_dispatch* is injectable ``(tool_name, args) -> result``; the default
     dispatches against the live MCP registry via :func:`_dispatch_tool`.  Tests
-    inject a deterministic dispatcher (no engine)."""
+    inject a deterministic dispatcher (no engine).
+
+    *max_tokens* caps each model completion.  Callers on a known tier pass the
+    tier's ``generation_headroom`` (tiers.yaml — the same budget source the
+    aicad.effort/1 resolution path reads), so the turn is bounded by tier
+    budgets rather than an ad-hoc constant.  Default 2048 when no tier is known."""
     budget = int(max_tool_calls if max_tool_calls is not None else 8)
+    completion_cap = int(max_tokens) if max_tokens else 2048
     dispatch = tool_dispatch or _dispatch_tool
     allow = set(allowed_tools or [])
     actor = actor or name
@@ -91,7 +98,7 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
 
     for _ in range(budget + 1):
         try:
-            reply = provider.complete(system, messages, max_tokens=2048)
+            reply = provider.complete(system, messages, max_tokens=completion_cap)
         except Exception as exc:  # noqa: BLE001 — provider/network error → escalate
             _log(ledger, actor, {"event": "provider_error", "error": str(exc)})
             return TurnResult(False, _FAILED,

@@ -1515,8 +1515,19 @@ def run_mission(
     if execute_dag:
         try:
             from services.dag import executor as _dag_exec
+            # T-W30: when the caller injects no agent_fn, bind the mission ledger
+            # into the default tool-executing agent_fn so every node turn's tool
+            # calls / handoffs land as agent_turn events (inspectability half of
+            # the execution-reality contract).
+            effective_agent_fn = agent_fn
+            if effective_agent_fn is None and ledger is not None:
+                try:
+                    from services.dag import node_runner as _node_runner
+                    effective_agent_fn = _node_runner.make_default_agent_fn(ledger=ledger)
+                except Exception:  # noqa: BLE001 — fall back to executor default
+                    effective_agent_fn = None
             dag_result = _dag_exec.run(
-                graph, run_id=run_id, emit=on_event, agent_fn=agent_fn,
+                graph, run_id=run_id, emit=on_event, agent_fn=effective_agent_fn,
                 autonomy_default=autonomy_default)
         except Exception as exc:  # noqa: BLE001
             # DAG execution failure does not corrupt the mission record; report it.

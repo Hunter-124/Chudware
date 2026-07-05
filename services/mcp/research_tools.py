@@ -12,6 +12,11 @@ These return the ``aicad.calc/1`` envelope (``contracts/advisor.md`` §7), not t
 research envelope — different schema, same "code does the maths" discipline.
 Call ``fit_calc`` BEFORE ``hole_sizing`` / bore-diameter decisions to get the ISO-table
 band; use ``recommend_fit`` first when the fit class itself is not yet decided.
+
+T-W4 adds ``research_eng_calc`` registry routing (beam, bolted_joint, thread_engagement,
+press_fit, wall_thickness, snap_fit) and a ``list_calcs`` discovery tool. The existing
+Pillar-8 ``research_eng_calc`` (axial_stress, hoop_stress, …) is preserved and extended:
+calc_ids not found in the new registry fall through to the legacy Pillar-8 formulas.
 """
 from __future__ import annotations
 
@@ -21,6 +26,7 @@ from mcp.server.fastmcp import FastMCP
 
 from mcp_server.cad_tools import _dumps, _err
 from engine import research
+import engine_oracle.research.calcs as _calcs  # registers all T-W4 calculators
 
 
 def register_research_tools(mcp: FastMCP) -> None:
@@ -112,19 +118,45 @@ def register_research_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def research_eng_calc(formula: str, params: Optional[dict] = None,
-                          raw_quote: Optional[str] = None) -> str:
+                          raw_quote: Optional[str] = None,
+                          prefilled: Optional[dict] = None) -> str:
         """Evaluate a named deterministic engineering formula in SI (code does the maths).
 
-        `formula` is one of `axial_stress`, `bending_stress`, `hoop_stress`,
-        `safety_factor`, `cantilever_end_deflection`, `circle_area`; `params` is its input
-        dict (e.g. {"force_n":1000,"area_mm2":100}). Result is range-checked; a bad/unknown
-        formula degrades (`{ok:false}`) rather than raising.
+        **T-W4 registry** (aicad.calc/1 envelope, contracts/advisor.md §7):
+        `beam`, `bolted_joint`, `thread_engagement`, `press_fit`,
+        `wall_thickness`, `snap_fit`.  Call `list_calcs` for the full registry
+        with input schemas.
+
+        **Pillar-8 legacy formulas** (fallback, §1 envelope):
+        `axial_stress`, `bending_stress`, `hoop_stress`, `safety_factor`,
+        `cantilever_end_deflection`, `circle_area`.
+
+        `params` is the input dict for the chosen formula.
+        `prefilled` optionally records which inputs came from live geometry
+        (ledger provenance per §7, e.g. `{"L_mm": "doc_bbox z body=shaft"}`).
         """
         try:
             kw = dict(params or {})
+            # Route to T-W4 registry first
+            entry = _calcs.get_calc(formula)
+            if entry is not None:
+                return _dumps(_calcs.run_calc(formula, kw, prefilled=prefilled))
+            # Fall through to legacy Pillar-8 formulas
             if raw_quote is not None:
                 kw["raw_quote"] = raw_quote
             return _dumps(research.eng_calc(formula, **kw))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def list_calcs() -> str:
+        """Discover registered engineering calculators (T-W4 registry).
+
+        Returns {calc_id: {input_schema, prefill_hints}} for all registered
+        calculators.  Use calc_ids with ``research_eng_calc`` to compute results.
+        """
+        try:
+            return _dumps({"ok": True, "calcs": _calcs.list_calcs()})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

@@ -926,6 +926,15 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
                          constraint roster with driving-dimension values, closed-region count/
                          area, and the DOF (fully/under/over-defined) verdict — the sketch
                          equivalent of describe_part, for reviewing layout before you extrude it.
+  sketch_health(id)      the narrated constraint read: WHICH free variables remain (dof in plain
+                         words), open chain endpoints, per-entity under/full/over, redundant/
+                         conflicting with removal hints, and an ORDERED schedule (relations first,
+                         then driving dims) to reach dof 0 — the sketch loop is edit -> sketch_health
+                         -> add the scheduled relations / sketch_auto_constrain -> repeat.
+  sketch_auto_constrain(id)  stitch near-touching endpoints coincident (apply=True, default) or
+                         just propose them (apply=False); each add is rollback-safe (skips any that
+                         would conflict) and it reports which chains closed. Runs automatically after
+                         edits when doc meta sketch.auto_coincident is on (default).
   describe_scene(views)  the TEXT equivalent of render_part/contact_sheet for a model with no
                          vision: per requested view (default front/right/top/iso), which faces
                          face the camera (by sid/surf/side/dims) plus the part bbox — computed
@@ -1746,7 +1755,10 @@ def register_cad_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            r = cb.call("doc_sketch_solve", {"doc_id": d, "sketch_fid": sketch})
+            # The kernel dispatch method is "sketch_solve" and keys the feature id as
+            # "sketch" (not "doc_sketch_solve"/"sketch_fid" — those never dispatched, so
+            # check_sketch silently errored). Read-only solve of the named sketch feature.
+            r = cb.call("sketch_solve", {"doc_id": d, "sketch": sketch})
             status = r.get("status", "")
             dof = r.get("dof", 0)
             conflicting = r.get("conflicting", []) or []
@@ -1761,9 +1773,23 @@ def register_cad_tools(mcp: FastMCP) -> None:
                            f"relations and/or driving dimensions until dof reaches 0.")
                 if redundant:
                     summary += f" (Also {len(redundant)} redundant: {redundant}.)"
-            return _dumps({"ok": True, "doc_id": d, "sketch": sketch, "status": status,
-                           "dof": dof, "fully_defined": (status == "full" or dof == 0),
-                           "conflicting": conflicting, "redundant": redundant, "summary": summary})
+            out = {"ok": True, "doc_id": d, "sketch": sketch, "status": status,
+                   "dof": dof, "fully_defined": (status == "full" or dof == 0),
+                   "conflicting": conflicting, "redundant": redundant, "summary": summary}
+            # Enrich with the narrated read from sketch_health (best-effort — never break
+            # check_sketch if the health RPC is unavailable or errors).
+            try:
+                health = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
+                out["open_endpoints"] = (health.get("closure") or {}).get("open_endpoints")
+                out["dof_narration"] = health.get("dof_narration")
+                out["schedule"] = health.get("schedule")
+                out["advisory"] = health.get("advisory")
+                narration = health.get("dof_narration")
+                if narration and status != "full" and dof != 0 and not conflicting:
+                    out["summary"] += f" Free: {narration}"
+            except Exception:  # noqa: BLE001
+                pass
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

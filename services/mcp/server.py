@@ -75,6 +75,10 @@ mcp = FastMCP(
         "DELIVERABLES: make_report/make_presentation/make_workbook build real office files "
         "(cad_guide('deliverables')). RESEARCH: research_web_search/research_fetch_page for "
         "look-it-up, never recall — the model never types a load-bearing number from memory.\n"
+        "DESIGN LEDGER (Pillar 20): ledger_get(run_id, budget_tokens) / ledger_note(run_id, kind, "
+        "payload) persist mission state (brief, decisions, dimensions, requirements, questions, "
+        "stage_log, artifacts) across role handoffs — the anti-context-loss mechanism for "
+        "24k-context local models. Every role should cold-start from ledger_get, not chat history.\n"
         "All cad_guide topics: overview, simulation, review, intake, gsl, cam, narration, parts, "
         "reverse, deliverables, requirements, dag, verify, interaction, sourcing, cost, spec, "
         "piping, hydraulic, firmware, structural, regen, code_compliance, serving, design_review, "
@@ -220,6 +224,12 @@ register_dag_replan_tools(mcp)
 # card per contracts/narration.md — never a raw JSON dump.
 from services.mcp.design_review_tools import register_design_review_tools
 register_design_review_tools(mcp)
+# Design ledger (T-W1, Pillar 20): persistent mission state (aicad.ledger/1).
+# ledger_get / ledger_note let any agent role read or write the design ledger without
+# holding the full chat history — the anti-context-loss mechanism for 24k local models.
+# ledger_get is risk-class READ; ledger_note is WRITE (auto-classified by tool_registry).
+from services.mcp.ledger_tools import register_ledger_tools
+register_ledger_tools(_reg.view(mcp, "ledger"))
 
 
 def _install_clean_stdout():

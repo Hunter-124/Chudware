@@ -39,7 +39,10 @@ _READ_SUFFIXES = ("_status",)
 _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tree",
               "cam_materials", "cam_op_types", "cam_tool_types", "cam_post_dialects",
               "list_parts", "list_configurations", "list_world_bodies",
-              "list_standard_parts"}
+              "list_standard_parts",
+              # Design ledger (T-W1): ledger_get reads the ledger; the name starts with
+              # "ledger_" not "get_", so the prefix classifier misses it — explicit entry needed.
+              "ledger_get"}
 
 # Explicit overrides for names the classifier would mislabel. name -> risk.
 _RISK_OVERRIDES: dict[str, str] = {

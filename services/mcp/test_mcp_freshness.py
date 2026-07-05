@@ -243,6 +243,9 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
     "design_review": {
         "design_review",
     },
+    "ledger": {
+        "ledger_get", "ledger_note",
+    },
 }
 
 # All tool names across all families (deduplicated — some tools like hover appear in
@@ -280,6 +283,7 @@ _FAMILY_SIGNALS: dict[str, list[str]] = {
     "code_compliance": ["code_check", "cad_guide('code_compliance')", "code_compliance"],
     "dag":           ["dag_plan", "dag_run", "cad_guide('dag')", "dag"],
     "design_review": ["design_review", "cad_guide('design_review')"],
+    "ledger":         ["ledger_get", "ledger_note", "design ledger", "ledger"],
 }
 
 
@@ -429,7 +433,7 @@ class TestMCPFreshness(unittest.TestCase):
             "doc_diff", "req", "verify", "research", "deliverables",
             "sourcing", "cost", "spec", "piping", "hydraulic", "firmware",
             "structural", "parts", "serving", "regen", "code_compliance",
-            "dag", "design_review",
+            "dag", "design_review", "ledger",
         }
         missing = required_families - set(_TOOL_FAMILIES.keys())
         self.assertFalse(

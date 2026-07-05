@@ -1791,6 +1791,21 @@ def _phase_gate_context(phase, ac_ids, Phase, *, ledger=None) -> dict:
     if phase is Phase.PLAN:
         return {"build_graph_blockers": [], "plan_ratified": True,
                 "council_synthesis_recorded": True}
+    if phase is Phase.GEOMETRY:
+        # Stage 2 exit (contract design_pipeline.md §5): the GEOMETRY gate reads
+        # durable ledger state only — every feature realized by ≥1 geometry_spec and
+        # every geometry_spec carrying provenance. Populate the gate context from the
+        # ledger accessors (T-DP1). Localized to this branch; DECOMPOSE (features)
+        # is DP2's, LINKAGE/BUILDPATH are DP4's.
+        feats: list = []
+        specs: list = []
+        if ledger is not None:
+            try:
+                feats = ledger.features()
+                specs = ledger.geometry_specs()
+            except Exception:  # noqa: BLE001 — a broken ledger fails the gate closed
+                pass
+        return {"features": feats, "geometry_specs": specs}
     if phase is Phase.BUILD:
         return {"unresolved_nodes": []}
     if phase is Phase.VERIFY:

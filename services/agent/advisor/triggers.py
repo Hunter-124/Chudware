@@ -295,6 +295,52 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "budget_tokens": 200,
         "cooldown_turns": 8,
     },
+    {
+        # T-DP3: sheet-metal bend — contract design_pipeline.md §8 "helper to add".
+        "id": "sheet_bend",
+        "match": {
+            "keywords": [
+                r"\bbend allowance\b", r"\bbend deduction\b", r"\bsheet metal\b",
+                r"\bsheet-metal\b", r"\bflange\b", r"\bflat pattern\b",
+                r"\bK.factor\b", r"\bbend radius\b", r"\bpress brake\b", r"\bformed\b",
+            ],
+            "tools": ["bend_allowance"],
+            "events": [],
+        },
+        "inject": {
+            "context_pack": "sheet_bend",
+            "prerun_calcs": [
+                {"calc": "bend_allowance", "inputs_from": "literal",
+                 "input_map": {"thickness_mm": None, "inside_radius_mm": None}},
+            ],
+            "exemplar": "t=2, r=2, 90° bend: BA=4.24 mm, BD=3.76 mm, K=0.35 (bend_allowance calc; Machinery’s Handbook)",
+        },
+        "budget_tokens": 250,
+        "cooldown_turns": 8,
+    },
+    {
+        # T-DP3: molded draft — contract design_pipeline.md §8 "helper to add".
+        "id": "molded_draft",
+        "match": {
+            "keywords": [
+                r"\bdraft\b", r"\bdraft angle\b", r"\bmolded\b", r"\bmoulded\b",
+                r"\binjection mold\b", r"\binjection mould\b", r"\brelease angle\b",
+                r"\bcavity\b", r"\bcore pull\b",
+            ],
+            "tools": ["draft_analysis", "draft_check"],
+            "events": [],
+        },
+        "inject": {
+            "context_pack": "molded_draft",
+            "prerun_calcs": [
+                {"calc": "draft_check", "inputs_from": "literal",
+                 "input_map": {"draw_depth_mm": None}},
+            ],
+            "exemplar": "Smooth molded wall: 1.0° min draft (mandatory for release); 30 mm draw → 0.52 mm taper/side (draft_check; process_profiles injection)",
+        },
+        "budget_tokens": 250,
+        "cooldown_turns": 8,
+    },
 ]
 
 _CHARS_PER_TOKEN = 4  # repo-wide heuristic (matches render.py / ledger.py)
@@ -482,6 +528,12 @@ def _run_prerun_calc(calc_spec: dict, text: str) -> Optional[dict]:
         elif calc_id == "wall_thickness":
             from engine_oracle.research.calcs.wall_thickness import wall_thickness as _wt  # noqa: PLC0415
             result = _wt(**inputs)
+        elif calc_id == "bend_allowance":
+            from engine_oracle.research.calcs.bend_allowance import bend_allowance as _ba  # noqa: PLC0415
+            result = _ba(**inputs)
+        elif calc_id == "draft_check":
+            from engine_oracle.research.calcs.draft_check import draft_check as _dc  # noqa: PLC0415
+            result = _dc(**inputs)
         else:
             # Try the generic calc registry
             from engine_oracle.research.calcs.registry import run_calc  # noqa: PLC0415

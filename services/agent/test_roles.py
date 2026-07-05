@@ -145,8 +145,11 @@ class _Gbnf:
             yield from self._match_tokens(tokens, ti + 1, s, j)
 
     def _match_token(self, tok, s, i):
-        # Repetition suffixes.
-        if tok.endswith("*") and not tok.startswith('"'):
+        # Repetition suffixes. A quoted literal always ends with '"', so a token
+        # ending in * or ? is a suffix — including an OPTIONAL quoted literal like
+        # `"-"?` (used by the integer/number rules); the old `not startswith('"')`
+        # guard wrongly excluded that case and broke integer handoffs (T-DP2/DP3).
+        if tok.endswith("*"):
             base = tok[:-1]
             # zero or more (greedy-with-backtrack): collect all reachable positions.
             seen = {i}
@@ -163,7 +166,7 @@ class _Gbnf:
                 frontier = nxt
             yield from results
             return
-        if tok.endswith("?") and not tok.startswith('"'):
+        if tok.endswith("?"):
             base = tok[:-1]
             yield i
             yield from self._match_atom(base, s, i)
@@ -302,14 +305,17 @@ def _class_match(tok, ch):
 class TestLoadAndValidate(unittest.TestCase):
     def test_thirteen_roles_load(self):
         # 13 pipeline roles + department_manager + design_thinker (org/ladder
-        # layers, authored post-branch). council_seats.yaml is data, not a card.
+        # layers) + feature_architect (design-pipeline Stage 1, T-DP2) +
+        # geometry_designer (design-pipeline Stage 2, T-DP3).
+        # council_seats.yaml is data, not a card.
         cards = roles.load_all_roles()
-        self.assertEqual(len(cards), 15, sorted(cards))
+        self.assertEqual(len(cards), 17, sorted(cards))
         for rid in ("intake_analyst", "clarifier", "spec_writer", "orchestrator",
                     "layout_engineer", "sketcher", "feature_modeler",
                     "assembly_fit_engineer", "sim_engineer", "cam_programmer",
                     "reviewer", "fixer", "overseer",
-                    "department_manager", "design_thinker"):
+                    "department_manager", "design_thinker",
+                    "feature_architect", "geometry_designer"):
             self.assertIn(rid, cards)
 
     def test_six_playbooks_load(self):

@@ -57,7 +57,7 @@ HANDOFF_SCHEMA = "aicad.handoff/1"
 # imported from services/agent/advisor/stages.py (that module is T-W5 territory;
 # the vocabulary itself is the frozen contract).
 STAGES = (
-    "intake", "spec", "layout", "sketch", "feature", "part_verify",
+    "intake", "spec", "decompose", "layout", "sketch", "feature", "part_verify",
     "assembly", "sim", "cam", "deliver", "fix",
 )
 

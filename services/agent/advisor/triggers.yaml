@@ -307,3 +307,64 @@ triggers:
       exemplar: "interface_check catches hole-pattern offset, coaxiality error, contact-plane gap — all pass interference but are still wrong"
     budget_tokens: 200
     cooldown_turns: 8
+
+  # T-DP3: sheet-metal bend — contract design_pipeline.md §8 "helper to add".
+  # Fires the bend_allowance calc so a folded flange's flat length is computed,
+  # never recalled. Numbers: engine_oracle/research/calcs/bend_allowance.py.
+  - id: sheet_bend
+    match:
+      keywords:
+        - "\\bbend allowance\\b"
+        - "\\bbend deduction\\b"
+        - "\\bsheet metal\\b"
+        - "\\bsheet-metal\\b"
+        - "\\bflange\\b"
+        - "\\bflat pattern\\b"
+        - "\\bK.factor\\b"
+        - "\\bbend radius\\b"
+        - "\\bpress brake\\b"
+        - "\\bformed\\b"
+      tools:
+        - bend_allowance
+      events: []
+    inject:
+      context_pack: sheet_bend
+      prerun_calcs:
+        - calc: bend_allowance
+          inputs_from: literal
+          input_map:
+            thickness_mm: null    # advertise as helper; caller supplies live t/r
+            inside_radius_mm: null
+      exemplar: "t=2, r=2, 90° bend: BA=4.24 mm, BD=3.76 mm, K=0.35 (bend_allowance calc; Machinery's Handbook)"
+    budget_tokens: 250
+    cooldown_turns: 8
+
+  # T-DP3: molded draft — contract design_pipeline.md §8 "helper to add".
+  # Fires the draft_check calc so a molded wall gets a mandatory release draft
+  # sized to its draw depth. Numbers: process_profiles.py injection + draft_check.py.
+  - id: molded_draft
+    match:
+      keywords:
+        - "\\bdraft\\b"
+        - "\\bdraft angle\\b"
+        - "\\bmolded\\b"
+        - "\\bmoulded\\b"
+        - "\\binjection mold\\b"
+        - "\\binjection mould\\b"
+        - "\\brelease angle\\b"
+        - "\\bcavity\\b"
+        - "\\bcore pull\\b"
+      tools:
+        - draft_analysis
+        - draft_check
+      events: []
+    inject:
+      context_pack: molded_draft
+      prerun_calcs:
+        - calc: draft_check
+          inputs_from: literal
+          input_map:
+            draw_depth_mm: null   # advertise as helper; caller supplies live depth
+      exemplar: "Smooth molded wall: 1.0° min draft (mandatory for release); 30 mm draw → 0.52 mm taper/side (draft_check; process_profiles injection)"
+    budget_tokens: 250
+    cooldown_turns: 8

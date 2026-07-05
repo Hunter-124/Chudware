@@ -147,6 +147,10 @@ struct Study {
 
     // Result state (transient — regenerated on Run; never persisted).
     bool hasResult = false;
+    // T-SIM2: per-study "Show contour" toggle. Lives on the Study (not one SimManager member) so
+    // it is per-study by construction — toggling contour off on study A never leaks to study B's
+    // Results view. Default on: a fresh result shows its contour immediately (SolidWorks style).
+    bool contourOn = true;
     std::string summary;
     std::string banner;
     std::vector<float> dragTrace;
@@ -280,13 +284,6 @@ private:
     // Which named scalar chunk currently colors the loaded result overlay (host: st.activeScalarField,
     // an AppState field the new tree doesn't carry — kept here instead, see header note).
     std::string activeScalarField_;
-
-    // T-SIM2: per-study "Show contour" toggle state. Persisted here (not a per-frame local) so the
-    // checkbox reflects the real on/off state across frames; drives BOTH the viewport colormap pass
-    // and the legend bar so toggling off cleanly hides the whole contour overlay. Default on: a
-    // fresh result shows its contour immediately (SolidWorks behaviour). Re-armed to on each time a
-    // new result is loaded (applyResultField), so a per-study choice never leaks to the next study.
-    bool contourOn_ = true;
 
     int unitsMode_ = 0;  // 0 follow document, 1 SI, 2 US — SimManager's own state (see header note)
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simulation backend audit — T-V1.
+"""Simulation backend audit — T-V1, extended T-SIM4 (live FEA + fatigue + thermal).
 
 Runs independent analytic checks against each simulation/analysis backend and
 prints per-tool verdicts: REAL, VALIDATED, STUB, or BROKEN.
@@ -446,142 +446,386 @@ def audit_ecad_sim() -> None:
 
 
 # ===========================================================================
-# FAMILY 5: FEA static + modal (core C++ via cb.call → sim_run_static/modal)
-# Requires libaicad.so and core_bridge; also needs PyNite for struct_analyze
+# FAMILY 5: FEA static + modal + fatigue + thermal (core C++ via core_bridge)
+# Requires libaicad.so. T-SIM4 UPDATE: the AICAD_WITH_NETGEN build
+# (core/build-occt-linux) registers sim_run_static/modal/fatigue/thermal
+# DIRECTLY on the raw cb.call() bridge (core/api/libaicad.cpp), so the audit
+# now solves LIVE when that build is staged. The T-V1-era "not exposed on the
+# raw bridge" finding only holds for the plain build-linux .so.
 # ===========================================================================
 
-def audit_fea() -> None:
-    print("\n--- FAMILY: FEA static + modal (C++ core, core_bridge) ---")
-
+def _load_core_bridge():
+    """Import core_bridge (or return (None, reason))."""
     lib_path = os.environ.get("AI_CAD_LIBAICAD", "")
     if not lib_path or not os.path.exists(lib_path):
-        _skip("run_fea_static",
-              "AI_CAD_LIBAICAD not set or .so not found — cannot load core_bridge",
-              install=f"export AI_CAD_LIBAICAD=/path/to/libaicad.so")
-        _skip("run_fea_modal",
-              "same: AI_CAD_LIBAICAD not set")
-        return
-
-    # core_bridge lives in services/mcp, not on the engine/ path
+        return None, ("AI_CAD_LIBAICAD not set or .so not found — "
+                      "export AI_CAD_LIBAICAD=core/build-occt-linux/bin/libaicad.so "
+                      "(the netgen build carries the FEA RPCs)")
     mcp_path = os.path.join(_PROJECT_ROOT, "services", "mcp")
     if mcp_path not in sys.path:
         sys.path.insert(0, mcp_path)
     try:
-        import core_bridge as cb
-        from core_bridge import CoreError
-    except ImportError as exc:
-        _skip("run_fea_static",
-              f"core_bridge import failed: {exc} — .so exists but Python binding not on path")
-        _skip("run_fea_modal",
-              f"core_bridge import failed: {exc}")
-        return
-    except Exception as exc:
-        _record("run_fea_static", "BROKEN",
-                f"core_bridge load error: {exc}")
-        _record("run_fea_modal", "BROKEN",
-                f"core_bridge load error: {exc}")
-        return
+        import core_bridge as cb  # noqa: PLC0415
+        return cb, ""
+    except Exception as exc:  # noqa: BLE001
+        return None, f"core_bridge import failed: {exc}"
 
-    # At this point core_bridge is loaded. Try a minimal cantilever FEA.
-    # Independent check (Euler-Bernoulli cantilever, square 50x50mm, L=1m, P=1000N at tip):
-    #   I = b*h^3/12 = 50^4/12 = 520833.33 mm^4
-    #   E = 200000 MPa
-    #   delta = P*L^3 / (3*E*I) = 1000 * 1000^3 / (3 * 200000 * 520833.33)
-    #         = 1e12 / (3.125e11) = 3.2 mm
+
+_CANTILEVER_CTX: dict = {}
+
+
+def _cantilever_setup(cb) -> dict:
+    """Build the audit cantilever (box 1000x50x50) once; return doc/step/facesets.
+
+    Returns {doc_id, step, fix_fp, load_fp} or {"error": ...}. Cached so the
+    static/modal/fatigue families share one geometry build.
+    """
+    if _CANTILEVER_CTX:
+        return _CANTILEVER_CTX
+    import tempfile
+    L_mm, b_mm, h_mm = 1000.0, 50.0, 50.0
+    doc_id = cb.call("doc_new", {"kind": "part", "name": "audit_cantilever"})["doc_id"]
+    r = cb.call("doc_apply_ops", {
+        "doc_id": doc_id,
+        "ops": [{"op": "add_feature", "feature": {
+            "type": "box", "name": "Beam",
+            "params": {
+                "length": {"value": L_mm, "expr": None},
+                "width":  {"value": b_mm, "expr": None},
+                "height": {"value": h_mm, "expr": None},
+            },
+        }}]})
+    fs = (r.get("rebuild") or {}).get("feature_status", [])
+    if not (fs and all(f.get("ok") for f in fs)):
+        _CANTILEVER_CTX["error"] = f"box rebuild failed: {fs}"
+        return _CANTILEVER_CTX
+    step = tempfile.mktemp(suffix=".step", prefix="sim_audit_")
+    cb.call("doc_export_step", {"doc_id": doc_id, "path": step})
+
+    def faceset(side):
+        q = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face", "side": side}})
+        m = [x for x in q.get("matches", []) if x.get("kind") == "face"]
+        return cb.call("doc_face_points", {"doc_id": doc_id, "selector": m[0]})
+
+    _CANTILEVER_CTX.update({
+        "doc_id": doc_id, "step": step,
+        "fix_fp": faceset("left"), "load_fp": faceset("right"),
+        "L_mm": L_mm, "b_mm": b_mm, "h_mm": h_mm,
+    })
+    return _CANTILEVER_CTX
+
+
+_AUDIT_STEEL = {"name": "audit-steel", "E_mpa": 200000.0, "nu": 0.3,
+                "density_g_cm3": 7.85, "yield_mpa": 250.0, "ultimate_mpa": 400.0}
+
+
+def audit_fea() -> None:
+    print("\n--- FAMILY: FEA static + modal (C++ core, core_bridge, LIVE) ---")
+
+    cb, reason = _load_core_bridge()
+    if cb is None:
+        _skip("run_fea_static", reason)
+        _skip("run_fea_modal", reason)
+        return
+    from core_bridge import CoreError  # noqa: PLC0415
+
+    # Independent references (first principles, computed HERE):
+    #   Euler-Bernoulli cantilever, square 50x50mm, L=1m, steel, P=1000N at tip:
+    #   I = b*h^3/12 = 50^4/12 = 520833.33 mm^4;  E = 200000 MPa
+    #   delta = P*L^3/(3*E*I) = 3.2000 mm         (Roark 8th Table 8.1 case 1a)
+    #   f1 = (1.8751)^2/(2*pi*L^2)*sqrt(E*I/(rho*A)) = 40.77 Hz
+    #                                             (Rao 5th §8.2 Table 8.1)
     L_mm = 1000.0; b_mm = 50.0; h_mm = 50.0
-    P_N = 1000.0; E_mpa = 200000.0
+    P_N = 1000.0; E_mpa = _AUDIT_STEEL["E_mpa"]
     I_mm4 = b_mm * h_mm ** 3 / 12.0
     delta_expected_mm = P_N * L_mm ** 3 / (3.0 * E_mpa * I_mm4)
-    print(f"  Cantilever: L={L_mm}mm, 50x50 square, P={P_N}N → "
-          f"expected tip deflection = {delta_expected_mm:.4f} mm")
-
-    # Key finding: sim_run_static/sim_run_modal are NOT exposed on the raw
-    # cb.call() JSON-RPC bridge. They are registered as C++ simulation plugins
-    # that load only when the full MCP server initialises (services/mcp/cad_tools.py).
-    # The bridge only exposes core geometry/modelling methods.
-    # We verified this by attempting cb.call("sim_run_static", ...) which returns
-    # CoreError: "unknown method: sim_run_static".
-    # Verdict: REAL from source audit of cad_tools.py lines 2003-2105 (static) and
-    # 2107-2167 (modal). Evidence:
-    #   - Exports part to STEP, resolves face points via doc_query/doc_face_points
-    #   - Calls cb.call("sim_run_static", {"study": {...}}) with tet10 mesh
-    #   - Returns summary {max_von_mises_mpa, max_disp_mm, min_fos}
-    # Cannot execute without the full MCP server context.
-    try:
-        # Verify the geometry bridge works (doc_new + box + face query) as a proxy
-        # that the geometry side (required pre-step for FEA) is functional.
-        import tempfile
-        doc_r = cb.call("doc_new", {"kind": "part", "name": "audit_probe"})
-        doc_id = doc_r["doc_id"]
-        r = cb.call("doc_apply_ops", {
-            "doc_id": doc_id,
-            "ops": [{"op": "add_feature", "feature": {
-                "type": "box", "name": "Beam",
-                "params": {
-                    "length": {"value": L_mm, "expr": None},
-                    "width":  {"value": b_mm, "expr": None},
-                    "height": {"value": h_mm, "expr": None},
-                },
-            }}]
-        })
-        fs = (r.get("rebuild") or {}).get("feature_status", [])
-        box_ok = fs[0].get("ok") if fs else False
-
-        step = tempfile.mktemp(suffix=".step")
-        cb.call("doc_export_step", {"doc_id": doc_id, "path": step})
-        step_exists = os.path.exists(step)
-
-        fix_q = cb.call("doc_query", {"doc_id": doc_id,
-                                       "query": {"of": "face", "side": "left"}})
-        fix_pts = cb.call("doc_face_points", {"doc_id": doc_id,
-                                               "selector": fix_q["matches"][0]})
-        n_pts = len(fix_pts.get("points", []))
-        cb.call("doc_close", {"doc_id": doc_id})
-
-        geom_note = (f"geometry pre-step OK: box built (feature ok={box_ok}), "
-                     f"STEP exported ({step_exists}), face resolved ({n_pts} pts). "
-                     f"sim_run_static is a C++ plugin not exposed on raw cb bridge — "
-                     f"FEA only runs through the full MCP server process. "
-                     f"Cantilever E-B reference: delta=P*L^3/3EI = "
-                     f"{delta_expected_mm:.4f} mm for 50x50x{L_mm:.0f}mm, P={P_N}N.")
-        if box_ok and step_exists and n_pts > 0:
-            _record("run_fea_static", "REAL", geom_note)
-        else:
-            _record("run_fea_static", "BROKEN",
-                    f"geometry pre-step failed: box_ok={box_ok}, step={step_exists}, "
-                    f"n_pts={n_pts}")
-
-    except CoreError as exc:
-        _record("run_fea_static", "BROKEN",
-                f"CoreError from geometry pre-step: {exc}")
-    except Exception as exc:
-        _record("run_fea_static", "BROKEN",
-                f"Unexpected error in FEA pre-step: {exc}")
-        traceback.print_exc()
-
-    # Modal FEA independent check:
-    # Prismatic cantilever, first bending mode:
-    #   f1 = (1.8751)^2 / (2*pi*L^2) * sqrt(E*I / (rho*A))
-    # 50x50 square steel: rho=7.85e-3 g/mm^3 = 7850 kg/m^3
-    #   A = 2500 mm^2, I = 520833 mm^4, E = 200000 MPa
-    #   In SI: L=1m, A=2.5e-3 m^2, I=5.208e-7 m^4, E=200e9 Pa, rho=7850
-    #   f1 = (1.8751)^2/(2*pi*1^2) * sqrt(200e9*5.208e-7/(7850*2.5e-3))
-    #      = 3.5160 / (2*pi) * sqrt(1.3274e7) = 0.5596 * 3643 = 2038 Hz
-    beta_L = 1.8751  # first root of cosh(x)*cos(x) = -1 (cantilever)
+    beta_L = 1.8751
     L_m = L_mm * 1e-3
     A_m2 = (b_mm * 1e-3) * (h_mm * 1e-3)
     I_m4 = I_mm4 * 1e-12
-    rho_si = 7850.0  # kg/m^3
-    E_si = E_mpa * 1e6  # Pa
+    rho_si = _AUDIT_STEEL["density_g_cm3"] * 1000.0
+    E_si = E_mpa * 1e6
     f1_expected_hz = (beta_L ** 2 / (2.0 * math.pi * L_m ** 2)) * math.sqrt(
         E_si * I_m4 / (rho_si * A_m2))
-    print(f"  Modal check: first cantilever bending mode expected ~ {f1_expected_hz:.1f} Hz")
-    # modal verdict from source audit (core calls sim_run_modal, same C++ solver)
-    _record("run_fea_modal [source audit]", "REAL",
-            f"cad_tools.py: calls cb.call('sim_run_modal') — same C++ FEA solver as static. "
-            f"Prismatic cantilever first-mode beam theory: {f1_expected_hz:.0f} Hz. "
-            f"Cannot execute without a full doc solve; verdict from source + static validation.",
-            executed=False)
+    print(f"  Cantilever refs: delta={delta_expected_mm:.4f} mm, f1={f1_expected_hz:.2f} Hz")
+
+    try:
+        ctx = _cantilever_setup(cb)
+        if ctx.get("error"):
+            _record("run_fea_static", "BROKEN", ctx["error"])
+            _record("run_fea_modal", "BROKEN", ctx["error"])
+            return
+
+        static_study = {
+            "step_path": ctx["step"], "material": _AUDIT_STEEL,
+            "fixtures": [ctx["fix_fp"]],
+            "loads": [{"faces": ctx["load_fp"], "type": "force",
+                       "vector": [0.0, 0.0, -P_N]}],
+            "mesh_order": 2, "fineness": 0.5,
+        }
+        try:
+            res = cb.call("sim_run_static", {"study": static_study})
+        except CoreError as exc:
+            if "unknown method" in str(exc):
+                # Plain (non-netgen) build: fall back to the T-V1 source-audit verdict.
+                _record("run_fea_static", "REAL",
+                        "geometry pre-step OK but this .so lacks the netgen FEA RPCs "
+                        "(sim_run_static: unknown method). Stage "
+                        "core/build-occt-linux/bin/libaicad.so to solve live. "
+                        f"E-B reference: delta={delta_expected_mm:.4f} mm.",
+                        executed=False)
+                _record("run_fea_modal", "REAL",
+                        "same build limitation — needs the AICAD_WITH_NETGEN .so. "
+                        f"Beam-theory reference: f1={f1_expected_hz:.2f} Hz.",
+                        executed=False)
+                return
+            raise
+        if not res.get("ok"):
+            _record("run_fea_static", "BROKEN", f"live solve failed: {res.get('error')}")
+        else:
+            got = (res.get("summary") or {}).get("max_disp_mm")
+            err = _pct_err(got, delta_expected_mm) if got is not None else 1e9
+            note = (f"LIVE cantilever solve: max_disp={got} mm "
+                    f"(E-B delta={delta_expected_mm:.4f} mm, err={err:.2f}%), "
+                    f"n_dof={res.get('n_dof')}")
+            if err < 10.0:
+                _record("run_fea_static [live]", "VALIDATED", note)
+            else:
+                _record("run_fea_static [live]", "BROKEN",
+                        f"deflection off beam theory by {err:.1f}%: {note}")
+            # Stash the live stress field summary for the fatigue cross-check.
+            _CANTILEVER_CTX["static_summary"] = res.get("summary") or {}
+            _CANTILEVER_CTX["static_study"] = static_study
+
+        modal_study = {"step_path": ctx["step"], "material": _AUDIT_STEEL,
+                       "fixtures": [ctx["fix_fp"]], "mesh_order": 2, "fineness": 0.5}
+        mres = cb.call("sim_run_modal", {"study": modal_study, "n_modes": 4})
+        if not mres.get("ok"):
+            _record("run_fea_modal", "BROKEN", f"live modal failed: {mres.get('error')}")
+        else:
+            freqs = mres.get("freqs_hz") or []
+            f1 = freqs[0] if freqs else None
+            err = _pct_err(f1, f1_expected_hz) if f1 is not None else 1e9
+            note = (f"LIVE modal solve: f1={f1:.2f} Hz "
+                    f"(beam theory {f1_expected_hz:.2f} Hz, err={err:.2f}%); "
+                    f"modes={['%.1f' % f for f in freqs]}")
+            if err < 10.0:
+                _record("run_fea_modal [live]", "VALIDATED", note)
+            else:
+                _record("run_fea_modal [live]", "BROKEN",
+                        f"f1 off beam theory by {err:.1f}%: {note}")
+
+    except CoreError as exc:
+        _record("run_fea_static", "BROKEN", f"CoreError: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        _record("run_fea_static", "BROKEN", f"Unexpected FEA audit error: {exc}")
+        traceback.print_exc()
+
+
+# ===========================================================================
+# FAMILY 5b: FEA fatigue (T-SIM4) — S-N math anchors (pure Python, always run)
+# + live sim_run_fatigue engine cross-check when the netgen .so is staged.
+# ===========================================================================
+
+def audit_fatigue() -> None:
+    print("\n--- FAMILY: FEA fatigue (S-N anchors + live engine cross-check) ---")
+
+    # --- Pure-math anchors (run everywhere; references computed here) --------
+    # Shigley 10th Eq 6-14..6-16 (f=0.9): a=(0.9*400)^2/200=648;
+    #   b=-1/3*log10(1.8)=-0.085085; N=(250/648)^(1/b)=7.2627e4 cycles.
+    try:
+        sys.path.insert(0, _PROJECT_ROOT) if _PROJECT_ROOT not in sys.path else None
+        from services.mcp.fea_advanced import sn_life  # noqa: PLC0415
+        from services.agent.advisor.sim_advisor import fatigue_anchor  # noqa: PLC0415
+
+        n_expected = (250.0 / ((0.9 * 400.0) ** 2 / 200.0)) ** (
+            1.0 / (-(1.0 / 3.0) * math.log10(0.9 * 400.0 / 200.0)))
+        n_got = sn_life(250.0, 200.0, 400.0)
+        err = _pct_err(n_got, n_expected)
+        note = (f"sa_eq=250, Se=200, Sut=400 MPa → N={n_got:.0f} cycles "
+                f"(Shigley Eq 6-14..6-16 hand calc {n_expected:.0f}, err={err:.2f}%)")
+        if err < 1.0:
+            _record("sn_life (fea_advanced)", "VALIDATED", note)
+        else:
+            _record("sn_life (fea_advanced)", "BROKEN", f"S-N life mismatch: {note}")
+
+        # fatigue_anchor Goodman zero-based hand case:
+        #   smax=200, smin=0, Sut=400, Se'=0.5*Sut=200 (Shigley Eq 6-8):
+        #   sa=100, sm=100 → sa_eq=100/(1-100/400)=133.333 MPa (Eq 6-46); FoS=1.5
+        a = fatigue_anchor(200.0, 0.0, ultimate_mpa=400.0)
+        sa_eq_expected = 100.0 / (1.0 - 100.0 / 400.0)
+        if a is None:
+            _record("fatigue_anchor (sim_advisor)", "BROKEN",
+                    "anchor returned None for a well-posed Goodman case")
+        else:
+            err = _pct_err(a["sa_eq_mpa"], sa_eq_expected)
+            note = (f"Goodman R=0: sa_eq={a['sa_eq_mpa']:.3f} MPa "
+                    f"(hand calc {sa_eq_expected:.3f}, err={err:.3f}%), "
+                    f"regime={a['regime']}, FoS={a['fos_endurance']:.2f}")
+            if err < 0.1 and a["regime"] == "infinite":
+                _record("fatigue_anchor (sim_advisor)", "VALIDATED", note)
+            else:
+                _record("fatigue_anchor (sim_advisor)", "BROKEN", note)
+    except Exception as exc:  # noqa: BLE001
+        _record("fatigue math anchors", "BROKEN", f"import/run error: {exc}")
+        traceback.print_exc()
+        return
+
+    # --- Live engine cross-check (needs the netgen .so + a prior static solve) --
+    cb, reason = _load_core_bridge()
+    if cb is None:
+        _skip("run_fea_fatigue [live]", reason)
+        return
+    from core_bridge import CoreError  # noqa: PLC0415
+    study = _CANTILEVER_CTX.get("static_study")
+    vm = (_CANTILEVER_CTX.get("static_summary") or {}).get("max_von_mises_mpa")
+    if not study or vm is None:
+        _skip("run_fea_fatigue [live]",
+              "no live static solve available (see run_fea_static row) — "
+              "fatigue reuses that stress field")
+        return
+    try:
+        fat_study = dict(study)
+        fat_study["fatigue"] = {"load_type": "reversed"}   # lmin=-1, lmax=1
+        res = cb.call("sim_run_fatigue", {"study": fat_study})
+        if not res.get("ok"):
+            _record("run_fea_fatigue [live]", "BROKEN",
+                    f"live fatigue failed: {res.get('error')}")
+            return
+        theories = ((res.get("summary") or {}).get("theories") or {})
+        goodman = (theories.get("goodman") or {}).get("sa_eq_mpa")
+        # Fully reversed: sm=0 → Goodman sa_eq must equal the static peak vM.
+        err = _pct_err(goodman, vm) if goodman is not None else 1e9
+        anchor = fatigue_anchor(vm, -vm, ultimate_mpa=_AUDIT_STEEL["ultimate_mpa"],
+                                endurance_mpa=0.5 * _AUDIT_STEEL["ultimate_mpa"])
+        anchor_err = (_pct_err(goodman, anchor["sa_eq_mpa"])
+                      if (goodman is not None and anchor) else 1e9)
+        note = (f"reversed load: engine Goodman sa_eq={goodman} MPa vs static "
+                f"peak vM={vm} MPa (err={err:.3f}%) and vs fatigue_anchor "
+                f"(err={anchor_err:.3f}%)")
+        if err < 1.0 and anchor_err < 1.0:
+            _record("run_fea_fatigue [live]", "VALIDATED", note)
+        else:
+            _record("run_fea_fatigue [live]", "BROKEN", f"sa_eq mismatch: {note}")
+    except CoreError as exc:
+        if "unknown method" in str(exc):
+            _skip("run_fea_fatigue [live]",
+                  "this .so lacks sim_run_fatigue (needs AICAD_WITH_NETGEN build)")
+        else:
+            _record("run_fea_fatigue [live]", "BROKEN", f"CoreError: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        _record("run_fea_fatigue [live]", "BROKEN", f"unexpected: {exc}")
+        traceback.print_exc()
+
+
+# ===========================================================================
+# FAMILY 5c: FEA thermal (T-SIM1 solver, audited by T-SIM4) — plane-wall
+# anchors (pure Python, always run) + live sim_run_thermal when staged.
+# ===========================================================================
+
+def audit_thermal() -> None:
+    print("\n--- FAMILY: FEA thermal (plane-wall anchors + live conduction solve) ---")
+
+    # --- Pure-math anchor checks (run everywhere) ----------------------------
+    # 1D plane wall (Incropera §3.1): q = k*dT/L. Slab 10mm thick, k=50 W/mK,
+    # 100→0 °C: q = 50*100/0.010 = 500000 W/m².
+    try:
+        if _PROJECT_ROOT not in sys.path:
+            sys.path.insert(0, _PROJECT_ROOT)
+        from services.agent.advisor.sim_advisor import thermal_anchor  # noqa: PLC0415
+        q_expected = 50.0 * (100.0 - 0.0) / 0.010
+        t = thermal_anchor({"x_mm": 10, "y_mm": 100, "z_mm": 100}, 50.0, 100.0,
+                           t_cold_c=0.0)
+        if t is None:
+            _record("thermal_anchor (sim_advisor)", "BROKEN",
+                    "anchor returned None for a well-posed conduction case")
+        else:
+            err = _pct_err(t["q_w_m2"], q_expected)
+            note = (f"conduction: q={t['q_w_m2']:.0f} W/m² "
+                    f"(Fourier hand calc {q_expected:.0f}, err={err:.3f}%)")
+            if err < 0.1:
+                _record("thermal_anchor (sim_advisor)", "VALIDATED", note)
+            else:
+                _record("thermal_anchor (sim_advisor)", "BROKEN", note)
+    except Exception as exc:  # noqa: BLE001
+        _record("thermal_anchor (sim_advisor)", "BROKEN", f"import/run error: {exc}")
+        traceback.print_exc()
+        return
+
+    # --- Live conduction solve (Dirichlet hot + convection cold) -------------
+    # Bar 100 (X) × 20 × 20 mm, k=50 W/mK; x=0 fixed 100 °C, x=100mm convection
+    # h=500 W/m²K to 20 °C ambient. Series resistance (Incropera §3.1):
+    #   q = (T_hot - T_amb)/(L/k + 1/h) = 80/(0.002+0.002) = 20000 W/m²
+    #   T_cold_face = T_amb + q/h = 20 + 40 = 60.0 °C ← the solve-dependent anchor
+    cb, reason = _load_core_bridge()
+    if cb is None:
+        _skip("sim_run_thermal [live]", reason)
+        return
+    from core_bridge import CoreError  # noqa: PLC0415
+    try:
+        import tempfile
+        L_mm, w_mm = 100.0, 20.0
+        k_w_mk, t_hot, h_conv, t_amb = 50.0, 100.0, 500.0, 20.0
+        q_ref = (t_hot - t_amb) / ((L_mm / 1000.0) / k_w_mk + 1.0 / h_conv)
+        t_cold_ref = t_amb + q_ref / h_conv
+
+        doc_id = cb.call("doc_new", {"kind": "part", "name": "audit_thermal_bar"})["doc_id"]
+        cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": [
+            {"op": "add_feature", "feature": {
+                "type": "box", "name": "Bar",
+                "params": {"length": {"value": L_mm, "expr": None},
+                           "width": {"value": w_mm, "expr": None},
+                           "height": {"value": w_mm, "expr": None}}}}]})
+        step = tempfile.mktemp(suffix=".step", prefix="sim_audit_th_")
+        cb.call("doc_export_step", {"doc_id": doc_id, "path": step})
+
+        def faceset(side):
+            q = cb.call("doc_query", {"doc_id": doc_id,
+                                      "query": {"of": "face", "side": side}})
+            m = [x for x in q.get("matches", []) if x.get("kind") == "face"]
+            return cb.call("doc_face_points", {"doc_id": doc_id, "selector": m[0]})
+
+        hot_fp = faceset("left")
+        cold_fp = faceset("right")
+        hot_fp["temp_c"] = t_hot
+        study = {
+            "step_path": step,
+            "material": {"k_w_mk": k_w_mk},
+            "fixtures": [hot_fp],
+            "loads": [{"type": "convection", "faces": cold_fp,
+                       "h": h_conv, "t_amb_c": t_amb}],
+            "mesh_order": 2, "fineness": 0.5,
+        }
+        res = cb.call("sim_run_thermal", {"study": study})
+        cb.call("doc_close", {"doc_id": doc_id})
+        try:
+            os.unlink(step)
+        except OSError:
+            pass
+        if not res.get("ok"):
+            _record("sim_run_thermal [live]", "BROKEN",
+                    f"live thermal failed: {res.get('error')}")
+            return
+        summ = res.get("summary") or {}
+        t_max, t_min = summ.get("max_temp_c"), summ.get("min_temp_c")
+        err_cold = _pct_err(t_min, t_cold_ref) if t_min is not None else 1e9
+        err_hot = _pct_err(t_max, t_hot) if t_max is not None else 1e9
+        note = (f"LIVE conduction+convection bar: T range [{t_min}, {t_max}] °C "
+                f"(series-resistance refs: cold face {t_cold_ref:.1f} °C, "
+                f"hot face {t_hot:.1f} °C; err cold={err_cold:.2f}%, hot={err_hot:.2f}%)")
+        if err_cold < 2.0 and err_hot < 0.1:
+            _record("sim_run_thermal [live]", "VALIDATED", note)
+        else:
+            _record("sim_run_thermal [live]", "BROKEN", f"temperature mismatch: {note}")
+    except CoreError as exc:
+        if "unknown method" in str(exc):
+            _skip("sim_run_thermal [live]",
+                  "this .so lacks sim_run_thermal (needs AICAD_WITH_NETGEN build)")
+        else:
+            _record("sim_run_thermal [live]", "BROKEN", f"CoreError: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        _record("sim_run_thermal [live]", "BROKEN", f"unexpected: {exc}")
+        traceback.print_exc()
 
 
 # ===========================================================================
@@ -741,6 +985,8 @@ def main() -> int:
     audit_ecad_impedance()
     audit_ecad_sim()
     audit_fea()
+    audit_fatigue()
+    audit_thermal()
     audit_cfd()
     audit_structural()
     elapsed = time.perf_counter() - t0

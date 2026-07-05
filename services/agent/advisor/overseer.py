@@ -446,20 +446,38 @@ def audit_to_advisory(audit: dict, seq: int = 0) -> dict:
         if v.get("class") == "ok":
             continue
         act = v.get("required_action") or {}
-        items.append({
-            "id": f"adv_{_fingerprint(v)}",
-            "severity": sev_map.get(v.get("severity"), "info"),
-            "check": v.get("class", "audit"),
-            "finding": v.get("finding", ""),
-            "refs": {"audit_id": audit.get("id", ""), **(v.get("evidence") or {})},
-            "numbers": {},
-            "candidate_fixes": [{
-                "action": act.get("kind", "none"),
+        sev = sev_map.get(v.get("severity"), "info")
+        akind = act.get("kind", "none")
+        if akind not in (None, "none"):
+            fixes = [{
+                "action": akind,
                 "params": {"dispatch_role": act.get("dispatch_role")} if act.get("dispatch_role") else {},
                 "basis": "overseer audit finding",
                 "predicted_effect": act.get("detail", ""),
                 "confidence": "llm",
-            }] if act.get("kind") not in (None, "none") else [],
+            }]
+        elif sev != "info":
+            # §3 invariant: a non-info advisory item MUST carry ≥1 candidate fix.
+            # A non-info verdict with required_action.kind=="none" would violate it,
+            # so we emit a "review" fix — the honest action is "a human/role should
+            # look at this finding" — rather than an illegal empty-fix item.
+            fixes = [{
+                "action": "review_finding",
+                "params": {},
+                "basis": "overseer flagged this but named no specific action",
+                "predicted_effect": v.get("finding", ""),
+                "confidence": "llm",
+            }]
+        else:
+            fixes = []
+        items.append({
+            "id": f"adv_{_fingerprint(v)}",
+            "severity": sev,
+            "check": v.get("class", "audit"),
+            "finding": v.get("finding", ""),
+            "refs": {"audit_id": audit.get("id", ""), **(v.get("evidence") or {})},
+            "numbers": {},
+            "candidate_fixes": fixes,
             "helper_tools": [],
             "source": {"kind": "llm", "detail": f"overseer:{audit.get('id','')}"},
         })

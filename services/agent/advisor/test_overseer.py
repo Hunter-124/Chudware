@@ -227,6 +227,23 @@ def test_ok_verdict_produces_no_advisory_items():
     assert adv["items"] == [], "an 'ok' verdict gives the working role nothing to act on"
 
 
+def test_non_info_verdict_with_no_action_still_carries_fix():
+    # §3 invariant: a non-info advisory item MUST carry >=1 candidate fix.  A
+    # blocker verdict whose required_action.kind is "none" must not yield an
+    # illegal empty-fix item — it gets a review_finding fix.
+    a = validate_audit({
+        "schema": "aicad.audit/1", "trigger": "manual",
+        "verdicts": [{"class": "spec_drift", "finding": "dim changed w/o decision",
+                      "evidence": {"ledger_events": [7]}, "severity": "blocker",
+                      "required_action": {"kind": "none"}}],
+    })
+    adv = audit_to_advisory(a)
+    item = adv["items"][0]
+    assert item["severity"] == "blocker"
+    assert item["candidate_fixes"], "a non-info audit item must never be fix-less (§3)"
+    assert item["candidate_fixes"][0]["action"] == "review_finding"
+
+
 def test_audit_logs_tokens_and_ledger_event(tmp_path):
     ledger = Ledger("run_tok", tmp_path / "ledger.json")
     prov = _CannedProvider([_blocker_audit()])
@@ -349,6 +366,24 @@ def test_change_request_routes_through_overseer_and_ledger(tmp_path):
     assert not result.needs_user_confirm
 
 
+def test_change_request_self_audit_sees_the_ledger(tmp_path):
+    # The self-audit must judge the map against the ACTUAL ledger — a mis-scoped
+    # map (missed dimension) is only catchable if the audit sees the ledger.
+    ledger = Ledger("run_cr2", tmp_path / "ledger.json")
+    ledger.upsert_dimension("intake", "DIM1", "bore diameter", 19.8, "mm",
+                            driver="fit", provenance="user",
+                            refs={"features": ["F7"]})
+    prov = _CannedProvider([_ok_audit()])
+    o = Overseer(provider=prov, role_card={"system_prompt": "audit."}, ledger=ledger)
+    cr.route_change_request("resize the bore", ledger.state,
+                            overseer=o, ledger=ledger, run_id="run_cr2")
+    # The audit prompt (the user message) carries the rendered ledger evidence.
+    assert prov.calls, "the self-audit must call the provider"
+    user_msg = prov.calls[0][1][0]["content"]
+    assert "LEDGER" in user_msg and "bore diameter" in user_msg, \
+        "the change-request self-audit must include the ledger in its evidence"
+
+
 def test_change_request_empty_scope_asks_user(tmp_path):
     ledger = Ledger("run_empty", tmp_path / "ledger.json")
     result = cr.route_change_request(
@@ -414,3 +449,33 @@ def test_inapp_audit_now_end_to_end(tmp_path):
     assert out["audit"]["verdicts"][0]["class"] == "wrong_order"
     assert out["advisory"]["items"][0]["source"]["kind"] == "llm"
     json.dumps(out)
+
+
+# ---------------------------------------------------------------------------
+# DAG stage-exit trigger seam (services/dag/node_runner._run_overseer_stage_exit)
+# ---------------------------------------------------------------------------
+
+def test_dag_stage_exit_seam_noops_without_run_id_or_providers():
+    from services.dag import node_runner
+    node = {"id": "n1", "type": "model", "name": "make bracket"}
+    # No run_id / no overseer_providers ⇒ no-op (the common/test path — must not
+    # regress the DAG suite or require a provider registry).
+    assert node_runner._run_overseer_stage_exit(node, {}) is None
+    assert node_runner._run_overseer_stage_exit(node, {"run_id": "r1"}) is None
+
+
+def test_dag_stage_exit_seam_fires_when_wired(tmp_path, monkeypatch):
+    from services.dag import node_runner
+    # Drive the in-app audit's ledger cache root at a temp dir so the seam can load
+    # the run's ledger.  monkeypatch scopes the env change to this test only.
+    monkeypatch.setenv("AICAD_CACHE_ROOT", str(tmp_path))
+    from services.agent.ledger import Ledger, run_ledger_path
+    led = Ledger("run_seam", run_ledger_path("run_seam"))
+    led.upsert_dimension("intake", "DIM1", "bore diameter", 19.8, "mm",
+                         driver="fit", provenance="user", refs={"features": ["F7"]})
+    prov = _CannedProvider([_ok_audit()])
+    node = {"id": "bg1", "type": "model", "name": "bore"}
+    ctx = {"run_id": "run_seam", "overseer_providers": {"mock": prov}}
+    out = node_runner._run_overseer_stage_exit(node, ctx)
+    assert out is not None and out["ok"]
+    assert prov.calls, "the wired seam must invoke the overseer provider"

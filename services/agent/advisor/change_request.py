@@ -368,6 +368,7 @@ def route_change_request(
     *,
     overseer: Any | None = None,
     ledger: Any | None = None,
+    ledger_text: str = "",
     buildgraph: dict | None = None,
     run_id: str = "",
     stage: str = "fix",
@@ -380,6 +381,12 @@ def route_change_request(
     dispatched here: the overseer never dispatches (freedom rule); the returned
     ``dispatch`` list is a recommendation for the orchestrator.  The plan + a
     plain-language summary are written to the ledger (questions/decisions §11).
+
+    ``ledger_text`` is the caller's ``ledger_render(ledger, budget)`` — passed into
+    the self-audit so the overseer can judge the map against the ACTUAL ledger (a
+    mis-scoped map — a missed dimension — is only catchable if the audit sees the
+    ledger, not just the plan).  When the caller has a ``ledger`` but no rendered
+    text, we render a compact view here as a fallback.
     """
     plan_obj = draft_change_plan(text, ledger_state)
     plan = plan_obj.to_dict()
@@ -391,12 +398,21 @@ def route_change_request(
 
     if overseer is not None and not empty:
         from .overseer import AuditScope  # local import: avoid cycle at module load
+        # The self-audit must see the ledger to catch a mis-scoped map (a missed
+        # dimension) — the plan alone cannot prove completeness against the ledger.
+        lt = ledger_text
+        if not lt and ledger is not None:
+            try:
+                from services.agent.ledger import ledger_render
+                lt = ledger_render(ledger, 2000)
+            except Exception:  # noqa: BLE001
+                lt = ""
         scope = AuditScope(
             run_id=run_id, stage=stage,
             roles=[d["role"] for d in plan_obj.dispatch],
             buildgraph_nodes=[],
         )
-        res = overseer.audit("change_request", scope,
+        res = overseer.audit("change_request", scope, ledger_text=lt,
                              buildgraph=buildgraph, change_plan=plan)
         audit = res.audit
         advisory = res.advisory

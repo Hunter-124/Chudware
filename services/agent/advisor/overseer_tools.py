@@ -29,6 +29,8 @@ from .overseer import (
 )
 from . import change_request as _cr
 
+_CR_LEDGER_BUDGET = 2000  # tokens rendered into the change-request self-audit
+
 
 # ---------------------------------------------------------------------------
 # Run-state loading (ledger + buildgraph sidecar)
@@ -139,8 +141,9 @@ def change_request(
 
     result = _cr.route_change_request(
         text, ledger.state,
-        overseer=overseer, ledger=ledger, buildgraph=graph,
-        run_id=run_id, stage=stage,
+        overseer=overseer, ledger=ledger,
+        ledger_text=ledger_render(ledger, _CR_LEDGER_BUDGET),
+        buildgraph=graph, run_id=run_id, stage=stage,
     )
     return {
         "ok": True,

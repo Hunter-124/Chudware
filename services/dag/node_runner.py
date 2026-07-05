@@ -228,6 +228,16 @@ def run(
     if adv_block:
         output_state["advisory"] = adv_block
 
+    # Overseer stage-exit audit (T-W13, §11): on a node completing DONE, trigger a
+    # budgeted overseer audit of the plan/reasoning so far.  Real trigger call site
+    # — but it fires ONLY when the context pack carries a run_id AND an overseer
+    # provider map (so it no-ops in the common/test path and never regresses the
+    # DAG suite).  See the run_id/ledger-glue NOTE above: same missing thread.
+    if verdict == VERDICT_DONE:
+        ov_out = _run_overseer_stage_exit(node, context_pack)
+        if ov_out:
+            output_state["overseer_audit"] = ov_out
+
     # Emit appropriate §11 completion event.
     if verdict == VERDICT_DONE:
         _emit(emit, "dag.node.done", {
@@ -366,6 +376,36 @@ def _run_advisory(node_type: str, doc_id: str | None, seq: int = 0) -> str:
         return render.render_advisory(advisory)
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _run_overseer_stage_exit(node: dict[str, Any],
+                             context_pack: dict[str, Any]) -> dict | None:
+    """Trigger a stage-exit overseer audit for a completed node (T-W13, §11).
+
+    Fires only when the context pack supplies a ``run_id`` AND an ``overseer_providers``
+    map (the resolved provider seam, §14).  Absent either, returns ``None`` — the
+    overseer needs the run's ledger + build graph, and there is no provider registry
+    threaded through the DAG runner yet (same missing glue the foreman NOTE above
+    flags; full ledger threading tracked for T-W19 glue).  Best-effort: never raises.
+    """
+    if not _ADVISOR_ENABLED:
+        return None
+    run_id = context_pack.get("run_id")
+    providers = context_pack.get("overseer_providers")
+    if not run_id or not providers:
+        return None
+    node_type = node.get("type", "")
+    stage = _NODE_TYPE_STAGE.get(node_type, node_type)
+    try:
+        from services.agent.advisor.overseer_tools import audit_now
+        return audit_now(
+            run_id,
+            {"stage": stage, "buildgraph_nodes": [node.get("id")] if node.get("id") else []},
+            trigger="stage_exit",
+            providers=providers,
+        )
+    except Exception:  # noqa: BLE001 — a broken auditor never breaks node execution
+        return None
 
 
 def _emit(emit: EmitFn, event_type: str, payload: dict[str, Any]) -> None:

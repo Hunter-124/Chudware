@@ -21,9 +21,11 @@
 #include "doc_tabs.h"           // docTabStripHeight (the column never overlaps the doc-tab band)
 #include "icons.h"              // getIcon / IconUV
 #include "metrics.h"            // dockRightTarget (command-dialog default anchor)
+#include "panel_collapse.h"     // ui::PanelCollapseAnim — shared vertical-collapse animation (T-G21)
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 // Overlay layout: the dockspace hosts ONLY the central document windows, tabbed in one node, so
 // the viewport runs edge to edge between the ribbon and the status bar. The FeatureManager and
@@ -221,9 +223,12 @@ void drawLeftPane(AppState& st,
                   const std::function<void(const std::string& featureId)>& editCallback) {
     PropertyManager* pm = st.propertyManager;
 
-    // Collapse-to-pill state. Not persisted by design (a fresh session always opens the manager);
-    // "Reset layout" clears it via takeOverlayColumnReset below.
-    static bool s_collapsed = false;
+    // Vertical-collapse state (T-G21): the column rolls UP to its header (tab row + collapse
+    // chevron) instead of shrinking to a pill. Persisted in config.json (st.settings.fmCollapsed)
+    // so a collapsed column stays collapsed across restarts; seeded once from the loaded setting
+    // (loadSettings runs before the first frame, so this static local's initializer reads it).
+    static bool s_collapsed = st.settings.fmCollapsed;
+    static ui::PanelCollapseAnim s_anim;
 
     // Auto-switch policy: the PropertyManager form is hosted INSIDE the FeatureManager tab now (the
     // separate "Property Manager" tab was a duplicate and was removed). When a command goes active
@@ -271,64 +276,38 @@ void drawLeftPane(AppState& st,
     const float bubbleDp = (rsFm.rounding >= 0.f) ? rsFm.rounding : 12.0f;
 
     const bool wantReset = takeOverlayColumnReset(0);
-    if (wantReset) s_collapsed = false;
-
-    // ---- collapsed: a small glass pill at the column anchor that re-expands -------------------
-    if (s_collapsed) {
-        const float pill = 40.0f * S;
-        ImGui::SetNextWindowPos(ImVec2(colX, colY), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(pill, pill), ImGuiCond_Always);
-        // Publish the pill's right edge like the expanded column does, so the doc-tab strip starts
-        // to its RIGHT instead of falling back to the band's left edge and drawing over the pill
-        // (which both hid it and let the strip steal its expand click).
-        publishOverlayColumnEdge(0, colX + pill);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, pill * 0.5f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-        // No NoBringToFrontOnFocus here (unlike the pre-fix expanded column): the pill must stay
-        // clickable above the later-drawn doc-tab overlay so it can always be re-expanded.
-        const ImGuiWindowFlags pillFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking |
-            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoSavedSettings;
-        if (ImGui::Begin("##LeftPanePill", nullptr, pillFlags)) {
-            const ImVec2 pp = ImGui::GetWindowPos();
-            const ImRect pr(pp, ImVec2(pp.x + pill, pp.y + pill));
-            // Distinct panel id (rect differs from the column's), same group => same user knobs.
-            const ui::AdaptiveSurface& psurf = ui::adaptivePanel(
-                ui::panelId("host_left_glass_pill"), pr, ui::GlassGroup::FeatureManager);
-            ui::glassPanel(ImGui::GetWindowDrawList(), pr, ui::GlassLevel::UltraThin,
-                           pill * 0.5f / S, psurf);
-            const bool pClicked = ImGui::InvisibleButton("##lp_expand", ImVec2(pill, pill));
-            const ImU32 pHalo = ui::viewportBackdrop().valid()
-                ? ImGui::ColorConvertFloat4ToU32(
-                      ImVec4(psurf.tint.x, psurf.tint.y, psurf.tint.z, 0x50 / 255.f))
-                : 0;
-            drawIconGlass(ImGui::GetWindowDrawList(), "history",
-                          ImVec2(pp.x + pill * 0.5f, pp.y + pill * 0.5f), 20.0f * S,
-                          ImGui::ColorConvertFloat4ToU32(psurf.textPrimary), pHalo);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Feature Manager");
-            if (pClicked) s_collapsed = false;
-        }
-        ImGui::End();
-        ImGui::PopStyleVar(3);
-        return;
+    if (wantReset && s_collapsed) {
+        s_collapsed = false;
+        st.settings.fmCollapsed = false;
+        saveSettings(st.settings);
+    }
+    // T-G21 screenshot hook: --ui-screenshot always resets the overlay columns for determinism
+    // (io.IniFilename is nulled in shot mode, so DockBuilderGetNode is always null and the reset
+    // branch above always fires) — the persisted collapse setting can't survive that on its own.
+    // AI_CAD_FM_COLLAPSED forces the collapsed capture the same way AI_CAD_COPILOT_NARROW forces
+    // a pane width; no effect outside a screenshot run.
+    if (std::getenv("AI_CAD_FM_COLLAPSED")) {
+        s_collapsed = true;
+        s_anim.snap(true, colH);  // snap immediately — headless captures must not depend on frame count
     }
 
-    // ---- expanded: the pinned full-height glass column -----------------------------------------
-    // Position + height are pinned every frame (min == max height in the constraint); WIDTH is the
-    // one free axis, resized via ImGui's invisible edge hit-zone (ConfigWindowsResizeFromEdges,
-    // EW mouse-cursor feedback, no drawn bars) and persisted in the imgui ini like any floating
-    // window. Default/min widths reuse the HiDPI-damped targets of the old dock split.
+    // ---- pinned full-height-or-collapsed glass column -------------------------------------------
+    // Position is pinned every frame; WIDTH is resized via ImGui's invisible edge hit-zone
+    // (ConfigWindowsResizeFromEdges, EW mouse-cursor feedback, no drawn bars) and persisted in the
+    // imgui ini like any floating window. HEIGHT animates between the full column height and the
+    // header-strip height (T-G21: vertical collapse — rolls UP to the tab row + chevron instead of
+    // shrinking to a pill; see ui::PanelCollapseAnim). Default/min widths reuse the HiDPI-damped
+    // targets of the old dock split.
     const float panelSc = 1.0f + (S - 1.0f) * 0.55f;
     const float minW = 250.0f * panelSc;
     const float defW = 360.0f * panelSc;
     const float maxW = std::max(minW + 40.0f * S,
                                 std::min(560.0f * panelSc, (band.maxX - band.minX) * 0.42f));
+    const float winH = s_anim.tick(s_collapsed, colH);
     ImGui::SetNextWindowPos(ImVec2(colX, colY), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(defW, colH),
+    ImGui::SetNextWindowSize(ImVec2(defW, winH),
                              wantReset ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(minW, colH), ImVec2(maxW, colH));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(minW, winH), ImVec2(maxW, winH));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, bubbleDp * S);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     // Kill every drawn resize affordance (corner grips + the edge hover/active flash) — the
@@ -371,11 +350,13 @@ void drawLeftPane(AppState& st,
         : 0;
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
-    // Collapse-to-pill chevron — a persistent glass CHIP parked at the column's top-right corner, on
-    // the same top row as the horizontal icon rail (fix 1) but reserved out of its width (chevRsv
+    // Collapse chevron — a persistent glass CHIP parked at the column's top-right corner, on the
+    // same top row as the horizontal icon rail (fix 1) but reserved out of its width (chevRsv
     // below) so the two never overlap. A resting glass background (not hover-only) makes it read as an
     // obvious button rather than a stray floating mark (fix 4). Drawn before the rail / body lay out;
-    // the cursor is restored so the flow below is unaffected.
+    // the cursor is restored so the flow below is unaffected. T-G21: position and glyph are
+    // unchanged from the old collapse-to-pill version — only the toggle now runs both directions
+    // (the pill's separate re-expand control is gone; this one chip drives the vertical collapse).
     const float chevSz  = 26.0f * S;                 // square chip, matches the rail icon-button height
     const float chevRsv = chevSz + 8.0f * S;         // width the rail must leave clear at the right
     {
@@ -400,8 +381,12 @@ void drawLeftPane(AppState& st,
             wdl->AddLine(ImVec2(cc.x + ox - ca * 0.5f, cc.y),
                          ImVec2(cc.x + ox + ca * 0.5f, cc.y + ca), cCol, 1.6f * S);
         }
-        if (cHover) ImGui::SetTooltip("Collapse");
-        if (cClicked) s_collapsed = true;
+        if (cHover) ImGui::SetTooltip(s_collapsed ? "Expand" : "Collapse");
+        if (cClicked) {
+            s_collapsed = !s_collapsed;
+            st.settings.fmCollapsed = s_collapsed;
+            saveSettings(st.settings);
+        }
         ImGui::SetCursorScreenPos(savedCur);
     }
 
@@ -465,129 +450,150 @@ void drawLeftPane(AppState& st,
     }
     ImGui::EndChild();
 
-    // T-G19: relocated OK/Cancel command buttons. Erik round-1 asked for them ABOVE the PM, between
-    // the Configurations tab and the collapse chevron. Rendered on the pane window (after the tab-strip
-    // child so their hit rect is clean), right-aligned to end just left of the chevron, vertically
-    // centered on the chevron. The PropertyManager owns commit/cancel + the form-ready guard.
-    if (pmActive && pm) {
-        const float chevLeftX  = lpPaneRect.Max.x - chevSz - 8.0f * S;
-        const float rowCenterY = lpPaneRect.Min.y + 8.0f * S + chevSz * 0.5f;
-        pm->drawChromeButtons(st, chevLeftX - 8.0f * S, rowCenterY);
-    }
+    // T-G21: the tab row IS the header strip a vertical collapse rolls up to — measure its height
+    // (cursor position right after the row, symmetric-padded) so PanelCollapseAnim knows the exact
+    // collapsed target. Measured every frame (one-frame lag feeding next frame's window height, same
+    // trick the Copilot composer already uses for s_composerH), so it tracks any future header change
+    // with no hand-tuned constant to keep in sync.
+    s_anim.measureHeader();
 
-    // Horizontal separator under the icon row, spanning the full pane width on the pane draw list.
-    {
-        ImDrawList* pdl = ImGui::GetWindowDrawList();
-        const float sepY = paneOrigin.y + railRowH - 0.5f;
-        pdl->AddLine(ImVec2(paneOrigin.x, sepY),
-                     ImVec2(paneOrigin.x + paneInnerWFull, sepY),
-                     ui::Palette::toU32(pal.glassBorder), 1.0f * S);
-    }
+    // Below the header: OK/Cancel, the separator, and the active tab body all disappear once the
+    // column has animated down near the header height — gates real work (tree/PM/config bodies)
+    // rather than just clipping it, so a collapsed column costs nothing per frame.
+    if (s_anim.bodyVisible()) {
+        // T-G19: relocated OK/Cancel command buttons. Erik round-1 asked for them ABOVE the PM,
+        // between the Configurations tab and the collapse chevron. Rendered on the pane window
+        // (after the tab-strip child so their hit rect is clean), right-aligned to end just left
+        // of the chevron, vertically centered on the chevron. The PropertyManager owns
+        // commit/cancel + the form-ready guard.
+        if (pmActive && pm) {
+            const float chevLeftX  = lpPaneRect.Max.x - chevSz - 8.0f * S;
+            const float rowCenterY = lpPaneRect.Min.y + 8.0f * S + chevSz * 0.5f;
+            pm->drawChromeButtons(st, chevLeftX - 8.0f * S, rowCenterY);
+        }
 
-    // ---- active tab body ----
-    const char* title = "Feature Manager";
-    const char* titleIcon = "history";
-    if (st.leftPaneTab == kLeftPaneExplorer) {
-        title = "Explorer";
-        titleIcon = "body_folder";
-    } else if (st.leftPaneTab == kLeftPaneConfigurations) {
-        title = "Configurations";
-        titleIcon = "settings";
-    } else if (pmActive) {
-        // A live command form takes over the FeatureManager tab body -> label it as such.
-        title = "Property Manager";
-        titleIcon = "material";
-    }
+        // Horizontal separator under the icon row, spanning the full pane width on the pane draw
+        // list.
+        {
+            ImDrawList* pdl = ImGui::GetWindowDrawList();
+            const float sepY = paneOrigin.y + railRowH - 0.5f;
+            pdl->AddLine(ImVec2(paneOrigin.x, sepY),
+                         ImVec2(paneOrigin.x + paneInnerWFull, sepY),
+                         ui::Palette::toU32(pal.glassBorder), 1.0f * S);
+        }
 
-    // Equal left/right margins via symmetric WindowPadding + a slim scrollbar. When the form
-    // overflows, ImGui reserves a vertical scrollbar on the right, which would make the right gap
-    // (padding + scrollbar) wider than the left (padding) — exactly the lopsided look on the tall
-    // Extrude PropertyManager. We mirror it by indenting the content by the scrollbar width while
-    // scrolling, so the gap from the rail equals the gap from the panel edge in BOTH states.
-    // s_bodyScrolled samples last frame's scroll state (queried just before EndChild).
-    static bool s_bodyScrolled = false;
-    const float bodyPad = 12.0f * S;
-    const float sbSize  = 8.0f * S;
-    // Transparent body — row-level glass pills only; viewport shows through gaps.
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(bodyPad, ImGui::GetStyle().WindowPadding.y));
-    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, sbSize);
-    // Inset the scroll region above the bubble's rounded bottom edge so the last row (the file
-    // strip's "(unsaved)" line / buttons) is never clipped by the corner radius (visual-review fix).
-    ImGui::BeginChild("##lp_body", ImVec2(0, -8.0f * S), ImGuiChildFlags_AlwaysUseWindowPadding);
-    const bool bodyIndented = s_bodyScrolled;
-    if (bodyIndented) ImGui::Indent(sbSize);   // balance the right-side scrollbar gutter
-    IconUV headIcon = getIcon(titleIcon, 20);
-    const float iconSz = headIcon.valid ? 20.0f * S : 0.0f;
-    const float iconGap = headIcon.valid ? 6.0f * S : 0.0f;
-    const float titleW = ImGui::CalcTextSize(title).x;
-    const float groupW = iconSz + iconGap + titleW;
-    // Center the header at the pane's TRUE horizontal center (captured in screen space above),
-    // mapped into this body child's local cursor X; clamp so it never sits left of the body padding.
-    const float localCur = ImGui::GetCursorPosX();
-    const float titleX = std::max(localCur,
-        localCur + (paneCenterX - groupW * 0.5f - ImGui::GetCursorScreenPos().x));
-    ui::glassRowAtCursor(4.0f, false, false, 6.0f);
-    ImGui::SetCursorPosX(titleX);
-    if (headIcon.valid) {
-        ImVec2 hp0 = ImGui::GetCursorScreenPos();
-        ImGui::Dummy(ImVec2(iconSz, iconSz));
-        drawIconGlass(ImGui::GetWindowDrawList(), titleIcon,
-                     ImVec2(hp0.x + iconSz * 0.5f, hp0.y + iconSz * 0.5f), iconSz,
-                     ImGui::ColorConvertFloat4ToU32(surf.textPrimary), lpHalo);
-        ImGui::SameLine(0, iconGap);
-    }
-    ImGui::PushFont(st.fonts.medium);
-    ImGui::TextUnformatted(title);
-    ImGui::PopFont();
-    ImGui::Separator();
-    switch (st.leftPaneTab) {
-        case kLeftPaneExplorer:
-            // Wave 3: the workspace file browser (file_explorer.cpp).
-            drawFileExplorerBody(st);
-            break;
+        // ---- active tab body ----
+        const char* title = "Feature Manager";
+        const char* titleIcon = "history";
+        if (st.leftPaneTab == kLeftPaneExplorer) {
+            title = "Explorer";
+            titleIcon = "body_folder";
+        } else if (st.leftPaneTab == kLeftPaneConfigurations) {
+            title = "Configurations";
+            titleIcon = "settings";
+        } else if (pmActive) {
+            // A live command form takes over the FeatureManager tab body -> label it as such.
+            title = "Property Manager";
+            titleIcon = "material";
+        }
 
-        case kLeftPaneConfigurations:
-            // User chose the live ConfigurationManager (config_* RPCs) for this tab. ConfigPanel is
-            // owned by run_gui and borrowed via st.configPanel; drawEmbedded renders its contents
-            // without a Begin/End. Fall back to the at-rest single-config body if it's unset.
-            if (st.configPanel) st.configPanel->drawEmbedded(st);
-            else                drawConfigurationsBody(st);
-            break;
+        // Equal left/right margins via symmetric WindowPadding + a slim scrollbar. When the form
+        // overflows, ImGui reserves a vertical scrollbar on the right, which would make the right
+        // gap (padding + scrollbar) wider than the left (padding) — exactly the lopsided look on
+        // the tall Extrude PropertyManager. We mirror it by indenting the content by the
+        // scrollbar width while scrolling, so the gap from the rail equals the gap from the panel
+        // edge in BOTH states. s_bodyScrolled samples last frame's scroll state (queried just
+        // before EndChild).
+        static bool s_bodyScrolled = false;
+        const float bodyPad = 12.0f * S;
+        const float sbSize  = 8.0f * S;
+        // Transparent body — row-level glass pills only; viewport shows through gaps.
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(bodyPad, ImGui::GetStyle().WindowPadding.y));
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, sbSize);
+        // Inset the scroll region above the bubble's rounded bottom edge so the last row (the
+        // file strip's "(unsaved)" line / buttons) is never clipped by the corner radius
+        // (visual-review fix).
+        ImGui::BeginChild("##lp_body", ImVec2(0, -8.0f * S), ImGuiChildFlags_AlwaysUseWindowPadding);
+        const bool bodyIndented = s_bodyScrolled;
+        if (bodyIndented) ImGui::Indent(sbSize);   // balance the right-side scrollbar gutter
+        IconUV headIcon = getIcon(titleIcon, 20);
+        const float iconSz = headIcon.valid ? 20.0f * S : 0.0f;
+        const float iconGap = headIcon.valid ? 6.0f * S : 0.0f;
+        const float titleW = ImGui::CalcTextSize(title).x;
+        const float groupW = iconSz + iconGap + titleW;
+        // Center the header at the pane's TRUE horizontal center (captured in screen space
+        // above), mapped into this body child's local cursor X; clamp so it never sits left of
+        // the body padding.
+        const float localCur = ImGui::GetCursorPosX();
+        const float titleX = std::max(localCur,
+            localCur + (paneCenterX - groupW * 0.5f - ImGui::GetCursorScreenPos().x));
+        ui::glassRowAtCursor(4.0f, false, false, 6.0f);
+        ImGui::SetCursorPosX(titleX);
+        if (headIcon.valid) {
+            ImVec2 hp0 = ImGui::GetCursorScreenPos();
+            ImGui::Dummy(ImVec2(iconSz, iconSz));
+            drawIconGlass(ImGui::GetWindowDrawList(), titleIcon,
+                         ImVec2(hp0.x + iconSz * 0.5f, hp0.y + iconSz * 0.5f), iconSz,
+                         ImGui::ColorConvertFloat4ToU32(surf.textPrimary), lpHalo);
+            ImGui::SameLine(0, iconGap);
+        }
+        ImGui::PushFont(st.fonts.medium);
+        ImGui::TextUnformatted(title);
+        ImGui::PopFont();
+        ImGui::Separator();
+        switch (st.leftPaneTab) {
+            case kLeftPaneExplorer:
+                // Wave 3: the workspace file browser (file_explorer.cpp).
+                drawFileExplorerBody(st);
+                break;
 
-        case kLeftPaneSimulation:   // legacy programmatic target — render the same unified body
-        case kLeftPaneFeatureManager:
-        default:
-            // A live command form owns the tab body (the former standalone PropertyManager tab was
-            // merged in here as a duplicate). At rest, the feature tree + inline simulation section.
-            if (pmActive) {
-                pm->drawBody(st);
-            } else {
-                drawFeatureTreeBody(st, editCallback);
-                // Simulation studies now live IN the FeatureManager tree (no separate "Simulation
-                // Studies" tab). Show the study section when the part has studies or the Simulation
-                // workspace is active, so a Static/Modal/Flow study reads as an editable tree feature
-                // with Material/Fixtures/Loads/Mesh/Results subnodes + per-type setup forms.
-                if (st.simManager) {
-                    const bool simWs = st.showSimulationTools || st.ribbonTab == AppState::RT_Simulation;
-                    if (st.simManager->studyCount() > 0 || simWs) {
-                        ImGui::Dummy(ImVec2(0, 6.0f * S));
-                        ImGui::Separator();
-                        ImGui::PushFont(st.fonts.medium);
-                        ImGui::TextUnformatted("Simulation");
-                        ImGui::PopFont();
-                        st.simManager->drawTreeBody(st);
+            case kLeftPaneConfigurations:
+                // User chose the live ConfigurationManager (config_* RPCs) for this tab.
+                // ConfigPanel is owned by run_gui and borrowed via st.configPanel; drawEmbedded
+                // renders its contents without a Begin/End. Fall back to the at-rest
+                // single-config body if it's unset.
+                if (st.configPanel) st.configPanel->drawEmbedded(st);
+                else                drawConfigurationsBody(st);
+                break;
+
+            case kLeftPaneSimulation:   // legacy programmatic target — render the same unified body
+            case kLeftPaneFeatureManager:
+            default:
+                // A live command form owns the tab body (the former standalone PropertyManager
+                // tab was merged in here as a duplicate). At rest, the feature tree + inline
+                // simulation section.
+                if (pmActive) {
+                    pm->drawBody(st);
+                } else {
+                    drawFeatureTreeBody(st, editCallback);
+                    // Simulation studies now live IN the FeatureManager tree (no separate
+                    // "Simulation Studies" tab). Show the study section when the part has
+                    // studies or the Simulation workspace is active, so a Static/Modal/Flow
+                    // study reads as an editable tree feature with
+                    // Material/Fixtures/Loads/Mesh/Results subnodes + per-type setup forms.
+                    if (st.simManager) {
+                        const bool simWs = st.showSimulationTools ||
+                                           st.ribbonTab == AppState::RT_Simulation;
+                        if (st.simManager->studyCount() > 0 || simWs) {
+                            ImGui::Dummy(ImVec2(0, 6.0f * S));
+                            ImGui::Separator();
+                            ImGui::PushFont(st.fonts.medium);
+                            ImGui::TextUnformatted("Simulation");
+                            ImGui::PopFont();
+                            st.simManager->drawTreeBody(st);
+                        }
                     }
                 }
-            }
-            break;
-    }
-    s_bodyScrolled = ImGui::GetScrollMaxY() > 0.0f;   // remembered for next frame's indent balance
-    if (bodyIndented) ImGui::Unindent(sbSize);
-    ImGui::EndChild();
-    ImGui::PopStyleVar(2);   // WindowPadding + ScrollbarSize pushed before the body child
-    ImGui::PopStyleColor();  // ChildBg transparent
+                break;
+        }
+        s_bodyScrolled = ImGui::GetScrollMaxY() > 0.0f;   // remembered for next frame's indent balance
+        if (bodyIndented) ImGui::Unindent(sbSize);
+        ImGui::EndChild();
+        ImGui::PopStyleVar(2);   // WindowPadding + ScrollbarSize pushed before the body child
+        ImGui::PopStyleColor();  // ChildBg transparent
+    }  // s_anim.bodyVisible()
 
     ImGui::PopStyleColor();  // surf.textPrimary pushed after Begin (liquid glass v2)
     ImGui::End();

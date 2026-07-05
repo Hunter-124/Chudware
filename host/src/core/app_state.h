@@ -132,6 +132,12 @@ struct Settings {
     // Modeler prompt augmentation toward an editable parametric feature SEQUENCE (DeepCAD /
     // CAD-Coder-style design history) over a monolithic solid. Serialized "experimental.cad_sequence_mode".
     bool expCadSequenceMode = false;
+
+    // T-G21: vertical-collapse state of the pinned FeatureManager / Copilot glass columns — a
+    // collapsed column (rolled up to its header strip) stays collapsed across restarts. Serialized
+    // "fm_collapsed" / "copilot_collapsed".
+    bool fmCollapsed = false;
+    bool copilotCollapsed = false;
 };
 
 std::string appdataDir();

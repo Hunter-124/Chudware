@@ -195,8 +195,24 @@ def _plan_from_entities(entities: list[dict], process: str, it_grade: int,
 
     Returns a list of dimension-plan items:
     ``{entity_ref, dim_type, why_critical, suggested_value, default_tolerance,
-       needs_user_confirm, priority}``
+       needs_user_confirm, priority, hole_comp_mm}``
+
+    ``hole_comp_mm`` is the process-specific diameter compensation that must be added to
+    the nominal modeled diameter so the finished hole meets the nominal size.  FDM prints
+    shrink inward (hole_comp_mm=+0.20 → model the hole 0.20 mm larger); CNC has no comp.
+    This is sourced from ``process_profiles.PROFILES[process].hole_comp_mm``
+    (engine_oracle/dfm/process_profiles.py) — never invented.
     """
+    # Pull the hole compensation from the DFM profile (real values, never invented).
+    # get_profile() wraps the DFM fields under a "params" key; fall back to top-level
+    # for forward-compatibility.
+    try:
+        profile = get_profile(process)
+        params = profile.get("params") or profile  # nested or flat
+        hole_comp_mm: float = float(params.get("hole_comp_mm") or 0.0)
+    except Exception:
+        hole_comp_mm = 0.0
+
     items: list[dict] = []
     priority = 1
 
@@ -216,6 +232,7 @@ def _plan_from_entities(entities: list[dict], process: str, it_grade: int,
             "default_tolerance": _bilateral_tolerance(nom, it_grade),
             "needs_user_confirm": True,
             "priority": priority,
+            "hole_comp_mm": hole_comp_mm,
         })
         priority += 1
 
@@ -230,20 +247,24 @@ def _plan_from_entities(entities: list[dict], process: str, it_grade: int,
                 "default_tolerance": _bilateral_tolerance(nom2, it_grade),
                 "needs_user_confirm": False,
                 "priority": priority,
+                "hole_comp_mm": hole_comp_mm,
             })
             priority += 1
 
-        # Hole diameter dim for each bolt-pattern circle (mating → confirm)
+        # Hole diameter dim for each bolt-pattern circle (mating → confirm).
+        # suggested_value = nominal + hole_comp_mm (compensated model diameter).
         for circle in group:
             nom_d = _entity_nominal(circle) or nominal_fallback_mm
+            comp_d = round(nom_d + hole_comp_mm, 6) if nom_d is not None else None
             items.append({
                 "entity_ref": circle.get("id"),
                 "dim_type": "diameter",
                 "why_critical": "mating feature (bolt clearance hole diameter)",
-                "suggested_value": nom_d if nom_d else None,
+                "suggested_value": comp_d,
                 "default_tolerance": _bilateral_tolerance(nom_d, it_grade),
                 "needs_user_confirm": True,
                 "priority": priority,
+                "hole_comp_mm": hole_comp_mm,
             })
             priority += 1
 
@@ -255,14 +276,16 @@ def _plan_from_entities(entities: list[dict], process: str, it_grade: int,
             continue
         if _is_mating(e):
             nom = _entity_nominal(e) or nominal_fallback_mm
+            comp = round(nom + hole_comp_mm, 6) if nom is not None else None
             items.append({
                 "entity_ref": e.get("id"),
                 "dim_type": "diameter",
                 "why_critical": "mating feature — bore/shaft diameter drives fit class",
-                "suggested_value": nom if nom else None,
+                "suggested_value": comp,
                 "default_tolerance": _bilateral_tolerance(nom, it_grade),
                 "needs_user_confirm": True,
                 "priority": priority,
+                "hole_comp_mm": hole_comp_mm,
             })
             priority += 1
 
@@ -283,6 +306,7 @@ def _plan_from_entities(entities: list[dict], process: str, it_grade: int,
                 "default_tolerance": _bilateral_tolerance(nom, it_grade),
                 "needs_user_confirm": False,
                 "priority": priority,
+                "hole_comp_mm": hole_comp_mm,
             })
             priority += 1
 
@@ -317,6 +341,23 @@ def _make_fixture_sketch(num_holes: int = 4, bolt_spacing_mm: float = 40.0,
             "tags": [],
         })
     return entities
+
+
+def _make_bore_sketch(bore_dia_mm: float = 20.0) -> list[dict]:
+    """Return a minimal sketch fixture: one circle representing a bore/hole.
+
+    Used in process-differentiation tests (machined bore vs printed hole) to verify that
+    the dimension scheme produces different ``suggested_value`` and ``it_grade`` per process.
+    The bore diameter is nominal (what the designer wants); each process adds its own
+    hole_comp_mm on top when producing the modeled dimension.
+    """
+    return [{
+        "id": "bore1",
+        "type": "circle",
+        "geom": f"cx=0 cy=0 r={bore_dia_mm / 2:.1f}",
+        "construction": False,
+        "tags": ["bore"],
+    }]
 
 
 # ──────────────────────────────────────────────────── MCP registration ────────

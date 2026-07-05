@@ -1230,6 +1230,86 @@ def _describe_project_text(run: dict | None = None) -> str:
     return _dumps({"ok": True, "text": "\n".join(lines)})
 
 
+def sketch_health_text(d: dict) -> str:
+    """Render a ``doc_sketch_health`` result dict as plain English text for no-vision models.
+
+    Returns a multi-line string with four sections:
+      1. Closure: "CLOSED (N material regions)" or "OPEN: N dangling endpoints at: [handles]"
+      2. Remaining DOF in plain words (from dof_narration).
+      3. Conflicts and redundant constraints (if any).
+      4. Ordered relations-then-dimensions schedule.
+
+    T-DP7 DoD §4: this is the feedback channel that lets a no-vision local model SEE its work
+    and know what to do next.
+    """
+    lines: list[str] = []
+
+    # ── 1. Closure ───────────────────────────────────────────────────────────────
+    closure = d.get("closure") or {}
+    open_eps = closure.get("open_endpoints") or []
+    mat_regions = closure.get("material_regions")
+    if not open_eps:
+        region_txt = f" ({mat_regions} material region{'s' if mat_regions != 1 else ''})" \
+            if mat_regions is not None else ""
+        lines.append(f"Closure: CLOSED{region_txt}")
+    else:
+        handles_str = ", ".join(str(h) for h in open_eps[:8])
+        more = f" … and {len(open_eps) - 8} more" if len(open_eps) > 8 else ""
+        lines.append(f"Closure: OPEN — {len(open_eps)} dangling endpoint(s) at: "
+                     f"{handles_str}{more}")
+        lines.append("  → run sketch_auto_constrain to stitch near-touching endpoints")
+
+    # ── 2. DOF / free variables ──────────────────────────────────────────────────
+    dof = d.get("dof", 0)
+    status = d.get("status", "unknown")
+    narration = d.get("dof_narration") or ""
+    if dof <= 0 and status == "full":
+        lines.append("DOF: 0 — fully constrained, ready to extrude")
+    elif dof < 0 or status == "over":
+        lines.append(f"DOF: {dof} — OVER-CONSTRAINED (conflicting constraints, see below)")
+    else:
+        lines.append(f"DOF: {dof} free — {narration}")
+
+    # ── 3. Conflicts and redundants ──────────────────────────────────────────────
+    conflicting = d.get("conflicting") or []
+    redundant = d.get("redundant") or []
+    if conflicting:
+        lines.append(f"Conflicts ({len(conflicting)}):")
+        for c in conflicting:
+            lines.append(f"  CONFLICT {c.get('id','?')} ({c.get('type','?')})"
+                         f" — {c.get('suggestion','remove it')}")
+    if redundant:
+        lines.append(f"Redundant ({len(redundant)}):")
+        for r in redundant:
+            lines.append(f"  REDUNDANT {r.get('id','?')} ({r.get('type','?')})"
+                         f" — {r.get('suggestion','remove it')}")
+
+    # ── 4. Schedule ──────────────────────────────────────────────────────────────
+    schedule = d.get("schedule") or []
+    if schedule:
+        lines.append("Schedule (apply in order):")
+        for step in schedule:
+            order = step.get("order", "?")
+            kind = step.get("kind", "?")
+            action = step.get("action", "?")
+            why = step.get("why", "")
+            entity = step.get("entity", "")
+            handles = step.get("handles") or []
+            if handles:
+                h_str = ", ".join(str(h) for h in handles[:6])
+                more_h = f" … +{len(handles)-6}" if len(handles) > 6 else ""
+                lines.append(f"  {order}. [{kind}] {action}"
+                             f" at {h_str}{more_h} — {why}")
+            elif entity:
+                lines.append(f"  {order}. [{kind}] {action} for {entity} — {why}")
+            else:
+                lines.append(f"  {order}. [{kind}] {action} — {why}")
+    elif dof == 0 and status == "full":
+        lines.append("Schedule: (nothing to do — sketch is fully constrained)")
+
+    return "\n".join(lines)
+
+
 def register_gsl_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
@@ -1331,7 +1411,8 @@ def register_gsl_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def sketch_health(sketch: str, doc_id: Optional[str] = None) -> str:
+    def sketch_health(sketch: str, text: bool = False,
+                      doc_id: Optional[str] = None) -> str:
         """The single narrated read of a sketch's constraint state — solve it and get back WHY it
         is under/over-defined plus an ordered plan to reach fully-constrained.
 
@@ -1352,12 +1433,18 @@ def register_gsl_tools(mcp: FastMCP) -> None:
                         RELATIONS first, then DRIVING dimensions, mirroring how a person constrains.
           advisory      [aicad.advisory/1 items] — emittable straight to the advisor layer.
 
+        text: when True, also includes a "health_text" key with a plain-English multi-line
+          summary (closure status, DOF in words, conflicts/redundants, ordered schedule) —
+          the feedback channel for no-vision local models. See sketch_health_text().
+
         Sketch loop: edit -> sketch_health -> add the scheduled relations / run sketch_auto_constrain
         -> sketch_health again until status is "full".
         """
         try:
             d = _doc(doc_id)
             result = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
+            if text and result.get("ok"):
+                result["health_text"] = sketch_health_text(result)
             return _dumps(result)
         except Exception as e:  # noqa: BLE001
             return _err(e)

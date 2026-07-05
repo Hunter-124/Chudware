@@ -645,7 +645,9 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
                                              ? "/routing/routing_view_error.json"
                                              : "/routing/routing_view.json");
             const std::string json = readWholeFile(vf);
-            ui::openAgentSettingsPanel();
+            // Routing editor is inline in the Settings modal AI tab (consolidation).
+            ui::settingsUi().openSettings    = true;
+            ui::settingsUi().openSettingsTab = 1;  // "AI Models & Routing"
             ui::seedAgentSettingsFromViewJson(json);
             std::printf("agent_settings: seeded from %s (%zu bytes)\n", vf.c_str(), json.size());
         } else {

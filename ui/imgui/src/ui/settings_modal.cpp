@@ -17,6 +17,7 @@
 // immediately on toggle (no deferred Save button needed for those fields).
 #include "ui/settings_modal.h"
 #include "ui/ai_effort_section.h"   // T-W28: harness effort (Simple/Advanced)
+#include "ui/agent_settings_panel.h" // T-W17: per-role routing (inline in AI tab)
 #include "ui/model_picker.h"
 #include "ui/model_registry.h"
 
@@ -248,12 +249,11 @@ static void drawAiModelsTab(app::AppState& st, bool busy, AppSettings& s) {
                          ImGuiInputTextFlags_Password);
     }
 
-    // ---- Per-role routing link -----------------------------------------------
+    // ---- Per-role routing (T-W17, inline since settings consolidation) --------
     drawSettingsSectionHeader("Per-role model routing");
     dimText("Assign different models to different agent roles (modeler, reviewer, …).");
     ImGui::Dummy(ImVec2(0, 4.f * sc));
-    if (ImGui::Button("Open Agent Settings\xe2\x80\xa6", ImVec2(180.f * sc, 0)))
-        s_ui.wantAgentSettings = true;
+    drawAgentSettingsInline(st);
 
     // ---- Harness effort (T-W28) ------------------------------------------------
     drawAiEffortSection(st);

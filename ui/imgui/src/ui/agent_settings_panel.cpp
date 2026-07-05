@@ -32,8 +32,6 @@ namespace ui {
 
 namespace {
 
-bool gOpen = false;
-ui::PanelScaffoldState gScaffoldState;
 aicad::ui::AgentSettingsModel gModel;
 
 using aicad::ui::SettingsState;
@@ -317,27 +315,22 @@ void drawContent(app::AppState&) {
 
 // ---- Public API ------------------------------------------------------------
 
-void drawAgentSettingsPanel(app::AppState& s) {
-    ui::PanelScaffoldSpec spec;
-    spec.id    = "agent_settings";
-    spec.title = "Agent Settings";
-    spec.icon  = "settings";
-    spec.hasSearch = false;
-
-    // Lazily load from the CLI on first open when nothing has been seeded (a shot
+void drawAgentSettingsInline(app::AppState& s) {
+    // Lazily load from the CLI on first draw when nothing has been seeded (a shot
     // seeds before first draw, so this only fires in the live app).
     if (gModel.state == SettingsState::Idle) refreshFromCli();
 
-    gScaffoldState.statusText = !gModel.statusText.empty()
-        ? gModel.statusText
+    drawContent(s);
+
+    // Status line where the scaffold status bar used to be.
+    const char* txt = !gModel.statusText.empty()
+        ? gModel.statusText.c_str()
         : "Edits write routing.yaml through routing.py validation";
-    gScaffoldState.statusIsError = !gModel.validationError.empty();
-
-    ui::drawPanelScaffold(spec, gScaffoldState, [&]() { drawContent(s); });
+    ImGui::PushStyleColor(ImGuiCol_Text,
+                          !gModel.validationError.empty() ? TVEC(bad) : TVEC(txt2));
+    ImGui::TextWrapped("%s", txt);
+    ImGui::PopStyleColor();
 }
-
-void openAgentSettingsPanel() { gOpen = true; }
-bool* agentSettingsPanelOpen() { return &gOpen; }
 
 void seedAgentSettingsFromViewJson(const std::string& view_json) {
     try { applyViewJson(json::parse(view_json)); }

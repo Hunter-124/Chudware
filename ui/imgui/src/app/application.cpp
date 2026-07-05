@@ -26,7 +26,6 @@
 #include "ui/mission_control_panel.h"  // T-F17 mission-control (DAG run steering) panel
 #include "ui/agent_inspector_panel.h"  // T-W17 agent inspector (advisor observability)
 #include "ui/watch_grid_panel.h"       // T-W17 multi-viewport watch grid
-#include "ui/agent_settings_panel.h"   // T-W17 model-source + routing settings
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -411,18 +410,8 @@ void Application::frame() {
             ui::drawWatchGridPanel(s);
         ImGui::End();
     }
-    // T-W17 Agent Settings — model sources + per-role routing editor.
-    // Screenshot-verifiable via AI_CAD_SHOT=agent_settings[_error].
-    if (*ui::agentSettingsPanelOpen()) {
-        const ImGuiViewport* vps = ImGui::GetMainViewport();
-        ImGui::SetNextWindowPos(ImVec2(vps->WorkPos.x + vps->WorkSize.x * 0.5f,
-                                       vps->WorkPos.y + vps->WorkSize.y * 0.5f),
-                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-        ImGui::SetNextWindowSize(ImVec2(700.f * theme::S(), 720.f * theme::S()), ImGuiCond_Appearing);
-        if (ImGui::Begin("Agent Settings###agent_settings", ui::agentSettingsPanelOpen(), pflags))
-            ui::drawAgentSettingsPanel(s);
-        ImGui::End();
-    }
+    // T-W17 Agent Settings now renders inline in the Settings modal's AI tab
+    // (settings consolidation: the popup is the only settings surface).
 
     ImGui::PopStyleColor();
 
@@ -431,11 +420,6 @@ void Application::frame() {
     ui::maybeOpenFirstRun(s);
     ui::drawFirstRunDialog(s);
     ui::drawSettingsModal(s, false);
-    // T-G22: AI tab "Open Agent Settings" button sets wantAgentSettings; dispatch here.
-    if (ui::settingsUi().wantAgentSettings) {
-        ui::settingsUi().wantAgentSettings = false;
-        ui::openAgentSettingsPanel();
-    }
     ui::drawProfilerWindow(s);
     ui::drawCommandSearch(s);
     ui::drawToasts(s);

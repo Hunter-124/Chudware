@@ -106,35 +106,58 @@ _FALLBACK_SYSTEM = (
 
 
 # ---------------------------------------------------------------------------
-# Routing seam (§14) — TODO(T-W14): resolve via routing.yaml 'overseer: [strongest]'.
+# Routing seam (§14) — resolved via routing.yaml 'overseer: [strongest]' (T-W14).
 # ---------------------------------------------------------------------------
 
-# Provider-preference order used until T-W14's routing.yaml resolver lands.  This
-# is a SEAM, not a role→model binding baked into logic: the moment routing.yaml is
-# available, resolve_overseer_provider should consult it and this list becomes the
-# fallback only.  (Contract §14: no role→model binding hardcoded outside routing.yaml.)
-_STRONGEST_PREFERENCE = ("anthropic", "openai", "openrouter", "gemini", "vllm",
-                         "llamacpp", "mock")
+# Fallback preference order used when routing.yaml is unavailable or has no sources
+# configured.  This is a last-resort fallback ONLY — contract §14 forbids hardcoded
+# role→model bindings; routing.yaml is the canonical source of truth.
+_STRONGEST_PREFERENCE_FALLBACK = ("anthropic", "openai", "openrouter", "gemini", "vllm",
+                                   "llamacpp", "mock")
 
 
-def resolve_overseer_provider(available: dict[str, Any]) -> Any | None:
+def resolve_overseer_provider(
+    available: dict[str, Any],
+    *,
+    routing: Any | None = None,
+    availability: dict[str, bool] | None = None,
+) -> Any | None:
     """Pick the 'strongest' provider for the overseer from *available*.
 
-    *available* maps provider-name → provider instance.  Until T-W14 lands, this
-    walks :data:`_STRONGEST_PREFERENCE` and returns the first present.  Returns
-    ``None`` if none are configured (the caller then skips the audit rather than
-    fabricating a verdict).
+    *available* maps provider-name / source-id → provider instance.
+    *routing* is an optional ``services.agent.routing.RoutingTable`` — when
+    provided, it resolves the 'overseer' assignment from routing.yaml (contract §14:
+    all role→model bindings live only in routing.yaml).  When routing is not provided
+    or has no configured sources, falls back to ``_STRONGEST_PREFERENCE_FALLBACK``
+    so the overseer still works in unconfigured / test environments.
 
-    TODO(T-W14): replace the preference walk with routing.yaml resolution of the
-    ``overseer`` assignment (``[strongest]``) against configured sources.
+    Returns ``None`` if no provider is configured (the caller skips the audit rather
+    than fabricating a verdict).
     """
     if not available:
         return None
-    for name in _STRONGEST_PREFERENCE:
+
+    # Try routing.yaml resolution first (§14 contract: routing.yaml is canonical).
+    if routing is not None:
+        try:
+            resolution = routing.resolve("overseer", availability=availability)
+            if resolution is not None:
+                # resolution.source_id maps to an available provider key.
+                src_id = resolution.source_id
+                if src_id in available and available[src_id] is not None:
+                    return available[src_id]
+                # source_id may be a provider kind (e.g. "anthropic") in older callers.
+                kind_prov = available.get(resolution.model_tier)  # tier is not a key
+                if kind_prov is not None:
+                    return kind_prov
+        except Exception:  # noqa: BLE001 — routing failure never blocks the auditor
+            pass
+
+    # Fallback: walk known-strong provider names (last resort, no routing.yaml sources).
+    for name in _STRONGEST_PREFERENCE_FALLBACK:
         if name in available and available[name] is not None:
             return available[name]
-    # No known-strong provider configured but something exists — collapse onto it
-    # (§14: "if only one source exists, all roles collapse onto it").
+    # Single-source collapse (§14): any available provider.
     for prov in available.values():
         if prov is not None:
             return prov

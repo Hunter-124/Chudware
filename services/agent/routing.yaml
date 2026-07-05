@@ -1,0 +1,52 @@
+schema: aicad.routing/1
+# Model source registry — user-configured via the GUI settings (T-W17 builds the UI).
+# This is the ONLY place role→model bindings live. No hardcoded role→model choices
+# anywhere else in the codebase (contract §14, Hunter directive 2026-07-04).
+#
+# Tiers (capability ranking — data, not code):
+#   frontier  — large cloud models (Anthropic, OpenAI flagship)
+#   strong    — mid-tier cloud or large local (≥70B)
+#   cheap_local — small/fast local (≤14B, lmstudio/llamacpp/ollama)
+#
+# Availability: if the first-preference source is offline, the resolver falls
+# through to the next entry. If only one source is configured, all roles collapse
+# onto it and the delegation tree still functions.
+
+sources: []  # populated by the user via the settings GUI (T-W17)
+  # Example entries (uncomment and fill in):
+  # - id: anthropic_api
+  #   kind: anthropic
+  #   models:
+  #     - id: claude-sonnet-4-6
+  #       tier: frontier
+  #     - id: claude-haiku-4-5
+  #       tier: strong
+  # - id: local_lmstudio
+  #   kind: lmstudio
+  #   models:
+  #     - id: qwen3-4b
+  #       tier: cheap_local
+
+assignments:
+  # Role → ordered preference list. First available (source online, model present) wins.
+  # 'strongest'/'cheapest' resolve against configured sources at runtime using the
+  # tier ranking (frontier > strong > cheap_local). 'explicit:<source_id>/<model_id>'
+  # pins a specific source+model.
+  overseer:      [strongest]
+  orchestrator:  [strongest]
+  reviewer:      [strong]
+  fixer:         [strong]
+  sketcher:      [cheap_local, strong]
+  feature_modeler: [cheap_local, strong]
+  cam_programmer: [cheap_local, strong]
+  intake_analyst: [strong]
+  clarifier:     [strong]
+  spec_writer:   [cheap_local, strong]
+  assembler:     [cheap_local, strong]
+  department_manager: [strongest]
+  default:       [cheap_local, strong]
+
+approval_policy:
+  depth_1: auto       # depth-1 from the orchestrator: auto-approved
+  deeper: overseer    # deeper sub-agents: requires the mission overseer's approval
+  # ponder nodes are auto-approved at ANY depth (read-only + hard token budget)

@@ -44,3 +44,10 @@ status-bar element — low GUI collision, can start now.
 
 ## Progress log
 - 2026-07-05 21:12 UTC [sonnet-fenn1] Backend estimator complete (39/39 tests pass). Token costs: qwen3-4b micro_evals output tokens (480/953/249 per role shape). TPS: 475.86 agg N=8, 482 integrator smoke. Status-bar ETA chip + DagRunView/AppState fields wired. Gate running.
+- 2026-07-05 21:57 UTC [sonnet-fenn1] DoD complete. gate.sh PASS (ui/imgui build+shot+selftest PASS, pytest/tools PASS, FAIL-RECORDED pre-existing T-V2). 44 Python tests pass.
+
+Advisor-flagged blockers resolved:
+1. ETA emitter wired: _emit_eta_for_remaining() added to loop.py, called from run_mission (after INTAKE) and _drive_phases_from_dag (each phase entry). Dual-sink: on_event callback + EventJournal(run_id).emit() for events.jsonl path.
+2. Mirror ungated: syncMissionEtaToAppState() extracted as public function in mission_control_panel.cpp, called unconditionally every frame from application.cpp so status-bar ETA chip updates even when Mission Control panel is closed.
+
+Token costs from matrix.json micro_evals (real measured output tokens). TPS from T-W31 integrator smoke: 482 tok/s. ETA formula: remaining_tokens / effective_tps. Branch: task/T-DP18-time-estimator.

@@ -12,8 +12,10 @@
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepAlgoAPI_Splitter.hxx>
+#include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeSolid.hxx>
 #include <BRepBuilderAPI_Sewing.hxx>
+#include <BRepClass3d_SolidClassifier.hxx>
 #include <BRepFill.hxx>
 #include <BRepFill_Filling.hxx>
 #include <BRepGProp.hxx>
@@ -26,6 +28,7 @@
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepTools.hxx>
+#include <Geom_Plane.hxx>
 #include <Geom_Surface.hxx>
 #include <GeomAbs_Shape.hxx>
 #include <GProp_GProps.hxx>
@@ -43,6 +46,7 @@
 #include <TopoDS_Solid.hxx>
 #include <gp_Ax1.hxx>
 #include <gp_Dir.hxx>
+#include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
@@ -539,6 +543,60 @@ bool piece_has_face_at(const TopoDS_Shape& piece, const Eigen::Vector3d& c, doub
     }
     return false;
 }
+
+// Local-normal + UV-center of a face, orientation-aware (mirrors split_solid_by_surface's
+// ref_normal derivation via BRepGProp_Face, which flips for TopAbs_REVERSED).
+bool face_center_normal(const TopoDS_Face& f, gp_Pnt& center, gp_Vec& normal) {
+    Standard_Real u0, u1, v0, v1;
+    BRepTools::UVBounds(f, u0, u1, v0, v1);
+    double uc = u0 + 0.5 * (u1 - u0), vc = v0 + 0.5 * (v1 - v0);
+    BRepGProp_Face(f).Normal(uc, vc, center, normal);
+    if (normal.Magnitude() < 1e-12) return false;
+    normal.Normalize();
+    return true;
+}
+
+// Nudge `f` a hair along its own normal, choosing the sign that moves it INTO `solid`
+// (probed with BRepClass3d_SolidClassifier at `near_solid`, an actual point on the solid's
+// boundary — the tool face's OWN parametric center is no guide here, since an enlarged
+// replacement's natural center can sit well outside the solid's footprint). This is what
+// lets a replacement that is exactly coincident with the target face (the common "swap
+// this face for this patch" pick) still produce a genuine two-piece BOP split: the
+// discarded sliver is bounded by the untouched original target face (still matched via
+// target_centroids), so the kept piece's new boundary is the nudged replacement —
+// indistinguishable from the true replacement at any real tolerance as eps -> 0.
+TopoDS_Face nudge_toward_solid(const TopoDS_Face& f, const TopoDS_Shape& solid,
+                               const gp_Pnt& near_solid, double eps) {
+    gp_Pnt center; gp_Vec normal;
+    if (!face_center_normal(f, center, normal)) return f;
+    double probe = std::max(eps * 100.0, 1e-3);
+    BRepClass3d_SolidClassifier clf(solid);
+    clf.Perform(near_solid.Translated(normal.Multiplied(-probe)), 1e-6);
+    double sign = (clf.State() == TopAbs_IN) ? -1.0 : 1.0;
+    gp_Trsf trsf;
+    trsf.SetTranslation(normal.Multiplied(sign * eps));
+    BRepBuilderAPI_Transform xf(f, trsf, /*copy=*/true);
+    if (!xf.IsDone()) return f;
+    return TopoDS::Face(xf.Shape());
+}
+
+// Rebuild a planar face as a generously oversized cutting plane (sized from the solid's
+// bbox diagonal) at the same location/orientation, nudged into `solid` by `eps`. Handles a
+// replacement patch that is coincident but smaller than the target face's footprint, so its
+// finite trim wouldn't otherwise reach across the solid. Non-planar faces are left as-is
+// (`ok` reports false) — the existing as-is/nudge attempts already cover the general case.
+TopoDS_Face enlarge_planar_face(const TopoDS_Face& f, double diag, double eps, bool& ok) {
+    ok = false;
+    Handle(Geom_Surface) surf = BRep_Tool::Surface(f);
+    Handle(Geom_Plane) pln = Handle(Geom_Plane)::DownCast(surf);
+    if (pln.IsNull()) return f;
+    gp_Pln plane = pln->Pln();
+    double half = std::max(diag * 4.0, 1.0);
+    BRepBuilderAPI_MakeFace mf(plane, -half, half, -half, half);
+    if (!mf.IsDone()) return f;
+    ok = true;
+    return TopoDS::Face(mf.Face());
+}
 }  // namespace
 
 TopoDS_Shape surf_replace_face_solid(const TopoDS_Shape& solid,
@@ -546,46 +604,95 @@ TopoDS_Shape surf_replace_face_solid(const TopoDS_Shape& solid,
                                      const TopoDS_Shape& surface, double diag) {
     if (solid.IsNull() || surface.IsNull()) return {};
 
-    // BOP-split the solid by the replacement surface's faces.
-    TopTools_ListOfShape args, tools;
-    args.Append(solid);
+    std::vector<TopoDS_Face> tool_faces;
     {
         TopTools_IndexedMapOfShape fm;
         TopExp::MapShapes(surface, TopAbs_FACE, fm);
-        for (int i = 1; i <= fm.Extent(); ++i) tools.Append(fm.FindKey(i));
+        for (int i = 1; i <= fm.Extent(); ++i) tool_faces.push_back(TopoDS::Face(fm.FindKey(i)));
     }
-    BRepAlgoAPI_Splitter splitter;
-    splitter.SetArguments(args);
-    splitter.SetTools(tools);
-    splitter.Build();
-    if (!splitter.IsDone()) return {};
-
-    std::vector<TopoDS_Solid> pieces;
-    for (TopExp_Explorer ex(splitter.Shape(), TopAbs_SOLID); ex.More(); ex.Next()) {
-        TopoDS_Solid sw = TopoDS::Solid(ex.Current());
-        if (solid_volume(sw) > 1e-9) pieces.push_back(sw);
-    }
-    if (pieces.size() < 2) return {};
+    if (tool_faces.empty()) return {};
 
     double tol = std::max(diag * 1e-4, 1e-4);
-    std::vector<TopoDS_Solid> retained;
-    for (const TopoDS_Solid& p : pieces) {
-        bool carries = false;
-        for (const Eigen::Vector3d& c : target_centroids)
-            if (piece_has_face_at(p, c, tol)) { carries = true; break; }
-        if (!carries) retained.push_back(p);
+
+    // BOP-split `solid` by `tools_in`, keep the piece(s) that do NOT carry a face at
+    // target_centroids, fuse them into one solid. Empty when the split doesn't yield >=2
+    // positive-volume pieces (the tool didn't actually divide the solid).
+    auto try_split = [&](const std::vector<TopoDS_Face>& tools_in) -> TopoDS_Shape {
+        TopTools_ListOfShape args, tools;
+        args.Append(solid);
+        for (const auto& f : tools_in) tools.Append(f);
+        BRepAlgoAPI_Splitter splitter;
+        splitter.SetArguments(args);
+        splitter.SetTools(tools);
+        splitter.Build();
+        if (!splitter.IsDone()) return {};
+
+        std::vector<TopoDS_Solid> pieces;
+        for (TopExp_Explorer ex(splitter.Shape(), TopAbs_SOLID); ex.More(); ex.Next()) {
+            TopoDS_Solid sw = TopoDS::Solid(ex.Current());
+            if (solid_volume(sw) > 1e-9) pieces.push_back(sw);
+        }
+        if (pieces.size() < 2) return {};
+
+        std::vector<TopoDS_Solid> retained;
+        for (const TopoDS_Solid& p : pieces) {
+            bool carries = false;
+            for (const Eigen::Vector3d& c : target_centroids)
+                if (piece_has_face_at(p, c, tol)) { carries = true; break; }
+            if (!carries) retained.push_back(p);
+        }
+        if (retained.empty()) {
+            // Degenerate: keep the largest piece.
+            TopoDS_Solid best = pieces.front();
+            double bv = solid_volume(best);
+            for (const auto& p : pieces) { double v = solid_volume(p); if (v > bv) { bv = v; best = p; } }
+            retained.push_back(best);
+        }
+        TopoDS_Shape fused = retained.front();
+        for (size_t i = 1; i < retained.size(); ++i) fused = ::geom::fuse(fused, retained[i]);
+        if (fused.IsNull() || solid_volume(fused) <= 1e-9) return {};
+        return fused;
+    };
+
+    // 1) As-is: the replacement may already cut clean through the solid (the existing,
+    //    working case — a replacement whose extent genuinely crosses the target region).
+    TopoDS_Shape result = try_split(tool_faces);
+    if (!result.IsNull()) return result;
+
+    // 2) Coincident/near-coincident replacement: nudge each tool face a hair into the solid
+    //    along its own normal so the BOP sees genuine material on both sides. Probe near a
+    //    target centroid (a real point on the solid's boundary), not the tool face's own
+    //    parametric center — an enlarged/oversized replacement's center can sit well outside
+    //    the solid's footprint.
+    if (target_centroids.empty()) return {};
+    const Eigen::Vector3d& tc = target_centroids.front();
+    gp_Pnt near_solid(tc.x(), tc.y(), tc.z());
+    double eps = std::max(diag * 1e-6, 1e-6);
+    std::vector<TopoDS_Face> nudged;
+    nudged.reserve(tool_faces.size());
+    for (const auto& f : tool_faces) nudged.push_back(nudge_toward_solid(f, solid, near_solid, eps));
+    result = try_split(nudged);
+    if (!result.IsNull()) return result;
+
+    // 3) Coincident but smaller than the target footprint (its finite trim doesn't reach
+    //    across the solid): enlarge planar replacements into a generously sized cutting
+    //    plane, nudged the same way, before retrying.
+    bool any_enlarged = false;
+    std::vector<TopoDS_Face> enlarged;
+    enlarged.reserve(tool_faces.size());
+    for (size_t i = 0; i < tool_faces.size(); ++i) {
+        bool ok = false;
+        TopoDS_Face big = enlarge_planar_face(tool_faces[i], diag, eps, ok);
+        if (ok) { big = nudge_toward_solid(big, solid, near_solid, eps); any_enlarged = true; }
+        else { big = nudged[i]; }
+        enlarged.push_back(big);
     }
-    if (retained.empty()) {
-        // Degenerate: keep the largest piece.
-        TopoDS_Solid best = pieces.front();
-        double bv = solid_volume(best);
-        for (const auto& p : pieces) { double v = solid_volume(p); if (v > bv) { bv = v; best = p; } }
-        retained.push_back(best);
+    if (any_enlarged) {
+        result = try_split(enlarged);
+        if (!result.IsNull()) return result;
     }
-    TopoDS_Shape fused = retained.front();
-    for (size_t i = 1; i < retained.size(); ++i) fused = ::geom::fuse(fused, retained[i]);
-    if (fused.IsNull() || solid_volume(fused) <= 1e-9) return {};
-    return fused;
+
+    return {};
 }
 
 // --------------------------------------------------------------------------- surf_thicken

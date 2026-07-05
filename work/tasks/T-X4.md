@@ -65,14 +65,14 @@ contract already states for `web_search`/`fetch_page`.
 
 ## Definition of done
 
-- [ ] `research_datasheet_fetch` falls back to an authenticated browser fetch
+- [x] `research_datasheet_fetch` falls back to an authenticated browser fetch
       only on 403/paywall AND an existing matching profile; otherwise behavior
       is byte-identical to before this task
-- [ ] Envelope stays contract-compliant; `session_profile_used` is additive,
+- [x] Envelope stays contract-compliant; `session_profile_used` is additive,
       documented in `contracts/research_tools.md`
-- [ ] No login is ever triggered automatically from this path — missing
+- [x] No login is ever triggered automatically from this path — missing
       profile just degrades as today
-- [ ] Tests cover all three cases; existing `test_research.py` suite still
+- [x] Tests cover all three cases; existing `test_research.py` suite still
       passes unchanged
 
 ## AI hints
@@ -84,3 +84,8 @@ contract already states for `web_search`/`fetch_page`.
 
 ## Progress log
 - 2026-07-05 19:15 UTC [sonnet-drift] Implemented: on a plain-fetch 401/403, datasheet_fetch() retries once via T-X1/T-X2's browser_download under a saved profile keyed by the URL's host (services/browser/profiles.has_profile) -- no profile means unchanged degradation, no login ever auto-triggered. Envelope gains additive session_profile_used (null unless the fallback served the bytes). contracts/research_tools.md gets a new append-only §9. 3 new tests (plain-success/never-invokes-fallback, 403-with-profile/succeeds, 403-no-profile/unchanged + asserts browser_download never called). Full engine_oracle+services regression sweep: 14 failed/44 errors, identical to the confirmed pre-existing baseline (ECAD/CFD/agent-provider, unrelated) -- zero new regressions, 2173 passed. Pushed task/T-X4-datasheet-browser-fallback, ready to merge alongside T-X1/T-X2/T-X3 (already merged+done). Earlier hit a transient local-checkout hazard (unpushed T-W17 merge commits on master) that blocked this status update -- resolved on its own, no action needed now.
+- 2026-07-05 [opus-sweep] Merge-integrator: clean merge (no conflicts) into master. Verified on
+  Windows: `pytest engine_oracle/research/test_source_helpers.py` 33/33 pass; full
+  `engine_oracle/research/` suite 171/172 (1 pre-existing unrelated failure,
+  test_knowledge_root_env_override — hardcoded `/tmp/...` literal vs WindowsPath backslash
+  normalization, nothing to do with this task's diff). Merged --no-ff, status -> done.

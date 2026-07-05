@@ -1858,6 +1858,8 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 break;
         }
         if (saStep <= 3) ++saStep;
+    }
+
     // ---------- sketch_convert (T-BL43 Convert Entities: external face loop -> in-sketch) ----
     // Builds a 40x40x20 box, opens an EMPTY sketch on its top face, then fires the exact
     // `sketch_convert` op the GUI Convert tool emits (host + ui/imgui applyConvertRef) with
@@ -2539,6 +2541,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppSt
         }
         if (win) glfwSwapBuffers(win);
         return cfg.sketchAutohideShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
     if (cfg.wantSketchConvert) {
         if (!scvCapture.empty()) { mirrorLast(scvCapture, "sketch_convert_01_insketch"); scvCapture.clear(); }
         if (win) glfwSwapBuffers(win);

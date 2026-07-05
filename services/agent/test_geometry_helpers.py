@@ -57,6 +57,16 @@ class TestRegistryShape(unittest.TestCase):
             self.assertTrue(b.tools, f"{kind}: no helper tools")
             self.assertIn(b.resolver, gh._RESOLVERS, f"{kind}: resolver unregistered")
 
+    def test_every_kind_trigger_id_is_a_real_trigger(self):
+        # "trigger-bound" (DoD): each binding's trigger_id must resolve to a real
+        # entry in the loaded aicad.trigger/1 table — not a typo.
+        from services.agent.advisor.triggers import load_table
+        ids = {t["id"] for t in load_table()}
+        for kind in gh.known_kinds():
+            b = gh.binding_for(kind)
+            self.assertIn(b.trigger_id, ids,
+                          f"{kind}: trigger_id {b.trigger_id!r} not in trigger table")
+
     def test_aliases_resolve(self):
         for alias, canon in (("bore", "mating_bore"), ("boss", "threaded_hole"),
                              ("wall", "thin_wall"), ("bend", "sheet_bend"),

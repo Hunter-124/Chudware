@@ -52,6 +52,20 @@ MANUAL PRIMITIVES (when the one-call path is not enough)
                                        a moved copy scores low, by design.
   convert_face_to_sketch(face, ...)    "convert entities": trace one planar face's wires into
                                        an editable sketch ON that face, then extrude/cut it.
+                                       Creates a NEW sketch positioned on the face's own plane.
+  project_into_sketch(sketch, refs)    "convert entities" INTO AN EXISTING sketch — appends
+                                       projected geometry (lines/arcs/circles/ellipses) to a
+                                       sketch you are already building, mirroring SolidWorks
+                                       Convert Entities workflow.  Distinct from
+                                       convert_face_to_sketch (which makes a new sketch).
+                                       refs: a datum string ("front"/"top"/"right"), a face sid
+                                       ("Fdb31d2"), a side word ("top" for the top face — note
+                                       "front"/"top"/"right" resolve to DATUM PLANES not faces),
+                                       an edge sid ("E4a7c9"), or a ref dict; or a list of any
+                                       mix.  A face ref projects ALL its boundary wires.  Each
+                                       entity is pinned with a fix relation.  ONE-SHOT: converted
+                                       geometry does NOT update when the source model changes.
+                                       Use construction=True for reference-only geometry.
   describe_part()/hover(sid)           read the imported geometry as text (cad_guide("gsl")).
 
 WORKFLOW FOR THE RESIDUAL

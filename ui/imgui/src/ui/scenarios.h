@@ -82,6 +82,8 @@ struct ShotConfig {
     bool sketchDispatchShotDone = false;
     bool wantSketchAutohide = false;   // T-BL41: dim/relation annotations hidden unless SmartDim armed
     bool sketchAutohideShotDone = false;
+    bool wantSketchConvert = false;         // T-BL43: Convert Entities in-sketch shot
+    bool sketchConvertShotDone = false;
     bool wantAsm = false;
     bool asmShotDone = false;
     bool wantFea = false;
@@ -110,8 +112,9 @@ struct ShotConfig {
     int  glassperfFrame = 0;
 
     bool isScenarioMode() const {
-        return wantM1 || wantSketch || wantSketchDispatch || wantSketchAutohide || wantAsm || wantFea
-            || wantFlow || wantCam || wantDrawing || wantEvalMass || wantActivity || wantMultidoc;
+        return wantM1 || wantSketch || wantSketchDispatch || wantSketchAutohide || wantSketchConvert
+            || wantAsm || wantFea || wantFlow || wantCam || wantDrawing || wantEvalMass
+            || wantActivity || wantMultidoc;
     }
 
     // Frame budget for the generic capture path (flow allows ~240 s at 60 Hz).
@@ -167,6 +170,11 @@ private:
     std::string saSavePath, saFid, saL0, saL1, saL2, saL3;
     bool saDirReady = false;
     std::string sketchAutohideCapture;
+    // sketch_convert (T-BL43)
+    int scvStep = 0, scvSettle = 0;
+    std::string scvSavePath, scvFid;
+    bool scvDirReady = false;
+    std::string scvCapture;
 
     // asm
     int asmStep = 0, asmSettle = 0;

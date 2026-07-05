@@ -306,6 +306,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantSketch = eq("sketch");
     cfg.wantSketchDispatch = eq("sketch_dispatch");  // T-BL48 proof: dispatch→drain→active_
     cfg.wantSketchAutohide = eq("sketch_autohide");  // T-BL41 proof: annotations hidden unless SmartDim
+    cfg.wantSketchConvert = eq("sketch_convert");   // T-BL43 Convert Entities in-sketch shot
     cfg.wantFea = eq("fea");
     cfg.wantCam = eq("cam");
     cfg.wantFlow = eq("flow");
@@ -345,7 +346,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
         st.workspace = cmd::Workspace::Model;
         ribbon::applyShotEnv(st);
     }
-    if (cfg.wantSketch) {
+    if (cfg.wantSketch || cfg.wantSketchConvert) {
         st.inSketch = true;
         st.workspace = cmd::Workspace::Sketch;
         ribbon::applyShotEnv(st);
@@ -1826,6 +1827,91 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
                 break;
         }
         if (saStep <= 3) ++saStep;
+    // ---------- sketch_convert (T-BL43 Convert Entities: external face loop -> in-sketch) ----
+    // Builds a 40x40x20 box, opens an EMPTY sketch on its top face, then fires the exact
+    // `sketch_convert` op the GUI Convert tool emits (host + ui/imgui applyConvertRef) with
+    // the BOTTOM face as the external ref — the projected loop (4 real, fix-pinned lines)
+    // renders in the open sketch and is captured. NOT part of the gui_parity `sketch` diff
+    // set (the host scenario has no convert step). Light vs dark: the --light CLI flag.
+    if (cfg.wantSketchConvert && st.workerStarted && !cfg.sketchConvertShotDone &&
+        cfg.frame >= 5) {
+        if (!scvDirReady) {
+            scvDirReady = true;
+            scvSavePath = repoBase() + "/scratch/sketch_convert_shots";
+            std::error_code ec; std::filesystem::create_directories(scvSavePath, ec);
+        }
+        const int kSettle = 4;
+        if (scvSettle > 0) { --scvSettle; return; }
+        if (!scvCapture.empty()) return;
+        std::string err;
+        switch (scvStep) {
+            case 0: {  // box -> empty sketch ON its top face -> sketch_convert(bottom) -> enter
+                if (!st.docMirror.newPart(st.worker, err)) {
+                    std::printf("sketch_convert: new_part FAILED: %s\n", err.c_str());
+                    std::fflush(stdout);
+                    cfg.sketchConvertShotDone = true; break;
+                }
+                st.addDocTab(false);
+                nlohmann::json ents = nlohmann::json::array({
+                    {{"id","e1"},{"type","line"},{"construction",false},{"p1",{0.0,0.0}},{"p2",{40.0,0.0}}},
+                    {{"id","e2"},{"type","line"},{"construction",false},{"p1",{40.0,0.0}},{"p2",{40.0,40.0}}},
+                    {{"id","e3"},{"type","line"},{"construction",false},{"p1",{40.0,40.0}},{"p2",{0.0,40.0}}},
+                    {{"id","e4"},{"type","line"},{"construction",false},{"p1",{0.0,40.0}},{"p2",{0.0,0.0}}}});
+                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op","add_feature"},{"feature",{{"type","sketch"},{"name","Base"},
+                        {"refs",{{"plane","plane.top"}}},
+                        {"params",{{"entities",ents},{"constraints",nlohmann::json::array()}}}}}},
+                    {{"op","add_feature"},{"feature",{{"type","extrude"},{"name","Box"},
+                        {"params",{{"mode","boss"},{"end","blind"},
+                                   {"depth",{{"value",20.0},{"expr",nullptr}}}}},
+                        {"refs",{{"profile",nlohmann::json::array({{{"kind","region"},
+                            {"sketch","$0"},{"centroid",{20.0,20.0}},{"hint_index",0}}})}}}}}}}));
+                if (!r.ok) {
+                    std::printf("sketch_convert: box build FAILED\n"); std::fflush(stdout);
+                    cfg.sketchConvertShotDone = true; break;
+                }
+                loadMesh(st, r.aicm_path);
+                // Resolver-owned selectors: top face = the sketch plane, bottom face = the
+                // EXTERNAL reference Convert Entities projects.
+                nlohmann::json qt, qb;
+                st.worker.call("doc_query", {{"doc_id",st.docMirror.docId()},
+                    {"query",{{"of","face"},{"side","top"}}}}, qt, err);
+                st.worker.call("doc_query", {{"doc_id",st.docMirror.docId()},
+                    {"query",{{"of","face"},{"side","bottom"}}}}, qb, err);
+                if (!qt.contains("matches") || qt["matches"].empty() ||
+                    !qb.contains("matches") || qb["matches"].empty()) {
+                    std::printf("sketch_convert: face query FAILED\n"); std::fflush(stdout);
+                    cfg.sketchConvertShotDone = true; break;
+                }
+                auto r2 = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op","add_feature"},{"feature",{{"type","sketch"},{"name","SkTop"},
+                        {"refs",{{"plane",qt["matches"][0]}}},
+                        {"params",{{"entities",nlohmann::json::array()},
+                                   {"constraints",nlohmann::json::array()}}}}}}}));
+                scvFid = (r2.id_map.is_object() && r2.id_map.contains("$0"))
+                         ? r2.id_map["$0"].get<std::string>() : "f3";
+                // THE op the Convert Entities tool emits — T-BL43 implemented it in the engine.
+                auto r3 = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                    {{"op","sketch_convert"},{"sketch",scvFid},
+                     {"refs",nlohmann::json::array({{{"kind","face"},
+                                                     {"selector",qb["matches"][0]}}})}}}));
+                std::printf("sketch_convert: convert op %s (sketch=%s)\n",
+                            r3.ok ? "OK" : "FAILED", scvFid.c_str());
+                nlohmann::json eres;
+                st.worker.call("sketch_enter",
+                    {{"doc_id", st.docMirror.docId()}, {"sketch", scvFid}}, eres, err);
+                st.inSketch = true;
+                std::fflush(stdout);
+                scvCapture = scvSavePath + "/sketch_convert_01_insketch.png";
+                scvSettle = kSettle;
+                break;
+            }
+            default:
+                cfg.sketchConvertShotDone = true;
+                std::printf("sketch_convert: scenario complete\n");
+                break;
+        }
+        if (scvStep < 1) ++scvStep;
     }
 
     // ---------- fea (host-parity SimManager study flow) ----------
@@ -2422,6 +2508,10 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppSt
         }
         if (win) glfwSwapBuffers(win);
         return cfg.sketchAutohideShotDone ? FrameAction::Break : FrameAction::Continue;
+    if (cfg.wantSketchConvert) {
+        if (!scvCapture.empty()) { mirrorLast(scvCapture, "sketch_convert_01_insketch"); scvCapture.clear(); }
+        if (win) glfwSwapBuffers(win);
+        return cfg.sketchConvertShotDone ? FrameAction::Break : FrameAction::Continue;
     }
     if (cfg.wantAsm) {
         if (!asmCapture.empty() && !st.rpc.busy()) { mirrorLast(asmCapture, "asm_01_seated"); asmCapture.clear(); }

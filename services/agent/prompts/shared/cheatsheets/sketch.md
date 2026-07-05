@@ -35,3 +35,23 @@ Example C - a NACA 2412 wing section (then EXTRUDE it for a wing):
 1. A sketch ALONE makes no solid - it must be extruded/cut/revolved/lofted in a LATER step. Do not expect volume yet.
 2. Plane MUST be "plane.top"/"plane.front"/"plane.right" (a string), never "XY" or an object. Entity coords are 2D ([x,y]), never 3D.
 3. No "rect" entity - a rectangle is 4 `line` entities; a round hole/post is a `circle`; a curved profile is a `spline`.
+
+PROJECTING EXISTING GEOMETRY INTO A SKETCH ("Convert Entities"):
+Use project_into_sketch(sketch, refs) to append edges/faces from the surrounding solid into an
+existing sketch. This is the MCP equivalent of SolidWorks "Convert Entities" — it does NOT create
+a new sketch (for that, use convert_face_to_sketch).
+
+  refs accepts: a datum string ("front"/"top"/"right" → datum plane intersection line), a face sid
+  ("F…" from describe_part), a side word ("bottom" etc.; note "front"/"top"/"right" are datums
+  first), an edge sid ("E…"), a ref dict {"kind":"face","selector":{"sid":"…"}}, or a list of any mix.
+
+  A face ref projects ALL its boundary wires (outer + hole loops) as entities. Oblique circles
+  become ellipses. Each projected entity is pinned with a fix relation.
+
+  ONE-SHOT (non-associative): converted entities do NOT update when the source model changes.
+  Pass construction=True for blue reference-only geometry (excluded from extrude regions).
+
+  Example — project the top face's outline into an existing sketch "s2":
+  project_into_sketch("s2", "Fdb31d2")   # face sid from describe_part
+
+  The underlying doc op is sketch_convert (see ops_cheatsheet for the raw op shape).

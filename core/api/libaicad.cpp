@@ -2683,6 +2683,12 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                 params.value("sketch", std::string()),
                                 params.contains("ref") ? params["ref"] : json(nullptr)),
                             out_json, 0);
+            if (m == "sketch_project_entities")
+                return emit(aicad::doc::doc_sketch_project_entities(
+                                params.value("doc_id", std::string()),
+                                params.value("sketch", std::string()),
+                                params.contains("refs") ? params["refs"] : json::array()),
+                            out_json, 0);
             if (m == "weld_cut_list")
                 return emit(aicad::doc::doc_weld_cut_list(
                                 params.value("doc_id", std::string())),

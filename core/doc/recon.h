@@ -5,9 +5,14 @@
 // independently testable, no knowledge of the document/feature-tree contract.
 #pragma once
 
+#include <vector>
+
 #include <nlohmann/json.hpp>
+#include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+
+#include "geom/plane.h"  // aicad::geom::SketchPlane — projection target frame
 
 namespace aicad::doc {
 
@@ -56,5 +61,30 @@ nlohmann::json compare_shapes(const TopoDS_Shape& a, const TopoDS_Shape& b);
 // plane_frame), entities:[...], wires:[{outer:bool, entity_ids:[...]}], approx:bool}.
 // Throws OpError("invalid_op", ...) if `face` is not planar.
 nlohmann::json face_wires(const TopoDS_Face& face);
+
+// C3 — "Convert Entities" / external-reference projection (T-BL43). Project arbitrary external
+// model edges ORTHOGRAPHICALLY onto a TARGET sketch plane (drop along the plane normal), then
+// classify the projected 2D image as doc-schema §3.1 sketch entities. Unlike face_wires (which
+// converts a face's OWN in-plane boundary), the source edges here can sit on ANY plane relative
+// to the sketch — projection-first-then-classify makes the result correct by construction:
+//   * a line stays a "line";
+//   * a circle whose axis is parallel to the sketch normal stays a "circle"/"arc";
+//   * a TILTED circle projects to an ellipse -> "ellipse"/"ellipse_arc" (this is the specific
+//     Convert-Entities correctness fix — the naive "reuse the source circle's radius" path
+//     produced wrong geometry);
+//   * BSpline/Bezier/offset curves fall through to a sampled 24-seg polyline (approx);
+//   * an edge (near) perpendicular to the sketch plane collapses to a single "point".
+// Every emitted entity carries construction:true (reference geometry — solves/constrains other
+// sketch entities but does not itself bound a region). `any_approx` is set if any edge sampled.
+struct ProjectedEntity {
+    nlohmann::json entity;  // doc-schema §3.1 entity WITHOUT an id (caller assigns on insert)
+};
+std::vector<ProjectedEntity> project_edges_to_plane(const std::vector<TopoDS_Edge>& edges,
+                                                    const aicad::geom::SketchPlane& plane,
+                                                    bool& any_approx);
+
+// All boundary edges of a face (every wire, outer + holes) — the edge set "Convert Entities on
+// a whole face" projects. Order follows OCCT's TopExp_Explorer edge traversal.
+std::vector<TopoDS_Edge> face_boundary_edges(const TopoDS_Face& face);
 
 }  // namespace aicad::doc

@@ -7,21 +7,33 @@ machined_fraction >= 0.90` (`TARGET_FRACTION` in `tools/flywheel/bench/benches/c
 
 ## Substrate ruling (work/questions/T-H8.md Q1)
 
-The T-H4 verifier battery (`services/verify/battery.py`) is a thin dispatcher: its generic
-`_extract_score` only recognizes the scalar keys `match_pct/score/min_fos/cd/
-max_von_mises_mpa/coverage_ratio`. `cam_simulate`'s real result fields —
-`machined_fraction` (0..1) and `gouges` (int count) — are not in that list, so scoring
-`cam_simulate` only through the battery silently degrades to a bare pass/fail `ok` and
-discards exactly the two numbers this bench needs.
+The T-H4 verifier battery (`services/verify/battery.py`) is a thin dispatcher whose
+`_extract_score` (reward_shape `"scalar"`) walks a priority key list and scores the first
+key it finds in the result JSON. The full scalar key list (in priority order) is:
+`match_pct`, `score`, `min_fos`, `cd`, `max_von_mises_mpa`, `coverage_ratio`,
+`machined_fraction`. Scoring rules:
 
-**Ruling (proceeding, non-blocking):** this bench reads `cam_simulate`'s **raw** result
-directly — `sim["results"][i]` with fields `{ok, error, removed_volume_mm3,
-remaining_volume_mm3, stock_volume_mm3, machined_fraction, cycle_time_s, gouges,
-max_gouge_mm, rapid_collisions, warnings}` — and separately records the battery's own
-`cam_simulate` check score (a bare 0/1) alongside as the through-battery signal
-(`detail["battery_cam_simulate"]`, live mode only). `services/verify/battery.py` is **not
-modified** by this bench; extending `_extract_score` to understand CAM's scalar fields is
-a T-H4 follow-up, filed but out of scope here.
+| Key | Transform | Notes |
+|---|---|---|
+| `match_pct` | `min(val / 100.0, 1.0)` | Volumetric match percentage from `eval_compare` |
+| `score` | raw 0..1 | Generic scalar score |
+| `min_fos` | `min(val / 2.0, 1.0)` | Factor of safety; FoS ≥ 2 → 1.0 |
+| `cd` | raw 0..1 | Drag coefficient (CFD) |
+| `max_von_mises_mpa` | 1.0 if `ok` else 0.0 | FEA stress pass/fail |
+| `coverage_ratio` | raw 0..1 | Area coverage fraction |
+| `machined_fraction` | raw 0..1 | Fraction of stock volume removed by toolpaths (from `cam_simulate`) |
+
+**CAM gouge pre-gate (T-BL23, landed 2026-07-03):** before the key loop, `_extract_score`
+checks `gouges` in the result. If `gouges > 0`, score is forced to `0.0` regardless of
+`machined_fraction` — a gouge is a hard fail. `gouges` counts voxel cells cut below the
+part surface by more than `gouge_tol = 0.05 mm` (`core/cam/stock_sim.h`). Only `gouges`
+is a hard gate; `rapid_collisions` (rapid moves through stock) is surfaced as a finding
+but does NOT force the score to zero.
+
+**Historical note:** at the time of T-H8 Q1 (pre-T-BL23), `_extract_score` did not
+recognize `machined_fraction` or check `gouges`, so this bench read `cam_simulate` raw.
+T-BL23 added both keys to the battery; the bench now goes through the standard battery
+path for `cam_simulate` checks.
 
 ## Dataset
 

@@ -2,8 +2,8 @@
 id: T-BL42
 title: Feature tree — extrude/revolve/sweep/loft absorb their sketches/references as hidden children; eye-toggle to show+highlight; sketches stay reusable
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-gorm
+status: review
 priority: 2
 lane: app-gui
 kind: overhaul
@@ -56,3 +56,4 @@ Manager and are **auto-hidden** in the viewport until the user clicks the eye ic
 - Related: T-BL37 (origin ref), T-BL41 (sketch dim auto-hide), T-BL43 (external refs).
 
 ## Progress log
+- 2026-07-04 17:00 UTC [sonnet-gorm] Core nesting was already shipped in master (C37/C48/C48b). This branch adds the remaining DoD gap: eye-toggle un-hide on absorbed sketch now selects+highlights it (tree selection card + selectFeatureInViewport). Both ui/imgui and host feature_tree.cpp patched identically. Verified: AI_CAD_SHOT=sketch scenario completes with Boss-Extrude1/Sketch1 nesting in dark+light mode screenshots; extrudetest OK. Branch: task/T-BL42-feature-sketch-absorption. Shared-sketch placement decision: nests under first (only) consumer; stays flat when shared by 2+ features or when consumer is rolled-back/errored.

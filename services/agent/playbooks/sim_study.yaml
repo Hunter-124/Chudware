@@ -1,0 +1,53 @@
+schema: aicad.playbook/1
+id: sim_study
+stage: sim
+# Owning role: sim_engineer. Helper tools ⊆ sim_engineer.tool_allowlist.
+steps:
+  - id: setup_material
+    goal: read the criterion being proved and set the material from the registry (never typed by hand)
+    helper_tools: [ledger_get, set_material, research_material_lookup]
+    checklist:
+      - AC id, load case, and pass rule stated
+      - material set from the registry; sourced values recorded if the registry lacked it
+    output:
+      type: object
+      required: [criterion_id, material]
+  - id: anchor
+    goal: ANCHOR FIRST — estimate expected order of magnitude with a closed-form calc before any solve
+    helper_tools: [research_eng_calc, measure_part]
+    checklist:
+      - closed-form anchor written to the ledger (e.g. "expect ~40 MPa at the root, cantilever approx")
+      - if no approximation maps, "no anchor" recorded honestly — never a fabricated anchor
+    output:
+      type: object
+      required: [anchor]
+  - id: setup_bcs
+    goal: fixtures and loads on named faces that exist; fix every pre-sim advisory item before running
+    helper_tools: [describe_part, ledger_note]
+    checklist:
+      - fixtures/loads on named faces (no dangling refs, no all-fixed body, no missing load)
+      - mesh per the advisory's feature-size suggestion
+    output:
+      type: object
+      required: [setup_summary]
+  - id: run_read
+    goal: run one load case per study, then read results and compare to the anchor
+    helper_tools: [run_fea_static, run_fea_modal, run_cfd_flow, describe_results]
+    checklist:
+      - one load case per study (mixed cases hide which load broke it)
+      - result within ~2-3x anchor = credible; beyond ~5x = suspect SETUP first (BCs/units/material)
+      - solver, mesh size, element count reported exactly; non-convergence/skips stated
+    output:
+      type: object
+      required: [studies]
+  - id: verdict
+    goal: verdict per criterion with margin and the failure location in face/feature words
+    helper_tools: [struct_analyze, ledger_note]
+    checklist:
+      - PASS/WARN/FAIL with numbers and margin vs the pass rule
+      - FAIL names the location in face/feature words so the fixer can act
+      - design suggestions routed AS EVIDENCE via the failure card, never edited into geometry
+    output:
+      type: object
+      required: [verdicts]
+exit_gate: [anchor_recorded, setup_linted, verdicts_with_margin]

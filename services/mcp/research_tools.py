@@ -6,6 +6,17 @@ returns the §1 answer envelope (``{ok, answer, units, source_url, quote, fetche
 confidence, cached}``) so a limited model quotes it verbatim and a frontier model chains
 it. Failures come back as the §6 degradation shape (``{ok:false, reason, hint}``), never a
 traceback — CI passes with no external keys/binaries.
+
+T-W3 adds ``fit_calc`` and ``recommend_fit`` (ISO 286 fit calculator, Pillar 20).
+These return the ``aicad.calc/1`` envelope (``contracts/advisor.md`` §7), not the §1
+research envelope — different schema, same "code does the maths" discipline.
+Call ``fit_calc`` BEFORE ``hole_sizing`` / bore-diameter decisions to get the ISO-table
+band; use ``recommend_fit`` first when the fit class itself is not yet decided.
+
+T-W4 adds ``research_eng_calc`` registry routing (beam, bolted_joint, thread_engagement,
+press_fit, wall_thickness, snap_fit) and a ``list_calcs`` discovery tool. The existing
+Pillar-8 ``research_eng_calc`` (axial_stress, hoop_stress, …) is preserved and extended:
+calc_ids not found in the new registry fall through to the legacy Pillar-8 formulas.
 """
 from __future__ import annotations
 
@@ -15,6 +26,7 @@ from mcp.server.fastmcp import FastMCP
 
 from mcp_server.cad_tools import _dumps, _err
 from engine import research
+import engine_oracle.research.calcs as _calcs  # registers all T-W4 calculators
 
 
 def register_research_tools(mcp: FastMCP) -> None:
@@ -106,19 +118,45 @@ def register_research_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def research_eng_calc(formula: str, params: Optional[dict] = None,
-                          raw_quote: Optional[str] = None) -> str:
+                          raw_quote: Optional[str] = None,
+                          prefilled: Optional[dict] = None) -> str:
         """Evaluate a named deterministic engineering formula in SI (code does the maths).
 
-        `formula` is one of `axial_stress`, `bending_stress`, `hoop_stress`,
-        `safety_factor`, `cantilever_end_deflection`, `circle_area`; `params` is its input
-        dict (e.g. {"force_n":1000,"area_mm2":100}). Result is range-checked; a bad/unknown
-        formula degrades (`{ok:false}`) rather than raising.
+        **T-W4 registry** (aicad.calc/1 envelope, contracts/advisor.md §7):
+        `beam`, `bolted_joint`, `thread_engagement`, `press_fit`,
+        `wall_thickness`, `snap_fit`.  Call `list_calcs` for the full registry
+        with input schemas.
+
+        **Pillar-8 legacy formulas** (fallback, §1 envelope):
+        `axial_stress`, `bending_stress`, `hoop_stress`, `safety_factor`,
+        `cantilever_end_deflection`, `circle_area`.
+
+        `params` is the input dict for the chosen formula.
+        `prefilled` optionally records which inputs came from live geometry
+        (ledger provenance per §7, e.g. `{"L_mm": "doc_bbox z body=shaft"}`).
         """
         try:
             kw = dict(params or {})
+            # Route to T-W4 registry first
+            entry = _calcs.get_calc(formula)
+            if entry is not None:
+                return _dumps(_calcs.run_calc(formula, kw, prefilled=prefilled))
+            # Fall through to legacy Pillar-8 formulas
             if raw_quote is not None:
                 kw["raw_quote"] = raw_quote
             return _dumps(research.eng_calc(formula, **kw))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def list_calcs() -> str:
+        """Discover registered engineering calculators (T-W4 registry).
+
+        Returns {calc_id: {input_schema, prefill_hints}} for all registered
+        calculators.  Use calc_ids with ``research_eng_calc`` to compute results.
+        """
+        try:
+            return _dumps({"ok": True, "calcs": _calcs.list_calcs()})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -132,5 +170,59 @@ def register_research_tools(mcp: FastMCP) -> None:
         """
         try:
             return _dumps(research.datasheet_fetch(source, tier=tier))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    # --- T-W3 ISO 286 fit calculator (aicad.calc/1 envelope, contracts/advisor.md §7) ---
+    # IMPORTANT: call fit_calc BEFORE making any hole-sizing or bore-diameter decisions.
+    # The fit class (e.g. H7/g6) must be resolved first — use recommend_fit if unknown.
+
+    @mcp.tool()
+    def fit_calc(nominal: float, fit: str,
+                 prefilled: Optional[dict] = None) -> str:
+        """Compute ISO 286 tolerance bands for a hole/shaft fit — code does the maths.
+
+        Call this BEFORE hole sizing: it gives the ISO-table band the bore and shaft must
+        hit. Returns an `aicad.calc/1` envelope (`contracts/advisor.md §7`) with:
+        - `answer.hole`: [lower_mm, upper_mm] offsets from nominal (null if shaft-only).
+        - `answer.shaft`: [lower_mm, upper_mm] offsets (null if hole-only).
+        - `answer.clearance`: [min_mm, max_mm] (negative = interference). null if single.
+        - `answer.fit_character`: "clearance" | "transition" | "press" | null.
+        - `answer.hole_absolute` / `answer.shaft_absolute`: absolute size bands [min, max].
+
+        `fit` accepts combined ("H7/g6", "H7\\g6") or single ("H7", "g6") forms.
+        `prefilled` optionally records which inputs came from live geometry measurement
+        (ledger provenance per §7, e.g. `{"nominal": "doc_eval_measure F7"}`).
+
+        Spot-check values (ISO 286-2:2010): 20H7/g6 → hole 20.000–20.021, shaft
+        19.980–19.993, clearance 0.007–0.041 mm, character=clearance.
+        50H7/p6 → interference 0.001–0.042 mm, character=press.
+        `source.kind` is "closed_form" for formula-derived deviations (g, f, e, d, h),
+        "table" for tabulated ones (k, n, p, r, s).
+        """
+        try:
+            return _dumps(research.fit_calc(nominal, fit, prefilled=prefilled))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def recommend_fit(function: str) -> str:
+        """Map a functional description to recommended ISO 286 fit classes with rationale.
+
+        `function` is a free-text keyword: "sliding", "press fit", "running bearing",
+        "dowel pin", "location", "transition", "bearing seat", etc. Returns an
+        `aicad.calc/1` envelope; `answer` is a list of matching fit recommendations,
+        each with `recommended_classes`, `character` (clearance/transition/press),
+        `rationale`, and `applications`.
+
+        Use this when the fit class is not yet known — to decide WHICH fit before
+        calling `fit_calc` to compute the actual bands. Example workflow:
+        1. `recommend_fit("sliding")` → H7/g6
+        2. `fit_calc(20.0, "H7/g6")` → hole 20.000–20.021, shaft 19.980–19.993
+        3. Edit bore feature to 20.000–20.021 (or confirm with ask_user for
+           function-critical dims).
+        """
+        try:
+            return _dumps(research.recommend_fit(function))
         except Exception as e:  # noqa: BLE001
             return _err(e)

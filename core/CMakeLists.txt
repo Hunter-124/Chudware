@@ -24,6 +24,14 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 # builds the geometry kernel + smoke test (see cmake/ProvisionOCCT.cmake).
 option(AICAD_WITH_OCCT "Provision + link the OCCT geometry kernel (Wave 2)" OFF)
 
+# MSVC: <windows.h> (pulled in transitively by OCCT headers) defines min()/max() macros that
+# clobber std::min / std::max / std::numeric_limits<>::min, breaking e.g. core/api/libaicad.cpp.
+# Suppress project-wide. Harmless without OCCT (windows.h isn't included then); mirrors the
+# per-file `#define NOMINMAX` already present in a few sources.
+if(MSVC)
+  add_compile_definitions(NOMINMAX)
+endif()
+
 include(FetchContent)
 
 # --- Eigen (header-only linear algebra; replaces numpy/scipy.linalg) ---------
@@ -189,6 +197,13 @@ add_library(aicad_cam STATIC
 target_include_directories(aicad_cam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_cam PUBLIC
   aicad_clipper2 aicad_miniz nlohmann_json::nlohmann_json)
+# MSVC only defines M_PI et al. in <cmath> when _USE_MATH_DEFINES is set; the CAM math
+# (helix/adaptive/stock-sim) relies on them. GCC/Clang expose them by default, so this is
+# a no-op there. Target-scoped to avoid redefinition warnings in files that set it locally.
+if(MSVC)
+  # PUBLIC so consumers (e.g. test_cam) that use M_PI via the CAM headers get it too.
+  target_compile_definitions(aicad_cam PUBLIC _USE_MATH_DEFINES)
+endif()
 set_property(TARGET aicad_cam PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
@@ -923,6 +938,22 @@ if(AICAD_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME sketch_drag_rpc COMMAND test_sketch_drag_rpc)
   set_tests_properties(sketch_drag_rpc PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- T-W2 sketch completion suite (auto-coincident + sketch_health) ----------
+  # Auto-coincident closes touching-corner profiles (default on, rollback-safe on
+  # conflict) and doc_sketch_health narrates closure / DOF free variables / advisory.
+  # RPC-level (doc_new -> doc_apply_ops -> doc_sketch_auto_constrain / _health), headless.
+  add_executable(test_sketch_autoconstrain
+    tests/test_sketch_autoconstrain.cpp)
+  target_include_directories(test_sketch_autoconstrain PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_sketch_autoconstrain PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_sketch_autoconstrain PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME sketch_autoconstrain COMMAND test_sketch_autoconstrain)
+  set_tests_properties(sketch_autoconstrain PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- Simulation-study persistence + mutate RPCs (doc_sim_study_*) -----------
   # Exercises the full study lifecycle (add/edit/list/save+open/delete) on a blank

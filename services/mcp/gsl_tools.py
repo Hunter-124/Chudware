@@ -862,6 +862,18 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
             if isinstance(v, (int, float)):
                 lines.append(f'  {k}: {v}')
 
+    # T-W9: additive sim-advisor verdict (margin policy + beam anchor + suggestions).
+    # Only run for fea_static studies (beam-anchor comparison only meaningful for static).
+    if stype == "fea_static":
+        try:
+            from services.agent.advisor.sim_advisor import postcheck, narrate_postcheck  # noqa: PLC0415
+            pc = postcheck(study)
+            verdict_text = narrate_postcheck(pc)
+            if verdict_text:
+                lines.append(verdict_text)
+        except Exception:  # noqa: BLE001
+            pass  # advisor postcheck is advisory-only; never crash describe_results
+
     lines.append('\n(Source: sim_study_list — numbers narrated from the stored study, '
                  'never recomputed)')
     return _dumps({"ok": True, "text": "\n".join(lines)})
@@ -1315,6 +1327,71 @@ def register_gsl_tools(mcp: FastMCP) -> None:
             digest = _sketch_digest(sketch, overview, regions_resp, feat)
             return _dumps({"ok": True, "sketch": sketch, "text": _sketch_text(digest),
                            "digest": digest})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def sketch_health(sketch: str, doc_id: Optional[str] = None) -> str:
+        """The single narrated read of a sketch's constraint state — solve it and get back WHY it
+        is under/over-defined plus an ordered plan to reach fully-constrained.
+
+        sketch: the sketch feature id (e.g. "s1"). Returns {ok, sketch, status, dof, converged, ...}
+        where the narrated fields are:
+          closure       {open_endpoints, closed_chains_ok, material_regions?} — open_endpoints names
+                        the dangling endpoint handles where chains fail to close (feed these to
+                        sketch_auto_constrain to stitch them coincident).
+          dof_narration plain words for the remaining free variables, e.g. "circle C1 radius;
+                        line L4 end x/y" — read this instead of counting dof yourself.
+          free_variables the same, structured: [{entity, param, var}].
+          statuses      per-entity id -> "under" | "full" | "over".
+          redundant     [{id, type, suggestion}] — constraints implied by the others, with a removal
+                        suggestion (a redundant DRIVING dimension over-defines — drop it).
+          conflicting   [{id, type, suggestion}] — constraints that contradict each other; the
+                        suggestion says which to remove.
+          schedule      ordered [{order, kind, action, why, ...}] to reach dof 0 — geometric
+                        RELATIONS first, then DRIVING dimensions, mirroring how a person constrains.
+          advisory      [aicad.advisory/1 items] — emittable straight to the advisor layer.
+
+        Sketch loop: edit -> sketch_health -> add the scheduled relations / run sketch_auto_constrain
+        -> sketch_health again until status is "full".
+        """
+        try:
+            d = _doc(doc_id)
+            result = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
+            return _dumps(result)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def sketch_auto_constrain(sketch: str, apply: bool = True, tol_mm: float = 1e-4,
+                              doc_id: Optional[str] = None) -> str:
+        """Stitch a sketch's near-touching endpoints closed by adding coincident constraints — the
+        cheap way to close chains before dimensioning.
+
+        Finds entity endpoints that lie within tol_mm of each other (they touch visually but are not
+        yet coincident) and adds a coincident constraint for each pair. With apply=True (default) it
+        mutates the sketch; with apply=False it only returns the proposals (no mutation) so you can
+        preview them. Every addition is rollback-safe: a proposal that would make the sketch
+        conflicting is skipped (counted in skipped_conflicting), never applied.
+
+        sketch:   the sketch feature id (e.g. "s1").
+        apply:    True to add the coincident constraints, False to only propose them.
+        tol_mm:   endpoint gap tolerance in mm (default 1e-4).
+
+        Returns {proposals:[{a:{handle}, b:{handle}, gap_mm}], applied:[cids], skipped_conflicting,
+        regions_before, regions_after, converged} — regions_before/regions_after report which closed
+        chains (material regions) the pass created.
+
+        This same pass also runs automatically after sketch edits when the doc meta
+        `sketch.auto_coincident` is true (default ON), so you usually only call it explicitly to
+        preview (apply=False) or to re-stitch after loosening the tolerance.
+        """
+        try:
+            d = _doc(doc_id)
+            result = cb.call("sketch_auto_constrain",
+                             {"doc_id": d, "sketch": sketch,
+                              "opts": {"tol_mm": tol_mm, "apply": apply}})
+            return _dumps(result)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

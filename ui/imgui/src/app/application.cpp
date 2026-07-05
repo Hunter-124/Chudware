@@ -24,6 +24,9 @@
 #include "ui/structural_panel.h"   // T-U7 structural viewer
 #include "ui/gallery_panel.h"       // T-U9 sample gallery
 #include "ui/mission_control_panel.h"  // T-F17 mission-control (DAG run steering) panel
+#include "ui/agent_inspector_panel.h"  // T-W17 agent inspector (advisor observability)
+#include "ui/watch_grid_panel.h"       // T-W17 multi-viewport watch grid
+#include "ui/agent_settings_panel.h"   // T-W17 model-source + routing settings
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -382,6 +385,43 @@ void Application::frame() {
                                  ImGuiCond_Appearing);
         if (ImGui::Begin("Mission Control###mission_control", ui::missionControlPanelOpen(), pflags))
             ui::drawMissionControlPanel(s);
+        ImGui::End();
+    }
+
+    // T-W17 Agent Inspector — advisor/agent observability, replayable from a run
+    // dir. Screenshot-verifiable via AI_CAD_SHOT=agent_inspector[_empty].
+    if (*ui::agentInspectorPanelOpen()) {
+        const ImGuiViewport* vpi = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vpi->WorkPos.x + vpi->WorkSize.x * 0.5f,
+                                       vpi->WorkPos.y + vpi->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(680.f * theme::S(), 860.f * theme::S()), ImGuiCond_Appearing);
+        if (ImGui::Begin("Agent Inspector###agent_inspector", ui::agentInspectorPanelOpen(), pflags))
+            ui::drawAgentInspectorPanel(s);
+        ImGui::End();
+    }
+    // T-W17 Agent Watch grid — live part previews per agent doc.
+    // Screenshot-verifiable via AI_CAD_SHOT=watch_grid.
+    if (*ui::watchGridPanelOpen()) {
+        const ImGuiViewport* vpw = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vpw->WorkPos.x + vpw->WorkSize.x * 0.5f,
+                                       vpw->WorkPos.y + vpw->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(720.f * theme::S(), 560.f * theme::S()), ImGuiCond_Appearing);
+        if (ImGui::Begin("Agent Watch###watch_grid", ui::watchGridPanelOpen(), pflags))
+            ui::drawWatchGridPanel(s);
+        ImGui::End();
+    }
+    // T-W17 Agent Settings — model sources + per-role routing editor.
+    // Screenshot-verifiable via AI_CAD_SHOT=agent_settings[_error].
+    if (*ui::agentSettingsPanelOpen()) {
+        const ImGuiViewport* vps = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vps->WorkPos.x + vps->WorkSize.x * 0.5f,
+                                       vps->WorkPos.y + vps->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(700.f * theme::S(), 720.f * theme::S()), ImGuiCond_Appearing);
+        if (ImGui::Begin("Agent Settings###agent_settings", ui::agentSettingsPanelOpen(), pflags))
+            ui::drawAgentSettingsPanel(s);
         ImGui::End();
     }
 

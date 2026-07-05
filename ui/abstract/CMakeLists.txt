@@ -15,6 +15,12 @@ add_library(aicad_ui_abstract STATIC
 target_include_directories(aicad_ui_abstract PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+# ask_form.cpp + the *_view.cpp adapters include <nlohmann/json.hpp>. Link the header-only
+# target (provided by core/ via FetchContent) so the include path resolves explicitly rather
+# than depending on an ambient system include (present on some Linux boxes, absent on Windows).
+if(TARGET nlohmann_json::nlohmann_json)
+    target_link_libraries(aicad_ui_abstract PUBLIC nlohmann_json::nlohmann_json)
+endif()
 
 add_executable(test_command_registry test/test_command_registry.cpp)
 target_link_libraries(test_command_registry PRIVATE aicad_ui_abstract)

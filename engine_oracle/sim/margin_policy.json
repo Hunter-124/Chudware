@@ -1,0 +1,54 @@
+{
+  "_doc": {
+    "schema": "aicad.margin_policy/1",
+    "description": "Per-material-class safety factors for sim margin verdicts (T-W9).",
+    "source": "Shigley's Mechanical Engineering Design, 10th ed., §6 (fatigue) and §2 (static); AISC LRFD Table B4.1 (structural); ASME VIII-1 §UG-23 (pressure).",
+    "fields": {
+      "sf_yield": "Static design safety factor on yield strength (max_stress × sf_yield ≤ yield_mpa).",
+      "sf_endurance": "Fatigue safety factor on endurance limit (for context where cyclic loading is flagged).",
+      "class": "Material class name — matched from study material.name by simple keyword heuristic."
+    },
+    "verdict_rules": {
+      "PASS": "max_stress_mpa × sf_yield ≤ yield_mpa",
+      "WARN": "yield_mpa < max_stress_mpa × sf_yield ≤ ultimate_mpa  (yielded but not fractured)",
+      "FAIL": "max_stress_mpa × sf_yield > ultimate_mpa  (fracture predicted)"
+    },
+    "unknown_class_default": "general",
+    "divergence_warn_ratio": 5.0
+  },
+  "metal_steel": {
+    "class": "metal_steel",
+    "keywords": ["steel", "stainless", "carbon", "alloy", "iron"],
+    "sf_yield": 1.5,
+    "sf_endurance": 2.0,
+    "source": "Shigley §6-12 (general machine design); AISC structural steel safety basis."
+  },
+  "metal_aluminium": {
+    "class": "metal_aluminium",
+    "keywords": ["aluminium", "aluminum", "al ", "6061", "7075", "2024"],
+    "sf_yield": 1.5,
+    "sf_endurance": 2.5,
+    "source": "Shigley §6-12; aluminium has no true endurance limit so sf_endurance is conservative."
+  },
+  "metal_titanium": {
+    "class": "metal_titanium",
+    "keywords": ["titanium", "ti-6al", "ti6al4v"],
+    "sf_yield": 1.4,
+    "sf_endurance": 2.0,
+    "source": "Shigley §6-12; aerospace-grade titanium — tighter SF allowed due to well-characterised fatigue."
+  },
+  "polymer": {
+    "class": "polymer",
+    "keywords": ["abs", "pla", "petg", "nylon", "pa12", "pa-12", "polycarbonate", "pc ", "hdpe", "pom"],
+    "sf_yield": 2.0,
+    "sf_endurance": 3.0,
+    "source": "Conservative per Shigley §2-1 note on plastics: high scatter, temperature sensitivity, creep."
+  },
+  "general": {
+    "class": "general",
+    "keywords": [],
+    "sf_yield": 2.0,
+    "sf_endurance": 3.0,
+    "source": "Conservative default when material class is unrecognised."
+  }
+}

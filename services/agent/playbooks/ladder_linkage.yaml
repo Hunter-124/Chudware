@@ -1,0 +1,29 @@
+# Rung C — authored by the lead, canonical. Fresh context: geometry_plan only.
+schema: aicad.playbook/1
+id: ladder_linkage
+stage: spec
+steps:
+  - id: datums
+    goal: Choose the datum scheme - the few planes/axes/points everything else references.
+    helper_tools: []
+    checklist:
+      - "one scheme serves modeling AND inspection (the tolerancing seat will check)"
+      - "every datum has defined_by and why; fewer is better"
+    output: {slots: [datums: "[{id, kind: plane|axis|point, defined_by, why}]"]}
+  - id: links
+    goal: Turn every 'derived:' param from rung B into an explicit link - these become LIVE engine equations (linked dimensions).
+    helper_tools: [fit_calc, research_eng_calc]
+    checklist:
+      - "every derived param has a link {from, to, relation, why}; relations are parseable arithmetic over named dims"
+      - "fit-driven values call fit_calc for the band NOW (this is where symbolic becomes numeric, with provenance)"
+      - "no circular links - walk your own graph before handing off"
+    output: {slots: [links: "[{from, to, relation, why}]", driving_dims: "[{name, owner: G, derived_from}]"]}
+  - id: constraints_and_refs
+    goal: Per sketch profile, the constraint schedule; overall, the parent/child reference tree.
+    helper_tools: []
+    checklist:
+      - "geometric constraints first, driving dims second, per profile"
+      - "reference_tree has no child referencing a later sibling (stability)"
+      - "symmetry constrained about centerlines, never dimensioned both sides"
+    output: {slots: [constraint_plans: "per profile", reference_tree: "parent/child", defects: "[]"]}
+exit_gate: [artifact_validates_as_linkage_map]

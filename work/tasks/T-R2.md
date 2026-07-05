@@ -2,8 +2,8 @@
 id: T-R2
 title: PLM vault core - services/plm/ engine, auto-history, checkpoint/release/restore, plm_* MCP tools
 workstream: R
-owner: unassigned
-status: todo
+owner: opus-quarry
+status: doing
 branch: task/T-R2-plm-vault-core
 depends_on: [T-R1]
 lane: plm-projects

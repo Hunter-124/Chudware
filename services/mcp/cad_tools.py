@@ -883,6 +883,13 @@ WORKFLOW
                                             (coincident/horizontal/parallel/tangent/...) + DRIVING
                                             DIMENSIONS, not loose geometry; check_sketch("s1")
                                             reports dof + conflicts so you can reach fully-defined.
+     preflight_ops(ops)                     OPTIONAL but recommended before big edits: dry-runs
+                                            the planned ops on a shadow clone — checks dangling
+                                            refs, impossible fillets, hole-through-nothing, and
+                                            downstream feature breaks — WITHOUT touching the live
+                                            doc. Returns aicad.preflight/1 with advisory_items.
+                                            A fail verdict is advisory (never blocks); add_features
+                                            runs preflight automatically (AI_CAD_PREFLIGHT=1).
   3. render_part()                          SEE it — an annotated, colour-coded image (faces
                                             tinted + labelled TOP/FRONT/RIGHT...). Self-review
                                             against the request; iterate add_features to fix.
@@ -926,6 +933,15 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
                          constraint roster with driving-dimension values, closed-region count/
                          area, and the DOF (fully/under/over-defined) verdict — the sketch
                          equivalent of describe_part, for reviewing layout before you extrude it.
+  sketch_health(id)      the narrated constraint read: WHICH free variables remain (dof in plain
+                         words), open chain endpoints, per-entity under/full/over, redundant/
+                         conflicting with removal hints, and an ORDERED schedule (relations first,
+                         then driving dims) to reach dof 0 — the sketch loop is edit -> sketch_health
+                         -> add the scheduled relations / sketch_auto_constrain -> repeat.
+  sketch_auto_constrain(id)  stitch near-touching endpoints coincident (apply=True, default) or
+                         just propose them (apply=False); each add is rollback-safe (skips any that
+                         would conflict) and it reports which chains closed. Runs automatically after
+                         edits when doc meta sketch.auto_coincident is on (default).
   describe_scene(views)  the TEXT equivalent of render_part/contact_sheet for a model with no
                          vision: per requested view (default front/right/top/iso), which faces
                          face the camera (by sid/surf/side/dims) plus the part bbox — computed
@@ -950,6 +966,20 @@ INTAKE / FIRST-TRY-FIT — get real-world parts to fit on the first print.
 
 NORTH STAR: never silently guess a dimension that decides whether parts FIT. Spend questions only
 on the dims that gate a mating interface; default everything else and flag it.
+
+ISO 286 FIT CALCULATOR — call fit_calc BEFORE setting any bore or shaft diameter:
+  fit_calc(nominal, fit)          ISO 286 tolerance bands + fit character. Always call this
+                                  BEFORE hole_sizing or setting a bore dimension. Example:
+                                  fit_calc(20.0, "H7/g6") → hole 20.000–20.021,
+                                  shaft 19.980–19.993, clearance 0.007–0.041 mm.
+  recommend_fit(function)         not sure which fit class? "sliding", "press fit", "bearing",
+                                  "dowel pin" → recommended ISO 286 classes + rationale.
+                                  Call recommend_fit FIRST, then fit_calc with the class it gives.
+  suggest_dimension_scheme(doc, sketch, process)
+                                  ordered dimension plan for a sketch: which dims to drive,
+                                  default IT-grade tolerances by process, bolt-pattern datum rules,
+                                  and needs_user_confirm flags for function-critical dims.
+                                  CNC/lathe → IT7, FDM → IT12, sheet/laser → IT10.
 
 WHEN the design must incorporate a real part you have NO model/datasheet for:
   1. LOOK IT UP FIRST — list_standard_parts / make_standard_part. Only a real miss triggers photos.
@@ -996,11 +1026,28 @@ TYPICAL LOOP
                        checks, estimated cycle time.
   8. cam_post("fanuc") emit the NC program; cam_setup_sheet() for the operator sheet.
 
+FEEDS & SPEEDS ADVISOR (T-W6 — table-driven, aicad.calc/1 contract)
+  Before cam_add_operation, call feeds_speeds() to get a recommended envelope:
+    feeds_speeds("alu_6061", "endmill_flat", 10.0, "roughing")
+    → {schema:"aicad.calc/1", answer:{rpm:{min,mid,max}, feed:{min,mid,max},
+       stepdown:{min,mid,max}, stepover:{min,mid,max}, chipload, coolant, provenance}}
+  After adding the op, call cam_check_feeds_envelope() to flag risky values:
+    cam_check_feeds_envelope("alu_6061", "endmill_flat", 10.0, "roughing", rpm=50000)
+    → {schema:"aicad.advisory/1", items:[{severity:"hint", candidate_fixes:[clamped_values]}]}
+  For tap operations, get the drill size first:
+    tap_drill("M6x1.0")  → {answer:{tap_drill_mm:5.0, pct_thread:75}}
+    tap_drill("1/4-20")  → {answer:{tap_drill_mm:5.1, ...}}
+  Supported tool_types: endmill_flat, endmill_ball, drill, tap, face_mill.
+  Supported operations: roughing, finishing, slotting, drilling.
+  Materials: alu_6061, steel_1018, steel_304_stainless, ti_6al4v, abs, pla,
+             nylon_pa12, cast_iron_gray, inconel_718 (+ aliases from cam_materials()).
+
 PLATFORMS: 3-axis mill, router, 4/5-axis (3+2), lathe / mill-turn, laser, plasma, waterjet.
 POSTS: grbl, linuxcnc, fanuc, haas, mach3, marlin (laser), siemens (840D), centroid/tormach —
   fully data-driven (cam_post_dialects() lists them); per-controller canned cycles, arc IJK/R,
   work offsets, tool changes, coolant, laser power gating.
-REFERENCE: cam_post_dialects(), cam_materials() (cutting-data DB), cam_tool_types(), cam_op_types().
+REFERENCE: cam_post_dialects(), cam_materials() (cutting-data DB), cam_tool_types(), cam_op_types(),
+           feeds_speeds(), cam_check_feeds_envelope(), tap_drill().
 Address geometry the same plain-English way as modeling — extract regions/holes/sections from the
 part, don't hand-type coordinates unless you must.
 """
@@ -1014,7 +1061,8 @@ def cad_guide_text(topic: str = "overview") -> str:
         return _read_prompt("reviewer.md") or "(reviewer guide unavailable)"
     if topic in ("simulation", "sim", "fea", "cfd"):
         return _SIM_GUIDE
-    if topic in ("intake", "fit", "measure", "manufacturing", "dfm", "photos"):
+    if topic in ("intake", "fit", "fits", "iso286", "tolerance", "measure",
+                 "manufacturing", "dfm", "photos"):
         return _INTAKE_GUIDE
     if topic in ("gsl", "describe", "outline", "digest", "adjacency"):
         return _GSL_GUIDE
@@ -1540,6 +1588,16 @@ def register_cad_tools(mcp: FastMCP) -> None:
                 before_hist = _face_hist(d)
                 before_vol = _LAST_VOLUME.get(d)
 
+                # T-W12 auto-preflight: dry-run on shadow clone before mutating.
+                # Freedom rule: fail verdict never blocks — we proceed regardless;
+                # if verdict==fail we log a preflight_overridden event after apply.
+                _pf_result: dict = {}
+                try:
+                    from services.mcp.preflight_tools import run_auto_preflight
+                    _pf_result = run_auto_preflight(d, "add_features", ops)
+                except Exception:  # noqa: BLE001
+                    pass
+
                 r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
                 fs = (r.get("rebuild") or {}).get("feature_status", [])
                 feats = [{"id": s.get("id"), "ok": s.get("ok"),
@@ -1642,6 +1700,19 @@ def register_cad_tools(mcp: FastMCP) -> None:
                     if pub:
                         out["shown_in_app"] = True
                     _autosave(d)  # persist so a server restart can recover this doc
+                # T-W12: attach preflight advisory items and log override event.
+                if _pf_result:
+                    adv_items = _pf_result.get("advisory_items") or []
+                    if adv_items:
+                        out["preflight_advisory"] = adv_items
+                    pf_verdict = _pf_result.get("verdict", "skipped")
+                    if pf_verdict == "fail":
+                        # Applied despite failed preflight — log audit trigger (§11).
+                        try:
+                            from services.mcp.preflight_tools import log_preflight_override
+                            log_preflight_override(d, "add_features", _pf_result)
+                        except Exception:  # noqa: BLE001
+                            pass
                 return out
 
             if background:
@@ -1746,11 +1817,27 @@ def register_cad_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            r = cb.call("doc_sketch_solve", {"doc_id": d, "sketch_fid": sketch})
+            # sketch_health is the read-only source of truth (never touches the interactive
+            # active_sketch state). It returns status/dof plus the narrated read; its
+            # conflicting/redundant are [{id,type,suggestion}] objects, from which we pull the
+            # ids for check_sketch's id-list contract. (The old "doc_sketch_solve"/"sketch_fid"
+            # call never dispatched — wrong method + key — so check_sketch silently errored.)
+            r = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
             status = r.get("status", "")
             dof = r.get("dof", 0)
-            conflicting = r.get("conflicting", []) or []
-            redundant = r.get("redundant", []) or []
+
+            def _ids(items):
+                out = []
+                for it in items or []:
+                    if isinstance(it, dict) and it.get("id") is not None:
+                        out.append(it["id"])
+                    elif isinstance(it, str):
+                        out.append(it)
+                return out
+
+            conflicting = _ids(r.get("conflicting"))
+            redundant = _ids(r.get("redundant"))
+            narration = r.get("dof_narration")
             if conflicting:
                 summary = (f"Over-defined: {len(conflicting)} conflicting constraint(s) "
                            f"{conflicting} — remove one to resolve the contradiction.")
@@ -1759,11 +1846,18 @@ def register_cad_tools(mcp: FastMCP) -> None:
             else:
                 summary = (f"Under-defined: {dof} degree(s) of freedom remain — add geometric "
                            f"relations and/or driving dimensions until dof reaches 0.")
+                if narration:
+                    summary += f" Free: {narration}"
                 if redundant:
                     summary += f" (Also {len(redundant)} redundant: {redundant}.)"
-            return _dumps({"ok": True, "doc_id": d, "sketch": sketch, "status": status,
-                           "dof": dof, "fully_defined": (status == "full" or dof == 0),
-                           "conflicting": conflicting, "redundant": redundant, "summary": summary})
+            out = {"ok": True, "doc_id": d, "sketch": sketch, "status": status,
+                   "dof": dof, "fully_defined": (status == "full" or dof == 0),
+                   "conflicting": conflicting, "redundant": redundant, "summary": summary,
+                   # narrated enrichment straight from sketch_health (the advisor source).
+                   "open_endpoints": (r.get("closure") or {}).get("open_endpoints"),
+                   "dof_narration": narration, "schedule": r.get("schedule"),
+                   "advisory": r.get("advisory")}
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

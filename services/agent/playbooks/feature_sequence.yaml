@@ -1,0 +1,51 @@
+schema: aicad.playbook/1
+id: feature_sequence
+stage: feature
+# Owning role: feature_modeler. Helper tools ⊆ feature_modeler.tool_allowlist.
+steps:
+  - id: read_node
+    goal: read the build-graph node — which feature, why, which ledger DIMs drive it
+    helper_tools: [ledger_get, describe_part]
+    checklist:
+      - feature and its purpose stated
+      - every driving value maps to a DIM id or an ADVISORY number (no improvised numbers)
+    output:
+      type: object
+      required: [node_id, driving_dims]
+  - id: preflight
+    goal: preflight the planned op before cutting (dangling refs, insane params, downstream breakage)
+    helper_tools: [preflight_ops]
+    checklist:
+      - preflight verdict read
+      - any warn/fail either resolved or disputed with a recorded reason
+    output:
+      type: object
+      required: [preflight_verdict]
+  - id: apply
+    goal: apply the feature, addressing faces in plain words
+    helper_tools: [add_features, query_geometry]
+    checklist:
+      - faces named in plain words, never invented face numbers
+      - standard parts placed via part_search/part_place, never approximated
+    output:
+      type: object
+      required: [applied]
+  - id: verify_mutation
+    goal: verify the mutation took and left no defect
+    helper_tools: [describe_part, measure_part, check_feature_overlap]
+    checklist:
+      - affected geometry measured/described
+      - check_feature_overlap run after boolean-heavy nodes (no swallowed boss / dead feature)
+    output:
+      type: object
+      required: [checks_run]
+  - id: diagnose_or_advance
+    goal: on rebuild failure diagnose first; else mark the node done
+    helper_tools: [regen_diagnose, undo]
+    checklist:
+      - rebuild failure ran regen_diagnose before any retry
+      - two same-approach failures on a node → replan_request, not a third attempt
+    output:
+      type: object
+      required: [node_status]
+exit_gate: [node_features_built, mutations_verified, no_feature_overlap]

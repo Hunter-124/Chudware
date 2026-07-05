@@ -1,0 +1,23 @@
+# Rung B — authored by the lead, canonical. Fresh context: function_map + envelope only.
+schema: aicad.playbook/1
+id: ladder_geometry
+stage: spec
+steps:
+  - id: realize
+    goal: For EACH feature, choose the geometry that realizes it - the shape a good modeler would pick, params symbolic with basis.
+    helper_tools: [recommend_fit, research_thread_spec, part_search]
+    checklist:
+      - "round things revolve, blended things loft, repeated things pattern - the feature a person would use, never box-stacks"
+      - "every param carries basis: 'derived: <expr>' | 'spec: DIM' | 'free' - NO final numbers invented here"
+      - "orientation_hint states which way the element naturally faces and why"
+      - "standard parts referenced by id (placed later), never re-modeled"
+    output: {slots: [elements: "[{id: G, kind, op, description, params: [{name, basis}], realizes: [FT], orientation_hint}]"]}
+  - id: share_and_conflict
+    goal: Find geometry serving multiple features, and geometry fighting for the same space.
+    helper_tools: []
+    checklist:
+      - "shared elements listed (one boss serving mount + alignment) - sharing is good, name it"
+      - "every conflict pair carries a resolution_needed statement (who yields, or what changes)"
+      - "coverage self-check done: every FT realized, no orphan G"
+    output: {slots: [shared: "[G]", conflicts: "[{pair, overlap_concern, resolution_needed}]", defects: "[]"]}
+exit_gate: [artifact_validates_as_geometry_plan]

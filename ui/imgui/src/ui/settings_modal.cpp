@@ -375,13 +375,30 @@ void drawSettingsModal(app::AppState& st, bool busy) {
         ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Appearing);
         ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
         theme::pushGlassWindowStyle();
-        if (ImGui::Begin("Settings", &s_settingsOpen,
-                         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking)) {
+        if (ImGui::Begin("##settings_win", &s_settingsOpen,
+                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_NoDocking)) {
             ImDrawList* wdl = ImGui::GetWindowDrawList();
             ImVec2 wp = ImGui::GetWindowPos();
             ImVec2 ws = ImGui::GetWindowSize();
             theme::glassPanel(wdl, ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)),
                               theme::MaterialLevel::Thick, theme::ctx().m.roundingLg * sc);
+
+            // Self-drawn header (replaces the transparent ImGui title bar)
+            {
+                ImGui::PushFont(theme::font(theme::Font::H2));
+                ImGui::TextUnformatted("Settings");
+                ImGui::PopFont();
+                const float btnW = ImGui::GetFrameHeight();
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(ImGui::GetWindowWidth() - btnW -
+                                     ImGui::GetStyle().WindowPadding.x);
+                if (ImGui::Button("\xC3\x97##settings_close", ImVec2(btnW, btnW)))
+                    s_settingsOpen = false;
+                if (ImGui::IsKeyPressed(ImGuiKey_Escape))
+                    s_settingsOpen = false;
+            }
+            ImGui::Spacing();
 
             bool jumpToAgents = false;
             if (!s_ui.pendingPromptRole.empty() && st.workerStarted) {

@@ -83,6 +83,47 @@ std::optional<double> measure_constraint(const nlohmann::json& constraint,
 std::map<std::string, std::string> warm_gate_decision(const nlohmann::json& sketch,
                                                       const SolveState& warm);
 
+// ---- T-W2 sketch completion suite ------------------------------------------
+//
+// Free-variable narration and endpoint enumeration reused by the doc-layer
+// doc_sketch_health / doc_sketch_auto_constrain RPCs. Both are read-only scans over
+// a solved sketch — they reuse the SAME solver internals (allocate_entity variable
+// layout + the compute_statuses SVD null-space projection) so the narration lines up
+// exactly with the per-entity under/full/over statuses SketchSolution already reports.
+
+// One free (unconstrained) degree of freedom, named in plain words for the advisor.
+// `entity` is the entity id; `param` is the semantic name of the loose parameter
+// ("radius", "center x", "end x", "p2 y", "point 3 x"); `var` is the global solver
+// variable index (for cross-referencing). Produced by free_variables().
+struct FreeVar {
+    std::string entity;
+    std::string param;
+    int var = 0;
+};
+
+// Named free variables of `sketch` (the entities/constraints dict form solve_sketch
+// takes) under `env`. Solves cold, runs the SVD null-space projection compute_statuses
+// uses, and maps every loose variable index back to a semantic ("circle C1 radius;
+// line L4 end x/y") via a per-entity-type table mirroring allocate_entity's layout.
+// The list is stable-ordered by entity declaration order then local variable index.
+std::vector<FreeVar> free_variables(const nlohmann::json& sketch, const nlohmann::json& env);
+
+// One endpoint of a sketch entity: its world (u,v) plus the handle string that
+// addresses it in a constraint ref ("L4.p2", "A1.start", "C1.center", "P3"). Produced
+// by entity_endpoints() over SOLVED coords. Endpoints are the connection points a
+// coincident constraint can pin; interior/derived points (line mid) are excluded.
+struct Endpoint {
+    std::string handle;
+    double x = 0.0;
+    double y = 0.0;
+};
+
+// All coincidence-eligible endpoints of every non-construction entity in the SOLVED
+// `coords` dict (the SketchSolution::entities id->coord form). Lines contribute p1/p2,
+// arcs their center + start/end rim points, slots p1/p2, splines their endpoint knots,
+// points themselves, circles their center. Used by the auto-coincident proximity scan.
+std::vector<Endpoint> entity_endpoints(const nlohmann::json& coords);
+
 // Constrained drag — C++ port of sketch_solver.py's drag. Rebuilds the system from
 // `sketch`, soft-targets the dragged handle(s) at weight 0.01, warm-starts from
 // state.x when the topology matches, and solves with a 10 ms time budget. Returns a

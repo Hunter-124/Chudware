@@ -2,8 +2,8 @@
 id: T-BL37
 title: Origin as a selectable, renderable reference point — FM selectable + viewport point render + engine ref-resolution
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-alba
+status: review
 priority: 3
 lane: modeling-core
 kind: new
@@ -68,3 +68,28 @@ engine ref-resolution + viewport rendering + FM selectability all have to agree 
   first, note it for T-BL36 so it covers the new row.
 
 ## Progress log
+- 2026-07-04 17:10 UTC [sonnet-alba] Implemented all four DoD dimensions. Commit eab9b052 on branch task/T-BL37-origin-selectable-reference-point.
+
+Engine ref-resolution: resolve_point() in document.cpp now accepts "point.origin" as alias for (0,0,0). RESERVED_DATUMS in validate.cpp updated so schema validation passes it in all SelOrDatum slots. Back-compat "origin" retained.
+
+Viewport render: Synthetic RefDatum{Kind::Point, (0,0,0), id="point.origin"} injected into renderer datum set on every doc rebuild via app.cpp. Uses existing Kind::Point gold-cross draw code. Hidden by default via hiddenFeatures["point.origin"] on new doc (matches plane hidden-by-default).
+
+FM selectable: Origin row body click sets selectedFeatureId="point.origin" with chevron-expand decoupled via OpenOnArrow flag. Eye toggle add/removes from hiddenFeatures. "point.origin" exempted from live-feature prune. FM click also routes into active PM point well.
+
+PM point well: PMSelKinds gains bool point; routeDatumPoint() and activeWellWantsPoint() added (mirrors routeDatumAxis pattern). activeWellKindHint emits "points".
+
+Viewport pick: drawPointPicker() added to SketchMode — screen-space 2D distance test against projected point datums with accent-circle highlight; wired into viewport_panel.cpp picker chain after axis picker.
+
+Docs: ops_cheatsheet.md, guide-overview.md, overview.md updated with canonical "point.origin" vocab.
+
+Gate: PASS (scripts/gate.sh — ctest 100%, check.py PASS, ui/imgui PASS). 60/60 test_document assertions pass in T-BL37-specific build dir.
+- 2026-07-04 20:56 UTC [sonnet-alba] Parity redo complete (sonnet-alba). Rebased onto origin/master (741eae0e). Commit 8dabd612: ui/imgui parity — feature_tree Origin row selectable + eye toggle, viewport syncRefDatums injects synthetic point.origin, PM routeDatumPoint/activeWellWantsPoint, panel_spec SelectorKinds.point. Build clean. Gate PASS (build+shot+selftest). MCP round-trip: box + circular_pattern 4x about axis.z (world origin) all ok. Headless shots docs/sessions/assets/bl37_{light,dark}_origin.png — engine live (WorkerClient rev 3), Reference section shows Origin row + nested planes. Branch pushed (force after rebase). Ready for foreman merge.
+- 2026-07-04 21:32 UTC [sonnet-alba] Evidence upgraded (addressing review gap re: visible+selected origin glyph).
+
+Added AI_CAD_SHOT=origin headless scenario (scenarios.h/cpp + featureTreeUnhideOrigin/featureTreeSelectOrigin setters in feature_tree.h/cpp). Shot creates an 80x60x40 box with engine ATTACHED (box ok=1 rev=1), then unhides the origin point datum and selects it.
+
+New evidence screenshots (commit 7a07691e):
+- docs/sessions/assets/bl37_dark_origin.png — dark theme, Origin row teal-highlighted (selected), live 3D box in viewport, status "Origin: point glyph visible + selected"
+- docs/sessions/assets/bl37_light_origin.png — light theme, same, blue selection highlight
+
+Gate: PASS (build + --shot + --selftest). Branch pushed to origin at 7a07691e.

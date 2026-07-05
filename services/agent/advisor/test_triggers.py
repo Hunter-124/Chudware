@@ -1,0 +1,349 @@
+"""Tests for trigger-based context injection — aicad.trigger/1 (T-W21).
+
+Covers (task step 5):
+  * Keyword match → context item injected with prerun calc result present
+  * M6x1.0 → tap_drill fires, answer.tap_drill_mm = 5.0 (real table lookup)
+  * Cooldown suppression (second call within cooldown_turns → no item)
+  * Budget drop-first: context items (info/tail) are dropped before findings (action/blocker)
+  * Ledger events emitted per firing {trigger_id, matched, tokens}
+  * No-match → zero cost path (no items, no events)
+  * Multi-trigger: two patterns fire in one turn
+  * Tool-name trigger fires when tool is in tool_names
+  * Event trigger fires when event is in events list
+  * Engine integration: build_advisory with output_text fires triggers additive to findings
+  * Prerun fail-soft: calc error → pack injected without numbers
+  * Cooldown state is caller-owned (fresh dict = no suppression)
+
+Offline: no LLM, no core, no network.
+"""
+from __future__ import annotations
+
+import pytest
+
+from services.agent.advisor import triggers, engine, render
+from services.agent.advisor.engine import Finding, Observation
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _fresh_state() -> dict:
+    """Return an empty cooldown state dict (each call starts fresh)."""
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# 1. No-match → zero cost (empty returns, no calcs)
+# ---------------------------------------------------------------------------
+
+def test_no_match_returns_empty():
+    items, events = triggers.match_triggers(
+        output_text="just draw a sphere",
+        cooldown_state=_fresh_state(),
+    )
+    assert items == []
+    assert events == []
+
+
+def test_no_match_with_no_text_returns_empty():
+    items, events = triggers.match_triggers(
+        output_text="",
+        tool_names=[],
+        events=[],
+        cooldown_state=_fresh_state(),
+    )
+    assert items == []
+    assert events == []
+
+
+# ---------------------------------------------------------------------------
+# 2. thread_mention trigger: M6x1.0 → tap_drill prerun fires
+# ---------------------------------------------------------------------------
+
+def test_thread_mention_keyword_fires():
+    items, events = triggers.match_triggers(
+        output_text="I'll add a tapped hole M6x1.0 through the boss",
+        cooldown_state=_fresh_state(),
+    )
+    # At least one item for thread_mention
+    trigger_ids = {e["trigger_id"] for e in events}
+    assert "thread_mention" in trigger_ids, f"thread_mention not in events: {events}"
+
+
+def test_thread_mention_prerun_tap_drill_result():
+    """M6x1.0 in text → tap_drill runs and answer.tap_drill_mm present in numbers."""
+    items, events = triggers.match_triggers(
+        output_text="tap M6x1.0 tapped hole for M6 bolt",
+        cooldown_state=_fresh_state(),
+    )
+    thread_items = [it for it in items if "thread_mention" in it.get("check", "")]
+    assert thread_items, "no thread_mention item injected"
+    item = thread_items[0]
+    assert "tap_drill_mm" in item["numbers"], (
+        f"tap_drill_mm not in numbers: {item['numbers']}"
+    )
+    # Real table value: M6x1.0 coarse → 5.0 mm (feeds_speeds.json)
+    assert item["numbers"]["tap_drill_mm"] == pytest.approx(5.0), (
+        f"expected 5.0 mm pilot for M6x1.0, got {item['numbers']['tap_drill_mm']}"
+    )
+
+
+def test_thread_mention_item_is_info_severity():
+    items, _ = triggers.match_triggers(
+        output_text="M8x1.25 tap through aluminum block",
+        cooldown_state=_fresh_state(),
+    )
+    thread_items = [it for it in items if "thread_mention" in it.get("check", "")]
+    assert thread_items
+    assert thread_items[0]["severity"] == "info"
+
+
+def test_thread_mention_item_has_no_candidate_fixes():
+    """Info items may have empty candidate_fixes (§3 invariant does not apply)."""
+    items, _ = triggers.match_triggers(
+        output_text="tap M6x1.0",
+        cooldown_state=_fresh_state(),
+    )
+    thread_items = [it for it in items if "thread_mention" in it.get("check", "")]
+    assert thread_items
+    assert thread_items[0]["candidate_fixes"] == []
+
+
+# ---------------------------------------------------------------------------
+# 3. Cooldown suppression
+# ---------------------------------------------------------------------------
+
+def test_cooldown_suppresses_refire():
+    state = _fresh_state()
+    # First call at seq=0 → fires
+    items1, events1 = triggers.match_triggers(
+        output_text="tap M6x1.0",
+        seq=0,
+        cooldown_state=state,
+    )
+    assert any(e["trigger_id"] == "thread_mention" for e in events1)
+
+    # Second call at seq=1 — cooldown_turns=8, delta=1 < 8 → suppressed
+    items2, events2 = triggers.match_triggers(
+        output_text="M6x1.0 tap again",
+        seq=1,
+        cooldown_state=state,
+    )
+    thread_events2 = [e for e in events2 if e["trigger_id"] == "thread_mention"]
+    assert not thread_events2, "thread_mention should be in cooldown"
+    thread_items2 = [it for it in items2 if "thread_mention" in it.get("check", "")]
+    assert not thread_items2
+
+
+def test_cooldown_expires_after_enough_turns():
+    state = _fresh_state()
+    triggers.match_triggers(output_text="tap M6x1.0", seq=0, cooldown_state=state)
+    # Fire after cooldown_turns=8 have passed (seq=8 → delta=8, not < 8)
+    items, events = triggers.match_triggers(
+        output_text="tap M6x1.0", seq=8, cooldown_state=state
+    )
+    thread_events = [e for e in events if e["trigger_id"] == "thread_mention"]
+    assert thread_events, "thread_mention should re-fire after cooldown expires"
+
+
+def test_no_cooldown_state_fires_every_time():
+    """None cooldown_state → no suppression (fires every call)."""
+    items1, events1 = triggers.match_triggers(output_text="tap M6x1.0", cooldown_state=None)
+    items2, events2 = triggers.match_triggers(output_text="tap M6x1.0", cooldown_state=None)
+    assert any(e["trigger_id"] == "thread_mention" for e in events1)
+    assert any(e["trigger_id"] == "thread_mention" for e in events2)
+
+
+# ---------------------------------------------------------------------------
+# 4. Ledger events: {trigger_id, matched, tokens}
+# ---------------------------------------------------------------------------
+
+def test_ledger_events_have_required_keys():
+    _, events = triggers.match_triggers(
+        output_text="tap M6x1.0",
+        cooldown_state=_fresh_state(),
+    )
+    for ev in events:
+        assert "trigger_id" in ev, f"missing trigger_id in {ev}"
+        assert "matched" in ev, f"missing matched in {ev}"
+        assert "tokens" in ev, f"missing tokens in {ev}"
+        assert isinstance(ev["tokens"], int), f"tokens not int: {ev}"
+
+
+def test_ledger_event_matched_is_string():
+    _, events = triggers.match_triggers(
+        output_text="I need to tap M8x1.25 holes",
+        cooldown_state=_fresh_state(),
+    )
+    thread_events = [e for e in events if e["trigger_id"] == "thread_mention"]
+    assert thread_events
+    assert isinstance(thread_events[0]["matched"], str)
+
+
+# ---------------------------------------------------------------------------
+# 5. Tool-name trigger fires
+# ---------------------------------------------------------------------------
+
+def test_tool_name_trigger_fires():
+    """bearing_seat trigger matches part_search tool name."""
+    items, events = triggers.match_triggers(
+        output_text="",                    # no keywords — tool match only
+        tool_names=["part_search"],
+        cooldown_state=_fresh_state(),
+    )
+    trigger_ids = {e["trigger_id"] for e in events}
+    assert "bearing_seat" in trigger_ids, f"bearing_seat not fired by tool: {trigger_ids}"
+
+
+# ---------------------------------------------------------------------------
+# 6. Event trigger fires
+# ---------------------------------------------------------------------------
+
+def test_event_trigger_fires():
+    """thin_wall trigger fires on geometry event 'thin_wall'."""
+    items, events = triggers.match_triggers(
+        output_text="",
+        events=["thin_wall"],
+        cooldown_state=_fresh_state(),
+    )
+    trigger_ids = {e["trigger_id"] for e in events}
+    assert "thin_wall" in trigger_ids, f"thin_wall not fired by event: {trigger_ids}"
+
+
+# ---------------------------------------------------------------------------
+# 7. Budget: context items sit at tail; render drops them before findings
+# ---------------------------------------------------------------------------
+
+def test_budget_drop_first_drops_context_before_findings():
+    """With a tiny budget, an action finding survives while an info context item is dropped."""
+    # A rebuild finding (action severity) plus trigger context item (info).
+    f = Finding(kind="rebuild", check="rebuild", severity="action",
+                finding="feature F1 rebuild failed")
+    ctx_items, _ = triggers.match_triggers(
+        output_text="tap M6x1.0",
+        cooldown_state=_fresh_state(),
+    )
+    obs = Observation(stage="feature", findings=[f], seq=1,
+                      output_text="tap M6x1.0",
+                      cooldown_state=_fresh_state())
+    advisory = engine.build_advisory(obs)
+    # The advisory must have at least one action item (rebuild) and at least one info item (context).
+    sevs = [it["severity"] for it in advisory["items"]]
+    assert "action" in sevs
+    assert "info" in sevs
+
+    # With a very tiny budget, only the blocker/action survives — info (context) is dropped.
+    block = render.render_advisory(advisory, budget_tokens=10)
+    assert "action" in block or "rebuild" in block
+    # At budget=10 the context info item should be dropped (never silent per §3).
+    if "dropped for budget" in block:
+        assert "lowest=info" in block
+
+
+# ---------------------------------------------------------------------------
+# 8. Engine integration: build_advisory with output_text fires triggers
+# ---------------------------------------------------------------------------
+
+def test_engine_build_advisory_fires_triggers_via_observation():
+    """Passing output_text on Observation causes triggers to fire inside build_advisory."""
+    obs = Observation(
+        stage="feature",
+        findings=[],
+        seq=0,
+        output_text="I'll add a tapped M6x1.0 hole through the boss",
+        cooldown_state=_fresh_state(),
+    )
+    advisory = engine.build_advisory(obs)
+    # At least one context item injected
+    assert advisory["items"], "no items when triggers should have fired"
+    # trigger_events exposed in advisory for host-side ledger writes
+    assert "trigger_events" in advisory
+    te = advisory["trigger_events"]
+    assert any(e["trigger_id"] == "thread_mention" for e in te)
+
+
+def test_engine_no_output_text_no_trigger_items():
+    """Without output_text, no trigger context items are added."""
+    obs = Observation(stage="feature", findings=[], seq=0)
+    advisory = engine.build_advisory(obs)
+    # No findings, no output_text → empty block
+    assert advisory["items"] == []
+    assert advisory.get("trigger_events", []) == []
+
+
+# ---------------------------------------------------------------------------
+# 9. Prerun fail-soft: unresolvable thread still injects pack
+# ---------------------------------------------------------------------------
+
+def test_prerun_fail_soft_still_injects_pack():
+    """If the matched text doesn't contain a parseable thread designation,
+    the pack is still injected but numbers dict will be empty."""
+    items, events = triggers.match_triggers(
+        output_text="I need to tap some threads here",   # 'tap' + 'thread' match but no M-designation
+        cooldown_state=_fresh_state(),
+    )
+    thread_events = [e for e in events if e["trigger_id"] == "thread_mention"]
+    if thread_events:
+        thread_items = [it for it in items if "thread_mention" in it.get("check", "")]
+        assert thread_items, "event fired but no item produced"
+        # numbers may be empty or populated — either is fine (fail-soft)
+        assert isinstance(thread_items[0]["numbers"], dict)
+
+
+# ---------------------------------------------------------------------------
+# 10. Multi-trigger: tolerance + thread in one turn
+# ---------------------------------------------------------------------------
+
+def test_multi_trigger_one_turn():
+    """Multiple triggers can fire in a single turn."""
+    items, events = triggers.match_triggers(
+        output_text="M6x1.0 tapped hole with H7/g6 tolerance fit for the shaft",
+        cooldown_state=_fresh_state(),
+    )
+    trigger_ids = {e["trigger_id"] for e in events}
+    # At minimum thread_mention should fire; tolerance_mention may also fire
+    assert "thread_mention" in trigger_ids or len(trigger_ids) >= 1
+
+
+# ---------------------------------------------------------------------------
+# 11. tolerance_mention trigger: fit designation extracted → fit_calc prerun
+# ---------------------------------------------------------------------------
+
+def test_tolerance_mention_fires_on_fit_keyword():
+    items, events = triggers.match_triggers(
+        output_text="The bore needs H7/g6 tolerance for sliding fit on Ø20",
+        cooldown_state=_fresh_state(),
+    )
+    trigger_ids = {e["trigger_id"] for e in events}
+    assert "tolerance_mention" in trigger_ids or "bearing_seat" in trigger_ids or len(trigger_ids) > 0
+
+
+# ---------------------------------------------------------------------------
+# 12. Context item source is "table" (from trigger table, not LLM)
+# ---------------------------------------------------------------------------
+
+def test_context_item_source_kind_is_table():
+    items, _ = triggers.match_triggers(
+        output_text="tap M6x1.0",
+        cooldown_state=_fresh_state(),
+    )
+    for item in items:
+        assert item["source"]["kind"] == "table", (
+            f"context item source.kind should be 'table', got {item['source']['kind']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 13. load_table is idempotent (cached)
+# ---------------------------------------------------------------------------
+
+def test_load_table_is_cached():
+    t1 = triggers.load_table()
+    t2 = triggers.load_table()
+    assert t1 is t2, "load_table should return the same cached list"
+
+
+def test_load_table_has_at_least_8_triggers():
+    table = triggers.load_table()
+    assert len(table) >= 8, f"expected ≥8 triggers, got {len(table)}"

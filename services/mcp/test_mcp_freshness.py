@@ -146,6 +146,7 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
         "describe_part", "query_adjacency", "hover", "describe_sketch",
         "describe_scene", "describe_toolpaths", "describe_results",
         "describe_assembly", "describe_board", "describe_project",
+        "sketch_health", "sketch_auto_constrain",
     },
     "recon": {
         "reverse_engineer", "compare_parts", "convert_face_to_sketch",
@@ -243,6 +244,12 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
     "design_review": {
         "design_review",
     },
+    "ledger": {
+        "ledger_get", "ledger_note",
+    },
+    "buildgraph": {
+        "buildgraph_plan", "buildgraph_status",
+    },
 }
 
 # All tool names across all families (deduplicated — some tools like hover appear in
@@ -280,6 +287,8 @@ _FAMILY_SIGNALS: dict[str, list[str]] = {
     "code_compliance": ["code_check", "cad_guide('code_compliance')", "code_compliance"],
     "dag":           ["dag_plan", "dag_run", "cad_guide('dag')", "dag"],
     "design_review": ["design_review", "cad_guide('design_review')"],
+    "ledger":         ["ledger_get", "ledger_note", "design ledger", "ledger"],
+    "buildgraph":    ["buildgraph_plan", "buildgraph_status", "buildgraph", "aicad.buildgraph/1"],
 }
 
 
@@ -391,6 +400,7 @@ class TestMCPFreshness(unittest.TestCase):
             "bom_rollup",                           # sourcing
             "cam_cost_estimate",                    # cost
             "serving_status",                       # adapter serving
+            "buildgraph_plan",                      # build-order DAG planner
         ]
         corpus_lower = self._corpus.lower()
         missing = [t for t in must_appear if t.lower() not in corpus_lower]
@@ -429,7 +439,7 @@ class TestMCPFreshness(unittest.TestCase):
             "doc_diff", "req", "verify", "research", "deliverables",
             "sourcing", "cost", "spec", "piping", "hydraulic", "firmware",
             "structural", "parts", "serving", "regen", "code_compliance",
-            "dag", "design_review",
+            "dag", "design_review", "ledger",
         }
         missing = required_families - set(_TOOL_FAMILIES.keys())
         self.assertFalse(

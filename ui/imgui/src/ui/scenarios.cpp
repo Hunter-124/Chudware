@@ -23,6 +23,9 @@
 #include "ui/structural_panel.h"   // T-U7 structural viewer   // T-U8
 #include "ui/gallery_panel.h"        // T-U9
 #include "ui/mission_control_panel.h"  // T-F17
+#include "ui/agent_inspector_panel.h"  // T-W17
+#include "ui/watch_grid_panel.h"       // T-W17
+#include "ui/agent_settings_panel.h"   // T-W17
 #include "ui/sim_panel.h"                       // T-U6: sim studies (AI_CAD_SHOT=sim_studies)
 #include "artifact_view.h"
 #include "app/app_state.h"
@@ -45,6 +48,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <vector>
 
 #include "cpp_core.h"
@@ -189,6 +193,27 @@ static bool findBoxAicm(std::string& out) {
     return false;
 }
 
+// T-W17: locate the committed fixtures dir (docs/contracts/fixtures) relative to
+// the binary's CWD — same multi-candidate walk-up as findBoxAicm.
+static bool findFixturesDir(std::string& out) {
+    if (const char* env = std::getenv("AI_CAD_FIXTURES")) { out = env; return !out.empty(); }
+    const char* candidates[] = {
+        "docs/contracts/fixtures",
+        "../docs/contracts/fixtures",
+        "../../docs/contracts/fixtures",
+        "../../../docs/contracts/fixtures",
+    };
+    for (const char* c : candidates)
+        if (std::filesystem::exists(c)) { out = c; return true; }
+    return false;
+}
+
+static std::string readWholeFile(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return {};
+    std::stringstream ss; ss << f.rdbuf(); return ss.str();
+}
+
 static void setupPickShot(app::AppState& st) {
     std::string aicm;
     if (!findBoxAicm(aicm)) {
@@ -295,6 +320,13 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantStructural   = eq("structural_view");   // T-U7
     cfg.wantGallery       = eq("gallery");
     cfg.wantMissionControl = eq("mission_control");  // T-F17
+    cfg.wantAgentInspector      = eq("agent_inspector");        // T-W17
+    cfg.wantAgentInspectorEmpty = eq("agent_inspector_empty");  // T-W17
+    cfg.wantAgentInspectorFailure    = eq("agent_inspector_failure");    // T-W17
+    cfg.wantAgentInspectorDelegation = eq("agent_inspector_delegation"); // T-W17
+    cfg.wantWatchGrid           = eq("watch_grid");             // T-W17
+    cfg.wantAgentSettings       = eq("agent_settings");         // T-W17
+    cfg.wantAgentSettingsError  = eq("agent_settings_error");   // T-W17
     cfg.wantSimStudies   = eq("sim_studies");   // T-U6
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
@@ -375,6 +407,55 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
         ui::selectAndOpenFirstSampleForShot();  // proves click -> doc_open -> editable tree
     }
     if (cfg.wantMissionControl) ui::openMissionControlPanel();  // T-F17
+
+    // T-W17 — seed from committed fixture run dirs immediately (no worker needed).
+    if (cfg.wantAgentInspector || cfg.wantAgentInspectorEmpty ||
+        cfg.wantAgentInspectorFailure || cfg.wantAgentInspectorDelegation) {
+        std::string fx;
+        if (findFixturesDir(fx)) {
+            const std::string run = fx + (cfg.wantAgentInspectorEmpty ? "/runs/r_empty"
+                                                                      : "/runs/r_demo_bracket");
+            ui::openAgentInspectorPanel();
+            ui::loadInspectorRunDir(run);
+            // Failure/audit render only for the fixer turn (index 2); the
+            // Delegation tab body renders only when active — force each so the
+            // shots actually exercise those surfaces.
+            if (cfg.wantAgentInspectorFailure)    ui::inspectorShotSelectTurn(2);
+            if (cfg.wantAgentInspectorDelegation) ui::inspectorShotForceDelegationTab();
+            std::printf("agent_inspector: loaded run dir %s\n", run.c_str());
+        } else {
+            std::printf("agent_inspector: fixtures dir not found\n");
+        }
+        std::fflush(stdout);
+    }
+    if (cfg.wantWatchGrid) {
+        std::string fx;
+        if (findFixturesDir(fx)) {
+            const std::string ws = fx + "/runs/r_demo_bracket/workspace_status.json";
+            ui::openWatchGridPanel();
+            ui::loadWatchWorkspace(ws);
+            std::printf("watch_grid: loaded workspace %s\n", ws.c_str());
+        } else {
+            std::printf("watch_grid: fixtures dir not found\n");
+        }
+        std::fflush(stdout);
+    }
+    if (cfg.wantAgentSettings || cfg.wantAgentSettingsError) {
+        std::string fx;
+        if (findFixturesDir(fx)) {
+            const std::string vf = fx + (cfg.wantAgentSettingsError
+                                             ? "/routing/routing_view_error.json"
+                                             : "/routing/routing_view.json");
+            const std::string json = readWholeFile(vf);
+            ui::openAgentSettingsPanel();
+            ui::seedAgentSettingsFromViewJson(json);
+            std::printf("agent_settings: seeded from %s (%zu bytes)\n", vf.c_str(), json.size());
+        } else {
+            std::printf("agent_settings: fixtures dir not found\n");
+        }
+        std::fflush(stdout);
+    }
+
     if (cfg.wantSimStudies)   ui::openSimStudiesPanel();  // T-U6
     if (cfg.wantPick) setupPickShot(st);
     if (cfg.wantGlassperf) setupPickShot(st);

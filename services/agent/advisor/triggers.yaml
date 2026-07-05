@@ -1,0 +1,233 @@
+# Trigger-based context injection table — aicad.trigger/1
+# Contract: contracts/advisor.md §20 (FROZEN).
+# Rules:
+#   - keywords match model output text and user text (compiled regex, single pass)
+#   - tools match tool_name strings from tool-call history
+#   - events match geometry event strings (e.g. "thin_wall")
+#   - context_pack: name of file in services/agent/advisor/context_packs/<name>.md
+#   - prerun_calcs: [{calc, inputs_from: match|literal, input_map: {param: group}}]
+#   - budget_tokens: per-pack cap (≤ advisory slot budget)
+#   - cooldown_turns: suppress re-injection while pack is still in context
+# Numbers in packs sourced from: engine_oracle/research/data/iso286.json,
+#   feeds_speeds.json, calcs/snap_fit.py, calcs/wall_thickness.py, materials.json.
+
+schema: aicad.trigger/1
+triggers:
+
+  - id: thread_mention
+    match:
+      keywords:
+        - "\\btap\\b"
+        - "\\bthread\\b"
+        - "\\bthreaded\\b"
+        - "M\\d+(?:\\.\\d+)?(?:[xX×]\\d+(?:\\.\\d+)?)?"
+        - "\\bUNC\\b"
+        - "\\bUNF\\b"
+        - "\\bpilot hole\\b"
+        - "\\btap drill\\b"
+      tools: []
+      events: []
+    inject:
+      context_pack: threads
+      prerun_calcs:
+        - calc: tap_drill
+          inputs_from: match
+          input_map:
+            thread: thread_designation   # extraction group: M\d+x\d+ from text
+      exemplar: "M6x1.0 → pilot 5.0 mm (Machinery's Handbook; ISO 2306 75% engagement)"
+    budget_tokens: 250
+    cooldown_turns: 8
+
+  - id: bearing_seat
+    match:
+      keywords:
+        - "\\bbearing\\b"
+        - "\\bbearing seat\\b"
+        - "\\bbore.*press"
+        - "\\binner race\\b"
+        - "\\bouter race\\b"
+        - "\\bshaft seat\\b"
+      tools:
+        - part_search
+        - part_place
+      events: []
+    inject:
+      context_pack: bearing_fits
+      prerun_calcs:
+        - calc: fit_calc
+          inputs_from: literal
+          input_map:
+            nominal: null    # no single match value; advertise as helper
+            fit: "H7/g6"
+      exemplar: "Shaft seat k6/m6 (press); housing bore H7/J7 (easy removal); source: iso286.json"
+    budget_tokens: 300
+    cooldown_turns: 8
+
+  - id: press_fit_mention
+    match:
+      keywords:
+        - "\\bpress fit\\b"
+        - "\\bpress.fit\\b"
+        - "\\binterference fit\\b"
+        - "\\bknurled\\b"
+        - "\\bpressed in\\b"
+        - "\\bforced fit\\b"
+        - "\\bp6\\b"
+        - "\\bs6\\b"
+        - "\\br6\\b"
+      tools: []
+      events: []
+    inject:
+      context_pack: press_fit
+      prerun_calcs:
+        - calc: fit_calc
+          inputs_from: literal
+          input_map:
+            nominal: null
+            fit: "H7/p6"
+      exemplar: "H7/p6 on Ø20: min interference 0.017 mm, max 0.042 mm (ISO 286, fit_calc)"
+    budget_tokens: 250
+    cooldown_turns: 8
+
+  - id: snap_fit_mention
+    match:
+      keywords:
+        - "\\bsnap fit\\b"
+        - "\\bsnap.fit\\b"
+        - "\\bcantilever hook\\b"
+        - "\\blatch\\b"
+        - "\\bdetent\\b"
+        - "\\bsnap hook\\b"
+        - "\\bsnap arm\\b"
+        - "\\bclip\\b"
+      tools: []
+      events: []
+    inject:
+      context_pack: snap_fit
+      prerun_calcs: []
+      exemplar: "ABS cantilever: ε_allow ≈ 0.6×(yield/E); viable if ε_root ≤ ε_allow (snap_fit calc)"
+    budget_tokens: 250
+    cooldown_turns: 8
+
+  - id: thin_wall
+    match:
+      keywords:
+        - "\\bthin wall\\b"
+        - "\\bthin-wall\\b"
+        - "\\bwall thickness\\b"
+        - "\\bshell\\b"
+        - "\\bminimum wall\\b"
+      tools:
+        - wall_thickness
+        - shell
+      events:
+        - thin_wall        # geometry event: wall_thickness check flagged a wall < 2 mm
+    inject:
+      context_pack: thin_wall
+      prerun_calcs: []
+      exemplar: "FDM: min wall 1.2 mm; SLA: 0.6 mm; CNC: depends on tool; source: wall_thickness.py"
+    budget_tokens: 200
+    cooldown_turns: 6
+
+  - id: fastener_pattern
+    match:
+      keywords:
+        - "\\bbolt circle\\b"
+        - "\\bbolt pattern\\b"
+        - "\\bscrew pattern\\b"
+        - "\\bfastener pattern\\b"
+        - "\\bPCD\\b"
+        - "\\bflange bolt\\b"
+        - "\\bclearance hole\\b"
+        - "\\bcountersink\\b"
+        - "\\bcounterbore\\b"
+      tools:
+        - bolt_circle
+      events: []
+    inject:
+      context_pack: fastener_pattern
+      prerun_calcs:
+        - calc: tap_drill
+          inputs_from: match
+          input_map:
+            thread: thread_designation
+      exemplar: "M8 clearance hole: 8.5 mm pass-through (ISO 273 medium); pilot 6.8 mm (feeds_speeds.json)"
+    budget_tokens: 250
+    cooldown_turns: 8
+
+  - id: material_mention
+    match:
+      keywords:
+        - "\\baluminum\\b"
+        - "\\baluminium\\b"
+        - "\\bsteel\\b"
+        - "\\bstainless\\b"
+        - "\\bABS\\b"
+        - "\\bPLA\\b"
+        - "\\bPETG\\b"
+        - "\\btitanium\\b"
+        - "\\bbr(?:ass|onze)\\b"
+        - "\\bcast iron\\b"
+        - "\\bpolycarbonate\\b"
+        - "\\bPC\\b"
+        - "\\bnylon\\b"
+      tools:
+        - set_material
+        - research_material_lookup
+      events: []
+    inject:
+      context_pack: material_props
+      prerun_calcs: []
+      exemplar: "6061-T6 Al: E=68900 MPa, yield=276 MPa, ρ=2.70 g/cm³ (materials.json)"
+    budget_tokens: 250
+    cooldown_turns: 10
+
+  - id: tolerance_mention
+    match:
+      keywords:
+        - "\\btolerance\\b"
+        - "\\bfit\\b"
+        - "\\bH7\\b"
+        - "\\bg6\\b"
+        - "\\bf7\\b"
+        - "\\bk6\\b"
+        - "\\bp6\\b"
+        - "\\bISO 286\\b"
+        - "\\bclearance\\b"
+        - "\\bsliding fit\\b"
+        - "\\brunning fit\\b"
+      tools:
+        - fit_calc
+        - measure_between
+      events: []
+    inject:
+      context_pack: tolerance_fits
+      prerun_calcs:
+        - calc: fit_calc
+          inputs_from: match
+          input_map:
+            nominal: nominal_mm
+            fit: fit_designation
+      exemplar: "H7/g6 sliding fit on Ø20: clearance 0.007–0.041 mm (ISO 286, iso286.json)"
+    budget_tokens: 300
+    cooldown_turns: 8
+
+  - id: thread_engagement
+    match:
+      keywords:
+        - "\\bengagement\\b"
+        - "\\bthread length\\b"
+        - "\\bstud\\b"
+        - "\\bthread engagement\\b"
+        - "\\bthrough-hole\\b"
+        - "\\bblind hole\\b"
+        - "\\bboss\\b"
+      tools:
+        - research_thread_spec
+      events: []
+    inject:
+      context_pack: thread_engagement
+      prerun_calcs: []
+      exemplar: "Min engagement: 1.0×D steel-in-steel; 1.5×D aluminum; 2.0×D plastic (Machinery's Handbook)"
+    budget_tokens: 200
+    cooldown_turns: 10

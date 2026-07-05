@@ -2,8 +2,8 @@
 id: T-BL38
 title: Copilot context bar — auto-track selected model's context window, place between model picker and send, constrain picker width, k-token count + click-through breakdown
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-pell
+status: doing
 priority: 2
 lane: app-gui
 kind: fix

@@ -39,7 +39,12 @@ _READ_SUFFIXES = ("_status",)
 _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tree",
               "cam_materials", "cam_op_types", "cam_tool_types", "cam_post_dialects",
               "list_parts", "list_configurations", "list_world_bodies",
-              "list_standard_parts"}
+              "list_standard_parts",
+              # Design ledger (T-W1): ledger_get reads the ledger; the name starts with
+              # "ledger_" not "get_", so the prefix classifier misses it — explicit entry needed.
+              "ledger_get",
+              # Workspace (T-W16): status/events are read-only poll tools.
+              "workspace_status", "workspace_doc_events"}
 
 # Explicit overrides for names the classifier would mislabel. name -> risk.
 _RISK_OVERRIDES: dict[str, str] = {
@@ -171,18 +176,48 @@ def refusal(name: str) -> dict:
 
 
 # --------------------------------------------------------------------------- guard + view
+def _workspace_lease_refusal(doc_id: str, name: str) -> dict | None:
+    """Check write-lease for a mutating doc_id-bearing tool call.
+
+    Returns None to proceed, or a contract-shaped refusal dict if another
+    agent holds the write lease.  Import is deferred to avoid circular imports
+    (workspace.py imports from interaction.py, not from tool_registry.py).
+
+    Read tools (RISK_READ) are never checked — this is the hot path for reads
+    and the check is gated on risk class first so there is zero overhead for
+    read-only calls.
+    """
+    if classify_risk(name) == RISK_READ:
+        return None  # read tools never need a lease check
+    try:
+        from services.agent.workspace import check_write_lease  # deferred import
+        result = check_write_lease(doc_id, name)
+        return result  # None or refusal dict
+    except Exception:  # noqa: BLE001 — guard errors must never crash dispatch
+        return None
+
+
 def _guard(fn, name):
     """Wrap *fn* so a disallowed dispatch returns :func:`refusal` instead of running.
 
     ONE shared guard for every tool — this is the single dispatch chokepoint. The wrapper
     preserves *fn*'s signature (via functools.wraps' ``__wrapped__``) so FastMCP still
     introspects the real parameters, and matches its sync/async-ness.
+
+    T-W16 extension: mutating tools that carry a ``doc_id`` keyword argument are also
+    checked against the active workspace lease registry.  Read tools are never checked
+    (classify_risk fast-path).  If no workspace session is active the check is a no-op.
     """
     if inspect.iscoroutinefunction(fn):
         @wraps(fn)
         async def aguard(*args, **kwargs):
             if not is_allowed(name):
                 return refusal(name)
+            doc_id = kwargs.get("doc_id")
+            if doc_id:
+                denial = _workspace_lease_refusal(doc_id, name)
+                if denial is not None:
+                    return denial
             return await fn(*args, **kwargs)
         return aguard
 
@@ -190,6 +225,11 @@ def _guard(fn, name):
     def guard(*args, **kwargs):
         if not is_allowed(name):
             return refusal(name)
+        doc_id = kwargs.get("doc_id")
+        if doc_id:
+            denial = _workspace_lease_refusal(doc_id, name)
+            if denial is not None:
+                return denial
         return fn(*args, **kwargs)
     return guard
 

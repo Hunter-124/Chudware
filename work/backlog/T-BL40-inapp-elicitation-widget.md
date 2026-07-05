@@ -2,8 +2,8 @@
 id: T-BL40
 title: Universal in-app elicitation UI — agents question the user inline (multiple choice, short answer, open-ended) via the interaction contract
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-pell
+status: review
 priority: 2
 lane: app-gui
 kind: fix

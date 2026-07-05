@@ -2,8 +2,8 @@
 id: T-BL41
 title: Sketch — auto-hide dimension/relation annotations by default; dimension tool reveals them and adds/deletes relations
 workstream: backlog
-owner: unassigned
-status: todo
+owner: sonnet-dill
+status: review
 priority: 3
 lane: app-gui
 kind: overhaul
@@ -63,3 +63,5 @@ toggled.
   depth should stop at a repro + question file rather than guessing at constraint semantics.
 
 ## Progress log
+- 2026-07-04 21:09 UTC [sonnet-dill] Implementation complete. Branch task/T-BL41-sketch-dimension-autohide pushed. Three changes in sketch_overlay.cpp: (1) relation badges gated on SmartDim with relHits_.clear() pre-gate, (2) dim annotations gated on SmartDim with dimHoverCid_ cleared when hidden, (3) badge interaction (toggleRel + context menu) extended to SmartDim while keeping geometry drag/box-select None-only. Build PASS, --shot PASS, selftest PASS. Gate services pytest hung on pre-existing CAD-T-BL39 teardown issue — not related to this change.
+- 2026-07-04 21:34 UTC [sonnet-dill] Screenshot evidence added per foreman. New AI_CAD_SHOT=sketch_autohide scenario (engine-attached, xvfb, real dispatch->drain via pendingSketchEditFid) captures 4 PNGs in docs/sessions/assets/bl41_{dark,light}_{tooloff,toolon}.png. EYEBALLED all four: tool-OFF = clean geometry no dim/relation glyphs; SmartDim ON = 80mm dimension + coincident relation badge revealed; confirmed both themes. Interactive add/delete/drag-obeys limitation documented in work/questions/T-BL41.md as merge-time human check (static shot harness cannot inject clicks). gate.sh re-run RESULT PASS (build+shot+selftest; pytest FAIL-RECORDED pre-existing T-V2). Branch pushed (87865606). Status stays review.

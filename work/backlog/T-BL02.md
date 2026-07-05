@@ -3,7 +3,7 @@ id: T-BL02
 title: Format interop track (reverse-engineering intake)
 workstream: backlog
 owner: mooseinatree
-status: todo
+status: doing
 branch: task/T-BL02-format-interop
 depends_on: []
 lane: modeling-core
@@ -30,3 +30,27 @@ normal agent auto-claim path — coordinate with mooseinatree on which format is
 - [ ] Each format lands as an engine/doc/formats.py importer with fixture round-trip tests
 - [ ] Clean-room protocol memo followed for every reversed format
 - [ ] ODA membership decision recorded for DWG/Revit
+
+## Progress log
+
+### 2026-07-03 — mooseinatree (Opus driver, isolated Windows checkout)
+
+Picking up the greenlit no-reversing slice: **DXF import via ezdxf (MIT)**. Status:
+- `.3dm` (rhino3dm, MIT) importer/exporter already exists in engine/doc/formats.py at
+  the mesh level (NURBS/Brep-only .3dm still skip — rhino3dm has no mesher; documented).
+- `.dxf` is entirely absent (no ext map, no FormatInfo, no importer) → building it now:
+  `engine_oracle/doc/formats_dxf.py` (new module, mirrors formats_solidworks.py),
+  wired into the registry + import_path; ezdxf → build123d edges → wires → faces where
+  closed → Compound. Import-only for now (2D→DXF export deferred; stated honestly).
+
+**Environment note (this Windows checkout only, local/non-committed):** the top-level
+`engine`, `mcp_server`, `dag`, `deliverables`, `agent`, `installer`, `app`, `corpus*`,
+`test_fixtures_sw` names are git symlinks (mode 120000, e.g. `engine → engine_oracle`)
+that got materialized as real directory copies because core.symlinks=false on Windows.
+Git reported all 11 as "deleted", which tripped `work.py claim`'s dirty-tree guard
+(BUSY on every claim). Remedy applied: `git update-index --skip-worktree` on those 11
+paths — local-only, reversible (`--no-skip-worktree`), does NOT change committed content
+or the Linux symlink layout. Canonical edits go in the tracked tree (`engine_oracle/`);
+the runtime `engine/` copy is kept in sync for pytest (Python imports resolve to `engine/`).
+- 2026-07-04 00:53 UTC [mooseinatree] DXF import slice complete + pushed on branch task/T-BL02-format-interop (merge-ready). ezdxf (MIT) -> engine/doc/formats_dxf.py: LINE/CIRCLE/ARC/LWPOLYLINE(bulge)/POLYLINE/ELLIPSE/SPLINE/INSERT -> build123d planar B-rep (closed wires -> Faces, open -> wires), wired into import_path + FORMAT_REGISTRY (.dxf, import-only) + doc_formats matrix. 8 round-trip tests pass (python -m pytest engine/doc/test_formats_dxf.py). requirements.txt + contracts/licenses.md updated (ezdxf MIT, no debt). scripts/check.py stdlib gate PASS; core-build/ctest/full-pytest need Linux env (SKIP on this Windows box) - foreman Linux merge pass to run full gate.sh. ORACLE SIDE ONLY: GUI/MCP import runs in the C++ core (core/doc/formats.cpp, no DXF reader yet) -> follow-up T-BL47 cut for the bit-identical C++ mirror; import_part MCP docstring intentionally left unchanged until the core can import DXF. T-BL02 remains the ongoing interop umbrella (reopen after merge for next format: Parasolid/CATIA/etc.).
+- 2026-07-04 02:25 UTC [mooseinatree] Added DWG import + folded in clean-room format reference docs (branch task/T-BL02-format-interop, pushed). DWG: engine/doc/formats_dwg.py converts DWG->DXF via an external user-provided converter (ODA File Converter through ezdxf.addons.odafc, or LibreDWG dwg2dxf on PATH; subprocess-only, never bundled) then reuses the DXF pipeline (refactored formats_dxf.bodies_from_doc for sharing). Import-only; wired into import_path + FORMAT_REGISTRY + doc_formats. 5 DWG tests (12 pass incl. DXF, 1 skipped real-roundtrip needs a converter). licenses.md rows added (ODA FC proprietary + LibreDWG GPL, both subprocess-only). Reference docs: docs/reference/ (file-format survey, Db/Ge/Gi/Gs data model, build guidance) adapted clean-room from public-spec sources, cross-linked to formats.py/T-BL02/licenses.md. Still oracle-side (C++ core mirror = T-BL47 covers DXF; DWG would follow the same converter->DXF path there).

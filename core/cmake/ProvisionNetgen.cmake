@@ -128,8 +128,11 @@ if(NOT EXISTS "${_ng_implib}")
 
   # 4) build + install (Release). This compiles Netgen once (a few minutes) and caches it.
   message(STATUS "[netgen] building (one-time; cached under ${_ng_install})…")
-  if(WIN32)
-    set(_ng_install_target INSTALL)   # the VS-generator install target is upper-case
+  # The install target is upper-case INSTALL only for the Visual Studio and Xcode
+  # generators; Ninja/Makefiles use lower-case install. Netgen inherits our generator
+  # (CMAKE_GENERATOR, line ~102), so a Windows + Ninja build needs `install`, not `INSTALL`.
+  if(CMAKE_GENERATOR MATCHES "Visual Studio|Xcode")
+    set(_ng_install_target INSTALL)
   else()
     set(_ng_install_target install)
   endif()

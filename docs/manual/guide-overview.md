@@ -12,6 +12,13 @@ WORKFLOW
                                             (coincident/horizontal/parallel/tangent/...) + DRIVING
                                             DIMENSIONS, not loose geometry; check_sketch("s1")
                                             reports dof + conflicts so you can reach fully-defined.
+     preflight_ops(ops)                     OPTIONAL but recommended before big edits: dry-runs
+                                            the planned ops on a shadow clone — checks dangling
+                                            refs, impossible fillets, hole-through-nothing, and
+                                            downstream feature breaks — WITHOUT touching the live
+                                            doc. Returns aicad.preflight/1 with advisory_items.
+                                            A fail verdict is advisory (never blocks); add_features
+                                            runs preflight automatically (AI_CAD_PREFLIGHT=1).
   3. render_part()                          SEE it — an annotated, colour-coded image (faces
                                             tinted + labelled TOP/FRONT/RIGHT...). Self-review
                                             against the request; iterate add_features to fix.

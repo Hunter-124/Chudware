@@ -47,6 +47,12 @@ mcp = FastMCP(
         "design done, run check_feature_overlap() (one part's own features colliding — a boss "
         "swallowed by a later cut, redundant cuts) and, for multi-body/assembly docs, "
         "check_interference() (clash/clearance between bodies or components).\n"
+        "SKETCHES: touching endpoints are auto-coincident on every sketch edit (config "
+        "sketch.auto_coincident, default on), so profiles close without a 'not closed' error. "
+        "The sketch loop is edit -> sketch_health(id) for the narrated read (closure, which free "
+        "variables remain in plain words, an ordered relations-then-dimensions schedule) -> add the "
+        "scheduled relations / sketch_auto_constrain(id) to stitch near-touching endpoints -> "
+        "repeat until check_sketch reports dof 0.\n"
         "DONE MEANS VERIFIED: before reporting a design as finished, call verify_battery(doc_id) "
         "(cad_guide('verify')) — it runs the full check battery and returns a narrated PASS/WARN/"
         "FAIL verdict. Never declare done on a FAIL.\n"
@@ -57,10 +63,22 @@ mcp = FastMCP(
         "can check fulfilment (cad_guide('requirements')).\n"
         "MULTI-STEP MISSIONS: for 3+ sequential tool calls that can fail independently, use "
         "dag_plan → dag_run with checkpointing (cad_guide('dag')).\n"
+        "BUILD-ORDER PLANNING: for complex parts/assemblies, call buildgraph_plan(plan_json) "
+        "to convert a BUILD PLAN or dag/1 mission into an aicad.buildgraph/1 prerequisite graph "
+        "(datum→sketch, boss→pierce, parts→mates order); validator findings are advisory items. "
+        "buildgraph_status(run_id) reports node statuses. "
+        "Use before executing multi-feature parts to catch missing prerequisites.\n"
         "UNKNOWNS: batch all user questions into ONE ask_user([{id, prompt, type, default}, ...]) "
         "call with defaults for every field (cad_guide('interaction')).\n"
         "BOM + COST: after placing parts, bom_rollup() → bom_price() for a costed BOM; "
         "cam_cost_estimate() for made-part cost seeds (cad_guide('sourcing'), cad_guide('cost')).\n"
+        "CAM FEEDS & SPEEDS: feeds_speeds(material, tool_type, tool_dia, operation) returns a "
+        "table-driven rpm/feed/stepdown/stepover envelope (aicad.calc/1); cam_check_feeds_envelope() "
+        "returns an aicad.advisory/1 hint when params are out of range; tap_drill(thread) gives "
+        "the standard tap-drill size for metric and unified threads. Call these BEFORE cam_add_operation "
+        "to pick sane defaults, and use cam_check_feeds_envelope() AFTER to flag risky params before "
+        "simulation. Materials: same ids as cam_materials() / cam_add_setup() (alu_6061, steel_1018, "
+        "ti_6al4v, abs, pla, nylon_pa12, cast_iron_gray, inconel_718, …).\n"
         "DOMAIN TOOLS: cam_* (machining toolpaths — cad_guide('cam')), ecad_* (schematic/PCB), "
         "piping_* (pipe networks — cad_guide('piping')), hydraulic_* (ISO 1219 circuits — "
         "cad_guide('hydraulic')), fw_* (firmware build/sim/flash — cad_guide('firmware')), "
@@ -75,6 +93,10 @@ mcp = FastMCP(
         "DELIVERABLES: make_report/make_presentation/make_workbook build real office files "
         "(cad_guide('deliverables')). RESEARCH: research_web_search/research_fetch_page for "
         "look-it-up, never recall — the model never types a load-bearing number from memory.\n"
+        "DESIGN LEDGER (Pillar 20): ledger_get(run_id, budget_tokens) / ledger_note(run_id, kind, "
+        "payload) persist mission state (brief, decisions, dimensions, requirements, questions, "
+        "stage_log, artifacts) across role handoffs — the anti-context-loss mechanism for "
+        "24k-context local models. Every role should cold-start from ledger_get, not chat history.\n"
         "All cad_guide topics: overview, simulation, review, intake, gsl, cam, narration, parts, "
         "reverse, deliverables, requirements, dag, verify, interaction, sourcing, cost, spec, "
         "piping, hydraulic, firmware, structural, regen, code_compliance, serving, design_review, "
@@ -142,8 +164,16 @@ register_verify_tools(mcp)
 
 # Research (Pillar 8): look-it-up-instead-of-recall. web_search + fetch_page return the
 # provenance-stamped answer envelope; per-user local cache; offline-safe degradation.
+# T-W3: also registers fit_calc + recommend_fit (ISO 286, aicad.calc/1 envelope).
+# Rule: call fit_calc BEFORE hole_sizing / bore decisions; recommend_fit to choose the class.
 from mcp_server.research_tools import register_research_tools
 register_research_tools(mcp)
+
+# Dimension scheme planner (T-W3 / Pillar 20): suggest_dimension_scheme reads a sketch
+# entity roster and emits an ordered process-aware dimension plan (IT-grade tolerances,
+# bolt-pattern datum rules, needs_user_confirm flags for function-critical dims).
+from mcp_server.dimension_scheme_tools import register_dimension_scheme_tools
+register_dimension_scheme_tools(mcp)
 
 # Deliverables — spec-driven office artifacts (contract deliverables/1): make_presentation /
 # make_report / make_workbook build real .pptx/.docx/.pdf/.xlsx from a JSON spec with the
@@ -187,6 +217,11 @@ register_firmware_tools(mcp)
 from mcp_server.structural_tools import register_structural_tools
 register_structural_tools(mcp)
 
+# Preflight (T-W12, Pillar 20 §2.10): dry-run plan validation on shadow doc clones.
+# preflight_ops is read-only; never mutates the live doc.
+from mcp_server.preflight_tools import register_preflight_tools
+register_preflight_tools(mcp)
+
 # Unified parts library (T-P1): federated search across all standard-parts catalogs.
 # part_search / part_get over the aicad.parts/1 FTS hub (contracts/parts.md).
 from mcp_server.parts_tools import register_parts_tools
@@ -215,11 +250,42 @@ register_dag_tools(mcp)
 # into the persisted graph sidecar, and resumes via executor.resume().
 from services.dag.mcp_tools import register_dag_replan_tools
 register_dag_replan_tools(mcp)
+# Mission pipeline (T-W19): mission_start / mission_status / replan_request.
+# The copilot's mission front door — INTAKE→DELIVER phase machine on top of the
+# ledger + roles + buildgraph + DAG.  mission_status renders phase state from the
+# ledger stage_log (what mission control + the GUI consume); replan_request routes
+# an aicad.replan/1 request per contract §17.  The in-app path is
+# services.agent.loop.run_mission.
+from services.mcp.mission_tools import register_mission_tools
+register_mission_tools(mcp)
 # Design review battery (T-F12): one-call battery dispatching through DISPATCH_TABLE
 # (verify.py) + battery._get_fn for feature_overlap/dfm.  Returns a narrated verdict
 # card per contracts/narration.md — never a raw JSON dump.
 from services.mcp.design_review_tools import register_design_review_tools
 register_design_review_tools(mcp)
+# Design ledger (T-W1, Pillar 20): persistent mission state (aicad.ledger/1).
+# ledger_get / ledger_note let any agent role read or write the design ledger without
+# holding the full chat history — the anti-context-loss mechanism for 24k local models.
+# ledger_get is risk-class READ; ledger_note is WRITE (auto-classified by tool_registry).
+from services.mcp.ledger_tools import register_ledger_tools
+register_ledger_tools(_reg.view(mcp, "ledger"))
+# Build-order DAG planner (T-W15): buildgraph_plan / buildgraph_status.
+# LLM-free planner converts BUILD PLAN / dag/1 mission into aicad.buildgraph/1 graph
+# with prerequisite edges; validator findings are aicad.advisory/1 items.
+# ready_nodes() surface for T-W16 multi-doc fan-out.
+from services.agent.buildgraph.mcp_tools import register_buildgraph_tools
+register_buildgraph_tools(mcp)
+# Advisory engine / foreman (T-W5, Pillar 20): advise / stage_set / advisory_dispute.
+# advise runs a stage's read-only check battery over a doc on demand (aicad.advisory/1);
+# the in-app loop.py + dag node runner already run the foreman automatically. advise is
+# risk-class READ; stage_set / advisory_dispute are WRITE (ledger-logged, §9.3).
+from services.mcp.advisor_tools import register_advisor_tools
+register_advisor_tools(_reg.view(mcp, "advisor"))
+# Workspace (T-W16, Pillar 20 §2.14): multi-doc lease registry + per-doc event streams.
+# workspace_status / workspace_doc_events are risk-class READ (named in _READ_EXACT);
+# no write-lease required to poll status.
+from services.mcp.workspace_tools import register_workspace_tools
+register_workspace_tools(_reg.view(mcp, "workspace"))
 
 
 def _install_clean_stdout():

@@ -1,0 +1,57 @@
+schema: aicad.playbook/1
+id: cam_job
+stage: cam
+# Owning role: cam_programmer. Helper tools ⊆ cam_programmer.tool_allowlist.
+# NOTE (task note / lead flag): the cam_programmer prompt instructs "tap_drill sizes
+# the pilot", but tap_drill is NOT in cam_programmer.tool_allowlist (which is already
+# at the 14-tool cap). Under the helpers ⊆ allowlist model it is therefore NOT listed
+# as a step helper here. Resolving that (drop a tool to make room, or have the foreman
+# supply the pilot size via advisory) is a lead decision — see the T-W7 task note.
+steps:
+  - id: job_setup
+    goal: create the job; stock from the ledger/spec; material aligned to cam_materials ids
+    helper_tools: [ledger_get, cam_new_job, cam_set_stock, cam_materials]
+    checklist:
+      - stock choice recorded as a decision (oversize is money)
+      - material id aligned to cam_materials
+    output:
+      type: object
+      required: [job_id, stock]
+  - id: sequence
+    goal: start from the template when the part matches a family; else compose ops in machining order
+    helper_tools: [cam_add_setup, cam_add_operation]
+    checklist:
+      - matching family → deterministic op plan gives the sequence; you choose strategy/parameters
+      - no family → face → rough → rest-rough → finish → drill/tap → deburr-critical
+    output:
+      type: object
+      required: [operations]
+  - id: parameters
+    goal: every cutting parameter from feeds_speeds (material x tool x op); off-table overrides recorded with a reason
+    helper_tools: [feeds_speeds, cam_update_operation]
+    checklist:
+      - parameters start at the feeds_speeds conservative default
+      - off-table overrides carry a recorded reason (e.g. "thin wall, halve stepover for deflection")
+    output:
+      type: object
+      required: [parameters]
+  - id: fixturing
+    goal: define clamped faces per setup and never cut where the clamps are; flips reference machined datums
+    helper_tools: [cam_add_setup]
+    checklist:
+      - clamped faces stated per setup; no cutting through clamps
+      - flip setups reference setup-1 machined datums, not raw stock
+    output:
+      type: object
+      required: [setups]
+  - id: generate_sim_post
+    goal: generate then simulate EVERY setup; only a clean sim earns a post
+    helper_tools: [cam_generate, cam_simulate, cam_cost_estimate, cam_post]
+    checklist:
+      - zero gouges, zero rapids-through-stock on every setup
+      - machined_fraction meets target (leftover stock found and cleaned)
+      - cam_cost_estimate sanity-checks cycle time before posting
+    output:
+      type: object
+      required: [sim_results, post_artifact]
+exit_gate: [sim_clean, machined_fraction_met, posted]

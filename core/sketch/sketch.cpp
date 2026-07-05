@@ -2375,6 +2375,170 @@ std::map<std::string, std::string> warm_gate_decision(const json& sketch,
     return decision;
 }
 
+// ---- T-W2 free-variable narration + endpoint enumeration --------------------
+
+namespace {
+
+// Plain-word names for an entity's variables IN ALLOCATION ORDER — mirrors
+// allocate_entity's per-type layout exactly (see that function). The i-th string
+// names the i-th solver variable of the entity; free_variables maps a loose global
+// index back to this name via the entity's var_map slot. Unknown types return {}.
+std::vector<std::string> entity_var_names(const std::string& t, int nvars) {
+    if (t == "point") return {"x", "y"};
+    if (t == "line") return {"p1 x", "p1 y", "p2 x", "p2 y"};
+    if (t == "circle") return {"center x", "center y", "radius"};
+    if (t == "arc")
+        return {"center x", "center y", "radius", "start angle", "end angle"};
+    if (t == "ellipse") return {"center x", "center y", "rx", "ry", "rotation"};
+    if (t == "ellipse_arc")
+        return {"center x", "center y", "rx", "ry", "rotation", "start angle",
+                "end angle"};
+    if (t == "parabola")
+        return {"vertex x", "vertex y", "focus x", "focus y", "t0", "t1"};
+    if (t == "conic")
+        return {"p0 x", "p0 y", "p1 x", "p1 y", "apex x", "apex y", "rho"};
+    if (t == "slot") return {"p1 x", "p1 y", "p2 x", "p2 y", "width"};
+    if (t == "arc_slot")
+        return {"center x", "center y", "radius", "start angle", "end angle", "width"};
+    if (t == "spline" || t == "style_spline") {
+        std::vector<std::string> out;
+        int npts = nvars / 2;
+        for (int i = 0; i < npts; ++i) {
+            out.push_back("point " + std::to_string(i) + " x");
+            out.push_back("point " + std::to_string(i) + " y");
+        }
+        return out;
+    }
+    if (t == "text") return {"x", "y"};
+    return {};
+}
+
+}  // namespace
+
+std::vector<FreeVar> free_variables(const json& sketch, const json& env) {
+    json entities_list = sketch.value("entities", json::array());
+    json constraints_list = sketch.value("constraints", json::array());
+
+    // Rebuild the exact same system solve_sketch builds so variable indices line up.
+    System sys;
+    VarMap var_map;
+    EntMap entities;
+    for (const auto& e : entities_list) {
+        entities[e["id"]] = e;
+        try {
+            var_map[e["id"]] = allocate_entity(sys, e);
+        } catch (...) {
+            var_map[e["id"]] = sys.add_vars(0, {});
+        }
+    }
+    for (const auto& c : constraints_list) {
+        try {
+            add_constraint(sys, c, entities, var_map, env);
+        } catch (...) { /* forward-tolerant */ }
+    }
+
+    auto res = sys.solve(std::nullopt, 1e-10, 50);
+    const VectorXd& x = res.x;
+    int n = sys.n_vars();
+    MatrixXd J = sys.real_jacobian(x);
+
+    std::vector<FreeVar> out;
+    if (J.rows() == 0 || n == 0) return out;  // wholly unconstrained -> no J rows
+
+    // Same SVD null-space projection compute_statuses uses: a variable is FREE when its
+    // row of the null-space basis has non-trivial norm (it can move without violating a
+    // constraint). This is the per-VARIABLE version of the per-entity status coloring.
+    Eigen::JacobiSVD<MatrixXd> svd(J, Eigen::ComputeFullV);
+    VectorXd s = svd.singularValues();
+    double s0 = s.size() ? s(0) : 1.0;
+    double thr = std::max(1e-7, 1e3 * std::numeric_limits<double>::epsilon() * s0);
+    int rank = 0;
+    for (int i = 0; i < s.size(); ++i)
+        if (s(i) > thr) ++rank;
+    int n_null = n - rank;
+    VectorXd null_proj = VectorXd::Zero(n);
+    if (n_null > 0) {
+        const MatrixXd& V = svd.matrixV();
+        MatrixXd Vn = V.block(0, rank, n, n_null);
+        for (int i = 0; i < n; ++i) null_proj(i) = Vn.row(i).norm();
+    }
+    const double tol_null = 1e-6;
+
+    // Walk entities in declaration order; for each, map its loose local variables to
+    // their plain-word names. A global->local lookup via the entity's var_map slot.
+    for (const auto& e : entities_list) {
+        std::string id = e["id"];
+        const std::string t = e.value("type", std::string());
+        const std::vector<int>& v = var_map.at(id);
+        std::vector<std::string> names = entity_var_names(t, static_cast<int>(v.size()));
+        for (size_t li = 0; li < v.size(); ++li) {
+            int gi = v[li];
+            if (gi < 0 || gi >= n) continue;
+            if (null_proj(gi) < tol_null) continue;  // pinned — skip
+            FreeVar fv;
+            fv.entity = id;
+            fv.param = (li < names.size()) ? names[li] : ("var " + std::to_string(li));
+            fv.var = gi;
+            out.push_back(std::move(fv));
+        }
+    }
+    return out;
+}
+
+std::vector<Endpoint> entity_endpoints(const json& coords) {
+    std::vector<Endpoint> out;
+    auto push = [&](const std::string& id, const std::string& sub, double x, double y) {
+        Endpoint ep;
+        ep.handle = sub.empty() ? id : (id + "." + sub);
+        ep.x = x;
+        ep.y = y;
+        out.push_back(std::move(ep));
+    };
+    for (auto it = coords.begin(); it != coords.end(); ++it) {
+        const std::string& id = it.key();
+        const json& ent = it.value();
+        if (!ent.is_object()) continue;
+        if (ent.value("construction", false)) continue;
+        const std::string t = ent.value("type", std::string());
+        auto pt = [&](const char* k, double& ox, double& oy) -> bool {
+            if (!ent.contains(k) || !ent[k].is_array() || ent[k].size() < 2) return false;
+            ox = num(ent[k][0]);
+            oy = num(ent[k][1]);
+            return true;
+        };
+        double ax, ay;
+        if (t == "point") {
+            if (pt("p", ax, ay)) push(id, "", ax, ay);
+        } else if (t == "line" || t == "slot") {
+            if (pt("p1", ax, ay)) push(id, "p1", ax, ay);
+            if (pt("p2", ax, ay)) push(id, "p2", ax, ay);
+        } else if (t == "circle") {
+            if (pt("center", ax, ay)) push(id, "center", ax, ay);
+        } else if (t == "arc") {
+            if (pt("center", ax, ay)) push(id, "center", ax, ay);
+            if (ent.contains("center") && ent.contains("radius") &&
+                ent.contains("start") && ent.contains("end")) {
+                double cx = num(ent["center"][0]), cy = num(ent["center"][1]);
+                double r = num(ent["radius"]);
+                double sa = num(ent["start"]) * kDeg, ea = num(ent["end"]) * kDeg;
+                push(id, "start", cx + r * std::cos(sa), cy + r * std::sin(sa));
+                push(id, "end", cx + r * std::cos(ea), cy + r * std::sin(ea));
+            }
+        } else if (t == "spline" || t == "style_spline") {
+            if (ent.contains("points") && ent["points"].is_array() &&
+                ent["points"].size() >= 2) {
+                const json& p0 = ent["points"].front();
+                const json& pn = ent["points"].back();
+                if (p0.is_array() && p0.size() >= 2)
+                    push(id, "p1", num(p0[0]), num(p0[1]));
+                if (pn.is_array() && pn.size() >= 2)
+                    push(id, "p2", num(pn[0]), num(pn[1]));
+            }
+        }
+    }
+    return out;
+}
+
 // Current solved measurement for a DIMENSIONAL constraint. Port of measure_constraint.
 std::optional<double> measure_constraint(const json& constraint,
                                          const json& entity_coords) {

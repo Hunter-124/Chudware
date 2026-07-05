@@ -1,0 +1,1009 @@
+{
+  "_schema": "aicad.feeds_speeds/1",
+  "_note": "Conservative first-pass machining envelope data. Values are clean-room first-party compilation from public machining references — nominal ranges a user is expected to tune. Material IDs match engine_oracle/sim/materials.json and engine_oracle/materials/registry.json. Cutting-group IDs (cam_id) map to core/cam/feeds.cpp CuttingDB entries.",
+  "_citation": "Machinery's Handbook 31st ed. (Industrial Press); consistent with in-repo core/cam/feeds.cpp CuttingDB builtin table (first-party, AI-CAD project).",
+  "_license": "first-party compilation — see contracts/license_debt.md",
+  "_oss_survey": "Surveyed 2026-07-04: FSWizard (proprietary), HSMAdvisor (proprietary), OpenCAMLib (LGPL, no feeds/speeds data), FreeCAD Path module (LGPL, no bundled data tables). No permissively-licensed open dataset found. Values seeded from Machinery's Handbook public ranges and anchored to core/cam/feeds.cpp CuttingDB which is already in-repo first-party.",
+
+  "materials": {
+    "alu_6061": {
+      "name": "Aluminium 6061-T6",
+      "cam_id": "aluminum",
+      "tool_types": {
+        "endmill_flat": {
+          "roughing": {
+            "vc_sfm": [700, 1100],
+            "vc_mmin": [213, 335],
+            "chipload_by_dia": {
+              "<=6mm":  [0.030, 0.060],
+              "<=12mm": [0.050, 0.100],
+              "<=25mm": [0.075, 0.150],
+              ">25mm":  [0.100, 0.200]
+            },
+            "stepdown_frac": [0.50, 1.00],
+            "stepover_frac": [0.35, 0.50],
+            "coolant": "flood or mist; air blast acceptable",
+            "source": "Machinery's Handbook 31st ed. §Speeds and Feeds; consistent with core/cam/feeds.cpp aluminum sfm_mill=900"
+          },
+          "finishing": {
+            "vc_sfm": [900, 1300],
+            "vc_mmin": [274, 396],
+            "chipload_by_dia": {
+              "<=6mm":  [0.015, 0.030],
+              "<=12mm": [0.025, 0.050],
+              "<=25mm": [0.040, 0.080],
+              ">25mm":  [0.060, 0.120]
+            },
+            "stepdown_frac": [0.05, 0.20],
+            "stepover_frac": [0.05, 0.15],
+            "coolant": "flood or mist; air blast acceptable",
+            "source": "Machinery's Handbook 31st ed. §Speeds and Feeds; consistent with core/cam/feeds.cpp aluminum sfm_mill=900"
+          },
+          "slotting": {
+            "vc_sfm": [500, 800],
+            "vc_mmin": [152, 244],
+            "chipload_by_dia": {
+              "<=6mm":  [0.025, 0.050],
+              "<=12mm": [0.040, 0.080],
+              "<=25mm": [0.060, 0.120],
+              ">25mm":  [0.080, 0.150]
+            },
+            "stepdown_frac": [0.50, 1.00],
+            "stepover_frac": [0.90, 1.00],
+            "coolant": "flood or air blast",
+            "source": "Machinery's Handbook 31st ed. §Speeds and Feeds"
+          }
+        },
+        "endmill_ball": {
+          "finishing": {
+            "vc_sfm": [700, 1000],
+            "vc_mmin": [213, 305],
+            "chipload_by_dia": {
+              "<=6mm":  [0.015, 0.030],
+              "<=12mm": [0.025, 0.045],
+              "<=25mm": [0.035, 0.060],
+              ">25mm":  [0.050, 0.090]
+            },
+            "stepdown_frac": [0.05, 0.15],
+            "stepover_frac": [0.05, 0.10],
+            "coolant": "flood or mist",
+            "source": "Machinery's Handbook 31st ed. §Speeds and Feeds"
+          }
+        },
+        "drill": {
+          "drilling": {
+            "vc_sfm": [250, 400],
+            "vc_mmin": [76, 122],
+            "feed_per_rev_mm_by_dia": {
+              "<=3mm":  [0.025, 0.060],
+              "<=6mm":  [0.050, 0.100],
+              "<=12mm": [0.080, 0.150],
+              ">12mm":  [0.100, 0.200]
+            },
+            "coolant": "flood or air blast",
+            "source": "Machinery's Handbook 31st ed. §Drills; consistent with core/cam/feeds.cpp aluminum sfm_drill=300"
+          }
+        },
+        "tap": {
+          "drilling": {
+            "vc_sfm": [40, 80],
+            "vc_mmin": [12, 24],
+            "coolant": "flood or cutting oil",
+            "note": "synchronized feed = rpm * pitch; see tap_drill() for drill diameter",
+            "source": "Machinery's Handbook 31st ed. §Tapping; consistent with core/cam/feeds.cpp tap path"
+          }
+        },
+        "face_mill": {
+          "roughing": {
+            "vc_sfm": [700, 1100],
+            "vc_mmin": [213, 335],
+            "chipload_by_dia": {
+              "<=50mm":  [0.100, 0.180],
+              ">50mm":   [0.130, 0.250]
+            },
+            "stepdown_frac": [0.05, 0.10],
+            "stepover_frac": [0.60, 0.80],
+            "coolant": "flood or mist",
+            "source": "Machinery's Handbook 31st ed. §Face Milling"
+          }
+        }
+      }
+    },
+
+    "steel_1018": {
+      "name": "Steel AISI 1018 (mild)",
+      "cam_id": "steel_mild",
+      "tool_types": {
+        "endmill_flat": {
+          "roughing": {
+            "vc_sfm": [300, 450],
+            "vc_mmin": [91, 137],
+            "chipload_by_dia": {
+              "<=6mm":  [0.020, 0.040],
+              "<=12mm": [0.035, 0.065],
+              "<=25mm": [0.050, 0.090],
+              ">25mm":  [0.070, 0.120]
+            },
+            "stepdown_frac": [0.25, 0.50],
+            "stepover_frac": [0.30, 0.45],
+            "coolant": "flood required",
+            "source": "Machinery's Handbook 31st ed. §Speeds and Feeds; consistent with core/cam/feeds.cpp steel_mild sfm_mill=380"
+          },
+          "finishing": {
+            "vc_sfm": [350, 500],
+            "vc_mmin": [107, 152],
+            "chipload_by_dia": {
+              "<=6mm":  [0.010, 0.020],
+              "<=12mm": [0.015, 0.035],
+              "<=25mm": [0.025, 0.050],
+              ">25mm":  [0.040, 0.075]
+            },
+            "stepdown_frac": [0.05, 0.15],
+            "stepover_frac": [0.05, 0.10],
+            "coolant": "flood required",
+            "source": "Machinery's Handbook 31st ed. §Speeds and Feeds"
+          },
+          "slotting": {
+            "vc_sfm": [200, 320],
+            "vc_mmin": [61, 98],
+            "chipload_by_dia": {
+              "<=6mm":  [0.015, 0.030],
+              "<=12mm": [0.025, 0.050],
+              "<=25mm": [0.040, 0.075],
+              ">25mm":  [0.055, 0.100]
+            },
+            "stepdown_frac": [0.50, 1.00],
+            "stepover_frac": [0.90, 1.00],
+            "coolant": "flood required",
+            "source": "Machinery's Handbook 31st ed. §Speeds and Feeds"
+          }
+        },
+        "endmill_ball": {
+          "finishing": {
+            "vc_sfm": [300, 420],
+            "vc_mmin": [91, 128],
+            "chipload_by_dia": {
+              "<=6mm":  [0.010, 0.020],
+              "<=12mm": [0.015, 0.030],
+              "<=25mm": [0.025, 0.045],
+              ">25mm":  [0.035, 0.065]
+            },
+            "stepdown_frac": [0.03, 0.10],
+            "stepover_frac": [0.03, 0.08],
+            "coolant": "flood required",
+            "source": "Machinery's Handbook 31st ed. §Speeds and Feeds"
+          }
+        },
+        "drill": {
+          "drilling": {
+            "vc_sfm": [70, 120],
+            "vc_mmin": [21, 37],
+            "feed_per_rev_mm_by_dia": {
+              "<=3mm":  [0.020, 0.050],
+              "<=6mm":  [0.040, 0.080],
+              "<=12mm": [0.060, 0.120],
+              ">12mm":  [0.080, 0.150]
+            },
+            "coolant": "flood required",
+            "source": "Machinery's Handbook 31st ed. §Drills; consistent with core/cam/feeds.cpp steel_mild sfm_drill=90"
+          }
+        },
+        "tap": {
+          "drilling": {
+            "vc_sfm": [15, 35],
+            "vc_mmin": [5, 11],
+            "coolant": "cutting oil or sulfurized oil",
+            "note": "synchronized feed = rpm * pitch",
+            "source": "Machinery's Handbook 31st ed. §Tapping"
+          }
+        },
+        "face_mill": {
+          "roughing": {
+            "vc_sfm": [280, 420],
+            "vc_mmin": [85, 128],
+            "chipload_by_dia": {
+              "<=50mm":  [0.075, 0.150],
+              ">50mm":   [0.100, 0.200]
+            },
+            "stepdown_frac": [0.05, 0.10],
+            "stepover_frac": [0.60, 0.80],
+            "coolant": "flood required",
+            "source": "Machinery's Handbook 31st ed. §Face Milling"
+          }
+        }
+      }
+    },
+
+    "steel_304_stainless": {
+      "name": "Stainless Steel 304",
+      "cam_id": "stainless_304",
+      "tool_types": {
+        "endmill_flat": {
+          "roughing": {
+            "vc_sfm": [180, 280],
+            "vc_mmin": [55, 85],
+            "chipload_by_dia": {
+              "<=6mm":  [0.015, 0.030],
+              "<=12mm": [0.025, 0.050],
+              "<=25mm": [0.035, 0.070],
+              ">25mm":  [0.050, 0.090]
+            },
+            "stepdown_frac": [0.20, 0.40],
+            "stepover_frac": [0.25, 0.35],
+            "coolant": "flood required; high-pressure preferred",
+            "source": "Machinery's Handbook 31st ed. §Speeds and Feeds; consistent with core/cam/feeds.cpp stainless_304 sfm_mill=250"
+          },
+          "finishing": {
+            "vc_sfm": [220, 320],
+            "vc_mmin": [67, 98],
+            "chipload_by_dia": {
+              "<=6mm":  [0.008, 0.015],
+              "<=12mm": [0.012, 0.025],
+              "<=25mm": [0.018, 0.038],
+              ">25mm":  [0.025, 0.055]
+            },
+            "stepdown_frac": [0.03, 0.10],
+            "stepover_frac": [0.03, 0.08],
+            "coolant": "flood required",
+            "source": "Machinery's Handbook 31st ed. §Speeds and Feeds"
+          },
+          "slotting": {
+            "vc_sfm": [120, 200],
+            "vc_mmin": [37, 61],
+            "chipload_by_dia": {
+              "<=6mm":  [0.012, 0.025],
+              "<=12mm": [0.020, 0.040],
+              "<=25mm": [0.030, 0.060],
+              ">25mm":  [0.040, 0.075]
+            },
+            "stepdown_frac": [0.40, 0.80],
+            "stepover_frac": [0.90, 1.00],
+            "coolant": "flood required",
+            "source": "Machinery's Handbook 31st ed. §Speeds and Feeds"
+          }
+        },
+        "endmill_ball": {
+          "finishing": {
+            "vc_sfm": [180, 260],
+            "vc_mmin": [55, 79],
+            "chipload_by_dia": {
+              "<=6mm":  [0.008, 0.015],
+              "<=12mm": [0.012, 0.022],
+              "<=25mm": [0.018, 0.032],
+              ">25mm":  [0.025, 0.045]
+            },
+            "stepdown_frac": [0.02, 0.08],
+            "stepover_frac": [0.02, 0.06],
+            "coolant": "flood required",
+            "source": "Machinery's Handbook 31st ed. §Speeds and Feeds"
+          }
+        },
+        "drill": {
+          "drilling": {
+            "vc_sfm": [40, 80],
+            "vc_mmin": [12, 24],
+            "feed_per_rev_mm_by_dia": {
+              "<=3mm":  [0.015, 0.035],
+              "<=6mm":  [0.025, 0.060],
+              "<=12mm": [0.040, 0.090],
+              ">12mm":  [0.060, 0.120]
+            },
+            "coolant": "flood required; high-pressure preferred",
+            "source": "Machinery's Handbook 31st ed. §Drills; consistent with core/cam/feeds.cpp stainless_304 sfm_drill=60"
+          }
+        },
+        "tap": {
+          "drilling": {
+            "vc_sfm": [8, 20],
+            "vc_mmin": [2, 6],
+            "coolant": "cutting oil or sulfurized oil",
+            "note": "synchronized feed = rpm * pitch; use spiral-flute taps",
+            "source": "Machinery's Handbook 31st ed. §Tapping"
+          }
+        },
+        "face_mill": {
+          "roughing": {
+            "vc_sfm": [170, 260],
+            "vc_mmin": [52, 79],
+            "chipload_by_dia": {
+              "<=50mm":  [0.050, 0.110],
+              ">50mm":   [0.070, 0.150]
+            },
+            "stepdown_frac": [0.03, 0.08],
+            "stepover_frac": [0.60, 0.80],
+            "coolant": "flood required",
+            "source": "Machinery's Handbook 31st ed. §Face Milling"
+          }
+        }
+      }
+    },
+
+    "ti_6al4v": {
+      "name": "Titanium Ti-6Al-4V",
+      "cam_id": "titanium",
+      "tool_types": {
+        "endmill_flat": {
+          "roughing": {
+            "vc_sfm": [100, 200],
+            "vc_mmin": [30, 61],
+            "chipload_by_dia": {
+              "<=6mm":  [0.015, 0.025],
+              "<=12mm": [0.020, 0.035],
+              "<=25mm": [0.025, 0.045],
+              ">25mm":  [0.030, 0.060]
+            },
+            "stepdown_frac": [0.15, 0.30],
+            "stepover_frac": [0.15, 0.25],
+            "coolant": "high-pressure flood required",
+            "source": "Machinery's Handbook 31st ed. §Titanium; consistent with core/cam/feeds.cpp titanium sfm_mill=150"
+          },
+          "finishing": {
+            "vc_sfm": [130, 230],
+            "vc_mmin": [40, 70],
+            "chipload_by_dia": {
+              "<=6mm":  [0.008, 0.015],
+              "<=12mm": [0.012, 0.022],
+              "<=25mm": [0.015, 0.030],
+              ">25mm":  [0.020, 0.040]
+            },
+            "stepdown_frac": [0.02, 0.08],
+            "stepover_frac": [0.02, 0.06],
+            "coolant": "high-pressure flood required",
+            "source": "Machinery's Handbook 31st ed. §Titanium"
+          },
+          "slotting": {
+            "vc_sfm": [70, 130],
+            "vc_mmin": [21, 40],
+            "chipload_by_dia": {
+              "<=6mm":  [0.010, 0.020],
+              "<=12mm": [0.015, 0.028],
+              "<=25mm": [0.020, 0.038],
+              ">25mm":  [0.025, 0.050]
+            },
+            "stepdown_frac": [0.20, 0.50],
+            "stepover_frac": [0.90, 1.00],
+            "coolant": "high-pressure flood required",
+            "source": "Machinery's Handbook 31st ed. §Titanium"
+          }
+        },
+        "endmill_ball": {
+          "finishing": {
+            "vc_sfm": [100, 180],
+            "vc_mmin": [30, 55],
+            "chipload_by_dia": {
+              "<=6mm":  [0.008, 0.013],
+              "<=12mm": [0.010, 0.018],
+              "<=25mm": [0.012, 0.022],
+              ">25mm":  [0.015, 0.030]
+            },
+            "stepdown_frac": [0.02, 0.06],
+            "stepover_frac": [0.02, 0.05],
+            "coolant": "high-pressure flood required",
+            "source": "Machinery's Handbook 31st ed. §Titanium"
+          }
+        },
+        "drill": {
+          "drilling": {
+            "vc_sfm": [25, 55],
+            "vc_mmin": [8, 17],
+            "feed_per_rev_mm_by_dia": {
+              "<=3mm":  [0.010, 0.025],
+              "<=6mm":  [0.020, 0.040],
+              "<=12mm": [0.030, 0.060],
+              ">12mm":  [0.040, 0.080]
+            },
+            "coolant": "high-pressure flood required",
+            "source": "Machinery's Handbook 31st ed. §Titanium; consistent with core/cam/feeds.cpp titanium sfm_drill=40"
+          }
+        },
+        "tap": {
+          "drilling": {
+            "vc_sfm": [5, 12],
+            "vc_mmin": [2, 4],
+            "coolant": "cutting oil; high-pressure preferred",
+            "note": "synchronized feed = rpm * pitch; use spiral-flute taps; titanium work-hardens",
+            "source": "Machinery's Handbook 31st ed. §Tapping"
+          }
+        },
+        "face_mill": {
+          "roughing": {
+            "vc_sfm": [100, 180],
+            "vc_mmin": [30, 55],
+            "chipload_by_dia": {
+              "<=50mm":  [0.030, 0.070],
+              ">50mm":   [0.040, 0.090]
+            },
+            "stepdown_frac": [0.03, 0.06],
+            "stepover_frac": [0.50, 0.70],
+            "coolant": "high-pressure flood required",
+            "source": "Machinery's Handbook 31st ed. §Face Milling"
+          }
+        }
+      }
+    },
+
+    "abs": {
+      "name": "ABS Plastic",
+      "cam_id": "plastic",
+      "tool_types": {
+        "endmill_flat": {
+          "roughing": {
+            "vc_sfm": [700, 1200],
+            "vc_mmin": [213, 366],
+            "chipload_by_dia": {
+              "<=6mm":  [0.050, 0.100],
+              "<=12mm": [0.075, 0.150],
+              "<=25mm": [0.100, 0.200],
+              ">25mm":  [0.130, 0.250]
+            },
+            "stepdown_frac": [0.50, 1.50],
+            "stepover_frac": [0.40, 0.60],
+            "coolant": "air blast; avoid flood (degrades plastic)",
+            "source": "Machinery's Handbook 31st ed. §Plastics; consistent with core/cam/feeds.cpp plastic sfm_mill=1000"
+          },
+          "finishing": {
+            "vc_sfm": [900, 1500],
+            "vc_mmin": [274, 457],
+            "chipload_by_dia": {
+              "<=6mm":  [0.030, 0.060],
+              "<=12mm": [0.050, 0.100],
+              "<=25mm": [0.075, 0.150],
+              ">25mm":  [0.100, 0.200]
+            },
+            "stepdown_frac": [0.05, 0.25],
+            "stepover_frac": [0.05, 0.15],
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics"
+          },
+          "slotting": {
+            "vc_sfm": [500, 900],
+            "vc_mmin": [152, 274],
+            "chipload_by_dia": {
+              "<=6mm":  [0.040, 0.080],
+              "<=12mm": [0.060, 0.120],
+              "<=25mm": [0.080, 0.160],
+              ">25mm":  [0.100, 0.200]
+            },
+            "stepdown_frac": [0.50, 1.50],
+            "stepover_frac": [0.90, 1.00],
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics"
+          }
+        },
+        "endmill_ball": {
+          "finishing": {
+            "vc_sfm": [700, 1100],
+            "vc_mmin": [213, 335],
+            "chipload_by_dia": {
+              "<=6mm":  [0.030, 0.060],
+              "<=12mm": [0.050, 0.090],
+              "<=25mm": [0.070, 0.130],
+              ">25mm":  [0.090, 0.170]
+            },
+            "stepdown_frac": [0.05, 0.15],
+            "stepover_frac": [0.05, 0.10],
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics"
+          }
+        },
+        "drill": {
+          "drilling": {
+            "vc_sfm": [250, 450],
+            "vc_mmin": [76, 137],
+            "feed_per_rev_mm_by_dia": {
+              "<=3mm":  [0.030, 0.070],
+              "<=6mm":  [0.060, 0.120],
+              "<=12mm": [0.080, 0.160],
+              ">12mm":  [0.100, 0.200]
+            },
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics; consistent with core/cam/feeds.cpp plastic sfm_drill=400"
+          }
+        },
+        "tap": {
+          "drilling": {
+            "vc_sfm": [30, 60],
+            "vc_mmin": [9, 18],
+            "coolant": "none or light oil",
+            "note": "synchronized feed = rpm * pitch",
+            "source": "Machinery's Handbook 31st ed. §Tapping"
+          }
+        },
+        "face_mill": {
+          "roughing": {
+            "vc_sfm": [700, 1200],
+            "vc_mmin": [213, 366],
+            "chipload_by_dia": {
+              "<=50mm":  [0.120, 0.230],
+              ">50mm":   [0.150, 0.300]
+            },
+            "stepdown_frac": [0.05, 0.15],
+            "stepover_frac": [0.60, 0.80],
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics"
+          }
+        }
+      }
+    },
+
+    "pla": {
+      "name": "PLA Plastic",
+      "cam_id": "plastic",
+      "tool_types": {
+        "endmill_flat": {
+          "roughing": {
+            "vc_sfm": [600, 1000],
+            "vc_mmin": [183, 305],
+            "chipload_by_dia": {
+              "<=6mm":  [0.040, 0.080],
+              "<=12mm": [0.060, 0.120],
+              "<=25mm": [0.080, 0.160],
+              ">25mm":  [0.100, 0.200]
+            },
+            "stepdown_frac": [0.50, 1.50],
+            "stepover_frac": [0.40, 0.60],
+            "coolant": "air blast; no flood",
+            "source": "Machinery's Handbook 31st ed. §Plastics; PLA softer than ABS, slightly lower speeds"
+          },
+          "finishing": {
+            "vc_sfm": [800, 1300],
+            "vc_mmin": [244, 396],
+            "chipload_by_dia": {
+              "<=6mm":  [0.025, 0.055],
+              "<=12mm": [0.040, 0.090],
+              "<=25mm": [0.060, 0.130],
+              ">25mm":  [0.080, 0.170]
+            },
+            "stepdown_frac": [0.05, 0.20],
+            "stepover_frac": [0.05, 0.12],
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics"
+          },
+          "slotting": {
+            "vc_sfm": [400, 750],
+            "vc_mmin": [122, 229],
+            "chipload_by_dia": {
+              "<=6mm":  [0.030, 0.065],
+              "<=12mm": [0.050, 0.100],
+              "<=25mm": [0.070, 0.140],
+              ">25mm":  [0.090, 0.170]
+            },
+            "stepdown_frac": [0.50, 1.50],
+            "stepover_frac": [0.90, 1.00],
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics"
+          }
+        },
+        "drill": {
+          "drilling": {
+            "vc_sfm": [200, 380],
+            "vc_mmin": [61, 116],
+            "feed_per_rev_mm_by_dia": {
+              "<=3mm":  [0.025, 0.055],
+              "<=6mm":  [0.050, 0.100],
+              "<=12mm": [0.070, 0.140],
+              ">12mm":  [0.090, 0.180]
+            },
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics"
+          }
+        },
+        "tap": {
+          "drilling": {
+            "vc_sfm": [25, 50],
+            "vc_mmin": [8, 15],
+            "coolant": "none",
+            "note": "synchronized feed = rpm * pitch; PLA brittle, use sharp taps",
+            "source": "Machinery's Handbook 31st ed. §Tapping"
+          }
+        },
+        "face_mill": {
+          "roughing": {
+            "vc_sfm": [600, 1000],
+            "vc_mmin": [183, 305],
+            "chipload_by_dia": {
+              "<=50mm":  [0.100, 0.200],
+              ">50mm":   [0.130, 0.250]
+            },
+            "stepdown_frac": [0.05, 0.15],
+            "stepover_frac": [0.60, 0.80],
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics"
+          }
+        },
+        "endmill_ball": {
+          "finishing": {
+            "vc_sfm": [600, 950],
+            "vc_mmin": [183, 290],
+            "chipload_by_dia": {
+              "<=6mm":  [0.025, 0.050],
+              "<=12mm": [0.040, 0.080],
+              "<=25mm": [0.060, 0.110],
+              ">25mm":  [0.080, 0.150]
+            },
+            "stepdown_frac": [0.05, 0.15],
+            "stepover_frac": [0.05, 0.10],
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics"
+          }
+        }
+      }
+    },
+
+    "nylon_pa12": {
+      "name": "Nylon PA-12",
+      "cam_id": "plastic",
+      "tool_types": {
+        "endmill_flat": {
+          "roughing": {
+            "vc_sfm": [500, 900],
+            "vc_mmin": [152, 274],
+            "chipload_by_dia": {
+              "<=6mm":  [0.040, 0.075],
+              "<=12mm": [0.060, 0.110],
+              "<=25mm": [0.080, 0.150],
+              ">25mm":  [0.100, 0.190]
+            },
+            "stepdown_frac": [0.50, 1.25],
+            "stepover_frac": [0.40, 0.60],
+            "coolant": "air blast; no flood",
+            "source": "Machinery's Handbook 31st ed. §Plastics; nylon absorbs moisture, keep speeds moderate"
+          },
+          "finishing": {
+            "vc_sfm": [700, 1100],
+            "vc_mmin": [213, 335],
+            "chipload_by_dia": {
+              "<=6mm":  [0.025, 0.050],
+              "<=12mm": [0.040, 0.080],
+              "<=25mm": [0.060, 0.120],
+              ">25mm":  [0.080, 0.160]
+            },
+            "stepdown_frac": [0.05, 0.20],
+            "stepover_frac": [0.05, 0.12],
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics"
+          },
+          "slotting": {
+            "vc_sfm": [350, 650],
+            "vc_mmin": [107, 198],
+            "chipload_by_dia": {
+              "<=6mm":  [0.030, 0.060],
+              "<=12mm": [0.050, 0.095],
+              "<=25mm": [0.070, 0.130],
+              ">25mm":  [0.090, 0.160]
+            },
+            "stepdown_frac": [0.50, 1.25],
+            "stepover_frac": [0.90, 1.00],
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics"
+          }
+        },
+        "drill": {
+          "drilling": {
+            "vc_sfm": [180, 350],
+            "vc_mmin": [55, 107],
+            "feed_per_rev_mm_by_dia": {
+              "<=3mm":  [0.025, 0.060],
+              "<=6mm":  [0.050, 0.100],
+              "<=12mm": [0.075, 0.140],
+              ">12mm":  [0.090, 0.170]
+            },
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics"
+          }
+        },
+        "tap": {
+          "drilling": {
+            "vc_sfm": [25, 50],
+            "vc_mmin": [8, 15],
+            "coolant": "none or light oil",
+            "note": "synchronized feed = rpm * pitch",
+            "source": "Machinery's Handbook 31st ed. §Tapping"
+          }
+        },
+        "face_mill": {
+          "roughing": {
+            "vc_sfm": [500, 900],
+            "vc_mmin": [152, 274],
+            "chipload_by_dia": {
+              "<=50mm":  [0.100, 0.190],
+              ">50mm":   [0.130, 0.240]
+            },
+            "stepdown_frac": [0.05, 0.15],
+            "stepover_frac": [0.60, 0.80],
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics"
+          }
+        },
+        "endmill_ball": {
+          "finishing": {
+            "vc_sfm": [500, 850],
+            "vc_mmin": [152, 259],
+            "chipload_by_dia": {
+              "<=6mm":  [0.025, 0.050],
+              "<=12mm": [0.040, 0.075],
+              "<=25mm": [0.055, 0.105],
+              ">25mm":  [0.075, 0.140]
+            },
+            "stepdown_frac": [0.05, 0.12],
+            "stepover_frac": [0.05, 0.10],
+            "coolant": "air blast",
+            "source": "Machinery's Handbook 31st ed. §Plastics"
+          }
+        }
+      }
+    },
+
+    "cast_iron_gray": {
+      "name": "Cast Iron (Gray)",
+      "cam_id": "cast_iron",
+      "tool_types": {
+        "endmill_flat": {
+          "roughing": {
+            "vc_sfm": [200, 350],
+            "vc_mmin": [61, 107],
+            "chipload_by_dia": {
+              "<=6mm":  [0.020, 0.045],
+              "<=12mm": [0.035, 0.070],
+              "<=25mm": [0.050, 0.100],
+              ">25mm":  [0.070, 0.130]
+            },
+            "stepdown_frac": [0.30, 0.60],
+            "stepover_frac": [0.30, 0.45],
+            "coolant": "dry or air blast; coolant can cause cracking",
+            "source": "Machinery's Handbook 31st ed. §Cast Iron; consistent with core/cam/feeds.cpp cast_iron sfm_mill=300"
+          },
+          "finishing": {
+            "vc_sfm": [250, 400],
+            "vc_mmin": [76, 122],
+            "chipload_by_dia": {
+              "<=6mm":  [0.010, 0.025],
+              "<=12mm": [0.018, 0.040],
+              "<=25mm": [0.030, 0.060],
+              ">25mm":  [0.045, 0.085]
+            },
+            "stepdown_frac": [0.03, 0.10],
+            "stepover_frac": [0.03, 0.08],
+            "coolant": "dry preferred",
+            "source": "Machinery's Handbook 31st ed. §Cast Iron"
+          },
+          "slotting": {
+            "vc_sfm": [150, 270],
+            "vc_mmin": [46, 82],
+            "chipload_by_dia": {
+              "<=6mm":  [0.015, 0.035],
+              "<=12mm": [0.025, 0.055],
+              "<=25mm": [0.040, 0.080],
+              ">25mm":  [0.055, 0.105]
+            },
+            "stepdown_frac": [0.40, 0.80],
+            "stepover_frac": [0.90, 1.00],
+            "coolant": "dry preferred",
+            "source": "Machinery's Handbook 31st ed. §Cast Iron"
+          }
+        },
+        "endmill_ball": {
+          "finishing": {
+            "vc_sfm": [200, 320],
+            "vc_mmin": [61, 98],
+            "chipload_by_dia": {
+              "<=6mm":  [0.010, 0.020],
+              "<=12mm": [0.015, 0.030],
+              "<=25mm": [0.022, 0.045],
+              ">25mm":  [0.030, 0.060]
+            },
+            "stepdown_frac": [0.02, 0.08],
+            "stepover_frac": [0.02, 0.06],
+            "coolant": "dry preferred",
+            "source": "Machinery's Handbook 31st ed. §Cast Iron"
+          }
+        },
+        "drill": {
+          "drilling": {
+            "vc_sfm": [70, 120],
+            "vc_mmin": [21, 37],
+            "feed_per_rev_mm_by_dia": {
+              "<=3mm":  [0.020, 0.050],
+              "<=6mm":  [0.040, 0.080],
+              "<=12mm": [0.060, 0.120],
+              ">12mm":  [0.080, 0.150]
+            },
+            "coolant": "dry preferred; air blast for chip clearing",
+            "source": "Machinery's Handbook 31st ed. §Cast Iron; consistent with core/cam/feeds.cpp cast_iron sfm_drill=90"
+          }
+        },
+        "tap": {
+          "drilling": {
+            "vc_sfm": [15, 30],
+            "vc_mmin": [5, 9],
+            "coolant": "light oil or dry",
+            "note": "synchronized feed = rpm * pitch",
+            "source": "Machinery's Handbook 31st ed. §Tapping"
+          }
+        },
+        "face_mill": {
+          "roughing": {
+            "vc_sfm": [200, 350],
+            "vc_mmin": [61, 107],
+            "chipload_by_dia": {
+              "<=50mm":  [0.075, 0.150],
+              ">50mm":   [0.100, 0.200]
+            },
+            "stepdown_frac": [0.04, 0.10],
+            "stepover_frac": [0.60, 0.80],
+            "coolant": "dry preferred",
+            "source": "Machinery's Handbook 31st ed. §Face Milling"
+          }
+        }
+      }
+    },
+
+    "inconel_718": {
+      "name": "Inconel 718",
+      "cam_id": "inconel",
+      "tool_types": {
+        "endmill_flat": {
+          "roughing": {
+            "vc_sfm": [60, 120],
+            "vc_mmin": [18, 37],
+            "chipload_by_dia": {
+              "<=6mm":  [0.012, 0.022],
+              "<=12mm": [0.018, 0.032],
+              "<=25mm": [0.022, 0.040],
+              ">25mm":  [0.028, 0.050]
+            },
+            "stepdown_frac": [0.10, 0.20],
+            "stepover_frac": [0.10, 0.20],
+            "coolant": "high-pressure flood required",
+            "source": "Machinery's Handbook 31st ed. §Superalloys; consistent with core/cam/feeds.cpp inconel sfm_mill=90"
+          },
+          "finishing": {
+            "vc_sfm": [80, 140],
+            "vc_mmin": [24, 43],
+            "chipload_by_dia": {
+              "<=6mm":  [0.006, 0.012],
+              "<=12mm": [0.010, 0.018],
+              "<=25mm": [0.012, 0.022],
+              ">25mm":  [0.015, 0.028]
+            },
+            "stepdown_frac": [0.02, 0.06],
+            "stepover_frac": [0.02, 0.05],
+            "coolant": "high-pressure flood required",
+            "source": "Machinery's Handbook 31st ed. §Superalloys"
+          },
+          "slotting": {
+            "vc_sfm": [40, 80],
+            "vc_mmin": [12, 24],
+            "chipload_by_dia": {
+              "<=6mm":  [0.008, 0.016],
+              "<=12mm": [0.012, 0.022],
+              "<=25mm": [0.016, 0.030],
+              ">25mm":  [0.020, 0.038]
+            },
+            "stepdown_frac": [0.10, 0.30],
+            "stepover_frac": [0.80, 1.00],
+            "coolant": "high-pressure flood required",
+            "source": "Machinery's Handbook 31st ed. §Superalloys"
+          }
+        },
+        "drill": {
+          "drilling": {
+            "vc_sfm": [15, 35],
+            "vc_mmin": [5, 11],
+            "feed_per_rev_mm_by_dia": {
+              "<=3mm":  [0.008, 0.018],
+              "<=6mm":  [0.012, 0.025],
+              "<=12mm": [0.018, 0.035],
+              ">12mm":  [0.025, 0.050]
+            },
+            "coolant": "high-pressure flood required",
+            "source": "Machinery's Handbook 31st ed. §Superalloys; consistent with core/cam/feeds.cpp inconel sfm_drill=25"
+          }
+        },
+        "tap": {
+          "drilling": {
+            "vc_sfm": [3, 8],
+            "vc_mmin": [1, 2],
+            "coolant": "cutting oil",
+            "note": "synchronized feed = rpm * pitch; extreme difficulty — consider thread milling",
+            "source": "Machinery's Handbook 31st ed. §Tapping"
+          }
+        },
+        "face_mill": {
+          "roughing": {
+            "vc_sfm": [60, 110],
+            "vc_mmin": [18, 34],
+            "chipload_by_dia": {
+              "<=50mm":  [0.030, 0.070],
+              ">50mm":   [0.040, 0.090]
+            },
+            "stepdown_frac": [0.02, 0.05],
+            "stepover_frac": [0.40, 0.60],
+            "coolant": "high-pressure flood required",
+            "source": "Machinery's Handbook 31st ed. §Superalloys"
+          }
+        },
+        "endmill_ball": {
+          "finishing": {
+            "vc_sfm": [60, 110],
+            "vc_mmin": [18, 34],
+            "chipload_by_dia": {
+              "<=6mm":  [0.005, 0.010],
+              "<=12mm": [0.008, 0.014],
+              "<=25mm": [0.010, 0.018],
+              ">25mm":  [0.012, 0.022]
+            },
+            "stepdown_frac": [0.01, 0.04],
+            "stepover_frac": [0.01, 0.04],
+            "coolant": "high-pressure flood required",
+            "source": "Machinery's Handbook 31st ed. §Superalloys"
+          }
+        }
+      }
+    }
+  },
+
+  "tap_drill": {
+    "_note": "Tap drill diameter = nominal major diameter - pitch (ISO 2306 / DIN 336 for metric; ASME B94.9 for unified). Values in mm for metric, in for unified.",
+    "_source": "Machinery's Handbook 31st ed. §Tap Drill Sizes; ISO 2306; ASME B94.9",
+    "metric_coarse": {
+      "M1x0.25":   {"tap_drill_mm": 0.75,  "pct_thread": 75},
+      "M1.6x0.35": {"tap_drill_mm": 1.25,  "pct_thread": 75},
+      "M2x0.4":    {"tap_drill_mm": 1.60,  "pct_thread": 75},
+      "M2.5x0.45": {"tap_drill_mm": 2.05,  "pct_thread": 75},
+      "M3x0.5":    {"tap_drill_mm": 2.50,  "pct_thread": 75},
+      "M4x0.7":    {"tap_drill_mm": 3.30,  "pct_thread": 75},
+      "M5x0.8":    {"tap_drill_mm": 4.20,  "pct_thread": 75},
+      "M6x1.0":    {"tap_drill_mm": 5.00,  "pct_thread": 75},
+      "M8x1.25":   {"tap_drill_mm": 6.80,  "pct_thread": 75},
+      "M10x1.5":   {"tap_drill_mm": 8.50,  "pct_thread": 75},
+      "M12x1.75":  {"tap_drill_mm": 10.20, "pct_thread": 75},
+      "M14x2.0":   {"tap_drill_mm": 12.00, "pct_thread": 75},
+      "M16x2.0":   {"tap_drill_mm": 14.00, "pct_thread": 75},
+      "M20x2.5":   {"tap_drill_mm": 17.50, "pct_thread": 75},
+      "M24x3.0":   {"tap_drill_mm": 21.00, "pct_thread": 75},
+      "M30x3.5":   {"tap_drill_mm": 26.50, "pct_thread": 75},
+      "M36x4.0":   {"tap_drill_mm": 32.00, "pct_thread": 75}
+    },
+    "metric_fine": {
+      "M6x0.75":   {"tap_drill_mm": 5.25,  "pct_thread": 75},
+      "M8x1.0":    {"tap_drill_mm": 7.00,  "pct_thread": 75},
+      "M10x1.0":   {"tap_drill_mm": 9.00,  "pct_thread": 75},
+      "M10x1.25":  {"tap_drill_mm": 8.75,  "pct_thread": 75},
+      "M12x1.25":  {"tap_drill_mm": 10.75, "pct_thread": 75},
+      "M12x1.5":   {"tap_drill_mm": 10.50, "pct_thread": 75},
+      "M16x1.5":   {"tap_drill_mm": 14.50, "pct_thread": 75},
+      "M20x1.5":   {"tap_drill_mm": 18.50, "pct_thread": 75},
+      "M20x2.0":   {"tap_drill_mm": 18.00, "pct_thread": 75},
+      "M24x2.0":   {"tap_drill_mm": 22.00, "pct_thread": 75}
+    },
+    "unified_unc": {
+      "#4-40":    {"tap_drill_in": 0.0890, "tap_drill_mm": 2.26,  "pct_thread": 75},
+      "#6-32":    {"tap_drill_in": 0.1065, "tap_drill_mm": 2.71,  "pct_thread": 75},
+      "#8-32":    {"tap_drill_in": 0.1360, "tap_drill_mm": 3.45,  "pct_thread": 75},
+      "#10-24":   {"tap_drill_in": 0.1495, "tap_drill_mm": 3.80,  "pct_thread": 75},
+      "#10-32":   {"tap_drill_in": 0.1590, "tap_drill_mm": 4.04,  "pct_thread": 75},
+      "1/4-20":   {"tap_drill_in": 0.2010, "tap_drill_mm": 5.11,  "pct_thread": 75},
+      "5/16-18":  {"tap_drill_in": 0.2570, "tap_drill_mm": 6.53,  "pct_thread": 75},
+      "3/8-16":   {"tap_drill_in": 0.3125, "tap_drill_mm": 7.94,  "pct_thread": 75},
+      "7/16-14":  {"tap_drill_in": 0.3680, "tap_drill_mm": 9.35,  "pct_thread": 75},
+      "1/2-13":   {"tap_drill_in": 0.4219, "tap_drill_mm": 10.72, "pct_thread": 75},
+      "5/8-11":   {"tap_drill_in": 0.5312, "tap_drill_mm": 13.49, "pct_thread": 75},
+      "3/4-10":   {"tap_drill_in": 0.6562, "tap_drill_mm": 16.67, "pct_thread": 75},
+      "1-8":      {"tap_drill_in": 0.8750, "tap_drill_mm": 22.23, "pct_thread": 75}
+    },
+    "unified_unf": {
+      "#4-48":    {"tap_drill_in": 0.0935, "tap_drill_mm": 2.37,  "pct_thread": 75},
+      "#6-40":    {"tap_drill_in": 0.1130, "tap_drill_mm": 2.87,  "pct_thread": 75},
+      "#8-36":    {"tap_drill_in": 0.1440, "tap_drill_mm": 3.66,  "pct_thread": 75},
+      "#10-32":   {"tap_drill_in": 0.1590, "tap_drill_mm": 4.04,  "pct_thread": 75},
+      "1/4-28":   {"tap_drill_in": 0.2130, "tap_drill_mm": 5.41,  "pct_thread": 75},
+      "5/16-24":  {"tap_drill_in": 0.2720, "tap_drill_mm": 6.91,  "pct_thread": 75},
+      "3/8-24":   {"tap_drill_in": 0.3320, "tap_drill_mm": 8.43,  "pct_thread": 75},
+      "7/16-20":  {"tap_drill_in": 0.3906, "tap_drill_mm": 9.92,  "pct_thread": 75},
+      "1/2-20":   {"tap_drill_in": 0.4531, "tap_drill_mm": 11.51, "pct_thread": 75},
+      "3/4-16":   {"tap_drill_in": 0.6875, "tap_drill_mm": 17.46, "pct_thread": 75},
+      "1-12":     {"tap_drill_in": 0.9219, "tap_drill_mm": 23.42, "pct_thread": 75}
+    }
+  }
+}

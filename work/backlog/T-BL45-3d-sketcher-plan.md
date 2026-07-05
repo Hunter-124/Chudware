@@ -2,8 +2,8 @@
 id: T-BL45
 title: 3D sketcher — OSS survey + design/plan freeze (data model, 3D constraint solver, integration with 2D sketch + features)
 workstream: backlog
-owner: unassigned
-status: todo
+owner: opus-corm
+status: doing
 priority: 3
 lane: modeling-core
 kind: new

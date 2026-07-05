@@ -37,3 +37,4 @@ shot-verified. Independent — can start now against the existing mission worksp
 
 ## Progress log
 - 2026-07-05 20:43 UTC [sonnet-vale1] Starting T-DP13: multi-file agent view. Running graphify to orient on mission workspace + ui/imgui substrate.
+- 2026-07-05 21:02 UTC [sonnet-vale1] Implementation complete. Extended DocTab with agentRunning/agentOwner/agentModel/agentSpinT; doc_tabs.cpp draws pulsing accent dot per tab when running. WatchTile gains spinT for live arc spinner in watch_grid_panel.cpp. New fixture r_concurrent_agents (2 docs both building). New AI_CAD_SHOT=agent_multifile: eyeballed PNG shows both tiles with spinning arcs, feature_modeler+assembly_fit_engineer attribution. ui_style_check 0 findings. Committed 832a582b, gate.sh running.

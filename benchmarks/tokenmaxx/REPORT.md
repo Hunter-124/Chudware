@@ -192,6 +192,23 @@ then, bundle the CUDA llama.cpp 4B stack.
   a "paradigm TPS reference only."
 - **qwen3 GBNF recovery fixes:** listed as hypotheses, not tested — out of scope for the
   bench; flagged for follow-up.
+- **scripts/gate.sh not run to completion:** it timed out at 7 min on the OCCT C++
+  build leg (unrelated to these Python-only changes). The Python legs were run directly
+  instead: full `pytest services/agent/` = **885 passed, 2 failed, 3 skipped**; the 2
+  failures (`test_h7_shadow`, `test_providers_conformance`) are the known issue #16
+  pre-existing failures in files this task never touched (confirmed: they fail in
+  isolation without any of my code in the import path). `test_local_runtime.py` (incl.
+  the 6 new `TestBackendSeam` tests) = 24 passed, 2 skipped. `test_loop_mock.py` was
+  uncollectable due to a pre-existing missing sample file (`services/engine/samples/
+  mounting_plate.py`), also unrelated. `graphify update .` was run (32450 nodes).
+
+## Caveat on qwen3's single-stream number
+
+qwen3-4b's 175 tok/s **includes its `<think>` reasoning tokens**, so its rate of
+*useful output* is lower than the raw figure — relevant to the serial-deep-think row
+where qwen3 is proposed for reasoning speed. The instruct models (gemma3/gemma4) emit no
+hidden reasoning, so their tok/s is closer to useful-output rate. This does not change
+the recommendation but is worth weighing when comparing the two families directly.
 
 ---
 

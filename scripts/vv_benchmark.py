@@ -1162,6 +1162,144 @@ def bench_calculix() -> None:
 
 
 # ===========================================================================
+# FAMILY 10: Advanced FEA (T-BL04) — fatigue / thermal / buckling / contact
+# Fatigue is pure-Python (S-N life layer, no binary). Thermal/buckling/contact
+# run through the SAME ccx subprocess as FAMILY 9 and SKIP honestly when absent.
+# Each case cites a closed-form reference with literal expected values + a tier.
+# ===========================================================================
+
+def bench_fatigue_life() -> None:
+    """T-BL04 fatigue: the host-mirrored S-N life layer vs a Shigley hand-calc."""
+    print("\n--- [fatigue] S-N (Basquin) life post-processing ---")
+    try:
+        from services.mcp import fea_advanced as fa
+    except Exception as exc:  # noqa: BLE001
+        _skip("fatigue", "FAT1-basquin-life", f"import failed: {exc}", "")
+        return
+    # Case FAT1: fully-reversed sa_eq=250 MPa on steel (Se=200, Sut=400).
+    # Shigley high-cycle S-N: a=(0.9*Sut)^2/Se=(360)^2/200=648.0;
+    #   b=-(1/3)*log10(0.9*Sut/Se)=-(1/3)*log10(1.8)=-0.085085;
+    #   N=(sa/a)^(1/b)=(250/648)^(1/-0.085085) = 7.263e4 cycles.
+    # Reference: Shigley's Mechanical Engineering Design 10th ed, Eq 6-14..6-16
+    #   (fully-reversed S-N line, f=0.9). Hand-typed; no text reproduced.
+    cite = "Shigley 10th Eq 6-14..6-16 (high-cycle S-N line, f=0.9)"
+    N = fa.sn_life(250.0, 200.0, 400.0)
+    _check("fatigue", "FAT1-basquin-life", "PRECISE", N, 7.2627e4, cite,
+           note="fully-reversed sa_eq=250, Se=200, Sut=400 MPa")
+    # Case FAT2: runout — sa_eq=150 < Se=200 ⇒ infinite life sentinel 1e6.
+    N2 = fa.sn_life(150.0, 200.0, 400.0)
+    _check("fatigue", "FAT2-endurance-runout", "EXACT", N2, 1.0e6, cite,
+           note="sa_eq below endurance limit ⇒ runout (>=1e6)")
+    # Case FAT3: Marin surface factor ka, machined steel Sut=400 MPa.
+    #   ka = 4.51 * 400^-0.265 = 0.9218. Reference: Shigley Eq 6-19, Table 6-2.
+    ka = fa.marin_ka(400.0, 1)
+    _check("fatigue", "FAT3-marin-ka", "PRECISE", ka, 0.9218,
+           "Shigley 10th Eq 6-19 Table 6-2 (surface factor, machined)")
+
+
+def bench_thermal_ccx() -> None:
+    """T-BL04 thermal: 1-D steady conduction mid-plane temperature via ccx."""
+    print("\n--- [thermal] CalculiX steady-state conduction ---")
+    from services.mcp import fea_advanced as fa
+    # Reference: 1-D steady conduction with fixed end temperatures has a LINEAR
+    # profile, so T(mid) = (T_hot + T_cold)/2 exactly (Incropera, Fundamentals of
+    # Heat and Mass Transfer, plane-wall conduction). Hand-typed.
+    cite = "Incropera Heat & Mass Transfer — 1-D plane-wall conduction (linear T)"
+    L, b, h = 200.0, 20.0, 20.0
+    gen = fa.build_thermal_bar_inp(L, b, h, 50.0, 100.0, 0.0)
+    if fa.ccx_path() is None:
+        _skip("thermal", "TH1-1d-conduction-mid-T",
+              "ccx not on PATH — subprocess-only (GPL-2.0 isolation); the .inp "
+              "generator + expected mid-T are covered by TestSmoke without ccx", cite)
+        return
+    run = fa.run_ccx(gen["inp"], job="th")
+    if not run.get("ok") or not run.get("dat_path"):
+        _record("thermal", "TH1-1d-conduction-mid-T", "ENGINEERING", "FAIL", None,
+                gen["expected_mid_T"], run.get("stderr", "")[-200:] or "ccx failed", cite)
+        return
+    mid = fa.parse_dat_nodal(run["dat_path"], "NT", gen["mid_nodes"], component=1)
+    if mid is None:
+        _record("thermal", "TH1-1d-conduction-mid-T", "ENGINEERING", "FAIL", None,
+                gen["expected_mid_T"], "could not parse NT from .dat", cite)
+        return
+    _check("thermal", "TH1-1d-conduction-mid-T", "ENGINEERING", mid,
+           gen["expected_mid_T"], cite, note="100/0 C ends, k=50 W/mK")
+
+
+def bench_buckling_ccx() -> None:
+    """T-BL04 buckling: Euler fixed-free critical load via ccx *BUCKLE."""
+    print("\n--- [buckling] CalculiX linear buckling ---")
+    from services.mcp import fea_advanced as fa
+    # Reference: Euler critical load, fixed-free column, Pcr = π²EI/(2L)²
+    #   (Timoshenko & Gere, Theory of Elastic Stability, K=2 end condition). Hand-typed.
+    cite = "Timoshenko & Gere, Theory of Elastic Stability — Euler fixed-free Pcr=π²EI/(2L)²"
+    L, b, h, E, nu = 1000.0, 20.0, 20.0, 200000.0, 0.29
+    P = 5000.0
+    gen = fa.build_buckling_column_inp(L, b, h, E, nu, P)
+    if fa.ccx_path() is None:
+        _skip("buckling", "BK1-euler-fixed-free",
+              "ccx not on PATH — subprocess-only (GPL-2.0 isolation); the .inp "
+              "generator + Euler reference are covered by TestSmoke without ccx", cite)
+        return
+    run = fa.run_ccx(gen["inp"], job="bk")
+    if not run.get("ok") or not run.get("dat_path"):
+        _record("buckling", "BK1-euler-fixed-free", "ENGINEERING", "FAIL", None,
+                gen["expected_Pcr"], run.get("stderr", "")[-200:] or "ccx failed", cite)
+        return
+    factors = fa.parse_buckle_factors(run["dat_path"])
+    if not factors:
+        _record("buckling", "BK1-euler-fixed-free", "ENGINEERING", "FAIL", None,
+                gen["expected_Pcr"], "could not parse buckling factors", cite)
+        return
+    Pcr_ccx = factors[0] * P
+    # 3-D hex buckling of a stubby block over-stiffens vs the slender Euler ideal;
+    # ENGINEERING tier (10%) for the discretised critical load. Note the aspect
+    # ratio L/h=50 keeps it Euler-slender so the tier holds.
+    _check("buckling", "BK1-euler-fixed-free", "ENGINEERING", Pcr_ccx,
+           gen["expected_Pcr"], cite, note=f"L/h=50 slender, λ1={factors[0]:.4g}")
+
+
+def bench_contact_ccx() -> None:
+    """T-BL04 contact: NLGEOM two-block contact load-transfer conservation via ccx."""
+    print("\n--- [contact] CalculiX nonlinear contact ---")
+    from services.mcp import fea_advanced as fa
+    # Reference: static equilibrium — the vertical reaction at the fixed base must
+    # equal the applied load transmitted across the contact interface (Newton's
+    # third law / global force balance). A correct contact solve conserves it.
+    cite = "Static equilibrium (Newton III): base reaction == applied load across contact"
+    L, b, h, E, nu = 20.0, 20.0, 10.0, 200000.0, 0.29
+    pressure = 5.0
+    gen = fa.build_contact_block_inp(L, b, h, E, nu, pressure)
+    applied = gen["applied_load_n"]
+    if fa.ccx_path() is None:
+        _skip("contact", "CT1-load-transfer-conservation",
+              "ccx not on PATH — subprocess-only (GPL-2.0 isolation); the two-block "
+              ".inp generator is covered by TestSmoke without ccx", cite)
+        return
+    run = fa.run_ccx(gen["inp"], job="ct", timeout=180.0)
+    if not run.get("ok") or not run.get("dat_path"):
+        _record("contact", "CT1-load-transfer-conservation", "ENGINEERING", "FAIL",
+                None, applied, run.get("stderr", "")[-200:] or "ccx failed", cite)
+        return
+    rf = fa.parse_dat_nodal(run["dat_path"], "RF", gen["base_nodes"], component=3)
+    if rf is None:
+        _record("contact", "CT1-load-transfer-conservation", "ENGINEERING", "FAIL",
+                None, applied, "could not parse RF from .dat", cite)
+        return
+    reaction = abs(rf * len(gen["base_nodes"]))
+    _check("contact", "CT1-load-transfer-conservation", "ENGINEERING", reaction,
+           applied, cite, note=f"pressure={pressure} MPa on {L}x{b} mm face")
+
+
+def bench_advanced_fea() -> None:
+    """T-BL04 FAMILY 10 driver — fatigue + thermal + buckling + contact."""
+    bench_fatigue_life()
+    bench_thermal_ccx()
+    bench_buckling_ccx()
+    bench_contact_ccx()
+
+
+# ===========================================================================
 # REPORT GENERATION
 # ===========================================================================
 
@@ -1292,6 +1430,7 @@ def main() -> int:
     bench_modal()
     bench_fea_static()
     bench_calculix()
+    bench_advanced_fea()   # T-BL04: fatigue + thermal + buckling + contact
     bench_cfd_lbm_trend()
     elapsed = time.perf_counter() - t0
 
@@ -1513,6 +1652,62 @@ class TestSmoke:
         assert meta["n_nodes"] == 5 * 3 * 3
         assert meta["n_elements"] == 4 * 2 * 2
         assert len(meta["tip_nodes"]) == 3 * 3
+
+    def test_bl04_fatigue_life_handcalc(self):
+        """T-BL04 FAT1: the S-N life layer matches the Shigley hand-calc (no binary)."""
+        from services.mcp import fea_advanced as fa
+        N = fa.sn_life(250.0, 200.0, 400.0)
+        assert abs(N - 7.2627e4) / 7.2627e4 < 0.01, N
+        assert fa.sn_life(150.0, 200.0, 400.0) == 1e6         # runout
+        assert abs(fa.marin_ka(400.0, 1) - 0.9218) < 0.01     # machined ka
+
+    def test_bl04_fatigue_summarize(self):
+        """T-BL04: fatigue_summarize turns engine sa_eq into life + regime + fos."""
+        from services.mcp import fea_advanced as fa
+        theories = {"goodman": {"sa_eq_mpa": 250.0}, "gerber": {"sa_eq_mpa": 150.0}}
+        out = fa.fatigue_summarize(theories, 200.0, 400.0, theory="goodman")
+        assert out["regime"] == "finite" and out["cycles"] is not None
+        assert out["theories"]["gerber"]["regime"] == "infinite"   # below Se
+        assert out["fos_endurance"] == round(200.0 / 250.0, 4)
+
+    def test_bl04_thermal_inp_generator(self):
+        """T-BL04 TH1: thermal .inp is self-consistent + mid-T = mean (no ccx)."""
+        from services.mcp import fea_advanced as fa
+        gen = fa.build_thermal_bar_inp(200.0, 20.0, 20.0, 50.0, 100.0, 0.0,
+                                       nx=8, ny=2, nz=2)
+        assert "*HEAT TRANSFER, STEADY STATE" in gen["inp"]
+        assert "*CONDUCTIVITY" in gen["inp"] and "*BOUNDARY" in gen["inp"]
+        assert gen["expected_mid_T"] == 50.0
+        assert gen["hot_nodes"] and gen["cold_nodes"] and gen["mid_nodes"]
+
+    def test_bl04_buckling_inp_generator(self):
+        """T-BL04 BK1: buckling .inp has *BUCKLE + Euler reference is exact (no ccx)."""
+        from services.mcp import fea_advanced as fa
+        import math as _m
+        gen = fa.build_buckling_column_inp(1000.0, 20.0, 20.0, 200000.0, 0.29,
+                                           5000.0, nx=8, ny=2, nz=2)
+        assert "*BUCKLE" in gen["inp"] and "*CLOAD" in gen["inp"]
+        I = 20.0 * 20.0 ** 3 / 12.0
+        Pcr = _m.pi ** 2 * 200000.0 * I / (2000.0 ** 2)
+        assert abs(gen["expected_Pcr"] - Pcr) < 1e-6, gen["expected_Pcr"]
+
+    def test_bl04_contact_inp_generator(self):
+        """T-BL04 CT1: contact .inp has NLGEOM + CONTACT PAIR + two disjoint blocks."""
+        from services.mcp import fea_advanced as fa
+        gen = fa.build_contact_block_inp(20.0, 20.0, 10.0, 200000.0, 0.29, 5.0,
+                                         nx=3, ny=3, nz=2)
+        t = gen["inp"]
+        assert "NLGEOM" in t and "*CONTACT PAIR" in t and "*SURFACE INTERACTION" in t
+        assert "TYPE=ELEMENT" in t and "TYPE=NODE" in t   # master face + slave node
+        assert gen["applied_load_n"] == 5.0 * 20.0 * 20.0
+        # node ids of the two blocks must not overlap
+        assert min(gen["top_nodes"]) > max(gen["base_nodes"])
+
+    def test_bl04_ccx_absent_degrade(self):
+        """T-BL04: the ccx-absent path returns an honest skipped shape, never fake data."""
+        from services.mcp import fea_advanced as fa
+        r = fa._ccx_absent_result("thermal")
+        assert r["ok"] is False and r["skipped"] is True and "reason" in r
 
 
 class TestFull:

@@ -25,6 +25,7 @@ Registered onto the FastMCP instance by ``register_cad_tools(mcp)``.
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import time
@@ -805,6 +806,35 @@ def _persist_study(doc_id: str, record: dict) -> Optional[str]:
         return None
 
 
+# --------------------------------------------------- T-BL04 thermal helpers
+
+# Typical thermal conductivity (W/m·K) by material family — used by run_fea_thermal
+# when neither the caller nor the material dict supplies one. Engineering nominals
+# (clean-room, standard handbook values), only for the box-proxy conduction estimate.
+_DEFAULT_CONDUCTIVITY_WMK: dict = {
+    "steel": 50.0, "stainless": 16.0, "aluminum": 205.0, "titanium": 22.0,
+    "brass": 109.0, "abs": 0.17, "pla": 0.13,
+}
+
+
+def _default_conductivity(mat: dict, material_arg: Any) -> float:
+    """Best-effort thermal conductivity (W/m·K) for the box-proxy thermal solve."""
+    name = str(mat.get("name", material_arg) or "").lower()
+    for key, val in _DEFAULT_CONDUCTIVITY_WMK.items():
+        if key in name:
+            return val
+    return 50.0  # mild-steel default
+
+
+def _first_temperature(faces: list, label: str) -> float:
+    """Pull the temperature (°C) from the first face spec in a thermal face list."""
+    for f in faces or []:
+        if isinstance(f, dict) and "temperature" in f:
+            return float(f["temperature"])
+    raise ValueError(f"{label} needs at least one entry with a 'temperature' (°C), "
+                     f"e.g. [{{\"face\": \"+x\", \"temperature\": 100}}]")
+
+
 # --------------------------------------------------------------------- the guide text
 
 _GUIDE_PROMPTS = ["overview", "review", "simulation"]
@@ -847,6 +877,25 @@ run_fea_static(fixtures, loads, material) — linear static stress.
   (yield / max stress). FoS > 1 means it holds; design to a target margin.
 
 run_fea_modal(fixtures, material, n_modes) — natural frequencies (Hz) of the held part.
+
+run_fea_fatigue(fixtures, loads, material, load_type, theory) — high-cycle FATIGUE life.
+  Reuses the static stress field, then applies the mean-stress theory (goodman/gerber/
+  soderberg/asme/morrow) + Marin endurance correction + Shigley S-N line to report cycles-
+  to-failure and a factor of safety. load_type "reversed"|"zero_based"|"ratio" sets the
+  cyclic spectrum. regime="infinite" ⇒ runout (>1e6 cycles). Same FEA backend as run_fea_static.
+
+run_fea_thermal(hot_faces, cold_faces, material) — steady-state THERMAL (heat conduction) via
+  CalculiX (ccx). hot_faces/cold_faces each carry a {face + temperature °C}. Solves a prismatic
+  box proxy sized to the part bbox (through-conduction estimate). ccx is a GPL-2.0 subprocess
+  (PATH-discovered); if absent it returns {skipped:true} — never a fabricated result.
+
+run_fea_buckling(fixtures, load, material, n_modes) — linear (eigenvalue) BUCKLING via CalculiX.
+  Returns the critical load factors λ (applied load × λ = Pcr); λ<1 buckles below the load.
+  Box-proxy Euler-column estimate for slender members. ccx subprocess; absent ⇒ {skipped:true}.
+
+run_fea_contact(pressure_mpa, material) — nonlinear large-deflection CONTACT FEA via CalculiX
+  (*STATIC,NLGEOM + *CONTACT PAIR). Two-block proxy demonstrating load transfer across a touching
+  interface (press/snap-fits). ccx subprocess; absent ⇒ {skipped:true}.
 
 run_cfd_flow(velocity, aoa, fluid) — LBM wind tunnel over the whole part/assembly.
   velocity m/s, aoa degrees, fluid "air"|"water". Returns drag (N), lift (N), Cd, frontal
@@ -2846,6 +2895,330 @@ def register_cad_tools(mcp: FastMCP) -> None:
                            "solver": caps.get("openfoam_version"), "preset": preset,
                            "note": "OpenFOAM RANS runs for minutes — poll get_job(job_id); it "
                                    "reports live meshing/solve progress."})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    # ================================================================
+    # T-BL04 — fatigue / thermal / buckling / contact FEA
+    # Fatigue routes to the C++ `sim_run_fatigue` solver (same posture as
+    # run_fea_static→sim_run_static). Thermal/buckling/contact route to a
+    # CalculiX (ccx) subprocess — GPL-2.0, subprocess-only, PATH-discovered,
+    # never linked/bundled (contracts/licenses.md) — and degrade HONESTLY
+    # (skipped:true) when ccx is absent. See services/mcp/fea_advanced.py.
+    # ================================================================
+
+    def _part_bbox_dims(d: str) -> tuple:
+        """Return (L, b, h) = the part's world bounding-box size (mm), sorted so
+        L is the longest span (the slender axis for beam/column proxies)."""
+        r = cb.call("asm_world_bodies", {"doc_id": d, "explode": False})
+        bodies = r.get("bodies", [])
+        if not bodies:
+            raise ValueError("no bodies in the document — build geometry first")
+        # Union of all body bboxes.
+        lo = [float("inf")] * 3
+        hi = [float("-inf")] * 3
+        for bd in bodies:
+            bb = bd.get("bbox", {})
+            mn, mx = bb.get("min"), bb.get("max")
+            if not (mn and mx):
+                continue
+            for i in range(3):
+                lo[i] = min(lo[i], float(mn[i]))
+                hi[i] = max(hi[i], float(mx[i]))
+        size = sorted((hi[i] - lo[i] for i in range(3)), reverse=True)
+        if size[0] <= 0:
+            raise ValueError("degenerate bounding box")
+        return size[0], size[1] if size[1] > 0 else size[0], \
+            size[2] if size[2] > 0 else size[0]
+
+    @mcp.tool()
+    def run_fea_fatigue(fixtures: list, loads: list, material: Union[str, dict] = "steel",
+                        load_type: str = "reversed", load_ratio: float = -1.0,
+                        surface: str = "machined", reliability_pct: float = 50.0,
+                        temperature_c: float = 20.0, theory: str = "goodman",
+                        mesh_fineness: float = 0.5, doc_id: Optional[str] = None,
+                        background: bool = False) -> str:
+        """High-cycle fatigue life (S-N) on the current part — reuses the linear-static
+        stress field, then applies mean-stress theory + Marin correction + Basquin life.
+
+        Runs the SAME static solve as run_fea_static (fixtures/loads/material), then the
+        engine (`sim_run_fatigue`) evaluates every mean-stress theory (Goodman/Gerber/
+        Soderberg/ASME/Morrow) node-by-node and returns each theory's max equivalent
+        fully-reversed amplitude sa_eq. This tool then applies the Marin endurance
+        correction + reliability + the Shigley S-N life line (mirrors the desktop app's
+        fatigue math exactly) to report cycles-to-failure + a factor of safety.
+
+        fixtures/loads : SAME plain-English face queries as run_fea_static.
+        material       : name or dict (needs ultimate_mpa + endurance_mpa; the built-in
+                         materials all carry them).
+        load_type      : "reversed" (R=-1, default) | "zero_based" (R=0) | "ratio" (use
+                         load_ratio) — the cyclic load spectrum on the static result.
+        surface        : "ground"|"machined"|"hot_rolled"|"as_forged" (Marin ka).
+        reliability_pct: design reliability for ke (50/90/99/99.9...).
+        theory         : which mean-stress theory to report at top level (default goodman).
+
+        Returns {ok, regime: infinite|finite|static_overload, cycles, fos_endurance,
+        se_corrected_mpa, theories{...}}. regime="infinite" ⇒ >1e6 cycles (runout).
+        Degrades like run_fea_static when the C++ FEA mesher backend is unavailable.
+        """
+        try:
+            from . import fea_advanced as fa
+            d = _doc(doc_id)
+            mat = _resolve_material(material)
+            Sut = float(mat.get("ultimate_mpa") or 0.0)
+            Se_base = float(mat.get("endurance_mpa") or 0.0)
+            if Sut <= 0:
+                return _dumps({"ok": False, "error":
+                               f"material {mat.get('name', material)!r} has no ultimate_mpa — "
+                               "fatigue needs ultimate + endurance strength."})
+            step = _tmp(".step")
+            cb.call("doc_export_step", {"doc_id": d, "path": step})
+            fixture_sets: list = []
+            for q in fixtures:
+                fixture_sets.extend(_resolve_face_points(d, q))
+            if not fixture_sets:
+                return _dumps({"ok": False, "error": "no fixture faces resolved — use "
+                               "query_geometry() to confirm the face query."})
+            load_specs: list = []
+            for ld in loads:
+                if not isinstance(ld, dict) or "face" not in ld:
+                    raise ValueError(f"each load needs a 'face' query: {ld!r}")
+                faces = _resolve_face_points(d, ld["face"])
+                merged: dict = {"points": []}
+                for f in faces:
+                    merged["points"].extend(f.get("points", []))
+                if faces and "face_normal" in faces[0]:
+                    merged["face_normal"] = faces[0]["face_normal"]
+                spec: dict = {"faces": merged}
+                if "pressure" in ld:
+                    spec["type"] = "pressure"; spec["magnitude"] = float(ld["pressure"])
+                elif "force" in ld:
+                    spec["type"] = "force"; spec["vector"] = [float(x) for x in ld["force"]]
+                else:
+                    raise ValueError(f"load needs 'force' or 'pressure': {ld!r}")
+                load_specs.append(spec)
+
+            surf_map = {"ground": 0, "machined": 1, "hot_rolled": 2, "as_forged": 3}
+            lt_map = {"reversed": {"lmin": -1.0, "lmax": 1.0},
+                      "zero_based": {"lmin": 0.0, "lmax": 1.0},
+                      "ratio": {"lmin": float(load_ratio), "lmax": 1.0}}
+            corr = fa.corrected_endurance(Se_base, Sut, surface=surf_map.get(surface, 1),
+                                          load_case=0, temperature_c=temperature_c,
+                                          reliability_pct=reliability_pct)
+            fat = {"ultimate_mpa": Sut, "yield_mpa": float(mat.get("yield_mpa") or 0.0),
+                   "se_corrected_mpa": corr["se_corrected_mpa"],
+                   "se_base_mpa": corr["se_base_mpa"]}
+            fat.update(lt_map.get(load_type, lt_map["reversed"]))
+            study = {"step_path": step, "material": mat, "fixtures": fixture_sets,
+                     "loads": load_specs, "mesh_order": 2, "fineness": mesh_fineness,
+                     "fatigue": fat}
+
+            def _solve() -> dict:
+                try:
+                    res = cb.call("sim_run_fatigue", {"study": study})
+                except CoreError as ce:
+                    if "unknown method" in str(ce):
+                        return {"ok": False, "skipped": True, "doc_id": d,
+                                "backend": "cpp fea",
+                                "reason": "the C++ FEA solver backend (sim_run_fatigue) is not "
+                                          "available in this build (mesher not compiled). Fatigue "
+                                          "reuses the static stress field — it needs the same FEA "
+                                          "backend as run_fea_static."}
+                    raise
+                if not res.get("ok"):
+                    return {"ok": False, "doc_id": d,
+                            "error": res.get("error", "fatigue solve failed")}
+                theories = res.get("summary", {}).get("theories", {})
+                life = fa.fatigue_summarize(theories, corr["se_corrected_mpa"], Sut,
+                                            theory=theory)
+                life.update({"ok": True, "doc_id": d, "marin": corr,
+                             "material": mat.get("name", material)})
+                _persist_study(d, {
+                    "type": "fea_fatigue",
+                    "name": f"Fatigue ({mat.get('name', material)}, {theory})",
+                    "engine": "cpp",
+                    "material": mat, "fixtures": fixtures, "loads": loads,
+                    "results": {"theories": life["theories"], "regime": life["regime"],
+                                "cycles": life["cycles"], "fos_endurance": life["fos_endurance"]},
+                })
+                life["saved_to_study"] = True
+                return life
+
+            _autosave_all_open()
+            if background:
+                jid = _start_job("fea_fatigue", _solve)
+                return _dumps({"ok": True, "job_id": jid, "status": "running", "doc_id": d})
+            return _dumps(_solve_sync_or_handoff("fea_fatigue", _solve))
+        except CoreError as e:
+            # C++ FEA backend absent (mesher not built) → honest degrade, same as static.
+            if "unknown method" in str(e):
+                return _dumps({"ok": False, "skipped": True,
+                               "reason": "the C++ FEA solver backend (sim_run_fatigue) is not "
+                                         "available in this build (mesher not compiled). Fatigue "
+                                         "reuses the static stress field — it needs the same FEA "
+                                         "backend as run_fea_static.", "backend": "cpp fea"})
+            return _err(e)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def run_fea_thermal(hot_faces: list, cold_faces: list,
+                        material: Union[str, dict] = "steel",
+                        conductivity_w_mk: Optional[float] = None,
+                        doc_id: Optional[str] = None) -> str:
+        """Steady-state thermal (heat-conduction) FEA via CalculiX (ccx subprocess).
+
+        Solves ∇·(k∇T)=0 with the given faces held at fixed temperatures (Dirichlet).
+        Because arbitrary CAD meshing needs the FEA mesher, this ccx path solves on a
+        PRISMATIC BOX PROXY sized to the part's bounding box with a 1-D conduction setup
+        (hot end vs cold end) — an engineering estimate of the through-conduction
+        temperature field / mid-plane temperature, honest for bar/plate-like parts.
+
+        hot_faces / cold_faces : each a {temperature: <°C>} plus a face query, e.g.
+                                 [{"face": "+x", "temperature": 100}].
+        conductivity_w_mk : thermal conductivity override (W/m·K); else from material
+                            (falls back to a typical value for the named material).
+
+        CalculiX is GPL-2.0 → subprocess-only, PATH-discovered. If ccx is not installed
+        this returns {ok:false, skipped:true, reason:...} — it never fabricates a result.
+        """
+        try:
+            from . import fea_advanced as fa
+            if fa.ccx_path() is None:
+                return _dumps(fa._ccx_absent_result("thermal steady-state"))
+            d = _doc(doc_id)
+            mat = _resolve_material(material)
+            k_cond = (float(conductivity_w_mk) if conductivity_w_mk is not None
+                      else float(mat.get("conductivity_w_mk") or _default_conductivity(mat, material)))
+            T_hot = _first_temperature(hot_faces, "hot_faces")
+            T_cold = _first_temperature(cold_faces, "cold_faces")
+            L, b, h = _part_bbox_dims(d)
+            gen = fa.build_thermal_bar_inp(L, b, h, k_cond, T_hot, T_cold)
+            run = fa.run_ccx(gen["inp"], job="thermal")
+            if run.get("skipped"):
+                return _dumps(run)
+            if not run.get("ok") or not run.get("dat_path"):
+                return _dumps({"ok": False, "error": run.get("stderr", "")[-400:]
+                               or run.get("error", "ccx thermal run failed"),
+                               "backend": run.get("backend")})
+            mid_T = fa.parse_dat_nodal(run["dat_path"], "NT", gen["mid_nodes"], component=1)
+            out = {"ok": True, "doc_id": d, "backend": run["backend"],
+                   "solver": "CalculiX *HEAT TRANSFER, STEADY STATE (box proxy)",
+                   "conductivity_w_mk": k_cond, "T_hot_c": T_hot, "T_cold_c": T_cold,
+                   "mid_plane_T_c": (round(mid_T, 3) if mid_T is not None else None),
+                   "expected_mid_T_c": round(gen["expected_mid_T"], 3),
+                   "note": "box-proxy 1-D conduction estimate; ccx GPL-2.0 subprocess."}
+            _persist_study(d, {"type": "fea_thermal", "name": f"Thermal ({mat.get('name', material)})",
+                               "engine": "calculix", "results": out})
+            return _dumps(out)
+        except CoreError as e:
+            return _err(e)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def run_fea_buckling(fixtures: list, load: list, material: Union[str, dict] = "steel",
+                         n_modes: int = 4, doc_id: Optional[str] = None) -> str:
+        """Linear (eigenvalue) buckling via CalculiX (ccx subprocess) — critical load
+        factor for slender members / thin panels.
+
+        Returns the buckling load FACTORS λ (the applied load × λ = the critical load
+        Pcr). λ<1 means the part buckles BELOW the applied load — unsafe. Like the
+        thermal tool this solves a BOX PROXY sized to the part bounding box (a
+        fixed-free column under axial compression), an Euler-grade estimate honest for
+        column/strut-like parts.
+
+        fixtures : face(s) held fixed (the mounted/clamped end), e.g. ["bottom"].
+        load     : the compressive load as a single {face + force}, e.g.
+                   [{"face":"top","force":[0,0,-1000]}] — magnitude is what λ scales.
+        n_modes  : number of buckling modes to return (lowest first).
+
+        CalculiX GPL-2.0 → subprocess-only. Absent ccx ⇒ {ok:false, skipped:true}.
+        """
+        try:
+            from . import fea_advanced as fa
+            if fa.ccx_path() is None:
+                return _dumps(fa._ccx_absent_result("linear buckling"))
+            d = _doc(doc_id)
+            mat = _resolve_material(material)
+            E = float(mat["E_mpa"]); nu = float(mat.get("nu", 0.3))
+            P = 1000.0
+            if load and isinstance(load[0], dict) and "force" in load[0]:
+                vec = load[0]["force"]
+                P = max(1.0, math.sqrt(sum(float(x) ** 2 for x in vec)))
+            L, b, h = _part_bbox_dims(d)
+            gen = fa.build_buckling_column_inp(L, b, h, E, nu, P, nz=4)
+            run = fa.run_ccx(gen["inp"], job="buckle")
+            if run.get("skipped"):
+                return _dumps(run)
+            if not run.get("ok") or not run.get("dat_path"):
+                return _dumps({"ok": False, "error": run.get("stderr", "")[-400:]
+                               or run.get("error", "ccx buckling run failed"),
+                               "backend": run.get("backend")})
+            factors = fa.parse_buckle_factors(run["dat_path"])[:n_modes]
+            crit = [round(f * P, 3) for f in factors]
+            out = {"ok": True, "doc_id": d, "backend": run["backend"],
+                   "solver": "CalculiX *BUCKLE (box proxy, fixed-free column)",
+                   "applied_load_n": P, "load_factors": [round(f, 4) for f in factors],
+                   "critical_loads_n": crit,
+                   "euler_reference_pcr_n": round(gen["expected_Pcr"], 3),
+                   "note": "box-proxy Euler buckling estimate; ccx GPL-2.0 subprocess. "
+                           "load_factor<1 ⇒ buckles below the applied load."}
+            _persist_study(d, {"type": "fea_buckling",
+                               "name": f"Buckling ({mat.get('name', material)})",
+                               "engine": "calculix", "results": out})
+            return _dumps(out)
+        except CoreError as e:
+            return _err(e)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def run_fea_contact(pressure_mpa: float = 1.0, material: Union[str, dict] = "steel",
+                        doc_id: Optional[str] = None) -> str:
+        """Nonlinear (large-deflection) contact FEA via CalculiX (ccx subprocess) — for
+        press-fits, snap-fits, stacked parts touching under load.
+
+        Solves a *STATIC, NLGEOM step with a *CONTACT PAIR transmitting load across a
+        touching interface. This ccx path uses a TWO-BLOCK PROXY (an upper block pressed
+        onto a lower fixed block) sized to the part bounding box — a validated
+        conservation demonstration that the contact interface transmits the applied load
+        into the fixed support (base reaction ≈ applied load).
+
+        pressure_mpa : downward pressure on the upper block's top face.
+
+        CalculiX GPL-2.0 → subprocess-only. Absent ccx ⇒ {ok:false, skipped:true}.
+        """
+        try:
+            from . import fea_advanced as fa
+            if fa.ccx_path() is None:
+                return _dumps(fa._ccx_absent_result("nonlinear contact"))
+            d = _doc(doc_id)
+            mat = _resolve_material(material)
+            E = float(mat["E_mpa"]); nu = float(mat.get("nu", 0.3))
+            L, b, h = _part_bbox_dims(d)
+            gen = fa.build_contact_block_inp(L, b, h, E, nu, float(pressure_mpa))
+            run = fa.run_ccx(gen["inp"], job="contact")
+            if run.get("skipped"):
+                return _dumps(run)
+            if not run.get("ok") or not run.get("dat_path"):
+                return _dumps({"ok": False, "error": run.get("stderr", "")[-400:]
+                               or run.get("error", "ccx contact run failed"),
+                               "backend": run.get("backend")})
+            rf = fa.parse_dat_nodal(run["dat_path"], "RF", gen["base_nodes"], component=3)
+            reaction = abs(rf * len(gen["base_nodes"])) if rf is not None else None
+            out = {"ok": True, "doc_id": d, "backend": run["backend"],
+                   "solver": "CalculiX *STATIC,NLGEOM + *CONTACT PAIR (two-block proxy)",
+                   "applied_load_n": round(gen["applied_load_n"], 3),
+                   "base_reaction_n": (round(reaction, 3) if reaction is not None else None),
+                   "note": "box-proxy contact conservation check; base reaction should "
+                           "equal the applied load. ccx GPL-2.0 subprocess."}
+            _persist_study(d, {"type": "fea_contact",
+                               "name": f"Contact ({mat.get('name', material)})",
+                               "engine": "calculix", "results": out})
+            return _dumps(out)
+        except CoreError as e:
+            return _err(e)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

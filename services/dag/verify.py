@@ -24,6 +24,10 @@ Mapping (check_type → MCP tool name, module_key for battery._get_fn):
   firmware       → fw_sim_run             (firmware)  [~] may be absent on base
   dc_ratio       → struct_check           (structural) [~] may be absent on base
   budget         → bom_price             (sourcing)   [~] may be absent on base
+  fatigue        → run_fea_fatigue        (cad)       [T-BL04] infinite-life gate
+  thermal        → run_fea_thermal        (cad)       [T-BL04] ccx subprocess
+  buckling       → run_fea_buckling       (cad)       [T-BL04] load-factor≥1 gate
+  contact        → run_fea_contact        (cad)       [T-BL04] ccx subprocess
 
 [~] = backend may be absent on non-merged base branches; calls degrade to ESCALATE
       with reason "backend_unavailable" (never a silent pass).
@@ -99,6 +103,37 @@ def _check_budget_default(r: dict) -> bool:
     return bool(r.get("ok", False))
 
 
+# T-BL04 advanced-FEA default predicates (fail-closed; caller supplies an
+# end_condition for a real numeric gate). A "skipped" result (backend absent)
+# is NOT a pass — it escalates, never silently green.
+def _check_fatigue_default(r: dict) -> bool:
+    """Pass when the fatigue solve ran and the reported theory is in the INFINITE
+    (runout) regime — finite/overload life fails closed."""
+    if not r.get("ok", False) or r.get("skipped"):
+        return False
+    return r.get("regime") == "infinite"
+
+def _check_thermal_default(r: dict) -> bool:
+    """Pass when the thermal solve ran and returned a mid-plane temperature."""
+    if not r.get("ok", False) or r.get("skipped"):
+        return False
+    return r.get("mid_plane_T_c") is not None
+
+def _check_buckling_default(r: dict) -> bool:
+    """Pass when the buckling solve ran and the lowest load factor ≥ 1.0
+    (the part does NOT buckle below the applied load)."""
+    if not r.get("ok", False) or r.get("skipped"):
+        return False
+    factors = r.get("load_factors", [])
+    return bool(factors) and min(factors) >= 1.0
+
+def _check_contact_default(r: dict) -> bool:
+    """Pass when the contact solve ran (returned a base reaction)."""
+    if not r.get("ok", False) or r.get("skipped"):
+        return False
+    return r.get("base_reaction_n") is not None
+
+
 # DISPATCH_TABLE is the T-F12-reusable public symbol.
 DISPATCH_TABLE: dict[str, tuple[str, str, Callable[[dict], bool]]] = {
     "interference": ("cad",        "check_interference",   _check_interference_default),
@@ -107,6 +142,11 @@ DISPATCH_TABLE: dict[str, tuple[str, str, Callable[[dict], bool]]] = {
     "firmware":     ("firmware",   "fw_sim_run",           _check_firmware_default),
     "dc_ratio":     ("structural", "struct_check",         _check_dc_ratio_default),
     "budget":       ("sourcing",   "bom_price",            _check_budget_default),
+    # T-BL04 — advanced FEA verify nodes (module_key "cad", tools in cad_tools.py).
+    "fatigue":      ("cad",        "run_fea_fatigue",      _check_fatigue_default),
+    "thermal":      ("cad",        "run_fea_thermal",      _check_thermal_default),
+    "buckling":     ("cad",        "run_fea_buckling",     _check_buckling_default),
+    "contact":      ("cad",        "run_fea_contact",      _check_contact_default),
 }
 
 
@@ -226,6 +266,23 @@ def _build_tool_kwargs(check_type: str, node_inputs: dict[str, Any]) -> dict[str
         if "doc_path" in node_inputs:
             kwargs["doc_path"] = node_inputs["doc_path"]
         return kwargs
+    # T-BL04 advanced FEA verify nodes — pass through the tool's own kwargs.
+    if check_type == "fatigue":
+        return {k: node_inputs[k] for k in (
+            "fixtures", "loads", "material", "load_type", "load_ratio", "surface",
+            "reliability_pct", "temperature_c", "theory", "mesh_fineness", "doc_id")
+            if k in node_inputs}
+    if check_type == "thermal":
+        return {k: node_inputs[k] for k in (
+            "hot_faces", "cold_faces", "material", "conductivity_w_mk", "doc_id")
+            if k in node_inputs}
+    if check_type == "buckling":
+        return {k: node_inputs[k] for k in (
+            "fixtures", "load", "material", "n_modes", "doc_id")
+            if k in node_inputs}
+    if check_type == "contact":
+        return {k: node_inputs[k] for k in (
+            "pressure_mpa", "material", "doc_id") if k in node_inputs}
     return {}
 
 

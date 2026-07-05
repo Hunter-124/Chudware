@@ -130,6 +130,7 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
         "add_drawing_view", "add_section_view", "add_detail_view",
         "add_dimension", "add_gdt", "add_surface_finish", "export_drawing",
         "run_fea_static", "run_fea_modal", "run_cfd_flow", "run_cfd_accurate",
+        "run_fea_fatigue", "run_fea_thermal", "run_fea_buckling", "run_fea_contact",
         "measure_part", "measure_between", "query_geometry",
         "check_feature_overlap", "check_interference", "check_symmetry",
         "check_metadata", "check_sketch",

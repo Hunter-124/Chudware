@@ -160,6 +160,7 @@ target_include_directories(aicad_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 add_library(aicad_sim STATIC
   sim/fea_static.cpp
   sim/fea_modal.cpp
+  sim/fea_thermal.cpp
   sim/spice.cpp
   sim/numpy_rng.cpp
   sim/netlist.cpp
@@ -261,6 +262,17 @@ target_link_libraries(test_tet10 PRIVATE aicad_sim)
 set_target_properties(test_tet10 PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME tet10 COMMAND test_tet10)
+
+# T-SIM1: steady-state thermal (heat-conduction) FEA gate — validates the conduction
+# kernel against the closed-form 1D plane-wall (Dirichlet) and wall+convection (Robin)
+# solutions, on tet4 and tet10. OCCT-/mesher-free (inline structured box meshes), so it
+# links only aicad_sim like test_sim / test_modal.
+add_executable(test_thermal tests/test_thermal.cpp)
+target_include_directories(test_thermal PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_thermal PRIVATE aicad_sim)
+set_target_properties(test_thermal PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME thermal COMMAND test_thermal)
 
 # SPICE deck parser + schematic->circuit mapper (parse_netlist / netlist_to_spice_circuit,
 # incl. the starter SYMBOL libid fallback via symbol_sim_table). OCCT-free, links aicad_sim.

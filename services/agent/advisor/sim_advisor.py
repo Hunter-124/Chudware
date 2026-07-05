@@ -171,6 +171,100 @@ def compute_beam_anchor(
 
 
 # ---------------------------------------------------------------------------
+# Thermal anchor helper (steady-state 1D plane-wall Fourier reference)
+# ---------------------------------------------------------------------------
+
+def thermal_anchor(
+    bbox: dict,
+    k_w_mk: float,
+    t_hot_c: float,
+    t_cold_c: Optional[float] = None,
+    h_w_m2k: Optional[float] = None,
+    t_amb_c: Optional[float] = None,
+) -> Optional[dict]:
+    """Compute a 1D plane-wall steady-conduction anchor (Fourier reference).
+
+    Same shape/contract as :func:`compute_beam_anchor`: returns a dict with the analytic
+    reference numbers + provenance, or ``None`` when the mapping is not confident (missing
+    bbox, non-positive conductivity, or neither a cold-face temperature nor a convection film
+    to close the problem).
+
+    The wall thickness ``L`` is taken as the SHORTEST bbox side (the through-thickness
+    direction heat crosses); the face area is the product of the other two sides. Two closed
+    forms, matching the FEA validation cases:
+
+      * Dirichlet–Dirichlet (``t_cold_c`` given): pure conduction,
+            q'' = k (t_hot - t_cold) / L        [W/m²],   T profile linear.
+      * Dirichlet–Robin (``h_w_m2k`` + ``t_amb_c`` given): series resistance,
+            q'' = (t_hot - t_amb) / (L/k + 1/h),  T_cold = t_amb + q''/h.
+
+    Units: ``k`` in W/(m·K), ``L`` in mm (converted to m internally), ``h`` in W/(m²·K).
+
+    Parameters
+    ----------
+    bbox : dict
+        Keys ``x_mm``/``y_mm``/``z_mm`` (bounding-box side lengths, mm).
+    k_w_mk : float
+        Thermal conductivity, W/(m·K) (from the material thermal table).
+    t_hot_c : float
+        Fixed hot-face temperature, °C.
+    t_cold_c : float | None
+        Fixed cold-face temperature, °C (Dirichlet–Dirichlet case).
+    h_w_m2k, t_amb_c : float | None
+        Convection film coefficient W/(m²·K) + ambient °C (Dirichlet–Robin case).
+    """
+    dims = {}
+    for ax in ("x", "y", "z"):
+        v = bbox.get(f"{ax}_mm") or bbox.get(ax)
+        if v and float(v) > 0:
+            dims[ax] = float(v)
+    if len(dims) < 3 or not (k_w_mk and float(k_w_mk) > 0):
+        return None
+    if not math.isfinite(float(t_hot_c)):
+        return None
+
+    sorted_axes = sorted(dims, key=lambda a: dims[a])  # ascending
+    L_mm = dims[sorted_axes[0]]                          # thinnest side = through-thickness
+    L_m = L_mm / 1000.0
+    if L_m <= 0:
+        return None
+    k = float(k_w_mk)
+
+    if t_cold_c is not None and math.isfinite(float(t_cold_c)):
+        # Dirichlet–Dirichlet plane wall.
+        q = k * (float(t_hot_c) - float(t_cold_c)) / L_m
+        return {
+            "mode": "conduction",
+            "q_w_m2": q,
+            "t_hot_c": float(t_hot_c),
+            "t_cold_c": float(t_cold_c),
+            "L_mm": L_mm,
+            "k_w_mk": k,
+            "source": "1D plane wall q=kΔT/L (Incropera, Fundamentals of Heat & Mass Transfer §3.1)",
+        }
+    if (h_w_m2k is not None and float(h_w_m2k) > 0
+            and t_amb_c is not None and math.isfinite(float(t_amb_c))):
+        # Dirichlet–Robin (series resistance) plane wall.
+        h = float(h_w_m2k)
+        q = (float(t_hot_c) - float(t_amb_c)) / (L_m / k + 1.0 / h)
+        t_cold = float(t_amb_c) + q / h
+        return {
+            "mode": "convection",
+            "q_w_m2": q,
+            "t_hot_c": float(t_hot_c),
+            "t_cold_c": t_cold,
+            "t_amb_c": float(t_amb_c),
+            "h_w_m2k": h,
+            "L_mm": L_mm,
+            "k_w_mk": k,
+            "source": "1D wall series resistance q=(T_hot-T_amb)/(L/k+1/h) "
+                      "(Incropera §3.1 thermal circuits)",
+        }
+    # No cold-face datum (neither fixed cold temp nor convection) -> not confident.
+    return None
+
+
+# ---------------------------------------------------------------------------
 # BC lint helpers
 # ---------------------------------------------------------------------------
 
@@ -214,6 +308,86 @@ def _bc_issues(study: dict) -> list[dict]:
                                  "the current doc — the study may silently ignore this constraint."})
 
     return issues
+
+
+def _is_thermal(study: dict) -> bool:
+    """True when the study is a steady-state thermal (conduction) study."""
+    t = (study.get("type") or "").lower()
+    return "thermal" in t or study.get("study_kind") == "thermal"
+
+
+def _thermal_bc_issues(study: dict) -> list[dict]:
+    """Deterministic BC checks for a thermal (conduction) study.
+
+    Returns a list of ``{kind, detail}`` issue dicts. Empty = clean.
+
+    The load-bearing lint is the SINGULARITY check: steady conduction has a floating
+    temperature datum unless SOMETHING anchors it. That anchor is a Dirichlet fixed-temperature
+    BC OR a convection (Robin) film — NOT a heat flux. A pure-Neumann problem (only fluxes, or
+    nothing) is singular and the solver rejects it, so we flag it before dispatch.
+
+    (Task DoD phrased this as "no fixed-T and no flux = singular"; the physically correct
+    condition is "no fixed-T and no convection" — a flux does not fix the datum, and convection
+    does. The lint matches what actually makes the conductivity matrix singular. Deviation noted
+    in the T-SIM1 work note.)
+    """
+    issues = []
+    fixtures = study.get("fixtures") or []
+    loads = study.get("loads") or []
+
+    # A thermal fixture is Dirichlet only when it carries a temperature.
+    has_fixed_temp = any(
+        isinstance(fx, dict) and fx.get("temp_c") is not None for fx in fixtures
+    )
+    has_convection = any(
+        isinstance(ld, dict) and (ld.get("type") == "convection")
+        and (ld.get("h") or 0) > 0
+        for ld in loads
+    )
+    has_flux = any(
+        isinstance(ld, dict) and ld.get("type") == "flux" and (ld.get("magnitude") or 0) != 0
+        for ld in loads
+    )
+
+    if not has_fixed_temp and not has_convection:
+        issues.append({
+            "kind": "thermal_singular",
+            "detail": (
+                "Thermal study has no fixed-temperature BC and no convection film — the "
+                "temperature datum is undefined (pure-Neumann conduction is singular). Add a "
+                "fixed temperature or a convection boundary. A heat flux alone does not anchor "
+                "the datum."
+            ),
+        })
+    if not has_fixed_temp and not has_flux and not has_convection:
+        issues.append({
+            "kind": "thermal_no_load",
+            "detail": (
+                "Thermal study has no heat input (no flux, no convection) and no imposed "
+                "temperature difference — the solve is trivial (uniform temperature)."
+            ),
+        })
+    return issues
+
+
+def _thermal_bc_fix(kind: str) -> dict:
+    """Candidate fix for a thermal BC-lint issue kind."""
+    if kind == "thermal_singular":
+        return {
+            "action": "add_thermal_datum",
+            "params": {"hint": "Fix a face temperature (temp_c) or add a convection film "
+                               "(type='convection', h, t_amb_c) to anchor the temperature."},
+            "basis": "Steady conduction needs a Dirichlet or Robin BC to fix the datum.",
+            "predicted_effect": "Conductivity matrix becomes non-singular; solve proceeds.",
+            "confidence": "heuristic",
+        }
+    return {
+        "action": "add_heat_input",
+        "params": {"hint": "Add a heat flux, a convection film, or a temperature difference."},
+        "basis": "No heat input + no ΔT ⇒ a uniform-temperature trivial result.",
+        "predicted_effect": "A meaningful temperature field is computed.",
+        "confidence": "heuristic",
+    }
 
 
 def _mesh_suggestion(study: dict, doc_geom: Optional[dict] = None) -> Optional[str]:
@@ -277,25 +451,44 @@ def precheck(study: dict, doc_geom: Optional[dict] = None) -> list[dict]:
         ``min_fillet_radius_mm``, ``min_wall_mm``.
     """
     items: list[dict] = []
+    thermal = _is_thermal(study)
 
     # --- BC lint ---
-    for issue in _bc_issues(study):
-        kind = issue["kind"]
-        # blocker kinds that halt dispatch (config-gated)
-        is_blocker = kind in ("no_fixture", "no_load", "dangling_ref") and PRECHECK_BLOCK_ENABLED
-        sev = "blocker" if is_blocker else "action"
-        item = {
-            "schema": "aicad.advisory/1",
-            "check": "sim_bc",
-            "severity": sev,
-            "finding": issue["detail"],
-            "refs": {},
-            "numbers": {},
-            "candidate_fixes": [_bc_fix(kind)],
-            "helper_tools": ["run_fea_static", "describe_part"],
-            "source": {"kind": "heuristic", "detail": "sim_advisor.precheck"},
-        }
-        items.append(item)
+    if thermal:
+        # Thermal studies lint for the singular temperature datum (no fixed-T + no convection).
+        for issue in _thermal_bc_issues(study):
+            kind = issue["kind"]
+            is_blocker = kind == "thermal_singular" and PRECHECK_BLOCK_ENABLED
+            sev = "blocker" if is_blocker else "action"
+            items.append({
+                "schema": "aicad.advisory/1",
+                "check": "sim_bc",
+                "severity": sev,
+                "finding": issue["detail"],
+                "refs": {},
+                "numbers": {},
+                "candidate_fixes": [_thermal_bc_fix(kind)],
+                "helper_tools": ["run_fea_static", "describe_part"],
+                "source": {"kind": "heuristic", "detail": "sim_advisor.precheck (thermal)"},
+            })
+    else:
+        for issue in _bc_issues(study):
+            kind = issue["kind"]
+            # blocker kinds that halt dispatch (config-gated)
+            is_blocker = kind in ("no_fixture", "no_load", "dangling_ref") and PRECHECK_BLOCK_ENABLED
+            sev = "blocker" if is_blocker else "action"
+            item = {
+                "schema": "aicad.advisory/1",
+                "check": "sim_bc",
+                "severity": sev,
+                "finding": issue["detail"],
+                "refs": {},
+                "numbers": {},
+                "candidate_fixes": [_bc_fix(kind)],
+                "helper_tools": ["run_fea_static", "describe_part"],
+                "source": {"kind": "heuristic", "detail": "sim_advisor.precheck"},
+            }
+            items.append(item)
 
     # --- Mesh size suggestion ---
     mesh_hint = _mesh_suggestion(study, doc_geom)
@@ -314,9 +507,52 @@ def precheck(study: dict, doc_geom: Optional[dict] = None) -> list[dict]:
 
     # --- Hand-calc anchor (order-of-magnitude cross-check) ---
     mat = study.get("material") or {}
-    E_mpa = mat.get("E_mpa")
     bbox = study.get("bbox")
     loads = study.get("loads") or []
+
+    if thermal:
+        # Thermal anchor: 1D plane-wall Fourier reference from the fixed-T + BC set.
+        k_w_mk = mat.get("k_w_mk") or study.get("k_w_mk")
+        fixtures = study.get("fixtures") or []
+        fixed_temps = [float(fx["temp_c"]) for fx in fixtures
+                       if isinstance(fx, dict) and fx.get("temp_c") is not None]
+        conv = next((ld for ld in loads
+                     if isinstance(ld, dict) and ld.get("type") == "convection"), None)
+        t_anchor = None
+        if k_w_mk and fixed_temps:
+            t_hot = max(fixed_temps)
+            if len(fixed_temps) >= 2:
+                t_anchor = thermal_anchor(bbox or {}, float(k_w_mk), t_hot,
+                                          t_cold_c=min(fixed_temps))
+            elif conv is not None and (conv.get("h") or 0) > 0:
+                t_anchor = thermal_anchor(bbox or {}, float(k_w_mk), t_hot,
+                                          h_w_m2k=float(conv.get("h")),
+                                          t_amb_c=float(conv.get("t_amb_c", 20.0)))
+        anchor_detail = (
+            f"Thermal anchor ({t_anchor['mode']}): wall flux {t_anchor['q_w_m2']:.1f} W/m² "
+            f"(L={t_anchor['L_mm']:.1f} mm, k={t_anchor['k_w_mk']:.1f} W/m·K, "
+            f"cold face ≈ {t_anchor['t_cold_c']:.1f} °C); source: {t_anchor['source']}."
+            if t_anchor else
+            "No thermal anchor — need a bbox, conductivity, and either two fixed-temperature "
+            "faces or a fixed face + convection to map to a 1D plane wall. FEA result will not "
+            "be cross-checked."
+        )
+        items.append({
+            "schema": "aicad.advisory/1",
+            "check": "sim_anchor",
+            "severity": "info",
+            "finding": anchor_detail,
+            "refs": {},
+            "numbers": {"anchor_flux_w_m2": t_anchor["q_w_m2"] if t_anchor else None,
+                        "anchor_cold_face_c": t_anchor["t_cold_c"] if t_anchor else None},
+            "candidate_fixes": [],
+            "helper_tools": [],
+            "source": {"kind": "calc", "detail": "thermal_anchor (1D plane wall)"},
+            "_anchor": t_anchor,
+        })
+        return items
+
+    E_mpa = mat.get("E_mpa")
     total_load_n = 0.0
     for ld in loads:
         force = ld.get("force") or [0, 0, 0]

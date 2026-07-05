@@ -10,6 +10,7 @@
 
 #include "sim/fea_modal.h"
 #include "sim/fea_static.h"
+#include "sim/fea_thermal.h"
 #include "sim/mesher.h"
 
 using nlohmann::json;
@@ -586,6 +587,141 @@ nlohmann::json fea_run_modal(const nlohmann::json& study, int n_modes) {
                 {"n_nodes", r.n_nodes},
                 {"n_dof", r.n_dof},
                 {"mesh_type_used", mesh_type_used},
+                {"solver_notes", notes}};
+}
+
+namespace {
+
+// Resolve a faceset object ({points,tol_mm[,face_normal,perp_tol_mm]}) to mesh node indices,
+// completing tet10 mid-side nodes so surface loads/BCs land on the nodes that carry the
+// consistent weights (identical treatment to fea_run_static's load loop). Returns sorted
+// unique node ids; empty when the faceset resolves to nothing.
+std::vector<int> resolve_face_nodes(const json& faces, const std::vector<double>& points,
+                                    const std::vector<int>& tets, int nodes_per_elem) {
+    std::vector<double> sample = faceset_sample(faces.value("points", json::array()));
+    const double tol = faces.value("tol_mm", 1.0);
+    std::array<double, 3> fn{};
+    double perp_tol = 0.0;
+    const bool has_fn = faceset_normal(faces, fn, perp_tol);
+    std::vector<int> ids = nodes_in_faceset(points, sample, tol, has_fn ? fn.data() : nullptr, perp_tol);
+    if (ids.empty()) return ids;
+    std::unordered_set<int> node_set(ids.begin(), ids.end());
+    add_midside_face_nodes(tets, nodes_per_elem, node_set);
+    ids.assign(node_set.begin(), node_set.end());
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+}  // namespace
+
+nlohmann::json fea_run_thermal(const nlohmann::json& study) {
+    std::vector<double> points;
+    std::vector<int> tets;
+    int nodes_per_elem = 4;
+    std::string mesh_type_used, mesh_note;
+    std::string err;
+    if (!resolve_mesh(study, points, tets, nodes_per_elem, mesh_type_used, mesh_note, err))
+        return json{{"ok", false}, {"error", err}};
+
+    std::vector<std::string> notes;
+    if (!mesh_note.empty()) notes.push_back("mesh: " + mesh_note);
+    if (nodes_per_elem == 10) notes.push_back("second-order (tet10) elements");
+
+    // Conductivity: W/(m·K) in the study, converted to the mesh unit (mm): W/(mm·K) = W/(m·K)/1000.
+    const json material = study.value("material", json::object());
+    const double k_w_mk = material.value("k_w_mk", study.value("k_w_mk", 0.0));
+    if (!(k_w_mk > 0.0))
+        return json{{"ok", false},
+                    {"error", "thermal study needs a positive conductivity (material.k_w_mk, W/m·K)"}};
+    const double k_cond = k_w_mk / 1000.0;  // W/(mm·K)
+
+    // ── Dirichlet fixed-temperature faces (fixtures with a temp_c) ──────────────────────
+    std::vector<int> fixed_nodes;
+    std::vector<double> fixed_temps;
+    std::unordered_set<int> fixed_seen;
+    if (study.contains("fixtures") && study["fixtures"].is_array()) {
+        for (const auto& fx : study["fixtures"]) {
+            // A thermal fixture MUST carry a temperature; a plain (mechanical) fixture with
+            // no temp_c is not a Dirichlet BC here — skip it with a note rather than pinning T=0.
+            if (!fx.contains("temp_c") || fx["temp_c"].is_null()) {
+                notes.push_back("Fixture without temp_c ignored (thermal needs a fixed temperature)");
+                continue;
+            }
+            const double t_c = fx["temp_c"].get<double>();
+            std::vector<int> ids = resolve_face_nodes(fx, points, tets, nodes_per_elem);
+            if (ids.empty()) {
+                notes.push_back("Fixed-temperature face resolved to no nodes — skipped");
+                continue;
+            }
+            for (int nid : ids)
+                if (fixed_seen.insert(nid).second) { fixed_nodes.push_back(nid); fixed_temps.push_back(t_c); }
+        }
+    }
+
+    // ── Loads: heat flux + convection film ──────────────────────────────────────────────
+    std::vector<int> flux_nodes;
+    std::unordered_set<int> flux_seen;
+    double flux_q_wm2 = 0.0;  // aggregate flux magnitude (W/m^2); one flux set per study
+    std::vector<aicad::sim::ThermalConvection> convections;
+    struct FluxFaceLog { size_t n_nodes; double q_wm2; };
+    std::vector<FluxFaceLog> flux_log;
+    if (study.contains("loads") && study["loads"].is_array()) {
+        for (const auto& load : study["loads"]) {
+            const std::string type = load.value("type", std::string());
+            const json faces = load.contains("faces") ? load["faces"] : json::object();
+            std::vector<int> ids = resolve_face_nodes(faces, points, tets, nodes_per_elem);
+            if (ids.empty()) {
+                notes.push_back("Thermal load on empty node set — skipped");
+                continue;
+            }
+            if (type == "flux") {
+                const double q_wm2 = load.contains("magnitude") && !load["magnitude"].is_null()
+                                         ? load["magnitude"].get<double>()
+                                         : 0.0;
+                for (int nid : ids)
+                    if (flux_seen.insert(nid).second) flux_nodes.push_back(nid);
+                flux_q_wm2 = q_wm2;  // W/m^2 (positive = heat into the body)
+                flux_log.push_back({ids.size(), q_wm2});
+            } else if (type == "convection") {
+                aicad::sim::ThermalConvection cv;
+                cv.nodes = ids;
+                // h in W/(m^2·K) -> W/(mm^2·K) = h/1e6; t_amb in °C (same scale as fixed temps).
+                cv.h = (load.value("h", 0.0)) / 1.0e6;
+                cv.t_amb = load.value("t_amb_c", 20.0);
+                if (cv.h > 0.0) convections.push_back(std::move(cv));
+                else notes.push_back("Convection load with non-positive h ignored");
+            } else {
+                notes.push_back("Unknown thermal load type '" + type + "' ignored");
+            }
+        }
+    }
+    // Flux magnitude to the mesh unit: W/m^2 -> W/mm^2 = q/1e6.
+    const double flux_q_mm2 = flux_q_wm2 / 1.0e6;
+
+    aicad::sim::ThermalResult r = aicad::sim::fea_thermal_solve(
+        points, tets, k_cond, fixed_nodes, fixed_temps, flux_nodes, flux_q_mm2, convections,
+        nodes_per_elem);
+    if (!r.ok) return json{{"ok", false}, {"error", r.error}, {"solver_notes", notes}};
+
+    // ── Per-face flux summary (advisory): report the applied flux/convection per BC. ─────
+    json flux_summary = json::array();
+    for (const auto& fl : flux_log)
+        flux_summary.push_back({{"type", "flux"}, {"q_w_m2", fl.q_wm2}, {"n_nodes", fl.n_nodes}});
+    for (const auto& cv : convections)
+        flux_summary.push_back({{"type", "convection"},
+                                {"h_w_m2k", cv.h * 1.0e6},
+                                {"t_amb_c", cv.t_amb},
+                                {"n_nodes", cv.nodes.size()}});
+
+    return json{{"ok", true},
+                {"temperature", r.temperature},
+                {"n_nodes", r.n_nodes},
+                {"n_dof", r.n_dof},
+                {"n_elems", r.n_elems},
+                {"mesh_type_used", mesh_type_used},
+                {"summary",
+                 {{"max_temp_c", round_nd(r.max_temp, 4)}, {"min_temp_c", round_nd(r.min_temp, 4)}}},
+                {"flux_summary", flux_summary},
                 {"solver_notes", notes}};
 }
 

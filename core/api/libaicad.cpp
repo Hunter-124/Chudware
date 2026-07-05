@@ -2164,6 +2164,17 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             json res = aicad::sim::fea_run_fatigue(study);
             return emit(std::move(res), out_json, 0);
         }
+        if (m == "sim_run_thermal") {
+            // T-SIM1: combined mesh + BC-resolve + steady-state heat-conduction solve
+            // (fea_run_thermal on top of the fea_thermal kernel). Params: {"study": {...}}
+            // where the study is step_path|points/tets, material.k_w_mk, fixtures with
+            // temp_c (Dirichlet), loads of type "flux"/"convection". Returns {ok,
+            // temperature, n_nodes, n_dof, n_elems, summary:{max_temp_c,min_temp_c},
+            // flux_summary, solver_notes}. Transient is out of scope (steady-state only).
+            const json& study = params.contains("study") ? params["study"] : json::object();
+            json res = aicad::sim::fea_run_thermal(study);
+            return emit(std::move(res), out_json, 0);
+        }
         if (m == "sim_run_modal") {
             // P50b: combined mesh + fixture-resolve + modal solve. Params:
             // {"study": {...}, "n_modes": <int, default 6>}. Returns {ok, freqs_hz,

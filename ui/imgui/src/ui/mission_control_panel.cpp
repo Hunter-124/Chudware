@@ -192,6 +192,26 @@ void applyEvent(const nlohmann::json& ev) {
             gView.steering.canApprove    = true;
             gView.steering.canReject     = true;
         }
+    } else if (k == "mission.eta") {
+        // T-DP18: backend estimator pushes whole-mission ETA.
+        // Fields: label (string), eta_s (number), low_s (number), high_s (number).
+        // Per-node ETAs: optional "nodes" object {node_id -> eta_label string}.
+        gView.etaLabel   = jstr(*d, "label");
+        gView.etaSeconds = d->contains("eta_s") && (*d)["eta_s"].is_number()
+                           ? (float)(*d)["eta_s"].get<double>() : -1.f;
+        gView.etaLowS    = d->contains("low_s") && (*d)["low_s"].is_number()
+                           ? (float)(*d)["low_s"].get<double>() : -1.f;
+        gView.etaHighS   = d->contains("high_s") && (*d)["high_s"].is_number()
+                           ? (float)(*d)["high_s"].get<double>() : -1.f;
+        // Per-node labels for the DAG widget.
+        if (d->contains("nodes") && (*d)["nodes"].is_object()) {
+            for (auto& [nid, nlabel] : (*d)["nodes"].items()) {
+                const std::string ls = nlabel.is_string()
+                                       ? nlabel.get<std::string>() : std::string();
+                for (auto& n : gView.nodes)
+                    if (n.nodeId == nid) { n.etaNodeLabel = ls; break; }
+            }
+        }
     } else if (k == "dag.run.done") {
         gView.status = jstr(*d, "status");
         if (gView.status.empty()) gView.status = "done";
@@ -493,6 +513,14 @@ void drawMissionControlPanel(app::AppState& s) {
     spec.icon  = "activity";
 
     ui::drawPanelScaffold(spec, gScaffoldState, [&]() { drawContent(s); });
+
+    // T-DP18: mirror whole-mission ETA from the view-model into AppState so
+    // status_bar.cpp can display the chip without an additional data path.
+    // Written every frame (cheap string/float copy); status_bar reads it.
+    s.agent.etaLabel   = gView.etaLabel;
+    s.agent.etaSeconds = gView.etaSeconds;
+    s.agent.etaLowS    = gView.etaLowS;
+    s.agent.etaHighS   = gView.etaHighS;
 }
 
 void openMissionControlPanel() { gOpen = true; }

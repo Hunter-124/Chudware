@@ -101,6 +101,28 @@ void drawStatusBar(AppState& s, float height) {
         drawGlassChip(phase.c_str(), theme::pal().txt2);
     }
 
+    // T-DP18: mission ETA clock chip.  Shown only when the agent is running
+    // and the backend estimator has produced a label (empty = no data yet).
+    if (busy && s.agent.running && !s.agent.etaLabel.empty()) {
+        ImGui::SameLine();
+        // warn colour for wide/unknown ranges, good for a tight ETA.
+        unsigned int etaRole = (s.agent.etaSeconds < 0.f)
+                               ? theme::pal().warn
+                               : theme::pal().good;
+        drawGlassChip(s.agent.etaLabel.c_str(), etaRole);
+        if (ImGui::IsItemHovered()) {
+            if (s.agent.etaSeconds >= 0.f && s.agent.etaLowS >= 0.f) {
+                ImGui::SetTooltip(
+                    "Mission time remaining: %.0f s (range %.0f \xe2\x80\x93 %.0f s)\n"
+                    "Based on measured output-token costs + live tok/s.",
+                    s.agent.etaSeconds, s.agent.etaLowS, s.agent.etaHighS);
+            } else {
+                ImGui::SetTooltip(
+                    "ETA unknown \xe2\x80\x94 some stages have no measured token cost yet.");
+            }
+        }
+    }
+
     const bool simForce = std::getenv("AI_CAD_SIMPROG") != nullptr;
     if (s.simClient.busy() || simForce) {
         static const char* kSpin[] = {"|", "/", "-", "\\"};

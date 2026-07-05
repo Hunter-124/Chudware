@@ -88,6 +88,23 @@ Expected: ~997/1002 `engine_oracle` tests pass. Remaining failures are pre-exist
 (a missing `board` fixture in `ecad`, a `docs/contracts/fixtures` path bug, one numerical LBM test)
 plus a missing `langgraph-checkpoint-sqlite` dependency that blocks `services/dag` collection.
 
+## Troubleshooting / gotchas
+
+- **NEVER `git stash` in this repo on Windows.** The step-0 compat symlinks get materialized as
+  absolute symlinks; a `git stash push`/`pop` cycle follows them and **deletes the real
+  target-directory contents** (~784 files across `services/`, `engine_oracle/`, `ui/imgui/`).
+  Recovery is `git reset --hard HEAD` (history is never affected). To land a commit despite the
+  symlink "changes", `git add` only your edited file(s), then `git pull --rebase` / `git push` —
+  don't stash. Running `scripts/setup_windows_links.ps1` (junctions + skip-worktree) avoids the
+  dirty-symlink state entirely.
+- **`cl` / `cmake` "is not recognized"** — MSVC isn't on `PATH` in a normal shell. Build from the
+  **x64 Native Tools Command Prompt for VS 2022** (Start menu) or run `vcvars64.bat` first.
+- **Known ctest failure** `freecad_parity` (both `windows-core` 19/20 and `windows-occt` 48/49) is a
+  pre-existing MSVC-vs-GCC solver-convergence diff, not a build problem — don't chase it as a Windows
+  regression.
+- **Legacy `UnicodeEncodeError` on `work.py board`** was a cp1252-console bug, fixed on `master`
+  (`work.py` forces UTF-8 stdout). If you hit it on an old checkout, pull latest.
+
 ## Not yet verified
 
 - **ImGui desktop app** (`AICAD_BUILD_APP=ON`) — still references `host/extern/glad`; blocked on the

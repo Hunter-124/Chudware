@@ -107,3 +107,4 @@ and workstream W's branches are out of scope for this workstream — do not touc
   from this package.
 
 ## Progress log
+- 2026-07-05 03:41 UTC [sonnet-drift] T-X1 DONE — branch task/T-X1-browser-sessions pushed. Built services/browser/ (session.py: browser_login/browser_fetch over playwright.sync_api, lazy-imported; profiles.py: local-only per-site profile dirs + metadata sidecar under engine.paths.BROWSER_PROFILES; ratelimit.py: per-site cooldown persisted in metadata). 12/12 new tests pass against a mocked Playwright (no real browser/network in CI). Added playwright==1.61.0 to requirements.txt + contracts/licenses.md row (Apache-2.0, OSS-first pick over Selenium/Puppeteer for persistent-context support). Verified graceful degradation with playwright import blocked (ok:false, no crash). Full engine_oracle+services regression sweep: 14 failed/44 errors, same as master baseline (ECAD/CFD/agent-provider, unrelated) — zero new regressions. Claiming T-X2 next.

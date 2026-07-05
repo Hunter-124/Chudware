@@ -251,7 +251,16 @@ public:
     // a steady hover doesn't redraw every frame. The thumb FBO is lazily allocated on first use.
     // GL note: the texture origin is bottom-left (GL) — flip V when blitting with ImGui::Image.
     // ALL state the main pass relies on (bound FBO, viewport, program) is restored before return.
-    unsigned int renderThumbnail(float yawDeg, float pitchDeg, int px);
+    // transparentBg=true (T-G25 icon pipeline, ported from host): clear the tile to RGBA(0,0,0,0)
+    // and SKIP the studio-gradient fill, so the part composites over transparency. Part fragments
+    // stay opaque (uAlpha=1). Default false preserves the View-Selector preview's solid studio bg.
+    unsigned int renderThumbnail(float yawDeg, float pitchDeg, int px, bool transparentBg = false);
+
+    // T-G25: read back the last-rendered thumbnail FBO (the last renderThumbnail() target) as
+    // px*px RGBA, flipped to top-left origin — the icon-pipeline capture format (ported from
+    // host/src/renderer.cpp Renderer::readThumbnailRGBA). Distinct from readRGBA(), which reads
+    // the MAIN resolve FBO, not the thumbnail.
+    std::vector<unsigned char> readThumbnailRGBA(int px) const;
 
     std::vector<unsigned char> readRGBA() const;         // final w*h*4, top-left origin
     // Final-size box-resolved texture. This is the intended on-screen presentation target.
@@ -378,6 +387,7 @@ private:
     float thumbYaw_ = 1e30f, thumbPitch_ = 1e30f;     // last rendered orientation (deg)
     unsigned int thumbMeshRev_ = 0;                   // meshesRevision_ at last render (mismatch = dirty)
     bool thumbValid_ = false;                         // a thumbnail has been rendered at least once
+    bool thumbTransparent_ = false;                   // T-G25: bg mode of the last thumbnail render
     unsigned int meshesRevision_ = 0;                 // bumped by setMeshes(); thumbnail cache key
     unsigned int prog_ = 0;
     unsigned int edgeProg_ = 0;

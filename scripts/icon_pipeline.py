@@ -43,9 +43,27 @@ from pathlib import Path
 from PIL import Image
 
 REPO = Path(__file__).resolve().parent.parent
-BIN = REPO / "host" / "build-linux" / "bin" / "AI-CAD"
+
+
+def _find_imgui_bin() -> Path:
+    """Locate the ui/imgui app binary (AI-CAD2). T-G25 retargeted this pipeline off the
+    reference host binary onto the keeper imgui app. Checks the Windows VS-generator layout
+    (Release subdir + .exe) first, then the Linux/Ninja layout."""
+    base = REPO / "ui" / "imgui" / "build" / "bin"
+    for c in (base / "Release" / "AI-CAD2.exe", base / "AI-CAD2.exe",
+              base / "Release" / "AI-CAD2", base / "AI-CAD2"):
+        if c.exists():
+            return c
+    return base / "AI-CAD2"  # default (nonexistent -> run_app prints a clear build hint)
+
+
+BIN = _find_imgui_bin()
+# Canonical atlas the C++ loader injects into stays host/assets/icons — the imgui build STAGES
+# this dir into <bin>/resources/icons at build time, so inject() keeps writing here.
 ICON_DIR = REPO / "host" / "assets" / "icons"
-DEPLOYED_ICON_DIR = REPO / "host" / "build-linux" / "bin" / "assets" / "icons"
+# Runtime copy the imgui binary actually reads; redeploy here after inject so a re-run picks up
+# new tiles without a full rebuild.
+DEPLOYED_ICON_DIR = BIN.parent / "resources" / "icons"
 RENDER_DIR = REPO / "scratch" / "icon_render"
 CONTACT_SHEET = REPO / "scratch" / "icon_contact_sheet.png"
 RENDER_PX = 128  # square offscreen render size; downscaled into the 32/20 cells
@@ -597,19 +615,18 @@ def write_recipes(path: Path) -> None:
 
 
 def run_app(recipes_json: Path, theme: str = "dark", timeout_s: int = 300) -> int:
-    """Run the GUI headless (AI_CAD_SHOT=iconpipe) to render every recipe to RENDER_DIR.
+    """Run the imgui GUI headless (AI_CAD_SHOT=iconpipe) to render every recipe to RENDER_DIR.
 
-    Runs under xvfb-run (llvmpipe) so the pipeline is deterministic and independent of the
-    desktop/GPU state; the whole multi-recipe run completes in a few seconds because the
-    scenario drains every recipe in one tick. NOTE: the HOST binary's headless flag is
-    --ui-screenshot (NOT --shot; that is AI-CAD2's flag -- passing --shot silently starts
-    the interactive GUI, which never exits headless). One invocation renders ALL recipes.
+    T-G25 retarget: the keeper ui/imgui app (AI-CAD2) is the target now, and its headless flag
+    is --shot (NOT the host binary's --ui-screenshot). On Linux we wrap in xvfb-run (llvmpipe)
+    for a deterministic, GPU-independent server; on Windows the desktop session supplies GL, so
+    the exe runs directly. One invocation drains ALL recipes in a single tick.
     """
     if not BIN.exists():
-        sys.exit(f"binary not found: {BIN} -- build host/build-linux first")
+        sys.exit(f"binary not found: {BIN} -- build ui/imgui first "
+                 f"(cmake --build ui/imgui/build --config Release --target AI-CAD2)")
     RENDER_DIR.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
-    env.pop("DISPLAY", None)  # force xvfb-run's own server; the live :0 may be unattended
     env.update({
         "AI_CAD_NO_FILE_DIALOGS": "1",
         "AI_CAD_REPO": str(REPO),
@@ -618,9 +635,12 @@ def run_app(recipes_json: Path, theme: str = "dark", timeout_s: int = 300) -> in
         "AI_CAD_THEME": theme,
     })
     throwaway = REPO / "scratch" / "iconpipe_final.png"
+    cmd = [str(BIN), "--shot", str(throwaway)]
+    if sys.platform.startswith("linux") and shutil.which("xvfb-run"):
+        env.pop("DISPLAY", None)  # force xvfb-run's own server; the live :0 may be unattended
+        cmd = ["xvfb-run", "-a", *cmd]
     print(f"[icon_pipeline] rendering {len(RECIPES)} recipes via {BIN.name} (theme={theme}) ...")
-    proc = subprocess.run(["xvfb-run", "-a", str(BIN), "--ui-screenshot", str(throwaway)],
-                          env=env, capture_output=True, text=True, timeout=timeout_s)
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout_s)
     for line in proc.stdout.splitlines():
         if "iconpipe" in line:
             print("   " + line)

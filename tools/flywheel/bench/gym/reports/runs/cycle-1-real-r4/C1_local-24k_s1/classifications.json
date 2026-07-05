@@ -4,20 +4,5 @@
     "detail": "acceptance criteria failed: AC1, AC2, AC3, AC4",
     "evidence_seqs": [],
     "evidence": []
-  },
-  {
-    "failure_class": "context_loss",
-    "detail": "cited nonexistent ref(s): DL1",
-    "evidence_seqs": [
-      9
-    ],
-    "evidence": [
-      {
-        "seq": 9,
-        "kind": "agent_turn",
-        "actor": "SPECIFY DL1: flanged bushing",
-        "why": "cites undeclared id(s) ['DL1']"
-      }
-    ]
   }
 ]

@@ -2,8 +2,8 @@
 id: T-SIM2
 title: Simulation results field visualization - mesh/nodal-field export + color-mapped contour overlay in the viewport
 workstream: SIM
-owner: unassigned
-status: todo
+owner: opus-vosk
+status: doing
 branch: task/T-SIM2-contour-results
 depends_on: []
 lane: simulation

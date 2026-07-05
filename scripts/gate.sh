@@ -367,7 +367,7 @@ stage_ui_imgui() {
     if [ -n "${SHOPCRAFT_SHOT:-}" ] && [ -z "${AI_CAD_SHOT:-}" ]; then
         export AI_CAD_SHOT="$SHOPCRAFT_SHOT"
     fi
-    local shot_cmd="AI_CAD_NO_FILE_DIALOGS=1 \"$bin\" --shot \"$shot\" --frames 12"
+    local shot_cmd="env AI_CAD_NO_FILE_DIALOGS=1 \"$bin\" --shot \"$shot\" --frames 12"
     # Always use xvfb-run when available unless AI_CAD_SHOT_HEADED=1 is set (interactive
     # walkthrough mode). This overrides DISPLAY so agents running under a user session
     # never pop windows onto the desktop. Set AI_CAD_SHOT_HEADED=1 for interactive runs.
@@ -381,7 +381,7 @@ stage_ui_imgui() {
         return 0
     fi
     if [ "${CORE_BUILD_OK:-0}" -eq 1 ] && [ -f "core/build-linux/bin/libaicad.so" ]; then
-        local self_cmd="AI_CAD_NO_FILE_DIALOGS=1 \"$bin\" --selftest"
+        local self_cmd="env AI_CAD_NO_FILE_DIALOGS=1 \"$bin\" --selftest"
         if [ "${AI_CAD_SHOT_HEADED:-0}" != "1" ] && command -v xvfb-run >/dev/null 2>&1; then
             self_cmd="xvfb-run -a $self_cmd"
         fi

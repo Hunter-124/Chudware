@@ -426,6 +426,27 @@ def cmd_claim(tasks, errors, args):
         lock.unlink(missing_ok=True)
 
 
+def _notify_hook(t):
+    """Best-effort Discord ping on a board change (see work/tools/notify_discord.py).
+
+    Fire-and-forget and fully guarded: this must NEVER delay or break the board
+    commit. No-ops silently if the notifier isn't configured on this machine.
+    """
+    try:
+        token = ROOT / "sync" / ".discord-token"
+        if not token.exists():
+            return
+        txt = token.read_text(encoding="utf-8").strip()
+        if not txt or txt.startswith("PASTE_"):
+            return
+        script = ROOT / "tools" / "notify_discord.py"
+        subprocess.Popen([sys.executable, str(script), "--hook", t.get("id", "")],
+                         cwd=str(ROOT.parent),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def _commit_task_change(t, msg):
     """Commit + push a single task-file change to master under the claim lock."""
     main = _main_worktree()
@@ -436,6 +457,7 @@ def _commit_task_change(t, msg):
         if _git(["push"], main).returncode != 0:
             _git(["pull", "--rebase"], main)
             _git(["push"], main, check=True)
+    _notify_hook(t)  # low-latency Discord ping for review/blocked/human-owned changes
 
 
 def _owned_task(tasks, tid, owner):

@@ -3,7 +3,7 @@ id: T-W5
 title: Advisory engine (foreman) - stage tracking, check batteries, advisory injection
 workstream: W
 owner: opus-hale
-status: review
+status: done
 branch: task/T-W5-advisory-engine
 depends_on: [T-W1]
 lane: ai-copilot

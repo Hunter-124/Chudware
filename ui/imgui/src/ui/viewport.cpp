@@ -1,5 +1,5 @@
 #include "ui/viewport.h"
-#include "ui/doc_tabs.h"
+#include "ui/doc_tab_strip.h"
 #include "ui/feature_tree.h"
 #include "ui/shortcut_bar.h"
 #include "ui/sketch/sketch_mode.h"

@@ -1,5 +1,5 @@
 #include "ui/title_bar.h"
-#include "ui/doc_tabs.h"
+#include "ui/doc_tab_strip.h"
 #include "app/app_state.h"
 #include "theme/theme.h"
 #include "theme/icons.h"

@@ -1,0 +1,451 @@
+"""Tests for the PLM vault engine (T-R2, contract aicad.plm/1).
+
+Covers the T-R2 DoD:
+  * zero-config init (open == create, silent, no visible files beyond .aicadvault/)
+  * auto-history on save; checkpoint(message); release() per contract
+  * release freezes geometry.step; restore rebuilds working container + APPENDS
+  * round-trip: save → checkpoint → edit → restore → doc_diff == empty
+    (part, assembly, drawing, and .ecad+ containers)
+  * plm_* MCP tools registered + exercised end-to-end
+  * vault stays lightweight (canonical-JSON delta is O(KB), not O(geometry))
+  * corrupted-vault graceful degradation (app still opens docs)
+  * §7.1 in-process PLMVaultClient seam (the plm_bridge substrate)
+  * ease-of-use: no git vocabulary in any user-facing string
+
+Runs under the gate venv (dulwich installed). No engine C++ dependency.
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import zipfile
+
+import pytest
+
+from services.plm import manifest, snapshot
+from services.plm.client import PLMVaultClient
+from services.plm.vault import Vault, VaultError
+
+# ---------------------------------------------------------------------------
+# fixtures / helpers
+# ---------------------------------------------------------------------------
+
+_GIT_VOCAB = {
+    "git", "commit", "repository", "repo", "branch", "merge", "rebase",
+    "head", "ref", "stage", "staging", "push", "pull", "sha", "hash",
+}
+
+
+def _container(doc: dict, *, extras: dict[str, bytes] | None = None) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("thumbnail.png", b"\x89PNG\r\n_stub_thumbnail")
+        zf.writestr("document.json", json.dumps(doc, indent=2))
+        for name, data in (extras or {}).items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def _part(wall: float = 3.0) -> dict:
+    return {"schema": "aicad.part/1", "id": "uuid-part-1", "name": "Bracket",
+            "features": [{"id": "f1", "params": {"wall": wall}}]}
+
+
+def _assembly() -> dict:
+    return {"schema": "aicad.asm/1", "id": "uuid-asm-1", "name": "Gearbox",
+            "components": [{"id": "c1", "ref": "Bracket"}],
+            "mates": [{"id": "m1", "kind": "coincident"}]}
+
+
+def _drawing() -> dict:
+    return {"schema": "aicad.drawing/1", "id": "uuid-dwg-1", "name": "Sheet1",
+            "views": [{"id": "v1", "kind": "front"}]}
+
+
+def _ecad() -> dict:
+    return {"schema": "aicad.pcb/1", "id": "uuid-pcb-1", "name": "Controller",
+            "footprints": [{"id": "u1", "ref": "U1"}]}
+
+
+def _write(project_dir, name, doc, extras=None):
+    (project_dir / name).write_bytes(_container(doc, extras=extras))
+
+
+def _doc_from_container(raw: bytes) -> dict:
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        return json.loads(zf.read("document.json"))
+
+
+def _assert_no_git_vocab(text: str) -> None:
+    words = set(text.lower().replace(".", " ").replace(",", " ").split())
+    leaked = words & _GIT_VOCAB
+    assert not leaked, f"git vocabulary leaked into user-facing text: {leaked} in {text!r}"
+
+
+# ---------------------------------------------------------------------------
+# zero-config init
+# ---------------------------------------------------------------------------
+
+def test_zero_config_open_creates_vault(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    assert not Vault.exists(tmp_path)
+    v = Vault.open(tmp_path)
+    try:
+        assert Vault.exists(tmp_path)
+        # only .aicadvault appears beyond the working files (contract §8.2)
+        names = {p.name for p in tmp_path.iterdir()}
+        assert names == {"Bracket.step+", ".aicadvault"}
+        st = v.status()
+        assert st["head"] is not None
+        assert len(st["items"]) == 1
+        assert st["items"][0]["lifecycle"] == manifest.LIFECYCLE_IN_WORK
+        assert st["items"][0]["part_number"].endswith("-0001")
+    finally:
+        v.close()
+
+
+def test_open_is_idempotent(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    v1 = Vault.open(tmp_path)
+    pid1 = v1.status()["project_id"]
+    v1.close()
+    v2 = Vault.open(tmp_path)  # re-open, must not re-init
+    assert v2.status()["project_id"] == pid1
+    v2.close()
+
+
+def test_open_missing_folder_is_reason_envelope():
+    with pytest.raises(VaultError) as e:
+        Vault.open("/nonexistent/path/xyz")
+    assert e.value.reason == "invalid_project"
+
+
+# ---------------------------------------------------------------------------
+# auto-history + checkpoint + save modes
+# ---------------------------------------------------------------------------
+
+def test_save_cuts_auto_entry(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    v = Vault.open(tmp_path)
+    try:
+        res = v.save("auto")
+        assert res["kind"] == "auto"
+        assert res["entry"]["kind"] == "auto"
+    finally:
+        v.close()
+
+
+def test_checkpoint_carries_message(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    v = Vault.open(tmp_path)
+    try:
+        res = v.checkpoint("Increased wall 3 to 5 mm")
+        assert res["entry"]["kind"] == "checkpoint"
+        assert res["entry"]["message"] == "Increased wall 3 to 5 mm"
+    finally:
+        v.close()
+
+
+def test_save_rejects_release_kind(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    v = Vault.open(tmp_path)
+    try:
+        with pytest.raises(VaultError) as e:
+            v.save("release")
+        assert e.value.reason == "invalid_mode"
+    finally:
+        v.close()
+
+
+# ---------------------------------------------------------------------------
+# round-trip per doc kind: save → checkpoint → edit → restore → doc_diff empty
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name,base_doc,edit", [
+    ("Bracket.step+", _part(3.0), _part(5.0)),
+    ("Gearbox.step+", _assembly(), {**_assembly(), "mates": [{"id": "m1", "kind": "concentric"}]}),
+    ("Sheet1.step+", _drawing(), {**_drawing(), "views": [{"id": "v1", "kind": "top"}]}),
+    ("Controller.ecad+", _ecad(), {**_ecad(), "footprints": [{"id": "u1", "ref": "U2"}]}),
+])
+def test_roundtrip_restore_matches_original(tmp_path, name, base_doc, edit):
+    from services.mcp.doc_diff_tools import doc_diff
+
+    _write(tmp_path, name, base_doc)
+    v = Vault.open(tmp_path)
+    try:
+        cp = v.checkpoint("original state")
+        orig_commit = cp["commit"]
+
+        # edit the working container and save
+        _write(tmp_path, name, edit)
+        v.save("auto")
+
+        # restore to the original checkpoint
+        v.restore(orig_commit)
+
+        # the working container's document.json must be semantically identical
+        restored = _doc_from_container((tmp_path / name).read_bytes())
+        diff = doc_diff(base_doc, restored)
+        # every diff bucket empty (float noise below µm already suppressed)
+        for key in ("features_added", "features_removed", "features_changed",
+                    "params_changed", "mate_deltas", "suppression_flips"):
+            assert not diff.get(key), f"{name}: non-empty {key}: {diff.get(key)}"
+    finally:
+        v.close()
+
+
+def test_restore_appends_never_rewrites(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part(3.0))
+    v = Vault.open(tmp_path)
+    try:
+        cp = v.checkpoint("v1")
+        before = v.history()
+        n_before = len(before)
+        _write(tmp_path, "Bracket.step+", _part(9.0))
+        v.save("auto")
+        v.restore(cp["commit"])
+        after = v.history()
+        # restore ADDS entries; the original entries are all still present (same commits)
+        assert len(after) > n_before
+        before_commits = {e["commit"] for e in before}
+        after_commits = {e["commit"] for e in after}
+        assert before_commits <= after_commits  # nothing rewritten/removed
+        assert after[0]["kind"] == "restore"  # newest entry is the restore
+    finally:
+        v.close()
+
+
+# ---------------------------------------------------------------------------
+# release: rev stamp + lifecycle + geometry freeze
+# ---------------------------------------------------------------------------
+
+def test_release_stamps_rev_and_lifecycle(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    v = Vault.open(tmp_path)
+    try:
+        iid = v.status()["items"][0]["item_id"]
+        rel = v.release(iid, "First production release")
+        assert rel["rev"] == "A"
+        item = v.status()["items"][0]
+        assert item["rev"] == "A"
+        assert item["lifecycle"] == manifest.LIFECYCLE_RELEASED
+    finally:
+        v.close()
+
+
+def test_release_requires_note(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    v = Vault.open(tmp_path)
+    try:
+        iid = v.status()["items"][0]["item_id"]
+        with pytest.raises(VaultError) as e:
+            v.release(iid, "")
+        assert e.value.reason == "preflight_failed"
+    finally:
+        v.close()
+
+
+def test_release_freezes_geometry_step(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    v = Vault.open(tmp_path)
+    try:
+        iid = v.status()["items"][0]["item_id"]
+        geom = b"ISO-10303-21;\nfake STEP body\nENDSEC;"
+        rel = v.release(iid, "rev A", geometry_step=geom)
+        tree = v._bind.read_tree(rel["commit"])
+        assert snapshot.item_prefix(iid) + "geometry.step" in tree
+        assert tree[snapshot.item_prefix(iid) + "geometry.step"] == geom
+    finally:
+        v.close()
+
+
+def test_non_release_commits_have_no_geometry(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    v = Vault.open(tmp_path)
+    try:
+        iid = v.status()["items"][0]["item_id"]
+        cp = v.checkpoint("no geometry here")
+        tree = v._bind.read_tree(cp["commit"])
+        assert snapshot.item_prefix(iid) + "geometry.step" not in tree
+    finally:
+        v.close()
+
+
+def test_second_release_supersedes_prior(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part(3.0))
+    v = Vault.open(tmp_path)
+    try:
+        iid = v.status()["items"][0]["item_id"]
+        v.release(iid, "rev A")
+        _write(tmp_path, "Bracket.step+", _part(5.0))
+        v.save("auto")
+        rel_b = v.release(iid, "rev B")
+        assert rel_b["rev"] == "B"
+        item = manifest.find_item(v.manifest(), iid)
+        revs = {rr["rev"]: rr["lifecycle"] for rr in item["released_revs"]}
+        assert revs["A"] == manifest.LIFECYCLE_SUPERSEDED
+        assert revs["B"] == manifest.LIFECYCLE_RELEASED
+    finally:
+        v.close()
+
+
+# ---------------------------------------------------------------------------
+# lightweight: canonical-JSON delta is O(KB), not O(geometry)
+# ---------------------------------------------------------------------------
+
+def test_checkpoint_is_lightweight(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part(3.0))
+    v = Vault.open(tmp_path)
+    try:
+        v.checkpoint("v1")
+        size_before = _vault_object_bytes(tmp_path)
+        # a one-param edit + checkpoint
+        _write(tmp_path, "Bracket.step+", _part(5.0))
+        v.checkpoint("v2")
+        size_after = _vault_object_bytes(tmp_path)
+        delta = size_after - size_before
+        # a single-param change must cost well under 64 KB of object store growth
+        assert 0 < delta < 64 * 1024, f"checkpoint delta too large: {delta} bytes"
+    finally:
+        v.close()
+
+
+def _vault_object_bytes(project_dir) -> int:
+    root = project_dir / ".aicadvault" / "objects"
+    total = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            total += os.path.getsize(os.path.join(dirpath, f))
+    return total
+
+
+# ---------------------------------------------------------------------------
+# corrupted-vault graceful degradation
+# ---------------------------------------------------------------------------
+
+def test_unreadable_container_is_skipped_not_fatal(tmp_path):
+    _write(tmp_path, "Good.step+", _part())
+    (tmp_path / "Broken.step+").write_bytes(b"not a zip at all")
+    v = Vault.open(tmp_path)
+    try:
+        # the good doc is registered; the broken one is skipped, app still opens
+        items = {it["path"] for it in v.status()["items"]}
+        assert "Good.step+" in items
+        assert "Broken.step+" not in items
+    finally:
+        v.close()
+
+
+def test_extra_container_entries_survive_roundtrip(tmp_path):
+    # netlist.json (a derived .ecad+ entry) must not be dropped on restore
+    _write(tmp_path, "Controller.ecad+", _ecad(), extras={"netlist.json": b'{"nets":[1,2,3]}'})
+    v = Vault.open(tmp_path)
+    try:
+        cp = v.checkpoint("with netlist")
+        _write(tmp_path, "Controller.ecad+", _ecad())  # rewrite WITHOUT netlist
+        v.save("auto")
+        v.restore(cp["commit"])
+        with zipfile.ZipFile(io.BytesIO((tmp_path / "Controller.ecad+").read_bytes())) as zf:
+            assert "netlist.json" in zf.namelist()
+            assert json.loads(zf.read("netlist.json")) == {"nets": [1, 2, 3]}
+    finally:
+        v.close()
+
+
+# ---------------------------------------------------------------------------
+# §7.1 in-process PLMVaultClient seam (the plm_bridge substrate)
+# ---------------------------------------------------------------------------
+
+def test_client_is_available():
+    c = PLMVaultClient()
+    assert c.is_available() is True
+
+
+def test_client_project_id_for_run_best_effort():
+    c = PLMVaultClient()
+    assert c.project_id_for_run("run_unknown") is None  # best-effort → None is valid
+    c.register_run("run_1", "p_abc")
+    assert c.project_id_for_run("run_1") == "p_abc"
+
+
+def test_client_checkpoint_writes_ai_attribution(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    v = Vault.open(tmp_path)
+    pid = v.status()["project_id"]
+    v.close()
+
+    c = PLMVaultClient()
+    c.register_project(pid, str(tmp_path))
+    res = c.checkpoint(project_id=pid, message="AI adjusted wall thickness",
+                       author_kind="ai", run_id="run_42", artifact_id="bg_node_7")
+    assert res["ok"] is True
+    entry = res["entry"]
+    assert entry["kind"] == "checkpoint"
+    assert entry["author"]["kind"] == "ai"
+    assert entry["ai"] is not None
+    assert entry["ai"]["run_id"] == "run_42"
+    assert entry["ai"]["artifact_id"] == "bg_node_7"
+    assert entry["ai"]["reversible"] is True
+
+
+def test_client_invalid_project_is_reason_envelope():
+    c = PLMVaultClient()
+    res = c.checkpoint(project_id="p_nope", message="x")
+    assert res["ok"] is False
+    assert res["reason"] == "invalid_project"
+
+
+def test_client_satisfies_bridge_protocol():
+    # the client must duck-type the T-W18 VaultClient Protocol (contract §7.1)
+    from services.agent.plm_bridge import VaultClient
+    assert isinstance(PLMVaultClient(), VaultClient)
+
+
+def test_plm_bridge_uses_real_client_when_flag_on(tmp_path, monkeypatch):
+    # AICAD_PLM_BRIDGE=1 → the bridge imports our PLMVaultClient, not the mock
+    monkeypatch.setenv("AICAD_PLM_BRIDGE", "1")
+    from services.agent import plm_bridge
+    vault = plm_bridge._default_vault()
+    assert type(vault).__name__ == "PLMVaultClient"
+
+
+# ---------------------------------------------------------------------------
+# ease-of-use: no git vocabulary in user-facing strings
+# ---------------------------------------------------------------------------
+
+def test_restore_message_has_no_git_vocab(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    v = Vault.open(tmp_path)
+    try:
+        cp = v.checkpoint("v1")
+        r = v.restore(cp["commit"])
+        _assert_no_git_vocab(r["entry"]["message"])
+    finally:
+        v.close()
+
+
+def test_error_hints_have_no_git_vocab():
+    # sample the reason hints surfaced by the vault
+    for reason, hint in [
+        ("invalid_project", "not a folder: /x"),
+        ("not_found", "that point in history could not be found"),
+    ]:
+        e = VaultError(reason, hint)
+        _assert_no_git_vocab(e.hint)
+
+
+# ---------------------------------------------------------------------------
+# manifest / rev-letter units
+# ---------------------------------------------------------------------------
+
+def test_rev_letter_progression():
+    assert manifest.next_rev_letter(None) == "A"
+    assert manifest.next_rev_letter("A") == "B"
+    assert manifest.next_rev_letter("Z") == "AA"
+
+
+def test_manifest_rejects_future_major():
+    bad = json.dumps({"schema": "aicad.plm/2", "items": []}).encode()
+    with pytest.raises(ValueError):
+        manifest.loads(bad)

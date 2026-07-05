@@ -136,3 +136,14 @@ Rule: the ECAD default distribution stays **GPL-clean**, identical to the CAD po
 |---|---|---|---|
 | **AISC shapes curated table** (`engine_oracle/data/aisc_shapes/aisc_shapes_curated.json`) | n/a (dimensional facts) | AISC W/S/C section properties for D/C ratio checks | **Clean-room curated table of ~18 common shapes.** Property values (A, Ix, Sx, Zx, …) are dimensional facts re-stated from widely published engineering references (Salmon & Johnson *Steel Structures* 5th ed, NSAI, CISC Handbook) — *not* a bulk copy of the AISC Shapes Database compilation (whose license is not clearly public-domain). The numbers are physical facts of steel geometry; the AISC compilation's selection/layout/commentary is what is proprietary. Posture: same as `analysis.py` `_MATERIALS` block. See `work/questions/T-D3.md` Q1. For unlisted shapes, T-D4/T-D5 can accept a user-supplied AISC XLSX path at runtime (not bundled). |
 | **ANSI/AWC NDS Supplement lumber sizes** (`engine_oracle/data/lumber_table.json`) | n/a (public standard) | Dressed (S4S) lumber actual dimensions + section properties | **Public standard facts.** PS 20 (American Softwood Lumber Standard) dressed sizes are a federal/industry standard; dimensional facts are not copyrightable. Fb/Fc allowable-stress values used in `checks.py` are the same NDS Supplement Table 4A numbers reproduced in open structural textbooks. No NDS document text is copied. |
+
+## PLM vault (Pillar 19, Workstream R — T-R2)
+
+Git binding chosen in `docs/PLM_OSS_SURVEY.md` and frozen in `contracts/plm.md` §7.
+Added by T-R2 (first code task importing dulwich) per the "adding a dependency needs a
+row in the same change" rule.
+
+| package | license | role | posture |
+|---|---|---|---|
+| **dulwich** (`services/plm/gitbind.py`) | **Apache-2.0 OR GPL-2.0-or-later** (dual; SPDX `Apache-2.0 OR GPL-2.0-or-later`) | pure-Python git implementation — the object store + commit/tree writer behind the hidden `.aicadvault/` version-control vault | ok — **in-process, take the Apache-2.0 arm** (permissive, GPL-clean, commercial-safe under the guardrails). A hard `requirements.txt` dep of `services/plm/`. Chosen for zero-provisioning cross-platform parity (no compiled wheel assumption, no binary-on-PATH); `pip install`-only, identical on Fedora + Windows. pygit2 was declined (GPL-linking-exception ambiguity + per-platform native wheel). |
+| **git** (optional accelerator for `services/plm/`) | GPL-2.0+ | system `git` binary, used ONLY for `gc`/`repack` acceleration when present on PATH | ok — **subprocess-only, PATH-discovered, never bundled, feature-detected**; its absence degrades transparently to the guaranteed pure-dulwich path (`GitBinding.repack()`). Same mere-aggregation isolation as ngspice/QEMU/pandoc/esptool. No `requirements.txt` line (never imported in-process — spawned as a subprocess). |

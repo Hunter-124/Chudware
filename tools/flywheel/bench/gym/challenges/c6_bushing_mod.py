@@ -148,16 +148,34 @@ def _seed_scripts() -> dict[int, dict[str, list[dict]]]:
                       "args": {"op": "bore", "diameter": 25.0, "through": True},
                       "hypothesis": "rebore unchanged"})
 
+    # seed 4 (T-W32): execution_stall — the cycle-1-real-r3 shape, LABELED: real
+    # agent turns whose every tool call failed to execute (resolution gaps), no
+    # dimension/decision ever recorded → every AC fails with nothing built.
+    # Distinct tools (no repeated fingerprint → not grind) and resolution-failure
+    # errors (not kwarg rejections → not tool_misuse).
+    stall = [
+        {"_kind": "agent_turn", "_actor": "spec_writer", "event": "tool_call",
+         "tool": "ledger_get", "args": {}, "ok": False,
+         "error": "\"tool 'ledger_get' could not be resolved\""},
+        {"_kind": "agent_turn", "_actor": "spec_writer", "event": "tool_call",
+         "tool": "part_search", "args": {"query": "25 mm shaft"}, "ok": False,
+         "error": "\"tool 'part_search' could not be resolved\""},
+        {"_kind": "agent_turn", "_actor": "feature_modeler", "event": "tool_call",
+         "tool": "ask_user", "args": {"questions": ["bore fit class?"]}, "ok": False,
+         "error": "\"tool 'ask_user' could not be resolved\""},
+    ]
+
     return {
         1: {"DL1": clean},
         2: {"DL1": ctxloss},
         3: {"DL1": grind},
+        4: {"DL1": stall},
     }
 
 
 CHALLENGE = Challenge(
     id="C6", name="bushing mod (fit 25mm shaft)", lane="parts-sourcing",
     request=MANIFEST["request_verbatim"], manifest=MANIFEST, checks=CHECKS,
-    seeds=(1, 2, 3), scripts=_seed_scripts(), modifies="C1",
+    seeds=(1, 2, 3, 4), scripts=_seed_scripts(), modifies="C1",
     notes="re-bore C1 to d25 H7, keep bolt circle; seed2=context_loss, seed3=grind.",
 )

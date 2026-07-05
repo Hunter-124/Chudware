@@ -37,8 +37,11 @@ _RETRY = "max_iters"
 _NOCODE = "no_code"
 _FAILED = "failed"
 
-_TOOL_CALL_RE = re.compile(
-    r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+# T-W32: match the fenced BODY (not a brace pair) — the old r"\{.*?\}" non-greedy
+# pattern truncated at the FIRST closing brace, so any tool call with nested args
+# (e.g. {"tool": "x", "args": {"a": {...}}}) failed to parse and the model's valid
+# directive was dropped as free text (observed live in the r4 PLAN node).
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
 class TurnResult:
@@ -69,12 +72,25 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
              max_tokens: int | None = None,
              ledger=None,
              actor: str | None = None,
-             tool_dispatch: Callable[[str, dict], Any] | None = None) -> TurnResult:
+             tool_dispatch: Callable[[str, dict], Any] | None = None,
+             mission_dispatch: Any | None = None,
+             tools_text: str | None = None) -> TurnResult:
     """Run a bounded tool-executing turn and return a :class:`TurnResult`.
 
     *tool_dispatch* is injectable ``(tool_name, args) -> result``; the default
     dispatches against the live MCP registry via :func:`_dispatch_tool`.  Tests
     inject a deterministic dispatcher (no engine).
+
+    *mission_dispatch* (T-W32) is the run-scoped dispatch layer
+    (``services.agent.mission_dispatch.MissionDispatch``): consulted BEFORE the
+    global registry so mission-context tools (ledger_get/ledger_note, dag_plan,
+    ask_user, delegate, part_search) resolve against THIS run.  Ignored when a
+    custom *tool_dispatch* is injected (the injector owns resolution).
+
+    *tools_text* (T-W32) is the rendered §9.1 tools slot (trimmed schemas for the
+    node's allowed tools — see ``services.agent.tool_schemas``).  When present it
+    replaces the bare "Allowed tools:" name list, so the model sees real kwargs
+    instead of guessing them.
 
     *max_tokens* caps each model completion.  Callers on a known tier pass the
     tier's ``generation_headroom`` (tiers.yaml — the same budget source the
@@ -82,12 +98,23 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     budgets rather than an ad-hoc constant.  Default 2048 when no tier is known."""
     budget = int(max_tool_calls if max_tool_calls is not None else 8)
     completion_cap = int(max_tokens) if max_tokens else 2048
-    dispatch = tool_dispatch or _dispatch_tool
+    if tool_dispatch is not None:
+        dispatch = tool_dispatch
+    elif mission_dispatch is not None:
+        def dispatch(tool: str, args: dict) -> Any:
+            fn = mission_dispatch.resolve(tool)
+            if fn is not None:
+                return fn(**(args or {}))
+            return _dispatch_tool(tool, args)
+    else:
+        dispatch = _dispatch_tool
     allow = set(allowed_tools or [])
     actor = actor or name
 
     system = (system_prompt or "") + "\n\n" + _SYSTEM_BASE
-    if allow:
+    if tools_text:
+        system += "\n\n" + tools_text
+    elif allow:
         system += "\nAllowed tools: " + ", ".join(sorted(allow))
 
     messages: list[dict] = [{"role": "user", "content": _parts(request)}]
@@ -165,23 +192,61 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
 # ---------------------------------------------------------------------------
 
 def _parse_directive(reply: str) -> dict | None:
-    """Extract the first fenced JSON object from *reply*; None if absent/invalid."""
+    """Extract the first JSON directive object from *reply*; None if absent/invalid.
+
+    Accepts, in order: fenced ```json blocks (nested braces fine — the whole fence
+    body is parsed), a bare JSON object reply, and an UNTERMINATED fence (a local
+    model hitting its completion cap mid-fence still yields its complete JSON
+    object). ``raw_decode`` parses the first complete object and tolerates
+    trailing prose — never a truncated-brace parse."""
     if not reply:
         return None
-    m = _TOOL_CALL_RE.search(reply)
-    candidate = m.group(1) if m else None
-    if candidate is None:
-        # Some models emit a bare JSON object with no fence.
-        stripped = reply.strip()
-        if stripped.startswith("{") and stripped.endswith("}"):
-            candidate = stripped
-    if candidate is None:
+    candidates: list[str] = [m.group(1) for m in _FENCE_RE.finditer(reply)]
+    stripped = reply.strip()
+    if stripped.startswith("{"):
+        candidates.append(stripped)
+    else:
+        # Unterminated fence: parse from the first '{' after the opening fence.
+        fence = stripped.find("```")
+        if fence != -1:
+            brace = stripped.find("{", fence)
+            if brace != -1:
+                candidates.append(stripped[brace:])
+    for cand in candidates:
+        obj = _loads_first_object(cand)
+        if obj is not None:
+            return obj
+    return None
+
+
+def _loads_first_object(text: str) -> dict | None:
+    """Parse the first complete JSON object at the start of *text* (trailing
+    prose/junk tolerated); None when it isn't a dict or doesn't parse."""
+    text = text.strip()
+    if not text.startswith("{"):
         return None
     try:
-        obj = json.loads(candidate)
+        obj, _end = json.JSONDecoder().raw_decode(text)
         return obj if isinstance(obj, dict) else None
     except (json.JSONDecodeError, ValueError):
         return None
+
+
+def resolver_for(mission_dispatch: Any | None = None) -> Callable[[str], Any]:
+    """Return a ``(tool_name) -> callable | None`` resolver mirroring run_turn's
+    dispatch order: mission-scoped layer first, then the global registry (T-W32).
+
+    The tool-schema renderer (``tool_schemas.render_tools_block``) uses this SAME
+    resolver, so the schemas injected into the prompt are exactly the callables the
+    dispatcher will invoke — never a schema the dispatch layer would reject."""
+    def _resolve(tool: str):
+        if mission_dispatch is not None:
+            fn = mission_dispatch.resolve(tool)
+            if fn is not None:
+                return fn
+        from services.agent.reviewer_exec import _resolve_fn
+        return _resolve_fn(tool)
+    return _resolve
 
 
 def _dispatch_tool(tool: str, args: dict) -> Any:

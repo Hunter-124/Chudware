@@ -46,7 +46,9 @@ _EXTRA_MODULES: dict[str, tuple[str, str]] = {
     # module_key names understood by _resolve_fn below (extends battery._get_fn).
     "verify_battery": ("verify", "verify_battery"),
     "fit_report":     ("intake", "fit_report"),
-    "design_review":  ("cad",    "design_review"),
+    # T-W32: design_review lives in design_review_tools, not cad_tools — the old
+    # ("cad", "design_review") mapping never resolved.
+    "design_review":  ("designreview", "design_review"),
 }
 
 
@@ -93,7 +95,21 @@ def _resolve_fn(tool: str) -> Callable[..., Any] | None:
         pass
     # 4) research/engineering-calc tools (fit_calc, tap_drill, research_*…) — the
     # spec_writer role's main toolset; registered in mcp_server.research_tools.
-    return _resolve_extra("research", tool)
+    fn = _resolve_extra("research", tool)
+    if fn is not None:
+        return fn
+    # 5) T-W32 dispatch-coverage gap: role cards allow GSL describers
+    # (describe_part/describe_project/…), parts-library tools (part_get/part_place;
+    # part_search also resolves mission-scoped) and the ledger tools (ledger_get/
+    # ledger_note with an explicit run_id) — none of which the battery singleton
+    # builds.  Same one-FastMCP-per-module pattern; still ONE process-wide registry.
+    for module_key in ("gsl", "parts", "ledger", "preflight", "regen", "buildgraph",
+                       "intake", "designreview", "req", "cost", "structural",
+                       "dimscheme", "workspace"):
+        fn = _resolve_extra(module_key, tool)
+        if fn is not None:
+            return fn
+    return None
 
 
 # One private FastMCP per extra module_key, built once.
@@ -122,6 +138,60 @@ def _resolve_extra(module_key: str, fn_name: str) -> Callable[..., Any] | None:
                 # battery modules, so agent turns need this branch to dispatch them.
                 from mcp_server.research_tools import register_research_tools
                 register_research_tools(mcp)
+            elif module_key == "gsl":
+                # T-W32: describe_part/describe_project/describe_scene… — the GSL
+                # describers every worker card allows; live in gsl_tools.
+                from mcp_server.gsl_tools import register_gsl_tools
+                register_gsl_tools(mcp)
+            elif module_key == "parts":
+                # T-W32: part_get/part_place (part_search also has a mission-scoped
+                # handler) — the standard-parts library surface.
+                from mcp_server.parts_tools import register_parts_tools
+                register_parts_tools(mcp)
+            elif module_key == "ledger":
+                # T-W32: ledger_get/ledger_note resolve globally with an explicit
+                # run_id; inside a mission the run-scoped dispatcher binds it.
+                from mcp_server.ledger_tools import register_ledger_tools
+                register_ledger_tools(mcp)
+            elif module_key == "preflight":
+                # T-W32: preflight_ops — the feature_modeler card's mandated
+                # pre-mutation check.
+                from mcp_server.preflight_tools import register_preflight_tools
+                register_preflight_tools(mcp)
+            elif module_key == "regen":
+                # T-W32: regen_diagnose/regen_resolve — the fixer/feature_modeler
+                # rebuild-failure toolset.
+                from mcp_server.regen_tools import register_regen_tools
+                register_regen_tools(mcp)
+            elif module_key == "buildgraph":
+                # T-W32: buildgraph_plan/buildgraph_status — the orchestrator /
+                # department_manager / overseer build-order surface.
+                from services.agent.buildgraph.mcp_tools import register_buildgraph_tools
+                register_buildgraph_tools(mcp)
+            elif module_key == "designreview":
+                # T-W32: design_review — the reviewer card's rubric tool.
+                from mcp_server.design_review_tools import register_design_review_tools
+                register_design_review_tools(mcp)
+            elif module_key == "req":
+                # T-W32: req_create/req_update/req_status — intake_analyst/clarifier.
+                from mcp_server.req_tools import register_req_tools
+                register_req_tools(mcp)
+            elif module_key == "cost":
+                # T-W32: cam_cost_estimate — cam_programmer.
+                from mcp_server.cost_tools import register_cost_tools
+                register_cost_tools(mcp)
+            elif module_key == "structural":
+                # T-W32: struct_analyze — sim_engineer.
+                from mcp_server.structural_tools import register_structural_tools
+                register_structural_tools(mcp)
+            elif module_key == "dimscheme":
+                # T-W32: suggest_dimension_scheme — sketcher.
+                from mcp_server.dimension_scheme_tools import register_dimension_scheme_tools
+                register_dimension_scheme_tools(mcp)
+            elif module_key == "workspace":
+                # T-W32: workspace_status/workspace_doc_events — orchestrator/overseer.
+                from mcp_server.workspace_tools import register_workspace_tools
+                register_workspace_tools(mcp)
             else:
                 return None
             _EXTRA_MCP[module_key] = mcp

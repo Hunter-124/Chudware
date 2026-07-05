@@ -28,6 +28,19 @@ The eight classes (task spec):
   advisory_ignored    an advisory was injected and then contradicted by a later action
                       without a dispute/replan. Evidence: the advisory event + the
                       contradicting action.
+  execution_stall     (T-W32, foreman-sanctioned 2026-07-05) the run produced tool
+                      activity but NOT ONE tool call succeeded — the mission stalled
+                      before any geometry existed (pre-BUILD). Evidence: the errored
+                      tool-call event seqs. When this fires, incoherent_geometry is
+                      suppressed: with zero successful executions there is no geometry
+                      to be incoherent (the old behaviour classified these runs as
+                      incoherent_geometry with EMPTY evidence seqs — see
+                      cycle-1-real-r3).
+
+Tool-call reading (T-W32): real agent turns record tool calls as ``agent_turn``
+events with ``payload.event == "tool_call"`` (services/agent/agent_turn._log), while
+scripted gym turns use ``kind == "tool_call"`` directly. The classifier normalises
+BOTH shapes (``_tool_call_events``) so real-run evidence is visible to the detectors.
 
 A single run can exhibit several classes; ``classify_ledger`` returns all that fire.
 The classifier is deterministic and side-effect free.
@@ -48,6 +61,7 @@ class FailureClass(str, Enum):
     ABSTRACTION_SKIP = "abstraction_skip"
     GRIND = "grind"
     ADVISORY_IGNORED = "advisory_ignored"
+    EXECUTION_STALL = "execution_stall"
 
 
 TAXONOMY: tuple[str, ...] = tuple(fc.value for fc in FailureClass)
@@ -87,13 +101,55 @@ def _ev_ref(e: dict, why: str) -> dict:
     return {"seq": e.get("seq"), "kind": e.get("kind"), "actor": e.get("actor"), "why": why}
 
 
+def _tool_call_events(events: Iterable[dict]) -> list[tuple[dict, dict]]:
+    """Every tool call in the ledger as ``(event, call_payload)`` pairs (T-W32).
+
+    Normalises the two shapes tool calls land in:
+      * scripted gym turns:   ``kind == "tool_call"``, payload IS the call;
+      * real agent turns:     ``kind == "agent_turn"`` with
+        ``payload.event == "tool_call"`` (agent_turn._log) — the call fields
+        (tool/args/ok/error/result) sit alongside the ``event`` tag.
+    """
+    out: list[tuple[dict, dict]] = []
+    for e in events:
+        p = e.get("payload") or {}
+        if e.get("kind") == "tool_call":
+            out.append((e, p))
+        elif e.get("kind") == "agent_turn" and p.get("event") == "tool_call":
+            out.append((e, p))
+    return out
+
+
+def _call_succeeded(p: dict) -> bool:
+    """A call payload counts as successful unless it carries an explicit failure
+    signal (``ok: false`` or an ``error``). Scripted turns without an ok field are
+    successful by construction."""
+    if p.get("ok") is False:
+        return False
+    if p.get("error"):
+        return False
+    return True
+
+
 # Ref-id patterns the pipeline uses: DL1 / AC2 / DIM7 / doc ids / feature ids.
 _REF_RE = re.compile(r"\b(DL\d+|AC\d+|DIM\d+|FN\d+|FT\d+|G\d+)\b")
 
 
-def _known_ids(events: list[dict]) -> set[str]:
-    """Every DL/AC/DIM/FN/FT/G id the ledger has actually MINTED (declared)."""
+def _known_ids(events: list[dict], manifest: dict | None = None) -> set[str]:
+    """Every DL/AC/DIM/FN/FT/G id the ledger has actually MINTED (declared).
+
+    T-W32: REAL cells don't replay the manifest as an artifact event (the mission
+    pipeline records the manifest artifact without its deliverables payload), so
+    ids the MANIFEST declares (DL/AC) are also known when the caller passes it —
+    otherwise every real run citing its own deliverable id was a context_loss
+    false positive."""
     known: set[str] = set()
+    for dl in (manifest or {}).get("deliverables", []) or []:
+        if dl.get("id"):
+            known.add(dl["id"])
+        for ac in dl.get("acceptance_criteria", []) or []:
+            if ac.get("id"):
+                known.add(ac["id"])
     for e in events:
         p = e.get("payload") or {}
         kind = e.get("kind")
@@ -168,6 +224,40 @@ def _amb_keyword(text: str) -> str:
     return ""
 
 
+def _detect_execution_stall(events: list[dict], graded: dict) -> list[Classification]:
+    """Fire when the run had tool activity but not ONE call succeeded (T-W32).
+
+    A pre-BUILD stall: the model tried to execute (or turned without executing)
+    and nothing ever ran — resolution failures, rejected kwargs, provider errors.
+    Only fires on a non-passing run (a graded PASS with odd events is not a stall).
+    """
+    if graded.get("passed"):
+        return []
+    calls = _tool_call_events(events)
+    turns = [e for e in events if e.get("kind") == "agent_turn"]
+    if calls:
+        if any(_call_succeeded(p) for _, p in calls):
+            return []
+        failed_calls = [(e, p) for e, p in calls if not _call_succeeded(p)]
+        seqs = [e.get("seq") for e, _ in failed_calls]
+        ev = [_ev_ref(e, f"tool {p.get('tool','?')} failed: "
+                          f"{str(p.get('error') or p.get('result'))[:60]}")
+              for e, p in failed_calls[:8]]
+        return [Classification(
+            FailureClass.EXECUTION_STALL.value,
+            f"all {len(failed_calls)} tool calls failed — nothing ever executed "
+            "(pre-BUILD stall)", seqs, ev)]
+    if turns:
+        # agent turns happened but the model never emitted a single tool call.
+        seqs = [e.get("seq") for e in turns[:8]]
+        ev = [_ev_ref(turns[0], "agent turns produced no tool call at all")]
+        return [Classification(
+            FailureClass.EXECUTION_STALL.value,
+            f"{len(turns)} agent-turn events with zero tool calls — nothing ever "
+            "executed (pre-BUILD stall)", seqs, ev)]
+    return []
+
+
 def _detect_incoherent_geometry(events: list[dict], graded: dict) -> list[Classification]:
     out: list[Classification] = []
     failed = [ac for ac in graded.get("criteria", []) if ac.get("result") == "FAIL"]
@@ -198,10 +288,12 @@ def _detect_tool_misuse(events: list[dict], manifest: dict | None) -> list[Class
                 if ac.get("id") and t:
                     ac_tool[ac["id"]] = t
 
-    for e in _by_kind(events, "tool_call"):
-        p = e.get("payload") or {}
-        # (a) preflight rejected the call.
-        if p.get("preflight") == "reject" or p.get("error"):
+    for e, p in _tool_call_events(events):
+        # (a) preflight rejected the call / the tool ran and errored.  A pure
+        # RESOLUTION failure ("could not be resolved") is a dispatch-coverage gap
+        # (harness), not model misuse — it feeds execution_stall instead (T-W32).
+        err = str(p.get("error") or "")
+        if p.get("preflight") == "reject" or (err and "could not be resolved" not in err):
             out.append(Classification(
                 FailureClass.TOOL_MISUSE.value,
                 f"tool {p.get('tool','?')} rejected/errored: {str(p.get('error') or p.get('reason'))[:60]}",
@@ -236,9 +328,10 @@ _CHECK_TOOLS = frozenset({
 })
 
 
-def _detect_context_loss(events: list[dict]) -> list[Classification]:
+def _detect_context_loss(events: list[dict],
+                         manifest: dict | None = None) -> list[Classification]:
     out: list[Classification] = []
-    known = _known_ids(events)
+    known = _known_ids(events, manifest)
     for e in events:
         p = e.get("payload") or {}
         # Only inspect free-text/ref fields a role authored (not the manifest artifact).
@@ -279,9 +372,13 @@ def _detect_abstraction_skip(events: list[dict]) -> list[Classification]:
 def _detect_grind(events: list[dict], grind_threshold: int = 3) -> list[Classification]:
     out: list[Classification] = []
     # Group tool_call / decision events by (node/deliverable, action fingerprint).
+    # T-W32: tool calls are read through the normaliser so real agent-turn calls
+    # (kind=agent_turn, payload.event=tool_call) count toward grind too.
     seen: dict[tuple, list[dict]] = {}
-    for e in _by_kind(events, "tool_call", "decision"):
-        p = e.get("payload") or {}
+    pairs = _tool_call_events(events) + [
+        (e, e.get("payload") or {}) for e in _by_kind(events, "decision")]
+    pairs.sort(key=lambda ep: ep[0].get("seq", 0))
+    for e, p in pairs:
         node = p.get("node") or p.get("for_dl") or p.get("stage") or "?"
         fp = p.get("hypothesis") or p.get("fingerprint")
         if fp is None:
@@ -364,9 +461,16 @@ def classify_ledger(ledger: dict[str, Any], *, manifest: dict | None = None,
 
     results: list[Classification] = []
     results += _detect_wrong_question(events, manifest, graded)
-    results += _detect_incoherent_geometry(events, graded)
+    # T-W32 (foreman-sanctioned): a pre-BUILD stall (no successful execution at
+    # all) is execution_stall, and SUPPRESSES incoherent_geometry — with nothing
+    # ever executed there is no geometry to be incoherent, and the old routing
+    # produced incoherent_geometry with empty evidence seqs.
+    stall = _detect_execution_stall(events, graded)
+    results += stall
+    if not stall:
+        results += _detect_incoherent_geometry(events, graded)
     results += _detect_tool_misuse(events, manifest)
-    results += _detect_context_loss(events)
+    results += _detect_context_loss(events, manifest)
     results += _detect_abstraction_skip(events)
     results += _detect_grind(events, grind_threshold)
     results += _detect_advisory_ignored(events)

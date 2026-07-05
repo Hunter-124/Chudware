@@ -63,6 +63,13 @@ CLASS_TO_DIAL: dict[str, dict[str, str]] = {
         "action": "keep the foreman advisory injection on (deliberation=full) and ensure "
                   "the advisory slot budget is not shrunk below its floor",
     },
+    "execution_stall": {
+        "knob": "budgets.tools (tools slot) + mission-dispatch coverage",
+        "action": "verify the turn prompt carries trimmed schemas for the node's full "
+                  "allowlist (no tools omitted for budget — raise budgets.tools if the "
+                  "tools_slot event reports omissions) and that every allowlisted tool "
+                  "resolves (mission-scoped dispatcher + registry fallback, T-W32)",
+    },
 }
 
 # Levers that would require a prompt/workflow/role-card edit → LEAD-OWNED, never applied.

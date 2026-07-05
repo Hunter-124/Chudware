@@ -141,3 +141,40 @@ def test_turn_logs_every_tool_call_to_ledger():
              if e["kind"] == "agent_turn"]
     assert kinds.count("tool_call") == 2, ledger.events
     assert all(e["actor"] == "feature_modeler" for e in ledger.events)
+
+
+# ---------------------------------------------------------------------------
+# T-W32 — directive parsing: nested args, unterminated fences, trailing prose
+# ---------------------------------------------------------------------------
+
+def test_parse_directive_nested_args():
+    """The r4 PLAN-node regression: a fenced tool call with NESTED object args
+    must parse (the old brace-pair regex truncated at the first '}')."""
+    from services.agent.agent_turn import _parse_directive
+    reply = ('```json\n{"tool": "buildgraph_plan", "args": {"plan_json": '
+             '{"deliverables": [{"name": "bushing", "ops": {"kind": "revolve"}}]}}}\n```')
+    obj = _parse_directive(reply)
+    assert obj is not None and obj["tool"] == "buildgraph_plan"
+    assert obj["args"]["plan_json"]["deliverables"][0]["ops"]["kind"] == "revolve"
+
+
+def test_parse_directive_unterminated_fence():
+    """A local model hitting its completion cap mid-fence: complete JSON object,
+    missing closing fence — still parsed."""
+    from services.agent.agent_turn import _parse_directive
+    reply = 'Let me plan.\n```json\n{"tool": "fit_calc", "args": {"nominal": 20}}'
+    obj = _parse_directive(reply)
+    assert obj is not None and obj["tool"] == "fit_calc"
+
+
+def test_parse_directive_trailing_prose_after_object():
+    from services.agent.agent_turn import _parse_directive
+    reply = '{"done": true, "handoff": {"summary": "ok"}}\nThat completes the node.'
+    obj = _parse_directive(reply)
+    assert obj is not None and obj.get("done") is True
+
+
+def test_parse_directive_prose_only_is_none():
+    from services.agent.agent_turn import _parse_directive
+    assert _parse_directive("Okay, let me think about the bushing design.") is None
+    assert _parse_directive("") is None

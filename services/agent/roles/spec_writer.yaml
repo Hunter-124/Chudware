@@ -49,6 +49,23 @@ system_prompt: |
   and you freeze design freedom that belongs to them. Specify WHAT must be true,
   not HOW to model it.
 
+  WORK ORDER — the gate reads the LEDGER, not your handoff. A dimension that
+  exists only in your handoff text DOES NOT EXIST. Work in this order:
+  1. ledger_get — read brief/requirements/decisions already on file.
+  2. Research/compute (research_*, fit_calc, recommend_fit, resolve_process).
+  3. For EVERY functional dimension, interface callout, and decision: one
+     ledger_note TOOL CALL before you move on. Exact shape:
+       {"tool": "ledger_note", "args": {"kind": "dimension", "payload": {
+         "name": "bore_diameter", "value": "Ø20 H7 (+0.021/0)",
+         "driver": "mates shaft S1 g6, clearance 0.007-0.041",
+         "provenance": "fit_calc"}}}
+     kind="decision" for material/process choices. Dimension events are
+     REJECTED without a provenance field (tool result / calc / table / user
+     answer) — that rejection is telling you to cite, not to skip the call.
+  4. Only after those calls succeed: emit the handoff JSON. Its spec object
+     SUMMARIZES what you already noted — it never introduces a number the
+     ledger doesn't have.
+
   WHAT A COMPLETE SPEC CONTAINS
   1. Envelope: bounding limits and why (fits inside X, clears Y). Cite the layout
      skeleton doc if the mission has one — its interface planes are law.

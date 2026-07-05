@@ -2394,12 +2394,16 @@ def register_cad_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def import_part(path: str, into: Optional[str] = None, as_solid: bool = False,
                     resolve_features: bool = True) -> str:
-        """Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/STEP+/…) as a body.
+        """Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3DM/DXF/DWG/STEP+/…) as a body.
 
         Lets you assemble components built or exported separately, or recover geometry from a file
         after a session reset. `into` = an existing doc_id to add the body to the CURRENT part
         (for assembly); omit it to open the file as a NEW part (made current). `as_solid` sews a
         mesh (STL/OBJ/…) into a solid on import; B-rep formats already import as solids.
+
+        DXF/DWG are 2D vector drawings: they import as planar wires + faces (closed loops become
+        faces) — reference/profile geometry to extrude or dimension, not a solid. DWG needs a
+        DWG→DXF converter (LibreDWG `dwg2dxf`) on PATH; without one it errors with a hint.
 
         SOLIDWORKS (.sldprt): with `resolve_features=True` (default) and no `into`, the part is
         opened by RECONSTRUCTING its SolidWorks feature tree (sketches with relations, reference

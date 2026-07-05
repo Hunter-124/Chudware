@@ -1,6 +1,7 @@
 // core/cam/op_engrave.cpp — engraving / tracing along open or closed curves.
 // For a V-bit the cut depth derives from the requested groove width and the tool
 // included angle; otherwise it follows the curve at the operation depth.
+#define _USE_MATH_DEFINES  // MSVC needs this before <cmath> for M_PI (mirrors geom/plane.cpp)
 #include <algorithm>
 #include <cmath>
 

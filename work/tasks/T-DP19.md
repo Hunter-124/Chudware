@@ -85,15 +85,21 @@ real ledger_get calls); grading fails on merits (AC1 "no bore dimension recorded
 
 ## HANDOFF — follow-ups (NOT in T-DP19 scope)
 
-- **[higher-value latent bug] Mission node providers ignore the passed provider.**
-  `services/dag/node_runner.py:152` resolves `config.get_provider()` (no-arg) →
-  config.json default. So the overseer/build/deliver nodes hit the AMBIENT cloud
-  provider even when the operator passed a local one to run_mission. Any mission on a
-  cloud config.json misroutes internal roles. Tonight's real run worked around it by
-  monkeypatching `config.load_config` to a local config (operator plumbing, no code /
-  no edit to Hunter's config.json). A real fix threads the mission provider (or the
-  tier) into node_runner's default agent_fn — touches services/agent under advisor.md,
-  so it wants its own task. Repro/evidence: scratchpad/dp19_local_tuning.py.
+- **[needs advisor/human design — NOT a simple patch] Local-tier missions route
+  internal nodes to the ambient cloud provider.** `services/dag/node_runner.py:152`
+  resolves `config.get_provider()` (no-arg) → config.json default, so a Python
+  `loop.run_mission` node (overseer-audit/build/deliver) runs on the AMBIENT provider
+  (Gemini) even for a `local-24k` cell. **Do NOT "just thread the mission provider"** —
+  advisor.md §14 (routing.yaml) mandates PER-ROLE routing (overseer→strongest,
+  sketcher→cheap_local) and says "code must not special-case any role's model choice",
+  so forcing one provider onto all nodes violates the contract. The real fix is a §14
+  routing override that pins local-tier runs to local per-role models (routing.yaml
+  layer, not the node_runner call site) — a Fable/human design call. Scope note: the
+  PRODUCTION app executes missions through the C++ core (core/agent/run.cpp::run_mission),
+  not this Python path, which is bench/gym-exercised — so the impact today is "gym real
+  runs need the config override," already handled. Tonight's honest run used a
+  `config.load_config` monkeypatch (operator plumbing, no code / no edit to config.json).
+  Repro/evidence: scratchpad/dp19_local_tuning.py.
 - **Fuller C-suite gradient.** Recorded result covers C1 only (minimal, timeboxed).
   Re-run the same driver with `challenge_ids=["C1","C1-DP2",...]` for the full suite;
   expect more honest 0.00s at the specify wall until scaffolding/model improves.

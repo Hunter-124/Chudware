@@ -34,3 +34,6 @@ section. Inline in the popup (settings consolidation rule — no floating window
 - [ ] Auto/advanced mode toggle; advanced reveals stage/council/helper knobs.
 - [ ] Inline in Settings AI tab; shot-verified; ui_style_check clean.
 - [ ] gate.sh PASS; graphify update.
+
+## Progress log
+- 2026-07-06 01:49 UTC [sonnet-sorrel2] T-DP12: built + pushed. 3-mode effort UI (Auto|Simple|Advanced) in AI tab. All 22 effort tests + 34 workflow_router tests pass, ui_style_check clean. Shots: ai_effort_auto (router tier-defaults table), ai_effort_simple (4-level dial), ai_effort_advanced (knob editor) all verified. gate.sh running.

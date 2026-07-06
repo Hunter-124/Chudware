@@ -37,3 +37,6 @@ Overseer holds + re-grounds the master intent so fresh-context stages never drif
 - [ ] User-change mapping: a change request resolves to a stage+feature re-entry (test).
 - [ ] Master-intent re-grounding: a drifted stage output is caught (test).
 - [ ] gate.sh PASS; graphify update.
+
+## Progress log
+- 2026-07-06 00:47 UTC [opus-slate1] Reroute core shipped: services/agent/advisor/reroute.py — deterministic targeted_reentry from audit evidence (ledger kind -> owning DP stage/role). Overseer.audit attaches it per-verdict + pins non-truncatable master-intent block (drift catch). change_request dispatch rows carry stage_reentry. advisor.md 1.6->1.7 additive. 14 new tests + 277 advisor suite green. Running gate next.

@@ -561,6 +561,10 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantRibbon) {
         st.workspace = cmd::Workspace::Model;
         ribbon::applyShotEnv(st);
+        // T-BL31: suppress the on-load ShopCraft toast for ribbon-icon captures so it can't
+        // overlap ribbon groups; re-enable with AI_CAD_SHOT_KEEPTOAST=1 for toast verification.
+        const char* keep = std::getenv("AI_CAD_SHOT_KEEPTOAST");
+        if (!(keep && *keep)) st.suppressToasts = true;
     }
     if (cfg.wantSketch || cfg.wantSketchConvert) {
         st.inSketch = true;

@@ -1,6 +1,7 @@
 #include "ui/toast.h"
 #include "app/app_state.h"
 #include "theme/theme.h"
+#include "ui/layout.h"   // overlayBand — anchor toasts below the real ribbon (T-BL31)
 #include "imgui.h"
 #include <cfloat>
 
@@ -33,7 +34,7 @@ void postToast(ToastLevel level, std::string msg) {
 }
 
 void drawToasts(app::AppState& st) {
-    (void)st;
+    if (st.suppressToasts) return;   // T-BL31: e.g. AI_CAD_SHOT=ribbon — keep captures clean
     std::lock_guard<std::mutex> lk(s_toastMtx);
     if (s_toasts.empty()) return;
 
@@ -55,7 +56,10 @@ void drawToasts(app::AppState& st) {
     const float pad      = theme::U(1.5f);
     const float toastW   = 320.f * S;
     const float rowGap   = theme::U(1.f);
-    const float topInset = 64.f * S;
+    // T-BL31: anchor below the real ribbon (the pinned-column band top) so toasts don't overlap
+    // ribbon groups; fall back to the fixed inset when the band hasn't been published this frame.
+    const ui::OverlayBand& band = ui::overlayBand();
+    const float topInset = band.valid ? (band.minY - vp->Pos.y) + 8.f * S : 64.f * S;
     float x = vp->Pos.x + pad;
     float y = vp->Pos.y + topInset;
 

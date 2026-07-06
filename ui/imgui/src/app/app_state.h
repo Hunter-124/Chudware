@@ -132,6 +132,7 @@ struct AppState {
     bool  inSketch = false;
     bool  sketchPlanePickActive = false;
     bool  camActive = false;   // H1 CAM content-swap: true while the CAM panel should be forward
+    bool  suppressToasts = false;  // T-BL31: AI_CAD_SHOT=ribbon suppresses on-load toasts (clean captures)
 
     // T-BL47: pending sketch ribbon commands — drained each frame in viewport.cpp
     // where the SketchHost + s_sketch static exist. Push here from dispatch(), drain there.

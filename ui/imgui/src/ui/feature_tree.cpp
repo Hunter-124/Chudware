@@ -1973,6 +1973,17 @@ static void applyOpenedDoc(AppState& st, const std::string& path) {
                 if (!lerr.empty())
                     st.addLog("[err] loadDocMesh: " + lerr);
             }
+            // T-BL47: flat 2D imports (DXF/DWG) have ~zero volume and lie on the XY datum plane,
+            // sharing its colour — hide the datum planes and face Top so the drawing is immediately
+            // visible. Solids (volume > 0) are untouched. (Ported from host/src/ui/feature_tree.cpp;
+            // the host-only fix never reached ui/imgui.)
+            if (!aicm.empty() && r.result.contains("volume") &&
+                std::abs(r.result.value("volume", 1.0)) < 1e-6) {
+                st.showPlane[0] = st.showPlane[1] = st.showPlane[2] = false;
+                st.planesUserToggled = true;   // stick — don't let auto-show re-reveal them
+                st.yaw = 0.0f; st.pitch = 89.5f; st.zoom = 1.0f;   // Top: face the flat drawing
+                st.addLog("[open] flat 2D import — hid datum planes + oriented Top");
+            }
             // doc_open left the mirror without feature_status / owner_map (DocMirror::open
             // clears them); doc_tree is a cheap no-rebuild pull that restores both (status
             // badges + feature->face highlights) and fires the listener so the tree repaints.

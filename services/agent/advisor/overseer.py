@@ -301,11 +301,48 @@ def _render_history(prior_audits: list[dict], prior_advisories: list[dict],
     return "[PRIOR-FINDINGS]\n" + body + "\n[/PRIOR-FINDINGS]"
 
 
+def render_master_intent(brief: dict | None, requirements: list[dict] | None,
+                         *, max_reqs: int = 12) -> str:
+    """Render the PINNED, non-truncatable master-intent block (T-DP5 §3.1).
+
+    The overseer "holds and re-grounds the master intent so fresh-context stages
+    never drift" (doc §3.1).  Master intent = the brief + the requirements.  It rides
+    in ``ledger_text`` today, which the budget truncates on a small local context —
+    exactly the case where drift happens.  So we pin it as its OWN block that
+    ``assemble_evidence`` never drops, giving the auditor an un-truncatable ground
+    truth to compare a possibly-drifted stage output against (the ``spec_drift``
+    catch).  Returns ``""`` when there is nothing to pin.
+    """
+    brief = brief or {}
+    reqs = requirements or []
+    title = (brief.get("title") or "").strip()
+    summary = (brief.get("summary") or "").strip()
+    crit = brief.get("success_criteria") or []
+    if not (title or summary or reqs or crit):
+        return ""
+    lines = ["[MASTER-INTENT — pinned, the goal every stage must still serve]"]
+    if title:
+        lines.append(f"  goal: {title}")
+    if summary:
+        lines.append(f"  summary: {summary}")
+    for c in crit:
+        lines.append(f"  success: {c if isinstance(c, str) else c.get('text', c)}")
+    for r in reqs[:max_reqs]:
+        rid = r.get("req_id", "?")
+        txt = (r.get("text") or "").strip()
+        lines.append(f"  requirement {rid}: {txt}")
+    if len(reqs) > max_reqs:
+        lines.append(f"  (+{len(reqs) - max_reqs} more requirement(s) — see ledger)")
+    lines.append("[/MASTER-INTENT]")
+    return "\n".join(lines)
+
+
 def assemble_evidence(
     trigger: str,
     scope: AuditScope,
     *,
     ledger_text: str = "",
+    master_intent: str = "",
     buildgraph: dict | None = None,
     handoffs: list[dict] | None = None,
     prior_audits: list[dict] | None = None,
@@ -320,6 +357,11 @@ def assemble_evidence(
     (passed in so this module stays decoupled from the Ledger class).  Everything
     else is optional — an audit degrades gracefully when a section is absent.
 
+    ``master_intent`` — the PINNED, non-truncatable brief+requirements block
+    (``render_master_intent``).  It is placed FIRST and never budget-dropped, so the
+    auditor always sees the goal even on a tiny local context where ``ledger_text``
+    truncates (T-DP5 §3.1 re-grounding).
+
     ``org_concerns`` — list of unresolved-concern context dicts from
     ``org.unresolved_concern_contexts()``.  When non-empty the concerns are
     appended as an [ORG-CONCERNS] block so the auditor can flag long-running
@@ -329,6 +371,9 @@ def assemble_evidence(
     parts: list[str] = [f"TRIGGER: {trigger}",
                         f"SCOPE: run={scope.run_id} stage={scope.stage} "
                         f"roles={scope.roles} nodes={scope.buildgraph_nodes}"]
+    if master_intent:
+        # Pinned first, never truncated — the ground truth for drift detection.
+        parts.append(master_intent)
     if ledger_text:
         parts.append(ledger_text)
     bg = _slice_buildgraph(buildgraph or {}, scope, budget.buildgraph * _CHARS_PER_TOKEN)
@@ -667,9 +712,19 @@ class Overseer:
         if prior_audits is None and prior_advisories is None and self.ledger is not None:
             prior_audits, prior_advisories = self.prior_findings_from_ledger()
 
+        # Pin the master intent (brief + requirements) so a small-context audit never
+        # loses the goal to budget truncation — the ground truth for drift detection
+        # (§3.1 re-grounding).  Pulled from the ledger state when available.
+        master_intent = ""
+        if self.ledger is not None:
+            state = getattr(self.ledger, "state", None) or {}
+            master_intent = render_master_intent(state.get("brief"),
+                                                  state.get("requirements"))
+
         evidence = assemble_evidence(
             trigger, scope,
-            ledger_text=ledger_text, buildgraph=buildgraph, handoffs=handoffs,
+            ledger_text=ledger_text, master_intent=master_intent,
+            buildgraph=buildgraph, handoffs=handoffs,
             prior_audits=prior_audits, prior_advisories=prior_advisories,
             change_plan=change_plan, org_concerns=org_concerns, budget=self.budget,
         )
@@ -701,6 +756,14 @@ class Overseer:
         # gave one, else estimate from evidence+reply length.
         if not audit["tokens"]:
             audit["tokens"] = _estimate_tokens(self._system, user_msg, reply)
+
+        # T-DP5 reroute: attach the deterministic ``targeted_reentry`` (owning DP
+        # stage + role) to every non-ok verdict BEFORE persisting, so the ledger
+        # ``audit`` event records where each finding routes (never a blind restart).
+        # Computed from the evidence ledger-kinds, not the model's prose (validate
+        # already stripped any model-supplied reroute — the harness owns routing).
+        from .reroute import route_audit
+        route_audit(audit, ledger=self.ledger)
 
         # Persist as a ledger event (audits are ledger events, §11).
         if self.ledger is not None:

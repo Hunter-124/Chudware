@@ -41,7 +41,7 @@ set(AICAD_STB_INCLUDE_DIR "${stb_SOURCE_DIR}" CACHE INTERNAL "")
 # --- glad (GL loader) — root preset may create glad before viewport ------------
 if(NOT TARGET glad)
   if(NOT EXISTS "${GLAD_DIR}/src/gl.c")
-    message(FATAL_ERROR "Missing ${GLAD_DIR}/src/gl.c — host/extern/glad required")
+    message(FATAL_ERROR "Missing ${GLAD_DIR}/src/gl.c — glad lives at extern/glad (GLAD_DIR)")
   endif()
   add_library(glad STATIC ${GLAD_DIR}/src/gl.c)
   target_include_directories(glad PUBLIC ${GLAD_DIR}/include)
@@ -103,15 +103,25 @@ target_link_libraries(AI-CAD2 PRIVATE
   OpenGL::GL)
 
 if(WIN32)
+  # Runtime engine-resolution fallback (see ui/imgui/src/main.cpp): if AI_CAD_LIBAICAD is
+  # unset AND no libaicad.dll sits next to the exe, main.cpp puts this path into the env.
+  # It MUST point at where the windows-occt preset actually builds the core (Ninja layout,
+  # build/windows-occt/bin) — NOT the old VS core/build-occt/bin/Release layout. cpp_core's
+  # SetDllDirectoryW then adds that dir to the process search path so the sibling OCCT/Netgen
+  # TK*.dll transitive deps resolve too (no need to copy ~100 DLLs next to the exe).
   target_compile_definitions(AI-CAD2 PRIVATE AICAD_HAVE_BRIDGE=1
-    AICAD_DEFAULT_LIBAICAD="${REPO}/core/build-occt/bin/Release/libaicad.dll")
+    AICAD_DEFAULT_LIBAICAD="${REPO}/build/windows-occt/bin/libaicad.dll")
   target_link_libraries(AI-CAD2 PRIVATE opengl32 dwmapi comdlg32)
   if(MSVC)
     # MSVC 14.51 (VS 2026): UCRT <cmath> is missing C99 float math declarations in the global
     # namespace; force-include the shim on C++ TUs only (parity with host/CMakeLists.txt — X1/T-WIN1).
     # ui/imgui keeps its OWN copy (extern/fix_math.h) so it survives the host/ deletion (T-G11).
+    # NOTE: do NOT wrap the path in inner quotes (/FI"...") — under the Ninja+MSVC generator a
+    # repo path with a space (e.g. "AI PROJECTS") makes cl treat the literal quote chars as part
+    # of the filename (C1083). Leaving the token unquoted lets Ninja quote the whole /FI<path>
+    # token, which cl unwraps correctly. (The legacy host/ VS-generator build never hit this.)
     target_compile_options(AI-CAD2 PRIVATE
-      $<$<COMPILE_LANGUAGE:CXX>:/FI"${CMAKE_CURRENT_SOURCE_DIR}/extern/fix_math.h">)
+      $<$<COMPILE_LANGUAGE:CXX>:/FI${CMAKE_CURRENT_SOURCE_DIR}/extern/fix_math.h>)
   endif()
 else()
   target_compile_definitions(AI-CAD2 PRIVATE AICAD_HAVE_BRIDGE=1

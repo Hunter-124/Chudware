@@ -24,9 +24,12 @@ Playwright (Apache-2.0) is an optional runtime dependency (see
 Playwright isn't installed; they degrade to the ``engine.research`` §6 failure
 shape instead (``contracts/research_tools.md``).
 
-Captcha/2FA: this module never attempts to detect, solve, or bypass either —
-that is T-X6's job, and the rule is the same regardless: hand control back to
-the user in a HEADED window, never automate around it.
+Captcha/2FA (T-X6): this module DETECTS these states (see :mod:`.challenge`) but
+never attempts to solve or bypass them. The rule is the same regardless — hand
+control back to the user: ``browser_login`` (headed) surfaces a clear "complete it
+yourself" message and keeps the window open; ``browser_fetch`` (headless) aborts
+with a "needs manual re-login" result rather than returning the challenge page or
+retrying.
 """
 from __future__ import annotations
 
@@ -36,7 +39,11 @@ from typing import Any, Callable
 
 from engine.research.common import fail, now_ts
 
-from . import profiles, ratelimit
+from . import challenge, profiles, ratelimit
+
+#: browser_login re-checks the page for a captcha/2FA prompt this often (seconds)
+#: while waiting for the user to finish and close the window.
+_LOGIN_POLL_INTERVAL_S = 2.0
 
 #: How long browser_login waits (seconds) for the user's login window to close
 #: on its own before this module closes it for them.
@@ -70,15 +77,35 @@ def browser_login(site: str, *, timeout: float = DEFAULT_LOGIN_TIMEOUT_S,
         return fail("playwright_not_installed", str(exc))
 
     profile_path = profiles.profile_dir(site)
+    challenge_detected: str | None = None
     try:
         with sync_playwright() as pw:
             context = pw.chromium.launch_persistent_context(str(profile_path), headless=False)
             try:
                 page = context.pages[0] if context.pages else context.new_page()
-                try:
-                    page.wait_for_event("close", timeout=timeout * 1000)
-                except Exception:  # noqa: BLE001 — timeout or already closed both mean "done"
-                    pass
+                # Poll for the user closing the window. Between polls, if the page shows
+                # a captcha/2FA we surface a clear "do it yourself" message ONCE per kind
+                # and record it — we never click, solve, or bypass it. The user completes
+                # it in this headed window and closes it when signed in.
+                announced: set[str] = set()
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    try:
+                        kind = challenge.classify_challenge(page.content(), page.url)
+                    except Exception:  # noqa: BLE001 — page mid-navigation / closing
+                        kind = None
+                    if kind:
+                        challenge_detected = kind
+                        if kind not in announced:
+                            announced.add(kind)
+                            print(f"[browser_login] {site}: {kind.upper()} detected — "
+                                  f"please complete it in the browser window. This tool "
+                                  f"will not attempt to solve or bypass it.", flush=True)
+                    try:
+                        page.wait_for_event("close", timeout=_LOGIN_POLL_INTERVAL_S * 1000)
+                        break  # window closed → the user signalled "done"
+                    except Exception:  # noqa: BLE001 — poll interval elapsed, still open
+                        continue
             finally:
                 context.close()
     except Exception as exc:  # noqa: BLE001 — never crash the caller on a browser-launch error
@@ -87,7 +114,8 @@ def browser_login(site: str, *, timeout: float = DEFAULT_LOGIN_TIMEOUT_S,
     profiles.touch_created(site)
     meta = profiles.save_meta(site, last_login_ts=time.time())
     return {"ok": True, "site": meta["site"], "profile_dir": str(profile_path),
-            "last_login_ts": meta["last_login_ts"]}
+            "last_login_ts": meta["last_login_ts"],
+            "challenge_detected": challenge_detected}
 
 
 def browser_fetch(url: str, site: str, *, nav_timeout: float = DEFAULT_NAV_TIMEOUT_S,
@@ -123,6 +151,17 @@ def browser_fetch(url: str, site: str, *, nav_timeout: float = DEFAULT_NAV_TIMEO
             return fail("browser_fetch_failed", str(exc))
     finally:
         ratelimit.mark_hit(site)
+
+    # A captcha/2FA interstitial is NOT real content. Headless has no human to hand
+    # off to, so abort — never return the challenge page as a success, never retry or
+    # attempt to solve it. The saved session has almost certainly expired; the caller
+    # surfaces this and the user re-logins headed.
+    challenge_kind = challenge.classify_challenge(content, url)
+    if challenge_kind:
+        return fail("captcha_or_2fa_detected",
+                    f"{site} returned a {challenge_kind} challenge for {url}; the saved "
+                    f"session likely expired — re-login with browser_login('{site}') "
+                    f"and retry")
 
     profiles.save_meta(site, last_used_ts=time.time())
     return {"ok": True, "url": url, "status": status, "content": content,

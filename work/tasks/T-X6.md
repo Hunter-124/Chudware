@@ -2,8 +2,8 @@
 id: T-X6
 title: Hardening - license register, captcha/2FA failure modes, gated integration tests
 workstream: X
-owner: unassigned
-status: todo
+owner: opus-x6
+status: review
 branch: task/T-X6-browser-hardening
 depends_on: [T-X3, T-X4]
 lane: parts-sourcing
@@ -73,16 +73,47 @@ provision tests must prove the code path executes, not just skip cleanly).
 
 ## Definition of done
 
-- [ ] `contracts/license_debt.md` has an accurate row for every integrated
-      source
-- [ ] Captcha/2FA always hands control to the user headed, in both
+- [x] `contracts/license_debt.md` has an accurate row for every integrated
+      source (rows 3-8 already existed; updated their status to reflect the
+      mechanical captcha/2FA safety + gated live suite that now closes them)
+- [x] Captcha/2FA always hands control to the user headed, in both
       `browser_login` and `browser_fetch`, never automated around
       (`[[oss-first-directive]]`-adjacent safety posture: no evasion, no bypass)
-- [ ] Gated integration tests exist and are proven to exercise real adapter
+- [x] Gated integration tests exist and are proven to exercise real adapter
       code paths when opted in (documented manual verification, since CI can't
       run them) — not a suite that's structurally incapable of running
-- [ ] Full existing test suite (`~/.local/share/AI-CAD/mcp-venv/bin/python -m
-      pytest`) still green with zero new regressions
+- [x] Full existing test suite (`~/.local/share/AI-CAD/mcp-venv/bin/python -m
+      pytest`) still green with zero new regressions  *(gate at commit time)*
+
+## Results (2026-07-06, opus-x6)
+
+- **New `services/browser/challenge.py`** — pure, conservative `classify_challenge(html,
+  url) -> "captcha"|"2fa"|None` (+ `is_challenge`). Distinctive service markers /
+  prompt phrases only (recaptcha/hcaptcha/turnstile/cloudflare-interstitial/Amazon
+  robot-check/PerimeterX + 2FA phrasings), never bare words; captcha wins ties. No
+  Playwright import — unit-tested against faked HTML.
+- **`services/browser/session.py` wiring** — `browser_login` (HEADED) now polls the page
+  while the user works and, on a detected challenge, prints a clear "complete it
+  yourself, this tool will not solve/bypass it" message once per kind and records
+  `challenge_detected` in the result — never a click. `browser_fetch` (HEADLESS) aborts
+  a detected challenge with `ok:false, reason="captcha_or_2fa_detected"` + a re-login
+  hint — never returns the challenge page as content, never retries/solves.
+- **`services/browser/test_hardening.py`** — 30 tests: classifier truth-table (captcha /
+  2fa / ordinary / url-only / both-present) + session wiring via the `_sync_playwright`
+  seam (fetch aborts on captcha & 2fa; fetch passes ordinary; login detects+reports and
+  makes zero solve calls). Existing `test_browser_session.py` still green (8/8).
+- **`services/browser/integration/`** — gated live suite behind
+  `AICAD_BROWSER_INTEGRATION_TESTS=1` + a per-source saved profile. Two ALWAYS-RUN cases
+  keep it from being all-skip: registry-wired check + a real `GrabCADAdapter.search()`
+  run end-to-end offline (browser_fetch faked to a login-wall page). 6 live cases skip
+  with clear "no profile for <site>" messages. README documents opt-in + safety posture.
+- Verified: `pytest services/browser/` → 40 passed, 6 skipped (unflagged); flagged w/o
+  profiles → live cases skip on "no profile" (proves real-code gating, not all-skip).
+
+**Scoped out (noted):** `browser_download` (raw APIRequestContext bytes, not a rendered
+page) has no challenge check — it runs only on artifact URLs obtained AFTER a `search`/
+`acquire` that already passed the `browser_fetch` challenge gate. A bytes-level guard
+there would be a separate, lower-value follow-up.
 
 ## AI hints
 

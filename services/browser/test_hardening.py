@@ -1,0 +1,214 @@
+"""Tests for services/browser captcha/2FA hardening — T-X6.
+
+No real Playwright, no real network, no real captcha: the detection classifier is
+pure (faked page HTML), and the session wiring is exercised through each function's
+``_sync_playwright`` injection seam (same pattern as test_browser_session.py). The
+point is to prove the HARD RULE mechanically — a detected challenge pauses the
+headed login and aborts the headless fetch, and we never automate around it.
+"""
+from __future__ import annotations
+
+import importlib
+
+import pytest
+
+from services.browser import challenge
+
+
+# --- classifier (pure) ----------------------------------------------------------
+
+@pytest.mark.parametrize("html", [
+    '<div class="g-recaptcha" data-sitekey="abc"></div>',
+    '<iframe src="https://www.google.com/recaptcha/api2/anchor"></iframe>',
+    '<div class="h-captcha"></div>',
+    '<div class="cf-turnstile"></div>',
+    "<title>Just a moment...</title>",
+    "<p>Checking your browser before accessing the site.</p>",
+    "<title>Robot Check</title><p>Enter the characters you see below</p>",
+    "<h1>Verify you are human</h1>",
+    "<p>Please complete the security check to continue.</p>",
+])
+def test_classifier_flags_captcha(html):
+    assert challenge.classify_challenge(html) == "captcha"
+    assert challenge.is_challenge(html) is True
+
+
+def test_classifier_flags_captcha_from_url_alone():
+    # Amazon redirects to /errors/validateCaptcha — the URL itself is the signal.
+    assert challenge.classify_challenge("<html>ok</html>",
+                                        "https://www.amazon.com/errors/validateCaptcha") == "captcha"
+
+
+@pytest.mark.parametrize("html", [
+    "<h1>Two-factor authentication</h1><p>Enter the code we sent to your phone.</p>",
+    "<label>Authentication code</label>",
+    "<p>Enter the 6-digit code from your authenticator app.</p>",
+    "<h2>2-Step Verification</h2>",
+    "<p>We sent a verification code to your email.</p>",
+])
+def test_classifier_flags_2fa(html):
+    assert challenge.classify_challenge(html) == "2fa"
+
+
+@pytest.mark.parametrize("html", [
+    "<html><body>A perfectly ordinary product page. Add to cart.</body></html>",
+    "<html><head><title>GrabCAD - Flanged Bushing</title></head><body>Download STEP</body></html>",
+    "<p>Sign in with your email and password to continue.</p>",  # a login form is NOT a captcha/2FA
+    "",
+    None,
+])
+def test_classifier_passes_ordinary_pages(html):
+    assert challenge.classify_challenge(html) is None
+    assert challenge.is_challenge(html) is False
+
+
+def test_captcha_wins_when_page_has_both():
+    html = '<div class="g-recaptcha"></div><p>two-factor authentication</p>'
+    assert challenge.classify_challenge(html) == "captcha"
+
+
+# --- fakes (page carries a .url, unlike test_browser_session's minimal one) ------
+
+class _FakePage:
+    def __init__(self, html, url, status=200):
+        self._html, self.url, self._status = html, url, status
+        self.solve_calls = 0  # would increment if anything tried to interact with a challenge
+
+    def wait_for_event(self, name, timeout=None):
+        return None  # user closes the login window immediately
+
+    def goto(self, url, timeout=None):
+        self.url = url
+        return _FakeResponse(self._status)
+
+    def content(self):
+        return self._html
+
+
+class _FakeResponse:
+    def __init__(self, status):
+        self.status = status
+
+
+class _FakeContext:
+    def __init__(self, html, url, status):
+        self.pages, self.closed = [], False
+        self._html, self._url, self._status = html, url, status
+
+    def new_page(self):
+        p = _FakePage(self._html, self._url, self._status)
+        self.pages.append(p)
+        return p
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeChromium:
+    def __init__(self, html, url, status):
+        self.launched, self.last_context = [], None
+        self._html, self._url, self._status = html, url, status
+
+    def launch_persistent_context(self, user_data_dir, headless=True):
+        self.launched.append((user_data_dir, headless))
+        self.last_context = _FakeContext(self._html, self._url, self._status)
+        return self.last_context
+
+
+class _FakePlaywright:
+    def __init__(self, html, url, status):
+        self.chromium = _FakeChromium(html, url, status)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _factory(html, url="https://example.com/", status=200):
+    pw = _FakePlaywright(html, url, status)
+
+    def _f():
+        return pw
+    _f.instance = pw
+    return _f
+
+
+@pytest.fixture()
+def sess(tmp_path, monkeypatch):
+    """Reload services.browser.* under an isolated APPDATA base (mirrors test_browser_session)."""
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    from engine import paths as engine_paths
+    importlib.reload(engine_paths)
+    from services.browser import profiles, ratelimit, session
+    importlib.reload(profiles)
+    importlib.reload(ratelimit)
+    importlib.reload(session)
+    yield profiles, session
+    monkeypatch.delenv("APPDATA", raising=False)
+    importlib.reload(engine_paths)
+
+
+# --- browser_fetch: HEADLESS abort on a challenge -------------------------------
+
+def test_fetch_aborts_on_captcha(sess):
+    profiles, session = sess
+    profiles.profile_dir("amazon").mkdir(parents=True)
+    fac = _factory('<title>Robot Check</title><div class="g-recaptcha"></div>',
+                   url="https://www.amazon.com/dp/B000")
+    result = session.browser_fetch("https://www.amazon.com/dp/B000", "amazon",
+                                   _sync_playwright=fac, min_interval=0.0)
+    assert result["ok"] is False
+    assert result["reason"] == "captcha_or_2fa_detected"
+    assert "re-login" in result["hint"]
+    # Never returned the challenge page as content, never marked a successful use.
+    assert "content" not in result
+    assert profiles.load_meta("amazon").get("last_used_ts") is None
+
+
+def test_fetch_aborts_on_2fa(sess):
+    profiles, session = sess
+    profiles.profile_dir("grabcad").mkdir(parents=True)
+    fac = _factory("<h1>Two-factor authentication</h1><p>Enter the code we sent.</p>",
+                   url="https://grabcad.com/parts")
+    result = session.browser_fetch("https://grabcad.com/parts", "grabcad",
+                                   _sync_playwright=fac, min_interval=0.0)
+    assert result["ok"] is False
+    assert result["reason"] == "captcha_or_2fa_detected"
+
+
+def test_fetch_passes_ordinary_page(sess):
+    profiles, session = sess
+    profiles.profile_dir("grabcad").mkdir(parents=True)
+    fac = _factory("<html><body>Flanged Bushing — download STEP</body></html>",
+                   url="https://grabcad.com/library/part-1")
+    result = session.browser_fetch("https://grabcad.com/library/part-1", "grabcad",
+                                   _sync_playwright=fac, min_interval=0.0)
+    assert result["ok"] is True
+    assert "Flanged Bushing" in result["content"]
+
+
+# --- browser_login: HEADED detect + surface, never automate ---------------------
+
+def test_login_detects_and_reports_captcha(sess, capsys):
+    _profiles, session = sess
+    fac = _factory('<div class="h-captcha"></div>', url="https://www.pcbway.com/login")
+    result = session.browser_login("pcbway", timeout=5.0, _sync_playwright=fac)
+    assert result["ok"] is True
+    assert result["challenge_detected"] == "captcha"
+    # A clear, user-facing instruction was surfaced; no bypass was attempted.
+    out = capsys.readouterr().out
+    assert "CAPTCHA" in out and "not attempt to solve" in out
+    # The headed window was the only actor — the fake page recorded zero solve calls.
+    page = fac.instance.chromium.last_context.pages[0]
+    assert page.solve_calls == 0
+
+
+def test_login_ordinary_page_has_no_challenge(sess):
+    _profiles, session = sess
+    fac = _factory("<html><body>Signed in as user</body></html>",
+                   url="https://grabcad.com/dashboard")
+    result = session.browser_login("grabcad", timeout=5.0, _sync_playwright=fac)
+    assert result["ok"] is True
+    assert result["challenge_detected"] is None

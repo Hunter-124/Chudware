@@ -3,7 +3,7 @@ id: T-X7
 title: Vendor adapter wave 2 - Amazon, McMaster-Carr, JLCPCB, PCBWay + manufacturing-service discovery
 workstream: X
 owner: opus-wynn
-status: doing
+status: done
 branch: task/T-X7-vendor-adapters-wave2
 depends_on: [T-X2, T-X3]
 lane: parts-sourcing

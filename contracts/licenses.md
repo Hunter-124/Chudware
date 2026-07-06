@@ -1,5 +1,10 @@
 # Contract: Dependency License Ledger
 
+> See also: [docs/reference/README.md](../docs/reference/README.md) — clean-room, public-spec CAD
+> format reference material (folded in from a sibling clean-room project) that documents the
+> general format landscape and the clean-room-reimplementation posture this ledger enforces for
+> specific dependencies (KiCad, BOLTS, etc. below).
+>
 > Policy: the default distribution stays GPL-clean except where isolated below. Re-audit at every
 > wheelhouse rebuild (M10 gate). Today's posture: personal/local tool; revisit before any
 > commercial distribution.
@@ -32,6 +37,9 @@
 | trimesh | MIT | voxelize, ray casts, mesh import/export lane (STL/OBJ/PLY/glTF) | ok |
 | networkx | BSD-3 | trimesh scene-graph dep (multi-mesh OBJ/glTF import) | ok |
 | rhino3dm | MIT | Rhino .3dm import/export (mesh-level) | ok |
+| ezdxf | MIT | DXF (2D vector) import → planar B-rep wires/faces (engine.doc.formats_dxf) | ok (in-process; MIT permissive) |
+| ODA File Converter (optional) | proprietary (free EULA) | DWG→DXF conversion for `engine.doc.formats_dwg` (via `ezdxf.addons.odafc`) | **subprocess-only**, user-installed, PATH/registry-discovered, never bundled (mere aggregation) — absence degrades to an actionable error |
+| LibreDWG `dwg2dxf` (optional) | GPL-3.0 | alternative DWG→DXF converter for `engine.doc.formats_dwg` | **subprocess-only**, PATH-discovered, never linked or bundled (GPL isolation, same policy as pandoc/ngspice) |
 | olefile | BSD-2 | OLE2 probe for legacy SolidWorks .sldprt preview (experimental) | ok |
 | pywin32 | PSF-2.0 | optional SolidWorks COM automation (Windows-only, feature-detected) | ok |
 | numpy / scipy | BSD-3 | math, solvers | ok |

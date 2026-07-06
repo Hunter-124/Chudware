@@ -206,6 +206,7 @@ ready-to-order package. Decision records, in reading order:
 | [docs/PLATFORM_ADR.md](docs/PLATFORM_ADR.md) | Platform pillars: DAG workflow orchestrator, sourcing/cost, spec-sheet matching, firmware/Renode, structural suite, format interop |
 | [docs/AI_TOOLING_MASTER_PLAN.md](docs/AI_TOOLING_MASTER_PLAN.md) | Pillars 8–19: research tools, interaction, vision, narration, providers, translator, deliverables, flywheel, parts library, feature-UI productization, PLM |
 | [docs/PLM_VERSION_CONTROL_PLAN.md](docs/PLM_VERSION_CONTROL_PLAN.md) | PLM version control for user documents (Pillar 19, workstream R): ease-of-use-first, hidden git vault, Project Hub |
+| [docs/reference/README.md](docs/reference/README.md) | Clean-room, public-spec CAD format & data-model reference (folded in from a sibling clean-room project) for format-interop work — see `work/backlog/T-BL02.md` |
 
 Currently parked (per [work/WORKFLOW.md](work/WORKFLOW.md) §3): custom-model training and
 SaaS/cloud hosting — capture/eval seams stay, build-out waits.

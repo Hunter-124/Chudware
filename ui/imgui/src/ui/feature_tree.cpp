@@ -1819,12 +1819,15 @@ static const char* kStepPlusFilter = "AI-CAD part (*.step+)\0*.step+\0All files 
 // Win32 common-dialog layout: NUL-separated "label\0patterns\0"... pairs, double-NUL terminated
 // (the C string literal's own trailing NUL supplies the final one).
 static const char* kImportFilter =
-    "All CAD & mesh files\0*.step+;*.step;*.stp;*.iges;*.igs;*.brep;*.stl;*.3mf;*.obj;*.ply;*.gltf;*.glb;*.3dm;*.sldprt;*.sldasm;*.x_t;*.x_b\0"
+    "All CAD & mesh files\0*.step+;*.step;*.stp;*.iges;*.igs;*.brep;*.stl;*.3mf;*.obj;*.ply;*.gltf;*.glb;*.3dm;*.dxf;*.dwg;*.sldprt;*.sldasm;*.x_t;*.x_b\0"
     "AI-CAD part (*.step+)\0*.step+\0"
     "STEP (*.step;*.stp)\0*.step;*.stp\0"
     "IGES (*.iges;*.igs)\0*.iges;*.igs\0"
     "BREP (*.brep)\0*.brep\0"
     "Mesh (*.stl;*.obj;*.ply;*.3mf;*.gltf;*.glb;*.3dm)\0*.stl;*.obj;*.ply;*.3mf;*.gltf;*.glb;*.3dm\0"
+    // 2D vector drawings import as planar wires/faces (core: read_dxf_shape; DWG shells out to
+    // dwg2dxf then reuses the DXF path — core/doc/formats.cpp).
+    "2D drawings (*.dxf;*.dwg)\0*.dxf;*.dwg\0"
     // SolidWorks/Parasolid import is experimental (engine routes via SolidWorks COM -> STEP).
     "SolidWorks/Parasolid (*.sldprt;*.sldasm;*.x_t;*.x_b)\0*.sldprt;*.sldasm;*.x_t;*.x_b\0"
     "All files (*.*)\0*.*\0";

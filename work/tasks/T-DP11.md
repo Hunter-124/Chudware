@@ -3,7 +3,7 @@ id: T-DP11
 title: GUI transparency panel — helpers / advisories / councils / delegation / tool calls
 workstream: DP
 owner: sonnet-vetch2
-status: review
+status: done
 branch: task/T-DP11-transparency-panel
 depends_on: [T-DP6]
 lane: app-gui

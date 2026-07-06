@@ -252,8 +252,15 @@ def load_routing(path: Path | None = None) -> "RoutingTable":
         "depth_1": str(raw_policy.get("depth_1", "auto")),
         "deeper": str(raw_policy.get("deeper", "overseer")),
     }
+    # T-DP9: parse the delegation: block for soft rails config.
+    raw_delegation = data.get("delegation") or {}
+    delegation_config: dict[str, int] = {
+        "soft_depth_limit": int(raw_delegation.get("soft_depth_limit", 8)),
+        "max_agents": int(raw_delegation.get("max_agents", 64)),
+    }
     return RoutingTable(sources=sources, assignments=assignments,
-                        approval_policy=approval_policy)
+                        approval_policy=approval_policy,
+                        delegation_config=delegation_config)
 
 
 # ---------------------------------------------------------------------------
@@ -268,11 +275,16 @@ class RoutingTable:
         sources: list[Source],
         assignments: dict[str, list[str]],
         approval_policy: dict[str, str],
+        delegation_config: dict[str, int] | None = None,
     ) -> None:
         self._sources: list[Source] = list(sources)
         self._by_id: dict[str, Source] = {s.id: s for s in sources}
         self._assignments: dict[str, list[str]] = dict(assignments)
         self.approval_policy: dict[str, str] = dict(approval_policy)
+        # T-DP9: soft rails from routing.yaml delegation: block.
+        _dc = delegation_config or {}
+        self.soft_depth_limit: int = int(_dc.get("soft_depth_limit", 8))
+        self.max_agents: int = int(_dc.get("max_agents", 64))
 
     # -- availability probe --------------------------------------------------
 

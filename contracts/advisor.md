@@ -2,7 +2,8 @@
 
 Frozen 2026-07-04; §10–§15 added same day (1.0 → 1.1), §16–§17 (1.1 → 1.2),
 §18–§21 org layer (1.2 → 1.3), §22 design cognition ladder (1.3 → 1.4),
-§23 harness effort presets & user overrides (1.4 → 1.5, T-W28). All bumps additive. Companion to
+§23 harness effort presets & user overrides (1.4 → 1.5, T-W28),
+§12 T-DP9 recursion + budget_meter + kill-switch (1.5 → 1.6, additive). All bumps additive. Companion to
 `docs/ADVISOR_ARCHITECTURE.md` (Pillar 20) and `docs/COPILOT_MISSION_PIPELINE.md`
 (pipeline operation).
 
@@ -289,28 +290,75 @@ parts listed with ledger refs) before any mutation is dispatched.
 
 ## §12 Delegation tree (`aicad.delegation/1`)
 
+**T-DP9 additive amendment (1.5 → 1.6):** Removed hard depth cap; added recursive
+overseer-discretion spawn, human-visible budget meter, and kill-switch.  All new fields
+are additive; `depth_cap` is retained for backward compatibility with artifact readers
+but is NO LONGER enforced as a hard limit.
+
 ```json
 {
   "schema": "aicad.delegation/1",
+  "run_id": "r_...",
   "nodes": [{
     "id": "dg_...", "parent": null,
-    "role": "sketcher", "brief": "<=80 words, self-contained",
+    "role": "sketcher", "brief": "<=500 chars, self-contained",
     "requested_by": "orchestrator",
+    "kind": "worker|ponder",
+    "depth": 0,
     "approval": {"policy": "auto|overseer|human", "approved_by": "", "ts": ""},
     "model": {"provider": "", "id": "", "tier": "local-24k"},
     "budget": {"tokens_granted": 0, "tokens_spent": 0, "attempts": 0},
     "docs": [{"doc_id": "", "lease": "write|read"}],
     "status": "pending|approved|running|done|failed|revoked"
   }],
-  "depth_cap": 3
+  "depth_cap": 3,
+  "soft_depth_limit": 8,
+  "killed": false,
+  "budget_meter": {
+    "tokens_granted": 50000,
+    "tokens_spent": 0,
+    "tokens_remaining": 50000,
+    "token_pct": 0.0,
+    "agents_spawned": 0,
+    "agents_remaining": 64,
+    "max_agents": 64,
+    "agent_pct": 0.0,
+    "soft_depth_limit": 8,
+    "killed": false
+  }
 }
 ```
 
-Rules: depth-1 from the orchestrator auto-approves; deeper requires the mission
-overseer's approval (or human, per policy). Budgets inherit: child spend accrues to
-every ancestor; a node whose ancestors' remaining budget hits zero is revoked by the
-harness. The tree lives in the ledger (`artifacts` kind `delegation`) and every
-transition is an event.
+Rules:
+- depth-1 from the orchestrator auto-approves; deeper requires the mission overseer's
+  approval (or human, per policy). **`kind=ponder` is auto-approved at ANY depth.**
+- **No hard depth cap (T-DP9, Hunter directive).** An overseer/lead may spawn
+  sub-agents; those sub-agents may spawn their own with approval from the overseer that
+  called them, recursively, with NO hard cap. The only rails are:
+  1. `soft_depth_limit` (config, default 8): reaching this depth emits a
+     `delegation_depth_warning` advisory event; spawn still proceeds.
+  2. `max_agents` (config, default 64): reaching this count emits a
+     `delegation_agent_limit_warning` advisory event; spawn still proceeds.
+  3. `budget_meter`: tree-wide token+agent tracking, always current in the artifact.
+     Token exhaustion of any ancestor auto-revokes the subtree (unchanged).
+  4. `kill()` / `kill_delegation_tree` MCP tool: human kill-switch — revokes the whole
+     tree from root, sets `killed=True`, rejects all subsequent spawns.
+- `depth_cap` is emitted as the legacy constant `3` for backward compat with artifact
+  readers (e.g. `agent_inspector_view.h`). New readers should use `soft_depth_limit`.
+- `budget_meter` is the **human-visible meter**: tokens spent/remaining + agents
+  spawned/remaining. Updated on every `accrue()` call and every new delegation node.
+- Budgets inherit: child spend accrues to every ancestor; a node whose ancestor's
+  remaining budget hits zero is auto-revoked by the harness (unchanged from pre-T-DP9).
+- Soft limits are in `routing.yaml` under the `delegation:` block:
+  `soft_depth_limit: 8` and `max_agents: 64` (user-configurable, not hardcoded).
+- The tree lives in the ledger (`artifacts` kind `delegation`) and every transition
+  and advisory warning is a ledger event.
+
+New ledger event kinds (T-DP9, additive):
+- `delegation_depth_warning`: emitted when a spawn reaches `depth >= soft_depth_limit`.
+- `delegation_agent_limit_warning`: emitted when `agents_spawned >= max_agents`.
+- `delegation_killed`: emitted when `kill()` is called; includes final `budget_meter`
+  snapshot.
 
 ## §13 Build graph (`aicad.buildgraph/1`)
 
@@ -686,8 +734,9 @@ config.
   Simple-mode levels `eco | standard | deliberate | maximum`, each a set of knob
   overrides (`overrides.all`, then `overrides.<tier>`) applied over a baseline
   DERIVED at load time from tiers.yaml and the shipped code constants (ladder
-  MAX_BOUNCES, delegation DEPTH_CAP, councils seat budgets/threshold, failure
-  attempt budgets, overseer trigger points, trigger packs). `standard` is the
+  MAX_BOUNCES, delegation soft_depth_limit/max_agents (T-DP9; was hard DEPTH_CAP),
+  councils seat budgets/threshold, failure attempt budgets, overseer trigger points,
+  trigger packs). `standard` is the
   identity preset — the §8 1.3 INVERTED DIAL survives untouched.
 - Knob set (grouped for the GUI): Deliberation (`deliberation`, `ladder`,
   `ladder_max_bounces`, `council`, `council_seats`, `council_feature_threshold`,
@@ -705,6 +754,7 @@ config.
   (`shipped | preset:<level> | override`).
 - Freedom rule: absurd combinations WARN with the reason (mirrors §14
   warn-never-block) and are stored verbatim — never blocked, never silently
-  clamped. Runtime hard caps (e.g. §12 DEPTH_CAP) stay enforced at runtime.
+  clamped. Note: §12 DEPTH_CAP is NO LONGER a runtime hard cap (T-DP9); the
+  effective rail is soft_depth_limit (advisory) + max_agents (advisory) + kill().
 - Ledger: mission start appends one `kind: effort_profile` event with the fully
   resolved values + provenance for every tier (replayable).

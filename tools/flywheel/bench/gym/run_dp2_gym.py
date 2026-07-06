@@ -81,4 +81,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # T-DP19: re-exec into the mcp-venv when this interpreter lacks the DAG deps. This
+    # script runs C1-DP2 in MOCK mode (no live model), so it works under any interpreter
+    # — but the guard keeps the entrypoint consistent with cli.py / tuning.py.
+    from tools.flywheel.bench.gym.runner import ensure_capable_interpreter
+    ensure_capable_interpreter("tools.flywheel.bench.gym.run_dp2_gym")
     main()

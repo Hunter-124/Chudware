@@ -45,11 +45,20 @@ class ExecProbe:
     frontier_key: bool
     local_model: bool
     real_agent_fn: bool
+    # T-DP19: is the DAG executor's checkpoint dependency importable in THIS
+    # interpreter? run_mission's PLAN phase imports services.dag.executor, whose
+    # top-level `from langgraph.checkpoint.sqlite import SqliteSaver` raises under an
+    # interpreter that lacks it (system python3). Without this gate the probe reports
+    # "real", the mission dies at PLAN, and every cell ties at win_rate 0.00 — a
+    # misleading signal that looks like a model-quality result. Default True so
+    # externally-constructed probes keep their old meaning.
+    dag_deps: bool = True
 
     @property
     def can_run_real(self) -> bool:
-        # A genuine model-in-the-loop cycle needs a tool-executing agent AND a model.
-        return self.real_agent_fn and (self.frontier_key or self.local_model)
+        # A genuine model-in-the-loop cycle needs a tool-executing agent, a model, AND
+        # the DAG deps in-process (execute_dag=True imports services.dag.executor).
+        return self.real_agent_fn and self.dag_deps and (self.frontier_key or self.local_model)
 
     @property
     def mode(self) -> str:
@@ -58,7 +67,7 @@ class ExecProbe:
     def to_dict(self) -> dict[str, Any]:
         return {"core_available": self.core_available, "frontier_key": self.frontier_key,
                 "local_model": self.local_model, "real_agent_fn": self.real_agent_fn,
-                "mode": self.mode}
+                "dag_deps": self.dag_deps, "mode": self.mode}
 
 
 def execution_probe() -> ExecProbe:
@@ -88,7 +97,80 @@ def execution_probe() -> ExecProbe:
     real_agent = _real_agent_fn_present()
 
     return ExecProbe(core_available=core, frontier_key=frontier,
-                     local_model=local, real_agent_fn=real_agent)
+                     local_model=local, real_agent_fn=real_agent,
+                     dag_deps=_dag_deps_importable())
+
+
+# ---------------------------------------------------------------------------
+# Interpreter guard (T-DP19) — the gym real-run path runs run_mission IN-PROCESS,
+# whose PLAN phase imports services.dag.executor → `from langgraph.checkpoint.sqlite
+# import SqliteSaver` at module load. Launched under an interpreter lacking that
+# package (system python3), execute_dag raises ImportError, the mission dies at PLAN,
+# and every tuning cell ties at win_rate 0.00. The deps live in the shared mcp-venv;
+# re-exec into a capable interpreter AT ENTRY so real runs actually reach BUILD.
+#
+# NOTE: the T-DP19 work order framed this as "propagate sys.executable across a
+# subprocess boundary" — but the whole mission→DAG path is in-process, so the correct
+# fix is a re-exec-at-entry guard, not interpreter propagation across a spawn.
+# ---------------------------------------------------------------------------
+
+_REEXEC_SENTINEL = "_AICAD_GYM_REEXEC"
+_MCP_VENV_PY = Path(os.path.expanduser("~")) / ".local/share/AI-CAD/mcp-venv/bin/python"
+
+
+def _dag_deps_importable() -> bool:
+    """True when the DAG executor's checkpoint dependency imports in THIS interpreter.
+
+    Uses find_spec so we do NOT actually import langgraph (no side effects, no cost)."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec("langgraph.checkpoint.sqlite") is not None
+    except Exception:  # noqa: BLE001 — a broken import machinery counts as "absent"
+        return False
+
+
+def _capable_interpreter() -> str | None:
+    """Resolve a python that has the DAG deps: $AI_CAD_PYTHON, then the shared mcp-venv.
+
+    Mirrors how scripts/gate.sh resolves its runner. Returns None when neither resolves
+    to an existing executable distinct from the current one (e.g. CI without the
+    mcp-venv) — the caller then falls through and runs (mock still works).
+
+    NB: compare LITERAL abspaths, not os.path.realpath — a venv python is a symlink to
+    its base interpreter, so realpath would collapse the mcp-venv onto /usr/bin/python3
+    and wrongly skip it, discarding exactly the site-packages (langgraph) we need."""
+    import sys
+    here = os.path.abspath(sys.executable)
+    for cand in (os.environ.get("AI_CAD_PYTHON"), str(_MCP_VENV_PY)):
+        if cand and os.path.exists(cand) and os.path.abspath(cand) != here:
+            return cand
+    return None
+
+
+def ensure_capable_interpreter(module: str) -> None:
+    """Re-exec the gym into an interpreter that has the DAG deps — once.
+
+    *module* is the dotted entrypoint module (e.g. "tools.flywheel.bench.gym.tuning")
+    so the re-exec preserves the ``-m`` package invocation (and thus the repo-root
+    sys.path[0] the original launch relied on).
+
+    No-op when (a) the deps already import here, (b) we've already re-exec'd once (loop
+    sentinel — a target that ALSO lacks the dep must not spin forever), or (c) no better
+    interpreter exists. In cases (b)/(c) we fall through and run: the ``--mock`` path
+    works under any interpreter, and the probe now reports mock honestly."""
+    import sys
+    if _dag_deps_importable():
+        return
+    if os.environ.get(_REEXEC_SENTINEL):
+        return
+    target = _capable_interpreter()
+    if not target:
+        return
+    os.environ[_REEXEC_SENTINEL] = "1"
+    print(f"[gym] re-exec into {target}\n"
+          f"      (this interpreter lacks langgraph.checkpoint.sqlite; real DAG runs "
+          f"would die at PLAN — see T-DP19)", file=sys.stderr, flush=True)
+    os.execv(target, [target, "-m", module, *sys.argv[1:]])
 
 
 def _real_agent_fn_present() -> bool:
@@ -257,7 +339,7 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
         # REAL: run the full pipeline, then FOLD the mission's own ledger (written at
         # the default run path by run_mission) into THIS gym ledger so the real
         # tool_call / agent_turn / criterion_result events are graded/classified.
-        mission = _run_mission_real(challenge, run_id)
+        mission = _run_mission_real(challenge, run_id, tier)
         _merge_mission_ledger(run_id, ledger)
     else:
         # MOCK: drive the phase machine to PLAN (execute_dag=False) + scripted turns.
@@ -291,9 +373,44 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
     return cell
 
 
-def _run_mission_real(challenge: Challenge, run_id: str) -> dict | None:
+# T-DP19: local-tier cells must run on the bundled local model, not on whatever
+# config.json defaults to. Started once and cached (VRAM is finite — a fresh server per
+# cell OOMs the GPU; the llamacpp provider reuses its fixed-port server across cells).
+_LOCAL_PROVIDER_CACHE: dict[str, Any] = {}
+_TIER_LOCAL_MODEL = "qwen3-4b"  # the bundled CUDA model the tuning loop benchmarks (tiers.yaml local_models.fanout)
+
+
+def _provider_for_tier(tier: str):
+    """Resolve the provider a gym cell runs on.
+
+    A ``local-*`` cell MUST run on the bundled local model — otherwise the ambient
+    config.json (a cloud provider) silently answers and a ``local-24k`` benchmark is
+    meaningless (T-DP19: real cells were routing to Gemini and tying at win_rate 0.00,
+    which read like a model-quality signal but was really a routing artifact).
+
+    An explicit ``AI_CAD_PROVIDER`` override always wins — tests set it to ``mock``; a
+    human can force a frontier key for a frontier-tier comparison. Non-local tiers fall
+    through to the default resolution."""
+    import os
+    from services.agent import config
+    if os.environ.get("AI_CAD_PROVIDER") or not tier.startswith("local"):
+        return config.get_provider()
+    model_id = _TIER_LOCAL_MODEL
+    prov = _LOCAL_PROVIDER_CACHE.get(model_id)
+    if prov is None:
+        from services.agent import model_manager
+        mp = str(model_manager.get_model_path(model_id))
+        # llamacpp (not openai) so structured-output nodes get GBNF grammars, which the
+        # local-24k tier requires (tiers.yaml structured_output: gbnf).
+        prov = config.get_provider("llamacpp", cfg={"llamacpp": {"model_path": mp, "model": model_id}})
+        _LOCAL_PROVIDER_CACHE[model_id] = prov
+    return prov
+
+
+def _run_mission_real(challenge: Challenge, run_id: str, tier: str) -> dict | None:
     """Drive the FULL pipeline for a REAL cell (T-W30): execute_dag=True with the
-    node_runner's real tool-executing agent_fn and a resolved provider.
+    node_runner's real tool-executing agent_fn and the tier's provider (T-DP19: a
+    local-* tier resolves to the bundled qwen3-4b, not the ambient cloud default).
 
     Honest failure handling: a mission/DAG/model error is CAPTURED into the mission
     record (and the ledger already holds whatever real events were emitted), never
@@ -310,8 +427,8 @@ def _run_mission_real(challenge: Challenge, run_id: str) -> dict | None:
     except Exception:  # noqa: BLE001 — best-effort cleanup
         pass
     try:
-        from services.agent import loop, config
-        provider = config.get_provider()  # AI_CAD_PROVIDER / routing / local default
+        from services.agent import loop
+        provider = _provider_for_tier(tier)  # local-* → bundled qwen3-4b, not ambient cloud (T-DP19)
         mr = loop.run_mission(
             challenge.request, provider,
             name=run_id, intake_fn=make_intake_fn(challenge),

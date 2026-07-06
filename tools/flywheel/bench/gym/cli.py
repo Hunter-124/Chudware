@@ -143,4 +143,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    # T-DP19: re-exec into the mcp-venv when this interpreter lacks the DAG deps, so
+    # `--real` cells execute past PLAN instead of dying on the langgraph import.
+    from tools.flywheel.bench.gym.runner import ensure_capable_interpreter
+    ensure_capable_interpreter("tools.flywheel.bench.gym.cli")
     sys.exit(main())

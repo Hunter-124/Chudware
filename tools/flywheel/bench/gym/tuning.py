@@ -407,4 +407,8 @@ def _cli(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover
+    # T-DP19: re-exec into the mcp-venv if this interpreter lacks the DAG deps, so real
+    # tuning cells reach BUILD instead of dying at PLAN (and tying every config at 0.00).
+    from tools.flywheel.bench.gym.runner import ensure_capable_interpreter
+    ensure_capable_interpreter("tools.flywheel.bench.gym.tuning")
     raise SystemExit(_cli(sys.argv[1:]))

@@ -1,13 +1,12 @@
 {
   "schema": "aicad.tuning/1",
-  "cycle": "dp10-tuning-real",
+  "cycle": "dp19-local-real",
   "configs": [
     "eco",
     "maximum"
   ],
   "challenges": [
-    "C1",
-    "C6"
+    "C1"
   ],
   "tiers": [
     "local-24k"
@@ -24,11 +23,11 @@
       "passed": false,
       "mode": "real",
       "mission_status": "failed",
-      "mission_phase": "plan",
+      "mission_phase": "specify",
       "failure_classes": [
         "incoherent_geometry"
       ],
-      "run_dir": "/home/hunter/Repositories/CAD-T-DP10/tools/flywheel/bench/gym/reports/runs/dp10-tuning-real/dp10-tuning-real_eco/C1_local-24k_s1"
+      "run_dir": "/home/hunter/Repositories/CAD/tools/flywheel/bench/gym/reports/runs/dp19-local-real/dp19-local-real_eco/C1_local-24k_s1"
     },
     {
       "challenge": "C1",
@@ -38,48 +37,16 @@
       "passed": false,
       "mode": "real",
       "mission_status": "failed",
-      "mission_phase": "plan",
+      "mission_phase": "specify",
       "failure_classes": [
         "incoherent_geometry"
       ],
-      "run_dir": "/home/hunter/Repositories/CAD-T-DP10/tools/flywheel/bench/gym/reports/runs/dp10-tuning-real/dp10-tuning-real_maximum/C1_local-24k_s1"
-    },
-    {
-      "challenge": "C6",
-      "tier": "local-24k",
-      "seed": 1,
-      "scaffold_config": "eco",
-      "passed": false,
-      "mode": "real",
-      "mission_status": "failed",
-      "mission_phase": "plan",
-      "failure_classes": [
-        "incoherent_geometry"
-      ],
-      "run_dir": "/home/hunter/Repositories/CAD-T-DP10/tools/flywheel/bench/gym/reports/runs/dp10-tuning-real/dp10-tuning-real_eco/C6_local-24k_s1"
-    },
-    {
-      "challenge": "C6",
-      "tier": "local-24k",
-      "seed": 1,
-      "scaffold_config": "maximum",
-      "passed": false,
-      "mode": "real",
-      "mission_status": "failed",
-      "mission_phase": "plan",
-      "failure_classes": [
-        "incoherent_geometry"
-      ],
-      "run_dir": "/home/hunter/Repositories/CAD-T-DP10/tools/flywheel/bench/gym/reports/runs/dp10-tuning-real/dp10-tuning-real_maximum/C6_local-24k_s1"
+      "run_dir": "/home/hunter/Repositories/CAD/tools/flywheel/bench/gym/reports/runs/dp19-local-real/dp19-local-real_maximum/C1_local-24k_s1"
     }
   ],
   "per_config_win_rates": {
     "eco": {
       "C1|local-24k": {
-        "pass_rate": 0.0,
-        "n": 1
-      },
-      "C6|local-24k": {
         "pass_rate": 0.0,
         "n": 1
       }
@@ -88,31 +55,11 @@
       "C1|local-24k": {
         "pass_rate": 0.0,
         "n": 1
-      },
-      "C6|local-24k": {
-        "pass_rate": 0.0,
-        "n": 1
       }
     }
   },
   "per_class_winners": {
     "multi_feature_part|local": {
-      "scaffold_level": "eco",
-      "win_rate": 0.0,
-      "n": 1,
-      "tied": true,
-      "all_configs": {
-        "eco": {
-          "win_rate": 0.0,
-          "n": 1
-        },
-        "maximum": {
-          "win_rate": 0.0,
-          "n": 1
-        }
-      }
-    },
-    "modification|local": {
       "scaffold_level": "eco",
       "win_rate": 0.0,
       "n": 1,

@@ -71,6 +71,7 @@ dulwich==1.2.7
 # = silent breakage if the venv is rebuilt from scratch. All MIT-licensed (in-process OK).
 anyio>=4.0.0          # MIT — async I/O transport used by services/mcp/server.py
 langgraph>=1.0.0      # MIT — DAG orchestration used by services/dag/
+langgraph-checkpoint-sqlite>=3.1.0  # MIT — sqlite checkpointer imported by services/dag/executor.py (was installed but undeclared; a fresh env broke DAG execution)
 pydantic>=2.0.0       # MIT — FastMCP tool arg schemas (indirect, via mcp package)
 qrcode>=7.0           # MIT — QR code generation used by engine_oracle/
 lib3mf>=2.5.0         # BSD — 3MF mesh file I/O (T-V4 audit: installed but undeclared)

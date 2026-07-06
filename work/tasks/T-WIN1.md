@@ -3,7 +3,7 @@ id: T-WIN1
 title: Windows 10 full-app bring-up (OCCT core + imgui GUI) under MSVC
 workstream: WIN
 owner: gissa
-status: doing
+status: review
 branch: task/T-WIN1-windows-bringup
 depends_on: []
 lane: platform-infra

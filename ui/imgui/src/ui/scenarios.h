@@ -103,6 +103,8 @@ struct ShotConfig {
     bool wsAiAgentShotDone      = false;
     bool wantWsPlm              = false;
     bool wsPlmShotDone          = false;
+    bool wantWsSketch3d         = false;   // 3D free-space sketcher overlay shot
+    bool wsSketch3dShotDone      = false;
 
     // T-G22: per-tab settings shots + composer dropdown + permissions popup
     bool wantSettingsGeneral = false;

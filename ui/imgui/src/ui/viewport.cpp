@@ -4,6 +4,7 @@
 #include "ui/shortcut_bar.h"
 #include "ui/sketch/sketch_mode.h"
 #include "ui/sketch/sketch_seam.h"
+#include "ui/sketch3d/sketch3d.h"
 #include "ui/camera_anim.h"
 #include "ui/mouse_gestures.h"
 #include "ui/view_selector.h"
@@ -897,6 +898,12 @@ void drawViewport(AppState& s) {
                 g_vpState.pitch = nPitch;
             }
         }
+
+        // 3D free-space sketcher (first slice): overlay ON TOP of the live GL scene
+        // (OverlayHosting) — points + lines placed on a work plane, projected via the
+        // same CameraXform the sketch overlay uses. a=imgMin, vw/vh match supersampling.
+        if (s.workspace == cmd::Workspace::Sketch3D)
+            ui::draw3DSketch(s, r->camera(), a, vw, vh, imgHovered);
     }
 
     s_shortcutBar.update(s, imgHovered, s.inSketch, a, b);

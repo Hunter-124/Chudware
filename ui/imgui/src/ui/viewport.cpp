@@ -15,6 +15,10 @@
 #include "ui/cam/cam_panel.h"
 #include "ui/ecad/ecad_panel.h"
 #include "ui/workspace_shells.h"   // T-DP16: drawAiAgentShell content-swap
+#include "ui/workspace_sim.h"         // workspace-framework: Simulate body
+#include "ui/workspace_manufacture.h" // workspace-framework: Manufacture/CAM body
+#include "ui/workspace_ecad.h"        // workspace-framework: ECAD body
+#include "ui/workspace_parts.h"       // workspace-framework: Parts Library body
 #include "app/app_state.h"
 #include "theme/theme.h"
 #include "theme/icons.h"
@@ -657,42 +661,43 @@ void drawViewport(AppState& s) {
         return;
     }
 
-    // H2: ECAD (Schematic/Board) workspaces host the ECAD editor INSIDE this viewport window
-    // (content-swap, full takeover) instead of the 3D render. Moving it here — rather than keeping
-    // it as a separate dock tab sharing the central node — is the fix for the headless surfacing
-    // gap: the central dock node hides its tab bar (NoTabBar), so the separate "ECAD" dock window
-    // was never brought forward in headless/offscreen shots. The begin("ECAD") block in
-    // application.cpp is now a no-draw stub (kept for dock-layout registration, never draws).
+    // H2: Full-viewport content-swap workspaces. Each takes over this central window entirely
+    // (no 3D render beneath) — same headless-surfacing fix as the original ECAD note: the dock
+    // node's NoTabBar means separate windows are never surfaced in headless shots, so we host
+    // the content inside this Viewport window. The Begin(xxx) blocks in application.cpp are
+    // no-draw stubs kept only for dock-layout registration.
     {
         const cmd::Workspace ews = s.effectiveWorkspace();
+
+        // ECAD (Schematic/Board) — routed through workspace_ecad.cpp wrapper.
+        // Phase-2 agents: add workspace header chrome in drawEcadWorkspace().
         if (ews == cmd::Workspace::Schematic || ews == cmd::Workspace::Board) {
-            ui::drawEcadEditor(s);
+            ui::drawEcadWorkspace(s);
             return;
         }
-        // T-DP16: the AI-Agent full-viewport workspace uses the SAME content-swap
-        // takeover as ECAD above — it hosts the mission-DAG shell INSIDE this
-        // full-screen Viewport window instead of the 3D render. The separate
-        // Begin("AI Agent###ai_agent_ws") dock window in application.cpp is a
-        // no-draw stub (kept for dock-layout registration), for the identical
-        // headless-surfacing reason documented for ECAD.
+        // AI Agent (T-DP16) — workspace_shells.cpp body (mission DAG).
         if (ews == cmd::Workspace::AiAgent) {
             ui::drawAiAgentShell(s);
             return;
         }
-        // T-R5 finisher: the PLM project hub takes over the full viewport the same
-        // way (content-swap), hosting the History timeline + checkpoint/release/
-        // compare surface. The Begin("PLM###plm_ws") dock window in application.cpp
-        // is a no-draw stub, for the identical headless-surfacing reason as ECAD.
+        // PLM project hub (T-R5) — workspace_shells.cpp body (History timeline).
         if (ews == cmd::Workspace::PlmManagement) {
             ui::drawPlmShell(s);
             return;
         }
+        // Parts Library — full-viewport catalog browser, routed through workspace_parts.cpp.
+        // Phase-2 agents: expand with category nav rail in drawPartsWorkspace().
+        if (ews == cmd::Workspace::PartsLibrary) {
+            ui::drawPartsWorkspace(s);
+            return;
+        }
     }
 
-    // H1: CAM panel content-swap. Same headless surfacing gap as ECAD above. The cam scenario
-    // sets st.camActive = true after building the job; cleared when leaving to a non-CAM mode.
-    if (s.camActive) {
-        ui::drawCamManager(s);
+    // H1: CAM / Manufacture content-swap. camActive is set by the cam scenario (or Manufacture
+    // workspace entry); routed through workspace_manufacture.cpp wrapper for phase-2 chrome.
+    // Phase-2 agents: add a toolbar strip in drawManufactureWorkspace().
+    if (s.camActive || s.workspace == cmd::Workspace::Manufacture) {
+        ui::drawManufactureWorkspace(s);
         return;
     }
 
@@ -936,7 +941,9 @@ void drawViewport(AppState& s) {
 
     if (r)
         drawHeadsUpToolbar(s, io, dl, a, b, *r, s.inSketch);
-    if (s.workspace == cmd::Workspace::Simulate) ui::simManager().drawEmbedded(s, a, b);
+    // Simulate workspace overlay (OverlayHosting — renders over the 3D scene).
+    // Routed through workspace_sim.cpp; phase-2 agents add workspace chrome there.
+    if (s.workspace == cmd::Workspace::Simulate) ui::drawSimWorkspace(s, a, b);
     drawLegend(s, dl, a, b);
     drawOrientationGizmo(dl, ImVec2(b.x - 52.f * S, a.y + 52.f * S));
 

@@ -40,14 +40,21 @@ this task adds the commerce-vendor adapters:
       line was extended; all_adapters()→hub.py auto-registers each as `browser_<key>`; the
       absent-profile CI-degraded skip is inherited from session.py (verified by the existing
       test_x3_browser_catalog discipline). Vendor facet tag = provider_id `browser_<key>`.
-- [ ] McMaster STEP → import_part with source metadata — PARTIAL: acquire() returns
-      provenance + `sku`; the T-X3 place.py import_file path already carries the record's
-      provenance/params. REMAINING: thread `sku` from the acquire envelope into the
-      BrowserCatalogAdapter part-record `params` so vendor/SKU/URL/fetched-at all land on
-      the imported part. See HANDOFF.
-- [ ] Structured price/availability → bom_price approved-provider seam — NOT DONE (the
-      main remaining work): browser adapters don't auto-feed bom_price (API-key chain). See
-      HANDOFF for the two options + anchors. Fail-closed, provenance-URL, never generated.
+- [x] McMaster STEP → import_part with source metadata (2bca34ba): BrowserCatalogAdapter.get()
+      folds the acquire envelope's vendor extras (sku/price/availability/asin/lcsc/stock) into
+      the part-record `params` alongside site/url/fetched_ts, so vendor/SKU/URL/fetched-at ride
+      the imported part. Also fixed a latent KeyError the no-CAD adapters would hit
+      (provenance_envelope omits artifact_path when None) → geometry_ref now conditional. 57
+      tests pass.
+- [~] Structured price/availability → bom_price approved-provider seam — ESCALATED to advisor
+      (work/questions/T-X7.md Q1), NOT wired unilaterally. The bom_price chain
+      (engine_oracle/parts_providers.py) is a deliberately API-key-only "AI-CAD does NOT scrape"
+      seam (guarantee surfaced in user-facing errors + license register); feeding browser-
+      session prices into it is a contract-posture change. Recommended (a) a distinct
+      profile-gated fail-closed BrowserVendorProvider behind the API providers with a
+      browser-session provenance tag; awaiting the ruling. NOTE: item 3 already exposes
+      browser-vendor prices on the catalog part record's params today, so alternative (b) is
+      partially in place regardless.
 - [x] docs/SOURCING_VENDOR_SURVEY.md (9be7a5ed) — 6-service shortlist (Xometry, Protolabs
       Network, Craftcloud, SendCutSend, JLC3DP, OSH Park) ranked by quote-automation +
       adapter difficulty, per-service notes, build-order rec for T-X9.

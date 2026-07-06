@@ -93,14 +93,31 @@ class BrowserCatalogAdapter:
         outcome = self._adapter.acquire(result)
         if not outcome.get("ok"):
             return outcome  # login_required / terms_confirmation_required / etc — actionable
+        # Fold the acquire envelope's vendor-specific extras (sku / price / availability / asin /
+        # lcsc / stock / ... — everything beyond the standard T-X2 envelope keys) into params so
+        # they land on the part record. T-X7 item 3: vendor(site)/SKU/URL/fetched-at metadata for
+        # BOM & sourcing. Additive — never renames the existing site/url keys.
+        _ENVELOPE_KEYS = {"ok", "source_url", "fetched_ts", "session_profile_used",
+                          "license_note", "artifact_path", "title"}
+        params = {"site": self._site, "url": result.get("url", ""),
+                  "fetched_ts": outcome.get("fetched_ts")}
+        for k, v in outcome.items():
+            if k not in _ENVELOPE_KEYS and v is not None:
+                params[k] = v
+        # geometry_ref only when a CAD file was actually downloaded (McMaster STEP, GrabCAD,
+        # TraceParts). Commerce/parts vendors (Amazon, JLCPCB, PCBWay) return artifact_path=None
+        # — a link-out + structured price/availability record, no importable geometry. (Using
+        # outcome.get avoids a KeyError: provenance_envelope omits artifact_path when it is None.)
+        artifact = outcome.get("artifact_path")
+        geometry_ref = {"kind": "import_file", "path": artifact} if artifact else None
         return {
             "part_id": part_id,
             "domain": self.domain,
             "title": result.get("title", ""),
             "standard": None,
             "designation": None,
-            "params": {"site": self._site, "url": result.get("url", "")},
-            "geometry_ref": {"kind": "import_file", "path": outcome["artifact_path"]},
+            "params": params,
+            "geometry_ref": geometry_ref,
             "sourcing": [],
             "provenance": f"Acquired via {self._site} under the user's own browser session "
                           f"({outcome['source_url']}, fetched {outcome['fetched_ts']})",

@@ -73,3 +73,12 @@ Current plumbing:
   with the Copilot panel open (default state) — legend/gizmo absent; likely present if the panel
   is collapsed. Next step: fix the viewport-rect calc (or give legend/gizmo their own Copilot-aware
   bound) in ui/imgui/src/ui/viewport.cpp, then recapture both this task's contact shots and T-G25's.
+- 2026-07-05 [opus-sweep] Per Hunter: removed the stale pair outright (`git rm`) rather than
+  leave incorrect-GUI screenshots sitting in the repo — contour_light.png/contour_dark.png no
+  longer exist under work/questions/T-SIM2-shots/. This is a narrower, scoped removal (just these
+  two files); other tasks' historical per-fix screenshots (T-G19, T-G12, T-BL37, T-BL41, etc.) are
+  untouched — they're legitimate point-in-time DoD evidence for already-closed tasks, not ongoing
+  documentation, so predating the polish wave doesn't make them wrong. Recapture is still blocked
+  on the legend/gizmo-behind-Copilot-panel bug above; do that fix first, then regenerate this
+  pair (and re-verify T-G25's own contact shots still look right once legend/gizmo positioning
+  changes, since drawOrientationGizmo shares the same viewport-rect calc).

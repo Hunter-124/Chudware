@@ -1,4 +1,4 @@
-# contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.5)
+# contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.6)
 
 Frozen 2026-07-04; §10–§15 added same day (1.0 → 1.1), §16–§17 (1.1 → 1.2),
 §18–§21 org layer (1.2 → 1.3), §22 design cognition ladder (1.3 → 1.4),

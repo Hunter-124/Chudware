@@ -3,7 +3,7 @@
 31 frozen contracts under `contracts/`:
 
 - `README.md` — contracts/ — frozen interface seams
-- `advisor.md` — contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.6)
+- `advisor.md` — contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.7)
 - `agent_events.md` — Contract: Agent Events — `aicad.agent_events/1`
 - `dag_schema.md` — Contract: DAG Orchestrator Schema — `aicad.dag/1`
 - `deliverables.md` — Contract: Deliverables — `deliverables/1`

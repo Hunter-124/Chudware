@@ -3,7 +3,7 @@ id: T-DP9
 title: Hierarchical delegation (overseer-discretion recursion) + budget meter + kill-switch
 workstream: DP
 owner: sonnet-onyx1
-status: doing
+status: done
 branch: task/T-DP9-hierarchical-delegation
 depends_on: [T-DP1]
 lane: ai-copilot

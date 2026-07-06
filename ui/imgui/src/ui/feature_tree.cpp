@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -447,16 +448,50 @@ static void treeIcon(const char* name, const char* fallback, float size = 16.0f,
 // THIS one function so the hover is pixel-identical everywhere. `hovered` is passed in (not
 // sampled here) because a feature row's last item is its status badge, not the node, so the
 // caller captures IsItemHovered at the node.
-static void fmRowHoverPaint(ImVec2 rowMin, ImVec2 rowMax, bool hovered, bool selected) {
-    if (selected || !hovered || ImGui::IsMouseDragging(ImGuiMouseButton_Left)) return;
+// T-BL36: animated accent border around the row pill — the selection/highlight cue that
+// replaces the old static left-edge bar. ImGui is immediate-mode, so the animation is a
+// per-frame function of ImGui::GetTime(): the accent border "breathes" (its glow alpha +
+// outer-ring thickness oscillate on a slow ~0.9 Hz phase) so a selected/hovered row reads as
+// live without any jarring flash — consistent with the T-G16 liquid-glass language. `selected`
+// gets the brighter, always-visible treatment; a hovered (not-selected) row gets a subtler
+// pulse. Drawn around the same inset pill rect the hover wash uses, with the pill's 4dp radius.
+static void fmAnimatedBorder(ImDrawList* dl, ImVec2 rowMin, ImVec2 rowMax,
+                             bool selected, bool hovered) {
+    if (!selected && !hovered) return;
     const auto& pal = fmPalette();
     const float S = theme::S();
-    ImVec2 hovMin(rowMin.x + 2.0f * S, rowMin.y + 1.0f * S);
-    ImVec2 hovMax(rowMax.x - 3.0f * S, rowMax.y - 1.0f * S);
-    ImVec4 hoverCol(pal.accent[0], pal.accent[1], pal.accent[2], 0.45f);
+    // Breathing phase in [0,1]; ImGui::GetTime() is the wall clock, so this advances every
+    // frame (a still frame only captures one phase — the motion is the GetTime() term).
+    const float phase = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 5.6f);
+    const ImVec2 mn(rowMin.x + 2.0f * S, rowMin.y + 1.0f * S);
+    const ImVec2 mx(rowMax.x - 3.0f * S, rowMax.y - 1.0f * S);
+    const float rounding = 4.0f * S;
+    const float baseA = selected ? 0.55f : 0.28f;   // selected: strong+steady; hover: subtle
+    const float ampA  = selected ? 0.30f : 0.16f;
+    const float a = baseA + ampA * phase;
+    const ImVec4 acc(pal.accent[0], pal.accent[1], pal.accent[2], a);
+    const ImVec4 accGlow(pal.accent[0], pal.accent[1], pal.accent[2], a * 0.35f);
+    // Outer soft glow (breathes in thickness) + inner crisp border.
+    dl->AddRect(ImVec2(mn.x - 1.0f * S, mn.y - 1.0f * S), ImVec2(mx.x + 1.0f * S, mx.y + 1.0f * S),
+                ImGui::ColorConvertFloat4ToU32(accGlow), rounding + 1.0f * S, 0,
+                (2.0f + 1.5f * phase) * S);
+    dl->AddRect(mn, mx, ImGui::ColorConvertFloat4ToU32(acc), rounding, 0, std::max(1.0f, 1.5f * S));
+}
+
+static void fmRowHoverPaint(ImVec2 rowMin, ImVec2 rowMax, bool hovered, bool selected) {
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) return;
+    if (!hovered && !selected) return;
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRect(hovMin, hovMax, ImGui::ColorConvertFloat4ToU32(hoverCol), 4.0f * S, 0, std::max(1.0f, 1.0f * S));
-    dl->AddRectFilled(hovMin, hovMax, fmToU32(pal.treeHover), 4.0f * S);
+    // Soft fill wash only for a hovered NOT-selected row (the selected pill already carries the
+    // selected wash via glassRowBackground); then the animated accent border for either state.
+    if (hovered && !selected) {
+        const auto& pal = fmPalette();
+        const float S = theme::S();
+        ImVec2 hovMin(rowMin.x + 2.0f * S, rowMin.y + 1.0f * S);
+        ImVec2 hovMax(rowMax.x - 3.0f * S, rowMax.y - 1.0f * S);
+        dl->AddRectFilled(hovMin, hovMax, fmToU32(pal.treeHover), 4.0f * S);
+    }
+    fmAnimatedBorder(dl, rowMin, rowMax, selected, hovered);   // T-BL36
 }
 
 // Frosted row pill at the current cursor (full content width). Stripe index advances per call.
@@ -2979,15 +3014,16 @@ static void drawFeatureTreeBodyImpl(AppState& st,
                         ctx.editCallback = &editCallback;
 
                         RowResult rr = featureRow(ctx, st);
-                        if (rr.hovered && !sel && !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-                            ImVec2 hovMin(rowMin.x + 2.0f * S, rowMin.y + 1.0f * S);
-                            ImVec2 hovMax(rowMax.x - 3.0f * S, rowMax.y - 1.0f * S);
-                            ImVec4 hoverCol(pal.accent[0], pal.accent[1], pal.accent[2], 0.45f);
-                            ImGui::GetWindowDrawList()->AddRect(
-                                hovMin, hovMax, ImGui::ColorConvertFloat4ToU32(hoverCol),
-                                4.0f * S, 0, std::max(1.0f, 1.0f * S));
-                            ImGui::GetWindowDrawList()->AddRectFilled(
-                                hovMin, hovMax, fmToU32(pal.treeHover), 4.0f * S);
+                        // T-BL36: animated accent border for hover AND selected (replaces the old
+                        // static left-edge cue); soft wash kept only for a hovered-not-selected row.
+                        if (!ImGui::IsMouseDragging(ImGuiMouseButton_Left) && (rr.hovered || sel)) {
+                            ImDrawList* fdl = ImGui::GetWindowDrawList();
+                            if (rr.hovered && !sel) {
+                                ImVec2 hovMin(rowMin.x + 2.0f * S, rowMin.y + 1.0f * S);
+                                ImVec2 hovMax(rowMax.x - 3.0f * S, rowMax.y - 1.0f * S);
+                                fdl->AddRectFilled(hovMin, hovMax, fmToU32(pal.treeHover), 4.0f * S);
+                            }
+                            fmAnimatedBorder(fdl, rowMin, rowMax, sel, rr.hovered && !sel);
                         }
 
                         // ---- rollback-bar drag hit-test (item 4) ----

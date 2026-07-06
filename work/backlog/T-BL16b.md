@@ -2,8 +2,8 @@
 id: T-BL16b
 title: GUI viewport playback/scrub for a simulate_motion trajectory
 workstream: backlog
-owner: unassigned
-status: todo
+owner: opus-sweep
+status: doing
 branch: task/T-BL16b-motion-playback-gui
 depends_on: [T-BL16]
 lane: app-gui

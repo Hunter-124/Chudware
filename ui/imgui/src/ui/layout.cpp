@@ -7,6 +7,7 @@
 // replaces the rejected ShopCraft docked "Model Tree"/Browser layout.
 #include "ui/layout.h"
 #include "ui/panels.h"
+#include "ui/plm_panel.h"   // T-R5: in-editor PLM strip controls (Checkpoint/Release/History)
 
 #include "app/app_state.h"
 #include "theme/theme.h"
@@ -290,14 +291,37 @@ void drawLeftPane(app::AppState& s) {
     ImGui::PopStyleVar();
     ImGui::SameLine(0, 4.0f * S);
 
+    // T-R5: reserve a bottom strip for the in-editor PLM controls (below the tree/PM body).
+    const float plmStripH = 92.f * S;   // rev/lifecycle line + [Checkpoint|Release] + History
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##lp_body", ImVec2(0, 0), ImGuiChildFlags_None,
+    ImGui::BeginChild("##lp_body", ImVec2(0, -plmStripH), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoBackground);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
     if (pmActive) drawInspector(s);
     drawLeftDock(s);
     ImGui::PopStyleColor();
     ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+    // T-R5: PLM strip pinned to the bottom of the Feature Manager — rev/lifecycle line +
+    // Checkpoint/Release/History for the active document (the in-editor PLM entry point;
+    // backed by the plm_* worker RPCs, same Vault as the PLM workspace). drawLeftDock's
+    // browser_glass only covers the body above, so paint a matching glass slab behind the
+    // strip; otherwise the buttons float below the column's glass edge.
+    {
+        const ImVec2 sp = ImGui::GetCursorScreenPos();
+        const ImRect stripRect(ImVec2(wp.x, sp.y), ImVec2(wp.x + ws.x, wp.y + ws.y));
+        theme::glassPanel(ImGui::GetWindowDrawList(), stripRect,
+                          theme::MaterialLevel::UltraThin, bubbleDp * S, surf);
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+    ImGui::Separator();
+    {
+        const std::string docPath = (s.activeTab >= 0 && s.activeTab < (int)s.docTabs.size())
+                                         ? s.docTabs[s.activeTab].path
+                                         : std::string();
+        ui::drawPlmStripControls(s, docPath);
+    }
     ImGui::PopStyleColor();
 
     ImGui::End();

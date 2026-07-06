@@ -170,3 +170,23 @@ picks up the Windows worker-start fix.
   further. TO CLOSE PARITY, either: (a) buddy's call on the tryStartWorker Windows path
   so headless capture works, or (b) gissa does the 2-min interactive launch (worker
   starts fine interactively) + press F (Zoom to Fit) + eyeball the solid.
+- 2026-07-06 20:39 UTC [gissa] [gissa/opus-sweep] 2026-07-06 â€” unified ui/imgui windows-app (AI-CAD2.exe) VERIFIED on Win11 (MSVC 14.44/VS2022 BuildTools, CMake 4.3, Ninja). Branch task/T-WIN1-windows-bringup pushed (2 commits: 026c98a6 build fix, a8876006 docs). PR not opened via CLI (gh not installed + non-interactive OAuth); one-click URL: https://github.com/Hunter-124/CAD/pull/new/task/T-WIN1-windows-bringup
+
+RESULTS:
+- Core windows-occt: ctest 48/49 (only freecad_parity, pre-existing MSVC-vs-GCC diff).
+- App windows-app: clean build after 3 Windows-guarded fixes in ui/imgui/CMakeLists.txt.
+  (1) /FI fix_math.h C1083 â€” inner-quoted /FI"..." + space-in-repo-path ("AI PROJECTS") under
+      Ninja+MSVC leaked literal quotes into the filename; dropped inner quotes so Ninja quotes the
+      whole /FI<path> token. (host/ VS-generator build never hit this.)
+  (2) AICAD_DEFAULT_LIBAICAD repointed from dead VS layout core/build-occt/bin/Release to the Ninja
+      preset output build/windows-occt/bin/libaicad.dll (main.cpp uses it as the runtime fallback;
+      SetDllDirectoryW then resolves the ~100 transitive OCCT TK*.dll).
+  (3) stale glad FATAL_ERROR msg (host/extern/glad -> extern/glad).
+- AI-CAD2.exe --selftest (NO env override) -> save=1 open=1 features=3 -> OK (in-process libaicad).
+- AI-CAD2.exe --shot -> 1616x1039 PNG: ribbon+icons+fonts, FeatureManager (Base/Fillet/Shell),
+  dark theme, 3D viewport solid FRAMED correctly. CLOSES the host/-era unverified viewport-framing gap.
+- Python engine_oracle: 1229 passed / 5 failed / 10 errors / 10 skipped â€” all pre-existing/env
+  (doc golden-fixture path, ecad board fixture, LBM numerical); zero Python touched, no new regressions.
+
+NEEDS LINUX-SIDE REVIEW: none. Every change is if(WIN32)/if(MSVC)-guarded; Linux else() path
+byte-for-byte unchanged. NOTHING duplicated/split into a per-OS tree â€” host/ stays deleted.

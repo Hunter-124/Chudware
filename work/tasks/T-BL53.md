@@ -2,8 +2,8 @@
 id: T-BL53
 title: Discord bot /stats + /leaderboard — implement the git-derived stats/embed helpers in notify_discord.py
 workstream: BL
-owner: unassigned
-status: todo
+owner: gissa
+status: doing
 branch: task/T-BL53-discord-stats
 depends_on: []
 lane: platform-infra

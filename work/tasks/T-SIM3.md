@@ -3,7 +3,7 @@ id: T-SIM3
 title: Simulation UI overhaul - material assignment dialog, T-W9 advisor wiring, studies panel polish
 workstream: SIM
 owner: fable-cove
-status: doing
+status: done
 branch: task/T-SIM3-sim-ui-overhaul
 depends_on: []
 lane: simulation

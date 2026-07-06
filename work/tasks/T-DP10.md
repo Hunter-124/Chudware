@@ -3,7 +3,7 @@ id: T-DP10
 title: Auto-mode workflow router + gym-based tuning loop
 workstream: DP
 owner: sonnet-birch2
-status: review
+status: done
 branch: task/T-DP10-automode-tuning
 depends_on: [T-DP2, T-DP3, T-DP4, T-DP8]
 lane: ai-copilot

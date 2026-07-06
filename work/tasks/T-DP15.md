@@ -42,3 +42,20 @@ reference-only; glass design; ui_style_check clean.
 - [ ] AI-Agent + PLM-management registered as full-viewport shells (bodies deferred to DP16/R).
 - [ ] Copilot overlay persists in overlay-hosting workspaces, absent in full-viewport ones.
 - [ ] Shot scenarios: switch to each workspace kind, EYEBALLED. ui_style_check clean; gate.sh PASS.
+
+## Progress log
+- 2026-07-06 02:18 UTC [sonnet-clay1] DONE — branch task/T-DP15-workspace-switching pushed, status: review.
+
+What changed:
+- WorkspaceKind enum (OverlayHosting/FullViewport) + workspaceKind() + globalWorkspaces() added to ui/abstract/command_registry.{h,cpp}
+- AiAgent + PlmManagement added to Workspace enum with labels ("AI Agent", "PLM") and icons ("ai_design", "history")
+- workspace_bar.cpp: second chip cluster for global workspaces (doc-type independent), separated by divider
+- application.cpp: drawLeftPane/drawRightPane gated on cmd::workspaceKind(s.effectiveWorkspace()) == OverlayHosting
+- workspace_shells.{h,cpp}: new placeholder shell panels for AiAgent and PlmManagement full-viewport bodies (deferred to T-DP16/R-stack)
+- scenarios.h/cpp: 4 new shot scenarios: ws_overlay_hosting, ws_full_viewport_ecad, ws_ai_agent, ws_plm
+
+Verification:
+- All 4 shots eyeballed: glass columns present in ws_overlay_hosting (Model), absent in ws_full_viewport_ecad (Schematic), ws_ai_agent, ws_plm
+- ui_style_check.py: 0 findings on all touched files
+- gate.sh RESULT: PASS (FAIL-RECORDED items are pre-existing T-V2, ui/imgui build+shot+selftest PASS)
+- Build clean in both ui/imgui/build (dev) and build/linux-app (gate preset)

@@ -450,10 +450,10 @@ add_executable(test_aicm
 # the standard <cmath>/<cstdlib> headers (MSVC C2039 'sinhf' etc.).
 target_include_directories(test_aicm PRIVATE
   ${doctest_SOURCE_DIR}
-  ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
 target_link_libraries(test_aicm PRIVATE aicad_aicm)
 target_sources(test_aicm PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
 set_target_properties(test_aicm PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME aicm COMMAND test_aicm)
@@ -746,11 +746,11 @@ if(AICAD_WITH_OCCT)
   target_include_directories(test_geom_aicm PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_geom_aicm PRIVATE aicad_geom_occt)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_geom_aicm PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_geom_aicm PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME geom_aicm COMMAND test_geom_aicm)
@@ -767,12 +767,12 @@ if(AICAD_WITH_OCCT)
   target_include_directories(test_profile_extrude PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_profile_extrude PRIVATE
     aicad_geom_occt aicad_sketch aicad_geom)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_profile_extrude PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_profile_extrude PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME profile_extrude COMMAND test_profile_extrude)
@@ -788,12 +788,12 @@ if(AICAD_WITH_OCCT)
   target_include_directories(test_ops PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_ops PRIVATE
     aicad_geom_occt aicad_sketch aicad_geom)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_ops PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_ops PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME ops COMMAND test_ops)
@@ -835,11 +835,11 @@ if(AICAD_WITH_OCCT)
   target_include_directories(test_import_roundtrip PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_import_roundtrip PRIVATE
     aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
   target_sources(test_import_roundtrip PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_import_roundtrip PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME import_roundtrip COMMAND test_import_roundtrip)
@@ -929,12 +929,12 @@ if(AICAD_WITH_OCCT)
   target_include_directories(test_document PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_document PRIVATE
     aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_document PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_document PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME document COMMAND test_document)
@@ -1105,12 +1105,12 @@ if(AICAD_WITH_OCCT)
   target_include_directories(test_pattern PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_pattern PRIVATE
     aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_pattern PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_pattern PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME pattern COMMAND test_pattern)
@@ -1131,12 +1131,12 @@ if(AICAD_WITH_OCCT)
   target_include_directories(test_mirror PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_mirror PRIVATE
     aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_mirror PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_mirror PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME mirror COMMAND test_mirror)
@@ -1178,12 +1178,12 @@ if(AICAD_WITH_OCCT)
   target_include_directories(test_hole PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_hole PRIVATE
     aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_hole PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_hole PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME hole COMMAND test_hole)
@@ -1223,12 +1223,12 @@ if(AICAD_WITH_OCCT)
   target_include_directories(test_picks PRIVATE
     ${doctest_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render)
   target_link_libraries(test_picks PRIVATE
     aicad_doc aicad_geom_occt aicad_geom)
   # Compile the host loader straight into the test target (the contract oracle).
   target_sources(test_picks PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../host/src/render/aicm_loader.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ui/viewport/render/aicm_loader.cpp)
   set_target_properties(test_picks PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME picks COMMAND test_picks)

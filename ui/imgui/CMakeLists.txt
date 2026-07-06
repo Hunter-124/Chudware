@@ -14,8 +14,7 @@ if(MSVC)
 endif()
 
 get_filename_component(REPO "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-set(HOST "${REPO}/host")
-set(GLAD_DIR "${HOST}/extern/glad")
+set(GLAD_DIR "${REPO}/extern/glad")
 
 include(FetchContent)
 
@@ -93,7 +92,6 @@ target_include_directories(AI-CAD2 PRIVATE
   ${REPO}
   ${REPO}/ui/abstract
   ${REPO}/services/worker
-  ${HOST}
   ${json_SOURCE_DIR}/single_include
   ${AICAD_STB_INCLUDE_DIR})
 
@@ -131,9 +129,9 @@ add_custom_command(TARGET AI-CAD2 POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
           "${CMAKE_CURRENT_SOURCE_DIR}/resources" "$<TARGET_FILE_DIR:AI-CAD2>/resources"
   COMMAND ${CMAKE_COMMAND} -E copy_directory
-          "${HOST}/assets/fonts" "$<TARGET_FILE_DIR:AI-CAD2>/resources/fonts"
+          "${REPO}/assets/fonts" "$<TARGET_FILE_DIR:AI-CAD2>/resources/fonts"
   COMMAND ${CMAKE_COMMAND} -E copy_directory
-          "${HOST}/assets/icons" "$<TARGET_FILE_DIR:AI-CAD2>/resources/icons"
+          "${REPO}/assets/icons" "$<TARGET_FILE_DIR:AI-CAD2>/resources/icons"
   VERBATIM)
 
 # Additive ShopCraft alias: create a symlink ShopCraft -> AI-CAD2 in the bin dir

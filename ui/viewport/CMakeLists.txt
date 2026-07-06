@@ -4,7 +4,7 @@ project(aicad_ui_viewport LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(AICAD_GLAD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../host/extern/glad")
+set(AICAD_GLAD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../extern/glad")
 
 add_library(aicad_ui_viewport STATIC
   renderer.cpp

@@ -1,6 +1,6 @@
 #include "viewport/scene.h"
 #include <glad/gl.h>
-#include "src/render/aicm_loader.h"   // reused pure-CPU AICM parser (-I ${HOST})
+#include "render/aicm_loader.h"   // reused pure-CPU AICM parser (via aicad_ui_viewport)
 #include <cmath>
 #include <cstdio>
 #include <cstring>

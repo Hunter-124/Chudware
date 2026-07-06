@@ -41,7 +41,7 @@ import re
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ATLAS = os.path.join(REPO, "host", "assets", "icons", "atlas.json")
+ATLAS = os.path.join(REPO, "assets", "icons", "atlas.json")  # T-G11 de-dup: icons moved host/assets -> shared assets/
 DEFAULT_ROOTS = [os.path.join(REPO, "host", "src")]
 
 # ui/imgui (Liquid Glass v2) icon pipeline — separate atlas + namespaced call forms (contract §3).

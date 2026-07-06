@@ -13,6 +13,7 @@
 #include "ui/sim_manager.h"
 #include "ui/cam/cam_panel.h"
 #include "ui/ecad/ecad_panel.h"
+#include "ui/workspace_shells.h"   // T-DP16: drawAiAgentShell content-swap
 #include "app/app_state.h"
 #include "theme/theme.h"
 #include "theme/icons.h"
@@ -665,6 +666,16 @@ void drawViewport(AppState& s) {
         const cmd::Workspace ews = s.effectiveWorkspace();
         if (ews == cmd::Workspace::Schematic || ews == cmd::Workspace::Board) {
             ui::drawEcadEditor(s);
+            return;
+        }
+        // T-DP16: the AI-Agent full-viewport workspace uses the SAME content-swap
+        // takeover as ECAD above — it hosts the mission-DAG shell INSIDE this
+        // full-screen Viewport window instead of the 3D render. The separate
+        // Begin("AI Agent###ai_agent_ws") dock window in application.cpp is a
+        // no-draw stub (kept for dock-layout registration), for the identical
+        // headless-surfacing reason documented for ECAD.
+        if (ews == cmd::Workspace::AiAgent) {
+            ui::drawAiAgentShell(s);
             return;
         }
     }

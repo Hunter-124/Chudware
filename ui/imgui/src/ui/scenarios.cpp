@@ -358,6 +358,48 @@ static std::string readWholeFile(const std::string& path) {
     std::stringstream ss; ss << f.rdbuf(); return ss.str();
 }
 
+// T-DP16: shared populated-DAG fixture (multi-layer mission + 3 delegation
+// sub-agents + explicit edges). Reused by both the agent_dag widget shot and the
+// AI-Agent workspace shot (ws_ai_agent) so the takeover renders the real DAG
+// centerpiece rather than the empty state.
+static const std::string& agentDagFixtureJsonl() {
+    static const std::string j = [] {
+        const char* ts = "2026-07-05T10:22:00Z";
+        std::string s;
+        auto ev = [&](const char* body) {
+            s += std::string("{\"ts\":\"") + ts + "\"," + body + "}\n";
+        };
+        // Mission run
+        ev(R"j("kind":"dag.run.started","run_id":"dp17fix","graph_name":"Bracket: Guided Design Pipeline","graph_id":"bracket-guided-dp")j");
+        // Orchestrator node (root)
+        ev(R"j("kind":"dag.node.started","run_id":"dp17fix","node_id":"n_orch","node_type":"mission","node_name":"Orchestrator")j");
+        ev(R"j("kind":"dag.node.done","run_id":"dp17fix","node_id":"n_orch","output_summary":"Pipeline dispatched — 3 sub-agents active")j");
+        // Feature architect sub-agent (delegation)
+        ev(R"j("kind":"delegation.spawn","parent_id":"n_orch","child_id":"n_feat","role":"feature_architect","model":"qwen3-4b","tokens_granted":8192)j");
+        ev(R"j("kind":"delegation.update","id":"n_feat","status":"running","current_tool":"add_features","tokens_spent":1840,"ledger_slice":"stage=FUNCTIONAL_DECOMP")j");
+        ev(R"j("kind":"delegation.update","id":"n_feat","status":"done","tokens_spent":3210)j");
+        // Geometry designer sub-agent
+        ev(R"j("kind":"delegation.spawn","parent_id":"n_orch","child_id":"n_geom","role":"geometry_designer","model":"qwen3-4b","tokens_granted":8192)j");
+        ev(R"j("kind":"delegation.update","id":"n_geom","status":"running","current_tool":"fit_calc","tokens_spent":2048,"ledger_slice":"stage=GEOMETRY_REALIZATION feature=mount_boss")j");
+        // Build strategist sub-agent
+        ev(R"j("kind":"delegation.spawn","parent_id":"n_orch","child_id":"n_build","role":"build_strategist","model":"qwen3-4b","tokens_granted":6000)j");
+        ev(R"j("kind":"delegation.update","id":"n_build","status":"blocked","tokens_spent":512,"ledger_slice":"waiting on geometry_designer")j");
+        // Verify + gate nodes
+        ev(R"j("kind":"dag.node.started","run_id":"dp17fix","node_id":"n_verify","node_type":"verify","node_name":"Verify: interference")j");
+        ev(R"j("kind":"dag.node.failed","run_id":"dp17fix","node_id":"n_verify","error":"geometry_designer still running")j");
+        ev(R"j("kind":"dag.node.started","run_id":"dp17fix","node_id":"n_gate","node_type":"gate","node_name":"Approve build plan")j");
+        ev(R"j("kind":"dag.node.paused","run_id":"dp17fix","node_id":"n_gate","reason":"gate")j");
+        ev(R"j("kind":"dag.node.approval_required","run_id":"dp17fix","node_id":"n_gate")j");
+        // Explicit edges to build the graph hierarchy
+        ev(R"j("kind":"dag.edge","from":"n_feat","to":"n_geom")j");
+        ev(R"j("kind":"dag.edge","from":"n_geom","to":"n_build")j");
+        ev(R"j("kind":"dag.edge","from":"n_build","to":"n_verify")j");
+        ev(R"j("kind":"dag.edge","from":"n_build","to":"n_gate")j");
+        return s;
+    }();
+    return j;
+}
+
 static void setupPickShot(app::AppState& st) {
     std::string aicm;
     if (!findBoxAicm(aicm)) {
@@ -589,7 +631,17 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     if (cfg.wantWsFullViewportEcad) { st.workspace = cmd::Workspace::Schematic;
         st.docs.push_back({"Schematic1", cmd::DocType::Schematic});
         st.activeDoc = (int)st.docs.size() - 1; }
-    if (cfg.wantWsAiAgent)  st.workspace = cmd::Workspace::AiAgent;
+    if (cfg.wantWsAiAgent) {
+        st.workspace = cmd::Workspace::AiAgent;
+        // T-DP16: seed the populated DAG here (configureShot, no worker gate) so the
+        // takeover renders the mission-DAG centerpiece — not the empty state. Same
+        // fixture as the agent_dag shot; select a node so the detail pane renders.
+        ui::seedAgentDagPanelFromJsonl(agentDagFixtureJsonl());
+        ui::agentDagShotSelectNode("n_geom");
+        cfg.wsAiAgentShotDone = true;
+        std::printf("ws_ai_agent: AiAgent workspace — full-viewport takeover (DAG centerpiece seeded)\n");
+        std::fflush(stdout);
+    }
     if (cfg.wantWsPlm)      st.workspace = cmd::Workspace::PlmManagement;
     if (cfg.wantMultidoc) st.railTab = 0;
     if (cfg.wantActivity) st.railTab = 0;
@@ -1405,46 +1457,9 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
     //   Compact shot: no selection, graph only.
     if ((cfg.wantAgentDag || cfg.wantAgentDagCompact) && !cfg.agentDagShotDone) {
         cfg.agentDagShotDone = true;
-        const char* ts = "2026-07-05T10:22:00Z";
-        std::string j;
-        auto ev = [&](const char* body) {
-            j += std::string("{\"ts\":\"") + ts + "\"," + body + "}\n";
-        };
-
-        // Mission run
-        ev(R"j("kind":"dag.run.started","run_id":"dp17fix","graph_name":"Bracket: Guided Design Pipeline","graph_id":"bracket-guided-dp")j");
-
-        // Orchestrator node (root)
-        ev(R"j("kind":"dag.node.started","run_id":"dp17fix","node_id":"n_orch","node_type":"mission","node_name":"Orchestrator")j");
-        ev(R"j("kind":"dag.node.done","run_id":"dp17fix","node_id":"n_orch","output_summary":"Pipeline dispatched — 3 sub-agents active")j");
-
-        // Feature architect sub-agent (delegation)
-        ev(R"j("kind":"delegation.spawn","parent_id":"n_orch","child_id":"n_feat","role":"feature_architect","model":"qwen3-4b","tokens_granted":8192)j");
-        ev(R"j("kind":"delegation.update","id":"n_feat","status":"running","current_tool":"add_features","tokens_spent":1840,"ledger_slice":"stage=FUNCTIONAL_DECOMP")j");
-        ev(R"j("kind":"delegation.update","id":"n_feat","status":"done","tokens_spent":3210)j");
-
-        // Geometry designer sub-agent
-        ev(R"j("kind":"delegation.spawn","parent_id":"n_orch","child_id":"n_geom","role":"geometry_designer","model":"qwen3-4b","tokens_granted":8192)j");
-        ev(R"j("kind":"delegation.update","id":"n_geom","status":"running","current_tool":"fit_calc","tokens_spent":2048,"ledger_slice":"stage=GEOMETRY_REALIZATION feature=mount_boss")j");
-
-        // Build strategist sub-agent
-        ev(R"j("kind":"delegation.spawn","parent_id":"n_orch","child_id":"n_build","role":"build_strategist","model":"qwen3-4b","tokens_granted":6000)j");
-        ev(R"j("kind":"delegation.update","id":"n_build","status":"blocked","tokens_spent":512,"ledger_slice":"waiting on geometry_designer")j");
-
-        // Verify + gate nodes
-        ev(R"j("kind":"dag.node.started","run_id":"dp17fix","node_id":"n_verify","node_type":"verify","node_name":"Verify: interference")j");
-        ev(R"j("kind":"dag.node.failed","run_id":"dp17fix","node_id":"n_verify","error":"geometry_designer still running")j");
-        ev(R"j("kind":"dag.node.started","run_id":"dp17fix","node_id":"n_gate","node_type":"gate","node_name":"Approve build plan")j");
-        ev(R"j("kind":"dag.node.paused","run_id":"dp17fix","node_id":"n_gate","reason":"gate")j");
-        ev(R"j("kind":"dag.node.approval_required","run_id":"dp17fix","node_id":"n_gate")j");
-
-        // Explicit edges to build the graph hierarchy
-        ev(R"j("kind":"dag.edge","from":"n_feat","to":"n_geom")j");
-        ev(R"j("kind":"dag.edge","from":"n_geom","to":"n_build")j");
-        ev(R"j("kind":"dag.edge","from":"n_build","to":"n_verify")j");
-        ev(R"j("kind":"dag.edge","from":"n_build","to":"n_gate")j");
-
-        ui::seedAgentDagPanelFromJsonl(j);
+        // T-DP16: fixture factored into agentDagFixtureJsonl() so the AI-Agent
+        // workspace shot (ws_ai_agent) can seed the same populated DAG.
+        ui::seedAgentDagPanelFromJsonl(agentDagFixtureJsonl());
 
         // Force the render mode matching the shot name.
         // agentDagShotForceMode overrides the DagWidgetMode::Full default in application.cpp
@@ -1457,7 +1472,7 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
         }
 
         std::printf("agent_dag: fixture seeded (%zu bytes) mode=%s\n",
-                    j.size(), cfg.wantAgentDag ? "full" : "compact");
+                    agentDagFixtureJsonl().size(), cfg.wantAgentDag ? "full" : "compact");
         std::fflush(stdout);
     }
 
@@ -1478,12 +1493,8 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
         std::printf("ws_full_viewport_ecad: Schematic workspace — full-viewport, no glass columns\n");
         std::fflush(stdout);
     }
-    if (cfg.wantWsAiAgent && !cfg.wsAiAgentShotDone) {
-        cfg.wsAiAgentShotDone = true;
-        st.workspace = cmd::Workspace::AiAgent;
-        std::printf("ws_ai_agent: AiAgent workspace — full-viewport shell, no glass columns\n");
-        std::fflush(stdout);
-    }
+    // T-DP16: ws_ai_agent is seeded in configureShot() (no worker gate) — tickSimpleShots
+    // returns early when no worker is started, so the seed cannot live here.
     if (cfg.wantWsPlm && !cfg.wsPlmShotDone) {
         cfg.wsPlmShotDone = true;
         st.workspace = cmd::Workspace::PlmManagement;

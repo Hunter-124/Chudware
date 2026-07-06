@@ -2,6 +2,7 @@
 // Placeholder shells for AiAgent and PlmManagement workspaces.
 // Bodies land in T-DP16 (AiAgent) and the R-stack (PlmManagement).
 #include "ui/workspace_shells.h"
+#include "ui/agent_dag_panel.h"   // T-DP16: mission-DAG centerpiece
 #include "app/app_state.h"
 #include "theme/theme.h"
 #include "imgui.h"
@@ -37,9 +38,42 @@ static void drawShellPlaceholder(const char* title, const char* subtitle) {
     ImGui::PopFont();
 }
 
-void drawAiAgentShell(AppState& /*s*/) {
-    // T-DP15: AI-Agent full-viewport shell — body in T-DP16.
-    drawShellPlaceholder("AI Agent", "Full-screen agent workspace — body arrives in T-DP16");
+void drawAiAgentShell(AppState& s) {
+    // T-DP16 (first slice): AI-Agent full-viewport workspace body.
+    //
+    // The full-viewport takeover itself is inherited from T-DP15: workspaceKind()
+    // marks AiAgent as FullViewport, application.cpp suppresses the pinned glass
+    // overlay columns and hands this shell the whole content area (the same
+    // mechanism that swaps the viewport for the ECAD schematic canvas). Switching
+    // out of the workspace returns to Model with the glass copilot overlay intact.
+    //
+    // This slice embeds the existing mission-DAG panel as the centerpiece. The
+    // panel draws its own glass PanelScaffold header ("Agent DAG") + status line
+    // and handles the empty state, so we add only a thin workspace-title strip
+    // above it (no glass-on-glass wrapping) and hand it the remaining area.
+    const float S = theme::S();
+
+    // Thin workspace-title strip — identifies the takeover; consistent glass text.
+    ImGui::PushFont(theme::font(theme::Font::H2));
+    ImGui::TextUnformatted("AI Agent");
+    ImGui::PopFont();
+    ImGui::PushFont(theme::font(theme::Font::Body));
+    ImGui::PushStyleColor(ImGuiCol_Text, TCOL(txt1));
+    ImGui::TextUnformatted("Mission workspace - live design-pipeline DAG");
+    ImGui::PopStyleColor();
+    ImGui::PopFont();
+    ImGui::Dummy(ImVec2(0, 8 * S));
+
+    // Centerpiece: the mission DAG (Full mode = graph + node detail pane).
+    ui::drawAgentDagPanel(s, aicad::ui::DagWidgetMode::Full);
+
+    // ---- DEFERRED to follow-up T-DP16 slices (do NOT build here) -------------
+    // TODO(T-DP16 slice 2): worker steering rail — pause/resume/kill any agent or
+    //   sub-agent, change a role's model/effort live, approve/deny pending
+    //   sub-agent spawns (ties to T-DP9 delegation seams).
+    // TODO(T-DP16 slice 3): session management — list/switch/fork/resume sessions
+    //   (embeds the multi-file view T-DP13).
+    // TODO(T-DP16 slice 4): transparency stream embed (T-DP11).
 }
 
 void drawPlmShell(AppState& /*s*/) {

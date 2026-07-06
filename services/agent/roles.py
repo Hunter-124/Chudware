@@ -57,8 +57,8 @@ HANDOFF_SCHEMA = "aicad.handoff/1"
 # imported from services/agent/advisor/stages.py (that module is T-W5 territory;
 # the vocabulary itself is the frozen contract).
 STAGES = (
-    "intake", "spec", "decompose", "layout", "sketch", "feature", "part_verify",
-    "assembly", "sim", "cam", "deliver", "fix",
+    "intake", "spec", "decompose", "layout", "sketch", "feature", "linkage",
+    "part_verify", "assembly", "sim", "cam", "deliver", "fix",
 )
 
 # Per-role tool-allowlist cap (contract §8 tier profile `max_tools_per_role`).

@@ -374,13 +374,54 @@ def _gate_geometry(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
 def _gate_linkage(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
     """Stage 3 exit — ``linkage_present`` (contract §5).
 
-    Reads the ledger: passes when ≥1 ``linkage`` event exists. Reference integrity
-    and interface consistency are T-DP4 checkers — this gate requires presence."""
+    Reads the ledger: passes when ≥1 ``linkage`` event exists.  When the caller
+    supplies T-DP4 checker findings (``dangling_refs``, ``ref_cycles``,
+    ``datum_gaps``, ``interface_mismatches``) via
+    ``linkage_integrity.gate_context_from_ledger``, those are surfaced as
+    additional gate reasons without changing the gate name
+    (``"linkage_present"``).  This is the "extend context, not gate signature"
+    rule (design_pipeline.md §5), mirroring ``_gate_decompose`` (T-DP2).
+    """
+    reasons: list[str] = []
     if not (ctx.get("linkages") or []):
-        return GateResult(False, "linkage_present",
-                          ["no linkage[] artifact in the ledger — Stage 3 "
-                           "(topology / linkage) produced no skeleton"])
-    return GateResult(True, "linkage_present")
+        reasons.append(
+            "no linkage[] artifact in the ledger — Stage 3 "
+            "(topology / linkage) produced no skeleton"
+        )
+        return GateResult(False, "linkage_present", reasons)
+
+    # T-DP4: optional checker findings — present only when the caller ran
+    # ``linkage_integrity.gate_context_from_ledger`` (or supplied them manually).
+    # Gate name stays "linkage_present" in all cases.
+    dangling = ctx.get("dangling_refs") or []
+    cycles   = ctx.get("ref_cycles")    or []
+    gaps     = ctx.get("datum_gaps")    or []
+    iface    = ctx.get("interface_mismatches") or []
+
+    if dangling:
+        reasons.append(
+            f"reference_edges with dangling endpoints (to unknown geometry_spec "
+            f"or datum id): {dangling} — fix or remove these references before "
+            "Stage 4 can order the build"
+        )
+    if cycles:
+        reasons.append(
+            f"cycles in reference_edges (part cannot be built — feature requires "
+            f"itself): {cycles} — break cycles by re-anchoring to datums"
+        )
+    if gaps:
+        reasons.append(
+            f"geometry_spec datum_refs referencing undeclared datums: {gaps} — "
+            "add missing datums to datum_tree or correct the datum_ref"
+        )
+    if iface:
+        reasons.append(
+            f"shared-interface dimension mismatches (two specs disagree on the "
+            f"same bore Ø/tolerance): {iface} — one spec must adopt the other's "
+            "value or a replan_request scope=spec is required"
+        )
+
+    return GateResult(not reasons, "linkage_present", reasons, overseer=bool(reasons))
 
 
 def _gate_buildpath(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:

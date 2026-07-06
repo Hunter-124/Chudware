@@ -1,0 +1,149 @@
+# council_policy.yaml — Per-(stage, tier) council policy defaults (T-DP8)
+#
+# Contract: docs/AGENT_DESIGN_PIPELINE.md §3.3 (councils at every stage,
+# configurable, per-tier, diverse-model).
+#
+# Key design decisions:
+#   - deliberation dial from TierProfile (contracts/advisor.md §8 1.3) is the anchor.
+#     local tiers (full) → wide breadth, frontier (minimal) → narrow breadth.
+#   - breadth = number of seats from the 4-seat roster (manufacturing / tolerancing /
+#     fitment / simplicity). local=4, mid=2, frontier=1.
+#   - enabled = whether the council is on by default for this (stage, tier) combo.
+#   - temperature_spread = delta applied to seat index when using temperature-diversity
+#     fallback (single provider source). Seat 0 gets base_temp, seat N gets
+#     base_temp + N*spread. Only active when diverse_models=false AND >1 seat.
+#   - diverse_models: set to true in the policy when you want multi-source selection;
+#     the resolver activates it when >1 provider source is actually injected.
+#
+# Stage vocabulary from contracts/advisor.md §1 (FROZEN):
+#   intake | spec | layout | sketch | feature | part_verify | assembly | sim | cam | deliver | fix
+#
+# Override discipline (lowest wins):
+#   1. Shipped defaults in this file (per stage+tier row, else the star fallback)
+#   2. effort_presets.yaml (AI_CAD_EFFORT_PRESET env / GUI preset selection)
+#   3. Per-tier user overrides (config.json ai_effort.council_* knobs, §23)
+#
+# Knobs exposed to Advanced mode (§23 table: council, council_seats,
+# council_feature_threshold — all live in effort.py resolve_effort; this file
+# sets the shipped defaults they layer over).
+#
+schema: aicad.council_policy/1
+
+# Default temperature used for seats (passed through to provider.complete if it
+# accepts a temperature kwarg). Providers that don't accept temperature ignore it.
+base_temperature: 0.7
+
+# Spread added per seat index for temperature-diversity fallback (1 provider source).
+# Seat 0 → base_temp, seat 1 → base_temp + spread, etc. Clamped to [0.0, 1.0].
+temperature_spread: 0.1
+
+# Stage × tier policy matrix.
+# Unrecognised (stage, tier) pairs fall back to the '*' row for that tier.
+# 'enabled' can be overridden per-call via resolve_policy(overrides=...).
+# 'breadth' is the number of seats; the first N seats from council_seats.yaml
+#   are used (existing seat order: manufacturing, tolerancing, fitment, simplicity).
+#   Values outside [1, 4] are clamped at runtime.
+#
+# Notes on choice of breadth:
+#   local = full deliberation (tokens free per §8 1.3) → all 4 seats
+#   mid   = standard deliberation → 2 seats (manufacturing + simplicity)
+#   frontier = minimal deliberation (tokens cost money) → 1 seat (chair only)
+
+stages:
+  # ── spec: strategy selection — high-value council, runs at all tiers ─────
+  spec:
+    local-24k:
+      enabled: true
+      breadth: 4
+      diverse_models: true
+    local-48k:
+      enabled: true
+      breadth: 4
+      diverse_models: true
+    mid:
+      enabled: true
+      breadth: 2
+      diverse_models: true
+    frontier:
+      enabled: true        # spec is important enough to warrant even on frontier
+      breadth: 1
+      diverse_models: true
+
+  # ── fix: error diagnosis — councils help diagnose ambiguous failures ──────
+  fix:
+    local-24k:
+      enabled: true
+      breadth: 4
+      diverse_models: true
+    local-48k:
+      enabled: true
+      breadth: 4
+      diverse_models: true
+    mid:
+      enabled: true
+      breadth: 2
+      diverse_models: true
+    frontier:
+      enabled: false       # frontier: skip council on fix (minimal dial)
+      breadth: 1
+      diverse_models: false
+
+  # ── layout: linkage / topology decisions ─────────────────────────────────
+  layout:
+    local-24k:
+      enabled: true
+      breadth: 4
+      diverse_models: true
+    local-48k:
+      enabled: true
+      breadth: 4
+      diverse_models: true
+    mid:
+      enabled: true
+      breadth: 2
+      diverse_models: true
+    frontier:
+      enabled: false
+      breadth: 1
+      diverse_models: false
+
+  # ── feature: build execution — off by default; risk-triggered for frontier
+  feature:
+    local-24k:
+      enabled: true
+      breadth: 4
+      diverse_models: true
+    local-48k:
+      enabled: true
+      breadth: 4
+      diverse_models: true
+    mid:
+      enabled: false
+      breadth: 2
+      diverse_models: false
+    frontier:
+      enabled: false
+      breadth: 1
+      diverse_models: false
+
+  # ── intake / sketch / part_verify / assembly / sim / cam / deliver ───────
+  # These use the '*' fallback (below). Callers may override via resolve_policy.
+
+# Fallback rows per tier — used for any stage NOT listed above.
+defaults:
+  local-24k:
+    enabled: true
+    breadth: 4
+    diverse_models: true
+  local-48k:
+    enabled: true
+    breadth: 4
+    diverse_models: true
+  mid:
+    enabled: false
+    breadth: 2
+    diverse_models: false
+  frontier:
+    enabled: false
+    breadth: 1
+    diverse_models: false

@@ -132,4 +132,4 @@ def download_dir(site: str) -> Path:
 # is reliably populated as soon as this package is imported — e.g. by
 # engine_oracle.parts_hub.hub.PartsHub.bootstrap() (T-X3), which only imports this
 # package's top level.
-from . import grabcad, traceparts  # noqa: E402,F401
+from . import amazon, grabcad, jlcpcb, mcmaster, pcbway, traceparts  # noqa: E402,F401

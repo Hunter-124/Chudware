@@ -27,6 +27,7 @@
 #include "ui/agent_inspector_panel.h"  // T-W17 agent inspector (advisor observability)
 #include "ui/watch_grid_panel.h"       // T-W17 multi-viewport watch grid
 #include "ui/agent_dag_panel.h"        // T-DP17 interactive agent DAG widget
+#include "ui/workspace_shells.h"       // T-DP15 full-viewport workspace shell panels
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -173,9 +174,15 @@ void Application::frame() {
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0,0,0,0));
     ImGuiWindowFlags pflags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBackground;
 
+    // T-DP15: pinned glass columns are ONLY drawn for overlay-hosting workspaces.
+    // Full-viewport workspaces (ECAD Schematic/Board, AiAgent, PlmManagement) own the entire
+    // screen — no glass overlay columns. effectiveWorkspace() handles the inSketch case.
+    const bool overlayHosting =
+        cmd::workspaceKind(s.effectiveWorkspace()) == cmd::WorkspaceKind::OverlayHosting;
+
     // Pinned glass FeatureManager column over the viewport's left edge (replaces "Browser###left").
     // Hosts the rail tabs + tree/bodies/files/configs + the PropertyManager form (drawInspector).
-    ui::drawLeftPane(s);
+    if (overlayHosting) ui::drawLeftPane(s);
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     if (ImGui::Begin("Viewport###viewport", nullptr, pflags | ImGuiWindowFlags_NoScrollbar |
@@ -203,8 +210,25 @@ void Application::frame() {
     ImGui::Begin("ECAD", nullptr, pflags);
     ImGui::End();
 
+    // T-DP15: AI-Agent full-viewport shell — registered as a dock window for layout consistency.
+    // drawAiAgentShell() fills the content area when workspace==AiAgent.
+    // Glass overlay columns are suppressed for this workspace (overlayHosting gate above).
+    // Body (mission stream, agent tiles, etc.) lands in T-DP16.
+    ImGui::Begin("AI Agent###ai_agent_ws", nullptr, pflags);
+    if (s.effectiveWorkspace() == cmd::Workspace::AiAgent)
+        ui::drawAiAgentShell(s);
+    ImGui::End();
+
+    // T-DP15: PLM project-hub full-viewport shell — same pattern as AiAgent above.
+    // Body (project tree, change history, release flow) lands in the R-stack.
+    ImGui::Begin("PLM###plm_ws", nullptr, pflags);
+    if (s.effectiveWorkspace() == cmd::Workspace::PlmManagement)
+        ui::drawPlmShell(s);
+    ImGui::End();
+
     // Pinned glass Copilot column over the viewport's right edge (replaces "Assistant###agent").
-    ui::drawRightPane(s);
+    // T-DP15: suppressed for full-viewport workspaces (same gate as drawLeftPane above).
+    if (overlayHosting) ui::drawRightPane(s);
 
     // T-F16 preview pane: closable. T-G23 removed the docked rightBottom slot (overlay layout), so it
     // now floats — anchored top-right inside the overlay band, left of the Copilot column, on first

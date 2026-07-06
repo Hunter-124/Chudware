@@ -481,6 +481,11 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantMissionControl   = eq("mission_control");   // T-F17
     cfg.wantAgentDag         = eq("agent_dag");         // T-DP17
     cfg.wantAgentDagCompact  = eq("agent_dag_compact"); // T-DP17
+    // T-DP15: workspace-kind shots — overlay presence/absence per workspace kind
+    cfg.wantWsOverlayHosting   = eq("ws_overlay_hosting");
+    cfg.wantWsFullViewportEcad = eq("ws_full_viewport_ecad");
+    cfg.wantWsAiAgent          = eq("ws_ai_agent");
+    cfg.wantWsPlm              = eq("ws_plm");
     cfg.wantAgentInspector      = eq("agent_inspector");        // T-W17
     cfg.wantAgentInspectorEmpty = eq("agent_inspector_empty");  // T-W17
     cfg.wantAgentInspectorFailure    = eq("agent_inspector_failure");    // T-W17
@@ -565,6 +570,13 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     // sourced the wrong document). The drawing scenario flips the workspace itself after
     // building the Plate, matching host's part-first ordering.
     if (cfg.wantEcad) st.workspace = cmd::Workspace::Schematic;
+    // T-DP15: workspace-kind shots — pre-switch to the target workspace before capture
+    if (cfg.wantWsOverlayHosting)   st.workspace = cmd::Workspace::Model;
+    if (cfg.wantWsFullViewportEcad) { st.workspace = cmd::Workspace::Schematic;
+        st.docs.push_back({"Schematic1", cmd::DocType::Schematic});
+        st.activeDoc = (int)st.docs.size() - 1; }
+    if (cfg.wantWsAiAgent)  st.workspace = cmd::Workspace::AiAgent;
+    if (cfg.wantWsPlm)      st.workspace = cmd::Workspace::PlmManagement;
     if (cfg.wantMultidoc) st.railTab = 0;
     if (cfg.wantActivity) st.railTab = 0;
 
@@ -1260,6 +1272,36 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
 
         std::printf("agent_dag: fixture seeded (%zu bytes) mode=%s\n",
                     j.size(), cfg.wantAgentDag ? "full" : "compact");
+        std::fflush(stdout);
+    }
+
+    // T-DP15: workspace-kind shots — one-frame captures with no worker RPC.
+    // ws_overlay_hosting: Modeling workspace shows glass left+right columns over viewport.
+    // ws_full_viewport_ecad: Schematic workspace fills screen, no glass columns.
+    // ws_ai_agent: AI-Agent shell fills screen, no glass columns.
+    // ws_plm: PLM shell fills screen, no glass columns.
+    if (cfg.wantWsOverlayHosting && !cfg.wsOverlayHostingShotDone) {
+        cfg.wsOverlayHostingShotDone = true;
+        st.workspace = cmd::Workspace::Model;
+        std::printf("ws_overlay_hosting: Model workspace — glass overlay columns present\n");
+        std::fflush(stdout);
+    }
+    if (cfg.wantWsFullViewportEcad && !cfg.wsFullViewportEcadShotDone) {
+        cfg.wsFullViewportEcadShotDone = true;
+        st.workspace = cmd::Workspace::Schematic;
+        std::printf("ws_full_viewport_ecad: Schematic workspace — full-viewport, no glass columns\n");
+        std::fflush(stdout);
+    }
+    if (cfg.wantWsAiAgent && !cfg.wsAiAgentShotDone) {
+        cfg.wsAiAgentShotDone = true;
+        st.workspace = cmd::Workspace::AiAgent;
+        std::printf("ws_ai_agent: AiAgent workspace — full-viewport shell, no glass columns\n");
+        std::fflush(stdout);
+    }
+    if (cfg.wantWsPlm && !cfg.wsPlmShotDone) {
+        cfg.wsPlmShotDone = true;
+        st.workspace = cmd::Workspace::PlmManagement;
+        std::printf("ws_plm: PlmManagement workspace — full-viewport shell, no glass columns\n");
         std::fflush(stdout);
     }
 }

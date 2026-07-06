@@ -52,6 +52,7 @@ void drawWorkspaceBar(AppState& s, float height) {
         chip("sk", "ws_sketch", "Sketch1", true, true);
         if (chip("skx", "ok_check", "Exit Sketch", false, true)) s.dispatch("sketch_exit");
     } else {
+        // --- doc-scoped workspaces (depend on current doc type) ---
         auto wss = cmd::workspacesFor(s.docType());
         for (size_t i = 0; i < wss.size(); ++i) {
             cmd::Workspace w = wss[i];
@@ -64,6 +65,22 @@ void drawWorkspaceBar(AppState& s, float height) {
                 ImVec2 sp = ImGui::GetCursorScreenPos();
                 dl->AddLine(ImVec2(sp.x, sp.y+4*S), ImVec2(sp.x, sp.y+height-8*S), TCOL(line), ImMax(1.f,S));
                 ImGui::SameLine(0, 10*S);
+            }
+        }
+
+        // --- T-DP15: global full-viewport workspaces (doc-type independent) ---
+        // AiAgent + PlmManagement available from any doc type; separated by a faint divider.
+        {
+            auto gws = cmd::globalWorkspaces();
+            if (!gws.empty()) {
+                ImVec2 sp = ImGui::GetCursorScreenPos();
+                dl->AddLine(ImVec2(sp.x, sp.y+4*S), ImVec2(sp.x, sp.y+height-8*S), TCOL(line), ImMax(1.f,S));
+                ImGui::SameLine(0, 10*S);
+                for (cmd::Workspace w : gws) {
+                    bool active = (s.workspace == w);
+                    if (chip(cmd::workspaceLabel(w), cmd::workspaceIcon(w), cmd::workspaceLabel(w), active, false))
+                        { s.workspace = w; s.activeTool.clear(); s.camActive = false; }
+                }
             }
         }
     }

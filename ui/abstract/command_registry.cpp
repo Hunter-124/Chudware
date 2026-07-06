@@ -263,6 +263,8 @@ const char* workspaceLabel(Workspace w) {
         case W::Surface: return "Surface";       case W::Assemble: return "Assemble";
         case W::Drafting: return "Drafting";     case W::Simulate: return "Simulate";
         case W::Schematic: return "Schematic";   case W::Board: return "Board";
+        case W::AiAgent:       return "AI Agent";       // T-DP15
+        case W::PlmManagement: return "PLM";            // T-DP15
         default: return "?";
     }
 }
@@ -273,6 +275,8 @@ const char* workspaceIcon(Workspace w) {
         case W::Surface: return "ws_surface";    case W::Assemble: return "ws_assemble";
         case W::Drafting: return "ws_draft";     case W::Simulate: return "ws_simulate";
         case W::Schematic: return "ws_schematic";case W::Board: return "ws_board";
+        case W::AiAgent:       return "ai_design";      // T-DP15 (reuse ai_design icon)
+        case W::PlmManagement: return "history";         // T-DP15 (reuse history icon)
         default: return "ws_model";
     }
 }
@@ -305,6 +309,22 @@ std::vector<Workspace> workspacesFor(DocType d) {
         case DocType::Pcb:       return { W::Board };
     }
     return { W::Model };
+}
+
+// T-DP15: workspace render kind — four workspaces own the full screen.
+WorkspaceKind workspaceKind(Workspace w) {
+    switch (w) {
+        case W::Schematic:     return WorkspaceKind::FullViewport;
+        case W::Board:         return WorkspaceKind::FullViewport;
+        case W::AiAgent:       return WorkspaceKind::FullViewport;
+        case W::PlmManagement: return WorkspaceKind::FullViewport;
+        default:               return WorkspaceKind::OverlayHosting;
+    }
+}
+
+// T-DP15: global workspaces available from any doc type (second cluster in the bar).
+std::vector<Workspace> globalWorkspaces() {
+    return { W::AiAgent, W::PlmManagement };
 }
 
 std::vector<const Command*> topCommands(Workspace w) {

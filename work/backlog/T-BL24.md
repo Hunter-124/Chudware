@@ -2,8 +2,8 @@
 id: T-BL24
 title: JLCPCB signed-request auth - rework JLCPCBProvider off the static-bearer assumption
 workstream: backlog
-owner: unassigned
-status: todo
+owner: opus-sweep
+status: doing
 branch: task/T-BL24-jlcpcb-auth
 depends_on: []
 lane: parts-sourcing

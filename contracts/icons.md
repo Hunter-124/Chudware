@@ -67,3 +67,21 @@ drawings may be revised freely; the **names and atlas layout (UVs) stay stable**
 never shifts any other icon's cell.
 
 Adding an icon = add a draw function + name here; atlas layout is computed, never hand-packed.
+
+## Manufacture toolpath tiles (T-BL34, append-only)
+
+The Manufacture ribbon op buttons get dedicated cells (previously they borrowed Features
+glyphs). Per Hunter's directive (2026-07-04) the shipped art is a **photographic render of
+the real generated toolpath** — `scripts/cam_toolpath_icons.py` drives
+`cam_new → add_tool/add_setup/add_operation → cam_generate → cam_simulate` and draws the
+returned moves (backplot palette: rapid/lead/cut/plunge/arc) over the stock silhouette.
+The render doubles as a CAM-chain smoke test; an op that yields no renderable toolpath is
+a CAM bug to file, never a stylized glyph. `make_icons.py` carries line-art fallbacks so a
+cell is never blank.
+
+- **2.5D**: `cam_face, cam_contour2d, cam_pocket2d, cam_adaptive2d, cam_slot,
+  cam_chamfer2d, cam_engrave`
+- **Holes**: `cam_drill, cam_thread_mill`
+- **3D**: `cam_parallel3d, cam_waterline3d, cam_scallop3d, cam_pocket3d`
+- **Turning**: `cam_turn_rough, cam_turn_finish, cam_turn_face, cam_turn_part`
+- **Cutting**: `cam_cut2d, cam_probe`

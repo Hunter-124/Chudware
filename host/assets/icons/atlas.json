@@ -1,7 +1,7 @@
 {
  "atlas_px": [
   56,
-  6426
+  7072
  ],
  "cell": {
   "app@32": {
@@ -2271,12 +2271,259 @@
    "y": 6399,
    "w": 20,
    "h": 20
+  },
+  "cam_face@32": {
+   "x": 0,
+   "y": 6427,
+   "w": 32,
+   "h": 32
+  },
+  "cam_face@20": {
+   "x": 34,
+   "y": 6433,
+   "w": 20,
+   "h": 20
+  },
+  "cam_contour2d@32": {
+   "x": 0,
+   "y": 6461,
+   "w": 32,
+   "h": 32
+  },
+  "cam_contour2d@20": {
+   "x": 34,
+   "y": 6467,
+   "w": 20,
+   "h": 20
+  },
+  "cam_pocket2d@32": {
+   "x": 0,
+   "y": 6495,
+   "w": 32,
+   "h": 32
+  },
+  "cam_pocket2d@20": {
+   "x": 34,
+   "y": 6501,
+   "w": 20,
+   "h": 20
+  },
+  "cam_adaptive2d@32": {
+   "x": 0,
+   "y": 6529,
+   "w": 32,
+   "h": 32
+  },
+  "cam_adaptive2d@20": {
+   "x": 34,
+   "y": 6535,
+   "w": 20,
+   "h": 20
+  },
+  "cam_slot@32": {
+   "x": 0,
+   "y": 6563,
+   "w": 32,
+   "h": 32
+  },
+  "cam_slot@20": {
+   "x": 34,
+   "y": 6569,
+   "w": 20,
+   "h": 20
+  },
+  "cam_chamfer2d@32": {
+   "x": 0,
+   "y": 6597,
+   "w": 32,
+   "h": 32
+  },
+  "cam_chamfer2d@20": {
+   "x": 34,
+   "y": 6603,
+   "w": 20,
+   "h": 20
+  },
+  "cam_engrave@32": {
+   "x": 0,
+   "y": 6631,
+   "w": 32,
+   "h": 32
+  },
+  "cam_engrave@20": {
+   "x": 34,
+   "y": 6637,
+   "w": 20,
+   "h": 20
+  },
+  "cam_drill@32": {
+   "x": 0,
+   "y": 6665,
+   "w": 32,
+   "h": 32
+  },
+  "cam_drill@20": {
+   "x": 34,
+   "y": 6671,
+   "w": 20,
+   "h": 20
+  },
+  "cam_thread_mill@32": {
+   "x": 0,
+   "y": 6699,
+   "w": 32,
+   "h": 32
+  },
+  "cam_thread_mill@20": {
+   "x": 34,
+   "y": 6705,
+   "w": 20,
+   "h": 20
+  },
+  "cam_parallel3d@32": {
+   "x": 0,
+   "y": 6733,
+   "w": 32,
+   "h": 32
+  },
+  "cam_parallel3d@20": {
+   "x": 34,
+   "y": 6739,
+   "w": 20,
+   "h": 20
+  },
+  "cam_waterline3d@32": {
+   "x": 0,
+   "y": 6767,
+   "w": 32,
+   "h": 32
+  },
+  "cam_waterline3d@20": {
+   "x": 34,
+   "y": 6773,
+   "w": 20,
+   "h": 20
+  },
+  "cam_scallop3d@32": {
+   "x": 0,
+   "y": 6801,
+   "w": 32,
+   "h": 32
+  },
+  "cam_scallop3d@20": {
+   "x": 34,
+   "y": 6807,
+   "w": 20,
+   "h": 20
+  },
+  "cam_pocket3d@32": {
+   "x": 0,
+   "y": 6835,
+   "w": 32,
+   "h": 32
+  },
+  "cam_pocket3d@20": {
+   "x": 34,
+   "y": 6841,
+   "w": 20,
+   "h": 20
+  },
+  "cam_turn_rough@32": {
+   "x": 0,
+   "y": 6869,
+   "w": 32,
+   "h": 32
+  },
+  "cam_turn_rough@20": {
+   "x": 34,
+   "y": 6875,
+   "w": 20,
+   "h": 20
+  },
+  "cam_turn_finish@32": {
+   "x": 0,
+   "y": 6903,
+   "w": 32,
+   "h": 32
+  },
+  "cam_turn_finish@20": {
+   "x": 34,
+   "y": 6909,
+   "w": 20,
+   "h": 20
+  },
+  "cam_turn_face@32": {
+   "x": 0,
+   "y": 6937,
+   "w": 32,
+   "h": 32
+  },
+  "cam_turn_face@20": {
+   "x": 34,
+   "y": 6943,
+   "w": 20,
+   "h": 20
+  },
+  "cam_turn_part@32": {
+   "x": 0,
+   "y": 6971,
+   "w": 32,
+   "h": 32
+  },
+  "cam_turn_part@20": {
+   "x": 34,
+   "y": 6977,
+   "w": 20,
+   "h": 20
+  },
+  "cam_cut2d@32": {
+   "x": 0,
+   "y": 7005,
+   "w": 32,
+   "h": 32
+  },
+  "cam_cut2d@20": {
+   "x": 34,
+   "y": 7011,
+   "w": 20,
+   "h": 20
+  },
+  "cam_probe@32": {
+   "x": 0,
+   "y": 7039,
+   "w": 32,
+   "h": 32
+  },
+  "cam_probe@20": {
+   "x": 34,
+   "y": 7045,
+   "w": 20,
+   "h": 20
   }
  },
  "raster_only": [
   "appr_default",
   "appr_metal",
   "appr_plastic",
+  "cam_adaptive2d",
+  "cam_chamfer2d",
+  "cam_contour2d",
+  "cam_cut2d",
+  "cam_drill",
+  "cam_engrave",
+  "cam_face",
+  "cam_parallel3d",
+  "cam_pocket2d",
+  "cam_pocket3d",
+  "cam_probe",
+  "cam_scallop3d",
+  "cam_slot",
+  "cam_thread_mill",
+  "cam_turn_face",
+  "cam_turn_finish",
+  "cam_turn_part",
+  "cam_turn_rough",
+  "cam_waterline3d",
   "chamfer",
   "circular_pattern",
   "combine",

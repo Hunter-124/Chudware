@@ -210,13 +210,12 @@ void Application::frame() {
     ImGui::Begin("ECAD", nullptr, pflags);
     ImGui::End();
 
-    // T-DP15: AI-Agent full-viewport shell — registered as a dock window for layout consistency.
-    // drawAiAgentShell() fills the content area when workspace==AiAgent.
-    // Glass overlay columns are suppressed for this workspace (overlayHosting gate above).
-    // Body (mission stream, agent tiles, etc.) lands in T-DP16.
+    // T-DP15/T-DP16: AI-Agent full-viewport workspace — no-draw dock stub, kept only for
+    // dock-layout registration (same rationale as the ECAD stub above). The mission-DAG shell
+    // is drawn as a content-swap INSIDE the full-screen Viewport window (viewport.cpp, gated on
+    // workspace==AiAgent) — the separate dock window is never brought forward in headless shots,
+    // so drawing here would leave the shell collapsed with the 3D viewport bleeding through.
     ImGui::Begin("AI Agent###ai_agent_ws", nullptr, pflags);
-    if (s.effectiveWorkspace() == cmd::Workspace::AiAgent)
-        ui::drawAiAgentShell(s);
     ImGui::End();
 
     // T-DP15: PLM project-hub full-viewport shell — same pattern as AiAgent above.

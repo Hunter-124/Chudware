@@ -1,7 +1,7 @@
 // Manufacture workspace body — CAM / machining workspace (OverlayHosting kind).
 //
 // Phase-2 hook: fill drawManufactureWorkspace() with CAM-specific chrome. The
-// CAM manager backend is drawCamManager() / drawCamWorkspacePanel() (cam_panel.h).
+// CAM manager backend is drawCamManager() / drawCamWorkspacePanel() (cam/cam_panel.h).
 // Reference-geometry commands (ref_plane / ref_axis / ref_point) are already
 // registered for this workspace in the command table — dispatch is unchanged.
 //

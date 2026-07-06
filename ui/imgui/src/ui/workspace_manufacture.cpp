@@ -10,7 +10,7 @@
 // commands from cmd::Workspace::Manufacture (cmd::groupsFor(W::Manufacture)) but
 // rendered as a mini context bar inside the content area (not the glass ribbon).
 #include "ui/workspace_manufacture.h"
-#include "ui/cam_panel.h"
+#include "ui/cam/cam_panel.h"
 #include "app/app_state.h"
 #include "theme/theme.h"
 #include "imgui.h"

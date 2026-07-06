@@ -16,12 +16,16 @@ path fully offline. Uses only stdlib ``urllib`` — no third-party dependency, s
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any, Optional
 
 from engine import paths
@@ -66,6 +70,58 @@ def _resolve_key(key: str, env_name: str) -> str:
     if not val:
         val = os.environ.get(env_name)
     return str(val).strip() if val else ""
+
+
+# --- JLCPCB Open API signed-request auth (T-BL24) --------------------------------------------
+# JLCPCB's Open API (https://api.jlcpcb.com/ · https://jlcpcb.com/help/catalog/213-JLCPCB-API)
+# authenticates EACH request with an HMAC-SHA256 signature, NOT a static bearer token. Creds are
+# a triple issued per developer account: appId + accessKey + secretKey (Erik obtained a real
+# accesskey/secretkey pair — T-S1). Scheme (public sources — reverse-eng SDK + JLCPCB help —
+# agree on HMAC-SHA256 + the "JOP" header; the exact string-to-sign ordering/separators should be
+# CONFIRMED against the authenticated official docs before the first live call, hence the pinned,
+# isolated _jlcpcb_sign below is the ONE line to adjust if they differ):
+#   string_to_sign = METHOD.upper() \n path \n timestamp \n nonce \n body
+#   signature      = base64( HMAC_SHA256(secretKey, string_to_sign) )
+#   Authorization  = JOP appid="..", accesskey="..", nonce="..", timestamp="..", signature=".."
+
+def _resolve_jlcpcb_creds() -> dict[str, str]:
+    """appId/accessKey/secretKey from config (``quote_providers.jlcpcb.{appid,accesskey,secretkey}``)
+    then env fallback (``JLCPCB_APP_ID`` / ``JLCPCB_ACCESS_KEY`` / ``JLCPCB_SECRET_KEY``) — mirrors
+    ``parts_providers._resolve_creds``. Absent creds resolve to ``""`` so ``quote()`` fails closed
+    (degraded shape, no network) exactly like every other approved-API provider."""
+    cfg = _provider_config("jlcpcb")
+    env_map = {"appid": "JLCPCB_APP_ID", "accesskey": "JLCPCB_ACCESS_KEY",
+               "secretkey": "JLCPCB_SECRET_KEY"}
+    out: dict[str, str] = {}
+    for field, env_name in env_map.items():
+        val = cfg.get(field) or os.environ.get(env_name)
+        out[field] = str(val).strip() if val else ""
+    return out
+
+
+def _jlcpcb_sign(method: str, path: str, timestamp: str, nonce: str, body: str,
+                 secret_key: str) -> str:
+    """base64(HMAC-SHA256(secretKey, METHOD\\npath\\ntimestamp\\nnonce\\nbody)).
+
+    Pure + deterministic — the T-BL24 test pins a known-input → known-signature fixture. This is
+    the single authoritative definition of the string-to-sign; adjust ONLY here if JLCPCB's
+    authenticated docs specify a different field order/separator."""
+    string_to_sign = "\n".join([method.upper(), path, timestamp, nonce, body])
+    digest = hmac.new(secret_key.encode("utf-8"), string_to_sign.encode("utf-8"),
+                      hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _jlcpcb_auth_header(creds: dict[str, str], method: str, path: str, body: str,
+                        *, timestamp: Optional[str] = None, nonce: Optional[str] = None) -> str:
+    """Build the ``JOP ...`` Authorization header for a signed JLCPCB request. ``timestamp``/
+    ``nonce`` are injectable so the signing is unit-testable deterministically; in production they
+    default to epoch-ms + a fresh uuid4 hex (single-use, replay-resistant)."""
+    ts = timestamp or str(int(time.time() * 1000))
+    nc = nonce or uuid.uuid4().hex
+    sig = _jlcpcb_sign(method, path, ts, nc, body, creds["secretkey"])
+    return (f'JOP appid="{creds["appid"]}", accesskey="{creds["accesskey"]}", '
+            f'nonce="{nc}", timestamp="{ts}", signature="{sig}"')
 
 
 # --- HTTP seam (stdlib urllib; monkeypatched in tests, so CI stays offline) -------------------
@@ -152,28 +208,33 @@ class XometryProvider(QuoteProvider):
 
 
 class JLCPCBProvider(QuoteProvider):
-    """JLCPCB board-fab quote API (Gerber bundle → PCB quote).
+    """JLCPCB board-fab quote API (Gerber bundle → PCB quote), HMAC-SHA256 signed (T-BL24).
 
-    No scraping. With no ``JLCPCB_KEY`` (or ``quote_providers.jlcpcb.api_key``) :meth:`quote`
-    returns the §0 degraded shape without a network call. With a key it POSTs the Gerber bundle
-    and normalizes into a §4 ``QuoteResult``.
+    No scraping. JLCPCB's Open API signs EVERY request (see :func:`_jlcpcb_sign`); the scaffold-era
+    static ``JLCPCB_KEY`` bearer is gone. With no appid/accesskey/secretkey configured, :meth:`quote`
+    returns the §0 degraded shape without a network call; with the credential triple it POSTs the
+    signed Gerber quote and normalizes into a §4 ``QuoteResult``.
     """
 
     key = "jlcpcb"
+    #: DEPRECATED (T-BL24): the scaffold-era static-bearer env var. JLCPCB's Open API requires
+    #: per-request HMAC signing, so this is no longer read for auth — kept only so the deprecation
+    #: is discoverable; quote() surfaces a clear message pointing at the new appid/accesskey/secretkey.
     env_var = "JLCPCB_KEY"
     API_URL = "https://api.jlcpcb.com/v1/quote"
 
     def quote(self, gerber_zip: str, layers: int = 2, quantity: int = 5,
               *, finish: Optional[str] = None, options: Optional[dict] = None) -> dict:
         qty = quantity if isinstance(quantity, int) and quantity >= 1 else 1
-        api_key = _resolve_key(self.key, self.env_var)
-        if not api_key:
+        creds = _resolve_jlcpcb_creds()
+        if not (creds["appid"] and creds["accesskey"] and creds["secretkey"]):
             return _degraded(
                 self.key,
-                "JLCPCB API key not configured (no quote_providers.jlcpcb.api_key and no "
-                "JLCPCB_KEY). An approved quote API key is required; no scraping.",
-                f"add 'quote_providers.jlcpcb.api_key' to {paths.CONFIG} (or set JLCPCB_KEY) then "
-                "retry request_quote.",
+                "JLCPCB Open API credentials not configured. The Open API requires per-request "
+                "HMAC-SHA256 signing with an appid + accesskey + secretkey triple (the static "
+                "JLCPCB_KEY bearer is no longer supported). No scraping.",
+                f"add quote_providers.jlcpcb.{{appid,accesskey,secretkey}} to {paths.CONFIG} (or set "
+                "JLCPCB_APP_ID / JLCPCB_ACCESS_KEY / JLCPCB_SECRET_KEY) then retry request_quote.",
             )
         if not gerber_zip:
             return _degraded(self.key, "no Gerber bundle to quote", "export the board Gerbers first.")
@@ -182,11 +243,17 @@ class JLCPCBProvider(QuoteProvider):
             "part_file": str(gerber_zip), "process": "pcb_fab", "quantity": qty,
             "finish": finish, "options": opts,
         }
+        # Sign over the EXACT body _http_post_json will send (both default-serialize the same dict →
+        # identical bytes) and the request PATH only (not scheme/host).
+        body = json.dumps(payload)
+        path = urllib.parse.urlparse(self.API_URL).path
+        auth = _jlcpcb_auth_header(creds, "POST", path, body)
         try:
-            raw = _http_post_json(self.API_URL, payload,
-                                  headers={"Authorization": f"Bearer {api_key}"})
+            raw = _http_post_json(self.API_URL, payload, headers={"Authorization": auth})
         except QuoteError as e:
-            return _degraded(self.key, e.message, "check the JLCPCB API key and the Gerber bundle.")
+            return _degraded(self.key, e.message,
+                             "check the JLCPCB Open API credentials (appid/accesskey/secretkey), "
+                             "the request signing, and the Gerber bundle.")
         return _normalize_result(self.key, qty, raw)
 
 

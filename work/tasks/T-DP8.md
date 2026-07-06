@@ -36,3 +36,6 @@ mode.
 - [ ] Local tier defaults wide, frontier narrow (test the resolved breadth).
 - [ ] Wired into ≥2 stages (strategy select, error diagnosis).
 - [ ] gate.sh PASS; graphify update.
+
+## Progress log
+- 2026-07-06 00:08 UTC [sonnet-flint1] Council policy engine delivered: council_policy.yaml (aicad.council_policy/1) + CouncilPolicy dataclass + resolve_policy(stage, tier) in councils.py. council_convene gains providers= (diverse-model round-robin) and temperature-diversity fallback (1-source). Wired into spec stage (org_tools.py MCP wrapper reads stage/tier from mission context) and fix stage (regen_diagnosis.diagnose gains council_tier= param; convenes failure_review council post-diagnosis; frontier skips). 46 tests pass (12 new policy, 12 existing councils, 3 new wiring, 19 existing regen). Gate.sh running. Resolved breadth: local-24k/spec=4, frontier/spec=1, local-24k/fix=4, frontier/fix=disabled.

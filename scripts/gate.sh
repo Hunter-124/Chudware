@@ -134,7 +134,12 @@ stage_core_build() {
     fi
     echo "  OCCT config: $occt_cfg"
     local build_dir="core/build-linux"
-    if ! CCACHE_DISABLE=1 cmake -S core -B "$build_dir" -DAICAD_WITH_OCCT=ON -G Ninja > /tmp/gate_cfg.out 2>&1; then
+    # CMAKE_BUILD_TYPE=Release is REQUIRED: without it the single-config Ninja generator
+    # builds -O0 (the -O3/-DNDEBUG live in CMAKE_CXX_FLAGS_RELEASE, only applied for a Release
+    # build type), and the `--config Release` on the build/ctest lines below is a NO-OP on
+    # single-config Ninja. Omitting it shipped an unoptimized libaicad — the FEA solver ran
+    # ~16x slower (sim ctests 34s -> 2s once Release was set). See docs/REFACTOR_LOG.md.
+    if ! CCACHE_DISABLE=1 cmake -S core -B "$build_dir" -DCMAKE_BUILD_TYPE=Release -DAICAD_WITH_OCCT=ON -G Ninja > /tmp/gate_cfg.out 2>&1; then
         record "core build          FAIL    cmake configure failed (see /tmp/gate_cfg.out)"
         echo "  FAIL: configure"; tail -n 15 /tmp/gate_cfg.out | sed 's/^/    /'
         fail_fatal=1

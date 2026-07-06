@@ -899,3 +899,23 @@ issue #7 — 10/21 are ScenarioRunner step machines that deadlock offscreen on m
 `DocMirror::newPart(worker)` (F4/C6 scope). ~11/21 (one-shots + static) capture fine. G3-gate
 re-scope decision requested from the foreman in work/questions/T-G7.md. **Touched:**
 ui/imgui/src/ui/scenarios.cpp, ui/abstract/panel_spec.cpp (+docs/task/question files).
+
+## 2026-07-06 — sim perf root cause: libaicad was built -O0 (FEA ~16x slow)
+
+**Symptom:** simple FEA simulations "extremely long" on Linux despite powerful hardware.
+**Root cause:** the core library (`libaicad.so`) was compiled **unoptimized (-O0)**. All
+`core/build-*` dirs had an EMPTY `CMAKE_BUILD_TYPE`; the `-O3 -DNDEBUG` flags live only in
+`CMAKE_CXX_FLAGS_RELEASE`, applied solely for a Release build type. `scripts/gate.sh`
+configured `core/build-linux` without `-DCMAKE_BUILD_TYPE=Release`, and its
+`cmake --build ... --config Release` / `ctest -C Release` are **no-ops on single-config
+Ninja** — so the gate produced an -O0 core while printing "PASS (Release)".
+**Measured:** FEA/solver ctests (sim+modal+tet10+thermal) 34.1s (-O0) -> 2.08s (-O3) = **~16x**
+(modal 68x, tet10 13.6x, sim 13.3x). The Eigen assembly/solve hot loops are extremely
+-O0-sensitive (lost inlining/vectorization).
+**Fix:** (1) `scripts/gate.sh` now configures with `-DCMAKE_BUILD_TYPE=Release`. (2) Reconfigured
++ rebuilt the in-use dirs `core/build-linux` AND `core/build-occt-linux` (the GUI's in-process
+`.so` via `cpp_core.cpp` -> baked `AICAD_DEFAULT_LIBAICAD`) at Release. **Note:** the stale
+`services/dist/AI-CAD/libaicad.so` (2026-07-02, -O0, predates `sim_run_static`) still shadows
+`core/build-linux` in `core_bridge` resolution order — refresh or remove it so tool/worker
+paths don't load stale -O0 code. Secondary levers (not yet done): single-threaded Netgen
+mesher, no mesh caching (re-meshes every solve), double STEP parse, tet10-by-default.

@@ -37,3 +37,6 @@ shared_interfaces} to the ledger (the skeleton the buildgraph orders).
 - [ ] Three checkers with tests (dangling ref, cycle, interface mismatch each caught).
 - [ ] Ledger `linkage` events read by the Stage-3 gate + consumed by buildgraph (Stage 4).
 - [ ] gate.sh PASS; graphify update.
+
+## Progress log
+- 2026-07-06 00:08 UTC [sonnet-jade1] Role, checkers, tests committed + pushed. gate.sh running (at pytest stage). 32 new tests + 57 roles/routing all green. Setting review when gate returns.

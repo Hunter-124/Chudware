@@ -306,16 +306,18 @@ class TestLoadAndValidate(unittest.TestCase):
     def test_thirteen_roles_load(self):
         # 13 pipeline roles + department_manager + design_thinker (org/ladder
         # layers) + feature_architect (design-pipeline Stage 1, T-DP2) +
-        # geometry_designer (design-pipeline Stage 2, T-DP3).
+        # geometry_designer (design-pipeline Stage 2, T-DP3) +
+        # linkage_planner (design-pipeline Stage 3, T-DP4).
         # council_seats.yaml is data, not a card.
         cards = roles.load_all_roles()
-        self.assertEqual(len(cards), 17, sorted(cards))
+        self.assertEqual(len(cards), 18, sorted(cards))
         for rid in ("intake_analyst", "clarifier", "spec_writer", "orchestrator",
                     "layout_engineer", "sketcher", "feature_modeler",
                     "assembly_fit_engineer", "sim_engineer", "cam_programmer",
                     "reviewer", "fixer", "overseer",
                     "department_manager", "design_thinker",
-                    "feature_architect", "geometry_designer"):
+                    "feature_architect", "geometry_designer",
+                    "linkage_planner"):
             self.assertIn(rid, cards)
 
     def test_six_playbooks_load(self):

@@ -108,6 +108,13 @@ if(WIN32)
   target_compile_definitions(AI-CAD2 PRIVATE AICAD_HAVE_BRIDGE=1
     AICAD_DEFAULT_LIBAICAD="${REPO}/core/build-occt/bin/Release/libaicad.dll")
   target_link_libraries(AI-CAD2 PRIVATE opengl32 dwmapi comdlg32)
+  if(MSVC)
+    # MSVC 14.51 (VS 2026): UCRT <cmath> is missing C99 float math declarations in the global
+    # namespace; force-include the shim on C++ TUs only (parity with host/CMakeLists.txt — X1/T-WIN1).
+    # ui/imgui keeps its OWN copy (extern/fix_math.h) so it survives the host/ deletion (T-G11).
+    target_compile_options(AI-CAD2 PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>:/FI"${CMAKE_CURRENT_SOURCE_DIR}/extern/fix_math.h">)
+  endif()
 else()
   target_compile_definitions(AI-CAD2 PRIVATE AICAD_HAVE_BRIDGE=1
     AICAD_DEFAULT_LIBAICAD="${REPO}/core/build-occt-linux/bin/libaicad.so")

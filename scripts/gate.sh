@@ -100,29 +100,6 @@ stage_ui_style_check() {
     fi
 }
 
-# ---- Stage 1.7: host/ freeze advisory (GUI unification) ---------------------
-# host/src/ui/ is the LEGACY Windows GUI — reference-only, scheduled for deletion (T-G11). It is
-# NOT built on Linux and is being replaced by ui/imgui over the shared ui/abstract schema. A GUI
-# fix landed only in host/ (e.g. a PropertyManager form change) will NOT reach the shipping Linux
-# app and diverges the two trees — this is exactly how T-BL35's datum-axis fix missed ui/abstract.
-# Advisory (non-fatal): flags any host/src/ui edit on this branch vs origin/master so it can't slip
-# in silently. Legitimate exceptions exist (T-WIN1 Windows seams, lead-approved backports).
-stage_host_freeze() {
-    echo "=== host/ freeze advisory (GUI unification) ==="
-    local edited
-    edited=$(git diff --name-only origin/master...HEAD -- 'host/src/ui/' 2>/dev/null)
-    if [ -z "$edited" ]; then
-        record "host/ freeze         PASS    no host/src/ui edits on this branch"
-        echo "  PASS"
-    else
-        record "host/ freeze         FAIL-RECORDED  host/src/ui edited — port to ui/imgui + ui/abstract (non-fatal)"
-        echo "  ⚠ host/src/ui is FROZEN (legacy, deleted by T-G11) and is NOT built on Linux."
-        echo "    These edits will NOT reach the shipping Linux app:"
-        echo "$edited" | sed 's/^/      /'
-        echo "    → Port the fix to ui/imgui/src/ui + the shared ui/abstract schema. See AGENTS.md."
-    fi
-}
-
 # ---- OCCT detection ---------------------------------------------------------
 find_occt_config() {
     # Look for the OpenCASCADE CMake config in the standard install locations.
@@ -581,7 +558,6 @@ CORE_BUILD_OK=0
 stage_check
 stage_manual_gen
 stage_ui_style_check
-stage_host_freeze
 stage_core_build
 stage_ui_abstract
 stage_ctest

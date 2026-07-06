@@ -42,7 +42,7 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ATLAS = os.path.join(REPO, "assets", "icons", "atlas.json")  # T-G11 de-dup: icons moved host/assets -> shared assets/
-DEFAULT_ROOTS = [os.path.join(REPO, "host", "src")]
+DEFAULT_ROOTS = [os.path.join(REPO, "ui", "imgui", "src")]  # T-G11: host/ deleted; lint the live tree
 
 # ui/imgui (Liquid Glass v2) icon pipeline — separate atlas + namespaced call forms (contract §3).
 UI_ATLAS = os.path.join(REPO, "ui", "imgui", "resources", "icons", "atlas.json")
@@ -113,10 +113,10 @@ PIXEL_MIN = 2.0
 # do not fail the gate. (Chrome exceptions inside these files can still be fixed; add a per-line
 # "// gui-lint: allow" if a specific art literal is mis-flagged elsewhere.)
 SCALE_WORLDSPACE_FILES = {
-    "host/src/ui/sketch_mode.cpp",        # 2D sketch canvas — world (model) coordinates
-    "host/src/ui/ecad/ecad_canvas.cpp",   # schematic / PCB canvas — world coordinates
-    "host/src/ui/drawing_panel.cpp",      # drawing sheet — paper-space coordinates
-    "host/src/ui_theme.cpp",              # base ImGuiStyle authored at 1.0x (ScaleAllSizes scales)
+    "ui/imgui/src/ui/sketch/sketch_mode.cpp",  # 2D sketch canvas — world (model) coordinates
+    "ui/imgui/src/ui/ecad/ecad_canvas.cpp",    # schematic / PCB canvas — world coordinates
+    "ui/imgui/src/ui/drawing_panel.cpp",       # drawing sheet — paper-space coordinates
+    "ui/imgui/src/theme/theme.cpp",            # base ImGuiStyle authored at 1.0x (ScaleAllSizes scales)
 }
 
 NUM_RE = re.compile(r"(?<![\w.])(-?\d+\.?\d*)f?(?![\w.\d])")

@@ -70,9 +70,10 @@ def _find_imgui_bin() -> Path:
 
 
 BIN = _find_imgui_bin()
-# Canonical atlas the C++ loader injects into stays host/assets/icons — the imgui build STAGES
-# this dir into <bin>/resources/icons at build time, so inject() keeps writing here.
-ICON_DIR = REPO / "host" / "assets" / "icons"
+# Canonical atlas the C++ loader injects into is the shared assets/icons (moved out of host/ in
+# T-G11) — the imgui build STAGES this dir into <bin>/resources/icons at build time, so inject()
+# keeps writing here.
+ICON_DIR = REPO / "assets" / "icons"
 # Runtime copy the imgui binary actually reads; redeploy here after inject so a re-run picks up
 # new tiles without a full rebuild.
 DEPLOYED_ICON_DIR = BIN.parent / "resources" / "icons"

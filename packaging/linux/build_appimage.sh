@@ -108,7 +108,7 @@ exec "$HERE/usr/bin/AI-CAD2" "$@"
 EOF
 chmod +x "$APPDIR/AppRun"
 cp "$REPO/packaging/linux/AI-CAD.desktop" "$APPDIR/AI-CAD.desktop"
-cp "$REPO/host/assets/logo_icon.png" "$APPDIR/AI-CAD.png"
+cp "$REPO/assets/logo_icon.png" "$APPDIR/AI-CAD.png"
 
 APPIMAGETOOL="$REPO/build/tools/appimagetool"
 if [ ! -x "$APPIMAGETOOL" ]; then

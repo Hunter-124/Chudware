@@ -12,9 +12,9 @@ ShopCraft is a parametric CAD application. The core geometry/document/solver/CAM
 engine is a C++ library `libaicad` (under `core/`) that is strangling out a
 legacy Python `engine/` oracle — the two are kept in lockstep by a per-subsystem
 parity corpus until each Python module is flipped off and deleted. The desktop
-GUI is an ImGui shell under `ui/imgui/` — this is the **sole active GUI target**.
-The older `host/` tree is reference-only (T-G23 Chrome-port source) and is deleted
-by T-G11. The active refactor plan lives at
+GUI is an ImGui shell under `ui/imgui/` — this is the **sole GUI target**.
+The older `host/` tree was **deleted in T-G11 (2026-07-06)** after the cross-platform build
+was de-duplicated off it. The active refactor plan lives at
 `/home/hunter/.cursor/plans/cad_modular_refactor_+_gui_abstraction_6371dd9f.plan.md`
 and is the source of truth for the target layered layout and the per-phase DAG.
 
@@ -27,16 +27,16 @@ physically lives today. "→ moves" marks dirs slated to move per the plan.
 | Dir | Purpose (current) | Plan target |
 |-----|-------------------|-------------|
 | `core/` | Pure C++/CUDA kernel → `libaicad` (the zero-Python engine target): geom/doc/sketch/solver/cam/sim/ecad/mate/parts/agent/util/api/tests. | Stays `core/`. |
-| `host/` | Legacy C++ ImGui desktop host: `src/ui/*` (panels/editors), `src/render/*` (GL viewport), `src/core/*` (app_state/doc_mirror/worker_client). **Reference-only** for T-G23 Chrome-port; deleted by T-G11 after T-G23+T-G25 land + Windows verify. Do NOT patch for new features — use `ui/imgui/` only. | Deleted by T-G11. |
+| `host/` | **Removed (T-G11, 2026-07-06).** Was the legacy C++ ImGui desktop host. Its shared pieces were de-duplicated into the cross-platform tree (glad → `extern/glad`, render module → `ui/viewport/render/`, assets → `assets/`) and the GUI is now `ui/imgui/` only. | Deleted. |
 | `app/` | **Removed (T-G24, 2026-07-05).** Was a convenience symlink → `ui/imgui/`. Use `ui/imgui/` directly. Build output: `build/linux-app/`. | Deleted. |
 | `engine_oracle/` | Python parity oracle (frozen while `core/` catches up). Root `engine` symlink preserves imports. Deleted LAST (N6b). | Deleted N6b. |
 | `services/agent/` | Built-in agent loop (Python now → C++ later). Root `agent` symlink. | C++ at N5e. |
 | `services/mcp/` | MCP server for external agents. Root `mcp_server` symlink. | C++ at N5e. |
 | `services/installer/` | Provisioning, MCP registration, packaging. Root `installer` symlink. | Stays until N6. |
-| `services/worker/` | Engine routing seam (scaffold; lands N4a from `host/src/core/*`). | N4a. |
+| `services/worker/` | Engine routing seam (WorkerClient/DocMirror/bootstrap). | N4a. |
 | `ui/abstract/` | Framework-agnostic UI seam (view-model, commands, panel specs). **No ImGui.** | P2. |
 | `ui/imgui/` | ImGui concrete backend (scaffold; `app/` lands here P3). | P3. |
-| `ui/viewport/` | Shared OpenGL viewport pipeline (scaffold; `host/src/render/*` lands N2c). | N2c/P3. |
+| `ui/viewport/` | Shared OpenGL viewport pipeline: `renderer`/`mesh`/`camera` + `render/` (AICM loader, id-pass picking, overlays). The single home of the render module (was duplicated in `host/`). | Done. |
 | `platform/` | Cross-OS shims (scaffold; `app/src/platform/*` lands P3). | P3. |
 | `corpora/` | Consolidated test fixtures (`sketch/`, `render/`, `sw_parity/`, `sw_fixtures/`). Root symlinks preserve legacy paths. | Done (N1d). |
 | `docs/` | Design docs, status notes, parity specs. | Stays `docs/`. |
@@ -46,21 +46,21 @@ physically lives today. "→ moves" marks dirs slated to move per the plan.
 | `third_party/` | Vendored third-party deps. | Stays. |
 | `scratch/` | Throwaway scratch area. | Stays (non-blocking). |
 
-## GUI ownership policy (T-G24, 2026-07-05)
+## GUI ownership policy (T-G11 — host/ deleted 2026-07-06)
 
-- **`ui/imgui/` is the ONLY target for new GUI work.** Never patch `host/` for new
-  features or bug fixes — `host/` is reference-only for T-G23.
-- **Double-patching both `host/` and `ui/imgui/` requires explicit lead approval.**
-  If your task seems to require touching both, stop and ask.
-- **Watch the DUPLICATED form/PropertyManager schema.** Feature form specs (wells, field
-  kinds, params) live in BOTH `host/src/ui/pm_forms.cpp` AND the shared
-  `ui/abstract/panel_spec.cpp`. `host/` reads its copy; the Linux app reads `ui/abstract`.
-  A form/PM fix (selector kinds, wells, gating) belongs in **`ui/abstract/panel_spec.cpp`** —
-  patching only `host/pm_forms.cpp` never reaches the shipping Linux app (this is how T-BL35's
-  datum-axis fix diverged; fixed in `41915e8c`). The gate's `host/ freeze` advisory flags any
-  `host/src/ui/` edit on a branch to catch this.
-- `host/` is deleted by T-G11, which depends on T-G23 and T-G25 landing first plus
-  a human-verified Windows build.
+- **`ui/imgui/` is the SINGLE GUI target** (concrete backend), over the shared,
+  framework-agnostic `ui/abstract/` (view-model, commands, panel specs) and the shared
+  `ui/viewport/` (OpenGL render pipeline). There is no second GUI tree anymore — the legacy
+  `host/` was deleted in T-G11 after the cross-platform build was de-duplicated off it
+  (glad → `extern/glad`, the render module → `ui/viewport/render/`, assets → `assets/`).
+- **Form/PropertyManager schema is the shared `ui/abstract/panel_spec.cpp`.** A form/PM fix
+  (selector kinds, wells, gating) belongs there — it is the single source the app reads. (There
+  used to be a duplicate `host/src/ui/pm_forms.cpp`; T-BL35's datum-axis fix diverged because it
+  was patched host-only — fixed in `41915e8c`. That trap is gone now that host/ is deleted.)
+- **OS-specifics belong in build files / the `platform/` seam, not duplicated source.** The one
+  live GUI compiles cross-platform via the `linux-app` / `windows-app` presets; per-OS bits
+  (subprocess launch, file dialogs, GL loader) live behind CMake conditionals or
+  `ui/imgui/src/platform/`. `ui/abstract` has zero platform ifdefs by design.
 - Scripted GUI launches (gate.sh, tools/gui_parity/run_all.py) always use `xvfb-run`
   when available unless `AI_CAD_SHOT_HEADED=1` is set. Set that env var for
   interactive/walkthrough runs (T-G12 protocol) to see a real window.

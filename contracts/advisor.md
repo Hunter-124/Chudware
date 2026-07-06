@@ -303,15 +303,18 @@ post-validation). The routing keys off the ledger event **kind** cited in
   "stage": "decompose|geometry|linkage|buildpath",   // phases.py Phase value
   "role": "feature_architect|geometry_designer|linkage_planner|orchestrator",
   "basis": "why this target (which evidence kind / class fallback)",
-  "feature": "G1",          // the specific artifact id to re-enter at (or null)
-  "full_restart": false      // true ONLY when nothing resolves — a blind retry
+  "feature": "G1"           // the specific artifact id to re-enter at (or null)
 }
 ```
 
 `feature`→decompose, `geometry_spec`→geometry, `linkage`→linkage, `build_node`→
 buildpath (the earliest owning stage wins when several kinds are cited — fix the
-deepest-upstream rung). Verdict `class` is a fallback signal only. `ok` verdicts
-carry `targeted_reentry: null`. This is additive; readers that ignore the field are
+deepest-upstream rung). A `targeted_reentry` is *always* a targeted correction to an
+owning stage — never a blind full retry — so there is no `full_restart` field; when
+nothing resolves the reroute is simply `null`. Verdict `class` is a fallback signal
+only, and that fallback is gated to design-pipeline runs (it needs a DP artifact in
+the ledger, or an explicit `dp_active`); a legacy audit therefore routes no verdict
+into a DP stage. `ok` verdicts carry `targeted_reentry: null`. This is additive; readers that ignore the field are
 unaffected. The same routing map powers the change-request `stage_reentry` on
 dispatch rows (a user "thicker wall" re-enters GEOMETRY on the wall's geometry_spec).
 

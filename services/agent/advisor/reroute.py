@@ -85,12 +85,15 @@ class Reentry:
     class fallback) so the routing is auditable, not a black box.  ``feature`` is the
     specific artifact id to re-enter at when the evidence pinned one (a user change to
     "the bore" carries the bore's geometry_spec/dimension id).
+
+    There is no ``full_restart`` field: a ``Reentry`` is *always* a targeted correction
+    to an owning stage (§3.1 "never a blind full retry").  When nothing resolves,
+    ``route_verdict`` returns ``None`` rather than a blind-retry Reentry.
     """
     stage: str
     role: str
     basis: str = ""
     feature: Optional[str] = None
-    full_restart: bool = False   # True only when nothing resolves — a blind retry
 
     def to_dict(self) -> dict:
         return {
@@ -98,7 +101,6 @@ class Reentry:
             "role": self.role,
             "basis": self.basis,
             "feature": self.feature,
-            "full_restart": self.full_restart,
         }
 
 
@@ -139,18 +141,40 @@ def _event_artifact_id(ev: dict) -> Any:
     return payload.get("id") or ev.get("seq")
 
 
+def _ledger_has_dp_artifacts(ledger: Any | None) -> bool:
+    """True iff the run has produced ≥1 design-pipeline artifact.
+
+    A legacy audit (design_pipeline flag OFF) never writes a feature / geometry_spec /
+    linkage / build_node into ledger.state, so an empty DP state is the deterministic
+    signal that no DP stage owns anything — the class fallback must NOT invent a
+    re-entry into a phase machine that isn't running.
+    """
+    state = getattr(ledger, "state", None)
+    if not isinstance(state, dict):
+        return False
+    return any(state.get(section) for section in
+               ("features", "geometry_specs", "linkages", "build_nodes"))
+
+
 def route_verdict(verdict: dict, *, ledger: Any | None = None,
-                  scope_stage: str = "") -> Optional[Reentry]:
+                  dp_active: bool = False) -> Optional[Reentry]:
     """Compute the targeted re-entry for one audit verdict.
 
     Priority (the routing rule):
       1. **Evidence ledger-kind** — the strongest signal.  Resolve every cited event
          to its kind; if any maps to a DP stage, re-enter the EARLIEST such stage
          (fix the deepest-upstream rung).  Carries the artifact id as ``feature``.
+         This branch is self-gating: it only fires when a DP event kind is cited, so
+         a non-DP run (which has no such events) never reaches it.
       2. **Verdict class fallback** — when no evidence kind resolves, a class → stage
-         map covers the common cases (``missed_requirement`` → decompose, …).
-      3. ``None`` — an ``ok`` verdict, or a verdict whose class/evidence names no DP
-         stage (the caller keeps it at ``scope_stage`` — no blind restart is invented).
+         map covers the common cases (``missed_requirement`` → decompose, …).  Unlike
+         (1) this branch has no intrinsic DP signal, so it is GATED on the run actually
+         being in the design pipeline: it fires only when ``dp_active`` is passed OR the
+         ledger already carries a DP artifact.  A legacy audit thus never routes to a
+         DP phase that isn't running.
+      3. ``None`` — an ``ok`` verdict, a non-DP run, or a verdict whose class/evidence
+         names no DP stage (the caller keeps it where it was detected — no blind
+         restart is invented).
 
     A ``spec_drift`` verdict is intent-drift: it re-grounds at its OWNING stage (from
     evidence) rather than restarting, so the fresh-context stage is re-run against the
@@ -178,12 +202,14 @@ def route_verdict(verdict: dict, *, ledger: Any | None = None,
                        basis=f"evidence cites a {_stage_kind(stage)} event",
                        feature=art if isinstance(art, str) else None)
 
-    # (2) Class fallback.
-    mapped = _CLASS_TO_STAGE.get(cls or "")
-    if mapped is not None:
-        stage, role = mapped
-        return Reentry(stage=stage, role=role,
-                       basis=f"class={cls} (no evidence artifact) → owning stage")
+    # (2) Class fallback — only within the design pipeline (see docstring).  A legacy
+    # audit with no DP artifacts and no dp_active flag falls through to (3).
+    if dp_active or _ledger_has_dp_artifacts(ledger):
+        mapped = _CLASS_TO_STAGE.get(cls or "")
+        if mapped is not None:
+            stage, role = mapped
+            return Reentry(stage=stage, role=role,
+                           basis=f"class={cls} (no evidence artifact) → owning stage")
 
     # (3) No DP stage owns this — keep it where it was detected, no restart.
     return None
@@ -197,18 +223,20 @@ def _stage_kind(stage: str) -> str:
     return stage
 
 
-def route_audit(audit: dict, *, ledger: Any | None = None) -> dict:
+def route_audit(audit: dict, *, ledger: Any | None = None,
+                dp_active: bool = False) -> dict:
     """Attach a ``targeted_reentry`` to every non-``ok`` verdict in an audit record.
 
     Deterministic post-validation step (the model's reroute prose is stripped by
     ``validate_audit``; the harness computes the real target here).  Returns the same
     audit dict with each verdict's ``targeted_reentry`` filled in — per-verdict, since
     each finding may own a different stage (DoD: "audit events {stage, finding,
-    targeted_reentry}").  ``ok`` verdicts get no reentry.
+    targeted_reentry}").  ``ok`` verdicts get no reentry.  ``dp_active`` forces the
+    class-fallback branch on for an explicitly-DP run; otherwise a DP artifact in the
+    ledger opens that gate (see ``route_verdict``).
     """
-    scope_stage = (audit.get("scope") or {}).get("stage", "")
     for v in audit.get("verdicts", []):
-        re = route_verdict(v, ledger=ledger, scope_stage=scope_stage)
+        re = route_verdict(v, ledger=ledger, dp_active=dp_active)
         v["targeted_reentry"] = re.to_dict() if re is not None else None
     return audit
 

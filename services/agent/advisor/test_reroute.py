@@ -128,7 +128,6 @@ def test_geometry_error_routes_to_geometry_stage(tmp_path):
     assert re.stage == "geometry", "must route to the GEOMETRY stage, not restart"
     assert re.role == "geometry_designer"
     assert re.feature == "G1", "the specific geometry_spec is the re-entry point"
-    assert re.full_restart is False
 
 
 def test_earliest_owning_stage_wins_when_multiple_kinds_cited(tmp_path):
@@ -145,13 +144,29 @@ def test_earliest_owning_stage_wins_when_multiple_kinds_cited(tmp_path):
 
 
 def test_class_fallback_when_no_evidence_kind():
-    """No resolvable evidence kind ⇒ class fallback picks an owning stage."""
+    """No resolvable evidence kind ⇒ class fallback picks an owning stage — but only
+    inside the design pipeline, so the DP context is signalled via ``dp_active``."""
     re = route_verdict({
         "class": "missed_requirement", "finding": "R3 has no feature",
         "evidence": {"ledger_events": []}, "required_action": {"kind": "replan"},
         "severity": "blocker",
-    }, ledger=None)
+    }, ledger=None, dp_active=True)
     assert re is not None and re.stage == "decompose"
+
+
+def test_class_fallback_gated_off_for_legacy_audit(tmp_path):
+    """A legacy audit (design_pipeline flag OFF → no DP artifacts in the ledger) with a
+    class that would map to a DP stage but NO DP evidence gets targeted_reentry=None:
+    the class fallback must not point at a phase machine that isn't running."""
+    lg = Ledger("run_legacy", tmp_path / "ledger.json")
+    lg.add_requirement("intake", "R1", "some legacy requirement")  # no DP artifact
+    assert reroute._ledger_has_dp_artifacts(lg) is False
+    re = route_verdict({
+        "class": "wrong_order", "finding": "operations sequenced out of order",
+        "evidence": {"ledger_events": []}, "required_action": {"kind": "replan"},
+        "severity": "action",
+    }, ledger=lg)
+    assert re is None, "a legacy (non-DP) audit must not route to a DP stage"
 
 
 def test_ok_verdict_gets_no_reentry():

@@ -1,6 +1,6 @@
 """services/agent/delegation.py — Hierarchical delegation tree + approval chain.
 
-Contract: contracts/advisor.md §12 (aicad.delegation/1, FROZEN).
+Contract: contracts/advisor.md §12 (aicad.delegation/1).
 
 What this module provides
 --------------------------
@@ -16,17 +16,44 @@ What this module provides
     One spawned sub-agent slot: role + model (resolved via routing) + brief +
     budget + docs lease requests (T-W16) + approval state.
 
+``BudgetMeter``
+    Human-visible tree-wide meter: tokens spent vs granted across ALL nodes, plus
+    total agents spawned vs the config max.  Updated on every accrue + every new
+    node.  Serialised in every ledger artifact flush so the GUI always has the
+    current meter state.
+
 Approval chain (contract §12)
     - depth-1 from the orchestrator: auto-approved.
     - kind='ponder' at any depth: auto-approved (read-only + hard token budget).
     - deeper worker: requires the mission overseer's approval (trigger=manual,
       scope=delegation) or human, per approval_policy in routing.yaml.
 
+Recursion rails (T-DP9, Hunter directive)
+    There is NO hard depth cap — an overseer/lead may spawn sub-agents, and those
+    sub-agents may spawn their own with approval from the overseer that called them,
+    recursively.  The only rails are:
+      1. ``soft_depth_limit`` (config, default 8): reaching or exceeding this depth
+         emits a ``delegation_depth_warning`` advisory event and allows the spawn.
+         The overseer-approval requirement at depth>1 is the human-visible gate.
+      2. ``max_agents`` (config, default 64): reaching this count emits a
+         ``delegation_agent_limit_warning`` event and allows the spawn.  The kill-
+         switch is the human-controlled stop.
+      3. ``budget_meter``: tree-wide token spend vs grant + agent count, always
+         visible in the artifact.  Token exhaustion of any ancestor auto-revokes
+         the subtree (unchanged from pre-T-DP9).
+      4. ``kill()`` method: human-visible kill-switch — revokes the whole tree from
+         root, sets ``killed=True``, and rejects all subsequent spawn requests.
+
+    ``DEPTH_CAP`` is kept as a module-level constant for backward compatibility with
+    any external readers (e.g. ``agent_inspector_view.h``), but it is NO LONGER
+    enforced.  The artifact still emits ``soft_depth_limit`` in place of the old
+    hard cap so consumers can distinguish the two semantics.
+
 Budget inheritance (contract §12)
     Child spend accrues to ALL ancestors (single counter tree).  The harness calls
     ``accrue(node_id, tokens)`` on the tree; when any ancestor's remaining budget
-    hits zero, the harness calls ``revoke(node_id)``.  Revocation produces a
-    ledger event with kind='delegation_revoked'.
+    hits zero, the subtree is automatically revoked.  Revocation produces a ledger
+    event with kind='delegation_revoked'.
 
 Sub-agent identities
     Every node gets an explicit ``dg_<hex>`` id.  No shared mutable defaults —
@@ -55,7 +82,16 @@ from services.agent.routing import Resolution, RoutingTable
 # ---------------------------------------------------------------------------
 
 DELEGATION_SCHEMA = "aicad.delegation/1"
-DEPTH_CAP = 3  # contract §12: hard cap on delegation depth
+
+# DEPTH_CAP is kept for backward compatibility (artifact readers, inspector UI).
+# It is NO LONGER enforced as a hard limit — see T-DP9.  The tree uses
+# ``soft_depth_limit`` (config) as an advisory warning only.
+DEPTH_CAP = 3
+
+# Default soft limits — configurable via routing.yaml ``delegation:`` block or
+# DelegationTree constructor kwargs (soft_depth_limit / max_agents).
+DEFAULT_SOFT_DEPTH_LIMIT: int = 8
+DEFAULT_MAX_AGENTS: int = 64
 
 # Node statuses (contract §12).
 STATUSES = frozenset({"pending", "approved", "running", "done", "failed", "revoked"})
@@ -122,6 +158,64 @@ class Budget:
 
 
 @dataclass
+class BudgetMeter:
+    """Human-visible tree-wide budget meter (T-DP9).
+
+    Tracks tokens and agent count across the WHOLE delegation tree so the UI and
+    kill-switch logic have a single, always-current summary.
+
+    ``tokens_granted``  — orchestrator root's initial grant (the tree ceiling).
+    ``tokens_spent``    — total tokens accrued across all nodes (mirrors root.budget.tokens_spent).
+    ``agents_spawned``  — total non-root delegation nodes ever created in this tree.
+    ``max_agents``      — config soft cap on agent count (advisory, not enforced hard).
+    ``soft_depth_limit``— config advisory depth threshold; exceeding emits a warning event.
+    ``killed``          — True after kill() has been called; all subsequent spawns are rejected.
+    """
+    tokens_granted: int
+    tokens_spent: int = 0
+    agents_spawned: int = 0
+    max_agents: int = DEFAULT_MAX_AGENTS
+    soft_depth_limit: int = DEFAULT_SOFT_DEPTH_LIMIT
+    killed: bool = False
+
+    @property
+    def tokens_remaining(self) -> int:
+        return self.tokens_granted - self.tokens_spent
+
+    @property
+    def agents_remaining(self) -> int:
+        return max(0, self.max_agents - self.agents_spawned)
+
+    @property
+    def token_pct(self) -> float:
+        """0.0–1.0 fraction of total token budget consumed."""
+        if self.tokens_granted <= 0:
+            return 0.0
+        return min(1.0, self.tokens_spent / self.tokens_granted)
+
+    @property
+    def agent_pct(self) -> float:
+        """0.0–1.0 fraction of agent budget consumed."""
+        if self.max_agents <= 0:
+            return 0.0
+        return min(1.0, self.agents_spawned / self.max_agents)
+
+    def to_dict(self) -> dict:
+        return {
+            "tokens_granted": self.tokens_granted,
+            "tokens_spent": self.tokens_spent,
+            "tokens_remaining": self.tokens_remaining,
+            "token_pct": round(self.token_pct, 4),
+            "agents_spawned": self.agents_spawned,
+            "agents_remaining": self.agents_remaining,
+            "max_agents": self.max_agents,
+            "agent_pct": round(self.agent_pct, 4),
+            "soft_depth_limit": self.soft_depth_limit,
+            "killed": self.killed,
+        }
+
+
+@dataclass
 class DelegationNode:
     """One node in the delegation tree.
 
@@ -182,6 +276,14 @@ class DelegationTree:
     ``ledger`` and ``routing`` are injected (test-mockable).  Both may be None:
     a None ledger means events are captured in ``_pending_events`` only; a None
     routing means model assignment is deferred (unresolved).
+
+    T-DP9 rails (no hard depth cap):
+      ``soft_depth_limit`` — depth at which a ``delegation_depth_warning`` advisory
+          event is emitted; spawn is still allowed.  Default: DEFAULT_SOFT_DEPTH_LIMIT.
+      ``max_agents`` — agent count at which a ``delegation_agent_limit_warning``
+          advisory event is emitted; spawn is still allowed.  Default: DEFAULT_MAX_AGENTS.
+      ``kill()`` — kills the whole tree: revokes all active nodes from root and sets
+          ``_meter.killed = True`` so subsequent spawns are rejected.
     """
 
     def __init__(
@@ -192,6 +294,8 @@ class DelegationTree:
         ledger: Any | None = None,
         routing: RoutingTable | None = None,
         overseer: Any | None = None,
+        soft_depth_limit: int = DEFAULT_SOFT_DEPTH_LIMIT,
+        max_agents: int = DEFAULT_MAX_AGENTS,
     ) -> None:
         self._run_id = run_id or f"r_{uuid.uuid4().hex[:8]}"
         self._ledger = ledger
@@ -199,6 +303,13 @@ class DelegationTree:
         self._overseer = overseer
         self._nodes: dict[str, DelegationNode] = {}
         self._pending_events: list[dict] = []
+
+        # Tree-wide budget meter (T-DP9) — always current, serialised in every flush.
+        self._meter = BudgetMeter(
+            tokens_granted=orchestrator_budget,
+            max_agents=max_agents,
+            soft_depth_limit=soft_depth_limit,
+        )
 
         # Root orchestrator node (depth=0).
         root_id = _fresh_id()
@@ -251,7 +362,16 @@ class DelegationTree:
                 request shape only — actual leasing lives in T-W16).
         *availability*: passed to routing for source availability probing.
 
-        Raises ``DelegationError`` on depth cap exceeded or invalid arguments.
+        Hard errors (DelegationError):
+          - Invalid arguments (kind, role, brief, budget_tokens).
+          - kill() has been called on this tree (killed=True).
+          - Parent node not found or not in a spawnable status.
+          - Requested budget exceeds any ancestor's total grant.
+
+        Soft advisories (ledger events, spawn still proceeds):
+          - depth >= soft_depth_limit  → ``delegation_depth_warning`` event.
+          - agents_spawned >= max_agents → ``delegation_agent_limit_warning`` event.
+
         Returns the newly created node (status pending, then transitioned to approved
         or awaiting overseer approval).
         """
@@ -266,6 +386,10 @@ class DelegationTree:
         if len(brief) > 500:
             raise DelegationError(f"brief must be ≤500 chars (contract §12), got {len(brief)}")
 
+        # Kill-switch guard (T-DP9): reject all spawns after kill().
+        if self._meter.killed:
+            raise DelegationError("delegation tree has been killed; no new sub-agents can be spawned")
+
         parent_id = parent_id or self._root_id
         parent = self._nodes.get(parent_id)
         if parent is None:
@@ -277,9 +401,23 @@ class DelegationTree:
             )
 
         depth = parent.depth + 1
-        if depth > DEPTH_CAP:
-            raise DelegationError(
-                f"delegation depth {depth} exceeds cap {DEPTH_CAP} (contract §12)"
+
+        # Soft depth advisory (T-DP9): emit warning event but allow the spawn.
+        if depth >= self._meter.soft_depth_limit:
+            self._emit_event(
+                actor=role,
+                kind="delegation_depth_warning",
+                payload={
+                    "schema": DELEGATION_SCHEMA,
+                    "depth": depth,
+                    "soft_depth_limit": self._meter.soft_depth_limit,
+                    "message": (
+                        f"Delegation at depth {depth} reached soft limit "
+                        f"{self._meter.soft_depth_limit}. "
+                        "Overseer approval required; spawn is proceeding. "
+                        "Use kill() to halt the tree if this is runaway."
+                    ),
+                },
             )
 
         # Budget check: the requested budget must not exceed any ancestor's total grant.
@@ -327,6 +465,25 @@ class DelegationTree:
         )
         self._nodes[node_id] = node
         self._emit_transition(node, "pending", "delegation requested")
+
+        # Update meter agent count BEFORE the agent-limit advisory so the emitted
+        # event reflects the post-spawn count.
+        self._meter.agents_spawned += 1
+        if self._meter.agents_spawned >= self._meter.max_agents:
+            self._emit_event(
+                actor=role,
+                kind="delegation_agent_limit_warning",
+                payload={
+                    "schema": DELEGATION_SCHEMA,
+                    "agents_spawned": self._meter.agents_spawned,
+                    "max_agents": self._meter.max_agents,
+                    "message": (
+                        f"Agent count {self._meter.agents_spawned} reached soft limit "
+                        f"{self._meter.max_agents}. "
+                        "Spawn is proceeding. Use kill() to halt the tree if this is runaway."
+                    ),
+                },
+            )
 
         # Approve or route to overseer.
         if approval_policy_str == "auto":
@@ -396,6 +553,9 @@ class DelegationTree:
 
         After accrual, any ancestor whose remaining budget hits zero (<=0) is
         automatically revoked — the harness never needs to poll manually.
+
+        The tree-wide budget meter is synchronised to the root's spent counter so
+        the human-visible meter always reflects the true total.
         """
         if tokens <= 0:
             return
@@ -403,6 +563,11 @@ class DelegationTree:
         chain = self._ancestors(node_id, inclusive=True)
         for anc in chain:
             anc.budget.tokens_spent += tokens
+
+        # Sync meter to root's authoritative spent counter (root accumulates all spend).
+        root = self._nodes.get(self._root_id)
+        if root is not None:
+            self._meter.tokens_spent = root.budget.tokens_spent
 
         # Revoke any node in the chain (bottom-up) whose budget is exhausted.
         # Revoke the child first so ancestors know to cascade.
@@ -417,13 +582,66 @@ class DelegationTree:
         self._revoke_subtree(node_id, reason=reason)
         self._flush_artifact()
 
+    def kill(self) -> None:
+        """Human kill-switch (T-DP9): halt the entire delegation tree.
+
+        Revokes all active nodes from the root down (cascading), sets
+        ``meter.killed = True`` so every subsequent ``request_delegation``
+        call raises ``DelegationError`` immediately.
+
+        Emits a ``delegation_killed`` ledger event with the current meter
+        snapshot so the human-visible log shows when and why the tree was
+        stopped.
+
+        Safe to call more than once — a tree that is already killed is a no-op.
+        """
+        if self._meter.killed:
+            return  # idempotent
+        self._meter.killed = True
+        # Revoke the whole tree from root down.
+        self._revoke_subtree(self._root_id, reason="kill-switch activated")
+        self._emit_event(
+            actor="harness",
+            kind="delegation_killed",
+            payload={
+                "schema": DELEGATION_SCHEMA,
+                "run_id": self._run_id,
+                "budget_meter": self._meter.to_dict(),
+                "message": "Delegation tree killed by harness/human kill-switch.",
+            },
+        )
+        self._flush_artifact()
+
+    @property
+    def budget_meter(self) -> BudgetMeter:
+        """The live tree-wide budget meter (read-only view).
+
+        Callers must NOT mutate this object — it is the tree's internal state.
+        Use ``accrue()`` / ``kill()`` / ``request_delegation()`` to drive changes.
+        """
+        return self._meter
+
     def to_artifact(self) -> dict:
-        """Serialize the tree to the aicad.delegation/1 ledger artifact shape."""
+        """Serialize the tree to the aicad.delegation/1 ledger artifact shape.
+
+        T-DP9 additive fields (backward-compatible):
+          ``budget_meter``     — tree-wide token+agent meter snapshot.
+          ``soft_depth_limit`` — config advisory depth threshold.
+          ``killed``           — True after kill() was called.
+
+        ``depth_cap`` is retained for backward compatibility with artifact
+        readers (e.g. agent_inspector_view.h) but is now the legacy constant
+        value, not an enforcement limit.  Readers that want the active limit
+        should use ``soft_depth_limit``.
+        """
         return {
             "schema": DELEGATION_SCHEMA,
             "run_id": self._run_id,
             "nodes": [n.to_dict() for n in self._nodes.values()],
-            "depth_cap": DEPTH_CAP,
+            "depth_cap": DEPTH_CAP,               # kept for backward compat
+            "soft_depth_limit": self._meter.soft_depth_limit,
+            "budget_meter": self._meter.to_dict(),
+            "killed": self._meter.killed,
         }
 
     # -- internal helpers ---------------------------------------------------
@@ -589,15 +807,19 @@ def delegate(
 # ---------------------------------------------------------------------------
 
 def register_delegation_tools(registry: Any, tree: DelegationTree | None = None) -> None:
-    """Register the ``delegate`` tool with an MCP tool registry.
+    """Register delegation tools with an MCP tool registry (T-DP9).
 
     The registry is the one from services/mcp/tool_registry.py.  This makes
-    ``delegate`` a real registered tool so validate_role no longer flags it as
-    feature-flagged.
+    ``delegate`` and ``kill_delegation_tree`` real registered tools.
 
-    *tree* is optional — when None, the tool returns an error asking the caller
+    *tree* is optional — when None, the tools return an error asking the caller
     to provide a tree via the mission context.  The actual mission loop injects
     the live tree through the context mechanism.
+
+    Registered tools:
+      ``delegate``            — spawn a sub-agent (unchanged API, no depth cap).
+      ``kill_delegation_tree``— human kill-switch: halt the whole tree immediately.
+      ``delegation_budget``   — read the live budget meter (tokens + agent count).
     """
     def _delegate_tool(
         role: str,
@@ -618,14 +840,34 @@ def register_delegation_tools(registry: Any, tree: DelegationTree | None = None)
             docs=docs,
         )
 
+    def _kill_tree_tool() -> dict:
+        if tree is None:
+            return {"error": "kill_delegation_tree: no delegation tree in this context",
+                    "status": "failed"}
+        try:
+            tree.kill()
+            return {"killed": True, "budget_meter": tree.budget_meter.to_dict()}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc), "status": "failed"}
+
+    def _budget_tool() -> dict:
+        if tree is None:
+            return {"error": "delegation_budget: no delegation tree in this context",
+                    "status": "failed"}
+        return tree.budget_meter.to_dict()
+
     try:
         registry.register(
             "delegate",
             _delegate_tool,
             description=(
                 "Spawn a sub-agent role with an isolated brief and token budget. "
+                "There is no hard depth cap — sub-agents may spawn their own sub-agents "
+                "with approval from the overseer that called them, recursively. "
                 "depth-1 sub-agents are auto-approved; deeper ones require overseer approval. "
                 "'ponder' kind is auto-approved at any depth (read-only + budget-bounded). "
+                "A depth_warning or agent_limit_warning advisory is emitted when soft limits "
+                "are reached, but the spawn still proceeds. "
                 "Returns the delegation node dict including status and model assignment."
             ),
             parameters={
@@ -645,6 +887,26 @@ def register_delegation_tools(registry: Any, tree: DelegationTree | None = None)
                              "description": "Doc lease requests [{doc_id, lease}] (T-W16)"},
                 },
             },
+        )
+        registry.register(
+            "kill_delegation_tree",
+            _kill_tree_tool,
+            description=(
+                "Human kill-switch: immediately revoke the entire delegation tree from root, "
+                "halt all active sub-agents, and prevent any new spawns. "
+                "Use when the delegation tree is suspected to be runaway. "
+                "Returns the final budget meter snapshot."
+            ),
+            parameters={"type": "object", "required": [], "properties": {}},
+        )
+        registry.register(
+            "delegation_budget",
+            _budget_tool,
+            description=(
+                "Return the live tree-wide budget meter: tokens spent/granted/remaining, "
+                "agents spawned/remaining, soft_depth_limit, max_agents, and killed status."
+            ),
+            parameters={"type": "object", "required": [], "properties": {}},
         )
     except Exception:  # noqa: BLE001 — registration failure must not crash startup
         pass

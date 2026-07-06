@@ -63,3 +63,11 @@ approval_policy:
   depth_1: auto       # depth-1 from the orchestrator: auto-approved
   deeper: overseer    # deeper sub-agents: requires the mission overseer's approval
   # ponder nodes are auto-approved at ANY depth (read-only + hard token budget)
+
+# T-DP9: Hierarchical delegation rails — no hard depth cap.
+# These are advisory soft limits; reaching them emits a warning ledger event
+# but the spawn still proceeds. The kill-switch (kill_delegation_tree tool or
+# DelegationTree.kill()) is the human-controlled hard stop.
+delegation:
+  soft_depth_limit: 8   # emit delegation_depth_warning at or beyond this depth
+  max_agents: 64        # emit delegation_agent_limit_warning at or beyond this count

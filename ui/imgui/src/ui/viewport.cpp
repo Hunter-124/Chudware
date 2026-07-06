@@ -4,6 +4,7 @@
 #include "ui/shortcut_bar.h"
 #include "ui/sketch/sketch_mode.h"
 #include "ui/sketch/sketch_seam.h"
+#include "ui/sketch3d/sketch3d.h"
 #include "ui/camera_anim.h"
 #include "ui/mouse_gestures.h"
 #include "ui/view_selector.h"
@@ -880,6 +881,20 @@ void drawViewport(AppState& s) {
         s_sketch.drawGhosts(host, a, b, vw, vh);
         if (s.inSketch)
             s_sketch.drawOverlay(host, io, a, b, vw, vh, imgHovered);
+        else if (host.propertyManager && host.propertyManager->active()) {
+            // Feature-PropertyManager viewport pickers. While a feature PM is open (and no
+            // sketch is being edited) these let the user click directly in the 3D view to
+            // fill the active well: sketch regions -> profile/sections, drawn sketches +
+            // curve datums (helix/spline) -> path/guides, origin datum planes/axes ->
+            // plane/axis refs. Each self-gates on the active well kind (returns fast when it
+            // doesn't apply) and returns true while it owns the cursor. Without this call the
+            // pickers were dead scaffold and profiles/guides could only be pre-selected before
+            // opening the command — the "can't click my sketch to pick it" gap.
+            s_sketch.drawPlanePicker(host, io, a, b, vw, vh, imgHovered);
+            s_sketch.drawAxisPicker(host, io, a, b, vw, vh, imgHovered);
+            s_sketch.drawCurvePathPicker(host, io, a, b, vw, vh, imgHovered);
+            s_sketch.drawRegionPicker(host, io, a, b, vw, vh, imgHovered);
+        }
 
         // T-BL44: Space orients the view normal-to the active sketch plane ("Normal To").
         // cameraLock() returns the fronto-parallel yaw/pitch that sketch entry computed from the
@@ -897,6 +912,12 @@ void drawViewport(AppState& s) {
                 g_vpState.pitch = nPitch;
             }
         }
+
+        // 3D free-space sketcher (first slice): overlay ON TOP of the live GL scene
+        // (OverlayHosting) — points + lines placed on a work plane, projected via the
+        // same CameraXform the sketch overlay uses. a=imgMin, vw/vh match supersampling.
+        if (s.workspace == cmd::Workspace::Sketch3D)
+            ui::draw3DSketch(s, r->camera(), a, vw, vh, imgHovered);
     }
 
     s_shortcutBar.update(s, imgHovered, s.inSketch, a, b);

@@ -568,6 +568,45 @@ bool SketchMode::drawRegionPicker(SketchHost& st, ImGuiIO& io, const ImVec2& img
     }
     dl->PopClipRect();
 
+    // ---- open-sketch hint --------------------------------------------------
+    // A candidate sketch that produced NO closed region can't be a profile, and the
+    // region picker draws/hover-tests nothing for it — so the sketch looks simply
+    // unselectable with no explanation (the #1 "why can't I pick my sketch?" gripe;
+    // a sweep/extrude profile must be a closed loop). Name the open sketch(es) so the
+    // user knows to close the loop. Drawn with the overlay palette — the dark glass
+    // chip carries its own light text, so it stays readable in dark AND light themes
+    // (never a hardcoded colour that could land black-on-black).
+    {
+        std::vector<std::string> openNames;
+        for (const auto& rs : pickRegions_) {
+            if (!rs.loaded || !rs.regions.empty()) continue;
+            std::string nm = rs.fid;  // fall back to the id
+            const nlohmann::json& tree = st.docMirror().tree();
+            if (tree.is_object() && tree.contains("features") && tree["features"].is_array())
+                for (const auto& tf : tree["features"])
+                    if (tf.is_object() && tf.value("id", std::string()) == rs.fid) {
+                        nm = tf.value("name", rs.fid); break;
+                    }
+            openNames.push_back(nm);
+        }
+        if (!openNames.empty()) {
+            const std::string msg =
+                openNames.size() == 1
+                    ? ("\"" + openNames[0] + "\" is open — a profile must be a closed loop")
+                    : (std::to_string(openNames.size()) +
+                       " sketches are open — a profile must be a closed loop");
+            ImVec2 ts = ImGui::CalcTextSize(msg.c_str());
+            float cx = (imgMin.x + imgMax.x) * 0.5f;
+            ImVec2 b0(cx - ts.x * 0.5f - 14, imgMin.y + 52.0f * ui::sketch::uiScale());
+            ImVec2 b1(cx + ts.x * 0.5f + 14, b0.y + ts.y + 12);
+            dl->PushClipRect(imgMin, imgMax, true);
+            dl->AddRectFilled(b0, b1, col(pal.overlayBg), 6.0f);
+            dl->AddRect(b0, b1, col(pal.overlayBorder), 6.0f);
+            dl->AddText(ImVec2(b0.x + 14, b0.y + 6), col(pal.overlayText), msg.c_str());
+            dl->PopClipRect();
+        }
+    }
+
     // ---- click: toggle the hovered region into/out of the profile ----
     if (hovS >= 0 && canHover && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         st.requestCursor(ui::sketch::CursorKind::Hand);
@@ -951,11 +990,23 @@ bool SketchMode::drawCurvePathPicker(SketchHost& st, ImGuiIO& io, const ImVec2& 
     std::string bestFid, bestName;
     std::vector<std::pair<ImVec2, ImVec2>> bestSegs;   // screen segments to highlight
 
+    // Features that must NOT be offered as a candidate: the sketch already consumed
+    // as the Profile (can't self-sweep), and — while filling the multi-ref guides
+    // well — the sweep's own path/centerline (a guide must differ from the spine).
+    std::set<std::string> excluded;
+    for (const auto& sel : pm->profilePicks())
+        if (sel.is_object() && sel.contains("sketch") && sel["sketch"].is_string())
+            excluded.insert(sel["sketch"].get<std::string>());
+    const bool fillingGuides = pm->activeWellKey() == "guides";
+    if (fillingGuides)
+        for (const auto& id : pm->spineFeatureIds()) excluded.insert(id);
+
     // --- 1) curve datums (helix / spiral / spline) -------------------------------
     const nlohmann::json& datums = st.docMirror().refDatums();
     if (datums.is_array()) {
         for (const auto& d : datums) {
             if (!d.is_object() || d.value("kind", std::string()) != "curve") continue;
+            if (excluded.count(d.value("id", std::string()))) continue;
             const auto& pts = d.contains("points") ? d["points"] : nlohmann::json();
             if (!pts.is_array() || pts.size() < 2) continue;
             std::vector<std::pair<ImVec2, ImVec2>> segs;
@@ -980,12 +1031,8 @@ bool SketchMode::drawCurvePathPicker(SketchHost& st, ImGuiIO& io, const ImVec2& 
 
     // --- 2) ghost sketches (a whole SKETCH used as the path) ---------------------
     // The sketch the user drew for the path is rendered as a ghost (drawGhosts); hit-test
-    // its projected entities so a viewport click on the sketch fills the path well. Skip the
-    // sketch already consumed as the Profile so the user can't accidentally self-sweep.
-    std::set<std::string> profileSketches;
-    for (const auto& sel : pm->profilePicks())
-        if (sel.is_object() && sel.contains("sketch") && sel["sketch"].is_string())
-            profileSketches.insert(sel["sketch"].get<std::string>());
+    // its projected entities so a viewport click on the sketch fills the path/guides well
+    // (excluded set above skips the profile and — for guides — the path).
     auto ghostName = [&](const std::string& fid) -> std::string {
         const nlohmann::json& tree = st.docMirror().tree();
         if (tree.is_object() && tree.contains("features") && tree["features"].is_array())
@@ -996,7 +1043,7 @@ bool SketchMode::drawCurvePathPicker(SketchHost& st, ImGuiIO& io, const ImVec2& 
     };
     const float D2R = 3.14159265f / 180.0f;
     for (const auto& g : ghosts_) {
-        if (!g.loaded || profileSketches.count(g.fid)) continue;
+        if (!g.loaded || excluded.count(g.fid)) continue;
         auto uv2s = [&](float u, float v, ImVec2& o) -> bool {
             float wx = g.frame[0] * u + g.frame[1] * v + g.frame[3];
             float wy = g.frame[4] * u + g.frame[5] * v + g.frame[7];
@@ -1067,7 +1114,8 @@ bool SketchMode::drawCurvePathPicker(SketchHost& st, ImGuiIO& io, const ImVec2& 
     wdl->PushClipRect(imgMin, imgMax, true);
     for (const auto& s : bestSegs)
         wdl->AddLine(s.first, s.second, col(pal.accent, 0.95f), 4.0f);
-    const char* banner = "Click to set this as the sweep path";
+    const char* banner = fillingGuides ? "Click to add this guide curve"
+                                       : "Click to set this as the sweep path";
     ImVec2 bts = ImGui::CalcTextSize(banner);
     float bcx = (imgMin.x + imgMax.x) * 0.5f;
     ImVec2 b0(bcx - bts.x * 0.5f - 14, imgMin.y + 52.0f * ui::sketch::uiScale());

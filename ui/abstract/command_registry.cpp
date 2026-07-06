@@ -259,6 +259,7 @@ const std::vector<Command>& all() {
 const char* workspaceLabel(Workspace w) {
     switch (w) {
         case W::Model: return "Model";          case W::Sketch: return "Sketch";
+        case W::Sketch3D: return "3D Sketch";
         case W::SheetMetal: return "Sheet Metal";case W::Weldment: return "Weldment";
         case W::Surface: return "Surface";       case W::Assemble: return "Assemble";
         case W::Drafting: return "Drafting";     case W::Simulate: return "Simulate";
@@ -271,6 +272,7 @@ const char* workspaceLabel(Workspace w) {
 const char* workspaceIcon(Workspace w) {
     switch (w) {
         case W::Model: return "ws_model";        case W::Sketch: return "ws_sketch";
+        case W::Sketch3D: return "ws_sketch";    // reuse the valid sketch atlas icon
         case W::SheetMetal: return "ws_sheetmetal";case W::Weldment: return "ws_weldment";
         case W::Surface: return "ws_surface";    case W::Assemble: return "ws_assemble";
         case W::Drafting: return "ws_draft";     case W::Simulate: return "ws_simulate";
@@ -302,7 +304,7 @@ const char* groupLabel(Group g) {
 
 std::vector<Workspace> workspacesFor(DocType d) {
     switch (d) {
-        case DocType::Part:      return { W::Model, W::SheetMetal, W::Weldment, W::Surface, W::Simulate };
+        case DocType::Part:      return { W::Model, W::Sketch3D, W::SheetMetal, W::Weldment, W::Surface, W::Simulate };
         case DocType::Assembly:  return { W::Assemble, W::Simulate };
         case DocType::Drawing:   return { W::Drafting };
         case DocType::Schematic: return { W::Schematic };

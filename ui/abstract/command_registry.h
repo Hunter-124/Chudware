@@ -12,7 +12,7 @@
 namespace cmd {
 
 enum class Workspace {
-    Model, Sketch, SheetMetal, Weldment, Surface, Assemble, Drafting,
+    Model, Sketch, Sketch3D, SheetMetal, Weldment, Surface, Assemble, Drafting,
     Simulate, Schematic, Board,
     // T-DP15: full-viewport global workspaces (doc-type independent)
     AiAgent,          // AI-Agent full-screen workspace (body: T-DP16)

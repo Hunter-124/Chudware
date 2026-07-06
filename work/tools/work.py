@@ -71,6 +71,70 @@ LANES = {
 KINDS = {"fix", "overhaul", "new"}
 KIND_RANK = {"fix": 0, "overhaul": 1, "new": 2}  # fix-first tiebreak inside a priority
 
+# --- Lane ownership / branch model (2026-07-06, Hunter directive) -----------
+# Each lane is owned by a human contributor and worked on its own branch, so
+# agents driven toward that lane's scope land on lane/<lane> and never touch
+# master until a human reviews & merges. Uncategorised / untagged bugfixes are
+# grouped onto ONE shared branch (lane/misc-fixes) to reduce cross-branch
+# divergence. Authored here (git-tracked work/lanes.json) — NOT in work/sync/,
+# which teamsync regenerates from remote and would clobber.
+LANES_FILE = ROOT / "lanes.json"
+UNTAGGED = "(untagged)"
+ASSIGNABLE_LANES = LANES | {UNTAGGED}
+MISC_BRANCH = "lane/misc-fixes"
+BRANCH_RE = re.compile(r"^lane/[a-z0-9._-]+$")
+
+
+def _default_branch(lane):
+    return MISC_BRANCH if lane == UNTAGGED else f"lane/{lane}"
+
+
+def _load_lane_board():
+    """The stored lane->{owner,branch,goal} map, or {} if unset/corrupt."""
+    if not LANES_FILE.exists():
+        return {}
+    try:
+        data = json.loads(LANES_FILE.read_text(encoding="utf-8"))
+        return data.get("lanes", {}) if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _lane_board_view():
+    """Every assignable lane with its owner/branch/goal (defaults filled in)."""
+    stored = _load_lane_board()
+    out = {}
+    for lane in sorted(ASSIGNABLE_LANES):
+        rec = stored.get(lane, {})
+        out[lane] = {
+            "lane": lane,
+            "owner": rec.get("owner") or "unassigned",
+            "branch": rec.get("branch") or _default_branch(lane),
+            "goal": rec.get("goal") or "",
+        }
+    return out
+
+
+def _save_lane_board(lanes):
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    LANES_FILE.write_text(
+        json.dumps({"version": 1, "updated": stamp, "lanes": lanes}, indent=1) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _commit_lane_board(msg):
+    """Commit + push work/lanes.json to master under the claim lock (same path
+    discipline as _commit_task_change: add exact file, author as identity, push)."""
+    main = _main_worktree()
+    rel = LANES_FILE.resolve().relative_to(main.resolve())
+    _git(["add", str(rel)], main, check=True)
+    _git(["commit", "-m", msg], main, check=True)
+    if _git(["remote"], main).stdout.strip():
+        if _git(["push"], main).returncode != 0:
+            _git(["pull", "--rebase"], main)
+            _git(["push"], main, check=True)
+
 
 def _is_deferred(t):
     return str(t.get("deferred", "no")).lower() in ("yes", "true", "1")
@@ -814,6 +878,63 @@ def cmd_lanes(tasks, errors, args):
     return 0
 
 
+def cmd_assignments(tasks, errors, args):
+    """Show who owns each lane, on which branch, toward what goal. --json for the
+    dashboard. Lanes not yet assigned show owner=unassigned + the default branch."""
+    view = _lane_board_view()
+    if getattr(args, "json", False):
+        print(json.dumps(list(view.values())))
+        return 0
+    print(f"{'lane':<20} {'owner':<18} {'branch':<22} goal")
+    for rec in view.values():
+        print(f"{rec['lane']:<20} {rec['owner']:<18} {rec['branch']:<22} {rec['goal']}")
+    return 0
+
+
+def cmd_assign_lane(tasks, errors, args):
+    """Assign a lane (feature area) to a human contributor + its working branch and
+    goal. This is how a human claims a slice of the roadmap to drive their own agents
+    on lane/<lane> without touching master. Writes git-tracked work/lanes.json and
+    pushes, so every contributor's dashboard live-syncs the ownership map."""
+    lock = _lock()
+    try:
+        lane = args.lane
+        if lane not in ASSIGNABLE_LANES:
+            raise RuntimeError(f"bad lane (allowed: {sorted(ASSIGNABLE_LANES)})")
+        branch = args.branch or _default_branch(lane)
+        if not BRANCH_RE.match(branch):
+            raise RuntimeError("branch must match ^lane/[a-z0-9._-]+$ "
+                               "(lane work lives on lane/* only, never master)")
+        main = _main_worktree()
+        if _git(["remote"], main).stdout.strip():
+            if not _safe_sync(main):
+                print("BUSY: main checkout diverged from origin (foreman mid-session)"
+                      " — retry in ~60s", file=sys.stderr)
+                return 3
+        lanes = _load_lane_board()
+        rec = lanes.get(lane, {})
+        if args.clear:
+            rec["owner"] = "unassigned"
+            verb = "unassigned"
+        else:
+            rec["owner"] = args.owner
+            verb = f"assigned to {args.owner}"
+        rec["branch"] = branch
+        if args.goal is not None:
+            rec["goal"] = args.goal
+        rec.setdefault("goal", "")
+        lanes[lane] = rec
+        _save_lane_board(lanes)
+        _commit_lane_board(f"assign lane {lane} -> {rec['owner']} on {branch} ({args.owner})")
+        print(f"ASSIGN: {lane} {verb} on {branch}")
+        return 0
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    finally:
+        lock.unlink(missing_ok=True)
+
+
 def cmd_whoami(tasks, errors, args):
     """Show or set the contributor identity (GitHub username) for this checkout.
     Stored gitignored in work/sync/identity.json; used to author board commits and
@@ -927,6 +1048,15 @@ def main():
     p_road.add_argument("--json", action="store_true")
     p_lanes = sub.add_parser("lanes")
     p_lanes.add_argument("--json", action="store_true")
+    p_assigns = sub.add_parser("assignments")
+    p_assigns.add_argument("--json", action="store_true")
+    p_assign = sub.add_parser("assign-lane")
+    p_assign.add_argument("lane")
+    p_assign.add_argument("--owner")
+    p_assign.add_argument("--branch", default=None)
+    p_assign.add_argument("--goal", default=None)
+    p_assign.add_argument("--clear", action="store_true",
+                          help="unassign the lane (keeps its branch mapping)")
     p_who = sub.add_parser("whoami")
     p_who.add_argument("--github", help="your GitHub username")
     p_who.add_argument("--name", help="display name for commit authorship")
@@ -964,7 +1094,8 @@ def main():
 
     # Default --owner to the stored identity for commands that write as a person
     # (NOT board/ready, where --owner is a filter, nor whoami).
-    MUTATING = {"claim", "note", "status", "release", "relink", "checkdod", "set"}
+    MUTATING = {"claim", "note", "status", "release", "relink", "checkdod", "set",
+                "assign-lane"}
     if args.cmd in MUTATING:
         try:
             args.owner = _resolve_owner(args)
@@ -979,6 +1110,7 @@ def main():
           "release": cmd_release, "relink": cmd_relink,
           "checkdod": cmd_checkdod, "set": cmd_set,
           "roadblocks": cmd_roadblocks, "lanes": cmd_lanes,
+          "assignments": cmd_assignments, "assign-lane": cmd_assign_lane,
           "whoami": cmd_whoami, "mine": cmd_mine}[args.cmd]
     sys.exit(fn(tasks, errors, args))
 

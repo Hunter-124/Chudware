@@ -88,7 +88,12 @@ public:
     void setProfilePicks(app::AppState& st, const std::vector<nlohmann::json>& sels);
     std::vector<std::string> regionCandidateSketches(app::AppState& st) const;
     std::vector<std::string> pathHighlightFeatureIds() const;
+    // Owners of the path/centerline (spine) wells only — the guides picker excludes
+    // these so a sweep's own path can't be picked as its guide curve.
+    std::vector<std::string> spineFeatureIds() const;
     std::string activeWellKindHint() const;
+    // Key of the currently-active selector well ("path"/"guides"/…), or "" if none.
+    std::string activeWellKey() const;
 
     bool cancelEdits(app::AppState& st);
 

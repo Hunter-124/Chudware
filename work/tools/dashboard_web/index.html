@@ -16,9 +16,9 @@
   <nav class="nav">
     <button class="nav-btn active" data-view="overview">Overview</button>
     <button class="nav-btn" data-view="map">Map</button>
+    <button class="nav-btn" data-view="codebase">Codebase</button>
   </nav>
   <div class="topbar-right">
-    <button class="ghost-btn" id="graphify-btn" title="Ask the code knowledge graph">Ask the codebase</button>
     <span class="refresh-note" id="refresh-note">loading…</span>
   </div>
 </header>
@@ -39,14 +39,51 @@
     <div class="cards" id="needs-you-cards"></div>
   </section>
 
+  <section class="section" id="issues-section">
+    <div class="section-head">
+      <h2>Hot issues</h2>
+      <span class="section-sub">open bugs &amp; reports from GitHub — untagged ones go to the shared <code>lane/misc-fixes</code> branch</span>
+    </div>
+    <div class="issues" id="issue-rows"><div class="muted">loading…</div></div>
+  </section>
+
   <section class="section">
     <div class="section-head">
-      <h2>Feature progress</h2>
-      <span class="section-sub">closest to finished on top — click a row to see its map</span>
+      <h2>Feature progress &amp; ownership</h2>
+      <span class="section-sub">each lane is owned by a person and worked on its own branch — click a row for its map, or <b>Assign</b> to claim it</span>
     </div>
     <div class="lanes" id="lane-rows"></div>
   </section>
 
+</main>
+
+<!-- ============ CODEBASE (graphify node graph) ============ -->
+<main id="view-codebase" class="view hidden">
+  <div class="graph-toolbar">
+    <span class="graph-stats" id="graph-stats">loading graph…</span>
+    <input id="graph-search" type="search" placeholder="Highlight nodes…" autocomplete="off">
+    <label class="toggle"><input type="checkbox" id="graph-edges" checked><span>Edges</span></label>
+    <button class="ghost-btn" id="graph-fit">Fit</button>
+    <span class="spacer"></span>
+    <button class="ghost-btn" id="graph-ask-toggle" title="Ask the knowledge graph in words">Ask ▾</button>
+  </div>
+  <div class="graph-ask hidden" id="graph-ask">
+    <div class="graph-ask-row">
+      <select id="graphify-mode">
+        <option value="query">Search</option>
+        <option value="explain">Explain</option>
+      </select>
+      <input id="graphify-q" type="text" placeholder="e.g. how does autosave recovery work?">
+      <button class="primary-btn" id="graphify-go">Ask</button>
+    </div>
+    <div class="freshness" id="graphify-freshness"></div>
+    <pre id="graphify-out" class="graphify-out">Ask a question to explore the graph in words.</pre>
+  </div>
+  <div class="graph-wrap" id="graph-wrap">
+    <canvas id="graph-canvas"></canvas>
+    <div class="graph-tip hidden" id="graph-tip"></div>
+    <div class="graph-empty hidden" id="graph-empty"></div>
+  </div>
 </main>
 
 <!-- ============ MAP ============ -->
@@ -107,23 +144,30 @@
   </div>
 </aside>
 
-<!-- ============ GRAPHIFY MODAL ============ -->
-<div id="graphify-modal" class="modal hidden">
+<!-- ============ ASSIGN-LANE MODAL ============ -->
+<div id="assign-modal" class="modal hidden">
   <div class="modal-card">
     <div class="modal-head">
-      <h3>Ask the codebase</h3>
-      <button class="ghost-btn" id="graphify-close">✕</button>
+      <h3 id="assign-title">Assign a lane</h3>
+      <button class="ghost-btn" id="assign-close">✕</button>
     </div>
-    <div class="modal-controls">
-      <select id="graphify-mode">
-        <option value="query">Search</option>
-        <option value="explain">Explain</option>
-      </select>
-      <input id="graphify-q" type="text" placeholder="e.g. how does autosave recovery work?">
-      <button class="primary-btn" id="graphify-go">Ask</button>
+    <p class="assign-help">Give this feature area an owner and a branch. Their agents
+      work on that branch toward the goal below — <b>master stays untouched</b> until
+      you or they review &amp; merge.</p>
+    <div class="assign-form">
+      <label>Owner <span class="muted">(GitHub username / name)</span>
+        <input id="assign-owner" type="text" placeholder="e.g. Hunter-124"></label>
+      <label>Branch
+        <input id="assign-branch" type="text" placeholder="lane/…"></label>
+      <label>Goal / scope <span class="muted">(optional)</span>
+        <input id="assign-goal" type="text" placeholder="what 'done' looks like for this lane"></label>
     </div>
-    <div class="freshness" id="graphify-freshness"></div>
-    <pre id="graphify-out" class="graphify-out">Results appear here.</pre>
+    <div id="assign-error" class="assign-error hidden"></div>
+    <div class="assign-actions">
+      <button class="ghost-btn danger" id="assign-clear">Unassign</button>
+      <span class="spacer"></span>
+      <button class="primary-btn" id="assign-save">Save assignment</button>
+    </div>
   </div>
 </div>
 

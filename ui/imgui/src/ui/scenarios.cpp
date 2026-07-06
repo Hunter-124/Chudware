@@ -3,6 +3,7 @@
 
 #include "ui/viewport.h"
 #include "ui/sketch/sketch_mode.h"   // T-BL46: full type for sketchMode().elementDragActive()
+#include "ui/sketch3d/sketch3d.h"    // 3D free-space sketcher shot seed (ws_sketch3d)
 #include "viewport_impl.h"            // T-BL46: GlViewport full type (renderer().camera())
 #include "renderer.h"                 // T-BL46: worldToScreen(), ViewportScreen
 
@@ -535,6 +536,7 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantWsFullViewportEcad = eq("ws_full_viewport_ecad");
     cfg.wantWsAiAgent          = eq("ws_ai_agent");
     cfg.wantWsPlm              = eq("ws_plm");
+    cfg.wantWsSketch3d         = eq("ws_sketch3d");
     cfg.wantAgentInspector      = eq("agent_inspector");        // T-W17
     cfg.wantAgentInspectorEmpty = eq("agent_inspector_empty");  // T-W17
     cfg.wantAgentInspectorFailure    = eq("agent_inspector_failure");    // T-W17
@@ -643,6 +645,14 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
         std::fflush(stdout);
     }
     if (cfg.wantWsPlm)      st.workspace = cmd::Workspace::PlmManagement;
+    if (cfg.wantWsSketch3d) {
+        // 3D free-space sketcher (OverlayHosting) — the live 3D scene keeps rendering
+        // under the point/line overlay, so this stays a Part-doc Model-style shot.
+        st.workspace = cmd::Workspace::Sketch3D;
+        ui::sketch3dSeedDemo();
+        std::printf("ws_sketch3d: Sketch3D workspace — 3D free-space points+lines over the live scene\n");
+        std::fflush(stdout);
+    }
     if (cfg.wantMultidoc) st.railTab = 0;
     if (cfg.wantActivity) st.railTab = 0;
 
@@ -1499,6 +1509,13 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
         cfg.wsPlmShotDone = true;
         st.workspace = cmd::Workspace::PlmManagement;
         std::printf("ws_plm: PlmManagement workspace — full-viewport shell, no glass columns\n");
+        std::fflush(stdout);
+    }
+    if (cfg.wantWsSketch3d && !cfg.wsSketch3dShotDone) {
+        cfg.wsSketch3dShotDone = true;
+        st.workspace = cmd::Workspace::Sketch3D;
+        ui::sketch3dSeedDemo();
+        std::printf("ws_sketch3d: Sketch3D workspace — 3D free-space points+lines over the live scene\n");
         std::fflush(stdout);
     }
 }

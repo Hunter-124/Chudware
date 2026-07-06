@@ -80,8 +80,16 @@ TopoDS_Shape extrude_face_tapered(const TopoDS_Face& face, const Eigen::Vector3d
 // Falls back to BRepOffsetAPI_MakePipe on shell failure. The profile should sit at
 // the spine start, roughly perpendicular to its tangent (SolidWorks pierce rule).
 // Empty shape only when every strategy fails.
+//
+// `guides` supplies optional guide curve(s): a guide is an auxiliary spine that
+// drives the profile's orientation + scaling as it travels (SolidWorks "Guide
+// Curves"). MakePipeShell drives one auxiliary spine, so only guides.front() is
+// used; when a guide is present it overrides the `orientation` frame law and the
+// MakePipe fallback is disabled (that fallback cannot honour a guide, so a shell
+// failure returns empty rather than silently ignoring the guide).
 TopoDS_Shape sweep_profile(const TopoDS_Face& profile, const TopoDS_Wire& spine,
-                           int orientation = 0);
+                           int orientation = 0,
+                           const std::vector<TopoDS_Wire>& guides = {});
 
 // Loft a solid through an ordered list of section wires (BRepOffsetAPI_ThruSections,
 // isSolid=true). `ruled` makes straight transitions between sections; otherwise a

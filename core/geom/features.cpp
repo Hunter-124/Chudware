@@ -17,6 +17,7 @@
 #include <BRepOffsetAPI_MakePipe.hxx>
 #include <BRepOffsetAPI_MakePipeShell.hxx>
 #include <BRepOffsetAPI_ThruSections.hxx>
+#include <BRepFill_TypeOfContact.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCone.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
@@ -360,13 +361,26 @@ TopoDS_Shape extrude_face_tapered(const TopoDS_Face& face, const Eigen::Vector3d
 // + solid capping). orientation: 0=follow_path (CorrectedFrenet, the SolidWorks
 // default and the most stable for helices), 1=frenet (true Frenet frame, can flip
 // at inflections), 2=keep_normal (fixed +Z binormal — a profile that never twists).
-// Null shape on kernel failure so the caller can fall back / error cleanly.
+// When `guide` is non-null it becomes an auxiliary spine that drives the profile's
+// orientation + scaling along the path (SolidWorks guide curve); it overrides the
+// `orientation` frame law. Null shape on kernel failure so the caller can fall
+// back / error cleanly.
 static TopoDS_Shape sweep_wire_solid(const TopoDS_Wire& profile, const TopoDS_Wire& spine,
-                                     int orientation) {
+                                     int orientation, const TopoDS_Wire& guide = TopoDS_Wire()) {
     if (profile.IsNull() || spine.IsNull()) return TopoDS_Shape();
     try {
         BRepOffsetAPI_MakePipeShell mk(spine);
-        if (orientation == 2)      mk.SetMode(gp_Dir(0, 0, 1));   // fixed binormal
+        if (!guide.IsNull())
+            // Auxiliary-spine (guide-curve) mode with BRepFill_ContactOnBorder: the
+            // section is homothetically scaled so its border rides the guide as it
+            // travels — a guide diverging from the spine grows the profile (SolidWorks
+            // guide curve), verified to reproduce the analytic frustum volume. NoContact
+            // (the default) only re-orients the section (invisible on a symmetric
+            // profile); plain Contact barely scales. CurvilinearEquivalence=true pairs
+            // spine and guide by relative arc length.
+            mk.SetMode(guide, /*CurvilinearEquivalence=*/Standard_True,
+                       BRepFill_ContactOnBorder);
+        else if (orientation == 2) mk.SetMode(gp_Dir(0, 0, 1));   // fixed binormal
         else if (orientation == 1) mk.SetMode(Standard_True);     // Frenet
         else                       mk.SetMode(Standard_False);    // CorrectedFrenet
         // Transition handling matters on a polyline spine with sharp corners
@@ -392,27 +406,34 @@ static TopoDS_Shape sweep_wire_solid(const TopoDS_Wire& profile, const TopoDS_Wi
 // pipes). Falls back to the simple BRepOffsetAPI_MakePipe over the face when the
 // shell sweeper can't close the outer solid. Empty shape only if everything fails.
 TopoDS_Shape sweep_profile(const TopoDS_Face& profile, const TopoDS_Wire& spine,
-                           int orientation) {
+                           int orientation, const std::vector<TopoDS_Wire>& guides) {
     if (profile.IsNull() || spine.IsNull()) return TopoDS_Shape();
     TopoDS_Wire outer = BRepTools::OuterWire(profile);
     if (outer.IsNull()) return TopoDS_Shape();
 
-    TopoDS_Shape solid = sweep_wire_solid(outer, spine, orientation);
+    // MakePipeShell drives a single auxiliary spine; honour the first guide.
+    const TopoDS_Wire guide = guides.empty() ? TopoDS_Wire() : guides.front();
+
+    TopoDS_Shape solid = sweep_wire_solid(outer, spine, orientation, guide);
     if (solid.IsNull()) {
         // Fallback: the classic pipe over the whole face. Less robust but covers
-        // simple straight/gently-curved spines where MakePipeShell is fussy.
-        try {
-            BRepOffsetAPI_MakePipe mk(spine, profile);
-            mk.Build();
-            if (mk.IsDone()) return mk.Shape();
-        } catch (const Standard_Failure&) {}
+        // simple straight/gently-curved spines where MakePipeShell is fussy. It
+        // cannot honour a guide, so a guided sweep skips it and fails cleanly
+        // rather than silently dropping the guide.
+        if (guide.IsNull()) {
+            try {
+                BRepOffsetAPI_MakePipe mk(spine, profile);
+                mk.Build();
+                if (mk.IsDone()) return mk.Shape();
+            } catch (const Standard_Failure&) {}
+        }
         return TopoDS_Shape();
     }
     // Subtract swept holes so washer / annular profiles yield hollow solids.
     for (TopExp_Explorer ex(profile, TopAbs_WIRE); ex.More(); ex.Next()) {
         TopoDS_Wire w = TopoDS::Wire(ex.Current());
         if (w.IsSame(outer)) continue;
-        TopoDS_Shape hole = sweep_wire_solid(w, spine, orientation);
+        TopoDS_Shape hole = sweep_wire_solid(w, spine, orientation, guide);
         if (!hole.IsNull()) {
             TopoDS_Shape cutres = cut(solid, hole);
             if (!cutres.IsNull()) solid = cutres;

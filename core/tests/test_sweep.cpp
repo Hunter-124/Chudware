@@ -9,8 +9,10 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <vector>
 
 #include <BRepAdaptor_Curve.hxx>
+#include <BRepCheck_Analyzer.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
@@ -116,6 +118,39 @@ TEST_CASE("circle profile swept along a 3-turn helix -> valid coil solid") {
     const double expect = kPi * a * a * arc;
     // 8% band: curvature + the planar end caps perturb the ideal tube volume.
     CHECK(solid_volume(solid) == doctest::Approx(expect).epsilon(0.08));
+}
+
+// --- 3b. GUIDE CURVE: a guide line that diverges from the straight spine scales the
+//         circular profile as it travels, so the same circle+spine that makes a plain
+//         cylinder instead sweeps into a truncated cone. The assertion is ANALYTIC:
+//         the profile radius grows linearly r0 -> r1 (it rides the guide's border), so
+//         the volume must equal the exact frustum (pi*L/3)(r0^2 + r0*r1 + r1^2). This
+//         both proves the guide is consumed AND that it scales the section correctly.
+TEST_CASE("guide curve scales the circular profile into an exact frustum") {
+    const double r0 = 2.0, r1 = 4.0, L = 10.0;
+    TopoDS_Face prof  = circle_face(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1), r0);
+    TopoDS_Wire spine = line_spine(gp_Pnt(0, 0, 0), gp_Pnt(0, 0, L));
+
+    const double cyl = solid_volume(geom::sweep_profile(prof, spine, 0));
+    REQUIRE(cyl == doctest::Approx(kPi * r0 * r0 * L).epsilon(1e-3));  // un-guided baseline
+
+    // Guide starts on the profile's rim (radius r0) and moves OUT to r1 over the same
+    // length, so the swept section grows linearly from r0 to r1.
+    std::vector<TopoDS_Wire> guides{line_spine(gp_Pnt(r0, 0, 0), gp_Pnt(r1, 0, L))};
+    TopoDS_Shape guided = geom::sweep_profile(prof, spine, 0, guides);
+    REQUIRE_FALSE(guided.IsNull());
+    CHECK(BRepCheck_Analyzer(guided).IsValid());
+    const double frustum = (kPi * L / 3.0) * (r0 * r0 + r0 * r1 + r1 * r1);
+    CHECK(solid_volume(guided) == doctest::Approx(frustum).epsilon(0.02));
+    CHECK(solid_volume(guided) > 2.0 * cyl);  // the guide clearly added material
+}
+
+// --- 3c. A guided sweep whose shell fails must NOT silently fall back to the plain
+//         (guide-ignoring) MakePipe — a null profile with a guide stays null.
+TEST_CASE("guided sweep does not fall back to an un-guided pipe on failure") {
+    TopoDS_Wire spine = line_spine(gp_Pnt(0, 0, 0), gp_Pnt(0, 0, 5));
+    std::vector<TopoDS_Wire> guides{line_spine(gp_Pnt(1, 0, 0), gp_Pnt(2, 0, 5))};
+    CHECK(geom::sweep_profile(TopoDS_Face(), spine, 0, guides).IsNull());
 }
 
 // --- 4. Sharp-cornered polyline path (an L-elbow): the RoundCorner transition must

@@ -21,6 +21,12 @@ std::string SketchPmSeam::previewFeatureId() const { return pm ? pm->previewFeat
 std::vector<std::string> SketchPmSeam::pathHighlightFeatureIds() const {
     return pm ? pm->pathHighlightFeatureIds() : std::vector<std::string>{};
 }
+std::vector<std::string> SketchPmSeam::spineFeatureIds() const {
+    return pm ? pm->spineFeatureIds() : std::vector<std::string>{};
+}
+std::string SketchPmSeam::activeWellKey() const {
+    return pm ? pm->activeWellKey() : std::string();
+}
 bool SketchPmSeam::wantsRegionPicker() const { return pm && pm->wantsRegionPicker(); }
 bool SketchPmSeam::sectionsAreOrdered() const { return pm && pm->sectionsAreOrdered(); }
 std::vector<nlohmann::json> SketchPmSeam::profilePicks() const {

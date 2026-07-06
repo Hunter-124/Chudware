@@ -2,8 +2,8 @@
 id: T-BL36
 title: FM reference/feature rows — replace left vertical bar with an animated border around the row background when selected/highlighted
 workstream: backlog
-owner: unassigned
-status: todo
+owner: opus-sweep
+status: doing
 priority: 3
 lane: app-gui
 kind: overhaul

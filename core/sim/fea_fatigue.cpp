@@ -98,7 +98,7 @@ ResolvedMesh resolve_mesh_for_overlay(const json& study) {
         opts.max_size_mm = study.value("max_size_mm", 0.0);
         opts.optimize = study.value("optimize", false);
         opts.algorithm3d = study.value("algorithm3d", 1);
-        MeshOut m = mesh_step(study["step_path"].get<std::string>(), opts);
+        MeshOut m = mesh_step_cached(study["step_path"].get<std::string>(), opts);
         if (m.ok) {
             rm.points = m.points;
             rm.tets = m.tets;

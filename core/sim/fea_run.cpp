@@ -4,7 +4,13 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iterator>
+#include <list>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -18,6 +24,41 @@ using nlohmann::json;
 namespace aicad::sim {
 
 namespace {
+
+// ── Mesh cache (memoize mesh_step) ───────────────────────────────────────────────
+// FNV-1a over a byte range, chainable so we can fold file bytes + each opts field.
+uint64_t fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+// Fold EVERY MeshOptions field into the key. The static_assert makes adding a field a
+// compile error here, so a new option can never be silently omitted (which would let the
+// cache return a stale mesh for changed settings). Fields hashed individually rather than
+// as raw struct bytes because struct padding is indeterminate (would defeat every hit).
+uint64_t mesh_opts_key(const MeshOptions& o, uint64_t h) {
+    static_assert(sizeof(MeshOptions) == 80,
+                  "MeshOptions size changed — a field was added/removed. Update mesh_opts_key "
+                  "to hash the new field(s), then update this expected size. The mesh cache "
+                  "MUST fold in every field or it can return a stale mesh for changed settings.");
+    h = fnv1a(&o.fineness, sizeof o.fineness, h);
+    h = fnv1a(&o.density, sizeof o.density, h);
+    h = fnv1a(&o.order, sizeof o.order, h);
+    h = fnv1a(&o.curvature, sizeof o.curvature, h);
+    h = fnv1a(&o.curv_elems_per_circle, sizeof o.curv_elems_per_circle, h);
+    h = fnv1a(&o.target_size_mm, sizeof o.target_size_mm, h);
+    h = fnv1a(&o.min_size_mm, sizeof o.min_size_mm, h);
+    h = fnv1a(&o.max_size_mm, sizeof o.max_size_mm, h);
+    h = fnv1a(&o.optimize, sizeof o.optimize, h);
+    h = fnv1a(&o.algorithm3d, sizeof o.algorithm3d, h);
+    h = fnv1a(&o.structured, sizeof o.structured, h);
+    h = fnv1a(&o.auto_type, sizeof o.auto_type, h);
+    h = fnv1a(&o.quad_surface, sizeof o.quad_surface, h);
+    h = fnv1a(&o.fallback_to_tet, sizeof o.fallback_to_tet, h);
+    h = fnv1a(&o.thin_wall_layers, sizeof o.thin_wall_layers, h);
+    return h;
+}
 
 // Round half-away-from-zero to `nd` decimals, matching Python's round() closely
 // enough for the summary fields (values are positive magnitudes here). Python's
@@ -127,7 +168,7 @@ bool resolve_mesh(const json& study, std::vector<double>& points, std::vector<in
         opts.quad_surface = study.value("quad_surface", false);
         opts.fallback_to_tet = study.value("fallback_to_tet", true);
         opts.thin_wall_layers = study.value("thin_wall_layers", 4.0);
-        MeshOut m = mesh_step(step_path, opts);
+        MeshOut m = mesh_step_cached(step_path, opts);
         if (!m.ok) {
             err = "mesh failed: " + m.error;
             return false;
@@ -723,6 +764,48 @@ nlohmann::json fea_run_thermal(const nlohmann::json& study) {
                  {{"max_temp_c", round_nd(r.max_temp, 4)}, {"min_temp_c", round_nd(r.min_temp, 4)}}},
                 {"flux_summary", flux_summary},
                 {"solver_notes", notes}};
+}
+
+// ── Mesh cache (public) ──────────────────────────────────────────────────────────
+// Memoize mesh_step keyed on STEP file CONTENTS + every MeshOptions field. Re-running a
+// study that changed only loads/material/fixtures reuses the mesh (the mesher is the #1 FEA
+// cost). Content-keyed (not path) because the caller may write a fresh temp STEP each solve.
+MeshOut mesh_step_cached(const std::string& step_path, const MeshOptions& options) {
+    // Hash the STEP bytes. On any read failure, skip the cache and mesh directly.
+    std::ifstream f(step_path, std::ios::binary);
+    if (!f) return mesh_step(step_path, options);
+    const std::string bytes((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+    if (bytes.empty()) return mesh_step(step_path, options);
+    uint64_t key = fnv1a(bytes.data(), bytes.size());
+    key = mesh_opts_key(options, key);
+
+    static std::mutex mtx;
+    static std::unordered_map<uint64_t, MeshOut> cache;  // key -> mesh
+    static std::list<uint64_t> lru;                       // most-recent at front
+    constexpr size_t kCap = 8;                            // bound memory (fine meshes are MBs)
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        auto it = cache.find(key);
+        if (it != cache.end()) {                          // HIT: identical geometry + options
+            lru.remove(key);
+            lru.push_front(key);
+            return it->second;
+        }
+    }
+    // MISS: mesh OUTSIDE the lock (mesh_step self-serializes), then store.
+    MeshOut m = mesh_step(step_path, options);
+    if (m.ok) {
+        std::lock_guard<std::mutex> lk(mtx);
+        cache[key] = m;
+        lru.remove(key);
+        lru.push_front(key);
+        while (lru.size() > kCap) {
+            cache.erase(lru.back());
+            lru.pop_back();
+        }
+    }
+    return m;
 }
 
 }  // namespace aicad::sim

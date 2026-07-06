@@ -135,4 +135,14 @@ inline constexpr double kPoorAspect = 10.0;
 MeshOut mesh_step(const std::string& step_path, double density, int order = 1);
 MeshOut mesh_step(const std::string& step_path, const MeshOptions& options);
 
+// mesh_step_cached — memoized mesh_step. Meshing (Netgen) is the #1 FEA cost, and it is
+// re-run on EVERY solve even when the user changed only loads / material / fixtures (which
+// do not affect the mesh). This memoizes the result keyed on the STEP file CONTENTS (not the
+// path — callers may write a fresh temp file per solve) combined with EVERY MeshOptions
+// field, so an unchanged geometry + mesh settings reuses the mesh instead of re-meshing.
+// The key can never false-HIT (a hit requires byte-identical geometry AND identical options),
+// only safe false-MISS (re-mesh). Thread-safe; bounded LRU cache. On any file-read failure it
+// falls back to a direct mesh_step. Drop-in replacement for the options overload above.
+MeshOut mesh_step_cached(const std::string& step_path, const MeshOptions& options);
+
 }  // namespace aicad::sim

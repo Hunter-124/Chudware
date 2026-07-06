@@ -1,0 +1,30 @@
+{
+  "challenge": "C6",
+  "criteria": [
+    {
+      "id": "AC1",
+      "text": "bore re-bored to d25 H7 (sliding-fit basis)",
+      "result": "FAIL",
+      "detail": "no bore dimension recorded in ledger"
+    },
+    {
+      "id": "AC2",
+      "text": "sliding-fit clearance for d25 h7 shaft in band",
+      "result": "FAIL",
+      "detail": "no fit_bore decision with a clearance value"
+    },
+    {
+      "id": "AC3",
+      "text": "bolt circle preserved (4 holes, unchanged from C1)",
+      "result": "FAIL",
+      "detail": "bolt circle has None holes, expected 4 (preserved)"
+    },
+    {
+      "id": "AC4",
+      "text": "verify_battery PASS (coherent geometry)",
+      "result": "FAIL",
+      "detail": "no verify_battery artifact recorded"
+    }
+  ],
+  "passed": false
+}

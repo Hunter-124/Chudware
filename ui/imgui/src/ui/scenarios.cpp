@@ -501,6 +501,8 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantAiEffortSimple   = eq("ai_effort_simple");
     cfg.wantAiEffortAdvanced = eq("ai_effort_advanced");
     cfg.wantAiEffortWarn     = eq("ai_effort_warn");
+    // T-DP12: auto mode — workflow_router tier-defaults readout
+    cfg.wantAiEffortAuto     = eq("ai_effort_auto");
     cfg.wantGlassperf = eq("glassperf");
     if (cfg.wantGlassperf) seedChatShot(st);  // bubble rendering included in the measured frame
 
@@ -525,9 +527,10 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
         settingsUi().openSettings = true;
         settingsUi().openSettingsTab = 3;
     }
-    // T-W28: AI Effort shots — open the modal on the AI tab; the effort model is
-    // seeded from a committed fixture below (no python subprocess in shot mode).
-    if (cfg.wantAiEffortSimple || cfg.wantAiEffortAdvanced || cfg.wantAiEffortWarn) {
+    // T-W28 / T-DP12: AI Effort shots — open the modal on the AI tab; the effort
+    // model is seeded from a committed fixture below (no python subprocess in shot mode).
+    if (cfg.wantAiEffortSimple || cfg.wantAiEffortAdvanced || cfg.wantAiEffortWarn ||
+        cfg.wantAiEffortAuto) {
         settingsUi().openSettings = true;
         settingsUi().openSettingsTab = 1;
     }
@@ -684,12 +687,13 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
         }
         std::fflush(stdout);
     }
-    // T-W28: seed the AI Effort section from a committed effort view fixture.
-    if (cfg.wantAiEffortSimple || cfg.wantAiEffortAdvanced || cfg.wantAiEffortWarn) {
+    // T-W28 / T-DP12: seed the AI Effort section from a committed effort view fixture.
+    if (cfg.wantAiEffortSimple || cfg.wantAiEffortAdvanced || cfg.wantAiEffortWarn || cfg.wantAiEffortAuto) {
         std::string fx;
         if (findFixturesDir(fx)) {
             const char* which = cfg.wantAiEffortWarn       ? "/effort/effort_view_warn.json"
                                 : cfg.wantAiEffortAdvanced ? "/effort/effort_view_advanced.json"
+                                : cfg.wantAiEffortAuto     ? "/effort/effort_view_auto.json"
                                                            : "/effort/effort_view.json";
             const std::string vf = fx + which;
             const std::string json = readWholeFile(vf);

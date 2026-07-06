@@ -10,6 +10,14 @@
 // writes it exclusively through the effort.py CLI (get / set / validate) —
 // resolution and warnings live in Python, never re-implemented here.
 // Offline/shot mode seeds from a committed view fixture.
+//
+// T-DP12 extension: three modes — auto | simple | advanced.
+//   auto     — default; the workflow_router (T-DP10) classifies each task and
+//              self-selects the scaffold level; GUI shows informational tier
+//              defaults + a description of the auto logic.
+//   simple   — manual 4-level dial (Eco → Maximum).
+//   advanced — full per-tier knob editor (deliberation / parallelization /
+//              safety / context groups), exposed behind the toggle.
 
 #include <string>
 #include <utility>
@@ -59,14 +67,25 @@ struct EffortTier {
     std::vector<std::string> warnings;      // warn-never-block advisories
 };
 
+// T-DP12: auto-mode router readout — one entry per tier showing the scaffold
+// level the workflow_router defaults to for that tier (informational, not editable
+// in auto mode).
+struct AutoRouterTierDefault {
+    std::string tier;           // "local-24k" | "local-48k" | "mid" | "frontier"
+    std::string scaffoldLevel;  // "eco" | "standard" | "deliberate" | "maximum"
+};
+
 struct AiEffortModel {
     EffortState state = EffortState::Idle;
-    std::string level = "standard";         // active preset
-    std::string mode  = "simple";           // simple | advanced
+    std::string level = "standard";         // active preset (used in simple mode)
+    std::string mode  = "auto";             // auto | simple | advanced (T-DP12)
     std::vector<EffortLevel>    levels;     // dial order (eco → maximum)
     std::vector<EffortKnobMeta> knobMeta;   // grouped knob catalog
     std::vector<EffortTier>     tiers;
     int selectedTier = 0;                   // advanced-mode tier being edited
+    // T-DP12: auto-mode readout (populated from auto_router in the view JSON).
+    std::string autoRouterDescription;
+    std::vector<AutoRouterTierDefault> autoRouterDefaults;
     std::string statusText;
     std::string errorMsg;
 };

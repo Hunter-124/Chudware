@@ -99,6 +99,8 @@ struct ShotConfig {
     bool wantAiEffortSimple = false;    // simple mode, 4-level dial
     bool wantAiEffortAdvanced = false;  // advanced mode, grouped knobs + overrides
     bool wantAiEffortWarn = false;      // advanced mode with warn-never-block advisories
+    // T-DP12: auto mode — workflow_router tier-defaults readout
+    bool wantAiEffortAuto = false;
 
     // Long-running scenario modes (ScenarioRunner step machines)
     bool wantM1 = false;

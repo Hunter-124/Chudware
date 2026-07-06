@@ -322,7 +322,9 @@ void Application::frame() {
         ImGui::SetNextWindowPos(ImVec2(vp4->WorkPos.x + vp4->WorkSize.x * 0.5f,
                                        vp4->WorkPos.y + vp4->WorkSize.y * 0.5f),
                                 ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-        ImGui::SetNextWindowSize(ImVec2(560.f * theme::S(), 540.f * theme::S()),
+        // T-DP11: dp_stream shots need a taller window to show the stream table.
+        const float transH = ui::isDPStreamShot() ? 820.f : 540.f;
+        ImGui::SetNextWindowSize(ImVec2(560.f * theme::S(), transH * theme::S()),
                                  ImGuiCond_Appearing);
         if (ImGui::Begin("Model & Telemetry###transparency", ui::transparencyPanelOpen(), pflags))
             ui::drawTransparencyPanel(s);

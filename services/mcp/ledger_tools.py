@@ -1,8 +1,9 @@
-"""Ledger MCP tools — ``ledger_get`` and ``ledger_note``.
+"""Ledger MCP tools — ``ledger_get``, ``ledger_note``, and ``ledger_events``.
 
 Family: ``ledger``.  Risk classes are auto-detected from tool names:
-  - ``ledger_get``  → classified as ``read``  (added to _READ_EXACT in tool_registry)
-  - ``ledger_note`` → classified as ``write`` (default)
+  - ``ledger_get``    → classified as ``read``  (added to _READ_EXACT in tool_registry)
+  - ``ledger_events`` → classified as ``read``  (added to _READ_EXACT in tool_registry)
+  - ``ledger_note``   → classified as ``write`` (default)
 
 Schema: contracts/advisor.md §2 (``aicad.ledger/1``).
 """
@@ -12,7 +13,7 @@ from typing import Any
 
 
 def register_ledger_tools(mcp) -> None:
-    """Register ``ledger_get`` and ``ledger_note`` under the ``ledger`` family."""
+    """Register ``ledger_get``, ``ledger_note``, and ``ledger_events``."""
 
     @mcp.tool()
     def ledger_get(
@@ -45,6 +46,60 @@ def register_ledger_tools(mcp) -> None:
         rendered = ledger_render(ledger, budget_tokens)
         return {"ok": True, "run_id": run_id, "rendered": rendered,
                 "event_count": len(ledger.events)}
+
+    @mcp.tool()
+    def ledger_events(
+        run_id: str,
+        kinds: list[str] | None = None,
+        after_seq: int = -1,
+        limit: int = 200,
+    ) -> dict:
+        """Return raw ledger events for *run_id*, for the GUI transparency stream.
+
+        ``kinds`` filters to specific event kinds (e.g. ["advisory", "audit",
+        "delegation", "trigger_fired"]).  Omit to return all kinds.
+        ``after_seq`` returns only events with seq > after_seq (cursor for live
+        polling; pass the last known seq to get only new events).
+        ``limit`` caps the number of events returned (default 200).
+
+        Each event has: seq, ts, actor, kind, payload.
+        The GUI transparency panel (T-DP11) uses this to render the live
+        action stream: advisory/audit/tool events, council votes, delegation
+        transitions, and auto-applied fixes.
+        """
+        try:
+            from services.agent.ledger import Ledger
+        except ImportError:
+            from agent.ledger import Ledger  # type: ignore
+
+        try:
+            ledger = Ledger.load(run_id)
+        except Exception as exc:
+            return {"ok": False, "error": f"ledger load failed: {exc}",
+                    "run_id": run_id, "events": []}
+
+        kinds_set = set(kinds) if kinds else None
+        result: list[dict] = []
+        for ev in ledger.events:
+            seq = ev.get("seq", 0)
+            if seq <= after_seq:
+                continue
+            if kinds_set is not None and ev.get("kind") not in kinds_set:
+                continue
+            result.append(ev)
+            if len(result) >= limit:
+                break
+
+        total = len(ledger.events)
+        last_seq = result[-1]["seq"] if result else after_seq
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "events": result,
+            "count": len(result),
+            "total_events": total,
+            "last_seq": last_seq,
+        }
 
     @mcp.tool()
     def ledger_note(

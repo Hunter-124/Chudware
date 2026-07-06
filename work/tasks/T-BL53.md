@@ -51,3 +51,10 @@ out of scope here) and does NOT commit the untracked `discord_bot.py` (leave tha
 
 - Stats/leaderboard use `git log --all` so unmerged-branch commits count immediately.
 - Reuse `nd._git`, `nd._main_worktree`, `nd.COLORS`, `nd._roadblocks`; match the `_embed` dict shape.
+
+## Progress log
+- 2026-07-06 21:38 UTC [gissa] [gissa/opus-sweep] 2026-07-06 â€” DONE, in review. Branch task/T-BL53-discord-stats pushed (commit 3a777d2f, +161 lines, purely additive to notify_discord.py â€” zero edits to existing notify/poll/hook logic). Implemented the 5 helpers discord_bot.py imports: _compute_stats, _stats_embed, _leaderboard_embed, _digest_embed, _recent_screenshots (+ small private helpers). All git-author-derived (git log --all so unmerged-branch commits count); owners from work.py board --json (doing/review); leaderboard folds identity_aliases.
+
+TESTED locally against real git data with discord.py 2.7.1: discord.Embed.from_dict validated all 3 embeds (stats/leaderboard/digest), no empty field values. Sample: all-time leaderboard = Hunter-124 2506, gissa 105, opus-wynn 38; 7-day stats total 2155 commits/5 contributors; daily digest 186 commits, board 200/241 done, +3 screenshots. All bot stats/leaderboard/digest/screenshot imports now resolve.
+
+OUT OF SCOPE (flagged, not done): discord_bot.py's bootstrap still needs nd._get (REST-GET guild resolution) to actually launch the Gateway process â€” that's separate bot-startup work, not part of the stats feature. discord_bot.py + requirements-discord-bot.txt remain UNTRACKED (left for their owner; not committed here). NOT merged, NOT done.

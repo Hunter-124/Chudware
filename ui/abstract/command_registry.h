@@ -13,7 +13,18 @@ namespace cmd {
 
 enum class Workspace {
     Model, Sketch, SheetMetal, Weldment, Surface, Assemble, Drafting,
-    Simulate, Schematic, Board, _count
+    Simulate, Schematic, Board,
+    // T-DP15: full-viewport global workspaces (doc-type independent)
+    AiAgent,          // AI-Agent full-screen workspace (body: T-DP16)
+    PlmManagement,    // PLM project hub full-screen workspace (body: R-stack)
+    _count
+};
+
+// T-DP15: workspace render mode — whether the workspace owns the full screen
+// (no glass overlay columns) or hosts the viewport with pinned glass columns.
+enum class WorkspaceKind {
+    OverlayHosting,  // viewport + pinned glass FeatureManager (left) + Copilot (right)
+    FullViewport,    // takes the full screen; no glass overlay columns
 };
 
 enum class Group {
@@ -60,6 +71,13 @@ const char* groupLabel    (Group g);
 
 // Workspaces offered for a document type, in display order.
 std::vector<Workspace> workspacesFor(DocType d);
+
+// T-DP15: render kind for a workspace (OverlayHosting or FullViewport).
+WorkspaceKind workspaceKind(Workspace w);
+
+// T-DP15: global workspaces available regardless of doc type (AiAgent, PlmManagement).
+// Rendered as a second cluster in the workspace bar, separated by a divider.
+std::vector<Workspace> globalWorkspaces();
 
 // Top-level commands in a workspace (excludes Flyout + Variant), grouped, in table order.
 std::vector<const Command*> topCommands(Workspace w);

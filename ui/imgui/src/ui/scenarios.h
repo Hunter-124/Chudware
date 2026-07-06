@@ -87,6 +87,20 @@ struct ShotConfig {
     bool wantAgentDagCompact = false;   // compact mode — graph only
     bool agentDagShotDone    = false;
 
+    // T-DP15: workspace-kind shots — prove overlay columns present/absent per workspace kind.
+    // ws_overlay_hosting: Modeling workspace — glass left+right columns visible over viewport.
+    // ws_full_viewport_ecad: Schematic workspace — ECAD editor fills screen, no glass columns.
+    // ws_ai_agent: AI-Agent workspace — full-viewport shell, no glass columns.
+    // ws_plm: PLM workspace — full-viewport shell, no glass columns.
+    bool wantWsOverlayHosting   = false;
+    bool wsOverlayHostingShotDone = false;
+    bool wantWsFullViewportEcad = false;
+    bool wsFullViewportEcadShotDone = false;
+    bool wantWsAiAgent          = false;
+    bool wsAiAgentShotDone      = false;
+    bool wantWsPlm              = false;
+    bool wsPlmShotDone          = false;
+
     // T-G22: per-tab settings shots + composer dropdown + permissions popup
     bool wantSettingsGeneral = false;
     bool wantSettingsAI = false;

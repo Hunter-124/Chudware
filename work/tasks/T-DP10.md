@@ -36,3 +36,6 @@ task-class, feeding the router's classifier — measured, never guessed.
       honest numbers).
 - [ ] Router consumes the tuning output; a task-class picks its measured-best config (test).
 - [ ] gate.sh PASS; graphify update.
+
+## Progress log
+- 2026-07-06 01:06 UTC [sonnet-birch2] Router + tuning loop shipped. Real gym: C1 (multi_feature_part) + C6 (modification), eco vs maximum, local-24k, qwen3-4b CUDA. Both configs tied at pass=0/1 (both fail at plan phase, dag_error — no core). Router reads tuning_results.json, falls back to local=full (maximum) per contract §7 when tied. 34 router tests + 12 tuning tests pass. gate.sh PASS. Branch pushed.

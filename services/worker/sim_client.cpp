@@ -73,9 +73,37 @@ std::string SimClient::stage() const {
     return progStage_;
 }
 
+int SimClient::pct() const {
+    std::lock_guard<std::mutex> lk(progMtx_);
+    return progPct_;
+}
+
 std::string SimClient::recentLog() const {
     std::lock_guard<std::mutex> lk(progMtx_);
     return progLog_;
+}
+
+std::vector<std::pair<std::string, float>> SimClient::stageTimes() const {
+    std::lock_guard<std::mutex> lk(progMtx_);
+    return stageDur_;
+}
+
+// Roll the wall-time accrued in the currently-timed stage into stageDur_, then arm the
+// timer for nextStage. Passing the same name (or "" at completion) just flushes the
+// running stage. O(1) — called once per stage transition, never per event/element.
+void SimClient::stampStageLocked(const std::string& nextStage) {
+    long long nowNs = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (!stageStartName_.empty() && stageStartNs_ != 0) {
+        float secs = static_cast<float>(static_cast<double>(nowNs - stageStartNs_) * 1e-9);
+        bool merged = false;
+        for (auto& kv : stageDur_)
+            if (kv.first == stageStartName_) { kv.second += secs; merged = true; break; }
+        if (!merged) stageDur_.emplace_back(stageStartName_, secs);
+    }
+    stageStartName_ = nextStage;
+    stageStartNs_   = nextStage.empty() ? 0 : nowNs;
 }
 
 float SimClient::elapsedSeconds() const {
@@ -115,7 +143,11 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
     {
         std::lock_guard<std::mutex> lk(progMtx_);
         progStage_ = "Starting";
+        progPct_ = 0;
         progLog_.clear();
+        stageDur_.clear();
+        stageStartName_.clear();
+        stageStartNs_ = 0;
     }
     launchNs_.store(static_cast<long long>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -145,7 +177,16 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
             // Update the live progress display (read before ev is moved into the queue).
             {
                 std::lock_guard<std::mutex> lk(progMtx_);
-                if (!ev.stage.empty()) progStage_ = ev.stage;
+                if (!ev.stage.empty()) {
+                    // On a real stage change, flush the prior stage's duration (O(1)) and
+                    // zero the bar so a bare pct=0 opener can't leave the new stage showing
+                    // the previous stage's fill.
+                    if (ev.stage != progStage_) { stampStageLocked(ev.stage); progPct_ = 0; }
+                    progStage_ = ev.stage;
+                }
+                // pct is 0..100 for the current stage; a bare-omitted pct arrives as 0,
+                // so only advance the bar (never rewind it) within a stage.
+                if (ev.pct > 0) progPct_ = ev.pct;
                 if (!ev.text.empty())  progLog_   = ev.text;
             }
             std::lock_guard<std::mutex> lk(job_.evMtx);
@@ -175,7 +216,13 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
         job_.ready = true;
         job_.running = false;
         launchNs_.store(0LL);
-        { std::lock_guard<std::mutex> lk(progMtx_); progStage_.clear(); progLog_.clear(); }
+        {
+            std::lock_guard<std::mutex> lk(progMtx_);
+            stampStageLocked("");   // flush the final (usually longest) stage into stageDur_
+            progStage_.clear();
+            progPct_ = 0;
+            progLog_.clear();
+        }
     }).detach();
 
     consoleNote = "[sim] launched " + method;

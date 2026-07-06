@@ -5,8 +5,11 @@
 #include "theme/theme.h"
 #include "imgui.h"
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace ui {
 
@@ -132,7 +135,17 @@ void drawStatusBar(AppState& s, float height) {
         std::string lg  = live ? s.simClient.recentLog()
                                : std::string("assembling stiffness matrix (12,480 nodes)");
         float elapsed   = live ? s.simClient.elapsedSeconds() : 7.f;
-        auto prettyStage = [](const std::string& stgIn) -> std::string {
+        int   pct       = live ? s.simClient.pct() : 42;
+        std::vector<std::pair<std::string, float>> stageTimes =
+            live ? s.simClient.stageTimes()
+                 : std::vector<std::pair<std::string, float>>{{"voxelize", 1.4f}, {"mesh", 2.3f}};
+
+        // Ordered pipeline stages the user watches march past. The current stage fills by
+        // pct; earlier stages read as done; later ones as pending.
+        static const char* kStageKey[]   = {"voxelize", "mesh", "assemble", "solve", "post"};
+        static const char* kStageLabel[] = {"Voxelize", "Mesh", "Assemble", "Solve", "Post"};
+        constexpr int kNStages = 5;
+        auto prettyStage = [&](const std::string& stgIn) -> std::string {
             if (stgIn == "voxelize") return "Voxelizing";
             if (stgIn == "mesh")     return "Meshing";
             if (stgIn == "assemble") return "Assembling";
@@ -141,13 +154,87 @@ void drawStatusBar(AppState& s, float height) {
             if (stgIn == "post")     return "Post-processing";
             return stgIn.empty() ? "Solving" : stgIn;
         };
+        // "stream" shares the solve/post cursor position; map it onto the last index.
+        int curIdx = 0;
+        for (int i = 0; i < kNStages; ++i) if (stg == kStageKey[i]) { curIdx = i; break; }
+        if (stg == "stream" || stg == "post") curIdx = kNStages - 1;
+
+        // Bottom-left current operation (verbatim ask): keep AppState::status current even
+        // in the forced demo, where tick() does not run.  Prettified, specific, prominent.
+        // Use an ASCII hyphen separator: the em-dash (U+2014) is absent from the viewport
+        // font atlas and renders as '?'.
+        std::string op = prettyStage(stg);
+        if (!lg.empty()) op += "  -  " + lg;
+        if (pct > 0)     op += "  (" + std::to_string(pct) + "%)";
+        if (simForce) s.status = std::string("Sim: ") + op;
+
+        // The chip: spinner + current op.  Followed by a segmented stage bar.
         std::string chip = std::string("Sim ") + kSpin[si] + "  " + prettyStage(stg);
-        if (!lg.empty()) chip += "  \xe2\x80\x94  " + lg;
+        if (!lg.empty()) chip += "  -  " + lg;
         chip += "  (" + std::to_string(static_cast<int>(elapsed)) + "s)";
         ImGui::SameLine();
         drawGlassChip(chip.c_str(), theme::pal().good, true);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Click to focus the Simulation pane");
+        if (ImGui::IsItemClicked())
+            s.workspace = cmd::Workspace::Simulate;
+
+        // ---- segmented per-stage progress bar --------------------------------------
+        // One cell per pipeline stage: completed = good, current filled to pct = accent,
+        // pending = bg2.  Drawn manually (ImGui::ProgressBar can't segment) with theme
+        // roles only (gate ui_style_check flags literal IM_COL32).
+        ImGui::SameLine();
+        const float S      = theme::S();
+        const float cellW  = theme::U(2.6f);
+        const float gapW   = theme::U(0.35f);
+        const float barH   = ImGui::GetTextLineHeight() * 0.55f;
+        ImVec2 bp = ImGui::GetCursorScreenPos();
+        bp.y += (ImGui::GetTextLineHeight() - barH) * 0.5f;
+        ImDrawList* bdl = ImGui::GetWindowDrawList();
+        const float rnd = barH * 0.35f;
+        const ImU32 cDone    = theme::rgba(theme::pal().good);
+        const ImU32 cCur     = theme::rgba(theme::pal().accent);
+        const ImU32 cPending = theme::rgba(theme::pal().bg2);
+        const ImU32 cBorder  = theme::roleU32A(theme::pal().line, 0.5f);
+        for (int i = 0; i < kNStages; ++i) {
+            float x0 = bp.x + i * (cellW + gapW);
+            float x1 = x0 + cellW;
+            ImVec2 c0(x0, bp.y), c1(x1, bp.y + barH);
+            if (i < curIdx) {
+                bdl->AddRectFilled(c0, c1, cDone, rnd);
+            } else if (i == curIdx) {
+                bdl->AddRectFilled(c0, c1, cPending, rnd);
+                float f = (pct <= 0 ? 0.06f : (pct >= 100 ? 1.f : pct / 100.f));
+                bdl->AddRectFilled(c0, ImVec2(x0 + (x1 - x0) * f, c1.y), cCur, rnd);
+            } else {
+                bdl->AddRectFilled(c0, c1, cPending, rnd);
+            }
+            bdl->AddRect(c0, c1, cBorder, rnd, 0, 1.f * S);
+        }
+        float barTotalW = kNStages * cellW + (kNStages - 1) * gapW;
+        // InvisibleButton (not Dummy) so the bar region reliably reports hover AND takes a
+        // click — Dummy() does not consume mouse clicks.
+        ImGui::InvisibleButton("##sim_stage_bar", ImVec2(barTotalW, barH));
+
+        // Hover the bar for the per-stage timing breakdown ("which part dominated") + the
+        // ordered stage list with the current one marked.
+        if (ImGui::IsItemHovered()) {
+            std::string tip = "Simulation pipeline\n";
+            for (int i = 0; i < kNStages; ++i) {
+                const char* mark = i < curIdx ? "[x] " : (i == curIdx ? "[>] " : "[ ] ");
+                tip += mark; tip += kStageLabel[i];
+                if (i == curIdx && pct > 0) tip += "  " + std::to_string(pct) + "%";
+                tip += "\n";
+            }
+            if (!stageTimes.empty()) {
+                tip += "\nPer-stage time:";
+                for (const auto& kv : stageTimes) {
+                    char b[64];
+                    std::snprintf(b, sizeof(b), "\n  %s  %.1fs", kv.first.c_str(), kv.second);
+                    tip += b;
+                }
+            }
+            tip += "\n\nClick to focus the Simulation pane";
+            ImGui::SetTooltip("%s", tip.c_str());
+        }
         if (ImGui::IsItemClicked())
             s.workspace = cmd::Workspace::Simulate;
     }

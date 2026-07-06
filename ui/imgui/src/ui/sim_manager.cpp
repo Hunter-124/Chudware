@@ -1290,8 +1290,26 @@ void SimManager::tick(app::AppState& st) {
             if (!job.events.empty()) evs.swap(job.events);
         }
         for (auto& ev : evs) {
-            if (!ev.text.empty())
-                st.status = "Sim: " + ev.text + (ev.pct ? " (" + std::to_string(ev.pct) + "%)" : "");
+            if (!ev.text.empty() || !ev.stage.empty()) {
+                // Bottom-left current operation: "Meshing — surface pass (42%)" so the user
+                // can tell which part we are waiting on. Prefix the prettified stage (never
+                // the raw token) and keep it free of "fail/warn/error" so the status-bar
+                // colour classifier does not misread a normal solve as an error.
+                auto pretty = [](const std::string& s) -> std::string {
+                    if (s == "voxelize") return "Voxelizing";
+                    if (s == "mesh")     return "Meshing";
+                    if (s == "assemble") return "Assembling";
+                    if (s == "solve")    return "Solving";
+                    if (s == "stream")   return "Streaming results";
+                    if (s == "post")     return "Post-processing";
+                    if (s == "Starting") return "Starting";
+                    return s;
+                };
+                std::string op = pretty(ev.stage);
+                if (!ev.text.empty()) op += (op.empty() ? "" : " - ") + ev.text;
+                if (ev.pct) op += " (" + std::to_string(ev.pct) + "%)";
+                st.status = op;
+            }
             if (ev.hasTrace) {
                 int traceStudy = -1;
                 if (!runningStudyId_.empty())

@@ -12,6 +12,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <chrono>
@@ -64,11 +65,17 @@ public:
 
     // Thread-safe progress readouts consumed by the status bar while busy() == true.
     // stage()       — current solver phase ("mesh", "assemble", "solve", "post", …)
+    // pct()         — 0..100 completion of the CURRENT stage (last streamed pct)
     // recentLog()   — most recent human-readable event text from the worker
     // elapsedSeconds() — wall seconds since the job was launched (0 if idle)
+    // stageTimes()  — accumulated wall seconds per completed stage, in first-seen order
+    //                 (e.g. {{"mesh",2.3f},{"solve",5.1f}}); lets the UI show which
+    //                 phase dominated. The in-flight stage is included once it has run.
     std::string stage() const;
+    int         pct() const;
     std::string recentLog() const;
     float       elapsedSeconds() const;
+    std::vector<std::pair<std::string, float>> stageTimes() const;
 
     // Launch a sim_* method on a background thread. `params` is the full RPC params object
     // (e.g. {"study": {...}} or {"stl_path":..., "direction":..., ...}). The job streams
@@ -104,8 +111,17 @@ private:
     // thread via the accessors above.  progMtx_ is mutable so the const accessors can lock it.
     mutable std::mutex     progMtx_;
     std::string            progStage_;        // current solver phase
+    int                    progPct_ = 0;      // 0..100 completion of the current stage
     std::string            progLog_;          // last human-readable event text
     std::atomic<long long> launchNs_{0LL};   // steady_clock ns at launch; 0 when idle
+
+    // Per-stage timing (transparency): first-seen order + accumulated seconds. Stamped
+    // O(1) on each stage change and once more at completion so the final (usually longest)
+    // stage is recorded. Guarded by progMtx_.
+    std::vector<std::pair<std::string, float>> stageDur_;  // completed/running stage -> seconds
+    std::string            stageStartName_;   // stage currently being timed
+    long long              stageStartNs_ = 0; // steady_clock ns when stageStartName_ began
+    void stampStageLocked(const std::string& nextStage);   // requires progMtx_ held
 };
 
 }  // namespace core

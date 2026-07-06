@@ -699,6 +699,20 @@ if(AICAD_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME mesh_quality COMMAND test_mesh_quality)
   set_tests_properties(mesh_quality PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
+
+  # Advanced multi-feature parts (boss+pocket+chamfer, hole array, stepped fillet) built via
+  # OCCT B-rep -> STEP -> mesh_step (tet10) + fea_run_static: asserts mesh-quality invariants
+  # (no inverted/degenerate elements, positive volumes), a finite plausible static solve
+  # (nonzero disp+stress, finite FoS), and a generous per-part wall-clock ceiling ("optimized
+  # enough to run"). Same OCCT + Netgen DLL PATH prepend as the other mesher tests.
+  add_executable(test_mesher_advanced tests/test_mesher_advanced.cpp)
+  target_include_directories(test_mesher_advanced PRIVATE
+    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_mesher_advanced PRIVATE aicad_mesh aicad_geom_occt)
+  set_target_properties(test_mesher_advanced PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME mesher_advanced COMMAND test_mesher_advanced)
+  set_tests_properties(mesher_advanced PROPERTIES ENVIRONMENT_MODIFICATION "${_fatigue_envmod}")
   endif()  # AICAD_WITH_NETGEN
 
   # FEA boundary-surface extractor: fea_surface_body (the result-plot display surface,

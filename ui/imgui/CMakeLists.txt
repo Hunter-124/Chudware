@@ -110,8 +110,13 @@ if(WIN32)
     # MSVC 14.51 (VS 2026): UCRT <cmath> is missing C99 float math declarations in the global
     # namespace; force-include the shim on C++ TUs only (parity with host/CMakeLists.txt — X1/T-WIN1).
     # ui/imgui keeps its OWN copy (extern/fix_math.h) so it survives the host/ deletion (T-G11).
+    # Use the SHELL: prefix so /FI and the (space-containing) absolute path tokenize as two
+    # args on EVERY generator. The plain /FI"path" form worked under the VS generator (MSBuild
+    # re-quotes) but under Ninja the embedded quotes became literal chars in the filename
+    # (C1083 "cannot open '\"...fix_math.h\"'") — the exact trap that broke the windows-app
+    # preset (T-G11 X1). SHELL: + a space-separated, quoted path fixes both generators.
     target_compile_options(AI-CAD2 PRIVATE
-      $<$<COMPILE_LANGUAGE:CXX>:/FI"${CMAKE_CURRENT_SOURCE_DIR}/extern/fix_math.h">)
+      "$<$<COMPILE_LANGUAGE:CXX>:SHELL:/FI \"${CMAKE_CURRENT_SOURCE_DIR}/extern/fix_math.h\">")
   endif()
 else()
   target_compile_definitions(AI-CAD2 PRIVATE AICAD_HAVE_BRIDGE=1

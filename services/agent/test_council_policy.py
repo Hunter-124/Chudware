@@ -316,3 +316,114 @@ def test_backward_compat_no_policy_args():
     assert len(record["positions"]) == 4
     # No 'policy' key when no stage/tier given
     assert "policy" not in record
+
+
+# ---------------------------------------------------------------------------
+# 13. regen_diagnosis fix-stage council wiring (T-DP8 stage 2)
+# ---------------------------------------------------------------------------
+
+def test_diagnose_fix_council_local_tier():
+    """diagnose() with council_tier=local-24k convenes a fix council (policy=enabled)."""
+    import json as _json
+
+    # Minimal failing document (dangling ref in selector format)
+    doc = {
+        "tree": {
+            "features": [
+                {
+                    "id": "f1", "op": "extrude",
+                    "refs": {"features": [{"owner_feature": "f99", "kind": "face"}]},
+                },
+            ]
+        }
+    }
+
+    pos_reply = _typed_position("repoint_ref is the correct fix", [], [])
+    synth_reply = _json.dumps({
+        "decision": "apply repoint_ref",
+        "rationale": "seats agree",
+        "rejected_alternatives": [],
+    })
+
+    class _DiagProvider:
+        name = "diag_mock"
+        calls: list = []
+
+        def complete(self, system: str, messages: list, max_tokens: int = 8000,
+                     **kwargs) -> str:
+            self.__class__.calls.append(system[:30])
+            if "CHAIR" in system or "synthesize" in system.lower():
+                return synth_reply
+            # Diagnosis reply (structured JSON)
+            if "fix_ops" in system or "regen" in system.lower():
+                return _json.dumps({"diagnosis": "dangling ref", "fix_ops": [
+                    {"op": "repoint_ref", "feature_id": "f1", "param": "refs",
+                     "old_value": "f99", "new_value": None}
+                ]})
+            return pos_reply
+
+    from services.agent.regen_diagnosis import diagnose
+
+    _DiagProvider.calls = []
+    result = diagnose(
+        doc,
+        _DiagProvider(),
+        wrap_logging=False,
+        council_tier="local-24k",
+    )
+
+    # Council was invoked (record is not None)
+    assert result.council_record is not None, "Expected council_record for local-24k"
+    cr = result.council_record
+    assert cr["schema"] == "aicad.council/1"
+    assert cr["kind"] == "failure_review"
+    # 4 seats for local-24k fix stage
+    assert len(cr["positions"]) == 4
+    assert cr["policy"]["tier"] == "local-24k"
+    assert cr["policy"]["breadth"] == 4
+
+
+def test_diagnose_fix_council_frontier_skipped():
+    """diagnose() with council_tier=frontier skips the council (policy=disabled)."""
+    import json as _json
+
+    doc = {"tree": {"features": [
+        {"id": "f1", "op": "extrude",
+         "refs": {"features": [{"owner_feature": "f99", "kind": "face"}]}}
+    ]}}
+
+    class _SimpleProv:
+        name = "simple"
+        def complete(self, system: str, messages: list, max_tokens: int = 8000, **kw) -> str:
+            return _json.dumps({"diagnosis": "ok", "fix_ops": []})
+
+    from services.agent.regen_diagnosis import diagnose
+
+    result = diagnose(
+        doc,
+        _SimpleProv(),
+        wrap_logging=False,
+        council_tier="frontier",
+    )
+
+    # Council was NOT invoked for frontier fix stage (policy.enabled=False)
+    assert result.council_record is None, (
+        f"Expected council_record=None for frontier fix, got {result.council_record}"
+    )
+
+
+def test_diagnose_no_council_when_tier_omitted():
+    """diagnose() without council_tier never invokes a council (backward compat)."""
+    import json as _json
+
+    doc = {"tree": {"features": []}}
+
+    class _P:
+        name = "p"
+        def complete(self, system: str, messages: list, max_tokens: int = 8000, **kw) -> str:
+            return _json.dumps({"diagnosis": "ok", "fix_ops": []})
+
+    from services.agent.regen_diagnosis import diagnose
+
+    result = diagnose(doc, _P(), wrap_logging=False)
+    assert result.council_record is None

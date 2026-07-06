@@ -141,16 +141,23 @@ def register_org_tools(mcp) -> None:
         kind: str,
         topic: str,
         inputs: Optional[dict] = None,
+        stage: Optional[str] = None,
+        tier: Optional[str] = None,
     ) -> dict:
         """Convene a council (§19: build_strategy | spec_review | failure_review | ...).
 
-        Runs a full 2-round, 4-seat deliberation (manufacturing / tolerancing /
+        Runs a full 2-round deliberation (manufacturing / tolerancing /
         fitment / simplicity) and returns the aicad.council/1 record.  Seats run
         as ponder delegations (kind='ponder', auto-approved, §12).
 
         The council record is written as a ledger artifact; the synthesis is also
         written as a decision event.  Dissents are registered in the mission's
         DissentsRegistry so the foreman can watch trigger_conditions.
+
+        T-DP8: ``stage`` and ``tier`` are optional — when omitted they are read
+        from the mission context automatically.  They drive the council policy
+        engine (breadth / diverse-model selection).  Local tiers run wide (all 4
+        seats); frontier runs narrow (1 seat, cost-minimising).
 
         Returns the completed council record dict.
         """
@@ -160,10 +167,18 @@ def register_org_tools(mcp) -> None:
             provider = getattr(ctx, "provider", None) if ctx else None
             ledger = getattr(ctx, "ledger", None) if ctx else None
             registry = getattr(ctx, "dissents_registry", None) if ctx else None
+            # T-DP8: read stage/tier from mission context when not explicitly given.
+            ctx_stage: Optional[str] = getattr(ctx, "stage", None) if ctx else None
+            ctx_tier: Optional[str] = getattr(ctx, "tier", None) if ctx else None
+            # Multiple providers for diverse-model selection (T-DP8).
+            ctx_providers: Optional[list] = getattr(ctx, "providers", None) if ctx else None
         except Exception:  # noqa: BLE001
             provider = None
             ledger = None
             registry = None
+            ctx_stage = None
+            ctx_tier = None
+            ctx_providers = None
 
         if provider is None:
             return {
@@ -174,6 +189,9 @@ def register_org_tools(mcp) -> None:
                 "status": "failed",
             }
 
+        resolved_stage = stage or ctx_stage
+        resolved_tier = tier or ctx_tier
+
         from services.agent.councils import council_convene as _convene
         return _convene(
             kind=kind,
@@ -182,4 +200,7 @@ def register_org_tools(mcp) -> None:
             provider=provider,
             ledger=ledger,
             registry=registry,
+            providers=ctx_providers if ctx_providers else None,
+            stage=resolved_stage,
+            tier=resolved_tier,
         )

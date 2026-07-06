@@ -11,8 +11,24 @@ int main() {
     assert(cmd::find("__no_such_cmd__") == nullptr);
 
     auto partWs = cmd::workspacesFor(cmd::DocType::Part);
-    assert(partWs.size() == 5);
+    // Part doc-scoped workspaces: Model, Sketch3D, SheetMetal, Weldment, Surface, Simulate
+    assert(partWs.size() == 6);
     assert(partWs[0] == cmd::Workspace::Model);
+
+    // Global workspaces always available from any doc type (second cluster in the bar).
+    auto gws = cmd::globalWorkspaces();
+    assert(!gws.empty());
+    bool hasManufacture = false, hasPartsLibrary = false;
+    for (auto w : gws) {
+        if (w == cmd::Workspace::Manufacture)  hasManufacture  = true;
+        if (w == cmd::Workspace::PartsLibrary) hasPartsLibrary = true;
+    }
+    assert(hasManufacture);
+    assert(hasPartsLibrary);
+
+    // workspaceKind: Manufacture=OverlayHosting, PartsLibrary=FullViewport
+    assert(cmd::workspaceKind(cmd::Workspace::Manufacture)  == cmd::WorkspaceKind::OverlayHosting);
+    assert(cmd::workspaceKind(cmd::Workspace::PartsLibrary) == cmd::WorkspaceKind::FullViewport);
 
     // palette() dedupes by id (stable table order).
     int extrudeCount = 0;

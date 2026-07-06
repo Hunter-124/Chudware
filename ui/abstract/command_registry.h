@@ -17,6 +17,9 @@ enum class Workspace {
     // T-DP15: full-viewport global workspaces (doc-type independent)
     AiAgent,          // AI-Agent full-screen workspace (body: T-DP16)
     PlmManagement,    // PLM project hub full-screen workspace (body: R-stack)
+    // workspace-framework: global always-visible workspaces (tab strip step 1)
+    Manufacture,      // CAM / machining workspace — OverlayHosting (delegates to drawCamManager)
+    PartsLibrary,     // Standard parts / catalog browser — FullViewport
     _count
 };
 

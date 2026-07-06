@@ -68,8 +68,12 @@ void drawWorkspaceBar(AppState& s, float height) {
             }
         }
 
-        // --- T-DP15: global full-viewport workspaces (doc-type independent) ---
-        // AiAgent + PlmManagement available from any doc type; separated by a faint divider.
+        // --- Global workspaces (always visible, doc-type independent) ---
+        // Strip order: AI | ECAD | Simulate | Manufacture | PLM | Parts
+        // Dedup: skip any global workspace already shown in the doc-scoped cluster above so a
+        // Part doc (which already shows Simulate) doesn't show it twice.
+        // Open-or-focus: ECAD/Simulate clicks navigate to an appropriate doc context; they do
+        // not dead-end when the active doc type doesn't support the workspace directly.
         {
             auto gws = cmd::globalWorkspaces();
             if (!gws.empty()) {
@@ -77,9 +81,54 @@ void drawWorkspaceBar(AppState& s, float height) {
                 dl->AddLine(ImVec2(sp.x, sp.y+4*S), ImVec2(sp.x, sp.y+height-8*S), TCOL(line), ImMax(1.f,S));
                 ImGui::SameLine(0, 10*S);
                 for (cmd::Workspace w : gws) {
+                    // Dedup: skip if this workspace is already shown in the doc-scoped cluster.
+                    bool inDocScoped = false;
+                    for (auto dw : wss) if (dw == w) { inDocScoped = true; break; }
+                    if (inDocScoped) continue;
+
                     bool active = (s.workspace == w);
-                    if (chip(cmd::workspaceLabel(w), cmd::workspaceIcon(w), cmd::workspaceLabel(w), active, false))
-                        { s.workspace = w; s.activeTool.clear(); s.camActive = false; }
+                    // Label override: Schematic tab reads as "ECAD" at the global level.
+                    const char* label = (w == cmd::Workspace::Schematic) ? "ECAD"
+                                      : cmd::workspaceLabel(w);
+                    const char* icon  = cmd::workspaceIcon(w);
+                    if (chip(cmd::workspaceLabel(w), icon, label, active, false)) {
+                        // Open-or-focus: ECAD/Simulate on an incompatible doc opens new context.
+                        cmd::DocType dt = s.docType();
+                        if (w == cmd::Workspace::Schematic || w == cmd::Workspace::Board) {
+                            // ECAD: if doc is already a Schematic or PCB just switch workspace,
+                            // otherwise request a new Schematic doc (dispatch to app handler).
+                            if (dt == cmd::DocType::Schematic) {
+                                s.workspace = cmd::Workspace::Schematic;
+                            } else if (dt == cmd::DocType::Pcb) {
+                                s.workspace = cmd::Workspace::Board;
+                            } else {
+                                // No ECAD doc open — dispatch new-schematic intent.
+                                s.dispatch("ecad_new_sch");
+                            }
+                        } else if (w == cmd::Workspace::Simulate) {
+                            // Simulate: valid on Part and Assembly. On ECAD/Drawing docs, open
+                            // a new Part doc first (or just set workspace if already compatible).
+                            if (dt == cmd::DocType::Part || dt == cmd::DocType::Assembly) {
+                                s.workspace = cmd::Workspace::Simulate;
+                            } else {
+                                // Focus first Part/Assembly tab that has a sim study, or fall
+                                // through to just switching workspace optimistically.
+                                for (int i = 0; i < (int)s.docTabs.size(); ++i) {
+                                    auto& tab = s.docTabs[i];
+                                    if (tab.kind == core::DocTabKind::Part ||
+                                        tab.kind == core::DocTabKind::Assembly) {
+                                        s.switchToTab(i);
+                                        break;
+                                    }
+                                }
+                                s.workspace = cmd::Workspace::Simulate;
+                            }
+                        } else {
+                            s.workspace = w;
+                        }
+                        s.activeTool.clear();
+                        s.camActive = false;
+                    }
                 }
             }
         }

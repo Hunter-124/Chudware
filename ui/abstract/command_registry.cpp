@@ -165,6 +165,12 @@ static const Command T[] = {
 { "view_style",           "Display",         "section_props",  W::Surface,  G::Appearance, K::Top,    nullptr,           "shaded wireframe edges display style hidden" },
 
 // ---- SIMULATE -------------------------------------------------------------
+// Reference-geometry commands reuse the SAME ids as Model/Manufacture — dispatch unchanged.
+// Sim setups need reference planes/axes for loads, symmetry BCs, and motion axis definitions.
+{ "ref_plane",            "Plane",           "ref_plane",      W::Simulate, G::Construct, K::Top,      nullptr,           "datum reference" },
+{ "ref_axis",             "Axis",            "ref_axis",       W::Simulate, G::Construct, K::Top,      nullptr,           "datum line" },
+{ "ref_point",            "Point",           "ref_point",      W::Simulate, G::Construct, K::Top,      nullptr,           "datum vertex" },
+
 { "sim_new_static",       "New Study",       "sim_static",     W::Simulate, G::Study,     K::Top,      nullptr,           "fea stress" },
 { "sim_new_modal",        "Modal Study",     "sim_modal",      W::Simulate, G::Study,     K::Flyout,   "sim_new_static",  "frequency vibration" },
 { "sim_new_flow",         "Flow Study",      "sim_flow",       W::Simulate, G::Study,     K::Flyout,   "sim_new_static",  "cfd aero" },
@@ -247,6 +253,58 @@ static const Command T[] = {
 { "ecad_export_gerber",   "Gerbers",         "gerber",         W::Board,    G::Output,    K::Top,      nullptr,           "fabrication" },
 { "ecad_export_drill",    "Drill",           "hole",           W::Board,    G::Output,    K::Top,      nullptr,           "nc" },
 { "ecad_export_bom",      "BOM",             "bom",            W::Board,    G::Output,    K::Top,      nullptr,           nullptr },
+
+// ---- MANUFACTURE (CAM) -------------------------------------------------------
+// Reference-geometry commands reuse the SAME ids as Model so dispatch is unchanged
+// (the registry allows duplicate ids in different workspaces; find() returns first match).
+{ "ref_plane",            "Plane",           "ref_plane",      W::Manufacture, G::Construct, K::Top,   nullptr,           "datum reference" },
+{ "ref_axis",             "Axis",            "ref_axis",       W::Manufacture, G::Construct, K::Top,   nullptr,           "datum line" },
+{ "ref_point",            "Point",           "ref_point",      W::Manufacture, G::Construct, K::Top,   nullptr,           "datum vertex" },
+
+// Job management
+{ "cam_new_job",          "New Job",         "ws_model",       W::Manufacture, G::New,       K::Top,   nullptr,           "cam machining program" },
+{ "cam_extract",          "Extract Geometry","mass_props",     W::Manufacture, G::Setup,     K::Top,   nullptr,           "stock geometry source" },
+{ "cam_add_setup",        "Add Setup",       "ref_plane",      W::Manufacture, G::Setup,     K::Top,   nullptr,           "wcs work coordinate" },
+{ "cam_add_tool",         "Add Tool",        "hole",           W::Manufacture, G::Setup,     K::Top,   nullptr,           "tool library" },
+
+// 2.5D operations
+{ "cam_op_face",          "Face",            "extrude",        W::Manufacture, G::Create,    K::Top,   nullptr,           "facing surfacing" },
+{ "cam_op_contour",       "Contour",         "sweep",          W::Manufacture, G::Create,    K::Top,   nullptr,           "profile 2d contour" },
+{ "cam_op_pocket",        "Pocket",          "subtract",       W::Manufacture, G::Create,    K::Top,   nullptr,           "2d pocket" },
+{ "cam_op_adaptive",      "Adaptive",        "combine",        W::Manufacture, G::Create,    K::Flyout,"cam_op_pocket",   "adaptive clearing trochoidal" },
+{ "cam_op_slot",          "Slot",            "sk_slot",        W::Manufacture, G::Create,    K::Flyout,"cam_op_pocket",   "slot milling" },
+{ "cam_op_chamfer",       "Chamfer",         "chamfer",        W::Manufacture, G::Create,    K::Flyout,"cam_op_pocket",   "deburr chamfer mill" },
+{ "cam_op_engrave",       "Engrave",         "sk_text",        W::Manufacture, G::Create,    K::Flyout,"cam_op_pocket",   "vcarve text" },
+{ "cam_op_drill",         "Drill",           "hole",           W::Manufacture, G::Create,    K::Top,   nullptr,           "drilling boring" },
+{ "cam_op_thread",        "Thread Mill",     "coil",           W::Manufacture, G::Create,    K::Flyout,"cam_op_drill",    "tapping helix" },
+
+// 3D operations
+{ "cam_op_parallel3d",    "Parallel",        "loft",           W::Manufacture, G::Modify,    K::Top,   nullptr,           "3d parallel finishing" },
+{ "cam_op_waterline3d",   "Waterline",       "revolve",        W::Manufacture, G::Modify,    K::Top,   nullptr,           "3d contour scallop" },
+{ "cam_op_scallop3d",     "Scallop",         "surf_offset",    W::Manufacture, G::Modify,    K::Flyout,"cam_op_waterline3d","3d scallop equidistant" },
+{ "cam_op_pocket3d",      "3D Pocket",       "subtract",       W::Manufacture, G::Modify,    K::Flyout,"cam_op_waterline3d","3d pocket rest machining" },
+
+// Turning
+{ "cam_op_turn_rough",    "Rough Turn",      "revolve",        W::Manufacture, G::Pattern,   K::Top,   nullptr,           "lathe turning roughing" },
+{ "cam_op_turn_finish",   "Finish Turn",     "revolve",        W::Manufacture, G::Pattern,   K::Flyout,"cam_op_turn_rough","lathe turning finishing" },
+{ "cam_op_turn_face",     "Face Turn",       "extrude",        W::Manufacture, G::Pattern,   K::Flyout,"cam_op_turn_rough","lathe facing" },
+{ "cam_op_turn_part",     "Part Off",        "split",          W::Manufacture, G::Pattern,   K::Flyout,"cam_op_turn_rough","parting cutoff" },
+
+// Other
+{ "cam_op_laser",         "Laser Cut",       "sk_trim",        W::Manufacture, G::Pattern,   K::Top,   nullptr,           "laser plasma waterjet" },
+{ "cam_op_probe",         "Probe",           "check",          W::Manufacture, G::Inspect,   K::Top,   nullptr,           "probing measurement" },
+
+// Simulate + post-process
+{ "cam_generate",         "Generate",        "run_study",      W::Manufacture, G::Run,       K::Top,   nullptr,           "toolpath compute" },
+{ "cam_simulate",         "Simulate",        "sim_flow",       W::Manufacture, G::Run,       K::Top,   nullptr,           "material removal verify" },
+{ "cam_post",             "Post Process",    "save",           W::Manufacture, G::Output,    K::Top,   nullptr,           "gcode nc program" },
+
+// ---- PARTS LIBRARY -----------------------------------------------------------
+// Full-viewport catalog browser — body: workspace_parts.cpp (phase-2 agent fills this).
+{ "parts_search",         "Search Parts",    "std_parts",      W::PartsLibrary, G::Place,    K::Top,   nullptr,           "catalog fastener standard part search" },
+{ "parts_insert",         "Insert Part",     "insert_component",W::PartsLibrary,G::Place,    K::Top,   nullptr,           "add standard part" },
+{ "parts_favorites",      "Favorites",       "star",           W::PartsLibrary, G::Display,  K::Top,   nullptr,           "bookmarks saved" },
+{ "parts_history",        "Recently Used",   "history",        W::PartsLibrary, G::Display,  K::Flyout,"parts_favorites",  "recent" },
 };
 
 static const int N = (int)(sizeof(T)/sizeof(T[0]));
@@ -266,6 +324,8 @@ const char* workspaceLabel(Workspace w) {
         case W::Schematic: return "Schematic";   case W::Board: return "Board";
         case W::AiAgent:       return "AI Agent";       // T-DP15
         case W::PlmManagement: return "PLM";            // T-DP15
+        case W::Manufacture:   return "Manufacture";    // workspace-framework
+        case W::PartsLibrary:  return "Parts Library";  // workspace-framework
         default: return "?";
     }
 }
@@ -279,6 +339,8 @@ const char* workspaceIcon(Workspace w) {
         case W::Schematic: return "ws_schematic";case W::Board: return "ws_board";
         case W::AiAgent:       return "ai_design";      // T-DP15 (reuse ai_design icon)
         case W::PlmManagement: return "history";         // T-DP15 (reuse history icon)
+        case W::Manufacture:   return "ws_model";       // workspace-framework (no dedicated icon yet; reuse ws_model)
+        case W::PartsLibrary:  return "std_parts";      // workspace-framework
         default: return "ws_model";
     }
 }
@@ -313,20 +375,32 @@ std::vector<Workspace> workspacesFor(DocType d) {
     return { W::Model };
 }
 
-// T-DP15: workspace render kind — four workspaces own the full screen.
+// T-DP15: workspace render kind — full-viewport workspaces own the entire screen.
+// Manufacture = OverlayHosting: shares viewport + reference-geometry commands with Model.
+// PartsLibrary = FullViewport: catalog browser takes the full screen (no 3D scene needed).
 WorkspaceKind workspaceKind(Workspace w) {
     switch (w) {
         case W::Schematic:     return WorkspaceKind::FullViewport;
         case W::Board:         return WorkspaceKind::FullViewport;
         case W::AiAgent:       return WorkspaceKind::FullViewport;
         case W::PlmManagement: return WorkspaceKind::FullViewport;
+        case W::PartsLibrary:  return WorkspaceKind::FullViewport;
+        // Manufacture = OverlayHosting (delegates to CAM panel inside the 3D viewport area)
+        case W::Manufacture:   return WorkspaceKind::OverlayHosting;
         default:               return WorkspaceKind::OverlayHosting;
     }
 }
 
-// T-DP15: global workspaces available from any doc type (second cluster in the bar).
+// workspace-framework: global workspaces always visible regardless of doc type.
+// Target strip order: Model(doc-scoped) | AI | ECAD | Simulate | Manufacture | PLM | Parts
+// ECAD (Schematic) and Simulate are doc-scoped for Part/Assembly too; workspace_bar deduplicates
+// — it suppresses a global tab when that workspace is already visible in the doc-scoped cluster
+// for the active doc type. Click handler must open-or-focus the appropriate doc context rather
+// than dead-ending (e.g. ECAD on a Part doc opens a new Schematic doc, or focuses existing one).
 std::vector<Workspace> globalWorkspaces() {
-    return { W::AiAgent, W::PlmManagement };
+    // Second cluster in the tab strip (right of doc-scoped tabs), in display order.
+    // Schematic stands in for "ECAD" per label override in workspace_bar.
+    return { W::AiAgent, W::Schematic, W::Simulate, W::Manufacture, W::PlmManagement, W::PartsLibrary };
 }
 
 std::vector<const Command*> topCommands(Workspace w) {

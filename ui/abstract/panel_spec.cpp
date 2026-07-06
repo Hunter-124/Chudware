@@ -658,7 +658,10 @@ static const std::vector<PanelSpec>& forms() {
         // --- surf_revolve --- refs.profile[]/axis; params angle.
         { "surf_revolve", "Revolved Surface", "revolve_boss", {
             Well  ("profile", "Profile", "Revolve", K_FACE, true),
-            Well  ("axis",    "Axis",    "Revolve", K_EDGE, false),
+            // Axis accepts an edge OR a datum axis (K_EDGEAXIS), mirroring the solid revolve form
+            // above — a datum axis (e.g. axis.z) must route into the well. (Shared-schema port of
+            // the host-only T-BL35 fix, which patched host/pm_forms.cpp but not this copy.)
+            Well  ("axis",    "Axis",    "Revolve", K_EDGEAXIS, false),
             Angle ("angle",   "Angle",   "Revolve", 360.0),
         }},
         // --- surf_sweep --- refs.profile[]/path/guides[]; no params.

@@ -37,3 +37,4 @@ section. Inline in the popup (settings consolidation rule — no floating window
 
 ## Progress log
 - 2026-07-06 01:49 UTC [sonnet-sorrel2] T-DP12: built + pushed. 3-mode effort UI (Auto|Simple|Advanced) in AI tab. All 22 effort tests + 34 workflow_router tests pass, ui_style_check clean. Shots: ai_effort_auto (router tier-defaults table), ai_effort_simple (4-level dial), ai_effort_advanced (knob editor) all verified. gate.sh running.
+- 2026-07-06 02:13 UTC [sonnet-sorrel2] T-DP12 complete. gate.sh PASS (FAIL-RECORDED items pre-existing). Shots verified: ai_effort_auto (auto mode with tier-defaults table), ai_effort_simple (4-level dial with new 3-button mode switcher), ai_effort_advanced (knob editor). 22 effort tests + 34 workflow_router tests + 118 combined suite pass. ui_style_check: 0 findings. Branch pushed: task/T-DP12-model-prefs-settings.

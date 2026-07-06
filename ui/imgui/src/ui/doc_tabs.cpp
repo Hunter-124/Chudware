@@ -293,6 +293,9 @@ float drawDocTabs(AppState& st, float availW) {
     }
     if (!open) s_confirmCloseIdx = -1;
 
+    // Section-view switcher: right-aligned chip row for linked views of the active part.
+    drawSectionSwitcher(st, bandR, y0, barH);
+
     ImGui::SetCursorScreenPos(origin);
     ImGui::Dummy(ImVec2(availW, barH));
 
@@ -315,6 +318,162 @@ float drawDocTabs(AppState& st, float availW) {
     }
 
     return barH;
+}
+
+// ---- Section-view switcher ---------------------------------------------------
+// Compact right-aligned chip row in the doc tab strip showing linked views of the
+// active part: Model | CAM Job | Sim Study | Drawing. Switching clicks change both
+// the active tab and the workspace together so the user lands in the right context.
+//
+// Link sources (what IS enumerable today):
+//   - Drawing: DocTab::drawingDocId — a Drawing tab whose drawingDocId == active part docId
+//   - CAM Job: st.camActive — the CAM manager is live for this doc
+//   - Sim Study: workspace==Simulate means a study exists/is active for this doc
+//   - Model: the Part/Assembly tab itself (always present when a part is open)
+//
+// When a true linked-doc graph exists (core/doc), expand from tabIndexForDocId to that graph.
+// Returns the width consumed (placed right-of-tabs, right-aligned to bandR).
+float drawSectionSwitcher(AppState& st, float bandR, float y0, float barH) {
+    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return 0.f;
+    const DocTab& active = st.docTabs[st.activeTab];
+    // Only show for Part and Assembly docs (drawings/ECAD/etc. have no linked views yet).
+    if (active.kind != DocTabKind::Part && active.kind != DocTabKind::Assembly) return 0.f;
+
+    const float S = theme::S();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // Gather link entries: {label, icon, tabIdx (-1=ws-only), targetWorkspace}
+    struct Entry {
+        const char* label;
+        const char* icon;
+        int   tabIdx;         // -1 = no tab switch, just workspace switch
+        cmd::Workspace ws;
+        bool  isCurrent;      // true = this view is already active
+    };
+    Entry entries[4];
+    int nEntries = 0;
+
+    // 1. Model (always — the Part/Assembly tab itself)
+    {
+        const bool cur = (st.workspace != cmd::Workspace::Simulate &&
+                          !st.camActive &&
+                          st.workspace != cmd::Workspace::Drafting);
+        entries[nEntries++] = { active.kind == DocTabKind::Assembly ? "Asm" : "Model",
+                                active.kind == DocTabKind::Assembly ? "assembly" : "ws_model",
+                                st.activeTab, cmd::Workspace::Model, cur };
+    }
+
+    // 2. CAM Job (present when camActive is true for this doc)
+    if (st.camActive) {
+        entries[nEntries++] = { "CAM Job", "ws_model",
+                                st.activeTab, cmd::Workspace::Model, false };
+        // Mark Model entry as non-current since CAM takeover is active
+        entries[0].isCurrent = false;
+        entries[nEntries - 1].isCurrent = true;
+    }
+
+    // 3. Sim Study (present when workspace is Simulate for this doc)
+    if (st.workspace == cmd::Workspace::Simulate) {
+        entries[nEntries - (st.camActive ? 2 : 1)].isCurrent = false; // Model no longer current
+        entries[nEntries++] = { "Sim Study", "sim_static",
+                                st.activeTab, cmd::Workspace::Simulate, true };
+    }
+
+    // 4. Drawing (find co-open Drawing tab whose drawingDocId matches active docId)
+    {
+        int dwgTab = -1;
+        if (!active.docId.empty()) {
+            for (int i = 0; i < (int)st.docTabs.size(); ++i) {
+                if (st.docTabs[i].kind == DocTabKind::Drawing &&
+                    st.docTabs[i].drawingDocId == active.docId) {
+                    dwgTab = i;
+                    break;
+                }
+            }
+        }
+        if (dwgTab >= 0) {
+            const bool cur = (st.activeTab == dwgTab && st.workspace == cmd::Workspace::Drafting);
+            entries[nEntries++] = { "Drawing", "section_props", dwgTab, cmd::Workspace::Drafting, cur };
+        }
+    }
+
+    if (nEntries <= 1) return 0.f;  // only "Model" itself — nothing to switch to
+
+    // Measure total width of the switcher block to right-align it.
+    ImFont* f = theme::font(theme::Font::Label);
+    const float chipH = barH * 0.76f;
+    const float icSz  = 12.f * S;
+    const float padX  = 8.f * S;
+    const float gap   = 3.f * S;
+    float totalW = padX;  // leading margin
+    for (int i = 0; i < nEntries; ++i) {
+        ImVec2 ts = f->CalcTextSizeA(f->FontSize, FLT_MAX, 0, entries[i].label);
+        totalW += icSz + 5.f * S + ts.x + padX * 1.6f + gap;
+    }
+    totalW += padX * 0.5f;  // trailing margin
+
+    float startX = bandR - totalW;
+    const float chipY  = y0 + (barH - chipH) * 0.5f;
+
+    // Separator line left of the switcher block
+    dl->AddLine(ImVec2(startX - padX * 0.5f, y0 + 4.f * S),
+                ImVec2(startX - padX * 0.5f, y0 + barH - 4.f * S),
+                TCOL(line), ImMax(1.f, S));
+
+    // Resolve glass surface (same adaptive surface as the band, already computed this frame)
+    const ImRect bandRect(ImVec2(startX, y0), ImVec2(bandR, y0 + barH));
+    const theme::AdaptiveSurface& surf =
+        theme::adaptivePanel(theme::panelId("doctabs_glass"), bandRect);
+
+    float x = startX + padX * 0.5f;
+    for (int i = 0; i < nEntries; ++i) {
+        const Entry& e = entries[i];
+        ImVec2 ts = f->CalcTextSizeA(f->FontSize, FLT_MAX, 0, e.label);
+        const float chipW = icSz + 5.f * S + ts.x + padX * 1.6f;
+        const ImVec2 p0(x, chipY);
+        const ImVec2 p1(x + chipW, chipY + chipH);
+
+        ImGui::SetCursorScreenPos(p0);
+        char bid[32]; std::snprintf(bid, sizeof(bid), "##svsw%d", i);
+        const bool clicked = ImGui::InvisibleButton(bid, ImVec2(chipW, chipH));
+        const bool hov     = ImGui::IsItemHovered();
+
+        // Background pill
+        const float r = chipH * 0.45f;
+        if (e.isCurrent) {
+            dl->AddRectFilled(p0, p1, TCOL(accent), r);
+        } else if (hov) {
+            theme::glassPanel(dl, ImRect(p0, p1), theme::MaterialLevel::UltraThin, r / S, surf);
+        }
+
+        // Icon + label
+        const ImU32 fg = e.isCurrent
+            ? TCOL(onAccent)
+            : ImGui::ColorConvertFloat4ToU32(hov ? surf.textPrimary : surf.textSecondary);
+        icons::draw(dl, e.icon,
+                    ImVec2(x + padX * 0.8f + icSz * 0.5f, chipY + chipH * 0.5f),
+                    icSz, fg);
+        dl->AddText(f, f->FontSize,
+                    ImVec2(x + padX * 0.8f + icSz + 5.f * S, chipY + (chipH - f->FontSize) * 0.5f),
+                    fg, e.label);
+
+        if (hov) ImGui::SetTooltip("%s", e.label);
+
+        if (clicked && !e.isCurrent) {
+            if (e.tabIdx >= 0 && e.tabIdx != st.activeTab)
+                s_switchTo = e.tabIdx;
+            st.workspace   = e.ws;
+            st.activeTool.clear();
+            // CAM: activate/deactivate camActive based on whether we're switching TO the CAM entry.
+            // The "CAM Job" entry keeps camActive=true; Model/Sim/Drawing entries clear it.
+            if (e.ws == cmd::Workspace::Model && std::strcmp(e.label, "CAM Job") != 0)
+                st.camActive = false;
+        }
+
+        x += chipW + gap;
+    }
+
+    return totalW;
 }
 
 void createNewDoc(AppState& st, int kindOrd) {

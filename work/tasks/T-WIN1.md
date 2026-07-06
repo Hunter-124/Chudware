@@ -190,3 +190,4 @@ RESULTS:
 
 NEEDS LINUX-SIDE REVIEW: none. Every change is if(WIN32)/if(MSVC)-guarded; Linux else() path
 byte-for-byte unchanged. NOTHING duplicated/split into a per-OS tree â€” host/ stays deleted.
+- 2026-07-06 21:13 UTC [gissa] [gissa/opus-sweep] 2026-07-06 â€” PR IS NOW OPEN (correcting the earlier "PR not opened via CLI" note): https://github.com/Hunter-124/CAD/pull/18 â€” "T-WIN1: Windows 11 bring-up of the unified GUI", base master <- head task/T-WIN1-windows-bringup, state open. Opened via the GitHub REST API using the existing git credential (no gh CLI / no browser OAuth needed). Task stays in review awaiting human merge â€” NOT merged, NOT marked done.

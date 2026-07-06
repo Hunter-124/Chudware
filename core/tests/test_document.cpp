@@ -799,6 +799,83 @@ TEST_CASE("sweep along a sketch path -> exact cylinder") {
     CHECK(count_surf(b, /*cylinder*/ 1) >= 1);  // a cylindrical wall exists
 }
 
+// 6a-guide. GUIDE CURVE end-to-end through the document layer: the same profile+path
+//    that sweeps a plain cylinder, given a guide SKETCH that diverges from the path,
+//    scales the section up into a truncated cone. Proves the engine (a) accepts the
+//    guides SelList in the schema, (b) resolves the region selector the GUI emits, and
+//    (c) actually consumes the guide — the guided volume must clearly exceed the plain
+//    sweep. This is the layer the GUI + MCP flow through (the user-reported gap).
+TEST_CASE("guide curve scales a swept profile end-to-end (document layer)") {
+    const double R = 4.0, Hh = 20.0;
+    auto prof_sketch = [&] {
+        json p; p["id"] = "prof"; p["type"] = "sketch"; p["plane"] = "top";
+        p["entities"] = json::array({circle("e1", 0, 0, R)});
+        p["constraints"] = json::array({
+            rel("c1", "fix", {"e1.center"}), dim("c2", "radius", {"e1"}, R)});
+        return p;
+    };
+    auto path_sketch = [&] {
+        json p; p["id"] = "path"; p["type"] = "sketch"; p["plane"] = "front";
+        p["entities"] = json::array({line("e1", 0, 0, 0, Hh)});
+        p["constraints"] = json::array({
+            rel("c1", "fix", {"e1.p1"}), rel("c2", "vertical", {"e1"}),
+            dim("c3", "distance", {"e1.p1", "e1.p2"}, Hh)});
+        return p;
+    };
+    // Guide on Front: sketch (R,0)->(2R,Hh) => world (R,0,0)->(2R,0,Hh). Starts on the
+    // profile rim (contact), diverging +X as it rises, so the section grows R -> 2R.
+    json guide; guide["id"] = "guide"; guide["type"] = "sketch"; guide["plane"] = "front";
+    guide["entities"] = json::array({line("e1", R, 0, 2 * R, Hh)});
+    guide["constraints"] = json::array({
+        rel("c1", "fix", {"e1.p1"}), rel("c2", "fix", {"e1.p2"})});
+
+    json base; base["features"] = json::array({prof_sketch(), path_sketch(),
+        json{{"id", "sw"}, {"type", "sweep"}, {"profile", "prof"}, {"path", "path"}}});
+    CompileResult rb = compile_document(base, json::object());
+    REQUIRE(rb.ok);
+
+    // The guides ref uses the exact region selector PropertyManager::routePathFeature
+    // emits for a sketch pick: {"kind":"region","sketch":<fid>}, wrapped in a SelList.
+    json g; g["features"] = json::array({prof_sketch(), path_sketch(), guide,
+        json{{"id", "sw"}, {"type", "sweep"}, {"profile", "prof"}, {"path", "path"},
+             {"guides", json::array({json{{"kind", "region"}, {"sketch", "guide"}}})}}});
+    CompileResult rg = compile_document(g, json::object());
+    for (const auto& s : rg.statuses) if (!s.ok) MESSAGE("feat " << s.id << ": " << s.error);
+    REQUIRE(rg.ok);
+    REQUIRE(rg.body_count == 1);
+    MESSAGE("guided vol=" << rg.volume << " un-guided vol=" << rb.volume);
+    CHECK(rg.volume > 1.4 * rb.volume);  // the guide grew the section (frustum >> cylinder)
+}
+
+// 6a-guide-reject. A guide identical to the path is rejected loudly (not silently swept
+//    guide-blind), so the user gets a clear message instead of a confusing result.
+TEST_CASE("sweep rejects a guide curve identical to the path") {
+    const double R = 4.0, Hh = 20.0;
+    json prof; prof["id"] = "prof"; prof["type"] = "sketch"; prof["plane"] = "top";
+    prof["entities"] = json::array({circle("e1", 0, 0, R)});
+    prof["constraints"] = json::array({
+        rel("c1", "fix", {"e1.center"}), dim("c2", "radius", {"e1"}, R)});
+    json path; path["id"] = "path"; path["type"] = "sketch"; path["plane"] = "front";
+    path["entities"] = json::array({line("e1", 0, 0, 0, Hh)});
+    path["constraints"] = json::array({
+        rel("c1", "fix", {"e1.p1"}), rel("c2", "vertical", {"e1"}),
+        dim("c3", "distance", {"e1.p1", "e1.p2"}, Hh)});
+
+    json doc; doc["features"] = json::array({prof, path,
+        json{{"id", "sw"}, {"type", "sweep"}, {"profile", "prof"}, {"path", "path"},
+             {"guides", json::array({json{{"kind", "region"}, {"sketch", "path"}}})}}});
+    CompileResult r = compile_document(doc, json::object());
+    CHECK_FALSE(r.ok);
+    bool sawSweep = false;
+    for (const auto& s : r.statuses)
+        if (s.id == "sw") {
+            sawSweep = true;
+            CHECK_FALSE(s.ok);
+            CHECK(s.error.find("guide") != std::string::npos);
+        }
+    CHECK(sawSweep);
+}
+
 // 6b. SWEEP BOSS FUSES into the running body (Bug H1). A base box, then a sweep boss
 //     whose swept cylinder OVERLAPS the box, must yield exactly ONE body — not two
 //     disjoint bodies (the H1 symptom, which also produced a degenerate negative

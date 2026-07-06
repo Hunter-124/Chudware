@@ -3210,9 +3210,56 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     else if (o == "keep_normal") orient = 2;
                 }
 
+                // Optional guide curve(s): each resolves to a wire the SAME way the
+                // path does — a whole sketch's raw wire, or a curve/helix datum lifted
+                // from its local frame through its base plane. A guide is an auxiliary
+                // spine that steers the profile's orientation + scaling as it sweeps
+                // (SolidWorks "Guide Curves"). MakePipeShell drives ONE auxiliary
+                // spine, so a single guide is supported; more than one is rejected
+                // loudly rather than silently dropped.
+                std::vector<TopoDS_Wire> guides;
+                if (auto git = feat.find("guides");
+                    git != feat.end() && git->is_array() && !git->empty()) {
+                    if (git->size() > 1)
+                        throw std::runtime_error(
+                            "sweep: only a single guide curve is supported — remove the "
+                            "extra guide(s) (multi-guide sweeps are not implemented yet)");
+                    const nlohmann::json& gsel = git->front();
+                    const std::string gid = selector_owner_id(gsel);
+                    if (gid.empty())
+                        throw std::runtime_error("sweep: malformed guide-curve ref");
+                    if (gid == path_id)
+                        throw std::runtime_error(
+                            "sweep: the guide curve must be a different sketch/curve "
+                            "than the path");
+                    TopoDS_Wire gw;
+                    auto gres = results.find(gid);
+                    if (gres != results.end() &&
+                        std::holds_alternative<CurveResult>(gres->second)) {
+                        const CurveResult& cr = std::get<CurveResult>(gres->second);
+                        const aicad::geom::SketchPlane& b = cr.base;
+                        gp_Trsf lift;
+                        lift.SetValues(
+                            b.uAxis.x(), b.vAxis.x(), b.normal.x(), b.origin.x(),
+                            b.uAxis.y(), b.vAxis.y(), b.normal.y(), b.origin.y(),
+                            b.uAxis.z(), b.vAxis.z(), b.normal.z(), b.origin.z());
+                        gw = TopoDS::Wire(
+                            BRepBuilderAPI_Transform(cr.wire, lift, true).Shape());
+                    } else {
+                        const SketchResult& gsk = require_sketch(results, gid, "guide");
+                        gw = aicad::geom::wire_from_solved_sketch(gsk.entities, gsk.plane);
+                    }
+                    if (gw.IsNull())
+                        throw std::runtime_error(
+                            "sweep: guide-curve sketch produced no wire — its edges must "
+                            "form a single connected chain (check consecutive entities "
+                            "share endpoints)");
+                    guides.push_back(gw);
+                }
+
                 TopoDS_Shape solid;
                 for (const TopoDS_Face& f : src.faces) {
-                    TopoDS_Shape pipe = ::geom::sweep_profile(f, spine, orient);
+                    TopoDS_Shape pipe = ::geom::sweep_profile(f, spine, orient, guides);
                     if (pipe.IsNull())
                         throw std::runtime_error("sweep produced an empty solid "
                             "(check the profile sits on/near the path start, roughly "
@@ -3291,7 +3338,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     BRepGProp::LinearProperties(spine, pl);
                     vol_estimate = profile_area * pl.Mass();
                 }
+                // A guide curve legitimately scales the cross-section along the path,
+                // so the profile_area * path_length estimate no longer bounds the
+                // volume — skip this heuristic for guided sweeps to avoid false
+                // rejects (the zero-volume guard above still catches an empty result).
                 const bool gross_under_volume =
+                    guides.empty() &&
                     vol_estimate > 1e-9 && sweep_volume < 0.5 * vol_estimate;
                 if (brep_invalid && gross_under_volume)
                     throw std::runtime_error(

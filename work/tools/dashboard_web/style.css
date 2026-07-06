@@ -322,6 +322,114 @@ h4 { font-size: 12px; font-weight: 650; text-transform: uppercase;
   color: var(--text-dim); white-space: pre-wrap;
 }
 
+/* ---------- hot issues ---------- */
+.issues { display: flex; flex-direction: column; gap: 8px; }
+.issue {
+  display: flex; align-items: center; gap: 12px;
+  background: var(--panel); border: 1px solid var(--stroke);
+  border-radius: var(--r-md); padding: 11px 16px; text-decoration: none;
+  color: var(--text); transition: background .15s ease, transform .15s ease;
+}
+.issue:hover { background: var(--panel-hover); transform: translateY(-1px); }
+.issue.bug { border-left: 3px solid var(--stuck); }
+.issue .inum { color: var(--text-faint); font-size: 12.5px; font-weight: 700;
+               font-variant-numeric: tabular-nums; flex: none; }
+.issue .ititle { flex: 1; min-width: 0; font-size: 14px;
+                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.issue .imeta { display: flex; align-items: center; gap: 6px; flex: none; }
+.ilabel {
+  font-size: 10.5px; font-weight: 650; letter-spacing: .03em; text-transform: uppercase;
+  padding: 2px 8px; border-radius: 999px; color: var(--text-dim);
+  border: 1px solid var(--stroke);
+}
+.ilabel.bug { color: var(--stuck); border-color: var(--stuck); background: var(--stuck-soft); }
+.iassignee { font-size: 12px; color: var(--text-dim); white-space: nowrap; }
+.iassignee.unassigned { color: var(--text-faint); font-family: ui-monospace, monospace; font-size: 11.5px; }
+
+/* ---------- lane ownership row ---------- */
+.lane-own {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
+  font-size: 12.5px; color: var(--text-dim); flex-wrap: wrap;
+}
+.own-who { font-weight: 600; color: var(--text); }
+.own-who.unassigned { color: var(--text-faint); font-weight: 500; }
+.own-branch { font-family: ui-monospace, monospace; font-size: 11.5px;
+              color: var(--text-dim); background: rgba(255,255,255,.04);
+              padding: 2px 8px; border-radius: 999px; border: 1px solid var(--stroke); }
+.own-goal { color: var(--text-faint); font-style: italic; min-width: 0;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
+.assign-btn {
+  margin-left: auto; background: var(--accent-soft); border: 1px solid var(--stroke);
+  color: var(--accent); border-radius: var(--r-sm); padding: 4px 12px; cursor: pointer;
+  font-weight: 600; font-size: 12.5px; transition: all .15s ease;
+}
+.assign-btn:hover { filter: brightness(1.15); border-color: var(--accent); }
+
+/* ---------- map band ownership ---------- */
+.band-label .owner { fill: var(--accent); font-weight: 600; }
+.band-label .branch { fill: var(--text-faint); font-weight: 400;
+                      font-family: ui-monospace, monospace; font-size: 11.5px; }
+
+/* ---------- codebase node graph ---------- */
+#view-codebase { max-width: none; padding: 0; height: calc(100vh - 57px);
+                 display: flex; flex-direction: column; }
+.graph-toolbar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 18px; border-bottom: 1px solid var(--stroke);
+  background: rgba(14, 17, 22, 0.6);
+}
+.graph-stats { color: var(--text-dim); font-size: 13px; min-width: 260px; }
+.graph-stats b { color: var(--text); font-variant-numeric: tabular-nums; }
+#graph-search {
+  background: var(--panel); border: 1px solid var(--stroke);
+  border-radius: var(--r-sm); padding: 7px 12px; width: 220px; outline: none;
+}
+#graph-search:focus { border-color: var(--accent); }
+.graph-wrap { flex: 1; position: relative; overflow: hidden; cursor: grab;
+              background: radial-gradient(1200px 700px at 50% 40%, rgba(91,156,245,.04), transparent 70%); }
+.graph-wrap.dragging { cursor: grabbing; }
+#graph-canvas { display: block; width: 100%; height: 100%; }
+.graph-tip {
+  position: absolute; z-index: 20; pointer-events: none; max-width: 340px;
+  background: rgba(14, 17, 22, 0.95); border: 1px solid var(--stroke-strong);
+  border-radius: var(--r-sm); padding: 7px 11px; font-size: 12.5px; box-shadow: var(--shadow);
+}
+.graph-tip b { color: var(--text); }
+.graph-tip span { display: block; color: var(--text-faint); font-size: 11.5px;
+                  font-family: ui-monospace, monospace; margin-top: 3px; }
+.graph-empty {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: var(--text-dim); font-size: 15px; text-align: center; padding: 40px;
+}
+.graph-ask {
+  padding: 12px 18px; border-bottom: 1px solid var(--stroke);
+  background: rgba(20, 26, 34, 0.6);
+}
+.graph-ask-row { display: flex; gap: 10px; }
+.graph-ask-row select, .graph-ask-row input {
+  background: var(--bg); border: 1px solid var(--stroke); border-radius: var(--r-sm);
+  padding: 8px 11px; outline: none;
+}
+.graph-ask-row input { flex: 1; }
+.graph-ask-row input:focus, .graph-ask-row select:focus { border-color: var(--accent); }
+.graph-ask .graphify-out { margin-top: 10px; max-height: 34vh; }
+
+/* ---------- assign-lane modal ---------- */
+#assign-modal .modal-card { width: 480px; }
+.assign-help { color: var(--text-dim); font-size: 13px; margin-bottom: 16px; line-height: 1.5; }
+.assign-form { display: flex; flex-direction: column; gap: 12px; }
+.assign-form label { display: flex; flex-direction: column; gap: 5px;
+                     font-size: 13px; color: var(--text-dim); }
+.assign-form input {
+  background: var(--bg); border: 1px solid var(--stroke); border-radius: var(--r-sm);
+  padding: 9px 11px; outline: none; color: var(--text);
+}
+.assign-form input:focus { border-color: var(--accent); }
+.assign-error { color: var(--stuck); font-size: 13px; margin-top: 12px; }
+.assign-actions { display: flex; align-items: center; gap: 10px; margin-top: 18px; }
+.ghost-btn.danger { color: var(--stuck); border-color: rgba(226,93,93,.4); }
+.ghost-btn.danger:hover { background: var(--stuck-soft); border-color: var(--stuck); color: var(--stuck); }
+
 /* ---------- toast ---------- */
 .toast {
   position: fixed; bottom: 26px; left: 50%; transform: translateX(-50%);

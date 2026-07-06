@@ -1208,8 +1208,11 @@ bool PropertyManager::activeWellWantsPathFeature() const {
     for (const auto& f : fields_) {
         if (f.def->kind != FieldKind::SelectorWell || !f.wellActive ||
             !fieldVisible(*f.def, fields_)) continue;
+        // path/centerline are single-ref spines; guides is a multi-ref auxiliary
+        // spine — all three accept a whole sketch or a curve/helix datum.
         return std::strcmp(f.def->key, "path") == 0 ||
-               std::strcmp(f.def->key, "centerline") == 0;
+               std::strcmp(f.def->key, "centerline") == 0 ||
+               std::strcmp(f.def->key, "guides") == 0;
     }
     return false;
 }
@@ -1219,7 +1222,8 @@ bool PropertyManager::routePathFeature(const std::string& fid, const std::string
     PMField* well = activeWell();
     if (!well || fid.empty()) return false;
     if (std::strcmp(well->def->key, "path") != 0 &&
-        std::strcmp(well->def->key, "centerline") != 0) return false;
+        std::strcmp(well->def->key, "centerline") != 0 &&
+        std::strcmp(well->def->key, "guides") != 0) return false;
     // Schema-valid selector: a sketch path is a region (its wire = spine); a curve/helix
     // path is a datum-feature ref. Both resolve to `fid` via selector_owner_id.
     nlohmann::json sel = isCurve ? nlohmann::json{{"kind", "datum"}, {"feature", fid}}
@@ -1238,7 +1242,7 @@ bool PropertyManager::routePathFeature(const std::string& fid, const std::string
             return true;
         }
     }
-    well->picks.clear();   // path / centerline are single-ref
+    if (!well->def->selMulti) well->picks.clear();  // path/centerline single-ref; guides appends
     PMSelEntry e;
     e.selector = std::move(sel);
     e.label = name.empty() ? fid : name;
@@ -1266,6 +1270,32 @@ std::vector<std::string> PropertyManager::pathHighlightFeatureIds() const {
         }
     }
     return out;
+}
+
+std::vector<std::string> PropertyManager::spineFeatureIds() const {
+    std::vector<std::string> out;
+    if (!active_) return out;
+    for (const auto& f : fields_) {
+        if (f.def->kind != FieldKind::SelectorWell) continue;
+        if (std::strcmp(f.def->key, "path") != 0 &&
+            std::strcmp(f.def->key, "centerline") != 0) continue;
+        for (const auto& p : f.picks) {
+            const auto& s = p.selector;
+            if (!s.is_object()) continue;
+            if (s.contains("feature") && s["feature"].is_string()) out.push_back(s["feature"]);
+            else if (s.contains("sketch") && s["sketch"].is_string()) out.push_back(s["sketch"]);
+        }
+    }
+    return out;
+}
+
+std::string PropertyManager::activeWellKey() const {
+    if (!active_) return std::string();
+    for (const auto& f : fields_)
+        if (f.def->kind == FieldKind::SelectorWell && f.wellActive &&
+            fieldVisible(*f.def, fields_))
+            return f.def->key ? f.def->key : std::string();
+    return std::string();
 }
 
 bool PropertyManager::wantsRegionPicker() const {

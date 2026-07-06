@@ -40,6 +40,8 @@ struct SketchPmSeam {
     bool activeWellWantsPathFeature() const;
     std::string previewFeatureId() const;
     std::vector<std::string> pathHighlightFeatureIds() const;
+    std::vector<std::string> spineFeatureIds() const;
+    std::string activeWellKey() const;
     std::vector<std::string> regionCandidateSketches(SketchHost& st) const;
     bool wantsRegionPicker() const;
     bool sectionsAreOrdered() const;

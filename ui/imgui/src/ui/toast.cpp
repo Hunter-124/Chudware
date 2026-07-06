@@ -11,6 +11,7 @@ namespace {
 
 static std::mutex              s_toastMtx;
 static std::vector<Toast>      s_toasts;
+static int                     s_firedAction = 0;  // T-R5: clicked toast action
 
 void levelColors(ToastLevel lvl, unsigned int& accentRole, const char*& tag) {
     const theme::Palette& p = theme::pal();
@@ -31,6 +32,26 @@ void postToast(ToastLevel level, std::string msg) {
     t.born  = ImGui::GetTime();
     std::lock_guard<std::mutex> lk(s_toastMtx);
     s_toasts.push_back(std::move(t));
+}
+
+void postToastAction(ToastLevel level, std::string msg,
+                     std::string actionLabel, int actionId, double ttl) {
+    Toast t;
+    t.level       = level;
+    t.msg         = std::move(msg);
+    t.ttl         = ttl;
+    t.born        = ImGui::GetTime();
+    t.actionLabel = std::move(actionLabel);
+    t.actionId    = actionId;
+    std::lock_guard<std::mutex> lk(s_toastMtx);
+    s_toasts.push_back(std::move(t));
+}
+
+int takeToastAction() {
+    std::lock_guard<std::mutex> lk(s_toastMtx);
+    int id = s_firedAction;
+    s_firedAction = 0;
+    return id;
 }
 
 void drawToasts(app::AppState& st) {
@@ -81,7 +102,10 @@ void drawToasts(app::AppState& st) {
         const float innerW = toastW - theme::U(2.5f);
         ImVec2 msgSize = font->CalcTextSizeA(font->FontSize, FLT_MAX, innerW, t.msg.c_str());
         float titleH = font->FontSize + theme::U(0.25f);
-        float cardH  = titleH + msgSize.y + theme::U(2.f);
+        // Action toasts get an extra clickable row under the message (T-R5).
+        const bool hasAction = !t.actionLabel.empty();
+        const float actionH = hasAction ? (font->FontSize + theme::U(0.75f)) : 0.f;
+        float cardH  = titleH + msgSize.y + actionH + theme::U(2.f);
 
         ImVec2 p0(x, y);
         ImVec2 p1(x + toastW, y + cardH);
@@ -109,7 +133,26 @@ void drawToasts(app::AppState& st) {
         msgCol.w *= alpha;
         dl->AddText(font, font->FontSize, ImVec2(tx, ty + titleH),
                     ImGui::ColorConvertFloat4ToU32(msgCol), t.msg.c_str(), nullptr, innerW);
-        if (clicked && mouse.x >= p0.x && mouse.x <= p1.x &&
+        bool actionHit = false;
+        if (hasAction) {
+            // Accent-colored, underlined action label — the whole label is the hit area.
+            const float ay = ty + titleH + msgSize.y + theme::U(0.5f);
+            const ImVec2 asz = font->CalcTextSizeA(font->FontSize, FLT_MAX, innerW,
+                                                   t.actionLabel.c_str());
+            const bool hov = mouse.x >= tx && mouse.x <= tx + asz.x &&
+                             mouse.y >= ay && mouse.y <= ay + asz.y;
+            const ImU32 acol = withA(p.accent, hov ? 1.f : 0.85f);
+            dl->AddText(font, font->FontSize, ImVec2(tx, ay), acol,
+                        t.actionLabel.c_str(), nullptr, innerW);
+            dl->AddLine(ImVec2(tx, ay + asz.y), ImVec2(tx + asz.x, ay + asz.y),
+                        acol, 1.f * S);
+            if (clicked && hov) {
+                s_firedAction = t.actionId;
+                dismissIdx = i;
+                actionHit = true;
+            }
+        }
+        if (!actionHit && clicked && mouse.x >= p0.x && mouse.x <= p1.x &&
             mouse.y >= p0.y && mouse.y <= p1.y) {
             ImGui::SetClipboardText(t.msg.c_str());
             dismissIdx = i;

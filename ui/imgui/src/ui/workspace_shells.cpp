@@ -3,6 +3,7 @@
 // Bodies land in T-DP16 (AiAgent) and the R-stack (PlmManagement).
 #include "ui/workspace_shells.h"
 #include "ui/agent_dag_panel.h"   // T-DP16: mission-DAG centerpiece
+#include "ui/plm_panel.h"         // T-R5: PLM History timeline centerpiece
 #include "app/app_state.h"
 #include "theme/theme.h"
 #include "imgui.h"
@@ -76,9 +77,31 @@ void drawAiAgentShell(AppState& s) {
     // TODO(T-DP16 slice 4): transparency stream embed (T-DP11).
 }
 
-void drawPlmShell(AppState& /*s*/) {
-    // T-DP15: PLM project-hub full-viewport shell — body in R-stack.
-    drawShellPlaceholder("PLM", "Project management hub — body arrives in the R-stack");
+void drawPlmShell(AppState& s) {
+    // T-R5 finisher: PLM project-hub full-viewport workspace body.
+    //
+    // Same full-viewport takeover as AiAgent/ECAD (workspaceKind==FullViewport +
+    // the viewport.cpp content-swap). Mounts the existing PLM History timeline
+    // panel as the centerpiece — checkpoint/release popovers + the compare view
+    // are separate windows driven from application.cpp (plmFrameTick /
+    // plmComparePanelOpen). The panel draws its own glass PanelScaffold header
+    // ("History") and handles empty states (no project / no history yet), so we
+    // add only a thin workspace-title strip above it (no glass-on-glass).
+    const float S = theme::S();
+
+    ImGui::PushFont(theme::font(theme::Font::H2));
+    ImGui::TextUnformatted("PLM");
+    ImGui::PopFont();
+    ImGui::PushFont(theme::font(theme::Font::Body));
+    ImGui::PushStyleColor(ImGuiCol_Text, TCOL(txt1));
+    ImGui::TextUnformatted("Project hub - versions, checkpoints & releases");
+    ImGui::PopStyleColor();
+    ImGui::PopFont();
+    ImGui::Dummy(ImVec2(0, 8 * S));
+
+    // Centerpiece: the PLM History timeline (self-contained; opens the active
+    // doc's project vault and renders session-vs-project history + actions).
+    ui::drawPlmPanel(s);
 }
 
 } // namespace ui

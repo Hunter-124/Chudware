@@ -678,6 +678,14 @@ void drawViewport(AppState& s) {
             ui::drawAiAgentShell(s);
             return;
         }
+        // T-R5 finisher: the PLM project hub takes over the full viewport the same
+        // way (content-swap), hosting the History timeline + checkpoint/release/
+        // compare surface. The Begin("PLM###plm_ws") dock window in application.cpp
+        // is a no-draw stub, for the identical headless-surfacing reason as ECAD.
+        if (ews == cmd::Workspace::PlmManagement) {
+            ui::drawPlmShell(s);
+            return;
+        }
     }
 
     // H1: CAM panel content-swap. Same headless surfacing gap as ECAD above. The cam scenario

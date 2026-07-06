@@ -17,6 +17,11 @@ struct Toast {
     std::string msg;
     double born = 0.0;
     double ttl  = 4.0;
+    // Optional action affordance (T-R5): a clickable label rendered under the
+    // message (e.g. "Back to rev B (discard draft)"). Clicking it dismisses the
+    // toast and publishes actionId — poll with takeToastAction().
+    std::string actionLabel;
+    int actionId = 0;
 };
 
 inline double toastTtl(ToastLevel l) {
@@ -28,6 +33,13 @@ inline double toastTtl(ToastLevel l) {
 }
 
 void postToast(ToastLevel level, std::string msg);
+// Toast with a clickable action row. Longer ttl by default so the affordance
+// is not missed; the click publishes actionId (see takeToastAction).
+void postToastAction(ToastLevel level, std::string msg,
+                     std::string actionLabel, int actionId, double ttl = 12.0);
+// One-shot poll: the actionId of a toast action clicked since the last call
+// (0 = none). Call once per frame from the feature that posted the action.
+int takeToastAction();
 void drawToasts(app::AppState& st);
 
 } // namespace ui

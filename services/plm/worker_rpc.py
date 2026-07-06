@@ -1,0 +1,368 @@
+"""Worker-RPC bridge for the PLM vault — the in-editor GUI seam (T-R5).
+
+Exposes the ``plm_*`` family as **engine-worker methods** so the C++/ImGui
+editor (history timeline panel, checkpoint/release toolbar, compare view,
+doc-tab revision badges — ``ui/imgui/src/ui/plm_panel.cpp``) reaches the vault
+through the same newline-delimited-JSON worker seam (``WorkerClient`` /
+``AsyncRpc``, ``services/worker/``) it already uses for every other service —
+no bespoke transport.
+
+These are thin wrappers over :class:`services.plm.vault.Vault` and the T-R3/
+T-R4 modules — the SAME single implementation behind the ``plm_*`` MCP tools
+(``services/mcp/plm_tools.py``); no vault logic lives here. Responses are the
+contract §0 flat envelope as a dict: ``{ok: true, …}`` / ``{ok: false, reason,
+hint}`` — never a traceback (worker methods degrade gracefully when dulwich is
+not provisioned).
+
+GUI extras beyond the MCP twins (additive, worker-seam only):
+
+* ``plm_history`` accepts ``thumb_dir`` — exports each entry's committed
+  ``thumbnail.png`` blob to ``<thumb_dir>/<entry-id>.png`` and adds a
+  ``thumbnail_file`` field, so the C++ timeline can texture-load real
+  thumbnails without a second round trip.
+* ``plm_status`` adds ``part_number_prefix`` + ``next_part_number`` so the
+  release flow can pre-fill the suggested number (T-R5 locked decision).
+* ``plm_draft`` — checkpoint/release message drafting for the toolbar. The
+  LOCAL model tier phrases a message from the deterministic T-R3 change
+  summary when (and only when) a local, loopback-served model is provisioned;
+  otherwise it reports ``source:"manual"`` and the GUI shows a plain manual
+  box. Frontier/cloud providers are never used here.
+* ``plm_scheme_set`` / ``plm_discard_draft`` — the T-R5 vault seams
+  (configurable part-number scheme; "back to rev X (discard draft)").
+
+Ease-of-use law (contract §8.1): no git vocabulary in any string a user could
+see. Registered append-only in ``engine/worker.py``, following the
+deliverables.worker_rpc / parts_hub.worker_rpc / dag.worker_rpc precedent.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Callable
+
+# ---------------------------------------------------------------------------
+# envelope helpers
+# ---------------------------------------------------------------------------
+
+_NO_VAULT = {"ok": False, "reason": "no_vault",
+             "hint": "version history is not available on this machine"}
+
+
+def _with_vault(params: dict, fn: Callable[[Any], dict]) -> dict:
+    """Open the project vault, run *fn(vault)*, close, and envelope errors."""
+    try:
+        from services.plm.vault import Vault, VaultError
+    except ImportError:
+        return dict(_NO_VAULT)
+    path = str((params or {}).get("path", "") or "")
+    if not path:
+        return {"ok": False, "reason": "invalid_project",
+                "hint": "no project folder given"}
+    try:
+        v = Vault.open(path)
+        try:
+            return fn(v)
+        finally:
+            v.close()
+    except VaultError as e:
+        out = {"ok": False, "reason": e.reason, "hint": e.hint}
+        problems = getattr(e, "problems", None)
+        if problems is not None:
+            out["problems"] = problems
+        return out
+    except Exception as e:  # noqa: BLE001 — worker methods never raise
+        return {"ok": False, "reason": "internal",
+                "hint": f"{type(e).__name__}: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# core surface (MCP twins)
+# ---------------------------------------------------------------------------
+
+def _plm_open(params: dict, _emit: Callable) -> dict:
+    """Open (auto-creating) the vault for a project folder — zero-config."""
+    def run(v: Any) -> dict:
+        m = v.manifest()
+        return {"ok": True, "project_id": m["project"]["id"], "manifest": m}
+    return _with_vault(params, run)
+
+
+def _plm_status(params: dict, _emit: Callable) -> dict:
+    """Project state for badges/panel + part-number scheme extras."""
+    def run(v: Any) -> dict:
+        from services.plm import manifest as manifest_mod
+
+        st = v.status()
+        m = v.manifest()
+        st["part_number_prefix"] = m.get("part_number_prefix", "")
+        st["next_part_number"] = manifest_mod.next_part_number(m)
+        return {"ok": True, **st}
+    return _with_vault(params, run)
+
+
+def _plm_history(params: dict, _emit: Callable) -> dict:
+    """The timeline. With ``thumb_dir``: export per-entry thumbnails to files."""
+    def run(v: Any) -> dict:
+        from services.plm import snapshot
+
+        item_id = (params or {}).get("item_id") or None
+        limit = int((params or {}).get("limit") or 0) or None
+        entries = v.history(item_id, limit)
+        thumb_dir = str((params or {}).get("thumb_dir", "") or "")
+        if thumb_dir:
+            td = Path(thumb_dir)
+            td.mkdir(parents=True, exist_ok=True)
+            for e in entries:
+                ref = e.get("thumbnail_ref")
+                if not ref:
+                    continue
+                dest = td / f'{e["commit"]}.png'
+                if not dest.exists():
+                    try:
+                        tree = v._bind.read_tree(e["commit"])  # noqa: SLF001 — same package
+                        raw = tree.get(ref)
+                        if raw:
+                            dest.write_bytes(raw)
+                    except Exception:  # noqa: BLE001 — thumbnails are best-effort
+                        continue
+                if dest.exists():
+                    e["thumbnail_file"] = str(dest)
+        return {"ok": True, "entries": entries, "head": v.status()["head"]}
+    return _with_vault(params, run)
+
+
+def _plm_save(params: dict, _emit: Callable) -> dict:
+    """An explicit save → one auto (or checkpoint) history entry."""
+    kind = str((params or {}).get("kind", "auto") or "auto")
+    if kind not in ("auto", "checkpoint"):
+        return {"ok": False, "reason": "invalid_mode",
+                "hint": "a save can only be a save or a named checkpoint"}
+
+    def run(v: Any) -> dict:
+        res = v.save(kind)
+        return {"ok": True, "commit": res["commit"], "entry": res["entry"]}
+    return _with_vault(params, run)
+
+
+def _plm_checkpoint(params: dict, _emit: Callable) -> dict:
+    """Save a named checkpoint the user can return to."""
+    def run(v: Any) -> dict:
+        res = v.checkpoint(str((params or {}).get("message", "") or ""),
+                           item_id=(params or {}).get("item_id") or None)
+        return {"ok": True, "commit": res["commit"], "entry": res["entry"]}
+    return _with_vault(params, run)
+
+
+def _plm_release(params: dict, _emit: Callable) -> dict:
+    """Release an item: pre-flight, rev stamp, geometry + BOM freeze (T-R4)."""
+    def run(v: Any) -> dict:
+        from services.plm import release as release_mod
+
+        res = release_mod.release(v, str((params or {}).get("item_id", "")),
+                                  str((params or {}).get("message", "") or ""),
+                                  confirm=bool((params or {}).get("confirm")))
+        return {"ok": True, "commit": res["commit"], "rev": res["rev"],
+                "entry": res["entry"], "preflight": res["preflight"],
+                "bom_freeze": res.get("bom_freeze"),
+                "stamp_orders": res["stamp_orders"]}
+    return _with_vault(params, run)
+
+
+def _plm_restore(params: dict, _emit: Callable) -> dict:
+    """Return the project (or one item) to an earlier point — forward-only."""
+    def run(v: Any) -> dict:
+        res = v.restore(str((params or {}).get("commit", "")),
+                        (params or {}).get("item_id") or None)
+        return {"ok": True, "commit": res["commit"], "entry": res["entry"]}
+    return _with_vault(params, run)
+
+
+def _plm_compare(params: dict, _emit: Callable) -> dict:
+    """Semantic (+ optional visual) compare of one item between two entries."""
+    def run(v: Any) -> dict:
+        from services.plm import compare as compare_mod
+
+        doc_a, doc_b = compare_mod.docs_at(
+            v, str((params or {}).get("commit_a", "")),
+            str((params or {}).get("commit_b", "")),
+            str((params or {}).get("item_id", "")))
+        sem = compare_mod.semantic_compare(doc_a, doc_b)
+        out: dict[str, Any] = {"ok": True, "doc_diff": sem["doc_diff"],
+                               "summary": sem["summary"]}
+        if bool((params or {}).get("visual")):
+            import tempfile
+
+            od = str((params or {}).get("out_dir", "") or "")
+            od = od or tempfile.mkdtemp(prefix="aicad_plm_compare_")
+            try:
+                out["eval_compare"] = compare_mod.visual_compare(doc_a, doc_b, od)
+            except Exception as e:  # noqa: BLE001 — visual half degrades gracefully
+                out["visual_unavailable"] = f"{type(e).__name__}: {e}"
+        return out
+    return _with_vault(params, run)
+
+
+def _plm_item_set(params: dict, _emit: Callable) -> dict:
+    """Edit an item's registry entry: part number and/or start a new revision."""
+    part_number = str((params or {}).get("part_number", "") or "")
+    start_new_rev = bool((params or {}).get("start_new_rev"))
+    if not part_number and not start_new_rev:
+        return {"ok": False, "reason": "invalid_mode",
+                "hint": "nothing to change — give a part number or ask to "
+                        "start a new revision"}
+
+    def run(v: Any) -> dict:
+        item_id = str((params or {}).get("item_id", ""))
+        out: dict[str, Any] = {"ok": True}
+        if part_number:
+            out["item"] = v.set_part_number(item_id, part_number)
+        if start_new_rev:
+            res = v.start_new_rev(item_id)
+            out["item"] = res["item"]
+            out["working_rev"] = res["working_rev"]
+        return out
+    return _with_vault(params, run)
+
+
+# ---------------------------------------------------------------------------
+# T-R5 seams: scheme config + discard draft
+# ---------------------------------------------------------------------------
+
+def _plm_scheme_set(params: dict, _emit: Callable) -> dict:
+    """Configure the part-number scheme prefix (suggestions only)."""
+    def run(v: Any) -> dict:
+        res = v.set_part_number_prefix(str((params or {}).get("prefix", "")))
+        return {"ok": True, **res}
+    return _with_vault(params, run)
+
+
+def _plm_discard_draft(params: dict, _emit: Callable) -> dict:
+    """Undo a next-rev draft: back to the item's released form (forward entry)."""
+    def run(v: Any) -> dict:
+        res = v.discard_working_rev(str((params or {}).get("item_id", "")))
+        return {"ok": True, "item": res["item"], "entry": res["entry"]}
+    return _with_vault(params, run)
+
+
+# ---------------------------------------------------------------------------
+# plm_draft — LOCAL model tier message drafting (T-R5 locked decision)
+# ---------------------------------------------------------------------------
+
+# Test seam: inject a fake local-model phrasing function (summary -> message).
+# None = resolve the configured provider; a callable bypasses provider lookup.
+_local_draft_hook: Callable[[str], str] | None = None
+
+
+def set_local_draft_hook(fn: Callable[[str], str] | None) -> None:
+    """Register (or clear) a local-model phrasing hook — tests only."""
+    global _local_draft_hook
+    _local_draft_hook = fn
+
+
+_DRAFT_SYSTEM = (
+    "You write one-sentence design-history notes for a CAD app. Rephrase the "
+    "change summary as a short, plain-language note. Copy every number "
+    "exactly. Never use version-control jargon. Reply with the note only."
+)
+
+
+def _local_provider() -> Any | None:
+    """The configured provider IFF it keeps traffic on this machine.
+
+    Cloud providers (Anthropic, Gemini, cloud OpenAI, OpenRouter) are never
+    used for drafting — this returns None for them, which the caller maps to
+    the plain manual box. Only loopback-served local models qualify.
+    """
+    if os.environ.get("AICAD_PLM_DRAFT_LOCAL", "1") == "0":
+        return None
+    try:
+        from services.agent import config as agent_config
+
+        cfg = agent_config.load_config()
+        name = (cfg.get("provider") or "").lower()
+        if name not in ("llamacpp", "llama.cpp", "llama-cpp", "vllm", "openai"):
+            return None
+        provider = agent_config.get_provider(name, cfg)
+        if not agent_config.provider_offline_safe(provider):
+            return None
+        return provider
+    except Exception:  # noqa: BLE001 — unprovisioned/misconfigured -> manual box
+        return None
+
+
+def _validated(draft: str, summary: str) -> str:
+    """Accept a model draft only if it is git-vocab-free and numeral-faithful."""
+    from services.plm import summarize
+
+    draft = " ".join(str(draft or "").split())
+    if not draft or len(draft) > 400:
+        return ""
+    words = set(draft.lower().replace(".", " ").replace(",", " ").split())
+    if words & summarize._GIT_VOCAB:  # noqa: SLF001 — same normative word list
+        return ""
+    if not summarize.numeral_tokens(draft) <= summarize.numeral_tokens(summary):
+        return ""
+    return draft
+
+
+def _plm_draft(params: dict, _emit: Callable) -> dict:
+    """Draft a checkpoint/release message for the toolbar.
+
+    Returns ``{ok, message, summary, source}`` where ``source`` is
+    ``"local_model"`` (a provisioned local model phrased the message from the
+    deterministic T-R3 change summary) or ``"manual"`` (no local model — the
+    GUI shows a plain manual box; ``summary`` is still returned for context).
+    """
+    mode = str((params or {}).get("mode", "checkpoint") or "checkpoint")
+    if mode not in ("checkpoint", "release"):
+        return {"ok": False, "reason": "invalid_mode",
+                "hint": "a draft is for a checkpoint or a release"}
+
+    def run(v: Any) -> dict:
+        item_id = (params or {}).get("item_id") or None
+        if mode == "release":
+            summary = v.draft_release_note(str(item_id or ""))
+        else:
+            summary = v.draft_message(item_id=item_id)
+        out = {"ok": True, "message": "", "summary": summary, "source": "manual"}
+        if not summary:
+            return out  # nothing changed — nothing to phrase
+        hook = _local_draft_hook
+        if hook is not None:
+            message = _validated(hook(summary), summary)
+            if message:
+                return {"ok": True, "message": message, "summary": summary,
+                        "source": "local_model"}
+            return out
+        provider = _local_provider()
+        if provider is None:
+            return out
+        try:
+            raw = provider.complete(
+                _DRAFT_SYSTEM,
+                [{"role": "user", "content": f"Change summary: {summary}"}],
+                max_tokens=120)
+        except Exception:  # noqa: BLE001 — local server down -> manual box
+            return out
+        message = _validated(raw, summary)
+        if message:
+            return {"ok": True, "message": message, "summary": summary,
+                    "source": "local_model"}
+        return out
+    return _with_vault(params, run)
+
+
+WORKER_METHODS = {
+    "plm_open": _plm_open,
+    "plm_status": _plm_status,
+    "plm_history": _plm_history,
+    "plm_save": _plm_save,
+    "plm_checkpoint": _plm_checkpoint,
+    "plm_release": _plm_release,
+    "plm_restore": _plm_restore,
+    "plm_compare": _plm_compare,
+    "plm_item_set": _plm_item_set,
+    "plm_scheme_set": _plm_scheme_set,
+    "plm_discard_draft": _plm_discard_draft,
+    "plm_draft": _plm_draft,
+}

@@ -1,0 +1,304 @@
+"""Tests for the PLM worker-RPC seam (T-R5, services/plm/worker_rpc.py).
+
+Covers the in-editor GUI surface:
+  * every worker method returns the contract §0 dict envelope (never raises)
+  * plm_history thumbnail export (thumb_dir -> thumbnail_file per entry)
+  * plm_status scheme extras (part_number_prefix + next_part_number)
+  * plm_scheme_set (configurable part-number scheme, suggestions only)
+  * plm_item_set start_new_rev + plm_discard_draft round trip (auto-branch
+    silently -> "back to rev A (discard draft)" -> Released again, forward-only)
+  * plm_restore round trip through the worker seam
+  * plm_draft: local-model tier via injected hook (validated: git vocabulary
+    and invented numerals are rejected), manual fallback when no local model
+  * no git vocabulary in any user-facing string
+  * graceful degradation on a non-project path
+
+Runs under the gate venv (dulwich installed). No engine C++ dependency, no
+live model server — the local tier is exercised through the test hook.
+"""
+from __future__ import annotations
+
+import io
+import json
+import zipfile
+
+import pytest
+
+from services.plm import worker_rpc
+
+_GIT_VOCAB = {
+    "git", "commit", "repository", "repo", "branch", "merge", "rebase",
+    "head", "ref", "stage", "staging", "push", "pull", "sha", "hash",
+}
+
+
+def _emit(_data: dict) -> None:  # worker emit callback stub
+    pass
+
+
+def _container(doc: dict) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("thumbnail.png", b"\x89PNG\r\n_stub_thumbnail")
+        zf.writestr("document.json", json.dumps(doc, indent=2))
+    return buf.getvalue()
+
+
+def _part(wall: float = 3.0) -> dict:
+    return {"schema": "aicad.part/1", "id": "uuid-part-1", "name": "Bracket",
+            "features": [{"id": "f1", "params": {"wall": wall}}]}
+
+
+def _write(project_dir, name, doc):
+    (project_dir / name).write_bytes(_container(doc))
+
+
+def _assert_no_git_vocab(text: str) -> None:
+    words = set(text.lower().replace(".", " ").replace(",", " ").split())
+    leaked = words & _GIT_VOCAB
+    assert not leaked, f"git vocabulary leaked: {leaked} in {text!r}"
+
+
+@pytest.fixture()
+def project(tmp_path):
+    _write(tmp_path, "Bracket.step+", _part())
+    r = worker_rpc.WORKER_METHODS["plm_open"]({"path": str(tmp_path)}, _emit)
+    assert r["ok"] is True
+    return tmp_path
+
+
+def _call(method: str, **params):
+    return worker_rpc.WORKER_METHODS[method](params, _emit)
+
+
+# ---------------------------------------------------------------------------
+# envelopes + degradation
+# ---------------------------------------------------------------------------
+
+def test_all_methods_envelope_on_missing_path():
+    for name, fn in worker_rpc.WORKER_METHODS.items():
+        out = fn({}, _emit)
+        assert isinstance(out, dict), name
+        assert out.get("ok") is False, name
+        assert "reason" in out, name
+        _assert_no_git_vocab(str(out.get("hint", "")))
+
+
+def test_open_zero_config(project):
+    out = _call("plm_open", path=str(project))
+    assert out["ok"] and out["project_id"]
+    assert out["manifest"]["items"][0]["path"] == "Bracket.step+"
+
+
+def test_status_carries_scheme_extras(project):
+    st = _call("plm_status", path=str(project))
+    assert st["ok"]
+    assert st["part_number_prefix"]
+    assert st["next_part_number"].startswith(st["part_number_prefix"] + "-")
+    assert st["items"][0]["lifecycle"] == "In work"
+
+
+# ---------------------------------------------------------------------------
+# history + thumbnails
+# ---------------------------------------------------------------------------
+
+def test_history_exports_thumbnails(project, tmp_path_factory):
+    _write(project, "Bracket.step+", _part(4.0))
+    assert _call("plm_save", path=str(project))["ok"]
+    _write(project, "Bracket.step+", _part(5.0))
+    assert _call("plm_checkpoint", path=str(project), message="wall to 5")["ok"]
+
+    td = tmp_path_factory.mktemp("thumbs")
+    out = _call("plm_history", path=str(project), thumb_dir=str(td))
+    assert out["ok"] and len(out["entries"]) >= 3
+    kinds = [e["kind"] for e in out["entries"]]
+    assert "checkpoint" in kinds and "auto" in kinds
+    for e in out["entries"]:
+        assert e.get("thumbnail_file"), e
+        assert (td / f'{e["commit"]}.png').exists()
+        for field in ("message", "summary"):
+            _assert_no_git_vocab(str(e.get(field) or ""))
+
+
+def test_save_rejects_release_kind(project):
+    out = _call("plm_save", path=str(project), kind="release")
+    assert out["ok"] is False and out["reason"] == "invalid_mode"
+
+
+# ---------------------------------------------------------------------------
+# restore round trip
+# ---------------------------------------------------------------------------
+
+def test_restore_round_trip(project):
+    st0 = _call("plm_status", path=str(project))
+    base = st0["head"]
+    _write(project, "Bracket.step+", _part(9.0))
+    saved = _call("plm_save", path=str(project))
+    assert saved["ok"]
+    out = _call("plm_restore", path=str(project), commit=base)
+    assert out["ok"] and out["entry"]["kind"] == "restore"
+    # the working file is back to wall=3, and history GREW (forward-only)
+    hist = _call("plm_history", path=str(project))["entries"]
+    assert hist[0]["kind"] == "restore"
+    assert len(hist) >= 3
+    with zipfile.ZipFile(io.BytesIO((project / "Bracket.step+").read_bytes())) as zf:
+        doc = json.loads(zf.read("document.json"))
+    assert doc["features"][0]["params"]["wall"] == 3.0
+
+
+# ---------------------------------------------------------------------------
+# compare
+# ---------------------------------------------------------------------------
+
+def test_compare_semantic(project):
+    st0 = _call("plm_status", path=str(project))
+    item_id = st0["items"][0]["item_id"]
+    a = st0["head"]
+    _write(project, "Bracket.step+", _part(7.5))
+    b = _call("plm_save", path=str(project))["commit"]
+    out = _call("plm_compare", path=str(project), commit_a=a, commit_b=b,
+                item_id=item_id)
+    assert out["ok"]
+    assert "7.5" in json.dumps(out["doc_diff"]) or "7.5" in out["summary"]
+    _assert_no_git_vocab(out["summary"])
+
+
+# ---------------------------------------------------------------------------
+# release -> auto-branch draft -> discard (the T-R5 toast round trip)
+# ---------------------------------------------------------------------------
+
+def test_release_then_start_rev_then_discard(project):
+    st0 = _call("plm_status", path=str(project))
+    item_id = st0["items"][0]["item_id"]
+    rel = _call("plm_release", path=str(project), item_id=item_id,
+                message="first release", confirm=True)
+    assert rel["ok"] and rel["rev"] == "A"
+
+    # the silent auto-branch: first edit of a Released doc -> start_new_rev
+    out = _call("plm_item_set", path=str(project), item_id=item_id,
+                start_new_rev=True)
+    assert out["ok"] and out["working_rev"] == "B"
+    assert out["item"]["lifecycle"] == "In work"
+
+    # edit the working file (the draft)
+    _write(project, "Bracket.step+", _part(11.0))
+    assert _call("plm_save", path=str(project))["ok"]
+
+    # "back to rev A (discard draft)"
+    disc = _call("plm_discard_draft", path=str(project), item_id=item_id)
+    assert disc["ok"]
+    assert disc["item"]["lifecycle"] == "Released"
+    assert disc["item"]["rev"] == "A"
+    with zipfile.ZipFile(io.BytesIO((project / "Bracket.step+").read_bytes())) as zf:
+        doc = json.loads(zf.read("document.json"))
+    assert doc["features"][0]["params"]["wall"] == 3.0
+    # forward-only: the discard appended entries, nothing was erased
+    hist = _call("plm_history", path=str(project))["entries"]
+    assert hist[0]["kind"] == "auto"          # lifecycle flip back to Released
+    assert any(e["kind"] == "restore" for e in hist)
+    assert any(e["kind"] == "release" for e in hist)
+
+
+def test_discard_without_release_is_refused(project):
+    st0 = _call("plm_status", path=str(project))
+    item_id = st0["items"][0]["item_id"]
+    out = _call("plm_discard_draft", path=str(project), item_id=item_id)
+    assert out["ok"] is False and out["reason"] == "not_found"
+    _assert_no_git_vocab(out["hint"])
+
+
+# ---------------------------------------------------------------------------
+# part-number scheme
+# ---------------------------------------------------------------------------
+
+def test_scheme_set_changes_suggestions_not_items(project):
+    st0 = _call("plm_status", path=str(project))
+    old_number = st0["items"][0]["part_number"]
+    out = _call("plm_scheme_set", path=str(project), prefix="prj")
+    assert out["ok"]
+    assert out["part_number_prefix"] == "PRJ"
+    assert out["next_part_number"].startswith("PRJ-")
+    st1 = _call("plm_status", path=str(project))
+    assert st1["items"][0]["part_number"] == old_number  # never rewritten
+    assert st1["next_part_number"].startswith("PRJ-")
+
+
+def test_scheme_set_rejects_empty(project):
+    out = _call("plm_scheme_set", path=str(project), prefix="  !!")
+    assert out["ok"] is False and out["reason"] == "invalid_mode"
+
+
+def test_item_set_part_number_editable(project):
+    st0 = _call("plm_status", path=str(project))
+    item_id = st0["items"][0]["item_id"]
+    out = _call("plm_item_set", path=str(project), item_id=item_id,
+                part_number="CUSTOM-42")
+    assert out["ok"] and out["item"]["part_number"] == "CUSTOM-42"
+
+
+# ---------------------------------------------------------------------------
+# plm_draft — local tier + manual fallback
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _clear_hook():
+    yield
+    worker_rpc.set_local_draft_hook(None)
+
+
+def test_draft_manual_fallback_without_local_model(project, monkeypatch):
+    monkeypatch.setenv("AICAD_PLM_DRAFT_LOCAL", "0")  # simulate: not provisioned
+    _write(project, "Bracket.step+", _part(6.0))
+    out = _call("plm_draft", path=str(project))
+    assert out["ok"]
+    assert out["source"] == "manual"
+    assert out["message"] == ""          # plain manual box in the GUI
+    assert out["summary"]                # T-R3 context still shown
+    _assert_no_git_vocab(out["summary"])
+
+
+def test_draft_local_model_phrases_from_summary(project):
+    _write(project, "Bracket.step+", _part(6.0))
+    worker_rpc.set_local_draft_hook(
+        lambda summary: "Increased the wall to 6 for stiffness")
+    out = _call("plm_draft", path=str(project))
+    assert out["ok"]
+    assert out["source"] == "local_model"
+    assert out["message"] == "Increased the wall to 6 for stiffness"
+    _assert_no_git_vocab(out["message"])
+
+
+def test_draft_rejects_git_vocab_from_model(project):
+    _write(project, "Bracket.step+", _part(6.0))
+    worker_rpc.set_local_draft_hook(lambda s: "Commit the new wall of 6.0")
+    out = _call("plm_draft", path=str(project))
+    assert out["source"] == "manual" and out["message"] == ""
+
+
+def test_draft_rejects_invented_numerals(project):
+    _write(project, "Bracket.step+", _part(6.0))
+    worker_rpc.set_local_draft_hook(lambda s: "Changed the wall to 6.2")
+    out = _call("plm_draft", path=str(project))
+    assert out["source"] == "manual" and out["message"] == ""
+
+
+def test_draft_no_changes_is_empty(project):
+    out = _call("plm_draft", path=str(project))
+    assert out["ok"] and out["summary"] == "" and out["source"] == "manual"
+
+
+def test_draft_release_mode(project):
+    st0 = _call("plm_status", path=str(project))
+    item_id = st0["items"][0]["item_id"]
+    _write(project, "Bracket.step+", _part(6.0))
+    # a never-released item's release note is "First version of Bracket." —
+    # numeral-free, so the phrased draft must stay numeral-free too
+    worker_rpc.set_local_draft_hook(
+        lambda s: "First version of the bracket, ready to ship")
+    out = _call("plm_draft", path=str(project), mode="release", item_id=item_id)
+    assert out["ok"] and out["source"] == "local_model"
+
+
+def test_draft_invalid_mode(project):
+    out = _call("plm_draft", path=str(project), mode="banana")
+    assert out["ok"] is False and out["reason"] == "invalid_mode"

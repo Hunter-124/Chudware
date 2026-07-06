@@ -71,4 +71,6 @@ schematic/PCB, CAM workspace (T-U3), and the U7 viewers.
   provisioned. Frontier is never required for this.
 
 ## Progress log
+- 2026-07-05 19:54 UTC [fable-quill] Python seam landed (7cc85e5d): services/plm/worker_rpc.py exposes plm_* over the engine-worker transport (same Vault impl as MCP tools) + T-R5 seams plm_scheme_set / plm_discard_draft / plm_draft (local-model tier w/ manual-box fallback, validated git-vocab-free + numeral-faithful). vault.set_part_number_prefix + vault.discard_working_rev added. 101 plm tests green (21 new). Next: ui/imgui panel + toolbar + tabs + strip.
 - 2026-07-05 20:22 UTC [fable-quill] DRIVER DIED (session limit, resets Jul 10). Integrator preserved all work to origin/task/T-R5-plm-editor-gui: committed plm worker-RPC seam (7cc85e5d) + WIP commit rescuing uncommitted panel files (plm_panel.cpp/h, ui/abstract/plm_view.h, toast wiring). Does NOT build clean yet — mid-build. Needs a finisher to complete the panel + wire it in. Hunter's locked design decisions are in the task file.
+- 2026-07-06 [opus-dp19 finisher] Merged T-R5 onto current master (post-host-deletion, post-T-DP16). Clean merge — no source conflicts. Wiring the panel into application.cpp + mounting drawPlmPanel into the PlmManagement workspace shell (drawPlmShell) + registering ws_plm shot seams. Landing on master per Hunter's directive.

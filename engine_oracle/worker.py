@@ -267,6 +267,22 @@ except Exception as _dag_import_err:  # noqa: BLE001
         " not registered: %s", _dag_import_err)
 # === end DAG steering ===
 
+# === PLM vault seam (T-R5, Pillar 19) — plm_open/status/history/save/checkpoint/... ===
+# Reaches the PLM vault engine (services/plm/) over the same worker seam so the in-editor
+# PLM GUI (ui/imgui/src/ui/plm_panel.cpp: history timeline, checkpoint/release toolbar,
+# compare view, revision badges) drives the SAME single implementation as the plm_* MCP
+# tools.  Gracefully absent when dulwich isn't provisioned (each method returns the
+# contract-shaped {ok:false, reason:"no_vault"} envelope, never a traceback).
+try:
+    from services.plm.worker_rpc import WORKER_METHODS as _PLM_METHODS  # noqa: E402
+    _METHODS.update(_PLM_METHODS)
+except Exception as _plm_import_err:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger("ai-cad.worker").warning(
+        "services.plm.worker_rpc unavailable — plm_* worker methods not registered: %s",
+        _plm_import_err)
+# === end PLM vault ===
+
 
 def _emit(obj: dict) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")

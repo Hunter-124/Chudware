@@ -28,6 +28,7 @@
 #include "ui/watch_grid_panel.h"       // T-W17 multi-viewport watch grid
 #include "ui/agent_dag_panel.h"        // T-DP17 interactive agent DAG widget
 #include "ui/workspace_shells.h"       // T-DP15 full-viewport workspace shell panels
+#include "ui/plm_panel.h"              // T-R5 PLM compare panel + per-frame tick
 #include "theme/theme.h"
 #include "theme/texture_cache.h"
 
@@ -218,11 +219,11 @@ void Application::frame() {
     ImGui::Begin("AI Agent###ai_agent_ws", nullptr, pflags);
     ImGui::End();
 
-    // T-DP15: PLM project-hub full-viewport shell — same pattern as AiAgent above.
-    // Body (project tree, change history, release flow) lands in the R-stack.
+    // T-DP15/T-R5: PLM project-hub full-viewport shell — no-draw dock stub, kept only for
+    // dock-layout registration (same rationale as the AiAgent/ECAD stubs above). The History
+    // timeline + checkpoint/release/compare surface is drawn as a content-swap INSIDE the
+    // full-screen Viewport window (viewport.cpp, gated on workspace==PlmManagement).
     ImGui::Begin("PLM###plm_ws", nullptr, pflags);
-    if (s.effectiveWorkspace() == cmd::Workspace::PlmManagement)
-        ui::drawPlmShell(s);
     ImGui::End();
 
     // Pinned glass Copilot column over the viewport's right edge (replaces "Assistant###agent").
@@ -456,7 +457,25 @@ void Application::frame() {
         ImGui::End();
     }
 
+    // T-R5 finisher: PLM compare view — side-by-side change list, opened from the
+    // History timeline's right-click "Compare" affordance (plmComparePanelOpen()).
+    if (*ui::plmComparePanelOpen()) {
+        const ImGuiViewport* vpc = ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(ImVec2(vpc->WorkPos.x + vpc->WorkSize.x * 0.5f,
+                                       vpc->WorkPos.y + vpc->WorkSize.y * 0.5f),
+                                ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(760.f * theme::S(), 560.f * theme::S()),
+                                 ImGuiCond_Appearing);
+        if (ImGui::Begin("Compare###plm_compare", ui::plmComparePanelOpen(), pflags))
+            ui::drawPlmComparePanel(s);
+        ImGui::End();
+    }
+
     ImGui::PopStyleColor();
+
+    // T-R5 finisher: drive PLM checkpoint/release popovers + drain toast actions
+    // (discard-draft). Cheap per-frame tick; safe with no project open.
+    ui::plmFrameTick(s);
 
     if (s.paletteOpen) ui::drawCommandPalette(s);
 

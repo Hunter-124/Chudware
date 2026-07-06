@@ -2,8 +2,8 @@
 id: T-DP15
 title: Workspace-switching architecture — full-viewport workspaces + overlay-hosting workspaces
 workstream: DP
-owner: unassigned
-status: todo
+owner: sonnet-clay1
+status: doing
 branch: task/T-DP15-workspace-switching
 depends_on: []
 lane: app-gui

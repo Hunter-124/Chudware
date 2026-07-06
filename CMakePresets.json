@@ -59,6 +59,23 @@
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
       }
+    },
+    {
+      "name": "windows-app",
+      "displayName": "Windows app (ImGui GUI, Ninja + MSVC)  [T-WIN1 — UNVERIFIED]",
+      "description": "Configure the cross-platform ImGui GUI (ui/imgui/) on Windows. Mirrors 'linux-app'; ui/imgui/CMakeLists.txt already carries the WIN32 link block (opengl32/dwmapi/comdlg32). Run from an 'x64 Native Tools Command Prompt for VS 2022'. The app dlopens libaicad at runtime — build 'windows-occt' first so libaicad.dll exists. STATUS: not yet human-verified on Windows (T-WIN1 / GUI-migration Wave 6); this preset is the starting point for that verification. See docs/BUILD_WINDOWS.md.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-app",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "AICAD_BUILD_APP": "ON",
+        "AICAD_BUILD_UI_ABSTRACT": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     }
   ],
   "buildPresets": [
@@ -80,6 +97,11 @@
     {
       "name": "windows-occt",
       "configurePreset": "windows-occt",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-app",
+      "configurePreset": "windows-app",
       "configuration": "Release"
     }
   ]

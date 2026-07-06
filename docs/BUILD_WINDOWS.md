@@ -2,7 +2,8 @@
 
 Status: the **C++ core (with and without the OCCT geometry kernel)** and the **Python runtime +
 test suite** are verified on Windows 11 (MSVC 14.44 / VS 2022 Build Tools, CMake 4.3, Ninja 1.13,
-Python 3.12). The ImGui desktop app is not yet wired for Windows (see [Not yet](#not-yet-verified)).
+Python 3.12). The legacy `host/` app ships on Windows today; the cross-platform `ui/imgui` app
+now has a `windows-app` preset but is not yet human-verified on Windows (T-WIN1 — see [ImGui app](#imgui-app-uiimgui--the-cross-platform-gui-t-win1-in-progress)).
 
 ## 0. One-time checkout fix — symlinks
 
@@ -105,7 +106,32 @@ plus a missing `langgraph-checkpoint-sqlite` dependency that blocks `services/da
 - **Legacy `UnicodeEncodeError` on `work.py board`** was a cp1252-console bug, fixed on `master`
   (`work.py` forces UTF-8 stdout). If you hit it on an old checkout, pull latest.
 
-## Desktop app (`host/`) — Windows status (T-WIN1)
+## ImGui app (`ui/imgui`) — the cross-platform GUI (T-WIN1, in progress)
+
+`ui/imgui/` (target `AI-CAD2`) is the **single cross-platform GUI** that replaces the legacy
+`host/` app on both Linux and Windows. Its `CMakeLists.txt` already carries the Windows link
+block (`opengl32`/`dwmapi`/`comdlg32`), so the code is ready; T-WIN1 is about wiring + verifying
+the Windows build. A `windows-app` preset now exists as the starting point:
+
+```
+cmake --preset windows-occt      REM build libaicad.dll first (the app dlopens it at runtime)
+cmake --build --preset windows-occt
+cmake --preset windows-app       REM configure the ImGui GUI (build\windows-app\)
+cmake --build --preset windows-app
+build\windows-app\bin\AI-CAD2.exe
+```
+
+**STATUS: NOT yet human-verified on Windows.** Likely first snags to work through: the
+`AICAD_DEFAULT_LIBAICAD` compile-time default path (points at the Linux `.so` — needs the Windows
+`.dll` path or a runtime override), and staging the OCCT/Netgen sibling DLLs next to `AI-CAD2.exe`
+(reuse `build.bat`'s dual-layout staging logic). Once this builds + renders with UI parity,
+Windows can drop the legacy `host/` app (below) and `host/` is deleted (T-G11) — collapsing the
+two GUI trees into one. Please report findings so the preset/docs can be corrected.
+
+## Desktop app (`host/`) — LEGACY Windows app (deleted by T-G11)
+
+> Legacy tree. New GUI work goes in `ui/imgui/` (above), never here — see AGENTS.md. This
+> section documents the app Windows ships **today**, until T-WIN1 lands `windows-app`.
 
 The imgui desktop host **builds, launches, and renders on Windows 10/11** (MSVC 14.44,
 VS 2022). Build it with:

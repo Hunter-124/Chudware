@@ -52,6 +52,13 @@ physically lives today. "→ moves" marks dirs slated to move per the plan.
   features or bug fixes — `host/` is reference-only for T-G23.
 - **Double-patching both `host/` and `ui/imgui/` requires explicit lead approval.**
   If your task seems to require touching both, stop and ask.
+- **Watch the DUPLICATED form/PropertyManager schema.** Feature form specs (wells, field
+  kinds, params) live in BOTH `host/src/ui/pm_forms.cpp` AND the shared
+  `ui/abstract/panel_spec.cpp`. `host/` reads its copy; the Linux app reads `ui/abstract`.
+  A form/PM fix (selector kinds, wells, gating) belongs in **`ui/abstract/panel_spec.cpp`** —
+  patching only `host/pm_forms.cpp` never reaches the shipping Linux app (this is how T-BL35's
+  datum-axis fix diverged; fixed in `41915e8c`). The gate's `host/ freeze` advisory flags any
+  `host/src/ui/` edit on a branch to catch this.
 - `host/` is deleted by T-G11, which depends on T-G23 and T-G25 landing first plus
   a human-verified Windows build.
 - Scripted GUI launches (gate.sh, tools/gui_parity/run_all.py) always use `xvfb-run`

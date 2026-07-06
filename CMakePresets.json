@@ -62,8 +62,8 @@
     },
     {
       "name": "windows-app",
-      "displayName": "Windows app (ImGui GUI, Ninja + MSVC)  [T-WIN1 — UNVERIFIED]",
-      "description": "Configure the cross-platform ImGui GUI (ui/imgui/) on Windows. Mirrors 'linux-app'; ui/imgui/CMakeLists.txt already carries the WIN32 link block (opengl32/dwmapi/comdlg32). Run from an 'x64 Native Tools Command Prompt for VS 2022'. The app dlopens libaicad at runtime — build 'windows-occt' first so libaicad.dll exists. STATUS: not yet human-verified on Windows (T-WIN1 / GUI-migration Wave 6); this preset is the starting point for that verification. See docs/BUILD_WINDOWS.md.",
+      "displayName": "Windows app (ImGui GUI, Ninja + MSVC)  [T-G11 — agent-verified]",
+      "description": "Configure the cross-platform ImGui GUI (ui/imgui/) on Windows. Mirrors 'linux-app'; ui/imgui/CMakeLists.txt carries the WIN32 link block (opengl32/dwmapi/comdlg32) + the SHELL:/FI fix_math.h force-include (fixed for Ninja under T-G11 — the plain /FI\"path\" form embedded literal quotes and hit C1083). Run from an 'x64 Native Tools Command Prompt for VS 2022'. The app dlopens libaicad at runtime — build 'windows-occt' first so libaicad.dll exists. STATUS: agent-verified 2026-07-06 (opus-sweep, MSVC 14.44) — configure+build clean (0 errors) and the binary runs headless (--shot → 1616x1039 PNG). A HUMAN interactive smoke (open part / sketch / extrude / save) is still required for the T-G11 host/-deletion gate. See docs/BUILD_WINDOWS.md.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-app",
       "cacheVariables": {

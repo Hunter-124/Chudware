@@ -3,7 +3,7 @@ id: T-DP12
 title: GUI sub-agent model-preference settings + effort auto/advanced mode UI
 workstream: DP
 owner: sonnet-sorrel2
-status: review
+status: done
 branch: task/T-DP12-model-prefs-settings
 depends_on: [T-DP9]
 lane: app-gui

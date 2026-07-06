@@ -166,7 +166,13 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
 }  // namespace
 
 float docTabStripHeight(const AppState& st) {
-    (void)st;
+    // Doc-less global full-viewport workspaces (AiAgent, PLM) have no document, so the
+    // doc-tab strip would render as an empty band above the shell — suppress it there.
+    // (ECAD Schematic/Board + Sketch3D are doc-scoped and keep their tabs.)
+    // st.workspace (not effectiveWorkspace()) — the latter is non-const; AiAgent/PLM are
+    // never the inSketch case so the raw workspace is equivalent here.
+    const cmd::Workspace ws = st.workspace;
+    if (ws == cmd::Workspace::AiAgent || ws == cmd::Workspace::PlmManagement) return 0.f;
     return 26.f * theme::S();
 }
 

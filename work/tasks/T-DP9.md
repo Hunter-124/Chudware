@@ -35,3 +35,6 @@ overseer discretion, NO hard depth cap. Rails are a human-visible budget meter +
 - [ ] Budget meter tracks tokens/agents across the whole tree; kill-switch halts cleanly (test).
 - [ ] Per-role model routing honored; sub-agent model prefs read from config.
 - [ ] gate.sh PASS; graphify update.
+
+## Progress log
+- 2026-07-06 00:14 UTC [sonnet-onyx1] 86/86 delegation tests pass (26 new: TestBudgetMeter×9, TestKillSwitch×8, TestSoftLimitAdvisory×5, TestRoutingDelegationConfig×3). Committed 866ff86f. gate.sh running. Changes: removed hard DEPTH_CAP, added BudgetMeter, kill(), soft_depth_limit/max_agents advisory events, routing.yaml delegation: block, contracts/advisor.md §12 updated (1.5→1.6).

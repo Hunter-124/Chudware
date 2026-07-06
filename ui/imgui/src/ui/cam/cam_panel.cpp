@@ -13,6 +13,7 @@
 
 #include "app/app_state.h"
 #include "theme/domain_tokens.h"
+#include "theme/icons.h"
 
 #include <algorithm>
 #include <cmath>
@@ -394,10 +395,21 @@ void drawCamManager(app::AppState& st) {
     ImGui::SameLine(); if (ImGui::Button("Add Tool")) camHandleCommand(st, "cam_add_tool");
     ImGui::Separator();
     // operation buttons
-    auto opBtn = [&](const char* label, const char* cmd) { if (ImGui::Button(label)) camHandleCommand(st, cmd); ImGui::SameLine(); };
-    opBtn("Face", "cam_op_face"); opBtn("Contour", "cam_op_contour"); opBtn("Pocket", "cam_op_pocket");
-    opBtn("Adaptive", "cam_op_adaptive"); opBtn("Drill", "cam_op_drill"); opBtn("3D Parallel", "cam_op_parallel3d");
-    opBtn("Waterline", "cam_op_waterline3d"); opBtn("Turn", "cam_op_turn_rough"); if (ImGui::Button("Laser")) camHandleCommand(st, "cam_op_laser");
+    // Each op button carries its CAM toolpath tile ("cam_"+atlas name); the tile is a multi-color
+    // raster (opted out of SDF via atlas.json "raster_only"), drawn in the label's leading pad.
+    auto opBtn = [&](const char* label, const char* cmd, const char* icon) {
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float lh = ImGui::GetTextLineHeight();
+        const bool clicked = ImGui::Button(label);
+        icons::draw(ImGui::GetWindowDrawList(), icon,
+                    ImVec2(p.x + ImGui::GetStyle().FramePadding.x + lh * 0.5f, p.y + ImGui::GetFrameHeight() * 0.5f),
+                    lh * 1.05f, IM_COL32(255, 255, 255, 255));
+        if (clicked) camHandleCommand(st, cmd);
+        ImGui::SameLine();
+    };
+    opBtn("   Face", "cam_op_face", "cam_face"); opBtn("   Contour", "cam_op_contour", "cam_contour2d"); opBtn("   Pocket", "cam_op_pocket", "cam_pocket2d");
+    opBtn("   Adaptive", "cam_op_adaptive", "cam_adaptive2d"); opBtn("   Drill", "cam_op_drill", "cam_drill"); opBtn("   3D Parallel", "cam_op_parallel3d", "cam_parallel3d");
+    opBtn("   Waterline", "cam_op_waterline3d", "cam_waterline3d"); opBtn("   Turn", "cam_op_turn_rough", "cam_turn_rough"); opBtn("   Laser", "cam_op_laser", "cam_cut2d");
     ImGui::Separator();
     if (ImGui::Button("Generate")) doGenerate(st);
     ImGui::SameLine(); if (ImGui::Button("Simulate")) doSimulate(st);

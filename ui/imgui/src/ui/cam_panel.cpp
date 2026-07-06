@@ -18,6 +18,7 @@
 
 #include "app/app_state.h"
 #include "worker_client.h"
+#include "theme/icons.h"
 
 #include <nlohmann/json.hpp>
 
@@ -685,18 +686,27 @@ void drawCamWorkspacePanel(app::AppState& s) {
     ImGui::Dummy(ImVec2(0, 2.f * S));
 
     // Op-add compact button row
-    auto opBtn = [&](const char* lbl, const char* type) {
-        if (ImGui::SmallButton(lbl)) addOp(s, type);
+    // Each op button carries its CAM toolpath tile (host/assets/icons atlas, "cam_"+type).
+    // The tile is a multi-color raster (opted out of SDF via atlas.json "raster_only"), drawn in
+    // the label's leading pad so it reads as icon + text.
+    auto opBtn = [&](const char* lbl, const char* type, const char* icon) {
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float lh = ImGui::GetTextLineHeight();
+        const bool clicked = ImGui::SmallButton(lbl);
+        icons::draw(ImGui::GetWindowDrawList(), icon,
+                    ImVec2(p.x + lh * 0.62f, p.y + lh * 0.5f), lh * 0.95f,
+                    IM_COL32(255, 255, 255, 255));
+        if (clicked) addOp(s, type);
         ImGui::SameLine();
     };
-    opBtn("Face",     "face");
-    opBtn("Contour",  "contour2d");
-    opBtn("Pocket",   "pocket2d");
-    opBtn("Adaptive", "adaptive2d");
-    opBtn("Drill",    "drill");
-    opBtn("3D Para",  "parallel3d");
-    opBtn("Turn",     "turn_rough");
-    if (ImGui::SmallButton("Laser")) addOp(s, "cut2d");
+    opBtn("   Face",     "face",       "cam_face");
+    opBtn("   Contour",  "contour2d",  "cam_contour2d");
+    opBtn("   Pocket",   "pocket2d",   "cam_pocket2d");
+    opBtn("   Adaptive", "adaptive2d", "cam_adaptive2d");
+    opBtn("   Drill",    "drill",      "cam_drill");
+    opBtn("   3D Para",  "parallel3d", "cam_parallel3d");
+    opBtn("   Turn",     "turn_rough", "cam_turn_rough");
+    opBtn("   Laser",    "cut2d",      "cam_cut2d");
 
     ImGui::Dummy(ImVec2(0, 3.f * S));
 

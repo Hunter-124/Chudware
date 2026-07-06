@@ -69,6 +69,7 @@ void loadIcons(const std::string& assetsDir) {
         return;
     }
 
+    std::unordered_set<std::string> rasterOnly;
     try {
         nlohmann::json jroot = nlohmann::json::parse(buf);
         if (!jroot.contains("atlas_px") || !jroot["atlas_px"].is_array() ||
@@ -104,6 +105,12 @@ void loadIcons(const std::string& assetsDir) {
             c.v1 = static_cast<float>(y + h) / ah;
             gAtlas.cells[it.key()] = c;
         }
+
+        // Photographic/screenshot tiles (e.g. CAM toolpath renders) opt out of SDF derivation so
+        // they render as multi-color raster, not a flattened silhouette (T-G15/T-G16 contract).
+        if (jroot.contains("raster_only") && jroot["raster_only"].is_array())
+            for (const auto& n : jroot["raster_only"])
+                if (n.is_string()) rasterOnly.insert(n.get<std::string>());
     } catch (...) {
         std::fprintf(stderr, "[icons] atlas.json parse error\n");
         return;
@@ -118,7 +125,7 @@ void loadIcons(const std::string& assetsDir) {
             gAtlas.texDark = uploadTexture(px, w, h);
             // SDF derivation reads the still-live pixel buffer (shape is theme-independent, so
             // deriving once from the dark atlas covers both themes) — freed right after.
-            icons_sdf::build(px, w, h, gAtlas.cells);
+            icons_sdf::build(px, w, h, gAtlas.cells, rasterOnly);
             stbi_image_free(px);
         } else {
             std::fprintf(stderr, "[icons] failed to load atlas_dark.png: %s\n", stbi_failure_reason());

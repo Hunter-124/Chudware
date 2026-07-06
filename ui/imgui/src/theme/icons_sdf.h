@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace icons_sdf {
 
@@ -22,8 +23,13 @@ struct CellUV {
 // once, synchronously, from ui::loadIcons() while `rgba` (the already stbi_load'd pixel buffer of
 // ONE atlas image, e.g. atlas_dark.png) is still valid — SDF shape is theme-independent, so a
 // single atlas image is enough. GUI thread only (uploads a GL_R8 texture).
+// `rasterOnly` (atlas.json "raster_only", written by scripts/icon_pipeline.py) names glyphs that
+// opt OUT of SDF derivation: their neutral-grey shading can pass the chroma gate, but an SDF
+// re-raster would flatten the multi-color raster (e.g. CAM toolpath tiles) to a tinted silhouette
+// — they keep the raster path per the T-G15/T-G16 shared visual contract.
 void build(const unsigned char* rgba, int atlasW, int atlasH,
-           const std::unordered_map<std::string, CellUV>& cells);
+           const std::unordered_map<std::string, CellUV>& cells,
+           const std::unordered_set<std::string>& rasterOnly = {});
 
 // Deletes the SDF + CPU re-raster cache GL textures and clears all CPU state. Call from
 // ui::freeIcons().

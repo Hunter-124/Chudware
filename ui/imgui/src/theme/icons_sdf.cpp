@@ -14,6 +14,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -250,7 +251,8 @@ const CacheEntry& rasterize(int id, int sizePx, Variant variant) {
 }  // namespace
 
 void build(const unsigned char* rgba, int atlasW, int atlasH,
-           const std::unordered_map<std::string, CellUV>& cells) {
+           const std::unordered_map<std::string, CellUV>& cells,
+           const std::unordered_set<std::string>& rasterOnly) {
     if (gSdfTex || !gGlyphs.empty()) return;  // idempotent — ui::loadIcons() also guards this
     if (!rgba || atlasW <= 0 || atlasH <= 0) return;
 
@@ -271,6 +273,10 @@ void build(const unsigned char* rgba, int atlasW, int atlasH,
     std::vector<Candidate> candidates;
     candidates.reserve(by32.size());
     auto tryAdd = [&](const std::string& base, const CellUV& uv) {
+        // Photographic/screenshot tiles (T-G15): explicit raster-only opt-out — their neutral-grey
+        // shading can pass the chroma gate, but an SDF re-raster would flatten them to a tinted
+        // silhouette (contract: photographic icons stay multi-color raster).
+        if (rasterOnly.count(base)) return;
         int px0 = (int)std::lround(uv.u0 * atlasW);
         int py0 = (int)std::lround(uv.v0 * atlasH);
         int pw  = (int)std::lround((uv.u1 - uv.u0) * atlasW);

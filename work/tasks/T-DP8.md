@@ -3,7 +3,7 @@ id: T-DP8
 title: Council policy engine — per-stage, per-tier, diverse-model, configurable
 workstream: DP
 owner: sonnet-flint1
-status: doing
+status: review
 branch: task/T-DP8-council-policy
 depends_on: [T-DP1]
 lane: ai-copilot

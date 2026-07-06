@@ -1,9 +1,10 @@
 # Building AI-CAD on Windows
 
-Status: the **C++ core (with and without the OCCT geometry kernel)** and the **Python runtime +
-test suite** are verified on Windows 11 (MSVC 14.44 / VS 2022 Build Tools, CMake 4.3, Ninja 1.13,
-Python 3.12). The legacy `host/` app ships on Windows today; the cross-platform `ui/imgui` app
-now has a `windows-app` preset but is not yet human-verified on Windows (T-WIN1 — see [ImGui app](#imgui-app-uiimgui--the-cross-platform-gui-t-win1-in-progress)).
+Status: the **C++ core (with and without the OCCT geometry kernel)**, the **Python runtime +
+test suite**, and the **unified `ui/imgui` GUI (`windows-app` / `AI-CAD2.exe`)** are all verified
+on Windows 11 (MSVC 14.44 / VS 2022 Build Tools, CMake 4.3, Ninja 1.13, Python 3.12). The legacy
+`host/` app tree was **deleted** (T-G11); `ui/imgui` is now the **single** cross-platform GUI on
+both Linux and Windows — see [ImGui app](#imgui-app-uiimgui--the-cross-platform-gui-t-win1-verified).
 
 ## 0. One-time checkout fix — symlinks
 
@@ -106,70 +107,54 @@ plus a missing `langgraph-checkpoint-sqlite` dependency that blocks `services/da
 - **Legacy `UnicodeEncodeError` on `work.py board`** was a cp1252-console bug, fixed on `master`
   (`work.py` forces UTF-8 stdout). If you hit it on an old checkout, pull latest.
 
-## ImGui app (`ui/imgui`) — the cross-platform GUI (T-WIN1, in progress)
+## ImGui app (`ui/imgui`) — the cross-platform GUI (T-WIN1, VERIFIED)
 
-`ui/imgui/` (target `AI-CAD2`) is the **single cross-platform GUI** that replaces the legacy
-`host/` app on both Linux and Windows. Its `CMakeLists.txt` already carries the Windows link
-block (`opengl32`/`dwmapi`/`comdlg32`), so the code is ready; T-WIN1 is about wiring + verifying
-the Windows build. A `windows-app` preset now exists as the starting point:
+`ui/imgui/` (target `AI-CAD2.exe`, aliased `ShopCraft.exe`) is the **single cross-platform GUI**
+on both Linux and Windows. The legacy `host/` tree was **deleted** (T-G11) — there is no
+Windows-only GUI. Build it after the core:
 
 ```
-cmake --preset windows-occt      REM build libaicad.dll first (the app dlopens it at runtime)
+cmake --preset windows-occt      REM build libaicad.dll first (the app loads it at runtime)
 cmake --build --preset windows-occt
 cmake --preset windows-app       REM configure the ImGui GUI (build\windows-app\)
 cmake --build --preset windows-app
 build\windows-app\bin\AI-CAD2.exe
 ```
 
-**STATUS: NOT yet human-verified on Windows.** Likely first snags to work through: the
-`AICAD_DEFAULT_LIBAICAD` compile-time default path (points at the Linux `.so` — needs the Windows
-`.dll` path or a runtime override), and staging the OCCT/Netgen sibling DLLs next to `AI-CAD2.exe`
-(reuse `build.bat`'s dual-layout staging logic). Once this builds + renders with UI parity,
-Windows can drop the legacy `host/` app (below) and `host/` is deleted (T-G11) — collapsing the
-two GUI trees into one. Please report findings so the preset/docs can be corrected.
-
-## Desktop app (`host/`) — LEGACY Windows app (deleted by T-G11)
-
-> Legacy tree. New GUI work goes in `ui/imgui/` (above), never here — see AGENTS.md. This
-> section documents the app Windows ships **today**, until T-WIN1 lands `windows-app`.
-
-The imgui desktop host **builds, launches, and renders on Windows 10/11** (MSVC 14.44,
-VS 2022). Build it with:
+**STATUS: VERIFIED on Win11 — MSVC 14.44 / VS 2022 Build Tools, CMake 4.3, Ninja (T-WIN1).**
+Clean `windows-app` build; `AI-CAD2.exe` links and renders the full GUI backed by the in-process
+C++ OCCT engine (no Python worker required for modeling). Smoke tests, both green:
 
 ```
-build.bat            REM configures host\ (VS 2022 gen), compiles AI-CAD.exe, stages dist\AI-CAD\
+build\windows-app\bin\AI-CAD2.exe --selftest
+REM -> [selftest] save=1 open=1 features=3 rev=0 -> OK   (part built + .step+ round-trips via libaicad)
+
+build\windows-app\bin\AI-CAD2.exe --shot out.png --frames 30
+REM -> writes a 1616x1039 PNG: ribbon + icons + fonts, FeatureManager (Base/Fillet/Shell),
+REM    dark theme, and the 3D viewport solid FRAMED correctly — full UI + render parity with Linux.
 ```
 
-`build.bat` stages `libaicad.dll` + the OCCT/Netgen sibling DLLs next to the exe (it now
-finds them in **either** the VS `core\build-occt\bin\Release` layout **or** the Ninja
-`build\windows-occt\bin` preset layout — see the dual-layout staging fix).
+The framed-viewport shot closes the viewport-framing question left open in the old `host/`-era
+notes: the unified app draws **and** frames geometry correctly on Windows.
 
-**Headless screenshot capture** (drives the GUI with no visible window):
+### Windows seams fixed for the bring-up
 
-```
-set AI_CAD_HIDDEN=1
-set AI_CAD_REPO=C:\path\to\CAD
-set AI_CAD_SHOT=sketch      REM scenarios: settings|chat|ribbon|pmform|m1|sketch|asm|fea|...
-dist\AI-CAD\AI-CAD.exe      REM writes PNGs to %AI_CAD_REPO%\scratch\<scenario>_shots\
-```
+All are `if(WIN32)`/`if(MSVC)` build-file conditionals in `ui/imgui/CMakeLists.txt` — the Linux
+`else()` path is byte-for-byte unchanged (no source forks, no `host/` resurrection):
 
-Verified via the `sketch` scenario: UI chrome (ribbon, FeatureManager, Copilot, dark theme)
-renders correctly; the sketch solver reports **Fully Defined DOF: 0**; and the engine builds
-a real parametric solid (`Sketch1 -> Boss-Extrude1 -> Solid Bodies(1)/Body1`). So the
-**geometry kernel, sketch constraint solver, and UI all reach parity on Windows.**
+- **`/FI fix_math.h` quoting (fatal C1083).** The MSVC force-include shim was written
+  `/FI"...path..."`; under the **Ninja + MSVC** generator a repo path containing a space (e.g.
+  `AI PROJECTS`) leaks the literal quote chars into the filename, so `cl` reports *"Cannot open
+  include file"*. Fix: drop the inner quotes (`/FI${path}`) so Ninja quotes the whole `/FI<path>`
+  token, which `cl` unwraps. (The old `host/` VS-generator build never exercised this quoting.)
+- **Engine resolution.** `AICAD_DEFAULT_LIBAICAD` — the runtime fallback `ui/imgui/src/main.cpp`
+  drops into the environment when `AI_CAD_LIBAICAD` is unset and no `libaicad.dll` sits next to
+  the exe — pointed at the dead VS layout `core/build-occt/bin/Release/`. Repointed at the Ninja
+  preset output `build/windows-occt/bin/libaicad.dll`; `cpp_core`'s `SetDllDirectoryW` then puts
+  that directory on the process search path so the ~100 sibling OCCT/Netgen `TK*.dll` **transitive**
+  deps also load — no manual DLL staging needed. To use a different build, set
+  `AI_CAD_LIBAICAD=<absolute path to libaicad.dll>`.
+- **Stale glad message** corrected — glad lives at `extern/glad` (`GLAD_DIR`), not `host/extern/glad`.
 
-### Open parity gaps (T-WIN1, honest status)
-
-- **Viewport geometry framing in headless capture is unconfirmed.** In `sketch`-scenario
-  captures the viewport *background* renders (sketch plane, origin triad) but the sketch
-  profile / extruded solid are not visibly framed. Undetermined whether the geometry is
-  drawn-but-not-zoomed-to-fit vs not drawn under `AI_CAD_HIDDEN`. **Needs an interactive
-  (visible-window) eyeball on Windows to confirm final render parity vs Linux.**
-- **`AI_CAD_SHOT=m1` scenario hangs headless.** On Windows `AppState::tryStartWorker()` requires
-  the managed **Python worker** (the in-process `libaicad` fallback is `#ifndef _WIN32`,
-  Linux-only — `host/src/core/app_state.cpp`); if worker start / the venv-freshness re-provision
-  gate stalls, the scenario never fires. The app is console-subsystem but its diagnostics go to
-  the in-app log (not stdout), so headless runs are hard to observe. Filed for the app-gui/engine
-  owner; not a WIN-lane fix.
-- **`freecad_parity` ctest** (48/49) — pre-existing MSVC-vs-GCC solver-convergence diff on the
-  point-on-ellipse case; reproduced here, not a Windows regression (see above).
+`freecad_parity` (windows-occt 48/49) remains the one pre-existing MSVC-vs-GCC solver-convergence
+diff on the point-on-ellipse case — not a Windows regression, not chased.

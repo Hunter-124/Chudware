@@ -158,6 +158,49 @@ def test_get_propagates_acquire_failure(provider_mods):
     assert rec == {"ok": False, "reason": "login_required", "ask_user": {"kind": "approval"}}
 
 
+def test_get_folds_vendor_extras_into_params(provider_mods):
+    """T-X7 item 3: acquire-envelope extras (e.g. McMaster sku + price) land in params
+    alongside site/url/fetched_ts, so vendor/SKU/URL/fetched-at ride on the part record."""
+    profiles, parts_provider = provider_mods
+    profiles.profile_dir("fakesite").mkdir(parents=True)
+    src = _FakeSourceAdapter()
+    src.acquire_return = {
+        "ok": True, "source_url": "https://fakesite.example/widget",
+        "fetched_ts": "2026-07-04T00:00:00Z", "session_profile_used": "fakesite",
+        "license_note": "n", "artifact_path": "/tmp/widget.step",
+        "sku": "91290A115", "price": "$12.34",
+    }
+    provider = parts_provider.BrowserCatalogAdapter(src)
+    rec = provider.get("catalog:fakesite::https://fakesite.example/widget")
+    assert rec["params"]["site"] == "fakesite"
+    assert rec["params"]["url"] == "https://fakesite.example/widget"
+    assert rec["params"]["fetched_ts"] == "2026-07-04T00:00:00Z"
+    assert rec["params"]["sku"] == "91290A115"
+    assert rec["params"]["price"] == "$12.34"
+    assert rec["geometry_ref"] == {"kind": "import_file", "path": "/tmp/widget.step"}
+
+
+def test_get_no_cad_vendor_has_null_geometry_and_price_in_params(provider_mods):
+    """Commerce/parts vendors (Amazon/JLCPCB/PCBWay) return artifact_path=None: the record
+    must carry geometry_ref=None (no importable file) and the price/availability in params,
+    and must NOT crash on the missing artifact_path (provenance_envelope omits it when None)."""
+    profiles, parts_provider = provider_mods
+    profiles.profile_dir("fakesite").mkdir(parents=True)
+    src = _FakeSourceAdapter()
+    src.acquire_return = {
+        "ok": True, "source_url": "https://fakesite.example/widget",
+        "fetched_ts": "2026-07-04T00:00:00Z", "session_profile_used": "fakesite",
+        "license_note": "n",  # no artifact_path key at all (no CAD file)
+        "price": "$9.99", "availability": "In Stock", "asin": "B00ABCDE12",
+    }
+    provider = parts_provider.BrowserCatalogAdapter(src)
+    rec = provider.get("catalog:fakesite::https://fakesite.example/widget")
+    assert rec["geometry_ref"] is None
+    assert rec["params"]["price"] == "$9.99"
+    assert rec["params"]["availability"] == "In Stock"
+    assert rec["params"]["asin"] == "B00ABCDE12"
+
+
 def test_count_and_iter_records_raise_not_implemented(provider_mods):
     _profiles, parts_provider = provider_mods
     provider = parts_provider.BrowserCatalogAdapter(_FakeSourceAdapter())

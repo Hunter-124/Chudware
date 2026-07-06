@@ -1,9 +1,10 @@
-# contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.6)
+# contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.7)
 
 Frozen 2026-07-04; §10–§15 added same day (1.0 → 1.1), §16–§17 (1.1 → 1.2),
 §18–§21 org layer (1.2 → 1.3), §22 design cognition ladder (1.3 → 1.4),
 §23 harness effort presets & user overrides (1.4 → 1.5, T-W28),
-§12 T-DP9 recursion + budget_meter + kill-switch (1.5 → 1.6, additive). All bumps additive. Companion to
+§12 T-DP9 recursion + budget_meter + kill-switch (1.5 → 1.6, additive),
+§11 T-DP5 verdict `targeted_reentry` reroute field (1.6 → 1.7, additive). All bumps additive. Companion to
 `docs/ADVISOR_ARCHITECTURE.md` (Pillar 20) and `docs/COPILOT_MISSION_PIPELINE.md`
 (pipeline operation).
 
@@ -287,6 +288,32 @@ not kernel facts). Two `blocker` audits with the same `class+finding` fingerprin
 mandatory ask_user. Change-request trigger: every user-issued fix/change first
 produces an audit-scoped change plan (affected requirements/dimensions/features/
 parts listed with ledger refs) before any mutation is dispatched.
+
+**T-DP5 additive amendment (1.6 → 1.7):** each non-`ok` verdict gains an optional
+`targeted_reentry` object — the **owning design-pipeline stage** a correction routes
+back to, so a fix re-enters the stage that produced the error rather than triggering
+a blind full retry (doc §3.1). It is computed **deterministically by the harness**
+(`services/agent/advisor/reroute.py`) from the verdict's evidence — the model does
+not supply it (`validate_audit` strips model-set fields; the reroute is attached
+post-validation). The routing keys off the ledger event **kind** cited in
+`evidence.ledger_events`, per the frozen `design_pipeline.md` §2/§4 table:
+
+```json
+"targeted_reentry": {
+  "stage": "decompose|geometry|linkage|buildpath",   // phases.py Phase value
+  "role": "feature_architect|geometry_designer|linkage_planner|orchestrator",
+  "basis": "why this target (which evidence kind / class fallback)",
+  "feature": "G1",          // the specific artifact id to re-enter at (or null)
+  "full_restart": false      // true ONLY when nothing resolves — a blind retry
+}
+```
+
+`feature`→decompose, `geometry_spec`→geometry, `linkage`→linkage, `build_node`→
+buildpath (the earliest owning stage wins when several kinds are cited — fix the
+deepest-upstream rung). Verdict `class` is a fallback signal only. `ok` verdicts
+carry `targeted_reentry: null`. This is additive; readers that ignore the field are
+unaffected. The same routing map powers the change-request `stage_reentry` on
+dispatch rows (a user "thicker wall" re-enters GEOMETRY on the wall's geometry_spec).
 
 ## §12 Delegation tree (`aicad.delegation/1`)
 

@@ -22,9 +22,15 @@ behind ``AI_CAD_COUNCIL_BUILDGRAPH`` (default on).
 
 ## Public API
 
-- ``council_convene(kind, topic, inputs, provider, ledger=None)``
+- ``council_convene(kind, topic, inputs, provider, ledger=None, providers=None)``
   Runs a full 2-round council and returns the council record dict.
   Signature is the seam T-W22's org.py will call; matching T-W22's stub.
+  ``providers`` is an optional list of Provider instances for diverse-model
+  selection (T-DP8); if omitted the single ``provider`` is used for all seats.
+
+- ``resolve_policy(stage, tier, *, overrides=None, path=None)``  — T-DP8
+  Resolve the CouncilPolicy for a given (stage, tier).  Returns a CouncilPolicy
+  dataclass with enabled/breadth/diverse_models/temperatures.
 
 - ``DissentsRegistry``   — live store of active dissents with trigger matching.
 - ``check_dissents(observation, registry)``  — foreman watch-hook (call after every
@@ -45,6 +51,16 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import yaml
+
+# ---------------------------------------------------------------------------
+# T-DP8: Council policy engine imports
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass as _dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path as _Path
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -72,6 +88,174 @@ _SEATS_YAML = (
 )
 
 _SEATS_CACHE: Optional[dict] = None
+
+# ---------------------------------------------------------------------------
+# T-DP8: Council policy engine (aicad.council_policy/1)
+# ---------------------------------------------------------------------------
+
+_POLICY_YAML = (
+    __import__("pathlib").Path(__file__).resolve().parent / "council_policy.yaml"
+)
+_POLICY_CACHE: Optional[dict] = None
+
+# Ordered seat names (from council_seats.yaml).  Breadth slices from index 0.
+_SEAT_ORDER: tuple[str, ...] = ("manufacturing", "tolerancing", "fitment", "simplicity")
+
+# Valid tier names (mirrors tiers.yaml profiles; must stay in sync).
+_KNOWN_TIERS: frozenset[str] = frozenset({"local-24k", "local-48k", "mid", "frontier"})
+
+
+@_dataclass(frozen=True)
+class CouncilPolicy:
+    """Resolved council policy for a (stage, tier) pair.
+
+    Attributes:
+        stage:          The pipeline stage (§1 vocabulary).
+        tier:           The model tier name.
+        enabled:        Whether the council is on by default.
+        breadth:        Number of seats to use (1–4, clamped).
+        diverse_models: True if multi-source model selection is requested.
+        temperatures:   Per-seat temperature list (length == breadth).
+                        When diverse_models=True AND multiple providers are
+                        injected, temperatures are advisory hints only —
+                        callers assign providers round-robin.
+                        When diverse_models=False OR only 1 provider:
+                        temperatures are the temperature-diversity fallback
+                        (base + index * spread).
+    """
+    stage: str
+    tier: str
+    enabled: bool
+    breadth: int
+    diverse_models: bool
+    temperatures: tuple[float, ...]
+
+    @property
+    def seat_names(self) -> tuple[str, ...]:
+        """Return the slice of seat names for this policy's breadth."""
+        return _SEAT_ORDER[: self.breadth]
+
+
+def _load_policy_yaml(path: Optional["_Path"] = None) -> dict:
+    """Load and cache council_policy.yaml.  Thread-unsafe (single-process)."""
+    global _POLICY_CACHE
+    if _POLICY_CACHE is not None and path is None:
+        return _POLICY_CACHE
+    import pathlib
+    p = path or _POLICY_YAML
+    if not isinstance(p, pathlib.Path):
+        p = pathlib.Path(p)
+    try:
+        raw = p.read_text(encoding="utf-8")
+        data = yaml.safe_load(raw)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"council_policy.yaml not found at {p}. "
+            "It is a canonical shipped file; check your checkout."
+        )
+    expected = "aicad.council_policy/1"
+    if data.get("schema") != expected:
+        raise RuntimeError(
+            f"council_policy.yaml schema mismatch: expected {expected!r}, "
+            f"got {data.get('schema')!r}"
+        )
+    if path is None:
+        _POLICY_CACHE = data
+    return data
+
+
+def _build_temperatures(
+    breadth: int,
+    base_temp: float,
+    spread: float,
+) -> tuple[float, ...]:
+    """Build per-seat temperatures for temperature-diversity fallback.
+
+    Seat 0 gets base_temp; seat i gets base_temp + i*spread, clamped to [0.0, 1.0].
+    """
+    temps: list[float] = []
+    for i in range(breadth):
+        t = base_temp + i * spread
+        temps.append(max(0.0, min(1.0, t)))
+    return tuple(temps)
+
+
+def resolve_policy(
+    stage: str,
+    tier: str,
+    *,
+    overrides: Optional[dict] = None,
+    path: Optional["_Path"] = None,
+) -> CouncilPolicy:
+    """Resolve the council policy for a (stage, tier) pair.
+
+    Resolution order (lowest wins = last applied):
+      1. Shipped defaults from council_policy.yaml (stage row → defaults row).
+      2. ``overrides`` dict (Advanced mode / effort preset layer).
+
+    The ``deliberation`` field on TierProfile (full/standard/minimal) is NOT
+    read here — ``enabled`` and ``breadth`` encode its intent directly in the
+    yaml matrix, keeping the resolver self-contained.  Callers wanting to
+    force-disable based on the tier profile can pass
+    ``overrides={"enabled": False}``.
+
+    Args:
+        stage:     Pipeline stage name (§1 vocabulary; unknown stages use '*' fallback).
+        tier:      Tier name (local-24k | local-48k | mid | frontier).
+        overrides: Optional dict with any subset of {enabled, breadth, diverse_models}.
+                   Boolean and int values only — no nested structure.
+        path:      Override path for council_policy.yaml (tests).
+
+    Returns:
+        CouncilPolicy dataclass.
+
+    Raises:
+        RuntimeError: if council_policy.yaml is missing or malformed.
+    """
+    data = _load_policy_yaml(path)
+
+    base_temp: float = float(data.get("base_temperature", 0.7))
+    spread: float = float(data.get("temperature_spread", 0.1))
+
+    # Look up (stage, tier) row; fall back to defaults[tier].
+    stage_block = data.get("stages", {}).get(stage, {})
+    tier_row: Optional[dict] = stage_block.get(tier)
+    if tier_row is None:
+        # Fall back to the defaults block for this tier.
+        tier_row = data.get("defaults", {}).get(tier)
+    if tier_row is None:
+        # Last resort: safe defaults — local wide, frontier narrow.
+        import re as _re
+        is_local = tier.startswith("local")
+        tier_row = {
+            "enabled": True,
+            "breadth": 4 if is_local else 1,
+            "diverse_models": is_local,
+        }
+
+    enabled: bool = bool(tier_row.get("enabled", False))
+    breadth: int = max(1, min(4, int(tier_row.get("breadth", 1))))
+    diverse_models: bool = bool(tier_row.get("diverse_models", False))
+
+    # Apply overrides (Advanced mode layer).
+    if overrides:
+        if "enabled" in overrides:
+            enabled = bool(overrides["enabled"])
+        if "breadth" in overrides:
+            breadth = max(1, min(4, int(overrides["breadth"])))
+        if "diverse_models" in overrides:
+            diverse_models = bool(overrides["diverse_models"])
+
+    temperatures = _build_temperatures(breadth, base_temp, spread)
+
+    return CouncilPolicy(
+        stage=stage,
+        tier=tier,
+        enabled=enabled,
+        breadth=breadth,
+        diverse_models=diverse_models,
+        temperatures=temperatures,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +395,7 @@ def _run_seat(
     inputs: dict,
     round1_positions: Optional[list[dict]],
     provider: Any,
+    temperature: Optional[float] = None,
 ) -> tuple[dict, Optional[str]]:
     """Run one seat for one round.
 
@@ -220,6 +405,11 @@ def _run_seat(
     When T-W14 lands, replace with a ponder delegation of kind="ponder"
     (auto-approved, read-only, budget-bounded per §12 amendment).
     The signature of this function is the seam — callers don't change.
+
+    T-DP8: ``temperature`` is passed through to provider.complete() via
+    kwargs when provided.  Providers that don't accept temperature silently
+    ignore the kwarg (base.Provider.complete has no temperature param;
+    concrete providers that support it accept **kwargs).
     """
     prompt_text = persona_cfg["prompt"]
 
@@ -258,11 +448,29 @@ def _run_seat(
 
     user_message = "\n".join(parts)
 
-    reply = provider.complete(
-        system=prompt_text,
-        messages=[{"role": "user", "content": [{"type": "text", "text": user_message}]}],
-        max_tokens=1500,
-    )
+    # T-DP8: pass temperature as kwarg when set; providers that don't accept
+    # temperature (e.g. the base mock) gracefully fall back to the no-temp call.
+    if temperature is not None:
+        try:
+            reply = provider.complete(
+                system=prompt_text,
+                messages=[{"role": "user", "content": [{"type": "text", "text": user_message}]}],
+                max_tokens=1500,
+                temperature=temperature,
+            )
+        except TypeError:
+            # Provider doesn't accept temperature — fall back to base signature.
+            reply = provider.complete(
+                system=prompt_text,
+                messages=[{"role": "user", "content": [{"type": "text", "text": user_message}]}],
+                max_tokens=1500,
+            )
+    else:
+        reply = provider.complete(
+            system=prompt_text,
+            messages=[{"role": "user", "content": [{"type": "text", "text": user_message}]}],
+            max_tokens=1500,
+        )
 
     # Parse typed position
     position_dict, dissent = _parse_seat_reply(reply, persona)
@@ -657,6 +865,19 @@ def build_strategy_needed(feature_count: int) -> bool:
 # Main entry point — council_convene
 # ---------------------------------------------------------------------------
 
+def _pick_provider(providers: list[Any], seat_index: int) -> Any:
+    """Select a provider for a seat using round-robin over the provider list.
+
+    With 1 provider: always returns that provider (temperature-diversity fallback
+    handles diversity via the ``temperature`` kwarg).
+    With N providers: cycles by seat index so consecutive seats use different
+    model sources (diverse-model selection, T-DP8).
+    """
+    if not providers:
+        raise ValueError("_pick_provider: empty providers list")
+    return providers[seat_index % len(providers)]
+
+
 def council_convene(
     kind: str,
     topic: str,
@@ -666,21 +887,41 @@ def council_convene(
     *,
     actor: str = "council",
     registry: Optional[DissentsRegistry] = None,
+    providers: Optional[list[Any]] = None,
+    stage: Optional[str] = None,
+    tier: Optional[str] = None,
+    policy_overrides: Optional[dict] = None,
+    policy_path: Optional[Any] = None,
 ) -> dict:
     """Convene a council and return the completed aicad.council/1 record.
 
     This is the T-W22 seam: org.py will call council_convene(kind, topic, inputs).
-    The signature is stable.
+    The signature is stable; all new T-DP8 params are keyword-only with defaults.
 
     Args:
         kind:     Council kind (e.g. "build_strategy").
         topic:    Free-text topic for all seats.
         inputs:   dict with "ledger_refs" and/or "buildgraph" keys.
         provider: A Provider instance (mock or real).  Seats + chair call it.
+                  Used as the sole provider when ``providers`` is not given.
         ledger:   Optional Ledger instance.  Council record written as artifact
                   event; synthesis as decision event.
         actor:    Ledger actor string.
         registry: Optional DissentsRegistry to register dissents into.
+
+        T-DP8 keyword-only params:
+        providers:       Optional list of Provider instances.  When given with
+                         >1 element, seats are assigned round-robin (diverse-model
+                         selection).  When given with 1 element or omitted, a
+                         single provider is used with temperature-diversity fallback.
+        stage:           Pipeline stage name (§1 vocabulary).  Used to look up the
+                         resolved CouncilPolicy.  When None, the policy defaults
+                         (all seats from ``_new_council_record``) are used.
+        tier:            Tier name (local-24k | local-48k | mid | frontier).
+                         When None, no policy breadth capping is applied.
+        policy_overrides: Optional dict passed to ``resolve_policy`` for Advanced
+                         mode / effort preset overrides.
+        policy_path:     Override path for council_policy.yaml (tests).
 
     Returns:
         Completed aicad.council/1 record dict.
@@ -692,9 +933,41 @@ def council_convene(
     personas = get_seat_personas()
     record = _new_council_record(kind, topic, inputs)
 
+    # T-DP8: resolve policy when stage+tier provided; apply breadth + diversity.
+    policy: Optional[CouncilPolicy] = None
+    if stage is not None and tier is not None:
+        policy = resolve_policy(
+            stage,
+            tier,
+            overrides=policy_overrides,
+            path=policy_path,
+        )
+        # Cap seats to resolved breadth.
+        record["seats"] = list(record["seats"][: policy.breadth])
+        # Store policy metadata in the record for ledger/transparency.
+        record["policy"] = {
+            "stage": policy.stage,
+            "tier": policy.tier,
+            "breadth": policy.breadth,
+            "diverse_models": policy.diverse_models,
+        }
+
+    # Build the provider pool for diverse-model selection.
+    # Priority: explicit ``providers`` list > single ``provider``.
+    provider_pool: list[Any] = list(providers) if providers else [provider]
+
+    # Determine temperatures for temperature-diversity fallback.
+    # Active only when provider_pool has 1 source (or diverse_models is off).
+    use_temp_diversity = len(provider_pool) == 1
+    if policy is not None:
+        temps = policy.temperatures
+    else:
+        # Default temperatures when no policy: use base 0.7 + 0.1 spread.
+        temps = _build_temperatures(len(record["seats"]), 0.7, 0.1)
+
     # ── Round 1 ──────────────────────────────────────────────────────────────
     round1_positions: list[dict] = []
-    for seat_cfg in record["seats"]:
+    for seat_idx, seat_cfg in enumerate(record["seats"]):
         persona = seat_cfg["persona"]
         p_cfg = personas.get(persona)
         if p_cfg is None:
@@ -702,6 +975,10 @@ def council_convene(
                 f"Persona '{persona}' not found in council_seats.yaml. "
                 "Check the authored file."
             )
+        seat_provider = _pick_provider(provider_pool, seat_idx)
+        seat_temp: Optional[float] = (
+            temps[seat_idx] if use_temp_diversity and seat_idx < len(temps) else None
+        )
         pos, _dissent_r1 = _run_seat(
             persona=persona,
             persona_cfg=p_cfg,
@@ -709,7 +986,8 @@ def council_convene(
             topic=topic,
             inputs=inputs,
             round1_positions=None,
-            provider=provider,
+            provider=seat_provider,
+            temperature=seat_temp,
         )
         round1_positions.append(pos)
         # Round-1 positions are ledger notes (not final positions)
@@ -726,9 +1004,13 @@ def council_convene(
     final_positions: list[dict] = []
     final_dissents: list[dict] = []
 
-    for seat_cfg in record["seats"]:
+    for seat_idx, seat_cfg in enumerate(record["seats"]):
         persona = seat_cfg["persona"]
         p_cfg = personas[persona]
+        seat_provider = _pick_provider(provider_pool, seat_idx)
+        seat_temp = (
+            temps[seat_idx] if use_temp_diversity and seat_idx < len(temps) else None
+        )
         pos, dissent = _run_seat(
             persona=persona,
             persona_cfg=p_cfg,
@@ -736,7 +1018,8 @@ def council_convene(
             topic=topic,
             inputs=inputs,
             round1_positions=round1_positions,
-            provider=provider,
+            provider=seat_provider,
+            temperature=seat_temp,
         )
         final_positions.append(pos)
         if dissent is not None:
@@ -746,7 +1029,8 @@ def council_convene(
     record["dissents"] = final_dissents
 
     # ── Chair synthesis ───────────────────────────────────────────────────────
-    synthesis = _synthesize(final_positions, final_dissents, topic, provider)
+    # Chair uses the first provider (or single provider).
+    synthesis = _synthesize(final_positions, final_dissents, topic, provider_pool[0])
     record["synthesis"] = synthesis
 
     # ── Ledger writes ─────────────────────────────────────────────────────────

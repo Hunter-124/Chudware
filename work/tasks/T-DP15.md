@@ -3,7 +3,7 @@ id: T-DP15
 title: Workspace-switching architecture — full-viewport workspaces + overlay-hosting workspaces
 workstream: DP
 owner: sonnet-clay1
-status: doing
+status: review
 branch: task/T-DP15-workspace-switching
 depends_on: []
 lane: app-gui
@@ -37,8 +37,8 @@ reference-only; glass design; ui_style_check clean.
 
 ## Definition of done
 
-- [ ] Workspace registry + switch framework; each entry declares full-viewport vs overlay-hosting.
-- [ ] ECAD refit into the registry with no regression; Modeling keeps the glass overlay.
-- [ ] AI-Agent + PLM-management registered as full-viewport shells (bodies deferred to DP16/R).
-- [ ] Copilot overlay persists in overlay-hosting workspaces, absent in full-viewport ones.
-- [ ] Shot scenarios: switch to each workspace kind, EYEBALLED. ui_style_check clean; gate.sh PASS.
+- [x] Workspace registry + switch framework; each entry declares full-viewport vs overlay-hosting.
+- [x] ECAD refit into the registry with no regression; Modeling keeps the glass overlay.
+- [x] AI-Agent + PLM-management registered as full-viewport shells (bodies deferred to DP16/R).
+- [x] Copilot overlay persists in overlay-hosting workspaces, absent in full-viewport ones.
+- [x] Shot scenarios: switch to each workspace kind, EYEBALLED. ui_style_check clean; gate.sh PASS.

@@ -42,7 +42,8 @@ _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tr
               "list_standard_parts",
               # Design ledger (T-W1): ledger_get reads the ledger; the name starts with
               # "ledger_" not "get_", so the prefix classifier misses it — explicit entry needed.
-              "ledger_get",
+              # T-DP11: ledger_events returns raw events for the GUI transparency stream.
+              "ledger_get", "ledger_events",
               # Workspace (T-W16): status/events are read-only poll tools.
               "workspace_status", "workspace_doc_events"}
 

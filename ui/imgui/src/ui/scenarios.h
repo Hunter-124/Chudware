@@ -54,6 +54,9 @@ struct ShotConfig {
     bool requirementsShotDone = false;
     bool wantTransparency = false;          // T-U8: model & telemetry transparency panel
     bool transparencyShotDone = false;
+    bool wantDPStream = false;              // T-DP11: DP action stream — populated fixture
+    bool wantDPStreamEmpty = false;         // T-DP11: DP action stream — empty state
+    bool dpStreamShotDone = false;
     bool wantSimStudies = false;                 // T-U6: sim studies panel (AI_CAD_SHOT=sim_studies)
     bool simStudiesShotDone = false;
 
@@ -277,6 +280,10 @@ private:
 
 // Bind runner + config for the frame loop (main.cpp calls once after configureShot).
 void setScenarioContext(ScenarioRunner* runner, ShotConfig* cfg);
+
+// T-DP11: returns true when AI_CAD_SHOT=dp_stream or dp_stream_empty is active —
+// application.cpp uses this to size the transparency panel taller for the shot.
+bool isDPStreamShot();
 
 // Read AI_CAD_SHOT (+ related env) and prime AppState for the requested scenario.
 void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,

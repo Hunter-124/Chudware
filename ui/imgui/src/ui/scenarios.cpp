@@ -401,6 +401,10 @@ void setScenarioContext(ScenarioRunner* runner, ShotConfig* cfg) {
     g_cfg = cfg;
 }
 
+bool isDPStreamShot() {
+    return g_cfg && (g_cfg->wantDPStream || g_cfg->wantDPStreamEmpty);
+}
+
 int ShotConfig::captureFrameBudget() const {
     if (wantFlow && !flowShotDone) return 999999;
     if (wantFea && !feaShotDone) return 999999;
@@ -411,6 +415,7 @@ int ShotConfig::captureFrameBudget() const {
     if (wantBom && !bomShotDone) return 150;
     if (wantRequirements && !requirementsShotDone) return 150;  // T-U5
     if (wantTransparency && !transparencyShotDone) return 150;  // T-U8
+    if ((wantDPStream || wantDPStreamEmpty) && !dpStreamShotDone) return 150;  // T-DP11
     if (wantSimStudies && !simStudiesShotDone) return 150;
     if (wantOrigin) return originShotDone ? 10 : 30;  // T-BL37
     if (wantTree) return treeShotDone ? 10 : 30;
@@ -472,8 +477,10 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantPartsBrowser  = eq("parts_browser");
     cfg.wantBom          = eq("bom");
     cfg.wantRequirements = eq("requirements");   // T-U5
-    cfg.wantTransparency = eq("transparency");   // T-U8
-    cfg.wantPiping       = eq("piping_view");       // T-U7
+    cfg.wantTransparency  = eq("transparency");   // T-U8
+    cfg.wantDPStream      = eq("dp_stream");       // T-DP11: populated action stream
+    cfg.wantDPStreamEmpty = eq("dp_stream_empty"); // T-DP11: empty state
+    cfg.wantPiping        = eq("piping_view");      // T-U7
     cfg.wantHydraulic    = eq("hydraulic_view");    // T-U7
     cfg.wantStructural   = eq("structural_view");   // T-U7
     cfg.wantGallery       = eq("gallery");
@@ -1056,6 +1063,177 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
             std::printf("transparency: fixture seeded (live unavailable: %s)\n",
                         err.c_str());
         }
+        std::fflush(stdout);
+    }
+
+    // T-DP11: Design-Pipeline Action Stream — populated state.
+    // Exercises every entry kind: advisory (1 blocker, 1 warn), audit (1 issue),
+    // council, delegation (with budget bars), trigger_fired, agent_turn (tool calls).
+    // Fixture events use real schema fields from the write-site sources; no invented keys.
+    if (cfg.wantDPStream && !cfg.dpStreamShotDone) {
+        cfg.dpStreamShotDone = true;
+        const std::string fixture = R"json([
+            {
+                "seq": 0, "ts": "2026-07-05T14:00:01Z",
+                "actor": "foreman", "kind": "advisory",
+                "payload": {
+                    "schema": "aicad.advisory/1",
+                    "seq": 0, "stage": "geometry",
+                    "user_override": false,
+                    "items": [
+                        {
+                            "id": "adv_a1b2c3",
+                            "severity": "blocker",
+                            "check": "thin_wall",
+                            "finding": "Wall at boss_1 is 0.6 mm — below 1.0 mm minimum for injection moulding.",
+                            "refs": {"doc_id": "fix-part-001"},
+                            "numbers": {"wall_mm": 0.6, "min_wall_mm": 1.0},
+                            "candidate_fixes": [
+                                {
+                                    "action": "resize_feature",
+                                    "params": {"feature": "boss_1", "wall_mm": 1.2},
+                                    "basis": "process minimum from material table",
+                                    "predicted_effect": "Wall increases to 1.2 mm — passes mould gate.",
+                                    "confidence": "table"
+                                }
+                            ],
+                            "helper_tools": ["wall_thickness"],
+                            "source": {"kind": "kernel", "detail": "wall_thickness_checker"}
+                        },
+                        {
+                            "id": "adv_d4e5f6",
+                            "severity": "warn",
+                            "check": "draft_angle",
+                            "finding": "Face F12 has 0 deg draft — 1 deg minimum recommended.",
+                            "refs": {"doc_id": "fix-part-001"},
+                            "numbers": {"draft_deg": 0.0, "min_draft_deg": 1.0},
+                            "candidate_fixes": [
+                                {
+                                    "action": "add_draft",
+                                    "params": {"face": "F12", "angle_deg": 1.5},
+                                    "basis": "DFM standard for injection moulding",
+                                    "predicted_effect": "Face F12 gets 1.5 deg draft.",
+                                    "confidence": "table"
+                                }
+                            ],
+                            "helper_tools": ["draft_analysis"],
+                            "source": {"kind": "kernel", "detail": "draft_checker"}
+                        }
+                    ],
+                    "trigger_events": []
+                }
+            },
+            {
+                "seq": 1, "ts": "2026-07-05T14:00:12Z",
+                "actor": "overseer", "kind": "audit",
+                "payload": {
+                    "schema": "aicad.audit/1",
+                    "id": "aud_7f8a9b0c",
+                    "scope": {"stage": "geometry", "trigger": "stage_exit"},
+                    "verdicts": [
+                        {
+                            "class": "thin_wall",
+                            "severity": "blocker",
+                            "finding": "Boss_1 wall 0.6 mm violates process minimum — must be resolved before build.",
+                            "evidence": {"feature": "boss_1", "wall_mm": 0.6},
+                            "required_action": {"kind": "fix", "target": "boss_1"},
+                            "targeted_reentry": {"stage": "geometry", "role": "geometry_designer"}
+                        },
+                        {
+                            "class": "ok",
+                            "severity": "ok",
+                            "finding": "Overall geometry intent matches brief.",
+                            "evidence": {},
+                            "required_action": {"kind": "none"}
+                        }
+                    ],
+                    "model": {"provider": "openai", "id": "gpt-4o"},
+                    "tokens": 1240
+                }
+            },
+            {
+                "seq": 2, "ts": "2026-07-05T14:01:30Z",
+                "actor": "council", "kind": "artifact",
+                "payload": {
+                    "id": "cncl_abc123",
+                    "kind": "council",
+                    "council": {
+                        "id": "cncl_abc123",
+                        "topic": "Should boss_1 be resized or redesigned as a snap-fit?",
+                        "seats": [
+                            {"persona": "manufacturing", "role": "manufacturing_engineer"},
+                            {"persona": "design", "role": "part_designer"},
+                            {"persona": "stress", "role": "fea_analyst"}
+                        ],
+                        "positions": [
+                            {"persona": "manufacturing", "position": "Resize to 1.2 mm wall — minimum change, no redesign risk."},
+                            {"persona": "design",        "position": "Resize is sufficient; snap-fit adds assembly complexity."},
+                            {"persona": "stress",        "position": "Resize to 1.2 mm is structurally adequate."}
+                        ],
+                        "dissents": [],
+                        "synthesis": {
+                            "decision": "Resize boss_1 to 1.2 mm wall thickness.",
+                            "rationale": "All three seats agree resize is the minimal, low-risk fix. No dissent.",
+                            "rejected_alternatives": []
+                        }
+                    }
+                }
+            },
+            {
+                "seq": 3, "ts": "2026-07-05T14:02:05Z",
+                "actor": "geometry_designer", "kind": "delegation",
+                "payload": {
+                    "schema": "aicad.delegation/1",
+                    "node_id": "del_001",
+                    "role": "geometry_designer",
+                    "status": "running",
+                    "depth": 1,
+                    "kind": "sub_role",
+                    "model": {"provider": "openai", "id": "gpt-4o"},
+                    "budget": {
+                        "token_budget": 8000,
+                        "tokens_used": 3200,
+                        "wall_budget_s": 120.0,
+                        "elapsed_s": 48.5
+                    },
+                    "note": "Delegated geometry resize sub-task"
+                }
+            },
+            {
+                "seq": 4, "ts": "2026-07-05T14:02:10Z",
+                "actor": "foreman", "kind": "trigger_fired",
+                "payload": {
+                    "trigger_id": "thin_wall_repeat",
+                    "id": "thin_wall_repeat",
+                    "context_summary": "Thin-wall finding repeated after resize attempt — escalating to council",
+                    "severity": "blocker"
+                }
+            },
+            {
+                "seq": 5, "ts": "2026-07-05T14:02:55Z",
+                "actor": "geometry_designer", "kind": "agent_turn",
+                "payload": {
+                    "turn_index": 2,
+                    "tool_calls": [
+                        {"name": "add_features", "args_digest": "resize boss_1 wall=1.2mm"},
+                        {"name": "render_part", "args_digest": ""},
+                        {"name": "wall_thickness", "args_digest": "face=F_boss_1"}
+                    ],
+                    "result_summary": "Wall thickness now 1.2 mm — passes minimum."
+                }
+            }
+        ])json";
+        ui::seedDPStreamForShot(fixture, "fixture-run-dp11-populated");
+        std::printf("dp_stream: fixture seeded (%d events)\n", 6);
+        std::fflush(stdout);
+    }
+
+    // T-DP11: Design-Pipeline Action Stream — empty state.
+    if (cfg.wantDPStreamEmpty && !cfg.dpStreamShotDone) {
+        cfg.dpStreamShotDone = true;
+        // Seed with the empty-events array — exercises the "Stream empty" empty state.
+        ui::seedDPStreamForShot("[]", "fixture-run-dp11-empty");
+        std::printf("dp_stream_empty: empty-state fixture seeded\n");
         std::fflush(stdout);
     }
 

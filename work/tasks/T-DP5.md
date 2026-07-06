@@ -2,8 +2,8 @@
 id: T-DP5
 title: Overseer audit-and-reroute loop + user-change → stage mapping
 workstream: DP
-owner: unassigned
-status: todo
+owner: opus-slate1
+status: doing
 branch: task/T-DP5-overseer-audit-loop
 depends_on: [T-DP1]
 lane: ai-copilot

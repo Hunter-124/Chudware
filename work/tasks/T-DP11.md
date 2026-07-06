@@ -34,3 +34,6 @@ clean. Shot-verify each state.
 - [ ] Each entry inspectable (inputs/outputs/why); auto-applied fixes flagged distinctly.
 - [ ] Shot scenarios for populated + empty states, EYEBALLED.
 - [ ] ui_style_check clean; gate.sh PASS; graphify update.
+
+## Progress log
+- 2026-07-06 02:27 UTC [sonnet-vetch2] Section 5 "Design-Pipeline Action Stream" shipped. Added to existing T-U8 transparency panel (not a rewrite). Deliverables: (1) ledger_events RPC in services/mcp/ledger_tools.py with kinds filter + after_seq cursor; (2) registered in tool_registry.py _READ_EXACT; (3) DPStreamModel / DPStreamEntry / DPStreamKind structs in ui/abstract/transparency_view.h; (4) full Section 5 implementation in transparency_panel.cpp — async polling via AsyncRpc, newest-first 500-entry ring, per-kind structured display (advisory items, audit verdicts, council decision, delegation budget, tool call names), [AUTO-FIX] badge for deterministic candidate_fixes, drawEntryInspector popover with raw payload TreeNode, theme tokens only (no literal colors); (5) shot scenarios dp_stream (6-event populated fixture) + dp_stream_empty eyeballed PASS; (6) application.cpp 2-line edit for taller window on dp_stream shots. Gate: PASS (all FAIL-RECORDED pre-existing / T-V2). ui_style_check 0 findings. Branch: task/T-DP11-transparency-panel commit 95ac68b2.

@@ -65,7 +65,7 @@ void applyViewJson(const json& v) {
     gModel.tiers.clear();
 
     gModel.level = v.value("level", std::string("standard"));
-    gModel.mode  = v.value("mode", std::string("simple"));
+    gModel.mode  = v.value("mode", std::string("auto"));
 
     for (const auto& lv : v.value("levels", json::array())) {
         aicad::ui::EffortLevel L;
@@ -133,6 +133,26 @@ void applyViewJson(const json& v) {
         gModel.tiers.push_back(std::move(T));
     }
     if (gModel.selectedTier >= (int)gModel.tiers.size()) gModel.selectedTier = 0;
+
+    // T-DP12: auto-mode router readout.
+    gModel.autoRouterDefaults.clear();
+    gModel.autoRouterDescription.clear();
+    if (v.contains("auto_router") && v["auto_router"].is_object()) {
+        const json& ar = v["auto_router"];
+        gModel.autoRouterDescription = ar.value("description", std::string());
+        if (ar.contains("tier_defaults") && ar["tier_defaults"].is_object()) {
+            // Emit in the canonical tier order.
+            static const char* tierOrder[] = {"local-24k", "local-48k", "mid", "frontier"};
+            for (const char* t : tierOrder) {
+                if (!ar["tier_defaults"].contains(t)) continue;
+                aicad::ui::AutoRouterTierDefault d;
+                d.tier          = t;
+                d.scaffoldLevel = ar["tier_defaults"][t].get<std::string>();
+                gModel.autoRouterDefaults.push_back(std::move(d));
+            }
+        }
+    }
+
     gModel.state = EffortState::Ready;
 }
 
@@ -245,6 +265,62 @@ void drawSourceTag(const aicad::ui::EffortKnobValue& kv) {
         ImGui::TextColored(TVEC(txt2), "[%s]", kv.source.c_str());
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Which layer supplies this value:\nshipped defaults < preset < your override");
+}
+
+// ---- T-DP12: auto-mode readout -----------------------------------------------
+// Shows what the workflow_router (T-DP10) will select per tier — informational
+// only.  The user can see what will happen without needing to configure anything.
+
+void drawAutoMode() {
+    const float S = theme::S();
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 520.f * S);
+    ImGui::TextColored(TVEC(txt2),
+        "Auto mode: the harness classifies each task and picks the scaffold "
+        "level measured as best for that task class. No manual selection needed.");
+    ImGui::PopTextWrapPos();
+
+    if (!gModel.autoRouterDescription.empty()) {
+        ImGui::Dummy(ImVec2(0, 4.f * S));
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 520.f * S);
+        ImGui::TextColored(TVEC(txt2), "%s", gModel.autoRouterDescription.c_str());
+        ImGui::PopTextWrapPos();
+    }
+
+    if (!gModel.autoRouterDefaults.empty()) {
+        ImGui::Dummy(ImVec2(0, 6.f * S));
+        ImGui::PushFont(theme::font(theme::Font::H2));
+        ImGui::TextUnformatted("Tier defaults (no tuning data / unclassified tasks)");
+        ImGui::PopFont();
+        ImGui::TextColored(TVEC(txt2),
+            "When task-class tuning data is absent, the router falls back to "
+            "these tier defaults (local = full scaffold; frontier = minimal).");
+        ImGui::Dummy(ImVec2(0, 4.f * S));
+
+        if (ImGui::BeginTable("##autodefaults", 2,
+                ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg)) {
+            ImGui::TableSetupColumn("Tier",          ImGuiTableColumnFlags_WidthStretch, 0.45f);
+            ImGui::TableSetupColumn("Default level", ImGuiTableColumnFlags_WidthStretch, 0.55f);
+            ImGui::TableHeadersRow();
+            for (const auto& d : gModel.autoRouterDefaults) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextColored(TVEC(txt1), "%s", d.tier.c_str());
+                ImGui::TableSetColumnIndex(1);
+                // Highlight local tiers (maximum scaffold) vs frontier (eco).
+                const bool isMaximum = (d.scaffoldLevel == "maximum");
+                ImGui::TextColored(isMaximum ? TVEC(good) : TVEC(accent),
+                    "%s", d.scaffoldLevel.c_str());
+                if (ImGui::IsItemHovered()) {
+                    if (isMaximum)
+                        ImGui::SetTooltip("Local tier: full scaffold (councils, delegation, context) by default");
+                    else
+                        ImGui::SetTooltip("Frontier tier: minimal scaffold by default (fast, single-pass)");
+                }
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::Dummy(ImVec2(0, 4.f * S));
 }
 
 void drawSimpleMode() {
@@ -416,12 +492,20 @@ void drawAdvancedMode() {
 
 // ---- Public API ---------------------------------------------------------------
 
+// T-DP12: three-state mode radio — auto (default) | simple | advanced.
+// auto    — workflow_router self-selects per task-class; informational readout.
+// simple  — manual 4-level dial (Eco → Maximum).
+// advanced — full per-tier knob editor (shown after toggling from auto or simple).
+//
+// The toggle persists through effort.py (same CLI path as T-W28).
+// Shot focus detection covers all three prefixes: ai_effort_auto, ai_effort_simple,
+// ai_effort_advanced (existing shots keep their names).
+
 void drawAiEffortSection(app::AppState&) {
     const float S = theme::S();
     drawSettingsSectionHeader("AI Effort");
 
-    // Shot mode: the section lives at the bottom of the AI tab — scroll it into
-    // view so the ai_effort_* captures actually show it (no chrome changes).
+    // Shot mode: scroll into view for any ai_effort_* shot variant.
     static const bool s_shotFocus = [] {
         const char* s = std::getenv("AI_CAD_SHOT");
         return s && std::strncmp(s, "ai_effort", 9) == 0;
@@ -440,21 +524,52 @@ void drawAiEffortSection(app::AppState&) {
         return;
     }
 
-    drawSimpleMode();
-    ImGui::Dummy(ImVec2(0, 4.f * S));
-
-    bool advanced = (gModel.mode == "advanced");
-    if (ImGui::Checkbox("Advanced mode (all harness knobs)", &advanced)) {
-        gModel.mode = advanced ? "advanced" : "simple";
-        saveThroughEffort();
+    // ---- mode radio (auto | simple | advanced) --------------------------------
+    // Rendered as a three-button segmented control so the three modes are clearly
+    // distinct options, not a checkbox tree.
+    {
+        struct ModeBtn { const char* id; const char* label; const char* tip; };
+        static const ModeBtn modes[] = {
+            {"auto",     "Auto",     "Workflow router picks the scaffold level for each task automatically (recommended)"},
+            {"simple",   "Simple",   "Manual 4-level dial: Eco \xe2\x86\x92 Standard \xe2\x86\x92 Deliberate \xe2\x86\x92 Maximum"},
+            {"advanced", "Advanced", "Full per-tier knob editor: deliberation / parallelization / safety / context"},
+        };
+        const auto& p = theme::pal();
+        for (int i = 0; i < 3; ++i) {
+            if (i > 0) ImGui::SameLine();
+            const bool active = (gModel.mode == modes[i].id);
+            if (active) {
+                ImGui::PushStyleColor(ImGuiCol_Button,        theme::vec(p.accent));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::vec(p.accent));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  theme::vec(p.accentDim));
+                ImGui::PushStyleColor(ImGuiCol_Text, theme::panelview::accentButtonInk());
+            }
+            if (ImGui::Button(modes[i].label, ImVec2(100.f * S, 28.f * S)) && !active) {
+                gModel.mode = modes[i].id;
+                saveThroughEffort();
+            }
+            if (active) ImGui::PopStyleColor(4);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", modes[i].tip);
+        }
     }
-    if (advanced) {
-        ImGui::Dummy(ImVec2(0, 2.f * S));
+    ImGui::Dummy(ImVec2(0, 6.f * S));
+
+    // ---- mode body -----------------------------------------------------------
+    if (gModel.mode == "auto") {
+        drawAutoMode();
+    } else if (gModel.mode == "simple") {
+        drawSimpleMode();
+    } else {
+        // advanced — show simple dial for reference, then the full knob editor.
+        drawSimpleMode();
+        ImGui::Dummy(ImVec2(0, 4.f * S));
         drawAdvancedMode();
     }
 
-    if (!gModel.statusText.empty())
+    if (!gModel.statusText.empty()) {
+        ImGui::Dummy(ImVec2(0, 2.f * S));
         ImGui::TextColored(TVEC(txt2), "%s", gModel.statusText.c_str());
+    }
 }
 
 void seedAiEffortFromViewJson(const std::string& view_json) {

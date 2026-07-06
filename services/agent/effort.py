@@ -65,8 +65,11 @@ _PRESETS_PATH = Path(__file__).resolve().parent / "effort_presets.yaml"
 # Simple-mode levels, in dial order.
 LEVELS: tuple[str, ...] = ("eco", "standard", "deliberate", "maximum")
 DEFAULT_LEVEL = "standard"
-MODES: tuple[str, ...] = ("simple", "advanced")
-DEFAULT_MODE = "simple"
+MODES: tuple[str, ...] = ("simple", "advanced", "auto")
+# "auto" is the T-DP12 default: the workflow_router (T-DP10) classifies each
+# task and self-selects the scaffold level.  "simple" exposes the 4-level dial
+# for manual selection.  "advanced" exposes every per-tier knob.
+DEFAULT_MODE = "auto"
 
 # The config.json key this module owns (config.save_config merges shallowly,
 # so writing {"ai_effort": {...}} never clobbers provider/api_key/etc.).
@@ -477,6 +480,29 @@ def view(*, config: dict | None = None, presets_path: Path | None = None) -> dic
     for name in tiers:
         prof = resolve_effort(name, config=config, presets_path=presets_path)
         out["tiers"][name] = prof.to_payload()
+
+    # T-DP12: auto-mode — include per-tier router defaults so the GUI can
+    # display what scaffold level the workflow_router would pick per tier.
+    # The GUI renders this as an informational readout (not editable in auto
+    # mode); advanced mode exposes the full knob editor as before.
+    if eff["mode"] == "auto":
+        try:
+            from services.agent.pipeline.workflow_router import ScaffoldLevel
+            router_defaults: dict[str, str] = {}
+            for tname in tiers:
+                router_defaults[tname] = ScaffoldLevel.tier_default(tname).value
+            out["auto_router"] = {
+                "description": (
+                    "In auto mode the workflow router classifies each task and "
+                    "selects the scaffold level measured as best for that task class. "
+                    "The values below are the tier defaults used when no tuning data "
+                    "exists for the task class."
+                ),
+                "tier_defaults": router_defaults,
+            }
+        except ImportError:
+            out["auto_router"] = {"description": "workflow router unavailable", "tier_defaults": {}}
+
     return out
 
 

@@ -525,6 +525,167 @@ def cmd_test_ping(_args):
     return 0 if status in (200, 204) else 1
 
 
+# ---------------------------------------------------- stats / leaderboard / digest
+# Consumed by the Gateway bot (work/tools/discord_bot.py) slash commands
+# /stats /update /leaderboard /screenshot. All git-author-derived (no stored
+# scoreboard); `identity_aliases` (work/sync/notify_config.json) folds a
+# contributor's commit names/emails to one canonical handle. Additive only —
+# none of the notify/poll/hook logic above depends on any of this. See T-BL53.
+
+def _canon(name, email, aliases):
+    """Fold a commit author (name or email) to a canonical handle via identity_aliases."""
+    name = (name or "").strip()
+    email = (email or "").strip()
+    return aliases.get(name) or aliases.get(email) or name or email or "unknown"
+
+
+def _commit_counts(main, since_args, aliases):
+    """Per-canonical-author commit counts across ALL refs (so unmerged-branch work
+    counts immediately). `since_args` is [] for all-time or ['--since=...'] for a window."""
+    r = subprocess.run(
+        ["git", "log", "--all", "--no-merges", *since_args, "--pretty=format:%an%x00%ae"],
+        cwd=str(main), capture_output=True, text=True)
+    counts = {}
+    for line in r.stdout.splitlines():
+        if "\x00" not in line:
+            continue
+        name, email = line.split("\x00", 1)
+        who = _canon(name, email, aliases)
+        counts[who] = counts.get(who, 0) + 1
+    return counts
+
+
+def _board_rows(main):
+    """The full task board as a list of dicts, via `work.py board --json`."""
+    script = main / "work" / "tools" / "work.py"
+    try:
+        r = subprocess.run([sys.executable, str(script), "board", "--json"],
+                           cwd=str(main), capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            return json.loads(r.stdout)
+    except Exception:
+        pass
+    return []
+
+
+def _active_owner_counts(main):
+    """Tasks currently held (status doing/review) per owner."""
+    counts = {}
+    for row in _board_rows(main):
+        if row.get("status") in ("doing", "review"):
+            o = (row.get("owner") or "").strip()
+            if o and o != "unassigned":
+                counts[o] = counts.get(o, 0) + 1
+    return counts
+
+
+def _ranked(counts, top=None):
+    """(handle, n) pairs, most commits first, ties broken alphabetically."""
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower()))
+    return ranked[:top] if top else ranked
+
+
+def _recent_screenshots(main, n=3):
+    """The n most recent git-tracked images under work/questions/ (newest mtime first).
+    Shared helper for /screenshot and _digest_embed."""
+    qdir = main / "work" / "questions"
+    if not qdir.exists():
+        return []
+    r = subprocess.run(["git", "ls-files", "work/questions"],
+                       cwd=str(main), capture_output=True, text=True)
+    exts = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+    paths = []
+    for rel in r.stdout.splitlines():
+        rel = rel.strip()
+        if rel.lower().endswith(exts):
+            p = main / rel
+            if p.exists():
+                paths.append(p)
+    paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return paths[:n]
+
+
+def _compute_stats(main, days, aliases=None):
+    """(commits, owners): per-author commit counts over `days` + active task-ownership counts.
+    Matches discord_bot.py's `commits, owners = nd._compute_stats(main, d, aliases)`."""
+    aliases = aliases or {}
+    since = [f"--since={days} days ago"] if days else []
+    return _commit_counts(main, since, aliases), _active_owner_counts(main)
+
+
+def _stats_embed(commits, owners, days):
+    """Discord embed dict: top committers + active task owners over the last `days`."""
+    total = sum(commits.values())
+    top = _ranked(commits, 10)
+    commit_lines = "\n".join(f"`{n:>3}`  {who}" for who, n in top) or "_no commits in window_"
+    own = _ranked(owners, 10)
+    owner_lines = "\n".join(f"`{n:>2}`  {who}" for who, n in own) or "_none active_"
+    return {
+        "title": f"AI-CAD stats — last {days} day(s)",
+        "description": f"**{total}** commit(s) from **{len(commits)}** contributor(s).",
+        "color": COLORS["digest"],
+        "fields": [
+            {"name": "Top committers", "value": commit_lines[:1024], "inline": True},
+            {"name": "Active task owners", "value": owner_lines[:1024], "inline": True},
+        ],
+    }
+
+
+def _leaderboard_embed(main, cfg):
+    """Discord embed dict: all-time commit leaderboard (aliases folded, medals for top 3)."""
+    aliases = (cfg or {}).get("identity_aliases", {}) or {}
+    counts = _commit_counts(main, [], aliases)         # [] => all-time
+    ranked = _ranked(counts, 15)
+    medals = ["\U0001F947", "\U0001F948", "\U0001F949"]   # gold/silver/bronze
+    lines = []
+    for i, (who, n) in enumerate(ranked):
+        badge = medals[i] if i < 3 else f"`#{i+1:>2}`"
+        lines.append(f"{badge}  **{who}** — {n}")
+    body = "\n".join(lines) if lines else "_no commits yet_"
+    return {
+        "title": "\U0001F3C6 AI-CAD all-time commit leaderboard",
+        "description": body[:4096],
+        "color": 0xF1C40F,                              # gold
+        "footer": {"text": f"{sum(counts.values())} commits · {len(counts)} contributors"},
+    }
+
+
+def _digest_embed(main, cfg, period_days, label):
+    """(embed_dict, shots): commits + board progress over the period, plus recent screenshots.
+    Matches discord_bot.py's `embed_dict, shots = nd._digest_embed(main, cfg, days, label)`."""
+    aliases = (cfg or {}).get("identity_aliases", {}) or {}
+    since = [f"--since={period_days} days ago"] if period_days else []
+    commits = _commit_counts(main, since, aliases)
+    total_commits = sum(commits.values())
+    commit_lines = "\n".join(f"`{n:>3}`  {who}" for who, n in _ranked(commits, 5)) or "_none_"
+
+    rows = _board_rows(main)
+    done = sum(1 for r in rows if r.get("status") == "done")
+    active = sum(1 for r in rows if r.get("status") in ("doing", "review"))
+    total_tasks = len(rows)
+
+    tr = subprocess.run(["git", "log", "--all", *since, "--oneline", "--",
+                         "work/tasks", "work/backlog"],
+                        cwd=str(main), capture_output=True, text=True)
+    board_updates = len([ln for ln in tr.stdout.splitlines() if ln.strip()])
+
+    fields = [
+        {"name": f"Commits ({label})",
+         "value": (f"**{total_commits}** across {len(commits)} contributor(s)\n{commit_lines}")[:1024],
+         "inline": False},
+        {"name": "Board", "value": f"**{done}**/{total_tasks} done · {active} active", "inline": True},
+        {"name": "Task activity", "value": f"{board_updates} board update(s)", "inline": True},
+    ]
+    embed = {
+        "title": f"AI-CAD {label} digest",
+        "description": (f"Progress over the last {period_days} day(s). "
+                        f"Master Plan: `docs/AI_TOOLING_MASTER_PLAN.md`"),
+        "color": COLORS["digest"],
+        "fields": fields,
+    }
+    return embed, _recent_screenshots(main, 3)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)

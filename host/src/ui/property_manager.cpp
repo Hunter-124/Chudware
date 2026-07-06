@@ -1809,6 +1809,19 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
     // overrides it). The engine errors cleanly if the chosen plane misses the part.
     if (t == "split") return true;
 
+    // surf_revolve needs BOTH a profile and an axis: the engine errors "axis required" if OK fires
+    // without an axis, so gate on both wells (unlike solid revolve, whose axis can be a sketch
+    // centerline resolved engine-side).
+    if (t == "surf_revolve") {
+        bool haveProfile = false, haveAxis = false;
+        for (const auto& f : fields) {
+            if (f.def->kind != PMFieldKind::SelectorWell) continue;
+            if (std::strcmp(f.def->key, "profile") == 0)   haveProfile = !f.picks.empty();
+            else if (std::strcmp(f.def->key, "axis") == 0) haveAxis    = !f.picks.empty();
+        }
+        return haveProfile && haveAxis;
+    }
+
     // Loft needs at least TWO section profiles before a preview is meaningful.
     if (t == "loft") {
         for (const auto& f : fields)
@@ -1850,7 +1863,7 @@ static bool readyForPreview(const PMFormDef* form, const std::vector<PMField>& f
     else if (t == "point")   needWell = "target";     // datum point reference
     else if (t == "rib")     needWell = "profile";    // rib needs an open-contour sketch profile
     // Surfacing — gate each surf feature on its primary (required) ref well, mirroring schema.py.
-    else if (t == "surf_extrude" || t == "surf_revolve" || t == "surf_sweep" ||
+    else if (t == "surf_extrude" || t == "surf_sweep" ||
              t == "surf_planar")        needWell = "profile";   // profile-driven surfaces
     else if (t == "surf_loft")          needWell = "sections";  // ordered section profiles
     else if (t == "surf_offset")        needWell = "faces";     // faces to offset

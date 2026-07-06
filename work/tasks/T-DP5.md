@@ -40,3 +40,4 @@ Overseer holds + re-grounds the master intent so fresh-context stages never drif
 
 ## Progress log
 - 2026-07-06 00:47 UTC [opus-slate1] Reroute core shipped: services/agent/advisor/reroute.py — deterministic targeted_reentry from audit evidence (ledger kind -> owning DP stage/role). Overseer.audit attaches it per-verdict + pins non-truncatable master-intent block (drift catch). change_request dispatch rows carry stage_reentry. advisor.md 1.6->1.7 additive. 14 new tests + 277 advisor suite green. Running gate next.
+- 2026-07-06 01:33 UTC [opus-slate1] gate.sh RESULT: PASS (EXIT=0). services pytest 1919 passed incl. all 14 reroute + 32 overseer/change_request tests; only FAIL-RECORDED are pre-existing exceptions (issue #16 ECAD, FEA/CFD engine-env, port-1234 flake — T-V2 owns). DoD met: audit events carry targeted_reentry, geometry error -> geometry_designer, user-change -> stage+feature, drift caught + re-grounded. advisor.md 1.6->1.7 additive. Setting review.

@@ -389,6 +389,12 @@ def route_change_request(
     text, we render a compact view here as a fallback.
     """
     plan_obj = draft_change_plan(text, ledger_state)
+    # T-DP5: add the DESIGN-STAGE re-entry (which DP stage/feature the change
+    # re-derives from) onto each dispatch row, on top of the existing execution-role
+    # mapping.  A "thicker wall" then re-enters GEOMETRY on the wall's geometry_spec
+    # rather than being blindly re-modeled (doc §3.1 user-change → stage mapping).
+    from .reroute import route_change
+    route_change(plan_obj.affected, plan_obj.dispatch)
     plan = plan_obj.to_dict()
     empty = plan_obj.affected.is_empty()
 

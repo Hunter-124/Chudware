@@ -41,9 +41,14 @@ static std::string s_flyoutOpenReq;
 
 static const char* kRibbonTabs[] = {"Features", "Sketch", "Evaluate", "Simulation", "Assembly",
                                     "Sheet Metal", "Weldments", "PCB", "Surfaces",
-                                    "View Layout", "Annotation", "Appearance", "Manufacture"};
-static constexpr int kRibbonTabCount = 13;  // + W17 contextual "View Layout"/"Annotation" (drawings)
+                                    "View Layout", "Annotation", "Appearance", "Manufacture",
+                                    // sim-gui rework: per-simulation-type tabs, shown ONLY in the
+                                    // Simulate workspace (indices 13..19 — see ribbon_tabVisible).
+                                    "Static", "Modal", "Flow", "Thermal", "Fatigue", "Motion",
+                                    "EM"};
+static constexpr int kRibbonTabCount = 20;  // + W17 contextual "View Layout"/"Annotation" (drawings)
                                             //   + "Appearance" (index 11) + "Manufacture" (CAM, 12)
+                                            //   + sim-gui per-type tabs (13..19, Simulate only)
 
 // W-overhaul: per-workspace tab icon, parallel to kRibbonTabs[]. The eight true workspace tabs use
 // the dedicated ws_* atlas glyphs from the icon contract; the four tabs that have no ws_* glyph
@@ -63,6 +68,16 @@ static const char* kTabIcons[] = {
     "smart_dim",      // Annotation (drawing — placeholder)
     "ws_appearance",  // Appearance
     "hole_wizard",    // Manufacture (CAM — placeholder, machining glyph)
+    // sim-gui per-type tabs (13..19). study_* glyphs exist in the atlas for the five FEA/CFD
+    // kinds; Motion reuses the assembly "mate" glyph (a motion study drives a mate), EM reuses
+    // "relations" as a wave-ish placeholder until a dedicated em glyph ships.
+    "study_static",   // Static
+    "study_modal",    // Modal
+    "study_flow",     // Flow
+    "study_thermal",  // Thermal
+    "study_fatigue",  // Fatigue
+    "mate",           // Motion
+    "relations",      // EM (placeholder)
 };
 static_assert(sizeof(kTabIcons) / sizeof(kTabIcons[0]) == kRibbonTabCount,
               "kTabIcons must stay parallel to kRibbonTabs");
@@ -70,6 +85,24 @@ static_assert(sizeof(kTabIcons) / sizeof(kTabIcons[0]) == kRibbonTabCount,
 // Forward-declared here; defined after drawRibbon's local state block (~line 330).
 // Default Model (0) — app.cpp sets the live value each frame via setRibbonWorkspace().
 static int s_workspace = 0;
+
+// sim-gui: dynamic command gating. Commands whose cmd_id starts with s_disabledPrefix render
+// disabled with s_disabledReason in their tooltip (instead of the static "Coming soon"). Used by
+// SimManager to grey the EM tools while the em_* solver backend is not installed. One prefix is
+// enough for now; generalize to a list if a second consumer appears.
+static std::string s_disabledPrefix;
+static std::string s_disabledReason;
+static const char* ribbon_dynDisabledReason(const char* cmd_id) {
+    if (s_disabledPrefix.empty() || !cmd_id) return nullptr;
+    return std::strncmp(cmd_id, s_disabledPrefix.c_str(), s_disabledPrefix.size()) == 0
+               ? s_disabledReason.c_str()
+               : nullptr;
+}
+// Effective enabled state for a row: the static schema-reserved flag (stretch) AND the dynamic
+// prefix gate above. Every button/flyout/overflow row goes through this.
+static bool ribbon_cmdEnabled(const ui::RibbonCmd* c) {
+    return !c->stretch && !ribbon_dynDisabledReason(c->cmd_id);
+}
 
 // W17 + per-workspace: control which tabs appear in the ribbon for the current workspace.
 //
@@ -95,8 +128,11 @@ static bool ribbon_tabVisible(int tab, bool showSimulationTools, bool showPcbToo
         return tab == 9 || tab == 10 || tab == 1;
     }
 
-    // Simulate workspace: Simulation tab only.
-    if (s_workspace == 2 /*Simulate*/) return tab == 3;
+    // Simulate workspace (sim-gui rework): the per-simulation-type tabs ONLY (Static / Modal /
+    // Flow / Thermal / Fatigue / Motion / EM, indices 13..19). Each carries only the tools for
+    // its study type + the shared Reference group. The legacy all-in-one Simulation tab (3) is
+    // retired from this workspace (its rows stay in ribbon_def for append-only compat).
+    if (s_workspace == 2 /*Simulate*/) return tab >= 13 && tab <= 19;
 
     // Electronics workspace: PCB tab only.
     if (s_workspace == 3 /*Electronics*/) return tab == 7;
@@ -110,6 +146,7 @@ static bool ribbon_tabVisible(int tab, bool showSimulationTools, bool showPcbToo
     if (tab == 3) return showSimulationTools;  // Simulation: legacy bool
     if (tab == 7) return showPcbTools;         // PCB: legacy bool
     if (tab == 12) return false;               // Manufacture: only in Manufacture workspace
+    if (tab >= 13) return false;               // sim-gui per-type tabs: Simulate workspace only
     return true;
 }
 
@@ -672,8 +709,10 @@ static void ribbon_tooltip(const char* title, const char* cmd_id, bool enabled) 
             ImGui::PopStyleColor();
         }
         if (!enabled) {
+            // Dynamic gate (e.g. "EM solver not installed") beats the static "Coming soon".
+            const char* why = ribbon_dynDisabledReason(cmd_id);
             ImGui::PushStyleColor(ImGuiCol_Text, col(ui::palette.textDisabled));
-            ImGui::TextUnformatted("Coming soon");
+            ImGui::TextUnformatted(why ? why : "Coming soon");
             ImGui::PopStyleColor();
         }
         ImGui::PopTextWrapPos();
@@ -1068,7 +1107,7 @@ static const char* ribbon_flyoutPopup(const char* parentId,
         float popW = padX + iconSz + gapX + maxLblW + padX;
 
         for (const auto* sc : rows) {
-            bool scEnabled = !sc->stretch;
+            bool scEnabled = ribbon_cmdEnabled(sc);
             ImVec2 cp0 = ImGui::GetCursorScreenPos();
             ImGui::PushID(sc->cmd_id);
 
@@ -1257,6 +1296,11 @@ void setRibbonSketchActive(bool active) {
 
 void setRibbonWorkspace(int workspace) {
     s_workspace = workspace;
+}
+
+void setRibbonDisabledPrefix(const char* prefix, const char* reason) {
+    s_disabledPrefix = prefix ? prefix : "";
+    s_disabledReason = (reason && *reason) ? reason : "Unavailable";
 }
 
 float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool showPcbTools,
@@ -1527,7 +1571,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 ImGui::SetCursorPos(ImVec2(bx, 0.0f));
                 const char* showIcon; const char* showLabel;
                 resolveFace(cmd, drop, showIcon, showLabel);
-                ribbon_bigBtn(cmd->cmd_id, showIcon, showLabel, !cmd->stretch, drop);
+                ribbon_bigBtn(cmd->cmd_id, showIcon, showLabel, ribbon_cmdEnabled(cmd), drop);
                 if (drop) runFlyout(cmd);
                 bx += ribbon_bigBtnW(cmd->cmd_id, cmd->label, drop) + 2.0f * s;
             }
@@ -1543,7 +1587,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                     for (int r = 0; r < col.count; ++r) {
                         const auto* cmd = grp.smCmds[col.first + r];
                         ImGui::SetCursorPos(ImVec2(sx, sy));
-                        ribbon_smBtn(cmd->cmd_id, cmd->icon, cmd->label, !cmd->stretch);
+                        ribbon_smBtn(cmd->cmd_id, cmd->icon, cmd->label, ribbon_cmdEnabled(cmd));
                         sy += kSmRowH * s;
                     }
                     sx += col.width;
@@ -1574,10 +1618,11 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                         bool drop = ribbon_hasSubs(grp, cmd);
                         const char* showIcon; const char* showLabel;
                         resolveFace(cmd, drop, showIcon, showLabel);
-                        ribbon_bigBtnAsSmall(cmd->cmd_id, showIcon, showLabel, !cmd->stretch, drop);
+                        ribbon_bigBtnAsSmall(cmd->cmd_id, showIcon, showLabel,
+                                             ribbon_cmdEnabled(cmd), drop);
                         if (drop) runFlyout(cmd);
                     } else {
-                        ribbon_smBtn(cmd->cmd_id, cmd->icon, cmd->label, !cmd->stretch);
+                        ribbon_smBtn(cmd->cmd_id, cmd->icon, cmd->label, ribbon_cmdEnabled(cmd));
                     }
                     // §2.3: degraded big rows are taller than kSmRowH — advance by the actual height.
                     sy += (idx < nBig) ? ribbon_bigBtnAsSmallRowH() : kSmRowH * s;
@@ -1648,7 +1693,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 // One row renderer for big + small overflowed commands (the two loops were
                 // byte-identical apart from the button id, which PushID(cmd_id) scopes anyway).
                 auto overflowRow = [&](const ui::RibbonCmd* cmd) {
-                    bool enabled = !cmd->stretch;
+                    bool enabled = ribbon_cmdEnabled(cmd);
                     ImVec2 cp0 = ImGui::GetCursorScreenPos();
                     float rowH   = snap(28.0f * s);
                     float iconSz = snap(20.0f * s);

@@ -484,6 +484,108 @@ static const RibbonCmd kCmds[] = {
     { "cam_show3d",        "Show in 3D",  "display_shaded",  "Manufacture", "Output",    false, nullptr, false },
     { "cam_flavor",        "Flavor",      "settings",        "Manufacture", "Output",    false, nullptr, false },
 
+    // =========================================================================
+    // sim-gui rework (Hunter red-pen): per-simulation-type ribbon tabs, one per study kind,
+    // shown ONLY in the Simulate workspace (ribbon.cpp ribbon_tabVisible, tabs 13..19).
+    // Each tab carries JUST the tools for its study type — the first button is always
+    // "+ New <type> Study", then the type's setup tools, Run/Results, and the shared
+    // Reference group. cmd_ids reuse the existing sim_* dispatch (app.cpp routes every
+    // "sim_"-prefixed command into SimManager::handleCommand); new sim_* setup cmd_ids
+    // below are handled there too. The legacy all-in-one "Simulation" tab rows above stay
+    // (append-only) but that tab is retired from the Simulate workspace.
+    // =========================================================================
+
+    // --- Tab: Static (linear stress / displacement / FoS) ---
+    { "sim_new_static",    "New Study",   "study_static",    "Static",  "Study",     true,  nullptr, false },
+    { "sim_material",      "Material",    "material",        "Static",  "Setup",     true,  nullptr, false },
+    { "sim_fixture",       "Fixture",     "fixture",         "Static",  "Setup",     true,  nullptr, false },
+    { "sim_load_force",    "Force",       "load_force",      "Static",  "Loads",     true,  nullptr, false },
+    { "sim_load_pressure", "Pressure",    "load_pressure",   "Static",  "Loads",     true,  nullptr, false },
+    // Torque loads: schema-reserved (engine has no torque/moment load op yet) — honest greyed row.
+    { "sim_load_torque",   "Torque",      "load_force",      "Static",  "Loads",     false, nullptr, true  },
+    { "sim_mesh",          "Mesh",        "mesh",            "Static",  "Mesh",      true,  nullptr, false },
+    { "sim_run",           "Run",         "run_study",       "Static",  "Run",       true,  nullptr, false },
+    { "sim_results",       "Results",     "results",         "Static",  "Run",       true,  nullptr, false },
+    { "ref_plane",         "Ref. Plane",  "ref_plane",       "Static",  "Reference", false, nullptr, false },
+    { "ref_axis",          "Ref. Axis",   "ref_axis",        "Static",  "Reference", false, nullptr, false },
+    { "ref_point",         "Ref. Point",  "ref_point",       "Static",  "Reference", false, nullptr, false },
+    { "ref_csys",          "Coord. Sys.", "ref_csys",        "Static",  "Reference", false, nullptr, false },
+
+    // --- Tab: Modal (natural frequencies / mode shapes; loads not applicable) ---
+    { "sim_new_modal",     "New Study",   "study_modal",     "Modal",   "Study",     true,  nullptr, false },
+    { "sim_material",      "Material",    "material",        "Modal",   "Setup",     true,  nullptr, false },
+    { "sim_fixture",       "Fixture",     "fixture",         "Modal",   "Setup",     true,  nullptr, false },
+    { "sim_modal_options", "Frequencies", "study_modal",     "Modal",   "Options",   true,  nullptr, false },
+    { "sim_mesh",          "Mesh",        "mesh",            "Modal",   "Mesh",      true,  nullptr, false },
+    { "sim_run",           "Run",         "run_study",       "Modal",   "Run",       true,  nullptr, false },
+    { "sim_results",       "Results",     "results",         "Modal",   "Run",       true,  nullptr, false },
+    { "ref_plane",         "Ref. Plane",  "ref_plane",       "Modal",   "Reference", false, nullptr, false },
+    { "ref_axis",          "Ref. Axis",   "ref_axis",        "Modal",   "Reference", false, nullptr, false },
+    { "ref_point",         "Ref. Point",  "ref_point",       "Modal",   "Reference", false, nullptr, false },
+    { "ref_csys",          "Coord. Sys.", "ref_csys",        "Modal",   "Reference", false, nullptr, false },
+
+    // --- Tab: Flow (external CFD wind/water tunnel) — fluid, flow direction/boundaries, grid ---
+    { "sim_new_flow",      "New Study",   "study_flow",      "Flow",    "Study",     true,  nullptr, false },
+    { "sim_fluid",         "Fluid",       "material",        "Flow",    "Setup",     true,  nullptr, false },
+    { "sim_flow_bc",       "Boundaries",  "fixture",         "Flow",    "Setup",     true,  nullptr, false },
+    { "sim_flow_res",      "Resolution",  "mesh",            "Flow",    "Grid",      true,  nullptr, false },
+    { "sim_run",           "Run",         "run_study",       "Flow",    "Run",       true,  nullptr, false },
+    { "sim_results",       "Results",     "results",         "Flow",    "Run",       true,  nullptr, false },
+    { "ref_plane",         "Ref. Plane",  "ref_plane",       "Flow",    "Reference", false, nullptr, false },
+    { "ref_axis",          "Ref. Axis",   "ref_axis",        "Flow",    "Reference", false, nullptr, false },
+    { "ref_point",         "Ref. Point",  "ref_point",       "Flow",    "Reference", false, nullptr, false },
+    { "ref_csys",          "Coord. Sys.", "ref_csys",        "Flow",    "Reference", false, nullptr, false },
+
+    // --- Tab: Thermal (steady-state heat transfer: wall BC / heat source / CHT) ---
+    { "sim_new_thermal",   "New Study",   "study_thermal",   "Thermal", "Study",     true,  nullptr, false },
+    { "sim_thermal_bc",    "Heat Loads",  "load_pressure",   "Thermal", "Setup",     true,  nullptr, false },
+    { "sim_run",           "Run",         "run_study",       "Thermal", "Run",       true,  nullptr, false },
+    { "sim_results",       "Results",     "results",         "Thermal", "Run",       true,  nullptr, false },
+    { "ref_plane",         "Ref. Plane",  "ref_plane",       "Thermal", "Reference", false, nullptr, false },
+    { "ref_axis",          "Ref. Axis",   "ref_axis",        "Thermal", "Reference", false, nullptr, false },
+    { "ref_point",         "Ref. Point",  "ref_point",       "Thermal", "Reference", false, nullptr, false },
+    { "ref_csys",          "Coord. Sys.", "ref_csys",        "Thermal", "Reference", false, nullptr, false },
+
+    // --- Tab: Fatigue (cyclic life over a static stress state: loading + S-N/Marin) ---
+    { "sim_new_fatigue",   "New Study",   "study_fatigue",   "Fatigue", "Study",     true,  nullptr, false },
+    { "sim_material",      "Material",    "material",        "Fatigue", "Setup",     true,  nullptr, false },
+    { "sim_fatigue_setup", "Loading / S-N","results",        "Fatigue", "Setup",     true,  nullptr, false },
+    { "sim_mesh",          "Mesh",        "mesh",            "Fatigue", "Mesh",      true,  nullptr, false },
+    { "sim_run",           "Run",         "run_study",       "Fatigue", "Run",       true,  nullptr, false },
+    { "sim_results",       "Results",     "results",         "Fatigue", "Run",       true,  nullptr, false },
+    { "ref_plane",         "Ref. Plane",  "ref_plane",       "Fatigue", "Reference", false, nullptr, false },
+    { "ref_axis",          "Ref. Axis",   "ref_axis",        "Fatigue", "Reference", false, nullptr, false },
+    { "ref_point",         "Ref. Point",  "ref_point",       "Fatigue", "Reference", false, nullptr, false },
+    { "ref_csys",          "Coord. Sys.", "ref_csys",        "Fatigue", "Reference", false, nullptr, false },
+
+    // --- Tab: Motion (kinematics: drive one assembly mate, play back the trajectory) ---
+    { "sim_new_motion",    "New Study",   "mate",            "Motion",  "Study",     true,  nullptr, false },
+    { "sim_motion_setup",  "Driver / Time","move_component", "Motion",  "Setup",     true,  nullptr, false },
+    { "sim_run",           "Run",         "run_study",       "Motion",  "Run",       true,  nullptr, false },
+    { "sim_results",       "Playback",    "results",         "Motion",  "Run",       true,  nullptr, false },
+    { "ref_plane",         "Ref. Plane",  "ref_plane",       "Motion",  "Reference", false, nullptr, false },
+    { "ref_axis",          "Ref. Axis",   "ref_axis",        "Motion",  "Reference", false, nullptr, false },
+    { "ref_point",         "Ref. Point",  "ref_point",       "Motion",  "Reference", false, nullptr, false },
+    { "ref_csys",          "Coord. Sys.", "ref_csys",        "Motion",  "Reference", false, nullptr, false },
+
+    // --- Tab: EM (electromagnetics — backed by the em_* worker RPCs, parallel agent).
+    // SimManager gates every sim_em_* command on an em_status probe: when the solver backend is
+    // not installed the whole set renders disabled with an honest "EM solver not installed"
+    // tooltip (ui::setRibbonDisabledPrefix). Study-kind buttons per Hunter's spec: Eigenmode,
+    // Frequency Sweep (S-parameters), Time Domain; setup tools: ports / boundaries / freq range.
+    { "sim_em_eigen",      "Eigenmode",   "study_modal",     "EM",      "Study",     true,  nullptr, false },
+    { "sim_em_sweep",      "Freq Sweep",  "study_flow",      "EM",      "Study",     true,  nullptr, false },
+    { "sim_em_time",       "Time Domain", "study_static",    "EM",      "Study",     true,  nullptr, false },
+    { "sim_em_ports",      "Ports",       "point_ent",       "EM",      "Setup",     true,  nullptr, false },
+    { "sim_em_boundary",   "Boundaries",  "fixture",         "EM",      "Setup",     true,  nullptr, false },
+    { "sim_em_range",      "Freq Range",  "settings",        "EM",      "Setup",     false, nullptr, false },
+    { "sim_em_run",        "Run",         "run_study",       "EM",      "Run",       true,  nullptr, false },
+    { "sim_em_results",    "Results",     "results",         "EM",      "Run",       true,  nullptr, false },
+    { "ref_plane",         "Ref. Plane",  "ref_plane",       "EM",      "Reference", false, nullptr, false },
+    { "ref_axis",          "Ref. Axis",   "ref_axis",        "EM",      "Reference", false, nullptr, false },
+    { "ref_point",         "Ref. Point",  "ref_point",       "EM",      "Reference", false, nullptr, false },
+    { "ref_csys",          "Coord. Sys.", "ref_csys",        "EM",      "Reference", false, nullptr, false },
+
 };
 // clang-format on
 

@@ -30,6 +30,12 @@ void setRibbonSketchActive(bool active);
 // call-site in app.cpp; ribbon.cpp defaults to Model so the band builds without the wire.
 void setRibbonWorkspace(int workspace);
 
+// sim-gui: dynamically disable every command whose cmd_id starts with `prefix` — the buttons
+// render in the disabled ghost state and their tooltip shows `reason` (instead of the static
+// "Coming soon"). Pass ""/nullptr as prefix to clear. Used by SimManager to grey the EM tab's
+// tools while the em_* electromagnetics solver backend is not installed. Sticky until changed.
+void setRibbonDisabledPrefix(const char* prefix, const char* reason);
+
 // --- Ribbon layout helpers --------------------------------------------------
 
 // Begin the ribbon bar: reserves a full-width child window of height ribbonH.

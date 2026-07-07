@@ -2676,7 +2676,13 @@ void SimManager::drawTreeBody(AppState& st) {
         ImGui::Dummy(ImVec2(0, 2.0f * S2));
 
         const float iconSz = 18.0f * S2;
-        const float nameCol = 108.0f * S2;   // fixed name column so descriptions align
+        // Description column starts past the WIDEST name so no name (e.g. "Electromagnetic") clips
+        // into its description.
+        ImGui::PushFont(st.fonts.medium);
+        float maxNameW = 0.0f;
+        for (const auto& e : kEntries) maxNameW = std::max(maxNameW, ImGui::CalcTextSize(e.name).x);
+        ImGui::PopFont();
+        const float descOffset = iconSz + 8.0f * S2 + maxNameW + 14.0f * S2;
         Kind chosenKind = Kind::Fea;
         StudyType chosenType = StudyType::Static;
         bool picked = false;
@@ -2695,15 +2701,16 @@ void SimManager::drawTreeBody(AppState& st) {
             ImGui::TextUnformatted(e.name);
             ImGui::PopFont();
             ImGui::SameLine(0, 0);
-            ImGui::SetCursorPosX(startX + iconSz + 8.0f * S2 + nameCol);
+            ImGui::SetCursorPosX(startX + descOffset);
             pushDimText();
             ImGui::TextUnformatted(e.desc);
             popDimText();
+            // Full-row hit target as the LAST item so fmRowPillEnd's hover paint (and the click)
+            // cover the entire row, not just the description text under the cursor.
+            ImGui::SetCursorScreenPos(r.mn);
+            const bool hit = ImGui::InvisibleButton("##row", ImVec2(r.mx.x - r.mn.x, r.mx.y - r.mn.y));
             ui::fmRowPillEnd(r, false);
-            if (ImGui::IsMouseHoveringRect(r.mn, r.mx) &&
-                ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                chosenKind = e.kind; chosenType = e.type; picked = true;
-            }
+            if (hit) { chosenKind = e.kind; chosenType = e.type; picked = true; }
             ImGui::PopID();
         }
 

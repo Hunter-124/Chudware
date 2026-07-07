@@ -888,14 +888,17 @@ void plmDrawPlanningPage(AppState& st) {
             ImGui::Spacing();
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 3 * S));
+            // ArrowButton draws a real triangle (font-independent — the ‹ › glyphs
+            // were not in the atlas and rendered blank); the tight FramePadding
+            // above shrinks its square to a compact size.
             ImGui::BeginDisabled(!blocked && idx == 0);
-            if (ImGui::SmallButton("\xe2\x80\xb9"))  // ‹
+            if (ImGui::ArrowButton("##prev", ImGuiDir_Left))
                 planCall(st, "update", "task",
                          {{"status", blocked ? "todo" : kPipe[idx - 1]}}, t.id);
             ImGui::EndDisabled();
             ImGui::SameLine();
             ImGui::BeginDisabled(!blocked && idx == 2);
-            if (ImGui::SmallButton("\xe2\x80\xba"))  // ›
+            if (ImGui::ArrowButton("##next", ImGuiDir_Right))
                 planCall(st, "update", "task",
                          {{"status", blocked ? "doing" : kPipe[idx + 1]}}, t.id);
             ImGui::EndDisabled();

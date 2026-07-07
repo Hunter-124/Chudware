@@ -94,7 +94,11 @@ def _agent_design(params: dict, emit_event: EmitFn) -> dict:
         session = loop.Session(name=name)
         _SESSIONS[session_id] = session
 
-    provider = config.get_provider()
+    # O1 (GUI model picker): an explicit provider NAME in the params pins the provider for this
+    # turn — get_provider(name=...) beats the ambient AI_CAD_PROVIDER env / config.json default.
+    # An explicit pick also skips the IP-1 routing override below (the user's choice wins).
+    explicit_provider = params.get("provider") or None
+    provider = config.get_provider(explicit_provider, cfg)
     # T-BL22: per-insertion-point adapter routing (T-H9 seam, IP-1 = the design loop).
     # When config.json carries a "routing" entry for IP-1, resolve which brain answers:
     # a non-fallback decision re-resolves the provider (e.g. a vLLM-served LoRA) and the
@@ -105,7 +109,7 @@ def _agent_design(params: dict, emit_event: EmitFn) -> dict:
         from services.serving.routing import load_routing_table
 
         _rt = load_routing_table(cfg)
-        if "IP-1" in _rt:
+        if "IP-1" in _rt and not explicit_provider:  # explicit user pick beats adapter routing
             _decision = _rt.resolve("IP-1", user_id=str(session_id or ""))
             if not _decision.is_fallback:
                 try:

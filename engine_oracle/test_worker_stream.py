@@ -174,11 +174,39 @@ def test_subprocess_roundtrip() -> None:
         p.wait(timeout=10)
 
 
+def test_agent_design_provider_override_threads_name() -> None:
+    """O1 (GUI model picker): an explicit params["provider"] name must reach
+    config.get_provider(name=...) — it may not be silently dropped in favor of the ambient
+    config.json / AI_CAD_PROVIDER default."""
+    original = config.get_provider
+    worker._SESSIONS.clear()
+    seen: list = []
+
+    def _capture(name=None, cfg=None, *a, **k):  # noqa: ANN001
+        seen.append(name)
+        return MockProvider([
+            '```python\nresult = Box(10, 10, 10)\n```\n```json\n{"done": false, "notes": "v1"}\n```',
+            '```json\n{"done": true, "notes": "ok"}\n```',
+        ])
+
+    try:
+        config.get_provider = _capture
+        worker._agent_design(
+            {"request": "a 10mm cube", "name": "wkr_ovr", "session_id": "s_ovr",
+             "plan": False, "provider": "llamacpp"}, lambda e: None)
+    finally:
+        config.get_provider = original
+        worker._SESSIONS.clear()
+    assert seen and seen[0] == "llamacpp", (
+        f"explicit provider name should thread into get_provider, got {seen!r}")
+
+
 def main() -> None:
     test_session_reuse_reset_and_streaming()
     test_plan_event_forwarded()
     test_run_model_assembly()
     test_event_wire_format()
+    test_agent_design_provider_override_threads_name()
     test_subprocess_roundtrip()
     print("\nWORKER SESSION + STREAMING TESTS PASSED")
 

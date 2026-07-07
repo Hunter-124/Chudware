@@ -365,16 +365,40 @@ void hydrate_assist_from_session(nlohmann::ordered_json& op, const std::string& 
     }
 }
 
+// O1 (GUI model picker): apply the caller's explicit model / reasoning-effort overrides onto a
+// resolved provider descriptor. Only overwrites when the param is a non-empty string; a refusal
+// descriptor ({error:...}) passes through untouched.
+static nlohmann::json apply_model_overrides(nlohmann::json desc, const nlohmann::json& params) {
+    if (!desc.is_object() || desc.contains("error")) return desc;
+    if (params.contains("model") && params["model"].is_string() &&
+        !params["model"].get<std::string>().empty())
+        desc["model"] = params["model"];
+    if (params.contains("reasoning_effort") && params["reasoning_effort"].is_string() &&
+        !params["reasoning_effort"].get<std::string>().empty())
+        desc["reasoning_effort"] = params["reasoning_effort"];
+    return desc;
+}
+
 // P54b host-ergonomics: resolve the assist provider from the ambient config.json when
 // the caller did not pass one (the host sends bare {question|params, doc_id}). Returns
 // the descriptor to feed make_assist_provider. On a config-provider refusal/resolution
 // failure, returns {error:...} (the caller may surface it). The gates always pass an
 // explicit provider, so this fallback never runs under them.
+// O1: params.provider may now also be a provider NAME string (the GUI picker's explicit
+// override) — resolved via resolve_provider(name, cfg, env) so it beats an ambient
+// AI_CAD_PROVIDER env var, then params.model / params.reasoning_effort refine the descriptor.
+// The offline (ITAR) guard still applies — a refused name returns {error:...} as before.
 nlohmann::json resolve_assist_provider(const nlohmann::json& params) {
-    if (params.contains("provider") && !params["provider"].is_null())
-        return params["provider"];  // explicit (gate mock / host override)
+    if (params.contains("provider") && params["provider"].is_object() &&
+        !params["provider"].empty())
+        return params["provider"];  // explicit descriptor (gate mock / full host override)
     json cfg = aicad::agent::load_config();
-    return aicad::agent::resolve_provider(std::nullopt, cfg, nlohmann::json::object());
+    std::optional<std::string> name;
+    if (params.contains("provider") && params["provider"].is_string() &&
+        !params["provider"].get<std::string>().empty())
+        name = params["provider"].get<std::string>();
+    json desc = aicad::agent::resolve_provider(name, cfg, nlohmann::json::object());
+    return apply_model_overrides(std::move(desc), params);
 }
 
 // Wind-tunnel CFD on a live doc. Extracted from the agent_simulate_v1 handler so the
@@ -1546,7 +1570,15 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             } else {
                 // Resolve from config.json over the live process env (the same inputs
                 // the Python agent uses). resolve_provider applies the offline guard.
-                json resolved = aicad::agent::resolve_provider(std::nullopt, cfg, json::object());
+                // O1: params.provider as a NAME string (the GUI picker) pins the provider
+                // explicitly — it beats an ambient AI_CAD_PROVIDER env var; params.model /
+                // params.reasoning_effort then refine the descriptor.
+                std::optional<std::string> pname;
+                if (params.contains("provider") && params["provider"].is_string() &&
+                    !params["provider"].get<std::string>().empty())
+                    pname = params["provider"].get<std::string>();
+                json resolved = apply_model_overrides(
+                    aicad::agent::resolve_provider(pname, cfg, json::object()), params);
                 if (resolved.is_object() && resolved.contains("error")) {
                     return emit(json{{"ok", false},
                                      {"error", jstr(resolved, "error", "provider resolution failed")}},
@@ -1600,7 +1632,13 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
             if (explicit_provider) {
                 provider = params["provider"];
             } else {
-                json resolved = aicad::agent::resolve_provider(std::nullopt, cfg, json::object());
+                // O1: honor a provider NAME string + model/effort overrides (GUI picker).
+                std::optional<std::string> pname;
+                if (params.contains("provider") && params["provider"].is_string() &&
+                    !params["provider"].get<std::string>().empty())
+                    pname = params["provider"].get<std::string>();
+                json resolved = apply_model_overrides(
+                    aicad::agent::resolve_provider(pname, cfg, json::object()), params);
                 if (resolved.is_object() && resolved.contains("error"))
                     return emit(json{{"ok", false},
                                      {"error", jstr(resolved, "error", "provider resolution failed")}},

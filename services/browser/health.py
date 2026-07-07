@@ -62,7 +62,7 @@ def _check_site(site: str) -> dict[str, Any]:
         "error": None,
     }
     try:
-        result["logged_in"] = profiles.has_profile(site)
+        result["logged_in"] = profiles.has_login(site)
     except Exception as exc:  # noqa: BLE001 — bookkeeping only, never fatal
         result["error"] = f"profile check failed: {exc}"
 

@@ -69,3 +69,13 @@ try:
     WORKER_METHODS.update(_GUI_METHODS)
 except Exception:  # noqa: BLE001 — GUI seam is optional; agent tools above still register
     pass
+
+# Embedded-browser seam (Parts Library V2 workstream 3, generic/reusable) —
+# browser_embed_start/frame/input/navigate/stop + login_wizard_*. Thin wrappers
+# over services.browser.embed (CDP screencast); degrade to ok:false envelopes
+# when Playwright isn't provisioned.
+try:
+    from engine_oracle.embed_rpc import EMBED_WORKER_METHODS as _EMBED_METHODS
+    WORKER_METHODS.update(_EMBED_METHODS)
+except Exception:  # noqa: BLE001 — embed seam is optional; methods above still register
+    pass

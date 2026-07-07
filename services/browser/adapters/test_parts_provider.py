@@ -48,15 +48,17 @@ class _FakeSourceAdapter:
         return self.acquire_return
 
 
-def test_search_returns_empty_without_profile(provider_mods):
+def test_search_without_profile_reaches_adapter(provider_mods):
+    # Anonymous browsing is allowed (2026-07-07): no profile no longer gates
+    # search — session.browser_fetch auto-creates one; gated sites degrade to
+    # login_required stubs from the adapter itself.
     profiles, parts_provider = provider_mods
     src = _FakeSourceAdapter()
     provider = parts_provider.BrowserCatalogAdapter(src)
 
-    hits = provider.search("widget")
+    provider.search("widget")
 
-    assert hits == []
-    assert src.search_calls == []  # never even called the underlying adapter
+    assert src.search_calls == ["widget"]
 
 
 def test_search_filters_by_domain(provider_mods):
@@ -98,13 +100,16 @@ def test_search_passes_through_ask_user_errors(provider_mods):
     assert hits == [{"ok": False, "reason": "login_required", "ask_user": {"kind": "approval"}}]
 
 
-def test_get_returns_none_without_profile(provider_mods):
+def test_get_without_profile_reaches_adapter(provider_mods):
+    # Anonymous acquire allowed (2026-07-07) — the adapter itself reports
+    # login_required when the site actually gates the download.
     _profiles, parts_provider = provider_mods
     src = _FakeSourceAdapter()
     provider = parts_provider.BrowserCatalogAdapter(src)
 
-    assert provider.get("catalog:fakesite::https://fakesite.example/widget") is None
-    assert src.acquire_calls == []
+    provider.get("catalog:fakesite::https://fakesite.example/widget")
+
+    assert len(src.acquire_calls) == 1
 
 
 def test_get_returns_none_for_other_site_part_id(provider_mods):

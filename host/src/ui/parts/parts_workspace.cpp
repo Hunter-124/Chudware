@@ -58,6 +58,60 @@ void loadCategories(AppState& st) {
     });
 }
 
+// parts_taxonomy → S().taxonomyRoot. Facet field arrives as "key" (mapped into TaxFacet.id).
+// The tree includes a "vendors" root (Vendors → type groups → site leaves) rendered like any
+// folder. On failure / method-missing, falls back to the flat parts_list_categories list.
+static void parseTaxNode(const nlohmann::json& j, TaxNode& out) {
+    out.id    = j.value("id",    "");
+    out.label = j.value("label", "");
+    out.icon  = j.value("icon",  "");
+    if (j.contains("facets") && j["facets"].is_array())
+        for (auto& f : j["facets"]) {
+            TaxFacet tf;
+            tf.id    = f.value("key",   "");   // NOTE: RPC field is "key", not "id"
+            tf.label = f.value("label", tf.id);
+            tf.type  = f.value("type",  "text");
+            tf.unit  = f.value("unit",  "");
+            if (f.contains("values") && f["values"].is_array())
+                for (auto& v : f["values"])
+                    if (v.is_string()) tf.options.push_back(v.get<std::string>());
+            out.facets.push_back(std::move(tf));
+        }
+    if (j.contains("children") && j["children"].is_array())
+        for (auto& c : j["children"]) {
+            TaxNode ch;
+            parseTaxNode(c, ch);
+            out.children.push_back(std::move(ch));
+        }
+}
+
+void loadTaxonomy(AppState& st) {
+    if (S().taxonomyLoaded || S().taxonomyLoading) return;
+    S().taxonomyLoading = true;
+    st.rpc.call("parts_taxonomy", {}, [&st](const core::RpcResult& r) {
+        S().taxonomyLoading = false;
+        S().taxonomyLoaded  = true;
+        bool ok = r.ok && r.result.is_object() && r.result.value("ok", false) &&
+                  r.result.contains("tree") && r.result["tree"].is_array();
+        if (!ok) {
+            // Method-missing or failure → flat parts_list_categories 2-level synthesis.
+            S().taxonomyIsTree = false;
+            loadCategories(st);
+            return;
+        }
+        TaxNode root;
+        root.id = "";
+        root.label = "All Parts";
+        for (auto& n : r.result["tree"]) {
+            TaxNode ch;
+            parseTaxNode(n, ch);
+            root.children.push_back(std::move(ch));
+        }
+        S().taxonomyRoot   = std::move(root);
+        S().taxonomyIsTree = true;
+    });
+}
+
 void loadVendors(AppState& st, bool force) {
     if (S().vendorsLoading) return;
     if (S().vendorsLoaded && !force) return;
@@ -114,14 +168,35 @@ void doSearch(AppState& st) {
     S().results.clear();
     nlohmann::json p;
     p["query"]    = S().searchBuf;
-    p["category"] = S().selectedCategory;
     p["limit"]    = 100;
+    // Tree mode → taxonomy category_id (incl. vendors.*.<site> leaves = browse that vendor);
+    // fallback flat mode keeps the legacy "category" param.
+    if (S().taxonomyIsTree) p["category_id"] = S().selectedCategory;
+    else                    p["category"]    = S().selectedCategory;
     if (S().priceMin > 0.0f) p["price_min"] = S().priceMin;
     if (S().priceMax > 0.0f) p["price_max"] = S().priceMax;
     if (S().materialBuf[0])  p["material"]  = S().materialBuf;
     if (S().vendorBuf[0])    p["vendor"]    = S().vendorBuf;
     if (S().sourceFilter == 1) p["source"] = "local";
     if (S().sourceFilter == 2) p["source"] = "live";
+    // Active facet values: range → {min?,max?}, enum → string list, text → substring.
+    {
+        nlohmann::json facets = nlohmann::json::object();
+        for (const auto& [key, fv] : S().facetValues) {
+            if (!fv.active()) continue;
+            if (fv.rmin != 0.0f || fv.rmax != 0.0f) {
+                nlohmann::json range = nlohmann::json::object();
+                if (fv.rmin != 0.0f) range["min"] = fv.rmin;
+                if (fv.rmax != 0.0f) range["max"] = fv.rmax;
+                facets[key] = std::move(range);
+            } else if (!fv.multi.empty()) {
+                facets[key] = std::vector<std::string>(fv.multi.begin(), fv.multi.end());
+            } else if (fv.text[0]) {
+                facets[key] = fv.text;
+            }
+        }
+        if (!facets.empty()) p["facets"] = std::move(facets);
+    }
     st.rpc.call("parts_search", p, [](const core::RpcResult& r) {
         S().searching  = false;
         S().searchDone = true;
@@ -133,6 +208,17 @@ void doSearch(AppState& st) {
         }
         S().hasLive = r.result.value("has_live", false);
         S().results.clear();
+        // Per-site skip notices (login_required stubs) — shown as a hint line under the
+        // results header instead of blank rows.
+        S().notices.clear();
+        if (r.result.contains("notices") && r.result["notices"].is_array())
+            for (auto& n : r.result["notices"]) {
+                Notice nt;
+                nt.site   = n.value("site",   "");
+                nt.reason = n.value("reason", "");
+                nt.hint   = n.value("hint",   "");
+                S().notices.push_back(std::move(nt));
+            }
         if (!r.result.contains("results")) return;
         for (auto& it : r.result["results"]) {
             PartsItem item;
@@ -313,15 +399,24 @@ void drawPartsLibraryWorkspace(AppState& st) {
         S().expandedCats.clear();
         for (const auto& c : st.settings.partsExpandedCats) S().expandedCats.insert(c);
         if (st.workerStarted) {
-            loadCategories(st);
+            loadTaxonomy(st);   // falls back to loadCategories on method-missing
             loadVendors(st);
             pollQueue(st);
         }
     }
     // Re-try if worker came up after first frame.
     if (st.workerStarted) {
-        if (!S().categoriesLoaded && !S().categoriesLoading) loadCategories(st);
-        if (!S().vendorsLoaded   && !S().vendorsLoading)    loadVendors(st);
+        if (!S().taxonomyLoaded && !S().taxonomyLoading) loadTaxonomy(st);
+        if (!S().vendorsLoaded  && !S().vendorsLoading)  loadVendors(st);
+    }
+
+    // Debounced filter → search: any facet/global-filter change stamps filterDirtyAt; fire
+    // one doSearch 0.35 s after the last change (no Apply button). Held while a search is
+    // already in flight so the dirty edit is never dropped.
+    if (S().filterDirtyAt > 0.0 && !S().searching &&
+        ImGui::GetTime() - S().filterDirtyAt > 0.35) {
+        S().filterDirtyAt = 0.0;
+        doSearch(st);
     }
 
     if (!st.workerStarted) {
@@ -330,11 +425,11 @@ void drawPartsLibraryWorkspace(AppState& st) {
         return;
     }
 
-    // Layout: [categories+filters 210px] | [results flex] | [vendors+queue 250px]
+    // Layout: [taxonomy tree 240px] | [results flex] | [filters + vendor strip 260px]
     float totalW = ImGui::GetContentRegionAvail().x;
-    const float catW  = 210.0f * sc;
-    const float vendW = 250.0f * sc;
-    const float midW  = totalW - catW - vendW - 12.0f * sc;
+    const float catW  = 240.0f * sc;
+    const float filtW = 260.0f * sc;
+    const float midW  = totalW - catW - filtW - 12.0f * sc;
 
     // ---- search bar (above results column only) --------------------------------
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 5 * sc));
@@ -404,13 +499,30 @@ void drawPartsLibraryWorkspace(AppState& st) {
                 std::snprintf(hdr, sizeof(hdr), "Parts");
             sectionHeader(hdr, /*firstInPane=*/true);
         }
+        // Subtle one-line hint for per-site skip notices (login_required stubs).
+        if (!S().notices.empty()) {
+            char hint[128];
+            std::snprintf(hint, sizeof(hint), "%d vendor%s need sign-in — see Vendors",
+                          (int)S().notices.size(), S().notices.size() == 1 ? "" : "s");
+            ImGui::TextDisabled("%s", hint);
+            if (ImGui::IsItemHovered()) {
+                std::string tip;
+                for (const auto& n : S().notices) {
+                    if (!tip.empty()) tip += "\n";
+                    tip += n.site + ": " + (n.hint.empty() ? n.reason : n.hint);
+                }
+                ImGui::SetTooltip("%s", tip.c_str());
+            }
+        }
         if (S().gridView) drawResultsGrid(st);
         else              drawResultsList(st);
     }
     ImGui::EndChild();
 
     ImGui::SameLine();
-    drawVendorsPane(st, vendW);
+    drawFiltersBlock(st, filtW);   // right pane: filters + facets + vendor strip footer
+
+    drawVendorsPopup(st);          // floating "Vendor Accounts" window (no-op when closed)
 }
 
 }  // namespace ui

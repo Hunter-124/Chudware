@@ -26,11 +26,20 @@ from __future__ import annotations
 
 # Distinctive captcha service markers / challenge-page phrases (substring,
 # case-insensitive). Kept specific enough not to fire on ordinary pages.
+#
+# IMPORTANT nuance (live-probe 2026-07-07): many ordinary pages ship the PASSIVE
+# reCAPTCHA v3 badge (api.js?render=…, grecaptcha-badge, an invisible anchor
+# iframe) with no challenge presented — e.g. every TraceParts page.  Library
+# presence is NOT a challenge; we match only ACTIVE widget markup (the v2
+# checkbox div, the bframe challenge popup) and challenge-page phrases, plus a
+# size=invisible exclusion for the anchor iframe below.  This keeps the hard
+# rule intact — anything that IS a challenge still aborts and hands control to
+# the human — while no longer aborting successful fetches of normal pages.
 _CAPTCHA_MARKERS: tuple[str, ...] = (
-    # Google reCAPTCHA / hCaptcha / Cloudflare Turnstile widgets
-    "recaptcha", "g-recaptcha", "grecaptcha",
+    # Google reCAPTCHA v2 explicit widget / challenge popup, hCaptcha, Turnstile
+    "g-recaptcha", "recaptcha/api2/bframe",
     "hcaptcha", "h-captcha",
-    "cf-turnstile", "data-sitekey",
+    "cf-turnstile",
     # Cloudflare interstitial / challenge pages
     "cf-challenge", "cf_chl_", "challenge-platform",
     "checking your browser before", "just a moment...",
@@ -58,8 +67,10 @@ _TWO_FACTOR_MARKERS: tuple[str, ...] = (
     "confirm your identity to continue",
 )
 
-# iframe src fragments that indicate an embedded captcha widget.
-_CAPTCHA_IFRAME_SRC: tuple[str, ...] = ("recaptcha", "hcaptcha", "turnstile", "/captcha")
+# iframe src fragments that indicate an embedded captcha widget.  "recaptcha"
+# is deliberately absent: the v3 badge injects an invisible anchor iframe on
+# ordinary pages — the anchor is handled separately with a size=invisible check.
+_CAPTCHA_IFRAME_SRC: tuple[str, ...] = ("hcaptcha", "turnstile", "/captcha")
 
 # URL fragments that themselves signal a captcha challenge redirect.
 _CAPTCHA_URL_MARKERS: tuple[str, ...] = ("validatecaptcha", "/captcha", "/errors/validate")
@@ -82,6 +93,10 @@ def classify_challenge(html: str | None, url: str = "") -> str | None:
     if any(m in hay for m in _CAPTCHA_MARKERS):
         return "captcha"
     if "<iframe" in hay and any(s in hay for s in _CAPTCHA_IFRAME_SRC):
+        return "captcha"
+    # reCAPTCHA anchor iframe: a visible checkbox is a challenge; the v3 badge's
+    # size=invisible anchor on an ordinary page is not.
+    if "recaptcha/api2/anchor" in hay and "size=invisible" not in hay:
         return "captcha"
     if any(m in hay for m in _TWO_FACTOR_MARKERS):
         return "2fa"

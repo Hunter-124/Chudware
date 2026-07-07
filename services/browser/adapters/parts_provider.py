@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from typing import Iterator
 
-from ..profiles import has_profile
 from . import SourceAdapter
 
 
@@ -55,8 +54,8 @@ class BrowserCatalogAdapter:
               filters: dict | None = None) -> list[dict]:
         if domain and domain != self.domain:
             return []
-        if not has_profile(self._site):
-            return []  # silent — same posture as a live vendor provider with no API key
+        # Anonymous search is allowed (session.browser_fetch auto-creates a
+        # profile); login-gated sites degrade to login_required stubs upstream.
         hits = self._adapter.search(query)
         records: list[dict] = []
         for hit in hits:
@@ -85,8 +84,6 @@ class BrowserCatalogAdapter:
         prefix = f"catalog:{self._site}::"
         if not part_id.startswith(prefix):
             return None
-        if not has_profile(self._site):
-            return None  # silent — no session, nothing this provider can do
         result = self._cache.get(part_id)
         if result is None:
             result = {"title": "", "url": part_id[len(prefix):], "site": self._site}

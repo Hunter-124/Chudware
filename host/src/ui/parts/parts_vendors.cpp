@@ -1,6 +1,16 @@
-// Parts Library — right pane: vendor sign-in, API pricing credentials, download queue.
-// GUI V2 phase A: rows use the border treatment (resting glass + hover/selected border).
+// Parts Library — vendors (GUI V2 phase B): the old full right pane is gone. This TU owns
+//   * drawVendorStrip  — compact fixed footer of the filters pane: status dots + "N/M signed
+//     in", health summary, "Connect vendor accounts", "Vendors…" (popup) and "Test vendors".
+//     ALL background polling (login watch, download queue, health) lives here so it keeps
+//     running whether or not the popup is open.
+//   * drawVendorsPopup — floating glass window with the vendor sign-in list, API-provider
+//     credential editors, download queue and health-check results table.
+//   * openVendorWizard — phase C seam: probes the worker for browser_embed_start (embedded
+//     browser); method-missing → headed vendor_login fallback for the first unsigned vendor.
+//   * startHealthCheck/pollHealthStatus — vendors_health_check/_status flow (single-flight,
+//     2 s backoff while running).
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -15,17 +25,193 @@
 namespace ui {
 namespace parts {
 
-void drawVendorsPane(AppState& st, float paneW) {
+// ---- health check flow -------------------------------------------------------------
+
+void startHealthCheck(AppState& st) {
+    if (!S().healthSupported || S().healthStarting || S().healthRunning) return;
+    S().healthStarting = true;
+    st.rpc.call("vendors_health_check", {}, [&st](const core::RpcResult& r) {
+        S().healthStarting = false;
+        if (!r.ok) {
+            if (r.err.find("unknown method") != std::string::npos) {
+                S().healthSupported = false;
+            } else {
+                st.toast(ui::ToastLevel::Error, "Health check failed to start: " + r.err);
+            }
+            return;
+        }
+        if (!r.result.is_object() || !r.result.value("ok", false)) {
+            st.toast(ui::ToastLevel::Error, "Health check failed to start: " +
+                     (r.result.is_object() ? r.result.value("error", std::string("unknown"))
+                                           : std::string("bad response")));
+            return;
+        }
+        S().healthRunning  = true;
+        S().lastHealthPoll = 0.0;  // poll immediately on the next frame
+    });
+}
+
+void pollHealthStatus(AppState& st) {
+    if (!S().healthSupported || S().healthPolling) return;
+    S().healthPolling  = true;
+    S().lastHealthPoll = ImGui::GetTime();
+    st.rpc.call("vendors_health_status", {}, [](const core::RpcResult& r) {
+        S().healthPolling = false;
+        if (!r.ok) {
+            if (r.err.find("unknown method") != std::string::npos)
+                S().healthSupported = false;
+            S().healthRunning = false;
+            return;
+        }
+        if (!r.result.is_object() || !r.result.value("ok", false)) return;
+        S().healthRunning = r.result.value("running", false);
+        S().healthChecked = true;
+        std::vector<HealthRow> rows;
+        if (r.result.contains("results"))
+            for (auto& x : r.result["results"]) {
+                HealthRow h;
+                h.site      = x.value("site", "");
+                h.ok        = x.value("ok", false);
+                h.loggedIn  = x.value("logged_in", false);
+                h.expected  = x.value("expected", false);
+                h.latencyMs = x.value("latency_ms", 0.0);
+                h.hitCount  = x.value("hit_count", 0);
+                h.error     = x.value("error", "");
+                rows.push_back(std::move(h));
+            }
+        S().healthResults = std::move(rows);
+    });
+}
+
+// ---- phase C seam: vendor sign-in wizard --------------------------------------------
+// Probes browser_embed_start (services/browser embedded session — landing concurrently in
+// phase C). If the worker speaks it, flag the browser panel (parts_browser_panel.cpp keys
+// browserPanelActive() off S().browserWizardRequested in phase C — today it just toasts).
+// Method-missing → old headed vendor_login for the first not-signed-in vendor.
+
+void openVendorWizard(AppState& st) {
+    st.rpc.call("browser_embed_start", nlohmann::json{{"probe", true}},
+                [&st](const core::RpcResult& r) {
+        bool missing = !r.ok && r.err.find("unknown method") != std::string::npos;
+        if (!missing) {
+            S().browserWizardRequested = true;
+            st.toast(ui::ToastLevel::Info,
+                     "Embedded browser wizard arriving in the next build");
+            return;
+        }
+        for (auto& v : S().vendors) {
+            if (v.loggedIn || v.loginInProgress) continue;
+            startVendorLogin(st, v);
+            return;
+        }
+        st.toast(ui::ToastLevel::Info, "All vendor sites are already signed in.");
+    });
+}
+
+// ---- compact strip (fixed footer of the filters pane) --------------------------------
+
+void drawVendorStrip(AppState& st, float paneW) {
     const float sc = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 4 * sc));
-    ImGui::BeginChild("##parts_vendors", ImVec2(paneW, 0), ImGuiChildFlags_None);
-    ImGui::PopStyleVar();
+    (void)paneW;
 
-    sectionHeader("Vendor Sites", /*firstInPane=*/true);
-
+    // -- background polling (always runs while the parts workspace is visible) --------
     bool anyLoginBusy = false;
-    for (auto& v : S().vendors)
+    int  signedIn     = 0;
+    for (auto& v : S().vendors) {
         if (v.loginInProgress) anyLoginBusy = true;
+        if (v.loggedIn) ++signedIn;
+    }
+    // While a headed login window is open, poll status so the dot flips green the moment
+    // the user closes the window. Edge-triggered + backed off (2 s).
+    if (anyLoginBusy && !S().vendorsLoading &&
+        ImGui::GetTime() - S().lastVendorPoll > 2.0)
+        loadVendors(st, /*force=*/true);
+    // Poll the download queue while active jobs exist (backed off; async).
+    if (S().queueActive && ImGui::GetTime() - S().lastQueuePoll > 2.5)
+        pollQueue(st);
+    // Poll health while the backend reports running (single-flight + 2 s backoff).
+    if (S().healthRunning && ImGui::GetTime() - S().lastHealthPoll > 2.0)
+        pollHealthStatus(st);
+
+    ImGui::Separator();
+
+    // -- status dot row + "N/M signed in" ---------------------------------------------
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        const float d   = 7.0f * sc;           // dot diameter
+        const float gap = 4.0f * sc;
+        float x = p.x + d * 0.5f;
+        float cy = p.y + 5.0f * sc + d * 0.5f;
+        int i = 0;
+        for (auto& v : S().vendors) {
+            const float* role = v.loggedIn ? palette.statusOk : palette.textDisabled;
+            if (!v.loginError.empty()) role = palette.statusErr;
+            dl->AddCircleFilled(ImVec2(x, cy), d * 0.5f, Palette::toU32(role));
+            // Invisible hover target per dot for the tooltip.
+            ImGui::SetCursorScreenPos(ImVec2(x - d * 0.5f, cy - d * 0.5f));
+            ImGui::PushID(i++);
+            ImGui::InvisibleButton("##dot", ImVec2(d, d));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s — %s", v.label.c_str(),
+                                  !v.loginError.empty() ? v.loginError.c_str()
+                                  : v.loggedIn          ? "signed in"
+                                                        : "not signed in");
+            ImGui::PopID();
+            x += d + gap;
+        }
+        ImGui::SetCursorScreenPos(ImVec2(x + 4.0f * sc, p.y + 3.0f * sc));
+        if (!S().vendors.empty())
+            ImGui::TextDisabled("%d/%d signed in", signedIn, (int)S().vendors.size());
+        else
+            ImGui::TextDisabled("no vendors");
+    }
+
+    // -- one-line health summary --------------------------------------------------------
+    if (!S().healthSupported) {
+        ImGui::TextDisabled("Health check unavailable (update the worker)");
+    } else if (S().healthStarting || (S().healthRunning && S().healthResults.empty())) {
+        spinner("Testing vendors");
+    } else if (S().healthChecked && !S().healthResults.empty()) {
+        int ok = 0, needLogin = 0, failing = 0;
+        for (auto& h : S().healthResults) {
+            if (h.ok) ++ok;
+            else if (h.expected) ++needLogin;
+            else ++failing;
+        }
+        if (failing > 0)
+            ImGui::TextDisabled("Health: %d ok · %d need sign-in · %d failing",
+                                ok, needLogin, failing);
+        else
+            ImGui::TextDisabled("Health: %d ok · %d need sign-in", ok, needLogin);
+    } else {
+        ImGui::TextDisabled(" ");
+    }
+
+    // -- buttons -------------------------------------------------------------------------
+    if (borderRow("##connect_vendors", "Connect vendor accounts", "browser_panel",
+                  /*selected=*/false, ImVec2(0, 22.0f * sc), /*centerText=*/true))
+        openVendorWizard(st);
+
+    const float half = (ImGui::GetContentRegionAvail().x - 4.0f * sc) * 0.5f;
+    if (borderRow("##vendors_popup", "Vendors…", nullptr, S().vendorsPopupOpen,
+                  ImVec2(half, 20.0f * sc), /*centerText=*/true))
+        S().vendorsPopupOpen = !S().vendorsPopupOpen;
+    ImGui::SameLine(0.0f, 4.0f * sc);
+    const bool healthBusy = S().healthStarting || S().healthRunning;
+    if (borderRow("##test_vendors", healthBusy ? "Testing…" : "Test vendors", nullptr,
+                  /*selected=*/false, ImVec2(half, 20.0f * sc), /*centerText=*/true) &&
+        !healthBusy)
+        startHealthCheck(st);
+}
+
+// ---- floating "Vendor Accounts" popup ------------------------------------------------
+
+namespace {
+
+void drawVendorSignInList(AppState& st) {
+    const float sc = ui::uiScale;
+    sectionHeader("Vendor Sites", /*firstInPane=*/true);
 
     if (S().vendorsLoading && S().vendors.empty()) {
         spinner("Checking");
@@ -78,14 +264,10 @@ void drawVendorsPane(AppState& st, float paneW) {
             ImGui::PopID();
         }
     }
+}
 
-    // While a headed login window is open, poll status so the dot flips green
-    // the moment the user closes the window. Edge-triggered + backed off (2 s).
-    if (anyLoginBusy && !S().vendorsLoading &&
-        ImGui::GetTime() - S().lastVendorPoll > 2.0)
-        loadVendors(st, /*force=*/true);
-
-    // ---- API pricing providers --------------------------------------------------
+void drawApiProviders(AppState& st, float paneW) {
+    const float sc = ui::uiScale;
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -93,68 +275,66 @@ void drawVendorsPane(AppState& st, float paneW) {
 
     if (S().apiProviders.empty()) {
         ImGui::TextDisabled("No API providers available.");
-    } else {
-        for (auto& a : S().apiProviders) {
-            ImGui::PushID(a.id.c_str());
-            borderRowSurface(false, a.editing ? (2.2f + (float)a.fields.size()) : 1.6f);
-            ImGui::BeginGroup();
-
-            ImVec4 dot = a.configured
-                ? ImVec4(palette.statusOk[0],  palette.statusOk[1],
-                         palette.statusOk[2],  1.0f)
-                : ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                         palette.textDisabled[2], 0.9f);
-            ImGui::PushStyleColor(ImGuiCol_Text, dot);
-            ImGui::TextUnformatted(a.configured ? "[+]" : "[ ]");
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            ImGui::TextUnformatted(a.label.c_str());
-            ImGui::SameLine();
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                                 ImGui::GetContentRegionAvail().x - 80.0f * sc);
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                ImVec4(palette.button[0], palette.button[1],
-                       palette.button[2], 0.80f));
-            if (ImGui::SmallButton(a.editing ? "Close" : (a.configured ? "Edit" : "Set up")))
-                a.editing = !a.editing;
-            ImGui::PopStyleColor();
-
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palette.textDisabled[0], palette.textDisabled[1],
-                       palette.textDisabled[2], 1.0f));
-            ImGui::TextUnformatted(a.configured ? "  Configured" : "  Not configured");
-            ImGui::PopStyleColor();
-
-            if (a.editing) {
-                for (size_t i = 0; i < a.fields.size() && i < 2; ++i) {
-                    ImGui::SetNextItemWidth(paneW - 24.0f * sc);
-                    ImGui::InputTextWithHint(
-                        (std::string("##cred_") + a.fields[i]).c_str(),
-                        a.fields[i].c_str(), a.fieldBuf[i], sizeof(a.fieldBuf[i]),
-                        ImGuiInputTextFlags_Password);
-                }
-                if (a.saving) {
-                    spinner("Saving");
-                } else if (ImGui::SmallButton("Save")) {
-                    saveApiCreds(st, a);
-                }
-            }
-
-            ImGui::EndGroup();
-            ImGui::Spacing();
-            ImGui::PopID();
-        }
+        return;
     }
+    for (auto& a : S().apiProviders) {
+        ImGui::PushID(a.id.c_str());
+        borderRowSurface(false, a.editing ? (2.2f + (float)a.fields.size()) : 1.6f);
+        ImGui::BeginGroup();
 
-    // ---- Download queue ----------------------------------------------------------
+        ImVec4 dot = a.configured
+            ? ImVec4(palette.statusOk[0],  palette.statusOk[1],
+                     palette.statusOk[2],  1.0f)
+            : ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                     palette.textDisabled[2], 0.9f);
+        ImGui::PushStyleColor(ImGuiCol_Text, dot);
+        ImGui::TextUnformatted(a.configured ? "[+]" : "[ ]");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::TextUnformatted(a.label.c_str());
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             ImGui::GetContentRegionAvail().x - 80.0f * sc);
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            ImVec4(palette.button[0], palette.button[1],
+                   palette.button[2], 0.80f));
+        if (ImGui::SmallButton(a.editing ? "Close" : (a.configured ? "Edit" : "Set up")))
+            a.editing = !a.editing;
+        ImGui::PopStyleColor();
+
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                   palette.textDisabled[2], 1.0f));
+        ImGui::TextUnformatted(a.configured ? "  Configured" : "  Not configured");
+        ImGui::PopStyleColor();
+
+        if (a.editing) {
+            for (size_t i = 0; i < a.fields.size() && i < 2; ++i) {
+                ImGui::SetNextItemWidth(paneW - 24.0f * sc);
+                ImGui::InputTextWithHint(
+                    (std::string("##cred_") + a.fields[i]).c_str(),
+                    a.fields[i].c_str(), a.fieldBuf[i], sizeof(a.fieldBuf[i]),
+                    ImGuiInputTextFlags_Password);
+            }
+            if (a.saving) {
+                spinner("Saving");
+            } else if (ImGui::SmallButton("Save")) {
+                saveApiCreds(st, a);
+            }
+        }
+
+        ImGui::EndGroup();
+        ImGui::Spacing();
+        ImGui::PopID();
+    }
+}
+
+void drawDownloadQueue(AppState& st) {
+    const float sc = ui::uiScale;
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
     sectionHeader("Download Queue");
-
-    // Poll while active jobs exist (backed off; async — never blocks the frame).
-    if (S().queueActive && ImGui::GetTime() - S().lastQueuePoll > 2.5)
-        pollQueue(st);
 
     if (S().queue.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text,
@@ -164,77 +344,142 @@ void drawVendorsPane(AppState& st, float paneW) {
         ImGui::PopStyleColor();
         if (ImGui::SmallButton("Refresh"))
             pollQueue(st);
-    } else {
-        if (ImGui::SmallButton("Refresh"))
-            pollQueue(st);
-        ImGui::Spacing();
-        for (auto& q : S().queue) {
-            ImGui::PushID(q.id.c_str());
-            borderRowSurface(false, 1.8f);
-            ImGui::BeginGroup();
-            std::string label = q.query;
-            if (label.size() > 34) label = label.substr(0, 31) + "...";
-            ImGui::Text("%-34.34s", label.c_str());
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", q.site.c_str());
-            if (q.status == "done") {
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                    ImVec4(palette.statusOk[0], palette.statusOk[1],
-                           palette.statusOk[2], 1.0f));
-                ImGui::TextUnformatted("  Done");
-                ImGui::PopStyleColor();
-                if (!q.artifactPath.empty()) {
-                    ImGui::SameLine();
-                    if (q.importing) {
-                        spinner("Importing");
-                    } else if (ImGui::SmallButton("Import into doc")) {
-                        q.importing = true;
-                        nlohmann::json p;
-                        p["artifact_path"] = q.artifactPath;
-                        st.rpc.call("parts_import_artifact", p,
-                            [&st, id = q.id](const core::RpcResult& r) {
-                                for (auto& j : S().queue)
-                                    if (j.id == id) j.importing = false;
-                                bool ok = r.ok && r.result.is_object() &&
-                                          r.result.value("ok", false);
-                                if (ok) {
-                                    st.toast(ui::ToastLevel::Success,
-                                        "Imported → " + r.result.value("doc_id", std::string("doc")));
-                                } else {
-                                    std::string why = r.ok
-                                        ? r.result.value("reason", std::string("import failed"))
-                                        : r.err;
-                                    st.toast(ui::ToastLevel::Error, "Import failed: " + why);
-                                }
-                            });
-                    }
-                }
-            } else if (q.status == "error") {
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                    ImVec4(palette.statusErr[0], palette.statusErr[1],
-                           palette.statusErr[2], 1.0f));
-                ImGui::TextUnformatted("  Failed");
-                ImGui::PopStyleColor();
-                if (!q.error.empty() && ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s", q.error.c_str());
-            } else if (q.status == "cancelled") {
-                ImGui::TextDisabled("  Cancelled");
-            } else {
-                float ph = (float)(0.5 + 0.5 * sin(ImGui::GetTime() * 2.5));
-                ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
-                    ImVec4(palette.accent[0], palette.accent[1],
-                           palette.accent[2], 0.80f));
-                ImGui::ProgressBar(ph, ImVec2(-1.0f, 4.0f * sc),
-                                   q.status == "running" ? "downloading" : "queued");
-                ImGui::PopStyleColor();
-            }
-            ImGui::EndGroup();
-            ImGui::Spacing();
-            ImGui::PopID();
-        }
+        return;
     }
+    if (ImGui::SmallButton("Refresh"))
+        pollQueue(st);
+    ImGui::Spacing();
+    for (auto& q : S().queue) {
+        ImGui::PushID(q.id.c_str());
+        borderRowSurface(false, 1.8f);
+        ImGui::BeginGroup();
+        std::string label = q.query;
+        if (label.size() > 34) label = label.substr(0, 31) + "...";
+        ImGui::Text("%-34.34s", label.c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", q.site.c_str());
+        if (q.status == "done") {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.statusOk[0], palette.statusOk[1],
+                       palette.statusOk[2], 1.0f));
+            ImGui::TextUnformatted("  Done");
+            ImGui::PopStyleColor();
+            if (!q.artifactPath.empty()) {
+                ImGui::SameLine();
+                if (q.importing) {
+                    spinner("Importing");
+                } else if (ImGui::SmallButton("Import into doc")) {
+                    q.importing = true;
+                    nlohmann::json p;
+                    p["artifact_path"] = q.artifactPath;
+                    st.rpc.call("parts_import_artifact", p,
+                        [&st, id = q.id](const core::RpcResult& r) {
+                            for (auto& j : S().queue)
+                                if (j.id == id) j.importing = false;
+                            bool ok = r.ok && r.result.is_object() &&
+                                      r.result.value("ok", false);
+                            if (ok) {
+                                st.toast(ui::ToastLevel::Success,
+                                    "Imported → " + r.result.value("doc_id", std::string("doc")));
+                            } else {
+                                std::string why = r.ok
+                                    ? r.result.value("reason", std::string("import failed"))
+                                    : r.err;
+                                st.toast(ui::ToastLevel::Error, "Import failed: " + why);
+                            }
+                        });
+                }
+            }
+        } else if (q.status == "error") {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.statusErr[0], palette.statusErr[1],
+                       palette.statusErr[2], 1.0f));
+            ImGui::TextUnformatted("  Failed");
+            ImGui::PopStyleColor();
+            if (!q.error.empty() && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", q.error.c_str());
+        } else if (q.status == "cancelled") {
+            ImGui::TextDisabled("  Cancelled");
+        } else {
+            float ph = (float)(0.5 + 0.5 * sin(ImGui::GetTime() * 2.5));
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
+                ImVec4(palette.accent[0], palette.accent[1],
+                       palette.accent[2], 0.80f));
+            ImGui::ProgressBar(ph, ImVec2(-1.0f, 4.0f * sc),
+                               q.status == "running" ? "downloading" : "queued");
+            ImGui::PopStyleColor();
+        }
+        ImGui::EndGroup();
+        ImGui::Spacing();
+        ImGui::PopID();
+    }
+}
 
-    ImGui::EndChild();
+void drawHealthTable(AppState& st) {
+    const float sc = ui::uiScale;
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    sectionHeader("Vendor Health");
+
+    if (!S().healthSupported) {
+        ImGui::TextDisabled("Health check unavailable — the worker does not support it yet.");
+        return;
+    }
+    const bool busy = S().healthStarting || S().healthRunning;
+    if (ImGui::SmallButton(busy ? "Running…" : "Run health check") && !busy)
+        startHealthCheck(st);
+    if (busy && S().healthResults.empty()) {
+        spinner("Testing");
+        return;
+    }
+    if (S().healthResults.empty()) {
+        ImGui::TextDisabled("Not tested this session.");
+        return;
+    }
+    ImGui::Spacing();
+    for (auto& h : S().healthResults) {
+        ImGui::PushID(h.site.c_str());
+        // Badge: green ok, amber expected sign-in-required failure, red real error.
+        const float* role = h.ok ? palette.statusOk
+                          : h.expected ? palette.statusWarn
+                                       : palette.statusErr;
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(role[0], role[1], role[2], 1.0f));
+        ImGui::TextUnformatted(h.ok ? "[+]" : (h.expected ? "[!]" : "[x]"));
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::TextUnformatted(h.site.c_str());
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             ImGui::GetContentRegionAvail().x - 78.0f * sc);
+        if (h.ok)
+            ImGui::TextDisabled("%.0f ms", h.latencyMs);
+        else
+            ImGui::TextDisabled("%s", h.expected ? "sign-in required" : "error");
+        if (!h.error.empty() && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", h.error.c_str());
+        ImGui::PopID();
+    }
+}
+
+}  // namespace
+
+void drawVendorsPopup(AppState& st) {
+    if (!S().vendorsPopupOpen) return;
+    const float sc = ui::uiScale;
+    const float popW = 420.0f * sc;
+
+    ImGui::SetNextWindowSize(ImVec2(popW, 540.0f * sc), ImGuiCond_FirstUseEver);
+    ui::pushGlassWindowStyle();
+    if (ImGui::Begin("Vendor Accounts##parts_vendors_popup", &S().vendorsPopupOpen,
+                     ImGuiWindowFlags_NoCollapse)) {
+        drawVendorSignInList(st);
+        drawApiProviders(st, popW);
+        drawDownloadQueue(st);
+        drawHealthTable(st);
+    }
+    ImGui::End();
+    ui::popGlassWindowStyle();
 }
 
 }  // namespace parts

@@ -18,6 +18,7 @@ the real per-source integration tests behind an env flag).
 """
 from __future__ import annotations
 
+import html as html_mod
 import re
 
 from .. import session as _session
@@ -37,16 +38,18 @@ LICENSE_NOTE = (
 
 _LOGIN_WALL_MARKERS = ('Sign in to TraceParts', 'class="tp-login"', 'id="login-form"')
 _TERMS_MARKERS = ('Accept the terms', 'class="supplier-terms"', 'License agreement required')
-# Best-effort: TraceParts product cards link to /en/product/<slug>.
+# Best-effort: TraceParts product links are /en/product/<slug>?CatalogPath=…&Product=…
+# (live 2026-07-07: no product-card class, and the query string is REQUIRED — the
+# Product/PartNumber params identify the part, so the href keeps it).
 _RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*product-card[^"]*"[^>]+href="(?P<href>/en/product/[^"?#]+)"[^>]*>'
-    r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
+    r'<a[^>]+href="(?P<href>/en/product/[^"]+)"[^>]*>(?P<title>.*?)</a>',
+    re.IGNORECASE | re.DOTALL)
 _DOWNLOAD_RE = re.compile(
     r'href="(?P<href>[^"]+\.(?:step|stp|iges|igs)(?:\?[^"]*)?)"', re.IGNORECASE)
 
 
 def _strip_tags(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text).strip()
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text)).strip()
 
 
 class TracePartsAdapter:
@@ -60,10 +63,21 @@ class TracePartsAdapter:
         content = result.get("content", "")
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
             return [login_required(SITE, url)]
-        return [
-            {"title": _strip_tags(m.group("title")), "url": BASE_URL + m.group("href"), "site": SITE}
-            for m in _RESULT_RE.finditer(content)
-        ]
+        # A product may be wrapped by several anchors (thumbnail, title); dedupe
+        # by href, preferring the first anchor whose inner text is non-empty.
+        seen: dict[str, str] = {}
+        for m in _RESULT_RE.finditer(content):
+            href = html_mod.unescape(m.group("href"))
+            title = _strip_tags(m.group("title"))
+            if href not in seen or (not seen[href] and title):
+                seen[href] = title
+        hits = []
+        for href, title in seen.items():
+            if not title:
+                slug = href.split("/en/product/", 1)[1].split("?", 1)[0]
+                title = slug.replace("-", " ").strip()
+            hits.append({"title": title, "url": BASE_URL + href, "site": SITE})
+        return hits
 
     def acquire(self, result: dict) -> dict:
         url = result.get("url", "")

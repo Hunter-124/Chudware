@@ -198,12 +198,28 @@ def test_browser_login_never_raises_on_launch_error(browser_mods):
 
 # --- session: browser_fetch ------------------------------------------------------
 
-def test_browser_fetch_without_profile_fails_cleanly(browser_mods):
-    _profiles, _ratelimit, session = browser_mods
-    result = session.browser_fetch("https://example.com/part", "grabcad")
-    assert result == {"ok": False, "reason": "no_profile",
-                      "hint": "no saved browser session for site 'grabcad' — "
-                               "call browser_login('grabcad') first"}
+def test_browser_fetch_without_profile_autocreates_one(browser_mods):
+    # Anonymous browsing allowed (2026-07-07): a missing profile is created on
+    # the fly instead of failing with no_profile.
+    profiles, _ratelimit, session = browser_mods
+    fake_factory = _fake_sync_playwright_factory(html="<html>part page</html>", status=200)
+    result = session.browser_fetch("https://example.com/part", "grabcad",
+                                   _sync_playwright=fake_factory)
+    assert result["ok"] is True
+    assert profiles.has_profile("grabcad") is True
+    assert profiles.has_login("grabcad") is False  # a dir is not a login
+
+
+def test_browser_fetch_surfaces_bot_wall_status(browser_mods):
+    # HTTP 403/429 pages are bot walls, not content (live-probe 2026-07-07:
+    # they used to return ok:True and adapters reported silent empty results).
+    profiles, _ratelimit, session = browser_mods
+    profiles.profile_dir("grabcad").mkdir(parents=True)
+    fake_factory = _fake_sync_playwright_factory(html="<html>Access Denied</html>", status=403)
+    result = session.browser_fetch("https://example.com/part", "grabcad",
+                                   _sync_playwright=fake_factory)
+    assert result["ok"] is False
+    assert result["reason"] == "bot_walled"
 
 
 def test_browser_fetch_returns_envelope_when_profile_exists(browser_mods):

@@ -54,6 +54,12 @@ def test_classifier_flags_2fa(html):
     "<html><body>A perfectly ordinary product page. Add to cart.</body></html>",
     "<html><head><title>GrabCAD - Flanged Bushing</title></head><body>Download STEP</body></html>",
     "<p>Sign in with your email and password to continue.</p>",  # a login form is NOT a captcha/2FA
+    # Passive reCAPTCHA v3 badge on an ordinary page (TraceParts et al.) — the
+    # library/badge is NOT a challenge (live-probe 2026-07-07 false positive).
+    '<script src="https://www.google.com/recaptcha/api.js?render=6LcKey"></script>'
+    '<div class="grecaptcha-badge"></div>'
+    '<iframe src="https://www.google.com/recaptcha/api2/anchor?ar=1&size=invisible"></iframe>'
+    "<body>608 bearing — 40 results. Download STEP AP214.</body>",
     "",
     None,
 ])

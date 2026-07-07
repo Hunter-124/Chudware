@@ -37,7 +37,10 @@ LICENSE_NOTE = (
     "contracts/license_debt.md."
 )
 
-_LOGIN_WALL_MARKERS = ('id="ap_email"', 'Sign in to your account', 'name="signIn"')
+# NOTE: 'name="signIn"' is deliberately absent — every ordinary Amazon page
+# carries a hidden sign-in nav form with that attribute (live-probe 2026-07-07
+# false positive); only markers unique to the actual auth interstitial belong here.
+_LOGIN_WALL_MARKERS = ('id="ap_email"', 'Sign in to your account')
 # Bot-challenge markers: never bypass, treat exactly like a login wall.
 _CHALLENGE_MARKERS = (
     "Enter the characters you see",
@@ -46,11 +49,14 @@ _CHALLENGE_MARKERS = (
     "Type the characters you see in this image",
 )
 
-# Best-effort: Amazon search result cards.
+# Best-effort: Amazon search result cards.  Handles both legacy markup (title
+# in a separate <span class="a-text-normal">) and current markup where
+# a-link-normal…a-text-normal share one <a> and the title is a class-less
+# <span> inside an <h2> (live-probe 2026-07-07: old regex matched 0/34 cards).
 _RESULT_RE = re.compile(
-    r'<div[^>]+data-asin="(?P<asin>[A-Z0-9]{10})"[^>]*>.*?'
-    r'<a[^>]+class="[^"]*a-link-normal[^"]*"[^>]+href="(?P<href>/[^"?#]+)"[^>]*>.*?'
-    r'<span[^>]*class="[^"]*a-text-normal[^"]*"[^>]*>(?P<title>.*?)</span>',
+    r'data-asin="(?P<asin>[A-Z0-9]{10})"[^>]*>.*?'
+    r'<a[^>]+class="[^"]*a-link-normal[^"]*"[^>]+href="(?P<href>/[^"?#]+)"[^>]*>\s*'
+    r'(?:<h2[^>]*>\s*)?<span[^>]*>(?P<title>[^<]{3,300})</span>',
     re.IGNORECASE | re.DOTALL,
 )
 _PRICE_RE = re.compile(

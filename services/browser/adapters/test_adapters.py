@@ -348,6 +348,35 @@ def test_amazon_search_parses_result_cards(adapter_mods, monkeypatch):
     assert hits[0]["price"] == "$12.99"
 
 
+AMAZON_SEARCH_HTML_MODERN = """
+<html><body>
+<form name="signIn" style="display:none"></form>
+<div data-asin="B07CVBSC9Y" data-component-type="s-search-result">
+  <h2 class="a-size-mini"><a class="a-link-normal s-line-clamp-2 s-link-style a-text-normal"
+     href="/dp/B07CVBSC9Y"><span>608 2RS Ball Bearing 8x22x7mm, 10 Pack</span></a></h2>
+  <span class="a-offscreen">$5.59</span>
+</div>
+</body></html>
+"""
+
+
+def test_amazon_search_parses_modern_result_cards(adapter_mods, monkeypatch):
+    # Live-probe 2026-07-07: current Amazon markup fuses a-link-normal +
+    # a-text-normal on one <a> with a class-less title <span> inside <h2>,
+    # and every page carries a hidden name="signIn" nav form (not a login wall).
+    _adapters_pkg, _grabcad, _traceparts, session, amazon, _mcmaster, _jlcpcb, _pcbway = adapter_mods
+    monkeypatch.setattr(session, "browser_fetch",
+                        lambda url, site: {"ok": True, "content": AMAZON_SEARCH_HTML_MODERN})
+
+    hits = amazon.ADAPTER.search("608 bearing")
+
+    assert len(hits) == 1
+    assert hits[0]["title"] == "608 2RS Ball Bearing 8x22x7mm, 10 Pack"
+    assert hits[0]["url"] == "https://www.amazon.com/dp/B07CVBSC9Y"
+    assert hits[0]["asin"] == "B07CVBSC9Y"
+    assert hits[0]["price"] == "$5.59"
+
+
 def test_amazon_search_login_wall_surfaces_ask_user(adapter_mods, monkeypatch):
     _adapters_pkg, _grabcad, _traceparts, session, amazon, _mcmaster, _jlcpcb, _pcbway = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",

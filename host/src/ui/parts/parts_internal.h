@@ -77,10 +77,27 @@ struct Thumb {
     int w = 0, h = 0;
 };
 
+// parts_search "notices" — per-site skip reasons (login_required etc.) so stubbed vendors
+// surface as a hint line instead of blank rows.
+struct Notice {
+    std::string site, reason, hint;
+};
+
+// vendors_health_status result row.
+struct HealthRow {
+    std::string site;
+    bool   ok        = false;
+    bool   loggedIn  = false;
+    bool   expected  = false;   // expected failure (sign-in required) → amber, not red
+    double latencyMs = 0.0;
+    int    hitCount  = 0;
+    std::string error;
+};
+
 // ---- taxonomy / facets (phase B data model — populated by later phases) ----------
 
 struct TaxFacet {
-    std::string id, label, type, unit;    // type: "range" | "multi" | "select" | "text"
+    std::string id, label, type, unit;    // type: "range" | "enum" | "text" (RPC field is "key" → id)
     std::vector<std::string> options;
     float vmin = 0, vmax = 0;
 };
@@ -115,6 +132,7 @@ struct PartsState {
     std::vector<PartsItem> results;
     std::string            searchErr;
     bool hasLive = false;
+    std::vector<Notice> notices;   // per-site skip reasons from the last parts_search
 
     // ---- filters (sent with parts_search) ----
     float priceMin = 0.0f;
@@ -135,12 +153,26 @@ struct PartsState {
     std::map<std::string, FacetValue> facetValues;
     double filterDirtyAt = 0;
 
-    // ---- vendors (right pane) ----
+    // ---- vendors (strip + popup) ----
     bool vendorsLoaded   = false;
     bool vendorsLoading  = false;
     std::vector<VendorEntry> vendors;
     std::vector<ApiProvider> apiProviders;
     double lastVendorPoll = 0.0;
+    bool vendorsPopupOpen = false;
+
+    // ---- vendor health check (vendors_health_check / vendors_health_status) ----
+    bool   healthSupported = true;   // false once the worker says "unknown method"
+    bool   healthStarting  = false;  // vendors_health_check in flight
+    bool   healthRunning   = false;  // backend reports running → keep polling
+    bool   healthPolling   = false;  // vendors_health_status in flight (single-flight)
+    bool   healthChecked   = false;  // at least one status result received
+    double lastHealthPoll  = 0.0;
+    std::vector<HealthRow> healthResults;
+
+    // Phase C seam: set true when openVendorWizard finds the embedded-browser RPC live;
+    // parts_browser_panel.cpp will key browserPanelActive() off this in phase C.
+    bool browserWizardRequested = false;
 
     // ---- download queue ----
     std::vector<QueueJob> queue;
@@ -165,6 +197,7 @@ PartsState& S();
 
 // ---- data / RPC functions (parts_workspace.cpp) -----------------------------------
 void loadCategories(AppState& st);
+void loadTaxonomy(AppState& st);     // parts_taxonomy → S().taxonomyRoot (falls back to loadCategories)
 void loadVendors(AppState& st, bool force = false);
 void doSearch(AppState& st);
 void pollQueue(AppState& st);
@@ -173,12 +206,24 @@ void insertItem(AppState& st, const PartsItem& item);
 void startVendorLogin(AppState& st, VendorEntry& v);
 void saveApiCreds(AppState& st, ApiProvider& a);
 
+// Find a node by id anywhere in the taxonomy tree (nullptr when absent). Defined in
+// parts_taxonomy_pane.cpp; parts_filters.cpp uses it to reach the selected node's facets.
+const TaxNode* findTaxNode(const TaxNode& root, const std::string& id);
+
 // ---- panes ------------------------------------------------------------------------
-void drawTaxonomyPane(AppState& st, float paneW);   // parts_taxonomy_pane.cpp
-void drawFiltersBlock(AppState& st, float paneW);   // parts_filters.cpp
+void drawTaxonomyPane(AppState& st, float paneW);   // parts_taxonomy_pane.cpp (left, tree)
+void drawFiltersBlock(AppState& st, float paneW);   // parts_filters.cpp (right pane + vendor strip)
 void drawResultsList(AppState& st);                 // parts_results.cpp
 void drawResultsGrid(AppState& st);                 // parts_results.cpp
-void drawVendorsPane(AppState& st, float paneW);    // parts_vendors.cpp
+
+// parts_vendors.cpp — compact vendor strip (footer of the filters pane), the floating
+// "Vendor Accounts" popup (sign-in list + API creds + download queue + health table), the
+// vendor health-check flow, and the phase-C wizard seam.
+void drawVendorStrip(AppState& st, float paneW);    // fixed footer inside the filters pane
+void drawVendorsPopup(AppState& st);                // floating glass window; no-op when closed
+void openVendorWizard(AppState& st);                // phase C seam: embed wizard or headed fallback
+void startHealthCheck(AppState& st);
+void pollHealthStatus(AppState& st);
 
 // parts_browser_panel.cpp — embedded vendor-browser panel (later phase; stub for now).
 bool browserPanelActive();

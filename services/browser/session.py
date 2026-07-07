@@ -52,6 +52,13 @@ DEFAULT_LOGIN_TIMEOUT_S = 300.0
 DEFAULT_NAV_TIMEOUT_S = 30.0
 
 
+def _busy(site: str) -> dict:
+    """§6 degradation for Chromium ProcessSingleton contention on a site profile."""
+    return fail("profile_busy",
+                f"site profile '{site}' is open in the embedded browser — close that "
+                f"session (or finish the login wizard) and retry")
+
+
 def _import_sync_playwright() -> Callable[[], Any]:
     try:
         from playwright.sync_api import sync_playwright
@@ -76,6 +83,16 @@ def browser_login(site: str, *, timeout: float = DEFAULT_LOGIN_TIMEOUT_S,
     except RuntimeError as exc:
         return fail("playwright_not_installed", str(exc))
 
+    lock = profiles.profile_lock(site)
+    if not lock.acquire(blocking=False):
+        return _busy(site)
+    try:
+        return _browser_login_locked(site, timeout=timeout, sync_playwright=sync_playwright)
+    finally:
+        lock.release()
+
+
+def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callable[[], Any]) -> dict:
     profile_path = profiles.profile_dir(site)
     challenge_detected: str | None = None
     try:
@@ -123,17 +140,29 @@ def browser_fetch(url: str, site: str, *, nav_timeout: float = DEFAULT_NAV_TIMEO
                   _sync_playwright: Callable[[], Any] | None = None) -> dict:
     """Fetch ``url`` HEADLESS under ``site``'s saved session profile.
 
-    Returns the §6 failure shape (never raises) when no profile exists yet for
-    ``site``, when Playwright isn't installed, or when navigation fails.
+    Returns the §6 failure shape (never raises) when Playwright isn't installed
+    or navigation fails.  A missing profile is auto-created (anonymous browsing
+    of public catalogs is allowed — live-probe 2026-07-07; login-gated content
+    still degrades to login_required via the adapters).
     """
-    if not profiles.has_profile(site):
-        return fail("no_profile", f"no saved browser session for site '{site}' — "
-                                    f"call browser_login('{site}') first")
+    profiles.ensure_profile(site)
     try:
         sync_playwright = _sync_playwright or _import_sync_playwright()
     except RuntimeError as exc:
         return fail("playwright_not_installed", str(exc))
 
+    lock = profiles.profile_lock(site)
+    if not lock.acquire(blocking=False):
+        return _busy(site)
+    try:
+        return _browser_fetch_locked(url, site, nav_timeout=nav_timeout,
+                                     min_interval=min_interval, sync_playwright=sync_playwright)
+    finally:
+        lock.release()
+
+
+def _browser_fetch_locked(url: str, site: str, *, nav_timeout: float, min_interval: float,
+                          sync_playwright: Callable[[], Any]) -> dict:
     ratelimit.wait(site, min_interval=min_interval)
     profile_path = profiles.profile_dir(site)
     try:
@@ -163,6 +192,16 @@ def browser_fetch(url: str, site: str, *, nav_timeout: float = DEFAULT_NAV_TIMEO
                     f"session likely expired — re-login with browser_login('{site}') "
                     f"and retry")
 
+    # An HTTP error page is not real content either — surface it distinctly so
+    # the health board can tell "bot-walled" (403/429 from Akamai/Cloudflare/PX)
+    # from "parser broke" (live-probe 2026-07-07: these used to come back ok:True
+    # and adapters reported a silent empty result).
+    if status is not None and status >= 400:
+        reason = "bot_walled" if status in (403, 429) else "http_error"
+        return fail(reason, f"{site} returned HTTP {status} for {url}; the site is "
+                            f"likely blocking automated access — a signed-in session "
+                            f"(browser_login('{site}')) usually helps")
+
     profiles.save_meta(site, last_used_ts=time.time())
     return {"ok": True, "url": url, "status": status, "content": content,
             "fetched_ts": now_ts(), "session_profile_used": profiles.slug(site)}
@@ -177,15 +216,27 @@ def browser_download(url: str, site: str, dest: Path, *, nav_timeout: float = DE
     which shares the context's cookies) rather than page navigation — the
     right tool for a CAD/PDF file, which a real page load would hand to the
     browser's download manager instead of returning as page content.
+    A missing profile is auto-created (public datasheets/models need no login;
+    gated files fail naturally and surface login_required upstream).
     """
-    if not profiles.has_profile(site):
-        return fail("no_profile", f"no saved browser session for site '{site}' — "
-                                    f"call browser_login('{site}') first")
+    profiles.ensure_profile(site)
     try:
         sync_playwright = _sync_playwright or _import_sync_playwright()
     except RuntimeError as exc:
         return fail("playwright_not_installed", str(exc))
 
+    lock = profiles.profile_lock(site)
+    if not lock.acquire(blocking=False):
+        return _busy(site)
+    try:
+        return _browser_download_locked(url, site, dest, nav_timeout=nav_timeout,
+                                        min_interval=min_interval, sync_playwright=sync_playwright)
+    finally:
+        lock.release()
+
+
+def _browser_download_locked(url: str, site: str, dest: Path, *, nav_timeout: float,
+                             min_interval: float, sync_playwright: Callable[[], Any]) -> dict:
     ratelimit.wait(site, min_interval=min_interval)
     profile_path = profiles.profile_dir(site)
     try:

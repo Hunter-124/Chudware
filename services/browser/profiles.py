@@ -15,11 +15,42 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from engine import paths
+
+# ---------------------------------------------------------------------------
+# Per-site profile locks (Parts Library V2 / embedded browser).
+#
+# Chromium's ProcessSingleton means ONE user-data-dir cannot back two live
+# browser contexts at once. Every code path that opens a persistent context
+# for a site (sync session.py entry points AND the embedded-browser sessions
+# in services.browser.embed) must hold that site's lock for the duration.
+# Acquisition is NON-BLOCKING everywhere: contention degrades to a structured
+# ``profile_busy`` result instead of deadlocking a worker thread.
+
+_PROFILE_LOCKS: dict[str, threading.Lock] = {}
+_PROFILE_LOCKS_GUARD = threading.Lock()
+
+
+def profile_lock(site: str | None) -> threading.Lock:
+    """Process-wide lock guarding ``site``'s persistent profile directory.
+
+    The same ``site`` (after :func:`slug` normalisation) always returns the
+    same :class:`threading.Lock`. ``site=None`` returns a fresh per-call dummy
+    lock (no shared profile → nothing to serialise).
+    """
+    if site is None:
+        return threading.Lock()
+    key = slug(site)
+    with _PROFILE_LOCKS_GUARD:
+        lock = _PROFILE_LOCKS.get(key)
+        if lock is None:
+            lock = _PROFILE_LOCKS[key] = threading.Lock()
+        return lock
 
 
 def slug(site: str) -> str:
@@ -43,6 +74,24 @@ def profile_dir(site: str) -> Path:
 
 def has_profile(site: str) -> bool:
     return profile_dir(site).exists()
+
+
+def ensure_profile(site: str) -> Path:
+    """Create ``site``'s profile dir if missing (anonymous browsing is allowed —
+    public catalogs don't need a login; gated content still degrades to
+    login_required via the adapters). Returns the profile path."""
+    p = profile_dir(site)
+    if not p.exists():
+        p.mkdir(parents=True, exist_ok=True)
+        touch_created(site)
+    return p
+
+
+def has_login(site: str) -> bool:
+    """True only when the user completed a real sign-in for ``site``
+    (``browser_login`` / the login wizard stamp ``last_login_ts``).  A mere
+    profile dir no longer implies a login — anonymous fetches auto-create one."""
+    return bool(load_meta(site).get("last_login_ts"))
 
 
 def _meta_path(site: str) -> Path:

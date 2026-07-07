@@ -28,6 +28,19 @@ namespace parts {
 
 namespace {
 
+// Null-tolerant string read. Client-mode wizard payloads carry embed_id /
+// current_site as JSON null (Python None); nlohmann::json::value(key, "")
+// THROWS type_error.302 on a present-but-null key (null → std::string is not
+// convertible), which — uncaught in an st.rpc drain callback — aborts the whole
+// GUI. Treat null / missing / non-string uniformly as the default.
+std::string jstr(const nlohmann::json& j, const char* key,
+                 const std::string& dflt = "") {
+    if (!j.is_object()) return dflt;
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_string()) return dflt;
+    return it->get<std::string>();
+}
+
 struct WizardState {
     // Backend-agnostic (screencast today, CEF later) — see web_view_backend.h.
     std::unique_ptr<ui::IWebViewBackend> web = ui::makeWebView();
@@ -39,6 +52,11 @@ struct WizardState {
     std::vector<std::string> done, skipped, remaining;
     bool   statusPending = false, actionPending = false;
     double lastStatusAt = 0.0;
+    // Client-driven auto-advance (CEF backend): time the login chip first read
+    // "logged_in" on the current site; 0 while not logged in. After a short
+    // stability window we export the session + advance — the worker can't see
+    // the in-process browser, so the GUI is the one that must drive the wizard.
+    double loggedInSince = 0.0;
     std::string setupError;   // embed backend failed — rendered in-panel
     std::string setupHint;
 };
@@ -59,6 +77,7 @@ std::string vendorLabel(const std::string& site) {
 // the current site's sign-in URL in-process instead (usesWorkerEmbed()==false).
 void openWizardSite(AppState& st, const std::string& embedId) {
     auto& w = W();
+    w.loggedInSince = 0.0;
     if (w.web->usesWorkerEmbed())
         w.web->attach(st, embedId);
     else if (!w.currentSite.empty())
@@ -78,6 +97,7 @@ void closeWizard(AppState& st, bool sendStop) {
     w.remaining.clear();
     w.setupError.clear();
     w.setupHint.clear();
+    w.loggedInSince = 0.0;
     S().browserWizardRequested = false;
     loadVendors(st, /*force=*/true);
 }
@@ -99,6 +119,7 @@ void finishWizard(AppState& st) {
 void applyWizardStatus(AppState& st, const nlohmann::json& j) {
     auto& w = W();
     if (!w.active) return;
+    const std::string prevSite = w.currentSite;
 
     if (j.contains("done") && j["done"].is_array()) {
         std::vector<std::string> nd;
@@ -120,16 +141,21 @@ void applyWizardStatus(AppState& st, const nlohmann::json& j) {
         for (const auto& s : j["remaining"])
             if (s.is_string()) w.remaining.push_back(s.get<std::string>());
     }
-    w.currentSite = j.value("current_site", w.currentSite);
+    w.currentSite = jstr(j, "current_site", w.currentSite);
 
     if (j.value("all_done", false) || !j.value("active", true)) {
         finishWizard(st);
         return;
     }
-    const std::string embed = j.value("embed_id", "");
+    const std::string embed = jstr(j, "embed_id");
     if (!embed.empty() && embed != w.embedId) {   // wizard advanced → new session
         w.embedId = embed;
         openWizardSite(st, embed);
+    } else if (!w.web->usesWorkerEmbed() && !w.currentSite.empty() &&
+               w.currentSite != prevSite) {
+        // Client mode has no embed_id — the wizard advanced when current_site
+        // changed, and the GUI opens the next site's sign-in page itself.
+        openWizardSite(st, "");
     }
 }
 
@@ -149,18 +175,40 @@ void wizardNext(AppState& st, bool skip) {
     auto& w = W();
     if (w.actionPending) return;
     w.actionPending = true;
-    st.rpc.call("login_wizard_next", nlohmann::json{{"skip", skip}},
-                [&st](const core::RpcResult& r) {
-        W().actionPending = false;
-        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
-            std::string why = r.ok && r.result.is_object()
-                                  ? r.result.value("reason", std::string("wizard step failed"))
-                                  : r.err;
-            st.toast(ui::ToastLevel::Error, "Wizard: " + why);
-            return;
-        }
-        applyWizardStatus(st, r.result);
-    });
+    // The GUI's live classification decides logged_in in client mode (the worker
+    // never sees the in-process browser). Sent along so wizard_next records the
+    // site as done vs skipped correctly.
+    const bool loggedIn = !skip && w.web->loginState() == "logged_in";
+    auto send = [&st, skip, loggedIn]() {
+        st.rpc.call("login_wizard_next",
+                    nlohmann::json{{"skip", skip}, {"logged_in", loggedIn}},
+                    [&st](const core::RpcResult& r) {
+            W().actionPending = false;
+            if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+                std::string why = r.ok && r.result.is_object()
+                                      ? r.result.value("reason", std::string("wizard step failed"))
+                                      : r.err;
+                st.toast(ui::ToastLevel::Error, "Wizard: " + why);
+                return;
+            }
+            applyWizardStatus(st, r.result);
+        });
+    };
+    // Signed in on an in-process backend → hand the session to the worker FIRST
+    // (cookie export + browser_session_import staging) so headless fetches can
+    // reuse it, then advance. Export failure still advances — the login stamp is
+    // also written by the import, so a failed export degrades to "signed in for
+    // this GUI session only" rather than blocking the wizard.
+    if (loggedIn && !w.web->usesWorkerEmbed() && !w.currentSite.empty()) {
+        w.web->exportSession(st, w.currentSite, [send](bool ok) {
+            if (!ok)
+                std::fprintf(stderr, "[parts] vendor session export failed — "
+                                     "headless reuse unavailable for this site\n");
+            send();
+        });
+    } else {
+        send();
+    }
 }
 
 // Login-state chip: borderRow-style pill, colored by state.
@@ -213,6 +261,11 @@ void startLoginWizard(AppState& st, const std::string& site) {
 
     nlohmann::json p = nlohmann::json::object();
     if (!site.empty()) p["sites"] = nlohmann::json::array({site});
+    // In-process backends (CEF) render + classify the login themselves; the
+    // worker must NOT launch its own invisible Playwright session per step (it
+    // would sit unattended on the login URL, hold the site's profile lock, and
+    // never see the user's sign-in). client mode = bookkeeping-only wizard.
+    if (!w.web->usesWorkerEmbed()) p["mode"] = "client";
 
     st.rpc.call("login_wizard_start", p, [&st, site](const core::RpcResult& r) {
         auto& w    = W();
@@ -274,12 +327,14 @@ void startLoginWizard(AppState& st, const std::string& site) {
         if (r.result.contains("sites") && r.result["sites"].is_array())
             for (const auto& s : r.result["sites"])
                 if (s.is_string()) w.remaining.push_back(s.get<std::string>());
-        w.currentSite = r.result.value("current_site", "");
+        w.currentSite = jstr(r.result, "current_site");
         w.embedId.clear();
-        const std::string embed = r.result.value("embed_id", "");
+        const std::string embed = jstr(r.result, "embed_id");
         if (!embed.empty()) {
             w.embedId = embed;
             openWizardSite(st, embed);
+        } else if (!w.web->usesWorkerEmbed() && !w.currentSite.empty()) {
+            openWizardSite(st, "");   // client mode: open the first site in-process
         }
         w.lastStatusAt = ImGui::GetTime();
     });
@@ -296,6 +351,22 @@ void drawBrowserPanel(AppState& st) {
     w.web->update(st);
     if (w.active && !w.statusPending && ImGui::GetTime() - w.lastStatusAt > 2.0)
         pollWizardStatus(st);
+
+    // Client-driven auto-advance (in-process CEF backend): the worker cannot
+    // observe this browser, so when the login chip has read "logged_in" for a
+    // short stability window (multi-hop OAuth redirects settle), the GUI itself
+    // exports the session and advances — same UX the worker-side classify loop
+    // used to give. The chip only reads logged_in after the page LEFT a
+    // sign-in URL it started on, so homepage false-positives can't fire this.
+    if (w.active && !w.web->usesWorkerEmbed() && !w.actionPending) {
+        if (w.web->loginState() == "logged_in") {
+            if (w.loggedInSince == 0.0) w.loggedInSince = ImGui::GetTime();
+            else if (ImGui::GetTime() - w.loggedInSince > 1.5)
+                wizardNext(st, /*skip=*/false);
+        } else {
+            w.loggedInSince = 0.0;
+        }
+    }
 
     // ---- top bar (28dp): title + step, chip, clipped URL, right-aligned actions ----------
     const float barH = 28.0f * sc;

@@ -145,6 +145,15 @@ private:
     std::string mdDocC;                  // worker doc id of Part C
     bool mdPassCFresh = false;           // C's PM was fresh (inactive) before we opened its form
     bool mdPassChop[4] = {false, false, false, false};  // A<->C hop verdicts (A,C,A,C)
+
+    // ---------- workspaces scenario (AI_CAD_SHOT=workspaces) ----------
+    // Cycles all 8 workspace tabs (Model, Drawing, Simulate, Electronics, Manufacture, PLM,
+    // PartsLibrary, AI), capturing one screenshot per workspace. Acceptance gate for the
+    // workspace routing switch. Per-step backbuffer-capture pattern matches multidoc/m1.
+    void runWorkspaces(AppState& st);
+    int wsStep = 0, wsSettle = 0;
+    bool wsDirReady = false;
+    std::string wsSavePath, wsCapture;
 };
 
 }  // namespace ui

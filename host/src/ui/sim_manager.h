@@ -12,10 +12,14 @@
 // owning doc id so a completion lands on the right document even if the user switched tabs mid-run.
 #pragma once
 
+#include <array>
+#include <map>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
+
+#include "../render/aicm_loader.h"   // render::DocMesh for motion study body-transform cache
 
 struct AppState;
 
@@ -23,7 +27,7 @@ namespace core { class SimClient; }
 
 namespace ui {
 
-enum class StudyType { Static, Modal, Flow, Fatigue, Thermal };
+enum class StudyType { Static, Modal, Flow, Fatigue, Thermal, Motion };
 
 // Static failure theory used for the headline factor of safety + the FoS plot field.
 enum class FailureCriterion { VonMises = 0, Tresca = 1, MaxNormal = 2 };
@@ -129,6 +133,30 @@ struct Study {
     // Conjugate (type 1): the solid part conducts heat from an internal dissipation.
     float flowSolidKappa = 200.0f;  // solid thermal conductivity (W/mK); 200 ~ aluminium
     float flowPowerW = 20.0f;       // power dissipated inside the solid (W)
+
+    // ---- Motion study (StudyType::Motion) ----
+    // Drives ONE dimensional assembly mate across [motionStart, motionStop] in `motionSteps`
+    // samples; re-solves the mate graph at each step. The per-body 4×4 world transforms are
+    // cached in motionTrajectory and played back with setBodyTransforms().
+    std::string motionMateId;           // mate id to drive (empty = auto-pick single drivable mate)
+    float motionStart = 0.0f;           // driver start value (deg or mm)
+    float motionStop  = 360.0f;         // driver stop value
+    int   motionSteps = 24;             // number of samples [2..120]
+    bool  motionLoop  = true;           // append a closing sample back at start
+    bool  motionCheckInterference = false;  // run interference check at each step
+    float motionFps   = 24.0f;          // playback speed (frames per second)
+
+    // Transient result (filled by runMotion, never persisted).
+    bool  motionHasResult = false;
+    bool  motionPlaying   = false;
+    int   motionFrame     = 0;          // current displayed frame
+    double motionLastTick = -1.0;       // ImGui::GetTime() at last frame advance
+    nlohmann::json motionTrajectory;    // array of {i, value, converged, bodies:[{name, transform}]}
+    std::string motionDriverUnit;       // "deg" or "mm"
+    // Per-body translation magnitude trace (|t| per frame) for the position plot.
+    // Keyed by body name; built once after runMotion and plotted in the Results panel.
+    std::vector<std::string> motionBodyNames;   // body display order (from frame 0)
+    int  motionPlotBody = 0;                    // which body to show in the trace plot
 
     // Result state (transient — regenerated on Run; never persisted).
     bool hasResult = false;
@@ -301,6 +329,20 @@ private:
     void runStaticOrModal(AppState& st, Study& s);
     void runFlow(AppState& st, Study& s);
     void runFatigue(AppState& st, Study& s);
+    // Motion study: call simulate_motion synchronously on the worker, parse the trajectory,
+    // show frame 0 and navigate to Results. runMotion is called once from run().
+    void runMotion(AppState& st, Study& s);
+    // Apply one trajectory frame to the renderer: CPU-transform each body's cached positions by
+    // the row-major 4×4 from the trajectory, then re-upload via st.setBodyTransforms().
+    void applyMotionFrame(AppState& st, Study& s, int frame);
+    // Build the per-body position-magnitude trace for the plot from the stored trajectory.
+    void buildMotionTrace(Study& s);
+    // Inline form for a Motion study (mate-id / range / steps / interference / fps / loop).
+    void drawMotionForm(AppState& st, Study& s);
+    // Timeline transport bar (rewind / step-back / play-pause / step-fwd / scrub slider).
+    void drawMotionTimeline(AppState& st, Study& s);
+    // Advance the playback frame on the main thread (called from tick()).
+    void tickMotion(AppState& st);
     nlohmann::json facePointsFor(AppState& st, const nlohmann::json& selector, std::string& err);
 
     // pick capture: append every currently-selected face into `well`.
@@ -346,6 +388,11 @@ private:
     bool flowShowSlices_ = false;
     double flowLinesVmax_ = 1.0;           // speed range the bands were built against
     void rebuildFlowLines(AppState& st, Study& s);  // (re)parse the overlay AICM into the band arrays
+
+    // Motion study: CPU-side cached DocMesh so applyMotionFrame can re-upload with per-body
+    // transforms without re-parsing the AICM each frame. Populated in runMotion(), cleared in
+    // clearResultOverlay(). The PartMesh rebuilding mirrors AppState::loadDocMesh's shaded path.
+    render::DocMesh motionDocMesh_;
 
     // Custom-material editor scratch (filled by the "+ New material…" popup).
     char cmName_[64] = "";

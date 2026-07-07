@@ -84,6 +84,9 @@
 #include "ui/profiler_window.h"   // in-app sampling-profiler window (text report + flamegraph)
 #include "ui/command_search.h"    // unified settings + modeling-tools search popup
 #include "ui/scenarios.h"  // scripted screenshot/test scenarios (m1/sketch/asm/fea/evalmass/activity)
+// [workspace-tabs seam] full-body workspace renderers for PLM and PartsLibrary.
+#include "ui/plm/plm_workspace.h"
+#include "ui/parts/parts_workspace.h"
 
 #include <filesystem>      // Wave N: ecad export output dir + W14: flat-pattern DXF export
 
@@ -1451,6 +1454,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // C22b: activity shot — new part doc -> agent_run_v2 -> Activity panel -> Settings Agents tab
     st.wantActivity = shot && shotMode && std::strcmp(shotMode, "activity") == 0;
     if (st.wantActivity) { st.showActivityPanel = true; }
+    // [workspace-tabs seam] workspaces shot — cycle all 8 workspace tabs, one screenshot each.
+    st.wantWorkspace = shot && shotMode && std::strcmp(shotMode, "workspaces") == 0;
+    if (st.wantWorkspace) { st.showRibbon = true; }
     // C20b: assembly shot — author base/peg parts, new assembly, insert + mate + interference.
     st.wantAsm = shot && shotMode && std::strcmp(shotMode, "asm") == 0;
     // AI_CAD_MATEFORM: a lightweight Mate-form-only variant of the asm shot for visual verification
@@ -2794,35 +2800,112 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // Multi-document: the ACTIVE document's PropertyManager (st.propertyManager is re-seated on
         // every tab switch). A backgrounded doc's PM is NOT ticked here, so its debounced preview
         // pauses while parked and resumes when its tab is reactivated.
-        if (st.propertyManager->active()) {
-            st.propertyManager->tick(st);
-            st.showFeatureTree = true;
+
+        // [workspace-tabs seam] Derive per-frame display flags from st.activeWorkspace. These are
+        // LOCAL to this frame — they never write persistent state (no st.leftPaneTab mutation,
+        // no clamping that traps the user). Full-body workspaces (PLM, PartsLibrary, AI) suppress
+        // the left pane and viewport in favour of their own full-screen layout; the docked Copilot
+        // column is always drawn so it stays available in non-AI workspaces exactly as today.
+        using WS = AppState::Workspace;
+        const WS ws = st.activeWorkspace;
+        // Workspaces that own the ENTIRE central region — no left pane, no viewport, no cam/ecad.
+        const bool wsFullBody = (ws == WS::PLM || ws == WS::PartsLibrary || ws == WS::AI);
+        // Effective left-pane tab override (derived this frame; never written to st).
+        // Simulate forces the Simulation tab so the sim tree shows; others follow st.leftPaneTab.
+        const int effectiveLeftTab = (ws == WS::Simulate) ? ui::kLeftPaneSimulation
+                                                           : st.leftPaneTab;
+        // The Manufacture workspace makes the CAM manager visible (like the old ribbon-tab gate).
+        const bool wsShowCam = (ws == WS::Manufacture) || (st.ribbonTab == AppState::RT_Manufacture);
+        // Electronics workspace shows the ECAD editor as the primary body.
+        const bool wsShowEcad = (ws == WS::Electronics) || st.showPcbTools || !st.ecadDocId.empty();
+
+        if (!wsFullBody) {
+            // ---- normal viewport workspaces (Model, Drawing, Simulate, Electronics, Manufacture) ----
+            if (st.propertyManager->active()) {
+                st.propertyManager->tick(st);
+                st.showFeatureTree = true;
+            }
+            if (st.showFeatureTree) {
+                // Pass the effective tab as a temporary override via the AppState field; restore after.
+                // drawLeftPane reads st.leftPaneTab directly, so we temporarily set it per-frame.
+                const int savedTab = st.leftPaneTab;
+                if (effectiveLeftTab != savedTab) st.leftPaneTab = effectiveLeftTab;
+                ui::drawLeftPane(st, [&st](const std::string& fid) {
+                    st.propertyManager->openForEdit(st, fid);
+                });
+                if (effectiveLeftTab != savedTab) st.leftPaneTab = savedTab;
+            }
         }
-        if (st.showFeatureTree) {
-            ui::drawLeftPane(st, [&st](const std::string& fid) {
-                st.propertyManager->openForEdit(st, fid);
-            });
-        }
+
         // W3-H: unified AI Copilot pane (input-at-top + conversation; embeds the run tree
-        // inline while a v2 run is active). st.activityPanel is still fed events via onEvent.
+        // inline while a v2 run is active). Always drawn (available in all workspaces).
+        // In the AI workspace it provides the right-column chat; in other workspaces it is
+        // the normal docked Copilot column on the right edge.
         ui::drawAIPanel(st, busy, canRun);
         // W3-H: standalone "Agent Activity" window (View > Activity / the pane's Activity
         // button / the activity shot). No-op unless st.showActivityPanel; was previously
         // unreachable because only the in-pane tab hosted drawBody.
         activityPanel.draw(st);
-        if (st.wantFocusViewport > 0) { ImGui::SetNextWindowFocus(); st.wantFocusViewport--; }
-        ui::drawViewportPanel(st, io, busy);
-        if (st.wantFocusEcad > 0) {
-            st.showPcbTools = true;
-            ImGui::SetNextWindowFocus();
-            st.wantFocusEcad--;
+
+        if (!wsFullBody) {
+            // ---- 3D/2D viewport (Model, Drawing, Simulate, Manufacture) ----
+            if (st.wantFocusViewport > 0) { ImGui::SetNextWindowFocus(); st.wantFocusViewport--; }
+            ui::drawViewportPanel(st, io, busy);
         }
-        if (st.showPcbTools || !st.ecadDocId.empty())
-            ui::drawEcadEditor(st);   // Wave N: AI-ECAD 2D editor
-        // CAM Manufacture workspace: reveal when its ribbon tab is active; draw every frame
-        // (no-ops until opened). Self-contained dock window like the ECAD editor.
-        if (st.ribbonTab == AppState::RT_Manufacture) ui::camEnsureVisible();
-        ui::drawCamManager(st);
+
+        if (!wsFullBody) {
+            // ---- ECAD editor (Electronics workspace or when an ECAD doc is open) ----
+            if (st.wantFocusEcad > 0) {
+                st.showPcbTools = true;   // ensure the ECAD window is visible when focus is requested
+                ImGui::SetNextWindowFocus();
+                st.wantFocusEcad--;
+            }
+            if (wsShowEcad) ui::drawEcadEditor(st);   // Wave N: AI-ECAD 2D editor
+        }
+
+        // ---- CAM Manufacture workspace ----
+        if (!wsFullBody) {
+            // Reveal the CAM manager when in the Manufacture workspace; draw every frame
+            // (no-ops until opened). Self-contained dock window like the ECAD editor.
+            if (wsShowCam) ui::camEnsureVisible();
+            ui::drawCamManager(st);
+        }
+
+        // ---- full-body workspace renderers (PLM / PartsLibrary / AI) ----
+        // These take the whole central region. They use drawViewportPanel's dock slot (the
+        // ImGui window ID "Viewport" is NOT opened by them — they draw directly into the
+        // overlay band area as floating non-docked glass panels, same pattern as drawLeftPane).
+        if (ws == WS::PLM) {
+            // PLM workspace: vault status, checkpoint history, release/lock. Full body, no left pane.
+            ui::drawPlmWorkspace(st);
+        } else if (ws == WS::PartsLibrary) {
+            // Parts Library workspace: catalog browse, vendor login, download queue.
+            ui::drawPartsLibraryWorkspace(st);
+        } else if (ws == WS::AI) {
+            // AI workspace: full-screen layout — the Copilot is already drawn above (right column);
+            // this stub draws the left session list + center live-model preview placeholder.
+            // When the AI workspace agent fills drawAIWorkspaceBody(), replace this stub.
+            {
+                const ui::OverlayBand& band = ui::overlayBand();
+                if (band.valid) {
+                    // Session list panel on the left side of the AI workspace.
+                    const float margin = 12.0f;
+                    const float sessionW = 200.0f;
+                    ImGui::SetNextWindowPos(ImVec2(band.minX + margin, band.minY + margin));
+                    ImGui::SetNextWindowSize(ImVec2(sessionW, band.maxY - band.minY - 2.0f * margin));
+                    ImGui::SetNextWindowBgAlpha(0.0f);
+                    ImGui::Begin("##AISessionList", nullptr,
+                                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                                 ImGuiWindowFlags_NoBringToFrontOnFocus |
+                                 ImGuiWindowFlags_NoNav);
+                    ImGui::TextDisabled("Sessions");
+                    ImGui::Separator();
+                    ImGui::TextDisabled("(No sessions yet)");
+                    ImGui::End();
+                }
+            }
+        }
         if (st.ecadAiGo) { st.ecadAiGo = false; ecadAiDesign(st, st.ecadAiRequest); }  // Wave P
         if (st.ecadAiBoardGo) { st.ecadAiBoardGo = false; ecadAiBoard(st, st.ecadAiRequest); }  // Wave U
         if (st.ecadOpsGo) { st.ecadOpsGo = false; ecadApplyOps(st, st.ecadPendingOps); }  // Wave Q

@@ -136,6 +136,7 @@ static const char* studyTypeKey(StudyType t) {
         case StudyType::Flow:    return "flow";
         case StudyType::Fatigue: return "fatigue";
         case StudyType::Thermal: return "thermal";
+        case StudyType::Motion:  return "motion";
         default:                 return "static";
     }
 }
@@ -144,6 +145,7 @@ static StudyType studyTypeFromKey(const std::string& k) {
     if (k == "flow")    return StudyType::Flow;
     if (k == "fatigue") return StudyType::Fatigue;
     if (k == "thermal") return StudyType::Thermal;
+    if (k == "motion")  return StudyType::Motion;
     return StudyType::Static;
 }
 static const char* studyTypeLabel(StudyType t) {
@@ -152,6 +154,7 @@ static const char* studyTypeLabel(StudyType t) {
         case StudyType::Flow:    return "Flow";
         case StudyType::Fatigue: return "Fatigue";
         case StudyType::Thermal: return "Thermal";
+        case StudyType::Motion:  return "Motion";
         default:                 return "Static";
     }
 }
@@ -164,6 +167,7 @@ static const char* studyTypeIcon(StudyType t) {
         case StudyType::Flow:    return "study_flow";
         case StudyType::Fatigue: return "study_fatigue";
         case StudyType::Thermal: return "study_thermal";
+        case StudyType::Motion:  return "study_motion";   // graceful miss: IconUV::valid guards callers
         default:                 return "study_static";
     }
 }
@@ -557,6 +561,9 @@ nlohmann::json SimManager::studyToJson(const Study& s) {
                      {"surface", s.fatigueSurface}, {"load_case", s.fatigueLoadCase},
                      {"size_mm", s.fatigueSizeMm}, {"temp_c", s.fatigueTempC},
                      {"reliability", s.fatigueReliability}}},
+        {"motion", {{"mate_id", s.motionMateId}, {"start", s.motionStart}, {"stop", s.motionStop},
+                    {"steps", s.motionSteps}, {"loop", s.motionLoop}, {"fps", s.motionFps},
+                    {"check_interference", s.motionCheckInterference}}},
         {"result_summary", s.summary},
     };
 }
@@ -633,6 +640,16 @@ Study SimManager::studyFromJson(const nlohmann::json& j) {
         s.fatigueTempC = fa.value("temp_c", 20.0);
         s.fatigueReliability = fa.value("reliability", 50.0);
     }
+    if (j.contains("motion") && j["motion"].is_object()) {
+        const auto& mo = j["motion"];
+        s.motionMateId = mo.value("mate_id", std::string());
+        s.motionStart  = mo.value("start", 0.0f);
+        s.motionStop   = mo.value("stop", 360.0f);
+        s.motionSteps  = mo.value("steps", 24);
+        s.motionLoop   = mo.value("loop", true);
+        s.motionFps    = mo.value("fps", 24.0f);
+        s.motionCheckInterference = mo.value("check_interference", false);
+    }
     s.summary = j.value("result_summary", std::string());
     if (j.contains("fixtures") && j["fixtures"].is_array())
         for (const auto& sel : j["fixtures"]) s.fixtures.picks.push_back(selFromJson(sel));
@@ -675,7 +692,16 @@ void SimManager::refresh(AppState& st) {
                                     s.freqs = p.freqs;
                                     s.dragN = p.dragN; s.cd = p.cd; s.frontalMm2 = p.frontalMm2;
                                     s.solverNotes = p.solverNotes;
-                                    if (!p.summary.empty()) s.summary = p.summary; break; }
+                                    if (!p.summary.empty()) s.summary = p.summary;
+                                    // Motion transient result
+                                    s.motionHasResult = p.motionHasResult;
+                                    s.motionPlaying   = p.motionPlaying;
+                                    s.motionFrame     = p.motionFrame;
+                                    s.motionTrajectory = p.motionTrajectory;
+                                    s.motionDriverUnit = p.motionDriverUnit;
+                                    s.motionBodyNames  = p.motionBodyNames;
+                                    s.motionPlotBody   = p.motionPlotBody;
+                                    break; }
             studies_.push_back(std::move(s));
         }
     lastDocId_ = st.docMirror.docId();
@@ -764,6 +790,7 @@ bool SimManager::handleCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sim_new_flow")    { newStudy(st, StudyType::Flow);    return true; }
     if (cmdId == "sim_new_thermal") { newStudy(st, StudyType::Thermal); return true; }
     if (cmdId == "sim_new_fatigue") { newStudy(st, StudyType::Fatigue); return true; }
+    if (cmdId == "sim_new_motion")  { newStudy(st, StudyType::Motion);  return true; }
     refresh(st);
     const bool haveStudy = sel_ >= 0 && sel_ < (int)studies_.size();
     // Material / Results / Mesh: open the pane on the matching sub-node of the active study. Mesh
@@ -1459,9 +1486,10 @@ nlohmann::json SimManager::facePointsFor(AppState& st, const nlohmann::json& sel
 }
 
 void SimManager::run(AppState& st, Study& s) {
-    if (isFlowFamily(s.type)) runFlow(st, s);
-    else if (s.type == StudyType::Fatigue) runFatigue(st, s);
-    else runStaticOrModal(st, s);
+    if (s.type == StudyType::Motion)         runMotion(st, s);
+    else if (isFlowFamily(s.type))           runFlow(st, s);
+    else if (s.type == StudyType::Fatigue)   runFatigue(st, s);
+    else                                     runStaticOrModal(st, s);
 }
 
 void SimManager::runFatigue(AppState& st, Study& s) {
@@ -3665,6 +3693,16 @@ void SimManager::drawForm(AppState& st, Study& s) {
             ImGui::TextWrapped("%s", s.summary.c_str());
         }
     }
+}
+
+// ---------- Motion study stub ----------
+// Full implementation delivered by the sim-kinematics agent (T-SIM3/T-SIM4).
+// Stub prevents the undefined-reference linker error that blocks every other agent's build.
+void SimManager::runMotion(AppState& /*st*/, Study& s) {
+    s.motionHasResult = false;
+    s.motionPlaying   = false;
+    s.motionFrame     = 0;
+    s.summary         = "Motion simulation: coming online (T-SIM3).";
 }
 
 }  // namespace ui

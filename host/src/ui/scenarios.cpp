@@ -906,6 +906,9 @@ void ScenarioRunner::tick(AppState& st) {
 
     // ---------- T-G15 icon pipeline (AI_CAD_SHOT=iconpipe) ----------
     runIconPipe(st);
+
+    // ---------- workspaces scenario (AI_CAD_SHOT=workspaces) ----------
+    runWorkspaces(st);
 }
 
 // T-G15 icon pipeline (AI_CAD_SHOT=iconpipe). Recipe-driven clean-viewport icon generator: reads a
@@ -1749,7 +1752,82 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         return st.multidocShotDone ? FrameAction::Break : FrameAction::Continue;
     }
 
+    // workspaces scenario: one capture per workspace tab, last capture mirrored to screenshotPath.
+    if (st.wantWorkspace) {
+        ++st.frame;
+        if (!wsCapture.empty()) {
+            // Mirror the last workspace capture (AI workspace, step 8) to screenshotPath.
+            const char* mirror = wsCapture.find("08_ai") != std::string::npos
+                               ? screenshotPath : nullptr;
+            writeBackbufferPng(wsCapture.c_str(), dw, dh, mirror);
+            std::printf("workspaces: screenshot -> %s (%dx%d)\n", wsCapture.c_str(), dw, dh);
+            std::fflush(stdout);
+            wsCapture.clear();
+        }
+        glfwSwapBuffers(st.win);
+        return st.workspaceShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+
     return FrameAction::None;
+}
+
+// ---------- workspaces scenario (AI_CAD_SHOT=workspaces) ----------
+// Cycles all 8 workspace tabs (Model, Drawing, Simulate, Electronics, Manufacture, PLM,
+// PartsLibrary, AI), letting the frame settle for kSettle frames after each switch, then
+// capturing one PNG per workspace. Validates that the workspace routing switch produces a
+// distinct non-blank frame for each tab.
+void ScenarioRunner::runWorkspaces(AppState& st) {
+    if (!st.wantWorkspace || st.workspaceShotDone) return;
+    if (!st.workerStarted || st.frame < 5) return;
+
+    if (!wsDirReady) {
+        wsDirReady = true;
+        const char* repo = std::getenv("AI_CAD_REPO");
+        std::string base  = repo ? std::string(repo) : std::string(".");
+        wsSavePath = base + "/scratch/workspace_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(wsSavePath, ec);
+    }
+
+    const int kSettle = 6;  // frames to wait after switching workspace before capturing
+
+    // Drain any pending capture first.
+    if (!wsCapture.empty()) return;
+
+    if (wsSettle > 0) { --wsSettle; return; }
+
+    // Each step: switch to a workspace, settle, capture.
+    // Steps 0-7: switch + settle schedule; steps 8-15: capture; step 16: done.
+    // Simpler: even steps switch+settle, odd steps capture (interleaved via wsSettle).
+    using WS = AppState::Workspace;
+    struct WSEntry { WS ws; const char* name; };
+    static constexpr WSEntry kWS[] = {
+        { WS::Model,        "01_model"        },
+        { WS::Drawing,      "02_drawing"      },
+        { WS::Simulate,     "03_simulate"     },
+        { WS::Electronics,  "04_electronics"  },
+        { WS::Manufacture,  "05_manufacture"  },
+        { WS::PLM,          "06_plm"          },
+        { WS::PartsLibrary, "07_parts_library"},
+        { WS::AI,           "08_ai"           },
+    };
+    constexpr int kCount = (int)(sizeof(kWS) / sizeof(kWS[0]));
+
+    if (wsStep < kCount) {
+        // Switch workspace and schedule a settle + capture.
+        st.activeWorkspace = kWS[wsStep].ws;
+        std::printf("workspaces: switching to %s (step %d)\n", kWS[wsStep].name, wsStep);
+        std::fflush(stdout);
+        wsCapture = wsSavePath + "/workspace_" + kWS[wsStep].name + ".png";
+        wsSettle  = kSettle;
+        ++wsStep;
+    } else {
+        // All workspaces captured — restore Model and finish.
+        st.activeWorkspace = WS::Model;
+        st.workspaceShotDone = true;
+        std::printf("workspaces: scenario complete (%d captures)\n", kCount);
+        std::fflush(stdout);
+    }
 }
 
 }  // namespace ui

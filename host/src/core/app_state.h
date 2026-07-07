@@ -1128,6 +1128,9 @@ struct AppState {
     bool multidocShotDone = false; // guard so the multidoc scenario runs exactly once per shot
     bool wantActivity = false;  // C22b: AI_CAD_SHOT=activity scripted orchestrator run + activity panel
     bool activityShotDone = false; // guard so the activity scenario runs exactly once
+    // [workspace-tabs seam] AI_CAD_SHOT=workspaces: cycle all 8 workspace tabs, one screenshot each.
+    bool wantWorkspace = false;     // AI_CAD_SHOT=workspaces: workspace cycle scenario
+    bool workspaceShotDone = false; // guard so the workspaces scenario runs exactly once
 
     // ---- W1-B: toast notification queue (rendered by ui::drawToasts in app.cpp) ----
     // C39: guarded by toastsMtx — the worker errorSink posts toasts from background threads

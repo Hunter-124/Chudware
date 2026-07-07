@@ -2909,12 +2909,31 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // These take the whole central region. They use drawViewportPanel's dock slot (the
         // ImGui window ID "Viewport" is NOT opened by them — they draw directly into the
         // overlay band area as floating non-docked glass panels, same pattern as drawLeftPane).
-        if (ws == WS::PLM) {
-            // PLM workspace: vault status, checkpoint history, release/lock. Full body, no left pane.
-            ui::drawPlmWorkspace(st);
-        } else if (ws == WS::PartsLibrary) {
-            // Parts Library workspace: catalog browse, vendor login, download queue.
-            ui::drawPartsLibraryWorkspace(st);
+        if (ws == WS::PLM || ws == WS::PartsLibrary) {
+            // PLM / Parts Library: full-body workspaces. The body functions emit widgets directly
+            // (no Begin of their own), so host them in ONE borderless window spanning the whole
+            // central band — otherwise ImGui dumps them into its fallback "Debug" window (a small
+            // box top-left, which is what Hunter saw). The band already stops left of the docked
+            // Copilot column, so the body fills the central region and Copilot stays visible.
+            const ui::OverlayBand& band = ui::overlayBand();
+            if (band.valid) {
+                const float m = 12.0f;
+                // Stop at the docked Copilot column's LEFT edge (published each frame, slot 1) so
+                // the 2D workspace body never renders under the Copilot. Falls back to the band's
+                // right edge when the Copilot isn't up.
+                float rightX = ui::overlayColumnEdge(1);
+                if (rightX <= band.minX + m) rightX = band.maxX;
+                ImGui::SetNextWindowPos(ImVec2(band.minX + m, band.minY + m));
+                ImGui::SetNextWindowSize(ImVec2((rightX - band.minX) - 2.0f * m,
+                                                (band.maxY - band.minY) - 2.0f * m));
+                ImGui::Begin(ws == WS::PLM ? "##PLMWorkspace" : "##PartsWorkspace", nullptr,
+                             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                             ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav);
+                if (ws == WS::PLM) ui::drawPlmWorkspace(st);
+                else               ui::drawPartsLibraryWorkspace(st);
+                ImGui::End();
+            }
         } else if (ws == WS::AI) {
             // AI workspace: full-screen layout — the Copilot is already drawn above (right column);
             // this stub draws the left session list + center live-model preview placeholder.

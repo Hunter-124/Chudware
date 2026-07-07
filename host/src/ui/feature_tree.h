@@ -42,6 +42,10 @@ void fmTreeIconInArrowSlot(ImVec2 rowPos, const char* name, const char* fallback
 // Centered treeSection-colored label flanked by two hairlines (the "Reference"/"Features" rule).
 void fmSectionDivider(const char* label);
 
+// Section divider with a small square "+" button pinned at the right edge (the right hairline is cut
+// short to clear it). Returns true when the button is clicked. See feature_tree.cpp.
+bool fmSectionDividerAddButton(const char* label, const char* btnId, const char* tooltip);
+
 // 24px square glass icon button (FeatureManager top-toolbar style: resting 0.22 pill, 0.38 on
 // hover, 18px SDF-crisp glyph). Returns true on click; disabled renders dimmed and never fires.
 bool fmToolbarIconBtn(const char* id, const char* iconName, const char* tooltip, bool enabled);

@@ -789,7 +789,26 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         ImGui::PopID();
     };
     if (pcb) {
-        ui::fmSectionDivider("Layers");
+        // "Layers" divider carries a "+" button that adds a copper layer. The engine models copper as
+        // a SYMMETRIC stackup count (1, then even: 2/4/6…, cap 32 — see engine/ecad/ops.py
+        // pcb_set_stackup), so "+" advances to the next valid count and adds an inner pair once past 2.
+        // A toast names the jump so the pair-add isn't a surprise (Hunter round-5c; per-layer DELETE is
+        // deferred until the engine supports true per-layer removal).
+        if (ui::fmSectionDividerAddButton("Layers", "ecad_add_layer", "Add copper layer")) {
+            const int cur = (int)m.layers().size();
+            const int next = cur < 2 ? 2 : cur + 2;
+            if (next > 32) {
+                st.toast(ToastLevel::Warn, "PCB stackup is capped at 32 copper layers");
+            } else {
+                st.ecadPendingOps = nlohmann::json::array(
+                    {{{"op", "pcb_set_stackup"}, {"copper_layers", next}}});
+                st.ecadOpsGo = true;
+                char msg[96];
+                std::snprintf(msg, sizeof(msg), "Copper layers %d -> %d (symmetric stackup)", cur,
+                              next);
+                st.toast(ToastLevel::Info, msg);
+            }
+        }
         for (const auto& ly : m.layers()) layerRow(ly);
         char netsHdr[32]; std::snprintf(netsHdr, sizeof(netsHdr), "Nets (%d)", (int)m.nets().size());
         ui::fmSectionDivider(netsHdr);

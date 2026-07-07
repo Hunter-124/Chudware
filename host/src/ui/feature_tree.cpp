@@ -444,6 +444,61 @@ void fmTreeIconInArrowSlot(ImVec2 rowPos, const char* name, const char* fallback
     treeIconInArrowSlot(rowPos, name, fallback, alpha);
 }
 void fmSectionDivider(const char* label) { treeSectionDivider(label); }
+
+// Section divider carrying a small square "+" button pinned at the right edge. The right hairline is
+// cut short so it stops before the button (leaving a clean gap) instead of running under it. Returns
+// true on the frame the button is clicked. Used by the ECAD PCB Manager's "Layers" header to add a
+// copper layer (Hunter round-5c).
+bool fmSectionDividerAddButton(const char* label, const char* btnId, const char* tooltip) {
+    const auto& pal = fmPalette();
+    const float S = ui::uiScale;
+    const float btn = 18.0f * S;                      // compact square, smaller than the toolbar btns
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float  w = ImGui::GetContentRegionAvail().x;
+    float  lineH = ImGui::GetTextLineHeight();
+    const float rowH = std::max(lineH + 4.0f * S, btn + 2.0f * S);
+    ImVec2 tsz = ImGui::CalcTextSize(label);
+    float  textX = p.x + (w - tsz.x) * 0.5f;
+    float  textY = p.y + (rowH - lineH) * 0.5f;
+    float  cy = p.y + rowH * 0.5f;
+    const float btnX = p.x + w - btn;
+    const float rightLineEnd = btnX - 8.0f * S;       // short-cut so the line clears the button
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 lineCol = ui::Palette::toU32(pal.border);
+    if (textX > p.x + 4.0f * S) {
+        dl->AddLine(ImVec2(p.x + 4.0f * S, cy), ImVec2(textX - 6.0f * S, cy),
+                    lineCol, std::max(1.0f, 1.0f * S));
+        const float rStart = textX + tsz.x + 6.0f * S;
+        if (rStart < rightLineEnd)
+            dl->AddLine(ImVec2(rStart, cy), ImVec2(rightLineEnd, cy), lineCol,
+                        std::max(1.0f, 1.0f * S));
+    }
+    ImGui::SetCursorScreenPos(ImVec2(textX, textY));
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(pal.treeSection[0], pal.treeSection[1], pal.treeSection[2], pal.treeSection[3]));
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+
+    // Square "+" button (glass pill + a hand-drawn plus glyph), vertically centered on the row.
+    const ImVec2 bMin(btnX, p.y + (rowH - btn) * 0.5f), bMax(bMin.x + btn, bMin.y + btn);
+    ImGui::SetCursorScreenPos(bMin);
+    ImGui::PushID(btnId);
+    ui::glassRowBackground(dl, bMin, bMax, 3.0f, false, false, 0.22f);
+    const bool clicked = ImGui::InvisibleButton("##add", ImVec2(btn, btn));
+    const bool hov = ImGui::IsItemHovered();
+    if (hov) ui::glassRowBackground(dl, bMin, bMax, 3.0f, false, false, 0.40f);
+    const ImVec2 bc((bMin.x + bMax.x) * 0.5f, (bMin.y + bMax.y) * 0.5f);
+    const float arm = btn * 0.28f, th = std::max(1.0f, 1.4f * S);
+    const ImU32 ink = ImGui::ColorConvertFloat4ToU32(fmSurf().textPrimary);
+    dl->AddLine(ImVec2(bc.x - arm, bc.y), ImVec2(bc.x + arm, bc.y), ink, th);
+    dl->AddLine(ImVec2(bc.x, bc.y - arm), ImVec2(bc.x, bc.y + arm), ink, th);
+    if (hov && tooltip) ImGui::SetTooltip("%s", tooltip);
+    ImGui::PopID();
+
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y));
+    ImGui::Dummy(ImVec2(w, rowH));
+    return clicked;
+}
 void fmDrawEyeGlyph(ImVec2 mn, ImVec2 mx, bool shown, bool hovered) {
     drawEyeGlyph(ImGui::GetWindowDrawList(), mn, mx, shown, hovered, fmSurf());
 }

@@ -429,25 +429,35 @@ void drawFilesTab(AppState& st) {
 // The Files destination folds in History + Releases as sub-tabs, so the whole
 // "what's in the project / how it changed / what's released" story lives together.
 void plmDrawFilesPage(AppState& st) {
+    const float S = ui::uiScale;
+    const float gap = 10.0f * S;
+
+    // Files span the full left vertical side; Releases (top) + History (bottom)
+    // share the right side. No tab bar — everything visible at once.
+    const float leftW = ImGui::GetContentRegionAvail().x * 0.52f;
+
+    ImGui::BeginChild("##files_left", ImVec2(leftW, 0), ImGuiChildFlags_None);
     plmSectionHeader("Files");
-    if (ImGui::BeginTabBar("##files_tabs", ImGuiTabBarFlags_None)) {
-        if (ImGui::BeginTabItem("Files")) {
-            ImGui::Spacing();
-            drawFilesTab(st);
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("History")) {
-            ImGui::Spacing();
-            plmDrawHistoryPage(st);
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Releases")) {
-            ImGui::Spacing();
-            plmDrawReleasesPage(st);
-            ImGui::EndTabItem();
-        }
-        ImGui::EndTabBar();
-    }
+    ImGui::Spacing();
+    drawFilesTab(st);
+    ImGui::EndChild();
+
+    ImGui::SameLine(0.0f, gap);
+
+    ImGui::BeginChild("##files_right", ImVec2(0, 0), ImGuiChildFlags_None);
+    const float rightH = ImGui::GetContentRegionAvail().y;
+    const float topH = rightH * 0.5f - gap * 0.5f;
+
+    ImGui::BeginChild("##files_releases", ImVec2(0, topH), ImGuiChildFlags_None);
+    plmDrawReleasesPage(st);
+    ImGui::EndChild();
+
+    ImGui::Dummy(ImVec2(0, gap));
+
+    ImGui::BeginChild("##files_history", ImVec2(0, 0), ImGuiChildFlags_None);
+    plmDrawHistoryPage(st);
+    ImGui::EndChild();
+    ImGui::EndChild();
 }
 
 // ---- History ------------------------------------------------------------------

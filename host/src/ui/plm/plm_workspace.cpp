@@ -258,7 +258,7 @@ void drawPlmWorkspace(AppState& st) {
     ImGui::Dummy(ImVec2(0, M));   // top margin
     ImGui::Indent(M);            // left margin (rail + page shift right)
 
-    const float railW = 190.0f * S;
+    const float railW = 168.0f * S;
     drawRail(st, railW, M);
     ImGui::SameLine();
 

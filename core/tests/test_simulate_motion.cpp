@@ -173,6 +173,20 @@ TEST_CASE("doc_simulate_motion: trajectory shape + frame count") {
     CHECK(result.contains("interference"));
     CHECK_FALSE(result["interference"].value("checked", true));
 
+    // KEY MOTION CHECK: at least one body's transform must differ between frame 0
+    // and the last frame. This proves the solver actually moved bodies when the
+    // mate value changed, not just that the plumbing returned shaped data.
+    {
+        const json& b0 = result["trajectory"][0]["bodies"];
+        const json& bL = result["trajectory"][4]["bodies"];
+        REQUIRE((int)b0.size() == (int)bL.size());
+        bool moved = false;
+        for (size_t k = 0; k < b0.size(); ++k)
+            if (b0[k]["transform"] != bL[k]["transform"]) { moved = true; break; }
+        CHECK_MESSAGE(moved, "body transforms did not change across the sweep "
+                     "— the mate may be dangling or the solver is not moving bodies");
+    }
+
     fs::remove(pa);
     fs::remove(pb);
 }

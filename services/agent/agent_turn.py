@@ -78,7 +78,8 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
              on_event: Callable[..., None] | None = None,
              run_id: str | None = None,
              node_id: str | None = None,
-             parent_id: str | None = None) -> TurnResult:
+             parent_id: str | None = None,
+             subagent_id: str | None = None) -> TurnResult:
     """Run a bounded tool-executing turn and return a :class:`TurnResult`.
 
     *tool_dispatch* is injectable ``(tool_name, args) -> result``; the default
@@ -148,6 +149,36 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
     last_reason = _NOCODE
 
     for _ in range(budget + 1):
+        # Phase 4 (M11/M16/M17): the sub-agent turn boundary.  When this turn IS a
+        # sub-agent session (subagent_id set), drain the cross-process steering queue
+        # BEFORE each model completion — a user steer queued from the GUI lands as a
+        # user-role message at the very next model call — and honor a pending
+        # terminate flag by stopping cleanly (never a hard kill).  Best-effort: a
+        # registry failure never breaks the turn.
+        if subagent_id:
+            try:
+                from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+                if _sreg.terminate_requested(subagent_id):
+                    _sreg.set_status(subagent_id, "terminated",
+                                     note="terminated by user at turn boundary")
+                    _sreg.append_transcript(
+                        subagent_id, "system",
+                        "Sub-agent stopped: user termination honored at turn boundary.")
+                    _log(ledger, actor, {"event": "subagent_terminated",
+                                         "subagent_id": subagent_id})
+                    return TurnResult(False, "terminated_by_user",
+                                      {"calls": calls, "tool_calls": tool_calls_made})
+                for _steer in _sreg.consume_steers(subagent_id):
+                    messages.append({"role": "user", "content": _parts(
+                        "[Human steering] " + str(_steer.get("text", "")))})
+                    _sreg.append_transcript(
+                        subagent_id, "system", "steering applied at turn boundary",
+                        steer_id=_steer.get("steer_id", ""))
+                    _log(ledger, actor, {"event": "subagent_steer_applied",
+                                         "subagent_id": subagent_id,
+                                         "steer_id": _steer.get("steer_id", "")})
+            except Exception:  # noqa: BLE001
+                pass
         try:
             reply = provider.complete(system, messages, max_tokens=completion_cap)
         except Exception as exc:  # noqa: BLE001 — provider/network error → escalate
@@ -156,6 +187,14 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
                               {"error": f"provider error: {exc}", "calls": calls})
 
         messages.append({"role": "assistant", "content": _parts(reply)})
+        # Phase 4: sub-agent transcripts capture every model reply so the GUI viewer
+        # shows the real conversation (never fabricated).
+        if subagent_id:
+            try:
+                from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+                _sreg.append_transcript(subagent_id, "subagent", str(reply)[:4000])
+            except Exception:  # noqa: BLE001
+                pass
         parsed = _parse_directive(reply)
 
         if parsed is None:

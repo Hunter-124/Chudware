@@ -96,7 +96,9 @@ class _StubAgentResult:
 
 def make_default_agent_fn(ledger=None,
                           mission_dispatch=None,
-                          provider=None) -> "Callable[[str, dict[str, Any]], Any]":
+                          provider=None,
+                          delegation_tree=None,
+                          on_event=None) -> "Callable[[str, dict[str, Any]], Any]":
     """Return the default tool-executing agent_fn with *ledger* bound (T-W30).
 
     The mission pipeline (loop.run_mission) uses this to thread its run ledger
@@ -127,11 +129,18 @@ def make_default_agent_fn(ledger=None,
     delegate, part_search) resolve against THIS run instead of erroring out of
     the process-wide registry.  Best-effort: a failure to build the dispatcher
     never blocks node execution (turns just lack the mission layer)."""
+    # Phase 4 (M11): *delegation_tree* + *on_event* thread the mission's live
+    # delegation layer into the dispatch, so a node agent that calls ``delegate``
+    # actually spawns a registry-listed sub-agent (streaming ``agent.spawn`` live
+    # through *on_event*) and — when *provider* is bound — RUNS it synchronously
+    # with GUI steering consumed at its turn boundaries.
     if mission_dispatch is None and ledger is not None:
         try:
             from services.agent.mission_dispatch import MissionDispatch  # noqa: PLC0415
             mission_dispatch = MissionDispatch(
-                run_id=getattr(ledger, "run_id", "") or "", ledger=ledger)
+                run_id=getattr(ledger, "run_id", "") or "", ledger=ledger,
+                delegation_tree=delegation_tree, provider=provider,
+                on_event=on_event)
         except Exception:  # noqa: BLE001 — mission layer optional
             mission_dispatch = None
 

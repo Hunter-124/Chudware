@@ -1679,12 +1679,27 @@ def run_mission(
             # (rather than falling straight through to the executor's own default)
             # no longer requires a ledger — it is unconditional so the fix applies
             # even when the ledger layer is disabled/unavailable.
+            # Phase 4 (M11): construct the mission's live DelegationTree when the org
+            # layer is on (default since T-W22), threading the mission's *on_event*
+            # sink so `agent.spawn` streams live to the GUI (un-gates the M20 spawn
+            # row) and every spawned sub-agent lands in the session registry
+            # (subagent_list / subagent_steer).  Best-effort — a tree failure never
+            # blocks the mission (delegate degrades to its structured refusal).
+            delegation_tree = None
+            if flags.org_layer:
+                try:
+                    from services.agent.delegation import DelegationTree
+                    delegation_tree = DelegationTree(
+                        run_id=run_id, ledger=ledger, on_event=on_event)
+                except Exception:  # noqa: BLE001
+                    delegation_tree = None
             effective_agent_fn = agent_fn
             if effective_agent_fn is None:
                 try:
                     from services.dag import node_runner as _node_runner
                     effective_agent_fn = _node_runner.make_default_agent_fn(
-                        ledger=ledger, provider=provider)
+                        ledger=ledger, provider=provider,
+                        delegation_tree=delegation_tree, on_event=on_event)
                 except Exception:  # noqa: BLE001 — fall back to executor default
                     effective_agent_fn = None
             dag_result = _dag_exec.run(

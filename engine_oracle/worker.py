@@ -280,6 +280,21 @@ except Exception as _dag_import_err:  # noqa: BLE001
         " not registered: %s", _dag_import_err)
 # === end DAG steering ===
 
+# === Sub-agent registry seam (AI workspace v2 Phase 4, M11/M15–M17) ===
+# subagent_list / subagent_transcript / subagent_steer / subagent_terminate — the GUI's
+# sub-agent chat viewer + live steering reach the file-backed session registry
+# (services/agent/subagent_registry.py) over the same worker seam.  Steering is queued
+# and consumed at the sub-agent's next turn boundary (agent_turn.run_turn).
+try:
+    from services.agent.subagent_rpc import WORKER_METHODS as _SUBAGENT_METHODS  # noqa: E402
+    _METHODS.update(_SUBAGENT_METHODS)
+except Exception as _subagent_import_err:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger("ai-cad.worker").warning(
+        "services.agent.subagent_rpc unavailable — subagent_* methods not registered: %s",
+        _subagent_import_err)
+# === end Sub-agent registry ===
+
 # === PLM vault seam (T-R5, Pillar 19) — plm_open/status/history/save/checkpoint/... ===
 # Reaches the PLM vault engine (services/plm/) over the same worker seam so the in-editor
 # PLM GUI (ui/imgui/src/ui/plm_panel.cpp: history timeline, checkpoint/release toolbar,

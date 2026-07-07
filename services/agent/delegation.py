@@ -492,6 +492,20 @@ class DelegationTree:
             except Exception:  # noqa: BLE001 — spawn event never blocks delegation
                 pass
 
+        # Phase 4 (M11): every spawned node is also a registry session so the GUI
+        # can list it, open its transcript, and queue steering messages into it.
+        # Best-effort — a registry failure never blocks delegation.
+        try:
+            from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+            _sreg.register_session(
+                node_id, role=role, brief=brief, spawn_kind=kind,
+                parent_run_id=self._run_id, parent_node_id=parent_id,
+                requested_by=parent.role,
+                model=(model_assign.id or ""), budget_tokens=budget_tokens,
+                status="pending")
+        except Exception:  # noqa: BLE001
+            pass
+
         # Update meter agent count BEFORE the agent-limit advisory so the emitted
         # event reflects the post-spawn count.
         self._meter.agents_spawned += 1
@@ -740,10 +754,24 @@ class DelegationTree:
                 },
             )
             node.status = "revoked"
+            if node.parent is not None:
+                try:
+                    from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+                    _sreg.set_status(node.id, "revoked", note=reason)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _transition(self, node: DelegationNode, new_status: str, note: str) -> None:
         node.status = new_status
         self._emit_transition(node, new_status, note)
+        # Phase 4 (M11): mirror node status onto the sub-agent session registry so the
+        # GUI's list/viewer stays truthful.  Root has no session; best-effort.
+        if node.parent is not None:
+            try:
+                from services.agent import subagent_registry as _sreg  # noqa: PLC0415
+                _sreg.set_status(node.id, new_status, note=note)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _emit_transition(self, node: DelegationNode, status: str, note: str) -> None:
         self._emit_event(

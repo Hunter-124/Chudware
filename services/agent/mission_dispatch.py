@@ -66,13 +66,21 @@ class MissionDispatch:
 
     def __init__(self, *, run_id: str, ledger=None, autonomy: str = "auto",
                  graph: dict | None = None, delegation_tree=None,
-                 doc_id: str | None = None) -> None:
+                 doc_id: str | None = None, provider=None, on_event=None) -> None:
         self.run_id = run_id
         self.ledger = ledger
         self.autonomy = autonomy
         self.graph = graph
         self.delegation_tree = delegation_tree
         self.doc_id = doc_id
+        # Phase 4 (M11): when a *provider* is bound, ``delegate`` actually RUNS the
+        # approved sub-agent (one bounded agent_turn, synchronous) instead of only
+        # minting a node — so the registry session gets a real transcript and the
+        # GUI's queued steering lands at the sub-agent's turn boundaries.
+        # *on_event* is the mission's live event sink (agent.tool_call etc. stream
+        # from inside the sub-agent turn through the same drain).
+        self.provider = provider
+        self.on_event = on_event
         self._handlers: dict[str, Callable[..., Any]] = {
             "ledger_get": self.ledger_get,
             "ledger_note": self.ledger_note,
@@ -230,10 +238,86 @@ class MissionDispatch:
                               "off); do the work directly or escalate in your handoff")}
         try:
             from services.agent.delegation import delegate as _delegate
-            return _delegate(role, brief, budget_tokens, tree=self.delegation_tree,
+            node = _delegate(role, brief, budget_tokens, tree=self.delegation_tree,
                              parent_id=parent_id, kind=kind, docs=docs)
         except Exception as exc:  # noqa: BLE001 — error is data for the model
             return {"ok": False, "status": "failed", "error": f"delegate failed: {exc}"}
+
+        # Phase 4 (M11): run the approved sub-agent NOW (synchronous, bounded).
+        # HONESTY: without a bound provider nothing executes — the node is returned
+        # spawned-but-not-run with an explicit note (never a fabricated result).
+        if not isinstance(node, dict) or node.get("status") != "approved":
+            return node
+        if self.provider is None:
+            node["executed"] = False
+            node["note"] = ("sub-agent spawned (registry session created) but NOT "
+                            "executed: no provider bound to this mission dispatch")
+            return node
+        node["executed"] = True
+        node.update(self._run_subagent(node, brief))
+        return node
+
+    def _run_subagent(self, node: dict, brief: str) -> dict:
+        """Run one bounded synchronous sub-agent turn for an approved node.
+
+        The turn IS the sub-agent's session: its replies land in the registry
+        transcript, and steering queued from the GUI (``subagent_steer``, a
+        different process) is consumed at each of its model-call boundaries by
+        ``agent_turn.run_turn(subagent_id=...)``.
+        """
+        node_id = str(node.get("id", ""))
+        role = str(node.get("role", "subagent"))
+        try:
+            from services.agent import agent_turn as _at
+            from services.agent import subagent_registry as _sreg
+            try:
+                self.delegation_tree.start(node_id)  # pending→ mirror handles registry
+            except Exception:  # noqa: BLE001 — status mirror is best-effort
+                pass
+            try:
+                _sreg.append_transcript(node_id, "system",
+                                        f"Sub-agent {role!r} started. Brief: {brief}"[:800])
+            except Exception:  # noqa: BLE001
+                pass
+            result = _at.run_turn(
+                brief, self.provider, name=role, actor=role,
+                ledger=self.ledger, max_tool_calls=4,
+                on_event=self.on_event, run_id=self.run_id,
+                node_id=node_id, subagent_id=node_id)
+            tokens = 0  # provider seam exposes no usage here; accrual stays honest at 0
+            if result.stop_reason == "terminated_by_user":
+                try:
+                    self.delegation_tree.fail(node_id, reason="terminated by user")
+                except Exception:  # noqa: BLE001
+                    pass
+                try:  # the tree-fail mirror wrote "failed" — the truthful status is "terminated"
+                    _sreg.set_status(node_id, "terminated",
+                                     note="terminated by user at turn boundary")
+                except Exception:  # noqa: BLE001
+                    pass
+                return {"ok": False, "subagent_status": "terminated",
+                        "result": result.result}
+            if result.success:
+                try:
+                    self.delegation_tree.complete(node_id, tokens_used=tokens)
+                except Exception:  # noqa: BLE001
+                    pass
+                return {"ok": True, "subagent_status": "done",
+                        "handoff": result.result.get("handoff"),
+                        "result": result.result}
+            try:
+                self.delegation_tree.fail(node_id, reason=result.stop_reason)
+            except Exception:  # noqa: BLE001
+                pass
+            return {"ok": False, "subagent_status": "failed",
+                    "stop_reason": result.stop_reason, "result": result.result}
+        except Exception as exc:  # noqa: BLE001 — execution error is data
+            try:
+                self.delegation_tree.fail(node_id, reason=str(exc))
+            except Exception:  # noqa: BLE001
+                pass
+            return {"ok": False, "subagent_status": "failed",
+                    "error": f"sub-agent execution failed: {exc}"}
 
     # ------------------------------------------------------------------ parts
     def part_search(self, query: str = "", domain: str = "", limit: int = 20,

@@ -99,6 +99,8 @@ CONTRACT_NAMES: list[str] = [
     "cat_drivetrain", "cat_wheels", "cat_tools", "cat_cutting_tools",
     "cat_electronics", "cat_hydraulics", "cat_hardware",
     "vendor_globe", "browser_panel", "filter_funnel", "health_check",
+    # ---- PLM Project Hub (append-only): planning/collaboration glyphs ----
+    "plan_board", "issue_bug", "milestone_flag", "team",
 ]
 
 # FM + ribbon-adjacent refresh scope (Agent 3 — fm_copilot_gui_rectify).
@@ -3433,6 +3435,79 @@ def draw_health_check(d, cell, p):
                  (s*0.52, s*0.66), (s*0.60, s*0.44), (s*0.66, s*0.52),
                  (s*0.84, s*0.52)], p.accent, lw)
     filled_circle(d, s*0.84, s*0.52, max(1, lw), p.accent)
+
+
+# ---- PLM Project Hub -------------------------------------------------------
+
+@icon("plan_board")
+def draw_plan_board(d, cell, p):
+    """Kanban board: framed panel with three columns of cards."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rounded_rectangle([s*0.13, s*0.20, s*0.87, s*0.80], radius=int(s*0.07),
+                        outline=p.stroke, width=lw)
+    for fx in (0.377, 0.623):
+        d.line([(s*fx, s*0.22), (s*fx, s*0.78)], fill=_rgba(p.stroke, 150),
+               width=max(1, lw // 2))
+
+    def card(x0, x1, y0, y1, accent=False):
+        col = p.accent if accent else p.stroke
+        d.rounded_rectangle([s*x0, s*y0, s*x1, s*y1], radius=int(s*0.028),
+                            fill=_rgba(col, 95), outline=col, width=max(1, lw // 2))
+    card(0.175, 0.345, 0.28, 0.40, accent=True)
+    card(0.175, 0.345, 0.47, 0.59)
+    card(0.425, 0.595, 0.28, 0.40)
+    card(0.655, 0.825, 0.28, 0.40, accent=True)
+
+
+@icon("issue_bug")
+def draw_issue_bug(d, cell, p):
+    """A bug — the 'issue' glyph: rounded body, head, antennae and legs."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, cy = s*0.5, s*0.55
+    bw, bh = s*0.17, s*0.24
+    d.ellipse([cx-bw, cy-bh, cx+bw, cy+bh], outline=p.accent, width=lw,
+              fill=_rgba(p.accent, 60))
+    d.line([(cx, cy-bh*0.85), (cx, cy+bh*0.9)], fill=p.accent, width=max(1, lw // 2))
+    filled_circle(d, cx, cy-s*0.30, s*0.075, p.stroke)
+    polyline(d, [(cx-s*0.05, cy-s*0.36), (cx-s*0.13, cy-s*0.45)], p.stroke, max(1, lw // 2))
+    polyline(d, [(cx+s*0.05, cy-s*0.36), (cx+s*0.13, cy-s*0.45)], p.stroke, max(1, lw // 2))
+    for yy in (0.46, 0.56, 0.66):
+        d.line([(cx-bw*0.9, s*yy), (cx-s*0.32, s*(yy-0.045))], fill=p.stroke, width=max(1, lw // 2))
+        d.line([(cx+bw*0.9, s*yy), (cx+s*0.32, s*(yy-0.045))], fill=p.stroke, width=max(1, lw // 2))
+
+
+@icon("milestone_flag")
+def draw_milestone_flag(d, cell, p):
+    """A pennant flag on a pole — a milestone marker."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    px = s*0.31
+    d.line([(px, s*0.15), (px, s*0.87)], fill=p.stroke, width=lw)
+    filled_circle(d, px, s*0.87, max(1, lw), p.stroke)
+    flag = [(px, s*0.17), (px+s*0.45, s*0.31), (px, s*0.45)]
+    d.polygon(flag, fill=_rgba(p.accent, 115))
+    d.line(flag + [flag[0]], fill=p.accent, width=lw)
+
+
+@icon("team")
+def draw_team(d, cell, p):
+    """Two people — the team / sharing glyph."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    hw = max(1, lw // 2)
+    # back person (accent, offset right)
+    bx = s*0.63
+    filled_circle(d, bx, s*0.37, s*0.10, _rgba(p.accent, 130))
+    d.pieslice([bx-s*0.16, s*0.52, bx+s*0.16, s*0.86], start=180, end=360,
+               fill=_rgba(p.accent, 95), outline=p.accent, width=hw)
+    # front person (stroke)
+    fx = s*0.40
+    d.ellipse([fx-s*0.13, s*0.40-s*0.13, fx+s*0.13, s*0.40+s*0.13],
+              outline=p.stroke, width=lw, fill=_rgba(p.stroke, 30))
+    d.pieslice([fx-s*0.18, s*0.55, fx+s*0.18, s*0.93], start=180, end=360,
+               fill=_rgba(p.stroke, 30), outline=p.stroke, width=lw)
 
 
 # ---------------------------------------------------------------------------

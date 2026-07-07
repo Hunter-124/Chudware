@@ -144,7 +144,7 @@ struct RailItem { PlmPage page; const char* label; const char* icon; };
 static const RailItem kRail[] = {
     {PlmPage::Overview, "Overview", "app"},
     {PlmPage::Files,    "Files",    "body_folder"},
-    {PlmPage::Planning, "Planning", "prompt_edit"},
+    {PlmPage::Planning, "Planning", "plan_board"},
     {PlmPage::Settings, "Settings", "settings"},
 };
 

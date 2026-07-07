@@ -150,7 +150,7 @@ void plmPanelBegin(const char* id, const char* title, const char* icon = nullptr
                    float width = 0.0f) {
     const float S = ui::uiScale;
     ui::pushGlassChildStyle(11.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16 * S, 13 * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16 * S, 11 * S));
     ImGui::BeginChild(id, ImVec2(width, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
     if (title && title[0]) {
@@ -169,7 +169,7 @@ void plmPanelBegin(const char* id, const char* title, const char* icon = nullptr
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(title);
         ImGui::PopStyleColor();
-        ImGui::Dummy(ImVec2(0, 7 * S));
+        ImGui::Dummy(ImVec2(0, 3 * S));
     }
 }
 
@@ -1156,10 +1156,11 @@ void priorityDot(const std::string& pr) {
     // Draw a real filled circle — the ● glyph isn't in the font atlas (rendered
     // as a '?'), so paint it directly on the draw-list.
     const float r = 4.5f * S;
+    const float rowH = ImGui::GetFrameHeight();   // match the copy-text field height
     ImGui::SameLine(ImGui::GetContentRegionMax().x - 14 * S);
     ImVec2 o = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(ImVec2(r * 2, ImGui::GetTextLineHeight()));
-    ImVec2 ctr(o.x + r, o.y + ImGui::GetTextLineHeight() * 0.5f);
+    ImGui::Dummy(ImVec2(r * 2, rowH));
+    ImVec2 ctr(o.x + r, o.y + rowH * 0.5f);
     ImGui::GetWindowDrawList()->AddCircleFilled(
         ctr, r, ImGui::GetColorU32(ImVec4(c[0], c[1], c[2], a)), 16);
     if (ImGui::IsItemHovered()) {
@@ -1300,7 +1301,7 @@ void plmDrawPlanningPage(AppState& st) {
 
     // Issues — log a problem with a severity, so you can plan fixes while you see
     // what's wrong. "Make plan" (on each row) turns one into a linked task.
-    plmPanelBegin("##pl_issues", "Issues", "warning_badge", halfW);
+    plmPanelBegin("##pl_issues", "Issues", "issue_bug", halfW);
     ImGui::SetNextItemWidth(90 * S);
     ImGui::Combo("##newissuesev", &H.newIssueSev, kSev, IM_ARRAYSIZE(kSev));
     ImGui::SameLine();
@@ -1321,7 +1322,7 @@ void plmDrawPlanningPage(AppState& st) {
     ImGui::SameLine(0, 12 * S);
 
     // Milestones — title + due date + Add, all the same height and baseline.
-    plmPanelBegin("##pl_ms", "Milestones", "ok_badge", halfW);
+    plmPanelBegin("##pl_ms", "Milestones", "milestone_flag", halfW);
     static char s_msTitle[160] = {};
     static char s_msDue[32] = {};
     ImGui::SetNextItemWidth(150 * S);
@@ -1343,14 +1344,14 @@ void plmDrawPlanningPage(AppState& st) {
 
     // ---- Team & Sync (placeholder until remotes/locks land) — its own panel,
     //      between the Issues/Milestones band and the board. --------------------
-    plmPanelBegin("##pl_team", "Team & Sync", "flow_arrow");
-    dimText("Share via a shared folder or your own server. Sync brings changes "
-            "together without ever merging or losing work — coming in a later update.");
+    plmPanelBegin("##pl_team", "Team & Sync", "team");
     ImGui::BeginDisabled(true);
     ImGui::Button("Connect a shared folder\xe2\x80\xa6");
     ImGui::SameLine();
     ImGui::Button("Sync now");
     ImGui::EndDisabled();
+    ImGui::SameLine();
+    dimText("Share & sync without merging — coming soon.");
     plmPanelEnd();
 
     ImGui::Dummy(ImVec2(0, 10 * S));

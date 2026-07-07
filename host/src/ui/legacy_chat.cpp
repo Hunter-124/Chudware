@@ -1691,8 +1691,16 @@ void refreshModelAvailability(AppState& st, bool force) {
                                           : std::string("http://localhost:1234/v1");
     std::string localKey = activeLoopback ? std::string(st.settings.apiKey) : std::string();
     static double lastProbe = -1e9;
+    // Failure backoff (freeze fix): when the local endpoint is DOWN, each probe burns ~5s in a
+    // curl connect-fail INSIDE the worker, holding the WorkerClient mutex. At the old flat 5s
+    // cadence the worker was busy-failing near-100% of the time, so any SYNC worker.call from
+    // the GL thread (CAM/ECAD panels on workspace switch) blocked behind it — the app appeared
+    // hard-frozen and had to be force-killed. Back off to 60s after a failed probe (force — the
+    // user clicking refresh in the picker — still bypasses); a success restores the 5s cadence.
+    static bool lastProbeFailed = false;
+    const double cooldown = lastProbeFailed ? 60.0 : 5.0;
     double now = ImGui::GetTime();
-    if (!force && (st.modelProbeInFlight.load() || (now - lastProbe) < 5.0)) return;
+    if (!force && (st.modelProbeInFlight.load() || (now - lastProbe) < cooldown)) return;
     lastProbe = now;
     st.modelProbeInFlight.store(true);
     nlohmann::json p = {{"provider", "openai"},
@@ -1716,6 +1724,7 @@ void refreshModelAvailability(AppState& st, bool force) {
         } else {
             pm.error = r.err.empty() ? "core unavailable" : r.err;
         }
+        lastProbeFailed = !pm.ok;   // drives the 60s down-endpoint backoff above
         st.providerModels[ui::PROV_LOCAL] = pm;
         st.providerModels[ui::PROV_LLAMACPP] = pm;  // same local endpoint family
         st.modelProbeInFlight.store(false);

@@ -148,10 +148,10 @@ static const RailItem kRail[] = {
     {PlmPage::Settings, "Settings"},
 };
 
-static void drawRail(AppState& st, float railW) {
+static void drawRail(AppState& st, float railW, float bottomMargin) {
     const float S = ui::uiScale;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 10 * S));
-    ImGui::BeginChild("##plm_rail", ImVec2(railW, 0), ImGuiChildFlags_None);
+    ImGui::BeginChild("##plm_rail", ImVec2(railW, -bottomMargin), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
 
     ImGui::PushStyleColor(ImGuiCol_Text,
@@ -255,12 +255,18 @@ void drawPlmWorkspace(AppState& st) {
     // keep the dashboard aggregate fresh (drives rail badges + Overview)
     plmEnsureOverview(st);
 
+    // Outer margin so neither the rail nor the page hugs the main window border.
+    const float M = 10.0f * S;
+    ImGui::Dummy(ImVec2(0, M));   // top margin
+    ImGui::Indent(M);            // left margin (rail + page shift right)
+
     const float railW = 190.0f * S;
-    drawRail(st, railW);
+    drawRail(st, railW, M);
     ImGui::SameLine();
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14 * S, 10 * S));
-    ImGui::BeginChild("##plm_page", ImVec2(0, 0), ImGuiChildFlags_None);
+    // -M width/height leaves a matching right + bottom margin from the window edge.
+    ImGui::BeginChild("##plm_page", ImVec2(-M, -M), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
     switch (g_plmHub.page) {
         case PlmPage::Overview: plmDrawOverviewPage(st); break;
@@ -273,6 +279,7 @@ void drawPlmWorkspace(AppState& st) {
         case PlmPage::Settings: plmDrawSettingsPage(st); break;
     }
     ImGui::EndChild();
+    ImGui::Unindent(M);
 }
 
 }  // namespace ui

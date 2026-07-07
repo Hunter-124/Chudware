@@ -835,45 +835,67 @@ void plmDrawPlanningPage(AppState& st) {
     if (!H.planErr.empty()) plmError(H.planErr);
     ImGui::Spacing();
 
-    // kanban columns
+    // kanban columns — bordered, scrollable boxes so cards stay contained inside
+    // their column instead of spilling past the bottom. Each column scrolls
+    // independently when it fills up; the boxes are sized to the remaining page
+    // height so they feel like a real board.
     struct Col { const char* id; const char* label; };
     static const Col kCols[] = {
         {"todo", "To do"}, {"doing", "Doing"}, {"done", "Done"}, {"blocked", "Blocked"},
     };
-    ImGui::Columns(4, "##kanban", true);
-    for (const auto& col : kCols) {
+    static const char* kPipe[] = {"todo", "doing", "done"};  // ordered lane; "blocked" is aside
+    const float gap  = 8 * S;
+    float colW = (ImGui::GetContentRegionAvail().x - gap * 3) / 4.0f;
+    float colH = ImGui::GetContentRegionAvail().y - 210 * S;  // reserve room for milestones
+    if (colH < 260 * S) colH = 260 * S;
+
+    for (int ci = 0; ci < 4; ++ci) {
+        const auto& col = kCols[ci];
+        if (ci) ImGui::SameLine(0, gap);
+        ImGui::BeginGroup();
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
         ImGui::TextUnformatted(col.label);
         ImGui::PopStyleColor();
-        ImGui::Separator();
-        // pipeline order for the ◀ ▶ movement arrows; "blocked" is a side state
-        static const char* kPipe[] = {"todo", "doing", "done"};
+
+        ImGui::PushID(ci);
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6 * S);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6 * S, 6 * S));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+            ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.03f));
+        ImGui::PushStyleColor(ImGuiCol_Border,
+            ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.12f));
+        ImGui::BeginChild("##col", ImVec2(colW, colH), ImGuiChildFlags_Borders);
+
+        int shown = 0;
         for (const auto& t : H.allTasks) {
             if (t.status != col.id) continue;
+            ++shown;
             ImGui::PushID(t.id.c_str());
             bool sel = (s_selTask == t.id);
-            plmCardBegin("##task", sel);
+            plmCardBegin("##task", sel, 8.0f, 5.0f);
             priorityTag(t.priority);
             ImGui::SameLine();
             ImGui::TextWrapped("%s", t.title.c_str());
             if (!t.assignee.empty()) dimText("@%s", t.assignee.c_str());
 
-            // movement controls — always visible so a task moves in one click, no
-            // select-first step. Arrows walk the todo→doing→done pipeline; a Block
-            // toggle parks it. These are compact enough to fit the narrow column.
+            // Movement controls — always visible, one click, no select-first step.
+            // ‹ › walk the todo→doing→done lane; Block parks the task. A tight
+            // frame padding keeps them small so the card stays compact.
             int idx = -1;
             for (int k = 0; k < 3; ++k) if (t.status == kPipe[k]) idx = k;
             bool blocked = (idx < 0);
             ImGui::Spacing();
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 3 * S));
             ImGui::BeginDisabled(!blocked && idx == 0);
-            if (ImGui::ArrowButton("##prev", ImGuiDir_Left))
+            if (ImGui::SmallButton("\xe2\x80\xb9"))  // ‹
                 planCall(st, "update", "task",
                          {{"status", blocked ? "todo" : kPipe[idx - 1]}}, t.id);
             ImGui::EndDisabled();
             ImGui::SameLine();
             ImGui::BeginDisabled(!blocked && idx == 2);
-            if (ImGui::ArrowButton("##next", ImGuiDir_Right))
+            if (ImGui::SmallButton("\xe2\x80\xba"))  // ›
                 planCall(st, "update", "task",
                          {{"status", blocked ? "doing" : kPipe[idx + 1]}}, t.id);
             ImGui::EndDisabled();
@@ -885,18 +907,25 @@ void plmDrawPlanningPage(AppState& st) {
                 planCall(st, "update", "task", {{"status", "blocked"}}, t.id);
             }
             if (sel) {
+                ImGui::SameLine();
                 ImGui::PushStyleColor(ImGuiCol_Button,
                     ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 0.55f));
-                if (ImGui::SmallButton("Delete"))
+                if (ImGui::SmallButton("Del"))
                     planCall(st, "delete", "task", nullptr, t.id);
                 ImGui::PopStyleColor();
             }
+            ImGui::PopStyleVar(2);
             if (plmCardEnd()) s_selTask = sel ? "" : t.id;
             ImGui::PopID();
         }
-        ImGui::NextColumn();
+        if (!shown) dimText("Nothing here yet.");
+
+        ImGui::EndChild();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(2);
+        ImGui::PopID();
+        ImGui::EndGroup();
     }
-    ImGui::Columns(1);
 
     // milestones lane
     ImGui::Dummy(ImVec2(0, 8 * S));

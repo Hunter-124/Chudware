@@ -46,20 +46,33 @@ Status legend: `[ ]` pending · `[~]` in progress (fleet wf_b556d138-1bf) · `[x
 ## 5. Simulations (Hunter 2026-07-06 late — FULL implementation required)
 - [x] Kinematic/motion studies end-to-end: motor definition → play/pause/scrub timeline →
   viewport bodies animate → trace plots (angle/velocity vs time).
-- [ ] **All simulation kinds live in the ONE Simulate tab**: structural FEA (static, modal,
-  thermal, buckling, fatigue, frequency response, contact), CFD (fast + accurate), motion,
-  **electronics simulation** (SPICE/impedance via the ecad engine) and **firmware emulation**
-  (fw_sim/fw_debug) — no separate sim tabs.
+- [x] **Per-simulation-type ribbon tabs** (Hunter red-pen 2026-07-07, supersedes the earlier
+  "one Simulate tab" lock): the Simulate workspace shows one ribbon tab per study kind —
+  Static / Modal / Flow / Thermal / Fatigue / Motion / EM — each carrying ONLY that kind's
+  tools ("+ New Study" first, then setup tools, Run/Results, shared Reference group).
+  Implemented in ribbon.cpp (tabs 13–19, Simulate-only) + ribbon_def.cpp.
+- [~] **EM (electromagnetics) tab**: Eigenmode / Freq Sweep (S-params) / Time Domain study
+  buttons + Ports/Boundaries/Freq Range tools, gated on an async `em_status` probe — when the
+  em_* backend is missing the whole set renders disabled with an honest "EM solver not
+  installed" tooltip (ui::setRibbonDisabledPrefix). Study setup forms wire up once the EM
+  backend agent's RPC contract is final (wire request filed in host/WIRE_REQUESTS.md).
+- [x] **Tool-invoked setup panels** (Hunter red-pen 2026-07-07): the numbered always-open
+  accordion stack is gone. Setup editors open ONLY when the matching ribbon tool is invoked
+  (or a study-tree node is double-clicked), PropertyManager-style — the panel takes over the
+  left pane body with an icon+title header and OK to close; the tree keeps "+ New Study",
+  the study tree with status dots, and the study switcher.
 - [ ] **Progressive disclosure by open part type**: electronics-sim and emulation study options
   appear ONLY when electronics parts (schematic/PCB/firmware docs) are open; mechanical study
   types for parts/assemblies; motion only when an assembly with mates is open. Users are never
-  shown options irrelevant to what they have open.
-- [ ] **Simulate view hides the feature/model tree entirely.** The left pane shows ONLY the
-  simulation setup tree (study → material / fixtures / loads / mesh / results …) rendered in the
-  same visual style as the feature tree.
-- [ ] Controls for the different simulation kinds stay separated per kind (a static study shows
-  static setup nodes; a flow study shows flow nodes; an electronics sim shows netlist/probe
-  nodes) — one setup tree grammar, per-kind vocabularies.
+  shown options irrelevant to what they have open. (Electronics-circuit sim remains follow-up
+  T-SIM10; the EM tab is always present per the red-pen tab list.)
+- [x] **Simulate view hides the feature/model tree entirely.** The left pane shows ONLY the
+  simulation setup tree (study → material / fixtures / loads / mesh / results …) rendered
+  FM-grade via the exported feature_tree.h helpers (fmRowPill / fmTreeIconInArrowSlot /
+  fmSectionDivider); the Simulation tree is clamped OUT of Model/Drawing left panes.
+- [x] Controls for the different simulation kinds stay separated per kind (a static study shows
+  static setup nodes; a flow study shows flow nodes) — one setup tree grammar, per-kind
+  vocabularies + per-kind ribbon tabs. (Electronics netlist/probe nodes: T-SIM10.)
 
 ## 6. Workspace bodies
 - [~] Model: today's modeling environment; entering a sketch auto-switches to Drawing.

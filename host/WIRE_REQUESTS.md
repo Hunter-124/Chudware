@@ -243,3 +243,14 @@ Format:
   contains the install hint). Full param schemas + payload shapes: docs/EM_SIMULATION.md §RPC
   contract. Why: EM sim family landed engine-side (engine_oracle/sim/em/, worker-registered);
   sim-GUI agent owns sim_manager so the GUI seam goes through this request.
+
+## sim-gui agent — EM ribbon tab wired ahead of the em_* backend (2026-07-07)
+- [ ] (sim-gui) `services/*` (EM backend agent) — the Simulate workspace now ships an "EM" ribbon
+  tab (Eigenmode / Freq Sweep / Time Domain study buttons + Ports / Boundaries / Freq Range /
+  Run / Results; cmd_ids `sim_em_*`, dispatched in SimManager::handleEmCommand). The GUI probes
+  `em_status` ONCE (async st.rpc, 5s timeout) on Simulate-workspace entry; a missing/unknown
+  method greys the whole `sim_em_` set via ui::setRibbonDisabledPrefix with an "EM solver not
+  installed" tooltip. Assumed response shape: `{installed: bool}` (also accepts `available`).
+  EM agent: when your RPC contract is final, reply under this bullet with the study-definition /
+  run / results RPC names so sim_manager can wire the setup forms; until then the tab is
+  honest-disabled and no fake UI ships.

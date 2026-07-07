@@ -335,26 +335,37 @@ def score_candidate(rec: dict, *, facets: dict, defs: list[dict],
     if matched:
         reasons.append("spec fit: " + ", ".join(matched))
     title_toks = set(_tokens(str(rec.get("title", ""))))
+    overlap = (len(need_tokens & title_toks) / len(need_tokens)) if need_tokens else 0.0
     if need_tokens:
-        overlap = len(need_tokens & title_toks) / len(need_tokens)
         score += 0.5 * overlap
+    # Relevance gate: a record that matches NONE of the queried facets and shares
+    # negligible title vocabulary with the need is almost certainly the wrong part
+    # family (e.g. a fastener FTS-matched on a stray shared token like "OD" when
+    # the correct category has zero local records). Without this, the flat
+    # "local library"/"placeable geometry" bonuses below let such a false-positive
+    # float above a legitimately-empty result set. Skip the gate when the need
+    # carried no concrete facet constraints — title overlap is the only signal.
+    relevant = (not facets) or fit > 0 or overlap >= 0.34
     price = _first_price(rec)
     if price > 0:
         score += 0.3
         reasons.append(f"priced ({price:g})")
     if rec.get("source") == "live":
-        score += 0.1
-        reasons.append("live vendor result")
-    else:
+        if relevant:
+            score += 0.1
+            reasons.append("live vendor result")
+    elif relevant:
         score += 0.4
         reasons.append("local library record")
     gref = rec.get("geometry_ref") or {}
-    if gref.get("kind"):
+    if relevant and gref.get("kind"):
         score += 0.5
         reasons.append("placeable geometry available")
-    elif str(rec.get("part_id", "")).startswith("catalog:"):
+    elif relevant and str(rec.get("part_id", "")).startswith("catalog:"):
         score += 0.2
         reasons.append("downloadable via scrape queue")
+    if not relevant:
+        reasons.append("low relevance to requested specs")
     return round(score, 4), "; ".join(reasons)
 
 

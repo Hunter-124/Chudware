@@ -1,10 +1,10 @@
-// AI workspace — full-page AI hub for the AI title-bar tab (v2 redesign, tracker M1-M8).
+// AI workspace — full-page AI hub for the AI title-bar tab (v2 redesign, tracker M1-M8, M21).
 //
 //   +----------------------------------------------------------------+
-//   | [rail] |  DAG pane   [ Agent Workflow | Session Plan ]  [gear] |   <- upper main
-//   |        |                                                       |
-//   +----------------------------------------------------------------+
-//   | conversation (log + composer)      |  workflow settings        |   <- lower zone
+//   | [rail] | chat        |  DAG pane [Agent Workflow|Session Plan] |   <- M21 layout
+//   |        | (narrow,    |                                         |
+//   |        |  full       +-----------------------------------------+
+//   |        |  height)    |  workflow options (re-flowed, M21)      |
 //   +----------------------------------------------------------------+
 //
 // The conversation window is ALWAYS visible (M6 — no "Conversation" tab); it renders the SAME
@@ -238,8 +238,17 @@ void feedAgentDagEvent(const std::string& kind, const nlohmann::json& data) {
         n.title  = "spawn: " + agEnvStr(data, "role");
         n.detail = agEnvStr(data, "brief");
         // Seed the child's execution root so its later events attach under this spawn node.
+        // Copy the actor to a local BEFORE the second agUpsert — it push_backs into the node
+        // vector, which can reallocate and dangle the `n` reference above. (Only matters once a
+        // real spawn sink lands; harmless on the empty path today, but correct now.)
+        const std::string spawnActor = n.actor;
         const std::string childId = agEnvStr(data, "subagent_id");
-        if (!childId.empty()) { AgNode& c = agUpsert(childId, key); if (c.title.empty()) { c.kind = AgKind::Root; c.actor = n.actor; c.title = "subagent " + n.actor; } }
+        if (!childId.empty()) {
+            AgNode& c = agUpsert(childId, key);
+            if (c.title.empty()) {
+                c.kind = AgKind::Root; c.actor = spawnActor; c.title = "subagent " + spawnActor;
+            }
+        }
         s_agdag.sawSpawn = true;
     } else if (kind == "agent.advisor") {
         AgNode& n = agUpsert(key, parentId);
@@ -687,8 +696,15 @@ static void drawAgentDagCanvas(AppState& st) {
                 ImGui::ColorConvertFloat4ToU32(ImVec4(palette.text[0], palette.text[1],
                                                       palette.text[2], 1.0f)),
                 s_agdag.nodes[idx].collapsed ? "+" : "-");
-            if (hov && !navActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-                s_agdag.nodes[idx].collapsed = !s_agdag.nodes[idx].collapsed;
+            // Toggle on RELEASE of a tap (not press): the full-canvas nav InvisibleButton claims
+            // the click on press, so `navActive` is true the same frame IsMouseClicked fires —
+            // gating on click-down can never pass. A release with near-zero drag = a tap (a drag
+            // pans instead). Threshold keeps a slightly-jittery click from being read as a pan.
+            if (hov && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left, 0.0f);
+                if (dd.x * dd.x + dd.y * dd.y < (4.0f * S) * (4.0f * S))
+                    s_agdag.nodes[idx].collapsed = !s_agdag.nodes[idx].collapsed;
+            }
         }
 
         if (z > 0.5f) {
@@ -1057,21 +1073,31 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
 // reasoning effort, max response tokens, model context window, API key, base URL, vision, and
 // the Privacy/Offline toggle) and Settings -> Experimental (the separate vision reviewer). This
 // pane keeps ONLY the run-behavior knobs — the same config.json fields, no parallel store.
-static void drawSettingsPane(AppState& st, float paneW, bool /*busy*/) {
+// M21: this pane now lives lower-RIGHT (below the DAG, beside the chat column) as a WIDE strip,
+// so the content re-flows into two side-by-side groups (Workflow mode | Limits) with the
+// persistence footnote spanning underneath; on a narrow strip it degrades to a single stack.
+static void drawSettingsPane(AppState& st, float paneH, bool /*busy*/) {
     const float S = ui::uiScale;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
-    ImGui::BeginChild("##ai_ws_settings", ImVec2(paneW, 0), ImGuiChildFlags_None);
+    ImGui::BeginChild("##ai_ws_settings", ImVec2(0, paneH), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
 
     bool changed = false;
+    const bool twoCol = ImGui::GetContentRegionAvail().x > 480.0f * S;
 
+    ImGui::BeginGroup();
     sectionHeader("Workflow");
     int pm = st.settings.planMode ? 0 : 1;
     if (ImGui::RadioButton("Supervised — plan + clarify first", &pm, 0)) changed = true;
     if (ImGui::RadioButton("Autopilot — model straight from the prompt", &pm, 1))
         changed = true;
     st.settings.planMode = (pm == 0);
+    ImGui::EndGroup();
 
+    if (twoCol) ImGui::SameLine(0.0f, 28.0f * S);
+
+    ImGui::BeginGroup();
+    sectionHeader("Limits");
     auto intKnob = [&](const char* label, int& v, const char* tip) {
         ImGui::SetNextItemWidth(90.0f * S);
         if (ImGui::InputInt(label, &v, 0, 0)) { v = std::max(0, v); changed = true; }
@@ -1083,6 +1109,7 @@ static void drawSettingsPane(AppState& st, float paneW, bool /*busy*/) {
             "Max output tokens per model call. 0 = provider default.");
     intKnob("Context window##ai_ws_ctx", st.settings.contextWindow,
             "Model's total token window. 0 = automatic (cloud large, local 8192).");
+    ImGui::EndGroup();
 
     if (changed) saveSettings(st.settings);
 
@@ -1156,12 +1183,11 @@ void drawAiWorkspace(AppState& st) {
                           ? st.conversations[st.activeConv].id
                           : std::string();
 
-    // v2 layout (M1 compact):
-    //   [rail] | +-----------------------------------------------+
-    //           |   DAG pane (upper, M4)   [tabs] [Options]       |
-    //           +-----------------------------------------------+
-    //           |  conversation (M5, lower-left) | workflow (M3) |
-    //           +-----------------------------------------------+
+    // M21 layout (Hunter's annotated screenshot):
+    //   [rail] | chat (narrow FULL-height left column) | DAG pane         (upper right)
+    //          |                                       | workflow options (lower right)
+    // Hairline dividers (theme glassBorder, same grammar as layout.cpp pane separators) mark the
+    // chat/right boundary and the DAG/options boundary.
     const float totalW = ImGui::GetContentRegionAvail().x;
     const float railW  = 210.0f * S;                             // compacted from 235
     const float bodyW  = totalW - railW - 8.0f * S;
@@ -1173,29 +1199,57 @@ void drawAiWorkspace(AppState& st) {
     ImGui::BeginChild("##ai_ws_body", ImVec2(bodyW, 0), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
 
-    // Upper region: the DAG pane occupies the top ~52% of the body height (M4).
-    const float bodyH  = ImGui::GetContentRegionAvail().y;
-    const float dagH   = std::max(160.0f * S, bodyH * 0.52f);
+    const ImVec2 bodyPos  = ImGui::GetCursorScreenPos();
+    const float  bodyH    = ImGui::GetContentRegionAvail().y;
+    const float  gap      = 8.0f * S;
+    const ImU32  hairline = ui::Palette::toU32(palette.glassBorder);
+
+    // Chat column: a small, consistent slice of the body — 30% with clean bounds so it never
+    // starves (min) or sprawls on wide monitors (max). Full height: log + composer inside.
+    const float chatW = std::max(300.0f * S, std::min(bodyW * 0.30f, 440.0f * S));
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
+    ImGui::BeginChild("##ai_ws_conv", ImVec2(chatW, 0), ImGuiChildFlags_None);
+    ImGui::PopStyleVar();
+    drawChatCenter(st, busy, canRun);   // log + composer (mode tabs + prompt); no stray header
+    ImGui::EndChild();
+
+    ImGui::SameLine(0.0f, gap);
+
+    // Right stack: DAG pane on top, workflow options strip below (when shown).
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::BeginChild("##ai_ws_right", ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGui::PopStyleVar();
+
+    const float rightH = ImGui::GetContentRegionAvail().y;
+    const float optH   = s_ai.showSettings
+                             ? std::max(150.0f * S, std::min(rightH * 0.34f, 260.0f * S))
+                             : 0.0f;
+    const float dagH   = std::max(160.0f * S,
+                                  rightH - (s_ai.showSettings ? optH + gap : 0.0f));
 
     ImGui::BeginChild("##ai_ws_upper", ImVec2(0, dagH), ImGuiChildFlags_None);
     drawDagPane(st, busy);
     ImGui::EndChild();
 
-    // Lower region: conversation (left, always visible — M5/M6) + workflow settings (right — M3).
-    const float lowerW = ImGui::GetContentRegionAvail().x;
-    const float setW   = s_ai.showSettings ? std::min(280.0f * S, lowerW * 0.34f) : 0.0f;
-    const float convW  = lowerW - setW - (s_ai.showSettings ? 8.0f * S : 0.0f);
-
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
-    ImGui::BeginChild("##ai_ws_conv", ImVec2(convW, 0), ImGuiChildFlags_None);
-    ImGui::PopStyleVar();
-    sectionHeader("Conversation");
-    drawChatCenter(st, busy, canRun);
-    ImGui::EndChild();
-
     if (s_ai.showSettings) {
-        ImGui::SameLine();
-        drawSettingsPane(st, setW, busy);
+        // Horizontal hairline between the DAG pane and the options strip.
+        {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float x0 = bodyPos.x + chatW + gap;
+            const float y  = bodyPos.y + dagH + gap * 0.5f;
+            dl->AddLine(ImVec2(x0, y), ImVec2(bodyPos.x + bodyW, y), hairline, 1.0f * S);
+        }
+        drawSettingsPane(st, ImGui::GetContentRegionAvail().y, busy);
+    }
+
+    ImGui::EndChild();  // ##ai_ws_right
+
+    // Vertical hairline along the chat/right boundary (full body height).
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float x = bodyPos.x + chatW + gap * 0.5f;
+        dl->AddLine(ImVec2(x, bodyPos.y), ImVec2(x, bodyPos.y + bodyH), hairline, 1.0f * S);
     }
 
     ImGui::EndChild();  // ##ai_ws_body

@@ -1,0 +1,6 @@
+{
+ "from": "opus-cef",
+ "to": "broadcast",
+ "text": "[opus-cef] Landed the Parts\u2192RE delivery seam (uncommitted, on shared checkout). NEW engine_oracle/reveng_rpc.py = worker-RPC bridge exposing list_reveng_sessions/get_reveng_session/reveng_start_session/reveng_add_images/reveng_ingest_datasheet (registered in engine_oracle/worker.py). IMPORTANT for RE-30/RE tab: reveng had ZERO worker methods before this \u2014 the RE workspace's list_reveng_sessions call was hitting \"method not found\" \u2192 \"Reverse Eng tools unavailable\". This bridge fixes that; the RE tab can now reach the backend. Parts side: host/src/ui/parts/ \"Reverse-engineer\" button on live results \u2192 reveng_start_session(part_ref, research) \u2192 sets AppState.pendingRevengSessionId + activeWorkspace=ReverseEng. RE-30 owner: consume+clear pendingRevengSessionId in the RE workspace draw to auto-select the new session. Bridge imports reveng_tools' module-level helpers (zero edits to reveng_tools.py). Tests: engine_oracle/test_reveng_rpc.py (5, green).",
+ "ts": "2026-07-07T17:18:49Z"
+}

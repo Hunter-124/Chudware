@@ -146,6 +146,33 @@ change (§2).
 > read-only companion is `sketch_project_entities` `{doc_id, sketch, refs:[Ref…]}` →
 > `{ok, entities (no ids, construction:true), approx, sources, plane_frame}`.
 
+> **Amendment (T-BL49, 2026-07-07) — `sketch_convert` is now ASSOCIATIVE by default.** New
+> optional field `associative:bool` (default `true`): each Ref is also recorded on the sketch as
+> a persistent external reference (`params.external_refs[]`, id family `x<N>` — see
+> doc_schema.md §3.5) owning the entities it produced. On EVERY later rebuild (any mutating
+> `doc_apply_ops` batch, and `doc_rebuild`) the engine re-resolves each recorded source and
+> re-projects, updating the owned entities **in place under stable entity ids** (user
+> constraints/dims attached to converted geometry survive; if a re-projection changes an
+> entity's TYPE — e.g. a line collapsing to a point after a plane change — constraints touching
+> that entity are cascade-dropped and the `fix` pin re-added, so the document always stays
+> valid). Re-resolution uses the **scored selector match with the selectors.md §3 accept
+> thresholds** (strict; duplicate-free unique-edge candidate set), NOT the forgiving
+> centroid-near pick used at creation: a source that no longer resolves (owner deleted, geometry
+> moved past the score threshold, symmetric ambiguity) marks the ref `stale:true` — the
+> last-good entities are KEPT, the rebuild NEVER fails because of a stale ref, and the staleness
+> surfaces as (a) a feature-status `warning` on the sketch, (b) `sketch_health.external_refs[]`
+> rows, and (c) an `external` map (`eid -> {ref, stale}`) on `sketch_enter`/`sketch_solve`/
+> `sketch_drag` results (the host styles external entities distinctly and dashes/ambers stale
+> ones). If the source later resolves again, the ref self-heals (`stale:false`, geometry
+> re-projected). Source growth/shrink (a face gaining/losing boundary edges) appends new ids /
+> deletes orphaned tail ids (constraints on deleted entities cascade). `associative:false`
+> restores the one-shot copy above. New op **`sketch_break_external_ref`** `{sketch, id:"x<N>",
+> delete_entities:bool=false}` severs one link (SolidWorks "break link"): the record is removed
+> and the entities stay as ordinary fix-pinned geometry (or are deleted with constraint cascade
+> when `delete_entities:true`); an unknown ref id raises `invalid_op`. A ref that cannot resolve
+> at CREATION time still fails the op (`convert_failed`/`unsupported_ref`) — staleness only
+> applies to later rebuilds.
+
 **Sketch move/copy (C54 — translate or duplicate the selection by a delta):**
 
 | op | fields |

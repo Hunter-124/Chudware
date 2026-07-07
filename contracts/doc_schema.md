@@ -205,6 +205,35 @@ The solver reports per-entity status (`under` | `full` | `over`) and sketch DOF;
 never persists solve state. Entity coordinates stored in the document are the **last solved**
 positions (so documents open without solving).
 
+### 3.5 External references (associative Convert Entities — T-BL49, 2026-07-07)
+
+A sketch may additionally carry `params.external_refs: [ExternalRef…]` — the persistent record
+behind associative `sketch_convert` (doc_ops.md):
+
+```json
+{"id": "x1",
+ "source": {"kind": "face", "selector": { ...selectors.md selector... }},
+ "construction": false, "fix": true,
+ "entity_ids": ["e5", "e6", "e7", "e8"],
+ "stale": false}
+```
+
+| field | meaning |
+|---|---|
+| `id` | `x<N>` (its own id family; minted by the op id generator) |
+| `source` | the projected Ref: `{datum:"front"|"top"|"right"}` or `{kind:"face"|"edge", selector}` |
+| `construction` / `fix` | the creation-time flags — re-projection re-applies them to grown entities |
+| `entity_ids` | the sketch entities this ref OWNS, in projection order (ids are STABLE across re-projection) |
+| `stale` | `true` when the last rebuild could not re-resolve `source` (strict selectors.md §3 match); last-good entities kept, sketch compiles with a warning |
+
+Semantics (normative): on every mutating rebuild the engine re-resolves `source` against the
+compiled model and re-projects onto the sketch plane, patching the owned entities in place.
+Constraints/dims attached to owned entities survive geometry updates; an entity whose projected
+TYPE changes has its touching constraints cascade-dropped (+ `fix` re-pinned). Owned entities are
+solver-FIXED via ordinary `fix` constraints — users constrain other geometry TO them but cannot
+drag them. `sketch_break_external_ref` severs the link. Converted geometry defaults to REAL
+(non-construction) entities: closed converted loops are extrudable profiles.
+
 ## 4. Equations — expression grammar
 
 ```

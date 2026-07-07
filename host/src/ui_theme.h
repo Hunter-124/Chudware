@@ -115,6 +115,11 @@ struct Palette {
     // C49: sketch inference ink (dashed alignment lines + snap markers). Amber so it reads on
     // the light canvas in both themes and never collides with the under-defined blue.
     float sketchInfer[4]     = {0.950f,0.650f,0.200f, 0.85f};
+    // T-BL49: associative Convert Entities — entities owned by an external ref render in a
+    // distinct violet (fully-defined ink would hide their provenance); a STALE ref (source no
+    // longer resolves; last-good geometry kept) renders dashed in the warning amber.
+    float sketchExternal[4]      = {0.500f,0.380f,0.820f, 1};   // live external-ref entities
+    float sketchExternalStale[4] = {0.953f,0.610f,0.220f, 1};   // stale (dashed) entities
 
     // ---- status ----
     float statusOk[4]   = {0.176f,0.831f,0.749f, 1};   // same as accent

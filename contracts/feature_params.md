@@ -32,7 +32,10 @@
 ## Sketch
 
 ### `sketch`
-- params: `entities: [Entity]` · `constraints: [Constraint]` (doc_schema §3)
+- params: `entities: [Entity]` · `constraints: [Constraint]` (doc_schema §3) ·
+  `external_refs: [ExternalRef]?` (doc_schema §3.5 — associative Convert Entities records;
+  written by the `sketch_convert` op, re-projected on every rebuild, `stale:true` on a
+  non-resolving source with last-good geometry kept + a feature-status warning)
 - refs: `plane: sel(face[plane], datum)`
 - compiler: `features/sketch.py` — solve → wire graph → closed-loop region detection →
   pickable region faces (AICM pseudo-body `sketch:<id>`).

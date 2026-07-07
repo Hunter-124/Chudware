@@ -94,6 +94,10 @@ struct SketchEntity {
     std::string type;            // line|circle|arc|slot|arc_slot|point|ellipse|spline
     std::string status;          // under|full|over (from the solver)
     bool construction = false;
+    // T-BL49 associative Convert Entities: owned by an external ref (distinct color);
+    // stale = the source no longer resolves (dashed + warning color, last-good geometry).
+    bool external = false;
+    bool externalStale = false;
     // Coordinate payload (sketch-plane u,v). Only the fields for `type` are populated.
     float p1[2] = {0, 0}, p2[2] = {0, 0};   // line/slot endpoints; point reuses p1 for "p"
     float center[2] = {0, 0};               // circle/arc/ellipse/arc_slot

@@ -403,11 +403,18 @@ static void parseEntities(const nlohmann::json& res, std::vector<SketchEntity>& 
     out.clear();
     const nlohmann::json* stats = res.contains("statuses") ? &res["statuses"] : nullptr;
     if (!res.contains("entities") || !res["entities"].is_array()) return;
+    // T-BL49: eid -> {ref, stale} ownership map for associative Convert Entities styling.
+    const nlohmann::json* ext = res.contains("external") && res["external"].is_object()
+                                    ? &res["external"] : nullptr;
     for (const auto& e : res["entities"]) {
         SketchEntity se;
         se.id = e.value("id", std::string());
         se.type = e.value("type", std::string());
         se.construction = e.value("construction", false);
+        if (ext && ext->contains(se.id)) {
+            se.external = true;
+            se.externalStale = (*ext)[se.id].value("stale", false);
+        }
         if (stats && stats->contains(se.id)) se.status = (*stats)[se.id].get<std::string>();
         else se.status = "under";
         auto v2 = [&](const char* k, float o[2]) {
@@ -5323,6 +5330,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // ---- entities (color by solver status via theme roles) ----
     auto statusCol = [&](const SketchEntity& e) -> ImU32 {
         if (e.status == "over") return col(pal.statusErr);
+        // T-BL49: external-ref (Convert Entities) provenance beats the solved-ink color —
+        // violet when live, warning amber when the source no longer resolves (stale).
+        if (e.externalStale) return col(pal.sketchExternalStale);
+        if (e.external) return col(pal.sketchExternal);
         if (e.status == "full") return col(pal.sketchInk);
         return col(pal.sketchUnder);   // under-defined (blue-ish)
     };
@@ -5333,11 +5344,16 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // addSeg accumulates points into a local vector so the polyline dash phase is continuous.
     // DPI-scaled marker sizes shared by the entity loop (endpoint/center dots, point crosses).
     const float dotR = 3.0f * ui::uiScale, ctrR = 2.5f * ui::uiScale;
-    for (const auto& e : ents_) {
+    for (const auto& e0 : ents_) {
+        // T-BL49: a STALE external-ref entity draws DASHED (warning styling) — reuse the
+        // construction dash path on a per-draw copy so every entity-type branch below
+        // inherits it without touching the stored construction flag.
+        SketchEntity e = e0;
+        if (e.externalStale) e.construction = true;
         // C41 (T2): selected entities render in the (canvas-darkened) accent, slightly thicker.
         bool sel = !selIds_.empty() && isSelected(e.id);
         ImU32 cc = sel ? canvasAccent() : statusCol(e);
-        float th = ((e.construction ? 1.0f : 2.0f) + (sel ? 1.0f : 0.0f)) * ui::uiScale;
+        float th = ((e0.construction ? 1.0f : 2.0f) + (sel ? 1.0f : 0.0f)) * ui::uiScale;
         // Helper: stroke a polyline; uses dashed rendering for construction entities.
         auto strokePoly = [&](const std::vector<ImVec2>& pts) {
             if (e.construction) {

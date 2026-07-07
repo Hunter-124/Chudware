@@ -203,6 +203,224 @@ TEST_CASE("op: sketch_convert projects a face loop as REAL entities and they ext
                       "extrude of the converted loop failed: " << st.dump());
 }
 
+// ---------------------------------------------------------------------------
+// T-BL49 — ASSOCIATIVE external references
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Fetch the sketch feature json out of a doc_apply_ops/doc_tree response tree.
+json feature_of(const json& tree, const std::string& fid) {
+    for (const auto& f : tree.at("features"))
+        if (f.value("id", std::string()) == fid) return f;
+    return json(nullptr);
+}
+
+}  // namespace
+
+TEST_CASE("assoc: converted entities re-project (stable ids) when the source moves") {
+    const double W = 40.0, D = 30.0, H = 20.0;
+    std::string doc_id = make_box("AssocConvert", W, D, H);  // f1 sketch, f2 extrude
+
+    // Sketch on a STABLE datum plane (plane.top offset 50 — no face-selector churn: this
+    // test isolates the associativity of the CONVERT ref itself); Convert Entities on the
+    // box's BOTTOM face (the external source).
+    json mk = json::array({json{{"op", "add_feature"}, {"feature",
+        json{{"type", "sketch"}, {"name", "SkAbove"},
+             {"params", {{"entities", json::array()}, {"constraints", json::array()},
+                         {"offset", 50.0}}},
+             {"refs", {{"plane", "plane.top"}}}}}}});
+    json mr = doc_apply_ops(doc_id, -1, mk, false);
+    const std::string fid = mr.at("id_map").at("$0").get<std::string>();
+
+    json qb = doc_query(doc_id, json{{"of", "face"}, {"side", "bottom"}});
+    REQUIRE(qb.value("count", 0) >= 1);
+    json cv = json::array({json{{"op", "sketch_convert"}, {"sketch", fid},
+        {"refs", json::array({json{{"kind", "face"}, {"selector", qb.at("matches").at(0)}}})}}});
+    json cr = doc_apply_ops(doc_id, -1, cv, false);
+
+    // Associative by default: the sketch carries ONE external_ref owning the 4 lines.
+    json skf = feature_of(cr.at("tree"), fid);
+    REQUIRE_FALSE(skf.is_null());
+    REQUIRE(skf.at("params").contains("external_refs"));
+    const json& xrs = skf["params"]["external_refs"];
+    REQUIRE(xrs.size() == 1);
+    CHECK(xrs[0].value("stale", true) == false);
+    REQUIRE(xrs[0].at("entity_ids").size() == 4);
+    std::vector<std::string> ids_before;
+    for (const auto& e : xrs[0]["entity_ids"]) ids_before.push_back(e.get<std::string>());
+
+    // Extrude the converted loop so a downstream feature rides on the converted geometry
+    // (a separate body floating above the box — it must NOT erode the source face, or the
+    // test would measure selector churn instead of associativity).
+    json ex = json::array({json{{"op", "add_feature"}, {"feature",
+        json{{"type", "extrude"}, {"name", "Boss"},
+             {"params", {{"mode", "boss"}, {"end", "blind"}, {"depth", dimv(5.0)}}},
+             {"refs", {{"profile", json::array({json{{"kind", "region"}, {"sketch", fid},
+                        {"centroid", json::array({W / 2.0, D / 2.0})},
+                        {"hint_index", 0}}})}}}}}}});
+    json er = doc_apply_ops(doc_id, -1, ex, false);
+    for (const auto& st : er.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(st.value("ok", false), "pre-edit tree failed: " << st.dump());
+    const double vol_before = er.value("volume", 0.0);
+    CHECK(vol_before == doctest::Approx(W * D * H + W * D * 5.0).epsilon(1e-6));
+
+    // EDIT THE SOURCE: widen the base rectangle 40 -> 60 (the bottom face grows).
+    json ed = json::array({
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e1"},
+             {"params", {{"p2", json::array({60.0, 0.0})}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e2"},
+             {"params", {{"p1", json::array({60.0, 0.0})}, {"p2", json::array({60.0, D})}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e3"},
+             {"params", {{"p1", json::array({60.0, D})}}}},
+    });
+    json rr = doc_apply_ops(doc_id, -1, ed, false);
+    for (const auto& st : rr.at("rebuild").at("feature_status"))
+        CHECK_MESSAGE(st.value("ok", false), "post-edit rebuild failed: " << st.dump());
+
+    // The ref must still be live and own the SAME entity ids (constraints would survive).
+    skf = feature_of(rr.at("tree"), fid);
+    const json& xr2 = skf["params"]["external_refs"][0];
+    CHECK(xr2.value("stale", true) == false);
+    REQUIRE(xr2.at("entity_ids").size() == ids_before.size());
+    for (std::size_t i = 0; i < ids_before.size(); ++i)
+        CHECK(xr2["entity_ids"][i].get<std::string>() == ids_before[i]);
+
+    // And the geometry MOVED: the converted loop now spans 60 in u (datum-plane frame =
+    // absolute world x/y, so u reaches 60 instead of 40).
+    double max_u = 0.0;
+    for (const auto& e : skf["params"]["entities"]) {
+        bool owned = false;
+        for (const auto& id : ids_before)
+            if (e.value("id", std::string()) == id) owned = true;
+        if (!owned) continue;
+        for (const char* key : {"p1", "p2"})
+            if (e.contains(key))
+                max_u = std::max(max_u, std::abs(e.at(key).at(0).get<double>()));
+    }
+    CHECK_MESSAGE(max_u == doctest::Approx(60.0).epsilon(1e-6),
+                  "converted loop did not follow the widened source (max_u=" << max_u << ")");
+
+    // Downstream extrude UPDATED: the boss riding on the converted loop widened with it.
+    CHECK(rr.value("volume", 0.0) ==
+          doctest::Approx(60.0 * D * H + 60.0 * D * 5.0).epsilon(1e-6));
+}
+
+TEST_CASE("assoc: deleting the source feature marks the ref stale, rebuild still succeeds") {
+    const double W = 40.0, D = 30.0, H = 20.0;
+    std::string doc_id = make_box("StaleConvert", W, D, H);
+
+    // Cylinder boss on the box top (circle sketch + extrude).
+    json qt = doc_query(doc_id, json{{"of", "face"}, {"side", "top"}});
+    json boss = json::array({
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "sketch"}, {"name", "SkBoss"},
+                 {"params", {{"entities", json::array({json{{"id", "e1"}, {"type", "circle"},
+                              {"construction", false}, {"center", json::array({0.0, 0.0})},
+                              {"radius", 5.0}}})},
+                             {"constraints", json::array()}}},
+                 {"refs", {{"plane", qt.at("matches").at(0)}}}}}},
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "extrude"}, {"name", "CylBoss"},
+                 {"params", {{"mode", "boss"}, {"end", "blind"}, {"depth", dimv(10.0)}}},
+                 {"refs", {{"profile", json::array({json{{"kind", "region"}, {"sketch", "$0"},
+                            {"centroid", json::array({0.0, 0.0})}, {"hint_index", 0}}})}}}}}},
+    });
+    json br = doc_apply_ops(doc_id, -1, boss, false);
+    const std::string boss_fid = br.at("id_map").at("$1").get<std::string>();
+
+    // New sketch above everything; convert the cylinder's TOP circular edge.
+    json mk = json::array({json{{"op", "add_feature"}, {"feature",
+        json{{"type", "sketch"}, {"name", "SkAbove"},
+             {"params", {{"entities", json::array()}, {"constraints", json::array()},
+                         {"offset", 50.0}}},
+             {"refs", {{"plane", "plane.top"}}}}}}});
+    json mr = doc_apply_ops(doc_id, -1, mk, false);
+    const std::string fid = mr.at("id_map").at("$0").get<std::string>();
+
+    json qe = doc_query(doc_id, json{{"of", "edge"}});
+    json circ_sel;
+    double best_z = -1e30;
+    for (const auto& m : qe.at("matches")) {
+        if (m.value("surf", std::string()) != "circle") continue;
+        const double z = m.at("centroid").at(2).get<double>();
+        if (z > best_z) { best_z = z; circ_sel = m; }
+    }
+    REQUIRE_MESSAGE(!circ_sel.is_null(), "no circular edge found: " << qe.dump());
+
+    json cv = json::array({json{{"op", "sketch_convert"}, {"sketch", fid},
+        {"refs", json::array({json{{"kind", "edge"}, {"selector", circ_sel}}})}}});
+    json cr = doc_apply_ops(doc_id, -1, cv, false);
+    json skf = feature_of(cr.at("tree"), fid);
+    REQUIRE(skf["params"]["external_refs"].size() == 1);
+    CHECK(skf["params"]["external_refs"][0].value("stale", true) == false);
+    const std::string owned_id =
+        skf["params"]["external_refs"][0]["entity_ids"][0].get<std::string>();
+
+    // DELETE the source (boss extrude + its sketch): the circular edge vanishes.
+    json del = json::array({json{{"op", "delete_feature"}, {"id", boss_fid},
+                                 {"cascade", true}}});
+    json dr = doc_apply_ops(doc_id, -1, del, false);
+    for (const auto& st : dr.at("rebuild").at("feature_status"))
+        CHECK_MESSAGE(st.value("ok", false),
+                      "rebuild after source delete failed: " << st.dump());
+
+    // Stale, last-good geometry kept (same entity id, same radius).
+    skf = feature_of(dr.at("tree"), fid);
+    const json& xr = skf["params"]["external_refs"][0];
+    CHECK_MESSAGE(xr.value("stale", false) == true,
+                  "ref should be stale after the source was deleted: " << xr.dump());
+    bool found = false;
+    for (const auto& e : skf["params"]["entities"])
+        if (e.value("id", std::string()) == owned_id) {
+            found = true;
+            CHECK(e.value("type", std::string()) == "circle");
+            CHECK(e.value("radius", 0.0) == doctest::Approx(5.0).epsilon(1e-6));
+        }
+    CHECK_MESSAGE(found, "last-good converted entity must survive a stale ref");
+}
+
+TEST_CASE("assoc: associative=false is a one-shot copy (no external_refs, no update)") {
+    const double W = 40.0, D = 30.0, H = 20.0;
+    std::string doc_id = make_box("OneShotConvert", W, D, H);
+    json qt = doc_query(doc_id, json{{"of", "face"}, {"side", "top"}});
+    json mk = json::array({json{{"op", "add_feature"}, {"feature",
+        json{{"type", "sketch"}, {"name", "Sk"},
+             {"params", {{"entities", json::array()}, {"constraints", json::array()}}},
+             {"refs", {{"plane", qt.at("matches").at(0)}}}}}}});
+    json mr = doc_apply_ops(doc_id, -1, mk, false);
+    const std::string fid = mr.at("id_map").at("$0").get<std::string>();
+
+    json qb = doc_query(doc_id, json{{"of", "face"}, {"side", "bottom"}});
+    json cv = json::array({json{{"op", "sketch_convert"}, {"sketch", fid},
+        {"refs", json::array({json{{"kind", "face"}, {"selector", qb.at("matches").at(0)}}})},
+        {"associative", false}}});
+    json cr = doc_apply_ops(doc_id, -1, cv, false);
+    json skf = feature_of(cr.at("tree"), fid);
+    const json& params = skf.at("params");
+    const bool has_refs = params.contains("external_refs") &&
+                          !params["external_refs"].empty();
+    CHECK_FALSE(has_refs);
+
+    // Widen the base; the one-shot copy must NOT move.
+    json ed = json::array({
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e1"},
+             {"params", {{"p2", json::array({60.0, 0.0})}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e2"},
+             {"params", {{"p1", json::array({60.0, 0.0})}, {"p2", json::array({60.0, D})}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e3"},
+             {"params", {{"p1", json::array({60.0, D})}}}},
+    });
+    json rr = doc_apply_ops(doc_id, -1, ed, false);
+    skf = feature_of(rr.at("tree"), fid);
+    double max_u = 0.0;
+    for (const auto& e : skf["params"]["entities"])
+        for (const char* key : {"p1", "p2"})
+            if (e.contains(key))
+                max_u = std::max(max_u, std::abs(e.at(key).at(0).get<double>()));
+    CHECK(max_u == doctest::Approx(20.0).epsilon(1e-6));
+}
+
 TEST_CASE("op: sketch_convert rejects empty refs with invalid_op") {
     std::string doc_id = make_box("ConvertOpBad", 20, 20, 10);
     json qt = doc_query(doc_id, json{{"of", "face"}, {"side", "top"}});

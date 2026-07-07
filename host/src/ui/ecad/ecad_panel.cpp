@@ -552,9 +552,32 @@ void handleCanvasEdit(AppState& st, EcadEditorState& es, const EcadCanvasIO& io)
 }
 
 // ---- left sub-panel: PCB layers / sch nets ----
-void drawLeftPanel(EcadEditorState& es) {
+// Restyled to match the Feature Manager's panel chrome (host/src/ui/feature_tree.cpp
+// drawFeatureManagerTopStrip): a centered glass-backed icon row for the document history controls,
+// sitting on the panel that owns the undo/redo-able state, instead of the canvas toolbar above.
+void drawLeftPanel(AppState& st, EcadEditorState& es) {
     const ui::Palette& pal = ui::palette;
     EcadMirror& m = es.mirror;
+    const float sc = ui::uiScale;
+
+    // History controls (moved off the canvas toolbar — item 3): same glass-row treatment the
+    // Feature Manager's top strip uses for its Undo/Redo buttons.
+    {
+        const float bw = 24.0f * sc, gap = 4.0f * sc;
+        const float toolW = 2.0f * bw + gap;
+        ImVec2 rowMin = ImGui::GetCursorScreenPos();
+        const float availW = ImGui::GetContentRegionAvail().x;
+        ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin,
+                               ImVec2(rowMin.x + availW, rowMin.y + bw), 3.5f, false, false, 0.24f);
+        float bx = rowMin.x + std::max(0.0f, (availW - toolW) * 0.5f);
+        ImGui::SetCursorScreenPos(ImVec2(bx, rowMin.y));
+        if (ImGui::SmallButton("Undo")) st.ecadUndoGo = true;
+        ImGui::SameLine(0, gap);
+        if (ImGui::SmallButton("Redo")) st.ecadRedoGo = true;
+        ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMin.y + bw));
+        ImGui::Dummy(ImVec2(availW, 0));
+        ImGui::Spacing();
+    }
 
     if (m.isPcb()) {
         ImGui::TextColored(v4(pal.textDim), "Layers");
@@ -959,7 +982,9 @@ void drawEcadEditor(AppState& st) {
         // Launchpad: describe a circuit -> the AI designs a verified schematic. (Blank docs come
         // from the PCB ribbon's New Schematic / New PCB.) The button hands the request to the app
         // loop via st.ecadAiRequest/ecadAiGo, which runs ecad_design + loads the result here.
-        ImGui::Dummy(ImVec2(0, 18 * sc));
+        // Reserve the floating doc-tab strip's height first (see the toolbar's identical Dummy below)
+        // so the launchpad copy doesn't start under the tab pills.
+        ImGui::Dummy(ImVec2(0, ui::docTabStripHeight(st) + 18 * sc));
         ImGui::Indent(24 * sc);
         ImGui::TextColored(v4(pal.accent), "AI-ECAD  -  electronics design");
         ImGui::Spacing();
@@ -995,16 +1020,22 @@ void drawEcadEditor(AppState& st) {
         return;
     }
 
+    // The document tab strip (ui::drawDocTabs) is a FLOATING overlay pinned flush under the ribbon
+    // (see doc_tabs.cpp "pinned floating overlay window" note) — it reserves no layout space in this
+    // window, so any content drawn at the window's own top would sit at the exact same screen row and
+    // get visually/input-occluded by the tab pills. The Model viewport dodges this because its 3D
+    // image is a full-bleed background the overlay simply floats on top of; the ECAD toolbar is real
+    // widgets, so it must explicitly reserve the strip's height first.
+    ImGui::Dummy(ImVec2(0, ui::docTabStripHeight(st) + 2.0f * sc));
+
     // ---- header toolbar (item 2 layout rework) ----
     // Convention mirrors the Modeling / Drawing tab strips: a single compact, LEFT-aligned control
     // row (view/history controls + the contextual confirm action), with the File Display centered on
     // the same line, then a status strip below. View controls that were right-anchored now sit LEFT.
+    // Undo/Redo moved into the left Layers/Nets panel (drawLeftPanel) so they sit next to the panel
+    // they actually affect and match the Feature Manager convention of history controls living on the
+    // tree/panel chrome rather than the canvas toolbar.
     ImGui::AlignTextToFramePadding();
-    // LEFT: history + view controls (worker ecad_undo / ecad_redo via one-shot flags).
-    if (ImGui::SmallButton("Undo")) st.ecadUndoGo = true;
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Redo")) st.ecadRedoGo = true;
-    ImGui::SameLine(0, 12 * sc);
     if (ImGui::SmallButton("Zoom Fit")) es.canvas.requestFit();
     ImGui::SameLine(0, 12 * sc);
     ImGui::Checkbox(es.mirror.isPcb() ? "Layers" : "Nets", &es.showLeft);
@@ -1140,7 +1171,7 @@ void drawEcadEditor(AppState& st) {
     // Left sub-panel.
     if (es.showLeft) {
         ImGui::BeginChild("##ecadLeft", ImVec2(es.leftW * sc, mainH), ImGuiChildFlags_Border);
-        drawLeftPanel(es);
+        drawLeftPanel(st, es);
         ImGui::EndChild();
         ImGui::SameLine();
     }

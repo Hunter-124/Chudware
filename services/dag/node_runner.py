@@ -244,7 +244,14 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
         max_tool_calls=max_tools,
         max_tokens=(int(profile.generation_headroom) if profile else None),
         ledger=ledger, actor=node_name,
-        mission_dispatch=mission_dispatch, tools_text=tools_text)
+        mission_dispatch=mission_dispatch, tools_text=tools_text,
+        # M20: thread the live event sink + span context so agent_turn emits
+        # `agent.tool_call` (target + latency) to BOTH the GUI stream and the
+        # per-run events.jsonl. run()/context_pack.assemble() seed these keys;
+        # absent → emission is a no-op (back-compat with standalone DAG runs).
+        on_event=context_pack.get("_event_sink"),
+        run_id=context_pack.get("run_id"),
+        node_id=context_pack.get("node_id"))
 
 
 def _tier_profile():
@@ -349,6 +356,17 @@ def run(
 
     # Resolve agent callable.
     _agent_fn = agent_fn or _default_agent_fn
+
+    # M20: seed the agent-execution event sink + span context into context_pack so
+    # the agent turn can emit `agent.tool_call` (etc.) through the SAME §11 `emit`
+    # callback the DAG lifecycle events use. run_id may already be on the pack
+    # (mission path); node_id/node_name come from the node here. Best-effort — a
+    # None emit leaves the keys harmless (agent_turn no-ops emission).
+    if emit is not None:
+        context_pack = dict(context_pack)
+        context_pack.setdefault("_event_sink", emit)
+        context_pack.setdefault("node_id", node_id)
+        context_pack.setdefault("node_name", node_name)
 
     # Emit node.started (§11).
     _emit(emit, "dag.node.started", {

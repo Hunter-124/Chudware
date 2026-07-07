@@ -1,16 +1,29 @@
-# Contract: Agent Events — `aicad.agent_events/1`
+# Contract: Agent Events — `aicad.agent_events/2`
 
-> **Frozen by T-F17 (2026-07-03).** Append-only; schema-string bump required for any
-> field change or new enum value. This is the single event vocabulary shared by two
-> producers (the DAG executor and the built-in agent loop) and two sinks (the
-> mission-control UI live stream and the telemetry journal). Never duplicate this
-> vocabulary in a parallel file.
+> **Frozen `/1` by T-F17 (2026-07-03). Bumped to `/2` by M20 (2026-07-07).**
+> Append-only; schema-string bump required for any field change or new enum value.
+> This is the single event vocabulary shared by two producers (the DAG executor and
+> the built-in agent loop) and two sinks (the mission-control UI live stream and the
+> telemetry journal). Never duplicate this vocabulary in a parallel file.
+>
+> **`/2` is a strict superset of `/1`** — every `/1` record is a valid `/2` record.
+> `/2` adds four net-new agent-level kinds (`agent.context_injected`, `agent.spawn`,
+> `agent.advisor`, and the forward-compat `agent.thought.delta`), a human-readable
+> **`target`** field on `agent.tool_call`, and **per-event parent linkage**
+> (`id` / `parent_id` span ids + `actor`) on all agent-level events. Because the
+> conformance rules (§5) already require consumers to tolerate unknown kinds AND
+> unknown fields, a `/1` consumer reads a `/2` stream without changes (it simply
+> ignores the new kinds/fields). Producers stamp the schema string only where a
+> schema field is written; the envelope itself is unversioned per-record.
 >
 > **Binding relationships:**
 > - DAG-side events (`dag.*`) bind to the 8-event table in `contracts/dag_schema.md §11`.
 >   Field names here MUST match exactly.
 > - Thought / tool_call / artifact kinds reuse the T-H1 telemetry vocabulary
 >   (`contracts/telemetry.md`) for the overlapping fields so one pipeline has two sinks.
+>   The `/2` additions (`target`, `id`/`parent_id`, `actor`) are **superset fields**:
+>   they are new to this contract and are NOT part of the bound telemetry vocabulary,
+>   so the telemetry sink ignores them (per its own unknown-field rule).
 > - Question / answer events bind to `contracts/interaction.md §7` (`ask_question` /
 >   `ask_answer` kinds) — no new fields, referenced here for discoverability only.
 
@@ -50,6 +63,25 @@ Every event is a bare JSON object (no wrapper envelope). All events carry:
 
 Unknown fields MUST be tolerated (skip). Unknown `kind` values MUST be tolerated (skip).
 
+### 2.1 Parent linkage (`/2` — agent-level events only)
+
+Every **agent-level** event (the `agent.*` kinds in §3.2 and §3.3-new) additionally
+carries the fields below so a consumer can reconstruct the **execution DAG tree**
+(the Agent Workflow view). DAG-lifecycle events (`dag.*`) do NOT carry these — they
+already form a tree via `node_id` and bind to `dag_schema.md §11` unchanged.
+
+| Field       | Type   | Required | Description |
+|-------------|--------|----------|-------------|
+| `id`        | string | yes      | **Span id** — unique per event, the tree key. A single `node_id` emits MANY events, so `node_id` is NOT the tree key; `id` is. Format: short opaque token (hex). |
+| `parent_id` | string | no       | The `id` of the span that *caused* this one (the spawner / enclosing turn / trunk). Empty/absent for a run-root span. The GUI builds the tree by joining `parent_id → id`. |
+| `actor`     | string | no       | Which agent/subagent/role emitted the event (e.g. `"orchestrator"`, `"cad_designer"`, a node name). Lets the GUI colour/group by actor. |
+| `seq`       | int    | no       | Optional monotonic-per-run ordering hint. **Best-effort only** — producers that mint a fresh journal per emit (e.g. `loop.py`) cannot guarantee monotonicity, so consumers MUST fall back to `ts` + the `parent_id`→`id` tree and treat `seq` as advisory. May be absent. |
+
+**Rule:** `id` is REQUIRED on every agent-level event; `parent_id`/`actor`/`seq` are
+optional (a producer that has no parent in scope emits a root span with no `parent_id`).
+Consumers tolerate a missing `parent_id` (treat as root) and a missing `id` on a legacy
+`/1` record (fall back to `node_id`+`ts` grouping, no tree).
+
 ---
 
 ## 3. Event kinds
@@ -74,15 +106,36 @@ summary for the panel's final-state rendering (not the full output dict).
 
 These are emitted by node runners that call an agent loop. They share fields with the
 T-H1 `ai_artifact` / `ai_artifact_action` event kinds so a single telemetry sink can
-consume both vocabularies.
+consume both vocabularies. **All carry the §2.1 parent-linkage fields (`id`,
+`parent_id`, `actor`).**
 
 | kind | Fields | When |
 |------|--------|------|
-| `agent.thought` | `node_id`, `text` (≤500 chars; truncated with `…` if longer), `model` | Model produced a reasoning/thinking block |
-| `agent.tool_call` | `node_id`, `tool_name`, `args_digest` (SHA-256 hex of JSON args, first 16 chars), `result_digest` (SHA-256 hex of result text, first 16 chars), `latency_ms` | Tool call completed |
+| `agent.thought` | `node_id`, `text` (≤500 chars; truncated with `…` if longer), `model` | Model produced a **completed** reasoning/thinking block (summary-on-arrival) |
+| `agent.thought.delta` *(`/2`, forward-compat)* | `node_id`, `text` (token delta), `model` | A single streamed token/chunk of an in-progress thought. **Producer-gated:** only emitted when the provider seam exposes token streaming. The current `Provider.complete`/`complete_ex` seam returns whole strings (non-streaming), so NO producer emits this today — it is reserved so the GUI can render a live collapsible thought box once a streaming provider lands, without a further schema bump. Consumers coalesce deltas sharing a `parent_id` into one growing block, finalised by the matching `agent.thought`. |
+| `agent.tool_call` | `node_id`, `tool_name`, **`target`** (`/2`; human-readable ≤120 chars — "what it acts on", e.g. `"top face of Part1"`, `"sketch S3"`; NOT a hash; best-effort derived from the call args, `""` when nothing legible), `args_digest` (SHA-256 hex of JSON args, first 16 chars), `result_digest` (SHA-256 hex of result text, first 16 chars), `ok` (bool), `latency_ms` | Tool call completed |
 | `agent.artifact` | `node_id`, `artifact_id`, `kind`, `path`, `summary` (≤80 chars) | Agent produced a deliverable |
 | `agent.question` | `node_id`, `batch_id`, `prompt` | Agent raised a blocking question (mirrors `ask_question`) |
 | `agent.answer` | `node_id`, `batch_id`, `source` (`"user"` \| `"default"`) | Question answered |
+
+### 3.2a Agent execution-DAG events (`/2` — net-new)
+
+These carry the §2.1 parent-linkage fields and feed the **Agent Workflow DAG** (M9) +
+the transparency chat (M12). They are emitted by the agent loop / delegation / advisor
+paths, NOT the DAG executor.
+
+| kind | Fields | When |
+|------|--------|------|
+| `agent.context_injected` | `node_id`, `source` (`"ledger"` \| `"advisory"` \| `"previous_output"` \| `"memory"` \| `"role"` \| `"plan"` \| `"other"`), `label` (human-readable ≤80 chars — what was injected, e.g. `"prior render + build plan"`), `token_est` (int, best-effort; may be 0/absent) | Context/memory/system material was assembled into a turn's prompt |
+| `agent.spawn` | `node_id`, `subagent_id` (the spawned node's id), `role`, `spawn_kind` (`"worker"` \| `"ponder"`), `brief` (≤120 chars), `budget_tokens` (int) | The orchestrator delegated to a subagent/branch. `parent_id` links to the spawner span; `subagent_id` is the child's own execution root. |
+| `agent.advisor` | `node_id`, `advisor_kind` (`"advise"` \| `"design_review"` \| `"council"` \| `"ladder_council"`), `verdict_summary` (≤120 chars) | An advisor / design-review / build-strategy-council path ran |
+
+> **Reserved envelope key:** `kind` is the top-level event discriminator (§2), so no
+> `/2` payload sub-field is named `kind` — hence `spawn_kind` / `advisor_kind` (a payload
+> `kind` would clobber the discriminator when the journal spreads the payload into the
+> record). New producers MUST NOT emit a payload field literally named `kind`. (The
+> frozen `/1` `agent.artifact` still documents a `kind` sub-field; it has no live
+> journal producer and is left unchanged — do not add one without addressing this.)
 
 ### 3.3 Steering events (mission-control → executor)
 

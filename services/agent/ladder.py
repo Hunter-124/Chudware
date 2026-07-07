@@ -416,7 +416,25 @@ def run_ladder(
             build_pathway=artifacts["build_pathway"],
         )
         if on_event:
+            # Legacy event (kept for existing consumers).
             on_event("ladder_council", {"kind": "build_strategy"})
+            # M20: also emit the contract /2 `agent.advisor` vocabulary event so the
+            # Agent Workflow DAG + transparency chat see the council call. Reconciles
+            # the off-vocabulary `ladder_council` onto the frozen /2 kind.
+            try:
+                from services.agent import agent_events as _ae  # noqa: PLC0415
+                _verdict = ""
+                if isinstance(council_result, dict):
+                    _verdict = str(council_result.get("verdict")
+                                   or council_result.get("summary") or "")
+                elif isinstance(council_result, str):
+                    _verdict = council_result
+                _k, _p = _ae.advisor_event(
+                    doc_id or "ladder", "ladder_council", _verdict,
+                    actor="design_thinker")
+                _ae.emit_event(_k, _p, live=on_event)
+            except Exception:  # noqa: BLE001 — advisor event never blocks the ladder
+                pass
 
     # -- compile rung D losslessly into aicad.buildgraph/1 (T-W15) ------------
     graph = lc.compile_pathway(artifacts["build_pathway"], mission="design_ladder",

@@ -1163,8 +1163,47 @@ def run_turn(session: Session, request: str, provider: Provider,
             parts.append(text_part("(Above: the current design you are modifying.)"))
         session.messages.append(user(parts))
 
+    # M20: record what context was injected into this turn's prompt (plan on first
+    # turn, prior render on refine turns). Emitted just below once the span exists.
+    _ctx_injections: list[tuple[str, str]] = []
+    if first_turn and session.plan:
+        _ctx_injections.append(("plan", "build plan (parts/dimensions/features)"))
+    if (not first_turn) and session.contact_sheet:
+        _ctx_injections.append(("previous_output", "prior render of the current design"))
+
     session.turns += 1
     turn = session.turns
+
+    # M20: per-turn root span for the agent-execution event stream. Every
+    # `agent.thought` / `agent.context_injected` emitted below links to this span
+    # as parent, so the GUI can build the execution DAG tree for the chat turn.
+    # The legacy single-part loop is session-scoped (no mission run_id); events
+    # stream LIVE via on_event (→ GUI drain). A run_id, when the caller threads one
+    # onto the session, also persists them to events.jsonl for replay.
+    _ae = None
+    _turn_span = None
+    _run_journal = None
+    if on_event is not None:
+        try:
+            from services.agent import agent_events as _ae  # noqa: PLC0415
+            _turn_span = _ae.new_span_id()
+            _rid = getattr(session, "run_id", None)
+            if _rid:
+                from services.dag.event_journal import EventJournal  # noqa: PLC0415
+                _run_journal = EventJournal(_rid)
+        except Exception:  # noqa: BLE001
+            _ae = None
+
+    # M20: emit the context-injection events now that the turn span exists.
+    if _ae is not None and _turn_span is not None:
+        for _src, _label in _ctx_injections:
+            try:
+                _k, _p = _ae.context_injected_event(
+                    session.name, _src, _label,
+                    parent_id=_turn_span, actor=session.name)
+                _ae.emit_event(_k, _p, live=on_event, journal=_run_journal)
+            except Exception:  # noqa: BLE001
+                pass
 
     log: list[IterationLog] = []
     last_code: str | None = session.last_code
@@ -1187,6 +1226,20 @@ def run_turn(session: Session, request: str, provider: Provider,
               text=f"Iteration {i + 1}: generating build123d...")
         reply, thinking = _generate(session, provider, on_event, i, turn)
         session.messages.append(assistant([text_part(reply)]))
+
+        # M20: emit the model's COMPLETED thinking block (summary-on-arrival). The
+        # provider seam (Provider.complete/complete_ex) returns whole strings, not a
+        # token stream, so we emit one `agent.thought` per block. `agent.thought.delta`
+        # (contract /2) is reserved for a future streaming seam — no producer yet.
+        if _ae is not None and _turn_span is not None and thinking:
+            try:
+                _k, _p = _ae.thought_event(
+                    session.name, thinking,
+                    model=getattr(provider, "name", None),
+                    parent_id=_turn_span, actor=session.name)
+                _ae.emit_event(_k, _p, live=on_event, journal=_run_journal)
+            except Exception:  # noqa: BLE001 — event emission never breaks the loop
+                pass
 
         code = _extract_code(reply)
         decision = _extract_decision(reply)

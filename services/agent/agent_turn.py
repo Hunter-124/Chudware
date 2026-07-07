@@ -74,7 +74,11 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
              actor: str | None = None,
              tool_dispatch: Callable[[str, dict], Any] | None = None,
              mission_dispatch: Any | None = None,
-             tools_text: str | None = None) -> TurnResult:
+             tools_text: str | None = None,
+             on_event: Callable[..., None] | None = None,
+             run_id: str | None = None,
+             node_id: str | None = None,
+             parent_id: str | None = None) -> TurnResult:
     """Run a bounded tool-executing turn and return a :class:`TurnResult`.
 
     *tool_dispatch* is injectable ``(tool_name, args) -> result``; the default
@@ -110,6 +114,26 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
         dispatch = _dispatch_tool
     allow = set(allowed_tools or [])
     actor = actor or name
+
+    # M20: agent-execution event stream. Emit `agent.tool_call` (with human `target`
+    # + latency) with a per-turn root span so the GUI can build the execution DAG
+    # tree. The DAG path threads an *already journal-wrapped* `on_event` (the executor
+    # does `EventJournal(run_id).wrap(emit)` in T-F17), so streaming through it also
+    # persists to events.jsonl — we must NOT double-write with a second journal here.
+    # A standalone journal is created ONLY when a run_id is given WITHOUT a live sink
+    # (a headless caller that wants replay but no GUI). Best-effort: never blocks.
+    _ev_journal = None
+    if run_id and on_event is None:
+        try:
+            from services.dag.event_journal import EventJournal  # noqa: PLC0415
+            _ev_journal = EventJournal(run_id)
+        except Exception:  # noqa: BLE001
+            _ev_journal = None
+    _ev_node = node_id or name
+    _turn_span = None
+    if on_event is not None or _ev_journal is not None:
+        from services.agent import agent_events as _ae  # noqa: PLC0415
+        _turn_span = _ae.new_span_id()
 
     system = (system_prompt or "") + "\n\n" + _SYSTEM_BASE
     if tools_text:
@@ -169,16 +193,29 @@ def run_turn(request: str, provider: Any, *, name: str = "dag_node",
             break
 
         tool_calls_made += 1
+        import time as _time  # noqa: PLC0415
+        _t0 = _time.monotonic()
         try:
             result = dispatch(tool, args)
             ok = True
         except Exception as exc:  # noqa: BLE001 — dispatch error fed back to model
             result = {"ok": False, "error": str(exc)}
             ok = False
+        _latency_ms = (_time.monotonic() - _t0) * 1000.0
         call_rec = {"tool": tool, "args": args, "ok": ok,
                     "result": _truncate(result)}
         calls.append(call_rec)
         _log(ledger, actor, {"event": "tool_call", **call_rec})
+        # M20: stream the tool call to the live GUI + persist to events.jsonl.
+        if _turn_span is not None:
+            try:
+                from services.agent import agent_events as _ae  # noqa: PLC0415
+                _kind, _payload = _ae.tool_call_event(
+                    _ev_node, tool, args, result, ok=ok, latency_ms=_latency_ms,
+                    parent_id=_turn_span, actor=actor)
+                _ae.emit_event(_kind, _payload, live=on_event, journal=_ev_journal)
+            except Exception:  # noqa: BLE001 — event emission never blocks the turn
+                pass
         messages.append({"role": "user", "content": _parts(
             f"Result of {tool}:\n{_as_text(result)}")})
 

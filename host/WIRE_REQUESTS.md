@@ -254,3 +254,35 @@ Format:
   EM agent: when your RPC contract is final, reply under this bullet with the study-definition /
   run / results RPC names so sim_manager can wire the setup forms; until then the tab is
   honest-disabled and no fake UI ships.
+
+## M20 backend agent → GUI drain: accept `aicad.agent_events/2` fields (2026-07-07)
+- [ ] (Phase 2/3 GUI agent) `host/src/core/app_state.h` + `host/src/core/jobs.cpp` + the
+  `app.cpp` `JobState.events` drain — the backend now emits the net-new `/2` agent-execution
+  event kinds live through the SAME streaming `onEvent`→`JobState.events` transport (no new
+  RPC). Extend `AgentEvent` + the jobs.cpp wrapper to carry these fields so the Agent Workflow
+  DAG (M9) + transparency chat (M12/M13/M14) can render them. Contract: `contracts/agent_events.md`
+  (`/2`, §2.1 + §3.2/§3.2a). New/extended kinds + fields to surface:
+  - **`agent.tool_call`**: `tool_name`, **`target`** (plain-language "what it acts on", ≤120 —
+    M14), `ok`, `latency_ms`, `args_digest`/`result_digest`.
+  - **`agent.thought`**: `text` (≤500, COMPLETED block — summary-on-arrival), `model`. NOTE:
+    `agent.thought.delta` (token stream, M13 live box) is defined in `/2` but **producer-gated** —
+    the current provider seam (`Provider.complete`/`complete_ex`) returns whole strings, so NO
+    backend emits deltas yet; render the completed block on arrival until a streaming provider lands.
+  - **`agent.context_injected`** (M12): `source` (ledger|advisory|previous_output|memory|role|plan|
+    other), `label` (≤80), `token_est`.
+  - **`agent.spawn`** (M9/M11): `subagent_id`, `role`, `spawn_kind` (worker|ponder), `brief`,
+    `budget_tokens`.
+  - **`agent.advisor`** (M9): `advisor_kind` (advise|design_review|council|ladder_council),
+    `verdict_summary`.
+  - **Parent linkage (§2.1, ALL agent.* kinds)** — the load-bearing DAG-tree keys:
+    **`id`** (per-event span id — THE tree key; `node_id` is NOT unique per event), **`parent_id`**
+    (join `parent_id`→`id` to build the tree; absent = root span), **`actor`** (emitting agent/role),
+    **`seq`** (advisory only — fall back to `ts`+tree). `dag.*` lifecycle events are unchanged (no `id`).
+  - **Reserved key:** the payload NEVER contains a sub-field named `kind` (would clobber the envelope
+    discriminator) — spawn/advisor use `spawn_kind`/`advisor_kind`. The GUI parser can rely on the
+    top-level `kind` always being the true event kind.
+  - **Persistence/replay:** all of these also land in `~/.local/share/AI-CAD/cache/runs/<run_id>/events.jsonl`
+    (existing `EventJournal`), so the replay/rescan path (à la `ActivityPanel`/mission_control) reads them
+    with no change beyond tolerating the new kinds/fields (already required by §5).
+  Backend commit + emit points: services/agent/agent_events.py (builders), agent_turn.py (tool_call),
+  loop.py (thought+context), delegation.py (spawn), ladder.py (advisor), node_runner.py (sink threading).

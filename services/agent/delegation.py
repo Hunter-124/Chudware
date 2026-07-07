@@ -296,6 +296,7 @@ class DelegationTree:
         overseer: Any | None = None,
         soft_depth_limit: int = DEFAULT_SOFT_DEPTH_LIMIT,
         max_agents: int = DEFAULT_MAX_AGENTS,
+        on_event: Any | None = None,
     ) -> None:
         self._run_id = run_id or f"r_{uuid.uuid4().hex[:8]}"
         self._ledger = ledger
@@ -303,6 +304,17 @@ class DelegationTree:
         self._overseer = overseer
         self._nodes: dict[str, DelegationNode] = {}
         self._pending_events: list[dict] = []
+        # M20: optional live event sink (GUI stream). When set, request_delegation
+        # emits an `agent.spawn` (contract /2) with parent-linkage AND persists it to
+        # the run's events.jsonl. Best-effort — a None sink is a no-op.
+        self._on_event = on_event
+        self._ev_journal = None
+        if on_event is not None:
+            try:
+                from services.dag.event_journal import EventJournal  # noqa: PLC0415
+                self._ev_journal = EventJournal(self._run_id)
+            except Exception:  # noqa: BLE001
+                self._ev_journal = None
 
         # Tree-wide budget meter (T-DP9) — always current, serialised in every flush.
         self._meter = BudgetMeter(
@@ -465,6 +477,20 @@ class DelegationTree:
         )
         self._nodes[node_id] = node
         self._emit_transition(node, "pending", "delegation requested")
+
+        # M20: stream an `agent.spawn` (contract /2 §3.2a) to the GUI + events.jsonl.
+        # parent_id links to the SPAWNER span (the parent delegation node's id);
+        # subagent_id is the new child node's own execution root. Best-effort.
+        if self._on_event is not None or self._ev_journal is not None:
+            try:
+                from services.agent import agent_events as _ae  # noqa: PLC0415
+                _k, _p = _ae.spawn_event(
+                    parent_id, node_id, role, kind=kind, brief=brief,
+                    budget_tokens=budget_tokens, span_id=node_id,
+                    parent_id=parent_id, actor=parent.role)
+                _ae.emit_event(_k, _p, live=self._on_event, journal=self._ev_journal)
+            except Exception:  # noqa: BLE001 — spawn event never blocks delegation
+                pass
 
         # Update meter agent count BEFORE the agent-limit advisory so the emitted
         # event reflects the post-spawn count.

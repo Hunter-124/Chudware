@@ -65,6 +65,15 @@ bool takeOverlayColumnReset(int slot);
 void publishOverlayColumnEdge(int slot, float edgeX);
 float overlayColumnEdge(int slot);
 
+// Publish/read the actual rendered height (screen pixels) of a pinned overlay column this frame.
+// drawLeftPane calls publishOverlayColumnHeight(0, heightPx) with the true column height each
+// frame it draws; viewport_panel.cpp reads overlayColumnHeight(0) to decide the triad anchor:
+// when the column is short/collapsed and does not reach down to the triad row, the triad anchors
+// at the far-left of the viewport; when the column is tall enough to reach it, it anchors to the
+// right of the column's edge (the existing hudLeft behaviour). Returns -1 when not published.
+void publishOverlayColumnHeight(int slot, float heightPx);
+float overlayColumnHeight(int slot);
+
 // ---- doc-tab band bottom edge --------------------------------------------------------------------
 // The doc-tab strip draws inside the central document window, so its glass band actually ends a few
 // px BELOW band.minY + docTabStripHeight (the central window's content origin sits under the node

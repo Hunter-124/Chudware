@@ -3285,7 +3285,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             float hudLeft = cr0.x;
             {
                 const float e = ui::overlayColumnEdge(0);
-                if (e > cr0.x && e < cr1.x - 140.0f * ts) hudLeft = e;
+                if (e > cr0.x && e < cr1.x - 140.0f * ts) {
+                    // Only push the triad right of the FM column when the column is tall enough to
+                    // actually reach down to the triad row. A short or collapsed FM column doesn't
+                    // occlude the triad so we leave it at the far-left anchor (cr0.x).
+                    const float colH  = ui::overlayColumnHeight(0);
+                    const float triadRowY = (cr1.y - cr0.y) - 52.0f * ts;  // triad cy relative to viewport top
+                    const bool colReachesTriad = (colH > 0.0f) && (colH >= triadRowY);
+                    if (colReachesTriad) hudLeft = e;
+                }
             }
             float cx = hudLeft + 52.0f * ts, cy = cr1.y - 52.0f * ts;
             float L = 30.0f * ts;

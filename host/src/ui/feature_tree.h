@@ -9,9 +9,50 @@
 #include <functional>
 #include <string>
 
+#include "imgui.h"   // ImVec2 (FmRowRect) — shared FM row-styling API below
+
 struct AppState;
 
 namespace ui {
+
+// ---- Shared FeatureManager row styling (the panel-wide ratified look) ----
+// Exported so sibling left-pane tabs (file_explorer.cpp Explorer) draw rows/icons/section rules
+// PIXEL-IDENTICAL to the FeatureManager reference: frosted row pill + soft-blue selection card +
+// accent-outline hover, 16px atlas icons vertically centered in the leaf-arrow slot, and the
+// centered hairline section dividers ("Reference"/"Features" style).
+//
+// Usage per row: fmRowPill(selected) BEFORE the row's widget (pushes FramePadding + transparent
+// Header colors), then the widget (TreeNodeEx/Selectable/InputText), then fmRowPillEnd(rect,
+// selected) — pairs MUST balance. Call fmRowStripeReset() once at the top of a tab body so the
+// alternating stripe phase restarts each frame.
+struct FmRowRect { ImVec2 mn, mx; };
+FmRowRect fmRowPill(bool selected = false);
+void      fmRowPillEnd(const FmRowRect& r, bool selected = false);
+void      fmRowStripeReset();
+
+// 16px atlas icon drawn as its own item (use before a TreeNodeEx that HAS a chevron; follow with
+// SameLine(0, 4*uiScale)). Falls back to `fallback` text when the atlas lacks the glyph.
+void fmTreeIcon(const char* name, const char* fallback, float size = 16.0f, float alpha = 1.0f);
+
+// 16px atlas icon painted INSIDE the (empty) leaf-arrow slot of the TreeNodeEx just submitted;
+// pass the cursor pos captured immediately BEFORE the node. Vertically centered in the row.
+void fmTreeIconInArrowSlot(ImVec2 rowPos, const char* name, const char* fallback,
+                           float alpha = 1.0f);
+
+// Centered treeSection-colored label flanked by two hairlines (the "Reference"/"Features" rule).
+void fmSectionDivider(const char* label);
+
+// 24px square glass icon button (FeatureManager top-toolbar style: resting 0.22 pill, 0.38 on
+// hover, 18px SDF-crisp glyph). Returns true on click; disabled renders dimmed and never fires.
+bool fmToolbarIconBtn(const char* id, const char* iconName, const char* tooltip, bool enabled);
+
+// Pane-header chip ("Feature Manager"/"Explorer"/... title above the tab body): icon + title in
+// ONE glass pill sized from its content — icon fully inside with even padding, the icon+text
+// group centered on paneCenterX (screen-space; clamped into the content region). titleIcon
+// "history" renders a purpose-built line-art feature-tree glyph (root node + two branch
+// children, row-icon stroke weight); any other name draws that SDF/atlas icon. Advances the
+// layout cursor past the chip. Intended call site: layout.cpp drawLeftPane's tab-body header.
+void fmPaneHeaderChip(AppState& st, const char* title, const char* titleIcon, float paneCenterX);
 
 // The tree's inner content WITHOUT its own Begin/End. The tabbed left pane (ui::drawLeftPane) calls
 // this inside its own "LeftPane" container child so the FeatureManager and PropertyManager tabs share

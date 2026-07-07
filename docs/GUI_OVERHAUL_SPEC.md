@@ -39,12 +39,12 @@ Status legend: `[ ]` pending · `[~]` in progress (fleet wf_b556d138-1bf) · `[x
 - [~] Regenerate the out-of-place icons: undo/redo buttons + feature-manager icon.
 - [~] Feature manager: vertically center rows; proper padding for text and icons (icons too
   close to the edge) — header, filter, section labels, tree rows, bottom buttons, live.step+.
-- [~] Axis triad: hug far LEFT under the feature tree when the tree is short; move back toward
+- [x] Axis triad: hug far LEFT under the feature tree when the tree is short; move back toward
   the middle when the tree is long.
 - [~] File-name preview / doc tab strip: vertically center its content.
 
 ## 5. Simulations (Hunter 2026-07-06 late — FULL implementation required)
-- [~] Kinematic/motion studies end-to-end: motor definition → play/pause/scrub timeline →
+- [x] Kinematic/motion studies end-to-end: motor definition → play/pause/scrub timeline →
   viewport bodies animate → trace plots (angle/velocity vs time).
 - [ ] **All simulation kinds live in the ONE Simulate tab**: structural FEA (static, modal,
   thermal, buckling, fatigue, frequency response, contact), CFD (fast + accurate), motion,
@@ -64,8 +64,8 @@ Status legend: `[ ]` pending · `[~]` in progress (fleet wf_b556d138-1bf) · `[x
 ## 6. Workspace bodies
 - [~] Model: today's modeling environment; entering a sketch auto-switches to Drawing.
 - [~] Drawing: the sketch environment (sketch editing) + 2D drawing sheets.
-- [~] Electronics: ECAD editor as the full central body.
-- [~] Manufacture: viewport + CAM manager; cross-doc auto-update (part change → CAM stale/regen).
+- [x] Electronics: ECAD editor as the full central body.
+- [x] Manufacture: viewport + CAM manager; cross-doc auto-update (part change → CAM stale/regen).
 - [~] PLM: vault status, checkpoints, history, release/lock.
 - [~] Parts Library: scraped catalog browse/search + vendor login browsers (McMaster-Carr
   first) + spec/doc scraping + download queue.

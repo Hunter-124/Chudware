@@ -161,9 +161,18 @@ static void fmRowHoverPaint(ImVec2 rowMin, ImVec2 rowMax, bool hovered, bool sel
 // returned rect feeds fmRowPillEnd(), which pops those styles and draws the shared hover on
 // the row's just-submitted item. Pairs must balance (one End per Pill) or the style stack
 // asserts; for folders, call End right after the header node and BEFORE its children.
-struct FmRowRect { ImVec2 mn, mx; };
+// FmRowRect lives in feature_tree.h (shared with the Explorer tab); fmRowPill/fmRowPillEnd are
+// exported (non-static) for the same reason — see the header's "Shared FeatureManager row
+// styling" block.
 static int s_fmStripeIdx = 0;
-static FmRowRect fmRowPill(bool selected = false) {
+void fmRowStripeReset() {
+    s_fmStripeIdx = 0;
+    // Also refresh the FM palette: when a sibling tab (Explorer) is the active pane body,
+    // drawFeatureTreeBody's own refresh never runs this frame, and the dividers/hover paint
+    // below read g_fmPal — without this they'd render with a stale (or first-frame zero) palette.
+    fmPaletteRefresh(ui::viewportBackdrop().valid() ? &fmSurf() : nullptr);
+}
+FmRowRect fmRowPill(bool selected) {
     // polish(G2): 6dp horizontal gives icons breathing room from the left edge; 4dp vertical gives
     // text more vertical breathing without making rows too tall.
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
@@ -179,7 +188,7 @@ static FmRowRect fmRowPill(bool selected = false) {
                            (s_fmStripeIdx++ % 2) == 0, selected, wash);
     return {rowMin, rowMax};
 }
-static void fmRowPillEnd(const FmRowRect& r, bool selected = false) {
+void fmRowPillEnd(const FmRowRect& r, bool selected) {
     bool hovered = ImGui::IsItemHovered();
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar(1);
@@ -406,6 +415,17 @@ static void treeSectionDivider(const char* label) {
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y));
     ImGui::Dummy(ImVec2(w, lineH + 4.0f * S));
 }
+
+// ---- exported thin wrappers (feature_tree.h "Shared FeatureManager row styling") ----
+// The Explorer tab reuses the FM look through these so both left-pane tabs stay pixel-identical;
+// the local static helpers keep their short names for the many call sites in this file.
+void fmTreeIcon(const char* name, const char* fallback, float size, float alpha) {
+    treeIcon(name, fallback, size, alpha);
+}
+void fmTreeIconInArrowSlot(ImVec2 rowPos, const char* name, const char* fallback, float alpha) {
+    treeIconInArrowSlot(rowPos, name, fallback, alpha);
+}
+void fmSectionDivider(const char* label) { treeSectionDivider(label); }
 
 // ---- shared op applier (DocMirror ops -> rebuild -> reload mesh) ----
 // Centralizes the apply_ops -> loadDocMesh pattern used by suppress/delete/reorder/rename/folder.
@@ -1537,6 +1557,74 @@ static bool toolbarIconBtn(const char* id, const char* iconName, const char* too
     ImGui::PopID();
     return clicked;
 }
+// Exported wrapper (feature_tree.h) — the Explorer tab's toolbar reuses this exact button.
+bool fmToolbarIconBtn(const char* id, const char* iconName, const char* tooltip, bool enabled) {
+    return toolbarIconBtn(id, iconName, tooltip, enabled);
+}
+
+// ---- pane-header chip (feature_tree.h) ----
+// Purpose-built line-art "feature tree" glyph: a root node with two branch children, stroked at
+// the same weight as the row icons (1.3dp, like drawEyeGlyph) so it reads as part of the set —
+// replaces the generic "history" three-dot atlas glyph that said nothing about features.
+static void drawFeatureTreeGlyph(ImDrawList* dl, ImVec2 mn, float sz, ImU32 ink) {
+    const float S = ui::uiScale;
+    const float th = std::max(1.0f, 1.3f * S);
+    const float u = sz / 16.0f;                       // glyph designed on a 16-unit grid
+    // Root node (top-left).
+    ImVec2 r0(mn.x + 2.0f * u, mn.y + 2.0f * u), r1(mn.x + 6.5f * u, mn.y + 6.5f * u);
+    dl->AddRect(r0, r1, ink, 1.0f * u, 0, th);
+    // Trunk down from the root to the lower branch.
+    const float trunkX = (r0.x + r1.x) * 0.5f;
+    dl->AddLine(ImVec2(trunkX, r1.y), ImVec2(trunkX, mn.y + 12.75f * u), ink, th);
+    // Two elbow branches to two child nodes.
+    for (int i = 0; i < 2; ++i) {
+        const float by = mn.y + (i == 0 ? 8.75f : 12.75f) * u;
+        dl->AddLine(ImVec2(trunkX, by), ImVec2(mn.x + 9.0f * u, by), ink, th);
+        dl->AddRect(ImVec2(mn.x + 9.0f * u, by - 1.75f * u),
+                    ImVec2(mn.x + 13.5f * u, by + 1.75f * u), ink, 0.75f * u, 0, th);
+    }
+}
+
+void fmPaneHeaderChip(AppState& st, const char* title, const char* titleIcon, float paneCenterX) {
+    const float S = ui::uiScale;
+    const ui::AdaptiveSurface& surf = fmSurf();
+    const float iconSz  = 16.0f * S;
+    const float iconGap = 6.0f * S;
+    const float padX    = 10.0f * S;
+    const float padY    = 5.0f * S;
+
+    ImGui::PushFont(st.fonts.medium);
+    const ImVec2 tsz = ImGui::CalcTextSize(title);
+    const float chipH = std::max(tsz.y, iconSz) + 2.0f * padY;
+    const float chipW = iconSz + iconGap + tsz.x + 2.0f * padX;
+
+    const ImVec2 rowPos = ImGui::GetCursorScreenPos();
+    const float  availW = ImGui::GetContentRegionAvail().x;
+    // Center the chip on the pane's true center, clamped inside the content region so the pill
+    // (and everything in it) always fits.
+    float chipX = paneCenterX - chipW * 0.5f;
+    chipX = std::max(rowPos.x, std::min(chipX, rowPos.x + availW - chipW));
+    const ImVec2 c0(chipX, rowPos.y), c1(chipX + chipW, rowPos.y + chipH);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    // ONE fitted pill sized from its content (the old chip painted a text-height row the 20px
+    // icon overflowed, with the group centered off the pill).
+    ui::glassRowBackground(dl, c0, c1, 6.0f, false, false, 0.26f);
+
+    const ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
+    const ImVec2 iMin(c0.x + padX, c0.y + (chipH - iconSz) * 0.5f);
+    if (titleIcon && std::string(titleIcon) == "history") {
+        drawFeatureTreeGlyph(dl, iMin, iconSz, ink);   // FM/PM: the feature-tree glyph
+    } else if (titleIcon && *titleIcon) {
+        drawIconGlass(dl, titleIcon, ImVec2(iMin.x + iconSz * 0.5f, iMin.y + iconSz * 0.5f),
+                     iconSz, ink, fmHalo(surf));
+    }
+    dl->AddText(ImVec2(iMin.x + iconSz + iconGap, c0.y + (chipH - tsz.y) * 0.5f), ink, title);
+    ImGui::PopFont();
+
+    // Advance the layout cursor past the chip row (draw-list painting doesn't move it).
+    ImGui::Dummy(ImVec2(availW, chipH));
+}
 
 // ---- C41: real file Save / Open (native dialogs + viewport refresh) -------------------------
 // fm_save = classic Save: silent re-save to s_docPath, dialog only on first save (or Shift+click
@@ -2014,6 +2102,16 @@ static void drawFeatureManagerTopStrip(AppState& st) {
 // the former drawFeatureTree(); the only change is the removed Begin/End at the top and bottom.
 void drawFeatureTreeBody(AppState& st,
                          const std::function<void(const std::string&)>& editCallback) {
+    // TEMP-VERIFY (removed before commit): force the Explorer tab for a headless screenshot.
+    if (const char* e = std::getenv("AI_CAD_FORCE_EXPLORER"); e && *e == '1') {
+        st.leftPaneTab = AppState::LP_Explorer;
+        if (st.recentFiles.empty()) {
+            st.recentFiles.push_back(std::string(std::getenv("HOME")) +
+                                     "/Documents/AI-CAD/swasi_test.step+");
+            st.recentFiles.push_back("/tmp/missing_old_part.step+");
+        }
+        return;
+    }
     const ui::AdaptiveSurface& lpSurf = fmSurf();
     fmPaletteRefresh(ui::viewportBackdrop().valid() ? &lpSurf : nullptr);
     const auto& pal = fmPalette();

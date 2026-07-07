@@ -146,6 +146,7 @@ add_executable(AI-CAD
   # --- [parts-plm sources] workspace bodies (parts-port agent appends here) ---
   src/ui/parts/parts_workspace.cpp
   src/ui/plm/plm_workspace.cpp
+  src/ui/ai/ai_workspace.cpp
   # --- end [parts-plm sources] ---
   ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/src/gl.c
   ${imgui_SOURCE_DIR}/imgui.cpp

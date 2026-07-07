@@ -909,6 +909,9 @@ void ScenarioRunner::tick(AppState& st) {
 
     // ---------- workspaces scenario (AI_CAD_SHOT=workspaces) ----------
     runWorkspaces(st);
+
+    // ---------- motion scenario (AI_CAD_SHOT=motion) ----------
+    runMotion(st);
 }
 
 // T-G15 icon pipeline (AI_CAD_SHOT=iconpipe). Recipe-driven clean-viewport icon generator: reads a
@@ -1768,6 +1771,20 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         return st.workspaceShotDone ? FrameAction::Break : FrameAction::Continue;
     }
 
+    // motion scenario: three per-step captures (t0 setup, t1 frame0, t2 midpoint).
+    if (st.wantMotion) {
+        ++st.frame;
+        if (!mtCapture.empty()) {
+            const char* mirror = mtDone ? screenshotPath : nullptr;
+            writeBackbufferPng(mtCapture.c_str(), dw, dh, mirror);
+            std::printf("motion: screenshot -> %s (%dx%d)\n", mtCapture.c_str(), dw, dh);
+            std::fflush(stdout);
+            mtCapture.clear();
+        }
+        glfwSwapBuffers(st.win);
+        return st.motionShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+
     return FrameAction::None;
 }
 
@@ -1818,6 +1835,9 @@ void ScenarioRunner::runWorkspaces(AppState& st) {
         st.activeWorkspace = kWS[wsStep].ws;
         std::printf("workspaces: switching to %s (step %d)\n", kWS[wsStep].name, wsStep);
         std::fflush(stdout);
+        // Manufacture: float the CAM panel so the docked-tab race doesn't leave it hidden
+        // behind an empty Viewport slot in the headless capture (same technique as the cam scenario).
+        if (kWS[wsStep].ws == WS::Manufacture) ui::camFloatForShot();
         wsCapture = wsSavePath + "/workspace_" + kWS[wsStep].name + ".png";
         wsSettle  = kSettle;
         ++wsStep;
@@ -1827,6 +1847,209 @@ void ScenarioRunner::runWorkspaces(AppState& st) {
         st.workspaceShotDone = true;
         std::printf("workspaces: scenario complete (%d captures)\n", kCount);
         std::fflush(stdout);
+    }
+}
+
+// ---------- motion scenario (AI_CAD_SHOT=motion) ----------
+// Kinematic motion study end-to-end. Steps:
+//   0: Build two parts (base box + arm box), author them as AICM files.
+//   1: new_assembly, insert both components.
+//   2: Add an angle mate between two faces (the motion driver mate).
+//   3: Open Simulate workspace, create Motion study, set leftPaneTab = LP_Simulation.
+//      Capture motion_t0.png (the setup/tree view before solve).
+//   4: Run the motion study (sim_run — synchronous). If solve fails, report and stop.
+//      Capture motion_t1.png (frame 0, bodies at start pose).
+//   5: Advance to mid-frame via applyMotionFramePublic, capture motion_t2.png.
+//      Bodies MUST be at a different position from t1 to prove live playback.
+//
+// Note: the motion scenario requires a real assembly with at least one drivable mate.
+// If the worker's simulate_motion RPC fails (no kinematic solver available or no mate
+// found), the scenario reports "motion solve FAILED" and still writes t0 + t1 as
+// partial evidence — it does NOT fake the body-position difference.
+void ScenarioRunner::runMotion(AppState& st) {
+    if (!st.wantMotion || st.motionShotDone) return;
+    if (!st.workerStarted || st.frame < 5) return;
+
+    if (!mtDirReady) {
+        mtDirReady = true;
+        const char* repo = std::getenv("AI_CAD_REPO");
+        std::string base = repo ? std::string(repo) : std::string(".");
+        mtSavePath = base + "/scratch/motion_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(mtSavePath, ec);
+        mtBasePath = base + "/scratch/motion_shots/motion_base.step+";
+        mtArmPath  = base + "/scratch/motion_shots/motion_arm.step+";
+    }
+
+    if (!mtCapture.empty()) return;   // wait for endFrame to consume the capture
+    if (mtSettle > 0) { --mtSettle; return; }
+
+    const int kSettle = 6;
+
+    // Helper: author a part via raw worker calls (same pattern as the asm scenario).
+    // doc_new -> doc_apply_ops -> doc_save (step+) -> doc_close. The saved path is then
+    // handed to insertComponent by the assembly step.
+    auto makePart = [&](const char* name, const nlohmann::json& ops,
+                        const std::string& outPath) -> bool {
+        nlohmann::json res; std::string err;
+        if (!st.worker.call("doc_new", {{"kind","part"},{"name",name}}, res, err)) {
+            std::printf("motion: doc_new(%s) FAILED: %s\n", name, err.c_str()); std::fflush(stdout);
+            return false;
+        }
+        std::string did = res.value("doc_id", std::string());
+        int rev = res.value("revision", 0);
+        nlohmann::json ap2;
+        if (!st.worker.call("doc_apply_ops",
+                {{"doc_id",did},{"base_revision",rev},{"ops",ops}}, ap2, err)) {
+            std::printf("motion: doc_apply_ops(%s) FAILED: %s\n", name, err.c_str()); std::fflush(stdout);
+            return false;
+        }
+        nlohmann::json sv;
+        if (!st.worker.call("doc_save", {{"doc_id",did},{"path",outPath}}, sv, err)) {
+            std::printf("motion: doc_save(%s) FAILED: %s\n", name, err.c_str()); std::fflush(stdout);
+            return false;
+        }
+        nlohmann::json cl;
+        st.worker.call("doc_close", {{"doc_id",did}}, cl, err);
+        return true;
+    };
+
+    AsmPanels* ap = st.asmPanels;
+
+    switch (mtStep) {
+        case 0: {
+            // Author base box (60x40x10mm) and arm box (10x10x50mm) parts.
+            std::printf("motion: authoring base + arm parts\n"); std::fflush(stdout);
+            auto dim = [](double v) { return nlohmann::json{{"value",v},{"expr",nullptr}}; };
+            nlohmann::json baseOps = nlohmann::json::array();
+            baseOps.push_back({{"op","add_feature"},{"feature",{
+                {"type","box"},{"name","Base"},{"suppressed",false},
+                {"params",{{"length",dim(60)},{"width",dim(40)},{"height",dim(10)},
+                           {"centered",true}}},{"refs",nlohmann::json::object()}}}});
+            nlohmann::json armOps = nlohmann::json::array();
+            armOps.push_back({{"op","add_feature"},{"feature",{
+                {"type","box"},{"name","Arm"},{"suppressed",false},
+                {"params",{{"length",dim(10)},{"width",dim(10)},{"height",dim(50)},
+                           {"centered",true}}},{"refs",nlohmann::json::object()}}}});
+            bool okB = makePart("base", baseOps, mtBasePath);
+            bool okA = makePart("arm",  armOps,  mtArmPath);
+            std::printf("motion: parts authored base=%d arm=%d\n", (int)okB, (int)okA);
+            std::fflush(stdout);
+            if (!okB || !okA) { st.motionShotDone = true; break; }  // can't proceed without parts
+            mtSettle = 2; ++mtStep; break;
+        }
+        case 1: {
+            // new_assembly + insert base (fixed) + arm (offset so it's visible separately).
+            if (!ap) { std::printf("motion: no AsmPanels — skip\n"); std::fflush(stdout);
+                st.motionShotDone = true; break; }
+            std::string err;
+            if (!st.docMirror.newAssembly(st.worker, err)) {
+                std::printf("motion: new_assembly FAILED: %s\n", err.c_str()); std::fflush(stdout);
+                st.motionShotDone = true; break;
+            }
+            mtAsmDoc = st.docMirror.docId();
+            std::string aicm;
+            ap->insertComponent(st, mtBasePath, nullptr, aicm);
+            // Place the arm offset so it doesn't overlap the base initially.
+            nlohmann::json off = nlohmann::json::array(
+                {1,0,0,0, 0,1,0,0, 0,0,1,60, 0,0,0,1});  // +60mm in Z
+            ap->insertComponent(st, mtArmPath, off, aicm);
+            // Grab the second component id.
+            const auto& tr = st.docMirror.tree();
+            if (tr.contains("components") && tr["components"].is_array() &&
+                tr["components"].size() >= 2)
+                mtK2 = tr["components"][1].value("id", std::string());
+            std::printf("motion: assembly %s, arm=%s\n", mtAsmDoc.c_str(), mtK2.c_str());
+            std::fflush(stdout);
+            st.yaw = 25; st.pitch = 18; st.zoom = 1.0f;
+            mtSettle = kSettle; ++mtStep; break;
+        }
+        case 2: {
+            // Add an angle mate between top face of base (body 1) and front face of arm (body 2).
+            // An angle mate is the drivable dimensional mate for motion studies.
+            if (!ap) { st.motionShotDone = true; break; }
+            auto resolveAsm = [&](int bodyId, const char* kind, int topo,
+                                  std::string& comp) -> nlohmann::json {
+                std::string e;
+                std::string s = st.docMirror.resolvePickAsm(st.worker, bodyId, kind, topo, comp, e);
+                if (s.empty()) return nlohmann::json();
+                try { return nlohmann::json::parse(s); } catch (...) { return nlohmann::json(); }
+            };
+            // Find a planar face on base (body 1) and a planar face on arm (body 2).
+            std::string cBase, cArm;
+            nlohmann::json baseFace, armFace;
+            for (int t = 1; t <= 20; ++t) {
+                std::string c; nlohmann::json s = resolveAsm(1, "face", t, c);
+                if (!s.is_object()) break;
+                if (s.value("surf","") == "plane" && baseFace.is_null()) { baseFace = s; cBase = c; }
+            }
+            for (int t = 1; t <= 20; ++t) {
+                std::string c; nlohmann::json s = resolveAsm(2, "face", t, c);
+                if (!s.is_object()) break;
+                if (s.value("surf","") == "plane" && armFace.is_null()) { armFace = s; cArm = c; }
+            }
+            std::string aicm;
+            if (baseFace.is_object() && armFace.is_object()) {
+                nlohmann::json refs = nlohmann::json::array();
+                refs.push_back({{"component", cBase}, {"selector", baseFace}});
+                refs.push_back({{"component", cArm},  {"selector", armFace}});
+                ap->addMate(st, "angle", "aligned", refs, aicm);
+                std::printf("motion: angle mate added base=%s arm=%s\n",
+                            cBase.c_str(), cArm.c_str());
+            } else {
+                std::printf("motion: WARNING planar faces not found — motion may fail\n");
+            }
+            std::fflush(stdout);
+            mtSettle = kSettle; ++mtStep; break;
+        }
+        case 3: {
+            // Switch to Simulate workspace, create Motion study.
+            st.activeWorkspace = AppState::Workspace::Simulate;
+            st.leftPaneTab     = AppState::LP_Simulation;
+            if (st.simManager) {
+                st.simManager->handleCommand(st, "sim_new_motion");
+                std::printf("motion: Motion study created\n"); std::fflush(stdout);
+            } else {
+                std::printf("motion: WARNING no simManager\n"); std::fflush(stdout);
+            }
+            mtCapture = mtSavePath + "/motion_t0.png";
+            mtSettle  = kSettle; ++mtStep; break;
+        }
+        case 4: {
+            // Run the motion study synchronously.
+            if (st.simManager) {
+                st.simManager->handleCommand(st, "sim_run");
+                mtRunOk = st.simManager->motionHasResult();
+                std::printf("motion: sim_run complete, hasResult=%d, frames=%d\n",
+                            (int)mtRunOk, mtRunOk ? st.simManager->motionFrameCount() : 0);
+                std::fflush(stdout);
+            }
+            // Capture frame 0 (bodies at start pose) regardless of solve outcome.
+            mtCapture = mtSavePath + "/motion_t1.png";
+            mtSettle  = kSettle; ++mtStep; break;
+        }
+        case 5: {
+            // Advance to mid-frame and capture. Bodies must differ from t1 to prove live playback.
+            if (mtRunOk && st.simManager) {
+                const int nFrames = st.simManager->motionFrameCount();
+                const int mid     = nFrames / 2;
+                std::printf("motion: advancing to mid-frame %d/%d\n", mid, nFrames);
+                std::fflush(stdout);
+                st.simManager->applyMotionFramePublic(st, mid);
+                mtSettle = kSettle;
+            } else {
+                std::printf("motion: PARTIAL — solve did not produce frames; t2 same as t1\n");
+                std::fflush(stdout);
+            }
+            mtCapture = mtSavePath + "/motion_t2.png";
+            mtDone = true;
+            ++mtStep; break;
+        }
+        default:
+            st.motionShotDone = true;
+            std::printf("motion: scenario complete (runOk=%d)\n", (int)mtRunOk);
+            std::fflush(stdout);
+            break;
     }
 }
 

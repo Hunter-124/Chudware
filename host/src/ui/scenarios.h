@@ -154,6 +154,19 @@ private:
     int wsStep = 0, wsSettle = 0;
     bool wsDirReady = false;
     std::string wsSavePath, wsCapture;
+
+    // ---------- motion scenario (AI_CAD_SHOT=motion) ----------
+    // Builds a 2-body assembly with an angle mate, runs a Motion study, captures t0/t1/t2
+    // where body positions differ. Proves kinematic motion playback is end-to-end live.
+    void runMotion(AppState& st);
+    bool mtInit = false, mtWant = false, mtDone = false;
+    int  mtStep = 0, mtSettle = 0;
+    bool mtDirReady = false;
+    std::string mtSavePath, mtCapture;
+    std::string mtBasePath, mtArmPath;   // authored part AICM paths
+    std::string mtAsmDoc;                // assembly doc id
+    std::string mtK2;                    // second component id (the arm)
+    bool mtRunOk = false;                // motion solve succeeded
 };
 
 }  // namespace ui

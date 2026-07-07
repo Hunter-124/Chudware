@@ -264,6 +264,15 @@ public:
 
     // ---- scripted-shot helpers (AI_CAD_SHOT=fea), preserved from the old SimPanel ----
     void configureActive(AppState& st, float density, const std::string& materialKey);
+
+    // ---- scripted-shot helpers (AI_CAD_SHOT=motion) ----
+    // True when the selected study is a Motion type with a successful result.
+    bool motionHasResult() const;
+    // Number of frames in the active motion trajectory (0 when no result).
+    int  motionFrameCount() const;
+    // Advance the active motion study to a specific frame and upload transforms to the viewport.
+    // No-op when motionHasResult() is false.
+    void applyMotionFramePublic(AppState& st, int frame);
     // Scripted-shot helper (AI_CAD_SHOT=flow): set the active flow study's fluid / angles / resolution.
     void configureActiveFlow(AppState& st, int fluid, float aoaDeg, float sideslipDeg, int preset);
 

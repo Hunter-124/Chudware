@@ -334,9 +334,17 @@ const CamBackplot* camActiveBackplot() {
 
 void camEnsureVisible() { g.show = true; }
 
+void camRequestFocus() {
+    g.show = true;
+    // Keep focusFrames non-zero every frame the Manufacture workspace is active so the CAM window
+    // wins the docked-tab race against the Viewport window in the shared central dock node.
+    // Set to 3 each frame so it's always non-zero (drawCamManager decrements by 1 per frame).
+    g.focusFrames = 3;
+}
+
 // Shot-only hook: make the CAM panel float (undock + centre) so a headless screenshot of the
 // AI_CAD_SHOT=cam scenario can actually show the populated workspace. Never called in normal use.
-void camFloatForShot() { g.floatForShot = true; }
+void camFloatForShot() { g.floatForShot = true; g.show = true; }
 
 // Adopt an existing CAM job doc (built core-side by the copilot's CAM fast-path) into the
 // panel so it shows up populated instead of empty. Loads the job tree (setups/ops/tools).
@@ -374,12 +382,13 @@ void drawCamManager(AppState& st) {
         ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
         ImGui::SetNextWindowPos(ImVec2(330, 210), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(660, 470), ImGuiCond_Always);
+    } else {
+        ImGui::SetNextWindowSize(ImVec2(720, 480), ImGuiCond_FirstUseEver);
     }
     static bool prevShown = false;
     if (g.focusFrames > 0 || (g.show && !prevShown)) ImGui::SetNextWindowFocus();  // applies to the Begin below
     prevShown = g.show;
     if (g.focusFrames > 0) g.focusFrames--;
-    ImGui::SetNextWindowSize(ImVec2(720, 480), ImGuiCond_FirstUseEver);
     // The global theme makes window title bars fully transparent (a clean look for docked panels),
     // but a FLOATING CAM window then reads as see-through at the top. Give this window an opaque
     // title bar and a solid (fully opaque) border so it stands on its own whether floating or

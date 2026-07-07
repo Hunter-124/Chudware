@@ -3968,6 +3968,29 @@ void SimManager::applyMotionFrame(AppState& st, Study& s, int frame) {
     st.renderer->setFramingFrozen(false);
 }
 
+// ---------- scripted-shot motion helpers (AI_CAD_SHOT=motion) -------------------------
+
+bool SimManager::motionHasResult() const {
+    if (sel_ < 0 || sel_ >= (int)studies_.size()) return false;
+    const Study& s = studies_[sel_];
+    return s.type == StudyType::Motion && s.motionHasResult;
+}
+
+int SimManager::motionFrameCount() const {
+    if (sel_ < 0 || sel_ >= (int)studies_.size()) return 0;
+    const Study& s = studies_[sel_];
+    if (s.type != StudyType::Motion || !s.motionHasResult) return 0;
+    return (int)s.motionTrajectory.size();
+}
+
+void SimManager::applyMotionFramePublic(AppState& st, int frame) {
+    if (sel_ < 0 || sel_ >= (int)studies_.size()) return;
+    Study& s = studies_[sel_];
+    if (s.type != StudyType::Motion || !s.motionHasResult) return;
+    s.motionFrame = frame;
+    applyMotionFrame(st, s, frame);
+}
+
 // ---------- tickMotion -----------------------------------------------------------------
 
 void SimManager::tickMotion(AppState& st) {

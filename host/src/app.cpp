@@ -1457,6 +1457,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // [workspace-tabs seam] workspaces shot — cycle all 8 workspace tabs, one screenshot each.
     st.wantWorkspace = shot && shotMode && std::strcmp(shotMode, "workspaces") == 0;
     if (st.wantWorkspace) { st.showRibbon = true; }
+    // AI_CAD_SHOT=motion: kinematic motion study end-to-end (2-body asm + angle mate + playback).
+    st.wantMotion = shot && shotMode && std::strcmp(shotMode, "motion") == 0;
+    if (st.wantMotion) { st.showRibbon = true; st.activeWorkspace = AppState::Workspace::Simulate; }
     // C20b: assembly shot — author base/peg parts, new assembly, insert + mate + interference.
     st.wantAsm = shot && shotMode && std::strcmp(shotMode, "asm") == 0;
     // AI_CAD_MATEFORM: a lightweight Mate-form-only variant of the asm shot for visual verification
@@ -2845,21 +2848,32 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // Workspaces that own the ENTIRE central region — no left pane, no viewport, no cam/ecad.
         const bool wsFullBody = (ws == WS::PLM || ws == WS::PartsLibrary || ws == WS::AI);
         // Effective left-pane tab override (derived this frame; never written to st).
-        // Simulate forces the Simulation tab so the sim tree shows; others follow st.leftPaneTab.
-        const int effectiveLeftTab = (ws == WS::Simulate) ? ui::kLeftPaneSimulation
-                                                           : st.leftPaneTab;
+        // Simulate forces the Simulation tab so the sim tree shows.
+        // Non-Simulate workspaces must NOT show the sim tree: clamp LP_Simulation back to
+        // FeatureManager so the sim tab never leaks into Model/Drawing/etc.
+        const int effectiveLeftTab = (ws == WS::Simulate)
+            ? ui::kLeftPaneSimulation
+            : (st.leftPaneTab == ui::kLeftPaneSimulation ? ui::kLeftPaneFeatureManager
+                                                         : st.leftPaneTab);
         // The Manufacture workspace makes the CAM manager visible (like the old ribbon-tab gate).
         const bool wsShowCam = (ws == WS::Manufacture) || (st.ribbonTab == AppState::RT_Manufacture);
         // Electronics workspace shows the ECAD editor as the primary body.
+        // In other workspaces, only show ECAD when an ECAD doc is actually open (ecadDocId set)
+        // or showPcbTools was explicitly triggered by a ribbon command. Do NOT let showPcbTools
+        // bleed from the Electronics workspace into Manufacture/Model/etc — clear it on exit.
+        if (ws != WS::Electronics && st.showPcbTools && st.ecadDocId.empty()) st.showPcbTools = false;
         const bool wsShowEcad = (ws == WS::Electronics) || st.showPcbTools || !st.ecadDocId.empty();
 
         if (!wsFullBody) {
             // ---- normal viewport workspaces (Model, Drawing, Simulate, Electronics, Manufacture) ----
+            // Electronics suppresses the model feature tree — the ECAD panel owns its own
+            // left sub-panel (layer visibility / net list) so a double left column is wrong.
+            const bool showLeftPane = (ws != WS::Electronics);
             if (st.propertyManager->active()) {
                 st.propertyManager->tick(st);
-                st.showFeatureTree = true;
+                if (showLeftPane) st.showFeatureTree = true;
             }
-            if (st.showFeatureTree) {
+            if (st.showFeatureTree && showLeftPane) {
                 // Pass the effective tab as a temporary override via the AppState field; restore after.
                 // drawLeftPane reads st.leftPaneTab directly, so we temporarily set it per-frame.
                 const int savedTab = st.leftPaneTab;
@@ -2883,13 +2897,27 @@ int run_gui(const char* screenshotPath, const char* openPath) {
 
         if (!wsFullBody) {
             // ---- 3D/2D viewport (Model, Drawing, Simulate, Manufacture) ----
-            if (st.wantFocusViewport > 0) { ImGui::SetNextWindowFocus(); st.wantFocusViewport--; }
-            ui::drawViewportPanel(st, io, busy);
+            // Electronics uses the ECAD editor as the full central body — skip the 3D viewport
+            // so the ECAD dock window wins the central node without fighting the Viewport tab.
+            // Manufacture similarly uses the CAM panel as the central body (it has its own
+            // Toolpaths/backplot tab for 3D review); the feature tree stays visible on the left.
+            const bool skipViewport = (ws == WS::Electronics) || (ws == WS::Manufacture);
+            if (!skipViewport) {
+                if (st.wantFocusViewport > 0) { ImGui::SetNextWindowFocus(); st.wantFocusViewport--; }
+                ui::drawViewportPanel(st, io, busy);
+            }
         }
 
         if (!wsFullBody) {
             // ---- ECAD editor (Electronics workspace or when an ECAD doc is open) ----
-            if (st.wantFocusEcad > 0) {
+            // Force focus every frame in the Electronics workspace so the ECAD dock tab
+            // stays in front of the central node (no Viewport competing for the slot).
+            // Reset showPcbTools when leaving Electronics so ECAD doesn't bleed into other
+            // workspaces (it was set unconditionally inside this block each frame).
+            if (ws == WS::Electronics) {
+                st.wantFocusEcad = 2;   // keep non-zero every frame so SetNextWindowFocus fires
+                ImGui::SetNextWindowFocus();
+            } else if (st.wantFocusEcad > 0) {
                 st.showPcbTools = true;   // ensure the ECAD window is visible when focus is requested
                 ImGui::SetNextWindowFocus();
                 st.wantFocusEcad--;
@@ -2900,8 +2928,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // ---- CAM Manufacture workspace ----
         if (!wsFullBody) {
             // Reveal the CAM manager when in the Manufacture workspace; draw every frame
-            // (no-ops until opened). Self-contained dock window like the ECAD editor.
-            if (wsShowCam) ui::camEnsureVisible();
+            // (no-ops until opened). Force focus every frame in Manufacture so the CAM dock
+            // tab wins over the Viewport tab in the shared central node.
+            if (wsShowCam) ui::camRequestFocus();
             ui::drawCamManager(st);
         }
 
@@ -2923,13 +2952,18 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 // right edge when the Copilot isn't up.
                 float rightX = ui::overlayColumnEdge(1);
                 if (rightX <= band.minX + m) rightX = band.maxX;
-                ImGui::SetNextWindowPos(ImVec2(band.minX + m, band.minY + m));
+                // ImGuiCond_Always: override any stale collapsed/size state from imgui.ini
+                // so the workspace always fills the full band on first open.
+                ImGui::SetNextWindowPos(ImVec2(band.minX + m, band.minY + m),
+                                        ImGuiCond_Always);
                 ImGui::SetNextWindowSize(ImVec2((rightX - band.minX) - 2.0f * m,
-                                                (band.maxY - band.minY) - 2.0f * m));
+                                                (band.maxY - band.minY) - 2.0f * m),
+                                         ImGuiCond_Always);
                 ImGui::Begin(ws == WS::PLM ? "##PLMWorkspace" : "##PartsWorkspace", nullptr,
                              ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                              ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-                             ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav);
+                             ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
+                             ImGuiWindowFlags_NoSavedSettings);
                 if (ws == WS::PLM) ui::drawPlmWorkspace(st);
                 else               ui::drawPartsLibraryWorkspace(st);
                 ImGui::End();

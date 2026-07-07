@@ -142,23 +142,45 @@ def load_graphviz_json():
     nodes = raw.get("nodes", [])
     links = raw.get("links", [])
 
-    order = sorted(range(len(nodes)),
-                   key=lambda i: (nodes[i].get("community", -1) if nodes[i].get("community") is not None else -1,
-                                  str(nodes[i].get("id", ""))))
     GA = math.pi * (3.0 - math.sqrt(5.0))   # golden angle
-    SCALE = 42.0
-    out_nodes = [None] * len(nodes)
-    for rank, i in enumerate(order):
-        rr = SCALE * math.sqrt(rank + 0.5)
-        aa = (rank + 0.5) * GA
-        n = nodes[i]
+    SCALE = 42.0        # spacing between community cluster centers
+    LOCAL_SCALE = 26.0  # spread of members within a cluster
+
+    # A single golden-angle spiral over all nodes equidistributes points around
+    # the full circle almost immediately, so a community's members — even
+    # though contiguous in sort order — end up smeared across their whole
+    # radius band instead of clustering together (looks like rainbow noise,
+    # not "coloured spiral clusters"). Fix: two-level layout — one spiral
+    # placing each community's cluster center (radius grows with cumulative
+    # node count so cluster density stays roughly even), then a small
+    # per-cluster spiral placing that community's members around its center.
+    groups = {}
+    for i, n in enumerate(nodes):
         try:
             comm = int(n.get("community", -1))
         except (TypeError, ValueError):
             comm = -1
-        out_nodes[i] = [round(rr * math.cos(aa)), round(rr * math.sin(aa)),
-                        comm, n.get("label") or str(n.get("id", "")),
-                        n.get("source_file", "")]
+        groups.setdefault(comm, []).append(i)
+
+    out_nodes = [None] * len(nodes)
+    cum = 0.0
+    for comm_rank, comm in enumerate(sorted(groups, key=lambda c: (-len(groups[c]), c))):
+        members = sorted(groups[comm], key=lambda i: str(nodes[i].get("id", "")))
+        count = len(members)
+        rr_c = SCALE * math.sqrt(cum + count / 2.0 + 0.5)
+        aa_c = (comm_rank + 0.5) * GA
+        cx, cy = rr_c * math.cos(aa_c), rr_c * math.sin(aa_c)
+        cum += count
+        # Deterministic per-cluster angle offset so member arms don't all
+        # line up on the same bearing across every cluster.
+        rot = (comm * 2.399963) % (2.0 * math.pi)
+        for local_rank, i in enumerate(members):
+            rr = LOCAL_SCALE * math.sqrt(local_rank + 0.5)
+            aa = (local_rank + 0.5) * GA + rot
+            n = nodes[i]
+            out_nodes[i] = [round(cx + rr * math.cos(aa)), round(cy + rr * math.sin(aa)),
+                            comm, n.get("label") or str(n.get("id", "")),
+                            n.get("source_file", "")]
 
     idx = {n.get("id"): i for i, n in enumerate(nodes)}
     edges = []

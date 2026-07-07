@@ -3489,4 +3489,37 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     ImGui::End();
 }
 
+// ============================ AI workspace hub reuse hooks ============================
+// Thin exported wrappers over the statics above (see legacy_chat.h). They let the full-page
+// AI workspace (host/src/ui/ai/ai_workspace.cpp) render the SAME conversation state, session
+// list and composer/send path as the docked Copilot column — single implementation, two hosts.
+
+void chatWorkspaceSync(AppState& st) {
+    syncChatToDoc(st);
+    ensureConversations(st);
+}
+
+bool chatTurnActive(AppState& st) { return aiTurnActive(st); }
+
+void chatDrawLog(AppState& st) {
+    ui::Fonts& fonts = st.fonts;
+    const float logW = ImGui::GetContentRegionAvail().x;
+    for (size_t mi = 0; mi < st.chat.size(); ++mi) {
+        ChatMsg& m = st.chat[mi];
+        ImGui::PushID((int)mi);
+        if (m.fromUser) {
+            drawUserBlock(m, fonts, logW);
+            ImGui::PopID();
+            continue;
+        }
+        drawAssistantTurn(st, m, fonts, logW);
+        ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));
+        ImGui::PopID();
+    }
+}
+
+void chatDrawComposer(AppState& st, bool busy, bool canRun) { drawComposer(st, busy, canRun); }
+
+void chatDrawSessionsList(AppState& st, bool busy) { drawSessionsPanel(st, busy); }
+
 }  // namespace ui

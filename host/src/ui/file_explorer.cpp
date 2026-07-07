@@ -33,10 +33,10 @@ namespace fs = std::filesystem;
 namespace ui {
 
 // ---- module state (single Explorer instance) ----
-static int s_explorerStripe = 0;
-static void explorerRowPill(bool selected = false) {
-    ui::glassRowAtCursor(3.5f, (s_explorerStripe++ % 2) == 0, selected, 5.0f);
-}
+// Row styling comes from feature_tree.h's shared FM helpers (fmRowPill / fmRowPillEnd /
+// fmTreeIcon* / fmSectionDivider / fmToolbarIconBtn) so Explorer rows are pixel-identical to the
+// FeatureManager reference: same pill height + FramePadding, same soft-blue selection card, same
+// accent-outline hover, same 16px crisp icons and centered hairline section rules.
 
 // Liquid glass v2 (host contract §H4): fetch (never paint) the left pane's ONE glass surface —
 // layout.cpp's drawLeftPane already painted it this frame under "host_left_glass"; adaptivePanel
@@ -50,14 +50,6 @@ static const ui::AdaptiveSurface& explorerSurf() {
     // "host_left_glass" call sites (layout.cpp, feature_tree.cpp) must pass the same group.
     return ui::adaptivePanel(ui::panelId("host_left_glass"), r, ui::GlassGroup::FeatureManager);
 }
-// Contrast halo for drawIconGlass: surf.tint is already the opposite-tone neutral (see
-// ui_theme.cpp adaptiveSurface) at ~0x50 alpha; 0 alpha (no live backdrop) => drawIconGlass
-// draws plain (icons.h contract).
-static ImU32 explorerHalo(const ui::AdaptiveSurface& surf) {
-    if (!ui::viewportBackdrop().valid()) return 0;
-    return ImGui::ColorConvertFloat4ToU32(ImVec4(surf.tint.x, surf.tint.y, surf.tint.z, 0x50 / 255.f));
-}
-
 static std::string s_selectedPath;     // the currently-highlighted tree node (file or folder)
 static std::string s_currentFolder;    // folder that New Folder / Paste act inside (a dir, or a
                                        // file's parent); defaults to the workspace root
@@ -117,50 +109,9 @@ static const char* fileIconName(const std::string& ext) {
     return "new_doc";
 }
 
-// Draw a 16px icon inline (or nothing if the atlas lacks it) and advance the cursor. Tint tracks
-// the pane's adaptive surface (max contrast over the frosted backdrop); drawIconGlass adds the
-// opposite-tone contrast halo (host contract §H4).
-static void drawIcon(const char* name) {
-    const float sz = 16.0f * ui::uiScale;
-    IconUV ic = getIcon(name, 20);
-    if (ic.valid) {
-        const ui::AdaptiveSurface& surf = explorerSurf();
-        ImVec2 p0 = ImGui::GetCursorScreenPos();
-        ImGui::Dummy(ImVec2(sz, sz));
-        drawIconGlass(ImGui::GetWindowDrawList(), name, ImVec2(p0.x + sz * 0.5f, p0.y + sz * 0.5f),
-                     sz, ImGui::ColorConvertFloat4ToU32(surf.textSecondary), explorerHalo(surf));
-        ImGui::SameLine(0, 4.0f * ui::uiScale);
-    }
-}
-
-static bool toolbarIconButton(const char* id, const char* icon, const char* tip, bool enabled = true) {
-    const float S = ui::uiScale;
-    const float btn = 28.0f * S;
-    const float glyph = 18.0f * S;
-    ImVec2 p0 = ImGui::GetCursorScreenPos();
-    ImVec2 p1(p0.x + btn, p0.y + btn);
-
-    ImGui::PushID(id);
-    if (!enabled) ImGui::BeginDisabled();
-    bool clicked = ImGui::InvisibleButton("##fx_tool", ImVec2(btn, btn));
-    bool hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
-    if (!enabled) ImGui::EndDisabled();
-
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    if (hovered && enabled)
-        ui::glassRowBackground(dl, p0, p1, 5.0f, false, false);
-    IconUV ic = getIcon(icon, 20);
-    if (ic.valid) {
-        const ui::AdaptiveSurface& surf = explorerSurf();
-        ImVec4 tintV = enabled ? surf.textPrimary
-                               : ImVec4(surf.textTertiary.x, surf.textTertiary.y,
-                                        surf.textTertiary.z, surf.textTertiary.w * 0.35f);
-        drawIconGlass(dl, icon, ImVec2(p0.x + btn * 0.5f, p0.y + btn * 0.5f), glyph,
-                     ImGui::ColorConvertFloat4ToU32(tintV), explorerHalo(surf));
-    }
-    if (hovered) ImGui::SetTooltip("%s", tip);
-    ImGui::PopID();
-    return clicked && enabled;
+// Text fallback glyph for a row whose atlas icon is missing (fmTreeIcon* contract).
+static const char* fileIconFallback(const std::string& ext) {
+    return isEcadExt(ext) ? "[E]" : "[F]";
 }
 
 // ---- workspace resolution ------------------------------------------------
@@ -293,18 +244,30 @@ static void drawFileRow(AppState& st, const fs::path& root, const fs::path& p, c
     const bool isRenaming = (s_renameId == pathStr);
     const bool selected = (s_selectedPath == pathStr);
     ImGui::PushID(pathStr.c_str());
-    explorerRowPill(selected);
-    drawIcon(fileIconName(ext));
     if (isRenaming) {
+        // Inline rename: pill + icon + InputText (same frame height as a normal row).
+        ui::FmRowRect rr = ui::fmRowPill(selected);
+        ui::fmTreeIcon(fileIconName(ext), fileIconFallback(ext));
+        ImGui::SameLine(0, 4.0f * ui::uiScale);
         ImGui::SetNextItemWidth(-1);
         if (s_renameFocus) { ImGui::SetKeyboardFocusHere(); s_renameFocus = false; }
         if (ImGui::InputText("##rn", s_renameBuf, sizeof(s_renameBuf),
                              ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll))
             commitRename(st, root);
         if (ImGui::IsItemDeactivated()) commitRename(st, root);   // click-away / Esc commits-or-cancels
+        ui::fmRowPillEnd(rr, selected);
     } else {
-        if (ImGui::Selectable(p.filename().string().c_str(), selected,
-                              ImGuiSelectableFlags_AllowDoubleClick)) {
+        // FM leaf-row pattern (identical to the FeatureManager plane rows): pill FIRST at the
+        // row's true left edge, then a leaf TreeNodeEx, then the type icon painted into the
+        // unused leaf-arrow slot so icon + label share the FM's exact metrics and centering.
+        ui::FmRowRect rr = ui::fmRowPill(selected);
+        ImVec2 rowPos = ImGui::GetCursorScreenPos();
+        ImGui::TreeNodeEx(p.filename().string().c_str(),
+                          ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                          ImGuiTreeNodeFlags_SpanFullWidth);
+        ui::fmTreeIconInArrowSlot(rowPos, fileIconName(ext), fileIconFallback(ext));
+        ui::fmRowPillEnd(rr, selected);
+        if (ImGui::IsItemClicked()) {
             s_selectedPath = pathStr;
             s_currentFolder = p.parent_path().string();
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) requestOpen(st, p);
@@ -342,32 +305,39 @@ static void drawFileRow(AppState& st, const fs::path& root, const fs::path& p, c
 // (sorted), then known files (sorted). Hidden/dot entries and unknown extensions are skipped.
 static void drawDirNode(AppState& st, const fs::path& root, const fs::path& dir, bool isRoot) {
     std::error_code ec;
-    std::string label = isRoot ? ("Workspace  (" + dir.filename().string() + ")")
-                               : dir.filename().string();
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
+    // The "Workspace" section rule above the tree already names the section; the root row just
+    // shows the workspace folder's own name (FM-style: divider carries the section label).
+    std::string label = dir.filename().string();
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth;
     if (isRoot) flags |= ImGuiTreeNodeFlags_DefaultOpen;
-    if (s_selectedPath == dir.string()) flags |= ImGuiTreeNodeFlags_Selected;
+    const bool dirSelected = (s_selectedPath == dir.string());
 
     ImGui::PushID(dir.string().c_str());
 
     // A non-root folder being inline-renamed shows an InputText in place of its tree node; its
     // children stay collapsed during the rename (kept simple — folder rename is a leaf interaction).
     if (!isRoot && s_renameId == dir.string()) {
-        explorerRowPill(s_selectedPath == dir.string());
-        drawIcon("body_folder");
+        ui::FmRowRect rr = ui::fmRowPill(dirSelected);
+        ui::fmTreeIcon("body_folder", "[D]");
+        ImGui::SameLine(0, 4.0f * ui::uiScale);
         ImGui::SetNextItemWidth(-1);
         if (s_renameFocus) { ImGui::SetKeyboardFocusHere(); s_renameFocus = false; }
         if (ImGui::InputText("##rnd", s_renameBuf, sizeof(s_renameBuf),
                              ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll))
             commitRename(st, root);
         if (ImGui::IsItemDeactivated()) commitRename(st, root);
+        ui::fmRowPillEnd(rr, dirSelected);
         ImGui::PopID();
         return;
     }
 
-    explorerRowPill(s_selectedPath == dir.string());
-    drawIcon("body_folder");
+    // FM expandable-row pattern (identical to the FeatureManager Origin row): pill, 16px icon as
+    // its own item, then the chevron node. Pill ends right after the node, BEFORE children.
+    ui::FmRowRect rr = ui::fmRowPill(dirSelected);
+    ui::fmTreeIcon("body_folder", "[D]");
+    ImGui::SameLine(0, 4.0f * ui::uiScale);
     bool open = ImGui::TreeNodeEx(label.c_str(), flags);
+    ui::fmRowPillEnd(rr, dirSelected);
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
         s_selectedPath = dir.string();
         s_currentFolder = dir.string();
@@ -426,32 +396,38 @@ static void drawDirNode(AppState& st, const fs::path& root, const fs::path& dir,
 // ---- Recent section -------------------------------------------------------
 static void drawRecentSection(AppState& st) {
     if (st.recentFiles.empty()) return;
-    if (ImGui::CollapsingHeader("Recent", ImGuiTreeNodeFlags_DefaultOpen)) {
-        int idx = 0;
-        for (const std::string& rp : st.recentFiles) {
-            ImGui::PushID(idx++);
-            fs::path p(rp);
-            explorerRowPill(false);
-            drawIcon(fileIconName(lowerExt(p)));
-            std::error_code ec;
-            bool exists = fs::exists(p, ec);
-            if (!exists) ImGui::PushStyleColor(ImGuiCol_Text, explorerSurf().textSecondary);
-            if (ImGui::Selectable(p.filename().string().c_str(), false,
-                                  ImGuiSelectableFlags_AllowDoubleClick) &&
-                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && exists)
-                requestOpen(st, p);
-            // Drag a Recent row onto the viewport to open it (same payload as the tree rows).
-            if (exists && isKnownExt(lowerExt(p)) &&
-                ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
-                ImGui::SetDragDropPayload(kFileDragPayload, rp.c_str(), rp.size() + 1);
-                ImGui::TextUnformatted(p.filename().string().c_str());
-                ImGui::EndDragDropSource();
-            }
-            if (!exists) ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", rp.c_str());
-            ImGui::PopID();
+    // FM-style section rule (the "Reference"/"Features" treatment) instead of a CollapsingHeader.
+    ui::fmSectionDivider("Recent");
+    int idx = 0;
+    for (const std::string& rp : st.recentFiles) {
+        ImGui::PushID(idx++);
+        fs::path p(rp);
+        std::error_code ec;
+        const bool exists = fs::exists(p, ec);
+        const std::string ext = lowerExt(p);
+        // Same FM leaf-row pattern as the tree's file rows; a missing file keeps a readable dim
+        // state (dim text + faded icon), like the FM's hidden planes.
+        ui::FmRowRect rr = ui::fmRowPill(false);
+        ImVec2 rowPos = ImGui::GetCursorScreenPos();
+        if (!exists) ImGui::PushStyleColor(ImGuiCol_Text, explorerSurf().textSecondary);
+        ImGui::TreeNodeEx(p.filename().string().c_str(),
+                          ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                          ImGuiTreeNodeFlags_SpanFullWidth);
+        if (!exists) ImGui::PopStyleColor();
+        ui::fmTreeIconInArrowSlot(rowPos, fileIconName(ext), fileIconFallback(ext),
+                                  exists ? 1.0f : 0.45f);
+        ui::fmRowPillEnd(rr, false);
+        if (ImGui::IsItemClicked() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && exists)
+            requestOpen(st, p);
+        // Drag a Recent row onto the viewport to open it (same payload as the tree rows).
+        if (exists && isKnownExt(ext) &&
+            ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+            ImGui::SetDragDropPayload(kFileDragPayload, rp.c_str(), rp.size() + 1);
+            ImGui::TextUnformatted(p.filename().string().c_str());
+            ImGui::EndDragDropSource();
         }
-        ImGui::Separator();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", rp.c_str());
+        ImGui::PopID();
     }
 }
 
@@ -494,7 +470,7 @@ static void drawDeleteModal(AppState& st, const fs::path& root) {
 
 // ---- body -----------------------------------------------------------------
 void drawFileExplorerBody(AppState& st) {
-    s_explorerStripe = 0;
+    ui::fmRowStripeReset();   // restart the FM stripe phase + refresh the shared FM palette
     ensureWorkspaceDir(st);
     fs::path root(st.workspaceDir);
 
@@ -517,28 +493,33 @@ void drawFileExplorerBody(AppState& st) {
         fs::is_regular_file(fs::path(s_selectedPath), curEc) &&
         isKnownExt(lowerExt(fs::path(s_selectedPath)));
 
-    ui::glassRowAtCursor(3.5f, false, false, 8.0f);
-    if (toolbarIconButton("open", "open", "Open selected file", selectedFile))
+    // Toolbar: the exact FeatureManager top-strip button (24px glass pill, 18px crisp glyph).
+    if (ui::fmToolbarIconBtn("fx_open", "open", "Open selected file", selectedFile) && selectedFile)
         requestOpen(st, fs::path(s_selectedPath));
     ImGui::SameLine(0, 3.0f * ui::uiScale);
-    if (toolbarIconButton("new_folder", "folder_new", "New folder"))
+    if (ui::fmToolbarIconBtn("fx_new_folder", "folder_new", "New folder", true))
         createNewFolder(st, root, current);
     ImGui::SameLine(0, 3.0f * ui::uiScale);
-    if (toolbarIconButton("paste", "paste", "Paste into current folder", !s_clipboardPath.empty()))
+    if (ui::fmToolbarIconBtn("fx_paste", "paste", "Paste into current folder",
+                             !s_clipboardPath.empty()) && !s_clipboardPath.empty())
         doPaste(st, root, current);
     ImGui::SameLine(0, 3.0f * ui::uiScale);
-    if (toolbarIconButton("refresh", "refresh", "Refresh"))
+    if (ui::fmToolbarIconBtn("fx_refresh", "refresh", "Refresh", true))
         st.toast(ui::ToastLevel::Info, "Explorer refreshed");
 
-    ui::glassRowAtCursor(3.5f, false, false, 5.0f);
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, explorerSurf().textSecondary);
-    std::string folderName = current.filename().string();
-    if (folderName.empty()) folderName = current.string();
-    ImGui::TextUnformatted(folderName.c_str());
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", current.string().c_str());
-    ImGui::Separator();
+    // Breadcrumb: the current folder, in an FM row pill (secondary ink, frame-padded centering).
+    {
+        std::string folderName = current.filename().string();
+        if (folderName.empty()) folderName = current.string();
+        ui::FmRowRect bc = ui::fmRowPill(false);
+        ImGui::SetCursorScreenPos(ImVec2(bc.mn.x + 6.0f * ui::uiScale, bc.mn.y));
+        ImGui::AlignTextToFramePadding();
+        ImGui::PushStyleColor(ImGuiCol_Text, explorerSurf().textSecondary);
+        ImGui::TextUnformatted(folderName.c_str());
+        ImGui::PopStyleColor();
+        ui::fmRowPillEnd(bc, false);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", current.string().c_str());
+    }
 
     drawRecentSection(st);
 
@@ -557,6 +538,7 @@ void drawFileExplorerBody(AppState& st) {
         }
     }
 
+    ui::fmSectionDivider("Workspace");
     ImGui::BeginChild("##fx_tree", ImVec2(0, 0), ImGuiChildFlags_None);
     std::error_code ec;
     if (fs::exists(root, ec))

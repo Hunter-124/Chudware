@@ -320,8 +320,10 @@ float drawDocTabs(AppState& st, float availW) {
         if (rightBound < 0.0f) rightBound = band.maxX - margin;
         const float winW = std::max(80.0f * s,
                                     std::min(contentW + 6.0f * s, rightBound - docX));
-        // Height hugs the band + a hair of slack so the rounded pills are not clipped.
-        const float winH = barH + ImGui::GetStyle().ItemSpacing.y + 2.0f * s;
+        // Height hugs the band + a hair of slack so the rounded pills are not clipped. The band
+        // itself is exactly barH tall now (centering fix below) — the old +ItemSpacing.y made the
+        // glass band taller than the top-aligned pills, so tab text / the "+" icon read high.
+        const float winH = barH + 2.0f * s;
         availW = winW;   // the strip lays out relative to this window's content width
         ImGui::SetNextWindowPos(ImVec2(docX, docY), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Always);
@@ -348,16 +350,18 @@ float drawDocTabs(AppState& st, float availW) {
     // workaround, and with a live backdrop the new per-rect UV projection samples one continuous
     // texture so that banding cannot recur (host facts, see local://glass_host.md).
     ImVec2 origin = ImGui::GetCursorScreenPos();
-    const ImGuiStyle& style = ImGui::GetStyle();
     // In the floating overlay window origin is already the strip's top-left; there is no dock node to
     // consult (the old inline strip pulled bandT from the central node top).
     float bandT = origin.y, bandL = origin.x;
-    const float bandB = origin.y + barH + style.ItemSpacing.y;
+    // Band hugs the pill row EXACTLY (was +ItemSpacing.y tall and +6dp wide): pills are barH tall
+    // and top-aligned at origin.y, so any extra band height/width below/right of them made every
+    // tab label and the "+" glyph look off-center in its background box (Hunter centering fix).
+    const float bandB = origin.y + barH;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     // The band hugs its CONTENT (contentW measured above the Begin) instead of spanning the full
     // window — a full-width glass slab with zero/few tabs read as a large dead strip (visual-review
     // fix); it now also matches the hugged window footprint.
-    const float bandR = std::min(origin.x + availW, bandL + contentW + 6.0f * s);
+    const float bandR = std::min(origin.x + availW, bandL + contentW);
     const ImRect bandRect(ImVec2(bandL, bandT), ImVec2(bandR, bandB));
     // Tell the pinned glass columns where the band REALLY ends (bandB sits below band.minY +
     // docTabStripHeight because origin.y is the central window's content cursor, not the node top)

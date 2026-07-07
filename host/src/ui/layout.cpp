@@ -95,6 +95,25 @@ float overlayColumnEdge(int slot) {
     if (g_overlayColEdgeFrame[slot] < ImGui::GetFrameCount() - 1) return -1.0f;
     return g_overlayColEdge[slot];
 }
+
+// ---- pinned-column rendered height (see layout.h) -----------------------------------------------
+// Mirrors publishOverlayColumnEdge: each column publishes its actual rendered height in pixels
+// once per frame so the orientation triad can decide whether the column reaches down to the triad
+// row and should push it right, or is short/collapsed so the triad stays at the far-left anchor.
+static float g_overlayColHeight[2]      = {-1.0f, -1.0f};
+static int   g_overlayColHeightFrame[2] = {-1, -1};
+
+void publishOverlayColumnHeight(int slot, float heightPx) {
+    if (slot < 0 || slot > 1) return;
+    g_overlayColHeight[slot] = heightPx;
+    g_overlayColHeightFrame[slot] = ImGui::GetFrameCount();
+}
+float overlayColumnHeight(int slot) {
+    if (slot < 0 || slot > 1) return -1.0f;
+    if (g_overlayColHeightFrame[slot] < ImGui::GetFrameCount() - 1) return -1.0f;
+    return g_overlayColHeight[slot];
+}
+
 // ---- doc-tab band bottom edge (see layout.h) -----------------------------------------------------
 // Frame-stamped like the column edges: a strip that stops drawing stops insetting one frame later.
 static float g_docTabBandBottom      = -1.0f;
@@ -342,6 +361,9 @@ void drawLeftPane(AppState& st,
     const ImRect lpPaneRect(lpWp, ImVec2(lpWp.x + lpWs.x, lpWp.y + lpWs.y));
     // Let the viewport HUD (triad / model-info pill) dodge the pinned column (layout.h).
     publishOverlayColumnEdge(0, lpPaneRect.Max.x);
+    // Also publish the column height so the triad can decide whether the FM column reaches down
+    // to the triad row (tall column → anchor right of FM; short/collapsed → anchor at far left).
+    publishOverlayColumnHeight(0, lpWs.y);
     const ui::AdaptiveSurface& surf =
         ui::adaptivePanel(ui::panelId("host_left_glass"), lpPaneRect, ui::GlassGroup::FeatureManager);
     const bool lpLive = ui::viewportBackdrop().valid();

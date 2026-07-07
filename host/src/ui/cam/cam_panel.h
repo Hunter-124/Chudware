@@ -23,6 +23,10 @@ void drawCamManager(AppState& st);
 
 // Reveal the CAM panel (called when the Manufacture ribbon workspace is activated).
 void camEnsureVisible();
+// Request focus for the CAM panel this frame (brings it in front of the Viewport in the shared
+// central dock node). Call every frame when the Manufacture workspace is active so the CAM tab
+// wins the docked-tab race against the Viewport window.
+void camRequestFocus();
 // Shot-only: float the panel so a headless AI_CAD_SHOT=cam capture can show the populated tree.
 void camFloatForShot();
 // Adopt an EXISTING CAM job doc (e.g. one the copilot's CAM fast-path just built) into the

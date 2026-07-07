@@ -37,4 +37,15 @@ void persistChatHistory(AppState& state);
 // Call once per frame from the main loop (alongside pollAiCadHandoff).
 void pollChatOpenFoam(AppState& state);
 
+// ---- AI workspace hub reuse (host/src/ui/ai/ai_workspace.cpp) --------------------------
+// Thin exported wrappers over this pane's internals so the full-page AI workspace renders the
+// SAME sessions/messages/composer state (st.chat / st.conversations / st.prompt / send path)
+// as the docked Copilot — zero duplicated chat logic. All emit widgets into the CURRENT
+// window/child; none Begin() a window of their own.
+void chatWorkspaceSync(AppState& st);                         // bind conversations to the active doc
+bool chatTurnActive(AppState& st);                            // an assistant turn is streaming
+void chatDrawLog(AppState& st);                               // the active conversation's turns
+void chatDrawComposer(AppState& st, bool busy, bool canRun);  // prelude + input + toolbar (real send path)
+void chatDrawSessionsList(AppState& st, bool busy);           // session rows + "+ New session"
+
 }  // namespace ui

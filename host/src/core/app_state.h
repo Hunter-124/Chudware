@@ -1131,6 +1131,9 @@ struct AppState {
     // [workspace-tabs seam] AI_CAD_SHOT=workspaces: cycle all 8 workspace tabs, one screenshot each.
     bool wantWorkspace = false;     // AI_CAD_SHOT=workspaces: workspace cycle scenario
     bool workspaceShotDone = false; // guard so the workspaces scenario runs exactly once
+    // AI_CAD_SHOT=motion: kinematic motion study end-to-end (2-body assembly + angle mate + playback).
+    bool wantMotion = false;        // AI_CAD_SHOT=motion scripted motion study scenario
+    bool motionShotDone = false;    // guard so the motion scenario runs exactly once
 
     // ---- W1-B: toast notification queue (rendered by ui::drawToasts in app.cpp) ----
     // C39: guarded by toastsMtx — the worker errorSink posts toasts from background threads

@@ -194,7 +194,7 @@ void plmCopyText(const char* id, const std::string& text, const float* col = nul
         ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.07f));
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], 1.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 2 * S));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5 * S);
     ImGui::SetNextItemWidth(-1);
     ImGui::InputText(id, buf, sizeof(buf), ImGuiInputTextFlags_ReadOnly);
@@ -367,7 +367,7 @@ void plmDrawOverviewPage(AppState& st) {
         if (ov.recent.empty()) { dimText("No history yet."); return; }
         for (const auto& e : ov.recent) {
             ImGui::PushID(e.commit.c_str());
-            plmCardBegin("##act", false, 8.0f, 4.0f,
+            plmCardBegin("##act", false, 8.0f, 3.0f,
                          e.kind == "release" ? palette.statusOk : palette.accent, 0.15f);
             std::string headline = !e.message.empty() ? e.message
                                  : (!e.summary.empty() ? e.summary : "(saved)");
@@ -383,7 +383,7 @@ void plmDrawOverviewPage(AppState& st) {
         } else {
             for (const auto& t : ov.tasks) {
                 ImGui::PushID(t.id.c_str());
-                plmCardBegin("##ovt", false, 8.0f, 6.0f, plmTintPriority(t.priority), 0.20f);
+                plmCardBegin("##ovt", false, 8.0f, 3.0f, plmTintPriority(t.priority), 0.20f);
                 plmCopyText("##ovtt", t.title);
                 priorityDot(t.priority);
                 plmCardEnd();
@@ -636,7 +636,7 @@ void drawFilesTab(AppState& st) {
         bool sel = (H.selectedItem == it.itemId);
         const float* ftint = it.dirty ? palette.statusWarn
                            : (it.lifecycle == "Released" ? palette.statusOk : palette.accent);
-        plmCardBegin("##fitem", sel, 8.0f, 6.0f, ftint, 0.13f);
+        plmCardBegin("##fitem", sel, 8.0f, 4.0f, ftint, 0.13f);
 
         // one padded row: [TAG] path .......... rev · lifecycle  ●
         plmDocTypeTag(it.docType, it.kind);
@@ -799,7 +799,7 @@ void plmDrawHistoryPage(AppState& st) {
         float cardTop = ImGui::GetCursorScreenPos().y;
         const float* htint = rel ? palette.statusOk
                            : (e.scope == "planning" ? palette.statusWarn : palette.accent);
-        plmCardBegin("##hrow", sel, 8.0f, 6.0f, htint, 0.13f);
+        plmCardBegin("##hrow", sel, 8.0f, 4.0f, htint, 0.13f);
         if (rel) {
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f));
@@ -982,7 +982,33 @@ void plmDrawSettingsPage(AppState& st) {
     plmSectionHeader("Settings", "settings");
     if (!H.setErr.empty()) { plmError(H.setErr); return; }
 
+    // ---- Category grid nav — one glass cell per settings group, so the page reads
+    //      as a tidy switcher instead of a long scroll and scales as groups are
+    //      added for bigger teams. Only one group's panel shows at a time. --------
+    struct SetCat { const char* label; const char* icon; };
+    static const SetCat kSetCats[] = {
+        {"Part numbers", "new_doc"}, {"AI assistance", "health_check"},
+        {"Organization", "settings"}, {"Team & Sync", "team"},
+    };
+    static int s_setCat = 0;
+    {
+        const int   cols = 4;
+        const float gg   = 8 * S;
+        const float gw   = ImGui::GetContentRegionAvail().x;
+        const float cw   = std::floor((gw - gg * (cols - 1)) / cols);
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gg, gg));
+        for (int i = 0; i < (int)IM_ARRAYSIZE(kSetCats); ++i) {
+            if (i % cols) ImGui::SameLine();
+            char cid[16]; std::snprintf(cid, sizeof(cid), "##setcat%d", i);
+            if (plmGlassButton(cid, kSetCats[i].label, kSetCats[i].icon, s_setCat == i, cw))
+                s_setCat = i;
+        }
+        ImGui::PopStyleVar();
+    }
+    ImGui::Dummy(ImVec2(0, 10 * S));
+
     // part-number scheme
+    if (s_setCat == 0) {
     plmPanelBegin("##set_pn", "Part-number scheme", "new_doc");
     dimText("New items are numbered <prefix>-0001, <prefix>-0002, … You can always "
             "rename a number later.");
@@ -1007,8 +1033,10 @@ void plmDrawSettingsPage(AppState& st) {
     }
     ImGui::PopStyleColor(2);
     plmPanelEnd();
+    }
 
-    ImGui::Dummy(ImVec2(0, 10 * S));
+    // AI assistance
+    if (s_setCat == 1) {
     plmPanelBegin("##set_ai", "AI assistance", "health_check");
     dimText("How much the assistant helps with history. Manual controls are always "
             "available.");
@@ -1036,12 +1064,13 @@ void plmDrawSettingsPage(AppState& st) {
         ImGui::PopStyleColor();
     }
     plmPanelEnd();
+    }
 
     // ---- Organization & access (preview — applies once a team is connected) ----
-    ImGui::Dummy(ImVec2(0, 10 * S));
+    if (s_setCat == 2) {
     plmPanelBegin("##set_org", "Organization & access", "settings");
     dimText("Who can see and change this project. These apply once you connect a "
-            "team (Team & Sync on the Planning page).");
+            "team (see Team & Sync).");
 
     // project visibility
     ImGui::Dummy(ImVec2(0, 2 * S));
@@ -1082,6 +1111,29 @@ void plmDrawSettingsPage(AppState& st) {
     dimText("Preview — permissions are enforced server-side once team sharing is "
             "enabled; nothing here changes single-machine use.");
     plmPanelEnd();
+    }
+
+    // ---- Team & Sync (moved here from the Planning page) ----
+    if (s_setCat == 3) {
+    plmPanelBegin("##set_team", "Team & Sync", "team");
+    dimText("Share a project through a shared folder or your own server. Everyone "
+            "keeps working; Sync brings changes together without ever merging or "
+            "losing work — if two people change the same design, both versions are "
+            "kept.");
+    ImGui::Dummy(ImVec2(0, 6 * S));
+    ImGui::TextUnformatted("Shared locations");
+    dimText("No shared location connected yet.");
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    ImGui::BeginDisabled(true);
+    ImGui::Button("Connect a shared folder\xe2\x80\xa6");
+    ImGui::SameLine();
+    ImGui::Button("Sync now");
+    ImGui::EndDisabled();
+    ImGui::Dummy(ImVec2(0, 2 * S));
+    dimText("Sharing and Sync arrive in a later update — the project is fully "
+            "usable on this machine today.");
+    plmPanelEnd();
+    }
 }
 
 // ---- Planning (kanban + milestones) -------------------------------------------
@@ -1282,7 +1334,7 @@ static void drawMilestoneRow(AppState& st, const PlmMilestoneRow& m) {
     bool done = (m.status == "done");
     bool editing = (H.msEditId == m.id);
     ImGui::PushID(m.id.c_str());
-    plmCardBegin("##ms", editing, 8.0f, 4.0f,
+    plmCardBegin("##ms", editing, 8.0f, 3.0f,
                  done ? palette.statusOk : palette.accent, 0.15f);
     if (editing) {
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5 * S, 3 * S));
@@ -1358,7 +1410,7 @@ static void drawIssueRow(AppState& st, const PlmIssueRow& is) {
     const float S = ui::uiScale;
     bool closed = (is.state == "closed");
     ImGui::PushID(is.id.c_str());
-    plmCardBegin("##is", false, 8.0f, 4.0f, plmTintSeverity(is.severity), 0.16f);
+    plmCardBegin("##is", false, 8.0f, 3.0f, plmTintSeverity(is.severity), 0.16f);
     const float* sc = palette.textDim;
     if (is.severity == "critical" || is.severity == "high") sc = palette.statusErr;
     else if (is.severity == "med") sc = palette.statusWarn;
@@ -1520,8 +1572,11 @@ void plmDrawPlanningPage(AppState& st) {
     // Floor the width and shave a pixel so 4 columns + 3 gaps never exceed the
     // available width (sub-pixel overflow would wrap the 4th column onto a new row).
     float colW = std::floor((ImGui::GetContentRegionAvail().x - gap * 3) / 4.0f) - 1.0f;
-    float colH = ImGui::GetContentRegionAvail().y - 8 * S;  // fill to the page bottom
-    if (colH < 240 * S) colH = 240 * S;
+    // Reserve the column-label line (drawn above each box) so label + box fit the
+    // page exactly — otherwise the box bottoms spilled past the non-scrolling page.
+    float colH = ImGui::GetContentRegionAvail().y
+               - ImGui::GetTextLineHeightWithSpacing() - 6 * S;
+    if (colH < 220 * S) colH = 220 * S;
 
     for (int ci = 0; ci < 4; ++ci) {
         const auto& col = kCols[ci];
@@ -1556,7 +1611,7 @@ void plmDrawPlanningPage(AppState& st) {
             const auto& t = *tp;
             ImGui::PushID(t.id.c_str());
             bool sel = (s_selTask == t.id);
-            plmCardBegin("##task", sel, 8.0f, 4.0f, plmTintPriority(t.priority), 0.22f);
+            plmCardBegin("##task", sel, 8.0f, 3.0f, plmTintPriority(t.priority), 0.22f);
 
             // Title wraps to the card width so the card auto-grows (AutoResizeY) to
             // fit a long title instead of clipping it to one line.

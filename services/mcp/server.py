@@ -315,6 +315,12 @@ register_tolerance_tools(mcp)
 # Mechanical engineering checks (T-BL18): AGMA gear tooth stress + ISO 281 bearing life.
 from mcp_server.mechanical_tools import register_mechanical_tools
 register_mechanical_tools(mcp)
+# 3D sketch + sketch preview tools: sketch3d_new/add_curves/get/clear/as_sweep_guide,
+# render_sketch, sketch_preview_text, doc_sketch_contact_sheet, sketch3d_preview.
+# These give an AI driver the same 3D-sketch and 2D-sketch-preview capabilities the GUI
+# provides in the Sketch3D workspace + sketch overlay (no C++ build required — Python only).
+from mcp_server.sketch3d_tools import register_sketch3d_tools
+register_sketch3d_tools(_reg.view(mcp, "cad"))
 
 
 def _install_clean_stdout():

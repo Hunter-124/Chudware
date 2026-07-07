@@ -264,7 +264,7 @@ static void drawFileRow(AppState& st, const fs::path& root, const fs::path& p, c
         ImVec2 rowPos = ImGui::GetCursorScreenPos();
         ImGui::TreeNodeEx(p.filename().string().c_str(),
                           ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
-                          ImGuiTreeNodeFlags_SpanFullWidth);
+                          ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
         ui::fmTreeIconInArrowSlot(rowPos, fileIconName(ext), fileIconFallback(ext));
         ui::fmRowPillEnd(rr, selected);
         if (ImGui::IsItemClicked()) {
@@ -308,7 +308,8 @@ static void drawDirNode(AppState& st, const fs::path& root, const fs::path& dir,
     // The "Workspace" section rule above the tree already names the section; the root row just
     // shows the workspace folder's own name (FM-style: divider carries the section label).
     std::string label = dir.filename().string();
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth;
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth |
+                               ImGuiTreeNodeFlags_FramePadding;   // pill-height node
     if (isRoot) flags |= ImGuiTreeNodeFlags_DefaultOpen;
     const bool dirSelected = (s_selectedPath == dir.string());
 
@@ -412,7 +413,7 @@ static void drawRecentSection(AppState& st) {
         if (!exists) ImGui::PushStyleColor(ImGuiCol_Text, explorerSurf().textSecondary);
         ImGui::TreeNodeEx(p.filename().string().c_str(),
                           ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
-                          ImGuiTreeNodeFlags_SpanFullWidth);
+                          ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_FramePadding);
         if (!exists) ImGui::PopStyleColor();
         ui::fmTreeIconInArrowSlot(rowPos, fileIconName(ext), fileIconFallback(ext),
                                   exists ? 1.0f : 0.45f);

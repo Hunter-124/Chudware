@@ -115,17 +115,28 @@ static const FmPalette& fmPalette() { return g_fmPal; }
 // Attempt to draw a named atlas icon; fall back to a text glyph if the atlas is absent.
 // C37-E: `alpha` dims the icon (suppressed / rolled-back rows get a faded icon, item 6).
 static void treeIcon(const char* name, const char* fallback, float size = 16.0f, float alpha = 1.0f) {
+    // Red-pen fix (Hunter round-2): the old ImGui::Image draw sat at the LINE TOP (too high in
+    // the frame-height row pill) and at the row's raw left edge (the Origin icon clipped into
+    // the pill's rounded corner). Reserve a frame-height slot inset by FramePadding.x, then
+    // paint the glyph draw-list-centered in it — same vertical math as treeIconInArrowSlot.
+    const float px     = size * ui::uiScale;                  // #4.1: DPI-scaled quad
+    const float insetX = ImGui::GetStyle().FramePadding.x;    // 6dp inside fmRowPill (polish G2)
+    const float rowH   = ImGui::GetFrameHeight();             // == the row pill's height
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(insetX + px, rowH));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
     IconUV iv = getIcon(name, 20);
     if (iv.valid) {
-        // #4.1: raw px literal — scale the drawn quad so the icon tracks DPI (fonts are pre-scaled).
-        float px = size * ui::uiScale;
-        ImGui::Image(iv.texId, ImVec2(px, px), iv.uv0, iv.uv1, ImVec4(1, 1, 1, alpha));
+        ImVec2 ip(p0.x + insetX, p0.y + (rowH - px) * 0.5f);
+        dl->AddImage(iv.texId, ip, ImVec2(ip.x + px, ip.y + px), iv.uv0, iv.uv1,
+                     IM_COL32(255, 255, 255, (int)(alpha * 255.0f)));
     } else {
-        if (alpha < 1.0f) ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(fmSurf().textSecondary.x, fmSurf().textSecondary.y,
-                   fmSurf().textSecondary.z, alpha));
-        ImGui::TextUnformatted(fallback);
-        if (alpha < 1.0f) ImGui::PopStyleColor();
+        const ui::AdaptiveSurface& surf = fmSurf();
+        dl->AddText(ImVec2(p0.x + insetX, p0.y + (rowH - ImGui::GetFontSize()) * 0.5f),
+                    ImGui::ColorConvertFloat4ToU32(
+                        ImVec4(surf.textSecondary.x, surf.textSecondary.y,
+                               surf.textSecondary.z, alpha)),
+                    fallback);
     }
 }
 
@@ -353,16 +364,18 @@ static void featureBadge(bool ok, bool hasError, const std::string& errText,
     const float w = 2.0f * r + 4.0f * S;   // dot diameter + breathing room
     ImGui::SameLine();
     ImVec2 p = ImGui::GetCursorScreenPos();
-    float  lineH = ImGui::GetTextLineHeight();
-    ImVec2 center(p.x + r + 2.0f * S, p.y + lineH * 0.5f);
+    // Center on the just-submitted node's FULL rect (pill-height rows, red-pen round-2) — the
+    // old GetTextLineHeight() center rode ~4dp high once rows became frame-height.
+    float  rowH = ImGui::GetItemRectSize().y;
+    ImVec2 center(p.x + r + 2.0f * S, p.y + rowH * 0.5f);
     // A non-interactive Dummy advances the layout cursor by [w]; the tooltip uses a geometric
     // IsMouseHoveringRect (same pattern as the per-row eye above) so the badge never captures hover
     // or competes with the row's click / context-menu binding — tree behavior is unchanged.
-    ImGui::Dummy(ImVec2(w, lineH));
+    ImGui::Dummy(ImVec2(w, rowH));
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (hollow) dl->AddCircle(center, r, col, 0, std::max(1.0f, 1.5f * S));
     else        dl->AddCircleFilled(center, r, col);
-    if (hasTip && ImGui::IsMouseHoveringRect(p, ImVec2(p.x + w, p.y + lineH)))
+    if (hasTip && ImGui::IsMouseHoveringRect(p, ImVec2(p.x + w, p.y + rowH)))
         ImGui::SetTooltip("%s", tip.c_str());
 }
 
@@ -396,9 +409,13 @@ static void treeSectionDivider(const char* label) {
     ImVec2 p = ImGui::GetCursorScreenPos();
     float  w = ImGui::GetContentRegionAvail().x;
     float  lineH = ImGui::GetTextLineHeight();
+    const float rowH = lineH + 4.0f * S;           // the Dummy row reserved below
     ImVec2 tsz = ImGui::CalcTextSize(label);
     float  textX = p.x + (w - tsz.x) * 0.5f;
-    float  cy = p.y + lineH * 0.5f;
+    // Red-pen round-2: center label + hairlines in the FULL reserved row (the old text-at-p.y /
+    // cy-at-lineH/2 pair sat 2dp high against the row's extra bottom padding).
+    float  textY = p.y + (rowH - lineH) * 0.5f;
+    float  cy = p.y + rowH * 0.5f;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImU32 lineCol = ui::Palette::toU32(pal.border);
     if (textX > p.x + 4.0f * S) {   // guard tiny panels (avoid zero/negative-length segments)
@@ -407,13 +424,13 @@ static void treeSectionDivider(const char* label) {
         dl->AddLine(ImVec2(textX + tsz.x + 6.0f * S, cy), ImVec2(p.x + w - 4.0f * S, cy),
                     lineCol, std::max(1.0f, 1.0f * S));
     }
-    ImGui::SetCursorScreenPos(ImVec2(textX, p.y));
+    ImGui::SetCursorScreenPos(ImVec2(textX, textY));
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(pal.treeSection[0], pal.treeSection[1], pal.treeSection[2], pal.treeSection[3]));
     ImGui::TextUnformatted(label);
     ImGui::PopStyleColor();
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y));
-    ImGui::Dummy(ImVec2(w, lineH + 4.0f * S));
+    ImGui::Dummy(ImVec2(w, rowH));
 }
 
 // ---- exported thin wrappers (feature_tree.h "Shared FeatureManager row styling") ----
@@ -950,10 +967,15 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
         return res;
     }
 
+    // FramePadding flag (red-pen round-2): without it a TreeNodeEx is TEXT height drawn at the
+    // row top — every label sat ~4dp too high inside the frame-height row pill, and the eye /
+    // badge (centered on the node rect) rode up with it. With it the node IS pill-height and
+    // ImGui centers the label via the pushed 4dp FramePadding.y.
     ImGuiTreeNodeFlags flags =
         ImGuiTreeNodeFlags_Leaf |
         ImGuiTreeNodeFlags_NoTreePushOnOpen |
-        ImGuiTreeNodeFlags_SpanFullWidth;
+        ImGuiTreeNodeFlags_SpanFullWidth |
+        ImGuiTreeNodeFlags_FramePadding;
 
     // Suppressed → dim. Rolled back → dim + italic-ish look (we cannot truly italicize a
     // default font, so we use the lighter dim + the "(Rolled back)" cue in the badge/tooltip).
@@ -1449,7 +1471,8 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
             std::string label = (fixed ? "(f) " : "") + cname;
             if (suppressed) label += " [S]";
             ImGuiTreeNodeFlags lf = ImGuiTreeNodeFlags_Leaf |
-                ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanFullWidth;
+                ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanFullWidth |
+                ImGuiTreeNodeFlags_FramePadding;   // pill-height node (red-pen round-2)
             ImVec2 compRowPos = ImGui::GetCursorScreenPos();
             ImGui::TreeNodeEx((label + "##comp_" + cid).c_str(), lf);
             treeIconInArrowSlot(compRowPos, isAsm ? "assembly" : "part", isAsm ? "[A]" : "[P]");
@@ -1465,7 +1488,8 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
     FmRowRect matesRect = fmRowPill();
     treeIcon("mates_folder", "[M]", 16.0f);
     ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
-    ImGuiTreeNodeFlags ff = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth;
+    ImGuiTreeNodeFlags ff = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanFullWidth |
+                            ImGuiTreeNodeFlags_FramePadding;   // pill-height node
     bool matesOpen = ImGui::TreeNodeEx("Mates##mates_folder", ff);
     fmRowPillEnd(matesRect);
     if (matesOpen) {
@@ -1496,7 +1520,8 @@ static void drawAssemblyTree(AppState& st, const nlohmann::json& tree,
                 if (msup) ImGui::PushStyleColor(ImGuiCol_Text,
                     ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 0.75f));
                 ImGuiTreeNodeFlags mf = ImGuiTreeNodeFlags_Leaf |
-                    ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanFullWidth;
+                    ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_SpanFullWidth |
+                    ImGuiTreeNodeFlags_FramePadding;   // pill-height node
                 ImVec2 mateRowPos = ImGui::GetCursorScreenPos();
                 ImGui::TreeNodeEx((row + "##mate_" + mid).c_str(), mf);
                 treeIconInArrowSlot(mateRowPos, "mate", "[m]", msup ? 0.6f : 1.0f);
@@ -2127,7 +2152,8 @@ void drawFeatureTreeBody(AppState& st,
     {
         ImGuiTreeNodeFlags rootFlags =
             ImGuiTreeNodeFlags_DefaultOpen |
-            ImGuiTreeNodeFlags_SpanFullWidth;
+            ImGuiTreeNodeFlags_SpanFullWidth |
+            ImGuiTreeNodeFlags_FramePadding;   // pill-height node (red-pen round-2)
         FmRowRect rootRect = fmRowPill();
         bool rootOpen = ImGui::TreeNodeEx(docName.c_str(), rootFlags);
         fmRowPillEnd(rootRect);
@@ -2189,7 +2215,8 @@ void drawFeatureTreeBody(AppState& st,
                 }
                 ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_Leaf |
                                        ImGuiTreeNodeFlags_NoTreePushOnOpen |
-                                       ImGuiTreeNodeFlags_SpanFullWidth;
+                                       ImGuiTreeNodeFlags_SpanFullWidth |
+                                       ImGuiTreeNodeFlags_FramePadding;   // pill-height node
                 char eqLabel[64];
                 std::snprintf(eqLabel, sizeof(eqLabel), "Equations (%d)##eqhdr", eqCount);
                 FmRowRect eqRect = fmRowPill();
@@ -2206,7 +2233,8 @@ void drawFeatureTreeBody(AppState& st,
             {
                 ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_Leaf |
                                        ImGuiTreeNodeFlags_NoTreePushOnOpen |
-                                       ImGuiTreeNodeFlags_SpanFullWidth;
+                                       ImGuiTreeNodeFlags_SpanFullWidth |
+                                       ImGuiTreeNodeFlags_FramePadding;   // pill-height node
                 std::string matKey;
                 if (tree.is_object()) {
                     auto m = tree.find("material");
@@ -2301,7 +2329,8 @@ void drawFeatureTreeBody(AppState& st,
                     treeIcon("body_folder", "[F]", 16.0f);   // #4.4: was borrowed "mates_folder"
                     ImGui::SameLine(0, 4 * ui::uiScale);   // #4.5
                     bool open = ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_DefaultOpen |
-                                                       ImGuiTreeNodeFlags_SpanFullWidth);
+                                                       ImGuiTreeNodeFlags_SpanFullWidth |
+                                                       ImGuiTreeNodeFlags_FramePadding);
                     fmRowPillEnd(bodiesRect);
                     if (open) {
                         for (int bi = 0; bi < nBodies; ++bi) {
@@ -2312,7 +2341,8 @@ void drawFeatureTreeBody(AppState& st,
                             std::snprintf(bname, sizeof(bname), "Body%u", bid);
                             ImGuiTreeNodeFlags bf = ImGuiTreeNodeFlags_Leaf |
                                                     ImGuiTreeNodeFlags_NoTreePushOnOpen |
-                                                    ImGuiTreeNodeFlags_SpanFullWidth;
+                                                    ImGuiTreeNodeFlags_SpanFullWidth |
+                                                    ImGuiTreeNodeFlags_FramePadding;
                             FmRowRect bodyRect = fmRowPill();
                             if (hidden)
                                 ImGui::PushStyleColor(ImGuiCol_Text,
@@ -2380,7 +2410,8 @@ void drawFeatureTreeBody(AppState& st,
             {
                 ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_DefaultOpen |
                                        ImGuiTreeNodeFlags_SpanFullWidth |
-                                       ImGuiTreeNodeFlags_OpenOnArrow;
+                                       ImGuiTreeNodeFlags_OpenOnArrow |
+                                       ImGuiTreeNodeFlags_FramePadding;   // pill-height node
                 bool originSelected = (st.selectedFeatureId == "point.origin");
                 bool originHidden   = st.hiddenFeatures.count("point.origin") > 0;
                 FmRowRect originRect = fmRowPill(originSelected);
@@ -2439,7 +2470,8 @@ void drawFeatureTreeBody(AppState& st,
                     for (int pi = 0; pi < 3; ++pi) {
                         ImGuiTreeNodeFlags pf = ImGuiTreeNodeFlags_Leaf |
                                                 ImGuiTreeNodeFlags_NoTreePushOnOpen |
-                                                ImGuiTreeNodeFlags_SpanFullWidth;
+                                                ImGuiTreeNodeFlags_SpanFullWidth |
+                                                ImGuiTreeNodeFlags_FramePadding;
                         // T-G18: selection is shown by fmRowPill's glass card (like feature rows);
                         // the ImGui Selected/Header paint on top read heavier than a feature row.
                         bool planeShownEff = st.showPlane[pi] || planesAutoShow;
@@ -2932,7 +2964,8 @@ void drawFeatureTreeBody(AppState& st,
                                 folderOpen = ImGui::TreeNodeEx(
                                     (folder + "##fld_" + folder).c_str(),
                                     ImGuiTreeNodeFlags_DefaultOpen |
-                                    ImGuiTreeNodeFlags_SpanFullWidth);
+                                    ImGuiTreeNodeFlags_SpanFullWidth |
+                                    ImGuiTreeNodeFlags_FramePadding);
                                 fmRowPillEnd(fldRect);
                                 ImGui::PopStyleVar();
                                 ImGui::PopStyleColor();
@@ -3092,15 +3125,23 @@ void drawFeatureTreeBody(AppState& st,
             }
         } else {
             // File name on its own dimmed line (a narrow panel must never push it — or the
-            // buttons — past the edge); the full path shows on hover.
-            ui::glassRowAtCursor(3.5f, false, false, 5.0f);
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1.0f));
-            std::string fileLabel = s_docPath.empty() ? "(unsaved)" : pathBaseName(s_docPath);
-            ImGui::TextUnformatted(fileLabel.c_str());
-            ImGui::PopStyleColor();
-            if (!s_docPath.empty() && ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", s_docPath.c_str());
+            // buttons — past the edge); the full path shows on hover. Red-pen round-2: the old
+            // glassRowAtCursor + raw Text drew the label flush into the pill's rounded left
+            // corner and at the row top — use the standard fmRowPill with the 6dp left inset and
+            // frame-padded vertical centering (same treatment as the Explorer breadcrumb).
+            {
+                std::string fileLabel = s_docPath.empty() ? "(unsaved)" : pathBaseName(s_docPath);
+                ui::FmRowRect fr = ui::fmRowPill(false);
+                ImGui::SetCursorScreenPos(ImVec2(fr.mn.x + 6.0f * ui::uiScale, fr.mn.y));
+                ImGui::AlignTextToFramePadding();
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(pal.textDim[0], pal.textDim[1], pal.textDim[2], 1.0f));
+                ImGui::TextUnformatted(fileLabel.c_str());
+                ImGui::PopStyleColor();
+                ui::fmRowPillEnd(fr, false);
+                if (!s_docPath.empty() && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", s_docPath.c_str());
+            }
             bool canSave = st.docMirror.hasDoc();
             // Adaptive glass chips: theme Button colors don't track the live backdrop, which left
             // the labels near-invisible over the frosted column (visual-review fix). Fill + ink

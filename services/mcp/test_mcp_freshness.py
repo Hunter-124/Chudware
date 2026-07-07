@@ -21,6 +21,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 
 # ---------------------------------------------------------------------------
@@ -39,10 +40,21 @@ def _stub_core_bridge():
     sys.modules.setdefault("core_bridge", mod)
 
 
-def _ensure_stubs():
-    """Ensure lightweight stubs are in place before importing the server."""
-    _stub_core_bridge()
-    # mcp package stub — only FastMCP is needed
+def _build_stubs() -> dict:
+    """Build a dict of lightweight stub modules for use with patch.dict(sys.modules, ...)."""
+    stubs: dict[str, object] = {}
+
+    # core_bridge stubs (use setdefault so they don't clobber real ones)
+    for key in ("mcp_server.core_bridge", "core_bridge"):
+        if key not in sys.modules:
+            mod = types.ModuleType(key)
+            mod.available = lambda: False  # type: ignore[attr-defined]
+            mod.call = lambda method, params=None: {}  # type: ignore[attr-defined]
+            mod.feat = lambda *a, **kw: {}  # type: ignore[attr-defined]
+            mod.dim = lambda v, unit="mm": {"value": v, "unit": unit}  # type: ignore[attr-defined]
+            stubs[key] = mod
+
+    # mcp package stub — only install if the real mcp is not present
     if "mcp" not in sys.modules:
         mcp_pkg = types.ModuleType("mcp")
         server_mod = types.ModuleType("mcp.server")
@@ -65,27 +77,27 @@ def _ensure_stubs():
                 return self._tools
 
         fastmcp_mod.FastMCP = _FakeFastMCP
-        sys.modules["mcp"] = mcp_pkg
-        sys.modules["mcp.server"] = server_mod
-        sys.modules["mcp.server.fastmcp"] = fastmcp_mod
+        stubs["mcp"] = mcp_pkg
+        stubs["mcp.server"] = server_mod
+        stubs["mcp.server.fastmcp"] = fastmcp_mod
 
     # mcp.server.stdio stub
     if "mcp.server.stdio" not in sys.modules:
         stdio_mod = types.ModuleType("mcp.server.stdio")
-        sys.modules["mcp.server.stdio"] = stdio_mod
+        stubs["mcp.server.stdio"] = stdio_mod
 
     # anyio stub
     if "anyio" not in sys.modules:
         anyio_mod = types.ModuleType("anyio")
-        anyio_mod.run = lambda coro: None
-        anyio_mod.wrap_file = lambda f: f
-        sys.modules["anyio"] = anyio_mod
+        anyio_mod.run = lambda coro: None  # type: ignore[attr-defined]
+        anyio_mod.wrap_file = lambda f: f  # type: ignore[attr-defined]
+        stubs["anyio"] = anyio_mod
 
     # mcp_server package stub (so sub-imports work)
     if "mcp_server" not in sys.modules:
         pkg = types.ModuleType("mcp_server")
-        pkg.__path__ = []
-        sys.modules["mcp_server"] = pkg
+        pkg.__path__ = []  # type: ignore[attr-defined]
+        stubs["mcp_server"] = pkg
 
     # tool_registry stub
     if "mcp_server.tool_registry" not in sys.modules:
@@ -102,8 +114,16 @@ def _ensure_stubs():
             def __getattr__(self, name):
                 return getattr(self._mcp, name)
 
-        reg_mod.view = lambda mcp, family: _View(mcp, family)
-        sys.modules["mcp_server.tool_registry"] = reg_mod
+        reg_mod.view = lambda mcp, family: _View(mcp, family)  # type: ignore[attr-defined]
+        stubs["mcp_server.tool_registry"] = reg_mod
+
+    return stubs
+
+
+def _ensure_stubs():
+    """Ensure lightweight stubs are in place (module-level call for corpus builder)."""
+    for key, mod in _build_stubs().items():
+        sys.modules.setdefault(key, mod)
 
 
 # ---------------------------------------------------------------------------
@@ -382,11 +402,23 @@ class TestMCPFreshness(unittest.TestCase):
     """Consistency: every registered tool family is discoverable from the agent's entry points."""
 
     _corpus: str = ""
+    _stubs_patcher: object = None  # patch.dict context manager
 
     @classmethod
     def setUpClass(cls):
+        # Install stubs only for the duration of this test class so they don't
+        # leak into later test modules (e.g. test_reveng_e2e_datasheet which
+        # needs the *real* mcp.server.fastmcp.FastMCP with _tool_manager).
+        stubs = _build_stubs()
+        cls._stubs_patcher = patch.dict(sys.modules, stubs)
+        cls._stubs_patcher.start()
         cls._corpus = _build_coverage_corpus()
         assert cls._corpus, "Coverage corpus is empty — check import paths"
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._stubs_patcher is not None:
+            cls._stubs_patcher.stop()
 
     def test_corpus_nonempty(self):
         """Sanity: corpus must have meaningful content."""

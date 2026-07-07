@@ -399,9 +399,14 @@ PickHit IdPass::pickFinalPreferEdge(int px, int py, int finalW, int finalH, int 
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    // Nearest EDGE/VERTEX pixel to the cursor, within the (circular) radius, skipping hidden bodies.
-    long bestD2 = (long)rss * rss + 1;
-    PickHit best;
+    // Two-tier nearest search within the (circular) radius, skipping hidden bodies. Vertices are a
+    // smaller target than edges, which are a smaller target than faces, so precedence is strictly
+    // by KIND first, distance second: ANY vertex in range beats EVERY edge, and any edge/vertex beats
+    // the center face. Within a tier we take the pixel nearest the cursor. (A center pixel that was
+    // already Edge/Vertex returned above, unchanged — Convert Entities relies on that.)
+    long bestVD2 = (long)rss * rss + 1;
+    long bestED2 = (long)rss * rss + 1;
+    PickHit bestV, bestE;
     for (int j = 0; j < bh; ++j) {
         for (int i = 0; i < bw; ++i) {
             uint32_t v = block[(size_t)j * bw + i];
@@ -410,10 +415,16 @@ PickHit IdPass::pickFinalPreferEdge(int px, int py, int finalW, int finalH, int 
             if (k != PickKind::Edge && k != PickKind::Vertex) continue;
             long dx = (long)(x0 + i) - cx, dy = (long)(y0 + j) - cy;
             long d2 = dx * dx + dy * dy;
-            if (d2 < bestD2) { bestD2 = d2; best = decodeId(v); }
+            if (k == PickKind::Vertex) {
+                if (d2 < bestVD2) { bestVD2 = d2; bestV = decodeId(v); }
+            } else {  // Edge
+                if (d2 < bestED2) { bestED2 = d2; bestE = decodeId(v); }
+            }
         }
     }
-    return best.valid() ? best : center;
+    if (bestV.valid()) return bestV;   // vertex tier wins outright
+    if (bestE.valid()) return bestE;   // else nearest edge
+    return center;                     // else the exact-pixel face (or background)
 }
 
 }  // namespace render

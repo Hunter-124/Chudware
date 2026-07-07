@@ -1775,10 +1775,19 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // plane pick. The plane picker (drawPlanePicker) hit-tests them and feeds pmPlaneHover() back.
         bool pmWantsPlane = !inSketch && st.propertyManager && st.propertyManager->active() &&
                             st.propertyManager->activeWellWantsPlane();
-        // C37-C item 5: while sketchPlanePickActive, force-show all three origin planes (the sketcher
-        // needs them visible so the user can pick one). This uses the same effPlane mechanism as
-        // the empty-doc state (viewport_panel.cpp:290-294 convention).
-        if (st.sketchPlanePickActive || pmWantsPlane)
+        // C37-C item 5: while sketchPlanePickActive, force-show all three origin planes so a first
+        // sketch has something to click — BUT only on an empty scene. If visible model geometry is
+        // already present (e.g. an extruded cube the user wants to pick a face of), forcing the three
+        // datum planes on just clutters the view over the geometry; the plane hit-test still runs, so
+        // the user can pick a planar face instead. We only ever OR-in true (never force-HIDE), so a
+        // plane the user explicitly turned on stays on regardless. "Visible geometry" = at least one
+        // shown solid body (bodyVisible is one slot per non-empty body, default-visible on load).
+        bool anyVisibleBody = false;
+        for (uint8_t v : st.bodyVisible)
+            if (v) { anyVisibleBody = true; break; }
+        // pmWantsPlane (ref-plane/ref-axis creation) genuinely needs the origin planes as pickable
+        // datums even amid geometry, so it stays unconditional.
+        if ((st.sketchPlanePickActive && !anyVisibleBody) || pmWantsPlane)
             effPlane[0] = effPlane[1] = effPlane[2] = true;
         if (inSketch) { bool none[3] = {false,false,false}; renderer.setPlanes(none, -1); }
         else if (st.sketchPlanePickActive && sketch != nullptr)
@@ -2706,9 +2715,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 const bool preferEdge = inAnySketch ||
                     (st.propertyManager && st.propertyManager->active() &&
                      st.propertyManager->activeWellPrefersEdge());
-                st.hover = preferEdge
-                    ? st.idPass->pickFinalPreferEdge(px, py, vw, vh, (int)(14.0f * ui::uiScale))
-                    : st.idPass->pickFinal(px, py, vw, vh);
+                // General viewport hover ALSO snaps to nearby edges/vertices (SolidWorks/Fusion pick
+                // feel): points and edges are tiny targets, so an exact single-pixel pick almost
+                // always lands on a face interior and thin geometry becomes unclickable. Use a modest
+                // radius here so faces stay pickable in their interiors, and the larger reference
+                // radius for the tools that explicitly hunt edges (Convert Entities, edge wells).
+                // pickFinalPreferEdge falls back to the exact-pixel face when nothing thin is in range.
+                const float snapRadius = preferEdge ? 14.0f : 7.0f;
+                st.hover = st.idPass->pickFinalPreferEdge(px, py, vw, vh,
+                                                          (int)(snapRadius * ui::uiScale));
             } else {
                 st.hover = render::PickHit{};
             }

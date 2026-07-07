@@ -1,13 +1,15 @@
-"""Smoke tests for services/mcp/sketch3d_tools.py.
+"""Tests for services/mcp/sketch3d_tools.py — ENGINE-BACKED sketch3d tools.
 
-Tests the Python-side logic (3D sketch CRUD, geometry, connectivity analysis) without
-requiring the C++ core / libaicad.  Engine-backed tools (render_sketch, doc_sketch_contact_sheet,
-sketch3d_as_sweep_guide) are exercised in the skip-guarded section at the bottom.
+The sketch3d_* tools drive the real doc feature `sketch3d` (doc_schema §3B,
+contracts/sketch3d_gui_contract.md): create/edit via doc_apply_ops, solve via the
+stateless sketch3d_health RPC, sweep consumption via the sweep path/guides refs.
+
+Pure-Python helpers (curve mapping, arc tessellation, path sampling, narration) are
+tested without the engine; everything else is skip-guarded on libaicad availability.
 
 Run:
   cd /home/hunter/Repositories/CAD
   python3 -m pytest services/mcp/test_sketch3d_tools.py -q
-  python3 services/mcp/test_sketch3d_tools.py            # also works
 """
 from __future__ import annotations
 
@@ -50,7 +52,13 @@ _unshadow_mcp_sdk()
 import pytest  # noqa: E402
 
 from mcp_server import core_bridge as cb  # noqa: E402
-from mcp_server.sketch3d_tools import _STORE, _S3Sketch, _seg_from_dict  # noqa: E402
+from mcp_server.sketch3d_tools import (  # noqa: E402
+    _arc_polyline,
+    _curves_to_entities,
+    _free_narration,
+    _polyline_length,
+    _sample_polyline,
+)
 
 _engine_available = cb.available()
 
@@ -58,20 +66,13 @@ _engine_available = cb.available()
 # ─────────────────────────────────────────────── helpers ──────────────────────
 
 def _call(name: str, args: dict):
-    """Invoke a registered MCP tool; return (parsed_json_or_None, raw_content).
-
-    Handles both the two-value (content, structured) return from FastMCP tools that
-    return a string, and the single-value return from tools that return [Image, text]
-    (image-bearing tools — those return a flat list from call_tool in some MCP versions).
-    """
+    """Invoke a registered MCP tool; return (parsed_json_or_None, raw_content)."""
     from mcp_server import server
     result = asyncio.run(server.mcp.call_tool(name, args))
-    # FastMCP may return (content_list, structured_dict) or just a content_list.
     if isinstance(result, tuple) and len(result) == 2:
         content, structured = result
         text = structured.get("result") if isinstance(structured, dict) else None
     else:
-        # Image / list return — content is the result itself; no structured JSON.
         content = result
         text = None
     parsed = None
@@ -80,7 +81,6 @@ def _call(name: str, args: dict):
             parsed = json.loads(text)
         except json.JSONDecodeError:
             parsed = None
-    # For image returns, check if any content item is text we can parse.
     if parsed is None and isinstance(content, (list, tuple)):
         for item in content:
             raw = getattr(item, "text", None)
@@ -93,428 +93,417 @@ def _call(name: str, args: dict):
     return parsed, content
 
 
-# ─────────────────────────────────────────────── unit: _S3Sketch ──────────────
+# ─────────────────────────────────────── pure-Python unit tests ───────────────
 
 
-class TestS3SketchGeometry:
-    """Pure-Python geometry: no MCP calls, no engine."""
+class TestCurveMapping:
+    """_curves_to_entities: legacy curve specs AND raw engine entities."""
 
-    def test_new_sketch_empty(self):
-        sk = _S3Sketch("test")
-        assert sk.id.startswith("s3d_")
-        assert sk.name == "test"
-        assert sk.segs == []
-        assert sk.bbox() is None
-        assert sk.total_length() == 0.0
+    def test_line(self):
+        ents = _curves_to_entities([{"kind": "line", "pts": [[0, 0, 0], [0, 0, 80]]}])
+        assert ents == [{"id": "e1", "type": "line", "construction": False,
+                         "p1": [0, 0, 0], "p2": [0, 0, 80]}]
 
-    def test_bbox_single_line(self):
-        sk = _S3Sketch("line_test")
-        from mcp_server.sketch3d_tools import _S3Seg
-        sk.segs.append(_S3Seg("line", [[0, 0, 0], [10, 0, 0]]))
-        bb = sk.bbox()
-        assert bb is not None
-        assert bb["min"] == [0.0, 0.0, 0.0]
-        assert bb["max"] == [10.0, 0.0, 0.0]
-        assert bb["size"] == [10.0, 0.0, 0.0]
+    def test_polyline_expands_to_lines(self):
+        ents = _curves_to_entities(
+            [{"kind": "polyline", "pts": [[0, 0, 0], [10, 0, 0], [10, 5, 0]]}])
+        assert [e["type"] for e in ents] == ["line", "line"]
+        assert ents[0]["p2"] == ents[1]["p1"] == [10, 0, 0]
 
-    def test_length_line(self):
-        sk = _S3Sketch("len_test")
-        from mcp_server.sketch3d_tools import _S3Seg
-        sk.segs.append(_S3Seg("line", [[0, 0, 0], [3, 4, 0]]))
-        assert abs(sk.total_length() - 5.0) < 1e-9  # 3-4-5 triangle
+    def test_arc_three_point(self):
+        ents = _curves_to_entities(
+            [{"kind": "arc", "pts": [[0, 0, 0], [5, 5, 0], [10, 0, 0]]}])
+        assert ents[0]["type"] == "arc"
+        assert ents[0]["pm"] == [5, 5, 0]
 
-    def test_length_polyline(self):
-        sk = _S3Sketch("poly_test")
-        from mcp_server.sketch3d_tools import _S3Seg
-        # Two unit steps
-        sk.segs.append(_S3Seg("polyline", [[0, 0, 0], [1, 0, 0], [1, 1, 0]]))
-        assert abs(sk.total_length() - 2.0) < 1e-9
+    def test_spline_and_point(self):
+        ents = _curves_to_entities([
+            {"kind": "spline", "pts": [[0, 0, 0], [1, 2, 3], [2, 0, 6]]},
+            {"kind": "point", "pts": [[9, 9, 9]]},
+        ])
+        assert ents[0]["type"] == "spline" and len(ents[0]["points"]) == 3
+        assert ents[1]["type"] == "point" and ents[1]["p"] == [9, 9, 9]
 
+    def test_raw_engine_entity_passthrough(self):
+        ents = _curves_to_entities(
+            [{"type": "line", "p1": [0, 0, 0], "p2": [1, 1, 1]}], start_n=4)
+        assert ents[0]["id"] == "e5"
+        assert ents[0]["construction"] is False
 
-class TestSegFromDict:
-    """_seg_from_dict validation."""
+    def test_id_continuation(self):
+        ents = _curves_to_entities(
+            [{"kind": "line", "pts": [[0, 0, 0], [1, 0, 0]]}], start_n=7)
+        assert ents[0]["id"] == "e8"
 
-    def test_line_ok(self):
-        seg = _seg_from_dict({"kind": "line", "pts": [[0, 0, 0], [1, 0, 0]]})
-        assert seg.kind == "line"
-        assert len(seg.pts) == 2
+    def test_bad_kind_raises(self):
+        with pytest.raises(ValueError):
+            _curves_to_entities([{"kind": "bezier", "pts": [[0, 0, 0], [1, 0, 0]]}])
 
-    def test_arc_ok(self):
-        seg = _seg_from_dict(
-            {"kind": "arc", "pts": [[0, 0, 0], [1, 1, 0], [2, 0, 0]]}
-        )
-        assert seg.kind == "arc"
-        assert len(seg.pts) == 3
-
-    def test_spline_ok(self):
-        seg = _seg_from_dict(
-            {"kind": "spline", "pts": [[0, 0, 0], [5, 5, 5], [10, 0, 10]]}
-        )
-        assert seg.kind == "spline"
-
-    def test_line_wrong_pts_count(self):
-        with pytest.raises(ValueError, match="exactly 2"):
-            _seg_from_dict({"kind": "line", "pts": [[0, 0, 0]]})
-
-    def test_arc_wrong_pts_count(self):
-        with pytest.raises(ValueError, match="exactly 3"):
-            _seg_from_dict({"kind": "arc", "pts": [[0, 0, 0], [1, 0, 0]]})
-
-    def test_bad_kind(self):
-        with pytest.raises(ValueError, match="Unknown curve kind"):
-            _seg_from_dict({"kind": "bezier", "pts": [[0, 0, 0], [1, 0, 0]]})
-
-    def test_bad_point_shape(self):
-        with pytest.raises(ValueError, match=r"pts\[0\]"):
-            _seg_from_dict({"kind": "line", "pts": [[0, 0], [1, 0, 0]]})
+    def test_bad_pts_raise(self):
+        with pytest.raises(ValueError):
+            _curves_to_entities([{"kind": "line", "pts": [[0, 0], [1, 0]]}])
+        with pytest.raises(ValueError):
+            _curves_to_entities([{"kind": "arc", "pts": [[0, 0, 0], [1, 0, 0]]}])
 
 
-# ─────────────────────────────────────────────── MCP tools (pure Python) ─────
+class TestArcPolyline:
+    def test_semicircle_length(self):
+        # Half circle radius 5 in XY: (0,0,0) → (5,5,0) → (10,0,0).
+        pts = _arc_polyline([0, 0, 0], [5, 5, 0], [10, 0, 0], n=64)
+        length = _polyline_length([pts])
+        assert abs(length - math.pi * 5.0) < 0.05
+        # Passes through the mid point.
+        assert any(abs(p[0] - 5) < 0.3 and abs(p[1] - 5) < 0.3 for p in pts)
+
+    def test_out_of_plane_arc(self):
+        pts = _arc_polyline([0, 0, 0], [5, 0, 5], [10, 0, 0], n=64)
+        assert abs(_polyline_length([pts]) - math.pi * 5.0) < 0.05
+
+    def test_collinear_degenerates_to_polyline(self):
+        pts = _arc_polyline([0, 0, 0], [5, 0, 0], [10, 0, 0])
+        assert pts == [[0, 0, 0], [5, 0, 0], [10, 0, 0]]
 
 
-class TestSketch3dMcpTools:
-    """Tests that run the full MCP tool path but need no engine."""
+class TestSamplePolyline:
+    CHAINS = [[[0, 0, 0], [10, 0, 0]]]
 
-    def test_new_returns_id(self):
-        r, _ = _call("sketch3d_new", {"name": "my_path"})
-        assert r is not None and r.get("ok"), r
-        assert r["name"] == "my_path"
-        assert r["id"].startswith("s3d_")
+    def test_midpoint(self):
+        s = _sample_polyline(self.CHAINS, 0.5)
+        assert abs(s["point"][0] - 5.0) < 1e-9
+        assert abs(s["tangent"][0] - 1.0) < 1e-9
 
-    def test_add_curves_line(self):
-        r0, _ = _call("sketch3d_new", {"name": "sweep_path"})
-        sid = r0["id"]
-        r, _ = _call("sketch3d_add_curves", {
-            "sketch3d_id": sid,
-            "curves": [
-                {"kind": "line", "pts": [[0, 0, 0], [0, 0, 50]]},
-            ],
-        })
-        assert r["ok"], r
-        assert r["added"] == 1
-        assert r["total_segs"] == 1
-        assert abs(r["total_length_mm"] - 50.0) < 0.01
+    def test_ends_and_clamp(self):
+        assert _sample_polyline(self.CHAINS, 0.0)["point"][0] == 0.0
+        assert abs(_sample_polyline(self.CHAINS, 1.0)["point"][0] - 10.0) < 1e-9
+        assert abs(_sample_polyline(self.CHAINS, 2.5)["point"][0] - 10.0) < 1e-9
 
-    def test_add_multiple_curves(self):
-        r0, _ = _call("sketch3d_new", {"name": "multi_path"})
-        sid = r0["id"]
-        r, _ = _call("sketch3d_add_curves", {
-            "sketch3d_id": sid,
-            "curves": [
-                {"kind": "line",     "pts": [[0, 0, 0], [10, 0, 0]]},
-                {"kind": "polyline", "pts": [[10, 0, 0], [10, 10, 0], [10, 10, 20]]},
-                {"kind": "arc",      "pts": [[10, 10, 20], [15, 15, 25], [20, 10, 20]]},
-            ],
-        })
-        assert r["ok"], r
-        assert r["added"] == 3
-        assert r["total_segs"] == 3
+    def test_elbow_tangent_switch(self):
+        chains = [[[0, 0, 0], [0, 0, 10], [10, 0, 10]]]
+        s1 = _sample_polyline(chains, 0.25)
+        s2 = _sample_polyline(chains, 0.75)
+        assert abs(s1["tangent"][2] - 1.0) < 1e-9
+        assert abs(s2["tangent"][0] - 1.0) < 1e-9
 
-    def test_get_returns_geometry(self):
-        r0, _ = _call("sketch3d_new", {"name": "get_test"})
-        sid = r0["id"]
-        _call("sketch3d_add_curves", {
-            "sketch3d_id": sid,
-            "curves": [{"kind": "line", "pts": [[0, 0, 0], [30, 40, 0]]}],
-        })
-        r, _ = _call("sketch3d_get", {"sketch3d_id": sid})
-        assert r["ok"], r
-        assert r["seg_count"] == 1
-        assert abs(r["total_length_mm"] - 50.0) < 0.01
-        bb = r["bbox"]
-        assert bb["max"][0] == pytest.approx(30.0)
-
-    def test_clear(self):
-        r0, _ = _call("sketch3d_new", {"name": "clear_test"})
-        sid = r0["id"]
-        _call("sketch3d_add_curves", {
-            "sketch3d_id": sid,
-            "curves": [{"kind": "line", "pts": [[0, 0, 0], [1, 0, 0]]}],
-        })
-        rc, _ = _call("sketch3d_clear", {"sketch3d_id": sid})
-        assert rc["ok"], rc
-        r, _ = _call("sketch3d_get", {"sketch3d_id": sid})
-        assert r["seg_count"] == 0
-
-    def test_list(self):
-        # Ensure at least one sketch in store from earlier tests.
-        r, _ = _call("sketch3d_list", {})
-        assert r["ok"], r
-        assert isinstance(r["sketches"], list)
-
-    def test_preview_connectivity(self):
-        r0, _ = _call("sketch3d_new", {"name": "chain_test"})
-        sid = r0["id"]
-        # Two connected line segments sharing a point at (10,0,0).
-        _call("sketch3d_add_curves", {
-            "sketch3d_id": sid,
-            "curves": [
-                {"kind": "line", "pts": [[0, 0, 0], [10, 0, 0]]},
-                {"kind": "line", "pts": [[10, 0, 0], [20, 0, 0]]},
-            ],
-        })
-        r, _ = _call("sketch3d_preview", {"sketch3d_id": sid})
-        assert r["ok"], r
-        assert r["connected_chains"] == 1, (
-            f"Expected 1 chain for two connected lines, got {r['connected_chains']}"
-        )
-
-    def test_preview_disconnected(self):
-        r0, _ = _call("sketch3d_new", {"name": "disco_test"})
-        sid = r0["id"]
-        # Two disconnected segments.
-        _call("sketch3d_add_curves", {
-            "sketch3d_id": sid,
-            "curves": [
-                {"kind": "line", "pts": [[0, 0, 0],    [5, 0, 0]]},
-                {"kind": "line", "pts": [[10, 0, 0], [15, 0, 0]]},
-            ],
-        })
-        r, _ = _call("sketch3d_preview", {"sketch3d_id": sid})
-        assert r["ok"], r
-        assert r["connected_chains"] == 2, (
-            f"Expected 2 chains for disconnected lines, got {r['connected_chains']}"
-        )
-
-    def test_unknown_sketch_id_returns_error(self):
-        r, _ = _call("sketch3d_get", {"sketch3d_id": "s3d_does_not_exist"})
-        assert r is not None
-        assert r.get("ok") is False
-        assert "s3d_does_not_exist" in r.get("error", "")
-
-    def test_add_curves_empty_list_returns_error(self):
-        r0, _ = _call("sketch3d_new", {"name": "empty_curves"})
-        r, _ = _call("sketch3d_add_curves", {"sketch3d_id": r0["id"], "curves": []})
-        assert r is not None
-        assert r.get("ok") is False
-
-    def test_as_sweep_guide_empty_sketch_returns_error(self):
-        r0, _ = _call("sketch3d_new", {"name": "empty_guide"})
-        if not _engine_available:
-            return  # skip without engine
-        r, _ = _call("sketch3d_as_sweep_guide", {"sketch3d_id": r0["id"]})
-        # Should fail because sketch is empty OR because no current doc.
-        assert r is not None and r.get("ok") is False
-
-    def test_sample_at_midpoint(self):
-        """sketch3d_sample_at should return the midpoint of a straight line at t=0.5."""
-        r0, _ = _call("sketch3d_new", {"name": "sample_line"})
-        sid = r0["id"]
-        _call("sketch3d_add_curves", {
-            "sketch3d_id": sid,
-            "curves": [{"kind": "line", "pts": [[0, 0, 0], [10, 0, 0]]}],
-        })
-        r, _ = _call("sketch3d_sample_at", {"sketch3d_id": sid, "t": 0.5})
-        assert r is not None and r.get("ok"), r
-        pt = r["point"]
-        assert abs(pt[0] - 5.0) < 0.01, f"Expected x=5 at t=0.5, got {pt}"
-        assert abs(pt[1]) < 0.01
-        assert abs(pt[2]) < 0.01
-        # Tangent should point along +X.
-        tang = r["tangent"]
-        assert abs(tang[0] - 1.0) < 0.01, f"Expected tangent x=1, got {tang}"
-
-    def test_sample_at_start_and_end(self):
-        """t=0.0 gives start, t=1.0 gives end."""
-        r0, _ = _call("sketch3d_new", {"name": "sample_endpoints"})
-        sid = r0["id"]
-        _call("sketch3d_add_curves", {
-            "sketch3d_id": sid,
-            "curves": [{"kind": "line", "pts": [[0, 0, 0], [0, 0, 20]]}],
-        })
-        r_start, _ = _call("sketch3d_sample_at", {"sketch3d_id": sid, "t": 0.0})
-        r_end, _ = _call("sketch3d_sample_at", {"sketch3d_id": sid, "t": 1.0})
-        assert r_start["ok"] and r_end["ok"]
-        assert abs(r_start["point"][2]) < 0.01, "Start z should be 0"
-        assert abs(r_end["point"][2] - 20.0) < 0.01, "End z should be 20"
-
-    def test_sample_at_empty_sketch_errors(self):
-        r0, _ = _call("sketch3d_new", {"name": "empty_sample"})
-        r, _ = _call("sketch3d_sample_at", {"sketch3d_id": r0["id"], "t": 0.5})
-        assert r is not None and r.get("ok") is False
-
-    def test_ledger_roundtrip(self):
-        """sketch3d_to_ledger → sketch3d_from_ledger should restore sketch geometry."""
-        # Create and populate a sketch.
-        r0, _ = _call("sketch3d_new", {"name": "ledger_test"})
-        sid = r0["id"]
-        _call("sketch3d_add_curves", {
-            "sketch3d_id": sid,
-            "curves": [
-                {"kind": "line",  "pts": [[0, 0, 0], [5, 0, 0]]},
-                {"kind": "spline", "pts": [[5, 0, 0], [7, 3, 0], [10, 0, 0]]},
-            ],
-        })
-        # Serialize to ledger payload.
-        r_out, _ = _call("sketch3d_to_ledger", {})
-        assert r_out is not None and r_out.get("ok"), r_out
-        assert r_out["sketch_count"] >= 1
-        payload = r_out["payload"]
-        assert isinstance(payload, str)
-
-        # Clear the store entry and restore from payload.
-        from mcp_server.sketch3d_tools import _STORE
-        del _STORE[sid]
-        r_in, _ = _call("sketch3d_from_ledger", {"payload": payload})
-        assert r_in is not None and r_in.get("ok"), r_in
-        assert sid in r_in.get("ids", []), f"{sid} not in restored ids: {r_in}"
-
-        # Verify geometry was restored.
-        r_get, _ = _call("sketch3d_get", {"sketch3d_id": sid})
-        assert r_get["ok"]
-        assert r_get["seg_count"] == 2
-
-    def test_ledger_skips_existing_ids(self):
-        """Restoring an already-existing id must not clobber it."""
-        r0, _ = _call("sketch3d_new", {"name": "no_clobber"})
-        sid = r0["id"]
-        _call("sketch3d_add_curves", {
-            "sketch3d_id": sid,
-            "curves": [{"kind": "line", "pts": [[0, 0, 0], [1, 0, 0]]}],
-        })
-        r_out, _ = _call("sketch3d_to_ledger", {})
-        payload = r_out["payload"]
-        # Restore while the id is still in the store.
-        r_in, _ = _call("sketch3d_from_ledger", {"payload": payload})
-        assert r_in["ok"]
-        assert sid in r_in.get("skipped_ids", []), (
-            f"Expected {sid} in skipped_ids: {r_in}"
-        )
-
-    def test_ledger_bad_payload_errors(self):
-        r, _ = _call("sketch3d_from_ledger", {"payload": "not-valid-json"})
-        assert r is not None and r.get("ok") is False
+    def test_empty(self):
+        assert _sample_polyline([], 0.5) is None
 
 
-# ─────────────────────────────────── engine-backed tests (skipped if no core) ─
+class TestFreeNarration:
+    def test_groups_axes(self):
+        free = [{"entity": "e2", "param": "p2 x", "var": 9},
+                {"entity": "e2", "param": "p2 y", "var": 10},
+                {"entity": "e2", "param": "p2 z", "var": 11}]
+        txt = _free_narration(free)
+        assert "e2" in txt and "p2 x/y/z" in txt and "loose" in txt
+
+    def test_empty(self):
+        assert _free_narration([]) == ""
+
+
+# ─────────────────────────────── engine-backed MCP tool tests ─────────────────
 
 
 @pytest.mark.skipif(
     not _engine_available,
     reason="libaicad not staged — C++ engine not available",
 )
-class TestSketch3dEngineIntegration:
-    """End-to-end: create a part, inject a 3D sketch as a guide, verify it round-trips."""
+class TestSketch3dDocTools:
+    """The re-pointed surface: sketch3d features live in the doc, solved by the engine."""
 
     def _new_part(self, name: str) -> str:
         r, _ = _call("new_part", {"name": name})
         assert r and r.get("ok"), f"new_part failed: {r}"
         return r["doc_id"]
 
-    def test_sketch3d_as_sweep_guide_basic(self):
-        doc_id = self._new_part("guide_test_part")
-        r0, _ = _call("sketch3d_new", {"name": "helix_guide"})
-        sid = r0["id"]
-        # A simple straight path up Z.
-        _call("sketch3d_add_curves", {
-            "sketch3d_id": sid,
-            "curves": [{"kind": "line", "pts": [[0, 0, 0], [0, 0, 30]]}],
-        })
+    # ── CRUD ────────────────────────────────────────────────────────────────
+
+    def test_new_creates_doc_feature(self):
+        d = self._new_part("s3d_new")
+        r, _ = _call("sketch3d_new", {"name": "route", "doc_id": d})
+        assert r and r.get("ok"), r
+        fid = r["id"]
+        assert fid and fid.startswith("f")
+        # It is a real feature in the doc tree.
+        tree = cb.call("doc_tree", {"doc_id": d})
+        feats = {f["id"]: f for f in tree["tree"]["features"]}
+        assert feats[fid]["type"] == "sketch3d"
+
+    def test_add_curves_and_health(self):
+        d = self._new_part("s3d_curves")
+        r0, _ = _call("sketch3d_new", {"name": "p", "doc_id": d})
+        fid = r0["id"]
+        r, _ = _call("sketch3d_add_curves", {"sketch3d_id": fid, "doc_id": d, "curves": [
+            {"kind": "line", "pts": [[0, 0, 0], [0, 0, 40]]},
+            {"kind": "arc", "pts": [[0, 0, 40], [2.93, 0, 47.07], [10, 0, 50]]},
+        ]})
+        assert r and r.get("ok"), r
+        assert r["added"] == 2 and r["entity_count"] == 2
+        assert r["health"]["status"] in ("under", "full")
+        assert r["health"]["wires"], "touching line+arc should chain into a wire"
+        assert r["health"]["wires"][0]["n_edges"] == 2
+
+    def test_add_curves_unknown_feature_errors(self):
+        d = self._new_part("s3d_missing")
+        r, _ = _call("sketch3d_add_curves", {
+            "sketch3d_id": "f999", "doc_id": d,
+            "curves": [{"kind": "line", "pts": [[0, 0, 0], [1, 0, 0]]}]})
+        assert r and r.get("ok") is False
+        assert "f999" in r.get("error", "")
+
+    def test_get_clear_list(self):
+        d = self._new_part("s3d_get")
+        r0, _ = _call("sketch3d_new", {"name": "g", "doc_id": d})
+        fid = r0["id"]
+        _call("sketch3d_add_curves", {"sketch3d_id": fid, "doc_id": d,
+                                      "curves": [{"kind": "line",
+                                                  "pts": [[0, 0, 0], [10, 0, 0]]}]})
+        r, _ = _call("sketch3d_get", {"sketch3d_id": fid, "doc_id": d})
+        assert r["ok"] and r["entities"][0]["type"] == "line"
+        assert abs(r["total_length_mm"] - 10.0) < 1e-6
+        assert r["wires"]
+
+        rl, _ = _call("sketch3d_list", {"doc_id": d})
+        assert rl["ok"] and any(s["id"] == fid for s in rl["sketches"])
+
+        rc, _ = _call("sketch3d_clear", {"sketch3d_id": fid, "doc_id": d})
+        assert rc["ok"]
+        r2, _ = _call("sketch3d_get", {"sketch3d_id": fid, "doc_id": d})
+        assert r2["ok"] and r2["entities"] == []
+
+    # ── constraints + health narration ──────────────────────────────────────
+
+    def test_constrain_to_fully_defined(self):
+        d = self._new_part("s3d_constrain")
+        r0, _ = _call("sketch3d_path_from_points", {
+            "name": "L", "doc_id": d, "fit": "polyline",
+            "points": [[0, 0, 0], [0, 0, 40], [30, 0, 40]]})
+        fid = r0["id"]
+        assert r0["health"]["status"] == "under"
+        r, _ = _call("sketch3d_add_constraints", {"sketch3d_id": fid, "doc_id": d,
+                                                  "constraints": [
+            {"type": "fix", "refs": ["e1.p1"]},
+            {"type": "along_axis", "refs": ["e1"], "axis": "z"},
+            {"type": "length", "refs": ["e1"], "value": 40},
+            {"type": "coincident", "refs": ["e1.p2", "e2.p1"]},
+            {"type": "along_axis", "refs": ["e2"], "axis": "x"},
+            {"type": "length", "refs": ["e2"], "value": 30},
+        ]})
+        assert r and r.get("ok"), r
+        h = r["health"]
+        # fix(3) + along_axis(2+2) + length(1+1) + coincident(3) = 12 dof of 12.
+        assert h["dof"] == 0 and h["status"] == "full", h
+        assert h["fully_defined"] is True
+        assert "Fully defined" in h["summary"]
+
+        rc, _ = _call("check_sketch3d", {"sketch3d_id": fid, "doc_id": d})
+        assert rc["ok"] and rc["status"] == "full" and rc["dof"] == 0
+        assert rc["wires"] and rc["wires"][0]["n_edges"] == 2
+
+    def test_check_sketch3d_under_narrates_free_vars(self):
+        d = self._new_part("s3d_under")
+        r0, _ = _call("sketch3d_path_from_points", {
+            "name": "seg", "doc_id": d, "points": [[0, 0, 0], [0, 0, 20]]})
+        fid = r0["id"]
+        _call("sketch3d_add_constraints", {"sketch3d_id": fid, "doc_id": d,
+                                           "constraints": [{"type": "fix",
+                                                            "refs": ["e1.p1"]}]})
+        r, _ = _call("check_sketch3d", {"sketch3d_id": fid, "doc_id": d})
+        assert r["ok"] and r["status"] == "under" and r["dof"] == 3
+        assert "e1" in r["free_narration"] and "loose" in r["free_narration"]
+        assert "Under-defined" in r["summary"]
+
+    def test_bad_constraint_rejected_and_rolled_back(self):
+        d = self._new_part("s3d_badcon")
+        r0, _ = _call("sketch3d_path_from_points", {
+            "name": "seg", "doc_id": d, "points": [[0, 0, 0], [0, 0, 20]]})
+        fid = r0["id"]
+        r, _ = _call("sketch3d_add_constraints", {
+            "sketch3d_id": fid, "doc_id": d,
+            "constraints": [{"type": "tangent", "refs": ["e1", "e1"]}]})  # v2-only type
+        assert r and r.get("ok") is False
+        # The doc keeps solving cleanly afterwards (rollback worked).
+        rc, _ = _call("check_sketch3d", {"sketch3d_id": fid, "doc_id": d})
+        assert rc["ok"]
+
+    # ── one-call helpers ─────────────────────────────────────────────────────
+
+    def test_path_from_points_polyline_and_closed(self):
+        d = self._new_part("s3d_path")
+        r, _ = _call("sketch3d_path_from_points", {
+            "name": "tri", "doc_id": d, "close": True,
+            "points": [[0, 0, 0], [20, 0, 0], [0, 20, 0]]})
+        assert r["ok"], r
+        assert r["entity_count"] == 3
+        assert r["wires"] and r["wires"][0]["closed"] is True
+        expected = 40 + math.hypot(20, 20)
+        assert abs(r["total_length_mm"] - expected) < 1e-3
+
+    def test_path_from_points_spline(self):
+        d = self._new_part("s3d_spline")
+        r, _ = _call("sketch3d_path_from_points", {
+            "name": "smooth", "doc_id": d, "fit": "spline",
+            "points": [[0, 0, 0], [10, 5, 10], [20, 0, 20]]})
+        assert r["ok"] and r["entity_count"] == 1
+        assert r["wires"] and r["wires"][0]["n_edges"] == 1
+
+    def test_pipe_along_path_makes_solid(self):
+        """The headline flow: 3D path → constraints → health → 12 mm tube along it."""
+        d = self._new_part("s3d_pipe")
+        r0, _ = _call("sketch3d_path_from_points", {
+            "name": "route", "doc_id": d, "fit": "polyline",
+            "points": [[0, 0, 0], [0, 0, 40], [30, 0, 40]]})
+        fid = r0["id"]
+        r, _ = _call("sketch3d_pipe", {"sketch3d_id": fid, "diameter_mm": 12,
+                                       "doc_id": d})
+        assert r and r.get("ok"), r
+        assert r["feature_ids"]["sweep"]
+        assert r["feature_ids"]["plane"] and r["feature_ids"]["profile"]
+        assert r.get("body_count") == 1
+        # Volume ≈ π r² L (elbow eats a bit): sanity-band it.
+        vol = r["volume_mm3"]
+        nominal = math.pi * 6 * 6 * 70
+        assert 0.8 * nominal < vol < 1.1 * nominal, (vol, nominal)
+        assert r["start_point"] == [0, 0, 0]
+
+    def test_pipe_with_existing_profile_sketch(self):
+        d = self._new_part("s3d_pipe_prof")
+        r0, _ = _call("sketch3d_path_from_points", {
+            "name": "up", "doc_id": d, "points": [[5, 10, 0], [5, 10, 50]]})
+        fid = r0["id"]
+        # Author the profile manually on plane.top at the path start.
+        ra, _ = _call("add_features", {"doc_id": d, "ops": [
+            {"op": "add_feature", "feature": {"type": "sketch", "name": "prof",
+             "params": {"entities": [{"id": "e1", "type": "circle",
+                                      "construction": False,
+                                      "center": [5, 10], "radius": 4}],
+                        "constraints": []},
+             "refs": {"plane": "plane.top"}}}]})
+        assert ra and ra.get("ok"), ra
+        prof = ra["features"][-1]["id"]  # feature_status covers ALL features; last = the new sketch
+        r, _ = _call("sketch3d_pipe", {"sketch3d_id": fid, "profile_sketch": prof,
+                                       "doc_id": d})
+        assert r and r.get("ok"), r
+        vol = r["volume_mm3"]
+        nominal = math.pi * 16 * 50
+        assert abs(vol - nominal) / nominal < 0.05, (vol, nominal)
+
+    def test_pipe_requires_exactly_one_profile_spec(self):
+        d = self._new_part("s3d_pipe_arg")
+        r0, _ = _call("sketch3d_path_from_points", {
+            "name": "p", "doc_id": d, "points": [[0, 0, 0], [0, 0, 10]]})
+        r, _ = _call("sketch3d_pipe", {"sketch3d_id": r0["id"], "doc_id": d})
+        assert r and r.get("ok") is False and "exactly one" in r["error"]
+
+    # ── sweep-ref helper / sampling / section ────────────────────────────────
+
+    def test_as_sweep_guide_spine_and_guide(self):
+        d = self._new_part("s3d_guide")
+        r0, _ = _call("sketch3d_path_from_points", {
+            "name": "spine", "doc_id": d, "points": [[0, 0, 0], [0, 0, 30]]})
+        fid = r0["id"]
         r, _ = _call("sketch3d_as_sweep_guide",
-                     {"sketch3d_id": sid, "role": "guide", "doc_id": doc_id})
-        assert r is not None and r.get("ok"), f"sketch3d_as_sweep_guide failed: {r}"
-        # sketch3d_id is the canonical identifier — no wire_id alias (that was removed
-        # to prevent models from passing a Python-side id as a C++ doc wire feature ref).
-        assert r.get("sketch3d_id") == sid, "sketch3d_id must be echoed back"
-        assert "wire_id" not in r, (
-            "wire_id alias was removed — it misled models into treating Python sketch ids "
-            "as C++ doc wire feature ids"
-        )
-        # The sweep guides[] ref is now plumbed end-to-end (doc_apply_ops ->
-        # document.cpp sweep branch -> geom::sweep_profile) and the engine has a real
-        # `sketch3d` feature, so guide_support is True and the tool returns a
-        # ready-to-apply add_feature op for it.
-        assert r.get("guide_support") is True, (
-            "guide_support must be True — sweep guides[] + sketch3d feature are live"
-        )
-        fop = r.get("feature_op")
-        assert isinstance(fop, dict) and fop.get("op") == "add_feature"
-        assert fop["feature"]["type"] == "sketch3d"
-        ents = fop["feature"]["params"]["entities"]
-        assert ents and ents[0]["type"] == "line" and ents[0]["p2"] == [0, 0, 30]
-        # Workflow hint and coord_summary must be present for the driver.
-        assert "workflow_hint" in r
-        assert "coord_summary" in r
+                     {"sketch3d_id": fid, "role": "spine", "doc_id": d})
+        assert r["ok"] and r["guide_support"] is True
+        assert r["ref"] == fid  # single chain → bare fid
+        assert r["wires"] and "workflow_hint" in r and "coord_summary" in r
+        rg, _ = _call("sketch3d_as_sweep_guide",
+                      {"sketch3d_id": fid, "role": "guide", "doc_id": d})
+        assert rg["ok"] and rg["ref"] == {"feature": fid, "wire": 0}
 
-    def test_doc_sketch_contact_sheet_runs(self):
-        doc_id = self._new_part("contact_sheet_test")
-        # Add a simple box so there's something to render.
-        _call("add_features", {"ops": [{"op": "box", "dx": 20, "dy": 20, "dz": 20}],
-                               "doc_id": doc_id})
-        r, content = _call("doc_sketch_contact_sheet", {"doc_id": doc_id})
-        # A list return means [Image, caption_text] — content will have ImageContent.
-        assert content or r is not None  # Either structured or content returned
+    def test_as_sweep_guide_empty_sketch_errors(self):
+        d = self._new_part("s3d_guide_empty")
+        r0, _ = _call("sketch3d_new", {"name": "empty", "doc_id": d})
+        r, _ = _call("sketch3d_as_sweep_guide",
+                     {"sketch3d_id": r0["id"], "doc_id": d})
+        assert r and r.get("ok") is False
 
-    def test_sketch3d_section_at_runs(self):
-        """sketch3d_section_at: plane ORIENTATION from tangent; cut LOCATION is always origin.
+    def test_sample_at_solved_geometry(self):
+        d = self._new_part("s3d_sample")
+        r0, _ = _call("sketch3d_path_from_points", {
+            "name": "seg", "doc_id": d, "points": [[0, 0, 0], [10, 0, 0]]})
+        fid = r0["id"]
+        r, _ = _call("sketch3d_sample_at", {"sketch3d_id": fid, "t": 0.5, "doc_id": d})
+        assert r["ok"] and abs(r["point"][0] - 5.0) < 0.01
+        assert abs(r["tangent"][0] - 1.0) < 0.01
+        r0b, _ = _call("sketch3d_sample_at", {"sketch3d_id": fid, "t": 0.0, "doc_id": d})
+        r1b, _ = _call("sketch3d_sample_at", {"sketch3d_id": fid, "t": 1.0, "doc_id": d})
+        assert r0b["point"][0] == 0.0 and abs(r1b["point"][0] - 10.0) < 0.01
 
-        ENGINE LIMIT: eval_section_props cuts at world origin only (no plane offset RPC).
-        This test verifies:
-          • ok=True
-          • plane_used='top' for a Z-direction path (tangent along Z → top/XY plane)
-          • point is the on-path world point at t=0.5 (z=25), NOT the cut location
-          • area_mm2 key present (value may be 0 if solid doesn't span origin)
-          • summary key present and describes the origin-based cut honestly
-        """
-        doc_id = self._new_part("section_at_test")
-        # Build a box centred at origin so the top-plane cut actually hits it.
-        _call("add_features", {"ops": [{"op": "box", "dx": 30, "dy": 30, "dz": 50,
-                                        "x": -15, "y": -15, "z": -25}],
-                               "doc_id": doc_id})
-        # Create a vertical path along Z.
-        r0, _ = _call("sketch3d_new", {"name": "section_path"})
-        sid = r0["id"]
-        _call("sketch3d_add_curves", {
-            "sketch3d_id": sid,
-            "curves": [{"kind": "line", "pts": [[0, 0, 0], [0, 0, 50]]}],
-        })
-        r, _ = _call("sketch3d_section_at",
-                     {"sketch3d_id": sid, "t": 0.5, "doc_id": doc_id})
-        assert r is not None and r.get("ok"), f"sketch3d_section_at failed: {r}"
-        # Tangent along Z → dominant axis 2 → plane_used='top'.
-        assert r.get("plane_used") == "top", f"Expected 'top' plane, got {r.get('plane_used')}"
-        # 'point' is the on-path world point at t=0.5 (z=25) — NOT the cut location.
-        # Cut location is always z=0 (world origin).
-        assert abs(r["point"][2] - 25.0) < 0.1, f"Expected z=25 at t=0.5, got {r['point']}"
-        # area_mm2 key must be present; value may be 0 if box placement varies.
-        assert "area_mm2" in r
-        assert "summary" in r
-        # The summary should mention 'origin' to flag the limit.
-        assert "origin" in r["summary"].lower(), (
-            f"summary should mention 'origin' to flag the cut-location limit: {r['summary']}"
-        )
+    def test_sample_at_empty_sketch_errors(self):
+        d = self._new_part("s3d_sample_empty")
+        r0, _ = _call("sketch3d_new", {"name": "empty", "doc_id": d})
+        r, _ = _call("sketch3d_sample_at", {"sketch3d_id": r0["id"], "doc_id": d})
+        assert r and r.get("ok") is False
+
+    def test_section_at_orientation_from_tangent(self):
+        d = self._new_part("s3d_section")
+        _call("add_features", {"doc_id": d, "ops": [
+            {"op": "add_feature", "feature": {"type": "box", "name": "b",
+             "params": {"length": {"value": 30, "expr": None},
+                        "width": {"value": 30, "expr": None},
+                        "height": {"value": 50, "expr": None},
+                        "centered": True}}}]})
+        r0, _ = _call("sketch3d_path_from_points", {
+            "name": "path", "doc_id": d, "points": [[0, 0, 0], [0, 0, 50]]})
+        fid = r0["id"]
+        r, _ = _call("sketch3d_section_at", {"sketch3d_id": fid, "t": 0.5, "doc_id": d})
+        assert r and r.get("ok"), r
+        assert r["plane_used"] == "top"
+        assert abs(r["point"][2] - 25.0) < 0.1
+        assert "area_mm2" in r and "origin" in r["summary"].lower()
+
+    # ── preview + deprecated ledger surface ──────────────────────────────────
+
+    def test_preview_text_read(self):
+        d = self._new_part("s3d_preview")
+        r0, _ = _call("sketch3d_path_from_points", {
+            "name": "route", "doc_id": d,
+            "points": [[0, 0, 0], [0, 0, 40], [30, 0, 40]]})
+        fid = r0["id"]
+        r, _ = _call("sketch3d_preview", {"sketch3d_id": fid, "doc_id": d})
+        assert r["ok"], r
+        txt = r["summary_text"]
+        assert fid in txt and "wire 0" in txt and "Health:" in txt
+        assert "e1" in txt and "e2" in txt
+
+    def test_ledger_deprecated_and_migration(self):
+        d = self._new_part("s3d_ledger")
+        rout, _ = _call("sketch3d_to_ledger", {"doc_id": d})
+        assert rout["ok"] and rout["deprecated"] is True
+        # Old-format payload migrates into a REAL feature.
+        payload = json.dumps({"version": 1, "sketches": [
+            {"id": "s3d_old", "name": "legacy_path",
+             "segs": [{"kind": "line", "pts": [[0, 0, 0], [0, 0, 25]]}]}]})
+        rin, _ = _call("sketch3d_from_ledger", {"payload": payload, "doc_id": d})
+        assert rin["ok"] and rin["deprecated"] is True, rin
+        assert rin["migrated"] and rin["migrated"][0]["old_id"] == "s3d_old"
+        fid = rin["migrated"][0]["feature_id"]
+        rg, _ = _call("sketch3d_get", {"sketch3d_id": fid, "doc_id": d})
+        assert rg["ok"] and abs(rg["total_length_mm"] - 25.0) < 1e-6
+
+    def test_ledger_bad_payload_errors(self):
+        d = self._new_part("s3d_ledger_bad")
+        r, _ = _call("sketch3d_from_ledger", {"payload": "not-json", "doc_id": d})
+        assert r and r.get("ok") is False
+
+    # ── 2D preview tools still work ──────────────────────────────────────────
+
+    def test_doc_sketch_contact_sheet_lists_sketch3d(self):
+        d = self._new_part("s3d_sheet")
+        _call("add_features", {"doc_id": d, "ops": [
+            {"op": "add_feature", "feature": {"type": "box", "name": "b",
+             "params": {"length": {"value": 20, "expr": None},
+                        "width": {"value": 20, "expr": None},
+                        "height": {"value": 20, "expr": None}}}}]})
+        _call("sketch3d_path_from_points", {
+            "name": "p", "doc_id": d, "points": [[0, 0, 0], [0, 0, 30]]})
+        r, content = _call("doc_sketch_contact_sheet", {"doc_id": d})
+        # [Image, caption] return — caption text should mention the 3D sketch row.
+        texts = [getattr(c, "text", "") for c in (content or [])]
+        assert any("(3D)" in (t or "") for t in texts), texts
 
 
 # ─────────────────────────────────────────────── __main__ runner ─────────────
 
 if __name__ == "__main__":
-    import traceback
-
-    print("Running sketch3d_tools smoke tests...")
-    passed = failed = 0
-
-    suites = [
-        TestS3SketchGeometry,
-        TestSegFromDict,
-        TestSketch3dMcpTools,
-    ]
-    if _engine_available:
-        suites.append(TestSketch3dEngineIntegration)
-    else:
-        print("  [skip] Engine not available — TestSketch3dEngineIntegration skipped")
-
-    for cls in suites:
-        obj = cls()
-        for name in [m for m in dir(cls) if m.startswith("test_")]:
-            fn = getattr(obj, name)
-            try:
-                fn()
-                print(f"  PASS  {cls.__name__}.{name}")
-                passed += 1
-            except Exception as exc:
-                print(f"  FAIL  {cls.__name__}.{name}: {exc}")
-                traceback.print_exc()
-                failed += 1
-
-    print(f"\n{'PASS' if failed == 0 else 'FAIL'}  {passed} passed, {failed} failed")
-    sys.exit(0 if failed == 0 else 1)
+    sys.exit(pytest.main([__file__, "-q"]))

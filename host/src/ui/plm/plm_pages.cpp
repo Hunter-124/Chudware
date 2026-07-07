@@ -982,34 +982,14 @@ void plmDrawSettingsPage(AppState& st) {
     plmSectionHeader("Settings", "settings");
     if (!H.setErr.empty()) { plmError(H.setErr); return; }
 
-    // ---- Category grid nav — one glass cell per settings group, so the page reads
-    //      as a tidy switcher instead of a long scroll and scales as groups are
-    //      added for bigger teams. Only one group's panel shows at a time. --------
-    struct SetCat { const char* label; const char* icon; };
-    static const SetCat kSetCats[] = {
-        {"Part numbers", "new_doc"}, {"AI assistance", "health_check"},
-        {"Organization", "settings"}, {"Team & Sync", "team"},
-    };
-    static int s_setCat = 0;
-    {
-        const int   cols = 4;
-        const float gg   = 8 * S;
-        const float gw   = ImGui::GetContentRegionAvail().x;
-        const float cw   = std::floor((gw - gg * (cols - 1)) / cols);
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gg, gg));
-        for (int i = 0; i < (int)IM_ARRAYSIZE(kSetCats); ++i) {
-            if (i % cols) ImGui::SameLine();
-            char cid[16]; std::snprintf(cid, sizeof(cid), "##setcat%d", i);
-            if (plmGlassButton(cid, kSetCats[i].label, kSetCats[i].icon, s_setCat == i, cw))
-                s_setCat = i;
-        }
-        ImGui::PopStyleVar();
-    }
-    ImGui::Dummy(ImVec2(0, 10 * S));
+    // ---- Two-column panel grid — the setting groups are horizontally compressed
+    //      to a half-width column and tiled side by side so the page fills the
+    //      screen with minimal deadspace instead of one narrow full-width stack. --
+    const float pgGap = 12 * S;
+    const float colW  = std::floor((ImGui::GetContentRegionAvail().x - pgGap) / 2.0f);
 
-    // part-number scheme
-    if (s_setCat == 0) {
-    plmPanelBegin("##set_pn", "Part-number scheme", "new_doc");
+    // Row 1 · left: part-number scheme
+    plmPanelBegin("##set_pn", "Part-number scheme", "new_doc", colW);
     dimText("New items are numbered <prefix>-0001, <prefix>-0002, … You can always "
             "rename a number later.");
     if (H.prefixBuf[0] == '\0' && !H.partPrefix.empty())
@@ -1033,11 +1013,10 @@ void plmDrawSettingsPage(AppState& st) {
     }
     ImGui::PopStyleColor(2);
     plmPanelEnd();
-    }
 
-    // AI assistance
-    if (s_setCat == 1) {
-    plmPanelBegin("##set_ai", "AI assistance", "health_check");
+    // Row 1 · right: AI assistance
+    ImGui::SameLine(0, pgGap);
+    plmPanelBegin("##set_ai", "AI assistance", "health_check", colW);
     dimText("How much the assistant helps with history. Manual controls are always "
             "available.");
     struct Mode { const char* id; const char* label; };
@@ -1064,11 +1043,11 @@ void plmDrawSettingsPage(AppState& st) {
         ImGui::PopStyleColor();
     }
     plmPanelEnd();
-    }
 
-    // ---- Organization & access (preview — applies once a team is connected) ----
-    if (s_setCat == 2) {
-    plmPanelBegin("##set_org", "Organization & access", "settings");
+    ImGui::Dummy(ImVec2(0, pgGap));
+
+    // Row 2 · left: Organization & access (preview — applies once a team is connected)
+    plmPanelBegin("##set_org", "Organization & access", "settings", colW);
     dimText("Who can see and change this project. These apply once you connect a "
             "team (see Team & Sync).");
 
@@ -1111,11 +1090,10 @@ void plmDrawSettingsPage(AppState& st) {
     dimText("Preview — permissions are enforced server-side once team sharing is "
             "enabled; nothing here changes single-machine use.");
     plmPanelEnd();
-    }
 
-    // ---- Team & Sync (moved here from the Planning page) ----
-    if (s_setCat == 3) {
-    plmPanelBegin("##set_team", "Team & Sync", "team");
+    // Row 2 · right: Team & Sync (moved here from the Planning page)
+    ImGui::SameLine(0, pgGap);
+    plmPanelBegin("##set_team", "Team & Sync", "team", colW);
     dimText("Share a project through a shared folder or your own server. Everyone "
             "keeps working; Sync brings changes together without ever merging or "
             "losing work — if two people change the same design, both versions are "
@@ -1133,7 +1111,6 @@ void plmDrawSettingsPage(AppState& st) {
     dimText("Sharing and Sync arrive in a later update — the project is fully "
             "usable on this machine today.");
     plmPanelEnd();
-    }
 }
 
 // ---- Planning (kanban + milestones) -------------------------------------------

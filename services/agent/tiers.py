@@ -240,6 +240,19 @@ def load_local_models(*, path: Path | None = None) -> dict:
 
 # --------------------------------------------------------------------------- tier -> provider
 
+# Tokenmaxxing (Hunter, 2026-07-07): three local models are bundled/served via
+# llama.cpp (services/installer/llamacpp.py, model_manager._REGISTRY,
+# benchmarks/tokenmaxx/REPORT.md). A tier listed here pins a SPECIFIC model instead
+# of always falling to tiers.yaml's local_models.fanout — this is what lets gym
+# tiers like "local-24k-gemma3-qat" actually route to gemma3-4b-qat rather than
+# collapsing to qwen3-4b (the fanout default). A tier not listed here keeps the
+# historical fanout-based resolution — no behavior change for existing callers.
+LOCAL_TIER_MODELS: dict[str, str] = {
+    "local-24k-gemma3-qat": "gemma3-4b-qat",   # smallest footprint, full GBNF grammar
+    "local-24k-gemma4-e4b": "gemma4-e4b",      # larger/slower GBNF backup, comparison-only
+}
+
+
 def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     """Resolve the :class:`Provider` a *tier* should run on.
 
@@ -255,7 +268,10 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     A ``local-*`` tier (``local-24k`` / ``local-48k``) MUST run on the bundled
     local model (tiers.yaml ``local_models.fanout``, currently ``qwen3-4b``)
     rather than falling through to the ambient default — otherwise a "local"
-    tier run is meaningless (it silently answers from a cloud model).
+    tier run is meaningless (it silently answers from a cloud model). A tier
+    listed in ``LOCAL_TIER_MODELS`` (e.g. ``local-24k-gemma3-qat``) pins that
+    specific bundled model instead of the fanout default — this is the
+    tokenmaxx benchmark's per-model tier matrix (T-W29/T-DP19).
 
     An explicit ``AI_CAD_PROVIDER`` env override always wins (tests pin it to
     ``mock``; a human can force a frontier key even for a nominally local
@@ -277,7 +293,7 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
         return _config.get_provider(cfg=cfg)
 
     local_models = load_local_models()
-    model_id = local_models.get("fanout") or "qwen3-4b"
+    model_id = LOCAL_TIER_MODELS.get(tier) or local_models.get("fanout") or "qwen3-4b"
     from services.agent import model_manager
     model_path = str(model_manager.get_model_path(model_id))
     merged_cfg = dict(cfg or {})

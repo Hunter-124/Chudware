@@ -385,7 +385,39 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
 # This function is kept as a thin, gym-specific wrapper purely for the VRAM cache
 # below — the tier->provider mapping itself is no longer duplicated here.
 _LOCAL_PROVIDER_CACHE: dict[str, Any] = {}
-_TIER_LOCAL_MODEL = "qwen3-4b"  # the bundled CUDA model the tuning loop benchmarks (tiers.yaml local_models.fanout)
+_DEFAULT_LOCAL_MODEL = "qwen3-4b"  # the bundled CUDA model the tuning loop benchmarks (tiers.yaml local_models.fanout)
+
+# Tokenmaxxing (Hunter, 2026-07-07): three local models are production-ready and
+# bundled/served via llama.cpp (services/installer/llamacpp.py, model_manager._REGISTRY,
+# benchmarks/tokenmaxx/REPORT.md). New tier names are suffixed variants of the existing
+# "local-24k" tiers.yaml profile (same 24k budget/context class — effort.normalize_tier
+# prefix-matches "local-24k" against them), matching the "frontier-200k" alias convention:
+#
+#   local-24k             -> qwen3-4b        (unchanged default; fastest, NO GBNF —
+#                                              structured-output nodes fall back to
+#                                              prompted-JSON + roles.validate_handoff)
+#   local-24k-gemma3-qat  -> gemma3-4b-qat   (smallest footprint, FULL GBNF grammar
+#                                              compliance — structured/grammar-requiring
+#                                              roles actually exercise the schema_to_gbnf
+#                                              path here, which qwen3-4b's tier never does)
+#   local-24k-gemma4-e4b  -> gemma4-e4b      (larger/slower GBNF worker; comparison-only,
+#                                              no measured upside over gemma3-4b-qat today)
+#
+# The tier->model_id map itself lives in services.agent.tiers.LOCAL_TIER_MODELS (the
+# single shared seam also consulted by provider_for_tier) — NOT duplicated here, so the
+# gym's cache key always agrees with whatever model provider_for_tier actually resolves.
+# A tier not listed there falls back to tiers.yaml's local_models.fanout (_DEFAULT_LOCAL_MODEL).
+#
+# T-DP8 council mechanism check (2026-07-07): services/agent/councils.py's
+# council_convene() DOES accept a ``providers`` list for diverse-model seats, but it is
+# only wired into ONE call site — regen_diagnosis._maybe_convene_fix_council (the
+# ladder's fix-stage council), reached from deep inside run_mission's DAG execution, not
+# from a parameter run_mission()/loop.run_mission() itself exposes. _run_mission_real()
+# calls loop.run_mission(request, provider, ...) with exactly ONE Provider for the whole
+# mission — there is no role-based multi-provider seam at that call boundary today.
+# Wiring council_providers through run_mission's signature down to the ladder would be
+# new orchestration machinery, not a tier-mapping change — explicitly out of scope here.
+# NO "council" tier is added; a stub would only produce meaningless benchmark data.
 
 
 def _provider_for_tier(tier: str):
@@ -399,17 +431,22 @@ def _provider_for_tier(tier: str):
     An explicit ``AI_CAD_PROVIDER`` override always wins — tests set it to ``mock``; a
     human can force a frontier key for a frontier-tier comparison. Non-local tiers fall
     through to the default resolution. Actual tier->provider resolution is delegated to
-    ``services.agent.tiers.provider_for_tier`` (shared with node_runner); only the
-    llama.cpp-server VRAM cache is gym-specific."""
+    ``services.agent.tiers.provider_for_tier`` (shared with node_runner); the gym only
+    adds the llama.cpp-server VRAM cache, keyed off the SAME per-tier model map
+    (``tiers.LOCAL_TIER_MODELS``) that ``provider_for_tier`` itself consults, so
+    ``local-24k-gemma3-qat`` and ``local-24k-gemma4-e4b`` each get their own cached
+    server instead of colliding on the fanout default."""
     import os
     from services.agent import config
-    from services.agent.tiers import load_local_models, provider_for_tier
+    from services.agent.tiers import LOCAL_TIER_MODELS, load_local_models, provider_for_tier
     if os.environ.get("AI_CAD_PROVIDER") or not tier.startswith("local"):
         return config.get_provider()
-    try:
-        model_id = load_local_models().get("fanout") or _TIER_LOCAL_MODEL
-    except Exception:  # noqa: BLE001 — best-effort cache key, falls back to the constant
-        model_id = _TIER_LOCAL_MODEL
+    model_id = LOCAL_TIER_MODELS.get(tier)
+    if model_id is None:
+        try:
+            model_id = load_local_models().get("fanout") or _DEFAULT_LOCAL_MODEL
+        except Exception:  # noqa: BLE001 — best-effort cache key, falls back to the constant
+            model_id = _DEFAULT_LOCAL_MODEL
     prov = _LOCAL_PROVIDER_CACHE.get(model_id)
     if prov is None:
         prov = provider_for_tier(tier)

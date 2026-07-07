@@ -4,6 +4,22 @@
   python3 -m tools.flywheel.bench.gym.cli run --smoke        # C1 only, local tier, seed 1
   python3 -m tools.flywheel.bench.gym.cli run --challenges C1,C3 --tiers local-24k
 
+Tokenmaxxing (2026-07-07): local tiers route to a specific bundled llama.cpp model
+(services.agent.tiers.LOCAL_TIER_MODELS) — ``local-24k`` (qwen3-4b, fastest,
+no GBNF grammar), ``local-24k-gemma3-qat`` (gemma3-4b-qat, smallest footprint, full GBNF),
+``local-24k-gemma4-e4b`` (gemma4-e4b, larger/slower GBNF backup, comparison-only). Run
+several in one cycle (real hardware) to find the best local-model config:
+
+  python3 -m tools.flywheel.bench.gym.cli run --real \\
+      --tiers local-24k,local-24k-gemma3-qat,local-24k-gemma4-e4b
+
+No "council" (multi-model debate/judge) tier exists yet: services/agent/councils.py's
+council_convene() supports diverse-model seats, but it is wired only into the ladder's
+fix-stage (services/agent/regen_diagnosis.py), not into a role-based seam that
+loop.run_mission()/the gym's single-provider cells can reach — see the runner.py
+docstring above ``_provider_for_tier`` for the full trace. Building that seam is out of
+scope here; a stub council tier would only produce meaningless benchmark data.
+
 The ``run`` command executes the matrix, writes the per-cycle markdown+JSON report under
 ``reports/``, then runs the ASSESS-ADJUST-RERUN step: it applies the in-scope
 (config/data only) dial adjustments and re-runs the affected cells, reporting deltas
@@ -129,7 +145,10 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="run the challenge matrix + report")
     r.add_argument("--cycle", default="cycle-1")
-    r.add_argument("--tiers", default=None, help="comma list, e.g. local-24k,frontier-200k")
+    r.add_argument("--tiers", default=None,
+                   help="comma list, e.g. local-24k,frontier-200k — local tokenmaxxing "
+                        "tiers: local-24k (qwen3-4b), local-24k-gemma3-qat (gemma3-4b-qat, "
+                        "full GBNF), local-24k-gemma4-e4b (gemma4-e4b, GBNF backup)")
     r.add_argument("--challenges", default=None, help="comma list, e.g. C1,C3")
     r.add_argument("--smoke", action="store_true", help="C1 only, local tier, seed 1")
     r.add_argument("--real", action="store_true",

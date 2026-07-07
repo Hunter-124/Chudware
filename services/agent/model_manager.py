@@ -74,9 +74,17 @@ __all__ = [
 #   parallel_slots     recommended llama-server --parallel for this model on the
 #                      bundled CUDA runtime (12 GB has headroom past N=8).
 #
-# Deliberately NOT in the registry (REPORT.md "TL;DR recommendation"):
-#   gemma4-e4b       — dropped: GBNF 100% but slower (115 tok/s) and larger
-#                      (3464 MB) than gemma3-4b-qat with no measured upside.
+# gemma4-e4b is NOT the shipped default for any role_shape (REPORT.md "TL;DR
+# recommendation": slower (115 tok/s) and larger (3464 MB) than gemma3-4b-qat
+# with no measured upside for production role routing) — but it IS registered
+# here (unlike diffusiongemma, which is a hard NO-GO on 12 GB: 26B-A4B MoE,
+# smallest quant 16 GB, draft-CLI only, no server/grammar/parallel slots) so
+# the tokenmaxxing gym tiers (tools/flywheel/bench/gym) can address it as a
+# backup GBNF-worker comparison point. Its role_shape is deliberately left
+# unset (not "gbnf_worker") so model_for_role_shape() never picks it as a
+# shipped default over gemma3-4b-qat.
+#
+# Deliberately NOT in the registry:
 #   diffusiongemma   — NO-GO on 12 GB: 26B-A4B MoE, smallest quant 16 GB,
 #                      draft-CLI only (no server / grammar / parallel slots).
 _REGISTRY: dict[str, dict[str, Any]] = {
@@ -106,6 +114,20 @@ _REGISTRY: dict[str, dict[str, Any]] = {
         "sha256": None,
         "structured_output": "gbnf",
         "role_shape": "gbnf_worker",
+        "parallel_slots": 8,
+    },
+    "gemma4-e4b": {
+        "id": "gemma4-e4b",
+        "repo": "unsloth/gemma-4-E4B-it-GGUF",
+        "file": "gemma-4-E4B-it-Q4_K_M.gguf",
+        "quant": "Q4_K_M",
+        "fallback_file": None,
+        "fallback_quant": None,
+        "ctx": 131072,
+        "license": "Gemma-ToU",
+        "sha256": None,
+        "structured_output": "gbnf",
+        "role_shape": "",  # not a shipped default (see comment above) — comparison-only
         "parallel_slots": 8,
     },
 }

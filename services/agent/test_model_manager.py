@@ -164,7 +164,9 @@ class TestW29RoleMapping(unittest.TestCase):
 
     Numbers/verdicts from benchmarks/tokenmaxx/REPORT.md (copied, not re-derived):
     qwen3-4b GBNF broken -> prompted_json fan-out; gemma3-4b-qat GBNF 100% ->
-    gbnf_worker; gemma4-e4b dropped; DiffusionGemma NO-GO.
+    gbnf_worker; gemma4-e4b registered as a comparison-only GBNF backup (not a
+    shipped role_shape default, see test_gemma4_e4b_registered_but_not_a_shipped_default,
+    2026-07-07 tokenmaxxing); DiffusionGemma NO-GO.
     """
 
     def test_qwen3_is_prompted_json_fanout(self) -> None:
@@ -179,11 +181,17 @@ class TestW29RoleMapping(unittest.TestCase):
         assert _REGISTRY["gemma3-4b-qat"]["structured_output"] == "gbnf"
         assert _REGISTRY["gemma3-4b-qat"]["role_shape"] == "gbnf_worker"
 
-    def test_dropped_models_not_in_registry(self) -> None:
-        # gemma4-e4b dropped (slower/larger, no upside); DiffusionGemma NO-GO.
-        from services.agent.model_manager import _REGISTRY
+    def test_gemma4_e4b_registered_but_not_a_shipped_default(self) -> None:
+        # 2026-07-07 tokenmaxxing: gemma4-e4b IS now registered (so the gym's
+        # local-24k-gemma4-e4b tier can address/provision it as a comparison-only
+        # GBNF backup worker), but it must not usurp gemma3-4b-qat as the shipped
+        # gbnf_worker default (slower/larger, no measured upside — REPORT.md).
+        # DiffusionGemma remains a hard NO-GO (16 GB min quant on a 12 GB card).
+        from services.agent.model_manager import _REGISTRY, model_for_role_shape
 
-        assert "gemma4-e4b" not in _REGISTRY
+        assert "gemma4-e4b" in _REGISTRY
+        assert _REGISTRY["gemma4-e4b"]["role_shape"] != "gbnf_worker"
+        assert model_for_role_shape("gbnf_worker") == "gemma3-4b-qat"
         assert not any("diffusion" in k.lower() for k in _REGISTRY)
 
     def test_structured_output_for(self) -> None:
@@ -225,16 +233,17 @@ class TestW29RoleMapping(unittest.TestCase):
 
 
 class TestListModels(unittest.TestCase):
-    def test_returns_two_entries(self) -> None:
+    def test_returns_three_entries(self) -> None:
+        # 2026-07-07: gemma4-e4b joined the registry (tokenmaxxing comparison tier).
         from services.agent import model_manager
 
         with tempfile.TemporaryDirectory() as td:
             with patch.object(model_manager, "_model_dir", return_value=Path(td)):
                 models = model_manager.list_models()
 
-        assert len(models) == 2
+        assert len(models) == 3
         ids = {m["id"] for m in models}
-        assert ids == {"qwen3-4b", "gemma3-4b-qat"}
+        assert ids == {"qwen3-4b", "gemma3-4b-qat", "gemma4-e4b"}
 
     def test_present_false_when_not_downloaded(self) -> None:
         from services.agent import model_manager

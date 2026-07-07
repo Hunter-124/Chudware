@@ -80,6 +80,16 @@ Models available under `~/.local/share/AI-CAD/models/`: qwen3-4b (prompted-JSON/
 gemma3-4b-qat (GBNF-capable), gemma4-e4b, qwen3vl4b. Role mapping: qwen3=fanout,
 gemma3-qat=GBNF roles (see `benchmarks/tokenmaxx/REPORT.md`).
 
+Tokenmaxxing (2026-07-07): the gym now has an explicit tier per local model (start the
+matching model's llama-server first, per model), so `--tiers` can target any of them, or
+several in one cycle to compare:
+- `local-24k` -> qwen3-4b (fastest; no GBNF grammar)
+- `local-24k-gemma3-qat` -> gemma3-4b-qat (smallest footprint; full GBNF compliance)
+- `local-24k-gemma4-e4b` -> gemma4-e4b (larger/slower GBNF backup; comparison-only)
+No "council" (multi-model) tier yet — see `tools/flywheel/bench/gym/runner.py`'s note
+above `_TIER_LOCAL_MODEL`: the T-DP8 council primitive supports diverse-model seats but
+isn't wired into a seam the gym's single-provider cells can reach.
+
 **b. Run a real mission through the FULL pipeline (design stages ON):**
 ```
 cd /home/hunter/Repositories/CAD

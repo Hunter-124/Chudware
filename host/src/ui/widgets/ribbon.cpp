@@ -1678,6 +1678,10 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         // Sketch tab, no sketch being edited: present "New Sketch" in the "Exit Sketch" slot so the
         // user can start a sketch from this tab (matches the Features-tab entry point). Once a sketch
         // is open, s_sketchActive is true and the real "Exit Sketch" button shows.
+        // While editing ANY sketch, the single highlighted "Finish Sketch" button takes the place of
+        // BOTH New Sketch and New 3D Sketch — suppress the "New 3D Sketch" entry so only Finish shows.
+        if (std::strcmp(c.cmd_id, "sketch3d_new") == 0 && (s_sketchActive || s_sketch3dActive))
+            continue;
         const RibbonCmd* cp = &c;
         if (std::strcmp(c.cmd_id, "sketch_exit") == 0) {
             // Editing a 2D sketch: this slot becomes the highlighted "Finish Sketch" big button

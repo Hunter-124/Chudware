@@ -1,0 +1,154 @@
+{
+  "schema": "aicad.dag/1",
+  "id": "tmpl-reveng-scan",
+  "name": "Reverse Engineer — Photo Scan",
+  "nodes": [
+    {
+      "id": "n_capture",
+      "type": "plan",
+      "name": "Ingest capture sources",
+      "inputs": {
+        "request": "Add session images, run blur cull on video frames, report coverage.",
+        "session_id": "$inputs.session_id",
+        "tools": ["reveng_add_images", "reveng_add_video", "get_reveng_coverage",
+                  "start_capture_session", "stop_capture_session"]
+      },
+      "tools": ["reveng_add_images", "reveng_add_video", "get_reveng_coverage",
+                "start_capture_session", "stop_capture_session"],
+      "end_condition": "Coverage plan satisfied or user confirms sparse capture.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_scale_gate",
+      "type": "gate",
+      "name": "Confirm scale",
+      "inputs": {
+        "gate_kind": "scale_confirm",
+        "request": "Confirm ArUco mat or two-point scale before reconstruction.",
+        "tools": ["reveng_set_scale", "reveng_print_scale_mat", "measure_from_photo"]
+      },
+      "tools": ["reveng_set_scale", "reveng_print_scale_mat", "measure_from_photo"],
+      "end_condition": "Scale residual within 1% or user accepts manual scale.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    },
+    {
+      "id": "n_reconstruct",
+      "type": "plan",
+      "name": "Sparse + dense + splat reconstruction",
+      "inputs": {
+        "request": "Run sparse (pycolmap/GLOMAP, ffwd fallback), dense mesh, optional splat.",
+        "session_id": "$inputs.session_id",
+        "tools": ["reveng_reconstruct", "reveng_status", "mission_status"]
+      },
+      "tools": ["reveng_reconstruct", "reveng_status", "mission_status"],
+      "end_condition": "Scaled mesh artifact available in session dir.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_fit",
+      "type": "plan",
+      "name": "Segment and fit primitives",
+      "inputs": {
+        "request": "Run Open3D segmentation + RANSAC primitive fits.",
+        "session_id": "$inputs.session_id",
+        "tools": ["reveng_fit_primitives"]
+      },
+      "tools": ["reveng_fit_primitives"],
+      "end_condition": "aicad.reveng_fits/1 written with at least one primitive.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_parametric",
+      "type": "design",
+      "name": "Build parametric model",
+      "inputs": {
+        "request": "Run reverse_engineer with fit hints, then re_modeler for remaining features.",
+        "session_id": "$inputs.session_id",
+        "tools": ["reveng_build_parametric", "reverse_engineer", "compare_parts",
+                  "get_reveng_deviation", "confirm_dimensions"]
+      },
+      "tools": ["reveng_build_parametric", "reverse_engineer", "compare_parts",
+                "get_reveng_deviation", "confirm_dimensions"],
+      "end_condition": "Parametric doc_id with match_pct >= target or labeled mesh fallback.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_dim_gate",
+      "type": "gate",
+      "name": "Confirm fit-critical dimensions",
+      "inputs": {
+        "gate_kind": "dimension_confirm",
+        "tools": ["confirm_dimensions", "intake_status", "fit_report"]
+      },
+      "tools": ["confirm_dimensions", "intake_status", "fit_report"],
+      "end_condition": "All required intake dimensions confirmed.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    },
+    {
+      "id": "n_verify_deviation",
+      "type": "verify",
+      "name": "Mesh vs B-rep deviation check",
+      "inputs": {
+        "check_type": "reveng_deviation",
+        "session_id": "$inputs.session_id"
+      },
+      "tools": ["get_reveng_deviation", "compare_parts"],
+      "end_condition": "Deviation within tolerance or user accepts fallback mesh body.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_iterate",
+      "type": "design",
+      "name": "Iterate parametric model on deviation",
+      "inputs": {
+        "request": "Adjust features to reduce deviation; re-run compare_parts.",
+        "tools": ["reveng_build_parametric", "compare_parts", "get_reveng_deviation"]
+      },
+      "tools": ["reveng_build_parametric", "compare_parts", "get_reveng_deviation"],
+      "end_condition": "Deviation improved or retry budget exhausted.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    },
+    {
+      "id": "n_deliver",
+      "type": "report",
+      "name": "Attach result to parts hub",
+      "inputs": {
+        "request": "Attach parametric part or labeled mesh fallback to parts hub entry.",
+        "tools": ["reveng_attach_result", "describe_reveng_result", "part_place"]
+      },
+      "tools": ["reveng_attach_result", "describe_reveng_result", "part_place"],
+      "end_condition": "Part ref updated with geometry_ref and provenance chain intact.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    }
+  ],
+  "edges": [
+    {"from": "n_capture",          "to": "n_scale_gate"},
+    {"from": "n_scale_gate",       "to": "n_reconstruct"},
+    {"from": "n_reconstruct",      "to": "n_fit"},
+    {"from": "n_fit",              "to": "n_parametric"},
+    {"from": "n_parametric",       "to": "n_dim_gate"},
+    {"from": "n_dim_gate",         "to": "n_verify_deviation"},
+    {"from": "n_verify_deviation", "to": "n_iterate",     "retry_budget": 2},
+    {"from": "n_iterate",          "to": "n_verify_deviation"},
+    {"from": "n_verify_deviation", "to": "n_deliver"},
+    {"from": "n_reconstruct",      "to": "n_capture",     "retry_budget": 1}
+  ]
+}

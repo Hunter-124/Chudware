@@ -1,0 +1,129 @@
+{
+  "schema": "aicad.dag/1",
+  "id": "tmpl-reveng-datasheet",
+  "name": "Reverse Engineer — Datasheet",
+  "nodes": [
+    {
+      "id": "n_ingest",
+      "type": "plan",
+      "name": "Ingest datasheet PDF",
+      "inputs": {
+        "request": "Parse datasheet tables and drawing crops via docling.",
+        "session_id": "$inputs.session_id",
+        "tools": ["reveng_ingest_datasheet"]
+      },
+      "tools": ["reveng_ingest_datasheet"],
+      "end_condition": "Dimension tables and drawing crops extracted.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_mpn_fastpath",
+      "type": "plan",
+      "name": "MPN fast-path lookup",
+      "inputs": {
+        "request": "Try match_part_number and spec_sheet_match before VLM datasheet reader.",
+        "tools": ["match_part_number", "spec_sheet_match"]
+      },
+      "tools": ["match_part_number", "spec_sheet_match"],
+      "end_condition": "MPN matched to generator or fast-path exhausted.",
+      "verify": null,
+      "on_fail": "skip",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_datasheet_read",
+      "type": "design",
+      "name": "Datasheet VLM mapping",
+      "inputs": {
+        "request": "Map crops/tables to parametric template via re_datasheet_reader role.",
+        "tools": ["cad_guide", "add_features", "measure_part"]
+      },
+      "tools": ["cad_guide", "add_features", "measure_part"],
+      "end_condition": "Parametric template selected or features drafted.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_dim_gate",
+      "type": "gate",
+      "name": "Confirm datasheet dimensions",
+      "inputs": {
+        "gate_kind": "dimension_confirm",
+        "tools": ["confirm_dimensions", "intake_status"]
+      },
+      "tools": ["confirm_dimensions", "intake_status"],
+      "end_condition": "All fit-critical dims confirmed with datasheet provenance.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    },
+    {
+      "id": "n_build",
+      "type": "design",
+      "name": "Build parametric part",
+      "inputs": {
+        "request": "Generate parametric part from confirmed dims.",
+        "tools": ["reveng_build_parametric", "add_features", "render_part", "measure_part"]
+      },
+      "tools": ["reveng_build_parametric", "add_features", "render_part", "measure_part"],
+      "end_condition": "Part geometry complete and measured dims match datasheet.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_final_gate",
+      "type": "gate",
+      "name": "Final accept",
+      "inputs": {
+        "gate_kind": "final_accept",
+        "tools": ["describe_reveng_result", "measure_part"]
+      },
+      "tools": ["describe_reveng_result", "measure_part"],
+      "end_condition": "User accepts the parametric result.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    },
+    {
+      "id": "n_deliver",
+      "type": "report",
+      "name": "Attach to parts hub",
+      "inputs": {
+        "tools": ["reveng_attach_result", "part_place"]
+      },
+      "tools": ["reveng_attach_result", "part_place"],
+      "end_condition": "geometry_ref registered on part_ref.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_fix_dims",
+      "type": "design",
+      "name": "Fix dimensions on measure mismatch",
+      "inputs": {
+        "request": "Adjust features when measure_part disagrees with datasheet gate.",
+        "tools": ["add_features", "measure_part", "confirm_dimensions"]
+      },
+      "tools": ["add_features", "measure_part", "confirm_dimensions"],
+      "end_condition": "Measured dims match confirmed datasheet values.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    }
+  ],
+  "edges": [
+    {"from": "n_ingest",        "to": "n_mpn_fastpath"},
+    {"from": "n_mpn_fastpath",  "to": "n_datasheet_read"},
+    {"from": "n_datasheet_read","to": "n_dim_gate"},
+    {"from": "n_dim_gate",      "to": "n_build"},
+    {"from": "n_build",         "to": "n_final_gate"},
+    {"from": "n_final_gate",    "to": "n_deliver"},
+    {"from": "n_build",         "to": "n_fix_dims",    "retry_budget": 2},
+    {"from": "n_fix_dims",      "to": "n_build"}
+  ]
+}

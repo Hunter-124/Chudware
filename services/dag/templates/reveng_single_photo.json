@@ -1,0 +1,86 @@
+{
+  "schema": "aicad.dag/1",
+  "id": "tmpl-reveng-single-photo",
+  "name": "Reverse Engineer — Single Photo (approximate)",
+  "nodes": [
+    {
+      "id": "n_single_photo",
+      "type": "plan",
+      "name": "Single-photo mesh tier",
+      "inputs": {
+        "request": "Run TripoSR or TRELLIS tier; output force-tagged approximate.",
+        "session_id": "$inputs.session_id",
+        "tools": ["reveng_single_photo", "reveng_status"]
+      },
+      "tools": ["reveng_single_photo", "reveng_status"],
+      "end_condition": "Approximate mesh preview available; honesty.approximate=true.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_review_gate",
+      "type": "gate",
+      "name": "Acknowledge approximate preview",
+      "inputs": {
+        "gate_kind": "final_accept",
+        "request": "User acknowledges mesh is reference-only, not fit-critical.",
+        "tools": ["describe_reveng_result"]
+      },
+      "tools": ["describe_reveng_result"],
+      "end_condition": "User accepts approximate preview or cancels.",
+      "verify": null,
+      "on_fail": "abort",
+      "autonomy": "approve"
+    },
+    {
+      "id": "n_optional_parametric",
+      "type": "design",
+      "name": "Optional parametric override",
+      "inputs": {
+        "request": "Only if user explicitly overrides: attempt parametric from approximate mesh.",
+        "strategy": "override_approximate",
+        "tools": ["reveng_build_parametric", "reverse_engineer"]
+      },
+      "tools": ["reveng_build_parametric", "reverse_engineer"],
+      "end_condition": "Override parametric attempted or skipped.",
+      "verify": null,
+      "on_fail": "skip",
+      "autonomy": "manual"
+    },
+    {
+      "id": "n_deliver",
+      "type": "report",
+      "name": "Export approximate bundle",
+      "inputs": {
+        "tools": ["export_reveng_bundle", "reveng_attach_result"]
+      },
+      "tools": ["export_reveng_bundle", "reveng_attach_result"],
+      "end_condition": "Bundle exported with approximate provenance tag.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "auto"
+    },
+    {
+      "id": "n_retry_tier",
+      "type": "plan",
+      "name": "Retry alternate single-photo tier",
+      "inputs": {
+        "request": "Try the other single-photo backend tier.",
+        "tools": ["reveng_single_photo"]
+      },
+      "tools": ["reveng_single_photo"],
+      "end_condition": "Alternate tier mesh produced.",
+      "verify": null,
+      "on_fail": "pause",
+      "autonomy": "approve"
+    }
+  ],
+  "edges": [
+    {"from": "n_single_photo",       "to": "n_review_gate"},
+    {"from": "n_review_gate",        "to": "n_optional_parametric"},
+    {"from": "n_optional_parametric","to": "n_deliver"},
+    {"from": "n_single_photo",       "to": "n_retry_tier", "retry_budget": 1},
+    {"from": "n_retry_tier",         "to": "n_review_gate"}
+  ]
+}

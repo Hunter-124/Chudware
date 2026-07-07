@@ -58,6 +58,11 @@ assignments:
   sim_engineer:           [strong, cheap_local]
   assembly_fit_engineer:  [strong, cheap_local]
   design_thinker:         [strong, cheap_local]
+  sourcing_specialist:    [cheap_local, strong]
+  # RE-ANCHOR(reveng): reverse-engineering agent roles (RE-00/RE-18).
+  re_modeler:             [cheap_local, strong]
+  re_datasheet_reader:    [strong, cheap_local]
+  re_geometry_verifier:   [strong, cheap_local]
   default:                [cheap_local, strong]
 
 approval_policy:

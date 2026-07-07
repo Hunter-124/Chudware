@@ -22,6 +22,7 @@
 
 #include "core/app_state.h"
 #include "core/async_rpc.h"
+#include "ui/icons.h"
 #include "ui_theme.h"
 
 namespace ui {
@@ -137,14 +138,14 @@ void plmDocTypeTag(const std::string& docType, const std::string& kind) {
 
 namespace {
 
-struct RailItem { PlmPage page; const char* label; };
+struct RailItem { PlmPage page; const char* label; const char* icon; };
 // The hub collapsed to four destinations: Files folds in History + Releases;
 // Planning folds in Milestones, Issues and Team & Sync (see plm_pages.cpp).
 static const RailItem kRail[] = {
-    {PlmPage::Overview, "Overview"},
-    {PlmPage::Files,    "Files"},
-    {PlmPage::Planning, "Planning"},
-    {PlmPage::Settings, "Settings"},
+    {PlmPage::Overview, "Overview", "app"},
+    {PlmPage::Files,    "Files",    "body_folder"},
+    {PlmPage::Planning, "Planning", "prompt_edit"},
+    {PlmPage::Settings, "Settings", "settings"},
 };
 
 static void drawRail(AppState& st, float railW, float bottomMargin) {
@@ -185,13 +186,18 @@ static void drawRail(AppState& st, float railW, float bottomMargin) {
         ui::glassRowBackground(dl, p0, ImVec2(p0.x + w, p0.y + rowH), 4.0f,
                                false, sel || hovered, bgA);
 
-        // Label — centered horizontally + vertically inside the pill.
+        // Icon + label — icon at a fixed left inset, label left-aligned after it.
         ImVec4 tc = sel
             ? ImVec4(palette.text[0], palette.text[1], palette.text[2], 1.0f)
             : ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f);
+        ImU32 tcu = ImGui::ColorConvertFloat4ToU32(tc);
+        const float iconSz = 18 * S;
+        const float iconX  = p0.x + 12 * S;
+        ui::drawIconGlass(dl, r.icon, ImVec2(iconX + iconSz * 0.5f, p0.y + rowH * 0.5f),
+                          iconSz, tcu, 0);
         ImVec2 ts = ImGui::CalcTextSize(r.label);
-        dl->AddText(ImVec2(p0.x + (w - ts.x) * 0.5f, p0.y + (rowH - ts.y) * 0.5f),
-                    ImGui::ColorConvertFloat4ToU32(tc), r.label);
+        dl->AddText(ImVec2(iconX + iconSz + 10 * S, p0.y + (rowH - ts.y) * 0.5f),
+                    tcu, r.label);
 
         // Count badge (from cached overview) pinned to the right edge, centered.
         int badge = 0;

@@ -141,6 +141,44 @@ void plmCopyText(const char* id, const std::string& text, const float* col = nul
     ImGui::PopStyleColor(4);
 }
 
+// A discrete frosted-glass section box. Content drawn between Begin/End sits inside
+// a rounded translucent panel with even internal padding and an optional icon+title
+// header — so each settings/planning group reads as its own card instead of a wall
+// of left-hugging text. Auto-height; pass width for side-by-side panels (0 = fill).
+// Callers add vertical spacing between stacked panels themselves.
+void plmPanelBegin(const char* id, const char* title, const char* icon = nullptr,
+                   float width = 0.0f) {
+    const float S = ui::uiScale;
+    ui::pushGlassChildStyle(11.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16 * S, 13 * S));
+    ImGui::BeginChild(id, ImVec2(width, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
+    if (title && title[0]) {
+        const float h = ImGui::GetTextLineHeight();
+        if (icon && icon[0]) {
+            ImVec2 c = ImGui::GetCursorScreenPos();
+            const float isz = 17 * S;
+            ui::drawIconGlass(ImGui::GetWindowDrawList(), icon,
+                              ImVec2(c.x + isz * 0.5f, c.y + h * 0.5f), isz,
+                              Palette::toU32(palette.accent), 0);
+            ImGui::Dummy(ImVec2(isz + 9 * S, h));
+            ImGui::SameLine();
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(title);
+        ImGui::PopStyleColor();
+        ImGui::Dummy(ImVec2(0, 7 * S));
+    }
+}
+
+void plmPanelEnd() {
+    ImGui::EndChild();
+    ImGui::PopStyleVar();      // WindowPadding
+    ui::popGlassChildStyle();
+}
+
 void priorityDot(const std::string& pr);  // defined below; used by Overview too
 
 // A liquid-glass action button: the shared frosted-glass panel (translucent base +
@@ -222,20 +260,27 @@ void plmDrawOverviewPage(AppState& st) {
     if (!H.ovErr.empty()) { plmError(H.ovErr); return; }
 
     const auto& ov = H.overview;
-    // stat cards
+
+    // At-a-glance stat band — frosted chips inside a discrete panel.
+    plmPanelBegin("##ov_stats", nullptr);
     statCard("Files",      ov.itemsCount,     palette.accent);
     statCard("Unsaved",    ov.dirtyCount,     ov.dirtyCount ? palette.statusWarn : palette.textDim);
     statCard("Tasks",      ov.openTasks,      palette.textDim);
     statCard("Issues",     ov.openIssues,     ov.openIssues ? palette.statusWarn : palette.textDim);
     statCard("Milestones", ov.openMilestones, palette.textDim);
     ImGui::NewLine();
-    if (!ov.nextMilestone.empty())
+    if (!ov.nextMilestone.empty()) {
+        ImGui::Dummy(ImVec2(0, 2 * S));
         dimText("Next milestone: %s", ov.nextMilestone.c_str());
-    ImGui::Dummy(ImVec2(0, 6 * S));
+    }
+    plmPanelEnd();
+
+    ImGui::Dummy(ImVec2(0, 10 * S));
 
     // quick checkpoint — the basic loop, front and centre
-    plmSectionHeader("Save a checkpoint");
+    plmPanelBegin("##ov_ckpt", "Save a checkpoint", "save");
     dimText("Record a point in this project's history you can return to.");
+    ImGui::Dummy(ImVec2(0, 2 * S));
     ImGui::SetNextItemWidth(320 * S);
     bool enter = ImGui::InputTextWithHint("##plm_ckpt", "What changed? (optional)",
         H.checkpointMsg, sizeof(H.checkpointMsg), ImGuiInputTextFlags_EnterReturnsTrue);
@@ -250,12 +295,14 @@ void plmDrawOverviewPage(AppState& st) {
         ImGui::TextUnformatted(H.actionOk.c_str());
         ImGui::PopStyleColor();
     }
+    plmPanelEnd();
 
-    ImGui::Dummy(ImVec2(0, 6 * S));
-    ImGui::Columns(2, "##ov_cols", false);
+    ImGui::Dummy(ImVec2(0, 10 * S));
 
-    // recent activity
-    plmSectionHeader("Recent activity");
+    // recent activity + open tasks — two discrete side-by-side panels
+    const float halfW = (ImGui::GetContentRegionAvail().x - 12 * S) * 0.5f;
+
+    plmPanelBegin("##ov_recent", "Recent activity", "history", halfW);
     if (ov.recent.empty()) {
         dimText("No history yet.");
     } else {
@@ -270,10 +317,11 @@ void plmDrawOverviewPage(AppState& st) {
             ImGui::PopID();
         }
     }
-    ImGui::NextColumn();
+    plmPanelEnd();
 
-    // my tasks + dirty docs
-    plmSectionHeader("Open tasks");
+    ImGui::SameLine(0, 12 * S);
+
+    plmPanelBegin("##ov_tasks", "Open tasks", "prompt_edit", halfW);
     if (ov.tasks.empty()) {
         dimText("No open tasks.");
     } else {
@@ -287,8 +335,11 @@ void plmDrawOverviewPage(AppState& st) {
         }
     }
     if (ov.dirtyCount > 0) {
-        ImGui::Dummy(ImVec2(0, 4 * S));
-        plmSectionHeader("Unsaved files");
+        ImGui::Dummy(ImVec2(0, 6 * S));
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+        ImGui::TextUnformatted("Unsaved files");
+        ImGui::PopStyleColor();
         for (const auto& it : ov.dirtyItems) {
             plmDocTypeTag(it.docType, it.kind);
             ImGui::SameLine();
@@ -296,7 +347,7 @@ void plmDrawOverviewPage(AppState& st) {
             ImGui::TextWrapped("%s", it.path.c_str());
         }
     }
-    ImGui::Columns(1);
+    plmPanelEnd();
 }
 
 // ---- Files --------------------------------------------------------------------
@@ -831,7 +882,7 @@ void plmDrawSettingsPage(AppState& st) {
     if (!H.setErr.empty()) { plmError(H.setErr); return; }
 
     // part-number scheme
-    plmSectionHeader("Part-number scheme");
+    plmPanelBegin("##set_pn", "Part-number scheme", "new_doc");
     dimText("New items are numbered <prefix>-0001, <prefix>-0002, … You can always "
             "rename a number later.");
     if (H.prefixBuf[0] == '\0' && !H.partPrefix.empty())
@@ -854,9 +905,10 @@ void plmDrawSettingsPage(AppState& st) {
         });
     }
     ImGui::PopStyleColor(2);
+    plmPanelEnd();
 
-    ImGui::Dummy(ImVec2(0, 8 * S));
-    plmSectionHeader("AI assistance");
+    ImGui::Dummy(ImVec2(0, 10 * S));
+    plmPanelBegin("##set_ai", "AI assistance", "health_check");
     dimText("How much the assistant helps with history. Manual controls are always "
             "available.");
     struct Mode { const char* id; const char* label; };
@@ -882,10 +934,11 @@ void plmDrawSettingsPage(AppState& st) {
         }
         ImGui::PopStyleColor();
     }
+    plmPanelEnd();
 
     // ---- Organization & access (preview — applies once a team is connected) ----
     ImGui::Dummy(ImVec2(0, 10 * S));
-    plmSectionHeader("Organization & access");
+    plmPanelBegin("##set_org", "Organization & access", "settings");
     dimText("Who can see and change this project. These apply once you connect a "
             "team (Team & Sync on the Planning page).");
 
@@ -927,6 +980,7 @@ void plmDrawSettingsPage(AppState& st) {
     ImGui::Dummy(ImVec2(0, 2 * S));
     dimText("Preview — permissions are enforced server-side once team sharing is "
             "enabled; nothing here changes single-machine use.");
+    plmPanelEnd();
 }
 
 // ---- Planning (kanban + milestones) -------------------------------------------
@@ -1108,7 +1162,11 @@ void priorityDot(const std::string& pr) {
     ImVec2 ctr(o.x + r, o.y + ImGui::GetTextLineHeight() * 0.5f);
     ImGui::GetWindowDrawList()->AddCircleFilled(
         ctr, r, ImGui::GetColorU32(ImVec4(c[0], c[1], c[2], a)), 16);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("priority %s", p.c_str());
+    if (ImGui::IsItemHovered()) {
+        const char* word = p == "p0" ? "critical" : p == "p1" ? "high"
+                         : p == "p3" ? "low" : "med";
+        ImGui::SetTooltip("priority: %s", word);
+    }
 }
 
 static std::string s_selTask;
@@ -1236,12 +1294,13 @@ void plmDrawPlanningPage(AppState& st) {
 
     static const char* kSev[] = {"low", "med", "high", "critical"};
 
-    // ---- top band: Issues (left) + Milestones (right) --------------------------
-    ImGui::Columns(2, "##plan_top", false);
+    // ---- top band: Issues + Milestones as two discrete glass panels ------------
+    const float availTop = ImGui::GetContentRegionAvail().x;
+    const float halfW = (availTop - 12 * S) * 0.5f;
 
     // Issues — log a problem with a severity, so you can plan fixes while you see
     // what's wrong. "Make plan" (on each row) turns one into a linked task.
-    plmSectionHeader("Issues");
+    plmPanelBegin("##pl_issues", "Issues", "warning_badge", halfW);
     ImGui::SetNextItemWidth(90 * S);
     ImGui::Combo("##newissuesev", &H.newIssueSev, kSev, IM_ARRAYSIZE(kSev));
     ImGui::SameLine();
@@ -1257,11 +1316,12 @@ void plmDrawPlanningPage(AppState& st) {
     }
     if (H.issues.empty()) dimText("No issues logged.");
     for (const auto& is : H.issues) drawIssueRow(st, is);
+    plmPanelEnd();
 
-    ImGui::NextColumn();
+    ImGui::SameLine(0, 12 * S);
 
     // Milestones — title + due date + Add, all the same height and baseline.
-    plmSectionHeader("Milestones");
+    plmPanelBegin("##pl_ms", "Milestones", "ok_badge", halfW);
     static char s_msTitle[160] = {};
     static char s_msDue[32] = {};
     ImGui::SetNextItemWidth(150 * S);
@@ -1277,14 +1337,13 @@ void plmDrawPlanningPage(AppState& st) {
     }
     if (H.milestones.empty()) dimText("No milestones yet.");
     for (const auto& m : H.milestones) drawMilestoneRow(st, m);
+    plmPanelEnd();
 
-    ImGui::Columns(1);
-    ImGui::Dummy(ImVec2(0, 4 * S));
-    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0, 10 * S));
 
-    // ---- Team & Sync (placeholder until remotes/locks land) — sits between the
-    //      Issues/Milestones band and the board, per Hunter's layout. ------------
-    plmSectionHeader("Team & Sync");
+    // ---- Team & Sync (placeholder until remotes/locks land) — its own panel,
+    //      between the Issues/Milestones band and the board. --------------------
+    plmPanelBegin("##pl_team", "Team & Sync", "flow_arrow");
     dimText("Share via a shared folder or your own server. Sync brings changes "
             "together without ever merging or losing work — coming in a later update.");
     ImGui::BeginDisabled(true);
@@ -1292,17 +1351,21 @@ void plmDrawPlanningPage(AppState& st) {
     ImGui::SameLine();
     ImGui::Button("Sync now");
     ImGui::EndDisabled();
-    ImGui::Dummy(ImVec2(0, 4 * S));
-    ImGui::Separator();
+    plmPanelEnd();
 
-    // ---- Task board ------------------------------------------------------------
+    ImGui::Dummy(ImVec2(0, 10 * S));
+
+    // ---- Task board (own header + full-width glass columns) --------------------
     plmSectionHeader("Board");
     // add a task: priority picker, then a compact left-aligned title box that
     // matches the Add-task button height (no custom frame padding on either).
-    static int s_newTaskPri = 2;                       // default p2
-    static const char* kPri[] = {"p0", "p1", "p2", "p3"};
-    ImGui::SetNextItemWidth(62 * S);
-    ImGui::Combo("##ntpri", &s_newTaskPri, kPri, IM_ARRAYSIZE(kPri));
+    // Task priority uses the SAME words as issue severity (low/med/high/critical)
+    // for consistency, mapped onto the stored p3..p0 scale.
+    static int s_newTaskPri = 1;                        // default med
+    static const char* kPriWord[] = {"low", "med", "high", "critical"};
+    static const char* kPriCode[] = {"p3", "p2", "p1", "p0"};
+    ImGui::SetNextItemWidth(86 * S);
+    ImGui::Combo("##ntpri", &s_newTaskPri, kPriWord, IM_ARRAYSIZE(kPriWord));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(300 * S);
     bool enter = ImGui::InputTextWithHint("##newtask", "new task title\xe2\x80\xa6",
@@ -1311,7 +1374,7 @@ void plmDrawPlanningPage(AppState& st) {
     if ((plmGlassButton("##addtask", "Add task", "new_doc", true, 116 * S) || enter) &&
         H.newTaskTitle[0]) {
         planCall(st, "create", "task",
-                 {{"title", H.newTaskTitle}, {"priority", kPri[s_newTaskPri]}});
+                 {{"title", H.newTaskTitle}, {"priority", kPriCode[s_newTaskPri]}});
         H.newTaskTitle[0] = '\0';
     }
     ImGui::Spacing();

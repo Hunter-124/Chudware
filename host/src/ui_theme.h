@@ -75,7 +75,10 @@ struct Palette {
     float planeOutline[4]  = {0.290f,0.540f,0.870f, 0.700f};
 
     // ---- selection / hover ----
-    float selectionHighlight[4] = {0.176f,0.831f,0.749f, 0.22f};
+    // Selection is the persistent state and must read as more emphatic than the transient hover
+    // wash, so its alpha sits above hoverHighlight's (previously inverted: 0.22 vs 0.40, which made
+    // a selected-but-unhovered face look lighter/weaker than a merely-hovered one).
+    float selectionHighlight[4] = {0.176f,0.831f,0.749f, 0.50f};
     float hoverHighlight[4]     = {0.176f,0.831f,0.749f, 0.40f};
 
     // ---- C24: orientation-triad axis colors (X/Y/Z) ----

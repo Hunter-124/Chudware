@@ -274,6 +274,15 @@ public:
     bool bodyVisible(size_t index) const {
         return index < subs_.size() && subs_[index].visible;
     }
+    // Same query keyed by AICM body_id (as opposed to the setMeshes() vector index) — the id-buffer
+    // pick pass reports body_id, and it draws every body regardless of hide/show, so callers that
+    // want to reject a pick on a hidden body (e.g. the sketch-plane-pick face test) need this rather
+    // than bodyVisible(index). Unknown body_id (stale key) reads as visible so it never masks a pick
+    // that should otherwise resolve normally.
+    bool bodyVisibleById(uint32_t body_id) const {
+        for (const auto& s : subs_) if (s.body_id == body_id) return s.visible;
+        return true;
+    }
 
     // ---- F1: glass backdrop + adaptive contrast (Liquid Glass v2) ----
     // Kawase-blurred copy of the resolved color buffer (updated when resolveColorTexture runs).

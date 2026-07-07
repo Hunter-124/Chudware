@@ -4458,6 +4458,7 @@ bool SketchMode::drawPlanePicker(AppState& st, ImGuiIO& io, const ImVec2& imgMin
     bool quadVis[3] = {false, false, false};
     Vec3 quadW[3][4];
     for (int p = 0; p < 3; ++p) {
+        if (!st.showPlane[p]) continue;   // hidden origin plane: not a valid sketch-plane pick
         Vec3 c4[4];
         if (!r.planeQuad(p, c4)) continue;
         for (int i = 0; i < 4; ++i) quadW[p][i] = c4[i];
@@ -4971,6 +4972,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         bool quadVis[3] = {false, false, false};
         Vec3 quadW[3][4];
         for (int p = 0; p < 3; ++p) {
+            if (!st.showPlane[p]) continue;   // hidden origin plane: not a valid sketch-plane pick
             Vec3 c4[4];
             if (!r.planeQuad(p, c4)) continue;
             for (int i = 0; i < 4; ++i) quadW[p][i] = c4[i];
@@ -5027,7 +5029,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // A face in FRONT of a plane must win the pick, not fall through to the plane behind it.
         float sFaceDepth = 1e30f;
         bool sFaceHit = false;
-        if (imgHovered && st.hover.valid() && st.hover.kind == render::PickKind::Face) {
+        // The id-buffer draws every body regardless of Solid-Bodies hide/show (it needs to keep
+        // picking geometry-stable for feature edits), so a hidden body's face still shows up as
+        // st.hover here. Reject it explicitly — a face you can't see must not be pickable as a
+        // sketch plane.
+        if (imgHovered && st.hover.valid() && st.hover.kind == render::PickKind::Face &&
+            r.bodyVisibleById(st.hover.body_id)) {
             uint64_t fkey = ((uint64_t)st.hover.body_id << 32) | (uint64_t)st.hover.topo_id;
             auto fit = st.faceNormalCache.find(fkey);
             if (fit != st.faceNormalCache.end()) {

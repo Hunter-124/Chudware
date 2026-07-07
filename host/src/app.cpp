@@ -2798,6 +2798,10 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // running (and no sketch tool is armed) highlight the Profiler button instead, so its
         // ON state is visible at a glance.
         const char* activeCmd = st.sketchMode->activeToolCmd();
+        // Armed-but-awaiting-pick: "New Sketch" was clicked and we're waiting on a plane/face pick
+        // (no sketch tool active yet, so activeToolCmd() above returns ""). Highlight the New Sketch
+        // button itself so the armed state is visible, matching every other armed-tool convention.
+        if ((!activeCmd || !*activeCmd) && st.sketchPlanePickActive) activeCmd = "sketch_new";
         if (st.profilerRunning && (!activeCmd || !*activeCmd)) activeCmd = "prof_toggle";
         ui::setRibbonActiveCmd(activeCmd);
         // Sketch tab swaps Exit Sketch <-> New Sketch depending on whether a sketch is being edited.

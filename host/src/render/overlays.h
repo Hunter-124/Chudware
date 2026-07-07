@@ -99,7 +99,10 @@ private:
     std::vector<unsigned int> bodyVbos_;  // owns the per-body shared position VBOs (FaceBuf.vbo refs)
 
     float hoverCol_[4] = {0.176f, 0.831f, 0.749f, 0.45f};      // teal wash (hover, not selected)
-    float selCol_[4] = {1.000f, 0.620f, 0.180f, 0.55f};        // amber wash (selected)
+    // Amber's bright RGB channels (esp. R=1.0) composite lighter than teal against gray shaded
+    // geometry even at higher alpha, so a plain alpha bump alone doesn't read as "more prominent
+    // than hover" — the RGB is darkened/desaturated too so SELECTED unambiguously outweighs HOVER.
+    float selCol_[4] = {0.850f, 0.480f, 0.100f, 0.70f};        // amber wash (selected), darkened + more opaque
     float selHoverCol_[4] = {0.550f, 0.341f, 0.099f, 0.75f};   // darker amber (selected AND hovered)
     // C37-C: feature-highlight color — slightly dimmer amber (same hue, lower alpha)
     float featHlCol_[4] = {1.000f, 0.620f, 0.180f, 0.30f};

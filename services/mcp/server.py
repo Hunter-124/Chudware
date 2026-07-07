@@ -129,7 +129,12 @@ mcp = FastMCP(
         "card (diagnosis + editable fix_ops + verifier verdict). Record your verdict with "
         "regen_resolve(card, 'accept'|'edit'|'reject') — accept/edit returns the fixed document; "
         "regen_diagnose(document_json) runs the same diagnosis on any failed doc directly.\n"
-        "ECAD (schematic/PCB) tools are also available (ecad_*)."
+        "ECAD (schematic/PCB) tools are also available (ecad_*).\n"
+        "REVERSE ENGINEERING: reveng_start_session → reveng_add_images/reveng_add_video → "
+        "reveng_set_scale → reveng_reconstruct → reveng_fit_primitives → reveng_build_parametric. "
+        "reveng_status() probes backend availability (COLMAP/OpenMVS/Brush/TripoSR). "
+        "reveng_ingest_datasheet for PDF table extraction. list_reveng_sessions/get_reveng_session "
+        "to manage sessions (cad_guide('reveng'))."
     ),
 )
 
@@ -340,6 +345,11 @@ register_mechanical_tools(mcp)
 # provides in the Sketch3D workspace + sketch overlay (no C++ build required — Python only).
 from mcp_server.sketch3d_tools import register_sketch3d_tools
 register_sketch3d_tools(_reg.view(mcp, "cad"))
+
+# RE-ANCHOR(reveng): Reverse Engineering MCP family (contracts/reveng.md §8).
+# Sessions/ingest are live; long-job tools return backend_not_provisioned until RE-17.
+from services.mcp.reveng_tools import register_reveng_tools
+register_reveng_tools(_reg.view(mcp, "reveng"))
 
 
 def _install_clean_stdout():

@@ -99,7 +99,7 @@ Canonical checklist of every GUI change Hunter has requested for the host/ light
 | # | Item | Status | Commit |
 |---|------|--------|--------|
 | L1 | Freeze when leaving Electronics/Manufacture (down local-LLM probe saturated worker mutex) | ✅ | `50a54308` |
-| L2 | Remaining crash/freeze on rapid Model→Drawing→Simulate→Electronics→Manufacture switching | 🔧 (Hunter's separate crash-fix agent) | — |
+| L2 | Remaining crash/freeze on rapid Model→Drawing→Simulate→Electronics→Manufacture switching (Electronics per-frame ECAD focus-grab ate every click outside its window) | ✅ | `9178c8f6` |
 
 ---
 

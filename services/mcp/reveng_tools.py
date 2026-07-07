@@ -250,29 +250,86 @@ def register_reveng_tools(mcp: FastMCP) -> None:
         })
 
     @mcp.tool()
-    def get_reveng_deviation(session_id: str) -> str:
-        """Return mesh-vs-BRep deviation report for *session_id* (contracts/reveng.md §5).
+    def get_reveng_deviation(
+        session_id: str,
+        ref_path: Optional[str] = None,
+        brep_doc_id: Optional[str] = None,
+        n_samples: int = 20_000,
+    ) -> str:
+        """Compute mesh-vs-mesh (or mesh-vs-B-Rep tessellation) deviation (RE-16).
 
-        Returns the deviation schema or ``{ok: false, reason}`` if the session has no
-        completed parametric model yet.
+        Implements contracts/reveng.md §5 deviation schema:
+        ``max_mm``, ``rms_mm``, per-region heat ``buckets``, and
+        ``vertex_distances_mm`` for GUI colour-coding.
+
+        Parameters
+        ----------
+        session_id:
+            RE session identifier (``re_`` + 8 hex chars).
+        ref_path:
+            Absolute path to the reference mesh / tessellation.  Required
+            unless ``brep_doc_id`` is supplied (B-Rep tessellation path is a
+            future RE-02 extension — returns instructive error for now).
+        brep_doc_id:
+            Optional B-Rep doc id.  Future RE-02 extension will auto-tessellate
+            the parametric model and compute deviation against it.
+        n_samples:
+            Surface sample count for KD-tree probe (default 20 000).
         """
         s = _load_session(session_id)
         if s is None:
             return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
-        doc_id = s.get("artifacts", {}).get("doc_id")
+
+        # Resolve query mesh from session artifacts
         mesh_path = s.get("artifacts", {}).get("mesh_path")
-        if not doc_id or not mesh_path:
+        if not mesh_path:
             return _dumps({
                 "ok": False,
-                "reason": "no parametric model yet",
-                "hint": "run reveng_build_parametric first",
+                "reason": "no mesh in session",
+                "hint": "run reveng_reconstruct or import_scan_mesh first",
             })
-        # Deviation computation requires the real engine — not available at MCP layer yet.
-        return _dumps({
-            "ok": False,
-            "reason": "backend_not_provisioned",
-            "hint": "deviation computation requires RE-17 DAG integration",
-        })
+        if not _os.path.isabs(mesh_path):
+            mesh_path = str(_session_path(session_id) / mesh_path)
+        if not _os.path.exists(mesh_path):
+            return _dumps({
+                "ok": False,
+                "reason": f"mesh file not found: {mesh_path!r}",
+                "hint": "check session artifacts",
+            })
+
+        # Resolve reference
+        if ref_path is None and brep_doc_id is None:
+            return _dumps({
+                "ok": False,
+                "reason": "either ref_path or brep_doc_id must be supplied",
+                "hint": "export parametric model via export_part('ply') and pass ref_path",
+            })
+        if ref_path is None:
+            return _dumps({
+                "ok": False,
+                "reason": "B-Rep auto-tessellation not yet wired (RE-02 pending)",
+                "hint": "export the parametric model to PLY/OBJ and pass ref_path",
+            })
+        if not _os.path.exists(ref_path):
+            return _dumps({
+                "ok": False,
+                "reason": f"ref_path not found: {ref_path!r}",
+                "hint": "check the file path",
+            })
+
+        try:
+            from engine_oracle.vision.deviation import compute_deviation
+            result = compute_deviation(
+                mesh_path,
+                ref_path,
+                session_id=session_id,
+                brep_doc_id=brep_doc_id,
+                n_samples=n_samples,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _dumps({"ok": False, "reason": f"deviation computation failed: {exc}"})
+
+        return _dumps(result)
 
     @mcp.tool()
     def describe_reveng_result(session_id: str) -> str:

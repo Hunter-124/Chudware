@@ -40,6 +40,10 @@
 #include "render/overlays.h"
 
 #include "core/app_state.h"
+
+#ifdef AI_CAD_ENABLE_CEF
+#include "ui/widgets/cef/cef_app.h"  // CEF process lifecycle (init/pump/shutdown)
+#endif
 #include "core/cpp_core.h"   // sampling-profiler RPCs (prof_start/prof_stop) via libaicad
 #include "core/jobs.h"
 #include "ui/console_panel.h"
@@ -49,6 +53,7 @@
 #include "ui/layout.h"        // Wave 1C/1D: buildDefaultLayout + tabbed left pane (drawLeftPane)
 #include "ui/legacy_chat.h"
 #include "ui/ai/ai_workspace.h"   // AI workspace full-body hub (sessions + DAG + chat + settings)
+#include "ui/reveng/reveng_workspace.h"  // Reverse Engineering workspace full-body shell (RE-03)
 #include "ui/settings_modal.h"
 #include "ui/status_bar.h"
 #include "ui/title_bar.h"
@@ -801,6 +806,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     glfwSwapInterval(1);
     if (!gladLoadGL((GLADloadfunc)glfwGetProcAddress)) return 1;
 
+    // CEF (when the cef backend is selected) is initialised early in main(),
+    // before GLFW — see main.cpp. Nothing to do here.
+
     const std::string assets = exeDir() + "/assets";  // '/' is valid on Windows + POSIX
     setWindowIcon(win, assets + "/logo_icon.png");
 
@@ -1497,6 +1505,12 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     if (shot && shotMode && std::strcmp(shotMode, "aiws") == 0) {
         st.showRibbon = true; st.activeWorkspace = AppState::Workspace::AI;
     }
+    // AI_CAD_SHOT=reveng: open the Reverse Engineering full-body workspace shell (RE-03) for
+    // headless visual verification of the new tab. Same inline flag pattern as aiws — the
+    // generic per-frame shot capture grabs it (no scenario state machine needed).
+    if (shot && shotMode && std::strcmp(shotMode, "reveng") == 0) {
+        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::ReverseEng;
+    }
     // C20b: assembly shot — author base/peg parts, new assembly, insert + mate + interference.
     st.wantAsm = shot && shotMode && std::strcmp(shotMode, "asm") == 0;
     // AI_CAD_MATEFORM: a lightweight Mate-form-only variant of the asm shot for visual verification
@@ -1800,6 +1814,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
+#ifdef AI_CAD_ENABLE_CEF
+        ui::cef::pump_if_due();   // drive CEF's message loop when its deadline is due
+#endif
 
         // Borderless-window chrome: drag / edge-resize / double-click-maximize off the same
         // title-bar HitLayout the GUI publishes. No-op on Windows (the WndProc handles it).
@@ -2588,6 +2605,7 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                     {ImGuiKey_3, WS::Simulate},     {ImGuiKey_4, WS::Electronics},
                     {ImGuiKey_5, WS::Manufacture},  {ImGuiKey_6, WS::PLM},
                     {ImGuiKey_7, WS::PartsLibrary}, {ImGuiKey_8, WS::AI},
+                    {ImGuiKey_9, WS::ReverseEng},
                 };
                 for (const auto& k : kWsKeys)
                     if (ImGui::IsKeyPressed(k.key, false)) { st.activeWorkspace = k.ws; break; }
@@ -2903,7 +2921,8 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         using WS = AppState::Workspace;
         const WS ws = st.activeWorkspace;
         // Workspaces that own the ENTIRE central region — no left pane, no viewport, no cam/ecad.
-        const bool wsFullBody = (ws == WS::PLM || ws == WS::PartsLibrary || ws == WS::AI);
+        const bool wsFullBody = (ws == WS::PLM || ws == WS::PartsLibrary || ws == WS::AI
+                                 || ws == WS::ReverseEng);
         // Effective left-pane tab override (derived this frame; never written to st).
         // Simulate forces the Simulation tab so the sim tree shows.
         // Non-Simulate workspaces must NOT show the sim tree: clamp LP_Simulation back to
@@ -3062,6 +3081,25 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                              ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
                              ImGuiWindowFlags_NoSavedSettings);
                 ui::drawAiWorkspace(st);
+                ImGui::End();
+            }
+        } else if (ws == WS::ReverseEng) {
+            // RE-ANCHOR(reveng): full-body Reverse Engineering workspace (RE-03/RE-19/RE-21).
+            const ui::OverlayBand& band = ui::overlayBand();
+            if (band.valid) {
+                const float m = 12.0f;
+                float rightX = ui::overlayColumnEdge(1);
+                if (rightX <= band.minX + m) rightX = band.maxX;
+                ImGui::SetNextWindowPos(ImVec2(band.minX + m, band.minY + m), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2((rightX - band.minX) - 2.0f * m,
+                                                (band.maxY - band.minY) - 2.0f * m),
+                                         ImGuiCond_Always);
+                ImGui::Begin("##RevEngWorkspace", nullptr,
+                             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                             ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
+                             ImGuiWindowFlags_NoSavedSettings);
+                ui::drawRevEngWorkspace(st);
                 ImGui::End();
             }
         }
@@ -3367,6 +3405,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     st.rpc.shutdown();          // C39: drop pending async calls + abort the in-flight one
     st.worker.stop();
     simClient.stop();  // C19: shut down the second worker process
+#ifdef AI_CAD_ENABLE_CEF
+    ui::cef::shutdown();  // no-op unless CEF was initialised (browsers close in their dtors)
+#endif
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

@@ -168,6 +168,7 @@ add_executable(AI-CAD
   src/ui/plm/plm_state.cpp   # plmInvalidate/plmEnsureOverview/plmProjectName
   src/ui/plm/plm_quickbar.cpp # embedded per-doc PLM control (status-bar chip + popover)
   src/ui/ai/ai_workspace.cpp
+  src/ui/reveng/reveng_workspace.cpp  # RE-03 Reverse Engineering workspace shell
   # --- end [parts-plm sources] ---
   ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/src/gl.c
   ${imgui_SOURCE_DIR}/imgui.cpp

@@ -263,7 +263,10 @@ void drawPlmWorkspace(AppState& st) {
     drawRail(st, railW, M);
     ImGui::SameLine();
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14 * S, 10 * S));
+    // One generous, uniform content margin for every page body — so the Overview,
+    // Planning band, Team & Sync and the board all share the same left edge instead
+    // of each element hugging the border by a different amount.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24 * S, 14 * S));
     // -M width/height leaves a matching right + bottom margin from the window edge.
     ImGui::BeginChild("##plm_page", ImVec2(-M, -M), ImGuiChildFlags_None);
     ImGui::PopStyleVar();

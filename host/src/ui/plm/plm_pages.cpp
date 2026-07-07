@@ -122,15 +122,24 @@ std::string plmNiceTime(const std::string& iso) {
 // a real text field so highlighting and copy/paste work throughout the hub.
 void plmCopyText(const char* id, const std::string& text, const float* col = nullptr) {
     const float* c = col ? col : palette.text;
+    const float S = ui::uiScale;
     char buf[1024]; std::snprintf(buf, sizeof(buf), "%s", text.c_str());
+    // A read-only field that reads like a plain label: a barely-there frame (so the
+    // eye sees text, not a box) but real horizontal padding so the glyphs never jam
+    // against the left edge, and vertical padding so the row has proper height. The
+    // faint hover/active wash is the only affordance that it's selectable.
     ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,
+        ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.05f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,
+        ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.07f));
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], 1.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5 * S);
     ImGui::SetNextItemWidth(-1);
     ImGui::InputText(id, buf, sizeof(buf), ImGuiInputTextFlags_ReadOnly);
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(3);
     ImGui::PopStyleColor(4);
 }
 
@@ -1281,8 +1290,10 @@ void plmDrawPlanningPage(AppState& st) {
         {"todo", "To do"}, {"doing", "Doing"}, {"done", "Done"}, {"blocked", "Blocked"},
     };
     static const char* kPipe[] = {"todo", "doing", "done"};  // ordered lane; "blocked" is aside
-    const float gap  = 8 * S;
-    float colW = (ImGui::GetContentRegionAvail().x - gap * 3) / 4.0f;
+    const float gap  = 10 * S;
+    // Floor the width and shave a pixel so 4 columns + 3 gaps never exceed the
+    // available width (sub-pixel overflow would wrap the 4th column onto a new row).
+    float colW = std::floor((ImGui::GetContentRegionAvail().x - gap * 3) / 4.0f) - 1.0f;
     float colH = ImGui::GetContentRegionAvail().y - 8 * S;  // fill to the page bottom
     if (colH < 240 * S) colH = 240 * S;
 

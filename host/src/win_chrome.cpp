@@ -55,11 +55,15 @@ LRESULT CALLBACK proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const int B = L ? L->resizeBorder : 0;
         const bool maxed = isMaximized(hWnd);
 
-        // Interactive bits of the title bar (menus, window buttons) always take the click.
-        if (L && relY < H &&
-            ((relX >= L->menuLeft && relX < L->menuRight) ||
-             (relX >= L->controlsLeft && relX < L->controlsRight)))
-            return HTCLIENT;
+        // Interactive bits of the title bar (menus, window buttons, workspace tabs) always
+        // take the click. Fine-grained spans are checked first; legacy coarse spans are the
+        // fallback for code that hasn't been migrated yet.
+        if (L && relY < H) {
+            if (L->hitAny(relX)) return HTCLIENT;
+            if ((relX >= L->menuLeft  && relX < L->menuRight) ||
+                (relX >= L->controlsLeft && relX < L->controlsRight))
+                return HTCLIENT;
+        }
 
         // Resize edges (disabled while maximized).
         if (!maxed) {
@@ -165,6 +169,7 @@ void tick(GLFWwindow* win, HitLayout* layout) {
     // Press transition: decide what this drag is (resize edge / caption drag / nothing).
     if (down && !g_prevDown && g_mode == Mode::None) {
         const bool inMenu =
+            layout->hitAny((int)cx) ||
             (cx >= layout->menuLeft && cx < layout->menuRight) ||
             (cx >= layout->controlsLeft && cx < layout->controlsRight);
         int edge = 0;

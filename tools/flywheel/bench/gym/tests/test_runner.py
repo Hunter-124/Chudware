@@ -84,9 +84,9 @@ def test_full_matrix_all_classes_fire(tmp_path):
     counts = rep["taxonomy"]["counts"]
     fired = {k for k, v in counts.items() if v > 0}
     assert fired == set(TAXONOMY), f"classes never fired: {set(TAXONOMY) - fired}"
-    # tool_misuse must be exactly the 3 designed cells (C1s2, C4s3, C5s3) on 1 tier —
+    # tool_misuse must be exactly the 4 designed cells (C1s2, C4s3, C5s3, C7s3) on 1 tier —
     # the C6-seed3 build-tool false-positive must stay fixed.
-    assert counts["tool_misuse"] == 3, f"tool_misuse should be 3 on 1 tier, got {counts}"
+    assert counts["tool_misuse"] == 4, f"tool_misuse should be 4 on 1 tier, got {counts}"
 
 
 def test_grind_dial_delta_is_real(tmp_path):

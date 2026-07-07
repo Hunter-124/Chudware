@@ -12,6 +12,8 @@ The suite (task spec):
   C4  two-part hinge          — assembly fit + motion clearance
   C5  bracket + CAM program   — zero-gouge
   C6  modification on C1       — "fit a 25mm shaft"
+  C7  shaft-housing assembly  — all-custom 2-part running fit + retaining groove
+  C8  motor bracket + fasteners — custom parts + catalog M3 screws mated + sized
 
 Determinism: fixtures carry no wall-clock / random inputs; each challenge declares 3
 seeds (``seeds``) that select scripted agent-turn variants so the same seed reproduces
@@ -66,7 +68,8 @@ class Challenge:
 
 _CHALLENGE_MODULES = ("c1_flanged_bushing", "c2_clamshell_enclosure",
                       "c3_bearing_block", "c4_two_part_hinge",
-                      "c5_bracket_cam", "c6_bushing_mod")
+                      "c5_bracket_cam", "c6_bushing_mod",
+                      "c7_shaft_housing_fit", "c8_motor_bracket_fasteners")
 
 
 def load_challenges(*, strict: bool = False) -> list[Challenge]:

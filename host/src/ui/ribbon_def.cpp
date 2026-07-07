@@ -414,6 +414,30 @@ static const RibbonCmd kCmds[] = {
     { "sk_poly_star", "Star",     "poly_star",     "Sketch", "Draw", false, "sk_polygon", false },
 
     // =========================================================================
+    // Tab: Simulation — shared Reference Geometry group (same cmd_ids as Features tab so
+    // dispatch, tooltip, and setRibbonActiveCmd all work without change). Appended here so
+    // the Simulate workspace's ribbon has access to ref-plane / axis / point / coord sys
+    // without leaking 3D modeling tabs into the sim context.
+    // =========================================================================
+
+    // --- Group: Reference (Simulation tab copy) ---
+    { "ref_plane",         "Ref. Plane",     "ref_plane",       "Simulation", "Reference",      true,  nullptr, false },
+    { "ref_axis",          "Ref. Axis",      "ref_axis",        "Simulation", "Reference",      false, nullptr, false },
+    { "ref_point",         "Ref. Point",     "ref_point",       "Simulation", "Reference",      false, nullptr, false },
+    { "ref_csys",          "Coord. Sys.",    "ref_csys",        "Simulation", "Reference",      false, nullptr, false },
+
+    // =========================================================================
+    // Tab: Manufacture — shared Reference Geometry group (same cmd_ids as Features tab).
+    // Appended here so the Manufacture workspace has ref-plane / axis without leaking 3D tabs.
+    // =========================================================================
+
+    // --- Group: Reference (Manufacture tab copy) ---
+    { "ref_plane",         "Ref. Plane",     "ref_plane",       "Manufacture", "Reference",     true,  nullptr, false },
+    { "ref_axis",          "Ref. Axis",      "ref_axis",        "Manufacture", "Reference",     false, nullptr, false },
+    { "ref_point",         "Ref. Point",     "ref_point",       "Manufacture", "Reference",     false, nullptr, false },
+    { "ref_csys",          "Coord. Sys.",    "ref_csys",        "Manufacture", "Reference",     false, nullptr, false },
+
+    // =========================================================================
     // Tab: Manufacture (CAM — toolpaths / post / material-removal sim)
     // =========================================================================
     // --- Group: Job ---

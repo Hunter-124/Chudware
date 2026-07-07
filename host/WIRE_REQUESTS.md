@@ -95,3 +95,13 @@ Format:
   `parts_insert_into_doc`, call `st.addToast("Part inserted into document", ToastLevel::Ok)`.
   The RPC is already fired from parts_workspace.cpp; only the success toast is missing.
   This is a low-priority polish item — the Insert button works silently without it.
+
+## ribbon agent — exact insertion point for setRibbonWorkspace (2026-07-06)
+- [ ] (ribbon) `host/src/app.cpp:2719` — insert before the `drawRibbon` call (currently line ~2720):
+  `ui::setRibbonWorkspace(static_cast<int>(st.activeWorkspace));`
+  ribbon.h is already included at that translation unit. This one-liner wires the per-workspace
+  ribbon filter. Confirmed the call site: lines 2717-2722 of app.cpp read:
+    ui::setRibbonActiveCmd(activeCmd);
+    ui::setRibbonSketchActive(st.sketchMode->active());
+    float ribbonH = ui::drawRibbon(...)
+  Insert between setRibbonSketchActive and drawRibbon. Owner: workspace-shell.

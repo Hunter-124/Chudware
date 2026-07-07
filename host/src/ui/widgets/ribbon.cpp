@@ -1226,9 +1226,15 @@ void setRibbonSketchActive(bool active) {
     s_sketchActive = active;
 }
 
+void setRibbonWorkspace(int workspace) {
+    s_workspace = workspace;
+}
+
 float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool showPcbTools,
                  float titleBarH, bool showDrawingTools) {
     if (!visible) return 0.0f;
+    // PLM(5), PartsLibrary(6), AI(7): no ribbon band — viewport reclaims the full height.
+    if (s_workspace >= 5) return 0.0f;
     ribbon_seedDefaults();
     if (activeTab < 0 || activeTab >= kRibbonTabCount ||
         !ribbon_tabVisible(activeTab, showSimulationTools, showPcbTools, showDrawingTools)) {
@@ -1321,10 +1327,10 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
             ui::glassRowBackground(dl, tp0, tp1, 4.0f, /*stripe*/false, /*selected*/isAct);
         }
         if (isAct) {
-            float tabInset = ui::metrics::ribbonSmSplitInset();
-            dl->AddLine(ImVec2(tp0.x + tabInset, tp1.y - ui::metrics::px(1.0f)),
-                        ImVec2(tp1.x - tabInset, tp1.y - ui::metrics::px(1.0f)),
-                        Palette::toU32(palette.accent), ui::metrics::stroke(2.0f));
+            // Bold outline box — matches the tool-button active cue (deliverable 3).
+            // glassRowBackground already filled the pill; this adds the perimeter accent stroke.
+            dl->AddRect(tp0, tp1, Palette::toU32(palette.accent), 4.0f,
+                        0, ui::metrics::stroke(2.0f));
         }
         ImVec4 lc = (isAct || tabHov)
             ? ImVec4(palette.text[0],    palette.text[1],    palette.text[2],    palette.text[3])

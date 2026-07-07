@@ -23,6 +23,13 @@ void setRibbonActiveCmd(const char* cmd_id);
 // (SolidWorks shows the same entry point). Set once per frame before drawRibbon.
 void setRibbonSketchActive(bool active);
 
+// Per-workspace ribbon filter. Must be called once per frame before drawRibbon. The value is
+// the integer cast of AppState::Workspace (order: Model=0, Drawing=1, Simulate=2, Electronics=3,
+// Manufacture=4, PLM=5, PartsLibrary=6, AI=7). Default is 0 (Model = show all 3D tabs).
+// PLM / PartsLibrary / AI collapse the ribbon to height 0 (no band). Workspace-shell owns the
+// call-site in app.cpp; ribbon.cpp defaults to Model so the band builds without the wire.
+void setRibbonWorkspace(int workspace);
+
 // --- Ribbon layout helpers --------------------------------------------------
 
 // Begin the ribbon bar: reserves a full-width child window of height ribbonH.

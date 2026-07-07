@@ -14,6 +14,7 @@
 #include "app/app_state.h"
 #include "theme/domain_tokens.h"
 #include "theme/icons.h"
+#include "ui/toast.h"
 
 #include <algorithm>
 #include <cmath>
@@ -23,6 +24,9 @@
 #include <fstream>
 #include <string>
 #include <vector>
+
+// Toast action id for "Regen from Part" — polled by drawManufactureWorkspace each frame.
+static constexpr int kToastRegenFromPart = 0x43414D31;  // "CAM1" as int
 
 namespace ui {
 
@@ -661,6 +665,14 @@ bool camCheckPartStale(app::AppState& st) {
                 }
                 long srcRev = dq.value("source_revision", (long)-1);
                 if (srcRev >= 0) g.lastPolledPartRev = srcRev;
+                // Fire a toast once per stale cycle so the user sees it even
+                // when the Manufacture workspace isn't currently visible.
+                if (g.partStale && !g.staleToastShown) {
+                    g.staleToastShown = true;
+                    postToastAction(ToastLevel::Warn,
+                        "Part changed — CAM job geometry is stale.",
+                        "Regen from Part", kToastRegenFromPart);
+                }
                 return g.partStale;
             }
         }
@@ -681,6 +693,13 @@ bool camCheckPartStale(app::AppState& st) {
                 }
             }
             g.lastPolledPartRev = rev;
+            // Fire a toast once per stale cycle (fallback polling path).
+            if (g.partStale && !g.staleToastShown) {
+                g.staleToastShown = true;
+                postToastAction(ToastLevel::Warn,
+                    "Part changed — CAM job geometry is stale.",
+                    "Regen from Part", kToastRegenFromPart);
+            }
             break;
         }
     }

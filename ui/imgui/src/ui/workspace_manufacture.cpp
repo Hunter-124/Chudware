@@ -15,7 +15,11 @@
 #include "ui/cam/cam_panel.h"
 #include "app/app_state.h"
 #include "theme/theme.h"
+#include "ui/toast.h"
 #include "imgui.h"
+
+// Toast action id — must match cam_panel.cpp kToastRegenFromPart.
+static constexpr int kToastRegenFromPart = 0x43414D31;
 
 namespace ui {
 
@@ -25,7 +29,15 @@ void drawManufactureWorkspace(app::AppState& s) {
     //    it polls doc_list_open ~once/second and sets a stale flag when the source part
     //    has been rebuilt since the last cam_extract. The banner in the header strip
     //    responds immediately; clicking "Regen from Part" calls camRegenFromPart().
+    //    Also fires a postToastAction when the part first goes stale — visible even if
+    //    the Manufacture workspace is not the active tab.
     camCheckPartStale(s);
+
+    // Poll the toast action queue: if the user clicked "Regen from Part" on the
+    // global toast (posted by camCheckPartStale), drive the regen here.
+    if (takeToastAction() == kToastRegenFromPart)
+        camRegenFromPart(s);
+
     drawCamWorkspaceHeader(s);
 
     ImGui::Spacing();

@@ -106,6 +106,20 @@ struct ShotConfig {
     bool wantWsSketch3d         = false;   // 3D free-space sketcher overlay shot
     bool wsSketch3dShotDone      = false;
 
+    // Integration-gate workspace shots (each new workspace tab from the buildout)
+    // ws_simulate: Simulate workspace overlay columns + study tree visible
+    // ws_manufacture: Manufacture/CAM workspace full panel visible
+    // ws_parts: Parts Library full-viewport catalog browser visible
+    // ws_motion_study: kinematic motion study — assembly posed at mid-trajectory frame
+    bool wantWsSimulate    = false;
+    bool wsSimulateShotDone = false;
+    bool wantWsManufacture = false;
+    bool wsManufactureShotDone = false;
+    bool wantWsParts       = false;
+    bool wsPartsShotDone   = false;
+    bool wantWsMotionStudy = false;   // kinematics acceptance gate
+    bool wsMotionStudyShotDone = false;
+
     // T-G22: per-tab settings shots + composer dropdown + permissions popup
     bool wantSettingsGeneral = false;
     bool wantSettingsAI = false;

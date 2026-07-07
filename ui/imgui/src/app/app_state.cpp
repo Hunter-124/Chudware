@@ -2,6 +2,7 @@
 #include "platform/file_dialog.h"
 #include "viewport/scene.h"
 #include "ui/ecad/ecad_panel.h"
+#include "ui/workspace_ecad.h"
 #include <cstring>
 #include <string>
 #include <nlohmann/json.hpp>
@@ -221,6 +222,14 @@ void AppState::dispatch(const char* cmdId) {
     if (std::strcmp(cmdId, "ecad_ai_design") == 0) {
         startDemoAgent("Design a 5V regulator schematic.");
         status = "AI Design"; return;
+    }
+    if (std::strcmp(cmdId, "ecad_to_3d") == 0) { ui::ecadHandleTo3d(*this); return; }
+    if (std::strcmp(cmdId, "ecad_open") == 0) {
+        // Open ECAD file: fall through to the standard part-open dialog for now;
+        // the engine detects .kicad_sch/.kicad_pcb format automatically.
+        // TODO: add platform::openEcadFile() with ECAD-specific file-type filters.
+        doOpen();
+        return;
     }
 
     if (std::strcmp(cmdId, "view_style") == 0) {

@@ -546,6 +546,11 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
     cfg.wantWsAiAgent          = eq("ws_ai_agent");
     cfg.wantWsPlm              = eq("ws_plm");
     cfg.wantWsSketch3d         = eq("ws_sketch3d");
+    // Integration gate: new workspace tabs from the buildout
+    cfg.wantWsSimulate    = eq("ws_simulate");
+    cfg.wantWsManufacture = eq("ws_manufacture");
+    cfg.wantWsParts       = eq("ws_parts");
+    cfg.wantWsMotionStudy = eq("ws_motion_study");
     cfg.wantAgentInspector      = eq("agent_inspector");        // T-W17
     cfg.wantAgentInspectorEmpty = eq("agent_inspector_empty");  // T-W17
     cfg.wantAgentInspectorFailure    = eq("agent_inspector_failure");    // T-W17
@@ -660,6 +665,36 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
         st.workspace = cmd::Workspace::Sketch3D;
         ui::sketch3dSeedDemo();
         std::printf("ws_sketch3d: Sketch3D workspace — 3D free-space points+lines over the live scene\n");
+        std::fflush(stdout);
+    }
+    // Integration gate: new workspace-tab shots
+    if (cfg.wantWsSimulate) {
+        st.workspace = cmd::Workspace::Simulate;
+        ribbon::applyShotEnv(st);
+        std::printf("ws_simulate: Simulate workspace — study tree + overlay columns\n");
+        std::fflush(stdout);
+    }
+    if (cfg.wantWsManufacture) {
+        st.workspace = cmd::Workspace::Manufacture;
+        st.camActive = true;
+        ui::openCamWorkspacePanel();
+        std::printf("ws_manufacture: Manufacture workspace — CAM job tree + operation panel\n");
+        std::fflush(stdout);
+    }
+    if (cfg.wantWsParts) {
+        st.workspace = cmd::Workspace::PartsLibrary;
+        ui::openPartsPanel();
+        std::printf("ws_parts: Parts Library workspace — category nav rail + catalog browser\n");
+        std::fflush(stdout);
+    }
+    if (cfg.wantWsMotionStudy) {
+        // Kinematics acceptance gate: switch to Simulate workspace so the study tree
+        // + motion transport bar chrome renders. Study creation happens in tickSimpleShots
+        // after the first tick (once the SimManager is ready — no worker required for
+        // the new-study RPC path as sim_new_* only mutates local state).
+        st.workspace = cmd::Workspace::Simulate;
+        ribbon::applyShotEnv(st);
+        std::printf("ws_motion_study: kinematic motion study — Simulate workspace chrome\n");
         std::fflush(stdout);
     }
     if (cfg.wantMultidoc) st.railTab = 0;
@@ -1525,6 +1560,32 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
         st.workspace = cmd::Workspace::Sketch3D;
         ui::sketch3dSeedDemo();
         std::printf("ws_sketch3d: Sketch3D workspace — 3D free-space points+lines over the live scene\n");
+        std::fflush(stdout);
+    }
+    // Integration gate: new workspace-tab one-shot captures
+    if (cfg.wantWsSimulate && !cfg.wsSimulateShotDone) {
+        cfg.wsSimulateShotDone = true;
+        st.workspace = cmd::Workspace::Simulate;
+        std::printf("ws_simulate: Simulate workspace — study tree + overlay columns ready\n");
+        std::fflush(stdout);
+    }
+    if (cfg.wantWsManufacture && !cfg.wsManufactureShotDone) {
+        cfg.wsManufactureShotDone = true;
+        st.workspace = cmd::Workspace::Manufacture;
+        st.camActive = true;
+        std::printf("ws_manufacture: Manufacture workspace — CAM panel ready\n");
+        std::fflush(stdout);
+    }
+    if (cfg.wantWsParts && !cfg.wsPartsShotDone) {
+        cfg.wsPartsShotDone = true;
+        st.workspace = cmd::Workspace::PartsLibrary;
+        std::printf("ws_parts: Parts Library workspace — catalog browser ready\n");
+        std::fflush(stdout);
+    }
+    if (cfg.wantWsMotionStudy && !cfg.wsMotionStudyShotDone) {
+        cfg.wsMotionStudyShotDone = true;
+        st.workspace = cmd::Workspace::Simulate;
+        std::printf("ws_motion_study: kinematic motion study — Simulate workspace visible\n");
         std::fflush(stdout);
     }
 }

@@ -31,10 +31,30 @@ struct AppState;
 namespace ui {
 
 class EcadMirror;  // fwd (defined in ecad_mirror.h)
+struct AdaptiveSurface;  // fwd (defined in ui_theme.h)
 
 // Draw the ECAD editor dock window. Call every frame from the app draw loop, after the other panels
 // (see ECAD_UI_INTEGRATION.md §(c)). Self-contained: opens/closes its own ImGui window.
 void drawEcadEditor(AppState& st);
+
+// Draw the "PCB Manager" / "Schematic Manager" body — the ECAD analogue of the Feature Manager tree,
+// restyled to match its chrome (pane-header chip, glass icon toolbar, tree-row layers/nets/symbols).
+// Hosted INSIDE the shared pinned left column (layout.cpp::drawLeftPane) when the Electronics
+// workspace is active, so the ECAD tab's left column shares the FeatureManager column's exact
+// geometry (position/width) — this is what keeps the doc-tab strip anchored at the same screen X as
+// the Model tab (see doc_tabs.cpp's overlayColumnEdge(0) consumer). No Begin/End of its own — the
+// caller owns the surrounding pinned window. `surf`/`halo` are the caller's already-resolved adaptive
+// glass surface + icon halo (same ones used for the FeatureManager body) so icon/text tinting matches.
+void drawEcadManagerBody(AppState& st, const ui::AdaptiveSurface& surf, unsigned int halo);
+
+// Prime the editor's active-AppState pointer (the same one drawEcadEditor/drawEcadManagerBody set as
+// their first line) WITHOUT drawing anything. Call once at the very top of the app frame, before any
+// workspace-entry logic that might call ecadAdopt/ecadEditorLoadResponse (e.g. the Electronics
+// workspace's auto-init-PCB1) on a frame where neither draw function has run yet this session — until
+// one of them runs, the state() resolver falls back to a process-wide singleton instead of the active
+// document tab's own state, so an RPC response adopted before that point silently lands in the wrong
+// place (loads, but the manager column / canvas the user actually sees still reads empty).
+void ecadPrimeActiveApp(AppState& st);
 
 // Accessor for the scaffold's editor mirror, so external code (a ribbon command handler, a scripted
 // shot) can feed it a fresh worker response without reaching through ImGui. Returns the same mirror

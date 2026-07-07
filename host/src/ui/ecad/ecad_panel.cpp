@@ -4,6 +4,9 @@
 
 #include "ecad_panel.h"
 #include "../doc_tabs.h"      // document tabs share the central node with the Viewport (see below)
+#include "../feature_tree.h"  // fmPaneHeaderChip/fmSectionDivider/fmRowPill/fmToolbarIconBtn — the
+                              // ECAD manager body reuses the Feature Manager's own row/header chrome
+                              // so the two panels read as the same design language (item 2).
 
 #include <algorithm>
 #include <cmath>
@@ -37,8 +40,6 @@ struct EcadEditorState {
     EcadMirror mirror;
     EcadCanvas canvas;
     EcadMirror::Kind lastKind = EcadMirror::Kind::None;
-    float leftW = 200.0f;     // left sub-panel width (px, pre-scale)
-    bool  showLeft = true;
     // Wave Q — canvas editing tool state.
     std::string placeLib = "Device:R";             // symbol to place (Place tool, schematic)
     std::string placeFp  = "Resistor_SMD:R_0603";  // footprint to place (Place tool, board)
@@ -107,42 +108,6 @@ EcadEditorState& state() {
 }
 
 ImVec4 v4(const float c[4], float a = 1.0f) { return ImVec4(c[0], c[1], c[2], c[3] * a); }
-
-// Item 3 — programmatic checkmark glyph drawn straight onto a rect via ImDrawList (no atlas sprite,
-// so no dual-atlas / POST_BUILD staging hazard). Proportions mirror the property-manager's proven
-// drawChromeButtons check (property_manager.cpp) so panel-owned check buttons read consistently with
-// the rest of the app. `c` = glyph centre, `half` = half the target square edge, `th` = stroke px.
-void drawProcCheck(ImDrawList* dl, const ImVec2& c, float half, ImU32 col, float th) {
-    ImVec2 p0(c.x - half * 0.72f, c.y + half * 0.05f);
-    ImVec2 p1(c.x - half * 0.18f, c.y + half * 0.58f);
-    ImVec2 p2(c.x + half * 0.74f, c.y - half * 0.55f);
-    dl->PathLineTo(p0); dl->PathLineTo(p1); dl->PathLineTo(p2);
-    dl->PathStroke(col, ImDrawFlags_None, th);
-    dl->AddCircleFilled(p0, th * 0.5f, col);   // round the ends so the crook reads clean
-    dl->AddCircleFilled(p1, th * 0.5f, col);
-    dl->AddCircleFilled(p2, th * 0.5f, col);
-}
-
-// A small text button with a leading procedural checkmark glyph (item 3). Used for panel-owned
-// confirm-style actions (Update Board / Annotate) so their check aligns with the app convention
-// without touching the ribbon atlas. Returns true on click.
-bool checkButton(const char* label, float sc) {
-    const ui::Palette& pal = ui::palette;
-    const float h = ImGui::GetFrameHeight();
-    const float glyph = h;                       // reserve a square glyph slot at the button height
-    const ImVec2 lbl = ImGui::CalcTextSize(label);
-    const ImVec2 size(glyph + 6 * sc + lbl.x + 12 * sc, h);
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    ImGui::PushID(label);
-    const bool clicked = ImGui::Button("##checkbtn", size);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImVec2 gc(p0.x + 6 * sc + glyph * 0.5f, p0.y + h * 0.5f);
-    drawProcCheck(dl, gc, glyph * 0.34f, ui::Palette::toU32(pal.statusOk), 2.4f * sc);
-    dl->AddText(ImVec2(p0.x + glyph + 6 * sc, p0.y + (h - lbl.y) * 0.5f),
-                ui::Palette::toU32(pal.text), label);
-    ImGui::PopID();
-    return clicked;
-}
 
 // Item 4 — runtime workspace health scan. Reads the loaded mirror (pure, no RPC) and flags missing
 // deps / unlinked components / broken schematic->board hooks. Only re-runs when the revision changed
@@ -551,76 +516,211 @@ void handleCanvasEdit(AppState& st, EcadEditorState& es, const EcadCanvasIO& io)
     if (!ops.empty()) { st.ecadPendingOps = ops; st.ecadOpsGo = true; }
 }
 
-// ---- left sub-panel: PCB layers / sch nets ----
-// Restyled to match the Feature Manager's panel chrome (host/src/ui/feature_tree.cpp
-// drawFeatureManagerTopStrip): a centered glass-backed icon row for the document history controls,
-// sitting on the panel that owns the undo/redo-able state, instead of the canvas toolbar above.
-void drawLeftPanel(AppState& st, EcadEditorState& es) {
-    const ui::Palette& pal = ui::palette;
+// ---- ECAD manager body: PCB layers / sch nets+symbols, restyled to match Feature Manager ----
+// (moved OUT of the ECAD dock window and into the shared pinned left column — see ecad_panel.h and
+// layout.cpp's Electronics branch. Kept here, in the anonymous namespace, as the implementation the
+// exported ui::drawEcadManagerBody (bottom of file) delegates to, so it can still reach the file's
+// other anonymous-namespace helpers (state(), v4(), layerSwatch(), scanEcadHealth(), drawPropInspector()).
+void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU32 halo) {
+    EcadEditorState& es = state();
     EcadMirror& m = es.mirror;
+    const ui::Palette& pal = ui::palette;
     const float sc = ui::uiScale;
+    (void)halo;
 
-    // History controls (moved off the canvas toolbar — item 3): same glass-row treatment the
-    // Feature Manager's top strip uses for its Undo/Redo buttons.
+    if (!m.hasDoc()) {
+        ImGui::TextColored(v4(pal.textDim), "No PCB/schematic document open.");
+        return;
+    }
+    const bool pcb = m.isPcb();
+
+    // ---- header: pane-header chip (icon + title), the SAME helper the Feature Manager column uses
+    // for its "Feature Manager" header pill — item 1/2: identical chrome + geometry. ----
+    const ImVec2 pOrigin = ImGui::GetCursorScreenPos();
+    const float paneW = ImGui::GetContentRegionAvail().x;
+    const float centerX = pOrigin.x + paneW * 0.5f;
+    char titleBuf[32];
+    std::snprintf(titleBuf, sizeof(titleBuf), "%s Manager", pcb ? "PCB" : "Schematic");
+    ui::fmPaneHeaderChip(st, titleBuf, "ai_panel", centerX);
+    ImGui::Separator();
+
+    // Subtitle: file name + revision (folds in the removed canvas "File Display" row — item 4) plus
+    // the runtime workspace-health line (item 4 also removed the canvas status strip; it lives here
+    // now, right under the header, exactly where SolidWorks-style managers put document status).
+    {
+        const std::string nm = m.name().empty() ? "(untitled)" : m.name();
+        char rev[24]; std::snprintf(rev, sizeof(rev), "rev %d", m.revision());
+        ImGui::TextColored(v4(pal.textDim), "%s  -  %s", nm.c_str(), rev);
+    }
+    scanEcadHealth(es);
+    if (!es.healthMsg.empty()) {
+        const ImVec4 hc = es.healthLevel >= 2 ? v4(pal.statusErr)
+                        : es.healthLevel == 1 ? v4(pal.statusWarn)
+                                              : v4(pal.statusOk);
+        ImGui::TextColored(hc, es.healthLevel == 0 ? "%s" : "! %s", es.healthMsg.c_str());
+    }
+    ImGui::Spacing();
+
+    // ---- icon toolbar row: Zoom Fit / Undo / Redo / Run DRC (pcb) or Annotate (sch) — same glass
+    // icon-button the Feature Manager toolbar uses (ui::fmToolbarIconBtn), instead of the old
+    // SmallButton row / the canvas-top checkButton. ----
     {
         const float bw = 24.0f * sc, gap = 4.0f * sc;
-        const float toolW = 2.0f * bw + gap;
+        const int nBtn = 4;
+        const float toolW = nBtn * bw + (nBtn - 1) * gap;
         ImVec2 rowMin = ImGui::GetCursorScreenPos();
         const float availW = ImGui::GetContentRegionAvail().x;
         ui::glassRowBackground(ImGui::GetWindowDrawList(), rowMin,
                                ImVec2(rowMin.x + availW, rowMin.y + bw), 3.5f, false, false, 0.24f);
         float bx = rowMin.x + std::max(0.0f, (availW - toolW) * 0.5f);
         ImGui::SetCursorScreenPos(ImVec2(bx, rowMin.y));
-        if (ImGui::SmallButton("Undo")) st.ecadUndoGo = true;
+        if (ui::fmToolbarIconBtn("ecad_fit", "view_selector", "Zoom Fit", true)) es.canvas.requestFit();
         ImGui::SameLine(0, gap);
-        if (ImGui::SmallButton("Redo")) st.ecadRedoGo = true;
+        if (ui::fmToolbarIconBtn("ecad_undo", "undo", "Undo", true)) st.ecadUndoGo = true;
+        ImGui::SameLine(0, gap);
+        if (ui::fmToolbarIconBtn("ecad_redo", "redo", "Redo", true)) st.ecadRedoGo = true;
+        ImGui::SameLine(0, gap);
+        if (pcb) {
+            if (ui::fmToolbarIconBtn("ecad_drc", "health_check", "Run DRC — rebuild + re-check design rules",
+                                     true))
+                st.ecadPanelCmd = "ecad_run_drc";
+        } else {
+            if (ui::fmToolbarIconBtn("ecad_ann", "health_check",
+                                     "Annotate — auto-assign reference designators", true))
+                st.ecadPanelCmd = "sch_annotate";
+        }
         ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMin.y + bw));
         ImGui::Dummy(ImVec2(availW, 0));
-        ImGui::Spacing();
+    }
+    ImGui::Spacing();
+
+    // ---- Select / Place / Route segmented control — the "Place/Route controls", full-width and
+    // prominent like Feature Manager's "Name & group features" CTA row (doesn't need to be blue —
+    // the selected segment just carries the accent tint). ----
+    {
+        static const char* kLabels[3] = {"Select", "Place", "Route"};
+        const float rowH = ImGui::GetFrameHeight();
+        const float availW = ImGui::GetContentRegionAvail().x;
+        const float segGap = 4.0f * sc;
+        const float segW = (availW - 2.0f * segGap) / 3.0f;
+        for (int i = 0; i < 3; ++i) {
+            if (i > 0) ImGui::SameLine(0, segGap);
+            const bool on = (st.ecadTool == i);
+            if (on) ImGui::PushStyleColor(ImGuiCol_Button, ui::Palette::toU32(pal.accentSoft));
+            ImGui::PushID(i);
+            if (ImGui::Button(kLabels[i], ImVec2(segW, rowH))) { st.ecadTool = i; es.routing = false; }
+            ImGui::PopID();
+            if (on) ImGui::PopStyleColor();
+        }
     }
 
-    if (m.isPcb()) {
-        ImGui::TextColored(v4(pal.textDim), "Layers");
-        ImGui::Separator();
-        for (const auto& ly : m.layers()) {
-            ImGui::PushID(ly.id.c_str());
-            bool vis = m.layerVisible(ly.id);
-            if (ImGui::Checkbox("##v", &vis)) m.setLayerVisible(ly.id, vis);
-            ImGui::SameLine();
-            // color swatch
-            const ImVec4 sw = layerSwatch(ly.copperIndex);
-            ImVec2 p0 = ImGui::GetCursorScreenPos();
-            const float s = ImGui::GetTextLineHeight();
-            ImGui::GetWindowDrawList()->AddRectFilled(
-                p0, ImVec2(p0.x + s, p0.y + s), ui::Palette::toU32(&sw.x), 2.0f);
-            ImGui::Dummy(ImVec2(s + 6 * ui::uiScale, s));
-            ImGui::SameLine();
-            ImGui::TextColored(vis ? v4(pal.text) : v4(pal.textDisabled), "%s", ly.id.c_str());
-            ImGui::PopID();
-        }
+    // Contextual: Place tool's part/footprint picker; Route tool's hint. Select tool falls through
+    // to the property inspector below (drawPropInspector), which doubles as this column's live
+    // "PropertyManager" form when a symbol/footprint is selected — the ECAD analogue of the
+    // FeatureManager tab hosting the PM form inline.
+    if (st.ecadTool == 1) {
         ImGui::Spacing();
-        ImGui::TextColored(v4(pal.textDim), "Nets (%d)", (int)m.nets().size());
-        ImGui::Separator();
-        for (const auto& n : m.nets())
-            ImGui::TextColored(v4(pal.text), "%s", n.name.c_str());
-    } else if (m.isSch()) {
-        ImGui::TextColored(v4(pal.textDim), "Nets (%d)", (int)m.nets().size());
-        ImGui::Separator();
-        for (const auto& n : m.nets()) {
-            ImGui::TextColored(v4(pal.text), "%s", n.name.c_str());
+        if (m.isSch()) {
+            static const char* kLibs[] = {"Device:R", "Device:C", "Device:L", "Device:D",
+                "Simulation_SPICE:V_source", "power:GND", "power:VCC"};
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::BeginCombo("##ecadPlacePart", es.placeLib.c_str())) {
+                for (auto* l : kLibs)
+                    if (ImGui::Selectable(l, es.placeLib == l)) es.placeLib = l;
+                ImGui::EndCombo();
+            }
+        } else {
+            static const char* kFps[] = {"Resistor_SMD:R_0603", "Capacitor_SMD:C_0603",
+                "Package_SO:SOIC-8", "Package_TO_SOT_SMD:SOT-23"};
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::BeginCombo("##ecadPlaceFp", es.placeFp.c_str())) {
+                for (auto* f : kFps)
+                    if (ImGui::Selectable(f, es.placeFp == f)) es.placeFp = f;
+                ImGui::EndCombo();
+            }
+        }
+    } else if (st.ecadTool == 2) {
+        ImGui::Spacing();
+        ImGui::TextColored(v4(pal.textDim), "Route: click points; Esc / right-click to finish");
+    } else if (st.ecadTool == 0) {
+        if (drawPropInspector(st, es, sc)) ImGui::Spacing();
+        else ImGui::TextColored(v4(pal.textDim),
+                                "Select: click a part to edit; middle/right-drag to pan, wheel to zoom");
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    // ---- Layers (pcb) / Nets + Symbols (sch) — Feature Manager tree-row styling: fmSectionDivider
+    // for the "Reference"/"Features"-style section labels, fmRowPill for the alternating-stripe,
+    // hoverable rows (mirrors the "Front Plane"/"Top Plane" convention). ----
+    ImGui::BeginChild("##ecadMgrTree", ImVec2(0, 0), ImGuiChildFlags_None);
+    ui::fmRowStripeReset();
+    auto layerRow = [&](const EcadLayer& ly) {
+        ImGui::PushID(ly.id.c_str());
+        ui::FmRowRect r = ui::fmRowPill();
+        bool vis = m.layerVisible(ly.id);
+        const ImVec4 sw = layerSwatch(ly.copperIndex);
+        const float s = ImGui::GetTextLineHeight();
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImGui::GetWindowDrawList()->AddRectFilled(p0, ImVec2(p0.x + s, p0.y + s),
+                                                  ui::Palette::toU32(&sw.x), 2.0f * sc);
+        ImGui::Dummy(ImVec2(s + 6.0f * sc, s));
+        ImGui::SameLine();
+        ImGui::TextColored(vis ? v4(pal.text) : v4(pal.textDisabled), "%s", ly.id.c_str());
+        ImGui::SameLine();
+        const float availW = ImGui::GetContentRegionAvail().x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, availW - s));
+        bool visChk = vis;
+        if (ImGui::Checkbox("##vis", &visChk)) m.setLayerVisible(ly.id, visChk);
+        ui::fmRowPillEnd(r);
+        ImGui::PopID();
+    };
+    auto netRow = [&](const EcadNet& n, bool withPins) {
+        ui::FmRowRect r = ui::fmRowPill();
+        ImGui::TextColored(v4(pal.text), "%s", n.name.c_str());
+        if (withPins) {
             ImGui::SameLine();
             ImGui::TextColored(v4(pal.textDim), "(%d pins)", n.pinCount);
         }
+        ui::fmRowPillEnd(r);
+    };
+    if (pcb) {
+        ui::fmSectionDivider("Layers");
+        for (const auto& ly : m.layers()) layerRow(ly);
         ImGui::Spacing();
-        ImGui::TextColored(v4(pal.textDim), "Symbols (%d)", (int)m.symbols().size());
-        ImGui::Separator();
+        char netsHdr[32]; std::snprintf(netsHdr, sizeof(netsHdr), "Nets (%d)", (int)m.nets().size());
+        ui::fmSectionDivider(netsHdr);
+        for (const auto& n : m.nets()) netRow(n, /*withPins=*/false);
+    } else {
+        char netsHdr[32]; std::snprintf(netsHdr, sizeof(netsHdr), "Nets (%d)", (int)m.nets().size());
+        ui::fmSectionDivider(netsHdr);
+        for (const auto& n : m.nets()) netRow(n, /*withPins=*/true);
+        ImGui::Spacing();
+        char symHdr[32]; std::snprintf(symHdr, sizeof(symHdr), "Symbols (%d)", (int)m.symbols().size());
+        ui::fmSectionDivider(symHdr);
         for (const auto& s : m.symbols()) {
+            ui::FmRowRect r = ui::fmRowPill();
             ImGui::TextColored(v4(pal.text), "%s", s.ref.empty() ? s.libid.c_str() : s.ref.c_str());
             if (!s.value.empty()) {
                 ImGui::SameLine();
                 ImGui::TextColored(v4(pal.textDim), "%s", s.value.c_str());
             }
+            ui::fmRowPillEnd(r);
         }
+    }
+    ImGui::EndChild();
+
+    // ---- Simulation (schematic only): analysis picker + Simulate button, tucked at the bottom of
+    // the manager column instead of the removed canvas-top toolbar. ----
+    if (!pcb) {
+        ImGui::Separator();
+        static const char* kAnalyses[] = {"Transient", "AC"};
+        int analysis = st.ecadSimAnalysis;
+        ImGui::SetNextItemWidth(-70.0f * sc);
+        if (ImGui::Combo("##ecadAnalysis", &analysis, kAnalyses, 2)) st.ecadSimAnalysis = analysis;
+        ImGui::SameLine();
+        if (ImGui::Button("Simulate", ImVec2(-1, 0))) st.ecadSimGo = true;
     }
 }
 
@@ -962,6 +1062,20 @@ void ecadEditorLoadResponse(const nlohmann::json& resp) {
     }
 }
 
+// Called from layout.cpp's Electronics branch of drawLeftPane, BEFORE drawEcadEditor runs this same
+// frame — so route state() to the active ECAD tab here too (drawEcadEditor does it again a few lines
+// later; both are idempotent, g_app just needs to point at the live AppState before state() is used).
+void drawEcadManagerBody(AppState& st, const ui::AdaptiveSurface& surf, unsigned int halo) {
+    g_app = &st;
+    drawEcadManagerBodyImpl(st, surf, (ImU32)halo);
+}
+
+// See ecad_panel.h. Call once at the top of the app frame — cheap (one pointer store) — so a
+// workspace-entry RPC adopt (ecadAutoInitBoard's ecad_new -> ecadAdopt) that fires before either draw
+// function has run this session still resolves state() to the real per-tab EcadEditorState instead of
+// the process-wide fallback.
+void ecadPrimeActiveApp(AppState& st) { g_app = &st; }
+
 void drawEcadEditor(AppState& st) {
     g_app = &st;                  // Wave 2: route state() to this frame's active ECAD tab
     EcadEditorState& es = state();
@@ -1022,74 +1136,13 @@ void drawEcadEditor(AppState& st) {
 
     // The document tab strip (ui::drawDocTabs) is a FLOATING overlay pinned flush under the ribbon
     // (see doc_tabs.cpp "pinned floating overlay window" note) — it reserves no layout space in this
-    // window, so any content drawn at the window's own top would sit at the exact same screen row and
-    // get visually/input-occluded by the tab pills. The Model viewport dodges this because its 3D
-    // image is a full-bleed background the overlay simply floats on top of; the ECAD toolbar is real
-    // widgets, so it must explicitly reserve the strip's height first.
-    ImGui::Dummy(ImVec2(0, ui::docTabStripHeight(st) + 2.0f * sc));
-
-    // ---- header toolbar (item 2 layout rework) ----
-    // Convention mirrors the Modeling / Drawing tab strips: a single compact, LEFT-aligned control
-    // row (view/history controls + the contextual confirm action), with the File Display centered on
-    // the same line, then a status strip below. View controls that were right-anchored now sit LEFT.
-    // Undo/Redo moved into the left Layers/Nets panel (drawLeftPanel) so they sit next to the panel
-    // they actually affect and match the Feature Manager convention of history controls living on the
-    // tree/panel chrome rather than the canvas toolbar.
-    ImGui::AlignTextToFramePadding();
-    if (ImGui::SmallButton("Zoom Fit")) es.canvas.requestFit();
-    ImGui::SameLine(0, 12 * sc);
-    ImGui::Checkbox(es.mirror.isPcb() ? "Layers" : "Nets", &es.showLeft);
-    // Contextual confirm action with a procedural checkmark (item 3): Annotate on a schematic,
-    // Update Board on a PCB. Routed through the shared ribbon handler (ecadPanelCmd), so behaviour
-    // matches the ribbon button exactly. Checkmark is drawn in code — no atlas / POST_BUILD hazard.
-    ImGui::SameLine(0, 16 * sc);
-    if (es.mirror.isSch()) {
-        if (checkButton("Annotate", sc)) st.ecadPanelCmd = "sch_annotate";
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Auto-assign reference designators (R1, C1, ...)");
-    } else {
-        // Board-side confirm action. NOTE: "Update Board" (back-annotate from the linked schematic)
-        // needs a sch_doc_id the panel mirror doesn't carry — that stays on the ribbon. The panel
-        // offers Run DRC instead (self-contained, routes through the same ribbon handler).
-        if (checkButton("Run DRC", sc)) st.ecadPanelCmd = "ecad_run_drc";
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Rebuild + re-check design rules on the current board");
-    }
-
-    // CENTER: File Display / File Manager — the document badge + name + revision, horizontally
-    // centered on the toolbar row (item 2). Computed from the text extents so it stays centered at
-    // any window width; falls back to a left position if the left cluster would overlap.
-    {
-        const char* badge = es.mirror.isSch() ? "SCHEMATIC" : "PCB LAYOUT";
-        const std::string nm = es.mirror.name().empty() ? "(untitled)" : es.mirror.name();
-        char rev[24]; std::snprintf(rev, sizeof(rev), "rev %d", es.mirror.revision());
-        const float wBadge = ImGui::CalcTextSize(badge).x;
-        const float wName  = ImGui::CalcTextSize(nm.c_str()).x;
-        const float wRev   = ImGui::CalcTextSize(rev).x;
-        const float total  = wBadge + 12 * sc + wName + 8 * sc + wRev;
-        const float regionW = ImGui::GetWindowContentRegionMax().x - ImGui::GetWindowContentRegionMin().x;
-        const float leftEnd = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x;  // end of left cluster
-        float cx = (regionW - total) * 0.5f;
-        if (cx < leftEnd + 16 * sc) cx = leftEnd + 16 * sc;   // never overlap the left cluster
-        ImGui::SameLine(cx);
-        ImGui::TextColored(v4(pal.accent), "%s", badge);
-        ImGui::SameLine(0, 12 * sc);
-        ImGui::TextColored(v4(pal.text), "%s", nm.c_str());
-        ImGui::SameLine(0, 8 * sc);
-        ImGui::TextColored(v4(pal.textDim), "%s", rev);
-    }
-
-    // Status strip below the toolbar — the runtime workspace-health line (item 4). Matches the
-    // Drawing tab's dim/warn status-strip convention. Scan is revision-guarded (no per-frame cost,
-    // no RPC); auto-init of an empty board happens in app.cpp at workspace entry.
-    scanEcadHealth(es);
-    if (!es.healthMsg.empty()) {
-        const ImVec4 hc = es.healthLevel >= 2 ? v4(pal.statusErr)
-                        : es.healthLevel == 1 ? v4(pal.statusWarn)
-                                              : v4(pal.statusOk);
-        ImGui::TextColored(hc, es.healthLevel == 0 ? "%s" : "! %s", es.healthMsg.c_str());
-    }
-
-    ImGui::Separator();
+    // window. The Model viewport doesn't reserve space for it either (viewport_panel.cpp's
+    // vpDockStripDraw): its 3D image is full-bleed and the overlay simply floats on top. The ECAD
+    // canvas now follows the SAME convention (item 4) — no toolbar chrome above it any more (Zoom
+    // Fit / Select-Place-Route / Layers / Undo-Redo / Run DRC / the File Display badge all moved into
+    // the pinned left column's PCB/Schematic Manager body — see ecad_panel.h::drawEcadManagerBody and
+    // layout.cpp's Electronics branch of drawLeftPane), so the canvas reaches all the way up to the
+    // ribbon exactly like the 3D viewport does, with the floating doc tabs over its top-left corner.
 
     // ---- keyboard history: Ctrl+Z = undo, Ctrl+Y / Ctrl+Shift+Z = redo ----
     // GATED on the ECAD window (incl. its child windows) being focused so it never collides with the
@@ -1105,76 +1158,14 @@ void drawEcadEditor(AppState& st) {
         }
     }
 
-    // ---- canvas tool toolbar (Wave Q): Select / Place / Route + the part to place ----
-    {
-        auto toolBtn = [&](const char* label, int tool) {
-            const bool on = (st.ecadTool == tool);
-            if (on) ImGui::PushStyleColor(ImGuiCol_Button, v4(pal.accentDim));
-            if (ImGui::Button(label)) { st.ecadTool = tool; es.routing = false; }
-            if (on) ImGui::PopStyleColor();
-            ImGui::SameLine();
-        };
-        toolBtn("Select", 0);
-        toolBtn("Place", 1);
-        toolBtn("Route", 2);
-        ImGui::TextColored(v4(pal.textDim), "|");
-        ImGui::SameLine();
-        if (st.ecadTool == 1 && es.mirror.isSch()) {
-            static const char* kLibs[] = {"Device:R", "Device:C", "Device:L", "Device:D",
-                "Simulation_SPICE:V_source", "power:GND", "power:VCC"};
-            ImGui::SetNextItemWidth(210 * sc);
-            if (ImGui::BeginCombo("Part", es.placeLib.c_str())) {
-                for (auto* l : kLibs)
-                    if (ImGui::Selectable(l, es.placeLib == l)) es.placeLib = l;
-                ImGui::EndCombo();
-            }
-        } else if (st.ecadTool == 1) {
-            static const char* kFps[] = {"Resistor_SMD:R_0603", "Capacitor_SMD:C_0603",
-                "Package_SO:SOIC-8", "Package_TO_SOT_SMD:SOT-23"};
-            ImGui::SetNextItemWidth(250 * sc);
-            if (ImGui::BeginCombo("Footprint", es.placeFp.c_str())) {
-                for (auto* f : kFps)
-                    if (ImGui::Selectable(f, es.placeFp == f)) es.placeFp = f;
-                ImGui::EndCombo();
-            }
-        } else {
-            ImGui::TextColored(v4(pal.textDim), st.ecadTool == 2
-                ? "Route: click points; Esc / right-click to finish"
-                : "Select: click a part to edit; middle/right-drag to pan, wheel to zoom");
-        }
-        // Native simulator controls (schematic only): an analysis selector + a Simulate button that
-        // fires ecad_simulate via the app loop (st.ecadSimGo). Results plot in the bottom strip.
-        if (es.mirror.isSch()) {
-            ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 240 * sc);
-            ImGui::SetNextItemWidth(110 * sc);
-            const char* kAnalyses[] = {"Transient", "AC"};
-            int analysis = st.ecadSimAnalysis;
-            if (ImGui::Combo("##ecadAnalysis", &analysis, kAnalyses, 2)) st.ecadSimAnalysis = analysis;
-            ImGui::SameLine();
-            if (ImGui::Button("Simulate", ImVec2(100 * sc, 0))) st.ecadSimGo = true;
-        }
-    }
-    // Property inspector row (Select tool): edit the selected symbol/footprint's Ref/Value. On its
-    // own line so it never contends with the right-anchored Simulate controls. Draws nothing unless a
-    // symbol/footprint is selected, so the toolbar stays compact when picking wires/tracks/nothing.
-    if (st.ecadTool == 0) drawPropInspector(st, es, sc);
-    ImGui::Separator();
-
-    // Reserve the bottom results strip; the rest splits left sub-panel | canvas. Give the strip
-    // more room when there are sim results to plot so the waveform is readable.
+    // Reserve the bottom results strip; the rest is the full-width canvas (the left Manager column
+    // now floats OVER it, pinned window style, same as the Model tab's FeatureManager column floats
+    // over the 3D viewport). Give the strip more room when there are sim results to plot.
     const bool hasSimNow = es.mirror.isSch() && st.ecadSimResults.is_object() &&
                            !st.ecadSimResults.empty();
     const float bottomH = (hasSimNow ? 260.0f : 140.0f) * sc;
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     const float mainH = avail.y - bottomH;
-
-    // Left sub-panel.
-    if (es.showLeft) {
-        ImGui::BeginChild("##ecadLeft", ImVec2(es.leftW * sc, mainH), ImGuiChildFlags_Border);
-        drawLeftPanel(st, es);
-        ImGui::EndChild();
-        ImGui::SameLine();
-    }
 
     // Canvas.
     ImGui::BeginChild("##ecadCanvasHost",

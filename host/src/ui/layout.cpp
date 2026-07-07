@@ -19,6 +19,7 @@
 #include "config_panel.h"       // ConfigPanel::drawEmbedded (live Configurations tab)
 #include "sim_manager.h"        // SimManager::drawTreeBody (live Simulation tab)
 #include "cam/cam_panel.h"      // drawCamTreeBody (the Manufacture workspace's left tree)
+#include "ecad/ecad_panel.h"    // drawEcadManagerBody (the Electronics workspace's left tree)
 #include "doc_tabs.h"           // docTabStripHeight (the column never overlaps the doc-tab band)
 #include "icons.h"              // getIcon / IconUV
 #include "metrics.h"            // dockRightTarget (command-dialog default anchor)
@@ -428,6 +429,23 @@ void drawLeftPane(AppState& st,
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * S, 4.0f * S));
         ui::drawCamTreeBody(st);
         ImGui::PopStyleVar();
+        ImGui::PopStyleColor();  // ImGuiCol_Text (surf.textPrimary)
+        ImGui::End();
+        return;
+    }
+
+    // [workspace-tabs seam] Electronics workspace: the ECAD "PCB Manager" / "Schematic Manager" body
+    // (ecad/ecad_panel.cpp::drawEcadManagerBody), same pattern as Simulate/Manufacture above — one
+    // workspace-appropriate tree, no Explorer/FeatureManager/Configurations tabs. Hosting it INSIDE
+    // this SAME pinned column (rather than a separate embedded child inside the ECAD dock window,
+    // which is what app.cpp used to do) is what keeps the column's geometry byte-identical to the
+    // Model tab's FeatureManager column — publishOverlayColumnEdge(0, ...) above already ran this
+    // frame, so the floating doc-tab strip (doc_tabs.cpp) anchors at the SAME screen X switching
+    // between Model and Electronics (previously it fell back to the band's far-left edge, since
+    // Electronics never called drawLeftPane and the published edge is frame-stamped stale by one
+    // frame — see doc_tabs.cpp's overlayColumnEdge(0) consumer).
+    if (st.activeWorkspace == AppState::Workspace::Electronics) {
+        ui::drawEcadManagerBody(st, surf, lpHalo);
         ImGui::PopStyleColor();  // ImGuiCol_Text (surf.textPrimary)
         ImGui::End();
         return;

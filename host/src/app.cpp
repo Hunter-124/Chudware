@@ -2941,11 +2941,45 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         if (ws != WS::Electronics && st.showPcbTools && st.ecadDocId.empty()) st.showPcbTools = false;
         const bool wsShowEcad = (ws == WS::Electronics) || st.showPcbTools || !st.ecadDocId.empty();
 
+        // ---- Electronics workspace-entry auto-init (hoisted ABOVE drawLeftPane) ----
+        // Must run before drawLeftPane (below) so its ECAD "PCB Manager" body (layout.cpp's
+        // Electronics branch -> ecad_panel.cpp::drawEcadManagerBody) sees the freshly-created board
+        // on the SAME frame the workspace is entered, instead of one frame of "No PCB/schematic
+        // document open" while the mirror is still empty. wantFocusEcad's actual SetNextWindowFocus
+        // stays below, right before drawEcadEditor draws — window-focus calls that fire before their
+        // window's Begin() are a no-op, so only the doc-creation edge needs to move.
+        //
+        // ecadPrimeActiveApp is needed because ecadAutoInitBoard's ecad_new -> ecadAdopt can be the
+        // FIRST-EVER ECAD call this session (a brand new Electronics entry, nothing loaded yet) —
+        // before either drawEcadEditor or drawEcadManagerBody has run once to set the state()
+        // resolver's active-AppState pointer. Without priming it first, ecadAdopt's mirror load lands
+        // in the process-wide fallback state instead of the just-created PCB1 tab's own state, so the
+        // manager body / canvas the user actually sees still reads "no document" this frame.
+        ui::ecadPrimeActiveApp(st);
+        static WS ecadPrevWsForInit = WS::Model;
+        if (ws != ecadPrevWsForInit) {
+            if (ws == WS::Electronics) {
+                st.wantFocusEcad = 2;      // pop the ECAD tab forward for a couple of frames
+                // Auto-init a default PCB1 board on first entry with nothing open, so the user
+                // lands in a usable layout (item 1). Edge-triggered here (once), never in the
+                // draw path. No-op when a doc is already open; graceful fallback on worker error.
+                ecadAutoInitBoard(st);
+            } else if (ecadPrevWsForInit == WS::Electronics) {
+                st.wantFocusEcad = 0;      // cancel any pending grab from the stay
+                st.wantFocusViewport = 2;  // bring the 3D view back to the central node
+            }
+            ecadPrevWsForInit = ws;
+        }
+
         if (!wsFullBody) {
             // ---- normal viewport workspaces (Model, Drawing, Simulate, Electronics, Manufacture) ----
-            // Electronics suppresses the model feature tree — the ECAD panel owns its own
-            // left sub-panel (layer visibility / net list) so a double left column is wrong.
-            const bool showLeftPane = (ws != WS::Electronics);
+            // Electronics used to suppress this column (the ECAD panel drew its own embedded left
+            // sub-panel instead) — that's what left the doc-tab strip anchored at the band's far-left
+            // edge instead of matching the Model tab (drawLeftPane never ran, so it never published
+            // this frame's overlayColumnEdge(0)). drawLeftPane now hosts the ECAD "PCB/Schematic
+            // Manager" body itself (layout.cpp's Electronics branch, mirroring the Simulate/
+            // Manufacture single-tree pattern) so the SAME pinned column serves every workspace.
+            const bool showLeftPane = true;
             if (st.propertyManager->active()) {
                 st.propertyManager->tick(st);
                 if (showLeftPane) st.showFeatureTree = true;
@@ -2990,26 +3024,12 @@ int run_gui(const char* screenshotPath, const char* openPath) {
 
         if (!wsFullBody) {
             // ---- ECAD editor (Electronics workspace or when an ECAD doc is open) ----
-            // Surface the ECAD dock tab ONCE when the Electronics workspace is entered, and hand
-            // the central node back to the Viewport ONCE on the way out. This must stay
-            // edge-triggered: SetNextWindowFocus -> FocusWindow steals ImGui's ActiveId from
-            // widgets in every other window, so the old continuous per-frame grab cancelled any
-            // click outside the ECAD window before its release could land — title-bar workspace
-            // tabs included. That was the "stuck on the Electronics tab" input lockup.
-            static WS ecadPrevWs = WS::Model;
-            if (ws != ecadPrevWs) {
-                if (ws == WS::Electronics) {
-                    st.wantFocusEcad = 2;      // pop the ECAD tab forward for a couple of frames
-                    // Auto-init a default PCB1 board on first entry with nothing open, so the user
-                    // lands in a usable layout (item 1). Edge-triggered here (once), never in the
-                    // draw path. No-op when a doc is already open; graceful fallback on worker error.
-                    ecadAutoInitBoard(st);
-                } else if (ecadPrevWs == WS::Electronics) {
-                    st.wantFocusEcad = 0;      // cancel any pending grab from the stay
-                    st.wantFocusViewport = 2;  // bring the 3D view back to the central node
-                }
-                ecadPrevWs = ws;
-            }
+            // The workspace-entry edge trigger (auto-init PCB1 + arming wantFocusEcad/
+            // wantFocusViewport) now runs ABOVE drawLeftPane — see the hoisted block above. This must
+            // stay edge-triggered: SetNextWindowFocus -> FocusWindow steals ImGui's ActiveId from
+            // widgets in every other window, so a continuous per-frame grab would cancel any click
+            // outside the ECAD window before its release could land — title-bar workspace tabs
+            // included. That was the "stuck on the Electronics tab" input lockup.
             if (st.wantFocusEcad > 0) {
                 // Surfaced by an explicit ecad command from another workspace: ensure visible.
                 if (ws != WS::Electronics) st.showPcbTools = true;

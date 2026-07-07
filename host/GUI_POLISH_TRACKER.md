@@ -39,6 +39,7 @@ Canonical checklist of every GUI change Hunter has requested for the host/ light
 | C1 | "Feature Manager" text centered in its background | ✅ | `55976c2e`/`c363bf81` |
 | C2 | Icon fits inside the background (no overflow) | ✅ | same |
 | C3 | Replace generic three-dot glyph with a meaningful feature-tree glyph, centered | ✅ (needs rebuild — code on master is correct) | same |
+| C4 | Use that same feature-tree glyph for the Feature Manager **rail tab** icon (was the atlas "history" clock); Explorer/Configurations tab icons unchanged | ✅ | `558f59ca` |
 
 ## D. Feature tree rows
 | # | Item | Status | Commit |

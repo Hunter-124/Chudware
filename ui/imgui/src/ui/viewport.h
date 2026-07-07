@@ -2,6 +2,8 @@
 #pragma once
 
 #include <string>
+#include <array>
+#include <map>
 #include "imgui.h"
 #include "theme/theme.h"
 
@@ -52,6 +54,12 @@ void viewportSetColormapMode(bool on);
 void viewportSetDeformScale(float scale);
 float viewportDeformScale();
 bool viewportScalarRange(float& vmin, float& vmax);
+
+// Motion study: re-upload the current doc mesh with per-body model transforms applied in CPU.
+// nameToMatrix maps component/body name -> 16-float column-major 4x4 model matrix.
+// Calling with an empty map restores the identity-transform upload (i.e. clears motion pose).
+// No-op when the viewport pipeline is not wired or the doc mesh was never loaded.
+void viewportSetBodyTransforms(const std::map<std::string, std::array<float, 16>>& nameToMatrix);
 
 // Draw the central Viewport dock window content (mesh, nav, HUD, tools).
 void drawViewport(app::AppState& s);

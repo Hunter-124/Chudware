@@ -27,8 +27,11 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <map>
 
 namespace ui {
 
@@ -55,6 +58,10 @@ static ImVec2 s_zoomAreaP1 = {0, 0};
 static ImVec2 s_bdMin  = {0, 0};
 static ImVec2 s_bdMax  = {0, 0};
 static bool   s_bdLive = false;
+
+// Motion study: last loaded DocMesh (populated by ensureDocLoaded and viewportLoadAicm).
+// Used by viewportSetBodyTransforms to re-upload with per-body motion-frame transforms.
+static render::DocMesh s_cachedDocMesh;
 
 ViewportState& viewportState() { return g_vpState; }
 // T-BL46: accessor so scenarios.cpp can read s_sketch.elementDragActive() without friendship.
@@ -152,6 +159,7 @@ bool ensureDocLoaded(AppState& s) {
     if (!render::loadAicmFile(s.engine.aicmPath(), doc, err)) return false;
     if (!g_glVp->setDoc(doc, err)) return false;
     uploadDocMeshes(doc);  // shaded studio pass (was never wired in AI-CAD2 — id pass only)
+    s_cachedDocMesh = doc;  // cache for motion study transforms
     g_glVp->setSceneRevision(s.engine.revision());
     s.viewMeshRev = s.engine.revision();
     return true;
@@ -501,6 +509,7 @@ bool viewportLoadAicm(const std::string& path) {
         std::fprintf(stderr, "viewport: setDoc failed: %s\n", err.c_str());
         return false;
     }
+    s_cachedDocMesh = doc;  // cache for motion study transforms
     return uploadDocMeshes(doc);
 }
 
@@ -579,6 +588,76 @@ float viewportDeformScale() {
 }
 bool viewportScalarRange(float& vmin, float& vmax) {
     return g_glVp && g_glVp->renderer().scalarRange(vmin, vmax);
+}
+
+// Motion study: re-upload doc meshes with per-body CPU-side model transforms applied.
+// Each entry in nameToMatrix maps a BodyMesh::name to a column-major 4x4 float matrix.
+// Bodies whose names are not in the map are uploaded with identity (original position).
+// An empty map restores a clean upload from the cached doc.
+void viewportSetBodyTransforms(const std::map<std::string, std::array<float, 16>>& nameToMatrix) {
+    if (!g_glVp || s_cachedDocMesh.empty()) return;
+
+    // Helper: multiply a 3-component position by a 4x4 col-major matrix (w=1, no perspective).
+    auto xformPt = [](const float* m, float x, float y, float z, float& ox, float& oy, float& oz) {
+        ox = m[0]*x + m[4]*y + m[8] *z + m[12];
+        oy = m[1]*x + m[5]*y + m[9] *z + m[13];
+        oz = m[2]*x + m[6]*y + m[10]*z + m[14];
+    };
+    // Normals are transformed by the upper-left 3×3 of the matrix (assuming no non-uniform scale).
+    auto xformNrm = [](const float* m, float nx, float ny, float nz, float& ox, float& oy, float& oz) {
+        ox = m[0]*nx + m[4]*ny + m[8] *nz;
+        oy = m[1]*nx + m[5]*ny + m[9] *nz;
+        oz = m[2]*nx + m[6]*ny + m[10]*nz;
+        // Re-normalize.
+        float len = std::sqrt(ox*ox + oy*oy + oz*oz);
+        if (len > 1e-7f) { ox /= len; oy /= len; oz /= len; }
+    };
+
+    std::vector<Renderer::PartMesh> pms;
+    pms.reserve(s_cachedDocMesh.bodies.size());
+    for (const auto& b : s_cachedDocMesh.bodies) {
+        if (b.pos.empty()) continue;
+        Renderer::PartMesh pm;
+        pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
+        pm.metallic = b.metallic; pm.roughness = b.roughness;
+        pm.body_id = b.body_id;
+        pm.faces.reserve(b.faces.size());
+        for (const auto& fr : b.faces)
+            pm.faces.push_back({fr.face_id, fr.first_tri, fr.tri_count});
+
+        auto it = nameToMatrix.find(b.name);
+        if (it == nameToMatrix.end() || nameToMatrix.empty()) {
+            // No transform for this body — upload as-is.
+            pm.mesh = meshFromBody(b);
+        } else {
+            // Apply the 4×4 transform to every vertex/normal.
+            const float* M = it->second.data();
+            render::BodyMesh tb = b;  // shallow copy (keeps idx, faces, edges, edge_pts)
+            const uint32_t nv = b.n_verts;
+            tb.pos.resize(3 * nv);
+            tb.nrm.resize(3 * nv);
+            for (uint32_t vi = 0; vi < nv; ++vi) {
+                float ox, oy, oz;
+                xformPt(M, b.pos[vi*3+0], b.pos[vi*3+1], b.pos[vi*3+2], ox, oy, oz);
+                tb.pos[vi*3+0] = ox; tb.pos[vi*3+1] = oy; tb.pos[vi*3+2] = oz;
+                if (b.nrm.size() == tb.nrm.size()) {
+                    xformNrm(M, b.nrm[vi*3+0], b.nrm[vi*3+1], b.nrm[vi*3+2], ox, oy, oz);
+                    tb.nrm[vi*3+0] = ox; tb.nrm[vi*3+1] = oy; tb.nrm[vi*3+2] = oz;
+                }
+            }
+            // Transform feature edge points too.
+            const size_t nep = b.edge_pts.size() / 3;
+            tb.edge_pts.resize(nep * 3);
+            for (size_t ei = 0; ei < nep; ++ei) {
+                float ox, oy, oz;
+                xformPt(M, b.edge_pts[ei*3+0], b.edge_pts[ei*3+1], b.edge_pts[ei*3+2], ox, oy, oz);
+                tb.edge_pts[ei*3+0] = ox; tb.edge_pts[ei*3+1] = oy; tb.edge_pts[ei*3+2] = oz;
+            }
+            pm.mesh = meshFromBody(tb);
+        }
+        pms.push_back(std::move(pm));
+    }
+    g_glVp->setMeshes(pms);
 }
 
 void setViewportPipeline(aicad::viewport::GlViewport* viewport) {

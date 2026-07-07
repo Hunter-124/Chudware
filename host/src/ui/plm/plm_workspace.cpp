@@ -137,14 +137,12 @@ void plmDocTypeTag(const std::string& docType, const std::string& kind) {
 namespace {
 
 struct RailItem { PlmPage page; const char* label; };
+// The hub collapsed to four destinations: Files folds in History + Releases;
+// Planning folds in Milestones, Issues and Team & Sync (see plm_pages.cpp).
 static const RailItem kRail[] = {
     {PlmPage::Overview, "Overview"},
     {PlmPage::Files,    "Files"},
-    {PlmPage::History,  "History"},
-    {PlmPage::Releases, "Releases"},
     {PlmPage::Planning, "Planning"},
-    {PlmPage::Issues,   "Issues"},
-    {PlmPage::Team,     "Team & Sync"},
     {PlmPage::Settings, "Settings"},
 };
 
@@ -196,8 +194,8 @@ static void drawRail(AppState& st, float railW, float bottomMargin) {
 
         // Count badge (from cached overview) pinned to the right edge, centered.
         int badge = 0;
-        if (r.page == PlmPage::Files)  badge = g_plmHub.overview.dirtyCount;
-        if (r.page == PlmPage::Issues) badge = g_plmHub.overview.openIssues;
+        if (r.page == PlmPage::Files)    badge = g_plmHub.overview.dirtyCount;
+        if (r.page == PlmPage::Planning) badge = g_plmHub.overview.openIssues;
         if (badge > 0) {
             char b[16]; std::snprintf(b, sizeof(b), "%d", badge);
             ImVec2 bs = ImGui::CalcTextSize(b);

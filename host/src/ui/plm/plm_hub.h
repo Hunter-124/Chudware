@@ -99,7 +99,11 @@ struct PlmHubState {
     char        trackPath[512] = {};
     char        linkUrl[512] = {};
     char        linkName[128] = {};
+    char        linkCheckout[512] = {};  // optional local checkout of the linked repo
     char        prefixBuf[64] = {};
+    char        msEditTitle[160] = {};   // milestone inline-edit buffers
+    char        msEditDue[32] = {};
+    std::string msEditId;                // milestone currently being edited ("" = none)
 };
 
 extern PlmHubState g_plmHub;

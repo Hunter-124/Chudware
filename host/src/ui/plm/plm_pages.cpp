@@ -17,6 +17,7 @@
 
 #include "core/app_state.h"
 #include "core/async_rpc.h"
+#include "ui/file_dialog.h"
 #include "ui_theme.h"
 
 namespace ui {
@@ -135,11 +136,14 @@ void plmDrawOverviewPage(AppState& st) {
 
     const auto& ov = H.overview;
     // stat cards
-    statCard("Files",   ov.itemsCount, palette.accent);
-    statCard("Unsaved", ov.dirtyCount, ov.dirtyCount ? palette.statusWarn : palette.textDim);
-    statCard("Tasks",   ov.openTasks,  palette.textDim);
-    statCard("Issues",  ov.openIssues, ov.openIssues ? palette.statusWarn : palette.textDim);
+    statCard("Files",      ov.itemsCount,     palette.accent);
+    statCard("Unsaved",    ov.dirtyCount,     ov.dirtyCount ? palette.statusWarn : palette.textDim);
+    statCard("Tasks",      ov.openTasks,      palette.textDim);
+    statCard("Issues",     ov.openIssues,     ov.openIssues ? palette.statusWarn : palette.textDim);
+    statCard("Milestones", ov.openMilestones, palette.textDim);
     ImGui::NewLine();
+    if (!ov.nextMilestone.empty())
+        dimText("Next milestone: %s", ov.nextMilestone.c_str());
     ImGui::Dummy(ImVec2(0, 6 * S));
 
     // quick checkpoint — the basic loop, front and centre
@@ -259,15 +263,36 @@ void doLink(AppState& st) {
     H.busy = true; H.actionErr.clear();
     nlohmann::json p = pathParam(st);
     p["url"] = H.linkUrl;
-    p["name"] = H.linkName[0] ? H.linkName : "Linked code";
+    p["name"] = H.linkName[0] ? H.linkName : "Linked repo";
+    if (H.linkCheckout[0]) p["checkout_path"] = H.linkCheckout;  // local clone for pinning
     st.rpc.call("plm_link_repo", p, [&st](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.busy = false;
         if (!plmOk(r, H.actionErr)) { st.toast(ui::ToastLevel::Error, H.actionErr); return; }
-        H.linkUrl[0] = '\0'; H.linkName[0] = '\0';
-        st.toast(ui::ToastLevel::Success, "Linked external code");
+        H.linkUrl[0] = '\0'; H.linkName[0] = '\0'; H.linkCheckout[0] = '\0';
+        st.toast(ui::ToastLevel::Success, "Linked GitHub repo");
         plmInvalidate();
     });
+}
+
+// Open the native file picker and store the choice, made relative to the project
+// folder (plm_item_add expects a project-relative path). A pick outside the
+// project is rejected with a toast.
+void browseTrackFile(AppState& st) {
+    std::string abs = ui::openFileDialog(
+        "All files (*.*)\0*.*\0Documents (*.pdf *.docx *.xlsx)\0*.pdf;*.docx;*.xlsx\0");
+    if (abs.empty()) return;
+    std::string root = st.plmProjectPath();
+    for (char& c : abs)  if (c == '\\') c = '/';
+    for (char& c : root) if (c == '\\') c = '/';
+    if (!root.empty() && root.back() == '/') root.pop_back();
+    if (abs.size() > root.size() + 1 &&
+        abs.compare(0, root.size(), root) == 0 && abs[root.size()] == '/') {
+        std::snprintf(g_plmHub.trackPath, sizeof(g_plmHub.trackPath), "%s",
+                      abs.c_str() + root.size() + 1);
+    } else {
+        st.toast(ui::ToastLevel::Error, "Pick a file inside the project folder");
+    }
 }
 
 void doUntrack(AppState& st, const std::string& itemId) {
@@ -287,34 +312,43 @@ void doUntrack(AppState& st, const std::string& itemId) {
 
 }  // namespace
 
-void plmDrawFilesPage(AppState& st) {
+void drawFilesTab(AppState& st) {
     auto& H = g_plmHub;
     const float S = ui::uiScale;
     plmEnsureItems(st);
 
-    plmSectionHeader("Files");
-
-    // track-a-file + link-code row
+    // track-a-file row: type a relative path or Browse… to the native picker
+    dimText("Track a document or folder in this project.");
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
     ImGui::SetNextItemWidth(240 * S);
     ImGui::InputTextWithHint("##track", "file or folder (relative to project)",
                              H.trackPath, sizeof(H.trackPath));
     ImGui::PopStyleVar();
     ImGui::SameLine();
+    if (ImGui::Button("Browse\xe2\x80\xa6")) browseTrackFile(st);
+    ImGui::SameLine();
     accentButtonColors();
     if (ImGui::Button("Track", ImVec2(70 * S, 0))) doTrack(st);
     ImGui::PopStyleColor(2);
-    ImGui::SameLine(0, 18 * S);
+
+    // link a GitHub / Git repo (kept under version control externally; its issues
+    // are tracked here in the project). Optional local checkout enables pinning.
+    ImGui::Dummy(ImVec2(0, 2 * S));
+    dimText("Link a GitHub / Git repo (version-controlled outside AI-CAD).");
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
-    ImGui::SetNextItemWidth(180 * S);
-    ImGui::InputTextWithHint("##linkurl", "external code URL",
+    ImGui::SetNextItemWidth(230 * S);
+    ImGui::InputTextWithHint("##linkurl", "https://github.com/owner/repo",
                              H.linkUrl, sizeof(H.linkUrl));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(110 * S);
     ImGui::InputTextWithHint("##linkname", "name", H.linkName, sizeof(H.linkName));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(150 * S);
+    ImGui::InputTextWithHint("##linkco", "local checkout (optional)",
+                             H.linkCheckout, sizeof(H.linkCheckout));
     ImGui::PopStyleVar();
     ImGui::SameLine();
-    if (ImGui::Button("Link code", ImVec2(90 * S, 0))) doLink(st);
+    if (ImGui::Button("Link repo", ImVec2(90 * S, 0))) doLink(st);
     plmError(H.actionErr);
 
     // filter pills
@@ -390,6 +424,30 @@ void plmDrawFilesPage(AppState& st) {
     if (shown == 0)
         plmEmptyState("(#)", "No files here yet",
                       "Save a design, or Track a document/folder above.");
+}
+
+// The Files destination folds in History + Releases as sub-tabs, so the whole
+// "what's in the project / how it changed / what's released" story lives together.
+void plmDrawFilesPage(AppState& st) {
+    plmSectionHeader("Files");
+    if (ImGui::BeginTabBar("##files_tabs", ImGuiTabBarFlags_None)) {
+        if (ImGui::BeginTabItem("Files")) {
+            ImGui::Spacing();
+            drawFilesTab(st);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("History")) {
+            ImGui::Spacing();
+            plmDrawHistoryPage(st);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Releases")) {
+            ImGui::Spacing();
+            plmDrawReleasesPage(st);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
 }
 
 // ---- History ------------------------------------------------------------------
@@ -813,12 +871,181 @@ static std::string s_selTask;
 
 }  // namespace
 
+// A milestone's inline read / edit row (condensed for the right-hand column).
+static void drawMilestoneRow(AppState& st, const PlmMilestoneRow& m) {
+    auto& H = g_plmHub;
+    const float S = ui::uiScale;
+    bool done = (m.status == "done");
+    bool editing = (H.msEditId == m.id);
+    ImGui::PushID(m.id.c_str());
+    plmCardBegin("##ms", editing);
+    if (editing) {
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5 * S, 3 * S));
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##met", "title", H.msEditTitle, sizeof(H.msEditTitle));
+        ImGui::PopStyleVar();
+        plmDatePicker("##med", H.msEditDue, sizeof(H.msEditDue));
+        ImGui::SameLine();
+        accentButtonColors();
+        if (ImGui::SmallButton("Save") && H.msEditTitle[0]) {
+            nlohmann::json d = {{"title", H.msEditTitle}};
+            d["due"] = H.msEditDue[0] ? H.msEditDue : "";
+            planCall(st, "update", "milestone", d, m.id);
+            H.msEditId.clear();
+        }
+        ImGui::PopStyleColor(2);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Cancel")) H.msEditId.clear();
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, done
+            ? ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f)
+            : ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(done ? "[x]" : "[ ]");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::TextWrapped("%s", m.title.c_str());
+        if (!m.due.empty()) dimText("due %s", m.due.c_str());
+        // action row
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 3 * S));
+        if (ImGui::SmallButton("Edit")) {
+            H.msEditId = m.id;
+            std::snprintf(H.msEditTitle, sizeof(H.msEditTitle), "%s", m.title.c_str());
+            std::snprintf(H.msEditDue, sizeof(H.msEditDue), "%s", m.due.c_str());
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(done ? "Reopen" : "Complete"))
+            planCall(st, "update", "milestone", {{"status", done ? "open" : "done"}}, m.id);
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 0.5f));
+        if (ImGui::SmallButton("Del")) planCall(st, "delete", "milestone", nullptr, m.id);
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar(2);
+    }
+    plmCardEnd();
+    ImGui::PopID();
+}
+
+// One issue row on the Planning page: severity + title, with visible actions —
+// including "Make plan", which spins the issue into a linked task so you can
+// organise fixes right where you see the problems.
+static void drawIssueRow(AppState& st, const PlmIssueRow& is) {
+    const float S = ui::uiScale;
+    bool closed = (is.state == "closed");
+    ImGui::PushID(is.id.c_str());
+    plmCardBegin("##is", false);
+    const float* sc = palette.textDim;
+    if (is.severity == "critical" || is.severity == "high") sc = palette.statusErr;
+    else if (is.severity == "med") sc = palette.statusWarn;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(sc[0], sc[1], sc[2], 1.0f));
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("[%s]", is.severity.empty() ? "med" : is.severity.c_str());
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    if (closed) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDisabled[0],
+            palette.textDisabled[1], palette.textDisabled[2], 1.0f));
+        ImGui::TextWrapped("(closed) %s", is.title.c_str());
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::TextWrapped("%s", is.title.c_str());
+    }
+    ImGui::Spacing();
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 3 * S));
+    accentButtonColors();
+    if (ImGui::SmallButton("Make plan")) {
+        nlohmann::json d = {{"title", is.title},
+                            {"links", nlohmann::json::array({
+                                {{"kind", "issue"}, {"id", is.id}}})}};
+        planCall(st, "create", "task", d);
+        st.toast(ui::ToastLevel::Success, "Added a task from this issue");
+    }
+    ImGui::PopStyleColor(2);
+    ImGui::SameLine();
+    if (ImGui::SmallButton(closed ? "Reopen" : "Close"))
+        planCall(st, "update", "issue", {{"state", closed ? "open" : "closed"}}, is.id);
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Button,
+        ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 0.5f));
+    if (ImGui::SmallButton("Del")) planCall(st, "delete", "issue", nullptr, is.id);
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+    plmCardEnd();
+    ImGui::PopID();
+}
+
 void plmDrawPlanningPage(AppState& st) {
     auto& H = g_plmHub;
     const float S = ui::uiScale;
     plmEnsurePlanning(st);
 
     plmSectionHeader("Planning");
+    if (!H.planErr.empty()) plmError(H.planErr);
+
+    // ---- top band: Team & Sync (left) + Milestones (right, condensed) ----------
+    ImGui::Columns(2, "##plan_top", false);
+    ImGui::SetColumnWidth(0, 320 * S);
+
+    plmSectionHeader("Team & Sync");
+    dimText("Share via a shared folder or your own server. Sync brings changes "
+            "together without ever merging or losing work.");
+    ImGui::BeginDisabled(true);
+    ImGui::Button("Connect a shared folder\xe2\x80\xa6");
+    ImGui::SameLine();
+    ImGui::Button("Sync now");
+    ImGui::EndDisabled();
+    dimText("Sharing & Sync arrive in a later update.");
+
+    ImGui::NextColumn();
+
+    plmSectionHeader("Milestones");
+    static char s_msTitle[160] = {};
+    static char s_msDue[32] = {};
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
+    ImGui::SetNextItemWidth(150 * S);
+    ImGui::InputTextWithHint("##msTitle", "milestone", s_msTitle, sizeof(s_msTitle));
+    ImGui::PopStyleVar();
+    ImGui::SameLine();
+    plmDatePicker("##msDue", s_msDue, sizeof(s_msDue));
+    ImGui::SameLine();
+    if (ImGui::Button("Add") && s_msTitle[0]) {
+        nlohmann::json d = {{"title", s_msTitle}};
+        if (s_msDue[0]) d["due"] = s_msDue;
+        planCall(st, "create", "milestone", d);
+        s_msTitle[0] = '\0'; s_msDue[0] = '\0';
+    }
+    if (H.milestones.empty()) dimText("No milestones yet.");
+    for (const auto& m : H.milestones) drawMilestoneRow(st, m);
+
+    ImGui::Columns(1);
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    ImGui::Separator();
+
+    // ---- Issues (folded in so you can see problems while you plan) --------------
+    plmSectionHeader("Issues");
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
+    ImGui::SetNextItemWidth(-130 * S);
+    bool ienter = ImGui::InputTextWithHint("##newissue", "describe an issue\xe2\x80\xa6",
+        H.newIssueTitle, sizeof(H.newIssueTitle), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::PopStyleVar();
+    ImGui::SameLine();
+    accentButtonColors();
+    if ((ImGui::Button("Log issue", ImVec2(120 * S, 0)) || ienter) && H.newIssueTitle[0]) {
+        planCall(st, "create", "issue", {{"title", H.newIssueTitle}});
+        H.newIssueTitle[0] = '\0';
+    }
+    ImGui::PopStyleColor(2);
+    if (H.issues.empty()) dimText("No issues logged. \"Make plan\" turns one into a task.");
+    for (const auto& is : H.issues) drawIssueRow(st, is);
+
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    ImGui::Separator();
+
+    // ---- Task board ------------------------------------------------------------
+    plmSectionHeader("Board");
     // add a task
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
     ImGui::SetNextItemWidth(-120 * S);
@@ -832,7 +1059,6 @@ void plmDrawPlanningPage(AppState& st) {
         H.newTaskTitle[0] = '\0';
     }
     ImGui::PopStyleColor(2);
-    if (!H.planErr.empty()) plmError(H.planErr);
     ImGui::Spacing();
 
     // kanban columns — bordered, scrollable boxes so cards stay contained inside
@@ -928,45 +1154,6 @@ void plmDrawPlanningPage(AppState& st) {
         ImGui::PopStyleVar(2);
         ImGui::PopID();
         ImGui::EndGroup();
-    }
-
-    // milestones lane
-    ImGui::Dummy(ImVec2(0, 8 * S));
-    plmSectionHeader("Milestones");
-    static char s_msTitle[160] = {};
-    static char s_msDue[32] = {};
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
-    ImGui::SetNextItemWidth(220 * S);
-    ImGui::InputTextWithHint("##msTitle", "milestone", s_msTitle, sizeof(s_msTitle));
-    ImGui::PopStyleVar();
-    ImGui::SameLine();
-    plmDatePicker("##msDue", s_msDue, sizeof(s_msDue));
-    ImGui::SameLine();
-    if (ImGui::Button("Add milestone") && s_msTitle[0]) {
-        nlohmann::json d = {{"title", s_msTitle}};
-        if (s_msDue[0]) d["due"] = s_msDue;
-        planCall(st, "create", "milestone", d);
-        s_msTitle[0] = '\0'; s_msDue[0] = '\0';
-    }
-    for (const auto& m : H.milestones) {
-        ImGui::PushID(m.id.c_str());
-        bool done = (m.status == "done");
-        plmCardBegin("##ms", false);
-        ImGui::PushStyleColor(ImGuiCol_Text, done
-            ? ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f)
-            : ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(done ? "[x]" : "[ ]");
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::TextUnformatted(m.title.c_str());
-        if (!m.due.empty()) { ImGui::SameLine(); dimText("  due %s", m.due.c_str()); }
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - 80 * S);
-        if (ImGui::SmallButton(done ? "Reopen" : "Complete"))
-            planCall(st, "update", "milestone",
-                     {{"status", done ? "open" : "done"}}, m.id);
-        plmCardEnd();
-        ImGui::PopID();
     }
 }
 

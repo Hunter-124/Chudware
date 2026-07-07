@@ -869,6 +869,10 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
         if (!hitTestHandle(st, io.MousePos, imgMin, vw, vh, hovHandle_, hw))
             hovEnt_ = hitTestEntity(st, io.MousePos, imgMin, vw, vh);
     }
+    // GUI-picking overhaul: "hot" whenever a sketch entity/handle claims the cursor, a drawing
+    // tool owns it, or a drag is live — the viewport's fallback model-pick must not fire then.
+    // See Sketch3DMode::inSketchEntityHot().
+    entityHoverHot_ = tool_ != Sk3Tool::None || dragging_ || !hovHandle_.empty() || !hovEnt_.empty();
 
     // ---- entities ----
     const auto& pal = ui::palette;

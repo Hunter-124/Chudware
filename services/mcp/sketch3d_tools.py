@@ -13,24 +13,25 @@ Exposes to an AI driver the same capabilities the GUI gives a human in the Sketc
                                          does NOT yet expose a guides[] ref on the sweep op — the
                                          geom::sweep_profile C++ function accepts guides internally
                                          but that wiring is not plumbed through doc_apply_ops yet.
-                                         This tool returns wire_id (= sketch3d_id) + a workflow hint.
+                                         Returns sketch3d_id + coord_summary + workflow_hint.
     sketch3d_sample_at(id, t)           sample a world-space point + tangent on the path at
                                          fractional arc-length t ∈ [0,1] — useful for placing
                                          profile sketch planes along a sweep spine
-    sketch3d_section_at(id, t, doc_id)  cross-section the part at the plane derived from the 3D
-                                         sketch tangent at t — in-app section-view parity for
-                                         sketch3d paths (calls eval_section_props)
+    sketch3d_section_at(id, t, doc_id)  cross-section the part using the plane ORIENTATION derived
+                                         from the 3D sketch tangent at t.  NOTE: eval_section_props
+                                         always cuts at the world origin — t selects orientation
+                                         only, not cut location.  Use add_section_view with
+                                         offset_mm for an offset cut.
     sketch3d_to_ledger()                serialize all session 3D sketches to a JSON payload for
                                          ledger_note persistence across MCP restarts
     sketch3d_from_ledger(payload)       restore 3D sketches from a ledger_note payload
 
-    render_sketch(sketch, doc_id)        render a 2D sketch's host part as a multi-view image so
-                                         an AI can see the model context before extruding.
-                                         NOTE: the engine has no sketch-isolated flat render RPC
-                                         (doc_render_sketch does not exist); this renders the solid
-                                         bodies via doc_render_view/doc_render_contact_sheet.
-                                         For the actual 2D sketch geometry (entity coords, dims,
-                                         DOF) use sketch_preview_text instead.
+    render_sketch(sketch, doc_id)        render a 2D sketch as an image.  When solid geometry
+                                         exists: renders the part from the specified camera views.
+                                         When no solid yet (pre-extrude): falls back to a
+                                         matplotlib wireframe of the sketch entity coords so the
+                                         AI can SEE the sketch before extruding.  For text-only
+                                         info (entity list, DOF, constraints) use sketch_preview_text.
     sketch_preview_text(sketch, doc_id)  non-vision equivalent: full text description of a 2D sketch
                                          (entities, constraints, DOF, regions) — wraps describe_sketch
                                          with additional health narration
@@ -52,6 +53,7 @@ Registered onto the FastMCP instance by register_sketch3d_tools(mcp).
 """
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
@@ -211,6 +213,117 @@ def _tmp(suffix: str) -> str:
     fd, path = tempfile.mkstemp(suffix=suffix, prefix="aicad_s3d_")
     os.close(fd)
     return path
+
+
+def _render_sketch_wireframe(overview: dict, sketch_id: str, out_path: str) -> bool:
+    """Render a 2D sketch wireframe to a PNG using matplotlib.
+
+    Reads entity solved-coords from a doc_sketch_overview response and draws each entity
+    as a colored line/arc in the sketch's 2D plane.  Returns True if the PNG was written.
+
+    This is the visual half of deliverable (b) — lets an AI SEE a sketch before extruding
+    without needing a solid body in the doc.  Works headless (Agg backend).
+
+    Entity types handled:
+      line      → straight segment using start/end solved-coords
+      circle    → circle drawn from center + radius
+      arc       → circular arc from start/end angles
+      point     → a crosshair marker
+      spline / polyline → polyline through control/solved points
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+    except ImportError:
+        return False
+
+    entities = (overview.get("entities") or [])
+    if not entities:
+        return False
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.set_aspect("equal")
+    ax.set_title(f"Sketch {sketch_id!r} — wireframe preview", fontsize=10)
+    ax.set_xlabel("u (mm)")
+    ax.set_ylabel("v (mm)")
+    ax.grid(True, linestyle="--", alpha=0.4)
+
+    color_map = {
+        "line": "#2196F3",
+        "circle": "#4CAF50",
+        "arc": "#FF9800",
+        "spline": "#9C27B0",
+        "polyline": "#9C27B0",
+        "point": "#F44336",
+    }
+
+    any_drawn = False
+    for ent in entities:
+        etype = (ent.get("type") or "").lower()
+        color = color_map.get(etype, "#607D8B")
+        coords = ent.get("coords") or ent.get("solved_coords") or {}
+        eid = ent.get("id", "")
+
+        if etype == "line":
+            sx = coords.get("start_x") or coords.get("x1", 0)
+            sy = coords.get("start_y") or coords.get("y1", 0)
+            ex = coords.get("end_x") or coords.get("x2", 0)
+            ey = coords.get("end_y") or coords.get("y2", 0)
+            ax.plot([sx, ex], [sy, ey], color=color, linewidth=1.5)
+            mx, my = (sx + ex) / 2, (sy + ey) / 2
+            ax.annotate(eid, (mx, my), fontsize=6, color=color, alpha=0.7)
+            any_drawn = True
+
+        elif etype == "circle":
+            cx = coords.get("center_x", 0)
+            cy = coords.get("center_y", 0)
+            r = coords.get("radius", 1)
+            circ = mpatches.Circle((cx, cy), r, fill=False, color=color, linewidth=1.5)
+            ax.add_patch(circ)
+            ax.annotate(eid, (cx + r * 0.7, cy + r * 0.7), fontsize=6, color=color, alpha=0.7)
+            ax.set_xlim(auto=True)
+            ax.set_ylim(auto=True)
+            any_drawn = True
+
+        elif etype == "arc":
+            cx = coords.get("center_x", 0)
+            cy = coords.get("center_y", 0)
+            r = coords.get("radius", 1)
+            a1 = math.degrees(coords.get("start_angle", 0))
+            a2 = math.degrees(coords.get("end_angle", math.pi))
+            arc_patch = mpatches.Arc((cx, cy), 2 * r, 2 * r,
+                                     angle=0, theta1=a1, theta2=a2,
+                                     color=color, linewidth=1.5)
+            ax.add_patch(arc_patch)
+            any_drawn = True
+
+        elif etype in ("spline", "polyline"):
+            pts = coords.get("points") or coords.get("control_points") or []
+            if len(pts) >= 2:
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                ax.plot(xs, ys, color=color, linewidth=1.5, linestyle="--")
+                ax.annotate(eid, (xs[0], ys[0]), fontsize=6, color=color, alpha=0.7)
+                any_drawn = True
+
+        elif etype == "point":
+            px = coords.get("x", 0)
+            py = coords.get("y", 0)
+            ax.plot(px, py, "+", color=color, markersize=8)
+            ax.annotate(eid, (px, py), fontsize=6, color=color, alpha=0.7)
+            any_drawn = True
+
+    if not any_drawn:
+        plt.close(fig)
+        return False
+
+    ax.autoscale_view()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return os.path.exists(out_path)
 
 
 # ──────────────────────────────────────────── registration ───────────────────────────────────────
@@ -408,9 +521,6 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
             return _dumps({
                 "ok": True,
                 "sketch3d_id": sketch3d_id,
-                # wire_id is an alias for sketch3d_id — callers that expect a
-                # "wire feature id" from an older contract get this key too.
-                "wire_id": sketch3d_id,
                 "role": role,
                 "doc_id": d,
                 # guide_support=False: geom::sweep_profile in C++ accepts guides[]
@@ -492,11 +602,32 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
                     rendered = False
 
             if not rendered:
+                # Fallback: matplotlib wireframe of the 2D sketch entities.
+                # This is the visual path for pre-extrude / no-solid-yet workflows.
+                try:
+                    overview = cb.call("doc_sketch_overview", {"doc_id": d, "sketch": sketch})
+                    wf_ok = _render_sketch_wireframe(overview, sketch, png)
+                except Exception:  # noqa: BLE001
+                    wf_ok = False
+                if wf_ok:
+                    rendered = True
+                    # Build a minimal health caption for the wireframe case.
+                    try:
+                        h = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
+                        status = h.get("status", "unknown")
+                        dof = h.get("dof", "?")
+                        health_text = (
+                            f"Sketch {sketch!r} wireframe (pre-extrude): "
+                            f"{status.upper()} dof={dof}"
+                        )
+                    except Exception:  # noqa: BLE001
+                        health_text = f"Sketch {sketch!r} wireframe (no solid yet)"
+                    return [Image(path=png), health_text]
                 return _dumps({
                     "ok": False,
                     "error": (
-                        "could not render — no solid geometry built yet "
-                        "(the engine renders bodies, not bare sketch wires). "
+                        "could not render — no solid geometry built yet and "
+                        "sketch entity coords not available. "
                         "Call sketch_preview_text for text-only sketch info."
                     ),
                 })
@@ -894,32 +1025,40 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
         t: float = 0.5,
         doc_id: Optional[str] = None,
     ) -> str:
-        """Cross-section the part at a plane derived from the 3D sketch path at parameter t.
+        """Cross-section the part with a plane whose ORIENTATION is derived from the 3D sketch.
 
-        Samples the path at fractional arc-length t ∈ [0,1] to get a world point + tangent,
-        then calls the engine's cross-section probe (eval_section_props) using that tangent
-        as the section plane normal.  This is the MCP equivalent of the GUI's 'Section at
-        point along sweep spine' inspector — see the solid's cross-section AT any point along
-        a 3D sketch path without leaving the sketch3d workflow.
+        ENGINE LIMIT: eval_section_props always cuts at the WORLD ORIGIN (0,0,0) — the engine's
+        reserved datum planes (top/front/right) are fixed at origin.  The parameter ``t`` selects
+        the tangent direction at that arc-length fraction, which in turn selects the nearest
+        reserved plane ORIENTATION.  The cut LOCATION is always the origin regardless of t.
 
-        sketch3d_id: the 3D sketch whose path sets the cutting plane origin + normal.
-        t: arc-length fraction — 0.0 = sketch start, 0.5 = midpoint, 1.0 = sketch end.
+        This is useful for:
+          • Verifying the cross-sectional shape of a part whose centroid is near the origin.
+          • Picking the right section orientation (XY vs XZ vs YZ) based on the sweep direction.
+          • Use sketch3d_sample_at(id, t) separately to get the actual on-path POINT.
+
+        To see a section at an offset location, use the drawing subsystem:
+          add_section_view(doc_id, plane='top', offset_mm=25)
+
+        sketch3d_id: 3D sketch path whose tangent at t selects the plane orientation.
+        t: arc-length fraction — selects which segment's tangent drives the plane choice.
+           0.0 = first segment tangent, 0.5 = mid-path tangent, 1.0 = last segment tangent.
         doc_id: part document to section (default: current part).
 
-        Plane mapping:
-          • tangent along X → section plane 'right'  (YZ normal)
-          • tangent along Y → section plane 'front'  (XZ normal)
-          • tangent along Z → section plane 'top'    (XY normal)
-          • otherwise       → nearest reserved plane ('top'/'front'/'right')
+        Plane selection from dominant tangent axis:
+          • tangent primarily along X → section plane 'right'  (YZ, normal = +X)
+          • tangent primarily along Y → section plane 'front'  (XZ, normal = +Y)
+          • tangent primarily along Z → section plane 'top'    (XY, normal = +Z)
 
-        Returns {ok, t, point, tangent, plane_used, area_mm2, centroid, Ixx, Iyy, Ixy, summary}.
-        If the doc has no solid geometry the area will be 0 (no bodies to cut).
+        Returns {ok, t, point (on-path world point), tangent, plane_used,
+                 area_mm2 (at-origin cross-section area), centroid, Ixx, Iyy, Ixy, summary}.
+        area_mm2 will be 0 if the origin-plane misses the solid (body not centred at origin).
 
         Workflow example:
-          sketch3d_sample_at(id, 0.25)  → inspect the point
-          sketch3d_section_at(id, 0.25) → verify cross-section at that point
+          sketch3d_sample_at(id, 0.5)   → get on-path midpoint world coords
+          sketch3d_section_at(id, 0.5)  → check which plane the path tangent selects + area
           add_features([{op:'sweep', profile:'sk1', spine:'sk2'}])
-          sketch3d_section_at(id, 0.5)  → check mid-sweep cross-section after build
+          sketch3d_section_at(id, 0.0)  → confirm plane orientation of the sweep profile face
         """
         try:
             sk = _s3get(sketch3d_id)
@@ -972,12 +1111,16 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
 
             area = res.get("area_mm2", 0.0)
             summary = (
-                f"Cross-section at t={t_clamped:.2f} (plane='{plane_used}', "
+                f"Section plane='{plane_used}' (at world origin, normal from tangent at t={t_clamped:.2f} "
                 f"tangent=({tx:.2f},{ty:.2f},{tz:.2f})): "
                 f"area = {area:.4g} mm^2"
             )
             if not area or area == 0:
-                summary += " — plane may miss the body or no solid built yet"
+                summary += (
+                    " — area=0: the origin-plane may not intersect the solid "
+                    "(body not centred at origin). Use add_section_view with offset_mm for "
+                    "an offset cut."
+                )
 
             return _dumps({
                 "ok": True,

@@ -413,12 +413,16 @@ class TestSketch3dEngineIntegration:
         r, _ = _call("sketch3d_as_sweep_guide",
                      {"sketch3d_id": sid, "role": "guide", "doc_id": doc_id})
         assert r is not None and r.get("ok"), f"sketch3d_as_sweep_guide failed: {r}"
-        # wire_id is an alias for sketch3d_id (Python-side only).
+        # sketch3d_id is the canonical identifier — no wire_id alias (that was removed
+        # to prevent models from passing a Python-side id as a C++ doc wire feature ref).
+        assert r.get("sketch3d_id") == sid, "sketch3d_id must be echoed back"
+        assert "wire_id" not in r, (
+            "wire_id alias was removed — it misled models into treating Python sketch ids "
+            "as C++ doc wire feature ids"
+        )
         # The C++ engine dispatch does NOT yet forward a guides[] key from
         # doc_apply_ops (core/doc/session.cpp has no guides wiring), so guide_support
         # is always False.  When session.cpp gains the wiring, guide_support becomes True.
-        assert "wire_id" in r, f"Expected wire_id alias in response, got: {list(r.keys())}"
-        assert r["wire_id"] == sid, "wire_id should equal the sketch3d_id"
         assert r.get("guide_support") is False, (
             "guide_support must be False until session.cpp wires guides[] in doc_apply_ops"
         )
@@ -436,10 +440,20 @@ class TestSketch3dEngineIntegration:
         assert content or r is not None  # Either structured or content returned
 
     def test_sketch3d_section_at_runs(self):
-        """sketch3d_section_at should return ok and derive the correct plane from the path tangent."""
+        """sketch3d_section_at: plane ORIENTATION from tangent; cut LOCATION is always origin.
+
+        ENGINE LIMIT: eval_section_props cuts at world origin only (no plane offset RPC).
+        This test verifies:
+          • ok=True
+          • plane_used='top' for a Z-direction path (tangent along Z → top/XY plane)
+          • point is the on-path world point at t=0.5 (z=25), NOT the cut location
+          • area_mm2 key present (value may be 0 if solid doesn't span origin)
+          • summary key present and describes the origin-based cut honestly
+        """
         doc_id = self._new_part("section_at_test")
-        # Build a box so there's a solid to cut.
-        _call("add_features", {"ops": [{"op": "box", "dx": 30, "dy": 30, "dz": 50}],
+        # Build a box centred at origin so the top-plane cut actually hits it.
+        _call("add_features", {"ops": [{"op": "box", "dx": 30, "dy": 30, "dz": 50,
+                                        "x": -15, "y": -15, "z": -25}],
                                "doc_id": doc_id})
         # Create a vertical path along Z.
         r0, _ = _call("sketch3d_new", {"name": "section_path"})
@@ -451,13 +465,18 @@ class TestSketch3dEngineIntegration:
         r, _ = _call("sketch3d_section_at",
                      {"sketch3d_id": sid, "t": 0.5, "doc_id": doc_id})
         assert r is not None and r.get("ok"), f"sketch3d_section_at failed: {r}"
-        # For a vertical path, tangent is along Z → plane_used should be 'top'.
+        # Tangent along Z → dominant axis 2 → plane_used='top'.
         assert r.get("plane_used") == "top", f"Expected 'top' plane, got {r.get('plane_used')}"
-        # t=0.5 on a 50-mm-long line: point should be at z=25.
+        # 'point' is the on-path world point at t=0.5 (z=25) — NOT the cut location.
+        # Cut location is always z=0 (world origin).
         assert abs(r["point"][2] - 25.0) < 0.1, f"Expected z=25 at t=0.5, got {r['point']}"
-        # area_mm2 is returned (may be 0 if plane passes outside the solid's origin-based bbox).
+        # area_mm2 key must be present; value may be 0 if box placement varies.
         assert "area_mm2" in r
         assert "summary" in r
+        # The summary should mention 'origin' to flag the limit.
+        assert "origin" in r["summary"].lower(), (
+            f"summary should mention 'origin' to flag the cut-location limit: {r['summary']}"
+        )
 
 
 # ─────────────────────────────────────────────── __main__ runner ─────────────

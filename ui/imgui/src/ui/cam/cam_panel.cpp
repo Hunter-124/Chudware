@@ -46,8 +46,22 @@ struct CamUI {
     // operation form buffers (selected op)
     char opName[64] = "";
     float fStepover = 0, fStepdown = 0, fStockLeave = 0, fFeed = 0, fRpm = 0;
-    float hTop = 0, hBottom = -5, hClear = 15, hRetract = 5;
+    float hTop = 0, hBottom = -5, hClear = 15, hRetract = 4;
     int loadedOpFor = -1;
+
+    // --- cross-doc dependency tracking (b) ---
+    // The part docId this job was extracted from. Set when cam_extract succeeds.
+    std::string sourcePartDocId;
+    // The part revision at the time of the last cam_extract (geometry snapshot).
+    long sourcePartRevision = -1;
+    // Whether the part has changed since the last extract (stale flag — pull model).
+    bool partStale = false;
+    // Whether the stale toast has been shown this stale cycle (suppress re-trigger).
+    bool staleToastShown = false;
+    // Part revision as of last poll (avoid a worker RPC every single frame — poll
+    // every ~60 frames when the Manufacture workspace is visible).
+    long lastPolledPartRev = -1;
+    int pollCountdown = 0;
 };
 CamUI g;
 
@@ -87,6 +101,7 @@ nlohmann::json applyOps(app::AppState& st, const nlohmann::json& ops) {
 }
 
 // Export the active PART tab to a temp STEP (cached), for cam_extract.
+// Also records the source part docId and the revision at the time of export.
 bool exportPartStep(app::AppState& st) {
     if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) { g.status = "no active part"; return false; }
     const auto& tab = st.docTabs[st.activeTab];
@@ -96,6 +111,17 @@ bool exportPartStep(app::AppState& st) {
     if (!camCall(st, "export_file", {{"doc_id", tab.docId}, {"path", p.string()}, {"format", "step"}}, r))
         return false;
     g.partStep = p.string();
+    // Snapshot: record which part and which revision this geometry came from.
+    g.sourcePartDocId = tab.docId;
+    // Read current revision from doc_tree (lightweight call, returns {tree,env,revision}).
+    nlohmann::json tr;
+    if (camCall(st, "doc_tree", {{"doc_id", tab.docId}}, tr) && tr.contains("revision"))
+        g.sourcePartRevision = tr["revision"].get<long>();
+    else
+        g.sourcePartRevision = -1;
+    g.partStale = false;
+    g.staleToastShown = false;
+    g.lastPolledPartRev = g.sourcePartRevision;
     return true;
 }
 
@@ -270,6 +296,152 @@ void drawSimSummary() {
     }
 }
 
+// ---- op-parameter editor form -----------------------------------------------
+// Reads back the selected op's parameters from the mirror and lets the user edit
+// them. On "Apply" rebuilds the op via applyOps with an update_operation op.
+static void drawOpEditorImpl(app::AppState& st) {
+    if (g.mirror.setups().empty() || g.selSetup < 0 || g.selSetup >= (int)g.mirror.setups().size()) {
+        ImGui::TextDisabled("No setup selected.");
+        return;
+    }
+    const auto& setup = g.mirror.setups()[g.selSetup];
+    if (g.selOp < 0 || g.selOp >= (int)setup.ops.size()) {
+        ImGui::TextDisabled("Select an operation in the tree to edit its parameters.");
+        return;
+    }
+    const auto& op = setup.ops[g.selOp];
+
+    // Seed form buffers once when the selected op changes.
+    if (g.loadedOpFor != g.selOp) {
+        g.loadedOpFor = g.selOp;
+        std::snprintf(g.opName, sizeof(g.opName), "%s", op.name.empty() ? op.type.c_str() : op.name.c_str());
+        // Conservative defaults — proper values come from the live op JSON via cam_tree
+        // (which is already in the mirror). For now seed from struct defaults; a future
+        // pass can deep-copy the op JSON into the form when the mirror exposes it.
+        g.fStepover    = 3.0f;
+        g.fStepdown    = 2.0f;
+        g.fStockLeave  = 0.0f;
+        g.fFeed        = 600.0f;
+        g.fRpm         = 8000.0f;
+        g.hTop         = 0.0f;
+        g.hBottom      = -5.0f;
+        g.hClear       = 15.0f;
+        g.hRetract     = 4.0f;
+    }
+
+    ImGui::Text("Operation: %s  [T%d]", op.type.c_str(), op.tool_number);
+    ImGui::Separator();
+
+    ImGui::SetNextItemWidth(180);
+    ImGui::InputText("Name", g.opName, sizeof(g.opName));
+
+    bool changed = false;
+    ImGui::Text("Cut Parameters");
+    ImGui::SetNextItemWidth(120); changed |= ImGui::InputFloat("Stepover (mm)", &g.fStepover, 0.1f, 0.5f, "%.2f");
+    ImGui::SetNextItemWidth(120); changed |= ImGui::InputFloat("Stepdown (mm)", &g.fStepdown, 0.1f, 0.5f, "%.2f");
+    ImGui::SetNextItemWidth(120); changed |= ImGui::InputFloat("Stock Leave (mm)", &g.fStockLeave, 0.05f, 0.2f, "%.3f");
+    ImGui::Spacing();
+    ImGui::Text("Feeds & Speeds");
+    ImGui::SetNextItemWidth(120); changed |= ImGui::InputFloat("Feed (mm/min)", &g.fFeed, 10.f, 50.f, "%.0f");
+    ImGui::SetNextItemWidth(120); changed |= ImGui::InputFloat("RPM", &g.fRpm, 100.f, 500.f, "%.0f");
+    ImGui::Spacing();
+    ImGui::Text("Heights (mm, WCS Z)");
+    ImGui::SetNextItemWidth(120); changed |= ImGui::InputFloat("Top", &g.hTop, 0.1f, 1.f, "%.2f");
+    ImGui::SetNextItemWidth(120); changed |= ImGui::InputFloat("Bottom", &g.hBottom, 0.1f, 1.f, "%.2f");
+    ImGui::SetNextItemWidth(120); changed |= ImGui::InputFloat("Clearance", &g.hClear, 0.5f, 2.f, "%.2f");
+    ImGui::SetNextItemWidth(120); changed |= ImGui::InputFloat("Retract", &g.hRetract, 0.1f, 0.5f, "%.2f");
+
+    ImGui::Spacing();
+    if (ImGui::Button("Apply") && !g.docId.empty()) {
+        nlohmann::json params = {
+            {"stepover",    (double)g.fStepover},
+            {"stepdown",    (double)g.fStepdown},
+            {"stock_leave", (double)g.fStockLeave},
+            {"feed",        (double)g.fFeed},
+            {"spindle_rpm", (double)g.fRpm},
+        };
+        nlohmann::json heights = {
+            {"top",      (double)g.hTop},
+            {"bottom",   (double)g.hBottom},
+            {"clearance",(double)g.hClear},
+            {"retract",  (double)g.hRetract},
+        };
+        nlohmann::json upd = {
+            {"op", "update_operation"},
+            {"setup_id",     setup.id},
+            {"operation_id", op.id},
+            {"params",       params},
+            {"heights",      heights},
+        };
+        if (std::string(g.opName) != (op.name.empty() ? op.type : op.name))
+            upd["name"] = std::string(g.opName);
+        applyOps(st, nlohmann::json::array({upd}));
+        g.status = "updated operation parameters";
+    }
+    (void)changed;  // used only to indicate form is dirty — future: dirty-flag indicator
+}
+
+// ---- setup-sheet summary tab ------------------------------------------------
+static void drawSetupSheetImpl(app::AppState& st) {
+    if (g.mirror.setups().empty()) {
+        ImGui::TextDisabled("No setups. Add a setup and run Generate.");
+        return;
+    }
+
+    ImGui::Text("Job: %s", g.mirror.name().c_str());
+    ImGui::Separator();
+
+    const auto& setups = g.mirror.setups();
+    for (int si = 0; si < (int)setups.size(); ++si) {
+        const auto& s = setups[si];
+        ImGui::PushID(si);
+        if (ImGui::CollapsingHeader(s.name.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Text("Machine: %s", s.machine.c_str());
+            // Stock dimensions from last extract (if available)
+            if (!g.lastExtract.empty() && g.lastExtract.contains("bbox")) {
+                const auto& bbox = g.lastExtract["bbox"];
+                if (bbox.contains("min") && bbox.contains("max")) {
+                    const auto& mn = bbox["min"];
+                    const auto& mx = bbox["max"];
+                    if (mn.is_array() && mx.is_array() && mn.size() >= 3 && mx.size() >= 3) {
+                        double dx = mx[0].get<double>() - mn[0].get<double>();
+                        double dy = mx[1].get<double>() - mn[1].get<double>();
+                        double dz = mx[2].get<double>() - mn[2].get<double>();
+                        ImGui::Text("Stock: %.1f x %.1f x %.1f mm", dx, dy, dz);
+                    }
+                }
+            } else {
+                ImGui::TextDisabled("Stock: run Extract Part");
+            }
+            // Operations count
+            ImGui::Text("Operations: %d", (int)s.ops.size());
+            // Sim data (cycle time) per setup if available
+            if (!g.sim.empty() && g.sim.contains("results") && si < (int)g.sim["results"].size()) {
+                const auto& r = g.sim["results"][si];
+                double t = r.value("cycle_time_s", 0.0);
+                ImGui::Text("Cycle time: %dm %02ds", (int)(t / 60), (int)t % 60);
+            }
+            // G-code output path
+            if (!g.gcodePath.empty()) {
+                ImGui::TextDisabled("NC: %s", g.gcodePath.c_str());
+                if (ImGui::Button("Open in explorer")) {
+                    std::string cmd = "xdg-open \"" + std::filesystem::path(g.gcodePath).parent_path().string() + "\"";
+                    (void)std::system(cmd.c_str());
+                }
+            } else {
+                ImGui::TextDisabled("NC: not yet posted");
+            }
+        }
+        ImGui::PopID();
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Tools:");
+    for (const auto& t : g.mirror.tools())
+        ImGui::BulletText("T%d  %s  \xC3\x98%.2f mm  (%d fl)", t.number, t.type.c_str(),
+                          t.diameter, 0);
+}
+
 }  // namespace
 
 // ---- ribbon command handler ----
@@ -384,6 +556,169 @@ void camLoadJob(app::AppState& st, const std::string& docId) {
     camEnsureVisible();
 }
 
+// ---- workspace header strip (drawn above drawCamManager by workspace_manufacture.cpp) ----
+void drawCamWorkspaceHeader(app::AppState& st) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const float S = ImGui::GetIO().DisplaySize.y > 0 ? 1.f : 1.f;  // placeholder; theme::S() used in panels
+    const float hdr = 28.f * S;
+    const float avail = ImGui::GetContentRegionAvail().x;
+    // Glass header bar background
+    dl->AddRectFilled(p0, ImVec2(p0.x + avail, p0.y + hdr),
+                      IM_COL32(40, 40, 44, 180), 4.f);
+    ImGui::Dummy(ImVec2(avail, hdr));
+
+    ImGui::SameLine(0, 0);
+    ImGui::SetCursorScreenPos(ImVec2(p0.x + 8, p0.y + (hdr - ImGui::GetTextLineHeight()) * 0.5f));
+    // Breadcrumb: Job > Setup > Op
+    const std::string jobName  = g.mirror.name().empty() ? "No Job" : g.mirror.name();
+    const std::string setupName = (!g.mirror.setups().empty() && g.selSetup >= 0 && g.selSetup < (int)g.mirror.setups().size())
+                                  ? g.mirror.setups()[g.selSetup].name : "";
+    const std::string opName = (!setupName.empty() && g.selOp >= 0 && g.selOp < (int)g.mirror.setups()[g.selSetup].ops.size())
+                                ? g.mirror.setups()[g.selSetup].ops[g.selOp].type : "";
+
+    ImGui::TextDisabled("Manufacture");
+    if (!jobName.empty()) { ImGui::SameLine(); ImGui::TextDisabled(">"); ImGui::SameLine(); ImGui::Text("%s", jobName.c_str()); }
+    if (!setupName.empty()) { ImGui::SameLine(); ImGui::TextDisabled(">"); ImGui::SameLine(); ImGui::TextDisabled("%s", setupName.c_str()); }
+    if (!opName.empty()) { ImGui::SameLine(); ImGui::TextDisabled(">"); ImGui::SameLine(); ImGui::TextDisabled("%s", opName.c_str()); }
+
+    // Right-aligned shortcut buttons
+    const float btnW = 90.f * S;
+    const float gap  = 4.f * S;
+    float rx = p0.x + avail - 3 * (btnW + gap) - gap;
+    ImGui::SetCursorScreenPos(ImVec2(rx, p0.y + (hdr - 20.f) * 0.5f));
+    if (ImGui::Button("Generate", ImVec2(btnW, 0))) doGenerate(st);
+    ImGui::SetCursorScreenPos(ImVec2(rx + btnW + gap, p0.y + (hdr - 20.f) * 0.5f));
+    ImGui::SameLine();
+    if (ImGui::Button("Simulate", ImVec2(btnW, 0))) doSimulate(st);
+    ImGui::SetCursorScreenPos(ImVec2(rx + 2 * (btnW + gap), p0.y + (hdr - 20.f) * 0.5f));
+    ImGui::SameLine();
+    if (ImGui::Button("Post", ImVec2(btnW, 0))) doPost(st);
+
+    // Stale banner (b): part changed since last extract
+    if (g.partStale) {
+        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 200, 60, 255));
+        ImGui::SameLine(0, 16.f);
+        ImGui::TextUnformatted("Part changed.");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Regen from Part")) camRegenFromPart(st);
+    }
+}
+
+// ---- public wrappers for the sub-draws used by workspace_manufacture ----
+void drawCamOpEditor(app::AppState& st)     { drawOpEditorImpl(st); }
+void drawCamSetupSheet(app::AppState& st)   { drawSetupSheetImpl(st); }
+
+// ---- cross-doc stale check (b) ----------------------------------------------
+bool camCheckPartStale(app::AppState& st) {
+    // Only meaningful when we have a job linked to a source part.
+    if (g.sourcePartDocId.empty() || g.docId.empty()) return false;
+
+    // Throttle: check roughly every 60 frames (~1 s at 60 fps).
+    if (--g.pollCountdown > 0) return g.partStale;
+    g.pollCountdown = 60;
+
+    // Ask the worker for the current open sessions (cheap read — no geometry).
+    nlohmann::json r;
+    if (!camCall(st, "doc_list_open", nlohmann::json::object(), r)) return g.partStale;
+    if (!r.contains("docs") || !r["docs"].is_array()) return g.partStale;
+
+    for (const auto& d : r["docs"]) {
+        if (d.value("doc_id", std::string()) == g.sourcePartDocId) {
+            long rev = d.value("revision", (long)-1);
+            if (rev > g.sourcePartRevision && g.sourcePartRevision >= 0) {
+                if (!g.partStale) {
+                    g.partStale = true;
+                    g.staleToastShown = false;
+                }
+            }
+            g.lastPolledPartRev = rev;
+            break;
+        }
+    }
+    return g.partStale;
+}
+
+void camRegenFromPart(app::AppState& st) {
+    // Re-export the part step then re-extract stock + re-generate toolpaths.
+    g.partStep.clear();  // force re-export
+    if (!exportPartStep(st)) return;
+    g.lastExtract = extract(st, "all");
+    if (!ensureJob(st)) return;
+    // Seed a setup if none exists (fresh re-link)
+    if (g.mirror.setups().empty() && g.lastExtract.contains("stock")) {
+        nlohmann::json box = g.lastExtract["stock"]["box"];
+        box["type"] = "box"; box["off_ztop"] = 1.0; box["material"] = "aluminum";
+        applyOps(st, nlohmann::json::array({nlohmann::json{
+            {"op", "add_setup"},
+            {"setup", {{"name", "Setup1"}, {"machine", {{"kind", "mill3"}}}, {"stock", box}}}}}));
+    }
+    doGenerate(st);
+    g.partStale = false;
+    g.staleToastShown = true;
+    g.status = "re-generated from updated part (rev " + std::to_string(g.sourcePartRevision) + ")";
+}
+
+// ---- part↔CAM resolver (c) --------------------------------------------------
+std::string camFindOrCreateJobForPart(app::AppState& st, const std::string& partDocId) {
+    if (partDocId.empty()) return {};
+
+    // Case 1: the currently loaded job was extracted from this part — reuse it.
+    if (!g.docId.empty() && g.sourcePartDocId == partDocId) {
+        st.camActive = true;
+        camEnsureVisible();
+        return g.docId;
+    }
+
+    // Case 2: create a new CAM job, extract geometry from the part, add a default setup.
+    // We need the active tab to match partDocId so exportPartStep picks the right tab.
+    // Find the tab index for partDocId.
+    int targetTab = -1;
+    for (int i = 0; i < (int)st.docTabs.size(); ++i) {
+        if (st.docTabs[i].docId == partDocId) { targetTab = i; break; }
+    }
+    const int prevTab = st.activeTab;
+    if (targetTab >= 0) st.activeTab = targetTab;
+
+    g.docId.clear();
+    g.mirror.clear();
+    g.partStep.clear();
+    g.lastExtract = nlohmann::json();
+
+    if (!ensureJob(st)) {
+        st.activeTab = prevTab;
+        return {};
+    }
+    g.sourcePartDocId = partDocId;
+
+    // Extract geometry from the part
+    nlohmann::json extr = extract(st, "all");
+    if (!extr.empty()) {
+        g.lastExtract = extr;
+        // Add a default setup seeded from stock bounding box
+        if (g.mirror.setups().empty() && extr.contains("stock")) {
+            nlohmann::json box = extr["stock"]["box"];
+            box["type"] = "box"; box["off_ztop"] = 1.0; box["material"] = "aluminum";
+            applyOps(st, nlohmann::json::array({nlohmann::json{
+                {"op", "add_setup"},
+                {"setup", {{"name", "Setup1"}, {"machine", {{"kind", "mill3"}}}, {"stock", box}}}}}));
+        }
+    }
+    // Read the part revision snapshot
+    nlohmann::json tr;
+    if (camCall(st, "doc_tree", {{"doc_id", partDocId}}, tr) && tr.contains("revision"))
+        g.sourcePartRevision = tr["revision"].get<long>();
+    g.partStale = false;
+    g.lastPolledPartRev = g.sourcePartRevision;
+
+    st.activeTab = prevTab;
+    st.camActive = true;
+    camEnsureVisible();
+    g.status = "CAM job created for part";
+    return g.docId;
+}
+
 // ---- the panel body (Begin("CAM")/End() live in application.cpp; see cam_panel.h) ----
 void drawCamManager(app::AppState& st) {
     refreshDialects(st);
@@ -464,9 +799,17 @@ void drawCamManager(app::AppState& st) {
     ImGui::NextColumn();
     if (ImGui::BeginTabBar("cam_tabs")) {
         if (ImGui::BeginTabItem("Toolpaths")) { drawBackplot(st); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Op Editor")) {
+            drawOpEditorImpl(st);
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("Simulate")) {
             if (ImGui::Button("Run Material-Removal Sim")) doSimulate(st);
             drawSimSummary();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Setup Sheet")) {
+            drawSetupSheetImpl(st);
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("G-code")) {

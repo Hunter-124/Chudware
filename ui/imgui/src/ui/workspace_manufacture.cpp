@@ -1,14 +1,16 @@
-// Manufacture workspace body — delegates to CAM manager + adds workspace chrome.
+// Manufacture workspace body — workspace header strip + CAM manager panel.
 //
-// Backend: drawCamManager(s) (cam_panel.h) draws the CAM job tree, toolpath list,
-// setup panels, and simulation controls. This file wraps that call so phase-2
-// agents can add workspace-level chrome (toolbar, material-removal stats, post
-// controls) without editing cam_panel.cpp or viewport.cpp.
+// Wiring: viewport.cpp calls drawManufactureWorkspace() when workspace == Manufacture
+// (or camActive is true). The 3D scene still renders beneath (OverlayHosting kind).
 //
-// Phase-2 agents: add a compact toolbar strip BEFORE the drawCamManager call —
-// the strip should show the same New Job / Add Setup / Add Tool / Generate / Post
-// commands from cmd::Workspace::Manufacture (cmd::groupsFor(W::Manufacture)) but
-// rendered as a mini context bar inside the content area (not the glass ribbon).
+// Layout:
+//   1. Workspace header strip: breadcrumb + Generate/Simulate/Post shortcuts +
+//      stale-part banner (cross-doc auto-update, feat(xdoc)).
+//   2. drawCamManager(s): the full CAM manager with job tree, Op Editor, Toolpaths,
+//      Simulate, Setup Sheet, G-code tabs.
+//
+// Cross-doc pull: camCheckPartStale() is called each frame so the stale banner in
+// the header strip lights up immediately when the source part rebuilds.
 #include "ui/workspace_manufacture.h"
 #include "ui/cam/cam_panel.h"
 #include "app/app_state.h"
@@ -18,11 +20,18 @@
 namespace ui {
 
 void drawManufactureWorkspace(app::AppState& s) {
-    // TODO(phase-2 cam): add workspace header bar here — "Manufacture" title strip +
-    // breadcrumb (Job / Setup / Operation) and Generate / Post shortcut buttons.
-    // See cam_panel.h drawCamWorkspacePanel for the CAM panel API.
+    // 1. Workspace header strip: breadcrumb + action shortcuts + stale banner.
+    //    camCheckPartStale() is the pull-model cross-doc staleness check (feat(xdoc)):
+    //    it polls doc_list_open ~once/second and sets a stale flag when the source part
+    //    has been rebuilt since the last cam_extract. The banner in the header strip
+    //    responds immediately; clicking "Regen from Part" calls camRegenFromPart().
+    camCheckPartStale(s);
+    drawCamWorkspaceHeader(s);
 
-    // Delegate to the existing CAM manager panel (live backend — do not replace).
+    ImGui::Spacing();
+
+    // 2. Full CAM manager body: job tree (left) + tabbed right pane (Toolpaths /
+    //    Op Editor / Simulate / Setup Sheet / G-code). Live backend — do not replace.
     ui::drawCamManager(s);
 }
 

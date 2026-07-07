@@ -25,6 +25,18 @@ struct CamBackplot;  // fwd (cam_mirror.h)
 // application.cpp's frame(). Renders an empty-job toolbar/tree when no job is open yet.
 void drawCamManager(app::AppState& st);
 
+// Thin workspace header strip: breadcrumb (Job / Setup / Operation) + Generate/Post shortcuts.
+// Drawn ABOVE drawCamManager() by drawManufactureWorkspace() — NOT inside the "CAM" dock window.
+void drawCamWorkspaceHeader(app::AppState& st);
+
+// Operation-parameter editor form for the currently selected op (stepover/depth/heights/feeds).
+// Drawn inside drawCamManager() when an op is selected. No-op when nothing is selected.
+void drawCamOpEditor(app::AppState& st);
+
+// Setup-sheet summary (stock dims, machine kind, cycle time, posted nc path).
+// Drawn as a tab inside drawCamManager().
+void drawCamSetupSheet(app::AppState& st);
+
 // Reveal / bring-forward the CAM panel (called when a cam_* command runs, or the Manufacture
 // workspace is entered once that ribbon wiring exists). Requests focus for a few frames.
 void camEnsureVisible();
@@ -48,5 +60,22 @@ void camHandleCommand(app::AppState& st, const std::string& cmd);
 // part (rapid/cut/lead/plunge/arc), or nullptr when there is nothing to show. NOTE: not yet
 // wired into ui/imgui/src/ui/viewport.cpp (out of the H1 write-set — see task report).
 const CamBackplot* camActiveBackplot();
+
+// ---- Cross-doc dependency (b) -----------------------------------------------
+// Pull-model stale check: call once per frame when the Manufacture workspace is
+// visible. Compares the cached source-part revision to the part's current revision
+// (via doc_list_open). Returns true if the job geometry is now stale (part changed
+// since last extract). Callers may show a "Part changed — regen?" toast.
+bool camCheckPartStale(app::AppState& st);
+
+// Acknowledge the stale state and force a re-extract + re-generate from the current part.
+// Shows the result in g.status. Call when the user clicks "Regen from Part".
+void camRegenFromPart(app::AppState& st);
+
+// ---- Part↔CAM resolver (c) --------------------------------------------------
+// Given a part docId, find the active CAM job for that part (g.docId when
+// g.sourcePartDocId == partDocId) or create a new one. Activates the CAM panel.
+// Returns the cam job docId (empty on error).
+std::string camFindOrCreateJobForPart(app::AppState& st, const std::string& partDocId);
 
 }  // namespace ui

@@ -512,13 +512,12 @@ def report_evidence(ev: Evidence) -> None:
 # ====================================================================================================
 
 def main(argv) -> int:
-    # T-G11: this auditor harvests code-evidence from the legacy host/ ribbon + pm_forms,
-    # which were deleted. It needs RE-POINTING to ui/imgui + ui/abstract (command_registry
-    # + panel_spec) — a separate task. Skip cleanly until then rather than fail the gate on
-    # missing host/ inputs (it only ever read the now-deleted host/ tree).
+    # This auditor harvests code-evidence from the host/ ribbon (ribbon_def.cpp). It needs
+    # re-pointing to host/src/ after the ui/imgui retirement. Skip cleanly when RIBBON is
+    # absent rather than fail the gate.
     if not os.path.exists(RIBBON):
-        print("parity_audit: SKIPPED — host/ deleted (T-G11); re-point evidence harvest to "
-              "ui/imgui + ui/abstract/command_registry.cpp + panel_spec.cpp.")
+        print("parity_audit: SKIPPED — ribbon_def.cpp not found; re-point evidence harvest to "
+              "host/src/ (ui/imgui + ui/abstract retired — see docs/PORT_LEDGER.md).")
         return 0
     ap = argparse.ArgumentParser(description="AI-opencad SolidWorks-parity drift auditor")
     ap.add_argument("--report", default="text", choices=["text", "md"],

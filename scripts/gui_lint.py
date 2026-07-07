@@ -6,11 +6,10 @@ exact bug classes the 2026-06 GUI audit found, so they cannot silently ship agai
 backlog can be cleared (and kept clear) deterministically:
 
   rule=icons  every getIcon/treeIcon/asmIcon/hasIcon/huBtn("name") and every ribbon_def.cpp row icon
-              field (host/src) must name an icon in host/assets/icons/atlas.json. Additionally,
-              every icons::draw/icons::inlineIcon/icons::drawGlass("name") call under ui/imgui/src
-              (Liquid Glass v2 N3 — SDF icon pipeline) must name an icon in
-              ui/imgui/resources/icons/atlas.json UNION the hand-drawn glyph names UNION the alias
-              map names (both hardcoded below, kept in sync with ui/imgui/src/theme/icons.cpp).
+              field (host/src) must name an icon in host/assets/icons/atlas.json.
+              NOTE: the Liquid Glass v2 N3 SDF icon pipeline (icons::draw/inlineIcon/drawGlass)
+              was part of ui/imgui, which is retired (see docs/PORT_LEDGER.md). That branch of
+              this rule is now dead and will be removed when host/ adopts its own SDF pipeline.
               This is the bug that rendered the PM OK/Cancel buttons as a magenta "?": names
               'ok'/'cancel' that the atlas never had.
   rule=theme  flags applyTheme(..., 1.0f) literal scale (collapses padding to 100% on HiDPI and
@@ -113,10 +112,9 @@ PIXEL_MIN = 2.0
 # do not fail the gate. (Chrome exceptions inside these files can still be fixed; add a per-line
 # "// gui-lint: allow" if a specific art literal is mis-flagged elsewhere.)
 SCALE_WORLDSPACE_FILES = {
-    "ui/imgui/src/ui/sketch/sketch_mode.cpp",  # 2D sketch canvas — world (model) coordinates
-    "ui/imgui/src/ui/ecad/ecad_canvas.cpp",    # schematic / PCB canvas — world coordinates
-    "ui/imgui/src/ui/drawing_panel.cpp",       # drawing sheet — paper-space coordinates
-    "ui/imgui/src/theme/theme.cpp",            # base ImGuiStyle authored at 1.0x (ScaleAllSizes scales)
+    # ui/imgui (retired, see docs/PORT_LEDGER.md) — these paths are inert but kept for
+    # historical reference in case ui/imgui commits are inspected via git show.
+    # host/ equivalents should be added here when known.
 }
 
 NUM_RE = re.compile(r"(?<![\w.])(-?\d+\.?\d*)f?(?![\w.\d])")
@@ -218,9 +216,9 @@ RIBBON_ROW_RE = re.compile(r'^\s*\{\s*"[^"]*"\s*,\s*"[^"]*"\s*,\s*"([^"]*)"\s*,'
 APPLY_THEME_RE = re.compile(r'applyTheme\s*\([^,]+,\s*1(?:\.0*)?f?\s*\)')
 FONT_GLOBAL_RE = re.compile(r'FontGlobalScale\s*=')
 
-# ui/imgui (Liquid Glass v2 N3) icon call forms — see extract_call_args() for the paren-balanced
-# argument extraction; the icon name is the first quoted literal within the call (icons::draw and
-# icons::drawGlass take a leading ImDrawList* arg before the name; icons::inlineIcon does not).
+# Liquid Glass v2 N3 icon call forms (was ui/imgui; that tree is retired — is_ui_imgui is now
+# always False so these are dead; kept for reference until host/ adopts the SDF icon pipeline).
+# See extract_call_args() for paren-balanced arg extraction; icon name is the first quoted literal.
 UI_ICON_FUNCS = ("icons::draw", "icons::inlineIcon", "icons::drawGlass")
 FIRST_STR_RE = re.compile(r'"([^"]*)"')
 
@@ -228,7 +226,7 @@ FIRST_STR_RE = re.compile(r'"([^"]*)"')
 def lint_file(path: str, atlas: set[str], ui_names: set[str], rules: set[str], findings: list):
     rel = os.path.relpath(path, REPO).replace(os.sep, "/")
     is_ribbon_def = rel.endswith("ribbon_def.cpp")
-    is_ui_imgui = rel.startswith("ui/imgui/src/")
+    is_ui_imgui = False  # ui/imgui retired (docs/PORT_LEDGER.md) — SDF icon path is dead
     # World-space / base-style files report scale findings under the non-gating "scale-ws" rule.
     scale_rule = "scale-ws" if rel in SCALE_WORLDSPACE_FILES else "scale"
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -254,7 +252,7 @@ def lint_file(path: str, atlas: set[str], ui_names: set[str], rules: set[str], f
                         key = f"{rel}:{n}"
                         if name and name not in ui_names and key not in ICONS_UI_ALLOWLIST:
                             findings.append((rel, n, "icons",
-                                             f'icon "{name}" not in ui/imgui atlas '
+                                             f'icon "{name}" not in SDF icon atlas '
                                              f'\u222a hand-drawn \u222a alias names', line.strip()))
             else:
                 for m in ICON_CALL_RE.finditer(code):
@@ -342,12 +340,8 @@ def main(argv) -> int:
     findings: list = []
     for path in iter_source_files(roots):
         lint_file(path, atlas, ui_names, rules, findings)
-    # The icons rule also covers ui/imgui/src (Liquid Glass v2 N3) by default — but only when the
-    # caller didn't already scope roots explicitly (an explicit self-check invocation covers
-    # exactly what it asked for; this avoids double-scanning the same files).
-    if "icons" in rules and not explicit_roots:
-        for path in iter_source_files([UI_IMGUI_ROOT]):
-            lint_file(path, atlas, ui_names, {"icons"}, findings)
+    # TODO: ui/imgui SDF icon scan (Liquid Glass v2 N3) was here; ui/imgui is retired.
+    # Re-add when host/ adopts the SDF icon pipeline (docs/PORT_LEDGER.md).
     findings.sort(key=lambda f: (f[2], f[0], f[1]))
 
     if args.update_baseline:

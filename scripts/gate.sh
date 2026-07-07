@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/gate.sh — the Linux build + test gate for the AI-CAD modular refactor.
+# scripts/gate.sh — the Linux build + test gate for AI-CAD.
 #
 # Every DAG node must leave this gate green before close (see AGENTS.md swarm
 # rules + the plan file). It runs, in order:
@@ -8,10 +8,14 @@
 #   2. core CMake/Ninja build  — libaicad with -DAICAD_WITH_OCCT=ON + ctest. SKIPPED with a
 #                                 clear reason if the system OCCT cmake config is not found
 #                                 (the gate does NOT fail just because OCCT is absent on a box).
+#   2b. host GUI build         — cmake -S host -B host/build-linux + ninja AI-CAD.
+#                                 The ui/imgui / ui/abstract (AI-CAD2) app is retired;
+#                                 host/ is the single cross-platform GUI target.
 #   3. ctest                   — only if the core build succeeded; best-effort (SKIP if no tests).
 #   4. engine + agent pytest   — only if a runtime venv / pytest is discoverable; SKIP with a
 #                                 clear reason if the Python runtime is not provisioned.
-#   5. PASS/SKIP summary.
+#   5. host shot smoke         — AI_CAD_SHOT=m1 headless screenshot via xvfb-run.
+#   6. PASS/SKIP summary.
 #
 # SKIP semantics: OCCT-absent and venv-absent are environment SKIPs, not failures — the gate
 # stays green on a box that simply hasn't provisioned those optional runtimes, while still
@@ -78,11 +82,10 @@ stage_manual_gen() {
 }
 
 # ---- Stage 1.6: UI style conformance (advisory, T-U1) ------------------------
-# scripts/ui_style_check.py enforces the panel_scaffold.h kit rules from
-# docs/UI_PATTERN_LIBRARY.md (no literal colors outside theme::/tokens.h, no OS #ifdef outside
-# ui/imgui/src/platform/, a ui/abstract/ view-model header per scaffold-built panel). Advisory
-# like manual regen — pre-existing findings are absorbed into scripts/ui_style_check_baseline.json
-# so this gates only NEW drift on top of the pre-T-U1 host/ history, not a wholesale rewrite.
+# scripts/ui_style_check.py enforces panel-conformance rules from
+# docs/UI_PATTERN_LIBRARY.md. Advisory — pre-existing findings are absorbed into
+# scripts/ui_style_check_baseline.json. Now targets host/ source; ui/imgui and
+# ui/abstract are retired (see docs/PORT_LEDGER.md).
 stage_ui_style_check() {
     echo "=== ui_style_check.py (advisory) ==="
     if ! command -v python3 >/dev/null 2>&1; then
@@ -156,24 +159,32 @@ stage_core_build() {
     CORE_BUILD_OK=1
 }
 
-# ---- Stage 2b: ui/abstract build + test -------------------------------------
+# ---- Stage 2b: host GUI build (ninja AI-CAD) --------------------------------
+# ui/abstract is deleted (retired with ui/imgui in refactor(unify)). This stage
+# now builds the host/ GUI — the single cross-platform GUI target.
 stage_ui_abstract() {
-    echo "=== [2b/6] ui/abstract build + ctest ==="
+    echo "=== [2b/6] host GUI build (ninja AI-CAD) ==="
     if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
-        record "ui/abstract         SKIP    cmake or ninja not on PATH"
+        record "host build          SKIP    cmake or ninja not on PATH"
         echo "  SKIP: cmake/ninja missing"
         return 0
     fi
-    if CCACHE_DISABLE=1 cmake -S . -B build/linux-ui-abstract -DAICAD_BUILD_CORE=OFF -DAICAD_BUILD_UI_ABSTRACT=ON -G Ninja > /tmp/gate_uiabs_cfg.out 2>&1 \
-       && CCACHE_DISABLE=1 cmake --build build/linux-ui-abstract --config Release > /tmp/gate_uiabs_build.out 2>&1 \
-       && ctest --test-dir build/linux-ui-abstract -C Release --output-on-failure > /tmp/gate_uiabs_ctest.out 2>&1; then
-        record "ui/abstract         PASS    command_registry test green"
-        echo "  PASS"
-    else
-        record "ui/abstract         FAIL    build or ctest (see /tmp/gate_uiabs_*.out)"
-        echo "  FAIL: ui/abstract"; tail -n 10 /tmp/gate_uiabs_build.out 2>/dev/null | sed 's/^/    /'
+    local host_build="$REPO/host/build-linux"
+    if ! CCACHE_DISABLE=1 cmake -S "$REPO/host" -B "$host_build" -G Ninja -DCMAKE_BUILD_TYPE=Release > /tmp/gate_host_cfg.out 2>&1; then
+        record "host build          FAIL    cmake configure (see /tmp/gate_host_cfg.out)"
+        echo "  FAIL: configure"; tail -n 15 /tmp/gate_host_cfg.out | sed 's/^/    /'
         fail_fatal=1
+        return 0
     fi
+    if ! ninja -C "$host_build" AI-CAD > /tmp/gate_host_build.out 2>&1; then
+        record "host build          FAIL    ninja AI-CAD (see /tmp/gate_host_build.out)"
+        echo "  FAIL: build"; tail -n 20 /tmp/gate_host_build.out | sed 's/^/    /'
+        fail_fatal=1
+        return 0
+    fi
+    record "host build          PASS    host/build-linux/bin/AI-CAD built"
+    echo "  PASS"
+    HOST_BUILD_OK=1
 }
 
 # ---- Stage 3: ctest (core) -------------------------------------------------
@@ -339,67 +350,48 @@ stage_pytest() {
     fi
 }
 
-# ---- Stage 5: ui/imgui (AI-CAD2) build + --shot smoke -----------------------
+# ---- Stage 5: host GUI shot smoke (AI_CAD_SHOT=m1) -------------------------
+# ui/imgui (AI-CAD2) is retired. This stage runs the host GUI headless under
+# xvfb and verifies it renders a screenshot. The host binary is expected to
+# exist at host/build-linux/bin/AI-CAD (built by stage 2b above, or a prior
+# cached build). Skips gracefully when the host build did not succeed or the
+# binary is absent.
 stage_ui_imgui() {
-    echo "=== [5/6] ui/imgui build + AI-CAD2 --shot smoke ==="
-    if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
-        record "ui/imgui             SKIP    cmake or ninja not on PATH"
-        echo "  SKIP: cmake/ninja missing"
-        return 0
-    fi
-    local build_dir="build/linux-app"
-    if ! CCACHE_DISABLE=1 cmake --preset linux-app > /tmp/gate_app_cfg.out 2>&1; then
-        record "ui/imgui             FAIL    cmake configure (see /tmp/gate_app_cfg.out)"
-        echo "  FAIL: configure"; tail -n 15 /tmp/gate_app_cfg.out | sed 's/^/    /'
-        fail_fatal=1
-        return 0
-    fi
-    if ! CCACHE_DISABLE=1 cmake --build "$build_dir" --config Release > /tmp/gate_app_build.out 2>&1; then
-        record "ui/imgui             FAIL    cmake build (see /tmp/gate_app_build.out)"
-        echo "  FAIL: build"; tail -n 20 /tmp/gate_app_build.out | sed 's/^/    /'
-        fail_fatal=1
-        return 0
-    fi
-    local bin="$build_dir/bin/AI-CAD2"
+    echo "=== [5/6] host GUI shot smoke (AI_CAD_SHOT=m1) ==="
+    local bin="$REPO/host/build-linux/bin/AI-CAD"
     if [ ! -x "$bin" ]; then
-        record "ui/imgui             FAIL    AI-CAD2 binary missing at $bin"
-        echo "  FAIL: missing $bin"
-        fail_fatal=1
+        if [ "${HOST_BUILD_OK:-0}" -eq 1 ]; then
+            record "host shot           FAIL    binary missing at $bin after successful build"
+            echo "  FAIL: missing $bin"
+            fail_fatal=1
+        else
+            record "host shot           SKIP    host build did not succeed or was skipped"
+            echo "  SKIP: host binary not available"
+        fi
         return 0
     fi
-    local shot="/tmp/aicad2-gate-shot.png"
-    # Accept SHOPCRAFT_SHOT as alias for AI_CAD_SHOT (T-G10 rename shim)
-    if [ -n "${SHOPCRAFT_SHOT:-}" ] && [ -z "${AI_CAD_SHOT:-}" ]; then
-        export AI_CAD_SHOT="$SHOPCRAFT_SHOT"
-    fi
-    local shot_cmd="env AI_CAD_NO_FILE_DIALOGS=1 \"$bin\" --shot \"$shot\" --frames 12"
-    # Always use xvfb-run when available unless AI_CAD_SHOT_HEADED=1 is set (interactive
-    # walkthrough mode). This overrides DISPLAY so agents running under a user session
-    # never pop windows onto the desktop. Set AI_CAD_SHOT_HEADED=1 for interactive runs.
+    local shot="/tmp/aicad-gate-host-shot.png"
+    local libaicad="${AI_CAD_LIBAICAD:-$REPO/core/build-occt-linux/bin/libaicad.so}"
+    local shot_cmd="env AI_CAD_NO_FILE_DIALOGS=1 AI_CAD_SHOT=m1"
+    [ -f "$libaicad" ] && shot_cmd="$shot_cmd AI_CAD_LIBAICAD=$libaicad"
+    shot_cmd="$shot_cmd \"$bin\" --ui-screenshot \"$shot\""
+    # Always use xvfb-run when available unless AI_CAD_SHOT_HEADED=1 is set.
     if [ "${AI_CAD_SHOT_HEADED:-0}" != "1" ] && command -v xvfb-run >/dev/null 2>&1; then
         shot_cmd="xvfb-run -a $shot_cmd"
     fi
-    if ! eval "$shot_cmd" > /tmp/gate_app_shot.out 2>&1; then
-        record "ui/imgui             FAIL    --shot smoke (see /tmp/gate_app_shot.out)"
-        echo "  FAIL: --shot"; tail -n 15 /tmp/gate_app_shot.out | sed 's/^/    /'
+    if ! eval "$shot_cmd" > /tmp/gate_host_shot.out 2>&1; then
+        record "host shot           FAIL    --ui-screenshot smoke (see /tmp/gate_host_shot.out)"
+        echo "  FAIL: host shot"; tail -n 15 /tmp/gate_host_shot.out | sed 's/^/    /'
         fail_fatal=1
         return 0
     fi
-    if [ "${CORE_BUILD_OK:-0}" -eq 1 ] && [ -f "core/build-linux/bin/libaicad.so" ]; then
-        local self_cmd="env AI_CAD_NO_FILE_DIALOGS=1 \"$bin\" --selftest"
-        if [ "${AI_CAD_SHOT_HEADED:-0}" != "1" ] && command -v xvfb-run >/dev/null 2>&1; then
-            self_cmd="xvfb-run -a $self_cmd"
-        fi
-        if eval "$self_cmd" > /tmp/gate_app_selftest.out 2>&1; then
-            record "ui/imgui             PASS    build + --shot + --selftest"
-            echo "  PASS (build + shot + selftest)"
-        else
-            record "ui/imgui             PASS    build + --shot (--selftest FAIL, see /tmp/gate_app_selftest.out)"
-            echo "  PASS (build + shot; selftest failed — non-fatal)"
-        fi
+    if [ -f "$shot" ]; then
+        record "host shot           PASS    AI_CAD_SHOT=m1 headless screenshot written"
+        echo "  PASS ($shot)"
     else
-        record "ui/imgui             PASS    build + --shot smoke"
-        echo "  PASS (build + shot)"
+        record "host shot           FAIL    shot PNG not written (see /tmp/gate_host_shot.out)"
+        echo "  FAIL: $shot not created"
+        fail_fatal=1
     fi
 }
 
@@ -560,6 +552,7 @@ stage_modeling() {
 
 # ---- main -------------------------------------------------------------------
 CORE_BUILD_OK=0
+HOST_BUILD_OK=0
 stage_check
 stage_manual_gen
 stage_ui_style_check

@@ -1,36 +1,20 @@
 # Top-level CMake dispatcher for the layered AI-CAD layout.
-# Presets: CMakePresets.json (linux-core, linux-app).
-# The Linux gate (scripts/gate.sh) configures core/ directly; presets use this file.
+# Presets: CMakePresets.json (linux-core, windows-core, windows-occt).
+# The host GUI (host/) has its own CMakeLists.txt — build it directly:
+#   cmake -S host -B host/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+#   ninja -C host/build-linux AI-CAD
+# The Linux gate (scripts/gate.sh) configures core/ via this file's linux-core
+# preset; the host GUI stage builds from host/ directly.
+#
+# NOTE: ui/imgui and ui/abstract are retired. host/ is the single GUI.
 cmake_minimum_required(VERSION 3.20)
 project(aicad LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(AICAD_BUILD_CORE         "Build core/ (libaicad)"           ON)
-option(AICAD_BUILD_UI_ABSTRACT  "Build ui/abstract/ (UI seam)"     ON)
-option(AICAD_BUILD_APP          "Build ui/imgui/ (ImGui GUI)"      OFF)
-option(AICAD_BUILD_UI_IMGUI     "Build ui/imgui/ (post-P3)"        OFF)
+option(AICAD_BUILD_CORE "Build core/ (libaicad)" ON)
 
 if(AICAD_BUILD_CORE)
     add_subdirectory(core)
-endif()
-if(AICAD_BUILD_UI_ABSTRACT)
-    enable_testing()
-    add_subdirectory(ui/abstract)
-endif()
-if(AICAD_BUILD_APP)
-    set(AICAD_GLAD_DIR "${CMAKE_SOURCE_DIR}/extern/glad")
-    if(NOT EXISTS "${AICAD_GLAD_DIR}/src/gl.c")
-        message(FATAL_ERROR "Missing ${AICAD_GLAD_DIR}/src/gl.c for AI-CAD2 build")
-    endif()
-    if(NOT TARGET glad)
-        add_library(glad STATIC ${AICAD_GLAD_DIR}/src/gl.c)
-        target_include_directories(glad PUBLIC ${AICAD_GLAD_DIR}/include)
-    endif()
-    add_subdirectory(ui/viewport)
-    add_subdirectory(ui/imgui)
-endif()
-if(AICAD_BUILD_UI_IMGUI)
-    add_subdirectory(ui/imgui)
 endif()

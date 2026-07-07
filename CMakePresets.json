@@ -15,18 +15,6 @@
       }
     },
     {
-      "name": "linux-app",
-      "displayName": "Linux app (ImGui GUI, Ninja)",
-      "description": "Configure the new ImGui desktop GUI (ui/imgui/). Output: build/linux-app/bin/AI-CAD2.",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/linux-app",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "AICAD_BUILD_APP": "ON",
-        "AICAD_BUILD_UI_ABSTRACT": "ON"
-      }
-    },
-    {
       "name": "windows-core",
       "displayName": "Windows core (libaicad, Ninja + MSVC, OCCT off)",
       "description": "Configure the C++ core with MSVC. Run from an 'x64 Native Tools Command Prompt for VS 2022' (or after vcvars64.bat) so cl/link are on PATH. OCCT off = the self-contained fast build; verified on Win11 + MSVC 14.44. See docs/BUILD_WINDOWS.md.",
@@ -59,34 +47,12 @@
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
       }
-    },
-    {
-      "name": "windows-app",
-      "displayName": "Windows app (ImGui GUI, Ninja + MSVC)  [T-G11 — agent-verified]",
-      "description": "Configure the cross-platform ImGui GUI (ui/imgui/) on Windows. Mirrors 'linux-app'; ui/imgui/CMakeLists.txt carries the WIN32 link block (opengl32/dwmapi/comdlg32) + the SHELL:/FI fix_math.h force-include (fixed for Ninja under T-G11 — the plain /FI\"path\" form embedded literal quotes and hit C1083). Run from an 'x64 Native Tools Command Prompt for VS 2022'. The app dlopens libaicad at runtime — build 'windows-occt' first so libaicad.dll exists. STATUS: agent-verified 2026-07-06 (opus-sweep, MSVC 14.44) — configure+build clean (0 errors) and the binary runs headless (--shot → 1616x1039 PNG). A HUMAN interactive smoke (open part / sketch / extrude / save) is still required for the T-G11 host/-deletion gate. See docs/BUILD_WINDOWS.md.",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/windows-app",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "AICAD_BUILD_APP": "ON",
-        "AICAD_BUILD_UI_ABSTRACT": "ON"
-      },
-      "condition": {
-        "type": "equals",
-        "lhs": "${hostSystemName}",
-        "rhs": "Windows"
-      }
     }
   ],
   "buildPresets": [
     {
       "name": "linux-core",
       "configurePreset": "linux-core",
-      "configuration": "Release"
-    },
-    {
-      "name": "linux-app",
-      "configurePreset": "linux-app",
       "configuration": "Release"
     },
     {
@@ -97,11 +63,6 @@
     {
       "name": "windows-occt",
       "configurePreset": "windows-occt",
-      "configuration": "Release"
-    },
-    {
-      "name": "windows-app",
-      "configurePreset": "windows-app",
       "configuration": "Release"
     }
   ]

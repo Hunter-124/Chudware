@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# packaging/linux/build_appimage.sh — assemble a self-contained AppImage for the ui/imgui GUI
-# (AI-CAD2). Mirrors services/installer/build_release.py's "embed-and-extract" payload shape
+# packaging/linux/build_appimage.sh — assemble a self-contained AppImage for the AI-CAD
+# host GUI. Mirrors services/installer/build_release.py's "embed-and-extract" payload shape
 # (app/ Python packages + wheelhouse/ offline wheels) so the SAME bootstrap.cpp
 # findPayload()/provisionRuntime() logic that already runs on Windows also works unmodified
 # inside the AppImage's mount (exeDir()/app + exeDir()/wheelhouse via /proc/self/exe).
 #
-# Requires a prior build of the ui/imgui GUI:
-#   flock /tmp/host-build-linux.lock -c \
-#     "cmake --preset linux-app && cmake --build build/linux-app --config Release -j\$(nproc)"
+# Requires a prior build of the host GUI:
+#   cmake -S host -B host/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+#   ninja -C host/build-linux AI-CAD
 #
 # Usage:
 #   packaging/linux/build_appimage.sh [--out DIR] [--skip-wheels] [--with-libaicad] [--zip-only-appdir]
@@ -36,11 +36,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-BIN="$REPO/build/linux-app/bin/AI-CAD2"
+BIN="$REPO/host/build-linux/bin/AI-CAD"
 if [ ! -x "$BIN" ]; then
     echo "error: $BIN not found — build it first:" >&2
-    echo '  flock /tmp/host-build-linux.lock -c \' >&2
-    echo '    "cmake --preset linux-app && cmake --build build/linux-app --config Release -j$(nproc)"' >&2
+    echo '  cmake -S host -B host/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release' >&2
+    echo '  ninja -C host/build-linux AI-CAD' >&2
     exit 1
 fi
 
@@ -52,9 +52,9 @@ rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
 
 echo "==> staging binary + resources"
-cp "$BIN" "$APPDIR/usr/bin/AI-CAD2"
-if [ -d "$REPO/build/linux-app/bin/resources" ]; then
-    cp -a "$REPO/build/linux-app/bin/resources" "$APPDIR/usr/bin/resources"
+cp "$BIN" "$APPDIR/usr/bin/AI-CAD"
+if [ -d "$REPO/host/build-linux/bin/assets" ]; then
+    cp -a "$REPO/host/build-linux/bin/assets" "$APPDIR/usr/bin/assets"
 fi
 
 if [ "$WITH_LIBAICAD" = "1" ]; then
@@ -104,7 +104,7 @@ export LD_LIBRARY_PATH="$HERE/usr/lib:${LD_LIBRARY_PATH:-}"
 if [ -f "$HERE/usr/lib/libaicad.so" ] && [ -z "${AI_CAD_LIBAICAD:-}" ]; then
     export AI_CAD_LIBAICAD="$HERE/usr/lib/libaicad.so"
 fi
-exec "$HERE/usr/bin/AI-CAD2" "$@"
+exec "$HERE/usr/bin/AI-CAD" "$@"
 EOF
 chmod +x "$APPDIR/AppRun"
 cp "$REPO/packaging/linux/AI-CAD.desktop" "$APPDIR/AI-CAD.desktop"

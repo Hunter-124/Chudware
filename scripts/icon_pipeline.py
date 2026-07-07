@@ -57,26 +57,22 @@ from PIL import Image
 REPO = Path(__file__).resolve().parent.parent
 
 
-def _find_imgui_bin() -> Path:
-    """Locate the ui/imgui app binary (AI-CAD2). T-G25 retargeted this pipeline off the
-    reference host binary onto the keeper imgui app. Checks the Windows VS-generator layout
-    (Release subdir + .exe) first, then the Linux/Ninja layout."""
-    base = REPO / "ui" / "imgui" / "build" / "bin"
-    for c in (base / "Release" / "AI-CAD2.exe", base / "AI-CAD2.exe",
-              base / "Release" / "AI-CAD2", base / "AI-CAD2"):
+def _find_host_bin() -> Path:
+    """Locate the host GUI binary (AI-CAD). Checks Windows layout first, then Linux/Ninja."""
+    base = REPO / "host" / "build-linux" / "bin"
+    for c in (base / "Release" / "AI-CAD.exe", base / "AI-CAD.exe",
+              base / "Release" / "AI-CAD", base / "AI-CAD"):
         if c.exists():
             return c
-    return base / "AI-CAD2"  # default (nonexistent -> run_app prints a clear build hint)
+    return base / "AI-CAD"  # default (nonexistent -> run_app prints a clear build hint)
 
 
-BIN = _find_imgui_bin()
-# Canonical atlas the C++ loader injects into is the shared assets/icons (moved out of host/ in
-# T-G11) — the imgui build STAGES this dir into <bin>/resources/icons at build time, so inject()
-# keeps writing here.
+BIN = _find_host_bin()
+# Canonical atlas the C++ loader injects into (shared assets/icons staging source).
 ICON_DIR = REPO / "assets" / "icons"
-# Runtime copy the imgui binary actually reads; redeploy here after inject so a re-run picks up
+# Runtime copy the host binary reads; redeploy here after inject so a re-run picks up
 # new tiles without a full rebuild.
-DEPLOYED_ICON_DIR = BIN.parent / "resources" / "icons"
+DEPLOYED_ICON_DIR = BIN.parent / "assets" / "icons"
 RENDER_DIR = REPO / "scratch" / "icon_render"
 CONTACT_SHEET = REPO / "scratch" / "icon_contact_sheet.png"
 RENDER_PX = 128  # square offscreen render size; downscaled into the 32/20 cells
@@ -835,16 +831,17 @@ def write_recipes(path: Path) -> None:
 
 
 def run_app(recipes_json: Path, theme: str = "dark", timeout_s: int = 300) -> int:
-    """Run the imgui GUI headless (AI_CAD_SHOT=iconpipe) to render every recipe to RENDER_DIR.
+    """Run the host GUI headless (AI_CAD_SHOT=iconpipe) to render every recipe to RENDER_DIR.
 
-    T-G25 retarget: the keeper ui/imgui app (AI-CAD2) is the target now, and its headless flag
-    is --shot (NOT the host binary's --ui-screenshot). On Linux we wrap in xvfb-run (llvmpipe)
-    for a deterministic, GPU-independent server; on Windows the desktop session supplies GL, so
-    the exe runs directly. One invocation drains ALL recipes in a single tick.
+    Targets host/build-linux/bin/AI-CAD (ui/imgui / AI-CAD2 is retired — see docs/PORT_LEDGER.md).
+    On Linux we wrap in xvfb-run (llvmpipe) for a deterministic, GPU-independent server; on
+    Windows the desktop session supplies GL, so the exe runs directly. One invocation drains ALL
+    recipes in a single tick.
     """
     if not BIN.exists():
-        sys.exit(f"binary not found: {BIN} -- build ui/imgui first "
-                 f"(cmake --build ui/imgui/build --config Release --target AI-CAD2)")
+        sys.exit(f"binary not found: {BIN} -- build the host GUI first:\n"
+                 f"  cmake -S host -B host/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release\n"
+                 f"  ninja -C host/build-linux AI-CAD")
     RENDER_DIR.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env.update({

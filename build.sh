@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # ===========================================================================
-#  AI-CAD build script (Linux) — thin wrapper around the CMake presets.
+#  AI-CAD build script (Linux) — thin wrapper around CMake/Ninja.
 # ---------------------------------------------------------------------------
 #  Builds the native CMake/Ninja projects that make up AI-CAD:
-#    core -> the C++ OCCT kernel (libaicad.so), via the linux-core preset
-#    app  -> AI-CAD2, the cross-platform ImGui GUI over the shared ui/abstract
-#            schema, via the linux-app preset (which also builds core transitively)
+#    core -> the C++ OCCT kernel (libaicad.so)
+#    app  -> AI-CAD host GUI (cmake -S host -B host/build-linux + ninja AI-CAD)
 #
-#  (The legacy host/ desktop GUI was retired in T-G11 — ui/imgui is the single
-#  GUI target now, so this script no longer has a "host" mode.)
+#  The ui/imgui / ui/abstract (AI-CAD2) app is retired. host/ is the single
+#  cross-platform GUI target (builds on Linux with GCC/Clang + on Windows with
+#  MSVC). Binary: host/build-linux/bin/AI-CAD
 #
 #  Usage:
-#    ./build.sh            Default: build the app (linux-app preset).
+#    ./build.sh            Default: build the host GUI.
 #    ./build.sh app        Same as default.
 #    ./build.sh core       Only the C++ kernel (linux-core preset).
-#    ./build.sh all        core, then app.
-#    ./build.sh clean      Wipe the app build dir (core kept — OCCT is expensive
+#    ./build.sh all        core, then host GUI.
+#    ./build.sh clean      Wipe host/build-linux (core kept — OCCT is expensive
 #                          to reconfigure), then run the default build.
 #
 #  Close any running AI-CAD / MCP server first if a link step reports the output
@@ -30,12 +30,15 @@ command -v cmake >/dev/null 2>&1 || { echo "[build] ERROR: cmake not found on PA
 command -v ninja >/dev/null 2>&1 || { echo "[build] ERROR: ninja not found on PATH"; exit 1; }
 
 build_core() { cmake --preset linux-core && cmake --build --preset linux-core; }
-build_app()  { cmake --preset linux-app  && cmake --build --preset linux-app;  }
+build_app()  {
+    cmake -S "$ROOT/host" -B "$ROOT/host/build-linux" -G Ninja -DCMAKE_BUILD_TYPE=Release
+    ninja -C "$ROOT/host/build-linux" AI-CAD
+}
 
 case "$MODE" in
   clean)
-    echo "[build] wiping the app build dir (core kept) ..."
-    rm -rf "$ROOT/build/linux-app"
+    echo "[build] wiping host/build-linux (core kept) ..."
+    rm -rf "$ROOT/host/build-linux"
     MODE=default
     ;;
 esac
@@ -52,6 +55,6 @@ esac
 
 echo ""
 echo "[build] DONE ($MODE)."
-BIN="$ROOT/build/linux-app/bin/AI-CAD2"
+BIN="$ROOT/host/build-linux/bin/AI-CAD"
 [ -x "$BIN" ] && echo "[build] Run the GUI:  $BIN  (set AI_CAD_LIBAICAD to the built libaicad.so)"
 exit 0

@@ -2945,7 +2945,11 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // or showPcbTools was explicitly triggered by a ribbon command. Do NOT let showPcbTools
         // bleed from the Electronics workspace into Manufacture/Model/etc — clear it on exit.
         if (ws != WS::Electronics && st.showPcbTools && st.ecadDocId.empty()) st.showPcbTools = false;
-        const bool wsShowEcad = (ws == WS::Electronics) || st.showPcbTools || !st.ecadDocId.empty();
+        // The ECAD editor canvas + PCB Manager belong to the Electronics workspace ONLY — an open
+        // board no longer bleeds its 2D canvas over the 3D viewport in Model/etc (Hunter round). The
+        // doc-tab strip drives the coupling the other way: activating a PCB/Schematic tab switches the
+        // workspace to Electronics (AppState::switchToTab), so a board is always reachable.
+        const bool wsShowEcad = (ws == WS::Electronics);
 
         // ---- Electronics workspace-entry auto-init (hoisted ABOVE drawLeftPane) ----
         // Must run before drawLeftPane (below) so its ECAD "PCB Manager" body (layout.cpp's
@@ -3037,8 +3041,10 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             // outside the ECAD window before its release could land — title-bar workspace tabs
             // included. That was the "stuck on the Electronics tab" input lockup.
             if (st.wantFocusEcad > 0) {
-                // Surfaced by an explicit ecad command from another workspace: ensure visible.
-                if (ws != WS::Electronics) st.showPcbTools = true;
+                // Surfaced by an explicit ecad command from another workspace: the editor now lives
+                // ONLY in the Electronics workspace (wsShowEcad above), so switch there to reveal it
+                // instead of the old showPcbTools overlay (which no longer un-hides the canvas).
+                if (ws != WS::Electronics) st.activeWorkspace = WS::Electronics;
                 ImGui::SetNextWindowFocus();
                 st.wantFocusEcad--;
             }

@@ -214,6 +214,7 @@ void AppState::switchToTab(int idx) {
     //     activeTabIsDrawing(). Re-fetch drawing_get on activation so source-part edits reflect.
     if (dst0.kind == DocTab::TabKind::Drawing) {
         activeTab = idx;
+        activeWorkspace = Workspace::Drawing;   // the sheet renders in the Drawing workspace
         animActive = false;
         reseatActiveSubsystems(nullptr);   // drawing tab: CAD subsystems fall back to the singletons
         // A drawing has no Assembly/PCB context; otherwise it keeps whatever ribbon was forward.
@@ -231,6 +232,7 @@ void AppState::switchToTab(int idx) {
     //     ecad_panel state() resolver targets this tab's per-document EcadEditorState.
     if (dst0.kind == DocTab::TabKind::Schematic || dst0.kind == DocTab::TabKind::PCB) {
         activeTab = idx;
+        activeWorkspace = Workspace::Electronics;   // the ECAD canvas only renders on this workspace
         animActive = false;
         reseatActiveSubsystems(nullptr);  // ECAD tab: CAD subsystems fall back to the singletons
         ecadDocId   = dst0.ecadDocId;     // mirror the active ECAD doc onto AppState (app.cpp helpers)
@@ -287,6 +289,13 @@ void AppState::switchToTab(int idx) {
     }
 
     activeTab = idx;
+    // A Part/Assembly renders in the 3D viewport, which is hosted by the Model / Simulate / Manufacture
+    // workspaces. Only pull to Model when the current workspace CAN'T host a 3D part (Electronics, PLM,
+    // Parts Library, AI, Reverse Eng) — so switching among parts inside Simulate/Manufacture doesn't
+    // yank the user back to Model.
+    if (activeWorkspace != Workspace::Model && activeWorkspace != Workspace::Simulate &&
+        activeWorkspace != Workspace::Manufacture)
+        activeWorkspace = Workspace::Model;
     // Re-seat the active PM / sketch / evaluate borrows at THIS document's session, then restore its
     // parked MODEL state (hidden-body mask + readouts + tree highlight) BEFORE loadDocMesh so the
     // mask is preserved across the rebuild. The viewport selection is restored AFTER the mesh load

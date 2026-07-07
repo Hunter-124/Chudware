@@ -764,7 +764,6 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
     if (pcb) {
         ui::fmSectionDivider("Layers");
         for (const auto& ly : m.layers()) layerRow(ly);
-        ImGui::Spacing();
         char netsHdr[32]; std::snprintf(netsHdr, sizeof(netsHdr), "Nets (%d)", (int)m.nets().size());
         ui::fmSectionDivider(netsHdr);
         for (const auto& n : m.nets()) netRow(n, /*withPins=*/false);
@@ -1198,7 +1197,13 @@ void drawEcadEditor(AppState& st) {
     if (hasDocNow && !prevHadDoc) ImGui::SetNextWindowFocus();  // applies to the Begin below
     prevHadDoc = hasDocNow;
 
-    if (!ImGui::Begin("ECAD")) { ImGui::End(); return; }
+    // Zero window padding so the PCB canvas is full-bleed like the 3D viewport — its edges reach the
+    // ribbon, the window sides, and the status bar (Hunter round: extend the grid flush to the frame
+    // so the PCB Manager / file strip / copilot get their proper spacing around it).
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    const bool ecadOpen = ImGui::Begin("ECAD");
+    ImGui::PopStyleVar();
+    if (!ecadOpen) { ImGui::End(); return; }
     ecadDockStripDraw(st);   // hide the redundant dock tab; app.cpp owns the filename strip
 
     if (!es.mirror.hasDoc()) {
@@ -1280,7 +1285,7 @@ void drawEcadEditor(AppState& st) {
 
     // Canvas.
     ImGui::BeginChild("##ecadCanvasHost",
-                      ImVec2(0, mainH), ImGuiChildFlags_Border,
+                      ImVec2(0, mainH), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     const ImVec2 canvasAvail = ImGui::GetContentRegionAvail();
     // Push the current selection + live drag offset into the canvas so it haloes the picked entity

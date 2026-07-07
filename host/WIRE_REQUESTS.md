@@ -88,3 +88,10 @@ Format:
      different position from step 1.
   Owner: workspace-shell (scenarios.cpp ownership). Body positions MUST differ between
   step 1 and step 2 screenshots to prove motion playback is live.
+
+## parts-plm agent requests
+- [ ] (parts-plm) `host/src/app.cpp` — After the PLM/PartsLibrary workspace blocks, wire a
+  `parts_insert_into_doc` RPC result handler: when the worker returns successfully from
+  `parts_insert_into_doc`, call `st.addToast("Part inserted into document", ToastLevel::Ok)`.
+  The RPC is already fired from parts_workspace.cpp; only the success toast is missing.
+  This is a low-priority polish item — the Insert button works silently without it.

@@ -139,6 +139,11 @@ void loadSettings(Settings& s) {
         s.theme = j.value("theme", "dark");
         s.units = (j.value("units", std::string("mmgs")) == "ips") ? Units::IPS : Units::MMGS;
         s.partsGridView = j.value("parts_grid_view", false);
+        s.partsSortMode = j.value("parts_sort_mode", 0);
+        s.partsExpandedCats.clear();
+        if (auto it = j.find("parts_expanded_categories"); it != j.end() && it->is_array())
+            for (const auto& e : *it)
+                if (e.is_string()) s.partsExpandedCats.push_back(e.get<std::string>());
         // v2.1 colored liquid glass ("appearance.glass"). Absent keys stay at their GlassStyle
         // sentinels (= inherit Global / built-in default: dynamic color ON, geometry as today),
         // so an old config.json with no "appearance" block loads to the out-of-box look.
@@ -256,6 +261,8 @@ void saveSettings(const Settings& s) {
     j["theme"] = s.theme;
     j["units"] = (s.units == Units::IPS) ? "ips" : "mmgs";
     j["parts_grid_view"] = s.partsGridView;
+    j["parts_sort_mode"] = s.partsSortMode;
+    j["parts_expanded_categories"] = s.partsExpandedCats;
     // v2.1 colored liquid glass. Emit only fields the user moved off their sentinel and only
     // groups with at least one such field, so a default config carries no "appearance" block.
     {

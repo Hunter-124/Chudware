@@ -1,0 +1,2535 @@
+{
+  "version": 1,
+  "categories": [
+    {
+      "id": "fasteners",
+      "label": "Fasteners",
+      "icon": "cat_fasteners",
+      "description": "Threaded fasteners and fixing hardware: bolts, screws, nuts, washers, rivets, anchors, inserts.",
+      "domains": [
+        "fastener",
+        "mech_family"
+      ],
+      "sites": [
+        "mcmaster",
+        "fastenal",
+        "grainger",
+        "homedepot",
+        "lowes",
+        "acehardware",
+        "amazon"
+      ],
+      "query_terms": [
+        "fastener"
+      ],
+      "facets": [
+        {
+          "key": "material",
+          "label": "Material",
+          "type": "enum",
+          "values": [
+            "steel",
+            "stainless",
+            "alloy steel",
+            "brass",
+            "nylon",
+            "titanium"
+          ]
+        },
+        {
+          "key": "finish",
+          "label": "Finish",
+          "type": "enum",
+          "values": [
+            "zinc",
+            "black oxide",
+            "plain",
+            "galvanized"
+          ]
+        }
+      ],
+      "children": [
+        {
+          "id": "fasteners.bolts_screws",
+          "label": "Bolts & Screws",
+          "description": "Externally threaded fasteners of all head styles.",
+          "query_terms": [
+            "bolt",
+            "screw"
+          ],
+          "facets": [
+            {
+              "key": "thread",
+              "label": "Thread",
+              "type": "enum",
+              "values": [
+                "M3",
+                "M4",
+                "M5",
+                "M6",
+                "M8",
+                "M10",
+                "M12",
+                "#4-40",
+                "#6-32",
+                "#8-32",
+                "#10-24",
+                "1/4-20",
+                "5/16-18",
+                "3/8-16",
+                "1/2-13"
+              ]
+            },
+            {
+              "key": "length_mm",
+              "label": "Length",
+              "type": "range",
+              "unit": "mm"
+            },
+            {
+              "key": "head",
+              "label": "Head Style",
+              "type": "text"
+            }
+          ],
+          "children": [
+            {
+              "id": "fasteners.bolts_screws.socket_head",
+              "label": "Socket Head",
+              "description": "Socket head cap screws (SHCS), hex drive.",
+              "query_terms": [
+                "socket head cap screw"
+              ]
+            },
+            {
+              "id": "fasteners.bolts_screws.hex",
+              "label": "Hex Head",
+              "description": "Hex head bolts and cap screws.",
+              "query_terms": [
+                "hex bolt",
+                "hex cap screw"
+              ]
+            },
+            {
+              "id": "fasteners.bolts_screws.button_flat",
+              "label": "Button & Flat Head",
+              "description": "Button head and flat/countersunk head screws.",
+              "query_terms": [
+                "button head screw",
+                "flat head screw"
+              ]
+            },
+            {
+              "id": "fasteners.bolts_screws.set_screws",
+              "label": "Set Screws",
+              "description": "Headless set screws (cup, cone, flat point).",
+              "query_terms": [
+                "set screw"
+              ]
+            },
+            {
+              "id": "fasteners.bolts_screws.wood_deck",
+              "label": "Wood & Deck Screws",
+              "description": "Wood, deck and construction screws.",
+              "query_terms": [
+                "wood screw",
+                "deck screw"
+              ]
+            },
+            {
+              "id": "fasteners.bolts_screws.sheet_metal",
+              "label": "Sheet Metal Screws",
+              "description": "Self-tapping and sheet-metal screws.",
+              "query_terms": [
+                "sheet metal screw",
+                "self tapping screw"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "fasteners.nuts",
+          "label": "Nuts",
+          "description": "Internally threaded fasteners.",
+          "query_terms": [
+            "nut"
+          ],
+          "facets": [
+            {
+              "key": "thread",
+              "label": "Thread",
+              "type": "enum",
+              "values": [
+                "M3",
+                "M4",
+                "M5",
+                "M6",
+                "M8",
+                "M10",
+                "M12",
+                "#4-40",
+                "#6-32",
+                "#8-32",
+                "#10-24",
+                "1/4-20",
+                "5/16-18",
+                "3/8-16",
+                "1/2-13"
+              ]
+            }
+          ],
+          "children": [
+            {
+              "id": "fasteners.nuts.hex",
+              "label": "Hex Nuts",
+              "query_terms": [
+                "hex nut"
+              ]
+            },
+            {
+              "id": "fasteners.nuts.lock",
+              "label": "Lock Nuts",
+              "description": "Nylon-insert and all-metal lock nuts.",
+              "query_terms": [
+                "lock nut",
+                "nylock nut"
+              ]
+            },
+            {
+              "id": "fasteners.nuts.wing",
+              "label": "Wing Nuts",
+              "query_terms": [
+                "wing nut"
+              ]
+            },
+            {
+              "id": "fasteners.nuts.t_nuts",
+              "label": "T-Nuts",
+              "description": "T-slot and pronged tee nuts.",
+              "query_terms": [
+                "t-nut",
+                "tee nut"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "fasteners.washers",
+          "label": "Washers",
+          "description": "Flat, lock and fender washers.",
+          "query_terms": [
+            "washer"
+          ],
+          "children": [
+            {
+              "id": "fasteners.washers.flat",
+              "label": "Flat Washers",
+              "query_terms": [
+                "flat washer"
+              ]
+            },
+            {
+              "id": "fasteners.washers.lock",
+              "label": "Lock Washers",
+              "description": "Split and tooth lock washers.",
+              "query_terms": [
+                "lock washer",
+                "split washer"
+              ]
+            },
+            {
+              "id": "fasteners.washers.fender",
+              "label": "Fender Washers",
+              "description": "Oversized-OD fender washers.",
+              "query_terms": [
+                "fender washer"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "fasteners.threaded_rod_studs",
+          "label": "Threaded Rod & Studs",
+          "description": "All-thread rod, studs and standoffs.",
+          "query_terms": [
+            "threaded rod",
+            "stud"
+          ],
+          "facets": [
+            {
+              "key": "thread",
+              "label": "Thread",
+              "type": "enum",
+              "values": [
+                "M3",
+                "M4",
+                "M5",
+                "M6",
+                "M8",
+                "M10",
+                "M12",
+                "#4-40",
+                "#6-32",
+                "#8-32",
+                "#10-24",
+                "1/4-20",
+                "5/16-18",
+                "3/8-16",
+                "1/2-13"
+              ]
+            },
+            {
+              "key": "length_mm",
+              "label": "Length",
+              "type": "range",
+              "unit": "mm"
+            }
+          ]
+        },
+        {
+          "id": "fasteners.rivets",
+          "label": "Rivets",
+          "description": "Blind/pop rivets and solid rivets.",
+          "query_terms": [
+            "rivet",
+            "pop rivet"
+          ]
+        },
+        {
+          "id": "fasteners.anchors",
+          "label": "Anchors",
+          "description": "Concrete, drywall and wedge anchors.",
+          "query_terms": [
+            "anchor",
+            "concrete anchor"
+          ]
+        },
+        {
+          "id": "fasteners.inserts_helicoils",
+          "label": "Inserts & Helicoils",
+          "description": "Threaded inserts, heat-set inserts and helical thread repair coils.",
+          "query_terms": [
+            "threaded insert",
+            "helicoil"
+          ],
+          "facets": [
+            {
+              "key": "thread",
+              "label": "Thread",
+              "type": "enum",
+              "values": [
+                "M3",
+                "M4",
+                "M5",
+                "M6",
+                "M8",
+                "M10",
+                "M12",
+                "#4-40",
+                "#6-32",
+                "#8-32",
+                "#10-24",
+                "1/4-20",
+                "5/16-18",
+                "3/8-16",
+                "1/2-13"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "bearings_motion",
+      "label": "Bearings & Motion",
+      "icon": "cat_bearings",
+      "description": "Rolling-element bearings, bushings and linear-motion components.",
+      "domains": [
+        "bearing"
+      ],
+      "sites": [
+        "mcmaster",
+        "grainger",
+        "amazon",
+        "misumi"
+      ],
+      "query_terms": [
+        "bearing"
+      ],
+      "children": [
+        {
+          "id": "bearings_motion.ball_bearings",
+          "label": "Ball Bearings",
+          "description": "Radial ball bearings.",
+          "query_terms": [
+            "ball bearing"
+          ],
+          "children": [
+            {
+              "id": "bearings_motion.ball_bearings.deep_groove",
+              "label": "Deep Groove",
+              "description": "Deep-groove radial ball bearings (60xx/62xx/63xx).",
+              "query_terms": [
+                "deep groove ball bearing"
+              ],
+              "facets": [
+                {
+                  "key": "bore_mm",
+                  "label": "Bore",
+                  "type": "range",
+                  "unit": "mm"
+                },
+                {
+                  "key": "od_mm",
+                  "label": "OD",
+                  "type": "range",
+                  "unit": "mm"
+                },
+                {
+                  "key": "width_mm",
+                  "label": "Width",
+                  "type": "range",
+                  "unit": "mm"
+                },
+                {
+                  "key": "seals",
+                  "label": "Seals",
+                  "type": "enum",
+                  "values": [
+                    "2RS",
+                    "ZZ",
+                    "open"
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "bearings_motion.ball_bearings.angular_contact",
+              "label": "Angular Contact",
+              "description": "Angular-contact ball bearings for combined loads.",
+              "query_terms": [
+                "angular contact bearing"
+              ],
+              "facets": [
+                {
+                  "key": "bore_mm",
+                  "label": "Bore",
+                  "type": "range",
+                  "unit": "mm"
+                },
+                {
+                  "key": "od_mm",
+                  "label": "OD",
+                  "type": "range",
+                  "unit": "mm"
+                }
+              ]
+            },
+            {
+              "id": "bearings_motion.ball_bearings.flanged",
+              "label": "Flanged",
+              "description": "Flanged ball bearings (F6xx series).",
+              "query_terms": [
+                "flanged ball bearing"
+              ],
+              "facets": [
+                {
+                  "key": "bore_mm",
+                  "label": "Bore",
+                  "type": "range",
+                  "unit": "mm"
+                },
+                {
+                  "key": "od_mm",
+                  "label": "OD",
+                  "type": "range",
+                  "unit": "mm"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "bearings_motion.roller_bearings",
+          "label": "Roller Bearings",
+          "description": "Cylindrical, tapered and needle roller bearings.",
+          "query_terms": [
+            "roller bearing",
+            "tapered roller bearing"
+          ]
+        },
+        {
+          "id": "bearings_motion.bushings_sleeves",
+          "label": "Bushings & Sleeves",
+          "description": "Plain bearings: bronze, oil-embedded and polymer bushings.",
+          "query_terms": [
+            "bushing",
+            "sleeve bearing"
+          ],
+          "facets": [
+            {
+              "key": "bore_mm",
+              "label": "Bore",
+              "type": "range",
+              "unit": "mm"
+            },
+            {
+              "key": "od_mm",
+              "label": "OD",
+              "type": "range",
+              "unit": "mm"
+            },
+            {
+              "key": "length_mm",
+              "label": "Length",
+              "type": "range",
+              "unit": "mm"
+            }
+          ]
+        },
+        {
+          "id": "bearings_motion.linear_rails_slides",
+          "label": "Linear Rails & Slides",
+          "description": "Profile rails, round rails, carriages and drawer slides.",
+          "query_terms": [
+            "linear rail",
+            "linear guide"
+          ],
+          "facets": [
+            {
+              "key": "rail_width_mm",
+              "label": "Rail Width",
+              "type": "range",
+              "unit": "mm"
+            },
+            {
+              "key": "length_mm",
+              "label": "Length",
+              "type": "range",
+              "unit": "mm"
+            }
+          ]
+        },
+        {
+          "id": "bearings_motion.lead_ball_screws",
+          "label": "Lead & Ball Screws",
+          "description": "Lead screws, ball screws and matching nuts.",
+          "query_terms": [
+            "lead screw",
+            "ball screw"
+          ],
+          "facets": [
+            {
+              "key": "diameter_mm",
+              "label": "Diameter",
+              "type": "range",
+              "unit": "mm"
+            },
+            {
+              "key": "lead_mm",
+              "label": "Lead",
+              "type": "range",
+              "unit": "mm"
+            }
+          ]
+        },
+        {
+          "id": "bearings_motion.rod_ends_spherical",
+          "label": "Rod Ends & Spherical",
+          "description": "Rod-end (heim) joints and spherical plain bearings.",
+          "query_terms": [
+            "rod end",
+            "heim joint",
+            "spherical bearing"
+          ]
+        },
+        {
+          "id": "bearings_motion.thrust_bearings",
+          "label": "Thrust Bearings",
+          "description": "Axial-load thrust ball and roller bearings.",
+          "query_terms": [
+            "thrust bearing"
+          ],
+          "facets": [
+            {
+              "key": "bore_mm",
+              "label": "Bore",
+              "type": "range",
+              "unit": "mm"
+            }
+          ]
+        },
+        {
+          "id": "bearings_motion.pillow_blocks",
+          "label": "Pillow Blocks",
+          "description": "Mounted bearing units: pillow blocks and flange blocks.",
+          "query_terms": [
+            "pillow block bearing"
+          ],
+          "facets": [
+            {
+              "key": "bore_mm",
+              "label": "Bore",
+              "type": "range",
+              "unit": "mm"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "structural_stock",
+      "label": "Structural & Stock",
+      "icon": "cat_stock_metal",
+      "description": "Raw stock: metal tube/bar/sheet, extrusions, structural shapes, lumber and plastic stock.",
+      "domains": [
+        "section"
+      ],
+      "sites": [
+        "onlinemetals",
+        "metalsdepot",
+        "homedepot",
+        "lowes",
+        "misumi"
+      ],
+      "children": [
+        {
+          "id": "structural_stock.metal_tube",
+          "label": "Metal Tube",
+          "description": "Round, square and rectangular metal tubing.",
+          "query_terms": [
+            "metal tube",
+            "tubing"
+          ],
+          "facets": [
+            {
+              "key": "alloy",
+              "label": "Alloy",
+              "type": "enum",
+              "values": [
+                "6061",
+                "6063",
+                "4130",
+                "1018",
+                "304",
+                "316",
+                "Ti-6Al-4V"
+              ]
+            },
+            {
+              "key": "od_mm",
+              "label": "OD",
+              "type": "range",
+              "unit": "mm"
+            },
+            {
+              "key": "wall_mm",
+              "label": "Wall",
+              "type": "range",
+              "unit": "mm"
+            },
+            {
+              "key": "length_mm",
+              "label": "Length",
+              "type": "range",
+              "unit": "mm"
+            }
+          ],
+          "children": [
+            {
+              "id": "structural_stock.metal_tube.round",
+              "label": "Round Tube",
+              "query_terms": [
+                "round tube"
+              ]
+            },
+            {
+              "id": "structural_stock.metal_tube.square",
+              "label": "Square Tube",
+              "query_terms": [
+                "square tube"
+              ]
+            },
+            {
+              "id": "structural_stock.metal_tube.rectangular",
+              "label": "Rectangular Tube",
+              "query_terms": [
+                "rectangular tube"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "structural_stock.metal_bar",
+          "label": "Metal Bar",
+          "description": "Solid bar stock.",
+          "query_terms": [
+            "bar stock"
+          ],
+          "facets": [
+            {
+              "key": "alloy",
+              "label": "Alloy",
+              "type": "enum",
+              "values": [
+                "6061",
+                "6063",
+                "4130",
+                "1018",
+                "304",
+                "316",
+                "Ti-6Al-4V"
+              ]
+            },
+            {
+              "key": "length_mm",
+              "label": "Length",
+              "type": "range",
+              "unit": "mm"
+            }
+          ],
+          "children": [
+            {
+              "id": "structural_stock.metal_bar.round",
+              "label": "Round Bar",
+              "query_terms": [
+                "round bar"
+              ],
+              "facets": [
+                {
+                  "key": "diameter_mm",
+                  "label": "Diameter",
+                  "type": "range",
+                  "unit": "mm"
+                }
+              ]
+            },
+            {
+              "id": "structural_stock.metal_bar.flat",
+              "label": "Flat Bar",
+              "query_terms": [
+                "flat bar"
+              ],
+              "facets": [
+                {
+                  "key": "width_mm",
+                  "label": "Width",
+                  "type": "range",
+                  "unit": "mm"
+                },
+                {
+                  "key": "thickness_mm",
+                  "label": "Thickness",
+                  "type": "range",
+                  "unit": "mm"
+                }
+              ]
+            },
+            {
+              "id": "structural_stock.metal_bar.hex",
+              "label": "Hex Bar",
+              "query_terms": [
+                "hex bar"
+              ],
+              "facets": [
+                {
+                  "key": "across_flats_mm",
+                  "label": "Across Flats",
+                  "type": "range",
+                  "unit": "mm"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "structural_stock.metal_sheet_plate",
+          "label": "Sheet & Plate",
+          "description": "Metal sheet and plate stock.",
+          "query_terms": [
+            "sheet metal",
+            "plate"
+          ],
+          "facets": [
+            {
+              "key": "alloy",
+              "label": "Alloy",
+              "type": "enum",
+              "values": [
+                "6061",
+                "6063",
+                "4130",
+                "1018",
+                "304",
+                "316",
+                "Ti-6Al-4V"
+              ]
+            },
+            {
+              "key": "thickness_mm",
+              "label": "Thickness",
+              "type": "range",
+              "unit": "mm"
+            }
+          ]
+        },
+        {
+          "id": "structural_stock.extrusions_tslot",
+          "label": "T-Slot Extrusions",
+          "description": "Aluminum T-slot framing extrusion (80/20 style).",
+          "query_terms": [
+            "t-slot extrusion",
+            "aluminum extrusion"
+          ],
+          "facets": [
+            {
+              "key": "series",
+              "label": "Series",
+              "type": "enum",
+              "values": [
+                "2020",
+                "2040",
+                "3030",
+                "4040"
+              ]
+            },
+            {
+              "key": "length_mm",
+              "label": "Length",
+              "type": "range",
+              "unit": "mm"
+            }
+          ]
+        },
+        {
+          "id": "structural_stock.structural_shapes",
+          "label": "Structural Shapes",
+          "description": "Hot-rolled structural sections.",
+          "query_terms": [
+            "structural steel"
+          ],
+          "children": [
+            {
+              "id": "structural_stock.structural_shapes.angle",
+              "label": "Angle",
+              "query_terms": [
+                "angle iron",
+                "steel angle"
+              ]
+            },
+            {
+              "id": "structural_stock.structural_shapes.channel",
+              "label": "Channel",
+              "query_terms": [
+                "steel channel"
+              ]
+            },
+            {
+              "id": "structural_stock.structural_shapes.beam",
+              "label": "Beam",
+              "query_terms": [
+                "I-beam",
+                "steel beam"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "structural_stock.lumber",
+          "label": "Lumber",
+          "description": "Dimensional lumber, plywood and sheet goods.",
+          "query_terms": [
+            "lumber",
+            "plywood"
+          ]
+        },
+        {
+          "id": "structural_stock.plastics_stock",
+          "label": "Plastics Stock",
+          "description": "Plastic sheet, rod and bar stock.",
+          "query_terms": [
+            "plastic stock",
+            "plastic sheet"
+          ],
+          "facets": [
+            {
+              "key": "material",
+              "label": "Material",
+              "type": "enum",
+              "values": [
+                "HDPE",
+                "UHMW",
+                "acetal",
+                "polycarbonate",
+                "acrylic",
+                "PLA stock"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "drivetrain",
+      "label": "Drivetrain",
+      "icon": "cat_drivetrain",
+      "description": "Power transmission: chains, sprockets, belts, gears, shafts and couplings.",
+      "domains": [
+        "mech_family"
+      ],
+      "sites": [
+        "mcmaster",
+        "grainger",
+        "amazon"
+      ],
+      "children": [
+        {
+          "id": "drivetrain.chains",
+          "label": "Chains",
+          "description": "Roller chain and bicycle chain.",
+          "query_terms": [
+            "chain"
+          ],
+          "children": [
+            {
+              "id": "drivetrain.chains.roller",
+              "label": "Roller Chain",
+              "query_terms": [
+                "roller chain"
+              ],
+              "facets": [
+                {
+                  "key": "pitch",
+                  "label": "Pitch",
+                  "type": "enum",
+                  "values": [
+                    "1/2 in bicycle",
+                    "#25",
+                    "#35",
+                    "#40",
+                    "#50"
+                  ]
+                },
+                {
+                  "key": "speed_count",
+                  "label": "Speeds",
+                  "type": "range"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "drivetrain.sprockets_chainrings",
+          "label": "Sprockets & Chainrings",
+          "description": "Chain sprockets and bicycle chainrings.",
+          "query_terms": [
+            "sprocket",
+            "chainring"
+          ],
+          "facets": [
+            {
+              "key": "teeth",
+              "label": "Teeth",
+              "type": "range"
+            },
+            {
+              "key": "bore_mm",
+              "label": "Bore",
+              "type": "range",
+              "unit": "mm"
+            }
+          ]
+        },
+        {
+          "id": "drivetrain.belts_pulleys",
+          "label": "Belts & Pulleys",
+          "description": "Timing belts, V-belts and matching pulleys.",
+          "query_terms": [
+            "timing belt",
+            "pulley"
+          ],
+          "facets": [
+            {
+              "key": "profile",
+              "label": "Profile",
+              "type": "enum",
+              "values": [
+                "GT2",
+                "GT3",
+                "HTD-5M",
+                "v-belt"
+              ]
+            },
+            {
+              "key": "width_mm",
+              "label": "Width",
+              "type": "range",
+              "unit": "mm"
+            }
+          ]
+        },
+        {
+          "id": "drivetrain.gears",
+          "label": "Gears",
+          "description": "Spur, helical, bevel and worm gears.",
+          "query_terms": [
+            "gear"
+          ],
+          "facets": [
+            {
+              "key": "module",
+              "label": "Module",
+              "type": "range"
+            },
+            {
+              "key": "teeth",
+              "label": "Teeth",
+              "type": "range"
+            }
+          ]
+        },
+        {
+          "id": "drivetrain.freewheels_hubs",
+          "label": "Freewheels & Hubs",
+          "description": "Freewheels, cassettes and wheel hubs.",
+          "query_terms": [
+            "freewheel",
+            "hub"
+          ]
+        },
+        {
+          "id": "drivetrain.cranks_pedals",
+          "label": "Cranks & Pedals",
+          "description": "Bicycle cranksets and pedals.",
+          "query_terms": [
+            "crankset",
+            "pedals"
+          ]
+        },
+        {
+          "id": "drivetrain.bottom_brackets_headsets",
+          "label": "Bottom Brackets & Headsets",
+          "description": "Bicycle bottom brackets and headsets.",
+          "query_terms": [
+            "bottom bracket",
+            "headset"
+          ]
+        },
+        {
+          "id": "drivetrain.shafts_couplings",
+          "label": "Shafts & Couplings",
+          "description": "Keyed/plain shafts and shaft couplings.",
+          "query_terms": [
+            "shaft",
+            "shaft coupling"
+          ],
+          "facets": [
+            {
+              "key": "bore_mm",
+              "label": "Bore",
+              "type": "range",
+              "unit": "mm"
+            }
+          ]
+        },
+        {
+          "id": "drivetrain.clutches_brakes",
+          "label": "Clutches & Brakes",
+          "description": "Mechanical clutches, brakes and disc rotors.",
+          "query_terms": [
+            "clutch",
+            "brake"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "wheels_tires_casters",
+      "label": "Wheels, Tires & Casters",
+      "icon": "cat_wheels",
+      "description": "Bicycle wheels, tires and tubes, casters and utility wheels.",
+      "domains": [
+        "mech_family"
+      ],
+      "sites": [
+        "amazon",
+        "harborfreight",
+        "tractorsupply",
+        "homedepot"
+      ],
+      "children": [
+        {
+          "id": "wheels_tires_casters.bicycle_wheels",
+          "label": "Bicycle Wheels",
+          "query_terms": [
+            "bicycle wheel"
+          ],
+          "facets": [
+            {
+              "key": "size",
+              "label": "Size",
+              "type": "enum",
+              "values": [
+                "16",
+                "20",
+                "24",
+                "26",
+                "27.5",
+                "29",
+                "700c"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "wheels_tires_casters.tires_tubes",
+          "label": "Tires & Tubes",
+          "query_terms": [
+            "bicycle tire",
+            "inner tube"
+          ],
+          "facets": [
+            {
+              "key": "diameter",
+              "label": "Diameter",
+              "type": "enum",
+              "values": [
+                "16",
+                "20",
+                "24",
+                "26",
+                "27.5",
+                "29",
+                "700c"
+              ]
+            },
+            {
+              "key": "width_in",
+              "label": "Width",
+              "type": "range",
+              "unit": "in"
+            }
+          ]
+        },
+        {
+          "id": "wheels_tires_casters.casters",
+          "label": "Casters",
+          "description": "Swivel, rigid and locking casters.",
+          "query_terms": [
+            "caster"
+          ],
+          "facets": [
+            {
+              "key": "wheel_diameter_mm",
+              "label": "Wheel Diameter",
+              "type": "range",
+              "unit": "mm"
+            },
+            {
+              "key": "capacity_kg",
+              "label": "Capacity",
+              "type": "range",
+              "unit": "kg"
+            },
+            {
+              "key": "type",
+              "label": "Type",
+              "type": "enum",
+              "values": [
+                "swivel",
+                "rigid",
+                "locking"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "wheels_tires_casters.hand_truck_wheels",
+          "label": "Hand Truck Wheels",
+          "description": "Pneumatic and solid utility wheels.",
+          "query_terms": [
+            "hand truck wheel",
+            "utility wheel"
+          ]
+        },
+        {
+          "id": "wheels_tires_casters.spokes_rims",
+          "label": "Spokes & Rims",
+          "query_terms": [
+            "spokes",
+            "bicycle rim"
+          ]
+        },
+        {
+          "id": "wheels_tires_casters.axles_quick_release",
+          "label": "Axles & Quick Release",
+          "query_terms": [
+            "axle",
+            "quick release skewer"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tools",
+      "label": "Tools",
+      "icon": "cat_tools",
+      "description": "Hand tools, power tools, cutting tools, measuring and workholding.",
+      "domains": [
+        "catalog"
+      ],
+      "sites": [
+        "harborfreight",
+        "homedepot",
+        "lowes",
+        "acehardware",
+        "grainger",
+        "amazon"
+      ],
+      "children": [
+        {
+          "id": "tools.hand_tools",
+          "label": "Hand Tools",
+          "query_terms": [
+            "hand tool"
+          ],
+          "children": [
+            {
+              "id": "tools.hand_tools.wrenches",
+              "label": "Wrenches",
+              "query_terms": [
+                "wrench"
+              ]
+            },
+            {
+              "id": "tools.hand_tools.screwdrivers",
+              "label": "Screwdrivers",
+              "query_terms": [
+                "screwdriver"
+              ]
+            },
+            {
+              "id": "tools.hand_tools.pliers",
+              "label": "Pliers",
+              "query_terms": [
+                "pliers"
+              ]
+            },
+            {
+              "id": "tools.hand_tools.hammers",
+              "label": "Hammers",
+              "query_terms": [
+                "hammer"
+              ]
+            },
+            {
+              "id": "tools.hand_tools.files",
+              "label": "Files",
+              "query_terms": [
+                "file set"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "tools.power_tools",
+          "label": "Power Tools",
+          "query_terms": [
+            "power tool"
+          ],
+          "children": [
+            {
+              "id": "tools.power_tools.drills",
+              "label": "Drills",
+              "query_terms": [
+                "drill",
+                "cordless drill"
+              ]
+            },
+            {
+              "id": "tools.power_tools.saws",
+              "label": "Saws",
+              "query_terms": [
+                "circular saw",
+                "jigsaw"
+              ]
+            },
+            {
+              "id": "tools.power_tools.grinders",
+              "label": "Grinders",
+              "query_terms": [
+                "angle grinder"
+              ]
+            },
+            {
+              "id": "tools.power_tools.sanders",
+              "label": "Sanders",
+              "query_terms": [
+                "orbital sander"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "tools.cutting_tools",
+          "label": "Cutting Tools",
+          "icon": "cat_cutting_tools",
+          "description": "Machining cutters: end mills, drills, taps, reamers, inserts.",
+          "sites": [
+            "mcmaster",
+            "grainger",
+            "amazon"
+          ],
+          "query_terms": [
+            "cutting tool"
+          ],
+          "children": [
+            {
+              "id": "tools.cutting_tools.end_mills",
+              "label": "End Mills",
+              "query_terms": [
+                "end mill"
+              ],
+              "facets": [
+                {
+                  "key": "tool_diameter_mm",
+                  "label": "Diameter",
+                  "type": "range",
+                  "unit": "mm"
+                },
+                {
+                  "key": "flutes",
+                  "label": "Flutes",
+                  "type": "enum",
+                  "values": [
+                    "1",
+                    "2",
+                    "3",
+                    "4",
+                    "5",
+                    "6"
+                  ]
+                },
+                {
+                  "key": "coating",
+                  "label": "Coating",
+                  "type": "enum",
+                  "values": [
+                    "uncoated",
+                    "TiN",
+                    "TiAlN",
+                    "AlTiN",
+                    "DLC"
+                  ]
+                },
+                {
+                  "key": "shank_diameter_mm",
+                  "label": "Shank Diameter",
+                  "type": "range",
+                  "unit": "mm"
+                },
+                {
+                  "key": "loc_mm",
+                  "label": "Length of Cut",
+                  "type": "range",
+                  "unit": "mm"
+                },
+                {
+                  "key": "material",
+                  "label": "Material",
+                  "type": "enum",
+                  "values": [
+                    "HSS",
+                    "carbide",
+                    "cobalt"
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "tools.cutting_tools.drills",
+              "label": "Drill Bits",
+              "query_terms": [
+                "drill bit"
+              ],
+              "facets": [
+                {
+                  "key": "diameter_mm",
+                  "label": "Diameter",
+                  "type": "range",
+                  "unit": "mm"
+                },
+                {
+                  "key": "type",
+                  "label": "Type",
+                  "type": "enum",
+                  "values": [
+                    "jobber",
+                    "stub",
+                    "taper"
+                  ]
+                },
+                {
+                  "key": "material",
+                  "label": "Material",
+                  "type": "enum",
+                  "values": [
+                    "HSS",
+                    "carbide",
+                    "cobalt"
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "tools.cutting_tools.taps_dies",
+              "label": "Taps & Dies",
+              "query_terms": [
+                "tap",
+                "die"
+              ],
+              "facets": [
+                {
+                  "key": "thread",
+                  "label": "Thread",
+                  "type": "enum",
+                  "values": [
+                    "M3",
+                    "M4",
+                    "M5",
+                    "M6",
+                    "M8",
+                    "M10",
+                    "M12",
+                    "#4-40",
+                    "#6-32",
+                    "#8-32",
+                    "#10-24",
+                    "1/4-20",
+                    "5/16-18",
+                    "3/8-16",
+                    "1/2-13"
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "tools.cutting_tools.reamers",
+              "label": "Reamers",
+              "query_terms": [
+                "reamer"
+              ],
+              "facets": [
+                {
+                  "key": "diameter_mm",
+                  "label": "Diameter",
+                  "type": "range",
+                  "unit": "mm"
+                }
+              ]
+            },
+            {
+              "id": "tools.cutting_tools.saw_blades",
+              "label": "Saw Blades",
+              "query_terms": [
+                "saw blade"
+              ]
+            },
+            {
+              "id": "tools.cutting_tools.inserts",
+              "label": "Indexable Inserts",
+              "query_terms": [
+                "carbide insert"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "tools.measuring",
+          "label": "Measuring",
+          "query_terms": [
+            "measuring tool"
+          ],
+          "children": [
+            {
+              "id": "tools.measuring.calipers",
+              "label": "Calipers",
+              "query_terms": [
+                "caliper"
+              ]
+            },
+            {
+              "id": "tools.measuring.micrometers",
+              "label": "Micrometers",
+              "query_terms": [
+                "micrometer"
+              ]
+            },
+            {
+              "id": "tools.measuring.squares",
+              "label": "Squares",
+              "query_terms": [
+                "machinist square"
+              ]
+            },
+            {
+              "id": "tools.measuring.indicators",
+              "label": "Indicators",
+              "query_terms": [
+                "dial indicator"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "tools.workholding",
+          "label": "Workholding",
+          "query_terms": [
+            "workholding"
+          ],
+          "children": [
+            {
+              "id": "tools.workholding.vises",
+              "label": "Vises",
+              "query_terms": [
+                "vise"
+              ]
+            },
+            {
+              "id": "tools.workholding.clamps",
+              "label": "Clamps",
+              "query_terms": [
+                "clamp"
+              ]
+            },
+            {
+              "id": "tools.workholding.parallels",
+              "label": "Parallels",
+              "query_terms": [
+                "parallels set"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "electronics",
+      "label": "Electronics",
+      "icon": "cat_electronics",
+      "description": "Electronic components, modules, wire, batteries, sensors and motors.",
+      "domains": [
+        "ecad"
+      ],
+      "sites": [
+        "lcsc",
+        "digikey_web",
+        "snapeda",
+        "jlcpcb",
+        "amazon"
+      ],
+      "children": [
+        {
+          "id": "electronics.passives",
+          "label": "Passives",
+          "description": "Resistors, capacitors, inductors.",
+          "facets": [
+            {
+              "key": "package",
+              "label": "Package",
+              "type": "enum",
+              "values": [
+                "0402",
+                "0603",
+                "0805",
+                "1206",
+                "THT"
+              ]
+            }
+          ],
+          "children": [
+            {
+              "id": "electronics.passives.resistors",
+              "label": "Resistors",
+              "query_terms": [
+                "resistor"
+              ]
+            },
+            {
+              "id": "electronics.passives.capacitors",
+              "label": "Capacitors",
+              "query_terms": [
+                "capacitor"
+              ]
+            },
+            {
+              "id": "electronics.passives.inductors",
+              "label": "Inductors",
+              "query_terms": [
+                "inductor"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "electronics.semiconductors",
+          "label": "Semiconductors",
+          "children": [
+            {
+              "id": "electronics.semiconductors.mcus",
+              "label": "Microcontrollers",
+              "query_terms": [
+                "microcontroller",
+                "MCU"
+              ]
+            },
+            {
+              "id": "electronics.semiconductors.transistors_mosfets",
+              "label": "Transistors & MOSFETs",
+              "query_terms": [
+                "transistor",
+                "MOSFET"
+              ]
+            },
+            {
+              "id": "electronics.semiconductors.diodes",
+              "label": "Diodes",
+              "query_terms": [
+                "diode"
+              ]
+            },
+            {
+              "id": "electronics.semiconductors.regulators",
+              "label": "Regulators",
+              "query_terms": [
+                "voltage regulator",
+                "LDO"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "electronics.connectors",
+          "label": "Connectors",
+          "query_terms": [
+            "connector"
+          ],
+          "facets": [
+            {
+              "key": "pitch_mm",
+              "label": "Pitch",
+              "type": "range",
+              "unit": "mm"
+            }
+          ]
+        },
+        {
+          "id": "electronics.pcb_modules",
+          "label": "PCB Modules",
+          "description": "Breakout boards and ready-made modules.",
+          "query_terms": [
+            "module",
+            "breakout board"
+          ]
+        },
+        {
+          "id": "electronics.wire_cable",
+          "label": "Wire & Cable",
+          "query_terms": [
+            "hookup wire",
+            "cable"
+          ],
+          "facets": [
+            {
+              "key": "awg",
+              "label": "AWG",
+              "type": "enum",
+              "values": [
+                "10",
+                "12",
+                "14",
+                "16",
+                "18",
+                "20",
+                "22",
+                "24",
+                "26",
+                "28",
+                "30"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "electronics.batteries_power",
+          "label": "Batteries & Power",
+          "query_terms": [
+            "battery",
+            "power supply"
+          ],
+          "facets": [
+            {
+              "key": "chemistry",
+              "label": "Chemistry",
+              "type": "enum",
+              "values": [
+                "li-ion",
+                "LiPo",
+                "LiFePO4",
+                "NiMH",
+                "alkaline",
+                "lead-acid"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "electronics.sensors",
+          "label": "Sensors",
+          "query_terms": [
+            "sensor"
+          ]
+        },
+        {
+          "id": "electronics.motors_actuators",
+          "label": "Motors & Actuators",
+          "query_terms": [
+            "motor",
+            "actuator"
+          ],
+          "facets": [
+            {
+              "key": "type",
+              "label": "Type",
+              "type": "enum",
+              "values": [
+                "stepper",
+                "BLDC",
+                "brushed",
+                "servo"
+              ]
+            },
+            {
+              "key": "voltage_v",
+              "label": "Voltage",
+              "type": "range",
+              "unit": "V"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fluid_power",
+      "label": "Fluid Power",
+      "icon": "cat_hydraulics",
+      "description": "Pneumatics, hydraulics, fittings and seals.",
+      "domains": [
+        "fitting",
+        "hydraulic"
+      ],
+      "sites": [
+        "mcmaster",
+        "grainger",
+        "tractorsupply"
+      ],
+      "children": [
+        {
+          "id": "fluid_power.pneumatic",
+          "label": "Pneumatic",
+          "query_terms": [
+            "pneumatic"
+          ],
+          "children": [
+            {
+              "id": "fluid_power.pneumatic.cylinders",
+              "label": "Cylinders",
+              "query_terms": [
+                "air cylinder"
+              ],
+              "facets": [
+                {
+                  "key": "bore_mm",
+                  "label": "Bore",
+                  "type": "range",
+                  "unit": "mm"
+                },
+                {
+                  "key": "stroke_mm",
+                  "label": "Stroke",
+                  "type": "range",
+                  "unit": "mm"
+                }
+              ]
+            },
+            {
+              "id": "fluid_power.pneumatic.valves",
+              "label": "Valves",
+              "query_terms": [
+                "solenoid valve",
+                "air valve"
+              ]
+            },
+            {
+              "id": "fluid_power.pneumatic.fittings_push",
+              "label": "Push-to-Connect Fittings",
+              "query_terms": [
+                "push to connect fitting"
+              ],
+              "facets": [
+                {
+                  "key": "tube_od_mm",
+                  "label": "Tube OD",
+                  "type": "range",
+                  "unit": "mm"
+                }
+              ]
+            },
+            {
+              "id": "fluid_power.pneumatic.tubing",
+              "label": "Tubing",
+              "query_terms": [
+                "pneumatic tubing"
+              ],
+              "facets": [
+                {
+                  "key": "od_mm",
+                  "label": "OD",
+                  "type": "range",
+                  "unit": "mm"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "fluid_power.hydraulic",
+          "label": "Hydraulic",
+          "query_terms": [
+            "hydraulic"
+          ],
+          "children": [
+            {
+              "id": "fluid_power.hydraulic.cylinders",
+              "label": "Cylinders",
+              "query_terms": [
+                "hydraulic cylinder"
+              ],
+              "facets": [
+                {
+                  "key": "bore_mm",
+                  "label": "Bore",
+                  "type": "range",
+                  "unit": "mm"
+                },
+                {
+                  "key": "stroke_mm",
+                  "label": "Stroke",
+                  "type": "range",
+                  "unit": "mm"
+                }
+              ]
+            },
+            {
+              "id": "fluid_power.hydraulic.pumps",
+              "label": "Pumps",
+              "query_terms": [
+                "hydraulic pump"
+              ]
+            },
+            {
+              "id": "fluid_power.hydraulic.hose",
+              "label": "Hose",
+              "query_terms": [
+                "hydraulic hose"
+              ],
+              "facets": [
+                {
+                  "key": "id_mm",
+                  "label": "ID",
+                  "type": "range",
+                  "unit": "mm"
+                },
+                {
+                  "key": "pressure_bar",
+                  "label": "Pressure",
+                  "type": "range",
+                  "unit": "bar"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "fluid_power.fittings_couplings",
+          "label": "Fittings & Couplings",
+          "description": "Threaded pipe fittings and quick couplings.",
+          "query_terms": [
+            "pipe fitting",
+            "coupling"
+          ],
+          "facets": [
+            {
+              "key": "thread",
+              "label": "Thread",
+              "type": "enum",
+              "values": [
+                "NPT",
+                "BSPP",
+                "AN",
+                "JIC"
+              ]
+            },
+            {
+              "key": "size",
+              "label": "Size",
+              "type": "text"
+            }
+          ]
+        },
+        {
+          "id": "fluid_power.seals_orings",
+          "label": "Seals & O-Rings",
+          "query_terms": [
+            "o-ring",
+            "seal"
+          ],
+          "facets": [
+            {
+              "key": "id_mm",
+              "label": "ID",
+              "type": "range",
+              "unit": "mm"
+            },
+            {
+              "key": "cross_section_mm",
+              "label": "Cross Section",
+              "type": "range",
+              "unit": "mm"
+            },
+            {
+              "key": "material",
+              "label": "Material",
+              "type": "enum",
+              "values": [
+                "buna",
+                "viton",
+                "silicone"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "hardware_misc",
+      "label": "Hardware & Misc",
+      "icon": "cat_hardware",
+      "description": "Springs, pins, hinges, knobs, magnets and general hardware.",
+      "domains": [
+        "mech_family"
+      ],
+      "sites": [
+        "mcmaster",
+        "homedepot",
+        "lowes",
+        "acehardware",
+        "amazon"
+      ],
+      "children": [
+        {
+          "id": "hardware_misc.springs",
+          "label": "Springs",
+          "query_terms": [
+            "spring"
+          ],
+          "facets": [
+            {
+              "key": "od_mm",
+              "label": "OD",
+              "type": "range",
+              "unit": "mm"
+            },
+            {
+              "key": "rate_n_mm",
+              "label": "Rate",
+              "type": "range",
+              "unit": "N/mm"
+            }
+          ],
+          "children": [
+            {
+              "id": "hardware_misc.springs.compression",
+              "label": "Compression",
+              "query_terms": [
+                "compression spring"
+              ]
+            },
+            {
+              "id": "hardware_misc.springs.extension",
+              "label": "Extension",
+              "query_terms": [
+                "extension spring"
+              ]
+            },
+            {
+              "id": "hardware_misc.springs.torsion",
+              "label": "Torsion",
+              "query_terms": [
+                "torsion spring"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "hardware_misc.pins_clips_retaining",
+          "label": "Pins, Clips & Retaining",
+          "query_terms": [
+            "pin",
+            "retaining ring"
+          ],
+          "children": [
+            {
+              "id": "hardware_misc.pins_clips_retaining.dowel",
+              "label": "Dowel Pins",
+              "query_terms": [
+                "dowel pin"
+              ],
+              "facets": [
+                {
+                  "key": "diameter_mm",
+                  "label": "Diameter",
+                  "type": "range",
+                  "unit": "mm"
+                },
+                {
+                  "key": "length_mm",
+                  "label": "Length",
+                  "type": "range",
+                  "unit": "mm"
+                }
+              ]
+            },
+            {
+              "id": "hardware_misc.pins_clips_retaining.cotter",
+              "label": "Cotter Pins",
+              "query_terms": [
+                "cotter pin"
+              ]
+            },
+            {
+              "id": "hardware_misc.pins_clips_retaining.circlips",
+              "label": "Circlips",
+              "query_terms": [
+                "circlip",
+                "snap ring"
+              ],
+              "facets": [
+                {
+                  "key": "shaft_mm",
+                  "label": "Shaft Diameter",
+                  "type": "range",
+                  "unit": "mm"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "hardware_misc.hinges_latches",
+          "label": "Hinges & Latches",
+          "query_terms": [
+            "hinge",
+            "latch"
+          ]
+        },
+        {
+          "id": "hardware_misc.knobs_handles_grips",
+          "label": "Knobs, Handles & Grips",
+          "query_terms": [
+            "knob",
+            "handle",
+            "grip"
+          ]
+        },
+        {
+          "id": "hardware_misc.magnets",
+          "label": "Magnets",
+          "query_terms": [
+            "magnet",
+            "neodymium magnet"
+          ],
+          "facets": [
+            {
+              "key": "diameter_mm",
+              "label": "Diameter",
+              "type": "range",
+              "unit": "mm"
+            },
+            {
+              "key": "pull_kg",
+              "label": "Pull Force",
+              "type": "range",
+              "unit": "kg"
+            }
+          ]
+        },
+        {
+          "id": "hardware_misc.grommets_bumpers",
+          "label": "Grommets & Bumpers",
+          "query_terms": [
+            "grommet",
+            "rubber bumper"
+          ]
+        },
+        {
+          "id": "hardware_misc.cable_management",
+          "label": "Cable Management",
+          "query_terms": [
+            "cable tie",
+            "cable clamp"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "adhesives_consumables",
+      "label": "Adhesives & Consumables",
+      "icon": "material",
+      "description": "Adhesives, tapes, lubricants, abrasives, welding consumables and coatings.",
+      "domains": [
+        "catalog"
+      ],
+      "sites": [
+        "homedepot",
+        "lowes",
+        "acehardware",
+        "amazon",
+        "grainger"
+      ],
+      "children": [
+        {
+          "id": "adhesives_consumables.adhesives_epoxy",
+          "label": "Adhesives & Epoxy",
+          "query_terms": [
+            "adhesive",
+            "epoxy"
+          ]
+        },
+        {
+          "id": "adhesives_consumables.tapes",
+          "label": "Tapes",
+          "query_terms": [
+            "tape"
+          ]
+        },
+        {
+          "id": "adhesives_consumables.lubricants",
+          "label": "Lubricants",
+          "query_terms": [
+            "lubricant",
+            "grease"
+          ]
+        },
+        {
+          "id": "adhesives_consumables.abrasives",
+          "label": "Abrasives",
+          "query_terms": [
+            "sandpaper",
+            "abrasive"
+          ],
+          "facets": [
+            {
+              "key": "grit",
+              "label": "Grit",
+              "type": "range"
+            }
+          ]
+        },
+        {
+          "id": "adhesives_consumables.welding_consumables",
+          "label": "Welding Consumables",
+          "query_terms": [
+            "welding wire",
+            "welding rod"
+          ],
+          "facets": [
+            {
+              "key": "process",
+              "label": "Process",
+              "type": "enum",
+              "values": [
+                "MIG",
+                "TIG",
+                "stick"
+              ]
+            },
+            {
+              "key": "diameter_mm",
+              "label": "Diameter",
+              "type": "range",
+              "unit": "mm"
+            }
+          ]
+        },
+        {
+          "id": "adhesives_consumables.paint_coatings",
+          "label": "Paint & Coatings",
+          "query_terms": [
+            "paint",
+            "coating"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "safety",
+      "label": "Safety",
+      "icon": "warning",
+      "description": "Personal protective equipment, guards, first aid and signage.",
+      "domains": [
+        "catalog"
+      ],
+      "sites": [
+        "grainger",
+        "homedepot",
+        "tractorsupply"
+      ],
+      "children": [
+        {
+          "id": "safety.ppe",
+          "label": "PPE",
+          "query_terms": [
+            "PPE",
+            "personal protective equipment"
+          ],
+          "children": [
+            {
+              "id": "safety.ppe.gloves",
+              "label": "Gloves",
+              "query_terms": [
+                "work gloves"
+              ]
+            },
+            {
+              "id": "safety.ppe.eye",
+              "label": "Eye Protection",
+              "query_terms": [
+                "safety glasses"
+              ]
+            },
+            {
+              "id": "safety.ppe.hearing",
+              "label": "Hearing Protection",
+              "query_terms": [
+                "ear protection",
+                "earmuffs"
+              ]
+            },
+            {
+              "id": "safety.ppe.respiratory",
+              "label": "Respiratory",
+              "query_terms": [
+                "respirator",
+                "dust mask"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "safety.guards_shields",
+          "label": "Guards & Shields",
+          "query_terms": [
+            "machine guard",
+            "shield"
+          ]
+        },
+        {
+          "id": "safety.first_aid",
+          "label": "First Aid",
+          "query_terms": [
+            "first aid kit"
+          ]
+        },
+        {
+          "id": "safety.signage_labels",
+          "label": "Signage & Labels",
+          "query_terms": [
+            "safety sign",
+            "warning label"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "vendors",
+      "label": "Vendors",
+      "icon": "vendor_globe",
+      "description": "Browse by vendor: pick a vendor type, then a site, then search within it",
+      "domains": [
+        "catalog"
+      ],
+      "children": [
+        {
+          "id": "vendors.cad_models",
+          "label": "CAD Models",
+          "icon": "vendor_globe",
+          "description": "Downloadable 3D models (STEP) and component geometry",
+          "sites": [
+            "grabcad",
+            "traceparts",
+            "3dcontentcentral",
+            "mcmaster",
+            "misumi"
+          ],
+          "children": [
+            {
+              "id": "vendors.cad_models.grabcad",
+              "label": "GrabCAD",
+              "icon": "vendor_globe",
+              "sites": [
+                "grabcad"
+              ]
+            },
+            {
+              "id": "vendors.cad_models.traceparts",
+              "label": "TraceParts",
+              "icon": "vendor_globe",
+              "sites": [
+                "traceparts"
+              ]
+            },
+            {
+              "id": "vendors.cad_models.3dcontentcentral",
+              "label": "3D ContentCentral",
+              "icon": "vendor_globe",
+              "sites": [
+                "3dcontentcentral"
+              ]
+            },
+            {
+              "id": "vendors.cad_models.mcmaster",
+              "label": "McMaster-Carr",
+              "icon": "vendor_globe",
+              "sites": [
+                "mcmaster"
+              ]
+            },
+            {
+              "id": "vendors.cad_models.misumi",
+              "label": "MISUMI",
+              "icon": "vendor_globe",
+              "sites": [
+                "misumi"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "vendors.electronics",
+          "label": "Electronics",
+          "icon": "vendor_globe",
+          "description": "Components, footprints, symbols, PCB fabs",
+          "sites": [
+            "lcsc",
+            "digikey",
+            "snapeda",
+            "jlcpcb",
+            "pcbway"
+          ],
+          "children": [
+            {
+              "id": "vendors.electronics.lcsc",
+              "label": "LCSC",
+              "icon": "vendor_globe",
+              "sites": [
+                "lcsc"
+              ]
+            },
+            {
+              "id": "vendors.electronics.digikey",
+              "label": "DigiKey",
+              "icon": "vendor_globe",
+              "sites": [
+                "digikey"
+              ]
+            },
+            {
+              "id": "vendors.electronics.snapeda",
+              "label": "SnapEDA",
+              "icon": "vendor_globe",
+              "sites": [
+                "snapeda"
+              ]
+            },
+            {
+              "id": "vendors.electronics.jlcpcb",
+              "label": "JLCPCB",
+              "icon": "vendor_globe",
+              "sites": [
+                "jlcpcb"
+              ]
+            },
+            {
+              "id": "vendors.electronics.pcbway",
+              "label": "PCBWay",
+              "icon": "vendor_globe",
+              "sites": [
+                "pcbway"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "vendors.industrial_supply",
+          "label": "Industrial Supply",
+          "icon": "vendor_globe",
+          "description": "Fasteners, hardware, MRO with rich spec data",
+          "sites": [
+            "mcmaster",
+            "grainger",
+            "fastenal",
+            "misumi"
+          ],
+          "children": [
+            {
+              "id": "vendors.industrial_supply.mcmaster",
+              "label": "McMaster-Carr",
+              "icon": "vendor_globe",
+              "sites": [
+                "mcmaster"
+              ]
+            },
+            {
+              "id": "vendors.industrial_supply.grainger",
+              "label": "Grainger",
+              "icon": "vendor_globe",
+              "sites": [
+                "grainger"
+              ]
+            },
+            {
+              "id": "vendors.industrial_supply.fastenal",
+              "label": "Fastenal",
+              "icon": "vendor_globe",
+              "sites": [
+                "fastenal"
+              ]
+            },
+            {
+              "id": "vendors.industrial_supply.misumi",
+              "label": "MISUMI",
+              "icon": "vendor_globe",
+              "sites": [
+                "misumi"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "vendors.hardware_stores",
+          "label": "Hardware Stores",
+          "icon": "vendor_globe",
+          "description": "Brick-and-mortar building supplies and tools",
+          "sites": [
+            "homedepot",
+            "lowes",
+            "acehardware",
+            "harborfreight",
+            "tractorsupply"
+          ],
+          "children": [
+            {
+              "id": "vendors.hardware_stores.homedepot",
+              "label": "Home Depot",
+              "icon": "vendor_globe",
+              "sites": [
+                "homedepot"
+              ]
+            },
+            {
+              "id": "vendors.hardware_stores.lowes",
+              "label": "Lowe's",
+              "icon": "vendor_globe",
+              "sites": [
+                "lowes"
+              ]
+            },
+            {
+              "id": "vendors.hardware_stores.acehardware",
+              "label": "Ace Hardware",
+              "icon": "vendor_globe",
+              "sites": [
+                "acehardware"
+              ]
+            },
+            {
+              "id": "vendors.hardware_stores.harborfreight",
+              "label": "Harbor Freight",
+              "icon": "vendor_globe",
+              "sites": [
+                "harborfreight"
+              ]
+            },
+            {
+              "id": "vendors.hardware_stores.tractorsupply",
+              "label": "Tractor Supply",
+              "icon": "vendor_globe",
+              "sites": [
+                "tractorsupply"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "vendors.metals_stock",
+          "label": "Metals & Stock",
+          "icon": "vendor_globe",
+          "description": "Cut-to-size metal tube, bar, sheet, plate",
+          "sites": [
+            "onlinemetals",
+            "metalsdepot"
+          ],
+          "children": [
+            {
+              "id": "vendors.metals_stock.onlinemetals",
+              "label": "OnlineMetals",
+              "icon": "vendor_globe",
+              "sites": [
+                "onlinemetals"
+              ]
+            },
+            {
+              "id": "vendors.metals_stock.metalsdepot",
+              "label": "Metals Depot",
+              "icon": "vendor_globe",
+              "sites": [
+                "metalsdepot"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "vendors.marketplaces",
+          "label": "Marketplaces",
+          "icon": "vendor_globe",
+          "description": "General marketplaces with known-measurement prefab items",
+          "sites": [
+            "amazon"
+          ],
+          "children": [
+            {
+              "id": "vendors.marketplaces.amazon",
+              "label": "Amazon",
+              "icon": "vendor_globe",
+              "sites": [
+                "amazon"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

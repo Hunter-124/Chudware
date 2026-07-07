@@ -25,7 +25,10 @@ from services.browser import adapters
 
 #: Every source with real adapter code (T-X2/T-X7). Kept in sync with the registry.
 EXPECTED_SITES = ("amazon", "grabcad", "jlcpcb", "mcmaster", "pcbway", "traceparts",
-                  "misumi", "lcsc", "digikey", "snapeda", "3dcontentcentral")
+                  "misumi", "lcsc", "digikey", "snapeda", "3dcontentcentral",
+                  # retail wave (Parts Library V2)
+                  "homedepot", "lowes", "acehardware", "grainger", "fastenal",
+                  "harborfreight", "tractorsupply", "onlinemetals", "metalsdepot")
 
 _ENABLED = os.environ.get("AICAD_BROWSER_INTEGRATION_TESTS") == "1"
 _gated = pytest.mark.skipif(

@@ -145,6 +145,12 @@ add_executable(AI-CAD
   # --- end C14 ---
   # --- [parts-plm sources] workspace bodies (parts-port agent appends here) ---
   src/ui/parts/parts_workspace.cpp
+  src/ui/parts/parts_widgets.cpp
+  src/ui/parts/parts_taxonomy_pane.cpp
+  src/ui/parts/parts_filters.cpp
+  src/ui/parts/parts_results.cpp
+  src/ui/parts/parts_vendors.cpp
+  src/ui/parts/parts_browser_panel.cpp
   src/ui/plm/plm_workspace.cpp
   src/ui/ai/ai_workspace.cpp
   # --- end [parts-plm sources] ---

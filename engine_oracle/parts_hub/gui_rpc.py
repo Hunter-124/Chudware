@@ -47,6 +47,15 @@ _SITE_LABELS: dict[str, str] = {
     "snapeda":          "SnapEDA",
     "content3d":        "3D ContentCentral",
     "3dcontentcentral": "3D ContentCentral",
+    "homedepot":        "Home Depot",
+    "lowes":            "Lowe's",
+    "acehardware":      "Ace Hardware",
+    "grainger":         "Grainger",
+    "fastenal":         "Fastenal",
+    "harborfreight":    "Harbor Freight",
+    "tractorsupply":    "Tractor Supply",
+    "onlinemetals":     "OnlineMetals",
+    "metalsdepot":      "Metals Depot",
 }
 
 # API pricing providers (engine_oracle/parts_providers.py) and the credential
@@ -174,19 +183,55 @@ def _parts_list_categories(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "reason": f"parts_list_categories failed: {exc}"}
 
 
+# ---- taxonomy (Parts Library V2) ---------------------------------------------------
+
+def _parts_taxonomy(params: dict, _emit: Callable) -> dict:
+    """Category taxonomy tree for the GUI — nodes carry EFFECTIVE (inherited) facets.
+
+    ``{category_id?}`` → ``{ok, version, tree}``; with a category_id, ``tree`` is
+    ``[that subtree]``. Unknown ids degrade to ok:false (never a traceback).
+    """
+    try:
+        from engine_oracle.parts_hub import taxonomy as _tax
+        cid = str((params or {}).get("category_id", "")).strip()
+        doc = _tax.load_taxonomy()
+        tree = _tax.flat_tree_for_gui(cid or None)
+        if cid and not tree:
+            return {"ok": False, "reason": f"unknown category_id: {cid!r}"}
+        return {"ok": True, "version": int(doc.get("version", 1)), "tree": tree}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"parts_taxonomy failed: {exc}"}
+
+
 # ---- search -----------------------------------------------------------------------
 
 def _parts_search(params: dict, _emit: Callable) -> dict:
     try:
         from engine_oracle.parts_hub import search as _search
         p = params or {}
-        query    = str(p.get("query", "")).strip()
-        category = str(p.get("category", "")).strip()
-        limit    = max(1, min(int(p.get("limit", 50)), 200))
+        query       = str(p.get("query", "")).strip()
+        category    = str(p.get("category", "")).strip()
+        category_id = str(p.get("category_id", "")).strip()
+        facets_q    = p.get("facets") if isinstance(p.get("facets"), dict) else {}
+        limit       = max(1, min(int(p.get("limit", 50)), 200))
 
-        domain: str | None = None
+        domain: str | list[str] | None = None
         site: str | None = None
-        if category.startswith("catalog:"):
+        route_sites: list[str] = []
+        query_terms: list[str] = []
+        facet_defs: list[dict] = []
+
+        if category_id:
+            # V2 taxonomy routing — unknown ids degrade to an unrouted search.
+            from engine_oracle.parts_hub import taxonomy as _tax
+            if _tax.get_node(category_id) is not None:
+                routing = _tax.route(category_id)
+                domain = routing["domains"] or None
+                route_sites = routing["sites"]
+                query_terms = routing["query_terms"]
+                facet_defs = _tax.effective_facets(category_id)
+        elif category.startswith("catalog:"):
+            # Legacy flat-category vocabulary (kept working verbatim).
             domain, site = "catalog", category.split(":", 1)[1]
         elif category:
             domain = category
@@ -195,6 +240,45 @@ def _parts_search(params: dict, _emit: Callable) -> dict:
         if site:
             prefix = f"catalog:{site}::"
             records = [r for r in records if str(r.get("part_id", "")).startswith(prefix)]
+
+        if category_id and route_sites:
+            # Category-routed live catalog search: restrict catalog records to the
+            # taxonomy's sites (unknown/absent adapters simply never match), with
+            # the node's query_terms appended to the vendor query.
+            vendor_query = " ".join([query] + [t for t in query_terms if t]).strip()
+            try:
+                cat_records = _search(vendor_query, domain="catalog", limit=limit)
+            except Exception:  # noqa: BLE001 — live layer optional
+                cat_records = []
+            prefixes = tuple(f"catalog:{s}::" for s in route_sites)
+            seen_ids = {str(r.get("part_id", "")) for r in records}
+            for rec in cat_records:
+                pid = str(rec.get("part_id", ""))
+                if pid.startswith(prefixes) and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    records.append(rec)
+
+        # Drop non-record stubs (e.g. login_required pass-throughs from the live
+        # catalog layer) — they have no part_id/title and would render as blank,
+        # ID-colliding rows.  Surface them as actionable notices instead.
+        notices: list[dict] = []
+        _seen_notice: set = set()
+        _clean: list[dict] = []
+        for r in records:
+            pid = str(r.get("part_id", "") or "")
+            title = str(r.get("title", "") or "").strip()
+            if pid and title:
+                _clean.append(r)
+                continue
+            n_site = str(r.get("site", "") or "")
+            if not n_site and pid.startswith("catalog:"):
+                n_site = pid[len("catalog:"):].split("::", 1)[0]
+            n_reason = str(r.get("reason", "") or "unavailable")
+            if (n_site, n_reason) not in _seen_notice:
+                _seen_notice.add((n_site, n_reason))
+                notices.append({"site": n_site, "reason": n_reason,
+                                "hint": str(r.get("hint", "") or "")})
+        records = _clean
 
         items = [_record_to_item(r) for r in records]
 
@@ -210,6 +294,14 @@ def _parts_search(params: dict, _emit: Callable) -> dict:
         vendor    = str(p.get("vendor", "")).strip().lower()
         source    = str(p.get("source", "")).strip().lower()  # "", "local", "live"
 
+        if facets_q:
+            # Facet post-filter (V2): match on the underlying record params using
+            # the category's effective facet definitions (empty defs → text match).
+            from engine_oracle.parts_hub.taxonomy import match_facets as _match_facets
+            pairs = [(i, r) for i, r in zip(items, records)
+                     if _match_facets(r.get("params") or {}, facets_q, facet_defs)]
+            items = [i for i, _ in pairs]
+
         if price_min > 0:
             items = [i for i in items if i["price_usd"] >= price_min]
         if price_max > 0:
@@ -222,7 +314,8 @@ def _parts_search(params: dict, _emit: Callable) -> dict:
             items = [i for i in items if i["source"] == source]
 
         has_live = any(i["source"] == "live" for i in items)
-        return {"ok": True, "count": len(items), "has_live": has_live, "results": items}
+        return {"ok": True, "count": len(items), "has_live": has_live,
+                "results": items, "notices": notices}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"parts_search failed: {exc}"}
 
@@ -415,6 +508,95 @@ def _vendor_creds_set(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "reason": f"vendor_creds_set failed: {exc}"}
 
 
+# ---- vendor health (Parts Library V2) ------------------------------------------------
+#
+# Same daemon-thread + poll idiom as vendor_login above: vendors_health_check kicks
+# off canary searches on a background thread and returns immediately; the GUI polls
+# vendors_health_status. The actual canary logic lives in services/browser/health
+# (another agent's module — imported lazily, absence degrades to ok:false).
+
+_health_lock = threading.Lock()
+_health_thread: threading.Thread | None = None
+_health_state: dict[str, Any] = {
+    "results": [], "started_ts": 0.0, "finished_ts": 0.0,
+}
+
+
+def _health_running() -> bool:
+    return bool(_health_thread and _health_thread.is_alive())
+
+
+def _vendors_health_check(params: dict, _emit: Callable) -> dict:
+    """Start a per-adapter canary health sweep — returns {ok, started} immediately.
+
+    ``{sites?: [..]}`` restricts the sweep; default is every registered adapter.
+    Results shape (polled via vendors_health_status):
+    ``[{site, ok, latency_ms, logged_in, hit_count, error}]``.
+    """
+    global _health_thread
+    try:
+        sites = (params or {}).get("sites") or None
+        if sites is not None and not isinstance(sites, list):
+            return {"ok": False, "error": "sites must be a list"}
+        try:
+            from services.browser import health as _health  # noqa: PLC0415
+        except Exception:  # noqa: BLE001 — module lands with the adapter workstream
+            return {"ok": False, "error": "health module not available"}
+
+        with _health_lock:
+            if _health_running():
+                return {"ok": True, "started": False, "already": True}
+
+            import time as _time
+            _health_state["results"] = []
+            _health_state["started_ts"] = _time.time()
+            _health_state["finished_ts"] = 0.0
+
+            # Accept either spelling of the entry point (run_health_check landed first).
+            _sweep = getattr(_health, "run_health_checks", None) or \
+                getattr(_health, "run_health_check", None)
+            if _sweep is None:
+                return {"ok": False, "error": "health module not available"}
+
+            def _run() -> None:
+                try:
+                    results = _sweep(sites=sites)
+                    with _health_lock:
+                        _health_state["results"] = list(results or [])
+                except Exception as exc:  # noqa: BLE001
+                    with _health_lock:
+                        _health_state["results"] = [
+                            {"site": s, "ok": False, "latency_ms": 0,
+                             "logged_in": False, "hit_count": 0, "error": str(exc)}
+                            for s in (sites or ["*"])
+                        ]
+                finally:
+                    with _health_lock:
+                        _health_state["finished_ts"] = _time.time()
+
+            t = threading.Thread(target=_run, name="vendors-health-check", daemon=True)
+            _health_thread = t
+            t.start()
+        return {"ok": True, "started": True}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"vendors_health_check failed: {exc}"}
+
+
+def _vendors_health_status(params: dict, _emit: Callable) -> dict:
+    """Poll the health sweep: {ok, running, results, started_ts, finished_ts}."""
+    try:
+        with _health_lock:
+            return {
+                "ok":          True,
+                "running":     _health_running(),
+                "results":     list(_health_state["results"]),
+                "started_ts":  _health_state["started_ts"],
+                "finished_ts": _health_state["finished_ts"],
+            }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"vendors_health_status failed: {exc}"}
+
+
 # ---- thumbnails ---------------------------------------------------------------------
 
 def _thumb_cache_dir():
@@ -453,7 +635,10 @@ def _parts_thumbnail(params: dict, _emit: Callable) -> dict:
 
 GUI_WORKER_METHODS: dict[str, Callable] = {
     "parts_list_categories": _parts_list_categories,
+    "parts_taxonomy":        _parts_taxonomy,
     "parts_search":          _parts_search,
+    "vendors_health_check":  _vendors_health_check,
+    "vendors_health_status": _vendors_health_status,
     "parts_download":        _parts_download,
     "parts_queue_status":    _parts_queue_status,
     "parts_insert_into_doc": _parts_insert_into_doc,

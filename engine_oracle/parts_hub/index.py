@@ -106,10 +106,15 @@ class PartsIndex:
     # ------------------------------------------------------------------
 
     def search(self, query: str, *,
-               domain: str | None = None,
+               domain: str | list[str] | None = None,
                limit: int = 20) -> list[dict]:
-        """Ranked FTS5 search. Returns PartRecord dicts, best-first."""
-        if not query and domain is None:
+        """Ranked FTS5 search. Returns PartRecord dicts, best-first.
+
+        ``domain`` may be a single domain string or a list of domains
+        (SQL ``IN (...)``) — Parts Library V2 taxonomy routing passes lists.
+        """
+        domains = _normalize_domains(domain)
+        if not query and domains is None:
             return self._enumerate(domain=None, limit=limit)
 
         conn = self._conn
@@ -119,7 +124,9 @@ class PartsIndex:
         fts_query = _build_fts_query(query)
 
         # Run the FTS query plus scoring.
-        domain_filter = "AND f.domain = ?" if domain else ""
+        domain_filter = ""
+        if domains:
+            domain_filter = "AND f.domain IN (%s)" % ",".join("?" * len(domains))
         params: list = []
 
         if fts_query:
@@ -138,18 +145,18 @@ class PartsIndex:
             LIMIT ?
             """
             params = [norm_q, norm_q + "%", fts_query]
-            if domain:
-                params.append(domain)
+            if domains:
+                params.extend(domains)
             params.append(limit)
         else:
             # Empty query with domain filter → enumerate.
-            return self._enumerate(domain=domain, limit=limit)
+            return self._enumerate(domain=domains, limit=limit)
 
         try:
             rows = conn.execute(sql, params).fetchall()
         except sqlite3.OperationalError:
             # FTS query parse error (e.g. empty after quoting) → fall back.
-            return self._enumerate(domain=domain, limit=limit)
+            return self._enumerate(domain=domains, limit=limit)
 
         results = []
         seen: set[str] = set()
@@ -164,12 +171,14 @@ class PartsIndex:
                 pass
         return results
 
-    def _enumerate(self, *, domain: str | None, limit: int) -> list[dict]:
-        """Return up to limit records, optionally filtered by domain."""
-        if domain:
+    def _enumerate(self, *, domain: str | list[str] | None, limit: int) -> list[dict]:
+        """Return up to limit records, optionally filtered by domain(s)."""
+        domains = _normalize_domains(domain)
+        if domains:
             rows = self._conn.execute(
-                "SELECT record_json FROM parts_meta WHERE domain=? LIMIT ?",
-                (domain, limit)
+                "SELECT record_json FROM parts_meta WHERE domain IN (%s) LIMIT ?"
+                % ",".join("?" * len(domains)),
+                (*domains, limit)
             ).fetchall()
         else:
             rows = self._conn.execute(
@@ -217,6 +226,16 @@ class PartsIndex:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _normalize_domains(domain: str | list | tuple | None) -> list[str] | None:
+    """Coerce a domain filter (str | list[str] | None) to a non-empty list or None."""
+    if domain is None:
+        return None
+    if isinstance(domain, str):
+        return [domain] if domain else None
+    domains = [str(d) for d in domain if d]
+    return domains or None
+
 
 def _record_to_row(rec: dict) -> tuple | None:
     """Convert a PartRecord dict to the (part_id, domain, designation, standard, record_json) tuple."""

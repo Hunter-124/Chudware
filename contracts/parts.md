@@ -180,3 +180,105 @@ adapters/parts_provider.py`'s `BrowserCatalogAdapter` wraps GrabCAD/TraceParts a
 session rather than a paid API — the parked `work/backlog/T-BL12.md` plan is a
 different mechanism for an overlapping catalog and is untouched by this. Both
 mechanisms can coexist behind this same seam if the paid-API plan is ever revived.
+
+## 7. Parts Library V2 — taxonomy, faceted search, vendor health (additive)
+
+> Added 2026-07-07 (workstream 1, Parts Library V2). Everything in this section is
+> ADDITIVE per §0 — no frozen field changes, no version bump. Producers:
+> `engine_oracle/parts_hub/taxonomy.json` + `taxonomy.py` + `gui_rpc.py`.
+> Consumers: the Parts Library workspace GUI (`host/src/ui/parts/`) and the
+> vendor-adapter workstream (`services/browser/`).
+
+### 7.1 `PartRecord.category_id` (new OPTIONAL field)
+
+| field | type | required | meaning |
+|---|---|---|---|
+| `category_id` | `str \| null` | no | Dotted taxonomy node id (§7.2) the record belongs to, e.g. `"fasteners.bolts_screws.socket_head"`. Absent on legacy records; adapters may set it when they can classify a hit. |
+
+### 7.2 Taxonomy node schema (`engine_oracle/parts_hub/taxonomy.json`)
+
+Top-level document: `{"version": 1, "categories": [<node>, ...]}` — 11 root folders.
+Node ids are dotted paths (`parent.child`), globally unique.
+
+```json
+{
+  "id": "fasteners.bolts_screws.socket_head",
+  "label": "Socket Head",
+  "icon": "cat_fasteners",
+  "description": "agent-facing hint",
+  "domains": ["fastener"],
+  "sites": ["mcmaster", "fastenal"],
+  "query_terms": ["socket head cap screw"],
+  "facets": [
+    {"key": "thread", "label": "Thread", "type": "enum", "values": ["M3", "M8"]},
+    {"key": "length_mm", "label": "Length", "type": "range", "unit": "mm"}
+  ],
+  "children": []
+}
+```
+
+Inheritance (root→leaf): `domains` / `sites` / `query_terms` EXTEND down the tree
+(parent values first, deduplicated); `facets` inherit with a child definition
+OVERRIDING its parent by `key`. Facet types:
+
+| type | definition | query shape | matching |
+|---|---|---|---|
+| `range` | `{key,label,type,unit?}` | `{min?,max?}` (or scalar = exact) | numeric parse with unit-suffix tolerance (`"6.35 mm"` → 6.35); list-valued params match if ANY element is in range |
+| `enum` | `{key,label,type,values[]}` | value or list of values | case-insensitive membership |
+| `text` | `{key,label,type}` | substring | case-insensitive substring |
+
+A queried facet whose key is missing from a record's `params` is a NON-match; facets
+not queried never exclude anything. Missing/corrupt `taxonomy.json` degrades to a
+built-in flat fallback tree (the seven legacy §0 domains) — never a traceback.
+
+### 7.3 `parts_taxonomy` worker RPC (new)
+
+`parts_taxonomy({category_id?})` →
+
+```json
+{"ok": true, "version": 1, "tree": [
+  {"id": "...", "label": "...", "icon": "...", "description": "...",
+   "facets": [/* EFFECTIVE (inherited+merged) facet defs */], "children": [/* ... */]}
+]}
+```
+
+Without `category_id`: `tree` is the list of the 11 root categories. With one:
+`tree` is `[that subtree]`. Unknown ids → `{"ok": false, "reason": ...}`.
+
+### 7.4 `parts_search` — new OPTIONAL params (GUI RPC)
+
+- `category_id` (str): taxonomy routing. The node's merged `domains` become the index
+  domain filter (list → SQL `IN`); its `sites` restrict `domain="catalog"` records to
+  `part_id` prefixes `catalog:<site>::`; its `query_terms` are appended to the vendor
+  query for the catalog leg. Unknown `category_id` degrades to an unrouted search
+  (ok:true). Sites without a registered adapter simply never match — routing tolerates
+  not-yet-existing adapters.
+- `facets` (dict): `{facet_key: query}` post-filter applied to record `params` via
+  §7.2 matching, using the category's effective facet definitions (no definition →
+  text matching).
+- The legacy `category` param keeps its exact pre-V2 semantics (fallback when no
+  `category_id` is given).
+
+`PartsHub.search()` / `PartsIndex.search()` / `engine_oracle.parts_hub.search()` now
+accept `domain: str | list[str] | None` (list → SQL `IN`) — additive signature widening.
+
+### 7.5 `vendors_health_check` / `vendors_health_status` worker RPCs (new)
+
+Same daemon-thread + poll idiom as `vendor_login` / `vendor_status`:
+
+- `vendors_health_check({sites?: [str]})` → `{"ok": true, "started": bool}`
+  (`already: true` when a sweep is in flight). Runs one canary search per adapter via
+  a lazy import of `services.browser.health` (`run_health_checks(sites=None)`, singular
+  `run_health_check` also accepted); if that module is absent →
+  `{"ok": false, "error": "health module not available"}`.
+- `vendors_health_status({})` →
+  `{"ok": true, "running": bool, "results": [...], "started_ts": float, "finished_ts": float}`
+  with each result row `{"site", "ok", "latency_ms", "logged_in", "hit_count", "error"}`
+  (extra additive keys allowed).
+
+### 7.6 New catalog sites (additive site keys)
+
+Nine site keys join the §6.3 browser-catalog vocabulary (labels in
+`gui_rpc._SITE_LABELS`); adapters land separately and absent adapters degrade to
+"never matches": `grainger`, `fastenal`, `homedepot`, `lowes`, `acehardware`,
+`harborfreight`, `tractorsupply`, `onlinemetals`, `metalsdepot`.

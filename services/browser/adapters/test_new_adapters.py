@@ -25,10 +25,15 @@ def adapter_mods(tmp_path, monkeypatch):
     importlib.reload(adapters_pkg)
     # Reloading the package resets _REGISTRY — re-register EVERY site module
     # (not just the ones under test) so the registry stays whole for later tests.
-    from services.browser.adapters import (amazon, content3d, digikey_web, grabcad, jlcpcb,
-                                           lcsc, mcmaster, misumi, pcbway, snapeda, traceparts)
+    from services.browser.adapters import (_retail, acehardware, amazon, content3d,
+                                           digikey_web, fastenal, grabcad, grainger,
+                                           harborfreight, homedepot, jlcpcb, lcsc, lowes,
+                                           mcmaster, metalsdepot, misumi, onlinemetals,
+                                           pcbway, snapeda, tractorsupply, traceparts)
     for mod in (amazon, grabcad, jlcpcb, mcmaster, pcbway, traceparts,
-                misumi, lcsc, digikey_web, snapeda, content3d):
+                misumi, lcsc, digikey_web, snapeda, content3d, _retail,
+                homedepot, lowes, acehardware, grainger, fastenal, harborfreight,
+                tractorsupply, onlinemetals, metalsdepot):
         importlib.reload(mod)
     yield adapters_pkg, session, misumi, lcsc, digikey_web, snapeda, content3d
     monkeypatch.delenv("APPDATA", raising=False)

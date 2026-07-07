@@ -158,6 +158,157 @@ class TestPartGet:
 # part_place — R1 editability assertion (DoD requirement)
 # ---------------------------------------------------------------------------
 
+class TestPartsTaxonomyRpc:
+    """Parts Library V2: the parts_taxonomy GUI RPC envelope."""
+
+    def _taxonomy(self, params=None):
+        from engine_oracle.parts_hub.gui_rpc import _parts_taxonomy
+        return _parts_taxonomy(params or {}, _noop_emit)
+
+    def test_registered_in_gui_worker_methods(self):
+        from engine_oracle.parts_hub.gui_rpc import GUI_WORKER_METHODS
+        for name in ("parts_taxonomy", "vendors_health_check", "vendors_health_status"):
+            assert name in GUI_WORKER_METHODS and callable(GUI_WORKER_METHODS[name])
+
+    def test_envelope(self):
+        r = self._taxonomy()
+        assert r.get("ok") is True
+        assert r.get("version") == 1
+        assert isinstance(r.get("tree"), list) and r["tree"]
+        node = r["tree"][0]
+        for key in ("id", "label", "icon", "description", "facets", "children"):
+            assert key in node, f"tree node missing {key!r}"
+
+    def test_subtree_by_category_id(self):
+        r = self._taxonomy({"category_id": "fasteners.bolts_screws"})
+        assert r.get("ok") is True
+        assert len(r["tree"]) == 1
+        assert r["tree"][0]["id"] == "fasteners.bolts_screws"
+
+    def test_unknown_category_id_ok_false_no_traceback(self):
+        r = self._taxonomy({"category_id": "no.such.category"})
+        assert r.get("ok") is False
+        assert "reason" in r
+
+
+class TestCategoryRoutedPartsSearch:
+    """Parts Library V2: parts_search with category_id routing + facet filters."""
+
+    def _gui_search(self, **params):
+        from engine_oracle.parts_hub.gui_rpc import _parts_search
+        return _parts_search(params, _noop_emit)
+
+    def test_category_routed_search(self):
+        """category_id fasteners routes to fastener/mech_family domains."""
+        r = self._gui_search(query="M8", category_id="fasteners")
+        assert r.get("ok") is True, f"routed search failed: {r}"
+        for item in r.get("results", []):
+            assert item["domain"] in ("fastener", "mech_family", "catalog"), \
+                f"category routing violated: {item['domain']!r}"
+
+    def test_unknown_category_id_degrades_gracefully(self):
+        """Unknown category_id must return ok:true (unrouted), never a traceback."""
+        r = self._gui_search(query="M8", category_id="no.such.category")
+        assert r.get("ok") is True
+        assert isinstance(r.get("results"), list)
+
+    def test_legacy_category_param_still_works(self):
+        r = self._gui_search(query="M8", category="fastener")
+        assert r.get("ok") is True
+        for item in r.get("results", []):
+            assert item["domain"] == "fastener"
+
+    def test_facet_range_filters_synthetic_bolt(self, monkeypatch):
+        """A facets length_mm range must keep the in-range bolt and drop the long one."""
+        import engine_oracle.parts_hub as hub_mod
+
+        def _fake_search(query, *, domain=None, filters=None, limit=20):
+            def bolt(pid, length):
+                return {"part_id": f"fastener:SYN:{pid}", "domain": "fastener",
+                        "title": f"Synthetic bolt {pid}", "designation": pid,
+                        "params": {"thread": "M8", "length_mm": length},
+                        "sourcing": [], "provenance": "test", "license": "clean-room"}
+            return [bolt("M8x20", "20 mm"), bolt("M8x80", 80)]
+
+        monkeypatch.setattr(hub_mod, "search", _fake_search)
+        r = self._gui_search(query="M8", category_id="fasteners.bolts_screws.hex",
+                             facets={"length_mm": {"min": 10, "max": 30}})
+        assert r.get("ok") is True, f"facet search failed: {r}"
+        ids = [item["id"] for item in r["results"]]
+        assert any(i.endswith("M8x20") for i in ids), f"in-range bolt dropped: {ids}"
+        assert not any(i.endswith("M8x80") for i in ids), f"out-of-range bolt kept: {ids}"
+
+    def test_facet_enum_filters_synthetic_bolt(self, monkeypatch):
+        import engine_oracle.parts_hub as hub_mod
+
+        def _fake_search(query, *, domain=None, filters=None, limit=20):
+            return [{"part_id": "fastener:SYN:M8", "domain": "fastener",
+                     "title": "Synthetic M8", "designation": "M8",
+                     "params": {"thread": "M8"}, "sourcing": [],
+                     "provenance": "test", "license": "clean-room"}]
+
+        monkeypatch.setattr(hub_mod, "search", _fake_search)
+        keep = self._gui_search(query="bolt", category_id="fasteners.bolts_screws.hex",
+                                facets={"thread": "m8"})
+        drop = self._gui_search(query="bolt", category_id="fasteners.bolts_screws.hex",
+                                facets={"thread": "M10"})
+        assert keep.get("ok") and len(keep["results"]) == 1
+        assert drop.get("ok") and len(drop["results"]) == 0
+
+
+class TestVendorsHealthRpc:
+    """Parts Library V2: vendors_health_check / vendors_health_status envelopes."""
+
+    def test_check_degrades_without_health_module(self):
+        """services.browser.health is another agent's module — absence must yield
+        the documented ok:false envelope (never a traceback). When it exists,
+        the call must return {ok:true, started:bool}."""
+        from engine_oracle.parts_hub.gui_rpc import _vendors_health_check
+        r = _vendors_health_check({}, _noop_emit)
+        assert "ok" in r
+        if r["ok"]:
+            assert "started" in r
+        else:
+            assert r.get("error") == "health module not available"
+
+    def test_check_rejects_non_list_sites(self):
+        from engine_oracle.parts_hub.gui_rpc import _vendors_health_check
+        r = _vendors_health_check({"sites": "mcmaster"}, _noop_emit)
+        assert r.get("ok") is False
+
+    def test_status_envelope(self):
+        from engine_oracle.parts_hub.gui_rpc import _vendors_health_status
+        r = _vendors_health_status({}, _noop_emit)
+        assert r.get("ok") is True
+        for key in ("running", "results", "started_ts", "finished_ts"):
+            assert key in r, f"status envelope missing {key!r}"
+        assert isinstance(r["results"], list)
+
+
+class TestDomainListSearch:
+    """Parts Library V2: PartsIndex/hub accept domain as a list (SQL IN)."""
+
+    def test_index_domain_list(self):
+        from engine_oracle.parts_hub import PartsIndex
+        idx = PartsIndex()
+        recs = [
+            {"part_id": "fastener:T:1", "domain": "fastener", "title": "bolt one", "params": {}},
+            {"part_id": "bearing:T:2", "domain": "bearing", "title": "bearing two", "params": {}},
+            {"part_id": "ecad:T:3", "domain": "ecad", "title": "chip three", "params": {}},
+        ]
+        idx.rebuild(iter(recs))
+        got = {r["domain"] for r in idx.search("", domain=["fastener", "bearing"], limit=10)}
+        assert got == {"fastener", "bearing"}
+        got_one = {r["domain"] for r in idx.search("", domain="ecad", limit=10)}
+        assert got_one == {"ecad"}
+
+    def test_hub_search_domain_list(self):
+        from engine_oracle.parts_hub import search as _search
+        recs = _search("M8", domain=["fastener", "mech_family"], limit=20)
+        for rec in recs:
+            assert rec["domain"] in ("fastener", "mech_family")
+
+
 class TestPartPlace:
     @pytest.fixture
     def placeable_part_id(self):

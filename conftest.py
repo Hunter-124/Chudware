@@ -107,3 +107,42 @@ def _isolated_subagent_registry(tmp_path_factory):
         yield
     finally:
         os.environ.pop("AICAD_SUBAGENTS_DIR", None)
+
+
+# ---------------------------------------------------------------------------
+# `live` marker (Parts Library V2): tests that hit real vendor sites over the
+# network under a saved browser profile. Skipped by default; opt in with
+# `pytest --live` or AICAD_LIVE_TESTS=1.
+
+def pytest_addoption(parser):
+    try:
+        parser.addoption("--live", action="store_true", default=False,
+                         help="run tests marked 'live' (real vendor sites, real network)")
+    except ValueError:
+        pass  # another plugin/conftest already registered --live
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "live: hits real vendor sites over the network; opt in with --live or AICAD_LIVE_TESTS=1",
+    )
+
+
+def _live_enabled(config) -> bool:
+    if os.environ.get("AICAD_LIVE_TESTS") == "1":
+        return True
+    try:
+        return bool(config.getoption("--live"))
+    except (ValueError, KeyError):
+        return False
+
+
+def pytest_collection_modifyitems(config, items):
+    if _live_enabled(config):
+        return
+    skip_live = _pytest.mark.skip(
+        reason="live vendor test — opt in with --live or AICAD_LIVE_TESTS=1")
+    for item in items:
+        if "live" in item.keywords:
+            item.add_marker(skip_live)

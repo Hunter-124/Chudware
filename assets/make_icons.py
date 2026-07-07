@@ -94,6 +94,11 @@ CONTRACT_NAMES: list[str] = [
     "cam_parallel3d", "cam_waterline3d", "cam_scallop3d", "cam_pocket3d",
     "cam_turn_rough", "cam_turn_finish", "cam_turn_face", "cam_turn_part",
     "cam_cut2d", "cam_probe",
+    # ---- Parts library (GUI V2, append-only): taxonomy category glyphs + panel chrome ----
+    "parts_all", "cat_fasteners", "cat_bearings", "cat_stock_metal",
+    "cat_drivetrain", "cat_wheels", "cat_tools", "cat_cutting_tools",
+    "cat_electronics", "cat_hydraulics", "cat_hardware",
+    "vendor_globe", "browser_panel", "filter_funnel", "health_check",
 ]
 
 # FM + ribbon-adjacent refresh scope (Agent 3 — fm_copilot_gui_rectify).
@@ -3155,6 +3160,279 @@ for _n, _fn in {
     "cam_cut2d": _cam_cut, "cam_probe": _cam_probe,
 }.items():
     _REGISTRY[_n] = _fn
+
+
+# ---------------------------------------------------------------------------
+# Parts library (GUI V2) — taxonomy category glyphs + panel chrome.
+# ---------------------------------------------------------------------------
+
+def _hexagon(cx, cy, r, rot=-90):
+    return [(cx + r * math.cos(math.radians(rot + i * 60)),
+             cy + r * math.sin(math.radians(rot + i * 60))) for i in range(6)]
+
+
+@icon("parts_all")
+def draw_parts_all(d, cell, p):
+    """Parts bin: open crate with a bolt, washer and cube inside."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # crate
+    d.polygon([(s*0.14, s*0.50), (s*0.86, s*0.50), (s*0.80, s*0.86), (s*0.20, s*0.86)],
+              fill=_rgba(p.stroke, 26), outline=p.stroke)
+    d.line([(s*0.14, s*0.50), (s*0.86, s*0.50), (s*0.80, s*0.86), (s*0.20, s*0.86),
+            (s*0.14, s*0.50)], fill=p.stroke, width=lw)
+    # cube part
+    shaded_prism(d, s, s*0.22, s*0.30, s*0.16, s*0.14, s*0.05, s*0.04, p)
+    # washer part
+    circle(d, s*0.56, s*0.32, s*0.10, outline=p.accent, lw=lw)
+    circle(d, s*0.56, s*0.32, s*0.04, outline=p.accent, lw=max(1, lw//2))
+    # bolt part
+    pts = _hexagon(s*0.80, s*0.26, s*0.08)
+    d.polygon(pts, fill=_rgba(p.stroke, 30))
+    d.line(pts + [pts[0]], fill=p.stroke, width=max(1, lw//2))
+    d.line([(s*0.80, s*0.34), (s*0.80, s*0.46)], fill=p.stroke, width=lw)
+
+
+@icon("cat_fasteners")
+def draw_cat_fasteners(d, cell, p):
+    """Hex bolt: hexagonal head + threaded shank."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx = s * 0.5
+    pts = _hexagon(cx, s*0.28, s*0.17)
+    d.polygon(pts, fill=_rgba(p.stroke, 30))
+    d.line(pts + [pts[0]], fill=p.stroke, width=lw)
+    # shank
+    d.rectangle([cx - s*0.06, s*0.42, cx + s*0.06, s*0.84], fill=_rgba(p.accent, 90),
+                outline=p.accent, width=lw)
+    # threads
+    for i in range(4):
+        y = s * (0.50 + i * 0.09)
+        d.line([(cx - s*0.10, y), (cx + s*0.10, y + s*0.03)], fill=p.stroke,
+               width=max(1, lw//2))
+
+
+@icon("cat_bearings")
+def draw_cat_bearings(d, cell, p):
+    """Ball bearing: outer + inner race with rolling balls between."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, cy = s*0.5, s*0.5
+    circle(d, cx, cy, s*0.38, outline=p.stroke, lw=lw)
+    circle(d, cx, cy, s*0.15, outline=p.stroke, lw=lw)
+    circle(d, cx, cy, s*0.15, fill=_rgba(p.stroke, 22))
+    for i in range(7):
+        a = math.radians(i * 360 / 7 - 90)
+        filled_circle(d, cx + s*0.265*math.cos(a), cy + s*0.265*math.sin(a),
+                      s*0.045, p.accent)
+
+
+@icon("cat_stock_metal")
+def draw_cat_stock_metal(d, cell, p):
+    """Raw stock: round tube + square bar + sheet stack."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # sheet stack (bottom)
+    for i in range(2):
+        y = s*0.70 + i*s*0.09
+        d.polygon([(s*0.16, y), (s*0.62, y), (s*0.84, y + s*0.07), (s*0.38, y + s*0.07)],
+                  fill=_rgba(p.stroke, 26), outline=p.stroke)
+    # square bar (middle-left, angled extrusion)
+    shaded_prism(d, s, s*0.16, s*0.36, s*0.22, s*0.18, s*0.16, s*0.10, p)
+    # round tube (right)
+    d.ellipse([s*0.58, s*0.14, s*0.86, s*0.40], outline=p.accent, width=lw)
+    d.ellipse([s*0.66, s*0.21, s*0.78, s*0.33], outline=p.accent, width=max(1, lw//2))
+
+
+@icon("cat_drivetrain")
+def draw_cat_drivetrain(d, cell, p):
+    """Sprocket with a chain link."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, cy = s*0.42, s*0.46
+    r = s*0.26
+    # teeth
+    for i in range(8):
+        a = math.radians(i * 45)
+        d.line([(cx + r*math.cos(a), cy + r*math.sin(a)),
+                (cx + (r + s*0.08)*math.cos(a), cy + (r + s*0.08)*math.sin(a))],
+               fill=p.stroke, width=lw)
+    circle(d, cx, cy, r, outline=p.stroke, lw=lw)
+    circle(d, cx, cy, s*0.08, outline=p.stroke, lw=lw)
+    # chain link (accent)
+    d.rounded_rectangle([s*0.58, s*0.62, s*0.90, s*0.80], radius=int(s*0.09),
+                        outline=p.accent, width=lw)
+    d.rounded_rectangle([s*0.66, s*0.67, s*0.82, s*0.75], radius=int(s*0.04),
+                        outline=p.accent, width=max(1, lw//2))
+
+
+@icon("cat_wheels")
+def draw_cat_wheels(d, cell, p):
+    """Wheel: tire + rim + hub with spokes."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, cy = s*0.5, s*0.5
+    circle(d, cx, cy, s*0.38, fill=_rgba(p.stroke, 26), outline=p.stroke, lw=lw)
+    circle(d, cx, cy, s*0.24, outline=p.accent, lw=lw)
+    circle(d, cx, cy, s*0.06, fill=_rgba(p.accent, 160))
+    for i in range(5):
+        a = math.radians(i * 72 - 90)
+        d.line([(cx + s*0.07*math.cos(a), cy + s*0.07*math.sin(a)),
+                (cx + s*0.23*math.cos(a), cy + s*0.23*math.sin(a))],
+               fill=p.accent, width=max(1, lw//2))
+
+
+@icon("cat_tools")
+def draw_cat_tools(d, cell, p):
+    """Open-end wrench, diagonal."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # handle
+    d.line([(s*0.30, s*0.70), (s*0.72, s*0.28)], fill=p.stroke, width=lw*3)
+    # head: open jaw (C shape) at top-right
+    d.arc([s*0.58, s*0.10, s*0.92, s*0.44], start=80, end=340, fill=p.stroke, width=lw*2)
+    # ring end at bottom-left
+    circle(d, s*0.26, s*0.74, s*0.11, outline=p.stroke, lw=lw*2)
+    circle(d, s*0.26, s*0.74, s*0.045, fill=_rgba(p.accent, 200))
+
+
+@icon("cat_cutting_tools")
+def draw_cat_cutting_tools(d, cell, p):
+    """End mill silhouette: shank + fluted cutting end."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx = s*0.5
+    # shank
+    d.rectangle([cx - s*0.09, s*0.10, cx + s*0.09, s*0.42], fill=_rgba(p.stroke, 40),
+                outline=p.stroke, width=lw)
+    # cutter body
+    d.rectangle([cx - s*0.13, s*0.42, cx + s*0.13, s*0.80], fill=_rgba(p.accent, 60),
+                outline=p.accent, width=lw)
+    # helical flutes
+    for i in range(3):
+        x0 = cx - s*0.13 + i * s*0.09
+        d.line([(x0, s*0.80), (x0 + s*0.08, s*0.46)], fill=p.stroke, width=max(1, lw//2))
+    # cutting tip corners
+    d.line([(cx - s*0.13, s*0.80), (cx - s*0.06, s*0.88), (cx + s*0.06, s*0.88),
+            (cx + s*0.13, s*0.80)], fill=p.accent, width=lw)
+
+
+@icon("cat_electronics")
+def draw_cat_electronics(d, cell, p):
+    """IC chip with pins + pin-1 dot."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rounded_rectangle([s*0.28, s*0.28, s*0.72, s*0.72], radius=int(s*0.04),
+                        fill=_rgba(p.stroke, 30), outline=p.stroke, width=lw)
+    for i in range(3):
+        t = s*(0.36 + i*0.14)
+        d.line([(s*0.14, t), (s*0.28, t)], fill=p.stroke, width=lw)
+        d.line([(s*0.72, t), (s*0.86, t)], fill=p.stroke, width=lw)
+        d.line([(t, s*0.14), (t, s*0.28)], fill=p.stroke, width=lw)
+        d.line([(t, s*0.72), (t, s*0.86)], fill=p.stroke, width=lw)
+    filled_circle(d, s*0.37, s*0.37, s*0.035, p.accent)
+
+
+@icon("cat_hydraulics")
+def draw_cat_hydraulics(d, cell, p):
+    """Hydraulic cylinder: barrel + extended rod + ports."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rounded_rectangle([s*0.10, s*0.36, s*0.58, s*0.64], radius=int(s*0.03),
+                        fill=_rgba(p.stroke, 30), outline=p.stroke, width=lw)
+    # piston line
+    d.line([(s*0.42, s*0.36), (s*0.42, s*0.64)], fill=p.stroke, width=lw)
+    # rod
+    d.rectangle([s*0.58, s*0.46, s*0.86, s*0.54], fill=_rgba(p.accent, 120),
+                outline=p.accent, width=max(1, lw//2))
+    # rod eye
+    circle(d, s*0.88, s*0.50, s*0.05, outline=p.accent, lw=lw)
+    # ports
+    d.line([(s*0.18, s*0.36), (s*0.18, s*0.24)], fill=p.accent, width=lw)
+    d.line([(s*0.50, s*0.36), (s*0.50, s*0.24)], fill=p.accent, width=lw)
+
+
+@icon("cat_hardware")
+def draw_cat_hardware(d, cell, p):
+    """Hex nut + washer pair."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    # nut (upper-left)
+    pts = _hexagon(s*0.38, s*0.38, s*0.22)
+    d.polygon(pts, fill=_rgba(p.stroke, 30))
+    d.line(pts + [pts[0]], fill=p.stroke, width=lw)
+    circle(d, s*0.38, s*0.38, s*0.09, outline=p.stroke, lw=lw)
+    # washer (lower-right, accent)
+    circle(d, s*0.68, s*0.68, s*0.18, fill=_rgba(p.accent, 50), outline=p.accent, lw=lw)
+    circle(d, s*0.68, s*0.68, s*0.07, outline=p.accent, lw=max(1, lw//2))
+
+
+@icon("vendor_globe")
+def draw_vendor_globe(d, cell, p):
+    """Globe: sphere with meridians + equator."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    cx, cy, r = s*0.5, s*0.5, s*0.34
+    circle(d, cx, cy, r, outline=p.stroke, lw=lw)
+    # equator + tropics
+    d.line([(cx - r, cy), (cx + r, cy)], fill=p.stroke, width=max(1, lw//2))
+    d.arc([cx - r, cy - r*0.55, cx + r, cy + r*1.45], start=215, end=325,
+          fill=_rgba(p.stroke, 140), width=max(1, lw//2))
+    d.arc([cx - r, cy - r*1.45, cx + r, cy + r*0.55], start=35, end=145,
+          fill=_rgba(p.stroke, 140), width=max(1, lw//2))
+    # meridians (accent)
+    d.ellipse([cx - r*0.45, cy - r, cx + r*0.45, cy + r], outline=p.accent,
+              width=max(1, lw//2))
+    d.line([(cx, cy - r), (cx, cy + r)], fill=p.accent, width=max(1, lw//2))
+
+
+@icon("browser_panel")
+def draw_browser_panel(d, cell, p):
+    """Embedded browser window: chrome bar + traffic dots + page."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rounded_rectangle([s*0.12, s*0.16, s*0.88, s*0.84], radius=int(s*0.05),
+                        outline=p.stroke, width=lw)
+    d.line([(s*0.12, s*0.34), (s*0.88, s*0.34)], fill=p.stroke, width=lw)
+    for i in range(3):
+        filled_circle(d, s*(0.21 + i*0.09), s*0.25, s*0.028,
+                      p.accent if i == 0 else p.stroke)
+    # address pill
+    d.rounded_rectangle([s*0.48, s*0.21, s*0.82, s*0.29], radius=int(s*0.035),
+                        outline=_rgba(p.stroke, 140), width=max(1, lw//2))
+    # page content lines
+    d.line([(s*0.20, s*0.46), (s*0.80, s*0.46)], fill=_rgba(p.accent, 200), width=lw)
+    d.line([(s*0.20, s*0.58), (s*0.70, s*0.58)], fill=_rgba(p.stroke, 140),
+           width=max(1, lw//2))
+    d.line([(s*0.20, s*0.68), (s*0.74, s*0.68)], fill=_rgba(p.stroke, 140),
+           width=max(1, lw//2))
+
+
+@icon("filter_funnel")
+def draw_filter_funnel(d, cell, p):
+    """Filter funnel with a drop."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.polygon([(s*0.16, s*0.18), (s*0.84, s*0.18), (s*0.58, s*0.50), (s*0.58, s*0.78),
+               (s*0.42, s*0.70), (s*0.42, s*0.50)],
+              fill=_rgba(p.stroke, 26))
+    d.line([(s*0.16, s*0.18), (s*0.84, s*0.18), (s*0.58, s*0.50), (s*0.58, s*0.78),
+            (s*0.42, s*0.70), (s*0.42, s*0.50), (s*0.16, s*0.18)],
+           fill=p.stroke, width=lw)
+    filled_circle(d, s*0.50, s*0.88, s*0.045, p.accent)
+
+
+@icon("health_check")
+def draw_health_check(d, cell, p):
+    """Service health: pulse/ECG line in a rounded frame."""
+    s = cell * SS
+    lw = stroke_width(cell)
+    d.rounded_rectangle([s*0.10, s*0.22, s*0.90, s*0.78], radius=int(s*0.06),
+                        outline=p.stroke, width=lw)
+    polyline(d, [(s*0.16, s*0.52), (s*0.34, s*0.52), (s*0.42, s*0.34),
+                 (s*0.52, s*0.66), (s*0.60, s*0.44), (s*0.66, s*0.52),
+                 (s*0.84, s*0.52)], p.accent, lw)
+    filled_circle(d, s*0.84, s*0.52, max(1, lw), p.accent)
 
 
 # ---------------------------------------------------------------------------

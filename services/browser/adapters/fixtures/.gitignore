@@ -1,0 +1,3 @@
+# Captured live search pages are local-dev artifacts — never committed
+# (copyrighted page content + constant markup churn).
+*.html

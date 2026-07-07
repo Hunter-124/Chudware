@@ -125,10 +125,13 @@ class PartsHub:
     # ------------------------------------------------------------------
 
     def search(self, query: str, *,
-               domain: str | None = None,
+               domain: str | list[str] | None = None,
                filters: dict | None = None,
                limit: int = 20) -> list[dict]:
         """Full-text search. Returns ranked PartRecord dicts.
+
+        ``domain`` accepts a single domain string or a list of domains
+        (taxonomy routing, Parts Library V2) — semantics otherwise unchanged.
 
         Primary: FTS5 index over all indexable providers.
         Fallback: when the index returns no results AND domain matches a live
@@ -140,6 +143,7 @@ class PartsHub:
         results = self._index.search(query, domain=domain, limit=limit)
         if results:
             return _dedupe_related(results)
+        domains = [domain] if isinstance(domain, str) else list(domain or [])
         # Fallback to live providers when the index has no hits.
         live_results: list[dict] = []
         for provider in self._registry.providers():
@@ -147,7 +151,7 @@ class PartsHub:
             if not _is_live_only(provider):
                 continue
             pdomain = getattr(provider, "domain", None)
-            if domain and pdomain and pdomain != domain:
+            if domains and pdomain and pdomain not in domains:
                 continue
             if callable(getattr(provider, "search", None)):
                 try:

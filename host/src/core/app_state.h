@@ -98,6 +98,12 @@ struct Settings {
     std::string theme = "dark";  // "dark" | "light" — persisted to config.json
     Units units = Units::MMGS;   // document display/input unit system — persisted to config.json
     bool partsGridView = false;  // Parts Library results as grid cards vs list — "parts_grid_view"
+    // Parts Library GUI V2: expanded taxonomy categories + result sort mode
+    // (0=Relevance 1=Price low→high 2=Price high→low 3=Name). Serialized as
+    // "parts_expanded_categories" / "parts_sort_mode"; mirrored into the parts workspace
+    // state on first frame like partsGridView, written back on change.
+    std::vector<std::string> partsExpandedCats;
+    int partsSortMode = 0;
     // v2.1 colored liquid glass: per-group tint/level/rounding/contrast knobs (+ dynamicColor,
     // ON by default) — persisted to config.json under "appearance.glass"; absent keys stay at
     // their GlassStyle sentinels (= inherit Global / built-in default). Mirrored into

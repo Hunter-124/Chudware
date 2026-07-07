@@ -33,7 +33,7 @@ def register_provider(provider: object) -> None:
 
 
 def search(query: str, *,
-           domain: str | None = None,
+           domain: str | list[str] | None = None,
            filters: dict | None = None,
            limit: int = 20) -> list[dict]:
     """Full-text search across all indexed providers. Returns ranked PartRecord dicts."""

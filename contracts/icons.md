@@ -85,3 +85,16 @@ cell is never blank.
 - **3D**: `cam_parallel3d, cam_waterline3d, cam_scallop3d, cam_pocket3d`
 - **Turning**: `cam_turn_rough, cam_turn_finish, cam_turn_face, cam_turn_part`
 - **Cutting**: `cam_cut2d, cam_probe`
+
+## Parts Library (GUI V2, append-only)
+
+The Parts Library workspace gets dedicated glyphs: one per taxonomy top-level category
+(drawn as the category's signature part — hex bolt, ball bearing, stock shapes, sprocket +
+chain, wheel, wrench, end mill, IC chip, hydraulic cylinder, nut + washer) plus panel
+chrome for the vendor/browser/filter/health UI. `host/src/ui/parts/parts_widgets.cpp`
+`partIcon()` maps taxonomy + legacy domain ids onto these names and falls back to the
+in-code `domainGlyph` vector art for unmapped ids, so a row is never icon-less.
+
+- **Categories**: `parts_all, cat_fasteners, cat_bearings, cat_stock_metal, cat_drivetrain,
+  cat_wheels, cat_tools, cat_cutting_tools, cat_electronics, cat_hydraulics, cat_hardware`
+- **Panel chrome**: `vendor_globe, browser_panel, filter_funnel, health_check`

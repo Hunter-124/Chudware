@@ -134,3 +134,5 @@ def download_dir(site: str) -> Path:
 # package's top level.
 from . import (amazon, content3d, digikey_web, grabcad, jlcpcb, lcsc, mcmaster,  # noqa: E402,F401
                misumi, pcbway, snapeda, traceparts)
+from . import (acehardware, fastenal, grainger, harborfreight, homedepot,  # noqa: E402,F401
+               lowes, metalsdepot, onlinemetals, tractorsupply)

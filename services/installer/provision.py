@@ -65,8 +65,12 @@ def _imports_ok(py: Path) -> bool:
         return False
     # Includes the deliverables/1 in-process engines (contract §7): they are required deps, so a
     # runtime missing python-pptx/docx/openpyxl/matplotlib/reportlab/pypdfium2 is NOT ready.
+    # dulwich backs the PLM vault (Pillar 19 version history); a venv missing it silently breaks
+    # every plm_* call with a no_vault envelope, so probe it too — a venv that predates the PLM
+    # dependency is then flagged not-ready and rebuilt instead of being reused as-is.
     probe = ("import build123d, pyvista, mcp, anthropic, openai; "
-             "import pptx, docx, openpyxl, matplotlib, reportlab, pypdfium2")
+             "import pptx, docx, openpyxl, matplotlib, reportlab, pypdfium2; "
+             "import playwright, dulwich")
     r = subprocess.run([str(py), "-c", probe], capture_output=True, text=True)
     return r.returncode == 0
 

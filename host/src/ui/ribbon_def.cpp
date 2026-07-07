@@ -22,7 +22,9 @@ static const RibbonCmd kCmds[] = {
 
     // --- Group: 3D Body ---
     { "extrude_boss",      "Extrude",        "extrude_boss",    "Features", "3D Body",         true,  nullptr,          false },
-    { "extrude_cut",       "Extrude Cut",    "extrude_cut",     "Features", "3D Body",         true,  nullptr,          false },
+    // Extrude Cut folded UNDER extrude_boss as a split-button variant (parity with revolve_cut).
+    // Default face = Extrude (Boss); the flyout injects the boss row so users can switch back.
+    { "extrude_cut",       "Extrude Cut",    "extrude_cut",     "Features", "3D Body",         false, "extrude_boss",   false },
     { "revolve_boss",      "Revolve",        "revolve_boss",    "Features", "3D Body",         true,  nullptr,          false },
     { "revolve_cut",       "Revolve Cut",    "revolve_cut",     "Features", "3D Body",         false, "revolve_boss",   false },
     { "sweep_boss",        "Sweep",          "sweep",           "Features", "3D Body",         true,  nullptr,          false },
@@ -31,11 +33,13 @@ static const RibbonCmd kCmds[] = {
     { "loft_cut",          "Loft Cut",       "loft_cut",        "Features", "3D Body",         false, "loft_boss",      false },
 
     // --- Group: Dress-up ---
+    // Fillet is the split-button parent; Chamfer folded under it (default face = Fillet).
     { "fillet",            "Fillet",         "fillet",          "Features", "Dress-up",        true,  nullptr,          false },
-    { "chamfer",           "Chamfer",        "chamfer",         "Features", "Dress-up",        true,  nullptr,          false },
+    { "chamfer",           "Chamfer",        "chamfer",         "Features", "Dress-up",        false, "fillet",         false },
     { "shell",             "Shell",          "shell",           "Features", "Dress-up",        true,  nullptr,          false },
-    { "draft",             "Draft",          "draft",           "Features", "Dress-up",        false, nullptr,          false },
-    { "rib",               "Rib",            "rib",             "Features", "Dress-up",        false, nullptr,          false },
+    // Draft is the split-button parent; Rib folded under it (default face = Draft).
+    { "draft",             "Draft",          "draft",           "Features", "Dress-up",        true,  nullptr,          false },
+    { "rib",               "Rib",            "rib",             "Features", "Dress-up",        false, "draft",          false },
 
     // --- Group: Hole ---
     { "hole_wizard",       "Hole Wizard",    "hole_wizard",     "Features", "Hole",            true,  nullptr,          false },
@@ -81,7 +85,12 @@ static const RibbonCmd kCmds[] = {
     { "sk_spline",         "Spline",         "spline",          "Sketch",   "Draw",            true,  nullptr,          false },
     { "sk_ellipse",        "Ellipse",        "ellipse",         "Sketch",   "Draw",            false, nullptr,          false },
     { "sk_point",          "Point",          "point_ent",       "Sketch",   "Draw",            false, nullptr,          false },
-    { "sk_text",           "Text",           "text_ent",        "Sketch",   "Draw",            false, nullptr,          false },
+    // Centerline: "for construction only" line with an exaggerated midpoint marker. No distinct
+    // engine centerline entity exists, so this is a construction-line variant (see sketch_mode.cpp
+    // SketchTool::Centerline). Positioned right after Point per the ribbon spec.
+    { "sk_centerline",     "Centerline",     "construction",    "Sketch",   "Draw",            false, nullptr,          false },
+    // Ellipse + Text promoted to tall/big tool buttons to match airfoil/spline/slot/polygon.
+    { "sk_text",           "Text",           "text_ent",        "Sketch",   "Draw",            true,  nullptr,          false },
 
     // --- Group: Smart Dimension ---
     { "smart_dim",         "Smart Dim.",     "smart_dim",       "Sketch",   "Dimension",       true,  nullptr,          false },
@@ -213,7 +222,7 @@ static const RibbonCmd kCmds[] = {
     // sk_ellipse_big is the split-button parent with sub-variants. W4-K: enabled (stretch=false) so
     // its default face shows the Ellipse icon+label (instead of the greyed generic look) and a plain
     // click opens the flyout. Sub-variants stay greyed (stretch=true, no engine support yet).
-    { "sk_ellipse_big",      "Ellipse",         "ellipse",          "Sketch", "Draw", false, nullptr,          false },
+    { "sk_ellipse_big",      "Ellipse",         "ellipse",          "Sketch", "Draw", true,  nullptr,          false },
     // C28-B: conic family wired to the C28-A engine contract (ellipse_arc/parabola/conic entities) —
     // enabled. (Worker errors at add-time are acceptable until the engine side merges.)
     { "sk_ellipse_partial",  "Partial Ellipse", "ellipse_partial",  "Sketch", "Draw", false, "sk_ellipse_big", false },
@@ -589,8 +598,11 @@ static const RibbonCmd kCmds[] = {
     // --- 3D Sketch (sketch3d features): entry point on Features + Sketch tabs. Creates a
     //     sketch3d feature and enters the free-space sketcher; the in-mode tools (line / 3-pt
     //     arc / spline / point, working-plane presets, constraints) live on the viewport
-    //     overlay toolbar (sketch3d_mode.cpp), not the ribbon. ---
-    { "sketch3d_new",      "3D Sketch",   "spline",          "Features", "Sketch",   true,  nullptr, false },
+    //     overlay toolbar (sketch3d_mode.cpp), not the ribbon. Relocated OFF the Features tab
+    //     into the Sketch tab's "Sketch" group so it sits right beside the "New Sketch" entry
+    //     (the injected kSketchNewOnSketchTab, same group). Command wiring (sketch3d_new)
+    //     unchanged — only tab/group/label moved. ---
+    { "sketch3d_new",      "New 3D Sketch", "spline",        "Sketch",   "Sketch",   true,  nullptr, false },
 };
 // clang-format on
 

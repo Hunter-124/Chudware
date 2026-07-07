@@ -296,6 +296,95 @@ class TestSketch3dMcpTools:
         # Should fail because sketch is empty OR because no current doc.
         assert r is not None and r.get("ok") is False
 
+    def test_sample_at_midpoint(self):
+        """sketch3d_sample_at should return the midpoint of a straight line at t=0.5."""
+        r0, _ = _call("sketch3d_new", {"name": "sample_line"})
+        sid = r0["id"]
+        _call("sketch3d_add_curves", {
+            "sketch3d_id": sid,
+            "curves": [{"kind": "line", "pts": [[0, 0, 0], [10, 0, 0]]}],
+        })
+        r, _ = _call("sketch3d_sample_at", {"sketch3d_id": sid, "t": 0.5})
+        assert r is not None and r.get("ok"), r
+        pt = r["point"]
+        assert abs(pt[0] - 5.0) < 0.01, f"Expected x=5 at t=0.5, got {pt}"
+        assert abs(pt[1]) < 0.01
+        assert abs(pt[2]) < 0.01
+        # Tangent should point along +X.
+        tang = r["tangent"]
+        assert abs(tang[0] - 1.0) < 0.01, f"Expected tangent x=1, got {tang}"
+
+    def test_sample_at_start_and_end(self):
+        """t=0.0 gives start, t=1.0 gives end."""
+        r0, _ = _call("sketch3d_new", {"name": "sample_endpoints"})
+        sid = r0["id"]
+        _call("sketch3d_add_curves", {
+            "sketch3d_id": sid,
+            "curves": [{"kind": "line", "pts": [[0, 0, 0], [0, 0, 20]]}],
+        })
+        r_start, _ = _call("sketch3d_sample_at", {"sketch3d_id": sid, "t": 0.0})
+        r_end, _ = _call("sketch3d_sample_at", {"sketch3d_id": sid, "t": 1.0})
+        assert r_start["ok"] and r_end["ok"]
+        assert abs(r_start["point"][2]) < 0.01, "Start z should be 0"
+        assert abs(r_end["point"][2] - 20.0) < 0.01, "End z should be 20"
+
+    def test_sample_at_empty_sketch_errors(self):
+        r0, _ = _call("sketch3d_new", {"name": "empty_sample"})
+        r, _ = _call("sketch3d_sample_at", {"sketch3d_id": r0["id"], "t": 0.5})
+        assert r is not None and r.get("ok") is False
+
+    def test_ledger_roundtrip(self):
+        """sketch3d_to_ledger → sketch3d_from_ledger should restore sketch geometry."""
+        # Create and populate a sketch.
+        r0, _ = _call("sketch3d_new", {"name": "ledger_test"})
+        sid = r0["id"]
+        _call("sketch3d_add_curves", {
+            "sketch3d_id": sid,
+            "curves": [
+                {"kind": "line",  "pts": [[0, 0, 0], [5, 0, 0]]},
+                {"kind": "spline", "pts": [[5, 0, 0], [7, 3, 0], [10, 0, 0]]},
+            ],
+        })
+        # Serialize to ledger payload.
+        r_out, _ = _call("sketch3d_to_ledger", {})
+        assert r_out is not None and r_out.get("ok"), r_out
+        assert r_out["sketch_count"] >= 1
+        payload = r_out["payload"]
+        assert isinstance(payload, str)
+
+        # Clear the store entry and restore from payload.
+        from mcp_server.sketch3d_tools import _STORE
+        del _STORE[sid]
+        r_in, _ = _call("sketch3d_from_ledger", {"payload": payload})
+        assert r_in is not None and r_in.get("ok"), r_in
+        assert sid in r_in.get("ids", []), f"{sid} not in restored ids: {r_in}"
+
+        # Verify geometry was restored.
+        r_get, _ = _call("sketch3d_get", {"sketch3d_id": sid})
+        assert r_get["ok"]
+        assert r_get["seg_count"] == 2
+
+    def test_ledger_skips_existing_ids(self):
+        """Restoring an already-existing id must not clobber it."""
+        r0, _ = _call("sketch3d_new", {"name": "no_clobber"})
+        sid = r0["id"]
+        _call("sketch3d_add_curves", {
+            "sketch3d_id": sid,
+            "curves": [{"kind": "line", "pts": [[0, 0, 0], [1, 0, 0]]}],
+        })
+        r_out, _ = _call("sketch3d_to_ledger", {})
+        payload = r_out["payload"]
+        # Restore while the id is still in the store.
+        r_in, _ = _call("sketch3d_from_ledger", {"payload": payload})
+        assert r_in["ok"]
+        assert sid in r_in.get("skipped_ids", []), (
+            f"Expected {sid} in skipped_ids: {r_in}"
+        )
+
+    def test_ledger_bad_payload_errors(self):
+        r, _ = _call("sketch3d_from_ledger", {"payload": "not-valid-json"})
+        assert r is not None and r.get("ok") is False
+
 
 # ─────────────────────────────────── engine-backed tests (skipped if no core) ─
 
@@ -324,9 +413,18 @@ class TestSketch3dEngineIntegration:
         r, _ = _call("sketch3d_as_sweep_guide",
                      {"sketch3d_id": sid, "role": "guide", "doc_id": doc_id})
         assert r is not None and r.get("ok"), f"sketch3d_as_sweep_guide failed: {r}"
-        assert "wire_id" in r
-        # guide_support flag reflects whether the engine build has the feature.
-        assert isinstance(r.get("guide_support"), bool)
+        # wire_id is an alias for sketch3d_id (Python-side only).
+        # The C++ engine dispatch does NOT yet forward a guides[] key from
+        # doc_apply_ops (core/doc/session.cpp has no guides wiring), so guide_support
+        # is always False.  When session.cpp gains the wiring, guide_support becomes True.
+        assert "wire_id" in r, f"Expected wire_id alias in response, got: {list(r.keys())}"
+        assert r["wire_id"] == sid, "wire_id should equal the sketch3d_id"
+        assert r.get("guide_support") is False, (
+            "guide_support must be False until session.cpp wires guides[] in doc_apply_ops"
+        )
+        # Workflow hint and coord_summary must be present for the driver.
+        assert "workflow_hint" in r
+        assert "coord_summary" in r
 
     def test_doc_sketch_contact_sheet_runs(self):
         doc_id = self._new_part("contact_sheet_test")
@@ -336,6 +434,30 @@ class TestSketch3dEngineIntegration:
         r, content = _call("doc_sketch_contact_sheet", {"doc_id": doc_id})
         # A list return means [Image, caption_text] — content will have ImageContent.
         assert content or r is not None  # Either structured or content returned
+
+    def test_sketch3d_section_at_runs(self):
+        """sketch3d_section_at should return ok and derive the correct plane from the path tangent."""
+        doc_id = self._new_part("section_at_test")
+        # Build a box so there's a solid to cut.
+        _call("add_features", {"ops": [{"op": "box", "dx": 30, "dy": 30, "dz": 50}],
+                               "doc_id": doc_id})
+        # Create a vertical path along Z.
+        r0, _ = _call("sketch3d_new", {"name": "section_path"})
+        sid = r0["id"]
+        _call("sketch3d_add_curves", {
+            "sketch3d_id": sid,
+            "curves": [{"kind": "line", "pts": [[0, 0, 0], [0, 0, 50]]}],
+        })
+        r, _ = _call("sketch3d_section_at",
+                     {"sketch3d_id": sid, "t": 0.5, "doc_id": doc_id})
+        assert r is not None and r.get("ok"), f"sketch3d_section_at failed: {r}"
+        # For a vertical path, tangent is along Z → plane_used should be 'top'.
+        assert r.get("plane_used") == "top", f"Expected 'top' plane, got {r.get('plane_used')}"
+        # t=0.5 on a 50-mm-long line: point should be at z=25.
+        assert abs(r["point"][2] - 25.0) < 0.1, f"Expected z=25 at t=0.5, got {r['point']}"
+        # area_mm2 is returned (may be 0 if plane passes outside the solid's origin-based bbox).
+        assert "area_mm2" in r
+        assert "summary" in r
 
 
 # ─────────────────────────────────────────────── __main__ runner ─────────────

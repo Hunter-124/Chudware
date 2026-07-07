@@ -7,23 +7,46 @@ Exposes to an AI driver the same capabilities the GUI gives a human in the Sketc
     sketch3d_add_curves(id, curves)      append lines / spline-polylines / arcs-in-space
     sketch3d_get(id)                     read back the wire geometry + bounding info
     sketch3d_clear(id)                   erase all entities from a 3D sketch
-    sketch3d_as_sweep_guide(id, doc_id)  inject the 3D sketch as a sweep guide-curve feature
-                                         into the current part doc (uses the guide-curve support
-                                         that landed in core/geom/features.* on this branch)
+    sketch3d_as_sweep_guide(id, doc_id)  record a 3D sketch as a designated sweep guide/spine
+                                         in the Python store and explain how to use it in a sweep
+                                         feature op.  NOTE: the doc feature schema (feature_params.md)
+                                         does NOT yet expose a guides[] ref on the sweep op — the
+                                         geom::sweep_profile C++ function accepts guides internally
+                                         but that wiring is not plumbed through doc_apply_ops yet.
+                                         This tool returns wire_id (= sketch3d_id) + a workflow hint.
+    sketch3d_sample_at(id, t)           sample a world-space point + tangent on the path at
+                                         fractional arc-length t ∈ [0,1] — useful for placing
+                                         profile sketch planes along a sweep spine
+    sketch3d_section_at(id, t, doc_id)  cross-section the part at the plane derived from the 3D
+                                         sketch tangent at t — in-app section-view parity for
+                                         sketch3d paths (calls eval_section_props)
+    sketch3d_to_ledger()                serialize all session 3D sketches to a JSON payload for
+                                         ledger_note persistence across MCP restarts
+    sketch3d_from_ledger(payload)       restore 3D sketches from a ledger_note payload
 
-    render_sketch(sketch, doc_id)        render a 2D sketch feature as an annotated flat image
-                                         PLUS a 3D view so an AI can see the sketch before extruding
+    render_sketch(sketch, doc_id)        render a 2D sketch's host part as a multi-view image so
+                                         an AI can see the model context before extruding.
+                                         NOTE: the engine has no sketch-isolated flat render RPC
+                                         (doc_render_sketch does not exist); this renders the solid
+                                         bodies via doc_render_view/doc_render_contact_sheet.
+                                         For the actual 2D sketch geometry (entity coords, dims,
+                                         DOF) use sketch_preview_text instead.
     sketch_preview_text(sketch, doc_id)  non-vision equivalent: full text description of a 2D sketch
                                          (entities, constraints, DOF, regions) — wraps describe_sketch
                                          with additional health narration
     doc_sketch_contact_sheet(doc_id)     multi-view tiled image of the whole doc with per-sketch
-                                         health summary — the quickest way to see ALL open sketches
-                                         + the solid in one shot
+                                         health summary — the quickest way to see the solid from
+                                         all standard angles + a sketch health table in the caption
 
 The 3D sketch store is in-process (Python dict, keyed by sketch3d id).  It is intentionally
 lightweight: points + typed curve segments, no constraint solver (matching the GUI first-slice).
 The geometry is serialisable to JSON so it can be round-tripped through ledger_note for
 multi-session persistence.
+
+Engine RPC methods actually available (verified against core/doc/session.cpp):
+  doc_render_png, doc_render_view, doc_render_contact_sheet — solid-body renders
+  sketch_health, doc_tree, doc_apply_ops, doc_sketch_overview, doc_sketch_regions
+  drawing_add_section — section views (lives in the drawing subsystem, not show_in_app)
 
 Registered onto the FastMCP instance by register_sketch3d_tools(mcp).
 """
@@ -163,20 +186,24 @@ def _seg_from_dict(spec: dict) -> _S3Seg:
     return _S3Seg(kind, pts, spec.get("meta"))
 
 
-def _sketch3d_as_wire_op(sk: _S3Sketch) -> dict:
-    """Convert a _S3Sketch to a wire_from_3d_sketch op payload for doc_apply_ops.
+def _sketch3d_as_guide_record(sk: _S3Sketch, role: str) -> dict:
+    """Serialise a _S3Sketch as a guide-record dict (Python store only — not a C++ op).
 
-    The engine's sweep_profile / loft_sections accept a ``spine`` or ``guides`` wire built
-    from 3D point sequences.  We encode this as an "add_wire_3d" op that the C++ session
-    dispatcher (core/doc/session.cpp apply_one) resolves to a TopoDS_Wire for use as
-    spine/guide. If the method isn't supported (pre-guide-curve build), we fall back to a
-    placeholder that at least records the intent in the feature tree for the human.
+    The sweep feature schema (feature_params.md) does NOT yet expose a guides[] ref — the
+    geom::sweep_profile C++ function accepts a guides vector internally but that parameter
+    is not wired through doc_apply_ops / apply_one.  Attempting "wire_from_3d_sketch" as an
+    op would raise 'unsupported' from apply_one.
+
+    This record is stored in the Python layer only.  The workflow hint returned by
+    sketch3d_as_sweep_guide tells the driver how to use the curve coords in a real sweep op.
     """
     return {
-        "op": "wire_from_3d_sketch",
         "sketch3d_id": sk.id,
         "name": sk.name,
+        "role": role,
         "segments": [s.to_dict() for s in sk.segs],
+        "total_length_mm": round(sk.total_length(), 4),
+        "bbox": sk.bbox(),
     }
 
 
@@ -305,34 +332,35 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
         role: str = "guide",
         doc_id: Optional[str] = None,
     ) -> str:
-        """Inject a 3D sketch as a sweep/loft SPINE or GUIDE CURVE into the current part doc.
+        """Record a 3D sketch as the designated sweep GUIDE or SPINE and get a workflow plan.
 
-        This bridges the 3D sketch (Python-side geometry) into the C++ feature engine so
-        the wire is available for a subsequent ``sweep`` or ``loft`` feature op.  The
-        guide-curve support in core/geom/features.sweep_profile (guides[] parameter) was
-        added on the fix/sweep-guide-curves branch — this tool is the MCP entry point for it.
+        CURRENT ENGINE LIMIT: the sweep feature schema (feature_params.md §sweep) does NOT
+        yet expose a guides[] ref through doc_apply_ops — geom::sweep_profile accepts guide
+        wires internally in C++ but that parameter is not wired to the doc feature dispatch.
+        Calling this tool does NOT inject geometry into the C++ engine; it stores the record
+        in the Python session store and returns a concrete workflow for using the 3D curve
+        coords in a real sweep feature.
 
-        sketch3d_id: the 3D sketch to inject.
-        role: "guide" (default) — a guide curve that drives profile orientation/scaling;
-              "spine" — the primary sweep path (overrides the sketch's spine if used in sweep).
-              Use "guide" when the sweep already has a 2D sketch spine and you want the
-              guide to shape the cross-section as it travels.
-        doc_id: part document to inject into (default: current part).
+        sketch3d_id: the 3D sketch to designate.
+        role: "guide" (default) — a guide curve that will drive profile orientation/scaling
+                                   when the engine wiring ships.
+              "spine" — the primary sweep path; use the returned coord summary to create a
+                        matching 2D helix or sketch path feature in the doc.
+        doc_id: part document context (used only for the workflow hint).
 
-        Workflow:
-          sketch3d_new("s") → sketch3d_add_curves("s", [...]) →
-          sketch3d_as_sweep_guide("s", role="guide") →
-          add_features([{"op":"sweep", "profile":"sk1", "spine":"sk2",
-                         "guides":["<wire_id_returned_here>"]}])
+        Workflow for SPINE (role="spine"):
+          1. Use the returned ``coord_summary`` to create a matching doc curve:
+             - For a straight-line path: add_features([{op:"sketch", ...line entities...}])
+             - For a helix: add_features([{op:"helix", pitch:P, height:H, base:"<cylinder>"}])
+          2. Reference that sketch/helix as the "spine" in the sweep op.
 
-        Returns {ok, wire_id, role, doc_id, summary} — wire_id is the feature id to pass
-        in the sweep op's ``guides`` list (or ``spine`` key if role=="spine").
+        Workflow for GUIDE (role="guide"):
+          Currently only one guide is consumed by MakePipeShell.  To approximate guide
+          behaviour: use orientation=2 (keep_normal) on the sweep, or build a loft between
+          sections that approximate the intended shape.
 
-        NOTE: if the engine build predates the guide-curve merge (core/geom/features.cpp
-        sweep_profile guides[] parameter), the wire feature is still stored in the doc's
-        feature tree as a reference geometry item and shown in render_part, but the sweep
-        won't pick it up until the engine is rebuilt.  The return includes a
-        ``guide_support`` flag so you can detect this case.
+        Returns {ok, sketch3d_id, role, guide_support, coord_summary, workflow_hint}.
+        guide_support is always False until the doc feature schema gains a guides[] ref.
         """
         try:
             sk = _s3get(sketch3d_id)
@@ -341,55 +369,60 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
                 return _dumps({"ok": False,
                                "error": "3D sketch is empty — call sketch3d_add_curves first"})
 
-            wire_op = _sketch3d_as_wire_op(sk)
-            wire_id = f"w3d_{sk.id}"
-            wire_op["id"] = wire_id
-            wire_op["role"] = role
+            record = _sketch3d_as_guide_record(sk, role)
+            # Store the designation so sketch3d_list / sketch3d_preview can show it.
+            sk.meta = getattr(sk, "meta", {})  # type: ignore[attr-defined]
+            if not hasattr(sk, "meta"):
+                sk.meta = {}  # type: ignore[attr-defined]
 
-            # Try to register the wire via doc_apply_ops.  The C++ session dispatcher
-            # handles "wire_from_3d_sketch" when the guide-curve branch is merged.
-            # If it returns an unknown-op error we record the intent as a reference_geom
-            # feature (so render_part can show it as a construction wire) and report the
-            # limitation.
-            guide_support = False
-            try:
-                r = cb.call("doc_apply_ops", {"doc_id": d, "ops": [wire_op]})
-                if r.get("ok") or "features" in r:
-                    guide_support = True
-            except CoreError as ce:
-                # "unknown op" / "unsupported" — engine predates guide curve merge
-                if "unknown" in str(ce).lower() or "unsupported" in str(ce).lower():
-                    guide_support = False
-                else:
-                    raise
-
-            pts_total = sum(len(s.pts) for s in sk.segs)
             length = sk.total_length()
-            summary = (
-                f"3D sketch '{sk.name}' ({len(sk.segs)} segment(s), "
-                f"{pts_total} pts, length {length:.1f} mm) injected as {role} wire {wire_id!r}"
-            )
-            if not guide_support:
-                summary += (
-                    " [NOTE: engine does not yet dispatch wire_from_3d_sketch — "
-                    "rebuild with guide-curve branch to activate sweep/loft integration]"
+            pts_total = sum(len(s.pts) for s in sk.segs)
+
+            # Build a compact coordinate summary the driver can use to recreate the path.
+            coord_lines: list[str] = []
+            for i, seg in enumerate(sk.segs):
+                pts_str = " → ".join(
+                    f"({p[0]:.2f},{p[1]:.2f},{p[2]:.2f})" for p in seg.pts
                 )
+                coord_lines.append(f"  seg[{i}] {seg.kind}: {pts_str}")
+            coord_summary = "\n".join(coord_lines)
+
+            if role == "spine":
+                workflow_hint = (
+                    "To use this 3D path as a sweep spine:\n"
+                    "  • Straight path: add a sketch with the same line entity, reference as sweep spine.\n"
+                    "  • Helical path: add_features([{op:'helix', pitch:P, height:H, base:'<edge>'}]) "
+                    "then use that helix feature id as the sweep spine.\n"
+                    "  • General spline: create a sketch with a spline entity matching these coords.\n"
+                    "Coords above can be used directly as sketch entity points."
+                )
+            else:
+                workflow_hint = (
+                    "Guide curve doc-schema wiring is pending (feature_params.md sweep has no guides[] yet).\n"
+                    "Current workaround options:\n"
+                    "  • Use orientation=2 (keep_normal) on the sweep to lock the profile orientation.\n"
+                    "  • Use a loft between cross-sections placed at the guide curve positions.\n"
+                    "  • When guide wiring ships, pass the guide sketch id in guides:[<id>] on the sweep op."
+                )
+
             return _dumps({
                 "ok": True,
-                "wire_id": wire_id,
+                "sketch3d_id": sketch3d_id,
+                # wire_id is an alias for sketch3d_id — callers that expect a
+                # "wire feature id" from an older contract get this key too.
+                "wire_id": sketch3d_id,
                 "role": role,
                 "doc_id": d,
-                "guide_support": guide_support,
+                # guide_support=False: geom::sweep_profile in C++ accepts guides[]
+                # internally (core/geom/features.cpp sweep_wire_solid) but the JSON
+                # dispatch in core/doc/session.cpp does NOT yet forward a guides key
+                # from doc_apply_ops.  Set to True once session.cpp wires it.
+                "guide_support": False,
                 "length_mm": round(length, 4),
                 "seg_count": len(sk.segs),
-                "summary": summary,
-                "next_step": (
-                    f'add_features([{{"op":"sweep","profile":"<sketch_id>",'
-                    f'"spine":"<spine_sketch_id>","guides":["{wire_id}"]}}])'
-                    if role == "guide" else
-                    f'add_features([{{"op":"sweep","profile":"<sketch_id>",'
-                    f'"spine":"{wire_id}"}}])'
-                ),
+                "point_count": pts_total,
+                "coord_summary": coord_summary,
+                "workflow_hint": workflow_hint,
             })
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -402,72 +435,71 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
         doc_id: Optional[str] = None,
         views: Optional[list] = None,
     ) -> Any:
-        """Render a 2D sketch feature as an ANNOTATED IMAGE so you can SEE it before extruding.
+        """Render the part containing a 2D sketch as a multi-view image.
 
-        Returns the sketch in TWO modes tiled side-by-side:
-          • Flat 2D (looking straight down the sketch normal) — shows entity shapes + dims
-          • Oblique 3D (iso camera) — shows where the sketch sits on the part
+        Shows the SOLID BODIES from standard camera angles so you can see the model context
+        around the sketch.  The caption includes the sketch health summary (DOF, closure).
 
-        sketch: the sketch feature id (e.g. "s1", "s2").
+        IMPORTANT LIMITS:
+          • The engine has no sketch-isolated flat-view RPC — there is no "doc_render_sketch"
+            method.  This renders solid bodies (doc_render_view / doc_render_contact_sheet),
+            not bare sketch wireframes.  If the doc has no solid geometry yet the call will
+            report "no bodies" and return an error.
+          • For the 2D sketch geometry itself (entity coords, constraint list, DOF, regions)
+            use sketch_preview_text — it gives full text without needing a rendered image.
+          • For section views through a built solid, use drawing_add_section (drawing subsystem).
+
+        sketch: the sketch feature id (e.g. "s1", "s2").  Used only for the health caption.
         doc_id: part document (default: current part).
-        views: override the camera list — a subset of ["flat", "iso", "front", "right", "top"]
-               (default: ["flat", "iso"]).  "flat" is the special sketch-normal view.
+        views: camera list — any subset of ["front","right","top","iso","left","back","bottom"]
+               (default: ["top", "iso"]).  "top" approximates the sketch-normal view for
+               XY-plane sketches.
 
-        Returns [image, caption]: the PNG plus a text summary (plane, entity count, DOF status,
-        any open endpoints) so a non-vision model still gets useful signal.
+        Returns [image, caption] — the PNG contact sheet plus a sketch health summary.
 
-        Workflow: edit sketch → render_sketch("s1") to SEE it → check_sketch("s1") for DOF →
-        add_features([{op:"extrude", sketch:"s1", depth:10}]) when fully-defined.
-
-        NOTE: if the engine does not support the "flat" sketch-normal view, falls back to
-        render_part(view="top") — the image will show the whole part from above, not just
-        the sketch plane.
+        Workflow: add_features([sketch+extrude]) → render_sketch("s1") to see the result →
+        sketch_preview_text("s1") for the 2D entity details → iterate.
         """
         try:
             d = _doc(doc_id)
-            view_list = views or ["flat", "iso"]
+            view_list = views or ["top", "iso"]
+            # Map any "flat" alias to "top" (there is no sketch-normal RPC).
+            view_list = ["top" if v == "flat" else v for v in view_list]
             png = _tmp(".png")
 
-            # First attempt: engine's dedicated sketch render (renders just the sketch plane
-            # content + entity annotations — the sketch overlay the user sees in the app).
+            # Try contact sheet first (multiple views tiled).
             rendered = False
-            caption_text = ""
             try:
-                r = cb.call("doc_render_sketch", {
+                r = cb.call("doc_render_contact_sheet", {
                     "doc_id": d,
-                    "sketch": sketch,
                     "out_path": png,
                     "views": view_list,
                 })
-                if r.get("ok") and os.path.exists(png):
-                    rendered = True
-                    caption_text = r.get("caption", "")
-            except (CoreError, Exception):  # noqa: BLE001
+                rendered = r.get("ok") and os.path.exists(png)
+            except Exception:  # noqa: BLE001
                 rendered = False
 
-            # Fallback: render the whole part (the sketch is visible as a construction
-            # overlay on the model) using the contact-sheet for multiple angles.
+            # Fallback: single iso render.
             if not rendered:
-                fallback_views = []
-                for v in view_list:
-                    if v == "flat":
-                        fallback_views.append("top")  # closest approximation to sketch-normal
-                    else:
-                        fallback_views.append(v)
-                r2 = cb.call("doc_render_contact_sheet", {
-                    "doc_id": d,
-                    "out_path": png,
-                    "views": fallback_views or ["top", "iso"],
+                try:
+                    r2 = cb.call("doc_render_view", {
+                        "doc_id": d,
+                        "out_path": png,
+                        "view": "iso",
+                    })
+                    rendered = r2.get("ok") and os.path.exists(png)
+                except Exception:  # noqa: BLE001
+                    rendered = False
+
+            if not rendered:
+                return _dumps({
+                    "ok": False,
+                    "error": (
+                        "could not render — no solid geometry built yet "
+                        "(the engine renders bodies, not bare sketch wires). "
+                        "Call sketch_preview_text for text-only sketch info."
+                    ),
                 })
-                if not r2.get("ok") or not os.path.exists(png):
-                    # Last resort: single iso render
-                    r3 = cb.call("doc_render_png", {"doc_id": d, "out_path": png})
-                    if not r3.get("ok") or not os.path.exists(png):
-                        return _dumps({
-                            "ok": False,
-                            "error": "could not render sketch — no geometry built yet?",
-                            "hint": "call add_features with a sketch op first, then render_sketch",
-                        })
 
             # Build a text caption enriched with sketch health info.
             health_text = ""
@@ -487,11 +519,8 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
             except Exception:  # noqa: BLE001
                 health_text = f"(sketch health unavailable for {sketch!r})"
 
-            full_caption = caption_text or f"Sketch {sketch!r} — {health_text}"
-            if caption_text and health_text:
-                full_caption = f"{caption_text}\n{health_text}"
-
-            return [Image(path=png), full_caption]
+            caption = f"Part render (views: {', '.join(view_list)})\n{health_text}"
+            return [Image(path=png), caption]
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -765,5 +794,291 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
                 "bbox": bb,
                 "total_length_mm": round(sk.total_length(), 4),
             })
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    # ──────────────────────────────────── 3D sketch path sampling ────────────────────────────────
+
+    @mcp.tool()
+    def sketch3d_sample_at(sketch3d_id: str, t: float = 0.5) -> str:
+        """Sample a POINT on a 3D sketch path at fractional arc-length parameter t ∈ [0, 1].
+
+        Walks the polyline chain (in segment order) to the fraction t of its total arc-length
+        and returns the interpolated world-space point plus the local tangent direction.  Useful
+        for placing profile sketches along a sweep spine, sizing a section cut, or locating a
+        datum point on a guide curve.
+
+        sketch3d_id: the 3D sketch to sample.
+        t: fraction of total arc-length, 0.0 = start of first segment, 1.0 = end of last.
+           Values outside [0, 1] are clamped.
+
+        Returns {ok, t, point:[x,y,z], tangent:[dx,dy,dz] (unit vector), seg_index,
+                 seg_t (local t within that segment), total_length_mm}.
+
+        Example: sketch3d_sample_at(id, 0.5) → midpoint of the sweep spine.
+        Use this point as a ``plane_origin`` for a profile sketch:
+          add_features([{op:'sketch', plane:'custom',
+                         plane_origin: <point>, plane_normal: <tangent>}])
+        """
+        try:
+            sk = _s3get(sketch3d_id)
+            if not sk.segs:
+                return _dumps({"ok": False, "error": "3D sketch is empty"})
+            t_clamped = max(0.0, min(1.0, float(t)))
+            total = sk.total_length()
+            if total < 1e-9:
+                # Degenerate zero-length sketch: return first point.
+                first_pt = sk.segs[0].pts[0]
+                return _dumps({
+                    "ok": True, "t": t_clamped, "point": first_pt,
+                    "tangent": [0.0, 0.0, 1.0], "seg_index": 0,
+                    "seg_t": 0.0, "total_length_mm": 0.0,
+                })
+            target = t_clamped * total
+            walked = 0.0
+            for seg_idx, seg in enumerate(sk.segs):
+                pts = seg.pts
+                for i in range(len(pts) - 1):
+                    a, b = pts[i], pts[i + 1]
+                    step = math.sqrt(sum((b[k] - a[k]) ** 2 for k in range(3)))
+                    if walked + step >= target - 1e-9:
+                        local_t = (target - walked) / step if step > 1e-9 else 0.0
+                        local_t = max(0.0, min(1.0, local_t))
+                        px = a[0] + local_t * (b[0] - a[0])
+                        py = a[1] + local_t * (b[1] - a[1])
+                        pz = a[2] + local_t * (b[2] - a[2])
+                        # Tangent = direction of this sub-segment, normalised.
+                        tlen = math.sqrt((b[0] - a[0]) ** 2 +
+                                         (b[1] - a[1]) ** 2 +
+                                         (b[2] - a[2]) ** 2)
+                        if tlen > 1e-12:
+                            tx = (b[0] - a[0]) / tlen
+                            ty = (b[1] - a[1]) / tlen
+                            tz = (b[2] - a[2]) / tlen
+                        else:
+                            tx, ty, tz = 0.0, 0.0, 1.0
+                        seg_local_t = (walked + local_t * step) / total
+                        return _dumps({
+                            "ok": True,
+                            "t": t_clamped,
+                            "point": [round(px, 4), round(py, 4), round(pz, 4)],
+                            "tangent": [round(tx, 6), round(ty, 6), round(tz, 6)],
+                            "seg_index": seg_idx,
+                            "seg_t": round(seg_local_t, 6),
+                            "total_length_mm": round(total, 4),
+                        })
+                    walked += step
+            # Reached end (floating point edge case): return last point.
+            last_seg = sk.segs[-1]
+            last_pt = last_seg.pts[-1]
+            prev_pt = last_seg.pts[-2] if len(last_seg.pts) > 1 else last_seg.pts[0]
+            dx = last_pt[0] - prev_pt[0]
+            dy = last_pt[1] - prev_pt[1]
+            dz = last_pt[2] - prev_pt[2]
+            tlen = math.sqrt(dx * dx + dy * dy + dz * dz)
+            tang = [dx / tlen, dy / tlen, dz / tlen] if tlen > 1e-12 else [0.0, 0.0, 1.0]
+            return _dumps({
+                "ok": True, "t": t_clamped,
+                "point": [round(last_pt[0], 4), round(last_pt[1], 4), round(last_pt[2], 4)],
+                "tangent": tang,
+                "seg_index": len(sk.segs) - 1,
+                "seg_t": 1.0,
+                "total_length_mm": round(total, 4),
+            })
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def sketch3d_section_at(
+        sketch3d_id: str,
+        t: float = 0.5,
+        doc_id: Optional[str] = None,
+    ) -> str:
+        """Cross-section the part at a plane derived from the 3D sketch path at parameter t.
+
+        Samples the path at fractional arc-length t ∈ [0,1] to get a world point + tangent,
+        then calls the engine's cross-section probe (eval_section_props) using that tangent
+        as the section plane normal.  This is the MCP equivalent of the GUI's 'Section at
+        point along sweep spine' inspector — see the solid's cross-section AT any point along
+        a 3D sketch path without leaving the sketch3d workflow.
+
+        sketch3d_id: the 3D sketch whose path sets the cutting plane origin + normal.
+        t: arc-length fraction — 0.0 = sketch start, 0.5 = midpoint, 1.0 = sketch end.
+        doc_id: part document to section (default: current part).
+
+        Plane mapping:
+          • tangent along X → section plane 'right'  (YZ normal)
+          • tangent along Y → section plane 'front'  (XZ normal)
+          • tangent along Z → section plane 'top'    (XY normal)
+          • otherwise       → nearest reserved plane ('top'/'front'/'right')
+
+        Returns {ok, t, point, tangent, plane_used, area_mm2, centroid, Ixx, Iyy, Ixy, summary}.
+        If the doc has no solid geometry the area will be 0 (no bodies to cut).
+
+        Workflow example:
+          sketch3d_sample_at(id, 0.25)  → inspect the point
+          sketch3d_section_at(id, 0.25) → verify cross-section at that point
+          add_features([{op:'sweep', profile:'sk1', spine:'sk2'}])
+          sketch3d_section_at(id, 0.5)  → check mid-sweep cross-section after build
+        """
+        try:
+            sk = _s3get(sketch3d_id)
+            d = _doc(doc_id)
+            if not sk.segs:
+                return _dumps({"ok": False, "error": "3D sketch is empty"})
+
+            # Sample the path at t to get the cutting plane normal.
+            t_clamped = max(0.0, min(1.0, float(t)))
+            total = sk.total_length()
+            target = t_clamped * total
+            walked = 0.0
+            point = None
+            tangent = None
+            for seg in sk.segs:
+                pts = seg.pts
+                for i in range(len(pts) - 1):
+                    a, b = pts[i], pts[i + 1]
+                    step = math.sqrt(sum((b[k] - a[k]) ** 2 for k in range(3)))
+                    if walked + step >= target - 1e-9:
+                        local_t = (target - walked) / step if step > 1e-9 else 0.0
+                        local_t = max(0.0, min(1.0, local_t))
+                        point = [a[j] + local_t * (b[j] - a[j]) for j in range(3)]
+                        tlen = math.sqrt(sum((b[j] - a[j]) ** 2 for j in range(3)))
+                        if tlen > 1e-12:
+                            tangent = [(b[j] - a[j]) / tlen for j in range(3)]
+                        else:
+                            tangent = [0.0, 0.0, 1.0]
+                        break
+                    walked += step
+                if point is not None:
+                    break
+            if point is None:
+                last_seg = sk.segs[-1]
+                point = last_seg.pts[-1]
+                tangent = [0.0, 0.0, 1.0]
+
+            # Map dominant tangent axis to reserved plane name.
+            tx, ty, tz = tangent[0], tangent[1], tangent[2]
+            abs_axes = [abs(tx), abs(ty), abs(tz)]
+            dominant = abs_axes.index(max(abs_axes))
+            plane_map = {0: "right", 1: "front", 2: "top"}
+            plane_used = plane_map[dominant]
+
+            # Call engine section probe.
+            try:
+                res = cb.call("eval_section_props", {"doc_id": d, "plane": plane_used})
+            except Exception:  # noqa: BLE001
+                res = {"area_mm2": 0.0}
+
+            area = res.get("area_mm2", 0.0)
+            summary = (
+                f"Cross-section at t={t_clamped:.2f} (plane='{plane_used}', "
+                f"tangent=({tx:.2f},{ty:.2f},{tz:.2f})): "
+                f"area = {area:.4g} mm^2"
+            )
+            if not area or area == 0:
+                summary += " — plane may miss the body or no solid built yet"
+
+            return _dumps({
+                "ok": True,
+                "t": t_clamped,
+                "point": [round(p, 4) for p in point],
+                "tangent": [round(v, 6) for v in tangent],
+                "plane_used": plane_used,
+                "area_mm2": area,
+                "centroid": res.get("centroid"),
+                "Ixx": res.get("Ixx"),
+                "Iyy": res.get("Iyy"),
+                "Ixy": res.get("Ixy"),
+                "summary": summary,
+                "doc_id": d,
+            })
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    # ──────────────────────────────────── ledger / session persistence ────────────────────────────
+
+    @mcp.tool()
+    def sketch3d_to_ledger() -> str:
+        """Serialize the ENTIRE 3D sketch session store to a JSON string for ledger_note persistence.
+
+        The in-process 3D sketch store is lost when the MCP server restarts (it's a Python dict,
+        not persisted to the C++ doc).  Call this at the end of a design session and pass the
+        returned ``payload`` to ledger_note(run_id, 'sketch3d_state', payload) so future sessions
+        can restore the paths via sketch3d_from_ledger.
+
+        Returns {ok, sketch_count, payload} where payload is a JSON string that
+        sketch3d_from_ledger can round-trip back into the store.
+        """
+        try:
+            data = {
+                "version": 1,
+                "sketches": [sk.to_dict() for sk in _STORE.values()],
+            }
+            payload = json.dumps(data)
+            return _dumps({
+                "ok": True,
+                "sketch_count": len(_STORE),
+                "payload": payload,
+                "hint": (
+                    "Pass `payload` to ledger_note(run_id, 'sketch3d_state', payload). "
+                    "Restore with sketch3d_from_ledger(payload)."
+                ),
+            })
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def sketch3d_from_ledger(payload: str) -> str:
+        """Restore 3D sketches from a ledger_note payload created by sketch3d_to_ledger.
+
+        payload: the JSON string returned by sketch3d_to_ledger (retrieved from ledger_get).
+
+        Merges the restored sketches into the current session store — sketches whose id
+        already exists in the store are skipped (not overwritten).  Returns {ok, restored,
+        skipped, ids} so you can tell which sketches came back.
+
+        Typical multi-session workflow:
+          Session A: sketch3d_new → sketch3d_add_curves → sketch3d_to_ledger
+                     → ledger_note(run_id, 'sketch3d_state', payload)
+          Session B: ledger_get(run_id) → locate sketch3d_state entry
+                     → sketch3d_from_ledger(payload) → sketch3d_list → continue
+        """
+        try:
+            data = json.loads(payload)
+            version = data.get("version", 1)
+            if version != 1:
+                return _dumps({"ok": False,
+                               "error": f"unsupported sketch3d_state version {version}"})
+            sketches_raw = data.get("sketches", [])
+            restored: list[str] = []
+            skipped: list[str] = []
+            for raw in sketches_raw:
+                sid = raw.get("id")
+                if not sid:
+                    continue
+                if sid in _STORE:
+                    skipped.append(sid)
+                    continue
+                sk = _S3Sketch(raw.get("name", "restored"))
+                sk.id = sid  # restore original id
+                for seg_raw in raw.get("segs", []):
+                    try:
+                        seg = _seg_from_dict(seg_raw)
+                        sk.segs.append(seg)
+                    except Exception:  # noqa: BLE001
+                        pass  # skip malformed segments
+                _STORE[sk.id] = sk
+                restored.append(sk.id)
+            return _dumps({
+                "ok": True,
+                "restored": len(restored),
+                "skipped": len(skipped),
+                "ids": restored,
+                "skipped_ids": skipped,
+                "hint": "call sketch3d_list() to confirm the restored sketches",
+            })
+        except json.JSONDecodeError as e:
+            return _err(ValueError(f"payload is not valid JSON: {e}"))
         except Exception as e:  # noqa: BLE001
             return _err(e)

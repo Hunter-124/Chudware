@@ -64,10 +64,12 @@ public:
     virtual bool usesWorkerEmbed() const { return true; }
 };
 
-// Backend selection, single source of truth. Returns a CefWebView when built
-// with AI_CAD_ENABLE_CEF *and* enabled at runtime (env AI_CAD_WEBVIEW=cef, or
-// the app setting), otherwise the ScreencastWebView. Call sites stay
-// backend-agnostic: `auto web = ui::makeWebView();  web->open(...);`.
+// Backend selection, single source of truth. Returns the in-process CefWebView —
+// the one and only embedded-browser backend — whenever built with
+// AI_CAD_ENABLE_CEF (the default on every OS; no runtime toggle). Only an
+// SDK-less build (AI_CAD_ENABLE_CEF=OFF, e.g. CI without the CEF binary dist)
+// falls back to the inert NullWebView. Call sites stay backend-agnostic:
+// `auto web = ui::makeWebView();  web->open(...);`.
 std::unique_ptr<IWebViewBackend> makeWebView();
 
 }  // namespace ui

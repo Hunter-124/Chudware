@@ -320,8 +320,6 @@ int main(int argc, char** argv) {
         ui::cef::shutdown();
         return ok ? 0 : 1;
     }
-    if (const char* wv = std::getenv("AI_CAD_WEBVIEW"); wv && std::strcmp(wv, "cef") == 0)
-        ui::cef::initialize();
 #endif
     installCrashHandler();  // symbolized stack + minidump on any unhandled fault
     // Point the C++ core at its prompts on EVERY launch path (run_gui only calls
@@ -341,6 +339,14 @@ int main(int argc, char** argv) {
         std::printf("%s\n", log.c_str());
         return ok ? 0 : 1;
     }
+#ifdef AI_CAD_ENABLE_CEF
+    // Every remaining path launches the GUI, whose Parts-Library vendor browser is
+    // the in-process CEF backend. Bootstrap Chromium unconditionally here — the CEF
+    // browser is the default, not an opt-in (no AI_CAD_WEBVIEW toggle). The headless
+    // CLI modes (--render/--contact/--build/--design/--ensure-runtime) all returned
+    // above, so they never pay for a Chromium boot.
+    ui::cef::initialize();
+#endif
     if (argc >= 2 && std::strcmp(argv[1], "--ui-screenshot") == 0) {
         // Headless UI capture. An explicit output path is optional; when omitted (the common
         // smoke-test invocation `AI-CAD --ui-screenshot`), default to a PNG next to the exe so

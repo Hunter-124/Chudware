@@ -1585,7 +1585,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // the orbit feel dead. Once dragging, the lock yields immediately; s_sketchRotated keeps it
         // yielded for the rest of the sketch session.
         if (inSketch && !s_sketchRotated && ImGui::IsMouseDragging(ImGuiMouseButton_Middle) &&
-            !ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift)
+            !ImGui::GetIO().KeyCtrl && !ImGui::GetIO().KeyShift &&
+            !(sketch != nullptr && sketch->entityDragActive()))   // MMB yields to an entity drag
             s_sketchRotated = true;
         if (inSketch && !s_sketchRotated) {
             float ly, lp; if (sketch->cameraLock(ly, lp)) { st.yaw = ly; st.pitch = lp; }
@@ -1693,11 +1694,29 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // body bbox doesn't include sketch entities, so an offset sketch would otherwise spin about
         // the origin). Off elsewhere — center_ (the model bbox centre) is already correct.
         {
+            // Drag dead zone (Hunter UX): the override tracks the sketch bbox centre, which MOVES
+            // while an entity is being dragged — an unfrozen pivot re-translates the camera target
+            // every frame, so the view "scrolls" under the drag. Freeze the pivot for the drag's
+            // whole duration; on release, fold the pivot delta into pan so the handover to the new
+            // bbox centre is seamless (no recenter jump on commit).
+            static bool s_skDragPivotLock = false;
+            static Vec3 s_skDragPivot{0, 0, 0};
             Vec3 sc;
-            if (inSketch && sketch != nullptr && sketch->sketchOrbitCenter(sc))
+            if (inSketch && sketch != nullptr && sketch->sketchOrbitCenter(sc)) {
+                if (sketch->entityDragActive()) {
+                    if (!s_skDragPivotLock) { s_skDragPivotLock = true; s_skDragPivot = sc; }
+                    sc = s_skDragPivot;
+                } else if (s_skDragPivotLock) {
+                    s_skDragPivotLock = false;
+                    st.pan[0] += s_skDragPivot.x - sc.x;   // target = pivot + pan stays constant
+                    st.pan[1] += s_skDragPivot.y - sc.y;
+                    st.pan[2] += s_skDragPivot.z - sc.z;
+                }
                 renderer.setOrbitCenterOverride(true, sc);
-            else
+            } else {
+                s_skDragPivotLock = false;
                 renderer.setOrbitCenterOverride(false, Vec3{0, 0, 0});
+            }
         }
         // Emphasize the currently-selected datum (reference axis/plane/point) in the viewport.
         renderer.setSelectedDatumId(st.selectedFeatureId);
@@ -2380,7 +2399,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // The sketch overlay reprojects from the live camera each frame, so a rotated view stays
             // correct (entity picking included).
             const bool ctrl = io.KeyCtrl, shift = io.KeyShift;
-            if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) &&
+            // Deconflict: while a sketch entity/handle/group LMB drag is armed or live, ALL camera
+            // input yields — no MMB orbit/pan/zoom and no wheel zoom. The sketch overlay's own
+            // edge auto-pan is the only thing allowed to move the view mid-drag (Hunter UX).
+            const bool skDrag = sketch != nullptr && sketch->entityDragActive();
+            if (!skDrag && ImGui::IsMouseDragging(ImGuiMouseButton_Middle) &&
                 (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
                 cancelCameraAnimation();
                 if (ctrl) {
@@ -2410,7 +2433,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     s_sketchRotated = true;   // stop forcing normal-to so the rotation sticks
                 }
             }
-            if (io.MouseWheel != 0) {
+            if (!skDrag && io.MouseWheel != 0) {
                 st.zoom *= (1.0f + io.MouseWheel * 0.1f);
                 st.zoom = st.zoom < 0.1f ? 0.1f : (st.zoom > 10 ? 10 : st.zoom);
             }

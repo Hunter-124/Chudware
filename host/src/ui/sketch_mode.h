@@ -205,6 +205,12 @@ public:
     // sketch (not the body bbox / origin). Returns false when not editing a sketch.
     bool sketchOrbitCenter(Vec3& world) const;
 
+    // True while a sketch entity/handle/group/dimension LMB drag is armed or live. The viewport
+    // uses this to (a) freeze the sketch-bbox orbit-centre override for the drag's duration (the
+    // bbox moves WITH the drag, so an unfrozen pivot re-translates the camera every frame — the
+    // "view scrolls under my drag" bug) and (b) ignore MMB orbit/pan/zoom + wheel while dragging.
+    bool entityDragActive() const;
+
     // Origin-plane index (0/1/2, -1 none) hovered by the PM plane picker last frame — fed to
     // Renderer::setPlanes as the emphasis so the hovered datum plane brightens (mirrors planeHover
     // for the new-sketch flow).

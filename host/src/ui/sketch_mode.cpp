@@ -4839,6 +4839,10 @@ bool SketchMode::drawDatumSelect(AppState& st, ImGuiIO& io, const ImVec2& imgMin
     return true;
 }
 
+bool SketchMode::entityDragActive() const {
+    return dragArmed_ || dragging_ || groupDragArmed_ || groupDragging_ || dimDragging_;
+}
+
 bool SketchMode::sketchOrbitCenter(Vec3& world) const {
     if (!active_) return false;
     // 2D bbox over the sketch entities (plane u,v); empty sketch -> plane origin (u=v=0).
@@ -5747,7 +5751,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // grows the pick from that lone edge to its whole closed loop (SolidWorks-ish loop pick).
         // Clicking the INSIDE of a profile selects the loop with no delay (handled via hovRegion).
         constexpr float kLoopDwell = 0.7f;   // ~"a second" of rest to expand an edge to its loop
-        bool slow = std::hypot(io.MouseDelta.x, io.MouseDelta.y) < 2.5f;
+        bool slow = std::hypot(io.MouseDelta.x, io.MouseDelta.y) < 2.5f * ui::uiScale;
         int loopOfHov = hovEnt.empty() ? -1 : regionContaining(hovEnt);
         if (!hovEnt.empty() && hovEnt == dwellEnt_ && slow && loopOfHov >= 0) dwellAccum_ += io.DeltaTime;
         else { dwellEnt_ = hovEnt; dwellAccum_ = 0.0f; }
@@ -5799,17 +5803,20 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 boxArmed_ = true; boxStart_ = io.MousePos; boxCtrl_ = io.KeyCtrl;   // empty canvas
             }
         }
+        // Arm->drag promotion threshold: DPI-scaled (matches the viewport's LMB threshold style)
+        // and a touch generous at 5px so a sloppy click still reads as a click, not a micro-drag.
+        const float kDragArmPx = 5.0f * ui::uiScale;
         // Armed handle: promote to a real (single-point reshape) drag past the threshold. The
         // origin is fixed at (0,0) — it stays armed (never promotes), so releasing simply selects it.
         if (dragArmed_ && !dragging_ && pendingHandle_ != "origin" &&
             ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            if (std::hypot(io.MousePos.x - dragDownPos_.x, io.MousePos.y - dragDownPos_.y) > 4.0f) {
+            if (std::hypot(io.MousePos.x - dragDownPos_.x, io.MousePos.y - dragDownPos_.y) > kDragArmPx) {
                 dragging_ = true; dragHandle_ = pendingHandle_; dragFrame_ = -1; dragArmed_ = false;
             }
         }
         // C51: armed group -> promote to a live profile/selection translate past the threshold.
         if (groupDragArmed_ && !groupDragging_ && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            if (std::hypot(io.MousePos.x - boxStart_.x, io.MousePos.y - boxStart_.y) > 4.0f) {
+            if (std::hypot(io.MousePos.x - boxStart_.x, io.MousePos.y - boxStart_.y) > kDragArmPx) {
                 std::vector<std::string> set;
                 if (groupClickKind_ == 2 && groupClickRegion_ >= 0 &&
                     groupClickRegion_ < (int)regions_.size()) {
@@ -5826,7 +5833,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
         // C51: armed box -> promote to a live rubber band past the threshold.
         if (boxArmed_ && !boxSelecting_ && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            if (std::hypot(io.MousePos.x - boxStart_.x, io.MousePos.y - boxStart_.y) > 4.0f)
+            if (std::hypot(io.MousePos.x - boxStart_.x, io.MousePos.y - boxStart_.y) > kDragArmPx)
                 boxSelecting_ = true;
         }
         // C51: feed the live group translate (throttled once/frame, like the point drag). Compute
@@ -5873,6 +5880,47 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                              {"xy", nlohmann::json::array({(double)mu, (double)mv})}};
                 }
                 if (callSketch(st, "sketch_drag", extra, res)) applyEnterResult(res);
+            }
+        }
+        // ---- Drag edge auto-pan (Hunter UX). While an entity/handle/group is being LMB-dragged,
+        // the camera holds perfectly still in the central "dead zone"; only when the cursor enters
+        // a band along a visible viewport edge does the view pan toward that edge, with the speed
+        // ramping quadratically from 0 at the band's inner boundary to a modest max at the edge.
+        // Tuning: kDragPanBandPx = band width; kDragPanMaxPx = full-speed px/s (540 px/s crosses a
+        // 1080p-tall viewport in ~2 s). Frame-rate independent via io.DeltaTime.
+        if ((dragging_ || groupDragging_) && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            const float kDragPanBandPx = 48.0f * ui::uiScale;    // edge band width (screen px)
+            const float kDragPanMaxPx  = 540.0f * ui::uiScale;   // max auto-pan speed (px/s)
+            // Visible sketch region = image bounds minus the pinned columns (skClip*), so the band
+            // hugs the edges the user actually sees.
+            auto ramp = [](float t) { t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t); return t * t; };
+            // Outward direction (screen space, y down), magnitude 0..1 per axis.
+            float ox = ramp((skClipMin.x + kDragPanBandPx - io.MousePos.x) / kDragPanBandPx) * -1.f
+                     + ramp((io.MousePos.x - (skClipMax.x - kDragPanBandPx)) / kDragPanBandPx);
+            float oy = ramp((skClipMin.y + kDragPanBandPx - io.MousePos.y) / kDragPanBandPx) * -1.f
+                     + ramp((io.MousePos.y - (skClipMax.y - kDragPanBandPx)) / kDragPanBandPx);
+            if ((ox != 0.0f || oy != 0.0f) && st.renderer) {
+                float dt = io.DeltaTime < 0.1f ? io.DeltaTime : 0.1f;   // stall guard: no lurches
+                // Grab-pan convention (mirrors the in-sketch Ctrl+MMB pan in viewport_panel.cpp):
+                // a grab delta of (+dx) slides content right / camera left. To REVEAL space toward
+                // the edge, feed the negated outward vector as the grab delta.
+                float gx = -ox * kDragPanMaxPx * dt;
+                float gy = -oy * kDragPanMaxPx * dt;
+                const float deg = 3.14159265f / 180.0f;
+                const float fov = Renderer::kFovDeg * deg;
+                float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
+                float dist = st.renderer->effectiveSceneRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
+                float worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
+                float yr = st.yaw * deg, pr = st.pitch * deg;
+                Vec3 vdir(std::cos(pr) * std::sin(yr), -std::cos(pr) * std::cos(yr), std::sin(pr));
+                Vec3 wUp = normalize(Vec3(-std::sin(pr) * std::sin(yr),
+                                           std::sin(pr) * std::cos(yr), std::cos(pr)));
+                Vec3 V = normalize(vdir);
+                Vec3 R = normalize(cross(wUp, V));
+                Vec3 U = normalize(cross(V, R));
+                st.pan[0] += (-R.x * gx + U.x * gy) * worldPerPx;
+                st.pan[1] += (-R.y * gx + U.y * gy) * worldPerPx;
+                st.pan[2] += (-R.z * gx + U.z * gy) * worldPerPx;
             }
         }
         if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {

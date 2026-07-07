@@ -304,13 +304,53 @@ def register_parts_tools(mcp: FastMCP) -> None:
         """Return the current state of all scrape/download queue jobs.
 
         Returns {ok, jobs: [{id, site, query, status, artifact_path, error,
-                              created_ts, started_ts, finished_ts}]}.
+                              created_ts, started_ts, finished_ts, spec_data}]}.
 
         status values: pending | running | done | error | cancelled.
         artifact_path is set (local filesystem path) when status == "done".
+        spec_data is a dict of vendor metadata (title, sku, price, source_url,
+        fetched_ts, etc.) extracted from the acquire() provenance envelope; empty
+        for non-done jobs.
         """
         try:
             from services.browser.queue import queue_status as _status
             return json.dumps(_status(), ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001
             return _err(f"scrape_queue_status failed: {exc}")
+
+    @mcp.tool()
+    def import_artifact(artifact_path: str) -> str:
+        """Import a locally acquired CAD file (STEP/IGES) into a new editable part doc.
+
+        This is the second step after a scrape/download queue job completes with
+        status="done": take the artifact_path returned by scrape_queue_status and
+        import it into the CAD kernel, creating an editable part document.
+
+        artifact_path : local filesystem path to the acquired CAD file (e.g. a .step
+                        file downloaded by the McMaster or GrabCAD adapter). Obtain it
+                        from scrape_queue_status's artifact_path field on a done job.
+
+        Returns a PlacementResult dict:
+          {ok, domain: "import_file", doc_id, editable: true, detail: {imported_from, ...}}
+        or {ok: false, reason: ..., hint: ...} on failure.
+
+        After import you can call reverse_engineer(source=doc_id) for parametric
+        feature recovery where the geometry supports it.
+        """
+        import os
+        path = (artifact_path or "").strip()
+        if not path:
+            return _err("artifact_path is required",
+                        "Pass the artifact_path from scrape_queue_status on a done job.")
+        if not os.path.isfile(path):
+            return _err(f"file not found: {path}",
+                        "Verify the artifact_path from scrape_queue_status. "
+                        "The file may have been cleaned up.")
+        try:
+            from engine_oracle.parts_hub.place import _place_import_file  # noqa: PLC0415
+            gref = {"kind": "import_file", "path": path}
+            result = _place_import_file(gref, None, None)
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"import_artifact failed: {exc}",
+                        "Ensure the native core (AI_CAD_LIBAICAD) is available.")

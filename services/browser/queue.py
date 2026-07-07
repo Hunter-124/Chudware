@@ -60,6 +60,10 @@ class ScrapeJob:
     error:          str = ""
     # Intermediate results from search() (lightweight stubs, not yet acquired).
     search_hits:    list = field(default_factory=list)
+    # Spec metadata extracted from the acquire() provenance envelope:
+    # title, sku, price, source_url, fetched_ts, and any other vendor extras.
+    # Populated when status transitions to DONE; empty dict until then.
+    spec_data:      dict = field(default_factory=dict)
 
 
 # ---- Global queue ----------------------------------------------------------------
@@ -111,6 +115,9 @@ def queue_status() -> dict:
                 "created_ts":    j.created_ts,
                 "started_ts":    j.started_ts,
                 "finished_ts":   j.finished_ts,
+                # Spec metadata from acquire() provenance envelope (title, sku, price, …).
+                # Empty dict for pending/running/error jobs; populated on DONE.
+                "spec_data":     j.spec_data,
             }
             for j in snapshot
         ],
@@ -180,6 +187,13 @@ def _run_job(job: ScrapeJob) -> None:
         if result.get("ok"):
             job.artifact_path = result.get("artifact_path", "")
             job.status = JobStatus.DONE
+            # Capture spec metadata from the provenance envelope for GUI display.
+            # All non-plumbing keys (ok, source_url, fetched_ts, session_profile_used,
+            # license_note, artifact_path) are considered "vendor extras" (sku, price,
+            # title, asin, lcsc, etc.) and collected into spec_data.
+            _SKIP_KEYS = {"ok", "session_profile_used", "license_note"}
+            job.spec_data = {k: v for k, v in result.items()
+                             if k not in _SKIP_KEYS and v is not None}
             return
         else:
             job.error = result.get("hint", result.get("reason", "acquire failed"))

@@ -1355,7 +1355,37 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
                                          mpStage_ = 0; mpSel_.clear();                     return true; }
     if (cmdId == "sk_circ_pattern")    { resetTool(); tool_ = SketchTool::CircPattern;
                                          mpStage_ = 0; mpSel_.clear();                     return true; }
-    if (cmdId == "sk_convert_ent")     { resetTool(); tool_ = SketchTool::Convert;         return true; }
+    // GUI-picking overhaul: if model faces/edges are already selected (picked before entering the
+    // sketch, or picked during it via the viewport's fallback model-pick), Convert applies to them
+    // immediately instead of requiring a click-after-button pick. Vertices aren't convertible
+    // (sketch_convert only takes edge/face refs), so a vertex-only selection falls through to the
+    // normal pick-mode arm below. The existing post-button pick mode remains the fallback when
+    // nothing usable is selected.
+    if (cmdId == "sk_convert_ent") {
+        resetTool();
+        std::vector<nlohmann::json> refs;
+        for (const auto& it : st.selection.items()) {
+            const render::PickHit& h = it.hit;
+            if (h.kind != render::PickKind::Edge && h.kind != render::PickKind::Face) continue;
+            std::string perr;
+            std::string selStr = st.docMirror.resolvePick(
+                st.worker, h.body_id, h.kind == render::PickKind::Edge ? "edge" : "face",
+                h.topo_id, perr);
+            nlohmann::json selJs;
+            if (!selStr.empty()) { try { selJs = nlohmann::json::parse(selStr); } catch (...) {} }
+            if (selJs.is_object())
+                refs.push_back({{"kind", h.kind == render::PickKind::Edge ? "edge" : "face"},
+                                {"selector", selJs}});
+        }
+        if (!refs.empty()) {
+            for (const auto& ref : refs) applyConvertRef(st, ref);
+            st.selection.clear();
+            tool_ = SketchTool::None;
+        } else {
+            tool_ = SketchTool::Convert;
+        }
+        return true;
+    }
     // C54: Move/Copy entities (engine op sketch_move) — reuses the mirror/pattern selection stage.
     if (cmdId == "sk_move")            { resetTool(); tool_ = SketchTool::Move;
                                          mpStage_ = 0; mpSel_.clear(); moveCopy_ = false;   return true; }
@@ -4886,6 +4916,10 @@ bool SketchMode::sketchOrbitCenter(Vec3& world) const {
 void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, const ImVec2& imgMax,
                              int vw, int vh, bool imgHovered) {
     if (!st.renderer) return;
+    // GUI-picking overhaul: default to "hot" (blocks the viewport's model-pick fallback) any time a
+    // drawing/edit tool owns the cursor (tool_ != None) or before the idle-hover pass below runs;
+    // the tool_==None branch narrows this to the actual per-frame hit-test result.
+    entityHoverHot_ = (tool_ != SketchTool::None);
     // Sketch dimensions + Modify box follow the document unit system (mm / inch); refreshed each
     // frame so a status-bar units toggle reformats on-canvas dims and the Modify box live.
     g_skIps = st.ips();
@@ -5762,6 +5796,11 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             }
         }
         hoverRelCid_ = hovRel;   // feeds the badge tint on the next frame's render pass
+        // GUI-picking overhaul: "hot" whenever a sketch entity/handle/relation/region claims the
+        // cursor, or a drag/box-select is armed/live (idleHover false covers those cases) — either
+        // way the viewport's fallback model-pick must not also fire this frame.
+        entityHoverHot_ = !idleHover || !hovHandle.empty() || !hovRel.empty() ||
+                          !hovEnt.empty() || hovRegion >= 0;
 
         // C51: entity-edge dwell -> loop preview. Resting on the same loop-member edge for kLoopDwell
         // grows the pick from that lone edge to its whole closed loop (SolidWorks-ish loop pick).

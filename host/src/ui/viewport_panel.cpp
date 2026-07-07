@@ -2662,10 +2662,20 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // ---- hover + click selection (once per frame; only while a doc mesh is loaded) ----
         // C25 W2-E: suppressed while the glass-box View Selector is up (it owns the click).
         // C37-C item 5: also suppressed while sketchPlanePickActive (the overlay owns the mouse).
-        if (picking && !inSketch && !inSketch3d && !s_viewSelector.active() &&
+        //
+        // GUI-picking overhaul: model geometry (face/edge/vertex) picking now ALSO runs while a 2D
+        // or 3D sketch is active, as a fallback behind the sketch's own entity/handle picking —
+        // sketch entities keep priority (SketchMode::inSketchEntityHot() / Sketch3DMode's), model
+        // picking only fires when the cursor is over neither. This replaces the old flat dead zone
+        // (model picking fully suppressed for the whole sketch session).
+        const bool sketchEntityHot = (inSketch && sketch && sketch->inSketchEntityHot()) ||
+                                     (inSketch3d && sketch3d && sketch3d->inSketchEntityHot());
+        const bool inAnySketch = inSketch || inSketch3d;
+        if (picking && (!inAnySketch || !sketchEntityHot) && !s_viewSelector.active() &&
             !st.sketchPlanePickActive) {
             // Instant3D: while a push-pull OR dimension drag owns the mouse, freeze hover and swallow
-            // the click so the press that grabbed the handle doesn't also re-select / clear.
+            // the click so the press that grabbed the handle doesn't also re-select / clear. (Both
+            // are non-sketch features, so their guards are always false while in a sketch.)
             if (imgHovered && !s_lmbDragActive && !regionPickerHot && !planePickerHot &&
                 !axisPickerHot && !pointPickerHot && !curvePickerHot && !datumSelectHot && !blendDeselectHot &&
                 !s_pp.active && !s_dim.active) {
@@ -2674,8 +2684,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 // Fillet/chamfer "Edges" wells: snap to the nearest edge within a grab radius so the
                 // 1-px curved rims of a revolved/round body are clickable (they'd otherwise lose the
                 // centre pixel to the face behind). Same edge-priority trick the Convert tool uses.
-                const bool preferEdge = st.propertyManager && st.propertyManager->active() &&
-                                        st.propertyManager->activeWellPrefersEdge();
+                // In-sketch fallback picking always prefers edge/vertex the same way — sketch
+                // reference picking (Convert, snap targets) cares about edges/vertices far more
+                // than the coplanar face usually sitting right behind the sketch plane.
+                const bool preferEdge = inAnySketch ||
+                    (st.propertyManager && st.propertyManager->active() &&
+                     st.propertyManager->activeWellPrefersEdge());
                 st.hover = preferEdge
                     ? st.idPass->pickFinalPreferEdge(px, py, vw, vh, (int)(14.0f * ui::uiScale))
                     : st.idPass->pickFinal(px, py, vw, vh);

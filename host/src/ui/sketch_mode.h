@@ -215,6 +215,14 @@ public:
     // "view scrolls under my drag" bug) and (b) ignore MMB orbit/pan/zoom + wheel while dragging.
     bool entityDragActive() const;
 
+    // GUI-picking overhaul: true when this frame's cursor is "hot" over a sketch entity, handle,
+    // relation badge, region interior, or mid-interaction (drag/box-select armed or live), i.e.
+    // sketch-entity picking claims the cursor. The viewport uses `!inSketchEntityHot()` to gate its
+    // fallback model-geometry pick while a sketch is active — sketch entities keep priority, model
+    // picking (faces/edges/vertices) only fires when the cursor is over neither. Valid only after
+    // drawOverlay() has run this frame (defaults to true/safe before the first call).
+    bool inSketchEntityHot() const { return entityHoverHot_; }
+
     // Origin-plane index (0/1/2, -1 none) hovered by the PM plane picker last frame — fed to
     // Renderer::setPlanes as the emphasis so the hovered datum plane brightens (mirrors planeHover
     // for the new-sketch flow).
@@ -632,6 +640,9 @@ private:
     struct RelHit { std::string cid; ImVec2 lo, hi; };
     std::vector<RelHit> relHits_;
     std::string hoverRelCid_;
+    // GUI-picking overhaul: set each frame by drawOverlay's hover pass; see inSketchEntityHot().
+    // Defaults true so a stale/pre-first-frame read never opens the model-pick fallback by mistake.
+    bool entityHoverHot_ = true;
     std::vector<std::string> selRelIds_;
     bool isRelSelected(const std::string& cid) const;
     int  hitTestRelationBadge(const ImVec2& s) const;   // index into relHits_, or -1

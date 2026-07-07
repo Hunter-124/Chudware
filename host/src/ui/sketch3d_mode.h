@@ -66,6 +66,12 @@ public:
     // Status-bar line ("Fully Defined" / "Under Defined   DOF: 4" / "Over Defined").
     std::string statusLine() const;
 
+    // GUI-picking overhaul: true when this frame's cursor is "hot" over a 3D-sketch entity/handle
+    // or a drawing tool/drag owns it. The viewport gates its fallback model-geometry pick on
+    // `!inSketchEntityHot()` — sketch entities keep priority, model picking is the fallback. Set
+    // each frame by drawOverlay(); defaults true (safe) before the first call.
+    bool inSketchEntityHot() const { return entityHoverHot_; }
+
 private:
     // ---- worker round-trips ----
     bool callSk3(AppState& st, const char* method, const nlohmann::json& extra,
@@ -169,6 +175,8 @@ private:
     // per-frame hover
     std::string hovHandle_;
     std::string hovEnt_;
+    // GUI-picking overhaul: see inSketchEntityHot(). Defaults true (safe before the first frame).
+    bool entityHoverHot_ = true;
 };
 
 }  // namespace ui

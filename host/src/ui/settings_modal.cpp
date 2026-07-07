@@ -233,8 +233,22 @@ void drawSettingsModal(AppState& st, bool busy) {
     if (s_settingsOpen) {
         ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Appearing);
         ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-        if (ImGui::Begin("Settings", &s_settingsOpen,
-                         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking)) {
+        // Opaque title strip — the global applyTheme sets TitleBg* to rgba(0,0,0,0) so floating
+        // glass windows render transparently by default.  Override here so the Settings dialog
+        // reads as a crisp native chrome dialog in both light and dark themes.
+        ImGui::PushStyleColor(ImGuiCol_TitleBg,
+            ImVec4(ui::palette.headerBg[0], ui::palette.headerBg[1],
+                   ui::palette.headerBg[2], 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_TitleBgActive,
+            ImVec4(ui::palette.headerBg[0], ui::palette.headerBg[1],
+                   ui::palette.headerBg[2], 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed,
+            ImVec4(ui::palette.headerBg[0], ui::palette.headerBg[1],
+                   ui::palette.headerBg[2], 1.0f));
+        bool settingsBegun = ImGui::Begin("Settings", &s_settingsOpen,
+                         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking);
+        ImGui::PopStyleColor(3);  // TitleBg / TitleBgActive / TitleBgCollapsed
+        if (settingsBegun) {
         // C22b: if a pending prompt role was requested, load prompts and jump to the Prompts tab.
         bool jumpToPrompts = false;
         if (!st.pendingPromptRole.empty() && st.workerStarted) {

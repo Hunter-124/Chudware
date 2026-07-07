@@ -58,17 +58,32 @@ void drawCommandSearch(AppState& st) {
     const float    sc   = ui::uiScale;
     const float    popW = 560.0f * sc;
     const float    popH = 460.0f * sc;
-    ImGui::SetNextWindowSize(ImVec2(popW, popH), ImGuiCond_Always);
-    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    // Position only on appear so the window is movable after that (ImGuiCond_Always would snap
+    // it back to center every frame, defeating the movable requirement).
+    ImGui::SetNextWindowSize(ImVec2(popW, popH), ImGuiCond_Appearing);
+    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
 
     bool shouldClose = false;
 
+    // Opaque title strip (same approach as drawSettingsModal): applyTheme sets TitleBg* to
+    // transparent; push opaque headerBg so the "Search" strip reads as crisp chrome — a sibling
+    // of the Settings dialog, not a floating naked list.
     ui::pushGlassWindowStyle();
-    if (ImGui::Begin("##CommandSearch", nullptr,
-                     ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoResize  |
-                     ImGuiWindowFlags_NoMove       | ImGuiWindowFlags_NoDocking |
-                     ImGuiWindowFlags_NoScrollbar  | ImGuiWindowFlags_NoScrollWithMouse |
-                     ImGuiWindowFlags_NoCollapse)) {
+    ImGui::PushStyleColor(ImGuiCol_TitleBg,
+        ImVec4(ui::palette.headerBg[0], ui::palette.headerBg[1],
+               ui::palette.headerBg[2], 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive,
+        ImVec4(ui::palette.headerBg[0], ui::palette.headerBg[1],
+               ui::palette.headerBg[2], 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed,
+        ImVec4(ui::palette.headerBg[0], ui::palette.headerBg[1],
+               ui::palette.headerBg[2], 1.0f));
+    bool searchBegun = ImGui::Begin("Search##CommandSearch", &st.showCommandSearch,
+                     ImGuiWindowFlags_NoResize    | ImGuiWindowFlags_NoDocking |
+                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                     ImGuiWindowFlags_NoCollapse);
+    ImGui::PopStyleColor(3);  // TitleBg / TitleBgActive / TitleBgCollapsed
+    if (searchBegun) {
 
         // ---- filter input ----
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * sc, 6.0f * sc));

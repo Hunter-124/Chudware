@@ -462,6 +462,7 @@ void drawLeftPane(AppState& st,
         const ImVec2 ePaneOrigin = ImGui::GetCursorScreenPos();
         const float  ePaneInnerW = ImGui::GetContentRegionAvail().x;
         const float  ePaneCenterX = ePaneOrigin.x + ePaneInnerW * 0.5f;
+        (void)ePaneCenterX;   // header chip now positioned in the rail deadspace (round-5b)
 
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
         ImGui::BeginChild("##ecad_tabstrip", ImVec2(2.0f * ebtn + egap, erailRowH),
@@ -478,6 +479,22 @@ void drawLeftPane(AppState& st,
                                  surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/true))
             s_ecadTab = 1;
         ImGui::EndChild();
+
+        // Active-tab header chip drawn in the DEAD BAND to the RIGHT of the two square tab buttons,
+        // vertically centered against them — round-5b: kills that empty band and lets the manager
+        // body start straight below the rail (its chip used to sit on its own row under here, pushing
+        // everything down). Cursor is saved/restored so the hairline + body flow below is unaffected.
+        {
+            const float railW = 2.0f * ebtn + egap;
+            const float hdrX = ePaneOrigin.x + railW + egap;
+            const float hdrW = ePaneInnerW - railW - egap;
+            const char* hdrTitle = s_ecadTab == 0 ? "Explorer" : ui::ecadManagerTitle();
+            const char* hdrIcon  = s_ecadTab == 0 ? "body_folder" : "ai_panel";
+            const ImVec2 saveLocal = ImGui::GetCursorPos();
+            ImGui::SetCursorScreenPos(ImVec2(hdrX, ePaneOrigin.y + erowPad + 2.0f * S));
+            ui::fmPaneHeaderChip(st, hdrTitle, hdrIcon, hdrX + hdrW * 0.5f);
+            ImGui::SetCursorPos(saveLocal);
+        }
 
         // Hairline under the rail, spanning the full pane width (matches the Model rail separator).
         {
@@ -497,8 +514,7 @@ void drawLeftPane(AppState& st,
                             ImVec2(ebodyPad, ImGui::GetStyle().WindowPadding.y));
         ImGui::BeginChild("##ecad_body", ImVec2(0, -8.0f * S), ImGuiChildFlags_AlwaysUseWindowPadding);
         if (s_ecadTab == 0) {
-            ui::fmPaneHeaderChip(st, "Explorer", "body_folder", ePaneCenterX);
-            ImGui::Separator();
+            // Header chip is drawn up in the rail row (round-5b) — body starts at the file list.
             drawFileExplorerBody(st);
         } else {
             ui::drawEcadManagerBody(st, surf, lpHalo);

@@ -59,6 +59,17 @@ ImU32 copperColor(int copperIndex, float a) {
     }
 }
 
+// Effective copper color for a specific layer: a per-layer override (picked in the PCB Manager's
+// layer swatch) wins over the copperIndex-derived default, so a recolored layer repaints on the board.
+ImU32 copperColorFor(const EcadMirror& doc, const std::string& layerId, int copperIndex, float a) {
+    float ov[3];
+    if (!layerId.empty() && doc.layerColor(layerId, ov)) {
+        float c[4] = {ov[0], ov[1], ov[2], a};
+        return ui::Palette::toU32(c);
+    }
+    return copperColor(copperIndex, a);
+}
+
 // Split a "<kind>:<id>" selection token into its parts. Returns false on an empty/malformed token.
 bool splitSel(const std::string& sel, std::string& kind, std::string& id) {
     const auto c = sel.find(':');
@@ -346,8 +357,8 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
         if (!doc.layerVisible(z.layer)) continue;
         int ci = 0;
         for (const auto& ly : doc.layers()) if (ly.id == z.layer) { ci = ly.copperIndex; break; }
-        const ImU32 fill = copperColor(ci, 0.14f);
-        const ImU32 edge = copperColor(ci, 0.6f);
+        const ImU32 fill = copperColorFor(doc, z.layer, ci, 0.14f);
+        const ImU32 edge = copperColorFor(doc, z.layer, ci, 0.6f);
         std::vector<ImVec2> poly;
         poly.reserve(z.polygon.size());
         for (const auto& pt : z.polygon) poly.push_back(toScreen(pt));
@@ -365,7 +376,7 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
               [](const EcadLayer& a, const EcadLayer& b) { return a.copperIndex > b.copperIndex; });
     for (const auto& ly : layersCopy) {
         if (!doc.layerVisible(ly.id)) continue;
-        const ImU32 c = copperColor(ly.copperIndex, 0.92f);
+        const ImU32 c = copperColorFor(doc, ly.id, ly.copperIndex, 0.92f);
         for (const EcadTrack* t : doc.tracksOnLayer(ly.id)) {
             if (!doc.netVisible(t->net)) continue;
             const float wpx = std::max(1.0f, t->width * pxPerMm_);
@@ -401,15 +412,16 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
         for (const auto& pad : fp.pads) {
             // Pad color: the topmost copper layer it sits on (F.Cu if present, else first layer).
             int ci = 0;
+            std::string cLid;
             bool found = false;
             for (const auto& lid : pad.layers) {
                 for (const auto& ly : doc.layers()) {
-                    if (ly.id == lid && doc.layerVisible(lid)) { ci = ly.copperIndex; found = true; break; }
+                    if (ly.id == lid && doc.layerVisible(lid)) { ci = ly.copperIndex; cLid = lid; found = true; break; }
                 }
                 if (found) break;
             }
             if (!found && !pad.layers.empty() && !doc.layerVisible(pad.layers.front())) continue;
-            const ImU32 padCol = copperColor(ci, 0.95f);
+            const ImU32 padCol = copperColorFor(doc, cLid, ci, 0.95f);
             const ImVec2 sp = toScreen(pad.pos);
             const float hw = std::max(2.0f, pad.w * 0.5f * pxPerMm_);
             const float hh = std::max(2.0f, pad.h * 0.5f * pxPerMm_);

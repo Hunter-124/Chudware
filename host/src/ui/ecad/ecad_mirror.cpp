@@ -446,6 +446,19 @@ void EcadMirror::setNetVisible(const std::string& net, bool vis) {
     if (!net.empty()) netVis_[net] = vis;
 }
 
+bool EcadMirror::layerColor(const std::string& layerId, float out[3]) const {
+    auto it = layerColor_.find(layerId);
+    if (it == layerColor_.end()) return false;
+    out[0] = it->second[0];
+    out[1] = it->second[1];
+    out[2] = it->second[2];
+    return true;
+}
+
+void EcadMirror::setLayerColor(const std::string& layerId, float r, float g, float b) {
+    if (!layerId.empty()) layerColor_[layerId] = {r, g, b};
+}
+
 bool EcadMirror::worldBounds(EcadPt& outMin, EcadPt& outMax) const {
     bool have = false;
     auto grow = [&](EcadPt p) {

@@ -23,6 +23,7 @@
 //     parsed JSON in via loadFromTree(); see ECAD_UI_INTEGRATION.md §(e) for the call pattern.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -241,6 +242,12 @@ public:
     bool netVisible(const std::string& net) const;
     void setNetVisible(const std::string& net, bool vis);
 
+    // Per-layer color override (RGB 0..1; panel-owned). When no override is set for a layer id,
+    // callers fall back to the copperIndex-derived default (layerSwatch / copperColor). Returns
+    // true and fills out[3] when an override exists; false otherwise.
+    bool layerColor(const std::string& layerId, float out[3]) const;
+    void setLayerColor(const std::string& layerId, float r, float g, float b);
+
     // ---- compile accessors (both kinds) ----
     const std::vector<EcadAirwire>&   ratsnest()  const { return ratsnest_; }
     const std::vector<EcadViolation>& erc()       const { return erc_; }
@@ -282,6 +289,7 @@ private:
     std::vector<EcadLayer>      layers_;
     std::unordered_map<std::string, bool> layerVis_;  // id -> visible (panel-owned)
     std::unordered_map<std::string, bool> netVis_;    // net name -> visible (panel-owned)
+    std::unordered_map<std::string, std::array<float, 3>> layerColor_;  // id -> RGB override (panel-owned)
 
     // compile
     std::vector<EcadAirwire>   ratsnest_;

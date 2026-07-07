@@ -538,15 +538,9 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
     }
     const bool pcb = m.isPcb();
 
-    // ---- header: pane-header chip (icon + title), the SAME helper the Feature Manager column uses
-    // for its "Feature Manager" header pill — item 1/2: identical chrome + geometry. ----
-    const ImVec2 pOrigin = ImGui::GetCursorScreenPos();
-    const float paneW = ImGui::GetContentRegionAvail().x;
-    const float centerX = pOrigin.x + paneW * 0.5f;
-    char titleBuf[32];
-    std::snprintf(titleBuf, sizeof(titleBuf), "%s Manager", pcb ? "PCB" : "Schematic");
-    ui::fmPaneHeaderChip(st, titleBuf, "ai_panel", centerX);
-    ImGui::Separator();
+    // ---- header: the pane-header chip now lives UP in the Electronics rail row (drawn by layout.cpp
+    // beside the Explorer/PCB Manager tab buttons — round-5b: kills the dead band to the right of
+    // those buttons and pulls this tree up). The body therefore starts straight at the doc-name row. ----
 
     // Doc name + revision row — carried on a glass fmRowPill (item: give "Board1 - rev N" a proper
     // Feature-Manager-style background instead of bare dim text). fmRowStripeReset first so this is
@@ -696,14 +690,21 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         const std::string selId = "layer:" + ly.id;
         const bool sel = (es.mgrSel == selId);
         bool vis = m.layerVisible(ly.id);
-        ui::FmRowRect r = ui::fmRowPill(sel);
-        // Liquid-glass pill DYED the layer color: a translucent left→right color tint over the glass
-        // (light alpha so it reads as a tint, text stays legible). BOUNDED to the rounded pill —
-        // a rounded base fill rounds the corners, then the gradient body is inset horizontally by the
-        // corner radius so it never pokes square corners past the selection box (Hunter round-4).
-        const ImVec4 c = layerSwatch(ly.copperIndex);
+        // fmRowPill(false): NEVER let the shared selection chrome paint its blue accent — a layer's
+        // highlight must read in the LAYER's own color, not the app accent (Hunter round-5b). The
+        // selected state is expressed below via a stronger layer-color dye + a layer-color border.
+        ui::FmRowRect r = ui::fmRowPill(false);
+        // Effective layer color: a per-layer override (picked via the swatch) wins over the
+        // copperIndex-derived default.
+        float ov[3];
+        const ImVec4 c = m.layerColor(ly.id, ov) ? ImVec4(ov[0], ov[1], ov[2], 1.0f)
+                                                  : layerSwatch(ly.copperIndex);
         auto dye = [&](float a) { return ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, a)); };
-        const ImU32 cL = dye(vis ? 0.34f : 0.16f), cR = dye(vis ? 0.05f : 0.02f);
+        // Liquid-glass pill DYED the layer color: a translucent left→right color tint over the glass
+        // (light alpha so it reads as a tint, text stays legible). BOUNDED to the rounded pill. When
+        // selected, the dye is stronger and a layer-color border frames the pill.
+        const float dl0 = sel ? (vis ? 0.55f : 0.30f) : (vis ? 0.34f : 0.16f);
+        const ImU32 cL = dye(dl0), cR = dye(vis ? (sel ? 0.10f : 0.05f) : 0.02f);
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const float s = sc, rr = 3.5f * s;
         ImVec2 mn(r.mn.x + 2.0f * s, r.mn.y + 2.0f * s), mx(r.mx.x - 2.0f * s, r.mx.y - 2.0f * s);
@@ -712,10 +713,20 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         // Left accent bar dyed the LAYER color (round-4: was the always-blue selection accent).
         dl->AddRectFilled(mn, ImVec2(mn.x + 3.0f * s, mx.y), dye(vis ? 0.95f : 0.45f), rr,
                           ImDrawFlags_RoundCornersLeft);
+        if (sel)   // layer-color selection border (replaces the app-accent border)
+            dl->AddRect(mn, mx, dye(vis ? 0.95f : 0.55f), rr, 0, std::max(1.0f, 1.4f * s));
+        // Circular color swatch to the LEFT of the text: click it to change the layer color. Drawn
+        // vertically centered in the pill and padded off the left edge (Hunter round-5b).
+        const float swR = 5.5f * s, swPad = 8.0f * s;
+        ImVec2 swC(r.mn.x + swPad + swR, (r.mn.y + r.mx.y) * 0.5f);
+        dl->AddCircleFilled(swC, swR, dye(1.0f), 16);
+        dl->AddCircle(swC, swR, ImGui::ColorConvertFloat4ToU32(ImVec4(0, 0, 0, 0.55f)), 16,
+                      std::max(1.0f, 1.0f * s));
+        const float swRightX = swC.x + swR;
         ImGui::AlignTextToFramePadding();
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 9.0f * sc);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (swRightX - r.mn.x) + 6.0f * sc);
         ImGui::TextColored(vis ? v4(pal.text) : v4(pal.textDisabled), "%s", ly.id.c_str());
-        ui::fmRowPillEnd(r, sel);
+        ui::fmRowPillEnd(r, false);
         // Right-edge eye toggle (show/hide the layer) — the SAME glyph + placement the Feature
         // Manager uses on its plane rows. Clicking elsewhere on the row selects it (fmRowPill glow).
         const float eyeSz = 14.0f * sc, eyePad = 6.0f * sc;
@@ -723,12 +734,28 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         ImVec2 eMax(eMin.x + eyeSz, eMin.y + eyeSz);
         const bool overEye = ImGui::IsMouseHoveringRect(eMin, eMax);
         ui::fmDrawEyeGlyph(eMin, eMax, vis, overEye);
-        if (overEye) {
+        // Swatch hit-test (generous square around the circle). Clicking opens the color picker.
+        ImVec2 swMin(swC.x - swR - 2.0f * s, swC.y - swR - 2.0f * s);
+        ImVec2 swMax(swC.x + swR + 2.0f * s, swC.y + swR + 2.0f * s);
+        const bool overSwatch = ImGui::IsMouseHoveringRect(swMin, swMax);
+        if (overSwatch) {
+            ImGui::SetTooltip("Change %s color", ly.id.c_str());
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) ImGui::OpenPopup("##layerColor");
+        }
+        if (ImGui::BeginPopup("##layerColor")) {
+            float col[3] = {c.x, c.y, c.z};
+            ImGui::TextUnformatted(ly.id.c_str());
+            if (ImGui::ColorPicker3("##pick", col,
+                                    ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_NoInputs))
+                m.setLayerColor(ly.id, col[0], col[1], col[2]);
+            ImGui::EndPopup();
+        }
+        if (!overSwatch && !overEye && ImGui::IsMouseHoveringRect(r.mn, r.mx) &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            es.mgrSel = sel ? std::string() : selId;   // toggle row selection
+        } else if (overEye) {
             ImGui::SetTooltip(vis ? "Hide %s" : "Show %s", ly.id.c_str());
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) m.setLayerVisible(ly.id, !vis);
-        } else if (ImGui::IsMouseHoveringRect(r.mn, r.mx) &&
-                   ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            es.mgrSel = sel ? std::string() : selId;   // toggle row selection
         }
         ImGui::PopID();
     };
@@ -1144,6 +1171,12 @@ void ecadEditorLoadResponse(const nlohmann::json& resp) {
 void drawEcadManagerBody(AppState& st, const ui::AdaptiveSurface& surf, unsigned int halo) {
     g_app = &st;
     drawEcadManagerBodyImpl(st, surf, (ImU32)halo);
+}
+
+const char* ecadManagerTitle() {
+    EcadEditorState& es = state();
+    if (!es.mirror.hasDoc()) return "PCB Manager";
+    return es.mirror.isPcb() ? "PCB Manager" : "Schematic Manager";
 }
 
 // See ecad_panel.h. Call once at the top of the app frame — cheap (one pointer store) — so a

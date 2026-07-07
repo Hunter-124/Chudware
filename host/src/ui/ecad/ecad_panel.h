@@ -47,6 +47,11 @@ void drawEcadEditor(AppState& st);
 // glass surface + icon halo (same ones used for the FeatureManager body) so icon/text tinting matches.
 void drawEcadManagerBody(AppState& st, const ui::AdaptiveSurface& surf, unsigned int halo);
 
+// Title for the manager's header chip ("PCB Manager" / "Schematic Manager"), reflecting the open
+// doc kind. The Electronics rail draws this chip beside its tab buttons (round-5b), so the header is
+// no longer owned by drawEcadManagerBody's body.
+const char* ecadManagerTitle();
+
 // Draw the PCB DRC / unrouted summary as a right-aligned glass pill in the ribbon band's trailing
 // dead space. Call from the app draw loop right after drawRibbon when the Electronics workspace is
 // active, passing the ribbon band's top Y (screen space) and height. No-op for schematic docs (they

@@ -29,6 +29,7 @@
 #include "property_manager.h"
 #include "sim_manager.h"
 #include "sketch_mode.h"
+#include "sketch3d_mode.h"
 
 namespace {
 
@@ -402,6 +403,85 @@ void ScenarioRunner::tick(AppState& st) {
                     break;
             }
             if (skStep <= 2) ++skStep;
+        }
+    }
+
+    // ---------- 3D sketch scenario (AI_CAD_SHOT=sketch3d) ----------
+    // new part -> add a sketch3d feature (Z-axis line chained into a 3-pt arc; fix + along_axis
+    // + coincident constraints) -> enter the 3D sketcher (overlay + toolbar + working-plane grid)
+    // -> screenshot -> constrained drag of the arc end via sketch3d_drag + edit_feature commit
+    // -> screenshot. Same per-step backbuffer capture mechanism as the 2D sketch scenario.
+    if (st.wantSketch3d && st.workerStarted && !st.sketch3dShotDone && st.frame >= 5) {
+        if (!s3DirReady) {
+            s3DirReady = true;
+            const char* repo = std::getenv("AI_CAD_REPO");
+            std::string base = repo ? std::string(repo) : std::string(".");
+            s3SavePath = base + "/scratch/sketch3d_shots";
+            std::error_code ec; std::filesystem::create_directories(s3SavePath, ec);
+        }
+        const int kSettle = 4;
+        if (s3Settle > 0) { --s3Settle; }
+        else if (s3Capture.empty()) {
+            std::string err;
+            switch (s3Step) {
+                case 0: {  // new part + sketch3d (line + 3-pt arc, constrained) + enter
+                    if (!st.docMirror.newPart(st.worker, err)) {
+                        std::printf("sketch3d: new_part FAILED: %s\n", err.c_str()); std::fflush(stdout);
+                        st.sketch3dShotDone = true; break;
+                    }
+                    nlohmann::json s3op = nlohmann::json::parse(R"JSON(
+                        {"op":"add_feature","feature":{"type":"sketch3d","name":"3DSketch1",
+                         "params":{
+                           "entities":[
+                             {"id":"e1","type":"line","construction":false,
+                              "p1":[0,0,0],"p2":[0,0,60]},
+                             {"id":"e2","type":"arc","construction":false,
+                              "p1":[0,0,60],"pm":[2.93,0,67.07],"p2":[10,0,70]}],
+                           "constraints":[
+                             {"id":"c1","type":"fix","refs":["e1.p1"]},
+                             {"id":"c2","type":"along_axis","refs":["e1"],"axis":"z"},
+                             {"id":"c3","type":"coincident","refs":["e1.p2","e2.p1"]}]}}}
+                    )JSON");
+                    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({s3op}));
+                    s3Fid = (r.ok && r.id_map.is_object() && r.id_map.contains("$0"))
+                                ? r.id_map["$0"].get<std::string>() : std::string("f1");
+                    bool entered = st.sketch3dMode && st.sketch3dMode->enterForFeature(st, s3Fid);
+                    st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
+                    st.pan[0] = st.pan[1] = st.pan[2] = 0.0f;
+                    std::printf("sketch3d: feature %s (line+arc) entered=%d ok=%d status=%s\n",
+                                s3Fid.c_str(), (int)entered, (int)r.ok,
+                                st.sketch3dMode ? st.sketch3dMode->statusLine().c_str() : "?");
+                    std::fflush(stdout);
+                    s3Capture = s3SavePath + "/sketch3d_01_enter.png"; s3Settle = kSettle;
+                    break;
+                }
+                case 1: {  // constrained drag of the arc end (transient) + edit_feature commit
+                    nlohmann::json dres;
+                    nlohmann::json dragP = {{"doc_id",st.docMirror.docId()},{"sketch",s3Fid},
+                        {"handle","e2.p2"},{"xyz",nlohmann::json::array({18.0,6.0,72.0})}};
+                    bool dok = st.worker.call("sketch3d_drag", dragP, dres, err) &&
+                               dres.value("ok", false);
+                    if (dok && dres.contains("entities")) {
+                        st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                            {{"op","edit_feature"},{"id",s3Fid},
+                             {"params",{{"entities",dres["entities"]}}}}}));
+                    }
+                    // re-enter refreshes the overlay from the committed doc
+                    if (st.sketch3dMode) st.sketch3dMode->enterForFeature(st, s3Fid);
+                    std::printf("sketch3d: drag e2.p2 ok=%d converged=%d; committed; status=%s\n",
+                                (int)dok, (int)dres.value("converged", false),
+                                st.sketch3dMode ? st.sketch3dMode->statusLine().c_str() : "?");
+                    std::fflush(stdout);
+                    s3Capture = s3SavePath + "/sketch3d_02_drag.png"; s3Settle = kSettle;
+                    break;
+                }
+                default:
+                    if (st.sketch3dMode) st.sketch3dMode->exitSketch(st, /*keep=*/true);
+                    st.sketch3dShotDone = true;
+                    std::printf("sketch3d: scenario complete\n"); std::fflush(stdout);
+                    break;
+            }
+            if (s3Step <= 1) ++s3Step;
         }
     }
 
@@ -1623,6 +1703,21 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
         }
         glfwSwapBuffers(st.win);
         return st.sketchShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+
+    // 3D sketch scenario: identical per-step capture mechanism.
+    if (st.wantSketch3d) {
+        ++st.frame;
+        if (!s3Capture.empty()) {
+            const char* mirror = s3Capture.find("sketch3d_02_drag") != std::string::npos
+                               ? screenshotPath : nullptr;
+            writeBackbufferPng(s3Capture.c_str(), dw, dh, mirror);
+            std::printf("sketch3d screenshot -> %s (%dx%d)\n", s3Capture.c_str(), dw, dh);
+            std::fflush(stdout);
+            s3Capture.clear();
+        }
+        glfwSwapBuffers(st.win);
+        return st.sketch3dShotDone ? FrameAction::Break : FrameAction::Continue;
     }
 
     // C20b assembly scenario: identical per-step capture mechanism.

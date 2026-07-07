@@ -26,6 +26,7 @@
 #include "file_dialog.h"   // C41: native Win32 Save/Open dialogs
 #include "icons.h"
 #include "sketch_mode.h"   // C18 (Edit Sketch context entry)
+#include "sketch3d_mode.h" // Edit 3D Sketch context/double-click entry
 #include "property_manager.h"  // sweep/loft PATH pick from the tree (routePathFeature)
 #include "appearance_common.h"  // W1-B (item 9): shared MaterialPreset table + appearance picker
 #include "cursors.h"        // C37-E: ResizeV cursor over the rollback bar
@@ -1081,6 +1082,10 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
                 auto* sk = st.sketchMode;
                 if (sk) sk->beginPlaneEdit(st, fid);
             }
+        } else if (c.type == "sketch3d") {
+            if (ImGui::MenuItem("Edit 3D Sketch")) {
+                if (st.sketch3dMode) st.sketch3dMode->enterForFeature(st, fid);
+            }
         } else if (c.editCallback && *c.editCallback) {
             if (ImGui::MenuItem("Edit")) (*c.editCallback)(fid);
         } else {
@@ -1265,6 +1270,7 @@ static bool featureModeIsCut(const nlohmann::json* feature) {
 
 static const char* featureIcon(const std::string& type, const nlohmann::json* feature = nullptr) {
     if (type == "sketch")           return "sketch_node";
+    if (type == "sketch3d")         return "spline";
     if (type == "extrude")          return featureModeIsCut(feature) ? "extrude_cut" : "extrude_boss";
     if (type == "revolve")          return featureModeIsCut(feature) ? "revolve_cut" : "revolve_boss";
     if (type == "sweep")            return featureModeIsCut(feature) ? "sweep_cut" : "sweep";
@@ -1323,6 +1329,7 @@ static const char* featureIcon(const std::string& type, const nlohmann::json* fe
 static const char* featureFallback(const std::string& type) {
     // Sketch
     if (type == "sketch")            return "[S]";
+    if (type == "sketch3d")          return "[3S]";
     // Solid operations (boss)
     if (type == "extrude")           return "[E]";
     if (type == "revolve")           return "[Rv]";
@@ -1389,7 +1396,7 @@ static const char* featureFallback(const std::string& type) {
 // Category color strip: thin left-edge accent by feature group.
 // Groups: sketch, solid-add, solid-cut, dress-up, pattern, datum, sheet-metal, weldment, surface.
 static ImU32 categoryColor(const std::string& type, bool isCut) {
-    if (type == "sketch")
+    if (type == "sketch" || type == "sketch3d")
         return IM_COL32(86, 152, 245, 180);   // soft blue
     if (isCut && (type == "extrude" || type == "revolve" ||
                   type == "sweep"   || type == "loft"))
@@ -2868,8 +2875,12 @@ void drawFeatureTreeBody(AppState& st,
                             selectFeatureInViewport(st, fid);
                         } else if (rr.clicked && st.propertyManager && st.propertyManager->active() &&
                             st.propertyManager->activeWellWantsPathFeature() &&
-                            (ftype == "sketch" || ftype == "helix" || ftype == "curve")) {
-                            const bool isCurve = (ftype == "helix" || ftype == "curve");
+                            (ftype == "sketch" || ftype == "sketch3d" || ftype == "helix" ||
+                             ftype == "curve")) {
+                            // sketch3d wires are sweep path/guide material (bare fid = single
+                            // chain; the engine rejects a multi-chain bare fid loudly).
+                            const bool isCurve = (ftype == "helix" || ftype == "curve" ||
+                                                  ftype == "sketch3d");
                             st.propertyManager->routePathFeature(fid, fname, isCurve);
                             selectedFeatureId = fid;
                             s_multiSel.clear();
@@ -2880,6 +2891,8 @@ void drawFeatureTreeBody(AppState& st,
                             selectFeatureInViewport(st, fid);
                             if (ftype == "sketch") {
                                 if (st.sketchMode) st.sketchMode->enterForFeature(st, fid);
+                            } else if (ftype == "sketch3d") {
+                                if (st.sketch3dMode) st.sketch3dMode->enterForFeature(st, fid);
                             } else if (editCallback) {
                                 editCallback(fid);
                             }

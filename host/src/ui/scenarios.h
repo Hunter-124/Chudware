@@ -73,6 +73,12 @@ private:
     bool skDirReady = false;
     std::string sketchCapture;  // same per-step capture mechanism, separate path slot
 
+    // ---------- 3D sketch scenario (AI_CAD_SHOT=sketch3d) ----------
+    int s3Step = 0, s3Settle = 0;
+    std::string s3SavePath, s3Fid;
+    bool s3DirReady = false;
+    std::string s3Capture;  // same per-step capture mechanism, separate path slot
+
     // ---------- C20b assembly scenario (AI_CAD_SHOT=asm) ----------
     int asmStep = 0, asmSettle = 0;
     std::string asmSavePath, asmBasePath, asmPegPath, asmDoc, asmK2;

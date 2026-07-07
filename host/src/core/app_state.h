@@ -44,6 +44,7 @@ namespace ui {
 class PropertyManager;
 class ConfigPanel;
 class SketchMode;
+class Sketch3DMode;   // 3D free-space sketcher (sketch3d features) — app-wide singleton
 class SimManager;
 class AsmPanels;
 class ActivityPanel;
@@ -1054,6 +1055,9 @@ struct AppState {
     // Drawing / ECAD tab). Set once in run_gui; never null after startup.
     ui::PropertyManager* fallbackPropertyManager = nullptr;
     ui::SketchMode*      fallbackSketchMode      = nullptr;
+    // 3D sketcher (sketch3d features). Single app-wide instance owned by run_gui (NOT per
+    // DocSession — it guards its doc id and auto-exits on a doc switch). Never null after startup.
+    ui::Sketch3DMode*    sketch3dMode            = nullptr;
     ui::EvaluateDialogs* fallbackEvaluate        = nullptr;
     // Configurations left-pane tab (SolidWorks ConfigurationManager). The live ConfigPanel is owned
     // by run_gui and borrowed here so ui::drawLeftPane's Configurations case can render it
@@ -1098,6 +1102,8 @@ struct AppState {
     ui::SketchMode* sketchMode = nullptr;  // active doc's sketch (per DocSession; re-seated on switch)
     bool wantSketch = false;           // AI_CAD_SHOT=sketch scripted flow
     bool sketchShotDone = false;       // guard so the sketch scenario runs once per shot
+    bool wantSketch3d = false;         // AI_CAD_SHOT=sketch3d scripted 3D-sketch flow
+    bool sketch3dShotDone = false;     // guard so the sketch3d scenario runs once per shot
 
     // ---- EvaluateDialogs (C19) — Measure / Mass / Section windows; per-document like the PM ----
     // Re-seated on tab switch so a measurement window/log on one part is independent of another's —

@@ -215,3 +215,27 @@ Semantics (mirrors 2D `sketch_drag`):
    optimization, API-compatible.
 6. MCP `sketch3d_*` tools (services/mcp/sketch3d_tools.py) still speak the SESSION-scoped
    Python store, not this feature — re-pointing map in that file's header TODO.
+
+## 8. GUI v1 — working-plane scheme (host/src/ui/sketch3d_mode.{h,cpp})
+
+How the desktop 3D sketcher places free-space points (documented here per the GUI work order):
+
+- Points are placed by ray-casting the cursor onto a **movable working plane**. Presets, cycled
+  with **Tab** or the overlay-toolbar buttons: `XY` (default), `XZ`, `YZ`, `View` (view-aligned,
+  re-derived from the live camera every frame).
+- The plane is **anchored at the last placed point** of the in-progress tool (the origin when
+  idle), so a polyline chain can turn in space by switching presets mid-chain.
+- **Snapping** (beats the plane): existing sketch3d point handles + the world origin within
+  10 px — the click lands on the exact 3D point and a `coincident` constraint is emitted
+  (origin snap is positional only). **Axis inference**: with a previous tool point, the
+  candidate is pulled onto the X/Y/Z line through it when within 6 px on screen; an
+  axis-snapped Line segment gets a real `along_axis` constraint.
+- **Camera**: NOT plane-locked (free-space). MMB orbit / Ctrl+MMB pan / Shift+MMB+wheel zoom
+  stay live — but ALL camera input freezes while an LMB entity drag is armed/live (dead-zone
+  rule; DPI-scaled 5 px arm threshold, quadratic edge auto-pan is the only view motion).
+- **Drag**: handle drags move on the screen-parallel plane through the handle's press position;
+  transient `sketch3d_drag` once per frame, committed on release as ONE `edit_feature` (§4.3).
+- Gated in GUI v1 (honest list): repositioning the working plane onto a picked model FACE,
+  snapping to model (B-rep) vertices, in-viewport wire picking for sweep wells (sketch3d wires
+  are picked from the FEATURE TREE into path/guide wells; multi-chain `{feature,wire:k}` refs
+  need the tree->health wire index flow, not yet surfaced).

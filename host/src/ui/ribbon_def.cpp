@@ -586,6 +586,11 @@ static const RibbonCmd kCmds[] = {
     { "ref_point",         "Ref. Point",  "ref_point",       "EM",      "Reference", false, nullptr, false },
     { "ref_csys",          "Coord. Sys.", "ref_csys",        "EM",      "Reference", false, nullptr, false },
 
+    // --- 3D Sketch (sketch3d features): entry point on Features + Sketch tabs. Creates a
+    //     sketch3d feature and enters the free-space sketcher; the in-mode tools (line / 3-pt
+    //     arc / spline / point, working-plane presets, constraints) live on the viewport
+    //     overlay toolbar (sketch3d_mode.cpp), not the ribbon. ---
+    { "sketch3d_new",      "3D Sketch",   "spline",          "Features", "Sketch",   true,  nullptr, false },
 };
 // clang-format on
 

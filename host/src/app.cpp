@@ -64,6 +64,7 @@
 #include "ui/ribbon_def.h"
 #include "ui/property_manager.h"
 #include "ui/sketch_mode.h"   // C18
+#include "ui/sketch3d_mode.h" // 3D free-space sketcher (sketch3d features)
 #include "ui/config_panel.h"  // Configurations (SolidWorks ConfigurationManager)
 #include "ui/design_table_panel.h"  // Design Table (SolidWorks editable config grid)
 #include "ui/cutlist_panel.h"  // Weldment Cut List (SolidWorks Weldment Cut List)
@@ -927,6 +928,10 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     st.sketchMode = &sketchMode;
     st.fallbackSketchMode = &sketchMode;
 
+    // 3D sketcher (sketch3d features) — app-wide singleton (guards its doc id itself).
+    ui::Sketch3DMode sketch3dMode;
+    st.sketch3dMode = &sketch3dMode;
+
     // Configurations panel (SolidWorks ConfigurationManager) — owned here. The Configurations
     // left-pane tab renders it (ConfigPanel::drawEmbedded) via st.configPanel; there is no
     // standalone dock window for it anymore.
@@ -998,6 +1003,8 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         if (propertyManager.active() && std::strcmp(cmd_id, "sketch_new") == 0)
             propertyManager.cancelEdits(st);
         if (sketchMode.onRibbonCommand(st, cmd_id)) return;       // C18 sketch tool handled
+        // 3D sketch entry point + exit (all in-mode tools live on the viewport overlay toolbar).
+        if (st.sketch3dMode && st.sketch3dMode->onRibbonCommand(st, cmd_id)) return;
         // Wave 4C/4D: Edit-menu copy / cut / paste. The menu bar fires these ids; they route exactly
         // like the global Ctrl+C/X/V keys (sketch first when active, else the FeatureManager). Copy
         // routed AFTER onRibbonCommand so an armed sketch tool doesn't swallow "edit_copy" — these
@@ -1436,6 +1443,8 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     if (st.wantEcad) { st.showPcbTools = true; st.showRibbon = true; st.ribbonTab = AppState::RT_PCB; }  // PCB tab forward
     st.wantSketch = shot && shotMode && std::strcmp(shotMode, "sketch") == 0;  // C18 sketch flow
     if (st.wantSketch) { st.showRibbon = true; st.ribbonTab = AppState::RT_Sketch; }  // Sketch tab forward
+    st.wantSketch3d = shot && shotMode && std::strcmp(shotMode, "sketch3d") == 0;  // 3D sketcher flow
+    if (st.wantSketch3d) { st.showRibbon = true; st.showFeatureTree = true; }
     st.wantFea = shot && shotMode && std::strcmp(shotMode, "fea") == 0;       // C19 static study
     st.wantCam = shot && shotMode && std::strcmp(shotMode, "cam") == 0;       // CAM copilot fast-path
     if (st.wantCam) { st.showRibbon = true; st.ribbonTab = AppState::RT_Manufacture; }

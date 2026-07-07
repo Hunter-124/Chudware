@@ -688,13 +688,11 @@ void configureShot(app::AppState& st, ShotConfig& cfg, const char* shotEnv,
         std::fflush(stdout);
     }
     if (cfg.wantWsMotionStudy) {
-        // Kinematics acceptance gate: switch to Simulate workspace so the study tree
-        // + motion transport bar chrome renders. Study creation happens in tickSimpleShots
-        // after the first tick (once the SimManager is ready — no worker required for
-        // the new-study RPC path as sim_new_* only mutates local state).
+        // Kinematics acceptance gate: step machine runs in tick().
+        // Pre-switch to Simulate so the initial frame shows the right workspace chrome.
         st.workspace = cmd::Workspace::Simulate;
         ribbon::applyShotEnv(st);
-        std::printf("ws_motion_study: kinematic motion study — Simulate workspace chrome\n");
+        std::printf("ws_motion_study: kinematics acceptance gate — step machine starting\n");
         std::fflush(stdout);
     }
     if (cfg.wantMultidoc) st.railTab = 0;
@@ -1582,12 +1580,8 @@ void ScenarioRunner::tickSimpleShots(ShotConfig& cfg, app::AppState& st) {
         std::printf("ws_parts: Parts Library workspace — catalog browser ready\n");
         std::fflush(stdout);
     }
-    if (cfg.wantWsMotionStudy && !cfg.wsMotionStudyShotDone) {
-        cfg.wsMotionStudyShotDone = true;
-        st.workspace = cmd::Workspace::Simulate;
-        std::printf("ws_motion_study: kinematic motion study — Simulate workspace visible\n");
-        std::fflush(stdout);
-    }
+    // ws_motion_study is handled by a dedicated step machine in tick() (not a simple one-frame shot)
+    // so it is intentionally absent here.
 }
 
 void ScenarioRunner::tickGlassperf(ShotConfig& cfg, app::AppState& st) {
@@ -3038,6 +3032,187 @@ void ScenarioRunner::tick(ShotConfig& cfg, app::AppState& st) {
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // ws_motion_study: kinematics acceptance gate
+    // Build a two-body angle-driven assembly, solve simulate_motion (synchronous), then
+    // capture frame-0 (rest pose) and the mid-trajectory frame (body visibly moved).
+    // Uses synthetic face selectors — no doc_query needed because box geometry is known.
+    // ---------------------------------------------------------------------------
+    if (cfg.wantWsMotionStudy && st.workerStarted && !cfg.wsMotionStudyShotDone) {
+        if (!msDirReady) {
+            msDirReady = true;
+            msSavePath = repoBase() + "/scratch/motion_shots";
+            msArmPath  = msSavePath + "/arm.step+";
+            msGndPath  = msSavePath + "/ground.step+";
+            std::error_code ec; std::filesystem::create_directories(msSavePath, ec);
+        }
+
+        // Helper: build a box part and save it
+        auto makeBoxPart = [&](const std::string& name, double L, double W, double H,
+                                const std::string& path) -> bool {
+            nlohmann::json res, ops = nlohmann::json::array();
+            ops.push_back({{"op","add_feature"},{"feature",{
+                {"type","box"},{"name",name},
+                {"params",{{"length",dim(L)},{"width",dim(W)},{"height",dim(H)}}}}}});
+            std::string err;
+            if (!st.worker.call("doc_new", {{"kind","part"},{"name",name}}, res, err)) return false;
+            std::string did = res.value("doc_id", std::string());
+            int rev = res.value("revision", 0);
+            nlohmann::json ap2;
+            if (!st.worker.call("doc_apply_ops",
+                    {{"doc_id",did},{"base_revision",rev},{"ops",ops}}, ap2, err)) return false;
+            nlohmann::json sv;
+            if (!st.worker.call("doc_save", {{"doc_id",did},{"path",path}}, sv, err)) return false;
+            nlohmann::json cl;
+            st.worker.call("doc_close", {{"doc_id",did}}, cl, err);
+            return true;
+        };
+
+        const int kSettle = 4;
+        if (msSettle > 0) { --msSettle; return; }
+        if (!msCapture.empty()) return;
+
+        switch (msStep) {
+            case 0: {
+                // Build Arm (40x4x4) and Ground (40x4x4, used as fixed reference) parts
+                bool ok = makeBoxPart("Arm",    40, 4, 4, msArmPath)
+                       && makeBoxPart("Ground", 40, 4, 4, msGndPath);
+                if (!ok) { std::printf("ws_motion_study: part build failed\n"); cfg.wsMotionStudyShotDone = true; break; }
+                msSettle = 2; ++msStep; break;
+            }
+            case 1: {
+                // Create assembly, insert Ground (fixed, far +Y) and Arm (free at origin)
+                std::string err;
+                nlohmann::json res;
+                if (!st.worker.call("doc_new", {{"kind","assembly"},{"name","SwingArm"}}, res, err)) {
+                    std::printf("ws_motion_study: doc_new assembly failed: %s\n", err.c_str());
+                    cfg.wsMotionStudyShotDone = true; break;
+                }
+                msAsmDocId = res.value("doc_id", std::string());
+                int rev = res.value("revision", 0);
+                // Ground placed far +Y so it never enters the Arm's swing arc
+                std::vector<double> gndXf = {1,0,0,0, 0,1,0,200, 0,0,1,0, 0,0,0,1};
+                nlohmann::json insertOps = nlohmann::json::array();
+                insertOps.push_back({
+                    {"op","asm_insert_component"},
+                    {"source",{{"path",msGndPath}}},
+                    {"name","Ground"},{"fixed",true},
+                    {"transform",gndXf}});
+                insertOps.push_back({
+                    {"op","asm_insert_component"},
+                    {"source",{{"path",msArmPath}}},
+                    {"name","Arm"},{"fixed",false}});
+                nlohmann::json r2;
+                if (!st.worker.call("doc_apply_ops",
+                        {{"doc_id",msAsmDocId},{"base_revision",rev},{"with_tess",false},
+                         {"ops",insertOps}}, r2, err)) {
+                    std::printf("ws_motion_study: insert components failed: %s\n", err.c_str());
+                    cfg.wsMotionStudyShotDone = true; break;
+                }
+                // Get the new revision and add mates:
+                // - angle mate between the +X end faces of Ground(k1) and Arm(k2) → driven
+                // - parallel mate between the top (+Z) faces → DOF lock (keeps motion in-plane)
+                // Arm is 40x4x4: the +X face has centroid [20,0,0] normal [1,0,0];
+                //                 the +Z face has centroid [0,0,2] normal [0,0,1].
+                nlohmann::json endFace = {{"kind","face"},{"centroid",{20.0,0.0,0.0}},{"normal",{1.0,0.0,0.0}}};
+                nlohmann::json topFace = {{"kind","face"},{"centroid",{0.0,0.0,2.0}},{"normal",{0.0,0.0,1.0}}};
+                nlohmann::json rev2Res;
+                st.worker.call("doc_tree", {{"doc_id",msAsmDocId}}, rev2Res, err);
+                int rev2 = rev2Res.value("revision", rev + 1);
+                nlohmann::json mateOps = nlohmann::json::array();
+                mateOps.push_back({{"op","asm_add_mate"},{"mate",{
+                    {"type","angle"},{"align","aligned"},{"suppressed",false},
+                    {"refs",{{{"component","k1"},{"selector",endFace}},
+                             {{"component","k2"},{"selector",endFace}}}},
+                    {"value",{{"value",0.0}}}}}});
+                mateOps.push_back({{"op","asm_add_mate"},{"mate",{
+                    {"type","parallel"},{"align","aligned"},{"suppressed",false},
+                    {"refs",{{{"component","k1"},{"selector",topFace}},
+                             {{"component","k2"},{"selector",topFace}}}}}}});
+                nlohmann::json r3;
+                if (!st.worker.call("doc_apply_ops",
+                        {{"doc_id",msAsmDocId},{"base_revision",rev2},{"with_tess",false},
+                         {"ops",mateOps}}, r3, err)) {
+                    std::printf("ws_motion_study: add mates failed: %s\n", err.c_str());
+                    cfg.wsMotionStudyShotDone = true; break;
+                }
+                // Get the drive mate id from the id_map (first op → "$0")
+                if (r3.contains("id_map") && r3["id_map"].contains("$0"))
+                    msDriveMateId = r3["id_map"]["$0"].get<std::string>();
+                // Load the assembly into the current doc mirror and viewport
+                st.docMirror.setDocId(msAsmDocId);
+                st.workspace = cmd::Workspace::Simulate;
+                msSettle = kSettle; ++msStep; break;
+            }
+            case 2: {
+                // Run simulate_motion synchronously via worker.call (same path as SimManager::runMotion)
+                nlohmann::json params = {
+                    {"doc_id", msAsmDocId},
+                    {"start",  0.0},
+                    {"stop",   90.0},
+                    {"steps",  9},   // 10 frames: 0°,10°,20°,...,90°
+                    {"check_interference", false}
+                };
+                if (!msDriveMateId.empty()) params["mate_id"] = msDriveMateId;
+                nlohmann::json res; std::string err;
+                if (!st.worker.call("simulate_motion", params, res, err) || !res.value("ok",false)) {
+                    std::string msg = res.value("error", err.empty() ? std::string("simulate_motion failed") : err);
+                    std::printf("ws_motion_study: simulate_motion failed: %s\n", msg.c_str());
+                    cfg.wsMotionStudyShotDone = true; break;
+                }
+                msTrajectory  = res.value("trajectory", nlohmann::json::array());
+                msTotalFrames = (int)msTrajectory.size();
+                // Get drive_mate_id from result (engine may auto-pick)
+                if (!res.value("mate_id", std::string()).empty())
+                    msDriveMateId = res["mate_id"].get<std::string>();
+                std::printf("ws_motion_study: simulate_motion OK — %d frames, mate=%s\n",
+                            msTotalFrames, msDriveMateId.c_str());
+                std::fflush(stdout);
+                // Apply frame 0 to the viewport via the sim manager
+                if (msTotalFrames > 0) {
+                    auto& sm = ui::simManager();
+                    sm.handleCommand(st, "sim_new_motion");
+                    auto* study = sm.activeStudy();
+                    if (study) {
+                        study->motionHasResult  = true;
+                        study->motionTrajectory = msTrajectory;
+                        study->motionFrame      = 0;
+                        study->motionPlaying    = false;
+                        study->hasResult        = true;
+                        sm.applyMotionFrame(st, *study, 0);
+                    }
+                }
+                msSettle = kSettle; ++msStep; break;
+            }
+            case 3: {
+                // Capture frame-0 (rest pose, Arm at 0°)
+                msCapture = msSavePath + "/motion_frame0.png";
+                cfg.wsMotionStudyFrame0Done = true;
+                std::printf("ws_motion_study: capturing frame-0 (rest pose)\n");
+                std::fflush(stdout);
+                msSettle = kSettle; ++msStep; break;
+            }
+            case 4: {
+                // Apply mid-trajectory frame (Arm rotated ~45°) and capture
+                if (msTotalFrames > 1) {
+                    int mid = msTotalFrames / 2;
+                    auto& sm = ui::simManager();
+                    auto* study = sm.activeStudy();
+                    if (study) sm.applyMotionFrame(st, *study, mid);
+                    std::printf("ws_motion_study: applying mid frame %d/%d\n", mid, msTotalFrames);
+                    std::fflush(stdout);
+                }
+                msCapture = msSavePath + "/motion_mid.png";
+                msSettle = kSettle; ++msStep; break;
+            }
+            default:
+                cfg.wsMotionStudyShotDone = true;
+                std::printf("ws_motion_study: kinematics gate complete — frame0 + mid captured\n");
+                std::fflush(stdout);
+                break;
+        }
+    }
+
     runMultidoc(cfg, st);
     runDrawing(cfg, st);
     runIconPipe(cfg, st);
@@ -3469,6 +3644,21 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(ShotConfig& cfg, app::AppSt
         if (!asmCapture.empty() && !st.rpc.busy()) { mirrorLast(asmCapture, "asm_01_seated"); asmCapture.clear(); }
         if (win) glfwSwapBuffers(win);
         return cfg.asmShotDone ? FrameAction::Break : FrameAction::Continue;
+    }
+    if (cfg.wantWsMotionStudy) {
+        // Two captures: motion_frame0 (Arm at 0°) and motion_mid (Arm at ~45°).
+        // The primary screenshotPath receives the LAST capture (mid-trajectory) so the
+        // integration-gate image shows actual body movement.
+        if (!msCapture.empty()) {
+            const bool isMid = msCapture.find("motion_mid") != std::string::npos;
+            writeBackbufferPng(msCapture.c_str(), dw, dh, isMid ? screenshotPath : nullptr);
+            std::printf("ws_motion_study: screenshot -> %s (%dx%d)%s\n",
+                        msCapture.c_str(), dw, dh, isMid ? " [primary]" : "");
+            std::fflush(stdout);
+            msCapture.clear();
+        }
+        if (win) glfwSwapBuffers(win);
+        return cfg.wsMotionStudyShotDone ? FrameAction::Break : FrameAction::Continue;
     }
     if (cfg.wantFea) {
         if (cfg.feaShotDone) {

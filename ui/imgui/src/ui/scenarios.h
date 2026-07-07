@@ -117,8 +117,10 @@ struct ShotConfig {
     bool wsManufactureShotDone = false;
     bool wantWsParts       = false;
     bool wsPartsShotDone   = false;
-    bool wantWsMotionStudy = false;   // kinematics acceptance gate
+    bool wantWsMotionStudy = false;   // kinematics acceptance gate (step machine)
     bool wsMotionStudyShotDone = false;
+    bool wsMotionStudyFrame0Done = false;  // first capture (t=0 pose)
+    // (mid-trajectory capture is second; wsMotionStudyShotDone = true after both)
 
     // T-G22: per-tab settings shots + composer dropdown + permissions popup
     bool wantSettingsGeneral = false;
@@ -201,7 +203,8 @@ struct ShotConfig {
         return wantM1 || wantSketch || wantSketchDispatch || wantSketchAutohide || wantSketchConvert
             || wantAsm || wantFea || wantFeaOverlay || wantFlow || wantCam || wantDrawing
             || wantEvalMass || wantActivity || wantMultidoc || wantIconPipe
-            || wantSimMaterial || wantSimPrecheck || wantSimPostcheck;
+            || wantSimMaterial || wantSimPrecheck || wantSimPostcheck
+            || wantWsMotionStudy;   // kinematics gate: full step-machine, not a simple shot
     }
 
     // Frame budget for the generic capture path (flow allows ~240 s at 60 Hz).
@@ -308,6 +311,20 @@ private:
     int ipIndex = 0, ipPx = 128;
     std::string ipOutDir;
     std::vector<nlohmann::json> ipRecipes;
+
+    // ws_motion_study (kinematics acceptance gate): two-body angle-driven assembly → two captures
+    // Step 0: build Arm + Ground parts + save as .step+
+    // Step 1: new assembly, insert both components (Ground fixed, Arm free), add angle + parallel mates
+    // Step 2: call simulate_motion (synchronous worker.call, fills motionTrajectory)
+    // Step 3: applyMotionFrame(0), settle, capture frame-0 shot
+    // Step 4: applyMotionFrame(mid), settle, capture mid-trajectory shot
+    int  msStep = 0, msSettle = 0;
+    bool msDirReady = false;
+    std::string msSavePath, msArmPath, msGndPath;
+    std::string msAsmDocId, msDriveMateId;
+    std::string msCapture;
+    nlohmann::json msTrajectory;
+    int  msTotalFrames = 0;
 };
 
 // Bind runner + config for the frame loop (main.cpp calls once after configureShot).

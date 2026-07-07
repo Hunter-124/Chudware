@@ -152,7 +152,10 @@ void drawWorkspaceChips(AppState& s, float originX, float height) {
                     } else if (dt == cmd::DocType::Pcb) {
                         s.workspace = cmd::Workspace::Board;
                     } else {
-                        s.dispatch("ecad_new_sch");
+                        // No ECAD doc open: switch to Schematic workspace to
+                        // show the ECAD landing page (New / Open buttons),
+                        // rather than immediately creating an empty schematic.
+                        s.workspace = cmd::Workspace::Schematic;
                     }
                 } else if (w == cmd::Workspace::Simulate) {
                     if (dt == cmd::DocType::Part || dt == cmd::DocType::Assembly) {

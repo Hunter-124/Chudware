@@ -169,9 +169,39 @@ static const char* studyTypeIcon(StudyType t) {
         case StudyType::Flow:    return "study_flow";
         case StudyType::Fatigue: return "study_fatigue";
         case StudyType::Thermal: return "study_thermal";
-        case StudyType::Motion:  return "study_motion";   // graceful miss: IconUV::valid guards callers
+        case StudyType::Motion:  return "rotate_component";  // no dedicated study_motion sprite; the
+                                                             // rotation-gizmo glyph reads as motion and
+                                                             // is a real atlas icon (picker + study tree)
         default:                 return "study_static";
     }
+}
+
+// Frosted-glass backing for a popup, so the "New study" picker floats as part of the app-wide glass
+// family (matching the drawing-mode dialogs + section tool) instead of ImGui's flat legacy PopupBg.
+// Call once right after BeginPopup() succeeds (pair with SetNextWindowBgAlpha(0) BEFORE BeginPopup);
+// finish() paints the frosted panel behind the content and merges the split.
+struct GlassPopupScope {
+    ImDrawList* dl = nullptr;
+    const char* id = nullptr;
+    void finish() {
+        const float s = ui::uiScale;
+        ImVec2 p0 = ImGui::GetWindowPos();
+        ImVec2 p1(p0.x + ImGui::GetWindowSize().x, p0.y + ImGui::GetWindowSize().y);
+        dl->ChannelsSetCurrent(0);
+        const ui::AdaptiveSurface& surf =
+            ui::adaptivePanel(ui::panelId(id), ImRect(p0, p1), ui::GlassGroup::Hud);
+        ui::glassPanel(dl, ImRect(p0, p1), ui::GlassLevel::Regular,
+                       ImGui::GetStyle().PopupRounding / s, surf);
+        dl->ChannelsMerge();
+    }
+};
+static GlassPopupScope beginGlassPopup(const char* panelId) {
+    GlassPopupScope sc;
+    sc.dl = ImGui::GetWindowDrawList();
+    sc.id = panelId;
+    sc.dl->ChannelsSplit(2);
+    sc.dl->ChannelsSetCurrent(1);
+    return sc;
 }
 
 // One-line study-type intent banner on a translucent glass card (type icon + description). Part of
@@ -2607,40 +2637,87 @@ void SimManager::drawTreeBody(AppState& st) {
         ImGui::OpenPopup("##newStudyPicker");
     simTip("Add a simulation study to this part. Static, Fatigue, Frequency, Flow, or Thermal.");
 
+    const float S2 = ui::uiScale;
+    ImGui::SetNextWindowBgAlpha(0.0f);   // suppress the flat PopupBg — the glass panel replaces it
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * S2, 10.0f * S2));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * S2, 3.0f * S2));
     if (ImGui::BeginPopup("##newStudyPicker")) {
-        struct SEntry { StudyType type; const char* name; const char* desc; };
-        static const SEntry kEntries[] = {
-            { StudyType::Static,  "Static",    "Linear stress, displacement and factor of safety." },
-            { StudyType::Fatigue, "Fatigue",   "Cyclic loading life using Goodman/Gerber/Soderberg." },
-            { StudyType::Modal,   "Frequency", "Natural frequencies and mode shapes." },
-            { StudyType::Flow,    "Flow",      "External aerodynamics: drag, lift and streamlines." },
-            { StudyType::Thermal, "Thermal",   "Heat transfer via OpenFOAM convection / CHT." },
-            { StudyType::Motion,  "Motion",    "Drive a dimensional mate, play back body trajectory." },
+        GlassPopupScope glass = beginGlassPopup("sim_new_study_popup");
+        pushCardText();          // re-pair the adaptive ink for the frosted popup surface
+        ui::fmRowStripeReset();  // refresh the FM palette + restart the row stripe phase
+
+        // A study row can create either an in-part FEA/CFD study (newStudy) or route into the EM
+        // panel (handleEmCommand — which honours the em_status solver gate).
+        enum class Kind { Fea, Em };
+        struct SEntry { Kind kind; StudyType type; const char* name; const char* icon; const char* desc; };
+        const SEntry kEntries[] = {
+            { Kind::Fea, StudyType::Static,  "Static",          studyTypeIcon(StudyType::Static),
+              "Linear stress, displacement and factor of safety." },
+            { Kind::Fea, StudyType::Fatigue, "Fatigue",         studyTypeIcon(StudyType::Fatigue),
+              "Cyclic-load life (Goodman / Gerber / Soderberg)." },
+            { Kind::Fea, StudyType::Modal,   "Frequency",       studyTypeIcon(StudyType::Modal),
+              "Natural frequencies and mode shapes." },
+            { Kind::Fea, StudyType::Flow,    "Flow",            studyTypeIcon(StudyType::Flow),
+              "External aerodynamics: drag, lift, streamlines." },
+            { Kind::Fea, StudyType::Thermal, "Thermal",         studyTypeIcon(StudyType::Thermal),
+              "Heat transfer via OpenFOAM convection / CHT." },
+            { Kind::Fea, StudyType::Motion,  "Motion",          studyTypeIcon(StudyType::Motion),
+              "Drive a dimensional mate, play back the trajectory." },
+            { Kind::Em,  StudyType::Static,  "Electromagnetic", "cat_electronics",
+              "Full-wave RF: eigenmode, S-parameters, time domain." },
         };
-        pushCardText();  // popup fills with theme glassBg — re-pair the pane's adaptive text
-        ImGui::TextDisabled("Select study type");
-        ImGui::Separator();
-        const float S2 = ui::uiScale;
+
+        // Title.
+        ImGui::PushFont(st.fonts.medium);
+        pushDimText();
+        ImGui::TextUnformatted("New study");
+        popDimText();
+        ImGui::PopFont();
+        ImGui::Dummy(ImVec2(0, 2.0f * S2));
+
+        const float iconSz = 18.0f * S2;
+        const float nameCol = 108.0f * S2;   // fixed name column so descriptions align
+        Kind chosenKind = Kind::Fea;
+        StudyType chosenType = StudyType::Static;
+        bool picked = false;
         for (const auto& e : kEntries) {
-            ImGui::PushID((int)e.type);
-            IconUV iv = getIcon(studyTypeIcon(e.type), 20);
-            if (iv.valid) {
-                ImGui::Image(iv.texId, ImVec2(16.0f * S2, 16.0f * S2), iv.uv0, iv.uv1);
-                ImGui::SameLine(0, 6.0f * S2);
-            }
-            ImGui::PushFont(st.fonts.medium);
-            bool hit = ImGui::Selectable(e.name, false, 0, ImVec2(80.0f * S2, 0));
-            ImGui::PopFont();
+            ImGui::PushID(e.name);
+            ui::FmRowRect r = ui::fmRowPill(false);
+            const float startX = ImGui::GetCursorPosX();
+            ImGui::AlignTextToFramePadding();
+            IconUV iv = getIcon(e.icon, 20);
+            if (iv.valid)
+                ImGui::Image(iv.texId, ImVec2(iconSz, iconSz), iv.uv0, iv.uv1);
+            else
+                ImGui::Dummy(ImVec2(iconSz, iconSz));
             ImGui::SameLine(0, 8.0f * S2);
+            ImGui::PushFont(st.fonts.medium);
+            ImGui::TextUnformatted(e.name);
+            ImGui::PopFont();
+            ImGui::SameLine(0, 0);
+            ImGui::SetCursorPosX(startX + iconSz + 8.0f * S2 + nameCol);
             pushDimText();
             ImGui::TextUnformatted(e.desc);
             popDimText();
-            if (hit) { newStudy(st, e.type); ImGui::CloseCurrentPopup(); }
+            ui::fmRowPillEnd(r, false);
+            if (ImGui::IsMouseHoveringRect(r.mn, r.mx) &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                chosenKind = e.kind; chosenType = e.type; picked = true;
+            }
             ImGui::PopID();
         }
+
         popCardText();
+        glass.finish();
+        // Act AFTER the loop so a routed EM command (which mutates panel state) doesn't run mid-draw.
+        if (picked) {
+            if (chosenKind == Kind::Em) handleEmCommand(st, "sim_em_eigen");
+            else                        newStudy(st, chosenType);
+            ImGui::CloseCurrentPopup();
+        }
         ImGui::EndPopup();
     }
+    ImGui::PopStyleVar(2);
     ImGui::Spacing();
 
     if (!st.docMirror.hasDoc()) {

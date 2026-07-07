@@ -1,0 +1,422 @@
+// AI-CAD UI theme: named palette roles, two palettes (dark/teal + SolidWorks-light),
+// runtime-switchable. applyTheme(Theme, scale) fills ImGuiStyle + the global palette;
+// all panels read ONLY role fields — never hardcode ImVec4/ImU32 colors in panel code.
+#pragma once
+#include <cstdint>
+#include <string>
+
+#include "imgui.h"
+#include "imgui_internal.h"   // ImRect (adaptivePanel/glassPanel rects), ImHashStr (panelId)
+
+namespace ui {
+
+struct Fonts {
+    ImFont* body = nullptr;    // Rubik Regular
+    ImFont* medium = nullptr;  // Rubik Medium (labels/buttons)
+    ImFont* h1 = nullptr;      // Rubik Bold (titles)
+    ImFont* h2 = nullptr;      // Rubik SemiBold (section headers)
+    ImFont* mono = nullptr;    // JetBrains Mono (code/console)
+};
+
+// Canonical theme identifiers.
+enum class Theme { Dark, Light };
+
+// ~40 named palette roles — the ONLY way panels should reference colors.
+// All values are ImVec4-compatible floats (r,g,b,a in 0..1), or ImU32 for draw-list calls.
+// Panels use the float[4] fields; for draw-list IM_COL32 use palette.toU32(field).
+struct Palette {
+    // ---- chrome ----
+    float windowBg[4]      = {0.082f,0.090f,0.110f, 1};   // top-level window backgrounds
+    float panelBg[4]       = {0.094f,0.106f,0.129f, 1};   // docked panel / child bg
+    float headerBg[4]      = {0.110f,0.125f,0.157f, 1};   // menu bar / title bar
+    float popupBg[4]       = {0.106f,0.118f,0.145f, 1};
+    float border[4]        = {0.165f,0.184f,0.227f, 0.85f};
+    float statusBg[4]      = {0.075f,0.086f,0.108f, 1};
+
+    // ---- ribbon ----
+    float ribbonBg[4]      = {0.110f,0.125f,0.157f, 1};
+    float ribbonTabActive[4]= {0.094f,0.106f,0.129f, 1};  // active ribbon tab underline bg
+
+    // ---- text ----
+    float text[4]          = {0.898f,0.918f,0.945f, 1};   // primary text
+    float textDim[4]       = {0.620f,0.660f,0.720f, 1};   // secondary / dim text (glass rows)
+    float textDisabled[4]  = {0.471f,0.502f,0.549f, 1};
+
+    // ---- accent ----
+    float accent[4]        = {0.176f,0.831f,0.749f, 1};   // teal #2DD4BF
+    float accentDim[4]     = {0.118f,0.553f,0.498f, 1};
+    float accentSoft[4]    = {0.176f,0.831f,0.749f, 0.22f};
+    float accentMid[4]     = {0.176f,0.831f,0.749f, 0.40f};
+
+    // ---- interactive ----
+    float button[4]        = {0.149f,0.176f,0.220f, 1};
+    float buttonHovered[4] = {0.184f,0.224f,0.275f, 1};
+    float buttonActive[4]  = {0.216f,0.259f,0.318f, 1};
+
+    // ---- frame / input ----
+    float frameBg[4]       = {0.129f,0.149f,0.184f, 1};
+    float frameBgHovered[4]= {0.165f,0.192f,0.235f, 1};
+    float frameBgActive[4] = {0.192f,0.224f,0.271f, 1};
+
+    // ---- viewport ----
+    // C25: the 3D viewport is light in BOTH themes (SolidWorks studio look).
+    float viewportTop[4]   = {0.957f,0.965f,0.976f, 1};   // bg gradient top    (#F4F6F9)
+    float viewportMid[4]   = {0.851f,0.867f,0.894f, 1};   // bg gradient mid    (#D9DDE4)
+    float viewportBottom[4]= {0.933f,0.941f,0.953f, 1};   // bg floor glow      (#EEF0F3)
+    float viewportEdge[4]  = {0.090f,0.100f,0.120f, 1};   // model feature-edge lines
+    float partDefault[4]   = {0.776f,0.792f,0.847f, 1};   // default body color (#C6CAD8)
+    float groundShadow[4]  = {0.200f,0.220f,0.260f, 0.35f}; // soft contact shadow (a = max)
+    float overlayBg[4]     = {0.039f,0.055f,0.075f, 0.843f}; // pill overlays on 3D view
+    float overlayBorder[4] = {0.176f,0.831f,0.749f, 0.275f};
+    float overlayText[4]   = {0.886f,0.906f,0.941f, 0.941f};
+    // W4-K: SolidWorks-style datum planes — subtle light-blue translucent fill + thin blue
+    // outline (alpha in [3] is the base; the renderer scales it per emphasis state).
+    float planeFill[4]     = {0.380f,0.620f,0.910f, 0.085f};
+    float planeOutline[4]  = {0.290f,0.540f,0.870f, 0.700f};
+
+    // ---- selection / hover ----
+    float selectionHighlight[4] = {0.176f,0.831f,0.749f, 0.22f};
+    float hoverHighlight[4]     = {0.176f,0.831f,0.749f, 0.40f};
+
+    // ---- C24: orientation-triad axis colors (X/Y/Z) ----
+    float axisX[4]         = {0.910f,0.380f,0.380f, 1};   // red
+    float axisY[4]         = {0.470f,0.820f,0.450f, 1};   // green
+    float axisZ[4]         = {0.420f,0.620f,0.960f, 1};   // blue
+
+    // ---- in-viewport simulation / flow / CAM overlay roles (viewport_panel.cpp) ----
+    // Promoted from viewport_panel file-statics so themes can tune them; the light theme darkens
+    // the translucent washes slightly so they hold on the light canvas.
+    float simFixture[4]    = {0.18f,0.80f,0.36f, 0.45f}; // fixture-face wash (green)
+    float simLoad[4]       = {0.95f,0.27f,0.20f, 0.45f}; // load-face wash (red)
+    float simArrow[4]      = {0.95f,0.27f,0.20f, 1};     // load arrows
+    float simGlyph[4]      = {0.10f,0.66f,0.30f, 1};     // fixture ground glyphs
+    float simMesh[4]       = {0.55f,0.74f,0.95f, 0.55f}; // mesh-preview wireframe
+    float flowArrow[4]     = {0.28f,0.70f,0.98f, 1};     // incoming-flow arrows (bright blue)
+    float flowDomain[4]    = {0.45f,0.55f,0.68f, 0.55f}; // wind-tunnel domain box
+    float flowInlet[4]     = {0.30f,0.80f,0.85f, 0.75f}; // inlet plane (teal)
+    float camRapid[4]      = {0.78f,0.24f,0.20f, 0.55f}; // CAM backplot: rapid (faint red)
+    float camLead[4]       = {0.31f,0.78f,0.47f, 0.95f}; //   lead in/out (green)
+    float camPlunge[4]     = {0.31f,0.71f,0.86f, 0.95f}; //   plunge (cyan)
+    float camCut[4]        = {0.35f,0.59f,0.94f, 1};     //   cut (blue)
+    float camArc[4]        = {0.59f,0.51f,0.94f, 1};     //   arc (violet)
+
+    // ---- C18 sketch mode ----
+    float sketchUnder[4]   = {0.337f,0.612f,0.960f, 1};   // under-defined entity (SW-style blue)
+    float sketchGrid[4]    = {0.520f,0.560f,0.620f, 0.18f}; // faint sketch grid lines
+    // C40: ink drawn ON the 3D viewport (which is light in BOTH themes) — fully-defined
+    // entities and dimension lines/text must be dark like SolidWorks, never the panel text
+    // role (near-white in the dark theme = invisible on the white canvas).
+    float sketchInk[4]     = {0.090f,0.100f,0.125f, 1};   // fully-defined entities, dim text
+    float sketchDimLine[4] = {0.165f,0.184f,0.220f, 1};   // dim/extension lines + arrows
+    // C41: relation-badge chips (SolidWorks-like): light green fill + darker green border;
+    // the glyph itself is drawn with sketchInk (dark on the light canvas in both themes).
+    float sketchRelBg[4]     = {0.550f,0.780f,0.550f, 0.90f};
+    float sketchRelBorder[4] = {0.300f,0.520f,0.300f, 1};
+    // C49: sketch inference ink (dashed alignment lines + snap markers). Amber so it reads on
+    // the light canvas in both themes and never collides with the under-defined blue.
+    float sketchInfer[4]     = {0.950f,0.650f,0.200f, 0.85f};
+
+    // ---- status ----
+    float statusOk[4]   = {0.176f,0.831f,0.749f, 1};   // same as accent
+    float statusWarn[4] = {0.953f,0.761f,0.420f, 1};   // amber
+    float statusErr[4]  = {0.961f,0.549f,0.420f, 1};   // red-orange
+
+    // ---- console colors ----
+    float consoleDefault[4]= {0.780f,0.820f,0.880f, 1};
+    float consoleOk[4]     = {0.176f,0.831f,0.749f, 1};
+    float consoleWarn[4]   = {0.953f,0.761f,0.420f, 1};
+    float consoleErr[4]    = {0.961f,0.549f,0.420f, 1};
+    float consoleDim[4]    = {0.620f,0.660f,0.720f, 1};
+
+    // ---- code / diff ----
+    float chipBg[4]        = {0.176f,0.831f,0.749f, 0.30f};
+    float codeBg[4]        = {0.055f,0.065f,0.085f, 1};
+    // NOTE: proseBg is ≈ the Copilot pane's dark base (windowBg ~0.082) since the panes
+    // went opaque-dark, so prose cards now read by their BORDER, not fill contrast. If chat
+    // content ever looks flat, lighten ~0.03 above windowBg so the cards regain a surface.
+    float proseBg[4]       = {0.085f,0.100f,0.130f, 1};
+    float proseText[4]     = {0.780f,0.820f,0.880f, 1};
+    float setupWarnBg[4]   = {0.200f,0.130f,0.100f, 1};
+
+    float diffDefault[4]   = {0.780f,0.820f,0.880f, 1};
+    float diffHdr[4]       = {0.600f,0.660f,0.740f, 1};   // +++ / ---
+    float diffHunk[4]      = {0.451f,0.741f,0.961f, 1};   // @@
+    float diffAdd[4]       = {0.459f,0.859f,0.549f, 1};   // + lines
+    float diffDel[4]       = {0.961f,0.502f,0.502f, 1};   // - lines
+
+    // ---- fit readout ----
+    float fitOk[4]         = {0.459f,0.859f,0.549f, 1};   // green
+    float fitBad[4]        = {0.961f,0.549f,0.502f, 1};   // red
+    float fitDim[4]        = {0.620f,0.660f,0.720f, 1};
+
+    // ---- iteration badge ----
+    float iterBuilt[4]     = {0.600f,0.780f,0.950f, 1};   // "built" in-progress badge
+
+    // ---- chat ----
+    float assistantName[4] = {0.820f,0.860f,0.920f, 1};
+    float errSystem[4]     = {0.961f,0.600f,0.502f, 1};
+    float errCad[4]        = {0.929f,0.800f,0.561f, 1};
+
+    // ---- plan card accent bar ----
+    float planAccentBar    = 150.0f;   // alpha 0..255 for IM_COL32 accent bar (float so we can lerp)
+
+    // ---- dims text in plan card ----
+    float planDims[4]      = {0.639f,0.722f,0.780f, 1};
+    float planFeature[4]   = {0.600f,0.639f,0.700f, 1};
+
+    // ---- parts list ----
+    float partsDim[4]      = {0.620f,0.660f,0.720f, 1};
+
+    // ---- window chrome buttons ----
+    float captionFg        = 0.922f;   // greyscale for caption glyphs
+
+    // ---- glass (floating widgets: tooltips, popovers, overlays) ----
+    // glassBg:        main translucent fill — semi-opaque so the content behind bleeds through subtly.
+    // glassBorder:    cooler/brighter border than the standard chrome border.
+    // glassHighlight: white-tinted top-shine gradient + specular line (top inner edge).
+    // glassShadow:    soft simulated drop-shadow beneath the panel.
+    float glassBg[4]        = {0.118f, 0.133f, 0.167f, 0.87f};
+    float glassBorder[4]    = {0.230f, 0.275f, 0.365f, 0.80f};
+    float glassHighlight[4] = {1.000f, 1.000f, 1.000f, 0.09f};
+    float glassShadow[4]    = {0.000f, 0.000f, 0.000f, 0.40f};
+
+    // ---- tree (feature-manager rows: hover wash + section header label) ----
+    // treeHover:   accent-tinted row hover wash (low alpha so text stays legible).
+    // treeSection: muted label color for collapsible section headers.
+    float treeHover[4]      = {0.176f, 0.831f, 0.749f, 0.10f};
+    float treeSection[4]    = {0.620f, 0.660f, 0.720f, 1.0f};
+
+    // ---- copilot blocks (chat action cards) ----
+    // blockActionBg: action-card background — near-opaque so structured content reads clearly.
+    float blockActionBg[4]  = {0.094f, 0.110f, 0.141f, 0.96f};
+
+    // Helper: convert float[4] to ImU32 (for draw-list calls).
+    // Usage: palette.toU32(palette.accent)
+    static inline uint32_t toU32(const float f[4]) {
+        auto clamp = [](float v) -> uint8_t {
+            int i = (int)(v * 255.0f + 0.5f);
+            return (uint8_t)(i < 0 ? 0 : i > 255 ? 255 : i);
+        };
+        return ((uint32_t)clamp(f[3]) << 24) | ((uint32_t)clamp(f[2]) << 16) |
+               ((uint32_t)clamp(f[1]) << 8)  |  (uint32_t)clamp(f[0]);
+    }
+    // Helper: build alpha-scaled copy of a role.
+    static inline void withAlpha(const float src[4], float dst[4], float a) {
+        dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]*a;
+    }
+};
+
+// Fill ImGuiStyle + the global palette for the given theme.
+// Must be called after ImGui::CreateContext() and whenever the theme is toggled.
+void applyTheme(Theme t, float scale = 1.0f);
+
+Fonts loadFonts(const std::string& assetsDir, float pxScale = 1.0f);
+
+// Draw a glassmorphism panel background onto 'dl' covering [mn, mx].
+// Layers (back to front): drop-shadow, translucent base fill, vertical inner-shine gradient,
+// border, top specular line. 'rounding' is a logical dp value (multiplied by ui::uiScale
+// internally, so 8.0f matches the PopupRounding set by applyTheme at any DPI).
+void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 8.0f);
+// Alpha-scaled variant for animated widgets (e.g. toasts): `alpha` (0..1) multiplies every glass
+// role's alpha before drawing, so a fading card dims all five layers coherently.
+void glassBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding, float alpha);
+
+// Push/pop ImGuiStyle overrides for the BeginTooltip() + glassBackground() pattern.
+// pushGlassTooltipStyle() sets PopupBg=transparent so ImGui's native rect fill does not
+// compete with the custom-drawn glass layers. popGlassTooltipStyle() restores all pushed state.
+// Callers of SetTooltip() do NOT need push/pop — ImGuiCol_PopupBg==glassBg globally.
+// Usage pattern:
+//   ui::pushGlassTooltipStyle();
+//   if (ImGui::BeginTooltip()) {
+//       ImVec2 p0 = ImGui::GetWindowPos();
+//       ImVec2 p1 = p0 + ImGui::GetWindowSize();
+//       ui::glassBackground(ImGui::GetWindowDrawList(), p0, p1);
+//       /* content */
+//       ImGui::EndTooltip();
+//   }
+//   ui::popGlassTooltipStyle();
+void pushGlassTooltipStyle();
+void popGlassTooltipStyle();
+
+// Push/pop WindowBg=glassBg around a floating ImGui::Begin() window (translucent glass panel).
+// Pair the calls immediately around Begin()/End().
+void pushGlassWindowStyle();
+void popGlassWindowStyle();
+
+// Push/pop ChildBg=glassBg + Border=glassBorder + ChildRounding around a BeginChild() card.
+// `rounding` is logical dp (scaled by uiScale internally). Pair around BeginChild()/EndChild().
+void pushGlassChildStyle(float rounding = 8.0f);
+void popGlassChildStyle();
+
+// Subtle frosted pill behind a single text/icon row (FeatureManager, Copilot blocks). Keeps the
+// panel itself maximally transparent while preserving row readability. `stripe` adds a faint
+// alternating tint; `selected` draws a restrained accent card.
+void glassRowBackground(ImDrawList* dl, ImVec2 mn, ImVec2 mx, float rounding = 4.0f,
+                        bool stripe = false, bool selected = false, float washAlpha = 0.42f);
+
+// Paint a row pill at the current cursor (full content width). Call immediately BEFORE the row's
+// widgets so the pill sits behind text/icons.
+void glassRowAtCursor(float rounding = 4.0f, bool stripe = false, bool selected = false,
+                      float rowPadV = 5.0f);
+
+// The active palette — read-only from panels.
+extern Palette palette;
+
+// The active theme — readable from any code that needs to branch on dark vs. light.
+extern Theme activeTheme;
+
+// The active UI content scale (1.0 at 100% DPI, 1.5 at 150%, etc). Set by applyTheme().
+// Custom-drawn widgets (e.g. the ribbon) multiply their pixel geometry by this so it tracks
+// the pre-scaled font atlas. Prefer this over ImGui::GetIO().FontGlobalScale, which the app
+// leaves at 1.0 (fonts are scaled at load time, not via FontGlobalScale).
+extern float uiScale;
+
+// =========================================================================
+// Liquid Glass v2 — adaptive contrast + backdrop-projected glass panels
+// Ported from ui/imgui/src/theme/theme.{h,cpp} (see local://glass_host.md for the host
+// contract). Over-viewport surfaces (left dock, Copilot, viewport HUD, doc-tab band, toasts)
+// use these instead of the theme-dependent glass* helpers above, so text contrast tracks the
+// LIVE viewport content identically in dark and light theme.
+// =========================================================================
+
+// iOS UIBlurEffect-style material levels — tint alphas 0.12 / 0.22 / 0.35 / 0.52.
+enum class GlassLevel { UltraThin, Thin, Regular, Thick };
+
+// ---- Colored liquid glass (v2.1): per-group user styling -------------------
+// Panel groups that can be styled independently. Global is the base; the other groups inherit
+// any field they leave at its sentinel (see GlassStyle). Pass the group that OWNS a surface to
+// adaptivePanel()/adaptiveSurface(); untagged call sites default to Global.
+enum class GlassGroup : uint8_t { Global = 0, FeatureManager, Copilot, Hud, Count };
+
+// One group's user knobs. SENTINELS (-1) mean 'inherit from Global'; for Global itself they
+// resolve to the built-in default shown in the trailing comment. Default-constructed GlassStyle
+// == today's glass GEOMETRY/opacity with dynamic color ON (the out-of-box look).
+struct GlassStyle {
+    float tintHue           = -1.f;   // scrim hue, degrees 0..360; <0 inherit (Global: 210)
+    float tintSat           = -1.f;   // scrim saturation 0..1; <0 inherit (Global: 0 = neutral)
+    float tintStrength      = -1.f;   // 0..1 tint mix into the scrim; <0 inherit (Global: 0)
+    int   glassLevel        = -1;     // 0..3 forces UltraThin..Thick; -1 inherit (Global: call-site level)
+    float opacityMul        = -1.f;   // scrim-alpha multiplier 0.25..2; <0 inherit (Global: 1)
+    float rounding          = -1.f;   // logical dp override; <0 inherit (Global: call-site rounding)
+    float textContrastBoost = -1.f;   // 0..1 extra scrim + halo; <0 inherit (Global: 0)
+    int   dynamicColor      = -1;     // 1 on / 0 off / -1 inherit (Global: ON — auto max-contrast
+                                      // tint/text vs the live backdrop is the out-of-box default)
+};
+
+// Whole user config: one style per group (index by (size_t)GlassGroup). Settings owns the
+// persisted copy (config.json "appearance.glass"); ui_theme owns the active copy below.
+struct GlassConfig {
+    GlassStyle group[(size_t)GlassGroup::Count];
+};
+
+// Install the active config. Cheap + idempotent (early-outs when nothing changed), so the frame
+// loop may push Settings every frame: ui::setGlassConfig(st.settings.glassCfg). Call once after
+// loadSettings at startup and on every Appearance-tab edit. Independent of applyTheme() — theme
+// toggles never reset glass knobs. GUI thread only.
+void               setGlassConfig(const GlassConfig& cfg);
+const GlassConfig& glassConfig();
+
+// Fully-resolved (sentinel-free) style for a group, cached by setGlassConfig(). Safe to call
+// before the first setGlassConfig (static defaults == default config resolution).
+struct GlassStyleResolved {
+    float tintHue = 210.f, tintSat = 0.f, tintStrength = 0.f;
+    int   glassLevel = -1;          // -1 = keep the call-site GlassLevel
+    float opacityMul = 1.f;
+    float rounding = -1.f;          // -1 = keep the call-site rounding
+    float textContrastBoost = 0.f;
+    bool  dynamicColor = true;      // out-of-box: auto-tint from the live backdrop
+};
+const GlassStyleResolved& glassStyleResolved(GlassGroup g);
+
+// Precomputed contrast surface for one panel/rect — see adaptivePanel() / adaptiveSurface().
+struct AdaptiveSurface {
+    ImVec4 tint;                             // scrim color+alpha to draw over the blurred backdrop
+    ImVec4 textPrimary, textSecondary, textTertiary;
+    bool   darkText = false;                 // true => dark-on-bright text
+    float  scrim = 0.f;                      // extra contrast alpha already folded into tint.w
+    // v2.1: which group's GlassStyleResolved applies (set by adaptivePanel/adaptiveSurface);
+    // glassPanel reads level/rounding/opacity overrides through this.
+    GlassGroup group = GlassGroup::Global;
+    // v2.1: resolved textContrastBoost (+ the dynamic-color busyness term when active), consumed
+    // by glassText()/glassIconHalo() halo alpha. 0 = today's halo.
+    float contrastBoost = 0.f;
+};
+
+// Published once per frame by the viewport (after its render) so glassPanel()/adaptivePanel()
+// can project any panel rect into backdrop UVs. screenMin/Max = the viewport IMAGE rect in
+// absolute screen coords.
+struct ViewportBackdropInfo {
+    std::uintptr_t textureId = 0;
+    ImVec2 uvMin{0, 0}, uvMax{1, 1};
+    ImVec2 screenMin{0, 0}, screenMax{0, 0};
+    bool   flipV = true;   // GL bottom-left texture: v runs bottom-up
+    bool valid() const {
+        return textureId != 0 && screenMax.x > screenMin.x && screenMax.y > screenMin.y;
+    }
+};
+void                        setViewportBackdrop(const ViewportBackdropInfo& b);
+const ViewportBackdropInfo& viewportBackdrop();
+
+// Luminance bridge: the viewport registers a sampler; theme code consumes it. Screen coords in,
+// 0..1 luminance out; negative => no live backdrop under that rect.
+using LuminanceSampler = float (*)(ImVec2 mn, ImVec2 mx);
+void  setLuminanceSampler(LuminanceSampler fn);
+float sampleLuminance(ImVec2 mn, ImVec2 mx);   // -1 when unavailable
+
+// v2.1 dynamic color: aggregate backdrop statistics under a rect. hue/sat are the HSV of the
+// MEAN RGB (hue of the mean, not mean of hues — circular-safe and cheap); variance is the
+// luminance variance across the sampled grid cells (busyness proxy; the source grid is built
+// from the BLURRED quarter-res buffer, so treat it as a low-frequency measure). The scalar
+// LuminanceSampler above stays registered and untouched — this is a second, richer bridge the
+// viewport registers alongside it.
+struct BackdropStats {
+    float lum = -1.f;      // mean Rec.709 luminance; -1 = unavailable
+    float variance = 0.f;  // luminance variance across grid cells, 0..~0.25
+    float hue = 0.f;       // mean-color hue, degrees 0..360
+    float sat = 0.f;       // mean-color saturation 0..1
+};
+using BackdropStatsSampler = bool (*)(ImVec2 mn, ImVec2 mx, BackdropStats& out);
+void setBackdropStatsSampler(BackdropStatsSampler fn);
+// false => unavailable (no live backdrop / sampler unregistered); callers then behave exactly
+// as if dynamicColor were off.
+bool sampleBackdropStats(ImVec2 mn, ImVec2 mx, BackdropStats& out);
+
+// Stable, window-independent panel-surface id (ImHashStr) — the same id resolves to the same
+// AdaptiveSurface no matter which window/TU looks it up (e.g. a pane vs. its own rows).
+ImGuiID panelId(const char* label);
+
+// Stateless surface builder. avgLuminance >= 0: theme-INDEPENDENT vibrancy tokens (identical
+// constants in dark+light theme) — tone comes solely from the sampled luminance. avgLuminance
+// < 0: palette fallback (chrome, no live backdrop); darkText = (activeTheme == Theme::Light).
+// `group` selects the user GlassStyle (tint / opacity / contrast) applied to the scrim.
+AdaptiveSurface adaptiveSurface(float avgLuminance, GlassGroup group = GlassGroup::Global);
+
+// Hysteretic (.42/.58) + temporally smoothed (tau 0.24s) per-panel adapter. Samples luminance
+// under `rect` via the registered sampler. `id` = any stable ImGuiID (use panelId()). Safe to
+// call every frame; idempotent within a frame; GUI thread only. `group` selects the user
+// GlassStyle (tint / dynamic color / contrast); pass the SAME group every frame for a given id.
+const AdaptiveSurface& adaptivePanel(ImGuiID id, const ImRect& rect,
+                                     GlassGroup group = GlassGroup::Global);
+
+// Frosted panel: projects `rect` into the live backdrop's UV space (clamped => frosted
+// edge-bleed for rects that spill past the viewport image) and tints with `surf`; falls back to
+// the layered glassBackground() above when no backdrop is live. `rounding` < 0 uses the default
+// panel rounding.
+void glassPanel(ImDrawList* dl, const ImRect& rect, GlassLevel level, float rounding,
+                const AdaptiveSurface& surf, float alpha = 1.f);
+
+// Draw text with a contrast halo (1px offset soft shadow in the opposite tone) — for text
+// painted directly on the viewport (legend, HUD labels, doc-name overlay).
+void glassText(ImDrawList* dl, ImFont* font, float size, ImVec2 pos,
+              const AdaptiveSurface& s, const char* text, const char* textEnd = nullptr);
+
+// Contrast halo color for an icon/glyph drawn over a frosted adaptive surface: the vibrancy
+// tone OPPOSITE the surface's text tone at ~0x50 alpha. alphaMul scales the alpha (HUD fades).
+ImU32 glassIconHalo(const AdaptiveSurface& surf, float alphaMul = 1.0f);
+
+// v2.1: max-contrast text color over an ARBITRARY tinted surface color (Rec.709 luminance
+// split, same 0.5 threshold as adaptiveSurface's tone pick). Use for text painted on a custom
+// tint that did not come from adaptiveSurface/adaptivePanel — those already carry textPrimary.
+ImVec4 maxContrastTextOn(const ImVec4& surface);
+
+}  // namespace ui

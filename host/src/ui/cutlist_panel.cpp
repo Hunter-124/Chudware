@@ -1,0 +1,197 @@
+// Weldment Cut List panel (SolidWorks "Weldment Cut List") — see cutlist_panel.h.
+//
+// Shows the active part document's weldment cut list: weld_member structural members grouped by
+// profile + dimensions + length into rows (Item / Profile / Description / Length / Qty / Total
+// Length). Read-only — backed by the engine weld_cut_list RPC via DocMirror::weldCutList. The
+// result is cached and re-pulled when the mirror's doc id or revision changes, or on Refresh.
+#include "cutlist_panel.h"
+
+#include <string>
+
+#include "imgui.h"
+#include "imgui_internal.h"     // ImRect (ui::adaptivePanel / ui::glassPanel rect argument)
+
+#include "../core/app_state.h"
+#include "../core/doc_mirror.h"
+#include "../ui_theme.h"        // ui::palette / ui::uiScale
+#include "layout.h"             // setNextCommandDialogPlacement (floating dialog anchor)
+#include "property_manager.h"   // pmFormatDim — match the rest of the UI's dim formatting
+
+namespace ui {
+
+// ---- local JSON helpers (tolerant) ----
+static inline std::string cjstr(const nlohmann::json& o, const char* k) {
+    auto it = o.find(k);
+    return (it != o.end() && it->is_string()) ? it->get<std::string>() : std::string();
+}
+static inline double cjnum(const nlohmann::json& o, const char* k, double dflt = 0.0) {
+    auto it = o.find(k);
+    return (it != o.end() && it->is_number()) ? it->get<double>() : dflt;
+}
+static inline long long cjint(const nlohmann::json& o, const char* k, long long dflt = 0) {
+    auto it = o.find(k);
+    return (it != o.end() && it->is_number_integer()) ? it->get<long long>() : (long long)cjnum(o, k, (double)dflt);
+}
+
+// True when the active document is a PART we can show a cut list for (not a drawing tab, not the
+// empty start state). Weldments live in parts; drawing tabs leave the part mirror loaded, so gate
+// on the tab kind too.
+static bool cutListApplicable(AppState& st) {
+    return st.docMirror.hasDoc() && st.workerStarted && !st.activeTabIsDrawing();
+}
+
+// ---------------------------------------------------------------------------
+
+void CutListPanel::refresh(AppState& st) {
+    if (!cutListApplicable(st)) { cacheValid_ = false; return; }
+    std::string err;
+    nlohmann::json res = st.docMirror.weldCutList(st.worker, err);
+    if (res.is_null()) {
+        if (!err.empty()) st.addLog("[cutlist] weld_cut_list failed: " + err);
+        // Leave the previous cache in place; mark invalid so we retry next frame (cheap call).
+        cacheValid_ = false;
+        return;
+    }
+    rows_ = (res.contains("rows") && res["rows"].is_array()) ? res["rows"]
+                                                            : nlohmann::json::array();
+    totalMembers_ = (int)cjint(res, "total_members");
+    totalLengthMm_ = cjnum(res, "total_length_mm");
+    profiles_.clear();
+    if (res.contains("profiles") && res["profiles"].is_array())
+        for (const auto& p : res["profiles"])
+            if (p.is_string()) profiles_.push_back(p.get<std::string>());
+
+    cacheValid_ = true;
+    cacheDocId_ = st.docMirror.docId();
+    cacheRevision_ = st.docMirror.revision();
+}
+
+void CutListPanel::draw(AppState& st) {
+    if (!st.showCutListPanel) return;
+    // Frosted-glass fill so the floating panel joins the app-wide glass family.
+    ui::setNextCommandDialogPlacement();   // sane first-open anchor over the full-width viewport
+    ImGui::SetNextWindowSize(ImVec2(560 * ui::uiScale, 380 * ui::uiScale), ImGuiCond_FirstUseEver);
+    // Liquid-glass v2: transparent native WindowBg so the adaptive glassPanel (painted below,
+    // once Begin succeeds) is the only fill — ImGui's dark rect must not compete with the frost.
+    // The title bar renders DURING Begin (before our glass paint), so give it its own opaque-ish
+    // glassBg backing via a scoped TitleBg push (the theme sets it transparent globally); we then
+    // frost only the CONTENT region so the title/X stay crisp instead of filmed over.
+    const ImVec4 titleTint(ui::palette.glassBg[0], ui::palette.glassBg[1],
+                           ui::palette.glassBg[2], ui::palette.glassBg[3]);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, titleTint);
+    ImGui::PushStyleColor(ImGuiCol_TitleBgCollapsed, titleTint);
+    const bool clVis = ImGui::Begin("Cut List", &st.showCutListPanel);
+    ImGui::PopStyleColor(3);  // title bar already rendered; WindowBg stays for the frame
+    if (!clVis) {
+        ImGui::End();
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    // Paint the panel's own frosted-glass background over the content region (below title).
+    const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+    const float contentTopY = ImGui::GetCursorScreenPos().y - ImGui::GetStyle().WindowPadding.y;
+    const ImRect winRect(ImVec2(wp.x, contentTopY), ImVec2(wp.x + ws.x, wp.y + ws.y));
+    const ui::AdaptiveSurface& surf =
+        ui::adaptivePanel(ui::panelId("host_cutlist_glass"), winRect, ui::GlassGroup::Global);
+    ui::glassPanel(ImGui::GetWindowDrawList(), winRect, ui::GlassLevel::Regular, 12.0f, surf);
+    // Default ink for the plain table readouts tracks the frost's contrast tone.
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+
+    const auto& pal = ui::palette;
+    const ImVec4 accentCol(pal.accent[0], pal.accent[1], pal.accent[2], 1);
+    // Contrast-matched text over the frosted backdrop (dim = secondary tone).
+    const ImVec4 dimCol = surf.textSecondary;
+
+    // Gate: only part docs have a weldment cut list. Drawing tabs / no-doc show a hint.
+    if (!cutListApplicable(st)) {
+        ImGui::TextColored(dimCol, "Open a part to see its weldment cut list.");
+        cacheValid_ = false;
+        ImGui::End();
+        ImGui::PopStyleColor(2);  // text ink + WindowBg
+        return;
+    }
+
+    // Auto-invalidate when the mirror moved to a different doc or advanced its revision (an edit,
+    // undo/redo): the cached rows may be stale.
+    if (cacheValid_ && (cacheDocId_ != st.docMirror.docId() ||
+                        cacheRevision_ != st.docMirror.revision()))
+        cacheValid_ = false;
+    if (!cacheValid_) refresh(st);
+
+    // ---- header + Refresh ----
+    ImGui::PushFont(st.fonts.medium);
+    ImGui::TextColored(accentCol, "Weldment Cut List");
+    ImGui::PopFont();
+    ImGui::SameLine();
+    ImGui::TextColored(dimCol, "(%d item%s)", (int)rows_.size(),
+                       rows_.size() == 1 ? "" : "s");
+    ImGui::SameLine(ImGui::GetWindowWidth() - 90.0f * ui::uiScale);
+    if (ImGui::Button("Refresh")) cacheValid_ = false;
+
+    // ---- empty hint: a part with no weld_member features ----
+    if (rows_.empty()) {
+        ImGui::Separator();
+        ImGui::TextColored(dimCol, "No weldment members.");
+        ImGui::TextColored(dimCol, "Add a Structural Member (Weldments tab) to populate the cut list.");
+        ImGui::End();
+        ImGui::PopStyleColor(2);  // text ink + WindowBg
+        return;
+    }
+
+    ImGui::Separator();
+
+    // ---- cut-list table ----
+    const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                  ImGuiTableFlags_SizingStretchProp |
+                                  ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+    if (ImGui::BeginTable("cutlist", 6, flags)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthFixed, 40.0f * ui::uiScale);
+        ImGui::TableSetupColumn("Profile", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Description", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        ImGui::TableSetupColumn("Length", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Qty", ImGuiTableColumnFlags_WidthFixed, 40.0f * ui::uiScale);
+        ImGui::TableSetupColumn("Total Length", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableHeadersRow();
+
+        const bool ips = st.ips();
+        for (const auto& r : rows_) {
+            if (!r.is_object()) continue;
+            ImGui::TableNextRow();
+
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("%lld", cjint(r, "item"));
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(cjstr(r, "profile").c_str());
+
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(cjstr(r, "description").c_str());
+
+            ImGui::TableSetColumnIndex(3);
+            ImGui::TextUnformatted(pmFormatDim(cjnum(r, "length_mm"), ips).c_str());
+
+            ImGui::TableSetColumnIndex(4);
+            ImGui::Text("%lld", cjint(r, "quantity"));
+
+            ImGui::TableSetColumnIndex(5);
+            ImGui::TextUnformatted(pmFormatDim(cjnum(r, "total_length_mm"), ips).c_str());
+        }
+        ImGui::EndTable();
+    }
+
+    // ---- footer totals ----
+    ImGui::Separator();
+    ImGui::TextColored(dimCol, "%d member%s total", totalMembers_, totalMembers_ == 1 ? "" : "s");
+    ImGui::SameLine();
+    ImGui::TextColored(dimCol, "  |  total length %s",
+                       pmFormatDim(totalLengthMm_, st.ips()).c_str());
+
+    ImGui::End();
+    ImGui::PopStyleColor(2);  // text ink + WindowBg
+}
+
+}  // namespace ui

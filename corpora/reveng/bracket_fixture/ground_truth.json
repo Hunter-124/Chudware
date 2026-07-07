@@ -1,0 +1,42 @@
+{
+  "schema": "aicad.reveng_fixture/1",
+  "part": "bracket",
+  "units": "mm",
+  "overall": {
+    "length": 80.0,
+    "width": 50.0,
+    "height": 30.0
+  },
+  "wall_thickness": 5.0,
+  "holes": [
+    {
+      "id": "H1",
+      "diameter": 8.0,
+      "center_x": 20.0,
+      "center_y": 15.0,
+      "depth": 30.0,
+      "face": "top"
+    },
+    {
+      "id": "H2",
+      "diameter": 8.0,
+      "center_x": 60.0,
+      "center_y": 15.0,
+      "depth": 30.0,
+      "face": "top"
+    }
+  ],
+  "hole_spacing": 40.0,
+  "hole_edge_dist": 12.0,
+  "render_count": 6,
+  "render_files": [
+    "render_000.png",
+    "render_001.png",
+    "render_002.png",
+    "render_003.png",
+    "render_004.png",
+    "render_005.png"
+  ],
+  "aruco_mat": "aruco_mat.png",
+  "camera_poses_file": "camera_poses.json"
+}

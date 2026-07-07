@@ -1,0 +1,152 @@
+[
+  {
+    "index": 0,
+    "view": "top",
+    "eye_xyz": [
+      40,
+      25,
+      200
+    ],
+    "target_xyz": [
+      40,
+      25,
+      0
+    ],
+    "up_xyz": [
+      0,
+      1,
+      0
+    ],
+    "fov_deg": 45.0,
+    "projection": "orthographic",
+    "image_width_px": 800,
+    "image_height_px": 600,
+    "scale_px_per_mm": 8.0,
+    "render_file": "render_000.png"
+  },
+  {
+    "index": 1,
+    "view": "front",
+    "eye_xyz": [
+      40,
+      -200,
+      15
+    ],
+    "target_xyz": [
+      40,
+      0,
+      15
+    ],
+    "up_xyz": [
+      0,
+      0,
+      1
+    ],
+    "fov_deg": 45.0,
+    "projection": "orthographic",
+    "image_width_px": 800,
+    "image_height_px": 600,
+    "scale_px_per_mm": 8.0,
+    "render_file": "render_001.png"
+  },
+  {
+    "index": 2,
+    "view": "right",
+    "eye_xyz": [
+      200,
+      25,
+      15
+    ],
+    "target_xyz": [
+      0,
+      25,
+      15
+    ],
+    "up_xyz": [
+      0,
+      0,
+      1
+    ],
+    "fov_deg": 45.0,
+    "projection": "orthographic",
+    "image_width_px": 800,
+    "image_height_px": 600,
+    "scale_px_per_mm": 8.0,
+    "render_file": "render_002.png"
+  },
+  {
+    "index": 3,
+    "view": "iso_ne",
+    "eye_xyz": [
+      180,
+      -140,
+      160
+    ],
+    "target_xyz": [
+      40,
+      25,
+      15
+    ],
+    "up_xyz": [
+      0,
+      0,
+      1
+    ],
+    "fov_deg": 45.0,
+    "projection": "orthographic",
+    "image_width_px": 800,
+    "image_height_px": 600,
+    "scale_px_per_mm": 8.0,
+    "render_file": "render_003.png"
+  },
+  {
+    "index": 4,
+    "view": "iso_nw",
+    "eye_xyz": [
+      -100,
+      -140,
+      160
+    ],
+    "target_xyz": [
+      40,
+      25,
+      15
+    ],
+    "up_xyz": [
+      0,
+      0,
+      1
+    ],
+    "fov_deg": 45.0,
+    "projection": "orthographic",
+    "image_width_px": 800,
+    "image_height_px": 600,
+    "scale_px_per_mm": 8.0,
+    "render_file": "render_004.png"
+  },
+  {
+    "index": 5,
+    "view": "bottom",
+    "eye_xyz": [
+      40,
+      25,
+      -200
+    ],
+    "target_xyz": [
+      40,
+      25,
+      0
+    ],
+    "up_xyz": [
+      0,
+      -1,
+      0
+    ],
+    "fov_deg": 45.0,
+    "projection": "orthographic",
+    "image_width_px": 800,
+    "image_height_px": 600,
+    "scale_px_per_mm": 8.0,
+    "render_file": "render_005.png"
+  }
+]

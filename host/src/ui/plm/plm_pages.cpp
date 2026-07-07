@@ -313,7 +313,7 @@ void plmDrawFilesPage(AppState& st) {
         ImGui::PopStyleColor();
         ImGui::SameLine();
         ImGui::Text("%s", it.path.c_str());
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 140 * S);
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - 140 * S);
         plmLifecycleBadge(it.lifecycle, !it.rev.empty() ? it.rev : it.workingRev);
         if (it.dirty) {
             ImGui::SameLine();
@@ -497,9 +497,9 @@ void plmDrawReleasesPage(AppState& st) {
         plmDocTypeTag(it.docType, it.kind);
         ImGui::SameLine();
         ImGui::Text("%s", it.path.c_str());
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 200 * S);
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - 200 * S);
         plmLifecycleBadge(it.lifecycle, !it.rev.empty() ? it.rev : it.workingRev);
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 90 * S);
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - 90 * S);
         bool open = (s_releaseItem == it.itemId);
         if (it.lifecycle == "Released") {
             dimText("released");
@@ -679,34 +679,48 @@ bool plmDatePicker(const char* id, char* buf, size_t n) {
     if (haveVal && ImGui::SmallButton("Clear")) { buf[0] = '\0'; changed = true; }
 
     if (ImGui::BeginPopup("##cal")) {
+        // Fixed cell geometry + a tight, uniform column pitch so the weekday header,
+        // the leading blanks and the day buttons all sit on the SAME grid. (The default
+        // 8px ItemSpacing plus variable-width header text made the columns drift, which
+        // read as the day numbers being off-centre under their headers.)
+        const float kCell = 26 * S, kCellH = 22 * S, kGap = 2 * S;
+        const float kGridW = kCell * 7 + kGap * 6;  // full week row width
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(kGap, kGap));
+        ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.5f, 0.5f));
+
         int vy = store->GetInt(kY, y), vm = store->GetInt(kM, mo);
-        // header: < Month Year >
+        // header: < Month Year >  (arrows pinned to the grid edges, title centred between)
         if (ImGui::ArrowButton("##pm", ImGuiDir_Left)) {
             if (--vm < 1) { vm = 12; --vy; }
             store->SetInt(kY, vy); store->SetInt(kM, vm);
         }
-        ImGui::SameLine();
         static const char* kMon[] = {"Jan","Feb","Mar","Apr","May","Jun",
                                      "Jul","Aug","Sep","Oct","Nov","Dec"};
         char hdr[32]; std::snprintf(hdr, sizeof(hdr), "%s %d", kMon[vm - 1], vy);
         float hw = ImGui::CalcTextSize(hdr).x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (150 * S - hw) * 0.5f);
+        float rowX0 = ImGui::GetCursorPosX();  // left edge of the arrow just drawn's row
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(rowX0 + (kGridW - hw) * 0.5f);
+        ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(hdr);
-        ImGui::SameLine(180 * S);
+        ImGui::SameLine(rowX0 + kGridW - ImGui::GetFrameHeight());
         if (ImGui::ArrowButton("##nm", ImGuiDir_Right)) {
             if (++vm > 12) { vm = 1; ++vy; }
             store->SetInt(kY, vy); store->SetInt(kM, vm);
         }
 
-        // weekday header
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        // weekday header — each label centred inside its 26px column
         static const char* kDow[] = {"Su","Mo","Tu","We","Th","Fr","Sa"};
-        ImGui::PushStyleColor(ImGuiCol_Text,
+        ImU32 dimCol = ImGui::ColorConvertFloat4ToU32(
             ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
         for (int i = 0; i < 7; ++i) {
             if (i) ImGui::SameLine();
-            ImGui::Text("%3s", kDow[i]);
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            ImVec2 ts = ImGui::CalcTextSize(kDow[i]);
+            dl->AddText(ImVec2(p.x + (kCell - ts.x) * 0.5f, p.y), dimCol, kDow[i]);
+            ImGui::Dummy(ImVec2(kCell, ts.y));
         }
-        ImGui::PopStyleColor();
 
         // day grid — first weekday + day count via std::tm normalisation
         std::tm first{}; first.tm_year = vy - 1900; first.tm_mon = vm - 1;
@@ -719,7 +733,7 @@ bool plmDatePicker(const char* id, char* buf, size_t n) {
         int cell = 0;
         for (int i = 0; i < lead; ++i, ++cell) {
             if (cell % 7) ImGui::SameLine();
-            ImGui::Dummy(ImVec2(24 * S, 22 * S));
+            ImGui::Dummy(ImVec2(kCell, kCellH));
         }
         for (int day = 1; day <= dim; ++day, ++cell) {
             if (cell % 7) ImGui::SameLine();
@@ -734,7 +748,7 @@ bool plmDatePicker(const char* id, char* buf, size_t n) {
                 ImGui::PushStyleColor(ImGuiCol_Button,
                     ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.25f));
             char db[4]; std::snprintf(db, sizeof(db), "%d", day);
-            if (ImGui::Button(db, ImVec2(24 * S, 22 * S))) {
+            if (ImGui::Button(db, ImVec2(kCell, kCellH))) {
                 std::snprintf(buf, n, "%04d-%02d-%02d", vy, vm, day);
                 changed = true;
                 ImGui::CloseCurrentPopup();
@@ -742,6 +756,7 @@ bool plmDatePicker(const char* id, char* buf, size_t n) {
             if (isSel || isToday) ImGui::PopStyleColor();
             ImGui::PopID();
         }
+        ImGui::PopStyleVar(2);
         ImGui::EndPopup();
     }
     ImGui::PopID();
@@ -857,7 +872,7 @@ void plmDrawPlanningPage(AppState& st) {
         ImGui::SameLine();
         ImGui::Text("%s", m.title.c_str());
         if (!m.due.empty()) { ImGui::SameLine(); dimText("  due %s", m.due.c_str()); }
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 70 * S);
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - 70 * S);
         if (ImGui::SmallButton(done ? "Reopen" : "Complete"))
             planCall(st, "update", "milestone",
                      {{"status", done ? "open" : "done"}}, m.id);

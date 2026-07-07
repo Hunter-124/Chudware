@@ -307,6 +307,40 @@ std::vector<TopoDS_Face> close_profile_to_axis(
     return out;
 }
 
+// W2 (hole-frame determinism) — the [u,v] frame that hole/bolt_circle `positions` are
+// measured in. Two fixes over the old (area-centroid + gp_Pln::XAxis) frame:
+//   origin: the area centroid of the face's OUTER boundary only. The whole-face centroid
+//     MOVES every time a bore removes area, so a second hole feature on the same face
+//     landed offset from where the first one's coordinates said (measured 0.57 mm drift
+//     on a 60x65 plate after one Ø22.5 bore). The outer boundary is unchanged by holes,
+//     so the frame is stable no matter how many features already cut the face.
+//   axes: SketchPlane::from's deterministic convention — u = world +X projected into the
+//     plane (falls back to +Y when the plane is ⟂X), v = n×u, right-handed around the
+//     OUTWARD normal. gp_Pln::XAxis() is an arbitrary artifact of surface
+//     parameterization (one extrude's front face measured u→+Z,v→−X while a primitive's
+//     top face measured u→+X,v→+Y) — unplaceable without trial and error.
+static aicad::geom::SketchPlane hole_face_frame(const TopoDS_Face& face,
+                                                const Eigen::Vector3d& outward_normal) {
+    const TopoDS_Face* measured = &face;
+    TopoDS_Face outer_only;
+    TopoDS_Wire ow = BRepTools::OuterWire(face);
+    if (!ow.IsNull()) {
+        BRepAdaptor_Surface s(face);
+        if (s.GetType() == GeomAbs_Plane) {
+            BRepBuilderAPI_MakeFace mf(s.Plane(), ow);
+            if (mf.IsDone()) {
+                outer_only = mf.Face();
+                measured = &outer_only;
+            }
+        }
+    }
+    GProp_GProps props;
+    BRepGProp::SurfaceProperties(*measured, props);
+    gp_Pnt c = props.CentreOfMass();
+    return aicad::geom::SketchPlane::from(Eigen::Vector3d(c.X(), c.Y(), c.Z()),
+                                          outward_normal);
+}
+
 // Read a string field, with a default for an absent key. Throws if present but not a
 // string (a malformed feature dict -> error status).
 std::string str_field(const json& feat, const char* key, const std::string& dflt) {
@@ -4252,29 +4286,23 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     throw std::runtime_error("hole: target face is not planar");
                 gp_Pln pln = surf.Plane();
 
-                // --- face frame (origin at the TRUE area centroid + x/y in-plane + outward
-                // normal). Positions are "[u,v] mm from the face CENTRE" (the contract, and
-                // what bolt_circle uses), so the origin MUST be the area centroid — NOT
-                // pln.Location(), the surface PARAMETER origin, which for many faces (e.g. a
-                // centred primitive's top face) is a CORNER. A corner origin drills the bore
-                // off-centre — only the quarter inside the body gets removed, so a Ø10 hole
-                // came out looking like Ø5. (test_hole passed only because its sketch-extrude
-                // box happened to have its param origin at the centroid.)
-                GProp_GProps fcprops;
-                BRepGProp::SurfaceProperties(face, fcprops);
-                gp_Pnt o = fcprops.CentreOfMass();
-                gp_Dir xd = pln.XAxis().Direction();
-                gp_Dir yd = pln.YAxis().Direction();
+                // --- face frame: see hole_face_frame — origin at the OUTER-boundary area
+                // centroid (stable under previously-cut holes; the whole-face centroid is
+                // NOT — and gp_Pln::Location() is worse, often a CORNER: a Ø10 hole came
+                // out looking like Ø5), axes = the deterministic SketchPlane convention
+                // (u = world +X projected, v = n×u) instead of the kernel's arbitrary
+                // surface parameterization.
                 gp_Dir nd = pln.Axis().Direction();
-                Eigen::Vector3d origin(o.X(), o.Y(), o.Z());
-                Eigen::Vector3d xdir(xd.X(), xd.Y(), xd.Z());
-                Eigen::Vector3d ydir(yd.X(), yd.Y(), yd.Z());
                 Eigen::Vector3d normal(nd.X(), nd.Y(), nd.Z());
                 // OUTWARD-NORMAL CORRECTION: a face stored REVERSED in the solid has its
                 // geometric normal pointing INTO the material, so flip it to point OUT
                 // of the solid. drill_dir then points INTO the material (the watch-point:
                 // get this wrong and the cut removes nothing).
                 if (face.Orientation() == TopAbs_REVERSED) normal = -normal;
+                const aicad::geom::SketchPlane fframe = hole_face_frame(face, normal);
+                const Eigen::Vector3d origin = fframe.origin;
+                const Eigen::Vector3d xdir = fframe.uAxis;
+                const Eigen::Vector3d ydir = fframe.vAxis;
                 const Eigen::Vector3d drill_dir = -normal;
 
                 // --- positions: [u,v] face-local mm pairs; default = face centre ---
@@ -4502,13 +4530,11 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 if (bc_surf.GetType() != GeomAbs_Plane)
                     throw std::runtime_error("bolt_circle: target face is not planar");
 
-                // Frame centred on the TRUE area centroid (not the surface param origin).
+                // Frame centred on the OUTER-boundary area centroid with deterministic
+                // axes — see hole_face_frame (W2): stable when the face already carries
+                // holes, and the same u/v convention as the `hole` feature.
                 Eigen::Vector3d normal = src_face_normal(face);
-                GProp_GProps fprops;
-                BRepGProp::SurfaceProperties(face, fprops);
-                gp_Pnt fcm = fprops.CentreOfMass();
-                Eigen::Vector3d center(fcm.X(), fcm.Y(), fcm.Z());
-                aicad::geom::SketchPlane fr = aicad::geom::SketchPlane::from(center, normal);
+                aicad::geom::SketchPlane fr = hole_face_frame(face, normal);
                 const Eigen::Vector3d drill_dir = -normal;
 
                 // Ring geometry.
@@ -4579,7 +4605,7 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 tools.reserve((size_t)count);
                 for (int k = 0; k < count; ++k) {
                     const double ang = a0 + 2.0 * PI * static_cast<double>(k) / static_cast<double>(count);
-                    Eigen::Vector3d world = center + (ring_r * std::cos(ang)) * fr.uAxis +
+                    Eigen::Vector3d world = fr.origin + (ring_r * std::cos(ang)) * fr.uAxis +
                                                      (ring_r * std::sin(ang)) * fr.vAxis;
                     Eigen::Vector3d lifted = world + lift * normal;
                     TopoDS_Shape t = ::geom::make_hole_tool(lifted, drill_dir, style, tool_dims);

@@ -755,6 +755,30 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
             if (c->rep_dir) s += dir_scale * c->rep_dir->dot(*dir);
             return s;
         };
+        // W3 — side + size-pick interplay. `side` alone means "the extreme face that
+        // way" (a body's TOP face). But combined with an explicit largest/smallest
+        // pick, extremum-first makes the pick a no-op: {"side":"top","pick":"largest"}
+        // kept only the single highest face (a 300 mm² wall-top sliver) and then picked
+        // "largest" among that one — silently ignoring the 2400 mm² base top the query
+        // obviously meant. With a size pick present, `side` instead FILTERS to every
+        // face FACING that way (rep_dir·dir ≥ 0.7) and lets the pick choose among them.
+        // Face queries only; falls back to the extremum path when nothing faces the
+        // side (e.g. a sphere's continuous wall).
+        bool side_done = false;
+        if (want_face && q.contains("pick") && q["pick"].is_string()) {
+            const std::string pk = lc(q["pick"].get<std::string>());
+            if (pk == "largest" || pk == "biggest" || pk == "smallest") {
+                constexpr double kFacing = 0.7;
+                std::vector<const QCand*> facing;
+                for (const QCand* c : keep)
+                    if (c->rep_dir && c->rep_dir->dot(*dir) >= kFacing) facing.push_back(c);
+                if (!facing.empty()) {
+                    keep.swap(facing);
+                    side_done = true;
+                }
+            }
+        }
+        if (!side_done) {
         // CAP PREFERENCE (revolved-part fix): when this is a FACE query and the body has
         // PLANAR faces whose normal is PARALLEL to the queried direction (|rep_dir·dir| ~ 1
         // — axis-perpendicular CAPS like a flange top/bottom), restrict the set to those
@@ -801,6 +825,7 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
             if (!dominant.empty()) ext.swap(dominant);
         }
         keep.swap(ext);
+        }  // !side_done (W3 — skipped when side acted as a facing filter for a size pick)
     }
 
     // 3b) pick: keep the extreme set. largest/smallest face by area, longest/shortest

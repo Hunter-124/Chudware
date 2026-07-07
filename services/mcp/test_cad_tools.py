@@ -1265,6 +1265,178 @@ def test_simulate_motion_rejects_non_dimensional_mate(tmp_path):
     assert "coincident" in out["error"] or "dimensional" in out["error"], out
 
 
+# ================================================================ W2 hole-frame determinism
+# hole/bolt_circle `positions` frame: origin = OUTER-boundary centroid (stable when the face
+# already carries holes), axes = SketchPlane convention (u = world +X projected, v = n×u).
+# Regression for the L-bracket incident: a Ø22.5 pilot bore shifted the whole-face centroid
+# by +0.57 mm, so the NEXT hole feature's pattern landed off by that much — parts didn't fit.
+
+def _bore_axes(doc: str) -> list:
+    """(x,y,z) axis-point (centroid) of every cylindrical face, sorted for stable compare."""
+    m = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "surf": "cylindrical"}})
+    pts = [tuple(round(v, 6) for v in f["centroid"]) for f in m.get("matches", [])]
+    return sorted(pts)
+
+
+def test_hole_positions_stable_after_prior_cut():
+    """A second hole feature lands where its [u,v] says even after a big prior bore moved
+    the face's area centroid; top-face axes are u=+X, v=+Y exactly."""
+    r, _ = _call("new_part", {"name": "w2_frame"})
+    doc = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Slab", {"length": cb.dim(60), "width": cb.dim(40),
+                                "height": cb.dim(10)}),
+        # big off-centre bore FIRST — the area centroid of the top face now shifts…
+        cb.feat("hole", "Big", {"style": "simple", "end": "through_all",
+                                "diameter": cb.dim(20), "positions": [[-15, 0]]},
+                {"face": {"of": "face", "side": "top"}}),
+        # …but the SECOND hole feature must still land at exactly (+20, +10).
+        cb.feat("hole", "Small", {"style": "simple", "end": "through_all",
+                                  "diameter": cb.dim(5), "positions": [[20, 10]]},
+                {"face": {"of": "face", "side": "top"}}),
+    ]})
+    assert r["ok"], r
+    axes = _bore_axes(doc)
+    # box is origin-centred: top-face outer boundary centroid = (0,0); u=+X, v=+Y.
+    assert (-15.0, 0.0, 0.0) in axes, axes
+    assert (20.0, 10.0, 0.0) in axes, axes
+    _call("close_part", {"doc_id": doc})
+
+
+def test_hole_positions_front_face_axes():
+    """On a front (−Y) face the frame is u=+X, v=+Z (world-aligned, not the kernel's
+    arbitrary surface parameterization)."""
+    r, _ = _call("new_part", {"name": "w2_front"})
+    doc = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Slab", {"length": cb.dim(60), "width": cb.dim(20),
+                                "height": cb.dim(40)}),
+        cb.feat("hole", "H", {"style": "simple", "end": "through_all",
+                              "diameter": cb.dim(6), "positions": [[15, 10]]},
+                {"face": {"of": "face", "side": "front"}}),
+    ]})
+    assert r["ok"], r
+    axes = _bore_axes(doc)
+    # front face centre (0, -10, 0); u=+X → x=15, v=+Z → z=10; bore axis runs along Y (y=0 mid).
+    assert (15.0, 0.0, 10.0) in axes, axes
+    _call("close_part", {"doc_id": doc})
+
+
+def test_side_plus_pick_largest_facing_face():
+    """W3: {"side":"top","pick":"largest"} = the LARGEST face FACING up — not the highest.
+    L-bracket regression: the extremum rule used to pick the 60x5 wall-top sliver."""
+    r, _ = _call("new_part", {"name": "w3_lbracket"})
+    doc = r["doc_id"]
+    ops = [
+        {"op": "add_feature", "feature": {"type": "sketch", "name": "L",
+            "params": {"entities": [], "constraints": []}, "refs": {"plane": "plane.right"}}},
+    ]
+    pts = [(0, 0), (45, 0), (45, 5), (5, 5), (5, 65), (0, 65)]
+    for i in range(len(pts)):
+        p1, p2 = pts[i], pts[(i + 1) % len(pts)]
+        ops.append({"op": "sketch_add_entity", "sketch": "$0",
+                    "entity": {"type": "line", "p1": list(p1), "p2": list(p2)}})
+    ops.append({"op": "add_feature", "feature": {"type": "extrude", "name": "Body",
+        "params": {"mode": "boss", "end": "blind", "depth": cb.dim(60)},
+        "refs": {"profile": [{"kind": "region", "sketch": "$0", "centroid": [10, 3],
+                              "hint_index": 0}]}}})
+    r, _ = _call("add_features", {"doc_id": doc, "ops": ops})
+    assert r["ok"], r
+    m = cb.call("doc_query", {"doc_id": doc,
+                              "query": {"of": "face", "side": "top", "pick": "largest"}})
+    faces = m.get("matches", [])
+    assert len(faces) == 1, faces
+    # the base top (60 x 40 = 2400 mm²), NOT the 60x5=300 mm² wall top at z=65.
+    assert abs(faces[0]["area_or_len"] - 2400.0) < 1.0, faces[0]
+    # side alone still means the EXTREME face — the wall top.
+    m2 = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "side": "top"}})
+    tops = m2.get("matches", [])
+    assert len(tops) == 1 and abs(tops[0]["area_or_len"] - 300.0) < 1.0, tops
+    _call("close_part", {"doc_id": doc})
+
+
+# ================================================================ G4/G5 assembly authoring
+
+def test_asm_ops_rejected_on_part_doc():
+    """asm_* ops on a PART doc must fail loudly (they used to no-op silently)."""
+    r, _ = _call("new_part", {"name": "not_an_asm"})
+    doc = r["doc_id"]
+    out, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "asm_insert_component", "source": {"path": "/nonexistent.step+"}}]})
+    assert out["ok"] is False, out
+    assert "assembly" in json.dumps(out).lower(), out
+    _call("close_part", {"doc_id": doc})
+
+
+def test_assembly_tools_end_to_end(tmp_path):
+    """new_assembly + asm_add_component + asm_mate: a pin seats concentrically in a plate's
+    bore with faces coincident; the solver lands the pin on the hole axis."""
+    # part 1: plate with an off-centre Ø8 bore
+    r, _ = _call("new_part", {"name": "aa_plate"})
+    plate = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": plate, "ops": [
+        cb.feat("box", "Plate", {"length": cb.dim(60), "width": cb.dim(40),
+                                 "height": cb.dim(10)}),
+        cb.feat("hole", "Bore", {"style": "simple", "end": "through_all",
+                                 "diameter": cb.dim(8), "positions": [[15, 5]]},
+                {"face": {"of": "face", "side": "top"}}),
+    ]})
+    assert r["ok"], r
+    plate_path = str(tmp_path / "aa_plate.step+")
+    r, _ = _call("save_part", {"doc_id": plate, "path": plate_path})
+    assert r["ok"], r
+
+    # part 2: a Ø8 x 20 pin
+    r, _ = _call("new_part", {"name": "aa_pin"})
+    pin = r["doc_id"]
+    r, _ = _call("add_features", {"doc_id": pin, "ops": [
+        cb.feat("cylinder", "Pin", {"radius": cb.dim(4), "height": cb.dim(20)})]})
+    assert r["ok"], r
+    pin_path = str(tmp_path / "aa_pin.step+")
+    r, _ = _call("save_part", {"doc_id": pin, "path": pin_path})
+    assert r["ok"], r
+
+    # assembly: plate fixed, pin mated into the bore
+    r, _ = _call("new_assembly", {"name": "aa_asm"})
+    assert r["ok"] and r["kind"] == "assembly", r
+    asm = r["doc_id"]
+    r, _ = _call("asm_add_component", {"doc_id": asm, "path": plate_path, "fixed": True})
+    assert r["ok"] and r["component"] == "k1", r
+    r, _ = _call("asm_add_component", {"doc_id": asm, "path": pin_path,
+                                       "at": [15, 5, 30]})
+    assert r["ok"] and r["component"] == "k2", r
+    assert r["component_count"] == 2, r
+
+    # ambiguous query → helpful error with candidates
+    bad, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric",
+                                "a": {"component": "k1", "query": {"of": "face"}},
+                                "b": {"component": "k2",
+                                      "query": {"of": "face", "surf": "round"}}})
+    assert bad["ok"] is False and "candidates" in bad, bad
+
+    r, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric",
+                              "a": {"component": "k1",
+                                    "query": {"of": "face", "surf": "round"}},
+                              "b": {"component": "k2",
+                                    "query": {"of": "face", "surf": "round"}}})
+    assert r["ok"], r
+    assert r["mate"], r
+    bodies = {b["component"]: b for b in (r.get("world_bodies") or [])}
+    assert "k2" in bodies, r
+    bb = bodies["k2"]["bbox"]
+    # concentric seats the pin's axis on the bore's axis: x=15, y=5 (±solver tol)
+    cx = (bb["min"][0] + bb["max"][0]) / 2.0
+    cy = (bb["min"][1] + bb["max"][1]) / 2.0
+    assert abs(cx - 15.0) < 1e-3 and abs(cy - 5.0) < 1e-3, bodies["k2"]
+
+    # describe_assembly narrates it without error
+    out, _ = _call("describe_assembly", {"doc_id": asm})
+    assert out is None or out.get("ok", True) is not False, out
+    _call("close_part", {"doc_id": asm})
+    _call("close_part", {"doc_id": pin})
+    _call("close_part", {"doc_id": plate})
+
+
 if __name__ == "__main__":
     import sys
 

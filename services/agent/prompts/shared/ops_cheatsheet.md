@@ -98,6 +98,10 @@ need a face number or a coordinate.
   Query predicates (combine freely; omit all = EVERY edge/face of `of`):
     "side": which side it's on — "top"/"bottom"/"left"/"right"/"front"/"back" (top=+Z, front=-Y;
             signed axes "+z"/"-x"/.. also work). Keeps the faces/edges furthest that way.
+            EXCEPTION with a size pick: side+pick "largest"/"smallest" means "the largest/
+            smallest face FACING that way" — side filters to that facing, pick chooses by area
+            (so {"side":"top","pick":"largest"} finds a base's big top even when a taller
+            sliver face sits higher).
     "surf": the shape — faces "flat"/"round" (round matches ANY curved face: cylinder/cone/sphere/
             torus); also "cylindrical"/"conical"/"spherical"/"toroidal" for specific curved types.
             Edges: "straight"/"round" (or exact: plane/cylinder/cone/sphere/torus, line/circle).
@@ -175,7 +179,12 @@ for the common machining features; they take a face in plain words and need no p
           resolves the clearance bore — M3->3.4mm; tap-drill when style:"tap"). For an "M3 clearance
           bore" just give {"standard":"M3"}.
           refs.face = a face query e.g. {"of":"face","side":"top"}. Optional `positions`:[[u,v],..]
-          (mm in the face, origin = face centre) for several holes; omit = one at the centre.
+          for several holes; omit = one at the centre.
+          POSITIONS FRAME (deterministic): origin = the centroid of the face's OUTER boundary
+          (holes already cut in the face do NOT shift it); u = world +X projected into the face
+          (world +Y if the face is perpendicular to X); v = n×u, right-handed around the outward
+          normal. So on a top face u=+X,v=+Y; on a front (−Y) face u=+X,v=+Z; on a right (+X)
+          face u=+Y,v=+Z. bolt_circle uses the same frame (start_angle measured from u).
   bolt_circle — a RING of holes in one feature (no per-hole trig). params {diameter, count, pcd
           (bolt-circle diameter), style?, end?, depth?(blind), start_angle?:<deg>}. refs.face = a
           face query (defaults to the top face). e.g. 6×⌀5 on a 40mm circle:

@@ -160,6 +160,12 @@
   · `csink_d: dim?` · `csink_angle: dim` (90) · `thread_callout: str?` (cosmetic, BOM/callout only)
 - refs: `face: sel(face[plane])` · `positions: sel(region) | [sel(vertex)]` — a sketch of points
   on that face (preferred: `positions_sketch: feature-id`)
+- params may also carry `positions: [[u,v], …]` (mm, face-local; the common agent form). The
+  [u,v] frame is **normative and deterministic** (W2): origin = the area centroid of the face's
+  **outer boundary only** (already-cut holes never shift it); `u` = world **+X** projected into
+  the face plane (world **+Y** when the plane is ⟂X); `v` = `n×u`, right-handed around the
+  **outward** normal. Top face: u=+X, v=+Y; front (−Y) face: u=+X, v=+Z. `bolt_circle` uses
+  the same frame (`start_angle` measured from `u`).
 - compiler: `features/hole.py` → `Hole/CounterBoreHole/CounterSinkHole` at each point.
 
 ## Patterns & mirror — tool-body semantics (normative)

@@ -973,6 +973,53 @@ TIPS
     tune it with min_clearance_mm just like a static check.
 """
 
+_ASSEMBLY_GUIDE = """\
+ASSEMBLY GUIDE — put SEPARATE PARTS together so they actually fit (mates + solve + checks).
+
+TWO WAYS TO ASSEMBLE
+  A) TRUE ASSEMBLY (mates — SolidWorks/Onshape model; use for anything that must fit or move):
+     components are SAVED PART FILES placed by a mate solver. Gives per-component identity
+     (BOM), mates, kinematics (simulate_motion), exploded views.
+  B) MULTI-BODY PART (quick static stack-up): import_part(into=doc) / make_standard_part then
+     `transform` features with explicit coordinates. No mates, no motion — fine for a weldment
+     or a one-off clearance check, wrong for a real mechanism.
+
+TRUE-ASSEMBLY WORKFLOW
+  1. Build/obtain each part: new_part + add_features, make_standard_part (fasteners/bearings),
+     or import_part (a downloaded STEP). save_part(path) each one to .step+.
+  2. new_assembly("motor_mount")                    create the assembly doc (it becomes current).
+  3. asm_add_component(path, fixed=True)            the grounded base (first one defaults fixed).
+     asm_add_component(path2, at=[x,y,z])           free components; `at` is a starting pose
+                                                    (helps the solver pick the right side).
+  4. asm_mate(mate_type, a, b, ...)                 constrain pairs of faces/edges:
+       a/b = {"component": "k1", "query": {"of":"face","side":"top"}}
+       The query is the SAME plain-word geometry query as query_geometry, resolved against
+       that component's SOURCE PART, and must match exactly ONE face/edge (narrow with
+       pick/near/count; the error lists candidates when it matches several).
+       mate types: coincident | parallel | perpendicular | tangent | concentric |
+                   distance | angle | lock   (distance mm / angle deg take value=)
+       align="aligned"|"anti" flips which way normals/axes point.
+     SEATING PATTERNS (what a person clicks in SolidWorks):
+       bolt in hole      concentric (shank ↔ bore) + coincident (head seat ↔ plate face)
+       motor on bracket  concentric (pilot boss ↔ pilot bore) + coincident (flange ↔ plate)
+                         + parallel or a second concentric (bolt ↔ hole) to stop spin
+       pin joint         concentric (pin ↔ bore) + coincident/distance for axial position
+  5. asm_mate solves after each add (solve=True default) — or call solve_mates() explicitly.
+  6. VALIDATE: describe_assembly() (world bboxes + solve status), check_interference()
+     (clashes + tightest clearances; min_clearance_mm flags too-tight fits), interface_check
+     (do hole patterns/axes actually line up), measure_between (spot dimensions).
+  7. save_part(path) the assembly .step+; simulate_motion drives a dimensional mate for
+     kinematics + swept-clash.
+
+GOTCHAS
+  * asm_* ops REQUIRE an assembly doc (new_assembly) — they are rejected on a part doc.
+  * Components reference their source FILES: keep the .step+ files where the assembly can
+    find them (same directory is safest) and re-save parts before re-solving the assembly.
+  * An unconstrained component has 6 DOF: a single concentric leaves it free to slide+spin —
+    add the seating coincident (and an anti-spin mate) before trusting positions.
+  * Set the FIRST component fixed (default) so the solve has a ground.
+"""
+
 _OVERVIEW_HEADER = """\
 AI-CAD MODELING GUIDE (C++ parametric engine — same as the desktop app).
 
@@ -1166,6 +1213,9 @@ def cad_guide_text(topic: str = "overview") -> str:
     if topic in ("motion", "kinematics", "kinematic", "mechanism", "simulate_motion",
                  "linkage", "animate", "playback"):
         return _MOTION_GUIDE
+    if topic in ("assembly", "assemblies", "asm", "mate", "mates", "component",
+                 "components"):
+        return _ASSEMBLY_GUIDE
     if topic in ("intake", "fit", "fits", "iso286", "tolerance", "measure",
                  "manufacturing", "dfm", "photos"):
         return _INTAKE_GUIDE
@@ -1175,7 +1225,7 @@ def cad_guide_text(topic: str = "overview") -> str:
         return _CAM_GUIDE
     if topic in ("narration", "narrate", "describe_toolpaths", "describe_results",
                  "describe_assembly", "describe_board", "describe_project",
-                 "results", "fea_results", "cfd_results", "assembly", "board", "project"):
+                 "results", "fea_results", "cfd_results", "board", "project"):
         return (
             "NARRATION TOOLS — compact text summaries of every domain state:\n\n"
             "  describe_toolpaths([job_id])\n"
@@ -1792,6 +1842,8 @@ def register_cad_tools(mcp: FastMCP) -> None:
         taught. topic="overview" (default) gives the workflow + full op cheatsheet (primitives,
         sketch+extrude/revolve/loft/sweep, fillet/chamfer/shell/draft, holes, bolt_circle,
         patterns/mirror, edits) and the plain-English geometry-query predicates. Other topics:
+        "assembly" (new_assembly/asm_add_component/asm_mate/solve_mates — put saved parts
+        together with mates so they actually fit; seating patterns + validation loop),
         "simulation" (FEA/CFD how-to), "motion" (simulate_motion — drive a mate to animate an
         assembly + swept interference, kinematics), "review" (how to read the annotated render), "gsl" (the
         progressive TEXT read of a part's geometry — describe_part/describe_sketch/
@@ -3780,6 +3832,193 @@ def register_cad_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     # ---------------------------------------------------------------- assembly
+
+    # Component source docs opened for mate-query resolution, keyed by absolute path —
+    # asm_mate resolves plain-word queries against the COMPONENT's own part document, and
+    # reopening the same .step+ for every mate would be wasteful.
+    _ASM_QUERY_DOCS: dict = {}
+
+    def _asm_component_doc(path: str) -> str:
+        """doc_id of the component's source part, opened (once) for geometry queries."""
+        import os as _os
+        p = _os.path.abspath(path)
+        d = _ASM_QUERY_DOCS.get(p)
+        if d:
+            try:  # still open?
+                cb.call("doc_tree", {"doc_id": d})
+                return d
+            except Exception:  # noqa: BLE001
+                _ASM_QUERY_DOCS.pop(p, None)
+        r = cb.call("doc_open", {"path": p})
+        d = r.get("doc_id")
+        _ASM_QUERY_DOCS[p] = d
+        return d
+
+    def _asm_components(doc_id: str) -> list:
+        tr = cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}
+        comps = tr.get("components") if isinstance(tr, dict) else None
+        return comps if isinstance(comps, list) else []
+
+    def _asm_revision(doc_id: str) -> int:
+        return cb.call("doc_tree", {"doc_id": doc_id}).get("revision", 0)
+
+    @mcp.tool()
+    def new_assembly(name: str = "assembly") -> str:
+        """Create a new, empty ASSEMBLY document and make it current. Returns its doc_id.
+
+        An assembly PLACES saved part files as components and positions them with MATES —
+        the SolidWorks/Onshape model. Build the parts first (new_part/make_standard_part/
+        import_part), save_part() each to a .step+ file, then:
+          1. new_assembly("motor_mount")
+          2. asm_add_component(path, fixed=True)      the grounded base component
+          3. asm_add_component(path2), ...            the moving/attached components
+          4. asm_mate("concentric", a=..., b=...)     seat components against each other
+          5. solve_mates() -> describe_assembly() / check_interference() to validate fit.
+        For a quick static stack-up WITHOUT mates, a multi-body part (import_part into= +
+        transform features) also works — but only an assembly gives you mates, motion
+        (simulate_motion) and per-component BOM identity.
+        """
+        try:
+            r = cb.call("doc_new", {"kind": "assembly", "name": name})
+            did = r.get("doc_id")
+            _CUR["doc_id"] = did
+            return _dumps({"ok": True, "doc_id": did, "name": name, "kind": "assembly",
+                           "revision": r.get("revision", 0)})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def asm_add_component(path: str, name: Optional[str] = None, fixed: Optional[bool] = None,
+                          at: Optional[list] = None, rotate: Optional[list] = None,
+                          angle: float = 0.0, doc_id: Optional[str] = None) -> str:
+        """Insert a saved part file into the current assembly as a component.
+
+        path  : the part file to place (.step+ preferred — editable; plain STEP accepted).
+        name  : component display name (default: the file stem).
+        fixed : ground this component (default: the FIRST component is fixed, later ones free).
+        at    : optional [x,y,z] mm initial translation (a starting pose for the solver, or
+                the final pose if you skip mates entirely).
+        rotate/angle : optional axis [ax,ay,az] + degrees initial rotation (applied before
+                `at`'s translation).
+        Returns the new component id ("k1", "k2", ...) for use in asm_mate refs.
+        """
+        try:
+            import math as _math
+            import os as _os
+            d = _doc(doc_id)
+            p = _os.path.abspath(path)
+            if not _os.path.exists(p):
+                return _dumps({"ok": False, "error": f"no such file: {p}"})
+            op: dict = {"op": "asm_insert_component", "source": {"path": p}}
+            if name:
+                op["name"] = name
+            if fixed is not None:
+                op["fixed"] = bool(fixed)
+            if at is not None or rotate is not None:
+                # row-major 4x4: rotation about `rotate` by `angle` deg, then translate `at`.
+                t = [0.0, 0.0, 0.0] if at is None else [float(v) for v in at]
+                r3 = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+                if rotate is not None and angle:
+                    ax = [float(v) for v in rotate]
+                    n = _math.sqrt(sum(v * v for v in ax)) or 1.0
+                    x, y, z = (v / n for v in ax)
+                    c, s = _math.cos(_math.radians(angle)), _math.sin(_math.radians(angle))
+                    C = 1 - c
+                    r3 = [[c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+                          [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+                          [z * x * C - y * s, z * y * C + x * s, c + z * z * C]]
+                op["transform"] = [r3[0][0], r3[0][1], r3[0][2], t[0],
+                                   r3[1][0], r3[1][1], r3[1][2], t[1],
+                                   r3[2][0], r3[2][1], r3[2][2], t[2],
+                                   0.0, 0.0, 0.0, 1.0]
+            r = cb.call("doc_apply_ops", {"doc_id": d, "base_revision": _asm_revision(d),
+                                          "with_tess": False, "ops": [op]})
+            kid = (r.get("id_map") or {}).get("$0")
+            comps = _asm_components(d)
+            me = next((c for c in comps if c.get("id") == kid), {})
+            _publish_current(d)
+            _autosave(d)
+            return _dumps({"ok": True, "doc_id": d, "component": kid,
+                           "name": me.get("name"), "fixed": me.get("fixed"),
+                           "component_count": len(comps)})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def asm_mate(mate_type: str, a: dict, b: dict, value: Optional[float] = None,
+                 align: str = "aligned", solve: bool = True,
+                 doc_id: Optional[str] = None) -> str:
+        """Add a MATE between two components of the current assembly (and solve it).
+
+        mate_type : coincident | parallel | perpendicular | tangent | concentric |
+                    distance | angle | lock  (distance mm / angle deg carry `value`).
+        a, b      : each names ONE face/edge of ONE component:
+                      {"component": "k1", "query": {"of":"face","side":"top"}}
+                    `query` is the same plain-word geometry query used everywhere
+                    (query_geometry), resolved against that component's SOURCE part — a bare
+                    side word ("top") also works. It must resolve to exactly ONE face/edge;
+                    narrow with pick/near/count if it matches several.
+        align     : "aligned" or "anti" (flip which way the normals/axes face).
+        value     : the driving dimension for distance/angle mates.
+        solve     : re-solve the mate network immediately (default) and report status.
+
+        Typical seating pattern: `concentric` (bolt shank ↔ hole bore) + `coincident`
+        (head seat face ↔ plate face). Returns the mate id (drive it with simulate_motion
+        for kinematics) plus the solve status and each component's world bbox.
+        """
+        try:
+            d = _doc(doc_id)
+            comps = {c.get("id"): c for c in _asm_components(d)}
+            if not comps:
+                return _dumps({"ok": False, "error": "assembly has no components — "
+                               "asm_add_component first (or is this a part doc?)"})
+            refs = []
+            for tag, ref in (("a", a), ("b", b)):
+                if not isinstance(ref, dict) or "component" not in ref:
+                    return _dumps({"ok": False, "error":
+                                   f"{tag} must be {{'component': 'kN', 'query': ...}}"})
+                kid = ref["component"]
+                if kid not in comps:
+                    return _dumps({"ok": False, "error": f"{tag}: no component '{kid}' "
+                                   f"(have: {sorted(comps)})"})
+                src = ((comps[kid].get("source") or {}).get("path")) or ""
+                if not src:
+                    return _dumps({"ok": False, "error": f"{tag}: component '{kid}' has no "
+                                   "source path (embedded components not supported yet)"})
+                q = ref.get("query", "top")
+                if isinstance(q, str):
+                    q = {"of": "face", "side": q}
+                part_doc = _asm_component_doc(src)
+                matches = (cb.call("doc_query", {"doc_id": part_doc, "query": q})
+                           .get("matches") or [])
+                if len(matches) != 1:
+                    brief = [{k: m.get(k) for k in ("sid", "kind", "surf", "side",
+                                                    "centroid", "radius")}
+                             for m in matches[:8]]
+                    return _dumps({"ok": False, "error":
+                                   f"{tag}: query must resolve to exactly ONE face/edge of "
+                                   f"'{kid}' — got {len(matches)}. Narrow with pick/near/"
+                                   "count (candidates below).", "candidates": brief})
+                refs.append({"component": kid, "selector": matches[0]})
+            mate: dict = {"type": mate_type, "align": align, "suppressed": False,
+                          "refs": refs}
+            if value is not None:
+                mate["value"] = {"value": float(value)}
+            r = cb.call("doc_apply_ops", {"doc_id": d, "base_revision": _asm_revision(d),
+                                          "with_tess": False,
+                                          "ops": [{"op": "asm_add_mate", "mate": mate}]})
+            mate_id = (r.get("id_map") or {}).get("$0")
+            out: dict = {"ok": True, "doc_id": d, "mate": mate_id, "type": mate_type}
+            if solve:
+                sr = cb.call("doc_solve_mates", {"doc_id": d})
+                out["solve_status"] = (sr.get("rebuild") or {}).get("doc_status")
+                wb = cb.call("asm_world_bodies", {"doc_id": d})
+                out["world_bodies"] = wb.get("bodies")
+            _publish_current(d)
+            _autosave(d)
+            return _dumps(out)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
 
     @mcp.tool()
     def solve_mates(doc_id: Optional[str] = None) -> str:

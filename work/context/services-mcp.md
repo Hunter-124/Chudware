@@ -18,6 +18,15 @@ Contracts: contracts/doc_ops.md, contracts/doc_schema.md, contracts/worker_rpc.m
   export_part, make_drawing, measure_part, check_feature_overlap, check_interference,
   wall_thickness, draft_analysis, list_parts, undo/redo, close_part, recover_parts,
   import_part, make_standard_part, set_material/view/process, configurations, drawings).
+  ASSEMBLY AUTHORING (2026-07-06): new_assembly (doc_new kind=assembly),
+  asm_add_component (asm_insert_component op + initial pose), asm_mate (plain-word
+  queries resolved per component source doc via doc_open+doc_query → asm_add_mate +
+  auto-solve) — cad_guide("assembly") is the workflow topic. Engine rejects asm_* ops
+  on part docs (used to silently no-op). hole/bolt_circle `positions` frame is now
+  DETERMINISTIC (origin = outer-boundary centroid, u = world +X projected, v = n×u —
+  contracts/feature_params.md `hole`); {"side","pick":"largest"} = largest face FACING
+  that way (core/doc/picks.cpp W3). Regression tests: test_cad_tools.py W2/W3/G4-G5
+  sections; acceptance = NEMA17 bracket+motor+screws mate assembly (2026-07-06 session).
 - services/mcp/cad_tools.py:1009 `cad_guide_text(topic)` — the knowledge-dispatch
   function behind the `cad_guide` tool; topics: overview, simulation, review, intake, gsl,
   cam, narration, parts, reverse, deliverables, requirements, dag, verify, interaction,

@@ -351,7 +351,12 @@
         "mcmaster",
         "grainger",
         "amazon",
-        "misumi"
+        "misumi",
+        "thk",
+        "hiwin",
+        "thomson",
+        "igus",
+        "traceparts"
       ],
       "query_terms": [
         "bearing"
@@ -590,7 +595,13 @@
         "metalsdepot",
         "homedepot",
         "lowes",
-        "misumi"
+        "misumi",
+        "speedymetals",
+        "coremarkmetals",
+        "professionalplastics",
+        "rockwest",
+        "acpcomposites",
+        "fibreglast"
       ],
       "children": [
         {
@@ -1527,7 +1538,16 @@
         "digikey_web",
         "snapeda",
         "jlcpcb",
-        "amazon"
+        "amazon",
+        "wch",
+        "hdsc",
+        "futureelectronics",
+        "seeedstudio",
+        "dfrobot",
+        "datasheet4u",
+        "ultralibrarian",
+        "componentsearchengine",
+        "cadenas"
       ],
       "children": [
         {
@@ -1732,7 +1752,12 @@
       "sites": [
         "mcmaster",
         "grainger",
-        "tractorsupply"
+        "tractorsupply",
+        "boschrexroth",
+        "hydraforce",
+        "parker",
+        "surpluscenter",
+        "baileyhydraulics"
       ],
       "children": [
         {
@@ -1919,6 +1944,134 @@
               ]
             }
           ]
+        },
+        {
+          "id": "fluid_power.pumps",
+          "label": "Hydraulic Pumps",
+          "description": "Gear, vane, piston & manifold pumps.",
+          "query_terms": [
+            "hydraulic pump",
+            "gear pump",
+            "piston pump"
+          ],
+          "facets": [
+            {
+              "key": "displacement_cc_rev",
+              "label": "Displacement",
+              "type": "range",
+              "unit": "cc/rev"
+            },
+            {
+              "key": "max_pressure_bar",
+              "label": "Max Pressure",
+              "type": "range",
+              "unit": "bar"
+            }
+          ],
+          "children": []
+        },
+        {
+          "id": "fluid_power.motors",
+          "label": "Hydraulic Motors",
+          "description": "Orbital, gear & piston hydraulic motors.",
+          "query_terms": [
+            "hydraulic motor",
+            "orbital motor"
+          ],
+          "facets": [
+            {
+              "key": "displacement_cc_rev",
+              "label": "Displacement",
+              "type": "range",
+              "unit": "cc/rev"
+            },
+            {
+              "key": "max_torque_nm",
+              "label": "Max Torque",
+              "type": "range",
+              "unit": "N·m"
+            }
+          ],
+          "children": []
+        },
+        {
+          "id": "fluid_power.cylinders",
+          "label": "Hydraulic Cylinders",
+          "description": "Tie-rod, welded & telescopic cylinders.",
+          "query_terms": [
+            "hydraulic cylinder"
+          ],
+          "facets": [
+            {
+              "key": "bore_mm",
+              "label": "Bore",
+              "type": "range",
+              "unit": "mm"
+            },
+            {
+              "key": "stroke_mm",
+              "label": "Stroke",
+              "type": "range",
+              "unit": "mm"
+            }
+          ],
+          "children": []
+        },
+        {
+          "id": "fluid_power.valves",
+          "label": "Valves & Manifolds",
+          "description": "Directional, cartridge, relief valves & manifolds.",
+          "query_terms": [
+            "hydraulic valve",
+            "cartridge valve",
+            "manifold"
+          ],
+          "facets": [
+            {
+              "key": "valve_type",
+              "label": "Valve Type",
+              "type": "enum",
+              "values": [
+                "directional",
+                "cartridge",
+                "relief",
+                "flow",
+                "check"
+              ]
+            }
+          ],
+          "children": []
+        },
+        {
+          "id": "fluid_power.accumulators",
+          "label": "Accumulators & Reservoirs",
+          "description": "Bladder/piston accumulators, reservoirs & tanks.",
+          "query_terms": [
+            "accumulator",
+            "reservoir",
+            "hydraulic tank"
+          ],
+          "facets": [
+            {
+              "key": "volume_l",
+              "label": "Volume",
+              "type": "range",
+              "unit": "L"
+            }
+          ],
+          "children": []
+        },
+        {
+          "id": "fluid_power.pneumatics",
+          "label": "Pneumatics",
+          "description": "Air cylinders, valves & FRLs.",
+          "query_terms": [
+            "pneumatic",
+            "air cylinder",
+            "solenoid valve"
+          ],
+          "facets": [],
+          "children": []
         }
       ]
     },
@@ -2259,6 +2412,475 @@
             "safety sign",
             "warning label"
           ]
+        }
+      ]
+    },
+    {
+      "id": "electric_motors",
+      "label": "Electric Motors",
+      "icon": "cat_motor",
+      "description": "Electric motors & gearmotors: steppers, BLDC, servo, DC, AC induction, gearmotors.",
+      "domains": [
+        "motor"
+      ],
+      "sites": [
+        "maxon",
+        "orientalmotor",
+        "anaheimautomation",
+        "grainger",
+        "amazon"
+      ],
+      "query_terms": [
+        "motor"
+      ],
+      "facets": [
+        {
+          "key": "motor_type",
+          "label": "Type",
+          "type": "enum",
+          "values": [
+            "stepper",
+            "bldc",
+            "servo",
+            "dc",
+            "ac induction",
+            "gearmotor"
+          ]
+        },
+        {
+          "key": "power_w",
+          "label": "Power",
+          "type": "range",
+          "unit": "W"
+        },
+        {
+          "key": "voltage_v",
+          "label": "Voltage",
+          "type": "range",
+          "unit": "V"
+        },
+        {
+          "key": "rated_torque_nm",
+          "label": "Rated Torque",
+          "type": "range",
+          "unit": "N·m"
+        }
+      ],
+      "children": [
+        {
+          "id": "electric_motors.stepper",
+          "label": "Stepper Motors",
+          "description": "NEMA-frame & geared stepper motors.",
+          "query_terms": [
+            "stepper motor",
+            "nema"
+          ],
+          "facets": [
+            {
+              "key": "frame",
+              "label": "NEMA Frame",
+              "type": "enum",
+              "values": [
+                "NEMA8",
+                "NEMA11",
+                "NEMA14",
+                "NEMA17",
+                "NEMA23",
+                "NEMA34"
+              ]
+            }
+          ],
+          "children": []
+        },
+        {
+          "id": "electric_motors.bldc_servo",
+          "label": "BLDC & Servo",
+          "description": "Brushless DC and servo motors.",
+          "query_terms": [
+            "bldc",
+            "servo motor"
+          ],
+          "facets": [],
+          "children": []
+        },
+        {
+          "id": "electric_motors.dc_gearmotor",
+          "label": "DC & Gearmotors",
+          "description": "Brushed DC motors and gearmotors.",
+          "query_terms": [
+            "dc motor",
+            "gearmotor"
+          ],
+          "facets": [],
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "motion_control",
+      "label": "Motion Control",
+      "icon": "cat_motion",
+      "description": "Linear & rotary motion: linear guides, ballscrews, actuators, stages, couplings, drives.",
+      "domains": [
+        "motion"
+      ],
+      "sites": [
+        "thk",
+        "hiwin",
+        "thomson",
+        "igus",
+        "misumi",
+        "traceparts"
+      ],
+      "query_terms": [
+        "linear motion",
+        "actuator"
+      ],
+      "facets": [
+        {
+          "key": "motion_type",
+          "label": "Type",
+          "type": "enum",
+          "values": [
+            "linear guide",
+            "ballscrew",
+            "linear actuator",
+            "stage",
+            "rotary",
+            "coupling"
+          ]
+        },
+        {
+          "key": "stroke_mm",
+          "label": "Stroke",
+          "type": "range",
+          "unit": "mm"
+        }
+      ],
+      "children": [
+        {
+          "id": "motion_control.linear_guides",
+          "label": "Linear Guides & Rails",
+          "description": "Profile rails, round-rail & recirculating guides.",
+          "query_terms": [
+            "linear guide",
+            "linear rail",
+            "lm guide"
+          ],
+          "facets": [],
+          "children": []
+        },
+        {
+          "id": "motion_control.ballscrews",
+          "label": "Ballscrews & Leadscrews",
+          "description": "Precision ballscrews and leadscrews.",
+          "query_terms": [
+            "ballscrew",
+            "leadscrew"
+          ],
+          "facets": [],
+          "children": []
+        },
+        {
+          "id": "motion_control.actuators",
+          "label": "Linear Actuators & Stages",
+          "description": "Electric linear actuators and positioning stages.",
+          "query_terms": [
+            "linear actuator",
+            "linear stage"
+          ],
+          "facets": [],
+          "children": []
+        },
+        {
+          "id": "motion_control.couplings",
+          "label": "Couplings",
+          "description": "Shaft couplings: bellows, jaw, disc, beam.",
+          "query_terms": [
+            "coupling",
+            "shaft coupling"
+          ],
+          "facets": [],
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "power_supplies",
+      "label": "Power Supplies",
+      "icon": "cat_power",
+      "description": "AC-DC & DC-DC power supplies, converters, LED drivers, inverters.",
+      "domains": [
+        "power_supply"
+      ],
+      "sites": [
+        "meanwell",
+        "cui",
+        "digikey_web",
+        "futureelectronics",
+        "amazon"
+      ],
+      "query_terms": [
+        "power supply",
+        "converter"
+      ],
+      "facets": [
+        {
+          "key": "supply_type",
+          "label": "Type",
+          "type": "enum",
+          "values": [
+            "ac-dc",
+            "dc-dc",
+            "led driver",
+            "inverter",
+            "din-rail"
+          ]
+        },
+        {
+          "key": "output_v",
+          "label": "Output Voltage",
+          "type": "range",
+          "unit": "V"
+        },
+        {
+          "key": "output_power_w",
+          "label": "Output Power",
+          "type": "range",
+          "unit": "W"
+        }
+      ],
+      "children": []
+    },
+    {
+      "id": "batteries",
+      "label": "Batteries & Charging",
+      "icon": "cat_battery",
+      "description": "Cells, packs, chargers & battery-management: Li-ion, LiFePO4, NiMH, lead-acid.",
+      "domains": [
+        "battery"
+      ],
+      "sites": [
+        "batteryspace",
+        "digikey_web",
+        "amazon"
+      ],
+      "query_terms": [
+        "battery",
+        "cell",
+        "charger"
+      ],
+      "facets": [
+        {
+          "key": "chemistry",
+          "label": "Chemistry",
+          "type": "enum",
+          "values": [
+            "li-ion",
+            "lifepo4",
+            "nimh",
+            "lead-acid",
+            "lipo",
+            "alkaline"
+          ]
+        },
+        {
+          "key": "nominal_v",
+          "label": "Nominal Voltage",
+          "type": "range",
+          "unit": "V"
+        },
+        {
+          "key": "capacity_mah",
+          "label": "Capacity",
+          "type": "range",
+          "unit": "mAh"
+        }
+      ],
+      "children": []
+    },
+    {
+      "id": "seals_gaskets",
+      "label": "Seals & Gaskets",
+      "icon": "cat_seal",
+      "description": "O-rings, seals, gaskets & sealing: rotary/reciprocating seals, gasket material.",
+      "domains": [
+        "seal"
+      ],
+      "sites": [
+        "applerubber",
+        "marcorubber",
+        "globaloring",
+        "mcmaster",
+        "grainger"
+      ],
+      "query_terms": [
+        "o-ring",
+        "seal",
+        "gasket"
+      ],
+      "facets": [
+        {
+          "key": "seal_type",
+          "label": "Type",
+          "type": "enum",
+          "values": [
+            "o-ring",
+            "rotary seal",
+            "reciprocating seal",
+            "gasket",
+            "x-ring",
+            "back-up ring",
+            "oil seal"
+          ]
+        },
+        {
+          "key": "material",
+          "label": "Material",
+          "type": "enum",
+          "values": [
+            "nbr",
+            "buna-n",
+            "viton",
+            "fkm",
+            "epdm",
+            "silicone",
+            "ptfe",
+            "neoprene"
+          ]
+        },
+        {
+          "key": "id_mm",
+          "label": "Inner Diameter",
+          "type": "range",
+          "unit": "mm"
+        },
+        {
+          "key": "cross_section_mm",
+          "label": "Cross Section",
+          "type": "range",
+          "unit": "mm"
+        }
+      ],
+      "children": [
+        {
+          "id": "seals_gaskets.orings",
+          "label": "O-Rings",
+          "description": "Standard AS568 & metric O-rings.",
+          "query_terms": [
+            "o-ring",
+            "as568"
+          ],
+          "facets": [],
+          "children": []
+        },
+        {
+          "id": "seals_gaskets.shaft_seals",
+          "label": "Shaft & Oil Seals",
+          "description": "Rotary shaft seals and oil seals.",
+          "query_terms": [
+            "oil seal",
+            "shaft seal"
+          ],
+          "facets": [],
+          "children": []
+        },
+        {
+          "id": "seals_gaskets.gaskets",
+          "label": "Gaskets & Sheet",
+          "description": "Cut gaskets and gasket sheet stock.",
+          "query_terms": [
+            "gasket",
+            "gasket sheet"
+          ],
+          "facets": [],
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "electromechanical",
+      "label": "Electro-Mechanical",
+      "icon": "cat_electromech",
+      "description": "Relays, solenoids, connectors, switches, encoders, fans & other electro-mechanical components.",
+      "domains": [
+        "electromech"
+      ],
+      "sites": [
+        "digikey_web",
+        "cui",
+        "futureelectronics",
+        "componentsearchengine",
+        "ultralibrarian",
+        "amazon"
+      ],
+      "query_terms": [
+        "relay",
+        "solenoid",
+        "connector",
+        "switch",
+        "encoder"
+      ],
+      "facets": [
+        {
+          "key": "component_type",
+          "label": "Type",
+          "type": "enum",
+          "values": [
+            "relay",
+            "solenoid",
+            "connector",
+            "switch",
+            "encoder",
+            "fan",
+            "contactor",
+            "terminal block"
+          ]
+        }
+      ],
+      "children": [
+        {
+          "id": "electromechanical.relays",
+          "label": "Relays & Contactors",
+          "description": "Signal, power relays and contactors.",
+          "query_terms": [
+            "relay",
+            "contactor"
+          ],
+          "facets": [],
+          "children": []
+        },
+        {
+          "id": "electromechanical.solenoids",
+          "label": "Solenoids",
+          "description": "Linear & rotary solenoids.",
+          "query_terms": [
+            "solenoid"
+          ],
+          "facets": [],
+          "children": []
+        },
+        {
+          "id": "electromechanical.connectors",
+          "label": "Connectors",
+          "description": "Wire-to-board, circular & power connectors.",
+          "query_terms": [
+            "connector"
+          ],
+          "facets": [],
+          "children": []
+        },
+        {
+          "id": "electromechanical.switches_encoders",
+          "label": "Switches & Encoders",
+          "description": "Switches, potentiometers and encoders.",
+          "query_terms": [
+            "switch",
+            "encoder",
+            "potentiometer"
+          ],
+          "facets": [],
+          "children": []
         }
       ]
     },

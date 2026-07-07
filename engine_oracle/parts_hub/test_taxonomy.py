@@ -44,7 +44,7 @@ class TestRealTaxonomyFile:
         doc = tax.load_taxonomy()
         assert doc["version"] == 1
         assert isinstance(doc["categories"], list)
-        assert len(doc["categories"]) == 12, "product catalog defines 12 top folders (11 part folders + vendors)"
+        assert len(doc["categories"]) == 18, "product catalog defines 18 top folders (17 part folders + vendors)"
 
     def test_ids_unique_and_dotted(self):
         doc = tax.load_taxonomy()
@@ -244,7 +244,7 @@ class TestMatchFacets:
 class TestGuiTree:
     def test_roots(self):
         roots = tax.flat_tree_for_gui()
-        assert len(roots) == 12
+        assert len(roots) == 18
         for node in roots:
             for key in ("id", "label", "icon", "description", "facets", "children"):
                 assert key in node

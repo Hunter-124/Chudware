@@ -30,6 +30,12 @@ _DOMAIN_LABELS: dict[str, str] = {
     "fitting":     "Pipe Fittings",
     "hydraulic":   "Hydraulics",
     "ecad":        "Electronics (ECAD)",
+    "motor":       "Electric Motors",
+    "motion":      "Motion Control",
+    "power_supply": "Power Supplies",
+    "battery":     "Batteries",
+    "seal":        "Seals & Gaskets",
+    "electromech": "Electro-Mechanical",
 }
 
 # Friendly labels for browser-catalog sites; adapters may also carry a ``label``

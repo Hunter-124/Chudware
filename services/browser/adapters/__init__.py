@@ -65,6 +65,22 @@ _LOGIN_WIZARD_SITES: frozenset[str] = frozenset({
     "misumi",
     "snapeda",
     "traceparts",
+    # Wave 3/4 CAD-download-behind-login sites (STEP/IGES/symbol libs behind a
+    # free account). Commerce/datasheet + open sources (freecadlibrary, gbstandards,
+    # the datasheet DBs, materials/composites storefronts) are intentionally absent.
+    "boschrexroth",
+    "hydraforce",
+    "parker",
+    "ultralibrarian",
+    "componentsearchengine",
+    "cadenas",
+    "maxon",
+    "orientalmotor",
+    "anaheimautomation",
+    "thk",
+    "hiwin",
+    "thomson",
+    "igus",
 })
 
 
@@ -155,3 +171,22 @@ from . import (amazon, content3d, digikey_web, grabcad, jlcpcb, lcsc, mcmaster, 
                misumi, pcbway, snapeda, traceparts)
 from . import (acehardware, fastenal, grainger, harborfreight, homedepot,  # noqa: E402,F401
                lowes, metalsdepot, onlinemetals, tractorsupply)
+# Wave 3 (2026-07-07): supplier expansion — hydraulics/fluid-power, Chinese &
+# foreign electronics, materials, engineered-products CAD portals + the RE-feed
+# datasheet/standards DBs (see docs/parts_supplier_research.md).
+from . import (boschrexroth, hydraforce, parker,  # hydraulics CAD  # noqa: E402,F401
+               speedymetals, coremarkmetals, professionalplastics,  # metals/plastics
+               rockwest, acpcomposites, fibreglast,  # composites
+               surpluscenter, baileyhydraulics,  # hydraulics commerce
+               wch, hdsc, dfrobot, seeedstudio, futureelectronics,  # CN/electronics
+               datasheet4u,  # datasheet DB (RE feed)
+               ultralibrarian, componentsearchengine,  # ECAD CAD libraries
+               freecadlibrary,  # open git STEP repo (no login)
+               cadenas,  # CADENAS 3Dfindit/PARTcommunity portal engine
+               gbstandards)  # free GB/T full-text standards (RE feed)
+# Wave 4 (2026-07-07): electro-mechanical — electric motors, motion control,
+# seals/gaskets, batteries, power supplies.
+from . import (maxon, orientalmotor, anaheimautomation,  # motors  # noqa: E402,F401
+               thk, hiwin, thomson, igus,  # motion control
+               applerubber, marcorubber, globaloring,  # seals/gaskets
+               meanwell, cui, batteryspace)  # power supplies / batteries

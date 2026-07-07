@@ -30,6 +30,39 @@ from mcp.server.fastmcp import FastMCP
 # ── helpers from cad_tools (already loaded) ────────────────────────────────
 from mcp_server.cad_tools import _dumps, _err  # type: ignore[attr-defined]
 
+# ── RE-29: research ingest orchestrator ────────────────────────────────────
+try:
+    from engine_oracle.vision.research_ingest import research_and_ingest as _research_and_ingest
+except ImportError:
+    _research_and_ingest = None  # type: ignore[assignment]
+
+
+def _research_ingest(
+    session_id: str,
+    *,
+    query: Optional[str] = None,
+    part_number: Optional[str] = None,
+    url: Optional[str] = None,
+) -> dict:
+    """Internal helper: run research_and_ingest for *session_id*."""
+    if _research_and_ingest is None:
+        return {
+            "ok": False,
+            "reason": "backend_not_provisioned",
+            "hint": "research_ingest module not available; check engine_oracle install",
+        }
+    session_root = _session_path(session_id)
+    try:
+        return _research_and_ingest(
+            session_root,
+            query=query,
+            part_number=part_number,
+            url=url,
+        )
+    except Exception as exc:
+        return {"ok": False, "reason": "ingest_error", "hint": str(exc)}
+
+
 # ── RE-06: provisioning probe ───────────────────────────────────────────────
 try:
     from engine_oracle.vision.reveng_provision import reveng_status as _reveng_status
@@ -594,21 +627,40 @@ def register_reveng_tools(mcp: FastMCP) -> None:
     def reveng_start_session(
         name: Optional[str] = None,
         part_ref: Optional[str] = None,
+        research: Optional[str] = None,
     ) -> str:
         """Create a new reverse engineering session.
 
         Args:
             name: Human label for this session (defaults to a timestamp label).
             part_ref: Optional parts-hub ``part_id`` when seeded from the library.
+            research: Optional seed for the web/part-number lane — pass a part number,
+                search query, or vendor URL.  When provided, the session is created and
+                ``reveng_research_source`` is immediately called with this value so the
+                datasheet lane is populated before the caller needs to do anything else.
 
-        Returns ``{ok, session_id, session}``.
+        Returns ``{ok, session_id, session}`` (plus ``research_result`` when the seed
+        was provided).
         """
         try:
             sid = _new_session_id()
             label = name or f"RE session {_now_iso()}"
             session = _make_session(sid, label, part_ref)
             _save_session(session)
-            return _dumps({"ok": True, "session_id": sid, "session": session})
+            result: dict = {"ok": True, "session_id": sid, "session": session}
+            if research:
+                # Determine whether the seed looks like a URL, a part number, or a query
+                import re as _re
+                _url_pat = _re.compile(r"^https?://", _re.IGNORECASE)
+                _mpn_pat = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]{2,20}$")
+                if _url_pat.match(research):
+                    ri = _research_ingest(session_id=sid, url=research)
+                elif _mpn_pat.match(research):
+                    ri = _research_ingest(session_id=sid, part_number=research)
+                else:
+                    ri = _research_ingest(session_id=sid, query=research)
+                result["research_result"] = ri
+            return _dumps(result)
         except Exception as e:
             return _err(e)
 
@@ -996,5 +1048,70 @@ def register_reveng_tools(mcp: FastMCP) -> None:
                     if fpath.is_file():
                         zf.write(str(fpath), str(fpath.relative_to(session_root)))
             return _dumps({"ok": True, "path": str(dest_path)})
+        except Exception as e:
+            return _err(e)
+
+    # ── RE-29: web / part-number research lane ─────────────────────────────
+    # RE-ANCHOR — additive insertion point for research-lane tools
+
+    @mcp.tool()
+    def reveng_research_source(
+        session_id: str,
+        query: Optional[str] = None,
+        part_number: Optional[str] = None,
+        url: Optional[str] = None,
+    ) -> str:
+        """Pull web / datasheet data into a session for the no-photo research lane.
+
+        Given a part number, a search query, or a vendor / listing URL (at least one
+        required), fetches the datasheet PDF + spec data + images from the internet,
+        assembles them into the session ``datasheet/`` directory, and returns a bundle
+        with candidate MPNs and dimensions ready to feed the ``reveng_datasheet`` mission.
+
+        Every pulled dimension carries ``provenance`` (``"datasheet"`` / ``"web"`` /
+        ``"vendor"``).  Fit-critical dims still route through ``confirm_dimensions``
+        per ``contracts/reveng.md §0``.
+
+        Args:
+            session_id:   Existing RE session to populate.
+            query:        Free-text search, e.g. ``"SKF 6204-2RS bearing specifications"``.
+            part_number:  Manufacturer part number, e.g. ``"6204-2RS"``.
+            url:          Direct vendor page or PDF URL.
+
+        Returns
+        -------
+        ``{ok, session_id, datasheet_dir, candidate_mpns, candidate_dims, sources,
+          mission_seed}`` on success, where ``mission_seed`` is ready to hand off to
+        ``reveng_datasheet`` mission launch.
+
+        ``{ok: false, reason, hint}`` when offline or tools absent — never a traceback.
+        """
+        try:
+            s = _load_session(session_id)
+            if s is None:
+                return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
+            result = _research_ingest(
+                session_id=session_id,
+                query=query,
+                part_number=part_number,
+                url=url,
+            )
+            if not result.get("ok"):
+                return _dumps(result)
+            # Record provenance in the session manifest
+            from typing import cast as _cast
+            s.setdefault("provenance", []).append({
+                "step": "research_source",
+                "query": query,
+                "part_number": part_number,
+                "url": url,
+                "candidate_mpns": result.get("candidate_mpns", []),
+                "sources_count": len(result.get("sources", [])),
+                "ts": _now_iso(),
+            })
+            # Mark datasheet stage as populated
+            s.setdefault("stages", {})["datasheet"] = "done"
+            _save_session(s)
+            return _dumps({"ok": True, "session_id": session_id, **result})
         except Exception as e:
             return _err(e)

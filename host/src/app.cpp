@@ -2541,8 +2541,10 @@ int run_gui(const char* screenshotPath, const char* openPath) {
 
             // [workspace-tabs seam] Ctrl+1..Ctrl+8 switch the title-bar workspace (matches tab
             // order). The shortcut bar advertises these. Guards: text input owns digits while
-            // typing; ECAD keeps its own accelerator space.
-            if (!textFocus && !ecadFocused && (io.KeyCtrl || io.KeySuper) && !io.KeyShift && !io.KeyAlt) {
+            // typing. Deliberately NOT gated on ecadFocused: the ECAD window is focused for the
+            // whole Electronics stay, and its accelerator space has no Ctrl+digit bindings —
+            // gating here made the workspace keys dead exactly where users need an exit.
+            if (!textFocus && (io.KeyCtrl || io.KeySuper) && !io.KeyShift && !io.KeyAlt) {
                 using WS = AppState::Workspace;
                 static constexpr struct { ImGuiKey key; WS ws; } kWsKeys[] = {
                     {ImGuiKey_1, WS::Model},        {ImGuiKey_2, WS::Drawing},
@@ -2919,15 +2921,25 @@ int run_gui(const char* screenshotPath, const char* openPath) {
 
         if (!wsFullBody) {
             // ---- ECAD editor (Electronics workspace or when an ECAD doc is open) ----
-            // Force focus every frame in the Electronics workspace so the ECAD dock tab
-            // stays in front of the central node (no Viewport competing for the slot).
-            // Reset showPcbTools when leaving Electronics so ECAD doesn't bleed into other
-            // workspaces (it was set unconditionally inside this block each frame).
-            if (ws == WS::Electronics) {
-                st.wantFocusEcad = 2;   // keep non-zero every frame so SetNextWindowFocus fires
-                ImGui::SetNextWindowFocus();
-            } else if (st.wantFocusEcad > 0) {
-                st.showPcbTools = true;   // ensure the ECAD window is visible when focus is requested
+            // Surface the ECAD dock tab ONCE when the Electronics workspace is entered, and hand
+            // the central node back to the Viewport ONCE on the way out. This must stay
+            // edge-triggered: SetNextWindowFocus -> FocusWindow steals ImGui's ActiveId from
+            // widgets in every other window, so the old continuous per-frame grab cancelled any
+            // click outside the ECAD window before its release could land — title-bar workspace
+            // tabs included. That was the "stuck on the Electronics tab" input lockup.
+            static WS ecadPrevWs = WS::Model;
+            if (ws != ecadPrevWs) {
+                if (ws == WS::Electronics) {
+                    st.wantFocusEcad = 2;      // pop the ECAD tab forward for a couple of frames
+                } else if (ecadPrevWs == WS::Electronics) {
+                    st.wantFocusEcad = 0;      // cancel any pending grab from the stay
+                    st.wantFocusViewport = 2;  // bring the 3D view back to the central node
+                }
+                ecadPrevWs = ws;
+            }
+            if (st.wantFocusEcad > 0) {
+                // Surfaced by an explicit ecad command from another workspace: ensure visible.
+                if (ws != WS::Electronics) st.showPcbTools = true;
                 ImGui::SetNextWindowFocus();
                 st.wantFocusEcad--;
             }

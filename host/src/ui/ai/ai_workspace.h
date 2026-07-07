@@ -1,8 +1,13 @@
-// AI workspace: full-viewport body for the AI title-bar tab.
-// Left rail: copilot sessions (+ sub-agents section). Center: expanded Copilot chat (SAME
-// state/send path as the docked column, via the legacy_chat.h reuse hooks) or the project
-// build-plan DAG view (persisted run sidecars + dag_status/dag_approve/dag_abort over st.rpc).
-// Right: workflow + model-assignment settings persisted through saveSettings (config.json).
+// AI workspace: full-viewport body for the AI title-bar tab (v2 layout, tracker M1-M8).
+// Compact, transparency-first shell:
+//   - UPPER main area: the DAG pane, switched by an Agent Workflow | Session Plan tab strip
+//     (Phase 1 renders the existing buildgraph view in both; Phase 2 swaps in the live
+//     agent-execution DAG for Agent Workflow). Left of it: the sessions/sub-agents rail.
+//   - LOWER-LEFT: the conversation window (message log + composer) — ALWAYS visible, no tab
+//     (SAME state/send path as the docked column, via the legacy_chat.h reuse hooks).
+//   - LOWER-RIGHT: AI *workflow* settings only (Supervised/Autopilot, refine passes, max output
+//     tokens, context window). The inference block (model/effort/tokens/API key/privacy/vision)
+//     lives ONLY on the main Settings page now — persisted through saveSettings (config.json).
 #pragma once
 
 struct AppState;

@@ -1,14 +1,23 @@
-// AI workspace — full-page AI hub for the AI title-bar tab (Hunter's spec, 2026-07-06).
-//   [sessions + sub-agents rail] | [expanded Copilot chat  OR  project build-plan DAG] | [AI settings]
+// AI workspace — full-page AI hub for the AI title-bar tab (v2 redesign, tracker M1-M8).
 //
-// The chat column renders the SAME conversation state and send path as the docked Copilot
-// (st.chat / st.conversations / st.prompt) via the legacy_chat.h reuse hooks — single chat
-// implementation, two hosts. The DAG view reads the persisted run sidecars the worker's
-// dag_status method serves (~/.local/share/AI-CAD/runs/*.buildgraph.json — the ONLY run
-// enumeration source; the worker seam has no list-runs method) and steers gate-paused runs
-// via dag_status / dag_approve / dag_abort over st.rpc (async — never blocks the GL thread).
-// Settings persist through the existing saveSettings -> config.json mechanism. No fake data
-// anywhere: every pane degrades to an honest empty-state.
+//   +----------------------------------------------------------------+
+//   | [rail] |  DAG pane   [ Agent Workflow | Session Plan ]  [gear] |   <- upper main
+//   |        |                                                       |
+//   +----------------------------------------------------------------+
+//   | conversation (log + composer)      |  workflow settings        |   <- lower zone
+//   +----------------------------------------------------------------+
+//
+// The conversation window is ALWAYS visible (M6 — no "Conversation" tab); it renders the SAME
+// state and send path as the docked Copilot (st.chat / st.conversations / st.prompt) via the
+// legacy_chat.h reuse hooks — single chat implementation, two hosts. The tab strip switches only
+// the DAG pane (M7): "Session Plan" is the existing buildgraph view (persisted run sidecars the
+// worker's dag_status serves — ~/.local/share/AI-CAD/runs/*.buildgraph.json, the ONLY run
+// enumeration source), steered via dag_status / dag_approve / dag_abort over st.rpc (async).
+// "Agent Workflow" is reserved for the Phase-2 live agent-execution DAG; in Phase 1 it renders
+// the same buildgraph view. The right pane keeps ONLY AI workflow knobs (M3); the inference
+// block (model/effort/tokens/API key/privacy/vision reviewer) was WIPED (M2) and now lives ONLY
+// on the main Settings page (Settings -> AI + Experimental). No fake data anywhere: every pane
+// degrades to an honest empty-state.
 #include "ai_workspace.h"
 
 #include <algorithm>
@@ -48,8 +57,17 @@ struct DagRun {
 };
 
 struct AiWsState {
-    int  centerView   = 0;     // 0 = conversation, 1 = project plan (DAG)
+    // Which DAG the upper pane shows (M7): 0 = Agent Workflow, 1 = Session Plan.
+    // Phase 1 renders the buildgraph view for BOTH; Phase 2 swaps a live agent-execution DAG
+    // into Agent Workflow. The conversation window is always visible below (M6), never a tab.
+    int  dagView      = 1;     // default to Session Plan (the only view with real data today)
     bool showSettings = true;
+
+    // M8 plumbing: the chat session whose plan the "Session Plan" view is scoped to. Set from
+    // the active conversation each frame; the per-session run_id aggregation is Phase-2 backend
+    // data (Conversation has no run_id yet — see AI_WORKSPACE_V2_PLAN.md §2.1), so today the
+    // view still lists every persisted run. Kept here so the scoping wiring is already in place.
+    std::string selSession;
 
     // DAG run catalog (scanned from the persisted runs dir; Refresh re-scans).
     bool                runsScanned = false;
@@ -444,6 +462,12 @@ static void drawDagView(AppState& st) {
     const float S = ui::uiScale;
     if (!s_ai.runsScanned) scanRuns();
 
+    // M8 (per-session scoping): the Session Plan should show only the run(s) belonging to the
+    // active chat session. The selection plumbing is here (s_ai.selSession tracks the active
+    // conversation), but Conversation has no run_id yet (AI_WORKSPACE_V2_PLAN.md §2.1), so there
+    // is no session->run index to filter on. Until Phase 2 adds it, the picker still lists every
+    // persisted run.  TODO(Phase 2): filter s_ai.runs to runs whose session == s_ai.selSession.
+
     // ---- toolbar: run picker + refresh + steer + worker status ----
     ImGui::SetNextItemWidth(300.0f * S);
     const char* preview = "No plans found";
@@ -496,8 +520,8 @@ static void drawDagView(AppState& st) {
         loadRunGraph(s_ai.runs[s_ai.selRun]);
 
     if (s_ai.runs.empty()) {
-        emptyState("[#]", "No active plan",
-                   "Start one from Copilot — mission plans appear here as they run.");
+        emptyState("[#]", "No session plan yet",
+                   "Start a build in the conversation — this session's plan appears here as it runs.");
         return;
     }
     if (!s_ai.loadErr.empty()) {
@@ -601,9 +625,14 @@ static void drawChatCenter(AppState& st, bool busy, bool canRun) {
     s_composerH = ImGui::GetItemRectSize().y + 6.0f * S;
 }
 
-// ---- right: workflow + model-assignment settings ----------------------------------
-
-static void drawSettingsPane(AppState& st, float paneW, bool busy) {
+// ---- right: AI *workflow* settings ONLY (M2 wiped the inference block; M3 keeps these) ------
+// The model / reasoning-effort / max-tokens / context-window / API key / privacy / vision-
+// reviewer controls were REMOVED from this pane (M2). They are reachable ONLY on the main
+// Settings page: Settings -> AI (ui::drawProviderModelPicker, which covers provider, model,
+// reasoning effort, max response tokens, model context window, API key, base URL, vision, and
+// the Privacy/Offline toggle) and Settings -> Experimental (the separate vision reviewer). This
+// pane keeps ONLY the run-behavior knobs — the same config.json fields, no parallel store.
+static void drawSettingsPane(AppState& st, float paneW, bool /*busy*/) {
     const float S = ui::uiScale;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
     ImGui::BeginChild("##ai_ws_settings", ImVec2(paneW, 0), ImGuiChildFlags_None);
@@ -611,41 +640,6 @@ static void drawSettingsPane(AppState& st, float paneW, bool busy) {
 
     bool changed = false;
 
-    sectionHeader("Model assignment");
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-    ImGui::TextWrapped("Copilot (planner + modeler)");
-    ImGui::PopStyleColor();
-    // The SAME provider/model picker as Settings -> AI and the inline Copilot settings
-    // (slim mode) — one implementation, persisted below on change.
-    changed |= drawProviderModelPicker(st, busy, /*slim=*/true);
-
-    ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-    ImGui::TextWrapped("Vision reviewer (experimental)");
-    ImGui::PopStyleColor();
-    changed |= ImGui::Checkbox("Separate vision model##ai_ws_vr",
-                               &st.settings.expVisionReview);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Route the review/fix render judgment to its own "
-                          "OpenAI-compatible vision endpoint.");
-    if (st.settings.expVisionReview) {
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##ai_ws_vr_model", "vision model id",
-                                 st.settings.expVisionModel,
-                                 sizeof(st.settings.expVisionModel));
-        changed |= ImGui::IsItemDeactivatedAfterEdit();
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##ai_ws_vr_url", "vision base URL",
-                                 st.settings.expVisionBaseUrl,
-                                 sizeof(st.settings.expVisionBaseUrl));
-        changed |= ImGui::IsItemDeactivatedAfterEdit();
-    }
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
     sectionHeader("Workflow");
     int pm = st.settings.planMode ? 0 : 1;
     if (ImGui::RadioButton("Supervised — plan + clarify first", &pm, 0)) changed = true;
@@ -671,8 +665,9 @@ static void drawSettingsPane(AppState& st, float paneW, bool busy) {
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(palette.textDisabled[0], palette.textDisabled[1],
                palette.textDisabled[2], 1.0f));
-    ImGui::TextWrapped("Settings persist to config.json and are shared with the docked "
-                       "Copilot and the Settings dialog.");
+    ImGui::TextWrapped("Workflow knobs persist to config.json (shared with the docked Copilot). "
+                       "Model, reasoning effort, tokens, API key, privacy and the vision reviewer "
+                       "live on the main Settings page (Settings \xE2\x86\x92 AI).");
     ImGui::PopStyleColor();
 
     ImGui::EndChild();
@@ -681,6 +676,41 @@ static void drawSettingsPane(AppState& st, float paneW, bool busy) {
 }  // anonymous namespace
 
 // ---- public entry point ------------------------------------------------------------
+
+// The upper DAG pane: tab strip (Agent Workflow | Session Plan) + gear, then the graph canvas.
+static void drawDagPane(AppState& st, bool /*busy*/) {
+    const float S = ui::uiScale;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
+    ImGui::BeginChild("##ai_ws_dag", ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGui::PopStyleVar();
+
+    // Tab strip switches ONLY this pane (M7). Both tabs render the buildgraph view in Phase 1;
+    // the live agent-execution DAG lands under "Agent Workflow" in Phase 2.
+    if (viewChip("Agent Workflow", s_ai.dagView == 0)) s_ai.dagView = 0;
+    ImGui::SameLine();
+    if (viewChip("Session Plan", s_ai.dagView == 1)) s_ai.dagView = 1;
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                         std::max(0.0f, ImGui::GetContentRegionAvail().x - 84.0f * S));
+    if (viewChip(s_ai.showSettings ? "Options \xE2\x96\xB8" : "\xE2\x97\x82 Options",
+                 s_ai.showSettings))
+        s_ai.showSettings = !s_ai.showSettings;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show / hide the AI workflow options pane.");
+    ImGui::Spacing();
+
+    if (!st.workerStarted) {
+        emptyState("[#]", "Worker not running",
+                   "The AI-CAD worker service is required to load and steer plans.");
+    } else if (s_ai.dagView == 0) {
+        // Phase 1: Agent Workflow reuses the buildgraph view. Phase 2 swaps in the live
+        // agent-execution DAG (tool calls / context injections / subagent branches).
+        drawDagView(st);
+    } else {
+        drawDagView(st);
+    }
+    ImGui::EndChild();
+}
 
 void drawAiWorkspace(AppState& st) {
     const float S      = ui::uiScale;
@@ -692,44 +722,55 @@ void drawAiWorkspace(AppState& st) {
     refreshModelAvailability(st, false);
     chatWorkspaceSync(st);
 
-    // Layout: [sessions/sub-agents 235px] | [chat-or-DAG flex] | [settings 300px, collapsible]
+    // M8 plumbing: bind the Session Plan scope to the active chat session's id (see the TODO in
+    // drawDagView — the run filter itself waits on Phase-2 session->run_id data).
+    s_ai.selSession = (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size())
+                          ? st.conversations[st.activeConv].id
+                          : std::string();
+
+    // v2 layout (M1 compact):
+    //   [rail] | +-----------------------------------------------+
+    //           |   DAG pane (upper, M4)   [tabs] [Options]       |
+    //           +-----------------------------------------------+
+    //           |  conversation (M5, lower-left) | workflow (M3) |
+    //           +-----------------------------------------------+
     const float totalW = ImGui::GetContentRegionAvail().x;
-    const float railW  = 235.0f * S;
-    const float setW   = s_ai.showSettings ? 300.0f * S : 0.0f;
-    const float midW   = totalW - railW - setW - 12.0f * S;
+    const float railW  = 210.0f * S;                             // compacted from 235
+    const float bodyW  = totalW - railW - 8.0f * S;
 
     drawSessionsRail(st, railW, busy);
     ImGui::SameLine();
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
-    ImGui::BeginChild("##ai_ws_center", ImVec2(midW, 0), ImGuiChildFlags_None);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::BeginChild("##ai_ws_body", ImVec2(bodyW, 0), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
 
-    // Center header: view switch + settings toggle.
-    if (viewChip("Conversation", s_ai.centerView == 0)) s_ai.centerView = 0;
-    ImGui::SameLine();
-    if (viewChip("Project Plan", s_ai.centerView == 1)) s_ai.centerView = 1;
-    ImGui::SameLine();
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                         std::max(0.0f, ImGui::GetContentRegionAvail().x - 80.0f * S));
-    if (viewChip(s_ai.showSettings ? "Settings >" : "< Settings", s_ai.showSettings))
-        s_ai.showSettings = !s_ai.showSettings;
-    ImGui::Spacing();
+    // Upper region: the DAG pane occupies the top ~52% of the body height (M4).
+    const float bodyH  = ImGui::GetContentRegionAvail().y;
+    const float dagH   = std::max(160.0f * S, bodyH * 0.52f);
 
-    if (!st.workerStarted && s_ai.centerView == 1) {
-        emptyState("[#]", "Worker not running",
-                   "The AI-CAD worker service is required to steer plans.");
-    } else if (s_ai.centerView == 0) {
-        drawChatCenter(st, busy, canRun);
-    } else {
-        drawDagView(st);
-    }
+    ImGui::BeginChild("##ai_ws_upper", ImVec2(0, dagH), ImGuiChildFlags_None);
+    drawDagPane(st, busy);
+    ImGui::EndChild();
+
+    // Lower region: conversation (left, always visible — M5/M6) + workflow settings (right — M3).
+    const float lowerW = ImGui::GetContentRegionAvail().x;
+    const float setW   = s_ai.showSettings ? std::min(280.0f * S, lowerW * 0.34f) : 0.0f;
+    const float convW  = lowerW - setW - (s_ai.showSettings ? 8.0f * S : 0.0f);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
+    ImGui::BeginChild("##ai_ws_conv", ImVec2(convW, 0), ImGuiChildFlags_None);
+    ImGui::PopStyleVar();
+    sectionHeader("Conversation");
+    drawChatCenter(st, busy, canRun);
     ImGui::EndChild();
 
     if (s_ai.showSettings) {
         ImGui::SameLine();
         drawSettingsPane(st, setW, busy);
     }
+
+    ImGui::EndChild();  // ##ai_ws_body
 }
 
 }  // namespace ui

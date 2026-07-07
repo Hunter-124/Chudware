@@ -118,6 +118,7 @@ struct AgNode {
     std::string title;      // primary line (tool name / "thought" / injection source)
     std::string detail;     // secondary line (target / label / verdict / text)
     std::string status;     // "ok" | "failed" | "" (drives the accent color, reuses statusColor)
+    std::string refId;      // M11: subagent_id for Spawn/subagent-root nodes — click opens its chat
     int         latencyMs = -1;
     long long   seq = 0;    // arrival order (advisory ordering fallback per §2.1)
     // tree links (resolved each rebuild)
@@ -244,10 +245,12 @@ void feedAgentDagEvent(const std::string& kind, const nlohmann::json& data) {
         const std::string spawnActor = n.actor;
         const std::string childId = agEnvStr(data, "subagent_id");
         if (!childId.empty()) {
+            s_agdag.nodes[s_agdag.byId[key]].refId = childId;  // M11: click → open its chat
             AgNode& c = agUpsert(childId, key);
             if (c.title.empty()) {
                 c.kind = AgKind::Root; c.actor = spawnActor; c.title = "subagent " + spawnActor;
             }
+            c.refId = childId;
         }
         s_agdag.sawSpawn = true;
     } else if (kind == "agent.advisor") {
@@ -522,6 +525,347 @@ static const float* statusColor(const std::string& s) {
     return palette.textDisabled;  // pending / unknown
 }
 
+// ==================================================================================
+// Phase 4 (M11/M15–M17) — sub-agent chat viewing + LIVE steering.
+//
+// Data source: the file-backed sub-agent session registry served by the worker's
+// subagent_list / subagent_transcript / subagent_steer / subagent_terminate RPCs
+// (services/agent/subagent_rpc.py) — ALL async via st.rpc (never a sync worker.call
+// in a draw path). Steering semantics are queued-and-consumed-at-turn-boundary
+// (agent_turn.run_turn drains the queue before each model call); the UI says so.
+// HONESTY: with no spawned sub-agents the registry is empty and every surface shows
+// its empty-state — nothing is fabricated.
+// ==================================================================================
+
+struct SubMsg {
+    std::string who;    // "user" | "subagent" | "system"
+    std::string text;
+    bool        queued = false;   // a steer mirrored into the transcript, not yet consumed
+};
+
+struct SubagentSession {
+    std::string id, role, brief, status, model, spawnKind;
+    int budgetTokens = 0, pendingSteers = 0, transcriptLen = 0;
+};
+
+struct SubagentViewState {
+    // registry snapshot (sidebar list)
+    std::vector<SubagentSession> sessions;
+    bool   listPending = false;
+    bool   listedOnce  = false;
+    double lastListT   = 0.0;
+    std::string listErr;
+
+    // the open sub-agent chat (replaces the conversation column content, M11)
+    bool            active = false;
+    SubagentSession cur;
+    std::vector<SubMsg> msgs;
+    bool   trPending = false;
+    double lastTrT   = 0.0;
+    std::string viewErr;
+
+    // steering composer
+    char        steerBuf[2048] = {0};
+    bool        steerPending   = false;
+    std::string steerNote;      // the worker's honest injection-semantics note
+
+    bool termPending = false;
+};
+
+static SubagentViewState s_sub;
+
+static SubagentSession parseSubSession(const nlohmann::json& s) {
+    SubagentSession o;
+    o.id            = s.value("id", "");
+    o.role          = s.value("role", "");
+    o.brief         = s.value("brief", "");
+    o.status        = s.value("status", "");
+    o.model         = s.value("model", "");
+    o.spawnKind     = s.value("spawn_kind", "");
+    o.budgetTokens  = s.value("budget_tokens", 0);
+    o.pendingSteers = s.value("pending_steers", 0);
+    o.transcriptLen = s.value("transcript_len", 0);
+    return o;
+}
+
+// Poll the registry snapshot (sidebar list). Cheap file-glob on the worker side;
+// throttled to one in-flight call every few seconds while the workspace is drawn.
+static void pollSubagentList(AppState& st) {
+    if (!st.workerStarted || s_sub.listPending) return;
+    const double now = ImGui::GetTime();
+    if (s_sub.listedOnce && now - s_sub.lastListT < 4.0) return;
+    s_sub.listPending = true;
+    s_sub.lastListT   = now;
+    st.rpc.call("subagent_list", nlohmann::json::object(),
+                [](const core::RpcResult& r) {
+        s_sub.listPending = false;
+        s_sub.listedOnce  = true;
+        if (!r.ok) { s_sub.listErr = r.err.empty() ? "worker unreachable" : r.err; return; }
+        if (!r.result.value("ok", false)) {
+            s_sub.listErr = r.result.value("reason", std::string("subagent_list failed"));
+            return;
+        }
+        s_sub.listErr.clear();
+        s_sub.sessions.clear();
+        if (r.result.contains("sessions") && r.result["sessions"].is_array())
+            for (const auto& s : r.result["sessions"])
+                if (s.is_object()) s_sub.sessions.push_back(parseSubSession(s));
+    });
+}
+
+// Fetch the open sub-agent's transcript (+ refreshed session meta). Throttled.
+static void fetchSubagentTranscript(AppState& st, bool force = false) {
+    if (!st.workerStarted || !s_sub.active || s_sub.trPending) return;
+    const double now = ImGui::GetTime();
+    if (!force && now - s_sub.lastTrT < 2.0) return;
+    s_sub.trPending = true;
+    s_sub.lastTrT   = now;
+    nlohmann::json p;
+    p["subagent_id"] = s_sub.cur.id;
+    const std::string want = s_sub.cur.id;
+    st.rpc.call("subagent_transcript", p, [want](const core::RpcResult& r) {
+        s_sub.trPending = false;
+        if (!s_sub.active || s_sub.cur.id != want) return;  // stale — user left/switched
+        if (!r.ok) { s_sub.viewErr = r.err.empty() ? "worker unreachable" : r.err; return; }
+        if (!r.result.value("ok", false)) {
+            s_sub.viewErr = r.result.value("reason", std::string("transcript unavailable"));
+            return;
+        }
+        s_sub.viewErr.clear();
+        if (r.result.contains("session") && r.result["session"].is_object())
+            s_sub.cur = parseSubSession(r.result["session"]);
+        s_sub.cur.pendingSteers = r.result.contains("pending_steers") &&
+                                  r.result["pending_steers"].is_array()
+                                      ? (int)r.result["pending_steers"].size() : 0;
+        s_sub.msgs.clear();
+        if (r.result.contains("messages") && r.result["messages"].is_array())
+            for (const auto& m : r.result["messages"]) {
+                if (!m.is_object()) continue;
+                SubMsg sm;
+                sm.who    = m.value("who", "");
+                sm.text   = m.value("text", "");
+                sm.queued = m.value("queued", false);
+                s_sub.msgs.push_back(std::move(sm));
+            }
+    });
+}
+
+// M11: open a sub-agent's chat in the main conversation column.
+static void openSubagentView(AppState& st, const std::string& subagentId,
+                             const std::string& roleHint = std::string()) {
+    if (subagentId.empty()) return;
+    s_sub.active = true;
+    if (s_sub.cur.id != subagentId) {
+        s_sub.cur = SubagentSession{};
+        s_sub.cur.id   = subagentId;
+        s_sub.cur.role = roleHint;
+        s_sub.msgs.clear();
+        s_sub.viewErr.clear();
+        s_sub.steerNote.clear();
+        s_sub.steerBuf[0] = '\0';
+    }
+    // Prefer the registry snapshot for instant header data.
+    for (const auto& s : s_sub.sessions)
+        if (s.id == subagentId) { s_sub.cur = s; break; }
+    fetchSubagentTranscript(st, /*force=*/true);
+}
+
+static void sendSubagentSteer(AppState& st) {
+    if (!st.workerStarted || s_sub.steerPending || !s_sub.active) return;
+    std::string text(s_sub.steerBuf);
+    if (text.find_first_not_of(" \t\r\n") == std::string::npos) return;
+    s_sub.steerPending = true;
+    nlohmann::json p;
+    p["subagent_id"] = s_sub.cur.id;
+    p["text"]        = text;
+    const std::string want = s_sub.cur.id;
+    st.rpc.call("subagent_steer", p, [want](const core::RpcResult& r) {
+        s_sub.steerPending = false;
+        if (!s_sub.active || s_sub.cur.id != want) return;
+        if (!r.ok) { s_sub.steerNote = r.err.empty() ? "worker unreachable" : r.err; return; }
+        if (!r.result.value("ok", false)) {
+            s_sub.steerNote = r.result.value("reason", std::string("steer failed"));
+            return;
+        }
+        s_sub.steerNote   = r.result.value("note", std::string("queued"));
+        s_sub.steerBuf[0] = '\0';
+        s_sub.lastTrT     = 0.0;   // refresh the transcript promptly (shows the queued steer)
+    });
+}
+
+static void requestSubagentTerminate(AppState& st) {
+    if (!st.workerStarted || s_sub.termPending || !s_sub.active) return;
+    s_sub.termPending = true;
+    nlohmann::json p;
+    p["subagent_id"] = s_sub.cur.id;
+    p["confirm"]     = true;   // the GUI confirm dialog IS the M16 gate; the RPC re-checks it
+    const std::string want = s_sub.cur.id;
+    st.rpc.call("subagent_terminate", p, [want](const core::RpcResult& r) {
+        s_sub.termPending = false;
+        if (!s_sub.active || s_sub.cur.id != want) return;
+        if (r.ok && r.result.value("ok", false))
+            s_sub.steerNote = r.result.value(
+                "note", std::string("termination requested — honored at the next turn boundary"));
+        else
+            s_sub.steerNote = r.ok ? r.result.value("reason", std::string("terminate failed"))
+                                   : (r.err.empty() ? "worker unreachable" : r.err);
+        s_sub.lastTrT = 0.0;
+    });
+}
+
+// The sub-agent conversation panel — swapped into the main conversation column (M11) with an
+// unmistakable recolor (M15), no easy end (M16), and read-only run parameters (M17).
+static void drawSubagentChat(AppState& st) {
+    const float S = ui::uiScale;
+    const float* wc = palette.statusWarn;   // the "you're in a sub-agent" accent hue (M15)
+
+    fetchSubagentTranscript(st);
+
+    // --- header banner (M15): solid tinted strip naming the mode ------------------
+    {
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImVec2 p1(p0.x + ImGui::GetContentRegionAvail().x,
+                  p0.y + ImGui::GetFrameHeight() * 1.9f);
+        ImGui::GetWindowDrawList()->AddRectFilled(p0, p1,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(wc[0], wc[1], wc[2], 0.22f)), 5.0f * S);
+        ImGui::GetWindowDrawList()->AddRect(p0, p1,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(wc[0], wc[1], wc[2], 0.85f)), 5.0f * S,
+            0, 1.5f * S);
+        ImGui::SetCursorScreenPos(ImVec2(p0.x + 8.0f * S, p0.y + 4.0f * S));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(wc[0], wc[1], wc[2], 1.0f));
+        ImGui::Text("SUB-AGENT  ·  %s",
+                    s_sub.cur.role.empty() ? s_sub.cur.id.c_str() : s_sub.cur.role.c_str());
+        ImGui::PopStyleColor();
+        const float* sc = statusColor(s_sub.cur.status);
+        ImGui::SetCursorScreenPos(ImVec2(p0.x + 8.0f * S,
+                                         p0.y + 4.0f * S + ImGui::GetTextLineHeight()));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(sc[0], sc[1], sc[2], 1.0f));
+        ImGui::TextUnformatted(s_sub.cur.status.empty() ? "status unknown"
+                                                        : s_sub.cur.status.c_str());
+        ImGui::PopStyleColor();
+        // M16: the ONLY exit is the explicit "Back to main chat" affordance — leaving the view
+        // never ends the sub-agent.
+        const char* backLbl = "Back to main chat";
+        float bw = ImGui::CalcTextSize(backLbl).x + 16.0f * S;
+        ImGui::SetCursorScreenPos(ImVec2(p1.x - bw - 6.0f * S,
+                                         p0.y + (p1.y - p0.y - ImGui::GetFrameHeight()) * 0.5f));
+        if (ImGui::SmallButton(backLbl)) { s_sub.active = false; }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Return to the main conversation. The sub-agent keeps running.");
+        ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y + 4.0f * S));
+    }
+
+    // --- read-only run parameters (M17) --------------------------------------------
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+    ImGui::Text("Model: %s", s_sub.cur.model.empty()
+                                 ? "inherited from parent mission (read-only)"
+                                 : (s_sub.cur.model + "  (read-only)").c_str());
+    ImGui::Text("Effort / budget: %s%s",
+                s_sub.cur.budgetTokens > 0
+                    ? (std::to_string(s_sub.cur.budgetTokens) + " tokens").c_str()
+                    : "inherited",
+                "  (read-only)");
+    if (!s_sub.cur.brief.empty()) {
+        ImGui::TextUnformatted("Starting prompt (read-only):");
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                   palette.textDisabled[2], 1.0f));
+        ImGui::TextWrapped("%s", s_sub.cur.brief.c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+
+    // --- transcript ------------------------------------------------------------------
+    const float composerH = ImGui::GetFrameHeightWithSpacing() * 4.6f;
+    float logH = ImGui::GetContentRegionAvail().y - composerH;
+    if (logH < 90.0f * S) logH = 90.0f * S;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(wc[0], wc[1], wc[2], 0.05f));
+    ImGui::BeginChild("##subagent_log", ImVec2(0, logH), ImGuiChildFlags_None);
+    if (!s_sub.viewErr.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 1.0f));
+        ImGui::TextWrapped("%s", s_sub.viewErr.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (s_sub.msgs.empty() && s_sub.viewErr.empty()) {
+        emptyState("[sa]", s_sub.trPending ? "Loading transcript…" : "No transcript yet",
+                   "This sub-agent has not produced any messages yet. Its replies and your "
+                   "steering messages appear here.");
+    }
+    for (const auto& m : s_sub.msgs) {
+        const float* c = palette.text;
+        const char*  tag = "";
+        if (m.who == "user")        { c = palette.accent;       tag = "you"; }
+        else if (m.who == "system") { c = palette.textDisabled; tag = "sys"; }
+        else                        { c = palette.text;         tag = "agent"; }
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], m.who == "system" ? 0.9f : 1.0f));
+        ImGui::TextWrapped("[%s]%s %s", tag, m.queued ? " (queued)" : "", m.text.c_str());
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
+    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12) ImGui::SetScrollHereY(1.0f);
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+    // --- steering composer (M11: injections via subagent_steer) ----------------------
+    ImGui::Spacing();
+    ImGui::InputTextMultiline("##subagent_steer", s_sub.steerBuf, sizeof(s_sub.steerBuf),
+                              ImVec2(-1.0f, ImGui::GetFrameHeight() * 1.9f));
+    const bool canSteer = st.workerStarted && !s_sub.steerPending &&
+                          s_sub.steerBuf[0] != '\0';
+    ImGui::BeginDisabled(!canSteer);
+    if (ImGui::SmallButton(s_sub.steerPending ? "Queuing…" : "Steer")) sendSubagentSteer(st);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Inject a steering message. It is queued and read by the sub-agent "
+                          "at its next turn boundary (before its next model call).");
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+               palette.textDisabled[2], 1.0f));
+    if (s_sub.cur.pendingSteers > 0)
+        ImGui::Text("%d steer%s pending", s_sub.cur.pendingSteers,
+                    s_sub.cur.pendingSteers == 1 ? "" : "s");
+    else
+        ImGui::TextUnformatted("applied at the sub-agent's next turn boundary");
+    ImGui::PopStyleColor();
+    // M16: no close/end button anywhere in this view; terminate is deliberately small, off to the
+    // side, and gated behind an explicit confirm dialog.
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                         std::max(0.0f, ImGui::GetContentRegionAvail().x - 88.0f * S));
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+               palette.textDisabled[2], 1.0f));
+    if (ImGui::SmallButton("Terminate…")) ImGui::OpenPopup("##subagent_term_confirm");
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Stop this sub-agent (requires confirmation). It halts cleanly at "
+                          "its next turn boundary — never mid-action.");
+    if (ImGui::BeginPopupModal("##subagent_term_confirm", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Terminate this sub-agent?");
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+        ImGui::TextWrapped("The sub-agent stops cleanly at its next turn boundary. Work it has "
+                           "already handed off is kept.");
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+        if (ImGui::Button("Terminate")) { requestSubagentTerminate(st); ImGui::CloseCurrentPopup(); }
+        ImGui::SameLine();
+        if (ImGui::Button("Keep running")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    if (!s_sub.steerNote.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+        ImGui::TextWrapped("%s", s_sub.steerNote.c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
 // ---- Agent Workflow DAG (Phase 2, M9/M10) ---------------------------------------
 // A collapsible, scalable execution tree built from the live event store (s_agdag). Reuses the
 // pan/zoom/clip/Bézier scaffolding grammar of drawDagCanvas but with its OWN layout so M10 can
@@ -738,7 +1082,23 @@ static void drawAgentDagCanvas(AppState& st) {
             ImGui::TextDisabled("%s%s%s%s", agKindTag(n.kind),
                 n.actor.empty() ? "" : " · ", n.actor.c_str(),
                 n.latencyMs >= 0 ? (" · " + std::to_string(n.latencyMs) + " ms").c_str() : "");
+            if (!n.refId.empty())
+                ImGui::TextDisabled("click to open this sub-agent's chat");
             ImGui::EndTooltip();
+            // M11: tapping a sub-agent node (spawn OR its execution root, including a live one)
+            // opens/steers its chat in the main conversation column. Same tap-vs-pan release
+            // discipline as the collapse toggle (the nav InvisibleButton owns the press).
+            if (!n.refId.empty() && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                ImVec2 dd = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left, 0.0f);
+                bool overToggle = false;
+                if (hasKids && z > 0.5f) {
+                    ImVec2 tg0(p1.x - 20.0f * S * z, p0.y + (nodeH - 16.0f * S * z) * 0.5f);
+                    ImVec2 tg1(tg0.x + 16.0f * S * z, tg0.y + 16.0f * S * z);
+                    overToggle = ImGui::IsMouseHoveringRect(tg0, tg1);
+                }
+                if (!overToggle && dd.x * dd.x + dd.y * dd.y < (4.0f * S) * (4.0f * S))
+                    openSubagentView(st, n.refId, n.actor);
+            }
         }
     }
 
@@ -1003,9 +1363,44 @@ static void drawSessionsRail(AppState& st, float railW, bool busy) {
     ImGui::Separator();
     ImGui::Spacing();
     sectionHeader("Sub-agents");
-    // Honest data only: nodes of the selected plan that carry an assignee. The worker seam
-    // exposes no fleet/agent listing yet — until it does, an unassigned plan shows none.
+    // Live registry sessions first (subagent_list, async — Phase 4 M11): every spawned
+    // sub-agent, clickable to open/steer its chat in the conversation column. Honest: the
+    // registry is empty until a mission actually delegates — no fabricated rows.
+    pollSubagentList(st);
     int shown = 0;
+    for (const auto& s : s_sub.sessions) {
+        ImGui::PushID(s.id.c_str());
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImVec2 p1(p0.x + ImGui::GetContentRegionAvail().x,
+                  p0.y + ImGui::GetFrameHeight() * 1.6f);
+        const bool open = s_sub.active && s_sub.cur.id == s.id;
+        ui::glassRowBackground(ImGui::GetWindowDrawList(), p0, p1, 4.0f,
+                               ImGui::IsMouseHoveringRect(p0, p1), open, 0.24f);
+        if (ImGui::InvisibleButton("##subrow", ImVec2(p1.x - p0.x, p1.y - p0.y)))
+            openSubagentView(st, s.id, s.role);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Open this sub-agent's chat (view + steer).");
+        ImGui::SetCursorScreenPos(ImVec2(p0.x + 4.0f * S, p0.y + 2.0f * S));
+        ImGui::BeginGroup();
+        const float* sc = statusColor(s.status);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(sc[0], sc[1], sc[2], 1.0f));
+        ImGui::TextUnformatted(s.status == "running" ? "[>]" : "[ ]");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::TextUnformatted(s.role.empty() ? s.id.c_str() : s.role.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+        ImGui::TextUnformatted(("  " + (s.brief.empty() ? s.status : s.brief).substr(0, 46))
+                                   .c_str());
+        ImGui::PopStyleColor();
+        ImGui::EndGroup();
+        ImGui::SetCursorScreenPos(ImVec2(p0.x, p1.y));
+        ImGui::Spacing();
+        ImGui::PopID();
+        ++shown;
+    }
+    // Plan-assignee rows (the selected Session Plan's assigned nodes) — a different, older
+    // surface kept beneath the live registry list.
     for (const auto& n : s_ai.nodes) {
         if (n.assigned.empty()) continue;
         ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -1043,6 +1438,14 @@ static void drawSessionsRail(AppState& st, float railW, bool busy) {
 
 static void drawChatCenter(AppState& st, bool busy, bool canRun) {
     const float S = ui::uiScale;
+
+    // Phase 4 (M11): while a sub-agent chat is open it REPLACES the main conversation in this
+    // column — recolored (M15), no easy end (M16), read-only run parameters (M17). The main
+    // chat state is untouched; "Back to main chat" restores it instantly.
+    if (s_sub.active) {
+        drawSubagentChat(st);
+        return;
+    }
 
     // Reserve the composer height measured last frame so the log fills the rest
     // (same one-frame-lag trick as the docked Copilot).
@@ -1214,11 +1617,28 @@ void drawAiWorkspace(AppState& st) {
     // starves (min) or sprawls on wide monitors (max). Full height: log + composer inside.
     const float chatW = std::max(300.0f * S, std::min(bodyW * 0.30f, 440.0f * S));
 
+    // M15: while viewing a sub-agent, the WHOLE conversation column recolors (tinted background
+    // + warm border) so there is no mistaking which chat you are in.
+    const bool subView = s_sub.active;
+    if (subView)
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+            ImVec4(palette.statusWarn[0], palette.statusWarn[1], palette.statusWarn[2], 0.07f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 8 * S));
     ImGui::BeginChild("##ai_ws_conv", ImVec2(chatW, 0), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
     drawChatCenter(st, busy, canRun);   // log + composer (mode tabs + prompt); no stray header
     ImGui::EndChild();
+    if (subView) {
+        ImGui::PopStyleColor();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 c0 = ImGui::GetItemRectMin();
+        ImVec2 c1 = ImGui::GetItemRectMax();
+        dl->AddRect(c0, c1,
+            ImGui::ColorConvertFloat4ToU32(
+                ImVec4(palette.statusWarn[0], palette.statusWarn[1],
+                       palette.statusWarn[2], 0.75f)),
+            4.0f * S, 0, 2.0f * S);
+    }
 
     ImGui::SameLine(0.0f, gap);
 

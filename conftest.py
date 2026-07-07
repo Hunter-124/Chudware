@@ -84,3 +84,26 @@ except ImportError:
 
 # cv2 — engine.vision.fiducial already guards its own import (HAVE_CV2), so no stub is
 # needed; tests that need real cv2 use pytest.importorskip("cv2").
+
+
+# ---------------------------------------------------------------------------
+# Sub-agent registry isolation (Phase 4, M11): services/agent/subagent_registry.py
+# is file-backed under ~/.local/share/AI-CAD/cache/subagents by default, and
+# DelegationTree.request_delegation registers a session on EVERY spawn — so any
+# delegation-exercising test would pollute the real user registry (and the GUI's
+# Sub-agents list) unless redirected. Session-scoped autouse: every test run gets
+# a throwaway registry dir. An explicitly pre-set AICAD_SUBAGENTS_DIR is honored.
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True, scope="session")
+def _isolated_subagent_registry(tmp_path_factory):
+    if os.environ.get("AICAD_SUBAGENTS_DIR"):
+        yield
+        return
+    d = tmp_path_factory.mktemp("subagents")
+    os.environ["AICAD_SUBAGENTS_DIR"] = str(d)
+    try:
+        yield
+    finally:
+        os.environ.pop("AICAD_SUBAGENTS_DIR", None)

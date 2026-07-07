@@ -143,7 +143,7 @@ add_executable(AI-CAD
   src/ui/widgets/ribbon.cpp
   src/ui/ribbon_def.cpp
   # --- end C14 ---
-  extern/glad/src/gl.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/src/gl.c
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -162,7 +162,7 @@ target_include_directories(AI-CAD PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker
   ${stb_SOURCE_DIR}
-  ${CMAKE_CURRENT_SOURCE_DIR}/extern/glad/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/include
   ${imgui_SOURCE_DIR}
   ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(AI-CAD PRIVATE glfw nlohmann_json::nlohmann_json)
@@ -187,7 +187,7 @@ add_executable(test_aicm
   src/render/aicm_loader.cpp
   src/render/test_aicm_cpp/test_aicm.cpp)
 target_include_directories(test_aicm PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/extern/glad/include)
+  ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/include)
 set_target_properties(test_aicm PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 # --- end C15 ---
@@ -195,6 +195,6 @@ set_target_properties(test_aicm PROPERTIES
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET AI-CAD POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
-          "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../assets"
           "$<TARGET_FILE_DIR:AI-CAD>/assets"
   COMMENT "Copying assets next to AI-CAD.exe")

@@ -159,7 +159,7 @@ static void loadCategories(AppState& st) {
     st.rpc.call("parts_list_categories", {}, [](const core::RpcResult& r) {
         s_parts.categoriesLoading = false;
         s_parts.categoriesLoaded  = true;
-        if (!r.ok) return;
+        if (!r.ok || !r.result.is_array()) return;
         s_parts.categories.clear();
         for (auto& c : r.result) {
             Category cat;
@@ -184,7 +184,7 @@ static void loadVendors(AppState& st) {
     st.rpc.call("vendor_status", {}, [](const core::RpcResult& r) {
         s_parts.vendorsLoading = false;
         s_parts.vendorsLoaded  = true;
-        if (!r.ok) return;
+        if (!r.ok || !r.result.is_object()) return;
         for (auto& v : s_parts.vendors) {
             v.checking = false;
             if (r.result.contains(v.id))
@@ -208,6 +208,7 @@ static void doSearch(AppState& st, const std::string& query,
         s_parts.searching  = false;
         s_parts.searchDone = true;
         if (!r.ok) { s_parts.searchErr = r.err; return; }
+        if (!r.result.is_array()) return;
         s_parts.results.clear();
         for (auto& it : r.result) {
             PartsItem item;

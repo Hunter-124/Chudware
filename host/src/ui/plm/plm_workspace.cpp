@@ -176,6 +176,7 @@ static void loadStatus(AppState& st) {
         s_plm.statusLoading = false;
         s_plm.statusLoaded  = true;
         if (!r.ok) { s_plm.statusErr = r.err; return; }
+        if (!r.result.is_object()) return;
         auto& v          = s_plm.vaultStatus;
         v.initialised    = r.result.value("initialised",      false);
         v.hasActiveDoc   = r.result.value("has_active_doc",   false);
@@ -194,6 +195,7 @@ static void loadCheckpoints(AppState& st) {
         s_plm.checkpointsLoading = false;
         s_plm.checkpointsLoaded  = true;
         if (!r.ok) { s_plm.checkpointsErr = r.err; return; }
+        if (!r.result.is_array()) return;
         s_plm.checkpoints.clear();
         for (auto& c : r.result) {
             PlmCheckpoint cp;
@@ -215,6 +217,7 @@ static void loadItems(AppState& st) {
         s_plm.itemsLoading = false;
         s_plm.itemsLoaded  = true;
         if (!r.ok) { s_plm.itemsErr = r.err; return; }
+        if (!r.result.is_array()) return;
         s_plm.items.clear();
         for (auto& it : r.result) {
             PlmItem item;

@@ -159,6 +159,11 @@ Split/dropdown ribbon buttons whose label changes with the selected variant don'
 | N4 | Features ribbon: after switching Revolve/Sweep/Loft to a Cut mode you **can't switch back** (stuck one-way toggle) | ⬜ | — |
 | N5 | Audit ALL split/variant ribbon buttons for the same width-not-recomputed bug; apply the widest-label sizing rule everywhere | ⬜ | — |
 
+## O. AI functional / backend bugs (2026-07-07)
+| # | Item | Status | Commit |
+|---|------|--------|--------|
+| O1 | **Model picker is decorative** — GUI provider+model selection (composer dropdown, `s.provider` ~legacy_chat.cpp:1822) is NOT threaded into the agent-turn RPC payloads `agent_ask_v2` (~L2696) / `agent_clarify_v1` (~L2748) (nor equivalents in ai_workspace.cpp). Backend `services/agent/config.py get_provider()` is called with no override → falls back to config.json/env default, silently ignoring the user's pick. **Fix:** thread provider/model through those RPC payloads + any sibling agent-turn calls; Python RPC handlers accept the override and pass `get_provider(name=...)`. Trace GUI state → payload → handler → get_provider end-to-end; add/update Python test if coverage exists. **QUEUED — fire after Wave 1 (Phase 0 + Phase 1) lands; collides with both agents' files (ai_workspace.cpp, services/agent).** | ⬜ (queued) | — |
+
 ---
 
 ## Open / next-up queue (orchestrator dispatches on Hunter's go)

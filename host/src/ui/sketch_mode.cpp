@@ -1234,7 +1234,9 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
     }
     // Resync the mirror revision (sketch_exit bumps it server-side).
     resyncMirror(st);
-    if (!keep && isNewEmpty_ && ents_.empty()) {
+    // A NEW sketch that was never given any content is noise — delete it on exit either way
+    // (plain Finish and discard both apply; matches the 3D sketcher's behavior).
+    if (isNewEmpty_ && ents_.empty()) {
         nlohmann::json ops = nlohmann::json::array({
             {{"op", "delete_feature"}, {"id", fid_}, {"cascade", true}}});
         st.docMirror.applyOps(st.worker, ops);
@@ -1293,6 +1295,15 @@ void SketchMode::cancelSketch(AppState& st) {
         if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
     }
     resyncMirror(st);
+    // The checkpoint was taken right after a NEW sketch's (empty) feature was created, so the
+    // revert above leaves that empty feature sitting in the tree — delete it too (matches the
+    // plain-exit path's empty-new-sketch cleanup).
+    if (isNewEmpty_) {
+        nlohmann::json ops = nlohmann::json::array({
+            {{"op", "delete_feature"}, {"id", fid_}, {"cascade", true}}});
+        auto dr = st.docMirror.applyOps(st.worker, ops);
+        if (dr.ok && !dr.aicm_path.empty()) { std::string le; st.loadDocMesh(dr.aicm_path, le); }
+    }
     st.addLog("[sketch] cancelled " + fid_ + " (reverted to entry checkpoint)");
     st.toast(ui::ToastLevel::Info, "Sketch cancelled");
     // Teardown (mirror of exitSketch, minus the sketch_exit call — revert already rebuilt).

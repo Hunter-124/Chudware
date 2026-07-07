@@ -370,6 +370,10 @@ static std::string s_activeCmd;
 // Same group label ("Sketch") so it occupies the Exit-Sketch slot.
 static bool s_sketchActive = false;
 
+// True while a 3D (free-space) sketch is being edited — see ribbon.h. Swaps the Sketch tab's
+// command source to the "Sketch3D" pseudo-tab rows in ribbon_def.cpp instead of the 2D tools.
+static bool s_sketch3dActive = false;
+
 // s_workspace declared near top of file (before ribbon_tabVisible).
 // Per-workspace ribbon filter. Mirrors AppState::Workspace (Model=0..AI=7). Default: Model.
 // Workspace-shell sets this each frame via setRibbonWorkspace(); see ribbon.h.
@@ -1358,6 +1362,10 @@ void setRibbonSketchActive(bool active) {
     s_sketchActive = active;
 }
 
+void setRibbonSketch3DActive(bool active) {
+    s_sketch3dActive = active;
+}
+
 void setRibbonWorkspace(int workspace) {
     s_workspace = workspace;
 }
@@ -1521,9 +1529,14 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         return false;
     };
 
+    // A 3D sketch being edited swaps the WHOLE Sketch-tab command source to the "Sketch3D"
+    // pseudo-tab (ribbon_def.cpp) instead of the normal 2D tool rows (Hunter red-pen item 1).
+    const bool onSketchTab   = std::strcmp(actTabName, "Sketch") == 0;
+    const char* srcTabName   = (onSketchTab && s_sketch3dActive) ? "Sketch3D" : actTabName;
+
     for (int i = 0; i < cmdCount; ++i) {
         const RibbonCmd& c = cmds[i];
-        if (std::strcmp(c.tab, actTabName) != 0) continue;
+        if (std::strcmp(c.tab, srcTabName) != 0) continue;
         // Sketch tab, no sketch being edited: present "New Sketch" in the "Exit Sketch" slot so the
         // user can start a sketch from this tab (matches the Features-tab entry point). Once a sketch
         // is open, s_sketchActive is true and the real "Exit Sketch" button shows.
@@ -1534,6 +1547,11 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
             // "New Sketch" entry point so a sketch can be started straight from the Sketch tab.
             if (s_sketchActive) continue;
             cp = &kSketchNewOnSketchTab;
+        }
+        // Same commit-cluster treatment for the 3D sketcher's "Exit Sketch" slot — Finish/Cancel
+        // render as the right-aligned chip pair instead (below), never as an inline button.
+        if (std::strcmp(c.cmd_id, "sketch3d_exit") == 0) {
+            if (s_sketch3dActive) continue;
         }
         RibbonGroup& grp = ribbon_findOrAddGroup(groups, cp->group);
         if (cp->sub_of)  grp.subCmds.push_back(cp);
@@ -1547,7 +1565,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     // Sketch-commit cluster: while a sketch is being edited AND the Sketch tab is showing, a
     // Finish (✓) / Cancel (✗) pair floats at the RIGHT end of the tool row (replacing the old
     // floating in-viewport corner). Reserve its width up front so the tool groups never run under it.
-    const bool  sketchCommit   = s_sketchActive && std::strcmp(actTabName, "Sketch") == 0;
+    const bool  sketchCommit   = (s_sketchActive || s_sketch3dActive) && onSketchTab;
     const float commitChipW    = 40.0f * s;
     const float commitClusterW = sketchCommit ? (commitChipW * 2.0f + 6.0f * s + 12.0f * s) : 0.0f;
     float chevronW  = 22.0f * s;  // reserved for overflow '»' button
@@ -1849,8 +1867,10 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
             if (hov) ImGui::SetTooltip("%s", tip);
             if (clicked) ribbon_fire(cmd);
         };
-        commitChip("##sk_finish", xFinish, ui::palette.statusOk,  true,  "sketch_exit",   "Finish Sketch");
-        commitChip("##sk_cancel", xCancel, ui::palette.statusErr, false, "sketch_cancel", "Cancel Sketch");
+        const char* finishCmd = s_sketch3dActive ? "sketch3d_exit"   : "sketch_exit";
+        const char* cancelCmd = s_sketch3dActive ? "sketch3d_cancel" : "sketch_cancel";
+        commitChip("##sk_finish", xFinish, ui::palette.statusOk,  true,  finishCmd, "Finish Sketch");
+        commitChip("##sk_cancel", xCancel, ui::palette.statusErr, false, cancelCmd, "Cancel Sketch (discard changes)");
     }
 
     ImGui::EndChild();

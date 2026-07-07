@@ -23,6 +23,13 @@ void setRibbonActiveCmd(const char* cmd_id);
 // (SolidWorks shows the same entry point). Set once per frame before drawRibbon.
 void setRibbonSketchActive(bool active);
 
+// True while a 3D (free-space) sketch is being EDITED. When true, the Sketch tab's command
+// source swaps from the 2D tool set to the 3D sketch tool set (Line/3-Pt Arc/Spline/Point,
+// working-plane presets, Construction/Relations/Fix/Delete) and the same commit cluster
+// (Finish/Cancel) shown for 2D sketches fires sketch3d_exit/sketch3d_cancel instead. Mutually
+// exclusive with setRibbonSketchActive in practice (only one sketch mode is active at a time).
+void setRibbonSketch3DActive(bool active);
+
 // Per-workspace ribbon filter. Must be called once per frame before drawRibbon. The value is
 // the integer cast of AppState::Workspace (order: Model=0, Drawing=1, Simulate=2, Electronics=3,
 // Manufacture=4, PLM=5, PartsLibrary=6, AI=7). Default is 0 (Model = show all 3D tabs).

@@ -153,11 +153,13 @@ Hunter's red-pen on the shipped AI hub: make it compact, transparency-first, DAG
 Split/dropdown ribbon buttons whose label changes with the selected variant don't recompute width for the new label → text clips (too narrow) or bleeds into the neighbor (too wide), making menu scaling look broken. Fix: size each variant button to fit its **widest** variant label (stable width, never clips/bleeds, no neighbor reflow). **Fix EVERY instance.**
 | # | Item | Status | Commit |
 |---|------|--------|--------|
-| N1 | 3-Pt Arc button too narrow — text doesn't fit; widen to fit | ⬜ | — |
-| N2 | Rectangle split button: shrinks too small on "Ctr. Rect"; grows too big on "Parallelogram" and bleeds into the Circle button | ⬜ | — |
-| N3 | Features ribbon Revolve/Sweep/Loft → Cut mode: text gets cut off inside the button in cut mode | ⬜ | — |
-| N4 | Features ribbon: after switching Revolve/Sweep/Loft to a Cut mode you **can't switch back** (stuck one-way toggle) | ⬜ | — |
-| N5 | Audit ALL split/variant ribbon buttons for the same width-not-recomputed bug; apply the widest-label sizing rule everywhere | ⬜ | — |
+| N1 | 3-Pt Arc button too narrow — text doesn't fit; widen to fit | ✅ | 7bd5bdd6 |
+| N2 | Rectangle split button: shrinks too small on "Ctr. Rect"; grows too big on "Parallelogram" and bleeds into the Circle button | ✅ | 7bd5bdd6 |
+| N3 | Features ribbon Revolve/Sweep/Loft → Cut mode: text gets cut off inside the button in cut mode | ✅ | 7bd5bdd6 |
+| N4 | Features ribbon: after switching Revolve/Sweep/Loft to a Cut mode you **can't switch back** (stuck one-way toggle) | ✅ | 7bd5bdd6 |
+| N5 | Audit ALL split/variant ribbon buttons for the same width-not-recomputed bug; apply the widest-label sizing rule everywhere | ✅ | 7bd5bdd6 |
+
+**Fix (all N1–N5, ribbon.cpp):** split/variant big buttons now size to their **widest-variant width** (`ribbon_bigBtnWMax` / `ribbon_bigBtnAsSmallWMax` = max over parent + injected default + every `sub_of` variant label), threaded identically through measure (`ribbon_groupNaturalW`), advance, and draw (new `wOverride` param on `ribbon_bigBtn`/`ribbon_bigBtnAsSmall`) so the face label can change without reflow/clip/bleed. `kBigBtnMaxW` raised 96→120 so no-space labels like "Parallelogram" fit. **N4:** `ribbon_flyoutPopup` now injects the functional parent (`stretch==false`, not a `kParentDefaults` host) as the first flyout row, so selecting it sets `s_LastUsed[parent]=parent` and `resolveFace` falls back to the parent face — the variant toggle cycles both ways for every split button.
 
 ## O. AI functional / backend bugs (2026-07-07)
 | # | Item | Status | Commit |

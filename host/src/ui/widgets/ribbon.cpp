@@ -190,7 +190,9 @@ static constexpr float kTabH        = 28.0f;
 static constexpr float kBigIconSz   = 36.0f;
 static constexpr float kSmIconSz    = 20.0f;
 static constexpr float kBigBtnW     = 52.0f;
-static constexpr float kBigBtnMaxW  = 96.0f;
+// N1-N5 (Hunter, 2026-07-07): raised from 96 so long variant labels that can't wrap
+// (no space — e.g. "Parallelogram") fit inside a split button's face without clipping.
+static constexpr float kBigBtnMaxW  = 120.0f;
 static constexpr float kBigLblPad   = 6.0f;
 static constexpr float kGroupPadX   = 7.0f;   // audit: was 9 — trimmed dead space between groups
 static constexpr float kBodyH       = 100.0f;
@@ -393,6 +395,43 @@ static bool ribbon_hasSubs(const RibbonGroup& grp, const ui::RibbonCmd* cmd) {
     return false;
 }
 
+// N1-N5 (Hunter, 2026-07-07): a split/variant big button's FACE label changes with the selected
+// variant (resolveFace swaps in the sub's label). Sizing to the CURRENT face label made the button
+// reflow every switch — too narrow for long variants (clipping: N1 "3-Pt Arc", N3 cut variants) and
+// bleeding into the neighbor when a wide variant like "Parallelogram" drew past the parent-label
+// advance (N2). The fix: every split button gets a STABLE width = the widest of {parent label, every
+// variant label, injected parent-default label}. Measure and draw both use this so the button never
+// reflows and never clips, regardless of the active variant. Plain (non-drop) buttons return their
+// own width unchanged.
+static float ribbon_bigBtnWMax(const RibbonGroup& grp, const ui::RibbonCmd* cmd, bool drop) {
+    float w = ribbon_bigBtnW(cmd->cmd_id, cmd->label, drop);
+    if (!drop) return w;
+    // Injected parent-default flyout row (e.g. sk_ellipse_big -> "Ellipse") is also a possible face.
+    if (const ParentDefault* pd = ribbon_parentDefault(cmd->cmd_id))
+        w = ImMax(w, ribbon_bigBtnW(pd->defaultCmd, pd->defaultLabel, drop));
+    for (const auto* sc : grp.subCmds)
+        if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0)
+            w = ImMax(w, ribbon_bigBtnW(sc->cmd_id, sc->label, drop));
+    return w;
+}
+
+// N1-N5: the same widest-variant rule for the degraded "big-as-small" row (icon + side label).
+// Mirrors ribbon_bigBtnAsSmall's width (ribbon_smBtnW + optional drop-arrow slot) but over the
+// widest of {parent, injected default, every variant} label so the packed column reserves enough.
+static float ribbon_bigBtnAsSmallWMax(const RibbonGroup& grp, const ui::RibbonCmd* cmd, bool drop) {
+    float s = ui::uiScale;
+    float w = ribbon_smBtnW(cmd->label);
+    if (drop) {
+        if (const ParentDefault* pd = ribbon_parentDefault(cmd->cmd_id))
+            w = ImMax(w, ribbon_smBtnW(pd->defaultLabel));
+        for (const auto* sc : grp.subCmds)
+            if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0)
+                w = ImMax(w, ribbon_smBtnW(sc->label));
+        w += kDropArrowW * s;
+    }
+    return w;
+}
+
 // C25c FIX (defect 1): measured width of the small-button zone for a group, packing rows into
 // independently-measured columns (each column's width = its widest row, not the group-wide max).
 // `extraSmallRows` are big-cmd labels that degrade to small rows (COL_SMALL/COL_LABEL).
@@ -401,9 +440,10 @@ static float ribbon_smZoneW(const RibbonGroup& grp,
     std::vector<float> widths;
     widths.reserve(grp.smCmds.size() + extraSmallRows.size());
     for (const auto* cmd : extraSmallRows) {
-        float w = ribbon_smBtnW(cmd->label);
-        if (ribbon_hasSubs(grp, cmd)) w += kDropArrowW * ui::uiScale;
-        widths.push_back(w);
+        // N1-N5: degraded big rows reserve the widest-variant width so a variant switch never
+        // overflows the packed column.
+        bool drop = ribbon_hasSubs(grp, cmd);
+        widths.push_back(ribbon_bigBtnAsSmallWMax(grp, cmd, drop));
     }
     for (const auto* cmd : grp.smCmds)
         widths.push_back(ribbon_smBtnW(cmd->label));
@@ -430,7 +470,7 @@ static float ribbon_groupNaturalW(const RibbonGroup& grp, CollapseLevel level) {
         float bigColW = 0.0f;
         for (const auto* cmd : grp.bigCmds) {
             bool drop = ribbon_hasSubs(grp, cmd);
-            bigColW += ribbon_bigBtnW(cmd->cmd_id, cmd->label, drop) + 2.0f * s;
+            bigColW += ribbon_bigBtnWMax(grp, cmd, drop) + 2.0f * s;  // N1-N5: widest variant
         }
         float smW = ribbon_smZoneW(grp, {});
         content = kGroupPadX * s + bigColW
@@ -790,10 +830,13 @@ static void ribbon_btnActive(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float roundin
 }
 
 // Draw a SW big button. Returns true if main area clicked.
+// wOverride < 0 => size from the passed (face) label as before; >= 0 => draw at this stable width
+// (the widest-variant width, so a split button never reflows/clips when the face label changes).
 static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
-                           const char* label, bool enabled, bool hasDrop) {
+                           const char* label, bool enabled, bool hasDrop,
+                           float wOverride = -1.0f) {
     float s   = ui::uiScale;
-    float bw  = ribbon_bigBtnW(cmd_id, label, hasDrop);
+    float bw  = wOverride >= 0.0f ? wOverride : ribbon_bigBtnW(cmd_id, label, hasDrop);
     float bh  = (kBodyH - kCaptionH) * s;
     float rnd = ui::metrics::ribbonBtnRound();
 
@@ -953,13 +996,16 @@ static float ribbon_bigBtnAsSmallRowH() {
 
 // Draw a big button degraded to small-row layout (icon + side label, one row height).
 static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
-                                  const char* label, bool enabled, bool hasDrop) {
+                                  const char* label, bool enabled, bool hasDrop,
+                                  float wOverride = -1.0f) {
     float s      = ui::uiScale;
     float rowH   = ribbon_bigBtnAsSmallRowH();  // fit ~3 per body zone, floored at kSmRowH
     float iconSz = snap(kSmIconSz * s);
     // §2.2 (same fix as ribbon_smBtn): drive the drawn/hit width from the SAME helper the column
     // packer measures with, so measure and draw never disagree.
-    float totalW = ribbon_smBtnW(label) + (hasDrop ? kDropArrowW * s : 0.0f);
+    // N1-N5: wOverride (widest-variant width) keeps the row stable when the face label changes.
+    float totalW = wOverride >= 0.0f ? wOverride
+                                     : ribbon_smBtnW(label) + (hasDrop ? kDropArrowW * s : 0.0f);
 
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImGui::PushID(cmd_id);
@@ -1099,6 +1145,24 @@ static const char* ribbon_flyoutPopup(const char* parentId,
             defaultRow.stretch = false;   // functional
             rows.push_back(&defaultRow);
         }
+
+        // N4 FIX (Hunter, 2026-07-07): a split button whose PARENT is itself a functional command
+        // (revolve_boss/sweep_boss/loft_boss, sk_rect_corner, sk_arc_3pt, ...) had no flyout row for
+        // the parent, so once a *_cut / variant was picked (last-used) the user was stuck one-way —
+        // there was no way to switch BACK to the boss/base variant. Inject the parent itself as the
+        // FIRST row (unless a kParentDefaults row already stands in for the parent's action, or the
+        // parent is a pure flyout host with no engine action). Selecting it sets s_LastUsed[parent]=
+        // parent; resolveFace then finds no matching sub and falls back to the parent's own face.
+        const ui::RibbonCmd* parentCmd = nullptr;
+        if (!pd) {
+            int n = 0;
+            const ui::RibbonCmd* all = ui::getRibbonCmds(n);
+            for (int i = 0; i < n; ++i)
+                if (std::strcmp(all[i].cmd_id, parentId) == 0) { parentCmd = &all[i]; break; }
+            // Only inject when the parent has its own action (not schema-reserved / stretch).
+            if (parentCmd && !parentCmd->stretch) rows.push_back(parentCmd);
+        }
+
         for (const auto* sc : subs) rows.push_back(sc);
 
         float maxLblW = 0.0f;
@@ -1571,9 +1635,12 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 ImGui::SetCursorPos(ImVec2(bx, 0.0f));
                 const char* showIcon; const char* showLabel;
                 resolveFace(cmd, drop, showIcon, showLabel);
-                ribbon_bigBtn(cmd->cmd_id, showIcon, showLabel, ribbon_cmdEnabled(cmd), drop);
+                // N1-N5: stable widest-variant width — draw and advance share it so the face label
+                // (variant) can change without reflowing or bleeding into the neighbor.
+                float wStable = ribbon_bigBtnWMax(grp, cmd, drop);
+                ribbon_bigBtn(cmd->cmd_id, showIcon, showLabel, ribbon_cmdEnabled(cmd), drop, wStable);
                 if (drop) runFlyout(cmd);
-                bx += ribbon_bigBtnW(cmd->cmd_id, cmd->label, drop) + 2.0f * s;
+                bx += wStable + 2.0f * s;
             }
 
             // small zone: pack into independently-measured columns (defect 1)
@@ -1602,9 +1669,13 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
             std::vector<float> widths;
             int nBig = (int)grp.bigCmds.size();
             for (int i = 0; i < (int)rows.size(); ++i) {
-                float w = ribbon_smBtnW(rows[i]->label);
-                if (i < nBig && ribbon_hasSubs(grp, rows[i])) w += kDropArrowW * s;
-                widths.push_back(w);
+                if (i < nBig) {
+                    // N1-N5: degraded big row reserves its widest-variant width.
+                    widths.push_back(ribbon_bigBtnAsSmallWMax(grp, rows[i],
+                                                              ribbon_hasSubs(grp, rows[i])));
+                } else {
+                    widths.push_back(ribbon_smBtnW(rows[i]->label));
+                }
             }
             auto cols = ribbon_packColumns(widths, rowsPerCol);
             float sx = curX + kGroupPadX * s;
@@ -1618,8 +1689,10 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                         bool drop = ribbon_hasSubs(grp, cmd);
                         const char* showIcon; const char* showLabel;
                         resolveFace(cmd, drop, showIcon, showLabel);
+                        // N1-N5: draw at the same widest-variant width the packer reserved.
                         ribbon_bigBtnAsSmall(cmd->cmd_id, showIcon, showLabel,
-                                             ribbon_cmdEnabled(cmd), drop);
+                                             ribbon_cmdEnabled(cmd), drop,
+                                             ribbon_bigBtnAsSmallWMax(grp, cmd, drop));
                         if (drop) runFlyout(cmd);
                     } else {
                         ribbon_smBtn(cmd->cmd_id, cmd->icon, cmd->label, ribbon_cmdEnabled(cmd));

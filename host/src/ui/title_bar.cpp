@@ -309,7 +309,9 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             if (ImGui::GetCursorPosX() + wmW + 18.0f * s < rightGroupStartRelX - 240.0f * s) {
                 ImGui::SetCursorPosY((barH - wmH) * 0.5f);
                 ImGui::Image((ImTextureID)(intptr_t)wm.id, ImVec2(wmW, wmH));
-                logoEndRelX = ImGui::GetCursorPosX();
+                // GetItemRectMax().x is the screen-right edge of the Image item — reliable even
+                // after ImGui resets CursorPosX to indent. Convert to window-relative.
+                logoEndRelX = ImGui::GetItemRectMax().x - winX;
                 ImGui::SameLine(0, 16.0f * s);
             }
         } else if (st.logoIcon.id) {
@@ -317,7 +319,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             if (ImGui::GetCursorPosX() + iconH + 18.0f * s < rightGroupStartRelX - 240.0f * s) {
                 ImGui::SetCursorPosY((barH - iconH) * 0.5f);
                 ImGui::Image((ImTextureID)(intptr_t)st.logoIcon.id, ImVec2(iconH, iconH));
-                logoEndRelX = ImGui::GetCursorPosX();
+                logoEndRelX = ImGui::GetItemRectMax().x - winX;
                 ImGui::SameLine(0, 16.0f * s);
             }
         }

@@ -118,6 +118,11 @@ namespace aicad::doc {
 
 using nlohmann::json;
 
+// Forward decl — defined with the cross-doc dependency registry near the bottom of this
+// file (feat(xdoc)); used by warm_and_respond inside the anonymous namespace below. The
+// xdoc commit was never compiled on Linux, so the missing declaration only surfaced now.
+static int dep_notify_unlocked(const std::string& source_doc_id, long new_revision);
+
 namespace {
 
 // ----------------------------------------------------------------- session store
@@ -2390,6 +2395,17 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
     else if (k == "sketch_mirror_entities")     op_sketch_mirror_entities(doc, op, idx, gen, id_map);
     else if (k == "sketch_pattern_entities")    op_sketch_pattern_entities(doc, op, idx, gen, id_map);
     else if (k == "sketch_move")                op_sketch_move(doc, op, idx, gen, id_map);
+    else if (k.rfind("asm_", 0) == 0 &&
+             doc.value("schema", std::string()) != "aicad.asm/1")
+        // G4 guard — asm_* ops on a PART document used to "succeed" by writing a
+        // components[]/mates[] array the part compiler never reads: revision bumped,
+        // geometry unchanged, no error. Reject loudly instead so the caller learns the
+        // doc kind is wrong (create the doc with doc_new kind="assembly").
+        throw OpError("invalid_op",
+                      "op[" + std::to_string(idx) + "]: '" + k +
+                          "' requires an ASSEMBLY document (aicad.asm/1); this is a part. "
+                          "Create one with doc_new kind=\"assembly\" (MCP: new_assembly).",
+                      {{"index", idx}, {"reason", "not an assembly document"}});
     else if (k == "asm_insert_component")       op_asm_insert_component(doc, op, idx, gen, id_map);
     else if (k == "asm_edit_component")         op_asm_edit_component(doc, op, idx);
     else if (k == "asm_delete_component")       op_asm_delete_component(doc, op, idx);
@@ -9741,7 +9757,7 @@ json doc_dep_query(const std::string& source_doc_id, const std::string& kind_fil
     long src_rev = -1;
     {
         auto it = g_sessions.find(source_doc_id);
-        if (it != g_sessions.end()) src_rev = it->second->revision;
+        if (it != g_sessions.end()) src_rev = it->second.revision;
     }
 
     json deps = json::array();
@@ -9802,6 +9818,228 @@ json doc_dep_unregister(const std::string& dep_doc_id, const std::string& kind) 
         removed += (int)(before - vec.size());
     }
     return json{{"unregistered", removed}};
+}
+
+// ============================================================ kinematic motion study
+// Mate types whose scalar `value` field can be swept as a motion driver.
+// Mirrors services/mcp/cad_tools.py::_DRIVABLE_MATE_TYPES.
+static const std::map<std::string, std::string> k_drivable_mate_types = {
+    {"angle",          "deg"},
+    {"angle_limit",    "deg"},
+    {"distance",       "mm"},
+    {"distance_limit", "mm"},
+    {"gear",           "deg"},
+    {"rack_pinion",    "mm"},
+    {"screw",          "mm"},
+};
+
+// Transpose a 4×4 row-major double matrix to column-major float (for viewport).
+// Row-major M[r][c] = flat[r*4+c]; col-major M[r][c] = flat[c*4+r].
+static std::array<float, 16> row_to_col_major(const std::vector<double>& rm) {
+    std::array<float, 16> cm{};
+    if (rm.size() < 16) { cm[0] = 1; cm[5] = 1; cm[10] = 1; cm[15] = 1; return cm; }
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            cm[(size_t)(c * 4 + r)] = (float)rm[(size_t)(r * 4 + c)];
+    return cm;
+}
+
+json doc_simulate_motion(const std::string& doc_id,
+                         const std::string& mate_id_in,
+                         double start, double stop, int steps,
+                         bool check_interference,
+                         double min_clearance_mm) {
+    if (steps < 2)
+        throw OpError("invalid_op", "simulate_motion: steps must be >= 2");
+
+    // ---- 1. Resolve the driven mate ----------------------------------------
+    std::string mate_id = mate_id_in;
+    std::string driver_type, driver_unit;
+    double orig_value = 0.0;
+    {
+        DocLock lk;
+        Session& s = require_session(doc_id);
+        if (!s.is_assembly())
+            throw OpError("invalid_op", "simulate_motion: document is not an assembly");
+
+        json& doc = s.doc;
+        const json& mates = doc.contains("mates") && doc["mates"].is_array()
+                            ? doc["mates"] : json::array();
+
+        if (mates.empty())
+            throw OpError("invalid_op",
+                "simulate_motion: document has no mates. Build an assembly with mates first.");
+
+        // Collect drivable mates.
+        std::vector<const json*> drivable;
+        for (const json& m : mates) {
+            if (m.value("suppressed", false)) continue;
+            const std::string mt = m.value("type", std::string());
+            if (k_drivable_mate_types.count(mt)) drivable.push_back(&m);
+        }
+
+        if (mate_id.empty()) {
+            if (drivable.empty())
+                throw OpError("invalid_op",
+                    "simulate_motion: no drivable dimensional mate found. "
+                    "Add an angle or distance mate to drive the mechanism.");
+            if (drivable.size() > 1)
+                throw OpError("invalid_op",
+                    "simulate_motion: multiple drivable mates — pass mate_id explicitly.");
+            mate_id = (*drivable[0]).value("id", std::string());
+        }
+
+        // Locate the named mate.
+        const json* driven = nullptr;
+        for (const json& m : mates)
+            if (m.value("id", std::string()) == mate_id) { driven = &m; break; }
+        if (!driven)
+            throw OpError("invalid_op",
+                "simulate_motion: mate '" + mate_id + "' not found.");
+        const std::string mt = driven->value("type", std::string());
+        auto dit = k_drivable_mate_types.find(mt);
+        if (dit == k_drivable_mate_types.end())
+            throw OpError("invalid_op",
+                "simulate_motion: mate '" + mate_id + "' (type '" + mt + "') is not drivable. "
+                "Drive a dimensional mate (angle, distance, gear, rack_pinion, screw).");
+        driver_type = mt;
+        driver_unit = dit->second;
+
+        // Read current value.
+        const json& v = (*driven).value("value", json(nullptr));
+        if (v.is_object()) orig_value = v.value("value", 0.0);
+        else if (v.is_number()) orig_value = v.get<double>();
+        else orig_value = 0.0;
+    }
+
+    // If start was not specified (NaN convention), use orig_value.
+    // The public API always requires explicit start from the C++ caller.
+
+    // ---- 2. Build sample values --------------------------------------------
+    std::vector<double> samples;
+    samples.reserve((size_t)steps);
+    for (int i = 0; i < steps; ++i)
+        samples.push_back(start + (stop - start) * i / (steps - 1));
+
+    // ---- 3. Sweep ----------------------------------------------------------
+    json trajectory = json::array();
+    json first_collision_step_j = nullptr;
+    double first_collision_value = 0.0;
+    json first_collision_detail = nullptr;
+    bool had_collision = false;
+
+    for (int i = 0; i < (int)samples.size(); ++i) {
+        const double val = samples[(size_t)i];
+
+        // Set mate value + re-solve (each call acquires DocLock internally).
+        json set_ops = json::array();
+        set_ops.push_back({{"op", "asm_edit_mate"}, {"id", mate_id}, {"value", val}});
+        try {
+            doc_apply_ops(doc_id, -1, set_ops, /*coalesce=*/true);
+        } catch (const OpError&) {
+            // On a bad op just skip frame; don't abort the whole study.
+            continue;
+        }
+        json sm = doc_solve_mates(doc_id);
+
+        // Collect per-body transforms from asm_result.
+        json bodies_j = json::array();
+        bool converged = sm.value("converged", true);
+        {
+            DocLock lk2;
+            Session& s2 = require_session(doc_id);
+            if (s2.asm_result) {
+                for (const AsmBodyOut& body : s2.asm_result->bodies) {
+                    // Emit column-major 4×4 float matrix (viewport convention).
+                    auto cm = row_to_col_major(body.transform);
+                    json t = json::array();
+                    for (float f : cm) t.push_back(f);
+                    bodies_j.push_back({
+                        {"name",      body.name},
+                        {"component", body.component_id},
+                        {"transform", t},
+                    });
+                }
+            }
+        }
+
+        json frame = {
+            {"i",         i},
+            {"value",     val},
+            {"converged", converged},
+            {"bodies",    bodies_j},
+        };
+        trajectory.push_back(std::move(frame));
+
+        // Interference check (optional, stop at first collision).
+        if (check_interference && !had_collision) {
+            json ifp = {{"doc_id", doc_id},
+                        {"min_clearance_mm", min_clearance_mm}};
+            json ifr = doc_eval_interference(doc_id, ifp);
+            bool clash = false;
+            json detail = json::array();
+            if (ifr.contains("interferences") && ifr["interferences"].is_array()) {
+                for (const json& pair : ifr["interferences"]) {
+                    if (pair.value("volume", 0.0) > 0.0) {
+                        clash = true;
+                        detail.push_back({{"a", pair.value("a", "?")},
+                                          {"b", pair.value("b", "?")}});
+                    }
+                }
+            }
+            if (clash) {
+                had_collision = true;
+                first_collision_step_j = i;
+                first_collision_value  = val;
+                first_collision_detail = detail;
+            }
+        }
+    }
+
+    // ---- 4. Restore original mate value ------------------------------------
+    {
+        json restore_ops = json::array();
+        restore_ops.push_back({{"op", "asm_edit_mate"}, {"id", mate_id}, {"value", orig_value}});
+        try {
+            doc_apply_ops(doc_id, -1, restore_ops, /*coalesce=*/true);
+            doc_solve_mates(doc_id);
+        } catch (...) {
+            // Best-effort restore — don't propagate.
+        }
+    }
+
+    // ---- 5. Build result ---------------------------------------------------
+    json interference = {
+        {"checked",               check_interference},
+        {"first_collision_step",  first_collision_step_j},
+        {"first_collision_value", had_collision ? json(first_collision_value) : json(nullptr)},
+        {"detail",                had_collision ? first_collision_detail : json::array()},
+    };
+
+    char summary_buf[256];
+    if (had_collision)
+        std::snprintf(summary_buf, sizeof(summary_buf),
+                      "%d frames | driver %s | interference at step %d",
+                      (int)trajectory.size(), mate_id.c_str(),
+                      first_collision_step_j.get<int>());
+    else
+        std::snprintf(summary_buf, sizeof(summary_buf),
+                      "%d frames | driver %s | no interference detected",
+                      (int)trajectory.size(), mate_id.c_str());
+
+    return json{
+        {"ok",           true},
+        {"doc_id",       doc_id},
+        {"mate_id",      mate_id},
+        {"driver",       {{"type",  driver_type},
+                          {"unit",  driver_unit},
+                          {"start", start},
+                          {"stop",  stop},
+                          {"steps", steps}}},
+        {"trajectory",   trajectory},
+        {"interference", interference},
+        {"summary",      std::string(summary_buf)},
+    };
 }
 
 }  // namespace aicad::doc

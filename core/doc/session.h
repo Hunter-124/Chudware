@@ -530,4 +530,21 @@ nlohmann::json doc_dep_query(const std::string& source_doc_id, const std::string
 nlohmann::json doc_dep_notify(const std::string& source_doc_id, long new_revision);
 nlohmann::json doc_dep_unregister(const std::string& dep_doc_id, const std::string& kind);
 
+// Kinematic motion study: drive one dimensional mate across [start, stop] in `steps`
+// samples, re-solve the assembly mate graph at each sample, and collect per-body world
+// transforms for every frame. Optionally checks eval_interference at each step and
+// reports the first collision step. The driven mate is restored to its original value
+// when the study finishes. Pure math/kinematics — no meshing.
+//
+// Returns {ok, doc_id, mate_id, driver:{type,unit,start,stop,steps},
+//          trajectory:[{i, value, converged, bodies:[{name, transform:[16 floats col-major]}]}],
+//          interference:{checked, first_collision_step, first_collision_value, detail},
+//          summary}.
+// Throws OpError("invalid_op") on non-assembly doc, missing/non-drivable mate, or bad range.
+nlohmann::json doc_simulate_motion(const std::string& doc_id,
+                                   const std::string& mate_id,  // "" = auto-pick
+                                   double start, double stop, int steps,
+                                   bool check_interference,
+                                   double min_clearance_mm = 0.0);
+
 }  // namespace aicad::doc

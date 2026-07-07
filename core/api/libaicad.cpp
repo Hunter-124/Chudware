@@ -3045,6 +3045,25 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 return emit(json{{"closed", aicad::doc::drawing_close(
                                                 params.value("doc_id", std::string()))}},
                             out_json, 0);
+
+            // ---- kinematic motion study (simulate_motion) ------------------
+            // Pure math: drive one dimensional mate, re-solve the mate graph at
+            // each step, collect per-body column-major transforms, optionally
+            // check interference. Restores the mate to its original value when done.
+            // Synchronous and fast (no meshing). Used by SimManager::runMotion().
+            if (m == "simulate_motion") {
+                const std::string sm_doc = params.value("doc_id", std::string());
+                const std::string sm_mid = params.value("mate_id", std::string());
+                const double sm_start = params.value("start", 0.0);
+                const double sm_stop  = params.value("stop",  90.0);
+                const int    sm_steps = std::max(2, params.value("steps", 24));
+                const bool   sm_ci    = params.value("check_interference", true);
+                const double sm_mcl   = params.value("min_clearance_mm", 0.0);
+                return emit(aicad::doc::doc_simulate_motion(
+                                sm_doc, sm_mid, sm_start, sm_stop, sm_steps, sm_ci, sm_mcl),
+                            out_json, 0);
+            }
+
         } catch (const aicad::doc::OpError& oe) {
             // Structured error envelope (matches the Python worker's doc_* errors).
             return emit(oe.envelope(), out_json, 3);

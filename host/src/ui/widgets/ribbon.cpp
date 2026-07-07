@@ -905,11 +905,12 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     const bool isActive = ribbon_isActive(cmd_id);
     const bool hovAny   = (mainHov || dropHov) && enabled;
     if (highlight) {
-        // Accent-tinted fill so a highlighted action (e.g. Finish Sketch) stands out from the
-        // neutral tool buttons. Draw before the active-outline layer so a bold outline still reads.
+        // Highlighted action (e.g. Finish Sketch): keep the neutral glass fill but wrap it in an
+        // accent-GREEN border so it stands out from the tool buttons without flooding the tile green.
+        ribbon_btnRest(dl, p0, p1, rnd, enabled, /*inset=*/false, /*hovered=*/hovAny);
         const float* ok = ui::palette.statusOk;
-        ImVec4 f(ok[0], ok[1], ok[2], hovAny ? 1.0f : 0.90f);
-        dl->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32(f), rnd);
+        ImVec4 bc(ok[0], ok[1], ok[2], hovAny ? 1.0f : 0.90f);
+        dl->AddRect(p0, p1, ImGui::ColorConvertFloat4ToU32(bc), rnd, 0, 2.0f * s);
     } else {
         ribbon_btnRest(dl, p0, p1, rnd, enabled, /*inset=*/false, /*hovered=*/hovAny);
     }
@@ -968,9 +969,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         }
 
         ribbon_icon(dl, iconName, cx, iy + iconSz * 0.5f, iconSz, enabled, ribbon_isActive(cmd_id));
-        // Finish Sketch: overlay a procedural check badge on the pencil glyph.
-        if (finishBadge)
-            ribbon_sketchFinishBadge(dl, cx, iy + iconSz * 0.5f, iconSz, /*isCheck=*/true);
+        (void)finishBadge;  // Finish Sketch reads via its green border alone — no check-badge overlay.
 
         // Material color swatch: a 20x4 bar under the icon previewing the exact color this button
         // applies. The label below is nudged down (see ty) so the bar never overlaps the text.

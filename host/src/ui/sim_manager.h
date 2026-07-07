@@ -428,6 +428,8 @@ private:
     EmState em_;
     bool emPanelOpen_ = false;
     EmForm emForm_ = EmForm::Eigenmode;
+    bool emTabSync_ = false;               // force the in-panel tab bar to emForm_ for ONE frame
+                                           // (after a ribbon command); else the user's clicks win
     bool emRunning_ = false;               // an em_* run launched by this manager is in flight
     void openEmForm(AppState& st, EmForm f);
     void drawEmPanel(AppState& st);        // full panel (header + form + results); returns via emPanelOpen_

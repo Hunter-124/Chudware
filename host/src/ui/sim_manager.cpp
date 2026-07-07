@@ -797,6 +797,10 @@ void SimManager::deleteStudy(AppState& st, int i) {
 bool SimManager::handleCommand(AppState& st, const std::string& cmdId) {
     // EM (electromagnetics) tab: every sim_em_* command is gated on the em_* backend probe.
     if (cmdId.rfind("sim_em_", 0) == 0) return handleEmCommand(st, cmdId);
+    // Any non-EM sim tool means the user left the EM analysis — yield the pane back to the study
+    // tree/panel. (The EM panel takes over drawTreeBody first, so without this it stays glued over
+    // any study a subsequent study command opens.)
+    emPanelOpen_ = false;
 
     // sim-gui rework: creating a study opens its setup panel (PM-style, left pane) immediately.
     auto newAndOpen = [&](StudyType t) {
@@ -1013,6 +1017,7 @@ static const int kNEmModes = (int)(sizeof(kEmModes) / sizeof(kEmModes[0]));
 void SimManager::openEmForm(AppState& st, EmForm f) {
     (void)st;
     emForm_ = f;
+    emTabSync_ = true;    // force the in-panel tab bar to this form on the next draw only
     emPanelOpen_ = true;
     panelOpen_ = false;   // EM takes over the pane; close any study setup panel
 }
@@ -1066,9 +1071,16 @@ void SimManager::runEmForm(AppState& st) {
         if (!ok) {
             err = r.result.value("error", r.err.empty() ? std::string("EM solve failed") : r.err);
         }
+        // Coerce a JSON number array to float, clamping non-finite entries (a matched-port S11 can
+        // come back as +/-inf/NaN from some adapters) so the auto-ranged plot stays sane.
         auto toF = [](const nlohmann::json& a, std::vector<float>& out) {
             out.clear();
-            if (a.is_array()) for (const auto& v : a) out.push_back(v.is_number() ? (float)v.get<double>() : 0.0f);
+            if (!a.is_array()) return;
+            for (const auto& v : a) {
+                float f = v.is_number() ? (float)v.get<double>() : 0.0f;
+                if (!std::isfinite(f)) f = (f < 0 || (v.is_number() && v.get<double>() < 0)) ? -300.0f : 300.0f;
+                out.push_back(f);
+            }
         };
         if (which == EmForm::Eigenmode) {
             em_.eigResult = ok ? 1 : 0; em_.eigError = err;
@@ -1290,9 +1302,12 @@ void SimManager::drawEmPanel(AppState& st) {
                                  {"Freq Sweep", EmForm::Driven},
                                  {"Time Domain", EmForm::TimeDomain}};
         for (const auto& t : tabs) {
-            ImGuiTabItemFlags tf = (emForm_ == t.f) ? ImGuiTabItemFlags_SetSelected : 0;
+            // Only force-select on the frame right after a ribbon command changed emForm_; otherwise
+            // the tab bar's own click drives emForm_ (SetSelected every frame would fight the user).
+            ImGuiTabItemFlags tf = (emTabSync_ && emForm_ == t.f) ? ImGuiTabItemFlags_SetSelected : 0;
             if (ImGui::BeginTabItem(t.label, nullptr, tf)) { emForm_ = t.f; ImGui::EndTabItem(); }
         }
+        emTabSync_ = false;
         ImGui::EndTabBar();
     }
     ImGui::Spacing();
@@ -1361,8 +1376,14 @@ void SimManager::drawEmPanel(AppState& st) {
             ImGui::TextWrapped("%s", em_.drvError.c_str());
             ImGui::PopStyleColor();
         } else if (em_.drvResult == 1) {
-            ImGui::SeparatorText("S-parameters (dB)");
-            drawEmLinePlot("##emsparam", em_.drvFreq, &em_.drvS11, "S11 (dB)", &em_.drvS21, "S21 (dB)",
+            // S11 and S21 live on very different dB scales (a matched section has S11 near the noise
+            // floor and S21 near 0), so a shared Y axis would flatten one. Plot them stacked, each
+            // auto-ranged.
+            ImGui::SeparatorText("Return loss S11 (dB)");
+            drawEmLinePlot("##ems11", em_.drvFreq, &em_.drvS11, "S11 (dB)", nullptr, nullptr,
+                           "GHz", "dB");
+            ImGui::SeparatorText("Insertion loss S21 (dB)");
+            drawEmLinePlot("##ems21", em_.drvFreq, &em_.drvS21, "S21 (dB)", nullptr, nullptr,
                            "GHz", "dB");
         } else {
             ImGui::TextDisabled("Run to compute S11 / S21 vs frequency.");

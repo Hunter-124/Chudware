@@ -106,11 +106,19 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     ui::GlassLevel level = active ? ui::GlassLevel::Regular : ui::GlassLevel::UltraThin;
     if (hovered && !active) level = ui::GlassLevel::Thin;
     ui::glassPanel(dl, tabRect, level, 4.0f /*dp — glassPanel scales by uiScale*/, surf);
-    if (active)
-        dl->AddLine(ImVec2(p0.x + ui::metrics::px(2), p0.y + ui::metrics::px(1)),
-                    ImVec2(p1.x - ui::metrics::px(2), p0.y + ui::metrics::px(1)),
-                    ui::Palette::toU32(pal.accent), 2.0f * s);
-    else  // thin separator on the right edge of inactive tabs
+    if (active) {
+        // polish(G3): bold bounding-box outline replaces the thin top-edge line indicator —
+        // matches the SolidWorks-refined active-state language (filled pill + visible border).
+        // Inset 1dp so the corner rounding of the glassPanel isn't hidden by a perfectly
+        // flush rect; stroke 1.5dp reads as "bold" without being heavy.
+        const float inset = 1.0f * s;
+        dl->AddRect(ImVec2(p0.x + inset, p0.y + inset),
+                    ImVec2(p1.x - inset, p1.y - inset),
+                    ui::Palette::toU32(pal.accent),
+                    4.0f * s,   // corner radius matches the glass pill (4dp)
+                    0,
+                    std::max(1.0f, 1.5f * s));
+    } else  // thin separator on the right edge of inactive tabs
         dl->AddLine(ImVec2(p1.x - 0.5f, p0.y + 4 * s), ImVec2(p1.x - 0.5f, p1.y - 4 * s),
                     ui::Palette::toU32(pal.border), 1.0f);
 

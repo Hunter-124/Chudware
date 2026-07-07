@@ -54,3 +54,15 @@ Format:
 
 ## Polish agent requests (build fix — parts_workspace.cpp fonts member)
 - [ ] (polish) `host/src/ui/parts/parts_workspace.cpp:93,111` — `ui::fonts` should be `ui::Fonts` (capital F). The struct is declared as `ui::Fonts` in ui_theme.h (L13) but parts_workspace.cpp references it as lowercase `ui::fonts`. Fix: replace `ui::fonts.h2` with `ui::Fonts.h2` at L93 and `ui::fonts.h1` with `ui::Fonts.h1` at L111. This is blocking the build (not in polish file ownership).
+
+## ribbon agent — per-workspace ribbon filter (2026-07-06)
+- [ ] (ribbon) `host/src/app.cpp` — before each `drawRibbon(...)` call, add:
+  `ui::setRibbonWorkspace(static_cast<int>(st.activeWorkspace));`
+  (include `host/src/ui/widgets/ribbon.h` if not already included at that call-site).
+  This enables per-workspace tab filtering: Simulate shows only Simulation+Reference,
+  Electronics shows PCB only, Manufacture shows Manufacture+Reference only,
+  PLM/PartsLibrary/AI collapse the ribbon to 0 height. Default is Model (all 3D tabs).
+  Owner: workspace-shell.
+
+## Polish agent — parts_workspace.cpp build fix (correct fonts access)
+- [ ] (polish) `host/src/ui/parts/parts_workspace.cpp:93,111` — `ui::fonts` is not a member of namespace `ui`; fonts live on AppState. Fix: replace `ui::fonts.h2` with `st.fonts.h2` at L93 (in sectionHeader) and `ui::fonts.h1` with `st.fonts.h1` at L111 (in emptyState). The `st` AppState& param is in scope in both functions. This blocks the ninja build — not in polish file ownership so filing as wire request.

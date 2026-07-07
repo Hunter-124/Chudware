@@ -97,17 +97,30 @@ except ImportError:
 
 # ── datasheet ingest (docling) ───────────────────────────────────────────────
 try:
-    from engine_oracle.vision.ingest import ingest_pdf as _ingest_pdf
+    from engine_oracle.vision.datasheet_ingest import ingest_datasheet as _ingest_datasheet
 except ImportError:
     try:
-        from engine.vision.ingest import ingest_pdf as _ingest_pdf  # type: ignore
+        from engine.vision.datasheet_ingest import ingest_datasheet as _ingest_datasheet  # type: ignore
     except ImportError:
-        def _ingest_pdf(path: str, out_dir: str) -> dict:  # type: ignore[misc]
-            return {
-                "ok": False,
-                "reason": "docling not provisioned",
-                "hint": "pip install docling",
-            }
+        _ingest_datasheet = None  # type: ignore[assignment]
+
+
+def _ingest_pdf(path: str, out_dir: str) -> dict:
+    """Adapter onto RE-15's datasheet_ingest.
+
+    ``reveng_ingest_datasheet`` passes ``<session>/datasheet`` as ``out_dir``, but
+    ``ingest_datasheet`` takes the session ROOT and writes the ``datasheet/`` subdir
+    itself. It returns ``{ok, tables, crops, mpn_candidates}`` (docling → pdfplumber
+    backend chain) or an honest degradation envelope — never raises.
+    """
+    if _ingest_datasheet is None:
+        return {
+            "ok": False,
+            "reason": "backend_not_provisioned",
+            "hint": "pip install docling  (or pdfplumber for text-table extraction)",
+        }
+    from pathlib import Path as _P
+    return _ingest_datasheet(path, _P(out_dir).parent)
 
 
 # ── session store ───────────────────────────────────────────────────────────

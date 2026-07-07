@@ -309,11 +309,21 @@ class TestRevengSessionLifecycle(unittest.TestCase):
         self.assertIn("add_video", prov_steps)
 
     def test_ingest_datasheet(self):
+        import os
         create = _call(self.tools, "reveng_start_session", name="Bracket")
         sid = create["session_id"]
-        r = _call(self.tools, "reveng_ingest_datasheet",
-                  session_id=sid, path="/fake/datasheet.pdf")
-        self.assertTrue(r["ok"])
+        # A fake path must honestly fail (the tool no longer no-ops to ok=True).
+        bad = _call(self.tools, "reveng_ingest_datasheet",
+                    session_id=sid, path="/fake/datasheet.pdf")
+        self.assertFalse(bad["ok"])
+        # Real bearing datasheet fixture (RE-15): pdfplumber extracts its table.
+        repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        pdf = os.path.join(repo, "corpora", "reveng", "bearing_spec.pdf")
+        r = _call(self.tools, "reveng_ingest_datasheet", session_id=sid, path=pdf)
+        if not r.get("ok"):
+            # No PDF backend (docling/pdfplumber) provisioned — honest degradation.
+            self.assertEqual(r.get("reason"), "backend_not_provisioned")
+            return
         self.assertIsInstance(r["tables"], list)
         self.assertIsInstance(r["crops"], list)
         self.assertIn("session", r)

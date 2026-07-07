@@ -9,7 +9,7 @@ Format:
 - [ ] (agent) `path/to/file.cpp:123` — change X to Y because Z
 
 ## Polish agent requests (Goal 4 — axis triad dynamic placement)
-- [ ] (polish) `host/src/ui/viewport_panel.cpp:3285-3290` — The orientation triad anchor
+- [x] (polish) `host/src/ui/viewport_panel.cpp:3285-3290` — DONE e5e90805. The orientation triad anchor
   currently uses the FM column's RIGHT edge X (hudLeft) regardless of column height. The goal is:
   when the FM column does NOT reach the triad row (i.e. the column height in screen pixels is less
   than `cr1.y - 52.0f * ts - 60.0f * ts`), anchor the triad at `cr0.x + 52.0f * ts` (far left of
@@ -26,7 +26,7 @@ Format:
 - [ ] (hunter/orchestrator) Sim study-type pickers must be scoped by open doc types (progressive disclosure): mechanical FEA/CFD kinds for Part/Assembly docs; motion only when an assembly with mates is open; electronics-sim/emulation entries only when Schematic/PCB docs are open (full electronics wiring is follow-up task T-SIM10 — tonight: the scoping of what is OFFERED must already be in place, even if electronics kinds show a "coming online" state).
 
 ## unify-build agent — build blocker (2026-07-06)
-- [ ] (unify-build) `host/src/ui/scenarios.cpp` — `ScenarioRunner::runWorkspaces(AppState&)` is
+- [x] (unify-build) `host/src/ui/scenarios.cpp` — DONE e5e90805. `ScenarioRunner::runWorkspaces(AppState&)` is
   called at line ~911 but has NO definition in scenarios.cpp (only added as a declaration in
   scenarios.h by a prior agent run). Link fails with "undefined reference". Either provide a stub
   body or remove the call — the host ninja build is RED until this is fixed.
@@ -150,3 +150,51 @@ Format:
   ```
   Note: substitute the actual DocTab display-name member (`title`/`name` — whichever the tab strip
   renders) and the GLFWwindow* variable in scope (`window` in run_gui). Owner: workspace-shell.
+
+## ai-workspace agent — route WS::AI to the full AI hub (2026-07-06)
+- [ ] (ai-workspace) `host/src/app.cpp` — 3 edits wire the new full-page AI hub
+  (`host/src/ui/ai/ai_workspace.cpp`, already built + linked into AI-CAD):
+
+  1. Add the include next to the other ui includes (~L50, beside `ui/legacy_chat.h`):
+  ```cpp
+  #include "ui/ai/ai_workspace.h"
+  ```
+
+  2. At ~L2892, gate the docked Copilot column out of the AI workspace (the hub renders the
+  SAME conversation state full-width via the legacy_chat reuse hooks — two composers over one
+  st.prompt in the same frame would double-render):
+  ```cpp
+  // The AI workspace hosts the expanded chat itself (same st.chat/st.conversations state);
+  // keep the docked Copilot column in every OTHER workspace exactly as today.
+  if (ws != WS::AI) ui::drawAIPanel(st, busy, canRun);
+  ```
+  (replaces the bare `ui::drawAIPanel(st, busy, canRun);` line)
+
+  3. Replace the WS::AI stub block (`} else if (ws == WS::AI) { ... }` at ~L2971-2995 — the
+  "##AISessionList" placeholder window) verbatim with:
+  ```cpp
+        } else if (ws == WS::AI) {
+            // AI workspace: full-page AI hub — sessions/sub-agents rail, expanded Copilot
+            // chat or project build-plan DAG, and AI workflow/model settings
+            // (host/src/ui/ai/ai_workspace.cpp). The docked Copilot is suppressed in this
+            // workspace (gate above), so the hub spans the whole central band.
+            const ui::OverlayBand& band = ui::overlayBand();
+            if (band.valid) {
+                const float m = 12.0f;
+                ImGui::SetNextWindowPos(ImVec2(band.minX + m, band.minY + m),
+                                        ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2((band.maxX - band.minX) - 2.0f * m,
+                                                (band.maxY - band.minY) - 2.0f * m),
+                                         ImGuiCond_Always);
+                ImGui::Begin("##AIWorkspace", nullptr,
+                             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                             ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
+                             ImGuiWindowFlags_NoSavedSettings);
+                ui::drawAiWorkspace(st);
+                ImGui::End();
+            }
+        }
+  ```
+  Note `band.maxX` (not `ui::overlayColumnEdge(1)`) — with the docked Copilot suppressed the
+  published column edge is stale, and the hub owns the full width. Owner: ai-workspace.

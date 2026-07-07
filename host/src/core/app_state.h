@@ -672,6 +672,11 @@ struct AppState {
     };
     std::vector<DocTab> docTabs;
     int activeTab = -1;             // index into docTabs; -1 = no document open (start state)
+    // [workspace-tabs seam] Top-level workspace selected in the title bar. Drives which body fills
+    // the central region (viewport / sketcher / sim / ecad / cam / plm / parts / ai) and which
+    // ribbon set is visible. Title bar writes it; app.cpp routes on it; ribbon filters by it.
+    enum class Workspace { Model, Drawing, Simulate, Electronics, Manufacture, PLM, PartsLibrary, AI };
+    Workspace activeWorkspace = Workspace::Model;
     // Multi-document: sessions of CLOSED tabs that may still have an async RPC in flight. A
     // DocSession's PropertyManager / SketchMode / EvaluateDialogs capture `this` in their st.rpc
     // completion lambdas (live preview, AI assist, sketch overview/regions, evaluate). Destroying the

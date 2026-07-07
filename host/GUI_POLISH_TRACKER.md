@@ -149,6 +149,16 @@ Hunter's red-pen on the shipped AI hub: make it compact, transparency-first, DAG
 |---|------|--------|--------|
 | M20 | Agent-execution event stream: harness/orchestrator emits structured, timestamped, parent-linked events (tool call start/end + target, context injection, subagent spawn/branch, advisor/council call, interruption) that feed the Agent Workflow DAG + transparency chat live. **Architecture pass in progress** — gap analysis vs existing AgentEvent/ActivityItem/buildgraph. | 🔧 | — |
 
+## N. Ribbon variant-button sizing (2026-07-07 — Hunter red-pen)
+Split/dropdown ribbon buttons whose label changes with the selected variant don't recompute width for the new label → text clips (too narrow) or bleeds into the neighbor (too wide), making menu scaling look broken. Fix: size each variant button to fit its **widest** variant label (stable width, never clips/bleeds, no neighbor reflow). **Fix EVERY instance.**
+| # | Item | Status | Commit |
+|---|------|--------|--------|
+| N1 | 3-Pt Arc button too narrow — text doesn't fit; widen to fit | ⬜ | — |
+| N2 | Rectangle split button: shrinks too small on "Ctr. Rect"; grows too big on "Parallelogram" and bleeds into the Circle button | ⬜ | — |
+| N3 | Features ribbon Revolve/Sweep/Loft → Cut mode: text gets cut off inside the button in cut mode | ⬜ | — |
+| N4 | Features ribbon: after switching Revolve/Sweep/Loft to a Cut mode you **can't switch back** (stuck one-way toggle) | ⬜ | — |
+| N5 | Audit ALL split/variant ribbon buttons for the same width-not-recomputed bug; apply the widest-label sizing rule everywhere | ⬜ | — |
+
 ---
 
 ## Open / next-up queue (orchestrator dispatches on Hunter's go)

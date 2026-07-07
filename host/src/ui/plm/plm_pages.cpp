@@ -522,8 +522,13 @@ void drawFilesTab(AppState& st) {
     ImGui::Separator();
     ImGui::Spacing();
 
-    if (H.itemsLoading && H.items.empty()) { plmSpinner("Loading"); return; }
-    if (!H.itemsErr.empty()) { plmError(H.itemsErr); return; }
+    // Only the item list scrolls; the header + track/link + filter row above stay
+    // pinned at the top of the panel.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::BeginChild("##files_list", ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGui::PopStyleVar();
+    if (H.itemsLoading && H.items.empty()) { plmSpinner("Loading"); ImGui::EndChild(); return; }
+    if (!H.itemsErr.empty()) { plmError(H.itemsErr); ImGui::EndChild(); return; }
 
     // build a filtered + sorted view (pointers into H.items — no copies)
     std::vector<const PlmItemRow*> view;
@@ -608,6 +613,7 @@ void drawFilesTab(AppState& st) {
     if (shown == 0)
         plmEmptyState("(#)", "No files here yet",
                       "Save a design, or Track a document/folder above.");
+    ImGui::EndChild();
 }
 
 // The Files destination folds in History + Releases as sub-tabs, so the whole
@@ -687,10 +693,15 @@ void plmDrawHistoryPage(AppState& st) {
     ImGui::Separator();
     ImGui::Spacing();
 
-    if (!H.histErr.empty()) { plmError(H.histErr); return; }
-    if (H.histLoading && H.history.empty()) { plmSpinner("Loading"); return; }
+    // Header + scope toggle stay pinned; the timeline scrolls below.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::BeginChild("##hist_scroll", ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGui::PopStyleVar();
+    if (!H.histErr.empty()) { plmError(H.histErr); ImGui::EndChild(); return; }
+    if (H.histLoading && H.history.empty()) { plmSpinner("Loading"); ImGui::EndChild(); return; }
     if (H.history.empty()) {
         plmEmptyState("[~]", "No history yet", "Save a checkpoint to start tracking.");
+        ImGui::EndChild();
         return;
     }
 
@@ -752,6 +763,7 @@ void plmDrawHistoryPage(AppState& st) {
         if (clicked) H.selectedEntry = sel ? "" : e.commit;
         ImGui::PopID();
     }
+    ImGui::EndChild();
 }
 
 // ---- Releases -----------------------------------------------------------------
@@ -789,10 +801,15 @@ void plmDrawReleasesPage(AppState& st) {
     dimText("Stamp the next revision and freeze the design.");
     ImGui::Spacing();
 
-    if (!H.itemsErr.empty()) { plmError(H.itemsErr); return; }
+    // Header stays pinned; the release list scrolls below.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::BeginChild("##rel_scroll", ImVec2(0, 0), ImGuiChildFlags_None);
+    ImGui::PopStyleVar();
+    if (!H.itemsErr.empty()) { plmError(H.itemsErr); ImGui::EndChild(); return; }
     if (H.items.empty()) {
         plmEmptyState("(#)", "Nothing to release yet",
                       "Add a design or document, then release it here.");
+        ImGui::EndChild();
         return;
     }
 
@@ -846,6 +863,7 @@ void plmDrawReleasesPage(AppState& st) {
         plmCardEnd();
         ImGui::PopID();
     }
+    ImGui::EndChild();
 }
 
 // ---- Team & Sync --------------------------------------------------------------

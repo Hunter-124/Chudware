@@ -177,11 +177,122 @@ def _plm_restore(params: dict, _emit: Callable) -> dict:
     return _with_vault(params, run)
 
 
+def _plm_item_list(params: dict, _emit: Callable) -> dict:
+    """The full item registry for the Files/Items page: each item's view (with
+    ``doc_type``), whether it has unsaved changes, and its thumbnail path when
+    one exists. Optional ``doc_type`` / ``kind`` filters. Fixes the historical
+    empty-param GUI call."""
+    def run(v: Any) -> dict:
+        from services.plm import items as items_mod
+        from services.plm import manifest as manifest_mod
+
+        m = v.manifest()
+        dirty = set(v._dirty_items(m))  # noqa: SLF001 — same package
+        want_dt = str((params or {}).get("doc_type", "") or "")
+        want_kind = str((params or {}).get("kind", "") or "")
+        out: list[dict[str, Any]] = []
+        for it in m["items"]:
+            if want_dt and it.get("doc_type") != want_dt:
+                continue
+            if want_kind and it.get("kind") != want_kind:
+                continue
+            view = items_mod.item_view(it)
+            view["dirty"] = it["item_id"] in dirty
+            out.append(view)
+        _ = manifest_mod  # imported for parity with other methods
+        return {"ok": True, "items": out}
+    return _with_vault(params, run)
+
+
+def _plm_item_add(params: dict, _emit: Callable) -> dict:
+    """Track a non-CAD file/folder as a versioned item ("Track this file")."""
+    def run(v: Any) -> dict:
+        rel = str((params or {}).get("file_path") or (params or {}).get("folder_path") or "")
+        if not rel:
+            return {"ok": False, "reason": "invalid_mode",
+                    "hint": "give a file or folder to track"}
+        item = v.add_item(rel,
+                          doc_type=(params or {}).get("doc_type") or None,
+                          part_number=(params or {}).get("part_number") or None)
+        return {"ok": True, "item": item}
+    return _with_vault(params, run)
+
+
+def _plm_item_untrack(params: dict, _emit: Callable) -> dict:
+    """Stop tracking an item (history keeps its old versions)."""
+    def run(v: Any) -> dict:
+        item = v.untrack_item(str((params or {}).get("item_id", "")))
+        return {"ok": True, "item": item}
+    return _with_vault(params, run)
+
+
+def _plm_link_repo(params: dict, _emit: Callable) -> dict:
+    """Link an external source repository by reference (no code stored)."""
+    def run(v: Any) -> dict:
+        item = v.link_repo(str((params or {}).get("url", "")),
+                           str((params or {}).get("name", "") or ""),
+                           checkout_path=(params or {}).get("checkout_path") or None)
+        return {"ok": True, "item": item}
+    return _with_vault(params, run)
+
+
+def _plm_where_used(params: dict, _emit: Callable) -> dict:
+    """What consumes an item (assemblies/drawings/CAM), derived live."""
+    def run(v: Any) -> dict:
+        from services.plm import whereused
+
+        m = v.manifest()
+        docs = whereused.docs_at_head(v)
+        try:
+            consumers = whereused.where_used(
+                m, docs, str((params or {}).get("item_id", "")),
+                transitive=bool((params or {}).get("transitive")))
+        except KeyError:
+            return {"ok": False, "reason": "invalid_item",
+                    "hint": "no such item"}
+        return {"ok": True, "consumers": consumers}
+    return _with_vault(params, run)
+
+
+def _plm_set_ai_mode(params: dict, _emit: Callable) -> dict:
+    """Set the assist tier (manual | assisted | managed) — worker twin."""
+    def run(v: Any) -> dict:
+        return {"ok": True, "ai_mode": v.set_ai_mode(str((params or {}).get("mode", "")))}
+    return _with_vault(params, run)
+
+
+def _plm_settings_get(params: dict, _emit: Callable) -> dict:
+    """Per-machine vault-local settings (visible columns, last page, …)."""
+    def run(v: Any) -> dict:
+        return {"ok": True, "settings": v.get_local_config()}
+    return _with_vault(params, run)
+
+
+def _plm_settings_set(params: dict, _emit: Callable) -> dict:
+    """Merge a patch into the vault-local settings."""
+    def run(v: Any) -> dict:
+        patch = (params or {}).get("settings")
+        if not isinstance(patch, dict):
+            return {"ok": False, "reason": "invalid_mode",
+                    "hint": "settings must be an object"}
+        return {"ok": True, "settings": v.set_local_config(patch)}
+    return _with_vault(params, run)
+
+
 def _plm_compare(params: dict, _emit: Callable) -> dict:
-    """Semantic (+ optional visual) compare of one item between two entries."""
+    """Semantic (+ optional visual) compare of one item between two entries.
+
+    Generic (non-CAD) items route to the content/text-diff comparison instead
+    of the geometric ``doc_diff``.
+    """
     def run(v: Any) -> dict:
         from services.plm import compare as compare_mod
 
+        item_id = str((params or {}).get("item_id", ""))
+        if compare_mod.is_generic_item(v, item_id):
+            return {"ok": True, **compare_mod.generic_compare(
+                v, str((params or {}).get("commit_a", "")),
+                str((params or {}).get("commit_b", "")), item_id)}
         doc_a, doc_b = compare_mod.docs_at(
             v, str((params or {}).get("commit_a", "")),
             str((params or {}).get("commit_b", "")),
@@ -362,6 +473,14 @@ WORKER_METHODS = {
     "plm_restore": _plm_restore,
     "plm_compare": _plm_compare,
     "plm_item_set": _plm_item_set,
+    "plm_item_list": _plm_item_list,
+    "plm_item_add": _plm_item_add,
+    "plm_item_untrack": _plm_item_untrack,
+    "plm_link_repo": _plm_link_repo,
+    "plm_where_used": _plm_where_used,
+    "plm_set_ai_mode": _plm_set_ai_mode,
+    "plm_settings_get": _plm_settings_get,
+    "plm_settings_set": _plm_settings_set,
     "plm_scheme_set": _plm_scheme_set,
     "plm_discard_draft": _plm_discard_draft,
     "plm_draft": _plm_draft,

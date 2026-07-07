@@ -172,6 +172,53 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(**fields)
 
     @mcp.tool()
+    def plm_item_add(path: str, file_path: str = "", folder_path: str = "",
+                     doc_type: str = "", part_number: str = "") -> str:
+        """Track a non-design file or folder as a versioned item — a
+        specification, report, datasheet, spreadsheet, image, simulation folder
+        or source tree. Design documents (.step+/.ecad+) are tracked
+        automatically when saved; this is for everything else. ``doc_type`` is
+        auto-detected when omitted and can be changed later. Returns
+        ``{ok, item}``."""
+        try:
+            Vault, VaultError = _vault_module()
+        except ImportError:
+            return _err("no_vault", "version history is not available on this machine")
+        rel = file_path or folder_path
+        if not rel:
+            return _err("invalid_mode", "give a file or folder to track")
+        try:
+            v = Vault.open(path)
+            try:
+                item = v.add_item(rel, doc_type=doc_type or None,
+                                  part_number=part_number or None)
+            finally:
+                v.close()
+        except VaultError as e:
+            return _err(e.reason, e.hint)
+        return _ok(item=item)
+
+    @mcp.tool()
+    def plm_link_repo(path: str, url: str, name: str = "",
+                      checkout_path: str = "") -> str:
+        """Link an external source-code repository to the project by reference
+        (the code is never copied in — only a pointer, pinned to a version at
+        each release). Returns ``{ok, item}``."""
+        try:
+            Vault, VaultError = _vault_module()
+        except ImportError:
+            return _err("no_vault", "version history is not available on this machine")
+        try:
+            v = Vault.open(path)
+            try:
+                item = v.link_repo(url, name, checkout_path=checkout_path or None)
+            finally:
+                v.close()
+        except VaultError as e:
+            return _err(e.reason, e.hint)
+        return _ok(item=item)
+
+    @mcp.tool()
     def plm_where_used(path: str, item_id: str, transitive: bool = False) -> str:
         """Answer "where is this used?": the assemblies, drawings and CAM jobs
         that consume an item (directly, or the whole chain with

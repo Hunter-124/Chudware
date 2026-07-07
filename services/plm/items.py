@@ -110,8 +110,22 @@ def item_view(item: dict[str, Any]) -> dict[str, Any]:
     working = None
     if item["lifecycle"] == manifest_mod.LIFECYCLE_IN_WORK:
         working = manifest_mod.next_rev_letter(item.get("rev"))
-    return {
+    view = {
         "item_id": item["item_id"], "path": item["path"], "kind": item["kind"],
         "part_number": item.get("part_number"), "rev": item.get("rev"),
         "lifecycle": item["lifecycle"], "working_rev": working,
     }
+    if item.get("doc_type"):
+        view["doc_type"] = item["doc_type"]
+    return view
+
+
+def untrack_item(m: dict[str, Any], item_id: str) -> dict[str, Any]:
+    """Remove an item from the registry (contract §4 forward-only: history is
+    NOT touched — old entries keep the item's blobs, so a restore of an earlier
+    point still recovers it; only the live registry drops the row)."""
+    item = manifest_mod.find_item(m, item_id)
+    if item is None:
+        raise ItemRuleError("invalid_item", f"no such item: {item_id}")
+    m["items"] = [it for it in m["items"] if it["item_id"] != item_id]
+    return item

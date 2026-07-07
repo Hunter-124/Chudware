@@ -22,13 +22,19 @@ import time
 from pathlib import Path
 from typing import Any
 
-from services.plm import assist, gitbind, manifest, snapshot
+from services.plm import assist, doctypes, generic_snapshot, gitbind, manifest, snapshot
 from services.plm import history as hist  # aliased: Vault.history() method shadows the name
 from services.plm import items as items_mod
 from services.plm import summarize
 
 # document containers we version (contract §2)
 _CONTAINER_SUFFIXES = (".step+", ".ecad+")
+
+# versioned shadow-tree top-level dirs the container explode does not itself
+# own but that MUST survive every whole-tree commit (carry-forward law). The
+# planning store (aicad.planning/1) lives under planning/ and is written via a
+# dedicated path; without carry-forward it would drop out of any container save.
+_CARRY_FORWARD_TOPLEVEL = frozenset({"planning"})
 
 # doc-kind inference from container extension (best-effort; refined by document.json)
 _SUFFIX_KIND = {".step+": "part", ".ecad+": "ecad"}
@@ -121,24 +127,43 @@ class Vault:
     def history(self, item_id: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
         """Return the timeline (filtered per item if given) — contract §7 plm_history."""
         entries: list[dict[str, Any]] = []
-        item_path = None
-        if item_id is not None:
-            item_path = snapshot.item_prefix(item_id) + "document.json"
-        prev_tree: dict[str, bytes] | None = None
+        prev_sig: object | None = None
+        first = True
         commits = self._bind.log()
         for commit in commits:
             tree = self._bind.read_tree(commit)
-            # per-item filter: include only commits where this item's blob changed
-            if item_path is not None:
-                cur = tree.get(item_path)
-                if prev_tree is not None and prev_tree.get(item_path) == cur:
-                    prev_tree = tree
+            # per-item filter: include only commits where this item's content
+            # changed. CAD items key on document.json; generic (non-container)
+            # items key on their whole content-blob set (no document.json).
+            if item_id is not None:
+                cur = self._item_content_signature(tree, item_id)
+                if not first and cur == prev_sig:
+                    prev_sig = cur
                     continue
+                prev_sig = cur
+                first = False
             entries.append(self._entry_view(commit, tree, item_id))
-            prev_tree = tree
             if limit is not None and len(entries) >= limit:
                 break
         return entries
+
+    def _item_content_signature(self, tree: dict[str, bytes], item_id: str) -> object:
+        """A change signature for one item at a history point — the CAD
+        document.json blob, or (for generic items) the sorted content-blob map
+        excluding the per-commit-regenerated meta.json/summary.txt."""
+        p = snapshot.item_prefix(item_id)
+        doc = tree.get(p + "document.json")
+        if doc is not None:
+            return doc
+        sig: list[tuple[str, bytes]] = []
+        for path, data in tree.items():
+            if not path.startswith(p):
+                continue
+            tail = path[len(p):]
+            if tail in ("meta.json", "summary.txt"):
+                continue
+            sig.append((path, data))
+        return tuple(sorted(sig))
 
     # -- writing -----------------------------------------------------------
 
@@ -279,6 +304,112 @@ class Vault:
         self._commit_manifest_change(m)
         return {"item": items_mod.item_view(item), "entry": res["entry"]}
 
+    # -- generic (non-CAD) items: docs, code, linked repos (2026-07) --------
+
+    def add_item(self, rel_path: str, *, doc_type: str | None = None,
+                 part_number: str | None = None) -> dict[str, Any]:
+        """Track a non-CAD file or folder as a versioned item (contract §2).
+
+        CAD ``.step+``/``.ecad+`` containers are registered automatically on
+        save; this is the explicit "Track this file" path for everything else —
+        specs, reports, spreadsheets, images, simulation folders, source trees.
+        ``doc_type`` is auto-detected (:mod:`doctypes`) when omitted and is
+        always user-retaggable. Returns the item view.
+        """
+        m = self.manifest()
+        rel = str(rel_path).replace("\\", "/").lstrip("/")
+        if manifest.find_item_by_path(m, rel) is not None:
+            raise VaultError("invalid_mode", "that file is already tracked")
+        abs_path = self.project_dir / rel
+        dt = doc_type or doctypes.detect_doc_type(str(abs_path))
+        if dt in doctypes.CONTAINER_DOC_TYPES:
+            raise VaultError("invalid_mode",
+                             "design documents are tracked automatically when saved")
+        if not abs_path.exists():
+            raise VaultError("not_found", f"there is nothing to track at {rel}")
+        item = manifest.register_item(
+            m, kind=doctypes.kind_for(dt), path=rel, doc_type=dt)
+        if part_number:
+            try:
+                items_mod.set_part_number(m, item["item_id"], part_number)
+            except items_mod.ItemRuleError as e:
+                raise VaultError(e.reason, e.hint)
+        self._commit_manifest_change(m)
+        m = self.manifest()
+        return items_mod.item_view(manifest.find_item(m, item["item_id"]))
+
+    def untrack_item(self, item_id: str) -> dict[str, Any]:
+        """Stop tracking an item (forward-only: history keeps its old versions,
+        only the live registry drops it — a restore of an earlier point still
+        recovers it). Returns the removed item view."""
+        m = self.manifest()
+        try:
+            item = items_mod.untrack_item(m, item_id)
+        except items_mod.ItemRuleError as e:
+            raise VaultError(e.reason, e.hint)
+        self._commit_manifest_change(m)
+        return items_mod.item_view(item)
+
+    def link_repo(self, url: str, name: str,
+                  checkout_path: str | None = None) -> dict[str, Any]:
+        """Link an external source repository by reference (contract §2 link).
+
+        Stores only a reference (``link.json``) — never the code itself. At
+        release the current upstream version is pinned (best-effort). The
+        upstream version id is never surfaced to users as-is (contract §8.1).
+        ``checkout_path`` (a local working copy, for pinning) is a per-machine
+        detail recorded in the vault-local config, not the versioned tree.
+        """
+        url = str(url or "").strip()
+        name = str(name or "").strip() or "Linked code"
+        if not url:
+            raise VaultError("invalid_mode", "a link needs a location")
+        m = self.manifest()
+        item = manifest.register_item(
+            m, kind=doctypes.kind_for("linked_repo"), path=name, doc_type="linked_repo")
+        iid = item["item_id"]
+        inject = {iid: {generic_snapshot.link_path(iid):
+                        generic_snapshot.new_link_doc(url, name)}}
+        files = self._explode_project_into_shadow(
+            m, kind=hist.KIND_AUTO, message="", inject=inject)
+        author = _user_author()
+        emeta = gitbind.EntryMeta(
+            kind=hist.KIND_AUTO, message="",
+            author_name=author["display"], author_email=f'{author["id"]}@aicad.local')
+        self._bind.commit_tree(files, emeta)
+        if checkout_path:
+            self.set_local_config({"link_checkouts": {iid: str(checkout_path)}})
+        m = self.manifest()
+        return items_mod.item_view(manifest.find_item(m, iid))
+
+    # -- vault-local (per-machine, unversioned) config ----------------------
+
+    def get_local_config(self) -> dict[str, Any]:
+        """Per-machine settings kept beside the vault (never in the shadow tree,
+        never shared): visible columns, link checkout paths, last page. Returns
+        ``{}`` when none is set."""
+        import json as _json
+        cfg_path = self._bind.vault_dir / "config.json"
+        if not cfg_path.is_file():
+            return {}
+        try:
+            return _json.loads(cfg_path.read_text("utf-8"))
+        except Exception:
+            return {}
+
+    def set_local_config(self, patch: dict[str, Any]) -> dict[str, Any]:
+        """Merge *patch* into the vault-local config (one level deep for dicts)."""
+        import json as _json
+        cfg = self.get_local_config()
+        for k, v in (patch or {}).items():
+            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                cfg[k].update(v)
+            else:
+                cfg[k] = v
+        cfg_path = self._bind.vault_dir / "config.json"
+        cfg_path.write_text(_json.dumps(cfg, indent=2, sort_keys=True), "utf-8")
+        return cfg
+
     def _commit_manifest_change(self, m: dict[str, Any]) -> str:
         """Persist a manifest-only change as an auto entry (§3.1: the manifest
         is re-committed with every history entry)."""
@@ -348,7 +479,14 @@ class Vault:
         if item_id is not None and not targets:
             raise VaultError("invalid_item", f"no such item: {item_id}")
         for it in targets:
-            exploded = snapshot.read_item_from_tree(src_tree, it["item_id"])
+            dt = it.get("doc_type")
+            if dt and dt in doctypes.GENERIC_DOC_TYPES:
+                generic_snapshot.materialize(it, src_tree, self.project_dir)
+                continue
+            try:
+                exploded = snapshot.read_item_from_tree(src_tree, it["item_id"])
+            except KeyError:
+                continue  # item not present at that point (e.g. added later)
             container = snapshot.reassemble_container(exploded)
             (self.project_dir / it["path"]).write_bytes(container)
 
@@ -487,14 +625,21 @@ class Vault:
         author: dict[str, Any] | None = None, ai: dict[str, Any] | None = None,
         geometry_for: dict[str, bytes] | None = None,
         enforce_released_lock: bool = False,
+        inject: dict[str, dict[str, bytes]] | None = None,
     ) -> dict[str, bytes]:
         """Explode every project container into the shadow tree + manifest.
 
         Registers newly-seen containers into ``m`` (zero-config first check-in).
+        Generic (non-container) items are re-emitted here too, per the
+        carry-forward law (:mod:`generic_snapshot`) — a whole-tree commit that
+        omitted them would drop them from that point in history. Any versioned
+        sibling trees (e.g. ``planning/``) are carried forward verbatim.
         Returns the whole ``{path: bytes}`` shadow tree to commit.
         """
         author = author or _user_author()
         geometry_for = geometry_for or {}
+        inject = inject or {}
+        ai_block = ai if (ai and author.get("kind") == "ai") else None
         files: dict[str, bytes] = {}
         head = self._bind.head_commit()
         head_tree = self._bind.read_tree(head) if head else {}
@@ -518,7 +663,6 @@ class Vault:
             elif schema_kind and item["kind"] != schema_kind:
                 item["kind"] = schema_kind  # refine a suffix-guessed kind
             iid = item["item_id"]
-            ai_block = ai if (ai and author.get("kind") == "ai") else None
             meta_json = hist.make_meta(
                 item_id=iid, entry_kind=kind, authored_at=_now_iso(),
                 author_kind=author.get("kind", "user"), author_id=author["id"],
@@ -541,6 +685,46 @@ class Vault:
                 summary_txt=summary.encode("utf-8"),
                 geometry_step=geometry_for.get(iid),
             ))
+
+        # generic (non-container) items — the carry-forward law (contract §2):
+        # re-emit their content every commit (re-reading the working file, or
+        # carrying the HEAD blobs forward) so a whole-tree commit never drops
+        # them from that point in history.
+        for it in m["items"]:
+            dt = it.get("doc_type")
+            if not dt or dt in doctypes.CONTAINER_DOC_TYPES:
+                continue  # container item (handled above) or legacy CAD item
+            iid = it["item_id"]
+            injected = inject.get(iid)
+            content = (injected if injected is not None
+                       else generic_snapshot.content_paths(it, self.project_dir, head_tree))
+            old_content = generic_snapshot.head_content(iid, head_tree)
+            if enforce_released_lock and old_content and content != old_content:
+                try:
+                    items_mod.guard_released_edit(m, [iid])
+                except items_mod.ItemRuleError as e:
+                    raise VaultError(e.reason, e.hint)
+            summary = generic_snapshot.summarize(it, old_content, content)
+            meta_json = hist.make_meta(
+                item_id=iid, entry_kind=kind, authored_at=_now_iso(),
+                author_kind=author.get("kind", "user"), author_id=author["id"],
+                author_display=author["display"], message=message,
+                doc_uuid=it.get("doc_uuid", ""), rev=it.get("rev"),
+                lifecycle=it["lifecycle"], ai=ai_block,
+            )
+            p = snapshot.item_prefix(iid)
+            files.update(content)
+            files[p + "meta.json"] = meta_json
+            files[p + "summary.txt"] = summary.encode("utf-8")
+
+        # carry forward any versioned sibling trees the explode does not own
+        # (e.g. planning/ — written via the dedicated planning path). Whole-tree
+        # commits must include them or they vanish from that point in history.
+        for path, data in head_tree.items():
+            top = path.split("/", 1)[0]
+            if top in _CARRY_FORWARD_TOPLEVEL and path not in files:
+                files[path] = data
+
         files["manifest.json"] = manifest.dumps(m)
         return files
 
@@ -580,6 +764,11 @@ class Vault:
         tree = self._bind.read_tree(head)
         dirty: list[str] = []
         for it in m["items"]:
+            dt = it.get("doc_type")
+            if dt and dt in doctypes.GENERIC_DOC_TYPES:
+                if generic_snapshot.is_dirty(it, self.project_dir, tree):
+                    dirty.append(it["item_id"])
+                continue
             path = self.project_dir / it["path"]
             if not path.exists():
                 continue

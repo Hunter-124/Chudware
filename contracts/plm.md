@@ -478,3 +478,53 @@ control").
   git-vocabulary guard is the same normative rule as §8.1. No PLM-side schema is
   owed to the bridge beyond the §7.1 seam and the §3.4 `ai` block it fills.
 ```
+
+## Appendix B — additive extensions (2026-07, still `aicad.plm/1`)
+
+Per the frozen-seam policy (top of file), the following are **additive only** —
+new OPTIONAL fields and new tool slots. They do NOT change any existing field's
+meaning, the lifecycle machine, the lock/remote protocol, or the frozen
+`ITEM_KINDS` enum, so the schema string stays `aicad.plm/1`. Planning (below) is
+carried on its **own** schema `aicad.planning/1` in a sibling shadow-tree dir so
+this manifest schema is untouched.
+
+**B.1 Document-type taxonomy (`services/plm/doctypes.py`).** Each manifest item
+MAY carry an OPTIONAL `doc_type` refining its frozen `kind` without widening the
+enum. Absent `doc_type` = a legacy CAD item, read from `kind` as before (§4
+forward-tolerance). Values + the frozen `kind` each maps onto:
+
+| `doc_type` | maps to `kind` | shadow storage |
+|---|---|---|
+| part/assembly/drawing/ecad/cam | (same) | container explode (§2, unchanged) |
+| `spec` | requirements | `items/<id>/file/<name>` verbatim |
+| `report`/`datasheet`/`spreadsheet`/`dataset`/`image`/`document` | deliverable | `items/<id>/file/<name>` verbatim |
+| `sim_study`/`software` | deliverable | `items/<id>/tree/<rel>` + `tree.index.json` |
+| `linked_repo` | deliverable | `items/<id>/link.json` (`aicad.plm.link/1`, reference only) |
+
+`doc_type` detection is a *suggestion* (`detect_doc_type`), always user-retaggable
+via `plm_item_set`, and falls back to `document` — never an error.
+
+**B.2 The carry-forward law (normative for generic items).** Because a history
+commit is whole-tree (§2), generic-item blobs (`file/`, `tree/`, `link.json`) and
+any sibling versioned dir (e.g. `planning/`) MUST be re-emitted on **every**
+commit — re-read from the working copy when present, else carried forward from
+the prior tree verbatim. Omitting them drops them from that commit's tree and a
+later restore would lose them. `geometry.step` is the sole exception (release
+commits only, §5) and is never carried forward.
+
+**B.3 Additive tool slots** (worker seam + MCP, append-only per §7):
+
+| tool | request | response |
+|---|---|---|
+| `plm_item_list` | `{path, doc_type?, kind?}` | `{ok, items:[{…item view, doc_type?, dirty}]}` |
+| `plm_item_add` | `{path, file_path?\|folder_path?, doc_type?, part_number?}` | `{ok, item}` |
+| `plm_item_untrack` | `{path, item_id}` | `{ok, item}` (registry-only; history retained) |
+| `plm_link_repo` | `{path, url, name?, checkout_path?}` | `{ok, item}` |
+| `plm_where_used` | `{path, item_id, transitive?}` | `{ok, consumers}` (promotes the §7 reserved slot) |
+| `plm_settings_get`/`plm_settings_set` | `{path[, settings]}` | `{ok, settings}` (per-machine, unversioned) |
+| `plm_plan` | `{path, op, entity, data?, id?}` | `{ok, tasks\|issues\|milestones\|entity}` (planning — `aicad.planning/1`) |
+| `plm_overview` | `{path}` | `{ok, dirty_items, recent_entries, open_tasks, open_issues, next_milestone, head, ai_mode}` |
+
+`plm_history` additionally accepts an OPTIONAL `scope` (`design`\|`planning`\|`all`,
+default `design`); `plm_compare` returns `mode:"generic"` (with an optional
+`text_diff`) for generic items instead of `doc_diff`. Reason codes unchanged (§7).

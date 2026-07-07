@@ -45,6 +45,68 @@ def semantic_compare(doc_a: dict[str, Any], doc_b: dict[str, Any]) -> dict[str, 
             "summary": summarize.summarize_diff(diff, doc_a, doc_b)}
 
 
+def is_generic_item(vault: Any, item_id: str) -> bool:
+    """True when *item_id* is a non-container (generic) item — a doc/code/link
+    item that has no ``document.json`` to semantic-diff."""
+    from services.plm import doctypes
+
+    m = vault.manifest()
+    from services.plm import manifest as manifest_mod
+
+    it = manifest_mod.find_item(m, item_id)
+    dt = (it or {}).get("doc_type")
+    return bool(dt and dt in doctypes.GENERIC_DOC_TYPES)
+
+
+def generic_compare(vault: Any, commit_a: str, commit_b: str,
+                    item_id: str) -> dict[str, Any]:
+    """Compare a generic item between two history points (contract §2 sibling
+    content). Returns ``{mode:"generic", summary, text_diff?}`` — a plain-language
+    line always, plus a unified text diff when both versions are text.
+    """
+    import difflib
+
+    from services.plm import generic_snapshot
+    from services.plm import manifest as manifest_mod
+    from services.plm.vault import VaultError
+
+    try:
+        tree_a = vault._bind.read_tree(commit_a)
+        tree_b = vault._bind.read_tree(commit_b)
+    except KeyError:
+        raise VaultError("not_found", "one of those points in history could not be found")
+    old = generic_snapshot.head_content(item_id, tree_a)
+    new = generic_snapshot.head_content(item_id, tree_b)
+    if not old and not new:
+        raise VaultError("invalid_item", "that item is not present at one of those points")
+    item = manifest_mod.find_item(vault.manifest(), item_id) or {"path": item_id,
+                                                                 "item_id": item_id}
+    out: dict[str, Any] = {"mode": "generic",
+                           "summary": generic_snapshot.summarize(item, old, new)}
+    # a single-file text item gets a readable unified diff
+    if len(old) <= 1 and len(new) <= 1:
+        a_bytes = next(iter(old.values()), b"")
+        b_bytes = next(iter(new.values()), b"")
+        a_txt = _as_text(a_bytes)
+        b_txt = _as_text(b_bytes)
+        if a_txt is not None and b_txt is not None:
+            diff = difflib.unified_diff(
+                a_txt.splitlines(), b_txt.splitlines(),
+                fromfile="before", tofile="after", lineterm="")
+            out["text_diff"] = "\n".join(diff)
+    return out
+
+
+def _as_text(data: bytes) -> str | None:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if "\x00" in text:
+        return None
+    return text
+
+
 def docs_at(vault: Any, commit_a: str, commit_b: str,
             item_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """Load one item's parsed document at two history points.

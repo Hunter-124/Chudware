@@ -103,8 +103,15 @@ def next_part_number(manifest: dict[str, Any]) -> str:
     return f"{prefix}-{n:04d}"
 
 
-def register_item(manifest: dict[str, Any], *, doc_uuid: str, kind: str, path: str) -> dict[str, Any]:
-    """Register a new item at first check-in; returns the new item dict."""
+def register_item(manifest: dict[str, Any], *, kind: str, path: str,
+                  doc_uuid: str = "", doc_type: str | None = None) -> dict[str, Any]:
+    """Register a new item at first check-in; returns the new item dict.
+
+    ``doc_uuid`` is empty for docless generic items (a spec PDF, a source tree —
+    they have no document UUID). ``doc_type`` is the OPTIONAL 2026-07 taxonomy
+    refinement (:mod:`doctypes`); it is added to the item ONLY when given so
+    legacy CAD items stay byte-identical (forward-tolerance, contract §4).
+    """
     if kind not in ITEM_KINDS:
         kind = "part"
     item = {
@@ -117,6 +124,8 @@ def register_item(manifest: dict[str, Any], *, doc_uuid: str, kind: str, path: s
         "lifecycle": LIFECYCLE_IN_WORK,
         "released_revs": [],
     }
+    if doc_type:
+        item["doc_type"] = doc_type
     manifest["items"].append(item)
     return item
 

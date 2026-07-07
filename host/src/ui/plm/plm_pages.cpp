@@ -619,9 +619,220 @@ void plmDrawSettingsPage(AppState& st) {
     }
 }
 
-// ---- staged placeholders (Phase 5) --------------------------------------------
+// ---- Planning (kanban + milestones) -------------------------------------------
 
-void plmDrawPlanningPage(AppState&) { plmComingSoon("Planning", "Task board and milestones."); }
-void plmDrawIssuesPage(AppState&)   { plmComingSoon("Issues",   "Issue log linked to items and revisions."); }
+namespace {
+
+void planCall(AppState& st, const char* op, const char* entity,
+              const nlohmann::json& data, const std::string& id = "") {
+    auto& H = g_plmHub;
+    if (H.busy) return;
+    H.busy = true;
+    nlohmann::json p = pathParam(st);
+    p["op"] = op;
+    p["entity"] = entity;
+    if (!data.is_null()) p["data"] = data;
+    if (!id.empty()) p["id"] = id;
+    st.rpc.call("plm_plan", p, [&st](const core::RpcResult& r) {
+        g_plmHub.busy = false;
+        if (!r.ok) { st.toast(ui::ToastLevel::Error, r.err); return; }
+        plmInvalidate();
+    });
+}
+
+void priorityTag(const std::string& pr) {
+    const float* c = palette.textDim;
+    if (pr == "p0" || pr == "p1") c = palette.statusWarn;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], 1.0f));
+    ImGui::Text("[%s]", pr.empty() ? "p2" : pr.c_str());
+    ImGui::PopStyleColor();
+}
+
+static std::string s_selTask;
+
+}  // namespace
+
+void plmDrawPlanningPage(AppState& st) {
+    auto& H = g_plmHub;
+    const float S = ui::uiScale;
+    plmEnsurePlanning(st);
+
+    plmSectionHeader("Planning");
+    // add a task
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
+    ImGui::SetNextItemWidth(-120 * S);
+    bool enter = ImGui::InputTextWithHint("##newtask", "new task title\xe2\x80\xa6",
+        H.newTaskTitle, sizeof(H.newTaskTitle), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::PopStyleVar();
+    ImGui::SameLine();
+    accentButtonColors();
+    if ((ImGui::Button("Add task", ImVec2(110 * S, 0)) || enter) && H.newTaskTitle[0]) {
+        planCall(st, "create", "task", {{"title", H.newTaskTitle}});
+        H.newTaskTitle[0] = '\0';
+    }
+    ImGui::PopStyleColor(2);
+    if (!H.planErr.empty()) plmError(H.planErr);
+    ImGui::Spacing();
+
+    // kanban columns
+    struct Col { const char* id; const char* label; };
+    static const Col kCols[] = {
+        {"todo", "To do"}, {"doing", "Doing"}, {"done", "Done"}, {"blocked", "Blocked"},
+    };
+    ImGui::Columns(4, "##kanban", true);
+    for (const auto& col : kCols) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
+        ImGui::TextUnformatted(col.label);
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+        for (const auto& t : H.allTasks) {
+            if (t.status != col.id) continue;
+            ImGui::PushID(t.id.c_str());
+            bool sel = (s_selTask == t.id);
+            plmRowPill(sel, sel ? 3.2f : 1.8f);
+            ImGui::BeginGroup();
+            priorityTag(t.priority);
+            ImGui::SameLine();
+            ImGui::TextWrapped("%s", t.title.c_str());
+            if (!t.assignee.empty()) dimText("  @%s", t.assignee.c_str());
+            ImGui::EndGroup();
+            if (ImGui::IsItemClicked()) s_selTask = sel ? "" : t.id;
+            if (sel) {
+                // move-to buttons (reliable alternative to drag-drop)
+                for (const auto& dest : kCols) {
+                    if (std::strcmp(dest.id, col.id) == 0) continue;
+                    if (ImGui::SmallButton(dest.label))
+                        planCall(st, "update", "task", {{"status", dest.id}}, t.id);
+                    ImGui::SameLine();
+                }
+                ImGui::PushStyleColor(ImGuiCol_Button,
+                    ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 0.5f));
+                if (ImGui::SmallButton("Delete"))
+                    planCall(st, "delete", "task", nullptr, t.id);
+                ImGui::PopStyleColor();
+            }
+            ImGui::Spacing();
+            ImGui::PopID();
+        }
+        ImGui::NextColumn();
+    }
+    ImGui::Columns(1);
+
+    // milestones lane
+    ImGui::Dummy(ImVec2(0, 8 * S));
+    plmSectionHeader("Milestones");
+    static char s_msTitle[160] = {};
+    static char s_msDue[32] = {};
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
+    ImGui::SetNextItemWidth(220 * S);
+    ImGui::InputTextWithHint("##msTitle", "milestone", s_msTitle, sizeof(s_msTitle));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120 * S);
+    ImGui::InputTextWithHint("##msDue", "due (YYYY-MM-DD)", s_msDue, sizeof(s_msDue));
+    ImGui::PopStyleVar();
+    ImGui::SameLine();
+    if (ImGui::Button("Add milestone") && s_msTitle[0]) {
+        nlohmann::json d = {{"title", s_msTitle}};
+        if (s_msDue[0]) d["due"] = s_msDue;
+        planCall(st, "create", "milestone", d);
+        s_msTitle[0] = '\0'; s_msDue[0] = '\0';
+    }
+    for (const auto& m : H.milestones) {
+        ImGui::PushID(m.id.c_str());
+        plmRowPill(false, 1.2f);
+        bool done = (m.status == "done");
+        ImGui::PushStyleColor(ImGuiCol_Text, done
+            ? ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f)
+            : ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+        ImGui::Text(done ? "[x]" : "[ ]");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::Text("%s", m.title.c_str());
+        if (!m.due.empty()) { ImGui::SameLine(); dimText("  due %s", m.due.c_str()); }
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 70 * S);
+        if (ImGui::SmallButton(done ? "Reopen" : "Complete"))
+            planCall(st, "update", "milestone",
+                     {{"status", done ? "open" : "done"}}, m.id);
+        ImGui::PopID();
+    }
+}
+
+// ---- Issues -------------------------------------------------------------------
+
+namespace {
+static std::string s_selIssue;
+
+void severityBadge(const std::string& sev) {
+    const float* c = palette.textDim;
+    if (sev == "critical" || sev == "high") c = palette.statusErr;
+    else if (sev == "med") c = palette.statusWarn;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], 1.0f));
+    ImGui::Text("[%s]", sev.empty() ? "med" : sev.c_str());
+    ImGui::PopStyleColor();
+}
+}  // namespace
+
+void plmDrawIssuesPage(AppState& st) {
+    auto& H = g_plmHub;
+    const float S = ui::uiScale;
+    plmEnsurePlanning(st);
+
+    plmSectionHeader("Issues");
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
+    ImGui::SetNextItemWidth(-120 * S);
+    bool enter = ImGui::InputTextWithHint("##newissue", "describe an issue\xe2\x80\xa6",
+        H.newIssueTitle, sizeof(H.newIssueTitle), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::PopStyleVar();
+    ImGui::SameLine();
+    accentButtonColors();
+    if ((ImGui::Button("Log issue", ImVec2(110 * S, 0)) || enter) && H.newIssueTitle[0]) {
+        planCall(st, "create", "issue", {{"title", H.newIssueTitle}});
+        H.newIssueTitle[0] = '\0';
+    }
+    ImGui::PopStyleColor(2);
+    if (!H.planErr.empty()) plmError(H.planErr);
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (H.issues.empty()) {
+        plmEmptyState("[!]", "No issues logged",
+                      "Track bugs and defects here, linked to the items they affect.");
+        return;
+    }
+    for (const auto& is : H.issues) {
+        ImGui::PushID(is.id.c_str());
+        bool sel = (s_selIssue == is.id);
+        bool closed = (is.state == "closed");
+        plmRowPill(sel, sel ? 2.6f : 1.4f);
+        severityBadge(is.severity);
+        ImGui::SameLine();
+        if (closed) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                       palette.textDisabled[2], 1.0f));
+            ImGui::Text("(closed) %s", is.title.c_str());
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::Text("%s", is.title.c_str());
+        }
+        if (ImGui::IsItemClicked()) s_selIssue = sel ? "" : is.id;
+        if (sel) {
+            ImGui::Indent(16 * S);
+            if (ImGui::SmallButton(closed ? "Reopen" : "Close issue"))
+                planCall(st, "update", "issue",
+                         {{"state", closed ? "open" : "closed"}}, is.id);
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 0.5f));
+            if (ImGui::SmallButton("Delete"))
+                planCall(st, "delete", "issue", nullptr, is.id);
+            ImGui::PopStyleColor();
+            ImGui::Unindent(16 * S);
+        }
+        ImGui::Spacing();
+        ImGui::PopID();
+    }
+}
 
 }  // namespace ui

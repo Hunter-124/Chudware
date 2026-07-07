@@ -1345,7 +1345,7 @@ static void drawMilestoneRow(AppState& st, const PlmMilestoneRow& m) {
         ImGui::PopTextWrapPos();
         // action row (due date rides inline on the right so the row stays compact)
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 3 * S));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 1 * S));
         if (ImGui::SmallButton("Edit")) {
             H.msEditId = m.id;
             std::snprintf(H.msEditTitle, sizeof(H.msEditTitle), "%s", m.title.c_str());
@@ -1392,8 +1392,12 @@ static void drawIssueRow(AppState& st, const PlmIssueRow& is) {
     if (is.severity == "critical" || is.severity == "high") sc = palette.statusErr;
     else if (is.severity == "med") sc = palette.statusWarn;
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(sc[0], sc[1], sc[2], 1.0f));
+    // Match plmCopyText's frame padding (2px) so the badge frame height equals the
+    // title field's — otherwise the [sev] tag sits above the title text baseline.
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 2 * S));
     ImGui::AlignTextToFramePadding();
     ImGui::Text("[%s]", is.severity.empty() ? "med" : is.severity.c_str());
+    ImGui::PopStyleVar();
     ImGui::PopStyleColor();
     ImGui::SameLine();
     if (closed) {
@@ -1402,7 +1406,7 @@ static void drawIssueRow(AppState& st, const PlmIssueRow& is) {
         plmCopyText("##ist", is.title);
     }
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 3 * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 1 * S));
     accentButtonColors();
     if (ImGui::SmallButton("Make plan")) {
         nlohmann::json d = {{"title", is.title},
@@ -1606,9 +1610,8 @@ void plmDrawPlanningPage(AppState& st) {
             int idx = -1;
             for (int k = 0; k < 3; ++k) if (t.status == kPipe[k]) idx = k;
             bool blocked = (idx < 0);
-            ImGui::Dummy(ImVec2(0, 2 * S));   // nudge the control row + dot down
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 3 * S));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 1 * S));
             // ArrowButton draws a real triangle (font-independent — the ‹ › glyphs
             // were not in the atlas and rendered blank); the tight FramePadding
             // above shrinks its square to a compact size.

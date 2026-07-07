@@ -1614,11 +1614,24 @@ def run_mission(
             # into the default tool-executing agent_fn so every node turn's tool
             # calls / handoffs land as agent_turn events (inspectability half of
             # the execution-reality contract).
+            #
+            # Provider-leak fix: *provider* is ALSO threaded through here so every
+            # internal DAG node reuses the SAME provider this mission was started
+            # on. Before this fix, node_runner independently re-resolved a provider
+            # via the bare config.get_provider() for every node, silently ignoring
+            # whatever provider run_mission() was called with — a mission started
+            # on a local tier (e.g. the gym's bundled qwen3-4b) would still leak
+            # every internal node (overseer-audit, build, deliver, ...) to the
+            # ambient config.json / AI_CAD_PROVIDER cloud default. Building this
+            # (rather than falling straight through to the executor's own default)
+            # no longer requires a ledger — it is unconditional so the fix applies
+            # even when the ledger layer is disabled/unavailable.
             effective_agent_fn = agent_fn
-            if effective_agent_fn is None and ledger is not None:
+            if effective_agent_fn is None:
                 try:
                     from services.dag import node_runner as _node_runner
-                    effective_agent_fn = _node_runner.make_default_agent_fn(ledger=ledger)
+                    effective_agent_fn = _node_runner.make_default_agent_fn(
+                        ledger=ledger, provider=provider)
                 except Exception:  # noqa: BLE001 — fall back to executor default
                     effective_agent_fn = None
             dag_result = _dag_exec.run(

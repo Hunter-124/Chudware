@@ -29,6 +29,7 @@ def register_mission_tools(mcp) -> None:
         manifest: Optional[dict] = None,
         run_id: Optional[str] = None,
         autonomy_default: str = "approve",
+        tier: Optional[str] = None,
     ) -> dict:
         """Plan a mission: validate the deliverable manifest and compile the
         role-assigned mission DAG (does NOT execute — call dag_run to run it).
@@ -40,6 +41,17 @@ def register_mission_tools(mcp) -> None:
 
         A blocking ambiguity or an invalid manifest returns ``ok=False`` with the
         validator findings and the block reason — the mission never fabricates a graph.
+
+        ``tier`` (optional): a model tier (``local-24k`` / ``local-48k`` / ``mid`` /
+        ``frontier``) to pin EVERY node of the compiled graph to. This MCP path has no
+        in-hand Provider object (unlike the in-app ``run_mission(request, provider,
+        ...)``, whose own provider is now threaded into every internal DAG node), so a
+        tier recorded here is how ``dag_run`` keeps this mission on the requested
+        tier's provider (resolved via ``services.agent.tiers.provider_for_tier`` —
+        e.g. a ``local-*`` tier stays on the bundled local model instead of silently
+        leaking to the ambient config.json / ``AI_CAD_PROVIDER`` cloud default).
+        Omitting it (the default) produces exactly the graph this tool has always
+        returned — no behaviour change.
         """
         from services.agent.pipeline import (
             validate_manifest, manifest_valid, blocking_ambiguities)
@@ -66,7 +78,8 @@ def register_mission_tools(mcp) -> None:
 
         gid = run_id or "mission"
         graph = build_mission_graph(manifest, graph_id=gid,
-                                    default_autonomy=autonomy_default)
+                                    default_autonomy=autonomy_default,
+                                    tier=tier)
         return {
             "ok": True,
             "run_id": gid,

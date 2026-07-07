@@ -95,7 +95,8 @@ class _StubAgentResult:
 
 
 def make_default_agent_fn(ledger=None,
-                          mission_dispatch=None) -> "Callable[[str, dict[str, Any]], Any]":
+                          mission_dispatch=None,
+                          provider=None) -> "Callable[[str, dict[str, Any]], Any]":
     """Return the default tool-executing agent_fn with *ledger* bound (T-W30).
 
     The mission pipeline (loop.run_mission) uses this to thread its run ledger
@@ -103,6 +104,22 @@ def make_default_agent_fn(ledger=None,
     ``agent_turn`` events — the inspectability half of the execution-reality
     contract.  A standalone DAG run (no ledger) gets the same behaviour minus
     the events.
+
+    *provider* (optional): when given, EVERY node run through the returned
+    agent_fn uses this exact provider instance instead of re-resolving one from
+    ambient config. This is the fix for the historical mission-tier leak:
+    ``loop.run_mission(request, provider, ...)`` already resolves the provider
+    the mission should run on (e.g. a gym cell's bundled local-tier model), but
+    previously only used it for INTAKE — every internal DAG node independently
+    called the bare ``config.get_provider()`` here and silently fell through to
+    the ambient config.json / ``AI_CAD_PROVIDER`` default (typically a cloud
+    provider), regardless of the tier the mission was started with.
+    ``loop.run_mission`` now passes its own *provider* through to this
+    constructor so internal nodes stay on it. Callers that build a graph
+    without an in-hand Provider object (mission_start/dag_run over MCP) can
+    instead record a ``tier`` on the node/graph inputs — see
+    ``_resolve_provider`` below, which falls back to
+    ``services.agent.tiers.provider_for_tier`` for that path.
 
     T-W32: when a *ledger* is bound and no explicit *mission_dispatch* is given,
     a run-scoped :class:`services.agent.mission_dispatch.MissionDispatch` is built
@@ -120,23 +137,53 @@ def make_default_agent_fn(ledger=None,
 
     def _agent_fn(request: str, context_pack: dict[str, Any]) -> Any:
         return _default_agent_fn(request, context_pack, ledger=ledger,
-                                 mission_dispatch=mission_dispatch)
+                                 mission_dispatch=mission_dispatch,
+                                 provider=provider)
     return _agent_fn
 
 
+def _resolve_provider(context_pack: dict[str, Any], provider=None):
+    """Resolve the provider for one node's agent turn.
+
+    Priority (highest first):
+      1. *provider* — injected by the caller (``make_default_agent_fn(provider=...)``,
+         which ``loop.run_mission`` uses to thread its OWN already-resolved provider
+         into every internal node — the direct fix for a mission started on a
+         local tier leaking internal nodes to the ambient cloud default).
+      2. A ``tier`` recorded on this node (``node_inputs['tier']``, set by
+         ``mission_template.build_mission_graph(tier=...)`` when a caller compiles
+         the graph with a tier but has no Provider object in hand — e.g.
+         ``mission_start(tier=...)`` over MCP followed by ``dag_run``) or on the
+         context pack directly. Resolved via the single shared
+         ``services.agent.tiers.provider_for_tier`` seam (also used by the gym).
+      3. The ambient ``config.get_provider()`` default — UNCHANGED behaviour for
+         any node whose graph/caller specifies neither a provider nor a tier.
+    """
+    if provider is not None:
+        return provider
+    node_inputs = context_pack.get("node_inputs") or {}
+    tier = node_inputs.get("tier") or context_pack.get("tier")
+    if tier:
+        from services.agent.tiers import provider_for_tier  # noqa: PLC0415
+        return provider_for_tier(tier)
+    from services.agent import config  # noqa: PLC0415 — real import, no wrong name
+    return config.get_provider()
+
+
 def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
-                      ledger=None, mission_dispatch=None) -> Any:
+                      ledger=None, mission_dispatch=None, provider=None) -> Any:
     """Run a real tool-executing agent turn for this DAG node (T-W30).
 
-    Resolves the provider from the agent config seam (``config.get_provider`` —
-    honours ``AI_CAD_PROVIDER`` / routing.yaml / the local llama.cpp default), then
-    runs a bounded tool-calling turn (``agent_turn.run_turn``): the model proposes
-    MCP tool calls, they are dispatched against the live engine, results are fed
-    back, and a structured handoff is returned.  The node's ``allowed_tools`` scope
-    the callable tools.
+    Resolves the provider via ``_resolve_provider`` (an injected provider, else a
+    node/graph-recorded tier via ``tiers.provider_for_tier``, else the ambient
+    ``config.get_provider`` seam — honours ``AI_CAD_PROVIDER`` / routing.yaml /
+    the local llama.cpp default), then runs a bounded tool-calling turn
+    (``agent_turn.run_turn``): the model proposes MCP tool calls, they are
+    dispatched against the live engine, results are fed back, and a structured
+    handoff is returned.  The node's ``allowed_tools`` scope the callable tools.
 
-    Provider resolution is the actual fix for the historical silent-stub bug: the
-    old code imported ``services.agent.providers.anthropic`` (wrong module name —
+    Provider resolution is also the actual fix for the historical silent-stub bug:
+    the old code imported ``services.agent.providers.anthropic`` (wrong module name —
     the module is ``anthropic_provider``), so the import ALWAYS failed and every
     "live" node degraded to ``_StubAgentResult``.  We now import the real seam.
 
@@ -144,12 +191,11 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
     server and no API key): return a NON-success stub so the node ESCALATES rather
     than silently reporting a fabricated success.  A raised exception is surfaced by
     ``run()`` as an escalate verdict."""
-    from services.agent import config  # noqa: PLC0415 — real import, no wrong name
     from services.agent import agent_turn  # noqa: PLC0415
 
     node_name = context_pack.get("node_name", "dag_node")
     try:
-        provider = config.get_provider()
+        resolved_provider = _resolve_provider(context_pack, provider)
     except Exception as exc:  # noqa: BLE001 — no constructible provider
         # Do NOT return a confirmed stub: that is the fabrication bug. Signal a
         # non-success so the node escalates and the failure is visible.
@@ -192,7 +238,7 @@ def _default_agent_fn(request: str, context_pack: dict[str, Any], *,
             tools_text = None
 
     return agent_turn.run_turn(
-        request=request, provider=provider, name=node_name,
+        request=request, provider=resolved_provider, name=node_name,
         allowed_tools=allowed_tools,
         system_prompt=context_pack.get("role_system_prompt"),
         max_tool_calls=max_tools,

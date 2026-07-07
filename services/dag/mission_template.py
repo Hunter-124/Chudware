@@ -147,6 +147,7 @@ def build_mission_graph(
     is_assembly: Optional[bool] = None,
     org_layer: bool = False,
     default_autonomy: str = "auto",
+    tier: Optional[str] = None,
 ) -> dict[str, Any]:
     """Compile a validated deliverable manifest into an ``aicad.dag/1`` mission graph.
 
@@ -162,6 +163,17 @@ def build_mission_graph(
         org_layer:       insert the ORGANIZE (department_manager) node (Phase 2.5,
                          feature-flagged on T-W22/T-W23).
         default_autonomy: node autonomy floor ("auto" | "approve" | "manual").
+        tier:            optional model tier (``local-24k`` / ``local-48k`` / ``mid`` /
+                         ``frontier``) recorded on EVERY node's ``inputs.tier``. This is
+                         the plumbing a caller with no in-hand Provider object uses to
+                         pin the mission to a tier (e.g. ``mission_start(tier=...)``
+                         over MCP, followed by ``dag_run``): ``services.dag.node_runner``
+                         reads ``inputs.tier`` and resolves it via
+                         ``services.agent.tiers.provider_for_tier`` — the same seam the
+                         gym bench (T-DP19) uses — instead of silently falling through
+                         to the ambient config.json / ``AI_CAD_PROVIDER`` default.
+                         ``None`` (the default) leaves every node's ``inputs`` exactly
+                         as before — no behaviour change for callers that don't pass it.
 
     Returns:
         An ``aicad.dag/1`` graph dict (validated).  Raises ``GraphValidationError``
@@ -320,6 +332,15 @@ def build_mission_graph(
         # on its SPEC (e.g. a report deliverable with no build node).
         upstream = verify_ids.get(did) or spec_ids.get(did) or plan_id
         edges.append({"from": upstream, "to": del_id})
+
+    # Record the tier on EVERY node's inputs (best-effort, additive only) so
+    # node_runner can resolve the matching provider per-node when no Provider
+    # object is threaded in directly (the mission_start/dag_run MCP path — see
+    # the ``tier`` arg docstring above). A caller that omits ``tier`` gets
+    # exactly the graph this function has always produced.
+    if tier:
+        for n in nodes:
+            n.setdefault("inputs", {})["tier"] = tier
 
     graph = {
         "schema": "aicad.dag/1",

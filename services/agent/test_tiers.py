@@ -289,6 +289,84 @@ class TestTierDetect:
 
 
 # ---------------------------------------------------------------------------
+# tier -> provider resolution (the node_runner / gym T-DP19 shared seam)
+
+class TestProviderForTier:
+    """``provider_for_tier`` is the single tier->provider resolution seam shared
+    by services.dag.node_runner and the gym bench (T-DP19). It must:
+      * route local-* tiers to the bundled local model (never the ambient
+        default), unless AI_CAD_PROVIDER overrides;
+      * leave every non-local tier (and no tier at all) on the ordinary
+        config.get_provider() resolution — no behaviour change there."""
+
+    def test_non_local_tier_falls_through_to_ambient_default(self, monkeypatch):
+        from . import config as agent_config
+        from .tiers import provider_for_tier
+
+        calls = []
+
+        def _tracked(name=None, cfg=None):
+            calls.append((name, cfg))
+            return "ambient-provider"
+
+        monkeypatch.setattr(agent_config, "get_provider", _tracked)
+        result = provider_for_tier("frontier")
+        assert result == "ambient-provider"
+        assert calls == [(None, None)]
+
+    def test_no_tier_falls_through_to_ambient_default(self, monkeypatch):
+        from . import config as agent_config
+        from .tiers import provider_for_tier
+
+        monkeypatch.setattr(agent_config, "get_provider",
+                            lambda name=None, cfg=None: "ambient-provider")
+        assert provider_for_tier(None) == "ambient-provider"
+
+    def test_local_tier_resolves_bundled_local_model(self, monkeypatch):
+        from . import config as agent_config
+        from . import model_manager
+        from .tiers import provider_for_tier
+
+        monkeypatch.delenv("AI_CAD_PROVIDER", raising=False)
+        monkeypatch.setattr(model_manager, "get_model_path",
+                            lambda model_id: Path("/models/qwen3-4b.gguf"))
+
+        calls = []
+
+        def _tracked(name=None, cfg=None):
+            calls.append((name, cfg))
+            return "local-provider"
+
+        monkeypatch.setattr(agent_config, "get_provider", _tracked)
+        result = provider_for_tier("local-24k")
+        assert result == "local-provider"
+        assert len(calls) == 1
+        name, cfg = calls[0]
+        assert name == "llamacpp"
+        assert cfg["llamacpp"]["model"] == "qwen3-4b"
+        assert cfg["llamacpp"]["model_path"] == "/models/qwen3-4b.gguf"
+
+    def test_ai_cad_provider_env_override_wins_even_for_local_tier(self, monkeypatch):
+        """A human forcing AI_CAD_PROVIDER (e.g. to point a 'local' tier cell at a
+        frontier key for comparison, or a test pinning 'mock') always wins over
+        the local-tier bundled-model resolution."""
+        from . import config as agent_config
+        from .tiers import provider_for_tier
+
+        monkeypatch.setenv("AI_CAD_PROVIDER", "mock")
+        calls = []
+
+        def _tracked(name=None, cfg=None):
+            calls.append((name, cfg))
+            return "mock-provider"
+
+        monkeypatch.setattr(agent_config, "get_provider", _tracked)
+        result = provider_for_tier("local-24k")
+        assert result == "mock-provider"
+        assert calls == [(None, None)]
+
+
+# ---------------------------------------------------------------------------
 # Grammar routing tests
 
 class TestGrammarRouting:

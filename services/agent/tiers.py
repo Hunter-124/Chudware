@@ -238,6 +238,56 @@ def load_local_models(*, path: Path | None = None) -> dict:
     return dict(block)
 
 
+# --------------------------------------------------------------------------- tier -> provider
+
+def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
+    """Resolve the :class:`Provider` a *tier* should run on.
+
+    This is the SINGLE tier->provider resolution seam shared by the DAG node
+    runner (``services.dag.node_runner``) and the gym bench (T-DP19's
+    ``_provider_for_tier``) — both used to carry their own copy of this logic,
+    which is exactly how the node_runner half of the bug went unfixed: the
+    gym worked around it locally for gym cells only, while every OTHER caller
+    of missions (mission_start/dag_run, or run_mission called directly) kept
+    silently leaking internal DAG nodes to the ambient config.json /
+    AI_CAD_PROVIDER default.
+
+    A ``local-*`` tier (``local-24k`` / ``local-48k``) MUST run on the bundled
+    local model (tiers.yaml ``local_models.fanout``, currently ``qwen3-4b``)
+    rather than falling through to the ambient default — otherwise a "local"
+    tier run is meaningless (it silently answers from a cloud model).
+
+    An explicit ``AI_CAD_PROVIDER`` env override always wins (tests pin it to
+    ``mock``; a human can force a frontier key even for a nominally local
+    tier run). Every non-local tier (``mid`` / ``frontier`` / ``None``/unset)
+    falls straight through to the ordinary ``config.get_provider()``
+    resolution — behaviour is UNCHANGED for any caller that does not pass a
+    tier at all, which is the point: this is a targeted fix, not a change to
+    cloud-default usage.
+
+    Raises whatever the underlying provider construction raises (e.g. no
+    bundled model weights on this machine) — callers fail closed, they never
+    silently fall back to a cloud provider on a resolution error.
+    """
+    import os
+
+    from services.agent import config as _config
+
+    if not tier or os.environ.get("AI_CAD_PROVIDER") or not tier.startswith("local"):
+        return _config.get_provider(cfg=cfg)
+
+    local_models = load_local_models()
+    model_id = local_models.get("fanout") or "qwen3-4b"
+    from services.agent import model_manager
+    model_path = str(model_manager.get_model_path(model_id))
+    merged_cfg = dict(cfg or {})
+    merged_cfg["llamacpp"] = {**(merged_cfg.get("llamacpp") or {}),
+                              "model_path": model_path, "model": model_id}
+    # llamacpp (not openai) so structured-output nodes get GBNF grammars, which
+    # the local-24k/local-48k tiers require (tiers.yaml structured_output: gbnf).
+    return _config.get_provider("llamacpp", cfg=merged_cfg)
+
+
 # --------------------------------------------------------------------------- tier detection
 
 def detect_tier(context_length: int) -> str:

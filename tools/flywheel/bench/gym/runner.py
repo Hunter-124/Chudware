@@ -376,12 +376,20 @@ def run_cell(challenge: Challenge, tier: str, seed: int, *, cycle: str,
 # T-DP19: local-tier cells must run on the bundled local model, not on whatever
 # config.json defaults to. Started once and cached (VRAM is finite — a fresh server per
 # cell OOMs the GPU; the llamacpp provider reuses its fixed-port server across cells).
+#
+# Resolution itself now delegates to services.agent.tiers.provider_for_tier — the
+# SINGLE tier->provider seam shared with services.dag.node_runner (the node_runner
+# fix for the twin half of T-DP19: internal DAG nodes used to independently
+# re-resolve a bare ambient provider and ignore whatever tier/provider the mission
+# was started with; only the gym had a local workaround, and only for gym cells).
+# This function is kept as a thin, gym-specific wrapper purely for the VRAM cache
+# below — the tier->provider mapping itself is no longer duplicated here.
 _LOCAL_PROVIDER_CACHE: dict[str, Any] = {}
 _TIER_LOCAL_MODEL = "qwen3-4b"  # the bundled CUDA model the tuning loop benchmarks (tiers.yaml local_models.fanout)
 
 
 def _provider_for_tier(tier: str):
-    """Resolve the provider a gym cell runs on.
+    """Resolve the provider a gym cell runs on (cached per model id for VRAM reuse).
 
     A ``local-*`` cell MUST run on the bundled local model — otherwise the ambient
     config.json (a cloud provider) silently answers and a ``local-24k`` benchmark is
@@ -390,19 +398,21 @@ def _provider_for_tier(tier: str):
 
     An explicit ``AI_CAD_PROVIDER`` override always wins — tests set it to ``mock``; a
     human can force a frontier key for a frontier-tier comparison. Non-local tiers fall
-    through to the default resolution."""
+    through to the default resolution. Actual tier->provider resolution is delegated to
+    ``services.agent.tiers.provider_for_tier`` (shared with node_runner); only the
+    llama.cpp-server VRAM cache is gym-specific."""
     import os
     from services.agent import config
+    from services.agent.tiers import load_local_models, provider_for_tier
     if os.environ.get("AI_CAD_PROVIDER") or not tier.startswith("local"):
         return config.get_provider()
-    model_id = _TIER_LOCAL_MODEL
+    try:
+        model_id = load_local_models().get("fanout") or _TIER_LOCAL_MODEL
+    except Exception:  # noqa: BLE001 — best-effort cache key, falls back to the constant
+        model_id = _TIER_LOCAL_MODEL
     prov = _LOCAL_PROVIDER_CACHE.get(model_id)
     if prov is None:
-        from services.agent import model_manager
-        mp = str(model_manager.get_model_path(model_id))
-        # llamacpp (not openai) so structured-output nodes get GBNF grammars, which the
-        # local-24k tier requires (tiers.yaml structured_output: gbnf).
-        prov = config.get_provider("llamacpp", cfg={"llamacpp": {"model_path": mp, "model": model_id}})
+        prov = provider_for_tier(tier)
         _LOCAL_PROVIDER_CACHE[model_id] = prov
     return prov
 

@@ -681,6 +681,115 @@ class TestDefaultAgentFnSeams:
         assert seen.get("max_tokens") is None
 
 
+class TestProviderTierResolution:
+    """Regression coverage for the mission-tier provider leak: an INTERNAL DAG
+    node (not just the mission's entry/INTAKE call) must stay on the tier/
+    provider the mission was started with, instead of independently
+    re-resolving the bare ambient config.get_provider() default.
+
+    Two fix paths, tested separately:
+      1. An explicit provider injected via make_default_agent_fn(provider=...)
+         — what loop.run_mission now threads through from its own already-
+         resolved provider argument.
+      2. A tier recorded on the node's inputs (mission_template's tier=
+         plumbing) — resolved via services.agent.tiers.provider_for_tier, for
+         callers with no in-hand Provider object (mission_start/dag_run).
+
+    In both cases the ambient config.get_provider() must NOT be called — if it
+    is, the node has leaked to the ambient/cloud default.
+    """
+
+    def test_injected_provider_used_for_internal_node_not_ambient(self, monkeypatch):
+        from services.agent import config as agent_config
+        from services.agent import agent_turn as at
+
+        local_provider = _TurnScriptedProvider()
+
+        def _ambient_should_not_be_called(name=None, cfg=None):
+            raise AssertionError(
+                "ambient config.get_provider() was called — the mission's own "
+                "provider did not propagate to this internal node")
+
+        monkeypatch.setattr(agent_config, "get_provider", _ambient_should_not_be_called)
+
+        seen = {}
+        real_run_turn = at.run_turn
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real_run_turn(*args, **kwargs)
+
+        monkeypatch.setattr(at, "run_turn", _spy)
+
+        # An "internal" node — e.g. a BUILD node, not the mission's entry node.
+        agent_fn = nr.make_default_agent_fn(provider=local_provider)
+        res = agent_fn("build the bracket",
+                       {"node_name": "n_build_d1", "allowed_tools": []})
+
+        assert res.success is True
+        assert seen.get("provider") is local_provider
+
+    def test_node_tier_resolves_via_shared_tiers_seam_not_ambient(self, monkeypatch):
+        """No injected provider, but the node carries inputs.tier (the
+        mission_start/dag_run MCP path with no Provider object in hand) —
+        node_runner must resolve it through services.agent.tiers.provider_for_tier,
+        and must NOT fall through to the ambient config.get_provider()."""
+        from services.agent import config as agent_config
+        from services.agent import tiers as agent_tiers
+        from services.agent import agent_turn as at
+
+        local_provider = _TurnScriptedProvider()
+        seen_tier_calls = []
+
+        def _ambient_should_not_be_called(name=None, cfg=None):
+            raise AssertionError(
+                "ambient config.get_provider() was called — the node's tier did "
+                "not resolve through the shared tiers.provider_for_tier seam")
+
+        monkeypatch.setattr(agent_config, "get_provider", _ambient_should_not_be_called)
+
+        def _fake_provider_for_tier(tier, cfg=None):
+            seen_tier_calls.append(tier)
+            return local_provider
+
+        monkeypatch.setattr(agent_tiers, "provider_for_tier", _fake_provider_for_tier)
+
+        seen = {}
+        real_run_turn = at.run_turn
+
+        def _spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real_run_turn(*args, **kwargs)
+
+        monkeypatch.setattr(at, "run_turn", _spy)
+
+        context_pack = {"node_name": "n_build_d1", "allowed_tools": [],
+                        "node_inputs": {"tier": "local-24k"}}
+        res = nr._default_agent_fn("build the bracket", context_pack)
+
+        assert res.success is True
+        assert seen_tier_calls == ["local-24k"]
+        assert seen.get("provider") is local_provider
+
+    def test_no_provider_no_tier_falls_back_to_ambient_default(self, monkeypatch):
+        """A node with neither an injected provider nor a recorded tier must keep
+        resolving the ambient config.get_provider() default — the targeted-fix
+        requirement: no behaviour change for callers that specify neither."""
+        from services.agent import config as agent_config
+
+        calls = []
+
+        def _tracked_get_provider(name=None, cfg=None):
+            calls.append((name, cfg))
+            return _TurnScriptedProvider()
+
+        monkeypatch.setattr(agent_config, "get_provider", _tracked_get_provider)
+
+        res = nr._default_agent_fn("go", {"node_name": "n1"})
+        assert res.success is True
+        assert len(calls) == 1
+
+
 class TestRoleCardWiring:
     """T-W30 real-run regressions: mission-graph nodes carry role in inputs.role
     (mission_template._node); the runner must resolve the card from there and must

@@ -90,6 +90,11 @@ void Overlays::setColors(const float hover[4], const float selection[4], const f
         selCol_[i] = selection[i];
         if (feature) featHlCol_[i] = feature[i];
     }
+    // Selected+hovered tier tracks the live selection color: same hue, darkened and more opaque so
+    // hovering an already-selected item reads as "still selected, under the cursor" — clearly darker
+    // than plain selection and distinct from the (lighter) hover wash. Applies to all pick kinds.
+    for (int i = 0; i < 3; ++i) selHoverCol_[i] = selCol_[i] * 0.55f;
+    selHoverCol_[3] = selCol_[3] < 0.80f ? selCol_[3] + 0.20f : 1.0f;
 }
 
 void Overlays::setSectionClip(int count, const float normals[3][3], const float offsets[3]) {
@@ -337,10 +342,15 @@ void Overlays::draw(const Renderer::CameraXform& cam, const PickHit& hover,
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
 
-    // Selection first (persistent), hover on top (transient), so a hovered+selected item shows
-    // the hover color.
+    // Selection first (persistent), hover on top (transient). A hover over an UNselected item shows
+    // the lighter hover wash; a hover over an already-SELECTED item shows the darker selected+hover
+    // wash so "what's selected" stays readable. Applies uniformly to faces, edges and vertices.
     for (const auto& h : sel) drawHit(cam, h, selCol_);
-    if (hover.valid()) drawHit(cam, hover, hoverCol_);
+    if (hover.valid()) {
+        bool hoverSelected = false;
+        for (const auto& h : sel) { if (h == hover) { hoverSelected = true; break; } }
+        drawHit(cam, hover, hoverSelected ? selHoverCol_ : hoverCol_);
+    }
 
     glBindVertexArray(0);
 }

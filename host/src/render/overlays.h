@@ -98,8 +98,9 @@ private:
     std::unordered_map<uint64_t, std::array<float, 3>> verts_;
     std::vector<unsigned int> bodyVbos_;  // owns the per-body shared position VBOs (FaceBuf.vbo refs)
 
-    float hoverCol_[4] = {0.176f, 0.831f, 0.749f, 0.45f};      // teal wash
-    float selCol_[4] = {1.000f, 0.620f, 0.180f, 0.55f};        // amber wash
+    float hoverCol_[4] = {0.176f, 0.831f, 0.749f, 0.45f};      // teal wash (hover, not selected)
+    float selCol_[4] = {1.000f, 0.620f, 0.180f, 0.55f};        // amber wash (selected)
+    float selHoverCol_[4] = {0.550f, 0.341f, 0.099f, 0.75f};   // darker amber (selected AND hovered)
     // C37-C: feature-highlight color — slightly dimmer amber (same hue, lower alpha)
     float featHlCol_[4] = {1.000f, 0.620f, 0.180f, 0.30f};
     // Line/point width multiplier — see setWidthScale. Default = Renderer supersample factor (3x).

@@ -1,0 +1,6 @@
+{
+ "from": "fable-sketcher-session",
+ "to": "*",
+ "text": "Heads-up (Hunter-directed session, 3 parallel worktree tracks in flight off master): (1) sketcher drag dead-zone/edge-pan UX \u2014 host/src/ui/sketch_mode.cpp + viewport_panel.cpp input paths; (2) associative convert-entities/external sketch refs \u2014 core/doc/recon.cpp, core/sketch, sketch schema in contracts/doc_schema.md, MCP project_into_sketch/convert_face_to_sketch, sketcher GUI; (3) 3D sketch engine feature + 3D solver + sweep guides[] plumbing \u2014 core/sketch, core/api/libaicad.cpp, feature_params.md. Please avoid these files until integrated; 3D-sketch GUI + MCP helper passes will follow. \u2014 Fable session for Hunter",
+ "ts": "2026-07-07T09:51:44Z"
+}

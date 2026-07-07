@@ -435,9 +435,9 @@ static const RibbonCmd kCmds[] = {
     { "appr_color",          "Appearance",      "color_picker",     "Appearance", "Material", true,  nullptr, false },
     { "appr_mat_plastic",    "Plastic",         "appr_plastic",     "Appearance", "Material", true,  nullptr, false },
     { "appr_mat_aluminum",   "Aluminum",        "appr_metal",       "Appearance", "Material", true,  nullptr, false },
-    { "appr_mat_steel",      "Steel",           "appr_metal",       "Appearance", "Material", true,  nullptr, false },
-    { "appr_mat_brass",      "Brass",           "appr_metal",       "Appearance", "Material", true,  nullptr, false },
-    { "appr_mat_dark",       "Dark Metal",      "appr_metal",       "Appearance", "Material", true,  nullptr, false },
+    { "appr_mat_steel",      "Steel",           "appr_steel",       "Appearance", "Material", true,  nullptr, false },
+    { "appr_mat_brass",      "Brass",           "appr_brass",       "Appearance", "Material", true,  nullptr, false },
+    { "appr_mat_dark",       "Dark Metal",      "appr_dark",        "Appearance", "Material", true,  nullptr, false },
     { "appr_clear",          "Clear",           "refresh",          "Appearance", "Material", false, nullptr, false },
 
     // --- Group: Display --- (sets st.displayStyle; the viewport applies it each frame) ---
@@ -489,7 +489,7 @@ static const RibbonCmd kCmds[] = {
     { "cam_new_job",       "New Job",     "new_doc",         "Manufacture", "Job",       true,  nullptr, false },
     { "cam_extract",       "From Part",   "hole_wizard",     "Manufacture", "Job",       true,  nullptr, false },
     { "cam_add_setup",     "Setup",       "ref_csys",        "Manufacture", "Job",       false, nullptr, false },
-    { "cam_set_stock",     "Stock",       "extrude",         "Manufacture", "Job",       false, nullptr, false },
+    { "cam_set_stock",     "Stock",       "stock",           "Manufacture", "Job",       false, nullptr, false },
     { "cam_add_tool",      "Tool",        "curve_helix",     "Manufacture", "Job",       false, nullptr, false },
     // --- Group: 2.5D Milling ---
     { "cam_op_face",       "Face",        "cam_face",        "Manufacture", "2.5D",      true,  nullptr, false },

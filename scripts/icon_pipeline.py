@@ -91,6 +91,14 @@ def box(length=52.0, width=40.0, height=30.0, name="Box1") -> dict:
         "centered": True}}
 
 
+def sphere(radius=22.0, name="Ball1") -> dict:
+    """A sphere primitive (engine `sphere` feature, radius param) centred at origin --
+    the material-preset "ball" so the Appearance tiles read as rounded swatches."""
+    return {"op": "add_feature", "feature": {
+        "type": "sphere", "name": name,
+        "params": {"radius": dim(radius)}}}
+
+
 # ---------------------------------------------------------------------------------------
 # RECIPE TABLE  (icon-name -> demo build).  icon-name MUST be an existing atlas.json cell
 # so the UVs stay put and the C++ loader needs no change.  Each recipe:
@@ -199,6 +207,33 @@ RECIPES: dict[str, dict] = {
 
     # Plain solid block reads as "create a 3D body / boss".
     "extrude_boss": {"yaw": 35, "pitch": 26, "steps": [box(52, 40, 34), accent()]},
+
+    # extrude_cut: solid block with a deep rectangular pocket cut into its TOP face,
+    # so material is obviously REMOVED (reads as an extruded cut). f1=block sketch,
+    # f2=block extrude, f3=pocket sketch on top face, f4=extrude-cut.
+    "extrude_cut": {"yaw": 35, "pitch": 26, "steps": [
+        *sketch_with_id([
+            {"type": "line", "p1": [-26, -20], "p2": [26, -20], "id": "b1"},
+            {"type": "line", "p1": [26, -20], "p2": [26, 20], "id": "b2"},
+            {"type": "line", "p1": [26, 20], "p2": [-26, 20], "id": "b3"},
+            {"type": "line", "p1": [-26, 20], "p2": [-26, -20], "id": "b4"},
+        ], plane="plane.top", name="CutBlockSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "CutBlock",
+            "params": {"mode": "boss", "depth": dim(30)},
+            "refs": {"profile": [region("f1", 0, 0)]}}},
+        # Pocket profile on the top face (Z=30): a rectangle inset from the walls.
+        *sketch_with_id([
+            {"type": "line", "p1": [-15, -11], "p2": [15, -11], "id": "p1"},
+            {"type": "line", "p1": [15, -11], "p2": [15, 11], "id": "p2"},
+            {"type": "line", "p1": [15, 11], "p2": [-15, 11], "id": "p3"},
+            {"type": "line", "p1": [-15, 11], "p2": [-15, -11], "id": "p4"},
+        ], plane="plane.top", name="PocketSk", fid="f3", offset=30),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "Pocket",
+            "params": {"mode": "cut", "depth": dim(22)},
+            "refs": {"profile": [region("f3", 0, 0)]}}},
+    ]},
 
     # revolve_boss: stepped-rectangle profile on plane.front (XZ), revolve around Z axis.
     # plane.front = XZ; sketch-x = world-X, sketch-y = world-Z.
@@ -350,23 +385,82 @@ RECIPES: dict[str, dict] = {
     # Features -> Dress-up (first tranche already live -- do NOT redo)
     # -----------------------------------------------------------------------
 
+    # fillet/chamfer: round/bevel EVERY edge of the block (all 12) so the tile
+    # unmistakably reads as the dress-up op. "all_edges" selector (scenarios.cpp
+    # resolveSel) walks tid 1..12 and takes every edge; n=12 = a box's edge count.
+    # Moderate radius/length so all-corner blends stay geometrically valid at 32px.
     "fillet": {"yaw": 38, "pitch": 24, "steps": [
         box(52, 40, 30),
         {"feature": {"type": "fillet", "name": "Fillet1",
-                     "params": {"radius": dim(7.0)}},
-         "selrefs": {"edges": {"select": "vertical_edges", "n": 4}}}]},
+                     "params": {"radius": dim(5.0)}},
+         "selrefs": {"edges": {"select": "all_edges", "n": 12}}}]},
 
     "chamfer": {"yaw": 38, "pitch": 24, "steps": [
         box(52, 40, 30),
         {"feature": {"type": "chamfer", "name": "Chamfer1",
-                     "params": {"length": dim(6.0)}},
-         "selrefs": {"edges": {"select": "vertical_edges", "n": 4}}}]},
+                     "params": {"length": dim(4.5)}},
+         "selrefs": {"edges": {"select": "all_edges", "n": 12}}}]},
 
     "shell": {"yaw": 40, "pitch": 34, "steps": [
         box(52, 40, 30),
         {"feature": {"type": "shell", "name": "Shell1",
                      "params": {"thickness": dim(3.0)}},
          "selrefs": {"remove": {"select": "top_face", "n": 1}}}]},
+
+    # draft: a block with a strongly TAPERED side wall. The standalone `draft`
+    # feature needs neutral+faces selectors the iconpipe runner can't resolve, so
+    # we bake the taper into the extrude (contract: extrude `draft` dim -> taper).
+    # ~18° so the slope reads clearly at 32px. f1=profile sketch, f2=tapered extrude.
+    "draft": {"yaw": 35, "pitch": 22, "steps": [
+        *sketch_with_id([
+            {"type": "line", "p1": [-26, -20], "p2": [26, -20], "id": "b1"},
+            {"type": "line", "p1": [26, -20], "p2": [26, 20], "id": "b2"},
+            {"type": "line", "p1": [26, 20], "p2": [-26, 20], "id": "b3"},
+            {"type": "line", "p1": [-26, 20], "p2": [-26, -20], "id": "b4"},
+        ], plane="plane.top", name="DraftSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "DraftBlock",
+            "params": {"mode": "boss", "depth": dim(34), "draft": dim(18)},
+            "refs": {"profile": [region("f1", 0, 0)]}}},
+        accent(),
+    ]},
+
+    # rib: an L of two walls with a triangular reinforcement web bridging them.
+    # Uses the REAL rib feature: an OPEN profile contour, grown toward the body and
+    # fused. f1=L base sketch, f2=extrude, f3=open rib contour, f4=rib.
+    "rib": {"yaw": 40, "pitch": 24, "steps": [
+        *sketch_with_id([
+            # L-shaped base: a back wall + a bottom floor (two thin legs).
+            {"type": "line", "p1": [-24, -4], "p2": [24, -4], "id": "b1"},
+            {"type": "line", "p1": [24, -4], "p2": [24, 4], "id": "b2"},
+            {"type": "line", "p1": [24, 4], "p2": [-16, 4], "id": "b3"},
+            {"type": "line", "p1": [-16, 4], "p2": [-16, 40], "id": "b4"},
+            {"type": "line", "p1": [-16, 40], "p2": [-24, 40], "id": "b5"},
+            {"type": "line", "p1": [-24, 40], "p2": [-24, -4], "id": "b6"},
+        ], plane="plane.front", name="LBaseSk", fid="f1"),
+        {"op": "add_feature", "feature": {
+            "type": "extrude", "name": "LWalls",
+            "params": {"mode": "boss", "depth": dim(30)},
+            "refs": {"profile": [region("f1", 0, 6)]}}},
+        # Open rib contour: a diagonal line spanning the inside corner of the L,
+        # on the mid plane, so the web bridges the vertical wall and the floor.
+        *sketch_with_id([
+            {"type": "line", "p1": [-16, 36], "p2": [20, 4], "id": "rib1"},
+        ], plane="plane.front", name="RibSk", fid="f3"),
+        {"op": "add_feature", "feature": {
+            "type": "rib", "name": "Rib1",
+            "params": {"thickness": dim(5)},
+            "refs": {"profile": [region("f3", 0, 20)]}}},
+        accent(),
+    ]},
+
+    # stock: a rectangular raw billet for the Manufacture > Stock button. A plain
+    # machined-aluminium block (bright metal, mid roughness) that reads as "raw
+    # stock material". No annotation -- the billet IS the icon.
+    "stock": {"yaw": 32, "pitch": 24, "steps": [
+        box(56, 40, 26),
+        appearance(0.90, 0.32, (0.80, 0.82, 0.85)),   # aluminium billet
+    ]},
 
     # -----------------------------------------------------------------------
     # Features -> Pattern  (seed MUST be sketch-based -- bare box not patternable)
@@ -606,12 +700,21 @@ RECIPES: dict[str, dict] = {
     # See work/questions/T-BL29.md Q4 — skipped.
     # -----------------------------------------------------------------------
 
-    "appr_metal":   {"yaw": 33, "pitch": 26, "steps": [
-        box(48, 40, 26), appearance(0.90, 0.35, (0.83, 0.85, 0.88))]},   # Aluminum
+    # Material presets: one SPHERE per material in its OWN preset color, so each of the
+    # 5 Appearance buttons (Plastic/Aluminum/Steel/Brass/Dark Metal) has a distinct swatch.
+    # rgb/metallic/roughness mirror ui::kMaterials (host/src/ui/appearance_common.cpp).
     "appr_plastic": {"yaw": 33, "pitch": 26, "steps": [
-        box(48, 40, 26), appearance(0.00, 0.50, (0.71, 0.76, 0.82))]},   # Plastic
+        sphere(22), appearance(0.00, 0.50, (0.71, 0.76, 0.82))]},   # Plastic
+    "appr_metal":   {"yaw": 33, "pitch": 26, "steps": [
+        sphere(22), appearance(0.90, 0.35, (0.83, 0.85, 0.88))]},   # Aluminum (silver)
+    "appr_steel":   {"yaw": 33, "pitch": 26, "steps": [
+        sphere(22), appearance(0.85, 0.25, (0.56, 0.58, 0.62))]},   # Steel (darker)
+    "appr_brass":   {"yaw": 33, "pitch": 26, "steps": [
+        sphere(22), appearance(0.95, 0.30, (0.80, 0.62, 0.28))]},   # Brass (warm)
+    "appr_dark":    {"yaw": 33, "pitch": 26, "steps": [
+        sphere(22), appearance(0.90, 0.45, (0.22, 0.23, 0.26))]},   # Dark Metal (near-black, nudged up so it's not pure black)
     "appr_default": {"yaw": 33, "pitch": 26, "steps": [
-        box(48, 40, 26)]},                                               # engine default grey
+        sphere(22)]},                                               # engine default grey
 
     # -----------------------------------------------------------------------
     # Appearance -> Display: display_* are line-art SDF glyphs, NOT photographic.
@@ -635,7 +738,11 @@ RECIPES: dict[str, dict] = {
 # Colors: app accent teal + dark keyline so the cue reads on BOTH theme backgrounds.
 # ---------------------------------------------------------------------------------------
 ANNOTATIONS: dict[str, dict] = {
-    "extrude_boss":     {"arrow": [0.84, 0.66, 0.84, 0.20]},
+    "extrude_boss":     {"arrow": [0.50, 0.30, 0.44, 0.05]},   # grows OUT of the top-face center along the extrude axis
+    "extrude_cut":      {"arrow": [0.50, 0.14, 0.50, 0.46]},   # cut plunges down into the pocket
+    "draft":            {"arrow": [0.30, 0.30, 0.20, 0.66]},   # taper slope cue on the drafted wall
+    "rib":              {"ring": [0.52, 0.52, 0.15]},          # look-here on the reinforcing web
+    # stock: no annotation -- the raw billet IS the icon.
     "revolve_boss":     {"arc": [0.50, 0.22, 0.17, 210, 330]},
     "revolve_cut":      {"arc": [0.50, 0.22, 0.17, 210, 330]},
     "sweep":            {"arrow": [0.68, 0.52, 0.68, 0.16]},
@@ -778,7 +885,12 @@ def ensure_cells(names: list[str]) -> None:
 
         def placeholder(name, sz, fn):
             pal = mi.DARK if fn == "atlas_dark.png" else mi.LIGHT
-            return mi._render_icon(name, sz, pal)
+            try:
+                return mi._render_icon(name, sz, pal)
+            except Exception:
+                # no registered drawer for this name (e.g. a fresh RECIPE-only
+                # slot like `stock`) -> transparent placeholder; inject() fills it.
+                return Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
     except Exception as e:  # pragma: no cover -- make_icons import is best-effort
         print(f"   ensure_cells: no placeholder glyphs ({e})")
 
@@ -850,9 +962,16 @@ def run_app(recipes_json: Path, theme: str = "dark", timeout_s: int = 300) -> in
         "AI_CAD_SHOT": "iconpipe",
         "AI_CAD_ICON_RECIPES": str(recipes_json),
         "AI_CAD_THEME": theme,
+        # Create the GLFW window unmapped so the headless capture-then-exit path
+        # runs cleanly under xvfb without ever mapping a visible window.
+        "AI_CAD_HIDDEN": "1",
     })
     throwaway = REPO / "scratch" / "iconpipe_final.png"
-    cmd = [str(BIN), "--shot", str(throwaway)]
+    # The headless capture-then-exit path is entered ONLY via --ui-screenshot
+    # (main.cpp): it calls run_gui(path) with shot=true, which drains the iconpipe
+    # recipes and exits. A bare --shot flag is unrecognized and falls through to
+    # interactive GUI mode, which hangs forever headlessly.
+    cmd = [str(BIN), "--ui-screenshot", str(throwaway)]
     if sys.platform.startswith("linux") and shutil.which("xvfb-run"):
         env.pop("DISPLAY", None)  # force xvfb-run's own server; the live :0 may be unattended
         cmd = ["xvfb-run", "-a", *cmd]
@@ -977,7 +1096,9 @@ def main(argv=None) -> int:
         _, cam_failures = cam_render_all()
 
     if args.render or args.inject_only:
-        ensure_cells(CAM_CELLS)   # append cam_* atlas cells if this atlas predates them
+        # Append any missing atlas cells for RECIPE names too (e.g. a brand-new
+        # `stock` billet tile); no-ops names that already have cells.
+        ensure_cells(list(RECIPES.keys()) + CAM_CELLS)
         done = inject(names)
         contact_sheet(names)
         if not done:

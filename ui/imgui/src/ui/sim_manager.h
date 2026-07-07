@@ -51,7 +51,7 @@ struct ImVec2;
 
 namespace ui {
 
-enum class StudyType { Static, Modal, Flow, Fatigue, Thermal };
+enum class StudyType { Static, Modal, Flow, Fatigue, Thermal, Motion };
 
 // Static failure theory used for the headline factor of safety + the FoS plot field.
 enum class FailureCriterion { VonMises = 0, Tresca = 1, MaxNormal = 2 };
@@ -182,6 +182,30 @@ struct Study {
     // Thermal result scalars (T-SIM1; transient, regenerated on Run).
     double maxTempC = 0.0, minTempC = 0.0;
 
+    // Motion / kinematic study fields.
+    // motionMateId: driven mate id ("" = auto-pick the single drivable mate in the assembly).
+    // motionStart/Stop: the range to drive the mate value (degrees for angle, mm for distance).
+    // motionSteps: number of trajectory frames (≥2). motionFrameRate: playback fps.
+    // motionCheckInterference: pass check_interference=true to simulate_motion RPC.
+    std::string motionMateId;               // "" = auto-pick
+    float motionStart = 0.0f;
+    float motionStop  = 90.0f;
+    int   motionSteps = 30;
+    bool  motionGravity = false;            // future: passed to engine when supported
+    bool  motionCheckInterference = true;
+    float motionFrameRate = 24.0f;          // playback fps
+    bool  motionLoop = true;
+
+    // Motion result (transient — cleared on re-run; never persisted).
+    bool  motionHasResult = false;
+    std::string motionDriverType;           // "angle", "distance", etc.
+    std::string motionDriverUnit;           // "deg", "mm", etc.
+    nlohmann::json motionTrajectory;        // full trajectory array from simulate_motion
+    nlohmann::json motionInterference;      // interference result sub-object
+    int   motionFrame = 0;                  // currently displayed frame index
+    bool  motionPlaying = false;
+    double motionLastTickSec = 0.0;         // ImGui::GetTime() at last frame advance
+
     // T-SIM3: sim-advisor postcheck result (transient, regenerated on Run completion).
     // Verdict is PASS/WARN/FAIL vs engine_oracle/sim/margin_policy.json; narration is the
     // advisor's multi-line explanation (narrate_postcheck). Empty verdict = advisor not run.
@@ -300,6 +324,11 @@ private:
     void runFlow(app::AppState& st, Study& s);
     void runFatigue(app::AppState& st, Study& s);
     void runThermal(app::AppState& st, Study& s);  // T-SIM1: steady-state conduction dispatch
+    void runMotion(app::AppState& st, Study& s);   // kinematic / motion study dispatch
+    void drawMotionForm(app::AppState& st, Study& s);
+    void drawMotionResults(app::AppState& st, Study& s);
+    void tickMotion(app::AppState& st);
+    void applyMotionFrame(app::AppState& st, Study& s, int frame);
     nlohmann::json facePointsFor(app::AppState& st, const nlohmann::json& selector, std::string& err);
 
     // pick capture: append every currently-selected face into `well` (st.selection).

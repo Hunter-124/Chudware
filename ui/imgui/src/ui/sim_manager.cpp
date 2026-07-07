@@ -2,6 +2,7 @@
 #include "ui/sim_manager.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -50,6 +51,7 @@ static const char* studyTypeKey(StudyType t) {
         case StudyType::Flow:    return "flow";
         case StudyType::Fatigue: return "fatigue";
         case StudyType::Thermal: return "thermal";
+        case StudyType::Motion:  return "motion";
         default:                 return "static";
     }
 }
@@ -58,6 +60,7 @@ static StudyType studyTypeFromKey(const std::string& k) {
     if (k == "flow")    return StudyType::Flow;
     if (k == "fatigue") return StudyType::Fatigue;
     if (k == "thermal") return StudyType::Thermal;
+    if (k == "motion")  return StudyType::Motion;
     return StudyType::Static;
 }
 static const char* studyTypeLabel(StudyType t) {
@@ -66,6 +69,7 @@ static const char* studyTypeLabel(StudyType t) {
         case StudyType::Flow:    return "Flow";
         case StudyType::Fatigue: return "Fatigue";
         case StudyType::Thermal: return "Thermal";
+        case StudyType::Motion:  return "Motion";
         default:                 return "Static";
     }
 }
@@ -75,6 +79,7 @@ static const char* studyTypeIcon(StudyType t) {
         case StudyType::Flow:    return "study_flow";
         case StudyType::Fatigue: return "study_fatigue";
         case StudyType::Thermal: return "study_thermal";
+        case StudyType::Motion:  return "study_modal";   // reuse modal icon; no dedicated motion icon yet
         default:                 return "study_static";
     }
 }
@@ -403,6 +408,11 @@ nlohmann::json SimManager::studyToJson(const Study& s) {
                      {"conv_h", s.thermalConvH}, {"amb_c", s.thermalAmbC},
                      {"use_flux", s.thermalUseFlux}, {"flux_wm2", s.thermalFluxWm2}}},
         {"result_summary", s.summary},
+        // Motion (kinematic) study inputs — persisted so settings survive refresh.
+        {"motion", {{"mate_id", s.motionMateId}, {"start", s.motionStart}, {"stop", s.motionStop},
+                    {"steps", s.motionSteps}, {"gravity", s.motionGravity},
+                    {"check_interference", s.motionCheckInterference},
+                    {"frame_rate", s.motionFrameRate}, {"loop", s.motionLoop}}},
     };
 }
 
@@ -470,6 +480,18 @@ Study SimManager::studyFromJson(const nlohmann::json& j) {
         s.fatigueLoadCase = fa.value("load_case", 0); s.fatigueSizeMm = fa.value("size_mm", 25.0);
         s.fatigueTempC = fa.value("temp_c", 20.0); s.fatigueReliability = fa.value("reliability", 50.0);
     }
+    // Motion study inputs.
+    if (j.contains("motion") && j["motion"].is_object()) {
+        const auto& mo = j["motion"];
+        s.motionMateId = mo.value("mate_id", std::string());
+        s.motionStart  = mo.value("start", 0.0f);
+        s.motionStop   = mo.value("stop", 90.0f);
+        s.motionSteps  = mo.value("steps", 30);
+        s.motionGravity = mo.value("gravity", false);
+        s.motionCheckInterference = mo.value("check_interference", true);
+        s.motionFrameRate = mo.value("frame_rate", 24.0f);
+        s.motionLoop = mo.value("loop", true);
+    }
     s.summary = j.value("result_summary", std::string());
     if (j.contains("fixtures") && j["fixtures"].is_array())
         for (const auto& sel : j["fixtures"]) s.fixtures.picks.push_back(selFromJson(sel));
@@ -521,6 +543,11 @@ void SimManager::refresh(app::AppState& st) {
                     s.advisorVerdict = p.advisorVerdict; s.advisorMatClass = p.advisorMatClass;
                     s.advisorSf = p.advisorSf; s.advisorNarration = p.advisorNarration;
                     s.advisorItems = p.advisorItems;
+                    // Motion transient result is carried across refresh like FEA results.
+                    s.motionHasResult = p.motionHasResult;
+                    s.motionDriverType = p.motionDriverType; s.motionDriverUnit = p.motionDriverUnit;
+                    s.motionTrajectory = p.motionTrajectory; s.motionInterference = p.motionInterference;
+                    s.motionFrame = p.motionFrame; s.motionPlaying = p.motionPlaying;
                     if (!p.summary.empty()) s.summary = p.summary;
                     break;
                 }
@@ -598,6 +625,7 @@ bool SimManager::handleCommand(app::AppState& st, const std::string& cmdId) {
     if (cmdId == "sim_new_flow")    { newStudy(st, StudyType::Flow);    return true; }
     if (cmdId == "sim_new_thermal") { newStudy(st, StudyType::Thermal); return true; }
     if (cmdId == "sim_new_fatigue") { newStudy(st, StudyType::Fatigue); return true; }
+    if (cmdId == "sim_new_motion")  { newStudy(st, StudyType::Motion);  return true; }
     refresh(st);
     const bool haveStudy = sel_ >= 0 && sel_ < (int)studies_.size();
     if (cmdId == "sim_material" || cmdId == "sim_results" || cmdId == "sim_mesh") {
@@ -761,6 +789,7 @@ void SimManager::run(app::AppState& st, Study& s) {
     // shared with the Flow study and the T-SIM2/T-SIM3 rendering) so the flow dispatch is
     // untouched — additive seam only.
     if (s.type == StudyType::Thermal) { runThermal(st, s); return; }
+    if (s.type == StudyType::Motion)  { runMotion(st, s);  return; }
     if (isFlowFamily(s.type)) runFlow(st, s);
     else if (s.type == StudyType::Fatigue) runFatigue(st, s);
     else runStaticOrModal(st, s);
@@ -1047,6 +1076,440 @@ void SimManager::runThermal(app::AppState& st, Study& s) {
     c5::addLog(st, note);
 }
 
+// ---------------------------------------------------------------- motion / kinematic simulation
+
+void SimManager::runMotion(app::AppState& st, Study& s) {
+    if (!st.docMirror.hasDoc()) { c5::addLog(st, "[motion] no document"); return; }
+    // Build the simulate_motion RPC params (see services/mcp/test_cad_tools.py for API contract).
+    nlohmann::json params = {
+        {"doc_id",             st.docMirror.docId()},
+        {"start",              s.motionStart},
+        {"stop",               s.motionStop},
+        {"steps",              std::max(2, s.motionSteps)},
+        {"check_interference", s.motionCheckInterference},
+    };
+    if (!s.motionMateId.empty()) params["mate_id"] = s.motionMateId;
+
+    c5::addLog(st, "[motion] running simulate_motion (synchronous)...");
+    st.status = "Running motion study...";
+
+    nlohmann::json res; std::string err;
+    // simulate_motion is synchronous and fast (pure math, no meshing) — use worker.call.
+    // Timeout: 60 s (plenty for 100+ steps; typical 300 ms for 30 steps).
+    if (!st.worker.call("simulate_motion", params, res, err, 60000)) {
+        c5::toast(ToastLevel::Error, "Motion study: worker unreachable — " + err);
+        c5::addLog(st, "[motion] RPC error: " + err);
+        st.status.clear();
+        return;
+    }
+    if (!res.value("ok", false)) {
+        std::string msg = res.value("error", err.empty() ? std::string("simulate_motion failed") : err);
+        c5::toast(ToastLevel::Error, "Motion: " + msg);
+        c5::addLog(st, "[motion] failed: " + msg);
+        st.status.clear();
+        return;
+    }
+
+    // Parse result.
+    s.motionHasResult    = true;
+    s.motionTrajectory   = res.value("trajectory", nlohmann::json::array());
+    s.motionInterference = res.value("interference", nlohmann::json::object());
+    if (res.contains("driver") && res["driver"].is_object()) {
+        s.motionDriverType = res["driver"].value("type", std::string());
+        s.motionDriverUnit = res["driver"].value("unit", std::string());
+        if (s.motionDriverType.empty()) {
+            // Derive from mate_id hint when the engine omits type
+            s.motionDriverType = "angle";
+            s.motionDriverUnit = "deg";
+        }
+    } else {
+        s.motionDriverType = "angle";
+        s.motionDriverUnit = "deg";
+    }
+    s.motionFrame   = 0;
+    s.motionPlaying = false;
+    s.hasResult     = true;
+
+    int nFrames = (int)s.motionTrajectory.size();
+    // Update mate_id from result so the label is accurate (engine auto-picked).
+    if (!res.value("mate_id", std::string()).empty()) s.motionMateId = res["mate_id"].get<std::string>();
+
+    // Check for first collision.
+    bool hasCollision = false;
+    int  collisionStep = -1;
+    if (s.motionInterference.contains("first_collision_step") &&
+        !s.motionInterference["first_collision_step"].is_null()) {
+        hasCollision  = true;
+        collisionStep = s.motionInterference["first_collision_step"].get<int>();
+    }
+
+    char buf[256];
+    if (hasCollision)
+        std::snprintf(buf, sizeof(buf), "Motion: %d frames | driver %s | interference at step %d",
+                      nFrames, s.motionMateId.c_str(), collisionStep);
+    else
+        std::snprintf(buf, sizeof(buf), "Motion: %d frames | driver %s | no interference detected",
+                      nFrames, s.motionMateId.c_str());
+    s.summary = buf;
+    st.status = s.summary;
+    c5::addLog(st, "[motion] done — " + s.summary);
+
+    // Display the first frame immediately.
+    if (nFrames > 0) applyMotionFrame(st, s, 0);
+
+    // Navigate to the Results view (timeline).
+    node_ = SimNode::Results;
+    persist(st, s);
+}
+
+// Apply one frame of the trajectory to the viewport: re-upload the doc mesh with
+// per-body model transforms (CPU-side transform then setMeshes upload).
+void SimManager::applyMotionFrame(app::AppState& st, Study& s, int frame) {
+    if (!s.motionHasResult || s.motionTrajectory.empty()) return;
+    const int n = (int)s.motionTrajectory.size();
+    if (frame < 0) frame = 0;
+    if (frame >= n) frame = n - 1;
+    s.motionFrame = frame;
+
+    const auto& step = s.motionTrajectory[frame];
+    if (!step.contains("bodies") || !step["bodies"].is_array()) return;
+
+    // Build a name→matrix map for this frame.
+    // The trajectory body uses "name" (BodyMesh::name = the key viewportSetBodyTransforms
+    // looks up). The matrices are column-major (already transposed in doc_simulate_motion).
+    std::map<std::string, std::array<float, 16>> nameToMatrix;
+    for (const auto& body : step["bodies"]) {
+        if (!body.contains("transform")) continue;
+        // Prefer "name" (matches BodyMesh::name); fall back to "component" for compatibility.
+        std::string key;
+        if (body.contains("name") && body["name"].is_string())
+            key = body["name"].get<std::string>();
+        else if (body.contains("component") && body["component"].is_string())
+            key = body["component"].get<std::string>();
+        else continue;
+        const auto& tf = body["transform"];
+        if (!tf.is_array() || tf.size() != 16) continue;
+        std::array<float, 16> m;
+        for (int i = 0; i < 16; ++i) m[(size_t)i] = tf[i].get<float>();
+        nameToMatrix[key] = m;
+    }
+    viewportSetBodyTransforms(nameToMatrix);
+}
+
+// Advance/stop the motion playback. Called from tick().
+void SimManager::tickMotion(app::AppState& st) {
+    // Find the selected motion study (if any).
+    Study* s = nullptr;
+    for (auto& study : studies_)
+        if (study.type == StudyType::Motion && study.motionPlaying && study.motionHasResult)
+            { s = &study; break; }
+    if (!s) return;
+
+    const int n = (int)s->motionTrajectory.size();
+    if (n <= 1) { s->motionPlaying = false; return; }
+
+    const double now = ImGui::GetTime();
+    const double dt  = now - s->motionLastTickSec;
+    const double frameDt = (s->motionFrameRate > 0.f) ? 1.0 / s->motionFrameRate : 1.0 / 24.0;
+    if (dt < frameDt) return;
+    s->motionLastTickSec = now;
+
+    int next = s->motionFrame + 1;
+    if (next >= n) {
+        if (s->motionLoop) next = 0;
+        else { next = n - 1; s->motionPlaying = false; }
+    }
+    applyMotionFrame(st, *s, next);
+}
+
+// Draw the motion setup form (mate picker + parameters).
+void SimManager::drawMotionForm(app::AppState& st, Study& s) {
+    const float S = theme::S();
+    ImGui::TextUnformatted("Driven mate ID (empty = auto-pick)");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    // Use a per-study char buffer sized on the stack. ImGui does NOT take ownership — the
+    // buffer only needs to live for the lifetime of this frame's InputText call.
+    char mateBuf[128] = {};
+    std::strncpy(mateBuf, s.motionMateId.c_str(), sizeof(mateBuf) - 1);
+    if (ImGui::InputText("##motionMate", mateBuf, sizeof(mateBuf))) {
+        s.motionMateId = mateBuf;
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+    simTip("Leave blank to let the engine auto-pick the single drivable dimensional mate. "
+           "Enter a mate ID (e.g. \"angle_0\") to drive a specific mate.");
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Start value");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputFloat("##motStart", &s.motionStart, 0, 0, "%.2f");
+    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+
+    ImGui::TextUnformatted("Stop value");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputFloat("##motStop", &s.motionStop, 0, 0, "%.2f");
+    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+    simTip("Range to sweep the driven dimension. Units follow the mate type: degrees for angle mates, mm for distance mates.");
+
+    ImGui::TextUnformatted("Steps (frames)");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputInt("##motSteps", &s.motionSteps);
+    s.motionSteps = std::max(2, std::min(300, s.motionSteps));
+    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+    simTip("Number of trajectory frames (2–300). More steps = smoother animation, longer solve.");
+
+    ImGui::Spacing();
+    if (ImGui::Checkbox("Check interference", &s.motionCheckInterference)) persist(st, s);
+    simTip("Report the first step where any two bodies collide.");
+
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Playback speed (fps)");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::SliderFloat("##motFPS", &s.motionFrameRate, 1.0f, 60.0f, "%.0f fps");
+    if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+
+    if (ImGui::Checkbox("Loop", &s.motionLoop)) persist(st, s);
+
+    ImGui::Spacing();
+    if (!s.motionHasResult) {
+        ImGui::PushStyleColor(ImGuiCol_Text, c5::txtDim());
+        ImGui::TextWrapped("Press Run to solve the motion trajectory. The engine sweeps the driven "
+                           "mate across [Start, Stop] and returns per-body transforms for each frame.");
+        ImGui::PopStyleColor();
+    }
+}
+
+// Draw the motion results area: timeline transport + trace plots.
+void SimManager::drawMotionResults(app::AppState& st, Study& s) {
+    if (!s.motionHasResult || s.motionTrajectory.empty()) {
+        ImGui::TextColored(c5::txtDim(), "No motion result yet. Run the study first.");
+        return;
+    }
+    const float S = theme::S();
+    const int n = (int)s.motionTrajectory.size();
+
+    // ---- Summary row ---------------------------------------------------
+    if (!s.motionDriverType.empty()) {
+        ImGui::TextColored(c5::accent(), "Driver: %s  (%s)", s.motionMateId.c_str(), s.motionDriverType.c_str());
+        ImGui::SameLine(0, 8*S);
+        ImGui::TextColored(c5::txtDim(), "%.2f -> %.2f %s  |  %d frames",
+                           s.motionStart, s.motionStop, s.motionDriverUnit.c_str(), n);
+    }
+
+    // ---- Interference alert -------------------------------------------
+    bool hasCollision = false; int collisionStep = -1;
+    if (s.motionInterference.contains("checked") && s.motionInterference["checked"].get<bool>()) {
+        if (!s.motionInterference["first_collision_step"].is_null()) {
+            hasCollision  = true;
+            collisionStep = s.motionInterference["first_collision_step"].get<int>();
+        }
+    }
+    if (hasCollision) {
+        ImGui::PushStyleColor(ImGuiCol_Text, c5::errCol());
+        ImGui::Text("Interference at step %d", collisionStep);
+        ImGui::PopStyleColor();
+        if (s.motionInterference.contains("detail") && s.motionInterference["detail"].is_array()) {
+            for (const auto& d : s.motionInterference["detail"]) {
+                ImGui::TextColored(c5::txtDim(), "  %s x %s",
+                    d.value("a", "?").c_str(), d.value("b", "?").c_str());
+            }
+        }
+        ImGui::Spacing();
+    }
+
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ---- Timeline transport bar ----------------------------------------
+    ImGui::PushFont(theme::font(theme::Font::H2));
+    ImGui::TextUnformatted("Timeline");
+    ImGui::PopFont();
+
+    // Compute current driven value for display.
+    float range = s.motionStop - s.motionStart;
+    float tVal = (n > 1) ? s.motionStart + range * ((float)s.motionFrame / (float)(n - 1))
+                         : s.motionStart;
+
+    // Frame scrubber.
+    int frame = s.motionFrame;
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::SliderInt("##motionScrub", &frame, 0, n - 1, "Frame %d")) {
+        s.motionPlaying = false;
+        applyMotionFrame(st, s, frame);
+    }
+
+    // Value readout.
+    ImGui::TextColored(c5::txtDim(), "Value: %.3f %s", tVal, s.motionDriverUnit.c_str());
+
+    // Transport buttons.
+    ImGui::Spacing();
+    const bool canPlay = (n > 1);
+    if (!canPlay) ImGui::BeginDisabled();
+
+    // |< (rewind)
+    if (ImGui::Button("|<##motRew")) {
+        s.motionPlaying = false;
+        applyMotionFrame(st, s, 0);
+    }
+    simTip("Rewind to first frame.");
+    ImGui::SameLine(0, 4*S);
+
+    // < (step back)
+    if (ImGui::Button("<##motPrev")) {
+        s.motionPlaying = false;
+        applyMotionFrame(st, s, s.motionFrame - 1);
+    }
+    simTip("Step back one frame.");
+    ImGui::SameLine(0, 4*S);
+
+    // Play / Pause
+    if (ImGui::Button(s.motionPlaying ? "||" : " > ")) {
+        s.motionPlaying = !s.motionPlaying;
+        if (s.motionPlaying) {
+            s.motionLastTickSec = ImGui::GetTime();
+            // If at the end, restart.
+            if (s.motionFrame >= n - 1) applyMotionFrame(st, s, 0);
+        }
+    }
+    simTip(s.motionPlaying ? "Pause" : "Play");
+    ImGui::SameLine(0, 4*S);
+
+    // > (step forward)
+    if (ImGui::Button(">##motNext")) {
+        s.motionPlaying = false;
+        applyMotionFrame(st, s, s.motionFrame + 1);
+    }
+    simTip("Step forward one frame.");
+    ImGui::SameLine(0, 4*S);
+
+    // >| (fast-forward)
+    if (ImGui::Button(">|##motEnd")) {
+        s.motionPlaying = false;
+        applyMotionFrame(st, s, n - 1);
+    }
+    simTip("Jump to last frame.");
+    ImGui::SameLine(0, 8*S);
+
+    // Loop toggle
+    ImGui::Checkbox("Loop##motLoop", &s.motionLoop);
+
+    if (!canPlay) ImGui::EndDisabled();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ---- Component position trace plot ------------------------------------
+    // Build per-frame position magnitude from the ACTUAL solved body transforms
+    // (column-major: translation is at indices 12, 13, 14). This reads the real
+    // kinematic output, not the linear input sweep which would always be a straight line.
+    //
+    // Component picker: shows a combo listing all bodies in frame 0.
+    ImGui::PushFont(theme::font(theme::Font::H2));
+    ImGui::TextUnformatted("Component position trace");
+    ImGui::PopFont();
+
+    // Collect body names from frame 0 (stable across frames).
+    static std::vector<std::string> traceBodyNames;
+    static int traceBodySel = 0;
+    traceBodyNames.clear();
+    if (!s.motionTrajectory.empty()) {
+        const auto& f0 = s.motionTrajectory[0];
+        if (f0.contains("bodies") && f0["bodies"].is_array())
+            for (const auto& b : f0["bodies"])
+                if (b.contains("name") && b["name"].is_string())
+                    traceBodyNames.push_back(b["name"].get<std::string>());
+    }
+    if (traceBodySel >= (int)traceBodyNames.size()) traceBodySel = 0;
+
+    if (!traceBodyNames.empty()) {
+        ImGui::SetNextItemWidth(200 * S);
+        if (ImGui::BeginCombo("##tracePick",
+                              traceBodySel < (int)traceBodyNames.size()
+                                  ? traceBodyNames[(size_t)traceBodySel].c_str() : "(none)")) {
+            for (int bi = 0; bi < (int)traceBodyNames.size(); ++bi) {
+                bool sel = (bi == traceBodySel);
+                if (ImGui::Selectable(traceBodyNames[(size_t)bi].c_str(), sel))
+                    traceBodySel = bi;
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        simTip("Select a component to plot its world position magnitude across frames.");
+    }
+
+    // Build position trace from the selected body's column-major transforms.
+    // Column-major 4×4: translation = [m12, m13, m14] = indices 12, 13, 14.
+    static std::vector<float> tracePosValues;   // position magnitude (mm)
+    static std::vector<float> traceVelValues;   // finite-diff velocity (mm/frame)
+    tracePosValues.resize((size_t)n, 0.f);
+    traceVelValues.resize((size_t)n, 0.f);
+    const std::string traceName = (!traceBodyNames.empty() && traceBodySel < (int)traceBodyNames.size())
+                                  ? traceBodyNames[(size_t)traceBodySel] : std::string();
+    for (int fi = 0; fi < n; ++fi) {
+        const auto& frame = s.motionTrajectory[(size_t)fi];
+        if (!frame.contains("bodies") || !frame["bodies"].is_array()) continue;
+        for (const auto& body : frame["bodies"]) {
+            std::string bname;
+            if (body.contains("name") && body["name"].is_string())
+                bname = body["name"].get<std::string>();
+            if (bname != traceName) continue;
+            if (!body.contains("transform") || !body["transform"].is_array()
+                || body["transform"].size() != 16) break;
+            const float tx = body["transform"][12].get<float>();
+            const float ty = body["transform"][13].get<float>();
+            const float tz = body["transform"][14].get<float>();
+            tracePosValues[(size_t)fi] = std::sqrt(tx*tx + ty*ty + tz*tz);
+            break;
+        }
+    }
+    // Finite-difference velocity: mm per frame.
+    for (int fi = 0; fi < n; ++fi) {
+        if (fi == 0)
+            traceVelValues[0] = (n > 1) ? tracePosValues[1] - tracePosValues[0] : 0.f;
+        else if (fi == n - 1)
+            traceVelValues[(size_t)fi] = tracePosValues[(size_t)fi] - tracePosValues[(size_t)(fi - 1)];
+        else
+            traceVelValues[(size_t)fi] = (tracePosValues[(size_t)(fi + 1)] - tracePosValues[(size_t)(fi - 1)]) * 0.5f;
+    }
+
+    char posLabel[64]; std::snprintf(posLabel, sizeof(posLabel), "Position |r| (mm)##motTrace");
+    ImGui::PlotLines(posLabel, tracePosValues.data(), n, 0, nullptr,
+                     FLT_MAX, FLT_MAX, ImVec2(-FLT_MIN, 60 * S));
+    // Draw a vertical cursor at the current frame on the position plot.
+    {
+        ImVec2 p0 = ImGui::GetItemRectMin();
+        ImVec2 p1 = ImGui::GetItemRectMax();
+        float fx  = p0.x + (p1.x - p0.x) * ((float)s.motionFrame / (float)std::max(1, n - 1));
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddLine(ImVec2(fx, p0.y), ImVec2(fx, p1.y),
+                    ImGui::ColorConvertFloat4ToU32(c5::accent()), 2.0f);
+    }
+
+    // Velocity trace (finite-diff, mm/frame).
+    ImGui::Spacing();
+    char velLabel[64]; std::snprintf(velLabel, sizeof(velLabel), "Velocity (mm/frame)##motVelTrace");
+    ImGui::PlotLines(velLabel, traceVelValues.data(), n, 0, nullptr,
+                     FLT_MAX, FLT_MAX, ImVec2(-FLT_MIN, 45 * S));
+    {
+        ImVec2 p0 = ImGui::GetItemRectMin();
+        ImVec2 p1 = ImGui::GetItemRectMax();
+        float fx  = p0.x + (p1.x - p0.x) * ((float)s.motionFrame / (float)std::max(1, n - 1));
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddLine(ImVec2(fx, p0.y), ImVec2(fx, p1.y),
+                    ImGui::ColorConvertFloat4ToU32(c5::accent()), 2.0f);
+    }
+
+    // ---- Interference step marker ------------------------------------
+    if (hasCollision && collisionStep >= 0 && collisionStep < n) {
+        ImGui::Spacing();
+        if (ImGui::Button("Jump to interference##motGotoColl")) {
+            s.motionPlaying = false;
+            applyMotionFrame(st, s, collisionStep);
+        }
+        simTip("Seek to the first frame where interference was detected.");
+    }
+}
+
 // ---------------------------------------------------------------- sim advisor (T-SIM3)
 // The T-W9 sim advisor (services/agent/advisor/sim_advisor.py) is the single source of
 // advisor policy (BC lint, mesh suggestion, margin_policy.json verdict, narration). The GUI
@@ -1277,6 +1740,8 @@ void SimManager::syncResultView(app::AppState& st) {
 }
 
 void SimManager::tick(app::AppState& st) {
+    // Advance any playing motion study — must run every frame for smooth playback.
+    tickMotion(st);
     syncResultView(st);
     auto& job = st.simClient.job();
     const bool owns = (job.ownerDocId.empty() && running_) ||
@@ -1457,6 +1922,8 @@ static bool studyReady(const Study& s, std::string& blocker) {
         }
         return true;
     }
+    // A motion study is always ready — no material, fixtures, or loads needed.
+    if (s.type == StudyType::Motion) return true;
     if (isFlowFamily(s.type)) return true;
     if (s.materialKey.empty()) { blocker = "Material required - pick a material before running."; return false; }
     if (s.type != StudyType::Modal && s.fixtures.empty()) {
@@ -1514,6 +1981,7 @@ void SimManager::drawEmbedded(app::AppState& st, const ImVec2& vpMin, const ImVe
             {StudyType::Modal,   "Frequency", "Natural frequencies and mode shapes."},
             {StudyType::Flow,    "Flow",      "External aerodynamics: drag, lift, streamlines."},
             {StudyType::Thermal, "Thermal",   "Heat transfer via OpenFOAM convection / CHT."},
+            {StudyType::Motion,  "Motion",    "Kinematic assembly simulation: animate mates, check interference."},
         };
         for (const auto& e : kEntries) {
             ImGui::PushID((int)e.type);
@@ -1641,8 +2109,15 @@ void SimManager::drawStudyRow(app::AppState& st, int i) {
             }
             child("mesh", "Mesh", SimNode::Mesh, true, "Mesh density for the solve.");
         }
-        child("results", s.hasResult ? "Results" : "Results (not run)", SimNode::Results, s.hasResult,
-              s.hasResult ? "" : "Run the study to generate results.");
+        // Motion study: simplified tree — no material/fixtures/loads/mesh needed.
+        if (s.type == StudyType::Motion) {
+            child("results", s.motionHasResult ? "Timeline / Results" : "Timeline (not run)",
+                  SimNode::Results, s.motionHasResult,
+                  s.motionHasResult ? "" : "Run the motion study to animate the assembly.");
+        } else {
+            child("results", s.hasResult ? "Results" : "Results (not run)", SimNode::Results, s.hasResult,
+                  s.hasResult ? "" : "Run the study to generate results.");
+        }
         ImGui::TreePop();
     }
     if (pendingDeleteLoad >= 0 && pendingDeleteLoad < (int)s.loads.size()) {
@@ -2660,6 +3135,34 @@ void SimManager::drawForm(app::AppState& st, Study& s) {
         }
     }
     ImGui::Spacing();
+
+    // Motion study has its own form and results — handle before the generic dispatch.
+    if (s.type == StudyType::Motion) {
+        if (node_ == SimNode::Results && s.motionHasResult) {
+            drawMotionResults(st, s);
+        } else {
+            drawMotionForm(st, s);
+            if (s.motionHasResult) {
+                ImGui::Spacing();
+                ImGui::Separator();
+                drawMotionResults(st, s);
+            }
+        }
+        // Run button for motion (synchronous worker.call — no simClient busy state).
+        {
+            ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+            std::string blocker;
+            bool ready = studyReady(s, blocker);
+            if (!ready) ImGui::BeginDisabled();
+            if (ImGui::Button(s.motionHasResult ? "Re-run" : "Run",
+                              ImVec2(-FLT_MIN, 30 * theme::S())))
+                run(st, s);
+            if (!ready) ImGui::EndDisabled();
+            if (!ready) simTip(blocker.c_str());
+        }
+        drawMaterialDialog(st, s);
+        return;
+    }
 
     switch (node_) {
         case SimNode::Results:

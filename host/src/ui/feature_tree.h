@@ -54,6 +54,12 @@ bool fmToolbarIconBtn(const char* id, const char* iconName, const char* tooltip,
 // layout cursor past the chip. Intended call site: layout.cpp drawLeftPane's tab-body header.
 void fmPaneHeaderChip(AppState& st, const char* title, const char* titleIcon, float paneCenterX);
 
+// The purpose-built line-art feature-tree glyph (root node + two branch children) used by the
+// FeatureManager pane-header chip. Exported so the left-pane rail tab button can render the same
+// glyph for the Feature Manager tab instead of the atlas "history" icon. `mn` = top-left, `sz` =
+// glyph box size, `ink` = stroke color.
+void drawFeatureTreeGlyph(ImDrawList* dl, ImVec2 mn, float sz, ImU32 ink);
+
 // The tree's inner content WITHOUT its own Begin/End. The tabbed left pane (ui::drawLeftPane) calls
 // this inside its own "LeftPane" container child so the FeatureManager and PropertyManager tabs share
 // one dock window. editCallback is invoked when "Edit" is chosen from a feature's context menu; it

@@ -1591,7 +1591,7 @@ bool fmToolbarIconBtn(const char* id, const char* iconName, const char* tooltip,
 // Purpose-built line-art "feature tree" glyph: a root node with two branch children, stroked at
 // the same weight as the row icons (1.3dp, like drawEyeGlyph) so it reads as part of the set —
 // replaces the generic "history" three-dot atlas glyph that said nothing about features.
-static void drawFeatureTreeGlyph(ImDrawList* dl, ImVec2 mn, float sz, ImU32 ink) {
+void drawFeatureTreeGlyph(ImDrawList* dl, ImVec2 mn, float sz, ImU32 ink) {
     const float S = ui::uiScale;
     const float th = std::max(1.0f, 1.3f * S);
     const float u = sz / 16.0f;                       // glyph designed on a 16-unit grid

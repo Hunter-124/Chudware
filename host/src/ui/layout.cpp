@@ -148,7 +148,8 @@ static bool drawManagerTabButton(const char* id,
                                  const ui::AdaptiveSurface& surf,
                                  ImU32 halo,
                                  float btn,
-                                 float glyph) {
+                                 float glyph,
+                                 bool useTreeGlyph) {
     const auto& pal = ui::palette;
     const float S = ui::uiScale;
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -177,7 +178,12 @@ static bool drawManagerTabButton(const char* id,
     ImVec4 tint = selected ? surf.textPrimary : surf.textSecondary;
     if (pmAttention && !selected) tint = roleColor(pal.accent);
     IconUV ic = getIcon(icon, 20);
-    if (ic.valid) {
+    if (useTreeGlyph) {
+        // Feature Manager tab: draw the same purpose-built feature-tree glyph the pane-header chip
+        // uses (root node + two branch children) instead of the atlas "history" clock icon.
+        ui::drawFeatureTreeGlyph(dl, ImVec2(p0.x + (btn - glyph) * 0.5f, p0.y + (btn - glyph) * 0.5f),
+                                 glyph, ImGui::ColorConvertFloat4ToU32(tint));
+    } else if (ic.valid) {
         drawIconGlass(dl, icon, ImVec2(p0.x + btn * 0.5f, p0.y + btn * 0.5f), glyph,
                      ImGui::ColorConvertFloat4ToU32(tint), halo);
     } else {
@@ -515,7 +521,8 @@ void drawLeftPane(AppState& st,
         if (i == 0) ImGui::SetCursorPosX(0.0f);
         else        ImGui::SameLine(0, gap);
         if (drawManagerTabButton(idBuf, t.icon, t.fallback, t.tip, selected, attention,
-                                 surf, lpHalo, btn, glyph)) {
+                                 surf, lpHalo, btn, glyph,
+                                 t.id == kLeftPaneFeatureManager)) {
             st.leftPaneTab = t.id;
             // Opening the Simulation manager reveals + fronts the Simulation ribbon toolbar so the
             // study tools are at hand the moment the user is in the simulation workspace.

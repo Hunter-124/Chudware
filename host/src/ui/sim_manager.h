@@ -381,8 +381,63 @@ private:
     // result also drives ui::setRibbonDisabledPrefix("sim_em_", ...) for the honest disabled state.
     int  emStatus_ = 0;
     bool emProbeInflight_ = false;
+    nlohmann::json emStatusResult_;   // cached em_status payload (solvers/defaults/note) for the panel
     void probeEmStatus(AppState& st);
     bool handleEmCommand(AppState& st, const std::string& cmdId);
+
+    // ---- EM (electromagnetics) study UI ----------------------------------------------------------
+    // EM is NOT a doc-persisted Study (the em_* backend is stateless one-shot analysis RPCs, no
+    // sim_study_* persistence). It gets its own PropertyManager-style panel that takes over the left
+    // pane — three forms (eigenmode / driven S-params / time domain), each run async via st.rpc with
+    // a dedicated in-flight guard and results parsed onto the manager (drawn with ImDrawList lines,
+    // the same plotting facility drawFatigueGraphs uses; there is no ImPlot in host/).
+    enum class EmForm { Eigenmode, Driven, TimeDomain };
+    struct EmState {
+        // Shared waveguide selection. stdIdx: -1 = custom, else index into the WR-xx preset table.
+        int   stdIdx = 7;          // default WR-90 (X band) — index into kEmStandards
+        int   shape = 0;           // custom cross-section: 0 = rect, 1 = circular
+        float a_mm = 22.86f;       // rect broad wall (custom)
+        float b_mm = 10.16f;       // rect narrow wall (custom)
+        float radius_mm = 8.0f;    // circular radius (custom)
+
+        // Eigenmode inputs.
+        int   nModes = 6;
+        int   resolution = 64;
+
+        // Driven / time-domain shared geometry length + mode.
+        float lengthMm = 50.0f;
+        int   modeIdx = 0;         // index into kEmModes (TE10 default)
+
+        // Driven sweep.
+        float fStartGhz = 8.0f;
+        float fStopGhz = 12.0f;
+        int   nFreq = 101;
+        char  stlPath[256] = "";   // optional geometry STL (driven)
+
+        // Time domain.
+        float f0Ghz = 10.0f;
+        float bwGhz = 4.0f;
+
+        // Per-form results (transient). ok<0 unrun, 0 error, 1 ok.
+        int  eigResult = -1, drvResult = -1, tdResult = -1;
+        std::string eigError, drvError, tdError;
+        nlohmann::json eigModes;                       // array of {name,type,fc_ghz,kc_per_m,analytic_err_pct}
+        std::vector<float> drvFreq, drvS11, drvS21;    // driven S-parameter arrays
+        std::vector<float> tdTime, tdPort1, tdPort2;   // time-domain traces
+    };
+    EmState em_;
+    bool emPanelOpen_ = false;
+    EmForm emForm_ = EmForm::Eigenmode;
+    bool emRunning_ = false;               // an em_* run launched by this manager is in flight
+    void openEmForm(AppState& st, EmForm f);
+    void drawEmPanel(AppState& st);        // full panel (header + form + results); returns via emPanelOpen_
+    void drawEmForm(AppState& st);         // the active form's inputs
+    void runEmForm(AppState& st);          // dispatch the active form's em_* RPC (async)
+    nlohmann::json emWaveguideSpec() const; // {standard:...} or {waveguide:{...}} from em_
+    void drawEmLinePlot(const char* id, const std::vector<float>& x,
+                        const std::vector<float>* y1, const char* l1,
+                        const std::vector<float>* y2, const char* l2,
+                        const char* xlabel, const char* ylabel);
 
     // Armed well for viewport picking: -1 none, 0 = fixtures, >=1 = loads[armId-1]. Tied to sel_.
     int armedWell_ = -1;

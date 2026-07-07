@@ -929,6 +929,7 @@ void SimManager::probeEmStatus(AppState& st) {
                     const bool available = r.ok && !r.result.contains("code") &&
                                            r.result.value("installed", r.result.value("available", true));
                     emStatus_ = available ? 1 : -1;
+                    if (available) emStatusResult_ = r.result;
                     if (emStatus_ < 0)
                         ui::setRibbonDisabledPrefix("sim_em_", "EM solver not installed");
                     else
@@ -938,7 +939,6 @@ void SimManager::probeEmStatus(AppState& st) {
 }
 
 bool SimManager::handleEmCommand(AppState& st, const std::string& cmdId) {
-    (void)cmdId;
     if (emStatus_ == 0) {
         probeEmStatus(st);
         st.toast(ui::ToastLevel::Info, "Checking for the electromagnetics solver\xe2\x80\xa6");
@@ -950,13 +950,436 @@ bool SimManager::handleEmCommand(AppState& st, const std::string& cmdId) {
                  "available on this machine.");
         return true;
     }
-    // Backend present. The EM study UI (eigenmode / S-parameter sweep / time domain setup forms)
-    // wires up once the backend agent's RPC contract is final — wire request filed in
-    // host/WIRE_REQUESTS.md (sim-gui agent). Honest state until then: tell the user.
-    st.toast(ui::ToastLevel::Info,
-             "EM backend detected \xe2\x80\x94 EM study setup UI lands with the backend contract "
-             "(in progress).");
+    // Backend present — route each sim_em_* ribbon command to the EM panel (PM-style, takes over the
+    // left pane). The three analysis forms open on their own command; the Setup/Run/Results commands
+    // act on the currently-open form (mirrors how the study tools target the active study).
+    st.leftPaneTab = AppState::LP_Simulation;
+    if (cmdId == "sim_em_eigen") { openEmForm(st, EmForm::Eigenmode); return true; }
+    if (cmdId == "sim_em_sweep") { openEmForm(st, EmForm::Driven);    return true; }
+    if (cmdId == "sim_em_time")  { openEmForm(st, EmForm::TimeDomain); return true; }
+
+    // Setup helpers fold into the relevant form (there are no separate port/boundary editors — the
+    // uniform-section backend takes ports/boundaries implicitly as matched modal ports). Open the
+    // form the setting belongs to so the user lands on the right inputs.
+    if (cmdId == "sim_em_ports" || cmdId == "sim_em_boundary") {
+        if (!emPanelOpen_) openEmForm(st, EmForm::Driven);
+        else               emPanelOpen_ = true;
+        st.toast(ui::ToastLevel::Info,
+                 "EM uses matched modal ports on the guide cross-section \xe2\x80\x94 set the "
+                 "waveguide, length and mode in the form.");
+        return true;
+    }
+    if (cmdId == "sim_em_range") {
+        // Frequency range lives on the driven (sweep) form.
+        openEmForm(st, EmForm::Driven);
+        return true;
+    }
+    if (cmdId == "sim_em_run") {
+        if (!emPanelOpen_) {
+            st.toast(ui::ToastLevel::Warn,
+                     "Open an EM analysis first (Eigenmode, Freq Sweep or Time Domain).");
+            return true;
+        }
+        runEmForm(st);
+        return true;
+    }
+    if (cmdId == "sim_em_results") {
+        if (!emPanelOpen_) openEmForm(st, emForm_);
+        else               emPanelOpen_ = true;
+        return true;
+    }
     return true;
+}
+
+// ---------------------------------------------------------------- EM panel (PropertyManager-style)
+
+// EIA rectangular-waveguide standards (name -> broad/narrow wall in mm), mirrored from
+// engine_oracle/sim/em/analytic.py STANDARD_WAVEGUIDES. The order here defines em_.stdIdx; keep
+// WR-90 at index 7 (the EmState default). "Custom" is stdIdx == -1 (handled in the form).
+namespace {
+struct EmStandard { const char* name; float a_mm; float b_mm; };
+static const EmStandard kEmStandards[] = {
+    {"WR-2300", 584.20f, 292.10f}, {"WR-650", 165.10f, 82.55f}, {"WR-430", 109.22f, 54.61f},
+    {"WR-284", 72.136f, 34.036f},  {"WR-187", 47.5488f, 22.1488f}, {"WR-137", 34.8488f, 15.7988f},
+    {"WR-112", 28.4988f, 12.6238f},{"WR-90", 22.86f, 10.16f},  {"WR-75", 19.05f, 9.525f},
+    {"WR-62", 15.7988f, 7.8994f},  {"WR-42", 10.668f, 4.318f}, {"WR-28", 7.112f, 3.556f},
+    {"WR-15", 3.7592f, 1.8796f},   {"WR-10", 2.54f, 1.27f},
+};
+static const int kNEmStandards = (int)(sizeof(kEmStandards) / sizeof(kEmStandards[0]));
+static const char* kEmModes[] = {"TE10", "TE20", "TE01", "TE11", "TM11"};
+static const int kNEmModes = (int)(sizeof(kEmModes) / sizeof(kEmModes[0]));
+}  // namespace
+
+void SimManager::openEmForm(AppState& st, EmForm f) {
+    (void)st;
+    emForm_ = f;
+    emPanelOpen_ = true;
+    panelOpen_ = false;   // EM takes over the pane; close any study setup panel
+}
+
+// Build the {standard:"WR-90"} or {waveguide:{shape,a_mm,b_mm|radius_mm}} spec from em_.
+nlohmann::json SimManager::emWaveguideSpec() const {
+    if (em_.stdIdx >= 0 && em_.stdIdx < kNEmStandards)
+        return nlohmann::json{{"standard", kEmStandards[em_.stdIdx].name}};
+    nlohmann::json wg;
+    if (em_.shape == 1) { wg = {{"shape", "circular"}, {"radius_mm", em_.radius_mm}}; }
+    else                { wg = {{"shape", "rect"}, {"a_mm", em_.a_mm}, {"b_mm", em_.b_mm}}; }
+    return nlohmann::json{{"waveguide", wg}};
+}
+
+// Dispatch the active form's em_* RPC asynchronously (st.rpc — the callback lands in a later
+// drain() on the GL thread, safe to touch em_). A single in-flight guard blocks re-entry.
+void SimManager::runEmForm(AppState& st) {
+    if (emRunning_) return;
+    nlohmann::json params = emWaveguideSpec();
+    std::string method;
+    switch (emForm_) {
+        case EmForm::Eigenmode:
+            method = "em_eigenmode";
+            params["n_modes"] = em_.nModes;
+            params["resolution"] = em_.resolution;
+            break;
+        case EmForm::Driven:
+            method = "em_driven";
+            params["length_mm"] = em_.lengthMm;
+            params["mode"] = kEmModes[(em_.modeIdx >= 0 && em_.modeIdx < kNEmModes) ? em_.modeIdx : 0];
+            params["f_start_ghz"] = em_.fStartGhz;
+            params["f_stop_ghz"] = em_.fStopGhz;
+            params["n_freq"] = em_.nFreq;
+            if (em_.stlPath[0])
+                params["geometry"] = nlohmann::json{{"stl_path", std::string(em_.stlPath)}};
+            break;
+        case EmForm::TimeDomain:
+            method = "em_timedomain";
+            params["length_mm"] = em_.lengthMm;
+            params["mode"] = kEmModes[(em_.modeIdx >= 0 && em_.modeIdx < kNEmModes) ? em_.modeIdx : 0];
+            params["f0_ghz"] = em_.f0Ghz;
+            params["bw_ghz"] = em_.bwGhz;
+            break;
+    }
+    emRunning_ = true;
+    EmForm which = emForm_;
+    st.rpc.call(method, params, [this, which](const core::RpcResult& r) {
+        emRunning_ = false;
+        const bool ok = r.ok && !r.result.contains("code") && r.result.value("ok", true);
+        std::string err;
+        if (!ok) {
+            err = r.result.value("error", r.err.empty() ? std::string("EM solve failed") : r.err);
+        }
+        auto toF = [](const nlohmann::json& a, std::vector<float>& out) {
+            out.clear();
+            if (a.is_array()) for (const auto& v : a) out.push_back(v.is_number() ? (float)v.get<double>() : 0.0f);
+        };
+        if (which == EmForm::Eigenmode) {
+            em_.eigResult = ok ? 1 : 0; em_.eigError = err;
+            em_.eigModes = ok ? r.result.value("modes", nlohmann::json::array()) : nlohmann::json::array();
+        } else if (which == EmForm::Driven) {
+            em_.drvResult = ok ? 1 : 0; em_.drvError = err;
+            if (ok) {
+                toF(r.result.value("freq_ghz", nlohmann::json::array()), em_.drvFreq);
+                toF(r.result.value("s11_db", nlohmann::json::array()), em_.drvS11);
+                toF(r.result.value("s21_db", nlohmann::json::array()), em_.drvS21);
+            } else { em_.drvFreq.clear(); em_.drvS11.clear(); em_.drvS21.clear(); }
+        } else {
+            em_.tdResult = ok ? 1 : 0; em_.tdError = err;
+            if (ok) {
+                toF(r.result.value("t_ns", nlohmann::json::array()), em_.tdTime);
+                const auto& ports = r.result.value("ports", nlohmann::json::object());
+                toF(ports.value("port1_v", nlohmann::json::array()), em_.tdPort1);
+                toF(ports.value("port2_v", nlohmann::json::array()), em_.tdPort2);
+            } else { em_.tdTime.clear(); em_.tdPort1.clear(); em_.tdPort2.clear(); }
+        }
+    }, 120000);
+}
+
+// Generic two-series line plot (ImDrawList — there is no ImPlot in host/; this mirrors the
+// drawFatigueGraphs plotting idiom). x drives the horizontal axis; y1/y2 are optional series drawn
+// in the two accent hues, auto-ranged to the combined min/max with a small margin.
+void SimManager::drawEmLinePlot(const char* id, const std::vector<float>& x,
+                                const std::vector<float>* y1, const char* l1,
+                                const std::vector<float>* y2, const char* l2,
+                                const char* xlabel, const char* ylabel) {
+    const float S = ui::uiScale;
+    if (x.size() < 2) { ImGui::TextDisabled("Not enough samples to plot."); return; }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec4 inkV = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    auto ink = [&](float a) {
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(inkV.x, inkV.y, inkV.z, inkV.w * a));
+    };
+    const ImU32 axisCol = ink(0.62f), txtCol = ink(1.0f), gridCol = ink(0.20f);
+    const ImU32 c1 = IM_COL32(90, 170, 250, 255), c2 = IM_COL32(240, 140, 60, 255);
+
+    float xLo = x.front(), xHi = x.back();
+    if (xHi <= xLo) xHi = xLo + 1.0f;
+    float yLo = 1e30f, yHi = -1e30f;
+    auto span = [&](const std::vector<float>* y) {
+        if (!y) return;
+        for (float v : *y) { if (v < yLo) yLo = v; if (v > yHi) yHi = v; }
+    };
+    span(y1); span(y2);
+    if (yLo > yHi) { yLo = 0; yHi = 1; }
+    if (yHi - yLo < 1e-6f) { yHi += 0.5f; yLo -= 0.5f; }
+    const float ymarg = (yHi - yLo) * 0.08f; yLo -= ymarg; yHi += ymarg;
+
+    const float w = ImGui::GetContentRegionAvail().x, h = 170.0f * S;
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(w, h));
+    dl->PushClipRect(p0, ImVec2(p0.x + w, p0.y + h), true);
+    const float padL = 48 * S, padB = 22 * S, padT = 8 * S, padR = 12 * S;
+    const ImVec2 a0(p0.x + padL, p0.y + padT), a1(p0.x + w - padR, p0.y + h - padB);
+    auto X = [&](float v) { return a0.x + (v - xLo) / (xHi - xLo) * (a1.x - a0.x); };
+    auto Y = [&](float v) { return a1.y - (v - yLo) / (yHi - yLo) * (a1.y - a0.y); };
+    // grid + axes
+    for (int g = 0; g <= 4; ++g) {
+        float yy = a0.y + (a1.y - a0.y) * g / 4.0f;
+        dl->AddLine(ImVec2(a0.x, yy), ImVec2(a1.x, yy), gridCol, 1.0f);
+        char lb[24]; std::snprintf(lb, sizeof(lb), "%.4g", yHi - (yHi - yLo) * g / 4.0f);
+        dl->AddText(ImVec2(p0.x + 2 * S, yy - 6 * S), axisCol, lb);
+    }
+    dl->AddLine(ImVec2(a0.x, a1.y), ImVec2(a1.x, a1.y), axisCol, 1.5f);
+    dl->AddLine(ImVec2(a0.x, a0.y), ImVec2(a0.x, a1.y), axisCol, 1.5f);
+    // x tick labels (start / mid / end)
+    for (int g = 0; g <= 2; ++g) {
+        float xv = xLo + (xHi - xLo) * g / 2.0f;
+        char lb[24]; std::snprintf(lb, sizeof(lb), "%.4g", xv);
+        dl->AddText(ImVec2(X(xv) - (g == 2 ? 24 * S : g == 1 ? 12 * S : 0), a1.y + 4 * S), axisCol, lb);
+    }
+    auto plot = [&](const std::vector<float>* y, ImU32 col) {
+        if (!y || y->empty()) return;
+        int n = (int)std::min(x.size(), y->size());
+        ImVec2 prev(X(x[0]), Y((*y)[0]));
+        for (int i = 1; i < n; ++i) {
+            ImVec2 cur(X(x[i]), Y((*y)[i]));
+            dl->AddLine(prev, cur, col, 2.0f); prev = cur;
+        }
+    };
+    plot(y1, c1); plot(y2, c2);
+    if (xlabel) dl->AddText(ImVec2(a1.x - 30 * S, a1.y + 4 * S), txtCol, xlabel);
+    if (ylabel) dl->AddText(ImVec2(p0.x + 2 * S, p0.y + 2 * S), txtCol, ylabel);
+    dl->PopClipRect();
+    // legend row
+    if (l1 && y1) { ImGui::PushStyleColor(ImGuiCol_Text, c1); ImGui::TextUnformatted(l1); ImGui::PopStyleColor(); }
+    if (l2 && y2) { if (l1 && y1) ImGui::SameLine(0, 16 * S);
+                    ImGui::PushStyleColor(ImGuiCol_Text, c2); ImGui::TextUnformatted(l2); ImGui::PopStyleColor(); }
+    (void)id;
+}
+
+void SimManager::drawEmForm(AppState& st) {
+    (void)st;
+    const float S = ui::uiScale;
+    // ---- shared waveguide cross-section selector ----
+    ImGui::TextUnformatted("Waveguide");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    const char* stdLabel = (em_.stdIdx >= 0 && em_.stdIdx < kNEmStandards)
+                               ? kEmStandards[em_.stdIdx].name : "Custom cross-section";
+    if (ImGui::BeginCombo("##emstd", stdLabel)) {
+        for (int i = 0; i < kNEmStandards; ++i) {
+            char lb[48];
+            std::snprintf(lb, sizeof(lb), "%s  (%.3g x %.3g mm)",
+                          kEmStandards[i].name, kEmStandards[i].a_mm, kEmStandards[i].b_mm);
+            if (ImGui::Selectable(lb, em_.stdIdx == i)) {
+                em_.stdIdx = i; em_.a_mm = kEmStandards[i].a_mm; em_.b_mm = kEmStandards[i].b_mm;
+            }
+        }
+        if (ImGui::Selectable("Custom cross-section", em_.stdIdx < 0)) em_.stdIdx = -1;
+        ImGui::EndCombo();
+    }
+    simTip("EIA rectangular-waveguide standard (WR-90 is X-band). Choose Custom for an arbitrary "
+           "rectangular or circular cross-section.");
+    if (em_.stdIdx < 0) {
+        static const char* kShapes[2] = {"Rectangular", "Circular"};
+        ImGui::TextUnformatted("Cross-section");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##emshape", kShapes[em_.shape ? 1 : 0])) {
+            for (int i = 0; i < 2; ++i) if (ImGui::Selectable(kShapes[i], em_.shape == i)) em_.shape = i;
+            ImGui::EndCombo();
+        }
+        if (em_.shape == 0) {
+            ImGui::TextUnformatted("Broad wall a (mm)");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::DragFloat("##ema", &em_.a_mm, 0.1f, 0.1f, 2000.0f, "%.3f mm");
+            ImGui::TextUnformatted("Narrow wall b (mm)");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::DragFloat("##emb", &em_.b_mm, 0.1f, 0.1f, 2000.0f, "%.3f mm");
+        } else {
+            ImGui::TextUnformatted("Radius (mm)");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::DragFloat("##emr", &em_.radius_mm, 0.1f, 0.1f, 2000.0f, "%.3f mm");
+        }
+    }
+    ImGui::Spacing();
+
+    // ---- per-form inputs ----
+    if (emForm_ == EmForm::Eigenmode) {
+        ImGui::SeparatorText("Eigenmode");
+        ImGui::TextUnformatted("Number of modes");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SliderInt("##emn", &em_.nModes, 1, 20);
+        simTip("How many cutoff modes to solve, ordered by cutoff frequency.");
+        ImGui::TextUnformatted("Resolution (grid)");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SliderInt("##emres", &em_.resolution, 16, 256);
+        simTip("FDFD eigensolver grid resolution across the cross-section. Higher = more accurate, "
+               "slower. The analytic error vs the closed-form cutoff is reported per mode.");
+    } else {
+        // Driven + time domain share the guide length + excitation mode.
+        ImGui::SeparatorText(emForm_ == EmForm::Driven ? "Driven (S-parameters)" : "Time domain");
+        ImGui::TextUnformatted("Length (mm)");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::DragFloat("##emlen", &em_.lengthMm, 0.5f, 0.1f, 5000.0f, "%.2f mm");
+        simTip("Straight guide section length between the two matched modal ports.");
+        ImGui::TextUnformatted("Excitation mode");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        int mi = (em_.modeIdx >= 0 && em_.modeIdx < kNEmModes) ? em_.modeIdx : 0;
+        if (ImGui::BeginCombo("##emmode", kEmModes[mi])) {
+            for (int i = 0; i < kNEmModes; ++i) if (ImGui::Selectable(kEmModes[i], mi == i)) em_.modeIdx = i;
+            ImGui::EndCombo();
+        }
+        if (emForm_ == EmForm::Driven) {
+            ImGui::TextUnformatted("Start frequency (GHz)");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::DragFloat("##emf0", &em_.fStartGhz, 0.05f, 0.01f, 300.0f, "%.3f GHz");
+            ImGui::TextUnformatted("Stop frequency (GHz)");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::DragFloat("##emf1", &em_.fStopGhz, 0.05f, 0.01f, 300.0f, "%.3f GHz");
+            ImGui::TextUnformatted("Frequency points");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::SliderInt("##emnf", &em_.nFreq, 3, 1001);
+            ImGui::TextUnformatted("Geometry STL (optional)");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputText("##emstl", em_.stlPath, sizeof(em_.stlPath));
+            simTip("Optional STL path for a full-wave (openEMS) solve over real geometry. Leave empty "
+                   "for the fast analytic uniform-section S-parameters.");
+        } else {  // TimeDomain
+            ImGui::TextUnformatted("Center frequency f0 (GHz)");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::DragFloat("##emtf0", &em_.f0Ghz, 0.05f, 0.01f, 300.0f, "%.3f GHz");
+            ImGui::TextUnformatted("Bandwidth (GHz)");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::DragFloat("##embw", &em_.bwGhz, 0.05f, 0.01f, 300.0f, "%.3f GHz");
+            simTip("Gaussian-modulated excitation: center frequency and bandwidth of the pulse.");
+        }
+    }
+    (void)S;
+}
+
+void SimManager::drawEmPanel(AppState& st) {
+    const float S = ui::uiScale;
+    // ---- header (own — EM has no Study, so drawPanelHeader(Study&) doesn't apply) ----
+    const char* formName = emForm_ == EmForm::Eigenmode ? "Eigenmode"
+                         : emForm_ == EmForm::Driven ? "Freq Sweep (S-parameters)" : "Time Domain";
+    IconUV iv = getIcon(emForm_ == EmForm::Eigenmode ? "study_modal"
+                        : emForm_ == EmForm::Driven ? "study_flow" : "study_static", 20);
+    if (iv.valid) { ImGui::Image(iv.texId, ImVec2(16.0f * S, 16.0f * S), iv.uv0, iv.uv1);
+                    ImGui::SameLine(0, 6.0f * S); }
+    ImGui::PushFont(st.fonts.medium);
+    ImGui::TextUnformatted((std::string("Electromagnetics \xe2\x80\x94 ") + formName).c_str());
+    ImGui::PopFont();
+    const float btnW = 40.0f * S;
+    const float rightX = ImGui::GetWindowContentRegionMax().x - btnW;
+    if (rightX > ImGui::GetCursorPosX()) ImGui::SameLine(rightX); else ImGui::SameLine();
+    if (ImGui::Button("OK", ImVec2(btnW, 0))) { emPanelOpen_ = false; return; }
+    simTip("Close the EM panel and return to the study tree.");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ---- analysis switcher (three tabs, so all forms are reachable without the ribbon) ----
+    if (ImGui::BeginTabBar("##emtabs")) {
+        struct T { const char* label; EmForm f; };
+        static const T tabs[] = {{"Eigenmode", EmForm::Eigenmode},
+                                 {"Freq Sweep", EmForm::Driven},
+                                 {"Time Domain", EmForm::TimeDomain}};
+        for (const auto& t : tabs) {
+            ImGuiTabItemFlags tf = (emForm_ == t.f) ? ImGuiTabItemFlags_SetSelected : 0;
+            if (ImGui::BeginTabItem(t.label, nullptr, tf)) { emForm_ = t.f; ImGui::EndTabItem(); }
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::Spacing();
+
+    // ---- inputs ----
+    drawEmForm(st);
+
+    // ---- run ----
+    ImGui::Spacing();
+    ImGui::Separator();
+    if (emRunning_) {
+        ImGui::TextDisabled("Solving\xe2\x80\xa6");
+        ImGui::BeginDisabled();
+        ImGui::Button("Run", ImVec2(-FLT_MIN, 0));
+        ImGui::EndDisabled();
+    } else {
+        if (ImGui::Button("Run", ImVec2(-FLT_MIN, 0))) runEmForm(st);
+    }
+    simTip("Run the electromagnetics solve for this analysis (async — the panel stays responsive).");
+
+    // ---- results ----
+    ImGui::Spacing();
+    if (emForm_ == EmForm::Eigenmode) {
+        if (em_.eigResult == 0) {
+            ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(ui::palette.statusErr));
+            ImGui::TextWrapped("%s", em_.eigError.c_str());
+            ImGui::PopStyleColor();
+        } else if (em_.eigResult == 1) {
+            ImGui::SeparatorText("Modes");
+            if (em_.eigModes.empty()) {
+                ImGui::TextDisabled("No modes returned.");
+            } else if (ImGui::BeginTable("##emmodes", 5,
+                       ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("Mode");
+                ImGui::TableSetupColumn("Type");
+                ImGui::TableSetupColumn("fc (GHz)");
+                ImGui::TableSetupColumn("kc (1/m)");
+                ImGui::TableSetupColumn("err %");
+                ImGui::TableHeadersRow();
+                int row = 0;
+                for (const auto& m : em_.eigModes) {
+                    ImGui::TableNextRow();
+                    // The first (lowest-fc) mode is the dominant mode — highlight the whole row.
+                    if (row == 0)
+                        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(90, 170, 250, 40));
+                    ImGui::TableNextColumn();
+                    std::string nm = m.value("name", std::string("?"));
+                    if (row == 0) nm += "  (dominant)";
+                    ImGui::TextUnformatted(nm.c_str());
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(m.value("type", std::string("")).c_str());
+                    ImGui::TableNextColumn(); ImGui::Text("%.4f", m.value("fc_ghz", 0.0));
+                    ImGui::TableNextColumn(); ImGui::Text("%.2f", m.value("kc_per_m", 0.0));
+                    ImGui::TableNextColumn();
+                    if (m.contains("analytic_err_pct")) ImGui::Text("%.3f", m.value("analytic_err_pct", 0.0));
+                    else ImGui::TextDisabled("-");
+                    ++row;
+                }
+                ImGui::EndTable();
+            }
+        } else {
+            ImGui::TextDisabled("Run to compute the cutoff-mode table.");
+        }
+    } else if (emForm_ == EmForm::Driven) {
+        if (em_.drvResult == 0) {
+            ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(ui::palette.statusErr));
+            ImGui::TextWrapped("%s", em_.drvError.c_str());
+            ImGui::PopStyleColor();
+        } else if (em_.drvResult == 1) {
+            ImGui::SeparatorText("S-parameters (dB)");
+            drawEmLinePlot("##emsparam", em_.drvFreq, &em_.drvS11, "S11 (dB)", &em_.drvS21, "S21 (dB)",
+                           "GHz", "dB");
+        } else {
+            ImGui::TextDisabled("Run to compute S11 / S21 vs frequency.");
+        }
+    } else {  // TimeDomain
+        if (em_.tdResult == 0) {
+            ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(ui::palette.statusErr));
+            ImGui::TextWrapped("%s", em_.tdError.c_str());
+            ImGui::PopStyleColor();
+        } else if (em_.tdResult == 1) {
+            ImGui::SeparatorText("Port voltages");
+            drawEmLinePlot("##emtd", em_.tdTime, &em_.tdPort1, "Port 1 (V)", &em_.tdPort2, "Port 2 (V)",
+                           "ns", "V");
+        } else {
+            ImGui::TextDisabled("Run to compute the port-voltage traces.");
+        }
+    }
 }
 
 void SimManager::configureActive(AppState& st, float density, const std::string& materialKey) {
@@ -2130,6 +2553,10 @@ void SimManager::drawTreeBody(AppState& st) {
     const bool paneInk = ui::viewportBackdrop().valid();
     if (paneInk) ImGui::PushStyleColor(ImGuiCol_Text, simSurf().textPrimary);
     struct PaneInkPop { bool on; ~PaneInkPop() { if (on) ImGui::PopStyleColor(); } } paneInkPop{paneInk};
+
+    // ---- EM (electromagnetics) panel takes over the pane when open. EM is standalone (no doc Study),
+    // so it must be handled BEFORE the study-panel block below (which requires a valid sel_).
+    if (emPanelOpen_) { drawEmPanel(st); return; }
 
     // ---- sim-gui rework: tool-invoked setup panel (PropertyManager flow) --------------------
     // When a ribbon tool was invoked (or a tree node double-clicked) the matching setup editor

@@ -9933,7 +9933,9 @@ json doc_simulate_motion(const std::string& doc_id,
 
         // Set mate value + re-solve (each call acquires DocLock internally).
         json set_ops = json::array();
-        set_ops.push_back({{"op", "asm_edit_mate"}, {"id", mate_id}, {"value", val}});
+        // Mate value must be a dim object {value, expr} — bare double fails validation.
+        set_ops.push_back({{"op", "asm_edit_mate"}, {"id", mate_id},
+                           {"value", {{"value", val}, {"expr", nullptr}}}});
         try {
             doc_apply_ops(doc_id, -1, set_ops, /*coalesce=*/true);
         } catch (const OpError&) {
@@ -9999,7 +10001,8 @@ json doc_simulate_motion(const std::string& doc_id,
     // ---- 4. Restore original mate value ------------------------------------
     {
         json restore_ops = json::array();
-        restore_ops.push_back({{"op", "asm_edit_mate"}, {"id", mate_id}, {"value", orig_value}});
+        restore_ops.push_back({{"op", "asm_edit_mate"}, {"id", mate_id},
+                               {"value", {{"value", orig_value}, {"expr", nullptr}}}});
         try {
             doc_apply_ops(doc_id, -1, restore_ops, /*coalesce=*/true);
             doc_solve_mates(doc_id);

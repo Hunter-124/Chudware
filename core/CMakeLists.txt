@@ -874,6 +874,21 @@ if(AICAD_WITH_OCCT)
   add_test(NAME export_assembly COMMAND test_export_assembly)
   set_tests_properties(export_assembly PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- simulate_motion: assembly kinematic sweep smoke test -------------------
+  # Exercises doc_simulate_motion end-to-end: assembly + angle mate + sweep 0->90 deg.
+  # Linked like test_export_assembly (needs STEP writer via aicad_geom_occt).
+  add_executable(test_simulate_motion
+    tests/test_simulate_motion.cpp)
+  target_include_directories(test_simulate_motion PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_simulate_motion PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_simulate_motion PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME simulate_motion COMMAND test_simulate_motion)
+  set_tests_properties(simulate_motion PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- Wave 2 milestone: the document model — a rebuildable feature tree ------
   # core/doc/document.cpp orchestrates solve_sketch -> faces_from_solved_sketch ->
   # extrude/revolve -> fuse/cut/common -> fillet/chamfer into a part, keyed by

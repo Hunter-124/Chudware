@@ -629,13 +629,14 @@ void drawCamTreeBody(AppState& st) {
 
     // ---- Job root ----
     const bool jobSel = (g.selKind == 1);
+    bool jobOpen = false;
     {
         FmRowRect rr = fmRowPill(jobSel);
         fmTreeIcon("new_doc", "J");
         ImGui::SameLine(0, 4.0f * S);
         std::string jobLbl = (g.mirror.name().empty() ? std::string("CAM Job") : g.mirror.name())
                              + "  (rev " + std::to_string(g.mirror.revision()) + ")";
-        const bool jobOpen = ImGui::TreeNodeEx("##cam_job",
+        jobOpen = ImGui::TreeNodeEx("##cam_job",
             ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow |
             ImGuiTreeNodeFlags_SpanAvailWidth, "%s", jobLbl.c_str());
         if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) g.selKind = 1;
@@ -777,6 +778,8 @@ void drawCamTreeBody(AppState& st) {
         ImGui::TextDisabled("%s", g.status.c_str());
         ImGui::PopTextWrapPos();
     }
+
+    if (jobOpen) ImGui::TreePop();   // balance the ##cam_job TreeNodeEx opened above
 
     if (!pendingOps.empty()) applyOps(st, pendingOps);   // after the walk — mirror reload safe
 }

@@ -202,6 +202,32 @@ void plmCopyText(const char* id, const std::string& text, const float* col = nul
     ImGui::PopStyleColor(4);
 }
 
+// A wrapping item title/message. Every list card uses this so long text wraps to
+// the card width (and grows the AutoResizeY card) instead of clipping — unlike
+// plmCopyText, which is a single-line field. Plain text, so a click on it counts
+// as a card-body click (used to select the row and reveal its admin controls).
+// `col` = text colour (nullptr = default). Pass alignFrame when it shares a line
+// with a framed widget (e.g. a severity badge) so baselines line up.
+void plmItemTitle(const std::string& text, const float* col = nullptr,
+                  bool alignFrame = false) {
+    const float* c = col ? col : palette.text;
+    if (alignFrame) ImGui::AlignTextToFramePadding();
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], 1.0f));
+    ImGui::TextUnformatted(text.c_str());
+    ImGui::PopStyleColor();
+    ImGui::PopTextWrapPos();
+}
+
+// Tight, uniform metrics for a card's admin action row — shown only when the card
+// is selected. Every card's controls use these so spacing/padding read identically.
+void plmActionRowBegin() {
+    const float S = ui::uiScale;
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 1 * S));
+}
+void plmActionRowEnd() { ImGui::PopStyleVar(2); }
+
 // A discrete frosted-glass section box. Content drawn between Begin/End sits inside
 // a rounded translucent panel with even internal padding and an optional icon+title
 // header — so each settings/planning group reads as its own card instead of a wall
@@ -371,7 +397,7 @@ void plmDrawOverviewPage(AppState& st) {
                          e.kind == "release" ? palette.statusOk : palette.accent, 0.15f);
             std::string headline = !e.message.empty() ? e.message
                                  : (!e.summary.empty() ? e.summary : "(saved)");
-            plmCopyText("##acth", headline);
+            plmItemTitle(headline);          // wraps long messages instead of clipping
             dimText("%s  \xc2\xb7  %s", e.author.c_str(), plmNiceTime(e.authoredAt).c_str());
             plmCardEnd();
             ImGui::PopID();
@@ -384,8 +410,8 @@ void plmDrawOverviewPage(AppState& st) {
             for (const auto& t : ov.tasks) {
                 ImGui::PushID(t.id.c_str());
                 plmCardBegin("##ovt", false, 8.0f, 3.0f, plmTintPriority(t.priority), 0.20f);
-                plmCopyText("##ovtt", t.title);
-                priorityDot(t.priority);
+                plmItemTitle(t.title);          // wraps long titles instead of clipping
+                priorityDot(t.priority);        // right-pinned on the title line
                 plmCardEnd();
                 ImGui::PopID();
             }
@@ -810,7 +836,7 @@ void plmDrawHistoryPage(AppState& st) {
         }
         std::string headline = !e.message.empty() ? e.message
                              : (!e.summary.empty() ? e.summary : "(saved)");
-        plmCopyText("##hh", headline);
+        plmItemTitle(headline, nullptr, /*alignFrame=*/rel);   // wraps long messages
         dimText("%s  \xc2\xb7  %s", e.author.c_str(), plmNiceTime(e.authoredAt).c_str());
         if (sel) {
             ImGui::PushStyleColor(ImGuiCol_Button,
@@ -1300,7 +1326,9 @@ void priorityDot(const std::string& pr) {
     }
 }
 
-static std::string s_selTask;
+static std::string s_selTask;     // selected kanban task (reveals its controls)
+static std::string s_selMs;       // selected milestone row
+static std::string s_selIssue2;   // selected planning-page issue row
 
 }  // namespace
 
@@ -1331,6 +1359,8 @@ static void drawMilestoneRow(AppState& st, const PlmMilestoneRow& m) {
         ImGui::SameLine();
         if (ImGui::SmallButton("Cancel")) H.msEditId.clear();
     } else {
+        bool sel = (s_selMs == m.id);
+        // status badge + wrapping title, always visible
         ImGui::PushStyleColor(ImGuiCol_Text, done
             ? ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f)
             : ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
@@ -1338,27 +1368,8 @@ static void drawMilestoneRow(AppState& st, const PlmMilestoneRow& m) {
         ImGui::TextUnformatted(done ? "Done" : "Open");
         ImGui::PopStyleColor();
         ImGui::SameLine();
-        // Title wraps so a long name grows the card instead of clipping.
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(m.title.c_str());
-        ImGui::PopTextWrapPos();
-        // action row (due date rides inline on the right so the row stays compact)
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 1 * S));
-        if (ImGui::SmallButton("Edit")) {
-            H.msEditId = m.id;
-            std::snprintf(H.msEditTitle, sizeof(H.msEditTitle), "%s", m.title.c_str());
-            std::snprintf(H.msEditDue, sizeof(H.msEditDue), "%s", m.due.c_str());
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton(done ? "Reopen" : "Complete"))
-            planCall(st, "update", "milestone", {{"status", done ? "open" : "done"}}, m.id);
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button,
-            ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 0.5f));
-        if (ImGui::SmallButton("Del")) planCall(st, "delete", "milestone", nullptr, m.id);
-        ImGui::PopStyleColor();
+        plmItemTitle(m.title, nullptr, /*alignFrame=*/true);
+        // due date — dimmed, pinned to the right of the title row (info, always on)
         if (!m.due.empty()) {
             char due[48]; std::snprintf(due, sizeof(due), "due %s", m.due.c_str());
             float dw = ImGui::CalcTextSize(due).x;
@@ -1374,9 +1385,27 @@ static void drawMilestoneRow(AppState& st, const PlmMilestoneRow& m) {
                 dimText("due %s", m.due.c_str());  // narrow card: wrap to next line
             }
         }
-        ImGui::PopStyleVar(2);
+        // admin controls — hidden until the row is selected
+        if (sel) {
+            plmActionRowBegin();
+            if (ImGui::SmallButton("Edit")) {
+                H.msEditId = m.id;
+                std::snprintf(H.msEditTitle, sizeof(H.msEditTitle), "%s", m.title.c_str());
+                std::snprintf(H.msEditDue, sizeof(H.msEditDue), "%s", m.due.c_str());
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton(done ? "Reopen" : "Complete"))
+                planCall(st, "update", "milestone", {{"status", done ? "open" : "done"}}, m.id);
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 0.5f));
+            if (ImGui::SmallButton("Del")) planCall(st, "delete", "milestone", nullptr, m.id);
+            ImGui::PopStyleColor();
+            plmActionRowEnd();
+        }
     }
-    plmCardEnd();
+    bool msClicked = plmCardEnd();
+    if (!editing && msClicked) s_selMs = (s_selMs == m.id) ? "" : m.id;
     ImGui::PopID();
 }
 
@@ -1385,55 +1414,53 @@ static void drawMilestoneRow(AppState& st, const PlmMilestoneRow& m) {
 // organise fixes right where you see the problems.
 static void drawIssueRow(AppState& st, const PlmIssueRow& is) {
     const float S = ui::uiScale;
+    (void)S;
     bool closed = (is.state == "closed");
+    bool sel = (s_selIssue2 == is.id);
     ImGui::PushID(is.id.c_str());
-    plmCardBegin("##is", false, 8.0f, 3.0f, plmTintSeverity(is.severity), 0.16f);
+    plmCardBegin("##is", sel, 8.0f, 3.0f, plmTintSeverity(is.severity), 0.16f);
     const float* sc = palette.textDim;
     if (is.severity == "critical" || is.severity == "high") sc = palette.statusErr;
     else if (is.severity == "med") sc = palette.statusWarn;
+    // severity badge + wrapping title (plain text, so a click selects the row)
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(sc[0], sc[1], sc[2], 1.0f));
-    // Match plmCopyText's frame padding (2px) so the badge frame height equals the
-    // title field's — otherwise the [sev] tag sits above the title text baseline.
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 2 * S));
     ImGui::AlignTextToFramePadding();
     ImGui::Text("[%s]", is.severity.empty() ? "med" : is.severity.c_str());
-    ImGui::PopStyleVar();
     ImGui::PopStyleColor();
     ImGui::SameLine();
-    if (closed) {
-        plmCopyText("##ist", "(closed) " + is.title, palette.textDisabled);
-    } else {
-        plmCopyText("##ist", is.title);
+    plmItemTitle(closed ? "(closed) " + is.title : is.title,
+                 closed ? palette.textDisabled : nullptr, /*alignFrame=*/true);
+    // admin controls — hidden until the row is selected
+    if (sel) {
+        plmActionRowBegin();
+        accentButtonColors();
+        if (ImGui::SmallButton("Make plan")) {
+            nlohmann::json d = {{"title", is.title},
+                                {"links", nlohmann::json::array({
+                                    {{"kind", "issue"}, {"id", is.id}}})}};
+            planCall(st, "create", "task", d);
+            st.toast(ui::ToastLevel::Success, "Added a task from this issue");
+        }
+        ImGui::PopStyleColor(2);
+        ImGui::SameLine();
+        // cycle the severity/priority in place: low → med → high → critical → low
+        static const char* kSevCycle[] = {"low", "med", "high", "critical"};
+        if (ImGui::SmallButton("Priority")) {
+            int cur = 1;  // default med
+            for (int k = 0; k < 4; ++k) if (is.severity == kSevCycle[k]) cur = k;
+            planCall(st, "update", "issue", {{"severity", kSevCycle[(cur + 1) % 4]}}, is.id);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(closed ? "Reopen" : "Close"))
+            planCall(st, "update", "issue", {{"state", closed ? "open" : "closed"}}, is.id);
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 0.5f));
+        if (ImGui::SmallButton("Del")) planCall(st, "delete", "issue", nullptr, is.id);
+        ImGui::PopStyleColor();
+        plmActionRowEnd();
     }
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 1 * S));
-    accentButtonColors();
-    if (ImGui::SmallButton("Make plan")) {
-        nlohmann::json d = {{"title", is.title},
-                            {"links", nlohmann::json::array({
-                                {{"kind", "issue"}, {"id", is.id}}})}};
-        planCall(st, "create", "task", d);
-        st.toast(ui::ToastLevel::Success, "Added a task from this issue");
-    }
-    ImGui::PopStyleColor(2);
-    ImGui::SameLine();
-    // cycle the severity/priority in place: low → med → high → critical → low
-    static const char* kSevCycle[] = {"low", "med", "high", "critical"};
-    if (ImGui::SmallButton("Priority")) {
-        int cur = 1;  // default med
-        for (int k = 0; k < 4; ++k) if (is.severity == kSevCycle[k]) cur = k;
-        planCall(st, "update", "issue", {{"severity", kSevCycle[(cur + 1) % 4]}}, is.id);
-    }
-    ImGui::SameLine();
-    if (ImGui::SmallButton(closed ? "Reopen" : "Close"))
-        planCall(st, "update", "issue", {{"state", closed ? "open" : "closed"}}, is.id);
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button,
-        ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 0.5f));
-    if (ImGui::SmallButton("Del")) planCall(st, "delete", "issue", nullptr, is.id);
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar(2);
-    plmCardEnd();
+    if (plmCardEnd()) s_selIssue2 = sel ? "" : is.id;
     ImGui::PopID();
 }
 
@@ -1596,56 +1623,48 @@ void plmDrawPlanningPage(AppState& st) {
 
             // Title wraps to the card width so the card auto-grows (AutoResizeY) to
             // fit a long title instead of clipping it to one line.
-            ImGui::PushTextWrapPos(0.0f);
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palette.text[0], palette.text[1], palette.text[2], 1.0f));
-            ImGui::TextUnformatted(t.title.c_str());
-            ImGui::PopStyleColor();
-            ImGui::PopTextWrapPos();
+            plmItemTitle(t.title);
+            // Priority dot — always visible, right-pinned on the title's line (info,
+            // not a control), so an unselected card still shows its priority.
+            priorityDot(t.priority);
             if (!t.assignee.empty()) dimText("@%s", t.assignee.c_str());
 
-            // Movement controls — always visible, one click, no select-first step.
-            // ‹ › walk the todo→doing→done lane; Block parks the task. The row is
-            // dropped down a touch and shares a baseline with the priority dot.
-            int idx = -1;
-            for (int k = 0; k < 3; ++k) if (t.status == kPipe[k]) idx = k;
-            bool blocked = (idx < 0);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 1 * S));
-            // ArrowButton draws a real triangle (font-independent — the ‹ › glyphs
-            // were not in the atlas and rendered blank); the tight FramePadding
-            // above shrinks its square to a compact size.
-            ImGui::BeginDisabled(!blocked && idx == 0);
-            if (ImGui::ArrowButton("##prev", ImGuiDir_Left))
-                planCall(st, "update", "task",
-                         {{"status", blocked ? "todo" : kPipe[idx - 1]}}, t.id);
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::BeginDisabled(!blocked && idx == 2);
-            if (ImGui::ArrowButton("##next", ImGuiDir_Right))
-                planCall(st, "update", "task",
-                         {{"status", blocked ? "doing" : kPipe[idx + 1]}}, t.id);
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            if (blocked) {
-                if (ImGui::SmallButton("Unblock"))
-                    planCall(st, "update", "task", {{"status", "todo"}}, t.id);
-            } else if (ImGui::SmallButton("Block")) {
-                planCall(st, "update", "task", {{"status", "blocked"}}, t.id);
-            }
+            // Admin controls — hidden until the card is selected (click to reveal).
+            // ‹ › walk the todo→doing→done lane; Block parks the task; Del removes it.
             if (sel) {
+                int idx = -1;
+                for (int k = 0; k < 3; ++k) if (t.status == kPipe[k]) idx = k;
+                bool blocked = (idx < 0);
+                plmActionRowBegin();
+                // ArrowButton draws a real triangle (font-independent — the ‹ › glyphs
+                // were not in the atlas and rendered blank); the tight FramePadding
+                // shrinks its square to a compact size.
+                ImGui::BeginDisabled(!blocked && idx == 0);
+                if (ImGui::ArrowButton("##prev", ImGuiDir_Left))
+                    planCall(st, "update", "task",
+                             {{"status", blocked ? "todo" : kPipe[idx - 1]}}, t.id);
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!blocked && idx == 2);
+                if (ImGui::ArrowButton("##next", ImGuiDir_Right))
+                    planCall(st, "update", "task",
+                             {{"status", blocked ? "doing" : kPipe[idx + 1]}}, t.id);
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (blocked) {
+                    if (ImGui::SmallButton("Unblock"))
+                        planCall(st, "update", "task", {{"status", "todo"}}, t.id);
+                } else if (ImGui::SmallButton("Block")) {
+                    planCall(st, "update", "task", {{"status", "blocked"}}, t.id);
+                }
                 ImGui::SameLine();
                 ImGui::PushStyleColor(ImGuiCol_Button,
                     ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 0.55f));
                 if (ImGui::SmallButton("Del"))
                     planCall(st, "delete", "task", nullptr, t.id);
                 ImGui::PopStyleColor();
+                plmActionRowEnd();
             }
-            // Priority dot on the SAME line as the controls — drawn while the compact
-            // FramePadding is still pushed so its height matches the buttons and they
-            // share a vertical centre. Right-pinned inside the card.
-            priorityDot(t.priority);
-            ImGui::PopStyleVar(2);
             if (plmCardEnd()) s_selTask = sel ? "" : t.id;
             ImGui::PopID();
         }

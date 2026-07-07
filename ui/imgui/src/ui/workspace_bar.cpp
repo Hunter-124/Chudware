@@ -1,4 +1,5 @@
 #include "ui/panels.h"
+#include "ui/title_bar.h"
 #include "ui/command_registry.h"
 #include "app/app_state.h"
 #include "theme/theme.h"
@@ -9,6 +10,10 @@ namespace ui {
 
 using app::AppState;
 
+// ---------------------------------------------------------------------------
+// chip() — single workspace mode pill.  Returns true when clicked.
+// Caller must be inside an ImGui window (InvisibleButton advances cursor).
+// ---------------------------------------------------------------------------
 static bool chip(const char* id, const char* icon, const char* label, bool active, bool primary) {
     const float S = theme::S();
     ImGui::PushID(id);
@@ -30,115 +35,158 @@ static bool chip(const char* id, const char* icon, const char* label, bool activ
     return clicked;
 }
 
-void drawWorkspaceBar(AppState& s, float height) {
+// ---------------------------------------------------------------------------
+// chipWidth() — measure a single chip without drawing it.
+// ---------------------------------------------------------------------------
+static float chipWidth(const char* label) {
     const float S = theme::S();
-    // T-G23: the SW-style workspace tab strip shares the ribbon's T-G16 liquid-glass band treatment
-    // (adaptive surface + Thin material) so the tab row + ribbon read as one continuous glass chrome
-    // band over the full-width viewport, instead of an opaque bg1 strip.
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##wsbar", ImVec2(0, height), false,
-                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    {
-        ImVec2 bwp = ImGui::GetWindowPos(), bws = ImGui::GetWindowSize();
-        ImRect bandRect(bwp, ImVec2(bwp.x + bws.x, bwp.y + bws.y));
-        const theme::AdaptiveSurface& bandSurf =
-            theme::adaptivePanel(theme::panelId("wsbar_glass"), bandRect);
-        theme::glassPanel(dl, bandRect, theme::MaterialLevel::Thin, 0.f, bandSurf);
-    }
-    ImGui::SetCursorPos(ImVec2(12*S, (height-24*S)*0.5f));
+    ImFont* f = theme::font(theme::Font::Label);
+    ImVec2 ts = f->CalcTextSizeA(f->FontSize, FLT_MAX, 0, label);
+    float icSz = 15*S;
+    return icSz + 8*S + ts.x + 20*S;
+}
+
+// ---------------------------------------------------------------------------
+// workspaceChipsWidth() — total pixel width of the chip cluster for the
+// current doc type / inSketch state.  Call this before drawWorkspaceChips()
+// to compute the centered X origin in the title bar.
+// ---------------------------------------------------------------------------
+float workspaceChipsWidth(AppState& s) {
+    const float S = theme::S();
+    const float chipGap = 6*S;
+    const float divW    = 10*S + ImMax(1.f, S); // spacing around the divider line
 
     if (s.inSketch) {
-        chip("sk", "ws_sketch", "Sketch1", true, true);
+        // "Sketch1" chip + "Exit Sketch" chip
+        return chipWidth("Sketch1") + chipGap + chipWidth("Exit Sketch") + chipGap;
+    }
+
+    float total = 0.f;
+    auto wss = cmd::workspacesFor(s.docType());
+    for (size_t i = 0; i < wss.size(); ++i) {
+        total += chipWidth(cmd::workspaceLabel(wss[i])) + chipGap;
+        if (i == 0 && wss.size() > 1) total += divW;
+    }
+
+    auto gws = cmd::globalWorkspaces();
+    bool anyGlobal = false;
+    for (cmd::Workspace w : gws) {
+        bool inDocScoped = false;
+        for (auto dw : wss) if (dw == w) { inDocScoped = true; break; }
+        if (inDocScoped) continue;
+        if (!anyGlobal) { total += divW; anyGlobal = true; }
+        const char* label = (w == cmd::Workspace::Schematic) ? "ECAD"
+                            : cmd::workspaceLabel(w);
+        total += chipWidth(label) + chipGap;
+    }
+    return total;
+}
+
+// ---------------------------------------------------------------------------
+// drawWorkspaceChips() — render the chip cluster.
+// originX: screen-space X where the cluster should begin (pre-computed by
+//           the caller from workspaceChipsWidth + centering math).
+// height:  title-bar pixel height, used for divider line extents and
+//          vertical centering.  Caller sets cursor Y before calling this.
+//
+// Must be called INSIDE an active ImGui window (child window context).
+// The cursor Y is set by the caller; this function overrides cursor X
+// to match originX and draws chips horizontally from there.
+// ---------------------------------------------------------------------------
+void drawWorkspaceChips(AppState& s, float originX, float height) {
+    const float S = theme::S();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 wp = ImGui::GetWindowPos();
+
+    // Set cursor X to the computed centered position; keep caller's Y.
+    float localX = originX - wp.x;
+    float currentY = ImGui::GetCursorPosY();
+    ImGui::SetCursorPos(ImVec2(localX, currentY));
+
+    if (s.inSketch) {
+        chip("sk",  "ws_sketch",  "Sketch1",     true,  true);
         if (chip("skx", "ok_check", "Exit Sketch", false, true)) s.dispatch("sketch_exit");
-    } else {
-        // --- doc-scoped workspaces (depend on current doc type) ---
-        auto wss = cmd::workspacesFor(s.docType());
-        for (size_t i = 0; i < wss.size(); ++i) {
-            cmd::Workspace w = wss[i];
-            bool active = (s.workspace == w);
-            bool primary = (i == 0);   // first workspace is the primary one
-            if (chip(cmd::workspaceLabel(w), cmd::workspaceIcon(w), cmd::workspaceLabel(w), active, primary))
-                { s.workspace = w; s.activeTool.clear(); s.camActive = false; }
-            if (i == 0 && wss.size() > 1) {
-                // a faint divider between the primary workspace and the specialized workbenches
-                ImVec2 sp = ImGui::GetCursorScreenPos();
-                dl->AddLine(ImVec2(sp.x, sp.y+4*S), ImVec2(sp.x, sp.y+height-8*S), TCOL(line), ImMax(1.f,S));
-                ImGui::SameLine(0, 10*S);
-            }
-        }
+        return;
+    }
 
-        // --- Global workspaces (always visible, doc-type independent) ---
-        // Strip order: AI | ECAD | Simulate | Manufacture | PLM | Parts
-        // Dedup: skip any global workspace already shown in the doc-scoped cluster above so a
-        // Part doc (which already shows Simulate) doesn't show it twice.
-        // Open-or-focus: ECAD/Simulate clicks navigate to an appropriate doc context; they do
-        // not dead-end when the active doc type doesn't support the workspace directly.
-        {
-            auto gws = cmd::globalWorkspaces();
-            if (!gws.empty()) {
-                ImVec2 sp = ImGui::GetCursorScreenPos();
-                dl->AddLine(ImVec2(sp.x, sp.y+4*S), ImVec2(sp.x, sp.y+height-8*S), TCOL(line), ImMax(1.f,S));
-                ImGui::SameLine(0, 10*S);
-                for (cmd::Workspace w : gws) {
-                    // Dedup: skip if this workspace is already shown in the doc-scoped cluster.
-                    bool inDocScoped = false;
-                    for (auto dw : wss) if (dw == w) { inDocScoped = true; break; }
-                    if (inDocScoped) continue;
-
-                    bool active = (s.workspace == w);
-                    // Label override: Schematic tab reads as "ECAD" at the global level.
-                    const char* label = (w == cmd::Workspace::Schematic) ? "ECAD"
-                                      : cmd::workspaceLabel(w);
-                    const char* icon  = cmd::workspaceIcon(w);
-                    if (chip(cmd::workspaceLabel(w), icon, label, active, false)) {
-                        // Open-or-focus: ECAD/Simulate on an incompatible doc opens new context.
-                        cmd::DocType dt = s.docType();
-                        if (w == cmd::Workspace::Schematic || w == cmd::Workspace::Board) {
-                            // ECAD: if doc is already a Schematic or PCB just switch workspace,
-                            // otherwise request a new Schematic doc (dispatch to app handler).
-                            if (dt == cmd::DocType::Schematic) {
-                                s.workspace = cmd::Workspace::Schematic;
-                            } else if (dt == cmd::DocType::Pcb) {
-                                s.workspace = cmd::Workspace::Board;
-                            } else {
-                                // No ECAD doc open — dispatch new-schematic intent.
-                                s.dispatch("ecad_new_sch");
-                            }
-                        } else if (w == cmd::Workspace::Simulate) {
-                            // Simulate: valid on Part and Assembly. On ECAD/Drawing docs, open
-                            // a new Part doc first (or just set workspace if already compatible).
-                            if (dt == cmd::DocType::Part || dt == cmd::DocType::Assembly) {
-                                s.workspace = cmd::Workspace::Simulate;
-                            } else {
-                                // Focus first Part/Assembly tab that has a sim study, or fall
-                                // through to just switching workspace optimistically.
-                                for (int i = 0; i < (int)s.docTabs.size(); ++i) {
-                                    auto& tab = s.docTabs[i];
-                                    if (tab.kind == core::DocTabKind::Part ||
-                                        tab.kind == core::DocTabKind::Assembly) {
-                                        s.switchToTab(i);
-                                        break;
-                                    }
-                                }
-                                s.workspace = cmd::Workspace::Simulate;
-                            }
-                        } else {
-                            s.workspace = w;
-                        }
-                        s.activeTool.clear();
-                        s.camActive = false;
-                    }
-                }
-            }
+    // --- doc-scoped workspaces ---
+    auto wss = cmd::workspacesFor(s.docType());
+    for (size_t i = 0; i < wss.size(); ++i) {
+        cmd::Workspace w = wss[i];
+        bool active  = (s.workspace == w);
+        bool primary = (i == 0);
+        if (chip(cmd::workspaceLabel(w), cmd::workspaceIcon(w), cmd::workspaceLabel(w), active, primary))
+            { s.workspace = w; s.activeTool.clear(); s.camActive = false; }
+        if (i == 0 && wss.size() > 1) {
+            ImVec2 sp = ImGui::GetCursorScreenPos();
+            dl->AddLine(ImVec2(sp.x, sp.y+4*S), ImVec2(sp.x, sp.y+height-8*S), TCOL(line), ImMax(1.f,S));
+            ImGui::SameLine(0, 10*S);
         }
     }
 
-    ImVec2 wp = ImGui::GetWindowPos(), wsz = ImGui::GetWindowSize();
-    dl->AddLine(ImVec2(wp.x, wp.y+wsz.y-0.5f), ImVec2(wp.x+wsz.x, wp.y+wsz.y-0.5f),
-                theme::roleU32A(theme::pal().line, 0.35f), 1.f);
-    ImGui::EndChild();
-    ImGui::PopStyleColor();
+    // --- Global workspaces (always visible, deduped against doc-scoped) ---
+    {
+        auto gws = cmd::globalWorkspaces();
+        bool first = true;
+        for (cmd::Workspace w : gws) {
+            bool inDocScoped = false;
+            for (auto dw : wss) if (dw == w) { inDocScoped = true; break; }
+            if (inDocScoped) continue;
+
+            if (first) {
+                ImVec2 sp = ImGui::GetCursorScreenPos();
+                dl->AddLine(ImVec2(sp.x, sp.y+4*S), ImVec2(sp.x, sp.y+height-8*S), TCOL(line), ImMax(1.f,S));
+                ImGui::SameLine(0, 10*S);
+                first = false;
+            }
+
+            bool active = (s.workspace == w);
+            const char* label = (w == cmd::Workspace::Schematic) ? "ECAD"
+                                : cmd::workspaceLabel(w);
+            const char* icon  = cmd::workspaceIcon(w);
+            if (chip(cmd::workspaceLabel(w), icon, label, active, false)) {
+                cmd::DocType dt = s.docType();
+                if (w == cmd::Workspace::Schematic || w == cmd::Workspace::Board) {
+                    if (dt == cmd::DocType::Schematic) {
+                        s.workspace = cmd::Workspace::Schematic;
+                    } else if (dt == cmd::DocType::Pcb) {
+                        s.workspace = cmd::Workspace::Board;
+                    } else {
+                        s.dispatch("ecad_new_sch");
+                    }
+                } else if (w == cmd::Workspace::Simulate) {
+                    if (dt == cmd::DocType::Part || dt == cmd::DocType::Assembly) {
+                        s.workspace = cmd::Workspace::Simulate;
+                    } else {
+                        for (int i = 0; i < (int)s.docTabs.size(); ++i) {
+                            auto& tab = s.docTabs[i];
+                            if (tab.kind == core::DocTabKind::Part ||
+                                tab.kind == core::DocTabKind::Assembly) {
+                                s.switchToTab(i);
+                                break;
+                            }
+                        }
+                        s.workspace = cmd::Workspace::Simulate;
+                    }
+                } else {
+                    s.workspace = w;
+                }
+                s.activeTool.clear();
+                s.camActive = false;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// drawWorkspaceBar() — legacy band call.  Now a no-op: the workspace chips
+// moved into the title bar (drawTitleBar / drawWorkspaceChips).  The band
+// call in application.cpp has been removed, so this function should never be
+// reached, but the symbol must remain so panels.h's declaration links cleanly
+// without touching the shared header.
+// ---------------------------------------------------------------------------
+void drawWorkspaceBar(AppState& /*s*/, float /*height*/) {
+    // No-op: chips now live inside drawTitleBar (centered in the title bar band).
 }
 
 } // namespace ui

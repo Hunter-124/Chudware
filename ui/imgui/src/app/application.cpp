@@ -119,7 +119,8 @@ void Application::frame() {
     }
 
     const float titleH = theme::ctx().m.titleBarH  * theme::S();
-    const float wsH    = theme::ctx().m.workspaceH  * theme::S();
+    // wsH removed: workspace chips moved into the title bar (drawWorkspaceChips,
+    // centered between menus and caption buttons — Hunter directive 2026-07-06).
     const float tbH    = theme::ctx().m.toolbarH    * theme::S();
     const float statusH= theme::ctx().m.statusH     * theme::S();
     const float railW  = theme::ctx().m.railW        * theme::S();
@@ -139,7 +140,8 @@ void Application::frame() {
     ImGui::PopStyleVar(3);
 
     ui::drawTitleBar(s, titleH);
-    ui::drawWorkspaceBar(s, wsH);
+    // drawWorkspaceBar removed: workspace chips now live inside drawTitleBar,
+    // centered between the menu items and the caption buttons.
     ui::drawContextToolbar(s, tbH);
     (void)railW;   // T-G23: the standalone left rail is gone — its tabs live inside the glass column.
 

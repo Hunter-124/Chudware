@@ -65,6 +65,55 @@ void drawTitleBar(AppState& st, float height) {
     const ImVec2 wsz = ImGui::GetWindowSize();
     const bool maximized = win && glfwGetWindowAttrib(win, GLFW_MAXIMIZED) != 0;
 
+    // -----------------------------------------------------------------------
+    // Part 1: Workspace chip cluster — drawn DIRECTLY in the child window
+    // (not inside BeginMenuBar) so it renders correctly in both runtime and
+    // headless screenshot mode.  We measure the free width between the menu
+    // zone and the caption-button zone and center the chips there.
+    // -----------------------------------------------------------------------
+    {
+        const float S2 = S;
+        // Caption button geometry (same formula as Part 2 below so the zones match).
+        // We need a provisional barH.  Since FramePadding hasn't been pushed yet,
+        // use the current frame height as an approximation; it equals what Part 2
+        // will see after the style push (FramePadding only affects GetFrameHeight
+        // if a new PushStyleVar is applied first, which Part 2 does — but the
+        // difference is small: 12*S on each side, so barH_approx ≈ FontSize+24*S).
+        // Use the title bar pixel height directly for vertical centering since that
+        // is authoritative.
+        const float chipH    = 24*S2;
+        const float chipY    = (height - chipH) * 0.5f;   // child-local Y
+
+        // Rough menu zone right edge: ShopCraft2 title (~80px) + 5 menus (~300px)
+        // The real edge is determined at runtime inside BeginMenuBar, but for centering
+        // we use a conservative estimate.  The chips will be clamped at that edge + pad.
+        const float menuEstimateW  = 380.f * S2;    // app title + File/Edit/View/Insert/Help/Search
+        const float captionBtnW    = height * (1.35f + 0.15f * (S2 - 1.f)); // single btn width
+        const float captionZoneW   = captionBtnW * 3.f;
+        const float winW           = wsz.x;
+        const float menuEdgeEst    = menuEstimateW;
+        const float captionStartX  = winW - captionZoneW;
+        const float freeW          = captionStartX - menuEdgeEst;
+
+        const float chipsW = ui::workspaceChipsWidth(st);
+        const float pad    = 8.f * S2;
+        float chipLocalX   = menuEdgeEst + (freeW - chipsW) * 0.5f;
+        if (chipLocalX < menuEdgeEst + pad) chipLocalX = menuEdgeEst + pad;
+        // Don't let chips overlap caption buttons
+        if (chipLocalX + chipsW > captionStartX - pad) chipLocalX = captionStartX - pad - chipsW;
+        if (chipLocalX < pad) chipLocalX = pad;
+
+        // Place chips: SetCursorPos is child-window-local.
+        ImGui::SetCursorPos(ImVec2(chipLocalX, chipY));
+        const float chipScreenX = wp.x + chipLocalX;
+        ui::drawWorkspaceChips(st, chipScreenX, height);
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 2: App title/menus + caption buttons — drawn inside BeginMenuBar.
+    // These are interactive at runtime.  The style push makes the bar height
+    // match the title bar band so menu items align vertically.
+    // -----------------------------------------------------------------------
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(14.f * S, 12.f * S));
     ImGui::PushStyleColor(ImGuiCol_MenuBarBg, TVEC(bg1));
 
@@ -167,6 +216,7 @@ void drawTitleBar(AppState& st, float height) {
             if (ImGui::MenuItem("Search")) st.paletteOpen = true;
         }
 
+        // Caption buttons — right-aligned.
         const float bx = winW - captionZoneW;
         ImGui::SetCursorPos(ImVec2(bx, 0.f));
         if (windowButton("##min", BTN_MIN, barH, false)) glfwIconifyWindow(win);
@@ -184,6 +234,7 @@ void drawTitleBar(AppState& st, float height) {
     ImGui::PopStyleColor();
     ImGui::PopStyleVar();
 
+    // Bottom separator line.
     dl->AddLine(ImVec2(wp.x, wp.y + wsz.y - 0.5f), ImVec2(wp.x + wsz.x, wp.y + wsz.y - 0.5f),
                 theme::roleU32A(theme::pal().line, 0.35f), 1.f);
 

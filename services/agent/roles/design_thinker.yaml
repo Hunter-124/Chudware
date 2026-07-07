@@ -13,6 +13,8 @@ tool_allowlist:
   - tool: research_material_lookup
   - tool: research_thread_spec
   - tool: part_search
+  - tool: parts_taxonomy
+  - tool: part_source
 context_recipe:
   ledger_tokens: 600
   describers: []

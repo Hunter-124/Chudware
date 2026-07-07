@@ -7,7 +7,7 @@ tool_allowlist:
   - tool: ledger_get
   - tool: ledger_note
   - tool: cam_new_job
-  - tool: cam_set_stock
+  - tool: cam_tool_import
   - tool: cam_add_tool
   - tool: cam_add_setup
   - tool: cam_add_operation
@@ -47,8 +47,12 @@ system_prompt: |
   sequences.
 
   THE JOB LOOP
-  1. Job setup: cam_new_job, stock from the ledger/spec (record stock choice as a
-     decision — oversize is money), material aligned to cam_materials ids.
+  1. Job setup: cam_new_job, stock from the ledger/spec via cam_add_setup(stock=...)
+     (record stock choice as a decision — oversize is money), material aligned to
+     cam_materials ids. Tools: cam_add_tool for generic cutters; for a REAL catalog
+     cutter from the parts library use cam_tool_import(part_id) — it maps the
+     vendor record (diameter, flutes, coating) into the tool library with
+     provenance. Feeds still come from feeds_speeds, never the vendor record.
   2. Start from the template when the part matches a family (pocketed block,
      drilled plate...): the deterministic op plan gives the sequence; you choose
      strategy and parameters. No matching family → compose operations in machining

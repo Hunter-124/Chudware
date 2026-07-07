@@ -227,6 +227,11 @@ _TOOL_FAMILIES: dict[str, set[str]] = {
     },
     "parts": {
         "part_search", "part_get", "part_place",
+        # Parts Library V2 (workstream 5)
+        "parts_taxonomy", "part_source", "vendors_health", "cam_tool_import",
+        # vendor-source + scrape queue tools (T-X2/T-X4/T-X7)
+        "vendor_status", "vendor_login",
+        "scrape_enqueue", "scrape_queue_status", "import_artifact",
     },
     "serving": {
         "serving_status", "serving_set_canary", "serving_rollback",
@@ -291,7 +296,8 @@ _FAMILY_SIGNALS: dict[str, list[str]] = {
     "hydraulic":     ["hydraulic_new", "cad_guide('hydraulic')", "hydraulic"],
     "firmware":      ["fw_new_project", "fw_build", "cad_guide('firmware')", "firmware"],
     "structural":    ["struct_analyze", "cad_guide('structural')", "structural"],
-    "parts":         ["part_search", "part_place", "cad_guide('parts')"],
+    "parts":         ["part_search", "part_place", "cad_guide('parts')",
+                      "parts_taxonomy", "part_source"],
     "serving":       ["serving_status", "cad_guide('serving')", "serving"],
     "regen":         ["regen_diagnose", "cad_guide('regen')", "regen"],
     "code_compliance": ["code_check", "cad_guide('code_compliance')", "code_compliance"],
@@ -399,6 +405,9 @@ class TestMCPFreshness(unittest.TestCase):
         # The full tool inventory is in _TOOL_FAMILIES; here we spot-check critical ones.
         must_appear = [
             "part_search", "part_place",           # standard-parts bias
+            "parts_taxonomy", "part_source",        # Parts Library V2 browse + sourcing
+            "vendors_health", "cam_tool_import",    # vendor canary + cutting-tool import
+            "scrape_enqueue", "import_artifact",    # catalog geometry acquisition
             "verify_battery",                       # done-check
             "ask_user",                             # elicitation seam
             "dag_plan",                             # multi-step missions

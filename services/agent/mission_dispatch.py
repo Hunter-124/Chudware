@@ -60,9 +60,13 @@ class MissionDispatch:
         doc_id: default doc context for tools that accept one.
     """
 
-    #: The run-scoped tool families this layer serves (task T-W32 DoD list).
+    #: The run-scoped tool families this layer serves (T-W32 DoD list + the
+    #: Parts Library V2 sourcing surface — workstream 5).
     TOOLS = ("ledger_get", "ledger_note", "dag_plan", "ask_user",
-             "delegate", "part_search")
+             "delegate", "part_search",
+             "parts_taxonomy", "part_get", "part_source", "vendors_health",
+             "scrape_enqueue", "scrape_queue_status", "import_artifact",
+             "cam_tool_import")
 
     def __init__(self, *, run_id: str, ledger=None, autonomy: str = "auto",
                  graph: dict | None = None, delegation_tree=None,
@@ -88,6 +92,14 @@ class MissionDispatch:
             "ask_user": self.ask_user,
             "delegate": self.delegate,
             "part_search": self.part_search,
+            "parts_taxonomy": self.parts_taxonomy,
+            "part_get": self.part_get,
+            "part_source": self.part_source,
+            "vendors_health": self.vendors_health,
+            "scrape_enqueue": self.scrape_enqueue,
+            "scrape_queue_status": self.scrape_queue_status,
+            "import_artifact": self.import_artifact,
+            "cam_tool_import": self.cam_tool_import,
         }
 
     # ------------------------------------------------------------------ resolve
@@ -279,9 +291,42 @@ class MissionDispatch:
                                         f"Sub-agent {role!r} started. Brief: {brief}"[:800])
             except Exception:  # noqa: BLE001
                 pass
+            # Workstream 5 fix: sub-agents no longer run BARE. When the role has
+            # a card (services/agent/roles/<role>.yaml) it gets the card's
+            # system_prompt + tool allowlist, real tool schemas rendered against
+            # THIS dispatch layer, this MissionDispatch as its mission-scoped
+            # resolver, and a budget-derived tool-call cap. Unknown roles keep
+            # the old bare behavior (no card = no constraints to apply).
+            card = None
+            try:
+                from services.agent.roles import load_role as _load_role  # noqa: PLC0415
+                card = _load_role(role)
+            except Exception:  # noqa: BLE001 — unknown role → bare sub-agent
+                card = None
+            system_prompt = card.system_prompt if card is not None else None
+            allowed = card.concrete_tools if card is not None else None
+            tools_text = None
+            if allowed:
+                try:
+                    from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
+                    tools_text, _meta = render_tools_block(
+                        allowed, resolver=_at.resolver_for(self))
+                except Exception:  # noqa: BLE001 — schema render is best-effort
+                    tools_text = None
+            granted = 0
+            try:
+                granted = int((node.get("budget") or {}).get("tokens_granted", 0))
+            except (TypeError, ValueError):
+                granted = 0
+            derived = (granted // 2000) if granted > 0 else 10
+            max_calls = max(4, min(12, derived))
             result = _at.run_turn(
                 brief, self.provider, name=role, actor=role,
-                ledger=self.ledger, max_tool_calls=4,
+                system_prompt=system_prompt,
+                allowed_tools=allowed,
+                tools_text=tools_text,
+                mission_dispatch=self,
+                ledger=self.ledger, max_tool_calls=max_calls,
                 on_event=self.on_event, run_id=self.run_id,
                 node_id=node_id, subagent_id=node_id)
             tokens = 0  # provider seam exposes no usage here; accrual stays honest at 0
@@ -321,25 +366,170 @@ class MissionDispatch:
 
     # ------------------------------------------------------------------ parts
     def part_search(self, query: str = "", domain: str = "", limit: int = 20,
-                    **_ignored: Any) -> dict:
-        """Search the unified standard-parts library (all domains federated).
+                    category_id: str = "", facets: dict | str | None = None,
+                    price_max: float = 0.0, vendors: str = "",
+                    in_stock: bool = False, **_ignored: Any) -> dict:
+        """Search the standard-parts library with taxonomy routing + facet filters.
 
-        query: free text, e.g. "M8 socket head", "bearing 6205"; domain optionally
-        filters (fastener | bearing | mech_family | section | fitting | hydraulic |
-        ecad); limit caps results (default 20).
+        query: free text ("M8 socket head", "bearing 6205"); category_id: a
+        parts_taxonomy id ("bearings_motion.ball_bearings.deep_groove") that routes
+        domains and vendor sites; facets: dict of facet filters keyed by the
+        category's facet keys ({"bore_mm": 12, "alloy": "4130"}); price_max /
+        vendors (CSV) / in_stock post-filter the result set. Returns results +
+        facet_summary (top param values in THIS result set) + applied filters.
         """
         if not query:
             return {"ok": False, "error": "part_search needs a query string"}
         try:
-            from engine_oracle.parts_hub import search as _search
-            results = _search(query, domain=domain or None,
-                              limit=max(1, min(int(limit), 200)))
-            return {"ok": True, "count": len(results),
-                    "has_live": any(r.get("source") == "live" for r in results),
-                    "results": results}
+            from services.mcp.parts_tools import search_parts_v2  # noqa: PLC0415
+            return search_parts_v2(query, domain=domain, limit=limit,
+                                   category_id=category_id, facets=facets,
+                                   price_max=price_max, vendors=vendors,
+                                   in_stock=in_stock)
         except Exception as exc:  # noqa: BLE001 — error is data for the model
             return {"ok": False, "error": f"part_search failed: {exc}",
                     "hint": "Check that engine_oracle/parts_hub is importable."}
+
+    def parts_taxonomy(self, node_id: str = "", depth: int = 2,
+                       include_facets: bool = True, **_ignored: Any) -> dict:
+        """Browse the parts category taxonomy; a node's EFFECTIVE facets tell you
+        which facet keys part_search(facets=...) accepts there.
+
+        node_id "" lists roots; then parts_taxonomy(node_id) for children +
+        breadcrumbs + facets. Workflow: browse -> pick category -> faceted search.
+        """
+        try:
+            from services.mcp.parts_tools import taxonomy_browse  # noqa: PLC0415
+            return taxonomy_browse(node_id, depth, include_facets)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"parts_taxonomy failed: {exc}"}
+
+    def part_get(self, part_id: str = "", **_ignored: Any) -> dict:
+        """Fetch one full PartRecord by stable part_id (inspect params +
+        geometry_ref before placing).
+
+        part_id comes from part_search/part_source, e.g. "fastener:ISO4762:M8".
+        """
+        if not part_id:
+            return {"ok": False, "error": "part_get needs a part_id"}
+        try:
+            from engine_oracle.parts_hub import get as _get  # noqa: PLC0415
+            rec = _get(part_id)
+            if rec is None:
+                return {"ok": False, "error": f"part_id not found: {part_id!r}",
+                        "hint": "Use part_search to discover valid part_ids."}
+            return {"ok": True, "part": rec}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"part_get failed: {exc}"}
+
+    def part_source(self, need: str = "", constraints: str = "",
+                    limit: int = 5, **_ignored: Any) -> dict:
+        """Source candidate parts for a plain-language need — deterministic
+        taxonomy match + faceted search + scored candidates with artifact plans.
+
+        need: e.g. "4130 chromoly tube OD 25.4 wall 1.25" or "bearing 12mm bore".
+        Each candidate carries artifact_plan.how: part_place | scrape_import |
+        make_standard_part — follow it to obtain real geometry.
+        """
+        try:
+            from services.mcp.parts_tools import part_source_impl  # noqa: PLC0415
+            return part_source_impl(need, constraints, limit)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"part_source failed: {exc}"}
+
+    def vendors_health(self, sites: str = "", **_ignored: Any) -> dict:
+        """Canary health check of the vendor source adapters (CSV sites filter).
+
+        Rows with needs_human_login=true mean a human must run vendor_login for
+        that site — record a question for the human; never fabricate results.
+        """
+        try:
+            from services.mcp.parts_tools import vendors_health_impl  # noqa: PLC0415
+            return vendors_health_impl(sites)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"vendors_health failed: {exc}"}
+
+    def scrape_enqueue(self, site: str = "", query: str = "",
+                       **_ignored: Any) -> dict:
+        """Enqueue a background vendor search + CAD-artifact download; returns a
+        job id to poll with scrape_queue_status.
+
+        site: adapter key ("mcmaster", "grabcad" — vendors_health lists them);
+        query: what to search on the vendor site. The download lands as an
+        artifact_path you feed to import_artifact.
+        """
+        if not site or not query:
+            return {"ok": False, "error": "scrape_enqueue needs site and query"}
+        try:
+            from services.browser.queue import enqueue, ensure_worker_started  # noqa: PLC0415
+            ensure_worker_started()
+            out = enqueue(site.strip().lower(), query.strip())
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"scrape_enqueue failed: {exc}",
+                    "hint": "services/browser must be available and the site logged in."}
+        # Provenance: record the acquisition on the mission ledger (kind=artifact).
+        if self.ledger is not None and isinstance(out, dict) and out.get("ok", True):
+            try:
+                self.ledger.append("agent", "artifact", {
+                    "event": "scrape_enqueued", "site": site, "query": query,
+                    "job_id": out.get("id", "")})
+            except Exception:  # noqa: BLE001 — provenance is best-effort
+                pass
+        return out if isinstance(out, dict) else {"ok": True, "result": out}
+
+    def scrape_queue_status(self, **_ignored: Any) -> dict:
+        """Poll the scrape/download queue: jobs with status pending|running|done|
+        error; a done job's artifact_path feeds import_artifact.
+        """
+        try:
+            from services.browser.queue import queue_status  # noqa: PLC0415
+            out = queue_status()
+            return out if isinstance(out, dict) else {"ok": True, "jobs": out}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"scrape_queue_status failed: {exc}"}
+
+    def import_artifact(self, artifact_path: str = "", **_ignored: Any) -> dict:
+        """Import a downloaded CAD file (STEP/IGES artifact_path from a done
+        scrape job) into a new editable part document.
+
+        Returns {ok, doc_id, editable: true, ...} on success.
+        """
+        path = str(artifact_path or "").strip()
+        if not path:
+            return {"ok": False,
+                    "error": "import_artifact needs the artifact_path of a done job"}
+        import os  # noqa: PLC0415
+        if not os.path.isfile(path):
+            return {"ok": False, "error": f"file not found: {path}",
+                    "hint": "Take artifact_path from scrape_queue_status on a done job."}
+        try:
+            from engine_oracle.parts_hub.place import _place_import_file  # noqa: PLC0415
+            out = _place_import_file({"kind": "import_file", "path": path}, None, None)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"import_artifact failed: {exc}",
+                    "hint": "Ensure the native core (AI_CAD_LIBAICAD) is available."}
+        if self.ledger is not None and isinstance(out, dict) and out.get("ok"):
+            try:
+                self.ledger.append("agent", "artifact", {
+                    "event": "artifact_imported", "path": path,
+                    "doc_id": out.get("doc_id", "")})
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+
+    def cam_tool_import(self, part_id: str = "", number: int = 0,
+                        material: str = "", **_ignored: Any) -> dict:
+        """Import a cutting-tool part record (end mill / drill from the library)
+        into the current CAM job's tool library; number 0 = next free.
+
+        Returns the mapped tool + vendor machining data; feeds/speeds still come
+        from the CuttingDB (feeds_speeds tool), not the record.
+        """
+        try:
+            from services.mcp.parts_tools import cam_tool_import_impl  # noqa: PLC0415
+            return cam_tool_import_impl(part_id, number, material)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"cam_tool_import failed: {exc}"}
 
 
 # --------------------------------------------------------------------------- helpers

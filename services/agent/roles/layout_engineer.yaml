@@ -15,6 +15,8 @@ tool_allowlist:
   - tool: query_geometry
   - tool: render_part
   - tool: part_search
+  - tool: parts_taxonomy
+  - tool: part_source
   - tool: preflight_ops
 context_recipe:
   ledger_tokens: 1000

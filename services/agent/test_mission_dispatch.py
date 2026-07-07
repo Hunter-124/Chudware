@@ -197,9 +197,117 @@ class TestPartSearch:
         import engine_oracle.parts_hub as hub
 
         monkeypatch.setattr(hub, "search",
-                            lambda q, domain=None, limit=20: [{"designation": "M3"}])
+                            lambda q, domain=None, limit=20, **kw:
+                            [{"part_id": "fastener:x:M3", "title": "M3 screw",
+                              "designation": "M3", "params": {}}])
         out = md.part_search("M3")
         assert out["ok"] is True and out["count"] == 1
+
+    def test_v2_kwargs_forwarded(self, md, monkeypatch):
+        seen = {}
+
+        def _v2(query, **kw):
+            seen.update(kw, query=query)
+            return {"ok": True, "count": 0, "results": []}
+        from services.mcp import parts_tools as pt
+        monkeypatch.setattr(pt, "search_parts_v2", _v2)
+        out = md.part_search("bearing", category_id="bearings_motion",
+                             facets={"bore_mm": 12}, price_max=9.0,
+                             vendors="mcmaster", in_stock=True)
+        assert out["ok"] is True
+        assert seen["category_id"] == "bearings_motion"
+        assert seen["facets"] == {"bore_mm": 12}
+        assert seen["price_max"] == 9.0 and seen["vendors"] == "mcmaster"
+        assert seen["in_stock"] is True
+
+
+# ---------------------------------------------------------------------------
+# Parts Library V2 handlers (workstream 5)
+# ---------------------------------------------------------------------------
+
+class TestPartsV2Handlers:
+    def test_all_v2_tools_resolve(self, md):
+        for tool in ("parts_taxonomy", "part_get", "part_source",
+                     "vendors_health", "scrape_enqueue", "scrape_queue_status",
+                     "import_artifact", "cam_tool_import"):
+            assert md.resolve(tool) is not None, tool
+
+    def test_parts_taxonomy_roots(self, md):
+        out = md.parts_taxonomy()
+        assert out["ok"] is True
+        assert any(c["id"] == "fasteners" for c in out["children"])
+
+    def test_part_get(self, md, monkeypatch):
+        import engine_oracle.parts_hub as hub
+        monkeypatch.setattr(hub, "get",
+                            lambda pid: {"part_id": pid} if pid == "x:1" else None)
+        assert md.part_get("x:1")["ok"] is True
+        assert md.part_get("x:2")["ok"] is False
+        assert md.part_get("")["ok"] is False
+
+    def test_part_source_delegates_to_impl(self, md, monkeypatch):
+        from services.mcp import parts_tools as pt
+        monkeypatch.setattr(pt, "part_source_impl",
+                            lambda need, constraints, limit:
+                            {"ok": True, "candidates": [], "need": need})
+        out = md.part_source(need="bearing 12mm bore")
+        assert out["ok"] is True and out["need"] == "bearing 12mm bore"
+
+    def test_vendors_health_delegates(self, md, monkeypatch):
+        from services.mcp import parts_tools as pt
+        monkeypatch.setattr(pt, "vendors_health_impl",
+                            lambda sites: {"ok": True, "count": 0, "sites": []})
+        assert md.vendors_health()["ok"] is True
+
+    def test_scrape_enqueue_writes_artifact_ledger_note(self, md, ledger, monkeypatch):
+        from services.browser import queue as q
+        monkeypatch.setattr(q, "ensure_worker_started", lambda: None)
+        monkeypatch.setattr(q, "enqueue",
+                            lambda site, query, **kw:
+                            {"ok": True, "id": "job1", "status": "pending"})
+        out = md.scrape_enqueue(site="mcmaster", query="6205 bearing")
+        assert out["ok"] is True and out["id"] == "job1"
+        arts = [e for e in ledger.events if e.get("kind") == "artifact"
+                and (e.get("payload") or {}).get("event") == "scrape_enqueued"]
+        assert len(arts) == 1 and arts[0]["payload"]["job_id"] == "job1"
+
+    def test_scrape_enqueue_requires_args(self, md):
+        assert md.scrape_enqueue()["ok"] is False
+
+    def test_scrape_queue_status_delegates(self, md, monkeypatch):
+        from services.browser import queue as q
+        monkeypatch.setattr(q, "queue_status", lambda: {"ok": True, "jobs": []})
+        assert md.scrape_queue_status() == {"ok": True, "jobs": []}
+
+    def test_import_artifact_missing_file(self, md, tmp_path):
+        assert md.import_artifact("")["ok"] is False
+        out = md.import_artifact(str(tmp_path / "nope.step"))
+        assert out["ok"] is False and "not found" in out["error"]
+
+    def test_cam_tool_import_delegates(self, md, monkeypatch):
+        from services.mcp import parts_tools as pt
+        seen = {}
+
+        def _impl(part_id, number, material):
+            seen.update(part_id=part_id, number=number, material=material)
+            return {"ok": True, "tool_number": 3}
+        monkeypatch.setattr(pt, "cam_tool_import_impl", _impl)
+        out = md.cam_tool_import(part_id="catalog:x::u", number=0, material="hss")
+        assert out["ok"] is True and seen["part_id"] == "catalog:x::u"
+
+    def test_render_tools_block_yields_real_signatures(self, md):
+        """The §9.1 tools slot renders REAL kwargs for the V2 wrappers via the
+        same resolver run_turn dispatches with (schema = the mission wrapper)."""
+        from services.agent.tool_schemas import render_tools_block
+        text, meta = render_tools_block(
+            ["parts_taxonomy", "part_search", "part_source", "cam_tool_import",
+             "vendors_health"],
+            resolver=agent_turn.resolver_for(md))
+        assert meta["unresolved"] == []
+        assert "part_source(need: str = ''" in text
+        assert "category_id" in text          # upgraded part_search kwargs
+        assert "cam_tool_import(part_id: str = ''" in text
+        assert "parts_taxonomy(node_id: str = ''" in text
 
 
 # ---------------------------------------------------------------------------

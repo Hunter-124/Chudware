@@ -1276,7 +1276,8 @@ def cad_guide_text(topic: str = "overview") -> str:
                     "with the deliverables package; make_report/make_presentation/make_workbook/"
                     "render_document/list_artifacts.")
     if topic in ("parts", "standard_parts", "standard-parts", "library", "catalog",
-                 "part_search", "part_get", "part_place", "hardware", "bom_parts"):
+                 "part_search", "part_get", "part_place", "hardware", "bom_parts",
+                 "parts_taxonomy", "taxonomy", "facets", "faceted_search"):
         return (
             "STANDARD-PARTS LIBRARY — search → get → place (T-P3, aicad.parts/1)\n\n"
             "BIAS: always prefer standard parts over custom geometry for hardware.\n"
@@ -1334,6 +1335,28 @@ def cad_guide_text(topic: str = "overview") -> str:
             "EDITABILITY GUARANTEE:\n"
             "  part_place always returns {'editable': true}.  A placed part that isn't\n"
             "  editable is a bug — report it and use part_get to inspect geometry_ref.\n\n"
+            "TAXONOMY BROWSE + FACETED SEARCH (Parts Library V2):\n"
+            "  parts_taxonomy()                       → root categories (fasteners,\n"
+            "      bearings_motion, structural_stock, drivetrain, tools, electronics,\n"
+            "      fluid_power, hardware_misc, vendors, ...)\n"
+            "  parts_taxonomy('bearings_motion.ball_bearings.deep_groove')\n"
+            "      → children + breadcrumbs + EFFECTIVE facets (the facet keys this\n"
+            "        category accepts: bore_mm, od_mm, width_mm, seals, ...)\n"
+            "  part_search(query, category_id=..., facets='{...}')\n"
+            "      → taxonomy-ROUTED search (right domains + the category's vendor\n"
+            "        sites) with facet post-filtering.  Examples:\n"
+            "    part_search('tube', category_id='structural_stock.metal_tube',\n"
+            "                facets='{\"od_mm\": 25.4, \"alloy\": \"4130\"}')\n"
+            "    part_search('bearing', category_id='bearings_motion.ball_bearings',\n"
+            "                facets='{\"bore_mm\": {\"min\": 10, \"max\": 14}}')\n"
+            "    part_search('end mill', category_id='tools.cutting_tools.end_mills',\n"
+            "                facets='{\"flutes\": \"4\", \"coating\": \"AlTiN\"}',\n"
+            "                price_max=40, vendors='mcmaster', in_stock=True)\n"
+            "  The response's facet_summary shows the top param values in THIS result\n"
+            "  set — read it to see what to narrow by next.\n\n"
+            "NEED-DRIVEN SOURCING: part_source('4130 chromoly tube OD 25.4 wall 1.25')\n"
+            "  deterministically matches the taxonomy + extracts facets + returns scored\n"
+            "  candidates, each with an artifact_plan — see cad_guide('sourcing').\n\n"
             "SOURCING:\n"
             "  Each PartRecord carries a sourcing[] list of VendorPart dicts (aicad.sourcing/1).\n"
             "  Use bom_rollup after placing multiple parts to get a costed BOM.\n"
@@ -1461,20 +1484,54 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  only surface genuinely ambiguous choices.  Scope='run' (default) resets\n"
             "  each dag_run; scope='session' persists across runs."
         )
-    if topic in ("sourcing", "bom", "bom_rollup", "bom_price", "vendor", "purchase"):
+    if topic in ("sourcing", "bom", "bom_rollup", "bom_price", "vendor", "purchase",
+                 "part_source", "vendors_health", "cam_tool_import", "procure",
+                 "scrape", "scrape_enqueue", "import_artifact"):
         return (
-            "SOURCING / BOM — unified BOM roll-up + approved-provider price resolution\n\n"
-            "Tools: bom_rollup(doc_path) / bom_price(doc_path)\n\n"
-            "  bom_rollup(doc_path)   Roll up the assembly or part tree into a flat BOM.\n"
-            "                         Returns line items: qty, part_id, description, sourcing[].\n"
-            "  bom_price(doc_path)    Resolve live prices via approved providers (Nexar, DK,\n"
-            "                         Mouser); returns costed BOM with unit/ext price columns.\n\n"
-            "WORKFLOW: model → part_place (for standard parts) → bom_rollup → bom_price.\n"
-            "  Each PartRecord from part_search carries a sourcing[] list — bom_rollup\n"
-            "  merges these into the assembly BOM automatically.\n"
-            "BIAS: always prefer part_search/part_place for hardware (fasteners, bearings,\n"
-            "  electrical components) — they arrive pre-sourced.  Custom geometry (made parts)\n"
-            "  get cost estimates from cam_cost_estimate / request_quote."
+            "SOURCING — need → candidates → geometry → BOM → quote (Parts Library V2)\n\n"
+            "THE FULL LOOP:\n"
+            "  1. parts_taxonomy(node_id?)          Browse categories; a node's facets\n"
+            "                                       are the filter keys it supports\n"
+            "                                       (cad_guide('parts') for examples).\n"
+            "  2. part_source(need, constraints?, limit?)\n"
+            "       Deterministic sourcing fan-out for a plain-language need:\n"
+            "         part_source('4130 chromoly tube OD 25.4 wall 1.25')\n"
+            "         part_source('bearing 12mm bore', constraints='sealed, under $10')\n"
+            "       It matches taxonomy categories, extracts spec facets from the text\n"
+            "       (OD/bore/wall/alloy/...), searches the routed domains, and returns\n"
+            "       scored candidates: {part_id, title, vendor, price, specs, score,\n"
+            "       rationale, artifact_plan}.  Schema: contracts/sourcing.md.\n"
+            "  3. Narrow interactively when needed: part_search(query, category_id,\n"
+            "       facets, price_max, vendors, in_stock) + its facet_summary.\n"
+            "       part_get(part_id) for the full record before committing.\n"
+            "  4. Follow each candidate's artifact_plan.how to get REAL geometry:\n"
+            "       part_place          → local record with geometry_ref: place it.\n"
+            "       scrape_import       → vendor catalog record: scrape_enqueue(site,\n"
+            "                             query) → poll scrape_queue_status() → done →\n"
+            "                             import_artifact(artifact_path).\n"
+            "       make_standard_part  → standard hardware family: make_standard_part.\n"
+            "  5. CUTTING TOOLS are special: an end mill / drill from the library goes\n"
+            "       into the CAM job via cam_tool_import(part_id, number=0) — it maps\n"
+            "       the vendor record (tool_diameter_mm→diameter, flutes, coating) into\n"
+            "       the tool library with provenance and suggests conservative\n"
+            "       stepover/stepdown.  Feeds/speeds ALWAYS come from the CuttingDB\n"
+            "       (feeds_speeds / cam_check_feeds_envelope), never the vendor row.\n"
+            "  6. BOM + COST: bom_rollup(doc_path) rolls the tree into a flat BOM\n"
+            "       (PartRecord sourcing[] rows merge in automatically); bom_price\n"
+            "       resolves live prices via approved providers (Nexar, DigiKey,\n"
+            "       Mouser); request_quote(doc_path, vendor, qty) for PO decisions;\n"
+            "       cam_cost_estimate for made-part cost seeds.\n\n"
+            "VENDOR LOGIN ETIQUETTE:\n"
+            "  vendors_health(sites?) runs a canary search per adapter and reports\n"
+            "  {site, ok, latency_ms, logged_in, hit_count, error, needs_human_login}.\n"
+            "  needs_human_login=true means a HUMAN must run vendor_login(site) — a\n"
+            "  headed browser window only a person can complete.  Record a question\n"
+            "  for the human and continue with the healthy sites; NEVER fabricate\n"
+            "  results for a logged-out site, and never retry a login-required site\n"
+            "  in a loop.  vendor_status() lists adapter login state cheaply.\n\n"
+            "BIAS: always prefer part_search/part_source + part_place for hardware —\n"
+            "  candidates arrive pre-sourced and editable.  Never invent prices or\n"
+            "  specs: every number in a recommendation comes from a tool result."
         )
     if topic in ("cost", "cost_estimate", "cam_cost", "quote", "request_quote", "pricing"):
         return (
@@ -1852,13 +1909,16 @@ def register_cad_tools(mcp: FastMCP) -> None:
         "narration" (how to use describe_toolpaths and describe_results to get compact
         text summaries of CAM jobs and FEA/CFD results instead of raw JSON dumps),
         "parts" (standard-parts library: search→get→place workflow, standard-before-custom
-        bias, domain routing, editability guarantee, sourcing), "reverse"
+        bias, parts_taxonomy category browse + faceted part_search, domain routing,
+        editability guarantee, sourcing), "reverse"
         (reverse-engineering an imported STEP/mesh into an editable feature tree),
         "requirements" (req_create/update/status/report — design-brief CRUD),
         "dag" (dag_plan/run/status/approve/abort/replan — multi-step mission orchestration),
         "verify" (verify_battery — done-check before declaring a design finished),
         "interaction" (ask_user elicitation seam — batch unknowns into one call),
-        "sourcing" (bom_rollup/bom_price — BOM roll-up + approved-provider pricing),
+        "sourcing" (part_source need→ranked candidates, artifact plans (place / scrape+import /
+        make_standard_part), vendors_health login etiquette, cam_tool_import cutting tools,
+        bom_rollup/bom_price + request_quote),
         "cost" (cam_cost_estimate/request_quote — made-part cost model),
         "spec" (match_part_number/spec_sheet_match — MPN resolution + datasheet extraction),
         "piping" (piping_solve/report/... — 1-D hydraulic solve + CFD handoff),

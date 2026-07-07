@@ -81,6 +81,44 @@ def _apply(ops: list) -> dict:
     return cb.call("cam_apply_ops", {"doc_id": _job(), "base_revision": -1, "ops": ops})
 
 
+def add_tool_from_dict(tool: dict) -> dict:
+    """Add (or replace by number) one tool in the current CAM job's library.
+
+    Module-level seam shared by ``cam_add_tool`` and the parts-library
+    ``cam_tool_import`` tool (services/mcp/parts_tools.py). Fills the same
+    defaults cam_add_tool historically applied; raises when no CAM job is
+    current (callers surface that as data)."""
+    t = dict(tool or {})
+    number = int(t.get("number", 0))
+    t.setdefault("type", "endmill_flat")
+    t.setdefault("diameter", 6.0)
+    t.setdefault("flutes", 2)
+    t.setdefault("corner_radius", 0.0)
+    t.setdefault("tool_material", "carbide")
+    t.setdefault("tip_angle", 0.0)
+    t.setdefault("thread_pitch", 0.0)
+    if not t.get("name"):
+        t["name"] = f"T{number} {t['type']}"
+    t["number"] = number
+    return _apply([{"op": "add_tool", "tool": t}])
+
+
+def existing_tool_numbers() -> list[int]:
+    """Tool numbers already present in the current CAM job's library (sorted).
+
+    Reads the same job tree ``cam_job_tree`` renders. Raises when no CAM job
+    is current."""
+    r = cb.call("cam_tree", {"doc_id": _job()})
+    tree = r.get("tree") if isinstance(r.get("tree"), dict) else r
+    nums: list[int] = []
+    for t in (tree.get("tools") or []):
+        try:
+            nums.append(int(t.get("number")))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return sorted(set(nums))
+
+
 def register_cam_tools(mcp: FastMCP) -> None:
     """Attach the CAM toolpath/post/sim tools to the FastMCP server."""
 
@@ -140,7 +178,7 @@ def register_cam_tools(mcp: FastMCP) -> None:
             tool = {"number": number, "type": type, "diameter": diameter, "flutes": flutes,
                     "corner_radius": corner_radius, "name": name or f"T{number} {type}",
                     "tool_material": tool_material, "tip_angle": tip_angle, "thread_pitch": thread_pitch}
-            return _dumps(_apply([{"op": "add_tool", "tool": tool}]))
+            return _dumps(add_tool_from_dict(tool))
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

@@ -10,7 +10,7 @@ stage: cam
 steps:
   - id: job_setup
     goal: create the job; stock from the ledger/spec; material aligned to cam_materials ids
-    helper_tools: [ledger_get, cam_new_job, cam_set_stock, cam_materials]
+    helper_tools: [ledger_get, cam_new_job, cam_add_setup, cam_materials]
     checklist:
       - stock choice recorded as a decision (oversize is money)
       - material id aligned to cam_materials

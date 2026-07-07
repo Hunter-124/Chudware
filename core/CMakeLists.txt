@@ -302,7 +302,8 @@ add_test(NAME cam COMMAND test_cam)
 
 # --- libaicad sketch (parameterization + constraints over the solver core) ---
 add_library(aicad_sketch STATIC
-  sketch/sketch.cpp)
+  sketch/sketch.cpp
+  sketch/sketch3d.cpp)
 target_include_directories(aicad_sketch PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aicad_sketch PUBLIC aicad_solver aicad_util nlohmann_json::nlohmann_json)
 
@@ -351,6 +352,14 @@ target_link_libraries(test_sketch PRIVATE aicad_sketch)
 set_target_properties(test_sketch PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME sketch COMMAND test_sketch)
+
+add_executable(test_sketch3d
+  tests/test_sketch3d.cpp)
+target_include_directories(test_sketch3d PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_sketch3d PRIVATE aicad_sketch)
+set_target_properties(test_sketch3d PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME sketch3d COMMAND test_sketch3d)
 
 add_executable(test_drag
   tests/test_drag.cpp)
@@ -582,6 +591,7 @@ if(AICAD_WITH_OCCT)
     geom/tessellate.cpp
     geom/features.cpp
     geom/profile.cpp
+    geom/profile3d.cpp
     geom/booleans.cpp
     geom/dress.cpp
     geom/transform.cpp
@@ -969,6 +979,20 @@ if(AICAD_WITH_OCCT)
   add_test(NAME document COMMAND test_document)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(document PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- sketch3d document layer: wire chaining, sweep spine/guide from a 3D
+  # free-space sketch, and the sketch3d_health/drag session RPCs. --------------
+  add_executable(test_sketch3d_doc
+    tests/test_sketch3d_doc.cpp)
+  target_include_directories(test_sketch3d_doc PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_sketch3d_doc PRIVATE
+    aicad_doc aicad_geom_occt aicad_sketch aicad_geom)
+  set_target_properties(test_sketch3d_doc PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME sketch3d_doc COMMAND test_sketch3d_doc)
+  set_tests_properties(sketch3d_doc PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- Sketch-on-face DISPLAY fix (doc/session.cpp resolve_sketch_plane) -------
   # A sketch whose refs.plane is a kind=="face" selector must ENTER on that face:

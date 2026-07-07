@@ -11,6 +11,7 @@
 
 #include <cctype>
 #include <map>
+#include <array>
 #include <regex>
 #include <set>
 #include <string>
@@ -151,6 +152,9 @@ const std::map<string, FeatureSpec> FEATURE_TYPES = {
     {"sweep", {{"mode"}, {{"profile", RefForm::SelList, true},
                           {"path", RefForm::SelOrDatum, true},
                           {"guides", RefForm::SelList, false}}}},
+    // 3D free-space sketch (doc_schema §3B): world-coordinate entities +
+    // constraints, no plane ref. Params validated by validate_sketch3d_params.
+    {"sketch3d", {{"entities", "constraints"}, {}}},
     {"loft", {{"mode"}, {{"sections", RefForm::SelList, true},
                          {"centerline", RefForm::SelOrDatum, false},
                          {"guides", RefForm::SelList, false}}}},
@@ -1092,6 +1096,128 @@ vector<string> validate_sketch_params(const json& params, const string& where,
     return errs;
 }
 
+// 3D free-space sketch (feature type "sketch3d", doc_schema §3B). Lighter than
+// the 2D validator: entity coords are [x,y,z] triples, the entity vocabulary is
+// point/line/arc(three-point)/spline, and the constraint vocabulary is the v1
+// core set. Handle grammar: e<N>[.(p|p1|p2|pm|start|end|mid|p<K>)].
+vector<string> validate_sketch3d_params(const json& params, const string& where,
+                                        const std::set<string>& globals_names) {
+    vector<string> errs;
+    const json& entities = get(params, "entities");
+    const json& constraints = get(params, "constraints");
+    if (!entities.is_array()) return {where + ".entities: must be a list"};
+    if (!constraints.is_array()) return {where + ".constraints: must be a list"};
+
+    static const std::regex ENT_ID_RE("^e\\d+$");
+    static const std::regex CON_ID_RE("^c\\d+$");
+    static const std::regex HANDLE_RE("^e\\d+(\\.(p|p1|p2|pm|start|end|mid|p\\d+))?$");
+
+    auto is_xyz = [](const json& v) {
+        if (!v.is_array() || v.size() != 3) return false;
+        for (const auto& c : v)
+            if (!c.is_number()) return false;
+        return true;
+    };
+
+    std::set<string> ent_ids;
+    for (size_t i = 0; i < entities.size(); ++i) {
+        const string ew = where + ".entities[" + std::to_string(i) + "]";
+        const json& e = entities[i];
+        if (!e.is_object()) { errs.push_back(ew + ": must be an object"); continue; }
+        string eid = get(e, "id").is_string() ? e["id"].get<string>() : "";
+        if (!std::regex_match(eid, ENT_ID_RE))
+            errs.push_back(ew + ".id: must match e<N>");
+        else if (!ent_ids.insert(eid).second)
+            errs.push_back(ew + ".id: duplicate '" + eid + "'");
+        const string t = get(e, "type").is_string() ? e["type"].get<string>() : "";
+        if (t == "point") {
+            if (!is_xyz(get(e, "p"))) errs.push_back(ew + ".p: must be [x,y,z]");
+        } else if (t == "line") {
+            if (!is_xyz(get(e, "p1"))) errs.push_back(ew + ".p1: must be [x,y,z]");
+            if (!is_xyz(get(e, "p2"))) errs.push_back(ew + ".p2: must be [x,y,z]");
+        } else if (t == "arc") {
+            if (!is_xyz(get(e, "p1"))) errs.push_back(ew + ".p1: must be [x,y,z]");
+            if (!is_xyz(get(e, "pm"))) errs.push_back(ew + ".pm: must be [x,y,z]");
+            if (!is_xyz(get(e, "p2"))) errs.push_back(ew + ".p2: must be [x,y,z]");
+        } else if (t == "spline") {
+            const json& pts = get(e, "points");
+            if (!pts.is_array() || pts.size() < 2)
+                errs.push_back(ew + ".points: must be a list of >= 2 [x,y,z]");
+            else
+                for (size_t k = 0; k < pts.size(); ++k)
+                    if (!is_xyz(pts[k]))
+                        errs.push_back(ew + ".points[" + std::to_string(k) +
+                                       "]: must be [x,y,z]");
+        } else {
+            errs.push_back(ew + ".type: '" + t + "' is not a sketch3d entity type");
+        }
+    }
+
+    // Constraint arity table: {min_refs, max_refs, needs_value}.
+    static const std::map<string, std::array<int, 3>> CON3 = {
+        {"coincident", {2, 2, 0}}, {"fix", {1, 1, 0}},      {"distance", {2, 2, 1}},
+        {"length", {1, 1, 1}},     {"parallel", {2, 2, 0}}, {"perpendicular", {2, 2, 0}},
+        {"angle", {2, 2, 1}},      {"along_axis", {1, 1, 0}}, {"point_on", {2, 2, 0}},
+    };
+    std::set<string> con_ids;
+    for (size_t i = 0; i < constraints.size(); ++i) {
+        const string cw = where + ".constraints[" + std::to_string(i) + "]";
+        const json& c = constraints[i];
+        if (!c.is_object()) { errs.push_back(cw + ": must be an object"); continue; }
+        string cid = get(c, "id").is_string() ? c["id"].get<string>() : "";
+        if (!std::regex_match(cid, CON_ID_RE))
+            errs.push_back(cw + ".id: must match c<N>");
+        else if (!con_ids.insert(cid).second)
+            errs.push_back(cw + ".id: duplicate '" + cid + "'");
+        const string t = get(c, "type").is_string() ? c["type"].get<string>() : "";
+        auto tit = CON3.find(t);
+        if (tit == CON3.end()) {
+            errs.push_back(cw + ".type: '" + t + "' is not a sketch3d constraint type");
+            continue;
+        }
+        const json& refs = get(c, "refs");
+        int n = refs.is_array() ? static_cast<int>(refs.size()) : -1;
+        if (n < tit->second[0] || n > tit->second[1]) {
+            errs.push_back(cw + ".refs: " + t + " takes " +
+                           std::to_string(tit->second[0]) +
+                           (tit->second[0] == tit->second[1]
+                                ? string(" ref(s)")
+                                : ".." + std::to_string(tit->second[1]) + " ref(s)"));
+        } else {
+            for (int k = 0; k < n; ++k) {
+                if (!refs[k].is_string() ||
+                    !std::regex_match(refs[k].get<string>(), HANDLE_RE)) {
+                    errs.push_back(cw + ".refs[" + std::to_string(k) + "]: bad handle");
+                    continue;
+                }
+                string h = refs[k].get<string>();
+                string base = h.substr(0, h.find('.'));
+                if (!ent_ids.count(base))
+                    errs.push_back(cw + ".refs[" + std::to_string(k) +
+                                   "]: unknown entity '" + base + "'");
+            }
+        }
+        bool has_value = c.contains("value") && !c["value"].is_null();
+        if (tit->second[2] && !has_value)
+            errs.push_back(cw + ".value: required for " + t);
+        if (!tit->second[2] && has_value)
+            errs.push_back(cw + ".value: not allowed for " + t);
+        if (has_value && c["value"].is_object()) {
+            auto de = validate_dim(c["value"], cw + ".value", globals_names);
+            errs.insert(errs.end(), de.begin(), de.end());
+        }
+        if (t == "along_axis") {
+            const json& ax = get(c, "axis");
+            const json& dr = get(c, "dir");
+            bool ok_axis = ax.is_string() && (ax == "x" || ax == "y" || ax == "z");
+            bool ok_dir = dr.is_array() && dr.size() == 3;
+            if (!ok_axis && !ok_dir)
+                errs.push_back(cw + ": along_axis needs axis:\"x\"|\"y\"|\"z\" or dir:[x,y,z]");
+        }
+    }
+    return errs;
+}
+
 // --------------------------------------------------------------------------- features
 
 // "truthy" check mirroring Python's `if params.get(k):` / `if not refs.get(k):`.
@@ -1166,6 +1292,11 @@ vector<string> validate_feature(const json& f, const string& where,
 
     if (ftype == "sketch") {
         auto se = validate_sketch_params(params, where + ".params", globals_names);
+        errs.insert(errs.end(), se.begin(), se.end());
+    }
+
+    if (ftype == "sketch3d") {
+        auto se = validate_sketch3d_params(params, where + ".params", globals_names);
         errs.insert(errs.end(), se.begin(), se.end());
     }
 

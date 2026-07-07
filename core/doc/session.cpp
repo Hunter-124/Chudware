@@ -106,6 +106,8 @@
 #include "geom/booleans.h"  // fuse_many — doc_eval_compare's default whole-doc shape
 #include "geom/plane.h"
 #include "geom/profile.h"
+#include "geom/profile3d.h"   // sketch3d wires (doc_sketch3d_health chain report)
+#include "sketch/sketch3d.h"  // 3D free-space sketch solver (sketch3d_* RPCs)
 #include "geom/tessellate.h"
 #include "geom/airfoil.h"  // "airfoil" sketch-entity expansion (agent aerofoil support)
 
@@ -10043,6 +10045,150 @@ json doc_simulate_motion(const std::string& doc_id,
         {"interference", interference},
         {"summary",      std::string(summary_buf)},
     };
+}
+
+// ============================================================ sketch3d RPCs
+// 3D free-space sketch (feature type "sketch3d", doc_schema §3B). Both RPCs are
+// STATELESS — they solve from the persisted feature params on every call (no
+// active-sketch session state; sketch3d has no plane/region machinery). The GUI
+// commits a drag by sending doc_apply_ops edit_feature with the full solved
+// entities array (contract: contracts/sketch3d_gui_contract.md).
+
+namespace {
+
+// Locate a "sketch3d" feature by id (throws on missing / wrong type).
+json& find_sketch3d_feature(Session& s, const std::string& fid) {
+    if (s.doc.contains("features") && s.doc["features"].is_array())
+        for (json& f : s.doc["features"])
+            if (f.is_object() && f.value("id", std::string()) == fid) {
+                if (f.value("type", std::string()) != "sketch3d")
+                    throw OpError("invalid_op", "feature '" + fid + "' is not a sketch3d",
+                                  {{"reason", "not a sketch3d"}});
+                return f;
+            }
+    throw OpError("invalid_op", "no sketch3d feature '" + fid + "'",
+                  {{"reason", "unknown sketch3d"}});
+}
+
+// The {entities, constraints} dict solve_sketch3d takes, from either the host
+// canonical shape (params.entities) or the flat fallback.
+json sketch3d_solver_input(const json& feat) {
+    const json p = sketch_params(feat);  // same params/flat duality as 2D
+    json sk;
+    sk["entities"] = p.contains("entities") ? p["entities"] : json::array();
+    sk["constraints"] = p.contains("constraints") ? p["constraints"] : json::array();
+    return sk;
+}
+
+// id-keyed solved-entity map -> the GUI-friendly array form [{id, type, …}, …],
+// preserving each entity's construction flag from the authored params.
+json sketch3d_entity_array(const json& coords, const json& sk) {
+    auto construction_of = [&](const std::string& eid) -> bool {
+        if (sk.contains("entities") && sk["entities"].is_array())
+            for (const json& e : sk["entities"])
+                if (e.is_object() && e.value("id", std::string()) == eid)
+                    return e.value("construction", false);
+        return false;
+    };
+    json out = json::array();
+    if (coords.is_object())
+        for (auto it = coords.begin(); it != coords.end(); ++it) {
+            json rec = it.value();
+            rec["id"] = it.key();
+            rec["construction"] = construction_of(it.key());
+            out.push_back(std::move(rec));
+        }
+    return out;
+}
+
+}  // namespace
+
+json doc_sketch3d_health(const std::string& doc_id, const std::string& sketch_fid) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    json& feat = find_sketch3d_feature(s, sketch_fid);
+    json env = env_from_doc(s.doc);
+    json sk = sketch3d_solver_input(feat);
+
+    aicad::sketch3d::Sketch3DSolution sol = aicad::sketch3d::solve_sketch3d(sk, env);
+
+    json statuses = json::object();
+    for (const auto& kv : sol.statuses) statuses[kv.first] = kv.second;
+    json redundant = json::array(), conflicting = json::array();
+    for (const auto& t : sol.redundant) redundant.push_back(t);
+    for (const auto& t : sol.conflicting) conflicting.push_back(t);
+
+    json free_vars = json::array();
+    for (const auto& fv : aicad::sketch3d::free_variables3(sk, env))
+        free_vars.push_back({{"entity", fv.entity}, {"param", fv.param}, {"var", fv.var}});
+
+    // Wire-chain report: how the solved entities connect (the same chains the
+    // compiler hands a sweep as spine/guide, in the same deterministic order).
+    json wires = json::array();
+    for (const TopoDS_Wire& w : aicad::geom::wires_from_sketch3d(sol.entities)) {
+        int n_edges = 0;
+        for (TopExp_Explorer ex(w, TopAbs_EDGE); ex.More(); ex.Next()) ++n_edges;
+        wires.push_back({{"closed", static_cast<bool>(w.Closed())}, {"n_edges", n_edges}});
+    }
+
+    std::string status = "under";
+    if (!sol.conflicting.empty() || !sol.converged) status = "over";
+    else if (sol.dof == 0) status = "full";
+
+    return json{{"ok", true},
+                {"status", status},
+                {"dof", sol.dof},
+                {"converged", sol.converged},
+                {"statuses", statuses},
+                {"redundant", redundant},
+                {"conflicting", conflicting},
+                {"free", free_vars},
+                {"entities", sketch3d_entity_array(sol.entities, sk)},
+                {"wires", wires}};
+}
+
+json doc_sketch3d_drag(const std::string& doc_id, const std::string& sketch_fid,
+                       const std::string& handle, const json& xyz, const json& targets) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    json& feat = find_sketch3d_feature(s, sketch_fid);
+    json env = env_from_doc(s.doc);
+    json sk = sketch3d_solver_input(feat);
+
+    // Stateless: a cold solve supplies the warm-start state for this drag step.
+    // (Authored coords ARE the last committed positions — doc_schema §3.4 —
+    // so the cold solve is already at/near the on-screen configuration.)
+    aicad::sketch3d::Sketch3DSolution base = aicad::sketch3d::solve_sketch3d(sk, env);
+
+    Eigen::Vector3d target(0, 0, 0);
+    if (xyz.is_array() && xyz.size() >= 3)
+        target = Eigen::Vector3d(xyz[0].get<double>(), xyz[1].get<double>(),
+                                 xyz[2].get<double>());
+    json res = aicad::sketch3d::drag3(base.state, handle, target, sk, env,
+                                      targets.is_null() ? json() : targets);
+
+    const json res_entities = res.contains("entities") ? res["entities"] : json::object();
+    json entities = sketch3d_entity_array(res_entities, sk);
+
+    if (res.is_object() && res.contains("ok") && !res["ok"].get<bool>()) {
+        // Failed/empty drag: keep the frozen entities so the host overlay is
+        // preserved (same never-wipe rule as the 2D sketch_drag).
+        return json{{"ok", false},
+                    {"error", res.contains("error") && !res["error"].is_null()
+                                  ? res["error"] : json("drag target did not resolve")},
+                    {"rejected_handles", res.contains("rejected_handles")
+                                             ? res["rejected_handles"] : json::array()},
+                    {"entities", entities},
+                    {"statuses", res.contains("statuses") ? res["statuses"] : json::object()}};
+    }
+
+    return json{{"ok", true},
+                {"entities", entities},
+                {"statuses", res.contains("statuses") ? res["statuses"] : json::object()},
+                {"rejected_handles", res.contains("rejected_handles")
+                                         ? res["rejected_handles"] : json::array()},
+                {"converged", res.value("converged", true)},
+                {"budget_exceeded", res.value("budget_exceeded", false)}};
 }
 
 }  // namespace aicad::doc

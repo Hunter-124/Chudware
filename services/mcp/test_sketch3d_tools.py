@@ -420,12 +420,18 @@ class TestSketch3dEngineIntegration:
             "wire_id alias was removed — it misled models into treating Python sketch ids "
             "as C++ doc wire feature ids"
         )
-        # The C++ engine dispatch does NOT yet forward a guides[] key from
-        # doc_apply_ops (core/doc/session.cpp has no guides wiring), so guide_support
-        # is always False.  When session.cpp gains the wiring, guide_support becomes True.
-        assert r.get("guide_support") is False, (
-            "guide_support must be False until session.cpp wires guides[] in doc_apply_ops"
+        # The sweep guides[] ref is now plumbed end-to-end (doc_apply_ops ->
+        # document.cpp sweep branch -> geom::sweep_profile) and the engine has a real
+        # `sketch3d` feature, so guide_support is True and the tool returns a
+        # ready-to-apply add_feature op for it.
+        assert r.get("guide_support") is True, (
+            "guide_support must be True — sweep guides[] + sketch3d feature are live"
         )
+        fop = r.get("feature_op")
+        assert isinstance(fop, dict) and fop.get("op") == "add_feature"
+        assert fop["feature"]["type"] == "sketch3d"
+        ents = fop["feature"]["params"]["entities"]
+        assert ents and ents[0]["type"] == "line" and ents[0]["p2"] == [0, 0, 30]
         # Workflow hint and coord_summary must be present for the driver.
         assert "workflow_hint" in r
         assert "coord_summary" in r

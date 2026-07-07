@@ -105,6 +105,8 @@
 #include "geom/transform.h"
 #include "geom/aicm.h"
 #include "sketch/sketch.h"
+#include "sketch/sketch3d.h"
+#include "geom/profile3d.h"
 #include "util/expr.h"
 
 namespace aicad::doc {
@@ -165,8 +167,18 @@ struct CurveResult {
     aicad::geom::SketchPlane base;    // lift frame
 };
 
+// A 3D free-space sketch result: the solved entities chained into WORLD-space
+// wires (open or closed). Never a body; consumed by a downstream sweep as its
+// spine/path or guide curve (and by a future loft-guides pass). `wires` is
+// deterministically ordered (wire 0 = the chain containing the earliest-authored
+// entity — see geom::wires_from_sketch3d).
+struct Sketch3DResult {
+    std::vector<TopoDS_Wire> wires;
+    nlohmann::json entities;  // solved entities (id -> param dict)
+};
+
 using FeatureResult = std::variant<SketchResult, SolidResult, PlaneResult, AxisResult,
-                                   PointResult, CurveResult>;
+                                   PointResult, CurveResult, Sketch3DResult>;
 
 // -------------------------------------------------------------------- env parsing
 // Flatten the env json object into name -> double. Non-numeric entries are skipped
@@ -264,6 +276,33 @@ const SketchResult& require_sketch(const std::map<std::string, FeatureResult>& r
         throw std::runtime_error(std::string("profile '") + slot + "' -> '" + ref_id +
                                  "' is a solid body, not a sketch");
     return std::get<SketchResult>(it->second);
+}
+
+// Pick ONE wire chain out of a Sketch3DResult for a sweep path/guide ref. A plain
+// feature-id ref takes the single chain (and rejects an ambiguous multi-chain
+// sketch loudly); {"feature":fid,"wire":k} selects chain k explicitly. `what` is
+// "path"/"guide" for the error text.
+TopoDS_Wire sketch3d_ref_wire(const Sketch3DResult& s3, const json& ref,
+                              const char* what) {
+    if (s3.wires.empty())
+        throw std::runtime_error(std::string("sweep: ") + what +
+                                 " sketch3d produced no wire — its non-construction "
+                                 "entities do not form any connected chain");
+    int widx = -1;
+    if (ref.is_object() && ref.contains("wire") && ref["wire"].is_number_integer())
+        widx = ref["wire"].get<int>();
+    if (widx < 0) {
+        if (s3.wires.size() == 1) return s3.wires.front();
+        throw std::runtime_error(std::string("sweep: ") + what + " sketch3d has " +
+                                 std::to_string(s3.wires.size()) +
+                                 " wire chains — pick one with "
+                                 "{\"feature\":\"<fid>\",\"wire\":<k>}");
+    }
+    if (widx >= static_cast<int>(s3.wires.size()))
+        throw std::runtime_error(std::string("sweep: ") + what + " sketch3d wire index " +
+                                 std::to_string(widx) + " out of range (has " +
+                                 std::to_string(s3.wires.size()) + " chains)");
+    return s3.wires[widx];
 }
 
 // Close an OPEN revolve profile back to its axis so a bare outer-wall curve can still
@@ -1479,6 +1518,24 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // valid path/trace for a sweep/rib. A consuming feature that needs a
                 // face (extrude/revolve) raises if faces is empty.
                 results[id] = SketchResult{std::move(faces), plane, sol.entities};
+                st.ok = true;
+
+            } else if (type == "sketch3d") {
+                // 3D free-space sketch (doc_schema §3B): solve the constraint
+                // system in world coordinates, then chain the solved entities
+                // into 3D wires a downstream sweep consumes as spine or guide.
+                json sk;
+                sk["entities"] = feat.value("entities", json::array());
+                sk["constraints"] = feat.value("constraints", json::array());
+                aicad::sketch3d::Sketch3DSolution sol =
+                    aicad::sketch3d::solve_sketch3d(sk, env_json);
+                if (!sol.converged)
+                    throw std::runtime_error("sketch3d did not converge");
+                std::vector<TopoDS_Wire> wires =
+                    aicad::geom::wires_from_sketch3d(sol.entities);
+                // NB: zero wires is NOT an error here — a points-only skeleton is
+                // valid; a consuming sweep raises if it needs a wire.
+                results[id] = Sketch3DResult{std::move(wires), sol.entities};
                 st.ok = true;
 
             } else if (type == "plane") {
@@ -3224,6 +3281,12 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                         b.uAxis.y(), b.vAxis.y(), b.normal.y(), b.origin.y(),
                         b.uAxis.z(), b.vAxis.z(), b.normal.z(), b.origin.z());
                     spine = TopoDS::Wire(BRepBuilderAPI_Transform(cr.wire, lift, true).Shape());
+                } else if (path_it != results.end() &&
+                           std::holds_alternative<Sketch3DResult>(path_it->second)) {
+                    // A 3D free-space sketch: its wires are already in world
+                    // coordinates — no lift. Wire choice per sketch3d_ref_wire.
+                    spine = sketch3d_ref_wire(std::get<Sketch3DResult>(path_it->second),
+                                              *pit, "path");
                 } else {
                     const SketchResult& pathsk = require_sketch(results, path_id, "path");
                     spine = aicad::geom::wire_from_solved_sketch(pathsk.entities, pathsk.plane);
@@ -3279,6 +3342,10 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                             b.uAxis.z(), b.vAxis.z(), b.normal.z(), b.origin.z());
                         gw = TopoDS::Wire(
                             BRepBuilderAPI_Transform(cr.wire, lift, true).Shape());
+                    } else if (gres != results.end() &&
+                               std::holds_alternative<Sketch3DResult>(gres->second)) {
+                        gw = sketch3d_ref_wire(std::get<Sketch3DResult>(gres->second),
+                                               gsel, "guide");
                     } else {
                         const SketchResult& gsk = require_sketch(results, gid, "guide");
                         gw = aicad::geom::wire_from_solved_sketch(gsk.entities, gsk.plane);

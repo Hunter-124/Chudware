@@ -2727,6 +2727,21 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                                 params.value("doc_id", std::string()),
                                 params.value("sketch", std::string())),
                             out_json, 0);
+            // 3D free-space sketch (feature type "sketch3d"). Same "sketch" param
+            // carries the feature id; contract in contracts/sketch3d_gui_contract.md.
+            if (m == "sketch3d_health")
+                return emit(aicad::doc::doc_sketch3d_health(
+                                params.value("doc_id", std::string()),
+                                params.value("sketch", std::string())),
+                            out_json, 0);
+            if (m == "sketch3d_drag")
+                return emit(aicad::doc::doc_sketch3d_drag(
+                                params.value("doc_id", std::string()),
+                                params.value("sketch", std::string()),
+                                params.value("handle", std::string()),
+                                params.contains("xyz") ? params["xyz"] : json(nullptr),
+                                params.contains("targets") ? params["targets"] : json(nullptr)),
+                            out_json, 0);
             if (m == "sketch_project_ref")
                 return emit(aicad::doc::doc_sketch_project_ref(
                                 params.value("doc_id", std::string()),

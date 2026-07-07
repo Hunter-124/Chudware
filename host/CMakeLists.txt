@@ -9,6 +9,15 @@ endif()
 
 include(FetchContent)
 
+# --- Embedded browser backend selection -------------------------------------
+# OFF (default): the app ships only the ScreencastWebView (worker-side headless
+# Chromium streamed over browser_embed_* RPCs) — no extra deps, always builds.
+# ON: additionally compile the in-process CEF off-screen backend (native
+# <select>/clipboard/autofill). Requires a CEF binary distribution; point
+# CEF_ROOT at it. See docs/cef_webview.md and cmake/cef.cmake. The build stays
+# green with this OFF so CI and contributors never need the ~1 GB CEF SDK.
+option(AI_CAD_ENABLE_CEF "Build the in-process CEF off-screen browser backend" OFF)
+
 # --- GLFW (window + GL context) ---------------------------------------------
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -142,7 +151,8 @@ add_executable(AI-CAD
   src/ui/icons.cpp
   src/ui/icons_sdf.cpp  # liquid-glass v2: runtime SDF glyphs + halo (drawIconGlass)
   src/ui/widgets/ribbon.cpp
-  src/ui/widgets/web_view.cpp  # phase C: reusable embedded-browser widget (browser_embed_*)
+  src/ui/widgets/web_view.cpp          # ScreencastWebView: browser_embed_* JPEG stream (default)
+  src/ui/widgets/web_view_backend.cpp  # IWebViewBackend factory (screencast vs CEF)
   src/ui/ribbon_def.cpp
   # --- end C14 ---
   # --- [parts-plm sources] workspace bodies (parts-port agent appends here) ---
@@ -182,6 +192,14 @@ target_include_directories(AI-CAD PRIVATE
   ${imgui_SOURCE_DIR}
   ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(AI-CAD PRIVATE glfw nlohmann_json::nlohmann_json)
+
+# CEF off-screen browser backend (opt-in). cmake/cef.cmake finds the CEF binary
+# distribution, adds the cef_web_view sources + libcef_dll_wrapper, defines
+# AI_CAD_ENABLE_CEF, and registers the mandatory subprocess-helper target. Kept
+# out of the default build entirely (no-op when the option is OFF).
+if(AI_CAD_ENABLE_CEF)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/cef.cmake)
+endif()
 if(WIN32)
   target_link_libraries(AI-CAD PRIVATE dwmapi comdlg32 dbghelp)  # comdlg32: C41 file dialogs; dbghelp: crash stack/minidump
   # Emit debug info even in Release so crash stacks symbolize (PDB next to the exe).
@@ -207,6 +225,19 @@ target_include_directories(test_aicm PRIVATE
 set_target_properties(test_aicm PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 # --- end C15 ---
+
+# --- RE-08: image decode + GL texture util test (pure-CPU, no GL context) ---
+enable_testing()
+add_executable(test_img_tex
+  tests/test_img_tex.cpp)
+target_include_directories(test_img_tex PRIVATE
+  ${stb_SOURCE_DIR})
+set_target_properties(test_img_tex PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_img_tex
+  COMMAND test_img_tex "${CMAKE_BINARY_DIR}/test_img_tex_tmp"
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end RE-08 ---
 
 # Copy brand/font assets next to the exe so the GUI can load them at runtime.
 add_custom_command(TARGET AI-CAD POST_BUILD

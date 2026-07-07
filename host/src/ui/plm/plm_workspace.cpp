@@ -127,6 +127,7 @@ void plmDocTypeTag(const std::string& docType, const std::string& kind) {
     else if (k == "sim_study")  t = {"SIM",  palette.textDim[0], palette.textDim[1], palette.textDim[2]};
     else if (k == "software")   t = {"CODE", palette.accent[0], palette.accent[1], palette.accent[2]};
     else if (k == "linked_repo")t = {"LINK", palette.accent[0], palette.accent[1], palette.accent[2]};
+    ImGui::AlignTextToFramePadding();  // sit level with the path text / controls beside it
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(t.r, t.g, t.b, 1.0f));
     ImGui::Text("[%s]", t.tag);
     ImGui::PopStyleColor();

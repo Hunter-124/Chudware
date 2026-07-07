@@ -7,11 +7,13 @@
 // successful mutation it bumps the generation so caches refetch.
 #include "plm_hub.h"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <vector>
 
 #include "imgui.h"
 
@@ -372,7 +374,7 @@ void drawFilesTab(AppState& st) {
     ImGui::PopStyleColor(2);
     plmError(H.actionErr);
 
-    // filter pills
+    // filter pills + sort dropdown
     ImGui::Dummy(ImVec2(0, 6 * S));
     for (int i = 0; i < (int)(sizeof(kFilters) / sizeof(kFilters[0])); ++i) {
         if (i) ImGui::SameLine();
@@ -383,15 +385,43 @@ void drawFilesTab(AppState& st) {
         if (ImGui::SmallButton(kFilters[i].label)) H.kindFilter = i;
         ImGui::PopStyleColor();
     }
+    // Sort control, pinned to the right of the filter row.
+    static const char* kSort[] = {
+        "Name (A\xe2\x86\x92Z)", "Type", "Revision", "Status", "Unsaved first",
+    };
+    const float sortW = 130 * S;
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - sortW);
+    ImGui::SetNextItemWidth(sortW);
+    ImGui::Combo("##sort", &H.sortMode, kSort, IM_ARRAYSIZE(kSort));
     ImGui::Separator();
     ImGui::Spacing();
 
     if (H.itemsLoading && H.items.empty()) { plmSpinner("Loading"); return; }
     if (!H.itemsErr.empty()) { plmError(H.itemsErr); return; }
 
+    // build a filtered + sorted view (pointers into H.items — no copies)
+    std::vector<const PlmItemRow*> view;
+    view.reserve(H.items.size());
+    for (const auto& it : H.items)
+        if (passesFilter(it, H.kindFilter)) view.push_back(&it);
+    std::stable_sort(view.begin(), view.end(),
+        [&](const PlmItemRow* a, const PlmItemRow* b) {
+            switch (H.sortMode) {
+                case 1: return a->kind + a->docType < b->kind + b->docType;
+                case 2: {  // revision, highest first
+                    const std::string& ra = !a->rev.empty() ? a->rev : a->workingRev;
+                    const std::string& rb = !b->rev.empty() ? b->rev : b->workingRev;
+                    return ra > rb;
+                }
+                case 3: return a->lifecycle < b->lifecycle;
+                case 4: return a->dirty > b->dirty;   // unsaved first
+                default: return a->path < b->path;    // name A→Z
+            }
+        });
+
     int shown = 0;
-    for (const auto& it : H.items) {
-        if (!passesFilter(it, H.kindFilter)) continue;
+    for (const PlmItemRow* itp : view) {
+        const auto& it = *itp;
         ++shown;
         ImGui::PushID(it.itemId.c_str());
         bool sel = (H.selectedItem == it.itemId);
@@ -772,6 +802,51 @@ void plmDrawSettingsPage(AppState& st) {
         }
         ImGui::PopStyleColor();
     }
+
+    // ---- Organization & access (preview — applies once a team is connected) ----
+    ImGui::Dummy(ImVec2(0, 10 * S));
+    plmSectionHeader("Organization & access");
+    dimText("Who can see and change this project. These apply once you connect a "
+            "team (Team & Sync on the Planning page).");
+
+    // project visibility
+    ImGui::Dummy(ImVec2(0, 2 * S));
+    ImGui::TextUnformatted("Visibility");
+    struct Opt { const char* id; const char* label; };
+    static const Opt kVis[] = {
+        {"private", "Private"}, {"team", "Team"},
+        {"org", "Organization"}, {"public", "Public"},
+    };
+    static int s_vis = 1;  // Team
+    for (int i = 0; i < 4; ++i) {
+        if (i) ImGui::SameLine();
+        bool sel = (s_vis == i);
+        ImGui::PushStyleColor(ImGuiCol_Button, sel
+            ? ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.30f)
+            : ImVec4(palette.button[0], palette.button[1], palette.button[2], 0.5f));
+        if (ImGui::Button(kVis[i].label)) s_vis = i;
+        ImGui::PopStyleColor();
+    }
+
+    // default role for new members
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    ImGui::TextUnformatted("Default role for new members");
+    static const char* kRoles[] = {"Viewer", "Commenter", "Editor", "Manager"};
+    static int s_role = 0;
+    ImGui::SetNextItemWidth(180 * S);
+    ImGui::Combo("##defrole", &s_role, kRoles, IM_ARRAYSIZE(kRoles));
+
+    // release / edit governance
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    ImGui::TextUnformatted("Governance");
+    static bool s_reqApproval = false, s_lockOnEdit = true, s_restrictRelease = true;
+    ImGui::Checkbox("Require approval before a release", &s_reqApproval);
+    ImGui::Checkbox("Take an advisory lock while a document is open", &s_lockOnEdit);
+    ImGui::Checkbox("Only Managers can release", &s_restrictRelease);
+
+    ImGui::Dummy(ImVec2(0, 2 * S));
+    dimText("Preview — permissions are enforced server-side once team sharing is "
+            "enabled; nothing here changes single-machine use.");
 }
 
 // ---- Planning (kanban + milestones) -------------------------------------------
@@ -862,16 +937,26 @@ bool plmDatePicker(const char* id, char* buf, size_t n) {
         }
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        // weekday header — each label centred inside its 26px column
+        // Every cell (weekday label and day number) is drawn the same way: reserve a
+        // fixed square with a Dummy/InvisibleButton, then draw the glyph centred both
+        // horizontally AND vertically inside that square via the draw list. This is
+        // immune to font metrics / ButtonTextAlign quirks — the number always sits
+        // dead-centre in its box.
+        auto centreText = [&](ImVec2 rmin, ImVec2 rmax, const char* txt, ImU32 col) {
+            ImVec2 ts = ImGui::CalcTextSize(txt);
+            dl->AddText(ImVec2((rmin.x + rmax.x - ts.x) * 0.5f,
+                               (rmin.y + rmax.y - ts.y) * 0.5f), col, txt);
+        };
+
+        // weekday header
         static const char* kDow[] = {"Su","Mo","Tu","We","Th","Fr","Sa"};
         ImU32 dimCol = ImGui::ColorConvertFloat4ToU32(
             ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
         for (int i = 0; i < 7; ++i) {
             if (i) ImGui::SameLine();
             ImVec2 p = ImGui::GetCursorScreenPos();
-            ImVec2 ts = ImGui::CalcTextSize(kDow[i]);
-            dl->AddText(ImVec2(p.x + (kCell - ts.x) * 0.5f, p.y), dimCol, kDow[i]);
-            ImGui::Dummy(ImVec2(kCell, ts.y));
+            ImGui::Dummy(ImVec2(kCell, kCellH));
+            centreText(p, ImVec2(p.x + kCell, p.y + kCellH), kDow[i], dimCol);
         }
 
         // day grid — first weekday + day count via std::tm normalisation
@@ -882,6 +967,8 @@ bool plmDatePicker(const char* id, char* buf, size_t n) {
         int dim = mdays[vm - 1];
         if (vm == 2 && ((vy % 4 == 0 && vy % 100 != 0) || vy % 400 == 0)) dim = 29;
 
+        ImU32 txtCol = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(palette.text[0], palette.text[1], palette.text[2], 1.0f));
         int cell = 0;
         for (int i = 0; i < lead; ++i, ++cell) {
             if (cell % 7) ImGui::SameLine();
@@ -893,19 +980,26 @@ bool plmDatePicker(const char* id, char* buf, size_t n) {
             bool isSel = (haveVal && vy == y && vm == mo && day == d);
             bool isToday = (vy == now.tm_year + 1900 && vm == now.tm_mon + 1 &&
                             day == now.tm_mday);
+            ImVec2 rmin = ImGui::GetCursorScreenPos();
+            bool click = ImGui::InvisibleButton("##d", ImVec2(kCell, kCellH));
+            ImVec2 rmax(rmin.x + kCell, rmin.y + kCellH);
+            bool hov = ImGui::IsItemHovered();
             if (isSel)
-                ImGui::PushStyleColor(ImGuiCol_Button,
-                    ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
+                dl->AddRectFilled(rmin, rmax, ImGui::ColorConvertFloat4ToU32(
+                    ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f)), 4 * S);
             else if (isToday)
-                ImGui::PushStyleColor(ImGuiCol_Button,
-                    ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.25f));
+                dl->AddRectFilled(rmin, rmax, ImGui::ColorConvertFloat4ToU32(
+                    ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.28f)), 4 * S);
+            else if (hov)
+                dl->AddRectFilled(rmin, rmax, ImGui::ColorConvertFloat4ToU32(
+                    ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.10f)), 4 * S);
             char db[4]; std::snprintf(db, sizeof(db), "%d", day);
-            if (ImGui::Button(db, ImVec2(kCell, kCellH))) {
+            centreText(rmin, rmax, db, txtCol);
+            if (click) {
                 std::snprintf(buf, n, "%04d-%02d-%02d", vy, vm, day);
                 changed = true;
                 ImGui::CloseCurrentPopup();
             }
-            if (isSel || isToday) ImGui::PopStyleColor();
             ImGui::PopID();
         }
         ImGui::PopStyleVar(2);
@@ -915,12 +1009,22 @@ bool plmDatePicker(const char* id, char* buf, size_t n) {
     return changed;
 }
 
-void priorityTag(const std::string& pr) {
+// A small filled priority dot, right-aligned to the card's bottom-right corner.
+// p0 = red, p1 = orange/warn, p2 = neutral dim, p3 = faint. Hover shows the label.
+void priorityDot(const std::string& pr) {
+    const float S = ui::uiScale;
+    std::string p = pr.empty() ? "p2" : pr;
     const float* c = palette.textDim;
-    if (pr == "p0" || pr == "p1") c = palette.statusWarn;
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], 1.0f));
-    ImGui::Text("[%s]", pr.empty() ? "p2" : pr.c_str());
+    float a = 0.9f;
+    if (p == "p0")      { c = palette.statusErr;  }
+    else if (p == "p1") { c = palette.statusWarn; }
+    else if (p == "p3") { c = palette.textDisabled; a = 0.7f; }
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - 12 * S);
+    ImGui::AlignTextToFramePadding();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], a));
+    ImGui::TextUnformatted("\xe2\x97\x8f");  // ●
     ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("priority %s", p.c_str());
 }
 
 static std::string s_selTask;
@@ -955,11 +1059,12 @@ static void drawMilestoneRow(AppState& st, const PlmMilestoneRow& m) {
     } else {
         ImGui::PushStyleColor(ImGuiCol_Text, done
             ? ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f)
-            : ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+            : ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
         ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(done ? "[x]" : "[ ]");
+        ImGui::TextUnformatted(done ? "Done" : "Open");
         ImGui::PopStyleColor();
         ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
         ImGui::TextWrapped("%s", m.title.c_str());
         if (!m.due.empty()) dimText("due %s", m.due.c_str());
         // action row
@@ -1021,6 +1126,14 @@ static void drawIssueRow(AppState& st, const PlmIssueRow& is) {
     }
     ImGui::PopStyleColor(2);
     ImGui::SameLine();
+    // cycle the severity/priority in place: low → med → high → critical → low
+    static const char* kSevCycle[] = {"low", "med", "high", "critical"};
+    if (ImGui::SmallButton("Priority")) {
+        int cur = 1;  // default med
+        for (int k = 0; k < 4; ++k) if (is.severity == kSevCycle[k]) cur = k;
+        planCall(st, "update", "issue", {{"severity", kSevCycle[(cur + 1) % 4]}}, is.id);
+    }
+    ImGui::SameLine();
     if (ImGui::SmallButton(closed ? "Reopen" : "Close"))
         planCall(st, "update", "issue", {{"state", closed ? "open" : "closed"}}, is.id);
     ImGui::SameLine();
@@ -1041,62 +1154,54 @@ void plmDrawPlanningPage(AppState& st) {
     plmSectionHeader("Planning");
     if (!H.planErr.empty()) plmError(H.planErr);
 
-    // ---- top band: Team & Sync (left) + Milestones (right, condensed) ----------
-    ImGui::Columns(2, "##plan_top", false);
-    ImGui::SetColumnWidth(0, 320 * S);
+    static const char* kSev[] = {"low", "med", "high", "critical"};
 
-    plmSectionHeader("Team & Sync");
-    dimText("Share via a shared folder or your own server. Sync brings changes "
-            "together without ever merging or losing work.");
-    ImGui::BeginDisabled(true);
-    ImGui::Button("Connect a shared folder\xe2\x80\xa6");
+    // ---- top band: Issues (left) + Milestones (right) --------------------------
+    ImGui::Columns(2, "##plan_top", false);
+
+    // Issues — log a problem with a severity, so you can plan fixes while you see
+    // what's wrong. "Make plan" (on each row) turns one into a linked task.
+    plmSectionHeader("Issues");
+    ImGui::SetNextItemWidth(90 * S);
+    ImGui::Combo("##newissuesev", &H.newIssueSev, kSev, IM_ARRAYSIZE(kSev));
     ImGui::SameLine();
-    ImGui::Button("Sync now");
-    ImGui::EndDisabled();
-    dimText("Sharing & Sync arrive in a later update.");
+    ImGui::SetNextItemWidth(-90 * S);
+    bool ienter = ImGui::InputTextWithHint("##newissue", "describe an issue\xe2\x80\xa6",
+        H.newIssueTitle, sizeof(H.newIssueTitle), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    accentButtonColors();
+    if ((ImGui::Button("Log", ImVec2(-1, 0)) || ienter) && H.newIssueTitle[0]) {
+        planCall(st, "create", "issue",
+                 {{"title", H.newIssueTitle}, {"severity", kSev[H.newIssueSev]}});
+        H.newIssueTitle[0] = '\0';
+    }
+    ImGui::PopStyleColor(2);
+    if (H.issues.empty()) dimText("No issues logged.");
+    for (const auto& is : H.issues) drawIssueRow(st, is);
 
     ImGui::NextColumn();
 
+    // Milestones — title + due date + Add, all the same height and baseline.
     plmSectionHeader("Milestones");
     static char s_msTitle[160] = {};
     static char s_msDue[32] = {};
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
     ImGui::SetNextItemWidth(150 * S);
     ImGui::InputTextWithHint("##msTitle", "milestone", s_msTitle, sizeof(s_msTitle));
-    ImGui::PopStyleVar();
     ImGui::SameLine();
     plmDatePicker("##msDue", s_msDue, sizeof(s_msDue));
     ImGui::SameLine();
+    accentButtonColors();
     if (ImGui::Button("Add") && s_msTitle[0]) {
         nlohmann::json d = {{"title", s_msTitle}};
         if (s_msDue[0]) d["due"] = s_msDue;
         planCall(st, "create", "milestone", d);
         s_msTitle[0] = '\0'; s_msDue[0] = '\0';
     }
+    ImGui::PopStyleColor(2);
     if (H.milestones.empty()) dimText("No milestones yet.");
     for (const auto& m : H.milestones) drawMilestoneRow(st, m);
 
     ImGui::Columns(1);
-    ImGui::Dummy(ImVec2(0, 4 * S));
-    ImGui::Separator();
-
-    // ---- Issues (folded in so you can see problems while you plan) --------------
-    plmSectionHeader("Issues");
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
-    ImGui::SetNextItemWidth(-130 * S);
-    bool ienter = ImGui::InputTextWithHint("##newissue", "describe an issue\xe2\x80\xa6",
-        H.newIssueTitle, sizeof(H.newIssueTitle), ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::PopStyleVar();
-    ImGui::SameLine();
-    accentButtonColors();
-    if ((ImGui::Button("Log issue", ImVec2(120 * S, 0)) || ienter) && H.newIssueTitle[0]) {
-        planCall(st, "create", "issue", {{"title", H.newIssueTitle}});
-        H.newIssueTitle[0] = '\0';
-    }
-    ImGui::PopStyleColor(2);
-    if (H.issues.empty()) dimText("No issues logged. \"Make plan\" turns one into a task.");
-    for (const auto& is : H.issues) drawIssueRow(st, is);
-
     ImGui::Dummy(ImVec2(0, 4 * S));
     ImGui::Separator();
 
@@ -1128,8 +1233,8 @@ void plmDrawPlanningPage(AppState& st) {
     static const char* kPipe[] = {"todo", "doing", "done"};  // ordered lane; "blocked" is aside
     const float gap  = 8 * S;
     float colW = (ImGui::GetContentRegionAvail().x - gap * 3) / 4.0f;
-    float colH = ImGui::GetContentRegionAvail().y - 210 * S;  // reserve room for milestones
-    if (colH < 260 * S) colH = 260 * S;
+    float colH = ImGui::GetContentRegionAvail().y - 150 * S;  // reserve room for Team & Sync
+    if (colH < 240 * S) colH = 240 * S;
 
     for (int ci = 0; ci < 4; ++ci) {
         const auto& col = kCols[ci];
@@ -1156,8 +1261,6 @@ void plmDrawPlanningPage(AppState& st) {
             ImGui::PushID(t.id.c_str());
             bool sel = (s_selTask == t.id);
             plmCardBegin("##task", sel, 8.0f, 5.0f);
-            priorityTag(t.priority);
-            ImGui::SameLine();
             ImGui::TextWrapped("%s", t.title.c_str());
             if (!t.assignee.empty()) dimText("@%s", t.assignee.c_str());
 
@@ -1200,6 +1303,7 @@ void plmDrawPlanningPage(AppState& st) {
                 ImGui::PopStyleColor();
             }
             ImGui::PopStyleVar(2);
+            priorityDot(t.priority);  // bottom-right corner of the card
             if (plmCardEnd()) s_selTask = sel ? "" : t.id;
             ImGui::PopID();
         }
@@ -1211,6 +1315,18 @@ void plmDrawPlanningPage(AppState& st) {
         ImGui::PopID();
         ImGui::EndGroup();
     }
+
+    // ---- Team & Sync (placeholder until remotes/locks land) --------------------
+    ImGui::Dummy(ImVec2(0, 6 * S));
+    ImGui::Separator();
+    plmSectionHeader("Team & Sync");
+    dimText("Share via a shared folder or your own server. Sync brings changes "
+            "together without ever merging or losing work — coming in a later update.");
+    ImGui::BeginDisabled(true);
+    ImGui::Button("Connect a shared folder\xe2\x80\xa6");
+    ImGui::SameLine();
+    ImGui::Button("Sync now");
+    ImGui::EndDisabled();
 }
 
 // ---- Issues -------------------------------------------------------------------

@@ -73,6 +73,7 @@ struct PlmHubState {
     std::vector<PlmItemRow> items;
     std::string selectedItem;
     int         kindFilter = 0;           // 0 = all; else index into a filter list
+    int         sortMode   = 0;           // Files sort: 0 name,1 type,2 rev,3 status,4 unsaved
 
     // history (History page)
     int         histGen = -1; bool histLoading = false; std::string histErr;
@@ -96,6 +97,7 @@ struct PlmHubState {
     std::string actionErr, actionOk;
     char        newTaskTitle[192] = {};
     char        newIssueTitle[192] = {};
+    int         newIssueSev = 1;          // severity for the next logged issue (0 low..3 crit)
     char        trackPath[512] = {};
     char        linkUrl[512] = {};
     char        linkName[128] = {};

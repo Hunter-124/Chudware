@@ -2584,6 +2584,22 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // but the sketcher agent needs to draw plane hover/click overlay). Guard with sketch != null.
         // C40: inactive sketches ghost-render in every mode (SolidWorks grey sketches); the
         // active sketch (if any) is skipped — drawOverlay below owns it.
+        // Sketch-plane pick (SolidWorks "New Sketch -> pick a face/plane") needs a live face hover so a
+        // planar SOLID FACE under the cursor can win the pick over the datum plane behind it. The main
+        // pick block (~2664) is suppressed during sketchPlanePickActive (the overlay owns the mouse +
+        // click), so st.hover was never populated and the overlay's face branch was dead. Compute a
+        // hover-only FACE pick HERE — before drawOverlay reads st.hover — with NO click/selection/Esc
+        // side effects (the overlay below consumes the click). Placed above drawOverlay for same-frame
+        // correctness (no one-frame hover lag).
+        if (picking && st.sketchPlanePickActive && !s_viewSelector.active()) {
+            if (imgHovered && !s_lmbDragActive && st.idPass) {
+                int px = (int)(io.MousePos.x - vr0.x);
+                int py = (int)(io.MousePos.y - vr0.y);
+                st.hover = st.idPass->pickFinal(px, py, vw, vh);
+            } else {
+                st.hover = render::PickHit{};
+            }
+        }
         if (sketch != nullptr) sketch->drawGhosts(st, vr0, vr1, vw, vh);
         if (inSketch) {
             // While the glass-box View Selector is open over a sketch, it owns the cursor — tell the

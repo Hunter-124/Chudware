@@ -5020,8 +5020,42 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         std::string sDatumFid, sDatumName; float sDatumDepth = 1e30f; ImVec2 sDatumQuad[4];
         bool sDatumHit = imgHovered && hitTestDatumPlane(st, io.MousePos, imgMin, vw, vh,
                                                          sDatumFid, sDatumName, sDatumDepth, sDatumQuad);
-        bool sDatumWins = sDatumHit && sDatumDepth < hoveredDepth;
-        if (sDatumWins) hovered = -1;   // a datum plane is in front; drop origin-plane emphasis
+        // A planar SOLID FACE under the cursor (SolidWorks "sketch on a face"). The id-buffer pick
+        // (st.hover) tells us WHICH face; we compute its depth by intersecting the cursor ray with the
+        // face's supporting plane (anchor + normal from faceNormalCache), then dist^2 from the hit point
+        // to cam.eye — the SAME metric hoveredDepth / sDatumDepth use — so all three compare directly.
+        // A face in FRONT of a plane must win the pick, not fall through to the plane behind it.
+        float sFaceDepth = 1e30f;
+        bool sFaceHit = false;
+        if (imgHovered && st.hover.valid() && st.hover.kind == render::PickKind::Face) {
+            uint64_t fkey = ((uint64_t)st.hover.body_id << 32) | (uint64_t)st.hover.topo_id;
+            auto fit = st.faceNormalCache.find(fkey);
+            if (fit != st.faceNormalCache.end()) {
+                const auto& fn = fit->second;   // {nx,ny,nz, cx,cy,cz}
+                Vec3 n(fn[0], fn[1], fn[2]);
+                Vec3 anchor(fn[3], fn[4], fn[5]);
+                Vec3 ro, rd;
+                if (screenRay(cam, imgMin, vw, vh, io.MousePos, ro, rd)) {
+                    float denom = dot(rd, n);
+                    if (std::fabs(denom) > 1e-6f) {   // not grazing/parallel
+                        float t = dot(anchor - ro, n) / denom;
+                        if (t > 0.0f) {               // hit is in front of the ray origin
+                            Vec3 hit = ro + rd * t;
+                            float dx = hit.x - cam.eye.x, dy = hit.y - cam.eye.y, dz = hit.z - cam.eye.z;
+                            sFaceDepth = dx * dx + dy * dy + dz * dz;
+                            sFaceHit = true;
+                        }
+                    }
+                }
+            }
+        }
+        // Three-way frontmost among {origin plane, datum plane, solid face} — a strict priority chain
+        // would reintroduce the "plane wins if it registers at all" bug, so rank purely by depth.
+        float originDepth = (hovered >= 0) ? hoveredDepth : 1e30f;
+        bool sFaceWins = sFaceHit && sFaceDepth < originDepth &&
+                         (!sDatumHit || sFaceDepth < sDatumDepth);
+        bool sDatumWins = sDatumHit && !sFaceWins && sDatumDepth < originDepth;
+        if (sDatumWins || sFaceWins) hovered = -1;   // a plane/face is in front; drop origin emphasis
         planeHover_ = hovered;
         // The renderer already draws all three datum planes (fill + outline, with emphasis
         // brightening the hovered one — viewport_panel passes planeHover() as the emphasis).
@@ -5039,15 +5073,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
         // Click: a datum plane wins if frontmost; else an origin plane; else the hovered planar face.
         if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            if (sDatumWins) {
-                // A created datum plane: refs.plane = the bare feature-id STRING (the engine's sketch
-                // compiler looks it up in the results map as a PlaneResult — see document.cpp).
-                planePicking_ = false; st.sketchPlanePickActive = false;
-                consumePlanePick(st, nlohmann::json(sDatumFid));
-            } else if (hovered >= 0) {
-                planePicking_ = false; st.sketchPlanePickActive = false;
-                consumePlanePick(st, planeSel[hovered]);
-            } else if (st.hover.valid() && st.hover.kind == render::PickKind::Face) {
+            if (sFaceWins && st.hover.valid() && st.hover.kind == render::PickKind::Face) {
                 // Planar-face pick: resolve via the same path enterNewOnSelection uses. We try the
                 // hovered face's selector; the engine rejects non-planar faces (toast + stay).
                 std::string perr;
@@ -5063,6 +5089,14 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                         else { planePicking_ = false; st.sketchPlanePickActive = false; }
                     }
                 }
+            } else if (sDatumWins) {
+                // A created datum plane: refs.plane = the bare feature-id STRING (the engine's sketch
+                // compiler looks it up in the results map as a PlaneResult — see document.cpp).
+                planePicking_ = false; st.sketchPlanePickActive = false;
+                consumePlanePick(st, nlohmann::json(sDatumFid));
+            } else if (hovered >= 0) {
+                planePicking_ = false; st.sketchPlanePickActive = false;
+                consumePlanePick(st, planeSel[hovered]);
             }
         }
         // Top-center banner. Sits BELOW the heads-up view toolbar (centered pill at imgMin.y+8,

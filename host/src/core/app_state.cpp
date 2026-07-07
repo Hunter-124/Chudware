@@ -138,6 +138,7 @@ void loadSettings(Settings& s) {
         s.systemPrompt = j.value("system_prompt", "");
         s.theme = j.value("theme", "dark");
         s.units = (j.value("units", std::string("mmgs")) == "ips") ? Units::IPS : Units::MMGS;
+        s.partsGridView = j.value("parts_grid_view", false);
         // v2.1 colored liquid glass ("appearance.glass"). Absent keys stay at their GlassStyle
         // sentinels (= inherit Global / built-in default: dynamic color ON, geometry as today),
         // so an old config.json with no "appearance" block loads to the out-of-box look.
@@ -254,6 +255,7 @@ void saveSettings(const Settings& s) {
     if (!s.systemPrompt.empty()) j["system_prompt"] = s.systemPrompt;
     j["theme"] = s.theme;
     j["units"] = (s.units == Units::IPS) ? "ips" : "mmgs";
+    j["parts_grid_view"] = s.partsGridView;
     // v2.1 colored liquid glass. Emit only fields the user moved off their sentinel and only
     // groups with at least one such field, so a default config carries no "appearance" block.
     {

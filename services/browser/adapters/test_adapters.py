@@ -30,6 +30,11 @@ def adapter_mods(tmp_path, monkeypatch):
     importlib.reload(mcmaster)
     importlib.reload(jlcpcb)
     importlib.reload(pcbway)
+    # Reloading the package reset _REGISTRY — re-register the remaining site modules
+    # too so the registry stays whole for tests that run after this fixture.
+    from services.browser.adapters import content3d, digikey_web, lcsc, misumi, snapeda
+    for _mod in (misumi, lcsc, digikey_web, snapeda, content3d):
+        importlib.reload(_mod)
     yield adapters_pkg, grabcad, traceparts, session, amazon, mcmaster, jlcpcb, pcbway
     monkeypatch.delenv("APPDATA", raising=False)
     importlib.reload(engine_paths)

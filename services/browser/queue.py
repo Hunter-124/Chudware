@@ -60,6 +60,9 @@ class ScrapeJob:
     error:          str = ""
     # Intermediate results from search() (lightweight stubs, not yet acquired).
     search_hits:    list = field(default_factory=list)
+    # Optional pre-selected search hit (e.g. the GUI already holds the item URL from
+    # part_search) — when set, the worker skips the search step and acquires it directly.
+    preset:         Optional[dict] = None
     # Spec metadata extracted from the acquire() provenance envelope:
     # title, sku, price, source_url, fetched_ts, and any other vendor extras.
     # Populated when status transitions to DONE; empty dict until then.
@@ -74,10 +77,14 @@ _cond   = threading.Condition(_lock)
 _worker_started = False
 
 
-def enqueue(site: str, query: str) -> dict:
+def enqueue(site: str, query: str, preset: Optional[dict] = None) -> dict:
     """Add a (site, query) job to the download queue.  Idempotent within a session:
     if an identical (site, query) is already pending or running, returns the
     existing job's status instead of queuing a duplicate.
+
+    ``preset``: an already-chosen search-hit dict (must carry the fields the site
+    adapter's ``acquire()`` expects, typically ``url``/``title``) — the worker then
+    acquires it directly instead of re-searching.
     """
     site  = site.strip().lower()
     query = query.strip()
@@ -91,7 +98,8 @@ def enqueue(site: str, query: str) -> dict:
                     JobStatus.PENDING, JobStatus.RUNNING):
                 return {"ok": True, "id": j.id, "status": j.status.value, "deduplicated": True}
 
-        job = ScrapeJob(id=str(uuid.uuid4())[:8], site=site, query=query)
+        job = ScrapeJob(id=str(uuid.uuid4())[:8], site=site, query=query,
+                        preset=preset if isinstance(preset, dict) else None)
         _jobs.append(job)
         _cond.notify_all()
 
@@ -153,13 +161,17 @@ def _run_job(job: ScrapeJob) -> None:
         job.error  = f"no adapter registered for site '{job.site}'"
         return
 
-    # Step 1: search
-    try:
-        hits = adapter.search(job.query)
-    except Exception as exc:  # noqa: BLE001
-        job.status = JobStatus.ERROR
-        job.error  = f"search failed: {exc}"
-        return
+    # Step 1: search — skipped when the caller already picked the hit (GUI download
+    # button holds the item URL from part_search).
+    if job.preset is not None:
+        hits = [job.preset]
+    else:
+        try:
+            hits = adapter.search(job.query)
+        except Exception as exc:  # noqa: BLE001
+            job.status = JobStatus.ERROR
+            job.error  = f"search failed: {exc}"
+            return
 
     if not hits:
         job.status = JobStatus.ERROR

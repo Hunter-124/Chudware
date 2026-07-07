@@ -97,6 +97,7 @@ struct Settings {
     std::string systemPrompt;    // system prompt override; empty = built-in
     std::string theme = "dark";  // "dark" | "light" — persisted to config.json
     Units units = Units::MMGS;   // document display/input unit system — persisted to config.json
+    bool partsGridView = false;  // Parts Library results as grid cards vs list — "parts_grid_view"
     // v2.1 colored liquid glass: per-group tint/level/rounding/contrast knobs (+ dynamicColor,
     // ON by default) — persisted to config.json under "appearance.glass"; absent keys stay at
     // their GlassStyle sentinels (= inherit Global / built-in default). Mirrored into

@@ -218,6 +218,11 @@ def register_parts_tools(mcp: FastMCP) -> None:
                 "amazon":     "Amazon Business",
                 "jlcpcb":     "JLCPCB",
                 "pcbway":     "PCBWay",
+                "misumi":     "MISUMI",
+                "lcsc":       "LCSC",
+                "digikey":    "DigiKey",
+                "snapeda":    "SnapEDA",
+                "3dcontentcentral": "3D ContentCentral",
             }
 
             sources = []

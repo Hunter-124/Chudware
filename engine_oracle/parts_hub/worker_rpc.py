@@ -61,3 +61,11 @@ WORKER_METHODS: dict[str, Callable] = {
     "part_get": _part_get,
     "part_place": _part_place,
 }
+
+# GUI-shaped methods for the Parts Library workspace (host/src/ui/parts/) —
+# categories, filtered search, vendor login/status, scrape queue, thumbnails.
+try:
+    from engine_oracle.parts_hub.gui_rpc import GUI_WORKER_METHODS as _GUI_METHODS
+    WORKER_METHODS.update(_GUI_METHODS)
+except Exception:  # noqa: BLE001 — GUI seam is optional; agent tools above still register
+    pass

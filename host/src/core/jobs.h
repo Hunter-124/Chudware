@@ -4,6 +4,8 @@
 
 #include <string>
 
+#include <nlohmann/json.hpp>
+
 class WorkerClient;
 struct JobState;
 
@@ -13,8 +15,12 @@ struct JobState;
 // main-thread drain can route them to the ActivityPanel separately from legacy events.
 // `cam` (set when the copilot is launched from the Manufacture workspace) routes generic
 // "make a program"-style requests to the core's CAM fast-path on the current part.
+// `extra` (O1/M23): additional top-level params merged into the RPC payload — the GUI threads
+// the model picker's provider/model/reasoning_effort override and the composer attachments
+// through here. Empty object = no extra fields (byte-identical payload to before).
 void launchAgentRunV2(WorkerClient& w, JobState& job,
-                      const std::string& request, const std::string& docId, bool cam = false);
+                      const std::string& request, const std::string& docId, bool cam = false,
+                      const nlohmann::json& extra = nlohmann::json::object());
 
 // --- Mission orchestrator launcher ---
 // Runs agent_mission_v1 on a background thread: the core decomposes the request into an ordered
@@ -22,4 +28,5 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
 // returns {..., verdict, tasks, created_doc?, asm_path?}. Streams the same "orch_"-prefixed events
 // as launchAgentRunV2 (plus mission_* kinds) and stashes the verdict into job.missionVerdict.
 void launchMissionRun(WorkerClient& w, JobState& job,
-                      const std::string& request, const std::string& docId);
+                      const std::string& request, const std::string& docId,
+                      const nlohmann::json& extra = nlohmann::json::object());

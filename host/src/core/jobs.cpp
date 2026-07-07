@@ -18,7 +18,8 @@
 // job.events with an "orch_" prefix (kind field) so the main thread drain can distinguish
 // them from legacy iteration events and route them to the ActivityPanel.
 void launchAgentRunV2(WorkerClient& w, JobState& job,
-                      const std::string& request, const std::string& docId, bool cam) {
+                      const std::string& request, const std::string& docId, bool cam,
+                      const nlohmann::json& extra) {
     if (job.running.exchange(true)) return;
     job.ready = false;
     job.kind = JOB_DESIGN;
@@ -31,7 +32,7 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
 
-    std::thread([&w, &job, request, docId, cam]() {
+    std::thread([&w, &job, request, docId, cam, extra]() {
         nlohmann::json result;
         std::string err;
 
@@ -59,10 +60,14 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
 
         // options.cam (true when launched from the Manufacture workspace) lets the core's
         // CAM fast-path treat a generic "make a program" as a CAM request on the current part.
-        bool ok = w.call("agent_run_v2",
-                         {{"request", request}, {"doc_id", docId},
-                          {"options", {{"cam", cam}}}},
-                         result, err, 900000, onEvent);
+        nlohmann::json params = {{"request", request}, {"doc_id", docId},
+                                 {"options", {{"cam", cam}}}};
+        // O1/M23: merge the GUI's extra fields (provider/model/reasoning_effort override,
+        // attachments) as top-level params. Core keys above always win.
+        if (extra.is_object())
+            for (auto it = extra.begin(); it != extra.end(); ++it)
+                if (!params.contains(it.key())) params[it.key()] = it.value();
+        bool ok = w.call("agent_run_v2", params, result, err, 900000, onEvent);
         std::lock_guard<std::mutex> lk(job.mtx);
         if (!ok) {
             job.error = err;
@@ -102,7 +107,8 @@ void launchAgentRunV2(WorkerClient& w, JobState& job,
 // but calls agent_mission_v1 and captures the verdict + any assembly tab to open. The mission
 // emits mission_* events (in addition to each sub-run's stage events) — the drain renders them.
 void launchMissionRun(WorkerClient& w, JobState& job,
-                      const std::string& request, const std::string& docId) {
+                      const std::string& request, const std::string& docId,
+                      const nlohmann::json& extra) {
     if (job.running.exchange(true)) return;
     job.ready = false;
     job.kind = JOB_DESIGN;
@@ -116,7 +122,7 @@ void launchMissionRun(WorkerClient& w, JobState& job,
     }
     { std::lock_guard<std::mutex> lk(job.evMtx); job.events.clear(); }
 
-    std::thread([&w, &job, request, docId]() {
+    std::thread([&w, &job, request, docId, extra]() {
         nlohmann::json result;
         std::string err;
 
@@ -138,9 +144,11 @@ void launchMissionRun(WorkerClient& w, JobState& job,
             job.events.push_back(std::move(e));
         };
 
-        bool ok = w.call("agent_mission_v1",
-                         {{"request", request}, {"doc_id", docId}},
-                         result, err, 900000, onEvent);
+        nlohmann::json params = {{"request", request}, {"doc_id", docId}};
+        if (extra.is_object())
+            for (auto it = extra.begin(); it != extra.end(); ++it)
+                if (!params.contains(it.key())) params[it.key()] = it.value();
+        bool ok = w.call("agent_mission_v1", params, result, err, 900000, onEvent);
         std::lock_guard<std::mutex> lk(job.mtx);
         if (!ok) {
             job.error = err;

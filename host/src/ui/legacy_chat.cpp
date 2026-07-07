@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 
@@ -42,6 +43,7 @@
 #include "metrics.h"          // ui::metrics::px/U/asmHeaderIconGap
 #include "activity_panel.h"  // C22b: ActivityPanel still fed for the AI_CAD_SHOT=activity scenario
 #include "console_panel.h"   // drawConsoleBody (shared console helper)
+#include "file_dialog.h"     // openFileDialog — composer paperclip attachments (M23)
 #include "icons.h"           // getIcon / IconUV — composer settings glyph
 
 #include "../core/app_state.h"
@@ -796,6 +798,95 @@ static std::string stripMdMarks(const std::string& in) {
     return out;
 }
 
+// ---- O1: model picker → RPC payload threading --------------------------------------------------
+// Canonical provider NAME for the core's resolve_provider(name, cfg, env) from the GUI enum.
+// PROV_LOCAL / PROV_CLOUDCOMPAT resolve as "openai" descriptors — the base_url (persisted to
+// config.json by saveSettings immediately before every send) discriminates local vs cloud.
+static const char* providerWireName(int provider) {
+    switch (provider) {
+        case ui::PROV_ANTHROPIC:   return "anthropic";
+        case ui::PROV_OPENAI:
+        case ui::PROV_LOCAL:
+        case ui::PROV_CLOUDCOMPAT: return "openai";
+        case ui::PROV_LLAMACPP:    return "llamacpp";
+        case ui::PROV_GEMINI:      return "gemini";
+    }
+    return "";
+}
+
+// The explicit provider/model/effort override the GUI now attaches to EVERY agent-turn RPC
+// (agent_run_v2 / agent_ask_v2 / agent_clarify_v1 / agent_mission_v1). Without it the core
+// resolves from ambient config.json + process env, so an AI_CAD_PROVIDER env var (or a config
+// edited behind the GUI's back) silently beat the picker (tracker O1). saveSettings still runs
+// before each send so descriptor details (base_url / api_key / model_path) match the picker;
+// these fields pin name + model + effort explicitly on top of that.
+static nlohmann::json agentProviderOverride(const Settings& s) {
+    nlohmann::json j = nlohmann::json::object();
+    const char* name = providerWireName(s.provider);
+    if (name && name[0]) j["provider"] = name;
+    // llamacpp's Settings::model holds the gguf FILE PATH (the wire model stays "local-gguf");
+    // don't clobber the descriptor's model with a filesystem path.
+    if (s.provider != ui::PROV_LLAMACPP && s.model[0]) j["model"] = s.model;
+    if (s.reasoningEffort[0]) j["reasoning_effort"] = s.reasoningEffort;
+    return j;
+}
+
+// ---- M23: composer file attachments -------------------------------------------------------------
+static std::string attachmentBaseName(const std::string& p) {
+    size_t cut = p.find_last_of("\\/");
+    return cut == std::string::npos ? p : p.substr(cut + 1);
+}
+
+// Read a reasonably-sized TEXT file for inline injection into the request. Returns false for
+// binary or large files — those ride as path-only attachments (no fabricated previews).
+static bool readAttachmentText(const std::string& path, std::string& out) {
+    constexpr uintmax_t kMaxInline = 64 * 1024;   // inline cap: keep the prompt sane
+    std::error_code ec;
+    const uintmax_t sz = std::filesystem::file_size(path, ec);
+    if (ec || sz == 0 || sz > kMaxInline) return false;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    std::string data = ss.str();
+    size_t ctrl = 0;
+    for (unsigned char c : data) {
+        if (c == 0) return false;                    // NUL => binary
+        if (c < 9 || (c > 13 && c < 32)) ++ctrl;     // odd control chars
+    }
+    if (ctrl * 10 > data.size()) return false;       // >10% control bytes => binary
+    out = std::move(data);
+    return true;
+}
+
+// Consume st.pendingAttachments into (a) an augmented request string — the text the model
+// actually receives: small text files inlined verbatim, everything else as an explicit path —
+// and (b) the structured "attachments" array carried in the RPC payload. HONESTY: the core's
+// agent handlers currently pass only the request TEXT to the model, so the inline injection here
+// is what actually delivers attachment content today; the structured field rides along (clearly
+// named) for handler-side consumption later.
+static nlohmann::json consumeAttachments(AppState& st, std::string& requestText) {
+    nlohmann::json atts = nlohmann::json::array();
+    if (st.pendingAttachments.empty()) return atts;
+    for (const std::string& path : st.pendingAttachments) {
+        nlohmann::json a = {{"path", path}, {"name", attachmentBaseName(path)}};
+        std::string content;
+        if (readAttachmentText(path, content)) {
+            a["inline"] = true;
+            requestText += "\n\n[Attached file: " + attachmentBaseName(path) + " (" + path +
+                           ")]\n```\n" + content;
+            if (content.empty() || content.back() != '\n') requestText += "\n";
+            requestText += "```";
+        } else {
+            a["inline"] = false;
+            requestText += "\n\n[Attached file (path only; content not inlined): " + path + "]";
+        }
+        atts.push_back(std::move(a));
+    }
+    st.pendingAttachments.clear();
+    return atts;
+}
+
 // Create a fresh part document if needed and launch the v2 orchestrator for `request`. The
 // current doc is replaced only when it already has features (so an empty new part is reused).
 // Centralized so both the direct Design path and the post-clarify "Build it" path share it.
@@ -831,8 +922,11 @@ static void launchDesignRun(AppState& st, const std::string& request) {
     st.agentV2 = true;
     if (st.activityPanel)
         st.activityPanel->clearLive();
+    // O1: pin the picker's provider/model/effort explicitly in the RPC payload (beats an
+    // ambient AI_CAD_PROVIDER env override in the core's resolve_provider).
     launchAgentRunV2(st.worker, st.job, request, st.docMirror.docId(),
-                     st.ribbonTab == AppState::RT_Manufacture);
+                     st.ribbonTab == AppState::RT_Manufacture,
+                     agentProviderOverride(st.settings));
 }
 
 // Launch the MISSION orchestrator for a multi-capability request (e.g. "model X, then run CFD and
@@ -874,7 +968,9 @@ static void launchMissionRunChat(AppState& st, const std::string& request, bool 
     st.agentV2 = true;
     if (st.activityPanel)
         st.activityPanel->clearLive();
-    launchMissionRun(st.worker, st.job, request, st.docMirror.docId());
+    // O1: pin the picker's provider/model/effort explicitly in the RPC payload.
+    launchMissionRun(st.worker, st.job, request, st.docMirror.docId(),
+                     agentProviderOverride(st.settings));
 }
 
 // The inline clarify card: the build-critical questions the model asked, each with an editable
@@ -2735,8 +2831,23 @@ static void submitTurn(AppState& st, const std::string& text) {
     // resolves the provider from config.json (not in-memory st.settings), so this guarantees the
     // run uses exactly what the picker shows — closing the window where a freshly-picked local
     // model still ran against a stale, previously-saved cloud endpoint (the 403 "model_failed").
+    // (O1 additionally pins provider/model/effort EXPLICITLY in each RPC payload below, so an
+    // AI_CAD_PROVIDER env var can no longer silently override the picker.)
     saveSettings(st.settings);
-    { ChatMsg u; u.fromUser = true; u.text = text; st.chat.push_back(u); }
+    // M23: fold pending attachments into THIS turn. `sendText` (what the model receives) gets
+    // inlined text-file content / explicit paths appended; the chat shows a compact marker.
+    std::string sendText = text;
+    const nlohmann::json attachments = consumeAttachments(st, sendText);
+    const nlohmann::json provOverride = agentProviderOverride(st.settings);
+    {
+        ChatMsg u; u.fromUser = true; u.text = text;
+        if (!attachments.empty()) {
+            u.text += "\n[attached:";
+            for (const auto& a : attachments) u.text += " " + a.value("name", std::string());
+            u.text += "]";
+        }
+        st.chat.push_back(u);
+    }
     { ChatMsg a; a.running = true; st.chat.push_back(a); }
     st.designStarted = true;   // conversation is now active (kept for shot scenarios)
 
@@ -2776,7 +2887,7 @@ static void submitTurn(AppState& st, const std::string& text) {
         return buildVerb && analyzeVerb;
     };
     if (looksLikeMission()) {
-        launchMissionRunChat(st, text, /*needFreshDoc=*/true);
+        launchMissionRunChat(st, sendText, /*needFreshDoc=*/true);
         return;
     }
 
@@ -2877,8 +2988,10 @@ static void submitTurn(AppState& st, const std::string& text) {
         st.agentV2 = true;
         if (st.activityPanel)
             st.activityPanel->clearLive();
-        launchAgentRunV2(st.worker, st.job, text, st.docMirror.docId(),
-                         st.ribbonTab == AppState::RT_Manufacture);
+        nlohmann::json extra = provOverride;                       // O1: pin the picker
+        if (!attachments.empty()) extra["attachments"] = attachments;   // M23
+        launchAgentRunV2(st.worker, st.job, sendText, st.docMirror.docId(),
+                         st.ribbonTab == AppState::RT_Manufacture, extra);
     } else if (askMode) {
         // Ask -> Wave D: question answering about the open part via agent_ask_v2. The worker
         // answers from the doc tree without mutating anything (an empty doc_id is handled
@@ -2897,7 +3010,10 @@ static void submitTurn(AppState& st, const std::string& text) {
         st.status = "Answering...";  st.statusKind = 0;
         nlohmann::json params = {
             {"doc_id", st.docMirror.hasDoc() ? st.docMirror.docId() : std::string()},
-            {"question", text}};
+            {"question", sendText}};
+        for (auto it = provOverride.begin(); it != provOverride.end(); ++it)
+            params[it.key()] = it.value();                              // O1: pin the picker
+        if (!attachments.empty()) params["attachments"] = attachments;  // M23
         st.rpc.call("agent_ask_v2", params, [&st](const core::RpcResult& r) {
             // Find the last running assistant message (the one this turn pushed).
             ChatMsg* msg = nullptr;
@@ -2937,21 +3053,25 @@ static void submitTurn(AppState& st, const std::string& text) {
         if (!st.settings.planMode) {
             for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
                 if (!it->fromUser && it->running) { it->liveStatus = "Building..."; break; }
-            launchDesignRun(st, text);
+            launchDesignRun(st, sendText);
             return;
         }
         for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
             if (!it->fromUser && it->running) {
                 it->clarify.awaiting = true;
-                it->clarify.request = text;
+                it->clarify.request = sendText;   // M23: the eventual build carries attachments
                 it->liveStatus = "Working out what I need to build this...";
                 break;
             }
         st.addLog("[..] clarify: " + text);
         st.status = "Thinking...";  st.statusKind = 0;
         const std::string clarifyDocId = st.docMirror.hasDoc() ? st.docMirror.docId() : std::string();
-        nlohmann::json params = {{"request", text}, {"doc_id", clarifyDocId}};
-        st.rpc.call("agent_clarify_v1", params, [&st, text, clarifyDocId](const core::RpcResult& r) {
+        nlohmann::json params = {{"request", sendText}, {"doc_id", clarifyDocId}};
+        for (auto it = provOverride.begin(); it != provOverride.end(); ++it)
+            params[it.key()] = it.value();                              // O1: pin the picker
+        if (!attachments.empty()) params["attachments"] = attachments;  // M23
+        st.rpc.call("agent_clarify_v1", params,
+                    [&st, text = sendText, clarifyDocId](const core::RpcResult& r) {
             ChatMsg* msg = nullptr;
             for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
                 if (!it->fromUser && it->clarify.awaiting) { msg = &*it; break; }
@@ -3122,6 +3242,36 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
         ImVec4(pal.buttonActive[0], pal.buttonActive[1], pal.buttonActive[2], 0.60f));
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
+    // M22 (Hunter's mockup): row 1 = `Permissions ▾` alone on top (context meter rides the same
+    // row right-aligned as a passive readout); row 2 = the Design|Edit|Ask segmented toggle. The
+    // large prompt box and the [model][effort][paperclip]…[send] rail follow in drawComposer.
+    const char* permLabel = st.settings.offlineMode ? "Permissions: Offline \xe2\x96\xbe"
+                                                    : "Permissions \xe2\x96\xbe";
+    if (ImGui::SmallButton(permLabel)) ImGui::OpenPopup("##cmpperm");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Privacy and run permissions for the copilot.");
+    if (ImGui::BeginPopup("##cmpperm")) {
+        bool off = st.settings.offlineMode;
+        if (ImGui::Checkbox("Offline mode (local models only — ITAR-safe)", &off)) {
+            st.settings.offlineMode = off;
+            saveSettings(st.settings);   // the core reads config.json — persist immediately
+        }
+        bool sup = st.settings.planMode;
+        if (ImGui::Checkbox("Supervised (plan + clarify before modeling)", &sup)) {
+            st.settings.planMode = sup;
+            saveSettings(st.settings);
+        }
+        ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
+        ImGui::EndPopup();
+    }
+
+    ImGui::SameLine();
+    const float room = ImGui::GetContentRegionAvail().x;
+    const float w    = measureContextMeter(st, room);
+    const float x    = ImGui::GetContentRegionMax().x - w;
+    if (x > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(x);
+    drawContextMeter(st, room);
+
     // Mode chips: a PROPER segmented toggle (Design | Edit | Ask) — one click, visible state —
     // instead of the old label-only popup. Active pill = translucent chip fill + accent outline;
     // inactive pills stay transparent with secondary ink so the row reads on any backdrop.
@@ -3152,32 +3302,6 @@ static void drawComposerPrelude(AppState& st, bool /*busy*/) {
             ImGui::SetTooltip("%s", needDoc ? "Edit — open a part first." : modeTips[i]);
     }
     ImGui::PopStyleVar();
-
-    ImGui::SameLine();
-    const char* permLabel = st.settings.offlineMode ? "Permissions: Offline" : "Permissions";
-    if (ImGui::SmallButton(permLabel)) ImGui::OpenPopup("##cmpperm");
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Privacy and run permissions for the copilot.");
-    if (ImGui::BeginPopup("##cmpperm")) {
-        bool off = st.settings.offlineMode;
-        if (ImGui::Checkbox("Offline mode (local models only — ITAR-safe)", &off)) {
-            st.settings.offlineMode = off;
-            saveSettings(st.settings);   // the core reads config.json — persist immediately
-        }
-        bool sup = st.settings.planMode;
-        if (ImGui::Checkbox("Supervised (plan + clarify before modeling)", &sup)) {
-            st.settings.planMode = sup;
-            saveSettings(st.settings);
-        }
-        ImGui::Checkbox("Show assistant thoughts", &gShowThinking);
-        ImGui::EndPopup();
-    }
-
-    const float room = ImGui::GetContentRegionAvail().x;
-    const float w    = measureContextMeter(st, room);
-    const float x    = ImGui::GetContentRegionMax().x - w;
-    if (x > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(x);
-    drawContextMeter(st, room);
 
     ImGui::PopStyleColor(4);
     ImGui::PopStyleVar();
@@ -3237,7 +3361,9 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
         char effBtn[48];
         std::snprintf(effBtn, sizeof(effBtn), "Thinking: %s", effLabels[effIdx]);
         const float chipW = ImGui::CalcTextSize(effBtn).x + 16 * sc;   // + FramePadding (8dp x2)
-        const float sendReserve = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x;
+        // Reserve room for the paperclip AND the send button at the row's right edge (M22/M23).
+        const float sendReserve =
+            2.0f * (ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x);
         if (ImGui::GetCursorPosX() + chipW <= ImGui::GetContentRegionMax().x - sendReserve) {
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
             if (ImGui::Button(effBtn)) ImGui::OpenPopup("##cmpeffort");
@@ -3253,6 +3379,52 @@ static void drawComposerToolbar(AppState& st, bool busy, bool canStart, bool act
                 }
             }
             ImGui::EndPopup();
+        }
+    }
+
+    // M23: paperclip — attach files to the NEXT message via the native open dialog (the same
+    // openFileDialog mechanism as FeatureManager Open/Import). Chips render above the input.
+    {
+        const float clipSz = ImGui::GetFrameHeight();
+        const float clipReserve = clipSz + ImGui::GetStyle().ItemSpacing.x;
+        ImGui::SameLine();
+        if (ImGui::GetCursorPosX() + clipSz <=
+            ImGui::GetContentRegionMax().x - clipReserve) {
+            if (ImGui::Button("##attach", ImVec2(clipSz, clipSz))) {
+                if (std::getenv("AI_CAD_NO_FILE_DIALOGS")) {
+                    st.toast(ui::ToastLevel::Info,
+                             "File dialogs are disabled (AI_CAD_NO_FILE_DIALOGS).");
+                } else {
+                    std::string p = openFileDialog("All files (*.*)\0*.*\0");
+                    if (!p.empty() &&
+                        std::find(st.pendingAttachments.begin(), st.pendingAttachments.end(),
+                                  p) == st.pendingAttachments.end())
+                        st.pendingAttachments.push_back(p);
+                }
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Attach a file — it rides your next message (small text "
+                                  "files are inlined; other files are passed by path).");
+            // Paperclip glyph: an open rounded loop + inner wire, drawn from the surface ink.
+            {
+                ImDrawList* adl = ImGui::GetWindowDrawList();
+                const ImVec2 amn = ImGui::GetItemRectMin(), amx = ImGui::GetItemRectMax();
+                const ImVec2 ac((amn.x + amx.x) * 0.5f, (amn.y + amx.y) * 0.5f);
+                const float ph = clipSz * 0.24f;   // half-height of the straight sides
+                const float pr = clipSz * 0.13f;   // loop radius
+                const ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
+                const float th = ui::metrics::stroke(1.4f);
+                constexpr float kPi = 3.14159265f;
+                adl->PathClear();
+                adl->PathLineTo(ImVec2(ac.x + pr, ac.y - ph));
+                adl->PathLineTo(ImVec2(ac.x + pr, ac.y + ph * 0.55f));
+                adl->PathArcTo(ImVec2(ac.x, ac.y + ph * 0.55f), pr, 0.0f, kPi);
+                adl->PathLineTo(ImVec2(ac.x - pr, ac.y - ph * 0.55f));
+                adl->PathArcTo(ImVec2(ac.x, ac.y - ph * 0.55f), pr, kPi, 2.0f * kPi);
+                adl->PathStroke(ink, 0, th);
+                adl->AddLine(ImVec2(ac.x, ac.y - ph * 0.45f), ImVec2(ac.x, ac.y + ph * 0.45f),
+                             ink, th);
+            }
         }
     }
 
@@ -3403,6 +3575,45 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
         ImGui::PopStyleColor();
     }
 
+    // ---- M23: attachment chips (Claude Code style) — filename + ✕, above the chat input ----
+    if (!st.pendingAttachments.empty()) {
+        const ui::AdaptiveSurface& asurf = chatSurf();
+        const float sc = ui::uiScale;
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::rounding(6.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, asurf.textPrimary);
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            ImVec4(asurf.textPrimary.x, asurf.textPrimary.y, asurf.textPrimary.z, 0.08f));
+        const float maxX = ImGui::GetContentRegionMax().x;
+        for (size_t ai = 0; ai < st.pendingAttachments.size(); ++ai) {
+            ImGui::PushID((int)ai + 12000);
+            std::string name = attachmentBaseName(st.pendingAttachments[ai]);
+            if (name.size() > 30) name = name.substr(0, 29) + "\xE2\x80\xA6";
+            const std::string lbl = name + "  \xC3\x97";   // "name  ×"
+            const float chipW = ImGui::CalcTextSize(lbl.c_str()).x + 16 * sc;
+            if (ai > 0) {
+                ImGui::SameLine(0, 4 * sc);
+                if (ImGui::GetCursorPosX() + chipW > maxX) ImGui::NewLine();
+            }
+            const bool removed = ImGui::SmallButton(lbl.c_str());
+            ImGui::GetWindowDrawList()->AddRect(
+                ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                ImGui::ColorConvertFloat4ToU32(ImVec4(asurf.textPrimary.x, asurf.textPrimary.y,
+                                                      asurf.textPrimary.z, 0.35f)),
+                ui::metrics::rounding(6.0f), 0, ui::metrics::stroke(1.0f));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s\nAttached — rides your next message. Click to remove.",
+                                  st.pendingAttachments[ai].c_str());
+            if (removed) {
+                st.pendingAttachments.erase(st.pendingAttachments.begin() + ai);
+                ImGui::PopID();
+                break;
+            }
+            ImGui::PopID();
+        }
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar();
+    }
+
     // ---- composer: prelude row -> transparent input -> toolbar row ----
     drawComposerPrelude(st, busy);
 
@@ -3456,6 +3667,48 @@ static void drawComposer(AppState& st, bool busy, bool canRun) {
             submitTurn(st, std::string(st.prompt.data()));
             st.prompt[0] = 0;
         }
+    }
+}
+
+// ---- M19: endless scroll-back via render-windowing --------------------------------------------
+// The full history is already in memory (persistChatHistory reload), so "lazy loading" here means
+// lazily RENDERING: a message far outside the scroll viewport re-emits as a fixed-height spacer
+// (the height measured the last time it was really drawn at this width) instead of running its
+// full draw path. Per-frame cost is O(visible) real draws + O(total) trivial spacer loop — no
+// crash and no unbounded frame cost on large histories. Interactive/animated messages (the
+// running turn, an open clarify card) always render so nothing live is ever frozen out. Cached
+// heights invalidate on width change (resize) and refresh every frame the message is visible
+// (expand/collapse toggles re-measure naturally). Shared by the docked Copilot column and the AI
+// workspace chat column.
+static void drawChatLogWindowed(AppState& st) {
+    ui::Fonts& fonts = st.fonts;
+    const float logW    = ImGui::GetContentRegionAvail().x;
+    const float viewTop = ImGui::GetScrollY();
+    const float viewBot = viewTop + ImGui::GetWindowSize().y;
+    const float slack   = ImGui::GetWindowSize().y;   // one extra viewport of buffer each side
+    for (size_t mi = 0; mi < st.chat.size(); ++mi) {
+        ChatMsg& m = st.chat[mi];
+        ImGui::PushID((int)mi);
+        const float y = ImGui::GetCursorPosY();
+        const bool cacheValid = m.uiCachedH > 0.0f && std::fabs(m.uiCachedW - logW) < 0.5f;
+        const bool interactive = m.running || m.clarify.active || m.clarify.awaiting;
+        if (cacheValid && !interactive &&
+            (y + m.uiCachedH < viewTop - slack || y > viewBot + slack)) {
+            ImGui::Dummy(ImVec2(logW, m.uiCachedH));   // same-height spacer, zero draw cost
+            ImGui::PopID();
+            continue;
+        }
+        ImGui::BeginGroup();
+        if (m.fromUser) {
+            drawUserBlock(m, fonts, logW);
+        } else {
+            drawAssistantTurn(st, m, fonts, logW);
+            ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));
+        }
+        ImGui::EndGroup();
+        m.uiCachedH = ImGui::GetItemRectSize().y;
+        m.uiCachedW = logW;
+        ImGui::PopID();
     }
 }
 
@@ -3645,19 +3898,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         } else if (st.showSessionsPicker) {
             drawSessionsPanel(st, busy);
         } else {
-            const float logW = ImGui::GetContentRegionAvail().x;
-            for (size_t mi = 0; mi < st.chat.size(); ++mi) {
-                ChatMsg& m = st.chat[mi];
-                ImGui::PushID((int)mi);
-                if (m.fromUser) {
-                    drawUserBlock(m, fonts, logW);
-                    ImGui::PopID();
-                    continue;
-                }
-                drawAssistantTurn(st, m, fonts, logW);
-                ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));
-                ImGui::PopID();
-            }
+            drawChatLogWindowed(st);   // M19: render-windowed endless scroll-back
             if (!st.showSessionsPicker && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 12)
                 ImGui::SetScrollHereY(1.0f);
         }
@@ -3716,20 +3957,7 @@ void chatWorkspaceSync(AppState& st) {
 bool chatTurnActive(AppState& st) { return aiTurnActive(st); }
 
 void chatDrawLog(AppState& st) {
-    ui::Fonts& fonts = st.fonts;
-    const float logW = ImGui::GetContentRegionAvail().x;
-    for (size_t mi = 0; mi < st.chat.size(); ++mi) {
-        ChatMsg& m = st.chat[mi];
-        ImGui::PushID((int)mi);
-        if (m.fromUser) {
-            drawUserBlock(m, fonts, logW);
-            ImGui::PopID();
-            continue;
-        }
-        drawAssistantTurn(st, m, fonts, logW);
-        ImGui::Dummy(ImVec2(0, 8 * ui::uiScale));
-        ImGui::PopID();
-    }
+    drawChatLogWindowed(st);   // M19: render-windowed endless scroll-back (shared with drawAIPanel)
 }
 
 void chatDrawComposer(AppState& st, bool busy, bool canRun) { drawComposer(st, busy, canRun); }

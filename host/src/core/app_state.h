@@ -431,6 +431,12 @@ struct ChatMsg {
                                    // namespaces sub-run stage keys so per-task stages don't collide
     std::vector<AgentStep> steps;  // assistant turn: the iteration trace
     ClarifyState clarify;          // pre-flight clarify gate (Design mode) — see ClarifyState
+    // ---- M19 render-windowing cache (GUI-only, not persisted) ----
+    // Height this message occupied last time it was actually drawn at uiCachedW width. Lets the
+    // chat log emit a same-height Dummy for messages far outside the scroll viewport instead of
+    // rendering them (endless scroll-back without unbounded frame cost). -1 = never measured.
+    float uiCachedH = -1.0f;
+    float uiCachedW = -1.0f;
 };
 
 // Fold one streamed orchestrator event (kind = stage_started / agent_output / stage_result /
@@ -1124,6 +1130,11 @@ struct AppState {
     // queuedPrompts: messages the user sent WHILE a turn was active (Claude-Code-style queue).
     // Drained one-at-a-time by the composer once the assistant is free again.
     std::vector<std::string> queuedPrompts;
+    // pendingAttachments (M23): absolute file paths attached via the composer paperclip. Shown
+    // as chips above the input; they ride the NEXT send (submitTurn consumes + clears them —
+    // small text files are inlined into the request, every path travels in the RPC payload's
+    // "attachments" field).
+    std::vector<std::string> pendingAttachments;
 
     // ---- C25: ribbon dispatch hook (set in app.cpp after the ribbon callback is wired) ----
     // Allows UI widgets (shortcut bar, gesture wheel) to fire ribbon commands without

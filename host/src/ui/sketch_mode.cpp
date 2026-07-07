@@ -1234,9 +1234,10 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
     }
     // Resync the mirror revision (sketch_exit bumps it server-side).
     resyncMirror(st);
-    // A NEW sketch that was never given any content is noise — delete it on exit either way
-    // (plain Finish and discard both apply; matches the 3D sketcher's behavior).
-    if (isNewEmpty_ && ents_.empty()) {
+    // An EMPTY sketch is noise — delete it on exit rather than leaving a contentless feature in the
+    // tree. Fires for a never-populated NEW sketch AND for an existing sketch the user emptied out;
+    // both plain Finish and discard route here (matches the 3D sketcher's behavior).
+    if (ents_.empty()) {
         nlohmann::json ops = nlohmann::json::array({
             {{"op", "delete_feature"}, {"id", fid_}, {"cascade", true}}});
         st.docMirror.applyOps(st.worker, ops);
@@ -1335,6 +1336,8 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sketch_exit") { exitSketch(st, /*keep=*/true); return true; }
     if (cmdId == "sketch_cancel") { cancelSketch(st); return true; }  // ribbon commit cluster ✗
     if (cmdId == "sk_line")        { resetTool(); tool_ = SketchTool::Line;       return true; }
+    // Centerline: same click-collect UX as Line, but commits a construction line + midpoint marker.
+    if (cmdId == "sk_centerline")  { resetTool(); tool_ = SketchTool::Line; centerline_ = true; return true; }
     if (cmdId == "sk_rect_corner") { resetTool(); tool_ = SketchTool::RectCorner; return true; }
     if (cmdId == "sk_circle")      { resetTool(); tool_ = SketchTool::Circle;     return true; }
     if (cmdId == "sk_arc_center")  { resetTool(); tool_ = SketchTool::ArcCenter;  return true; }
@@ -1541,6 +1544,7 @@ void SketchMode::clearEntitySelection() {
 }
 
 void SketchMode::resetTool() { tool_ = SketchTool::None; toolUV_.clear(); toolSnaps_.clear();
+                               centerline_ = false;   // centerline flavor clears on any tool change
                                conicRho_ = 0.5f; chainPrevId_.clear();
                                selIds_.clear();   // C41 (T2): selection dies with any tool change/exit
                                boxArmed_ = boxSelecting_ = false;  // C51
@@ -7218,26 +7222,44 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     snapCons(toolSnaps_[0], "$self.p1");
                 // C49: the END click's snap is now constrained too (was positional-only before).
                 snapCons(toolSnaps_[1], "$self.p2");
+                // Centerline flavor: construction line (dashed "for construction only"). Captured
+                // now because resetTool() below clears centerline_ before the chain re-arms.
+                const bool wasCenterline = centerline_;
                 nlohmann::json ent = {{"type", "line"},
                     {"p1", nlohmann::json::array({p1.x, p1.y})},
                     {"p2", nlohmann::json::array({p2.x, p2.y})}};
+                if (wasCenterline) ent["construction"] = true;
                 // Apply directly so we can capture the new line id for the next chain segment.
                 nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_},
                                      {"entity", ent}, {"constraints", cs}};
                 auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
                 std::string newId;
                 if (!r.ok) {
-                    st.toast(ui::ToastLevel::Error, "Line: " + r.error_message);
+                    st.toast(ui::ToastLevel::Error,
+                             std::string(wasCenterline ? "Centerline: " : "Line: ") + r.error_message);
                 } else {
                     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
                     newId = (r.id_map.is_object() && r.id_map.contains("$0"))
                           ? r.id_map["$0"].get<std::string>() : std::string();
+                    // Centerline: exaggerated midpoint marker — a construction point pinned to the
+                    // segment's midpoint (no distinct engine centerline entity; this is the marker).
+                    if (wasCenterline && !newId.empty()) {
+                        ImVec2 mid((p1.x + p2.x) * 0.5f, (p1.y + p2.y) * 0.5f);
+                        std::string mp = emitConstructionEntity(st,
+                            {{"type", "point"}, {"construction", true},
+                             {"p", nlohmann::json::array({mid.x, mid.y})}},
+                            nlohmann::json::array());
+                        if (!mp.empty())
+                            emitConstructionConstraint(st,
+                                {{"type", "midpoint"}, {"refs", {mp + ".p", newId}}});
+                    }
                     resolve(st);
                 }
                 // Chain: keep drawing from the new endpoint, remembering this segment's id so the
                 // next segment's p1 gets a coincident to its p2.
                 ImVec2 chainStart = p2;
                 resetTool(); tool_ = SketchTool::Line;
+                centerline_ = wasCenterline;   // continued segments stay centerlines
                 chainPrevId_ = newId;
                 toolUV_.push_back(chainStart);
                 toolSnaps_.push_back("");

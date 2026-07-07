@@ -389,6 +389,16 @@ static bool s_sketch3dActive = false;
 // Workspace-shell sets this each frame via setRibbonWorkspace(); see ribbon.h.
 static const ui::RibbonCmd kSketchNewOnSketchTab =
     { "sketch_new", "New Sketch", "sketch", "Sketch", "Sketch", true, nullptr, false };
+// While editing a sketch, the New Sketch slot is replaced by a highlighted "Finish Sketch" big
+// button (a dedicated render path — NOT wired through the generic split-button/last-used machinery,
+// so a plain click always finishes and only the dropdown offers Cancel). cmd_id carries the finish
+// command for the active mode; the Cancel flyout row fires the matching *_cancel below.
+// Base face uses the real "sketch" pencil glyph; a check badge is drawn procedurally over it (the
+// atlas has no dedicated sketch_finish glyph — see ribbon_sketchFinishBadge).
+static const ui::RibbonCmd kSketchFinishOnSketchTab =
+    { "sketch_exit",   "Finish Sketch", "sketch", "Sketch", "Sketch", true, nullptr, false };
+static const ui::RibbonCmd kSketch3dFinishOnSketchTab =
+    { "sketch3d_exit", "Finish Sketch", "sketch", "Sketch", "Sketch", true, nullptr, false };
 static bool ribbon_isActive(const char* cmd_id) {
     return !s_activeCmd.empty() && cmd_id && s_activeCmd == cmd_id;
 }
@@ -835,6 +845,9 @@ static void ribbon_btnRest(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding,
     dl->AddRect(p0, p1, border, rounding, 0, ui::metrics::stroke(1.0f));
 }
 
+// Fwd decl: procedural Finish check badge, drawn over the big button icon (defined below).
+static void ribbon_sketchFinishBadge(ImDrawList* dl, float cx, float cy, float sz, bool isCheck);
+
 // Bold active outline (deliverable 3): replaces the old accent underline / left-border cues.
 // Filled with accentSoft + BOLD accent outline on the full bounding box.
 static void ribbon_btnActive(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding) {
@@ -848,7 +861,8 @@ static void ribbon_btnActive(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float roundin
 // (the widest-variant width, so a split button never reflows/clips when the face label changes).
 static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
                            const char* label, bool enabled, bool hasDrop,
-                           float wOverride = -1.0f) {
+                           float wOverride = -1.0f, bool highlight = false,
+                           bool finishBadge = false) {
     float s   = ui::uiScale;
     float bw  = wOverride >= 0.0f ? wOverride : ribbon_bigBtnW(cmd_id, label, hasDrop);
     float bh  = (kBodyH - kCaptionH) * s;
@@ -890,7 +904,15 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     // State layering: liquid-glass rest/hover fill → bold active outline → press overlay.
     const bool isActive = ribbon_isActive(cmd_id);
     const bool hovAny   = (mainHov || dropHov) && enabled;
-    ribbon_btnRest(dl, p0, p1, rnd, enabled, /*inset=*/false, /*hovered=*/hovAny);
+    if (highlight) {
+        // Accent-tinted fill so a highlighted action (e.g. Finish Sketch) stands out from the
+        // neutral tool buttons. Draw before the active-outline layer so a bold outline still reads.
+        const float* ok = ui::palette.statusOk;
+        ImVec4 f(ok[0], ok[1], ok[2], hovAny ? 1.0f : 0.90f);
+        dl->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32(f), rnd);
+    } else {
+        ribbon_btnRest(dl, p0, p1, rnd, enabled, /*inset=*/false, /*hovered=*/hovAny);
+    }
     if (isActive) {
         // Armed tool: BOLD accent outline around the full bounding box (app-wide rule).
         ribbon_btnActive(dl, p0, p1, rnd);
@@ -946,6 +968,9 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         }
 
         ribbon_icon(dl, iconName, cx, iy + iconSz * 0.5f, iconSz, enabled, ribbon_isActive(cmd_id));
+        // Finish Sketch: overlay a procedural check badge on the pencil glyph.
+        if (finishBadge)
+            ribbon_sketchFinishBadge(dl, cx, iy + iconSz * 0.5f, iconSz, /*isCheck=*/true);
 
         // Material color swatch: a 20x4 bar under the icon previewing the exact color this button
         // applies. The label below is nudged down (see ty) so the bar never overlaps the text.
@@ -1251,6 +1276,102 @@ static const char* ribbon_flyoutPopup(const char* parentId,
         ImGui::EndPopup();
     }
     return selected;
+}
+
+// True for the injected "Finish Sketch" big button (2D or 3D). Identity is by pointer: only the two
+// kSketch*FinishOnSketchTab singletons take this path (their cmd_id doubles as a real finish
+// command, so a cmd_id match alone would also catch the ribbon_def rows).
+static bool ribbon_isSketchFinish(const ui::RibbonCmd* cmd) {
+    return cmd == &kSketchFinishOnSketchTab || cmd == &kSketch3dFinishOnSketchTab;
+}
+
+// Draw a small badge (accent disc + white check ✓, or err disc + white ✗) in the bottom-right of a
+// big button's icon — the atlas has no dedicated sketch_finish/sketch_cancel glyph, so Finish/Cancel
+// are marked procedurally in the same clean check/✗ style the old commit chips used.
+static void ribbon_sketchFinishBadge(ImDrawList* dl, float cx, float cy, float sz, bool isCheck) {
+    float s = ui::uiScale;
+    float br = sz * 0.34f;                 // badge radius relative to the 32px icon
+    float bx = cx + sz * 0.30f;            // tucked bottom-right of the icon block
+    float by = cy + sz * 0.30f;
+    const float* role = isCheck ? ui::palette.statusOk : ui::palette.statusErr;
+    ImVec4 disc(role[0], role[1], role[2], 1.0f);
+    dl->AddCircleFilled(ImVec2(bx, by), br, ImGui::ColorConvertFloat4ToU32(disc));
+    const ImU32 gl = IM_COL32(255, 255, 255, 255);
+    float lw = ImMax(1.6f * s, br * 0.28f);
+    if (isCheck) {
+        dl->AddLine(ImVec2(bx - br * 0.45f, by + br * 0.02f),
+                    ImVec2(bx - br * 0.08f, by + br * 0.42f), gl, lw);
+        dl->AddLine(ImVec2(bx - br * 0.08f, by + br * 0.42f),
+                    ImVec2(bx + br * 0.50f, by - br * 0.40f), gl, lw);
+    } else {
+        dl->AddLine(ImVec2(bx - br * 0.42f, by - br * 0.42f),
+                    ImVec2(bx + br * 0.42f, by + br * 0.42f), gl, lw);
+        dl->AddLine(ImVec2(bx - br * 0.42f, by + br * 0.42f),
+                    ImVec2(bx + br * 0.42f, by - br * 0.42f), gl, lw);
+    }
+}
+
+// Dedicated Cancel-only dropdown for the Finish Sketch button. Deliberately NOT ribbon_flyoutPopup:
+// that path injects the parent (Exit Sketch) row and writes s_LastUsed, which would corrupt the
+// finish button's face + plain-click action. This one offers a single "Cancel Sketch" item that
+// fires the matching *_cancel command and never touches last-used state. Uses the same deferred
+// s_flyoutOpenReq open handshake as the other split buttons (ID-scope fix, see comment ~L35).
+static void ribbon_sketchFinishFlyout(const ui::RibbonCmd* cmd) {
+    float s = ui::uiScale;
+    const char* parentId  = cmd->cmd_id;   // sketch_exit / sketch3d_exit
+    const bool  is3d      = std::strcmp(parentId, "sketch3d_exit") == 0;
+    const char* cancelCmd = is3d ? "sketch3d_cancel" : "sketch_cancel";
+
+    std::string popId = std::string(parentId) + "_drop";
+    if (s_flyoutOpenReq == parentId) {
+        ImGui::OpenPopup(popId.c_str());
+        s_flyoutOpenReq.clear();
+    }
+    if (ImGui::BeginPopup(popId.c_str(), ImGuiWindowFlags_NoMove)) {
+        float rowH   = snap(28.0f * s);
+        float iconSz = snap(20.0f * s);
+        float padX   = snap(8.0f * s);
+        float gapX   = snap(6.0f * s);
+        const char* label = "Cancel Sketch";
+        float popW = padX + iconSz + gapX + ImGui::CalcTextSize(label).x + padX;
+
+        ImVec2 cp0 = ImGui::GetCursorScreenPos();
+        ImGui::PushID("##sk_cancel_row");
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0,0,0,0));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0,0,0,0));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0,0,0,0));
+        bool rowClicked = ImGui::InvisibleButton("##fr", ImVec2(popW, rowH));
+        bool rowHov     = ImGui::IsItemHovered();
+        ImGui::PopStyleColor(3);
+        ImGui::PopStyleVar();
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        if (rowHov)
+            dl->AddRectFilled(cp0, ImVec2(cp0.x + popW, cp0.y + rowH),
+                              ui::Palette::toU32(ui::palette.buttonHovered),
+                              ui::metrics::ribbonBtnRound());
+        {
+            // Base pencil glyph + procedural ✗ badge (no dedicated sketch_cancel atlas glyph).
+            float ix = snap(cp0.x + padX);
+            float iy = snap(cp0.y + (rowH - iconSz) * 0.5f);
+            ribbon_icon(dl, "sketch", ix + iconSz * 0.5f, iy + iconSz * 0.5f, iconSz, true);
+            ribbon_sketchFinishBadge(dl, ix + iconSz * 0.5f, iy + iconSz * 0.5f, iconSz,
+                                     /*isCheck=*/false);
+        }
+        {
+            float tx = snap(cp0.x + padX + iconSz + gapX);
+            float ty = snap(cp0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f);
+            dl->AddText(nullptr, 0.0f, ImVec2(tx, ty),
+                        ui::Palette::toU32(ui::palette.text), label);
+        }
+        if (rowClicked) {
+            ribbon_fire(cancelCmd);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopID();
+        ImGui::EndPopup();
+    }
 }
 
 // Draw a small button. Returns true if clicked.
@@ -1559,16 +1680,14 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         // is open, s_sketchActive is true and the real "Exit Sketch" button shows.
         const RibbonCmd* cp = &c;
         if (std::strcmp(c.cmd_id, "sketch_exit") == 0) {
-            // Editing a sketch: Finish/Cancel move to the right-aligned commit cluster (drawn after
-            // the groups) — don't also render "Exit Sketch" here. Not editing: this slot becomes the
-            // "New Sketch" entry point so a sketch can be started straight from the Sketch tab.
-            if (s_sketchActive) continue;
-            cp = &kSketchNewOnSketchTab;
+            // Editing a 2D sketch: this slot becomes the highlighted "Finish Sketch" big button
+            // (dropdown → Cancel Sketch), taking the place + size of New Sketch. Not editing: it is
+            // the "New Sketch" entry point so a sketch can be started straight from the Sketch tab.
+            cp = s_sketchActive ? &kSketchFinishOnSketchTab : &kSketchNewOnSketchTab;
         }
-        // Same commit-cluster treatment for the 3D sketcher's "Exit Sketch" slot — Finish/Cancel
-        // render as the right-aligned chip pair instead (below), never as an inline button.
+        // Same treatment for the 3D sketcher's "Exit Sketch" slot while a 3D sketch is being edited.
         if (std::strcmp(c.cmd_id, "sketch3d_exit") == 0) {
-            if (s_sketch3dActive) continue;
+            if (s_sketch3dActive) cp = &kSketch3dFinishOnSketchTab;
         }
         RibbonGroup& grp = ribbon_findOrAddGroup(groups, cp->group);
         if (cp->sub_of)  grp.subCmds.push_back(cp);
@@ -1578,15 +1697,10 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
 
     // --- C25-W3G: priority collapse assignment ---
     // Available body width. Reserve the overflow chevron up front so it never lands off-edge once
-    // any group has to be hidden.
-    // Sketch-commit cluster: while a sketch is being edited AND the Sketch tab is showing, a
-    // Finish (✓) / Cancel (✗) pair floats at the RIGHT end of the tool row (replacing the old
-    // floating in-viewport corner). Reserve its width up front so the tool groups never run under it.
-    const bool  sketchCommit   = (s_sketchActive || s_sketch3dActive) && onSketchTab;
-    const float commitChipW    = 40.0f * s;
-    const float commitClusterW = sketchCommit ? (commitChipW * 2.0f + 6.0f * s + 12.0f * s) : 0.0f;
+    // any group has to be hidden. (The sketch Finish/Cancel controls now live inline in the Sketch
+    // group's New-Sketch slot, so no right-edge cluster width is reserved anymore.)
     float chevronW  = 22.0f * s;  // reserved for overflow '»' button
-    float availW    = vp->Size.x - 8.0f * s - chevronW - commitClusterW;
+    float availW    = vp->Size.x - 8.0f * s - chevronW;
 
     // Compute natural widths at COL_BIG (per-column small-zone measuring — defect 1)
     std::vector<float> natW(groups.size());
@@ -1666,6 +1780,18 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
             // --- BIG layout: big buttons left-to-right, then the small zone in measured columns ---
             float bx = curX + kGroupPadX * s;
             for (const auto* cmd : grp.bigCmds) {
+                // Finish Sketch: highlighted big button with a dedicated Cancel-only dropdown — NOT
+                // routed through the generic split-button last-used machinery (a plain click must
+                // always finish; only the flyout cancels). Rendered in the New-Sketch slot.
+                if (ribbon_isSketchFinish(cmd)) {
+                    ImGui::SetCursorPos(ImVec2(bx, 0.0f));
+                    float wStable = ribbon_bigBtnW(cmd->cmd_id, cmd->label, /*hasDrop=*/true);
+                    ribbon_bigBtn(cmd->cmd_id, cmd->icon, cmd->label, true, /*hasDrop=*/true,
+                                  wStable, /*highlight=*/true, /*finishBadge=*/true);
+                    ribbon_sketchFinishFlyout(cmd);
+                    bx += wStable + 2.0f * s;
+                    continue;
+                }
                 bool drop = ribbon_hasSubs(grp, cmd);
                 ImGui::SetCursorPos(ImVec2(bx, 0.0f));
                 const char* showIcon; const char* showLabel;
@@ -1721,6 +1847,16 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                     const auto* cmd = rows[idx];
                     ImGui::SetCursorPos(ImVec2(sx, sy));
                     if (idx < nBig) {
+                        // Finish Sketch degraded row: keep its Cancel dropdown (dedicated flyout,
+                        // not runFlyout — see the big-layout branch above for why).
+                        if (ribbon_isSketchFinish(cmd)) {
+                            ribbon_bigBtnAsSmall(cmd->cmd_id, cmd->icon, cmd->label,
+                                                 true, /*hasDrop=*/true,
+                                                 ribbon_bigBtnAsSmallWMax(grp, cmd, true));
+                            ribbon_sketchFinishFlyout(cmd);
+                            sy += ribbon_bigBtnAsSmallRowH();
+                            continue;
+                        }
                         bool drop = ribbon_hasSubs(grp, cmd);
                         const char* showIcon; const char* showLabel;
                         resolveFace(cmd, drop, showIcon, showLabel);
@@ -1853,42 +1989,9 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     }
     (void)chevronW;
 
-    // --- Sketch-commit cluster: right-aligned Finish (✓) / Cancel (✗) while editing a sketch ---
-    // Replaces the old floating in-viewport confirmation corner. Manual chips (green/red, matching
-    // the former corner's visual language) fired by command id through ribbon_fire, so no AppState or
-    // icon-atlas dependency is needed here. Only shown while s_sketchActive.
-    if (sketchCommit) {
-        ImDrawList* cdl = ImGui::GetWindowDrawList();
-        const float bodyW = vp->Size.x - 8.0f * s;          // matches the ##RibbonBody child width
-        const float chipH = commitChipW;                    // square (side == width), vertically centered
-        const float localY = std::max(0.0f, (bodyH2 - chipH) * 0.5f);
-        const float xCancel = bodyW - 8.0f * s - commitChipW;
-        const float xFinish = xCancel - 6.0f * s - commitChipW;
-        auto commitChip = [&](const char* id, float lx, const float* role, bool isCheck,
-                              const char* cmd, const char* tip) {
-            ImGui::SetCursorPos(ImVec2(lx, localY));
-            bool clicked = ImGui::InvisibleButton(id, ImVec2(commitChipW, chipH));
-            bool hov     = ImGui::IsItemHovered();
-            ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-            ImVec4 fill(role[0], role[1], role[2], hov ? 0.98f : 0.82f);
-            cdl->AddRectFilled(mn, mx, ImGui::ColorConvertFloat4ToU32(fill), 6.0f * s);
-            const ImU32 gl = ui::Palette::toU32(ui::palette.windowBg);
-            const ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
-            if (isCheck) {
-                cdl->AddLine(ImVec2(c.x - 7 * s, c.y + 0),      ImVec2(c.x - 2 * s, c.y + 6 * s), gl, 2.6f * s);
-                cdl->AddLine(ImVec2(c.x - 2 * s, c.y + 6 * s),  ImVec2(c.x + 8 * s, c.y - 6 * s), gl, 2.6f * s);
-            } else {
-                cdl->AddLine(ImVec2(c.x - 6 * s, c.y - 6 * s),  ImVec2(c.x + 6 * s, c.y + 6 * s), gl, 2.6f * s);
-                cdl->AddLine(ImVec2(c.x - 6 * s, c.y + 6 * s),  ImVec2(c.x + 6 * s, c.y - 6 * s), gl, 2.6f * s);
-            }
-            if (hov) ImGui::SetTooltip("%s", tip);
-            if (clicked) ribbon_fire(cmd);
-        };
-        const char* finishCmd = s_sketch3dActive ? "sketch3d_exit"   : "sketch_exit";
-        const char* cancelCmd = s_sketch3dActive ? "sketch3d_cancel" : "sketch_cancel";
-        commitChip("##sk_finish", xFinish, ui::palette.statusOk,  true,  finishCmd, "Finish Sketch");
-        commitChip("##sk_cancel", xCancel, ui::palette.statusErr, false, cancelCmd, "Cancel Sketch (discard changes)");
-    }
+    // Sketch Finish/Cancel now render as a highlighted "Finish Sketch" big button (with a Cancel
+    // dropdown) in the New-Sketch slot of the Sketch group — see the bigCmds render loop above. The
+    // old right-aligned commit-chip cluster was removed in favor of that native ribbon button.
 
     ImGui::EndChild();
     ImGui::End();

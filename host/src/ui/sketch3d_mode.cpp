@@ -313,12 +313,17 @@ void Sketch3DMode::exitSketch(AppState& st, bool keep) {
             st.docMirror.resync(st.worker);
         }
     }
-    // A NEW sketch that was never given any content is noise — delete it on exit either way.
+    // An EMPTY sketch is noise — delete it on exit rather than leaving a contentless feature in the
+    // tree. Fires for a never-populated NEW sketch AND for an existing sketch the user emptied out.
     // Note: the cancel checkpoint above was taken AFTER the empty feature was created (enterNew
     // adds the feature, then enterForFeature snapshots it), so a discard-revert alone leaves that
     // empty feature sitting in the tree; this delete cleans it up on both the keep and discard
     // paths.
-    if (isNewEmpty_ && entJson_.empty() && st.docMirror.docId() == docId_) {
+    // keep=true (Finish/exit): delete any empty sketch, new or existing — requirement 3.
+    // keep=false (Cancel): only delete a NEW empty sketch. An EXISTING sketch the user emptied was
+    // just restored by the revert block above; entJson_ (the in-memory mirror) is stale-empty and
+    // must NOT trigger a delete of the restored feature — the isNewEmpty_ gate protects it.
+    if (entJson_.empty() && (keep || isNewEmpty_) && st.docMirror.docId() == docId_) {
         nlohmann::json op = {{"op", "delete_feature"}, {"id", fid_}};
         st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
     }

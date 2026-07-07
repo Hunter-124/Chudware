@@ -25,7 +25,7 @@ from typing import Any
 from services.plm import assist, doctypes, generic_snapshot, gitbind, manifest, snapshot
 from services.plm import history as hist  # aliased: Vault.history() method shadows the name
 from services.plm import items as items_mod
-from services.plm import summarize
+from services.plm import permissions, planning, summarize
 
 # document containers we version (contract §2)
 _CONTAINER_SUFFIXES = (".step+", ".ecad+")
@@ -124,13 +124,23 @@ class Vault:
             "locks": [],  # lock manifest lives on refs/aicad/locks (T-R7)
         }
 
-    def history(self, item_id: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
-        """Return the timeline (filtered per item if given) — contract §7 plm_history."""
+    def history(self, item_id: str | None = None, limit: int | None = None,
+                scope: str = hist.SCOPE_DESIGN) -> list[dict[str, Any]]:
+        """Return the timeline (filtered per item if given) — contract §7 plm_history.
+
+        ``scope`` filters by entry scope: ``design`` (default — the curated
+        timeline, hiding planning-store churn), ``planning`` (only task/issue/
+        milestone changes), or ``all``.
+        """
         entries: list[dict[str, Any]] = []
         prev_sig: object | None = None
         first = True
         commits = self._bind.log()
         for commit in commits:
+            if scope != "all":
+                cmeta = self._bind.commit_meta(commit)
+                if hist.scope_from_commit_message(cmeta["message"]) != scope:
+                    continue
             tree = self._bind.read_tree(commit)
             # per-item filter: include only commits where this item's content
             # changed. CAD items key on document.json; generic (non-container)
@@ -410,6 +420,100 @@ class Vault:
         cfg_path.write_text(_json.dumps(cfg, indent=2, sort_keys=True), "utf-8")
         return cfg
 
+    # -- planning store: tasks / issues / milestones (aicad.planning/1) ------
+
+    def plan(self, op: str, entity: str, *, data: dict[str, Any] | None = None,
+             ent_id: str | None = None, actor: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Read or mutate the project planning store (contract plm_planning.md).
+
+        ``op`` ∈ list | create | update | delete; ``entity`` ∈ task | issue |
+        milestone. Mutations cut a planning-scoped history entry so the board is
+        versioned/restore-safe/release-frozen with the design, but stays out of
+        the curated design timeline (``plm_history`` default scope). Every
+        mutation routes through the :mod:`permissions` seam (allow-all today).
+        """
+        op = str(op or "list")
+        head = self._bind.head_commit()
+        head_tree = self._bind.read_tree(head) if head else {}
+        try:
+            fname = planning.file_name(entity)
+            coll = planning.load(head_tree.get(fname), entity)
+            if op == "list":
+                return {"items": planning.entities(coll, entity)}
+            action = {"create": "create", "update": "edit", "delete": "delete"}.get(op)
+            if action is None:
+                raise VaultError("invalid_mode", f"unknown planning action: {op!r}")
+            permissions.require(actor, action, "planning")
+            now = _now_iso()
+            made: dict[str, Any] | None = None
+            if op == "create":
+                made = planning.create(coll, entity, data or {}, actor, now)
+            elif op == "update":
+                made = planning.update(coll, entity, str(ent_id or ""), data or {}, now)
+            else:  # delete
+                planning.delete(coll, entity, str(ent_id or ""))
+        except planning.PlanningError as e:
+            raise VaultError(e.reason, e.hint)
+        except permissions.PermissionDenied as e:  # never in v1
+            raise VaultError(e.reason, e.hint)
+        self._commit_sibling(fname, planning.dump(coll), scope=hist.SCOPE_PLANNING)
+        out: dict[str, Any] = {"items": planning.entities(coll, entity)}
+        if made is not None:
+            out["entity"] = made
+        return out
+
+    def overview(self, *, mine: dict[str, Any] | None = None) -> dict[str, Any]:
+        """One round trip for the hub dashboard: unsaved items, recent design
+        activity, open tasks/issues, and the next milestone."""
+        m = self.manifest()
+        dirty = self._dirty_items(m)
+        head = self._bind.head_commit()
+        head_tree = self._bind.read_tree(head) if head else {}
+        tasks = planning.entities(
+            planning.load(head_tree.get("planning/tasks.json"), "task"), "task")
+        issues = planning.entities(
+            planning.load(head_tree.get("planning/issues.json"), "issue"), "issue")
+        miles = planning.entities(
+            planning.load(head_tree.get("planning/milestones.json"), "milestone"), "milestone")
+        open_tasks = [t for t in tasks if t.get("status") != "done"]
+        open_issues = [i for i in issues if i.get("state") == "open"]
+        open_ms = sorted(
+            (ms for ms in miles if ms.get("status") == "open"),
+            key=lambda ms: (ms.get("due") is None, ms.get("due") or ""))
+        return {
+            "head": head,
+            "ai_mode": m.get("ai_mode", "assisted"),
+            "dirty_items": [items_mod.item_view(it) for d in dirty
+                            if (it := manifest.find_item(m, d)) is not None],
+            "recent_entries": self.history(limit=5, scope=hist.SCOPE_DESIGN),
+            "open_tasks": open_tasks,
+            "open_issues": open_issues,
+            "next_milestone": open_ms[0] if open_ms else None,
+            "counts": {"items": len(m["items"]), "dirty": len(dirty),
+                       "open_tasks": len(open_tasks), "open_issues": len(open_issues),
+                       "open_milestones": len(open_ms)},
+        }
+
+    def _commit_sibling(self, path: str, blob: bytes, *, scope: str) -> str:
+        """Commit a change to a single versioned sibling path (e.g. a planning
+        file) by carrying the HEAD tree forward verbatim and overriding just
+        that path. Does NOT re-read working design files, so a planning edit
+        never captures unsaved design changes. Respects the geometry.step
+        release-only invariant (§2) by not carrying it forward."""
+        head = self._bind.head_commit()
+        if head is not None:
+            files = {p: d for p, d in self._bind.read_tree(head).items()
+                     if not p.endswith("/geometry.step")}
+        else:
+            files = {"manifest.json": manifest.dumps(self.manifest())}
+        files[path] = blob
+        author = _user_author()
+        emeta = gitbind.EntryMeta(
+            kind=hist.KIND_AUTO, message="",
+            author_name=author["display"], author_email=f'{author["id"]}@aicad.local',
+            scope=scope)
+        return self._bind.commit_tree(files, emeta)
+
     def _commit_manifest_change(self, m: dict[str, Any]) -> str:
         """Persist a manifest-only change as an auto entry (§3.1: the manifest
         is re-committed with every history entry)."""
@@ -626,6 +730,7 @@ class Vault:
         geometry_for: dict[str, bytes] | None = None,
         enforce_released_lock: bool = False,
         inject: dict[str, dict[str, bytes]] | None = None,
+        inject_paths: dict[str, bytes] | None = None,
     ) -> dict[str, bytes]:
         """Explode every project container into the shadow tree + manifest.
 
@@ -725,6 +830,11 @@ class Vault:
             if top in _CARRY_FORWARD_TOPLEVEL and path not in files:
                 files[path] = data
 
+        # explicit sibling-path writes (e.g. planning files) override the
+        # carried-forward blobs for exactly the paths being mutated.
+        for path, data in (inject_paths or {}).items():
+            files[path] = data
+
         files["manifest.json"] = manifest.dumps(m)
         return files
 
@@ -787,6 +897,7 @@ class Vault:
     def _entry_view(self, commit: str, tree: dict[str, bytes], item_id: str | None) -> dict[str, Any]:
         cmeta = self._bind.commit_meta(commit)
         kind = hist.kind_from_commit_message(cmeta["message"])
+        scope = hist.scope_from_commit_message(cmeta["message"])
         msg = hist.user_message_from_commit(cmeta["message"])
         # pull author + ai from a representative item meta.json
         author = {"kind": "user", "id": "user", "display": "User"}
@@ -810,7 +921,7 @@ class Vault:
                 thumb_ref = snapshot.item_prefix(pick_iid) + "thumbnail.png"
             summary = (tree.get(snapshot.item_prefix(pick_iid) + "summary.txt") or b"").decode("utf-8")
         return {
-            "commit": commit, "kind": kind,
+            "commit": commit, "kind": kind, "scope": scope,
             "authored_at": _iso(cmeta["authored_at"]),
             "author": author, "ai": ai, "message": msg,
             "thumbnail_ref": thumb_ref, "summary": summary,

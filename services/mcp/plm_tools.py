@@ -219,6 +219,29 @@ def register_plm_tools(mcp: FastMCP) -> None:
         return _ok(item=item)
 
     @mcp.tool()
+    def plm_plan(path: str, op: str = "list", entity: str = "task",
+                 data: dict | None = None, id: str = "") -> str:
+        """Plan the work: read or change the project's tasks, issues and
+        milestones (stored with the project, so they version and restore with
+        it). ``op`` ∈ ``list`` | ``create`` | ``update`` | ``delete``;
+        ``entity`` ∈ ``task`` | ``issue`` | ``milestone``. ``data`` carries the
+        fields (title, status/priority, assignee, links to items/revisions, …).
+        Returns ``{ok, items, entity?}``."""
+        try:
+            Vault, VaultError = _vault_module()
+        except ImportError:
+            return _err("no_vault", "version history is not available on this machine")
+        try:
+            v = Vault.open(path)
+            try:
+                res = v.plan(op, entity, data=data or None, ent_id=id or None)
+            finally:
+                v.close()
+        except VaultError as e:
+            return _err(e.reason, e.hint)
+        return _ok(**res)
+
+    @mcp.tool()
     def plm_where_used(path: str, item_id: str, transitive: bool = False) -> str:
         """Answer "where is this used?": the assemblies, drawings and CAM jobs
         that consume an item (directly, or the whole chain with

@@ -107,7 +107,8 @@ def _plm_history(params: dict, _emit: Callable) -> dict:
 
         item_id = (params or {}).get("item_id") or None
         limit = int((params or {}).get("limit") or 0) or None
-        entries = v.history(item_id, limit)
+        scope = str((params or {}).get("scope", "design") or "design")
+        entries = v.history(item_id, limit, scope=scope)
         thumb_dir = str((params or {}).get("thumb_dir", "") or "")
         if thumb_dir:
             td = Path(thumb_dir)
@@ -258,6 +259,25 @@ def _plm_set_ai_mode(params: dict, _emit: Callable) -> dict:
     """Set the assist tier (manual | assisted | managed) — worker twin."""
     def run(v: Any) -> dict:
         return {"ok": True, "ai_mode": v.set_ai_mode(str((params or {}).get("mode", "")))}
+    return _with_vault(params, run)
+
+
+def _plm_plan(params: dict, _emit: Callable) -> dict:
+    """Read/mutate the planning store (tasks/issues/milestones). One multiplexed
+    tool: ``op`` ∈ list|create|update|delete, ``entity`` ∈ task|issue|milestone."""
+    def run(v: Any) -> dict:
+        p = params or {}
+        res = v.plan(str(p.get("op", "list")), str(p.get("entity", "")),
+                     data=p.get("data") or None, ent_id=p.get("id") or None,
+                     actor=p.get("actor") or None)
+        return {"ok": True, **res}
+    return _with_vault(params, run)
+
+
+def _plm_overview(params: dict, _emit: Callable) -> dict:
+    """One-round-trip hub dashboard aggregate."""
+    def run(v: Any) -> dict:
+        return {"ok": True, **v.overview(mine=(params or {}).get("mine") or None)}
     return _with_vault(params, run)
 
 
@@ -479,6 +499,8 @@ WORKER_METHODS = {
     "plm_link_repo": _plm_link_repo,
     "plm_where_used": _plm_where_used,
     "plm_set_ai_mode": _plm_set_ai_mode,
+    "plm_plan": _plm_plan,
+    "plm_overview": _plm_overview,
     "plm_settings_get": _plm_settings_get,
     "plm_settings_set": _plm_settings_set,
     "plm_scheme_set": _plm_scheme_set,

@@ -66,6 +66,7 @@ class EntryMeta:
     author_name: str
     author_email: str
     authored_at: int | None = None  # epoch seconds; defaults to now
+    scope: str = "design"  # design (timeline) | planning (tasks/issues/milestones)
 
 
 class GitBinding:
@@ -179,7 +180,10 @@ class GitBinding:
         # self-describing without a side table (contract §3.1). meta.json in the
         # tree carries the same for readers that don't parse commit trailers.
         body = meta.message or ""
-        commit.message = (f"{body}\n\naicad-plm-kind: {meta.kind}\n").encode("utf-8")
+        trailer = f"aicad-plm-kind: {meta.kind}\n"
+        if meta.scope and meta.scope != "design":
+            trailer += f"aicad-plm-scope: {meta.scope}\n"
+        commit.message = (f"{body}\n\n{trailer}").encode("utf-8")
 
         obj_store.add_object(commit)
         self._repo.refs.set_if_equals(

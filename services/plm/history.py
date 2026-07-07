@@ -17,6 +17,13 @@ KIND_RESTORE = "restore"
 ENTRY_KINDS = {KIND_AUTO, KIND_CHECKPOINT, KIND_RELEASE, KIND_RESTORE}
 
 _KIND_TRAILER = "aicad-plm-kind:"
+_SCOPE_TRAILER = "aicad-plm-scope:"
+
+# entry scope: design history (the timeline users watch) vs planning-store
+# mutations (tasks/issues/milestones), so the default timeline stays curated.
+SCOPE_DESIGN = "design"
+SCOPE_PLANNING = "planning"
+SCOPES = {SCOPE_DESIGN, SCOPE_PLANNING}
 
 
 def make_meta(
@@ -82,7 +89,20 @@ def kind_from_commit_message(message: str) -> str:
     return KIND_AUTO
 
 
+def scope_from_commit_message(message: str) -> str:
+    """Extract the entry scope from a commit trailer (default 'design')."""
+    for line in message.splitlines():
+        line = line.strip()
+        if line.startswith(_SCOPE_TRAILER):
+            s = line[len(_SCOPE_TRAILER):].strip()
+            if s in SCOPES:
+                return s
+    return SCOPE_DESIGN
+
+
 def user_message_from_commit(message: str) -> str:
-    """Return the user-facing message (commit body with the kind trailer stripped)."""
-    lines = [ln for ln in message.splitlines() if not ln.strip().startswith(_KIND_TRAILER)]
+    """Return the user-facing message (commit body with the trailers stripped)."""
+    lines = [ln for ln in message.splitlines()
+             if not ln.strip().startswith(_KIND_TRAILER)
+             and not ln.strip().startswith(_SCOPE_TRAILER)]
     return "\n".join(lines).strip()

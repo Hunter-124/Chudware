@@ -35,6 +35,42 @@ void accentButtonColors() {
         ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
 }
 
+// A self-bounding "card": an auto-height bordered child whose rounded background
+// exactly wraps its content with even internal padding. Used by the kanban task
+// cards and single-line PLM rows so controls sit padded and vertically centred
+// inside their box instead of clipping out the top edge — the failure mode of the
+// old fixed-height plmRowPill, which guessed a height and drew content hugging its
+// top. AutoResizeY makes the box grow to fit wrapped titles and expanded controls.
+void plmCardBegin(const char* id, bool sel, float padX = 8.0f, float padY = 6.0f) {
+    const float S = ui::uiScale;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, sel
+        ? ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.20f)
+        : ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.055f));
+    ImGui::PushStyleColor(ImGuiCol_Border, sel
+        ? ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.55f)
+        : ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.14f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f * S);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padX * S, padY * S));
+    ImGui::BeginChild(id, ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
+}
+
+// Close a card opened with plmCardBegin. Returns true if the card body was clicked
+// outside any inner widget (for row/card selection). Reads hover state while the
+// child is still current, so call it before doing anything else.
+bool plmCardEnd(float gap = 4.0f) {
+    const float S = ui::uiScale;
+    bool clicked = ImGui::IsWindowHovered() &&
+                   ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                   !ImGui::IsAnyItemHovered();
+    ImGui::EndChild();
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(2);
+    ImGui::Dummy(ImVec2(0, gap * S));
+    return clicked;
+}
+
 // Dim helper text. Wraps to the content-region width so long paragraphs never
 // run off the right edge (short inline uses after SameLine wrap harmlessly).
 void dimText(const char* fmt, ...) {
@@ -493,15 +529,17 @@ void plmDrawReleasesPage(AppState& st) {
 
     for (const auto& it : H.items) {
         ImGui::PushID(it.itemId.c_str());
-        plmRowPill(false, 1.4f);
+        bool open = (s_releaseItem == it.itemId);
+        plmCardBegin("##rel", open);
         plmDocTypeTag(it.docType, it.kind);
         ImGui::SameLine();
-        ImGui::Text("%s", it.path.c_str());
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - 200 * S);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(it.path.c_str());
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - 210 * S);
         plmLifecycleBadge(it.lifecycle, !it.rev.empty() ? it.rev : it.workingRev);
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - 90 * S);
-        bool open = (s_releaseItem == it.itemId);
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - 95 * S);
         if (it.lifecycle == "Released") {
+            ImGui::AlignTextToFramePadding();
             dimText("released");
         } else if (ImGui::SmallButton(open ? "Cancel" : "Release\xe2\x80\xa6")) {
             s_releaseItem = open ? "" : it.itemId;
@@ -530,7 +568,7 @@ void plmDrawReleasesPage(AppState& st) {
             if (H.busy) plmSpinner("Releasing");
             ImGui::Unindent(16 * S);
         }
-        ImGui::Spacing();
+        plmCardEnd();
         ImGui::PopID();
     }
 }
@@ -809,33 +847,51 @@ void plmDrawPlanningPage(AppState& st) {
         ImGui::TextUnformatted(col.label);
         ImGui::PopStyleColor();
         ImGui::Separator();
+        // pipeline order for the ◀ ▶ movement arrows; "blocked" is a side state
+        static const char* kPipe[] = {"todo", "doing", "done"};
         for (const auto& t : H.allTasks) {
             if (t.status != col.id) continue;
             ImGui::PushID(t.id.c_str());
             bool sel = (s_selTask == t.id);
-            plmRowPill(sel, sel ? 3.2f : 1.8f);
-            ImGui::BeginGroup();
+            plmCardBegin("##task", sel);
             priorityTag(t.priority);
             ImGui::SameLine();
             ImGui::TextWrapped("%s", t.title.c_str());
-            if (!t.assignee.empty()) dimText("  @%s", t.assignee.c_str());
-            ImGui::EndGroup();
-            if (ImGui::IsItemClicked()) s_selTask = sel ? "" : t.id;
+            if (!t.assignee.empty()) dimText("@%s", t.assignee.c_str());
+
+            // movement controls — always visible so a task moves in one click, no
+            // select-first step. Arrows walk the todo→doing→done pipeline; a Block
+            // toggle parks it. These are compact enough to fit the narrow column.
+            int idx = -1;
+            for (int k = 0; k < 3; ++k) if (t.status == kPipe[k]) idx = k;
+            bool blocked = (idx < 0);
+            ImGui::Spacing();
+            ImGui::BeginDisabled(!blocked && idx == 0);
+            if (ImGui::ArrowButton("##prev", ImGuiDir_Left))
+                planCall(st, "update", "task",
+                         {{"status", blocked ? "todo" : kPipe[idx - 1]}}, t.id);
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!blocked && idx == 2);
+            if (ImGui::ArrowButton("##next", ImGuiDir_Right))
+                planCall(st, "update", "task",
+                         {{"status", blocked ? "doing" : kPipe[idx + 1]}}, t.id);
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (blocked) {
+                if (ImGui::SmallButton("Unblock"))
+                    planCall(st, "update", "task", {{"status", "todo"}}, t.id);
+            } else if (ImGui::SmallButton("Block")) {
+                planCall(st, "update", "task", {{"status", "blocked"}}, t.id);
+            }
             if (sel) {
-                // move-to buttons (reliable alternative to drag-drop)
-                for (const auto& dest : kCols) {
-                    if (std::strcmp(dest.id, col.id) == 0) continue;
-                    if (ImGui::SmallButton(dest.label))
-                        planCall(st, "update", "task", {{"status", dest.id}}, t.id);
-                    ImGui::SameLine();
-                }
                 ImGui::PushStyleColor(ImGuiCol_Button,
-                    ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 0.5f));
+                    ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 0.55f));
                 if (ImGui::SmallButton("Delete"))
                     planCall(st, "delete", "task", nullptr, t.id);
                 ImGui::PopStyleColor();
             }
-            ImGui::Spacing();
+            if (plmCardEnd()) s_selTask = sel ? "" : t.id;
             ImGui::PopID();
         }
         ImGui::NextColumn();
@@ -862,20 +918,22 @@ void plmDrawPlanningPage(AppState& st) {
     }
     for (const auto& m : H.milestones) {
         ImGui::PushID(m.id.c_str());
-        plmRowPill(false, 1.2f);
         bool done = (m.status == "done");
+        plmCardBegin("##ms", false);
         ImGui::PushStyleColor(ImGuiCol_Text, done
             ? ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f)
             : ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::Text(done ? "[x]" : "[ ]");
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(done ? "[x]" : "[ ]");
         ImGui::PopStyleColor();
         ImGui::SameLine();
-        ImGui::Text("%s", m.title.c_str());
+        ImGui::TextUnformatted(m.title.c_str());
         if (!m.due.empty()) { ImGui::SameLine(); dimText("  due %s", m.due.c_str()); }
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - 70 * S);
+        ImGui::SameLine(ImGui::GetContentRegionMax().x - 80 * S);
         if (ImGui::SmallButton(done ? "Reopen" : "Complete"))
             planCall(st, "update", "milestone",
                      {{"status", done ? "open" : "done"}}, m.id);
+        plmCardEnd();
         ImGui::PopID();
     }
 }

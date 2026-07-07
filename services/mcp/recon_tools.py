@@ -723,89 +723,19 @@ def _calibrate_face_frame(doc_id: str, face_query: dict, origin) -> Optional[dic
         return None
 
 
-# ------------------------------------------------------- RE-14: fitted-primitive hints
-
-# A hinted primitive is only worth trying when the deterministic passes did NOT already
-# recover the geometry it describes. Cylinder fits are the useful case: a large convex
-# boss (r > pass-5's fillet bound, not a bore so not a hole) falls through every frozen
-# pass and lands in `unclaimed` — exactly the gap a RANSAC cylinder fit fills.
-_HINT_MIN_CONFIDENCE = 0.5
-
-
-def _cylinder_boss_specs(hints: Optional[dict],
-                         claimed_cyl_axes: list) -> list:
-    """Pure-Python: turn an ``aicad.reveng_fits/1`` doc (contracts/reveng.md §3) into a
-    list of candidate cylinder-BOSS specs, dropping fits the deterministic passes already
-    explain. Engine-free and side-effect-free so it is unit-testable without libaicad.
-
-    hints             : the fits doc, or None (returns []).
-    claimed_cyl_axes  : (axis_unit, origin) pairs the passes already own (base/holes) —
-                        a fit coaxial+coincident with one of these is a duplicate, skipped.
-
-    Returns [{radius, height, axis, origin, confidence, face_ids}] — additive candidates,
-    NOT yet verified. reverse_engineer routes each through apply_batch (keep-or-revert), so
-    a bad hint can only revert, never regress the match. hints=None -> [] -> no behavior
-    change (this is what keeps the frozen recognizer and every existing test untouched)."""
-    if not hints:
-        return []
-    fits = hints.get("fits") if isinstance(hints, dict) else None
-    if not isinstance(fits, list):
-        return []
-    specs: list = []
-    for fit in fits:
-        if not isinstance(fit, dict) or fit.get("kind") != "cylinder":
-            continue
-        if float(fit.get("confidence") or 0.0) < _HINT_MIN_CONFIDENCE:
-            continue
-        p = fit.get("params_mm") or {}
-        r = float(p.get("radius") or 0.0)
-        h = float(p.get("height") or 0.0)
-        ax = _f3(p, "axis")
-        origin = _f3(p, "origin")
-        if r <= 0.0 or h <= 0.0 or ax is None or origin is None:
-            continue
-        a = _unit(ax)
-        if _norm(a) < 0.5:
-            continue
-        # skip a fit the passes already recovered: coaxial (parallel axes) AND the fit's
-        # origin sits on that axis line (perpendicular offset ~0).
-        dup = False
-        for cax, corg in claimed_cyl_axes:
-            cau = _unit(cax)
-            if abs(abs(_dot(a, cau)) - 1.0) > 1e-2:
-                continue
-            if _norm(_perp(_sub(origin, corg), cau)) < max(0.5, 0.1 * r):
-                dup = True
-                break
-        if dup:
-            continue
-        specs.append({"radius": r, "height": h, "axis": a, "origin": list(origin),
-                      "confidence": float(fit.get("confidence") or 0.0),
-                      "face_ids": fit.get("face_ids") or []})
-    return specs
-
-
 # ---------------------------------------------------------------- registration
 
 def register_recon_tools(mcp: FastMCP) -> None:
     """Attach the reverse-engineering tools to the FastMCP server."""
 
     @mcp.tool()
-    def reverse_engineer(source: str, name: Optional[str] = None,
-                         hints: Optional[dict] = None) -> str:
+    def reverse_engineer(source: str, name: Optional[str] = None) -> str:
         """Rebuild an imported solid (STEP/IGES/BREP/STL/...) as an EDITABLE parametric
         feature tree, verified against the source by boolean comparison.
 
         source : a file path (imported first; meshes are sewn to a solid) OR the doc_id of an
                  already-open document (e.g. from import_part).
         name   : optional name for the NEW rebuilt part (default "<source>-rebuilt").
-        hints  : OPTIONAL ``aicad.reveng_fits/1`` doc (contracts/reveng.md §3) from
-                 reveng_fit_primitives — RANSAC/segmentation primitive fits. When present,
-                 cylinder fits the deterministic passes could NOT recover (a convex boss that
-                 fell through into `recognition.unclaimed`) are tried as ADDITIVE boss batches
-                 AFTER the deterministic rebuild, each verified by the same eval_compare
-                 keep-or-revert gate — so a hint can only improve or be reverted, never
-                 regress the match. Omitting hints leaves the pipeline byte-for-byte unchanged.
 
         Pipeline: import -> deterministic recognition (prismatic/turned base, holes, patterns,
         fillet/chamfer candidates) -> rebuild in batches (base -> holes -> patterns -> dress-
@@ -1176,59 +1106,6 @@ def register_recon_tools(mcp: FastMCP) -> None:
                                               if k != "axis"},
                                            "note": "applied but the match regressed — "
                                                    "reverted (see rejected)"})
-
-            # ---------------- batch 5 (RE-14): fitted-primitive HINTS — additive only.
-            # Cylinder fits the frozen passes could not recover (convex bosses that fell into
-            # `unclaimed`) are tried as boss extrudes AFTER the deterministic rebuild. Each
-            # goes through apply_batch (checkpoint -> eval_compare -> keep/revert), so this can
-            # only raise or leave match_pct — never lower it. hints=None -> no specs -> no-op.
-            claimed_cyl_axes: list = []
-            for hl in plan["holes"]:
-                a_h, o_h = _f3(hl, "axis"), _f3(hl, "center")
-                if a_h is not None and o_h is not None:
-                    claimed_cyl_axes.append((a_h, o_h))
-            base = plan.get("base")
-            if base and base.get("type") == "revolve":
-                w = _AXES.get(base.get("axis"))
-                if w is not None:
-                    claimed_cyl_axes.append((list(w), [0.0, 0.0, 0.0]))
-            hint_specs = _cylinder_boss_specs(hints, claimed_cyl_axes)
-            if hint_specs:
-                notes.append(f"{len(hint_specs)} fitted cylinder hint(s) not already "
-                             "recovered — trying as additive boss batches")
-            for si, spec in enumerate(hint_specs):
-                letter = _principal_axis(spec["axis"])
-                # The `cylinder` primitive is Z-aligned and centered, placed by an absolute
-                # `at:[x,y,z]` (core/doc/document.cpp) — so only a Z-axis fit is authorable as
-                # a boss primitive today. Non-Z fits are surfaced as candidates, not applied.
-                if letter != "z":
-                    candidates.append({"kind": "cylinder_hint", "radius": spec["radius"],
-                                       "height": spec["height"], "axis": spec["axis"],
-                                       "note": "fit axis is not +Z — the boss primitive is "
-                                               "Z-aligned; author this cylinder by hand"})
-                    continue
-                w = _AXES[letter]
-                o = spec["origin"]
-                # Centered cylinder: `at` is the mid-point = fit origin + axis*(height/2).
-                mid = [o[i] + w[i] * spec["height"] / 2.0 for i in range(3)]
-                ops = [{"op": "add_feature", "feature": {
-                    "type": "cylinder", "name": f"HintBoss{si + 1}",
-                    "params": {"radius": _dim(spec["radius"]),
-                               "height": _dim(spec["height"]), "mode": "boss",
-                               "at": [round(x, 6) for x in mid]}}}]
-                r = apply_batch(f"hint boss r{spec['radius']:g}", ops)
-                if r:
-                    applied.append({"id": (r.get("id_map") or {}).get("$0"),
-                                    "type": "cylinder", "name": f"HintBoss{si + 1}",
-                                    "role": "hint", "radius_mm": spec["radius"],
-                                    "height_mm": spec["height"],
-                                    "confidence": spec["confidence"]})
-                else:
-                    candidates.append({"kind": "cylinder_hint", "radius": spec["radius"],
-                                       "height": spec["height"], "axis": spec["axis"],
-                                       "confidence": spec["confidence"],
-                                       "note": "hint boss did not build or regressed the "
-                                               "match — reverted (see rejected)"})
 
             # ---------------- final verification + report
             if applied:

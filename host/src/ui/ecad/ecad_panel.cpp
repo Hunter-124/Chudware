@@ -62,6 +62,12 @@ struct EcadEditorState {
     // so the plot axes match the run (not the live combo) and we can pop the Sim tab on new results.
     nlohmann::json lastSimResults;
     int lastAnalysis = 0;
+    // Item 4 — runtime workspace health. Re-scanned once whenever the mirror revision changes
+    // (tracked by healthScannedRev) so the scan never runs every frame or fires RPCs from the draw
+    // path. healthMsg is a human status line; healthLevel: 0=ok 1=warn 2=error.
+    std::string healthMsg;
+    int  healthLevel = 0;       // 0 ok, 1 warn, 2 error
+    int  healthScannedRev = -1; // mirror revision the current healthMsg was computed for
 };
 
 namespace {
@@ -101,6 +107,87 @@ EcadEditorState& state() {
 }
 
 ImVec4 v4(const float c[4], float a = 1.0f) { return ImVec4(c[0], c[1], c[2], c[3] * a); }
+
+// Item 3 — programmatic checkmark glyph drawn straight onto a rect via ImDrawList (no atlas sprite,
+// so no dual-atlas / POST_BUILD staging hazard). Proportions mirror the property-manager's proven
+// drawChromeButtons check (property_manager.cpp) so panel-owned check buttons read consistently with
+// the rest of the app. `c` = glyph centre, `half` = half the target square edge, `th` = stroke px.
+void drawProcCheck(ImDrawList* dl, const ImVec2& c, float half, ImU32 col, float th) {
+    ImVec2 p0(c.x - half * 0.72f, c.y + half * 0.05f);
+    ImVec2 p1(c.x - half * 0.18f, c.y + half * 0.58f);
+    ImVec2 p2(c.x + half * 0.74f, c.y - half * 0.55f);
+    dl->PathLineTo(p0); dl->PathLineTo(p1); dl->PathLineTo(p2);
+    dl->PathStroke(col, ImDrawFlags_None, th);
+    dl->AddCircleFilled(p0, th * 0.5f, col);   // round the ends so the crook reads clean
+    dl->AddCircleFilled(p1, th * 0.5f, col);
+    dl->AddCircleFilled(p2, th * 0.5f, col);
+}
+
+// A small text button with a leading procedural checkmark glyph (item 3). Used for panel-owned
+// confirm-style actions (Update Board / Annotate) so their check aligns with the app convention
+// without touching the ribbon atlas. Returns true on click.
+bool checkButton(const char* label, float sc) {
+    const ui::Palette& pal = ui::palette;
+    const float h = ImGui::GetFrameHeight();
+    const float glyph = h;                       // reserve a square glyph slot at the button height
+    const ImVec2 lbl = ImGui::CalcTextSize(label);
+    const ImVec2 size(glyph + 6 * sc + lbl.x + 12 * sc, h);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::PushID(label);
+    const bool clicked = ImGui::Button("##checkbtn", size);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 gc(p0.x + 6 * sc + glyph * 0.5f, p0.y + h * 0.5f);
+    drawProcCheck(dl, gc, glyph * 0.34f, ui::Palette::toU32(pal.statusOk), 2.4f * sc);
+    dl->AddText(ImVec2(p0.x + glyph + 6 * sc, p0.y + (h - lbl.y) * 0.5f),
+                ui::Palette::toU32(pal.text), label);
+    ImGui::PopID();
+    return clicked;
+}
+
+// Item 4 — runtime workspace health scan. Reads the loaded mirror (pure, no RPC) and flags missing
+// deps / unlinked components / broken schematic->board hooks. Only re-runs when the revision changed
+// (guarded by es.healthScannedRev) so it costs nothing per frame. Records es.healthMsg/healthLevel;
+// the header renders it. Auto-init of the empty board itself happens in app.cpp at workspace entry —
+// here we only DETECT + FLAG (and never render a silently-broken viewport).
+void scanEcadHealth(EcadEditorState& es) {
+    const int rev = es.mirror.revision();
+    if (rev == es.healthScannedRev) return;   // already scanned this revision
+    es.healthScannedRev = rev;
+    es.healthMsg.clear();
+    es.healthLevel = 0;
+
+    if (!es.mirror.hasDoc()) return;   // launchpad state — nothing to scan
+
+    if (es.mirror.isSch()) {
+        int unlinked = 0;
+        for (const auto& s : es.mirror.symbols())
+            if (!s.dnp && s.footprint.empty()) ++unlinked;
+        if (es.mirror.symbols().empty()) {
+            es.healthMsg = "Empty schematic — place symbols or use Design with AI.";
+            es.healthLevel = 1;
+        } else if (unlinked > 0) {
+            es.healthMsg = std::to_string(unlinked) +
+                " component(s) have no footprint assigned — assign before Update Board.";
+            es.healthLevel = 1;
+        } else {
+            es.healthMsg = "Schematic OK — all components have footprints.";
+            es.healthLevel = 0;
+        }
+    } else if (es.mirror.isPcb()) {
+        const int unrouted = es.mirror.unroutedCount();
+        if (es.mirror.footprints().empty()) {
+            es.healthMsg = "Board has no footprints — run Update Board from the schematic to populate it.";
+            es.healthLevel = 1;
+        } else if (unrouted > 0) {
+            es.healthMsg = std::to_string(unrouted) +
+                " net(s) unrouted — route manually or run Autoroute.";
+            es.healthLevel = 1;
+        } else {
+            es.healthMsg = "Board OK — populated and fully routed.";
+            es.healthLevel = 0;
+        }
+    }
+}
 
 // Copper-layer swatch color, kept in sync with ecad_canvas.cpp::copperColor (palette roles, theme
 // aware). Returns an ImVec4 for ImGui widget tinting.
@@ -908,23 +995,68 @@ void drawEcadEditor(AppState& st) {
         return;
     }
 
-    // ---- header toolbar: doc badge + name + revision (left); view controls (right) ----
+    // ---- header toolbar (item 2 layout rework) ----
+    // Convention mirrors the Modeling / Drawing tab strips: a single compact, LEFT-aligned control
+    // row (view/history controls + the contextual confirm action), with the File Display centered on
+    // the same line, then a status strip below. View controls that were right-anchored now sit LEFT.
     ImGui::AlignTextToFramePadding();
-    ImGui::TextColored(v4(pal.accent), "%s", es.mirror.isSch() ? "SCHEMATIC" : "PCB LAYOUT");
-    ImGui::SameLine(0, 12 * sc);
-    ImGui::TextColored(v4(pal.text), "%s",
-                       es.mirror.name().empty() ? "(untitled)" : es.mirror.name().c_str());
-    ImGui::SameLine(0, 8 * sc);
-    ImGui::TextColored(v4(pal.textDim), "rev %d", es.mirror.revision());
-    ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 270 * sc);
-    // History controls (worker ecad_undo / ecad_redo via one-shot flags consumed in the app loop).
+    // LEFT: history + view controls (worker ecad_undo / ecad_redo via one-shot flags).
     if (ImGui::SmallButton("Undo")) st.ecadUndoGo = true;
     ImGui::SameLine();
     if (ImGui::SmallButton("Redo")) st.ecadRedoGo = true;
     ImGui::SameLine(0, 12 * sc);
     if (ImGui::SmallButton("Zoom Fit")) es.canvas.requestFit();
-    ImGui::SameLine();
+    ImGui::SameLine(0, 12 * sc);
     ImGui::Checkbox(es.mirror.isPcb() ? "Layers" : "Nets", &es.showLeft);
+    // Contextual confirm action with a procedural checkmark (item 3): Annotate on a schematic,
+    // Update Board on a PCB. Routed through the shared ribbon handler (ecadPanelCmd), so behaviour
+    // matches the ribbon button exactly. Checkmark is drawn in code — no atlas / POST_BUILD hazard.
+    ImGui::SameLine(0, 16 * sc);
+    if (es.mirror.isSch()) {
+        if (checkButton("Annotate", sc)) st.ecadPanelCmd = "sch_annotate";
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Auto-assign reference designators (R1, C1, ...)");
+    } else {
+        // Board-side confirm action. NOTE: "Update Board" (back-annotate from the linked schematic)
+        // needs a sch_doc_id the panel mirror doesn't carry — that stays on the ribbon. The panel
+        // offers Run DRC instead (self-contained, routes through the same ribbon handler).
+        if (checkButton("Run DRC", sc)) st.ecadPanelCmd = "ecad_run_drc";
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Rebuild + re-check design rules on the current board");
+    }
+
+    // CENTER: File Display / File Manager — the document badge + name + revision, horizontally
+    // centered on the toolbar row (item 2). Computed from the text extents so it stays centered at
+    // any window width; falls back to a left position if the left cluster would overlap.
+    {
+        const char* badge = es.mirror.isSch() ? "SCHEMATIC" : "PCB LAYOUT";
+        const std::string nm = es.mirror.name().empty() ? "(untitled)" : es.mirror.name();
+        char rev[24]; std::snprintf(rev, sizeof(rev), "rev %d", es.mirror.revision());
+        const float wBadge = ImGui::CalcTextSize(badge).x;
+        const float wName  = ImGui::CalcTextSize(nm.c_str()).x;
+        const float wRev   = ImGui::CalcTextSize(rev).x;
+        const float total  = wBadge + 12 * sc + wName + 8 * sc + wRev;
+        const float regionW = ImGui::GetWindowContentRegionMax().x - ImGui::GetWindowContentRegionMin().x;
+        const float leftEnd = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x;  // end of left cluster
+        float cx = (regionW - total) * 0.5f;
+        if (cx < leftEnd + 16 * sc) cx = leftEnd + 16 * sc;   // never overlap the left cluster
+        ImGui::SameLine(cx);
+        ImGui::TextColored(v4(pal.accent), "%s", badge);
+        ImGui::SameLine(0, 12 * sc);
+        ImGui::TextColored(v4(pal.text), "%s", nm.c_str());
+        ImGui::SameLine(0, 8 * sc);
+        ImGui::TextColored(v4(pal.textDim), "%s", rev);
+    }
+
+    // Status strip below the toolbar — the runtime workspace-health line (item 4). Matches the
+    // Drawing tab's dim/warn status-strip convention. Scan is revision-guarded (no per-frame cost,
+    // no RPC); auto-init of an empty board happens in app.cpp at workspace entry.
+    scanEcadHealth(es);
+    if (!es.healthMsg.empty()) {
+        const ImVec4 hc = es.healthLevel >= 2 ? v4(pal.statusErr)
+                        : es.healthLevel == 1 ? v4(pal.statusWarn)
+                                              : v4(pal.statusOk);
+        ImGui::TextColored(hc, es.healthLevel == 0 ? "%s" : "! %s", es.healthMsg.c_str());
+    }
 
     ImGui::Separator();
 

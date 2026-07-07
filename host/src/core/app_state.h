@@ -549,6 +549,10 @@ struct AppState {
     int         ecadSimAnalysis = 0;        // 0 = Transient, 1 = AC
     bool        ecadUndoGo = false;         // one-shot: run ecadUndo(st) this frame (ecad_undo RPC)
     bool        ecadRedoGo = false;         // one-shot: run ecadRedo(st) this frame (ecad_redo RPC)
+    // One-shot ECAD command the 2D panel wants dispatched through the same handler the ribbon uses
+    // (ecadDispatch in app.cpp): e.g. "sch_annotate", "pcb_update_from_sch". "" = nothing pending.
+    // Lets panel-owned toolbar buttons fire the exact ribbon actions without duplicating logic.
+    std::string ecadPanelCmd;
 
     // ---- document tabs (SolidWorks/browser-style multi-document) ----
     // The worker already keeps every open document alive in its registry (keyed by doc_id); the

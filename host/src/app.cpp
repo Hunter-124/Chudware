@@ -164,6 +164,29 @@ void ecadNewDoc(AppState& st, const char* kind) {
     ImGui::SetWindowFocus("ECAD");   // bring the editor tab forward
 }
 
+// Auto-init: when the Electronics workspace is entered with no ECAD document open, create a default
+// "PCB1" board so the user always lands in a usable, editable layout instead of the empty launchpad.
+// Runs from the app loop (workspace-entry edge), NEVER from a draw path — an ecad_new call in
+// drawEcadEditor's every-frame empty branch would spawn infinite boards + risk the GL-thread-RPC
+// freeze. On worker failure it is a no-op: the launchpad stays as the graceful fallback (item 4:
+// flag/degrade, never render a broken viewport).
+void ecadAutoInitBoard(AppState& st) {
+    if (!st.ecadDocId.empty()) return;   // a board/schematic is already open — nothing to do
+    nlohmann::json res;
+    if (!ecadCall(st, "ecad_new", {{"kind", "pcb"}}, res)) {
+        // Backend hook missing/unavailable: degrade gracefully, keep the AI launchpad reachable.
+        st.addLog("[ecad] auto-init PCB1 skipped (worker ecad_new unavailable) — launchpad shown");
+        return;
+    }
+    const std::string id = jstr(res, "doc_id");
+    const int rev = jint(res, "revision");
+    st.addEcadTab("pcb", id, rev, /*title=*/"PCB1");
+    ecadAdopt(st, res);
+    st.addLog("[ecad] auto-init default board PCB1 (" + st.ecadDocId + ")");
+    st.toast(ui::ToastLevel::Info, "Started a new board: PCB1");
+    ImGui::SetWindowFocus("ECAD");
+}
+
 // A doc-scoped RPC that returns an ops-response (rebuild / autoroute / fill_zones) -> refresh.
 void ecadDocRpc(AppState& st, const char* method, const char* okMsg) {
     if (st.ecadDocId.empty()) { st.toast(ui::ToastLevel::Warn, "Open an ECAD document first"); return; }
@@ -2945,6 +2968,10 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             if (ws != ecadPrevWs) {
                 if (ws == WS::Electronics) {
                     st.wantFocusEcad = 2;      // pop the ECAD tab forward for a couple of frames
+                    // Auto-init a default PCB1 board on first entry with nothing open, so the user
+                    // lands in a usable layout (item 1). Edge-triggered here (once), never in the
+                    // draw path. No-op when a doc is already open; graceful fallback on worker error.
+                    ecadAutoInitBoard(st);
                 } else if (ecadPrevWs == WS::Electronics) {
                     st.wantFocusEcad = 0;      // cancel any pending grab from the stay
                     st.wantFocusViewport = 2;  // bring the 3D view back to the central node
@@ -3031,6 +3058,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         if (st.ecadSimGo) { st.ecadSimGo = false; ecadSimulate(st); }  // native simulator
         if (st.ecadUndoGo) { st.ecadUndoGo = false; ecadUndo(st); }  // ECAD history undo
         if (st.ecadRedoGo) { st.ecadRedoGo = false; ecadRedo(st); }  // ECAD history redo
+        // Panel-owned toolbar action (item 3 check buttons): route through the shared ribbon handler
+        // so Annotate / Update Board behave identically whether fired from the ribbon or the panel.
+        if (!st.ecadPanelCmd.empty()) { const std::string c = st.ecadPanelCmd; st.ecadPanelCmd.clear(); ecadDispatch(st, c); }
 
         // ---------- C19: simulation (active doc) + evaluate dialogs ----------
         // The active document's SimManager drains its own SimClient job (owner-gated) and loads result

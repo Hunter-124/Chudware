@@ -16,6 +16,9 @@ Canonical checklist of every GUI change Hunter has requested for the host/ light
 - ⬜ PENDING — not started / opt-in awaiting Hunter's go
 - 🐛 REOPENED — Hunter found it still broken after a commit
 
+## Verification log
+- **2026-07-07** — Hunter live-verified the full checklist (rows A–J, H1, F1, L1): "gui stuff all looks good." All ✅ rows below are considered ☑ VERIFIED as of this pass unless later reopened.
+
 ---
 
 ## A. Ribbon / top toolbar
@@ -90,7 +93,7 @@ Canonical checklist of every GUI change Hunter has requested for the host/ light
 | # | Item | Status | Commit |
 |---|------|--------|--------|
 | K1 | Full-wave EM backend: eigenmode/modal, freq-domain driven S-params, time-domain; FDTD/FEM/MoM; openEMS-primary pluggable adapters + others | ✅ | `025b0865` |
-| K2 | Wire EM study setup forms into the Simulate EM tab (eigenmode/driven/time-domain) — backend is live+validated, tab currently only toasts | ⬜ (next opt-in) | — see memory `em-gui-forms-gap` |
+| K2 | Wire EM study setup forms into the Simulate EM tab (eigenmode/driven/time-domain) — backend is live+validated, tab currently only toasts | 🔧 (agent running) | — see memory `em-gui-forms-gap` |
 
 ## L. Stability
 | # | Item | Status | Commit |
@@ -101,6 +104,6 @@ Canonical checklist of every GUI change Hunter has requested for the host/ light
 ---
 
 ## Open / next-up queue (orchestrator dispatches on Hunter's go)
-- **K2** — EM study forms (opt-in; backend ready).
+- **K2** — EM study forms — 🔧 agent running (2026-07-07).
 - **G3** — richer live sub-agent enumeration (needs a worker fleet-listing RPC; currently honest empty-state).
 - _(new rows land here as Hunter red-pens the list above)_

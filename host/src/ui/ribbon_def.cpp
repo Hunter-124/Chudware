@@ -119,6 +119,30 @@ static const RibbonCmd kCmds[] = {
     { "sk_fix",            "Fix",            "fix",             "Sketch",   "Relations",       false, nullptr,          false },
 
     // =========================================================================
+    // Pseudo-tab: "Sketch3D" — the 3D free-space sketcher's ribbon tool set. NOT one of
+    // kRibbonTabs (never shown by normal tab iteration); ribbon.cpp swaps the Sketch tab's
+    // command source to these rows while a sketch3d feature is being edited (Hunter red-pen
+    // item 1 — 3D tools belong in the ribbon, not the sketch3d_mode.cpp floating overlay).
+    // =========================================================================
+
+    { "sketch3d_exit",      "Exit Sketch",   "ok_check",        "Sketch3D", "Sketch",          true,  nullptr,          false },
+
+    { "sk3d_line",           "Line",          "line",           "Sketch3D", "Draw",            true,  nullptr,          false },
+    { "sk3d_arc",            "3-Pt Arc",      "arc_3pt",        "Sketch3D", "Draw",            true,  nullptr,          false },
+    { "sk3d_spline",         "Spline",        "spline",         "Sketch3D", "Draw",            true,  nullptr,          false },
+    { "sk3d_point",          "Point",         "point_ent",      "Sketch3D", "Draw",            true,  nullptr,          false },
+
+    { "sk3d_plane_xy",       "XY Plane",      "ref_plane",       "Sketch3D", "Working Plane",  true,  nullptr,          false },
+    { "sk3d_plane_xz",       "XZ Plane",      "ref_plane",       "Sketch3D", "Working Plane",  false, nullptr,          false },
+    { "sk3d_plane_yz",       "YZ Plane",      "ref_plane",       "Sketch3D", "Working Plane",  false, nullptr,          false },
+    { "sk3d_plane_view",     "View Plane",    "ref_plane",       "Sketch3D", "Working Plane",  false, nullptr,          false },
+
+    { "sk3d_construction",   "Construction",  "construction",    "Sketch3D", "Sketch Tools",   true,  nullptr,          false },
+    { "sk3d_relations",      "Relations",     "relations",       "Sketch3D", "Sketch Tools",    true,  nullptr,          false },
+    { "sk3d_fix",            "Fix",           "fix",             "Sketch3D", "Sketch Tools",    false, nullptr,          false },
+    { "sk3d_delete",         "Delete",        "trim",            "Sketch3D", "Sketch Tools",    false, nullptr,          false },
+
+    // =========================================================================
     // Tab: Evaluate
     // =========================================================================
 

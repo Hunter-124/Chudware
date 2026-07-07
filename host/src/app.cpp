@@ -2782,10 +2782,17 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         // while sketching.
         {
             static bool s_wasInSketch = false;
+            static bool s_wasInSketch3d = false;
             const bool nowInSketch = st.sketchMode->active();
-            if (nowInSketch && !s_wasInSketch)      st.ribbonTab = AppState::RT_Sketch;
-            else if (!nowInSketch && s_wasInSketch) st.ribbonTab = AppState::RT_Features;
+            const bool nowInSketch3d = st.sketch3dMode && st.sketch3dMode->active();
+            if ((nowInSketch && !s_wasInSketch) || (nowInSketch3d && !s_wasInSketch3d))
+                st.ribbonTab = AppState::RT_Sketch;
+            else if (!nowInSketch && s_wasInSketch && !nowInSketch3d)
+                st.ribbonTab = AppState::RT_Features;
+            else if (!nowInSketch3d && s_wasInSketch3d && !nowInSketch)
+                st.ribbonTab = AppState::RT_Features;
             s_wasInSketch = nowInSketch;
+            s_wasInSketch3d = nowInSketch3d;
         }
         // C40: accent-highlight the armed sketch tool's ribbon button. When the profiler is
         // running (and no sketch tool is armed) highlight the Profiler button instead, so its
@@ -2795,6 +2802,8 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         ui::setRibbonActiveCmd(activeCmd);
         // Sketch tab swaps Exit Sketch <-> New Sketch depending on whether a sketch is being edited.
         ui::setRibbonSketchActive(st.sketchMode->active());
+        // 3D sketch: swaps the Sketch tab's command source to the 3D tool set (see ribbon.cpp).
+        ui::setRibbonSketch3DActive(st.sketch3dMode && st.sketch3dMode->active());
         // [workspace-tabs seam] Drive the per-workspace ribbon filter from the active title-bar
         // workspace so Model shows modeling tools, Simulate shows sim tools, etc. (WIRE_REQUESTS).
         ui::setRibbonWorkspace(static_cast<int>(st.activeWorkspace));

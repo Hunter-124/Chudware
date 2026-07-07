@@ -312,8 +312,13 @@ void Sketch3DMode::exitSketch(AppState& st, bool keep) {
             }
             st.docMirror.resync(st.worker);
         }
-    } else if (keep && isNewEmpty_ && entJson_.empty() && st.docMirror.docId() == docId_) {
-        // A committed but still-empty NEW sketch is noise — delete it on exit.
+    }
+    // A NEW sketch that was never given any content is noise — delete it on exit either way.
+    // Note: the cancel checkpoint above was taken AFTER the empty feature was created (enterNew
+    // adds the feature, then enterForFeature snapshots it), so a discard-revert alone leaves that
+    // empty feature sitting in the tree; this delete cleans it up on both the keep and discard
+    // paths.
+    if (isNewEmpty_ && entJson_.empty() && st.docMirror.docId() == docId_) {
         nlohmann::json op = {{"op", "delete_feature"}, {"id", fid_}};
         st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
     }
@@ -334,6 +339,30 @@ bool Sketch3DMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
     }
     if (!active_) return false;
     if (cmdId == "sketch_exit" || cmdId == "sketch3d_exit") { exitSketch(st, true); return true; }
+    if (cmdId == "sketch3d_cancel") { exitSketch(st, false); return true; }   // ribbon commit cluster ✗
+    // Ribbon tool buttons (Sketch tab, swapped to the "Sketch3D" row set while editing — see
+    // ribbon.cpp/ribbon_def.cpp). Mirror the old floating overlay toolbar's tool-arming behavior.
+    if (cmdId == "sk3d_line")   { resetTool(); tool_ = Sk3Tool::Line;   clearSel(); return true; }
+    if (cmdId == "sk3d_arc")    { resetTool(); tool_ = Sk3Tool::Arc3;   clearSel(); return true; }
+    if (cmdId == "sk3d_spline") { resetTool(); tool_ = Sk3Tool::Spline; clearSel(); return true; }
+    if (cmdId == "sk3d_point")  { resetTool(); tool_ = Sk3Tool::Point;  clearSel(); return true; }
+    if (cmdId == "sk3d_plane_xy")   { setPlanePreset(st, 0); return true; }
+    if (cmdId == "sk3d_plane_xz")   { setPlanePreset(st, 1); return true; }
+    if (cmdId == "sk3d_plane_yz")   { setPlanePreset(st, 2); return true; }
+    if (cmdId == "sk3d_plane_view") { setPlanePreset(st, 3); return true; }
+    if (cmdId == "sk3d_construction") { constructionOn_ = !constructionOn_; return true; }
+    if (cmdId == "sk3d_delete") { deleteSelection(st); return true; }
+    if (cmdId == "sk3d_fix") {
+        for (const auto& h : selHandles_)
+            if (h != "origin") addConstraint(st, {{"type", "fix"}, {"refs", {h}}}, "Fix");
+        for (const auto& id : selEnts_) addConstraint(st, {{"type", "fix"}, {"refs", {id}}}, "Fix");
+        clearSel();
+        return true;
+    }
+    // sk3d_relations has no single well-defined relation without knowing the selection shape — the
+    // contextual buttons (drawConstraintButtons) already cover that from the viewport status strip;
+    // treat the ribbon button as a no-op tool-swallow so it doesn't fall through to "unhandled".
+    if (cmdId == "sk3d_relations") { return true; }
     return false;
 }
 
@@ -923,6 +952,28 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
         }
     }
 
+    // ---- in-progress placed points (spline needs this every frame — it collects 2+ points
+    // before committing, so without a live preview of the chain-so-far nothing is visible until
+    // Enter/double-click; line/arc commit at 2/3 points so the rubber band below already covers
+    // their single pending segment, but draw the chain uniformly for consistency). ----
+    if (tool_ != Sk3Tool::None && toolPts_.size() >= 2) {
+        ImU32 pc = col3(pal.accent, 0.55f);
+        ImVec2 pa, pb;
+        for (size_t i = 0; i + 1 < toolPts_.size(); ++i) {
+            if (worldToScreen(cam, imgMin, vw, vh, toolPts_[i].x, toolPts_[i].y, toolPts_[i].z, pa) &&
+                worldToScreen(cam, imgMin, vw, vh, toolPts_[i + 1].x, toolPts_[i + 1].y,
+                              toolPts_[i + 1].z, pb))
+                dl->AddLine(pa, pb, pc, 2.0f * ui::uiScale);
+        }
+    }
+    if (tool_ != Sk3Tool::None) {
+        for (const auto& p : toolPts_) {
+            ImVec2 pp;
+            if (worldToScreen(cam, imgMin, vw, vh, p.x, p.y, p.z, pp))
+                dl->AddCircleFilled(pp, 3.0f * ui::uiScale, col3(pal.accent, 0.8f));
+        }
+    }
+
     // ---- tool rubber band ----
     if (tool_ != Sk3Tool::None && imgHovered) {
         const Vec3* prev = toolPts_.empty() ? nullptr : &toolPts_.back();
@@ -1074,68 +1125,33 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
 
     dl->PopClipRect();
 
-    // ---- toolbar (glass strip, top-center of the viewport) ----
+    // ---- status/constraint strip (glass strip, top-center of the viewport) ----
+    // The draw-tool set, working-plane presets, construction toggle and Finish/Cancel now live in
+    // the ribbon's Sketch tab (see ribbon.cpp/ribbon_def.cpp — swapped in via
+    // setRibbonSketch3DActive while a sketch3d feature is being edited). What's left here is
+    // genuinely viewport-local: the DOF/status readout, and the selection-contextual constraint
+    // buttons + dimension popup, which need to sit right next to the current selection/cursor.
     {
         ImGui::SetNextWindowPos(ImVec2((imgMin.x + imgMax.x) * 0.5f, imgMin.y + 12.0f * ui::uiScale),
                                 ImGuiCond_Always, ImVec2(0.5f, 0.0f));
         ImGui::SetNextWindowBgAlpha(0.85f);
-        if (ImGui::Begin("##sk3toolbar", nullptr,
+        if (ImGui::Begin("##sk3status", nullptr,
                          ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
                              ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
                              ImGuiWindowFlags_NoNav)) {
-            auto toolBtn = [&](const char* label, Sk3Tool t) {
-                bool on = tool_ == t;
-                if (on) ImGui::PushStyleColor(ImGuiCol_Button,
-                                              ImVec4(ui::palette.accent[0], ui::palette.accent[1],
-                                                     ui::palette.accent[2], 0.65f));
-                if (ImGui::SmallButton(label)) {
-                    if (on) resetTool();
-                    else { resetTool(); tool_ = t; clearSel(); }
-                }
-                if (on) ImGui::PopStyleColor();
-                ImGui::SameLine();
-            };
             ImGui::TextDisabled("3D Sketch");
             ImGui::SameLine();
-            toolBtn("Select", Sk3Tool::None);
-            toolBtn("Line", Sk3Tool::Line);
-            toolBtn("Arc", Sk3Tool::Arc3);
-            toolBtn("Spline", Sk3Tool::Spline);
-            toolBtn("Point", Sk3Tool::Point);
-            bool con = constructionOn_;
-            if (con) ImGui::PushStyleColor(ImGuiCol_Button,
-                                           ImVec4(ui::palette.accent[0], ui::palette.accent[1],
-                                                  ui::palette.accent[2], 0.65f));
-            if (ImGui::SmallButton("Constr.")) constructionOn_ = !constructionOn_;
-            if (con) ImGui::PopStyleColor();
-            ImGui::SameLine();
             ImGui::TextDisabled("|");
             ImGui::SameLine();
-            const char* planeNames[4] = {"XY", "XZ", "YZ", "View"};
-            for (int i = 0; i < 4; ++i) {
-                bool on = wpPreset_ == i;
-                if (on) ImGui::PushStyleColor(ImGuiCol_Button,
-                                              ImVec4(ui::palette.accent[0], ui::palette.accent[1],
-                                                     ui::palette.accent[2], 0.65f));
-                if (ImGui::SmallButton(planeNames[i])) setPlanePreset(st, i);
-                if (on) ImGui::PopStyleColor();
-                ImGui::SameLine();
-            }
-            ImGui::TextDisabled("(Tab)");
-            ImGui::SameLine();
-            ImGui::TextDisabled("|");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Finish")) { ImGui::End(); exitSketch(st, true); return; }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Cancel")) { ImGui::End(); exitSketch(st, false); return; }
-
-            // second row: contextual constraints for the current selection + status
-            if (!selEnts_.empty() || !selHandles_.empty()) drawConstraintButtons(st);
             std::string sl = statusLine();
             if (nWires_ > 0) sl += "   wires: " + std::to_string(nWires_);
             const float* role = status_ == "over" || !converged_ ? ui::palette.statusErr
                               : status_ == "full" ? ui::palette.statusOk : ui::palette.sketchUnder;
             ImGui::TextColored(ImVec4(role[0], role[1], role[2], 1), "%s", sl.c_str());
+
+            // contextual constraints for the current selection (needs the live selection, so it
+            // stays viewport-local rather than a static ribbon row set)
+            if (!selEnts_.empty() || !selHandles_.empty()) drawConstraintButtons(st);
             drawDimPopup(st);
         }
         ImGui::End();

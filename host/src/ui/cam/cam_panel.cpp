@@ -618,14 +618,27 @@ void drawCamTreeBody(AppState& st) {
 
     // Leaf row helper: FM pill + 16px icon + selectable label. Returns clicked; double-click
     // opens the detail editor.
+    // Draw one leaf row's selectable+label against the SAME frame-height rect the pill/icon use.
+    // The Selectable is sized to GetFrameHeight() (matching fmRowPill's rowMax) and its text is
+    // vertically centered; it is NOT given `selected` — selection is painted by fmRowPill alone
+    // (a `selected` Selectable would paint ImGui's default header rect at the text-height bb, on
+    // top of the full-height glass card, which is the offset/glitching band the user reported).
+    auto leafSelectable = [&](const std::string& label) -> bool {
+        const float rowH = ImGui::GetFrameHeight();
+        ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
+        bool clicked = ImGui::Selectable(label.c_str(), false,
+                                         ImGuiSelectableFlags_AllowDoubleClick,
+                                         ImVec2(0.0f, rowH));
+        ImGui::PopStyleVar();
+        return clicked;
+    };
     auto leafRow = [&](const char* id, const char* icon, const char* fb,
                        const std::string& label, bool selected) -> bool {
         ImGui::PushID(id);
         FmRowRect rr = fmRowPill(selected);
         fmTreeIcon(icon, fb);
         ImGui::SameLine(0, 4.0f * S);
-        bool clicked = ImGui::Selectable(label.c_str(), selected,
-                                         ImGuiSelectableFlags_AllowDoubleClick);
+        bool clicked = leafSelectable(label);
         const bool dbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0);
         fmRowPillEnd(rr, selected);
         ImGui::PopID();
@@ -676,7 +689,45 @@ void drawCamTreeBody(AppState& st) {
         } else {
             lbl += " — (none)";
         }
-        if (leafRow("cam_stock", "extrude", "K", lbl, g.selKind == 3)) g.selKind = 3;
+        // Inlined (not leafRow) so the icon slot draws a clean stock-billet glyph instead of the
+        // "extrude" atlas name falling through to the bare "K" text fallback. The billet replicates
+        // treeIcon()'s geometry exactly (reserve a frame-height Dummy, paint centered in it) so it
+        // shares the size/baseline of the gear/csys glyphs on the neighbouring rows.
+        const bool stockSel = (g.selKind == 3);
+        ImGui::PushID("cam_stock");
+        FmRowRect rr = fmRowPill(stockSel);
+        {
+            const float px     = 16.0f * S;
+            const float insetX = ImGui::GetStyle().FramePadding.x;
+            const float rowH   = ImGui::GetFrameHeight();
+            ImVec2 p0 = ImGui::GetCursorScreenPos();
+            ImGui::Dummy(ImVec2(insetX + px, rowH));
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            // Match the secondary-ink weight of the atlas row glyphs without reaching into
+            // feature_tree.cpp's (file-static) fmSurf(): the current Text colour at ~0.85 alpha.
+            ImVec4 tc = ImGui::GetStyleColorVec4(ImGuiCol_Text); tc.w *= 0.85f;
+            const ImU32 ink = ImGui::ColorConvertFloat4ToU32(tc);
+            const float th = std::max(1.0f, 1.2f * S);
+            // billet box: a front face + a back face pushed up-right, joined at the 4 corners.
+            const float x0 = p0.x + insetX, y0 = p0.y + (rowH - px) * 0.5f;
+            const float d  = px * 0.28f;                 // isometric depth offset
+            const float fw = px - d, fh = px - d;        // front-face extent (leaves room for depth)
+            ImVec2 fTL(x0, y0 + d),        fBR(x0 + fw, y0 + d + fh);
+            ImVec2 fTR(fBR.x, fTL.y),      fBL(fTL.x, fBR.y);
+            ImVec2 bTL(fTL.x + d, fTL.y - d), bTR(fTR.x + d, fTR.y - d), bBR(fBR.x + d, fBR.y - d);
+            dl->AddRect(fTL, fBR, ink, 0.0f, 0, th);                 // front face
+            dl->AddLine(fTL, bTL, ink, th);                          // top-left edge
+            dl->AddLine(fTR, bTR, ink, th);                          // top-right edge
+            dl->AddLine(fBR, bBR, ink, th);                          // bottom-right edge
+            dl->AddLine(bTL, bTR, ink, th);                          // back top edge
+            dl->AddLine(bTR, bBR, ink, th);                          // back right edge
+        }
+        ImGui::SameLine(0, 4.0f * S);
+        if (leafSelectable(lbl)) g.selKind = 3;
+        const bool stockDbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0);
+        fmRowPillEnd(rr, stockSel);
+        ImGui::PopID();
+        if (stockDbl) camTreeOpenDetail();
     }
 
     // ---- Machining Setups (WCS/machine) + their operations -------------------------------------
@@ -711,8 +762,7 @@ void drawCamTreeBody(AppState& st) {
                 FmRowRect orr = fmRowPill(opSel);
                 fmTreeIcon(("cam_" + o.type).c_str(), "o", 16.0f, o.suppressed ? 0.45f : 1.0f);
                 ImGui::SameLine(0, 4.0f * S);
-                if (ImGui::Selectable(ol.c_str(), opSel,
-                                      ImGuiSelectableFlags_AllowDoubleClick)) {
+                if (leafSelectable(ol)) {
                     g.selKind = 5; g.selSetup = si; g.selOp = oi; g.loadedOpFor = -1;
                 }
                 const bool dbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0);

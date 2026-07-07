@@ -233,6 +233,14 @@ static void clearTransientResult(Study& s) {
     s.cd = 0.0;
     s.frontalMm2 = 0.0;
     s.solverNotes.clear();
+    // Motion study transient results.
+    s.motionHasResult = false;
+    s.motionPlaying   = false;
+    s.motionFrame     = 0;
+    s.motionLastTick  = -1.0;
+    s.motionTrajectory = nlohmann::json::array();
+    s.motionBodyNames.clear();
+    s.motionDriverUnit.clear();
 }
 
 std::string SimWell::label() const {
@@ -1781,6 +1789,7 @@ void SimManager::syncResultView(AppState& st) {
 
 void SimManager::tick(AppState& st) {
     syncResultView(st);   // keep the viewport in step with the result/model view (every frame, cheap)
+    tickMotion(st);       // advance motion playback frame if playing
     if (!st.simClient) return;
     auto* sim = st.simClient;
     auto& job = sim->job();
@@ -1945,6 +1954,7 @@ void SimManager::tick(AppState& st) {
 // unmet prerequisite when returning false. Flow / Thermal are always ready (no
 // material or fixtures required by the solver — the flow pipeline handles them).
 static bool studyReady(const Study& s, std::string& blocker) {
+    if (s.type == StudyType::Motion) return true;  // Motion only needs a doc + optional mate-id
     if (isFlowFamily(s.type)) return true;
     if (s.materialKey.empty()) {
         blocker = "Material required — pick a material before running.";
@@ -2015,6 +2025,7 @@ void SimManager::drawTreeBody(AppState& st) {
             { StudyType::Modal,   "Frequency", "Natural frequencies and mode shapes." },
             { StudyType::Flow,    "Flow",      "External aerodynamics: drag, lift and streamlines." },
             { StudyType::Thermal, "Thermal",   "Heat transfer via OpenFOAM convection / CHT." },
+            { StudyType::Motion,  "Motion",    "Drive a dimensional mate, play back body trajectory." },
         };
         pushCardText();  // popup fills with theme glassBg — re-pair the pane's adaptive text
         ImGui::TextDisabled("Select study type");
@@ -3217,6 +3228,15 @@ void SimManager::drawFlowForm(AppState& st, Study& s) {
 }
 
 void SimManager::drawResultControls(AppState& st, Study& s) {
+    // Motion results: timeline + trace plot — no colormap, no metric table.
+    if (s.type == StudyType::Motion) {
+        float rH = ImGui::GetContentRegionAvail().y - 50.0f * ui::uiScale;
+        ImGui::BeginChild("##motionresults", ImVec2(0, std::max(rH, 80.0f * ui::uiScale)), false);
+        drawMotionResults(st, s);
+        ImGui::EndChild();
+        return;
+    }
+
     if (!s.hasResult) {
         ImGui::TextWrapped("No results yet. Set up the study and press Run.");
         return;
@@ -3434,6 +3454,12 @@ void SimManager::drawResultControls(AppState& st, Study& s) {
 void SimManager::drawStudyChecklist(AppState& st, Study& s) {
     const float S = ui::uiScale;
     const auto& pal = ui::palette;
+
+    // ---------- Motion: banner + motion form, no structural steps ----------
+    if (s.type == StudyType::Motion) {
+        drawMotionForm(st, s);
+        return;
+    }
 
     // ---------- Flow / Thermal: banner + flow form, no structural steps ----------
     if (isFlowFamily(s.type)) {
@@ -3695,14 +3721,470 @@ void SimManager::drawForm(AppState& st, Study& s) {
     }
 }
 
-// ---------- Motion study stub ----------
-// Full implementation delivered by the sim-kinematics agent (T-SIM3/T-SIM4).
-// Stub prevents the undefined-reference linker error that blocks every other agent's build.
-void SimManager::runMotion(AppState& /*st*/, Study& s) {
-    s.motionHasResult = false;
+// ============================================================ Motion study (T-SIM3/T-SIM4)
+//
+// Motion studies drive ONE dimensional assembly mate across [start, stop] in `steps` samples.
+// simulate_motion is a synchronous worker RPC (same path as sim_mesh / doc_export_step) that
+// returns the full per-body world-transform trajectory in one shot.  The result is cached in
+// the Study and played back on the main thread by tickMotion + applyMotionFrame, which CPU-
+// transforms the base-pose vertex positions and re-uploads via Renderer::setMeshes().
+//
+// Engine-side solve path: worker_router dispatches "simulate_motion" -> engine.assemble.motion
+// which calls solve_mates() at each driver step.  No simClient / sim worker involved.
+
+// ---------- runMotion -------------------------------------------------------------------
+
+void SimManager::runMotion(AppState& st, Study& s) {
+    if (!st.docMirror.hasDoc()) {
+        st.toast(ui::ToastLevel::Warn, "Open an assembly with mates before running Motion");
+        return;
+    }
+
+    // Build RPC params.
+    nlohmann::json params = {
+        {"doc_id", st.docMirror.docId()},
+        {"start",  s.motionStart},
+        {"stop",   s.motionStop},
+        {"steps",  std::max(2, std::min(s.motionSteps, 120))},
+        {"check_interference", s.motionCheckInterference},
+    };
+    if (!s.motionMateId.empty()) params["mate_id"] = s.motionMateId;
+
+    st.status = "Motion: solving\xe2\x80\xa6";
+    st.statusKind = 0;
+
+    nlohmann::json result;
+    std::string err;
+    const bool ok = st.worker.call("simulate_motion", params, result, err, 120000);
+    if (!ok || result.contains("code")) {
+        const std::string msg = result.contains("message") ? result.value("message", err) : err;
+        st.addLog("[motion] simulate_motion failed: " + msg);
+        st.toast(ui::ToastLevel::Error, msg.empty() ? "Motion solve failed" : msg);
+        s.summary = "Motion failed: " + msg;
+        return;
+    }
+    if (!result.value("ok", false)) {
+        const std::string msg = result.value("error", std::string("motion error"));
+        st.addLog("[motion] simulate_motion error: " + msg);
+        st.toast(ui::ToastLevel::Error, msg);
+        s.summary = "Motion failed: " + msg;
+        return;
+    }
+
+    // Parse trajectory.
+    s.motionTrajectory = result.value("trajectory", nlohmann::json::array());
+    s.motionDriverUnit = "deg";
+    if (result.contains("driver") && result["driver"].is_object())
+        s.motionDriverUnit = result["driver"].value("unit", std::string("deg"));
+    if (result.contains("mate_id") && result["mate_id"].is_string())
+        s.motionMateId = result["mate_id"].get<std::string>();
+
+    const int nFrames = (int)s.motionTrajectory.size();
+    if (nFrames == 0) {
+        st.toast(ui::ToastLevel::Warn, "Motion: trajectory returned no frames");
+        s.summary = "Motion: no trajectory frames";
+        return;
+    }
+
+    // Cache the base AICM tessellation so applyMotionFrame can re-upload transformed geometry.
+    motionDocMesh_ = render::DocMesh{};
+    {
+        std::string aicm, le;
+        if (!st.docMirror.activate(st.worker, st.docMirror.docId(), aicm, le) || aicm.empty()) {
+            st.addLog("[motion] could not get AICM for base mesh: " + le);
+        } else {
+            std::string pe;
+            if (!render::loadAicmFile(aicm, motionDocMesh_, pe) && !pe.empty())
+                st.addLog("[motion] AICM parse warning: " + pe);
+        }
+    }
+
+    // Build body-name order from frame 0.
+    s.motionBodyNames.clear();
+    if (!s.motionTrajectory.empty() && s.motionTrajectory[0].contains("bodies")) {
+        for (const auto& b : s.motionTrajectory[0]["bodies"])
+            if (b.contains("component") && b["component"].is_string())
+                s.motionBodyNames.push_back(b["component"].get<std::string>());
+    }
+    s.motionPlotBody = 0;
+
+    buildMotionTrace(s);
+
+    s.motionHasResult = true;
+    s.hasResult       = true;
     s.motionPlaying   = false;
     s.motionFrame     = 0;
-    s.summary         = "Motion simulation: coming online (T-SIM3).";
+    s.motionLastTick  = -1.0;
+
+    // Interference note.
+    std::string ifNote;
+    if (s.motionCheckInterference && result.contains("interference")) {
+        const auto& inf = result["interference"];
+        if (inf.value("checked", false)) {
+            int col = inf.value("first_collision_step", -1);
+            char buf[80];
+            if (col >= 0) { std::snprintf(buf, sizeof(buf), " | first collision step %d", col); ifNote = buf; }
+            else ifNote = " | no collisions";
+        }
+    }
+    char hdr[160];
+    std::snprintf(hdr, sizeof(hdr), "Motion: %d frames, %.1f\xe2\x80\x93%.1f %s%s",
+                  nFrames, s.motionStart, s.motionStop, s.motionDriverUnit.c_str(), ifNote.c_str());
+    s.summary = hdr;
+
+    applyMotionFrame(st, s, 0);
+
+    node_         = SimNode::Results;
+    resultShown_  = true;
+    shownStudyId_ = s.id;
+    st.colormapOn = false;
+    if (st.renderer) st.renderer->setColormapMode(false);
+    st.legendOn   = false;
+
+    st.status = "Motion ready — " + s.summary;
+    st.addLog("[motion] " + s.summary);
+    st.toast(ui::ToastLevel::Info, hdr);
+}
+
+// ---------- buildMotionTrace -----------------------------------------------------------
+// Validates the trajectory parse; per-body traces are derived on demand in drawMotionResults.
+
+void SimManager::buildMotionTrace(Study& s) {
+    // Validate that each frame's bodies array is parseable: this surfaces JSON shape errors once
+    // at run time rather than silently in the draw loop.
+    for (const auto& frame : s.motionTrajectory) {
+        if (!frame.contains("bodies") || !frame["bodies"].is_array()) continue;
+        for (const auto& b : frame["bodies"]) {
+            if (!b.contains("transform") || !b["transform"].is_array()) continue;
+            if (b["transform"].size() < 16) continue;
+            // One read to prove the values parse without throwing.
+            (void)b["transform"][0].get<double>();
+        }
+    }
+    // motionBodyNames is already set by runMotion before this call.
+}
+
+// ---------- applyMotionFrame -----------------------------------------------------------
+// CPU-transforms the cached base-pose vertex positions by each body's world transform from
+// the trajectory, then re-uploads via Renderer::setMeshes().
+// Transform convention from simulate_motion: each body["transform"] is a row-major 4×4 float
+// list where row i, col j = T[i*4+j].  Translation = T[3], T[7], T[11].
+
+void SimManager::applyMotionFrame(AppState& st, Study& s, int frame) {
+    if (!st.renderer) return;
+    if (frame < 0 || frame >= (int)s.motionTrajectory.size()) return;
+    const auto& frameJ = s.motionTrajectory[frame];
+    if (!frameJ.contains("bodies") || !frameJ["bodies"].is_array()) return;
+
+    // Build name -> 4×4 row-major transform map.
+    struct Mat4r { float m[16]; };
+    std::map<std::string, Mat4r> bodyXf;
+    for (const auto& b : frameJ["bodies"]) {
+        if (!b.contains("component") || !b.contains("transform")) continue;
+        const auto& xf = b["transform"];
+        if (!xf.is_array() || xf.size() < 16) continue;
+        Mat4r M;
+        for (int i = 0; i < 16; ++i) M.m[i] = (float)xf[i].get<double>();
+        bodyXf[b["component"].get<std::string>()] = M;
+    }
+
+    // Build PartMesh list: transform each body's vertices; unknowns stay at identity.
+    std::vector<Renderer::PartMesh> parts;
+    parts.reserve(motionDocMesh_.bodies.size());
+
+    for (const auto& body : motionDocMesh_.bodies) {
+        Renderer::PartMesh pm;
+        pm.body_id   = body.body_id;
+        pm.color[0]  = body.color[0];
+        pm.color[1]  = body.color[1];
+        pm.color[2]  = body.color[2];
+        pm.metallic  = body.metallic;
+        pm.roughness = body.roughness;
+
+        for (const auto& f : body.faces)
+            pm.faces.push_back({f.face_id, f.first_tri, f.tri_count});
+
+        const uint32_t nv = body.n_verts;
+        Mesh mesh;
+        mesh.indices = body.idx;
+        mesh.positions.resize(nv * 3);
+        mesh.normals.resize(nv * 3, 0.0f);
+
+        auto it = bodyXf.find(body.name);
+        if (it != bodyXf.end()) {
+            const float* M = it->second.m;
+            for (uint32_t vi = 0; vi < nv; ++vi) {
+                const float* p = &body.pos[vi * 3];
+                mesh.positions[vi*3+0] = M[0]*p[0] + M[1]*p[1] + M[2]*p[2] + M[3];
+                mesh.positions[vi*3+1] = M[4]*p[0] + M[5]*p[1] + M[6]*p[2] + M[7];
+                mesh.positions[vi*3+2] = M[8]*p[0] + M[9]*p[1] + M[10]*p[2] + M[11];
+                if (!body.nrm.empty()) {
+                    const float* n = &body.nrm[vi * 3];
+                    mesh.normals[vi*3+0] = M[0]*n[0] + M[1]*n[1] + M[2]*n[2];
+                    mesh.normals[vi*3+1] = M[4]*n[0] + M[5]*n[1] + M[6]*n[2];
+                    mesh.normals[vi*3+2] = M[8]*n[0] + M[9]*n[1] + M[10]*n[2];
+                } else {
+                    mesh.normals[vi*3+1] = 1.0f;  // default up normal
+                }
+            }
+        } else {
+            // No transform for this body — copy as-is.
+            for (uint32_t vi = 0; vi < nv; ++vi) {
+                const float* p = &body.pos[vi * 3];
+                mesh.positions[vi*3+0] = p[0];
+                mesh.positions[vi*3+1] = p[1];
+                mesh.positions[vi*3+2] = p[2];
+                if (!body.nrm.empty()) {
+                    mesh.normals[vi*3+0] = body.nrm[vi*3];
+                    mesh.normals[vi*3+1] = body.nrm[vi*3+1];
+                    mesh.normals[vi*3+2] = body.nrm[vi*3+2];
+                } else {
+                    mesh.normals[vi*3+1] = 1.0f;
+                }
+            }
+        }
+        pm.mesh = std::move(mesh);
+        parts.push_back(std::move(pm));
+    }
+
+    // Freeze camera framing so the view doesn't jump on each frame advance.
+    st.renderer->setFramingFrozen(true);
+    st.renderer->setMeshes(parts);
+    st.renderer->setFramingFrozen(false);
+}
+
+// ---------- tickMotion -----------------------------------------------------------------
+
+void SimManager::tickMotion(AppState& st) {
+    if (sel_ < 0 || sel_ >= (int)studies_.size()) return;
+    Study& s = studies_[sel_];
+    if (s.type != StudyType::Motion || !s.motionHasResult || !s.motionPlaying) return;
+
+    const int nFrames = (int)s.motionTrajectory.size();
+    if (nFrames <= 1) return;
+
+    const double now = ImGui::GetTime();
+    if (s.motionLastTick < 0.0) { s.motionLastTick = now; return; }
+    const double elapsed = now - s.motionLastTick;
+    const double frameDur = 1.0 / std::max(1.0f, s.motionFps);
+    if (elapsed < frameDur) return;
+
+    s.motionLastTick = now;
+    s.motionFrame++;
+    if (s.motionFrame >= nFrames) {
+        if (s.motionLoop) s.motionFrame = 0;
+        else { s.motionFrame = nFrames - 1; s.motionPlaying = false; return; }
+    }
+    applyMotionFrame(st, s, s.motionFrame);
+}
+
+// ---------- drawMotionForm (setup pane) ------------------------------------------------
+
+void SimManager::drawMotionForm(AppState& st, Study& s) {
+    const float S = ui::uiScale;
+
+    drawStudyTypeBanner(s.type,
+        "Motion study: drives one dimensional assembly mate across a range, re-solves "
+        "the mate graph at each step, and plays back the per-body trajectory in the viewport.");
+
+    ImGui::Spacing();
+    ImGui::PushFont(st.fonts.medium);
+    ImGui::TextUnformatted("Driven mate");
+    ImGui::PopFont();
+
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    char mateIdBuf[128];
+    std::strncpy(mateIdBuf, s.motionMateId.c_str(), sizeof(mateIdBuf) - 1);
+    mateIdBuf[sizeof(mateIdBuf)-1] = '\0';
+    if (ImGui::InputText("##motionMateId", mateIdBuf, sizeof(mateIdBuf)))
+        s.motionMateId = mateIdBuf;
+    simTip("Mate ID to drive (e.g. \"m3\"). Leave blank to auto-pick the single drivable mate.");
+
+    ImGui::Spacing();
+    ImGui::PushFont(st.fonts.medium);
+    ImGui::TextUnformatted("Driver range");
+    ImGui::PopFont();
+
+    ImGui::SetNextItemWidth(100.0f * S);
+    if (ImGui::DragFloat("Start##ms", &s.motionStart, 1.0f, -720.0f, 720.0f, "%.1f"))
+        persist(st, s);
+    simTip("Driver start value (deg for angle mates, mm for distance mates).");
+    ImGui::SameLine(0, 12.0f * S);
+    ImGui::SetNextItemWidth(100.0f * S);
+    if (ImGui::DragFloat("Stop##ms", &s.motionStop, 1.0f, -720.0f, 720.0f, "%.1f"))
+        persist(st, s);
+    simTip("Driver stop value.");
+
+    int steps = s.motionSteps;
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::SliderInt("Steps", &steps, 2, 120)) { s.motionSteps = steps; persist(st, s); }
+    simTip("Number of frames in the trajectory (2..120).");
+
+    ImGui::Spacing();
+    ImGui::PushFont(st.fonts.medium);
+    ImGui::TextUnformatted("Playback");
+    ImGui::PopFont();
+
+    ImGui::SetNextItemWidth(80.0f * S);
+    if (ImGui::DragFloat("FPS##ms", &s.motionFps, 0.5f, 1.0f, 120.0f, "%.0f"))
+        persist(st, s);
+    simTip("Playback speed in frames per second.");
+    ImGui::SameLine(0, 16.0f * S);
+    if (ImGui::Checkbox("Loop##ms", &s.motionLoop)) persist(st, s);
+    simTip("Wrap playback back to frame 0 after the last frame.");
+
+    ImGui::Spacing();
+    if (ImGui::Checkbox("Check interference at each step", &s.motionCheckInterference))
+        persist(st, s);
+    simTip("Test for body-body intersection at each trajectory step (slower solve).");
+}
+
+// ---------- drawMotionTimeline (transport bar + scrub) --------------------------------
+
+void SimManager::drawMotionTimeline(AppState& st, Study& s) {
+    if (!s.motionHasResult) return;
+    const int nFrames = (int)s.motionTrajectory.size();
+    if (nFrames == 0) return;
+    const float S = ui::uiScale;
+    const auto& pal = ui::palette;
+
+    ImGui::Spacing();
+    const float bW = 28.0f * S, bH = 24.0f * S;
+
+    if (ImGui::Button("|<##mt", ImVec2(bW, bH))) {
+        s.motionPlaying = false; s.motionFrame = 0; applyMotionFrame(st, s, 0);
+    } simTip("Rewind to first frame.");
+    ImGui::SameLine(0, 2.0f * S);
+    if (ImGui::Button("<<##mt", ImVec2(bW, bH))) {
+        s.motionPlaying = false;
+        s.motionFrame = std::max(0, s.motionFrame - 1);
+        applyMotionFrame(st, s, s.motionFrame);
+    } simTip("Previous frame.");
+    ImGui::SameLine(0, 2.0f * S);
+    if (ImGui::Button(s.motionPlaying ? "||##mt" : ">##mt", ImVec2(bW, bH))) {
+        s.motionPlaying = !s.motionPlaying; s.motionLastTick = -1.0;
+    } simTip(s.motionPlaying ? "Pause" : "Play");
+    ImGui::SameLine(0, 2.0f * S);
+    if (ImGui::Button(">>##mt", ImVec2(bW, bH))) {
+        s.motionPlaying = false;
+        s.motionFrame = std::min(nFrames - 1, s.motionFrame + 1);
+        applyMotionFrame(st, s, s.motionFrame);
+    } simTip("Next frame.");
+    ImGui::SameLine(0, 2.0f * S);
+    if (ImGui::Button(">|##mt", ImVec2(bW, bH))) {
+        s.motionPlaying = false; s.motionFrame = nFrames - 1;
+        applyMotionFrame(st, s, s.motionFrame);
+    } simTip("Jump to last frame.");
+
+    // Driver value label.
+    float driverVal = s.motionStart;
+    if (s.motionFrame < nFrames) {
+        const auto& fj = s.motionTrajectory[s.motionFrame];
+        if (fj.contains("value") && fj["value"].is_number())
+            driverVal = (float)fj["value"].get<double>();
+    }
+    char info[64];
+    std::snprintf(info, sizeof(info), "  %d/%d  %.1f %s",
+                  s.motionFrame + 1, nFrames, driverVal, s.motionDriverUnit.c_str());
+    ImGui::SameLine(0, 6.0f * S);
+    ImGui::TextUnformatted(info);
+
+    // Scrub slider.
+    int frame = s.motionFrame;
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::SliderInt("##motionScrub", &frame, 0, nFrames - 1, "")) {
+        s.motionFrame = frame; s.motionPlaying = false;
+        applyMotionFrame(st, s, frame);
+    } simTip("Drag to scrub to any frame.");
+
+    // Per-frame status badges.
+    if (s.motionFrame < nFrames) {
+        const auto& fj = s.motionTrajectory[s.motionFrame];
+        if (fj.contains("converged") && !fj["converged"].get<bool>()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(pal.statusWarn[0], pal.statusWarn[1], pal.statusWarn[2], 1.0f));
+            ImGui::TextUnformatted("  ! Solver did not converge at this frame");
+            ImGui::PopStyleColor();
+        }
+        if (fj.contains("interference") && fj["interference"].get<bool>()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1.0f));
+            ImGui::TextUnformatted("  ! Interference at this frame");
+            ImGui::PopStyleColor();
+        }
+    }
+}
+
+// ---------- drawMotionResults (called from drawResultControls) -------------------------
+
+void SimManager::drawMotionResults(AppState& st, Study& s) {
+    if (!s.motionHasResult) {
+        ImGui::TextWrapped("Run the motion study to generate a trajectory.");
+        return;
+    }
+    const float S = ui::uiScale;
+    const int nFrames = (int)s.motionTrajectory.size();
+
+    ImGui::TextWrapped("%s", s.summary.c_str());
+    ImGui::Spacing();
+
+    drawMotionTimeline(st, s);
+    ImGui::Spacing();
+
+    // Per-body position trace (|translation| vs frame index).
+    if (!s.motionBodyNames.empty()) {
+        ImGui::PushFont(st.fonts.medium);
+        ImGui::TextUnformatted("Position trace");
+        ImGui::PopFont();
+
+        const int nBodies = (int)s.motionBodyNames.size();
+        if (nBodies > 1) {
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::BeginCombo("##motionPlotBody",
+                    s.motionPlotBody < nBodies ? s.motionBodyNames[s.motionPlotBody].c_str() : "(none)")) {
+                for (int i = 0; i < nBodies; ++i) {
+                    bool sel2 = (i == s.motionPlotBody);
+                    if (ImGui::Selectable(s.motionBodyNames[i].c_str(), sel2)) s.motionPlotBody = i;
+                    if (sel2) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            simTip("Body whose position magnitude to plot vs frame.");
+        }
+
+        const std::string& plotBodyName = (s.motionPlotBody < nBodies)
+                                          ? s.motionBodyNames[s.motionPlotBody] : std::string();
+        std::vector<float> trace;
+        trace.reserve(nFrames);
+        for (const auto& frame : s.motionTrajectory) {
+            float mag = 0.0f;
+            if (frame.contains("bodies")) {
+                for (const auto& b : frame["bodies"]) {
+                    if (!b.contains("component") || b["component"].get<std::string>() != plotBodyName) continue;
+                    if (!b.contains("transform") || b["transform"].size() < 16) break;
+                    float tx = (float)b["transform"][3].get<double>();
+                    float ty = (float)b["transform"][7].get<double>();
+                    float tz = (float)b["transform"][11].get<double>();
+                    mag = std::sqrt(tx*tx + ty*ty + tz*tz);
+                    break;
+                }
+            }
+            trace.push_back(mag);
+        }
+        if (!trace.empty()) {
+            const float plotH = 60.0f * S;
+            ImGui::PlotLines("##motiontrace", trace.data(), (int)trace.size(), 0,
+                             "|pos| (mm)", FLT_MAX, FLT_MAX, ImVec2(-FLT_MIN, plotH));
+            // Vertical cursor at current frame.
+            if (nFrames > 1) {
+                ImVec2 rMin = ImGui::GetItemRectMin(), rMax = ImGui::GetItemRectMax();
+                float xCur = rMin.x + (rMax.x - rMin.x) * ((float)s.motionFrame / (float)(nFrames-1));
+                ImGui::GetWindowDrawList()->AddLine(
+                    ImVec2(xCur, rMin.y), ImVec2(xCur, rMax.y),
+                    IM_COL32(255, 200, 80, 200), 1.5f * S);
+            }
+        }
+    }
 }
 
 }  // namespace ui

@@ -341,6 +341,8 @@ private:
     void drawMotionForm(AppState& st, Study& s);
     // Timeline transport bar (rewind / step-back / play-pause / step-fwd / scrub slider).
     void drawMotionTimeline(AppState& st, Study& s);
+    // Full results panel for a completed motion study (timeline + trace plot).
+    void drawMotionResults(AppState& st, Study& s);
     // Advance the playback frame on the main thread (called from tick()).
     void tickMotion(AppState& st);
     nlohmann::json facePointsFor(AppState& st, const nlohmann::json& selector, std::string& err);

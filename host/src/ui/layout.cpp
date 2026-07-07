@@ -350,6 +350,28 @@ void drawLeftPane(AppState& st,
         : 0;
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
+    // [workspace-tabs seam] Simulate workspace: show ONLY the simulation setup tree.
+    // Hunter hard requirement: no feature/model tree, no Explorer/Configurations tabs.
+    // Entire tab strip + normal body is suppressed; only SimManager::drawTreeBody runs,
+    // styled to fill the full column width with the same glass row discipline.
+    if (st.activeWorkspace == AppState::Workspace::Simulate && st.simManager) {
+        const float S = ui::uiScale;
+        ImGui::Dummy(ImVec2(0, 4.0f * S));
+        ImGui::PushFont(st.fonts.medium);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted("Simulation");
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * S, 4.0f * S));
+        st.simManager->drawTreeBody(st);
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();  // ImGuiCol_Text (surf.textPrimary)
+        ImGui::End();
+        return;
+    }
+
     // Collapse chevron — a persistent glass CHIP parked at the column's top-right corner, on the
     // same top row as the horizontal icon rail (fix 1) but reserved out of its width (chevRsv
     // below) so the two never overlap. A resting glass background (not hover-only) makes it read as an

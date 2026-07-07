@@ -67,15 +67,48 @@ static const char* kTabIcons[] = {
 static_assert(sizeof(kTabIcons) / sizeof(kTabIcons[0]) == kRibbonTabCount,
               "kTabIcons must stay parallel to kRibbonTabs");
 
-// W17: in a Drawing doc the ribbon swaps to the two contextual drawing tabs ONLY (the
-// mechanical/sim/pcb tabs are 3D-doc context and would do nothing on a sheet). Outside a
-// drawing the two drawing tabs stay hidden.
+// Forward-declared here; defined after drawRibbon's local state block (~line 330).
+static int s_workspace = 0;
+
+// W17 + per-workspace: control which tabs appear in the ribbon for the current workspace.
+//
+// Tab index → name map (matches kRibbonTabs):
+//   0=Features, 1=Sketch, 2=Evaluate, 3=Simulation, 4=Assembly, 5=Sheet Metal,
+//   6=Weldments, 7=PCB, 8=Surfaces, 9=View Layout, 10=Annotation, 11=Appearance, 12=Manufacture
+//
+// Workspace enum (AppState::Workspace): Model=0, Drawing=1, Simulate=2, Electronics=3,
+//   Manufacture=4, PLM=5, PartsLibrary=6, AI=7
+//
+// PLM/PartsLibrary/AI: ribbon collapsed to 0 height upstream — this function is never reached.
+// Drawing workspace: contextual tabs only (View Layout 9, Annotation 10, Sketch 1).
+//   Within it the bools still control contextual sub-visibility (sketch-vs-sheet).
+// Simulate workspace: Simulation(3) + Reference shared group (added as sim-tab rows in ribbon_def).
+// Electronics workspace: PCB tab(7) only.
+// Manufacture workspace: Manufacture tab(12) only.
+// Model workspace (default): Features/Sketch/Evaluate/Assembly/Surfaces/Sheet Metal/Weldments/
+//   Appearance — NO sim/cam/ecad unless the legacy bools also say yes.
 static bool ribbon_tabVisible(int tab, bool showSimulationTools, bool showPcbTools,
                               bool showDrawingTools) {
-    if (showDrawingTools) return tab == 9 || tab == 10;  // View Layout, Annotation
-    if (tab == 9 || tab == 10) return false;
-    if (tab == 3) return showSimulationTools;
-    if (tab == 7) return showPcbTools;
+    // Drawing workspace (or Drawing doc override): show View Layout, Annotation, Sketch only.
+    if (showDrawingTools || s_workspace == 1 /*Drawing*/) {
+        return tab == 9 || tab == 10 || tab == 1;
+    }
+
+    // Simulate workspace: Simulation tab only.
+    if (s_workspace == 2 /*Simulate*/) return tab == 3;
+
+    // Electronics workspace: PCB tab only.
+    if (s_workspace == 3 /*Electronics*/) return tab == 7;
+
+    // Manufacture workspace: Manufacture tab only.
+    if (s_workspace == 4 /*Manufacture*/) return tab == 12;
+
+    // Model workspace (0) and fallback: all 3D modeling tabs, no sim/pcb/drawing/manufacture
+    // unless the legacy bools override (backwards compat for callers that pass them explicitly).
+    if (tab == 9 || tab == 10) return false;   // drawing tabs: 3D docs never
+    if (tab == 3) return showSimulationTools;  // Simulation: legacy bool
+    if (tab == 7) return showPcbTools;         // PCB: legacy bool
+    if (tab == 12) return false;               // Manufacture: only in Manufacture workspace
     return true;
 }
 
@@ -293,6 +326,10 @@ static std::string s_activeCmd;
 // entry point the Features tab carries — so a sketch can be started directly from the Sketch tab.
 // Same group label ("Sketch") so it occupies the Exit-Sketch slot.
 static bool s_sketchActive = false;
+
+// s_workspace declared near top of file (before ribbon_tabVisible).
+// Per-workspace ribbon filter. Mirrors AppState::Workspace (Model=0..AI=7). Default: Model.
+// Workspace-shell sets this each frame via setRibbonWorkspace(); see ribbon.h.
 static const ui::RibbonCmd kSketchNewOnSketchTab =
     { "sketch_new", "New Sketch", "sketch", "Sketch", "Sketch", true, nullptr, false };
 static bool ribbon_isActive(const char* cmd_id) {
@@ -657,12 +694,39 @@ static const float* ribbon_matSwatchColor(const char* cmd_id) {
     return nullptr;
 }
 
+// Resting glass fill + hairline outline for a ribbon button (big or small).
+// Called before hover/active so the state layers are: rest < hover < active.
+// Uses existing palette roles (no new colors):
+//   fill = border at 8% alpha — faint tinted tint shows it is a pressable zone
+//   outline = border at 55% alpha — crisp single-px hairline
+// Both scale by `enabled` so disabled buttons keep the ghost appearance but stay low-contrast.
+static void ribbon_btnRest(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding, bool enabled) {
+    const float* bdr = ui::palette.border;
+    float fillA  = enabled ? 0.08f : 0.04f;
+    float lineA  = enabled ? 0.55f : 0.25f;
+    ImU32 fill   = IM_COL32((int)(bdr[0]*255), (int)(bdr[1]*255), (int)(bdr[2]*255),
+                             (int)(fillA * 255));
+    ImU32 border = IM_COL32((int)(bdr[0]*255), (int)(bdr[1]*255), (int)(bdr[2]*255),
+                             (int)(lineA * 255));
+    dl->AddRectFilled(p0, p1, fill, rounding);
+    dl->AddRect(p0, p1, border, rounding, 0, ui::metrics::stroke(1.0f));
+}
+
+// Bold active outline (deliverable 3): replaces the old accent underline / left-border cues.
+// Filled with accentSoft + BOLD accent outline on the full bounding box.
+static void ribbon_btnActive(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding) {
+    dl->AddRectFilled(p0, p1, ui::Palette::toU32(ui::palette.accentSoft), rounding);
+    dl->AddRect(p0, p1, ui::Palette::toU32(ui::palette.accent),
+                rounding, 0, ui::metrics::stroke(2.0f));
+}
+
 // Draw a SW big button. Returns true if main area clicked.
 static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
                            const char* label, bool enabled, bool hasDrop) {
     float s   = ui::uiScale;
     float bw  = ribbon_bigBtnW(cmd_id, label, hasDrop);
     float bh  = (kBodyH - kCaptionH) * s;
+    float rnd = ui::metrics::ribbonBtnRound();
 
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImGui::PushID(cmd_id);
@@ -680,16 +744,15 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     clicked = ImGui::InvisibleButton("##main", ImVec2(mainW, bh));
     bool mainHov    = ImGui::IsItemHovered();
     bool mainHovTip = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
+    bool mainPress  = ImGui::IsItemActive();
 
-    // C40: armed-tool highlight (drawn under the hover fill).
-    if (ribbon_isActive(cmd_id)) {
-        ImDrawList* adl = ImGui::GetWindowDrawList();
-        adl->AddRectFilled(p0, ImVec2(p0.x + bw, p0.y + bh),
-                           ui::Palette::toU32(ui::palette.accentSoft),
-                           ui::metrics::ribbonBtnRound());
-        adl->AddRect(p0, ImVec2(p0.x + bw, p0.y + bh),
-                     ui::Palette::toU32(ui::palette.accent),
-                     ui::metrics::ribbonBtnRound(), 0, ui::metrics::stroke(1.5f));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // State layering: rest → hover → active (armed tool). Draw in order so upper states paint over.
+    const bool isActive = ribbon_isActive(cmd_id);
+    ribbon_btnRest(dl, p0, ImVec2(p0.x + bw, p0.y + bh), rnd, enabled);
+    if (isActive) {
+        ribbon_btnActive(dl, p0, ImVec2(p0.x + bw, p0.y + bh), rnd);
     }
 
     if (hasDrop) {
@@ -697,9 +760,13 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         dropClicked = ImGui::InvisibleButton("##drop", ImVec2(kArrowW * s, bh));
         bool dropHov = ImGui::IsItemHovered();
 
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        if ((mainHov || dropHov) && enabled) {
+        if ((mainHov || dropHov) && enabled && !isActive) {
             ui::glassRowBackground(dl, p0, ImVec2(p0.x + bw, p0.y + bh), 4.0f);
+        } else if ((mainHov || dropHov) && enabled && isActive) {
+            // hover on top of active: reinforce the glass layer but keep the bold outline
+            ui::glassRowBackground(dl, p0, ImVec2(p0.x + bw, p0.y + bh), 4.0f);
+            dl->AddRect(p0, ImVec2(p0.x + bw, p0.y + bh),
+                        ui::Palette::toU32(ui::palette.accent), rnd, 0, ui::metrics::stroke(2.0f));
         }
         {
             float ax = p0.x + mainW + kArrowW * s * 0.5f;
@@ -714,31 +781,46 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
 
         if (dropClicked && enabled) s_flyoutOpenReq = cmd_id;   // deferred (ID-scope fix)
     } else {
-        if (mainHov && enabled) {
-            ImDrawList* dl = ImGui::GetWindowDrawList();
+        if (mainHov && enabled && !isActive) {
             ui::glassRowBackground(dl, p0, ImVec2(p0.x + bw, p0.y + bh), 4.0f);
+        } else if (mainHov && enabled && isActive) {
+            ui::glassRowBackground(dl, p0, ImVec2(p0.x + bw, p0.y + bh), 4.0f);
+            dl->AddRect(p0, ImVec2(p0.x + bw, p0.y + bh),
+                        ui::Palette::toU32(ui::palette.accent), rnd, 0, ui::metrics::stroke(2.0f));
         }
     }
+    (void)mainPress;
 
     ImGui::PopStyleColor(3);
     ImGui::PopStyleVar(2);
 
-    // Draw icon + label
+    // Draw icon + label — vertically centered within the button body.
+    // Block = iconSz + optional swatch bar (4px+gap) + label lines. Centered with ≥3px edge pad.
     {
-        ImDrawList* dl = ImGui::GetWindowDrawList();
         float iconSz = snap(kBigIconSz * s);
         float cx     = snap(p0.x + mainW * 0.5f);
         const char* visibleLabel = ribbon_displayLabel(cmd_id, label);
-        float iy     = snap(p0.y + 4.0f * s);
-        if (visibleLabel[0] == '\0')
-            iy = snap(p0.y + (bh - iconSz) * 0.5f - 1.0f * s);
+        const float* matRgb = ribbon_matSwatchColor(cmd_id);
 
-        ribbon_icon(dl, iconName, snap(cx - iconSz * 0.5f) + iconSz * 0.5f, iy + iconSz * 0.5f,
-                    iconSz, enabled, ribbon_isActive(cmd_id));
+        std::string l1, l2;
+        ribbon_wrapLabel(visibleLabel, l1, l2);
+        float lineH   = ImGui::GetTextLineHeight();
+        int   nLines  = (visibleLabel[0] == '\0') ? 0 : (l2.empty() ? 1 : 2);
+        float swatchH = matRgb ? 5.0f * s : 0.0f;  // 4px bar + 1px gap
+        float labelH  = nLines > 0 ? (lineH * (float)nLines + 2.0f * s + swatchH) : 0.0f;
+        float blockH  = iconSz + labelH;
+        float iy;
+        if (visibleLabel[0] == '\0') {
+            iy = snap(p0.y + (bh - iconSz) * 0.5f);
+        } else {
+            iy = snap(p0.y + (bh - blockH) * 0.5f);
+            if (iy < p0.y + 3.0f * s) iy = snap(p0.y + 3.0f * s);
+        }
+
+        ribbon_icon(dl, iconName, cx, iy + iconSz * 0.5f, iconSz, enabled, ribbon_isActive(cmd_id));
 
         // Material color swatch: a 20x4 bar under the icon previewing the exact color this button
         // applies. The label below is nudged down (see ty) so the bar never overlaps the text.
-        const float* matRgb = ribbon_matSwatchColor(cmd_id);
         if (matRgb) {
             float swW = 20.0f * s, swH = 4.0f * s;
             float sx0 = snap(cx - swW * 0.5f);
@@ -752,12 +834,9 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
                         ui::metrics::stroke(1.0f));
         }
 
-        std::string l1, l2;
-        ribbon_wrapLabel(visibleLabel, l1, l2);
         ImU32 tCol = enabled ? ui::Palette::toU32(ui::palette.text)
                              : ui::Palette::toU32(ui::palette.textDisabled);
-        float lineH = ImGui::GetTextLineHeight();
-        float ty    = iy + iconSz + (matRgb ? 6.0f * s : 2.0f * s);
+        float ty = iy + iconSz + swatchH + 2.0f * s;
         dl->PushClipRect(ImVec2(p0.x, p0.y), ImVec2(p0.x + mainW, p0.y + bh), true);
         if (visibleLabel[0] != '\0') {
             ImVec2 t1 = ImGui::CalcTextSize(l1.c_str());
@@ -827,39 +906,42 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
     bool mainHov    = ImGui::IsItemHovered();
     bool mainHovTip = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
 
-    // C40: armed-tool highlight (drawn under the hover fill).
-    if (ribbon_isActive(cmd_id)) {
-        ImDrawList* adl = ImGui::GetWindowDrawList();
-        adl->AddRectFilled(p0, ImVec2(p0.x + totalW, p0.y + rowH),
-                           ui::Palette::toU32(ui::palette.accentSoft),
-                           ui::metrics::ribbonBtnRound());
-        adl->AddRect(p0, ImVec2(p0.x + totalW, p0.y + rowH),
-                     ui::Palette::toU32(ui::palette.accent),
-                     ui::metrics::ribbonBtnRound(), 0, ui::metrics::stroke(1.5f));
-    }
+    ImDrawList* dl_sm = ImGui::GetWindowDrawList();
+    float rnd_sm = ui::metrics::ribbonBtnRound();
+    const bool isActiveSm = ribbon_isActive(cmd_id);
+    ImVec2 p1_sm(p0.x + totalW, p0.y + rowH);
+
+    // State layering: rest → hover → active (bold outline).
+    ribbon_btnRest(dl_sm, p0, p1_sm, rnd_sm, enabled);
+    if (isActiveSm) ribbon_btnActive(dl_sm, p0, p1_sm, rnd_sm);
 
     if (hasDrop) {
         ImGui::SameLine(0, 0);
         dropClicked = ImGui::InvisibleButton("##mdr", ImVec2(kDropArrowW * s, rowH));
         bool dropHov = ImGui::IsItemHovered();
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        if ((mainHov || dropHov) && enabled)
-            ui::glassRowBackground(dl, p0, ImVec2(p0.x + totalW, p0.y + rowH), 4.0f);
+        if ((mainHov || dropHov) && enabled) {
+            ui::glassRowBackground(dl_sm, p0, p1_sm, 4.0f);
+            if (isActiveSm)
+                dl_sm->AddRect(p0, p1_sm, ui::Palette::toU32(ui::palette.accent),
+                               rnd_sm, 0, ui::metrics::stroke(2.0f));
+        }
         {
             float ax = p0.x + mainW + kDropArrowW * s * 0.5f;
             float ay = p0.y + rowH * 0.5f;
             ImU32 aCol = enabled ? ui::Palette::toU32(ui::palette.text)
                                  : ui::Palette::toU32(ui::palette.textDisabled);
             float hs = 3.0f * s;
-            dl->AddTriangleFilled(ImVec2(ax - hs, ay - hs * 0.5f),
-                                  ImVec2(ax + hs, ay - hs * 0.5f),
-                                  ImVec2(ax,      ay + hs * 0.5f), aCol);
+            dl_sm->AddTriangleFilled(ImVec2(ax - hs, ay - hs * 0.5f),
+                                     ImVec2(ax + hs, ay - hs * 0.5f),
+                                     ImVec2(ax,      ay + hs * 0.5f), aCol);
         }
         if (dropClicked && enabled) s_flyoutOpenReq = cmd_id;   // deferred (ID-scope fix)
     } else {
         if (mainHov && enabled) {
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            ui::glassRowBackground(dl, p0, ImVec2(p0.x + totalW, p0.y + rowH), 4.0f);
+            ui::glassRowBackground(dl_sm, p0, p1_sm, 4.0f);
+            if (isActiveSm)
+                dl_sm->AddRect(p0, p1_sm, ui::Palette::toU32(ui::palette.accent),
+                               rnd_sm, 0, ui::metrics::stroke(2.0f));
         }
     }
 
@@ -1041,21 +1123,22 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
     ImGui::PopStyleColor(3);
     ImGui::PopStyleVar();
 
-    // C40: armed-tool highlight (under the hover fill).
-    if (ribbon_isActive(cmd_id)) {
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->AddRectFilled(p0, ImVec2(p0.x + totalW, p0.y + rowH),
-                          ui::Palette::toU32(ui::palette.accentSoft),
-                          ui::metrics::ribbonBtnRound());
-        dl->AddRect(p0, ImVec2(p0.x + totalW, p0.y + rowH),
-                    ui::Palette::toU32(ui::palette.accent),
-                    ui::metrics::ribbonBtnRound(), 0, ui::metrics::stroke(1.5f));
-    }
-    if (hov && enabled) {
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->AddRectFilled(p0, ImVec2(p0.x + totalW, p0.y + rowH),
-                          ui::Palette::toU32(ui::palette.buttonHovered),
-                          ui::metrics::ribbonBtnRound());
+    // State layering: rest → hover (glass, unified with big buttons) → active (bold outline).
+    {
+        ImDrawList* dl_s = ImGui::GetWindowDrawList();
+        float rnd_s = ui::metrics::ribbonBtnRound();
+        ImVec2 p1_s(p0.x + totalW, p0.y + rowH);
+        const bool isActiveSm2 = ribbon_isActive(cmd_id);
+        ribbon_btnRest(dl_s, p0, p1_s, rnd_s, enabled);
+        if (isActiveSm2) {
+            ribbon_btnActive(dl_s, p0, p1_s, rnd_s);
+        }
+        if (hov && enabled) {
+            ui::glassRowBackground(dl_s, p0, p1_s, 4.0f);
+            if (isActiveSm2)
+                dl_s->AddRect(p0, p1_s, ui::Palette::toU32(ui::palette.accent),
+                              rnd_s, 0, ui::metrics::stroke(2.0f));
+        }
     }
 
     {

@@ -26,7 +26,13 @@ LICENSE_NOTE = (
 )
 
 _LOGIN_WALL_MARKERS = ("Sign In", 'id="signInEmail"', "Create Account to See Your Price")
-_CHALLENGE_MARKERS = ("Access Denied", "Reference #", "Pardon Our Interruption")
+# "Whoops, we couldn't find that." is Grainger's edge/bot-block page (served with
+# HTTP 200 for the homepage and every search URL alike when traffic looks
+# non-residential/automated) — confirmed via a live probe 2026-07-07. Without this
+# marker the block page silently parses to zero JSON-LD products and reports a
+# confusing "no hits parsed" error instead of a clean, expected bot-wall degradation.
+_CHALLENGE_MARKERS = ("Access Denied", "Reference #", "Pardon Our Interruption",
+                      "Whoops, we couldn't find that", "Whoops, we couldn&#39;t find that")
 
 
 class GraingerAdapter(RetailAdapter):

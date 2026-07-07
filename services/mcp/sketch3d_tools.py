@@ -8,12 +8,25 @@ Exposes to an AI driver the same capabilities the GUI gives a human in the Sketc
     sketch3d_get(id)                     read back the wire geometry + bounding info
     sketch3d_clear(id)                   erase all entities from a 3D sketch
     sketch3d_as_sweep_guide(id, doc_id)  record a 3D sketch as a designated sweep guide/spine
-                                         in the Python store and explain how to use it in a sweep
-                                         feature op.  NOTE: the doc feature schema (feature_params.md)
-                                         does NOT yet expose a guides[] ref on the sweep op — the
-                                         geom::sweep_profile C++ function accepts guides internally
-                                         but that wiring is not plumbed through doc_apply_ops yet.
-                                         Returns sketch3d_id + coord_summary + workflow_hint.
+                                         and return a READY-TO-APPLY add_feature op for the real
+                                         engine `sketch3d` feature (doc_schema §3B), plus the
+                                         path/guides ref syntax for the sweep op.  The engine now
+                                         plumbs sweep guides[] end-to-end and consumes sketch3d
+                                         wires as sweep spine/guide.
+
+TODO (follow-up MCP-helpers pass) — re-point map to the real engine feature:
+    The tools below still operate on the SESSION-scoped Python store (_STORE), not on
+    engine `sketch3d` features. Full re-pointing is a separate tooling-polish task:
+      sketch3d_new/add_curves/clear -> doc_apply_ops add_feature/edit_feature on a
+          type:"sketch3d" feature (entity mapping identical to _segs_to_engine_entities);
+      sketch3d_get/list             -> read the doc tree's sketch3d features +
+          the `sketch3d_health` RPC (entities/wires/DOF);
+      sketch3d_preview              -> render from sketch3d_health entities;
+      sketch3d_sample_at/section_at -> sample the engine wire (needs a small RPC or
+          keep Python-side sampling over health entities);
+      sketch3d_to/from_ledger       -> obsolete once sketches live in the document
+          (persistence comes free with doc save) — keep for scratch sketches only.
+    Contract for all of it: contracts/sketch3d_gui_contract.md.
     sketch3d_sample_at(id, t)           sample a world-space point + tangent on the path at
                                          fractional arc-length t ∈ [0,1] — useful for placing
                                          profile sketch planes along a sweep spine
@@ -189,16 +202,7 @@ def _seg_from_dict(spec: dict) -> _S3Seg:
 
 
 def _sketch3d_as_guide_record(sk: _S3Sketch, role: str) -> dict:
-    """Serialise a _S3Sketch as a guide-record dict (Python store only — not a C++ op).
-
-    The sweep feature schema (feature_params.md) does NOT yet expose a guides[] ref — the
-    geom::sweep_profile C++ function accepts a guides vector internally but that parameter
-    is not wired through doc_apply_ops / apply_one.  Attempting "wire_from_3d_sketch" as an
-    op would raise 'unsupported' from apply_one.
-
-    This record is stored in the Python layer only.  The workflow hint returned by
-    sketch3d_as_sweep_guide tells the driver how to use the curve coords in a real sweep op.
-    """
+    """Serialise a _S3Sketch as a guide-record dict (Python session store bookkeeping)."""
     return {
         "sketch3d_id": sk.id,
         "name": sk.name,
@@ -207,6 +211,39 @@ def _sketch3d_as_guide_record(sk: _S3Sketch, role: str) -> dict:
         "total_length_mm": round(sk.total_length(), 4),
         "bbox": sk.bbox(),
     }
+
+
+def _segs_to_engine_entities(sk: _S3Sketch) -> list:
+    """Map session-store segments to engine `sketch3d` entities (doc_schema §3B).
+
+    line (2 pts) -> line {p1,p2}; arc (3 pts) -> arc {p1,pm,p2} (three-point);
+    spline -> spline {points}; polyline -> one line entity per consecutive pair.
+    Ids are e1..eN in segment order so the engine's wire chaining follows authoring order.
+    """
+    entities: list = []
+    n = 0
+
+    def _next_id() -> str:
+        nonlocal n
+        n += 1
+        return f"e{n}"
+
+    for seg in sk.segs:
+        pts = [list(map(float, p)) for p in seg.pts]
+        if seg.kind == "line":
+            entities.append({"id": _next_id(), "type": "line", "construction": False,
+                             "p1": pts[0], "p2": pts[1]})
+        elif seg.kind == "arc":
+            entities.append({"id": _next_id(), "type": "arc", "construction": False,
+                             "p1": pts[0], "pm": pts[1], "p2": pts[2]})
+        elif seg.kind == "spline":
+            entities.append({"id": _next_id(), "type": "spline", "construction": False,
+                             "points": pts})
+        else:  # polyline -> straight segments
+            for i in range(len(pts) - 1):
+                entities.append({"id": _next_id(), "type": "line", "construction": False,
+                                 "p1": pts[i], "p2": pts[i + 1]})
+    return entities
 
 
 def _tmp(suffix: str) -> str:
@@ -445,35 +482,29 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
         role: str = "guide",
         doc_id: Optional[str] = None,
     ) -> str:
-        """Record a 3D sketch as the designated sweep GUIDE or SPINE and get a workflow plan.
+        """Record a 3D sketch as the designated sweep GUIDE or SPINE and get the engine op.
 
-        CURRENT ENGINE LIMIT: the sweep feature schema (feature_params.md §sweep) does NOT
-        yet expose a guides[] ref through doc_apply_ops — geom::sweep_profile accepts guide
-        wires internally in C++ but that parameter is not wired to the doc feature dispatch.
-        Calling this tool does NOT inject geometry into the C++ engine; it stores the record
-        in the Python session store and returns a concrete workflow for using the 3D curve
-        coords in a real sweep feature.
+        The engine now has a REAL `sketch3d` feature (doc_schema §3B) and the sweep op
+        consumes it as `path` (spine) or a `guides:[...]` entry — guides[] is plumbed
+        end-to-end.  This tool converts the session-store 3D sketch into a ready-to-apply
+        `add_feature` op (returned as ``feature_op``): apply it via the doc ops path, then
+        reference the resulting feature id in the sweep.
 
         sketch3d_id: the 3D sketch to designate.
-        role: "guide" (default) — a guide curve that will drive profile orientation/scaling
-                                   when the engine wiring ships.
-              "spine" — the primary sweep path; use the returned coord summary to create a
-                        matching 2D helix or sketch path feature in the doc.
-        doc_id: part document context (used only for the workflow hint).
+        role: "guide" (default) — guide curve driving profile orientation/scaling
+                                   (ONE guide per sweep; must differ from the path).
+              "spine" — the primary sweep path.
+        doc_id: part document context (echoed in the hint).
 
-        Workflow for SPINE (role="spine"):
-          1. Use the returned ``coord_summary`` to create a matching doc curve:
-             - For a straight-line path: add_features([{op:"sketch", ...line entities...}])
-             - For a helix: add_features([{op:"helix", pitch:P, height:H, base:"<cylinder>"}])
-          2. Reference that sketch/helix as the "spine" in the sweep op.
+        Workflow (both roles):
+          1. Apply ``feature_op`` (add_feature, type:"sketch3d") -> feature id "fN".
+          2. Sweep refs: spine  -> {"path": "fN"}  (or {"path": {"feature":"fN","wire":k}}
+             when the sketch has multiple disconnected chains);
+             guide -> {"guides": [{"feature":"fN","wire":0}]}.
+          Full contract: contracts/sketch3d_gui_contract.md.
 
-        Workflow for GUIDE (role="guide"):
-          Currently only one guide is consumed by MakePipeShell.  To approximate guide
-          behaviour: use orientation=2 (keep_normal) on the sweep, or build a loft between
-          sections that approximate the intended shape.
-
-        Returns {ok, sketch3d_id, role, guide_support, coord_summary, workflow_hint}.
-        guide_support is always False until the doc feature schema gains a guides[] ref.
+        Returns {ok, sketch3d_id, role, guide_support, feature_op, coord_summary,
+        workflow_hint}.
         """
         try:
             sk = _s3get(sketch3d_id)
@@ -500,22 +531,32 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
                 coord_lines.append(f"  seg[{i}] {seg.kind}: {pts_str}")
             coord_summary = "\n".join(coord_lines)
 
+            feature_op = {
+                "op": "add_feature",
+                "feature": {
+                    "type": "sketch3d",
+                    "name": sk.name or f"3DSketch-{role}",
+                    "params": {
+                        "entities": _segs_to_engine_entities(sk),
+                        "constraints": [],
+                    },
+                },
+            }
             if role == "spine":
                 workflow_hint = (
-                    "To use this 3D path as a sweep spine:\n"
-                    "  • Straight path: add a sketch with the same line entity, reference as sweep spine.\n"
-                    "  • Helical path: add_features([{op:'helix', pitch:P, height:H, base:'<edge>'}]) "
-                    "then use that helix feature id as the sweep spine.\n"
-                    "  • General spline: create a sketch with a spline entity matching these coords.\n"
-                    "Coords above can be used directly as sketch entity points."
+                    "1. Apply the returned feature_op via doc ops -> a sketch3d feature id 'fN'.\n"
+                    "2. Add the sweep with {\"path\": \"fN\"} (single chain) or "
+                    "{\"path\": {\"feature\": \"fN\", \"wire\": k}} for a multi-chain sketch.\n"
+                    "The 2D profile sketch must sit at the spine START, roughly perpendicular "
+                    "to its tangent. Contract: contracts/sketch3d_gui_contract.md."
                 )
             else:
                 workflow_hint = (
-                    "Guide curve doc-schema wiring is pending (feature_params.md sweep has no guides[] yet).\n"
-                    "Current workaround options:\n"
-                    "  • Use orientation=2 (keep_normal) on the sweep to lock the profile orientation.\n"
-                    "  • Use a loft between cross-sections placed at the guide curve positions.\n"
-                    "  • When guide wiring ships, pass the guide sketch id in guides:[<id>] on the sweep op."
+                    "1. Apply the returned feature_op via doc ops -> a sketch3d feature id 'fN'.\n"
+                    "2. On the sweep, set {\"guides\": [{\"feature\": \"fN\", \"wire\": 0}]} "
+                    "(ONE guide; it must be a different feature than the path).\n"
+                    "The guide drives profile orientation + scaling along the path "
+                    "(SolidWorks Guide Curves). Contract: contracts/sketch3d_gui_contract.md."
                 )
 
             return _dumps({
@@ -523,11 +564,11 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
                 "sketch3d_id": sketch3d_id,
                 "role": role,
                 "doc_id": d,
-                # guide_support=False: geom::sweep_profile in C++ accepts guides[]
-                # internally (core/geom/features.cpp sweep_wire_solid) but the JSON
-                # dispatch in core/doc/session.cpp does NOT yet forward a guides key
-                # from doc_apply_ops.  Set to True once session.cpp wires it.
-                "guide_support": False,
+                # guide_support=True: the sweep guides[] ref is plumbed end-to-end
+                # (doc_apply_ops -> document.cpp sweep branch -> geom::sweep_profile)
+                # and sketch3d wires are consumable as spine/guide.
+                "guide_support": True,
+                "feature_op": feature_op,
                 "length_mm": round(length, 4),
                 "seg_count": len(sk.segs),
                 "point_count": pts_total,

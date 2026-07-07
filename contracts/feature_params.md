@@ -37,6 +37,21 @@
 - compiler: `features/sketch.py` — solve → wire graph → closed-loop region detection →
   pickable region faces (AICM pseudo-body `sketch:<id>`).
 
+### `sketch3d` (3D free-space sketch)
+- params: `entities: [Entity3D]` · `constraints: [Constraint3D]` (doc_schema §3B) — world-mm
+  coordinates, NO plane ref (free space).
+- refs: — (none).
+- compiler: C++ only — `core/sketch/sketch3d.cpp` (solve) + `core/geom/profile3d.cpp` (chain
+  non-construction line/arc/spline entities into 3D wires by endpoint proximity, tol 1e-4).
+  Never a body; produces ordered wire chains a downstream `sweep` consumes as `path` or
+  `guides[]` entry (loft guides: reserved — the loft compiler does not consume guides yet).
+- referencing a wire: a bare feature-id ref takes the single chain (a multi-chain sketch3d is
+  rejected loudly); `{"feature":"<fid>","wire":<k>}` selects chain k (deterministic order:
+  wire 0 = the chain containing the earliest-authored entity).
+- errors: non-convergent solve; a consuming sweep raises on no/ambiguous wire.
+- GUI/RPC contract: [sketch3d_gui_contract.md](sketch3d_gui_contract.md) (health/drag RPCs,
+  entity/constraint JSON, examples).
+
 ## Primitives (AI/quick-start path; SolidWorks purists use sketch+extrude)
 
 ### `box`
@@ -101,10 +116,19 @@
 - compiler: `features/revolve.py` → `revolve(...)`
 
 ### `sweep`
-- params: `mode: "boss"|"cut"` · `orientation: "follow_path"` (frozen v1) · `merge: bool`
-- refs: `profile: [sel(region)]` · `path: sel(edge, region-chain)` (sketch wire or model edge chain)
-- compiler: `features/sweep.py` → `sweep()` / `BRepOffsetAPI_MakePipeShell`
-- errors: self-intersecting sweep (OCCT failure surfaced with hint).
+- params: `mode: "boss"|"cut"` · `orientation: "follow_path"|"frenet"|"keep_normal"`
+  ("follow_path") · `merge: bool`
+- refs: `profile: [sel(region)]` · `path: sel(edge, region-chain) | <sketch/curve/sketch3d
+  feature id> | {"feature":fid,"wire":k}` (a 2D sketch wire, a helix/spiral curve feature, or a
+  `sketch3d` wire chain) · `guides: [sel(region) | {"feature":fid,"wire":k}]?` (0 or 1 — a
+  single guide curve; a 2D sketch, curve feature, or `sketch3d` chain. The guide overrides the
+  orientation law and drives profile orientation + SCALING along the path; must differ from the
+  path; >1 guide rejected loudly).
+- compiler: C++ `doc/document.cpp` sweep branch → `geom::sweep_profile`
+  (`BRepOffsetAPI_MakePipeShell`; guided mode uses `SetMode(guide, CurvilinearEquivalence,
+  BRepFill_ContactOnBorder)` so the profile scales to follow the guide).
+- errors: self-intersecting sweep; zero-volume sweep (profile not at path start — gap distance
+  named); guide == path; ambiguous multi-chain sketch3d ref without a `wire` index.
 
 ### `loft`
 - params: `mode: "boss"|"cut"` · `ruled: bool` (false) · `merge: bool`

@@ -82,10 +82,13 @@
 - `refs` holds geometry/topology references (selectors, datum ids, feature ids, region selectors).
   Rule of thumb: anything that must survive re-resolution on rebuild goes in `refs`.
 - Per-type `params`/`refs` fields are normative in [feature_params.md](feature_params.md).
-- **v1 feature types**: `plane`, `axis`, `point`, `csys`, `sketch`, `box`, `cylinder`, `sphere`,
-  `cone`, `torus`, `extrude`, `revolve`, `sweep`, `loft`, `fillet`, `chamfer`, `shell`, `draft`,
-  `hole`, `linear_pattern`, `circular_pattern`, `mirror`, `boolean`, `helix`, `script`, `import`.
+- **v1 feature types**: `plane`, `axis`, `point`, `csys`, `sketch`, `sketch3d`, `box`,
+  `cylinder`, `sphere`, `cone`, `torus`, `extrude`, `revolve`, `sweep`, `loft`, `fillet`,
+  `chamfer`, `shell`, `draft`, `hole`, `linear_pattern`, `circular_pattern`, `mirror`,
+  `boolean`, `helix`, `script`, `import`.
   Stretch (schema reserved, may not compile in v1): `rib`, `split`.
+  (`sketch3d` is a SKETCH3D-migration additive type — see §3B; every pre-existing document
+  remains valid, schema string unchanged.)
 - `script` is the legacy escape hatch: `params.code` is a build123d script executed through the
   existing forgiving kernel namespace; its result/parts become this feature's bodies.
 
@@ -204,6 +207,68 @@ The line↔arc/circle tangent (distance from center to line = radius) is unaffec
 The solver reports per-entity status (`under` | `full` | `over`) and sketch DOF; the document
 never persists solve state. Entity coordinates stored in the document are the **last solved**
 positions (so documents open without solving).
+
+## 3B. 3D Sketch (`sketch3d`)
+
+> **SKETCH3D migration (additive, no schema-string bump).** A NEW feature type `sketch3d` —
+> a FREE-SPACE 3D sketch (no plane): points, lines, arcs, splines in world coordinates with a
+> core 3D constraint set. It drives sweep paths, routing runs, and weldment skeletons. Every
+> pre-existing document remains valid. Full GUI/RPC contract (entity/constraint JSON, health/
+> drag RPC examples, wire referencing): [sketch3d_gui_contract.md](sketch3d_gui_contract.md).
+
+A `sketch3d` is a feature (`type:"sketch3d"`) with **no refs** and
+`params.entities` + `params.constraints`. All coordinates are **world millimeters**.
+
+### 3B.1 Entities
+
+```json
+{"id": "e1", "type": "line", "construction": false, "p1": [0,0,0], "p2": [0,0,80]}
+```
+
+| type | fields (world coords, mm) |
+|---|---|
+| `point` | `p:[x,y,z]` |
+| `line` | `p1:[x,y,z]`, `p2:[x,y,z]` |
+| `arc` | `p1:[x,y,z]`, `pm:[x,y,z]`, `p2:[x,y,z]` — **THREE-POINT** arc: start / interior "through" point / end. (Chosen over center+normal+radius+angles: uniform point parameterization — no unit-normal normalization in the solve, natural endpoint handles for chaining, 1:1 GUI point drags. Collinear `p1`/`pm`/`p2` is degenerate and fails edge compile.) |
+| `spline` | `points:[[x,y,z],…]` (≥ 2; cubic interpolation through every point, like the 2D `spline`) |
+
+All entities carry `construction:bool` (construction geometry never joins wire chains).
+
+### 3B.2 Handles
+
+`"e3"` = whole entity; `"e3.p"` (point); `"e3.p1"` / `"e3.p2"` (line + arc endpoints; aliases
+`"e3.start"`/`"e3.end"` accepted); `"e3.pm"` (arc through-point; alias `"e3.mid"`);
+`"e3.p0"…"e3.pN"` (spline points). Grammar:
+`^e\d+(\.(p|p1|p2|pm|start|end|mid|p\d+))?$`.
+
+### 3B.3 Constraints (v1)
+
+| type | refs (arity, kinds) | value / extra fields |
+|---|---|---|
+| `coincident` | 2 — point handle, point handle | — |
+| `fix` | 1 — any handle or whole entity (pins at authored coords) | — |
+| `distance` | 2 — `[point, point]` or `[point, <bare line entity id>]` (perpendicular gap to the **infinite** line) | dimension value (mm) |
+| `length` | 1 — line entity | dimension value (mm) |
+| `parallel` | 2 — line, line | — |
+| `perpendicular` | 2 — line, line | — |
+| `angle` | 2 — line, line | dimension value (deg, `[0,180]`) |
+| `along_axis` | 1 — line | `axis:"x"\|"y"\|"z"` **or** `dir:[x,y,z]` (constraint-record field, not `value`) |
+| `point_on` | 2 — point, line **or** arc entity (arc = full circumcircle, range-free like 2D) | — |
+
+Dimension constraints (`distance|length|angle`) MUST carry `value` (`{value, expr}` — expr
+evaluated against document equations, same as §3.3); the rest MUST NOT. `driven:true` marks a
+reference dimension (measured, never enforced). **Deferred to v2:** `point_on` a spline,
+tangent, symmetric, equal, midpoint.
+
+### 3B.4 Solve, statuses, wires (computed, not stored)
+
+Same solver-status shape as §3.4: per-entity `under|full|over`, sketch `dof`,
+`redundant`/`conflicting` constraint ids. Stored coordinates are the last solved/committed
+positions. The compiler chains non-construction line/arc/spline entities into **3D wire
+chains** by endpoint proximity (tol 1e-4, mixed-entity float gaps stitched); chain order is
+deterministic (wire 0 = the chain containing the earliest-authored entity). A downstream
+`sweep` references a chain as its `path` or a `guides[]` entry: a bare feature id when the
+sketch has exactly one chain, else `{"feature":"<fid>","wire":<k>}`.
 
 ## 4. Equations — expression grammar
 

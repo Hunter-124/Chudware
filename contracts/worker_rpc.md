@@ -185,6 +185,12 @@ groups it); machine-checked by `engine/doc/test_weld_cutlist.py`. Host passthrou
 | `sketch_drag_commit` | `{doc_id, sketch}` → ops-response (persists final positions as one undoable batch) + `constraints` |
 | `sketch_exit` | `{doc_id, sketch}` → ops-response (rebuilds downstream) |
 
+### 3D sketch interaction (`sketch3d` — SKETCH3D migration)
+| method | params → result |
+|---|---|
+| `sketch3d_health` | `{doc_id, sketch}` → `{ok, status:"under"\|"full"\|"over", dof, converged, statuses:{eid…}, redundant:[cid…], conflicting:[cid…], free:[{entity,param,var}…], entities:[{id, type, construction, …solved world coords}], wires:[{closed, n_edges}]}` — stateless solve + wire-chain report (wire order == the sweep compiler's spine/guide index). |
+| `sketch3d_drag` | `{doc_id, sketch, handle, xyz:[x,y,z]}` OR `{doc_id, sketch, targets:[{handle, xyz:[x,y,z]},…]}` → `{ok, entities, statuses, rejected_handles, converged, budget_exceeded}` — transient constrained drag; does NOT commit. Commit = `doc_apply_ops` `edit_feature` with the solved `entities` array (no dedicated commit RPC). Full contract + examples: [sketch3d_gui_contract.md](sketch3d_gui_contract.md). |
+
 **`solve_rejected` (sketch_enter / sketch_solve / sketch_drag, C50f).** Conflict-safe solving:
 when a re-solve comes back **contradictory** (`conflicting` non-empty) OR **non-convergent**, the
 solver's least-squares compromise is rejected for geometry. The response's `entities` carry the

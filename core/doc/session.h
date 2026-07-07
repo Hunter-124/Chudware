@@ -476,6 +476,26 @@ nlohmann::json doc_sketch_auto_constrain(const std::string& doc_id,
                                          const nlohmann::json& opts);
 nlohmann::json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid);
 
+// ---- sketch3d (3D free-space sketch, feature type "sketch3d") --------------
+//
+// Both are STATELESS reads over the persisted feature params (no active-sketch
+// session state). Contract + request/response examples:
+// contracts/sketch3d_gui_contract.md.
+//
+// doc_sketch3d_health: solve + report -> {ok, status:"under"|"full"|"over", dof,
+//   converged, statuses:{eid:...}, redundant:[cid], conflicting:[cid],
+//   free:[{entity,param,var}], entities:[{id,type,construction,...solved coords}],
+//   wires:[{closed,n_edges}]} (wire order == the compiler's spine/guide order).
+// doc_sketch3d_drag: constrained drag of a point handle ("e1.p2", "e2.pm",
+//   "e3.p0"...) toward world xyz [x,y,z]; `targets` (list of {handle,xyz}) wins
+//   over handle/xyz for multi-point drags. Returns {ok, entities:[...],
+//   statuses, rejected_handles, converged, budget_exceeded}. TRANSIENT — commit
+//   by sending doc_apply_ops edit_feature {params:{entities:[...solved...]}}.
+nlohmann::json doc_sketch3d_health(const std::string& doc_id, const std::string& sketch_fid);
+nlohmann::json doc_sketch3d_drag(const std::string& doc_id, const std::string& sketch_fid,
+                                 const std::string& handle, const nlohmann::json& xyz,
+                                 const nlohmann::json& targets);
+
 // sketch_project_ref: read-only projection of a datum plane / planar face / model edge
 // into the sketch's (u,v) plane (engine/doc/session.py sketch_project_ref). `ref` is
 // {"datum":...} or {"kind":"face|edge","selector":{...}}; returns {entity, source}.

@@ -528,6 +528,14 @@ json project_external_refs(const json& doc, const aicad::geom::SketchPlane& plan
 // params.external_refs against the current model state (defined near
 // project_external_refs below; called from apply_ops_locked / doc_rebuild).
 void refresh_sketch_external_refs(json& doc);
+// sketch3d counterpart (external model references — vertex targets, doc_schema §3B):
+// re-resolve every sketch3d feature's params.external_refs vertex selectors against
+// the current model, writing back last_point + stale so compile_document's sketch3d
+// branch can inject them as fixed ground points (see document.cpp). v1 resolves
+// against the FINAL compiled body/bodies (same convention refresh_sketch_external_refs
+// uses for face/edge selectors) rather than the body-as-of-that-feature — a documented
+// v1 simplification.
+void refresh_sketch3d_external_refs(json& doc);
 void op_sketch_delete_entity(json& doc, const json& op, const json& id_map);
 
 void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
@@ -2880,6 +2888,9 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
         try {
             refresh_sketch_external_refs(working);
         } catch (...) { /* keep last-good projections */ }
+        try {
+            refresh_sketch3d_external_refs(working);
+        } catch (...) { /* keep last-good ground points */ }
     }
 
     std::vector<std::string> errs = validate_document(working);
@@ -3520,6 +3531,9 @@ json doc_rebuild(const std::string& doc_id) {
     try {
         refresh_sketch_external_refs(s.doc);
     } catch (...) { /* keep last-good projections */ }
+    try {
+        refresh_sketch3d_external_refs(s.doc);
+    } catch (...) { /* keep last-good ground points */ }
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
@@ -9892,6 +9906,102 @@ void refresh_sketch_external_refs(json& doc) {
     }
 }
 
+// sketch3d external model references (T-3DXREF): re-resolve every sketch3d feature's
+// params.external_refs against the current model and write back last_point/stale.
+// v1 targets: vertex -> fixed 3D point (REQUIRED, implemented below). edge/face
+// targets are NOT resolved here (gated — see contracts/doc_schema.md §3B); an
+// external_ref whose source.kind isn't "vertex" is left stale:true untouched so
+// callers get an honest signal instead of a silent no-op.
+//
+// Resolution target: the FINAL compiled body/bodies of the document (one compile
+// serves every ref, mirroring refresh_sketch_external_refs's `pre` convention) —
+// NOT the body-as-of-the-sketch3d-feature's position in history. This is a
+// documented v1 simplification: a sketch3d authored early in the tree that
+// references a vertex from a LATER feature will still resolve (arguably even more
+// useful for "chase the final corner"), but it means a self-referential loop
+// (sketch3d -> its own downstream sweep -> vertex back on the same sketch3d) is
+// not meaningful and isn't guarded against beyond the existing rebuild recursion
+// guards elsewhere in this file.
+// A sketch3d feature stores its authored fields under "params" (the canonical
+// on-disk shape — see add_feature/edit_feature) but may also appear flattened
+// (top-level "external_refs") from callers that already normalized it. Return a
+// pointer to whichever json array is live, or nullptr if neither is present —
+// mirrors sketch_params' params/flat duality without a value-copy (we need to
+// MUTATE the array in place).
+json* sketch3d_external_refs_slot(json& f) {
+    if (f.contains("params") && f["params"].is_object()) {
+        json& p = f["params"];
+        if (p.contains("external_refs") && p["external_refs"].is_array())
+            return &p["external_refs"];
+        return nullptr;
+    }
+    if (f.contains("external_refs") && f["external_refs"].is_array())
+        return &f["external_refs"];
+    return nullptr;
+}
+
+void refresh_sketch3d_external_refs(json& doc) {
+    if (!doc.contains("features") || !doc["features"].is_array()) return;
+    bool any = false;
+    for (json& f : doc["features"]) {
+        if (!f.is_object() || f.value("type", std::string()) != "sketch3d") continue;
+        if (f.value("suppressed", false)) continue;
+        json* refs = sketch3d_external_refs_slot(f);
+        if (refs && !refs->empty()) { any = true; break; }
+    }
+    if (!any) return;
+
+    CompileResult pre = compile_document(doc, env_from_doc(doc));
+    if (pre.shapes.empty()) {
+        // No body yet (e.g. sketch3d is the very first feature) — every vertex ref
+        // goes stale, kept at its last-good point.
+        for (json& f : doc["features"]) {
+            if (!f.is_object() || f.value("type", std::string()) != "sketch3d") continue;
+            json* refs = sketch3d_external_refs_slot(f);
+            if (!refs) continue;
+            for (json& xr : *refs)
+                if (xr.is_object()) xr["stale"] = true;
+        }
+        return;
+    }
+
+    // Concatenate vertex descriptors across every body (a multi-body doc), tagging
+    // each with which shape it came from so the resolved centroid always comes back
+    // from the right body.
+    std::vector<TopoInfo> infos;
+    std::vector<int> shape_of;
+    double diag = 0.0;
+    for (size_t si = 0; si < pre.shapes.size(); ++si) {
+        diag = std::max(diag, bbox_diag(pre.shapes[si]));
+        std::vector<TopoInfo> vi = describe_vertices(pre.shapes[si]);
+        for (TopoInfo& ti : vi) {
+            shape_of.push_back(static_cast<int>(si));
+            infos.push_back(std::move(ti));
+        }
+    }
+    if (diag <= 0.0) diag = 1.0;
+
+    for (json& f : doc["features"]) {
+        if (!f.is_object() || f.value("type", std::string()) != "sketch3d") continue;
+        if (f.value("suppressed", false)) continue;
+        json* refs = sketch3d_external_refs_slot(f);
+        if (!refs) continue;
+        for (json& xr : *refs) {
+            if (!xr.is_object() || !xr.contains("source") || !xr["source"].is_object()) continue;
+            const json& src = xr["source"];
+            if (src.value("kind", std::string()) != "vertex" || !src.contains("selector")) {
+                xr["stale"] = true;  // edge/face refs: not yet resolved (v1 gap)
+                continue;
+            }
+            std::optional<int> idx = resolve_with_hint_fallback(src["selector"], infos, diag);
+            if (!idx) { xr["stale"] = true; continue; }
+            const Eigen::Vector3d& c = infos[*idx].centroid;
+            xr["last_point"] = json::array({c.x(), c.y(), c.z()});
+            xr["stale"] = false;
+        }
+    }
+}
+
 }  // namespace
 
 // session.py::sketch_project_ref — project a datum plane / planar face / model edge
@@ -10422,12 +10532,28 @@ json& find_sketch3d_feature(Session& s, const std::string& fid) {
 }
 
 // The {entities, constraints} dict solve_sketch3d takes, from either the host
-// canonical shape (params.entities) or the flat fallback.
+// canonical shape (params.entities) or the flat fallback. Also grounds resolved
+// external_refs (T-3DXREF) as fixed construction points + implicit fix constraints
+// — same injection compile_document's sketch3d branch does, kept in sync here so
+// sketch3d_health/sketch3d_drag see the exact same solve.
 json sketch3d_solver_input(const json& feat) {
     const json p = sketch_params(feat);  // same params/flat duality as 2D
     json sk;
     sk["entities"] = p.contains("entities") ? p["entities"] : json::array();
     sk["constraints"] = p.contains("constraints") ? p["constraints"] : json::array();
+    const json& refs = p.contains("external_refs") ? p["external_refs"] : json();
+    if (refs.is_array())
+        for (const json& xr : refs) {
+            if (!xr.is_object()) continue;
+            const std::string rid = xr.value("id", std::string());
+            if (rid.empty() || !xr.contains("last_point") || !xr["last_point"].is_array() ||
+                xr["last_point"].size() < 3)
+                continue;
+            sk["entities"].push_back(json{{"id", rid}, {"type", "point"},
+                                          {"p", xr["last_point"]}, {"construction", true}});
+            sk["constraints"].push_back(json{{"id", "__extref_fix_" + rid},
+                                             {"type", "fix"}, {"refs", json::array({rid})}});
+        }
     return sk;
 }
 

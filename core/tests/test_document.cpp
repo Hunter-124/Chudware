@@ -1128,6 +1128,62 @@ TEST_CASE("extrude from a reference plane -> profile starts at the plane") {
     CHECK(hi[2] == doctest::Approx(START + D).epsilon(1e-4));
 }
 
+// 11b. T-3DDATUM — datum plane method "point_normal" (arbitrary origin + normal;
+//      closes the sketch3d_pipe auto-profile gap, MCP _profile_plane_ops). An
+//      on-axis case must match the equivalent "offset" plane exactly (z=START); an
+//      off-axis normal must still produce a valid extrude of the SAME volume
+//      (rotation-invariant check — the strongest thing to assert without deriving
+//      the tilted bbox by hand).
+TEST_CASE("datum plane point_normal: on-axis matches offset; off-axis normal still extrudes") {
+    const double W = 30.0, H = 20.0, START = 5.0, D = 10.0;
+    {
+        json doc;
+        doc["features"] = json::array({
+            sketch_feature("s1", "top", rect_entities(0, 0, W, H)),
+            json{{"id", "p1"}, {"type", "plane"}, {"method", "point_normal"},
+                 {"origin", json::array({0.0, 0.0, START})},
+                 {"normal", json::array({0.0, 0.0, 1.0})}},
+            json{{"id", "x1"}, {"type", "extrude"}, {"profile", "s1"},
+                 {"start", "from_reference"},
+                 {"start_ref", json{{"kind", "datum"}, {"feature", "p1"}}},
+                 {"end", "blind"}, {"depth", D}},
+        });
+        CompileResult r = compile_document(doc, json::object());
+        for (const auto& s : r.statuses)
+            if (!s.ok) MESSAGE("feature " << s.id << " error: " << s.error);
+        REQUIRE(r.ok);
+        REQUIRE(r.body_count == 1);
+        render::DocMesh dm = parse(r);
+        REQUIRE(dm.bodies.size() == 1);
+        double lo[3], hi[3];
+        bbox(dm.bodies[0], lo, hi);
+        CHECK(lo[2] == doctest::Approx(START).epsilon(1e-4));
+        CHECK(hi[2] == doctest::Approx(START + D).epsilon(1e-4));
+        CHECK(r.volume == doctest::Approx(W * H * D).epsilon(1e-3));
+    }
+    {
+        json doc;
+        doc["features"] = json::array({
+            sketch_feature("s1", "top", rect_entities(0, 0, W, H)),
+            json{{"id", "p1"}, {"type", "plane"}, {"method", "point_normal"},
+                 {"origin", json::array({1.0, 2.0, 3.0})},
+                 {"normal", json::array({1.0, 1.0, 1.0})}},
+            json{{"id", "x1"}, {"type", "extrude"}, {"profile", "s1"},
+                 {"start", "from_reference"},
+                 {"start_ref", json{{"kind", "datum"}, {"feature", "p1"}}},
+                 {"end", "blind"}, {"depth", D}},
+        });
+        CompileResult r = compile_document(doc, json::object());
+        for (const auto& s : r.statuses)
+            if (!s.ok) MESSAGE("feature " << s.id << " error: " << s.error);
+        REQUIRE(r.ok);
+        REQUIRE(r.body_count == 1);
+        // Volume is orientation-invariant — the off-axis plane still extrudes a
+        // clean W x H x D box, just tilted in world space.
+        CHECK(r.volume == doctest::Approx(W * H * D).epsilon(1e-3));
+    }
+}
+
 // ===========================================================================
 // Regression suite for the MCP black-box bug report (A1/A2/A3/A4/A6/B1/B2/B4).
 // Each case reproduces a previously-silent or mislabelled failure and pins the new

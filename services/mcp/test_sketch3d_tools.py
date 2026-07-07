@@ -394,6 +394,89 @@ class TestSketch3dDocTools:
         r, _ = _call("sketch3d_pipe", {"sketch3d_id": r0["id"], "doc_id": d})
         assert r and r.get("ok") is False and "exactly one" in r["error"]
 
+    # ── T-3DEQ: eq_curve3d ───────────────────────────────────────────────────
+
+    def test_add_eq_curve3d_helix(self):
+        d = self._new_part("s3d_eqcurve")
+        r0, _ = _call("sketch3d_new", {"name": "helix", "doc_id": d})
+        fid = r0["id"]
+        r, _ = _call("sketch3d_add_curves", {"sketch3d_id": fid, "doc_id": d, "curves": [
+            {"kind": "eq_curve3d", "xt": "10*cos(t)", "yt": "10*sin(t)", "zt": "2*t/360",
+             "t1": 0, "t2": 720}]})
+        assert r and r.get("ok"), r
+        assert r["added"] == 1
+        # 0 DOF — equation-fixed (mirrors the 2D eq_curve).
+        assert r["health"]["dof"] == 0
+        rg, _ = _call("sketch3d_get", {"sketch3d_id": fid, "doc_id": d})
+        assert rg["ok"]
+        ent = rg["entities"][0]
+        assert ent["type"] == "eq_curve3d"
+        assert abs(ent["p1"][0] - 10.0) < 1e-6 and abs(ent["p1"][2] - 0.0) < 1e-6
+        assert abs(ent["p2"][0] - 10.0) < 1e-6 and abs(ent["p2"][2] - 4.0) < 1e-6
+
+    def test_eq_curve3d_bad_expression_rejected(self):
+        d = self._new_part("s3d_eqcurve_bad")
+        r0, _ = _call("sketch3d_new", {"name": "bad", "doc_id": d})
+        r, _ = _call("sketch3d_add_curves", {"sketch3d_id": r0["id"], "doc_id": d, "curves": [
+            {"kind": "eq_curve3d", "xt": 5, "yt": "0", "zt": "0", "t1": 0, "t2": 1}]})
+        assert r and r.get("ok") is False
+
+    # ── T-3DXREF: external vertex references ────────────────────────────────
+
+    def test_ref_vertex_grounds_a_coincident_constraint(self):
+        d = self._new_part("s3d_xref")
+        rb, _ = _call("add_features", {"doc_id": d, "ops": [
+            {"op": "add_feature", "feature": {"type": "box", "name": "Blk",
+             "params": {"length": 20, "width": 20, "height": 20}}}]})
+        assert rb and rb.get("ok"), rb
+
+        r0, _ = _call("sketch3d_new", {"name": "s", "doc_id": d})
+        fid = r0["id"]
+        _call("sketch3d_add_curves", {"sketch3d_id": fid, "doc_id": d, "curves": [
+            {"kind": "line", "pts": [[0, 0, 0], [1, 1, 1]]}]})
+
+        # Find a vertex pick id via doc_resolve_pick (mirrors the GUI id-pass).
+        topo_id = None
+        for tid in range(1, 65):
+            pick = cb.call("doc_resolve_pick",
+                           {"doc_id": d, "body_id": 1, "kind": "vertex", "topo_id": tid})
+            sel = pick.get("selector")
+            if sel and sel.get("centroid"):
+                topo_id = tid
+                break
+        assert topo_id is not None, "expected at least one vertex on the box"
+
+        r, _ = _call("sketch3d_ref_vertex", {"sketch3d_id": fid, "doc_id": d,
+                                             "topo_id": topo_id})
+        assert r and r.get("ok"), r
+        ref_id = r["ref_id"]
+        assert ref_id.startswith("x")
+        assert r["point"] is not None and len(r["point"]) == 3
+        assert r["stale"] is False
+
+        rc, _ = _call("sketch3d_add_constraints", {"sketch3d_id": fid, "doc_id": d,
+                                                    "constraints": [
+                                                        {"type": "fix", "refs": ["e1.p1"]},
+                                                        {"type": "coincident",
+                                                         "refs": ["e1.p2", ref_id]}]})
+        assert rc and rc.get("ok"), rc
+        rg, _ = _call("sketch3d_get", {"sketch3d_id": fid, "doc_id": d})
+        assert rg["ok"]
+        e1 = next(e for e in rg["entities"] if e["id"] == "e1")
+        p2 = e1["p2"]
+        assert all(abs(p2[i] - r["point"][i]) < 1e-4 for i in range(3)), (p2, r["point"])
+
+    def test_ref_vertex_bad_topo_id_errors(self):
+        d = self._new_part("s3d_xref_bad")
+        rb, _ = _call("add_features", {"doc_id": d, "ops": [
+            {"op": "add_feature", "feature": {"type": "box", "name": "Blk",
+             "params": {"length": 5, "width": 5, "height": 5}}}]})
+        assert rb and rb.get("ok"), rb
+        r0, _ = _call("sketch3d_new", {"name": "s", "doc_id": d})
+        r, _ = _call("sketch3d_ref_vertex", {"sketch3d_id": r0["id"], "doc_id": d,
+                                             "topo_id": 99999})
+        assert r and r.get("ok") is False
+
     # ── sweep-ref helper / sampling / section ────────────────────────────────
 
     def test_as_sweep_guide_spine_and_guide(self):

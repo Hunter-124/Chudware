@@ -260,15 +260,62 @@ A `sketch3d` is a feature (`type:"sketch3d"`) with **no refs** and
 | `line` | `p1:[x,y,z]`, `p2:[x,y,z]` |
 | `arc` | `p1:[x,y,z]`, `pm:[x,y,z]`, `p2:[x,y,z]` — **THREE-POINT** arc: start / interior "through" point / end. (Chosen over center+normal+radius+angles: uniform point parameterization — no unit-normal normalization in the solve, natural endpoint handles for chaining, 1:1 GUI point drags. Collinear `p1`/`pm`/`p2` is degenerate and fails edge compile.) |
 | `spline` | `points:[[x,y,z],…]` (≥ 2; cubic interpolation through every point, like the 2D `spline`) |
+| `eq_curve3d` (T-3DEQ) | `xt:str`, `yt:str`, `zt:str`, `t1`, `t2` — parametric `x(t)/y(t)/z(t)` expression strings over `t∈[t1,t2]`, evaluated against the document equation grammar (§4 — degrees trig, globals; `t` is bound per-sample, not a global name). Compiled by sampling 33 points and interpolating a cubic BSpline through them (mirrors the 2D `eq_curve`'s sample-to-spline compile). **Solver: 0 DOF — equation-fixed** (rigid, like the 2D `eq_curve`): `p1`/`p2` (the endpoints at `t1`/`t2`) are pinned by an implicit fix residual right after allocation, so they are usable as `coincident`/`distance`/`point_on` targets for chaining but never move under any other constraint. Use for helices, sinusoidal routing runs, etc. — e.g. a helix: `xt:"R*cos(t)"`, `yt:"R*sin(t)"`, `zt:"P*t/360"`, `t1:0`, `t2:"720"` (two turns, `P`=pitch/turn, degrees). |
 
 All entities carry `construction:bool` (construction geometry never joins wire chains).
 
 ### 3B.2 Handles
 
-`"e3"` = whole entity; `"e3.p"` (point); `"e3.p1"` / `"e3.p2"` (line + arc endpoints; aliases
-`"e3.start"`/`"e3.end"` accepted); `"e3.pm"` (arc through-point; alias `"e3.mid"`);
-`"e3.p0"…"e3.pN"` (spline points). Grammar:
+`"e3"` = whole entity; `"e3.p"` (point); `"e3.p1"` / `"e3.p2"` (line + arc endpoints; `eq_curve3d`
+also uses `p1`/`p2` for its `t1`/`t2` endpoints; aliases `"e3.start"`/`"e3.end"` accepted);
+`"e3.pm"` (arc through-point; alias `"e3.mid"`); `"e3.p0"…"e3.pN"` (spline points). Grammar:
 `^e\d+(\.(p|p1|p2|pm|start|end|mid|p\d+))?$`.
+
+### 3B.1b External model references (T-3DXREF, v1)
+
+A `sketch3d` feature may additionally carry `external_refs: [ExternalRef3…]` — persistent
+records that ground a constraint against a **vertex on the built model** (Hunter's ask: "a
+spline that interacts with a specific corner on my part"), mirroring the 2D §3.5 external-ref
+semantics but at the doc-feature level (not nested under a sketch plane).
+
+```json
+{"id": "x1", "source": {"kind": "vertex", "selector": {...}}, "stale": false,
+ "last_point": [12.5, 40.0, 0.0]}
+```
+
+| field | meaning |
+|---|---|
+| `id` | mints an `x<N>` id (same id-space convention as 2D external_refs), usable directly as a POINT handle in any constraint's `refs` (e.g. `coincident: ["e5.p2", "x1"]`, `distance: ["e3.p1", "x1"]`) — no `.p` suffix, `x1` alone is the point. |
+| `source.kind` | **`"vertex"` is the v1-supported, REQUIRED-to-work kind** — resolves to a fixed 3D point. `"edge"` / `"face"` are accepted in the schema (forward-compat) but are **NOT resolved in v1** — they are always left `stale:true` (an honest gate, not a silent no-op; see below). |
+| `source.selector` | a normal geometric selector (contracts/selectors.md — kind/surf/centroid/axis/measure/owner_feature/hint_index), built the same way `query_geometry`/pick selectors are built elsewhere in the doc. For a vertex this is the `describe_vertices` fingerprint. |
+| `stale` | `true` when the selector failed to re-resolve on the last rebuild (owner feature deleted, geometry moved past the score margin) **or** `source.kind` isn't `"vertex"`. The ref's `last_point` (if any) is kept — never wiped — so the sketch keeps solving at its last-good ground position, same "never block the edit" contract as 2D. |
+| `last_point` | the resolved `[x,y,z]` world point, written by the resolver on every successful re-resolve. Absent until the first successful resolve (a ref that has NEVER resolved is not injected into the solve at all — any constraint referencing it forward-tolerantly fails to resolve, like any unknown handle). |
+
+**Re-resolution + solve ordering (every mutating rebuild):** `refresh_sketch3d_external_refs`
+(core/doc/session.cpp) runs BEFORE `compile_document`, re-resolving every sketch3d's vertex
+selectors against the document's compiled body/bodies and writing back `last_point`/`stale`.
+`compile_document`'s `sketch3d` branch then injects each ref with a `last_point` as a fixed
+`construction:true` point entity (id = the ref id) plus an implicit `fix` constraint, and solves
+normally — so the constrained geometry (e.g. a spline endpoint pinned `coincident` to `x1`)
+follows the source vertex on every rebuild. A `sketch3d_health` call surfaces stale refs as a
+feature-status **warning** (never a failure), same shape as the 2D external-ref reporting.
+**Downstream ordering:** a `sweep` (or anything else) consuming this `sketch3d`'s wire compiles
+strictly after it in feature order, so it always sees the already-re-solved geometry — no
+separate re-run needed beyond the normal feature-tree compile order.
+
+**v1 simplification (documented gap):** refs resolve against the document's FINAL compiled
+body/bodies (same convention `refresh_sketch_external_refs` uses for 2D face/edge refs), not
+strictly "the body as of this sketch3d's position in history." In practice this means a
+sketch3d authored early can reference a vertex that only exists after a LATER feature — usually
+the more useful behavior ("chase the final corner"), but it is not a strict topological-order
+guarantee and isn't specially guarded beyond the existing rebuild recursion protections.
+**GUI creation flow (for the agent wiring the picker):** the host has the picked vertex's owner
+feature id + world position + a topology descriptor from its id-pass (the same pipeline that
+backs `doc_resolve_pick`); it should call the new MCP tool `sketch3d_ref_vertex(sketch_id,
+query)` (or the underlying `doc_apply_ops` `add_sketch3d_external_ref` op — see
+sketch3d_gui_contract.md) with either that pick descriptor or a `query_geometry`-style
+plain-word query; the engine mints the `x<N>` id and returns it for the GUI to use as a handle
+in the next `add_constraints` call.
 
 ### 3B.3 Constraints (v1)
 

@@ -76,14 +76,54 @@ void perp_basis(const Vector3d& axis, Vector3d& e1, Vector3d& e2) {
     e2 = a.cross(e1).normalized();
 }
 
+// eq_curve3d: evaluate x(t)/y(t)/z(t) expression strings (doc equation grammar,
+// aicad::util::evaluate — degrees trig, `env` globals, `t` bound per-call) at a
+// given parameter value. Throws aicad::util::ExprError on a bad expression.
+Vector3d eval_eq_curve3d(const json& e, double t, const json& env) {
+    std::map<std::string, double> m = env_to_map(env);
+    m["t"] = t;
+    double x = aicad::util::evaluate(e.value("xt", std::string("0")), m);
+    double y = aicad::util::evaluate(e.value("yt", std::string("0")), m);
+    double z = aicad::util::evaluate(e.value("zt", std::string("0")), m);
+    return Vector3d(x, y, z);
+}
+
+// Sample an eq_curve3d at N points over [t1, t2] inclusive (for wire compilation
+// — see profile3d.cpp's build_edge3, which interpolates a BSpline through these
+// exactly like the 2D eq_curve samples-to-spline compile).
+std::vector<Vector3d> sample_eq_curve3d(const json& e, const json& env, int n = 33) {
+    double t1 = num(e.value("t1", json(0.0)));
+    double t2 = num(e.value("t2", json(1.0)));
+    std::vector<Vector3d> pts;
+    pts.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        double t = t1 + (t2 - t1) * (static_cast<double>(i) / (n - 1));
+        pts.push_back(eval_eq_curve3d(e, t, env));
+    }
+    return pts;
+}
+
 // -------------------------------------------------------------- entity layout
 // Variable allocation order per entity (all coordinates are variables):
 //   point  p(x,y,z)                          -> 3
 //   line   p1(x,y,z) p2(x,y,z)               -> 6
 //   arc    p1(x,y,z) pm(x,y,z) p2(x,y,z)     -> 9   (three-point arc)
 //   spline points[0..N-1] each (x,y,z)       -> 3N
-std::vector<int> allocate_entity(System& sys, const json& e) {
+//   eq_curve3d p1(x,y,z)=P(t1) p2(x,y,z)=P(t2) -> 6 (rigid/fixed — see build_system's
+//          post-allocation pin pass; v1 has no solve variables, matching the 2D
+//          eq_curve "0 DOF — equation-fixed" convention. Endpoints are usable as
+//          coincident/point_on targets like any fixed geometry.)
+std::vector<int> allocate_entity(System& sys, const json& e, const json& env) {
     const std::string t = e.value("type", std::string());
+    if (t == "eq_curve3d") {
+        try {
+            Vector3d a = eval_eq_curve3d(e, num(e.value("t1", json(0.0))), env);
+            Vector3d b = eval_eq_curve3d(e, num(e.value("t2", json(1.0))), env);
+            return sys.add_vars(6, {a.x(), a.y(), a.z(), b.x(), b.y(), b.z()});
+        } catch (const aicad::util::ExprError&) {
+            return sys.add_vars(6, {0, 0, 0, 0, 0, 0});
+        }
+    }
     if (t == "point") {
         Vector3d p = pt3(e.at("p"));
         return sys.add_vars(3, {p.x(), p.y(), p.z()});
@@ -149,7 +189,7 @@ Handle3 resolve_handle(const std::string& h, const EntMap& entities,
         return Handle3{v, true};  // whole entity (fix)
     }
     if (t == "point" && sub == "p") return triple(0);
-    if (t == "line") {
+    if (t == "line" || t == "eq_curve3d") {
         if (sub == "p1" || sub == "start") return triple(0);
         if (sub == "p2" || sub == "end") return triple(1);
     }
@@ -588,7 +628,8 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
 }
 
 // ------------------------------------------------------------------- extraction
-json extract_entities(const VectorXd& x, const json& entities_list, const VarMap& vm) {
+json extract_entities(const VectorXd& x, const json& entities_list, const VarMap& vm,
+                      const json& env) {
     json out = json::object();
     auto arr3 = [&](const std::vector<int>& v, int k) {
         return json::array({x(v[k * 3]), x(v[k * 3 + 1]), x(v[k * 3 + 2])});
@@ -600,7 +641,23 @@ json extract_entities(const VectorXd& x, const json& entities_list, const VarMap
         if (vit == vm.end()) continue;
         const std::vector<int>& v = vit->second;
         json rec = json{{"type", t}, {"construction", e.value("construction", false)}};
-        if (t == "point" && v.size() >= 3) {
+        if (t == "eq_curve3d" && v.size() >= 6) {
+            rec["p1"] = arr3(v, 0);
+            rec["p2"] = arr3(v, 1);
+            rec["xt"] = e.value("xt", std::string());
+            rec["yt"] = e.value("yt", std::string());
+            rec["zt"] = e.value("zt", std::string());
+            rec["t1"] = num(e.value("t1", json(0.0)));
+            rec["t2"] = num(e.value("t2", json(1.0)));
+            json samples = json::array();
+            try {
+                for (const Vector3d& p : sample_eq_curve3d(e, env))
+                    samples.push_back(json::array({p.x(), p.y(), p.z()}));
+            } catch (const aicad::util::ExprError&) {
+                // leave samples empty — profile3d skips a bad eq_curve3d edge
+            }
+            rec["samples"] = std::move(samples);
+        } else if (t == "point" && v.size() >= 3) {
             rec["p"] = arr3(v, 0);
         } else if (t == "line" && v.size() >= 6) {
             rec["p1"] = arr3(v, 0);
@@ -702,10 +759,33 @@ void build_system(const json& entities_list, const json& constraints_list,
     for (const auto& e : entities_list) entities[e.value("id", std::string())] = e;
     for (const auto& e : entities_list) {
         try {
-            var_map[e.value("id", std::string())] = allocate_entity(sys, e);
+            var_map[e.value("id", std::string())] = allocate_entity(sys, e, env);
         } catch (...) {
             var_map[e.value("id", std::string())] = sys.add_vars(0, {});
         }
+    }
+    // eq_curve3d is rigid/equation-fixed (v1, mirroring the 2D eq_curve "0 DOF"
+    // convention): pin its 6 vars right after allocation so no downstream
+    // constraint can move the equation-computed endpoints — they're only usable
+    // as fixed targets (coincident/point_on/distance), not free geometry.
+    for (const auto& e : entities_list) {
+        if (e.value("type", std::string()) != "eq_curve3d") continue;
+        const std::string id = e.value("id", std::string());
+        auto vit = var_map.find(id);
+        if (vit == var_map.end() || vit->second.size() != 6) continue;
+        VectorXd init = sys.init_vector();
+        std::vector<double> targets;
+        for (int i : vit->second) targets.push_back(init(i));
+        std::vector<int> idx = vit->second;
+        sys.add_residual(
+            [targets](const VectorXd& x) {
+                VectorXd r(6);
+                for (int i = 0; i < 6; ++i) r(i) = x(i) - targets[i];
+                return r;
+            },
+            idx,
+            [](const VectorXd&) { return MatrixXd::Identity(6, 6); },
+            "__eq_curve3d_pin_" + id);
     }
     for (const auto& c : constraints_list) {
         try {
@@ -763,7 +843,7 @@ Sketch3DSolution solve_sketch3d(const json& sketch, const json& env,
     sol.redundant = analysis.redundant_tags;
     sol.conflicting = analysis.conflicting_tags;
 
-    sol.entities = extract_entities(res.x, entities_list, var_map);
+    sol.entities = extract_entities(res.x, entities_list, var_map, env);
     MatrixXd J = sys.real_jacobian(res.x);
     sol.statuses = compute_statuses(entities_list, var_map, sys.n_vars(), J,
                                     sol.conflicting, build_tag_vars(constraints_list, var_map));
@@ -886,7 +966,7 @@ json drag3(const SolveState3& state, const std::string& handle,
                     {"entities", extract_entities(
                                      state.n_vars == sys.n_vars() ? state.x
                                                                   : sys.init_vector(),
-                                     entities_list, var_map)},
+                                     entities_list, var_map, env)},
                     {"statuses", json::object()}, {"converged", true},
                     {"budget_exceeded", false}};
     }
@@ -906,7 +986,7 @@ json drag3(const SolveState3& state, const std::string& handle,
     for (const auto& kv : statuses_map) statuses[kv.first] = kv.second;
     json rej = json::array();
     for (const auto& h : rejected_handles) rej.push_back(h);
-    return json{{"ok", true}, {"entities", extract_entities(x, entities_list, var_map)},
+    return json{{"ok", true}, {"entities", extract_entities(x, entities_list, var_map, env)},
                 {"statuses", statuses}, {"rejected_handles", rej},
                 {"converged", res.converged}, {"budget_exceeded", res.budget_exceeded}};
 }

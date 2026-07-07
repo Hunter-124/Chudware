@@ -18,6 +18,8 @@
 
 #include "doc/document.h"
 #include "doc/session.h"
+#include "doc/selectors.h"
+#include "doc/picks.h"
 #include "geom/profile3d.h"
 
 using json = nlohmann::json;
@@ -291,6 +293,97 @@ TEST_CASE("sketch3d health + drag RPCs through the session layer") {
                                              json::array({0.0, 0.0, 0.0}), json());
     CHECK_FALSE(bad["ok"].get<bool>());
     CHECK(bad["entities"].size() == 1);
+
+    aicad::doc::doc_close(doc_id);
+}
+
+// ---- T-3DXREF: sketch3d external vertex references -------------------------
+
+TEST_CASE("sketch3d external vertex ref: resolves, grounds a coincident constraint, "
+         "follows an upstream edit, goes stale (kept) when the source is deleted") {
+    using aicad::doc::doc_new;
+    using aicad::doc::doc_apply_ops;
+    json nr = doc_new("part", "sketch3d-xref-test");
+    const std::string doc_id = nr["doc_id"].get<std::string>();
+
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    json add_box = json{{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Blk"},
+        {"params", {{"length", dimv(20)}, {"width", dimv(20)}, {"height", dimv(20)}}}}}};
+    json r1 = doc_apply_ops(doc_id, -1, json::array({add_box}), false);
+    REQUIRE(r1.contains("revision"));
+    const std::string box_fid = r1["id_map"]["$0"].get<std::string>();
+    REQUIRE(!box_fid.empty());
+
+    // Find the box corner at (20,20,20) through the same RPC surface a GUI pick
+    // would use (doc_resolve_pick) — scan vertex topo_ids for the one nearest our
+    // target corner (doc_resolve_pick needs a topo_id, which we don't know a
+    // priori from a plain box feature).
+    json best_sel;
+    double best_d = 1e18;
+    for (int tid = 1; tid <= 64; ++tid) {
+        json pick;
+        try {
+            pick = aicad::doc::doc_resolve_pick(doc_id, 1, "vertex", tid);
+        } catch (...) { break; }
+        const json& sel = pick["selector"];
+        if (!sel.contains("centroid")) continue;
+        Eigen::Vector3d c(sel["centroid"][0].get<double>(), sel["centroid"][1].get<double>(),
+                          sel["centroid"][2].get<double>());
+        double d = (c - Eigen::Vector3d(-10, -10, -10)).norm();
+        if (d < best_d) { best_d = d; best_sel = sel; }
+    }
+    REQUIRE(best_d < 1e-6);
+
+    json sk3 = json{{"type", "sketch3d"},
+                    {"params", json{
+                        {"entities", json::array({line3("e1", {0, 0, 0}, {5, 5, 5})})},
+                        {"constraints", json::array({rel("c1", "fix", {"e1.p1"}),
+                                                     rel("c2", "coincident", {"e1.p2", "x1"})})},
+                        {"external_refs", json::array({
+                            json{{"id", "x1"},
+                                {"source", {{"kind", "vertex"}, {"selector", best_sel}}},
+                                {"stale", true}}})}}}};
+    json ops2 = json::array({json{{"op", "add_feature"}, {"feature", sk3}}});
+    json r2 = doc_apply_ops(doc_id, -1, ops2, false);
+    const std::string fid = r2["id_map"]["$0"].get<std::string>();
+    REQUIRE(!fid.empty());
+
+    json h = aicad::doc::doc_sketch3d_health(doc_id, fid);
+    REQUIRE(h["ok"].get<bool>());
+    const json* e1 = nullptr;
+    for (const auto& e : h["entities"]) if (e["id"] == "e1") e1 = &e;
+    REQUIRE(e1 != nullptr);
+    // THE demo case: the constrained endpoint follows the resolved corner.
+    CHECK((*e1)["p2"][0].get<double>() == doctest::Approx(-10.0).epsilon(1e-4));
+    CHECK((*e1)["p2"][1].get<double>() == doctest::Approx(-10.0).epsilon(1e-4));
+    CHECK((*e1)["p2"][2].get<double>() == doctest::Approx(-10.0).epsilon(1e-4));
+
+    // Edit the box (height 20 -> 35): the corner moves to (10,10,17.5); re-resolve
+    // (any mutating doc_apply_ops batch refreshes external_refs) and re-check —
+    // the constrained endpoint follows the moved corner.
+    json edit_box = json{{"op", "edit_feature"}, {"id", "f1"},
+                         {"params", {{"height", dimv(35)}}}};
+    json r3 = doc_apply_ops(doc_id, -1, json::array({edit_box}), false);
+    REQUIRE(r3.contains("revision"));
+    json h2 = aicad::doc::doc_sketch3d_health(doc_id, fid);
+    REQUIRE(h2["ok"].get<bool>());
+    const json* e1b = nullptr;
+    for (const auto& e : h2["entities"]) if (e["id"] == "e1") e1b = &e;
+    REQUIRE(e1b != nullptr);
+    CHECK((*e1b)["p2"][2].get<double>() == doctest::Approx(-17.5).epsilon(1e-4));
+
+    // Delete the box: the vertex source can no longer resolve. The ref goes
+    // stale but keeps its LAST-GOOD ground point — the sketch keeps solving.
+    json del_box = json{{"op", "delete_feature"}, {"id", box_fid}};
+    json r4 = doc_apply_ops(doc_id, -1, json::array({del_box}), false);
+    REQUIRE(r4.contains("revision"));
+    json h3 = aicad::doc::doc_sketch3d_health(doc_id, fid);
+    REQUIRE(h3["ok"].get<bool>());
+    const json* e1c = nullptr;
+    for (const auto& e : h3["entities"]) if (e["id"] == "e1") e1c = &e;
+    REQUIRE(e1c != nullptr);
+    // Last-good position (from the height=35 state) kept, not silently zeroed.
+    CHECK((*e1c)["p2"][2].get<double>() == doctest::Approx(-17.5).epsilon(1e-4));
 
     aicad::doc::doc_close(doc_id);
 }

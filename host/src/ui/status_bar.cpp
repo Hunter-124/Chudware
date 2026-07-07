@@ -13,6 +13,25 @@
 
 namespace ui {
 
+// [workspace-tabs seam] Parts download-queue hook (see status_bar.h). Default-implemented as
+// unwired (null) — the Parts Library token shows "Downloads: 0" until the parts agent assigns it.
+int (*partsDownloadQueueCount)() = nullptr;
+
+// Human-readable stage labels that match the sim worker's stage token vocabulary.
+static std::string prettySimStage(const std::string& s) {
+    if (s == "voxelize") return "Voxelizing";
+    if (s == "mesh")     return "Meshing";
+    if (s == "assemble") return "Assembling";
+    if (s == "solve")    return "Solving";
+    if (s == "stream")   return "Streaming results";
+    if (s == "post")     return "Post-processing";
+    return s.empty() ? "Solving" : s;
+}
+
+// Title-bar workspace names, indexed by AppState::Workspace.
+static const char* kWsName[] = {"Model", "Drawing", "Simulate", "Electronics",
+                                "Manufacture", "PLM", "Parts Library", "AI"};
+
 void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
                    ImGuiWindowFlags hostFlags) {
     // ---------- status bar (state + live agent phase left, provider/model right) ----------
@@ -43,6 +62,16 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     ImGui::Dummy(ImVec2(dr * 2 + ui::metrics::px(8), 0));
     ImGui::SameLine();
     ImGui::TextColored(sc, "%s", st.status.c_str());
+    // [workspace-tabs seam] Active workspace context right after the app state — the title-bar
+    // tabs write st.activeWorkspace; this keeps the bottom-left readout in sync with them.
+    {
+        int wsIdx = (int)st.activeWorkspace;
+        if (wsIdx >= 0 && wsIdx < (int)(sizeof(kWsName) / sizeof(kWsName[0]))) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1),
+                               "|  %s", kWsName[wsIdx]);
+        }
+    }
     // C18: while editing a sketch, show "Under/Fully/Over Defined + DOF" tinted by status.
     if (auto* sk = st.sketchMode) {
         if (sk->active()) {
@@ -86,17 +115,7 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         std::string lg  = live ? st.simClient->recentLog()
                                : std::string("assembling stiffness matrix (12,480 nodes)");
         float elapsed   = live ? st.simClient->elapsedSeconds() : 7.0f;
-        // Human-readable stage labels that match the worker's stage token vocabulary.
-        auto prettyStage = [](const std::string& s) -> std::string {
-            if (s == "voxelize") return "Voxelizing";
-            if (s == "mesh")     return "Meshing";
-            if (s == "assemble") return "Assembling";
-            if (s == "solve")    return "Solving";
-            if (s == "stream")   return "Streaming results";
-            if (s == "post")     return "Post-processing";
-            return s.empty() ? "Solving" : s;
-        };
-        std::string chip = std::string("Sim ") + kSpin[si] + "  " + prettyStage(stg);
+        std::string chip = std::string("Sim ") + kSpin[si] + "  " + prettySimStage(stg);
         if (!lg.empty()) chip += "  \xe2\x80\x94  " + lg;  // em-dash separator before detail
         chip += "  (" + std::to_string(static_cast<int>(elapsed)) + "s)";
         ImGui::SameLine();
@@ -154,8 +173,39 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     // C24: the unit-system cluster mirrors SolidWorks — it shows MMGS / IPS and clicking it
     // toggles the active document unit system, reformatting every dimension display app-wide.
     const char* unitsTxt = st.ips() ? "IPS" : "MMGS";
-    const char* editTxt  = st.docMirror.hasDoc()
-                         ? (isAsm ? "Editing Assembly" : "Editing Part") : "";
+    // Unsaved-changes marker: mirror the active tab's dirty asterisk next to the editing mode so
+    // the save state is readable without looking up at the tab strip.
+    const bool docDirty = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+                          st.docTabs[st.activeTab].dirty;
+    std::string editStr = st.docMirror.hasDoc()
+                        ? std::string(isAsm ? "Editing Assembly" : "Editing Part") +
+                              (docDirty ? " *" : "")
+                        : std::string();
+    const char* editTxt = editStr.c_str();
+    // [workspace-tabs seam] Per-workspace live token, leftmost in the right cluster. Kept small
+    // and quiet; degrades gracefully when idle (Simulate shows "Solver idle", Parts Library shows
+    // the download-queue count via the partsDownloadQueueCount hook). Workspaces with no cheap
+    // live source (Manufacture CAM post state lives in the panel, not AppState) show nothing.
+    std::string wsTok;
+    bool wsTokLive = false;   // true => tint statusOk (something is actively running)
+    switch (st.activeWorkspace) {
+        case AppState::Workspace::Simulate:
+            if (st.simClient && st.simClient->busy()) {
+                wsTok = "Solver: " + prettySimStage(st.simClient->stage()) + " (" +
+                        std::to_string((int)st.simClient->elapsedSeconds()) + "s)";
+                wsTokLive = true;
+            } else {
+                wsTok = "Solver idle";
+            }
+            break;
+        case AppState::Workspace::PartsLibrary: {
+            int n = partsDownloadQueueCount ? partsDownloadQueueCount() : 0;
+            wsTok = "Downloads: " + std::to_string(n);
+            wsTokLive = n > 0;
+            break;
+        }
+        default: break;
+    }
     // W5C: current display style (mirrors viewport_panel's DisplayStyle order: 0=Shaded
     // 1=ShadedEdges 2=HLR 3=HLV 4=Wireframe). Shown only when a document is open.
     static const char* kViewStyle[] = {"Shaded", "Shaded + Edges", "Hidden Lines",
@@ -168,11 +218,22 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     float editw = editTxt[0] ? ImGui::CalcTextSize(editTxt).x : 0.0f;
     float vsw   = vsTxt[0] ? ImGui::CalcTextSize(vsTxt).x : 0.0f;
     float sepw  = ImGui::CalcTextSize(sep.c_str()).x;
-    float total = (vsw > 0 ? vsw + sepw : 0.0f) + uniw + sepw +
+    float wstw  = wsTok.empty() ? 0.0f : ImGui::CalcTextSize(wsTok.c_str()).x;
+    float total = (wstw > 0 ? wstw + sepw : 0.0f) + (vsw > 0 ? vsw + sepw : 0.0f) + uniw + sepw +
                   (editw > 0 ? editw + sepw : 0.0f) + ptw;
     ImGui::SameLine(ImGui::GetWindowWidth() - total - 16.0f * dpiS);
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(pal.consoleDim[0], pal.consoleDim[1], pal.consoleDim[2], 1));
+    // --- per-workspace live token (leftmost; statusOk tint while something runs).
+    if (!wsTok.empty()) {
+        if (wsTokLive)
+            ImGui::TextColored(ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 1),
+                               "%s", wsTok.c_str());
+        else
+            ImGui::TextUnformatted(wsTok.c_str());
+        ImGui::SameLine(0, 0); ImGui::TextUnformatted(sep.c_str());
+        ImGui::SameLine(0, 0);
+    }
     // --- view-style token (read-only label; the viewport HUD / context menu changes it).
     if (vsTxt[0]) {
         ImGui::TextUnformatted(vsTxt);

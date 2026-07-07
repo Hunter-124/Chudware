@@ -143,10 +143,41 @@ void ShortcutBar::draw(AppState& st, bool inSketch) {
     }
     ImGui::PopID();
 
-    // Click-outside detection: if the mouse button was clicked while not hovering the bar, dismiss.
+    // [workspace-tabs seam] Workspace-switch hint under the pill: the title-bar tabs are also
+    // reachable via Ctrl+1..Ctrl+8 (key routing in app.cpp); surface that here since the shortcut
+    // bar is exactly where a keyboard-first user looks. Small frosted chip, full mapping on hover.
+    {
+        const char* hint = "Ctrl+1\xe2\x80\xa6" "8  workspaces";   // "Ctrl+1…8  workspaces"
+        ImVec2 hsz = ImGui::CalcTextSize(hint);
+        const float hpx = 8.0f * s, hpy = 3.0f * s;
+        float hx = p0.x + (barW - hsz.x) * 0.5f;
+        float hy = p1.y + 4.0f * s;
+        ImRect hintRect(ImVec2(hx - hpx, hy - hpy), ImVec2(hx + hsz.x + hpx, hy + hsz.y + hpy));
+        const ui::AdaptiveSurface& hs =
+            ui::adaptivePanel(ui::panelId("host_shortcut_bar_hint"), hintRect, ui::GlassGroup::Hud);
+        ui::glassPanel(dl, hintRect, ui::GlassLevel::Regular,
+                       (hsz.y + hpy * 2.0f) * 0.5f / s, hs);
+        ImVec4 hc = hs.textSecondary;
+        dl->AddText(ImVec2(hx, hy), ImGui::ColorConvertFloat4ToU32(hc), hint);
+        ImVec2 mp = ImGui::GetIO().MousePos;
+        if (mp.x >= hintRect.Min.x && mp.x <= hintRect.Max.x &&
+            mp.y >= hintRect.Min.y && mp.y <= hintRect.Max.y)
+            ImGui::SetTooltip("Switch workspace:\n"
+                              "  Ctrl+1  Model\n"
+                              "  Ctrl+2  Drawing\n"
+                              "  Ctrl+3  Simulate\n"
+                              "  Ctrl+4  Electronics\n"
+                              "  Ctrl+5  Manufacture\n"
+                              "  Ctrl+6  PLM\n"
+                              "  Ctrl+7  Parts Library\n"
+                              "  Ctrl+8  AI");
+    }
+
+    // Click-outside detection: if the mouse button was clicked while not hovering the bar or its
+    // hint chip, dismiss (the hint chip sits just below the pill).
     if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         ImVec2 mp = ImGui::GetIO().MousePos;
-        if (mp.x < p0.x || mp.x > p1.x || mp.y < p0.y || mp.y > p1.y) {
+        if (mp.x < p0.x || mp.x > p1.x || mp.y < p0.y || mp.y > p1.y + 30.0f * s) {
             dismiss();
         }
     }

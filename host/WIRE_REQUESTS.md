@@ -105,3 +105,48 @@ Format:
     ui::setRibbonSketchActive(st.sketchMode->active());
     float ribbonH = ui::drawRibbon(...)
   Insert between setRibbonSketchActive and drawRibbon. Owner: workspace-shell.
+
+## furniture agent — workspace hotkeys + window title (2026-07-06)
+- [ ] (furniture) `host/src/app.cpp` — Ctrl+1..Ctrl+8 workspace switching. Insert inside the
+  existing global-keys block (the `{ const bool canDoc = ... }` scope, after the Ctrl+P handler
+  at ~L2531-2534 — same guards style as Ctrl+N/Ctrl+P). The shortcut bar + docs now advertise
+  these, so this block is the only missing piece:
+
+  ```cpp
+  // [workspace-tabs seam] Ctrl+1..Ctrl+8 switch the title-bar workspace (matches tab order).
+  // Guards: text input owns digits while typing; ECAD keeps its own accelerator space.
+  if (!textFocus && !ecadFocused && (io.KeyCtrl || io.KeySuper) && !io.KeyShift && !io.KeyAlt) {
+      using WS = AppState::Workspace;
+      static constexpr struct { ImGuiKey key; WS ws; } kWsKeys[] = {
+          {ImGuiKey_1, WS::Model},       {ImGuiKey_2, WS::Drawing},
+          {ImGuiKey_3, WS::Simulate},    {ImGuiKey_4, WS::Electronics},
+          {ImGuiKey_5, WS::Manufacture}, {ImGuiKey_6, WS::PLM},
+          {ImGuiKey_7, WS::PartsLibrary},{ImGuiKey_8, WS::AI},
+      };
+      for (const auto& k : kWsKeys)
+          if (ImGui::IsKeyPressed(k.key, false)) { st.activeWorkspace = k.ws; break; }
+  }
+  ```
+
+- [ ] (furniture) `host/src/app.cpp` — live window title "<doc name>[*] — AI-CAD" via
+  glfwSetWindowTitle on doc/tab/dirty change. Once per frame (anywhere after the doc-tab state is
+  settled, e.g. near the per-frame display-flag derivation at ~L2804), cheap change-detection:
+
+  ```cpp
+  // Window title mirrors the active document + dirty marker (SolidWorks-style).
+  {
+      std::string title;
+      if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+          const auto& tab = st.docTabs[st.activeTab];
+          title = tab.title.empty() ? "Untitled" : tab.title;   // use the tab-strip display name field
+          if (tab.dirty) title += "*";
+          title += " \xe2\x80\x94 AI-CAD";                      // " — AI-CAD"
+      } else {
+          title = "AI-CAD";
+      }
+      static std::string lastTitle;
+      if (title != lastTitle) { lastTitle = title; glfwSetWindowTitle(window, title.c_str()); }
+  }
+  ```
+  Note: substitute the actual DocTab display-name member (`title`/`name` — whichever the tab strip
+  renders) and the GLFWwindow* variable in scope (`window` in run_gui). Owner: workspace-shell.

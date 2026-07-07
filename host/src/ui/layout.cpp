@@ -243,6 +243,15 @@ void drawLeftPane(AppState& st,
                   const std::function<void(const std::string& featureId)>& editCallback) {
     PropertyManager* pm = st.propertyManager;
 
+    // [sim-gui rework, Hunter red-pen] The simulation setup tree exists ONLY in the Simulate
+    // workspace. SimManager::handleCommand parks st.leftPaneTab on LP_Simulation; if the user
+    // then switches to Model/Drawing (or any non-Simulate workspace) clamp it back to the
+    // FeatureManager so no Simulation pane state leaks into the modeling views (the inverse of
+    // the Simulate-side takeover below, which ignores the tab strip entirely).
+    if (st.activeWorkspace != AppState::Workspace::Simulate &&
+        st.leftPaneTab == kLeftPaneSimulation)
+        st.leftPaneTab = kLeftPaneFeatureManager;
+
     // Vertical-collapse state (T-G21): the column rolls UP to its header (tab row + collapse
     // chevron) instead of shrinking to a pill. Persisted in config.json (st.settings.fmCollapsed)
     // so a collapsed column stays collapsed across restarts; seeded once from the loaded setting
@@ -615,24 +624,10 @@ void drawLeftPane(AppState& st,
                 if (pmActive) {
                     pm->drawBody(st);
                 } else {
+                    // [sim-gui rework, Hunter red-pen] The simulation study tree does NOT render
+                    // here any more: it exists ONLY in the Simulate workspace (the early-return
+                    // Simulate branch above owns it). Model/Drawing show the feature tree alone.
                     drawFeatureTreeBody(st, editCallback);
-                    // Simulation studies now live IN the FeatureManager tree (no separate
-                    // "Simulation Studies" tab). Show the study section when the part has
-                    // studies or the Simulation workspace is active, so a Static/Modal/Flow
-                    // study reads as an editable tree feature with
-                    // Material/Fixtures/Loads/Mesh/Results subnodes + per-type setup forms.
-                    if (st.simManager) {
-                        const bool simWs = st.showSimulationTools ||
-                                           st.ribbonTab == AppState::RT_Simulation;
-                        if (st.simManager->studyCount() > 0 || simWs) {
-                            ImGui::Dummy(ImVec2(0, 6.0f * S));
-                            ImGui::Separator();
-                            ImGui::PushFont(st.fonts.medium);
-                            ImGui::TextUnformatted("Simulation");
-                            ImGui::PopFont();
-                            st.simManager->drawTreeBody(st);
-                        }
-                    }
                 }
                 break;
         }

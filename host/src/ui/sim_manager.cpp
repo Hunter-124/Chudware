@@ -17,7 +17,9 @@
 
 #include "metrics.h"
 #include "icons.h"
+#include "feature_tree.h"       // fmRowPill/fmTreeIcon/fmSectionDivider — FM-grade row styling
 #include "property_manager.h"   // PropertyManager::active() — mutual-exclusion pick guard
+#include "widgets/ribbon.h"     // setRibbonDisabledPrefix — EM tab gating
 #include "../core/app_state.h"
 #include "../core/sim_client.h"
 #include "../bootstrap.h"
@@ -793,13 +795,47 @@ void SimManager::deleteStudy(AppState& st, int i) {
 // ---------------------------------------------------------------- ribbon commands
 
 bool SimManager::handleCommand(AppState& st, const std::string& cmdId) {
-    if (cmdId == "sim_new_static")  { newStudy(st, StudyType::Static);  return true; }
-    if (cmdId == "sim_new_modal")   { newStudy(st, StudyType::Modal);   return true; }
-    if (cmdId == "sim_new_flow")    { newStudy(st, StudyType::Flow);    return true; }
-    if (cmdId == "sim_new_thermal") { newStudy(st, StudyType::Thermal); return true; }
-    if (cmdId == "sim_new_fatigue") { newStudy(st, StudyType::Fatigue); return true; }
-    if (cmdId == "sim_new_motion")  { newStudy(st, StudyType::Motion);  return true; }
+    // EM (electromagnetics) tab: every sim_em_* command is gated on the em_* backend probe.
+    if (cmdId.rfind("sim_em_", 0) == 0) return handleEmCommand(st, cmdId);
+
+    // sim-gui rework: creating a study opens its setup panel (PM-style, left pane) immediately.
+    auto newAndOpen = [&](StudyType t) {
+        newStudy(st, t);
+        if (sel_ >= 0) { node_ = SimNode::Study; panelOpen_ = true; }
+        return true;
+    };
+    if (cmdId == "sim_new_static")  return newAndOpen(StudyType::Static);
+    if (cmdId == "sim_new_modal")   return newAndOpen(StudyType::Modal);
+    if (cmdId == "sim_new_flow")    return newAndOpen(StudyType::Flow);
+    if (cmdId == "sim_new_thermal") return newAndOpen(StudyType::Thermal);
+    if (cmdId == "sim_new_fatigue") return newAndOpen(StudyType::Fatigue);
+    if (cmdId == "sim_new_motion")  return newAndOpen(StudyType::Motion);
     refresh(st);
+
+    // Per-type setup tools (the per-type ribbon tabs): target a study of the tab's type — keep
+    // the current selection when it already matches, else the first study of that type. All of
+    // them open the study-level setup panel (the Study node hosts the type's form).
+    struct TypedCmd { const char* id; StudyType t; };
+    static const TypedCmd kTypedSetup[] = {
+        {"sim_modal_options", StudyType::Modal},   {"sim_fluid",         StudyType::Flow},
+        {"sim_flow_bc",       StudyType::Flow},    {"sim_flow_res",      StudyType::Flow},
+        {"sim_thermal_bc",    StudyType::Thermal}, {"sim_fatigue_setup", StudyType::Fatigue},
+        {"sim_motion_setup",  StudyType::Motion},
+    };
+    for (const auto& tc : kTypedSetup) {
+        if (cmdId != tc.id) continue;
+        st.leftPaneTab = AppState::LP_Simulation;
+        if (!selectStudyOfType(tc.t)) {
+            st.toast(ui::ToastLevel::Warn, std::string("Create a ") + studyTypeLabel(tc.t) +
+                                               " study first (\"New Study\" on this tab).");
+            return true;
+        }
+        node_ = SimNode::Study;
+        loadIdx_ = -1;
+        armedWell_ = -1;
+        panelOpen_ = true;
+        return true;
+    }
     const bool haveStudy = sel_ >= 0 && sel_ < (int)studies_.size();
     // Material / Results / Mesh: open the pane on the matching sub-node of the active study. Mesh
     // also actually MESHES the part and shows the element wireframe (the toolbar button used to be a
@@ -815,6 +851,7 @@ bool SimManager::handleCommand(AppState& st, const std::string& cmdId) {
             const bool busy = st.simClient && st.simClient->busy();
             if (!busy) previewMesh(st, s);   // mesh now + show the wireframe (no solve)
         }
+        panelOpen_ = true;   // tool invoked -> its setup panel opens (PM-style)
         return true;
     }
     if (!haveStudy) {
@@ -840,23 +877,86 @@ bool SimManager::handleCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "sim_fixture") {
         captureSelectionInto(st, s.fixtures); persist(st, s);
         st.selection.clear();
-        node_ = SimNode::Fixtures; armedWell_ = 0; st.leftPaneTab = AppState::LP_Simulation; return true;
+        node_ = SimNode::Fixtures; armedWell_ = 0; st.leftPaneTab = AppState::LP_Simulation;
+        panelOpen_ = true; return true;
     }
     if (cmdId == "sim_load_force") {
         s.loads.push_back(SimLoad{}); captureSelectionInto(st, s.loads.back().faces); persist(st, s);
         st.selection.clear();
         node_ = SimNode::Load; loadIdx_ = (int)s.loads.size() - 1; armedWell_ = (int)s.loads.size();
-        st.leftPaneTab = AppState::LP_Simulation; return true;
+        st.leftPaneTab = AppState::LP_Simulation; panelOpen_ = true; return true;
     }
     if (cmdId == "sim_load_pressure") {
         SimLoad l; l.pressure = true; s.loads.push_back(l);
         captureSelectionInto(st, s.loads.back().faces); persist(st, s);
         st.selection.clear();
         node_ = SimNode::Load; loadIdx_ = (int)s.loads.size() - 1; armedWell_ = (int)s.loads.size();
-        st.leftPaneTab = AppState::LP_Simulation; return true;
+        st.leftPaneTab = AppState::LP_Simulation; panelOpen_ = true; return true;
     }
-    if (cmdId == "sim_run") { st.leftPaneTab = AppState::LP_Simulation; run(st, s); return true; }
+    if (cmdId == "sim_run") {
+        st.leftPaneTab = AppState::LP_Simulation;
+        panelOpen_ = true;   // show the run progress / result summary panel
+        run(st, s);
+        return true;
+    }
     return false;
+}
+
+// sim-gui rework: prefer the current selection when it already matches the requested type, else
+// the first study of that type (studies_ mirror order). Returns false when none exists.
+bool SimManager::selectStudyOfType(StudyType t) {
+    if (sel_ >= 0 && sel_ < (int)studies_.size() && studies_[sel_].type == t) return true;
+    for (int i = 0; i < (int)studies_.size(); ++i) {
+        if (studies_[i].type == t) { sel_ = i; return true; }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------- EM (electromagnetics) gating
+//
+// The EM ribbon tab's tools call em_* worker RPCs owned by a parallel backend agent. Until that
+// backend lands (or on installs without the solver), em_status is probed ONCE asynchronously; a
+// missing backend greys the whole sim_em_* command set with an honest "EM solver not installed"
+// tooltip (ui::setRibbonDisabledPrefix) — no fake buttons, no silent no-ops.
+void SimManager::probeEmStatus(AppState& st) {
+    if (emStatus_ != 0 || emProbeInflight_) return;
+    emProbeInflight_ = true;
+    st.rpc.call("em_status", nlohmann::json::object(),
+                [this](const core::RpcResult& r) {
+                    emProbeInflight_ = false;
+                    // Protocol-2 method errors arrive ok=true with result.code set — an unknown
+                    // method / missing solver both count as "not installed".
+                    const bool available = r.ok && !r.result.contains("code") &&
+                                           r.result.value("installed", r.result.value("available", true));
+                    emStatus_ = available ? 1 : -1;
+                    if (emStatus_ < 0)
+                        ui::setRibbonDisabledPrefix("sim_em_", "EM solver not installed");
+                    else
+                        ui::setRibbonDisabledPrefix("", "");
+                },
+                5000);
+}
+
+bool SimManager::handleEmCommand(AppState& st, const std::string& cmdId) {
+    (void)cmdId;
+    if (emStatus_ == 0) {
+        probeEmStatus(st);
+        st.toast(ui::ToastLevel::Info, "Checking for the electromagnetics solver\xe2\x80\xa6");
+        return true;
+    }
+    if (emStatus_ < 0) {
+        st.toast(ui::ToastLevel::Warn,
+                 "Electromagnetics solver not installed \xe2\x80\x94 the em_* backend is not "
+                 "available on this machine.");
+        return true;
+    }
+    // Backend present. The EM study UI (eigenmode / S-parameter sweep / time domain setup forms)
+    // wires up once the backend agent's RPC contract is final — wire request filed in
+    // host/WIRE_REQUESTS.md (sim-gui agent). Honest state until then: tell the user.
+    st.toast(ui::ToastLevel::Info,
+             "EM backend detected \xe2\x80\x94 EM study setup UI lands with the backend contract "
+             "(in progress).");
+    return true;
 }
 
 void SimManager::configureActive(AppState& st, float density, const std::string& materialKey) {
@@ -1805,6 +1905,11 @@ void SimManager::syncResultView(AppState& st) {
 void SimManager::tick(AppState& st) {
     syncResultView(st);   // keep the viewport in step with the result/model view (every frame, cheap)
     tickMotion(st);       // advance motion playback frame if playing
+    // EM gating: probe the em_* backend ONCE when the Simulate workspace is active (async — the
+    // callback lands in a later st.rpc.drain(); no per-frame or synchronous worker traffic).
+    if (emStatus_ == 0 && !emProbeInflight_ &&
+        st.activeWorkspace == AppState::Workspace::Simulate)
+        probeEmStatus(st);
     if (!st.simClient) return;
     auto* sim = st.simClient;
     auto& job = sim->job();
@@ -2026,8 +2131,24 @@ void SimManager::drawTreeBody(AppState& st) {
     if (paneInk) ImGui::PushStyleColor(ImGuiCol_Text, simSurf().textPrimary);
     struct PaneInkPop { bool on; ~PaneInkPop() { if (on) ImGui::PopStyleColor(); } } paneInkPop{paneInk};
 
-    // ---- Single "+ New Study" entry point: opens a picker popup for the 5 study types.
-    // Ribbon sim_new_* commands remain as keyboard accelerators (ribbon_def.cpp, untouched).
+    // ---- sim-gui rework: tool-invoked setup panel (PropertyManager flow) --------------------
+    // When a ribbon tool was invoked (or a tree node double-clicked) the matching setup editor
+    // TAKES OVER the pane body — exactly how a modeling command's PM form replaces the feature
+    // tree. Closing (OK / X) returns to the study tree. No more always-open numbered accordions.
+    if (panelOpen_ && (sel_ < 0 || sel_ >= (int)studies_.size())) panelOpen_ = false;
+    if (panelOpen_) {
+        Study& s = studies_[sel_];
+        if (!drawPanelHeader(st, s)) {
+            panelOpen_ = false;
+            armedWell_ = -1;
+        } else {
+            drawForm(st, s);
+        }
+        return;
+    }
+
+    // ---- Single "+ New Study" entry point: opens a picker popup for the study types.
+    // The per-type ribbon tabs' "New Study" buttons route to the same newStudy path.
     if (ImGui::Button("+ New Study", ImVec2(-FLT_MIN, 0)))
         ImGui::OpenPopup("##newStudyPicker");
     simTip("Add a simulation study to this part. Static, Fatigue, Frequency, Flow, or Thermal.");
@@ -2081,18 +2202,57 @@ void SimManager::drawTreeBody(AppState& st) {
         return;
     }
 
-    ImGui::Separator();
-
-    // ---- study tree ----
+    // ---- study tree (FM-grade rows; single-click selects, double-click opens the editor) ----
+    ui::fmRowStripeReset();   // restart stripe phase + refresh the FM palette for this pane body
+    ui::fmSectionDivider("Studies");
     for (int i = 0; i < (int)studies_.size(); ++i) drawStudyRow(st, i);
+}
 
-    // ---- inline form for the selected study/sub-node ----
-    if (sel_ >= 0 && sel_ < (int)studies_.size()) {
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-        drawForm(st, studies_[sel_]);
+// PM-style setup-panel header: study-type icon + "<study> - <section>" title and a right-aligned
+// OK button (the sim setup forms persist edits immediately, so OK simply closes — same visual
+// language as the PropertyManager's command header). Returns false once the user closes it.
+bool SimManager::drawPanelHeader(AppState& st, Study& s) {
+    const float S = ui::uiScale;
+    bool keepOpen = true;
+
+    const char* section = "Setup";
+    switch (node_) {
+        case SimNode::Material: section = "Material"; break;
+        case SimNode::Fixtures: section = "Fixtures"; break;
+        case SimNode::Load:     section = "Loads"; break;
+        case SimNode::Mesh:     section = "Mesh"; break;
+        case SimNode::Results:  section = (s.type == StudyType::Motion) ? "Playback" : "Results"; break;
+        case SimNode::Study:
+            switch (s.type) {
+                case StudyType::Flow:    section = "Flow Setup"; break;
+                case StudyType::Thermal: section = "Thermal Setup"; break;
+                case StudyType::Fatigue: section = "Loading / S-N"; break;
+                case StudyType::Motion:  section = "Driver / Time"; break;
+                default:                 section = "Study"; break;
+            }
+            break;
     }
+
+    IconUV iv = getIcon(studyTypeIcon(s.type), 20);
+    if (iv.valid) {
+        ImGui::Image(iv.texId, ImVec2(16.0f * S, 16.0f * S), iv.uv0, iv.uv1);
+        ImGui::SameLine(0, 6.0f * S);
+    }
+    ImGui::PushFont(st.fonts.medium);
+    ImGui::TextUnformatted((s.name + " \xe2\x80\x94 " + section).c_str());
+    ImGui::PopFont();
+
+    // Right-aligned OK (close) button on the same row.
+    const float btnW = 40.0f * S;
+    const float rightX = ImGui::GetWindowContentRegionMax().x - btnW;
+    if (rightX > ImGui::GetCursorPosX()) ImGui::SameLine(rightX);
+    else                                 ImGui::SameLine();
+    if (ImGui::Button("OK", ImVec2(btnW, 0))) keepOpen = false;
+    simTip("Close this setup panel and return to the study tree. Edits are saved as you make them.");
+
+    ImGui::Separator();
+    ImGui::Spacing();
+    return keepOpen;
 }
 
 void SimManager::drawStudyRow(AppState& st, int i) {
@@ -2100,49 +2260,65 @@ void SimManager::drawStudyRow(AppState& st, int i) {
     ImGui::PushID(i);
     const bool selStudy = (sel_ == i);
 
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
-                               ImGuiTreeNodeFlags_DefaultOpen;
+    // sim-gui rework (Hunter red-pen): FM-grade rows via the exported feature_tree.h helpers —
+    // glass row pills, soft-blue selection card, accent-outline hover, crisp icons at FM sizing.
+    // Single-click SELECTS (drives fixture/load previews); double-click opens the setup panel
+    // (same gesture as "Edit Feature" on the modeling tree). Pills must balance: one End per Pill.
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth |
+                               ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_FramePadding;
     if (selStudy && node_ == SimNode::Study) flags |= ImGuiTreeNodeFlags_Selected;
 
-    // v2: frosted row pill behind the study node (mirrors feature_tree's fmRowPill), painted at the
-    // cursor BEFORE the icon so it sits behind the whole icon + label row; accent card when selected.
-    simRowPill(selStudy && node_ == SimNode::Study);
-    // Study-type icon ahead of the node (study_* atlas; degrades to no icon when absent), matching
-    // the feature-tree's icon + SameLine + TreeNodeEx row convention.
-    IconUV tIcon = getIcon(studyTypeIcon(s.type), 20);
-    if (tIcon.valid) {
-        ImGui::Image(tIcon.texId, ImVec2(16.0f * ui::uiScale, 16.0f * ui::uiScale), tIcon.uv0, tIcon.uv1);
-        ImGui::SameLine(0, 4.0f * ui::uiScale);
-    }
+    ui::FmRowRect studyRect = ui::fmRowPill(selStudy && node_ == SimNode::Study);
+    ui::fmTreeIcon(studyTypeIcon(s.type), "[S]");
+    ImGui::SameLine(0, 4.0f * ui::uiScale);
     std::string title = s.name + "  (" + studyTypeLabel(s.type) + ")";
     bool open = ImGui::TreeNodeEx("##study", flags, "%s", title.c_str());
+    const bool studyDbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
         sel_ = i; node_ = SimNode::Study; armedWell_ = -1;
     }
+    ui::fmRowPillEnd(studyRect, selStudy && node_ == SimNode::Study);
+    if (studyDbl) { sel_ = i; node_ = SimNode::Study; armedWell_ = -1; panelOpen_ = true; }
     // Right-click: delete (deferred so we never mutate studies_ mid-row-draw).
     bool wantDelete = false;
     if (ImGui::BeginPopupContextItem("##studyctx")) {
+        if (ImGui::MenuItem("Open setup")) { sel_ = i; node_ = SimNode::Study; panelOpen_ = true; }
         if (ImGui::MenuItem("Delete study")) wantDelete = true;
         ImGui::EndPopup();
     }
 
     if (open) {
-        const float S = ui::uiScale;
-        // One leaf row: a 16px atlas icon (feature-manager vocabulary) + a clickable label + badge.
+        // One FM-grade leaf row: icon painted inside the leaf-arrow slot + label + status badge.
+        // Single-click selects the node (previews); double-click opens its setup panel and (for
+        // Fixtures / Loads) arms the face-pick well.
         auto child = [&](const char* icon, const std::string& label, SimNode n, bool ok,
                          const char* tip, int loadI = -1) {
             const bool selected = selStudy && node_ == n && (n != SimNode::Load || loadIdx_ == loadI);
-            simRowPill(selected);  // v2 frosted leaf-row pill behind icon + label
-            IconUV iv = getIcon(icon, 20);
-            if (iv.valid) {
-                ImGui::Image(iv.texId, ImVec2(15.0f * S, 15.0f * S), iv.uv0, iv.uv1);
-                ImGui::SameLine(0, 5.0f * S);
-            }
-            if (ImGui::Selectable(label.c_str(), selected)) {
+            ui::FmRowRect rr = ui::fmRowPill(selected);
+            ImGuiTreeNodeFlags lf = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                                    ImGuiTreeNodeFlags_SpanFullWidth |
+                                    ImGuiTreeNodeFlags_FramePadding;
+            if (selected) lf |= ImGuiTreeNodeFlags_Selected;
+            ImVec2 rowPos = ImGui::GetCursorScreenPos();
+            ImGui::TreeNodeEx((label + "##n" + std::to_string((int)n) + "_" +
+                               std::to_string(loadI)).c_str(), lf);
+            ui::fmTreeIconInArrowSlot(rowPos, icon, "");
+            const bool clicked = ImGui::IsItemClicked();
+            const bool dbl = ImGui::IsItemHovered() &&
+                             ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+            ui::fmRowPillEnd(rr, selected);
+            if (clicked || dbl) {
                 sel_ = i; node_ = n; loadIdx_ = loadI;
-                int newArm = (n == SimNode::Fixtures) ? 0 : (n == SimNode::Load ? loadI + 1 : -1);
-                if (newArm != armedWell_) st.selection.clear();  // switching wells: drop stale picks
-                armedWell_ = newArm;
+                if (dbl) {
+                    // Open the editor; arm the pick well for the selector-driven nodes.
+                    int newArm = (n == SimNode::Fixtures) ? 0
+                               : (n == SimNode::Load ? loadI + 1 : -1);
+                    if (newArm != armedWell_) st.selection.clear();  // drop stale picks
+                    armedWell_ = newArm;
+                    panelOpen_ = true;
+                } else {
+                    armedWell_ = -1;   // selection only: preview, no pick capture
+                }
             }
             simBadge(ok, tip);
         };
@@ -3688,15 +3864,76 @@ void SimManager::drawForm(AppState& st, Study& s) {
 
     ImGui::Spacing();
 
+    // sim-gui rework: each panel shows ONLY the invoked tool's editor (PropertyManager flow) —
+    // the numbered always-open accordion stack (drawStudyChecklist) is retired. The Study node
+    // hosts the type-level setup (flow/thermal BCs, fatigue loading, motion driver, or the
+    // static/modal study options); every other node maps 1:1 to its ribbon tool.
     switch (node_) {
         case SimNode::Results:
             drawResultControls(st, s);
             break;
+        case SimNode::Material:
+            drawMaterialCombo(st, s);
+            if (s.type == StudyType::Static) {
+                // Failure criterion lives logically with the material choice.
+                ImGui::Spacing();
+                ImGui::SeparatorText("Failure criterion");
+                static const char* kCrit[3] = {"Max von Mises (distortion energy)",
+                                               "Max shear stress (Tresca)",
+                                               "Max normal stress (Rankine)"};
+                int ci = (int)s.criterion; if (ci < 0 || ci > 2) ci = 0;
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::BeginCombo("##critp", kCrit[ci])) {
+                    for (int i = 0; i < 3; ++i)
+                        if (ImGui::Selectable(kCrit[i], ci == i)) {
+                            s.criterion = (FailureCriterion)i; persist(st, s);
+                        }
+                    ImGui::EndCombo();
+                }
+                simTip("Theory for the headline factor of safety. Ductile metals: von Mises or "
+                       "Tresca (more conservative). Brittle: max normal stress.");
+            }
+            break;
+        case SimNode::Fixtures:
+            drawFixturesForm(st, s);
+            break;
+        case SimNode::Load:
+            drawLoadsForm(st, s);
+            break;
+        case SimNode::Mesh:
+            drawMeshForm(st, s);
+            break;
+        case SimNode::Study:
         default:
-            // All structural nodes (Study / Material / Fixtures / Load / Mesh) go through
-            // the stepwise checklist. drawStudyChecklist uses SetNextItemOpen to auto-expand
-            // the section that matches the currently-selected tree leaf.
-            drawStudyChecklist(st, s);
+            if (s.type == StudyType::Motion) {
+                drawMotionForm(st, s);
+            } else if (isFlowFamily(s.type)) {
+                drawStudyTypeBanner(s.type, s.type == StudyType::Thermal
+                    ? "Steady-state heat transfer (OpenFOAM): convection with wall / heat-source "
+                      "boundary conditions. Structural material is not used."
+                    : "External flow / wind-tunnel (CFD): drag, lift and pressure from the "
+                      "velocity and fluid. Structural material is not used.");
+                drawFlowForm(st, s);
+            } else if (s.type == StudyType::Fatigue) {
+                drawStudyTypeBanner(s.type,
+                    "Fatigue life under cyclic loading: the static stress state is scaled over "
+                    "the load cycle (Goodman / Gerber / Soderberg).");
+                drawFatigueForm(st, s);
+            } else if (s.type == StudyType::Modal) {
+                drawStudyTypeBanner(s.type,
+                    "Natural frequencies and mode shapes. Loads are not applicable \xe2\x80\x94 "
+                    "fixtures (optional) constrain rigid-body modes.");
+                ImGui::SeparatorText("Modes");
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::SliderInt("##modesp", &s.nModes, 1, 12)) {}
+                if (ImGui::IsItemDeactivatedAfterEdit()) persist(st, s);
+                simTip("How many natural frequencies / mode shapes to solve for.");
+            } else {  // Static
+                drawStudyTypeBanner(s.type,
+                    "Linear static stress under applied loads. Use the ribbon's Material / "
+                    "Fixture / Force / Pressure / Mesh tools (or double-click a tree node) to "
+                    "set the study up, then Run.");
+            }
             break;
     }
 

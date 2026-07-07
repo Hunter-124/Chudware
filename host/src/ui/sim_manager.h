@@ -364,6 +364,26 @@ private:
     SimNode node_ = SimNode::Study; // selected sub-node of sel_
     int loadIdx_ = -1;              // which load is selected when node_==Load
 
+    // sim-gui rework: tool-invoked setup panels. The setup editors are NOT stacked under the tree
+    // any more — a panel opens (PropertyManager-style, taking over the left pane body) ONLY when a
+    // ribbon tool is invoked or a tree node is double-clicked, and closes via its OK button / the
+    // header close glyph. While closed the pane shows just "+ New Study" + the study tree.
+    bool panelOpen_ = false;
+    // Select a study of type t for a type-scoped ribbon tool (prefer the current selection when it
+    // already matches, else the first study of that type). Returns false when none exists.
+    bool selectStudyOfType(StudyType t);
+    // Draw the PM-style setup-panel header (icon + "<study> - <node>" + close). Returns false when
+    // the user closed the panel this frame.
+    bool drawPanelHeader(AppState& st, Study& s);
+
+    // EM (electromagnetics) gating: 0 = not probed yet, 1 = em_* backend available, -1 = missing.
+    // Probed ONCE asynchronously (st.rpc) when the Simulate workspace first becomes active; the
+    // result also drives ui::setRibbonDisabledPrefix("sim_em_", ...) for the honest disabled state.
+    int  emStatus_ = 0;
+    bool emProbeInflight_ = false;
+    void probeEmStatus(AppState& st);
+    bool handleEmCommand(AppState& st, const std::string& cmdId);
+
     // Armed well for viewport picking: -1 none, 0 = fixtures, >=1 = loads[armId-1]. Tied to sel_.
     int armedWell_ = -1;
 

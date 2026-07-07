@@ -147,6 +147,36 @@ class TestSource:
         assert plans[TUBE_GOOD["part_id"]]["query"]
         assert plans["fastener:ISO4762:M8"]["how"] == "make_standard_part"
 
+    def test_discrete_product_yields_find_model(self):
+        # A discrete manufactured product: MPN + brand identity, no geometry_ref,
+        # not standard hardware, no raw-stock params → find_model (contracts §2).
+        product = {
+            "part_id": "product:acme::1LNK-4B",
+            "domain": "catalog",
+            "title": "AcmeCorp Linkage Bracket 1LNK-4B",
+            "params": {"mpn": "1LNK-4B", "brand": "AcmeCorp"},
+        }
+        plan = src.artifact_plan(product)
+        assert plan == {"how": "find_model", "part_id": "product:acme::1LNK-4B"}
+
+    def test_raw_stock_still_scrape_import_not_find_model(self):
+        # Guard the boundary: raw stock (od_mm/wall_mm/alloy) keeps scrape_import
+        # even if the fan-out path is exercised — existing behavior preserved.
+        assert src.artifact_plan(TUBE_GOOD)["how"] == "scrape_import"
+        assert src.artifact_plan(FASTENER_NO_GREF)["how"] == "make_standard_part"
+        assert src.artifact_plan(BEARING_6001)["how"] == "part_place"
+
+    def test_cad_site_record_keeps_scrape_import_not_find_model(self):
+        # A record already FROM a CAD-model-yielding site (grabcad) keeps its
+        # direct scrape_import plan even with an MPN — the download IS the
+        # geometry; only commerce/no-CAD sites (amazon) round-trip via find_model.
+        grabcad = {"part_id": "catalog:grabcad::https://grabcad.com/x",
+                   "domain": "catalog", "params": {"mpn": "ABC-123"}}
+        amazon = {"part_id": "catalog:amazon::https://amazon.com/y",
+                  "domain": "catalog", "params": {"mpn": "ABC-123"}}
+        assert src.artifact_plan(grabcad)["how"] == "scrape_import"
+        assert src.artifact_plan(amazon)["how"] == "find_model"
+
     def test_deterministic(self):
         a = src.source("4130 chromoly tube OD 25.4 wall 1.25",
                        search_fn=_fixture_search)

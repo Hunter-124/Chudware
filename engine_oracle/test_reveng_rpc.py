@@ -29,7 +29,8 @@ def test_methods_registered_on_worker():
     """The bridge's methods land in the aggregated worker table (GUI reachability)."""
     import engine_oracle.worker as w
     for name in ("list_reveng_sessions", "get_reveng_session", "reveng_start_session",
-                 "reveng_add_images", "reveng_ingest_datasheet"):
+                 "reveng_add_images", "reveng_ingest_datasheet",
+                 "reveng_start_from_product"):
         assert name in w._METHODS, f"{name} not registered on the worker"
 
 
@@ -62,6 +63,51 @@ def test_add_images_delivers_photos(reveng_dir, tmp_path):
     assert r["ok"] and r["added"] == 1
     assert r["session"]["artifacts"]["images"] == 1
     assert r["session"]["stages"]["capture"] == "done"
+
+
+def test_start_from_product_threads_media(reveng_dir, monkeypatch):
+    """§2b hand-off: harvested images+documents are downloaded into the session
+    and threaded through add_images / ingest_datasheet."""
+    import engine_oracle.parts_hub.product_media as pm
+    from services.browser import session as bsession
+
+    monkeypatch.setattr(pm, "harvest_product_media", lambda ref: {
+        "ok": True, "source_url": "https://shop.example/widget",
+        "images": ["https://cdn.example/a.jpg", "https://cdn.example/b.jpg"],
+        "documents": ["https://cdn.example/ds.pdf"],
+    })
+
+    def _download(url, site, dest, **_k):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"%PDF-1.4\n" if str(dest).endswith(".pdf")
+                         else b"\xff\xd8\xff\xe0" + b"\x00" * 8)
+        return {"ok": True, "dest": str(dest)}
+    monkeypatch.setattr(bsession, "browser_download", _download)
+    # datasheet ingest backend may be absent in CI — make it deterministic.
+    monkeypatch.setattr("services.mcp.reveng_tools._ingest_pdf",
+                        lambda path, out_dir: {"ok": True, "tables": [], "crops": []})
+
+    r = reveng_rpc._reveng_start_from_product(
+        {"url": "https://shop.example/widget", "title": "Widget", "mpn": "W-1"}, _emit)
+    assert r["ok"] and r["session_id"]
+    assert r["images_added"] == 2
+    assert r["documents_ingested"] == 1
+    assert r["source_url"] == "https://shop.example/widget"
+    assert r["activeWorkspace"] == "ReverseEng"
+
+
+def test_start_from_product_empty_harvest_still_starts_session(reveng_dir, monkeypatch):
+    import engine_oracle.parts_hub.product_media as pm
+    monkeypatch.setattr(pm, "harvest_product_media",
+                        lambda ref: {"ok": False, "reason": "captcha_or_2fa_detected"})
+
+    r = reveng_rpc._reveng_start_from_product(
+        {"url": "https://shop.example/widget"}, _emit)
+    assert r["ok"] and r["session_id"]
+    assert r["images_added"] == 0 and r["documents_ingested"] == 0
+    # session really exists on disk
+    got = reveng_rpc._reveng_get_session({"session_id": r["session_id"]}, _emit)
+    assert got["ok"]
 
 
 def test_missing_session_is_structured_failure(reveng_dir):

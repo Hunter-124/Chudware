@@ -229,10 +229,110 @@ def _reveng_ingest_datasheet(params: dict, _emit: Callable) -> dict:
         return _wrap_exc(exc)
 
 
+# ── §2b product-media hand-off ───────────────────────────────────────────────
+
+def _site_of(url_or_part_id: str) -> str:
+    """Best-effort session-profile key for a download (mirrors product_media)."""
+    s = (url_or_part_id or "").strip()
+    if s.startswith("catalog:"):
+        return s[len("catalog:"):].split("::", 1)[0]
+    try:
+        from urllib.parse import urlparse
+        netloc = urlparse(s).netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        parts = netloc.split(".")
+        return parts[-2] if len(parts) >= 2 else (parts[0] if parts else netloc)
+    except Exception:  # noqa: BLE001
+        return "product"
+
+
+def _download_into(url: str, site: str, dest_dir: Path) -> Path | None:
+    """Download one media URL into ``dest_dir`` under the user's session; return
+    the local path, or None on any failure (best-effort — never raises)."""
+    try:
+        from services.browser import session as _bsession
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        name = url.rsplit("/", 1)[-1].split("?", 1)[0] or "file"
+        dest = dest_dir / name
+        out = _bsession.browser_download(url, site, dest)
+        if out.get("ok") and dest.is_file():
+            return dest
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _reveng_start_from_product(params: dict, _emit: Callable) -> dict:
+    """§2b hand-off: harvest a product's images+documents, then stand up an RE
+    session pre-populated with them. A zero-media harvest STILL creates a session
+    (the user adds their own photos). Each download/ingest is guarded — one
+    failure never fails the whole call."""
+    try:
+        t = _tools()
+        p = params or {}
+        ref = str(p.get("part_id") or p.get("url") or "").strip()
+        if not ref:
+            return _fail("no_reference", "pass a part_id or url")
+
+        from engine_oracle.parts_hub.product_media import harvest_product_media
+        harvest = harvest_product_media(ref)
+        images = harvest.get("images", []) if harvest.get("ok") else []
+        documents = harvest.get("documents", []) if harvest.get("ok") else []
+        source_url = harvest.get("source_url") if harvest.get("ok") else (
+            ref if ref.startswith("http") else None)
+        site = _site_of(ref)
+
+        # Start the session seeded with the product's identity (RE-23 seed lane).
+        seed_bits = []
+        for key in ("title", "mpn", "brand"):
+            if p.get(key):
+                seed_bits.append(f"{key}={p[key]}")
+        if source_url:
+            seed_bits.append(source_url)
+        started = _reveng_start_session({
+            "name": p.get("title") or None,
+            "research": " ".join(seed_bits) if seed_bits else None,
+        }, _emit)
+        if not started.get("ok"):
+            return started
+        sid = started["session_id"]
+
+        # Download images into <session>/images, then thread through reveng_add_images.
+        images_added = 0
+        if images:
+            img_dir = t._session_path(sid) / "_harvest_images"
+            local_imgs = [str(pth) for u in images
+                          if (pth := _download_into(u, site, img_dir)) is not None]
+            if local_imgs:
+                added = _reveng_add_images({"session_id": sid, "paths": local_imgs}, _emit)
+                if added.get("ok"):
+                    images_added = added.get("added", 0)
+
+        # Download each document, then ingest via the existing datasheet lane.
+        documents_ingested = 0
+        for doc_url in documents:
+            local = _download_into(doc_url, site, t._session_path(sid) / "_harvest_docs")
+            if local is None:
+                continue
+            ing = _reveng_ingest_datasheet({"session_id": sid, "path": str(local)}, _emit)
+            if ing.get("ok"):
+                documents_ingested += 1
+
+        return {"ok": True, "session_id": sid,
+                "images_added": images_added,
+                "documents_ingested": documents_ingested,
+                "source_url": source_url,
+                "activeWorkspace": "ReverseEng"}
+    except Exception as exc:  # noqa: BLE001
+        return _wrap_exc(exc)
+
+
 REVENG_WORKER_METHODS: dict[str, Callable] = {
     "list_reveng_sessions": _reveng_list_sessions,
     "get_reveng_session": _reveng_get_session,
     "reveng_start_session": _reveng_start_session,
     "reveng_add_images": _reveng_add_images,
     "reveng_ingest_datasheet": _reveng_ingest_datasheet,
+    "reveng_start_from_product": _reveng_start_from_product,
 }

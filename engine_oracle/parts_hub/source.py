@@ -292,6 +292,50 @@ def _vendor_of(rec: dict) -> str:
     return "library" if rec.get("source") != "live" else "vendor_api"
 
 
+#: raw-stock param signals — a record carrying any of these is modeled
+#: parametrically (metals/plastics tube/bar), never "found" or reverse-engineered.
+_RAW_STOCK_PARAMS = frozenset({"od_mm", "wall_mm", "alloy"})
+
+
+def _is_discrete_product(rec: dict, gref: dict) -> bool:
+    """True when *rec* is a discrete manufactured product with an identity but no
+    geometry (contracts/sourcing.md §2 ``find_model`` boundary).
+
+    Requires a product-identity signal (a normalized MPN/part-number OR a
+    brand/manufacturer) AND: no usable geometry_ref, NOT standard hardware, and
+    NO raw-stock params (od_mm/wall_mm/alloy) — those keep scrape_import /
+    make_standard_part.
+    """
+    if gref.get("kind"):
+        return False
+    if rec.get("domain") in _STANDARD_HW_DOMAINS:
+        return False
+    # A record already FROM a CAD-model-yielding site (grabcad/traceparts/…) keeps
+    # its direct scrape_import plan — that download IS the geometry. Only records
+    # from commerce/no-CAD sites (amazon, retail) need find_model's repo search.
+    pid = str(rec.get("part_id", ""))
+    if pid.startswith("catalog:"):
+        site = pid[len("catalog:"):].split("::", 1)[0]
+        try:
+            from engine_oracle.parts_hub.model_matcher import CAD_MODEL_SITES
+            if site in CAD_MODEL_SITES:
+                return False
+        except Exception:  # noqa: BLE001 — matcher optional; fall through to identity check
+            pass
+    params = rec.get("params") or {}
+    if any(k in params for k in _RAW_STOCK_PARAMS):
+        return False
+    mpn = ""
+    for k in ("mpn", "part_number", "sku", "lcsc"):
+        v = params.get(k)
+        if v is not None and str(v).strip():
+            mpn = str(v).strip()
+            break
+    has_brand = any(str(params.get(k) or "").strip()
+                    for k in ("brand", "manufacturer"))
+    return bool(mpn) or has_brand
+
+
 def artifact_plan(rec: dict, *, need: str = "",
                   route_sites: list[str] | None = None) -> dict:
     """How to obtain real geometry for a candidate record.
@@ -301,6 +345,13 @@ def artifact_plan(rec: dict, *, need: str = "",
     """
     pid = str(rec.get("part_id", ""))
     gref = rec.get("geometry_ref") or {}
+    # Discrete manufactured product (an MPN/brand identity, no geometry, NOT
+    # standard hardware, NOT raw stock) → the caller matches it to a CAD repo
+    # model via match_model. Checked FIRST so a discrete-product catalog record
+    # (e.g. an Amazon listing catalog:amazon::…) routes to find_model rather
+    # than a bare scrape_import; raw stock / standard hardware keep their plans.
+    if _is_discrete_product(rec, gref):
+        return {"how": "find_model", "part_id": pid}
     if pid.startswith("catalog:"):
         site = pid[len("catalog:"):].split("::", 1)[0]
         return {"how": "scrape_import", "site": site,

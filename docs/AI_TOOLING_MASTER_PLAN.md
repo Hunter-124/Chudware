@@ -196,19 +196,16 @@ One provider stack, subscription-friendly, governing every agent surface:
   `installer/setup_mcp_clients.py`), and adopt **MCP elicitation** (stable in the spec,
   shipped in Claude Code) as a Pillar-9 transport. Do **not** build on MCP *sampling* —
   unimplemented by every major client and deprecated in the MCP draft spec (2026-07-28).
-- **Session auth — only where blessed (researched 2026-07, decision-grade):**
-  - **PROHIBITED, never ship:** reusing Claude Pro/Max or Gemini consumer OAuth tokens in
-    a third-party app. Anthropic blocks it server-side, states it in the Agent SDK terms,
-    and sent OpenCode a legal takedown; Google mass-banned even paying subscribers
-    (enforced since 2026-03-25). A commercial closed-source product is a bigger target
-    than any of those tools were.
-  - **Blessed, ship:** **OpenRouter PKCE** ("Sign in with OpenRouter" — officially
-    documented for third-party apps; one login, hundreds of models, user-balance
-    billing). Evaluate the **GitHub Copilot SDK** (public preview 2026-04, MIT; runs on
+- **Session auth (researched 2026-07, updated 2026-07-07):**
+  - **Subscription auth (implemented):** Codex (ChatGPT Plus/Pro), Anthropic Claude
+    (Pro/Max), and Cursor (Pro) — same first-party OAuth flows their own CLIs use, driven
+    by the user's own browser login. Gemini consumer OAuth remains off-limits (Google
+    mass-bans). See `contracts/providers.md` §4.4.
+  - **OpenRouter PKCE** ("Sign in with OpenRouter" — officially documented for third-party
+    apps; one login, hundreds of models, user-balance billing).
+  - Evaluate the **GitHub Copilot SDK** (public preview 2026-04, MIT; runs on
     the user's Copilot subscription via GitHub OAuth — verify gh.io/terms before
-    shipping). Pursue an **OpenAI Partner Network** conversation for sanctioned
-    ChatGPT-subscription login (OpenAI has blessed exactly this for opencode). Anthropic's
-    metered **Agent SDK credit** is the one sanctioned subscription-linked Claude route.
+    shipping).
   - **BYO API key** stays for pros/enterprise; local models (LM Studio/llama.cpp/Ollama
     endpoint) stay first-class; offline/ITAR mode preserved.
 - **AI-CAD Cloud (company-hosted relay):** for users who won't attach an account or key,

@@ -402,7 +402,10 @@ def _vendor_status(params: dict, _emit: Callable) -> dict:
                     "id":                key,
                     "label":             _site_label(key, a),
                     "kind":              "browser",
-                    "logged_in":         _profiles.has_profile(key),
+                    # has_login, NOT has_profile: anonymous fetches auto-create
+                    # profile dirs — only a real browser_login/wizard sign-in
+                    # (last_login_ts stamp) counts as logged in.
+                    "logged_in":         _profiles.has_login(key),
                     "login_in_progress": _login_in_progress(key),
                     "login_error":       "" if last.get("ok", True) else str(
                         last.get("reason", "") or last.get("error", "")),

@@ -72,8 +72,11 @@ def _try_browser_fallback(url: str) -> tuple[Optional[bytes], Optional[str]]:
         return None, None
 
     site = urlparse(url).netloc
-    if not site or not _profiles.has_profile(site):
+    if not site:
         return None, None
+    # No has_profile gate: anonymous downloads are allowed (browser_download
+    # auto-creates a profile); gated files fail via the result envelope below.
+    _ = _profiles  # kept for the availability probe in the import above
 
     with tempfile.TemporaryDirectory() as tmp:
         dest = Path(tmp) / "datasheet.pdf"

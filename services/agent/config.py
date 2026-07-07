@@ -112,8 +112,9 @@ def provider_offline_safe(provider: Provider) -> bool:
     name = getattr(provider, "name", "")
     if name in ("mock", "mock-roles", "base"):
         return True
-    if name in ("anthropic", "gemini", "openrouter"):
-        return False  # always cloud
+    if name in ("anthropic", "gemini", "openrouter",
+                "anthropic-sub", "codex-sub", "cursor-sub"):
+        return False  # always cloud (incl. subscription-auth providers, §4.4)
     base_url = getattr(provider, "base_url", None)
     if name == "openai":
         # No base_url means the real OpenAI cloud endpoint; otherwise check the host.
@@ -277,6 +278,12 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
             raise OfflineModeError(
                 f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the vLLM serving "
                 f"endpoint {base_url!r} is not loopback, so it is refused before construction.")
+    if offline and name in ("anthropic-sub", "codex-sub", "cursor-sub"):
+        # Subscription-auth providers (§4.4) always talk to a vendor cloud endpoint.
+        raise OfflineModeError(
+            f"offline mode is enabled (config '{OFFLINE_SETTING}': true): the subscription "
+            f"provider {name!r} uses a vendor cloud endpoint and is refused. Use a local "
+            f"(loopback) model server instead.")
 
     if not name:
         # Nothing configured: default to a local LM Studio (OpenAI-compatible) endpoint
@@ -347,6 +354,24 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
         return OpenRouterProvider(api_key=key, model=cfg.get("model", DEFAULT_MODEL),
                                   supports_vision=oc.get("vision", True),
                                   timeout=float(oc.get("timeout", 120.0)))
+
+    if name == "anthropic-sub":
+        # Subscription auth (§4.4): uses the user's Claude Pro/Max login, not an api_key.
+        from .providers.anthropic_sub_provider import AnthropicSubProvider, DEFAULT_MODEL
+
+        return AnthropicSubProvider(model=cfg.get("model", DEFAULT_MODEL))
+
+    if name == "codex-sub":
+        # Subscription auth (§4.4): uses the user's ChatGPT Plus/Pro login.
+        from .providers.codex_sub_provider import CodexSubProvider, DEFAULT_MODEL
+
+        return CodexSubProvider(model=cfg.get("model", DEFAULT_MODEL))
+
+    if name == "cursor-sub":
+        # Subscription auth (§4.4): uses the user's Cursor Pro login.
+        from .providers.cursor_sub_provider import CursorSubProvider, DEFAULT_MODEL
+
+        return CursorSubProvider(model=cfg.get("model", DEFAULT_MODEL))
 
     if name in ("llamacpp", "llama.cpp", "llama-cpp"):
         from .providers.llamacpp_provider import LlamaCppProvider, DEFAULT_MODEL

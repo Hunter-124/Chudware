@@ -141,6 +141,7 @@ add_executable(AI-CAD
   src/ui/icons.cpp
   src/ui/icons_sdf.cpp  # liquid-glass v2: runtime SDF glyphs + halo (drawIconGlass)
   src/ui/widgets/ribbon.cpp
+  src/ui/widgets/web_view.cpp  # phase C: reusable embedded-browser widget (browser_embed_*)
   src/ui/ribbon_def.cpp
   # --- end C14 ---
   # --- [parts-plm sources] workspace bodies (parts-port agent appends here) ---

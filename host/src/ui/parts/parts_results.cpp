@@ -179,13 +179,18 @@ void drawResultsList(AppState& st) {
     ImGui::EndTable();
 }
 
+// Grid cards: deterministic column layout. Each card reserves a FIXED cardW×cardH
+// footprint first (InvisibleButton, AllowOverlap so the hover action buttons drawn on
+// top still click), then paints everything with the drawlist relative to that rect,
+// clipped to the card — free-floating text/SameLine bookkeeping was cascading cards
+// diagonally and letting long names bleed past the card edge (WS4a regression).
 void drawResultsGrid(AppState& st) {
     const float sc    = ui::uiScale;
     const float cardW = 168.0f * sc;
     const float cardH = 168.0f * sc;
     const float imgH  = 88.0f * sc;
-    float availW      = ImGui::GetContentRegionAvail().x;
-    int   cols        = std::max(1, (int)(availW / (cardW + 8.0f * sc)));
+    const float gap   = 8.0f * sc;
+    const float pad   = 8.0f * sc;
 
     if (S().searching) { spinner("Searching"); return; }
     if (S().results.empty()) {
@@ -197,53 +202,77 @@ void drawResultsGrid(AppState& st) {
         return;
     }
 
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const int   cols   = std::max(1, (int)((availW - gap) / (cardW + gap)));
+    // Distribute the leftover width: center the whole grid so the right side
+    // doesn't accumulate a dead column's worth of margin.
+    const float totalW = cols * cardW + (cols - 1) * gap;
+    const float startX = ImGui::GetCursorPosX() + std::max(0.0f, (availW - totalW) * 0.5f);
+    const float lineH  = ImGui::GetTextLineHeight();
+    ImDrawList* dl     = ImGui::GetWindowDrawList();
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gap, gap));  // uniform row gap
     int i = 0;
     for (auto& item : S().results) {
-        if (i % cols != 0) ImGui::SameLine();
+        const int col = i % cols;
+        if (col != 0)
+            ImGui::SameLine(startX + col * (cardW + gap));   // absolute → columns stay aligned
+        else
+            ImGui::SetCursorPosX(startX);
         ImGui::PushID(item.id.c_str());
 
-        ImVec2 p0 = ImGui::GetCursorScreenPos();
-        ImVec2 p1(p0.x + cardW, p0.y + cardH);
-        bool hov = ImGui::IsMouseHoveringRect(p0, p1);
+        // ---- fixed footprint + hover/tooltip item -----------------------------------
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const ImVec2 p1(p0.x + cardW, p0.y + cardH);
+        ImGui::SetNextItemAllowOverlap();
+        ImGui::InvisibleButton("##card", ImVec2(cardW, cardH));
+        itemTooltipAt(item, ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal));
+        const bool hov = ImGui::IsMouseHoveringRect(p0, p1);  // stays true over the buttons
+
         // Resting glass surface stays; hover reads by BORDER, not a stronger wash.
-        ui::glassRowBackground(ImGui::GetWindowDrawList(), p0, p1, 8.0f,
-                               false, false, 0.20f);
-        borderCardRect(ImGui::GetWindowDrawList(), p0, p1, /*selected=*/false, hov, 8.0f);
+        ui::glassRowBackground(dl, p0, p1, 8.0f, false, false, 0.20f);
+        borderCardRect(dl, p0, p1, /*selected=*/false, hov, 8.0f);
 
-        ImGui::BeginGroup();
+        dl->PushClipRect(p0, p1, true);
 
-        // ---- preview: real thumbnail when available, domain icon/glyph otherwise ----
+        // ---- preview band: thumbnail when available, domain icon/glyph otherwise ----
         requestThumb(st, item);
         auto th = S().thumbs.find(item.id);
         if (th != S().thumbs.end() && th->second.tex) {
-            // Fit the image into the preview band, centred, preserving aspect.
-            float iw = (float)th->second.w, ih = (float)th->second.h;
-            float sc = std::min((cardW - 16.0f * sc) / iw, imgH / ih);
-            float dw = iw * sc, dh = ih * sc;
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (cardW - dw) * 0.5f);
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (imgH - dh) * 0.5f);
-            ImGui::Image((ImTextureID)(intptr_t)th->second.tex, ImVec2(dw, dh));
-            float used = (imgH - dh) * 0.5f + dh;
-            if (used < imgH) ImGui::Dummy(ImVec2(1, imgH - used));
+            const float iw = (float)th->second.w, ih = (float)th->second.h;
+            const float fit = std::min((cardW - 2.0f * pad) / iw, (imgH - pad) / ih);
+            const float dw = iw * fit, dh = ih * fit;
+            const ImVec2 i0(p0.x + (cardW - dw) * 0.5f, p0.y + pad * 0.5f + (imgH - dh) * 0.5f);
+            dl->AddImage((ImTextureID)(intptr_t)th->second.tex, i0,
+                         ImVec2(i0.x + dw, i0.y + dh));
         } else {
-            ImVec2 c(p0.x + cardW * 0.5f, p0.y + imgH * 0.5f + 4.0f * sc);
-            partIconDraw(ImGui::GetWindowDrawList(), c, 52.0f * sc, item.domain);
-            ImGui::Dummy(ImVec2(cardW, imgH));
+            partIconDraw(dl, ImVec2(p0.x + cardW * 0.5f, p0.y + imgH * 0.5f + 4.0f * sc),
+                         52.0f * sc, item.domain);
         }
 
-        auto centre = [&](const char* t) {
-            float tw = ImGui::CalcTextSize(t).x;
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (cardW - tw) * 0.5f);
-            ImGui::TextUnformatted(t);
+        // ---- text lines: centered, ellipsized to the card width ---------------------
+        auto centreText = [&](float y, const char* t, ImU32 colU32) {
+            const float maxW = cardW - 12.0f * sc;
+            std::string s(t);
+            if (ImGui::CalcTextSize(s.c_str()).x > maxW) {
+                while (!s.empty() &&
+                       ImGui::CalcTextSize((s + "…").c_str()).x > maxW) {
+                    // pop one UTF-8 code point, not one byte
+                    do { s.pop_back(); } while (!s.empty() &&
+                                                ((unsigned char)s.back() & 0xC0) == 0x80);
+                }
+                s += "…";
+            }
+            const float tw = ImGui::CalcTextSize(s.c_str()).x;
+            dl->AddText(ImVec2(p0.x + (cardW - tw) * 0.5f, y), colU32, s.c_str());
         };
-        char nbuf[40];
-        std::snprintf(nbuf, sizeof(nbuf), "%.34s", item.name.c_str());
-        centre(nbuf);
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        centre(item.partNumber.c_str());
-        ImGui::PopStyleColor();
-
+        float ty = p0.y + imgH + 6.0f * sc;
+        centreText(ty, item.name.c_str(), ImGui::GetColorU32(ImGuiCol_Text));
+        ty += lineH + 2.0f * sc;
+        if (!item.partNumber.empty()) {
+            centreText(ty, item.partNumber.c_str(), Palette::toU32(palette.textDim));
+            ty += lineH + 2.0f * sc;
+        }
         char pbuf[48];
         if (item.priceUsd > 0.0)
             std::snprintf(pbuf, sizeof(pbuf), "$%.2f%s", item.priceUsd,
@@ -251,30 +280,31 @@ void drawResultsGrid(AppState& st) {
         else
             std::snprintf(pbuf, sizeof(pbuf), "%s",
                           item.source == "live" ? "[live]" : "—");
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
-        centre(pbuf);
-        ImGui::PopStyleColor();
+        centreText(ty, pbuf, ImGui::ColorConvertFloat4ToU32(
+                                 ImVec4(palette.accent[0], palette.accent[1],
+                                        palette.accent[2], 1.0f)));
 
-        // Hover action row inside the card.
+        dl->PopClipRect();
+
+        // ---- hover actions: bottom strip INSIDE the card rect ------------------------
         if (hov) {
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 10.0f * sc);
+            ImGui::SetCursorScreenPos(
+                ImVec2(p0.x + pad, p1.y - ImGui::GetFrameHeight() - 4.0f * sc));
             ImGui::PushStyleColor(ImGuiCol_Button,
                 ImVec4(palette.button[0], palette.button[1],
                        palette.button[2], palette.button[3]));
             itemActions(st, item);
             ImGui::PopStyleColor();
+            // Re-anchor layout on the card rect so the buttons' line doesn't skew the
+            // next SameLine/new-row bookkeeping.
+            ImGui::SetCursorScreenPos(p0);
+            ImGui::Dummy(ImVec2(cardW, cardH));
         }
-        ImGui::EndGroup();
-        itemTooltip(item);
-
-        // Keep card cells a fixed height so the flow layout stays aligned.
-        ImVec2 cur = ImGui::GetItemRectMax();
-        if (cur.y < p1.y) ImGui::Dummy(ImVec2(cardW, p1.y - cur.y));
 
         ImGui::PopID();
         ++i;
     }
+    ImGui::PopStyleVar();  // ItemSpacing
 }
 
 }  // namespace parts

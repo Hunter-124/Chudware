@@ -88,7 +88,7 @@ void drawNode(AppState& st, const TaxNode& node, int depth) {
 
 void drawTaxonomyPane(AppState& st, float paneW) {
     const float sc = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * sc, 2 * sc));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * sc, 2 * sc));  // symmetric inner margins
     ImGui::BeginChild("##parts_cats", ImVec2(paneW, 0), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
 

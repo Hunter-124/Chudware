@@ -79,3 +79,10 @@ try:
     WORKER_METHODS.update(_EMBED_METHODS)
 except Exception:  # noqa: BLE001 — embed seam is optional; methods above still register
     pass
+
+# Subscription-auth login methods (§4.4) for the Settings panel.
+try:
+    from engine_oracle.parts_hub.subscription_rpc import SUBSCRIPTION_METHODS as _SUB_METHODS
+    WORKER_METHODS.update(_SUB_METHODS)
+except Exception:  # noqa: BLE001 — optional seam; core methods still register
+    pass

@@ -1,9 +1,9 @@
-"""OpenRouter PKCE session login — the ONE blessed third-party session auth.
+"""OpenRouter PKCE session login — the default third-party session auth.
 
 Contract: contracts/providers.md §4.1. "Sign in with OpenRouter" is officially documented
 for third-party apps: one login mints a user-scoped API key, billed against the user's
-OpenRouter balance across hundreds of models. This is the sanctioned alternative to the
-PROHIBITED reuse of consumer Claude/Gemini subscription tokens (§4.2).
+OpenRouter balance across hundreds of models. Subscription-auth providers (§4.4) are a
+separate, owner-authorized path for using paid Pro/Max/Plus accounts directly.
 
 Flow (S256 PKCE):
   1. begin_login()  -> {auth_url, code_verifier}; open auth_url in a browser.
@@ -57,9 +57,8 @@ def _disabled() -> dict:
     return {
         "ok": False,
         "reason": "OpenRouter PKCE login is disabled",
-        "hint": (f"Enable it with config '{FLAG_CFG}': true or env {FLAG_ENV}=1. Consumer "
-                 "Claude/Gemini subscription OAuth reuse is prohibited (contract §4.2); "
-                 "OpenRouter PKCE is the blessed session login."),
+        "hint": (f"Enable it with config '{FLAG_CFG}': true or env {FLAG_ENV}=1. "
+                 "For subscription-auth (Claude/Codex/Cursor), see §4.4 providers."),
     }
 
 

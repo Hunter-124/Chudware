@@ -431,56 +431,8 @@ void drawPartsLibraryWorkspace(AppState& st) {
     const float filtW = 260.0f * sc;
     const float midW  = totalW - catW - filtW - 12.0f * sc;
 
-    // ---- search bar (above results column only) --------------------------------
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 5 * sc));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  ImVec2(6 * sc, 6 * sc));
-    ImGui::Dummy(ImVec2(catW + 6.0f * sc, 0.0f));  // skip category pane width
-    ImGui::SameLine();
-
-    // Sort combo width = widest entry + frame padding + arrow button.
-    static const char* kSortItems[] = {
-        "Relevance", "Price: low to high", "Price: high to low", "Name"};
-    float sortW = 0.0f;
-    for (const char* it : kSortItems)
-        sortW = std::max(sortW, ImGui::CalcTextSize(it).x);
-    sortW += ImGui::GetStyle().FramePadding.x * 2.0f + ImGui::GetFrameHeight();
-
-    ImGui::SetNextItemWidth(midW - 160.0f * sc - sortW);
-    bool hit = ImGui::InputTextWithHint("##parts_q",
-                                "search fasteners, bearings, sections, electronics, vendors…",
-                                S().searchBuf, sizeof(S().searchBuf),
-                                ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button,
-        ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-        ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
-    bool go = ImGui::Button("Search");
-    ImGui::PopStyleColor(2);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(sortW);
-    if (ImGui::Combo("##sort", &S().sortMode, kSortItems, IM_ARRAYSIZE(kSortItems))) {
-        st.settings.partsSortMode = S().sortMode;
-        saveSettings(st.settings);
-        doSearch(st);
-    }
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Button,
-        ImVec4(palette.button[0], palette.button[1], palette.button[2], 0.80f));
-    if (ImGui::Button(S().gridView ? "List" : "Grid")) {
-        S().gridView = !S().gridView;
-        st.settings.partsGridView = S().gridView;
-        saveSettings(st.settings);
-    }
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar(2);
-
-    if ((hit || go) && !S().searching)
-        doSearch(st);
-
-    ImGui::Spacing();
-
-    // ---- three-column body ----------------------------------------------------
+    // ---- three-column body (full height — the search bar lives INSIDE the middle
+    // column so Categories/Filters start flush at the top, no dead space) ---------
     drawTaxonomyPane(st, catW);
     ImGui::SameLine();
 
@@ -490,6 +442,52 @@ void drawPartsLibraryWorkspace(AppState& st) {
     if (browserPanelActive()) {
         drawBrowserPanel(st);
     } else {
+        // ---- search bar -----------------------------------------------------------
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * sc, 5 * sc));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,  ImVec2(6 * sc, 6 * sc));
+
+        // Sort combo width = widest entry + frame padding + arrow button.
+        static const char* kSortItems[] = {
+            "Relevance", "Price: low to high", "Price: high to low", "Name"};
+        float sortW = 0.0f;
+        for (const char* it : kSortItems)
+            sortW = std::max(sortW, ImGui::CalcTextSize(it).x);
+        sortW += ImGui::GetStyle().FramePadding.x * 2.0f + ImGui::GetFrameHeight();
+
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 152.0f * sc - sortW);
+        bool hit = ImGui::InputTextWithHint("##parts_q",
+                                    "search fasteners, bearings, sections, electronics, vendors…",
+                                    S().searchBuf, sizeof(S().searchBuf),
+                                    ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
+        bool go = ImGui::Button("Search");
+        ImGui::PopStyleColor(2);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(sortW);
+        if (ImGui::Combo("##sort", &S().sortMode, kSortItems, IM_ARRAYSIZE(kSortItems))) {
+            st.settings.partsSortMode = S().sortMode;
+            saveSettings(st.settings);
+            doSearch(st);
+        }
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button,
+            ImVec4(palette.button[0], palette.button[1], palette.button[2], 0.80f));
+        if (ImGui::Button(S().gridView ? "List" : "Grid")) {
+            S().gridView = !S().gridView;
+            st.settings.partsGridView = S().gridView;
+            saveSettings(st.settings);
+        }
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar(2);
+
+        if ((hit || go) && !S().searching)
+            doSearch(st);
+
+        ImGui::Spacing();
         {
             char hdr[96];
             if (!S().results.empty())

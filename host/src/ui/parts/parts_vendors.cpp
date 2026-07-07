@@ -83,30 +83,11 @@ void pollHealthStatus(AppState& st) {
     });
 }
 
-// ---- phase C seam: vendor sign-in wizard --------------------------------------------
-// Probes browser_embed_start (services/browser embedded session — landing concurrently in
-// phase C). If the worker speaks it, flag the browser panel (parts_browser_panel.cpp keys
-// browserPanelActive() off S().browserWizardRequested in phase C — today it just toasts).
-// Method-missing → old headed vendor_login for the first not-signed-in vendor.
+// ---- phase C: vendor sign-in wizard --------------------------------------------------
+// Launches the embedded-browser login wizard (parts_browser_panel.cpp); startLoginWizard
+// falls back to the old headed vendor_login flow when the worker lacks the embed backend.
 
-void openVendorWizard(AppState& st) {
-    st.rpc.call("browser_embed_start", nlohmann::json{{"probe", true}},
-                [&st](const core::RpcResult& r) {
-        bool missing = !r.ok && r.err.find("unknown method") != std::string::npos;
-        if (!missing) {
-            S().browserWizardRequested = true;
-            st.toast(ui::ToastLevel::Info,
-                     "Embedded browser wizard arriving in the next build");
-            return;
-        }
-        for (auto& v : S().vendors) {
-            if (v.loggedIn || v.loginInProgress) continue;
-            startVendorLogin(st, v);
-            return;
-        }
-        st.toast(ui::ToastLevel::Info, "All vendor sites are already signed in.");
-    });
-}
+void openVendorWizard(AppState& st) { startLoginWizard(st); }
 
 // ---- compact strip (fixed footer of the filters pane) --------------------------------
 
@@ -242,8 +223,10 @@ void drawVendorSignInList(AppState& st) {
                 ImVec4(palette.button[0], palette.button[1],
                        palette.button[2], 0.80f));
             const char* lbl = v.loginInProgress ? "..." : (v.loggedIn ? "Re-login" : "Sign in");
+            // Phase C: single-vendor embedded wizard (login_wizard_start {sites:[id]});
+            // headed vendor_login fallback lives inside startLoginWizard.
             if (!v.loginInProgress && ImGui::SmallButton(lbl))
-                startVendorLogin(st, v);
+                startLoginWizard(st, v.id);
             ImGui::PopStyleColor();
 
             ImGui::PushStyleColor(ImGuiCol_Text,

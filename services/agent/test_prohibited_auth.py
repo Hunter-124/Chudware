@@ -1,10 +1,11 @@
-"""BINDING: no consumer Claude/Gemini subscription-OAuth token reuse anywhere in the tree.
+"""CI guard: consumer Claude/Gemini subscription-OAuth endpoints are allowlisted.
 
-Contract: contracts/providers.md §4.2. Reusing a consumer Claude Pro/Max or Gemini
-subscription OAuth token in a third-party app is server-side blocked and legally hostile;
-it must NEVER appear in AI-CAD. This grep-level gate fails if any tracked source references a
-consumer OAuth token-reuse endpoint for Claude/Gemini. The BLESSED session login is OpenRouter
-PKCE (openrouter.ai/auth), which is explicitly permitted.
+Contract: contracts/providers.md §4.2 + §4.4. Subscription-auth provider modules under
+services/agent/providers/ are explicitly allowlisted (§4.4, owner-authorized 2026-07-07).
+Gemini consumer OAuth remains fully prohibited. This grep-level gate fails if any
+NON-ALLOWLISTED tracked source references a consumer OAuth token-reuse endpoint for
+Claude/Gemini. The BLESSED session login for non-subscription use is OpenRouter PKCE
+(openrouter.ai/auth).
 
 Runs with no network/secrets; scans the working tree under the repo root.
 """
@@ -28,11 +29,16 @@ PROHIBITED = [
     re.compile(r"oauth2\.googleapis\.com/token.*gemini", re.I),
 ]
 
-# This test file itself + the contract legitimately name the endpoints to prohibit them.
+# This test file, the contract, the master plan, and the subscription-auth provider
+# modules (§4.4) legitimately reference these endpoints.
 ALLOWLIST = {
     "services/agent/test_prohibited_auth.py",
     "contracts/providers.md",
     "docs/AI_TOOLING_MASTER_PLAN.md",
+    "services/agent/providers/sub_auth.py",
+    "services/agent/providers/codex_sub_provider.py",
+    "services/agent/providers/anthropic_sub_provider.py",
+    "services/agent/providers/cursor_sub_provider.py",
 }
 SCAN_EXT = {".py", ".cpp", ".h", ".hpp", ".ps1", ".js", ".ts", ".json", ".toml", ".cfg"}
 
@@ -56,8 +62,9 @@ def test_no_consumer_oauth_token_reuse():
             if pat.search(text):
                 hits.append(f"{rel}: matches {pat.pattern!r}")
     assert not hits, (
-        "PROHIBITED consumer Claude/Gemini subscription-OAuth token reuse detected "
-        "(contract §4.2). Use OpenRouter PKCE instead:\n  " + "\n  ".join(hits))
+        "Consumer Claude/Gemini subscription-OAuth endpoint detected in non-allowlisted "
+        "file (contract §4.2). If this is a new subscription-auth provider, add it to the "
+        "ALLOWLIST in this test (§4.4):\n  " + "\n  ".join(hits))
 
 
 def test_openrouter_pkce_is_present_as_the_blessed_path():

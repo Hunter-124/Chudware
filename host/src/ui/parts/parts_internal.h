@@ -225,9 +225,13 @@ void openVendorWizard(AppState& st);                // phase C seam: embed wizar
 void startHealthCheck(AppState& st);
 void pollHealthStatus(AppState& st);
 
-// parts_browser_panel.cpp — embedded vendor-browser panel (later phase; stub for now).
+// parts_browser_panel.cpp — embedded vendor-browser panel + login wizard (phase C).
+// startLoginWizard: site empty → full multi-vendor wizard (login_wizard_start {}),
+// site set → single-vendor wizard ({sites:[site]}). Falls back to the headed
+// vendor_login flow when the worker lacks the embed backend.
 bool browserPanelActive();
 void drawBrowserPanel(AppState& st);
+void startLoginWizard(AppState& st, const std::string& site = std::string());
 
 }  // namespace parts
 }  // namespace ui

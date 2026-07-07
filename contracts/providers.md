@@ -117,14 +117,34 @@ one login → hundreds of models → user-balance billing). Flow (S256 PKCE):
 - The network exchange is transport-injectable so CI exercises the full flow with a fake
   transport and NO network/secrets.
 
-### 4.2 Prohibited auth (BINDING — CI-enforced)
+### 4.2 Prohibited auth (CI-enforced — see §4.4 for authorized exceptions)
 
-NEVER, in any port: reuse a **consumer** Claude Pro/Max or Gemini subscription OAuth token in
-AI-CAD. Anthropic blocks it server-side and has issued takedowns; Google mass-bans (incl.
-paying subscribers). A CI assertion greps the tree and fails if code references consumer
-OAuth token-reuse endpoints for Claude/Gemini (`test_prohibited_auth.py`). Sanctioned
-subscription-linked routes (Anthropic Agent-SDK metered credit, GitHub Copilot SDK, an
-OpenAI Partner-Network login) are separate, human-gated, and out of scope here.
+By default, consumer Claude Pro/Max or Gemini subscription OAuth tokens MUST NOT appear in
+AI-CAD code outside of explicitly allowlisted provider files. Gemini consumer OAuth remains
+fully prohibited (Google mass-bans). A CI assertion greps the tree and fails if code
+references consumer OAuth token-reuse endpoints for Claude/Gemini in non-allowlisted files
+(`test_prohibited_auth.py`). The allowlist covers:
+- This contract and the test itself (legitimate references)
+- The subscription-auth provider modules under `services/agent/providers/` (§4.4)
+
+### 4.4 Subscription auth (opt-in, owner-authorized — 2026-07-07)
+
+Owner-authorized subscription-auth providers allow the app to authenticate using the user's
+own paid Pro/Max/Plus subscription for Claude, Codex, and Cursor — the same first-party
+OAuth flow those vendors' own CLI/IDE clients use. This is an **opt-in** feature: the user
+must explicitly log in through their browser; no subscription token is ever sent without
+the user initiating the flow.
+
+Providers: `codex-sub` (OpenAI Codex/ChatGPT Plus), `anthropic-sub` (Anthropic Claude
+Pro/Max), `cursor-sub` (Cursor Pro). Each lives in its own module under
+`services/agent/providers/` and is allowlisted in `test_prohibited_auth.py`.
+
+Credentials (access_token, refresh_token, expires_at_ms, account_id, email) are stored in
+`config.json` under the `subscription_auth` key, keyed by provider_id. Tokens are
+refreshed automatically before expiry (per-provider skew: Codex none, Anthropic 5min,
+Cursor 5min). Auth retry ladder: retry same → force-refresh → re-login prompt.
+
+These providers are NEVER offline-safe (cloud endpoints, §5).
 
 ### 4.3 AI-CAD Cloud relay (config seam ONLY — human-gated)
 

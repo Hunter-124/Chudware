@@ -4,8 +4,13 @@
 // When workspace is Schematic/Board but no ECAD doc exists, drawEcadWorkspace()
 // renders a centered landing body with:
 //   - New Schematic / New PCB action buttons (dispatch ecad_new_sch / ecad_new_pcb)
-//   - AI design prompt (dispatch ecad_ai_design) matching ecad_panel's launchpad text
-//   - Recent files placeholder (no file-history backend yet — text note only)
+//   - Open button (dispatch ecad_open — needs a dispatch handler in app_state.cpp,
+//     shared-file edit #4)
+//   - "Recent files: none yet" placeholder (no file-history backend yet)
+//
+// Note: AI design prompt is intentionally NOT on the landing. The per-doc AI launchpad
+// inside drawEcadEditor() (ecad_panel.cpp) handles that flow with the correct context
+// once a doc is open. Duplicating it here with a disconnected text buffer is confusing.
 //
 // The landing is gated on "no Schematic or PCB tab in docTabs" so it is distinct
 // from ecad_panel.cpp's per-doc empty mirror state (which is a valid doc that has
@@ -17,19 +22,21 @@
 // A compact ~28dp strip above the canvas shows:
 //   - "ECAD" title (H2 font) on the left
 //   - Schematic / PCB toggle chips (switch workspace between Schematic and Board)
-//   - ERC / DRC run buttons
-//   - Board to 3D (ecad_to_3d — PCB only)
-//   - Gerbers / BOM export shortcuts
-// The registry-driven context toolbar (rendered outside drawViewport by workspace_bar)
-// already shows the full command set; these buttons are quick-access for the most
-// common actions and are NOT duplicating the full toolbar.
+//
+// IMPORTANT: the registry-driven context toolbar (ribbon::drawBody, called by
+// drawContextToolbar in application.cpp BEFORE the viewport window) already renders
+// all ECAD commands for the active workspace: ERC, DRC, Board-to-3D, Gerbers, BOM,
+// Autoroute, etc. The header strip here provides ONLY the sub-workspace toggle
+// (Schematic ↔ PCB) which is not expressed in the registry commands. Do NOT add
+// duplicate action buttons here — they would appear twice (once in the ribbon, once
+// in the header strip).
 //
 // == Board-to-3D flow ==
 // ecadHandleTo3d(st):
 //   1. Calls worker.call("ecad_to_3d", {doc_id}) → {step_path}
 //   2. Calls engine.open(step_path) to load the STEP into the C++ CAD kernel
 //   3. Pushes a new Part DocTab; sets workspace = Model
-//   4. Stores the Board tab's index in the new Part tab's ecadDocId field so the
+//   4. Stores the Board tab's docId in the new Part tab's ecadDocId field so the
 //      section switcher (doc_tabs.cpp drawSectionSwitcher — shared-file edit required)
 //      can link Board ↔ Generated-3D-Part.
 //
@@ -42,6 +49,8 @@
 // 3. doc_tabs.cpp drawSectionSwitcher(): add a "Board" chip entry when active tab is a
 //    Part whose ecadDocId matches a co-open PCB tab (mirrors the Drawing/drawingDocId
 //    pattern at line ~382). See detailed diff in task report.
+// 4. app_state.cpp dispatch(): add handler for "ecad_open" to show a file-open dialog
+//    and call engine.open(path) with ECAD file types (.kicad_sch / .kicad_pcb).
 
 #include "ui/workspace_ecad.h"
 #include "ui/ecad/ecad_panel.h"
@@ -123,15 +132,15 @@ static void drawEcadLanding(AppState& s) {
     ImFont* h2   = theme::font(theme::Font::H2);
     ImFont* body = theme::font(theme::Font::Body);
     const char* kTitle    = "ECAD — Electronics Design";
-    const char* kSubtitle = "Start a schematic, layout a PCB, or describe a circuit and let AI design it.";
+    const char* kSubtitle = "Start a schematic, layout a PCB, or open an existing design.";
     const char* kRecent   = "Recent files: none yet";   // placeholder — no file-history backend
     ImVec2 tSz = h2->CalcTextSizeA(h2->FontSize, FLT_MAX, 0.f, kTitle);
     float  blockH = tSz.y
-                  + 10.f * S   // gap
+                  + 6.f  * S   // gap after title
+                  + body->FontSize  // subtitle
+                  + 12.f * S   // gap before buttons
                   + 26.f * S   // action buttons row
-                  + 8.f  * S   // gap
-                  + 34.f * S   // AI prompt row
-                  + 10.f * S   // gap
+                  + 12.f * S   // gap
                   + body->FontSize; // recent label
 
     float oy = (avail.y - blockH) * 0.5f;
@@ -145,6 +154,7 @@ static void drawEcadLanding(AppState& s) {
     ImGui::TextUnformatted(kTitle);
     ImGui::PopFont();
 
+    ImGui::Dummy(ImVec2(0.f, 6.f * S));
     ImGui::PushFont(body);
     ImGui::PushStyleColor(ImGuiCol_Text, TCOL(txt1));
     ImVec2 sSz = body->CalcTextSizeA(body->FontSize, FLT_MAX, 0.f, kSubtitle);
@@ -153,24 +163,28 @@ static void drawEcadLanding(AppState& s) {
     ImGui::PopStyleColor();
     ImGui::PopFont();
 
-    ImGui::Dummy(ImVec2(0.f, 10.f * S));
+    ImGui::Dummy(ImVec2(0.f, 12.f * S));
 
-    // ---- Action buttons row ----
+    // ---- Action buttons row: New Schematic | New PCB | Open ----
     {
-        const float btnW = 160.f * S;
-        const float gap  = 12.f * S;
-        const float totalBtnW = btnW * 2.f + gap;
+        const float btnW = 148.f * S;
+        const float gap  = 10.f * S;
+        const float totalBtnW = btnW * 3.f + gap * 2.f;
         ImGui::SetCursorPosX(ImGui::GetCursorPos().x + (avail.x - totalBtnW) * 0.5f);
         ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f * S);
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,  ImVec2(12.f * S, 5.f * S));
+
+        // New Schematic — primary accent
         ImGui::PushStyleColor(ImGuiCol_Button,        TCOL(accent));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, TCOL(accent));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  TCOL(bg3));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  TCOL(accentDim));
         ImGui::PushStyleColor(ImGuiCol_Text,          IM_COL32(255,255,255,255));
         if (ImGui::Button("New Schematic", ImVec2(btnW, 0.f)))
             s.dispatch("ecad_new_sch");
         ImGui::PopStyleColor(4);
         ImGui::SameLine(0.f, gap);
+
+        // New PCB — secondary
         ImGui::PushStyleColor(ImGuiCol_Button,        TCOL(bg2));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, TCOL(bg3));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive,  TCOL(bg3));
@@ -178,37 +192,22 @@ static void drawEcadLanding(AppState& s) {
         if (ImGui::Button("New PCB", ImVec2(btnW, 0.f)))
             s.dispatch("ecad_new_pcb");
         ImGui::PopStyleColor(4);
-        ImGui::PopStyleVar(2);
-    }
-
-    ImGui::Dummy(ImVec2(0.f, 8.f * S));
-
-    // ---- AI Design prompt row ----
-    {
-        const float inputW = 340.f * S;
-        const float btnW   = 130.f * S;
-        const float gap    = 8.f * S;
-        static char aiReq[256] = {};
-        ImGui::SetCursorPosX(ImGui::GetCursorPos().x + (avail.x - inputW - gap - btnW) * 0.5f);
-        ImGui::SetNextItemWidth(inputW);
-        ImGui::InputTextWithHint("##ecad_landing_ai", "describe a circuit to design with AI...",
-                                 aiReq, sizeof(aiReq));
         ImGui::SameLine(0.f, gap);
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.f * S);
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,  ImVec2(10.f * S, 4.f * S));
-        if (ImGui::Button("Design with AI", ImVec2(btnW, 0.f))) {
-            if (aiReq[0] != '\0') {
-                // Dispatch new schematic then AI design (ai_design reads the text from ecad_panel's
-                // static g.aiRequest — the panel's own launchpad captures it there).
-                s.dispatch("ecad_ai_design");
-            }
-        }
-        ImGui::PopStyleVar(2);
+
+        // Open — secondary; dispatches ecad_open (needs handler in app_state.cpp — shared-file #4)
+        ImGui::PushStyleColor(ImGuiCol_Button,        TCOL(bg2));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, TCOL(bg3));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  TCOL(bg3));
+        ImGui::PushStyleColor(ImGuiCol_Text,          TCOL(txt0));
+        if (ImGui::Button("Open...", ImVec2(btnW, 0.f)))
+            s.dispatch("ecad_open");
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Create a schematic from your description.");
+            ImGui::SetTooltip("Open an existing schematic or PCB file");
+        ImGui::PopStyleColor(4);
+        ImGui::PopStyleVar(2);
     }
 
-    ImGui::Dummy(ImVec2(0.f, 10.f * S));
+    ImGui::Dummy(ImVec2(0.f, 12.f * S));
 
     // ---- Recent files placeholder ----
     {
@@ -223,13 +222,21 @@ static void drawEcadLanding(AppState& s) {
 }
 
 // ---------------------------------------------------------------------------
-// Workspace header — shown when an ECAD doc is open, above the canvas.
-// Compact ~28dp strip: title | Schematic/PCB toggle | ERC/DRC | Board to 3D | Gerbers | BOM
+// Workspace header — shown when an ECAD doc is open, just above the canvas.
+// Compact ~28dp strip: title | Schematic/PCB sub-workspace toggle.
+//
+// All ECAD commands (ERC, DRC, Board→3D, Gerbers, BOM, Autoroute, etc.) are
+// rendered by the registry-driven ribbon (drawContextToolbar → ribbon::drawBody)
+// in application.cpp, which fires BEFORE drawViewport. Do NOT add duplicate
+// action buttons here — they would appear twice.
+//
+// This strip provides only the sub-workspace toggle (Schematic ↔ Board) which
+// switches cmd::Workspace and is not expressed as a registry command.
 // ---------------------------------------------------------------------------
 static void drawEcadHeader(AppState& s) {
     const float S = theme::S();
 
-    // Thin separator line background.
+    // Thin glass band behind the toggle strip.
     const ImVec2 cursorStart = ImGui::GetCursorScreenPos();
     const float  headerH     = 28.f * S;
     ImDrawList*  dl          = ImGui::GetWindowDrawList();
@@ -247,50 +254,15 @@ static void drawEcadHeader(AppState& s) {
 
     ImGui::SameLine(0.f, 16.f * S);
 
-    // Sub-workspace toggle: Schematic | PCB
+    // Sub-workspace toggle: Schematic | PCB.
+    // Switches cmd::Workspace without creating a new doc (both workspace kinds are
+    // FullViewport; ecad_panel.cpp routes to the right editor based on active tab kind).
     const bool isSch = (s.workspace == cmd::Workspace::Schematic);
     if (chipBtn("Schematic", isSch))
         s.workspace = cmd::Workspace::Schematic;
     ImGui::SameLine(0.f, 4.f * S);
     if (chipBtn("PCB", !isSch))
         s.workspace = cmd::Workspace::Board;
-
-    ImGui::SameLine(0.f, 16.f * S);
-
-    // ERC / DRC — context-sensitive label.
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.f * S);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,  ImVec2(7.f * S, 2.f * S));
-    if (isSch) {
-        if (ImGui::SmallButton("Run ERC"))
-            s.dispatch("ecad_run_erc");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Run Electrical Rules Check");
-    } else {
-        if (ImGui::SmallButton("Run DRC"))
-            s.dispatch("ecad_run_drc");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Run Design Rules Check");
-    }
-    ImGui::SameLine(0.f, 6.f * S);
-
-    // Board to 3D — PCB only.
-    if (!isSch) {
-        if (ImGui::SmallButton("Board to 3D"))
-            s.dispatch("ecad_to_3d");
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Export board as STEP and open as Part in the 3D scene");
-        ImGui::SameLine(0.f, 6.f * S);
-    }
-
-    // Export shortcuts — PCB only for Gerbers/BOM; suppress on Schematic.
-    if (!isSch) {
-        if (ImGui::SmallButton("Gerbers"))
-            s.dispatch("ecad_export_gerber");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Export Gerber fabrication files");
-        ImGui::SameLine(0.f, 6.f * S);
-        if (ImGui::SmallButton("BOM"))
-            s.dispatch("ecad_export_bom");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Export Bill of Materials");
-    }
-    ImGui::PopStyleVar(2);
 
     ImGui::Separator();
 }
@@ -301,24 +273,25 @@ static void drawEcadHeader(AppState& s) {
 // Public: drawEcadWorkspace
 // ---------------------------------------------------------------------------
 void drawEcadWorkspace(AppState& s) {
-    // Gate: if no ECAD tab is open, show the landing page.
     if (!hasEcadTab(s)) {
-        // If there IS an ECAD tab but it's not currently active, focus it.
-        // (This happens when workspace_bar navigates to ECAD while a Part tab is active.)
-        const int ecadIdx = firstEcadTabIdx(s);
-        if (ecadIdx >= 0) {
-            s.switchToTab(ecadIdx);
-        } else {
-            // Truly no ECAD doc — render landing.
-            drawEcadLanding(s);
-            return;
+        // No ECAD tab at all — render landing page.
+        drawEcadLanding(s);
+        return;
+    }
+
+    // At least one ECAD tab exists. If the active tab is NOT an ECAD tab (e.g. the user
+    // is on a Part tab and clicked the ECAD workspace button), focus the first ECAD tab
+    // so the editor renders against the correct doc.
+    if (s.activeTab >= 0 && s.activeTab < (int)s.docTabs.size()) {
+        const auto& active = s.docTabs[s.activeTab];
+        if (active.kind != core::DocTabKind::Schematic && active.kind != core::DocTabKind::Pcb) {
+            const int ecadIdx = firstEcadTabIdx(s);
+            if (ecadIdx >= 0) s.switchToTab(ecadIdx);
         }
     }
 
-    // ECAD doc is open: draw workspace header chrome above the canvas.
+    // ECAD doc is active: draw sub-workspace toggle strip, then the ECAD canvas editor.
     drawEcadHeader(s);
-
-    // Delegate to the existing ECAD editor (live backend — do not replace).
     ui::drawEcadEditor(s);
 }
 

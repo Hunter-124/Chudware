@@ -634,6 +634,9 @@ def register_reveng_tools(mcp: FastMCP) -> None:
         Args:
             name: Human label for this session (defaults to a timestamp label).
             part_ref: Optional parts-hub ``part_id`` when seeded from the library.
+                When supplied the session is seeded with any photos and datasheet
+                paths already recorded on the PartRecord (``metadata.photos`` and
+                ``metadata.datasheet``).
             research: Optional seed for the web/part-number lane — pass a part number,
                 search query, or vendor URL.  When provided, the session is created and
                 ``reveng_research_source`` is immediately called with this value so the
@@ -647,7 +650,54 @@ def register_reveng_tools(mcp: FastMCP) -> None:
             label = name or f"RE session {_now_iso()}"
             session = _make_session(sid, label, part_ref)
             _save_session(session)
-            result: dict = {"ok": True, "session_id": sid, "session": session}
+
+            # RE-23: seed photos / datasheet from the parts-hub entry when
+            # part_ref is supplied and carries embedded asset paths.
+            seeded: dict = {}
+            if part_ref:
+                try:
+                    from engine_oracle.parts_hub import get as _hub_get  # noqa: PLC0415
+                    record = _hub_get(part_ref)
+                    if record:
+                        meta = record.get("metadata") or {}
+                        photos = meta.get("photos") or []
+                        datasheet = meta.get("datasheet")
+                        if photos or datasheet:
+                            sess_dir = _session_path(sid)
+                            if photos:
+                                images_dir = sess_dir / "images"
+                                images_dir.mkdir(parents=True, exist_ok=True)
+                                import shutil as _shutil2  # noqa: PLC0415
+                                copied = 0
+                                for p in photos:
+                                    src = _Path(p).expanduser()
+                                    if src.is_file():
+                                        _shutil2.copy2(str(src), str(images_dir / src.name))
+                                        copied += 1
+                                session["artifacts"]["images"] = copied
+                                if copied:
+                                    session["stages"]["capture"] = "done"
+                                    seeded["images"] = copied
+                            if datasheet:
+                                ds_dir = sess_dir / "datasheet"
+                                ds_dir.mkdir(parents=True, exist_ok=True)
+                                src = _Path(datasheet).expanduser()
+                                if src.is_file():
+                                    import shutil as _shutil3  # noqa: PLC0415
+                                    _shutil3.copy2(str(src), str(ds_dir / src.name))
+                                    seeded["datasheet"] = str(ds_dir / src.name)
+                            if seeded:
+                                session["provenance"].append({
+                                    "step": "seeded_from_parts_hub",
+                                    "part_ref": part_ref,
+                                    "seeded": seeded,
+                                    "ts": _now_iso(),
+                                })
+                                _save_session(session)
+                except Exception:
+                    pass  # seeding is best-effort; never block session creation
+
+            result: dict = {"ok": True, "session_id": sid, "session": session, "seeded": seeded}
             if research:
                 # Determine whether the seed looks like a URL, a part number, or a query
                 import re as _re
@@ -934,6 +984,11 @@ def register_reveng_tools(mcp: FastMCP) -> None:
     ) -> str:
         """Attach a parts-hub ``part_ref`` to the completed RE result for *session_id*.
 
+        Writes a ``reveng_result.json`` sidecar into the session directory so
+        that the ``RevengResultAdapter`` can expose this part to ``part_place``
+        as a ``geometry_ref.kind="import_file"`` PartRecord.  Registers the
+        adapter into the parts-hub singleton on first call (idempotent).
+
         Returns ``{ok, part_ref, geometry_ref, session}``.
         """
         try:
@@ -947,11 +1002,36 @@ def register_reveng_tools(mcp: FastMCP) -> None:
                 "ts": _now_iso(),
             })
             _save_session(s)
-            doc_id = s.get("artifacts", {}).get("doc_id")
+            artifacts = s.get("artifacts", {})
+            doc_id = artifacts.get("doc_id")
+            mesh_path = artifacts.get("mesh_path")
+            geometry_ref = doc_id or mesh_path  # best available geometry handle
+
+            # RE-23: write sidecar so RevengResultAdapter can serve this PartRecord.
+            sidecar = {
+                "schema": "aicad.reveng_result/1",
+                "session_id": session_id,
+                "part_ref": part_ref,
+                "name": s.get("name", part_ref),
+                "doc_id": doc_id,
+                "mesh_path": mesh_path,
+                "attached_at": _now_iso(),
+            }
+            sidecar_path = _session_path(session_id) / "reveng_result.json"
+            sidecar_path.write_text(_json.dumps(sidecar, indent=2))
+
+            # Register the live adapter into the parts-hub singleton (idempotent).
+            try:
+                from engine_oracle.parts_hub import register_provider as _reg_provider  # noqa: PLC0415
+                from engine_oracle.parts_hub.adapters.reveng_result_adapter import RevengResultAdapter  # noqa: PLC0415
+                _reg_provider(RevengResultAdapter())
+            except Exception:
+                pass  # best-effort; part_place tests that bypass hub still work
+
             return _dumps({
                 "ok": True,
                 "part_ref": part_ref,
-                "geometry_ref": doc_id,
+                "geometry_ref": geometry_ref,
                 "session": s,
             })
         except Exception as e:

@@ -40,16 +40,25 @@ void plmRowPill(bool sel, float rows) {
                            false, sel, sel ? 0.42f : 0.20f);
 }
 
-void plmSectionHeader(const char* label) {
+void plmSectionHeader(const char* label, const char* icon) {
     const float S = ui::uiScale;
+    const float h = ImGui::GetFrameHeight();
+    if (icon && icon[0]) {
+        ImVec2 c = ImGui::GetCursorScreenPos();
+        const float isz = 17 * S;
+        ui::drawIconGlass(ImGui::GetWindowDrawList(), icon,
+                          ImVec2(c.x + isz * 0.5f, c.y + h * 0.5f), isz,
+                          Palette::toU32(palette.accent), 0);
+        ImGui::Dummy(ImVec2(isz + 9 * S, h));
+        ImGui::SameLine();
+    }
+    // Accent title, no underline — the old "underscore" rule read as clutter and
+    // clashed with the boxed glass panels. Icon (if any) is centred on the title.
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
+    ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(label);
-    ImVec2 p0 = ImGui::GetItemRectMin();
-    ImVec2 p1 = ImGui::GetItemRectMax();
-    ImGui::GetWindowDrawList()->AddLine(
-        ImVec2(p0.x, p1.y + 1.0f * S), ImVec2(p1.x, p1.y + 1.0f * S),
-        ImGui::ColorConvertFloat4ToU32(
-            ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.60f)),
-        1.0f * S);
+    ImGui::PopStyleColor();
     ImGui::Spacing();
 }
 
@@ -148,73 +157,100 @@ static const RailItem kRail[] = {
     {PlmPage::Settings, "Settings", "settings"},
 };
 
-static void drawRail(AppState& st, float railW, float bottomMargin) {
+// One horizontal PROJECT nav button: liquid-glass gradient fill (accent -> accentDim
+// top-to-bottom) when selected/hovered over the shared frosted base, icon + label,
+// and an optional count badge that sits in its OWN rounded pill inset from the
+// button's right edge. Drives g_plmHub.page on click.
+static void drawNavButton(const RailItem& r, int badge) {
     const float S = ui::uiScale;
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * S, 10 * S));
-    ImGui::BeginChild("##plm_rail", ImVec2(railW, -bottomMargin), ImGuiChildFlags_None);
-    ImGui::PopStyleVar();
+    ImGui::PushID((int)r.page);
+    const bool sel = (g_plmHub.page == r.page);
 
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
-    ImGui::TextUnformatted("PROJECT");
-    ImGui::PopStyleColor();
-    {
-        std::string name = plmProjectName(st);
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::TextWrapped("%s", name.empty() ? "(none open)" : name.c_str());
-        ImGui::PopStyleColor();
+    const float h       = ImGui::GetFrameHeight() * 1.5f;
+    const float iconSz  = 17 * S;
+    const float padX    = 14 * S;
+    const float iconGap = 8 * S;
+    const float textW   = ImGui::CalcTextSize(r.label).x;
+
+    // Badge pill metrics — its own background + extra right padding from the edge.
+    char bbuf[16] = {};
+    float badgePillW = 0.0f;
+    const float badgePadX  = 7 * S;   // inside the pill
+    const float badgeGap   = 9 * S;   // between label and pill
+    const float badgeInset = 11 * S;  // pill -> button right edge ("more padding")
+    if (badge > 0) {
+        std::snprintf(bbuf, sizeof(bbuf), "%d", badge);
+        badgePillW = ImGui::CalcTextSize(bbuf).x + badgePadX * 2;
     }
-    ImGui::Dummy(ImVec2(0, 8 * S));
 
+    const float w = padX + iconSz + iconGap + textW +
+                    (badge > 0 ? badgeGap + badgePillW + badgeInset : padX);
+
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImVec2 p1(p0.x + w, p0.y + h);
+    if (ImGui::InvisibleButton("##nav", ImVec2(w, h)))
+        g_plmHub.page = r.page;
+    const bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    for (const auto& r : kRail) {
-        ImGui::PushID((int)r.page);
-        bool sel = (g_plmHub.page == r.page);
-        const float rowH = ImGui::GetFrameHeight() * 1.4f;
-        ImVec2 p0 = ImGui::GetCursorScreenPos();
-        float  w  = ImGui::GetContentRegionAvail().x;
+    const float rnd = 9.0f * S;
 
-        // Full-row clickable button drives selection + hover (the old row only
-        // registered clicks on the label glyphs, so most of the pill was dead).
-        if (ImGui::InvisibleButton("##row", ImVec2(w, rowH)))
-            g_plmHub.page = r.page;
-        bool hovered = ImGui::IsItemHovered();
-
-        // Pill background (brightens on hover even when not selected).
-        float bgA = sel ? 0.42f : (hovered ? 0.30f : 0.20f);
-        ui::glassRowBackground(dl, p0, ImVec2(p0.x + w, p0.y + rowH), 4.0f,
-                               false, sel || hovered, bgA);
-
-        // Icon + label — icon at a fixed left inset, label left-aligned after it.
-        ImVec4 tc = sel
-            ? ImVec4(palette.text[0], palette.text[1], palette.text[2], 1.0f)
-            : ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f);
-        ImU32 tcu = ImGui::ColorConvertFloat4ToU32(tc);
-        const float iconSz = 18 * S;
-        const float iconX  = p0.x + 12 * S;
-        ui::drawIconGlass(dl, r.icon, ImVec2(iconX + iconSz * 0.5f, p0.y + rowH * 0.5f),
-                          iconSz, tcu, 0);
-        ImVec2 ts = ImGui::CalcTextSize(r.label);
-        dl->AddText(ImVec2(iconX + iconSz + 10 * S, p0.y + (rowH - ts.y) * 0.5f),
-                    tcu, r.label);
-
-        // Count badge (from cached overview) pinned to the right edge, centered.
-        int badge = 0;
-        if (r.page == PlmPage::Files)    badge = g_plmHub.overview.dirtyCount;
-        if (r.page == PlmPage::Planning) badge = g_plmHub.overview.openIssues;
-        if (badge > 0) {
-            char b[16]; std::snprintf(b, sizeof(b), "%d", badge);
-            ImVec2 bs = ImGui::CalcTextSize(b);
-            dl->AddText(ImVec2(p0.x + w - bs.x - 6 * S, p0.y + (rowH - bs.y) * 0.5f),
-                        ImGui::ColorConvertFloat4ToU32(ImVec4(palette.statusWarn[0],
-                            palette.statusWarn[1], palette.statusWarn[2], 1.0f)),
-                        b);
-        }
-        ImGui::Spacing();
-        ImGui::PopID();
+    // Frosted glass base for every button (translucent + specular + border).
+    ui::glassBackground(dl, p0, p1, 9.0f);
+    // Liquid-glass gradient wash. The highlight must cover the FULL rounded button
+    // (corners included): a rounded accent base, a rounded-top bright strip that
+    // owns the top corners, then a full-width vertical sheen below the corner radius
+    // (its square edges sit in the interior, never past the rounding).
+    if (sel || hov) {
+        const float aTop = sel ? (held ? 0.95f : 0.82f) : 0.30f;
+        const float aBot = sel ? 0.48f : 0.14f;
+        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(
+            palette.accentDim[0], palette.accentDim[1], palette.accentDim[2], aBot)), rnd);
+        const ImU32 cTop = ImGui::GetColorU32(ImVec4(
+            palette.accent[0], palette.accent[1], palette.accent[2], aTop));
+        const ImU32 cFade = ImGui::GetColorU32(ImVec4(
+            palette.accent[0], palette.accent[1], palette.accent[2], 0.0f));
+        dl->AddRectFilled(p0, ImVec2(p1.x, p0.y + rnd), cTop, rnd, ImDrawFlags_RoundCornersTop);
+        dl->AddRectFilledMultiColor(ImVec2(p0.x, p0.y + rnd),
+                                    ImVec2(p1.x, p0.y + h * 0.62f),
+                                    cTop, cTop, cFade, cFade);
     }
-    ImGui::EndChild();
+
+    const ImU32 tcu = sel ? Palette::toU32(palette.text)
+        : ImGui::ColorConvertFloat4ToU32(ImVec4(palette.textDim[0], palette.textDim[1],
+                                                palette.textDim[2], 1.0f));
+    float x = p0.x + padX;
+    ui::drawIconGlass(dl, r.icon, ImVec2(x + iconSz * 0.5f, p0.y + h * 0.5f),
+                      iconSz, tcu, 0);
+    x += iconSz + iconGap;
+    ImVec2 ts = ImGui::CalcTextSize(r.label);
+    dl->AddText(ImVec2(x, p0.y + (h - ts.y) * 0.5f), tcu, r.label);
+
+    if (badge > 0) {
+        ImVec2 bs = ImGui::CalcTextSize(bbuf);
+        ImVec2 bp1(p1.x - badgeInset, p0.y + (h - bs.y) * 0.5f - 3 * S);
+        ImVec2 bp0(bp1.x - badgePillW, bp1.y);
+        bp1.y = bp0.y + bs.y + 6 * S;
+        dl->AddRectFilled(bp0, bp1, ImGui::GetColorU32(ImVec4(palette.statusWarn[0],
+            palette.statusWarn[1], palette.statusWarn[2], 0.90f)), (bs.y + 6 * S) * 0.5f);
+        dl->AddText(ImVec2(bp0.x + badgePadX, bp0.y + 3 * S), IM_COL32(20, 22, 26, 255), bbuf);
+    }
+    ImGui::PopID();
+}
+
+// Horizontal PROJECT nav strip above the page body (replaces the old side rail —
+// frees the dead vertical column). Just the nav buttons — the "PROJECT <name>"
+// label was dropped so the strip sits at the very top and the page gets its space.
+static void drawTopNav(AppState& st) {
+    const float S = ui::uiScale;
+    (void)st;
+    const float gap = 8 * S;
+    for (int i = 0; i < (int)(sizeof(kRail) / sizeof(kRail[0])); ++i) {
+        if (i) ImGui::SameLine(0, gap);
+        int badge = 0;
+        if (kRail[i].page == PlmPage::Files)    badge = g_plmHub.overview.dirtyCount;
+        if (kRail[i].page == PlmPage::Planning) badge = g_plmHub.overview.openIssues;
+        drawNavButton(kRail[i], badge);
+    }
 }
 
 // ---- onboarding (no project resolvable) ---------------------------------------
@@ -260,21 +296,24 @@ void drawPlmWorkspace(AppState& st) {
     // keep the dashboard aggregate fresh (drives rail badges + Overview)
     plmEnsureOverview(st);
 
-    // Outer margin so neither the rail nor the page hugs the main window border.
+    // Outer margin so neither the nav nor the page hugs the main window border.
     const float M = 10.0f * S;
     ImGui::Dummy(ImVec2(0, M));   // top margin
-    ImGui::Indent(M);            // left margin (rail + page shift right)
+    ImGui::Indent(M);            // left margin
 
-    const float railW = 168.0f * S;
-    drawRail(st, railW, M);
-    ImGui::SameLine();
+    // Horizontal PROJECT nav above the page views (was a left side rail).
+    drawTopNav(st);
+    ImGui::Dummy(ImVec2(0, 8 * S));
 
     // One generous, uniform content margin for every page body — so the Overview,
     // Planning band, Team & Sync and the board all share the same left edge instead
     // of each element hugging the border by a different amount.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24 * S, 14 * S));
     // -M width/height leaves a matching right + bottom margin from the window edge.
-    ImGui::BeginChild("##plm_page", ImVec2(-M, -M), ImGuiChildFlags_None);
+    // The page body itself never scrolls — overflow lives in each page's inner
+    // item-list children (kanban columns, Files/History/Releases lists, etc.).
+    ImGui::BeginChild("##plm_page", ImVec2(-M, -M), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
     switch (g_plmHub.page) {
         case PlmPage::Overview: plmDrawOverviewPage(st); break;

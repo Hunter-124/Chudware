@@ -39,32 +39,92 @@ void accentButtonColors() {
         ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
 }
 
-// A self-bounding "card": an auto-height bordered child whose rounded background
-// exactly wraps its content with even internal padding. Used by the kanban task
-// cards and single-line PLM rows so controls sit padded and vertically centred
-// inside their box instead of clipping out the top edge — the failure mode of the
-// old fixed-height plmRowPill, which guessed a height and drew content hugging its
-// top. AutoResizeY makes the box grow to fit wrapped titles and expanded controls.
-void plmCardBegin(const char* id, bool sel, float padX = 8.0f, float padY = 6.0f) {
+// ---- card tint by category (priority / severity / status) ---------------------
+// Each list card gets a translucent liquid-glass background tinted by the item's
+// standing. Only tasks/open-tasks have a real "priority"; the other lists map to
+// their natural status colour (severity, lifecycle, scope), which reads the same.
+const float* plmTintPriority(const std::string& pr) {
+    if (pr == "p0") return palette.statusErr;    // critical
+    if (pr == "p1") return palette.statusWarn;   // high
+    if (pr == "p3") return palette.textDisabled; // low
+    return palette.accent;                        // p2 / med / default
+}
+const float* plmTintSeverity(const std::string& sev) {
+    if (sev == "critical" || sev == "high") return palette.statusErr;
+    if (sev == "med") return palette.statusWarn;
+    if (sev == "low") return palette.accentDim;
+    return palette.textDim;
+}
+// p0 highest → smallest rank (sorts first). Unknown → med.
+int plmPriorityRank(const std::string& pr) {
+    if (pr == "p0") return 0; if (pr == "p1") return 1;
+    if (pr == "p3") return 3; return 2;
+}
+int plmSeverityRank(const std::string& sev) {
+    if (sev == "critical") return 0; if (sev == "high") return 1;
+    if (sev == "med") return 2; return 3;
+}
+
+// A self-bounding "card": an auto-height bordered child whose background is a
+// priority-coloured liquid-glass gradient (frosted base + a vertical colour wash,
+// brighter at the top). Because AutoResizeY means the height isn't known until the
+// content is laid out, the gradient is painted in plmCardEnd on a *background*
+// draw-channel (channel 0, under the content on channel 1) once the size is final.
+// `tint` (a palette float[4]) selects the wash colour; nullptr = neutral.
+struct PlmCardStyle { float r, g, b, a; };
+static std::vector<PlmCardStyle> s_cardStyleStack;
+
+void plmCardBegin(const char* id, bool sel, float padX = 8.0f, float padY = 6.0f,
+                  const float* tint = nullptr, float tintA = 0.20f) {
     const float S = ui::uiScale;
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, sel
-        ? ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.20f)
-        : ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.055f));
-    ImGui::PushStyleColor(ImGuiCol_Border, sel
-        ? ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.55f)
-        : ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.14f));
+    const float* tc = sel ? palette.accent : (tint ? tint : palette.text);
+    // Transparent native body (we paint our own gradient); border echoes the tint.
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_Border,
+        sel ? ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.60f)
+            : ImVec4(tc[0], tc[1], tc[2], tint ? 0.40f : 0.14f));
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f * S);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padX * S, padY * S));
     ImGui::BeginChild(id, ImVec2(0, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
+    // Content draws on the foreground channel; the gradient goes behind it in End.
+    // Split + merge are unconditional and paired (End always merges).
+    ImGui::GetWindowDrawList()->ChannelsSplit(2);
+    ImGui::GetWindowDrawList()->ChannelsSetCurrent(1);
+    const float baseA = sel ? 0.28f : (tint ? tintA : 0.055f);
+    s_cardStyleStack.push_back({tc[0], tc[1], tc[2], baseA});
 }
 
-// Close a card opened with plmCardBegin. Returns true if the card body was clicked
-// outside any inner widget (for row/card selection). Reads hover state while the
-// child is still current, so call it before doing anything else.
-bool plmCardEnd(float gap = 4.0f) {
+// Close a card opened with plmCardBegin. Paints the deferred liquid-glass gradient
+// on the background channel, merges, then returns true if the card body was clicked
+// outside any inner widget (for row/card selection).
+bool plmCardEnd(float gap = 3.0f) {
     const float S = ui::uiScale;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    PlmCardStyle cs = s_cardStyleStack.empty()
+        ? PlmCardStyle{palette.text[0], palette.text[1], palette.text[2], 0.055f}
+        : s_cardStyleStack.back();
+    if (!s_cardStyleStack.empty()) s_cardStyleStack.pop_back();
+
+    ImVec2 mn = ImGui::GetWindowPos();
+    ImVec2 sz = ImGui::GetWindowSize();
+    ImVec2 mx(mn.x + sz.x, mn.y + sz.y);
+    const float rnd = 6.0f * S;
+    dl->ChannelsSetCurrent(0);                 // background, under the content
+    ui::glassBackground(dl, mn, mx, 6.0f);     // frosted translucent base + shine
+    const ImU32 top = ImGui::GetColorU32(ImVec4(cs.r, cs.g, cs.b, cs.a));
+    const ImU32 bot = ImGui::GetColorU32(ImVec4(cs.r, cs.g, cs.b, cs.a * 0.30f));
+    // The wash must cover the FULL rounded card (corners included): a rounded base
+    // (owns every corner at the faint bottom colour), a rounded-top strip so the top
+    // corners get the bright colour, then a full-width vertical fade in the interior.
+    dl->AddRectFilled(mn, mx, bot, rnd);
+    dl->AddRectFilled(mn, ImVec2(mx.x, mn.y + rnd), top, rnd, ImDrawFlags_RoundCornersTop);
+    if (mx.y - rnd > mn.y + rnd)
+        dl->AddRectFilledMultiColor(ImVec2(mn.x, mn.y + rnd), ImVec2(mx.x, mx.y - rnd),
+                                    top, top, bot, bot);
+    dl->ChannelsMerge();
+
     bool clicked = ImGui::IsWindowHovered() &&
                    ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                    !ImGui::IsAnyItemHovered();
@@ -90,9 +150,11 @@ void dimText(const char* fmt, ...) {
 // A bordered, padded stat chip: the count centered up top, the label centered
 // below. Fixed size so a row of them reads as a tidy dashboard band instead of
 // numbers crammed against the left edge.
-void statCard(const char* label, int n, const float* col) {
+// `w` = chip width (0 = default). No trailing SameLine — the caller lays chips out
+// (and wraps) so a band of them fits whatever column width it lives in.
+void statCard(const char* label, int n, const float* col, float w = 0.0f) {
     const float S = ui::uiScale;
-    const ImVec2 sz(100 * S, 60 * S);
+    const ImVec2 sz(w > 0 ? w : 100 * S, 60 * S);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImVec2 p1(p0.x + sz.x, p0.y + sz.y);
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -106,7 +168,6 @@ void statCard(const char* label, int n, const float* col) {
         ImGui::GetColorU32(ImVec4(
             palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f)), label);
     ImGui::Dummy(sz);
-    ImGui::SameLine(0, 10 * S);
 }
 
 // Shorten an ISO timestamp (2026-07-07T19:54:28Z) to a readable "2026-07-07  19:54".
@@ -154,7 +215,9 @@ void plmPanelBegin(const char* id, const char* title, const char* icon = nullptr
     ImGui::BeginChild(id, ImVec2(width, 0),
                       ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
     if (title && title[0]) {
-        const float h = ImGui::GetTextLineHeight();
+        // Icon centred on the SAME frame height the title is aligned to, so the
+        // glyph and text share a baseline instead of the icon floating high.
+        const float h = ImGui::GetFrameHeight();
         if (icon && icon[0]) {
             ImVec2 c = ImGui::GetCursorScreenPos();
             const float isz = 17 * S;
@@ -169,7 +232,7 @@ void plmPanelBegin(const char* id, const char* title, const char* icon = nullptr
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(title);
         ImGui::PopStyleColor();
-        ImGui::Dummy(ImVec2(0, 3 * S));
+        ImGui::Dummy(ImVec2(0, 1 * S));  // sit the title close to its content
     }
 }
 
@@ -256,59 +319,56 @@ void plmDrawOverviewPage(AppState& st) {
     const float S = ui::uiScale;
     plmEnsureOverview(st);
 
-    plmSectionHeader("Overview");
     if (!H.ovErr.empty()) { plmError(H.ovErr); return; }
 
     const auto& ov = H.overview;
 
-    // At-a-glance stat band — frosted chips inside a discrete panel.
-    plmPanelBegin("##ov_stats", nullptr);
-    statCard("Files",      ov.itemsCount,     palette.accent);
-    statCard("Unsaved",    ov.dirtyCount,     ov.dirtyCount ? palette.statusWarn : palette.textDim);
-    statCard("Tasks",      ov.openTasks,      palette.textDim);
-    statCard("Issues",     ov.openIssues,     ov.openIssues ? palette.statusWarn : palette.textDim);
-    statCard("Milestones", ov.openMilestones, palette.textDim);
-    ImGui::NewLine();
-    if (!ov.nextMilestone.empty()) {
+    // Quadrant bodies. Laid out 2×2:  [ Save a checkpoint | Overview ]
+    //                                 [ Recent activity   | Open tasks ]
+    auto bodyCheckpoint = [&]() {
+        dimText("Record a point in this project's history you can return to.");
         ImGui::Dummy(ImVec2(0, 2 * S));
-        dimText("Next milestone: %s", ov.nextMilestone.c_str());
-    }
-    plmPanelEnd();
-
-    ImGui::Dummy(ImVec2(0, 10 * S));
-
-    // quick checkpoint — the basic loop, front and centre
-    plmPanelBegin("##ov_ckpt", "Save a checkpoint", "save");
-    dimText("Record a point in this project's history you can return to.");
-    ImGui::Dummy(ImVec2(0, 2 * S));
-    ImGui::SetNextItemWidth(320 * S);
-    bool enter = ImGui::InputTextWithHint("##plm_ckpt", "What changed? (optional)",
-        H.checkpointMsg, sizeof(H.checkpointMsg), ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::SameLine();
-    bool save = plmGlassButton("##ckpt_btn", "Save checkpoint", "save", true) || enter;
-    if (save && !H.busy) doCheckpoint(st);
-    if (H.busy) plmSpinner("Saving");
-    plmError(H.actionErr);
-    if (!H.actionOk.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f));
-        ImGui::TextUnformatted(H.actionOk.c_str());
-        ImGui::PopStyleColor();
-    }
-    plmPanelEnd();
-
-    ImGui::Dummy(ImVec2(0, 10 * S));
-
-    // recent activity + open tasks — two discrete side-by-side panels
-    const float halfW = (ImGui::GetContentRegionAvail().x - 12 * S) * 0.5f;
-
-    plmPanelBegin("##ov_recent", "Recent activity", "history", halfW);
-    if (ov.recent.empty()) {
-        dimText("No history yet.");
-    } else {
+        ImGui::SetNextItemWidth(-1);
+        bool enter = ImGui::InputTextWithHint("##plm_ckpt", "What changed? (optional)",
+            H.checkpointMsg, sizeof(H.checkpointMsg), ImGuiInputTextFlags_EnterReturnsTrue);
+        bool save = plmGlassButton("##ckpt_btn", "Save checkpoint", "save", true) || enter;
+        if (save && !H.busy) doCheckpoint(st);
+        if (H.busy) plmSpinner("Saving");
+        plmError(H.actionErr);
+        if (!H.actionOk.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f));
+            ImGui::TextUnformatted(H.actionOk.c_str());
+            ImGui::PopStyleColor();
+        }
+    };
+    auto bodyStats = [&]() {
+        struct SC { const char* label; int n; const float* col; };
+        const SC scs[] = {
+            {"Files",      ov.itemsCount,     palette.accent},
+            {"Unsaved",    ov.dirtyCount,     ov.dirtyCount ? palette.statusWarn : palette.textDim},
+            {"Tasks",      ov.openTasks,      palette.textDim},
+            {"Issues",     ov.openIssues,     ov.openIssues ? palette.statusWarn : palette.textDim},
+            {"Milestones", ov.openMilestones, palette.textDim},
+        };
+        const float cw = 86 * S, cg = 8 * S;
+        int perRow = std::max(1, (int)std::floor(
+            (ImGui::GetContentRegionAvail().x + cg) / (cw + cg)));
+        for (int i = 0; i < (int)IM_ARRAYSIZE(scs); ++i) {
+            if (i % perRow) ImGui::SameLine(0, cg);
+            statCard(scs[i].label, scs[i].n, scs[i].col, cw);
+        }
+        if (!ov.nextMilestone.empty()) {
+            ImGui::Dummy(ImVec2(0, 2 * S));
+            dimText("Next milestone: %s", ov.nextMilestone.c_str());
+        }
+    };
+    auto bodyRecent = [&]() {
+        if (ov.recent.empty()) { dimText("No history yet."); return; }
         for (const auto& e : ov.recent) {
             ImGui::PushID(e.commit.c_str());
-            plmCardBegin("##act", false);
+            plmCardBegin("##act", false, 8.0f, 4.0f,
+                         e.kind == "release" ? palette.statusOk : palette.accent, 0.15f);
             std::string headline = !e.message.empty() ? e.message
                                  : (!e.summary.empty() ? e.summary : "(saved)");
             plmCopyText("##acth", headline);
@@ -316,37 +376,55 @@ void plmDrawOverviewPage(AppState& st) {
             plmCardEnd();
             ImGui::PopID();
         }
-    }
+    };
+    auto bodyTasks = [&]() {
+        if (ov.tasks.empty()) {
+            dimText("No open tasks.");
+        } else {
+            for (const auto& t : ov.tasks) {
+                ImGui::PushID(t.id.c_str());
+                plmCardBegin("##ovt", false, 8.0f, 6.0f, plmTintPriority(t.priority), 0.20f);
+                plmCopyText("##ovtt", t.title);
+                priorityDot(t.priority);
+                plmCardEnd();
+                ImGui::PopID();
+            }
+        }
+        if (ov.dirtyCount > 0) {
+            ImGui::Dummy(ImVec2(0, 6 * S));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+            ImGui::TextUnformatted("Unsaved files");
+            ImGui::PopStyleColor();
+            for (const auto& it : ov.dirtyItems) {
+                plmDocTypeTag(it.docType, it.kind);
+                ImGui::SameLine();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextWrapped("%s", it.path.c_str());
+            }
+        }
+    };
+
+    const float halfW = (ImGui::GetContentRegionAvail().x - 12 * S) * 0.5f;
+
+    // Row 1 — Save a checkpoint (left) · Overview (right)
+    plmPanelBegin("##ov_ckpt", "Save a checkpoint", "save", halfW);
+    bodyCheckpoint();
+    plmPanelEnd();
+    ImGui::SameLine(0, 12 * S);
+    plmPanelBegin("##ov_stats", "Overview", "app", halfW);
+    bodyStats();
     plmPanelEnd();
 
-    ImGui::SameLine(0, 12 * S);
+    ImGui::Dummy(ImVec2(0, 10 * S));
 
+    // Row 2 — Recent activity (left) · Open tasks (right)
+    plmPanelBegin("##ov_recent", "Recent activity", "history", halfW);
+    bodyRecent();
+    plmPanelEnd();
+    ImGui::SameLine(0, 12 * S);
     plmPanelBegin("##ov_tasks", "Open tasks", "prompt_edit", halfW);
-    if (ov.tasks.empty()) {
-        dimText("No open tasks.");
-    } else {
-        for (const auto& t : ov.tasks) {
-            ImGui::PushID(t.id.c_str());
-            plmCardBegin("##ovt", false);
-            plmCopyText("##ovtt", t.title);
-            priorityDot(t.priority);  // bottom-right corner, same as the board
-            plmCardEnd();
-            ImGui::PopID();
-        }
-    }
-    if (ov.dirtyCount > 0) {
-        ImGui::Dummy(ImVec2(0, 6 * S));
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::TextUnformatted("Unsaved files");
-        ImGui::PopStyleColor();
-        for (const auto& it : ov.dirtyItems) {
-            plmDocTypeTag(it.docType, it.kind);
-            ImGui::SameLine();
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextWrapped("%s", it.path.c_str());
-        }
-    }
+    bodyTasks();
     plmPanelEnd();
 }
 
@@ -556,7 +634,9 @@ void drawFilesTab(AppState& st) {
         ++shown;
         ImGui::PushID(it.itemId.c_str());
         bool sel = (H.selectedItem == it.itemId);
-        plmCardBegin("##fitem", sel);
+        const float* ftint = it.dirty ? palette.statusWarn
+                           : (it.lifecycle == "Released" ? palette.statusOk : palette.accent);
+        plmCardBegin("##fitem", sel, 8.0f, 6.0f, ftint, 0.13f);
 
         // one padded row: [TAG] path .......... rev · lifecycle  ●
         plmDocTypeTag(it.docType, it.kind);
@@ -644,7 +724,7 @@ void plmDrawFilesPage(AppState& st) {
     const float leftW = ImGui::GetContentRegionAvail().x * 0.50f;
 
     panelBegin("##files_left", ImVec2(leftW, 0));
-    plmSectionHeader("Files");
+    plmSectionHeader("Files", "body_folder");
     ImGui::Spacing();
     drawFilesTab(st);
     panelEnd();
@@ -674,7 +754,7 @@ void plmDrawHistoryPage(AppState& st) {
     const float S = ui::uiScale;
     plmEnsureHistory(st);
 
-    plmSectionHeader("History");
+    plmSectionHeader("History", "history");
 
     // scope toggle
     static const char* kScope[] = {"Design", "Planning", "All"};
@@ -717,7 +797,9 @@ void plmDrawHistoryPage(AppState& st) {
 
         ImGui::Indent(26 * S);
         float cardTop = ImGui::GetCursorScreenPos().y;
-        plmCardBegin("##hrow", sel);
+        const float* htint = rel ? palette.statusOk
+                           : (e.scope == "planning" ? palette.statusWarn : palette.accent);
+        plmCardBegin("##hrow", sel, 8.0f, 6.0f, htint, 0.13f);
         if (rel) {
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f));
@@ -797,7 +879,7 @@ void plmDrawReleasesPage(AppState& st) {
     const float S = ui::uiScale;
     plmEnsureItems(st);
 
-    plmSectionHeader("Releases");
+    plmSectionHeader("Releases", "ok_badge");
     dimText("Stamp the next revision and freeze the design.");
     ImGui::Spacing();
 
@@ -816,7 +898,8 @@ void plmDrawReleasesPage(AppState& st) {
     for (const auto& it : H.items) {
         ImGui::PushID(it.itemId.c_str());
         bool open = (s_releaseItem == it.itemId);
-        plmCardBegin("##rel", open);
+        plmCardBegin("##rel", open, 8.0f, 6.0f,
+                     it.lifecycle == "Released" ? palette.statusOk : palette.accent, 0.13f);
         plmDocTypeTag(it.docType, it.kind);
         ImGui::SameLine();
         ImGui::AlignTextToFramePadding();
@@ -870,13 +953,13 @@ void plmDrawReleasesPage(AppState& st) {
 
 void plmDrawTeamPage(AppState& st) {
     (void)st;
-    plmSectionHeader("Team & Sync");
+    plmSectionHeader("Team & Sync", "team");
     dimText("Share a project through a shared folder or your own server. Everyone "
             "keeps working; Sync brings changes together without ever merging or "
             "losing work — if two people change the same design, both versions are "
             "kept.");
     ImGui::Spacing();
-    plmSectionHeader("Shared locations");
+    plmSectionHeader("Shared locations", "vendor_globe");
     dimText("No shared location connected yet.");
     ImGui::Spacing();
     ImGui::BeginDisabled(true);
@@ -896,7 +979,7 @@ void plmDrawSettingsPage(AppState& st) {
     const float S = ui::uiScale;
     plmEnsureSettings(st);
 
-    plmSectionHeader("Settings");
+    plmSectionHeader("Settings", "settings");
     if (!H.setErr.empty()) { plmError(H.setErr); return; }
 
     // part-number scheme
@@ -1199,7 +1282,8 @@ static void drawMilestoneRow(AppState& st, const PlmMilestoneRow& m) {
     bool done = (m.status == "done");
     bool editing = (H.msEditId == m.id);
     ImGui::PushID(m.id.c_str());
-    plmCardBegin("##ms", editing);
+    plmCardBegin("##ms", editing, 8.0f, 4.0f,
+                 done ? palette.statusOk : palette.accent, 0.15f);
     if (editing) {
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5 * S, 3 * S));
         ImGui::SetNextItemWidth(-1);
@@ -1225,9 +1309,12 @@ static void drawMilestoneRow(AppState& st, const PlmMilestoneRow& m) {
         ImGui::TextUnformatted(done ? "Done" : "Open");
         ImGui::PopStyleColor();
         ImGui::SameLine();
-        plmCopyText("##mst", m.title);
-        if (!m.due.empty()) dimText("due %s", m.due.c_str());
-        // action row
+        // Title wraps so a long name grows the card instead of clipping.
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(m.title.c_str());
+        ImGui::PopTextWrapPos();
+        // action row (due date rides inline on the right so the row stays compact)
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 3 * S));
         if (ImGui::SmallButton("Edit")) {
@@ -1243,6 +1330,21 @@ static void drawMilestoneRow(AppState& st, const PlmMilestoneRow& m) {
             ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 0.5f));
         if (ImGui::SmallButton("Del")) planCall(st, "delete", "milestone", nullptr, m.id);
         ImGui::PopStyleColor();
+        if (!m.due.empty()) {
+            char due[48]; std::snprintf(due, sizeof(due), "due %s", m.due.c_str());
+            float dw = ImGui::CalcTextSize(due).x;
+            float rx = ImGui::GetContentRegionMax().x - dw;
+            if (rx > ImGui::GetCursorPosX()) {
+                ImGui::SameLine(rx);
+                ImGui::AlignTextToFramePadding();
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(
+                    palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+                ImGui::TextUnformatted(due);
+                ImGui::PopStyleColor();
+            } else {
+                dimText("due %s", m.due.c_str());  // narrow card: wrap to next line
+            }
+        }
         ImGui::PopStyleVar(2);
     }
     plmCardEnd();
@@ -1256,7 +1358,7 @@ static void drawIssueRow(AppState& st, const PlmIssueRow& is) {
     const float S = ui::uiScale;
     bool closed = (is.state == "closed");
     ImGui::PushID(is.id.c_str());
-    plmCardBegin("##is", false);
+    plmCardBegin("##is", false, 8.0f, 4.0f, plmTintSeverity(is.severity), 0.16f);
     const float* sc = palette.textDim;
     if (is.severity == "critical" || is.severity == "high") sc = palette.statusErr;
     else if (is.severity == "med") sc = palette.statusWarn;
@@ -1270,7 +1372,6 @@ static void drawIssueRow(AppState& st, const PlmIssueRow& is) {
     } else {
         plmCopyText("##ist", is.title);
     }
-    ImGui::Spacing();
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 3 * S));
     accentButtonColors();
@@ -1308,7 +1409,6 @@ void plmDrawPlanningPage(AppState& st) {
     const float S = ui::uiScale;
     plmEnsurePlanning(st);
 
-    plmSectionHeader("Planning");
     if (!H.planErr.empty()) plmError(H.planErr);
 
     static const char* kSev[] = {"low", "med", "high", "critical"};
@@ -1333,8 +1433,23 @@ void plmDrawPlanningPage(AppState& st) {
                  {{"title", H.newIssueTitle}, {"severity", kSev[H.newIssueSev]}});
         H.newIssueTitle[0] = '\0';
     }
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    // Only the item list scrolls — the header + add-row above stay pinned.
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+    ImGui::BeginChild("##isslist", ImVec2(0, 168 * S), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NavFlattened);
     if (H.issues.empty()) dimText("No issues logged.");
-    for (const auto& is : H.issues) drawIssueRow(st, is);
+    // Sort by severity (critical first) without disturbing the shared cache.
+    std::vector<const PlmIssueRow*> issueView;
+    issueView.reserve(H.issues.size());
+    for (const auto& is : H.issues) issueView.push_back(&is);
+    std::stable_sort(issueView.begin(), issueView.end(),
+        [](const PlmIssueRow* a, const PlmIssueRow* b) {
+            return plmSeverityRank(a->severity) < plmSeverityRank(b->severity);
+        });
+    for (const auto* is : issueView) drawIssueRow(st, *is);
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
     plmPanelEnd();
 
     ImGui::SameLine(0, 12 * S);
@@ -1354,28 +1469,22 @@ void plmDrawPlanningPage(AppState& st) {
         planCall(st, "create", "milestone", d);
         s_msTitle[0] = '\0'; s_msDue[0] = '\0';
     }
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    // Only the item list scrolls — the header + add-row above stay pinned.
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+    ImGui::BeginChild("##mslist", ImVec2(0, 168 * S), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NavFlattened);
     if (H.milestones.empty()) dimText("No milestones yet.");
     for (const auto& m : H.milestones) drawMilestoneRow(st, m);
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
     plmPanelEnd();
 
-    ImGui::Dummy(ImVec2(0, 10 * S));
+    // (Team & Sync moved to Settings → gives the boards below more vertical room.)
+    ImGui::Dummy(ImVec2(0, 8 * S));
 
-    // ---- Team & Sync (placeholder until remotes/locks land) — its own panel,
-    //      between the Issues/Milestones band and the board. --------------------
-    plmPanelBegin("##pl_team", "Team & Sync", "team");
-    ImGui::BeginDisabled(true);
-    ImGui::Button("Connect a shared folder\xe2\x80\xa6");
-    ImGui::SameLine();
-    ImGui::Button("Sync now");
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    dimText("Share & sync without merging — coming soon.");
-    plmPanelEnd();
-
-    ImGui::Dummy(ImVec2(0, 10 * S));
-
-    // ---- Task board (own header + full-width glass columns) --------------------
-    plmSectionHeader("Board");
+    // ---- Task board (full-width glass columns; no header — the columns label
+    //      themselves, and dropping it frees vertical room for the boards) -------
     // add a task: priority picker, then a compact left-aligned title box that
     // matches the Add-task button height (no custom frame padding on either).
     // Task priority uses the SAME words as issue severity (low/med/high/critical)
@@ -1433,23 +1542,39 @@ void plmDrawPlanningPage(AppState& st) {
         ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
         ImGui::BeginChild("##col", ImVec2(colW, colH), ImGuiChildFlags_Borders);
 
-        int shown = 0;
-        for (const auto& t : H.allTasks) {
-            if (t.status != col.id) continue;
-            ++shown;
+        // Tasks in this column, highest priority first. Sort a local pointer view —
+        // never reorder H.allTasks (a shared cache other pages read).
+        std::vector<const PlmTaskRow*> colTasks;
+        for (const auto& t : H.allTasks)
+            if (t.status == col.id) colTasks.push_back(&t);
+        std::stable_sort(colTasks.begin(), colTasks.end(),
+            [](const PlmTaskRow* a, const PlmTaskRow* b) {
+                return plmPriorityRank(a->priority) < plmPriorityRank(b->priority);
+            });
+
+        for (const auto* tp : colTasks) {
+            const auto& t = *tp;
             ImGui::PushID(t.id.c_str());
             bool sel = (s_selTask == t.id);
-            plmCardBegin("##task", sel, 8.0f, 5.0f);
-            plmCopyText("##tt", t.title);
+            plmCardBegin("##task", sel, 8.0f, 4.0f, plmTintPriority(t.priority), 0.22f);
+
+            // Title wraps to the card width so the card auto-grows (AutoResizeY) to
+            // fit a long title instead of clipping it to one line.
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.text[0], palette.text[1], palette.text[2], 1.0f));
+            ImGui::TextUnformatted(t.title.c_str());
+            ImGui::PopStyleColor();
+            ImGui::PopTextWrapPos();
             if (!t.assignee.empty()) dimText("@%s", t.assignee.c_str());
 
             // Movement controls — always visible, one click, no select-first step.
-            // ‹ › walk the todo→doing→done lane; Block parks the task. A tight
-            // frame padding keeps them small so the card stays compact.
+            // ‹ › walk the todo→doing→done lane; Block parks the task. The row is
+            // dropped down a touch and shares a baseline with the priority dot.
             int idx = -1;
             for (int k = 0; k < 3; ++k) if (t.status == kPipe[k]) idx = k;
             bool blocked = (idx < 0);
-            ImGui::Spacing();
+            ImGui::Dummy(ImVec2(0, 2 * S));   // nudge the control row + dot down
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(3 * S, 3 * S));
             // ArrowButton draws a real triangle (font-independent — the ‹ › glyphs
@@ -1481,12 +1606,15 @@ void plmDrawPlanningPage(AppState& st) {
                     planCall(st, "delete", "task", nullptr, t.id);
                 ImGui::PopStyleColor();
             }
+            // Priority dot on the SAME line as the controls — drawn while the compact
+            // FramePadding is still pushed so its height matches the buttons and they
+            // share a vertical centre. Right-pinned inside the card.
+            priorityDot(t.priority);
             ImGui::PopStyleVar(2);
-            priorityDot(t.priority);  // bottom-right corner of the card
             if (plmCardEnd()) s_selTask = sel ? "" : t.id;
             ImGui::PopID();
         }
-        if (!shown) dimText("Nothing here yet.");
+        if (colTasks.empty()) dimText("Nothing here yet.");
 
         ImGui::EndChild();
         ImGui::PopStyleColor(2);
@@ -1516,7 +1644,7 @@ void plmDrawIssuesPage(AppState& st) {
     const float S = ui::uiScale;
     plmEnsurePlanning(st);
 
-    plmSectionHeader("Issues");
+    plmSectionHeader("Issues", "issue_bug");
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
     ImGui::SetNextItemWidth(-120 * S);
     bool enter = ImGui::InputTextWithHint("##newissue", "describe an issue\xe2\x80\xa6",

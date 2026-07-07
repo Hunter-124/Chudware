@@ -128,6 +128,172 @@ static void applyThemeNow(AppState& st, bool light) {
             ui::palette.viewportBottom[0], ui::palette.viewportBottom[1],
             ui::palette.viewportBottom[2]);
 }
+
+// ---- Connected Accounts: subscription-auth logins (Codex / Claude / Cursor, §4.4) ----
+// Sign in with the user's own AI subscription so the agent runs on their plan instead of a
+// metered API key. The Python worker seam (subscription_status/login/logout) starts the browser
+// OAuth flow on a BACKGROUND thread — subscription_login returns immediately with in_progress:true.
+// We therefore never block the GL thread: fire the fast RPC, then poll subscription_status on a
+// ~2s frame-time backoff (same non-blocking cadence the Parts vendor panel uses) until the state
+// flips to connected.
+struct SubProvider {
+    std::string key;       // "codex" / "claude" / "cursor"
+    std::string label;     // e.g. "OpenAI Codex (ChatGPT Plus/Pro)"
+    bool        connected = false;
+    std::string email;
+    bool        loginInProgress = false;
+    std::string lastError;
+};
+static std::vector<SubProvider> s_subProviders;
+static bool   s_subLoaded   = false;
+static double s_subLastPoll = 0.0;
+static bool   s_subCodexDevice = false;  // Codex-only headless device-code flow
+static std::string s_subError;           // top-level fetch/RPC error
+
+static void loadSubscriptionStatus(AppState& st) {
+    nlohmann::json result;
+    std::string err;
+    if (!st.worker.call("subscription_status", nlohmann::json::object(), result, err, 8000)) {
+        s_subError = err;
+        return;
+    }
+    s_subError.clear();
+    s_subLastPoll = ImGui::GetTime();
+    s_subLoaded   = true;
+    auto str = [](const nlohmann::json& j, const char* k) -> std::string {
+        auto it = j.find(k);
+        return (it != j.end() && it->is_string()) ? it->get<std::string>() : std::string();
+    };
+    if (!result.is_object() || !result.value("ok", false)) return;
+    auto pit = result.find("providers");
+    if (pit == result.end() || !pit->is_object()) return;
+    // Fixed display order; skip any provider the backend doesn't report.
+    static const char* kOrder[] = {"codex", "claude", "cursor"};
+    s_subProviders.clear();
+    for (const char* key : kOrder) {
+        auto vit = pit->find(key);
+        if (vit == pit->end() || !vit->is_object()) continue;
+        const nlohmann::json& p = *vit;
+        SubProvider sp;
+        sp.key             = key;
+        sp.label           = str(p, "label");
+        if (sp.label.empty()) sp.label = key;
+        sp.connected       = p.value("connected", false);
+        sp.email           = str(p, "email");
+        sp.loginInProgress = p.value("login_in_progress", false);
+        sp.lastError       = str(p, "last_error");
+        s_subProviders.push_back(std::move(sp));
+    }
+}
+
+static void subscriptionLogin(AppState& st, const std::string& key, bool device) {
+    nlohmann::json params;
+    params["provider"] = key;
+    params["device"]   = device;
+    nlohmann::json result;
+    std::string err;
+    // Fire-and-forget: returns immediately (in_progress:true); a short timeout never blocks.
+    if (!st.worker.call("subscription_login", params, result, err, 8000)) {
+        s_subError = "login: " + err;
+        return;
+    }
+    loadSubscriptionStatus(st);  // refresh so the spinner shows on the next frame
+}
+
+static void subscriptionLogout(AppState& st, const std::string& key) {
+    nlohmann::json params;
+    params["provider"] = key;
+    nlohmann::json result;
+    std::string err;
+    if (!st.worker.call("subscription_logout", params, result, err, 8000)) {
+        s_subError = "logout: " + err;
+        return;
+    }
+    loadSubscriptionStatus(st);
+}
+
+// One row per provider: label + status, a Connect/Disconnect button, an optional Codex device-code
+// checkbox, and any last_error in red. Drawn inside the AI tab (see below).
+static void drawConnectedAccounts(AppState& st, bool busy) {
+    const float sc = st.scale;
+    ImGui::Dummy(ImVec2(0, 8 * sc));
+    ImGui::SeparatorText("Connected Accounts");
+    dimText("Sign in with your own AI subscription so the agent runs on your plan instead of a "
+            "metered API key. Opens a browser to complete sign-in \xe2\x80\x94 nothing is blocked "
+            "while you authorize.");
+    ImGui::Dummy(ImVec2(0, 4 * sc));
+
+    const bool canFetch = st.workerStarted && !busy;
+    if (!s_subLoaded && canFetch) loadSubscriptionStatus(st);
+
+    // Non-blocking poll: while any login is mid-flight, re-fetch status every ~2s so the
+    // "Waiting for browser…" state flips to Connected on its own.
+    bool anyBusy = false;
+    for (auto& p : s_subProviders) if (p.loginInProgress) anyBusy = true;
+    if (anyBusy && canFetch && ImGui::GetTime() - s_subLastPoll > 2.0)
+        loadSubscriptionStatus(st);
+
+    if (!s_subLoaded) {
+        dimText("Worker not ready \xe2\x80\x94 connected accounts appear once the runtime starts.");
+        return;
+    }
+    if (!s_subError.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.35f, 0.35f, 1));
+        ImGui::TextWrapped("Status error: %s", s_subError.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (s_subProviders.empty()) {
+        dimText("No subscription providers available.");
+        return;
+    }
+
+    for (auto& p : s_subProviders) {
+        ImGui::PushID(p.key.c_str());
+        ImGui::TextUnformatted(p.label.c_str());
+        ImGui::SameLine();
+        if (p.loginInProgress) {
+            ImGui::TextColored(ImVec4(0.45f, 0.75f, 0.95f, 1), "  Waiting for browser\xe2\x80\xa6");
+        } else if (p.connected) {
+            ImGui::TextColored(ImVec4(0.40f, 0.80f, 0.45f, 1), "  \xe2\x97\x8f Connected");
+            if (!p.email.empty()) {
+                ImGui::SameLine();
+                ImVec4 c = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+                c.w *= 0.62f;
+                ImGui::PushStyleColor(ImGuiCol_Text, c);
+                ImGui::Text("(%s)", p.email.c_str());
+                ImGui::PopStyleColor();
+            }
+        } else {
+            ImVec4 c = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+            c.w *= 0.62f;
+            ImGui::PushStyleColor(ImGuiCol_Text, c);
+            ImGui::TextUnformatted("  Not connected");
+            ImGui::PopStyleColor();
+        }
+        // Action button
+        if (p.connected) {
+            if (ImGui::SmallButton("Disconnect")) subscriptionLogout(st, p.key);
+        } else if (!p.loginInProgress) {
+            const bool device = (p.key == "codex") ? s_subCodexDevice : false;
+            if (ImGui::SmallButton("Connect")) subscriptionLogin(st, p.key, device);
+            // Codex-only headless flow for when the OAuth loopback port is busy.
+            if (p.key == "codex") {
+                ImGui::SameLine();
+                ImGui::Checkbox("use device code", &s_subCodexDevice);
+                helpMarker("Headless code-based sign-in for when the local OAuth port (1455) is "
+                           "busy. Codex only.");
+            }
+        }
+        // Per-provider error, in red.
+        if (!p.lastError.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.35f, 0.35f, 1));
+            ImGui::TextWrapped("  %s", p.lastError.c_str());
+            ImGui::PopStyleColor();
+        }
+        ImGui::Dummy(ImVec2(0, 4 * sc));
+        ImGui::PopID();
+    }
+}
 }  // anonymous namespace
 
 // ---- kSettingsEntries: unified command search table (command_search.cpp) ----
@@ -190,6 +356,12 @@ const SettingsEntry kSettingsEntries[] = {
     { "Parametric sequence mode", "Experimental", 5 },
     { "CAD sequence mode",        "Experimental", 5 },
     { "Feature sequence",         "Experimental", 5 },
+    // Team & Sync (tab 6) — moved out of the Planning page
+    { "Team",                     "Team & Sync",  6 },
+    { "Team & Sync",              "Team & Sync",  6 },
+    { "Sync",                     "Team & Sync",  6 },
+    { "Shared folder",            "Team & Sync",  6 },
+    { "Collaborate",              "Team & Sync",  6 },
 };
 const int kSettingsEntryCount =
     (int)(sizeof(kSettingsEntries) / sizeof(kSettingsEntries[0]));
@@ -273,19 +445,68 @@ void drawSettingsModal(AppState& st, bool busy) {
         // Tab content scrolls in its own region (a subtle glass card); Save/Cancel stay pinned
         // at the bottom.
         const float footerH = ImGui::GetFrameHeightWithSpacing() + 20.0f * sc;
+
+        // AI_CAD_SHOT=settings selects the Agent category ONE-SHOT: consuming
+        // st.wantSettings every frame would relock the other cells all session.
+        static bool s_wantSettingsTabDone = false;
+        bool wantSettingsSel = st.wantSettings && !s_wantSettingsTabDone;
+        if (wantSettingsSel) s_wantSettingsTabDone = true;
+
+        // ---- Category grid nav (replaces the old horizontal tab bar) — a tidy grid
+        //      of cells that scales to more categories for bigger teams/projects.
+        //      The grid itself never scrolls; only the content region below does.
+        //      Indices stay stable (Experimental=5) so kSettingsEntries + openSettingsTab
+        //      keep working; Team & Sync is appended as 6 and just placed before
+        //      Experimental in the visual order. ----------------------------------
+        struct SetCat { const char* label; int idx; };
+        static const SetCat kCats[] = {
+            {"Appearance", 0}, {"General", 1}, {"AI", 2}, {"Prompts", 3},
+            {"Agent", 4}, {"Team & Sync", 6}, {"Experimental", 5},
+        };
+        static int s_setCat = 0;
+        if (jumpToTab >= 0)  s_setCat = jumpToTab;
+        if (jumpToPrompts)   s_setCat = 3;
+        if (wantSettingsSel) s_setCat = 4;
+        {
+            const int   cols = 4;
+            const float gg   = 8.0f * sc;
+            const float gw   = ImGui::GetContentRegionAvail().x;
+            const float cw   = std::floor((gw - gg * (cols - 1)) / cols);
+            const float ch   = 34.0f * sc;
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gg, gg));
+            ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.5f, 0.5f));
+            for (int i = 0; i < (int)IM_ARRAYSIZE(kCats); ++i) {
+                if (i % cols) ImGui::SameLine();
+                bool selc = (s_setCat == kCats[i].idx);
+                if (selc) {
+                    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(ui::palette.accent[0],
+                        ui::palette.accent[1], ui::palette.accent[2], 0.55f));
+                    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(ui::palette.accent[0],
+                        ui::palette.accent[1], ui::palette.accent[2], 0.65f));
+                    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(ui::palette.accent[0],
+                        ui::palette.accent[1], ui::palette.accent[2], 0.75f));
+                }
+                if (ImGui::Selectable(kCats[i].label, selc, ImGuiSelectableFlags_None,
+                                      ImVec2(cw, ch)))
+                    s_setCat = kCats[i].idx;
+                if (selc) ImGui::PopStyleColor(3);
+            }
+            ImGui::PopStyleVar(2);
+        }
+        ImGui::Dummy(ImVec2(0, 8 * sc));
+
+        // Content region for the selected category — the ONLY part that scrolls.
         pushGlassChildStyle(10.0f);
         ImGui::BeginChild("##settabsarea",
                           ImVec2(0, std::max(120.0f * sc,
                                              ImGui::GetContentRegionAvail().y - footerH)));
-        if (ImGui::BeginTabBar("##settabs")) {
+        {
             // ---- Appearance tab (FIRST): theme + colored liquid glass (v2.1) ----
             // The canonical theme control lives here (moved from General; the View-menu item
             // stays a synced shortcut). The glass knobs edit Settings::glassCfg per group and
             // live-apply via ui::setGlassConfig + persist via saveSettings on every change —
             // so the persisted "appearance.glass" block is no longer a dead round-trip.
-            if (ImGui::BeginTabItem("Appearance", nullptr,
-                                    (jumpToTab == 0) ? ImGuiTabItemFlags_SetSelected
-                                                     : ImGuiTabItemFlags_None)) {
+            if (s_setCat == 0) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 ImGui::SeparatorText("Theme");
                 bool isLight = (ui::activeTheme == ui::Theme::Light);
@@ -463,13 +684,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 "Adaptive text over this group's glass");
                     ImGui::Dummy(ImVec2(pw, ph));
                 }
-                ImGui::EndTabItem();
             }
 
-            // ---- General tab: Document (units) + System (engine readout, profiler) ----
-            if (ImGui::BeginTabItem("General", nullptr,
-                                    (jumpToTab == 1) ? ImGuiTabItemFlags_SetSelected
-                                                     : ImGuiTabItemFlags_None)) {
+            // ---- General category: Document (units) + System (engine readout, profiler) ----
+            if (s_setCat == 1) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
 
                 ImGui::SeparatorText("Document");
@@ -567,11 +785,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                     st.showProfilerWindow = true;
                 ImGui::Dummy(ImVec2(0, 6 * sc));
                 dimText(("All settings here are stored in " + configPath() + ".").c_str());
-                ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("AI", nullptr,
-                                    (jumpToTab == 2) ? ImGuiTabItemFlags_SetSelected
-                                                     : ImGuiTabItemFlags_None)) {
+            if (s_setCat == 2) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 ImGui::SeparatorText("Provider & model");
                 dimText(("Used by Design, Edit, and Help. Stored in " + configPath() + ".")
@@ -580,12 +795,11 @@ void drawSettingsModal(AppState& st, bool busy) {
                 // Shared provider + availability-filtered model picker + reasoning effort +
                 // privacy/offline. The inline AI Settings tab renders the SAME widget.
                 ui::drawProviderModelPicker(st, busy);
-                ImGui::EndTabItem();
+                // Subscription-auth logins (use your own ChatGPT/Claude/Cursor plan).
+                drawConnectedAccounts(st, busy);
             }
-            // --- C22b: Prompts tab (role prompt editor + system-prompt override) ---
-            if (ImGui::BeginTabItem("Prompts", nullptr,
-                                    (jumpToPrompts || jumpToTab == 3) ? ImGuiTabItemFlags_SetSelected
-                                                                      : ImGuiTabItemFlags_None)) {
+            // --- C22b: Prompts category (role prompt editor + system-prompt override) ---
+            if (s_setCat == 3) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 bool canFetch = st.workerStarted && !busy;
                 if (!s_promptsLoaded && canFetch) loadPrompts(st);
@@ -712,20 +926,12 @@ void drawSettingsModal(AppState& st, bool busy) {
                         ImGui::SetTooltip("Delete the override and restore the shipped prompt");
                 }
                 ImGui::EndChild();
-                ImGui::EndTabItem();
             }
             // --- end C22b marked block ---
 
-            // ---- Agent tab: run behavior + iteration budget (the old Advanced tab minus the
-            // system-prompt editor, which moved to Prompts where it belongs — audit P1) ----
-            // AI_CAD_SHOT=settings selects this tab ONE-SHOT: consuming st.wantSettings directly
-            // every frame kept the other tabs unclickable for the whole session (audit P2).
-            static bool s_wantSettingsTabDone = false;
-            bool wantSettingsSel = st.wantSettings && !s_wantSettingsTabDone;
-            if (wantSettingsSel) s_wantSettingsTabDone = true;
-            if (ImGui::BeginTabItem("Agent", nullptr,
-                                    (wantSettingsSel || jumpToTab == 4) ? ImGuiTabItemFlags_SetSelected
-                                                                        : ImGuiTabItemFlags_None)) {
+            // ---- Agent category: run behavior + iteration budget (the old Advanced tab minus
+            // the system-prompt editor, which moved to Prompts where it belongs — audit P1) ----
+            if (s_setCat == 4) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 ImGui::SeparatorText("Run behavior");
                 ImGui::Checkbox("Plan before building (recommended)", &settings.planMode);
@@ -740,13 +946,26 @@ void drawSettingsModal(AppState& st, bool busy) {
                                  settings.maxIters == 0 ? "automatic" : "%d passes");
                 ImGui::SameLine();
                 dimText("0 = automatic (stops once the render matches)");
-                ImGui::EndTabItem();
             }
 
-            // ---- Experimental tab: research-backed opt-in AI features ----
-            if (ImGui::BeginTabItem("Experimental", nullptr,
-                                    (jumpToTab == 5) ? ImGuiTabItemFlags_SetSelected
-                                                     : ImGuiTabItemFlags_None)) {
+            // ---- Team & Sync category (moved out of the Planning page; placeholder until
+            //      shared remotes / locks land) ----------------------------------------
+            if (s_setCat == 6) {
+                ImGui::Dummy(ImVec2(0, 2 * sc));
+                ImGui::SeparatorText("Team & Sync");
+                dimText("Share a project and sync changes across a team without manual "
+                        "merging. Coming soon.");
+                ImGui::Dummy(ImVec2(0, 6 * sc));
+                ImGui::BeginDisabled(true);
+                ImGui::Button("Connect a shared folder\xe2\x80\xa6",
+                              ImVec2(200.0f * sc, 30.0f * sc));
+                ImGui::SameLine();
+                ImGui::Button("Sync now", ImVec2(120.0f * sc, 30.0f * sc));
+                ImGui::EndDisabled();
+            }
+
+            // ---- Experimental category: research-backed opt-in AI features ----
+            if (s_setCat == 5) {
                 ImGui::Dummy(ImVec2(0, 2 * sc));
                 dimText("Opt-in, default-off features from the model/provider research. All run "
                         "fully local (ITAR-safe) and are additive — off = the standard copilot.");
@@ -840,9 +1059,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 dimText(("Saved to " + configPath() + " under \"experimental\". Open-weight "
                          "model presets for your main provider live under AI → Local.")
                             .c_str());
-                ImGui::EndTabItem();
             }
-            ImGui::EndTabBar();
         }
         ImGui::EndChild();
         popGlassChildStyle();

@@ -26,6 +26,9 @@ std::string saveFileDialog(const char* filter, const char* defExt, const char* s
 // "Open" dialog. The chosen file must exist.
 std::string openFileDialog(const char* filter);
 
+// "Choose folder" dialog. Returns the chosen directory as UTF-8, or "" on cancel/error.
+std::string openFolderDialog();
+
 // Modal Yes/No/Cancel prompt asking whether to import a mesh file as a solid body (vs. keep it as a
 // graphics mesh). Only meaningful for mesh formats. Returns 1 (yes/solid), 0 (no/mesh), -1 (cancel).
 int promptImportMeshAsSolid();

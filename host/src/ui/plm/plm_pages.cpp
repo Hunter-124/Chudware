@@ -178,14 +178,12 @@ void plmDrawOverviewPage(AppState& st) {
     } else {
         for (const auto& e : ov.recent) {
             ImGui::PushID(e.commit.c_str());
-            plmRowPill(false, 2.0f);
-            ImGui::BeginGroup();
+            plmCardBegin("##act", false);
             std::string headline = !e.message.empty() ? e.message
                                  : (!e.summary.empty() ? e.summary : "(saved)");
             ImGui::TextWrapped("%s", headline.c_str());
-            dimText("  %s  %s", e.author.c_str(), e.authoredAt.c_str());
-            ImGui::EndGroup();
-            ImGui::Spacing();
+            dimText("%s  \xc2\xb7  %s", e.author.c_str(), e.authoredAt.c_str());
+            plmCardEnd();
             ImGui::PopID();
         }
     }
@@ -198,14 +196,16 @@ void plmDrawOverviewPage(AppState& st) {
     } else {
         for (const auto& t : ov.tasks) {
             ImGui::PushID(t.id.c_str());
-            plmRowPill(false, 1.3f);
+            plmCardBegin("##ovt", false);
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+            ImGui::AlignTextToFramePadding();
             ImGui::Text("[%s]", t.priority.empty() ? "p2" : t.priority.c_str());
             ImGui::PopStyleColor();
             ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
             ImGui::TextWrapped("%s", t.title.c_str());
-            ImGui::Spacing();
+            plmCardEnd();
             ImGui::PopID();
         }
     }
@@ -215,6 +215,7 @@ void plmDrawOverviewPage(AppState& st) {
         for (const auto& it : ov.dirtyItems) {
             plmDocTypeTag(it.docType, it.kind);
             ImGui::SameLine();
+            ImGui::AlignTextToFramePadding();
             ImGui::TextWrapped("%s", it.path.c_str());
         }
     }
@@ -275,12 +276,10 @@ void doLink(AppState& st) {
     });
 }
 
-// Open the native file picker and store the choice, made relative to the project
-// folder (plm_item_add expects a project-relative path). A pick outside the
-// project is rejected with a toast.
-void browseTrackFile(AppState& st) {
-    std::string abs = ui::openFileDialog(
-        "All files (*.*)\0*.*\0Documents (*.pdf *.docx *.xlsx)\0*.pdf;*.docx;*.xlsx\0");
+// Take an absolute path and store it in `dst`, made relative to the project folder
+// (plm_item_add expects a project-relative path). A pick outside the project is
+// rejected with a toast. Empty `abs` (dialog cancelled) is a silent no-op.
+void storeProjectRelative(AppState& st, std::string abs, char* dst, size_t dstSz) {
     if (abs.empty()) return;
     std::string root = st.plmProjectPath();
     for (char& c : abs)  if (c == '\\') c = '/';
@@ -288,11 +287,29 @@ void browseTrackFile(AppState& st) {
     if (!root.empty() && root.back() == '/') root.pop_back();
     if (abs.size() > root.size() + 1 &&
         abs.compare(0, root.size(), root) == 0 && abs[root.size()] == '/') {
-        std::snprintf(g_plmHub.trackPath, sizeof(g_plmHub.trackPath), "%s",
-                      abs.c_str() + root.size() + 1);
+        std::snprintf(dst, dstSz, "%s", abs.c_str() + root.size() + 1);
     } else {
-        st.toast(ui::ToastLevel::Error, "Pick a file inside the project folder");
+        st.toast(ui::ToastLevel::Error, "Pick a file or folder inside the project");
     }
+}
+
+void browseTrackFile(AppState& st) {
+    storeProjectRelative(st, ui::openFileDialog(
+        "All files (*.*)\0*.*\0Documents (*.pdf *.docx *.xlsx)\0*.pdf;*.docx;*.xlsx\0"),
+        g_plmHub.trackPath, sizeof(g_plmHub.trackPath));
+}
+
+void browseTrackFolder(AppState& st) {
+    storeProjectRelative(st, ui::openFolderDialog(),
+                         g_plmHub.trackPath, sizeof(g_plmHub.trackPath));
+}
+
+// The linked-repo checkout is an arbitrary local folder (not project-relative) —
+// store it verbatim.
+void browseCheckoutFolder(AppState&) {
+    std::string abs = ui::openFolderDialog();
+    if (!abs.empty())
+        std::snprintf(g_plmHub.linkCheckout, sizeof(g_plmHub.linkCheckout), "%s", abs.c_str());
 }
 
 void doUntrack(AppState& st, const std::string& itemId) {
@@ -317,42 +334,46 @@ void drawFilesTab(AppState& st) {
     const float S = ui::uiScale;
     plmEnsureItems(st);
 
-    // track-a-file row: type a relative path or Browse… to the native picker
-    dimText("Track a document or folder in this project.");
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
-    ImGui::SetNextItemWidth(240 * S);
-    ImGui::InputTextWithHint("##track", "file or folder (relative to project)",
-                             H.trackPath, sizeof(H.trackPath));
-    ImGui::PopStyleVar();
+    // track-a-file row: pick a file/folder via the native picker (no typing).
+    dimText("Add a document or folder from this project to track its history.");
+    ImGui::Spacing();
+    if (ImGui::Button("Browse file\xe2\x80\xa6")) browseTrackFile(st);
     ImGui::SameLine();
-    if (ImGui::Button("Browse\xe2\x80\xa6")) browseTrackFile(st);
-    ImGui::SameLine();
-    accentButtonColors();
-    if (ImGui::Button("Track", ImVec2(70 * S, 0))) doTrack(st);
-    ImGui::PopStyleColor(2);
+    if (ImGui::Button("Browse folder\xe2\x80\xa6")) browseTrackFolder(st);
+    if (H.trackPath[0]) {
+        ImGui::SameLine();
+        accentButtonColors();
+        if (ImGui::Button("Track", ImVec2(70 * S, 0))) doTrack(st);
+        ImGui::PopStyleColor(2);
+        ImGui::SameLine();
+        if (ImGui::Button("Clear")) H.trackPath[0] = '\0';
+        dimText("Selected: %s", H.trackPath);
+    }
 
     // link a GitHub / Git repo (kept under version control externally; its issues
     // are tracked here in the project). Optional local checkout enables pinning.
-    ImGui::Dummy(ImVec2(0, 2 * S));
+    ImGui::Dummy(ImVec2(0, 6 * S));
     dimText("Link a GitHub / Git repo (version-controlled outside AI-CAD).");
+    ImGui::Spacing();
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
-    ImGui::SetNextItemWidth(230 * S);
+    ImGui::SetNextItemWidth(-1);
     ImGui::InputTextWithHint("##linkurl", "https://github.com/owner/repo",
                              H.linkUrl, sizeof(H.linkUrl));
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(110 * S);
-    ImGui::InputTextWithHint("##linkname", "name", H.linkName, sizeof(H.linkName));
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(150 * S);
-    ImGui::InputTextWithHint("##linkco", "local checkout (optional)",
-                             H.linkCheckout, sizeof(H.linkCheckout));
+    ImGui::SetNextItemWidth(200 * S);
+    ImGui::InputTextWithHint("##linkname", "display name (optional)",
+                             H.linkName, sizeof(H.linkName));
     ImGui::PopStyleVar();
     ImGui::SameLine();
-    if (ImGui::Button("Link repo", ImVec2(90 * S, 0))) doLink(st);
+    if (ImGui::Button("Checkout folder\xe2\x80\xa6")) browseCheckoutFolder(st);
+    if (H.linkCheckout[0]) { ImGui::SameLine(); dimText("%s", H.linkCheckout); }
+    ImGui::Spacing();
+    accentButtonColors();
+    if (ImGui::Button("Link repo", ImVec2(110 * S, 0))) doLink(st);
+    ImGui::PopStyleColor(2);
     plmError(H.actionErr);
 
     // filter pills
-    ImGui::Dummy(ImVec2(0, 4 * S));
+    ImGui::Dummy(ImVec2(0, 6 * S));
     for (int i = 0; i < (int)(sizeof(kFilters) / sizeof(kFilters[0])); ++i) {
         if (i) ImGui::SameLine();
         bool sel = (H.kindFilter == i);
@@ -374,16 +395,19 @@ void drawFilesTab(AppState& st) {
         ++shown;
         ImGui::PushID(it.itemId.c_str());
         bool sel = (H.selectedItem == it.itemId);
-        plmRowPill(sel, 1.4f);
+        plmCardBegin("##fitem", sel);
+
+        // one padded row: [TAG] path .......... rev · lifecycle  ●
         plmDocTypeTag(it.docType, it.kind);
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text,
-            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::Text(" %-12.12s", it.partNumber.c_str());
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::Text("%s", it.path.c_str());
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - 140 * S);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(it.path.c_str());
+
+        // right-pinned badge, clamped so it never crosses the text on narrow cards
+        float badgeW = 130 * S + (it.dirty ? 16 * S : 0);
+        float pinX = ImGui::GetContentRegionMax().x - badgeW;
+        if (pinX > ImGui::GetCursorPosX() + 8 * S) ImGui::SameLine(pinX);
+        else ImGui::SameLine(0, 12 * S);
         plmLifecycleBadge(it.lifecycle, !it.rev.empty() ? it.rev : it.workingRev);
         if (it.dirty) {
             ImGui::SameLine();
@@ -392,12 +416,12 @@ void drawFilesTab(AppState& st) {
             ImGui::TextUnformatted("\xe2\x97\x8f");  // ● unsaved dot
             ImGui::PopStyleColor();
         }
-        if (ImGui::IsItemClicked()) H.selectedItem = sel ? "" : it.itemId;
 
         if (sel) {
-            ImGui::Indent(16 * S);
-            dimText("%s  \xc2\xb7  %s", it.kind.c_str(),
-                    it.docType.empty() ? "design document" : it.docType.c_str());
+            ImGui::Spacing();
+            dimText("%s  \xc2\xb7  %s%s", it.kind.c_str(),
+                    it.docType.empty() ? "design document" : it.docType.c_str(),
+                    it.partNumber.empty() ? "" : ("  \xc2\xb7  " + it.partNumber).c_str());
             if (ImGui::SmallButton("Where used")) {
                 nlohmann::json p = pathParam(st);
                 p["item_id"] = it.itemId;
@@ -416,9 +440,8 @@ void drawFilesTab(AppState& st) {
                 ImVec4(palette.statusErr[0], palette.statusErr[1], palette.statusErr[2], 0.55f));
             if (ImGui::SmallButton("Stop tracking")) doUntrack(st, it.itemId);
             ImGui::PopStyleColor();
-            ImGui::Unindent(16 * S);
         }
-        ImGui::Spacing();
+        if (plmCardEnd()) H.selectedItem = sel ? "" : it.itemId;
         ImGui::PopID();
     }
     if (shown == 0)
@@ -432,15 +455,32 @@ void plmDrawFilesPage(AppState& st) {
     const float S = ui::uiScale;
     const float gap = 10.0f * S;
 
+    // A bordered, padded panel so its content sits inset from the edges instead of
+    // clipping flush-left. AutoResize is off (fixed-size split panes).
+    auto panelBegin = [&](const char* id, ImVec2 sz) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+            ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.028f));
+        ImGui::PushStyleColor(ImGuiCol_Border,
+            ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.12f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f * S);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * S, 10 * S));
+        ImGui::BeginChild(id, sz, ImGuiChildFlags_Borders);
+    };
+    auto panelEnd = [&]() {
+        ImGui::EndChild();
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor(2);
+    };
+
     // Files span the full left vertical side; Releases (top) + History (bottom)
     // share the right side. No tab bar — everything visible at once.
-    const float leftW = ImGui::GetContentRegionAvail().x * 0.52f;
+    const float leftW = ImGui::GetContentRegionAvail().x * 0.50f;
 
-    ImGui::BeginChild("##files_left", ImVec2(leftW, 0), ImGuiChildFlags_None);
+    panelBegin("##files_left", ImVec2(leftW, 0));
     plmSectionHeader("Files");
     ImGui::Spacing();
     drawFilesTab(st);
-    ImGui::EndChild();
+    panelEnd();
 
     ImGui::SameLine(0.0f, gap);
 
@@ -448,15 +488,15 @@ void plmDrawFilesPage(AppState& st) {
     const float rightH = ImGui::GetContentRegionAvail().y;
     const float topH = rightH * 0.5f - gap * 0.5f;
 
-    ImGui::BeginChild("##files_releases", ImVec2(0, topH), ImGuiChildFlags_None);
+    panelBegin("##files_releases", ImVec2(0, topH));
     plmDrawReleasesPage(st);
-    ImGui::EndChild();
+    panelEnd();
 
     ImGui::Dummy(ImVec2(0, gap));
 
-    ImGui::BeginChild("##files_history", ImVec2(0, 0), ImGuiChildFlags_None);
+    panelBegin("##files_history", ImVec2(0, 0));
     plmDrawHistoryPage(st);
-    ImGui::EndChild();
+    panelEnd();
     ImGui::EndChild();
 }
 
@@ -494,29 +534,22 @@ void plmDrawHistoryPage(AppState& st) {
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    float lineX = ImGui::GetCursorScreenPos().x + 10 * S;
+    const float lineX = ImGui::GetCursorScreenPos().x + 9 * S;
     ImU32 lineCol = ImGui::ColorConvertFloat4ToU32(
         ImVec4(palette.border[0], palette.border[1], palette.border[2], palette.border[3]));
-    float prevY = ImGui::GetCursorScreenPos().y;
-    int idx = 0;
+    float prevY = -1.0f;
     for (const auto& e : H.history) {
         ImGui::PushID(e.commit.c_str());
         bool sel = (H.selectedEntry == e.commit);
         bool rel = (e.kind == "release");
-        float rowY = ImGui::GetCursorScreenPos().y;
-        float midY = rowY + ImGui::GetFrameHeight() * 0.5f;
-        if (idx > 0) dl->AddLine(ImVec2(lineX, prevY), ImVec2(lineX, midY), lineCol, 2 * S);
-        ImU32 dotCol = ImGui::ColorConvertFloat4ToU32(rel
-            ? ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f)
-            : ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
-        dl->AddCircleFilled(ImVec2(lineX, midY), 5 * S, dotCol);
 
         ImGui::Indent(26 * S);
-        plmRowPill(sel, 2.0f);
-        ImGui::BeginGroup();
+        float cardTop = ImGui::GetCursorScreenPos().y;
+        plmCardBegin("##hrow", sel);
         if (rel) {
             ImGui::PushStyleColor(ImGuiCol_Text,
                 ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f));
+            ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted("[Release]");
             ImGui::PopStyleColor();
             ImGui::SameLine();
@@ -524,10 +557,7 @@ void plmDrawHistoryPage(AppState& st) {
         std::string headline = !e.message.empty() ? e.message
                              : (!e.summary.empty() ? e.summary : "(saved)");
         ImGui::TextWrapped("%s", headline.c_str());
-        dimText("  %s  %s", e.author.c_str(), e.authoredAt.c_str());
-        ImGui::EndGroup();
-        if (ImGui::IsItemClicked()) H.selectedEntry = sel ? "" : e.commit;
-
+        dimText("%s  \xc2\xb7  %s", e.author.c_str(), e.authoredAt.c_str());
         if (sel) {
             ImGui::PushStyleColor(ImGuiCol_Button,
                 ImVec4(palette.button[0], palette.button[1], palette.button[2], 0.8f));
@@ -544,10 +574,21 @@ void plmDrawHistoryPage(AppState& st) {
             }
             ImGui::PopStyleColor();
         }
+        bool clicked = plmCardEnd();
         ImGui::Unindent(26 * S);
-        ImGui::Spacing();
+
+        // timeline node + connector, centred on the card we just drew. plmCardEnd
+        // appends a 4px gap Dummy, so the card bottom is the cursor minus that gap.
+        float cardBot = ImGui::GetCursorScreenPos().y - 4 * S;
+        float midY = (cardTop + cardBot) * 0.5f;
+        if (prevY >= 0) dl->AddLine(ImVec2(lineX, prevY), ImVec2(lineX, midY), lineCol, 2 * S);
+        ImU32 dotCol = ImGui::ColorConvertFloat4ToU32(rel
+            ? ImVec4(palette.statusOk[0], palette.statusOk[1], palette.statusOk[2], 1.0f)
+            : ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
+        dl->AddCircleFilled(ImVec2(lineX, midY), 5 * S, dotCol);
         prevY = midY;
-        ++idx;
+
+        if (clicked) H.selectedEntry = sel ? "" : e.commit;
         ImGui::PopID();
     }
 }
@@ -584,8 +625,7 @@ void plmDrawReleasesPage(AppState& st) {
     plmEnsureItems(st);
 
     plmSectionHeader("Releases");
-    dimText("Releasing stamps the next revision, freezes the design, and — for "
-            "assemblies — pins the bill of materials.");
+    dimText("Stamp the next revision and freeze the design.");
     ImGui::Spacing();
 
     if (!H.itemsErr.empty()) { plmError(H.itemsErr); return; }
@@ -603,9 +643,15 @@ void plmDrawReleasesPage(AppState& st) {
         ImGui::SameLine();
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted(it.path.c_str());
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - 210 * S);
+
+        // right cluster: [rev · lifecycle]  [Release… | released] — clamp so the
+        // controls never overrun the path text in a narrow embedded card.
+        const float ctrlW = 200 * S;
+        float pinX = ImGui::GetContentRegionMax().x - ctrlW;
+        bool tight = pinX <= ImGui::GetCursorPosX() + 8 * S;
+        if (tight) { ImGui::NewLine(); } else { ImGui::SameLine(pinX); }
         plmLifecycleBadge(it.lifecycle, !it.rev.empty() ? it.rev : it.workingRev);
-        ImGui::SameLine(ImGui::GetContentRegionMax().x - 95 * S);
+        ImGui::SameLine(0, 12 * S);
         if (it.lifecycle == "Released") {
             ImGui::AlignTextToFramePadding();
             dimText("released");

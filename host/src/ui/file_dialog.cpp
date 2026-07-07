@@ -126,6 +126,21 @@ std::string openFileDialog(const char* filter) {
     return narrow(buf);
 }
 
+std::string openFolderDialog() {
+    BROWSEINFOW bi{};
+    bi.hwndOwner = GetActiveWindow();
+    bi.lpszTitle = L"Choose folder";
+    bi.ulFlags   = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) return {};
+    wchar_t path[MAX_PATH] = L"";
+    bool ok = SHGetPathFromIDListW(pidl, path);
+    CoTaskMemFree(pidl);
+    if (!ok) return {};
+    rememberDir(path);
+    return narrow(path);
+}
+
 int promptImportMeshAsSolid() {
     int r = MessageBoxW(
         GetActiveWindow(),
@@ -296,6 +311,23 @@ std::string openFileDialog(const char* filter) {
     }
     if (res.empty()) return {};
     rememberDir(res);
+    return res;
+}
+
+std::string openFolderDialog() {
+    std::string res;
+    if (haveCmd("kdialog")) {
+        res = runCapture("kdialog --getexistingdirectory " + shq(startDir()) + " 2>/dev/null");
+    } else if (haveCmd("zenity")) {
+        res = runCapture("zenity --file-selection --directory --filename=" +
+                         shq(startDir() + "/") + " 2>/dev/null");
+    } else {
+        return {};
+    }
+    if (res.empty()) return {};
+    // a directory path won't round-trip through rememberDir's dirname split cleanly;
+    // just remember it as-is for the next dialog.
+    s_lastDir = res;
     return res;
 }
 

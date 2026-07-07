@@ -82,6 +82,14 @@ struct QueueEntry {
     std::string status;  // "pending"|"running"|"done"|"error"
     std::string artifact_path;
     std::string error_msg;
+    // Spec/vendor metadata from the acquire() provenance envelope.
+    // Non-empty only when status=="done" and acquire returned a full envelope.
+    // Keys commonly present: title, sku, price, source_url, fetched_ts.
+    nlohmann::json spec_data;  // object or null
+    // Per-row import state (Gap b: import done queue artifacts into the active doc).
+    bool import_in_flight = false;
+    std::string import_error;
+    std::string import_doc_id;
 };
 static std::vector<QueueEntry> gQueue;
 static bool gQueueLoading = false;
@@ -295,6 +303,9 @@ void fireQueueStatus(app::AppState& s) {
             e.status        = job.value("status",         std::string("pending"));
             e.artifact_path = job.value("artifact_path",  std::string());
             e.error_msg     = job.value("error",          std::string());
+            if (job.contains("spec_data") && job["spec_data"].is_object()) {
+                e.spec_data = job["spec_data"];
+            }
             gQueue.push_back(std::move(e));
         }
     });
@@ -314,6 +325,33 @@ void fireEnqueue(app::AppState& s, const std::string& site, const std::string& q
         }
         gEnqueueError.clear();
         // Refresh the queue display.
+    });
+}
+
+// (b) Import a downloaded artifact (artifact_path from a done queue job) into a new part doc.
+// Routes through import_artifact MCP tool → _place_import_file → import_file core RPC.
+void fireImportArtifact(app::AppState& s, int jobIdx) {
+    if (jobIdx < 0 || jobIdx >= (int)gQueue.size()) return;
+    auto& job = gQueue[jobIdx];
+    if (job.artifact_path.empty()) return;
+    job.import_in_flight = true;
+    job.import_error.clear();
+    job.import_doc_id.clear();
+    const std::string path = job.artifact_path;
+    s.rpc.call("import_artifact", {{"artifact_path", path}},
+               [jobIdx](const core::RpcResult& r) {
+        if (jobIdx >= (int)gQueue.size()) return;
+        auto& j = gQueue[jobIdx];
+        j.import_in_flight = false;
+        if (!r.ok) { j.import_error = r.err; return; }
+        const auto& res = r.result;
+        if (!res.value("ok", false)) {
+            j.import_error = res.value("reason",
+                                       std::string("import failed"));
+            return;
+        }
+        j.import_doc_id = res.value("doc_id", std::string());
+        j.import_error.clear();
     });
 }
 
@@ -647,21 +685,31 @@ void drawQueueStatus(app::AppState& s) {
         return;
     }
 
-    if (ImGui::BeginTable("##queueJobs", 4,
+    // Queue job table: 5 columns — Site | Query | Status | Spec/Result | Import
+    if (ImGui::BeginTable("##queueJobs", 5,
             ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH |
-            ImGuiTableFlags_ScrollY, ImVec2(0, 120.f * S))) {
-        ImGui::TableSetupColumn("Site",    ImGuiTableColumnFlags_WidthStretch, 0.18f);
-        ImGui::TableSetupColumn("Query",   ImGuiTableColumnFlags_WidthStretch, 0.40f);
-        ImGui::TableSetupColumn("Status",  ImGuiTableColumnFlags_WidthStretch, 0.22f);
-        ImGui::TableSetupColumn("Result",  ImGuiTableColumnFlags_WidthStretch, 0.20f);
+            ImGuiTableFlags_ScrollY, ImVec2(0, 180.f * S))) {
+        ImGui::TableSetupColumn("Site",    ImGuiTableColumnFlags_WidthStretch, 0.14f);
+        ImGui::TableSetupColumn("Query",   ImGuiTableColumnFlags_WidthStretch, 0.30f);
+        ImGui::TableSetupColumn("Status",  ImGuiTableColumnFlags_WidthStretch, 0.18f);
+        ImGui::TableSetupColumn("Spec / Result", ImGuiTableColumnFlags_WidthStretch, 0.26f);
+        ImGui::TableSetupColumn("Action",  ImGuiTableColumnFlags_WidthStretch, 0.12f);
         ImGui::TableHeadersRow();
 
-        for (const auto& job : gQueue) {
+        for (int i = 0; i < (int)gQueue.size(); ++i) {
+            auto& job = gQueue[i];
+            ImGui::PushID(i);
             ImGui::TableNextRow();
+
+            // Col 0: site
             ImGui::TableSetColumnIndex(0);
             ImGui::TextUnformatted(job.site.c_str());
+
+            // Col 1: query
             ImGui::TableSetColumnIndex(1);
             ImGui::TextUnformatted(job.query.c_str());
+
+            // Col 2: status badge
             ImGui::TableSetColumnIndex(2);
             ImVec4 col = TVEC(txt2);
             if (job.status == "done")    col = ImVec4(0.3f, 0.9f, 0.3f, 1.f);
@@ -670,16 +718,98 @@ void drawQueueStatus(app::AppState& s) {
             ImGui::TextColored(col, "%s", job.status.c_str());
             if (job.status == "error" && !job.error_msg.empty() && ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", job.error_msg.c_str());
+
+            // Col 3: (d) spec-extraction results view — show vendor metadata when available.
+            // For done jobs with spec_data, display title+sku+price on one line.
+            // Hover expands to source_url + fetched_ts.
+            // For done jobs with only artifact_path, show the filename.
             ImGui::TableSetColumnIndex(3);
-            if (job.status == "done" && !job.artifact_path.empty()) {
-                // Truncate to filename for display.
-                const auto slash = job.artifact_path.rfind('/');
-                const std::string fname = (slash != std::string::npos)
-                    ? job.artifact_path.substr(slash + 1) : job.artifact_path;
-                ImGui::TextColored(TVEC(txt2), "%s", fname.c_str());
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("%s", job.artifact_path.c_str());
+            if (job.status == "done") {
+                if (!job.spec_data.is_null() && job.spec_data.is_object() &&
+                    !job.spec_data.empty()) {
+                    // Build a compact spec summary line.
+                    std::string specLine;
+                    const auto& sd = job.spec_data;
+                    // Title (may be long — truncate for table display).
+                    if (sd.contains("title") && sd["title"].is_string()) {
+                        std::string t = sd["title"].get<std::string>();
+                        if (t.size() > 28) t = t.substr(0, 25) + "…";
+                        specLine += t;
+                    }
+                    if (sd.contains("sku") && sd["sku"].is_string()) {
+                        if (!specLine.empty()) specLine += " · ";
+                        specLine += sd["sku"].get<std::string>();
+                    }
+                    if (sd.contains("price") && sd["price"].is_string()) {
+                        if (!specLine.empty()) specLine += " ";
+                        specLine += sd["price"].get<std::string>();
+                    }
+                    if (specLine.empty()) {
+                        // Fallback: show filename if no useful vendor metadata.
+                        const auto slash = job.artifact_path.rfind('/');
+                        specLine = (slash != std::string::npos)
+                            ? job.artifact_path.substr(slash + 1) : job.artifact_path;
+                    }
+                    ImGui::TextColored(TVEC(txt2), "%s", specLine.c_str());
+                    // Hover tooltip: full spec detail.
+                    if (ImGui::IsItemHovered()) {
+                        std::string tip;
+                        if (sd.contains("title") && sd["title"].is_string())
+                            tip += "Title: " + sd["title"].get<std::string>() + "\n";
+                        if (sd.contains("sku") && sd["sku"].is_string())
+                            tip += "SKU: " + sd["sku"].get<std::string>() + "\n";
+                        if (sd.contains("price") && sd["price"].is_string())
+                            tip += "Price: " + sd["price"].get<std::string>() + "\n";
+                        if (sd.contains("source_url") && sd["source_url"].is_string())
+                            tip += "URL: " + sd["source_url"].get<std::string>() + "\n";
+                        if (sd.contains("fetched_ts") && sd["fetched_ts"].is_string())
+                            tip += "Fetched: " + sd["fetched_ts"].get<std::string>() + "\n";
+                        if (!job.artifact_path.empty())
+                            tip += "File: " + job.artifact_path;
+                        if (!tip.empty()) {
+                            // Trim trailing newline.
+                            if (tip.back() == '\n') tip.pop_back();
+                            ImGui::SetTooltip("%s", tip.c_str());
+                        }
+                    }
+                } else if (!job.artifact_path.empty()) {
+                    // No spec_data — show filename only.
+                    const auto slash = job.artifact_path.rfind('/');
+                    const std::string fname = (slash != std::string::npos)
+                        ? job.artifact_path.substr(slash + 1) : job.artifact_path;
+                    ImGui::TextColored(TVEC(txt2), "%s", fname.c_str());
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", job.artifact_path.c_str());
+                }
+                // Import result feedback (shown in same cell when import was attempted).
+                if (!job.import_doc_id.empty()) {
+                    ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.3f, 1.f),
+                                       "Imported: %s", job.import_doc_id.c_str());
+                }
+                if (!job.import_error.empty()) {
+                    ImGui::TextColored(TVEC(bad), "Import failed: %s",
+                                       job.import_error.c_str());
+                }
             }
+
+            // Col 4: (b) Import button — only on done jobs with an artifact file.
+            // Triggers import_artifact RPC → import_file core RPC → new editable doc.
+            ImGui::TableSetColumnIndex(4);
+            if (job.status == "done" && !job.artifact_path.empty()) {
+                const bool canImport = !job.import_in_flight &&
+                                       job.import_doc_id.empty() &&
+                                       s.workerStarted;
+                if (!canImport) ImGui::BeginDisabled();
+                if (ImGui::SmallButton(job.import_in_flight ? "…" : "Import")) {
+                    fireImportArtifact(s, i);
+                }
+                if (!canImport) ImGui::EndDisabled();
+                if (ImGui::IsItemHovered() && !job.import_in_flight)
+                    ImGui::SetTooltip("Import this downloaded CAD file into a new editable part doc.\n"
+                                      "%s", job.artifact_path.c_str());
+            }
+
+            ImGui::PopID();
         }
         ImGui::EndTable();
     }

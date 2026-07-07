@@ -31,3 +31,23 @@ Format:
   scenarios.h by a prior agent run). Link fails with "undefined reference". Either provide a stub
   body or remove the call — the host ninja build is RED until this is fixed.
   Filed by: unify-build finisher. Owner: workspace-shell/sim-kinematics agent.
+
+## chrome-tabs agent — ribbon.cpp duplicate static variable (build blocker)
+- [ ] (chrome-tabs) `host/src/ui/widgets/ribbon.cpp` — File has `static int s_workspace = 0;`
+  declared TWICE: once at line ~71 and again at line ~333. The second declaration causes a
+  "was not declared in this scope" compile error on ribbon_tabVisible() (lines ~90–104) because
+  the function sees only one of them depending on TU linkage. Fix: remove the DUPLICATE declaration
+  at line ~333, keeping only the one at line ~71. The variable `s_workspace` is a module-level
+  int that tracks the active workspace index for tab-visibility filtering. This is NOT my file
+  (chrome-tabs owns title_bar.cpp/.h + win_chrome.cpp/.h only); the ribbon agent must apply this.
+  Build is RED until resolved.
+
+## dialogs agent (fix(dialogs)) — Command Search screenshot scenario
+- [ ] (dialogs) `host/src/ui/scenarios.cpp` — Add a `dialogs` scenario (AI_CAD_SHOT=dialogs) that:
+  1. On step 0: sets `st.showCommandSearch = true` and settles 8 frames.
+  2. On step 1: captures to `scratch/dialog_shots/search_dark.png` (use AI_CAD_REPO env like appearance scenario).
+  3. On step 2: sets `st.openSettings = true`, `st.openSettingsTab = 0`, settles 8 frames.
+  4. On step 3: captures to `scratch/dialog_shots/settings_verify.png`.
+  Also add `runDialogs(AppState&)` declaration to ScenarioRunner in scenarios.h and a dispatch call
+  in the per-frame tick alongside the other scenarios. Needed for verify: both dialogs are visually
+  inspected in both themes by the dialogs finisher agent.

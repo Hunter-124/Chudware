@@ -1480,6 +1480,57 @@ void Renderer::drawRefDatums(const Mat4& mvp) {
                 break;
             }
             case RefDatum::Kind::Point: {
+                // The synthetic WORLD ORIGIN ("point.origin", injected in app.cpp) gets the full
+                // CAD-convention treatment instead of the plain cross: color-coded axes (X=red,
+                // Y=green, Z=blue), a solid arrow on the positive direction, and a dimmer DASHED
+                // tail on the negative direction. The +X/+Y/+Z text labels are screen-space and
+                // live in viewport_panel.cpp (kOriginAxisLen there must match os/e here).
+                if (d.id == "point.origin") {
+                    const float os = e * 0.22f;   // positive axis length
+                    const float ns = os * 0.80f;  // negative tail length (shorter, subdued)
+                    const float ah = os * 0.18f;  // arrowhead back-set along -dir
+                    const float aw = os * 0.07f;  // arrowhead half-width
+                    static const Vec3 kDirs[3] = {Vec3(1, 0, 0), Vec3(0, 1, 0), Vec3(0, 0, 1)};
+                    static const float kAxCol[3][3] = {{0.90f, 0.25f, 0.25f},   // X red
+                                                       {0.25f, 0.80f, 0.30f},   // Y green
+                                                       {0.30f, 0.45f, 0.95f}};  // Z blue
+                    const Vec3 o = d.origin;
+                    for (int ai = 0; ai < 3; ++ai) {
+                        const Vec3& dir = kDirs[ai];
+                        const Vec3& u = kDirs[(ai + 1) % 3];
+                        const Vec3& v = kDirs[(ai + 2) % 3];
+                        const float r = kAxCol[ai][0], g = kAxCol[ai][1], b = kAxCol[ai][2];
+                        // Positive: solid shaft + 4-line arrowhead (same construction as the
+                        // datum-plane normal arrow above).
+                        Vec3 tip = o + dir * os;
+                        Vec3 base = tip - dir * ah;
+                        setCol(selected ? r + 0.10f : r, selected ? g + 0.10f : g,
+                               selected ? b + 0.05f : b, 1.0f);
+                        glLineWidth(selected ? 3.5f : 2.5f);
+                        float shaft[6] = {o.x, o.y, o.z, tip.x, tip.y, tip.z};
+                        upload(shaft, 6);
+                        glDrawArrays(GL_LINES, 0, 2);
+                        Vec3 head[4] = {base + u * aw, base - u * aw, base + v * aw, base - v * aw};
+                        for (int i = 0; i < 4; ++i) {
+                            float seg[6] = {tip.x, tip.y, tip.z, head[i].x, head[i].y, head[i].z};
+                            upload(seg, 6);
+                            glDrawArrays(GL_LINES, 0, 2);
+                        }
+                        // Negative: dimmer dashed tail (CPU dashes — core GL has no stipple).
+                        setCol(r, g, b, selected ? 0.55f : 0.40f);
+                        glLineWidth(1.5f);
+                        Vec3 nEnd = o - dir * ns;
+                        const int cells = 12;  // 6 visible dashes
+                        for (int i = 0; i < cells; i += 2) {
+                            float t0 = (float)i / cells, t1 = (float)(i + 1) / cells;
+                            Vec3 p0 = o + (nEnd - o) * t0, p1 = o + (nEnd - o) * t1;
+                            float seg[6] = {p0.x, p0.y, p0.z, p1.x, p1.y, p1.z};
+                            upload(seg, 6);
+                            glDrawArrays(GL_LINES, 0, 2);
+                        }
+                    }
+                    break;
+                }
                 // A 3-axis cross marker centered on the point.
                 Vec3 o = d.origin;
                 float cross[18] = {

@@ -182,6 +182,14 @@ public:
         std::string name;
     };
     void setRefDatums(std::vector<RefDatum> datums) { refDatums_ = std::move(datums); }
+    // True when a datum with this feature id is currently loaded (e.g. "point.origin", injected on
+    // every doc rebuild). Lets screen-space overlays (the origin +X/+Y/+Z labels) gate on the same
+    // set drawRefDatums draws from, so labels never float without their geometry.
+    bool hasDatum(const std::string& id) const {
+        for (const auto& d : refDatums_)
+            if (d.id == id) return true;
+        return false;
+    }
     // Datum feature ids hidden via the FeatureManager eye toggle. drawRefDatums skips any datum whose
     // id is in this set, so a hide takes effect immediately (no document rebuild). Applied from
     // AppState::applyDatumVisibility() on toggle / tab-switch / rebuild. Harmless to pass a superset

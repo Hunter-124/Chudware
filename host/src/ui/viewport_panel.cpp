@@ -3515,6 +3515,76 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
         }
 
+        // ---- world-origin axis labels (+X/+Y/+Z, dim -X/-Y/-Z) ----
+        // Screen-space companions to the color-coded origin axes drawRefDatums draws at the world
+        // origin (X=red, Y=green, Z=blue; solid arrow on +, dashed tail on -). Gated on the same
+        // datum set + FeatureManager eye toggle so labels never float without their arrows. The
+        // world lengths (0.22 / 0.80 of scene radius) must match the renderer's origin-axis case.
+        if (!inSketch && renderer.hasDatum("point.origin") &&
+            !st.hiddenFeatures.count("point.origin")) {
+            const float* m = renderer.camera().mvp.m;  // column-major model->clip
+            auto project = [&](float wx, float wy, float wz, ImVec2& out) -> bool {
+                float x = m[0]*wx + m[4]*wy + m[8]*wz  + m[12];
+                float y = m[1]*wx + m[5]*wy + m[9]*wz  + m[13];
+                float wc= m[3]*wx + m[7]*wy + m[11]*wz + m[15];
+                if (wc <= 1e-4f) return false;  // behind the camera
+                out.x = vr0.x + (x / wc * 0.5f + 0.5f) * (vr1.x - vr0.x);
+                out.y = vr0.y + (1.0f - (y / wc * 0.5f + 0.5f)) * (vr1.y - vr0.y);
+                return true;
+            };
+            const float e  = renderer.effectiveSceneRadius();
+            const float os = e * 0.22f;   // positive axis length (matches drawRefDatums)
+            const float ns = os * 0.80f;  // negative tail length
+            static const float kAxis[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+            static const ImU32 kAxCol[3] = {IM_COL32(230, 64, 64, 255),    // X red
+                                            IM_COL32(56, 200, 72, 255),    // Y green
+                                            IM_COL32(84, 118, 245, 255)};  // Z blue
+            static const char* kPosL[3]  = {"+X", "+Y", "+Z"};
+            static const char* kNegL[3]  = {"-X", "-Y", "-Z"};
+            static const char* kPosId[3] = {"vp_org_px", "vp_org_py", "vp_org_pz"};
+            static const char* kNegId[3] = {"vp_org_nx", "vp_org_ny", "vp_org_nz"};
+            ImVec2 so;
+            const bool haveO = project(0, 0, 0, so);
+            auto axisLabel = [&](const char* id, const char* txt, float wx, float wy, float wz,
+                                 ImU32 col, float fs) {
+                ImVec2 sp;
+                if (!project(wx, wy, wz, sp)) return;
+                // Push the label outward (away from the origin on screen) past the arrowhead.
+                if (haveO) {
+                    float dx = sp.x - so.x, dy = sp.y - so.y;
+                    float len = std::sqrt(dx * dx + dy * dy);
+                    if (len > 1e-3f) {
+                        sp.x += dx / len * 10.0f * ui::uiScale;
+                        sp.y += dy / len * 10.0f * ui::uiScale;
+                    }
+                }
+                ImFont* f = ImGui::GetFont();
+                ImVec2 ts = f->CalcTextSizeA(fs, 1e30f, 0.0f, txt);
+                ImVec2 p(sp.x - ts.x * 0.5f, sp.y - ts.y * 0.5f);
+                // Contrast halo (light AND dark themes): sample the backdrop under the label and
+                // ring the glyphs with the opposite tone, same trick as the HUD chips.
+                const ui::AdaptiveSurface& lsurf = ui::adaptivePanel(
+                    ui::panelId(id), ImRect(p, ImVec2(p.x + ts.x, p.y + ts.y)),
+                    ui::GlassGroup::Hud);
+                const ImU32 halo = ui::glassIconHalo(lsurf);
+                static const float off[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+                for (int k = 0; k < 4; ++k)
+                    vdl->AddText(f, fs,
+                                 ImVec2(p.x + off[k][0] * ui::uiScale,
+                                        p.y + off[k][1] * ui::uiScale),
+                                 halo, txt);
+                vdl->AddText(f, fs, p, col, txt);
+            };
+            const float fsP = ImGui::GetFontSize();
+            const float fsN = fsP * 0.85f;
+            for (int ai = 0; ai < 3; ++ai) {
+                const float* d = kAxis[ai];
+                axisLabel(kPosId[ai], kPosL[ai], d[0] * os, d[1] * os, d[2] * os, kAxCol[ai], fsP);
+                const ImU32 dim = (kAxCol[ai] & 0x00FFFFFF) | 0x8C000000u;  // ~55% alpha
+                axisLabel(kNegId[ai], kNegL[ai], -d[0] * ns, -d[1] * ns, -d[2] * ns, dim, fsN);
+            }
+        }
+
         // ---- C27-A: SolidWorks-style in-viewport parameter callouts ----
         // While the PropertyManager is editing a feature, show a small chip ("Radius: 4mm")
         // per visible+enabled Dim field, tied by a leader line to the affected geometry.

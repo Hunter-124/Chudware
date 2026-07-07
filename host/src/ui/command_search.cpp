@@ -65,10 +65,14 @@ void drawCommandSearch(AppState& st) {
 
     bool shouldClose = false;
 
-    // Opaque title strip (same approach as drawSettingsModal): applyTheme sets TitleBg* to
-    // transparent; push opaque headerBg so the "Search" strip reads as crisp chrome — a sibling
-    // of the Settings dialog, not a floating naked list.
-    ui::pushGlassWindowStyle();
+    // Settings-style bordered popout: opaque body (windowBg) + opaque title strip.
+    // pushGlassWindowStyle() made the body semi-transparent (glassBg); the spec says
+    // Search should be a settings-style sibling — same opaque chrome as the Settings dialog.
+    // applyTheme sets TitleBg* to transparent and WindowBorderSize=1 (opaque Border already);
+    // we push windowBg opaque and the 4 title colors together, pop all after Begin().
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,
+        ImVec4(ui::palette.windowBg[0], ui::palette.windowBg[1],
+               ui::palette.windowBg[2], 1.0f));
     ImGui::PushStyleColor(ImGuiCol_TitleBg,
         ImVec4(ui::palette.headerBg[0], ui::palette.headerBg[1],
                ui::palette.headerBg[2], 1.0f));
@@ -82,7 +86,7 @@ void drawCommandSearch(AppState& st) {
                      ImGuiWindowFlags_NoResize    | ImGuiWindowFlags_NoDocking |
                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
                      ImGuiWindowFlags_NoCollapse);
-    ImGui::PopStyleColor(3);  // TitleBg / TitleBgActive / TitleBgCollapsed
+    ImGui::PopStyleColor(4);  // WindowBg / TitleBg / TitleBgActive / TitleBgCollapsed
     if (searchBegun) {
 
         // ---- filter input ----
@@ -237,7 +241,6 @@ void drawCommandSearch(AppState& st) {
         ImGui::EndChild();
     }
     ImGui::End();
-    ui::popGlassWindowStyle();
 
     if (shouldClose) {
         st.showCommandSearch = false;

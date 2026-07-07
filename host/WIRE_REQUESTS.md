@@ -51,3 +51,6 @@ Format:
   Also add `runDialogs(AppState&)` declaration to ScenarioRunner in scenarios.h and a dispatch call
   in the per-frame tick alongside the other scenarios. Needed for verify: both dialogs are visually
   inspected in both themes by the dialogs finisher agent.
+
+## Polish agent requests (build fix — parts_workspace.cpp fonts member)
+- [ ] (polish) `host/src/ui/parts/parts_workspace.cpp:93,111` — `ui::fonts` should be `ui::Fonts` (capital F). The struct is declared as `ui::Fonts` in ui_theme.h (L13) but parts_workspace.cpp references it as lowercase `ui::fonts`. Fix: replace `ui::fonts.h2` with `ui::Fonts.h2` at L93 and `ui::fonts.h1` with `ui::Fonts.h1` at L111. This is blocking the build (not in polish file ownership).

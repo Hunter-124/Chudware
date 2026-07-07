@@ -38,5 +38,37 @@
     "render_005.png"
   ],
   "aruco_mat": "aruco_mat.png",
-  "camera_poses_file": "camera_poses.json"
+  "camera_poses_file": "camera_poses.json",
+  "marker": {
+    "dict_name": "DICT_5X5_100",
+    "marker_id": 0,
+    "marker_len_mm": 40.0,
+    "center_xy_mm": [
+      40.0,
+      -35.0
+    ],
+    "plane_z_mm": 0.0,
+    "world_corners_mm": [
+      [
+        20.0,
+        -15.0,
+        0.0
+      ],
+      [
+        60.0,
+        -15.0,
+        0.0
+      ],
+      [
+        60.0,
+        -55.0,
+        0.0
+      ],
+      [
+        20.0,
+        -55.0,
+        0.0
+      ]
+    ]
+  }
 }

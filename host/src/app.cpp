@@ -186,6 +186,10 @@ void ecadAutoInitBoard(AppState& st) {
     const std::string id = jstr(res, "doc_id");
     const int rev = jint(res, "revision");
     st.addEcadTab("pcb", id, rev, /*title=*/"PCB1");
+    // Disposable starter: if the user leaves Electronics without adding anything, this blank PCB1 is
+    // discarded (AppState::discardWorkspaceStarter). Any edit sets the tab dirty and it survives.
+    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
+        st.docTabs[st.activeTab].isStarter = true;
     ecadAdopt(st, res);
     st.addLog("[ecad] auto-init default board PCB1 (" + st.ecadDocId + ")");
     st.toast(ui::ToastLevel::Info, "Started a new board: PCB1");
@@ -2968,6 +2972,14 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         ui::ecadPrimeActiveApp(st);
         static WS ecadPrevWsForInit = WS::Model;
         if (ws != ecadPrevWsForInit) {
+            // Leaving a workspace: discard its untouched auto-created starter doc (blank PCB1, an
+            // untouched starter Part, etc.) so a blank initial document doesn't linger. Runs BEFORE
+            // the Electronics auto-init below so entering Electronics from a blank Model drops that
+            // starter part first, then creates PCB1. Never closes the last tab.
+            st.discardWorkspaceStarter(ecadPrevWsForInit);
+            // discardWorkspaceStarter -> closeDocTab -> neighbor switchToTab can flip the workspace
+            // (a Part neighbor pulls to Model); re-assert the workspace the user actually picked.
+            st.activeWorkspace = ws;
             if (ws == WS::Electronics) {
                 st.wantFocusEcad = 2;      // pop the ECAD tab forward for a couple of frames
                 // Auto-init a default PCB1 board on first entry with nothing open, so the user

@@ -751,6 +751,11 @@ struct AppState {
     // opened so the blank example doesn't linger beside it. A starter the user edited (dirty) or
     // saved (has a path) is kept. No-op when there is no such tab.
     void dropBlankStarterTabs(int keepIdx);
+    // Discard the untouched auto-created "starter" document of the workspace being LEFT (an empty
+    // PCB1 on leaving Electronics, an untouched starter Part on leaving Model, etc.) so a blank
+    // initial doc the user never added to doesn't linger. No-op unless the tab is isStarter && clean
+    // && never-saved; never closes the last remaining tab (won't strand the user with zero docs).
+    void discardWorkspaceStarter(Workspace leftWs);
     // Mark the active tab dirty (on any mutation) / clear it (on save). Safe with no active tab.
     void markActiveTabDirty();
     void clearActiveTabDirty();

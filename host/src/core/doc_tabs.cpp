@@ -454,6 +454,27 @@ void AppState::dropBlankStarterTabs(int keepIdx) {
     }
 }
 
+void AppState::discardWorkspaceStarter(Workspace leftWs) {
+    using K = DocTab::TabKind;
+    auto kindMatches = [&](K k) {
+        switch (leftWs) {
+            case Workspace::Model:       return k == K::Part || k == K::Assembly;
+            case Workspace::Drawing:     return k == K::Drawing;
+            case Workspace::Electronics: return k == K::Schematic || k == K::PCB;
+            default:                     return false;
+        }
+    };
+    // Reverse scan so a close doesn't shift the indices we haven't visited yet.
+    for (int i = (int)docTabs.size() - 1; i >= 0; --i) {
+        if ((int)docTabs.size() <= 1) break;                 // never strand the user with zero docs
+        const DocTab& t = docTabs[i];
+        if (!t.isStarter || t.dirty || !t.path.empty()) continue;  // touched / saved → keep
+        if (!kindMatches(t.kind)) continue;
+        addLog("[tabs] discarding untouched starter '" + t.displayTitle() + "' on leaving workspace");
+        closeDocTab(i);   // tears down the engine-side doc (doc_close / ecad_close / drawing_close)
+    }
+}
+
 void AppState::markActiveTabDirty() {
     // Only dirty the tab that actually matches the mirror's current doc. Mid-transition (a path
     // re-pointed the mirror but the strip hasn't reconciled yet) the active index can lag the

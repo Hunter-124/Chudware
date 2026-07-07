@@ -658,10 +658,47 @@ def _parts_thumbnail(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "reason": f"parts_thumbnail failed: {exc}"}
 
 
+def _parts_match_model(params: dict, _emit: Callable) -> dict:
+    """Match a product that lacks a 3D model to a CAD-repo model (contracts/sourcing.md
+    §2a). Worker-RPC bridge to ``model_matcher.match_model`` for the GUI's "Find 3D
+    model" action. ``{part_id?, title?, mpn?, brand?, limit?}`` → the match envelope
+    (matches[], best, fallback). Only ``confidence:"exact"`` / ``attach:true`` should
+    be placed without asking; strong/weak need user confirmation; a
+    ``fallback.how == "reverse_engineer"`` routes to ``reveng_start_from_product``.
+    """
+    try:
+        from engine_oracle.parts_hub.model_matcher import match_model as _match
+        p = params or {}
+        pid = str(p.get("part_id", "")).strip()
+        title = str(p.get("title", "")).strip()
+        mpn = str(p.get("mpn", "")).strip()
+        brand = str(p.get("brand", "")).strip()
+        # Build the product from the identity fields the GUI already holds. Only
+        # enrich from the hub for a LOCAL (non-catalog) part_id when no identity was
+        # passed — a catalog: id's get() would trigger a live browser acquire we
+        # don't want just to match. A returned error envelope (ok:false) is ignored.
+        if pid and not (title or mpn) and not pid.startswith("catalog:"):
+            try:
+                from engine_oracle.parts_hub import get as _get_record
+                rec = _get_record(pid)
+                if isinstance(rec, dict) and rec.get("ok") is not False and \
+                        (rec.get("title") or rec.get("params")):
+                    return _match(rec, limit=max(1, min(int(p.get("limit", 8)), 50)))
+            except Exception:  # noqa: BLE001 — fall through to identity-field match
+                pass
+        product = {"part_id": pid, "title": title,
+                   "params": {"mpn": mpn, "brand": brand}}
+        limit = max(1, min(int(p.get("limit", 8)), 50))
+        return _match(product, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"parts_match_model failed: {exc}", "hint": ""}
+
+
 GUI_WORKER_METHODS: dict[str, Callable] = {
     "parts_list_categories": _parts_list_categories,
     "parts_taxonomy":        _parts_taxonomy,
     "parts_search":          _parts_search,
+    "parts_match_model":     _parts_match_model,
     "vendors_health_check":  _vendors_health_check,
     "vendors_health_status": _vendors_health_status,
     "parts_download":        _parts_download,

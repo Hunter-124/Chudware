@@ -379,3 +379,44 @@ class TestDispatchOrder:
             tools_text="[TOOLS] Call tools with EXACTLY these kwargs:\n- ledger_note(kind: str)")
         assert "EXACTLY these kwargs" in captured["system"]
         assert "Allowed tools:" not in captured["system"]
+
+
+# ---------------------------------------------------------------------------
+# match_model + reverse_engineer_product dispatch wrappers (contracts §2a/§2b)
+# ---------------------------------------------------------------------------
+
+class TestModelMatchDispatch:
+    def test_both_tools_resolve(self, md):
+        for tool in ("match_model", "reverse_engineer_product"):
+            assert md.resolve(tool) is not None, tool
+            assert tool in MissionDispatch.TOOLS
+
+    def test_match_model_forwards_and_returns_envelope(self, md, monkeypatch):
+        from services.mcp import parts_tools as pt
+        seen = {}
+
+        def _impl(part_id="", title="", mpn="", brand="", limit=8):
+            seen.update(part_id=part_id, title=title, mpn=mpn, brand=brand,
+                        limit=limit)
+            return {"ok": True, "matches": [
+                {"confidence": "exact", "attach": True},
+                {"confidence": "weak", "attach": False}], "best": None}
+        monkeypatch.setattr(pt, "match_model_impl", _impl)
+        out = md.match_model(mpn="1LNK-4B", brand="Acme", limit=5)
+        assert out["ok"] is True
+        assert seen == {"part_id": "", "title": "", "mpn": "1LNK-4B",
+                        "brand": "Acme", "limit": 5}
+        attaching = [m for m in out["matches"] if m.get("attach")]
+        assert len(attaching) == 1 and attaching[0]["confidence"] == "exact"
+
+    def test_reverse_engineer_product_forwards(self, md, monkeypatch):
+        from services.mcp import parts_tools as pt
+        seen = {}
+
+        def _impl(part_id="", url="", title="", mpn="", brand=""):
+            seen.update(part_id=part_id, url=url)
+            return {"ok": True, "session_id": "s1", "activeWorkspace": "ReverseEng"}
+        monkeypatch.setattr(pt, "reverse_engineer_product_impl", _impl)
+        out = md.reverse_engineer_product(url="https://a/x")
+        assert out["ok"] is True and out["session_id"] == "s1"
+        assert seen["url"] == "https://a/x"

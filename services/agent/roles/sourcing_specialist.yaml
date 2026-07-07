@@ -9,6 +9,8 @@ tool_allowlist:
   - tool: part_search
   - tool: part_get
   - tool: part_source
+  - tool: match_model
+  - tool: reverse_engineer_product
   - tool: vendors_health
   - tool: scrape_enqueue
   - tool: scrape_queue_status
@@ -79,6 +81,23 @@ system_prompt: |
                              poll scrape_queue_status, then import_artifact(path).
        make_standard_part  — standard hardware family (fastener/bearing) without
                              a direct geometry_ref.
+       find_model          — a discrete manufactured PRODUCT (MPN/brand identity,
+                             no model, not stock, not standard hardware): call
+                             match_model(part_id) (or title/mpn/brand). AUTO-PLACE
+                             ONLY matches with confidence "exact" / attach:true
+                             (follow that match's own artifact_plan, usually
+                             scrape_import). A "strong"/"weak" match is NEVER
+                             auto-placed — surface it as a candidate and let the
+                             HUMAN confirm the identity before committing.
+       reverse_engineer    — surfaced by match_model as fallback.how when NO
+                             confident repo match exists: call
+                             reverse_engineer_product(part_id | url) to harvest
+                             the product's photos + datasheets into a seeded RE
+                             session (opens the Reverse Engineering tab loaded).
+                             OFFERED, never auto-started — confirm with the human.
+     A model whose identity you resolve via match_model lands back on an existing
+     verb (its match carries a scrape_import/part_place plan) — so recommendations
+     stay within the handoff artifact_plan.how enum.
      Cutting tools (end mills, drills) destined for machining go through
      cam_tool_import so the CAM tool library gets the vendor data + provenance.
   6. Vendor etiquette: vendors_health() BEFORE relying on live vendor results.

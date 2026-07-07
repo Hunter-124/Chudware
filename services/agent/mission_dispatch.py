@@ -64,7 +64,8 @@ class MissionDispatch:
     #: Parts Library V2 sourcing surface — workstream 5).
     TOOLS = ("ledger_get", "ledger_note", "dag_plan", "ask_user",
              "delegate", "part_search",
-             "parts_taxonomy", "part_get", "part_source", "vendors_health",
+             "parts_taxonomy", "part_get", "part_source", "match_model",
+             "reverse_engineer_product", "vendors_health",
              "scrape_enqueue", "scrape_queue_status", "import_artifact",
              "cam_tool_import")
 
@@ -95,6 +96,8 @@ class MissionDispatch:
             "parts_taxonomy": self.parts_taxonomy,
             "part_get": self.part_get,
             "part_source": self.part_source,
+            "match_model": self.match_model,
+            "reverse_engineer_product": self.reverse_engineer_product,
             "vendors_health": self.vendors_health,
             "scrape_enqueue": self.scrape_enqueue,
             "scrape_queue_status": self.scrape_queue_status,
@@ -429,13 +432,50 @@ class MissionDispatch:
 
         need: e.g. "4130 chromoly tube OD 25.4 wall 1.25" or "bearing 12mm bore".
         Each candidate carries artifact_plan.how: part_place | scrape_import |
-        make_standard_part — follow it to obtain real geometry.
+        make_standard_part | find_model (→ match_model) | reverse_engineer
+        (→ reverse_engineer_product) — follow it to obtain real geometry.
         """
         try:
             from services.mcp.parts_tools import part_source_impl  # noqa: PLC0415
             return part_source_impl(need, constraints, limit)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"part_source failed: {exc}"}
+
+    def match_model(self, part_id: str = "", title: str = "", mpn: str = "",
+                    brand: str = "", limit: int = 8, **_ignored: Any) -> dict:
+        """Match a discrete manufactured product (MPN/brand identity, no 3D model,
+        not standard hardware, not raw stock) to a CAD model in a source repo —
+        fired when a part_source candidate's artifact_plan.how == "find_model".
+
+        Pass a part_id (read internally) OR a title/mpn/brand. Returns {ok,
+        product, matches, best, fallback, coverage} (contracts/sourcing.md §2a).
+        AUTO-PLACE only matches with confidence "exact" / attach:true; surface
+        strong/weak for the user to confirm. When fallback.how ==
+        "reverse_engineer" (no confident match), call reverse_engineer_product.
+        """
+        try:
+            from services.mcp.parts_tools import match_model_impl  # noqa: PLC0415
+            return match_model_impl(part_id, title, mpn, brand, limit)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"match_model failed: {exc}"}
+
+    def reverse_engineer_product(self, part_id: str = "", url: str = "",
+                                 title: str = "", mpn: str = "", brand: str = "",
+                                 **_ignored: Any) -> dict:
+        """Reverse-engineer hand-off (contracts/sourcing.md §2b): harvest ALL of a
+        product's photos + datasheets off its page and seed a reverse-engineering
+        session pre-populated with them (GUI opens the RE tab loaded). Call this
+        when match_model's fallback.how == "reverse_engineer".
+
+        Pass a part_id (source_url read from its record) OR the product url.
+        Returns {ok, session_id, images_added, documents_ingested, source_url,
+        activeWorkspace}. Best-effort: zero media still starts a session.
+        """
+        try:
+            from services.mcp.parts_tools import reverse_engineer_product_impl  # noqa: PLC0415
+            return reverse_engineer_product_impl(part_id, url, title, mpn, brand)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"reverse_engineer_product failed: {exc}"}
 
     def vendors_health(self, sites: str = "", **_ignored: Any) -> dict:
         """Canary health check of the vendor source adapters (CSV sites filter).

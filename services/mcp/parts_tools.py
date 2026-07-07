@@ -450,6 +450,81 @@ def part_source_impl(need: str, constraints: str = "", limit: int = 5) -> dict:
         return {"ok": False, "reason": f"part_source failed: {exc}", "hint": ""}
 
 
+def match_model_impl(part_id: str = "", title: str = "", mpn: str = "",
+                     brand: str = "", limit: int = 8) -> dict:
+    """Product → CAD-model matcher (aicad.match_model/1, contracts/sourcing.md §2a).
+
+    Builds the product dict from a PartRecord (when ``part_id`` is given) or from
+    the plain title/mpn/brand args, then fans out across the CAD-model-yielding
+    source adapters and ranks candidates by IDENTITY confidence. Deterministic —
+    no LLM inside. Imports lazily at call time so tests can monkeypatch
+    ``model_matcher.match_model``.
+    """
+    part_id = str(part_id or "").strip()
+    product: dict
+    if part_id:
+        try:
+            from engine_oracle.parts_hub import get as _get  # noqa: PLC0415
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "reason": f"parts hub unavailable: {exc}",
+                    "hint": "engine_oracle/parts_hub must be importable."}
+        try:
+            rec = _get(part_id)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "reason": f"part_get failed: {exc}", "hint": ""}
+        if rec is None:
+            return {"ok": False, "reason": f"part_id not found: {part_id!r}",
+                    "hint": "Use part_search/part_source to discover valid part_ids."}
+        product = dict(rec)
+    else:
+        product = {k: v for k, v in
+                   {"title": str(title or "").strip(),
+                    "mpn": str(mpn or "").strip(),
+                    "brand": str(brand or "").strip()}.items() if v}
+    if not product:
+        return {"ok": False, "reason": "no product to match",
+                "hint": "Pass a part_id, or a title/mpn/brand describing the product."}
+    try:
+        from engine_oracle.parts_hub import model_matcher as _mm  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"model matcher unavailable: {exc}",
+                "hint": "engine_oracle/parts_hub/model_matcher.py must be importable."}
+    try:
+        return _mm.match_model(product, limit=max(1, min(int(limit or 8), 50)))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"match_model failed: {exc}", "hint": ""}
+
+
+def reverse_engineer_product_impl(part_id: str = "", url: str = "", title: str = "",
+                                  mpn: str = "", brand: str = "") -> dict:
+    """RE hand-off (contracts/sourcing.md §2b): harvest a product's images +
+    documents and seed a reverse-engineering session pre-populated with them.
+
+    Calls the ``reveng_start_from_product`` worker path. Best-effort: zero media
+    still stands up a session (the user adds their own photos). Imports lazily at
+    call time so tests can monkeypatch ``reveng_rpc._reveng_start_from_product``.
+    """
+    seed = {k: v for k, v in
+            {"part_id": str(part_id or "").strip(),
+             "url": str(url or "").strip(),
+             "title": str(title or "").strip(),
+             "mpn": str(mpn or "").strip(),
+             "brand": str(brand or "").strip()}.items() if v}
+    if not seed.get("part_id") and not seed.get("url"):
+        return {"ok": False, "reason": "no reference to reverse-engineer",
+                "hint": "Pass a part_id or a url pointing at the product page."}
+    try:
+        from engine_oracle import reveng_rpc as _re  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"reverse-engineer suite unavailable: {exc}",
+                "hint": "engine_oracle/reveng_rpc.py must be importable."}
+    try:
+        return _re._reveng_start_from_product(seed, None)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"reverse_engineer_product failed: {exc}",
+                "hint": ""}
+
+
 def register_parts_tools(mcp: FastMCP) -> None:
     """Register part_search, part_get, and part_place MCP tools (append-only).
 
@@ -538,6 +613,67 @@ def register_parts_tools(mcp: FastMCP) -> None:
         """
         return json.dumps(part_source_impl(need, constraints, limit),
                           ensure_ascii=False)
+
+    @mcp.tool()
+    def match_model(part_id: str = "", title: str = "", mpn: str = "",
+                    brand: str = "", limit: int = 8) -> str:
+        """Match a discrete manufactured PRODUCT (has an MPN/brand identity, no 3D
+        model, not standard hardware, not raw stock) to a CAD model in a source
+        repo — deterministic identity fan-out (no LLM inside). Fired when a
+        part_source candidate's artifact_plan.how == "find_model".
+
+        part_id : a stored PartRecord id (part_get'd internally to read its
+                  mpn/brand/title/source_url); OR leave blank and pass:
+        title   : product title / description
+        mpn     : manufacturer part number
+        brand   : brand / manufacturer
+        limit   : max candidate models (default 8)
+
+        Returns {ok, product, matches:[{part_id, title, site, mpn, confidence,
+        score, attach, artifact_plan}], best, fallback, coverage} — see
+        contracts/sourcing.md §2a.
+
+        CONFIDENCE TIERS + AUTO-PLACE POLICY (a wrong model silently corrupts a
+        design — the bar is deliberately high):
+          exact  — normalized-MPN equality; the ONLY tier with attach:true. Only
+                   exact / attach:true matches may be AUTO-PLACED (follow the
+                   match's artifact_plan, usually scrape_import → import_artifact).
+          strong — brand match + part-number substring; attach:false. Surface to
+                   the USER for one-click confirmation; never auto-place.
+          weak   — title/spec token overlap only; attach:false. Tentative; must
+                   never auto-place — confirm with the user first.
+
+        When NO exact match exists, `best` is the top non-exact candidate for the
+        user to confirm, and `fallback` carries a plan. If
+        fallback.how == "reverse_engineer" (no confident repo match), call
+        reverse_engineer_product(...) to harvest the product's photos + datasheet
+        into a seeded RE session. reverse_engineer is OFFERED, never auto-started.
+        """
+        return json.dumps(match_model_impl(part_id, title, mpn, brand, limit),
+                          ensure_ascii=False)
+
+    @mcp.tool()
+    def reverse_engineer_product(part_id: str = "", url: str = "", title: str = "",
+                                 mpn: str = "", brand: str = "") -> str:
+        """Reverse-engineer hand-off (contracts/sourcing.md §2b): when match_model
+        finds NO confident repo match (fallback.how == "reverse_engineer"), harvest
+        EVERYTHING scrapable off the product page — all product photos / gallery
+        images / og:image AND every datasheet/manual/spec document — and seed a
+        reverse-engineering session pre-populated with them. The GUI opens the
+        Reverse Engineering tab already loaded (activeWorkspace == "ReverseEng").
+
+        part_id : a stored PartRecord id whose source_url points at the product; OR
+        url     : the product page URL directly. (One of part_id / url is required.)
+        title / mpn / brand : optional identity seed for the session name/research.
+
+        Returns {ok, session_id, images_added, documents_ingested, source_url,
+        activeWorkspace}. Best-effort: zero images/documents STILL starts a session
+        (the user adds their own photos) — never a traceback. Reference-only URLs;
+        nothing is redistributed.
+        """
+        return json.dumps(
+            reverse_engineer_product_impl(part_id, url, title, mpn, brand),
+            ensure_ascii=False)
 
     @mcp.tool()
     def vendors_health(sites: str = "") -> str:

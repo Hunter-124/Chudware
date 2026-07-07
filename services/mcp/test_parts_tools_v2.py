@@ -319,9 +319,139 @@ class TestRegistration:
         for name in ("part_search", "parts_taxonomy", "part_source",
                      "vendors_health", "cam_tool_import", "part_get",
                      "part_place", "vendor_status", "vendor_login",
+                     "match_model", "reverse_engineer_product",
                      "scrape_enqueue", "scrape_queue_status", "import_artifact"):
             assert name in m.tools, name
         out = json.loads(m.tools["parts_taxonomy"]())
         assert out["ok"] is True
         out = json.loads(m.tools["part_search"]("bearing", facets='{"bore_mm": 12}'))
         assert out["ok"] is True and out["count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# match_model + reverse_engineer_product (aicad.match_model/1, contracts §2a/§2b)
+# ---------------------------------------------------------------------------
+
+# A mixed-tier envelope: exactly one exact (attach:true), one strong, one weak.
+_MATCH_ENVELOPE = {
+    "ok": True,
+    "product": {"title": "Acme Widget", "mpn": "1LNK-4B", "brand": "AcmeCorp"},
+    "matches": [
+        {"part_id": "catalog:grabcad::https://g/1", "title": "Widget 1LNK-4B",
+         "site": "grabcad", "mpn": "1LNK-4B", "confidence": "exact",
+         "score": 4.0, "attach": True,
+         "artifact_plan": {"how": "scrape_import", "site": "grabcad",
+                           "query": "1LNK-4B"}},
+        {"part_id": "catalog:traceparts::https://t/2", "title": "Widget 1LNK",
+         "site": "traceparts", "mpn": "1LNK", "confidence": "strong",
+         "score": 2.0, "attach": False,
+         "artifact_plan": {"how": "scrape_import", "site": "traceparts",
+                           "query": "1LNK"}},
+        {"part_id": "catalog:content3d::https://c/3", "title": "Some Widget",
+         "site": "content3d", "mpn": "", "confidence": "weak",
+         "score": 1.0, "attach": False,
+         "artifact_plan": {"how": "scrape_import", "site": "content3d",
+                           "query": "widget"}},
+    ],
+    "best": None,
+    "fallback": None,
+    "coverage": {"sites_searched": 9, "raw_hits": 14},
+}
+
+
+class TestMatchModel:
+    def _patch(self, monkeypatch, capture=None):
+        from engine_oracle.parts_hub import model_matcher as mm
+
+        def _fake(product, *, limit=8):
+            if capture is not None:
+                capture["product"] = product
+                capture["limit"] = limit
+            return _MATCH_ENVELOPE
+        monkeypatch.setattr(mm, "match_model", _fake)
+
+    def test_from_identity_args_returns_envelope(self, monkeypatch):
+        cap: dict = {}
+        self._patch(monkeypatch, cap)
+        out = pt.match_model_impl(title="Acme Widget", mpn="1LNK-4B",
+                                  brand="AcmeCorp")
+        assert out["ok"] is True
+        assert cap["product"] == {"title": "Acme Widget", "mpn": "1LNK-4B",
+                                  "brand": "AcmeCorp"}
+        # the MCP tool wrapper returns a JSON string of the same envelope.
+        m = _FakeMCP()
+        pt.register_parts_tools(m)
+        assert json.loads(m.tools["match_model"](title="Acme Widget",
+                                                 mpn="1LNK-4B"))["ok"] is True
+
+    def test_only_exact_carries_attach_true(self, monkeypatch):
+        self._patch(monkeypatch)
+        out = pt.match_model_impl(mpn="1LNK-4B")
+        attaching = [m for m in out["matches"] if m.get("attach")]
+        assert len(attaching) == 1
+        assert attaching[0]["confidence"] == "exact"
+        # strong/weak never auto-attach
+        assert all(not m["attach"] for m in out["matches"]
+                   if m["confidence"] != "exact")
+
+    def test_part_id_path_fetches_record(self, monkeypatch):
+        cap: dict = {}
+        self._patch(monkeypatch, cap)
+        import engine_oracle.parts_hub as hub
+        rec = {"part_id": "catalog:amazon::https://a/x", "title": "Acme Widget",
+               "mpn": "1LNK-4B", "brand": "AcmeCorp"}
+        monkeypatch.setattr(hub, "get", lambda pid: rec)
+        out = pt.match_model_impl(part_id="catalog:amazon::https://a/x")
+        assert out["ok"] is True
+        # the WHOLE record is handed to the matcher (it extracts identity itself)
+        assert cap["product"]["mpn"] == "1LNK-4B"
+
+    def test_unknown_part_id_is_contract_error(self, monkeypatch):
+        import engine_oracle.parts_hub as hub
+        monkeypatch.setattr(hub, "get", lambda pid: None)
+        out = pt.match_model_impl(part_id="catalog:x::none")
+        assert out["ok"] is False and "not found" in out["reason"]
+
+    def test_no_product_is_contract_error(self):
+        out = pt.match_model_impl()
+        assert out["ok"] is False and "no product" in out["reason"]
+
+    def test_registered_and_json(self):
+        m = _FakeMCP()
+        pt.register_parts_tools(m)
+        assert "match_model" in m.tools
+        assert "reverse_engineer_product" in m.tools
+
+
+class TestReverseEngineerProduct:
+    def _patch(self, monkeypatch, capture=None):
+        from engine_oracle import reveng_rpc as re
+
+        def _fake(params, emit):
+            if capture is not None:
+                capture["params"] = params
+            return {"ok": True, "session_id": "sess_1", "images_added": 3,
+                    "documents_ingested": 1,
+                    "source_url": "https://a/x", "activeWorkspace": "ReverseEng"}
+        monkeypatch.setattr(re, "_reveng_start_from_product", _fake)
+
+    def test_url_seeds_session(self, monkeypatch):
+        cap: dict = {}
+        self._patch(monkeypatch, cap)
+        out = pt.reverse_engineer_product_impl(url="https://a/x", mpn="1LNK-4B")
+        assert out["ok"] is True and out["session_id"] == "sess_1"
+        assert out["activeWorkspace"] == "ReverseEng"
+        assert out["images_added"] == 3 and out["documents_ingested"] == 1
+        assert cap["params"]["url"] == "https://a/x"
+        assert cap["params"]["mpn"] == "1LNK-4B"
+
+    def test_part_id_seeds_session(self, monkeypatch):
+        cap: dict = {}
+        self._patch(monkeypatch, cap)
+        out = pt.reverse_engineer_product_impl(part_id="catalog:amazon::https://a/x")
+        assert out["ok"] is True
+        assert cap["params"]["part_id"] == "catalog:amazon::https://a/x"
+
+    def test_no_reference_is_contract_error(self):
+        out = pt.reverse_engineer_product_impl(title="just a title")
+        assert out["ok"] is False and "reference" in out["reason"]

@@ -26,15 +26,16 @@ namespace ui {
 void drawManufactureWorkspace(app::AppState& s) {
     // 1. Workspace header strip: breadcrumb + action shortcuts + stale banner.
     //    camCheckPartStale() is the pull-model cross-doc staleness check (feat(xdoc)):
-    //    it polls doc_list_open ~once/second and sets a stale flag when the source part
-    //    has been rebuilt since the last cam_extract. The banner in the header strip
-    //    responds immediately; clicking "Regen from Part" calls camRegenFromPart().
-    //    Also fires a postToastAction when the part first goes stale — visible even if
-    //    the Manufacture workspace is not the active tab.
+    //    it polls doc_dep_query / doc_list_open ~once/second and sets a stale flag when
+    //    the source part has been rebuilt since the last cam_extract. The inline banner
+    //    in drawCamWorkspaceHeader lights up immediately. postToastAction is also fired
+    //    on first-stale for the toast overlay, though both are co-visible while this
+    //    workspace is active (see cam_panel.h SCOPE NOTE for the integrator hook needed
+    //    to extend toast notification to other workspaces).
     camCheckPartStale(s);
 
-    // Poll the toast action queue: if the user clicked "Regen from Part" on the
-    // global toast (posted by camCheckPartStale), drive the regen here.
+    // Drain the global toast action queue. If the user clicked "Regen from Part" on
+    // the toast overlay (posted by camCheckPartStale above), drive the regen here.
     if (takeToastAction() == kToastRegenFromPart)
         camRegenFromPart(s);
 

@@ -62,10 +62,30 @@ void camHandleCommand(app::AppState& st, const std::string& cmd);
 const CamBackplot* camActiveBackplot();
 
 // ---- Cross-doc dependency (b) -----------------------------------------------
-// Pull-model stale check: call once per frame when the Manufacture workspace is
-// visible. Compares the cached source-part revision to the part's current revision
-// (via doc_list_open). Returns true if the job geometry is now stale (part changed
-// since last extract). Callers may show a "Part changed — regen?" toast.
+// Pull-model stale check: call once per frame while the CAM singleton is live
+// (source part registered). Compares the cached source-part revision to the
+// part's current revision via doc_dep_query / doc_list_open. Returns true when
+// the job geometry just became stale (part rebuilt since last extract).
+//
+// SCOPE NOTE: this is currently called only from drawManufactureWorkspace(), so
+// it only runs while the Manufacture workspace is active. The postToastAction
+// fired here is therefore redundant with the inline stale banner in the header
+// strip (both are visible at the same time). True cross-workspace notification
+// requires an additional unconditional call site each frame.
+//
+// INTEGRATOR HOOK (not yet wired — out of this task's write-set):
+//   To make the "Part changed" toast appear while the user is in the Model
+//   workspace, call camPollStaleGlobal(st) unconditionally once per frame from
+//   application.cpp frame() BEFORE the workspace gate, and drain
+//   takeToastAction() there too. camCheckPartStale is a no-op when no source
+//   part is registered, so the call is safe at all times.
+//
+// KNOWN LIMITATION — single-job singleton:
+//   camFindOrCreateJobForPart identifies the live job by comparing
+//   g.sourcePartDocId == partDocId (singleton). If a second part is passed it
+//   creates a duplicate rather than finding the existing job via doc_dep_query.
+//   Multi-part support requires replacing the singleton with a map keyed on
+//   partDocId or iterating doc_dep_query("cam") results.
 bool camCheckPartStale(app::AppState& st);
 
 // Acknowledge the stale state and force a re-extract + re-generate from the current part.

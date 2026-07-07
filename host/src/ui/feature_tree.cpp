@@ -156,7 +156,7 @@ static void fmRowHoverPaint(ImVec2 rowMin, ImVec2 rowMax, bool hovered, bool sel
 // stacked, overlapping slabs (visual-review fix).
 //
 // T-G18: fmRowPill()/fmRowPillEnd() bracket every meta/header row. fmRowPill pushes the SAME
-// FramePadding featureRow() uses (so every row is the same height + text baseline) and the
+// FramePadding featureRow() uses (6dp x, 4dp y — so every row is the same height + text baseline) and the
 // SAME transparent HeaderHovered/HeaderActive (so ImGui's default hover never paints); the
 // returned rect feeds fmRowPillEnd(), which pops those styles and draws the shared hover on
 // the row's just-submitted item. Pairs must balance (one End per Pill) or the style stack
@@ -164,8 +164,10 @@ static void fmRowHoverPaint(ImVec2 rowMin, ImVec2 rowMax, bool hovered, bool sel
 struct FmRowRect { ImVec2 mn, mx; };
 static int s_fmStripeIdx = 0;
 static FmRowRect fmRowPill(bool selected = false) {
+    // polish(G2): 6dp horizontal gives icons breathing room from the left edge; 4dp vertical gives
+    // text more vertical breathing without making rows too tall.
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                        ImVec2(3.0f * ui::uiScale, 3.0f * ui::uiScale));
+                        ImVec2(6.0f * ui::uiScale, 4.0f * ui::uiScale));
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0, 0, 0, 0));
     const float rowH = ImGui::GetFrameHeight();
@@ -193,7 +195,8 @@ static void treeIconInArrowSlot(ImVec2 rowPos, const char* name, const char* fal
                                 float alpha = 1.0f) {
     const float rowH = ImGui::GetItemRectSize().y;
     const float px = std::min(16.0f * ui::uiScale, ImGui::GetFontSize());
-    ImVec2 p(rowPos.x + ImGui::GetStyle().FramePadding.x * 0.5f,
+    // polish(G2): use full FramePadding.x (not 0.5x) so icon sits 6dp from the left edge.
+    ImVec2 p(rowPos.x + ImGui::GetStyle().FramePadding.x,
              rowPos.y + (rowH - px) * 0.5f);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     IconUV iv = getIcon(name, 20);
@@ -948,8 +951,9 @@ static RowResult featureRow(RowCtx& c, AppState& st) {
     if (c.suppressed) label += " [S]";
     label += "##ft_" + fid;
 
+    // polish(G2): match fmRowPill padding (6dp x, 4dp y) so featureRow height == pill height.
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                        ImVec2(3.0f * ui::uiScale, 3.0f * ui::uiScale));
+                        ImVec2(6.0f * ui::uiScale, 4.0f * ui::uiScale));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 2.0f * ui::uiScale));
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0, 0, 0, 0));
@@ -2610,9 +2614,9 @@ void drawFeatureTreeBody(AppState& st,
                         ImVec2 rowMin = ImGui::GetCursorScreenPos();
                         float availW = ImGui::GetContentRegionAvail().x;
                         const float S = ui::uiScale;
-                        // Must equal featureRow()'s node frame height (FramePadding 3dp pushed
+                        // Must equal featureRow()'s node frame height (FramePadding 4dp pushed
                         // there): a taller pill bled over the following row (visual-review fix).
-                        const float rowH = ImGui::GetTextLineHeight() + 6.0f * S;
+                        const float rowH = ImGui::GetTextLineHeight() + 8.0f * S;
                         ImVec2 rowMax(rowMin.x + availW, rowMin.y + rowH);
                         ImDrawList* rowDl = ImGui::GetWindowDrawList();
                         // Readable row pill via shared glass helper (panel stays transparent).

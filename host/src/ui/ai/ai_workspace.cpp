@@ -304,13 +304,19 @@ static void emptyState(const char* icon, const char* msg, const char* sub = null
         ImGui::PopStyleColor();
     }
     if (sub) {
-        float sw = ImGui::CalcTextSize(sub).x;
+        // Wrap-aware centering: long sub lines wrap inside the pane instead of clipping off the
+        // left edge (M21 — the DAG pane is narrower now that the chat column sits beside it).
+        float avail2 = ImGui::GetContentRegionAvail().x;
+        float wrapW  = std::min(avail2 - 16.0f * S, 460.0f * S);
+        float sw     = ImGui::CalcTextSize(sub, nullptr, false, wrapW).x;
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
-                             (ImGui::GetContentRegionAvail().x - sw) * 0.5f);
+                             std::max(0.0f, (avail2 - sw) * 0.5f));
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.textDisabled[0], palette.textDisabled[1],
                    palette.textDisabled[2], 0.8f));
-        ImGui::TextUnformatted(sub);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrapW);
+        ImGui::TextWrapped("%s", sub);
+        ImGui::PopTextWrapPos();
         ImGui::PopStyleColor();
     }
     ImGui::Dummy(ImVec2(0, 8.0f * S));

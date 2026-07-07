@@ -56,7 +56,7 @@ Format:
 - [ ] (polish) `host/src/ui/parts/parts_workspace.cpp:93,111` — `ui::fonts` should be `ui::Fonts` (capital F). The struct is declared as `ui::Fonts` in ui_theme.h (L13) but parts_workspace.cpp references it as lowercase `ui::fonts`. Fix: replace `ui::fonts.h2` with `ui::Fonts.h2` at L93 and `ui::fonts.h1` with `ui::Fonts.h1` at L111. This is blocking the build (not in polish file ownership).
 
 ## ribbon agent — per-workspace ribbon filter (2026-07-06)
-- [ ] (ribbon) `host/src/app.cpp` — before each `drawRibbon(...)` call, add:
+- [x] (ribbon) `host/src/app.cpp` — DONE e5e90805. before each `drawRibbon(...)` call, add:
   `ui::setRibbonWorkspace(static_cast<int>(st.activeWorkspace));`
   (include `host/src/ui/widgets/ribbon.h` if not already included at that call-site).
   This enables per-workspace tab filtering: Simulate shows only Simulation+Reference,
@@ -68,7 +68,7 @@ Format:
 - [ ] (polish) `host/src/ui/parts/parts_workspace.cpp:93,111` — `ui::fonts` is not a member of namespace `ui`; fonts live on AppState. Fix: replace `ui::fonts.h2` with `st.fonts.h2` at L93 (in sectionHeader) and `ui::fonts.h1` with `st.fonts.h1` at L111 (in emptyState). The `st` AppState& param is in scope in both functions. This blocks the ninja build — not in polish file ownership so filing as wire request.
 
 ## sim-kinematics agent — motion scenario (2026-07-06)
-- [ ] (sim-kinematics) `host/src/ui/scenarios.cpp` — Add a `motion` scenario
+- [x] (sim-kinematics) `host/src/ui/scenarios.cpp` — DONE e5e90805. Add a `motion` scenario
   (AI_CAD_SHOT=motion) that validates the Motion study viewport playback end-to-end.
   The scenario should:
   1. On step 0: build a minimal 2-body assembly (box + arm) with one angle mate driven
@@ -97,7 +97,7 @@ Format:
   This is a low-priority polish item — the Insert button works silently without it.
 
 ## ribbon agent — exact insertion point for setRibbonWorkspace (2026-07-06)
-- [ ] (ribbon) `host/src/app.cpp:2719` — insert before the `drawRibbon` call (currently line ~2720):
+- [x] (ribbon) `host/src/app.cpp:2719` — DONE e5e90805. insert before the `drawRibbon` call (currently line ~2720):
   `ui::setRibbonWorkspace(static_cast<int>(st.activeWorkspace));`
   ribbon.h is already included at that translation unit. This one-liner wires the per-workspace
   ribbon filter. Confirmed the call site: lines 2717-2722 of app.cpp read:
@@ -107,7 +107,7 @@ Format:
   Insert between setRibbonSketchActive and drawRibbon. Owner: workspace-shell.
 
 ## furniture agent — workspace hotkeys + window title (2026-07-06)
-- [ ] (furniture) `host/src/app.cpp` — Ctrl+1..Ctrl+8 workspace switching. Insert inside the
+- [x] (furniture) `host/src/app.cpp` — DONE e5e90805. Ctrl+1..Ctrl+8 workspace switching. Insert inside the
   existing global-keys block (the `{ const bool canDoc = ... }` scope, after the Ctrl+P handler
   at ~L2531-2534 — same guards style as Ctrl+N/Ctrl+P). The shortcut bar + docs now advertise
   these, so this block is the only missing piece:
@@ -128,7 +128,7 @@ Format:
   }
   ```
 
-- [ ] (furniture) `host/src/app.cpp` — live window title "<doc name>[*] — AI-CAD" via
+- [x] (furniture) `host/src/app.cpp` — DONE e5e90805. live window title "<doc name>[*] — AI-CAD" via
   glfwSetWindowTitle on doc/tab/dirty change. Once per frame (anywhere after the doc-tab state is
   settled, e.g. near the per-frame display-flag derivation at ~L2804), cheap change-detection:
 

@@ -45,7 +45,8 @@ from typing import Any, Callable
 # ---------------------------------------------------------------------------
 
 _NO_VAULT = {"ok": False, "reason": "no_vault",
-             "hint": "version history is not available on this machine"}
+             "hint": "Version history needs a one-time setup on this machine. "
+                     "Restart AI-CAD to finish setting it up."}
 
 
 def _with_vault(params: dict, fn: Callable[[Any], dict]) -> dict:

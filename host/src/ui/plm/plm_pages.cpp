@@ -10,6 +10,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <string>
 
 #include "imgui.h"
@@ -34,11 +35,13 @@ void accentButtonColors() {
         ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 1.0f));
 }
 
+// Dim helper text. Wraps to the content-region width so long paragraphs never
+// run off the right edge (short inline uses after SameLine wrap harmlessly).
 void dimText(const char* fmt, ...) {
     va_list ap; va_start(ap, fmt);
     ImGui::PushStyleColor(ImGuiCol_Text,
         ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-    ImGui::TextV(fmt, ap);
+    ImGui::TextWrappedV(fmt, ap);
     ImGui::PopStyleColor();
     va_end(ap);
 }
@@ -640,6 +643,111 @@ void planCall(AppState& st, const char* op, const char* entity,
     });
 }
 
+// A compact, interactive calendar popup bound to a "YYYY-MM-DD" text buffer.
+// The trigger button shows the current value (or a hint); the popup lets the
+// user page months and click a day. Returns true when the value changed.
+bool plmDatePicker(const char* id, char* buf, size_t n) {
+    const float S = ui::uiScale;
+    bool changed = false;
+
+    // parse the buffer (fall back to today for the initial view)
+    int y = 0, mo = 0, d = 0;
+    bool haveVal = (std::sscanf(buf, "%d-%d-%d", &y, &mo, &d) == 3 &&
+                    mo >= 1 && mo <= 12 && d >= 1 && d <= 31);
+    std::time_t tt = std::time(nullptr);
+    std::tm now{};
+#if defined(_WIN32)
+    localtime_s(&now, &tt);
+#else
+    localtime_r(&tt, &now);
+#endif
+    if (!haveVal) { y = now.tm_year + 1900; mo = now.tm_mon + 1; d = 0; }
+
+    ImGui::PushID(id);
+    // view state (month being browsed) lives in ImGui storage, keyed per widget
+    ImGuiStorage* store = ImGui::GetStateStorage();
+    ImGuiID kY = ImGui::GetID("vy"), kM = ImGui::GetID("vm");
+    char label[64];
+    if (haveVal) std::snprintf(label, sizeof(label), "%04d-%02d-%02d", y, mo, d);
+    else         std::snprintf(label, sizeof(label), "Pick a date\xe2\x80\xa6");
+    if (ImGui::Button(label, ImVec2(150 * S, 0))) {
+        store->SetInt(kY, y);
+        store->SetInt(kM, mo);
+        ImGui::OpenPopup("##cal");
+    }
+    ImGui::SameLine();
+    if (haveVal && ImGui::SmallButton("Clear")) { buf[0] = '\0'; changed = true; }
+
+    if (ImGui::BeginPopup("##cal")) {
+        int vy = store->GetInt(kY, y), vm = store->GetInt(kM, mo);
+        // header: < Month Year >
+        if (ImGui::ArrowButton("##pm", ImGuiDir_Left)) {
+            if (--vm < 1) { vm = 12; --vy; }
+            store->SetInt(kY, vy); store->SetInt(kM, vm);
+        }
+        ImGui::SameLine();
+        static const char* kMon[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                     "Jul","Aug","Sep","Oct","Nov","Dec"};
+        char hdr[32]; std::snprintf(hdr, sizeof(hdr), "%s %d", kMon[vm - 1], vy);
+        float hw = ImGui::CalcTextSize(hdr).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (150 * S - hw) * 0.5f);
+        ImGui::TextUnformatted(hdr);
+        ImGui::SameLine(180 * S);
+        if (ImGui::ArrowButton("##nm", ImGuiDir_Right)) {
+            if (++vm > 12) { vm = 1; ++vy; }
+            store->SetInt(kY, vy); store->SetInt(kM, vm);
+        }
+
+        // weekday header
+        static const char* kDow[] = {"Su","Mo","Tu","We","Th","Fr","Sa"};
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+        for (int i = 0; i < 7; ++i) {
+            if (i) ImGui::SameLine();
+            ImGui::Text("%3s", kDow[i]);
+        }
+        ImGui::PopStyleColor();
+
+        // day grid — first weekday + day count via std::tm normalisation
+        std::tm first{}; first.tm_year = vy - 1900; first.tm_mon = vm - 1;
+        first.tm_mday = 1; std::mktime(&first);
+        int lead = first.tm_wday;  // 0=Sun
+        static const int mdays[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+        int dim = mdays[vm - 1];
+        if (vm == 2 && ((vy % 4 == 0 && vy % 100 != 0) || vy % 400 == 0)) dim = 29;
+
+        int cell = 0;
+        for (int i = 0; i < lead; ++i, ++cell) {
+            if (cell % 7) ImGui::SameLine();
+            ImGui::Dummy(ImVec2(24 * S, 22 * S));
+        }
+        for (int day = 1; day <= dim; ++day, ++cell) {
+            if (cell % 7) ImGui::SameLine();
+            ImGui::PushID(day);
+            bool isSel = (haveVal && vy == y && vm == mo && day == d);
+            bool isToday = (vy == now.tm_year + 1900 && vm == now.tm_mon + 1 &&
+                            day == now.tm_mday);
+            if (isSel)
+                ImGui::PushStyleColor(ImGuiCol_Button,
+                    ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.85f));
+            else if (isToday)
+                ImGui::PushStyleColor(ImGuiCol_Button,
+                    ImVec4(palette.accent[0], palette.accent[1], palette.accent[2], 0.25f));
+            char db[4]; std::snprintf(db, sizeof(db), "%d", day);
+            if (ImGui::Button(db, ImVec2(24 * S, 22 * S))) {
+                std::snprintf(buf, n, "%04d-%02d-%02d", vy, vm, day);
+                changed = true;
+                ImGui::CloseCurrentPopup();
+            }
+            if (isSel || isToday) ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
+    return changed;
+}
+
 void priorityTag(const std::string& pr) {
     const float* c = palette.textDim;
     if (pr == "p0" || pr == "p1") c = palette.statusWarn;
@@ -727,10 +835,9 @@ void plmDrawPlanningPage(AppState& st) {
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
     ImGui::SetNextItemWidth(220 * S);
     ImGui::InputTextWithHint("##msTitle", "milestone", s_msTitle, sizeof(s_msTitle));
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(120 * S);
-    ImGui::InputTextWithHint("##msDue", "due (YYYY-MM-DD)", s_msDue, sizeof(s_msDue));
     ImGui::PopStyleVar();
+    ImGui::SameLine();
+    plmDatePicker("##msDue", s_msDue, sizeof(s_msDue));
     ImGui::SameLine();
     if (ImGui::Button("Add milestone") && s_msTitle[0]) {
         nlohmann::json d = {{"title", s_msTitle}};

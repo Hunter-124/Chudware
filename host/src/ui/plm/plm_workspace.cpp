@@ -167,31 +167,45 @@ static void drawRail(AppState& st, float railW) {
     }
     ImGui::Dummy(ImVec2(0, 8 * S));
 
+    ImDrawList* dl = ImGui::GetWindowDrawList();
     for (const auto& r : kRail) {
         ImGui::PushID((int)r.page);
         bool sel = (g_plmHub.page == r.page);
-        plmRowPill(sel, 1.4f);
-        ImGui::PushStyleColor(ImGuiCol_Text, sel
-            ? ImVec4(palette.text[0], palette.text[1], palette.text[2], 1.0f)
-            : ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(r.label);
-        ImGui::PopStyleColor();
+        const float rowH = ImGui::GetFrameHeight() * 1.4f;
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        float  w  = ImGui::GetContentRegionAvail().x;
 
-        // count badges from the cached overview
+        // Full-row clickable button drives selection + hover (the old row only
+        // registered clicks on the label glyphs, so most of the pill was dead).
+        if (ImGui::InvisibleButton("##row", ImVec2(w, rowH)))
+            g_plmHub.page = r.page;
+        bool hovered = ImGui::IsItemHovered();
+
+        // Pill background (brightens on hover even when not selected).
+        float bgA = sel ? 0.42f : (hovered ? 0.30f : 0.20f);
+        ui::glassRowBackground(dl, p0, ImVec2(p0.x + w, p0.y + rowH), 4.0f,
+                               false, sel || hovered, bgA);
+
+        // Label — centered horizontally + vertically inside the pill.
+        ImVec4 tc = sel
+            ? ImVec4(palette.text[0], palette.text[1], palette.text[2], 1.0f)
+            : ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f);
+        ImVec2 ts = ImGui::CalcTextSize(r.label);
+        dl->AddText(ImVec2(p0.x + (w - ts.x) * 0.5f, p0.y + (rowH - ts.y) * 0.5f),
+                    ImGui::ColorConvertFloat4ToU32(tc), r.label);
+
+        // Count badge (from cached overview) pinned to the right edge, centered.
         int badge = 0;
         if (r.page == PlmPage::Files)  badge = g_plmHub.overview.dirtyCount;
         if (r.page == PlmPage::Issues) badge = g_plmHub.overview.openIssues;
         if (badge > 0) {
             char b[16]; std::snprintf(b, sizeof(b), "%d", badge);
-            float bw = ImGui::CalcTextSize(b).x;
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x - bw - 6 * S);
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palette.statusWarn[0], palette.statusWarn[1], palette.statusWarn[2], 1.0f));
-            ImGui::TextUnformatted(b);
-            ImGui::PopStyleColor();
+            ImVec2 bs = ImGui::CalcTextSize(b);
+            dl->AddText(ImVec2(p0.x + w - bs.x - 6 * S, p0.y + (rowH - bs.y) * 0.5f),
+                        ImGui::ColorConvertFloat4ToU32(ImVec4(palette.statusWarn[0],
+                            palette.statusWarn[1], palette.statusWarn[2], 1.0f)),
+                        b);
         }
-        if (ImGui::IsItemClicked()) g_plmHub.page = r.page;
         ImGui::Spacing();
         ImGui::PopID();
     }

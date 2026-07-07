@@ -130,7 +130,9 @@ void drawToasts(AppState& st) {
     const float rounding = 6.0f * scale;
     const ui::OverlayBand& band = ui::overlayBand();
     const float topInset = band.valid ? (band.minY - vp->Pos.y) + 8.0f * scale : 64.0f * scale;
-    float x = vp->Pos.x + pad;
+    // Anchor the toast column to the top-RIGHT: cards are fixed-width (toastW), so a single
+    // right-edge origin flips the whole stack over from the former top-left placement.
+    float x = vp->Pos.x + vp->Size.x - toastW - pad;
     float y = vp->Pos.y + topInset;
 
     ImDrawList* dl = ImGui::GetForegroundDrawList();

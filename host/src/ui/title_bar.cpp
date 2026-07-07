@@ -601,6 +601,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
             {"PLM",          AppState::Workspace::PLM,          TbIcon::PLM},
             {"Parts Library",AppState::Workspace::PartsLibrary, TbIcon::PartsLibrary},
             {"AI",           AppState::Workspace::AI,           TbIcon::AI},
+            {"Reverse Eng",  AppState::Workspace::ReverseEng,   TbIcon::Search},
         };
         constexpr int kTabCount = (int)(sizeof(kTabs) / sizeof(kTabs[0]));
 

@@ -639,6 +639,12 @@ static const RibbonCmd kCmds[] = {
     //     (the injected kSketchNewOnSketchTab, same group). Command wiring (sketch3d_new)
     //     unchanged — only tab/group/label moved. ---
     { "sketch3d_new",      "New 3D Sketch", "spline",        "Sketch",   "Sketch",   true,  nullptr, false },
+
+    // RE-ANCHOR(reveng): tab "Reverse Eng" ribbon rows — RE-03 appends shell; RE-27 polishes.
+    // Session · Sources · Scale · Reconstruct · Model · Deliver groups (contracts/reveng.md).
+    { "reveng_new",         "New Session",    "new_part",       "Reverse Eng", "Session",    true,  nullptr, false },
+    { "reveng_open",        "Open Session",   "open_part",      "Reverse Eng", "Session",    false, nullptr, false },
+    { "reveng_from_library","From Library",   "insert_component","Reverse Eng", "Session",   false, nullptr, false },
 };
 // clang-format on
 

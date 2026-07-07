@@ -706,7 +706,8 @@ struct AppState {
     // [workspace-tabs seam] Top-level workspace selected in the title bar. Drives which body fills
     // the central region (viewport / sketcher / sim / ecad / cam / plm / parts / ai) and which
     // ribbon set is visible. Title bar writes it; app.cpp routes on it; ribbon filters by it.
-    enum class Workspace { Model, Drawing, Simulate, Electronics, Manufacture, PLM, PartsLibrary, AI };
+    // RE-ANCHOR(reveng): append ReverseEng after AI (RE-03 workspace tab shell).
+    enum class Workspace { Model, Drawing, Simulate, Electronics, Manufacture, PLM, PartsLibrary, AI, ReverseEng };
     Workspace activeWorkspace = Workspace::Model;
     // Multi-document: sessions of CLOSED tabs that may still have an async RPC in flight. A
     // DocSession's PropertyManager / SketchMode / EvaluateDialogs capture `this` in their st.rpc
@@ -1229,12 +1230,24 @@ struct AppState {
     std::string plmProjectDir;
     std::string plmProjectPath() const {
         if (!plmProjectDir.empty()) return plmProjectDir;
+        // Prefer the active tab, but never the read-only MCP handoff mirror
+        // (its folder is %APPDATA%\...\handoff — not a user project). Fall back
+        // to the first real saved doc, then the workspace folder.
+        auto folderOf = [](const std::string& p) -> std::string {
+            size_t s = p.find_last_of("/\\");
+            return s == std::string::npos ? std::string() : p.substr(0, s);
+        };
         if (activeTab >= 0 && activeTab < (int)docTabs.size()) {
-            const std::string& p = docTabs[activeTab].path;
-            if (!p.empty()) {
-                size_t s = p.find_last_of("/\\");
-                if (s != std::string::npos) return p.substr(0, s);
+            const auto& t = docTabs[activeTab];
+            if (!t.aiHandoff && !t.path.empty()) {
+                std::string f = folderOf(t.path);
+                if (!f.empty()) return f;
             }
+        }
+        for (const auto& t : docTabs) {
+            if (t.aiHandoff || t.path.empty()) continue;
+            std::string f = folderOf(t.path);
+            if (!f.empty()) return f;
         }
         return workspaceDir;
     }

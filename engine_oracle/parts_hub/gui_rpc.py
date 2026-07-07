@@ -394,8 +394,17 @@ def _vendor_status(params: dict, _emit: Callable) -> dict:
         try:
             from services.browser import adapters as _adapters
             from services.browser import profiles as _profiles
+            # Only surface vendors whose login actually gates CAD/model/datasheet/
+            # footprint downloads. Commerce/link-out sites (Ace, Amazon, Home Depot,
+            # …) are intentionally hidden so users aren't asked to sign into them.
+            try:
+                _eligible = set(_adapters.login_wizard_sites())
+            except Exception:  # noqa: BLE001 — fall back to the full registry
+                _eligible = None
             for a in _adapters.all_adapters():
                 key = a.key
+                if _eligible is not None and key not in _eligible:
+                    continue
                 meta = _profiles.load_meta(key)
                 last = _login_results.get(key) or {}
                 sources.append({
@@ -545,6 +554,13 @@ def _vendors_health_check(params: dict, _emit: Callable) -> dict:
             from services.browser import health as _health  # noqa: PLC0415
         except Exception:  # noqa: BLE001 — module lands with the adapter workstream
             return {"ok": False, "error": "health module not available"}
+        try:
+            from services.browser.embed import get_manager
+            if get_manager().wizard_active():
+                return {"ok": True, "started": False, "deferred": True,
+                        "reason": "login_wizard_active"}
+        except Exception:  # noqa: BLE001
+            pass
 
         with _health_lock:
             if _health_running():

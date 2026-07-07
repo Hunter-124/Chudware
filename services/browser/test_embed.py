@@ -119,7 +119,7 @@ class _FakeChromium:
         self.launches: list[str] = []
 
     async def launch_persistent_context(self, user_data_dir, headless=True,
-                                        args=None, viewport=None):
+                                        args=None, viewport=None, **_kwargs):
         self.launches.append(str(user_data_dir))
         return self._make_context()
 
@@ -404,13 +404,71 @@ def test_classify_login_state_is_logged_in_hook():
 
 
 def test_start_url_for_site_login_url_fallback_base_url():
-    # no adapter currently defines LOGIN_URL → BASE_URL fallback
-    assert embed.start_url_for_site("grabcad") == "https://grabcad.com"
+    assert embed.start_url_for_site("grabcad") == "https://grabcad.com/login"
+    assert embed.start_url_for_site("amazon") == "https://www.amazon.com/ap/signin"
     assert embed.start_url_for_site("no-such-site") is None
+
+
+def test_classify_login_state_auth_url_never_logged_in():
+    # A sign-in URL must read login_page even when the page markup lacks the
+    # adapter's login-wall markers — otherwise the chip flashes "Signed in" on
+    # the very page the user signs in on. Post-login URLs still read logged_in.
+    empty = "<html><body>welcome</body></html>"
+    for site, url in [
+        ("grabcad", "https://grabcad.com/login"),
+        ("misumi", "https://us.misumi-ec.com/login"),
+        ("snapeda", "https://www.snapeda.com/account/login/"),
+        ("3dcontentcentral", "https://www.3dcontentcentral.com/Login.aspx"),
+    ]:
+        assert classify_login_state(site, empty, url) == "login_page", site
+    assert classify_login_state("grabcad", empty, "https://grabcad.com/dashboard") == "logged_in"
+
+
+def test_classify_login_state_traceparts_auth_urls():
+    # Live TraceParts sign-in HTML no longer carries the v1 wall markers; URL guard
+    # must keep the wizard from treating the sign-in/sign-up pages as logged_in.
+    plain = "<html><body>welcome</body></html>"
+    assert classify_login_state(
+        "traceparts", plain, "https://www.traceparts.com/en/sign-in") == "login_page"
+    assert classify_login_state(
+        "traceparts", plain, "https://www.traceparts.com/en/sign-up") == "login_page"
+    assert classify_login_state(
+        "traceparts", plain, "https://www.traceparts.com/en/search") == "logged_in"
 
 
 # ---------------------------------------------------------------------------
 # Login wizard
+
+def test_login_wizard_sites_excludes_commerce_only():
+    from services.browser import adapters
+    sites = set(adapters.login_wizard_sites())
+    assert "grabcad" in sites and "mcmaster" in sites and "traceparts" in sites
+    assert "acehardware" not in sites and "amazon" not in sites
+    assert "homedepot" not in sites
+
+
+def test_has_login_requires_live_verification_not_just_a_stamp(tmp_profiles):
+    site = _site("verify")
+    # A bare last_login_ts (window opened) must NOT count as signed in — this is
+    # the exact bug that made the wizard say "all vendor sites are already
+    # signed in" on sites the user never completed.
+    profiles.save_meta(site, last_login_ts=123.0)
+    assert profiles.has_login(site) is False
+    # Only a login_verified_ts (live logged_in confirmation) counts.
+    profiles.save_meta(site, login_verified_ts=456.0)
+    assert profiles.has_login(site) is True
+
+
+def test_wizard_default_sites_walks_all_even_with_stale_stamps(tmp_profiles):
+    from services.browser import adapters
+    mgr, _made = _make_manager()
+    # Stamp a bare last_login_ts (the stale/bogus kind) on every wizard site.
+    for k in adapters.login_wizard_sites():
+        profiles.save_meta(k, last_login_ts=1.0)
+    # Walk-all: every login-gated vendor is still offered (live detection, not a
+    # stamp, decides who actually needs signing in).
+    assert set(mgr._wizard_default_sites()) == set(adapters.login_wizard_sites())
+
 
 def test_wizard_iteration_skip_and_done(tmp_profiles):
     mgr, _made = _make_manager()
@@ -423,14 +481,26 @@ def test_wizard_iteration_skip_and_done(tmp_profiles):
     assert status["active"] and status["current_site"] == site_a
     assert status["remaining"] == [site_a, site_b] and status["done"] == []
 
-    # success on A → meta stamped, session B opens
+    # success on A → meta stamped, session B opens. wizard_next only records a
+    # "done" (vs "skipped") when the live session actually reached logged_in, so
+    # stage the state the user would have driven it to.
+    sid_a = res["embed_id"]
+    with mgr._sessions_lock:
+        s_a = mgr._sessions[sid_a]
+    with s_a.frame_lock:
+        s_a.login_state = "logged_in"
     nxt = mgr.wizard_next(skip=False)
     assert nxt["ok"] and nxt["current_site"] == site_b and nxt["done"] == [site_a]
     assert profiles.load_meta(site_a).get("last_login_ts")
+    # A live-verified sign-in stamps login_verified_ts → has_login now True.
+    assert profiles.load_meta(site_a).get("login_verified_ts")
+    assert profiles.has_login(site_a) is True
 
     # skip B → no meta, wizard finishes
     fin = mgr.wizard_next(skip=True)
     assert fin["all_done"] and fin["skipped"] == [site_b] and fin["done"] == [site_a]
+    # B was skipped (never logged_in) → not verified, not signed in.
+    assert profiles.has_login(site_b) is False
     assert not profiles.load_meta(site_b).get("last_login_ts")
 
     # wizard cleaned up → status inactive, next fails structurally
@@ -446,8 +516,61 @@ def test_wizard_auto_advances_on_logged_in(tmp_profiles):
     with mgr._sessions_lock:
         s = mgr._sessions[sid]
     with s.frame_lock:
+        s.login_state = "login_page"
+    mgr.wizard_status()  # records saw_auth_wall
+    with s.frame_lock:
         s.login_state = "logged_in"
-    status = mgr.wizard_status()  # detects logged_in → advances to site B
+    status = mgr.wizard_status()  # detects logged_in after auth wall → advances to site B
+    assert status["done"] == [site_a] and status["current_site"] == site_b
+    mgr.wizard_stop()
+
+
+def test_wizard_does_not_auto_advance_homepage_false_logged_in(tmp_profiles):
+    mgr, _made = _make_manager()
+    site_a, site_b = _site("wizhold"), _site("wizhold")
+    res = mgr.wizard_start([site_a, site_b])
+    sid = res["embed_id"]
+    with mgr._sessions_lock:
+        s = mgr._sessions[sid]
+    with s.frame_lock:
+        s.login_state = "logged_in"  # false positive (homepage w/o login-wall markers)
+    status = mgr.wizard_status()
+    assert status["current_site"] == site_a and status["done"] == []
+    mgr.wizard_stop()
+
+
+def test_wizard_does_not_auto_advance_on_sign_up_navigation(tmp_profiles, monkeypatch):
+    mgr, _made = _make_manager()
+    site_a, site_b = _site("wizsignup"), _site("wizsignup")
+    login_url = "https://www.traceparts.com/en/sign-in"
+    monkeypatch.setattr(embed, "start_url_for_site", lambda s: login_url)
+    monkeypatch.setattr(embed, "_opened_at_sign_in", lambda s: True)
+    res = mgr.wizard_start([site_a, site_b])
+    sid = res["embed_id"]
+    with mgr._sessions_lock:
+        s = mgr._sessions[sid]
+    with s.frame_lock:
+        s.login_state = "logged_in"  # false positive (stale markers)
+        s.url = "https://www.traceparts.com/en/sign-up"
+    status = mgr.wizard_status()
+    assert status["current_site"] == site_a and status["done"] == []
+    mgr.wizard_stop()
+
+
+def test_wizard_auto_advances_already_logged_in_redirect(tmp_profiles, monkeypatch):
+    mgr, _made = _make_manager()
+    site_a, site_b = _site("wizsess"), _site("wizsess")
+    login_url = "https://example.com/account/login/"
+    monkeypatch.setattr(embed, "start_url_for_site", lambda s: login_url)
+    monkeypatch.setattr(embed, "_opened_at_sign_in", lambda s: True)
+    res = mgr.wizard_start([site_a, site_b])
+    sid = res["embed_id"]
+    with mgr._sessions_lock:
+        s = mgr._sessions[sid]
+    with s.frame_lock:
+        s.login_state = "logged_in"
+        s.url = "https://example.com/home/"
+    status = mgr.wizard_status()
     assert status["done"] == [site_a] and status["current_site"] == site_b
     mgr.wizard_stop()
 
@@ -497,7 +620,7 @@ def test_rpc_degrades_without_playwright(monkeypatch, tmp_profiles):
         raise RuntimeError("playwright not installed")
     monkeypatch.setattr(mgr, "_import_async_playwright", _boom)
     monkeypatch.setattr(embed, "get_manager", lambda: mgr)
-    res = rpc.EMBED_WORKER_METHODS["browser_embed_start"]({"url": "https://x.test"}, None)
+    res = rpc.EMBED_WORKER_METHODS["login_wizard_start"]({}, None)
     assert res["ok"] is False and res["reason"] == "playwright_not_installed"
 
 
@@ -507,44 +630,14 @@ def test_rpc_import_error_maps_to_playwright_missing(monkeypatch):
     def _import_boom():
         raise ImportError("No module named 'playwright'")
     monkeypatch.setattr(embed, "get_manager", _import_boom)
-    res = rpc.EMBED_WORKER_METHODS["browser_embed_frame"]({"id": "x"}, None)
+    res = rpc.EMBED_WORKER_METHODS["login_wizard_status"]({}, None)
     assert res["ok"] is False and res["reason"] == "playwright_not_installed"
     assert "pip install playwright" in res["hint"]
 
 
-def test_rpc_full_envelope_roundtrip(monkeypatch, tmp_profiles):
-    rpc = _rpc()
-    mgr, _made = _make_manager()
-    monkeypatch.setattr(embed, "get_manager", lambda: mgr)
-    methods = rpc.EMBED_WORKER_METHODS
-
-    start = methods["browser_embed_start"]({"url": "https://example.test/",
-                                            "max_width": 640, "max_height": 480,
-                                            "quality": 40}, None)
-    assert start["ok"] and start["w"] == 640 and start["h"] == 480
-    sid = start["id"]
-    try:
-        deadline = time.monotonic() + 5
-        frame = None
-        while time.monotonic() < deadline:
-            frame = methods["browser_embed_frame"]({"id": sid}, None)
-            if frame.get("ok") and frame["seq"] > 0:
-                break
-            time.sleep(0.02)
-        assert frame and frame["ok"] and frame["seq"] > 0
-        assert base64.b64decode(frame["frame_b64"])[:2] == b"\xff\xd8"
-        # unchanged → frame_b64 omitted entirely
-        same = methods["browser_embed_frame"]({"id": sid, "since_seq": frame["seq"]}, None)
-        assert same["ok"] and "frame_b64" not in same and same["seq"] >= frame["seq"]
-
-        assert methods["browser_embed_input"](
-            {"id": sid, "events": [{"type": "mousemove", "x": 1, "y": 2}]}, None)["ok"]
-        nav = methods["browser_embed_navigate"]({"id": sid, "url": "https://example.test/n"}, None)
-        assert nav["ok"]
-    finally:
-        assert methods["browser_embed_stop"]({"id": sid}, None)["ok"]
-    gone = methods["browser_embed_frame"]({"id": sid}, None)
-    assert gone["ok"] is False and gone["reason"] == "no_such_session"
+# (test_rpc_full_envelope_roundtrip removed 2026-07-07: the browser_embed_* JPEG
+# screencast transport it exercised was deleted with the migration to the
+# in-process CEF browser. CEF render/input is covered on the C++ side.)
 
 
 def test_rpc_wizard_wrappers(monkeypatch, tmp_profiles):
@@ -565,11 +658,15 @@ def test_rpc_wizard_wrappers(monkeypatch, tmp_profiles):
 
 def test_rpc_registered_on_worker_seam():
     from engine_oracle.parts_hub.worker_rpc import WORKER_METHODS
-    for name in ("browser_embed_start", "browser_embed_frame", "browser_embed_input",
-                 "browser_embed_navigate", "browser_embed_stop",
+    # browser_embed_* (JPEG screencast transport) removed with the CEF migration;
+    # what remains is the URL resolver + the sign-in wizard state machine.
+    for name in ("browser_start_url",
                  "login_wizard_start", "login_wizard_status", "login_wizard_next",
                  "login_wizard_stop"):
         assert name in WORKER_METHODS, name
+    for gone in ("browser_embed_start", "browser_embed_frame", "browser_embed_input",
+                 "browser_embed_navigate", "browser_embed_stop"):
+        assert gone not in WORKER_METHODS, f"{gone} should have been removed"
 
 
 # ---------------------------------------------------------------------------

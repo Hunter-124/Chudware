@@ -252,6 +252,21 @@ except Exception as _parts_import_err:  # noqa: BLE001
         "engine_oracle.parts_hub.worker_rpc unavailable — part_search/get/place not registered: %s",
         _parts_import_err)
 # === end Parts library ===
+# === Reverse Engineering seam — list/get/start_session/add_images/ingest_datasheet ===
+# Worker surface for the RE tab (host/src/ui/reveng/) + the Parts Library
+# "Reverse-engineer this part" delivery action.  Thin bridge over the reveng
+# session store (services/mcp/reveng_tools) so the GUI reaches it via AsyncRpc
+# with no bespoke transport.  Gracefully absent when the RE suite isn't installed
+# (the tab degrades to "Reverse Eng tools unavailable").
+try:
+    from engine_oracle.reveng_rpc import REVENG_WORKER_METHODS as _REVENG_METHODS  # noqa: E402
+    _METHODS.update(_REVENG_METHODS)
+except Exception as _reveng_import_err:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger("ai-cad.worker").warning(
+        "engine_oracle.reveng_rpc unavailable — reverse-engineering RPCs not registered: %s",
+        _reveng_import_err)
+# === end Reverse Engineering ===
 # === BOM / sourcing seam (T-U4) — bom_rollup / bom_price / request_quote / match_part_number ===
 # Thin wrappers over engine.bom + engine.quote_providers + engine_oracle.spec_sheet_matcher,
 # exposed over the worker seam so the BOM panel (ui/imgui/src/ui/bom_panel.cpp) reaches them

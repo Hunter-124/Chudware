@@ -332,6 +332,42 @@ void insertItem(AppState& st, const PartsItem& item) {
     });
 }
 
+// Parts Library → Reverse Engineering delivery. For an un-modeled part (no CAD to
+// download), hand its photos/datasheet + identifying info to a fresh RE session so
+// the reversing workflow can reconstruct a model. Backend (reveng_start_session):
+// seeds any photos/datasheet recorded on the part (part_ref), and the research
+// seed (vendor URL → part number → name) drives RE-29's datasheet/web lane so the
+// session is populated with no further clicks.
+void sendToReverseEngineering(AppState& st, const PartsItem& item) {
+    nlohmann::json p;
+    p["name"]     = item.name.empty() ? std::string("Reverse-engineer part") : item.name;
+    p["part_ref"] = item.id;   // best-effort seed of on-part assets; harmless if not a hub record
+    // Research seed: a vendor listing URL (encoded in a catalog id as
+    // "catalog:<site>::<url>") is richest; else the MPN; else the name.
+    std::string research;
+    const auto up = item.id.find("::http");
+    if (up != std::string::npos)      research = item.id.substr(up + 2);
+    else if (!item.partNumber.empty()) research = item.partNumber;
+    else                               research = item.name;
+    if (!research.empty()) p["research"] = research;
+
+    st.rpc.call("reveng_start_session", p, [&st, name = item.name](const core::RpcResult& r) {
+        bool ok = r.ok && r.result.is_object() && r.result.value("ok", false);
+        if (ok) {
+            st.pendingRevengSessionId = r.result.value("session_id", "");
+            st.activeWorkspace = AppState::Workspace::ReverseEng;   // jump to the RE tab
+            st.toast(ui::ToastLevel::Success, "Sent to Reverse Engineering: " + name);
+        } else {
+            std::string why = r.ok
+                ? r.result.value("reason", std::string("could not start session"))
+                : r.err;
+            std::string hint = r.ok ? r.result.value("hint", "") : "";
+            st.toast(ui::ToastLevel::Error,
+                     "Reverse-engineer failed: " + why + (hint.empty() ? "" : ("  (" + hint + ")")));
+        }
+    });
+}
+
 void startVendorLogin(AppState& st, VendorEntry& v) {
     v.loginInProgress = true;
     nlohmann::json p;

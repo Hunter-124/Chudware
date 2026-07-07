@@ -24,6 +24,14 @@ static void itemActions(AppState& st, const PartsItem& item) {
     if (isCatalog) ImGui::SameLine();
     if (ImGui::SmallButton("Insert"))
         insertItem(st, item);
+    // Un-modeled parts (live vendor listings with no CAD to download) can be
+    // reconstructed instead: hand their photos/datasheet/specs to a new Reverse
+    // Engineering session. Offered on live results — the ones that often ship no model.
+    if (item.source == "live") {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reverse-engineer"))
+            sendToReverseEngineering(st, item);
+    }
 }
 
 static void itemTooltipAt(const PartsItem& item, bool hovered) {

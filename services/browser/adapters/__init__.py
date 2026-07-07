@@ -54,6 +54,25 @@ def all_adapters() -> list["SourceAdapter"]:
     return list(_REGISTRY.values())
 
 
+# Sites where the login wizard provisions a session needed to **download importable
+# CAD/ECAD artifacts** (STEP, IGES, symbol libraries, etc.). Commerce / link-out
+# vendors (Amazon, retail adapters, PCB quoting) are intentionally excluded —
+# they do not gate geometry acquisition behind a user login.
+_LOGIN_WIZARD_SITES: frozenset[str] = frozenset({
+    "3dcontentcentral",
+    "grabcad",
+    "mcmaster",
+    "misumi",
+    "snapeda",
+    "traceparts",
+})
+
+
+def login_wizard_sites() -> list[str]:
+    """Registered adapters that need a saved login to download models/libraries."""
+    return [a.key for a in all_adapters() if a.key in _LOGIN_WIZARD_SITES]
+
+
 def provenance_envelope(*, source_url: str, session_profile_used: str, license_note: str,
                         artifact_path: str | None = None, fetched_ts: str | None = None,
                         **extra: Any) -> dict:

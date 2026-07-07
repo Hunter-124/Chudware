@@ -18,7 +18,7 @@
 #include "core/app_state.h"
 #include "ui_theme.h"
 
-#include "ui/widgets/web_view.h"
+#include "ui/widgets/web_view_backend.h"
 
 #include "parts_internal.h"
 #include "parts_widgets.h"
@@ -29,7 +29,8 @@ namespace parts {
 namespace {
 
 struct WizardState {
-    ui::WebView web;
+    // Backend-agnostic (screencast today, CEF later) — see web_view_backend.h.
+    std::unique_ptr<ui::IWebViewBackend> web = ui::makeWebView();
     bool active     = false;   // login_wizard session live on the worker
     bool starting   = false;   // login_wizard_start in flight
     bool singleSite = false;   // launched from one vendor row's "Sign in"
@@ -38,6 +39,8 @@ struct WizardState {
     std::vector<std::string> done, skipped, remaining;
     bool   statusPending = false, actionPending = false;
     double lastStatusAt = 0.0;
+    std::string setupError;   // embed backend failed — rendered in-panel
+    std::string setupHint;
 };
 
 WizardState& W() {
@@ -51,17 +54,30 @@ std::string vendorLabel(const std::string& site) {
     return site;
 }
 
+// Point the web view at the wizard's current step. The screencast backend adopts
+// the worker-side embed session (embed_id); CEF has no worker embed, so it opens
+// the current site's sign-in URL in-process instead (usesWorkerEmbed()==false).
+void openWizardSite(AppState& st, const std::string& embedId) {
+    auto& w = W();
+    if (w.web->usesWorkerEmbed())
+        w.web->attach(st, embedId);
+    else if (!w.currentSite.empty())
+        w.web->open(st, w.currentSite, /*isUrl=*/false);
+}
+
 void closeWizard(AppState& st, bool sendStop) {
     auto& w = W();
     if (sendStop)
         st.rpc.call("login_wizard_stop", {}, [](const core::RpcResult&) {});
-    w.web.close(st);
+    w.web->close(st);
     w.active = w.starting = false;
     w.currentSite.clear();
     w.embedId.clear();
     w.done.clear();
     w.skipped.clear();
     w.remaining.clear();
+    w.setupError.clear();
+    w.setupHint.clear();
     S().browserWizardRequested = false;
     loadVendors(st, /*force=*/true);
 }
@@ -113,7 +129,7 @@ void applyWizardStatus(AppState& st, const nlohmann::json& j) {
     const std::string embed = j.value("embed_id", "");
     if (!embed.empty() && embed != w.embedId) {   // wizard advanced → new session
         w.embedId = embed;
-        w.web.attach(st, embed);
+        openWizardSite(st, embed);
     }
 }
 
@@ -182,7 +198,9 @@ void loginStateChip(const std::string& state) {
 
 // ---- public: engagement flag ----------------------------------------------------------
 
-bool browserPanelActive() { return S().browserWizardRequested; }
+bool browserPanelActive() {
+    return S().browserWizardRequested;
+}
 
 // ---- public: start the wizard (multi-vendor when site empty, else that one site) --------
 
@@ -201,6 +219,30 @@ void startLoginWizard(AppState& st, const std::string& site) {
         w.starting = false;
         const bool ok = r.ok && r.result.is_object() && r.result.value("ok", false);
         if (!ok) {
+            std::string reason = r.ok && r.result.is_object()
+                                     ? r.result.value("reason", std::string())
+                                     : r.err;
+            std::string hint = r.ok && r.result.is_object()
+                                   ? r.result.value("hint", std::string())
+                                   : std::string();
+            // Playwright/embed setup failures affect headed login too — don't fall back
+            // to vendor_login (it would toast "browser opened" while nothing appears).
+            const bool embedSetup =
+                reason == "playwright_not_installed" || reason == "embed_start_failed" ||
+                reason.find("playwright") != std::string::npos;
+            if (embedSetup || reason == "wizard_active") {
+                if (reason == "wizard_active")
+                    st.rpc.call("login_wizard_stop", {}, [](const core::RpcResult&) {});
+                w.setupError = embedSetup
+                                   ? "Embedded browser unavailable — Playwright/Chromium not installed"
+                                   : "Sign-in wizard is busy — close it and try again";
+                w.setupHint  = hint.empty()
+                                   ? "Run Settings → Repair runtime, or: pip install playwright && "
+                                     "playwright install chromium"
+                                   : hint;
+                st.toast(ui::ToastLevel::Error, w.setupError);
+                return;
+            }
             // Embed backend missing / failed → old headed vendor_login fallback.
             S().browserWizardRequested = false;
             if (!site.empty()) {
@@ -237,7 +279,7 @@ void startLoginWizard(AppState& st, const std::string& site) {
         const std::string embed = r.result.value("embed_id", "");
         if (!embed.empty()) {
             w.embedId = embed;
-            w.web.attach(st, embed);
+            openWizardSite(st, embed);
         }
         w.lastStatusAt = ImGui::GetTime();
     });
@@ -251,7 +293,7 @@ void drawBrowserPanel(AppState& st) {
 
     // Background work: WebView frame/input polling + wizard status watch (2 s, single-flight;
     // the worker auto-advances on logged_in — embed_id changes are picked up here).
-    w.web.update(st);
+    w.web->update(st);
     if (w.active && !w.statusPending && ImGui::GetTime() - w.lastStatusAt > 2.0)
         pollWizardStatus(st);
 
@@ -291,10 +333,10 @@ void drawBrowserPanel(AppState& st) {
 
         // Login-state chip.
         ImGui::SameLine(0.0f, 10.0f * sc);
-        loginStateChip(w.web.loginState());
+        loginStateChip(w.web->loginState());
 
         // Clipped dim URL (fills the gap up to the buttons).
-        const std::string& u = w.web.url();
+        const std::string& u = w.web->url();
         if (!u.empty()) {
             ImGui::SameLine(0.0f, 10.0f * sc);
             const float urlW =
@@ -329,7 +371,7 @@ void drawBrowserPanel(AppState& st) {
 
     // ---- body: the embedded page ----------------------------------------------------------
     const ImVec2 avail = ImGui::GetContentRegionAvail();
-    if (w.starting && !w.web.active()) {
+    if (w.starting && !w.web->active()) {
         // login_wizard_start still in flight.
         ImDrawList* dl  = ImGui::GetWindowDrawList();
         const ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -342,7 +384,29 @@ void drawBrowserPanel(AppState& st) {
         ImGui::Dummy(avail);
         return;
     }
-    w.web.draw(st, avail);
+    if (!w.setupError.empty()) {
+        ImDrawList* dl  = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + avail.y),
+                          Palette::toU32(palette.panelBg), 6.0f * sc);
+        const ImVec2 errTs = ImGui::CalcTextSize(w.setupError.c_str());
+        dl->AddText(ImVec2(p0.x + (avail.x - errTs.x) * 0.5f, p0.y + avail.y * 0.45f),
+                    Palette::toU32(palette.statusErr), w.setupError.c_str());
+        if (!w.setupHint.empty()) {
+            const float wrapW = avail.x - 40.0f * sc;
+            ImGui::PushTextWrapPos(p0.x + avail.x - 20.0f * sc);
+            ImGui::SetCursorScreenPos(ImVec2(p0.x + 20.0f * sc, p0.y + avail.y * 0.55f));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                       palette.textDisabled[2], 1.0f));
+            ImGui::TextWrapped("%s", w.setupHint.c_str());
+            ImGui::PopStyleColor();
+            ImGui::PopTextWrapPos();
+        }
+        ImGui::Dummy(avail);
+        return;
+    }
+    w.web->draw(st, avail);
 }
 
 }  // namespace parts

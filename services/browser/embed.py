@@ -43,14 +43,15 @@ import threading
 import time
 import uuid
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from engine.research.common import fail
 
-from . import challenge, profiles
+from . import challenge, profiles, stealth
 
-DEFAULT_MAX_WIDTH = 900
-DEFAULT_MAX_HEIGHT = 700
-DEFAULT_QUALITY = 60
+DEFAULT_MAX_WIDTH = 1280
+DEFAULT_MAX_HEIGHT = 900
+DEFAULT_QUALITY = 80
 
 #: Sessions with no frame() poll for this long are reaped (closed) automatically.
 IDLE_TIMEOUT_S = 600.0
@@ -61,7 +62,7 @@ _CLASSIFY_INTERVAL_S = 2.0
 #: Timeout for a single control-op hop onto the browser loop.
 _CALL_TIMEOUT_S = 30.0
 #: Fallback screenshot cadence (~5 fps) when CDP screencast is unavailable.
-_FALLBACK_FRAME_INTERVAL_S = 0.2
+_FALLBACK_FRAME_INTERVAL_S = 0.1
 
 #: Scratch profile shared by all site-less sessions (also serialised by a lock —
 #: ProcessSingleton applies to it just like to any real site profile).
@@ -69,6 +70,29 @@ _EPHEMERAL_PROFILE = "embed_default"
 
 _MOUSE_BUTTONS = {0: "left", 1: "middle", 2: "right",
                   "left": "left", "middle": "middle", "right": "right"}
+
+# Sign-in URLs for the login wizard. Homepages often lack login-wall markers, so
+# opening BASE_URL there gets misclassified as logged_in and auto-advances away.
+_SIGN_IN_URLS: dict[str, str] = {
+    "amazon": "https://www.amazon.com/ap/signin",
+    "grabcad": "https://grabcad.com/login",
+    "traceparts": "https://www.traceparts.com/en/sign-in",
+    "homedepot": "https://www.homedepot.com/auth/view/signin",
+    "lowes": "https://www.lowes.com/u/login",
+    "grainger": "https://www.grainger.com/account/sign-in",
+    "fastenal": "https://www.fastenal.com/login",
+    "harborfreight": "https://www.harborfreight.com/login",
+    "tractorsupply": "https://www.tractorsupply.com/tsc/login",
+    "acehardware": "https://www.acehardware.com/user/login",
+    "mcmaster": "https://www.mcmaster.com/orders/",
+    "misumi": "https://us.misumi-ec.com/login",
+    "digikey": "https://www.digikey.com/MyDigiKey/Login",
+    "lcsc": "https://www.lcsc.com/login",
+    "snapeda": "https://www.snapeda.com/account/login/",
+    "pcbway": "https://www.pcbway.com/Member/Login.aspx",
+    "jlcpcb": "https://passport.jlcpcb.com/login",
+    "3dcontentcentral": "https://www.3dcontentcentral.com/Login.aspx",
+}
 
 
 def _profile_busy(site: str) -> dict:
@@ -99,9 +123,58 @@ def _adapter_attr(adapter: Any, name: str) -> Any:
 
 
 def start_url_for_site(site: str) -> str | None:
-    """Adapter ``LOGIN_URL`` when present, else ``BASE_URL`` — the wizard/start page."""
+    """Adapter ``LOGIN_URL``/``login_url`` when present, else a known sign-in URL,
+    else ``BASE_URL`` — the wizard/start page."""
     adapter = _adapter_for(site)
-    return _adapter_attr(adapter, "LOGIN_URL") or _adapter_attr(adapter, "BASE_URL")
+    explicit = (_adapter_attr(adapter, "LOGIN_URL")
+                or _adapter_attr(adapter, "login_url"))
+    if explicit:
+        return explicit
+    # Per-site sign-in entry points for the login wizard (homepage ≠ login page).
+    slug = (site or "").strip().lower()
+    if slug in _SIGN_IN_URLS:
+        return _SIGN_IN_URLS[slug]
+    return _adapter_attr(adapter, "BASE_URL") or _adapter_attr(adapter, "base_url")
+
+
+def _opened_at_sign_in(site: str) -> bool:
+    """True when the wizard step opens a dedicated sign-in URL (not bare homepage)."""
+    adapter = _adapter_for(site)
+    explicit = (_adapter_attr(adapter, "LOGIN_URL")
+                or _adapter_attr(adapter, "login_url"))
+    if explicit:
+        return True
+    return (site or "").strip().lower() in _SIGN_IN_URLS
+
+
+# URL path fragments that still mean "auth flow" — not a post-login destination.
+# ``/login`` also covers ``/account/login``, ``/user/login`` and ``/Login.aspx``.
+_AUTH_PATH_FRAGMENTS: tuple[str, ...] = (
+    "/sign-in", "/signin", "/sign-up", "/signup", "/register",
+    "/login", "/account/login", "/user/login", "/auth/", "/ap/signin",
+)
+
+
+def _is_auth_url(url: str) -> bool:
+    u = (url or "").lower()
+    return any(frag in u for frag in _AUTH_PATH_FRAGMENTS)
+
+
+def _redirected_to_post_login(site: str, current_url: str) -> bool:
+    """True when the browser left the sign-in URL for a non-auth page (e.g. /home/)."""
+    if not current_url or _is_auth_url(current_url):
+        return False
+    start = start_url_for_site(site) or ""
+    if not start:
+        return False
+    su, cu = urlparse(start), urlparse(current_url)
+    if su.netloc and cu.netloc and su.netloc != cu.netloc:
+        return False
+    sign_path = (su.path or "/").rstrip("/").lower()
+    cur_path = (cu.path or "/").rstrip("/").lower()
+    if not sign_path or cur_path == sign_path:
+        return False
+    return True
 
 
 def classify_login_state(site: str | None, content: str | None, url: str) -> str:
@@ -114,6 +187,14 @@ def classify_login_state(site: str | None, content: str | None, url: str) -> str
     """
     if challenge.classify_challenge(content, url):
         return "challenge"
+    # A sign-in/registration URL is never a logged-in destination — guard it
+    # uniformly so the login-state chip can't flash "Signed in" on the very page
+    # the user is signing in on (adapter _LOGIN_WALL_MARKERS are page-markup
+    # guesses; this URL check is robust and site-agnostic). This also ensures the
+    # wizard records ``saw_auth_wall`` so it reliably auto-advances once the user
+    # actually signs in and leaves the auth URL.
+    if _is_auth_url(url):
+        return "login_page"
     adapter = _adapter_for(site)
     if adapter is None or not content:
         return "unknown"
@@ -144,6 +225,8 @@ class EmbedSession:
         self.h = h
         self.quality = quality
         self.created_ts = time.time()
+        self.chromium_version = stealth.FALLBACK_FULL_VERSION
+        self.user_agent = stealth.user_agent(stealth.FALLBACK_FULL_VERSION)
 
         # loop-thread-only Playwright handles
         self.context: Any = None
@@ -301,10 +384,16 @@ class EmbedManager:
     async def _open_session(self, s: EmbedSession, start_url: str, *, headless: bool) -> None:
         pw = await self._ensure_pw()
         profile_path = profiles.profile_dir(s.profile_name)
-        args = ["--headless=new"] if headless else []
+        # Shared anti-detection identity (see services/browser/stealth.py) — the
+        # scraping path and this wizard present ONE consistent fingerprint.
+        s.chromium_version = await stealth.chromium_version_async(pw)
+        s.user_agent = stealth.user_agent(s.chromium_version)
         s.context = await pw.chromium.launch_persistent_context(
-            str(profile_path), headless=headless, args=args,
-            viewport={"width": s.w, "height": s.h})
+            str(profile_path), headless=headless,
+            args=stealth.launch_args(headless=headless),
+            viewport={"width": s.w, "height": s.h},
+            **stealth.context_options(s.user_agent))
+        await stealth.harden_context_async(s.context)
         pages = list(getattr(s.context, "pages", []) or [])
         s.page = pages[0] if pages else await s.context.new_page()
         # Screencast BEFORE the first navigation: CDP only pushes frames on
@@ -338,6 +427,9 @@ class EmbedManager:
         """CDP push screencast; degrade to a ~5 fps screenshot poller on failure."""
         try:
             s.cdp = await s.context.new_cdp_session(s.page)
+            # Scrub "HeadlessChrome" from Sec-CH-UA (client hints) so it agrees
+            # with the UA header — reuse this screencast CDP session.
+            await stealth.apply_cdp_ua_async(s.cdp, s.user_agent, s.chromium_version)
 
             def _on_frame(params: dict) -> None:
                 try:
@@ -352,7 +444,7 @@ class EmbedManager:
             s.cdp.on("Page.screencastFrame", _on_frame)
             await s.cdp.send("Page.startScreencast", {
                 "format": "jpeg", "quality": s.quality,
-                "maxWidth": s.w, "maxHeight": s.h, "everyNthFrame": 2,
+                "maxWidth": s.w, "maxHeight": s.h, "everyNthFrame": 1,
             })
             s.screencast_active = True
         except Exception:  # noqa: BLE001 — CDP unavailable → screenshot fallback
@@ -372,16 +464,28 @@ class EmbedManager:
 
     async def _classify_loop(self, s: EmbedSession) -> None:
         """Throttled login_state classification: URL every tick (cheap), full
-        page.content() classification at most every _CLASSIFY_INTERVAL_S."""
+        page.content() classification at most every _CLASSIFY_INTERVAL_S (longer
+        while ``challenge`` so content() does not starve screencast/input)."""
+        last_content_ts = 0.0
         while True:
             try:
                 cur_url = getattr(s.page, "url", "") or ""
+                with s.frame_lock:
+                    prev_state = s.login_state
+                interval = (_CLASSIFY_INTERVAL_S * 3
+                            if prev_state == "challenge" else _CLASSIFY_INTERVAL_S)
                 content: str | None = None
-                try:
-                    content = await s.page.content()
-                except Exception:  # noqa: BLE001 — mid-navigation; retry next tick
-                    pass
-                state = classify_login_state(s.site, content, cur_url)
+                now = self._clock()
+                if now - last_content_ts >= interval:
+                    try:
+                        content = await s.page.content()
+                        last_content_ts = now
+                    except Exception:  # noqa: BLE001 — mid-navigation; retry next tick
+                        pass
+                if content is not None:
+                    state = classify_login_state(s.site, content, cur_url)
+                else:
+                    state = prev_state or "unknown"
                 with s.frame_lock:
                     s.url = cur_url
                     s.login_state = state
@@ -533,10 +637,20 @@ class EmbedManager:
 
     # --------------------------------------------------------------- wizard
 
+    def wizard_active(self) -> bool:
+        with self._wizard_lock:
+            return self._wizard is not None
+
     def _wizard_default_sites(self) -> list[str]:
+        # Walk EVERY login-gated vendor, not just the ones lacking a stamp. A
+        # saved session may have silently expired, and a stamp is not proof of a
+        # live login — so we always offer all of them and let the live per-site
+        # classification auto-advance the ones that are genuinely still signed
+        # in (see wizard_status). This is what guarantees the user is prompted
+        # for every provider that needs a login for downloads/datasheets.
         try:
             from . import adapters
-            return [a.key for a in adapters.all_adapters() if not profiles.has_login(a.key)]
+            return adapters.login_wizard_sites()
         except Exception:  # noqa: BLE001
             return []
 
@@ -552,9 +666,12 @@ class EmbedManager:
                 return {"ok": True, "sites": [], "all_done": True,
                         "current_site": None, "embed_id": None}
             self._wizard = {"sites": site_list, "idx": 0, "done": [], "skipped": [],
-                            "embed_id": None}
+                            "embed_id": None, "saw_auth_wall": False,
+                            "opened_at_sign_in": False}
         res = self._wizard_open_current()
         if not res.get("ok"):
+            with self._wizard_lock:
+                self._wizard = None
             return res
         return {"ok": True, "sites": site_list, "current_site": site_list[0],
                 "embed_id": res["id"], "all_done": False}
@@ -565,27 +682,53 @@ class EmbedManager:
             if wiz is None:
                 return fail("no_wizard", "login wizard is not running")
             site = wiz["sites"][wiz["idx"]]
-        res = self.start(site=site)  # start() navigates to LOGIN_URL/BASE_URL for a site
+        site_slug = str(site).strip().lower()
+        use_headless = True
+        res = self.start(site=site, max_width=1280, max_height=900, quality=80,
+                         headless=use_headless)
         if res.get("ok"):
             with self._wizard_lock:
                 if self._wizard is not None:
                     self._wizard["embed_id"] = res["id"]
+                    self._wizard["saw_auth_wall"] = False
+                    self._wizard["opened_at_sign_in"] = _opened_at_sign_in(site)
         return res
 
     def wizard_status(self) -> dict:
         """Current wizard position. Auto-advances when the live session has
-        reached ``login_state == "logged_in"`` (the other advance path is an
-        explicit :meth:`wizard_next` from the client)."""
+        reached ``login_state == "logged_in"`` **after** the user was shown a
+        login/challenge page on this step (prevents homepage false-positives).
+        The other advance path is an explicit :meth:`wizard_next` from the client."""
         with self._wizard_lock:
             wiz = self._wizard
             if wiz is None:
                 return {"ok": True, "active": False, "current_site": None, "embed_id": None,
                         "done": [], "remaining": [], "all_done": False}
             embed_id = wiz["embed_id"]
+            current_site = wiz["sites"][wiz["idx"]] if wiz["idx"] < len(wiz["sites"]) else ""
+        state = ""
         if embed_id is not None:
             s = self._get(embed_id)
-            if s is not None and s.snapshot(None)["login_state"] == "logged_in":
-                return self.wizard_next(skip=False)
+            if s is not None:
+                snap = s.snapshot(None)
+                state = snap["login_state"]
+                page_url = snap.get("url") or ""
+                if state in ("login_page", "challenge"):
+                    with self._wizard_lock:
+                        if self._wizard is not None:
+                            self._wizard["saw_auth_wall"] = True
+                saw_wall = False
+                opened_sign_in = False
+                with self._wizard_lock:
+                    if self._wizard is not None:
+                        saw_wall = bool(self._wizard.get("saw_auth_wall"))
+                        opened_sign_in = bool(self._wizard.get("opened_at_sign_in"))
+                redirected = (_redirected_to_post_login(current_site, page_url)
+                              if opened_sign_in else False)
+                should_advance = (state == "logged_in"
+                                  and (saw_wall or (opened_sign_in and redirected)))
+                if should_advance:
+                    return self.wizard_next(skip=False)
         return self._wizard_status_dict()
 
     def _wizard_status_dict(self) -> dict:
@@ -610,13 +753,22 @@ class EmbedManager:
                 return fail("no_wizard", "login wizard is not running")
             site = wiz["sites"][wiz["idx"]]
             embed_id = wiz["embed_id"]
+        current_state = "unknown"
+        if embed_id is not None:
+            s = self._get(embed_id)
+            if s is not None:
+                current_state = s.snapshot(None)["login_state"]
 
         if embed_id is not None:
             self.stop(embed_id)  # releases the site profile lock BEFORE save_meta
-        if not skip:
+        mark_logged_in = (not skip) and (current_state == "logged_in")
+        if mark_logged_in:
             try:
                 profiles.touch_created(site)
-                profiles.save_meta(site, last_login_ts=time.time())
+                # login_verified_ts is the signal has_login() trusts — set it ONLY
+                # here, where the live page actually classified as logged_in.
+                now = time.time()
+                profiles.save_meta(site, last_login_ts=now, login_verified_ts=now)
             except Exception:  # noqa: BLE001 — bookkeeping only
                 pass
 
@@ -624,9 +776,11 @@ class EmbedManager:
             wiz = self._wizard
             if wiz is None:
                 return fail("no_wizard", "login wizard is not running")
-            (wiz["skipped"] if skip else wiz["done"]).append(site)
+            (wiz["done"] if mark_logged_in else wiz["skipped"]).append(site)
             wiz["idx"] += 1
             wiz["embed_id"] = None
+            wiz["saw_auth_wall"] = False
+            wiz["opened_at_sign_in"] = False
             finished = wiz["idx"] >= len(wiz["sites"])
             if finished:
                 self._wizard = None

@@ -7,12 +7,18 @@ some catalog pages (same shape as TraceParts — see traceparts.py). This
 adapter never accepts those terms on the user's behalf; it detects the
 click-through and surfaces :func:`terms_confirmation_required` instead.
 
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live logged-in McMaster-Carr session (T-X6 gates the real
-per-source integration tests behind an env flag).
+NOTE (live-probe 2026-07-07): McMaster is a hierarchical catalog SPA. A flat
+``/{query}/`` fetch does NOT reach a product-results page — its client-side
+router lands on a CATEGORY-NAVIGATION grid (``<a class="category-tile">``), so
+``search`` returns those catalog sections (``kind="category"``) rather than
+SKUs. Reaching purchasable SKUs (and their STEP downloads) needs to follow the
+category tree or drive McMaster's search API — a per-site follow-up, tracked
+separately. The product-card / SKU / price regexes remain a best-effort shape
+for when a real product page IS reached and are not yet live-verified.
 """
 from __future__ import annotations
 
+import html
 import re
 
 from .. import session as _session
@@ -36,6 +42,17 @@ _TERMS_MARKERS = ('Accept the terms', 'class="cad-terms"', 'License agreement re
 _RESULT_RE = re.compile(
     r'<a[^>]+class="[^"]*product-card[^"]*"[^>]+href="(?P<href>/[0-9A-Za-z]+/?)"[^>]*>'
     r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
+# McMaster is a hierarchical catalog SPA: a flat "/{query}/" fetch lands on a
+# CATEGORY-NAVIGATION page (grid of <a class="category-tile" href="/products/...">
+# with a <span class="category-name">), NOT a product-results page (live-probe
+# 2026-07-07). Parse those tiles so the query returns real navigable catalog
+# categories instead of a silent empty list; reaching actual SKUs requires
+# following the tree (a per-site follow-up — see the module note).
+_CATEGORY_TILE_RE = re.compile(
+    r'<a[^>]+class="[^"]*category-tile[^"]*"[^>]+href="(?P<href>/[^"]+)"[^>]*>'
+    r'(?P<inner>.*?)</a>', re.IGNORECASE | re.DOTALL)
+_CATEGORY_NAME_RE = re.compile(
+    r'<span[^>]*class="[^"]*category-name[^"]*"[^>]*>(?P<name>[^<]+)</span>', re.IGNORECASE)
 _SKU_RE = re.compile(r'<span[^>]*class="[^"]*part-number[^"]*"[^>]*>(?P<sku>[^<]+)</span>', re.IGNORECASE)
 _PRICE_RE = re.compile(r'<span[^>]*class="[^"]*price[^"]*"[^>]*>\$(?P<price>[0-9,.]+)</span>', re.IGNORECASE)
 _DOWNLOAD_RE = re.compile(
@@ -43,7 +60,7 @@ _DOWNLOAD_RE = re.compile(
 
 
 def _strip_tags(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text).strip()
+    return html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
 
 
 class McMasterAdapter:
@@ -65,6 +82,20 @@ class McMasterAdapter:
                 "url": BASE_URL + m.group("href"),
                 "site": SITE,
                 "sku": sku_match.group("sku").strip() if sku_match else None,
+            })
+        if hits:
+            return hits
+        # No product cards → we're on a catalog-navigation page. Return the real
+        # category tiles as typed "category" results (honest: these are catalog
+        # sections to drill into, not SKUs) instead of a misleading empty list.
+        for m in _CATEGORY_TILE_RE.finditer(content):
+            name = _CATEGORY_NAME_RE.search(m.group("inner"))
+            hits.append({
+                "title": html.unescape(name.group("name").strip()) if name
+                         else _strip_tags(m.group("inner")),
+                "url": BASE_URL + m.group("href"),
+                "site": SITE,
+                "kind": "category",   # navigable catalog section, not a purchasable SKU
             })
         return hits
 

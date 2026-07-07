@@ -18,7 +18,7 @@ import time
 from typing import Any
 
 from . import profiles
-from .adapters import all_adapters, get_adapter
+from .adapters import all_adapters, get_adapter, login_wizard_sites
 
 #: One cheap, representative query per registered site — kept in sync with the
 #: adapter registry (test_retail_adapters.py asserts full coverage).
@@ -99,6 +99,10 @@ def _check_site(site: str) -> dict[str, Any]:
         if reason in _EXPECTED_FAIL_REASONS:
             result["error"] = "login_required" if reason in ("login_required", "no_profile") else reason
             result["expected"] = True
+            # Live signal beats the stamp: hitting a login wall means the saved
+            # session is NOT authenticated (never was, or expired since).
+            if reason in ("login_required", "no_profile"):
+                result["logged_in"] = False
         else:
             result["error"] = reason
     else:
@@ -112,8 +116,18 @@ def run_health_check(sites: list[str] | None = None) -> list[dict[str, Any]]:
     Returns one ``{site, ok, latency_ms, logged_in, hit_count, error[, expected]}``
     dict per site, in input/registry order. Never raises.
     """
+    try:
+        from .embed import get_manager
+        if get_manager().wizard_active():
+            return []
+    except Exception:  # noqa: BLE001 — health must never raise
+        pass
     if sites is None:
-        registered = [a.key for a in all_adapters()]
+        # Only the vendors that gate CAD/datasheet/footprint downloads behind a
+        # login (login_wizard_sites) — commerce/link-out sites (Ace, Amazon, Home
+        # Depot, …) are not part of the "Test vendors" surface. Fall back to the
+        # full registry if the wizard-site list is unavailable/empty.
+        registered = login_wizard_sites() or [a.key for a in all_adapters()]
         # Registry order first, then any canary-only leftovers (defensive).
         sites = registered + [s for s in CANARY_QUERIES if s not in registered]
     out = []

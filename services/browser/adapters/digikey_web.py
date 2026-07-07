@@ -7,12 +7,30 @@ website under the user's own saved browser session instead: search returns
 part cards with price/stock; `acquire` returns a structured price/stock
 record plus datasheet + ECAD (symbol/footprint) links for ecad_find_part.
 
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live DigiKey session (T-X6 gates the real per-source integration
-tests behind an env flag).
+NOTE (live-verified 2026-07-07, fetch of
+``/en/products/result?keywords=resistor``): DigiKey's results page is a
+Next.js app that embeds its data in
+``<script id="__NEXT_DATA__" type="application/json">``. The verified live
+shape is ``props.pageProps.envelope.data.topResults`` — for a broad/ambiguous
+keyword this is a list of ~22 CATEGORY tiles
+(``categoryName``/``categoryUrl``/``parentCategory``/``productCount``/``id``),
+i.e. a disambiguation page, NOT product cards. There are no manufacturer /
+DigiKey part-number / price fields anywhere in the JSON for this page; the old
+speculative CSS-class regexes (``product-title``, ``digikey-part-number``,
+``price``) never matched the live DOM ("no hits parsed" bug). ``search`` now
+parses the embedded JSON and returns those tiles as typed ``kind="category"``
+results (honest: navigable catalog sections to drill into, not purchasable
+SKUs) — mirroring the McMaster adapter's identical category-navigation case.
+Reaching actual SKUs (and their part numbers/price/datasheet/ECAD links)
+requires following ``categoryUrl`` — a per-site follow-up tracked separately.
+Whether a NARROW query (a specific MPN) returns a product-results array under a
+different ``envelope.data`` key was NOT observed in this fixture. ``acquire``
+below is left as-is (best-effort detail-page shape, not part of this rewrite).
 """
 from __future__ import annotations
 
+import html
+import json
 import re
 
 from .. import session as _session
@@ -32,10 +50,12 @@ LICENSE_NOTE = (
 )
 
 _LOGIN_WALL_MARKERS = ('Sign In', 'id="signInName"', 'class="login-form"')
-# Best-effort: DigiKey search result rows link to /en/products/detail/<...>.
-_RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*product-title[^"]*"[^>]+href="(?P<href>/en/products/detail/[^"?#]+)"[^>]*>'
-    r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
+# Live-verified 2026-07-07: DigiKey embeds its results data in a Next.js
+# __NEXT_DATA__ JSON blob. Extract the raw JSON here, then read
+# props.pageProps.envelope.data.topResults from it (see module docstring).
+_NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__"[^>]*>(?P<json>.*?)</script>', re.DOTALL)
+# --- acquire() detail-page markers (best-effort, unchanged / not rewritten) ---
 _DKPN_RE = re.compile(
     r'<span[^>]*class="[^"]*digikey-part-number[^"]*"[^>]*>(?P<dkpn>[^<]+)</span>', re.IGNORECASE)
 _PRICE_RE = re.compile(r'<span[^>]*class="[^"]*price[^"]*"[^>]*>\$(?P<price>[0-9,.]+)</span>',
@@ -63,19 +83,41 @@ class DigiKeyWebAdapter:
         content = result.get("content", "")
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
             return [login_required(SITE, url)]
+
+        # Live-verified shape: results live in the embedded __NEXT_DATA__ JSON at
+        # props.pageProps.envelope.data.topResults (a list of category tiles for a
+        # broad/ambiguous keyword — a disambiguation page). Parse the JSON; no
+        # speculative CSS-class regex. Empty is honest.
+        m = _NEXT_DATA_RE.search(content)
+        if not m:
+            return []
+        try:
+            data = json.loads(m.group("json"))
+        except (ValueError, TypeError):
+            return []
+        top_results = (
+            data.get("props", {})
+            .get("pageProps", {})
+            .get("envelope", {})
+            .get("data", {})
+            .get("topResults", [])
+        )
         hits = []
-        for m in _RESULT_RE.finditer(content):
-            card = m.group("title")
-            dkpn_match = _DKPN_RE.search(card)
-            price_match = _PRICE_RE.search(card)
-            stock_match = _STOCK_RE.search(card)
+        for entry in top_results:
+            if not isinstance(entry, dict):
+                continue
+            rel = entry.get("categoryUrl", "")
+            name = entry.get("categoryName")
+            if not rel or not name:
+                continue
             hits.append({
-                "title": _strip_tags(card),
-                "url": BASE_URL + m.group("href"),
+                "title": html.unescape(name).strip(),
+                "url": BASE_URL + rel if rel.startswith("/") else rel,
                 "site": SITE,
-                "digikey_pn": dkpn_match.group("dkpn").strip() if dkpn_match else None,
-                "price": ("$" + price_match.group("price")) if price_match else None,
-                "stock": stock_match.group("stock") if stock_match else None,
+                "kind": "category",   # navigable catalog section, not a purchasable SKU
+                "parent_category": entry.get("parentCategory"),
+                "product_count": entry.get("productCount"),
+                "category_id": entry.get("id"),
             })
         return hits
 

@@ -2,13 +2,22 @@
 
 Commerce-only, like amazon.py: link-out + a small price/spec record copied with
 provenance, never a downloadable CAD file. Home Depot fronts with Akamai bot
-protection (HIGH risk): an "Access Denied" / "Reference #" interstitial is
-treated exactly like a login wall — degrade to ``login_required``, never
-solve or bypass.
+protection (HIGH risk): a bot interstitial is treated exactly like a login wall
+— degrade to ``login_required``, never solve or bypass.
+
+NOTE (live-probe 2026-07-07): an anonymous headless fetch of ``/s/{query}`` does
+NOT reach a product-results page — Home Depot's bot management serves a 200 OK
+error shell titled "Error Page" whose body reads "Oops!! Something went wrong.
+Please refresh page" (setting ``_bman_adv`` / ``_abck`` bot cookies), and it
+carries NONE of the classic Akamai "Access Denied" / "Reference #" markers.
+Without a marker for this specific shell the page parsed to zero JSON-LD
+products and reported a confusing "no hits parsed" instead of a clean bot-wall
+degradation, so the challenge markers below include it. Reaching real products
+needs a signed-in / less-bot-flagged session (browser_login).
 
 Parse strategy: JSON-LD Product records (search + product pages both ship
-them); the model number doubles as the SKU; product images live on
-thdstatic.com.
+them) once a real page IS reached; the model number doubles as the SKU;
+product images live on thdstatic.com.
 """
 from __future__ import annotations
 
@@ -27,8 +36,12 @@ LICENSE_NOTE = (
 )
 
 _LOGIN_WALL_MARKERS = ('id="username"', "Sign in to your account", "Sign In or Create Account")
-# Akamai bot wall — never bypass, treat exactly like a login wall.
-_CHALLENGE_MARKERS = ("Access Denied", "Reference #", "Request unsuccessful")
+# Akamai / bot-management walls — never bypass, treat exactly like a login wall.
+# "Oops!! Something went wrong. Please refresh page" is the 200-OK bot-management
+# error shell served to anonymous headless traffic (live-probe 2026-07-07); the
+# other markers cover the classic Akamai interstitial variants.
+_CHALLENGE_MARKERS = ("Access Denied", "Reference #", "Request unsuccessful",
+                      "Oops!! Something went wrong", "Please refresh page")
 
 
 class HomeDepotAdapter(RetailAdapter):

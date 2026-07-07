@@ -40,12 +40,22 @@ def adapter_mods(tmp_path, monkeypatch):
     importlib.reload(engine_paths)
 
 
-MISUMI_SEARCH_HTML = """
-<html><body>
-<a class="product-name" href="/vona2/detail/110302634310/">Linear Shaft
-<span class="part-number">PSFJ6-100</span><span class="price">$4.56</span></a>
-</body></html>
-"""
+# Real live shape (verified 2026-07-07): results are embedded in a Next.js
+# `<script id="__NEXT_DATA__">` blob at
+# props.pageProps.hawksearchKeywordSearchResponse.Results, each a configurable
+# SERIES (empty sku, no price on the results page). See test_misumi_parser.py
+# for the full verbatim slice. The old product-name/part-number markup was
+# speculative and never matched the live DOM.
+MISUMI_SEARCH_HTML = (
+    '<script id="__NEXT_DATA__" type="application/json">'
+    '{"props":{"pageProps":{"hawksearchKeywordSearchResponse":{"Results":['
+    '{"DocId":"M0101000000_threaded-linear-shafts","Score":100.0,"Document":{'
+    '"url_detail":["/vona2/mech/M0100000000/M0101000000/threaded-linear-shafts/"],'
+    '"unique_id":["M0101000000_threaded-linear-shafts"],'
+    '"name":["Threaded Linear Shafts"],"sku":[""]}}'
+    ']}}},"page":"/result"}'
+    '</script>'
+)
 
 MISUMI_LOGIN_WALL_HTML = '<html><body>Please log in <div id="loginId"></div></body></html>'
 
@@ -75,12 +85,21 @@ LCSC_DETAIL_HTML = """
 </body></html>
 """
 
-DIGIKEY_SEARCH_HTML = """
-<html><body>
-<a class="product-title" href="/en/products/detail/stmicroelectronics/STM32F103C8T6/1646338">STM32F103C8T6
-<span class="digikey-part-number">497-6063-ND</span><span class="price">$3.75</span><span class="stock">8,200 in stock</span></a>
-</body></html>
-"""
+# Real live shape (verified 2026-07-07): a keyword search lands on DigiKey's
+# category-disambiguation page — results are embedded in a Next.js
+# `<script id="__NEXT_DATA__">` blob at props.pageProps.envelope.data.topResults,
+# each a CATEGORY tile (categoryName/categoryUrl/parentCategory/productCount/id),
+# NOT a product. Same case McMaster handles. See test_digikey_parser.py for the
+# full slice. The old product-title/digikey-part-number markup was speculative.
+DIGIKEY_SEARCH_HTML = (
+    '<script id="__NEXT_DATA__" type="application/json">'
+    '{"props":{"pageProps":{"envelope":{"data":{"topResults":['
+    '{"categoryName":"Chip Resistor - Surface Mount",'
+    '"categoryUrl":"/en/products/filter/chip-resistor-surface-mount/52",'
+    '"parentCategory":"Resistors","productCount":"1,204,216","id":"52"}'
+    ']}}}}}'
+    '</script>'
+)
 
 DIGIKEY_LOGIN_WALL_HTML = '<html><body>Sign In <div id="signInName"></div></body></html>'
 
@@ -160,10 +179,13 @@ def test_misumi_search_parses_result_cards(adapter_mods, monkeypatch):
 
     assert len(hits) == 1
     assert "Linear Shaft" in hits[0]["title"]
-    assert hits[0]["url"] == "https://us.misumi-ec.com/vona2/detail/110302634310/"
+    assert hits[0]["url"] == (
+        "https://us.misumi-ec.com/vona2/mech/M0100000000/M0101000000/threaded-linear-shafts/")
     assert hits[0]["site"] == "misumi"
-    assert hits[0]["part_number"] == "PSFJ6-100"
-    assert hits[0]["price"] == "$4.56"
+    assert hits[0]["part_number"] == "M0101000000_threaded-linear-shafts"
+    assert hits[0]["kind"] == "series"
+    # empty sku on the real results page → no invented value emitted
+    assert "sku" not in hits[0]
 
 
 def test_misumi_search_login_wall_surfaces_ask_user(adapter_mods, monkeypatch):
@@ -343,16 +365,16 @@ def test_digikey_search_parses_result_cards(adapter_mods, monkeypatch):
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, site: {"ok": True, "content": DIGIKEY_SEARCH_HTML})
 
-    hits = digikey_web.ADAPTER.search("stm32f103c8t6")
+    hits = digikey_web.ADAPTER.search("resistor")
 
     assert len(hits) == 1
-    assert "STM32F103C8T6" in hits[0]["title"]
-    assert hits[0]["url"] == ("https://www.digikey.com/en/products/detail/"
-                              "stmicroelectronics/STM32F103C8T6/1646338")
+    assert hits[0]["title"] == "Chip Resistor - Surface Mount"
+    assert hits[0]["url"] == ("https://www.digikey.com/en/products/filter/"
+                              "chip-resistor-surface-mount/52")
     assert hits[0]["site"] == "digikey"
-    assert hits[0]["digikey_pn"] == "497-6063-ND"
-    assert hits[0]["price"] == "$3.75"
-    assert hits[0]["stock"] == "8,200"
+    assert hits[0]["kind"] == "category"
+    assert hits[0]["parent_category"] == "Resistors"
+    assert hits[0]["category_id"] == "52"
 
 
 def test_digikey_search_login_wall_surfaces_ask_user(adapter_mods, monkeypatch):

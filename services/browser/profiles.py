@@ -88,10 +88,17 @@ def ensure_profile(site: str) -> Path:
 
 
 def has_login(site: str) -> bool:
-    """True only when the user completed a real sign-in for ``site``
-    (``browser_login`` / the login wizard stamp ``last_login_ts``).  A mere
-    profile dir no longer implies a login — anonymous fetches auto-create one."""
-    return bool(load_meta(site).get("last_login_ts"))
+    """True only when a LIVE check confirmed an authenticated session for
+    ``site`` — a ``login_verified_ts`` stamp set by the login wizard / headed
+    ``browser_login`` ONLY after the post-login page actually classified as
+    logged_in.
+
+    Deliberately does NOT trust ``last_login_ts`` alone: that stamp merely
+    records "a sign-in window was opened/closed" and was historically written
+    even when the user never completed (or a false-positive fired), which made
+    the wizard wrongly report "all vendor sites are already signed in". A mere
+    profile dir never counted either (anonymous fetches auto-create one)."""
+    return bool(load_meta(site).get("login_verified_ts"))
 
 
 def _meta_path(site: str) -> Path:

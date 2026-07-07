@@ -1,0 +1,103 @@
+# host/cmake/cef.cmake — wire the CEF off-screen browser backend into AI-CAD.
+#
+# Included ONLY when AI_CAD_ENABLE_CEF=ON (see host/CMakeLists.txt). Follows the
+# canonical CEF binary-distribution integration (cefsimple pattern): find the
+# SDK, build libcef_dll_wrapper from source, add the libcef_lib logical target,
+# compile the cef/ backend into AI-CAD + the subprocess helper, and stage the
+# CEF runtime (libcef.so + *.pak + locales + helper) next to the binary.
+#
+#   cmake -S host -B host/build-cef -DAI_CAD_ENABLE_CEF=ON \
+#         -DCEF_ROOT=extern/cef/cef_binary_..._linux64_minimal
+#
+# CEF_ROOT defaults to the checked-out SDK under extern/cef if unset. Its Chromium
+# version must match the Playwright-bundled Chromium (149 — see stealth.py) so
+# cookies interoperate.
+
+if(NOT DEFINED CEF_ROOT OR CEF_ROOT STREQUAL "")
+  file(GLOB _cef_candidates "${CMAKE_CURRENT_SOURCE_DIR}/../extern/cef/cef_binary_*")
+  if(_cef_candidates)
+    list(GET _cef_candidates 0 CEF_ROOT)
+  endif()
+endif()
+if(NOT CEF_ROOT OR NOT EXISTS "${CEF_ROOT}")
+  message(FATAL_ERROR
+    "AI_CAD_ENABLE_CEF=ON but no CEF SDK found. Download a CEF binary distribution "
+    "(Chromium ~149 to match the scraper) into extern/cef/ or pass -DCEF_ROOT=<dir>. "
+    "See docs/cef_webview.md.")
+endif()
+
+# The minimal distribution ships Release binaries only — build CEF bits Release.
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+
+list(APPEND CMAKE_MODULE_PATH "${CEF_ROOT}/cmake")
+set(CEF_ROOT "${CEF_ROOT}" CACHE INTERNAL "" FORCE)
+find_package(CEF REQUIRED)                       # sets CEF_* vars + macros
+add_subdirectory("${CEF_ROOT}/libcef_dll" libcef_dll_wrapper)
+add_logical_target("libcef_lib" "${CEF_LIB_DEBUG}" "${CEF_LIB_RELEASE}")
+set_cef_target_out_dir()                         # → CEF_TARGET_OUT_DIR
+
+# --- OSR backend sources compiled INTO AI-CAD (guarded by the compile define) ---
+target_sources(AI-CAD PRIVATE
+  src/ui/widgets/cef/cef_web_view.cpp
+  src/ui/widgets/cef/cef_rpc_bridge.cpp        # AppState/RPC side — NO CEF headers, stays C++17
+  src/ui/widgets/cef/cef_osr_shot.cpp          # headless OSR render-to-PNG (--cef-shot)
+  src/ui/widgets/cef/cef_app.cpp
+  src/ui/widgets/cef/cef_platform_linux.cpp)   # Windows swaps this in cef.cmake's WIN32 branch below
+if(WIN32)
+  target_sources(AI-CAD PRIVATE src/ui/widgets/cef/cef_platform_windows.cpp)
+  # (remove the linux TU from the WIN32 build)
+  get_target_property(_srcs AI-CAD SOURCES)
+  list(REMOVE_ITEM _srcs src/ui/widgets/cef/cef_platform_linux.cpp)
+  set_target_properties(AI-CAD PROPERTIES SOURCES "${_srcs}")
+endif()
+
+target_compile_definitions(AI-CAD PRIVATE AI_CAD_ENABLE_CEF=1)
+target_include_directories(AI-CAD PRIVATE "${CEF_ROOT}")
+target_link_libraries(AI-CAD PRIVATE libcef_lib libcef_dll_wrapper ${CEF_STANDARD_LIBS})
+
+# Load the STAGED libcef.so (next to the binary), not the SDK's build-time copy.
+# CEF's Chrome runtime resolves icudtl.dat / *.pak relative to libcef.so's dir,
+# and we stage those next to the binary — so libcef.so must load from $ORIGIN.
+# (The helper already gets this via set_executable_target_properties.)
+set_property(TARGET AI-CAD APPEND PROPERTY BUILD_RPATH "$ORIGIN")
+set_property(TARGET AI-CAD APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
+
+# CEF 149 headers use C++20 concepts (std::same_as, …). The host is C++17; only
+# the cef/*.cpp TUs include CEF headers, so bump JUST those to C++20 (ABI-
+# compatible with the C++17 objects at link time). cef_web_view.h itself is
+# CEF-free, so nothing else needs bumping.
+set_source_files_properties(
+  src/ui/widgets/cef/cef_web_view.cpp
+  src/ui/widgets/cef/cef_osr_shot.cpp
+  src/ui/widgets/cef/cef_app.cpp
+  src/ui/widgets/cef/cef_platform_linux.cpp
+  src/ui/widgets/cef/cef_platform_windows.cpp
+  PROPERTIES COMPILE_OPTIONS "-std=c++20")
+
+# --- mandatory subprocess helper (its own executable) ---------------------------
+# CEF's render/GPU/utility processes re-exec this; CefExecuteProcess() dispatches
+# them. Must sit next to AI-CAD at runtime.
+add_executable(ai_cad_cef_helper
+  src/ui/widgets/cef/cef_helper_main.cpp
+  src/ui/widgets/cef/cef_app.cpp)
+if(WIN32)
+  target_sources(ai_cad_cef_helper PRIVATE src/ui/widgets/cef/cef_platform_windows.cpp)
+else()
+  target_sources(ai_cad_cef_helper PRIVATE src/ui/widgets/cef/cef_platform_linux.cpp)
+endif()
+set_executable_target_properties(ai_cad_cef_helper)
+target_compile_definitions(ai_cad_cef_helper PRIVATE AI_CAD_ENABLE_CEF=1)
+target_include_directories(ai_cad_cef_helper PRIVATE "${CEF_ROOT}" ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(ai_cad_cef_helper libcef_lib libcef_dll_wrapper ${CEF_STANDARD_LIBS})
+
+# --- stage the CEF runtime next to AI-CAD ---------------------------------------
+set(CEF_TARGET_OUT_DIR "$<TARGET_FILE_DIR:AI-CAD>")
+copy_files(AI-CAD "${CEF_BINARY_FILES}"   "${CEF_BINARY_DIR}"   "${CEF_TARGET_OUT_DIR}")
+copy_files(AI-CAD "${CEF_RESOURCE_FILES}" "${CEF_RESOURCE_DIR}" "${CEF_TARGET_OUT_DIR}")
+add_custom_command(TARGET AI-CAD POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "$<TARGET_FILE:ai_cad_cef_helper>" "${CEF_TARGET_OUT_DIR}")
+
+message(STATUS "AI-CAD: CEF backend enabled (CEF_ROOT=${CEF_ROOT}).")

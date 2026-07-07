@@ -16,7 +16,11 @@ include(FetchContent)
 # <select>/clipboard/autofill). Requires a CEF binary distribution; point
 # CEF_ROOT at it. See docs/cef_webview.md and cmake/cef.cmake. The build stays
 # green with this OFF so CI and contributors never need the ~1 GB CEF SDK.
-option(AI_CAD_ENABLE_CEF "Build the in-process CEF off-screen browser backend" OFF)
+# CEF is THE embedded-browser backend since the screencast removal (2026-07-07).
+# Default ON: a normal build carries the vendor sign-in browser. Requires the CEF
+# SDK under extern/cef/ (see cmake/cef.cmake / docs/cef_webview.md). Turn OFF only
+# for an SDK-less build — makeWebView then returns a NullWebView (no browser).
+option(AI_CAD_ENABLE_CEF "Build the in-process CEF off-screen browser backend" ON)
 
 # --- GLFW (window + GL context) ---------------------------------------------
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
@@ -151,8 +155,7 @@ add_executable(AI-CAD
   src/ui/icons.cpp
   src/ui/icons_sdf.cpp  # liquid-glass v2: runtime SDF glyphs + halo (drawIconGlass)
   src/ui/widgets/ribbon.cpp
-  src/ui/widgets/web_view.cpp          # ScreencastWebView: browser_embed_* JPEG stream (default)
-  src/ui/widgets/web_view_backend.cpp  # IWebViewBackend factory (screencast vs CEF)
+  src/ui/widgets/web_view_backend.cpp  # IWebViewBackend factory → CEF (or NullWebView without the SDK)
   src/ui/ribbon_def.cpp
   # --- end C14 ---
   # --- [parts-plm sources] workspace bodies (parts-port agent appends here) ---

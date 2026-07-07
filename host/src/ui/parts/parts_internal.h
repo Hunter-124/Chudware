@@ -203,6 +203,7 @@ void doSearch(AppState& st);
 void pollQueue(AppState& st);
 void queueDownload(AppState& st, const PartsItem& item);
 void insertItem(AppState& st, const PartsItem& item);
+void sendToReverseEngineering(AppState& st, const PartsItem& item);
 void startVendorLogin(AppState& st, VendorEntry& v);
 void saveApiCreds(AppState& st, ApiProvider& a);
 

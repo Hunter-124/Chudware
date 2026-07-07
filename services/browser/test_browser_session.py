@@ -70,7 +70,7 @@ class _FakeChromium:
         self._status = status
         self.last_context: _FakeContext | None = None
 
-    def launch_persistent_context(self, user_data_dir, headless=True):
+    def launch_persistent_context(self, user_data_dir, headless=True, **_kwargs):
         self.launched.append((user_data_dir, headless))
         ctx = _FakeContext(self._html, self._status)
         self.last_context = ctx

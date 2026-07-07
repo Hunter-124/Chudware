@@ -39,7 +39,7 @@ from typing import Any, Callable
 
 from engine.research.common import fail, now_ts
 
-from . import challenge, profiles, ratelimit
+from . import challenge, profiles, ratelimit, stealth
 
 #: browser_login re-checks the page for a captcha/2FA prompt this often (seconds)
 #: while waiting for the user to finish and close the window.
@@ -50,6 +50,12 @@ _LOGIN_POLL_INTERVAL_S = 2.0
 DEFAULT_LOGIN_TIMEOUT_S = 300.0
 #: Navigation timeout (seconds) for a single browser_fetch page load.
 DEFAULT_NAV_TIMEOUT_S = 30.0
+#: After navigation, how long (seconds) to let the network settle so XHR-driven
+#: single-page-app catalogs (McMaster, Misumi, DigiKey, Amazon, Home Depot, …)
+#: finish rendering their product cards before we snapshot the DOM. Bounded and
+#: best-effort — a chatty page that never idles just gets snapshotted at the
+#: deadline (still far better than the pre-render empty shell).
+DEFAULT_RENDER_SETTLE_S = 8.0
 
 
 def _busy(site: str) -> dict:
@@ -97,20 +103,29 @@ def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callabl
     challenge_detected: str | None = None
     try:
         with sync_playwright() as pw:
-            context = pw.chromium.launch_persistent_context(str(profile_path), headless=False)
+            ver = stealth.chromium_version_sync(pw)
+            ua  = stealth.user_agent(ver)
+            context = pw.chromium.launch_persistent_context(
+                str(profile_path), headless=False,
+                args=stealth.launch_args(headless=False), **stealth.context_options(ua))
+            stealth.harden_context_sync(context)
             try:
                 page = context.pages[0] if context.pages else context.new_page()
+                stealth.harden_page_sync(context, page, ua, ver)
                 # Poll for the user closing the window. Between polls, if the page shows
                 # a captcha/2FA we surface a clear "do it yourself" message ONCE per kind
                 # and record it — we never click, solve, or bypass it. The user completes
                 # it in this headed window and closes it when signed in.
                 announced: set[str] = set()
+                last_content: str | None = None
+                last_url: str = ""
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
                     try:
-                        kind = challenge.classify_challenge(page.content(), page.url)
+                        last_content, last_url = page.content(), page.url
+                        kind = challenge.classify_challenge(last_content, last_url)
                     except Exception:  # noqa: BLE001 — page mid-navigation / closing
-                        kind = None
+                        kind, last_content = None, None
                     if kind:
                         challenge_detected = kind
                         if kind not in announced:
@@ -129,13 +144,27 @@ def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callabl
         return fail("browser_login_failed", str(exc))
 
     profiles.touch_created(site)
-    meta = profiles.save_meta(site, last_login_ts=time.time())
+    # Only stamp login_verified_ts (the signal has_login trusts) when the last
+    # page we saw before the user closed the window actually classified as
+    # logged_in — best-effort; if we couldn't read it, degrade to not-verified.
+    now = time.time()
+    fields: dict[str, Any] = {"last_login_ts": now}
+    try:
+        from .embed import classify_login_state  # lazy: avoid import cycle
+        if last_content is not None and \
+                classify_login_state(site, last_content, last_url) == "logged_in":
+            fields["login_verified_ts"] = now
+    except Exception:  # noqa: BLE001 — verification is best-effort, never fatal
+        pass
+    meta = profiles.save_meta(site, **fields)
     return {"ok": True, "site": meta["site"], "profile_dir": str(profile_path),
             "last_login_ts": meta["last_login_ts"],
+            "login_verified": bool(meta.get("login_verified_ts")),
             "challenge_detected": challenge_detected}
 
 
 def browser_fetch(url: str, site: str, *, nav_timeout: float = DEFAULT_NAV_TIMEOUT_S,
+                  render_settle: float = DEFAULT_RENDER_SETTLE_S,
                   min_interval: float = ratelimit.DEFAULT_MIN_INTERVAL_S,
                   _sync_playwright: Callable[[], Any] | None = None) -> dict:
     """Fetch ``url`` HEADLESS under ``site``'s saved session profile.
@@ -156,24 +185,42 @@ def browser_fetch(url: str, site: str, *, nav_timeout: float = DEFAULT_NAV_TIMEO
         return _busy(site)
     try:
         return _browser_fetch_locked(url, site, nav_timeout=nav_timeout,
-                                     min_interval=min_interval, sync_playwright=sync_playwright)
+                                     render_settle=render_settle, min_interval=min_interval,
+                                     sync_playwright=sync_playwright)
     finally:
         lock.release()
 
 
-def _browser_fetch_locked(url: str, site: str, *, nav_timeout: float, min_interval: float,
-                          sync_playwright: Callable[[], Any]) -> dict:
+def _browser_fetch_locked(url: str, site: str, *, nav_timeout: float, render_settle: float,
+                          min_interval: float, sync_playwright: Callable[[], Any]) -> dict:
     ratelimit.wait(site, min_interval=min_interval)
     profile_path = profiles.profile_dir(site)
     try:
         try:
             with sync_playwright() as pw:
-                context = pw.chromium.launch_persistent_context(str(profile_path), headless=True)
+                ver = stealth.chromium_version_sync(pw)
+                ua  = stealth.user_agent(ver)
+                context = pw.chromium.launch_persistent_context(
+                    str(profile_path), headless=True,
+                    args=stealth.launch_args(headless=True), **stealth.context_options(ua))
+                stealth.harden_context_sync(context)
                 try:
                     page = context.new_page()
+                    stealth.harden_page_sync(context, page, ua, ver)
                     response = page.goto(url, timeout=nav_timeout * 1000)
-                    content = page.content()
                     status = response.status if response else None
+                    # SPA catalogs render product cards via XHR AFTER 'load'
+                    # fires, so page.content() right after goto() returns the
+                    # empty shell (the "no hits parsed" bug across McMaster/
+                    # Misumi/DigiKey/Amazon/…). Let the network settle first;
+                    # swallow the timeout so a chatty page is still snapshotted
+                    # at the deadline rather than failing the fetch.
+                    try:
+                        page.wait_for_load_state("networkidle",
+                                                 timeout=render_settle * 1000)
+                    except Exception:  # noqa: BLE001  (Playwright TimeoutError / mock page)
+                        pass
+                    content = page.content()
                 finally:
                     context.close()
         except Exception as exc:  # noqa: BLE001
@@ -242,7 +289,12 @@ def _browser_download_locked(url: str, site: str, dest: Path, *, nav_timeout: fl
     try:
         try:
             with sync_playwright() as pw:
-                context = pw.chromium.launch_persistent_context(str(profile_path), headless=True)
+                ver = stealth.chromium_version_sync(pw)
+                ua  = stealth.user_agent(ver)
+                context = pw.chromium.launch_persistent_context(
+                    str(profile_path), headless=True,
+                    args=stealth.launch_args(headless=True), **stealth.context_options(ua))
+                stealth.harden_context_sync(context)
                 try:
                     response = context.request.get(url, timeout=nav_timeout * 1000)
                     status = response.status

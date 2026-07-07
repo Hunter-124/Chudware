@@ -75,6 +75,35 @@ _CAPTCHA_IFRAME_SRC: tuple[str, ...] = ("hcaptcha", "turnstile", "/captcha")
 # URL fragments that themselves signal a captcha challenge redirect.
 _CAPTCHA_URL_MARKERS: tuple[str, ...] = ("validatecaptcha", "/captcha", "/errors/validate")
 
+# Cloudflare loads challenge-platform on many retail login pages without showing
+# an active interstitial — treat it as passive unless interstitial text appears.
+_PASSIVE_CF_MARKERS: frozenset[str] = frozenset({"challenge-platform"})
+_INTERSTITIAL_CF_MARKERS: tuple[str, ...] = (
+    "checking your browser before", "just a moment...",
+    "attention required! | cloudflare", "cf-challenge", "cf_chl_",
+)
+# Widget/library markup embedded in a normal login form — not a blocking interstitial.
+_PASSIVE_WIDGET_MARKERS: frozenset[str] = frozenset({
+    "g-recaptcha", "recaptcha/api2/bframe", "cf-turnstile", "challenge-platform",
+})
+_AUTH_URL_FRAGMENTS: tuple[str, ...] = (
+    "/sign-in", "/signin", "/sign-up", "/signup", "/login", "/register",
+    "/account/login", "/user/login", "/auth/",
+)
+_LOGIN_FORM_MARKERS: tuple[str, ...] = (
+    'id="login-email"', 'name="password"', 'type="password"',
+    "sign in to your account", "log in to your account",
+)
+
+
+def _is_auth_url(url: str) -> bool:
+    u = (url or "").lower()
+    return any(frag in u for frag in _AUTH_URL_FRAGMENTS)
+
+
+def _login_form_on_page(hay: str) -> bool:
+    return any(m in hay for m in _LOGIN_FORM_MARKERS)
+
 
 def classify_challenge(html: str | None, url: str = "") -> str | None:
     """Return ``"captcha"`` or ``"2fa"`` if the page looks like a challenge, else ``None``.
@@ -83,16 +112,39 @@ def classify_challenge(html: str | None, url: str = "") -> str | None:
     phrases only. Captcha is checked before 2FA so a page carrying both classifies
     as the (more automation-sensitive) captcha."""
     u = (url or "").lower()
-    if any(m in u for m in _CAPTCHA_URL_MARKERS):
+    url_markers = [m for m in _CAPTCHA_URL_MARKERS if m in u]
+    if url_markers:
         return "captcha"
 
     if not html:
         return None
     hay = html.lower()
 
-    if any(m in hay for m in _CAPTCHA_MARKERS):
+    hit_markers = [m for m in _CAPTCHA_MARKERS if m in hay]
+    # SnapEDA home can include recaptcha widget markup after a successful login
+    # (observed live) without presenting an active challenge. If we only see
+    # recaptcha library/widget markers on /home, don't classify as challenge.
+    if "snapeda.com/home" in u:
+        non_recaptcha_hits = [
+            m for m in hit_markers if m not in ("g-recaptcha", "recaptcha/api2/bframe")
+        ]
+        if not non_recaptcha_hits:
+            return None
+    if hit_markers:
+        has_interstitial = any(m in hay for m in _INTERSTITIAL_CF_MARKERS)
+        substantive = [m for m in hit_markers if m not in _PASSIVE_WIDGET_MARKERS]
+        passive_widgets = [m for m in hit_markers if m in _PASSIVE_WIDGET_MARKERS]
+        # Login forms often embed Turnstile/reCAPTCHA widgets — not a full-page CF wall.
+        if (_is_auth_url(u) and _login_form_on_page(hay) and not has_interstitial
+                and not substantive and passive_widgets):
+            return None
+        if (not substantive and passive_widgets and not has_interstitial):
+            # Passive CF script on a login page (Ace et al.) — not an active wall.
+            if "acehardware.com" in u and ("/login" in u or "/user/login" in u):
+                return None
         return "captcha"
-    if "<iframe" in hay and any(s in hay for s in _CAPTCHA_IFRAME_SRC):
+    iframe_hits = [s for s in _CAPTCHA_IFRAME_SRC if s in hay]
+    if "<iframe" in hay and iframe_hits:
         return "captcha"
     # reCAPTCHA anchor iframe: a visible checkbox is a challenge; the v3 badge's
     # size=invisible anchor on an ordinary page is not.

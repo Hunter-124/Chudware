@@ -5,8 +5,8 @@
 //     running whether or not the popup is open.
 //   * drawVendorsPopup — floating glass window with the vendor sign-in list, API-provider
 //     credential editors, download queue and health-check results table.
-//   * openVendorWizard — phase C seam: probes the worker for browser_embed_start (embedded
-//     browser); method-missing → headed vendor_login fallback for the first unsigned vendor.
+//   * openVendorWizard — opens the embedded-browser sign-in wizard via
+//     login_wizard_start; a Playwright/embed setup failure → headed vendor_login fallback.
 //   * startHealthCheck/pollHealthStatus — vendors_health_check/_status flow (single-flight,
 //     2 s backoff while running).
 #include <cmath>
@@ -111,7 +111,9 @@ void drawVendorStrip(AppState& st, float paneW) {
     if (S().queueActive && ImGui::GetTime() - S().lastQueuePoll > 2.5)
         pollQueue(st);
     // Poll health while the backend reports running (single-flight + 2 s backoff).
-    if (S().healthRunning && ImGui::GetTime() - S().lastHealthPoll > 2.0)
+    // Defer during the embedded login wizard — parallel browser_fetch sweeps starve it.
+    if (S().healthRunning && !browserPanelActive() &&
+        ImGui::GetTime() - S().lastHealthPoll > 2.0)
         pollHealthStatus(st);
 
     ImGui::Separator();
@@ -182,7 +184,7 @@ void drawVendorStrip(AppState& st, float paneW) {
     const bool healthBusy = S().healthStarting || S().healthRunning;
     if (borderRow("##test_vendors", healthBusy ? "Testing…" : "Test vendors", nullptr,
                   /*selected=*/false, ImVec2(half, 20.0f * sc), /*centerText=*/true) &&
-        !healthBusy)
+        !healthBusy && !browserPanelActive())
         startHealthCheck(st);
 }
 
@@ -410,7 +412,8 @@ void drawHealthTable(AppState& st) {
         return;
     }
     const bool busy = S().healthStarting || S().healthRunning;
-    if (ImGui::SmallButton(busy ? "Running…" : "Run health check") && !busy)
+    if (ImGui::SmallButton(busy ? "Running…" : "Run health check") && !busy &&
+        !browserPanelActive())
         startHealthCheck(st);
     if (busy && S().healthResults.empty()) {
         spinner("Testing");

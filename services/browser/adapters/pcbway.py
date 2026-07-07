@@ -6,9 +6,15 @@ matching, copied with provenance. Quote/order flows gate behind a
 per-order terms click-through; this adapter never accepts that on the
 user's behalf and surfaces :func:`terms_confirmation_required` instead.
 
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live logged-in PCBWay session (T-X6 gates the real per-source
-integration tests behind an env flag).
+NOTE (live-probe 2026-07-07): the current search URL template
+``/project/shopindex/{query}.html`` returns HTTP 404, which ``session.py``
+surfaces cleanly as an ``http_error`` fail (propagated by ``search`` as
+``[result]``) — an access/endpoint problem, NOT a parser bug. This is
+orthogonal to the parser reverse-engineering wave: reaching a real
+results page needs a corrected endpoint and/or a signed-in session
+(``browser_login('pcbway')``), a per-site follow-up tracked separately.
+The product-card / SKU / price regexes below therefore remain a best-effort
+shape, not yet verified against a real rendered results page.
 """
 from __future__ import annotations
 

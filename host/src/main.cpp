@@ -27,6 +27,11 @@
 #include "renderer.h"
 #include "worker_client.h"
 
+#ifdef AI_CAD_ENABLE_CEF
+#include "ui/widgets/cef/cef_app.h"
+#include "ui/widgets/cef/cef_osr_shot.h"
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #include <dbghelp.h>
@@ -298,6 +303,26 @@ int buildAndRender(const std::string& src, const std::string& out, bool isDesign
 }
 
 int main(int argc, char** argv) {
+#ifdef AI_CAD_ENABLE_CEF
+    // A separate subprocess executable (ai_cad_cef_helper) is configured via
+    // CefSettings.browser_subprocess_path, so this main binary is ALWAYS the
+    // browser process and must NOT call CefExecuteProcess. Initialise CEF HERE,
+    // before GLFW/X11 grab the display and signal handlers — CefInitialize wants
+    // to bootstrap Chromium first. Only when the CEF backend is selected.
+    ui::cef::stash_args(argc, argv);
+    // Headless OSR self-test: `AI-CAD --cef-shot <url> <out.png>` renders a page
+    // off-screen via CEF and writes a PNG — proves the browser pipeline with no
+    // display. Returns before any GUI/GLFW setup.
+    if (argc >= 4 && std::strcmp(argv[1], "--cef-shot") == 0) {
+        const bool ok = ui::cef::initialize() &&
+                        ui::cef::render_url_to_png(argv[2], 1280, 800, argv[3]);
+        std::fprintf(stderr, "[cef-shot] %s -> %s\n", ok ? "OK" : "FAILED", argv[3]);
+        ui::cef::shutdown();
+        return ok ? 0 : 1;
+    }
+    if (const char* wv = std::getenv("AI_CAD_WEBVIEW"); wv && std::strcmp(wv, "cef") == 0)
+        ui::cef::initialize();
+#endif
     installCrashHandler();  // symbolized stack + minidump on any unhandled fault
     // Point the C++ core at its prompts on EVERY launch path (run_gui only calls
     // ensureRuntime when provisioning is needed, so it can't be relied on for this).

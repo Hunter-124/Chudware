@@ -709,6 +709,13 @@ struct AppState {
     // RE-ANCHOR(reveng): append ReverseEng after AI (RE-03 workspace tab shell).
     enum class Workspace { Model, Drawing, Simulate, Electronics, Manufacture, PLM, PartsLibrary, AI, ReverseEng };
     Workspace activeWorkspace = Workspace::Model;
+    // Parts Library → Reverse Engineering handoff seam. The parts panel's
+    // "Reverse-engineer this part" action creates a session (reveng_start_session
+    // RPC), sets this to the new session_id, and switches activeWorkspace to
+    // ReverseEng. The RE workspace (RE-30) consumes + clears it on its next draw to
+    // auto-select that session. Additive + optional: even unread, the RE tab's
+    // session list surfaces the new session, so the handoff still works.
+    std::string pendingRevengSessionId;
     // Multi-document: sessions of CLOSED tabs that may still have an async RPC in flight. A
     // DocSession's PropertyManager / SketchMode / EvaluateDialogs capture `this` in their st.rpc
     // completion lambdas (live preview, AI assist, sketch overview/regions, evaluate). Destroying the

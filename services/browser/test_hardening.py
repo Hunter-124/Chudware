@@ -68,6 +68,29 @@ def test_classifier_passes_ordinary_pages(html):
     assert challenge.is_challenge(html) is False
 
 
+def test_classifier_ignores_passive_widgets_on_auth_login_form():
+    html = (
+        '<html><body><h1>Sign In to Your Account</h1>'
+        '<input id="login-email" type="email">'
+        '<input name="password" type="password">'
+        '<div class="cf-turnstile"></div>'
+        '<div class="g-recaptcha"></div>'
+        '<script>challenge-platform</script></body></html>'
+    )
+    assert challenge.classify_challenge(
+        html, "https://www.acehardware.com/user/login") is None
+
+
+def test_classifier_still_flags_cf_interstitial_on_auth_url():
+    html = (
+        '<title>Just a moment...</title>'
+        '<div class="cf-turnstile"></div>'
+        '<p>Checking your browser before accessing the site.</p>'
+    )
+    assert challenge.classify_challenge(
+        html, "https://www.acehardware.com/user/login") == "captcha"
+
+
 def test_captcha_wins_when_page_has_both():
     html = '<div class="g-recaptcha"></div><p>two-factor authentication</p>'
     assert challenge.classify_challenge(html) == "captcha"
@@ -115,7 +138,7 @@ class _FakeChromium:
         self.launched, self.last_context = [], None
         self._html, self._url, self._status = html, url, status
 
-    def launch_persistent_context(self, user_data_dir, headless=True):
+    def launch_persistent_context(self, user_data_dir, headless=True, **_kwargs):
         self.launched.append((user_data_dir, headless))
         self.last_context = _FakeContext(self._html, self._url, self._status)
         return self.last_context
@@ -218,3 +241,72 @@ def test_login_ordinary_page_has_no_challenge(sess):
     result = session.browser_login("grabcad", timeout=5.0, _sync_playwright=fac)
     assert result["ok"] is True
     assert result["challenge_detected"] is None
+
+
+# --- stealth: consistent, honest fingerprint (no "look at me, a robot" tells) ----
+
+def test_stealth_user_agent_is_desktop_chrome_no_headless():
+    from services.browser import stealth
+    ua = stealth.user_agent("149.0.7827.55")
+    assert "Chrome/149.0.7827.55" in ua
+    assert "Headless" not in ua        # the whole point
+    assert "Linux x86_64" in ua        # OS stays honest
+
+
+def test_stealth_launch_args_disable_automation_flag():
+    from services.browser import stealth
+    args = stealth.launch_args(headless=True)
+    assert "--disable-blink-features=AutomationControlled" in args  # flips webdriver
+    assert "--headless=new" in args
+    assert "--headless=new" not in stealth.launch_args(headless=False)
+
+
+def test_stealth_context_options_consistent_identity():
+    from services.browser import stealth
+    ua = stealth.user_agent("149.0.7827.55")
+    opts = stealth.context_options(ua)
+    assert opts["user_agent"] == ua
+    assert opts["locale"] == "en-US"
+    assert opts["timezone_id"] == "America/New_York"
+    assert opts["extra_http_headers"]["Accept-Language"] == "en-US,en;q=0.9"
+
+
+def test_stealth_cdp_override_scrubs_headless_from_client_hints():
+    from services.browser import stealth
+    ua = stealth.user_agent("149.0.7827.55")
+    params = stealth.cdp_ua_override_params(ua, "149.0.7827.55")
+    brands = params["userAgentMetadata"]["brands"]
+    names = [b["brand"] for b in brands]
+    assert "HeadlessChrome" not in names        # the Sec-CH-UA tell we remove
+    assert "Google Chrome" in names and "Chromium" in names
+    # UA header and client-hint versions must agree (consistency > mimicry).
+    assert all(b["version"] == "149" for b in brands if b["brand"] != "Not)A;Brand")
+    assert params["userAgentMetadata"]["platform"] == "Linux"
+    # Unweighted — CDP appends the q itself; passing q here double-appends it.
+    assert params["acceptLanguage"] == "en-US,en"
+
+
+def test_stealth_version_detection_degrades_without_real_browser():
+    from services.browser import stealth
+    stealth._VERSION_CACHE.pop("full", None)
+
+    class _NoLaunch:
+        chromium = object()  # no .launch → detection must fall back, not raise
+
+    assert stealth.chromium_version_sync(_NoLaunch()) == stealth.FALLBACK_FULL_VERSION
+    stealth._VERSION_CACHE.pop("full", None)
+
+
+def test_stealth_harden_helpers_never_raise_on_bare_objects():
+    from services.browser import stealth
+    # A context/page without add_init_script/new_cdp_session must degrade silently
+    # (real browsers get hardened; fakes/old playwright just skip it).
+    stealth.harden_context_sync(object())
+    stealth.harden_page_sync(object(), object(), "ua", "149.0.7827.55")
+
+
+def test_stealth_init_script_covers_the_known_tells():
+    from services.browser import stealth
+    js = stealth.INIT_SCRIPT
+    for tell in ("webdriver", "chrome", "plugins", "languages"):
+        assert tell in js

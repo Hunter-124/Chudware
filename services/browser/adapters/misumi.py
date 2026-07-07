@@ -5,12 +5,24 @@ MISUMI (misumi-ec.com) is a configurable mechanical-components catalog
 (STEP) gated behind the user's own free MISUMI account. Like McMaster, this
 is a CAD-download vendor: `acquire` lands a STEP file with provenance.
 
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live logged-in MISUMI session (T-X6 gates the real per-source
-integration tests behind an env flag).
+NOTE (live-probe 2026-07-07): the MISUMI result page (``/vona2/result/?Keyword=``)
+is a Next.js app whose search results are embedded server-side in a
+``<script id="__NEXT_DATA__" type="application/json">`` blob. Product results
+live at JSON path ``props.pageProps.hawksearchKeywordSearchResponse.Results``
+(~30 items). Each entry's ``.Document`` is a dict of **single-element lists**;
+the useful fields are ``name`` (title), ``url_detail`` (leading-slash-relative
+product URL), and ``unique_id`` (the series/category code). ``sku`` is present
+but EMPTY on the results page (``['']``) — MISUMI parts are configurable series,
+so a concrete part number/price only exist after on-site configuration; hence
+results are typed ``kind="series"`` and carry no price. ``search`` now parses
+that JSON blob (verified against the real saved page) instead of speculative
+CSS-class regex, which never matched the live DOM. The ``_PART_RE`` / ``_PRICE_RE``
+/ ``_DOWNLOAD_RE`` regexes below remain a best-effort shape for ``acquire`` on a
+configured product page and are not yet live-verified.
 """
 from __future__ import annotations
 
+import json
 import re
 
 from .. import session as _session
@@ -28,10 +40,10 @@ LICENSE_NOTE = (
 )
 
 _LOGIN_WALL_MARKERS = ('Log in to MISUMI', 'id="loginId"', 'class="login-form"', 'Please log in')
-# Best-effort: MISUMI search result cards link to /vona2/detail/<series>/.
-_RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*product-name[^"]*"[^>]+href="(?P<href>/vona2/detail/[^"?#]+)"[^>]*>'
-    r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
+# Live shape (2026-07-07): results are embedded in the Next.js __NEXT_DATA__ blob.
+_NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__" type="application/json">(?P<json>.*?)</script>',
+    re.DOTALL)
 _PART_RE = re.compile(r'<span[^>]*class="[^"]*part-number[^"]*"[^>]*>(?P<part>[^<]+)</span>',
                       re.IGNORECASE)
 _PRICE_RE = re.compile(r'<span[^>]*class="[^"]*price[^"]*"[^>]*>\$(?P<price>[0-9,.]+)</span>',
@@ -42,6 +54,16 @@ _DOWNLOAD_RE = re.compile(
 
 def _strip_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
+
+
+def _first(doc: dict, key: str) -> str | None:
+    """MISUMI Document fields are single-element lists; unwrap the first value."""
+    val = doc.get(key)
+    if isinstance(val, list):
+        val = val[0] if val else None
+    if isinstance(val, str):
+        val = val.strip()
+    return val or None
 
 
 class MisumiAdapter:
@@ -55,17 +77,40 @@ class MisumiAdapter:
         content = result.get("content", "")
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
             return [login_required(SITE, url)]
+
+        # Results are embedded in the Next.js __NEXT_DATA__ JSON blob at
+        # props.pageProps.hawksearchKeywordSearchResponse.Results (live 2026-07-07).
+        m = _NEXT_DATA_RE.search(content)
+        if not m:
+            return []
+        try:
+            data = json.loads(m.group("json"))
+            results = (data["props"]["pageProps"]
+                       ["hawksearchKeywordSearchResponse"]["Results"])
+        except (ValueError, KeyError, TypeError):
+            return []
+        if not isinstance(results, list):
+            return []
+
         hits = []
-        for m in _RESULT_RE.finditer(content):
-            card = m.group("title")
-            part_match = _PART_RE.search(card)
-            price_match = _PRICE_RE.search(card)
+        for entry in results:
+            doc = entry.get("Document") if isinstance(entry, dict) else None
+            if not isinstance(doc, dict):
+                continue
+            title = _first(doc, "name")
+            rel = _first(doc, "url_detail")
+            if not title or not rel:
+                continue
             hits.append({
-                "title": _strip_tags(card),
-                "url": BASE_URL + m.group("href"),
+                "title": title,
+                "url": BASE_URL + rel,
                 "site": SITE,
-                "part_number": part_match.group("part").strip() if part_match else None,
-                "price": ("$" + price_match.group("price")) if price_match else None,
+                # MISUMI parts are configurable series, not final SKUs; the
+                # results page carries the series/category code (unique_id) and
+                # an empty sku. Concrete part number/price only exist after
+                # on-site configuration — surface honestly as kind="series".
+                "part_number": _first(doc, "unique_id"),
+                "kind": "series",
             })
         return hits
 

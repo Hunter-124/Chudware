@@ -1,22 +1,15 @@
-"""Worker-RPC seam for the reusable embedded browser (Parts Library V2, workstream 3).
+"""Worker-RPC seam for the embedded-browser vendor sign-in flow.
 
-Thin wrappers over :mod:`services.browser.embed`'s :class:`EmbedManager` so any
-GUI surface (the parts-library browser panel today, anything else tomorrow)
-reaches a live CDP-screencast Chromium over the SAME newline-JSON worker seam
-(``WorkerClient``/``AsyncRpc``) as every other service — no bespoke transport.
+The JPEG-screencast transport (``browser_embed_*``) was removed with the
+migration to the in-process CEF browser (2026-07-07): the GUI now renders and
+takes input in-process, so it no longer streams frames from a worker-side
+Chromium. What remains on this seam:
 
-Envelopes (all degrade to ``{ok:false, reason, hint}``, never a traceback):
-
-- ``browser_embed_start    {site?|url?, max_width=900, max_height=700, quality=60}``
-  → ``{ok, id, w, h, url, login_state}``
-- ``browser_embed_frame    {id, since_seq?}``
-  → ``{ok, seq, frame_b64?, w, h, url, login_state}`` (``frame_b64`` omitted
-  when the caller's ``since_seq`` is already current — poll cheaply at paint rate)
-- ``browser_embed_input    {id, events:[{type,x,y,button,delta_y,key,text,modifiers}...]}`` → ``{ok}``
-- ``browser_embed_navigate {id, url}`` → ``{ok, url}``
-- ``browser_embed_stop     {id}`` → ``{ok}``
+- ``browser_start_url {site}`` → ``{ok, url, cache_dir}`` — resolve a vendor key
+  to its sign-in URL + local cookie cache dir (the CEF backend opens it directly).
 - ``login_wizard_start {sites?}`` / ``login_wizard_status {}`` /
-  ``login_wizard_next {skip?}`` / ``login_wizard_stop {}``
+  ``login_wizard_next {skip?}`` / ``login_wizard_stop {}`` — the multi-vendor
+  sign-in state machine (site list + login-verified tracking).
 
 Everything lazy-imports the embed backend so a worker without Playwright still
 registers these methods and answers with a structured failure.
@@ -26,7 +19,6 @@ try/except pattern as ``GUI_WORKER_METHODS``).
 """
 from __future__ import annotations
 
-import base64
 from typing import Callable
 
 
@@ -46,57 +38,23 @@ def _wrap_exc(exc: Exception) -> dict:
     return _fail(f"embed_rpc_failed: {exc}", "")
 
 
-def _browser_embed_start(params: dict, _emit: Callable) -> dict:
+def _browser_start_url(params: dict, _emit: Callable) -> dict:
+    """Resolve a vendor key → its sign-in URL + the local per-site cookie cache
+    directory. Used by the in-process CEF backend (which has no worker embed) to
+    open a site's login page directly and keep its cookie jar in the SAME profile
+    dir the Playwright scraper uses, so a future cookie-interop pass can share
+    sessions. ``{ok, url, cache_dir}`` — degrades to ``{ok:false}`` structurally.
+    """
     try:
-        p = params or {}
-        return _manager().start(
-            site=p.get("site") or None,
-            url=p.get("url") or None,
-            max_width=int(p.get("max_width", 900)),
-            max_height=int(p.get("max_height", 700)),
-            quality=int(p.get("quality", 60)),
-        )
-    except Exception as exc:  # noqa: BLE001
-        return _wrap_exc(exc)
-
-
-def _browser_embed_frame(params: dict, _emit: Callable) -> dict:
-    try:
-        p = params or {}
-        since = p.get("since_seq")
-        res = _manager().frame(str(p.get("id", "")),
-                               since_seq=int(since) if since is not None else None)
-        if not res.get("ok"):
-            return res
-        out = {"ok": True, "seq": res["seq"], "w": res["w"], "h": res["h"],
-               "url": res["url"], "login_state": res["login_state"]}
-        frame = res.get("frame")
-        if frame is not None:
-            out["frame_b64"] = base64.b64encode(frame).decode("ascii")
-        return out
-    except Exception as exc:  # noqa: BLE001
-        return _wrap_exc(exc)
-
-
-def _browser_embed_input(params: dict, _emit: Callable) -> dict:
-    try:
-        p = params or {}
-        return _manager().input(str(p.get("id", "")), list(p.get("events") or []))
-    except Exception as exc:  # noqa: BLE001
-        return _wrap_exc(exc)
-
-
-def _browser_embed_navigate(params: dict, _emit: Callable) -> dict:
-    try:
-        p = params or {}
-        return _manager().navigate(str(p.get("id", "")), str(p.get("url", "")))
-    except Exception as exc:  # noqa: BLE001
-        return _wrap_exc(exc)
-
-
-def _browser_embed_stop(params: dict, _emit: Callable) -> dict:
-    try:
-        return _manager().stop(str((params or {}).get("id", "")))
+        from services.browser.embed import start_url_for_site
+        from services.browser import profiles
+        site = str((params or {}).get("site", "")).strip()
+        if not site:
+            return _fail("no_site")
+        url = start_url_for_site(site)
+        if not url:
+            return _fail("no_url_for_site", site)
+        return {"ok": True, "url": url, "cache_dir": str(profiles.profile_dir(site))}
     except Exception as exc:  # noqa: BLE001
         return _wrap_exc(exc)
 
@@ -104,7 +62,8 @@ def _browser_embed_stop(params: dict, _emit: Callable) -> dict:
 def _login_wizard_start(params: dict, _emit: Callable) -> dict:
     try:
         sites = (params or {}).get("sites")
-        return _manager().wizard_start(list(sites) if sites else None)
+        res = _manager().wizard_start(list(sites) if sites else None)
+        return res
     except Exception as exc:  # noqa: BLE001
         return _wrap_exc(exc)
 
@@ -131,11 +90,7 @@ def _login_wizard_stop(params: dict, _emit: Callable) -> dict:
 
 
 EMBED_WORKER_METHODS: dict[str, Callable] = {
-    "browser_embed_start": _browser_embed_start,
-    "browser_embed_frame": _browser_embed_frame,
-    "browser_embed_input": _browser_embed_input,
-    "browser_embed_navigate": _browser_embed_navigate,
-    "browser_embed_stop": _browser_embed_stop,
+    "browser_start_url": _browser_start_url,
     "login_wizard_start": _login_wizard_start,
     "login_wizard_status": _login_wizard_status,
     "login_wizard_next": _login_wizard_next,

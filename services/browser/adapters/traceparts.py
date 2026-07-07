@@ -55,6 +55,15 @@ def _strip_tags(text: str) -> str:
 class TracePartsAdapter:
     key = SITE
 
+    def is_logged_in(self, content: str, url: str) -> bool:
+        """Auth URLs and login-wall markup are never a logged-in session."""
+        u = (url or "").lower()
+        if "/sign-in" in u or "/sign-up" in u or "/login" in u:
+            return False
+        if any(m in content for m in _LOGIN_WALL_MARKERS):
+            return False
+        return True
+
     def search(self, query: str) -> list[dict]:
         url = SEARCH_URL_TMPL.format(query=query.replace(" ", "+"))
         result = _session.browser_fetch(url, SITE)

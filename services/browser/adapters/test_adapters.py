@@ -45,10 +45,17 @@ def adapter_mods(tmp_path, monkeypatch):
     importlib.reload(engine_paths)
 
 
+# Real live shape (verified 2026-07-07): library result cards are AngularJS
+# `<a class="modelLink">` anchors wrapping a `<img class="previewImage" alt="…">`
+# whose alt text is the model title (see test_grabcad_parser.py for the verbatim
+# full-page slice). The old `card-title` markup here was speculative and never
+# matched the live DOM.
 GRABCAD_SEARCH_HTML = """
 <html><body>
-<a class="card-title result" href="/library/widget-abc">Widget <b>Abc</b></a>
-<a class="card-title result" href="/library/bracket-xyz">Bracket Xyz</a>
+<div class="imageArea"><a href="/library/widget-abc" class="modelLink">
+<img class="previewImage" src="https://grabcad.com/x/card.jpg" alt="Widget Abc"></a></div>
+<div class="imageArea"><a href="/library/bracket-xyz" class="modelLink">
+<img class="previewImage" src="https://grabcad.com/y/card.jpg" alt="Bracket Xyz"></a></div>
 </body></html>
 """
 
@@ -66,12 +73,21 @@ TRACEPARTS_TERMS_HTML = """
 </body></html>
 """
 
+# Real live shape (verified 2026-07-07): each result is a
+# `data-asin="…" data-component-type="s-search-result"` card whose title lives in
+# an `<a class="…s-line-clamp…"><h2><span>TITLE</span></h2></a>` and whose price is
+# a bare `$`-leading `<span class="a-offscreen">`. See test_amazon_parser.py for
+# the verbatim full-page slice. The old flat a-text-normal markup was speculative.
 AMAZON_SEARCH_HTML = """
 <html><body>
-<div data-asin="B00WIDGET1"><a class="a-link-normal" href="/dp/B00WIDGET1"><span class="a-text-normal">Widget Abc</span></a>
-<span class="a-offscreen">$12.99</span></div>
-<div data-asin="B00BRACKT1"><a class="a-link-normal" href="/dp/B00BRACKT1"><span class="a-text-normal">Bracket Xyz</span></a>
-<span class="a-offscreen">$7.49</span></div>
+<div data-asin="B00WIDGET1" data-component-type="s-search-result">
+  <a class="a-link-normal s-line-clamp-2 s-link-style a-text-normal" href="/sspa/click?x=1&url=/dp/B00WIDGET1">
+    <h2 class="a-size-mini"><span>Widget Abc</span></h2></a>
+  <span class="a-price"><span class="a-offscreen">$12.99</span></span></div>
+<div data-asin="B00BRACKT1" data-component-type="s-search-result">
+  <a class="a-link-normal s-line-clamp-2 s-link-style a-text-normal" href="/dp/B00BRACKT1">
+    <h2 class="a-size-mini"><span>Bracket Xyz</span></h2></a>
+  <span class="a-price"><span class="a-offscreen">$7.49</span></span></div>
 </body></html>
 """
 
@@ -348,35 +364,6 @@ def test_amazon_search_parses_result_cards(adapter_mods, monkeypatch):
     assert hits[0]["price"] == "$12.99"
 
 
-AMAZON_SEARCH_HTML_MODERN = """
-<html><body>
-<form name="signIn" style="display:none"></form>
-<div data-asin="B07CVBSC9Y" data-component-type="s-search-result">
-  <h2 class="a-size-mini"><a class="a-link-normal s-line-clamp-2 s-link-style a-text-normal"
-     href="/dp/B07CVBSC9Y"><span>608 2RS Ball Bearing 8x22x7mm, 10 Pack</span></a></h2>
-  <span class="a-offscreen">$5.59</span>
-</div>
-</body></html>
-"""
-
-
-def test_amazon_search_parses_modern_result_cards(adapter_mods, monkeypatch):
-    # Live-probe 2026-07-07: current Amazon markup fuses a-link-normal +
-    # a-text-normal on one <a> with a class-less title <span> inside <h2>,
-    # and every page carries a hidden name="signIn" nav form (not a login wall).
-    _adapters_pkg, _grabcad, _traceparts, session, amazon, _mcmaster, _jlcpcb, _pcbway = adapter_mods
-    monkeypatch.setattr(session, "browser_fetch",
-                        lambda url, site: {"ok": True, "content": AMAZON_SEARCH_HTML_MODERN})
-
-    hits = amazon.ADAPTER.search("608 bearing")
-
-    assert len(hits) == 1
-    assert hits[0]["title"] == "608 2RS Ball Bearing 8x22x7mm, 10 Pack"
-    assert hits[0]["url"] == "https://www.amazon.com/dp/B07CVBSC9Y"
-    assert hits[0]["asin"] == "B07CVBSC9Y"
-    assert hits[0]["price"] == "$5.59"
-
-
 def test_amazon_search_login_wall_surfaces_ask_user(adapter_mods, monkeypatch):
     _adapters_pkg, _grabcad, _traceparts, session, amazon, _mcmaster, _jlcpcb, _pcbway = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",
@@ -458,6 +445,29 @@ def test_mcmaster_search_parses_result_cards(adapter_mods, monkeypatch):
     assert hits[0]["url"] == "https://www.mcmaster.com/91290A115/"
     assert hits[0]["site"] == "mcmaster"
     assert hits[0]["sku"] == "91290A115"
+
+
+def test_mcmaster_search_falls_back_to_category_tiles(adapter_mods, monkeypatch):
+    # Live shape (2026-07-07): a flat "/{query}/" fetch lands on McMaster's
+    # catalog-navigation grid (no product cards). The adapter should return the
+    # real category tiles as kind="category" rather than a silent empty list.
+    _adapters_pkg, _grabcad, _traceparts, session, _amazon, mcmaster, _jlcpcb, _pcbway = adapter_mods
+    catalog_html = (
+        '<a id="catg0_Fastening" class="category-tile" href="/products/fastening-and-joining/">'
+        '<img alt="Fastening"><span class="category-name">Fastening &amp; Joining</span></a>'
+        '<a id="catg1_Sealing" class="category-tile" href="/products/sealing/">'
+        '<span class="category-name">Sealing</span></a>'
+    )
+    monkeypatch.setattr(session, "browser_fetch",
+                        lambda url, site: {"ok": True, "content": catalog_html})
+
+    hits = mcmaster.ADAPTER.search("screws")
+
+    assert len(hits) == 2
+    assert hits[0]["kind"] == "category"
+    assert hits[0]["title"] == "Fastening & Joining"   # entities unescaped
+    assert hits[0]["url"] == "https://www.mcmaster.com/products/fastening-and-joining/"
+    assert hits[1]["title"] == "Sealing"
 
 
 def test_mcmaster_search_login_wall_surfaces_ask_user(adapter_mods, monkeypatch):

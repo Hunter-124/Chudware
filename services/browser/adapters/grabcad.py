@@ -6,14 +6,19 @@ regexes, login-wall markers) is what would change if GrabCAD's markup
 changes; control flow is shared with TraceParts via the small helpers in
 ``services.browser.adapters``.
 
-NOTE: the regexes below are a v1 best-effort shape based on GrabCAD's public
-(logged-out) page structure, not verified against a live logged-in session —
-that requires a real account and is exactly what T-X6's env-flag-gated
-integration tests exist to prove. Treat them as the seam to update once a
-developer runs those tests, not as verified-correct markup matching.
+LIVE SHAPE (verified 2026-07-07 against a real fetch of
+``/library?query=gear``): library result cards are anchors of the form
+``<a href="/library/<slug>" class="modelLink">`` that wrap an
+``<img class="previewImage" ... alt="<Model Title>" ...>``. The model title
+is the img ``alt`` attribute; the model URL is ``BASE_URL`` + the
+``/library/<slug>`` href. The page carries ~24 such cards per query. We
+dedupe by href and skip the ``/library/new`` upload utility link (which uses
+a ``btn`` class, not ``modelLink``). The download regex on the detail page
+(``acquire``) is still a best-effort seam pending a live logged-in fetch.
 """
 from __future__ import annotations
 
+import html as _html
 import re
 
 from .. import session as _session
@@ -30,10 +35,12 @@ LICENSE_NOTE = (
 )
 
 _LOGIN_WALL_MARKERS = ('Log in to GrabCAD', 'id="user_email"', 'class="login-form"')
-# Best-effort: GrabCAD library result cards link to /library/<slug>.
+# Verified 2026-07-07: library result cards are `modelLink` anchors wrapping a
+# `previewImage` img whose `alt` attribute is the model title.
 _RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*card-title[^"]*"[^>]+href="(?P<href>/library/[^"?#]+)"[^>]*>'
-    r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
+    r'<a[^>]+href="(?P<href>/library/[^"?#]+)"[^>]*class="[^"]*\bmodelLink\b[^"]*"[^>]*>'
+    r'\s*<img[^>]*class="[^"]*\bpreviewImage\b[^"]*"[^>]*\balt="(?P<title>[^"]*)"',
+    re.IGNORECASE | re.DOTALL)
 # Best-effort: a model detail page's direct CAD download link.
 _DOWNLOAD_RE = re.compile(
     r'href="(?P<href>[^"]+\.(?:step|stp|iges|igs)(?:\?[^"]*)?)"', re.IGNORECASE)
@@ -54,10 +61,19 @@ class GrabCADAdapter:
         content = result.get("content", "")
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
             return [login_required(SITE, url)]
-        return [
-            {"title": _strip_tags(m.group("title")), "url": BASE_URL + m.group("href"), "site": SITE}
-            for m in _RESULT_RE.finditer(content)
-        ]
+        hits: list[dict] = []
+        seen: set[str] = set()
+        for m in _RESULT_RE.finditer(content):
+            href = m.group("href")
+            if href == "/library/new" or href in seen:
+                continue
+            seen.add(href)
+            hits.append({
+                "title": _html.unescape(m.group("title")).strip(),
+                "url": BASE_URL + href,
+                "site": SITE,
+            })
+        return hits
 
     def acquire(self, result: dict) -> dict:
         url = result.get("url", "")

@@ -3,12 +3,17 @@
 // Architecture (pattern library §0/§1):
 //   - View-model: aicad::ui::PartsPanelModel (ui/abstract/parts_view.h, no ImGui/GL includes)
 //   - Scaffold: ui::drawPanelScaffold / ui::drawPanelEmptyState (T-U1 kit)
-//   - Worker RPC: s.rpc.call("part_search" / "part_get" / "part_place") via AsyncRpc
+//   - Worker RPC: s.rpc.call("part_search" / "part_get" / "part_place" /
+//                            "vendor_status" / "vendor_login" /
+//                            "scrape_enqueue" / "scrape_queue_status") via AsyncRpc
 //   - State machine: PartsPanelState enum drives typed placeholder vocab (pattern §4)
 //   - Row pills: theme::glassRowBackground (pattern §2)
 //   - Domain filter chips: compact toggleable SmallButtons in the search row area
+//   - Vendor sources pane: collapsible tree with per-source status + "Log in…" button
+//   - Queue status pane: collapsible, shows background scrape/download progress
 
 #include "parts_panel.h"
+#include "workspace_parts.h"   // partsSetNavDomain declaration
 #include "panel_scaffold.h"
 #include "parts_view.h"   // ui/abstract/ (added to include path in CMakeLists — no ImGui includes)
 
@@ -37,6 +42,11 @@ aicad::ui::PartsPanelModel gModel;
 std::string gLastQuery;
 std::string gLastDomain;
 
+// Nav rail domain pending set (from workspace_parts.cpp nav click).
+// Cleared to "" after it is consumed in drawPartsPanel().
+static std::string gPendingNavDomain;
+static bool        gNavDomainPending = false;
+
 // Ordered domain filter chip list (blank = All).
 struct DomainChip { const char* label; const char* domain; };
 static const DomainChip kDomainChips[] = {
@@ -48,7 +58,39 @@ static const DomainChip kDomainChips[] = {
     {"Fitting",  "fitting"},
     {"Hydraulic","hydraulic"},
     {"ECAD",     "ecad"},
+    {"Catalog",  "catalog"},
 };
+
+// ---- Vendor sources model --------------------------------------------------------
+struct VendorSourceStatus {
+    std::string key;           // adapter key, e.g. "mcmaster"
+    std::string label;         // display label
+    bool        logged_in = false;
+    std::string last_login;    // ISO timestamp or empty
+    bool        login_in_flight = false;
+    std::string login_error;
+};
+static std::vector<VendorSourceStatus> gVendorSources;
+static bool gVendorLoaded = false;      // have we fetched status at least once?
+static bool gVendorLoading = false;     // vendor_status RPC in-flight
+
+// ---- Queue model -----------------------------------------------------------------
+struct QueueEntry {
+    std::string id;
+    std::string site;
+    std::string query;
+    std::string status;  // "pending"|"running"|"done"|"error"
+    std::string artifact_path;
+    std::string error_msg;
+};
+static std::vector<QueueEntry> gQueue;
+static bool gQueueLoading = false;
+static std::string gEnqueueSite;
+static std::string gEnqueueQuery;
+static char        gEnqueueSiteBuf[64]  = {};
+static char        gEnqueueQueryBuf[128] = {};
+static std::string gEnqueueError;
+static bool        gEnqueueRunning = false;
 
 // ---- RPC helpers -----------------------------------------------------------------
 
@@ -193,6 +235,88 @@ void firePartPlace(app::AppState& s, const std::string& part_id) {
     });
 }
 
+void fireVendorStatus(app::AppState& s) {
+    gVendorLoading = true;
+    s.rpc.call("vendor_status", {}, [](const core::RpcResult& r) {
+        gVendorLoading = false;
+        gVendorLoaded  = true;
+        gVendorSources.clear();
+        if (!r.ok) return;
+        const auto& res = r.result;
+        if (!res.value("ok", false)) return;
+        if (!res.contains("sources") || !res["sources"].is_array()) return;
+        for (const auto& src : res["sources"]) {
+            VendorSourceStatus v;
+            v.key        = src.value("key",        std::string());
+            v.label      = src.value("label",      v.key);
+            v.logged_in  = src.value("logged_in",  false);
+            v.last_login = src.value("last_login",  std::string());
+            gVendorSources.push_back(std::move(v));
+        }
+    });
+}
+
+void fireVendorLogin(app::AppState& s, int idx) {
+    if (idx < 0 || idx >= (int)gVendorSources.size()) return;
+    auto& vs = gVendorSources[idx];
+    vs.login_in_flight = true;
+    vs.login_error.clear();
+    const std::string site = vs.key;
+    s.rpc.call("vendor_login", {{"site", site}}, [idx](const core::RpcResult& r) {
+        if (idx >= (int)gVendorSources.size()) return;
+        auto& vs2 = gVendorSources[idx];
+        vs2.login_in_flight = false;
+        if (!r.ok) { vs2.login_error = r.err; return; }
+        const auto& res = r.result;
+        if (!res.value("ok", false)) {
+            vs2.login_error = res.value("reason", std::string("login failed"));
+            return;
+        }
+        vs2.logged_in  = true;
+        vs2.last_login = res.value("last_login_ts", std::string());
+        vs2.login_error.clear();
+    });
+}
+
+void fireQueueStatus(app::AppState& s) {
+    gQueueLoading = true;
+    s.rpc.call("scrape_queue_status", {}, [](const core::RpcResult& r) {
+        gQueueLoading = false;
+        gQueue.clear();
+        if (!r.ok) return;
+        const auto& res = r.result;
+        if (!res.value("ok", false)) return;
+        if (!res.contains("jobs") || !res["jobs"].is_array()) return;
+        for (const auto& job : res["jobs"]) {
+            QueueEntry e;
+            e.id            = job.value("id",            std::string());
+            e.site          = job.value("site",           std::string());
+            e.query         = job.value("query",          std::string());
+            e.status        = job.value("status",         std::string("pending"));
+            e.artifact_path = job.value("artifact_path",  std::string());
+            e.error_msg     = job.value("error",          std::string());
+            gQueue.push_back(std::move(e));
+        }
+    });
+}
+
+void fireEnqueue(app::AppState& s, const std::string& site, const std::string& query) {
+    gEnqueueRunning = true;
+    gEnqueueError.clear();
+    s.rpc.call("scrape_enqueue", {{"site", site}, {"query", query}},
+               [](const core::RpcResult& r) {
+        gEnqueueRunning = false;
+        if (!r.ok) { gEnqueueError = r.err; return; }
+        const auto& res = r.result;
+        if (!res.value("ok", false)) {
+            gEnqueueError = res.value("reason", std::string("enqueue failed"));
+            return;
+        }
+        gEnqueueError.clear();
+        // Refresh the queue display.
+    });
+}
+
 // ---- Draw helpers ----------------------------------------------------------------
 
 // Domain filter chip row.
@@ -211,7 +335,8 @@ void drawDomainChips(app::AppState& s, const std::string& currentQuery) {
             if (!active) {
                 gModel.domainFilter = chip.domain;
                 // Re-fire search with new domain filter.
-                fireSearch(s, currentQuery, gModel.domainFilter);
+                if (!currentQuery.empty())
+                    fireSearch(s, currentQuery, gModel.domainFilter);
             }
         }
         if (active) ImGui::PopStyleColor(3);
@@ -382,6 +507,184 @@ void drawDetailCard(app::AppState& s) {
     }
 }
 
+// ---- Vendor sources pane ---------------------------------------------------------
+// (c) Collapsible section: per-source status dot + "Log in…" button that triggers
+//     browser_login (headed Chromium window) via the vendor_login RPC.
+void drawVendorSources(app::AppState& s) {
+    const float S = theme::S();
+
+    ImGui::Dummy(ImVec2(0, 4.f * S));
+    ImGui::Separator();
+    if (!ImGui::CollapsingHeader("Vendor Sources")) return;
+    ImGui::Dummy(ImVec2(0, 2.f * S));
+
+    // Load on first open.
+    if (!gVendorLoaded && !gVendorLoading && s.workerStarted) {
+        fireVendorStatus(s);
+    }
+
+    if (gVendorLoading) {
+        ImGui::TextColored(TVEC(txt2), "Loading sources…");
+        return;
+    }
+    if (gVendorSources.empty()) {
+        ImGui::TextColored(TVEC(txt2), "No vendor adapters loaded.");
+        // Refresh button.
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Refresh") && s.workerStarted) {
+            gVendorLoaded = false;
+            fireVendorStatus(s);
+        }
+        return;
+    }
+
+    // Table: source name | status | action
+    if (ImGui::BeginTable("##vendorSrc", 3,
+            ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH)) {
+        ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthStretch, 0.40f);
+        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch, 0.35f);
+        ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthStretch, 0.25f);
+        ImGui::TableHeadersRow();
+
+        for (int i = 0; i < (int)gVendorSources.size(); ++i) {
+            auto& vs = gVendorSources[i];
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(vs.label.c_str());
+
+            ImGui::TableSetColumnIndex(1);
+            if (vs.login_in_flight) {
+                ImGui::TextColored(TVEC(txt2), "Logging in…");
+            } else if (!vs.login_error.empty()) {
+                ImGui::TextColored(TVEC(bad), "Error");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", vs.login_error.c_str());
+            } else if (vs.logged_in) {
+                ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.3f, 1.f), "Logged in");
+                if (!vs.last_login.empty() && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Last login: %s", vs.last_login.c_str());
+            } else {
+                ImGui::TextColored(TVEC(txt2), "Not logged in");
+            }
+
+            ImGui::TableSetColumnIndex(2);
+            ImGui::PushID(i);
+            const bool busy = vs.login_in_flight;
+            if (busy) ImGui::BeginDisabled();
+            if (ImGui::SmallButton(vs.logged_in ? "Re-login" : "Log in…")) {
+                if (s.workerStarted) fireVendorLogin(s, i);
+            }
+            if (busy) ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Opens a browser window for you to sign into %s.\n"
+                                  "Close the window when done — your session is saved locally.",
+                                  vs.label.c_str());
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    // Refresh button.
+    ImGui::Dummy(ImVec2(0, 2.f * S));
+    if (ImGui::SmallButton("Refresh status") && s.workerStarted && !gVendorLoading) {
+        gVendorLoaded = false;
+        fireVendorStatus(s);
+    }
+}
+
+// ---- Queue status pane -----------------------------------------------------------
+// (d) Collapsible section showing enqueue form + job list with progress.
+void drawQueueStatus(app::AppState& s) {
+    const float S = theme::S();
+
+    ImGui::Dummy(ImVec2(0, 4.f * S));
+    if (!ImGui::CollapsingHeader("Download Queue")) return;
+    ImGui::Dummy(ImVec2(0, 2.f * S));
+
+    // Enqueue form.
+    ImGui::PushFont(theme::font(theme::Font::Body));
+    ImGui::TextColored(TVEC(txt1), "Enqueue a vendor search:");
+    ImGui::PopFont();
+    ImGui::Dummy(ImVec2(0, 2.f * S));
+
+    ImGui::PushItemWidth(100.f * S);
+    ImGui::InputText("Site##eq_site", gEnqueueSiteBuf, sizeof(gEnqueueSiteBuf));
+    ImGui::SameLine(0, 4.f * S);
+    ImGui::SetNextItemWidth(180.f * S);
+    ImGui::InputText("Query##eq_query", gEnqueueQueryBuf, sizeof(gEnqueueQueryBuf));
+    ImGui::PopItemWidth();
+    ImGui::SameLine(0, 4.f * S);
+
+    const bool canEnqueue = gEnqueueSiteBuf[0] && gEnqueueQueryBuf[0] &&
+                            !gEnqueueRunning && s.workerStarted;
+    if (!canEnqueue) ImGui::BeginDisabled();
+    if (ImGui::SmallButton("Enqueue")) {
+        fireEnqueue(s, gEnqueueSiteBuf, gEnqueueQueryBuf);
+    }
+    if (!canEnqueue) ImGui::EndDisabled();
+
+    if (!gEnqueueError.empty()) {
+        ImGui::TextColored(TVEC(bad), "Enqueue error: %s", gEnqueueError.c_str());
+    }
+
+    ImGui::Dummy(ImVec2(0, 4.f * S));
+
+    // Job list — always refresh on first open; button to force refresh.
+    if (gQueue.empty() && !gQueueLoading && s.workerStarted) {
+        fireQueueStatus(s);
+    }
+
+    bool refreshBtn = ImGui::SmallButton("Refresh##q");
+    if (refreshBtn && s.workerStarted && !gQueueLoading) fireQueueStatus(s);
+
+    ImGui::Dummy(ImVec2(0, 2.f * S));
+    if (gQueueLoading) {
+        ImGui::TextColored(TVEC(txt2), "Loading…");
+        return;
+    }
+    if (gQueue.empty()) {
+        ImGui::TextColored(TVEC(txt2), "Queue is empty.");
+        return;
+    }
+
+    if (ImGui::BeginTable("##queueJobs", 4,
+            ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerH |
+            ImGuiTableFlags_ScrollY, ImVec2(0, 120.f * S))) {
+        ImGui::TableSetupColumn("Site",    ImGuiTableColumnFlags_WidthStretch, 0.18f);
+        ImGui::TableSetupColumn("Query",   ImGuiTableColumnFlags_WidthStretch, 0.40f);
+        ImGui::TableSetupColumn("Status",  ImGuiTableColumnFlags_WidthStretch, 0.22f);
+        ImGui::TableSetupColumn("Result",  ImGuiTableColumnFlags_WidthStretch, 0.20f);
+        ImGui::TableHeadersRow();
+
+        for (const auto& job : gQueue) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(job.site.c_str());
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(job.query.c_str());
+            ImGui::TableSetColumnIndex(2);
+            ImVec4 col = TVEC(txt2);
+            if (job.status == "done")    col = ImVec4(0.3f, 0.9f, 0.3f, 1.f);
+            if (job.status == "error")   col = TVEC(bad);
+            if (job.status == "running") col = TVEC(accent);
+            ImGui::TextColored(col, "%s", job.status.c_str());
+            if (job.status == "error" && !job.error_msg.empty() && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", job.error_msg.c_str());
+            ImGui::TableSetColumnIndex(3);
+            if (job.status == "done" && !job.artifact_path.empty()) {
+                // Truncate to filename for display.
+                const auto slash = job.artifact_path.rfind('/');
+                const std::string fname = (slash != std::string::npos)
+                    ? job.artifact_path.substr(slash + 1) : job.artifact_path;
+                ImGui::TextColored(TVEC(txt2), "%s", fname.c_str());
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", job.artifact_path.c_str());
+            }
+        }
+        ImGui::EndTable();
+    }
+}
+
 // ---- Top-level draw --------------------------------------------------------------
 
 void drawContent(app::AppState& s) {
@@ -409,6 +712,10 @@ void drawContent(app::AppState& s) {
     default:
         break;
     }
+
+    // Vendor sources + download queue panes (collapsible, at the bottom).
+    drawVendorSources(s);
+    drawQueueStatus(s);
 }
 
 }  // namespace
@@ -416,6 +723,17 @@ void drawContent(app::AppState& s) {
 // ---- Public API ------------------------------------------------------------------
 
 void drawPartsPanel(app::AppState& s) {
+    // Consume any pending nav domain set from workspace_parts.cpp nav rail click.
+    if (gNavDomainPending) {
+        gNavDomainPending = false;
+        if (gModel.domainFilter != gPendingNavDomain) {
+            gModel.domainFilter = gPendingNavDomain;
+            if (!gScaffoldState.searchText.empty() && s.workerStarted) {
+                fireSearch(s, gScaffoldState.searchText, gModel.domainFilter);
+            }
+        }
+    }
+
     ui::PanelScaffoldSpec spec;
     spec.id         = "parts_browser";
     spec.title      = "Parts Browser";
@@ -445,6 +763,11 @@ void drawPartsPanel(app::AppState& s) {
 void openPartsPanel() { gOpen = true; }
 
 bool* partsPanelOpen() { return &gOpen; }
+
+void partsSetNavDomain(const std::string& domain) {
+    gPendingNavDomain = domain;
+    gNavDomainPending = true;
+}
 
 void seedPartsPanelFromJson(const std::string& json_result, const std::string& query) {
     // Called from scenarios.cpp tickSimpleShots to pre-populate the model for headless shots.

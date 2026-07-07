@@ -1,21 +1,22 @@
 // Parts Library workspace body — full-viewport standard parts catalog browser.
 //
-// Backend: drawPartsPanel(s) (parts_panel.h — T-U2) provides federated search,
-// detail cards, and insert-via-part_place. In the old layout this lived as a
-// side panel; this workspace gives it a full-screen home so users can browse the
-// catalog without the 3D viewport competing for space.
+// Layout (phase-2 implementation):
+//   +----------------------------------------------+
+//   | [Parts Library title]  [/ search shortcut]   |
+//   | [Fasteners] [Bearings] [Seals] … nav rail     |
+//   +------+---------------------------------------+
+//   | LEFT | Category / filter breadcrumb          |
+//   | nav  | search bar + domain chips             |
+//   | rail | result rows                           |
+//   |      +---------------------------------------+
+//   |      | detail card + Insert button           |
+//   +------+---------------------------------------+
+//   | Vendor Sources pane (collapsible)            |
+//   +----------------------------------------------+
 //
-// Phase-2 agents: add a workspace header BEFORE the parts panel content:
-//   - "Parts Library" title on the left
-//   - Category nav rail (Fasteners / Bearings / Seals / Custom / Favorites)
-//   - Keyboard shortcut hints (/ to focus search, Enter to insert)
-//   - Insert-into-model button (wired to "parts_insert" dispatch, or openPartsPanel()
-//     followed by part_place RPC once a part is selected)
-// The drawPartsPanel body already handles search + results + detail card; the
-// header just adds navigation context.
-//
-// Note: openPartsPanel() / partsPanelOpen() are for the old side-pane mode;
-// in this workspace the panel body renders directly without the Begin/End pane wrapper.
+// Wiring: viewport.cpp calls drawPartsWorkspace() when workspace == PartsLibrary
+// (full-viewport content-swap — no 3D scene beneath).
+
 #include "ui/workspace_parts.h"
 #include "ui/parts_panel.h"
 #include "app/app_state.h"
@@ -23,29 +24,86 @@
 #include "theme/tokens.h"
 #include "imgui.h"
 
+#include <array>
+#include <cstring>
+
 namespace ui {
+
+namespace {
+
+// Category nav rail entries.  "All" maps to domain="" (same as clicking "All" chip).
+struct NavEntry { const char* icon; const char* label; const char* domain; };
+static const std::array<NavEntry, 9> kNavEntries = {{
+    { "P", "All",        ""           },
+    { "F", "Fasteners",  "fastener"   },
+    { "B", "Bearings",   "bearing"    },
+    { "M", "Mechanical", "mech_family"},
+    { "S", "Sections",   "section"    },
+    { "T", "Fittings",   "fitting"    },
+    { "H", "Hydraulic",  "hydraulic"  },
+    { "E", "ECAD",       "ecad"       },
+    { "C", "Catalog",    "catalog"    },
+}};
+
+static int gNavSel = 0;   // index into kNavEntries
+
+} // namespace
 
 void drawPartsWorkspace(app::AppState& s) {
     const float S = theme::S();
+    const float NAV_W = 100.f * S;   // left nav rail width
 
-    // Minimal header bar — "Parts Library" title.
-    // TODO(phase-2 parts): replace with full category nav rail + filter chips.
+    // ---- Workspace title bar ------------------------------------------------
     ImGui::PushFont(theme::font(theme::Font::H2));
     ImGui::TextUnformatted("Parts Library");
     ImGui::PopFont();
+    ImGui::SameLine(0, 12.f * S);
     ImGui::PushFont(theme::font(theme::Font::Body));
-    ImGui::PushStyleColor(ImGuiCol_Text, TCOL(txt1));
-    ImGui::TextUnformatted("Standard parts, fasteners, and custom catalog");
+    ImGui::PushStyleColor(ImGuiCol_Text, TCOL(txt2));
+    ImGui::TextUnformatted("Press / to search");
     ImGui::PopStyleColor();
     ImGui::PopFont();
-    ImGui::Dummy(ImVec2(0, 6.f * S));
     ImGui::Separator();
-    ImGui::Dummy(ImVec2(0, 4.f * S));
 
-    // Delegate to the existing Parts Panel (live backend — do not replace).
-    // drawPartsPanel renders its own PanelScaffold header ("Parts") + search bar;
-    // it runs headlessly via AI_CAD_SHOT=parts_browser fixture seeding.
+    // ---- Two-column layout: nav rail | main panel ---------------------------
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+
+    // Left column: nav rail
+    ImGui::BeginChild("##partsNav", ImVec2(NAV_W, avail.y), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar);
+    {
+        const float btnW = NAV_W - 8.f * S;
+        ImGui::Dummy(ImVec2(0, 4.f * S));
+        for (int i = 0; i < (int)kNavEntries.size(); ++i) {
+            const auto& e = kNavEntries[i];
+            const bool active = (gNavSel == i);
+            if (active) {
+                ImGui::PushStyleColor(ImGuiCol_Button,        TVEC(accent));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, TVEC(accent));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,  TVEC(accent));
+            }
+            ImGui::PushID(i);
+            if (ImGui::Button(e.label, ImVec2(btnW, 0))) {
+                if (!active) {
+                    gNavSel = i;
+                    // Propagate category selection into the parts panel domain filter.
+                    // The panel picks this up next frame via partsSetNavDomain().
+                    partsSetNavDomain(e.domain);
+                }
+            }
+            ImGui::PopID();
+            if (active) ImGui::PopStyleColor(3);
+            ImGui::Spacing();
+        }
+    }
+    ImGui::EndChild();
+
+    ImGui::SameLine(0, 4.f * S);
+
+    // Right column: the actual parts browser panel (search + results + detail card)
+    ImGui::BeginChild("##partsMain", ImVec2(0, avail.y), ImGuiChildFlags_None);
     ui::drawPartsPanel(s);
+    ImGui::EndChild();
 }
 
 } // namespace ui

@@ -20,6 +20,10 @@ void openPartsPanel();
 // The pane's open flag — application.cpp passes it to ImGui::Begin as p_open (close box).
 bool* partsPanelOpen();
 
+// Set the active domain filter from the nav rail (workspace_parts.cpp).
+// Applied on the next drawPartsPanel() call; re-fires the current query with the new domain.
+void partsSetNavDomain(const std::string& domain);
+
 // Seed the panel model from a part_search JSON result (scenario/shot use only — populates
 // gModel so the headless screenshot shows real results without needing a live async RPC round).
 // json_result is the raw JSON string returned by the part_search worker method.

@@ -403,6 +403,19 @@ struct ActivityItem {
     bool expanded = false; // user toggled this row open to read the detail
     bool missionHeader = false;  // a top-level mission TASK row ("Wind-tunnel it"); its sub-run
                                  // stages (intake/model/...) follow it, namespaced by task index
+    // ---- typed transparency rows (M12-M14, aicad.agent_events/2) ----
+    // 0 = orchestrator stage row (everything above, unchanged default);
+    // 1 = context injection chip (agent.context_injected): title=label, reason=source,
+    //     ctxTokens=token_est (M12);
+    // 2 = model thought box (agent.thought / agent.thought.delta): detail=text, streaming while
+    //     deltas arrive, collapsed-by-default once complete (M13);
+    // 3 = tool call row (agent.tool_call): title=tool_name, reason=target ("what it acts on"),
+    //     durationMs=latency_ms, status=done|fail from `ok` (M14).
+    int rowKind = 0;
+    int ctxTokens = 0;      // rowKind 1: best-effort injected-token estimate (kept out of the
+                            // turn's usage footer — it is not model I/O)
+    bool streaming = false; // rowKind 2: agent.thought.delta chunks still arriving; finalized
+                            // (and auto-collapsed) by the matching completed agent.thought
 };
 
 struct ChatMsg {

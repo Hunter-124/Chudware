@@ -564,7 +564,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
     } else if (kind == "mission_finished") {
         m.curMissionTask = -1;
         for (auto& a : m.activity)
-            if (a.status == "running" || a.status.empty()) a.status = "done";
+            if (a.status == "running" || a.status.empty()) { a.status = "done"; a.streaming = false; }
     } else if (kind == "stage_started") {
         std::string s = nsKey(jstr(data, "stage"));
         ActivityItem* a = findStage(s);
@@ -600,7 +600,69 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         // for the CURRENT task; mission_finished does the final sweep. Outside a mission this
         // closes everything, as before.
         for (auto& a : m.activity)
-            if ((a.status == "running" || a.status.empty()) && !a.missionHeader) a.status = "done";
+            if ((a.status == "running" || a.status.empty()) && !a.missionHeader) {
+                a.status = "done";
+                a.streaming = false;  // finalize any still-open thought box (M13)
+            }
+    }
+    // ---- M12-M14: typed transparency rows from the aicad.agent_events/2 stream ----
+    // These arrive through the SAME app.cpp drain as the stage events above (kind already has the
+    // "orch_" prefix stripped; `data` is the parsed /2 record with envelope + payload fields at
+    // top level). Each event appends a typed row at its ARRIVAL POSITION in the running turn's
+    // timeline, interleaving naturally with the stage rows. Span-id keys ("ctx:"/"thought:"/
+    // "tool:" + id) can never collide with the orchestrator stage keys.
+    else if (kind == "agent.context_injected") {                     // M12 — context chip
+        ActivityItem ni;
+        ni.rowKind = 1;
+        ni.stage   = "ctx:" + jstr(data, "id");
+        ni.title   = jstr(data, "label");
+        if (ni.title.empty()) ni.title = "context";
+        ni.reason    = jstr(data, "source");
+        ni.ctxTokens = jint(data, "token_est");
+        ni.status    = "done";
+        m.activity.push_back(std::move(ni));
+    } else if (kind == "agent.thought.delta" || kind == "agent.thought") {  // M13 — thought box
+        // Deltas sharing a parent span coalesce into ONE growing block, finalized by the matching
+        // completed agent.thought (contract §3.2). The provider seam is non-streaming today, so
+        // in practice whole agent.thought blocks land per-block on arrival; the delta path is
+        // coded so live token streaming lights up the moment a streaming provider ships.
+        std::string pid = jstr(data, "parent_id");
+        if (pid.empty()) pid = jstr(data, "node_id");
+        const std::string key = "thought:" + pid;
+        ActivityItem* a = nullptr;
+        for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
+            if (it->rowKind == 2 && it->stage == key && it->streaming) { a = &*it; break; }
+        if (!a) {
+            ActivityItem ni;
+            ni.rowKind = 2;
+            ni.stage   = key;
+            ni.title   = "Thoughts";
+            m.activity.push_back(std::move(ni));
+            a = &m.activity.back();
+        }
+        if (kind == "agent.thought.delta") {
+            a->detail += jstr(data, "text");
+            a->streaming = true;
+            a->status    = "running";
+        } else {
+            // Completed block: authoritative text replaces any delta accumulation (same content,
+            // possibly truncated per contract), then the box finalizes + auto-collapses.
+            std::string txt = jstr(data, "text");
+            if (!txt.empty() || a->detail.empty()) a->detail = txt;
+            a->streaming = false;
+            a->status    = "done";
+        }
+    } else if (kind == "agent.tool_call") {                          // M14 — tool call row
+        ActivityItem ni;
+        ni.rowKind = 3;
+        ni.stage   = "tool:" + jstr(data, "id");
+        ni.title   = jstr(data, "tool_name");
+        if (ni.title.empty()) ni.title = "tool";
+        ni.reason     = jstr(data, "target");   // human "what it acts on" (may be "")
+        ni.durationMs = jint(data, "latency_ms");
+        const bool ok = !data.is_object() || data.value("ok", true);
+        ni.status     = ok ? "done" : "fail";
+        m.activity.push_back(std::move(ni));
     }
 }
 
@@ -1084,17 +1146,157 @@ static void drawActionCard(ActivityItem& a, AgentStep* step, const ui::Fonts& fo
     }
 }
 
+// ============================ M12-M14: inline transparency rows ============================
+// Typed rows fed from the aicad.agent_events/2 stream (feedTurnActivity), rendered inline in the
+// same timeline as the orchestrator stage rows — subdued and informational, visually distinct
+// from the user/assistant bubbles. Nothing is fabricated: no events => none of these render.
+
+// M12 — a compact, dim one-line chip for a context injection: source + label + ~token count.
+static void drawContextChip(const ActivityItem& a, const ui::Fonts& fonts) {
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, 1 * sc));
+    ui::IconUV iv = ui::getIcon("bookmark", 20);
+    if (iv.valid) {
+        float gz = ImGui::GetTextLineHeight() * 0.85f;
+        ImVec4 tint(surf.textTertiary.x, surf.textTertiary.y, surf.textTertiary.z, 0.9f);
+        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, tint);
+        ImGui::SameLine(0, 5 * sc);
+    }
+    std::string line = "Context";
+    if (!a.reason.empty()) line += " \xc2\xb7 " + a.reason;          // source (ledger/memory/...)
+    line += ": " + a.title;                                          // human label
+    if (a.ctxTokens > 0) line += "  (~" + std::to_string(a.ctxTokens) + " tok)";
+    ImGui::PushFont(fonts.body);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+    ImGui::TextWrapped("%s", line.c_str());
+    ImGui::PopStyleColor();
+    ImGui::PopFont();
+}
+
+// M13 — the model's thoughts in a collapsible textbox. While deltas stream (a.streaming) the box
+// stays open so tokens appear live; a completed block auto-collapses to a one-line preview unless
+// the user pinned it open. `showThinking` off -> a single dim one-liner (matches drawThinkingBlock).
+static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThinking) {
+    const float sc = ui::uiScale;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    if (!showThinking) {
+        ImGui::PushFont(fonts.body);
+        ImGui::TextColored(surf.textSecondary, "Thoughts");
+        ImGui::PopFont();
+        return;
+    }
+    const bool open = a.expanded || a.streaming;
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::BeginChild("##thoughtbox", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PushFont(fonts.body);
+    ImGui::TextColored(surf.textSecondary, "%s", a.streaming ? "Thinking\xe2\x80\xa6" : "Thoughts");
+    ImGui::PopFont();
+    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (ImGui::IsItemClicked()) a.expanded = !open;
+    ImGui::SameLine(0, 6 * sc);
+    ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+    ImGui::TextUnformatted(open ? "(hide)" : "(show)");
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (ImGui::IsItemClicked()) a.expanded = !open;
+    if (open) {
+        if (!a.detail.empty())
+            drawProseBox("##thoughttxt", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
+    } else if (!a.detail.empty()) {
+        // Collapsed: a dim one-line preview (first line, ellipsized).
+        std::string prev = a.detail.substr(0, a.detail.find('\n'));
+        if (prev.size() > 110) { prev.resize(110); prev += "\xe2\x80\xa6"; }
+        else if (prev.size() < a.detail.size()) prev += " \xe2\x80\xa6";
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
+        ImGui::TextUnformatted(stripMdMarks(prev).c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::EndChild();
+    endGlassBubble(gb);
+}
+
+// M14 — one inline row per tool call: ok/fail glyph + tool icon + tool name + latency, with the
+// human-readable target ("what it acts on") as a dim wrapped line beneath. Every tool the AI
+// touches shows in the chat; a long detail body (future args capture) expands on click.
+static void drawToolCallRow(ActivityItem& a, const ui::Fonts& fonts) {
+    const auto& pal = ui::palette;
+    const float sc = ui::uiScale;
+    const bool fail = a.status == "fail";
+    ImGui::Dummy(ImVec2(0, 2 * sc));
+    GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
+    ImGui::BeginChild("##toolrow", ImVec2(0, 0),
+                      ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    const ui::AdaptiveSurface& surf = chatSurf();
+    drawStatusGlyph(a.status, ImGui::GetTextLineHeight());
+    ImGui::SameLine(0, 6 * sc);
+    ui::IconUV iv = ui::getIcon("wrench", 20);
+    if (iv.valid) {
+        float gz = ImGui::GetTextLineHeight();
+        ImVec4 tint(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.85f);
+        ImGui::Image(iv.texId, ImVec2(gz, gz), iv.uv0, iv.uv1, tint);
+        ImGui::SameLine(0, 6 * sc);
+    }
+    ImGui::PushFont(fonts.medium);
+    ImGui::TextColored(fail ? semanticOnGlass(pal.statusErr, surf) : surf.textPrimary,
+                       "%s", a.title.c_str());
+    ImGui::PopFont();
+    if (!a.detail.empty()) {   // future args/detail capture — expandable drawer
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
+        ImGui::SameLine(0, 6 * sc);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted(a.expanded ? "(hide)" : "(details)");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked()) a.expanded = !a.expanded;
+    }
+    if (fail || a.durationMs > 0) {
+        ImGui::SameLine(0, 8 * sc);
+        char meta[64];
+        if (fail && a.durationMs > 0)
+            std::snprintf(meta, sizeof(meta), "failed \xc2\xb7 %.1fs", a.durationMs / 1000.0);
+        else if (fail)
+            std::snprintf(meta, sizeof(meta), "failed");
+        else
+            std::snprintf(meta, sizeof(meta), "%.1fs", a.durationMs / 1000.0);
+        ImGui::PushStyleColor(ImGuiCol_Text, fail ? semanticOnGlass(pal.statusErr, surf)
+                                                  : surf.textSecondary);
+        ImGui::TextUnformatted(meta);
+        ImGui::PopStyleColor();
+    }
+    if (!a.reason.empty()) dimText(a.reason.c_str());   // the human target — "what it acts on"
+    if (a.expanded && !a.detail.empty())
+        drawProseBox("##tooldetail", stripMdMarks(a.detail), ui::metrics::copilotProseMaxH());
+    ImGui::EndChild();
+    ImRect rowRect = endGlassBubble(gb);
+    if (fail)
+        ImGui::GetWindowDrawList()->AddRect(rowRect.Min, rowRect.Max,
+                                            ui::Palette::toU32(pal.statusErr),
+                                            8.0f * sc, 0, ui::metrics::stroke(1.5f));
+}
+
 // The agent timeline: dispatch each activity row to a thinking block or an action card, computing
 // the thinking auto-collapse (a thinking row collapses once a later stage reaches a verdict).
+// Typed /2 transparency rows (M12-M14) dispatch by rowKind first, at their arrival position.
 static void drawAgentTimeline(ChatMsg& m, const ui::Fonts& fonts, float logW, bool showThinking) {
     if (m.activity.empty()) return;
     ImGui::Dummy(ImVec2(0, 2 * ui::uiScale));
     for (size_t i = 0; i < m.activity.size(); ++i) {
         ActivityItem& a = m.activity[i];
         ImGui::PushID((int)i);
-        if (isThinkingItem(a)) {
+        if (a.rowKind == 1) {
+            drawContextChip(a, fonts);
+        } else if (a.rowKind == 2) {
+            drawThoughtBox(a, fonts, showThinking);
+        } else if (a.rowKind == 3) {
+            drawToolCallRow(a, fonts);
+        } else if (isThinkingItem(a)) {
             bool laterDone = false;
             for (size_t j = i + 1; j < m.activity.size(); ++j) {
+                if (m.activity[j].rowKind != 0) continue;   // transparency rows don't close stages
                 const std::string& s = m.activity[j].status;
                 if (s == "pass" || s == "done" || s == "fail" || s == "retry") { laterDone = true; break; }
             }
@@ -1200,7 +1402,10 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts, 
     } else {
         // (7) Usage footer — tokens + wall-time for the finished turn, dim (DESIGN §5).
         int tin = 0, tout = 0, tms = 0;
-        for (const auto& a : m.activity) { tin += a.tokensIn; tout += a.tokensOut; tms += a.durationMs; }
+        for (const auto& a : m.activity) {
+            if (a.rowKind != 0) continue;   // tool latency / ctx estimates aren't stage wall-time
+            tin += a.tokensIn; tout += a.tokensOut; tms += a.durationMs;
+        }
         if (tin > 0) {
             ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textTertiary);
             ImGui::Text("%d tokens in / %d out \xc2\xb7 %.1f s", tin, tout, tms / 1000.0);

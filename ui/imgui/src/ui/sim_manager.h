@@ -261,6 +261,15 @@ public:
     void openMaterialDialog() { matDialogOpen_ = true; }
     void debugSeedStaticResult(app::AppState& st, double vmMpa, double dispMm, double minFos);
 
+    // ---- scripted kinematics gate (scenarios.cpp ws_motion_study step machine) ----
+    // Seed a completed motion result into the active (or freshly created) Motion study and
+    // apply the requested frame so the viewport shows the posed assembly.
+    // Call after handleCommand(st,"sim_new_motion") to ensure a Motion study exists.
+    void seedMotionResult(app::AppState& st,
+                          const nlohmann::json& trajectory,
+                          const std::string& mateId,
+                          int frame);
+
     // Material lookup (singleton: built-in engine/sim/materials.json + user custom_materials.json).
     struct Material {
         std::string key, name;

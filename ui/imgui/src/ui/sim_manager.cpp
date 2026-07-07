@@ -1704,6 +1704,35 @@ void SimManager::debugSeedStaticResult(app::AppState& st, double vmMpa, double d
     advisorPostcheck(st, s);
 }
 
+void SimManager::seedMotionResult(app::AppState& st,
+                                   const nlohmann::json& trajectory,
+                                   const std::string& mateId,
+                                   int frame) {
+    // Ensure a Motion study is selected (create one if needed).
+    if (sel_ < 0 || sel_ >= (int)studies_.size() ||
+        studies_[sel_].type != StudyType::Motion) {
+        newStudy(st, StudyType::Motion);
+    }
+    if (sel_ < 0 || sel_ >= (int)studies_.size()) return;
+    Study& s = studies_[sel_];
+    s.motionHasResult  = true;
+    s.motionTrajectory = trajectory;
+    s.motionMateId     = mateId;
+    s.motionFrame      = 0;
+    s.motionPlaying    = false;
+    s.hasResult        = true;
+    s.motionDriverType = "angle";
+    s.motionDriverUnit = "deg";
+    int n = (int)trajectory.size();
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "Motion: %d frames | driver %s", n, mateId.c_str());
+    s.summary = buf;
+    node_ = SimNode::Results;
+    // Apply the requested frame to the viewport.
+    int clamped = (n > 0) ? std::min(std::max(frame, 0), n - 1) : 0;
+    applyMotionFrame(st, s, clamped);
+}
+
 // ---------------------------------------------------------------- tick / result view
 
 void SimManager::clearResultOverlay(app::AppState&) {

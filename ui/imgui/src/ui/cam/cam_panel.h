@@ -78,4 +78,18 @@ void camRegenFromPart(app::AppState& st);
 // Returns the cam job docId (empty on error).
 std::string camFindOrCreateJobForPart(app::AppState& st, const std::string& partDocId);
 
+// Section-switcher integration (c): call this from doc_tabs.cpp drawSectionSwitcher()
+// instead of the inline camActive check so the "CAM Job" chip appears for every
+// Part/Assembly tab (not just when camActive is already true — circular).
+//
+// Returns true when a CAM job is available or can be created for partDocId.
+// Always true for Part/Assembly tabs — the job is created on demand on click.
+// isCurrent is set to true when the CAM panel is currently the active view.
+//
+// On click from the switcher: call camActivateForPart(st, partDocId) — this is
+// the one-liner the integrator adds to doc_tabs.cpp drawSectionSwitcher's
+// clicked-and-not-current branch for the "CAM Job" entry.
+bool camHasJobForPart(const std::string& partDocId);
+void camActivateForPart(app::AppState& st, const std::string& partDocId);
+
 }  // namespace ui

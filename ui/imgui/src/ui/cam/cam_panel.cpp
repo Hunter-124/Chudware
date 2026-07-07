@@ -568,6 +568,22 @@ void camLoadJob(app::AppState& st, const std::string& docId) {
     camEnsureVisible();
 }
 
+// ---- section-switcher helpers (c) -------------------------------------------
+
+bool camHasJobForPart(const std::string& /*partDocId*/) {
+    // Currently always returns true for any Part tab — a CAM job can always be
+    // created on demand. A future enhancement could query the dep registry to check
+    // whether a job was already created, and show a filled vs. empty icon.
+    return true;
+}
+
+void camActivateForPart(app::AppState& st, const std::string& partDocId) {
+    // Resolve (find existing or create new) the CAM job for this part, then switch
+    // workspace to Manufacture so the Manufacture overlay becomes active.
+    camFindOrCreateJobForPart(st, partDocId);
+    st.workspace = cmd::Workspace::Manufacture;
+}
+
 // ---- workspace header strip (drawn above drawCamManager by workspace_manufacture.cpp) ----
 void drawCamWorkspaceHeader(app::AppState& st) {
     ImDrawList* dl = ImGui::GetWindowDrawList();

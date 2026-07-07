@@ -314,13 +314,17 @@ static const RibbonCmd kCmds[] = {
     { "pcb_add_zone",       "Copper Zone",    "rect_center",     "PCB Design", "Board",      false, nullptr, false },
     { "ecad_autoroute",     "Autoroute",      "sweep",           "PCB Design", "Board",      true,  nullptr, false },
     { "ecad_fill_zones",    "Fill Zones",     "shell",           "PCB Design", "Board",      false, nullptr, false },
-    { "ecad_run_drc",       "Run DRC",        "interference",    "PCB Design", "Board",      false, nullptr, false },
 
     // --- Group: Outputs ---
     { "ecad_to_3d",         "Board to 3D",    "extrude_boss",    "PCB Design", "Outputs",    true,  nullptr, false },
     { "ecad_export_gerber", "Gerbers",        "ref_plane",       "PCB Design", "Outputs",    false, nullptr, false },
     { "ecad_export_drill",  "Drill",          "hole_wizard",     "PCB Design", "Outputs",    false, nullptr, false },
     { "ecad_export_bom",    "BOM",            "bom",             "PCB Design", "Outputs",    false, nullptr, false },
+
+    // --- Group: Checks --- (Run DRC promoted to a big primary button to the right of Outputs,
+    // sized like Board to 3D / PCB Layout; the old small Board-group entry + the manager toolbar
+    // icon were removed so there is one obvious DRC affordance.)
+    { "ecad_run_drc",       "Run DRC",        "interference",    "PCB Design", "Checks",     true,  nullptr, false },
 
     // =========================================================================
     // Tab: Schematic  (split from the old "PCB" tab — schematic capture + analog sim)

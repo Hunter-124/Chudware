@@ -69,6 +69,10 @@ struct EcadEditorState {
     std::string healthMsg;
     int  healthLevel = 0;       // 0 ok, 1 warn, 2 error
     int  healthScannedRev = -1; // mirror revision the current healthMsg was computed for
+    std::string healthToasted;  // last healthMsg surfaced as a toast (post-once-per-change guard)
+    // Manager-tree row selection ("layer:<id>" / "net:<name>") — drives the fmRowPill selected
+    // highlight so Layers/Nets rows select + read like the Feature Manager's plane/feature rows.
+    std::string mgrSel;
 };
 
 namespace {
@@ -544,21 +548,27 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
     ui::fmPaneHeaderChip(st, titleBuf, "ai_panel", centerX);
     ImGui::Separator();
 
-    // Subtitle: file name + revision (folds in the removed canvas "File Display" row — item 4) plus
-    // the runtime workspace-health line (item 4 also removed the canvas status strip; it lives here
-    // now, right under the header, exactly where SolidWorks-style managers put document status).
+    // Doc name + revision row — carried on a glass fmRowPill (item: give "Board1 - rev N" a proper
+    // Feature-Manager-style background instead of bare dim text). fmRowStripeReset first so this is
+    // stripe 0 and the tree rows below alternate cleanly from it.
+    ui::fmRowStripeReset();
     {
         const std::string nm = m.name().empty() ? "(untitled)" : m.name();
-        char rev[24]; std::snprintf(rev, sizeof(rev), "rev %d", m.revision());
-        ImGui::TextColored(v4(pal.textDim), "%s  -  %s", nm.c_str(), rev);
+        ui::FmRowRect rr = ui::fmRowPill();
+        ImGui::TextColored(v4(pal.text), "%s", nm.c_str());
+        ImGui::SameLine();
+        ImGui::TextColored(v4(pal.textDim), "rev %d", m.revision());
+        ui::fmRowPillEnd(rr);
     }
+
+    // Workspace health: surfaced as a TOAST (posted once per change), not an inline strip — keeps
+    // the manager column clean (Hunter red-pen: the "! Board has no footprints…" line was rendering
+    // in the panel). scanEcadHealth only recomputes on a revision change, so healthMsg is stable
+    // frame-to-frame; gate the post on the message actually changing to avoid re-toasting every frame.
     scanEcadHealth(es);
-    if (!es.healthMsg.empty()) {
-        const ImVec4 hc = es.healthLevel >= 2 ? v4(pal.statusErr)
-                        : es.healthLevel == 1 ? v4(pal.statusWarn)
-                                              : v4(pal.statusOk);
-        ImGui::TextColored(hc, es.healthLevel == 0 ? "%s" : "! %s", es.healthMsg.c_str());
-    }
+    if (es.healthLevel >= 1 && es.healthMsg != es.healthToasted)
+        st.toast(es.healthLevel >= 2 ? ui::ToastLevel::Error : ui::ToastLevel::Warn, es.healthMsg);
+    es.healthToasted = es.healthMsg;
     ImGui::Spacing();
 
     // ---- icon toolbar row: Zoom Fit / Undo / Redo / Run DRC (pcb) or Annotate (sch) — same glass
@@ -566,7 +576,9 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
     // SmallButton row / the canvas-top checkButton. ----
     {
         const float bw = 24.0f * sc, gap = 4.0f * sc;
-        const int nBtn = 4;
+        // PCB's Run DRC moved to the ribbon (Checks group) — the toolbar keeps view + history only.
+        // Schematic keeps Annotate here (no ribbon home for it).
+        const int nBtn = pcb ? 3 : 4;
         const float toolW = nBtn * bw + (nBtn - 1) * gap;
         ImVec2 rowMin = ImGui::GetCursorScreenPos();
         const float availW = ImGui::GetContentRegionAvail().x;
@@ -579,12 +591,8 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         if (ui::fmToolbarIconBtn("ecad_undo", "undo", "Undo", true)) st.ecadUndoGo = true;
         ImGui::SameLine(0, gap);
         if (ui::fmToolbarIconBtn("ecad_redo", "redo", "Redo", true)) st.ecadRedoGo = true;
-        ImGui::SameLine(0, gap);
-        if (pcb) {
-            if (ui::fmToolbarIconBtn("ecad_drc", "health_check", "Run DRC — rebuild + re-check design rules",
-                                     true))
-                st.ecadPanelCmd = "ecad_run_drc";
-        } else {
+        if (!pcb) {
+            ImGui::SameLine(0, gap);
             if (ui::fmToolbarIconBtn("ecad_ann", "health_check",
                                      "Annotate — auto-assign reference designators", true))
                 st.ecadPanelCmd = "sch_annotate";
@@ -643,9 +651,9 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         ImGui::Spacing();
         ImGui::TextColored(v4(pal.textDim), "Route: click points; Esc / right-click to finish");
     } else if (st.ecadTool == 0) {
+        // Property inspector when something is selected; no idle "Select: click a part…" hint
+        // (Hunter red-pen — it read as out-of-place chrome in the manager column).
         if (drawPropInspector(st, es, sc)) ImGui::Spacing();
-        else ImGui::TextColored(v4(pal.textDim),
-                                "Select: click a part to edit; middle/right-drag to pan, wheel to zoom");
     }
 
     ImGui::Spacing();
@@ -658,19 +666,22 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
     ui::fmRowStripeReset();
     auto layerRow = [&](const EcadLayer& ly) {
         ImGui::PushID(ly.id.c_str());
-        ui::FmRowRect r = ui::fmRowPill();
+        const std::string selId = "layer:" + ly.id;
+        const bool sel = (es.mgrSel == selId);
         bool vis = m.layerVisible(ly.id);
-        const ImVec4 sw = layerSwatch(ly.copperIndex);
-        const float s = ImGui::GetTextLineHeight();
-        ImVec2 p0 = ImGui::GetCursorScreenPos();
-        ImGui::GetWindowDrawList()->AddRectFilled(p0, ImVec2(p0.x + s, p0.y + s),
-                                                  ui::Palette::toU32(&sw.x), 2.0f * sc);
-        ImGui::Dummy(ImVec2(s + 6.0f * sc, s));
+        ui::FmRowRect r = ui::fmRowPill(sel);
+        // Liquid-glass pill DYED the layer color: a translucent left→right color gradient over the
+        // glass (light alpha so it reads as a tint, never a deep/dark fill — text stays legible).
+        const ImVec4 c = layerSwatch(ly.copperIndex);
+        const ImU32 cL = ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, vis ? 0.34f : 0.16f));
+        const ImU32 cR = ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, vis ? 0.05f : 0.02f));
+        ImGui::GetWindowDrawList()->AddRectFilledMultiColor(r.mn, r.mx, cL, cR, cR, cL);
+        ImGui::Dummy(ImVec2(6.0f * sc, ImGui::GetTextLineHeight()));
         ImGui::SameLine();
         ImGui::TextColored(vis ? v4(pal.text) : v4(pal.textDisabled), "%s", ly.id.c_str());
-        ui::fmRowPillEnd(r);
+        ui::fmRowPillEnd(r, sel);
         // Right-edge eye toggle (show/hide the layer) — the SAME glyph + placement the Feature
-        // Manager uses on its plane rows, instead of the old checkbox, so layers read as tree rows.
+        // Manager uses on its plane rows. Clicking elsewhere on the row selects it (fmRowPill glow).
         const float eyeSz = 14.0f * sc, eyePad = 6.0f * sc;
         ImVec2 eMin(r.mx.x - eyeSz - eyePad, r.mn.y + (r.mx.y - r.mn.y - eyeSz) * 0.5f);
         ImVec2 eMax(eMin.x + eyeSz, eMin.y + eyeSz);
@@ -679,17 +690,26 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         if (overEye) {
             ImGui::SetTooltip(vis ? "Hide %s" : "Show %s", ly.id.c_str());
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) m.setLayerVisible(ly.id, !vis);
+        } else if (ImGui::IsMouseHoveringRect(r.mn, r.mx) &&
+                   ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            es.mgrSel = sel ? std::string() : selId;   // toggle row selection
         }
         ImGui::PopID();
     };
     auto netRow = [&](const EcadNet& n, bool withPins) {
-        ui::FmRowRect r = ui::fmRowPill();
+        ImGui::PushID(n.name.c_str());
+        const std::string selId = "net:" + n.name;
+        const bool sel = (es.mgrSel == selId);
+        ui::FmRowRect r = ui::fmRowPill(sel);
         ImGui::TextColored(v4(pal.text), "%s", n.name.c_str());
         if (withPins) {
             ImGui::SameLine();
             ImGui::TextColored(v4(pal.textDim), "(%d pins)", n.pinCount);
         }
-        ui::fmRowPillEnd(r);
+        ui::fmRowPillEnd(r, sel);
+        if (ImGui::IsMouseHoveringRect(r.mn, r.mx) && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            es.mgrSel = sel ? std::string() : selId;   // toggle row selection
+        ImGui::PopID();
     };
     if (pcb) {
         ui::fmSectionDivider("Layers");

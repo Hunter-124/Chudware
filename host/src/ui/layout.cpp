@@ -451,14 +451,60 @@ void drawLeftPane(AppState& st,
     // Electronics never called drawLeftPane and the published edge is frame-stamped stale by one
     // frame — see doc_tabs.cpp's overlayColumnEdge(0) consumer).
     if (st.activeWorkspace == AppState::Workspace::Electronics) {
-        // Transparent ChildBg so the manager body's inner BeginChild regions (the layers/nets tree,
-        // the results strip) show the column's own glass instead of ImGui's default opaque ChildBg —
-        // that opaque fill is what read as the flat "white bar" behind the Layers/Nets sections and
-        // left the toolbar/segment rows sitting on a slab instead of glass (Hunter red-pen). The
-        // Simulate/Manufacture/FeatureManager bodies all render on transparent children; this brings
-        // Electronics to the same standard.
+        // Electronics gets its own icon-tab rail (Explorer + PCB Manager) across the column top —
+        // same geometry + drawManagerTabButton chrome as the Model FeatureManager rail (Hunter
+        // red-pen: those tab buttons were missing here). No Configurations tab. PCB Manager uses the
+        // Feature Manager tree glyph (useTreeGlyph=true); Explorer uses the folder icon and hosts the
+        // workspace file browser. Selection is a local static (no AppState churn) — a pure UI toggle.
+        static int s_ecadTab = 1;   // 0 = Explorer, 1 = PCB Manager
+        const float ebtn = 30.0f * S, eglyph = 18.0f * S, egap = 6.0f * S, erowPad = 6.0f * S;
+        const float erailRowH = erowPad + ebtn + erowPad;
+        const ImVec2 ePaneOrigin = ImGui::GetCursorScreenPos();
+        const float  ePaneInnerW = ImGui::GetContentRegionAvail().x;
+        const float  ePaneCenterX = ePaneOrigin.x + ePaneInnerW * 0.5f;
+
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImGui::BeginChild("##ecad_tabstrip", ImVec2(2.0f * ebtn + egap, erailRowH),
+                          ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
+        ImGui::PopStyleVar();
+        ImGui::SetCursorPosY(erowPad);
+        ImGui::SetCursorPosX(0.0f);
+        if (drawManagerTabButton("ecadE", "body_folder", "E", "Explorer", s_ecadTab == 0, false,
+                                 surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/false))
+            s_ecadTab = 0;
+        ImGui::SameLine(0, egap);
+        if (drawManagerTabButton("ecadM", "history", "P", "PCB Manager", s_ecadTab == 1, false,
+                                 surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/true))
+            s_ecadTab = 1;
+        ImGui::EndChild();
+
+        // Hairline under the rail, spanning the full pane width (matches the Model rail separator).
+        {
+            ImDrawList* pdl = ImGui::GetWindowDrawList();
+            const float sepY = ePaneOrigin.y + erailRowH - 0.5f;
+            pdl->AddLine(ImVec2(ePaneOrigin.x, sepY), ImVec2(ePaneOrigin.x + ePaneInnerW, sepY),
+                         ui::Palette::toU32(pal.glassBorder), 1.0f * S);
+        }
+
+        // Body. Transparent ChildBg so the inner BeginChild regions (layers/nets tree, results strip)
+        // show the column glass instead of ImGui's opaque default — that fill was the flat "white bar"
+        // behind Layers/Nets. Explorer reuses the workspace file browser under its own header chip;
+        // PCB Manager draws its own header chip internally.
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-        ui::drawEcadManagerBody(st, surf, lpHalo);
+        const float ebodyPad = 12.0f * S;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(ebodyPad, ImGui::GetStyle().WindowPadding.y));
+        ImGui::BeginChild("##ecad_body", ImVec2(0, -8.0f * S), ImGuiChildFlags_AlwaysUseWindowPadding);
+        if (s_ecadTab == 0) {
+            ui::fmPaneHeaderChip(st, "Explorer", "body_folder", ePaneCenterX);
+            ImGui::Separator();
+            drawFileExplorerBody(st);
+        } else {
+            ui::drawEcadManagerBody(st, surf, lpHalo);
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
         ImGui::PopStyleColor();   // ImGuiCol_ChildBg
         ImGui::PopStyleColor();   // ImGuiCol_Text (surf.textPrimary)
         ImGui::End();

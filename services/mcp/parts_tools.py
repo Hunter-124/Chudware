@@ -191,3 +191,126 @@ def register_parts_tools(mcp: FastMCP) -> None:
         except Exception as exc:  # noqa: BLE001
             return _err(f"part_place failed: {exc}",
                         "Check part_id with part_get first.")
+
+    # ---- Vendor-source tools (T-X2 / T-X7) ----
+    # These expose the services/browser acquisition layer to the GUI's vendor sources pane.
+
+    @mcp.tool()
+    def vendor_status() -> str:
+        """Return the login status of all registered vendor source adapters.
+
+        Returns a list of source records:
+          {key, label, logged_in, last_login, last_used}
+        for each adapter registered in services.browser.adapters.
+
+        The GUI uses this to populate the Vendor Sources pane in the Parts Library
+        workspace.  No network I/O — reads only local profile metadata sidecar JSON.
+        """
+        try:
+            from services.browser import adapters as _adapters
+            from services.browser import profiles as _profiles
+
+            # Friendly display names keyed by adapter key.
+            _LABELS: dict[str, str] = {
+                "mcmaster":   "McMaster-Carr",
+                "grabcad":    "GrabCAD",
+                "traceparts": "TraceParts",
+                "amazon":     "Amazon Business",
+                "jlcpcb":     "JLCPCB",
+                "pcbway":     "PCBWay",
+            }
+
+            sources = []
+            for adapter in _adapters.all_adapters():
+                key  = adapter.key
+                meta = _profiles.load_meta(key)
+                sources.append({
+                    "key":        key,
+                    "label":      _LABELS.get(key, key.title()),
+                    "logged_in":  _profiles.has_profile(key),
+                    "last_login": str(meta.get("last_login_ts", "")),
+                    "last_used":  str(meta.get("last_used_ts",  "")),
+                })
+
+            return json.dumps({"ok": True, "sources": sources}, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"vendor_status failed: {exc}")
+
+    @mcp.tool()
+    def vendor_login(site: str) -> str:
+        """Open a HEADED browser window so the user can log into a vendor site.
+
+        Blocks until the user closes the window (up to 5 minutes).  The saved
+        session profile (cookies, local storage) is stored locally under the app
+        data directory and is NEVER uploaded or logged.
+
+        site : adapter key, e.g. "mcmaster", "grabcad", "traceparts".
+               Use vendor_status() to list valid keys.
+
+        Returns:
+          {ok, site, last_login_ts, challenge_detected}
+        or {ok: false, reason: ...} on failure.
+
+        NOTE: this call is HEADED (opens a real browser window) and will block the
+        worker thread for up to 300 seconds while the user completes the login.
+        The GUI displays a "Logging in…" spinner for the duration.
+        """
+        try:
+            from services.browser.session import browser_login as _login
+            result = _login(site.strip().lower())
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"vendor_login failed: {exc}",
+                        f"Ensure Playwright is installed: pip install playwright && playwright install chromium")
+
+    # ---- Scrape/download queue tools (T-X4) ----
+    # Background queue: search a vendor site + download the first CAD artifact found,
+    # running in a daemon thread so the GUI stays responsive.
+
+    # Start the worker thread once at registration time (idempotent).
+    try:
+        from services.browser.queue import ensure_worker_started as _ensure_worker
+        _ensure_worker()
+    except Exception:  # noqa: BLE001
+        pass  # graceful degradation: queue tools still work, just won't run jobs
+
+    @mcp.tool()
+    def scrape_enqueue(site: str, query: str) -> str:
+        """Enqueue a vendor search + CAD-model download in the background queue.
+
+        The job runs asynchronously: the function returns immediately with a job id.
+        Use scrape_queue_status() to poll progress.
+
+        site  : adapter key, e.g. "mcmaster", "grabcad".  Must be logged in first
+                (vendor_login).
+        query : free-text search string, e.g. "6205 bearing", "M8 socket head".
+
+        Returns {ok, id, status} or {ok: false, reason: ...}.
+
+        The job lifecycle:
+          pending → running (search + acquire in progress)
+          → done (artifact_path set: local file path to the downloaded CAD file)
+          → error (error message set; check vendor login status)
+        """
+        try:
+            from services.browser.queue import enqueue as _enqueue
+            return json.dumps(_enqueue(site.strip().lower(), query.strip()),
+                              ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"scrape_enqueue failed: {exc}")
+
+    @mcp.tool()
+    def scrape_queue_status() -> str:
+        """Return the current state of all scrape/download queue jobs.
+
+        Returns {ok, jobs: [{id, site, query, status, artifact_path, error,
+                              created_ts, started_ts, finished_ts}]}.
+
+        status values: pending | running | done | error | cancelled.
+        artifact_path is set (local filesystem path) when status == "done".
+        """
+        try:
+            from services.browser.queue import queue_status as _status
+            return json.dumps(_status(), ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"scrape_queue_status failed: {exc}")

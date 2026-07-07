@@ -1,0 +1,231 @@
+"""services/browser/queue.py — background scrape/download queue (T-X4).
+
+A persistent, thread-safe job queue for vendor searches + CAD model downloads
+that run in a daemon background thread inside the MCP server process.  Each job
+calls the appropriate source adapter's ``search()`` then ``acquire()`` via the
+same authenticated browser sessions managed by :mod:`services.browser.session`.
+
+Design contract
+---------------
+- **State is in-process only** (no external message broker).  The MCP server
+  process is long-lived (started once per app session); jobs survive normal RPC
+  calls but are lost if the server restarts.  A persistent on-disk queue is a
+  phase-2 concern (T-X4 scope).
+- **One worker thread, serialised per site** — browser sessions are single-
+  threaded within a site (Playwright launches one persistent context at a time).
+  The worker drains the FIFO and calls adapters sequentially; this is safe
+  because ``browser_login`` / ``browser_download`` are themselves synchronous
+  (no asyncio, no thread-safety assumptions in Playwright's sync API).
+- **Honest placeholder on permanent concurrency**: if `parts_tools.py`'s MCP
+  server is ever invoked from multiple simultaneous callers the worker thread
+  may block on a long login.  That is acceptable for the headless/desktop
+  single-user use-case this ships for; a multi-user/multi-worker upgrade is
+  explicitly out of scope (see advisory in ``contracts/license_debt.md``).
+
+Public API (called by ``parts_tools.py`` register functions)
+------------------------------------------------------------
+- :func:`enqueue`      — add a (site, query) job, returns job id + status.
+- :func:`queue_status` — current snapshot of all jobs.
+- :func:`cancel_job`   — mark a pending job as cancelled (best-effort).
+- :func:`ensure_worker_started` — idempotent; call once at server startup.
+"""
+from __future__ import annotations
+
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+
+class JobStatus(str, Enum):
+    PENDING   = "pending"
+    RUNNING   = "running"
+    DONE      = "done"
+    ERROR     = "error"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class ScrapeJob:
+    id:             str
+    site:           str
+    query:          str
+    status:         JobStatus = JobStatus.PENDING
+    created_ts:     float     = field(default_factory=time.time)
+    started_ts:     Optional[float] = None
+    finished_ts:    Optional[float] = None
+    artifact_path:  str = ""
+    error:          str = ""
+    # Intermediate results from search() (lightweight stubs, not yet acquired).
+    search_hits:    list = field(default_factory=list)
+
+
+# ---- Global queue ----------------------------------------------------------------
+
+_lock   = threading.Lock()
+_jobs: list[ScrapeJob] = []
+_cond   = threading.Condition(_lock)
+_worker_started = False
+
+
+def enqueue(site: str, query: str) -> dict:
+    """Add a (site, query) job to the download queue.  Idempotent within a session:
+    if an identical (site, query) is already pending or running, returns the
+    existing job's status instead of queuing a duplicate.
+    """
+    site  = site.strip().lower()
+    query = query.strip()
+    if not site or not query:
+        return {"ok": False, "reason": "site and query must be non-empty"}
+
+    with _lock:
+        # Dedup: pending or running same-site+query.
+        for j in _jobs:
+            if j.site == site and j.query == query and j.status in (
+                    JobStatus.PENDING, JobStatus.RUNNING):
+                return {"ok": True, "id": j.id, "status": j.status.value, "deduplicated": True}
+
+        job = ScrapeJob(id=str(uuid.uuid4())[:8], site=site, query=query)
+        _jobs.append(job)
+        _cond.notify_all()
+
+    return {"ok": True, "id": job.id, "status": job.status.value}
+
+
+def queue_status() -> dict:
+    """Return a snapshot of all jobs (newest first, capped at 200)."""
+    with _lock:
+        snapshot = list(reversed(_jobs[-200:]))
+    return {
+        "ok": True,
+        "jobs": [
+            {
+                "id":            j.id,
+                "site":          j.site,
+                "query":         j.query,
+                "status":        j.status.value,
+                "artifact_path": j.artifact_path,
+                "error":         j.error,
+                "created_ts":    j.created_ts,
+                "started_ts":    j.started_ts,
+                "finished_ts":   j.finished_ts,
+            }
+            for j in snapshot
+        ],
+    }
+
+
+def cancel_job(job_id: str) -> dict:
+    """Mark a pending job cancelled.  Has no effect on running/finished jobs."""
+    with _lock:
+        for j in _jobs:
+            if j.id == job_id:
+                if j.status == JobStatus.PENDING:
+                    j.status = JobStatus.CANCELLED
+                    return {"ok": True, "id": job_id, "status": j.status.value}
+                return {"ok": False, "reason": f"job {job_id!r} is {j.status.value}, not cancellable"}
+    return {"ok": False, "reason": f"job {job_id!r} not found"}
+
+
+# ---- Worker thread ---------------------------------------------------------------
+
+def _run_job(job: ScrapeJob) -> None:
+    """Execute a single job synchronously (runs on the worker thread)."""
+    try:
+        from services.browser.adapters import get_adapter
+    except Exception as exc:  # noqa: BLE001
+        job.status = JobStatus.ERROR
+        job.error  = f"import adapters failed: {exc}"
+        return
+
+    adapter = get_adapter(job.site)
+    if adapter is None:
+        job.status = JobStatus.ERROR
+        job.error  = f"no adapter registered for site '{job.site}'"
+        return
+
+    # Step 1: search
+    try:
+        hits = adapter.search(job.query)
+    except Exception as exc:  # noqa: BLE001
+        job.status = JobStatus.ERROR
+        job.error  = f"search failed: {exc}"
+        return
+
+    if not hits:
+        job.status = JobStatus.ERROR
+        job.error  = "search returned no results"
+        return
+
+    # Surface login_required gracefully.
+    first = hits[0] if isinstance(hits[0], dict) else {}
+    if not first.get("ok", True) and first.get("reason") in ("login_required", "no_profile"):
+        job.status = JobStatus.ERROR
+        job.error  = first.get("hint", "login required — use vendor_login first")
+        return
+
+    job.search_hits = hits
+
+    # Step 2: acquire the first real hit.
+    for hit in hits:
+        if not isinstance(hit, dict) or not hit.get("ok", True):
+            continue  # skip error stubs
+        try:
+            result = adapter.acquire(hit)
+        except Exception as exc:  # noqa: BLE001
+            job.error = f"acquire failed: {exc}"
+            continue
+        if result.get("ok"):
+            job.artifact_path = result.get("artifact_path", "")
+            job.status = JobStatus.DONE
+            return
+        else:
+            job.error = result.get("hint", result.get("reason", "acquire failed"))
+            # Don't break — try next hit.
+
+    # All hits failed.
+    job.status = JobStatus.ERROR
+    # job.error already set from last attempt
+
+
+def _worker_loop() -> None:
+    """Long-lived daemon thread: drain the job queue until process exit."""
+    while True:
+        with _cond:
+            while True:
+                pending = [j for j in _jobs if j.status == JobStatus.PENDING]
+                if pending:
+                    break
+                _cond.wait(timeout=5.0)
+        # Pick the oldest pending job.
+        with _lock:
+            pending = [j for j in _jobs if j.status == JobStatus.PENDING]
+            if not pending:
+                continue
+            job = pending[0]
+            job.status     = JobStatus.RUNNING
+            job.started_ts = time.time()
+
+        try:
+            _run_job(job)
+        except Exception as exc:  # noqa: BLE001
+            job.status = JobStatus.ERROR
+            job.error  = f"worker exception: {exc}"
+        finally:
+            with _lock:
+                if job.status == JobStatus.RUNNING:
+                    job.status = JobStatus.ERROR
+                    job.error  = "job left in running state (unexpected)"
+                job.finished_ts = time.time()
+
+
+def ensure_worker_started() -> None:
+    """Start the background worker thread exactly once (idempotent)."""
+    global _worker_started
+    if _worker_started:
+        return
+    t = threading.Thread(target=_worker_loop, name="scrape-worker", daemon=True)
+    t.start()
+    _worker_started = True

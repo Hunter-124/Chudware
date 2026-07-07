@@ -102,7 +102,14 @@ Canonical checklist of every GUI change Hunter has requested for the host/ light
 | L2 | Remaining crash/freeze on rapid Model→Drawing→Simulate→Electronics→Manufacture switching (Electronics per-frame ECAD focus-grab ate every click outside its window) | ✅ | `9178c8f6` |
 
 ## M. AI workspace v2 redesign (2026-07-07 — screenshot-specified, major rework)
-Hunter's red-pen on the shipped AI hub: make it compact, transparency-first, DAG-centric. Screenshot marks regions: **DAG** upper-center, **conversation** lower-left (green box), **workflow settings** lower-right ("Settings/Options/Defaults"), inference settings **wiped**.
+Hunter's red-pen on the shipped AI hub: make it compact, transparency-first, DAG-centric. Screenshot marks regions: **DAG** upper-center, **conversation** lower-left (green box), **workflow settings** lower-right ("Settings/Options/Defaults"), inference settings **wiped**. Full plan: `host/AI_WORKSPACE_V2_PLAN.md` (`1761eafb`).
+
+**Locked decisions (Hunter, 2026-07-07):**
+- **Subagent steering = FULL** (M11/M15–M17): build the live subagent-session registry + steering RPCs up front — inject-into-running-subagent works, not read-only.
+- **Thoughts (M13) = live token streaming** for normal completions; thoughts streamed live into a **collapsible textbox** in the chat when the provider exposes transparent thought traces; providers that only return summaries may land per-block on arrival.
+- (orchestrator-decided) Schema **`agent_events/1`→`/2`**; **plain-language `target`** strings on tool_call (not hashed); **new GUI event-graph store** (not the ActivityPanel list); **one DAG per chat session** aggregating its turn run_ids.
+
+**Build waves:** W1 (parallel, non-colliding) = Phase 0 backend event/stream instrumentation + Phase 1 GUI layout refactor. W2 (after W1) = Phase 2 DAG, Phase 3 transparency, Phase 4-bk subagent registry/steering, Phase 5 chat UX. W3 = Phase 4-gui subagent open/steer.
 ### Layout / chrome
 | # | Item | Status | Commit |
 |---|------|--------|--------|

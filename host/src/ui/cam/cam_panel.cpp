@@ -572,6 +572,12 @@ void drawCamTreeBody(AppState& st) {
     refreshDialects(st);   // async + guarded; feeds the flavor popup + Job Setup row
     fmRowStripeReset();
 
+    // Compact vertical rhythm (match FeatureManager): tighten ItemSpacing.y only so the job tree
+    // (setups/operations/tools) doesn't read "double spaced". RAII so it unwinds on early returns.
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, 4.0f * S));
+    struct SpacingPop { ~SpacingPop() { ImGui::PopStyleVar(); } } spacingPop;
+
     // Ribbon "Flavor" dropdown: opened here (this body draws every frame in Manufacture) at the
     // mouse position, which is still on the ribbon button the frame after the click.
     if (g.flavorPopup) {

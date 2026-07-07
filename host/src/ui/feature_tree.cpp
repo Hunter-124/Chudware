@@ -2139,6 +2139,12 @@ void drawFeatureTreeBody(AppState& st,
     const auto& pal = fmPalette();
     s_fmStripeIdx = 0;
 
+    // Compact vertical rhythm: the fixed header rows (Equations/Material/References/Origin/planes)
+    // and the feature list inherit the theme's loose ItemSpacing.y (9dp), which read "double
+    // spaced". Tighten Y only (keep X for SameLine footers/top strip) for the whole tree body.
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, 4.0f * ui::uiScale));
+
     // C24: SolidWorks-style top strip (tab row + compact doc toolbar), replacing the old wide
     // New Part / Undo / Redo text buttons that used to live at the panel bottom.
     drawFeatureManagerTopStrip(st);
@@ -3193,6 +3199,8 @@ void drawFeatureTreeBody(AppState& st,
     // Wave 4C: run any copy/cut/paste requested from a row context menu (deferred to here because
     // the copy's DocMirror call replaces the tree json the menu was drawn over).
     flushPendingClipboard(st);
+
+    ImGui::PopStyleVar();  // compact ItemSpacing (pushed at top of body)
 }
 
 // ---- Wave 3: public Save/Open wrappers (the File menu + File Explorer reuse these) ----

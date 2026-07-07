@@ -2575,6 +2575,12 @@ void SimManager::drawTreeBody(AppState& st) {
     if (paneInk) ImGui::PushStyleColor(ImGuiCol_Text, simSurf().textPrimary);
     struct PaneInkPop { bool on; ~PaneInkPop() { if (on) ImGui::PopStyleColor(); } } paneInkPop{paneInk};
 
+    // Compact vertical rhythm (match FeatureManager): tighten ItemSpacing.y only so the study
+    // tree/rows don't read "double spaced". RAII so it unwinds on the body's early returns too.
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(ImGui::GetStyle().ItemSpacing.x, 4.0f * S));
+    struct SpacingPop { ~SpacingPop() { ImGui::PopStyleVar(); } } spacingPop;
+
     // ---- EM (electromagnetics) panel takes over the pane when open. EM is standalone (no doc Study),
     // so it must be handled BEFORE the study-panel block below (which requires a valid sel_).
     if (emPanelOpen_) { drawEmPanel(st); return; }
@@ -2714,7 +2720,11 @@ void SimManager::drawStudyRow(AppState& st, int i) {
     // (same gesture as "Edit Feature" on the modeling tree). Pills must balance: one End per Pill.
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth |
                                ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_FramePadding;
-    if (selStudy && node_ == SimNode::Study) flags |= ImGuiTreeNodeFlags_Selected;
+    // NB: do NOT set ImGuiTreeNodeFlags_Selected. fmRowPill pushes HeaderHovered/HeaderActive
+    // transparent but not ImGuiCol_Header, so a Selected node paints ImGui's default header rect
+    // (its own frame geometry, not the pill's GetFrameHeight()+content-avail rect) on top of the
+    // glass card — a mis-sized/overflowing blue fill. Selection is shown by fmRowPill(selected)
+    // alone, exactly like featureRow() and the origin/plane rows in feature_tree.cpp.
 
     ui::FmRowRect studyRect = ui::fmRowPill(selStudy && node_ == SimNode::Study);
     ui::fmTreeIcon(studyTypeIcon(s.type), "[S]");
@@ -2746,7 +2756,9 @@ void SimManager::drawStudyRow(AppState& st, int i) {
             ImGuiTreeNodeFlags lf = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                     ImGuiTreeNodeFlags_SpanFullWidth |
                                     ImGuiTreeNodeFlags_FramePadding;
-            if (selected) lf |= ImGuiTreeNodeFlags_Selected;
+            // No ImGuiTreeNodeFlags_Selected — the selection card is drawn by fmRowPill(selected);
+            // the Selected flag would paint ImGui's mis-sized default header rect over it (see the
+            // parent study row above and featureRow()/plane rows in feature_tree.cpp).
             ImVec2 rowPos = ImGui::GetCursorScreenPos();
             ImGui::TreeNodeEx((label + "##n" + std::to_string((int)n) + "_" +
                                std::to_string(loadI)).c_str(), lf);

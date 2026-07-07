@@ -3068,7 +3068,11 @@ bool featureTreeOpenPath(AppState& st, const std::string& path, bool asSolid) {
         return true;
     }
     st.addLog("[err] open: " + err);
-    st.toast(ui::ToastLevel::Error, "Open failed: " + pathBaseName(path) + " — " + err);
+    // A live MCP-handoff refresh polls in the background — a failed open there must not
+    // toast (it would spam once per poll for an unsupported doc, e.g. an assembly the C++
+    // core's doc_open declines). The caller logs it; pollAiCadHandoff won't retry the rev.
+    if (!st.handoffQuietOpen)
+        st.toast(ui::ToastLevel::Error, "Open failed: " + pathBaseName(path) + " — " + err);
     return false;
 }
 
@@ -3156,6 +3160,12 @@ void pollAiCadHandoff(AppState& st) {
         shownRev = pendingRev;
         if (firstReveal)
             st.toast(ui::ToastLevel::Info, "ShopCraft: live view of the AI's part — it updates as it builds");
+    } else if (!opened) {
+        // The open failed (e.g. the published doc is an assembly, which the C++ core's
+        // doc_open does not yet handle). Mark this rev as consumed so the poller does NOT
+        // retry it every frame — the failure was already logged quietly above. A NEWER rev
+        // (pendingRev > shownRev) will still be attempted when the MCP publishes one.
+        shownRev = pendingRev;
     }
 }
 

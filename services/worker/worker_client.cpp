@@ -797,6 +797,15 @@ bool WorkerClient::callImpl(const std::string& method, const json& params, json&
             err = "cpp-core (" + method + "): " + cerr;
             if (errorSink_) errorSink_(method, err);
             return false;
+        } else if (core::cpp_core().available()) {
+            // MINTING call failed with an UNSTRUCTURED core error while the DLL is
+            // loaded (e.g. doc_open: "no such file: live.step+"). That is a real
+            // failure, not an "unsupported container" decline — falling through to
+            // the Python worker would mask it behind "unknown method: doc_open"
+            // (the oracle has no doc engine anymore). Surface the core's message.
+            err = cerr.empty() ? ("cpp-core (" + method + ") failed") : cerr;
+            if (errorSink_) errorSink_(method, err);
+            return false;
         }
         // Minting-call fallback: the core could not mint this doc (unsupported kind or
         // the core DLL is unavailable) — continue to the Python worker path below so

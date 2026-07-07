@@ -143,6 +143,10 @@ add_executable(AI-CAD
   src/ui/widgets/ribbon.cpp
   src/ui/ribbon_def.cpp
   # --- end C14 ---
+  # --- [parts-plm sources] workspace bodies (parts-port agent appends here) ---
+  src/ui/parts/parts_workspace.cpp
+  src/ui/plm/plm_workspace.cpp
+  # --- end [parts-plm sources] ---
   ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/src/gl.c
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp

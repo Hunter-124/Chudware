@@ -146,6 +146,8 @@ Hunter's red-pen on the shipped AI hub: make it compact, transparency-first, DAG
 |---|------|--------|--------|
 | M18 | Prompt box auto-grows upward (with a max cap) as the user types a long prompt | ⬜ | — |
 | M19 | Endless scroll-back with lazy-loading of older messages (no crash on large history) | ⬜ | — |
+| M22 | **Composer restyle v2 (Hunter mockup 2026-07-07 — supersedes/refines the M5 red-box ordering).** Layout (his sketch; layout is binding, style/colors free): row 1 = `Permissions ▾` alone on top; row 2 = the large prompt input box; bottom edge inside/below the box = `[AI Model Picker ▾] [Effort ▾] [📎 paperclip]` left-aligned, **send button at the right edge** (his green arrow). **Send swaps to a RED SQUARE STOP button while a turn is in progress** (stop = cancel the in-flight turn). | ⬜ (queued, Phase 5) | — |
+| M23 | **File attachments in the composer:** the paperclip (where his red circle is) opens the native file-explorer dialog to attach files; attached files display as **chips above the chat input (Claude Code style)** — name + remove ✕; attachments ride the next send. | ⬜ (queued, Phase 5) | — |
 ### Backend / instrumentation (load-bearing — feeds M9/M12/M13/M14)
 | # | Item | Status | Commit |
 |---|------|--------|--------|

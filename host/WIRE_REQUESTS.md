@@ -198,3 +198,26 @@ Format:
   ```
   Note `band.maxX` (not `ui::overlayColumnEdge(1)`) — with the docked Copilot suppressed the
   published column edge is stale, and the hub owns the full width. Owner: ai-workspace.
+
+## Explorer restyle agent (2026-07-06)
+
+- **layout.cpp — swap the left-pane header chip to `ui::fmPaneHeaderChip` (Hunter red-pen item).**
+  The current header block in `drawLeftPane` (the `glassRowAtCursor(4.0f,...)` +
+  `Dummy(iconSz)` + `drawIconGlass(titleIcon,...)` + `PushFont(medium)` + `TextUnformatted(title)`
+  run, right after the `IconUV headIcon = getIcon(titleIcon, 20);` line, ~layout.cpp:565-588) has
+  three flagged defects: text not centered in its pill, the 20px icon overflows the text-height
+  pill, and the FM tab shows the meaningless "history" three-dot glyph. Replace that whole run
+  (KEEP the trailing `ImGui::Separator();` and the `titleX`/`groupW`/`headIcon` computations can
+  be deleted too) with ONE call:
+  ```cpp
+  ui::fmPaneHeaderChip(st, title, titleIcon, paneCenterX);
+  ```
+  (declared in feature_tree.h — already implemented/compiling). It draws a content-fitted glass
+  pill, icon fully inside with even padding, icon+text group centered on `paneCenterX`, and for
+  `titleIcon == "history"` renders a purpose-built line-art feature-tree glyph (root + two branch
+  children, row-icon stroke weight). Owner: explorer-restyle (feature_tree.cpp side already done).
+
+- **scenarios.cpp — add an `explorer` AI_CAD_SHOT scenario** that sets
+  `st.leftPaneTab = AppState::LP_Explorer;` (one line, first frame) so the Explorer tab is
+  headless-screenshot coverable like the other 21 scenarios. Verified manually this session via a
+  temporary hook (since removed); proof at /tmp/hunter-verify/explorer_restyle.png.

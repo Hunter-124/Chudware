@@ -2102,16 +2102,6 @@ static void drawFeatureManagerTopStrip(AppState& st) {
 // the former drawFeatureTree(); the only change is the removed Begin/End at the top and bottom.
 void drawFeatureTreeBody(AppState& st,
                          const std::function<void(const std::string&)>& editCallback) {
-    // TEMP-VERIFY (removed before commit): force the Explorer tab for a headless screenshot.
-    if (const char* e = std::getenv("AI_CAD_FORCE_EXPLORER"); e && *e == '1') {
-        st.leftPaneTab = AppState::LP_Explorer;
-        if (st.recentFiles.empty()) {
-            st.recentFiles.push_back(std::string(std::getenv("HOME")) +
-                                     "/Documents/AI-CAD/swasi_test.step+");
-            st.recentFiles.push_back("/tmp/missing_old_part.step+");
-        }
-        return;
-    }
     const ui::AdaptiveSurface& lpSurf = fmSurf();
     fmPaletteRefresh(ui::viewportBackdrop().valid() ? &lpSurf : nullptr);
     const auto& pal = fmPalette();

@@ -66,10 +66,19 @@ public:
         // separate-helper layout ("Invalid file descriptor to ICU data
         // received"). Disable it so each subprocess loads resources from disk.
         cmd->AppendSwitch("no-zygote");
-        // Diagnostic: AI_CAD_CEF_SINGLE_PROCESS=1 runs everything in one process
-        // (no helper/subprocess) — isolates whether the ICU/init crash is in a
-        // subprocess. Not for production OSR.
-        if (const char* sp = std::getenv("AI_CAD_CEF_SINGLE_PROCESS"); sp && sp[0] == '1')
+        // SINGLE-PROCESS by default. On this platform (Fedora 44 + this CEF
+        // build) the multi-process helper handshake fails Chromium's subprocess
+        // ICU file-descriptor hand-off ("Invalid file descriptor to ICU data
+        // received"), which crash-loops the GPU + network services so OSR never
+        // paints — the "stuck on Loading" bug. Proven empirically: `AI-CAD
+        // --cef-shot` renders a correct PNG ONLY in single-process mode; the
+        // multi-process path crash-loops to "GPU process isn't usable. Goodbye."
+        // Single-process ≠ single-thread — Chromium still runs the renderer on
+        // its own threads, so the GL/UI thread is not blocked by page JS; the
+        // only cost is software (SwiftShader) rasterisation, fine for OSR login
+        // pages. Override with AI_CAD_CEF_SINGLE_PROCESS=0 to test multi-process
+        // once the subprocess ICU hand-off is fixed for this distro.
+        if (const char* sp = std::getenv("AI_CAD_CEF_SINGLE_PROCESS"); !(sp && sp[0] == '0'))
             cmd->AppendSwitch("single-process");
         // TODO(cef): match the stealth profile — UA/lang are set per-browser via
         // CefBrowserSettings/RequestContext, not here.

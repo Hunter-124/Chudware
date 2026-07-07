@@ -329,6 +329,7 @@ struct CefWebView::Impl {
     unsigned tex = 0;
     int texW = 0, texH = 0;
     bool focused = false;
+    bool invalidatedOnce_ = false;   // AI_CAD_CEF_TRACE: log the first paint kick only
 
     void createBrowser(const std::string& url, const std::string& cacheDir, bool startedAtAuth) {
         CEF_TRACE("createBrowser url=%s cache=%s onUiThread=%d",
@@ -430,6 +431,7 @@ void CefWebView::attach(AppState& st, const std::string& embedId) {
 
 void CefWebView::close(AppState& /*st*/) {
     impl_->pendingUrlReq.clear();
+    impl_->invalidatedOnce_ = false;   // next open() kicks its own first paint
     impl_->closeBrowser();
     auto& s = *impl_->s;
     std::lock_guard<std::mutex> lk(s.mtx);
@@ -634,12 +636,24 @@ bool CefWebView::draw(AppState& /*st*/, ImVec2 avail) {
     }
 
     // CEF host call OUTSIDE the lock (see above): safe now that s.mtx is dropped.
+    const bool haveBrowser = impl_->client && impl_->client->browser();
     if (needResize) {
-        const bool haveBrowser = impl_->client && impl_->client->browser();
         CEF_TRACE("draw WasResized %dx%d haveBrowser=%d", (int)avail.x, (int)avail.y,
                   (int)haveBrowser);
         if (haveBrowser)
             impl_->client->browser()->GetHost()->WasResized();
+    }
+
+    // OSR FIRST-PAINT KICK. cef_osr_shot.cpp (the known-good headless OSR path in
+    // this exact CEF build) has to call Invalidate(PET_VIEW) to force the first
+    // frame — with --disable-gpu-compositing the windowless compositor does NOT
+    // reliably start painting from page-load auto-invalidation alone. Without
+    // this the interactive panel sits on "Loading…" forever (no OnPaint → active
+    // never flips). Kick every frame until the first OnPaint sets `active`;
+    // afterwards normal content invalidations drive paints and we stop nagging.
+    if (haveBrowser && !active) {
+        if (!impl_->invalidatedOnce_) { impl_->invalidatedOnce_ = true; CEF_TRACE("draw Invalidate(PET_VIEW) — kicking first paint"); }
+        impl_->client->browser()->GetHost()->Invalidate(PET_VIEW);
     }
 
     // No frame yet → status text.

@@ -10,8 +10,16 @@
 #include <vector>
 
 struct AppState;
+namespace core { struct RpcResult; }
 
 namespace ui {
+
+// The worker wraps every dispatched method as a JSON-RPC {ok:true, result:<method dict>};
+// a method-level failure lives as {ok:false, reason, hint} INSIDE result. So RpcResult::ok is
+// transport-only — real success is r.result["ok"]. plmOk unwraps both: returns true only on a
+// genuine method success, else fills *hint* with the plain-language reason.
+bool        plmOk(const core::RpcResult& r, std::string& hint);
+std::string plmReason(const core::RpcResult& r);   // the machine reason code ("" if none/ok)
 
 enum class PlmPage {
     Overview, Files, History, Releases, Planning, Issues, Team, Settings

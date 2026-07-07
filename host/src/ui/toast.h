@@ -14,6 +14,7 @@
 // swallows become visible.
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,12 @@ struct Toast {
     double born = 0.0;   // seconds (ImGui clock) when posted; 0 = not yet stamped
     double ttl = 4.0;    // lifetime in seconds (Info/Success 4, Warn 5, Error 7)
     int count = 1;       // collapsed-duplicate count (rendered as an xN badge when > 1)
+    // Optional single action button (additive — empty label = a plain toast, unchanged behaviour).
+    // Rendered as a small button on the card; clicking runs action(st) then dismisses the toast.
+    // Used e.g. for the auto-branch "Discard draft" affordance. Toasts carrying an action do NOT
+    // collapse with duplicates and get a longer ttl so the action stays reachable.
+    std::string actionLabel;
+    std::function<void(AppState&)> action;
 };
 
 // Default time-to-live for a level (seconds).
@@ -49,5 +56,13 @@ inline constexpr int kToastMaxVisible = 4;
 // Expired toasts are removed; a clicked toast is dismissed (click is swallowed so it doesn't
 // fall through to the viewport). No-op when the queue is empty.
 void drawToasts(AppState& st);
+
+// Post a toast carrying a single action button (additive over st.toast). The action runs on the
+// GL thread when the user clicks the button; the toast then dismisses. Used for reversible-action
+// affordances like the auto-branch "Discard draft". The callback must NOT synchronously post a
+// toast (the toast queue lock is held while it runs) — use st.rpc.call / async work, which posts
+// from its completion callback on a later frame.
+void toastWithAction(AppState& st, ToastLevel level, std::string msg,
+                     std::string actionLabel, std::function<void(AppState&)> action);
 
 }  // namespace ui

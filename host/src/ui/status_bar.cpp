@@ -10,6 +10,7 @@
 #include "../core/app_state.h"
 #include "sketch_mode.h"   // C18
 #include "sketch3d_mode.h" // 3D sketch status readout
+#include "plm/plm_quickbar.h"  // embedded per-doc PLM control
 #include "../core/sim_client.h"
 
 namespace ui {
@@ -73,6 +74,9 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
                                "|  %s", kWsName[wsIdx]);
         }
     }
+    // Embedded PLM control: current item's revision/lifecycle + a checkpoint/release popover,
+    // reachable from every workspace (no-op in the PLM workspace and without a project).
+    ui::drawPlmQuickChip(st);
     // C18: while editing a sketch, show "Under/Fully/Over Defined + DOF" tinted by status.
     if (auto* sk = st.sketchMode) {
         if (sk->active()) {

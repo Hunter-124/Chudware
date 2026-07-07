@@ -76,7 +76,7 @@ void doCheckpoint(AppState& st) {
     st.rpc.call("plm_checkpoint", p, [&st](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.busy = false;
-        if (!r.ok) { H.actionErr = r.err; return; }
+        if (!plmOk(r, H.actionErr)) return;
         H.checkpointMsg[0] = '\0';
         H.actionOk = "Checkpoint saved.";
         st.toast(ui::ToastLevel::Success, "Checkpoint saved");
@@ -207,7 +207,7 @@ void doTrack(AppState& st) {
     st.rpc.call("plm_item_add", p, [&st](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.busy = false;
-        if (!r.ok) { H.actionErr = r.err; st.toast(ui::ToastLevel::Error, r.err); return; }
+        if (!plmOk(r, H.actionErr)) { st.toast(ui::ToastLevel::Error, H.actionErr); return; }
         H.trackPath[0] = '\0';
         st.toast(ui::ToastLevel::Success, "Tracking new file");
         plmInvalidate();
@@ -224,7 +224,7 @@ void doLink(AppState& st) {
     st.rpc.call("plm_link_repo", p, [&st](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.busy = false;
-        if (!r.ok) { H.actionErr = r.err; st.toast(ui::ToastLevel::Error, r.err); return; }
+        if (!plmOk(r, H.actionErr)) { st.toast(ui::ToastLevel::Error, H.actionErr); return; }
         H.linkUrl[0] = '\0'; H.linkName[0] = '\0';
         st.toast(ui::ToastLevel::Success, "Linked external code");
         plmInvalidate();
@@ -240,7 +240,7 @@ void doUntrack(AppState& st, const std::string& itemId) {
     st.rpc.call("plm_item_untrack", p, [&st](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.busy = false;
-        if (!r.ok) { st.toast(ui::ToastLevel::Error, r.err); return; }
+        std::string h; if (!plmOk(r, h)) { st.toast(ui::ToastLevel::Error, h); return; }
         st.toast(ui::ToastLevel::Info, "Stopped tracking");
         plmInvalidate();
     });
@@ -329,7 +329,7 @@ void plmDrawFilesPage(AppState& st) {
                 nlohmann::json p = pathParam(st);
                 p["item_id"] = it.itemId;
                 st.rpc.call("plm_where_used", p, [&st](const core::RpcResult& r) {
-                    if (!r.ok) { st.toast(ui::ToastLevel::Error, r.err); return; }
+                    std::string h; if (!plmOk(r, h)) { st.toast(ui::ToastLevel::Error, h); return; }
                     int n = 0;
                     if (auto c = r.result.find("consumers");
                         c != r.result.end() && c->is_array()) n = (int)c->size();
@@ -430,7 +430,7 @@ void plmDrawHistoryPage(AppState& st) {
                 p["commit"] = e.commit;
                 st.rpc.call("plm_restore", p, [&st](const core::RpcResult& r) {
                     g_plmHub.busy = false;
-                    if (!r.ok) { st.toast(ui::ToastLevel::Error, r.err); return; }
+                    std::string h; if (!plmOk(r, h)) { st.toast(ui::ToastLevel::Error, h); return; }
                     st.toast(ui::ToastLevel::Success, "Restored — saved as the latest version");
                     plmInvalidate();
                 });
@@ -462,7 +462,7 @@ void doRelease(AppState& st, const std::string& itemId, bool confirm) {
     st.rpc.call("plm_release", p, [&st](const core::RpcResult& r) {
         auto& H = g_plmHub;
         H.busy = false;
-        if (!r.ok) { H.actionErr = r.err; return; }
+        if (!plmOk(r, H.actionErr)) return;
         std::string rev = r.result.value("rev", "");
         st.toast(ui::ToastLevel::Success, "Released revision " + rev);
         s_releaseItem.clear(); s_releaseNote[0] = '\0';
@@ -583,7 +583,7 @@ void plmDrawSettingsPage(AppState& st) {
         p["prefix"] = H.prefixBuf;
         st.rpc.call("plm_scheme_set", p, [&st](const core::RpcResult& r) {
             g_plmHub.busy = false;
-            if (!r.ok) { st.toast(ui::ToastLevel::Error, r.err); return; }
+            std::string h; if (!plmOk(r, h)) { st.toast(ui::ToastLevel::Error, h); return; }
             st.toast(ui::ToastLevel::Success, "Part-number scheme updated");
             plmInvalidate();
         });
@@ -610,7 +610,7 @@ void plmDrawSettingsPage(AppState& st) {
             p["mode"] = kModes[i].id;
             st.rpc.call("plm_set_ai_mode", p, [&st](const core::RpcResult& r) {
                 g_plmHub.busy = false;
-                if (!r.ok) { st.toast(ui::ToastLevel::Error, r.err); return; }
+                std::string h; if (!plmOk(r, h)) { st.toast(ui::ToastLevel::Error, h); return; }
                 st.toast(ui::ToastLevel::Info, "Assistance level updated");
                 plmInvalidate();
             });
@@ -635,7 +635,7 @@ void planCall(AppState& st, const char* op, const char* entity,
     if (!id.empty()) p["id"] = id;
     st.rpc.call("plm_plan", p, [&st](const core::RpcResult& r) {
         g_plmHub.busy = false;
-        if (!r.ok) { st.toast(ui::ToastLevel::Error, r.err); return; }
+        std::string h; if (!plmOk(r, h)) { st.toast(ui::ToastLevel::Error, h); return; }
         plmInvalidate();
     });
 }

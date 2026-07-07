@@ -63,6 +63,21 @@ static void drawIcon(ImDrawList* dl, ToastLevel lvl, ImVec2 c, float r, ImU32 co
     }
 }
 
+void toastWithAction(AppState& st, ToastLevel level, std::string msg,
+                     std::string actionLabel, std::function<void(AppState&)> action) {
+    Toast t;
+    t.level = level;
+    t.msg = std::move(msg);
+    t.born = 0.0;
+    t.ttl = toastTtl(level) + 6.0;   // longer life so the action stays reachable
+    t.actionLabel = std::move(actionLabel);
+    t.action = std::move(action);
+    std::lock_guard<std::mutex> lk(st.toastsMtx);
+    st.toasts.push_back(std::move(t));
+    if (st.toasts.size() > 32)
+        st.toasts.erase(st.toasts.begin(), st.toasts.begin() + (st.toasts.size() - 32));
+}
+
 void drawToasts(AppState& st) {
     // C39: the queue is also written from background threads (worker errorSink); hold the
     // lock for the whole pass — contention is a rare sub-microsecond push_back.
@@ -95,8 +110,10 @@ void drawToasts(AppState& st) {
     // burst of repeated errors ("Open failed" x5 at startup) shows one card with an xN badge.
     // Keeping the newer entry means the lifetime refreshes while the storm continues.
     for (size_t i = 1; i < st.toasts.size();) {
+        // Toasts carrying an action never collapse — each keeps its own reversible affordance.
         if (st.toasts[i].level == st.toasts[i - 1].level &&
-            st.toasts[i].msg == st.toasts[i - 1].msg) {
+            st.toasts[i].msg == st.toasts[i - 1].msg &&
+            !st.toasts[i].action && !st.toasts[i - 1].action) {
             st.toasts[i].count += st.toasts[i - 1].count;
             st.toasts.erase(st.toasts.begin() + (i - 1));
         } else {
@@ -161,7 +178,9 @@ void drawToasts(AppState& st) {
         const float innerW = toastW - 2.0f * innerPad;
         ImVec2 msgSize = font->CalcTextSizeA(font->FontSize, FLT_MAX, innerW, t.msg.c_str());
         float titleH = font->FontSize + 4.0f * scale;
-        float cardH = titleH + msgSize.y + 18.0f * scale;
+        const bool hasAction = !t.actionLabel.empty() && (bool)t.action;
+        const float actionRowH = hasAction ? (font->FontSize + 16.0f * scale) : 0.0f;
+        float cardH = titleH + msgSize.y + 18.0f * scale + actionRowH;
 
         ImVec2 p0(x, y);
         ImVec2 p1(x + toastW, y + cardH);
@@ -232,12 +251,27 @@ void drawToasts(AppState& st) {
                              ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
                              ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
                              ImGuiWindowFlags_NoFocusOnAppearing);
-            bool hit = ImGui::InvisibleButton("hit", ImVec2(toastW, cardH));
+            // Dismiss hit-area covers the card EXCEPT the action row (so the action button
+            // below can claim its own clicks).
+            bool hit = ImGui::InvisibleButton("hit", ImVec2(toastW, cardH - actionRowH));
             bool firstFrameFallback = clicked && hovered && !ImGui::IsItemHovered();
+            bool actionClicked = false;
+            if (hasAction) {
+                ImGui::SetCursorPos(ImVec2(innerPad, cardH - actionRowH + 3.0f * scale));
+                ImGui::PushStyleColor(ImGuiCol_Button, withA(accent, 0.22f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, withA(accent, 0.40f));
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.text));
+                actionClicked = ImGui::Button(t.actionLabel.c_str());
+                ImGui::PopStyleColor(3);
+            }
             ImGui::End();
             ImGui::PopStyleColor();
             ImGui::PopStyleVar(2);
-            if (hit || firstFrameFallback) {
+            if (actionClicked) {
+                auto fn = t.action;   // copy before the queue mutates
+                if (fn) fn(st);
+                dismissIdx = i;
+            } else if (hit || firstFrameFallback) {
                 ImGui::SetClipboardText(t.msg.c_str());
                 dismissIdx = i;
             }

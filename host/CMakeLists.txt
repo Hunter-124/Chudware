@@ -156,6 +156,7 @@ add_executable(AI-CAD
   src/ui/plm/plm_workspace.cpp
   src/ui/plm/plm_pages.cpp   # plmDraw*Page implementations (split out of plm_workspace)
   src/ui/plm/plm_state.cpp   # plmInvalidate/plmEnsureOverview/plmProjectName
+  src/ui/plm/plm_quickbar.cpp # embedded per-doc PLM control (status-bar chip + popover)
   src/ui/ai/ai_workspace.cpp
   # --- end [parts-plm sources] ---
   ${CMAKE_CURRENT_SOURCE_DIR}/../extern/glad/src/gl.c

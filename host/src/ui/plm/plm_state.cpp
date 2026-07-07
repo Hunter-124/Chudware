@@ -93,6 +93,26 @@ PlmMilestoneRow parseMilestone(const nlohmann::json& m) {
 
 }  // namespace
 
+bool plmOk(const core::RpcResult& r, std::string& hint) {
+    if (!r.ok) {
+        hint = r.err.empty() ? "the service did not respond" : r.err;
+        return false;
+    }
+    if (r.result.is_object() && !r.result.value("ok", true)) {
+        std::string reason = r.result.value("reason", std::string());
+        hint = r.result.value("hint", reason.empty() ? std::string("that could not be done")
+                                                      : reason);
+        return false;
+    }
+    return true;
+}
+
+std::string plmReason(const core::RpcResult& r) {
+    if (r.ok && r.result.is_object() && !r.result.value("ok", true))
+        return r.result.value("reason", std::string());
+    return "";
+}
+
 void plmInvalidate() { g_plmHub.generation++; }
 
 std::string plmProjectName(AppState& st) {
@@ -112,7 +132,7 @@ void plmEnsureOverview(AppState& st) {
         auto& H = g_plmHub;
         H.ovLoading = false;
         H.ovGen = gen;
-        if (!r.ok) { H.ovErr = r.err; return; }
+        if (!plmOk(r, H.ovErr)) return;
         H.ovErr.clear();
         PlmOverview ov;
         const auto& res = r.result;
@@ -145,7 +165,7 @@ void plmEnsureItems(AppState& st) {
         auto& H = g_plmHub;
         H.itemsLoading = false;
         H.itemsGen = gen;
-        if (!r.ok) { H.itemsErr = r.err; return; }
+        if (!plmOk(r, H.itemsErr)) return;
         H.itemsErr.clear();
         H.items.clear();
         if (auto it = r.result.find("items"); it != r.result.end() && it->is_array())
@@ -165,7 +185,7 @@ void plmEnsureHistory(AppState& st) {
         auto& H = g_plmHub;
         H.histLoading = false;
         H.histGen = gen;
-        if (!r.ok) { H.histErr = r.err; return; }
+        if (!plmOk(r, H.histErr)) return;
         H.histErr.clear();
         H.history.clear();
         if (auto e = r.result.find("entries"); e != r.result.end() && e->is_array())
@@ -184,7 +204,8 @@ void plmEnsurePlanning(AppState& st) {
         p["entity"] = entity;
         st.rpc.call("plm_plan", p, [slot](const core::RpcResult& r) {
             auto& H = g_plmHub;
-            if (r.ok) {
+            std::string h;
+            if (plmOk(r, h)) {
                 if (auto it = r.result.find("items"); it != r.result.end() && it->is_array()) {
                     if (slot == 0) { H.allTasks.clear();
                         for (const auto& t : *it) H.allTasks.push_back(parseTask(t)); }
@@ -194,7 +215,7 @@ void plmEnsurePlanning(AppState& st) {
                         for (const auto& m : *it) H.milestones.push_back(parseMilestone(m)); }
                 }
             } else {
-                H.planErr = r.err;
+                H.planErr = h;
             }
             H.planLoading = false;  // any completion clears the spinner
         });
@@ -213,7 +234,7 @@ void plmEnsureSettings(AppState& st) {
         auto& H = g_plmHub;
         H.setLoading = false;
         H.setGen = gen;
-        if (!r.ok) { H.setErr = r.err; return; }
+        if (!plmOk(r, H.setErr)) return;
         H.setErr.clear();
         H.partPrefix = getStr(r.result, "part_number_prefix");
         H.aiMode     = getStr(r.result, "ai_mode");

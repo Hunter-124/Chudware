@@ -691,7 +691,7 @@ static bool featureAnchor(AppState& st, const std::string& fid, float out[3], fl
 // the sketch-plane normal — derived from geometry, correct for ANY plane, no hardcoded axis. Returns
 // false (caller keeps the old behaviour, no regression) when the caps can't be cleanly identified
 // (dress-up feature, degenerate/curved caps, symmetric mid-plane where no single far cap dominates).
-static bool extrudeAxisHandle(AppState& st, const std::string& fid, bool flip,
+static bool extrudeAxisHandle(AppState& st, const std::string& fid, bool flip, double depth,
                               Vec3& axisOut, float anchorOut[3]) {
     const auto& om = st.docMirror.ownerMap();
     auto oit = om.find(fid);
@@ -711,16 +711,32 @@ static bool extrudeAxisHandle(AppState& st, const std::string& fid, bool flip,
         faces.push_back({Vec3(n.x/nl, n.y/nl, n.z/nl), Vec3(v[3], v[4], v[5])});
     }
     if (faces.size() < 2) return false;
-    // Find the most anti-parallel face pair (the extrude caps): minimise dot(ni, nj).
-    int bi = -1, bj = -1; float bestDot = 1.0f;
+    // Find the extrude caps among anti-parallel owned-face pairs. A rectangular extrude has THREE
+    // anti-parallel pairs (caps + the two side-wall pairs), all with dot ~ -1, so "most opposed"
+    // alone is ambiguous and would pick an arbitrary owner-map-ordered pair (possibly a side wall).
+    // The caps are the unique pair whose centroids are separated by the extrude DEPTH along the
+    // shared normal (side walls are separated by the profile width/height instead). So: among pairs
+    // that are genuinely opposed, pick the one whose axial separation best matches |depth|. Curved
+    // side walls (cylinders) average to a ~null normal and never enter this loop, so a round extrude
+    // still resolves to its two flat caps.
+    int bi = -1, bj = -1; float bestErr = 1e30f;
+    const float dtarget = (float)std::fabs(depth);
     for (size_t i = 0; i < faces.size(); ++i)
         for (size_t j = i + 1; j < faces.size(); ++j) {
-            float d = dot(faces[i].n, faces[j].n);
-            if (d < bestDot) { bestDot = d; bi = (int)i; bj = (int)j; }
+            if (dot(faces[i].n, faces[j].n) > -0.85f) continue;   // not an opposed pair
+            Vec3 axis = faces[i].n;
+            float sep = std::fabs(dot(faces[i].c - faces[j].c, axis));
+            float err = (dtarget > 1e-4f) ? std::fabs(sep - dtarget) : -sep;  // no depth -> widest pair
+            if (err < bestErr) { bestErr = err; bi = (int)i; bj = (int)j; }
         }
-    // Require a genuinely opposed pair — parallel caps read as dot ~ -1. A loose threshold keeps
-    // slightly-tessellated caps while rejecting features with no opposed planar faces.
-    if (bi < 0 || bestDot > -0.85f) return false;
+    if (bi < 0) return false;
+    // When we DO know the depth, reject the match if no opposed pair sits near it (the caps aren't in
+    // the owned set this frame) — better to fall back than to anchor on a mis-identified wall.
+    if (dtarget > 1e-4f) {
+        Vec3 ax = faces[bi].n;
+        float sep = std::fabs(dot(faces[bi].c - faces[bj].c, ax));
+        if (std::fabs(sep - dtarget) > 0.25f * dtarget + 0.5f) return false;
+    }
     // The extrude axis is the (unsigned) shared normal; use cap bi's outward normal as +axis.
     Vec3 axis = faces[bi].n;
     // Anchor on the cap that sits along the ACTIVE direction. Direction-1 (no flip) grows toward the
@@ -817,7 +833,7 @@ static std::vector<DimCandidate> dimCandidates(AppState& st, const std::string& 
         if (!isAngle && (c.param == "depth")) {
             bool flip = params.value("flip", false);
             Vec3 axis; float capAnchor[3];
-            if (extrudeAxisHandle(st, fid, flip, axis, capAnchor)) {
+            if (extrudeAxisHandle(st, fid, flip, val, axis, capAnchor)) {
                 c.dirW = axis;
                 c.anchor[0] = capAnchor[0];
                 c.anchor[1] = capAnchor[1];

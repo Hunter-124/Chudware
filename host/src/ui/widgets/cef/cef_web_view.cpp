@@ -47,12 +47,15 @@ namespace ui {
 
 namespace {
 
-// Lifecycle tracing → stderr when AI_CAD_CEF_TRACE=1. Diagnoses "stuck on
-// Loading" by showing exactly which CEF lifecycle step fired (or didn't).
+// Lifecycle tracing → stderr. Diagnoses "stuck on Loading" / freeze-on-open by
+// showing exactly which CEF lifecycle step fired (or didn't). Currently ON BY
+// DEFAULT while we chase the OSR open crash; set AI_CAD_CEF_TRACE=0 to silence.
+// CEF's own [FATAL:…] DCHECK/CHECK aborts also print to this same stderr, so a
+// run captured with `2>&1 | tee` shows both our trace and any CEF fatal line.
 bool cefTrace() {
     static const bool on = [] {
         const char* v = std::getenv("AI_CAD_CEF_TRACE");
-        return v && v[0] == '1';
+        return !(v && v[0] == '0');   // default on; only "0" disables
     }();
     return on;
 }
@@ -593,8 +596,14 @@ bool CefWebView::draw(AppState& /*st*/, ImVec2 avail) {
                     Palette::toU32(col), txt);
     };
 
-    // Push requested size to CEF + upload the newest frame — under one lock.
-    bool haveTex = false, starting = false, active = false;
+    // Record the requested size + upload the newest frame under the lock, but do
+    // NOT touch CEF while holding it. WasResized() synchronously re-enters
+    // GetViewRect() on THIS thread (TID_UI == the GL thread under the external
+    // message pump), and GetViewRect() locks s.mtx — a non-recursive relock =
+    // self-deadlock (the "freeze/abort on opening the browser" bug: main thread
+    // stuck in __lll_lock_wait, every CEF callback that wants s.mtx wedged behind
+    // it). So we only flip a flag here and call WasResized() after the lock drops.
+    bool haveTex = false, starting = false, active = false, needResize = false;
     std::string lastError;
     {
         std::lock_guard<std::mutex> lk(s.mtx);
@@ -602,10 +611,7 @@ bool CefWebView::draw(AppState& /*st*/, ImVec2 avail) {
         const int nw = (int)avail.x, nh = (int)avail.y;
         if (nw != s.reqW || nh != s.reqH) {
             s.reqW = nw; s.reqH = nh;
-            const bool haveBrowser = impl_->client && impl_->client->browser();
-            CEF_TRACE("draw WasResized %dx%d haveBrowser=%d", nw, nh, (int)haveBrowser);
-            if (haveBrowser)
-                impl_->client->browser()->GetHost()->WasResized();
+            needResize = true;
         }
         if (s.dirty && !s.bgra.empty() && s.paintW > 0 && s.paintH > 0) {
             if (!impl_->tex) glGenTextures(1, &impl_->tex);
@@ -625,6 +631,15 @@ bool CefWebView::draw(AppState& /*st*/, ImVec2 avail) {
             s.dirty = false;
         }
         haveTex = impl_->tex && impl_->texW > 0 && impl_->texH > 0;
+    }
+
+    // CEF host call OUTSIDE the lock (see above): safe now that s.mtx is dropped.
+    if (needResize) {
+        const bool haveBrowser = impl_->client && impl_->client->browser();
+        CEF_TRACE("draw WasResized %dx%d haveBrowser=%d", (int)avail.x, (int)avail.y,
+                  (int)haveBrowser);
+        if (haveBrowser)
+            impl_->client->browser()->GetHost()->WasResized();
     }
 
     // No frame yet → status text.

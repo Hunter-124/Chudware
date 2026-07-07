@@ -68,8 +68,8 @@ static_assert(sizeof(kTabIcons) / sizeof(kTabIcons[0]) == kRibbonTabCount,
               "kTabIcons must stay parallel to kRibbonTabs");
 
 // Forward-declared here; defined after drawRibbon's local state block (~line 330).
-// TEMP-VERIFY: set to 2 (Simulate) to confirm workspace filtering before reverting.
-static int s_workspace = 2;
+// Default Model (0) — app.cpp sets the live value each frame via setRibbonWorkspace().
+static int s_workspace = 0;
 
 // W17 + per-workspace: control which tabs appear in the ribbon for the current workspace.
 //
@@ -159,8 +159,7 @@ static constexpr float kGroupPadX   = 7.0f;   // audit: was 9 — trimmed dead s
 static constexpr float kBodyH       = 100.0f;
 static constexpr float kCaptionH    = 22.0f;
 static constexpr float kSmRowH      = 22.0f;
-static constexpr float kArrowW      = 12.0f;
-static constexpr float kDropArrowW  = 14.0f;
+static constexpr float kDropArrowW  = 14.0f;  // trailing arrow slot — compact rows only
 static constexpr float kBottomPad   = 4.0f;   // audit: was 8 — dead band under the body
 
 static const char* ribbon_displayLabel(const char* cmd_id, const char* label) {
@@ -209,7 +208,11 @@ static float ribbon_bigBtnW(const char* cmd_id, const char* label, bool hasDrop)
     float base = (visibleLabel[0] == '\0' ? 46.0f : kBigBtnW) * s;
     if (lblWScreen > base) base = lblWScreen;
     if (base > kBigBtnMaxW * s) base = kBigBtnMaxW * s;
-    return base + (hasDrop ? kDropArrowW * s : 0.0f);
+    // Defect fix (Hunter, 2026-07-06): the dropdown arrow no longer widens the button — it sits
+    // UNDER the icon in a bottom strip, so split buttons are exactly as wide as plain ones and
+    // the icon stays horizontally centered. hasDrop kept for call-site stability.
+    (void)hasDrop;
+    return base;
 }
 
 // Width of a small button in screen pixels.
@@ -695,31 +698,47 @@ static const float* ribbon_matSwatchColor(const char* cmd_id) {
     return nullptr;
 }
 
-// Resting glass fill + hairline outline for a ribbon button (big or small).
-// Called before hover/active so the state layers are: rest < hover < active.
+// Liquid-glass fill + hairline outline for a ribbon button (big or small).
+// Called before active so the state layers are: rest/hover (this) < press < active outline.
 //
-// Uses palette.text role — light in dark themes, dark in light themes — so the outline
-// is always readable regardless of panel background. palette.border is dark navy and
-// becomes invisible against dark panel backgrounds.
+// Layers (all palette roles — theme-safe in light AND dark):
+//   1. base fill    = text at low alpha (light in dark themes, dark in light themes) — the
+//                     faint tint that signals a pressable zone
+//   2. shine        = vertical translucent gradient, glassHighlight -> transparent over the
+//                     top ~55% (same material recipe as ui::glassBackground) — "liquid glass"
+//   3. outline      = text-role hairline at translucent alpha, soft rounding
 //
-//   fill    = text at 10% alpha — faint but perceptible tint signals a pressable zone
-//   outline = text at 45% alpha — crisp hairline; clearly visible on both themes
+// `hovered`: brightens all three layers (brighter gradient + outline) — the hover state.
+// `inset`:   1px vertical inset for stacked small-button rows so adjacent bottom/top edges
+//            don't share a pixel and merge into a solid grid line.
 //
-// `inset`: set true for stacked small-button rows so adjacent bottom/top edges don't share
-// a pixel and merge into a solid grid line when alpha is bumped.
-//
-// Both scale by `enabled` so disabled buttons keep the ghost appearance at lower contrast.
+// All layers scale down when !enabled so disabled buttons keep a low-contrast ghost.
 static void ribbon_btnRest(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding, bool enabled,
-                            bool inset = false) {
+                            bool inset = false, bool hovered = false) {
     const float* t = ui::palette.text;
-    float fillA  = enabled ? 0.10f : 0.05f;
-    float lineA  = enabled ? 0.45f : 0.20f;
+    float fillA    = !enabled ? 0.04f : (hovered ? 0.16f : 0.08f);
+    float lineA    = !enabled ? 0.20f : (hovered ? 0.70f : 0.45f);
+    float shineMul = !enabled ? 0.45f : (hovered ? 1.60f : 1.00f);
     ImU32 fill   = IM_COL32((int)(t[0]*255), (int)(t[1]*255), (int)(t[2]*255),
                              (int)(fillA * 255));
     ImU32 border = IM_COL32((int)(t[0]*255), (int)(t[1]*255), (int)(t[2]*255),
                              (int)(lineA * 255));
     if (inset) { p0.y += 1.0f; p1.y -= 1.0f; }
     dl->AddRectFilled(p0, p1, fill, rounding);
+    // Vertical shine gradient — lighter top, fading to transparent by ~55% height. Drawn 1px
+    // inside the outline so the square gradient corners never poke past the rounded border.
+    {
+        const float ix = 1.0f * ui::uiScale;
+        ImVec2 g0(p0.x + ix, p0.y + ix);
+        ImVec2 g1(p1.x - ix, p0.y + (p1.y - p0.y) * 0.55f);
+        if (g1.x > g0.x && g1.y > g0.y) {
+            float hc[4];
+            ui::Palette::withAlpha(ui::palette.glassHighlight, hc, shineMul);
+            ImU32 top = ui::Palette::toU32(hc);
+            ImU32 btm = top & 0x00FFFFFFu;  // same RGB, alpha=0 (ABGR: bits 24-31 = A)
+            dl->AddRectFilledMultiColor(g0, g1, top, top, btm, btm);
+        }
+    }
     dl->AddRect(p0, p1, border, rounding, 0, ui::metrics::stroke(1.0f));
 }
 
@@ -751,60 +770,52 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0,0,0,0));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0,0,0,0));
 
-    float mainW = hasDrop ? (bw - kArrowW * s) : bw;
-    clicked = ImGui::InvisibleButton("##main", ImVec2(mainW, bh));
+    // Split-button geometry (Hunter defect fix): the dropdown arrow lives in a BOTTOM strip
+    // under the icon/label — never a side column — so the button keeps its natural width and
+    // the icon stays horizontally centered like every non-dropdown button.
+    float dropH = hasDrop ? 12.0f * s : 0.0f;
+    clicked = ImGui::InvisibleButton("##main", ImVec2(bw, bh - dropH));
     bool mainHov    = ImGui::IsItemHovered();
     bool mainHovTip = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
     bool mainPress  = ImGui::IsItemActive();
+    bool dropHov    = false;
+
+    if (hasDrop) {
+        ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y + bh - dropH));
+        dropClicked = ImGui::InvisibleButton("##drop", ImVec2(bw, dropH));
+        dropHov = ImGui::IsItemHovered();
+        if (dropClicked && enabled) s_flyoutOpenReq = cmd_id;   // deferred (ID-scope fix)
+    }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p1(p0.x + bw, p0.y + bh);
 
-    // State layering: rest → hover → active (armed tool). Draw in order so upper states paint over.
+    // State layering: liquid-glass rest/hover fill → bold active outline → press overlay.
     const bool isActive = ribbon_isActive(cmd_id);
-    ribbon_btnRest(dl, p0, ImVec2(p0.x + bw, p0.y + bh), rnd, enabled);
+    const bool hovAny   = (mainHov || dropHov) && enabled;
+    ribbon_btnRest(dl, p0, p1, rnd, enabled, /*inset=*/false, /*hovered=*/hovAny);
     if (isActive) {
-        ribbon_btnActive(dl, p0, ImVec2(p0.x + bw, p0.y + bh), rnd);
+        // Armed tool: BOLD accent outline around the full bounding box (app-wide rule).
+        ribbon_btnActive(dl, p0, p1, rnd);
     }
 
     if (hasDrop) {
-        ImGui::SameLine(0, 0);
-        dropClicked = ImGui::InvisibleButton("##drop", ImVec2(kArrowW * s, bh));
-        bool dropHov = ImGui::IsItemHovered();
-
-        if ((mainHov || dropHov) && enabled && !isActive) {
-            ui::glassRowBackground(dl, p0, ImVec2(p0.x + bw, p0.y + bh), 4.0f);
-        } else if ((mainHov || dropHov) && enabled && isActive) {
-            // hover on top of active: reinforce the glass layer but keep the bold outline
-            ui::glassRowBackground(dl, p0, ImVec2(p0.x + bw, p0.y + bh), 4.0f);
-            dl->AddRect(p0, ImVec2(p0.x + bw, p0.y + bh),
-                        ui::Palette::toU32(ui::palette.accent), rnd, 0, ui::metrics::stroke(2.0f));
-        }
-        {
-            float ax = p0.x + mainW + kArrowW * s * 0.5f;
-            float ay = p0.y + bh - 10.0f * s;
-            ImU32 aCol = enabled ? ui::Palette::toU32(ui::palette.text)
-                                 : ui::Palette::toU32(ui::palette.textDisabled);
-            float hs = 3.5f * s;
-            dl->AddTriangleFilled(ImVec2(ax - hs, ay - hs * 0.5f),
-                                  ImVec2(ax + hs, ay - hs * 0.5f),
-                                  ImVec2(ax,      ay + hs * 0.5f), aCol);
-        }
-
-        if (dropClicked && enabled) s_flyoutOpenReq = cmd_id;   // deferred (ID-scope fix)
-    } else {
-        if (mainHov && enabled && !isActive) {
-            ui::glassRowBackground(dl, p0, ImVec2(p0.x + bw, p0.y + bh), 4.0f);
-        } else if (mainHov && enabled && isActive) {
-            ui::glassRowBackground(dl, p0, ImVec2(p0.x + bw, p0.y + bh), 4.0f);
-            dl->AddRect(p0, ImVec2(p0.x + bw, p0.y + bh),
-                        ui::Palette::toU32(ui::palette.accent), rnd, 0, ui::metrics::stroke(2.0f));
-        }
+        // Dropdown arrow: centered horizontally UNDER the icon/label, tucked inside the
+        // bottom strip with padding so it never touches the outline.
+        float ax = snap(p0.x + bw * 0.5f);
+        float ay = p0.y + bh - dropH * 0.5f;
+        ImU32 aCol = enabled ? ui::Palette::toU32(ui::palette.text)
+                             : ui::Palette::toU32(ui::palette.textDisabled);
+        float hs = 3.5f * s;
+        dl->AddTriangleFilled(ImVec2(ax - hs, ay - hs * 0.5f),
+                              ImVec2(ax + hs, ay - hs * 0.5f),
+                              ImVec2(ax,      ay + hs * 0.5f), aCol);
     }
     // Press feedback: darken the button slightly while the mouse button is held down.
     // Draws over hover/active layers — gives physical "click-down" feel.
     if (mainPress && enabled) {
         ImU32 pressOverlay = IM_COL32(0, 0, 0, 40);
-        dl->AddRectFilled(p0, ImVec2(p0.x + bw, p0.y + bh), pressOverlay, rnd);
+        dl->AddRectFilled(p0, p1, pressOverlay, rnd);
     }
 
     ImGui::PopStyleColor(3);
@@ -814,7 +825,9 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     // Block = iconSz + optional swatch bar (4px+gap) + label lines. Centered with ≥3px edge pad.
     {
         float iconSz = snap(kBigIconSz * s);
-        float cx     = snap(p0.x + mainW * 0.5f);
+        // Centered on the FULL button width — split buttons no longer reserve a side arrow
+        // column, so dropdown and plain buttons center identically (Hunter defect fix).
+        float cx     = snap(p0.x + bw * 0.5f);
         const char* visibleLabel = ribbon_displayLabel(cmd_id, label);
         const float* matRgb = ribbon_matSwatchColor(cmd_id);
 
@@ -825,11 +838,14 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         float swatchH = matRgb ? 5.0f * s : 0.0f;  // 4px bar + 1px gap
         float labelH  = nLines > 0 ? (lineH * (float)nLines + 2.0f * s + swatchH) : 0.0f;
         float blockH  = iconSz + labelH;
+        // Vertical centering excludes the bottom arrow strip so icon+label never collide
+        // with the under-icon dropdown arrow.
+        float bhContent = bh - dropH;
         float iy;
         if (visibleLabel[0] == '\0') {
-            iy = snap(p0.y + (bh - iconSz) * 0.5f);
+            iy = snap(p0.y + (bhContent - iconSz) * 0.5f);
         } else {
-            iy = snap(p0.y + (bh - blockH) * 0.5f);
+            iy = snap(p0.y + (bhContent - blockH) * 0.5f);
             if (iy < p0.y + 3.0f * s) iy = snap(p0.y + 3.0f * s);
         }
 
@@ -853,7 +869,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         ImU32 tCol = enabled ? ui::Palette::toU32(ui::palette.text)
                              : ui::Palette::toU32(ui::palette.textDisabled);
         float ty = iy + iconSz + swatchH + 2.0f * s;
-        dl->PushClipRect(ImVec2(p0.x, p0.y), ImVec2(p0.x + mainW, p0.y + bh), true);
+        dl->PushClipRect(ImVec2(p0.x, p0.y), ImVec2(p0.x + bw, p0.y + bh - dropH), true);
         if (visibleLabel[0] != '\0') {
             ImVec2 t1 = ImGui::CalcTextSize(l1.c_str());
             dl->AddText(nullptr, 0.0f, ImVec2(cx - t1.x * 0.5f, ty), tCol, l1.c_str());
@@ -921,45 +937,41 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
     clicked = ImGui::InvisibleButton("##msm", ImVec2(mainW, rowH));
     bool mainHov    = ImGui::IsItemHovered();
     bool mainHovTip = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
+    bool mainPress  = ImGui::IsItemActive();
+    bool dropHov    = false;
+
+    if (hasDrop) {
+        ImGui::SameLine(0, 0);
+        dropClicked = ImGui::InvisibleButton("##mdr", ImVec2(kDropArrowW * s, rowH));
+        dropHov = ImGui::IsItemHovered();
+        if (dropClicked && enabled) s_flyoutOpenReq = cmd_id;   // deferred (ID-scope fix)
+    }
 
     ImDrawList* dl_sm = ImGui::GetWindowDrawList();
     float rnd_sm = ui::metrics::ribbonBtnRound();
     const bool isActiveSm = ribbon_isActive(cmd_id);
     ImVec2 p1_sm(p0.x + totalW, p0.y + rowH);
 
-    // State layering: rest → hover → active (bold outline).
+    // State layering: liquid-glass rest/hover → active (bold outline) → press overlay.
     // inset=true: 1px vertical inset so stacked rows don't share an edge pixel.
-    ribbon_btnRest(dl_sm, p0, p1_sm, rnd_sm, enabled, /*inset=*/true);
+    // (Compact horizontal row: no room to stack the arrow under the 20px icon, so the arrow
+    // keeps its trailing slot here — the row is left-aligned so centering is unaffected.)
+    ribbon_btnRest(dl_sm, p0, p1_sm, rnd_sm, enabled, /*inset=*/true,
+                   /*hovered=*/(mainHov || dropHov) && enabled);
     if (isActiveSm) ribbon_btnActive(dl_sm, p0, p1_sm, rnd_sm);
 
     if (hasDrop) {
-        ImGui::SameLine(0, 0);
-        dropClicked = ImGui::InvisibleButton("##mdr", ImVec2(kDropArrowW * s, rowH));
-        bool dropHov = ImGui::IsItemHovered();
-        if ((mainHov || dropHov) && enabled) {
-            ui::glassRowBackground(dl_sm, p0, p1_sm, 4.0f);
-            if (isActiveSm)
-                dl_sm->AddRect(p0, p1_sm, ui::Palette::toU32(ui::palette.accent),
-                               rnd_sm, 0, ui::metrics::stroke(2.0f));
-        }
-        {
-            float ax = p0.x + mainW + kDropArrowW * s * 0.5f;
-            float ay = p0.y + rowH * 0.5f;
-            ImU32 aCol = enabled ? ui::Palette::toU32(ui::palette.text)
-                                 : ui::Palette::toU32(ui::palette.textDisabled);
-            float hs = 3.0f * s;
-            dl_sm->AddTriangleFilled(ImVec2(ax - hs, ay - hs * 0.5f),
-                                     ImVec2(ax + hs, ay - hs * 0.5f),
-                                     ImVec2(ax,      ay + hs * 0.5f), aCol);
-        }
-        if (dropClicked && enabled) s_flyoutOpenReq = cmd_id;   // deferred (ID-scope fix)
-    } else {
-        if (mainHov && enabled) {
-            ui::glassRowBackground(dl_sm, p0, p1_sm, 4.0f);
-            if (isActiveSm)
-                dl_sm->AddRect(p0, p1_sm, ui::Palette::toU32(ui::palette.accent),
-                               rnd_sm, 0, ui::metrics::stroke(2.0f));
-        }
+        float ax = p0.x + mainW + kDropArrowW * s * 0.5f;
+        float ay = p0.y + rowH * 0.5f;
+        ImU32 aCol = enabled ? ui::Palette::toU32(ui::palette.text)
+                             : ui::Palette::toU32(ui::palette.textDisabled);
+        float hs = 3.0f * s;
+        dl_sm->AddTriangleFilled(ImVec2(ax - hs, ay - hs * 0.5f),
+                                 ImVec2(ax + hs, ay - hs * 0.5f),
+                                 ImVec2(ax,      ay + hs * 0.5f), aCol);
+    }
+    if (mainPress && enabled) {
+        dl_sm->AddRectFilled(p0, p1_sm, IM_COL32(0, 0, 0, 40), rnd_sm);
     }
 
     ImGui::PopStyleColor(3);
@@ -1137,25 +1149,24 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
     bool clicked = ImGui::InvisibleButton("##sm", ImVec2(totalW, rowH));
     bool hov     = ImGui::IsItemHovered();
     bool hovTip  = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
+    bool press   = ImGui::IsItemActive();
     ImGui::PopStyleColor(3);
     ImGui::PopStyleVar();
 
-    // State layering: rest → hover (glass, unified with big buttons) → active (bold outline).
-    // inset=true: 1px vertical inset so stacked small rows don't share a grid-line edge.
+    // State layering: liquid-glass rest/hover (unified with big buttons) → active (bold
+    // outline) → press overlay. inset=true: 1px vertical inset so stacked small rows don't
+    // share a grid-line edge.
     {
         ImDrawList* dl_s = ImGui::GetWindowDrawList();
         float rnd_s = ui::metrics::ribbonBtnRound();
         ImVec2 p1_s(p0.x + totalW, p0.y + rowH);
         const bool isActiveSm2 = ribbon_isActive(cmd_id);
-        ribbon_btnRest(dl_s, p0, p1_s, rnd_s, enabled, /*inset=*/true);
+        ribbon_btnRest(dl_s, p0, p1_s, rnd_s, enabled, /*inset=*/true, /*hovered=*/hov && enabled);
         if (isActiveSm2) {
             ribbon_btnActive(dl_s, p0, p1_s, rnd_s);
         }
-        if (hov && enabled) {
-            ui::glassRowBackground(dl_s, p0, p1_s, 4.0f);
-            if (isActiveSm2)
-                dl_s->AddRect(p0, p1_s, ui::Palette::toU32(ui::palette.accent),
-                              rnd_s, 0, ui::metrics::stroke(2.0f));
+        if (press && enabled) {
+            dl_s->AddRectFilled(p0, p1_s, IM_COL32(0, 0, 0, 40), rnd_s);
         }
     }
 

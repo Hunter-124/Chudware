@@ -1861,6 +1861,11 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                                 auto* ap = st.activityPanel;
                                 ap->onEvent(orchKind, data);
                             }
+                            // Phase 2 (M9/M10): feed the live Agent Workflow DAG store. Ungated —
+                            // it must capture agent.* span events even when no chat bubble is
+                            // active (a subagent branch can outlive the trunk turn). GL-thread
+                            // only; the store is a plain static in ai_workspace.cpp.
+                            ui::feedAgentDagEvent(orchKind, data);
                             // Fold the event into the running turn's inline activity timeline so
                             // the conversation transparently shows what the AI is doing/thinking.
                             if (active) feedTurnActivity(*active, orchKind, data);

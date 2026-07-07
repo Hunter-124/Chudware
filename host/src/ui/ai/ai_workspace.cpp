@@ -60,7 +60,7 @@ struct AiWsState {
     // Which DAG the upper pane shows (M7): 0 = Agent Workflow, 1 = Session Plan.
     // Phase 1 renders the buildgraph view for BOTH; Phase 2 swaps a live agent-execution DAG
     // into Agent Workflow. The conversation window is always visible below (M6), never a tab.
-    int  dagView      = 1;     // default to Session Plan (the only view with real data today)
+    int  dagView      = 0;     // default to Agent Workflow (Phase 2 live execution DAG)
     bool showSettings = true;
 
     // M8 plumbing: the chat session whose plan the "Session Plan" view is scoped to. Set from
@@ -91,6 +91,169 @@ struct AiWsState {
 };
 
 static AiWsState s_ai;
+
+// ==================================================================================
+// Phase 2 (M9/M10) — live Agent Workflow DAG store.
+//
+// A DIFFERENT graph from the buildgraph Session Plan (AI_WORKSPACE_V2_PLAN.md §3): this is the
+// agent loop's own execution trace — tool calls (+ what they act on), context injections, thoughts,
+// and (when a production sink lands) subagent/advisor branches. It is built purely from the drained
+// `aicad.agent_events/2` stream by joining `parent_id`→`id` (§2.1). No buildgraph sidecar, no RPC.
+//
+// HONESTY: only agent.tool_call / agent.thought / agent.context_injected are emitted by a live
+// production sink today. agent.spawn / agent.advisor are emit-wired in the backend but have NO
+// production caller threaded yet (tracker M20) — the node kinds exist below so the tree lights up
+// the moment they arrive, but nothing is fabricated: absent events => empty-state.
+// (This block lives inside the file-level anonymous namespace opened above; the public
+// feedAgentDagEvent() below temporarily closes/reopens it so it gets external ui:: linkage.)
+// ==================================================================================
+
+enum class AgKind { Root, Tool, Thought, Context, Spawn, Advisor, Other };
+
+struct AgNode {
+    std::string id;         // span id (§2.1) — THE tree key
+    std::string parentId;   // join target
+    AgKind      kind = AgKind::Other;
+    std::string actor;      // emitting agent/role
+    std::string title;      // primary line (tool name / "thought" / injection source)
+    std::string detail;     // secondary line (target / label / verdict / text)
+    std::string status;     // "ok" | "failed" | "" (drives the accent color, reuses statusColor)
+    int         latencyMs = -1;
+    long long   seq = 0;    // arrival order (advisory ordering fallback per §2.1)
+    // tree links (resolved each rebuild)
+    std::vector<int>   children;
+    int   depth = 0;        // BFS depth from a root (for indent/layout)
+    bool  collapsed = false;// M10: user-collapsed — hides the subtree
+};
+
+struct AgentDagStore {
+    std::string          runId;          // envelope run_id this tree belongs to
+    std::vector<AgNode>  nodes;
+    std::unordered_map<std::string,int> byId;   // span id -> index
+    long long            seqCtr = 0;
+    bool                 sawSpawn = false;       // ever received a real subagent branch?
+    bool                 sawAdvisor = false;     // ever received a real advisor node?
+    int                  toolCount = 0, thoughtCount = 0, ctxCount = 0;
+
+    void reset(const std::string& rid) {
+        runId = rid; nodes.clear(); byId.clear(); seqCtr = 0;
+        sawSpawn = sawAdvisor = false; toolCount = thoughtCount = ctxCount = 0;
+    }
+    bool empty() const { return nodes.empty(); }
+};
+
+static AgentDagStore s_agdag;
+
+static std::string agEnvStr(const nlohmann::json& d, const char* k) {
+    auto it = d.find(k);
+    return (it != d.end() && it->is_string()) ? it->get<std::string>() : std::string();
+}
+static int agEnvInt(const nlohmann::json& d, const char* k, int def) {
+    auto it = d.find(k);
+    return (it != d.end() && it->is_number_integer()) ? it->get<int>() : def;
+}
+
+// Insert or update a node keyed by span id. Events without an `id` (legacy /1 records) get a
+// synthesized per-run id from actor+seq so they still land as leaves (§2.1 consumer fallback).
+static AgNode& agUpsert(const std::string& id, const std::string& parentId) {
+    auto it = s_agdag.byId.find(id);
+    if (it != s_agdag.byId.end()) {
+        AgNode& n = s_agdag.nodes[it->second];
+        if (n.parentId.empty() && !parentId.empty()) n.parentId = parentId;
+        return n;
+    }
+    AgNode n;
+    n.id = id;
+    n.parentId = parentId;
+    n.seq = s_agdag.seqCtr++;
+    s_agdag.byId[id] = (int)s_agdag.nodes.size();
+    s_agdag.nodes.push_back(std::move(n));
+    return s_agdag.nodes.back();
+}
+
+}  // close the file-level anonymous namespace so feedAgentDagEvent has external ui:: linkage
+
+// Feed one drained orchestrator event into the live Agent Workflow DAG (GL thread only).
+void feedAgentDagEvent(const std::string& kind, const nlohmann::json& data) {
+    if (!data.is_object()) return;
+
+    // Run boundary: a fresh run replaces the previous tree (mirrors the context-meter reset).
+    const std::string runId = agEnvStr(data, "run_id");
+    if (kind == "run_started" || kind == "dag.run.started") {
+        s_agdag.reset(runId);
+        return;
+    }
+    // If a new run_id arrives without a start marker (e.g. we joined mid-run), roll over cleanly.
+    if (!runId.empty() && !s_agdag.runId.empty() && runId != s_agdag.runId)
+        s_agdag.reset(runId);
+    if (s_agdag.runId.empty() && !runId.empty()) s_agdag.runId = runId;
+
+    // Only agent-level kinds carry §2.1 span linkage; everything else is ignored by this store
+    // (the buildgraph/Session Plan view owns the dag.* lifecycle).
+    if (kind.rfind("agent.", 0) != 0) return;
+
+    const std::string id       = agEnvStr(data, "id");
+    const std::string parentId = agEnvStr(data, "parent_id");
+    const std::string actor    = agEnvStr(data, "actor");
+    // A missing span id (legacy /1) can't seed the tree key — fall back to a synthetic leaf id so
+    // the record is still visible without a parent join.
+    const std::string key = !id.empty()
+        ? id
+        : ("_leaf" + std::to_string(s_agdag.seqCtr) + agEnvStr(data, "node_id"));
+
+    if (kind == "agent.tool_call") {
+        AgNode& n = agUpsert(key, parentId);
+        n.kind   = AgKind::Tool;
+        n.actor  = actor;
+        n.title  = agEnvStr(data, "tool_name");
+        if (n.title.empty()) n.title = "tool";
+        n.detail = agEnvStr(data, "target");        // human-readable "what it acts on" (M14)
+        bool ok  = data.value("ok", true);
+        n.status = ok ? "ok" : "failed";
+        n.latencyMs = agEnvInt(data, "latency_ms", -1);
+        ++s_agdag.toolCount;
+    } else if (kind == "agent.thought") {
+        AgNode& n = agUpsert(key, parentId);
+        n.kind   = AgKind::Thought;
+        n.actor  = actor;
+        n.title  = "thought";
+        n.detail = agEnvStr(data, "text");          // completed reasoning block (not streamed)
+        ++s_agdag.thoughtCount;
+    } else if (kind == "agent.context_injected") {
+        AgNode& n = agUpsert(key, parentId);
+        n.kind   = AgKind::Context;
+        n.actor  = actor;
+        n.title  = "context: " + agEnvStr(data, "source");
+        n.detail = agEnvStr(data, "label");
+        int tok  = agEnvInt(data, "token_est", 0);
+        if (tok > 0) n.detail += (n.detail.empty() ? "" : "  ") + ("~" + std::to_string(tok) + " tok");
+        ++s_agdag.ctxCount;
+    } else if (kind == "agent.spawn") {
+        // Subagent / worker branch. Emit-wired backend, no production sink today (M20) — but if a
+        // real one arrives we build the branch: the spawner span is `parent_id`, and the child's
+        // own execution root is `subagent_id`.
+        AgNode& n = agUpsert(key, parentId);
+        n.kind   = AgKind::Spawn;
+        n.actor  = actor.empty() ? agEnvStr(data, "role") : actor;
+        n.title  = "spawn: " + agEnvStr(data, "role");
+        n.detail = agEnvStr(data, "brief");
+        // Seed the child's execution root so its later events attach under this spawn node.
+        const std::string childId = agEnvStr(data, "subagent_id");
+        if (!childId.empty()) { AgNode& c = agUpsert(childId, key); if (c.title.empty()) { c.kind = AgKind::Root; c.actor = n.actor; c.title = "subagent " + n.actor; } }
+        s_agdag.sawSpawn = true;
+    } else if (kind == "agent.advisor") {
+        AgNode& n = agUpsert(key, parentId);
+        n.kind   = AgKind::Advisor;
+        n.actor  = actor;
+        n.title  = "advisor: " + agEnvStr(data, "advisor_kind");
+        n.detail = agEnvStr(data, "verdict_summary");
+        s_agdag.sawAdvisor = true;
+    }
+    // Any other agent.* kind (artifact/question/answer) is tolerated but not graphed here.
+}
+
+// Reopen the file-level anonymous namespace for the remaining internal helpers/renderers.
+namespace {
 
 // ---- shared little helpers (same visual grammar as parts/plm workspaces) --------
 
@@ -342,6 +505,268 @@ static const float* statusColor(const std::string& s) {
     if (s == "running" || s == "in_progress")               return palette.accent;
     if (s == "blocked" || s == "paused" || s == "waiting")  return palette.statusWarn;
     return palette.textDisabled;  // pending / unknown
+}
+
+// ---- Agent Workflow DAG (Phase 2, M9/M10) ---------------------------------------
+// A collapsible, scalable execution tree built from the live event store (s_agdag). Reuses the
+// pan/zoom/clip/Bézier scaffolding grammar of drawDagCanvas but with its OWN layout so M10 can
+// hide collapsed subtrees BEFORE laying out (the buildgraph canvas has no collapse concept).
+
+static const float* agNodeColor(const AgNode& n) {
+    switch (n.kind) {
+        case AgKind::Tool:    return n.status == "failed" ? palette.statusErr : palette.statusOk;
+        case AgKind::Thought: return palette.accent;
+        case AgKind::Context: return palette.statusWarn;
+        case AgKind::Spawn:   return palette.accent;
+        case AgKind::Advisor: return palette.accent;
+        case AgKind::Root:    return palette.textDim;
+        default:              return palette.textDisabled;
+    }
+}
+
+static const char* agKindTag(AgKind k) {
+    switch (k) {
+        case AgKind::Tool:    return "tool";
+        case AgKind::Thought: return "think";
+        case AgKind::Context: return "context";
+        case AgKind::Spawn:   return "subagent";
+        case AgKind::Advisor: return "advisor";
+        case AgKind::Root:    return "run";
+        default:              return "node";
+    }
+}
+
+// Resolve parent->children links + depth from the flat node list (join parent_id -> id, §2.1).
+// Nodes whose parent is absent become roots. Cheap enough to run every frame (tens of nodes).
+static void agResolveTree(std::vector<int>& roots) {
+    for (auto& n : s_agdag.nodes) { n.children.clear(); n.depth = 0; }
+    roots.clear();
+    for (size_t i = 0; i < s_agdag.nodes.size(); ++i) {
+        const std::string& pid = s_agdag.nodes[i].parentId;
+        auto it = pid.empty() ? s_agdag.byId.end() : s_agdag.byId.find(pid);
+        if (it == s_agdag.byId.end() || it->second == (int)i) roots.push_back((int)i);
+        else s_agdag.nodes[it->second].children.push_back((int)i);
+    }
+    // Depth via BFS from roots (advisory ordering; ts/seq keep siblings stable).
+    std::vector<int> stack(roots.begin(), roots.end());
+    std::vector<char> seen(s_agdag.nodes.size(), 0);
+    for (int r : roots) seen[r] = 1;
+    while (!stack.empty()) {
+        int cur = stack.back(); stack.pop_back();
+        for (int c : s_agdag.nodes[cur].children) {
+            if (seen[c]) continue;
+            seen[c] = 1;
+            s_agdag.nodes[c].depth = s_agdag.nodes[cur].depth + 1;
+            stack.push_back(c);
+        }
+    }
+}
+
+// M10: flatten to the VISIBLE set (stop descending at a collapsed node) in tree order, assigning
+// each visible node a (layer=depth, row=running counter) grid slot. Returns visible node indices.
+static void agFlattenVisible(const std::vector<int>& roots, std::vector<int>& visible,
+                             std::unordered_map<int,int>& rowOf) {
+    visible.clear(); rowOf.clear();
+    // Sort roots + children by seq for stable, arrival-ordered rows.
+    auto bySeq = [](const std::vector<int>&) {};
+    (void)bySeq;
+    std::vector<int> order;
+    // Iterative pre-order DFS honoring collapse.
+    std::vector<int> stack(roots.rbegin(), roots.rend());
+    int row = 0;
+    while (!stack.empty()) {
+        int cur = stack.back(); stack.pop_back();
+        visible.push_back(cur);
+        rowOf[cur] = row++;
+        if (!s_agdag.nodes[cur].collapsed) {
+            // push children in reverse-seq so they pop in seq order
+            std::vector<int> kids = s_agdag.nodes[cur].children;
+            std::sort(kids.begin(), kids.end(), [](int a, int b) {
+                return s_agdag.nodes[a].seq < s_agdag.nodes[b].seq;
+            });
+            for (auto rit = kids.rbegin(); rit != kids.rend(); ++rit) stack.push_back(*rit);
+        }
+    }
+}
+
+static void drawAgentDagCanvas(AppState& st) {
+    const float S = ui::uiScale;
+
+    std::vector<int> roots;
+    agResolveTree(roots);
+    std::sort(roots.begin(), roots.end(),
+              [](int a, int b) { return s_agdag.nodes[a].seq < s_agdag.nodes[b].seq; });
+    std::vector<int> visible;
+    std::unordered_map<int,int> rowOf;
+    agFlattenVisible(roots, visible, rowOf);
+
+    ImGui::BeginChild("##ag_dag_canvas", ImVec2(0, 0), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    const ImVec2 cMin = ImGui::GetWindowPos();
+    const ImVec2 cSz  = ImGui::GetWindowSize();
+    const ImVec2 cMax(cMin.x + cSz.x, cMin.y + cSz.y);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->PushClipRect(cMin, cMax, true);
+
+    // Whole-canvas pan/zoom surface (reuses the s_ai.pan/zoom camera — shared between DAG views).
+    ImGui::InvisibleButton("##ag_dag_nav", cSz,
+                           ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle);
+    bool navActive = ImGui::IsItemActive();
+    if (navActive) {
+        s_ai.pan.x += ImGui::GetIO().MouseDelta.x;
+        s_ai.pan.y += ImGui::GetIO().MouseDelta.y;
+    }
+    if (ImGui::IsItemHovered()) {
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0.0f) {
+            float oldZ = s_ai.zoom;
+            s_ai.zoom = std::min(2.5f, std::max(0.35f, s_ai.zoom * (1.0f + wheel * 0.1f)));
+            ImVec2 m = ImGui::GetIO().MousePos;
+            ImVec2 local(m.x - cMin.x - s_ai.pan.x, m.y - cMin.y - s_ai.pan.y);
+            s_ai.pan.x -= local.x * (s_ai.zoom / oldZ - 1.0f);
+            s_ai.pan.y -= local.y * (s_ai.zoom / oldZ - 1.0f);
+        }
+    }
+
+    const float z     = s_ai.zoom;
+    const float nodeW = 200.0f * S * z, nodeH = 44.0f * S * z;
+    const float gapX  = 46.0f * S * z,  gapY  = 12.0f * S * z;
+    // layer = depth (indent by tree level), row = pre-order counter.
+    auto slotPos = [&](int nodeIdx) {
+        const AgNode& n = s_agdag.nodes[nodeIdx];
+        int rr = rowOf.count(nodeIdx) ? rowOf[nodeIdx] : 0;
+        return ImVec2(cMin.x + s_ai.pan.x + 16.0f * S + n.depth * (32.0f * S * z),
+                      cMin.y + s_ai.pan.y + 16.0f * S + rr * (nodeH + gapY));
+    };
+
+    // Edges (parent right/bottom -> child left) behind boxes.
+    const ImU32 edgeCol = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 0.55f));
+    for (int idx : visible) {
+        const AgNode& n = s_agdag.nodes[idx];
+        auto pit = n.parentId.empty() ? s_agdag.byId.end() : s_agdag.byId.find(n.parentId);
+        if (pit == s_agdag.byId.end()) continue;
+        if (!rowOf.count(pit->second)) continue;   // parent not visible (shouldn't happen)
+        ImVec2 pC = slotPos(idx);
+        ImVec2 pP = slotPos(pit->second);
+        ImVec2 a(pP.x + 14.0f * S * z, pP.y + nodeH);          // out the bottom-left of the parent
+        ImVec2 b(pC.x,                 pC.y + nodeH * 0.5f);    // into the child's left edge
+        float  cy = std::max(12.0f * S * z, (b.y - a.y) * 0.5f);
+        dl->AddBezierCubic(a, ImVec2(a.x, a.y + cy), ImVec2(b.x - 20.0f * S * z, b.y), b,
+                           edgeCol, 1.4f * S * z);
+    }
+
+    // Nodes.
+    (void)navActive;
+    for (int idx : visible) {
+        const AgNode& n = s_agdag.nodes[idx];
+        ImVec2 p0 = slotPos(idx);
+        ImVec2 p1(p0.x + nodeW, p0.y + nodeH);
+        if (p1.y < cMin.y || p0.y > cMax.y) continue;   // vertical cull
+        const float* sc = agNodeColor(n);
+        const float rr  = 6.0f * S * z;
+        dl->AddRectFilled(p0, p1,
+            ImGui::ColorConvertFloat4ToU32(
+                ImVec4(palette.panelBg[0], palette.panelBg[1], palette.panelBg[2], 0.92f)), rr);
+        dl->AddRectFilled(p0, ImVec2(p0.x + 4.0f * S * z, p1.y),
+            ImGui::ColorConvertFloat4ToU32(ImVec4(sc[0], sc[1], sc[2], 0.95f)), rr,
+            ImDrawFlags_RoundCornersLeft);
+        dl->AddRect(p0, p1,
+            ImGui::ColorConvertFloat4ToU32(ImVec4(sc[0], sc[1], sc[2], 0.65f)), rr, 0, 1.2f * S * z);
+
+        // Collapse toggle: a [-]/[+] hit-box at the node's right edge when it has children.
+        bool hasKids = !n.children.empty();
+        if (hasKids && z > 0.5f) {
+            ImVec2 tg0(p1.x - 20.0f * S * z, p0.y + (nodeH - 16.0f * S * z) * 0.5f);
+            ImVec2 tg1(tg0.x + 16.0f * S * z, tg0.y + 16.0f * S * z);
+            bool hov = ImGui::IsMouseHoveringRect(tg0, tg1);
+            dl->AddRectFilled(tg0, tg1,
+                ImGui::ColorConvertFloat4ToU32(ImVec4(sc[0], sc[1], sc[2], hov ? 0.5f : 0.28f)),
+                3.0f * S * z);
+            dl->AddText(ImVec2(tg0.x + 4.0f * S * z, tg0.y + 1.0f * S * z),
+                ImGui::ColorConvertFloat4ToU32(ImVec4(palette.text[0], palette.text[1],
+                                                      palette.text[2], 1.0f)),
+                s_agdag.nodes[idx].collapsed ? "+" : "-");
+            if (hov && !navActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                s_agdag.nodes[idx].collapsed = !s_agdag.nodes[idx].collapsed;
+        }
+
+        if (z > 0.5f) {
+            char head[96];
+            std::snprintf(head, sizeof(head), "%s%s%s", agKindTag(n.kind),
+                          n.latencyMs >= 0 ? "  ·  " : "",
+                          n.latencyMs >= 0 ? (std::to_string(n.latencyMs) + " ms").c_str() : "");
+            dl->AddText(ImVec2(p0.x + 10.0f * S * z, p0.y + 4.0f * S * z),
+                ImGui::ColorConvertFloat4ToU32(ImVec4(sc[0], sc[1], sc[2], 1.0f)), head);
+            // primary line = title, dim secondary = detail (target/label/verdict/thought)
+            std::string lbl = n.title;
+            if (!n.detail.empty()) lbl += "  " + n.detail;
+            if (s_agdag.nodes[idx].collapsed && hasKids)
+                lbl += "  (+" + std::to_string((int)n.children.size()) + ")";
+            const size_t maxCh = (size_t)std::max(10.0f, 34.0f * z);
+            if (lbl.size() > maxCh) lbl = lbl.substr(0, maxCh - 1) + "\xE2\x80\xA6";
+            dl->AddText(ImVec2(p0.x + 10.0f * S * z, p0.y + nodeH * 0.46f),
+                ImGui::ColorConvertFloat4ToU32(
+                    ImVec4(palette.text[0], palette.text[1], palette.text[2], 1.0f)), lbl.c_str());
+        }
+        if (ImGui::IsMouseHoveringRect(p0, p1)) {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted(n.title.c_str());
+            if (!n.detail.empty()) { ImGui::PushTextWrapPos(340.0f * S); ImGui::TextDisabled("%s", n.detail.c_str()); ImGui::PopTextWrapPos(); }
+            ImGui::TextDisabled("%s%s%s%s", agKindTag(n.kind),
+                n.actor.empty() ? "" : " · ", n.actor.c_str(),
+                n.latencyMs >= 0 ? (" · " + std::to_string(n.latencyMs) + " ms").c_str() : "");
+            ImGui::EndTooltip();
+        }
+    }
+
+    dl->AddText(ImVec2(cMin.x + 8.0f * S, cMax.y - ImGui::GetTextLineHeight() - 6.0f * S),
+        ImGui::ColorConvertFloat4ToU32(
+            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                   palette.textDisabled[2], 0.8f)),
+        "drag to pan · wheel to zoom · [-] collapse a branch");
+
+    dl->PopClipRect();
+    ImGui::EndChild();
+}
+
+// The Agent Workflow tab body: live tree from the event store, honest empty-states throughout.
+static void drawAgentWorkflowView(AppState& st) {
+    const float S = ui::uiScale;
+    const bool  busy = st.job.running.load();
+
+    // Header strip: live counts + the honest state of the currently-unsourced branch kinds (M20).
+    if (!s_agdag.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+        ImGui::Text("%d tool call%s · %d thought%s · %d context inject%s",
+                    s_agdag.toolCount,   s_agdag.toolCount == 1 ? "" : "s",
+                    s_agdag.thoughtCount,s_agdag.thoughtCount == 1 ? "" : "s",
+                    s_agdag.ctxCount,    s_agdag.ctxCount == 1 ? "" : "s");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        // Sub-agent / advisor branches: present only when a real production sink emits them. Until
+        // then this is an HONEST status, not a fabricated node (tracker M20).
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                   palette.textDisabled[2], 1.0f));
+        if (!s_agdag.sawSpawn && !s_agdag.sawAdvisor)
+            ImGui::TextUnformatted("   · no sub-agent / advisor branches yet");
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
+
+    if (s_agdag.empty()) {
+        if (busy)
+            emptyState("[>]", "Agent is starting…",
+                       "Tool calls, thoughts and context injections will appear here as the run streams.");
+        else
+            emptyState("[/]", "No agent activity yet",
+                       "Send a message below — this graph traces the agent's tool calls, thoughts, "
+                       "context injections and (when they run) sub-agent / advisor branches, live.");
+        return;
+    }
+    drawAgentDagCanvas(st);
 }
 
 // ---- DAG canvas ------------------------------------------------------------------
@@ -699,14 +1124,17 @@ static void drawDagPane(AppState& st, bool /*busy*/) {
         ImGui::SetTooltip("Show / hide the AI workflow options pane.");
     ImGui::Spacing();
 
-    if (!st.workerStarted) {
+    if (s_ai.dagView == 0) {
+        // Phase 2 (M9/M10): the LIVE agent-execution DAG — tool calls / thoughts / context
+        // injections joined by parent_id→id, with collapsible branches. Fed from the JobState
+        // event drain (feedAgentDagEvent). Renders its own honest empty-state; does NOT need the
+        // worker to be up to show the empty-state, and never touches the buildgraph store.
+        drawAgentWorkflowView(st);
+    } else if (!st.workerStarted) {
         emptyState("[#]", "Worker not running",
                    "The AI-CAD worker service is required to load and steer plans.");
-    } else if (s_ai.dagView == 0) {
-        // Phase 1: Agent Workflow reuses the buildgraph view. Phase 2 swaps in the live
-        // agent-execution DAG (tool calls / context injections / subagent branches).
-        drawDagView(st);
     } else {
+        // Session Plan: the persisted buildgraph view (unchanged Phase-1 behavior).
         drawDagView(st);
     }
     ImGui::EndChild();

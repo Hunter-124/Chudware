@@ -34,6 +34,7 @@
 #include <nlohmann/json.hpp>
 
 class TopoDS_Shape;
+class TopoDS_Edge;
 
 namespace aicad::doc {
 
@@ -80,6 +81,14 @@ struct ResolveResult {
 // (empty => all nullopt).
 std::vector<TopoInfo> describe_faces(const TopoDS_Shape& shape,
                                      const std::map<int, std::string>& owners = {});
+// Geometric descriptor for ONE edge (centroid/axis/surf/measure) — the shared kernel
+// behind describe_edges and make_pick_selector. Exposed so callers that need a
+// DUPLICATE-FREE candidate list (describe_edges visits a shared edge once PER incident
+// face, which makes an edge selector self-ambiguous under resolve()'s margin rule) can
+// enumerate TopExp::MapShapes unique edges themselves (see session.cpp's associative
+// external-ref strict resolution).
+TopoInfo edge_info(const TopoDS_Edge& edge, int idx);
+
 std::vector<TopoInfo> describe_edges(const TopoDS_Shape& shape,
                                      const std::map<int, std::string>& owners = {});
 std::vector<TopoInfo> describe_vertices(const TopoDS_Shape& shape,

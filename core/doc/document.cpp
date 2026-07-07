@@ -1519,6 +1519,25 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // face (extrude/revolve) raises if faces is empty.
                 results[id] = SketchResult{std::move(faces), plane, sol.entities};
                 st.ok = true;
+                // T-BL49 — associative Convert Entities: a stale external ref (source
+                // selector no longer resolves; last-good projected geometry kept) is a
+                // WARNING, never a failure — the sketch still compiles and downstream
+                // features build on the last-good converted curves.
+                if (feat.contains("external_refs") && feat["external_refs"].is_array()) {
+                    int n_stale = 0;
+                    std::string first_stale;
+                    for (const json& xr : feat["external_refs"])
+                        if (xr.is_object() && xr.value("stale", false)) {
+                            if (first_stale.empty())
+                                first_stale = xr.value("id", std::string());
+                            ++n_stale;
+                        }
+                    if (n_stale > 0)
+                        st.warning = std::to_string(n_stale) +
+                                     " external reference(s) stale (e.g. '" + first_stale +
+                                     "'): source geometry no longer resolves; converted "
+                                     "entities kept at their last-good positions";
+                }
 
             } else if (type == "sketch3d") {
                 // 3D free-space sketch (doc_schema §3B): solve the constraint

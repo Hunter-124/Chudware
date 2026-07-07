@@ -301,7 +301,8 @@ struct IdGen {
                 // sketch entities/constraints live under params.
                 const json* params = f.contains("params") ? &f["params"] : nullptr;
                 if (params && params->is_object()) {
-                    for (const char* key : {"entities", "constraints"}) {
+                    // external_refs mint x<N> ids (associative Convert Entities).
+                    for (const char* key : {"entities", "constraints", "external_refs"}) {
                         if (params->contains(key) && (*params)[key].is_array())
                             for (const json& e : (*params)[key])
                                 if (e.contains("id") && e["id"].is_string())
@@ -521,7 +522,13 @@ void op_reorder_feature(json& doc, const json& op) {
 // op_sketch_convert can project against compiled geometry from inside the ops path (T-BL43).
 aicad::geom::SketchPlane resolve_sketch_plane_doc(const json& doc, const json& feat);
 json project_external_refs(const json& doc, const aicad::geom::SketchPlane& plane,
-                           const json& refs);
+                           const json& refs, const CompileResult* pre = nullptr,
+                           bool strict = false);
+// T-BL49 associative Convert Entities — re-resolve + re-project every sketch's
+// params.external_refs against the current model state (defined near
+// project_external_refs below; called from apply_ops_locked / doc_rebuild).
+void refresh_sketch_external_refs(json& doc);
+void op_sketch_delete_entity(json& doc, const json& op, const json& id_map);
 
 void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
@@ -713,8 +720,16 @@ void op_sketch_add_constraint(json& doc, const json& op, std::size_t idx, IdGen&
 //         fix:bool (default true — pin each projected curve so the solver treats it as an
 //                   anchor other entities constrain AGAINST, not a free curve it may drag)}.
 // Projection is orthographic along the sketch normal (GeomProjLib via recon.cpp) — a tilted
-// circle correctly lands as an ellipse. ONE-SHOT: no associative link back to the source is
-// stored (associative update is the filed follow-up; see the T-BL43 task file).
+// circle correctly lands as an ellipse.
+//
+// T-BL49 ASSOCIATIVE (default): each ref is also recorded in the sketch's
+// params.external_refs as {id:"x<N>", source:<the ref>, construction, fix,
+// entity_ids:[...], stale:false}. On every later doc rebuild,
+// refresh_sketch_external_refs re-resolves the source selector against the CURRENT
+// model and re-projects, updating the owned entities IN PLACE (stable entity ids, so
+// user constraints/dims attached to converted geometry survive). A source that no
+// longer resolves marks the ref stale (last-good geometry kept, rebuild never fails).
+// Pass associative:false for the legacy one-shot copy (no link stored).
 void op_sketch_convert(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
     const json refs = op.contains("refs") ? op["refs"] : json::array();
@@ -725,6 +740,7 @@ void op_sketch_convert(json& doc, const json& op, std::size_t idx, IdGen& gen, j
     json res = project_external_refs(doc, plane, refs);
     const bool constr = op.value("construction", false);
     const bool fix = op.value("fix", true);
+    const bool assoc = op.value("associative", true);
     std::vector<std::string> ids;
     for (json ent : res["entities"]) {
         ent["construction"] = constr;
@@ -740,9 +756,56 @@ void op_sketch_convert(json& doc, const json& op, std::size_t idx, IdGen& gen, j
         throw OpError("convert_failed",
                       "sketch_convert: nothing projectable in refs (degenerate/seam edges?)",
                       {{"reason", "no entities"}});
+    if (assoc) {
+        // Record one external_ref per source ref; slice the flat entity-id list by the
+        // per-source counts project_external_refs reports (sources[i].count).
+        if (!sk["params"].contains("external_refs") || !sk["params"]["external_refs"].is_array())
+            sk["params"]["external_refs"] = json::array();
+        const json& sources = res["sources"];
+        std::size_t pos = 0;
+        for (std::size_t i = 0; i < refs.size() && i < sources.size(); ++i) {
+            const int cnt = sources[i].value("count", 0);
+            json eids = json::array();
+            for (int k = 0; k < cnt && pos < ids.size(); ++k, ++pos) eids.push_back(ids[pos]);
+            sk["params"]["external_refs"].push_back(
+                json{{"id", gen.next("x")}, {"source", refs[i]}, {"construction", constr},
+                     {"fix", fix}, {"entity_ids", std::move(eids)}, {"stale", false}});
+        }
+    }
     id_map["$" + std::to_string(idx)] = ids[0];
     for (std::size_t k = 1; k < ids.size(); ++k)
         id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = ids[k];
+}
+
+// T-BL49 — break the associative link of ONE external ref (SolidWorks "break link"):
+// removes the ref record; the converted entities stay in the sketch as ordinary
+// (still fix-pinned) geometry. {op:"sketch_break_external_ref", sketch:<fid>, id:"x<N>",
+// delete_entities:false} — pass delete_entities:true to also remove the owned entities
+// (cascading constraints that touch them, same as sketch_delete_entity).
+void op_sketch_break_external_ref(json& doc, const json& op, const json& id_map) {
+    json& sk = require_sketch_feature(doc, op, id_map);
+    const std::string xid = op.value("id", std::string());
+    if (!sk["params"].contains("external_refs") || !sk["params"]["external_refs"].is_array())
+        throw OpError("invalid_op", "sketch_break_external_ref: sketch has no external refs",
+                      {{"reason", "no external refs"}});
+    json kept = json::array();
+    json removed;
+    for (const json& xr : sk["params"]["external_refs"]) {
+        if (xr.value("id", std::string()) == xid) removed = xr;
+        else kept.push_back(xr);
+    }
+    if (removed.is_null())
+        throw OpError("invalid_op", "sketch_break_external_ref: no external ref '" + xid + "'",
+                      {{"reason", "unknown external ref"}});
+    sk["params"]["external_refs"] = kept;
+    if (op.value("delete_entities", false) && removed.contains("entity_ids")) {
+        for (const json& eid : removed["entity_ids"]) {
+            if (!eid.is_string()) continue;
+            json del{{"op", "sketch_delete_entity"}, {"sketch", op.value("sketch", std::string())},
+                     {"id", eid.get<std::string>()}};
+            op_sketch_delete_entity(doc, del, id_map);
+        }
+    }
 }
 
 void op_sketch_edit_entity(json& doc, const json& op, const json& id_map) {
@@ -2389,6 +2452,7 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
     else if (k == "sketch_set_dim")             op_sketch_set_dim(doc, op, id_map);
     else if (k == "sketch_toggle_construction") op_sketch_toggle_construction(doc, op, id_map);
     else if (k == "sketch_convert")             op_sketch_convert(doc, op, idx, gen, id_map);
+    else if (k == "sketch_break_external_ref")  op_sketch_break_external_ref(doc, op, id_map);
     else if (k == "sketch_trim")                op_sketch_trim(doc, op, idx, gen, id_map);
     else if (k == "sketch_extend")              op_sketch_extend(doc, op, idx, gen, id_map);
     else if (k == "sketch_offset")              op_sketch_offset(doc, op, idx, gen, id_map);
@@ -2806,6 +2870,18 @@ json apply_ops_locked(Session& s, long base_revision, const json& ops, bool coal
         }
     }
 
+    // T-BL49 associative Convert Entities — after the batch mutated the tree (an upstream
+    // dim edit, a feature delete, a new boss...), re-resolve + re-project every sketch's
+    // external_refs against the post-batch model so converted geometry follows its source.
+    // Never blocks the edit: a total failure here leaves the last-good projected entities
+    // in place (per-ref failures are already absorbed inside as stale marks). Skipped for
+    // read-only batches (they leave the doc untouched and return early below).
+    if (!is_readonly_batch(ops)) {
+        try {
+            refresh_sketch_external_refs(working);
+        } catch (...) { /* keep last-good projections */ }
+    }
+
     std::vector<std::string> errs = validate_document(working);
     if (!errs.empty()) {
         std::string joined;
@@ -3202,6 +3278,25 @@ json strvec_json(const std::vector<std::string>& v) {
     return a;
 }
 
+// T-BL49 — external-ref ownership map (eid -> {ref, stale}) so the host can style
+// converted entities distinctly (and dash/warn the stale ones). Absent key = a normal
+// user-drawn entity. Shared by sketch_result (enter/solve) and doc_sketch_drag.
+json sketch_external_map(const json& feat) {
+    json ext = json::object();
+    const json params = sketch_params(feat);
+    if (params.contains("external_refs") && params["external_refs"].is_array())
+        for (const json& xr : params["external_refs"]) {
+            if (!xr.is_object()) continue;
+            const bool stale = xr.value("stale", false);
+            const std::string xid = xr.value("id", std::string());
+            if (xr.contains("entity_ids") && xr["entity_ids"].is_array())
+                for (const json& eid : xr["entity_ids"])
+                    if (eid.is_string())
+                        ext[eid.get<std::string>()] = json{{"ref", xid}, {"stale", stale}};
+        }
+    return ext;
+}
+
 // Build the sketch_enter/sketch_solve result dict from a packed SolveActive +
 // plane_frame + overall status (session.py sketch_enter/sketch_solve shape).
 json sketch_result(const json& feat, const SolveActive& packed,
@@ -3217,6 +3312,7 @@ json sketch_result(const json& feat, const SolveActive& packed,
     r["skipped_constraints"] = strvec_json(packed.skipped_constraints);
     r["solve_rejected"] = packed.rejected;
     r["constraints"] = sketch_constraints(feat, packed.entity_map);
+    r["external"] = sketch_external_map(feat);
     return r;
 }
 
@@ -3418,6 +3514,12 @@ json doc_rebuild(const std::string& doc_id) {
         rebuild_assembly(s);
         return ops_response_assembly(s, json::object());
     }
+    // T-BL49 — an explicit rebuild also re-syncs associative Convert Entities (covers
+    // mutation paths that bypass doc_apply_ops, e.g. sketch_drag_commit). No revision
+    // bump: re-projection is derived data; the compile below sees the refreshed tree.
+    try {
+        refresh_sketch_external_refs(s.doc);
+    } catch (...) { /* keep last-good projections */ }
     CompileResult r = compile_document(s.doc, env_from_doc(s.doc));
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
@@ -8315,6 +8417,7 @@ json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
     out["statuses"] = res.contains("statuses") ? res["statuses"] : json::object();
     out["solve_rejected"] = false;
     out["constraints"] = sketch_constraints(feat, res_entities);
+    out["external"] = sketch_external_map(feat);  // keep converted-entity styling alive mid-drag
     return out;
 }
 
@@ -9432,6 +9535,27 @@ json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid)
     out["conflicting"] = conflicting;
     out["schedule"] = schedule;
     out["advisory"] = advisory;
+    // T-BL49 — associative Convert Entities status: one row per external ref, so a driver
+    // (or the PM panel) sees which converted geometry is live vs stale (source no longer
+    // resolves; last-good geometry kept). Empty array when the sketch has no external refs.
+    {
+        json xrs = json::array();
+        if (params.contains("external_refs") && params["external_refs"].is_array())
+            for (const json& xr : params["external_refs"]) {
+                if (!xr.is_object()) continue;
+                json row;
+                row["id"] = xr.value("id", std::string());
+                row["stale"] = xr.value("stale", false);
+                row["entity_ids"] = xr.contains("entity_ids") ? xr["entity_ids"] : json::array();
+                const json src = xr.contains("source") ? xr["source"] : json();
+                row["kind"] = src.is_object()
+                                  ? (src.contains("datum") ? std::string("datum")
+                                                           : src.value("kind", std::string()))
+                                  : std::string();
+                xrs.push_back(std::move(row));
+            }
+        out["external_refs"] = std::move(xrs);
+    }
     return out;
 }
 
@@ -9469,10 +9593,14 @@ std::pair<Eigen::Vector2d, Eigen::Vector2d> plane_plane_line_uv(
 // Returns {entities:[...(no ids)...], approx:bool, sources:[...]}; throws OpError on a bad
 // ref shape, no solid bodies (for face/edge refs), or a datum parallel to the sketch plane.
 json project_external_refs(const json& doc, const aicad::geom::SketchPlane& plane,
-                           const json& refs) {
+                           const json& refs, const CompileResult* pre, bool strict) {
     const Eigen::Vector3d O1 = plane.origin, u = plane.uAxis, v = plane.vAxis,
                           n1 = plane.normal;
-    CompileResult r = compile_document(doc, env_from_doc(doc));
+    // Callers that already compiled the doc (the associative refresh, which walks every
+    // ref-bearing sketch) pass the compile in; ad-hoc callers compile here as before.
+    CompileResult local;
+    if (!pre) local = compile_document(doc, env_from_doc(doc));
+    const CompileResult& r = pre ? *pre : local;
 
     json all_entities = json::array();
     json sources = json::array();
@@ -9505,7 +9633,18 @@ json project_external_refs(const json& doc, const aicad::geom::SketchPlane& plan
             throw OpError("invalid_op",
                           "sketch projection: each ref needs 'datum' or 'kind'+'selector'",
                           {{"reason", "bad ref"}});
-        if (ref.contains("datum")) { project_datum(ref["datum"].get<std::string>()); continue; }
+        // Per-source entity count (sources[i].count) — lets op_sketch_convert slice the
+        // flat entity list back into per-ref groups for associative external_refs records.
+        const std::size_t ents_before = all_entities.size();
+        auto stamp_count = [&]() {
+            if (!sources.empty())
+                sources.back()["count"] = static_cast<int>(all_entities.size() - ents_before);
+        };
+        if (ref.contains("datum")) {
+            project_datum(ref["datum"].get<std::string>());
+            stamp_count();
+            continue;
+        }
 
         if (r.shapes.empty())
             throw OpError("invalid_op", "sketch projection: no solid bodies",
@@ -9515,8 +9654,49 @@ json project_external_refs(const json& doc, const aicad::geom::SketchPlane& plan
         json sel = ref.contains("selector") ? ref["selector"] : json(nullptr);
         std::string kind = ref.value("kind", std::string());
 
+        // STRICT (associative refresh) resolution: the scored best-match with the
+        // contracts/selectors.md accept thresholds (best < 0.35, margin > 0.05), so a
+        // DELETED/DRASTICALLY-MOVED source dangles -> the caller marks the ref stale
+        // instead of silently re-projecting the nearest unrelated geometry. Creation-time
+        // resolution (strict=false) keeps eval_resolve_ref's forgiving centroid-near pick
+        // (the selector was minted seconds ago from live geometry).
+        auto resolve_sub = [&](const json& s, const std::string& k) -> TopoDS_Shape {
+            if (!strict) return eval_resolve_ref(s, body, diag);
+            auto dangle = [&](const ResolveResult& rr) -> OpError {
+                return OpError("dangling_ref",
+                               "external ref no longer resolves" +
+                                   (rr.dangling_reason ? " (" + *rr.dangling_reason + ")"
+                                                       : std::string()),
+                               {{"reason", "dangling external ref"}});
+            };
+            if (k == "face") {
+                std::vector<TopoInfo> infos = describe_faces(body);
+                ResolveResult rr = resolve(s, infos, diag);
+                if (!rr.index.has_value()) throw dangle(rr);
+                int idx = 0;
+                for (TopExp_Explorer ex(body, TopAbs_FACE); ex.More(); ex.Next(), ++idx)
+                    if (idx == *rr.index) return ex.Current();
+            } else {
+                // UNIQUE edges via TopExp::MapShapes — describe_edges visits a shared edge
+                // once PER incident face, and those duplicates score identically, tripping
+                // resolve()'s margin rule ("symmetric ambiguity") on a perfectly-good edge.
+                TopTools_IndexedMapOfShape m;
+                TopExp::MapShapes(body, TopAbs_EDGE, m);
+                std::vector<TopoInfo> infos;
+                infos.reserve(m.Extent());
+                for (int i = 1; i <= m.Extent(); ++i)
+                    infos.push_back(aicad::doc::edge_info(TopoDS::Edge(m.FindKey(i)), i - 1));
+                ResolveResult rr = resolve(s, infos, diag);
+                if (!rr.index.has_value()) throw dangle(rr);
+                if (*rr.index >= 0 && *rr.index < m.Extent())
+                    return m.FindKey(*rr.index + 1);
+            }
+            throw OpError("dangling_ref", "external ref resolved out of range",
+                          {{"reason", "dangling external ref"}});
+        };
+
         if (kind == "face") {
-            TopoDS_Shape sub = eval_resolve_ref(sel, body, diag);
+            TopoDS_Shape sub = resolve_sub(sel, "face");
             TopoDS_Face face = TopoDS::Face(sub);
             std::vector<TopoDS_Edge> edges = aicad::doc::face_boundary_edges(face);
             bool approx = false;
@@ -9524,13 +9704,15 @@ json project_external_refs(const json& doc, const aicad::geom::SketchPlane& plan
             any_approx = any_approx || approx;
             sources.push_back(json{{"kind", "face"}, {"selector", sel},
                                    {"edges", static_cast<int>(edges.size())}});
+            stamp_count();
         } else if (kind == "edge") {
-            TopoDS_Shape sub = eval_resolve_ref(sel, body, diag);
+            TopoDS_Shape sub = resolve_sub(sel, "edge");
             TopoDS_Edge edge = TopoDS::Edge(sub);
             bool approx = false;
             append_entities(aicad::doc::project_edges_to_plane({edge}, plane, approx));
             any_approx = any_approx || approx;
             sources.push_back(json{{"kind", "edge"}, {"selector", sel}});
+            stamp_count();
         } else {
             throw OpError("invalid_op",
                           "sketch projection: ref kind '" + kind + "' must be face|edge",
@@ -9539,6 +9721,175 @@ json project_external_refs(const json& doc, const aicad::geom::SketchPlane& plan
     }
 
     return json{{"entities", all_entities}, {"approx", any_approx}, {"sources", sources}};
+}
+
+// ---------------------------------------------------------------- T-BL49 associative refresh
+
+// Remove one sketch entity + every constraint whose refs touch it (same cascade as
+// op_sketch_delete_entity, but callable on a params object during the refresh walk).
+void erase_entity_and_constraints(json& params, const std::string& eid) {
+    json kept = json::array();
+    for (const json& e : params["entities"])
+        if (e.value("id", std::string()) != eid) kept.push_back(e);
+    params["entities"] = kept;
+    json kc = json::array();
+    for (const json& c : params["constraints"]) {
+        bool touches = false;
+        if (c.contains("refs") && c["refs"].is_array())
+            for (const json& rref : c["refs"])
+                if (rref.is_string()) {
+                    const std::string s = rref.get<std::string>();
+                    if (s == eid || s.rfind(eid + ".", 0) == 0) { touches = true; break; }
+                }
+        if (!touches) kc.push_back(c);
+    }
+    params["constraints"] = kc;
+}
+
+// Write a fresh projection back into the entities one external_ref owns, KEEPING STABLE
+// ENTITY IDS so user constraints/dims attached to converted geometry survive a rebuild:
+//   * index k of the new projection maps onto entity_ids[k] — its geometry (and type, if
+//     the projected classification changed, e.g. circle -> ellipse after a plane tilt) is
+//     overwritten in place under the SAME id; a user-toggled construction flag survives.
+//   * extra projected curves (the source face gained an edge) append under new ids
+//     (+ a fix pin when the ref was created with fix).
+//   * leftover old entities (the source lost an edge) are deleted, cascading any
+//     constraints that touched them (same rule as sketch_delete_entity).
+void reconcile_external_ref_entities(json& params, json& xr, const json& new_ents, IdGen& gen) {
+    if (!params.contains("entities") || !params["entities"].is_array())
+        params["entities"] = json::array();
+    if (!params.contains("constraints") || !params["constraints"].is_array())
+        params["constraints"] = json::array();
+    const bool constr = xr.value("construction", false);
+    const bool fix = xr.value("fix", true);
+    const json old_ids = xr.contains("entity_ids") && xr["entity_ids"].is_array()
+                             ? xr["entity_ids"] : json::array();
+    auto find_ent = [&](const std::string& id) -> json* {
+        for (json& e : params["entities"])
+            if (e.is_object() && e.value("id", std::string()) == id) return &e;
+        return nullptr;
+    };
+    auto append_new = [&](json ne) -> std::string {
+        const std::string eid = gen.next("e");
+        ne["id"] = eid;
+        ne["construction"] = constr;
+        params["entities"].push_back(std::move(ne));
+        if (fix)
+            params["constraints"].push_back(
+                json{{"type", "fix"}, {"refs", json::array({eid})}, {"id", gen.next("c")}});
+        return eid;
+    };
+
+    json kept_ids = json::array();
+    std::size_t k = 0;
+    for (; k < new_ents.size(); ++k) {
+        json ne = new_ents[k];
+        if (k < old_ids.size() && old_ids[k].is_string()) {
+            const std::string eid = old_ids[k].get<std::string>();
+            if (json* e = find_ent(eid)) {
+                // TYPE CHANGE (e.g. a line collapsed to a point because the re-resolved
+                // plane tilted, or a circle became an ellipse): constraints holding
+                // sub-handles of the OLD type ("e5.p1" on what is now a point) would fail
+                // document validation and reject the whole edit batch. Drop the touched
+                // constraints first (the honest cascade — those relations no longer have a
+                // referent), then re-pin with a fresh fix so the entity stays solver-fixed.
+                const bool type_changed =
+                    e->value("type", std::string()) != ne.value("type", std::string());
+                const bool keep_construction = e->value("construction", constr);
+                if (type_changed) {
+                    erase_entity_and_constraints(params, eid);
+                    ne["id"] = eid;
+                    ne["construction"] = keep_construction;
+                    params["entities"].push_back(std::move(ne));
+                    if (fix)
+                        params["constraints"].push_back(
+                            json{{"type", "fix"}, {"refs", json::array({eid})},
+                                 {"id", gen.next("c")}});
+                } else {
+                    ne["id"] = eid;
+                    // A user may have flipped the converted entity to construction; honor it.
+                    ne["construction"] = keep_construction;
+                    *e = std::move(ne);
+                }
+                kept_ids.push_back(eid);
+                continue;
+            }
+        }
+        kept_ids.push_back(append_new(std::move(ne)));  // grew, or user deleted the old one
+    }
+    for (; k < old_ids.size(); ++k)  // source shrank — drop the orphaned tail
+        if (old_ids[k].is_string())
+            erase_entity_and_constraints(params, old_ids[k].get<std::string>());
+    xr["entity_ids"] = std::move(kept_ids);
+}
+
+// Re-resolve + re-project every sketch's params.external_refs against the current model
+// (the associative half of Convert Entities). Semantics:
+//   * runs on every mutating doc_apply_ops batch and on doc_rebuild, BEFORE the compile,
+//     so the compile already sees converted geometry that follows its source;
+//   * selectors resolve exactly like any other geometric reference (contracts/selectors.md
+//     scored best-match over the compiled body) — no persistent topological naming;
+//   * a ref whose source no longer resolves (owner feature deleted, geometry moved past the
+//     score threshold, sketch plane itself dangling) is marked stale:true and its LAST-GOOD
+//     entities are left untouched — the rebuild never fails because of a stale ref (the
+//     sketch compiles with a feature-status warning; see document.cpp + sketch_health).
+// The projection target is the doc compiled ONCE as-of the previous entity state (converted
+// geometry only feeds downstream features, so one refresh pass converges in a single step
+// for the supported upstream-source cases; a pathological self-referential loop simply
+// settles on the next rebuild).
+void refresh_sketch_external_refs(json& doc) {
+    if (!doc.contains("features") || !doc["features"].is_array()) return;
+    bool any = false;
+    for (const json& f : doc["features"]) {
+        if (!f.is_object() || f.value("type", std::string()) != "sketch") continue;
+        if (f.value("suppressed", false)) continue;
+        if (f.contains("params") && f["params"].is_object() &&
+            f["params"].contains("external_refs") && f["params"]["external_refs"].is_array() &&
+            !f["params"]["external_refs"].empty()) { any = true; break; }
+    }
+    if (!any) return;
+
+    // One compile of the whole doc serves every ref (selectors resolve against the LAST
+    // body, same convention as sketch_convert creation / doc_sketch_project_entities).
+    CompileResult pre = compile_document(doc, env_from_doc(doc));
+    IdGen gen(doc);
+    for (json& f : doc["features"]) {
+        if (!f.is_object() || f.value("type", std::string()) != "sketch") continue;
+        if (f.value("suppressed", false)) continue;
+        if (!f.contains("params") || !f["params"].is_object()) continue;
+        json& params = f["params"];
+        if (!params.contains("external_refs") || !params["external_refs"].is_array() ||
+            params["external_refs"].empty()) continue;
+
+        std::optional<aicad::geom::SketchPlane> plane;
+        try {
+            plane = resolve_sketch_plane_doc(doc, f);
+        } catch (...) { /* dangling plane -> every ref of this sketch goes stale below */ }
+
+        for (json& xr : params["external_refs"]) {
+            if (!xr.is_object() || !xr.contains("source")) continue;
+            if (!plane) { xr["stale"] = true; continue; }
+            json new_ents;
+            try {
+                json res = project_external_refs(doc, *plane, json::array({xr["source"]}),
+                                                 &pre, /*strict=*/true);
+                new_ents = res["entities"];
+            } catch (...) {
+                xr["stale"] = true;  // selector no longer resolves — keep last-good geometry
+                continue;
+            }
+            if (!new_ents.is_array() || new_ents.empty()) { xr["stale"] = true; continue; }
+            if (std::getenv("AICAD_XREF_DEBUG"))
+                std::fprintf(stderr, "[xref] sketch=%s ref=%s plane_o=(%g,%g,%g) n=(%g,%g,%g) new=%s\n",
+                             f.value("id", std::string()).c_str(),
+                             xr.value("id", std::string()).c_str(),
+                             plane->origin.x(), plane->origin.y(), plane->origin.z(),
+                             plane->normal.x(), plane->normal.y(), plane->normal.z(),
+                             new_ents.dump().c_str());
+            reconcile_external_ref_entities(params, xr, new_ents, gen);
+            xr["stale"] = false;
+        }
+    }
 }
 
 }  // namespace

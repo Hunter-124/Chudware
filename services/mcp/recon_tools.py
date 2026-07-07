@@ -1204,7 +1204,8 @@ def register_recon_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def convert_face_to_sketch(face: Union[str, dict], doc_id: Optional[str] = None,
-                               sketch_name: Optional[str] = None) -> str:
+                               sketch_name: Optional[str] = None,
+                               associative: bool = True) -> str:
         """"Convert entities": trace a planar face's boundary wires into a NEW editable sketch
         ON that face — the manual reverse-engineering primitive (grab an imported body's face
         outline, then extrude/cut/revolve it yourself).
@@ -1214,11 +1215,18 @@ def register_recon_tools(mcp: FastMCP) -> None:
                ({"of":"face","side":"top","pick":"largest"}). Must be PLANAR.
         doc_id : the document (default: current part).
         sketch_name : name for the new sketch feature (default "FaceSketch").
+        associative : True (default) stores a persistent external reference on the sketch
+               (params.external_refs) — the traced entities re-project on every rebuild when
+               the source face moves/changes, keeping stable entity ids so constraints
+               attached to them survive; if the face stops resolving the ref goes stale
+               (last-good geometry kept, rebuild still succeeds, warning surfaced). False =
+               legacy one-shot copy (entities baked, never updated).
 
         The sketch is created on the face's own plane (refs.plane = the face selector) with
         one entity per boundary edge — lines/arcs/circles/ellipses exactly, anything else
         (splines) as a sampled polyline with `approx: true`. Outer and inner (hole) loops are
-        all included. Returns {ok, doc_id, sketch, entity_count, wires, approx}.
+        all included. Returns {ok, doc_id, sketch, entity_count, wires, approx, associative,
+        external_refs:[{id, stale, entity_ids}]}.
         """
         try:
             d = _doc(doc_id)
@@ -1244,31 +1252,68 @@ def register_recon_tools(mcp: FastMCP) -> None:
             ents = fw.get("entities", [])
             if not ents:
                 return _dumps({"ok": False, "error": "face has no boundary wires"})
-            op = {"op": "add_feature", "feature": {
-                "type": "sketch", "name": sketch_name or "FaceSketch",
-                "params": {"entities": ents, "constraints": []},
-                "refs": {"plane": rec}}}
-            r = cb.call("doc_apply_ops", {"doc_id": d, "ops": [op]})
+            if associative:
+                # Empty sketch ON the face, then an associative Convert Entities of the
+                # SAME face into it — face_wires and the projector share the face-centroid
+                # frame convention, so the traced loop lands identically, but now with a
+                # persistent external_ref that re-projects on every rebuild.
+                ops = [
+                    {"op": "add_feature", "feature": {
+                        "type": "sketch", "name": sketch_name or "FaceSketch",
+                        "params": {"entities": [], "constraints": []},
+                        "refs": {"plane": rec}}},
+                    {"op": "sketch_convert", "sketch": "$0",
+                     "refs": [{"kind": "face", "selector": rec}],
+                     "construction": False, "associative": True},
+                ]
+            else:
+                ops = [{"op": "add_feature", "feature": {
+                    "type": "sketch", "name": sketch_name or "FaceSketch",
+                    "params": {"entities": ents, "constraints": []},
+                    "refs": {"plane": rec}}}]
+            r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
             ok, bad = _feature_ok(r)
             if not ok:
                 return _dumps({"ok": False, "error": "sketch feature failed to build",
                                "failed_features": bad})
             sk = (r.get("id_map") or {}).get("$0")
+            ext_refs = _external_refs_of(r, sk, []) if associative else []
             return _dumps({"ok": True, "doc_id": d, "sketch": sk,
                            "entity_count": len(ents),
                            "wires": [{"outer": w.get("outer"),
                                       "entities": len(w.get("entity_ids") or [])}
                                      for w in fw.get("wires", [])],
                            "approx": bool(fw.get("approx")),
+                           "associative": associative, "external_refs": ext_refs,
                            "note": "entities are 2D in the face's plane frame; extrude/"
                                    "revolve the sketch's regions to build on this face"})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
+    def _external_refs_of(resp: dict, sketch_fid: str, new_entity_ids: list) -> list:
+        """Pull the external_refs rows created by THIS call out of a doc_apply_ops
+        response tree: rows on `sketch_fid` whose entity_ids intersect the ids we just
+        inserted (a sketch may already carry earlier refs)."""
+        new_set = set(new_entity_ids or [])
+        out: list = []
+        for feat in ((resp.get("tree") or {}).get("features") or []):
+            if not isinstance(feat, dict) or feat.get("id") != sketch_fid:
+                continue
+            xrs = ((feat.get("params") or {}).get("external_refs") or [])
+            for xr in xrs:
+                if not isinstance(xr, dict):
+                    continue
+                eids = xr.get("entity_ids") or []
+                if not new_set or new_set.intersection(eids):
+                    out.append({"id": xr.get("id"), "stale": bool(xr.get("stale")),
+                                "entity_ids": eids})
+        return out
+
     @mcp.tool()
     def project_into_sketch(sketch: str, refs: Union[list, dict],
                             doc_id: Optional[str] = None,
-                            construction: bool = False) -> str:
+                            construction: bool = False,
+                            associative: bool = True) -> str:
         """"Convert entities" INTO an existing sketch — SolidWorks-style edge/face projection that
         appends real (or construction) geometry to a sketch you are already working in.
 
@@ -1281,10 +1326,17 @@ def register_recon_tools(mcp: FastMCP) -> None:
             ellipses; oblique circular edges become ellipses; near-perpendicular edges collapse to
             a point; unclassifiable curves fall back to a 24-seg polyline with approx:true).
           * Every new entity is immediately pinned with a whole-entity `fix` relation so it
-            cannot drift during sketch solving.
-          * Projection is ONE-SHOT (non-associative): converted geometry does NOT update if
-            the source model changes later — this is a deliberate trade-off matching the engine's
-            current capability.  Associative "sketch links" are a filed follow-up.
+            cannot drift during sketch solving; you can still constrain/dimension OTHER
+            entities TO the converted geometry.
+          * ASSOCIATIVE by default (associative=True): each ref is stored on the sketch as a
+            persistent external reference (params.external_refs, id "x<N>"). On every rebuild
+            the engine re-resolves the source selector and re-projects, updating the converted
+            entities IN PLACE (stable entity ids — constraints attached to them survive). If
+            the source stops resolving (owner feature deleted / geometry moved too far), the
+            ref is marked stale: the last-good geometry is kept, the rebuild still succeeds,
+            and the sketch's feature status / sketch_health carries a stale warning.
+          * Pass associative=False for a legacy one-shot copy (no link stored; converted
+            geometry never updates).
 
         construction : if True the projected entities are flagged construction (blue in the app);
                        they define references but are excluded from extruded regions.
@@ -1310,9 +1362,10 @@ def register_recon_tools(mcp: FastMCP) -> None:
                               construction=True)
               -> appends construction geometry tracing the face's wires
 
-        Returns {ok, doc_id, sketch, entity_ids, construction,
-                 note:"one-shot projection: converted geometry does NOT update if the source model
-                      changes"}.
+        Returns {ok, doc_id, sketch, entity_ids, construction, associative,
+                 external_refs:[{id, stale, entity_ids}]} (external_refs empty when
+        associative=False; use sketch_health to re-check stale status later, and the
+        sketch_break_external_ref doc-op to sever a link).
         entity_ids lists the ids of every appended entity in order (first is "$0", rest are
         "$0#1", "$0#2", … from the engine id_map).
         """
@@ -1374,7 +1427,7 @@ def register_recon_tools(mcp: FastMCP) -> None:
                                    f"('E…'), a side word, or a ref dict"})
 
             op = {"op": "sketch_convert", "sketch": sketch, "refs": norm_refs,
-                  "construction": construction}
+                  "construction": construction, "associative": associative}
             r = cb.call("doc_apply_ops", {"doc_id": d, "ops": [op]})
             ok, bad = _feature_ok(r)
             if not ok:
@@ -1395,10 +1448,16 @@ def register_recon_tools(mcp: FastMCP) -> None:
                     entity_ids.append(nxt)
                     k += 1
 
+            ext_refs = _external_refs_of(r, sketch, entity_ids) if associative else []
+            note = ("associative: converted geometry re-projects on every rebuild; a "
+                    "non-resolving source marks the ref stale (see sketch_health)"
+                    if associative else
+                    "one-shot projection: converted geometry does NOT update if the "
+                    "source model changes")
             return _dumps({"ok": True, "doc_id": d, "sketch": sketch,
                            "entity_ids": entity_ids, "construction": construction,
-                           "note": ("one-shot projection: converted geometry does NOT update "
-                                    "if the source model changes")})
+                           "associative": associative, "external_refs": ext_refs,
+                           "note": note})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

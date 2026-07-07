@@ -74,6 +74,31 @@ _ROUTING_SOURCE_ID = "bundled_llamacpp"
 # Path to routing.yaml (relative to this file at services/agent/).
 _ROUTING_YAML = Path(__file__).resolve().parent / "routing.yaml"
 
+# services.agent.tiers.detect_tier() context-length bucket -> routing.py capability
+# tier (routing.KNOWN_TIERS). Two independent tier vocabularies exist in this codebase
+# for two different purposes (context-slot budgeting vs. role->model capability
+# ranking) and must not be conflated on disk.
+_CONTEXT_TIER_TO_ROUTING_TIER = {
+    "local-24k": "cheap_local",
+    "local-48k": "cheap_local",
+    "mid": "local_large",
+    "frontier": "frontier",
+}
+
+
+def _to_routing_tier(tier: Optional[str]) -> str:
+    """Translate *tier* to a value ``services.agent.routing.KNOWN_TIERS`` accepts.
+
+    Falls back to ``cheap_local`` for ``None`` or anything unrecognized, so
+    ``register_routing_source`` never writes a tier ``load_routing()`` can't parse.
+    """
+    from services.agent.routing import KNOWN_TIERS  # noqa: PLC0415 — avoid import cycle risk
+
+    if not tier:
+        return "cheap_local"
+    mapped = _CONTEXT_TIER_TO_ROUTING_TIER.get(tier, tier)
+    return mapped if mapped in KNOWN_TIERS else "cheap_local"
+
 # --------------------------------------------------------------------------- errors
 
 
@@ -184,6 +209,8 @@ def ensure_running(
     *,
     model_id: Optional[str] = None,
     auto_port: bool = True,
+    register_routing: bool = True,
+    routing_yaml: Optional[Path] = None,
 ) -> RuntimeInfo:
     """Ensure a local llama.cpp server is reachable, starting one if needed.
 
@@ -201,6 +228,14 @@ def ensure_running(
         When ``True`` (default) and neither ``cfg["port"]`` nor ``cfg["base_url"]``
         are set, allocate a free OS port rather than defaulting to 1234.  This avoids
         collisions when multiple sessions run concurrently.
+    register_routing:
+        When ``True`` (default), auto-register this server into routing.yaml via
+        ``register_routing_source`` so real role/provider resolution
+        (``services.agent.config.get_provider``) can pick it up. Set ``False`` in
+        tests / fixtures that must not mutate the on-disk routing.yaml.
+    routing_yaml:
+        Override path forwarded to ``register_routing_source`` (default: the
+        canonical ``services/agent/routing.yaml``). Mainly for tests.
 
     Returns
     -------
@@ -247,6 +282,20 @@ def ensure_running(
             from services.agent.tiers import detect_tier  # noqa: PLC0415
             tier = detect_tier(n_ctx)
         except Exception:  # noqa: BLE001 - optional dep
+            pass
+
+    # Auto-register this server into routing.yaml so real role/provider resolution
+    # (services.agent.config.get_provider) can actually pick it up (contract §14).
+    # This was previously dead: register_routing_source() existed but nothing called
+    # it, so the bundled runtime never became a usable routing.yaml source. Best-effort
+    # and idempotent — a routing.yaml problem must never fail an otherwise-successful
+    # server start.
+    if base_url and register_routing:
+        try:
+            resolved_model_id = model_id or Path(raw.get("model", "")).stem or "local-gguf"
+            register_routing_source(base_url, resolved_model_id, tier,
+                                    routing_yaml=routing_yaml)
+        except Exception:  # noqa: BLE001 - best-effort, server is already up
             pass
 
     return RuntimeInfo(raw, n_ctx, tier)
@@ -304,8 +353,15 @@ def register_routing_source(
         provisioner registers BOTH bundled models (qwen3-4b + gemma3-4b-qat) so
         the W29 role-shape split is resolvable from routing.yaml.
     tier:
-        Tier name string (e.g. ``local-24k``).  Falls back to ``cheap_local``
-        if ``None`` (safe default for a 4B model).
+        Tier name string, typically a ``services.agent.tiers.detect_tier()`` result
+        (e.g. ``local-24k``, ``local-48k``, ``mid``, ``frontier``) — a DIFFERENT
+        vocabulary than routing.yaml's own capability tiers (``services.agent.routing
+        .KNOWN_TIERS``: frontier/strong/local_large/cheap_local/local/cheap). Translated
+        via ``_to_routing_tier`` before writing so ``load_routing()`` can actually parse
+        the result — writing a raw context-length tier here used to make every
+        subsequent ``load_routing()`` call raise (unknown tier), silently poisoning
+        role→model resolution the moment a real server registered itself.  Falls back to
+        ``cheap_local`` if ``None`` (safe default for a 4B model).
     routing_yaml:
         Override path to routing.yaml.  Defaults to the canonical location.
     source_id:
@@ -331,7 +387,7 @@ def register_routing_source(
     if any(isinstance(s, dict) and s.get("id") == source_id for s in sources):
         return False
 
-    effective_tier = tier or "cheap_local"
+    effective_tier = _to_routing_tier(tier)
     model_ids = [model_id] if isinstance(model_id, str) else list(model_id)
 
     new_source = {

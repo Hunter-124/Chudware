@@ -195,7 +195,7 @@ class TestEnsureRunning(unittest.TestCase):
 
         with patch("installer.llamacpp.ensure_server_running", side_effect=fake_ensure):
             with patch("services.agent.local_runtime.get_served_n_ctx", return_value=32768):
-                info = ensure_running({}, auto_port=True)
+                info = ensure_running({}, auto_port=True, register_routing=False)
 
         assert captured_cfg[0].get("port") is not None
         assert info.launched is True
@@ -214,7 +214,7 @@ class TestEnsureRunning(unittest.TestCase):
 
         with patch("installer.llamacpp.ensure_server_running", side_effect=fake_ensure):
             with patch("services.agent.local_runtime.get_served_n_ctx", return_value=24000):
-                info = ensure_running({}, auto_port=False)
+                info = ensure_running({}, auto_port=False, register_routing=False)
 
         # 24000 <= 32768 → local-24k
         assert info.tier == "local-24k"
@@ -228,7 +228,7 @@ class TestEnsureRunning(unittest.TestCase):
             side_effect=RuntimeError("binary not found"),
         ):
             with pytest.raises(LocalRuntimeError, match="binary not found"):
-                ensure_running({}, auto_port=False)
+                ensure_running({}, auto_port=False, register_routing=False)
 
     def test_n_ctx_none_when_unreachable(self) -> None:
         from services.agent.local_runtime import ensure_running
@@ -242,7 +242,7 @@ class TestEnsureRunning(unittest.TestCase):
 
         with patch("installer.llamacpp.ensure_server_running", side_effect=fake_ensure):
             with patch("services.agent.local_runtime.get_served_n_ctx", return_value=None):
-                info = ensure_running({}, auto_port=False)
+                info = ensure_running({}, auto_port=False, register_routing=False)
 
         assert info.n_ctx is None
         assert info.tier is None
@@ -299,7 +299,16 @@ class TestRegisterRoutingSource(unittest.TestCase):
             assert src["id"] == "bundled_llamacpp"
             assert src["kind"] == "llamacpp"
             assert src["models"][0]["id"] == "qwen3-4b"
-            assert src["models"][0]["tier"] == "local-24k"
+            # "local-24k" is a services.agent.tiers context-length bucket, not a
+            # routing.py capability tier (routing.KNOWN_TIERS) — it is translated to
+            # its routing-vocabulary equivalent before writing so load_routing() can
+            # actually parse the source back (see _to_routing_tier).
+            assert src["models"][0]["tier"] == "cheap_local"
+            from services.agent.routing import KNOWN_TIERS
+            assert src["models"][0]["tier"] in KNOWN_TIERS
+            # And the written file must round-trip through the real parser.
+            from services.agent.routing import load_routing
+            load_routing(routing)
 
     def test_idempotent_when_source_already_present(self) -> None:
         from services.agent.local_runtime import register_routing_source

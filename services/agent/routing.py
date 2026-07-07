@@ -85,6 +85,14 @@ _LOCAL_KINDS = frozenset({"lmstudio", "llamacpp", "ollama", "vllm"})
 # Module-level API: symbolic tokens understood by resolve() / validate().
 SYMBOLIC_TOKENS = ("strongest", "strong", "cheap_local", "cheapest")
 
+# Public view of the tier vocabulary _parse_source()/validate() accept for a model's
+# "tier" field. Consumers that WRITE into routing.yaml (e.g.
+# services.agent.local_runtime.register_routing_source) must translate any other tier
+# vocabulary (e.g. services.agent.tiers's context-length buckets: local-24k/local-48k/
+# mid) into one of these before writing, or load_routing() raises RoutingError on the
+# very next parse (unknown tier).
+KNOWN_TIERS = frozenset(_TIER_RANK)
+
 # Source kinds exposed by the GUI (subset of _SOURCE_KINDS, no internal mocks).
 ALLOWED_SOURCE_KINDS = (
     "anthropic", "openai", "openrouter",
@@ -120,6 +128,7 @@ class Source:
     id: str                                       # e.g. "anthropic_api"
     kind: str                                     # e.g. "anthropic"
     models: list[ModelEntry] = field(default_factory=list)
+    base_url: Optional[str] = None                # e.g. "http://127.0.0.1:8765/v1" (local kinds)
     _available: Optional[bool] = field(default=None, repr=False, compare=False)
 
     def best_model_at_tier(self, prefer_tier: str) -> Optional[ModelEntry]:
@@ -186,7 +195,9 @@ def _parse_source(raw: dict, i: int) -> Source:
                 f"source '{sid}' model '{mid}': tier {tier!r} not in {sorted(_TIER_RANK)}"
             )
         models.append(ModelEntry(id=str(mid), tier=tier))
-    return Source(id=str(sid), kind=kind, models=models)
+    base_url = raw.get("base_url")
+    return Source(id=str(sid), kind=kind, models=models,
+                  base_url=str(base_url) if base_url else None)
 
 
 def _parse_preference_list(role: str, raw: Any) -> list[str]:
@@ -285,6 +296,17 @@ class RoutingTable:
         _dc = delegation_config or {}
         self.soft_depth_limit: int = int(_dc.get("soft_depth_limit", 8))
         self.max_agents: int = int(_dc.get("max_agents", 64))
+
+    # -- source lookup --------------------------------------------------------
+
+    def get_source(self, source_id: str) -> Optional[Source]:
+        """Return the configured :class:`Source` for *source_id*, or ``None``.
+
+        Used by consumers of :meth:`resolve` (e.g. ``services.agent.config``) that
+        need more than the id — the source's ``kind``/``base_url`` — to actually
+        construct a provider from a routing decision.
+        """
+        return self._by_id.get(source_id)
 
     # -- availability probe --------------------------------------------------
 

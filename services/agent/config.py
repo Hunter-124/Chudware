@@ -146,17 +146,96 @@ def assert_offline_safe(provider: Provider, cfg: dict | None = None) -> None:
         )
 
 
-def get_provider(name: str | None = None, cfg: dict | None = None) -> Provider:
+def get_provider(name: str | None = None, cfg: dict | None = None,
+                 role: str | None = None) -> Provider:
     """Resolve the configured provider, enforcing offline mode (C35) at two points: cloud
     providers are refused by name BEFORE construction, and the resolved provider is re-checked
-    against ``provider_offline_safe`` AFTER (catches the empty-name local default + edge cases)."""
+    against ``provider_offline_safe`` AFTER (catches the empty-name local default + edge cases).
+
+    *role* (optional) is a routing.yaml role tag (e.g. ``"overseer"``, ``"fixer"``, or a DAG
+    node name) — see ``_resolve_via_routing``. When *name* / ``AI_CAD_PROVIDER`` is not given,
+    routing.yaml's role->source assignment (contract §14) is consulted BEFORE falling back to
+    config.json's flat ``provider`` field, so a source registered into routing.yaml (e.g. the
+    bundled llama.cpp runtime's ``register_routing_source``) actually gets picked up here."""
     cfg = cfg if cfg is not None else load_config()
-    provider = _resolve_provider(name, cfg)
+    provider = _resolve_provider(name, cfg, role=role)
     assert_offline_safe(provider, cfg)
     return provider
 
 
-def _resolve_provider(name: str | None, cfg: dict) -> Provider:
+# Routing-source `kind` -> provider `name` understood by `_resolve_provider` below.
+# lmstudio/ollama have no dedicated provider class: both speak the OpenAI-compatible
+# /v1/chat/completions protocol, so they route through the generic "openai" provider
+# with the source's own base_url.
+_ROUTING_KIND_TO_PROVIDER_NAME = {
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "openrouter": "openrouter",
+    "gemini": "gemini",
+    "llamacpp": "llamacpp",
+    "vllm": "vllm",
+    "mock": "mock",
+    "lmstudio": "openai",
+    "ollama": "openai",
+}
+
+# cfg sub-key each provider name reads its base_url from (see _resolve_provider below).
+_PROVIDER_BASE_URL_CFG_KEY = {
+    "openai": "openai",
+    "llamacpp": "llamacpp",
+    "vllm": "vllm",
+    "openrouter": "openrouter",
+}
+
+
+def _resolve_via_routing(role: str | None, cfg: dict) -> tuple[str, str | None, str | None] | None:
+    """Resolve *role* against routing.yaml (contract §14). Returns
+    ``(provider_name, model_id, base_url)`` or ``None`` when routing.yaml has no
+    configured sources / can't resolve the role — the caller falls back to
+    config.json in that case. Never raises: routing.yaml is a best-effort,
+    user-editable file and a malformed/missing one must not break provider
+    resolution."""
+    try:
+        from .routing import load_routing  # noqa: PLC0415 — avoid import cost/cycles
+        # Re-parse routing.yaml from disk each call (not the process-lifetime cache
+        # in get_routing_table()) — the file is user-editable and can also be mutated
+        # at runtime by local_runtime.register_routing_source(), so a stale cache would
+        # silently ignore a source registered after the first resolution in-process.
+        table = load_routing()
+        resolution = table.resolve(role or "default")
+        if resolution is None:
+            return None
+        source = table.get_source(resolution.source_id)
+        kind = source.kind if source is not None else ""
+        provider_name = _ROUTING_KIND_TO_PROVIDER_NAME.get(kind)
+        if provider_name is None:
+            return None
+        base_url = source.base_url if source is not None else None
+        return provider_name, resolution.model_id, base_url
+    except Exception:  # noqa: BLE001 — routing.yaml must never block provider resolution
+        return None
+
+
+def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> Provider:
+    routed_model: str | None = None
+    routed_base_url: str | None = None
+    if not name and not os.environ.get("AI_CAD_PROVIDER"):
+        routed = _resolve_via_routing(role, cfg)
+        if routed is not None:
+            name, routed_model, routed_base_url = routed
+
+    if routed_base_url or routed_model:
+        # Overlay the routing.yaml decision onto a shallow cfg copy so the existing
+        # per-provider branches below (which read cfg.get("model") / cfg[kind]["base_url"])
+        # pick it up without needing their own routing-awareness.
+        cfg = dict(cfg)
+        if routed_model:
+            cfg["model"] = routed_model
+        sub_key = _PROVIDER_BASE_URL_CFG_KEY.get((name or "").lower())
+        if routed_base_url and sub_key:
+            cfg[sub_key] = dict(cfg.get(sub_key) or {})
+            cfg[sub_key].setdefault("base_url", routed_base_url)
+
     name = (name or os.environ.get("AI_CAD_PROVIDER") or cfg.get("provider") or "").lower()
     offline = offline_enabled(cfg)
 

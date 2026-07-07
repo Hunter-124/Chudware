@@ -2833,6 +2833,12 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                                        st.showSimulationTools, st.showPcbTools, barH,
                                        st.activeTabIsDrawing());
 
+        // Electronics: surface the PCB DRC/unrouted summary in the ribbon band's trailing dead space
+        // (the board canvas gave up its bottom results strip to fill the full height — see
+        // ecad_panel.cpp). No-op for schematic docs / when no board is open.
+        if (st.activeWorkspace == AppState::Workspace::Electronics && ribbonH > 0.0f)
+            ui::drawEcadRibbonStatus(st, vp->Pos.y + barH, ribbonH);
+
         // ---------- default starter document ----------
         // Open straight into a fresh part on launch (non-shot) so the app is immediately usable.
         ensureStarterDoc(st, shot);

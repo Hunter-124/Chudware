@@ -668,12 +668,18 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         ImGui::Dummy(ImVec2(s + 6.0f * sc, s));
         ImGui::SameLine();
         ImGui::TextColored(vis ? v4(pal.text) : v4(pal.textDisabled), "%s", ly.id.c_str());
-        ImGui::SameLine();
-        const float availW = ImGui::GetContentRegionAvail().x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, availW - s));
-        bool visChk = vis;
-        if (ImGui::Checkbox("##vis", &visChk)) m.setLayerVisible(ly.id, visChk);
         ui::fmRowPillEnd(r);
+        // Right-edge eye toggle (show/hide the layer) — the SAME glyph + placement the Feature
+        // Manager uses on its plane rows, instead of the old checkbox, so layers read as tree rows.
+        const float eyeSz = 14.0f * sc, eyePad = 6.0f * sc;
+        ImVec2 eMin(r.mx.x - eyeSz - eyePad, r.mn.y + (r.mx.y - r.mn.y - eyeSz) * 0.5f);
+        ImVec2 eMax(eMin.x + eyeSz, eMin.y + eyeSz);
+        const bool overEye = ImGui::IsMouseHoveringRect(eMin, eMax);
+        ui::fmDrawEyeGlyph(eMin, eMax, vis, overEye);
+        if (overEye) {
+            ImGui::SetTooltip(vis ? "Hide %s" : "Show %s", ly.id.c_str());
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) m.setLayerVisible(ly.id, !vis);
+        }
         ImGui::PopID();
     };
     auto netRow = [&](const EcadNet& n, bool withPins) {
@@ -1076,6 +1082,38 @@ void drawEcadManagerBody(AppState& st, const ui::AdaptiveSurface& surf, unsigned
 // the process-wide fallback.
 void ecadPrimeActiveApp(AppState& st) { g_app = &st; }
 
+// Draw the PCB DRC / unrouted summary as a right-aligned glass pill in the ribbon band's trailing
+// dead space (item: the bottom results strip moved up here so the board canvas can fill the height).
+// No-op for schematic docs (they keep their own bottom ERC strip) and when no board is open.
+void drawEcadRibbonStatus(AppState& st, float bandTopY, float bandH) {
+    g_app = &st;
+    EcadEditorState& es = state();
+    EcadMirror& m = es.mirror;
+    if (!m.hasDoc() || !m.isPcb()) return;
+    const ui::Palette& pal = ui::palette;
+    const float sc = ui::uiScale;
+
+    int errs = 0, warns = 0;
+    for (const auto& v : m.drc()) (v.severity == "error" ? errs : warns)++;
+    const int unrouted = m.unroutedCount();
+
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "DRC  %d err   %d warn    |    Unrouted %d", errs, warns, unrouted);
+
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImDrawList* dl = ImGui::GetForegroundDrawList(vp);
+    const ImVec2 tsz = ImGui::CalcTextSize(buf);
+    const float padX = 12.0f * sc, padY = 5.0f * sc, rightMargin = 24.0f * sc;
+    const float cy = bandTopY + bandH * 0.5f;
+    ImVec2 p1(vp->Pos.x + vp->Size.x - rightMargin, cy + tsz.y * 0.5f + padY);
+    ImVec2 p0(p1.x - tsz.x - 2.0f * padX, cy - tsz.y * 0.5f - padY);
+    ui::glassRowBackground(dl, p0, p1, 6.0f * sc, false, false, 0.24f);
+    const ImU32 col = (errs > 0)                     ? ui::Palette::toU32(pal.statusErr)
+                    : (warns > 0 || unrouted > 0)    ? ui::Palette::toU32(pal.statusWarn)
+                                                     : ui::Palette::toU32(pal.statusOk);
+    dl->AddText(ImVec2(p0.x + padX, cy - tsz.y * 0.5f), col, buf);
+}
+
 void drawEcadEditor(AppState& st) {
     g_app = &st;                  // Wave 2: route state() to this frame's active ECAD tab
     EcadEditorState& es = state();
@@ -1158,14 +1196,16 @@ void drawEcadEditor(AppState& st) {
         }
     }
 
-    // Reserve the bottom results strip; the rest is the full-width canvas (the left Manager column
-    // now floats OVER it, pinned window style, same as the Model tab's FeatureManager column floats
-    // over the 3D viewport). Give the strip more room when there are sim results to plot.
+    // PCB reclaims the WHOLE height — the DRC/unrouted readout moved to the ribbon band's dead space
+    // (drawEcadRibbonStatus, called from app.cpp), so the board canvas now reaches the bottom of the
+    // screen exactly like the Model tab's 3D viewport (Hunter red-pen). The schematic keeps a bottom
+    // strip: it hosts the ERC list AND the simulation waveform plot, which have nowhere else to live.
+    const bool isPcbDoc = es.mirror.isPcb();
     const bool hasSimNow = es.mirror.isSch() && st.ecadSimResults.is_object() &&
                            !st.ecadSimResults.empty();
-    const float bottomH = (hasSimNow ? 260.0f : 140.0f) * sc;
+    const float bottomH = isPcbDoc ? 0.0f : (hasSimNow ? 260.0f : 140.0f) * sc;
     const ImVec2 avail = ImGui::GetContentRegionAvail();
-    const float mainH = avail.y - bottomH;
+    const float mainH = bottomH > 0.0f ? (avail.y - bottomH) : 0.0f;  // 0 => fill remaining height
 
     // Canvas.
     ImGui::BeginChild("##ecadCanvasHost",
@@ -1189,31 +1229,35 @@ void drawEcadEditor(AppState& st) {
     }
     ImGui::EndChild();
 
-    // Bottom area: ERC/DRC results, plus a Simulation waveform tab when results are present.
-    ImGui::BeginChild("##ecadStrip", ImVec2(0, 0), ImGuiChildFlags_Border);
-    const bool haveSim = es.mirror.isSch() && st.ecadSimResults.is_object() &&
-                         !st.ecadSimResults.empty();
-    if (haveSim && ImGui::BeginTabBar("##ecadBottomTabs")) {
-        if (ImGui::BeginTabItem(es.mirror.isSch() ? "ERC" : "DRC")) {
+    // Bottom area (schematic only): ERC results, plus a Simulation waveform tab when results are
+    // present. PCB has no bottom strip any more — its canvas fills the height and the DRC summary
+    // lives in the ribbon band (drawEcadRibbonStatus).
+    if (bottomH > 0.0f) {
+        ImGui::BeginChild("##ecadStrip", ImVec2(0, 0), ImGuiChildFlags_Border);
+        const bool haveSim = es.mirror.isSch() && st.ecadSimResults.is_object() &&
+                             !st.ecadSimResults.empty();
+        if (haveSim && ImGui::BeginTabBar("##ecadBottomTabs")) {
+            if (ImGui::BeginTabItem(es.mirror.isSch() ? "ERC" : "DRC")) {
+                drawResultsStrip(st, es);
+                ImGui::EndTabItem();
+            }
+            // Force the Simulation tab forward the frame results first appear (or change).
+            ImGuiTabItemFlags simFlags = ImGuiTabItemFlags_None;
+            if (es.lastSimResults != st.ecadSimResults) {
+                simFlags = ImGuiTabItemFlags_SetSelected;
+                es.lastSimResults = st.ecadSimResults;
+                es.lastAnalysis = st.ecadSimAnalysis;
+            }
+            if (ImGui::BeginTabItem("Simulation", nullptr, simFlags)) {
+                drawSimPlot(st.ecadSimResults, es.lastAnalysis);
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        } else {
             drawResultsStrip(st, es);
-            ImGui::EndTabItem();
         }
-        // Force the Simulation tab forward the frame results first appear (or change).
-        ImGuiTabItemFlags simFlags = ImGuiTabItemFlags_None;
-        if (es.lastSimResults != st.ecadSimResults) {
-            simFlags = ImGuiTabItemFlags_SetSelected;
-            es.lastSimResults = st.ecadSimResults;
-            es.lastAnalysis = st.ecadSimAnalysis;
-        }
-        if (ImGui::BeginTabItem("Simulation", nullptr, simFlags)) {
-            drawSimPlot(st.ecadSimResults, es.lastAnalysis);
-            ImGui::EndTabItem();
-        }
-        ImGui::EndTabBar();
-    } else {
-        drawResultsStrip(st, es);
+        ImGui::EndChild();
     }
-    ImGui::EndChild();
 
     ImGui::End();
 }

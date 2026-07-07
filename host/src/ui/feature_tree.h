@@ -46,6 +46,12 @@ void fmSectionDivider(const char* label);
 // hover, 18px SDF-crisp glyph). Returns true on click; disabled renders dimmed and never fires.
 bool fmToolbarIconBtn(const char* id, const char* iconName, const char* tooltip, bool enabled);
 
+// The FeatureManager row visibility "eye" glyph (open eye when shown; struck-through when hidden),
+// drawn into the current window's draw list with the FM adaptive-surface ink. Exported so other
+// left-column trees (the ECAD PCB/Schematic Manager) can render layer/plane visibility toggles that
+// read identically to the Feature Manager's plane rows. Caller owns the hit-test + click handling.
+void fmDrawEyeGlyph(ImVec2 mn, ImVec2 mx, bool shown, bool hovered);
+
 // Pane-header chip ("Feature Manager"/"Explorer"/... title above the tab body): icon + title in
 // ONE glass pill sized from its content — icon fully inside with even padding, the icon+text
 // group centered on paneCenterX (screen-space; clamped into the content region). titleIcon

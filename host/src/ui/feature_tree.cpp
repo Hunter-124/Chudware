@@ -444,6 +444,9 @@ void fmTreeIconInArrowSlot(ImVec2 rowPos, const char* name, const char* fallback
     treeIconInArrowSlot(rowPos, name, fallback, alpha);
 }
 void fmSectionDivider(const char* label) { treeSectionDivider(label); }
+void fmDrawEyeGlyph(ImVec2 mn, ImVec2 mx, bool shown, bool hovered) {
+    drawEyeGlyph(ImGui::GetWindowDrawList(), mn, mx, shown, hovered, fmSurf());
+}
 
 // ---- shared op applier (DocMirror ops -> rebuild -> reload mesh) ----
 // Centralizes the apply_ops -> loadDocMesh pattern used by suppress/delete/reorder/rename/folder.

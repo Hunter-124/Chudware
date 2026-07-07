@@ -336,13 +336,19 @@ void drawLeftPane(AppState& st,
     // targets of the old dock split.
     const float panelSc = 1.0f + (S - 1.0f) * 0.55f;
     const float minW = 250.0f * panelSc;
-    const float defW = 360.0f * panelSc;
+    // Electronics (PCB/Schematic Manager) runs a little wider than the Model FeatureManager — its
+    // layer/net rows carry a swatch + label + eye toggle, so the extra width keeps them uncramped
+    // (Hunter red-pen). Forced (Always) on that workspace so it reliably applies to the shared,
+    // otherwise user-resized column; the doc-tab strip re-anchors to this edge each frame, so a wider
+    // Electronics column just pushes its own tabs right — Model stays at its own persisted width.
+    const bool ecadWs = (st.activeWorkspace == AppState::Workspace::Electronics);
+    const float defW = (ecadWs ? 400.0f : 360.0f) * panelSc;
     const float maxW = std::max(minW + 40.0f * S,
                                 std::min(560.0f * panelSc, (band.maxX - band.minX) * 0.42f));
     const float winH = s_anim.tick(s_collapsed, colH);
     ImGui::SetNextWindowPos(ImVec2(colX, colY), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(defW, winH),
-                             wantReset ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
+                             (wantReset || ecadWs) ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSizeConstraints(ImVec2(minW, winH), ImVec2(maxW, winH));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, bubbleDp * S);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
@@ -445,8 +451,16 @@ void drawLeftPane(AppState& st,
     // Electronics never called drawLeftPane and the published edge is frame-stamped stale by one
     // frame — see doc_tabs.cpp's overlayColumnEdge(0) consumer).
     if (st.activeWorkspace == AppState::Workspace::Electronics) {
+        // Transparent ChildBg so the manager body's inner BeginChild regions (the layers/nets tree,
+        // the results strip) show the column's own glass instead of ImGui's default opaque ChildBg —
+        // that opaque fill is what read as the flat "white bar" behind the Layers/Nets sections and
+        // left the toolbar/segment rows sitting on a slab instead of glass (Hunter red-pen). The
+        // Simulate/Manufacture/FeatureManager bodies all render on transparent children; this brings
+        // Electronics to the same standard.
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
         ui::drawEcadManagerBody(st, surf, lpHalo);
-        ImGui::PopStyleColor();  // ImGuiCol_Text (surf.textPrimary)
+        ImGui::PopStyleColor();   // ImGuiCol_ChildBg
+        ImGui::PopStyleColor();   // ImGuiCol_Text (surf.textPrimary)
         ImGui::End();
         return;
     }

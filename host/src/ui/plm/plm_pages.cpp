@@ -20,6 +20,7 @@
 #include "core/app_state.h"
 #include "core/async_rpc.h"
 #include "ui/file_dialog.h"
+#include "ui/icons.h"
 #include "ui_theme.h"
 
 namespace ui {
@@ -91,14 +92,11 @@ void dimText(const char* fmt, ...) {
 // numbers crammed against the left edge.
 void statCard(const char* label, int n, const float* col) {
     const float S = ui::uiScale;
-    const ImVec2 sz(98 * S, 58 * S);
+    const ImVec2 sz(100 * S, 60 * S);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     ImVec2 p1(p0.x + sz.x, p0.y + sz.y);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(
-        palette.text[0], palette.text[1], palette.text[2], 0.045f)), 8 * S);
-    dl->AddRect(p0, p1, ImGui::GetColorU32(ImVec4(
-        palette.text[0], palette.text[1], palette.text[2], 0.12f)), 8 * S);
+    ui::glassBackground(dl, p0, p1, 10.0f);   // frosted translucent chip w/ shine
     char buf[24]; std::snprintf(buf, sizeof(buf), "%d", n);
     ImVec2 ns = ImGui::CalcTextSize(buf);
     dl->AddText(ImVec2(p0.x + (sz.x - ns.x) * 0.5f, p0.y + 11 * S),
@@ -144,6 +142,49 @@ void plmCopyText(const char* id, const std::string& text, const float* col = nul
 }
 
 void priorityDot(const std::string& pr);  // defined below; used by Overview too
+
+// A liquid-glass action button: the shared frosted-glass panel (translucent base +
+// vertical shine + specular + border), an accent-tinted wash when `accent`, and an
+// optional atlas icon + label centered inside. Matches the glass language used in
+// the ribbon / parts hub instead of a flat ImGui::Button. Returns clicked.
+bool plmGlassButton(const char* id, const char* label, const char* icon,
+                    bool accent = false, float widthOverride = 0.0f) {
+    const float S = ui::uiScale;
+    const float iconSz  = (icon && icon[0]) ? 16 * S : 0.0f;
+    const float iconGap = iconSz > 0 ? 6 * S : 0.0f;
+    const float padX    = 13 * S;
+    const float textW   = (label && label[0]) ? ImGui::CalcTextSize(label).x : 0.0f;
+    const float content = iconSz + iconGap + textW;
+    const float w = widthOverride > 0 ? widthOverride : (padX * 2 + content);
+    const float h = ImGui::GetFrameHeight();   // aligns with adjacent input rows
+
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImVec2 p1(p0.x + w, p0.y + h);
+    bool clicked = ImGui::InvisibleButton(id, ImVec2(w, h));
+    bool hov = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    ui::glassBackground(dl, p0, p1, 9.0f);
+    if (accent) {
+        float a = held ? 0.92f : hov ? 0.80f : 0.66f;
+        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(
+            palette.accent[0], palette.accent[1], palette.accent[2], a)), 9.0f * S);
+    } else if (hov) {
+        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(
+            palette.text[0], palette.text[1], palette.text[2], held ? 0.10f : 0.06f)), 9.0f * S);
+    }
+
+    ImU32 tcol = accent ? IM_COL32(255, 255, 255, 255) : Palette::toU32(palette.text);
+    float x = p0.x + (w - content) * 0.5f;
+    if (iconSz > 0) {
+        ui::drawIconGlass(dl, icon, ImVec2(x + iconSz * 0.5f, p0.y + h * 0.5f),
+                          iconSz, tcol, 0);
+        x += iconSz + iconGap;
+    }
+    if (textW > 0)
+        dl->AddText(ImVec2(x, p0.y + (h - ImGui::GetTextLineHeight()) * 0.5f), tcol, label);
+    return clicked;
+}
 
 void plmComingSoon(const char* title, const char* note) {
     plmSectionHeader(title);
@@ -199,9 +240,7 @@ void plmDrawOverviewPage(AppState& st) {
     bool enter = ImGui::InputTextWithHint("##plm_ckpt", "What changed? (optional)",
         H.checkpointMsg, sizeof(H.checkpointMsg), ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
-    accentButtonColors();
-    bool save = ImGui::Button("Save checkpoint", ImVec2(150 * S, 0)) || enter;
-    ImGui::PopStyleColor(2);
+    bool save = plmGlassButton("##ckpt_btn", "Save checkpoint", "save", true) || enter;
     if (save && !H.busy) doCheckpoint(st);
     if (H.busy) plmSpinner("Saving");
     plmError(H.actionErr);
@@ -1206,17 +1245,16 @@ void plmDrawPlanningPage(AppState& st) {
     ImGui::SetNextItemWidth(90 * S);
     ImGui::Combo("##newissuesev", &H.newIssueSev, kSev, IM_ARRAYSIZE(kSev));
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(-90 * S);
+    ImGui::SetNextItemWidth(-96 * S);
     bool ienter = ImGui::InputTextWithHint("##newissue", "describe an issue\xe2\x80\xa6",
         H.newIssueTitle, sizeof(H.newIssueTitle), ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
-    accentButtonColors();
-    if ((ImGui::Button("Log", ImVec2(-1, 0)) || ienter) && H.newIssueTitle[0]) {
+    if ((plmGlassButton("##logbtn", "Log", "new_doc", true, 88 * S) || ienter) &&
+        H.newIssueTitle[0]) {
         planCall(st, "create", "issue",
                  {{"title", H.newIssueTitle}, {"severity", kSev[H.newIssueSev]}});
         H.newIssueTitle[0] = '\0';
     }
-    ImGui::PopStyleColor(2);
     if (H.issues.empty()) dimText("No issues logged.");
     for (const auto& is : H.issues) drawIssueRow(st, is);
 
@@ -1231,14 +1269,12 @@ void plmDrawPlanningPage(AppState& st) {
     ImGui::SameLine();
     plmDatePicker("##msDue", s_msDue, sizeof(s_msDue));
     ImGui::SameLine();
-    accentButtonColors();
-    if (ImGui::Button("Add") && s_msTitle[0]) {
+    if (plmGlassButton("##msadd", "Add", "new_doc", true) && s_msTitle[0]) {
         nlohmann::json d = {{"title", s_msTitle}};
         if (s_msDue[0]) d["due"] = s_msDue;
         planCall(st, "create", "milestone", d);
         s_msTitle[0] = '\0'; s_msDue[0] = '\0';
     }
-    ImGui::PopStyleColor(2);
     if (H.milestones.empty()) dimText("No milestones yet.");
     for (const auto& m : H.milestones) drawMilestoneRow(st, m);
 
@@ -1272,13 +1308,12 @@ void plmDrawPlanningPage(AppState& st) {
     bool enter = ImGui::InputTextWithHint("##newtask", "new task title\xe2\x80\xa6",
         H.newTaskTitle, sizeof(H.newTaskTitle), ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
-    accentButtonColors();
-    if ((ImGui::Button("Add task", ImVec2(110 * S, 0)) || enter) && H.newTaskTitle[0]) {
+    if ((plmGlassButton("##addtask", "Add task", "new_doc", true, 116 * S) || enter) &&
+        H.newTaskTitle[0]) {
         planCall(st, "create", "task",
                  {{"title", H.newTaskTitle}, {"priority", kPri[s_newTaskPri]}});
         H.newTaskTitle[0] = '\0';
     }
-    ImGui::PopStyleColor(2);
     ImGui::Spacing();
 
     // kanban columns — bordered, scrollable boxes so cards stay contained inside
@@ -1307,12 +1342,13 @@ void plmDrawPlanningPage(AppState& st) {
         ImGui::PopStyleColor();
 
         ImGui::PushID(ci);
-        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6 * S);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6 * S, 6 * S));
-        ImGui::PushStyleColor(ImGuiCol_ChildBg,
-            ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.03f));
-        ImGui::PushStyleColor(ImGuiCol_Border,
-            ImVec4(palette.text[0], palette.text[1], palette.text[2], 0.12f));
+        ImVec2 cp0 = ImGui::GetCursorScreenPos();
+        ui::glassBackground(ImGui::GetWindowDrawList(), cp0,
+                            ImVec2(cp0.x + colW, cp0.y + colH), 10.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 10 * S);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8 * S, 8 * S));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
         ImGui::BeginChild("##col", ImVec2(colW, colH), ImGuiChildFlags_Borders);
 
         int shown = 0;

@@ -62,7 +62,8 @@ def _browser_start_url(params: dict, _emit: Callable) -> dict:
 def _login_wizard_start(params: dict, _emit: Callable) -> dict:
     try:
         sites = (params or {}).get("sites")
-        res = _manager().wizard_start(list(sites) if sites else None)
+        mode = str((params or {}).get("mode", "embed"))
+        res = _manager().wizard_start(list(sites) if sites else None, mode=mode)
         return res
     except Exception as exc:  # noqa: BLE001
         return _wrap_exc(exc)
@@ -77,7 +78,27 @@ def _login_wizard_status(params: dict, _emit: Callable) -> dict:
 
 def _login_wizard_next(params: dict, _emit: Callable) -> dict:
     try:
-        return _manager().wizard_next(skip=bool((params or {}).get("skip", False)))
+        p = params or {}
+        logged_in = p.get("logged_in")
+        return _manager().wizard_next(
+            skip=bool(p.get("skip", False)),
+            logged_in=None if logged_in is None else bool(logged_in))
+    except Exception as exc:  # noqa: BLE001
+        return _wrap_exc(exc)
+
+
+def _browser_session_import(params: dict, _emit: Callable) -> dict:
+    """Stage a GUI-exported cookie jar for a site (CEF → Playwright hand-off)
+    and stamp the login as verified. ``{site, cookies:[...], verified?}``.
+    Needs no Playwright — it only writes the staging sidecar + metadata."""
+    try:
+        from services.browser.embed import import_session_cookies
+        p = params or {}
+        site = str(p.get("site", "")).strip()
+        cookies = p.get("cookies")
+        return import_session_cookies(
+            site, list(cookies) if isinstance(cookies, list) else [],
+            verified=bool(p.get("verified", True)))
     except Exception as exc:  # noqa: BLE001
         return _wrap_exc(exc)
 
@@ -94,5 +115,6 @@ EMBED_WORKER_METHODS: dict[str, Callable] = {
     "login_wizard_start": _login_wizard_start,
     "login_wizard_status": _login_wizard_status,
     "login_wizard_next": _login_wizard_next,
+    "browser_session_import": _browser_session_import,
     "login_wizard_stop": _login_wizard_stop,
 }

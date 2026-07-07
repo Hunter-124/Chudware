@@ -24,6 +24,7 @@
 // its backend copies them and uploads on the GL thread like the screencast one.
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -56,6 +57,18 @@ public:
     virtual bool active() const = 0;
     virtual bool starting() const = 0;
     virtual const std::string& lastError() const = 0;
+
+    // Hand the live session over to the worker so headless scraping/downloads
+    // reuse it: export the backend's cookie jar for `site` and stage it via the
+    // browser_session_import RPC (which also stamps the login as verified).
+    // `done(ok)` fires on the GL thread. Backends whose cookies already live in
+    // the worker-side Playwright profile have nothing to hand over — the default
+    // reports success without doing anything.
+    virtual void exportSession(AppState& st, const std::string& site,
+                               std::function<void(bool)> done) {
+        (void)st; (void)site;
+        if (done) done(true);
+    }
 
     // True when the backend adopts the login wizard's worker-side embed via
     // attach(embed_id) (the ScreencastWebView default). CEF renders in-process and

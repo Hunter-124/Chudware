@@ -41,6 +41,11 @@ public:
     // CEF renders in-process — it has no worker-side embed to attach to, so the
     // panel opens the current wizard site's URL via open() instead of attach().
     bool usesWorkerEmbed() const override;
+    // Hand the live CEF session to the worker: visit the per-site request
+    // context's cookie jar and stage it via browser_session_import so headless
+    // Playwright (browser_fetch/download) reuses the sign-in. GL/UI thread.
+    void exportSession(AppState& st, const std::string& site,
+                       std::function<void(bool)> done) override;
 
 private:
     void forwardInput(ImVec2 img0, float scale, ImVec2 imgSize);  // GL/UI thread

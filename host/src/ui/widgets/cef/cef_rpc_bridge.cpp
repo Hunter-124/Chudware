@@ -31,4 +31,35 @@ void rpc_start_url(
     });
 }
 
+void rpc_session_import(
+    AppState& st, const std::string& site, std::vector<SessionCookie> cookies,
+    std::function<void(bool, const std::string&)> cb) {
+    nlohmann::json jar = nlohmann::json::array();
+    for (const auto& c : cookies) {
+        nlohmann::json j;
+        j["name"]      = c.name;
+        j["value"]     = c.value;
+        j["domain"]    = c.domain;
+        j["path"]      = c.path;
+        j["secure"]    = c.secure;
+        j["httponly"]  = c.httpOnly;
+        if (c.expires > 0) j["expires"] = c.expires;
+        if (!c.sameSite.empty()) j["same_site"] = c.sameSite;
+        jar.push_back(std::move(j));
+    }
+    nlohmann::json p;
+    p["site"]     = site;
+    p["cookies"]  = std::move(jar);
+    p["verified"] = true;
+    st.rpc.call("browser_session_import", p, [cb = std::move(cb)](const core::RpcResult& r) {
+        if (!r.ok) { cb(false, r.err); return; }
+        if (!r.result.is_object() || !r.result.value("ok", false)) {
+            cb(false, r.result.is_object() ? r.result.value("reason", std::string("import failed"))
+                                           : std::string("bad response"));
+            return;
+        }
+        cb(true, "");
+    });
+}
+
 }  // namespace ui::cef

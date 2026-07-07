@@ -703,3 +703,85 @@ def test_live_embed_smoke(tmp_profiles):
         assert nav["ok"] and "example.org" in nav["url"]
     finally:
         mgr.stop(sid)
+
+
+# ---------------------------------------------------------------------------
+# Client-mode wizard + GUI-session hand-off (CEF → Playwright cookie staging)
+
+
+def test_wizard_client_mode_never_launches_a_browser(tmp_profiles):
+    def _boom():
+        raise AssertionError("client mode must not touch playwright")
+
+    mgr = EmbedManager(_async_playwright=_boom)
+    res = mgr.wizard_start(["grabcad", "mcmaster"], mode="client")
+    assert res["ok"] and res["embed_id"] is None
+    assert res["current_site"] == "grabcad"
+
+    status = mgr.wizard_status()
+    assert status["active"] and status["embed_id"] is None
+    assert status["current_site"] == "grabcad"
+
+    # Client reports the outcome: grabcad signed in, mcmaster skipped.
+    nxt = mgr.wizard_next(skip=False, logged_in=True)
+    assert nxt["ok"] and nxt["current_site"] == "mcmaster"
+    assert nxt["embed_id"] is None            # no worker session opened for step 2
+    fin = mgr.wizard_next(skip=True)
+    assert fin["all_done"]
+    assert fin["done"] == ["grabcad"] and fin["skipped"] == ["mcmaster"]
+    assert profiles.has_login("grabcad")
+    assert not profiles.has_login("mcmaster")
+
+
+def test_wizard_client_mode_logged_in_false_marks_skipped(tmp_profiles):
+    mgr = EmbedManager(_async_playwright=lambda: None)
+    assert mgr.wizard_start(["grabcad"], mode="client")["ok"]
+    fin = mgr.wizard_next(skip=False, logged_in=False)
+    assert fin["all_done"] and fin["skipped"] == ["grabcad"]
+    assert not profiles.has_login("grabcad")
+
+
+def test_import_session_cookies_stages_and_stamps(tmp_profiles):
+    raw = [
+        {"name": "sid", "value": "s3cret", "domain": ".grabcad.com", "path": "/",
+         "secure": True, "httponly": True, "expires": 4102444800.0,
+         "same_site": "lax"},
+        {"name": "sess", "value": "v", "domain": "grabcad.com"},   # minimal
+        {"name": "", "value": "dropme", "domain": "grabcad.com"},  # invalid → dropped
+    ]
+    res = embed.import_session_cookies("grabcad", raw)
+    assert res["ok"] and res["cookies"] == 2 and res["login_verified"]
+    assert profiles.has_login("grabcad")
+    assert profiles.has_pending_session_cookies("grabcad")
+
+    jar = profiles.consume_session_cookies("grabcad")
+    assert not profiles.has_pending_session_cookies("grabcad")  # one-shot
+    assert jar[0]["name"] == "sid" and jar[0]["sameSite"] == "Lax"
+    assert jar[0]["httpOnly"] is True and jar[0]["expires"] == 4102444800.0
+    assert jar[1] == {"name": "sess", "value": "v", "domain": "grabcad.com",
+                      "path": "/", "secure": False, "httpOnly": False,
+                      "expires": -1}
+
+
+def test_import_session_cookies_empty_is_structured_error(tmp_profiles):
+    res = embed.import_session_cookies("grabcad", [])
+    assert not res["ok"] and res["reason"] == "no_cookies"
+    assert not profiles.has_login("grabcad")
+
+
+def test_apply_pending_cookies_sync_injects_and_consumes(tmp_profiles):
+    embed.import_session_cookies("grabcad", [
+        {"name": "sid", "value": "x", "domain": ".grabcad.com"}])
+
+    class _Ctx:
+        def __init__(self):
+            self.added = None
+
+        def add_cookies(self, jar):
+            self.added = jar
+
+    ctx = _Ctx()
+    assert embed.apply_pending_cookies_sync(ctx, "grabcad") == 1
+    assert ctx.added and ctx.added[0]["name"] == "sid"
+    # consumed: a second context gets nothing (cookies now live in the profile)
+    assert embed.apply_pending_cookies_sync(_Ctx(), "grabcad") == 0

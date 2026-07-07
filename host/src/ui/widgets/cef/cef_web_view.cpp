@@ -17,6 +17,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -25,6 +26,7 @@
 
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
+#include "include/cef_cookie.h"
 #include "include/cef_render_handler.h"
 #include "include/cef_life_span_handler.h"
 #include "include/cef_load_handler.h"
@@ -44,6 +46,24 @@
 namespace ui {
 
 namespace {
+
+// Lifecycle tracing → stderr when AI_CAD_CEF_TRACE=1. Diagnoses "stuck on
+// Loading" by showing exactly which CEF lifecycle step fired (or didn't).
+bool cefTrace() {
+    static const bool on = [] {
+        const char* v = std::getenv("AI_CAD_CEF_TRACE");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+#define CEF_TRACE(...)                                                    \
+    do {                                                                 \
+        if (::ui::cefTrace()) {                                           \
+            std::fprintf(stderr, "[cef-trace] " __VA_ARGS__);            \
+            std::fprintf(stderr, "\n");                                  \
+            std::fflush(stderr);                                         \
+        }                                                                \
+    } while (0)
 
 // --- ImGui → CEF modifier / key mapping ---------------------------------------
 uint32_t cefModifiers() {
@@ -124,6 +144,50 @@ bool isAuthUrl(const std::string& url) {
     return false;
 }
 
+// Collects every cookie of a request context into plain SessionCookie structs.
+// CEF calls Visit() on the UI thread (== the GL thread under our external
+// message pump); the jar is delivered from the destructor, which runs when CEF
+// releases the last reference AFTER visitation completes — also on the UI
+// thread, so the completion callback may talk to st.rpc directly.
+class CookieCollector : public CefCookieVisitor {
+public:
+    using Done = std::function<void(std::vector<cef::SessionCookie>)>;
+    explicit CookieCollector(Done done) : done_(std::move(done)) {}
+    ~CookieCollector() override {
+        CEF_TRACE("cookie export: visitation complete, %d cookies", (int)cookies_.size());
+        if (done_) done_(std::move(cookies_));
+    }
+
+    bool Visit(const CefCookie& c, int /*count*/, int /*total*/, bool& /*deleteCookie*/) override {
+        cef::SessionCookie sc;
+        sc.name     = CefString(&c.name).ToString();
+        sc.value    = CefString(&c.value).ToString();
+        sc.domain   = CefString(&c.domain).ToString();
+        sc.path     = CefString(&c.path).ToString();
+        sc.secure   = c.secure != 0;
+        sc.httpOnly = c.httponly != 0;
+        if (c.has_expires) {
+            cef_time_t t{};
+            double d = 0.0;
+            if (cef_time_from_basetime(c.expires, &t) && cef_time_to_doublet(&t, &d))
+                sc.expires = d;
+        }
+        switch (c.same_site) {
+            case CEF_COOKIE_SAME_SITE_NO_RESTRICTION: sc.sameSite = "none";   break;
+            case CEF_COOKIE_SAME_SITE_LAX_MODE:       sc.sameSite = "lax";    break;
+            case CEF_COOKIE_SAME_SITE_STRICT_MODE:    sc.sameSite = "strict"; break;
+            default:                                  break;  // unspecified
+        }
+        cookies_.push_back(std::move(sc));
+        return true;   // keep visiting
+    }
+
+private:
+    Done done_;
+    std::vector<cef::SessionCookie> cookies_;
+    IMPLEMENT_REFCOUNTING(CookieCollector);
+};
+
 }  // namespace
 
 // ---- Shared: the CEF-callback ↔ widget handoff (plain, shared_ptr-owned) ------
@@ -172,6 +236,7 @@ public:
     void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&,
                  const void* buffer, int width, int height) override {
         if (type != PET_VIEW) return;   // PET_POPUP (<select>) is a follow-up commit
+        if (!tracedFirstPaint_) { tracedFirstPaint_ = true; CEF_TRACE("OnPaint FIRST %dx%d", width, height); }
         std::lock_guard<std::mutex> lk(s_->mtx);
         const size_t n = static_cast<size_t>(width) * height * 4;
         s_->bgra.assign(static_cast<const unsigned char*>(buffer),
@@ -181,7 +246,10 @@ public:
     }
 
     // CefLifeSpanHandler
-    void OnAfterCreated(CefRefPtr<CefBrowser> browser) override { browser_ = browser; }
+    void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
+        browser_ = browser;
+        CEF_TRACE("OnAfterCreated (browser id=%d)", browser ? browser->GetIdentifier() : -1);
+    }
     void OnBeforeClose(CefRefPtr<CefBrowser>) override          { browser_ = nullptr; }
     // Keep popups (target=_blank etc.) in-frame: block the OS window, navigate the
     // main frame instead — the embedded panel has nowhere to put a second window.
@@ -195,8 +263,30 @@ public:
     }
 
     // CefLoadHandler / CefDisplayHandler — status for the login chip.
-    void OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, int) override {
-        if (frame->IsMain()) refreshLoginState(frame->GetURL());
+    void OnLoadStart(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
+                     TransitionType) override {
+        if (frame->IsMain()) CEF_TRACE("OnLoadStart %s", frame->GetURL().ToString().c_str());
+    }
+    void OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, int httpStatus) override {
+        if (frame->IsMain()) {
+            CEF_TRACE("OnLoadEnd http=%d %s", httpStatus, frame->GetURL().ToString().c_str());
+            refreshLoginState(frame->GetURL());
+        }
+    }
+    // A failed main-frame load (DNS, TLS, blocked, net error) previously left the
+    // panel on "Loading…" forever with no signal. Surface it: record the error so
+    // draw() shows it instead of a perpetual spinner, and clear `starting`.
+    void OnLoadError(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
+                     ErrorCode errorCode, const CefString& errorText,
+                     const CefString& failedUrl) override {
+        if (!frame->IsMain()) return;                 // sub-resource error — ignore
+        if (errorCode == ERR_ABORTED) return;         // navigation superseded — not fatal
+        const std::string msg = errorText.ToString();
+        CEF_TRACE("OnLoadError code=%d '%s' url=%s", (int)errorCode, msg.c_str(),
+                  failedUrl.ToString().c_str());
+        std::lock_guard<std::mutex> lk(s_->mtx);
+        s_->starting = false;
+        s_->lastError = msg.empty() ? "page failed to load" : ("load error: " + msg);
     }
     void OnAddressChange(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
                          const CefString& url) override {
@@ -222,6 +312,7 @@ private:
 
     std::shared_ptr<Shared> s_;
     CefRefPtr<CefBrowser> browser_;   // set in OnAfterCreated (CEF/UI thread)
+    bool tracedFirstPaint_ = false;   // AI_CAD_CEF_TRACE: log only the first OnPaint
     IMPLEMENT_REFCOUNTING(Client);
 };
 
@@ -237,6 +328,8 @@ struct CefWebView::Impl {
     bool focused = false;
 
     void createBrowser(const std::string& url, const std::string& cacheDir, bool startedAtAuth) {
+        CEF_TRACE("createBrowser url=%s cache=%s onUiThread=%d",
+                  url.c_str(), cacheDir.c_str(), (int)CefCurrentlyOn(TID_UI));
         CEF_REQUIRE_UI_THREAD();   // CreateBrowser is TID_UI-affine (loud if a future change breaks it)
         { std::lock_guard<std::mutex> lk(s->mtx); s->startedAtAuth = startedAtAuth; }
         client = new Client(s);
@@ -253,8 +346,11 @@ struct CefWebView::Impl {
             CefRequestContextSettings rc;
             CefString(&rc.cache_path) = cacheDir;
             ctx = CefRequestContext::CreateContext(rc, nullptr);
+            CEF_TRACE("per-site request context %s", ctx ? "created" : "NULL (CreateContext failed)");
         }
-        CefBrowserHost::CreateBrowser(window_info, client, url, settings, nullptr, ctx);
+        const bool ok =
+            CefBrowserHost::CreateBrowser(window_info, client, url, settings, nullptr, ctx);
+        CEF_TRACE("CreateBrowser returned %d", (int)ok);
     }
 
     void closeBrowser() {
@@ -300,10 +396,13 @@ void CefWebView::open(AppState& st, const std::string& siteOrUrl, bool isUrl) {
     const std::string req = siteOrUrl;
     impl_->pendingUrlReq = req;
     Impl* impl = impl_.get();
+    CEF_TRACE("open(site=%s) → rpc browser_start_url…", siteOrUrl.c_str());
     cef::rpc_start_url(st, siteOrUrl, [impl, req](bool ok, const std::string& url,
                                                   const std::string& /*plwCacheDir*/,
                                                   const std::string& err) {
-        if (impl->s->detached || impl->pendingUrlReq != req) return;  // stale / closed
+        CEF_TRACE("rpc_start_url cb ok=%d url=%s err=%s onUiThread=%d",
+                  (int)ok, url.c_str(), err.c_str(), (int)CefCurrentlyOn(TID_UI));
+        if (impl->s->detached || impl->pendingUrlReq != req) { CEF_TRACE("… stale/closed, drop"); return; }
         if (!ok || url.empty()) {
             std::lock_guard<std::mutex> lk(impl->s->mtx);
             impl->s->starting = false;
@@ -346,6 +445,42 @@ void CefWebView::update(AppState& /*st*/) {
 }
 
 bool CefWebView::usesWorkerEmbed() const { return false; }
+
+void CefWebView::exportSession(AppState& st, const std::string& site,
+                               std::function<void(bool)> done) {
+    Client* c = impl_->client.get();
+    if (site.empty() || !c || !c->browser()) {
+        CEF_TRACE("exportSession(%s): no live browser", site.c_str());
+        if (done) done(false);
+        return;
+    }
+    CefRefPtr<CefRequestContext> rctx = c->browser()->GetHost()->GetRequestContext();
+    CefRefPtr<CefCookieManager>  mgr  = rctx ? rctx->GetCookieManager(nullptr) : nullptr;
+    if (!mgr) {
+        CEF_TRACE("exportSession(%s): no cookie manager", site.c_str());
+        if (done) done(false);
+        return;
+    }
+    mgr->FlushStore(nullptr);   // best-effort: persist CEF's own on-disk jar too
+    CEF_TRACE("exportSession(%s): visiting cookies…", site.c_str());
+    AppState* stp = &st;        // AppState outlives every RPC (app-lifetime object)
+    CefRefPtr<CefCookieVisitor> collector = new CookieCollector(
+        [stp, site, done](std::vector<cef::SessionCookie> cookies) {
+            if (cookies.empty()) {
+                if (done) done(false);
+                return;
+            }
+            cef::rpc_session_import(*stp, site, std::move(cookies),
+                                    [site, done](bool ok, const std::string& err) {
+                CEF_TRACE("exportSession(%s): import %s %s", site.c_str(),
+                          ok ? "ok" : "FAILED", err.c_str());
+                if (done) done(ok);
+            });
+        });
+    if (!mgr->VisitAllCookies(collector))
+        CEF_TRACE("exportSession(%s): VisitAllCookies refused", site.c_str());
+    // A refused visit still destroys the collector → done(false) via empty jar.
+}
 
 // ---- input (GL/UI thread) ----------------------------------------------------
 
@@ -467,7 +602,9 @@ bool CefWebView::draw(AppState& /*st*/, ImVec2 avail) {
         const int nw = (int)avail.x, nh = (int)avail.y;
         if (nw != s.reqW || nh != s.reqH) {
             s.reqW = nw; s.reqH = nh;
-            if (impl_->client && impl_->client->browser())
+            const bool haveBrowser = impl_->client && impl_->client->browser();
+            CEF_TRACE("draw WasResized %dx%d haveBrowser=%d", nw, nh, (int)haveBrowser);
+            if (haveBrowser)
                 impl_->client->browser()->GetHost()->WasResized();
         }
         if (s.dirty && !s.bgra.empty() && s.paintW > 0 && s.paintH > 0) {

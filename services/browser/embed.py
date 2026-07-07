@@ -210,6 +210,96 @@ def classify_login_state(site: str | None, content: str | None, url: str) -> str
     return "unknown"
 
 
+# ---------------------------------------------------------------------------
+# GUI-browser session hand-off: the in-process CEF browser exports its cookie
+# jar after a verified sign-in; we normalise it to Playwright's add_cookies
+# shape, stage it (profiles.save_session_cookies) and stamp the login as
+# verified. Every subsequent persistent context opened for the site — headless
+# browser_fetch/browser_download AND embed sessions — injects the staged jar
+# once, after which the cookies live natively in the Playwright profile.
+
+_SAME_SITE_MAP = {
+    "strict": "Strict", "lax": "Lax", "none": "None",
+    "no_restriction": "None", "unspecified": None, "": None,
+}
+
+
+def _normalize_cookie(raw: dict) -> dict | None:
+    name = str(raw.get("name", "")).strip()
+    domain = str(raw.get("domain", "")).strip()
+    if not name or not domain:
+        return None
+    c: dict[str, Any] = {
+        "name": name,
+        "value": str(raw.get("value", "")),
+        "domain": domain,
+        "path": str(raw.get("path") or "/"),
+        "secure": bool(raw.get("secure", False)),
+        "httpOnly": bool(raw.get("httponly", raw.get("httpOnly", False))),
+    }
+    expires = raw.get("expires")
+    try:
+        expires = float(expires) if expires is not None else -1.0
+    except (TypeError, ValueError):
+        expires = -1.0
+    c["expires"] = expires if expires > 0 else -1
+    same_site = _SAME_SITE_MAP.get(str(raw.get("same_site",
+                                    raw.get("sameSite", ""))).strip().lower())
+    if same_site:
+        c["sameSite"] = same_site
+    return c
+
+
+def import_session_cookies(site: str, cookies: list[dict],
+                           *, verified: bool = True) -> dict:
+    """Stage a GUI-exported cookie jar for ``site`` and (when ``verified``)
+    stamp ``login_verified_ts`` — the signal ``profiles.has_login`` trusts."""
+    if not site:
+        return fail("no_site", "session import needs a site id")
+    normalized = [c for c in (_normalize_cookie(r) for r in (cookies or []))
+                  if c is not None]
+    if not normalized:
+        return fail("no_cookies", f"no usable cookies exported for '{site}'")
+    count = profiles.save_session_cookies(site, normalized)
+    profiles.touch_created(site)
+    now = time.time()
+    fields: dict[str, Any] = {"last_login_ts": now, "session_import_ts": now}
+    if verified:
+        fields["login_verified_ts"] = now
+    profiles.save_meta(site, **fields)
+    return {"ok": True, "site": profiles.slug(site), "cookies": count,
+            "login_verified": verified}
+
+
+async def apply_pending_cookies_async(context: Any, site: str | None) -> int:
+    """Inject ``site``'s staged cookie jar into a live ASYNC persistent context
+    (consumes the sidecar). Best-effort: a bad jar must never break the session."""
+    if not site:
+        return 0
+    jar = profiles.consume_session_cookies(site)
+    if not jar:
+        return 0
+    try:
+        await context.add_cookies(jar)
+        return len(jar)
+    except Exception:  # noqa: BLE001 — stale/foreign cookies: drop, don't break
+        return 0
+
+
+def apply_pending_cookies_sync(context: Any, site: str | None) -> int:
+    """SYNC-API twin of :func:`apply_pending_cookies_async` (session.py path)."""
+    if not site:
+        return 0
+    jar = profiles.consume_session_cookies(site)
+    if not jar:
+        return 0
+    try:
+        context.add_cookies(jar)
+        return len(jar)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 class EmbedSession:
     """State for one embedded browser tab. Playwright objects live on the loop
     thread; ``latest_frame``/``frame_seq``/``url``/``login_state`` are the only
@@ -394,6 +484,7 @@ class EmbedManager:
             viewport={"width": s.w, "height": s.h},
             **stealth.context_options(s.user_agent))
         await stealth.harden_context_async(s.context)
+        await apply_pending_cookies_async(s.context, s.site)
         pages = list(getattr(s.context, "pages", []) or [])
         s.page = pages[0] if pages else await s.context.new_page()
         # Screencast BEFORE the first navigation: CDP only pushes frames on
@@ -654,9 +745,23 @@ class EmbedManager:
         except Exception:  # noqa: BLE001
             return []
 
-    def wizard_start(self, sites: list[str] | None = None) -> dict:
-        """Begin the sequential login wizard: ONE embedded session at a time,
-        opened at each site's LOGIN_URL (fallback BASE_URL)."""
+    def wizard_start(self, sites: list[str] | None = None,
+                     mode: str = "embed") -> dict:
+        """Begin the sequential login wizard.
+
+        ``mode="embed"`` (legacy/tests): ONE worker-side embedded Playwright
+        session at a time, opened at each site's LOGIN_URL; the classify loop
+        auto-advances on logged_in.
+
+        ``mode="client"`` (the in-process CEF GUI browser): PURE BOOKKEEPING —
+        no worker-side browser is launched (the user signs in inside the GUI's
+        own Chromium, so a worker page would just sit unattended on the login
+        URL forever, holding the site's profile lock and blocking fetches).
+        The client reports the outcome of each step via
+        :meth:`wizard_next(skip=..., logged_in=...)` and hands the session
+        over with :func:`import_session_cookies`. Needs no Playwright at all.
+        """
+        client_mode = (mode == "client")
         with self._wizard_lock:
             if self._wizard is not None:
                 return fail("wizard_active", "a login wizard is already running — "
@@ -667,7 +772,10 @@ class EmbedManager:
                         "current_site": None, "embed_id": None}
             self._wizard = {"sites": site_list, "idx": 0, "done": [], "skipped": [],
                             "embed_id": None, "saw_auth_wall": False,
-                            "opened_at_sign_in": False}
+                            "opened_at_sign_in": False, "mode": mode}
+        if client_mode:
+            return {"ok": True, "sites": site_list, "current_site": site_list[0],
+                    "embed_id": None, "all_done": False}
         res = self._wizard_open_current()
         if not res.get("ok"):
             with self._wizard_lock:
@@ -744,15 +852,20 @@ class EmbedManager:
                     "done": list(wiz["done"]), "skipped": list(wiz["skipped"]),
                     "remaining": list(remaining), "all_done": not remaining}
 
-    def wizard_next(self, skip: bool = False) -> dict:
+    def wizard_next(self, skip: bool = False, logged_in: bool | None = None) -> dict:
         """Finish the current site (record success unless ``skip``) and open the
-        next one; returns the new status (``all_done`` when the list is spent)."""
+        next one; returns the new status (``all_done`` when the list is spent).
+
+        In client mode there is no worker session to classify, so the CLIENT's
+        verdict (``logged_in``, from the GUI browser's live login-state
+        classification) decides whether this step counts as a sign-in."""
         with self._wizard_lock:
             wiz = self._wizard
             if wiz is None:
                 return fail("no_wizard", "login wizard is not running")
             site = wiz["sites"][wiz["idx"]]
             embed_id = wiz["embed_id"]
+            client_mode = wiz.get("mode") == "client"
         current_state = "unknown"
         if embed_id is not None:
             s = self._get(embed_id)
@@ -761,7 +874,10 @@ class EmbedManager:
 
         if embed_id is not None:
             self.stop(embed_id)  # releases the site profile lock BEFORE save_meta
-        mark_logged_in = (not skip) and (current_state == "logged_in")
+        if client_mode:
+            mark_logged_in = (not skip) and bool(logged_in)
+        else:
+            mark_logged_in = (not skip) and (current_state == "logged_in")
         if mark_logged_in:
             try:
                 profiles.touch_created(site)
@@ -787,6 +903,8 @@ class EmbedManager:
                 return {"ok": True, "active": False, "current_site": None, "embed_id": None,
                         "done": list(wiz["done"]), "skipped": list(wiz["skipped"]),
                         "remaining": [], "all_done": True}
+        if client_mode:
+            return self._wizard_status_dict()   # the GUI opens the next site itself
         res = self._wizard_open_current()
         if not res.get("ok"):
             return res

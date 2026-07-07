@@ -65,6 +65,17 @@ def _busy(site: str) -> dict:
                 f"session (or finish the login wizard) and retry")
 
 
+def _apply_staged_cookies(context: Any, site: str) -> None:
+    """Inject a GUI-exported cookie jar staged by the login wizard (CEF →
+    Playwright hand-off, see embed.import_session_cookies). One-shot: the
+    sidecar is consumed and the cookies persist in the profile afterwards."""
+    try:
+        from .embed import apply_pending_cookies_sync  # lazy: avoid import cycle
+        apply_pending_cookies_sync(context, site)
+    except Exception:  # noqa: BLE001 — hand-off is best-effort, never fatal
+        pass
+
+
 def _import_sync_playwright() -> Callable[[], Any]:
     try:
         from playwright.sync_api import sync_playwright
@@ -109,6 +120,7 @@ def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callabl
                 str(profile_path), headless=False,
                 args=stealth.launch_args(headless=False), **stealth.context_options(ua))
             stealth.harden_context_sync(context)
+            _apply_staged_cookies(context, site)
             try:
                 page = context.pages[0] if context.pages else context.new_page()
                 stealth.harden_page_sync(context, page, ua, ver)
@@ -204,6 +216,7 @@ def _browser_fetch_locked(url: str, site: str, *, nav_timeout: float, render_set
                     str(profile_path), headless=True,
                     args=stealth.launch_args(headless=True), **stealth.context_options(ua))
                 stealth.harden_context_sync(context)
+                _apply_staged_cookies(context, site)
                 try:
                     page = context.new_page()
                     stealth.harden_page_sync(context, page, ua, ver)
@@ -295,6 +308,7 @@ def _browser_download_locked(url: str, site: str, dest: Path, *, nav_timeout: fl
                     str(profile_path), headless=True,
                     args=stealth.launch_args(headless=True), **stealth.context_options(ua))
                 stealth.harden_context_sync(context)
+                _apply_staged_cookies(context, site)
                 try:
                     response = context.request.get(url, timeout=nav_timeout * 1000)
                     status = response.status

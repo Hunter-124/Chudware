@@ -8,10 +8,28 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 struct AppState;
 
 namespace ui::cef {
+
+// One exported cookie, in plain std types (no CEF, no JSON). Marshalled to the
+// worker's `browser_session_import` RPC, which normalises it into Playwright's
+// add_cookies shape and stages it for the site's persistent profile.
+struct SessionCookie {
+    std::string name, value, domain, path;
+    double expires = -1.0;        // epoch seconds; <= 0 → session cookie
+    bool secure = false, httpOnly = false;
+    std::string sameSite;         // "strict" | "lax" | "none" | "" (unspecified)
+};
+
+// Stage an exported cookie jar for `site` on the worker (also stamps the login
+// as verified — the signal the vendor dots / has_login trust). `cb(ok, err)`
+// runs on the GL/UI thread.
+void rpc_session_import(
+    AppState& st, const std::string& site, std::vector<SessionCookie> cookies,
+    std::function<void(bool ok, const std::string& err)> cb);
 
 // Resolve a vendor key → its sign-in URL + per-site cookie cache dir over the
 // `browser_start_url` worker RPC. `cb` runs on the GL/UI thread (RPC drain), so

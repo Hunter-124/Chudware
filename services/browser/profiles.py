@@ -160,6 +160,61 @@ def delete_profile(site: str) -> bool:
     return removed
 
 
+# ---------------------------------------------------------------------------
+# Session-cookie hand-off (GUI CEF browser → Playwright profile).
+#
+# The in-process CEF browser keeps its own Chromium cookie store (different
+# cache layout AND a different OSCrypt key than Playwright's user-data-dir), so
+# raw profile sharing can never work. Instead the GUI exports the cookie jar
+# after a verified sign-in and the worker stages it here as a TRANSIENT sidecar
+# (`<site>.cookies.json`, chmod 600). The next Playwright persistent context
+# opened for the site consumes it via ``context.add_cookies`` — after which the
+# cookies live natively in the Playwright profile and the sidecar is deleted.
+# Unlike the metadata sidecar this file DOES hold secrets; it exists only
+# between "GUI login finished" and "first headless use of the session".
+
+
+def _cookie_sidecar_path(site: str) -> Path:
+    return paths.BROWSER_PROFILES / f"{slug(site)}.cookies.json"
+
+
+def save_session_cookies(site: str, cookies: list[dict[str, Any]]) -> int:
+    """Stage an exported cookie jar (Playwright ``add_cookies`` shape) for
+    ``site``. Returns the number of cookies staged. Overwrites any previous
+    staging — the newest login wins."""
+    p = _cookie_sidecar_path(site)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(list(cookies)), encoding="utf-8")
+    try:
+        p.chmod(0o600)
+    except OSError:
+        pass
+    return len(cookies)
+
+
+def consume_session_cookies(site: str) -> list[dict[str, Any]]:
+    """Read AND DELETE ``site``'s staged cookie jar (empty list when none).
+    Deleting on read keeps the secret transient: once the caller has injected
+    the cookies into a persistent Playwright context they live in the profile
+    and the sidecar has no reason to exist."""
+    p = _cookie_sidecar_path(site)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — a corrupt staging file is just discarded
+        data = []
+    try:
+        p.unlink()
+    except OSError:
+        pass
+    return data if isinstance(data, list) else []
+
+
+def has_pending_session_cookies(site: str) -> bool:
+    return _cookie_sidecar_path(site).exists()
+
+
 def touch_created(site: str) -> None:
     """Stamp ``created_ts`` the first time a profile is seen; a no-op afterwards."""
     meta = load_meta(site)

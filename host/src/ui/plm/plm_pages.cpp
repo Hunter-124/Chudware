@@ -86,20 +86,55 @@ void dimText(const char* fmt, ...) {
 }
 
 // a small labelled count card
+// A bordered, padded stat chip: the count centered up top, the label centered
+// below. Fixed size so a row of them reads as a tidy dashboard band instead of
+// numbers crammed against the left edge.
 void statCard(const char* label, int n, const float* col) {
     const float S = ui::uiScale;
-    ImGui::BeginGroup();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(col[0], col[1], col[2], 1.0f));
+    const ImVec2 sz(98 * S, 58 * S);
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImVec2 p1(p0.x + sz.x, p0.y + sz.y);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(
+        palette.text[0], palette.text[1], palette.text[2], 0.045f)), 8 * S);
+    dl->AddRect(p0, p1, ImGui::GetColorU32(ImVec4(
+        palette.text[0], palette.text[1], palette.text[2], 0.12f)), 8 * S);
     char buf[24]; std::snprintf(buf, sizeof(buf), "%d", n);
-    ImGui::TextUnformatted(buf);
-    ImGui::PopStyleColor();
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-    ImGui::TextUnformatted(label);
-    ImGui::PopStyleColor();
-    ImGui::EndGroup();
-    ImGui::SameLine(0, 26 * S);
+    ImVec2 ns = ImGui::CalcTextSize(buf);
+    dl->AddText(ImVec2(p0.x + (sz.x - ns.x) * 0.5f, p0.y + 11 * S),
+        ImGui::GetColorU32(ImVec4(col[0], col[1], col[2], 1.0f)), buf);
+    ImVec2 ls = ImGui::CalcTextSize(label);
+    dl->AddText(ImVec2(p0.x + (sz.x - ls.x) * 0.5f, p1.y - ls.y - 9 * S),
+        ImGui::GetColorU32(ImVec4(
+            palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f)), label);
+    ImGui::Dummy(sz);
+    ImGui::SameLine(0, 10 * S);
 }
+
+// Shorten an ISO timestamp (2026-07-07T19:54:28Z) to a readable "2026-07-07  19:54".
+std::string plmNiceTime(const std::string& iso) {
+    if (iso.size() < 16 || iso[10] != 'T') return iso;
+    return iso.substr(0, 10) + "  " + iso.substr(11, 5);
+}
+
+// Read-only text the user can select and copy (Ctrl-C / right-click). Styled to
+// look like a plain label — transparent frame, no padding, full-width — but it's
+// a real text field so highlighting and copy/paste work throughout the hub.
+void plmCopyText(const char* id, const std::string& text, const float* col = nullptr) {
+    const float* c = col ? col : palette.text;
+    char buf[1024]; std::snprintf(buf, sizeof(buf), "%s", text.c_str());
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputText(id, buf, sizeof(buf), ImGuiInputTextFlags_ReadOnly);
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(4);
+}
+
+void priorityDot(const std::string& pr);  // defined below; used by Overview too
 
 void plmComingSoon(const char* title, const char* note) {
     plmSectionHeader(title);
@@ -151,11 +186,9 @@ void plmDrawOverviewPage(AppState& st) {
     // quick checkpoint — the basic loop, front and centre
     plmSectionHeader("Save a checkpoint");
     dimText("Record a point in this project's history you can return to.");
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 5 * S));
-    ImGui::SetNextItemWidth(-160 * S);
+    ImGui::SetNextItemWidth(320 * S);
     bool enter = ImGui::InputTextWithHint("##plm_ckpt", "What changed? (optional)",
         H.checkpointMsg, sizeof(H.checkpointMsg), ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::PopStyleVar();
     ImGui::SameLine();
     accentButtonColors();
     bool save = ImGui::Button("Save checkpoint", ImVec2(150 * S, 0)) || enter;
@@ -183,8 +216,8 @@ void plmDrawOverviewPage(AppState& st) {
             plmCardBegin("##act", false);
             std::string headline = !e.message.empty() ? e.message
                                  : (!e.summary.empty() ? e.summary : "(saved)");
-            ImGui::TextWrapped("%s", headline.c_str());
-            dimText("%s  \xc2\xb7  %s", e.author.c_str(), e.authoredAt.c_str());
+            plmCopyText("##acth", headline);
+            dimText("%s  \xc2\xb7  %s", e.author.c_str(), plmNiceTime(e.authoredAt).c_str());
             plmCardEnd();
             ImGui::PopID();
         }
@@ -199,14 +232,8 @@ void plmDrawOverviewPage(AppState& st) {
         for (const auto& t : ov.tasks) {
             ImGui::PushID(t.id.c_str());
             plmCardBegin("##ovt", false);
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
-            ImGui::AlignTextToFramePadding();
-            ImGui::Text("[%s]", t.priority.empty() ? "p2" : t.priority.c_str());
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextWrapped("%s", t.title.c_str());
+            plmCopyText("##ovtt", t.title);
+            priorityDot(t.priority);  // bottom-right corner, same as the board
             plmCardEnd();
             ImGui::PopID();
         }
@@ -387,7 +414,7 @@ void drawFilesTab(AppState& st) {
     }
     // Sort control, pinned to the right of the filter row.
     static const char* kSort[] = {
-        "Name (A\xe2\x86\x92Z)", "Type", "Revision", "Status", "Unsaved first",
+        "Name (A-Z)", "Type", "Revision", "Status", "Unsaved first",
     };
     const float sortW = 130 * S;
     ImGui::SameLine(ImGui::GetContentRegionMax().x - sortW);
@@ -440,11 +467,16 @@ void drawFilesTab(AppState& st) {
         else ImGui::SameLine(0, 12 * S);
         plmLifecycleBadge(it.lifecycle, !it.rev.empty() ? it.rev : it.workingRev);
         if (it.dirty) {
+            // filled dot via the draw-list — the ● glyph isn't in the font atlas.
             ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                ImVec4(palette.statusWarn[0], palette.statusWarn[1], palette.statusWarn[2], 1.0f));
-            ImGui::TextUnformatted("\xe2\x97\x8f");  // ● unsaved dot
-            ImGui::PopStyleColor();
+            const float r = 4.0f * S;
+            ImVec2 o = ImGui::GetCursorScreenPos();
+            ImGui::Dummy(ImVec2(r * 2, ImGui::GetTextLineHeight()));
+            ImGui::GetWindowDrawList()->AddCircleFilled(
+                ImVec2(o.x + r, o.y + ImGui::GetTextLineHeight() * 0.5f), r,
+                ImGui::GetColorU32(ImVec4(palette.statusWarn[0], palette.statusWarn[1],
+                                          palette.statusWarn[2], 1.0f)), 16);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("unsaved changes");
         }
 
         if (sel) {
@@ -586,8 +618,8 @@ void plmDrawHistoryPage(AppState& st) {
         }
         std::string headline = !e.message.empty() ? e.message
                              : (!e.summary.empty() ? e.summary : "(saved)");
-        ImGui::TextWrapped("%s", headline.c_str());
-        dimText("%s  \xc2\xb7  %s", e.author.c_str(), e.authoredAt.c_str());
+        plmCopyText("##hh", headline);
+        dimText("%s  \xc2\xb7  %s", e.author.c_str(), plmNiceTime(e.authoredAt).c_str());
         if (sel) {
             ImGui::PushStyleColor(ImGuiCol_Button,
                 ImVec4(palette.button[0], palette.button[1], palette.button[2], 0.8f));
@@ -1019,11 +1051,15 @@ void priorityDot(const std::string& pr) {
     if (p == "p0")      { c = palette.statusErr;  }
     else if (p == "p1") { c = palette.statusWarn; }
     else if (p == "p3") { c = palette.textDisabled; a = 0.7f; }
-    ImGui::SameLine(ImGui::GetContentRegionMax().x - 12 * S);
-    ImGui::AlignTextToFramePadding();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(c[0], c[1], c[2], a));
-    ImGui::TextUnformatted("\xe2\x97\x8f");  // ●
-    ImGui::PopStyleColor();
+    // Draw a real filled circle — the ● glyph isn't in the font atlas (rendered
+    // as a '?'), so paint it directly on the draw-list.
+    const float r = 4.5f * S;
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - 14 * S);
+    ImVec2 o = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(r * 2, ImGui::GetTextLineHeight()));
+    ImVec2 ctr(o.x + r, o.y + ImGui::GetTextLineHeight() * 0.5f);
+    ImGui::GetWindowDrawList()->AddCircleFilled(
+        ctr, r, ImGui::GetColorU32(ImVec4(c[0], c[1], c[2], a)), 16);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("priority %s", p.c_str());
 }
 
@@ -1064,8 +1100,7 @@ static void drawMilestoneRow(AppState& st, const PlmMilestoneRow& m) {
         ImGui::TextUnformatted(done ? "Done" : "Open");
         ImGui::PopStyleColor();
         ImGui::SameLine();
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextWrapped("%s", m.title.c_str());
+        plmCopyText("##mst", m.title);
         if (!m.due.empty()) dimText("due %s", m.due.c_str());
         // action row
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
@@ -1106,12 +1141,9 @@ static void drawIssueRow(AppState& st, const PlmIssueRow& is) {
     ImGui::PopStyleColor();
     ImGui::SameLine();
     if (closed) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(palette.textDisabled[0],
-            palette.textDisabled[1], palette.textDisabled[2], 1.0f));
-        ImGui::TextWrapped("(closed) %s", is.title.c_str());
-        ImGui::PopStyleColor();
+        plmCopyText("##ist", "(closed) " + is.title, palette.textDisabled);
     } else {
-        ImGui::TextWrapped("%s", is.title.c_str());
+        plmCopyText("##ist", is.title);
     }
     ImGui::Spacing();
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4 * S, 1 * S));
@@ -1205,18 +1237,36 @@ void plmDrawPlanningPage(AppState& st) {
     ImGui::Dummy(ImVec2(0, 4 * S));
     ImGui::Separator();
 
+    // ---- Team & Sync (placeholder until remotes/locks land) — sits between the
+    //      Issues/Milestones band and the board, per Hunter's layout. ------------
+    plmSectionHeader("Team & Sync");
+    dimText("Share via a shared folder or your own server. Sync brings changes "
+            "together without ever merging or losing work — coming in a later update.");
+    ImGui::BeginDisabled(true);
+    ImGui::Button("Connect a shared folder\xe2\x80\xa6");
+    ImGui::SameLine();
+    ImGui::Button("Sync now");
+    ImGui::EndDisabled();
+    ImGui::Dummy(ImVec2(0, 4 * S));
+    ImGui::Separator();
+
     // ---- Task board ------------------------------------------------------------
     plmSectionHeader("Board");
-    // add a task
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6 * S, 4 * S));
-    ImGui::SetNextItemWidth(-120 * S);
+    // add a task: priority picker, then a compact left-aligned title box that
+    // matches the Add-task button height (no custom frame padding on either).
+    static int s_newTaskPri = 2;                       // default p2
+    static const char* kPri[] = {"p0", "p1", "p2", "p3"};
+    ImGui::SetNextItemWidth(62 * S);
+    ImGui::Combo("##ntpri", &s_newTaskPri, kPri, IM_ARRAYSIZE(kPri));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(300 * S);
     bool enter = ImGui::InputTextWithHint("##newtask", "new task title\xe2\x80\xa6",
         H.newTaskTitle, sizeof(H.newTaskTitle), ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::PopStyleVar();
     ImGui::SameLine();
     accentButtonColors();
     if ((ImGui::Button("Add task", ImVec2(110 * S, 0)) || enter) && H.newTaskTitle[0]) {
-        planCall(st, "create", "task", {{"title", H.newTaskTitle}});
+        planCall(st, "create", "task",
+                 {{"title", H.newTaskTitle}, {"priority", kPri[s_newTaskPri]}});
         H.newTaskTitle[0] = '\0';
     }
     ImGui::PopStyleColor(2);
@@ -1233,7 +1283,7 @@ void plmDrawPlanningPage(AppState& st) {
     static const char* kPipe[] = {"todo", "doing", "done"};  // ordered lane; "blocked" is aside
     const float gap  = 8 * S;
     float colW = (ImGui::GetContentRegionAvail().x - gap * 3) / 4.0f;
-    float colH = ImGui::GetContentRegionAvail().y - 150 * S;  // reserve room for Team & Sync
+    float colH = ImGui::GetContentRegionAvail().y - 8 * S;  // fill to the page bottom
     if (colH < 240 * S) colH = 240 * S;
 
     for (int ci = 0; ci < 4; ++ci) {
@@ -1261,7 +1311,7 @@ void plmDrawPlanningPage(AppState& st) {
             ImGui::PushID(t.id.c_str());
             bool sel = (s_selTask == t.id);
             plmCardBegin("##task", sel, 8.0f, 5.0f);
-            ImGui::TextWrapped("%s", t.title.c_str());
+            plmCopyText("##tt", t.title);
             if (!t.assignee.empty()) dimText("@%s", t.assignee.c_str());
 
             // Movement controls — always visible, one click, no select-first step.
@@ -1315,18 +1365,6 @@ void plmDrawPlanningPage(AppState& st) {
         ImGui::PopID();
         ImGui::EndGroup();
     }
-
-    // ---- Team & Sync (placeholder until remotes/locks land) --------------------
-    ImGui::Dummy(ImVec2(0, 6 * S));
-    ImGui::Separator();
-    plmSectionHeader("Team & Sync");
-    dimText("Share via a shared folder or your own server. Sync brings changes "
-            "together without ever merging or losing work — coming in a later update.");
-    ImGui::BeginDisabled(true);
-    ImGui::Button("Connect a shared folder\xe2\x80\xa6");
-    ImGui::SameLine();
-    ImGui::Button("Sync now");
-    ImGui::EndDisabled();
 }
 
 // ---- Issues -------------------------------------------------------------------

@@ -1,0 +1,6 @@
+{
+ "from": "opus-cef",
+ "to": "broadcast",
+ "text": "[opus-cef] Heads-up for the parts-hub/T-X3 owner: engine_oracle/parts_hub/test_x3_browser_catalog.py::test_zero_profile_search_contributes_nothing was failing in the deterministic suite. Two reasons: (1) it's actually a LIVE-network test (~2min real Amazon round-trip) that wasn't marked \u2014 I added @pytest.mark.live so it skips by default like the other live-adapter tests. (2) Its `catalog_results == []` assertion is now OUTDATED: anonymous public-catalog browsing is allowed AND I fixed browser_fetch to wait for the SPA DOM to render (session.py DEFAULT_RENDER_SETTLE_S) before snapshotting \u2014 so Amazon now returns filler/suggestion cards even for a nonsense query. Please redefine the intended behavior (likely \"no ask_user noise / no error\" rather than \"zero results\") and re-enable. Details in the test docstring.",
+ "ts": "2026-07-07T17:34:17Z"
+}

@@ -207,6 +207,19 @@ except Exception as _ecad_import_err:  # noqa: BLE001
         "engine.ecad.rpc unavailable — ecad_* methods not registered: %s", _ecad_import_err)
 # === end ECAD ===
 
+# === EM simulation family (T-SIM11) — em_status / em_eigenmode / em_driven / em_timedomain ===
+# Full-wave electromagnetics over the pluggable adapter layer (engine.sim.em): openEMS FDTD
+# when installed, builtin FDFD eigensolver + analytic uniform-guide model always. GPL solver
+# modules are imported lazily inside their adapter only (contracts/license_debt.md).
+try:
+    from engine.sim.em.worker_rpc import WORKER_METHODS as _EM_METHODS  # noqa: E402
+    _METHODS.update(_EM_METHODS)
+except Exception as _em_import_err:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger("ai-cad.worker").warning(
+        "engine.sim.em unavailable — em_* methods not registered: %s", _em_import_err)
+# === end EM simulation ===
+
 # === Deliverables preview seam (T-F16, Pillar 15) — render_document / list_artifacts ===
 # Reaches the deliverables service (contract deliverables/1 §5.4/§5.5) over the same worker seam
 # the ImGui GUI uses for every other service, so the preview pane + artifact cards fetch previews

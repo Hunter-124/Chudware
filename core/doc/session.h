@@ -497,4 +497,37 @@ nlohmann::json doc_sketch_project_entities(const std::string& doc_id,
                                            const std::string& sketch_fid,
                                            const nlohmann::json& refs);
 
+// ---- Cross-document dependency registry (feat(xdoc)) -----------------------
+// Process-global lightweight registry: maps source_doc_id → set of dependents.
+// Each dependent records its own doc_id + dependency kind + the source revision
+// at the time it was registered (stale when source.revision > linked_revision).
+//
+// Kinds (string, open vocabulary):
+//   "cam"      — a CAM job doc that extracted geometry from this part
+//   "sim"      — a sim study linked to this part
+//   "drawing"  — a drawing view referencing this part
+//
+// doc_dep_register: upsert a dependency link. Idempotent: re-registering the same
+//   (source, dependent, kind) triple with a newer linked_revision updates the
+//   baseline. Returns {"registered": true}.
+//
+// doc_dep_query: enumerate all dependents of source_doc_id that are currently
+//   stale (source.revision > linked_revision). Returns:
+//   {"source_revision": N, "dependents": [{dep_doc_id, kind, linked_revision, stale}]}
+//   `kind` empty → all kinds. Read-only; never blocks.
+//
+// doc_dep_notify: internal — called automatically after every successful rebuild
+//   (doc_apply_ops, doc_undo, doc_redo). Stamps every registered dependent with a
+//   stale flag so the next doc_dep_query shows it. Returns {"notified": count}.
+//   Exposed here for testing and for the libaicad C ABI (cam_panel calls it
+//   indirectly via the pull-model doc_list_open polling, but explicit notify gives
+//   sub-frame latency for in-process callers).
+nlohmann::json doc_dep_register(const std::string& source_doc_id,
+                                const std::string& dep_doc_id,
+                                const std::string& kind,
+                                long linked_revision);
+nlohmann::json doc_dep_query(const std::string& source_doc_id, const std::string& kind);
+nlohmann::json doc_dep_notify(const std::string& source_doc_id, long new_revision);
+nlohmann::json doc_dep_unregister(const std::string& dep_doc_id, const std::string& kind);
+
 }  // namespace aicad::doc

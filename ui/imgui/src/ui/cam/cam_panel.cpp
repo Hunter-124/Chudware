@@ -122,6 +122,18 @@ bool exportPartStep(app::AppState& st) {
     g.partStale = false;
     g.staleToastShown = false;
     g.lastPolledPartRev = g.sourcePartRevision;
+    // Register the cross-doc dependency: CAM job depends on this part at this revision.
+    // This persists the link in core/doc's dep registry so doc_dep_notify fires whenever
+    // the part rebuilds (feat(xdoc) in-process stale notification path).
+    if (!g.docId.empty() && g.sourcePartRevision >= 0) {
+        nlohmann::json dr;
+        camCall(st, "doc_dep_register", {
+            {"source_doc_id",   g.sourcePartDocId},
+            {"dep_doc_id",      g.docId},
+            {"kind",            "cam"},
+            {"linked_revision", g.sourcePartRevision},
+        }, dr);
+    }
     return true;
 }
 
@@ -619,11 +631,30 @@ bool camCheckPartStale(app::AppState& st) {
     if (--g.pollCountdown > 0) return g.partStale;
     g.pollCountdown = 60;
 
-    // Ask the worker for the current open sessions (cheap read — no geometry).
+    // Fast path: use doc_dep_query which reads the stale flag set by dep_notify_unlocked
+    // inside warm_and_respond on every part rebuild. Sub-frame latency for in-process use.
+    nlohmann::json dq;
+    if (camCall(st, "doc_dep_query", {{"source_doc_id", g.sourcePartDocId}, {"kind", "cam"}}, dq)
+        && dq.contains("dependents") && dq["dependents"].is_array()) {
+        for (const auto& d : dq["dependents"]) {
+            if (d.value("dep_doc_id", std::string()) == g.docId) {
+                bool stale = d.value("stale", false);
+                if (stale && !g.partStale) {
+                    g.partStale = true;
+                    g.staleToastShown = false;
+                }
+                long srcRev = dq.value("source_revision", (long)-1);
+                if (srcRev >= 0) g.lastPolledPartRev = srcRev;
+                return g.partStale;
+            }
+        }
+    }
+
+    // Fallback: poll doc_list_open when the dep registry entry is absent (e.g. the
+    // job was loaded via camLoadJob without a fresh extract).
     nlohmann::json r;
     if (!camCall(st, "doc_list_open", nlohmann::json::object(), r)) return g.partStale;
     if (!r.contains("docs") || !r["docs"].is_array()) return g.partStale;
-
     for (const auto& d : r["docs"]) {
         if (d.value("doc_id", std::string()) == g.sourcePartDocId) {
             long rev = d.value("revision", (long)-1);

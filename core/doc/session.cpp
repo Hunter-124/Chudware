@@ -2456,6 +2456,9 @@ json warm_and_respond(Session& s, CompileResult r, const json& id_map, bool with
     json resp = ops_response(s, r, id_map, with_tess);
     s.compiled = std::make_shared<CompileResult>(std::move(r));
     s.compiled_rev = s.revision;
+    // Cross-doc dependency notify (feat(xdoc)): stamp dependents stale when this doc
+    // rebuilds. Called unlocked-variant since DocLock is already held by the caller.
+    dep_notify_unlocked(s.doc_id, s.revision);
     return resp;
 }
 
@@ -9684,6 +9687,121 @@ json doc_sketch_project_entities(const std::string& doc_id, const std::string& s
     res["ok"] = true;
     res["plane_frame"] = plane_frame(plane);
     return res;
+}
+
+// ============================================================================
+// Cross-document dependency registry (feat(xdoc))
+// ============================================================================
+//
+// Process-global: lives for the lifetime of the loaded libaicad, reset when
+// all sessions are closed. Thread-safe: protected by the existing doc mutex
+// (DocLock) — same mutex serialises all doc_* calls so no extra lock needed.
+//
+// Schema:
+//   g_dep_registry[source_doc_id] = vector<DepEntry>
+// where each DepEntry is one (dep_doc_id, kind, linked_revision, stale) tuple.
+// Entries survive as long as the process lives (we do NOT auto-prune on session
+// close so a CAM job can track staleness even while only the part is open).
+
+namespace {
+
+struct DepEntry {
+    std::string dep_doc_id;
+    std::string kind;           // "cam" | "sim" | "drawing" | user-defined
+    long linked_revision = -1;  // source revision at the time of last register
+    bool stale = false;         // true when source has rebuilt past linked_revision
+};
+
+// Outer key: source_doc_id. Value: all dependents registered against it.
+static std::map<std::string, std::vector<DepEntry>> g_dep_registry;
+
+}  // namespace
+
+json doc_dep_register(const std::string& source_doc_id,
+                      const std::string& dep_doc_id,
+                      const std::string& kind,
+                      long linked_revision) {
+    DocLock lk;
+    auto& entries = g_dep_registry[source_doc_id];
+    // Upsert: find existing entry for (dep_doc_id, kind) and update revision.
+    for (auto& e : entries) {
+        if (e.dep_doc_id == dep_doc_id && e.kind == kind) {
+            e.linked_revision = linked_revision;
+            e.stale = false;  // fresh link — no longer stale
+            return json{{"registered", true}, {"updated", true}};
+        }
+    }
+    entries.push_back(DepEntry{dep_doc_id, kind, linked_revision, false});
+    return json{{"registered", true}, {"updated", false}};
+}
+
+json doc_dep_query(const std::string& source_doc_id, const std::string& kind_filter) {
+    DocLock lk;
+    // Look up the source session to get its current revision (if open).
+    long src_rev = -1;
+    {
+        auto it = g_sessions.find(source_doc_id);
+        if (it != g_sessions.end()) src_rev = it->second->revision;
+    }
+
+    json deps = json::array();
+    auto it = g_dep_registry.find(source_doc_id);
+    if (it != g_dep_registry.end()) {
+        for (const auto& e : it->second) {
+            if (!kind_filter.empty() && e.kind != kind_filter) continue;
+            bool stale = e.stale;
+            // Also check live revision if the source is open.
+            if (!stale && src_rev >= 0 && e.linked_revision >= 0 && src_rev > e.linked_revision)
+                stale = true;
+            deps.push_back(json{
+                {"dep_doc_id",       e.dep_doc_id},
+                {"kind",             e.kind},
+                {"linked_revision",  e.linked_revision},
+                {"stale",            stale},
+            });
+        }
+    }
+    return json{{"source_doc_id", source_doc_id},
+                {"source_revision", src_rev},
+                {"dependents", deps}};
+}
+
+// Internal: mark dependents stale WITHOUT acquiring DocLock.
+// Called from warm_and_respond (which already holds the lock).
+static int dep_notify_unlocked(const std::string& source_doc_id, long new_revision) {
+    int notified = 0;
+    auto it = g_dep_registry.find(source_doc_id);
+    if (it != g_dep_registry.end()) {
+        for (auto& e : it->second) {
+            if (e.linked_revision >= 0 && new_revision > e.linked_revision) {
+                e.stale = true;
+                ++notified;
+            }
+        }
+    }
+    return notified;
+}
+
+json doc_dep_notify(const std::string& source_doc_id, long new_revision) {
+    DocLock lk;
+    int notified = dep_notify_unlocked(source_doc_id, new_revision);
+    return json{{"notified", notified}, {"source_revision", new_revision}};
+}
+
+json doc_dep_unregister(const std::string& dep_doc_id, const std::string& kind) {
+    DocLock lk;
+    int removed = 0;
+    for (auto& kv : g_dep_registry) {
+        auto& vec = kv.second;
+        auto before = vec.size();
+        vec.erase(std::remove_if(vec.begin(), vec.end(),
+            [&](const DepEntry& e) {
+                return e.dep_doc_id == dep_doc_id &&
+                       (kind.empty() || e.kind == kind);
+            }), vec.end());
+        removed += (int)(before - vec.size());
+    }
+    return json{{"unregistered", removed}};
 }
 
 }  // namespace aicad::doc

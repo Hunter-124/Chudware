@@ -3237,6 +3237,30 @@ static int aicad_call_inner(const char* method, const char* params_json, char** 
                 return emit(aicad::cam::cam_save(params.value("doc_id", std::string()),
                                                  params.value("path", std::string())), out_json, 0);
             if (m == "cam_open") return emit(aicad::cam::cam_open(params.value("path", std::string())), out_json, 0);
+            // Cross-doc dependency registry (feat(xdoc)).
+            if (m == "doc_dep_register")
+                return emit(aicad::doc::doc_dep_register(
+                                params.value("source_doc_id", std::string()),
+                                params.value("dep_doc_id", std::string()),
+                                params.value("kind", std::string()),
+                                params.value("linked_revision", (long)-1)),
+                            out_json, 0);
+            if (m == "doc_dep_query")
+                return emit(aicad::doc::doc_dep_query(
+                                params.value("source_doc_id", std::string()),
+                                params.value("kind", std::string())),
+                            out_json, 0);
+            if (m == "doc_dep_notify")
+                return emit(aicad::doc::doc_dep_notify(
+                                params.value("source_doc_id", std::string()),
+                                params.value("new_revision", (long)-1)),
+                            out_json, 0);
+            if (m == "doc_dep_unregister")
+                return emit(aicad::doc::doc_dep_unregister(
+                                params.value("dep_doc_id", std::string()),
+                                params.value("kind", std::string())),
+                            out_json, 0);
+
             // OCCT extraction adapter: live B-rep part -> CAM geometry inputs.
             if (m == "cam_extract") return emit(aicad::cam::cam_extract(params), out_json, 0);
             // One-shot: build a complete machining job + G-code from the current part

@@ -93,6 +93,30 @@ def converters_status() -> dict:
     }
 
 
+# RE-ANCHOR(reveng): Reverse Engineering download-on-demand descriptors (RE-06).
+# The heavy RE toolchain (COLMAP/OpenMVS/Brush binaries, TripoSR/TRELLIS/VGGT
+# weights) is NEVER part of the base runtime venv above — it is provisioned on
+# demand or discovered from user-provided binaries. The SHA-pinned descriptor
+# table + offline readiness probe live in engine_oracle/vision/reveng_provision.py
+# (kept there so services/mcp/reveng_tools.reveng_status() can consume it without
+# importing the installer). OpenMVS is AGPL -> subprocess-only via OPENMVS_BIN,
+# never bundled/linked/auto-downloaded. This installer-facing wrapper reports
+# availability for --check; it installs nothing and never touches the network.
+def reveng_provisioning_status() -> dict:
+    """Offline readiness of the Reverse Engineering toolchain (contract §8.1).
+
+    Delegates to engine_oracle.vision.reveng_provision.reveng_status(); returns a
+    contract-shaped ``{ok, missing, ...}`` even if that module is unavailable, so
+    the installer --check never raises on a partial tree.
+    """
+    try:
+        from engine_oracle.vision import reveng_provision
+    except Exception as exc:  # noqa: BLE001 - optional subsystem, never fatal
+        return {"ok": False, "reason": "reveng_provision unavailable",
+                "hint": str(exc), "missing": [], "capabilities": {}}
+    return reveng_provision.reveng_status()
+
+
 def is_ready() -> bool:
     if not STAMP.exists():
         return False
@@ -157,6 +181,15 @@ def ensure_runtime(base_python: str | None = None, wheelhouse: Path | None = Non
                    "--find-links", str(wheelhouse), "--prefer-binary",
                    "-r", str(REQUIREMENTS)]
     subprocess.run(install, check=True)
+
+    # Install Playwright's Chromium browser binary (separate from the pip package).
+    # The browser is ~300 MB and needs network; a failure here is non-fatal — every
+    # Playwright call in services/browser/ degrades gracefully with a
+    # "playwright not installed" error envelope.
+    subprocess.run(
+        [str(py), "-m", "playwright", "install", "chromium", "--with-deps"],
+        check=False,
+    )
 
     if not _imports_ok(py):
         return {"status": "error", "reason": "imports failed after install"}

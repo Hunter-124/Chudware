@@ -2236,59 +2236,79 @@ float PropertyManager::drawChromeButtons(AppState& st, float rightX, float cente
     if (!active_ || !form_) return 0.0f;
     const float S   = ui::uiScale;
     const auto& pal = ui::palette;
-    const float btnW     = 40.0f * S;    // wider than the old 26dp square (Erik: "make them wider")
-    const float btnH     = 26.0f * S;
-    const float gap      = 6.0f * S;
-    const float icSz     = 18.0f * S;
-    const float clusterW = btnW * 2.0f + gap;
+    // TASK C: larger, SQUARE, easy-to-hit targets. The old cluster was a 40x26 non-square pair using
+    // atlas sprites; these are generous 34dp squares — the biggest square that still fits inside the
+    // ~42dp left-pane header band (rowPad 6 + btn 30 + rowPad 6) without spilling into the tabs or the
+    // separator below. Square + bigger = an obvious click target, per the brief.
+    const float btn      = 34.0f * S;    // square edge
+    const float gap      = 8.0f * S;
+    const float clusterW = btn * 2.0f + gap;
     const float x0       = rightX - clusterW;
-    const float y0       = centerY - btnH * 0.5f;
+    const float y0       = centerY - btn * 0.5f;
 
     // Draw at absolute screen positions but leave the caller's layout cursor untouched.
     const ImVec2 savedCur = ImGui::GetCursorScreenPos();
     ImGui::PushID("pm_chrome_okcancel");
     bool ok = false, cancel = false;
 
+    // TASK B: crisp, programmatic glyphs drawn straight onto the button rect via ImDrawList — no more
+    // muddy atlas sprite, and no atlas/POST_BUILD staging hazard. A clean two-segment check and a
+    // two-stroke X, both centred, thickness scaled with the button so they read at any DPI.
+    auto drawCheck = [&](ImDrawList* dl, const ImVec2& c, float half, ImU32 col, float th) {
+        // Classic checkmark: short down-stroke from upper-left to a low pivot, long up-stroke to the
+        // upper-right. Proportions tuned to look balanced inside a square.
+        ImVec2 p0(c.x - half * 0.72f, c.y + half * 0.05f);
+        ImVec2 p1(c.x - half * 0.18f, c.y + half * 0.58f);
+        ImVec2 p2(c.x + half * 0.74f, c.y - half * 0.55f);
+        dl->PathLineTo(p0); dl->PathLineTo(p1); dl->PathLineTo(p2);
+        dl->PathStroke(col, ImDrawFlags_None, th);
+        // Round the corners/ends so the crook reads clean, not chiselled.
+        dl->AddCircleFilled(p0, th * 0.5f, col);
+        dl->AddCircleFilled(p1, th * 0.5f, col);
+        dl->AddCircleFilled(p2, th * 0.5f, col);
+    };
+    auto drawX = [&](ImDrawList* dl, const ImVec2& c, float half, ImU32 col, float th) {
+        float r = half * 0.62f;
+        dl->AddLine(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), col, th);
+        dl->AddLine(ImVec2(c.x + r, c.y - r), ImVec2(c.x - r, c.y + r), col, th);
+    };
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
     // Confirm (OK) — palette statusOk role (adapts to the active theme; no baked greens).
     ImGui::SetCursorScreenPos(ImVec2(x0, y0));
     ImGui::PushStyleColor(ImGuiCol_Button,
-        ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 0.90f));
+        ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 0.92f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
         ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 1.0f));
-    {
-        IconUV okIc = getIcon("ok_check", 20);
-        if (okIc.valid) {
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                ImVec2((btnW - icSz) * 0.5f, (btnH - icSz) * 0.5f));
-            ok = ImGui::ImageButton("##pm_ok", okIc.texId, ImVec2(icSz, icSz), okIc.uv0, okIc.uv1);
-            ImGui::PopStyleVar();
-        } else {
-            ok = ImGui::Button("OK##pm", ImVec2(btnW, btnH));
-        }
-    }
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+        ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 1.0f));
+    ok = ImGui::Button("##pm_ok", ImVec2(btn, btn));
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("OK (Enter)");
-    ImGui::PopStyleColor(2);
+    {
+        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+        ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
+        // White glyph reads on the green fill in both themes.
+        drawCheck(dl, c, btn * 0.5f, IM_COL32(255, 255, 255, 255), 3.0f * S);
+    }
+    ImGui::PopStyleColor(3);
 
     // Cancel — neutral button fill, error-red on hover.
-    ImGui::SetCursorScreenPos(ImVec2(x0 + btnW + gap, y0));
+    ImGui::SetCursorScreenPos(ImVec2(x0 + btn + gap, y0));
     ImGui::PushStyleColor(ImGuiCol_Button,
-        ImVec4(pal.button[0], pal.button[1], pal.button[2], 0.90f));
+        ImVec4(pal.button[0], pal.button[1], pal.button[2], 0.92f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
         ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], pal.statusErr[3]));
-    {
-        IconUV cancelIc = getIcon("cancel_x", 20);
-        if (cancelIc.valid) {
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                ImVec2((btnW - icSz) * 0.5f, (btnH - icSz) * 0.5f));
-            cancel = ImGui::ImageButton("##pm_cancel", cancelIc.texId, ImVec2(icSz, icSz),
-                                        cancelIc.uv0, cancelIc.uv1);
-            ImGui::PopStyleVar();
-        } else {
-            cancel = ImGui::Button("X##pm", ImVec2(btnW, btnH));
-        }
-    }
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+        ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], pal.statusErr[3]));
+    cancel = ImGui::Button("##pm_cancel", ImVec2(btn, btn));
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Cancel (Esc)");
-    ImGui::PopStyleColor(2);
+    {
+        ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+        ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
+        drawX(dl, c, btn * 0.5f, IM_COL32(235, 235, 235, 255), 3.0f * S);
+    }
+    ImGui::PopStyleColor(3);
 
     ImGui::PopID();
     ImGui::SetCursorScreenPos(savedCur);   // restore the caller's layout flow

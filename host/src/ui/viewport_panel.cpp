@@ -678,6 +678,69 @@ static bool featureAnchor(AppState& st, const std::string& fid, float out[3], fl
     return false;
 }
 
+// TASK A: constrain + orient the extrude (and any planar-cap) DEPTH handle to the real geometry.
+// dimWorldDir() only knows a hardcoded axis map (depth -> world +Z), so for a sketch on any plane
+// other than the top the depth arrow pointed the WRONG way and, anchored at the AABB volume-centre,
+// floated inside the solid instead of sitting on the extruded surface. Here we recover the true
+// extrude axis + a point ON the extruded cap from cached geometry (populated for ALL faces at mesh
+// load, not pick-gated), so the handle is anchored to the surface being pulled and points along the
+// active extrusion direction — flipping when "Reverse direction" (params.flip) is toggled.
+//
+// Method: among the feature's owned faces, find the most anti-parallel normal pair (the two extrude
+// caps are parallel to the sketch plane, so their normals are ~opposite). That pair's shared axis IS
+// the sketch-plane normal — derived from geometry, correct for ANY plane, no hardcoded axis. Returns
+// false (caller keeps the old behaviour, no regression) when the caps can't be cleanly identified
+// (dress-up feature, degenerate/curved caps, symmetric mid-plane where no single far cap dominates).
+static bool extrudeAxisHandle(AppState& st, const std::string& fid, bool flip,
+                              Vec3& axisOut, float anchorOut[3]) {
+    const auto& om = st.docMirror.ownerMap();
+    auto oit = om.find(fid);
+    if (oit == om.end()) return false;
+    // Collect cached (normal, centroid) for every owned face.
+    struct FC { Vec3 n; Vec3 c; };
+    std::vector<FC> faces;
+    faces.reserve(oit->second.faces.size());
+    for (const auto& bf : oit->second.faces) {
+        uint64_t key = ((uint64_t)bf.first << 32) | (uint64_t)bf.second;
+        auto it = st.faceNormalCache.find(key);
+        if (it == st.faceNormalCache.end()) continue;
+        const auto& v = it->second;  // {nx,ny,nz, cx,cy,cz}
+        Vec3 n(v[0], v[1], v[2]);
+        float nl = std::sqrt(n.x*n.x + n.y*n.y + n.z*n.z);
+        if (nl < 1e-6f) continue;
+        faces.push_back({Vec3(n.x/nl, n.y/nl, n.z/nl), Vec3(v[3], v[4], v[5])});
+    }
+    if (faces.size() < 2) return false;
+    // Find the most anti-parallel face pair (the extrude caps): minimise dot(ni, nj).
+    int bi = -1, bj = -1; float bestDot = 1.0f;
+    for (size_t i = 0; i < faces.size(); ++i)
+        for (size_t j = i + 1; j < faces.size(); ++j) {
+            float d = dot(faces[i].n, faces[j].n);
+            if (d < bestDot) { bestDot = d; bi = (int)i; bj = (int)j; }
+        }
+    // Require a genuinely opposed pair — parallel caps read as dot ~ -1. A loose threshold keeps
+    // slightly-tessellated caps while rejecting features with no opposed planar faces.
+    if (bi < 0 || bestDot > -0.85f) return false;
+    // The extrude axis is the (unsigned) shared normal; use cap bi's outward normal as +axis.
+    Vec3 axis = faces[bi].n;
+    // Anchor on the cap that sits along the ACTIVE direction. Direction-1 (no flip) grows toward the
+    // cap whose centroid is further along +axis; flip picks the opposite cap. This keeps the handle
+    // on the moving/extruded surface rather than the fixed sketch cap.
+    float pi = dot(faces[bi].c, axis), pj = dot(faces[bj].c, axis);
+    const FC& farCap = (pi >= pj) ? faces[bi] : faces[bj];
+    const FC& nearCap = (pi >= pj) ? faces[bj] : faces[bi];
+    // Orient +axis to point OUT of the body (from the near cap toward the far cap) so the arrow's
+    // primary tip reads as "grow the extrusion". flip reverses that, matching params.flip.
+    Vec3 growDir = farCap.c - nearCap.c;
+    if (dot(growDir, axis) < 0.0f) axis = Vec3(-axis.x, -axis.y, -axis.z);
+    if (flip) axis = Vec3(-axis.x, -axis.y, -axis.z);
+    // Anchor on the cap the active direction points toward (the surface being pulled).
+    const FC& anchorCap = flip ? nearCap : farCap;
+    axisOut = axis;
+    anchorOut[0] = anchorCap.c.x; anchorOut[1] = anchorCap.c.y; anchorOut[2] = anchorCap.c.z;
+    return true;
+}
+
 // Build the draggable-dimension list for the selected feature, reusing the PM-form field table to
 // learn which params are dims and their labels/units. Skips greyed/conditional-off and expr-bound
 // dims, and any dim whose value the engine table drives (omitWhenDisabled while disabled). Returns
@@ -746,7 +809,23 @@ static std::vector<DimCandidate> dimCandidates(AppState& st, const std::string& 
         c.rangeMin = fd.dimMin;
         c.rangeMax = fd.dimMax;
         c.dirW = dimWorldDir(fd.key);
-        if (hasAnchor) {
+        // TASK A: the primary extrude/planar depth handle is constrained to the extruded surface and
+        // oriented along the real extrusion axis (recovered from cached cap geometry), honouring the
+        // "Reverse direction" flag. This replaces the hardcoded dimWorldDir()+AABB-centre placement
+        // that floated inside the solid and pointed along world +Z regardless of the sketch plane.
+        bool extrudeAnchored = false;
+        if (!isAngle && (c.param == "depth")) {
+            bool flip = params.value("flip", false);
+            Vec3 axis; float capAnchor[3];
+            if (extrudeAxisHandle(st, fid, flip, axis, capAnchor)) {
+                c.dirW = axis;
+                c.anchor[0] = capAnchor[0];
+                c.anchor[1] = capAnchor[1];
+                c.anchor[2] = capAnchor[2];
+                extrudeAnchored = true;
+            }
+        }
+        if (!extrudeAnchored && hasAnchor) {
             // Spread the handles around the anchor so chips/arrows don't stack: nudge each one a
             // little further out along its own measured axis (or +Z for angles).
             Vec3 d = isAngle ? Vec3(0, 0, 1) : c.dirW;

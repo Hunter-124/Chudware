@@ -1744,6 +1744,8 @@ void SimManager::clearResultOverlay(AppState& st) {
     // The overlay is no longer on the renderer; syncResultView re-applies it if Results is still up.
     resultShown_ = false;
     shownStudyId_.clear();
+    // Release cached motion tessellation (populated in runMotion).
+    motionDocMesh_ = render::DocMesh{};
 }
 
 void SimManager::restoreModelMesh(AppState& st) {
@@ -1771,6 +1773,19 @@ void SimManager::syncResultView(AppState& st) {
     // up. Any other focus (different sub-node, different study, different left-pane tab) restores the
     // editable model so the user isn't stuck on the (unpickable) FEA result mesh.
     const bool valid = sel_ >= 0 && sel_ < (int)studies_.size();
+
+    // Motion studies manage the viewport via applyMotionFrame (setMeshes); they don't use
+    // the overlay path and must not trigger restoreModelMesh while their Results node is active.
+    const bool motionActive = valid && studies_[sel_].type == StudyType::Motion &&
+                              studies_[sel_].motionHasResult &&
+                              st.leftPaneTab == AppState::LP_Simulation &&
+                              node_ == SimNode::Results;
+    if (motionActive) {
+        resultShown_  = true;
+        shownStudyId_ = studies_[sel_].id;
+        return;
+    }
+
     const bool wantShow = valid && st.leftPaneTab == AppState::LP_Simulation &&
                           node_ == SimNode::Results && studies_[sel_].hasResult &&
                           !studies_[sel_].overlayPath.empty();

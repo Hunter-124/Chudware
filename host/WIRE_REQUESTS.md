@@ -66,3 +66,25 @@ Format:
 
 ## Polish agent — parts_workspace.cpp build fix (correct fonts access)
 - [ ] (polish) `host/src/ui/parts/parts_workspace.cpp:93,111` — `ui::fonts` is not a member of namespace `ui`; fonts live on AppState. Fix: replace `ui::fonts.h2` with `st.fonts.h2` at L93 (in sectionHeader) and `ui::fonts.h1` with `st.fonts.h1` at L111 (in emptyState). The `st` AppState& param is in scope in both functions. This blocks the ninja build — not in polish file ownership so filing as wire request.
+
+## sim-kinematics agent — motion scenario (2026-07-06)
+- [ ] (sim-kinematics) `host/src/ui/scenarios.cpp` — Add a `motion` scenario
+  (AI_CAD_SHOT=motion) that validates the Motion study viewport playback end-to-end.
+  The scenario should:
+  1. On step 0: build a minimal 2-body assembly (box + arm) with one angle mate driven
+     0→120 deg, then open the Simulate workspace and create a Motion study via
+     `st.simManager->handleCommand(st, "sim_new_motion")`. Set
+     `st.leftPaneTab = AppState::LP_Simulation`. Settle 4 frames. Capture
+     `scratch/motion_shots/motion_t0.png` — this is the setup form.
+  2. On step 1: call `st.simManager->handleCommand(st, "sim_run")` to run the motion
+     solve. Poll `st.simClient` until !busy or use the synchronous path (runMotion uses
+     st.worker.call, so it returns on the same thread before the next frame). Settle 4
+     frames. Capture `scratch/motion_shots/motion_t1.png` — frame 0 with bodies at
+     start pose.
+  3. On step 2: advance the active motion study to its midpoint frame
+     (motionFrame = nFrames/2, call SimManager::applyMotionFrame via the tick path by
+     setting motionFrame directly and calling tick), settle 4 frames. Capture
+     `scratch/motion_shots/motion_t2.png` — midpoint: bodies must be at a visibly
+     different position from step 1.
+  Owner: workspace-shell (scenarios.cpp ownership). Body positions MUST differ between
+  step 1 and step 2 screenshots to prove motion playback is live.

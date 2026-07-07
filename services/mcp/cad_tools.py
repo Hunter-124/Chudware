@@ -1681,6 +1681,79 @@ def cad_guide_text(topic: str = "overview") -> str:
             "Both tools return a disclaimer — preliminary estimates, not certified analysis.\n"
             "Reference: Shigley's MED 10th ed., Ch. 11 (bearing) + Ch. 14 (gear)."
         )
+    if topic in ("sketch3d", "3d_sketch", "3dsketch", "sketch_3d",
+                 "sketch3d_tools", "sketch_preview", "guide_curve", "sweep_guide"):
+        return (
+            "3D SKETCH + SKETCH PREVIEW TOOLS\n\n"
+            "These tools give the MCP driver the same capabilities the GUI provides in the\n"
+            "Sketch3D workspace (free-space 3D curves) and the 2D sketch overlay (annotated\n"
+            "sketch preview before extruding).  No C++ build required — Python only.\n\n"
+            "── 3D SKETCH (free-space curves, no constraint solver) ────────────────────────\n\n"
+            "  sketch3d_new(name)               Create a named 3D sketch; returns {id, name}.\n"
+            "  sketch3d_add_curves(id, curves)  Append curve segments. Each curve is a dict:\n"
+            "      {kind, pts, meta?}\n"
+            "      kind: 'line'     — 2 pts [start, end]\n"
+            "            'polyline' — 2+ pts (piecewise-linear chain)\n"
+            "            'spline'   — 3+ control pts (B-spline through-points, degree 3)\n"
+            "            'arc'      — exactly 3 pts [start, mid, end] (circular arc)\n"
+            "      pts: [[x,y,z], ...] in mm, world space\n"
+            "  sketch3d_get(id)                 Read geometry + bbox + total_length_mm.\n"
+            "  sketch3d_clear(id)               Erase all segments (keeps id/name).\n"
+            "  sketch3d_list()                  All session 3D sketches.\n"
+            "  sketch3d_preview(id)             TEXT connectivity + segment description —\n"
+            "                                   no-vision read of the 3D polyline.\n\n"
+            "── INJECT INTO SWEEP / LOFT ───────────────────────────────────────────────────\n\n"
+            "  sketch3d_as_sweep_guide(id, role='guide'|'spine', doc_id?)\n"
+            "      Injects the 3D sketch as a wire feature into the part doc so the engine's\n"
+            "      sweep_profile / loft_sections can pick it up.\n"
+            "      Returns {wire_id, role, guide_support} — wire_id goes into add_features:\n\n"
+            "      sketch3d_new('s') → sketch3d_add_curves('s', [{kind:'line',...},...]) →\n"
+            "      sketch3d_as_sweep_guide('s', role='guide') →\n"
+            "      add_features([{op:'sweep', profile:'sk1', spine:'sk2',\n"
+            "                     guides:['<wire_id>']}])\n\n"
+            "      guide_support=True  → engine build has the guide-curve merge (fix/sweep-guide-curves).\n"
+            "      guide_support=False → wire stored as reference geometry; rebuild core to activate.\n\n"
+            "── 2D SKETCH PREVIEW ──────────────────────────────────────────────────────────\n\n"
+            "  render_sketch(sketch, doc_id?, views?)\n"
+            "      Renders a 2D sketch as an annotated PNG (flat + iso by default) PLUS a\n"
+            "      text caption with sketch_health info.  Returns [Image, caption].\n"
+            "      IMPORTANT: the 'flat' view is a sketch-normal camera — MUCH more useful\n"
+            "      than render_part's iso when you want to CHECK entity placement before\n"
+            "      extruding.  Sketch overlay (entity labels + dims) shown in the flat view.\n"
+            "      Falls back to render_part contact_sheet when doc_render_sketch unavailable.\n\n"
+            "  sketch_preview_text(sketch, doc_id?)\n"
+            "      Non-vision equivalent of render_sketch: full text of plane / entities /\n"
+            "      constraints / DOF / regions PLUS health narration schedule.\n"
+            "      Use for local models without image support; pair with check_sketch for DOF.\n\n"
+            "  doc_sketch_contact_sheet(doc_id?, include_health?)\n"
+            "      Multi-view contact sheet of the WHOLE DOC with a per-sketch health table.\n"
+            "      Returns [Image, caption_with_health_table].\n"
+            "      Best pre-commit check: catches under-defined sketches AND shows the solid.\n\n"
+            "── SHOW IN APP + RENDER DOCUMENT ──────────────────────────────────────────────\n\n"
+            "  show_in_app(doc_id?)    Push the current doc to the running desktop GUI.\n"
+            "      Works for docs with 3D-sketch wire features — the engine serialises them\n"
+            "      into the .step+ handoff file and the GUI renders the wire overlay.\n"
+            "      NOTE: sketch wire geometry is GUI-overlay-only; doc_render_png renders\n"
+            "      solids, not bare wires.  To SEE wires headlessly use sketch3d_preview (text)\n"
+            "      or build a solid first (extrude / sweep) then render_part.\n\n"
+            "── TYPICAL WORKFLOWS ──────────────────────────────────────────────────────────\n\n"
+            "  SWEEP with guide curve:\n"
+            "    new_part('vase')\n"
+            "    add_features([{op:'sketch', id:'profile', plane:'XY', entities:[...]}])\n"
+            "    add_features([{op:'sketch', id:'spine',   plane:'YZ', entities:[...]}])\n"
+            "    sketch3d_new('guide') → sketch3d_add_curves('guide', [{kind:'spline',...}])\n"
+            "    → sketch3d_as_sweep_guide('guide', role='guide')\n"
+            "    → add_features([{op:'sweep', profile:'profile', spine:'spine',\n"
+            "                     guides:['<wire_id>']}])\n"
+            "    → render_part()   # see the result\n\n"
+            "  PREVIEW a 2D sketch before extruding:\n"
+            "    add_features([{op:'sketch', id:'s1', ...}])\n"
+            "    → render_sketch('s1')            # annotated image: flat + iso\n"
+            "    → check_sketch('s1')             # DOF check\n"
+            "    → add_features([{op:'extrude', sketch:'s1', depth:10}])\n\n"
+            "  AUDIT all sketches in a doc:\n"
+            "    doc_sketch_contact_sheet()       # image + health table for every sketch\n"
+        )
     # Otherwise treat the topic as a per-feature cheatsheet name (hole, fillet, revolve, ...).
     sheet = _read_prompt(f"shared/cheatsheets/{topic}.md")
     if sheet:
@@ -1690,7 +1763,7 @@ def cad_guide_text(topic: str = "overview") -> str:
     return (f"No guide for {topic!r}. Topics: overview, simulation, motion, review, intake, gsl, "
             f"cam, narration, parts, reverse, deliverables, requirements, dag, verify, interaction, "
             f"sourcing, cost, spec, piping, hydraulic, firmware, structural, mechanical, regen, "
-            f"code_compliance, serving, design_review, doc_diff, plm, tolerance_stackup; "
+            f"code_compliance, serving, design_review, doc_diff, plm, tolerance_stackup, sketch3d; "
             f"or a feature cheatsheet: {avail}")
 
 
@@ -1737,6 +1810,9 @@ def register_cad_tools(mcp: FastMCP) -> None:
         "doc_diff" (doc_diff_tool — semantic feature-level diff between two revisions),
         "plm" (project-vault versioning stub — T-R2 fills this),
         "tolerance_stackup" (stackup_analyze — 1D worst-case + RSS tolerance stack-up),
+        "sketch3d" (sketch3d_new/add_curves/get/as_sweep_guide + render_sketch/
+        sketch_preview_text/doc_sketch_contact_sheet — 3D free-space sketch curves
+        usable as sweep spines/guide curves, and 2D sketch preview before extruding),
         or a single feature's cheatsheet by name ("hole", "fillet", "revolve", "loft",
         "sweep", "shell", "chamfer", "pattern", "mirror", "sketch", "airfoil",
         "drawing", "hardware", ...).

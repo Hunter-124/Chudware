@@ -551,10 +551,31 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
     // Doc name + revision row — carried on a glass fmRowPill (item: give "Board1 - rev N" a proper
     // Feature-Manager-style background instead of bare dim text). fmRowStripeReset first so this is
     // stripe 0 and the tree rows below alternate cleanly from it.
+    // A more DEFINED glass box (stronger fill + border) than a plain fmRowPill so the header, the
+    // Nets rows, etc. read clearly over the bright PCB grid bleeding through (Hunter round-4).
+    auto au = [](const float c[4], float a) {
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], c[3] * a));
+    };
+    auto defineBox = [&](const ui::FmRowRect& r) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float s = sc, rr = 3.5f * s;
+        ImVec2 mn(r.mn.x + 2.0f * s, r.mn.y + 2.0f * s), mx(r.mx.x - 2.0f * s, r.mx.y - 2.0f * s);
+        dl->AddRectFilled(mn, mx, au(pal.glassBg, 0.55f), rr);
+        dl->AddRect(mn, mx, au(pal.glassBorder, 0.90f), rr, 0, std::max(1.0f, s));
+    };
+    // Left-inset, frame-centered text — the padding + vertical centering the Layers rows use, so
+    // every row's text sits consistently inside its pill (Hunter round-4).
+    auto rowInk = [&]() {
+        ImGui::AlignTextToFramePadding();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 6.0f * sc);
+    };
+
     ui::fmRowStripeReset();
     {
         const std::string nm = m.name().empty() ? "(untitled)" : m.name();
         ui::FmRowRect rr = ui::fmRowPill();
+        defineBox(rr);
+        rowInk();
         ImGui::TextColored(v4(pal.text), "%s", nm.c_str());
         ImGui::SameLine();
         ImGui::TextColored(v4(pal.textDim), "rev %d", m.revision());
@@ -576,9 +597,9 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
     // SmallButton row / the canvas-top checkButton. ----
     {
         const float bw = 24.0f * sc, gap = 4.0f * sc;
-        // PCB's Run DRC moved to the ribbon (Checks group) — the toolbar keeps view + history only.
-        // Schematic keeps Annotate here (no ribbon home for it).
-        const int nBtn = pcb ? 3 : 4;
+        // Save / Open (the pair carried over from the Feature Manager toolbar) + view + history.
+        // PCB's Run DRC moved to the ribbon (Checks group); schematic keeps Annotate (no ribbon home).
+        const int nBtn = pcb ? 5 : 6;
         const float toolW = nBtn * bw + (nBtn - 1) * gap;
         ImVec2 rowMin = ImGui::GetCursorScreenPos();
         const float availW = ImGui::GetContentRegionAvail().x;
@@ -586,6 +607,12 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
                                ImVec2(rowMin.x + availW, rowMin.y + bw), 3.5f, false, false, 0.24f);
         float bx = rowMin.x + std::max(0.0f, (availW - toolW) * 0.5f);
         ImGui::SetCursorScreenPos(ImVec2(bx, rowMin.y));
+        if (ui::fmToolbarIconBtn("ecad_save", "save", "Save  (Shift-click: Save As...)", true))
+            st.ecadPanelCmd = "ecad_save";
+        ImGui::SameLine(0, gap);
+        if (ui::fmToolbarIconBtn("ecad_open", "open", "Open ECAD / KiCad file...", true))
+            st.ecadPanelCmd = "ecad_open";
+        ImGui::SameLine(0, gap);
         if (ui::fmToolbarIconBtn("ecad_fit", "view_selector", "Zoom Fit", true)) es.canvas.requestFit();
         ImGui::SameLine(0, gap);
         if (ui::fmToolbarIconBtn("ecad_undo", "undo", "Undo", true)) st.ecadUndoGo = true;
@@ -670,14 +697,23 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         const bool sel = (es.mgrSel == selId);
         bool vis = m.layerVisible(ly.id);
         ui::FmRowRect r = ui::fmRowPill(sel);
-        // Liquid-glass pill DYED the layer color: a translucent left→right color gradient over the
-        // glass (light alpha so it reads as a tint, never a deep/dark fill — text stays legible).
+        // Liquid-glass pill DYED the layer color: a translucent left→right color tint over the glass
+        // (light alpha so it reads as a tint, text stays legible). BOUNDED to the rounded pill —
+        // a rounded base fill rounds the corners, then the gradient body is inset horizontally by the
+        // corner radius so it never pokes square corners past the selection box (Hunter round-4).
         const ImVec4 c = layerSwatch(ly.copperIndex);
-        const ImU32 cL = ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, vis ? 0.34f : 0.16f));
-        const ImU32 cR = ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, vis ? 0.05f : 0.02f));
-        ImGui::GetWindowDrawList()->AddRectFilledMultiColor(r.mn, r.mx, cL, cR, cR, cL);
-        ImGui::Dummy(ImVec2(6.0f * sc, ImGui::GetTextLineHeight()));
-        ImGui::SameLine();
+        auto dye = [&](float a) { return ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, a)); };
+        const ImU32 cL = dye(vis ? 0.34f : 0.16f), cR = dye(vis ? 0.05f : 0.02f);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float s = sc, rr = 3.5f * s;
+        ImVec2 mn(r.mn.x + 2.0f * s, r.mn.y + 2.0f * s), mx(r.mx.x - 2.0f * s, r.mx.y - 2.0f * s);
+        dl->AddRectFilled(mn, mx, cR, rr);
+        dl->AddRectFilledMultiColor(ImVec2(mn.x + rr, mn.y), ImVec2(mx.x - rr, mx.y), cL, cR, cR, cL);
+        // Left accent bar dyed the LAYER color (round-4: was the always-blue selection accent).
+        dl->AddRectFilled(mn, ImVec2(mn.x + 3.0f * s, mx.y), dye(vis ? 0.95f : 0.45f), rr,
+                          ImDrawFlags_RoundCornersLeft);
+        ImGui::AlignTextToFramePadding();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 9.0f * sc);
         ImGui::TextColored(vis ? v4(pal.text) : v4(pal.textDisabled), "%s", ly.id.c_str());
         ui::fmRowPillEnd(r, sel);
         // Right-edge eye toggle (show/hide the layer) — the SAME glyph + placement the Feature
@@ -700,15 +736,29 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         ImGui::PushID(n.name.c_str());
         const std::string selId = "net:" + n.name;
         const bool sel = (es.mgrSel == selId);
+        const bool nvis = m.netVisible(n.name);
         ui::FmRowRect r = ui::fmRowPill(sel);
-        ImGui::TextColored(v4(pal.text), "%s", n.name.c_str());
+        defineBox(r);   // stronger fill + border so nets read clearly over the PCB grid (round-4)
+        rowInk();       // left-inset + frame-centered text (matches the Layers rows)
+        ImGui::TextColored(nvis ? v4(pal.text) : v4(pal.textDisabled), "%s", n.name.c_str());
         if (withPins) {
             ImGui::SameLine();
             ImGui::TextColored(v4(pal.textDim), "(%d pins)", n.pinCount);
         }
         ui::fmRowPillEnd(r, sel);
-        if (ImGui::IsMouseHoveringRect(r.mn, r.mx) && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        // Right-edge eye toggle — hide/show this net's tracks + ratsnest (round-4).
+        const float eyeSz = 14.0f * sc, eyePad = 6.0f * sc;
+        ImVec2 eMin(r.mx.x - eyeSz - eyePad, r.mn.y + (r.mx.y - r.mn.y - eyeSz) * 0.5f);
+        ImVec2 eMax(eMin.x + eyeSz, eMin.y + eyeSz);
+        const bool overEye = ImGui::IsMouseHoveringRect(eMin, eMax);
+        ui::fmDrawEyeGlyph(eMin, eMax, nvis, overEye);
+        if (overEye) {
+            ImGui::SetTooltip(nvis ? "Hide net %s" : "Show net %s", n.name.c_str());
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) m.setNetVisible(n.name, !nvis);
+        } else if (ImGui::IsMouseHoveringRect(r.mn, r.mx) &&
+                   ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             es.mgrSel = sel ? std::string() : selId;   // toggle row selection
+        }
         ImGui::PopID();
     };
     if (pcb) {
@@ -727,6 +777,7 @@ void drawEcadManagerBodyImpl(AppState& st, const ui::AdaptiveSurface& surf, ImU3
         ui::fmSectionDivider(symHdr);
         for (const auto& s : m.symbols()) {
             ui::FmRowRect r = ui::fmRowPill();
+            rowInk();
             ImGui::TextColored(v4(pal.text), "%s", s.ref.empty() ? s.libid.c_str() : s.ref.c_str());
             if (!s.value.empty()) {
                 ImGui::SameLine();

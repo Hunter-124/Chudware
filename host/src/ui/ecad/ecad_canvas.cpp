@@ -367,6 +367,7 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
         if (!doc.layerVisible(ly.id)) continue;
         const ImU32 c = copperColor(ly.copperIndex, 0.92f);
         for (const EcadTrack* t : doc.tracksOnLayer(ly.id)) {
+            if (!doc.netVisible(t->net)) continue;
             const float wpx = std::max(1.0f, t->width * pxPerMm_);
             if (t->kind == "arc") {
                 const int seg = 24;
@@ -435,8 +436,10 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
     }
 
     // Ratsnest airwires: thin dashed lines between unrouted pads.
-    for (const auto& aw : doc.ratsnest())
+    for (const auto& aw : doc.ratsnest()) {
+        if (!doc.netVisible(aw.net)) continue;
         drawDashedLine(dl_, toScreen(aw.p1), toScreen(aw.p2), ratsCol, 1.2f, 5, 4);
+    }
 
     // Selection highlight (drawn last, on top). A footprint gets a translucent halo over its
     // courtyard (or origin) + a ring; a track gets a thick translucent over-stroke.

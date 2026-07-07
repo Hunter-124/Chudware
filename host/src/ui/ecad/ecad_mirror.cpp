@@ -436,6 +436,16 @@ void EcadMirror::setLayerVisible(const std::string& layerId, bool vis) {
         if (ly.id == layerId) ly.visible = vis;
 }
 
+bool EcadMirror::netVisible(const std::string& net) const {
+    if (net.empty()) return true;
+    auto it = netVis_.find(net);
+    return it == netVis_.end() ? true : it->second;
+}
+
+void EcadMirror::setNetVisible(const std::string& net, bool vis) {
+    if (!net.empty()) netVis_[net] = vis;
+}
+
 bool EcadMirror::worldBounds(EcadPt& outMin, EcadPt& outMax) const {
     bool have = false;
     auto grow = [&](EcadPt p) {

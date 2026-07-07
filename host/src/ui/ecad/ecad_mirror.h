@@ -236,6 +236,11 @@ public:
     bool layerVisible(const std::string& layerId) const;
     void setLayerVisible(const std::string& layerId, bool vis);
 
+    // Per-net visibility (mutated by the panel's Nets eye toggles; the canvas hides that net's
+    // tracks + ratsnest). Defaults to visible; unknown/empty net names are treated as visible.
+    bool netVisible(const std::string& net) const;
+    void setNetVisible(const std::string& net, bool vis);
+
     // ---- compile accessors (both kinds) ----
     const std::vector<EcadAirwire>&   ratsnest()  const { return ratsnest_; }
     const std::vector<EcadViolation>& erc()       const { return erc_; }
@@ -276,6 +281,7 @@ private:
     std::vector<EcadOutlineSeg> outline_;
     std::vector<EcadLayer>      layers_;
     std::unordered_map<std::string, bool> layerVis_;  // id -> visible (panel-owned)
+    std::unordered_map<std::string, bool> netVis_;    // net name -> visible (panel-owned)
 
     // compile
     std::vector<EcadAirwire>   ratsnest_;

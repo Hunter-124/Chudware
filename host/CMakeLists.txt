@@ -89,6 +89,7 @@ add_executable(AI-CAD
   # --- C18: sketch mode UI ---
   src/ui/sketch_mode.cpp
   src/ui/airfoil.cpp   # NACA 4-/5-digit + .dat airfoil profile generator (SketchTool::Airfoil)
+  src/ui/sketch3d_mode.cpp   # 3D free-space sketcher (sketch3d features)
   # --- end C18 ---
   # --- Configurations panel (SolidWorks ConfigurationManager) ---
   src/ui/config_panel.cpp

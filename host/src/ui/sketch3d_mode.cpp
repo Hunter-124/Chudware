@@ -1,0 +1,1141 @@
+// 3D Sketch mode — implementation. See sketch3d_mode.h and contracts/sketch3d_gui_contract.md.
+#include "sketch3d_mode.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+
+#include "../core/app_state.h"
+#include "../renderer.h"
+#include "../ui_theme.h"
+#include "toast.h"
+
+namespace ui {
+
+namespace {
+
+// Projection helpers — local copies of sketch_mode.cpp's anonymous-namespace versions (same
+// math; that TU's helpers have internal linkage so they cannot be shared without a refactor).
+bool worldToScreen(const Renderer::CameraXform& cam, const ImVec2& imgMin, int vw, int vh,
+                   float wx, float wy, float wz, ImVec2& out) {
+    const float* m = cam.mvp.m;   // column-major: clip[r] = sum_c m[c*4+r]*p[c]
+    float p[4] = {wx, wy, wz, 1.0f};
+    float c[4];
+    for (int r = 0; r < 4; ++r)
+        c[r] = m[0 * 4 + r] * p[0] + m[1 * 4 + r] * p[1] + m[2 * 4 + r] * p[2] + m[3 * 4 + r] * p[3];
+    if (c[3] <= 1e-6f) return false;
+    float ndcX = c[0] / c[3];
+    float ndcY = c[1] / c[3];
+    out.x = imgMin.x + (ndcX * 0.5f + 0.5f) * (float)vw;
+    out.y = imgMin.y + (1.0f - (ndcY * 0.5f + 0.5f)) * (float)vh;
+    return true;
+}
+
+bool invert4x4(const float* m, float* inv) {
+    inv[0]  =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    inv[4]  = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    inv[8]  =  m[4]*m[9]*m[15]  - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14]  + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    inv[1]  = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+    inv[5]  =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+    inv[9]  = -m[0]*m[9]*m[15]  + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+    inv[13] =  m[0]*m[9]*m[14]  - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+    inv[2]  =  m[1]*m[6]*m[15]  - m[1]*m[7]*m[14]  - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7]  - m[13]*m[3]*m[6];
+    inv[6]  = -m[0]*m[6]*m[15]  + m[0]*m[7]*m[14]  + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7]  + m[12]*m[3]*m[6];
+    inv[10] =  m[0]*m[5]*m[15]  - m[0]*m[7]*m[13]  - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7]  - m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14]  + m[0]*m[6]*m[13]  + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6]  + m[12]*m[2]*m[5];
+    inv[3]  = -m[1]*m[6]*m[11]  + m[1]*m[7]*m[10]  + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7]   + m[9]*m[3]*m[6];
+    inv[7]  =  m[0]*m[6]*m[11]  - m[0]*m[7]*m[10]  - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7]   - m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11]  + m[0]*m[7]*m[9]   + m[4]*m[1]*m[11] - m[4]*m[3]*m[9]  - m[8]*m[1]*m[7]   + m[8]*m[3]*m[5];
+    inv[15] =  m[0]*m[5]*m[10]  - m[0]*m[6]*m[9]   - m[4]*m[1]*m[10] + m[4]*m[2]*m[9]  + m[8]*m[1]*m[6]   - m[8]*m[2]*m[5];
+    float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+    if (std::fabs(det) < 1e-20f) return false;
+    det = 1.0f / det;
+    for (int i = 0; i < 16; ++i) inv[i] *= det;
+    return true;
+}
+
+bool screenRay(const Renderer::CameraXform& cam, const ImVec2& imgMin, int vw, int vh,
+               ImVec2 mouse, Vec3& outOrig, Vec3& outDir) {
+    float inv[16];
+    if (!invert4x4(cam.mvp.m, inv)) return false;
+    float ndcX = ((mouse.x - imgMin.x) / (float)vw) * 2.0f - 1.0f;
+    float ndcY = 1.0f - ((mouse.y - imgMin.y) / (float)vh) * 2.0f;
+    auto unproj = [&](float ndcZ, Vec3& o) -> bool {
+        float cl[4] = {ndcX, ndcY, ndcZ, 1.0f}, w[4];
+        for (int r = 0; r < 4; ++r)
+            w[r] = inv[0*4+r]*cl[0] + inv[1*4+r]*cl[1] + inv[2*4+r]*cl[2] + inv[3*4+r]*cl[3];
+        if (std::fabs(w[3]) < 1e-12f) return false;
+        o = Vec3(w[0]/w[3], w[1]/w[3], w[2]/w[3]);
+        return true;
+    };
+    Vec3 pNear, pFar;
+    if (!unproj(-1.0f, pNear) || !unproj(1.0f, pFar)) return false;
+    Vec3 d = pFar - pNear;
+    float len = length(d);
+    if (len < 1e-9f) return false;
+    outOrig = pNear;
+    outDir = d * (1.0f / len);
+    return true;
+}
+
+constexpr float kSnapPx = 10.0f;       // point-handle snap radius (screen px, pre-DPI)
+constexpr float kAxisSnapPx = 6.0f;    // axis-inference pull radius (screen px, pre-DPI)
+constexpr float kHandlePx = 4.0f;      // handle square half-size
+constexpr float kEntHitPx = 9.0f;      // whole-entity pick distance
+
+ImU32 col(const float c[4], float aMul = 1.0f) {
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], c[3] * aMul));
+}
+ImU32 col3(const float c[4], float a) {
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], a));
+}
+
+float distPtSeg(const ImVec2& p, const ImVec2& a, const ImVec2& b) {
+    float dx = b.x - a.x, dy = b.y - a.y;
+    float l2 = dx * dx + dy * dy;
+    float t = l2 > 1e-9f ? ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2 : 0.0f;
+    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+    return std::hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+}
+
+// Circumcenter of 3 points in 3D (the arc's display center). False when near-collinear.
+bool circumcenter3(const Vec3& a, const Vec3& b, const Vec3& c, Vec3& out) {
+    Vec3 ab = b - a, ac = c - a;
+    Vec3 n = cross(ab, ac);
+    float n2 = dot(n, n);
+    if (n2 < 1e-10f) return false;
+    // center = a + (|ac|^2 (n x ab) + |ab|^2 (ac x n)) / (2 |n|^2)
+    Vec3 v = (cross(n, ab) * dot(ac, ac) + cross(ac, n) * dot(ab, ab)) * (1.0f / (2.0f * n2));
+    out = a + v;
+    return true;
+}
+
+// json [x,y,z] -> Vec3
+Vec3 jv(const nlohmann::json& a) {
+    if (!a.is_array() || a.size() < 3) return {0, 0, 0};
+    return {(float)a[0].get<double>(), (float)a[1].get<double>(), (float)a[2].get<double>()};
+}
+nlohmann::json vj(const Vec3& v) {
+    return nlohmann::json::array({(double)v.x, (double)v.y, (double)v.z});
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// worker round-trips
+// ---------------------------------------------------------------------------
+
+bool Sketch3DMode::callSk3(AppState& st, const char* method, const nlohmann::json& extra,
+                           nlohmann::json& result) {
+    if (!st.docMirror.hasDoc() || !st.workerStarted) return false;
+    nlohmann::json params = extra;
+    params["doc_id"] = st.docMirror.docId();
+    params["sketch"] = fid_;
+    std::string err;
+    if (!st.worker.call(method, params, result, err)) {
+        st.addLog(std::string("[sketch3d] ") + method + " transport error: " + err);
+        return false;
+    }
+    if (result.contains("code")) {   // structured OpError envelope
+        st.addLog(std::string("[sketch3d] ") + method + " error: " +
+                  result.value("message", std::string("?")));
+        return false;
+    }
+    return true;
+}
+
+void Sketch3DMode::applyEntities(const nlohmann::json& res) {
+    if (!res.contains("entities") || !res["entities"].is_array()) return;
+    const nlohmann::json* stats =
+        res.contains("statuses") && res["statuses"].is_object() ? &res["statuses"] : nullptr;
+    ents_.clear();
+    for (const auto& e : res["entities"]) {
+        Sk3Entity se;
+        se.id = e.value("id", std::string());
+        se.type = e.value("type", std::string());
+        se.construction = e.value("construction", false);
+        if (stats && stats->contains(se.id)) se.status = (*stats)[se.id].get<std::string>();
+        if (se.type == "point") {
+            se.pts.push_back(jv(e.value("p", nlohmann::json())));
+        } else if (se.type == "line") {
+            se.pts.push_back(jv(e.value("p1", nlohmann::json())));
+            se.pts.push_back(jv(e.value("p2", nlohmann::json())));
+        } else if (se.type == "arc") {
+            se.pts.push_back(jv(e.value("p1", nlohmann::json())));
+            se.pts.push_back(jv(e.value("pm", nlohmann::json())));
+            se.pts.push_back(jv(e.value("p2", nlohmann::json())));
+        } else if (se.type == "spline" && e.contains("points") && e["points"].is_array()) {
+            for (const auto& p : e["points"]) se.pts.push_back(jv(p));
+        }
+        ents_.push_back(std::move(se));
+    }
+}
+
+void Sketch3DMode::refreshHealth(AppState& st) {
+    nlohmann::json res;
+    if (!callSk3(st, "sketch3d_health", nlohmann::json::object(), res)) return;
+    applyEntities(res);
+    dof_ = res.value("dof", 0);
+    status_ = res.value("status", std::string("under"));
+    converged_ = res.value("converged", true);
+    nWires_ = res.contains("wires") && res["wires"].is_array() ? (int)res["wires"].size() : 0;
+}
+
+void Sketch3DMode::reloadParamsFromTree(AppState& st) {
+    entJson_ = nlohmann::json::array();
+    conJson_ = nlohmann::json::array();
+    const auto& tree = st.docMirror.tree();
+    if (!tree.is_object() || !tree.contains("features")) return;
+    for (const auto& f : tree["features"]) {
+        if (f.value("id", std::string()) != fid_) continue;
+        const auto& params = f.value("params", nlohmann::json::object());
+        if (params.contains("entities") && params["entities"].is_array())
+            entJson_ = params["entities"];
+        if (params.contains("constraints") && params["constraints"].is_array())
+            conJson_ = params["constraints"];
+        return;
+    }
+}
+
+bool Sketch3DMode::commitParams(AppState& st, const nlohmann::json* entities,
+                                const nlohmann::json* constraints, const char* label) {
+    nlohmann::json params = nlohmann::json::object();
+    if (entities) params["entities"] = *entities;
+    if (constraints) params["constraints"] = *constraints;
+    nlohmann::json op = {{"op", "edit_feature"}, {"id", fid_}, {"params", params}};
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (!r.ok) {
+        st.toast(ui::ToastLevel::Warn, std::string(label) + ": " + r.error_message);
+        reloadParamsFromTree(st);   // drop the rejected local edit
+        return false;
+    }
+    if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+    if (entities) entJson_ = *entities;
+    if (constraints) conJson_ = *constraints;
+    refreshHealth(st);
+    return true;
+}
+
+std::string Sketch3DMode::nextId(const char* prefix) const {
+    const nlohmann::json& arr = prefix[0] == 'e' ? entJson_ : conJson_;
+    int mx = 0;
+    for (const auto& e : arr) {
+        std::string id = e.value("id", std::string());
+        if (id.size() > 1 && id[0] == prefix[0]) mx = std::max(mx, std::atoi(id.c_str() + 1));
+    }
+    return std::string(prefix) + std::to_string(mx + 1);
+}
+
+std::string Sketch3DMode::addEntity(AppState& st, nlohmann::json entity,
+                                    nlohmann::json constraints) {
+    std::string id = nextId("e");
+    entity["id"] = id;
+    entity["construction"] = constructionOn_;
+    nlohmann::json ents = entJson_; ents.push_back(entity);
+    nlohmann::json cons = conJson_;
+    if (constraints.is_array())
+        for (auto c : constraints) {
+            // resolve "$self" placeholder to the assigned entity id
+            if (c.contains("refs"))
+                for (auto& r : c["refs"]) {
+                    std::string s = r.get<std::string>();
+                    auto p = s.find("$self");
+                    if (p != std::string::npos) r = s.substr(0, p) + id + s.substr(p + 5);
+                }
+            c["id"] = nextId("c");
+            cons.push_back(c);
+        }
+    if (!commitParams(st, &ents, &cons, "Add entity")) return {};
+    return id;
+}
+
+void Sketch3DMode::addConstraint(AppState& st, nlohmann::json con, const char* label) {
+    con["id"] = nextId("c");
+    nlohmann::json cons = conJson_; cons.push_back(con);
+    commitParams(st, nullptr, &cons, label);
+}
+
+// ---------------------------------------------------------------------------
+// enter / exit
+// ---------------------------------------------------------------------------
+
+bool Sketch3DMode::enterForFeature(AppState& st, const std::string& fid) {
+    if (active_) exitSketch(st, true);
+    if (!st.docMirror.hasDoc() || !st.workerStarted) return false;
+    fid_ = fid;
+    docId_ = st.docMirror.docId();
+    reloadParamsFromTree(st);
+    refreshHealth(st);
+    active_ = true;
+    isNewEmpty_ = false;
+    tool_ = Sk3Tool::None;
+    toolPts_.clear(); toolSnaps_.clear(); toolAxes_.clear(); chainPrevHandle_.clear();
+    clearSel();
+    setPlanePreset(st, 0);
+    wpO_ = {0, 0, 0};
+    // Cancel checkpoint so the confirmation-corner ✗ can revert the whole session.
+    nlohmann::json cres, cp = {{"doc_id", docId_}};
+    std::string cerr;
+    cancelCheckpoint_.clear();
+    if (st.worker.call("doc_checkpoint", cp, cres, cerr) && cres.contains("checkpoint"))
+        cancelCheckpoint_ = cres["checkpoint"].get<std::string>();
+    st.addLog("[sketch3d] editing " + fid_);
+    return true;
+}
+
+bool Sketch3DMode::enterNew(AppState& st) {
+    if (!st.docMirror.hasDoc() || !st.workerStarted) return false;
+    nlohmann::json op = {{"op", "add_feature"},
+                         {"feature", {{"type", "sketch3d"}, {"name", "3DSketch"},
+                                      {"params", {{"entities", nlohmann::json::array()},
+                                                  {"constraints", nlohmann::json::array()}}}}}};
+    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (!r.ok) { st.toast(ui::ToastLevel::Error, "3D Sketch: " + r.error_message); return false; }
+    std::string fid = (r.id_map.is_object() && r.id_map.contains("$0"))
+                          ? r.id_map["$0"].get<std::string>() : std::string();
+    if (fid.empty()) return false;
+    bool ok = enterForFeature(st, fid);
+    isNewEmpty_ = ok;
+    return ok;
+}
+
+void Sketch3DMode::exitSketch(AppState& st, bool keep) {
+    if (!active_) return;
+    if (!keep && !cancelCheckpoint_.empty() && st.docMirror.docId() == docId_) {
+        nlohmann::json res, params = {{"doc_id", docId_}, {"checkpoint", cancelCheckpoint_}};
+        std::string err;
+        if (st.worker.call("doc_revert", params, res, err) && !res.contains("code")) {
+            if (res.contains("tess") && res["tess"].is_object()) {
+                std::string aicm = res["tess"].value("aicm_path", std::string());
+                if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
+            }
+            st.docMirror.resync(st.worker);
+        }
+    } else if (keep && isNewEmpty_ && entJson_.empty() && st.docMirror.docId() == docId_) {
+        // A committed but still-empty NEW sketch is noise — delete it on exit.
+        nlohmann::json op = {{"op", "delete_feature"}, {"id", fid_}};
+        st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    }
+    active_ = false;
+    fid_.clear(); docId_.clear(); cancelCheckpoint_.clear();
+    ents_.clear(); entJson_ = nlohmann::json::array(); conJson_ = nlohmann::json::array();
+    resetTool();
+    clearSel();
+    dragArmed_ = dragging_ = false;
+    dimPopupOpen_ = false;
+}
+
+bool Sketch3DMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
+    if (cmdId == "sketch3d_new") {
+        if (active_) exitSketch(st, true);
+        else enterNew(st);
+        return true;
+    }
+    if (!active_) return false;
+    if (cmdId == "sketch_exit" || cmdId == "sketch3d_exit") { exitSketch(st, true); return true; }
+    return false;
+}
+
+std::string Sketch3DMode::statusLine() const {
+    if (!active_) return {};
+    if (status_ == "over" || !converged_) return "Over Defined";
+    if (status_ == "full") return "Fully Defined";
+    return "Under Defined   DOF: " + std::to_string(dof_);
+}
+
+// ---------------------------------------------------------------------------
+// working plane
+// ---------------------------------------------------------------------------
+
+void Sketch3DMode::setPlanePreset(AppState& st, int preset) {
+    wpPreset_ = preset;
+    switch (preset) {
+        case 0: wpU_ = {1, 0, 0}; wpV_ = {0, 1, 0}; break;   // XY (top)
+        case 1: wpU_ = {1, 0, 0}; wpV_ = {0, 0, 1}; break;   // XZ (front)
+        case 2: wpU_ = {0, 1, 0}; wpV_ = {0, 0, 1}; break;   // YZ (right)
+        default: {                                            // view-aligned
+            const float deg = 3.14159265f / 180.0f;
+            float yr = st.yaw * deg, pr = st.pitch * deg;
+            Vec3 vdir(std::cos(pr) * std::sin(yr), -std::cos(pr) * std::cos(yr), std::sin(pr));
+            Vec3 wUp = normalize(Vec3(-std::sin(pr) * std::sin(yr),
+                                       std::sin(pr) * std::cos(yr), std::cos(pr)));
+            Vec3 V = normalize(vdir);
+            wpU_ = normalize(cross(wUp, V));
+            wpV_ = normalize(cross(V, wpU_));
+            break;
+        }
+    }
+}
+
+void Sketch3DMode::drawPlaneGrid(ImDrawList* dl, AppState& st, const ImVec2& imgMin,
+                                 int vw, int vh) const {
+    if (!st.renderer) return;
+    const auto& cam = st.renderer->camera();
+    const float kStep = 10.0f, kHalf = 60.0f;   // 120mm grid, 10mm pitch
+    const ImU32 gc = col(ui::palette.sketchGrid);
+    for (float t = -kHalf; t <= kHalf + 0.1f; t += kStep) {
+        ImVec2 a, b, c, d;
+        Vec3 p0 = wpO_ + wpU_ * t - wpV_ * kHalf, p1 = wpO_ + wpU_ * t + wpV_ * kHalf;
+        Vec3 q0 = wpO_ + wpV_ * t - wpU_ * kHalf, q1 = wpO_ + wpV_ * t + wpU_ * kHalf;
+        if (worldToScreen(cam, imgMin, vw, vh, p0.x, p0.y, p0.z, a) &&
+            worldToScreen(cam, imgMin, vw, vh, p1.x, p1.y, p1.z, b))
+            dl->AddLine(a, b, gc, 1.0f);
+        if (worldToScreen(cam, imgMin, vw, vh, q0.x, q0.y, q0.z, c) &&
+            worldToScreen(cam, imgMin, vw, vh, q1.x, q1.y, q1.z, d))
+            dl->AddLine(c, d, gc, 1.0f);
+    }
+    // origin triad glyph (world axes at the world origin) — X red-ish, Y green-ish, Z blue-ish.
+    ImVec2 o, axp;
+    if (worldToScreen(cam, imgMin, vw, vh, 0, 0, 0, o)) {
+        const float axLen = 12.0f;
+        const Vec3 axes[3] = {{axLen, 0, 0}, {0, axLen, 0}, {0, 0, axLen}};
+        const ImU32 axc[3] = {IM_COL32(214, 84, 84, 255), IM_COL32(90, 176, 96, 255),
+                              IM_COL32(84, 120, 214, 255)};
+        for (int i = 0; i < 3; ++i)
+            if (worldToScreen(cam, imgMin, vw, vh, axes[i].x, axes[i].y, axes[i].z, axp))
+                dl->AddLine(o, axp, axc[i], 1.6f);
+        dl->AddCircleFilled(o, 3.0f * ui::uiScale, col(ui::palette.sketchInk));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// picking / snapping
+// ---------------------------------------------------------------------------
+
+const Sk3Entity* Sketch3DMode::entById(const std::string& id) const {
+    for (const auto& e : ents_) if (e.id == id) return &e;
+    return nullptr;
+}
+
+// handle name for point k of an entity ("e3.p1" style, per the contract grammar)
+static std::string handleName(const Sk3Entity& e, int k) {
+    if (e.type == "point") return e.id + ".p";
+    if (e.type == "line") return e.id + (k == 0 ? ".p1" : ".p2");
+    if (e.type == "arc") return e.id + (k == 0 ? ".p1" : (k == 1 ? ".pm" : ".p2"));
+    return e.id + ".p" + std::to_string(k);   // spline
+}
+
+Vec3 Sketch3DMode::handleWorld(const std::string& handle) const {
+    if (handle == "origin") return {0, 0, 0};
+    auto dot = handle.find('.');
+    const Sk3Entity* e = entById(handle.substr(0, dot));
+    if (!e) return {0, 0, 0};
+    if (dot == std::string::npos) return e->pts.empty() ? Vec3{0, 0, 0} : e->pts[0];
+    std::string suf = handle.substr(dot + 1);
+    int k = 0;
+    if (suf == "p" || suf == "p1" || suf == "start") k = 0;
+    else if (suf == "pm" || suf == "mid") k = 1;
+    else if (suf == "p2" || suf == "end") k = (int)e->pts.size() - 1;
+    else if (suf.size() > 1 && suf[0] == 'p') k = std::atoi(suf.c_str() + 1);
+    if (k < 0 || k >= (int)e->pts.size()) k = 0;
+    return e->pts[k];
+}
+
+bool Sketch3DMode::hitTestHandle(AppState& st, const ImVec2& s, const ImVec2& imgMin, int vw,
+                                 int vh, std::string& handleOut, Vec3& worldOut) const {
+    if (!st.renderer) return false;
+    const auto& cam = st.renderer->camera();
+    float best = kSnapPx * ui::uiScale;
+    bool found = false;
+    ImVec2 sp;
+    for (const auto& e : ents_) {
+        for (int k = 0; k < (int)e.pts.size(); ++k) {
+            if (!worldToScreen(cam, imgMin, vw, vh, e.pts[k].x, e.pts[k].y, e.pts[k].z, sp))
+                continue;
+            float d = std::hypot(s.x - sp.x, s.y - sp.y);
+            if (d < best) { best = d; handleOut = handleName(e, k); worldOut = e.pts[k]; found = true; }
+        }
+    }
+    if (worldToScreen(cam, imgMin, vw, vh, 0, 0, 0, sp)) {
+        float d = std::hypot(s.x - sp.x, s.y - sp.y);
+        if (d < best) { handleOut = "origin"; worldOut = {0, 0, 0}; found = true; }
+    }
+    return found;
+}
+
+void Sketch3DMode::samplePolyline(const Sk3Entity& e, std::vector<Vec3>& out) {
+    out.clear();
+    if (e.type == "point") { if (!e.pts.empty()) out.push_back(e.pts[0]); return; }
+    if (e.type == "line") { out = e.pts; return; }
+    if (e.type == "arc" && e.pts.size() == 3) {
+        Vec3 c;
+        if (!circumcenter3(e.pts[0], e.pts[1], e.pts[2], c)) { out = e.pts; return; }
+        Vec3 r0 = e.pts[0] - c, r2 = e.pts[2] - c;
+        float rad = length(r0);
+        Vec3 n = normalize(cross(e.pts[1] - e.pts[0], e.pts[2] - e.pts[0]));
+        Vec3 u = normalize(r0), v = normalize(cross(n, u));
+        float a2 = std::atan2(dot(r2, v), dot(r2, u));
+        // sweep from 0 to a2 keeping pm inside: check pm's angle sits between
+        Vec3 rm = e.pts[1] - c;
+        float am = std::atan2(dot(rm, v), dot(rm, u));
+        if (a2 < 0) a2 += 2 * 3.14159265f;
+        if (am < 0) am += 2 * 3.14159265f;
+        bool fwd = am <= a2;   // pm within the CCW 0..a2 sweep? else go the other way
+        float sweep = fwd ? a2 : a2 - 2 * 3.14159265f;
+        const int N = 24;
+        for (int i = 0; i <= N; ++i) {
+            float a = sweep * (float)i / (float)N;
+            out.push_back(c + (u * std::cos(a) + v * std::sin(a)) * rad);
+        }
+        return;
+    }
+    // spline: Catmull-Rom through the interpolation points (display approximation).
+    if (e.pts.size() < 2) { out = e.pts; return; }
+    const int seg = 8;
+    auto P = [&](int i) {
+        i = i < 0 ? 0 : (i >= (int)e.pts.size() ? (int)e.pts.size() - 1 : i);
+        return e.pts[i];
+    };
+    for (int i = 0; i + 1 < (int)e.pts.size(); ++i) {
+        Vec3 p0 = P(i - 1), p1 = P(i), p2 = P(i + 1), p3 = P(i + 2);
+        for (int k = (i == 0 ? 0 : 1); k <= seg; ++k) {
+            float t = (float)k / seg, t2 = t * t, t3 = t2 * t;
+            Vec3 q = (p1 * 2.0f + (p2 - p0) * t +
+                      (p0 * 2.0f - p1 * 5.0f + p2 * 4.0f - p3) * t2 +
+                      ((p1 - p2) * 3.0f + p3 - p0) * t3) * 0.5f;
+            out.push_back(q);
+        }
+    }
+}
+
+std::string Sketch3DMode::hitTestEntity(AppState& st, const ImVec2& s, const ImVec2& imgMin,
+                                        int vw, int vh) const {
+    if (!st.renderer) return {};
+    const auto& cam = st.renderer->camera();
+    float best = kEntHitPx * ui::uiScale;
+    std::string bestId;
+    std::vector<Vec3> poly;
+    std::vector<ImVec2> sp;
+    for (const auto& e : ents_) {
+        samplePolyline(e, poly);
+        sp.clear();
+        for (const auto& p : poly) {
+            ImVec2 q;
+            if (worldToScreen(cam, imgMin, vw, vh, p.x, p.y, p.z, q)) sp.push_back(q);
+        }
+        if (e.type == "point" && sp.size() == 1) {
+            float d = std::hypot(s.x - sp[0].x, s.y - sp[0].y);
+            if (d < best) { best = d; bestId = e.id; }
+            continue;
+        }
+        for (size_t i = 0; i + 1 < sp.size(); ++i) {
+            float d = distPtSeg(s, sp[i], sp[i + 1]);
+            if (d < best) { best = d; bestId = e.id; }
+        }
+    }
+    return bestId;
+}
+
+bool Sketch3DMode::cursorWorld(AppState& st, const ImVec2& mouse, const ImVec2& imgMin, int vw,
+                               int vh, const Vec3* prev, Vec3& out, std::string& snapHandle,
+                               std::string& axisSnap) const {
+    snapHandle.clear();
+    axisSnap.clear();
+    if (!st.renderer) return false;
+    const auto& cam = st.renderer->camera();
+    // 1) exact point snap (existing handles + origin) — wins outright.
+    Vec3 hw;
+    std::string h;
+    if (hitTestHandle(st, mouse, imgMin, vw, vh, h, hw)) {
+        out = hw; snapHandle = h; return true;
+    }
+    // 2) ray ∩ working plane.
+    Vec3 ro, rd;
+    if (!screenRay(cam, imgMin, vw, vh, mouse, ro, rd)) return false;
+    Vec3 n = normalize(cross(wpU_, wpV_));
+    float denom = dot(n, rd);
+    if (std::fabs(denom) < 1e-6f) return false;
+    float t = dot(n, wpO_ - ro) / denom;
+    if (t < 0) return false;
+    out = ro + rd * t;
+    // 3) axis inference off the previous point: pull onto the X/Y/Z line through prev when the
+    //    projection lands within kAxisSnapPx on screen (SolidWorks-style h/v inference, in 3D).
+    if (prev) {
+        const Vec3 axes[3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+        const char* names[3] = {"x", "y", "z"};
+        float best = kAxisSnapPx * ui::uiScale;
+        for (int i = 0; i < 3; ++i) {
+            Vec3 d = out - *prev;
+            Vec3 q = *prev + axes[i] * dot(d, axes[i]);
+            ImVec2 sq, sc;
+            if (!worldToScreen(cam, imgMin, vw, vh, q.x, q.y, q.z, sq) ||
+                !worldToScreen(cam, imgMin, vw, vh, out.x, out.y, out.z, sc))
+                continue;
+            float dist = std::hypot(sq.x - sc.x, sq.y - sc.y);
+            if (dist < best) { best = dist; out = q; axisSnap = names[i]; }
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// tools
+// ---------------------------------------------------------------------------
+
+void Sketch3DMode::resetTool() {
+    tool_ = Sk3Tool::None;
+    toolPts_.clear(); toolSnaps_.clear(); toolAxes_.clear();
+    chainPrevHandle_.clear();
+}
+
+void Sketch3DMode::commitLine(AppState& st) {
+    if (toolPts_.size() < 2) return;
+    nlohmann::json cs = nlohmann::json::array();
+    if (!chainPrevHandle_.empty())
+        cs.push_back({{"type", "coincident"}, {"refs", {chainPrevHandle_, "$self.p1"}}});
+    else if (!toolSnaps_[0].empty())
+        cs.push_back({{"type", "coincident"}, {"refs", {toolSnaps_[0], "$self.p1"}}});
+    if (!toolSnaps_[1].empty())
+        cs.push_back({{"type", "coincident"}, {"refs", {toolSnaps_[1], "$self.p2"}}});
+    if (!toolAxes_.empty() && !toolAxes_[0].empty())
+        cs.push_back({{"type", "along_axis"}, {"refs", {"$self"}}, {"axis", toolAxes_[0]}});
+    nlohmann::json e = {{"type", "line"}, {"p1", vj(toolPts_[0])}, {"p2", vj(toolPts_[1])}};
+    std::string id = addEntity(st, e, cs);
+    // chain: next segment starts here
+    Vec3 last = toolPts_[1];
+    std::string lastSnap = toolSnaps_[1];
+    toolPts_.clear(); toolSnaps_.clear(); toolAxes_.clear();
+    if (!id.empty()) {
+        chainPrevHandle_ = id + ".p2";
+        toolPts_.push_back(last);
+        toolSnaps_.push_back(lastSnap);
+    }
+}
+
+void Sketch3DMode::commitArc(AppState& st) {
+    if (toolPts_.size() < 3) return;
+    nlohmann::json cs = nlohmann::json::array();
+    const char* selfH[3] = {"$self.p1", "$self.pm", "$self.p2"};
+    for (int i = 0; i < 3; ++i)
+        if (!toolSnaps_[i].empty())
+            cs.push_back({{"type", "coincident"}, {"refs", {toolSnaps_[i], selfH[i]}}});
+    nlohmann::json e = {{"type", "arc"}, {"p1", vj(toolPts_[0])}, {"pm", vj(toolPts_[1])},
+                        {"p2", vj(toolPts_[2])}};
+    addEntity(st, e, cs);
+    toolPts_.clear(); toolSnaps_.clear(); toolAxes_.clear();
+}
+
+void Sketch3DMode::commitSpline(AppState& st) {
+    if (toolPts_.size() < 2) { toolPts_.clear(); toolSnaps_.clear(); return; }
+    nlohmann::json pts = nlohmann::json::array();
+    for (const auto& p : toolPts_) pts.push_back(vj(p));
+    nlohmann::json cs = nlohmann::json::array();
+    for (size_t i = 0; i < toolSnaps_.size() && i < toolPts_.size(); ++i)
+        if (!toolSnaps_[i].empty())
+            cs.push_back({{"type", "coincident"},
+                          {"refs", {toolSnaps_[i], std::string("$self.p") + std::to_string(i)}}});
+    nlohmann::json e = {{"type", "spline"}, {"points", pts}};
+    addEntity(st, e, cs);
+    toolPts_.clear(); toolSnaps_.clear(); toolAxes_.clear();
+}
+
+void Sketch3DMode::commitPoint(AppState& st) {
+    if (toolPts_.empty()) return;
+    nlohmann::json cs = nlohmann::json::array();
+    if (!toolSnaps_[0].empty())
+        cs.push_back({{"type", "coincident"}, {"refs", {toolSnaps_[0], "$self.p"}}});
+    nlohmann::json e = {{"type", "point"}, {"p", vj(toolPts_[0])}};
+    addEntity(st, e, cs);
+    toolPts_.clear(); toolSnaps_.clear(); toolAxes_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// selection / constraints
+// ---------------------------------------------------------------------------
+
+void Sketch3DMode::toggleSel(const std::string& idOrHandle) {
+    bool isHandle = idOrHandle.find('.') != std::string::npos || idOrHandle == "origin";
+    auto& vec = isHandle ? selHandles_ : selEnts_;
+    auto it = std::find(vec.begin(), vec.end(), idOrHandle);
+    if (it != vec.end()) vec.erase(it);
+    else vec.push_back(idOrHandle);
+}
+
+void Sketch3DMode::deleteSelection(AppState& st) {
+    if (selEnts_.empty()) return;
+    nlohmann::json ents = nlohmann::json::array(), cons = nlohmann::json::array();
+    auto gone = [&](const std::string& id) {
+        return std::find(selEnts_.begin(), selEnts_.end(), id) != selEnts_.end();
+    };
+    for (const auto& e : entJson_)
+        if (!gone(e.value("id", std::string()))) ents.push_back(e);
+    for (const auto& c : conJson_) {
+        bool refsGone = false;
+        if (c.contains("refs"))
+            for (const auto& r : c["refs"]) {
+                std::string s = r.get<std::string>();
+                if (gone(s.substr(0, s.find('.')))) { refsGone = true; break; }
+            }
+        if (!refsGone) cons.push_back(c);
+    }
+    if (commitParams(st, &ents, &cons, "Delete")) clearSel();
+}
+
+void Sketch3DMode::drawConstraintButtons(AppState& st) {
+    // Classify the selection: nP point handles, line/arc entity ids.
+    const int nP = (int)selHandles_.size();
+    std::vector<std::string> lines, arcs;
+    for (const auto& id : selEnts_) {
+        const Sk3Entity* e = entById(id);
+        if (!e) continue;
+        if (e->type == "line") lines.push_back(id);
+        else if (e->type == "arc") arcs.push_back(id);
+    }
+    const int nL = (int)lines.size(), nA = (int)arcs.size(), nE = (int)selEnts_.size();
+    auto btn = [&](const char* label) { return ImGui::SmallButton(label); };
+
+    bool any = false;
+    if (nP == 2 && nE == 0) {
+        any = true;
+        if (btn("Coincident"))
+            addConstraint(st, {{"type", "coincident"}, {"refs", {selHandles_[0], selHandles_[1]}}},
+                          "Coincident"), clearSel();
+        ImGui::SameLine();
+        if (btn("Distance")) {
+            dimPendingCon_ = {{"type", "distance"}, {"refs", {selHandles_[0], selHandles_[1]}}};
+            Vec3 a = handleWorld(selHandles_[0]), b = handleWorld(selHandles_[1]);
+            dimValue_ = length(b - a);
+            dimPopupOpen_ = true; dimFocus_ = true;
+        }
+    }
+    if (nP == 1 && nL + nA == 1 && nE == 1) {
+        any = true;
+        if (btn("Point On"))
+            addConstraint(st, {{"type", "point_on"}, {"refs", {selHandles_[0], selEnts_[0]}}},
+                          "Point On"), clearSel();
+        if (nL == 1) {
+            ImGui::SameLine();
+            if (btn("Distance")) {
+                dimPendingCon_ = {{"type", "distance"}, {"refs", {selHandles_[0], lines[0]}}};
+                dimValue_ = 10.0;
+                dimPopupOpen_ = true; dimFocus_ = true;
+            }
+        }
+    }
+    if (nL == 1 && nP == 0 && nE == 1) {
+        any = true;
+        if (btn("Length")) {
+            const Sk3Entity* e = entById(lines[0]);
+            dimPendingCon_ = {{"type", "length"}, {"refs", {lines[0]}}};
+            dimValue_ = (e && e->pts.size() == 2) ? length(e->pts[1] - e->pts[0]) : 10.0;
+            dimPopupOpen_ = true; dimFocus_ = true;
+        }
+        ImGui::SameLine();
+        if (btn("Along X"))
+            addConstraint(st, {{"type", "along_axis"}, {"refs", {lines[0]}}, {"axis", "x"}},
+                          "Along X"), clearSel();
+        ImGui::SameLine();
+        if (btn("Along Y"))
+            addConstraint(st, {{"type", "along_axis"}, {"refs", {lines[0]}}, {"axis", "y"}},
+                          "Along Y"), clearSel();
+        ImGui::SameLine();
+        if (btn("Along Z"))
+            addConstraint(st, {{"type", "along_axis"}, {"refs", {lines[0]}}, {"axis", "z"}},
+                          "Along Z"), clearSel();
+    }
+    if (nL == 2 && nP == 0 && nE == 2) {
+        any = true;
+        if (btn("Parallel"))
+            addConstraint(st, {{"type", "parallel"}, {"refs", {lines[0], lines[1]}}}, "Parallel"),
+                clearSel();
+        ImGui::SameLine();
+        if (btn("Perpendicular"))
+            addConstraint(st, {{"type", "perpendicular"}, {"refs", {lines[0], lines[1]}}},
+                          "Perpendicular"), clearSel();
+        ImGui::SameLine();
+        if (btn("Angle")) {
+            dimPendingCon_ = {{"type", "angle"}, {"refs", {lines[0], lines[1]}}};
+            dimValue_ = 90.0;
+            dimPopupOpen_ = true; dimFocus_ = true;
+        }
+    }
+    if (nP + nE == 1) {
+        any = true;
+        if (btn("Fix")) {
+            std::string ref = nP == 1 ? selHandles_[0] : selEnts_[0];
+            if (ref != "origin")
+                addConstraint(st, {{"type", "fix"}, {"refs", {ref}}}, "Fix");
+            clearSel();
+        }
+    }
+    if (nE >= 1) {
+        if (any) ImGui::SameLine();
+        any = true;
+        if (btn("Delete")) deleteSelection(st);
+        ImGui::SameLine();
+        if (btn("Construction")) {
+            nlohmann::json ents = entJson_;
+            for (auto& e : ents) {
+                std::string id = e.value("id", std::string());
+                if (std::find(selEnts_.begin(), selEnts_.end(), id) != selEnts_.end())
+                    e["construction"] = !e.value("construction", false);
+            }
+            commitParams(st, &ents, nullptr, "Construction");
+        }
+    }
+    if (!any && (nP + nE) > 0) {
+        ImGui::TextDisabled("(no relation for this selection)");
+    }
+}
+
+void Sketch3DMode::drawDimPopup(AppState& st) {
+    if (!dimPopupOpen_) return;
+    ImGui::OpenPopup("sk3_dim");
+    if (ImGui::BeginPopup("sk3_dim")) {
+        const std::string t = dimPendingCon_.value("type", std::string());
+        ImGui::TextUnformatted(t == "angle" ? "Angle (deg)" : (t + " (mm)").c_str());
+        if (dimFocus_) { ImGui::SetKeyboardFocusHere(); dimFocus_ = false; }
+        bool commit = ImGui::InputDouble("##v", &dimValue_, 0, 0, "%.3f",
+                                         ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        commit = ImGui::Button("OK") || commit;
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) { dimPopupOpen_ = false; ImGui::CloseCurrentPopup(); }
+        if (commit) {
+            nlohmann::json con = dimPendingCon_;
+            con["value"] = {{"value", dimValue_}, {"expr", nullptr}};
+            addConstraint(st, con, "Dimension");
+            clearSel();
+            dimPopupOpen_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    } else {
+        dimPopupOpen_ = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// drag
+// ---------------------------------------------------------------------------
+
+void Sketch3DMode::updateDrag(AppState& st, const ImVec2& mouse, const ImVec2& imgMin, int vw,
+                              int vh) {
+    if (!st.renderer) return;
+    int frame = ImGui::GetFrameCount();
+    if (frame == dragFrame_) return;   // once per frame (repo rule: throttled sync call)
+    dragFrame_ = frame;
+    // Target = cursor ray ∩ the screen-parallel plane through the handle's press position, so
+    // the point tracks the cursor at constant depth (standard 3D handle drag).
+    const auto& cam = st.renderer->camera();
+    Vec3 ro, rd;
+    if (!screenRay(cam, imgMin, vw, vh, mouse, ro, rd)) return;
+    Vec3 n = normalize(cam.eye - dragOrig_);
+    float denom = dot(n, rd);
+    if (std::fabs(denom) < 1e-6f) return;
+    float t = dot(n, dragOrig_ - ro) / denom;
+    if (t < 0) return;
+    Vec3 target = ro + rd * t;
+    nlohmann::json res;
+    nlohmann::json extra = {{"handle", dragHandle_}, {"xyz", vj(target)}};
+    if (callSk3(st, "sketch3d_drag", extra, res)) {
+        if (res.value("ok", false)) {
+            applyEntities(res);
+            if (res.contains("entities")) dragEntities_ = res["entities"];
+        }
+    }
+}
+
+void Sketch3DMode::commitDrag(AppState& st) {
+    if (dragEntities_.is_array() && !dragEntities_.empty()) {
+        // Contract §4.3: commit = plain edit_feature with the last drag response's entities.
+        commitParams(st, &dragEntities_, nullptr, "Drag");
+    }
+    dragEntities_ = nlohmann::json();
+    dragHandle_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// overlay (draw + interaction)
+// ---------------------------------------------------------------------------
+
+void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
+                               const ImVec2& imgMax, int vw, int vh, bool imgHovered) {
+    if (!active_) return;
+    // Doc switched underneath us (tab change / close): drop out cleanly.
+    if (!st.docMirror.hasDoc() || st.docMirror.docId() != docId_) { exitSketch(st, true); return; }
+    if (!st.renderer) return;
+    const auto& cam = st.renderer->camera();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->PushClipRect(imgMin, imgMax, true);
+
+    drawPlaneGrid(dl, st, imgMin, vw, vh);
+
+    // ---- hover ----
+    hovHandle_.clear(); hovEnt_.clear();
+    if (imgHovered && !dragging_) {
+        Vec3 hw;
+        if (!hitTestHandle(st, io.MousePos, imgMin, vw, vh, hovHandle_, hw))
+            hovEnt_ = hitTestEntity(st, io.MousePos, imgMin, vw, vh);
+    }
+
+    // ---- entities ----
+    const auto& pal = ui::palette;
+    std::vector<Vec3> poly;
+    std::vector<ImVec2> sp;
+    for (const auto& e : ents_) {
+        bool sel = std::find(selEnts_.begin(), selEnts_.end(), e.id) != selEnts_.end();
+        bool hov = hovEnt_ == e.id;
+        const float* role = e.status == "over" ? pal.statusErr
+                          : e.status == "full" ? pal.sketchInk : pal.sketchUnder;
+        ImU32 c = sel ? col(pal.accent) : hov ? col3(pal.accent, 0.85f) : col(role);
+        float th = (sel || hov ? 3.0f : 2.0f) * ui::uiScale;
+        samplePolyline(e, poly);
+        sp.clear();
+        for (const auto& p : poly) {
+            ImVec2 q;
+            if (worldToScreen(cam, imgMin, vw, vh, p.x, p.y, p.z, q)) sp.push_back(q);
+        }
+        if (e.type == "point") {
+            if (!sp.empty()) dl->AddCircleFilled(sp[0], 3.5f * ui::uiScale, c);
+        } else if (e.construction) {
+            // dashed construction stroke
+            for (size_t i = 0; i + 1 < sp.size(); ++i) {
+                ImVec2 a = sp[i], b = sp[i + 1];
+                float len = std::hypot(b.x - a.x, b.y - a.y);
+                int nd = (int)(len / (8.0f * ui::uiScale)) + 1;
+                for (int k = 0; k < nd; k += 2) {
+                    float t0 = (float)k / nd, t1 = std::min(1.0f, (float)(k + 1) / nd);
+                    dl->AddLine(ImVec2(a.x + (b.x - a.x) * t0, a.y + (b.y - a.y) * t0),
+                                ImVec2(a.x + (b.x - a.x) * t1, a.y + (b.y - a.y) * t1), c,
+                                th * 0.75f);
+                }
+            }
+        } else {
+            for (size_t i = 0; i + 1 < sp.size(); ++i) dl->AddLine(sp[i], sp[i + 1], c, th);
+        }
+        // point handles (defining points)
+        for (int k = 0; k < (int)e.pts.size(); ++k) {
+            ImVec2 q;
+            if (!worldToScreen(cam, imgMin, vw, vh, e.pts[k].x, e.pts[k].y, e.pts[k].z, q))
+                continue;
+            std::string h = handleName(e, k);
+            bool hh = hovHandle_ == h || (dragging_ && dragHandle_ == h);
+            bool hs = std::find(selHandles_.begin(), selHandles_.end(), h) != selHandles_.end();
+            float r = kHandlePx * ui::uiScale * (hh ? 1.4f : 1.0f);
+            ImU32 hc = hs || hh ? col(pal.accent) : col(pal.sketchInk);
+            dl->AddRectFilled(ImVec2(q.x - r, q.y - r), ImVec2(q.x + r, q.y + r), hc);
+        }
+    }
+
+    // ---- tool rubber band ----
+    if (tool_ != Sk3Tool::None && imgHovered) {
+        const Vec3* prev = toolPts_.empty() ? nullptr : &toolPts_.back();
+        Vec3 cur;
+        std::string snapH, axisS;
+        bool haveCur = cursorWorld(st, io.MousePos, imgMin, vw, vh, prev, cur, snapH, axisS);
+        if (haveCur) {
+            ImVec2 sc;
+            if (worldToScreen(cam, imgMin, vw, vh, cur.x, cur.y, cur.z, sc)) {
+                dl->AddCircle(sc, 4.0f * ui::uiScale, col(pal.accent), 0, 1.5f);
+                if (!snapH.empty())
+                    dl->AddCircle(sc, 8.0f * ui::uiScale, col(pal.sketchInfer), 0, 1.5f);
+            }
+            if (prev) {
+                ImVec2 a, b;
+                if (worldToScreen(cam, imgMin, vw, vh, prev->x, prev->y, prev->z, a) &&
+                    worldToScreen(cam, imgMin, vw, vh, cur.x, cur.y, cur.z, b)) {
+                    ImU32 rb = axisS.empty() ? col3(pal.accent, 0.7f) : col(pal.sketchInfer);
+                    dl->AddLine(a, b, rb, 1.5f * ui::uiScale);
+                    if (!axisS.empty()) {
+                        char lab[16];
+                        std::snprintf(lab, sizeof lab, "along %s", axisS.c_str());
+                        dl->AddText(ImVec2(b.x + 10, b.y - 14), col(pal.sketchInfer), lab);
+                    }
+                }
+            }
+            // click = place a point
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                toolPts_.push_back(cur);
+                toolSnaps_.push_back(snapH);
+                if (tool_ == Sk3Tool::Line) {
+                    toolAxes_.assign(1, axisS);
+                    if (toolPts_.size() == 2) commitLine(st);
+                } else if (tool_ == Sk3Tool::Arc3) {
+                    if (toolPts_.size() == 3) commitArc(st);
+                } else if (tool_ == Sk3Tool::Point) {
+                    commitPoint(st);
+                }
+                // spline collects until Enter / double-click
+            }
+            if (tool_ == Sk3Tool::Spline &&
+                (ImGui::IsKeyPressed(ImGuiKey_Enter) ||
+                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)))
+                commitSpline(st);
+        }
+        // Esc: end the chain / drop the tool.
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            if (tool_ == Sk3Tool::Spline && toolPts_.size() >= 2) commitSpline(st);
+            if (!toolPts_.empty() || !chainPrevHandle_.empty()) {
+                toolPts_.clear(); toolSnaps_.clear(); toolAxes_.clear();
+                chainPrevHandle_.clear();
+            } else {
+                resetTool();
+            }
+        }
+        // Right-click ends a line chain without dropping the tool.
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            toolPts_.clear(); toolSnaps_.clear(); toolAxes_.clear();
+            chainPrevHandle_.clear();
+        }
+        st.requestCursor(ui::CursorKind::Crosshair);
+    }
+
+    // ---- selection / drag (tool None) ----
+    if (tool_ == Sk3Tool::None) {
+        const float kDragArmPx = 5.0f * ui::uiScale;   // matches the 2D sketcher's threshold
+        if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !dragging_ &&
+            !dragArmed_) {
+            if (!hovHandle_.empty()) {
+                dragArmed_ = true;
+                dragHandle_ = hovHandle_;
+                dragOrig_ = handleWorld(hovHandle_);
+                dragDownPos_ = io.MousePos;
+            } else if (!hovEnt_.empty()) {
+                if (!io.KeyCtrl) clearSel();
+                toggleSel(hovEnt_);
+            } else if (!io.KeyCtrl) {
+                clearSel();
+            }
+        }
+        if (dragArmed_ && !dragging_ && ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+            dragHandle_ != "origin") {
+            if (std::hypot(io.MousePos.x - dragDownPos_.x, io.MousePos.y - dragDownPos_.y) >
+                kDragArmPx) {
+                dragging_ = true;
+                dragArmed_ = false;
+                dragFrame_ = -1;
+                dragEntities_ = nlohmann::json();
+            }
+        }
+        if (dragging_ && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            updateDrag(st, io.MousePos, imgMin, vw, vh);
+            st.requestCursor(ui::CursorKind::Hand);
+            // Edge auto-pan (Hunter UX): camera dead-still except a quadratic ramp inside the
+            // edge band — mirrors the 2D sketcher's tuning.
+            const float kBandPx = 48.0f * ui::uiScale;
+            const float kMaxPx = 540.0f * ui::uiScale;
+            auto ramp = [](float t) { t = t < 0 ? 0 : (t > 1 ? 1 : t); return t * t; };
+            float ox = ramp((imgMin.x + kBandPx - io.MousePos.x) / kBandPx) * -1.f +
+                       ramp((io.MousePos.x - (imgMax.x - kBandPx)) / kBandPx);
+            float oy = ramp((imgMin.y + kBandPx - io.MousePos.y) / kBandPx) * -1.f +
+                       ramp((io.MousePos.y - (imgMax.y - kBandPx)) / kBandPx);
+            if (ox != 0.0f || oy != 0.0f) {
+                float dt = io.DeltaTime < 0.1f ? io.DeltaTime : 0.1f;
+                float gx = -ox * kMaxPx * dt, gy = -oy * kMaxPx * dt;
+                const float deg = 3.14159265f / 180.0f;
+                const float fov = Renderer::kFovDeg * deg;
+                float zc = st.zoom < 0.05f ? 0.05f : st.zoom;
+                float dist = st.renderer->effectiveSceneRadius() / std::sin(fov * 0.5f) * 1.05f / zc;
+                float worldPerPx = 2.0f * dist * std::tan(fov * 0.5f) / (float)(vh > 1 ? vh : 1);
+                float yr = st.yaw * deg, pr = st.pitch * deg;
+                Vec3 vdir(std::cos(pr) * std::sin(yr), -std::cos(pr) * std::cos(yr), std::sin(pr));
+                Vec3 wUp = normalize(Vec3(-std::sin(pr) * std::sin(yr),
+                                          std::sin(pr) * std::cos(yr), std::cos(pr)));
+                Vec3 V = normalize(vdir);
+                Vec3 R = normalize(cross(wUp, V));
+                Vec3 U = normalize(cross(V, R));
+                st.pan[0] += (-R.x * gx + U.x * gy) * worldPerPx;
+                st.pan[1] += (-R.y * gx + U.y * gy) * worldPerPx;
+                st.pan[2] += (-R.z * gx + U.z * gy) * worldPerPx;
+            }
+        }
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+            if (dragging_) {
+                dragging_ = false;
+                commitDrag(st);
+            } else if (dragArmed_) {
+                // click-without-move = select the point handle
+                if (!io.KeyCtrl && hovEnt_.empty()) { /* keep multi via ctrl only */ }
+                toggleSel(dragHandle_);
+                dragArmed_ = false;
+                dragHandle_.clear();
+            }
+        }
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) dragArmed_ = false;
+        if ((ImGui::IsKeyPressed(ImGuiKey_Delete) || ImGui::IsKeyPressed(ImGuiKey_Backspace)) &&
+            !io.WantTextInput)
+            deleteSelection(st);
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape) && !dimPopupOpen_) clearSel();
+    }
+
+    // Tab cycles the working plane preset (documented in the contract appendix).
+    if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Tab))
+        setPlanePreset(st, (wpPreset_ + 1) % 4);
+    // Working plane follows the drawing chain so a polyline can turn in space: anchor at the
+    // last placed point (or the origin when idle).
+    wpO_ = toolPts_.empty() ? Vec3{0, 0, 0} : toolPts_.back();
+    if (wpPreset_ == 3) setPlanePreset(st, 3);   // view-aligned tracks the live camera
+
+    dl->PopClipRect();
+
+    // ---- toolbar (glass strip, top-center of the viewport) ----
+    {
+        ImGui::SetNextWindowPos(ImVec2((imgMin.x + imgMax.x) * 0.5f, imgMin.y + 12.0f * ui::uiScale),
+                                ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+        ImGui::SetNextWindowBgAlpha(0.85f);
+        if (ImGui::Begin("##sk3toolbar", nullptr,
+                         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDecoration |
+                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                             ImGuiWindowFlags_NoNav)) {
+            auto toolBtn = [&](const char* label, Sk3Tool t) {
+                bool on = tool_ == t;
+                if (on) ImGui::PushStyleColor(ImGuiCol_Button,
+                                              ImVec4(ui::palette.accent[0], ui::palette.accent[1],
+                                                     ui::palette.accent[2], 0.65f));
+                if (ImGui::SmallButton(label)) {
+                    if (on) resetTool();
+                    else { resetTool(); tool_ = t; clearSel(); }
+                }
+                if (on) ImGui::PopStyleColor();
+                ImGui::SameLine();
+            };
+            ImGui::TextDisabled("3D Sketch");
+            ImGui::SameLine();
+            toolBtn("Select", Sk3Tool::None);
+            toolBtn("Line", Sk3Tool::Line);
+            toolBtn("Arc", Sk3Tool::Arc3);
+            toolBtn("Spline", Sk3Tool::Spline);
+            toolBtn("Point", Sk3Tool::Point);
+            bool con = constructionOn_;
+            if (con) ImGui::PushStyleColor(ImGuiCol_Button,
+                                           ImVec4(ui::palette.accent[0], ui::palette.accent[1],
+                                                  ui::palette.accent[2], 0.65f));
+            if (ImGui::SmallButton("Constr.")) constructionOn_ = !constructionOn_;
+            if (con) ImGui::PopStyleColor();
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            const char* planeNames[4] = {"XY", "XZ", "YZ", "View"};
+            for (int i = 0; i < 4; ++i) {
+                bool on = wpPreset_ == i;
+                if (on) ImGui::PushStyleColor(ImGuiCol_Button,
+                                              ImVec4(ui::palette.accent[0], ui::palette.accent[1],
+                                                     ui::palette.accent[2], 0.65f));
+                if (ImGui::SmallButton(planeNames[i])) setPlanePreset(st, i);
+                if (on) ImGui::PopStyleColor();
+                ImGui::SameLine();
+            }
+            ImGui::TextDisabled("(Tab)");
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Finish")) { ImGui::End(); exitSketch(st, true); return; }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Cancel")) { ImGui::End(); exitSketch(st, false); return; }
+
+            // second row: contextual constraints for the current selection + status
+            if (!selEnts_.empty() || !selHandles_.empty()) drawConstraintButtons(st);
+            std::string sl = statusLine();
+            if (nWires_ > 0) sl += "   wires: " + std::to_string(nWires_);
+            const float* role = status_ == "over" || !converged_ ? ui::palette.statusErr
+                              : status_ == "full" ? ui::palette.statusOk : ui::palette.sketchUnder;
+            ImGui::TextColored(ImVec4(role[0], role[1], role[2], 1), "%s", sl.c_str());
+            drawDimPopup(st);
+        }
+        ImGui::End();
+    }
+}
+
+}  // namespace ui

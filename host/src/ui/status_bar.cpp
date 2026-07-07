@@ -9,6 +9,7 @@
 
 #include "../core/app_state.h"
 #include "sketch_mode.h"   // C18
+#include "sketch3d_mode.h" // 3D sketch status readout
 #include "../core/sim_client.h"
 
 namespace ui {
@@ -76,6 +77,18 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     if (auto* sk = st.sketchMode) {
         if (sk->active()) {
             std::string sl = sk->statusLine();
+            if (!sl.empty()) {
+                ImGui::SameLine();
+                const float* role = sl.rfind("Over", 0) == 0 ? pal.statusErr
+                                  : sl.rfind("Fully", 0) == 0 ? pal.statusOk : pal.sketchUnder;
+                ImGui::TextColored(ImVec4(role[0], role[1], role[2], 1), "|  %s", sl.c_str());
+            }
+        }
+    }
+    // 3D sketch: same Under/Fully/Over Defined + DOF readout while the 3D sketcher is active.
+    if (auto* sk3 = st.sketch3dMode) {
+        if (sk3->active()) {
+            std::string sl = sk3->statusLine();
             if (!sl.empty()) {
                 ImGui::SameLine();
                 const float* role = sl.rfind("Over", 0) == 0 ? pal.statusErr

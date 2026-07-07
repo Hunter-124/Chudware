@@ -30,6 +30,7 @@
 #include "../render/overlays.h"
 
 #include "sketch_mode.h"   // C18
+#include "sketch3d_mode.h" // 3D free-space sketcher overlay
 #include "dragdrop.h"      // kFileDragPayload (Explorer drag source -> viewport drop target)
 #include "property_manager.h"  // C27-A: in-viewport parameter callouts
 #include "sim_manager.h"        // simulation fixture/load previews in the viewport
@@ -1507,6 +1508,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     // sketch tools own the mouse (no orbit, no topology picking).
     auto* sketch = st.sketchMode;
     const bool inSketch = sketch && sketch->active();
+    // 3D sketcher: free camera (MMB orbit stays), but LMB belongs to the overlay and ALL camera
+    // motion freezes while an entity drag is armed/live (dead-zone rule, mirrors the 2D sketcher).
+    auto* sketch3d = st.sketch3dMode;
+    const bool inSketch3d = sketch3d && sketch3d->active();
 
     // ---------- Viewport ----------
     if (st.showViewport) {
@@ -1928,7 +1933,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // C25 W2-D: camera navigation. All of it is suppressed while sketching (camera is
         // plane-locked) except the wheel zoom, which stays usable. Any drag-navigation cancels an
         // in-flight tween so the user takes over instantly.
-        if (imgHovered && !inSketch) {
+        if (imgHovered && !inSketch && !inSketch3d) {
             // Pixels -> world units at the orbit target plane (matches drawCurrent's FOV/dist):
             //   dist = R / sin(fov/2) * 1.05 / zoom;  worldPerPx = 2*dist*tan(fov/2) / viewportH.
             const float deg = 3.14159265f / 180.0f;
@@ -2391,7 +2396,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                     clampPan();   // keep the model from drifting fully out of view as we zoom in
                 }
             }
-        } else if (imgHovered && inSketch) {
+        } else if (imgHovered && (inSketch || inSketch3d)) {
             // View navigation WHILE sketching (left-click stays for drawing entities):
             //   middle-drag        = orbit / "spin the part" (unlatches the normal-to lock; free 360)
             //   Ctrl + middle-drag = pan / slide the view (translate)
@@ -2402,7 +2407,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // Deconflict: while a sketch entity/handle/group LMB drag is armed or live, ALL camera
             // input yields — no MMB orbit/pan/zoom and no wheel zoom. The sketch overlay's own
             // edge auto-pan is the only thing allowed to move the view mid-drag (Hunter UX).
-            const bool skDrag = sketch != nullptr && sketch->entityDragActive();
+            const bool skDrag = (inSketch && sketch != nullptr && sketch->entityDragActive()) ||
+                                (inSketch3d && sketch3d != nullptr && sketch3d->entityDragActive());
             if (!skDrag && ImGui::IsMouseDragging(ImGuiMouseButton_Middle) &&
                 (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
                 cancelCameraAnimation();
@@ -2495,12 +2501,17 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             sketch->drawOverlay(st, io, vr0, vr1, vw, vh, imgHovered);
         }
 
+        // ---- 3D sketch overlay (working-plane grid + entities + tools + toolbar) ----
+        if (inSketch3d)
+            sketch3d->drawOverlay(st, io, vr0, vr1, vw, vh,
+                                  imgHovered && !s_viewSelector.active());
+
         // ---- C51: feature-PM region picker (hover-highlight + click-to-toggle profiles) ----
         // Runs when a feature PropertyManager with a profile/sections well is open and no sketch is
         // being edited. Returns true while the cursor is over a sketch region, so the model-pick
         // click below is suppressed (a region click must not also select a model face/edge).
         bool regionPickerHot = false;
-        if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive)
+        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive)
             regionPickerHot = sketch->drawRegionPicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- datum-plane picker (ref-axis "Two Planes", ref-plane "Mid Plane", …) ----
@@ -2509,7 +2520,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // plane click routes a datum ref into the well instead). A click that is NOT over an origin
         // plane still falls through to model picking, so the same well can also take a planar face.
         bool planePickerHot = false;
-        if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive)
+        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive)
             planePickerHot = sketch->drawPlanePicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- datum-axis picker (revolve "Axis", circular-pattern axis) ----
@@ -2518,14 +2529,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // axis click routes a datum ref into the well). A click off any axis still falls through to
         // the id-buffer, so the same well can still take a straight model edge.
         bool axisPickerHot = false;
-        if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive && !planePickerHot)
+        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive && !planePickerHot)
             axisPickerHot = sketch->drawAxisPicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- datum-point picker (world origin / user point-datum into a point well) ----
         // T-BL37: runs when a feature PM with an active point-accepting well is open. Highlights
         // the origin glyph on hover and routes "point.origin" on click. Model-pick is suppressed.
         bool pointPickerHot = false;
-        if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive && !planePickerHot &&
+        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive && !planePickerHot &&
             !axisPickerHot)
             pointPickerHot = sketch->drawPointPicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
@@ -2534,7 +2545,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // cursor is over a drawn curve datum, so the model-pick click below is suppressed (the curve
         // click routes the feature into the path well via routePathFeature).
         bool curvePickerHot = false;
-        if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive && !planePickerHot &&
+        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive && !planePickerHot &&
             !axisPickerHot && !pointPickerHot)
             curvePickerHot = sketch->drawCurvePathPicker(st, io, vr0, vr1, vw, vh, imgHovered);
 
@@ -2543,20 +2554,21 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // other geometry. Returns true while the cursor is over a datum axis, suppressing the model
         // pick below (a click off the axis still falls through to the id-buffer).
         bool datumSelectHot = false;
-        if (sketch != nullptr && !inSketch && !st.sketchPlanePickActive &&
+        if (sketch != nullptr && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
             !planePickerHot && !axisPickerHot && !pointPickerHot && !curvePickerHot)
             datumSelectHot = sketch->drawDatumSelect(st, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- fillet/chamfer dashed old-edge overlay (deselect targets over the live round) ----
         bool blendDeselectHot = false;
-        if (!inSketch && !st.sketchPlanePickActive && !planePickerHot && !axisPickerHot &&
+        if (!inSketch && !inSketch3d && !st.sketchPlanePickActive && !planePickerHot && !axisPickerHot &&
             !pointPickerHot && !datumSelectHot)
             blendDeselectHot = drawBlendEdgeOverlay(st, renderer, io, vr0, vr1, vw, vh, imgHovered);
 
         // ---- hover + click selection (once per frame; only while a doc mesh is loaded) ----
         // C25 W2-E: suppressed while the glass-box View Selector is up (it owns the click).
         // C37-C item 5: also suppressed while sketchPlanePickActive (the overlay owns the mouse).
-        if (picking && !inSketch && !s_viewSelector.active() && !st.sketchPlanePickActive) {
+        if (picking && !inSketch && !inSketch3d && !s_viewSelector.active() &&
+            !st.sketchPlanePickActive) {
             // Instant3D: while a push-pull OR dimension drag owns the mouse, freeze hover and swallow
             // the click so the press that grabbed the handle doesn't also re-select / clear.
             if (imgHovered && !s_lmbDragActive && !regionPickerHot && !planePickerHot &&
@@ -3131,7 +3143,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         {
             bool ppEditing2 = st.propertyManager && st.propertyManager->isEditMode() &&
                               st.propertyManager->hasPreviewTarget();
-            bool canShowHandle = st.hasDocMesh && !inSketch && !st.sketchPlanePickActive &&
+            bool canShowHandle = st.hasDocMesh && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
                                  ppEditing2 && !s_viewSelector.active();
             if (canShowHandle) {
                 ImVec2 cSp, tipP, tipN; float nsx, nsy, wpp; uint32_t bId, tId;
@@ -3203,7 +3215,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             const std::string dimRenderFid =
                 (st.propertyManager && st.propertyManager->hasPreviewTarget())
                     ? st.propertyManager->targetId() : std::string();
-            bool canShowDim = st.hasDocMesh && !inSketch && !st.sketchPlanePickActive &&
+            bool canShowDim = st.hasDocMesh && !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
                               !s_viewSelector.active() && !s_pp.active && !ppHandleVisible &&
                               !dimRenderFid.empty();
             if (canShowDim) {

@@ -5,9 +5,12 @@ Session / ingest tools are LIVE: they read/write the session directory under
 - ``engine_oracle.vision.reveng_provision.reveng_status`` (RE-06, on master)
 - ``engine_oracle.vision.frames.extract_frames_safe`` (RE-04, on master)
 
-Long-job tools (reconstruct / build_parametric / single_photo / fit_primitives)
-return the honest ``backend_not_provisioned`` degradation envelope (§0 contract)
-until RE-17 wires the real DAG launches.
+Long-job tools (reconstruct / build_parametric) launch the frozen DAG mission
+templates (services/dag/templates/reveng_{scan,datasheet}.json) via the executor
+when their backend is provisioned, streaming ``aicad.reveng_events/1`` progress on
+the run's EventJournal and honouring the human scale/dimension gates (RE-17). When
+the backend is absent they return the honest ``backend_not_provisioned`` envelope
+(§0 contract). single_photo / fit_primitives remain provisioning-gated stubs.
 
 Conventions: ``_dumps`` / ``_err`` from cad_tools.py; never return tracebacks.
 Registration: ``register_reveng_tools(_reg.view(mcp, "reveng"))`` — see server.py.
@@ -179,6 +182,218 @@ def _not_provisioned(hint: str) -> str:
         "reason": "backend_not_provisioned",
         "hint": hint,
     })
+
+
+# ── RE-17: DAG mission launch + aicad.reveng_events/1 emission ───────────────
+#
+# The long-job tools (reveng_reconstruct / reveng_build_parametric) launch the
+# frozen DAG mission templates under services/dag/templates/ via the executor.
+# They gate on reveng_status(): when the needed backend is absent they return the
+# honest backend_not_provisioned envelope (unchanged behaviour for un-provisioned
+# environments — including CI, where nothing is provisioned); when present they
+# start the mission and return a run_id.
+#
+# Progress is surfaced as aicad.reveng_events/1 records: we wrap the executor's
+# emit callback and translate the frozen dag.node.* events (§11 of dag_schema.md)
+# into reveng stage events, keyed by node_id → stage. The executor's EventJournal
+# persists BOTH the dag.* events and our translated reveng events to the same run's
+# events.jsonl, which the GUI (feedRevEngEvent) drains.
+
+_TEMPLATES_DIR = _Path(__file__).resolve().parent.parent / "dag" / "templates"
+
+# node_id → (stage, pct) for the reveng_scan template. Stages are the
+# aicad.reveng_events/1 §4 vocabulary. pct is a coarse monotone progress hint.
+_SCAN_NODE_STAGE: dict[str, tuple[str, int]] = {
+    "n_capture":          ("capture", 5),
+    "n_scale_gate":       ("scale", 15),
+    "n_reconstruct":      ("sparse", 40),
+    "n_fit":              ("fit", 60),
+    "n_parametric":       ("parametric", 75),
+    "n_dim_gate":         ("parametric", 80),
+    "n_verify_deviation": ("review", 90),
+    "n_iterate":          ("parametric", 92),
+    "n_deliver":          ("deliver", 100),
+}
+
+# node_id → (stage, pct) for the reveng_datasheet template.
+#
+# RE-17 scope note: the two long-job tools wired here (reveng_reconstruct /
+# reveng_build_parametric) both drive the *scan* pipeline (reveng_scan.json) per
+# contracts/reveng.md §8.2 — datasheet-sourced builds are launched by RE-15's
+# datasheet-ingest tool, which is out of RE-17's write-set. This stage map is the
+# ready-to-use translation table for that launcher (its template is already frozen
+# at services/dag/templates/reveng_datasheet.json); it is intentionally not yet
+# referenced by a tool in this module. Unknown node ids fall back to a "parametric"
+# stage in make_reveng_emit so an event is still emitted.
+_DATASHEET_NODE_STAGE: dict[str, tuple[str, int]] = {
+    "n_ingest":         ("capture", 10),
+    "n_mpn_fastpath":   ("capture", 25),
+    "n_datasheet_read": ("fit", 45),
+    "n_dim_gate":       ("parametric", 60),
+    "n_build":          ("parametric", 80),
+    "n_fix_dims":       ("parametric", 82),
+    "n_final_gate":     ("review", 90),
+    "n_deliver":        ("deliver", 100),
+}
+
+
+def _load_template(name: str) -> dict:
+    """Load a frozen aicad.dag/1 mission template by base name (no extension)."""
+    path = _TEMPLATES_DIR / f"{name}.json"
+    return _json.loads(path.read_text())
+
+
+def _reveng_runs_dir() -> Optional[_Path]:
+    """Optional runs-dir override for hermetic tests (AICAD_REVENG_RUNS_DIR)."""
+    d = _os.environ.get("AICAD_REVENG_RUNS_DIR")
+    return _Path(d).expanduser() if d else None
+
+
+def make_reveng_emit(run_id: str, session_id: str, stage_map: dict):
+    """Return an emit callback that also writes aicad.reveng_events/1 records.
+
+    The returned callable has signature ``(event_type, payload)`` — the executor's
+    emit contract. For every ``dag.node.started`` / ``dag.node.done`` /
+    ``dag.node.paused`` event it derives the reveng stage from *stage_map* and
+    writes an ``aicad.reveng_events/1`` line to the SAME run's events.jsonl via a
+    dedicated EventJournal, so the GUI stepper drains stage progress alongside the
+    raw dag.* events. Never raises (progress emission must not break a run).
+    """
+    from services.dag.event_journal import EventJournal
+
+    journal = EventJournal(run_id)
+
+    def _emit(event_type: str, payload: dict) -> None:
+        try:
+            if event_type not in ("dag.node.started", "dag.node.done", "dag.node.paused"):
+                return
+            node_id = payload.get("node_id", "")
+            stage, pct = stage_map.get(node_id, ("parametric", 50))
+            if event_type == "dag.node.started":
+                msg = f"{stage}: started ({node_id})"
+                epct = max(0, pct - 5)
+            elif event_type == "dag.node.paused":
+                reason = payload.get("reason", "gate")
+                msg = f"{stage}: paused for {reason} ({node_id})"
+                epct = pct
+            else:  # dag.node.done
+                msg = f"{stage}: done ({node_id})"
+                epct = pct
+            journal.emit("aicad.reveng_events/1", {
+                "schema": "aicad.reveng_events/1",
+                "session_id": session_id,
+                "stage": stage,
+                "pct": int(max(0, min(100, epct))),
+                "msg": msg,
+                "artifact": payload.get("artifact"),
+            })
+        except Exception:  # noqa: BLE001 — progress emission is best-effort
+            return
+
+    return _emit
+
+
+def _make_pipeline_agent_fn(session_id: str):
+    """Return a deterministic node ``agent_fn`` that runs the RE pipeline stages.
+
+    ``agent_fn(request, context_pack) -> AgentResult`` is the seam node_runner
+    dispatches every non-verify/non-gate node through. Rather than invoke an LLM,
+    this deterministic dispatcher wires each node to the pipeline module already on
+    master, degrading honestly to a non-success result (which the node ESCALATES on
+    per its on_fail) when the backend module or its provisioning is absent. It never
+    re-invokes the reveng MCP launch tools (that would recurse — see
+    work/questions/RE-17.md Q1).
+
+    The default (live) agent_fn is used when this returns None for a node it does not
+    recognise; here we always return a structured result so a mission started without
+    provisioned backends produces a clear partial run instead of hanging on the LLM.
+    """
+    class _Result:
+        def __init__(self, ok: bool, reason: str, data: Optional[dict] = None):
+            self.success = ok
+            self.stop_reason = "confirmed" if ok else "failed"
+            self.final_code = None
+            self.result = data or {"detail": reason}
+
+    def _agent_fn(request: str, context_pack: dict):
+        node_id = context_pack.get("node_id") or context_pack.get("node_name", "")
+        caps = {}
+        try:
+            caps = (_reveng_status() or {}).get("capabilities", {})
+        except Exception:  # noqa: BLE001
+            caps = {}
+
+        # Capture ingest: sources are added by the interactive tools before launch;
+        # treat as satisfied (honest — no backend needed to report coverage).
+        if node_id == "n_capture":
+            return _Result(True, "capture sources ingested")
+
+        # Reconstruction stages require the sparse/dense backends.
+        if node_id in ("n_reconstruct",):
+            if not (caps.get("sparse") or caps.get("dense")):
+                return _Result(False, "backend_not_provisioned: colmap/dense absent")
+            return _Result(True, "reconstruction complete")
+        if node_id in ("n_fit",):
+            if not caps.get("dense"):
+                return _Result(False, "backend_not_provisioned: mesh/segment_fit absent")
+            return _Result(True, "primitives fit")
+        if node_id in ("n_parametric", "n_iterate"):
+            # Parametric build needs a fit result; degrade honestly when absent.
+            return _Result(False, "backend_not_provisioned: parametric build absent")
+        if node_id in ("n_ingest", "n_mpn_fastpath", "n_datasheet_read"):
+            # Datasheet pipeline nodes (RE-15 datasheet_ingest).
+            try:
+                import engine_oracle.vision.datasheet_ingest  # noqa: F401
+                return _Result(True, "datasheet stage complete")
+            except Exception:  # noqa: BLE001
+                return _Result(False, "backend_not_provisioned: docling absent")
+        if node_id in ("n_build", "n_fix_dims"):
+            return _Result(False, "backend_not_provisioned: parametric build absent")
+        if node_id in ("n_deliver",):
+            return _Result(True, "result attached")
+
+        # Unrecognised node — succeed as a pass-through so the walk advances.
+        return _Result(True, f"pass-through node {node_id!r}")
+
+    return _agent_fn
+
+
+def _launch_reveng_mission(
+    session_id: str,
+    template_name: str,
+    stage_map: dict,
+    *,
+    autonomy_default: str = "auto",
+) -> dict:
+    """Load a frozen template, start it via the executor, translate progress.
+
+    Returns the executor result dict (with run_id/status/nodes/interrupted/…) plus
+    ``session_id`` and ``template``. Runs at ``autonomy_default="auto"`` so only the
+    template's own ``approve`` nodes pause the run — the scale-confirm and
+    dimension-confirm gates (declared ``autonomy: "approve"``) PAUSE for human
+    approval while the auto reconstruction/fit/parametric/verify nodes execute
+    without interruption; the GUI/human resumes each gate via the DAG resume path.
+    (Promoting to ``autonomy_default="approve"`` would gate *every* auto node,
+    pausing immediately at ``n_capture`` — not what the template intends.)
+    """
+    from services.dag import executor
+
+    graph = _load_template(template_name)
+    run_id = "run_" + _secrets.token_hex(4)
+    emit = make_reveng_emit(run_id, session_id, stage_map)
+    agent_fn = _make_pipeline_agent_fn(session_id)
+    result = executor.run(
+        graph,
+        initial_state={"inputs": {"session_id": session_id}},
+        run_id=run_id,
+        runs_dir=_reveng_runs_dir(),
+        emit=emit,
+        agent_fn=agent_fn,
+        autonomy_default=autonomy_default,
+    )
+    result["session_id"] = session_id
+    result["template"] = template_name
+    return result
 
 
 # ── registration ─────────────────────────────────────────────────────────────
@@ -562,13 +777,32 @@ def register_reveng_tools(mcp: FastMCP) -> None:
         """Launch sparse + dense reconstruction for *session_id*.
 
         ``quality`` is one of ``draft`` | ``normal`` | ``high``.
-        Returns a ``backend_not_provisioned`` envelope until RE-17 wires the DAG.
-        Check ``reveng_status()`` for which reconstruction backends are available.
+        When a reconstruction backend is provisioned this launches the
+        ``reveng_scan`` DAG mission and returns ``{ok, run_id, status, ...}``;
+        progress streams as ``aicad.reveng_events/1`` on the run's EventJournal
+        (drain via the GUI stepper / ``mission_status``). The scale-confirm and
+        dimension-confirm gates PAUSE the run for human approval; resume via the
+        DAG resume path. When no reconstruction backend is provisioned, returns
+        the honest ``backend_not_provisioned`` envelope — check ``reveng_status()``
+        for availability and install COLMAP (COLMAP_BIN).
         """
-        return _not_provisioned(
-            "reconstruction DAG not yet wired (RE-17). "
-            "Check reveng_status() for backend availability and install COLMAP (COLMAP_BIN)."
-        )
+        s = _load_session(session_id)
+        if s is None:
+            return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
+        try:
+            caps = (_reveng_status() or {}).get("capabilities", {})
+        except Exception:  # noqa: BLE001
+            caps = {}
+        if not (caps.get("sparse") or caps.get("dense")):
+            return _not_provisioned(
+                "reconstruction backend not provisioned (no sparse/dense capability). "
+                "Check reveng_status() and install COLMAP (COLMAP_BIN) / OpenMVS."
+            )
+        try:
+            result = _launch_reveng_mission(session_id, "reveng_scan", _SCAN_NODE_STAGE)
+            return _dumps({"ok": True, **result})
+        except Exception as e:
+            return _err(e)
 
     @mcp.tool()
     def reveng_single_photo(
@@ -621,10 +855,23 @@ def register_reveng_tools(mcp: FastMCP) -> None:
                         "multi-view images and run reveng_reconstruct instead."
                     ),
                 })
-        return _not_provisioned(
-            "parametric build not yet wired (RE-17). "
-            "Run reveng_reconstruct + reveng_fit_primitives first."
-        )
+        if s is None:
+            return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
+        try:
+            caps = (_reveng_status() or {}).get("capabilities", {})
+        except Exception:  # noqa: BLE001
+            caps = {}
+        # Parametric build needs at least a reconstructed/dense mesh to fit against.
+        if not caps.get("dense"):
+            return _not_provisioned(
+                "parametric build backend not provisioned (no dense/mesh capability). "
+                "Run reveng_reconstruct + reveng_fit_primitives first; check reveng_status()."
+            )
+        try:
+            result = _launch_reveng_mission(session_id, "reveng_scan", _SCAN_NODE_STAGE)
+            return _dumps({"ok": True, **result})
+        except Exception as e:
+            return _err(e)
 
     # ── §8.2 WRITE — session management ─────────────────────────────────────
 

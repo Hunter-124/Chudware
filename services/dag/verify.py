@@ -148,6 +148,27 @@ def _check_contact_default(r: dict) -> bool:
     return r.get("base_reaction_n") is not None
 
 
+def _check_reveng_deviation_default(r: dict) -> bool:
+    """Pass when the mesh-vs-B-Rep deviation is within tolerance (RE-16/RE-17).
+
+    Result shape is the contracts/reveng.md §5 deviation schema. The tolerance is
+    carried on the result as ``tol_mm`` when the tool computes one; absent that we
+    fall back to a conservative default so a real deviation still gates the run
+    rather than auto-passing. A non-ok result (no mesh, backend absent, no
+    reference) is NOT a pass — the verify node escalates and the human decides.
+    """
+    if not r.get("ok", False):
+        return False
+    max_mm = r.get("max_mm")
+    if max_mm is None:
+        return False
+    tol_mm = r.get("tol_mm", 0.5)  # §5 default heat-bucket boundary
+    try:
+        return float(max_mm) <= float(tol_mm)
+    except (TypeError, ValueError):
+        return False
+
+
 # DISPATCH_TABLE is the T-F12-reusable public symbol.
 # check_type 'requirement' is handled separately (see _run_requirement_verify) — not in this table.
 DISPATCH_TABLE: dict[str, tuple[str, str, Callable[[dict], bool]]] = {
@@ -163,6 +184,9 @@ DISPATCH_TABLE: dict[str, tuple[str, str, Callable[[dict], bool]]] = {
     "buckling":     ("cad",        "run_fea_buckling",     _check_buckling_default),
     "contact":      ("cad",        "run_fea_contact",      _check_contact_default),
     "vibration":    ("cad",        "run_fea_frequency_response", _check_vibration_default),
+    # RE-17 — reverse-engineering mesh-vs-B-Rep deviation verify node
+    # (get_reveng_deviation lives in the reveng MCP module, not recon).
+    "reveng_deviation": ("reveng",  "get_reveng_deviation", _check_reveng_deviation_default),
 }
 
 
@@ -207,6 +231,13 @@ def _get_fn(module_key: str, fn_name: str):
                 register_sourcing_tools(_mcp)
             except ImportError:
                 pass  # [~] WS-B
+        elif module_key == "reveng":
+            # RE-17 — get_reveng_deviation for the reveng_deviation verify node.
+            try:
+                from mcp_server.reveng_tools import register_reveng_tools
+                register_reveng_tools(_mcp)
+            except ImportError:
+                pass  # [~] RE wave not merged / backend absent
         _PRIVATE_MCP[module_key] = _mcp
 
     mcp = _PRIVATE_MCP[module_key]
@@ -299,6 +330,9 @@ def _build_tool_kwargs(check_type: str, node_inputs: dict[str, Any]) -> dict[str
     if check_type == "contact":
         return {k: node_inputs[k] for k in (
             "pressure_mpa", "material", "doc_id") if k in node_inputs}
+    if check_type == "reveng_deviation":
+        return {k: node_inputs[k] for k in (
+            "session_id", "ref_path", "brep_doc_id", "n_samples") if k in node_inputs}
     return {}
 
 

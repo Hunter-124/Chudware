@@ -1221,6 +1221,23 @@ struct AppState {
     // workspaceDir: the root directory the Explorer tab browses. Defaults to Documents/AI-CAD
     // (created on first use); overridable and persisted to config.json ("workspace_dir").
     std::string workspaceDir;
+    // plmProjectDir: the folder the PLM Project Hub (Workspace::PLM) treats as the current project
+    // (a project = a folder + its hidden vault, contract plm.md §1). "" = derive it: the parent
+    // folder of the active saved document, else workspaceDir. Set explicitly by "Open project
+    // folder…" in the hub, and implicitly followed as documents are opened/saved. Read via
+    // plmProjectPath() — every plm_* RPC passes {"path": st.plmProjectPath()}.
+    std::string plmProjectDir;
+    std::string plmProjectPath() const {
+        if (!plmProjectDir.empty()) return plmProjectDir;
+        if (activeTab >= 0 && activeTab < (int)docTabs.size()) {
+            const std::string& p = docTabs[activeTab].path;
+            if (!p.empty()) {
+                size_t s = p.find_last_of("/\\");
+                if (s != std::string::npos) return p.substr(0, s);
+            }
+        }
+        return workspaceDir;
+    }
     // recentFiles: most-recent-first list of absolute paths opened/saved, capped at kRecentFilesMax.
     // Persisted to config.json ("recent_files"); shown under File > Recent Files and the Explorer
     // "Recent" section. pushRecentFile() de-dups + caps + persists.

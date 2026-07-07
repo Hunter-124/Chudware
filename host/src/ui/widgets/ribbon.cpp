@@ -68,7 +68,8 @@ static_assert(sizeof(kTabIcons) / sizeof(kTabIcons[0]) == kRibbonTabCount,
               "kTabIcons must stay parallel to kRibbonTabs");
 
 // Forward-declared here; defined after drawRibbon's local state block (~line 330).
-static int s_workspace = 0;
+// TEMP-VERIFY: set to 2 (Simulate) to confirm workspace filtering before reverting.
+static int s_workspace = 2;
 
 // W17 + per-workspace: control which tabs appear in the ribbon for the current workspace.
 //
@@ -696,18 +697,28 @@ static const float* ribbon_matSwatchColor(const char* cmd_id) {
 
 // Resting glass fill + hairline outline for a ribbon button (big or small).
 // Called before hover/active so the state layers are: rest < hover < active.
-// Uses existing palette roles (no new colors):
-//   fill = border at 8% alpha — faint tinted tint shows it is a pressable zone
-//   outline = border at 55% alpha — crisp single-px hairline
-// Both scale by `enabled` so disabled buttons keep the ghost appearance but stay low-contrast.
-static void ribbon_btnRest(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding, bool enabled) {
-    const float* bdr = ui::palette.border;
-    float fillA  = enabled ? 0.08f : 0.04f;
-    float lineA  = enabled ? 0.55f : 0.25f;
-    ImU32 fill   = IM_COL32((int)(bdr[0]*255), (int)(bdr[1]*255), (int)(bdr[2]*255),
+//
+// Uses palette.text role — light in dark themes, dark in light themes — so the outline
+// is always readable regardless of panel background. palette.border is dark navy and
+// becomes invisible against dark panel backgrounds.
+//
+//   fill    = text at 10% alpha — faint but perceptible tint signals a pressable zone
+//   outline = text at 45% alpha — crisp hairline; clearly visible on both themes
+//
+// `inset`: set true for stacked small-button rows so adjacent bottom/top edges don't share
+// a pixel and merge into a solid grid line when alpha is bumped.
+//
+// Both scale by `enabled` so disabled buttons keep the ghost appearance at lower contrast.
+static void ribbon_btnRest(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float rounding, bool enabled,
+                            bool inset = false) {
+    const float* t = ui::palette.text;
+    float fillA  = enabled ? 0.10f : 0.05f;
+    float lineA  = enabled ? 0.45f : 0.20f;
+    ImU32 fill   = IM_COL32((int)(t[0]*255), (int)(t[1]*255), (int)(t[2]*255),
                              (int)(fillA * 255));
-    ImU32 border = IM_COL32((int)(bdr[0]*255), (int)(bdr[1]*255), (int)(bdr[2]*255),
+    ImU32 border = IM_COL32((int)(t[0]*255), (int)(t[1]*255), (int)(t[2]*255),
                              (int)(lineA * 255));
+    if (inset) { p0.y += 1.0f; p1.y -= 1.0f; }
     dl->AddRectFilled(p0, p1, fill, rounding);
     dl->AddRect(p0, p1, border, rounding, 0, ui::metrics::stroke(1.0f));
 }
@@ -789,7 +800,12 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
                         ui::Palette::toU32(ui::palette.accent), rnd, 0, ui::metrics::stroke(2.0f));
         }
     }
-    (void)mainPress;
+    // Press feedback: darken the button slightly while the mouse button is held down.
+    // Draws over hover/active layers — gives physical "click-down" feel.
+    if (mainPress && enabled) {
+        ImU32 pressOverlay = IM_COL32(0, 0, 0, 40);
+        dl->AddRectFilled(p0, ImVec2(p0.x + bw, p0.y + bh), pressOverlay, rnd);
+    }
 
     ImGui::PopStyleColor(3);
     ImGui::PopStyleVar(2);
@@ -912,7 +928,8 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
     ImVec2 p1_sm(p0.x + totalW, p0.y + rowH);
 
     // State layering: rest → hover → active (bold outline).
-    ribbon_btnRest(dl_sm, p0, p1_sm, rnd_sm, enabled);
+    // inset=true: 1px vertical inset so stacked rows don't share an edge pixel.
+    ribbon_btnRest(dl_sm, p0, p1_sm, rnd_sm, enabled, /*inset=*/true);
     if (isActiveSm) ribbon_btnActive(dl_sm, p0, p1_sm, rnd_sm);
 
     if (hasDrop) {
@@ -1124,12 +1141,13 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
     ImGui::PopStyleVar();
 
     // State layering: rest → hover (glass, unified with big buttons) → active (bold outline).
+    // inset=true: 1px vertical inset so stacked small rows don't share a grid-line edge.
     {
         ImDrawList* dl_s = ImGui::GetWindowDrawList();
         float rnd_s = ui::metrics::ribbonBtnRound();
         ImVec2 p1_s(p0.x + totalW, p0.y + rowH);
         const bool isActiveSm2 = ribbon_isActive(cmd_id);
-        ribbon_btnRest(dl_s, p0, p1_s, rnd_s, enabled);
+        ribbon_btnRest(dl_s, p0, p1_s, rnd_s, enabled, /*inset=*/true);
         if (isActiveSm2) {
             ribbon_btnActive(dl_s, p0, p1_s, rnd_s);
         }

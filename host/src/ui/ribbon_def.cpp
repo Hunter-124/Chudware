@@ -444,6 +444,7 @@ static const RibbonCmd kCmds[] = {
     { "cam_new_job",       "New Job",     "new_doc",         "Manufacture", "Job",       true,  nullptr, false },
     { "cam_extract",       "From Part",   "hole_wizard",     "Manufacture", "Job",       true,  nullptr, false },
     { "cam_add_setup",     "Setup",       "ref_csys",        "Manufacture", "Job",       false, nullptr, false },
+    { "cam_set_stock",     "Stock",       "extrude",         "Manufacture", "Job",       false, nullptr, false },
     { "cam_add_tool",      "Tool",        "curve_helix",     "Manufacture", "Job",       false, nullptr, false },
     // --- Group: 2.5D Milling ---
     { "cam_op_face",       "Face",        "cam_face",        "Manufacture", "2.5D",      true,  nullptr, false },

@@ -40,6 +40,57 @@ All entities: `id` (`"e<N>"`, unique in the sketch), `type`, `construction:bool`
 - `point` entities never form edges/wires (annotation/skeleton anchors, constraint targets).
 - `construction:true` entities never join wire chains.
 
+### 1a. `eq_curve3d` (T-3DEQ, equation-driven curve)
+
+```json
+{"id":"e5","type":"eq_curve3d","construction":false,
+ "xt":"R*cos(t)","yt":"R*sin(t)","zt":"P*t/360","t1":0,"t2":720}
+```
+
+- `xt`/`yt`/`zt`: expression strings over `t`, evaluated per-sample against the document
+  equation grammar (doc_schema §4 — degrees trig, `env` globals; `t` itself is NOT a global,
+  it's bound per-sample). `t1`/`t2`: the parameter range (numbers or `env`-resolvable
+  expressions via the normal dimension-value path).
+- **0 DOF — equation-fixed**, exactly like the 2D `eq_curve`: the endpoints (`e5.p1` at `t1`,
+  `e5.p2` at `t2`) are pinned by an implicit fix residual the instant the entity is allocated,
+  so no other constraint can move them; they ARE valid `coincident`/`distance`/`point_on`
+  targets for chaining onto adjacent geometry. The GUI should render eq_curve3d exactly like a
+  `spline` (it compiles the same way — sampled + BSpline-interpolated) but should NOT offer
+  point-drag handles on it beyond its two endpoints (no interior control points exist).
+- Display: use the compiled wire's tessellation for the curve shape; do not attempt to derive
+  a closed form from `xt/yt/zt` in the GUI.
+
+## 1b. External model references (T-3DXREF — ground a constraint to a model vertex)
+
+```json
+"external_refs": [
+  {"id":"x1", "source":{"kind":"vertex","selector":{...}}, "stale": false,
+   "last_point":[12.5,40.0,0.0]}
+]
+```
+
+- Lives on the feature at `params.external_refs` (same array-of-records shape as `entities`/
+  `constraints`; full field semantics: doc_schema §3B.1b). `x1` is a **point handle** — pass it
+  directly in any constraint's `refs`, e.g. `{"type":"coincident","refs":["e3.p2","x1"]}`.
+- **v1 supports `source.kind:"vertex"` only.** `"edge"`/`"face"` are accepted by the schema for
+  forward-compat but are NEVER resolved in v1 (always `stale:true`) — don't let the GUI offer
+  edge/face picks as an external-ref source yet; vertex-only.
+- **Creating one (GUI flow):** the host already has, from its id-pass, the picked vertex's
+  `body_id` + `topo_id` (kind `"vertex"`) — the exact pair `doc_resolve_pick` takes. Either (a)
+  call `doc_resolve_pick(doc_id, body_id, "vertex", topo_id)` to get the `selector`, then
+  `doc_apply_ops` `edit_feature` on the sketch3d with `params.external_refs` appended (mint the
+  next unused `"x<N>"` id, `stale:true` initially — it resolves on the next rebuild), or (b) go
+  through the MCP tool `sketch3d_ref_vertex(sketch3d_id, body_id, topo_id)` which does both
+  steps and force-rebuilds so `last_point` comes back populated immediately.
+- **Re-resolution:** happens automatically on every mutating `doc_apply_ops` batch and on
+  `doc_rebuild` (`refresh_sketch3d_external_refs`, before compile) — the GUI does not need to
+  do anything special after the initial creation; a normal edit/rebuild refreshes `last_point`/
+  `stale` on every affected sketch3d feature.
+- **Stale display:** `sketch3d_health` surfaces a stale ref as a feature-status `warning`
+  string (never a hard failure) — show it the same way the 2D external-ref stale banner is
+  shown; the ground point stays at its last-good position so the constrained geometry doesn't
+  jump/disappear.
+
 ## 2. Handles (constraint refs + drag targets)
 
 | handle | meaning |
@@ -215,6 +266,11 @@ Semantics (mirrors 2D `sketch_drag`):
    optimization, API-compatible.
 6. MCP `sketch3d_*` tools (services/mcp/sketch3d_tools.py) still speak the SESSION-scoped
    Python store, not this feature — re-pointing map in that file's header TODO.
+7. External refs (T-3DXREF, §1b): only `source.kind:"vertex"` resolves in v1; `"edge"`/`"face"`
+   sources are schema-legal but always report `stale:true` — a documented v1 gate, not a bug.
+8. External-ref resolution targets the document's FINAL compiled body/bodies (not strictly
+   "the body as of this sketch3d's position in the feature tree") — see doc_schema §3B.1b for
+   the exact wording; in practice this is usually the more useful behavior.
 
 ## 8. GUI v1 — working-plane scheme (host/src/ui/sketch3d_mode.{h,cpp})
 

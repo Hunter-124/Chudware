@@ -1546,6 +1546,38 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 json sk;
                 sk["entities"] = feat.value("entities", json::array());
                 sk["constraints"] = feat.value("constraints", json::array());
+                // External model references (T-3DXREF, doc_schema §3B): each
+                // resolved external_ref (refresh_sketch3d_external_refs already
+                // wrote last_point/stale onto the DOC before this compile ran —
+                // see session.cpp) becomes a fixed construction point entity with
+                // the ref's own id, plus an implicit fix constraint pinning it, so
+                // ordinary constraints (coincident/distance/point_on) can target
+                // "x1" exactly like any other fixed handle. A stale ref with no
+                // last_point yet is skipped (not injected) rather than failing the
+                // whole sketch3d — any constraint that references it will simply
+                // fail to resolve, forward-tolerantly, like an unknown handle.
+                int n_stale_refs = 0;
+                std::string first_stale_ref;
+                if (feat.contains("external_refs") && feat["external_refs"].is_array()) {
+                    for (const json& xr : feat["external_refs"]) {
+                        if (!xr.is_object()) continue;
+                        const std::string rid = xr.value("id", std::string());
+                        if (xr.value("stale", false)) {
+                            ++n_stale_refs;
+                            if (first_stale_ref.empty()) first_stale_ref = rid;
+                        }
+                        if (rid.empty() || !xr.contains("last_point") ||
+                            !xr["last_point"].is_array() || xr["last_point"].size() < 3)
+                            continue;  // never resolved even once — nothing to ground
+                        sk["entities"].push_back(json{{"id", rid}, {"type", "point"},
+                                                      {"p", xr["last_point"]},
+                                                      {"construction", true}});
+                        sk["constraints"].push_back(
+                            json{{"id", "__extref_fix_" + rid},
+                                {"type", "fix"},
+                                {"refs", json::array({rid})}});
+                    }
+                }
                 aicad::sketch3d::Sketch3DSolution sol =
                     aicad::sketch3d::solve_sketch3d(sk, env_json);
                 if (!sol.converged)
@@ -1556,6 +1588,11 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                 // valid; a consuming sweep raises if it needs a wire.
                 results[id] = Sketch3DResult{std::move(wires), sol.entities};
                 st.ok = true;
+                if (n_stale_refs > 0)
+                    st.warning = std::to_string(n_stale_refs) +
+                                 " external reference(s) stale (e.g. '" + first_stale_ref +
+                                 "'): source vertex no longer resolves; ground point(s) "
+                                 "kept at their last-good position";
 
             } else if (type == "plane") {
                 // Datum plane (engine/doc/features/datum.py compile_plane). Ported
@@ -1663,6 +1700,32 @@ CompileResult compile_document(const json& doc, const json& env_json) {
                     aicad::geom::SketchPlane p = base;
                     p.origin = thru;
                     results[id] = PlaneResult{p};
+
+                } else if (method == "point_normal") {
+                    // Arbitrary origin + normal (NEW — T-3DDATUM): the direct SolidWorks-
+                    // style "plane through a point, normal to a vector" constructor. No
+                    // existing method covered this exactly (three_point needs 3 points;
+                    // parallel_point inherits its orientation from a base plane/face). This
+                    // is what closes the sketch3d_pipe auto-profile gap (MCP
+                    // sketch3d_tools.py used to guess an axis-dominant tilt when no plane
+                    // existed at the spine start — now it can request an exact plane here).
+                    // `origin`: a point/vertex datum ref, a picked-vertex selector, or a
+                    // literal [x,y,z]. `normal`: a literal [x,y,z] (need not be unit length).
+                    if (!feat.contains("origin"))
+                        throw std::runtime_error("plane point_normal: refs.origin is required");
+                    Eigen::Vector3d origin;
+                    const json& oref = feat.at("origin");
+                    if (oref.is_array() && oref.size() >= 3)
+                        origin = Eigen::Vector3d(oref[0].get<double>(), oref[1].get<double>(),
+                                                 oref[2].get<double>());
+                    else
+                        origin = vertex_point(oref, "origin");
+                    if (!feat.contains("normal"))
+                        throw std::runtime_error("plane point_normal: refs.normal is required");
+                    Eigen::Vector3d normal = req_vec3(feat, "normal");
+                    if (normal.norm() < 1e-12)
+                        throw std::runtime_error("plane point_normal: normal is zero-length");
+                    results[id] = PlaneResult{aicad::geom::SketchPlane::from(origin, normal)};
 
                 } else if (method == "normal_to_curve") {
                     // A plane whose NORMAL is the tangent of a curve at a landing point

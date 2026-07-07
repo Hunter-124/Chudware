@@ -57,6 +57,26 @@ bool build_edge3(const json& ent, TopoDS_Edge& out) {
             out = BRepBuilderAPI_MakeEdge(mk.Value()).Edge();
             return true;
         }
+        if (t == "eq_curve3d") {
+            // Equation-driven 3D curve: sketch3d.cpp already sampled x(t)/y(t)/z(t)
+            // into "samples" (extract_entities); interpolate a BSpline through them,
+            // same recipe as "spline" below (mirrors the 2D eq_curve's sample-to-
+            // spline compile).
+            const json& pts = ent.contains("samples") ? ent["samples"] : json();
+            if (!pts.is_array() || pts.size() < 2) return false;
+            Handle(TColgp_HArray1OfPnt) arr =
+                new TColgp_HArray1OfPnt(1, static_cast<Standard_Integer>(pts.size()));
+            for (Standard_Integer i = 0; i < static_cast<Standard_Integer>(pts.size()); ++i) {
+                gp_Pnt p;
+                if (!pnt(pts[i], p)) return false;
+                arr->SetValue(i + 1, p);
+            }
+            GeomAPI_Interpolate interp(arr, /*periodic=*/Standard_False, 1e-7);
+            interp.Perform();
+            if (!interp.IsDone()) return false;
+            out = BRepBuilderAPI_MakeEdge(interp.Curve()).Edge();
+            return true;
+        }
         if (t == "spline") {
             const json& pts = ent.contains("points") ? ent["points"] : json();
             if (!pts.is_array() || pts.size() < 2) return false;

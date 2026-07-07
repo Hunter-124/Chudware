@@ -1110,7 +1110,12 @@ vector<string> validate_sketch3d_params(const json& params, const string& where,
 
     static const std::regex ENT_ID_RE("^e\\d+$");
     static const std::regex CON_ID_RE("^c\\d+$");
-    static const std::regex HANDLE_RE("^e\\d+(\\.(p|p1|p2|pm|start|end|mid|p\\d+))?$");
+    // T-3DXREF — bare "x<N>" (an external ref id) is also a valid whole-entity/point
+    // handle (it's always a fixed ground POINT — see resolve_handle in sketch3d.cpp,
+    // which treats a whole "point" entity the same way).
+    static const std::regex HANDLE_RE(
+        "^(e\\d+(\\.(p|p1|p2|pm|start|end|mid|p\\d+))?|x\\d+)$");
+    static const std::regex XREF_ID_RE("^x\\d+$");
 
     auto is_xyz = [](const json& v) {
         if (!v.is_array() || v.size() != 3) return false;
@@ -1148,10 +1153,43 @@ vector<string> validate_sketch3d_params(const json& params, const string& where,
                     if (!is_xyz(pts[k]))
                         errs.push_back(ew + ".points[" + std::to_string(k) +
                                        "]: must be [x,y,z]");
+        } else if (t == "eq_curve3d") {
+            // T-3DEQ: x(t)/y(t)/z(t) expression strings + t1/t2 range. Reuses the same
+            // safe-expr grammar check as the 2D eq_curve (validate_eq_curve_expr).
+            for (const char* key : {"xt", "yt", "zt"}) {
+                const json& v = get(e, key);
+                if (!v.is_string())
+                    errs.push_back(ew + "." + key + ": must be an expression string");
+                else {
+                    string err = validate_eq_curve_expr(v.get<string>(), "t");
+                    if (!err.empty()) errs.push_back(ew + "." + key + ": " + err);
+                }
+            }
+            if (!get(e, "t1").is_number()) errs.push_back(ew + ".t1: must be a number");
+            if (!get(e, "t2").is_number()) errs.push_back(ew + ".t2: must be a number");
         } else {
             errs.push_back(ew + ".type: '" + t + "' is not a sketch3d entity type");
         }
     }
+
+    // T-3DXREF — external_refs mint their own "x<N>" id space (bare ids double as fixed
+    // point handles usable in constraint refs, checked below alongside entity handles).
+    std::set<string> xref_ids;
+    const json& external_refs = get(params, "external_refs");
+    if (external_refs.is_array())
+        for (size_t i = 0; i < external_refs.size(); ++i) {
+            const json& xr = external_refs[i];
+            const string xw = where + ".external_refs[" + std::to_string(i) + "]";
+            if (!xr.is_object()) { errs.push_back(xw + ": must be an object"); continue; }
+            string xid = get(xr, "id").is_string() ? xr["id"].get<string>() : "";
+            if (!std::regex_match(xid, XREF_ID_RE))
+                errs.push_back(xw + ".id: must match x<N>");
+            else if (!xref_ids.insert(xid).second)
+                errs.push_back(xw + ".id: duplicate '" + xid + "'");
+            const json& src = get(xr, "source");
+            if (!src.is_object() || !src.contains("kind"))
+                errs.push_back(xw + ".source: must be an object with 'kind'");
+        }
 
     // Constraint arity table: {min_refs, max_refs, needs_value}.
     static const std::map<string, std::array<int, 3>> CON3 = {
@@ -1192,7 +1230,7 @@ vector<string> validate_sketch3d_params(const json& params, const string& where,
                 }
                 string h = refs[k].get<string>();
                 string base = h.substr(0, h.find('.'));
-                if (!ent_ids.count(base))
+                if (!ent_ids.count(base) && !xref_ids.count(base))
                     errs.push_back(cw + ".refs[" + std::to_string(k) +
                                    "]: unknown entity '" + base + "'");
             }

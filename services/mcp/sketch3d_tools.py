@@ -197,10 +197,23 @@ def _curves_to_entities(curves: list, start_n: int = 0) -> list:
             pts = _validate_pts(spec.get("pts", []), 1)
             entities.append({"id": _eid(), "type": "point", "construction": cons,
                              "p": pts[0]})
+        elif kind == "eq_curve3d":
+            # Equation-driven 3D curve (T-3DEQ, doc_schema §3B): x(t)/y(t)/z(t) expression
+            # strings over t in [t1, t2] (degrees trig, doc equations — §4). 0 DOF —
+            # equation-fixed, like the 2D eq_curve; endpoints (p1@t1, p2@t2) are usable as
+            # coincident/point_on targets. e.g. a helix: xt="R*cos(t)", yt="R*sin(t)",
+            # zt="P*t/360", t1=0, t2=720 (two turns; R/P from doc equations or literals).
+            for key in ("xt", "yt", "zt"):
+                if not isinstance(spec.get(key), str):
+                    raise ValueError(f"curves[{i}]: eq_curve3d needs a string '{key}' expression")
+            entities.append({"id": _eid(), "type": "eq_curve3d", "construction": cons,
+                             "xt": spec["xt"], "yt": spec["yt"], "zt": spec["zt"],
+                             "t1": spec.get("t1", 0), "t2": spec.get("t2", 1)})
         else:
             raise ValueError(
                 f"curves[{i}]: unknown kind {kind!r}. Use 'line', 'polyline', 'spline', "
-                f"'arc', 'point' — or pass a raw engine entity with a 'type' field.")
+                f"'arc', 'point', 'eq_curve3d' — or pass a raw engine entity with a 'type' "
+                f"field.")
     return entities
 
 
@@ -466,34 +479,24 @@ def _tmp(suffix: str) -> str:
 
 # ─────────────────────────────── pipe helper plane placement ─────────────────────────────────────
 
-# dominant axis → (base reserved plane, signed-offset factor, world→uv index pair)
-#   plane.top:   normal +Z, u=+X v=+Y → offset = P.z,  uv = (P.x, P.y)
-#   plane.front: normal −Y, u=+X v=+Z → offset = −P.y, uv = (P.x, P.z)
-#   plane.right: normal +X, u=+Y v=+Z → offset = P.x,  uv = (P.y, P.z)
-_PLANE_FOR_AXIS = {
-    0: ("plane.right", +1.0, (1, 2)),
-    1: ("plane.front", -1.0, (0, 2)),
-    2: ("plane.top",   +1.0, (0, 1)),
-}
-
-
 def _profile_plane_ops(start: list, tangent: list) -> tuple:
-    """Ops placing a datum plane at the spine start ⟂ the dominant tangent axis.
+    """Ops placing a datum plane at the spine start, EXACTLY perpendicular to the tangent.
+
+    T-3DDATUM closed this gap: the datum "plane" feature now has a "point_normal" method
+    (arbitrary origin + normal, core/doc/document.cpp) — this used to guess the nearest
+    reserved axis plane and warn past ~30° tilt (SolidWorks users hit real skewed starts,
+    e.g. an angled boss). point_normal makes the profile plane EXACT for every tangent, so
+    there is no longer an axis-dominant approximation or a tilt warning to surface.
 
     Returns (plane_op, uv_center, tilt_deg): the datum-plane add_feature op, the (u,v)
-    coordinates of the spine start within that plane, and the angular deviation of the
-    actual tangent from the chosen axis (0 = perfectly perpendicular profile).
+    coordinates of the spine start within that EXACT plane (always [0, 0] — the plane's
+    origin IS the spine start), and tilt_deg (always 0.0 now — kept in the return shape so
+    callers don't need to change).
     """
-    ax = max(range(3), key=lambda i: abs(tangent[i]))
-    base, sgn, (iu, iv) = _PLANE_FOR_AXIS[ax]
-    off = sgn * start[ax]
-    cos = abs(tangent[ax]) / max(_v_norm(tangent), 1e-12)
-    tilt = math.degrees(math.acos(max(-1.0, min(1.0, cos))))
     plane_op = {"op": "add_feature", "feature": {
         "type": "plane", "name": "PipeProfilePlane",
-        "params": {"method": "offset", "offset": _dim(off)},
-        "refs": {"base": base}}}
-    return plane_op, [start[iu], start[iv]], tilt
+        "params": {"method": "point_normal", "origin": list(start), "normal": list(tangent)}}}
+    return plane_op, [0.0, 0.0], 0.0
 
 
 # ──────────────────────────────────────────── registration ───────────────────────────────────────
@@ -543,8 +546,10 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
               kind: 'line' (2 pts) | 'polyline' (2+ pts → line per pair) |
                     'spline' (2+ through-points, cubic) | 'arc' (3 pts [start, mid, end] —
                     the engine arc is THREE-POINT: circumcircle through them) |
-                    'point' (1 pt — anchor/constraint target, never joins a wire)
-              pts: [[x,y,z], ...] in mm, WORLD space
+                    'point' (1 pt — anchor/constraint target, never joins a wire) |
+                    'eq_curve3d' (xt/yt/zt expression strings + t1/t2, no pts — equation-
+                    driven curve, e.g. a helix; see doc_schema §3B)
+              pts: [[x,y,z], ...] in mm, WORLD space (not used by eq_curve3d)
           • or a raw engine entity {type, p1/p2/pm/p/points, construction?, id?}
             (doc_schema §3B; missing ids auto-assigned).
 
@@ -625,6 +630,77 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
                            "added": len(added),
                            "new_constraint_ids": [c["id"] for c in added],
                            "constraint_count": len(cons), "health": read})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def sketch3d_ref_vertex(sketch3d_id: str, body_id: int = 1, topo_id: Optional[int] = None,
+                            selector: Optional[dict] = None,
+                            doc_id: Optional[str] = None) -> str:
+        """Ground a sketch3d constraint to a specific VERTEX on the built model (T-3DXREF).
+
+        Hunter's use case: "a spline that interacts with a specific corner on my part" — this
+        mints an external reference (doc_schema §3B.1b) that tracks a model vertex across
+        rebuilds. Pass EITHER:
+          topo_id   the vertex pick id from a viewport click (kind="vertex") — same id space
+                    doc_resolve_pick uses; body_id defaults to 1 (the single-body case)
+          selector  a raw vertex selector dict (already resolved elsewhere, e.g. by a prior
+                    sketch3d_ref_vertex call you're re-using, or hand-built)
+
+        Returns {ok, ref_id, point} — ``ref_id`` (e.g. "x1") is a POINT HANDLE usable directly
+        in sketch3d_add_constraints, e.g. {"type":"coincident","refs":["e3.p2","x1"]} or
+        {"type":"distance","refs":["e1.p1","x1"],"value":10}. The point is re-resolved on
+        every rebuild (it follows the vertex if upstream geometry moves); check_sketch3d /
+        sketch3d_get surface a warning if the source vertex stops resolving (stale — last-good
+        position kept, the sketch never breaks).
+        """
+        try:
+            d = _doc(doc_id)
+            feat = _find_sketch3d(d, sketch3d_id)
+            if selector is None:
+                if topo_id is None:
+                    return _dumps({"ok": False,
+                                   "error": "pass either topo_id (a viewport vertex pick) or "
+                                            "selector (a raw vertex selector dict)"})
+                pick = cb.call("doc_resolve_pick",
+                               {"doc_id": d, "body_id": body_id, "kind": "vertex",
+                                "topo_id": topo_id})
+                selector = pick.get("selector")
+                if not selector:
+                    return _dumps({"ok": False, "error": f"vertex pick {topo_id} did not resolve"})
+            # Mint a doc-wide-unique "x<N>" id (external refs share their own id space —
+            # separate from "e<N>" entities / "c<N>" constraints — across every sketch3d
+            # feature, so a ref minted for one sketch never collides with another's).
+            used = set()
+            for f in _tree_features(d):
+                if f.get("type") != "sketch3d":
+                    continue
+                for xr in ((f.get("params") or {}).get("external_refs") or []):
+                    rid = xr.get("id") if isinstance(xr, dict) else None
+                    if isinstance(rid, str) and rid.startswith("x") and rid[1:].isdigit():
+                        used.add(int(rid[1:]))
+            n = (max(used) + 1) if used else 1
+            ref_id = f"x{n}"
+            refs = list((feat.get("params") or {}).get("external_refs") or [])
+            refs.append({"id": ref_id, "source": {"kind": "vertex", "selector": selector},
+                        "stale": True})
+            _apply_ops(d, [{"op": "edit_feature", "id": sketch3d_id,
+                            "params": {"external_refs": refs}}])
+            # Force a rebuild so refresh_sketch3d_external_refs resolves it immediately
+            # (edit_feature alone re-solves the sketch but the refresh pass runs on every
+            # mutating apply_ops batch, so this has already happened by now — the extra
+            # doc_rebuild call just guarantees a fresh read-back for the caller).
+            cb.call("doc_rebuild", {"doc_id": d})
+            feat2 = _find_sketch3d(d, sketch3d_id)
+            refs2 = (feat2.get("params") or {}).get("external_refs") or []
+            rec = next((r for r in refs2 if r.get("id") == ref_id), None)
+            point = (rec or {}).get("last_point")
+            stale = (rec or {}).get("stale", True)
+            return _dumps({"ok": True, "id": sketch3d_id, "doc_id": d, "ref_id": ref_id,
+                           "point": point, "stale": stale,
+                           "hint": (f"use '{ref_id}' as a point handle in "
+                                    "sketch3d_add_constraints, e.g. "
+                                    f'{{"type":"coincident","refs":["e1.p1","{ref_id}"]}}')})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -823,11 +899,9 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
 
         Profile — pass exactly ONE of:
           diameter_mm: builds a circular profile automatically.  A datum plane is placed at
-            the path START, perpendicular to the reserved plane nearest the start tangent,
-            with the circle centred exactly on the path start (the sweep pierce rule).  If
-            the start tangent is far off-axis (> ~30° tilt) the result carries a `warning` —
-            for heavily skewed starts prefer starting the path axis-aligned, or pass your
-            own profile_sketch.
+            the path START, EXACTLY perpendicular to the start tangent (point_normal datum
+            method — T-3DDATUM), with the circle centred exactly on the path start (the
+            sweep pierce rule).  Works for any tangent direction, no axis-alignment needed.
           profile_sketch: an EXISTING 2D sketch feature id whose region is the profile
             (you are responsible for it sitting at the path start, ⟂ the tangent).
 
@@ -867,12 +941,7 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
             ids: dict = {}
             warning = None
             if diameter_mm is not None:
-                plane_op, uv, tilt = _profile_plane_ops(s["point"], s["tangent"])
-                if tilt > 30.0:
-                    warning = (f"path start tangent is {tilt:.1f}° off the nearest axis — "
-                               "the auto profile plane is only roughly perpendicular; the "
-                               "sweep may fail or pinch. Prefer an axis-aligned start "
-                               "segment or pass profile_sketch.")
+                plane_op, uv, _tilt = _profile_plane_ops(s["point"], s["tangent"])
                 ops.append(plane_op)                                   # $0 plane
                 ops.append({"op": "add_feature", "feature": {
                     "type": "sketch", "name": "PipeProfile",

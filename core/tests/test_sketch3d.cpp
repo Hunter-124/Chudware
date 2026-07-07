@@ -259,3 +259,41 @@ TEST_CASE("drag3 soft-targets a handle and honors constraints") {
     CHECK(bad["rejected_handles"].size() == 1);
     CHECK(bad["entities"].contains("e1"));
 }
+
+// ---- eq_curve3d (T-3DEQ) ------------------------------------------------------
+
+TEST_CASE("eq_curve3d: helix endpoints match x(t1)/y(t1)/z(t1) and x(t2)/y(t2)/z(t2)") {
+    json sk;
+    json ec = json{{"id", "e1"}, {"type", "eq_curve3d"}, {"construction", false},
+                   {"xt", "10*cos(t)"}, {"yt", "10*sin(t)"}, {"zt", "2*t/360"},
+                   {"t1", 0}, {"t2", 360}};
+    sk["entities"] = json::array({ec});
+    sk["constraints"] = json::array();
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.converged);
+    const json& p1 = sol.entities["e1"]["p1"];
+    const json& p2 = sol.entities["e1"]["p2"];
+    CHECK(p1[0].get<double>() == doctest::Approx(10.0).epsilon(1e-6));
+    CHECK(p1[1].get<double>() == doctest::Approx(0.0).epsilon(1e-6));
+    CHECK(p1[2].get<double>() == doctest::Approx(0.0).epsilon(1e-6));
+    CHECK(p2[0].get<double>() == doctest::Approx(10.0).epsilon(1e-6));
+    CHECK(p2[1].get<double>() == doctest::Approx(0.0).epsilon(1e-6));
+    CHECK(p2[2].get<double>() == doctest::Approx(2.0).epsilon(1e-6));
+    // 0 DOF — equation-fixed.
+    CHECK(sol.dof == 0);
+    CHECK(sol.entities["e1"]["samples"].size() > 2);
+}
+
+TEST_CASE("eq_curve3d: endpoint is a valid coincident target and stays pinned") {
+    json sk;
+    json ec = json{{"id", "e1"}, {"type", "eq_curve3d"}, {"construction", false},
+                   {"xt", "t"}, {"yt", "0"}, {"zt", "0"}, {"t1", 0}, {"t2", 10}};
+    json ln = line("e2", 20, 5, 5, 30, 5, 5);
+    sk["entities"] = json::array({ec, ln});
+    sk["constraints"] = json::array({rel("c1", "coincident", {"e1.p2", "e2.p1"})});
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(sol.converged);
+    // eq_curve3d endpoint never moves (equation-fixed); the line's p1 is pulled to it.
+    CHECK(dist3(sol.entities["e1"]["p2"], json::array({10.0, 0.0, 0.0})) < 1e-6);
+    CHECK(dist3(sol.entities["e2"]["p1"], sol.entities["e1"]["p2"]) < 1e-6);
+}

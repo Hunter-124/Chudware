@@ -15,7 +15,9 @@
 #include <vector>
 
 #include "../../core/app_state.h"
-#include "../../ui_theme.h"  // ui::palette (opaque title-bar / border override for this window)
+#include "../../ui_theme.h"    // ui::palette (opaque title-bar / border override for this window)
+#include "../feature_tree.h"   // fmRowPill / fmTreeIcon / fmSectionDivider — the ratified FM row
+                               // styling, reused so the Manufacture tree matches the FeatureManager
 
 namespace ui {
 
@@ -32,8 +34,19 @@ struct CamUI {
     int selOp = -1;
     nlohmann::json lastExtract;        // last cam_extract result (geometry source)
     std::string partStep;              // temp STEP path of the exported current part
+    std::string sourceModel;           // display name of the part doc the job extracts from
     std::vector<std::string> dialects;
+    bool   dialectsInflight = false;   // async cam_post_dialects in flight (never re-fire)
+    double dialectsNextTry  = 0.0;     // failure cooldown: no retry before this ImGui::GetTime()
     int postIdx = 0;
+    // Workspace-tree state (drawCamTreeBody — the Manufacture left column):
+    int  generatedRev = -1;            // mirror revision at the last successful cam_generate
+    int  genWarnings  = 0;             // warning count from that generate (op status)
+    bool flavorPopup  = false;         // ribbon "Flavor" clicked: open the dialect popup
+    bool floatUndock  = false;         // one-shot: float (undock) the detail panel on next open
+    int  selKind = 0;                  // visual tree selection: 0=none 1=job 2=jobsetup 3=stock
+                                       // 4=setup 5=op 6=tool 7=models
+    int  selTool = -1;                 // selected Tools row (selKind==6); separate from selOp
     std::string gcode;
     std::string gcodePath;
     nlohmann::json sim;                // last cam_simulate result
@@ -56,11 +69,20 @@ bool camCall(AppState& st, const char* method, const nlohmann::json& params, nlo
     return ok;
 }
 
+// Post-dialect list, fetched ONCE via the async rpc queue. This runs on per-frame draw paths
+// (drawCamManager / the Manufacture tree), so it must never issue a synchronous worker.call:
+// a failing worker would then be re-hit every frame from the GL thread (that pattern hard-froze
+// the app once — see commit 50a54308). Guards: in-flight flag + a 10s failure cooldown.
 void refreshDialects(AppState& st) {
-    if (!g.dialects.empty()) return;
-    nlohmann::json r;
-    if (camCall(st, "cam_post_dialects", nlohmann::json::object(), r) && r.contains("dialects"))
-        for (auto& d : r["dialects"]) g.dialects.push_back(d.value("id", std::string()));
+    if (!g.dialects.empty() || g.dialectsInflight) return;
+    if (ImGui::GetTime() < g.dialectsNextTry) return;
+    g.dialectsInflight = true;
+    st.rpc.call("cam_post_dialects", nlohmann::json::object(), [](const core::RpcResult& r) {
+        g.dialectsInflight = false;
+        if (r.ok && r.result.contains("dialects"))
+            for (auto& d : r.result["dialects"]) g.dialects.push_back(d.value("id", std::string()));
+        if (g.dialects.empty()) g.dialectsNextTry = ImGui::GetTime() + 10.0;  // failed: cool down
+    });
 }
 
 void loadTree(const nlohmann::json& r) { g.mirror.loadTree(r); }
@@ -91,6 +113,7 @@ bool exportPartStep(AppState& st) {
     if (!camCall(st, "export_file", {{"doc_id", tab.docId}, {"path", p.string()}, {"format", "step"}}, r))
         return false;
     g.partStep = p.string();
+    g.sourceModel = tab.title.empty() ? tab.docId : tab.title;  // Models node in the CAM tree
     return true;
 }
 
@@ -177,9 +200,11 @@ void doGenerate(AppState& st) {
     if (camCall(st, "cam_generate", {{"doc_id", g.docId}}, r)) {
         g.mirror.loadToolpaths(r);
         int n = r.contains("toolpaths") ? (int)r["toolpaths"].size() : 0;
+        g.generatedRev = g.mirror.revision();  // ops now read "generated" in the workspace tree
+        g.genWarnings = (r.contains("warnings") && r["warnings"].is_array())
+                            ? (int)r["warnings"].size() : 0;
         g.status = "generated " + std::to_string(n) + " toolpath(s)";
-        if (r.contains("warnings") && r["warnings"].is_array() && !r["warnings"].empty())
-            g.status += " (" + std::to_string(r["warnings"].size()) + " warning)";
+        if (g.genWarnings > 0) g.status += " (" + std::to_string(g.genWarnings) + " warning)";
     }
 }
 
@@ -269,8 +294,36 @@ void drawSimSummary() {
 
 // ---- ribbon command handler ----
 void camHandleCommand(AppState& st, const std::string& cmd) {
-    g.show = true;
+    // In the Manufacture WORKSPACE the CAM job tree (left column) + ribbon are the primary UI:
+    // commands fire silently against the tree selection and must NOT pop the floating detail
+    // panel. Everywhere else (e.g. the Manufacture ribbon tab from the Model workspace) keep the
+    // legacy behavior of revealing the panel.
+    const bool camWs = (st.activeWorkspace == AppState::Workspace::Manufacture);
+    if (!camWs) g.show = true;
     refreshDialects(st);
+    if (cmd == "cam_show3d") {          // ribbon Output toggle: viewport backplot overlay
+        g.backplot = !g.backplot;
+        g.status = g.backplot ? "toolpaths shown in 3D" : "toolpaths hidden";
+        return;
+    }
+    if (cmd == "cam_flavor") {          // ribbon Output dropdown: pick the post dialect
+        if (camWs) g.flavorPopup = true;    // popup rendered by drawCamTreeBody (left column)
+        else       g.show = true;           // elsewhere: the panel's combo has the picker
+        return;
+    }
+    if (cmd == "cam_set_stock") {
+        // Re-extract the current part's stock box and apply it to the selected setup.
+        if (!ensureJob(st)) return;
+        if (g.mirror.setups().empty()) { g.status = "add a setup first"; return; }
+        nlohmann::json s = extract(st, "stock");
+        if (!s.contains("stock")) { g.status = "stock extraction failed"; return; }
+        nlohmann::json box = s["stock"]["box"];
+        box["type"] = "box"; box["off_ztop"] = 1.0; box["material"] = "aluminum";
+        applyOps(st, nlohmann::json::array({nlohmann::json{
+            {"op", "set_stock"}, {"setup_id", setupId()}, {"stock", box}}}));
+        g.status = "stock set from part";
+        return;
+    }
     if (cmd == "cam_new_job") { g.docId.clear(); g.mirror.clear(); ensureJob(st); g.status = "new CAM job"; return; }
     if (cmd == "cam_extract") {
         if (!ensureJob(st)) return;
@@ -328,7 +381,10 @@ void camHandleCommand(AppState& st, const std::string& cmd) {
 }
 
 const CamBackplot* camActiveBackplot() {
-    if (!g.show || !g.backplot || g.mirror.backplot().empty()) return nullptr;
+    // No g.show gate anymore: in the Manufacture workspace the 3D viewport is the central body
+    // and the floating panel stays closed — the ribbon "Show in 3D" toggle (g.backplot) is the
+    // one switch for the overlay.
+    if (!g.backplot || g.mirror.backplot().empty()) return nullptr;
     return &g.mirror.backplot();
 }
 
@@ -362,7 +418,12 @@ void camLoadJob(AppState& st, const std::string& docId) {
     // Also pull the generated toolpaths so the backplot / "Show in 3D" works immediately (the
     // job was already generated core-side by cam_program; cam_generate returns the cached paths).
     nlohmann::json gp;
-    if (camCall(st, "cam_generate", {{"doc_id", docId}}, gp)) g.mirror.loadToolpaths(gp);
+    if (camCall(st, "cam_generate", {{"doc_id", docId}}, gp)) {
+        g.mirror.loadToolpaths(gp);
+        g.generatedRev = g.mirror.revision();  // copilot jobs arrive pre-generated
+        g.genWarnings = (gp.contains("warnings") && gp["warnings"].is_array())
+                            ? (int)gp["warnings"].size() : 0;
+    }
     g.show = true;
     g.focusFrames = 10;  // surface the CAM tab for a few frames even if the panel was already
                          // open in the background (out-competes a one-off viewport focus grab)
@@ -382,6 +443,13 @@ void drawCamManager(AppState& st) {
         ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
         ImGui::SetNextWindowPos(ImVec2(330, 210), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(660, 470), ImGuiCond_Always);
+    } else if (g.floatUndock) {
+        // Opened as the DETAIL editor from the Manufacture workspace tree: float it (undock)
+        // so it never steals the central dock node from the 3D viewport in that workspace.
+        ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(360, 220), ImGuiCond_Appearing);
+        ImGui::SetNextWindowSize(ImVec2(720, 480), ImGuiCond_Appearing);
+        g.floatUndock = false;
     } else {
         ImGui::SetNextWindowSize(ImVec2(720, 480), ImGuiCond_FirstUseEver);
     }
@@ -484,6 +552,233 @@ void drawCamManager(AppState& st) {
     }
     ImGui::Columns(1);
     ImGui::End();
+}
+
+// ---- the Manufacture workspace LEFT TREE ------------------------------------------------------
+// Drawn INSIDE drawLeftPane's pinned glass column (layout.cpp routes the Manufacture workspace
+// here, the same way Simulate routes to SimManager::drawTreeBody). Shows the real job structure —
+// Job / Job Setup / Stock Setup / Machining Setups (ops with status) / Tools / Models — styled
+// with the exported FeatureManager row helpers. Selecting a node sets the context the ribbon
+// commands act on (g.selSetup / g.selOp); double-click opens the floating panel as the detail
+// editor. NO RPCs on this per-frame path (refreshDialects is async + cooldown-guarded).
+namespace {
+
+void camTreeOpenDetail() { g.show = true; g.focusFrames = 3; g.floatUndock = true; }
+
+}  // namespace
+
+void drawCamTreeBody(AppState& st) {
+    const float S = ui::uiScale;
+    refreshDialects(st);   // async + guarded; feeds the flavor popup + Job Setup row
+    fmRowStripeReset();
+
+    // Ribbon "Flavor" dropdown: opened here (this body draws every frame in Manufacture) at the
+    // mouse position, which is still on the ribbon button the frame after the click.
+    if (g.flavorPopup) {
+        ImGui::OpenPopup("##cam_flavor_popup");
+        ImGui::SetNextWindowPos(ImGui::GetMousePos(), ImGuiCond_Appearing);
+        g.flavorPopup = false;
+    }
+    if (ImGui::BeginPopup("##cam_flavor_popup")) {
+        ImGui::TextDisabled("G-code flavor");
+        ImGui::Separator();
+        if (g.dialects.empty())
+            ImGui::TextDisabled(g.dialectsInflight ? "loading..." : "unavailable");
+        for (int i = 0; i < (int)g.dialects.size(); ++i)
+            if (ImGui::Selectable(g.dialects[i].c_str(), i == g.postIdx)) {
+                g.postIdx = i;
+                g.status = "post flavor: " + g.dialects[i];
+            }
+        ImGui::EndPopup();
+    }
+
+    if (g.docId.empty()) {
+        ImGui::Spacing();
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+        ImGui::TextDisabled("No CAM job.\n\nUse New Job or Extract Part on the Manufacture "
+                            "ribbon to start one from the active part.");
+        ImGui::PopTextWrapPos();
+        if (!g.status.empty()) { ImGui::Spacing(); ImGui::TextDisabled("%s", g.status.c_str()); }
+        return;
+    }
+
+    const auto& setups = g.mirror.setups();
+    if (g.selSetup >= (int)setups.size()) g.selSetup = setups.empty() ? 0 : (int)setups.size() - 1;
+    const bool generated = (g.generatedRev >= 0 && g.generatedRev == g.mirror.revision());
+
+    // Deferred mutations: context-menu actions apply ops AFTER the tree walk (applyOps reloads
+    // the mirror, which would invalidate the rows we're iterating).
+    nlohmann::json pendingOps = nlohmann::json::array();
+
+    // Leaf row helper: FM pill + 16px icon + selectable label. Returns clicked; double-click
+    // opens the detail editor.
+    auto leafRow = [&](const char* id, const char* icon, const char* fb,
+                       const std::string& label, bool selected) -> bool {
+        ImGui::PushID(id);
+        FmRowRect rr = fmRowPill(selected);
+        fmTreeIcon(icon, fb);
+        ImGui::SameLine(0, 4.0f * S);
+        bool clicked = ImGui::Selectable(label.c_str(), selected,
+                                         ImGuiSelectableFlags_AllowDoubleClick);
+        const bool dbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0);
+        fmRowPillEnd(rr, selected);
+        ImGui::PopID();
+        if (dbl) camTreeOpenDetail();
+        return clicked;
+    };
+
+    // ---- Job root ----
+    const bool jobSel = (g.selKind == 1);
+    {
+        FmRowRect rr = fmRowPill(jobSel);
+        fmTreeIcon("new_doc", "J");
+        ImGui::SameLine(0, 4.0f * S);
+        std::string jobLbl = (g.mirror.name().empty() ? std::string("CAM Job") : g.mirror.name())
+                             + "  (rev " + std::to_string(g.mirror.revision()) + ")";
+        const bool jobOpen = ImGui::TreeNodeEx("##cam_job",
+            ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow |
+            ImGuiTreeNodeFlags_SpanAvailWidth, "%s", jobLbl.c_str());
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) g.selKind = 1;
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) camTreeOpenDetail();
+        fmRowPillEnd(rr, jobSel);
+        if (!jobOpen) {
+            if (!g.status.empty()) { ImGui::Spacing(); ImGui::TextDisabled("%s", g.status.c_str()); }
+            return;
+        }
+    }
+
+    // ---- Job Setup (machine family + post flavor) ----
+    {
+        std::string flavor = (g.postIdx >= 0 && g.postIdx < (int)g.dialects.size())
+                                 ? g.dialects[g.postIdx] : g.mirror.post();
+        if (flavor.empty()) flavor = "grbl";
+        if (leafRow("cam_jobsetup", "settings", "S", "Job Setup — post: " + flavor,
+                    g.selKind == 2))
+            g.selKind = 2;
+    }
+
+    // ---- Stock Setup (selected setup's stock summary) ----
+    {
+        std::string lbl = "Stock Setup";
+        if (!setups.empty() && setups[g.selSetup].stock.is_object() &&
+            !setups[g.selSetup].stock.empty()) {
+            const auto& sk = setups[g.selSetup].stock;
+            lbl += " — " + sk.value("type", std::string("box"));
+            const std::string mat = sk.value("material", std::string());
+            if (!mat.empty()) lbl += ", " + mat;
+        } else {
+            lbl += " — (none)";
+        }
+        if (leafRow("cam_stock", "extrude", "K", lbl, g.selKind == 3)) g.selKind = 3;
+    }
+
+    // ---- Machining Setups (WCS/machine) + their operations -------------------------------------
+    for (int si = 0; si < (int)setups.size(); ++si) {
+        const auto& s = setups[si];
+        const bool setupSel = (g.selKind == 4 && g.selSetup == si);
+        ImGui::PushID(si);
+        FmRowRect rr = fmRowPill(setupSel);
+        fmTreeIcon("ref_csys", "W");
+        ImGui::SameLine(0, 4.0f * S);
+        std::string lbl = s.name + "  —  " + (s.machine.empty() ? "mill" : s.machine);
+        const bool open = ImGui::TreeNodeEx("##cam_setup",
+            (si == g.selSetup ? ImGuiTreeNodeFlags_DefaultOpen : 0) |
+            ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth,
+            "%s", lbl.c_str());
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+            g.selKind = 4; g.selSetup = si; g.selOp = -1;
+        }
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) camTreeOpenDetail();
+        fmRowPillEnd(rr, setupSel);
+        if (open) {
+            for (int oi = 0; oi < (int)s.ops.size(); ++oi) {
+                const auto& o = s.ops[oi];
+                const bool opSel = (g.selKind == 5 && g.selSetup == si && g.selOp == oi);
+                std::string ol = (o.name.empty() ? o.type : o.name)
+                                 + "  [T" + std::to_string(o.tool_number) + "]";
+                if (o.suppressed)      ol += "  — off";
+                else if (generated)    ol += (g.genWarnings > 0) ? "  — generated (!)"
+                                                                 : "  — generated";
+                else                   ol += "  — needs generate";
+                ImGui::PushID(oi);
+                FmRowRect orr = fmRowPill(opSel);
+                fmTreeIcon(("cam_" + o.type).c_str(), "o", 16.0f, o.suppressed ? 0.45f : 1.0f);
+                ImGui::SameLine(0, 4.0f * S);
+                if (ImGui::Selectable(ol.c_str(), opSel,
+                                      ImGuiSelectableFlags_AllowDoubleClick)) {
+                    g.selKind = 5; g.selSetup = si; g.selOp = oi; g.loadedOpFor = -1;
+                }
+                const bool dbl = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0);
+                if (ImGui::BeginPopupContextItem("##cam_op_ctx")) {
+                    if (ImGui::MenuItem(o.suppressed ? "Unsuppress" : "Suppress"))
+                        pendingOps.push_back(nlohmann::json{
+                            {"op", "update_operation"}, {"op_id", o.id},
+                            {"operation", {{"suppressed", !o.suppressed}}}});
+                    if (ImGui::MenuItem("Delete"))
+                        pendingOps.push_back(nlohmann::json{
+                            {"op", "remove_operation"}, {"op_id", o.id}});
+                    if (ImGui::MenuItem("Open in editor")) camTreeOpenDetail();
+                    ImGui::EndPopup();
+                }
+                fmRowPillEnd(orr, opSel);
+                ImGui::PopID();
+                if (dbl) camTreeOpenDetail();
+            }
+            if (s.ops.empty()) {
+                FmRowRect err = fmRowPill(false);
+                ImGui::TextDisabled("   (no operations — add from the ribbon)");
+                fmRowPillEnd(err, false);
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+    if (setups.empty()) {
+        FmRowRect err = fmRowPill(false);
+        ImGui::TextDisabled("   (no machining setup — Add Setup on the ribbon)");
+        fmRowPillEnd(err, false);
+    }
+
+    // ---- Tools (job tool library) ----
+    fmSectionDivider("Tools");
+    const auto& tools = g.mirror.tools();
+    for (int ti = 0; ti < (int)tools.size(); ++ti) {
+        const auto& t = tools[ti];
+        char lbl[128];
+        std::snprintf(lbl, sizeof(lbl), "T%d  %s  \xC3\x98%.2f mm",
+                      t.number, (t.name.empty() ? t.type.c_str() : t.name.c_str()), t.diameter);
+        char id[24];
+        std::snprintf(id, sizeof(id), "cam_tool_%d", ti);
+        if (leafRow(id, "curve_helix", "T", lbl, g.selKind == 6 && g.selTool == ti)) {
+            g.selKind = 6; g.selTool = ti;
+        }
+    }
+    if (tools.empty()) {
+        FmRowRect err = fmRowPill(false);
+        ImGui::TextDisabled("   (no tools — Add Tool on the ribbon)");
+        fmRowPillEnd(err, false);
+    }
+
+    // ---- Models (the part docs the toolpaths are computed from) ----
+    fmSectionDivider("Models");
+    if (!g.sourceModel.empty()) {
+        if (leafRow("cam_model", "part", "M", g.sourceModel, g.selKind == 7)) g.selKind = 7;
+    } else {
+        FmRowRect err = fmRowPill(false);
+        ImGui::TextDisabled("   (none — Extract Part pulls the active part)");
+        fmRowPillEnd(err, false);
+    }
+
+    // ---- status footer ----
+    if (!g.status.empty()) {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+        ImGui::TextDisabled("%s", g.status.c_str());
+        ImGui::PopTextWrapPos();
+    }
+
+    if (!pendingOps.empty()) applyOps(st, pendingOps);   // after the walk — mirror reload safe
 }
 
 }  // namespace ui

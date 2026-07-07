@@ -33,9 +33,18 @@ void camFloatForShot();
 // panel: point the panel at docId, load its tree, and reveal it. Lets a core-side cam_* run
 // surface in the GUI instead of leaving the Manufacture panel empty.
 void camLoadJob(AppState& st, const std::string& docId);
-// Handle a CAM ribbon command (cmd ids prefixed "cam_"). Opens the panel and performs the
-// action (new job / extract / add operation / generate / simulate / post / ...).
+// Handle a CAM ribbon command (cmd ids prefixed "cam_"). Performs the action (new job / extract
+// / add operation / generate / simulate / post / show-in-3D / flavor / ...). Outside the
+// Manufacture workspace it also reveals the floating panel; inside it, commands fire silently
+// against the workspace tree's selection (the panel stays a double-click detail editor).
 void camHandleCommand(AppState& st, const std::string& cmd);
+
+// The Manufacture workspace LEFT TREE body (no Begin/End) — the real job structure: Job / Job
+// Setup / Stock Setup / Machining Setups (operations with status) / Tools / Models, styled with
+// the exported FeatureManager row helpers. drawLeftPane (layout.cpp) routes the Manufacture
+// workspace here, exactly like Simulate routes to SimManager::drawTreeBody. Selection sets the
+// context ribbon commands act on; double-click opens the floating panel as the detail editor.
+void drawCamTreeBody(AppState& st);
 
 // Viewport overlay accessor: the active job's classified toolpath segments to draw over the
 // part (rapid/cut/lead/plunge/arc), or nullptr when the panel is hidden / backplot off.

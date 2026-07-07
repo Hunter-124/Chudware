@@ -18,6 +18,7 @@
 #include "property_manager.h"   // PropertyManager::drawBody
 #include "config_panel.h"       // ConfigPanel::drawEmbedded (live Configurations tab)
 #include "sim_manager.h"        // SimManager::drawTreeBody (live Simulation tab)
+#include "cam/cam_panel.h"      // drawCamTreeBody (the Manufacture workspace's left tree)
 #include "doc_tabs.h"           // docTabStripHeight (the column never overlaps the doc-tab band)
 #include "icons.h"              // getIcon / IconUV
 #include "metrics.h"            // dockRightTarget (command-dialog default anchor)
@@ -394,6 +395,29 @@ void drawLeftPane(AppState& st,
         return;
     }
 
+    // [workspace-tabs seam] Manufacture workspace: show ONLY the CAM job tree (Hunter directive:
+    // each workspace gets its own workspace-appropriate left tree — same pattern as Simulate
+    // above). No Explorer/FeatureManager/Configurations tabs; the CAM tree (Job / Setups /
+    // Operations / Tools / Models, cam/cam_panel.cpp) is the whole column. The docked Copilot
+    // column on the right is untouched.
+    if (st.activeWorkspace == AppState::Workspace::Manufacture) {
+        const float S = ui::uiScale;
+        ImGui::Dummy(ImVec2(0, 4.0f * S));
+        ImGui::PushFont(st.fonts.medium);
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
+        ImGui::TextUnformatted("CAM Manager");
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f * S, 4.0f * S));
+        ui::drawCamTreeBody(st);
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();  // ImGuiCol_Text (surf.textPrimary)
+        ImGui::End();
+        return;
+    }
+
     // Collapse chevron — a persistent glass CHIP parked at the column's top-right corner, on the
     // same top row as the horizontal icon rail (fix 1) but reserved out of its width (chevRsv
     // below) so the two never overlap. A resting glass background (not hover-only) makes it read as an
@@ -562,30 +586,10 @@ void drawLeftPane(AppState& st,
         ImGui::BeginChild("##lp_body", ImVec2(0, -8.0f * S), ImGuiChildFlags_AlwaysUseWindowPadding);
         const bool bodyIndented = s_bodyScrolled;
         if (bodyIndented) ImGui::Indent(sbSize);   // balance the right-side scrollbar gutter
-        IconUV headIcon = getIcon(titleIcon, 20);
-        const float iconSz = headIcon.valid ? 20.0f * S : 0.0f;
-        const float iconGap = headIcon.valid ? 6.0f * S : 0.0f;
-        const float titleW = ImGui::CalcTextSize(title).x;
-        const float groupW = iconSz + iconGap + titleW;
-        // Center the header at the pane's TRUE horizontal center (captured in screen space
-        // above), mapped into this body child's local cursor X; clamp so it never sits left of
-        // the body padding.
-        const float localCur = ImGui::GetCursorPosX();
-        const float titleX = std::max(localCur,
-            localCur + (paneCenterX - groupW * 0.5f - ImGui::GetCursorScreenPos().x));
-        ui::glassRowAtCursor(4.0f, false, false, 6.0f);
-        ImGui::SetCursorPosX(titleX);
-        if (headIcon.valid) {
-            ImVec2 hp0 = ImGui::GetCursorScreenPos();
-            ImGui::Dummy(ImVec2(iconSz, iconSz));
-            drawIconGlass(ImGui::GetWindowDrawList(), titleIcon,
-                         ImVec2(hp0.x + iconSz * 0.5f, hp0.y + iconSz * 0.5f), iconSz,
-                         ImGui::ColorConvertFloat4ToU32(surf.textPrimary), lpHalo);
-            ImGui::SameLine(0, iconGap);
-        }
-        ImGui::PushFont(st.fonts.medium);
-        ImGui::TextUnformatted(title);
-        ImGui::PopFont();
+        // Pane-header chip (wire request, explorer-restyle agent): ONE content-fitted glass pill
+        // — icon fully inside with even padding, icon+text centered on paneCenterX; the FM tab's
+        // "history" icon renders as a purpose-built line-art feature-tree glyph.
+        ui::fmPaneHeaderChip(st, title, titleIcon, paneCenterX);
         ImGui::Separator();
         switch (st.leftPaneTab) {
             case kLeftPaneExplorer:

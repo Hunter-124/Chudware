@@ -201,6 +201,8 @@ Format:
 
 ## Explorer restyle agent (2026-07-06)
 
+- [x] DONE (cam-workspace agent) — applied: drawLeftPane header block replaced with one
+  `ui::fmPaneHeaderChip(st, title, titleIcon, paneCenterX);` call (Separator kept).
 - **layout.cpp — swap the left-pane header chip to `ui::fmPaneHeaderChip` (Hunter red-pen item).**
   The current header block in `drawLeftPane` (the `glassRowAtCursor(4.0f,...)` +
   `Dummy(iconSz)` + `drawIconGlass(titleIcon,...)` + `PushFont(medium)` + `TextUnformatted(title)`

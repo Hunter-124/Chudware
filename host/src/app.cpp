@@ -2855,8 +2855,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             ? ui::kLeftPaneSimulation
             : (st.leftPaneTab == ui::kLeftPaneSimulation ? ui::kLeftPaneFeatureManager
                                                          : st.leftPaneTab);
-        // The Manufacture workspace makes the CAM manager visible (like the old ribbon-tab gate).
-        const bool wsShowCam = (ws == WS::Manufacture) || (st.ribbonTab == AppState::RT_Manufacture);
+        // (cam-workspace overhaul) Manufacture no longer force-shows the floating CAM manager —
+        // the workspace's primary UI is the left CAM tree + the Manufacture ribbon; the panel is
+        // the double-click detail editor (see drawCamManager call below).
         // Electronics workspace shows the ECAD editor as the primary body.
         // In other workspaces, only show ECAD when an ECAD doc is actually open (ecadDocId set)
         // or showPcbTools was explicitly triggered by a ribbon command. Do NOT let showPcbTools
@@ -2899,9 +2900,11 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             // ---- 3D/2D viewport (Model, Drawing, Simulate, Manufacture) ----
             // Electronics uses the ECAD editor as the full central body — skip the 3D viewport
             // so the ECAD dock window wins the central node without fighting the Viewport tab.
-            // Manufacture similarly uses the CAM panel as the central body (it has its own
-            // Toolpaths/backplot tab for 3D review); the feature tree stays visible on the left.
-            const bool skipViewport = (ws == WS::Electronics) || (ws == WS::Manufacture);
+            // Manufacture (cam-workspace overhaul): the 3D viewport IS the central body — the
+            // CAM job tree lives in the left column (drawLeftPane -> drawCamTreeBody), the CAM
+            // actions live on the Manufacture ribbon, and generated toolpaths draw over the part
+            // via the camActiveBackplot viewport overlay ("Show in 3D").
+            const bool skipViewport = (ws == WS::Electronics);
             if (!skipViewport) {
                 if (st.wantFocusViewport > 0) { ImGui::SetNextWindowFocus(); st.wantFocusViewport--; }
                 ui::drawViewportPanel(st, io, busy);
@@ -2925,12 +2928,12 @@ int run_gui(const char* screenshotPath, const char* openPath) {
             if (wsShowEcad) ui::drawEcadEditor(st);   // Wave N: AI-ECAD 2D editor
         }
 
-        // ---- CAM Manufacture workspace ----
+        // ---- CAM detail panel ----
         if (!wsFullBody) {
-            // Reveal the CAM manager when in the Manufacture workspace; draw every frame
-            // (no-ops until opened). Force focus every frame in Manufacture so the CAM dock
-            // tab wins over the Viewport tab in the shared central node.
-            if (wsShowCam) ui::camRequestFocus();
+            // The floating CAM panel is no longer the Manufacture workspace's primary UI (the
+            // left CAM tree + Manufacture ribbon are) — it is now the double-click DETAIL editor
+            // opened from the tree, so no per-frame camRequestFocus grab. Draw every frame
+            // (no-ops until opened).
             ui::drawCamManager(st);
         }
 

@@ -48,6 +48,7 @@
 #include "ui/file_explorer.h"  // Wave 3: File Explorer + workspace/recent helpers
 #include "ui/layout.h"        // Wave 1C/1D: buildDefaultLayout + tabbed left pane (drawLeftPane)
 #include "ui/legacy_chat.h"
+#include "ui/ai/ai_workspace.h"   // AI workspace full-body hub (sessions + DAG + chat + settings)
 #include "ui/settings_modal.h"
 #include "ui/status_bar.h"
 #include "ui/title_bar.h"
@@ -1460,6 +1461,10 @@ int run_gui(const char* screenshotPath, const char* openPath) {
     // AI_CAD_SHOT=motion: kinematic motion study end-to-end (2-body asm + angle mate + playback).
     st.wantMotion = shot && shotMode && std::strcmp(shotMode, "motion") == 0;
     if (st.wantMotion) { st.showRibbon = true; st.activeWorkspace = AppState::Workspace::Simulate; }
+    // AI_CAD_SHOT=aiws: open the AI workspace full-body hub for headless visual verification.
+    if (shot && shotMode && std::strcmp(shotMode, "aiws") == 0) {
+        st.showRibbon = true; st.activeWorkspace = AppState::Workspace::AI;
+    }
     // C20b: assembly shot — author base/peg parts, new assembly, insert + mate + interference.
     st.wantAsm = shot && shotMode && std::strcmp(shotMode, "asm") == 0;
     // AI_CAD_MATEFORM: a lightweight Mate-form-only variant of the asm shot for visual verification
@@ -2887,10 +2892,11 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         }
 
         // W3-H: unified AI Copilot pane (input-at-top + conversation; embeds the run tree
-        // inline while a v2 run is active). Always drawn (available in all workspaces).
-        // In the AI workspace it provides the right-column chat; in other workspaces it is
-        // the normal docked Copilot column on the right edge.
-        ui::drawAIPanel(st, busy, canRun);
+        // inline while a v2 run is active). Drawn as the docked Copilot column on the right
+        // edge in every workspace EXCEPT the AI workspace, where the full-body AI hub
+        // (drawAiWorkspace, below) hosts its own expanded chat on the same st.chat state —
+        // drawing both would double the conversation panel.
+        if (ws != WS::AI) ui::drawAIPanel(st, busy, canRun);
         // W3-H: standalone "Agent Activity" window (View > Activity / the pane's Activity
         // button / the activity shot). No-op unless st.showActivityPanel; was previously
         // unreachable because only the in-pane tab hosted drawBody.
@@ -2972,28 +2978,25 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 ImGui::End();
             }
         } else if (ws == WS::AI) {
-            // AI workspace: full-screen layout — the Copilot is already drawn above (right column);
-            // this stub draws the left session list + center live-model preview placeholder.
-            // When the AI workspace agent fills drawAIWorkspaceBody(), replace this stub.
-            {
-                const ui::OverlayBand& band = ui::overlayBand();
-                if (band.valid) {
-                    // Session list panel on the left side of the AI workspace.
-                    const float margin = 12.0f;
-                    const float sessionW = 200.0f;
-                    ImGui::SetNextWindowPos(ImVec2(band.minX + margin, band.minY + margin));
-                    ImGui::SetNextWindowSize(ImVec2(sessionW, band.maxY - band.minY - 2.0f * margin));
-                    ImGui::SetNextWindowBgAlpha(0.0f);
-                    ImGui::Begin("##AISessionList", nullptr,
-                                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-                                 ImGuiWindowFlags_NoBringToFrontOnFocus |
-                                 ImGuiWindowFlags_NoNav);
-                    ImGui::TextDisabled("Sessions");
-                    ImGui::Separator();
-                    ImGui::TextDisabled("(No sessions yet)");
-                    ImGui::End();
-                }
+            // AI workspace: full-body AI hub spanning the whole central band —
+            // [sessions + sub-agents rail] | [expanded Copilot chat / project DAG] | [AI settings].
+            // Unlike PLM/Parts this fills to band.maxX (drawAIPanel's docked column is suppressed
+            // for WS::AI above, so there is no right column to reserve space for). Same borderless
+            // full-region window pattern as drawPlmWorkspace / drawPartsLibraryWorkspace.
+            const ui::OverlayBand& band = ui::overlayBand();
+            if (band.valid) {
+                const float m = 12.0f;
+                ImGui::SetNextWindowPos(ImVec2(band.minX + m, band.minY + m), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2((band.maxX - band.minX) - 2.0f * m,
+                                                (band.maxY - band.minY) - 2.0f * m),
+                                         ImGuiCond_Always);
+                ImGui::Begin("##AIWorkspace", nullptr,
+                             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                             ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
+                             ImGuiWindowFlags_NoSavedSettings);
+                ui::drawAiWorkspace(st);
+                ImGui::End();
             }
         }
         if (st.ecadAiGo) { st.ecadAiGo = false; ecadAiDesign(st, st.ecadAiRequest); }  // Wave P

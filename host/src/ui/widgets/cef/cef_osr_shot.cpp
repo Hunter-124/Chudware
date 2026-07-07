@@ -9,6 +9,7 @@
 #include "cef_osr_shot.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 
@@ -74,10 +75,22 @@ private:
     IMPLEMENT_REFCOUNTING(ShotClient);
 };
 
+// AI_CAD_CEF_SHOT_EXTPUMP=1 drives the loop through the INTERACTIVE pump path
+// (cef::pump_if_due, fed by the live-browser counter) instead of a raw
+// CefDoMessageLoopWork, so this tool can verify the same pump the vendor panel
+// uses actually renders a page headlessly.
+bool ext_pump() {
+    static const bool on = [] {
+        const char* v = std::getenv("AI_CAD_CEF_SHOT_EXTPUMP");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
 void pump(int ms) {
     const int steps = ms / 10;
     for (int i = 0; i < steps; ++i) {
-        CefDoMessageLoopWork();
+        if (ext_pump()) pump_if_due(); else CefDoMessageLoopWork();
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
@@ -93,8 +106,14 @@ bool render_url_to_png(const std::string& url, int w, int h, const std::string& 
     CefBrowserSettings settings;
     settings.windowless_frame_rate = 30;
 
-    if (!CefBrowserHost::CreateBrowser(window_info, client, url, settings, nullptr, nullptr))
+    // In ext-pump mode, mark a browser alive so pump_if_due pumps every frame
+    // (mirrors CefWebView's OnAfterCreated/OnBeforeClose bookkeeping).
+    if (ext_pump()) note_browser_opened();
+
+    if (!CefBrowserHost::CreateBrowser(window_info, client, url, settings, nullptr, nullptr)) {
+        if (ext_pump()) note_browser_closed();
         return false;
+    }
 
     // Wait for the browser to exist + the main frame to finish loading.
     for (int i = 0; i < 500 && !(client->browser() && client->loaded()); ++i) pump(20);
@@ -116,6 +135,7 @@ bool render_url_to_png(const std::string& url, int w, int h, const std::string& 
     if (client->browser())
         client->browser()->GetHost()->CloseBrowser(true);
     pump(200);
+    if (ext_pump()) note_browser_closed();
     return ok;
 }
 

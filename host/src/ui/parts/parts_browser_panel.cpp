@@ -57,9 +57,17 @@ struct WizardState {
     // stability window we export the session + advance — the worker can't see
     // the in-process browser, so the GUI is the one that must drive the wizard.
     double loggedInSince = 0.0;
+    // Load watchdog: when the current site's page was (re)opened, and whether we
+    // already toasted a timeout for it. Lets the panel surface a stall + Retry
+    // instead of leaving the user on an eternal "Loading".
+    double siteOpenedAt = 0.0;
+    bool   loadTimedOut = false;
     std::string setupError;   // embed backend failed — rendered in-panel
     std::string setupHint;
 };
+
+// How long a vendor page may sit without its first paint before we call it stalled.
+constexpr double kLoadTimeoutSec = 25.0;
 
 WizardState& W() {
     static WizardState w;
@@ -78,10 +86,22 @@ std::string vendorLabel(const std::string& site) {
 void openWizardSite(AppState& st, const std::string& embedId) {
     auto& w = W();
     w.loggedInSince = 0.0;
+    w.siteOpenedAt  = ImGui::GetTime();   // arm the load watchdog
+    w.loadTimedOut  = false;
     if (w.web->usesWorkerEmbed())
         w.web->attach(st, embedId);
     else if (!w.currentSite.empty())
         w.web->open(st, w.currentSite, /*isUrl=*/false);
+}
+
+// Re-open the current site's page in-place (Retry after a stall / load error).
+void retryCurrentSite(AppState& st) {
+    auto& w = W();
+    if (w.currentSite.empty()) return;
+    w.siteOpenedAt = ImGui::GetTime();
+    w.loadTimedOut = false;
+    w.web->open(st, w.currentSite, /*isUrl=*/false);
+    st.toast(ui::ToastLevel::Info, "Reloading " + vendorLabel(w.currentSite) + "…");
 }
 
 void closeWizard(AppState& st, bool sendStop) {
@@ -98,6 +118,8 @@ void closeWizard(AppState& st, bool sendStop) {
     w.setupError.clear();
     w.setupHint.clear();
     w.loggedInSince = 0.0;
+    w.siteOpenedAt  = 0.0;
+    w.loadTimedOut  = false;
     S().browserWizardRequested = false;
     loadVendors(st, /*force=*/true);
 }
@@ -368,6 +390,19 @@ void drawBrowserPanel(AppState& st) {
         }
     }
 
+    // Load watchdog (in-process backend): if the page hasn't painted its first
+    // frame within kLoadTimeoutSec and there's no explicit load error, treat it
+    // as stalled — toast once and let the body show a Retry. Covers the silent
+    // OSR/network stalls that used to leave the user on an eternal "Loading".
+    if (!w.web->usesWorkerEmbed() && w.siteOpenedAt > 0.0 && !w.web->active() &&
+        w.web->lastError().empty() && !w.loadTimedOut &&
+        ImGui::GetTime() - w.siteOpenedAt > kLoadTimeoutSec) {
+        w.loadTimedOut = true;
+        st.toast(ui::ToastLevel::Error,
+                 vendorLabel(w.currentSite) +
+                     " is taking too long to load — check your connection, then Retry or Skip.");
+    }
+
     // ---- top bar (28dp): title + step, chip, clipped URL, right-aligned actions ----------
     const float barH = 28.0f * sc;
     ImGui::BeginChild("##wiz_bar", ImVec2(0, barH), ImGuiChildFlags_None,
@@ -382,7 +417,11 @@ void drawBrowserPanel(AppState& st) {
         auto bsz    = [&](const char* t) {
             return ImGui::CalcTextSize(t).x + ImGui::GetStyle().FramePadding.x * 2.0f;
         };
+        // Retry appears once a load has stalled or errored (in-process backend).
+        const bool showRetry = !w.web->usesWorkerEmbed() &&
+                               (w.loadTimedOut || !w.web->lastError().empty());
         if (showSkipNext) btnW += bsz("Skip") + bsz("Next") + 8.0f * sc;
+        if (showRetry)    btnW += bsz("Retry") + 4.0f * sc;
         btnW += bsz("Close") + 4.0f * sc;
 
         // Title.
@@ -432,6 +471,11 @@ void drawBrowserPanel(AppState& st) {
                 wizardNext(st, /*skip=*/false);
             ImGui::SameLine(0.0f, 4.0f * sc);
         }
+        if (showRetry) {
+            if (ImGui::SmallButton("Retry"))
+                retryCurrentSite(st);
+            ImGui::SameLine(0.0f, 4.0f * sc);
+        }
         if (ImGui::SmallButton("Close")) {
             closeWizard(st, /*sendStop=*/true);
             ImGui::EndChild();
@@ -474,6 +518,24 @@ void drawBrowserPanel(AppState& st) {
             ImGui::PopStyleColor();
             ImGui::PopTextWrapPos();
         }
+        ImGui::Dummy(avail);
+        return;
+    }
+    // Stalled load (watchdog fired, still no paint): replace the eternal
+    // "Loading" with an actionable message. Use Retry (top bar) or Skip.
+    if (w.loadTimedOut && !w.web->active()) {
+        ImDrawList* dl  = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + avail.y),
+                          Palette::toU32(palette.panelBg), 6.0f * sc);
+        const std::string msg = vendorLabel(w.currentSite) + " didn't load";
+        const ImVec2 ts = ImGui::CalcTextSize(msg.c_str());
+        dl->AddText(ImVec2(p0.x + (avail.x - ts.x) * 0.5f, p0.y + avail.y * 0.45f),
+                    Palette::toU32(palette.statusErr), msg.c_str());
+        const char* hint = "Check your connection, then Retry — or Skip this vendor.";
+        const ImVec2 hts = ImGui::CalcTextSize(hint);
+        dl->AddText(ImVec2(p0.x + (avail.x - hts.x) * 0.5f, p0.y + avail.y * 0.55f),
+                    Palette::toU32(palette.textDisabled), hint);
         ImGui::Dummy(avail);
         return;
     }

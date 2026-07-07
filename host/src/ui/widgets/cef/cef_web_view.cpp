@@ -251,9 +251,13 @@ public:
     // CefLifeSpanHandler
     void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
         browser_ = browser;
+        cef::note_browser_opened();   // frame loop pumps every frame while alive
         CEF_TRACE("OnAfterCreated (browser id=%d)", browser ? browser->GetIdentifier() : -1);
     }
-    void OnBeforeClose(CefRefPtr<CefBrowser>) override          { browser_ = nullptr; }
+    void OnBeforeClose(CefRefPtr<CefBrowser>) override {
+        browser_ = nullptr;
+        cef::note_browser_closed();
+    }
     // Keep popups (target=_blank etc.) in-frame: block the OS window, navigate the
     // main frame instead — the embedded panel has nowhere to put a second window.
     bool OnBeforePopup(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame>, int /*popup_id*/,

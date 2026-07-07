@@ -26,6 +26,10 @@ char** g_argv = nullptr;
 // via pump_if_due(). Atomic so the two threads don't need a lock.
 std::atomic<long long> g_pump_due{-1};
 
+// Live OSR browser count. While > 0 the frame loop pumps CEF every frame (the
+// deadline model starves OSR during load); at 0 it pumps only on the deadline.
+std::atomic<int> g_live_browsers{0};
+
 long long now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
@@ -151,10 +155,26 @@ bool initialize() {
 
 bool initialized() { return g_initialized; }
 
+void note_browser_opened() { g_live_browsers.fetch_add(1, std::memory_order_relaxed); }
+void note_browser_closed() {
+    int prev = g_live_browsers.fetch_sub(1, std::memory_order_relaxed);
+    if (prev <= 0) g_live_browsers.store(0, std::memory_order_relaxed);  // never negative
+}
+
 bool pump_if_due() {
     if (!g_initialized) return false;
-    const long long due = g_pump_due.load(std::memory_order_relaxed);
-    if (due < 0 || now_ms() < due) return false;
+    // Pump EVERY frame while any browser is alive OR is being created (live count
+    // is bumped in OnAfterCreated, which itself needs a pump — so also pump while
+    // a create is pending, tracked by a nonzero deadline). The external-pump
+    // deadline model proved unreliable for interactive OSR here: the panel hung on
+    // "Loading" while the --cef-shot path, which pumps continuously, worked. This
+    // matches that: the GLFW loop already spins at 60 fps (glfwPollEvents), so an
+    // unconditional pump-per-frame costs nothing extra and removes all dependence
+    // on OnScheduleMessagePumpWork firing. When fully idle (no browser, no pending
+    // deadline) we skip the call so a closed-panel app isn't needlessly poked.
+    const bool anyLive    = g_live_browsers.load(std::memory_order_relaxed) > 0;
+    const bool createPend = g_pump_due.load(std::memory_order_relaxed) >= 0;
+    if (!anyLive && !createPend) return false;
     g_pump_due.store(-1, std::memory_order_relaxed);  // CEF reschedules the next
     CefDoMessageLoopWork();
     return true;

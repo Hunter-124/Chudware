@@ -32,11 +32,19 @@ bool initialize();
 // True after a successful initialize(). CefWebView::available() forwards this.
 bool initialized();
 
-// External-pump model: call once per GLFW frame. Runs CefDoMessageLoopWork()
-// only when CEF's scheduled deadline (OnScheduleMessagePumpWork) is due, so OSR
-// isn't starved or busy-spun. No-op until initialize(). Returns true if it
+// Call once per GLFW frame. While any browser is alive (see note_browser_*),
+// pumps CefDoMessageLoopWork() EVERY frame — the external-pump deadline model
+// under-pumps OSR during creation/load and leaves the panel stuck on "Loading"
+// (the --cef-shot path works precisely because it pumps continuously). When no
+// browser is open it falls back to pumping only on CEF's scheduled deadline so
+// the idle app doesn't busy-spin. No-op until initialize(). Returns true if it
 // pumped this call.
 bool pump_if_due();
+
+// Live off-screen browser refcount, bumped from CefWebView's OnAfterCreated /
+// OnBeforeClose. Drives pump_if_due's every-frame vs on-deadline choice.
+void note_browser_opened();
+void note_browser_closed();
 
 // Browser process only, at app exit, after all CefWebViews are destroyed.
 void shutdown();

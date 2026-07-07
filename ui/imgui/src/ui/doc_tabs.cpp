@@ -1,12 +1,14 @@
 #include "ui/doc_tab_strip.h"
 #include "app/app_state.h"
 #include "ui/command_registry.h"
+#include "ui/cam/cam_panel.h"   // camActivateForPart / camHasJobForPart (section switcher)
 #include "theme/theme.h"
 #include "theme/icons.h"
 #include "theme/tokens.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #include <cmath>
+#include <cstring>
 #include <string>
 
 namespace ui {
@@ -350,7 +352,7 @@ float drawSectionSwitcher(AppState& st, float bandR, float y0, float barH) {
         cmd::Workspace ws;
         bool  isCurrent;      // true = this view is already active
     };
-    Entry entries[4];
+    Entry entries[5];   // Model | CAM Job | Sim Study | Drawing | Board
     int nEntries = 0;
 
     // 1. Model (always — the Part/Assembly tab itself)
@@ -363,18 +365,25 @@ float drawSectionSwitcher(AppState& st, float bandR, float y0, float barH) {
                                 st.activeTab, cmd::Workspace::Model, cur };
     }
 
-    // 2. CAM Job (present when camActive is true for this doc)
-    if (st.camActive) {
+    // 2. CAM Job — always show for Part/Assembly (creates on demand via camActivateForPart).
+    // Prior behaviour gated on camActive — circular: the user can't see the chip to activate.
+    // camHasJobForPart() returns true always (any part can have a CAM job created on demand);
+    // a future pass can check the dep registry for an existing job and show a filled vs. outline icon.
+    if (isCadTab(active)) {
+        const bool camCurrent = st.camActive;
         entries[nEntries++] = { "CAM Job", "ws_model",
-                                st.activeTab, cmd::Workspace::Model, false };
-        // Mark Model entry as non-current since CAM takeover is active
-        entries[0].isCurrent = false;
-        entries[nEntries - 1].isCurrent = true;
+                                st.activeTab, cmd::Workspace::Manufacture, camCurrent };
+        if (camCurrent) {
+            // Mark Model entry as non-current since CAM takeover is active
+            entries[0].isCurrent = false;
+        }
     }
 
     // 3. Sim Study (present when workspace is Simulate for this doc)
     if (st.workspace == cmd::Workspace::Simulate) {
-        entries[nEntries - (st.camActive ? 2 : 1)].isCurrent = false; // Model no longer current
+        // Mark Model (entry[0]) and CAM Job (entry[1]) as non-current — Sim Study is active.
+        entries[0].isCurrent = false;
+        if (nEntries > 1) entries[1].isCurrent = false;
         entries[nEntries++] = { "Sim Study", "sim_static",
                                 st.activeTab, cmd::Workspace::Simulate, true };
     }
@@ -394,6 +403,28 @@ float drawSectionSwitcher(AppState& st, float bandR, float y0, float barH) {
         if (dwgTab >= 0) {
             const bool cur = (st.activeTab == dwgTab && st.workspace == cmd::Workspace::Drafting);
             entries[nEntries++] = { "Drawing", "section_props", dwgTab, cmd::Workspace::Drafting, cur };
+        }
+    }
+
+    // 5. Board (find co-open PCB tab that was generated FROM this Part via ecadHandleTo3d).
+    // The Part tab's ecadDocId stores the Board docId; we find the PCB tab by docId match.
+    // Mirrors the Drawing/drawingDocId pattern. Shared-file edit #3 from workspace_ecad.cpp.
+    {
+        int boardTab = -1;
+        if (!active.ecadDocId.empty()) {
+            for (int i = 0; i < (int)st.docTabs.size(); ++i) {
+                if (st.docTabs[i].kind == DocTabKind::Pcb &&
+                    st.docTabs[i].docId == active.ecadDocId) {
+                    boardTab = i;
+                    break;
+                }
+            }
+        }
+        if (boardTab >= 0) {
+            const bool cur = (st.activeTab == boardTab &&
+                              (st.workspace == cmd::Workspace::Board ||
+                               st.workspace == cmd::Workspace::Schematic));
+            entries[nEntries++] = { "Board", "ws_board", boardTab, cmd::Workspace::Board, cur };
         }
     }
 
@@ -460,14 +491,18 @@ float drawSectionSwitcher(AppState& st, float bandR, float y0, float barH) {
         if (hov) ImGui::SetTooltip("%s", e.label);
 
         if (clicked && !e.isCurrent) {
-            if (e.tabIdx >= 0 && e.tabIdx != st.activeTab)
-                s_switchTo = e.tabIdx;
-            st.workspace   = e.ws;
             st.activeTool.clear();
-            // CAM: activate/deactivate camActive based on whether we're switching TO the CAM entry.
-            // The "CAM Job" entry keeps camActive=true; Model/Sim/Drawing entries clear it.
-            if (e.ws == cmd::Workspace::Model && std::strcmp(e.label, "CAM Job") != 0)
+            if (std::strcmp(e.label, "CAM Job") == 0) {
+                // CAM Job: use camActivateForPart() to find/create the job and set workspace.
+                // This handles the full setup (job creation + sourcePartDocId + workspace switch).
+                ui::camActivateForPart(st, active.docId);
+            } else {
+                // All other entries: switch tab (if needed) + workspace.
+                if (e.tabIdx >= 0 && e.tabIdx != st.activeTab)
+                    s_switchTo = e.tabIdx;
+                st.workspace = e.ws;
                 st.camActive = false;
+            }
         }
 
         x += chipW + gap;

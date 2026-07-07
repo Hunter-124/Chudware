@@ -2531,6 +2531,21 @@ int run_gui(const char* screenshotPath, const char* openPath) {
                 ImGui::IsKeyPressed(ImGuiKey_P, false))
                 st.showCommandSearch = true;
 
+            // [workspace-tabs seam] Ctrl+1..Ctrl+8 switch the title-bar workspace (matches tab
+            // order). The shortcut bar advertises these. Guards: text input owns digits while
+            // typing; ECAD keeps its own accelerator space.
+            if (!textFocus && !ecadFocused && (io.KeyCtrl || io.KeySuper) && !io.KeyShift && !io.KeyAlt) {
+                using WS = AppState::Workspace;
+                static constexpr struct { ImGuiKey key; WS ws; } kWsKeys[] = {
+                    {ImGuiKey_1, WS::Model},        {ImGuiKey_2, WS::Drawing},
+                    {ImGuiKey_3, WS::Simulate},     {ImGuiKey_4, WS::Electronics},
+                    {ImGuiKey_5, WS::Manufacture},  {ImGuiKey_6, WS::PLM},
+                    {ImGuiKey_7, WS::PartsLibrary}, {ImGuiKey_8, WS::AI},
+                };
+                for (const auto& k : kWsKeys)
+                    if (ImGui::IsKeyPressed(k.key, false)) { st.activeWorkspace = k.ws; break; }
+            }
+
             // ---- Wave 3: Ctrl+O / Ctrl+S / Ctrl+Shift+S file shortcuts ----
             // Set request flags consumed by the GL-thread file pump below (after the input block) so
             // the native dialog opens with the doc swap off the ImGui input path. Skip while a text
@@ -2696,6 +2711,22 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         float barH = 0.0f;
         ui::drawTitleBar(st, maximized, barH);
 
+        // Window title mirrors the active document + dirty marker (SolidWorks-style). Cheap
+        // change-detection so glfwSetWindowTitle only fires when the string actually changes.
+        {
+            std::string title;
+            if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
+                const auto& tab = st.docTabs[st.activeTab];
+                title = tab.title.empty() ? "Untitled" : tab.title;
+                if (tab.dirty) title += "*";
+                title += " \xe2\x80\x94 AI-CAD";                 // " — AI-CAD"
+            } else {
+                title = "AI-CAD";
+            }
+            static std::string lastTitle;
+            if (title != lastTitle) { lastTitle = title; glfwSetWindowTitle(win, title.c_str()); }
+        }
+
         // ---------- C14: ribbon bar (drawn between title bar and dockspace) ----------
         // syncIconTheme keeps texture selection in sync with the active theme.
         ui::syncIconTheme();
@@ -2717,6 +2748,9 @@ int run_gui(const char* screenshotPath, const char* openPath) {
         ui::setRibbonActiveCmd(activeCmd);
         // Sketch tab swaps Exit Sketch <-> New Sketch depending on whether a sketch is being edited.
         ui::setRibbonSketchActive(st.sketchMode->active());
+        // [workspace-tabs seam] Drive the per-workspace ribbon filter from the active title-bar
+        // workspace so Model shows modeling tools, Simulate shows sim tools, etc. (WIRE_REQUESTS).
+        ui::setRibbonWorkspace(static_cast<int>(st.activeWorkspace));
         float ribbonH = ui::drawRibbon(st.ribbonTab, st.showRibbon,
                                        st.showSimulationTools, st.showPcbTools, barH,
                                        st.activeTabIsDrawing());

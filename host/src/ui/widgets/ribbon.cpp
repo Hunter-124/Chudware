@@ -40,13 +40,17 @@ static std::unordered_map<std::string, std::string> s_LastUsed;
 static std::string s_flyoutOpenReq;
 
 static const char* kRibbonTabs[] = {"Features", "Sketch", "Evaluate", "Simulation", "Assembly",
-                                    "Sheet Metal", "Weldments", "PCB", "Surfaces",
+                                    "Sheet Metal", "Weldments", "PCB Design", "Surfaces",
                                     "View Layout", "Annotation", "Appearance", "Manufacture",
                                     // sim-gui rework: per-simulation-type tabs, shown ONLY in the
                                     // Simulate workspace (indices 13..19 — see ribbon_tabVisible).
                                     "Static", "Modal", "Flow", "Thermal", "Fatigue", "Motion",
-                                    "EM"};
-static constexpr int kRibbonTabCount = 20;  // + W17 contextual "View Layout"/"Annotation" (drawings)
+                                    "EM",
+                                    // ECAD split: the old single "PCB" tab (index 7, now "PCB Design")
+                                    // was split — this is the second half. Appended at index 20 to keep
+                                    // the sim per-type tab indices 13..19 stable (append-only).
+                                    "Schematic"};
+static constexpr int kRibbonTabCount = 21;  // + W17 contextual "View Layout"/"Annotation" (drawings)
                                             //   + "Appearance" (index 11) + "Manufacture" (CAM, 12)
                                             //   + sim-gui per-type tabs (13..19, Simulate only)
 
@@ -62,7 +66,7 @@ static const char* kTabIcons[] = {
     "ws_assembly",    // Assembly
     "ws_sheetmetal",  // Sheet Metal
     "ws_weldments",   // Weldments
-    "ai_panel",       // PCB (placeholder — no ws_pcb glyph in the contract)
+    "ai_panel",       // PCB Design (placeholder — no ws_pcb glyph in the contract)
     "ws_surfaces",    // Surfaces
     "view_selector",  // View Layout (drawing — placeholder)
     "smart_dim",      // Annotation (drawing — placeholder)
@@ -78,6 +82,7 @@ static const char* kTabIcons[] = {
     "study_fatigue",  // Fatigue
     "mate",           // Motion
     "relations",      // EM (placeholder)
+    "sketch",         // Schematic (index 20 — reuse sketch glyph; no ws_schematic glyph yet)
 };
 static_assert(sizeof(kTabIcons) / sizeof(kTabIcons[0]) == kRibbonTabCount,
               "kTabIcons must stay parallel to kRibbonTabs");
@@ -134,8 +139,8 @@ static bool ribbon_tabVisible(int tab, bool showSimulationTools, bool showPcbToo
     // retired from this workspace (its rows stay in ribbon_def for append-only compat).
     if (s_workspace == 2 /*Simulate*/) return tab >= 13 && tab <= 19;
 
-    // Electronics workspace: PCB tab only.
-    if (s_workspace == 3 /*Electronics*/) return tab == 7;
+    // Electronics workspace: both ECAD tabs — PCB Design (7) and Schematic (20).
+    if (s_workspace == 3 /*Electronics*/) return tab == 7 || tab == 20;
 
     // Manufacture workspace: Manufacture tab only.
     if (s_workspace == 4 /*Manufacture*/) return tab == 12;
@@ -144,7 +149,8 @@ static bool ribbon_tabVisible(int tab, bool showSimulationTools, bool showPcbToo
     // unless the legacy bools override (backwards compat for callers that pass them explicitly).
     if (tab == 9 || tab == 10) return false;   // drawing tabs: 3D docs never
     if (tab == 3) return showSimulationTools;  // Simulation: legacy bool
-    if (tab == 7) return showPcbTools;         // PCB: legacy bool
+    if (tab == 7) return showPcbTools;         // PCB Design: legacy bool
+    if (tab == 20) return showPcbTools;        // Schematic: same legacy ECAD bool as PCB Design
     if (tab == 12) return false;               // Manufacture: only in Manufacture workspace
     if (tab >= 13) return false;               // sim-gui per-type tabs: Simulate workspace only
     return true;
@@ -166,6 +172,10 @@ struct ParentDefault { const char* parentId; const char* defaultCmd; const char*
 static const ParentDefault kParentDefaults[] = {
     {"sk_ellipse_big", "sk_ellipse",  "Ellipse", "ellipse"},
     {"sk_polygon",     "sk_poly_hex", "Hexagon", "polygon"},
+    // Default rectangle/arc flavor: a plain click on the Rectangle/Arc split button arms the
+    // CENTER variant (Ctr. Rect. / Ctr. Arc). The corner/3-pt variants stay in the flyout.
+    {"sk_rect_corner", "sk_rect_center", "Ctr. Rect.", "rect_center"},
+    {"sk_arc_3pt",     "sk_arc_center",  "Ctr. Arc",   "arc_center"},
 };
 
 static const ParentDefault* ribbon_parentDefault(const char* parentId) {
@@ -195,15 +205,16 @@ static constexpr float kBigBtnW     = 52.0f;
 static constexpr float kBigBtnMaxW  = 120.0f;
 static constexpr float kBigLblPad   = 6.0f;
 static constexpr float kGroupPadX   = 7.0f;   // audit: was 9 — trimmed dead space between groups
-static constexpr float kBodyH       = 100.0f;
+static constexpr float kBodyH       = 112.0f;  // taller so split buttons' 2-line captions clear the
+                                               // bottom dropdown-arrow strip (was 100 — text clipped)
 static constexpr float kCaptionH    = 22.0f;
 static constexpr float kSmRowH      = 22.0f;
 static constexpr float kDropArrowW  = 14.0f;  // trailing arrow slot — compact rows only
 static constexpr float kBottomPad   = 4.0f;   // audit: was 8 — dead band under the body
 
 static const char* ribbon_displayLabel(const char* cmd_id, const char* label) {
-    // The Features-tab sketch entry is intentionally icon-only; the tooltip keeps the full name.
-    if (cmd_id && std::strcmp(cmd_id, "sketch_new") == 0) return "";
+    // sketch_new now carries its "New Sketch" text label like every other tool button
+    // (both the Features-tab entry and the injected Sketch-tab slot share this cmd_id).
     return label ? label : "";
 }
 
@@ -247,9 +258,8 @@ static float ribbon_bigBtnW(const char* cmd_id, const char* label, bool hasDrop)
     float base = (visibleLabel[0] == '\0' ? 46.0f : kBigBtnW) * s;
     if (lblWScreen > base) base = lblWScreen;
     if (base > kBigBtnMaxW * s) base = kBigBtnMaxW * s;
-    // Defect fix (Hunter, 2026-07-06): the dropdown arrow no longer widens the button — it sits
-    // UNDER the icon in a bottom strip, so split buttons are exactly as wide as plain ones and
-    // the icon stays horizontally centered. hasDrop kept for call-site stability.
+    // The dropdown arrow sits in a bottom strip (bottom-right corner), so a split button is exactly
+    // as wide as a plain one — never fattened. hasDrop kept for call-site stability.
     (void)hasDrop;
     return base;
 }
@@ -856,9 +866,10 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0,0,0,0));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0,0,0,0));
 
-    // Split-button geometry (Hunter defect fix): the dropdown arrow lives in a BOTTOM strip
-    // under the icon/label — never a side column — so the button keeps its natural width and
-    // the icon stays horizontally centered like every non-dropdown button.
+    // Split-button geometry (Hunter, 2026-07-07): the dropdown arrow lives in a short BOTTOM strip,
+    // tucked into the bottom-RIGHT corner (under the icon, right side). The button keeps its natural
+    // width (never fattened) and the taller body (kBodyH bump) gives the 2-line caption room so it is
+    // no longer clipped by the strip.
     float dropH = hasDrop ? 12.0f * s : 0.0f;
     clicked = ImGui::InvisibleButton("##main", ImVec2(bw, bh - dropH));
     bool mainHov    = ImGui::IsItemHovered();
@@ -886,9 +897,9 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     }
 
     if (hasDrop) {
-        // Dropdown arrow: centered horizontally UNDER the icon/label, tucked inside the
-        // bottom strip with padding so it never touches the outline.
-        float ax = snap(p0.x + bw * 0.5f);
+        // Dropdown arrow: bottom strip, tucked to the RIGHT (under the icon, right side). Its own
+        // strip sits below the caption block, so it never overlaps the text.
+        float ax = snap(p0.x + bw - 8.0f * s);
         float ay = p0.y + bh - dropH * 0.5f;
         ImU32 aCol = enabled ? ui::Palette::toU32(ui::palette.text)
                              : ui::Palette::toU32(ui::palette.textDisabled);
@@ -911,8 +922,8 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     // Block = iconSz + optional swatch bar (4px+gap) + label lines. Centered with ≥3px edge pad.
     {
         float iconSz = snap(kBigIconSz * s);
-        // Centered on the FULL button width — split buttons no longer reserve a side arrow
-        // column, so dropdown and plain buttons center identically (Hunter defect fix).
+        // Centered on the FULL button width — the arrow lives in the bottom strip, not a side
+        // column, so dropdown and plain buttons center identically.
         float cx     = snap(p0.x + bw * 0.5f);
         const char* visibleLabel = ribbon_displayLabel(cmd_id, label);
         const float* matRgb = ribbon_matSwatchColor(cmd_id);
@@ -924,8 +935,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         float swatchH = matRgb ? 5.0f * s : 0.0f;  // 4px bar + 1px gap
         float labelH  = nLines > 0 ? (lineH * (float)nLines + 2.0f * s + swatchH) : 0.0f;
         float blockH  = iconSz + labelH;
-        // Vertical centering excludes the bottom arrow strip so icon+label never collide
-        // with the under-icon dropdown arrow.
+        // Vertical centering excludes the bottom arrow strip so icon+label never collide with it.
         float bhContent = bh - dropH;
         float iy;
         if (visibleLabel[0] == '\0') {
@@ -1167,7 +1177,14 @@ static const char* ribbon_flyoutPopup(const char* parentId,
             if (parentCmd && !parentCmd->stretch) rows.push_back(parentCmd);
         }
 
-        for (const auto* sc : subs) rows.push_back(sc);
+        // Dedupe: the injected parent-default row (e.g. sk_polygon -> sk_poly_hex "Hexagon") is often
+        // ALSO one of the variant subs. Adding it twice pushed the same cmd_id ID twice — the "2
+        // visible items with conflicting ID" warning — and listed "Hexagon" twice. Skip the sub that
+        // the default already stands in for.
+        for (const auto* sc : subs) {
+            if (pd && std::strcmp(sc->cmd_id, pd->defaultCmd) == 0) continue;
+            rows.push_back(sc);
+        }
 
         float maxLblW = 0.0f;
         for (const auto* sc : rows)

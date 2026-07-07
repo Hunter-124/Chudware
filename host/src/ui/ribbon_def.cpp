@@ -293,42 +293,54 @@ static const RibbonCmd kCmds[] = {
     { "weld_end_cap",        "End Cap",         "weld_end_cap",     "Weldments",   "Dress",       true,  nullptr,          false },
 
     // =========================================================================
-    // Tab: PCB  (Wave N — AI-ECAD electrical design: schematic capture, PCB layout, sim)
+    // Tab: PCB Design  (Wave N — AI-ECAD board layout: footprints, routing, DRC, outputs)
+    // NOTE: the old single "PCB" tab was split into two dedicated tabs — "PCB Design"
+    // (this one, board/layout tools) and "Schematic" (symbols/nets/ERC/analog sim, below).
+    // Both share the Electronics workspace. The shared entry commands (AI Design / Open /
+    // Save) live here on PCB Design to avoid duplicating a cmd_id across two tabs.
     // =========================================================================
 
     // --- Group: New ---
-    { "ecad_ai_design",     "AI Design",      "ai_panel",        "PCB", "New",        true,  nullptr, false },
-    { "ecad_new_sch",       "Schematic",      "sketch",          "PCB", "New",        true,  nullptr, false },
-    { "ecad_new_pcb",       "PCB Layout",     "extrude_boss",    "PCB", "New",        true,  nullptr, false },
-    { "ecad_open",          "Open",           "ref_plane",       "PCB", "New",        false, nullptr, false },
-    { "ecad_save",          "Save",           "ok_check",        "PCB", "New",        false, nullptr, false },
-
-    // --- Group: Schematic ---
-    { "sch_add_symbol",     "Place Symbol",   "point_ent",       "PCB", "Schematic",  true,  nullptr, false },
-    { "sch_add_wire",       "Wire",           "line",            "PCB", "Schematic",  false, nullptr, false },
-    { "sch_add_label",      "Net Label",      "text_ent",        "PCB", "Schematic",  false, nullptr, false },
-    { "sch_add_power",      "Power Port",     "construction",    "PCB", "Schematic",  false, nullptr, false },
-    { "sch_annotate",       "Annotate",       "ok_check",        "PCB", "Schematic",  false, nullptr, false },
-    { "ecad_run_erc",       "Run ERC",        "interference",    "PCB", "Schematic",  false, nullptr, false },
+    { "ecad_ai_design",     "AI Design",      "ai_panel",        "PCB Design", "New",        true,  nullptr, false },
+    { "ecad_new_pcb",       "PCB Layout",     "extrude_boss",    "PCB Design", "New",        true,  nullptr, false },
+    { "ecad_open",          "Open",           "ref_plane",       "PCB Design", "New",        false, nullptr, false },
+    { "ecad_save",          "Save",           "ok_check",        "PCB Design", "New",        false, nullptr, false },
 
     // --- Group: Board ---
-    { "pcb_update_from_sch","Update Board",   "ok_check",        "PCB", "Board",      true,  nullptr, false },
-    { "pcb_add_footprint",  "Footprint",      "point_ent",       "PCB", "Board",      false, nullptr, false },
-    { "pcb_add_track",      "Route",          "line",            "PCB", "Board",      false, nullptr, false },
-    { "pcb_add_via",        "Via",            "circle",          "PCB", "Board",      false, nullptr, false },
-    { "pcb_add_zone",       "Copper Zone",    "rect_center",     "PCB", "Board",      false, nullptr, false },
-    { "ecad_autoroute",     "Autoroute",      "sweep",           "PCB", "Board",      true,  nullptr, false },
-    { "ecad_fill_zones",    "Fill Zones",     "shell",           "PCB", "Board",      false, nullptr, false },
-    { "ecad_run_drc",       "Run DRC",        "interference",    "PCB", "Board",      false, nullptr, false },
-
-    // --- Group: Analyze (native simulator) ---
-    { "ecad_simulate",      "Simulate",       "study_flow",      "PCB", "Analyze",    true,  nullptr, false },
+    { "pcb_update_from_sch","Update Board",   "ok_check",        "PCB Design", "Board",      true,  nullptr, false },
+    { "pcb_add_footprint",  "Footprint",      "point_ent",       "PCB Design", "Board",      false, nullptr, false },
+    { "pcb_add_track",      "Route",          "line",            "PCB Design", "Board",      false, nullptr, false },
+    { "pcb_add_via",        "Via",            "circle",          "PCB Design", "Board",      false, nullptr, false },
+    { "pcb_add_zone",       "Copper Zone",    "rect_center",     "PCB Design", "Board",      false, nullptr, false },
+    { "ecad_autoroute",     "Autoroute",      "sweep",           "PCB Design", "Board",      true,  nullptr, false },
+    { "ecad_fill_zones",    "Fill Zones",     "shell",           "PCB Design", "Board",      false, nullptr, false },
+    { "ecad_run_drc",       "Run DRC",        "interference",    "PCB Design", "Board",      false, nullptr, false },
 
     // --- Group: Outputs ---
-    { "ecad_to_3d",         "Board to 3D",    "extrude_boss",    "PCB", "Outputs",    true,  nullptr, false },
-    { "ecad_export_gerber", "Gerbers",        "ref_plane",       "PCB", "Outputs",    false, nullptr, false },
-    { "ecad_export_drill",  "Drill",          "hole_wizard",     "PCB", "Outputs",    false, nullptr, false },
-    { "ecad_export_bom",    "BOM",            "bom",             "PCB", "Outputs",    false, nullptr, false },
+    { "ecad_to_3d",         "Board to 3D",    "extrude_boss",    "PCB Design", "Outputs",    true,  nullptr, false },
+    { "ecad_export_gerber", "Gerbers",        "ref_plane",       "PCB Design", "Outputs",    false, nullptr, false },
+    { "ecad_export_drill",  "Drill",          "hole_wizard",     "PCB Design", "Outputs",    false, nullptr, false },
+    { "ecad_export_bom",    "BOM",            "bom",             "PCB Design", "Outputs",    false, nullptr, false },
+
+    // =========================================================================
+    // Tab: Schematic  (split from the old "PCB" tab — schematic capture + analog sim)
+    // Symbols, nets, power, ERC, and the native analog simulator. Backend hooks to
+    // port results into the Simulation tab land later; this just organizes the tools.
+    // =========================================================================
+
+    // --- Group: New ---
+    { "ecad_new_sch",       "New Schematic",  "sketch",          "Schematic", "New",        true,  nullptr, false },
+
+    // --- Group: Schematic ---
+    { "sch_add_symbol",     "Place Symbol",   "point_ent",       "Schematic", "Schematic",  true,  nullptr, false },
+    { "sch_add_wire",       "Wire",           "line",            "Schematic", "Schematic",  false, nullptr, false },
+    { "sch_add_label",      "Net Label",      "text_ent",        "Schematic", "Schematic",  false, nullptr, false },
+    { "sch_add_power",      "Power Port",     "construction",    "Schematic", "Schematic",  false, nullptr, false },
+    { "sch_annotate",       "Annotate",       "ok_check",        "Schematic", "Schematic",  false, nullptr, false },
+    { "ecad_run_erc",       "Run ERC",        "interference",    "Schematic", "Schematic",  false, nullptr, false },
+
+    // --- Group: Analyze (native analog simulator) ---
+    { "ecad_simulate",      "Simulate",       "study_flow",      "Schematic", "Analyze",    true,  nullptr, false },
 
     // =========================================================================
     // Tab: Surfaces — open-surface (kind="surface") body features. cmd_id == the
@@ -489,7 +501,7 @@ static const RibbonCmd kCmds[] = {
     { "cam_op_engrave",    "Engrave",     "cam_engrave",     "Manufacture", "2.5D",      false, nullptr, false },
     // --- Group: Holes ---
     { "cam_op_drill",      "Drill",       "cam_drill",       "Manufacture", "Holes",     true,  nullptr, false },
-    { "cam_op_thread",     "Thread Mill", "cam_thread_mill", "Manufacture", "Holes",     false, nullptr, false },
+    { "cam_op_thread",     "Thread Mill", "cam_thread_mill", "Manufacture", "Holes",     true,  nullptr, false },
     // --- Group: 3D Milling ---
     { "cam_op_parallel3d", "Parallel",    "cam_parallel3d",  "Manufacture", "3D",        true,  nullptr, false },
     { "cam_op_waterline3d","Waterline",   "cam_waterline3d", "Manufacture", "3D",        true,  nullptr, false },

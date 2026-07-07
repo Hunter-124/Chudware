@@ -231,7 +231,8 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"ready": is_ready(), "python": str(_venv_python()),
                           "exists": _venv_python().exists(),
                           "imports_ok": _imports_ok(_venv_python()),
-                          "converters": converters_status()}, indent=2))
+                          "converters": converters_status(),
+                          "reveng": reveng_provisioning_status()}, indent=2))
         return 0
 
     res = ensure_runtime(args.base_python, args.wheelhouse, args.force)

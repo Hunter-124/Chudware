@@ -113,14 +113,14 @@ Hunter's red-pen on the shipped AI hub: make it compact, transparency-first, DAG
 ### Layout / chrome
 | # | Item | Status | Commit |
 |---|------|--------|--------|
-| M1 | Make the AI tab more compact overall | ⬜ | — |
-| M2 | WIPE the inference-settings block from the AI panel (Model, Reasoning effort, Max response tokens, Model context window, API key, Privacy, Vision reviewer) — those live ONLY on the main Settings page | ⬜ | — |
-| M3 | AI panel keeps ONLY AI *workflow* settings (Supervised/Autopilot, refine passes, max output tokens, context window), relocated to lower-right ("Settings/Options/Defaults" zone) | ⬜ | — |
-| M4 | DAG view occupies the upper main area, above the workflow settings | ⬜ | — |
-| M5 | Conversation window (message log + composer) moves to lower-left (green box); composer laid out per red box: `Permissions ▾` row → `[Model picker ▾][Effort ▾][ctx display]` → `Design/Edit/Ask/Permissions` mode tabs → input | ⬜ | — |
-| M6 | Remove the "Conversation" tab; conversation window is always visible (not a tab) | ⬜ | — |
-| M7 | Tab switcher becomes **Agent Workflow** \| **Session Plan** (switches the DAG pane only) | ⬜ | — |
-| M8 | Rename "Project Plan" → "Session Plan"; scope it per chat session (tied to each session) | ⬜ | — |
+| M1 | Make the AI tab more compact overall | ✅ | `500340e9` |
+| M2 | WIPE the inference-settings block from the AI panel (Model, Reasoning effort, Max response tokens, Model context window, API key, Privacy, Vision reviewer) — those live ONLY on the main Settings page | ✅ | `500340e9` — parity was ALREADY complete on the main Settings page (Settings→AI `drawProviderModelPicker` covers provider/model/effort/max-tokens/context/API-key/base-URL/vision/Privacy-Offline; Settings→Experimental has the separate vision reviewer). No additions to `settings_modal.cpp` needed; no parallel store. |
+| M3 | AI panel keeps ONLY AI *workflow* settings (Supervised/Autopilot, refine passes, max output tokens, context window), relocated to lower-right ("Settings/Options/Defaults" zone) | ✅ | `500340e9` |
+| M4 | DAG view occupies the upper main area, above the workflow settings | ✅ | `500340e9` |
+| M5 | Conversation window (message log + composer) moves to lower-left (green box); composer laid out per red box: `Permissions ▾` row → `[Model picker ▾][Effort ▾][ctx display]` → `Design/Edit/Ask/Permissions` mode tabs → input | ✅ (partial) | `500340e9` — window relocated lower-left + always visible; reuses shared `chatDrawComposer` (all controls present: Design/Edit/Ask + Permissions + model picker + Thinking/effort + ctx meter + input). EXACT top-to-bottom red-box ordering deferred: composer atoms are file-private statics in `legacy_chat.cpp`; reordering them would restructure the shared docked-Copilot composer (out of scope per the ownership rule). |
+| M6 | Remove the "Conversation" tab; conversation window is always visible (not a tab) | ✅ | `500340e9` |
+| M7 | Tab switcher becomes **Agent Workflow** \| **Session Plan** (switches the DAG pane only) | ✅ | `500340e9` — both tabs render the buildgraph view in Phase 1; the live agent-execution DAG lands under Agent Workflow in Phase 2. |
+| M8 | Rename "Project Plan" → "Session Plan"; scope it per chat session (tied to each session) | ✅ (partial) | `500340e9` — renamed + per-session selection plumbing wired (`s_ai.selSession` ← active conversation id). Per-session run FILTER deferred: `Conversation` has no `run_id` yet (PLAN §2.1), so no session→run index exists — TODO left in `drawDagView` for Phase 2. |
 ### DAG (the centerpiece)
 | # | Item | Status | Commit |
 |---|------|--------|--------|
